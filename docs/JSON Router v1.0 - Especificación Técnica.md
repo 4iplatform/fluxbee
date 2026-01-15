@@ -248,6 +248,32 @@ WF.route.escalation
 WF.route.handoff
 ```
 
+#### Nodos SY (Sistema)
+
+Los nodos SY son infraestructura del sistema. Proveen servicios fundamentales para la operación de la red. No procesan mensajes de aplicación.
+
+```
+SY.<servicio>.<instancia>
+```
+
+| Campo | Descripción | Ejemplos |
+|-------|-------------|----------|
+| servicio | Función del sistema | time, monitor, admin, log |
+| instancia | Identificador de la instancia | primary, backup, region |
+
+**Ejemplos:**
+```
+SY.time.primary
+SY.time.backup
+SY.monitor.metrics
+SY.admin.console
+SY.log.collector
+```
+
+**Nodo SY.time (Time Server):**
+
+El servicio de tiempo es responsabilidad del router o de un nodo SY.time dedicado. Provee tiempo UTC sincronizado a toda la red mediante broadcast periódico.
+
 #### Resumen de Convenciones
 
 | Tipo | Modelo conceptual | Estructura |
@@ -255,6 +281,7 @@ WF.route.handoff
 | AI | Recursos Humanos (personas con roles) | `AI.<área>.<cargo>.<nivel>.<especialización>.<turno>` |
 | IO | Infraestructura de comunicación (canales) | `IO.<medio>.<identificador>` |
 | WF | APIs/Programación (acciones) | `WF.<verbo>.<objeto>.<variante>` |
+| SY | Infraestructura del sistema (servicios) | `SY.<servicio>.<instancia>` |
 
 Esta separación permite que cada tipo de nodo se describa con el vocabulario natural de su dominio, manteniendo el sistema unificado a través del primer campo de tipo.
 
@@ -602,6 +629,7 @@ Basados en estándares de OSPF y BGP.
 | **Dead Interval** | 40s (4x hello) | Sí | Sin hello = router marcado como caído |
 | **Route Refresh** | 300s (5min) | Sí | Refrescar tabla de rutas entre routers |
 | **Connect Backoff Max** | 100ms | Sí | Máximo random delay antes de conectar a socket nuevo |
+| **Time Sync Interval** | 60s | Sí | Cada cuánto emitir TIME_SYNC broadcast |
 
 #### 15.3 Timers de Nodo
 
@@ -623,7 +651,8 @@ Los timers se configuran en el archivo de configuración del router:
     "hello_interval": 10000,
     "dead_interval": 40000,
     "route_refresh": 300000,
-    "connect_backoff_max": 100
+    "connect_backoff_max": 100,
+    "time_sync_interval": 60000
   }
 }
 ```
@@ -742,8 +771,58 @@ Mensajes dirigidos a toda la red o grupo de routers.
 | `BCAST_RELOAD` | Admin | Todos | Recargar configuración en todos |
 | `BCAST_CONFIG` | Admin | Todos | Distribuir nueva configuración |
 | `BCAST_ANNOUNCE` | Router | Todos | Anunciar nodo nuevo en la red |
+| `TIME_SYNC` | Router/SY.time | Todos | Broadcast de tiempo UTC sincronizado |
 
-#### 10.6 Estado
+#### 10.6 Tiempo del Sistema
+
+El tiempo sincronizado es fundamental para:
+- Correlación de eventos y trazas
+- Cálculo de TTLs y timeouts
+- Timestamps del blob store (spool_day)
+- Logs y auditoría
+
+**Todo tiempo en el sistema es UTC.** La conversión a timezone local es responsabilidad de cada agente/aplicación.
+
+**Mensaje TIME_SYNC:**
+
+```json
+{
+  "routing": {
+    "src": "uuid-router",
+    "dst": null,
+    "ttl": 1,
+    "trace_id": "uuid"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "TIME_SYNC"
+  },
+  "payload": {
+    "utc": "2025-01-15T10:00:00.000Z",
+    "epoch_ms": 1736935200000,
+    "source": "SY.time.primary",
+    "stratum": 1
+  }
+}
+```
+
+| Campo | Propósito |
+|-------|-----------|
+| `utc` | Tiempo UTC en ISO-8601 |
+| `epoch_ms` | Milliseconds desde Unix epoch (para cálculos) |
+| `source` | Quién emite el tiempo (router o nodo SY.time) |
+| `stratum` | Nivel de confianza (1 = fuente primaria, 2+ = derivado) |
+
+**Emisión del TIME_SYNC:**
+
+- El router (o nodo SY.time dedicado) emite `TIME_SYNC` periódicamente
+- Intervalo recomendado: cada 60 segundos
+- TTL = 1 (no se propaga entre routers, cada router/isla tiene su fuente)
+- Los nodos pueden usar este tiempo para sincronizar sus relojes internos
+
+**Nota:** Los nodos no están obligados a sincronizar su reloj con TIME_SYNC, pero todos los timestamps en mensajes del protocolo DEBEN ser UTC.
+
+#### 10.7 Estado
 
 Cada componente define su propio mensaje de estado con información relevante a su tipo.
 
@@ -757,8 +836,9 @@ Cada componente define su propio mensaje de estado con información relevante a 
 - **Nodo AI:** Modelo cargado, requests en proceso, memoria usada
 - **Nodo IO:** Canal conectado, mensajes en cola, última actividad
 - **Nodo WF:** Workflows activos, ejecuciones pendientes
+- **Nodo SY:** Estado del servicio específico (ej: SY.time reporta stratum, drift)
 
-#### 10.7 Formato de Mensaje de Sistema
+#### 10.8 Formato de Mensaje de Sistema
 
 ```json
 {
@@ -780,6 +860,8 @@ Cada componente define su propio mensaje de estado con información relevante a 
 ```
 
 El campo `meta.type: "system"` distingue mensajes de control de mensajes normales.
+
+**Nota:** Todos los timestamps en mensajes del sistema DEBEN ser UTC (ISO-8601 con sufijo Z).
 
 ### 16. Semántica de Comunicación
 
