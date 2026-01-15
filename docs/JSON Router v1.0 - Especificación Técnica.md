@@ -381,17 +381,168 @@ Mensaje llega al router
 
 ## Parte III: Infraestructura de Red
 
-### 9. Sockets y Detección de Link
+### 11. Sockets y Detección de Link
 
 *Por definir: protocolo de conexión nodo-router, comportamiento en link down, reconexión.*
 
-### 10. Shared Memory
+### 12. Shared Memory
 
 *Por definir: estructura de la tabla de ruteo, estado de nodos, sincronización entre routers.*
 
-### 11. Ciclo de Vida de Nodos
+### 13. Ciclo de Vida de Nodos
 
 *Por definir: registro de nodo, asignación a router, desconexión, cleanup.*
+
+### 9. Tipos de Mensaje por Tamaño
+
+El sistema maneja mensajes de diferentes tamaños con estrategias distintas.
+
+#### 9.1 Mensaje Inline (< 64KB)
+
+JSON completo con payload incluido. Texto, comandos, metadata, respuestas LLM normales. Va directo por el socket.
+
+```json
+{
+  "routing": { ... },
+  "meta": { ... },
+  "payload": {
+    "type": "text",
+    "content": "Mensaje de texto normal"
+  }
+}
+```
+
+#### 9.2 Mensaje por Referencia (> 64KB)
+
+El payload es un archivo en disco. El JSON lleva el path. El nodo destino lo lee del filesystem compartido.
+
+```json
+{
+  "routing": { ... },
+  "meta": { ... },
+  "payload": {
+    "type": "file_ref",
+    "path": "/var/spool/mesh/blobs/uuid-del-archivo",
+    "mime": "image/png",
+    "size": 5242880
+  }
+}
+```
+
+**Flujo para mensaje grande:**
+
+1. Nodo origen recibe/genera archivo grande
+2. Nodo origen guarda archivo en `/var/spool/mesh/blobs/`
+3. Nodo origen manda JSON con `file_ref` al router
+4. Router rutea el JSON (chiquito) al nodo destino
+5. Nodo destino lee el archivo del path
+6. Cleanup externo (proceso de mantenimiento) borra archivos viejos
+
+**Storage de blobs:**
+
+- Directorio compartido entre todos los nodos
+- Montaje local o NFS según infraestructura
+- Sin HTTP, acceso directo a disco
+- Mantenimiento externo, los nodos no borran
+
+#### 9.3 Mensaje de Sistema (< 1KB)
+
+Mensajes de control de la red. Van por el mismo canal pero con `meta.type: "system"`. El router puede procesarlos él mismo en lugar de hacer forward.
+
+### 10. Mensajes de Sistema
+
+Nomenclatura basada en estándares de red existentes.
+
+#### 10.1 Descubrimiento y Registro
+
+| Mensaje | Origen | Destino | Propósito |
+|---------|--------|---------|-----------|
+| `ANNOUNCE` | Nodo | Router | Nodo anuncia existencia (UUID + nombre capa 2) |
+| `WITHDRAW` | Nodo | Router | Nodo anuncia shutdown limpio |
+| `QUERY` | Router | Nodo | Router pregunta identidad a socket nuevo |
+
+#### 10.2 Health y Diagnóstico (ICMP-like)
+
+| Mensaje | Origen | Destino | Propósito |
+|---------|--------|---------|-----------|
+| `ECHO` | Cualquiera | Cualquiera | Ping |
+| `ECHO_REPLY` | Cualquiera | Cualquiera | Pong |
+| `UNREACHABLE` | Router | Nodo origen | Destino no existe |
+| `TTL_EXCEEDED` | Router | Nodo origen | TTL llegó a 0 |
+| `SOURCE_QUENCH` | Router/Nodo | Nodo origen | Backpressure, bajar velocidad |
+
+#### 10.3 Routing (entre routers)
+
+| Mensaje | Origen | Destino | Propósito |
+|---------|--------|---------|-----------|
+| `HELLO` | Router | Routers | Anunciar existencia |
+| `LSA` | Router | Routers | Link State Advertisement, compartir nodos conectados |
+| `SYNC_REQUEST` | Router | Router | Pedir tabla completa |
+| `SYNC_REPLY` | Router | Router | Respuesta con tabla completa |
+
+#### 10.4 Administrativos (unicast)
+
+Mensajes dirigidos a un nodo o router específico.
+
+| Mensaje | Origen | Destino | Propósito |
+|---------|--------|---------|-----------|
+| `ADM_SHUTDOWN` | Admin | Nodo/Router | Orden de apagar |
+| `ADM_RELOAD` | Admin | Nodo/Router | Recargar configuración |
+| `ADM_STATUS` | Admin | Nodo/Router | Solicitar estado |
+| `ADM_STATUS_REPLY` | Nodo/Router | Admin | Respuesta con estado propio |
+| `ADM_ROUTES` | Admin | Router | Solicitar tabla de ruteo |
+| `ADM_ROUTES_REPLY` | Router | Admin | Respuesta con tabla de ruteo |
+| `ADM_NODES` | Admin | Router | Solicitar nodos conectados |
+| `ADM_NODES_REPLY` | Router | Admin | Respuesta con lista de nodos |
+
+#### 10.5 Administrativos (broadcast)
+
+Mensajes dirigidos a toda la red o grupo de routers.
+
+| Mensaje | Origen | Destino | Propósito |
+|---------|--------|---------|-----------|
+| `BCAST_SHUTDOWN` | Admin | Todos | Shutdown general |
+| `BCAST_RELOAD` | Admin | Todos | Recargar configuración en todos |
+| `BCAST_CONFIG` | Admin | Todos | Distribuir nueva configuración |
+| `BCAST_ANNOUNCE` | Router | Todos | Anunciar nodo nuevo en la red |
+
+#### 10.6 Estado
+
+Cada componente define su propio mensaje de estado con información relevante a su tipo.
+
+| Mensaje | Origen | Destino | Propósito |
+|---------|--------|---------|-----------|
+| `STATE` | Nodo/Router | Quien solicitó | Estado interno del componente |
+
+**Contenido de STATE según tipo:**
+
+- **Router:** Nodos conectados, tabla de ruteo, métricas de tráfico, uptime
+- **Nodo AI:** Modelo cargado, requests en proceso, memoria usada
+- **Nodo IO:** Canal conectado, mensajes en cola, última actividad
+- **Nodo WF:** Workflows activos, ejecuciones pendientes
+
+#### 10.7 Formato de Mensaje de Sistema
+
+```json
+{
+  "routing": {
+    "src": "uuid-origen",
+    "dst": "uuid-destino",
+    "ttl": 16,
+    "trace_id": "uuid"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "ECHO"
+  },
+  "payload": {
+    "timestamp": "2025-01-15T10:00:00Z",
+    "seq": 1
+  }
+}
+```
+
+El campo `meta.type: "system"` distingue mensajes de control de mensajes normales.
 
 ---
 
