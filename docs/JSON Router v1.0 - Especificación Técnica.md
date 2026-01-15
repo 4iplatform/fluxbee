@@ -158,6 +158,106 @@ Mensajes con identificadores inválidos se rechazan antes de entrar a la red.
 
 Un mismo nombre capa 2 puede tener múltiples UUIDs (varios nodos con mismo perfil). El router resuelve cuál de ellos recibe el mensaje.
 
+### 6.5 Caracterización de Nodos por Tipo
+
+La estructura del nombre capa 2 varía según el tipo de nodo. El primer campo siempre indica el tipo (`AI`, `IO`, `WF`), pero los campos siguientes siguen convenciones distintas según la naturaleza del nodo.
+
+#### Nodos AI (Agentes LLM)
+
+Los agentes AI emulan personas con roles funcionales. La nomenclatura sigue el modelo de **Recursos Humanos** para descripción de puestos:
+
+```
+AI.<área>.<cargo>.<nivel>.<especialización>.<turno>
+```
+
+| Campo | Descripción | Ejemplos |
+|-------|-------------|----------|
+| área | Departamento funcional | soporte, ventas, cobranzas, legal, rrhh, contable |
+| cargo | Puesto o función | analista, ejecutivo, asesor |
+| nivel | Seniority o tier | l1, l2, jr, sr, lead |
+| especialización | Nicho de expertise | tecnico, comercial, enterprise, pyme, español, ingles |
+| turno | Disponibilidad | diurno, nocturno, 24-7 |
+
+**Ejemplos:**
+```
+AI.soporte.analista.l1.tecnico.diurno
+AI.soporte.analista.l2.tecnico.nocturno
+AI.ventas.ejecutivo.bdr.pyme
+AI.ventas.ejecutivo.closer.enterprise
+AI.cobranzas.analista.jr.amigable
+AI.legal.asesor.sr.contratos
+AI.rrhh.analista.recruiting
+AI.contable.analista.facturas
+```
+
+No todos los campos son obligatorios. Un nodo puede registrarse como `AI.soporte.analista` si no requiere mayor especificidad.
+
+#### Nodos IO (Adaptación de Medio)
+
+Los nodos IO son infraestructura de comunicación. Representan canales, no personas. La nomenclatura describe el medio y el identificador de la cuenta/línea:
+
+```
+IO.<medio>.<identificador>
+```
+
+| Campo | Descripción | Ejemplos |
+|-------|-------------|----------|
+| medio | Canal de comunicación | wapp, email, telegram, instagram, sms, voice, chat |
+| identificador | Cuenta, número o instancia | número de teléfono, dirección email, handle |
+
+**Ejemplos:**
+```
+IO.wapp.+5491155551234
+IO.wapp.+5491155559999
+IO.email.ventas@empresa.com
+IO.email.soporte@empresa.com
+IO.telegram.@bot_empresa
+IO.instagram.@cuenta_oficial
+IO.chat.widget_web_01
+IO.voice.troncal_001
+IO.sms.+5491155550000
+```
+
+#### Nodos WF (Workflows Estáticos)
+
+Los nodos WF son infraestructura de proceso. Ejecutan acciones determinísticas. La nomenclatura sigue el patrón de APIs y programación:
+
+```
+WF.<verbo>.<objeto>.<variante>
+```
+
+| Campo | Descripción | Ejemplos |
+|-------|-------------|----------|
+| verbo | Acción a ejecutar | send, query, update, validate, count, log |
+| objeto | Recurso sobre el que actúa | email, sms, crm, erp, kyc, metrics |
+| variante | Especificación adicional | tipo, formato, destino |
+
+**Ejemplos:**
+```
+WF.send.email
+WF.send.sms
+WF.send.push
+WF.query.crm
+WF.update.crm
+WF.query.erp.facturas
+WF.validate.kyc
+WF.validate.fraud
+WF.count.mensajes
+WF.log.evento
+WF.route.escalation
+WF.route.handoff
+```
+
+#### Resumen de Convenciones
+
+| Tipo | Modelo conceptual | Estructura |
+|------|------------------|------------|
+| AI | Recursos Humanos (personas con roles) | `AI.<área>.<cargo>.<nivel>.<especialización>.<turno>` |
+| IO | Infraestructura de comunicación (canales) | `IO.<medio>.<identificador>` |
+| WF | APIs/Programación (acciones) | `WF.<verbo>.<objeto>.<variante>` |
+
+Esta separación permite que cada tipo de nodo se describa con el vocabulario natural de su dominio, manteniendo el sistema unificado a través del primer campo de tipo.
+
 ### 7. Estructura del Mensaje
 
 Todo mensaje en la red tiene tres secciones:
