@@ -781,6 +781,460 @@ Cada componente define su propio mensaje de estado con información relevante a 
 
 El campo `meta.type: "system"` distingue mensajes de control de mensajes normales.
 
+### 16. Semántica de Comunicación
+
+#### 16.1 Modelo: Request/Response End-to-End (tipo TCP)
+
+El sistema implementa comunicación request/response con confirmación end-to-end. La respuesta del nodo destino ES la confirmación de recepción, igual que en TCP donde el ACK viene del extremo final, no de intermediarios.
+
+```
+Nodo A ──REQ──► Router ──────► Nodo B
+                               │
+                               ▼
+                          Nodo B recibe
+                               │
+                               ▼
+Nodo A ◄──RESP── Router ◄───── Nodo B responde
+```
+
+**No hay ACK intermedio del router.** El router es transparente: mueve bytes, no confirma recepción.
+
+#### 16.2 Principios
+
+1. **El router es un medio de transporte, no un broker.**
+   - No almacena mensajes con fines de durabilidad
+   - No implementa reintentos automáticos
+   - No confirma recepción en nombre del destino
+
+2. **La respuesta es el único ACK.**
+   - En request/response, la respuesta confirma que el destino recibió Y procesó
+   - Si no hay respuesta dentro del timeout, la sesión se considera fallida
+
+3. **Retry y contingencia son decisiones de negocio (nodos).**
+   - Reintentar, reroutear, degradar, escalar son políticas de aplicación
+   - El router no intenta "resolver" fallas mediante reenvíos automáticos
+   - Los mensajes pueden tener efectos o costos; el router no puede decidir reenviar
+
+#### 16.3 Contrato del Protocolo
+
+| Campo | Obligatorio | Propósito |
+|-------|-------------|-----------|
+| `msg_id` | Sí (en REQ) | Identificador único de la solicitud |
+| `msg_id` | Sí (en RESP) | Correlation ID para cerrar la sesión |
+| `deadline` | Definido por emisor | Timeout de la solicitud |
+
+El emisor controla el timeout, no el router. El router no trackea sesiones "abiertas".
+
+#### 16.4 Señales del Router
+
+Cuando el router no puede aceptar o enrutar, responde inmediatamente con error:
+
+| Señal | Origen | Significado |
+|-------|--------|-------------|
+| `UNREACHABLE` | Router | No existe ruta, no hay nodos con ese rol, destino no existe |
+| `SOURCE_QUENCH` | Router o Nodo | Cola llena, backpressure, bajar velocidad |
+| `TTL_EXCEEDED` | Router | Mensaje excedió límite de hops |
+
+Estas señales NO implican que el mensaje fue procesado. Solo indican que el router no pudo completar el forwarding.
+
+#### 16.5 Estados Finales de Sesión
+
+Una sesión request/response termina en uno de estos estados:
+
+| Estado | Qué pasó | Acción típica |
+|--------|----------|---------------|
+| `SUCCESS` | Recibió RESP con resultado válido | Continuar |
+| `REMOTE_ERROR` | Recibió RESP con error de aplicación | Manejar error |
+| `ROUTER_ERROR` | Recibió señal del router (UNREACHABLE, etc.) | Retry o abortar |
+| `TIMEOUT` | No recibió respuesta antes del deadline | Ambiguo, decidir retry |
+
+#### 16.6 Ambigüedad del Timeout
+
+El timeout es el caso ambiguo. El emisor no puede saber:
+
+| Escenario | Qué pasó realmente | Qué ve el emisor |
+|-----------|-------------------|------------------|
+| Mensaje nunca llegó a B | Perdido en tránsito | Timeout |
+| B recibió, crasheó antes de responder | Puede haber procesado | Timeout |
+| B procesó, respuesta se perdió | Procesado pero sin confirmación | Timeout |
+
+En todos los casos el emisor ve lo mismo: timeout. Por eso **el retry es decisión de negocio**: si el emisor reintenta, el destino podría recibir el mensaje dos veces. La aplicación debe manejar idempotencia o aceptar duplicados.
+
+#### 16.7 Comparación con TCP
+
+| Aspecto | TCP | Este sistema |
+|---------|-----|--------------|
+| ACK de quién | Del extremo final | Del extremo final (RESP) |
+| ACK intermedio | No (routers IP no confirman) | No (router no confirma) |
+| Retransmisión | Automática por el stack | Manual, decisión de negocio |
+| Orden | Garantizado | Garantizado (SOCK_SEQPACKET) |
+| Detección de pérdida | Timeout + ACK duplicados | Timeout |
+
+La diferencia clave: TCP retransmite automáticamente porque son bytes sin semántica. Acá son mensajes con posibles efectos secundarios, entonces el retry lo decide la aplicación.
+
+### 17. Blob Store
+
+#### 17.1 Objetivo
+
+Transportar payloads grandes sin fragmentación ni streaming. El payload se consolida completamente en origen antes de ser referenciado y enviado por JSON.
+
+El blob store es un filesystem compartido entre todos los nodos. La infraestructura resuelve el acceso (NFS, mount compartido, etc.).
+
+#### 17.2 Umbral Inline vs Referencia
+
+| Tamaño | Transporte |
+|--------|------------|
+| `<= MAX_INLINE_BYTES` (64KB) | Inline en JSON |
+| `> MAX_INLINE_BYTES` | Referencia `blob_ref` |
+
+#### 17.3 Estructura de Directorios
+
+Root configurable: `BLOB_ROOT` (ej. `/var/lib/router/blobs`)
+
+Organización por día UTC:
+
+```
+${BLOB_ROOT}/YYYY/MM/DD/tmp/        # Escrituras incompletas
+${BLOB_ROOT}/YYYY/MM/DD/objects/    # Blobs sellados (válidos)
+${BLOB_ROOT}/YYYY/MM/DD/pins/       # Locks de uso (evita borrado)
+${BLOB_ROOT}/YYYY/MM/DD/manifest.log # Opcional, auditoría
+```
+
+Sharding recomendado para alto volumen (>10K blobs/día):
+
+```
+${BLOB_ROOT}/YYYY/MM/DD/objects/aa/bb/<blob_id>.blob
+```
+
+Los primeros caracteres del sha256 dan buena distribución.
+
+#### 17.4 Identidad del Blob
+
+| Campo | Obligatorio | Descripción |
+|-------|-------------|-------------|
+| `blob_id` | Sí | Opaco, recomendado: `sha256:<hash>` (content-addressed) |
+| `sha256` | Sí | Hash del contenido para validación |
+| `size` | Sí | Tamaño en bytes |
+| `mime` | Sí | Tipo de contenido para el receptor |
+| `spool_day` | Sí | Fecha UTC de creación (YYYY-MM-DD) |
+
+Content-addressed significa: si dos nodos mandan el mismo archivo, es el mismo blob. Deduplicación automática.
+
+#### 17.5 Escritura Atómica (Sellado)
+
+Un blob es válido solo si existe en `objects/`. Nunca leer desde `tmp/`.
+
+```
+1. Escribir a ${...}/tmp/<blob_id>.<pid>.<rand>.tmp
+2. fsync(file) + fsync(dir)
+3. rename() atómico a ${...}/objects/<blob_id>.blob
+```
+
+El `rename()` es atómico en POSIX. Si existe en `objects/`, está completo.
+
+#### 17.6 Mensaje blob_ref
+
+El router transporta solo el JSON, no el blob.
+
+```json
+{
+  "routing": { ... },
+  "meta": { ... },
+  "payload": {
+    "type": "blob_ref",
+    "blob_id": "sha256:a1b2c3d4...",
+    "size": 5242880,
+    "sha256": "a1b2c3d4...",
+    "mime": "image/png",
+    "spool_day": "2025-01-15"
+  }
+}
+```
+
+Los nodos no envían paths. El path se deriva localmente:
+
+```
+${BLOB_ROOT}/${spool_day}/objects/${blob_id}.blob
+```
+
+#### 17.7 Lectura y Validación
+
+El receptor:
+
+1. Construye path desde `BLOB_ROOT` + `spool_day` + `blob_id`
+2. Si no existe, fallback ±24 horas (orden: `spool_day` → `-1 día` → `+1 día`)
+3. Si no existe en ninguno, error `BLOB_NOT_FOUND`
+4. Lee archivo, valida `size` + `sha256`
+5. Si no valida, error (blob corrupto)
+6. Solo si valida, procesa el payload completo
+
+El fallback de ±24 horas cubre el caso de blob escrito a las 23:59 UTC y procesado a las 00:01 UTC.
+
+**Retry por latencia de filesystem compartido:**
+
+Si el blob no se encuentra inmediatamente, el nodo puede reintentar con backoff corto (ej. 100ms, 200ms, 400ms) antes de declarar `BLOB_NOT_FOUND`. Esto es responsabilidad del nodo, no hay comunicación adicional.
+
+#### 17.8 Pins (Locks de Uso)
+
+Para evitar que el GC borre blobs en uso:
+
+```
+Al comenzar a procesar: crear ${...}/pins/<blob_id>.<node_id>
+Al terminar: borrar ese pin
+```
+
+El GC no borra días con pins activos.
+
+#### 17.9 Retención y Garbage Collection
+
+Estrategia: borrar días completos (O(#días), no O(#archivos)).
+
+```
+RETENTION_DAYS >= 2 (recomendado)
+
+Candidato a borrar: directorio con fecha < today_utc - RETENTION_DAYS
+Condición: pins/ vacío o no existe
+Acción: borrar directorio del día completo
+```
+
+El sweeper corre periódicamente (configurable, ej. cada hora).
+
+#### 17.10 Límites Operativos
+
+| Límite | Propósito |
+|--------|-----------|
+| `MAX_BLOB_SIZE` | Hard limit por blob individual |
+| `MAX_SPOOL_BYTES` | Cuota total del spool |
+
+Si se excede `MAX_SPOOL_BYTES`, rechazar nuevas escrituras con `PAYLOAD_TOO_LARGE`.
+
+#### 17.11 Semántica
+
+- **Inmutable:** write-once, nunca se modifica un blob
+- **Best-effort:** el blob store no implica delivery garantizado
+- **No streaming:** el payload no se expone al receptor hasta validación completa
+
+#### 17.12 Señales de Error
+
+| Señal | Cuándo |
+|-------|--------|
+| `PAYLOAD_TOO_LARGE` | Blob excede `MAX_BLOB_SIZE` o spool excede cuota |
+| `BLOB_NOT_FOUND` | Receptor no encuentra blob (incluso con fallback ±24h) |
+| `BLOB_CORRUPTED` | Blob existe pero no valida `size` o `sha256` |
+
+### 18. Uplink WAN (Router ↔ Router)
+
+#### 18.1 Objetivo
+
+Conectar "islas" (dominios locales) mediante uplink persistente entre routers. El uplink transporta mensajes de sistema (control-plane) y forwarding de mensajes entre islas, manteniendo el diseño best-effort.
+
+```
+┌─────────────────┐                    ┌─────────────────┐
+│     Isla A      │                    │     Isla B      │
+│                 │                    │                 │
+│  [Nodo]──[Router A]════TCP/TLS════[Router B]──[Nodo]  │
+│  [Nodo]─┘       │      (WAN)         │       └─[Nodo] │
+└─────────────────┘                    └─────────────────┘
+```
+
+El uplink es siempre punto a punto: un router conecta con otro router. Un router puede tener múltiples uplinks a diferentes islas.
+
+#### 18.2 Transporte
+
+| Contexto | Transporte | Framing |
+|----------|------------|---------|
+| LAN/Local (nodos) | Unix domain socket `SOCK_SEQPACKET` | Automático (kernel) |
+| WAN (routers) | TCP stream | Manual: `uint32_be length` + `JSON bytes` |
+
+El framing WAN:
+```
+┌──────────────┬─────────────────────┐
+│ length (4B)  │ JSON message        │
+│ big-endian   │ (length bytes)      │
+└──────────────┴─────────────────────┘
+```
+
+`length` incluye solo el JSON, no el header de 4 bytes.
+
+El contenido del mensaje es el mismo JSON del protocolo (routing/meta/payload).
+
+#### 18.3 Mensajes Reutilizados
+
+El uplink WAN usa los mismos mensajes de routing entre routers ya definidos:
+
+| Mensaje | Propósito en WAN |
+|---------|------------------|
+| `HELLO` | Anunciar existencia, keepalive |
+| `LSA` | Propagar cambios de topología entre islas |
+| `SYNC_REQUEST` | Pedir tabla completa al conectar |
+| `SYNC_REPLY` | Responder con tabla completa |
+
+No se inventa protocolo nuevo para WAN.
+
+#### 18.4 Mensajes de Handshake WAN
+
+Dos mensajes adicionales para negociación explícita del uplink:
+
+| Mensaje | Origen | Destino | Propósito |
+|---------|--------|---------|-----------|
+| `UPLINK_ACCEPT` | Router | Router | Confirma aceptación del peer, versión y capabilities |
+| `UPLINK_REJECT` | Router | Router | Rechaza conexión con motivo explícito |
+
+#### 18.5 Handshake del Uplink
+
+Secuencia al establecer conexión TCP:
+
+```
+Router A                              Router B
+    │                                     │
+    │◄────────TCP connect─────────────────┤
+    │                                     │
+    ├─────────HELLO──────────────────────►│
+    │◄────────HELLO───────────────────────┤
+    │                                     │
+    │         (validación de HELLO)       │
+    │                                     │
+    ├─────────UPLINK_ACCEPT──────────────►│  (o UPLINK_REJECT)
+    │◄────────UPLINK_ACCEPT───────────────┤  (o UPLINK_REJECT)
+    │                                     │
+    ├─────────SYNC_REQUEST───────────────►│
+    │◄────────SYNC_REPLY──────────────────┤
+    │                                     │
+    │◄────────SYNC_REQUEST────────────────┤
+    ├─────────SYNC_REPLY─────────────────►│
+    │                                     │
+    │         (operación normal)          │
+    │                                     │
+    ├─────────HELLO periódico────────────►│
+    │◄────────HELLO periódico─────────────┤
+    │                                     │
+```
+
+#### 18.6 Payload del HELLO (WAN extendido)
+
+```json
+{
+  "routing": {
+    "src": "uuid-router-a",
+    "dst": "uuid-router-b",
+    "ttl": 16,
+    "trace_id": "uuid"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "HELLO"
+  },
+  "payload": {
+    "timestamp": "2025-01-15T10:00:00Z",
+    "seq": 1,
+    "protocol": "json-router/1",
+    "router_id": "uuid-router-a",
+    "island_id": "isla-produccion",
+    "capabilities": {
+      "sync": true,
+      "lsa": true,
+      "forwarding": true
+    },
+    "timers": {
+      "hello_interval_ms": 10000,
+      "dead_interval_ms": 40000
+    }
+  }
+}
+```
+
+| Campo | Propósito |
+|-------|-----------|
+| `protocol` | Versión del protocolo para compatibilidad |
+| `router_id` | UUID del router |
+| `island_id` | Identificador de la isla (dominio) |
+| `capabilities` | Qué soporta este router |
+| `timers` | Intervalos de hello/dead para sincronizar |
+
+#### 18.7 Payload de UPLINK_ACCEPT
+
+```json
+{
+  "meta": {
+    "type": "system",
+    "msg": "UPLINK_ACCEPT"
+  },
+  "payload": {
+    "timestamp": "2025-01-15T10:00:01Z",
+    "peer_router_id": "uuid-router-b",
+    "negotiated": {
+      "protocol": "json-router/1",
+      "hello_interval_ms": 10000,
+      "dead_interval_ms": 40000
+    }
+  }
+}
+```
+
+#### 18.8 Payload de UPLINK_REJECT
+
+```json
+{
+  "meta": {
+    "type": "system",
+    "msg": "UPLINK_REJECT"
+  },
+  "payload": {
+    "timestamp": "2025-01-15T10:00:01Z",
+    "reason": "PROTOCOL_MISMATCH",
+    "message": "Minimum supported version is json-router/1",
+    "min_version": "json-router/1"
+  }
+}
+```
+
+Razones de rechazo:
+
+| Reason | Descripción |
+|--------|-------------|
+| `PROTOCOL_MISMATCH` | Versión de protocolo no soportada |
+| `ISLAND_NOT_AUTHORIZED` | Island ID no está en lista de permitidos |
+| `CAPABILITY_MISSING` | Falta capability requerida |
+| `OVERLOADED` | Router no puede aceptar más uplinks |
+
+#### 18.9 Operación Normal
+
+Una vez establecido el uplink:
+
+- **HELLO periódico** cada `hello_interval_ms`
+- **Dead detection**: sin HELLO por `dead_interval_ms` = peer caído, invalidar rutas
+- **LSA incremental**: cambios de topología se propagan con LSA
+- **TTL**: se decrementa por hop, previene loops entre islas
+
+#### 18.10 Forwarding entre Islas
+
+Cuando un mensaje tiene destino en otra isla:
+
+```
+1. Router A recibe mensaje para nodo en Isla B
+2. Router A busca en tabla: nodo está en Isla B via Router B
+3. Router A decrementa TTL
+4. Router A envía mensaje por uplink TCP a Router B
+5. Router B recibe, busca nodo local, entrega por Unix socket
+```
+
+El mensaje JSON es idéntico. Solo cambia el transporte.
+
+#### 18.11 Seguridad
+
+La autenticación se delega al edge proxy (NGINX, Envoy, etc.):
+
+| Capa | Responsable | Mecanismo |
+|------|-------------|-----------|
+| Transporte | Edge proxy | TLS/mTLS |
+| Autorización | Edge proxy | Allowlist de IPs/certs |
+| Rate limiting | Edge proxy | Por conexión/bytes |
+| Protocolo | Router | HELLO + UPLINK_ACCEPT/REJECT |
+
+El proxy no interpreta el protocolo. Es transparente L4.
+
+La validación de `island_id` contra lista de islas autorizadas puede hacerse en el router al recibir HELLO, respondiendo `UPLINK_REJECT` si no está autorizado.
+
 ---
 
 ## Parte IV: Routing
