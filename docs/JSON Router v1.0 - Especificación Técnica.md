@@ -383,15 +383,252 @@ Mensaje llega al router
 
 ### 11. Sockets y Detección de Link
 
-*Por definir: protocolo de conexión nodo-router, comportamiento en link down, reconexión.*
+#### 11.1 Tipo de Socket
+
+El sistema usa **Unix domain sockets** con `SOCK_SEQPACKET`:
+
+- Mensajes discretos (no stream): un send = un receive completo
+- Detección automática de desconexión: si el nodo muere, el router recibe error
+- Sin framing manual: el kernel delimita mensajes
+- Límite por mensaje: ~64-200KB (configurable)
+
+#### 11.2 Ubicación de Sockets
+
+Los nodos crean sus sockets en un directorio conocido:
+
+```
+/var/run/mesh/nodes/<uuid>.sock
+```
+
+Los routers monitorean este directorio con `inotify` para detectar nodos nuevos sin polling.
+
+#### 11.3 Modelo de Conexión
+
+El nodo es pasivo, el router es activo:
+
+**Nodo:**
+```
+socket() → bind() → listen(fd, 1) → accept()
+```
+
+**Router:**
+```
+inotify detecta socket nuevo → random backoff → connect()
+```
+
+El `listen(fd, 1)` con backlog 1 garantiza que solo un router puede conectar. El primero que hace `connect()` gana, los demás reciben error.
+
+#### 11.4 Detección de Link Down
+
+El socket señala automáticamente cuando el nodo muere:
+
+| Evento | Qué pasa | Acción del router |
+|--------|----------|-------------------|
+| Nodo termina limpio | `close()` del socket | Router recibe EOF en próximo read |
+| Nodo crashea | Kernel cierra socket | Router recibe `ECONNRESET` o `EPIPE` |
+| Nodo se cuelga | Timeout en operación | Router detecta por inactividad |
+
+No hay heartbeat ni polling. El kernel notifica.
 
 ### 12. Shared Memory
 
-*Por definir: estructura de la tabla de ruteo, estado de nodos, sincronización entre routers.*
+#### 12.1 Qué vive en Shared Memory
+
+| Dato | Propósito | Quién escribe | Quién lee |
+|------|-----------|---------------|-----------|
+| Tabla de ruteo | Rutas estáticas, VPNs, forwards | Admin/Config | Routers |
+| Registro de nodos | UUID ↔ nombre capa 2 ↔ router dueño | Router que conectó | Todos los routers |
+| Tabla de routers | Routers activos, hops entre ellos | Routers (HELLO/LSA) | Todos los routers |
+
+#### 12.2 Qué NO vive en Shared Memory
+
+| Dato | Por qué no | Dónde vive |
+|------|------------|------------|
+| Estado del link (up/down) | El socket lo indica | Local en cada router |
+| Carga del nodo | Cambia muy rápido, causaría contención | Local en cada router |
+| Cola de mensajes | Es del nodo, no de la red | Buffer del socket / nodo |
+
+#### 12.3 Estructura de Registro de Nodo
+
+```c
+struct node_entry {
+    uuid_t      uuid;           // Capa 1: identificador único
+    char        name[256];      // Capa 2: AI.soporte.l1.español
+    uuid_t      router_owner;   // Qué router lo tiene conectado
+    uint64_t    connected_at;   // Timestamp de conexión
+};
+```
+
+#### 12.4 Implementación en Node.js
+
+Addon nativo C++ usando:
+- `shm_open()` / `mmap()` para la región compartida
+- `pthread_rwlock` con `PTHREAD_PROCESS_SHARED` para sincronización
+
+El addon expone funciones simples:
+```javascript
+shm.getRoutes()
+shm.getNodes()
+shm.registerNode(uuid, name)
+shm.unregisterNode(uuid)
+shm.getRouters()
+```
 
 ### 13. Ciclo de Vida de Nodos
 
-*Por definir: registro de nodo, asignación a router, desconexión, cleanup.*
+#### 13.1 Registro (Nodo Nuevo)
+
+```
+1. Nodo arranca
+2. Genera UUID (capa 1)
+3. Crea socket en /var/run/mesh/nodes/<uuid>.sock
+4. listen(fd, 1)
+5. Router detecta socket nuevo (inotify)
+6. Router espera random backoff (0-100ms)
+7. Router intenta connect()
+   - Éxito: Router registra nodo en shared memory
+   - Falla: Otro router lo tomó, ignorar
+8. Router envía QUERY al nodo
+9. Nodo responde ANNOUNCE con su nombre capa 2
+10. Router actualiza registro con nombre
+11. Router envía BCAST_ANNOUNCE a la red
+```
+
+#### 13.2 Operación Normal
+
+```
+Nodo ←──socket──→ Router ←──shared memory──→ Otros Routers
+         │
+         ▼
+    Mensajes JSON
+```
+
+#### 13.3 Desconexión Limpia
+
+```
+1. Nodo decide apagar
+2. Nodo envía WITHDRAW al router
+3. Nodo hace close() del socket
+4. Router detecta cierre
+5. Router elimina nodo de shared memory
+6. Router envía actualización LSA a otros routers
+```
+
+#### 13.4 Desconexión por Falla
+
+```
+1. Nodo crashea o se cuelga
+2. Kernel cierra socket (o router detecta timeout)
+3. Router detecta error en próximo read/write
+4. Router elimina nodo de shared memory
+5. Router envía UNREACHABLE a nodos que tenían mensajes pendientes
+6. Router envía actualización LSA a otros routers
+```
+
+#### 13.5 Reconexión
+
+```
+1. Nodo se recupera, arranca de nuevo
+2. Genera mismo o nuevo UUID (política del nodo)
+3. Crea socket, listen()
+4. Router detecta, conecta, registra
+5. Flujo normal de QUERY/ANNOUNCE
+```
+
+### 14. Coordinación entre Routers
+
+#### 14.1 Descubrimiento de Routers
+
+Los routers se descubren entre sí mediante mensajes HELLO en un canal dedicado (socket o multicast en shared memory).
+
+#### 14.2 Random Backoff para Evitar Colisiones
+
+Cuando múltiples routers detectan un socket nuevo simultáneamente:
+
+```
+Router recibe inotify "socket nuevo"
+    │
+    ▼
+Espera random(0, connect_backoff_max) ms
+    │
+    ▼
+Intenta connect()
+    │
+    ├─ Éxito → Registra en shared memory
+    │
+    └─ Falla (ECONNREFUSED) → Otro router ganó, ignorar
+```
+
+Este mecanismo está probado en redes (CSMA/CD en Ethernet, CSMA/CA en WiFi).
+
+#### 14.3 Sincronización de Tablas
+
+```
+Router nuevo arranca
+    │
+    ▼
+Envía HELLO a otros routers
+    │
+    ▼
+Envía SYNC_REQUEST
+    │
+    ▼
+Recibe SYNC_REPLY con tabla completa
+    │
+    ▼
+Actualiza su vista local
+    │
+    ▼
+Comienza a enviar HELLO periódico
+```
+
+### 15. Timers del Sistema
+
+Basados en estándares de OSPF y BGP.
+
+#### 15.1 Timers de Mensaje
+
+| Timer | Default | Configurable | Propósito |
+|-------|---------|--------------|-----------|
+| **TTL** | 16 hops | Sí | Máximo saltos antes de drop |
+| **Message Timeout** | 30s | Sí | Tiempo máximo esperando respuesta |
+| **Retransmit Interval** | 5s | Sí | Reenviar si no hay ACK |
+
+#### 15.2 Timers de Router
+
+| Timer | Default | Configurable | Propósito |
+|-------|---------|--------------|-----------|
+| **Hello Interval** | 10s | Sí | Cada cuánto anunciar existencia a otros routers |
+| **Dead Interval** | 40s (4x hello) | Sí | Sin hello = router marcado como caído |
+| **Route Refresh** | 300s (5min) | Sí | Refrescar tabla de rutas entre routers |
+| **Connect Backoff Max** | 100ms | Sí | Máximo random delay antes de conectar a socket nuevo |
+
+#### 15.3 Timers de Nodo
+
+| Timer | Default | Configurable | Propósito |
+|-------|---------|--------------|-----------|
+| **Reconnect Interval** | 5s | Sí | Tiempo entre reintentos de conexión |
+| **Reconnect Max Attempts** | 10 | Sí | Intentos antes de desistir |
+
+#### 15.4 Configuración de Timers
+
+Los timers se configuran en el archivo de configuración del router:
+
+```json
+{
+  "timers": {
+    "ttl_default": 16,
+    "message_timeout": 30000,
+    "retransmit_interval": 5000,
+    "hello_interval": 10000,
+    "dead_interval": 40000,
+    "route_refresh": 300000,
+    "connect_backoff_max": 100
+  }
+}
+```
+
+Todos los valores en milisegundos excepto TTL (hops).
 
 ### 9. Tipos de Mensaje por Tamaño
 
@@ -548,15 +785,15 @@ El campo `meta.type: "system"` distingue mensajes de control de mensajes normale
 
 ## Parte IV: Routing
 
-### 12. Tabla de Ruteo Estática
+### 16. Tabla de Ruteo Estática
 
 *Por definir: formato de rutas, matching de destinos, prioridades.*
 
-### 13. Policies OPA
+### 17. Policies OPA
 
 *Por definir: estructura de policies, input/output contract, ejemplos.*
 
-### 14. Balanceo entre Nodos del Mismo Rol
+### 18. Balanceo entre Nodos del Mismo Rol
 
 *Por definir: estrategia cuando hay múltiples nodos con la capacidad requerida.*
 
@@ -564,19 +801,19 @@ El campo `meta.type: "system"` distingue mensajes de control de mensajes normale
 
 ## Parte V: Operación
 
-### 15. Estados de la Red
+### 19. Estados de la Red
 
 *Por definir: estados posibles de nodos y links, transiciones, eventos.*
 
-### 16. Eventos del Sistema
+### 20. Eventos del Sistema
 
 *Por definir: qué eventos se generan, quién los consume, formato.*
 
-### 17. Broadcast y Multicast
+### 21. Broadcast y Multicast
 
 *Por definir: cómo mandar un mensaje a múltiples destinos, casos de uso.*
 
-### 18. Mantenimiento y Administración
+### 22. Mantenimiento y Administración
 
 *Por definir: herramientas de diagnóstico, limpieza de links huérfanos, monitoreo.*
 
@@ -584,15 +821,15 @@ El campo `meta.type: "system"` distingue mensajes de control de mensajes normale
 
 ## Parte VI: Implementación
 
-### 19. Router: Loop Principal
+### 23. Router: Loop Principal
 
 *Por definir: pseudocódigo del ciclo epoll/read/route/write.*
 
-### 20. Librería de Nodo
+### 24. Librería de Nodo
 
 *Por definir: API para que los nodos se comuniquen con el router.*
 
-### 21. Addon de Shared Memory
+### 25. Addon de Shared Memory
 
 *Por definir: interfaz del módulo nativo para Node.js.*
 
