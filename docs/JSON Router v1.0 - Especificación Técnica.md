@@ -98,17 +98,184 @@ Forward directo      ┌──────────────────�
 
 ## Parte II: Protocolo de Mensajes
 
-### 6. Estructura del Mensaje
+### 6. Identificadores
 
-*Por definir: formato del header de routing, metadata requerida, payload.*
+El sistema usa dos capas de identificación independientes.
 
-### 7. Header de Routing
+#### 6.1 Identificador Capa 1 (UUID)
 
-*Por definir: campos mínimos para que el router tome decisiones sin parsear payload.*
+- **Formato**: UUID v4 (128 bits, auto-generado)
+- **Propósito**: Identificación única del nodo en la red
+- **Generación**: El nodo lo genera al arrancar, sin coordinación central
+- **Unicidad**: Garantizada por probabilidad matemática, no por validación
+- **Representación**: String estándar UUID o base64url (22 chars) si se requiere compacto
 
-### 8. Metadata para OPA
+```
+Ejemplo: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+```
 
-*Por definir: qué campos del mensaje se exponen a OPA para decisión de rol/capacidad.*
+#### 6.2 Identificador Capa 2 (Nombre Descriptivo)
+
+- **Formato**: Campos separados por punto (`.`)
+- **Máximo**: 10 campos
+- **Caracteres permitidos**: Alfanuméricos, guión bajo (`_`), guión medio (`-`). Sin espacios, sin caracteres especiales.
+- **Primer campo**: Obligatorio, indica tipo de nodo. Valores válidos: `AI`, `IO`, `WF`.
+- **Campos siguientes**: Libres, definen perfil/rol/capacidad según dominio.
+
+```
+Formato: <tipo>.<campo2>.<campo3>...<campoN>
+
+Ejemplos:
+  AI.soporte.l1.español
+  AI.ventas.bdr.tecnico.nocturno
+  IO.wapp.+5491155551234
+  IO.email.soporte
+  WF.notify.email
+  WF.data.crm.update
+```
+
+#### 6.3 Validación en Librería de Comunicación
+
+La librería de nodo DEBE validar antes de registrar:
+
+**Capa 1:**
+- UUID válido según RFC 4122
+
+**Capa 2:**
+- Mínimo 1 campo, máximo 10 campos
+- Primer campo es `AI`, `IO`, o `WF`
+- Cada campo contiene solo caracteres permitidos
+- Ningún campo vacío
+
+Mensajes con identificadores inválidos se rechazan antes de entrar a la red.
+
+#### 6.4 Relación entre Capas
+
+| Capa | Identifica | Único | Quién lo usa |
+|------|-----------|-------|--------------|
+| Capa 1 (UUID) | Instancia física del nodo | Sí, globalmente | Router para forwarding directo |
+| Capa 2 (Nombre) | Perfil/capacidad del nodo | No necesariamente | OPA para decisión de routing |
+
+Un mismo nombre capa 2 puede tener múltiples UUIDs (varios nodos con mismo perfil). El router resuelve cuál de ellos recibe el mensaje.
+
+### 7. Estructura del Mensaje
+
+Todo mensaje en la red tiene tres secciones:
+
+```json
+{
+  "routing": { ... },
+  "meta": { ... },
+  "payload": { ... }
+}
+```
+
+#### 7.1 Sección `routing` (Header de Red)
+
+Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisiones leyendo SOLO esta sección.
+
+```json
+{
+  "routing": {
+    "src": "uuid-origen",
+    "dst": "uuid-destino | null",
+    "ttl": 16,
+    "trace_id": "uuid-correlación"
+  }
+}
+```
+
+| Campo | Tipo | Obligatorio | Descripción |
+|-------|------|-------------|-------------|
+| `src` | UUID | Sí | Nodo origen del mensaje |
+| `dst` | UUID o null | Sí | Nodo destino. Si null, requiere resolución OPA |
+| `ttl` | int | Sí | Time-to-live, decrementa en cada hop. Si llega a 0, drop. |
+| `trace_id` | UUID | Sí | ID de correlación para trazabilidad |
+
+#### 7.2 Sección `meta` (Metadata para OPA)
+
+Usado por OPA para decisiones de capa 2. El router pasa esta sección completa a OPA sin interpretarla.
+
+```json
+{
+  "meta": {
+    "target": "AI.soporte.l1.español",
+    "priority": "high",
+    "context": {
+      "cliente_tier": "vip",
+      "caso_id": "12345",
+      "horario": "nocturno"
+    }
+  }
+}
+```
+
+| Campo | Tipo | Obligatorio | Descripción |
+|-------|------|-------------|-------------|
+| `target` | string (nombre capa 2) | Sí si dst es null | Perfil/capacidad requerida |
+| `priority` | string | No | Hint de prioridad para OPA |
+| `context` | object | No | Datos adicionales para reglas OPA |
+
+La estructura de `context` es libre y depende de las policies definidas.
+
+#### 7.3 Sección `payload` (Datos de Aplicación)
+
+El contenido del mensaje. Ni el router ni OPA lo leen. Solo el nodo destino lo procesa.
+
+```json
+{
+  "payload": {
+    "type": "text",
+    "content": "Hola, necesito ayuda con mi factura",
+    "attachments": []
+  }
+}
+```
+
+La estructura interna es libre y la definen los nodos.
+
+### 8. Flujo de Resolución
+
+```
+Mensaje llega al router
+        │
+        ▼
+  ┌─────────────────┐
+  │ Leer routing.dst │
+  └─────────────────┘
+        │
+        ▼
+  ┌─────────────────┐     dst tiene valor
+  │ ¿dst es null?   │ ───────────────────────► Forward directo a UUID
+  └─────────────────┘
+        │ dst es null
+        ▼
+  ┌─────────────────┐
+  │ Pasar meta a OPA │
+  └─────────────────┘
+        │
+        ▼
+  ┌─────────────────┐
+  │ OPA retorna     │
+  │ nombre capa 2   │
+  └─────────────────┘
+        │
+        ▼
+  ┌─────────────────────────┐
+  │ Router busca en tabla:  │
+  │ ¿qué UUIDs tienen ese   │
+  │ nombre?                 │
+  └─────────────────────────┘
+        │
+        ▼
+  ┌─────────────────┐
+  │ Elegir uno      │
+  │ (balanceo)      │
+  └─────────────────┘
+        │
+        ▼
+    Forward a UUID elegido
+```
 
 ---
 
