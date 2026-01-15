@@ -14,6 +14,7 @@ Este documento especifica un router de mensajes JSON diseñado para interconecta
 - **Agentes AI**: Nodos con capacidad LLM para procesamiento de lenguaje natural.
 - **Agentes WF**: Nodos con workflows estáticos y resolución determinística.
 - **Nodos IO**: Adaptadores de medio (WhatsApp, email, Instagram, chat, etc.).
+- **Nodos SY**: Infraestructura del sistema (tiempo, monitoreo, administración).
 
 El sistema se configura mediante dos mecanismos ortogonales:
 
@@ -80,7 +81,10 @@ Forward directo      ┌──────────────────�
 
 | Componente | Responsabilidad |
 |------------|-----------------|
-| Nodo | Crea su socket, espera conexión, procesa mensajes. Maneja su propio buffer largo si lo necesita. |
+| Nodo AI | Procesa mensajes con LLM, responde según perfil/rol. |
+| Nodo WF | Ejecuta workflows determinísticos. |
+| Nodo IO | Adapta medios externos (WhatsApp, email, etc.) al protocolo interno. |
+| Nodo SY | Provee servicios de infraestructura (tiempo, monitoreo, admin). |
 | Router | Detecta nodos, conecta sockets, mantiene tabla local, consulta OPA si hace falta, rutea, detecta link down. |
 | Shared Memory | Tabla de ruteo y estado de nodos. Compartida entre routers, no accesible por nodos. |
 | OPA (WASM) | Evalúa policies de negocio. No accede a estado del sistema. |
@@ -143,7 +147,7 @@ La librería de nodo DEBE validar antes de registrar:
 
 **Capa 2:**
 - Mínimo 1 campo, máximo 10 campos
-- Primer campo es `AI`, `IO`, o `WF`
+- Primer campo es `AI`, `IO`, `WF`, o `SY`
 - Cada campo contiene solo caracteres permitidos
 - Ningún campo vacío
 
