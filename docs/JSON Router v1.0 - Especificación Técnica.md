@@ -1,6 +1,6 @@
 # JSON Router - Especificación Técnica
 
-**Estado:** Draft v0.3
+**Estado:** Draft v0.4
 **Fecha:** 2025-01-16
 
 ---
@@ -769,81 +769,255 @@ No hay heartbeat ni polling. El kernel notifica.
 
 ### 13. Shared Memory
 
-La shared memory es el corazón de la coordinación entre routers. Contiene la tabla de ruteo (RIB), el registro de nodos conectados, y el registro de routers activos.
+La shared memory es el mecanismo de coordinación entre routers. Cada router tiene su propia región que solo él escribe, y todos los demás leen.
 
-#### 13.1 Conceptos de Redes Aplicados
+#### 13.1 Modelo: Una Región por Router
 
-El diseño sigue los conceptos estándar de routing:
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Isla "produccion"                              │
+│                                                                          │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐             │
+│  │  Router A    │     │  Router B    │     │  Router C    │             │
+│  │              │     │              │     │              │             │
+│  │ ┌──────────┐ │     │ ┌──────────┐ │     │ ┌──────────┐ │             │
+│  │ │ SHM-A    │ │     │ │ SHM-A    │ │     │ │ SHM-A    │ │             │
+│  │ │(WRITER)  │◄├────►├─┤(reader)  │◄├────►├─┤(reader)  │ │             │
+│  │ └──────────┘ │     │ └──────────┘ │     │ └──────────┘ │             │
+│  │ ┌──────────┐ │     │ ┌──────────┐ │     │ ┌──────────┐ │             │
+│  │ │ SHM-B    │ │     │ │ SHM-B    │ │     │ │ SHM-B    │ │             │
+│  │ │(reader)  │◄├────►├─┤(WRITER)  │◄├────►├─┤(reader)  │ │             │
+│  │ └──────────┘ │     │ └──────────┘ │     │ └──────────┘ │             │
+│  │ ┌──────────┐ │     │ ┌──────────┐ │     │ ┌──────────┐ │             │
+│  │ │ SHM-C    │ │     │ │ SHM-C    │ │     │ │ SHM-C    │ │             │
+│  │ │(reader)  │◄├────►├─┤(reader)  │◄├────►├─┤(WRITER)  │ │             │
+│  │ └──────────┘ │     │ └──────────┘ │     │ └──────────┘ │             │
+│  └──────────────┘     └──────────────┘     └──────────────┘             │
+│                                                                          │
+│  Cada router:                                                            │
+│  - ESCRIBE solo en SU región (es el único writer)                       │
+│  - LEE las regiones de TODOS los otros routers                          │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Principio clave:** Cada región tiene exactamente un writer (su dueño) y múltiples readers (todos los demás). Esto permite usar seqlock sin conflictos.
+
+#### 13.2 Naming de Regiones
+
+El nombre de la región incluye el UUID del router dueño:
+
+```
+/jsr-<router_uuid>
+```
+
+Ejemplo:
+```
+/jsr-a1b2c3d4-e5f6-7890-abcd-ef1234567890
+```
+
+#### 13.3 Descubrimiento de Regiones via HELLO
+
+Los routers descubren las regiones de sus peers mediante el mensaje HELLO. El HELLO incluye el nombre de la región shm:
+
+```json
+{
+  "meta": {
+    "type": "system",
+    "msg": "HELLO"
+  },
+  "payload": {
+    "router_id": "uuid-router-a",
+    "island_id": "produccion",
+    "shm_name": "/jsr-a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "...": "..."
+  }
+}
+```
+
+**Flujo de descubrimiento:**
+
+```
+1. Router A arranca, crea su región /jsr-<uuid-A>
+2. Router A envía HELLO a la red (broadcast o a peers conocidos)
+3. Router B recibe HELLO de A
+4. Router B extrae shm_name del HELLO
+5. Router B mapea /jsr-<uuid-A> en modo read-only
+6. Router B ahora puede leer los nodos y rutas de A
+7. Router B responde con su propio HELLO (incluye su shm_name)
+8. Router A mapea /jsr-<uuid-B>
+```
+
+#### 13.4 Contenido de Cada Región
+
+Cada router escribe en SU región únicamente:
+
+| Dato | Descripción |
+|------|-------------|
+| **Sus nodos** | Nodos conectados directamente a este router |
+| **Sus rutas CONNECTED** | Rutas automáticas por nodos locales |
+| **Sus rutas STATIC** | Rutas configuradas en este router |
+| **Su estado** | owner_pid, heartbeat, timestamps |
+
+**NO escribe:**
+- Rutas de otros routers (esas las lee de sus regiones)
+- Nodos de otros routers (esas las lee de sus regiones)
+
+#### 13.5 Vista Consolidada (FIB)
+
+Cada router construye su FIB **en memoria local** (no en shm) leyendo todas las regiones:
+
+```
+FIB local = merge(
+    mi_shm.nodes,
+    mi_shm.routes,
+    peer_A_shm.nodes,    // Se convierten en rutas con admin_distance = AD_LSA
+    peer_A_shm.routes,
+    peer_B_shm.nodes,
+    peer_B_shm.routes,
+    ...
+)
+```
+
+Los nodos de otros routers se tratan como rutas aprendidas (LSA) con `admin_distance = AD_LSA`.
+
+#### 13.6 Conceptos de Redes Aplicados
 
 | Concepto | En redes IP | En este sistema |
 |----------|-------------|-----------------|
-| **RIB** (Routing Information Base) | Todas las rutas candidatas | `RouteEntry[]` con todas las rutas |
-| **FIB** (Forwarding Information Base) | Rutas ganadoras para forwarding rápido | Cache en memoria del router (derivado de RIB) |
+| **RIB** (Routing Information Base) | Todas las rutas candidatas | Datos en todas las regiones shm |
+| **FIB** (Forwarding Information Base) | Rutas ganadoras para forwarding rápido | Cache en memoria local del router |
 | **Next-hop** | Router vecino al que enviar | `next_hop_router` en RouteEntry |
 | **Admin distance** | Preferencia por origen de ruta | `admin_distance` (CONNECTED < STATIC < LSA) |
 | **LPM** (Longest Prefix Match) | Matcheo más específico gana | `prefix_len` + `match_kind` |
 
-#### 13.2 Layout de la Región
+#### 13.7 Layout de la Región
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ ShmHeader (64 bytes)                                        │
-│ - magic, version, seq (seqlock), counts, timestamps         │
+│ ShmHeader (128 bytes)                                       │
+│ - magic, version, seq (seqlock), owner info, timestamps     │
 ├─────────────────────────────────────────────────────────────┤
 │ NodeEntry[MAX_NODES] (1024 entries)                         │
-│ - Nodos conectados a la red                                 │
+│ - Nodos conectados a ESTE router                            │
 ├─────────────────────────────────────────────────────────────┤
 │ RouteEntry[MAX_ROUTES] (256 entries)                        │
-│ - Tabla de ruteo (RIB)                                      │
-├─────────────────────────────────────────────────────────────┤
-│ RouterEntry[MAX_ROUTERS] (16 entries)                       │
-│ - Routers activos en la red                                 │
+│ - Rutas CONNECTED y STATIC de ESTE router                   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-#### 13.3 Sincronización: Seqlock
+**Nota:** No hay `RouterEntry[]` en cada región. La lista de routers se construye dinámicamente a partir de los HELLOs recibidos y las regiones mapeadas.
 
-En lugar de locks tradicionales (que no funcionan bien entre procesos), se usa **seqlock**:
+#### 13.8 Sincronización: Seqlock
 
-- Un solo writer (router activo) + múltiples readers (otros routers, herramientas)
-- Header contiene `seq: u64` atómico
-- Sin deadlocks, sin contención
+Cada región tiene exactamente un writer (su dueño), lo que permite usar seqlock sin conflictos:
 
-**Protocolo del Writer:**
+- Header contiene `seq: u64`
+- Sin locks, sin deadlocks, sin contención
+
+**Protocolo del Writer (solo el router dueño):**
 ```
 1. seq++ (queda impar = "escribiendo")
 2. Escribir datos
-3. seq++ (queda par = "snapshot consistente")
+3. memory_barrier()
+4. seq++ (queda par = "snapshot consistente")
 ```
 
-**Protocolo del Reader:**
+**Protocolo del Reader (todos los demás):**
 ```
-1. Leer seq (si impar, esperar/reintentar)
-2. Copiar datos que necesita
-3. Leer seq de nuevo
-4. Si cambió, descartar y reintentar desde paso 1
+1. Leer seq
+2. Si impar, spin/yield y volver a 1
+3. memory_barrier()
+4. Copiar datos que necesita
+5. memory_barrier()
+6. Leer seq de nuevo
+7. Si cambió, descartar y volver a 1
 ```
 
-#### 13.4 Constantes
+#### 13.9 Inicialización y Recuperación
+
+##### ¿Quién crea la región?
+
+Cada router crea su propia región al arrancar.
+
+##### Detección de región stale (crash anterior)
+
+El header incluye campos para detectar si el dueño anterior crasheó:
+
+```rust
+pub struct ShmHeader {
+    // ... otros campos ...
+    pub owner_pid: u32,      // PID del proceso dueño
+    pub heartbeat: u64,      // Epoch ms, actualizado periódicamente
+}
+```
+
+**Al arrancar:**
+```
+1. Intentar abrir región existente con mi UUID
+2. Si existe:
+   a. Leer owner_pid
+   b. Verificar si el proceso está vivo: kill(owner_pid, 0)
+   c. Si el proceso NO existe → región stale → borrar y recrear
+   d. Si el proceso existe pero heartbeat > 30s → región stale → borrar y recrear
+   e. Si el proceso existe y heartbeat reciente → ERROR: otro proceso usa mi UUID
+3. Si no existe:
+   a. Crear región nueva
+   b. Inicializar header con magic, version, mi pid, etc.
+```
+
+##### Heartbeat
+
+El router dueño actualiza `heartbeat` periódicamente (cada 5 segundos):
+
+```rust
+// En el loop principal del router
+loop {
+    // ... procesar mensajes ...
+    
+    if tiempo_desde_ultimo_heartbeat > 5_seconds {
+        seqlock_write_begin();
+        header.heartbeat = now_epoch_ms();
+        seqlock_write_end();
+    }
+}
+```
+
+Los readers pueden verificar el heartbeat para detectar regiones de routers muertos.
+
+##### Detección de peer muerto (desde reader)
+
+Cuando un router lee la región de un peer:
+
+```
+1. Verificar heartbeat del peer
+2. Si heartbeat > dead_interval (ej. 30s):
+   a. Considerar peer como muerto
+   b. Dejar de usar sus rutas en la FIB
+   c. Intentar desmapear la región (o esperar a que desaparezca)
+```
+
+#### 13.10 Constantes
 
 ```rust
 // Identificación
-pub const SHM_MAGIC: u32 = 0x4A534852;  // "JSHR" en ASCII
+pub const SHM_MAGIC: u32 = 0x4A535352;  // "JSSR" en ASCII
 pub const SHM_VERSION: u32 = 1;
-pub const SHM_NAME: &str = "/json-router-shm";
+pub const SHM_NAME_PREFIX: &str = "/jsr-";
 
-// Capacidades por isla
-pub const MAX_NODES: u32 = 1024;
-pub const MAX_ROUTES: u32 = 256;
-pub const MAX_ROUTERS: u32 = 16;
+// Capacidades por router
+pub const MAX_NODES: u32 = 1024;    // Nodos por router
+pub const MAX_ROUTES: u32 = 256;    // Rutas por router
+pub const MAX_PEERS: usize = 16;    // Máximo de peers mapeados
 
 // Tamaños de campos
 pub const NAME_MAX_LEN: usize = 256;
 pub const ISLAND_ID_MAX_LEN: usize = 64;
+pub const SHM_NAME_MAX_LEN: usize = 64;
 
 // Flags de estado
 pub const FLAG_ACTIVE: u16 = 0x0001;
-pub const FLAG_DELETED: u16 = 0x0002;  // Marcado para cleanup
+pub const FLAG_DELETED: u16 = 0x0002;  // Marcado para reusar slot
 
 // Match kinds (para rutas)
 pub const MATCH_EXACT: u8 = 0;   // "AI.soporte.l1" matchea solo eso
@@ -853,19 +1027,22 @@ pub const MATCH_GLOB: u8 = 2;    // Patterns con wildcards
 // Tipos de ruta (route_type)
 pub const ROUTE_CONNECTED: u8 = 0;  // Nodo conectado directamente
 pub const ROUTE_STATIC: u8 = 1;     // Configurada manualmente
-pub const ROUTE_LSA: u8 = 2;        // Aprendida de otro router
 
 // Admin distances (menor = preferido)
-pub const AD_CONNECTED: u16 = 0;   // Siempre preferir nodos locales
-pub const AD_STATIC: u16 = 1;      // Rutas manuales
-pub const AD_LSA: u16 = 10;        // Rutas aprendidas
+pub const AD_CONNECTED: u16 = 0;    // Siempre preferir nodos locales
+pub const AD_STATIC: u16 = 1;       // Rutas manuales
+pub const AD_REMOTE: u16 = 10;      // Nodos/rutas de otros routers
 
 // Identificadores de link
-pub const LINK_LOCAL: u32 = 0;     // Nodo conectado localmente
+pub const LINK_LOCAL: u32 = 0;      // Nodo conectado localmente
 // LINK 1..N = uplinks WAN a otros routers
+
+// Timers de shared memory
+pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;    // Actualizar heartbeat cada 5s
+pub const HEARTBEAT_STALE_MS: u64 = 30_000;      // Heartbeat > 30s = stale
 ```
 
-#### 13.5 Estructuras de Datos
+#### 13.11 Estructuras de Datos
 
 Todas las estructuras usan `#[repr(C)]` para layout determinístico en memoria.
 
@@ -874,213 +1051,267 @@ Todas las estructuras usan `#[repr(C)]` para layout determinístico en memoria.
 ```rust
 #[repr(C)]
 pub struct ShmHeader {
-    // Identificación (8 bytes)
+    // === IDENTIFICACIÓN (8 bytes) ===
     pub magic: u32,              // SHM_MAGIC para validar
     pub version: u32,            // SHM_VERSION para compatibilidad
     
-    // Padding para alinear seq a 8 bytes (8 bytes)
-    pub _pad0: u64,
+    // === OWNER (24 bytes) ===
+    pub router_uuid: [u8; 16],   // UUID del router dueño
+    pub owner_pid: u32,          // PID del proceso dueño
+    pub _pad0: u32,
     
-    // Seqlock (8 bytes)
+    // === SEQLOCK (8 bytes) ===
     pub seq: u64,                // Impar=escribiendo, par=consistente
     
-    // Contadores actuales (12 bytes)
-    pub node_count: u32,         // Nodos activos
-    pub route_count: u32,        // Rutas activas
-    pub router_count: u32,       // Routers activos
+    // === CONTADORES (8 bytes) ===
+    pub node_count: u32,         // Nodos activos en esta región
+    pub route_count: u32,        // Rutas activas en esta región
     
-    // Capacidades máximas (12 bytes)
+    // === CAPACIDADES (8 bytes) ===
     pub node_max: u32,           // MAX_NODES
     pub route_max: u32,          // MAX_ROUTES
-    pub router_max: u32,         // MAX_ROUTERS
     
-    // Timestamps (16 bytes)
+    // === TIMESTAMPS (24 bytes) ===
     pub created_at: u64,         // Epoch ms cuando se creó
-    pub updated_at: u64,         // Epoch ms última modificación
+    pub updated_at: u64,         // Epoch ms última modificación de datos
+    pub heartbeat: u64,          // Epoch ms último heartbeat del owner
+    
+    // === ISLA (66 bytes) ===
+    pub island_id: [u8; 64],     // "produccion", "staging", etc.
+    pub island_id_len: u16,
+    
+    // === RESERVADO (46 bytes para llegar a 192) ===
+    pub _reserved: [u8; 46],
 }
-// Total: 64 bytes
+// Total: 192 bytes (alineado a 64)
 ```
 
 ##### NodeEntry
 
-Registro de un nodo conectado a la red.
+Registro de un nodo conectado a este router.
 
 ```rust
 #[repr(C)]
 pub struct NodeEntry {
-    // Identificación (16 bytes)
+    // === IDENTIFICACIÓN (16 bytes) ===
     pub uuid: [u8; 16],          // UUID del nodo (capa 1)
     
-    // Nombre capa 2 (258 bytes)
-    pub name: [u8; 256],         // "AI.soporte.l1.español"
-    pub name_len: u16,           // Longitud real del nombre
+    // === NOMBRE CAPA 2 (258 bytes) ===
+    pub name: [u8; 256],         // "AI.soporte.l1.español" (UTF-8)
+    pub name_len: u16,           // Longitud en bytes
     
-    // Ownership (18 bytes)
-    pub router_uuid: [u8; 16],   // UUID del router que lo tiene conectado
-    pub flags: u16,              // FLAG_ACTIVE, etc.
-    
-    // Timestamps (8 bytes)
+    // === ESTADO (10 bytes) ===
+    pub flags: u16,              // FLAG_ACTIVE, FLAG_DELETED
     pub connected_at: u64,       // Epoch ms cuando conectó
     
-    // Reservado para futuro (28 bytes)
+    // === RESERVADO (28 bytes) ===
     pub _reserved: [u8; 28],
 }
-// Total: 328 bytes
-// Con 1024 entries: 328 KB
+// Total: 312 bytes
+// Con 1024 entries: ~312 KB
 ```
+
+**Nota:** `router_uuid` no está en NodeEntry porque todos los nodos en una región pertenecen al router dueño de esa región.
 
 ##### RouteEntry
 
-Entrada en la tabla de ruteo (RIB). Sigue el modelo de routing de redes.
+Entrada en la tabla de ruteo. Solo rutas CONNECTED y STATIC de este router.
 
 ```rust
 #[repr(C)]
 pub struct RouteEntry {
     // === MATCHING (260 bytes) ===
-    pub prefix: [u8; 256],       // Pattern a matchear: "AI.soporte.*"
+    pub prefix: [u8; 256],       // Pattern a matchear: "AI.soporte.*" (UTF-8)
     pub prefix_len: u16,         // Longitud en bytes del prefix
     pub match_kind: u8,          // MATCH_EXACT, MATCH_PREFIX, MATCH_GLOB
-    pub _pad0: u8,
+    pub route_type: u8,          // ROUTE_CONNECTED, ROUTE_STATIC
     
     // === FORWARDING (24 bytes) ===
-    pub next_hop_router: [u8; 16], // UUID del router vecino (next-hop)
+    pub next_hop_router: [u8; 16], // UUID del router next-hop (para STATIC via WAN)
     pub out_link: u32,           // 0=local, 1..N=uplink WAN id
     pub metric: u32,             // Costo de esta ruta
     
     // === SELECCIÓN (4 bytes) ===
-    pub admin_distance: u16,     // AD_CONNECTED, AD_STATIC, AD_LSA
-    pub route_type: u8,          // ROUTE_CONNECTED, ROUTE_STATIC, ROUTE_LSA
-    pub flags: u8,               // FLAG_ACTIVE, etc.
+    pub admin_distance: u16,     // AD_CONNECTED, AD_STATIC
+    pub flags: u16,              // FLAG_ACTIVE, FLAG_DELETED
     
     // === METADATA (16 bytes) ===
     pub installed_at: u64,       // Epoch ms cuando se instaló
     pub _reserved: [u8; 8],
 }
 // Total: 304 bytes
-// Con 256 entries: 76 KB
+// Con 256 entries: ~76 KB
 ```
 
 **Campos de matching:**
-- `prefix`: El pattern contra el que se matchea. Puede ser nombre exacto, prefijo, o glob.
-- `prefix_len`: Permite comparaciones rápidas sin buscar null-terminator.
-- `match_kind`: Define cómo interpretar el prefix.
+- `prefix`: Pattern contra el que se matchea (UTF-8).
+- `prefix_len`: Longitud en bytes, permite comparaciones rápidas.
+- `match_kind`: EXACT, PREFIX, o GLOB.
 
 **Campos de forwarding:**
-- `next_hop_router`: El router VECINO al que enviar, no el destino final. Esto es routing hop-by-hop.
-- `out_link`: Por qué interfaz sale. 0=es un nodo local, 1..N=uplinks WAN.
-- `metric`: Para seleccionar entre múltiples rutas al mismo destino.
+- `next_hop_router`: Para rutas STATIC que van por WAN, el router vecino.
+- `out_link`: 0 = nodo local, 1..N = uplink WAN.
+- `metric`: Costo para selección entre rutas equivalentes.
 
-**Campos de selección:**
-- `admin_distance`: Preferencia por origen. Menor gana. CONNECTED < STATIC < LSA.
-- `route_type`: De dónde vino esta ruta.
+#### 13.12 Encoding de Strings
 
-##### RouterEntry
+**UTF-8** para `name`, `prefix`, e `island_id`.
 
-Registro de un router en la red (para coordinación multi-router).
+- Los nombres pueden contener caracteres Unicode: "AI.soporte.español", "日本語"
+- `name_len`, `prefix_len`, `island_id_len` son longitud en **bytes**, no caracteres
+- La validación de caracteres permitidos aplica a **code points**:
 
 ```rust
-#[repr(C)]
-pub struct RouterEntry {
-    // Identificación (16 bytes)
-    pub uuid: [u8; 16],          // UUID del router
-    
-    // Isla (66 bytes)
-    pub island_id: [u8; 64],     // "produccion", "staging", etc.
-    pub island_id_len: u16,      // Longitud real
-    
-    // Estado (10 bytes)
-    pub flags: u16,              // FLAG_ACTIVE, etc.
-    pub last_hello: u64,         // Epoch ms del último HELLO recibido
-    
-    // Reservado (36 bytes)
-    pub _reserved: [u8; 36],
+fn validate_name(name: &str) -> bool {
+    name.chars().all(|c| {
+        c.is_alphanumeric() || c == '_' || c == '-' || c == '.'
+    })
 }
-// Total: 128 bytes
-// Con 16 entries: 2 KB
 ```
 
-#### 13.6 Qué vive en Shared Memory
+#### 13.13 Qué vive en Shared Memory (por región)
 
-| Dato | Tabla | Quién escribe | Quién lee |
-|------|-------|---------------|-----------|
-| Nodos conectados | `NodeEntry[]` | Router que conectó | Todos los routers |
-| Rutas estáticas | `RouteEntry[]` | Admin/Config | Todos los routers |
-| Rutas aprendidas | `RouteEntry[]` | Routers (via LSA) | Todos los routers |
-| Routers activos | `RouterEntry[]` | Routers (via HELLO) | Todos los routers |
+| Dato | Quién escribe | Descripción |
+|------|---------------|-------------|
+| Header | Router dueño | Identificación, seqlock, heartbeat |
+| Nodos | Router dueño | Nodos conectados a este router |
+| Rutas CONNECTED | Router dueño | Una por cada nodo local |
+| Rutas STATIC | Router dueño | Configuradas manualmente |
 
-#### 13.7 Qué NO vive en Shared Memory
+#### 13.14 Qué NO vive en Shared Memory
 
 | Dato | Por qué no | Dónde vive |
 |------|------------|------------|
-| Estado del socket (up/down) | El socket lo indica | Local en cada router |
-| FIB compilada | Es derivada y cambia por router | Cache local del router |
-| Carga del nodo | Cambia muy rápido | Local en cada router |
-| Cola de mensajes | Es del nodo | Buffer del socket / nodo |
+| Lista de routers peers | Dinámica, via HELLOs | Memoria local del router |
+| FIB compilada | Derivada de todas las regiones | Memoria local del router |
+| Estado del socket | El socket lo indica | Local en cada router |
+| Rutas de otros routers | Cada uno las tiene en su región | Se leen, no se copian |
 
-#### 13.8 Algoritmo de Selección de Ruta
+#### 13.15 Construcción de la FIB
 
-Cuando el router necesita encontrar la mejor ruta para un destino:
+El router construye su FIB en memoria local leyendo todas las regiones:
 
 ```
-1. Buscar todas las RouteEntry que matchean el destino
-2. Filtrar solo las que tienen FLAG_ACTIVE
+FIB = []
+
+// 1. Agregar mis rutas (prioridad máxima)
+for route in mi_region.routes:
+    if route.flags & FLAG_ACTIVE:
+        FIB.add(route)
+
+// 2. Agregar nodos de peers como rutas remotas
+for peer_region in peers_mapeados:
+    if peer_region.heartbeat es reciente:
+        for node in peer_region.nodes:
+            if node.flags & FLAG_ACTIVE:
+                // Crear ruta sintética
+                FIB.add(RouteEntry {
+                    prefix: node.name,
+                    prefix_len: node.name_len,
+                    match_kind: MATCH_EXACT,
+                    next_hop_router: peer_region.router_uuid,
+                    out_link: uplink_to_peer,
+                    admin_distance: AD_REMOTE,
+                    route_type: ROUTE_LSA,  // Tratada como aprendida
+                    ...
+                })
+
+// 3. Agregar rutas STATIC de peers
+for peer_region in peers_mapeados:
+    for route in peer_region.routes:
+        if route.flags & FLAG_ACTIVE && route.route_type == ROUTE_STATIC:
+            // Propagar con admin_distance incrementado
+            FIB.add(route con admin_distance = AD_REMOTE)
+
+// 4. Ordenar FIB para lookup rápido
+FIB.sort_by(|a, b| {
+    // LPM: más específico primero
+    // Luego admin_distance menor
+    // Luego metric menor
+})
+```
+
+#### 13.16 Algoritmo de Selección de Ruta
+
+Cuando el router necesita encontrar destino para un mensaje:
+
+```
+1. Buscar en FIB todas las rutas que matchean el destino
+2. Filtrar solo FLAG_ACTIVE
 3. Ordenar por:
-   a. prefix_len descendente (más específico primero = LPM)
-   b. admin_distance ascendente (menor preferido)
+   a. prefix_len descendente (LPM: más específico primero)
+   b. admin_distance ascendente (menor = preferido)
    c. metric ascendente (menor costo)
 4. Tomar la primera (ganadora)
-5. Si next_hop_router == mi_uuid y out_link == 0:
-   → Es un nodo local, entregar directamente
+5. Si out_link == LINK_LOCAL:
+   → Es un nodo local, entregar directamente por socket
 6. Si out_link > 0:
    → Enviar por ese uplink WAN al next_hop_router
 ```
 
-#### 13.9 Operaciones Principales
+#### 13.17 Operaciones de Escritura (solo el router dueño)
 
 **Registrar nodo (cuando conecta):**
 ```
-1. Buscar slot libre en NodeEntry[] (flags != FLAG_ACTIVE)
-2. Seqlock: seq++
-3. Escribir uuid, name, router_uuid, connected_at
-4. Marcar FLAG_ACTIVE
-5. Incrementar node_count
-6. Seqlock: seq++
-7. Crear RouteEntry tipo CONNECTED apuntando al nodo
+1. Buscar slot libre en NodeEntry[] (flags == 0 o FLAG_DELETED)
+2. seqlock_begin_write()  // seq++
+3. Escribir uuid, name, name_len, connected_at
+4. flags = FLAG_ACTIVE
+5. node_count++
+6. updated_at = now()
+7. seqlock_end_write()    // seq++
+8. Crear RouteEntry CONNECTED para el nodo
 ```
 
 **Desregistrar nodo (cuando desconecta):**
 ```
 1. Buscar NodeEntry por uuid
-2. Seqlock: seq++
-3. Marcar FLAG_DELETED (no borrar, para evitar huecos)
-4. Decrementar node_count
-5. Marcar FLAG_DELETED en RouteEntry asociada
-6. Decrementar route_count
-7. Seqlock: seq++
+2. seqlock_begin_write()
+3. flags = FLAG_DELETED
+4. node_count--
+5. Marcar RouteEntry asociada como FLAG_DELETED
+6. route_count--
+7. updated_at = now()
+8. seqlock_end_write()
 ```
 
-**Agregar ruta estática:**
+**Actualizar heartbeat:**
 ```
-1. Buscar slot libre en RouteEntry[]
-2. Seqlock: seq++
-3. Escribir prefix, next_hop_router, admin_distance=AD_STATIC, route_type=ROUTE_STATIC
-4. Marcar FLAG_ACTIVE
-5. Incrementar route_count
-6. Seqlock: seq++
+1. seqlock_begin_write()
+2. heartbeat = now()
+3. seqlock_end_write()
 ```
 
-#### 13.10 Tamaño Total de la Región
+#### 13.18 Cleanup de Slots FLAG_DELETED
+
+**Política:** No compactar en tiempo real. Reusar slots.
+
+```rust
+fn find_free_slot<T>(entries: &[T]) -> Option<usize> 
+where T: HasFlags 
+{
+    entries.iter().position(|e| {
+        let flags = e.flags();
+        flags == 0 || (flags & FLAG_DELETED) != 0
+    })
+}
+```
+
+Si no hay slots libres (`node_count == node_max`), rechazar nuevas conexiones con error.
+
+**Compactación offline (opcional):** Una herramienta puede compactar cuando el router está apagado.
+
+#### 13.19 Tamaño Total de la Región
 
 ```
-ShmHeader:     64 bytes
-NodeEntry[]:   328 * 1024 = 335,872 bytes (~328 KB)
+ShmHeader:     192 bytes
+NodeEntry[]:   312 * 1024 = 319,488 bytes (~312 KB)
 RouteEntry[]:  304 * 256  =  77,824 bytes (~76 KB)
-RouterEntry[]: 128 * 16   =   2,048 bytes (~2 KB)
-─────────────────────────────────────────────────
-Total:                      415,808 bytes (~406 KB)
+─────────────────────────────────────────────────────
+Total:                      397,504 bytes (~388 KB)
 ```
 
-Redondeado a 512 KB o 1 MB para tener margen.
+Redondeado a **512 KB** para tener margen.
 
 ### 14. Ciclo de Vida de Nodos
 
@@ -1577,6 +1808,7 @@ Router A                              Router B
     "protocol": "json-router/1",
     "router_id": "uuid-router-a",
     "island_id": "isla-produccion",
+    "shm_name": "/jsr-a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     "capabilities": {
       "sync": true,
       "lsa": true,
@@ -1595,8 +1827,17 @@ Router A                              Router B
 | `protocol` | Versión del protocolo para compatibilidad |
 | `router_id` | UUID del router |
 | `island_id` | Identificador de la isla (dominio) |
+| `shm_name` | Nombre de la región de shared memory del router (para descubrimiento) |
 | `capabilities` | Qué soporta este router |
 | `timers` | Intervalos de hello/dead para sincronizar |
+
+**Descubrimiento de shared memory via HELLO:**
+
+Al recibir un HELLO de un peer, el router:
+1. Extrae `shm_name` del payload
+2. Mapea la región en modo read-only: `shm_open(shm_name, O_RDONLY)`
+3. Valida magic y version
+4. Comienza a leer nodos y rutas del peer para construir su FIB
 
 #### 19.7 Payload de UPLINK_ACCEPT
 
@@ -1766,17 +2007,30 @@ Recibidas de otros routers via mensajes LSA. El router instala estas rutas con `
 
 #### 26.1 Herramienta shm-watch
 
-Herramienta de línea de comandos para visualizar la shared memory en tiempo real:
+Herramienta de línea de comandos para visualizar las regiones de shared memory en tiempo real:
 
 ```bash
-shm-watch --shm /json-router-shm --refresh 1s
+# Ver todas las regiones detectadas
+shm-watch --discover --refresh 1s
+
+# Ver una región específica
+shm-watch --shm /jsr-a1b2c3d4-e5f6-7890-abcd-ef1234567890 --refresh 1s
+
+# Ver todas las regiones de una isla
+shm-watch --island produccion --refresh 1s
 ```
 
-Muestra:
-- Header: version, seq, counts, timestamps
+Muestra por cada región:
+- Header: router_uuid, owner_pid, heartbeat, seq, counts
+- Estado: ALIVE / STALE (basado en heartbeat)
 - Tabla de nodos activos
 - Tabla de rutas
-- Tabla de routers
+
+**Modo consolidado:**
+```bash
+shm-watch --all --refresh 1s
+```
+Muestra la vista consolidada (FIB) combinando todas las regiones.
 
 #### 26.2 Limpieza de Recursos
 
@@ -1811,12 +2065,14 @@ Muestra:
 - **Rol**: Capacidad abstracta de un nodo (ej: "soporte", "facturación").
 - **Framing**: Delimitación de mensajes en un stream de bytes (length prefix).
 - **Isla**: Dominio local con su propio router, conectado a otras islas via WAN.
-- **RIB**: Routing Information Base - todas las rutas candidatas.
-- **FIB**: Forwarding Information Base - rutas ganadoras para forwarding rápido.
+- **Región shm**: Área de shared memory de un router específico (cada router tiene la suya).
+- **RIB**: Routing Information Base - todas las rutas candidatas (distribuidas en múltiples regiones).
+- **FIB**: Forwarding Information Base - rutas ganadoras compiladas en memoria local.
 - **Next-hop**: Router vecino al que enviar un mensaje (no el destino final).
 - **LPM**: Longest Prefix Match - la ruta más específica gana.
 - **Admin Distance**: Preferencia por origen de ruta (menor = preferido).
 - **Seqlock**: Mecanismo de sincronización para un writer y múltiples readers.
+- **Heartbeat**: Timestamp actualizado periódicamente para detectar procesos muertos.
 
 ### B. Decisiones de Diseño
 
@@ -1825,10 +2081,14 @@ Muestra:
 | `SOCK_STREAM` con framing | `SOCK_SEQPACKET` | Compatibilidad con Node.js, consistencia con WAN |
 | Rust para router | Node.js | Performance, acceso a syscalls POSIX |
 | Framing `uint32_be + JSON` | Delimitador de línea | Mensajes pueden contener newlines, binary-safe |
-| Shared memory con seqlock | RwLock / Mutex | RwLock no es process-shared en Rust, seqlock es más simple |
+| Una región shm por router | Una región compartida por todos | Evita conflictos de escritura, seqlock funciona sin locks |
+| Descubrimiento de shm via HELLO | Directorio fijo / scanning | Mecanismo natural, ya existe HELLO |
+| Seqlock | RwLock / Mutex | RwLock no es process-shared en Rust, seqlock sin deadlocks |
 | Shared memory para tablas | Redis/etcd | Latencia, sin dependencias externas |
 | RouteEntry con next-hop | Destino final | Modelo estándar de redes, routing hop-by-hop |
 | Strings con length explícito | Null-terminated | Comparaciones rápidas, evita escanear 256 bytes |
+| UTF-8 para strings | ASCII estricto | Soporte internacional (español, etc.) |
+| Heartbeat para detectar stale | Solo verificar PID | PID puede ser reciclado, heartbeat más confiable |
 
 ### C. Referencias
 
