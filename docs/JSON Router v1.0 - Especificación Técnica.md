@@ -1,6 +1,6 @@
 # JSON Router - Especificación Técnica
 
-**Estado:** Draft v0.5
+**Estado:** Draft v0.6
 **Fecha:** 2025-01-16
 
 ---
@@ -895,8 +895,8 @@ Los nodos de otros routers se tratan como rutas aprendidas (LSA) con `admin_dist
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ ShmHeader (128 bytes)                                       │
-│ - magic, version, seq (seqlock), owner info, timestamps     │
+│ ShmHeader (192 bytes)                                       │
+│ - magic, version, owner info, seqlock, timestamps           │
 ├─────────────────────────────────────────────────────────────┤
 │ NodeEntry[MAX_NODES] (1024 entries)                         │
 │ - Nodos conectados a ESTE router                            │
@@ -1006,16 +1006,34 @@ pub struct ShmHeader {
    b. Inicializar header con magic, version, mi pid, start_time, generation=1
 ```
 
-**Obtener start_time del proceso (Linux):**
+**Obtener start_time del proceso:**
+
+La verificación de `owner_start_time` previene falsos positivos cuando el PID se recicla rápidamente.
+
 ```rust
+/// Obtiene el tiempo de inicio del proceso.
+/// Retorna None si no se puede obtener (proceso no existe o OS no soportado).
 fn get_process_start_time(pid: u32) -> Option<u64> {
-    // Leer /proc/<pid>/stat, campo 22 (starttime en ticks)
-    // Convertir a epoch ms usando boot_time + ticks/HZ
-    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    let fields: Vec<&str> = stat.split_whitespace().collect();
-    let start_ticks: u64 = fields.get(21)?.parse().ok()?;
-    // Conversión a epoch ms (simplificado)
-    Some(start_ticks)
+    #[cfg(target_os = "linux")]
+    {
+        // Leer /proc/<pid>/stat, campo 22 (starttime en ticks)
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+        let fields: Vec<&str> = stat.split_whitespace().collect();
+        let start_ticks: u64 = fields.get(21)?.parse().ok()?;
+        Some(start_ticks)
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        // En macOS se podría usar sysctl KERN_PROC o libproc
+        // Por ahora, fallback a None (solo usa heartbeat)
+        None
+    }
+    
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 fn is_owner_alive(header: &ShmHeader) -> bool {
@@ -1023,13 +1041,22 @@ fn is_owner_alive(header: &ShmHeader) -> bool {
     if unsafe { libc::kill(header.owner_pid as i32, 0) } != 0 {
         return false;
     }
-    // 2. Verificar que es el mismo proceso (no PID reciclado)
+    
+    // 2. Verificar start_time si está disponible (Linux)
+    //    En otros OS, confiar solo en heartbeat
     match get_process_start_time(header.owner_pid) {
         Some(actual_start) => header.owner_start_time == actual_start,
-        None => false,
+        None => true,  // OS no soporta, asumir OK y confiar en heartbeat
     }
 }
 ```
+
+**Nota de portabilidad:**
+- **Linux:** Verificación completa usando `/proc/<pid>/stat`
+- **macOS:** Solo `kill(pid, 0)` + heartbeat (start_time no implementado en v1)
+- **Otros OS:** Solo `kill(pid, 0)` + heartbeat
+
+El heartbeat de 30s provee protección adicional en todos los casos.
 
 ##### Comportamiento de shm_unlink y readers mapeados
 
@@ -1292,9 +1319,9 @@ peer_links: HashMap<Uuid, u32>  // peer_uuid → link_id
 ```
 
 **Cómo se llena:**
-- Al recibir un HELLO por un uplink WAN, el router sabe por qué socket llegó
+- Al recibir un HELLO por un uplink, el router registra por qué conexión llegó
 - `peer_links[peer_uuid] = link_id` del uplink por donde llegó el HELLO
-- Para peers locales (mismo host, accesibles por shm), `link_id = LINK_LOCAL`
+- Los `link_id` van de 1..N para uplinks (WAN o inter-router local)
 
 **Resolución de uplink_to_peer:**
 ```rust
@@ -1308,27 +1335,29 @@ fn get_link_for_peer(peer_uuid: &Uuid) -> Option<u32> {
 ```
 FIB = []
 
-// 1. Agregar mis rutas (prioridad máxima)
+// 1. Agregar mis rutas CONNECTED (nodos locales, prioridad máxima)
 for route in mi_region.routes:
     if route.flags & FLAG_ACTIVE:
         FIB.add(route)
+        // Estas rutas tienen out_link = LINK_LOCAL (0)
+        // porque los nodos están conectados a MIS sockets
 
 // 2. Agregar nodos de peers como rutas LSA
 for peer_region in peers_mapeados:
     if peer_region.heartbeat es reciente:
         let link_id = peer_links.get(peer_region.router_uuid)
         if link_id.is_none():
-            continue  // No tenemos ruta al peer, ignorar
+            continue  // No tenemos uplink al peer, ignorar
         
         for node in peer_region.nodes:
             if node.flags & FLAG_ACTIVE:
-                // Crear ruta sintética
+                // Crear ruta hacia el ROUTER peer, no hacia el nodo
                 FIB.add(RouteEntry {
                     prefix: node.name,
                     prefix_len: node.name_len,
                     match_kind: MATCH_EXACT,
                     next_hop_router: peer_region.router_uuid,
-                    out_link: link_id,
+                    out_link: link_id,        // Uplink al peer router (1..N)
                     admin_distance: AD_LSA,
                     route_type: ROUTE_LSA,
                     metric: 1,
@@ -1360,12 +1389,40 @@ FIB.sort_by(|a, b| {
 })
 ```
 
-##### Nota sobre peers locales vs WAN
+##### Semántica de LINK_LOCAL
 
-- **Peers locales (mismo host):** Accesibles por shm directamente. `out_link = LINK_LOCAL`. El forwarding va directo al socket del nodo.
-- **Peers WAN:** Accesibles por uplink TCP. `out_link = 1..N`. El mensaje se envía por el uplink correspondiente.
+**LINK_LOCAL (0) significa:** El nodo está conectado directamente a MIS sockets. Solo aplica a rutas CONNECTED en MI región.
 
-Para v1, peers locales son aquellos cuya región shm está disponible. Los peers WAN propagan sus nodos via mensajes LSA/SYNC sobre el uplink, no via shm (la shm no es accesible entre hosts).
+**Para nodos de otros routers (peers):** Siempre se usa un `link_id` de uplink (1..N), incluso si el peer está en el mismo host. El mensaje debe ir al router dueño del nodo, que lo entregará por su socket.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Mismo host                              │
+│                                                              │
+│  Router A                          Router B                  │
+│  ┌──────────┐    uplink 1         ┌──────────┐              │
+│  │ SHM-A    │◄───────────────────►│ SHM-B    │              │
+│  │          │    (Unix socket     │          │              │
+│  └──────────┘     o TCP local)    └──────────┘              │
+│       │                                 │                    │
+│       │ LINK_LOCAL                      │ LINK_LOCAL         │
+│       ▼                                 ▼                    │
+│  [Nodo 1]                          [Nodo 2]                  │
+│                                                              │
+│  Si Router A quiere enviar a Nodo 2:                        │
+│  - Lee de SHM-B que Nodo 2 existe                           │
+│  - out_link = 1 (uplink a Router B), NO LINK_LOCAL          │
+│  - Envía por uplink 1 a Router B                            │
+│  - Router B recibe, out_link = LINK_LOCAL, entrega a Nodo 2 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+##### Peers locales vs WAN
+
+- **Peers en mismo host:** Conectados por Unix socket o TCP localhost. Usan shm para leer nodos, pero el forwarding va por el uplink inter-router.
+- **Peers WAN:** Conectados por TCP remoto. Propagan sus nodos via mensajes LSA/SYNC sobre el uplink (la shm no es accesible entre hosts).
+
+En ambos casos, el forwarding a nodos de un peer **siempre** va por el uplink al peer router.
 
 #### 13.16 Algoritmo de Selección de Ruta
 
@@ -1380,9 +1437,9 @@ Cuando el router necesita encontrar destino para un mensaje:
    c. metric ascendente (menor costo)
 4. Tomar la primera (ganadora)
 5. Si out_link == LINK_LOCAL:
-   → Es un nodo local, entregar directamente por socket
+   → Nodo conectado a MI socket, entregar directamente
 6. Si out_link > 0:
-   → Enviar por ese uplink WAN al next_hop_router
+   → Enviar por ese uplink al next_hop_router
 ```
 
 #### 13.17 Operaciones de Escritura (solo el router dueño)
@@ -2224,9 +2281,12 @@ Muestra la vista consolidada (FIB) combinando todas las regiones.
 | Seqlock con AtomicU64 | RwLock / Mutex | RwLock no es process-shared en Rust, seqlock sin deadlocks |
 | Acquire/Release orderings | SeqCst | Suficiente para coherencia, mejor performance |
 | owner_start_time para stale | Solo PID | PID puede ser reciclado en Linux |
+| start_time Linux-only + fallback | Implementar para todos los OS | Simplicidad, heartbeat cubre otros OS |
 | generation en header | Ninguna | Permite detectar región recreada sin re-abrir |
 | shm_unlink + recrear | Sobrescribir in-place | Readers viejos mantienen snapshot, más seguro |
 | peer_links tabla local | En shm | Dinámica, depende de qué uplinks tengo |
+| LINK_LOCAL solo para nodos propios | LINK_LOCAL para peers locales | Un nodo solo es accesible por el router que tiene su socket |
+| Forwarding siempre via router dueño | Acceso directo a nodos de peers | Solo el router dueño tiene el socket del nodo |
 | ROUTE_LSA para rutas remotas | ROUTE_REMOTE | Consistente con terminología de redes (LSA) |
 | Shared memory para tablas | Redis/etcd | Latencia, sin dependencias externas |
 | RouteEntry con next-hop | Destino final | Modelo estándar de redes, routing hop-by-hop |
