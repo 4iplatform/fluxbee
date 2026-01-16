@@ -1,6 +1,6 @@
 # JSON Router - Especificación Técnica
 
-**Estado:** Draft v0.4
+**Estado:** Draft v0.5
 **Fecha:** 2025-01-16
 
 ---
@@ -912,27 +912,54 @@ Los nodos de otros routers se tratan como rutas aprendidas (LSA) con `admin_dist
 
 Cada región tiene exactamente un writer (su dueño), lo que permite usar seqlock sin conflictos:
 
-- Header contiene `seq: u64`
+- Header contiene `seq: AtomicU64` (explícitamente atómico)
 - Sin locks, sin deadlocks, sin contención
+- Usa memory orderings para coherencia entre procesos
 
 **Protocolo del Writer (solo el router dueño):**
-```
-1. seq++ (queda impar = "escribiendo")
-2. Escribir datos
-3. memory_barrier()
-4. seq++ (queda par = "snapshot consistente")
+```rust
+// Comenzar escritura (seq queda impar = "escribiendo")
+header.seq.fetch_add(1, Ordering::Relaxed);
+
+// Escribir datos en la región
+// ...
+
+// Finalizar escritura (seq queda par = "snapshot consistente")
+atomic::fence(Ordering::Release);
+header.seq.fetch_add(1, Ordering::Relaxed);
 ```
 
 **Protocolo del Reader (todos los demás):**
+```rust
+loop {
+    // Leer seq
+    let s1 = header.seq.load(Ordering::Acquire);
+    
+    // Si impar, el writer está escribiendo, reintentar
+    if s1 & 1 != 0 {
+        std::hint::spin_loop();
+        continue;
+    }
+    
+    // Barrera antes de leer datos
+    atomic::fence(Ordering::Acquire);
+    
+    // Copiar datos que necesita
+    let data = /* copiar snapshot */;
+    
+    // Barrera después de leer datos
+    atomic::fence(Ordering::Acquire);
+    
+    // Verificar que seq no cambió durante la lectura
+    let s2 = header.seq.load(Ordering::Acquire);
+    if s1 == s2 {
+        break; // Snapshot consistente
+    }
+    // Si cambió, descartar y reintentar
+}
 ```
-1. Leer seq
-2. Si impar, spin/yield y volver a 1
-3. memory_barrier()
-4. Copiar datos que necesita
-5. memory_barrier()
-6. Leer seq de nuevo
-7. Si cambió, descartar y volver a 1
-```
+
+**Importante:** `seq` debe estar alineado a 8 bytes para garantizar atomicidad en todas las arquitecturas.
 
 #### 13.9 Inicialización y Recuperación
 
@@ -947,24 +974,75 @@ El header incluye campos para detectar si el dueño anterior crasheó:
 ```rust
 pub struct ShmHeader {
     // ... otros campos ...
-    pub owner_pid: u32,      // PID del proceso dueño
-    pub heartbeat: u64,      // Epoch ms, actualizado periódicamente
+    pub owner_pid: u32,           // PID del proceso dueño
+    pub owner_start_time: u64,    // Epoch ms cuando arrancó el proceso
+    pub generation: u64,          // Incrementa en cada recreación de la región
+    pub heartbeat: u64,           // Epoch ms, actualizado periódicamente
 }
 ```
+
+**Campos de detección:**
+- `owner_pid`: PID del proceso dueño
+- `owner_start_time`: Timestamp de inicio del proceso (evita falsos positivos por PID reciclado)
+- `generation`: Contador que incrementa cada vez que se recrea la región
+- `heartbeat`: Actualizado periódicamente por el dueño
 
 **Al arrancar:**
 ```
 1. Intentar abrir región existente con mi UUID
 2. Si existe:
-   a. Leer owner_pid
-   b. Verificar si el proceso está vivo: kill(owner_pid, 0)
-   c. Si el proceso NO existe → región stale → borrar y recrear
-   d. Si el proceso existe pero heartbeat > 30s → región stale → borrar y recrear
-   e. Si el proceso existe y heartbeat reciente → ERROR: otro proceso usa mi UUID
+   a. Leer owner_pid y owner_start_time
+   b. Verificar si el proceso está vivo:
+      - kill(owner_pid, 0) == OK
+      - Y owner_start_time coincide con el start_time real del proceso
+   c. Si el proceso NO existe o start_time no coincide → región stale
+   d. Si heartbeat > HEARTBEAT_STALE_MS → región stale
+   e. Si región stale:
+      - shm_unlink(shm_name)
+      - Crear región nueva con generation++
+   f. Si proceso vivo y heartbeat reciente → ERROR: otro proceso usa mi UUID
 3. Si no existe:
    a. Crear región nueva
-   b. Inicializar header con magic, version, mi pid, etc.
+   b. Inicializar header con magic, version, mi pid, start_time, generation=1
 ```
+
+**Obtener start_time del proceso (Linux):**
+```rust
+fn get_process_start_time(pid: u32) -> Option<u64> {
+    // Leer /proc/<pid>/stat, campo 22 (starttime en ticks)
+    // Convertir a epoch ms usando boot_time + ticks/HZ
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    let fields: Vec<&str> = stat.split_whitespace().collect();
+    let start_ticks: u64 = fields.get(21)?.parse().ok()?;
+    // Conversión a epoch ms (simplificado)
+    Some(start_ticks)
+}
+
+fn is_owner_alive(header: &ShmHeader) -> bool {
+    // 1. Verificar que el proceso existe
+    if unsafe { libc::kill(header.owner_pid as i32, 0) } != 0 {
+        return false;
+    }
+    // 2. Verificar que es el mismo proceso (no PID reciclado)
+    match get_process_start_time(header.owner_pid) {
+        Some(actual_start) => header.owner_start_time == actual_start,
+        None => false,
+    }
+}
+```
+
+##### Comportamiento de shm_unlink y readers mapeados
+
+Cuando se hace `shm_unlink(shm_name)`:
+- El nombre se elimina del filesystem `/dev/shm/`
+- Los procesos que ya tenían la región mapeada **continúan viendo su snapshot** hasta que hagan `munmap()`
+- La nueva región con el mismo nombre es independiente
+
+**Implicaciones para readers (shm-watch, otros routers):**
+- Deben verificar periódicamente `generation` o `heartbeat`
+- Si detectan región stale o `generation` cambió, deben:
+  1. `munmap()` la región vieja
+  2. Re-abrir por nombre para obtener la nueva generación
 
 ##### Heartbeat
 
@@ -975,7 +1053,7 @@ El router dueño actualiza `heartbeat` periódicamente (cada 5 segundos):
 loop {
     // ... procesar mensajes ...
     
-    if tiempo_desde_ultimo_heartbeat > 5_seconds {
+    if tiempo_desde_ultimo_heartbeat > HEARTBEAT_INTERVAL_MS {
         seqlock_write_begin();
         header.heartbeat = now_epoch_ms();
         seqlock_write_end();
@@ -991,10 +1069,13 @@ Cuando un router lee la región de un peer:
 
 ```
 1. Verificar heartbeat del peer
-2. Si heartbeat > dead_interval (ej. 30s):
+2. Si heartbeat > HEARTBEAT_STALE_MS (30s):
    a. Considerar peer como muerto
    b. Dejar de usar sus rutas en la FIB
-   c. Intentar desmapear la región (o esperar a que desaparezca)
+   c. munmap() la región
+   d. Intentar re-abrir periódicamente (puede haber reiniciado)
+3. Si generation cambió desde la última lectura:
+   a. munmap() y re-abrir para obtener nueva generación
 ```
 
 #### 13.10 Constantes
@@ -1025,13 +1106,14 @@ pub const MATCH_PREFIX: u8 = 1;  // "AI.soporte" matchea "AI.soporte.*"
 pub const MATCH_GLOB: u8 = 2;    // Patterns con wildcards
 
 // Tipos de ruta (route_type)
-pub const ROUTE_CONNECTED: u8 = 0;  // Nodo conectado directamente
+pub const ROUTE_CONNECTED: u8 = 0;  // Nodo conectado directamente a este router
 pub const ROUTE_STATIC: u8 = 1;     // Configurada manualmente
+pub const ROUTE_LSA: u8 = 2;        // Aprendida de otro router (via shm o WAN)
 
 // Admin distances (menor = preferido)
 pub const AD_CONNECTED: u16 = 0;    // Siempre preferir nodos locales
 pub const AD_STATIC: u16 = 1;       // Rutas manuales
-pub const AD_REMOTE: u16 = 10;      // Nodos/rutas de otros routers
+pub const AD_LSA: u16 = 10;         // Rutas aprendidas de otros routers
 
 // Identificadores de link
 pub const LINK_LOCAL: u32 = 0;      // Nodo conectado localmente
@@ -1049,42 +1131,51 @@ Todas las estructuras usan `#[repr(C)]` para layout determinístico en memoria.
 ##### ShmHeader
 
 ```rust
+use std::sync::atomic::AtomicU64;
+
 #[repr(C)]
 pub struct ShmHeader {
     // === IDENTIFICACIÓN (8 bytes) ===
-    pub magic: u32,              // SHM_MAGIC para validar
-    pub version: u32,            // SHM_VERSION para compatibilidad
+    pub magic: u32,                 // SHM_MAGIC para validar
+    pub version: u32,               // SHM_VERSION para compatibilidad
     
-    // === OWNER (24 bytes) ===
-    pub router_uuid: [u8; 16],   // UUID del router dueño
-    pub owner_pid: u32,          // PID del proceso dueño
-    pub _pad0: u32,
+    // === OWNER (40 bytes) ===
+    pub router_uuid: [u8; 16],      // UUID del router dueño
+    pub owner_pid: u32,             // PID del proceso dueño
+    pub _pad0: u32,                 // Padding para alineación
+    pub owner_start_time: u64,      // Epoch ms cuando arrancó el proceso (anti PID-reuse)
+    pub generation: u64,            // Incrementa en cada recreación de la región
     
-    // === SEQLOCK (8 bytes) ===
-    pub seq: u64,                // Impar=escribiendo, par=consistente
+    // === SEQLOCK (8 bytes, alineado) ===
+    pub seq: AtomicU64,             // Impar=escribiendo, par=consistente
     
     // === CONTADORES (8 bytes) ===
-    pub node_count: u32,         // Nodos activos en esta región
-    pub route_count: u32,        // Rutas activas en esta región
+    pub node_count: u32,            // Nodos activos en esta región
+    pub route_count: u32,           // Rutas activas en esta región
     
     // === CAPACIDADES (8 bytes) ===
-    pub node_max: u32,           // MAX_NODES
-    pub route_max: u32,          // MAX_ROUTES
+    pub node_max: u32,              // MAX_NODES
+    pub route_max: u32,             // MAX_ROUTES
     
     // === TIMESTAMPS (24 bytes) ===
-    pub created_at: u64,         // Epoch ms cuando se creó
-    pub updated_at: u64,         // Epoch ms última modificación de datos
-    pub heartbeat: u64,          // Epoch ms último heartbeat del owner
+    pub created_at: u64,            // Epoch ms cuando se creó la región
+    pub updated_at: u64,            // Epoch ms última modificación de datos
+    pub heartbeat: u64,             // Epoch ms último heartbeat del owner
     
     // === ISLA (66 bytes) ===
-    pub island_id: [u8; 64],     // "produccion", "staging", etc.
+    pub island_id: [u8; 64],        // "produccion", "staging", etc.
     pub island_id_len: u16,
     
-    // === RESERVADO (46 bytes para llegar a 192) ===
-    pub _reserved: [u8; 46],
+    // === RESERVADO (30 bytes para llegar a 192) ===
+    pub _reserved: [u8; 30],
 }
 // Total: 192 bytes (alineado a 64)
 ```
+
+**Campos clave:**
+- `seq`: AtomicU64 para seqlock, debe estar alineado a 8 bytes
+- `owner_start_time`: Previene falsos positivos cuando el PID se recicla
+- `generation`: Permite a readers detectar que la región fue recreada
 
 ##### NodeEntry
 
@@ -1189,7 +1280,30 @@ fn validate_name(name: &str) -> bool {
 
 #### 13.15 Construcción de la FIB
 
-El router construye su FIB en memoria local leyendo todas las regiones:
+El router construye su FIB en memoria local leyendo todas las regiones.
+
+##### Tabla peer_links
+
+El router mantiene una tabla local (en memoria, no en shm) que mapea cada peer a su link:
+
+```rust
+// Tabla local del router
+peer_links: HashMap<Uuid, u32>  // peer_uuid → link_id
+```
+
+**Cómo se llena:**
+- Al recibir un HELLO por un uplink WAN, el router sabe por qué socket llegó
+- `peer_links[peer_uuid] = link_id` del uplink por donde llegó el HELLO
+- Para peers locales (mismo host, accesibles por shm), `link_id = LINK_LOCAL`
+
+**Resolución de uplink_to_peer:**
+```rust
+fn get_link_for_peer(peer_uuid: &Uuid) -> Option<u32> {
+    peer_links.get(peer_uuid).copied()
+}
+```
+
+##### Algoritmo de construcción
 
 ```
 FIB = []
@@ -1199,9 +1313,13 @@ for route in mi_region.routes:
     if route.flags & FLAG_ACTIVE:
         FIB.add(route)
 
-// 2. Agregar nodos de peers como rutas remotas
+// 2. Agregar nodos de peers como rutas LSA
 for peer_region in peers_mapeados:
     if peer_region.heartbeat es reciente:
+        let link_id = peer_links.get(peer_region.router_uuid)
+        if link_id.is_none():
+            continue  // No tenemos ruta al peer, ignorar
+        
         for node in peer_region.nodes:
             if node.flags & FLAG_ACTIVE:
                 // Crear ruta sintética
@@ -1210,26 +1328,44 @@ for peer_region in peers_mapeados:
                     prefix_len: node.name_len,
                     match_kind: MATCH_EXACT,
                     next_hop_router: peer_region.router_uuid,
-                    out_link: uplink_to_peer,
-                    admin_distance: AD_REMOTE,
-                    route_type: ROUTE_LSA,  // Tratada como aprendida
+                    out_link: link_id,
+                    admin_distance: AD_LSA,
+                    route_type: ROUTE_LSA,
+                    metric: 1,
                     ...
                 })
 
-// 3. Agregar rutas STATIC de peers
+// 3. Agregar rutas STATIC de peers (propagación)
 for peer_region in peers_mapeados:
-    for route in peer_region.routes:
-        if route.flags & FLAG_ACTIVE && route.route_type == ROUTE_STATIC:
-            // Propagar con admin_distance incrementado
-            FIB.add(route con admin_distance = AD_REMOTE)
+    if peer_region.heartbeat es reciente:
+        let link_id = peer_links.get(peer_region.router_uuid)
+        if link_id.is_none():
+            continue
+        
+        for route in peer_region.routes:
+            if route.flags & FLAG_ACTIVE && route.route_type == ROUTE_STATIC:
+                // Propagar con admin_distance de LSA
+                FIB.add(RouteEntry {
+                    ...route,
+                    admin_distance: AD_LSA,
+                    out_link: link_id,
+                    next_hop_router: peer_region.router_uuid,
+                })
 
 // 4. Ordenar FIB para lookup rápido
 FIB.sort_by(|a, b| {
-    // LPM: más específico primero
+    // LPM: más específico primero (prefix_len desc)
     // Luego admin_distance menor
     // Luego metric menor
 })
 ```
+
+##### Nota sobre peers locales vs WAN
+
+- **Peers locales (mismo host):** Accesibles por shm directamente. `out_link = LINK_LOCAL`. El forwarding va directo al socket del nodo.
+- **Peers WAN:** Accesibles por uplink TCP. `out_link = 1..N`. El mensaje se envía por el uplink correspondiente.
+
+Para v1, peers locales son aquellos cuya región shm está disponible. Los peers WAN propagan sus nodos via mensajes LSA/SYNC sobre el uplink, no via shm (la shm no es accesible entre hosts).
 
 #### 13.16 Algoritmo de Selección de Ruta
 
@@ -2071,8 +2207,10 @@ Muestra la vista consolidada (FIB) combinando todas las regiones.
 - **Next-hop**: Router vecino al que enviar un mensaje (no el destino final).
 - **LPM**: Longest Prefix Match - la ruta más específica gana.
 - **Admin Distance**: Preferencia por origen de ruta (menor = preferido).
-- **Seqlock**: Mecanismo de sincronización para un writer y múltiples readers.
+- **Seqlock**: Mecanismo de sincronización para un writer y múltiples readers usando contador atómico.
 - **Heartbeat**: Timestamp actualizado periódicamente para detectar procesos muertos.
+- **Generation**: Contador que incrementa cada vez que se recrea una región shm.
+- **peer_links**: Tabla local que mapea UUID de peer a link_id del uplink.
 
 ### B. Decisiones de Diseño
 
@@ -2083,12 +2221,17 @@ Muestra la vista consolidada (FIB) combinando todas las regiones.
 | Framing `uint32_be + JSON` | Delimitador de línea | Mensajes pueden contener newlines, binary-safe |
 | Una región shm por router | Una región compartida por todos | Evita conflictos de escritura, seqlock funciona sin locks |
 | Descubrimiento de shm via HELLO | Directorio fijo / scanning | Mecanismo natural, ya existe HELLO |
-| Seqlock | RwLock / Mutex | RwLock no es process-shared en Rust, seqlock sin deadlocks |
+| Seqlock con AtomicU64 | RwLock / Mutex | RwLock no es process-shared en Rust, seqlock sin deadlocks |
+| Acquire/Release orderings | SeqCst | Suficiente para coherencia, mejor performance |
+| owner_start_time para stale | Solo PID | PID puede ser reciclado en Linux |
+| generation en header | Ninguna | Permite detectar región recreada sin re-abrir |
+| shm_unlink + recrear | Sobrescribir in-place | Readers viejos mantienen snapshot, más seguro |
+| peer_links tabla local | En shm | Dinámica, depende de qué uplinks tengo |
+| ROUTE_LSA para rutas remotas | ROUTE_REMOTE | Consistente con terminología de redes (LSA) |
 | Shared memory para tablas | Redis/etcd | Latencia, sin dependencias externas |
 | RouteEntry con next-hop | Destino final | Modelo estándar de redes, routing hop-by-hop |
 | Strings con length explícito | Null-terminated | Comparaciones rápidas, evita escanear 256 bytes |
 | UTF-8 para strings | ASCII estricto | Soporte internacional (español, etc.) |
-| Heartbeat para detectar stale | Solo verificar PID | PID puede ser reciclado, heartbeat más confiable |
 
 ### C. Referencias
 
@@ -2097,5 +2240,7 @@ Muestra la vista consolidada (FIB) combinando todas las regiones.
 - [POSIX shared memory](https://man7.org/linux/man-pages/man7/shm_overview.7.html)
 - [OSPF Timers](https://datatracker.ietf.org/doc/html/rfc2328)
 - [Seqlock](https://en.wikipedia.org/wiki/Seqlock)
+- [Linux /proc/pid/stat](https://man7.org/linux/man-pages/man5/proc.5.html)
+- [Rust Atomics and Locks](https://marabos.nl/atomics/)
 - [memmap2 crate](https://docs.rs/memmap2)
 - [nix crate](https://docs.rs/nix)
