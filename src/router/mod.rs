@@ -141,12 +141,17 @@ impl Router {
                     };
                     let peer_snapshots = peers.refresh();
                     if let Some(local_snapshot) = snapshot {
-                        let mut new_fib = build_fib(&local_snapshot, &peer_snapshots);
+                        let uplink_nodes = {
+                            let uplinks = uplinks.lock().await;
+                            uplinks.snapshot_nodes()
+                        };
+                        let mut new_fib = build_fib(&local_snapshot, &peer_snapshots, &uplink_nodes);
                         new_fib.sort_by(route_cmp);
                         info!(
                             target: "json_router",
                             fib_routes = new_fib.len(),
                             peers = peer_snapshots.len(),
+                            uplink_nodes = uplink_nodes.len(),
                             "FIB refreshed"
                         );
                         let mut fib = fib.lock().await;
@@ -663,7 +668,19 @@ impl PeerManager {
     }
 }
 
-fn build_fib(local: &ShmSnapshot, peers: &[PeerSnapshot]) -> Vec<crate::shm::RouteEntry> {
+#[derive(Clone, Debug)]
+struct UplinkNode {
+    uuid: Uuid,
+    name: String,
+    link_id: u32,
+    router_id: Option<Uuid>,
+}
+
+fn build_fib(
+    local: &ShmSnapshot,
+    peers: &[PeerSnapshot],
+    uplink_nodes: &[UplinkNode],
+) -> Vec<crate::shm::RouteEntry> {
     let mut fib = Vec::new();
 
     for route in &local.routes {
@@ -702,6 +719,27 @@ fn build_fib(local: &ShmSnapshot, peers: &[PeerSnapshot]) -> Vec<crate::shm::Rou
             derived.out_link = LINK_LOCAL;
             fib.push(derived);
         }
+    }
+
+    for uplink in uplink_nodes {
+        let mut route = crate::shm::RouteEntry::default();
+        let name_bytes = uplink.name.as_bytes();
+        let name_len = name_bytes.len().min(route.prefix.len());
+        if name_len == 0 {
+            continue;
+        }
+        route.prefix[..name_len].copy_from_slice(&name_bytes[..name_len]);
+        route.prefix_len = name_len as u16;
+        route.match_kind = MATCH_EXACT;
+        route.route_type = ROUTE_LSA;
+        if let Some(router_id) = uplink.router_id {
+            route.next_hop_router = *router_id.as_bytes();
+        }
+        route.out_link = uplink.link_id;
+        route.metric = 1;
+        route.admin_distance = AD_LSA;
+        route.flags = FLAG_ACTIVE;
+        fib.push(route);
     }
 
     fib
@@ -775,6 +813,12 @@ async fn send_lsa(shm: &Arc<Mutex<ShmWriter>>, uplinks: &Arc<Mutex<UplinkManager
     let lsa = build_lsa(router_uuid, nodes);
     if let Ok(payload) = serde_json::to_vec(&lsa) {
         let mut uplinks = uplinks.lock().await;
+        info!(
+            target: "json_router",
+            router = %router_uuid,
+            nodes = lsa.payload.nodes.len(),
+            "LSA sent"
+        );
         uplinks.broadcast(payload);
     }
 }
@@ -793,14 +837,22 @@ async fn handle_lsa_frame(
     let Ok(payload) = serde_json::from_value::<LsaPayload>(msg.payload) else {
         return true;
     };
+    let router_id = Uuid::parse_str(&payload.router_id).ok();
     let mut uplinks = uplinks.lock().await;
-    uplinks.update_lsa(link_id, payload.nodes);
+    uplinks.update_lsa(link_id, router_id, payload.nodes);
+    info!(
+        target: "json_router",
+        link_id = link_id,
+        nodes = uplinks.peer_nodes.get(&link_id).map(|m| m.len()).unwrap_or(0),
+        "LSA received"
+    );
     true
 }
 
 struct UplinkManager {
     links: HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>,
     peer_nodes: HashMap<u32, HashMap<Uuid, String>>,
+    peer_router_ids: HashMap<u32, Uuid>,
     next_link_id: u32,
 }
 
@@ -809,6 +861,7 @@ impl UplinkManager {
         Self {
             links: HashMap::new(),
             peer_nodes: HashMap::new(),
+            peer_router_ids: HashMap::new(),
             next_link_id: 1,
         }
     }
@@ -837,12 +890,15 @@ impl UplinkManager {
         }
     }
 
-    fn update_lsa(&mut self, link_id: u32, nodes: Vec<NodeDescriptor>) {
+    fn update_lsa(&mut self, link_id: u32, router_id: Option<Uuid>, nodes: Vec<NodeDescriptor>) {
         let mut map = HashMap::new();
         for node in nodes {
             if let Ok(uuid) = Uuid::parse_str(&node.uuid) {
                 map.insert(uuid, node.name);
             }
+        }
+        if let Some(router_id) = router_id {
+            self.peer_router_ids.insert(link_id, router_id);
         }
         self.peer_nodes.insert(link_id, map);
     }
@@ -854,6 +910,22 @@ impl UplinkManager {
             }
         }
         None
+    }
+
+    fn snapshot_nodes(&self) -> Vec<UplinkNode> {
+        let mut out = Vec::new();
+        for (link_id, nodes) in &self.peer_nodes {
+            let router_id = self.peer_router_ids.get(link_id).cloned();
+            for (uuid, name) in nodes {
+                out.push(UplinkNode {
+                    uuid: *uuid,
+                    name: name.clone(),
+                    link_id: *link_id,
+                    router_id,
+                });
+            }
+        }
+        out
     }
 }
 

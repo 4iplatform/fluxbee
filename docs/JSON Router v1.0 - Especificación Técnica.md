@@ -1,6 +1,6 @@
 # JSON Router - Especificación Técnica
 
-**Estado:** Draft v0.8
+**Estado:** Draft v0.9
 **Fecha:** 2025-01-17
 
 ---
@@ -274,11 +274,17 @@ SY.time.backup
 SY.monitor.metrics
 SY.admin.console
 SY.log.collector
+SY.config.routes.primary
+SY.config.routes.backup
 ```
 
 **Nodo SY.time (Time Server):**
 
 El servicio de tiempo es responsabilidad del router o de un nodo SY.time dedicado. Provee tiempo UTC sincronizado a toda la red mediante broadcast periódico.
+
+**Nodo SY.config.routes (Configuración de Rutas):**
+
+Responsable de la configuración centralizada de rutas estáticas y VPNs. Un único proceso escribe en la región de shared memory `/jsr-config-<island>`, que todos los routers leen. Ver **Sección 27** para detalles completos.
 
 #### Resumen de Convenciones
 
@@ -1963,6 +1969,7 @@ El uplink WAN usa los mismos mensajes de routing entre routers ya definidos:
 | `LSA` | Propagar cambios de topología entre islas |
 | `SYNC_REQUEST` | Pedir tabla completa al conectar |
 | `SYNC_REPLY` | Responder con tabla completa |
+| `CONFIG_SYNC` | Propagar rutas estáticas y VPNs entre islas |
 
 No se inventa protocolo nuevo para WAN.
 
@@ -2181,15 +2188,13 @@ route_type: ROUTE_CONNECTED
 
 #### 20.4 Rutas STATIC (configuradas)
 
-Configuradas via archivo o API admin:
+Las rutas estáticas se configuran centralizadamente mediante el nodo `SY.config.routes`. Ver **Sección 27: Configuración Centralizada de Rutas** para detalles completos.
 
-```toml
-[[routes]]
-prefix = "AI.soporte.*"
-match_kind = "PREFIX"
-next_hop = "uuid-router-b"  # Para rutas via WAN
-out_link = 1                 # Uplink WAN #1
-metric = 10
+**Resumen:** Un nodo SY escribe las rutas estáticas en una región de shared memory dedicada (`/jsr-config-<island>`). Todos los routers de la isla leen esta región y actualizan su FIB. Los cambios se propagan entre islas via mensajes `CONFIG_SYNC`.
+
+```
+SY.config.routes → /jsr-config-<island> → Routers leen → FIB actualizada
+                                        → CONFIG_SYNC → Otras islas
 ```
 
 #### 20.5 Rutas LSA (aprendidas)
@@ -2252,6 +2257,484 @@ Muestra la vista consolidada (FIB) combinando todas las regiones.
 #### 26.2 Limpieza de Recursos
 
 *Por definir: cleanup de sockets huérfanos, entries marcadas DELETED, etc.*
+
+### 27. Configuración Centralizada de Rutas
+
+Las rutas estáticas y VPNs se configuran centralizadamente mediante un nodo de sistema `SY.config.routes`. Este nodo es el único que escribe en una región de shared memory dedicada, que todos los routers leen.
+
+#### 27.1 Principio de Diseño
+
+**Un escritor, múltiples lectores.**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   SY.config.routes                          │
+│                                                              │
+│  - Único proceso que escribe config de rutas                │
+│  - API para administración (REST/socket)                    │
+│  - Persiste cambios en disco                                │
+│  - Propaga cambios entre islas via routers                  │
+└─────────────────────────────────────────────────────────────┘
+                           │
+                           │ escribe
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│              /jsr-config-<island_id>                        │
+│              Región SHM de Configuración                     │
+│                                                              │
+│  - StaticRouteEntry[] - Rutas estáticas globales            │
+│  - VPNEntry[] - Configuración de VPNs                       │
+│  - Seqlock para sincronización                              │
+└─────────────────────────────────────────────────────────────┘
+                           │
+            ┌──────────────┼──────────────┐
+            │ leen         │ leen         │ leen
+            ▼              ▼              ▼
+       Router A       Router B       Router C
+       
+       Cada router:
+       1. Lee /jsr-config-<island>
+       2. Instala rutas STATIC en su FIB
+       3. Propaga CONFIG_SYNC a peers WAN
+```
+
+**Ventajas:**
+- Consistencia: todos los routers ven las mismas rutas estáticas
+- Simplicidad: no hay que configurar cada router individualmente
+- Auditabilidad: un solo lugar donde ver/modificar rutas
+- Sin dependencia de routers: el nodo SY no necesita que los routers estén arriba para escribir
+
+#### 27.2 Nodo SY.config.routes
+
+El nodo de configuración sigue el patrón de nodos SY:
+
+```
+SY.config.routes.<instancia>
+
+Ejemplos:
+  SY.config.routes.primary
+  SY.config.routes.backup
+```
+
+**Responsabilidades:**
+1. Proveer API para CRUD de rutas estáticas y VPNs
+2. Persistir configuración en disco (YAML/JSON)
+3. Escribir en `/jsr-config-<island_id>` al iniciar y al cambiar
+4. Mantener heartbeat en la región de config
+
+**No es responsabilidad del nodo:**
+- Propagar a otras islas (los routers lo hacen via CONFIG_SYNC)
+- Validar que las rutas sean alcanzables (solo las instala)
+
+#### 27.3 Región SHM de Configuración
+
+Nueva región de shared memory dedicada a configuración global.
+
+**Nombre:** `/jsr-config-<island_id>`
+
+**Ejemplo:** `/jsr-config-produccion`
+
+##### Layout de la región
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     ConfigHeader (128 bytes)                │
+├─────────────────────────────────────────────────────────────┤
+│                 StaticRouteEntry[MAX_STATIC_ROUTES]         │
+│                       (304 * 256 = 77,824 bytes)            │
+├─────────────────────────────────────────────────────────────┤
+│                     VPNEntry[MAX_VPNS]                      │
+│                       (256 * 64 = 16,384 bytes)             │
+└─────────────────────────────────────────────────────────────┘
+Total: ~94 KB
+```
+
+##### ConfigHeader
+
+```rust
+#[repr(C)]
+pub struct ConfigHeader {
+    // === IDENTIFICACIÓN (32 bytes) ===
+    pub magic: u32,                   // CONFIG_MAGIC = 0x4A534343 ("JSCC")
+    pub version: u32,                 // Versión del formato
+    pub island_id: [u8; 64],          // ID de la isla
+    pub island_id_len: u16,
+    pub _pad1: [u8; 6],
+    
+    // === OWNERSHIP (40 bytes) ===
+    pub owner_pid: u64,               // PID del SY.config.routes
+    pub owner_start_time: u64,        // Para detectar PID reuse
+    pub owner_uuid: [u8; 16],         // UUID del nodo SY.config.routes
+    pub heartbeat: u64,               // Epoch ms, actualizado periódicamente
+    
+    // === SEQLOCK (8 bytes) ===
+    pub seq: u64,                     // Seqlock counter (AtomicU64)
+    
+    // === CONTADORES (16 bytes) ===
+    pub static_route_count: u32,      // Rutas estáticas activas
+    pub vpn_count: u32,               // VPNs activas
+    pub config_version: u64,          // Versión de la config (incrementa con cada cambio)
+    
+    // === TIMESTAMPS (16 bytes) ===
+    pub created_at: u64,              // Epoch ms de creación
+    pub updated_at: u64,              // Epoch ms de última modificación
+    
+    // === RESERVED (16 bytes) ===
+    pub _reserved: [u8; 16],
+}
+// Total: 128 bytes
+```
+
+##### StaticRouteEntry
+
+Igual que `RouteEntry` de la sección 13.11, pero solo para rutas estáticas globales:
+
+```rust
+#[repr(C)]
+pub struct StaticRouteEntry {
+    // === MATCHING (260 bytes) ===
+    pub prefix: [u8; 256],            // Pattern: "AI.soporte.*"
+    pub prefix_len: u16,
+    pub match_kind: u8,               // MATCH_EXACT, MATCH_PREFIX, MATCH_GLOB
+    pub _pad1: u8,
+    
+    // === FORWARDING (24 bytes) ===
+    pub next_hop_island: [u8; 64],    // Island destino (para VPN/WAN)
+    pub next_hop_island_len: u16,
+    pub action: u8,                   // ACTION_FORWARD, ACTION_DROP, ACTION_VPN
+    pub _pad2: u8,
+    pub vpn_id: u32,                  // Si action == ACTION_VPN
+    pub metric: u32,
+    
+    // === ESTADO (8 bytes) ===
+    pub flags: u16,                   // FLAG_ACTIVE, FLAG_DELETED
+    pub priority: u16,                // Para ordenar (menor = más prioritario)
+    pub _pad3: [u8; 4],
+    
+    // === METADATA (12 bytes) ===
+    pub installed_at: u64,
+    pub _reserved: [u8; 4],
+}
+// Total: 304 bytes (igual que RouteEntry para consistencia)
+```
+
+**Acciones:**
+
+| action | Valor | Descripción |
+|--------|-------|-------------|
+| ACTION_FORWARD | 0 | Rutear normalmente |
+| ACTION_DROP | 1 | Descartar (blackhole) |
+| ACTION_VPN | 2 | Enviar por VPN específica |
+
+##### VPNEntry
+
+```rust
+#[repr(C)]
+pub struct VPNEntry {
+    // === IDENTIFICACIÓN (72 bytes) ===
+    pub vpn_id: u32,                  // ID único de la VPN
+    pub vpn_name: [u8; 64],           // Nombre descriptivo
+    pub vpn_name_len: u16,
+    pub _pad1: [u8; 2],
+    
+    // === DESTINO (72 bytes) ===
+    pub remote_island: [u8; 64],      // Isla destino
+    pub remote_island_len: u16,
+    pub _pad2: [u8; 6],
+    
+    // === ENDPOINTS (96 bytes) ===
+    pub endpoint_count: u32,
+    pub endpoints: [[u8; 46]; 2],     // Hasta 2 endpoints (IP:puerto)
+    pub _pad3: [u8; 2],
+    
+    // === ESTADO (16 bytes) ===
+    pub flags: u16,
+    pub _pad4: [u8; 6],
+    pub created_at: u64,
+}
+// Total: 256 bytes
+```
+
+#### 27.4 Constantes
+
+```rust
+// Región de configuración
+pub const CONFIG_MAGIC: u32 = 0x4A534343;  // "JSCC"
+pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_SHM_PREFIX: &str = "/jsr-config-";
+
+// Capacidades
+pub const MAX_STATIC_ROUTES: u32 = 256;    // Rutas estáticas por isla
+pub const MAX_VPNS: u32 = 64;              // VPNs por isla
+
+// Acciones de ruta
+pub const ACTION_FORWARD: u8 = 0;
+pub const ACTION_DROP: u8 = 1;
+pub const ACTION_VPN: u8 = 2;
+
+// Timers (heredados de router)
+pub const CONFIG_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
+pub const CONFIG_HEARTBEAT_STALE_MS: u64 = 30_000;
+```
+
+#### 27.5 API del Nodo SY.config.routes
+
+El nodo expone una API via socket Unix para administración:
+
+**Socket:** `/var/run/mesh/nodes/SY.config.routes.primary.sock`
+
+##### Mensajes de API
+
+**Listar rutas estáticas:**
+```json
+{
+  "routing": { "src": "admin-uuid", "dst": "sy-config-uuid", ... },
+  "meta": { "type": "admin", "action": "list_routes" },
+  "payload": {}
+}
+```
+
+**Respuesta:**
+```json
+{
+  "payload": {
+    "routes": [
+      {
+        "prefix": "AI.soporte.*",
+        "match_kind": "PREFIX",
+        "action": "FORWARD",
+        "next_hop_island": "produccion-us",
+        "metric": 10,
+        "priority": 100
+      }
+    ],
+    "config_version": 42
+  }
+}
+```
+
+**Agregar ruta estática:**
+```json
+{
+  "meta": { "type": "admin", "action": "add_route" },
+  "payload": {
+    "prefix": "AI.ventas.*",
+    "match_kind": "PREFIX",
+    "action": "FORWARD",
+    "next_hop_island": "produccion-us",
+    "metric": 10,
+    "priority": 100
+  }
+}
+```
+
+**Eliminar ruta estática:**
+```json
+{
+  "meta": { "type": "admin", "action": "delete_route" },
+  "payload": {
+    "prefix": "AI.ventas.*"
+  }
+}
+```
+
+**Listar VPNs:**
+```json
+{
+  "meta": { "type": "admin", "action": "list_vpns" },
+  "payload": {}
+}
+```
+
+**Agregar VPN:**
+```json
+{
+  "meta": { "type": "admin", "action": "add_vpn" },
+  "payload": {
+    "vpn_name": "vpn-staging",
+    "remote_island": "staging",
+    "endpoints": ["10.0.1.100:9000", "10.0.1.101:9000"]
+  }
+}
+```
+
+#### 27.6 Flujo del Router al Leer Config
+
+Cada router lee la región de config además de las regiones de otros routers:
+
+```rust
+// Al iniciar y periódicamente
+fn update_fib_from_config(&mut self) {
+    // 1. Abrir región de config si no está mapeada
+    let config_shm_name = format!("{}{}", CONFIG_SHM_PREFIX, self.island_id);
+    if self.config_region.is_none() {
+        self.config_region = map_config_region(&config_shm_name);
+    }
+    
+    // 2. Leer con seqlock
+    let config = match &self.config_region {
+        Some(region) => seqlock_read(region),
+        None => return,  // Config no disponible, continuar sin rutas estáticas
+    };
+    
+    // 3. Verificar heartbeat (SY.config.routes vivo)
+    if is_config_stale(&config.header) {
+        log::warn!("Config region stale, SY.config.routes may be down");
+        // Las rutas existentes se mantienen hasta que expire
+    }
+    
+    // 4. Si config_version cambió, actualizar FIB
+    if config.header.config_version != self.last_config_version {
+        self.install_static_routes(&config.static_routes);
+        self.last_config_version = config.header.config_version;
+        
+        // 5. Propagar a peers WAN
+        self.send_config_sync_to_wan_peers(&config);
+    }
+}
+```
+
+#### 27.7 Propagación WAN: CONFIG_SYNC
+
+Nuevo mensaje para propagar configuración de rutas entre islas:
+
+```json
+{
+  "routing": {
+    "src": "uuid-router-a",
+    "dst": "uuid-router-b",
+    "ttl": 16,
+    "trace_id": "uuid"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "CONFIG_SYNC"
+  },
+  "payload": {
+    "timestamp": "2025-01-17T10:00:00Z",
+    "config_version": 42,
+    "source_island": "produccion",
+    "routes": [
+      {
+        "prefix": "AI.soporte.*",
+        "match_kind": "PREFIX",
+        "action": "FORWARD",
+        "next_hop_island": "produccion",
+        "metric": 10,
+        "priority": 100
+      }
+    ],
+    "vpns": [
+      {
+        "vpn_id": 1,
+        "vpn_name": "vpn-staging",
+        "remote_island": "staging",
+        "endpoints": ["10.0.1.100:9000"]
+      }
+    ]
+  }
+}
+```
+
+**Comportamiento del router al recibir CONFIG_SYNC:**
+
+1. Validar que viene de un peer conocido
+2. Si `config_version` es mayor que el conocido para esa isla:
+   - Instalar rutas en FIB como STATIC con AD_STATIC
+   - Guardar `config_version` para evitar reprocessar
+3. NO re-propagar (evitar loops) - cada router propaga solo su propia config
+
+**Cuándo enviar CONFIG_SYNC:**
+
+- Al establecer un uplink WAN (después del handshake)
+- Cuando detecta cambio en `config_version` de la región local
+
+#### 27.8 Ejemplo: Agregar Ruta Estática
+
+```
+1. Admin conecta al socket de SY.config.routes
+2. Envía mensaje add_route
+3. SY.config.routes:
+   a. Valida el request
+   b. Persiste en disco (routes.yaml)
+   c. Escribe en /jsr-config-produccion con seqlock
+   d. Incrementa config_version
+   e. Responde OK
+4. Routers detectan cambio de config_version:
+   a. Leen nueva ruta de la región
+   b. Instalan en FIB
+   c. Propagan CONFIG_SYNC a peers WAN
+5. Routers en otras islas reciben CONFIG_SYNC:
+   a. Instalan ruta con next_hop apuntando a la isla origen
+```
+
+#### 27.9 Persistencia
+
+El nodo SY.config.routes persiste la configuración en disco:
+
+**Archivo:** `/etc/json-router/routes.yaml`
+
+```yaml
+# Rutas estáticas de la isla
+static_routes:
+  - prefix: "AI.soporte.*"
+    match_kind: PREFIX
+    action: FORWARD
+    next_hop_island: produccion-us
+    metric: 10
+    priority: 100
+    
+  - prefix: "AI.ventas.interno"
+    match_kind: EXACT
+    action: DROP
+    
+vpns:
+  - vpn_id: 1
+    vpn_name: vpn-staging
+    remote_island: staging
+    endpoints:
+      - "10.0.1.100:9000"
+      - "10.0.1.101:9000"
+```
+
+**Flujo al iniciar:**
+1. Leer `routes.yaml`
+2. Crear/reclamar región `/jsr-config-<island>`
+3. Escribir todas las rutas y VPNs en la región
+4. Iniciar heartbeat loop
+
+#### 27.10 Alta Disponibilidad
+
+Para HA, se puede correr un nodo backup:
+
+```
+SY.config.routes.primary   (activo, escribe en shm)
+SY.config.routes.backup    (standby, monitorea)
+```
+
+**Estrategia simple:** El backup monitorea el heartbeat del primary. Si detecta que está stale:
+1. Intenta reclamar la región (verifica que el primary realmente murió)
+2. Si lo logra, se convierte en primary
+3. Lee `routes.yaml` y reescribe la región
+
+El archivo `routes.yaml` es la fuente de verdad. Ambos nodos lo leen.
+
+#### 27.11 Eliminación de Rutas Locales en Routers
+
+Con el sistema centralizado, **los routers ya no tienen rutas STATIC propias**. Solo tienen:
+
+- **CONNECTED:** Nodos locales (automáticas)
+- **LSA:** Aprendidas de otros routers
+
+Las rutas estáticas vienen siempre de la región de config.
+
+**Impacto en `RouteEntry` de cada router:**
+- `route_type` solo puede ser `ROUTE_CONNECTED` o `ROUTE_LSA`
+- `ROUTE_STATIC` solo existe en la región de config
+
+**Impacto en la FIB:**
+- La FIB combina: nodos locales + rutas de peers + rutas de config
+- Las rutas de config tienen `admin_distance = AD_STATIC (1)`
 
 
 ---
@@ -2744,6 +3227,9 @@ El router usa directamente `config.yaml` + `identity.yaml`. El `island.yaml` no 
 - **config.yaml**: Configuración real del router (autosuficiente, no depende de island.yaml en runtime).
 - **identity.yaml**: Estado de hardware del router con UUID (auto-generado en primer arranque).
 - **Región shm**: Área de shared memory de un router específico (cada router tiene la suya).
+- **Región config shm**: Área de shared memory para rutas estáticas y VPNs (`/jsr-config-<island>`).
+- **SY.config.routes**: Nodo de sistema responsable de escribir la región de config.
+- **CONFIG_SYNC**: Mensaje WAN para propagar rutas estáticas entre islas.
 - **RIB**: Routing Information Base - todas las rutas candidatas (distribuidas en múltiples regiones).
 - **FIB**: Forwarding Information Base - rutas ganadoras compiladas en memoria local.
 - **Next-hop**: Router vecino al que enviar un mensaje (no el destino final).
@@ -2753,6 +3239,7 @@ El router usa directamente `config.yaml` + `identity.yaml`. El `island.yaml` no 
 - **Heartbeat**: Timestamp actualizado periódicamente para detectar procesos muertos.
 - **Generation**: Contador que incrementa cada vez que se recrea una región shm.
 - **peer_links**: Tabla local que mapea UUID de peer a link_id del uplink.
+- **VPN**: Túnel lógico entre islas con endpoints definidos.
 
 ### B. Decisiones de Diseño
 
@@ -2786,6 +3273,10 @@ El router usa directamente `config.yaml` + `identity.yaml`. El `island.yaml` no 
 | Solo 3 env vars (name, config, log) | Múltiples env vars | Simplicidad, evitar configuración dispersa |
 | Router name capa 2 (RT.*) | Solo UUID | Consistente con nomenclatura de nodos, legible |
 | state_dir relativo (./state) | Path absoluto fijo | Flexible, permite múltiples instancias en desarrollo |
+| Región config shm separada | Rutas estáticas en cada router | Un escritor (SY), consistencia garantizada |
+| SY.config.routes como nodo | Servicio externo | Integrado al sistema de mensajes, misma infra |
+| CONFIG_SYNC para propagar | Routers leen shm remota | shm no es accesible entre hosts |
+| Routers no escriben STATIC propias | Cada router con sus estáticas | Centralizado, fácil de auditar, sin conflictos |
 
 ### C. Referencias
 
