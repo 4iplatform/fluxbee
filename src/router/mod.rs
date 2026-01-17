@@ -7,14 +7,16 @@ use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::{self, Duration};
+use tokio::time::{self, Duration, Instant};
 use uuid::Uuid;
 
 use crate::config::Config;
 use crate::protocol::system::{
-    build_error, build_hello, build_lsa, build_query, AnnouncePayload, HelloPayload, LsaPayload,
-    Message, NodeDescriptor, WithdrawPayload, MSG_ANNOUNCE, MSG_HELLO, MSG_LSA, MSG_TTL_EXCEEDED,
-    MSG_UNREACHABLE, MSG_WITHDRAW, SYSTEM_KIND,
+    build_error, build_hello, build_lsa, build_query, build_uplink_accept, build_uplink_reject,
+    AnnouncePayload, HelloCapabilities, HelloPayload, LsaPayload, Message, NodeDescriptor,
+    UplinkAcceptPayload, UplinkRejectPayload, WithdrawPayload, MSG_ANNOUNCE, MSG_HELLO, MSG_LSA,
+    MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_UPLINK_ACCEPT, MSG_UPLINK_REJECT, MSG_WITHDRAW,
+    SYSTEM_KIND,
 };
 use crate::shm::{
     ShmError, ShmReader, ShmSnapshot, ShmWriter, AD_LSA, FLAG_ACTIVE, LINK_LOCAL, MATCH_EXACT,
@@ -84,9 +86,20 @@ impl Router {
             let nodes = Arc::clone(&self.nodes);
             let snapshot_cache = Arc::clone(&self.local_snapshot);
             let uplinks = Arc::clone(&self.uplinks);
+            let hello_interval_ms = self.cfg.hello_interval_ms;
+            let dead_interval_ms = self.cfg.dead_interval_ms;
             tokio::spawn(async move {
-                if let Err(err) =
-                    uplink_listen_loop(addr, shm, fib, nodes, snapshot_cache, uplinks).await
+                if let Err(err) = uplink_listen_loop(
+                    addr,
+                    shm,
+                    fib,
+                    nodes,
+                    snapshot_cache,
+                    uplinks,
+                    hello_interval_ms,
+                    dead_interval_ms,
+                )
+                .await
                 {
                     warn!(target: "json_router", "uplink listen error: {}", err);
                 }
@@ -100,8 +113,20 @@ impl Router {
             let snapshot_cache = Arc::clone(&self.local_snapshot);
             let uplinks = Arc::clone(&self.uplinks);
             let peers_cfg = self.cfg.uplink_peers.clone();
+            let hello_interval_ms = self.cfg.hello_interval_ms;
+            let dead_interval_ms = self.cfg.dead_interval_ms;
             tokio::spawn(async move {
-                uplink_connect_loop(peers_cfg, shm, fib, nodes, snapshot_cache, uplinks).await;
+                uplink_connect_loop(
+                    peers_cfg,
+                    shm,
+                    fib,
+                    nodes,
+                    snapshot_cache,
+                    uplinks,
+                    hello_interval_ms,
+                    dead_interval_ms,
+                )
+                .await;
             });
         }
 
@@ -936,6 +961,8 @@ async fn uplink_listen_loop(
     nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
     snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
     uplinks: Arc<Mutex<UplinkManager>>,
+    hello_interval_ms: u64,
+    dead_interval_ms: u64,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     info!(target: "json_router", addr = %addr, "uplink listening");
@@ -960,6 +987,8 @@ async fn uplink_listen_loop(
                 nodes,
                 snapshot_cache,
                 uplinks,
+                hello_interval_ms,
+                dead_interval_ms,
             )
             .await
             {
@@ -976,6 +1005,8 @@ async fn uplink_connect_loop(
     nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
     snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
     uplinks: Arc<Mutex<UplinkManager>>,
+    hello_interval_ms: u64,
+    dead_interval_ms: u64,
 ) {
     for peer in peers {
         let shm = Arc::clone(&shm);
@@ -997,6 +1028,8 @@ async fn uplink_connect_loop(
                             Arc::clone(&nodes),
                             Arc::clone(&snapshot_cache),
                             Arc::clone(&uplinks),
+                            hello_interval_ms,
+                            dead_interval_ms,
                         )
                         .await
                         {
@@ -1030,9 +1063,11 @@ async fn handle_uplink_connection(
     nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
     snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
     uplinks: Arc<Mutex<UplinkManager>>,
+    hello_interval_ms: u64,
+    dead_interval_ms: u64,
 ) -> io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
-    let hello = {
+    let (router_uuid, island_id, shm_name) = {
         let shm = shm.lock().await;
         let name = shm.name().to_string();
         let router_uuid = Uuid::from_slice(&shm.header().router_uuid).unwrap_or_else(|_| Uuid::nil());
@@ -1040,20 +1075,59 @@ async fn handle_uplink_connection(
             let raw = &shm.header().island_id[..shm.header().island_id_len as usize];
             String::from_utf8_lossy(raw).to_string()
         };
-        build_hello(router_uuid, &island_id, &name)
+        (router_uuid, island_id, name)
+    };
+    let capabilities = HelloCapabilities {
+        sync: false,
+        lsa: true,
+        forwarding: true,
+    };
+    let mut hello_seq: u64 = 1;
+    let hello = {
+        build_hello(
+            router_uuid,
+            &island_id,
+            &shm_name,
+            hello_seq,
+            hello_interval_ms,
+            dead_interval_ms,
+            capabilities.clone(),
+        )
     };
 
     let peer = match role {
         UplinkRole::Initiator => {
-            send_message(&mut writer, &hello).await?;
+            send_system_message(&mut writer, &hello).await?;
             read_hello(&mut reader).await?
         }
         UplinkRole::Acceptor => {
             let peer = read_hello(&mut reader).await?;
-            send_message(&mut writer, &hello).await?;
+            send_system_message(&mut writer, &hello).await?;
             peer
         }
     };
+
+    if peer.protocol != "json-router/1" {
+        let reject = build_uplink_reject(
+            "PROTOCOL_MISMATCH",
+            "unsupported protocol",
+            Some("json-router/1"),
+        );
+        let _ = send_system_message(&mut writer, &reject).await;
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "protocol mismatch"));
+    }
+
+    let accept = build_uplink_accept(&peer.router_id, hello_interval_ms, dead_interval_ms);
+    send_system_message(&mut writer, &accept).await?;
+    match read_uplink_response(&mut reader).await? {
+        UplinkResponse::Accept(_) => {}
+        UplinkResponse::Reject(payload) => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("uplink rejected: {}", payload.reason),
+            ));
+        }
+    }
 
     info!(
         target: "json_router",
@@ -1077,15 +1151,51 @@ async fn handle_uplink_connection(
         }
     });
 
+    let mut last_hello = Instant::now();
+    let mut hello_tick = time::interval(Duration::from_millis(hello_interval_ms));
+    let mut dead_tick = time::interval(Duration::from_millis(dead_interval_ms));
+
     loop {
-        match read_frame(&mut reader).await? {
-            Some(buf) => {
-                if handle_lsa_frame(&buf, link_id, &uplinks).await {
-                    continue;
+        tokio::select! {
+            _ = hello_tick.tick() => {
+                hello_seq = hello_seq.wrapping_add(1);
+                let hello = build_hello(
+                    router_uuid,
+                    &island_id,
+                    &shm_name,
+                    hello_seq,
+                    hello_interval_ms,
+                    dead_interval_ms,
+                    capabilities.clone(),
+                );
+                if send_system_message(&mut writer, &hello).await.is_err() {
+                    break;
                 }
-                handle_forward(&buf, &shm, &fib, &nodes, &snapshot_cache, &uplinks).await;
             }
-            None => break,
+            _ = dead_tick.tick() => {
+                if last_hello.elapsed() > Duration::from_millis(dead_interval_ms) {
+                    warn!(
+                        target: "json_router",
+                        link_id,
+                        "uplink dead detected"
+                    );
+                    break;
+                }
+            }
+            res = read_frame(&mut reader) => {
+                match res? {
+                    Some(buf) => {
+                        if handle_hello_frame(&buf, &mut last_hello) {
+                            continue;
+                        }
+                        if handle_lsa_frame(&buf, link_id, &uplinks).await {
+                            continue;
+                        }
+                        handle_forward(&buf, &shm, &fib, &nodes, &snapshot_cache, &uplinks).await;
+                    }
+                    None => break,
+                }
+            }
         }
     }
 
@@ -1106,8 +1216,52 @@ where
     Ok(msg.payload)
 }
 
-async fn send_message<W>(writer: &mut W, msg: &Message<HelloPayload>) -> io::Result<()>
+enum UplinkResponse {
+    Accept(UplinkAcceptPayload),
+    Reject(UplinkRejectPayload),
+}
+
+async fn read_uplink_response<R>(reader: &mut R) -> io::Result<UplinkResponse>
 where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(buf) = read_frame(reader).await? else {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "uplink accept eof"));
+    };
+    let msg = serde_json::from_slice::<Message<serde_json::Value>>(&buf)?;
+    if msg.meta.kind != SYSTEM_KIND {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected system message"));
+    }
+    match msg.meta.msg.as_str() {
+        MSG_UPLINK_ACCEPT => {
+            let payload = serde_json::from_value::<UplinkAcceptPayload>(msg.payload)?;
+            Ok(UplinkResponse::Accept(payload))
+        }
+        MSG_UPLINK_REJECT => {
+            let payload = serde_json::from_value::<UplinkRejectPayload>(msg.payload)?;
+            Ok(UplinkResponse::Reject(payload))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected UPLINK_ACCEPT or UPLINK_REJECT",
+        )),
+    }
+}
+
+fn handle_hello_frame(buf: &[u8], last_hello: &mut Instant) -> bool {
+    let Ok(msg) = serde_json::from_slice::<Message<HelloPayload>>(buf) else {
+        return false;
+    };
+    if msg.meta.kind != SYSTEM_KIND || msg.meta.msg != MSG_HELLO {
+        return false;
+    }
+    *last_hello = Instant::now();
+    true
+}
+
+async fn send_system_message<W, T>(writer: &mut W, msg: &Message<T>) -> io::Result<()>
+where
+    T: serde::Serialize,
     W: tokio::io::AsyncWrite + Unpin,
 {
     let payload = serde_json::to_vec(msg)?;
