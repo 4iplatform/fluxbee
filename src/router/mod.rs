@@ -1,1 +1,924 @@
 pub mod forward;
+
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::{self, Duration};
+use uuid::Uuid;
+
+use crate::config::Config;
+use crate::protocol::system::{
+    build_error, build_hello, build_query, AnnouncePayload, HelloPayload, Message,
+    WithdrawPayload, MSG_ANNOUNCE, MSG_HELLO, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW,
+    SYSTEM_KIND,
+};
+use crate::shm::{
+    ShmError, ShmReader, ShmSnapshot, ShmWriter, AD_LSA, FLAG_ACTIVE, LINK_LOCAL, MATCH_EXACT,
+    MATCH_GLOB, MATCH_PREFIX, ROUTE_LSA, ROUTE_STATIC,
+};
+use crate::socket::connection::{read_frame, write_frame};
+use tracing::{info, warn};
+
+const ANNOUNCE_TIMEOUT_MS: u64 = 5_000;
+
+pub struct Router {
+    cfg: Config,
+    shm: Arc<Mutex<ShmWriter>>,
+    fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    local_snapshot: Arc<Mutex<Option<ShmSnapshot>>>,
+    uplinks: Arc<Mutex<UplinkManager>>,
+}
+
+impl Router {
+    pub fn new(cfg: Config) -> Result<Self, ShmError> {
+        let shm = ShmWriter::open_or_create(cfg.router_uuid, &cfg.island_id)?;
+        Ok(Self {
+            cfg,
+            shm: Arc::new(Mutex::new(shm)),
+            fib: Arc::new(Mutex::new(Vec::new())),
+            nodes: Arc::new(Mutex::new(HashMap::new())),
+            local_snapshot: Arc::new(Mutex::new(None)),
+            uplinks: Arc::new(Mutex::new(UplinkManager::new())),
+        })
+    }
+
+    pub async fn run(self) -> Result<(), ShmError> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
+        let mut connected: HashSet<PathBuf> = HashSet::new();
+        let mut ticker = time::interval(Duration::from_millis(self.cfg.scan_interval_ms));
+        let mut fib_ticker = time::interval(Duration::from_millis(self.cfg.fib_refresh_ms));
+        let mut peers = PeerManager::new(self.cfg.peer_shm_names.clone());
+        let fib = Arc::clone(&self.fib);
+        let nodes = Arc::clone(&self.nodes);
+        let snapshot_cache = Arc::clone(&self.local_snapshot);
+        let uplinks = Arc::clone(&self.uplinks);
+
+        {
+            let mut shm = self.shm.lock().await;
+            for route in &self.cfg.static_routes {
+                if let Ok(next_hop) = Uuid::parse_str(&route.next_hop_router) {
+                    let match_kind = match route.match_kind.as_str() {
+                        "prefix" => MATCH_PREFIX,
+                        "glob" => MATCH_GLOB,
+                        _ => MATCH_EXACT,
+                    };
+                    let _ = shm.add_static_route(
+                        &route.pattern,
+                        match_kind,
+                        *next_hop.as_bytes(),
+                        route.link_id,
+                        1,
+                    );
+                }
+            }
+        }
+
+        if let Some(addr) = self.cfg.uplink_listen.clone() {
+            let shm = Arc::clone(&self.shm);
+            let fib = Arc::clone(&self.fib);
+            let nodes = Arc::clone(&self.nodes);
+            let snapshot_cache = Arc::clone(&self.local_snapshot);
+            let uplinks = Arc::clone(&self.uplinks);
+            tokio::spawn(async move {
+                if let Err(err) =
+                    uplink_listen_loop(addr, shm, fib, nodes, snapshot_cache, uplinks).await
+                {
+                    warn!(target: "json_router", "uplink listen error: {}", err);
+                }
+            });
+        }
+
+        if !self.cfg.uplink_peers.is_empty() {
+            let shm = Arc::clone(&self.shm);
+            let fib = Arc::clone(&self.fib);
+            let nodes = Arc::clone(&self.nodes);
+            let snapshot_cache = Arc::clone(&self.local_snapshot);
+            let uplinks = Arc::clone(&self.uplinks);
+            let peers_cfg = self.cfg.uplink_peers.clone();
+            tokio::spawn(async move {
+                uplink_connect_loop(peers_cfg, shm, fib, nodes, snapshot_cache, uplinks).await;
+            });
+        }
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let new_paths = scan_node_sockets(&self.cfg.nodes_dir).await;
+                    for path in new_paths {
+                        if connected.contains(&path) {
+                            continue;
+                        }
+                        match UnixStream::connect(&path).await {
+                            Ok(stream) => {
+                                connected.insert(path.clone());
+                                let shm = Arc::clone(&self.shm);
+                                let tx = tx.clone();
+                                let fib = Arc::clone(&fib);
+                                let nodes = Arc::clone(&nodes);
+                                let snapshot_cache = Arc::clone(&snapshot_cache);
+                                let uplinks = Arc::clone(&uplinks);
+                                tokio::spawn(async move {
+                                    handle_node_connection(path.clone(), stream, shm, fib, nodes, snapshot_cache, uplinks).await;
+                                    let _ = tx.send(path);
+                                });
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                Some(path) = rx.recv() => {
+                    connected.remove(&path);
+                }
+                _ = fib_ticker.tick() => {
+                    let snapshot = {
+                        let shm = self.shm.lock().await;
+                        shm.read_snapshot()
+                    };
+                    let peer_snapshots = peers.refresh();
+                    if let Some(local_snapshot) = snapshot {
+                        let mut new_fib = build_fib(&local_snapshot, &peer_snapshots);
+                        new_fib.sort_by(route_cmp);
+                        info!(
+                            target: "json_router",
+                            fib_routes = new_fib.len(),
+                            peers = peer_snapshots.len(),
+                            "FIB refreshed"
+                        );
+                        let mut fib = fib.lock().await;
+                        *fib = new_fib;
+                        let mut cached = snapshot_cache.lock().await;
+                        *cached = Some(local_snapshot);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn scan_node_sockets(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(_) => return out,
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("sock") {
+            continue;
+        }
+        out.push(path);
+    }
+    out
+}
+
+async fn handle_node_connection(
+    _path: PathBuf,
+    stream: UnixStream,
+    shm: Arc<Mutex<ShmWriter>>,
+    fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    local_snapshot: Arc<Mutex<Option<ShmSnapshot>>>,
+    uplinks: Arc<Mutex<UplinkManager>>,
+) {
+    let (mut reader, mut writer) = stream.into_split();
+    if let Err(err) = send_query(&mut writer).await {
+        let _ = err;
+        return;
+    }
+
+    let announce = match read_announce(&mut reader).await {
+        Ok(announce) => announce,
+        Err(_) => return,
+    };
+
+    let node_uuid = match Uuid::parse_str(&announce.uuid) {
+        Ok(uuid) => uuid,
+        Err(_) => return,
+    };
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    {
+        let mut shm = shm.lock().await;
+        let _ = shm.register_node(node_uuid, &announce.name);
+    }
+    info!(
+        target: "json_router",
+        node = %announce.name,
+        uuid = %node_uuid,
+        "node registered"
+    );
+
+    {
+        let mut nodes = nodes.lock().await;
+        nodes.insert(node_uuid, tx);
+    }
+
+    let mut write_task = tokio::spawn(async move {
+        while let Some(payload) = rx.recv().await {
+            if write_frame(&mut writer, &payload).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        match read_frame(&mut reader).await {
+            Ok(Some(buf)) => {
+                if let Ok(msg) = serde_json::from_slice::<Message>(&buf) {
+                    if msg.meta.kind == SYSTEM_KIND && msg.meta.msg == MSG_WITHDRAW {
+                        if let Ok(payload) =
+                            serde_json::from_value::<WithdrawPayload>(msg.payload)
+                        {
+                            if let Ok(uuid) = Uuid::parse_str(&payload.uuid) {
+                                let mut shm = shm.lock().await;
+                                let _ = shm.unregister_node(uuid);
+                                info!(
+                                    target: "json_router",
+                                    uuid = %uuid,
+                                    "node withdrawn"
+                                );
+                            }
+                        }
+                        break;
+                    }
+                }
+                handle_forward(&buf, &shm, &fib, &nodes, &local_snapshot, &uplinks).await;
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    let mut shm = shm.lock().await;
+    let _ = shm.unregister_node(node_uuid);
+    info!(
+        target: "json_router",
+        uuid = %node_uuid,
+        "node disconnected"
+    );
+    {
+        let mut nodes = nodes.lock().await;
+        nodes.remove(&node_uuid);
+    }
+    write_task.abort();
+}
+
+async fn send_query<W>(stream: &mut W) -> Result<(), ShmError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let msg = build_query();
+    let payload = serde_json::to_vec(&msg)?;
+    write_frame(stream, &payload).await?;
+    Ok(())
+}
+
+async fn read_announce<R>(stream: &mut R) -> Result<AnnouncePayload, ShmError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let buf = time::timeout(Duration::from_millis(ANNOUNCE_TIMEOUT_MS), read_frame(stream))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "announce timeout"))??;
+
+    let Some(buf) = buf else {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "announce eof").into());
+    };
+
+    let msg = serde_json::from_slice::<Message>(&buf)?;
+    if msg.meta.kind != SYSTEM_KIND || msg.meta.msg != MSG_ANNOUNCE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected ANNOUNCE").into());
+    }
+
+    let payload = serde_json::from_value::<AnnouncePayload>(msg.payload)?;
+    Ok(payload)
+}
+
+enum Resolution {
+    Local(Uuid),
+    Uplink(u32),
+    None,
+}
+
+async fn handle_forward(
+    buf: &[u8],
+    shm: &Arc<Mutex<ShmWriter>>,
+    fib: &Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
+    nodes: &Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    local_snapshot: &Arc<Mutex<Option<ShmSnapshot>>>,
+    uplinks: &Arc<Mutex<UplinkManager>>,
+) {
+    let value: serde_json::Value = match serde_json::from_slice(buf) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+
+    let src_uuid = value
+        .get("routing")
+        .and_then(|routing| routing.get("src"))
+        .and_then(|src| src.as_str())
+        .and_then(|src| Uuid::parse_str(src).ok());
+    let ttl = value
+        .get("routing")
+        .and_then(|routing| routing.get("ttl"))
+        .and_then(|ttl| ttl.as_i64());
+
+    let dst_uuid = value
+        .get("routing")
+        .and_then(|routing| routing.get("dst"))
+        .and_then(|dst| dst.as_str())
+        .and_then(|dst| Uuid::parse_str(dst).ok());
+
+    let target = value
+        .get("meta")
+        .and_then(|meta| meta.get("target"))
+        .and_then(|target| target.as_str())
+        .map(|s| s.to_string());
+
+    if let Some(ttl) = ttl {
+        if ttl <= 0 {
+            warn!(
+                target: "json_router",
+                src = src_uuid.as_ref().map(|id| id.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                "TTL exceeded"
+            );
+            send_error(nodes, src_uuid, MSG_TTL_EXCEEDED, "ttl", "ttl exhausted").await;
+            return;
+        }
+    }
+
+    let mut outgoing = value;
+    let resolution = if let Some(dst) = dst_uuid {
+        Resolution::Local(dst)
+    } else if let Some(target) = target {
+        resolve_target(&target, shm, fib, local_snapshot).await
+    } else {
+        Resolution::None
+    };
+
+    if matches!(resolution, Resolution::None) {
+        let _ = fib;
+        warn!(
+            target: "json_router",
+            src = src_uuid.as_ref().map(|id| id.to_string()).unwrap_or_else(|| "unknown".to_string()),
+            "no route found"
+        );
+        send_error(nodes, src_uuid, MSG_UNREACHABLE, "no_route", "destination not found").await;
+        return;
+    }
+
+    if let Resolution::Local(dst_uuid) = &resolution {
+        if let Some(routing) = outgoing.get_mut("routing") {
+            routing["dst"] = serde_json::Value::String(dst_uuid.to_string());
+        }
+    }
+
+    decrement_ttl(&mut outgoing);
+    let outgoing = match serde_json::to_vec(&outgoing) {
+        Ok(data) => data,
+        Err(_) => return,
+    };
+
+    match resolution {
+        Resolution::Local(dst_uuid) => {
+            let sender = {
+                let nodes = nodes.lock().await;
+                nodes.get(&dst_uuid).cloned()
+            };
+
+            if let Some(sender) = sender {
+                info!(
+                    target: "json_router",
+                    src = src_uuid.as_ref().map(|id| id.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                    dst = %dst_uuid,
+                    "forwarded"
+                );
+                let _ = sender.send(outgoing);
+            } else {
+                warn!(
+                    target: "json_router",
+                    dst = %dst_uuid,
+                    "destination not connected"
+                );
+                send_error(nodes, src_uuid, MSG_UNREACHABLE, "no_route", "destination not connected").await;
+            }
+        }
+        Resolution::Uplink(link_id) => {
+            let mut uplinks = uplinks.lock().await;
+            if uplinks.send_on_link(link_id, outgoing).is_err() {
+                warn!(target: "json_router", link_id, "uplink send failed");
+            }
+        }
+        Resolution::None => {}
+    }
+}
+
+async fn resolve_target(
+    target: &str,
+    shm: &Arc<Mutex<ShmWriter>>,
+    fib: &Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
+    local_snapshot: &Arc<Mutex<Option<ShmSnapshot>>>,
+) -> Resolution {
+    let snapshot = {
+        let cached = local_snapshot.lock().await;
+        cached.clone()
+    };
+    let snapshot = match snapshot {
+        Some(snapshot) => snapshot,
+        None => {
+            let shm = shm.lock().await;
+            match shm.read_snapshot() {
+                Some(snapshot) => snapshot,
+                None => return Resolution::None,
+            }
+        }
+    };
+
+    let fib = fib.lock().await;
+    let route = match fib
+        .iter()
+        .find(|route| route.is_active() && route_matches(route, target))
+    {
+        Some(route) => route,
+        None => return Resolution::None,
+    };
+
+    if route.out_link != LINK_LOCAL {
+        return Resolution::Uplink(route.out_link);
+    }
+
+    match_local_node(route, &snapshot.nodes)
+        .map(Resolution::Local)
+        .unwrap_or(Resolution::None)
+}
+
+fn route_matches(route: &crate::shm::RouteEntry, target: &str) -> bool {
+    let target_bytes = target.as_bytes();
+    let prefix_len = route.prefix_len as usize;
+    if prefix_len == 0 || prefix_len > route.prefix.len() {
+        return false;
+    }
+    let pattern = &route.prefix[..prefix_len];
+    match route.match_kind {
+        MATCH_EXACT => target_bytes == pattern,
+        MATCH_PREFIX => {
+            target_bytes.starts_with(pattern)
+                && (target_bytes.len() == prefix_len || target_bytes.get(prefix_len) == Some(&b'.'))
+        }
+        MATCH_GLOB => wildcard_match(pattern, target_bytes),
+        _ => false,
+    }
+}
+
+fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
+    let mut p = 0usize;
+    let mut t = 0usize;
+    let mut star = None;
+    let mut match_idx = 0usize;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == text[t] || pattern[p] == b'?') {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            match_idx = t;
+            p += 1;
+        } else if let Some(star_pos) = star {
+            p = star_pos + 1;
+            match_idx += 1;
+            t = match_idx;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+fn match_local_node(
+    route: &crate::shm::RouteEntry,
+    nodes: &[crate::shm::nodes::NodeEntry],
+) -> Option<Uuid> {
+    let pattern = route_prefix(route);
+    for node in nodes {
+        if !node.is_active() {
+            continue;
+        }
+        let name_len = node.name_len as usize;
+        let name = &node.name[..name_len];
+        let matches = match route.match_kind {
+            MATCH_EXACT => name == pattern,
+            MATCH_PREFIX => {
+                name.starts_with(pattern)
+                    && (name.len() == pattern.len() || name.get(pattern.len()) == Some(&b'.'))
+            }
+            MATCH_GLOB => wildcard_match(route_prefix(route), name),
+            _ => false,
+        };
+        if matches {
+            return Uuid::from_slice(&node.uuid).ok();
+        }
+    }
+    None
+}
+
+fn route_prefix(route: &crate::shm::RouteEntry) -> &[u8] {
+    &route.prefix[..route.prefix_len as usize]
+}
+
+fn decrement_ttl(value: &mut serde_json::Value) {
+    if let Some(ttl) = value
+        .get_mut("routing")
+        .and_then(|routing| routing.get_mut("ttl"))
+        .and_then(|ttl| ttl.as_i64())
+    {
+        let new_ttl = (ttl - 1).max(0);
+        if let Some(routing) = value.get_mut("routing") {
+            routing["ttl"] = serde_json::Value::Number(new_ttl.into());
+        }
+    }
+}
+
+struct PeerManager {
+    peers: Vec<PeerHandle>,
+}
+
+struct PeerHandle {
+    name: String,
+    reader: Option<ShmReader>,
+    generation: Option<u64>,
+}
+
+struct PeerSnapshot {
+    router_uuid: [u8; 16],
+    nodes: Vec<crate::shm::nodes::NodeEntry>,
+    routes: Vec<crate::shm::routes::RouteEntry>,
+}
+
+impl PeerManager {
+    fn new(names: Vec<String>) -> Self {
+        let peers = names
+            .into_iter()
+            .map(|name| PeerHandle {
+                name,
+                reader: None,
+                generation: None,
+            })
+            .collect();
+        Self { peers }
+    }
+
+    fn refresh(&mut self) -> Vec<PeerSnapshot> {
+        let mut out = Vec::new();
+        for peer in &mut self.peers {
+            if peer.reader.is_none() {
+                if let Ok(reader) = ShmReader::open_read_only(&peer.name) {
+                    peer.reader = Some(reader);
+                    peer.generation = None;
+                } else {
+                    continue;
+                }
+            }
+
+            let Some(reader) = peer.reader.as_ref() else {
+                continue;
+            };
+
+            let snapshot = match reader.read_snapshot() {
+                Some(snapshot) => snapshot,
+                None => continue,
+            };
+
+            if heartbeat_stale(snapshot.heartbeat) {
+                peer.reader = None;
+                peer.generation = None;
+                continue;
+            }
+
+            if let Some(prev) = peer.generation {
+                if prev != snapshot.generation {
+                    peer.reader = None;
+                    peer.generation = None;
+                    continue;
+                }
+            }
+
+            peer.generation = Some(snapshot.generation);
+            out.push(PeerSnapshot {
+                router_uuid: snapshot.router_uuid,
+                nodes: snapshot.nodes,
+                routes: snapshot.routes,
+            });
+        }
+        out
+    }
+}
+
+fn build_fib(local: &ShmSnapshot, peers: &[PeerSnapshot]) -> Vec<crate::shm::RouteEntry> {
+    let mut fib = Vec::new();
+
+    for route in &local.routes {
+        if route.is_active() {
+            fib.push(*route);
+        }
+    }
+
+    for peer in peers {
+        for node in &peer.nodes {
+            if !node.is_active() {
+                continue;
+            }
+            let mut route = crate::shm::RouteEntry::default();
+            let name_len = node.name_len as usize;
+            route.prefix[..name_len].copy_from_slice(&node.name[..name_len]);
+            route.prefix_len = node.name_len;
+            route.match_kind = MATCH_EXACT;
+            route.route_type = ROUTE_LSA;
+            route.next_hop_router = peer.router_uuid;
+            route.out_link = LINK_LOCAL;
+            route.metric = 1;
+            route.admin_distance = AD_LSA;
+            route.flags = FLAG_ACTIVE;
+            fib.push(route);
+        }
+
+        for route in &peer.routes {
+            if !route.is_active() || route.route_type != ROUTE_STATIC {
+                continue;
+            }
+            let mut derived = *route;
+            derived.route_type = ROUTE_LSA;
+            derived.admin_distance = AD_LSA;
+            derived.next_hop_router = peer.router_uuid;
+            derived.out_link = LINK_LOCAL;
+            fib.push(derived);
+        }
+    }
+
+    fib
+}
+
+fn route_cmp(a: &crate::shm::RouteEntry, b: &crate::shm::RouteEntry) -> std::cmp::Ordering {
+    b.prefix_len
+        .cmp(&a.prefix_len)
+        .then_with(|| a.admin_distance.cmp(&b.admin_distance))
+        .then_with(|| a.metric.cmp(&b.metric))
+}
+
+fn heartbeat_stale(heartbeat: u64) -> bool {
+    let now = now_epoch_ms();
+    now.saturating_sub(heartbeat) > crate::shm::HEARTBEAT_STALE_MS
+}
+
+fn now_epoch_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+async fn send_error(
+    nodes: &Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    src_uuid: Option<Uuid>,
+    msg: &str,
+    reason: &str,
+    detail: &str,
+) {
+    let Some(src_uuid) = src_uuid else {
+        return;
+    };
+    let payload = build_error(msg, reason, detail, &src_uuid.to_string());
+    let data = match serde_json::to_vec(&payload) {
+        Ok(data) => data,
+        Err(_) => return,
+    };
+    let sender = {
+        let nodes = nodes.lock().await;
+        nodes.get(&src_uuid).cloned()
+    };
+    if let Some(sender) = sender {
+        let _ = sender.send(data);
+    }
+}
+
+struct UplinkManager {
+    links: HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>,
+    next_link_id: u32,
+}
+
+impl UplinkManager {
+    fn new() -> Self {
+        Self {
+            links: HashMap::new(),
+            next_link_id: 1,
+        }
+    }
+
+    fn allocate_link_id(&mut self) -> u32 {
+        let id = self.next_link_id;
+        self.next_link_id = self.next_link_id.saturating_add(1);
+        id
+    }
+
+    fn register_link(&mut self, link_id: u32, sender: mpsc::UnboundedSender<Vec<u8>>) {
+        self.links.insert(link_id, sender);
+    }
+
+    fn send_on_link(&mut self, link_id: u32, payload: Vec<u8>) -> Result<(), ()> {
+        if let Some(sender) = self.links.get(&link_id) {
+            sender.send(payload).map_err(|_| ())
+        } else {
+            Err(())
+        }
+    }
+}
+
+async fn uplink_listen_loop(
+    addr: String,
+    shm: Arc<Mutex<ShmWriter>>,
+    fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
+    uplinks: Arc<Mutex<UplinkManager>>,
+) -> io::Result<()> {
+    let listener = TcpListener::bind(&addr).await?;
+    info!(target: "json_router", addr = %addr, "uplink listening");
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let shm = Arc::clone(&shm);
+        let fib = Arc::clone(&fib);
+        let nodes = Arc::clone(&nodes);
+        let snapshot_cache = Arc::clone(&snapshot_cache);
+        let uplinks = Arc::clone(&uplinks);
+        tokio::spawn(async move {
+            let link_id = {
+                let mut uplinks = uplinks.lock().await;
+                uplinks.allocate_link_id()
+            };
+            if let Err(err) = handle_uplink_connection(
+                stream,
+                UplinkRole::Acceptor,
+                link_id,
+                shm,
+                fib,
+                nodes,
+                snapshot_cache,
+                uplinks,
+            )
+            .await
+            {
+                warn!(target: "json_router", "uplink accept error: {}", err);
+            }
+        });
+    }
+}
+
+async fn uplink_connect_loop(
+    peers: Vec<crate::config::UplinkPeerConfig>,
+    shm: Arc<Mutex<ShmWriter>>,
+    fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
+    uplinks: Arc<Mutex<UplinkManager>>,
+) {
+    for peer in peers {
+        let shm = Arc::clone(&shm);
+        let fib = Arc::clone(&fib);
+        let nodes = Arc::clone(&nodes);
+        let snapshot_cache = Arc::clone(&snapshot_cache);
+        let uplinks = Arc::clone(&uplinks);
+        tokio::spawn(async move {
+            loop {
+                match TcpStream::connect(&peer.addr).await {
+                    Ok(stream) => {
+                        let link_id = peer.link_id;
+                        if let Err(err) = handle_uplink_connection(
+                            stream,
+                            UplinkRole::Initiator,
+                            link_id,
+                            Arc::clone(&shm),
+                            Arc::clone(&fib),
+                            Arc::clone(&nodes),
+                            Arc::clone(&snapshot_cache),
+                            Arc::clone(&uplinks),
+                        )
+                        .await
+                        {
+                            warn!(
+                                target: "json_router",
+                                addr = %peer.addr,
+                                "uplink connect error: {}",
+                                err
+                            );
+                        }
+                    }
+                    Err(_) => {}
+                }
+                time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+    }
+}
+
+enum UplinkRole {
+    Initiator,
+    Acceptor,
+}
+
+async fn handle_uplink_connection(
+    stream: TcpStream,
+    role: UplinkRole,
+    link_id: u32,
+    shm: Arc<Mutex<ShmWriter>>,
+    fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
+    uplinks: Arc<Mutex<UplinkManager>>,
+) -> io::Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    let hello = {
+        let shm = shm.lock().await;
+        let name = shm.name().to_string();
+        let router_uuid = Uuid::from_slice(&shm.header().router_uuid).unwrap_or_else(|_| Uuid::nil());
+        let island_id = {
+            let raw = &shm.header().island_id[..shm.header().island_id_len as usize];
+            String::from_utf8_lossy(raw).to_string()
+        };
+        build_hello(router_uuid, &island_id, &name)
+    };
+
+    let peer = match role {
+        UplinkRole::Initiator => {
+            send_message(&mut writer, &hello).await?;
+            read_hello(&mut reader).await?
+        }
+        UplinkRole::Acceptor => {
+            let peer = read_hello(&mut reader).await?;
+            send_message(&mut writer, &hello).await?;
+            peer
+        }
+    };
+
+    info!(
+        target: "json_router",
+        link_id,
+        peer = %peer.router_id,
+        "uplink established"
+    );
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    {
+        let mut uplinks = uplinks.lock().await;
+        uplinks.register_link(link_id, tx);
+    }
+
+    tokio::spawn(async move {
+        while let Some(payload) = rx.recv().await {
+            if write_frame(&mut writer, &payload).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        match read_frame(&mut reader).await? {
+            Some(buf) => {
+                handle_forward(&buf, &shm, &fib, &nodes, &snapshot_cache, &uplinks).await;
+            }
+            None => break,
+        }
+    }
+
+    Ok(())
+}
+
+async fn read_hello<R>(reader: &mut R) -> io::Result<HelloPayload>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(buf) = read_frame(reader).await? else {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "uplink hello eof"));
+    };
+    let msg = serde_json::from_slice::<Message<HelloPayload>>(&buf)?;
+    if msg.meta.kind != SYSTEM_KIND || msg.meta.msg != MSG_HELLO {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected HELLO"));
+    }
+    Ok(msg.payload)
+}
+
+async fn send_message<W>(writer: &mut W, msg: &Message<HelloPayload>) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let payload = serde_json::to_vec(msg)?;
+    write_frame(writer, &payload).await
+}

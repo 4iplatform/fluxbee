@@ -1,7 +1,7 @@
 # JSON Router - Especificación Técnica
 
-**Estado:** Draft v0.6
-**Fecha:** 2025-01-16
+**Estado:** Draft v0.7
+**Fecha:** 2025-01-17
 
 ---
 
@@ -288,6 +288,30 @@ El servicio de tiempo es responsabilidad del router o de un nodo SY.time dedicad
 | IO | Infraestructura de comunicación (canales) | `IO.<medio>.<identificador>` |
 | WF | APIs/Programación (acciones) | `WF.<verbo>.<objeto>.<variante>` |
 | SY | Infraestructura del sistema (servicios) | `SY.<servicio>.<instancia>` |
+| RT | Routers (infraestructura de red) | `RT.<isla>.<rol>` |
+
+#### Nodos RT (Routers)
+
+Los routers también tienen identificador capa 2, siguiendo el patrón de infraestructura:
+
+```
+RT.<isla>.<rol>
+```
+
+| Campo | Descripción | Ejemplos |
+|-------|-------------|----------|
+| isla | Identificador de la isla | produccion, staging, desarrollo |
+| rol | Función dentro de la isla | primary, secondary, backup |
+
+**Ejemplos:**
+```
+RT.produccion.primary
+RT.produccion.secondary
+RT.staging.main
+RT.desarrollo.local
+```
+
+El nombre capa 2 del router se define en la configuración de la isla y es estable. El UUID (capa 1) se genera automáticamente en el primer arranque y se persiste.
 
 ### 7. Estructura del Mensaje
 
@@ -2231,17 +2255,344 @@ Muestra la vista consolidada (FIB) combinando todas las regiones.
 
 ---
 
-## Parte VI: Implementación
+## Parte VI: Configuración y Arranque
 
-### 27. Router: Loop Principal
+Esta sección describe la estructura completa de configuración del sistema, separando claramente la configuración administrativa (lo que el admin define) del estado de runtime (lo que el sistema genera al arrancar).
+
+### 27. Estructura de Directorios
+
+```
+/etc/json-router/                      # Configuración (admin crea)
+├── island.yaml                        # Config de la isla
+└── routers/                           # Config por router
+    ├── RT.produccion.primary/
+    │   └── config.yaml
+    └── RT.produccion.secondary/
+        └── config.yaml
+
+./state/                               # Estado de runtime (router crea)
+└── RT.produccion.primary/
+    └── identity.yaml                  # UUID y datos de HW
+```
+
+**Nota:** El directorio `state/` es relativo al working directory del proceso. Puede configurarse en `island.yaml`.
+
+### 28. Configuración de Isla
+
+El archivo `island.yaml` define la configuración común a todos los routers de una isla.
+
+#### 28.1 Archivo: `/etc/json-router/island.yaml`
+
+```yaml
+# Configuración de la isla
+# Este archivo es compartido por todos los routers de la isla
+
+island:
+  id: produccion                       # Identificador único de la isla
+
+# Directorios de trabajo
+paths:
+  state_dir: ./state                   # Donde se guarda el estado de runtime
+  node_socket_dir: /var/run/mesh/nodes # Donde los nodos crean sus sockets
+  shm_prefix: /jsr-                    # Prefijo para regiones de shared memory
+
+# Timers (valores en milisegundos)
+timers:
+  hello_interval_ms: 10000             # HELLO entre routers cada 10s
+  dead_interval_ms: 40000              # Sin HELLO por 40s = peer muerto
+  heartbeat_interval_ms: 5000          # Actualizar heartbeat en shm cada 5s
+  heartbeat_stale_ms: 30000            # Heartbeat > 30s = región stale
+
+# Configuración WAN
+wan:
+  listen: "0.0.0.0:9000"               # Puerto para conexiones entrantes (opcional)
+  
+  # Uplinks a otras islas
+  uplinks:
+    - address: "10.0.1.2:9000"
+      island: staging
+    - address: "router.us-east.example.com:9000"
+      island: produccion-us
+
+# Routers autorizados en esta isla
+# El nombre debe seguir el patrón RT.<isla>.<rol>
+routers:
+  - name: RT.produccion.primary
+  - name: RT.produccion.secondary
+```
+
+#### 28.2 Campos obligatorios
+
+| Campo | Descripción |
+|-------|-------------|
+| `island.id` | Identificador único de la isla |
+| `routers[].name` | Lista de routers autorizados |
+
+#### 28.3 Campos con defaults
+
+| Campo | Default | Descripción |
+|-------|---------|-------------|
+| `paths.state_dir` | `./state` | Directorio para estado de runtime |
+| `paths.node_socket_dir` | `/var/run/mesh/nodes` | Directorio de sockets de nodos |
+| `paths.shm_prefix` | `/jsr-` | Prefijo para nombres de shm |
+| `timers.hello_interval_ms` | `10000` | Intervalo de HELLO |
+| `timers.dead_interval_ms` | `40000` | Timeout para peer muerto |
+| `timers.heartbeat_interval_ms` | `5000` | Intervalo de heartbeat |
+| `timers.heartbeat_stale_ms` | `30000` | Timeout para región stale |
+
+### 29. Configuración de Router
+
+Cada router puede tener configuración específica que sobreescribe los valores de la isla.
+
+#### 29.1 Archivo: `/etc/json-router/routers/<name>/config.yaml`
+
+```yaml
+# Configuración específica del router RT.produccion.primary
+# Valores aquí sobreescriben los de island.yaml
+
+# Override de WAN para este router específico
+wan:
+  listen: "10.0.1.1:9000"              # Bind a IP específica
+
+# Override de timers (opcional)
+timers:
+  hello_interval_ms: 5000              # Este router hace HELLO más frecuente
+```
+
+Este archivo es **opcional**. Si no existe, el router usa los valores de `island.yaml`.
+
+### 30. Estado de Runtime (Identity)
+
+El estado de runtime contiene datos generados automáticamente que deben persistir entre reinicios.
+
+#### 30.1 Archivo: `<state_dir>/<router_name>/identity.yaml`
+
+```yaml
+# AUTO-GENERADO - NO EDITAR MANUALMENTE
+# Este archivo es creado por el router en su primer arranque
+
+# Identificación capa 1 (hardware/instancia)
+layer1:
+  uuid: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+
+# Identificación capa 2 (configuración)
+layer2:
+  name: RT.produccion.primary
+
+# Shared memory
+shm:
+  name: /jsr-a1b2c3d4-e5f6-7890-abcd-ef1234567890
+
+# Timestamps
+created_at: 2025-01-16T10:30:00Z
+created_at_ms: 1737023400000
+
+# Información del sistema (para diagnóstico)
+system:
+  hostname: server-prod-01
+  pid_at_creation: 12345
+```
+
+#### 30.2 Campos del identity
+
+| Campo | Generado | Descripción |
+|-------|----------|-------------|
+| `layer1.uuid` | Primer arranque | UUID único del router, nunca cambia |
+| `layer2.name` | De `--name` | Nombre capa 2, debe coincidir con config |
+| `shm.name` | Derivado de UUID | Nombre de la región de shared memory |
+| `created_at` | Primer arranque | Timestamp ISO-8601 de creación |
+| `created_at_ms` | Primer arranque | Timestamp en epoch milliseconds |
+| `system.hostname` | Primer arranque | Hostname del servidor (diagnóstico) |
+| `system.pid_at_creation` | Primer arranque | PID del proceso que creó el identity |
+
+### 31. Flujo de Arranque
+
+```
+json-router --name RT.produccion.primary [--config /etc/json-router]
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Cargar island.yaml                                       │
+│    - Leer /etc/json-router/island.yaml                     │
+│    - Validar estructura                                     │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Validar router autorizado                                │
+│    - Buscar --name en island.routers[]                     │
+│    - Si no existe → ERROR: router no autorizado            │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Cargar config del router (opcional)                      │
+│    - Leer routers/<name>/config.yaml si existe             │
+│    - Merge con valores de island.yaml                       │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. Cargar o crear identity                                  │
+│    - Buscar state/<name>/identity.yaml                     │
+│                                                             │
+│    ┌─ Existe ─────────────────────────────────────────┐    │
+│    │  - Leer UUID                                      │    │
+│    │  - Validar layer2.name == --name                 │    │
+│    │  - Validar con island.id si presente             │    │
+│    └───────────────────────────────────────────────────┘    │
+│                                                             │
+│    ┌─ No existe ──────────────────────────────────────┐    │
+│    │  - Generar UUID nuevo                            │    │
+│    │  - Crear directorio state/<name>/                │    │
+│    │  - Escribir identity.yaml                        │    │
+│    │  - El router "nace"                              │    │
+│    └───────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 5. Inicializar shared memory                                │
+│    - shm_name = shm_prefix + uuid                          │
+│    - Verificar si existe región previa (crash recovery)    │
+│    - Crear o reclamar región                               │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 6. Iniciar servicios                                        │
+│    - Escuchar en node_socket_dir (inotify)                 │
+│    - Bind en wan.listen si configurado                      │
+│    - Conectar a wan.uplinks[]                              │
+│    - Iniciar loop principal                                 │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+         Router operativo
+```
+
+### 32. Validaciones de Arranque
+
+| Validación | Error | Acción |
+|------------|-------|--------|
+| `--name` no está en `island.routers[]` | Router no autorizado | EXIT 1 |
+| `island.yaml` no existe | Config no encontrada | EXIT 1 |
+| `identity.yaml` existe pero `layer2.name` no coincide | Identity corrupta | EXIT 1 |
+| Región shm existe y owner está vivo | Otro proceso usa este router | EXIT 1 |
+| `state_dir` no es escribible | No puede crear state | EXIT 1 |
+
+### 33. Reset de Identidad
+
+Para que un router "nazca de nuevo" con UUID diferente:
+
+```bash
+# Detener el router
+systemctl stop json-router@RT.produccion.primary
+
+# Borrar identity (esto borra el UUID)
+rm -rf ./state/RT.produccion.primary/
+
+# Reiniciar (generará nuevo UUID)
+systemctl start json-router@RT.produccion.primary
+```
+
+**Advertencia:** Esto hace que el router sea una entidad nueva para la red. Los peers tendrán rutas al UUID viejo que quedarán huérfanas hasta que expiren.
+
+### 34. Ejemplo Completo
+
+#### Escenario: Isla "produccion" con dos routers
+
+**Estructura de archivos:**
+
+```
+/etc/json-router/
+├── island.yaml
+└── routers/
+    ├── RT.produccion.primary/
+    │   └── config.yaml
+    └── RT.produccion.secondary/
+        └── config.yaml
+
+./state/                               # Creado automáticamente
+├── RT.produccion.primary/
+│   └── identity.yaml
+└── RT.produccion.secondary/
+    └── identity.yaml
+```
+
+**island.yaml:**
+```yaml
+island:
+  id: produccion
+
+paths:
+  state_dir: ./state
+  node_socket_dir: /var/run/mesh/nodes
+
+timers:
+  hello_interval_ms: 10000
+  dead_interval_ms: 40000
+
+wan:
+  listen: "0.0.0.0:9000"
+  uplinks:
+    - address: "staging.internal:9000"
+      island: staging
+
+routers:
+  - name: RT.produccion.primary
+  - name: RT.produccion.secondary
+```
+
+**routers/RT.produccion.primary/config.yaml:**
+```yaml
+wan:
+  listen: "10.0.1.1:9000"
+```
+
+**routers/RT.produccion.secondary/config.yaml:**
+```yaml
+wan:
+  listen: "10.0.1.2:9000"
+```
+
+**Arranque:**
+```bash
+# En servidor 1
+json-router --name RT.produccion.primary --config /etc/json-router
+
+# En servidor 2
+json-router --name RT.produccion.secondary --config /etc/json-router
+```
+
+**state/RT.produccion.primary/identity.yaml (auto-generado):**
+```yaml
+layer1:
+  uuid: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+layer2:
+  name: RT.produccion.primary
+shm:
+  name: /jsr-a1b2c3d4-e5f6-7890-abcd-ef1234567890
+created_at: 2025-01-16T10:30:00Z
+created_at_ms: 1737023400000
+system:
+  hostname: server-prod-01
+  pid_at_creation: 12345
+```
+
+---
+
+## Parte VII: Implementación
+
+### 35. Router: Loop Principal
 
 *Por definir: pseudocódigo del ciclo epoll/read/route/write.*
 
-### 28. Librería de Nodo (Node.js)
+### 36. Librería de Nodo (Node.js)
 
 *Por definir: API para que los nodos se comuniquen con el router.*
 
-### 29. Librería de Nodo (Rust)
+### 37. Librería de Nodo (Rust)
 
 *Por definir: crate compartido para nodos escritos en Rust.*
 
@@ -2252,12 +2603,15 @@ Muestra la vista consolidada (FIB) combinando todas las regiones.
 ### A. Glosario
 
 - **Nodo**: Proceso que procesa mensajes (AI, WF, IO, o SY).
-- **Router**: Proceso que mueve mensajes entre nodos.
+- **Router**: Proceso que mueve mensajes entre nodos, identificado como RT.
 - **Link**: Conexión socket entre nodo y router.
-- **IP lógica**: Identificador único de un nodo en el sistema (UUID).
+- **IP lógica**: Identificador único de un nodo en el sistema (UUID, capa 1).
+- **Nombre capa 2**: Identificador descriptivo jerárquico (ej: AI.soporte.l1, RT.produccion.primary).
 - **Rol**: Capacidad abstracta de un nodo (ej: "soporte", "facturación").
 - **Framing**: Delimitación de mensajes en un stream de bytes (length prefix).
-- **Isla**: Dominio local con su propio router, conectado a otras islas via WAN.
+- **Isla**: Dominio local con sus routers, conectado a otras islas via WAN.
+- **island.yaml**: Archivo de configuración de la isla (admin crea).
+- **identity.yaml**: Archivo de estado del router con UUID (auto-generado).
 - **Región shm**: Área de shared memory de un router específico (cada router tiene la suya).
 - **RIB**: Routing Information Base - todas las rutas candidatas (distribuidas en múltiples regiones).
 - **FIB**: Forwarding Information Base - rutas ganadoras compiladas en memoria local.
@@ -2292,6 +2646,11 @@ Muestra la vista consolidada (FIB) combinando todas las regiones.
 | RouteEntry con next-hop | Destino final | Modelo estándar de redes, routing hop-by-hop |
 | Strings con length explícito | Null-terminated | Comparaciones rápidas, evita escanear 256 bytes |
 | UTF-8 para strings | ASCII estricto | Soporte internacional (español, etc.) |
+| YAML para configuración | TOML | Más estándar, mejor soporte en editores |
+| Separar config (island.yaml) de state (identity.yaml) | Todo en un archivo | Config es admin, state es auto-generado |
+| UUID en identity.yaml, no en config | UUID manual en config | UUID debe ser estable pero no configurado manualmente |
+| Router name capa 2 (RT.*) | Solo UUID | Consistente con nomenclatura de nodos, legible |
+| state_dir relativo (./state) | Path absoluto fijo | Flexible, permite múltiples instancias en desarrollo |
 
 ### C. Referencias
 
@@ -2304,3 +2663,4 @@ Muestra la vista consolidada (FIB) combinando todas las regiones.
 - [Rust Atomics and Locks](https://marabos.nl/atomics/)
 - [memmap2 crate](https://docs.rs/memmap2)
 - [nix crate](https://docs.rs/nix)
+- [YAML 1.2 Spec](https://yaml.org/spec/1.2.2/)
