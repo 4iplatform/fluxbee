@@ -1,0 +1,11 @@
+layer1:
+  uuid: 7075c134-9f86-41d5-9ed7-9c48b11dc453
+layer2:
+  name: RT.sandbox.edge
+shm:
+  name: /jsr-7075c134b11dc453
+created_at: 2026-01-17T18:05:31.290546+00:00
+created_at_ms: 1768673131290
+system:
+  hostname: unknown
+  pid_at_creation: 34212

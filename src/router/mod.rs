@@ -12,9 +12,9 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::protocol::system::{
-    build_error, build_hello, build_query, AnnouncePayload, HelloPayload, Message,
-    WithdrawPayload, MSG_ANNOUNCE, MSG_HELLO, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW,
-    SYSTEM_KIND,
+    build_error, build_hello, build_lsa, build_query, AnnouncePayload, HelloPayload, LsaPayload,
+    Message, NodeDescriptor, WithdrawPayload, MSG_ANNOUNCE, MSG_HELLO, MSG_LSA, MSG_TTL_EXCEEDED,
+    MSG_UNREACHABLE, MSG_WITHDRAW, SYSTEM_KIND,
 };
 use crate::shm::{
     ShmError, ShmReader, ShmSnapshot, ShmWriter, AD_LSA, FLAG_ACTIVE, LINK_LOCAL, MATCH_EXACT,
@@ -36,7 +36,7 @@ pub struct Router {
 
 impl Router {
     pub fn new(cfg: Config) -> Result<Self, ShmError> {
-        let shm = ShmWriter::open_or_create(cfg.router_uuid, &cfg.island_id)?;
+        let shm = ShmWriter::open_or_create(cfg.router_uuid, &cfg.island_id, &cfg.shm_name)?;
         Ok(Self {
             cfg,
             shm: Arc::new(Mutex::new(shm)),
@@ -108,7 +108,7 @@ impl Router {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let new_paths = scan_node_sockets(&self.cfg.nodes_dir).await;
+                    let new_paths = scan_node_sockets(&self.cfg.node_socket_dir).await;
                     for path in new_paths {
                         if connected.contains(&path) {
                             continue;
@@ -207,6 +207,7 @@ async fn handle_node_connection(
         let mut shm = shm.lock().await;
         let _ = shm.register_node(node_uuid, &announce.name);
     }
+    send_lsa(&shm, &uplinks).await;
     info!(
         target: "json_router",
         node = %announce.name,
@@ -236,13 +237,16 @@ async fn handle_node_connection(
                             serde_json::from_value::<WithdrawPayload>(msg.payload)
                         {
                             if let Ok(uuid) = Uuid::parse_str(&payload.uuid) {
-                                let mut shm = shm.lock().await;
-                                let _ = shm.unregister_node(uuid);
+                                {
+                                    let mut shm = shm.lock().await;
+                                    let _ = shm.unregister_node(uuid);
+                                }
                                 info!(
                                     target: "json_router",
                                     uuid = %uuid,
                                     "node withdrawn"
                                 );
+                                send_lsa(&shm, &uplinks).await;
                             }
                         }
                         break;
@@ -255,13 +259,16 @@ async fn handle_node_connection(
         }
     }
 
-    let mut shm = shm.lock().await;
-    let _ = shm.unregister_node(node_uuid);
+    {
+        let mut shm = shm.lock().await;
+        let _ = shm.unregister_node(node_uuid);
+    }
     info!(
         target: "json_router",
         uuid = %node_uuid,
         "node disconnected"
     );
+    send_lsa(&shm, &uplinks).await;
     {
         let mut nodes = nodes.lock().await;
         nodes.remove(&node_uuid);
@@ -354,9 +361,43 @@ async fn handle_forward(
     }
 
     let mut outgoing = value;
-    let resolution = if let Some(dst) = dst_uuid {
-        Resolution::Local(dst)
-    } else if let Some(target) = target {
+    if let Some(dst) = dst_uuid {
+        if let Some(sender) = {
+            let nodes = nodes.lock().await;
+            nodes.get(&dst).cloned()
+        } {
+            decrement_ttl(&mut outgoing);
+            if let Ok(outgoing) = serde_json::to_vec(&outgoing) {
+                let _ = sender.send(outgoing);
+            }
+            return;
+        }
+
+        let link_id = {
+            let uplinks = uplinks.lock().await;
+            uplinks.route_uuid(&dst)
+        };
+        if let Some(link_id) = link_id {
+            decrement_ttl(&mut outgoing);
+            if let Ok(outgoing) = serde_json::to_vec(&outgoing) {
+                let mut uplinks = uplinks.lock().await;
+                if uplinks.send_on_link(link_id, outgoing).is_err() {
+                    warn!(target: "json_router", link_id, "uplink send failed");
+                }
+            }
+            return;
+        }
+
+        warn!(
+            target: "json_router",
+            dst = %dst,
+            "no route found"
+        );
+        send_error(nodes, src_uuid, MSG_UNREACHABLE, "no_route", "destination not found").await;
+        return;
+    }
+
+    let resolution = if let Some(target) = target {
         resolve_target(&target, shm, fib, local_snapshot).await
     } else {
         Resolution::None
@@ -710,8 +751,56 @@ async fn send_error(
     }
 }
 
+async fn send_lsa(shm: &Arc<Mutex<ShmWriter>>, uplinks: &Arc<Mutex<UplinkManager>>) {
+    let snapshot = {
+        let shm = shm.lock().await;
+        shm.read_snapshot()
+    };
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    let router_uuid = Uuid::from_slice(&snapshot.router_uuid).unwrap_or_else(|_| Uuid::nil());
+    let mut nodes = Vec::new();
+    for node in snapshot.nodes {
+        if !node.is_active() {
+            continue;
+        }
+        let name = String::from_utf8_lossy(&node.name[..node.name_len as usize]).to_string();
+        let uuid = Uuid::from_slice(&node.uuid).unwrap_or_else(|_| Uuid::nil());
+        nodes.push(NodeDescriptor {
+            uuid: uuid.to_string(),
+            name,
+        });
+    }
+    let lsa = build_lsa(router_uuid, nodes);
+    if let Ok(payload) = serde_json::to_vec(&lsa) {
+        let mut uplinks = uplinks.lock().await;
+        uplinks.broadcast(payload);
+    }
+}
+
+async fn handle_lsa_frame(
+    buf: &[u8],
+    link_id: u32,
+    uplinks: &Arc<Mutex<UplinkManager>>,
+) -> bool {
+    let Ok(msg) = serde_json::from_slice::<Message<serde_json::Value>>(buf) else {
+        return false;
+    };
+    if msg.meta.kind != SYSTEM_KIND || msg.meta.msg != MSG_LSA {
+        return false;
+    }
+    let Ok(payload) = serde_json::from_value::<LsaPayload>(msg.payload) else {
+        return true;
+    };
+    let mut uplinks = uplinks.lock().await;
+    uplinks.update_lsa(link_id, payload.nodes);
+    true
+}
+
 struct UplinkManager {
     links: HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>,
+    peer_nodes: HashMap<u32, HashMap<Uuid, String>>,
     next_link_id: u32,
 }
 
@@ -719,6 +808,7 @@ impl UplinkManager {
     fn new() -> Self {
         Self {
             links: HashMap::new(),
+            peer_nodes: HashMap::new(),
             next_link_id: 1,
         }
     }
@@ -739,6 +829,31 @@ impl UplinkManager {
         } else {
             Err(())
         }
+    }
+
+    fn broadcast(&mut self, payload: Vec<u8>) {
+        for sender in self.links.values() {
+            let _ = sender.send(payload.clone());
+        }
+    }
+
+    fn update_lsa(&mut self, link_id: u32, nodes: Vec<NodeDescriptor>) {
+        let mut map = HashMap::new();
+        for node in nodes {
+            if let Ok(uuid) = Uuid::parse_str(&node.uuid) {
+                map.insert(uuid, node.name);
+            }
+        }
+        self.peer_nodes.insert(link_id, map);
+    }
+
+    fn route_uuid(&self, uuid: &Uuid) -> Option<u32> {
+        for (link_id, nodes) in &self.peer_nodes {
+            if nodes.contains_key(uuid) {
+                return Some(*link_id);
+            }
+        }
+        None
     }
 }
 
@@ -880,6 +995,7 @@ async fn handle_uplink_connection(
         let mut uplinks = uplinks.lock().await;
         uplinks.register_link(link_id, tx);
     }
+    send_lsa(&shm, &uplinks).await;
 
     tokio::spawn(async move {
         while let Some(payload) = rx.recv().await {
@@ -892,6 +1008,9 @@ async fn handle_uplink_connection(
     loop {
         match read_frame(&mut reader).await? {
             Some(buf) => {
+                if handle_lsa_frame(&buf, link_id, &uplinks).await {
+                    continue;
+                }
                 handle_forward(&buf, &shm, &fib, &nodes, &snapshot_cache, &uplinks).await;
             }
             None => break,

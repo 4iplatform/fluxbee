@@ -173,19 +173,22 @@ pub struct ShmSnapshot {
 }
 
 impl ShmWriter {
-    pub fn open_or_create(router_uuid: Uuid, island_id: &str) -> Result<Self, ShmError> {
-        let name = shm_name_for_uuid(router_uuid);
-        if name.len() > SHM_NAME_LIMIT {
-            return Err(ShmError::ValueTooLong(name.len(), SHM_NAME_MAX_LEN));
+    pub fn open_or_create(
+        router_uuid: Uuid,
+        island_id: &str,
+        shm_name: &str,
+    ) -> Result<Self, ShmError> {
+        if shm_name.len() > SHM_NAME_LIMIT {
+            return Err(ShmError::ValueTooLong(shm_name.len(), SHM_NAME_MAX_LEN));
         }
         let layout = ShmLayout::new(MAX_NODES as usize, MAX_ROUTES as usize);
 
-        match shm_open_with_flags(&name, OFlag::O_RDWR) {
+        match shm_open_with_flags(shm_name, OFlag::O_RDWR) {
             Ok(fd) => {
                 let stat = fstat(&fd)?;
                 if stat.st_size < layout.total_len as i64 {
-                    shm_unlink_best_effort(&name)?;
-                    return recreate_region(&name, layout, router_uuid, island_id, None);
+                    shm_unlink_best_effort(shm_name)?;
+                    return recreate_region(shm_name, layout, router_uuid, island_id, None);
                 }
 
                 let mut mmap =
@@ -193,8 +196,8 @@ impl ShmWriter {
                 let header = header_mut(&mut mmap)?;
                 if !header_valid(header) {
                     drop(mmap);
-                    shm_unlink_best_effort(&name)?;
-                    return recreate_region(&name, layout, router_uuid, island_id, None);
+                    shm_unlink_best_effort(shm_name)?;
+                    return recreate_region(shm_name, layout, router_uuid, island_id, None);
                 }
 
                 if owner_alive(header) && !heartbeat_stale(header) {
@@ -204,11 +207,11 @@ impl ShmWriter {
 
                 let generation = Some(header.generation.saturating_add(1));
                 drop(mmap);
-                shm_unlink_best_effort(&name)?;
-                recreate_region(&name, layout, router_uuid, island_id, generation)
+                shm_unlink_best_effort(shm_name)?;
+                recreate_region(shm_name, layout, router_uuid, island_id, generation)
             }
             Err(ShmError::Nix(Errno::ENOENT)) => {
-                recreate_region(&name, layout, router_uuid, island_id, None)
+                recreate_region(shm_name, layout, router_uuid, island_id, None)
             }
             Err(err) => Err(err),
         }
@@ -623,20 +626,19 @@ fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
 
-fn shm_name_for_uuid(router_uuid: Uuid) -> String {
-    let full = format!("{SHM_NAME_PREFIX}{router_uuid}");
+pub fn build_shm_name(prefix: &str, router_uuid: Uuid) -> String {
+    let full = format!("{prefix}{router_uuid}");
     if full.len() <= SHM_NAME_LIMIT {
         return full;
     }
 
     let simple = router_uuid.simple().to_string();
-    let short = format!(
+    format!(
         "{}{}{}",
-        SHM_NAME_PREFIX,
+        prefix,
         &simple[..8],
         &simple[simple.len() - 8..]
-    );
-    short
+    )
 }
 
 fn now_epoch_ms() -> u64 {

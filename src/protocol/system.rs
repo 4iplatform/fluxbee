@@ -38,6 +38,18 @@ pub struct HelloPayload {
     pub shm_name: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NodeDescriptor {
+    pub uuid: String,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LsaPayload {
+    pub router_id: String,
+    pub nodes: Vec<NodeDescriptor>,
+}
+
 pub const SYSTEM_KIND: &str = "system";
 pub const MSG_QUERY: &str = "QUERY";
 pub const MSG_ANNOUNCE: &str = "ANNOUNCE";
@@ -45,6 +57,7 @@ pub const MSG_WITHDRAW: &str = "WITHDRAW";
 pub const MSG_UNREACHABLE: &str = "UNREACHABLE";
 pub const MSG_TTL_EXCEEDED: &str = "TTL_EXCEEDED";
 pub const MSG_HELLO: &str = "HELLO";
+pub const MSG_LSA: &str = "LSA";
 
 pub fn build_query() -> Message<QueryPayload> {
     Message {
@@ -68,6 +81,20 @@ pub fn build_hello(router_uuid: Uuid, island_id: &str, shm_name: &str) -> Messag
             router_id: router_uuid.to_string(),
             island_id: island_id.to_string(),
             shm_name: shm_name.to_string(),
+        },
+    }
+}
+
+pub fn build_lsa(router_uuid: Uuid, nodes: Vec<NodeDescriptor>) -> Message<LsaPayload> {
+    Message {
+        routing: Value::Null,
+        meta: Meta {
+            kind: SYSTEM_KIND.to_string(),
+            msg: MSG_LSA.to_string(),
+        },
+        payload: LsaPayload {
+            router_id: router_uuid.to_string(),
+            nodes,
         },
     }
 }
