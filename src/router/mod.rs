@@ -1,9 +1,11 @@
 pub mod forward;
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
 
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::sync::{mpsc, Mutex};
@@ -12,15 +14,17 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::protocol::system::{
-    build_error, build_hello, build_lsa, build_query, build_uplink_accept, build_uplink_reject,
-    AnnouncePayload, HelloCapabilities, HelloPayload, LsaPayload, Message, NodeDescriptor,
-    UplinkAcceptPayload, UplinkRejectPayload, WithdrawPayload, MSG_ANNOUNCE, MSG_HELLO, MSG_LSA,
-    MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_UPLINK_ACCEPT, MSG_UPLINK_REJECT, MSG_WITHDRAW,
-    SYSTEM_KIND,
+    build_config_sync, build_error, build_hello, build_lsa, build_query, build_sync_reply,
+    build_sync_request, build_uplink_accept, build_uplink_reject, AnnouncePayload,
+    ConfigSyncPayload, ConfigSyncRoutePayload, HelloCapabilities, HelloPayload, LsaPayload,
+    Message, NodeDescriptor, SyncReplyPayload, SyncRequestPayload, UplinkAcceptPayload,
+    UplinkRejectPayload, WithdrawPayload, MSG_ANNOUNCE, MSG_CONFIG_SYNC, MSG_HELLO, MSG_LSA,
+    MSG_SYNC_REPLY, MSG_SYNC_REQUEST, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_UPLINK_ACCEPT,
+    MSG_UPLINK_REJECT, MSG_WITHDRAW, SYSTEM_KIND,
 };
 use crate::shm::{
-    ShmError, ShmReader, ShmSnapshot, ShmWriter, AD_LSA, FLAG_ACTIVE, LINK_LOCAL, MATCH_EXACT,
-    MATCH_GLOB, MATCH_PREFIX, ROUTE_LSA, ROUTE_STATIC,
+    ShmError, ShmReader, ShmSnapshot, ShmWriter, AD_LSA, AD_STATIC, FLAG_ACTIVE, LINK_LOCAL,
+    MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, ROUTE_LSA, ROUTE_STATIC,
 };
 use crate::socket::connection::{read_frame, write_frame};
 use tracing::{info, warn};
@@ -166,17 +170,19 @@ impl Router {
                     };
                     let peer_snapshots = peers.refresh();
                     if let Some(local_snapshot) = snapshot {
-                        let uplink_nodes = {
+                        let (uplink_nodes, uplink_configs) = {
                             let uplinks = uplinks.lock().await;
-                            uplinks.snapshot_nodes()
+                            (uplinks.snapshot_nodes(), uplinks.snapshot_config_routes())
                         };
-                        let mut new_fib = build_fib(&local_snapshot, &peer_snapshots, &uplink_nodes);
+                        let mut new_fib =
+                            build_fib(&local_snapshot, &peer_snapshots, &uplink_nodes, &uplink_configs);
                         new_fib.sort_by(route_cmp);
                         info!(
                             target: "json_router",
                             fib_routes = new_fib.len(),
                             peers = peer_snapshots.len(),
                             uplink_nodes = uplink_nodes.len(),
+                            uplink_config_routes = uplink_configs.len(),
                             "FIB refreshed"
                         );
                         let mut fib = fib.lock().await;
@@ -701,10 +707,22 @@ struct UplinkNode {
     router_id: Option<Uuid>,
 }
 
+#[derive(Clone, Debug)]
+struct UplinkConfigRoute {
+    pattern: String,
+    match_kind: String,
+    metric: u32,
+    priority: u32,
+    link_id: u32,
+    source_island: String,
+    router_id: Option<Uuid>,
+}
+
 fn build_fib(
     local: &ShmSnapshot,
     peers: &[PeerSnapshot],
     uplink_nodes: &[UplinkNode],
+    uplink_configs: &[UplinkConfigRoute],
 ) -> Vec<crate::shm::RouteEntry> {
     let mut fib = Vec::new();
 
@@ -763,6 +781,31 @@ fn build_fib(
         route.out_link = uplink.link_id;
         route.metric = 1;
         route.admin_distance = AD_LSA;
+        route.flags = FLAG_ACTIVE;
+        fib.push(route);
+    }
+
+    for uplink in uplink_configs {
+        let mut route = crate::shm::RouteEntry::default();
+        let pattern_bytes = uplink.pattern.as_bytes();
+        let name_len = pattern_bytes.len().min(route.prefix.len());
+        if name_len == 0 {
+            continue;
+        }
+        route.prefix[..name_len].copy_from_slice(&pattern_bytes[..name_len]);
+        route.prefix_len = name_len as u16;
+        route.match_kind = match uplink.match_kind.as_str() {
+            "prefix" => MATCH_PREFIX,
+            "glob" => MATCH_GLOB,
+            _ => MATCH_EXACT,
+        };
+        route.route_type = ROUTE_STATIC;
+        if let Some(router_id) = uplink.router_id {
+            route.next_hop_router = *router_id.as_bytes();
+        }
+        route.out_link = uplink.link_id;
+        route.metric = uplink.metric as u16;
+        route.admin_distance = AD_STATIC;
         route.flags = FLAG_ACTIVE;
         fib.push(route);
     }
@@ -848,6 +891,102 @@ async fn send_lsa(shm: &Arc<Mutex<ShmWriter>>, uplinks: &Arc<Mutex<UplinkManager
     }
 }
 
+fn send_sync_request(
+    router_uuid: Uuid,
+    sender: &mpsc::UnboundedSender<Vec<u8>>,
+) -> Result<(), ()> {
+    let msg = build_sync_request(router_uuid);
+    send_system_frame(sender, &msg)
+}
+
+async fn send_sync_reply(
+    shm: &Arc<Mutex<ShmWriter>>,
+    sender: &mpsc::UnboundedSender<Vec<u8>>,
+) -> Result<(), ()> {
+    let snapshot = {
+        let shm = shm.lock().await;
+        shm.read_snapshot()
+    };
+    let Some(snapshot) = snapshot else {
+        return Err(());
+    };
+    let router_uuid = Uuid::from_slice(&snapshot.router_uuid).unwrap_or_else(|_| Uuid::nil());
+    let mut nodes = Vec::new();
+    for node in snapshot.nodes {
+        if !node.is_active() {
+            continue;
+        }
+        let name = String::from_utf8_lossy(&node.name[..node.name_len as usize]).to_string();
+        let uuid = Uuid::from_slice(&node.uuid).unwrap_or_else(|_| Uuid::nil());
+        nodes.push(NodeDescriptor {
+            uuid: uuid.to_string(),
+            name,
+        });
+    }
+    let msg = build_sync_reply(router_uuid, nodes);
+    send_system_frame(sender, &msg)
+}
+
+fn build_config_sync_routes(
+    snapshot: &ShmSnapshot,
+    source_island: &str,
+) -> Vec<ConfigSyncRoutePayload> {
+    let mut routes = Vec::new();
+    for route in &snapshot.routes {
+        if !route.is_active() || route.route_type != ROUTE_STATIC {
+            continue;
+        }
+        let prefix = String::from_utf8_lossy(route_prefix(route)).to_string();
+        let match_kind = match route.match_kind {
+            MATCH_PREFIX => "PREFIX",
+            MATCH_GLOB => "GLOB",
+            _ => "EXACT",
+        };
+        routes.push(ConfigSyncRoutePayload {
+            prefix,
+            match_kind: match_kind.to_string(),
+            action: "FORWARD".to_string(),
+            next_hop_island: source_island.to_string(),
+            metric: route.metric as u32,
+            priority: 100,
+        });
+    }
+    routes
+}
+
+fn compute_config_version(routes: &[ConfigSyncRoutePayload]) -> u64 {
+    let mut sorted = routes.to_vec();
+    sorted.sort_by(|a, b| a.prefix.cmp(&b.prefix).then_with(|| a.match_kind.cmp(&b.match_kind)));
+    let mut hasher = DefaultHasher::new();
+    for route in sorted {
+        route.prefix.hash(&mut hasher);
+        route.match_kind.hash(&mut hasher);
+        route.action.hash(&mut hasher);
+        route.next_hop_island.hash(&mut hasher);
+        route.metric.hash(&mut hasher);
+        route.priority.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+async fn send_config_sync(
+    shm: &Arc<Mutex<ShmWriter>>,
+    source_island: &str,
+    sender: &mpsc::UnboundedSender<Vec<u8>>,
+) -> Result<(), ()> {
+    let snapshot = {
+        let shm = shm.lock().await;
+        shm.read_snapshot()
+    };
+    let Some(snapshot) = snapshot else {
+        return Err(());
+    };
+    let routes = build_config_sync_routes(&snapshot, source_island);
+    let config_version = compute_config_version(&routes);
+    let msg = build_config_sync(source_island, config_version, routes, Vec::new());
+    send_system_frame(sender, &msg)
+}
+
 async fn handle_lsa_frame(
     buf: &[u8],
     link_id: u32,
@@ -874,10 +1013,94 @@ async fn handle_lsa_frame(
     true
 }
 
+async fn handle_sync_frame(
+    buf: &[u8],
+    link_id: u32,
+    uplinks: &Arc<Mutex<UplinkManager>>,
+) -> bool {
+    let Ok(msg) = serde_json::from_slice::<Message<serde_json::Value>>(buf) else {
+        return false;
+    };
+    if msg.meta.kind != SYSTEM_KIND || msg.meta.msg != MSG_SYNC_REPLY {
+        return false;
+    }
+    let Ok(payload) = serde_json::from_value::<SyncReplyPayload>(msg.payload) else {
+        return true;
+    };
+    let router_id = Uuid::parse_str(&payload.router_id).ok();
+    let mut uplinks = uplinks.lock().await;
+    uplinks.update_lsa(link_id, router_id, payload.nodes);
+    info!(
+        target: "json_router",
+        link_id = link_id,
+        nodes = uplinks.peer_nodes.get(&link_id).map(|m| m.len()).unwrap_or(0),
+        "SYNC reply received"
+    );
+    true
+}
+
+async fn handle_sync_request(
+    buf: &[u8],
+    shm: &Arc<Mutex<ShmWriter>>,
+    sender: &mpsc::UnboundedSender<Vec<u8>>,
+) -> bool {
+    let Ok(msg) = serde_json::from_slice::<Message<serde_json::Value>>(buf) else {
+        return false;
+    };
+    if msg.meta.kind != SYSTEM_KIND || msg.meta.msg != MSG_SYNC_REQUEST {
+        return false;
+    }
+    let Ok(_payload) = serde_json::from_value::<SyncRequestPayload>(msg.payload) else {
+        return true;
+    };
+    let _ = send_sync_reply(shm, sender).await;
+    true
+}
+
+async fn handle_config_sync_frame(
+    buf: &[u8],
+    link_id: u32,
+    uplinks: &Arc<Mutex<UplinkManager>>,
+) -> bool {
+    let Ok(msg) = serde_json::from_slice::<Message<serde_json::Value>>(buf) else {
+        return false;
+    };
+    if msg.meta.kind != SYSTEM_KIND || msg.meta.msg != MSG_CONFIG_SYNC {
+        return false;
+    }
+    let Ok(payload) = serde_json::from_value::<ConfigSyncPayload>(msg.payload) else {
+        return true;
+    };
+    let routes: Vec<ConfigSyncRoutePayload> = payload
+        .routes
+        .into_iter()
+        .filter(|route| route.action.eq_ignore_ascii_case("FORWARD"))
+        .collect();
+    let mut uplinks = uplinks.lock().await;
+    let updated = uplinks.update_config_sync(
+        link_id,
+        payload.source_island.clone(),
+        payload.config_version,
+        routes,
+    );
+    if updated {
+        info!(
+            target: "json_router",
+            link_id = link_id,
+            island = %payload.source_island,
+            "CONFIG_SYNC applied"
+        );
+    }
+    true
+}
+
 struct UplinkManager {
     links: HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>,
     peer_nodes: HashMap<u32, HashMap<Uuid, String>>,
     peer_router_ids: HashMap<u32, Uuid>,
+    config_routes: HashMap<u32, Vec<UplinkConfigRoute>>,
+    config_versions: HashMap<String, u64>,
+    config_island_links: HashMap<String, u32>,
     next_link_id: u32,
 }
 
@@ -887,6 +1110,9 @@ impl UplinkManager {
             links: HashMap::new(),
             peer_nodes: HashMap::new(),
             peer_router_ids: HashMap::new(),
+            config_routes: HashMap::new(),
+            config_versions: HashMap::new(),
+            config_island_links: HashMap::new(),
             next_link_id: 1,
         }
     }
@@ -899,6 +1125,10 @@ impl UplinkManager {
 
     fn register_link(&mut self, link_id: u32, sender: mpsc::UnboundedSender<Vec<u8>>) {
         self.links.insert(link_id, sender);
+    }
+
+    fn register_peer_router(&mut self, link_id: u32, router_id: Uuid) {
+        self.peer_router_ids.insert(link_id, router_id);
     }
 
     fn send_on_link(&mut self, link_id: u32, payload: Vec<u8>) -> Result<(), ()> {
@@ -928,6 +1158,44 @@ impl UplinkManager {
         self.peer_nodes.insert(link_id, map);
     }
 
+    fn update_config_sync(
+        &mut self,
+        link_id: u32,
+        source_island: String,
+        config_version: u64,
+        routes: Vec<ConfigSyncRoutePayload>,
+    ) -> bool {
+        if let Some(prev) = self.config_versions.get(&source_island) {
+            if config_version <= *prev {
+                return false;
+            }
+        }
+
+        if let Some(prev_link) = self.config_island_links.get(&source_island) {
+            if *prev_link != link_id {
+                self.config_routes.remove(prev_link);
+            }
+        }
+
+        self.config_versions.insert(source_island.clone(), config_version);
+        self.config_island_links.insert(source_island.clone(), link_id);
+
+        let mapped = routes
+            .into_iter()
+            .map(|route| UplinkConfigRoute {
+                pattern: route.prefix,
+                match_kind: route.match_kind.to_lowercase(),
+                metric: route.metric,
+                priority: route.priority,
+                link_id,
+                source_island: source_island.clone(),
+                router_id: None,
+            })
+            .collect();
+        self.config_routes.insert(link_id, mapped);
+        true
+    }
+
     fn route_uuid(&self, uuid: &Uuid) -> Option<u32> {
         for (link_id, nodes) in &self.peer_nodes {
             if nodes.contains_key(uuid) {
@@ -948,6 +1216,28 @@ impl UplinkManager {
                     link_id: *link_id,
                     router_id,
                 });
+            }
+        }
+        out
+    }
+
+    fn snapshot_config_routes(&self) -> Vec<UplinkConfigRoute> {
+        let mut out = Vec::new();
+        for (link_id, routes) in &self.config_routes {
+            let router_id = self.peer_router_ids.get(link_id).cloned();
+            for route in routes {
+                if self
+                    .config_island_links
+                    .get(&route.source_island)
+                    .copied()
+                    .unwrap_or(*link_id)
+                    != *link_id
+                {
+                    continue;
+                }
+                let mut entry = route.clone();
+                entry.router_id = router_id;
+                out.push(entry);
             }
         }
         out
@@ -1139,10 +1429,16 @@ async fn handle_uplink_connection(
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     {
         let mut uplinks = uplinks.lock().await;
-        uplinks.register_link(link_id, tx);
+        uplinks.register_link(link_id, tx.clone());
+        if let Ok(peer_uuid) = Uuid::parse_str(&peer.router_id) {
+            uplinks.register_peer_router(link_id, peer_uuid);
+        }
     }
     send_lsa(&shm, &uplinks).await;
+    send_sync_request(router_uuid, &tx).ok();
+    send_config_sync(&shm, &island_id, &tx).await.ok();
 
+    let tx_hello = tx.clone();
     tokio::spawn(async move {
         while let Some(payload) = rx.recv().await {
             if write_frame(&mut writer, &payload).await.is_err() {
@@ -1168,7 +1464,7 @@ async fn handle_uplink_connection(
                     dead_interval_ms,
                     capabilities.clone(),
                 );
-                if send_system_message(&mut writer, &hello).await.is_err() {
+                if send_system_frame(&tx_hello, &hello).is_err() {
                     break;
                 }
             }
@@ -1189,6 +1485,15 @@ async fn handle_uplink_connection(
                             continue;
                         }
                         if handle_lsa_frame(&buf, link_id, &uplinks).await {
+                            continue;
+                        }
+                        if handle_sync_frame(&buf, link_id, &uplinks).await {
+                            continue;
+                        }
+                        if handle_sync_request(&buf, &shm, &tx).await {
+                            continue;
+                        }
+                        if handle_config_sync_frame(&buf, link_id, &uplinks).await {
                             continue;
                         }
                         handle_forward(&buf, &shm, &fib, &nodes, &snapshot_cache, &uplinks).await;
@@ -1266,4 +1571,15 @@ where
 {
     let payload = serde_json::to_vec(msg)?;
     write_frame(writer, &payload).await
+}
+
+fn send_system_frame<T>(
+    sender: &mpsc::UnboundedSender<Vec<u8>>,
+    msg: &Message<T>,
+) -> Result<(), ()>
+where
+    T: serde::Serialize,
+{
+    let payload = serde_json::to_vec(msg).map_err(|_| ())?;
+    sender.send(payload).map_err(|_| ())
 }

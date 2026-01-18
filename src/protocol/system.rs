@@ -69,6 +69,44 @@ pub struct LsaPayload {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct SyncRequestPayload {
+    pub router_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SyncReplyPayload {
+    pub router_id: String,
+    pub nodes: Vec<NodeDescriptor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConfigSyncRoutePayload {
+    pub prefix: String,
+    pub match_kind: String,
+    pub action: String,
+    pub next_hop_island: String,
+    pub metric: u32,
+    pub priority: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConfigSyncVpnPayload {
+    pub vpn_id: u32,
+    pub vpn_name: String,
+    pub remote_island: String,
+    pub endpoints: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConfigSyncPayload {
+    pub timestamp: String,
+    pub config_version: u64,
+    pub source_island: String,
+    pub routes: Vec<ConfigSyncRoutePayload>,
+    pub vpns: Vec<ConfigSyncVpnPayload>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UplinkAcceptPayload {
     pub timestamp: String,
     pub peer_router_id: String,
@@ -100,6 +138,9 @@ pub const MSG_HELLO: &str = "HELLO";
 pub const MSG_LSA: &str = "LSA";
 pub const MSG_UPLINK_ACCEPT: &str = "UPLINK_ACCEPT";
 pub const MSG_UPLINK_REJECT: &str = "UPLINK_REJECT";
+pub const MSG_SYNC_REQUEST: &str = "SYNC_REQUEST";
+pub const MSG_SYNC_REPLY: &str = "SYNC_REPLY";
+pub const MSG_CONFIG_SYNC: &str = "CONFIG_SYNC";
 
 pub fn build_query() -> Message<QueryPayload> {
     Message {
@@ -159,6 +200,55 @@ pub fn build_lsa(router_uuid: Uuid, nodes: Vec<NodeDescriptor>) -> Message<LsaPa
         payload: LsaPayload {
             router_id: router_uuid.to_string(),
             nodes,
+        },
+    }
+}
+
+pub fn build_sync_request(router_uuid: Uuid) -> Message<SyncRequestPayload> {
+    Message {
+        routing: Value::Null,
+        meta: Meta {
+            kind: SYSTEM_KIND.to_string(),
+            msg: MSG_SYNC_REQUEST.to_string(),
+        },
+        payload: SyncRequestPayload {
+            router_id: router_uuid.to_string(),
+        },
+    }
+}
+
+pub fn build_sync_reply(router_uuid: Uuid, nodes: Vec<NodeDescriptor>) -> Message<SyncReplyPayload> {
+    Message {
+        routing: Value::Null,
+        meta: Meta {
+            kind: SYSTEM_KIND.to_string(),
+            msg: MSG_SYNC_REPLY.to_string(),
+        },
+        payload: SyncReplyPayload {
+            router_id: router_uuid.to_string(),
+            nodes,
+        },
+    }
+}
+
+pub fn build_config_sync(
+    source_island: &str,
+    config_version: u64,
+    routes: Vec<ConfigSyncRoutePayload>,
+    vpns: Vec<ConfigSyncVpnPayload>,
+) -> Message<ConfigSyncPayload> {
+    Message {
+        routing: Value::Null,
+        meta: Meta {
+            kind: SYSTEM_KIND.to_string(),
+            msg: MSG_CONFIG_SYNC.to_string(),
+        },
+        payload: ConfigSyncPayload {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            config_version,
+            source_island: source_island.to_string(),
+            routes,
+            vpns,
         },
     }
 }
