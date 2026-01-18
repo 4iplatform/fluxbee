@@ -1,6 +1,6 @@
 # JSON Router - Especificación Técnica
 
-**Estado:** Draft v1.2
+**Estado:** Draft v1.4
 **Fecha:** 2025-01-18
 
 ---
@@ -1752,7 +1752,22 @@ Nodo ←──socket──→ Router ←──shared memory──→ Otros Route
 
 #### 15.1 Descubrimiento de Routers
 
-Los routers se descubren entre sí mediante mensajes HELLO en un canal dedicado (socket o multicast en shared memory).
+El descubrimiento de routers depende del tipo de conexión:
+
+**Intra-isla (mismo host, fabric automático):**
+- Los routers escanean `/dev/shm/jsr-*` para descubrir regiones de peers
+- No requiere HELLO para descubrimiento
+- La conexión fabric (Unix socket) se establece automáticamente
+
+**Inter-isla (WAN, TCP configurado):**
+- Los uplinks WAN se configuran explícitamente en `config.yaml`
+- Al conectar, se intercambian mensajes HELLO
+- HELLO incluye `shm_name` para que el peer sepa qué región leer (aunque en WAN no puede leerla directamente, sirve para identificación)
+
+```
+Intra-isla:  Scan /dev/shm/jsr-* → Conectar fabric → Leer shm peer
+Inter-isla:  Config uplink → TCP connect → HELLO handshake → LSA/SYNC
+```
 
 #### 15.2 Random Backoff para Evitar Colisiones
 
@@ -2380,7 +2395,9 @@ El sistema soporta mensajes dirigidos a múltiples destinos. El router maneja es
 | UUID | - | Unicast: entregar a ese nodo específico |
 | `null` | nombre capa 2 | Resolver via OPA, luego unicast |
 | `"broadcast"` | - | Broadcast: entregar a todos los nodos |
-| `"broadcast"` | prefijo | Broadcast filtrado: entregar a nodos que matchean el prefijo |
+| `"broadcast"` | patrón capa 2 | Multicast: entregar a nodos que matchean el patrón |
+
+**Importante:** `dst: null` y `dst: "broadcast"` son flujos completamente distintos. No se mezclan.
 
 #### 25.2 Broadcast Global
 
@@ -2402,17 +2419,20 @@ Cuando `dst = "broadcast"` sin filtro:
 **Comportamiento del router:**
 
 ```
-1. Recibe mensaje con dst="broadcast"
-2. Para cada nodo conectado localmente:
+1. Verificar trace_id en cache → Si existe, DROP (loop)
+2. Agregar trace_id al cache (TTL 60s)
+3. Comparar routing.src con mi UUID → No entregar al origen
+4. Para cada nodo conectado localmente:
    - Copia el mensaje
    - Entrega al nodo
-3. Si TTL > 1:
+5. Si TTL > 1:
    - Decrementa TTL
    - Reenvía a routers peers (misma isla via fabric)
+6. Si TTL > 2:
    - Reenvía a routers WAN (otras islas)
 ```
 
-#### 25.3 Broadcast Filtrado
+#### 25.3 Multicast (Broadcast Filtrado)
 
 Cuando `dst = "broadcast"` con `meta.target`:
 
@@ -2435,43 +2455,107 @@ Cuando `dst = "broadcast"` con `meta.target`:
 **Comportamiento del router:**
 
 ```
-1. Recibe mensaje con dst="broadcast" y target="SY.config.*"
-2. Para cada nodo conectado localmente:
-   - Si nombre matchea "SY.config.*" → Entrega
+1-3. (Igual que broadcast global: cache, loop check, no al origen)
+4. Para cada nodo conectado localmente:
+   - Si nombre capa 2 matchea meta.target → Entrega
    - Si no matchea → Skip
-3. Propaga a otros routers (ellos filtran sus nodos)
+5-6. (Igual: propagar según TTL)
 ```
 
-#### 25.4 TTL en Broadcast
+**El filtro es por nombre capa 2.** El router ya conoce el nombre de cada nodo (registrado en HELLO).
+
+#### 25.4 Algoritmo de Match para meta.target
+
+```rust
+fn target_match(pattern: &str, node_name: &str) -> bool {
+    if pattern.ends_with(".*") {
+        // Prefix match: "SY.config.*" matchea "SY.config.routes"
+        let prefix = &pattern[..pattern.len() - 2];
+        node_name.starts_with(prefix)
+    } else {
+        // Exact match
+        pattern == node_name
+    }
+}
+```
+
+| Pattern | Node Name | Match |
+|---------|-----------|-------|
+| `SY.config.*` | `SY.config.routes` | ✓ |
+| `SY.config.*` | `SY.time` | ✗ |
+| `AI.ventas.*` | `AI.ventas.l1.diurno` | ✓ |
+| `AI.ventas.l1` | `AI.ventas.l1` | ✓ |
+| `AI.ventas.l1` | `AI.ventas.l1.diurno` | ✗ |
+
+#### 25.5 TTL en Broadcast
 
 El TTL controla el alcance del broadcast:
 
 | TTL | Alcance |
 |-----|---------|
-| 1 | Solo nodos del router local |
-| 2 | Nodos de la isla (todos los routers locales) |
-| 16+ | Todas las islas (cruza WAN) |
+| 1 | Solo nodos conectados a ESTE router |
+| 2 | Toda la isla (este router + peers via fabric) |
+| 3+ | Cruza WAN a otras islas |
 
-**Importante:** El broadcast WAN puede generar mucho tráfico. Usar con cuidado.
+**Decremento:**
+- Al reenviar por fabric: TTL - 1
+- Al reenviar por WAN: TTL - 1
 
-#### 25.5 Prevención de Loops
+**Importante:** Broadcast WAN (TTL > 2) puede generar mucho tráfico. Usar con cuidado.
 
-Para evitar que el mismo broadcast se procese múltiples veces:
+#### 25.6 Prevención de Loops
 
+Cada router mantiene un cache de `trace_id` por separado:
+
+```rust
+struct BroadcastCache {
+    seen: HashMap<Uuid, Instant>,  // trace_id → timestamp
+    ttl: Duration,                  // 60 segundos
+}
+
+impl BroadcastCache {
+    fn check_and_add(&mut self, trace_id: Uuid) -> bool {
+        self.cleanup_expired();
+        if self.seen.contains_key(&trace_id) {
+            false  // Ya visto, DROP
+        } else {
+            self.seen.insert(trace_id, Instant::now());
+            true   // Nuevo, procesar
+        }
+    }
+}
 ```
-1. Router mantiene cache de trace_id recientes (últimos 60s)
-2. Si recibe broadcast con trace_id ya visto → Drop
-3. Si es nuevo → Procesar y agregar trace_id al cache
+
+**El cache es por router.** No se comparte entre routers. Cada uno filtra independientemente.
+
+#### 25.7 No Entregar al Origen
+
+El router **nunca** entrega un broadcast al nodo que lo originó:
+
+```rust
+if msg.routing.src == node.uuid {
+    continue;  // Skip, es el origen
+}
 ```
 
-#### 25.6 Casos de Uso
+Esto aplica tanto para nodos locales como para reenvío a otros routers.
+
+#### 25.8 Casos de Uso
 
 | Mensaje | Target | TTL | Propósito |
 |---------|--------|-----|-----------|
-| `TIME_SYNC` | - | 1 | Tiempo a nodos locales |
+| `TIME_SYNC` | - | 1 | Tiempo a nodos de este router |
 | `CONFIG_ANNOUNCE` | `SY.config.*` | 16 | Anunciar rutas entre islas |
 | `BCAST_SHUTDOWN` | - | 16 | Shutdown de toda la red |
 | `BCAST_RELOAD` | - | 2 | Recargar config en isla |
+
+#### 25.9 Broadcast y VPN
+
+**Broadcast de sistema (SY.\*):** Siempre se entrega, sin filtro de VPN. Son mensajes de infraestructura esenciales.
+
+**Broadcast de negocio:** Por ahora no hay filtro por VPN. Todos los nodos que matchean el target reciben el mensaje.
+
+**Nota:** VPN en este sistema es un **túnel/camino** entre islas, no un mecanismo de segmentación de broadcast. Si en el futuro se requiere segmentación lógica, se definirá un concepto separado.
 
 ### 26. Mantenimiento y Administración
 
@@ -3475,7 +3559,7 @@ El router usa directamente `config.yaml` + `identity.yaml`. El `island.yaml` no 
 | state_dir relativo (./state) | Path absoluto fijo | Flexible, permite múltiples instancias en desarrollo |
 | Región config shm separada | Rutas estáticas en cada router | Un escritor (SY), consistencia garantizada |
 | SY.config.routes como nodo | Servicio externo | Integrado al sistema de mensajes, misma infra |
-| SY propaga config, no router | Router propaga CONFIG_SYNC | Separación data plane / control plane |
+| SY propaga config, no router | Router propaga config | Separación data plane / control plane |
 | Routers no escriben STATIC propias | Cada router con sus estáticas | Centralizado, fácil de auditar, sin conflictos |
 
 ### C. Referencias

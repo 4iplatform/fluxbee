@@ -1,8 +1,8 @@
 # JSON Router - Nodos SY (System)
 
-**Estado:** Draft v0.3
+**Estado:** Draft v0.5
 **Fecha:** 2025-01-18
-**Documento relacionado:** JSON Router Especificación Técnica v1.2
+**Documento relacionado:** JSON Router Especificación Técnica v1.4
 
 ---
 
@@ -618,7 +618,7 @@ Sincronización de tiempo en la red.
 {
   "routing": {
     "src": "<uuid-sy-time>",
-    "dst": null,
+    "dst": "broadcast",
     "ttl": 1,
     "trace_id": "<uuid>"
   },
@@ -634,7 +634,7 @@ Sincronización de tiempo en la red.
 }
 ```
 
-**dst: null** indica broadcast local. TTL=1 evita propagación WAN.
+**dst: "broadcast"** envía a todos los nodos. **TTL=1** limita a la isla local (no cruza WAN).
 
 ### 3.4 Por especificar
 
