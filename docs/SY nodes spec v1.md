@@ -1,8 +1,8 @@
 # JSON Router - Nodos SY (System)
 
-**Estado:** Draft v0.2
+**Estado:** Draft v0.3
 **Fecha:** 2025-01-18
-**Documento relacionado:** JSON Router Especificación Técnica v1.1
+**Documento relacionado:** JSON Router Especificación Técnica v1.2
 
 ---
 
@@ -38,86 +38,143 @@ Responsable de la configuración centralizada de rutas estáticas y VPNs.
 
 | Aspecto | Valor |
 |---------|-------|
-| Nombre | `SY.config.routes.<instancia>` |
+| Nombre | `SY.config.routes` (uno por isla, sin instancia) |
 | Región SHM | `/jsr-config-<island_id>` |
-| Persistencia | `/etc/json-router/routes.yaml` |
-| HA | Primary/Backup con failover automático |
-| API | Socket Unix (mismo protocolo que nodos) |
+| Persistencia | `/etc/json-router/sy-config-routes.yaml` |
+| Propagación | Broadcast (CONFIG_ANNOUNCE) |
+
+**Restricciones:**
+- Solo puede correr UNO por isla
+- Si ya hay uno corriendo, el segundo debe salir con error
+- Lee island_id del archivo de configuración (no por CLI)
 
 ### 2.2 Arquitectura
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                   SY.config.routes.primary                  │
+│                      SY.config.routes                       │
 │                                                              │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
 │  │ API Handler │  │ SHM Writer  │  │ Persistence │         │
 │  │             │  │             │  │             │         │
-│  │ - add_route │  │ - seqlock   │  │ - routes.   │         │
-│  │ - del_route │  │ - heartbeat │  │   yaml      │         │
-│  │ - list_*    │  │ - config_   │  │ - load/save │         │
-│  │ - add_vpn   │  │   version++ │  │             │         │
+│  │ - add_route │  │ - seqlock   │  │ - sy-config │         │
+│  │ - del_route │  │ - heartbeat │  │   -routes.  │         │
+│  │ - list_*    │  │ - version++ │  │   yaml      │         │
 │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘         │
 │         │                │                │                 │
 │         └────────────────┼────────────────┘                 │
 │                          │                                  │
 │  ┌───────────────────────┴───────────────────────┐         │
-│  │              Propagation Handler               │         │
+│  │              Broadcast Handler                 │         │
 │  │                                                │         │
-│  │  - Envía cambios a SY.config de otras islas   │         │
-│  │  - Recibe cambios de otras islas              │         │
-│  │  - Escribe cambios remotos en shm local       │         │
+│  │  - Envía CONFIG_ANNOUNCE (broadcast)          │         │
+│  │  - Recibe CONFIG_ANNOUNCE de otras islas      │         │
+│  │  - Actualiza zona global en shm               │         │
 │  └───────────────────────────────────────────────┘         │
 └──────────────────────────────────────────────────────────────┘
                            │
                            ▼
               /jsr-config-<island_id>
+              ┌─────────────────────┐
+              │ LocalRoutes[]       │ ← De archivo local
+              │ GlobalRoutes[]      │ ← De broadcasts recibidos
+              └─────────────────────┘
 ```
 
 **Separación de responsabilidades:**
 - **Router:** Solo mueve mensajes (data plane). Lee config de shm, no la propaga.
-- **SY.config.routes:** Escribe config y la propaga entre islas (control plane).
+- **SY.config.routes:** Escribe config local, hace broadcast, recibe broadcasts de otras islas.
 
 ### 2.3 Línea de comandos
 
 ```bash
-sy-config-routes --name SY.config.routes.primary \
-                 --config /etc/json-router \
-                 --island produccion \
-                 [--log-level info]
+# Arranque simple - todo por default
+sy-config-routes
+
+# Con directorio custom
+sy-config-routes --config-dir /otro/path
 ```
 
 | Parámetro | CLI | Env | Default | Obligatorio |
 |-----------|-----|-----|---------|-------------|
-| Nombre del nodo | `--name` | `SY_CONFIG_NAME` | - | Sí |
-| Config directory | `--config` | `SY_CONFIG_DIR` | `/etc/json-router` | No |
-| Island ID | `--island` | `SY_CONFIG_ISLAND` | - | Sí |
-| Log level | `--log-level` | `SY_LOG_LEVEL` | `info` | No |
+| Config directory | `--config-dir` | `JSR_CONFIG_DIR` | `/etc/json-router` | No |
+| Log level | `--log-level` | `JSR_LOG_LEVEL` | `info` | No |
 
-### 2.4 Archivos
+**No hay parámetros obligatorios.** Todo se lee del archivo de configuración.
+
+### 2.4 Directorios por Default
+
+| Directorio | Default | Descripción |
+|------------|---------|-------------|
+| Config | `/etc/json-router/` | Archivos de configuración |
+| State | `/var/lib/json-router/` | Estado persistente |
+| Sockets | `/var/run/json-router/` | Unix sockets |
+| SHM | `/dev/shm/` | Shared memory (automático) |
+
+### 2.5 Archivos
 
 ```
 /etc/json-router/
-├── island.yaml              # Lee island_id si no se pasa por CLI
-└── routes.yaml              # Rutas estáticas y VPNs (este nodo lo maneja)
+├── island.yaml              # Config de la isla (lee island_id de acá)
+└── sy-config-routes.yaml    # Rutas estáticas locales (este nodo lo maneja)
 
 /dev/shm/
 └── jsr-config-<island>      # Región SHM (este nodo la crea/escribe)
 ```
 
-### 2.5 Flujo de arranque
+**Convención de nombres:** `sy-<servicio>.yaml` para todos los nodos SY.
+
+### 2.6 Flujo de arranque
 
 ```
-sy-config-routes --name SY.config.routes.primary --island produccion
+sy-config-routes
     │
     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 1. Validar parámetros                                       │
-│    - --name debe empezar con SY.config.routes               │
-│    - --island obligatorio                                   │
+│ 1. Leer configuración                                       │
+│    - Leer /etc/json-router/island.yaml → island_id         │
+│    - Leer /etc/json-router/sy-config-routes.yaml → rutas   │
 └─────────────────────────────────────────────────────────────┘
     │
     ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Verificar instancia única                                │
+│    - Intentar abrir /jsr-config-<island>                   │
+│    - Si existe y owner_pid está vivo → EXIT "Ya corriendo" │
+│    - Si existe y owner muerto → Reclamar región            │
+│    - Si no existe → Crear región                           │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Inicializar shared memory                                │
+│    - Escribir header (magic, version, owner_pid, etc.)     │
+│    - Escribir rutas locales (de archivo)                   │
+│    - Zona global vacía (se llena con broadcasts)           │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. Conectar al router local                                 │
+│    - Crear socket en /var/run/json-router/                 │
+│    - Enviar HELLO, registrarse como SY.config.routes       │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 5. Broadcast inicial                                        │
+│    - Enviar CONFIG_ANNOUNCE con rutas locales              │
+│    - Otras islas reciben y actualizan su zona global       │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 6. Loop principal                                           │
+│    - Actualizar heartbeat en SHM cada 5s                   │
+│    - Escuchar mensajes (API, CONFIG_ANNOUNCE de otros)     │
+│    - Broadcast periódico de refresh (cada 60s)             │
+└─────────────────────────────────────────────────────────────┘
+```
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. Verificar región SHM existente                           │
 │    - Si existe y owner vivo → ERROR (ya hay primary)        │
@@ -331,20 +388,21 @@ El nodo recibe mensajes JSON via el router (como cualquier nodo).
 | `MAX_VPNS_EXCEEDED` | Se alcanzó el límite de 64 VPNs |
 | `PERSISTENCE_ERROR` | Error al guardar en disco |
 
-### 2.8 Persistencia: routes.yaml
+### 2.8 Persistencia: sy-config-routes.yaml
 
 ```yaml
-# /etc/json-router/routes.yaml
-# Gestionado por SY.config.routes - editar con cuidado
+# /etc/json-router/sy-config-routes.yaml
+# Solo rutas LOCALES de esta isla
+# Rutas de otras islas NO se persisten (llegan por broadcast)
 
 version: 1
-updated_at: "2025-01-17T10:30:00Z"
+updated_at: "2025-01-18T10:30:00Z"
 
-static_routes:
+routes:
+  # Rutas capa 2 (se propagan por broadcast)
   - prefix: "AI.soporte.*"
     match_kind: PREFIX
     action: FORWARD
-    next_hop_island: produccion-us
     metric: 10
     priority: 100
     
@@ -352,12 +410,11 @@ static_routes:
     match_kind: EXACT
     action: DROP
     
-  - prefix: "WF.facturar.*"
-    match_kind: PREFIX
-    action: VPN
-    vpn_id: 1
-    metric: 20
-    priority: 200
+  # Rutas capa 1 (NO se propagan, solo locales)
+  - prefix: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+    match_kind: EXACT
+    action: FORWARD
+    metric: 5
 
 vpns:
   - vpn_id: 1
@@ -368,51 +425,20 @@ vpns:
       - "10.0.1.101:9000"
 ```
 
-### 2.9 Alta disponibilidad
+**Nota:** Este archivo solo contiene rutas de ESTA isla. Las rutas de otras islas se reciben por broadcast y se guardan solo en shm (no se persisten).
 
-```
-┌─────────────────────────┐      ┌─────────────────────────┐
-│ SY.config.routes.primary│      │ SY.config.routes.backup │
-│                         │      │                         │
-│  - Escribe en SHM       │      │  - Monitorea heartbeat  │
-│  - Actualiza heartbeat  │      │  - Lee routes.yaml      │
-│  - Procesa API          │      │  - Standby              │
-└───────────┬─────────────┘      └───────────┬─────────────┘
-            │                                │
-            │ escribe                        │ monitorea
-            ▼                                ▼
-      /jsr-config-<island>            (misma región)
-```
-
-**Flujo de failover:**
-
-1. Backup monitorea heartbeat del primary cada 5s
-2. Si heartbeat > 30s (stale):
-   - Backup intenta `shm_open()` y verificar owner
-   - Si owner PID muerto → Backup reclama región
-   - Backup se convierte en primary
-   - Backup carga `routes.yaml` y reescribe región
-3. Si el primary original vuelve:
-   - Detecta que otro proceso es owner → Se convierte en backup
-
-**Nota:** Ambos nodos leen el mismo `routes.yaml`. Es la fuente de verdad.
-
-### 2.10 Systemd
+### 2.9 Systemd
 
 ```ini
-# /etc/systemd/system/sy-config-routes@.service
+# /etc/systemd/system/sy-config-routes.service
 
 [Unit]
-Description=JSON Router Config Service (%i)
-After=network.target
-Wants=json-router@RT.%i.primary.service
+Description=JSON Router Config Service
+After=network.target json-router.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/sy-config-routes \
-    --name SY.config.routes.%i \
-    --island %i \
-    --config /etc/json-router
+ExecStart=/usr/bin/sy-config-routes
 Restart=always
 RestartSec=5
 
@@ -422,80 +448,70 @@ WantedBy=multi-user.target
 
 ```bash
 # Habilitar
-systemctl enable sy-config-routes@produccion
+systemctl enable sy-config-routes
 
 # Iniciar
-systemctl start sy-config-routes@produccion
+systemctl start sy-config-routes
 
 # Ver logs
-journalctl -u sy-config-routes@produccion -f
+journalctl -u sy-config-routes -f
 ```
 
-### 2.11 Propagación entre Islas
+**Nota:** No hay template `@` porque solo puede haber uno por isla/máquina.
 
-La propagación de configuración entre islas es **responsabilidad de SY.config.routes**, no del router. El router solo mueve mensajes (data plane).
+### 2.10 Propagación entre Islas (Broadcast)
 
-#### 2.11.1 Modelo de Configuración Global
+La propagación de configuración entre islas usa **broadcast**, no mensajes punto a punto. El router maneja el broadcast de forma transparente.
+
+#### 2.10.1 Modelo Simplificado
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    CONFIGURACIÓN GLOBAL (lógica)                        │
+│                              BROADCAST                                  │
 │                                                                         │
-│   Cada SY.config.routes tiene una copia completa de la config          │
-│   de todas las islas. Escribe solo la de su isla.                      │
+│   SY.config.A ─────► CONFIG_ANNOUNCE ─────► todas las islas            │
+│   SY.config.B ─────► CONFIG_ANNOUNCE ─────► todas las islas            │
+│   SY.config.C ─────► CONFIG_ANNOUNCE ─────► todas las islas            │
 │                                                                         │
-│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐             │
-│   │  Isla A     │     │  Isla B     │     │  Isla C     │             │
-│   │  (rutas)    │     │  (rutas)    │     │  (rutas)    │             │
-│   └─────────────┘     └─────────────┘     └─────────────┘             │
 └─────────────────────────────────────────────────────────────────────────┘
-                              │
-       ┌──────────────────────┼──────────────────────┐
-       │                      │                      │
-       ▼                      ▼                      ▼
-┌─────────────┐        ┌─────────────┐        ┌─────────────┐
-│ SY.config.A │        │ SY.config.B │        │ SY.config.C │
-│             │◄──────►│             │◄──────►│             │
-│ Escribe: A  │  sync  │ Escribe: B  │  sync  │ Escribe: C  │
-│ Lee: A,B,C  │        │ Lee: A,B,C  │        │ Lee: A,B,C  │
-└──────┬──────┘        └──────┬──────┘        └──────┬──────┘
-       │                      │                      │
-       ▼                      ▼                      ▼
- /jsr-config-a          /jsr-config-b          /jsr-config-c
- (solo rutas A)         (solo rutas B)         (solo rutas C)
+
+Cada SY.config.routes:
+  - Archivo local: solo rutas de SU isla (persiste)
+  - SHM local: rutas propias + zona global (recibida por broadcast)
+  - NO persiste rutas de otras islas (se reconstruyen al arrancar)
 ```
 
-**Principio:** Cada SY.config.routes conoce toda la configuración pero solo escribe la de su isla en shm.
+**Principios:**
+- El archivo `sy-config-routes.yaml` solo tiene rutas locales
+- La zona global en shm se llena con broadcasts recibidos
+- Si reinicia, espera broadcasts de otras islas para reconstruir zona global
 
-#### 2.11.2 Mensaje CONFIG_SYNC
-
-Los nodos SY.config.routes se comunican entre sí usando mensajes normales (via el router):
+#### 2.10.2 Mensaje CONFIG_ANNOUNCE
 
 ```json
 {
   "routing": {
-    "src": "<uuid-sy-config-a>",
-    "dst": "<uuid-sy-config-b>",
+    "src": "<uuid-sy-config>",
+    "dst": "broadcast",
     "ttl": 16,
     "trace_id": "<uuid>"
   },
   "meta": {
     "type": "system",
-    "msg": "CONFIG_SYNC"
+    "msg": "CONFIG_ANNOUNCE",
+    "target": "SY.config.*"
   },
   "payload": {
+    "island": "produccion",
+    "version": 42,
     "timestamp": "2025-01-18T10:00:00Z",
-    "source_island": "produccion",
-    "config_version": 42,
     "routes": [
       {
         "prefix": "AI.soporte.*",
         "match_kind": "PREFIX",
         "action": "FORWARD",
-        "next_hop_island": "produccion",
         "metric": 10,
-        "priority": 100,
-        "replicate": true
+        "priority": 100
       }
     ],
     "vpns": [ ... ]
@@ -503,79 +519,78 @@ Los nodos SY.config.routes se comunican entre sí usando mensajes normales (via 
 }
 ```
 
-**Nota:** El router no interpreta CONFIG_SYNC. Solo lo mueve como cualquier otro mensaje.
+**Campos importantes:**
+- `dst: "broadcast"` - El router lo envía a todos
+- `meta.target: "SY.config.*"` - Filtro: solo nodos SY.config.* lo procesan
+- `payload.island` - Quién origina esta configuración
+- `payload.version` - Para detectar duplicados/orden
 
-#### 2.11.3 Flujo de Propagación
+#### 2.10.3 Cuándo hacer Broadcast
+
+| Evento | Acción |
+|--------|--------|
+| Arranque | Broadcast inmediato de rutas locales |
+| Cambio de config local | Broadcast inmediato |
+| Timer periódico (60s) | Broadcast de refresh |
+
+El refresh periódico asegura que islas que arrancaron después reciban la config.
+
+#### 2.10.4 Al Recibir CONFIG_ANNOUNCE
 
 ```
-1. Admin/AI conecta a SY.config.routes (cualquier isla)
-2. Envía add_route con replicate=true
-3. SY.config.routes local:
-   a. Valida
-   b. Escribe en shm local
-   c. Persiste en routes.yaml
-   d. Envía CONFIG_SYNC a SY.config.routes de otras islas
-4. SY.config.routes remoto recibe CONFIG_SYNC:
-   a. Valida config_version (evita duplicados)
-   b. Actualiza su copia de la config global
-   c. Si la ruta es para su isla → escribe en su shm
-   d. Si no → solo guarda para referencia
+1. ¿Es de mi propia isla? → Ignorar
+2. ¿version > la que tengo de esa isla? 
+   → Sí: Actualizar zona global en shm
+   → No: Ignorar (ya tengo igual o más nuevo)
 ```
 
-#### 2.11.4 Descubrimiento de Peers
+**No se persiste.** Solo se guarda en shm. Si reinicia, espera nuevos broadcasts.
 
-¿Cómo sabe SY.config.routes de Isla A dónde está SY.config.routes de Isla B?
+#### 2.10.5 Estructura de la Shared Memory
 
-**Opción implementada:** Configuración estática en `config.yaml`:
+```
+/jsr-config-<island>
+├── Header
+│   ├── magic, version
+│   ├── owner_pid, heartbeat
+│   └── local_version, global_versions[]
+│
+├── LocalRoutes[]           ← De sy-config-routes.yaml
+│   └── Rutas de ESTA isla
+│
+└── GlobalRoutes[]          ← De CONFIG_ANNOUNCE recibidos
+    ├── [isla-a]: version, timestamp, routes[]
+    ├── [isla-b]: version, timestamp, routes[]
+    └── ...
+```
+
+#### 2.10.6 Rutas que NO se propagan
+
+Solo se propagan rutas **capa 2** (por nombre). Rutas capa 1 (por UUID) son locales.
 
 ```yaml
-# /etc/json-router/sy-config.yaml
+# sy-config-routes.yaml
 
-island: produccion
-
-peers:
-  - island: staging
-    address: "SY.config.routes.primary"  # Nombre capa 2
-  - island: desarrollo
-    address: "SY.config.routes.primary"
-```
-
-Los mensajes se envían al nombre capa 2. El router resuelve cómo llegar (via WAN si es otra isla).
-
-#### 2.11.5 Rutas Replicables vs Locales
-
-No todas las rutas se propagan:
-
-```yaml
-static_routes:
-  # Esta se propaga a todas las islas
+routes:
+  # Esta se propaga (capa 2, nombre)
   - prefix: "AI.ventas.*"
     match_kind: PREFIX
     action: FORWARD
-    next_hop_island: staging
-    replicate: true           # ← Se propaga
     
-  # Esta es solo local (ej: ruta a UUID específico)
-  - prefix: "a1b2c3d4-..."
+  # Esta NO se propaga (capa 1, UUID)
+  - prefix: "a1b2c3d4-e5f6-..."
     match_kind: EXACT
     action: DROP
-    replicate: false          # ← Solo esta isla (default)
 ```
 
-**Regla:** 
-- Rutas capa 2 (por nombre): generalmente `replicate: true`
-- Rutas capa 1 (por UUID): siempre `replicate: false`
+**Detección automática:** Si prefix es un UUID válido → no propagar.
 
-#### 2.11.6 Consistencia Eventual
+#### 2.10.7 Consistencia Eventual
 
-El sistema usa **consistencia eventual**:
-
-- Cada SY.config.routes tiene su `config_version`
-- Los cambios se propagan de forma asíncrona
-- Puede haber ventanas breves donde las islas tienen versiones distintas
-- Para casos críticos, esperar confirmación de propagación
-
-**No hay coordinación distribuida** (no hay Paxos/Raft). Es un modelo simple de replicación con versiones.
+- Sin coordinación distribuida (no hay Paxos/Raft)
+- Puede haber ventanas donde islas tienen versiones distintas
+- El refresh periódico converge eventualmente
+- Para operaciones críticas: verificar version antes de actuar
 
 ---
 

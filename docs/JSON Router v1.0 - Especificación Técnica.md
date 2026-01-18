@@ -1,6 +1,6 @@
 # JSON Router - Especificación Técnica
 
-**Estado:** Draft v1.1
+**Estado:** Draft v1.2
 **Fecha:** 2025-01-18
 
 ---
@@ -489,7 +489,7 @@ Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisi
 | Campo | Tipo | Obligatorio | Descripción |
 |-------|------|-------------|-------------|
 | `src` | UUID | Sí | Nodo origen del mensaje |
-| `dst` | UUID o null | Sí | Nodo destino. Si null, requiere resolución OPA |
+| `dst` | UUID, "broadcast", o null | Sí | Nodo destino. UUID=unicast, "broadcast"=todos, null=resolver via OPA |
 | `ttl` | int | Sí | Time-to-live, decrementa en cada hop. Si llega a 0, drop. |
 | `trace_id` | UUID | Sí | ID de correlación para trazabilidad |
 
@@ -2371,7 +2371,107 @@ Recibidas de otros routers via mensajes LSA. El router instala estas rutas con `
 
 ### 25. Broadcast y Multicast
 
-*Por definir: cómo mandar un mensaje a múltiples destinos, casos de uso.*
+El sistema soporta mensajes dirigidos a múltiples destinos. El router maneja esto de forma transparente.
+
+#### 25.1 Tipos de Destino
+
+| `dst` | `meta.target` | Comportamiento |
+|-------|---------------|----------------|
+| UUID | - | Unicast: entregar a ese nodo específico |
+| `null` | nombre capa 2 | Resolver via OPA, luego unicast |
+| `"broadcast"` | - | Broadcast: entregar a todos los nodos |
+| `"broadcast"` | prefijo | Broadcast filtrado: entregar a nodos que matchean el prefijo |
+
+#### 25.2 Broadcast Global
+
+Cuando `dst = "broadcast"` sin filtro:
+
+```json
+{
+  "routing": {
+    "src": "uuid-origen",
+    "dst": "broadcast",
+    "ttl": 16,
+    "trace_id": "uuid"
+  },
+  "meta": { ... },
+  "payload": { ... }
+}
+```
+
+**Comportamiento del router:**
+
+```
+1. Recibe mensaje con dst="broadcast"
+2. Para cada nodo conectado localmente:
+   - Copia el mensaje
+   - Entrega al nodo
+3. Si TTL > 1:
+   - Decrementa TTL
+   - Reenvía a routers peers (misma isla via fabric)
+   - Reenvía a routers WAN (otras islas)
+```
+
+#### 25.3 Broadcast Filtrado
+
+Cuando `dst = "broadcast"` con `meta.target`:
+
+```json
+{
+  "routing": {
+    "src": "uuid-origen",
+    "dst": "broadcast",
+    "ttl": 16,
+    "trace_id": "uuid"
+  },
+  "meta": {
+    "type": "system",
+    "target": "SY.config.*"
+  },
+  "payload": { ... }
+}
+```
+
+**Comportamiento del router:**
+
+```
+1. Recibe mensaje con dst="broadcast" y target="SY.config.*"
+2. Para cada nodo conectado localmente:
+   - Si nombre matchea "SY.config.*" → Entrega
+   - Si no matchea → Skip
+3. Propaga a otros routers (ellos filtran sus nodos)
+```
+
+#### 25.4 TTL en Broadcast
+
+El TTL controla el alcance del broadcast:
+
+| TTL | Alcance |
+|-----|---------|
+| 1 | Solo nodos del router local |
+| 2 | Nodos de la isla (todos los routers locales) |
+| 16+ | Todas las islas (cruza WAN) |
+
+**Importante:** El broadcast WAN puede generar mucho tráfico. Usar con cuidado.
+
+#### 25.5 Prevención de Loops
+
+Para evitar que el mismo broadcast se procese múltiples veces:
+
+```
+1. Router mantiene cache de trace_id recientes (últimos 60s)
+2. Si recibe broadcast con trace_id ya visto → Drop
+3. Si es nuevo → Procesar y agregar trace_id al cache
+```
+
+#### 25.6 Casos de Uso
+
+| Mensaje | Target | TTL | Propósito |
+|---------|--------|-----|-----------|
+| `TIME_SYNC` | - | 1 | Tiempo a nodos locales |
+| `CONFIG_ANNOUNCE` | `SY.config.*` | 16 | Anunciar rutas entre islas |
+| `BCAST_SHUTDOWN` | - | 16 | Shutdown de toda la red |
+| `BCAST_RELOAD` | - | 2 | Recargar config en isla |
 
 ### 26. Mantenimiento y Administración
 
