@@ -1,8 +1,8 @@
 # JSON Router - Nodos SY (System)
 
-**Estado:** Draft v0.1
-**Fecha:** 2025-01-17
-**Documento relacionado:** JSON Router Especificación Técnica v0.9
+**Estado:** Draft v0.2
+**Fecha:** 2025-01-18
+**Documento relacionado:** JSON Router Especificación Técnica v1.1
 
 ---
 
@@ -61,11 +61,22 @@ Responsable de la configuración centralizada de rutas estáticas y VPNs.
 │         │                │                │                 │
 │         └────────────────┼────────────────┘                 │
 │                          │                                  │
-└──────────────────────────┼──────────────────────────────────┘
+│  ┌───────────────────────┴───────────────────────┐         │
+│  │              Propagation Handler               │         │
+│  │                                                │         │
+│  │  - Envía cambios a SY.config de otras islas   │         │
+│  │  - Recibe cambios de otras islas              │         │
+│  │  - Escribe cambios remotos en shm local       │         │
+│  └───────────────────────────────────────────────┘         │
+└──────────────────────────────────────────────────────────────┘
                            │
                            ▼
               /jsr-config-<island_id>
 ```
+
+**Separación de responsabilidades:**
+- **Router:** Solo mueve mensajes (data plane). Lee config de shm, no la propaga.
+- **SY.config.routes:** Escribe config y la propaga entre islas (control plane).
 
 ### 2.3 Línea de comandos
 
@@ -419,6 +430,152 @@ systemctl start sy-config-routes@produccion
 # Ver logs
 journalctl -u sy-config-routes@produccion -f
 ```
+
+### 2.11 Propagación entre Islas
+
+La propagación de configuración entre islas es **responsabilidad de SY.config.routes**, no del router. El router solo mueve mensajes (data plane).
+
+#### 2.11.1 Modelo de Configuración Global
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    CONFIGURACIÓN GLOBAL (lógica)                        │
+│                                                                         │
+│   Cada SY.config.routes tiene una copia completa de la config          │
+│   de todas las islas. Escribe solo la de su isla.                      │
+│                                                                         │
+│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐             │
+│   │  Isla A     │     │  Isla B     │     │  Isla C     │             │
+│   │  (rutas)    │     │  (rutas)    │     │  (rutas)    │             │
+│   └─────────────┘     └─────────────┘     └─────────────┘             │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+       ┌──────────────────────┼──────────────────────┐
+       │                      │                      │
+       ▼                      ▼                      ▼
+┌─────────────┐        ┌─────────────┐        ┌─────────────┐
+│ SY.config.A │        │ SY.config.B │        │ SY.config.C │
+│             │◄──────►│             │◄──────►│             │
+│ Escribe: A  │  sync  │ Escribe: B  │  sync  │ Escribe: C  │
+│ Lee: A,B,C  │        │ Lee: A,B,C  │        │ Lee: A,B,C  │
+└──────┬──────┘        └──────┬──────┘        └──────┬──────┘
+       │                      │                      │
+       ▼                      ▼                      ▼
+ /jsr-config-a          /jsr-config-b          /jsr-config-c
+ (solo rutas A)         (solo rutas B)         (solo rutas C)
+```
+
+**Principio:** Cada SY.config.routes conoce toda la configuración pero solo escribe la de su isla en shm.
+
+#### 2.11.2 Mensaje CONFIG_SYNC
+
+Los nodos SY.config.routes se comunican entre sí usando mensajes normales (via el router):
+
+```json
+{
+  "routing": {
+    "src": "<uuid-sy-config-a>",
+    "dst": "<uuid-sy-config-b>",
+    "ttl": 16,
+    "trace_id": "<uuid>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "CONFIG_SYNC"
+  },
+  "payload": {
+    "timestamp": "2025-01-18T10:00:00Z",
+    "source_island": "produccion",
+    "config_version": 42,
+    "routes": [
+      {
+        "prefix": "AI.soporte.*",
+        "match_kind": "PREFIX",
+        "action": "FORWARD",
+        "next_hop_island": "produccion",
+        "metric": 10,
+        "priority": 100,
+        "replicate": true
+      }
+    ],
+    "vpns": [ ... ]
+  }
+}
+```
+
+**Nota:** El router no interpreta CONFIG_SYNC. Solo lo mueve como cualquier otro mensaje.
+
+#### 2.11.3 Flujo de Propagación
+
+```
+1. Admin/AI conecta a SY.config.routes (cualquier isla)
+2. Envía add_route con replicate=true
+3. SY.config.routes local:
+   a. Valida
+   b. Escribe en shm local
+   c. Persiste en routes.yaml
+   d. Envía CONFIG_SYNC a SY.config.routes de otras islas
+4. SY.config.routes remoto recibe CONFIG_SYNC:
+   a. Valida config_version (evita duplicados)
+   b. Actualiza su copia de la config global
+   c. Si la ruta es para su isla → escribe en su shm
+   d. Si no → solo guarda para referencia
+```
+
+#### 2.11.4 Descubrimiento de Peers
+
+¿Cómo sabe SY.config.routes de Isla A dónde está SY.config.routes de Isla B?
+
+**Opción implementada:** Configuración estática en `config.yaml`:
+
+```yaml
+# /etc/json-router/sy-config.yaml
+
+island: produccion
+
+peers:
+  - island: staging
+    address: "SY.config.routes.primary"  # Nombre capa 2
+  - island: desarrollo
+    address: "SY.config.routes.primary"
+```
+
+Los mensajes se envían al nombre capa 2. El router resuelve cómo llegar (via WAN si es otra isla).
+
+#### 2.11.5 Rutas Replicables vs Locales
+
+No todas las rutas se propagan:
+
+```yaml
+static_routes:
+  # Esta se propaga a todas las islas
+  - prefix: "AI.ventas.*"
+    match_kind: PREFIX
+    action: FORWARD
+    next_hop_island: staging
+    replicate: true           # ← Se propaga
+    
+  # Esta es solo local (ej: ruta a UUID específico)
+  - prefix: "a1b2c3d4-..."
+    match_kind: EXACT
+    action: DROP
+    replicate: false          # ← Solo esta isla (default)
+```
+
+**Regla:** 
+- Rutas capa 2 (por nombre): generalmente `replicate: true`
+- Rutas capa 1 (por UUID): siempre `replicate: false`
+
+#### 2.11.6 Consistencia Eventual
+
+El sistema usa **consistencia eventual**:
+
+- Cada SY.config.routes tiene su `config_version`
+- Los cambios se propagan de forma asíncrona
+- Puede haber ventanas breves donde las islas tienen versiones distintas
+- Para casos críticos, esperar confirmación de propagación
+
+**No hay coordinación distribuida** (no hay Paxos/Raft). Es un modelo simple de replicación con versiones.
 
 ---
 

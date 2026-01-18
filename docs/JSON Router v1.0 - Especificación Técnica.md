@@ -1,7 +1,7 @@
 # JSON Router - Especificación Técnica
 
-**Estado:** Draft v1.0
-**Fecha:** 2025-01-17
+**Estado:** Draft v1.1
+**Fecha:** 2025-01-18
 
 ---
 
@@ -2117,9 +2117,8 @@ El uplink WAN usa los mismos mensajes de routing entre routers ya definidos:
 | `LSA` | Propagar cambios de topología entre islas |
 | `SYNC_REQUEST` | Pedir tabla completa al conectar |
 | `SYNC_REPLY` | Responder con tabla completa |
-| `CONFIG_SYNC` | Propagar rutas estáticas y VPNs entre islas |
 
-No se inventa protocolo nuevo para WAN.
+No se inventa protocolo nuevo para WAN. La propagación de configuración (rutas estáticas, VPNs) es responsabilidad del nodo `SY.config.routes`, no del router.
 
 #### 19.4 Mensajes de Handshake WAN
 
@@ -2338,12 +2337,13 @@ route_type: ROUTE_CONNECTED
 
 Las rutas estáticas se configuran centralizadamente mediante el nodo `SY.config.routes`. Ver **Sección 27: Configuración Centralizada de Rutas** para detalles completos.
 
-**Resumen:** Un nodo SY escribe las rutas estáticas en una región de shared memory dedicada (`/jsr-config-<island>`). Todos los routers de la isla leen esta región y actualizan su FIB. Los cambios se propagan entre islas via mensajes `CONFIG_SYNC`.
+**Resumen:** Un nodo SY escribe las rutas estáticas en una región de shared memory dedicada (`/jsr-config-<island>`). Todos los routers de la isla leen esta región y actualizan su FIB.
 
 ```
 SY.config.routes → /jsr-config-<island> → Routers leen → FIB actualizada
-                                        → CONFIG_SYNC → Otras islas
 ```
+
+**Nota:** La propagación de configuración entre islas es responsabilidad del nodo `SY.config.routes`, no del router. El router solo lee la configuración local. Ver documento "JSON Router - Nodos SY" para detalles de propagación.
 
 #### 20.5 Rutas LSA (aprendidas)
 
@@ -2410,9 +2410,13 @@ Muestra la vista consolidada (FIB) combinando todas las regiones.
 
 Las rutas estáticas y VPNs se configuran centralizadamente mediante un nodo de sistema `SY.config.routes`. Este nodo es el único que escribe en una región de shared memory dedicada, que todos los routers leen.
 
+**Separación de responsabilidades:**
+- **Router:** Solo lee configuración local. No propaga configuración.
+- **SY.config.routes:** Escribe configuración y la propaga entre islas.
+
 #### 27.1 Principio de Diseño
 
-**Un escritor, múltiples lectores.**
+**Router = Data Plane (solo lee)**
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -2421,7 +2425,7 @@ Las rutas estáticas y VPNs se configuran centralizadamente mediante un nodo de 
 │  - Único proceso que escribe config de rutas                │
 │  - API para administración (REST/socket)                    │
 │  - Persiste cambios en disco                                │
-│  - Propaga cambios entre islas via routers                  │
+│  - Propaga cambios entre islas (via mensajes a otros SY)   │
 └─────────────────────────────────────────────────────────────┘
                            │
                            │ escribe
@@ -2430,7 +2434,7 @@ Las rutas estáticas y VPNs se configuran centralizadamente mediante un nodo de 
 │              /jsr-config-<island_id>                        │
 │              Región SHM de Configuración                     │
 │                                                              │
-│  - StaticRouteEntry[] - Rutas estáticas globales            │
+│  - StaticRouteEntry[] - Rutas estáticas de esta isla       │
 │  - VPNEntry[] - Configuración de VPNs                       │
 │  - Seqlock para sincronización                              │
 └─────────────────────────────────────────────────────────────┘
@@ -2443,14 +2447,14 @@ Las rutas estáticas y VPNs se configuran centralizadamente mediante un nodo de 
        Cada router:
        1. Lee /jsr-config-<island>
        2. Instala rutas STATIC en su FIB
-       3. Propaga CONFIG_SYNC a peers WAN
+       (NO propaga - eso lo hace SY.config.routes)
 ```
 
 **Ventajas:**
 - Consistencia: todos los routers ven las mismas rutas estáticas
-- Simplicidad: no hay que configurar cada router individualmente
+- Simplicidad: router no tiene lógica de propagación
 - Auditabilidad: un solo lugar donde ver/modificar rutas
-- Sin dependencia de routers: el nodo SY no necesita que los routers estén arriba para escribir
+- Separación clara: router mueve mensajes, SY maneja config
 
 #### 27.2 Nodo SY.config.routes
 
@@ -2469,10 +2473,13 @@ Ejemplos:
 2. Persistir configuración en disco (YAML/JSON)
 3. Escribir en `/jsr-config-<island_id>` al iniciar y al cambiar
 4. Mantener heartbeat en la región de config
+5. **Propagar cambios a SY.config.routes de otras islas** (via mensajes normales)
 
-**No es responsabilidad del nodo:**
-- Propagar a otras islas (los routers lo hacen via CONFIG_SYNC)
-- Validar que las rutas sean alcanzables (solo las instala)
+**No es responsabilidad del router:**
+- Propagar configuración entre islas
+- Entender el contenido de la configuración (solo la lee y aplica)
+
+Ver documento "JSON Router - Nodos SY" para detalles de la propagación entre islas.
 
 #### 27.3 Región SHM de Configuración
 
@@ -2735,88 +2742,34 @@ fn update_fib_from_config(&mut self) {
     if config.header.config_version != self.last_config_version {
         self.install_static_routes(&config.static_routes);
         self.last_config_version = config.header.config_version;
-        
-        // 5. Propagar a peers WAN
-        self.send_config_sync_to_wan_peers(&config);
+        // Fin - el router NO propaga config, solo la lee
     }
 }
 ```
 
-#### 27.7 Propagación WAN: CONFIG_SYNC
+**El router NO propaga configuración.** Solo lee y aplica. La propagación entre islas es responsabilidad de `SY.config.routes`.
 
-Nuevo mensaje para propagar configuración de rutas entre islas:
-
-```json
-{
-  "routing": {
-    "src": "uuid-router-a",
-    "dst": "uuid-router-b",
-    "ttl": 16,
-    "trace_id": "uuid"
-  },
-  "meta": {
-    "type": "system",
-    "msg": "CONFIG_SYNC"
-  },
-  "payload": {
-    "timestamp": "2025-01-17T10:00:00Z",
-    "config_version": 42,
-    "source_island": "produccion",
-    "routes": [
-      {
-        "prefix": "AI.soporte.*",
-        "match_kind": "PREFIX",
-        "action": "FORWARD",
-        "next_hop_island": "produccion",
-        "metric": 10,
-        "priority": 100
-      }
-    ],
-    "vpns": [
-      {
-        "vpn_id": 1,
-        "vpn_name": "vpn-staging",
-        "remote_island": "staging",
-        "endpoints": ["10.0.1.100:9000"]
-      }
-    ]
-  }
-}
-```
-
-**Comportamiento del router al recibir CONFIG_SYNC:**
-
-1. Validar que viene de un peer conocido
-2. Si `config_version` es mayor que el conocido para esa isla:
-   - Instalar rutas en FIB como STATIC con AD_STATIC
-   - Guardar `config_version` para evitar reprocessar
-3. NO re-propagar (evitar loops) - cada router propaga solo su propia config
-
-**Cuándo enviar CONFIG_SYNC:**
-
-- Al establecer un uplink WAN (después del handshake)
-- Cuando detecta cambio en `config_version` de la región local
-
-#### 27.8 Ejemplo: Agregar Ruta Estática
+#### 27.7 Ejemplo: Agregar Ruta Estática
 
 ```
-1. Admin conecta al socket de SY.config.routes
+1. Admin/AI conecta al socket de SY.config.routes (cualquier isla)
 2. Envía mensaje add_route
 3. SY.config.routes:
    a. Valida el request
    b. Persiste en disco (routes.yaml)
-   c. Escribe en /jsr-config-produccion con seqlock
+   c. Escribe en /jsr-config-<isla> con seqlock
    d. Incrementa config_version
    e. Responde OK
-4. Routers detectan cambio de config_version:
+   f. Propaga a SY.config.routes de otras islas (si aplica)
+4. Routers de la isla detectan cambio de config_version:
    a. Leen nueva ruta de la región
    b. Instalan en FIB
-   c. Propagan CONFIG_SYNC a peers WAN
-5. Routers en otras islas reciben CONFIG_SYNC:
-   a. Instalan ruta con next_hop apuntando a la isla origen
+   (NO propagan - eso lo hace SY.config.routes)
 ```
 
-#### 27.9 Persistencia
+Ver documento "JSON Router - Nodos SY" para detalles de propagación entre islas.
+
+#### 27.8 Persistencia
 
 El nodo SY.config.routes persiste la configuración en disco:
 
@@ -2851,7 +2804,7 @@ vpns:
 3. Escribir todas las rutas y VPNs en la región
 4. Iniciar heartbeat loop
 
-#### 27.10 Alta Disponibilidad
+#### 27.9 Alta Disponibilidad
 
 Para HA, se puede correr un nodo backup:
 
@@ -2867,7 +2820,7 @@ SY.config.routes.backup    (standby, monitorea)
 
 El archivo `routes.yaml` es la fuente de verdad. Ambos nodos lo leen.
 
-#### 27.11 Eliminación de Rutas Locales en Routers
+#### 27.10 Eliminación de Rutas Locales en Routers
 
 Con el sistema centralizado, **los routers ya no tienen rutas STATIC propias**. Solo tienen:
 
@@ -3376,8 +3329,7 @@ El router usa directamente `config.yaml` + `identity.yaml`. El `island.yaml` no 
 - **identity.yaml**: Estado de hardware del router con UUID (auto-generado en primer arranque).
 - **Región shm**: Área de shared memory de un router específico (cada router tiene la suya).
 - **Región config shm**: Área de shared memory para rutas estáticas y VPNs (`/jsr-config-<island>`).
-- **SY.config.routes**: Nodo de sistema responsable de escribir la región de config.
-- **CONFIG_SYNC**: Mensaje WAN para propagar rutas estáticas entre islas.
+- **SY.config.routes**: Nodo de sistema responsable de escribir la región de config y propagar entre islas.
 - **RIB**: Routing Information Base - todas las rutas candidatas (distribuidas en múltiples regiones).
 - **FIB**: Forwarding Information Base - rutas ganadoras compiladas en memoria local.
 - **Next-hop**: Router vecino al que enviar un mensaje (no el destino final).
@@ -3423,7 +3375,7 @@ El router usa directamente `config.yaml` + `identity.yaml`. El `island.yaml` no 
 | state_dir relativo (./state) | Path absoluto fijo | Flexible, permite múltiples instancias en desarrollo |
 | Región config shm separada | Rutas estáticas en cada router | Un escritor (SY), consistencia garantizada |
 | SY.config.routes como nodo | Servicio externo | Integrado al sistema de mensajes, misma infra |
-| CONFIG_SYNC para propagar | Routers leen shm remota | shm no es accesible entre hosts |
+| SY propaga config, no router | Router propaga CONFIG_SYNC | Separación data plane / control plane |
 | Routers no escriben STATIC propias | Cada router con sus estáticas | Centralizado, fácil de auditar, sin conflictos |
 
 ### C. Referencias
