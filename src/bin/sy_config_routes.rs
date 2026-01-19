@@ -113,6 +113,8 @@ async fn main() -> io::Result<()> {
     }
 
     let identity = load_or_create_identity(&args.state_dir)?;
+    let node_uuid = Uuid::parse_str(&identity.uuid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid identity uuid"))?;
     let shm_name = format!("/jsr-config-{}", island.island.id);
     let config_shm = ConfigShmWriter::open_or_create(&shm_name, &island.island.id)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -145,7 +147,7 @@ async fn main() -> io::Result<()> {
 
     loop {
         let (stream, _) = listener.accept().await?;
-        let node_uuid = identity.uuid;
+        let node_uuid = node_uuid;
         let state_handle = Arc::clone(&state);
         let config_shm = Arc::clone(&config_shm);
         tokio::spawn(async move {
@@ -191,10 +193,11 @@ async fn handle_connection(
     let send_tx = tx.clone();
     let node_uuid = uuid;
     let state_sender = Arc::clone(&state);
+    let announce_tx = send_tx.clone();
     tokio::spawn(async move {
         if let Some(snapshot) = snapshot_state(&state_sender).await {
             let _ = send_config_announce(
-                &send_tx,
+                &announce_tx,
                 &node_uuid,
                 &snapshot.island_id,
                 snapshot.version,
@@ -207,7 +210,7 @@ async fn handle_connection(
             interval.tick().await;
             if let Some(snapshot) = snapshot_state(&state_sender).await {
                 let _ = send_config_announce(
-                    &send_tx,
+                    &announce_tx,
                     &node_uuid,
                     &snapshot.island_id,
                     snapshot.version,

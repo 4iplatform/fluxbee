@@ -1,13 +1,11 @@
 use std::ffi::CString;
 use std::io;
-use std::mem::{size_of, MaybeUninit};
-use std::os::fd::AsRawFd;
+use std::mem::size_of;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use memmap2::{MmapMut, MmapOptions};
-use nix::fcntl::{shm_open, OFlag};
-use nix::sys::mman::ftruncate;
+use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
-use uuid::Uuid;
 
 use crate::shm::SHM_NAME_MAX_LEN;
 
@@ -116,7 +114,9 @@ impl ConfigShmWriter {
                 }
                 Ok(writer)
             }
-            Err(nix::Error::ENOENT) => recreate_region(name, island, layout),
+            Err(ConfigShmError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {
+                recreate_region(name, island, layout)
+            }
             Err(err) => Err(err.into()),
         }
     }
@@ -233,12 +233,11 @@ fn recreate_region(
     layout: ConfigLayout,
 ) -> Result<ConfigShmWriter, ConfigShmError> {
     let cname = CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name"))?;
-    let fd = shm_open(
-        cname.as_c_str(),
+    let fd = shm_open_with_flags(
+        name,
         OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR,
-        Mode::from_bits_truncate(0o600),
     )?;
-    ftruncate(&fd, layout.total_len as i64)?;
+    ftruncate_fd(&fd, layout.total_len as i64)?;
     let mut mmap = unsafe { MmapOptions::new().len(layout.total_len).map_mut(fd.as_raw_fd())? };
     let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut ConfigHeader) };
     initialize_header(header, island);
@@ -327,9 +326,28 @@ fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
 
-fn shm_open_with_flags(name: &str, flags: OFlag) -> Result<nix::unistd::OwnedFd, ConfigShmError> {
+fn ftruncate_fd(fd: &OwnedFd, len: i64) -> Result<(), ConfigShmError> {
+    let res = unsafe { nix::libc::ftruncate(fd.as_raw_fd(), len as nix::libc::off_t) };
+    if res != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+fn shm_open_with_flags(name: &str, flags: OFlag) -> Result<OwnedFd, ConfigShmError> {
     let cname = CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name"))?;
-    Ok(shm_open(cname.as_c_str(), flags, Mode::empty())?)
+    let fd = unsafe {
+        nix::libc::shm_open(
+            cname.as_ptr(),
+            flags.bits(),
+            Mode::empty().bits() as nix::libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: fd is a valid OS file descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 fn now_epoch_ms() -> u64 {
@@ -339,4 +357,3 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-
