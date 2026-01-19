@@ -127,7 +127,10 @@ async fn main() -> io::Result<()> {
     });
 
     info!(target: "sy_admin", listen = %addr, "sy-admin listening");
-    Server::bind(&addr).serve(make_svc).await?;
+    Server::bind(&addr)
+        .serve(make_svc)
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
     Ok(())
 }
 
