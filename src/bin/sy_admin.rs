@@ -190,7 +190,7 @@ async fn handle_router_connection(stream: UnixStream, state: Arc<RouterState>) -
 
     loop {
         match read_frame(&mut reader).await {
-            Some(frame) => {
+            Ok(Some(frame)) => {
                 if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&frame) {
                     if let Some(trace_id) = value
                         .get("routing")
@@ -203,7 +203,7 @@ async fn handle_router_connection(stream: UnixStream, state: Arc<RouterState>) -
                     }
                 }
             }
-            None => break,
+            Ok(None) => break,
             Err(err) => {
                 warn!(target: "sy_admin", "router read error: {}", err);
                 break;
