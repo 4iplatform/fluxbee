@@ -1,8 +1,8 @@
 # JSON Router - Nodos SY (System)
 
-**Estado:** Draft v0.8
+**Estado:** Draft v0.9
 **Fecha:** 2025-01-19
-**Documento relacionado:** JSON Router Especificación Técnica v1.8
+**Documento relacionado:** JSON Router Especificación Técnica v1.9
 
 ---
 
@@ -991,12 +991,33 @@ Gateway HTTP REST único para toda la infraestructura. Punto de entrada para hum
 
 | Aspecto | Valor |
 |---------|-------|
-| Nombre | `SY.admin` (único en todo el sistema) |
+| Nombre L2 | `SY.admin` (único en todo el sistema) |
 | Función | Gateway HTTP → protocolo interno |
 | Interfaz | HTTP REST |
 | Seguridad | Ninguna (usar nginx/proxy externo si se requiere) |
+| Socket | `/var/run/json-router/nodes/` (como cualquier nodo) |
 
-### 5.2 Arquitectura
+### 5.2 Conexión al Router
+
+SY.admin se conecta como un nodo normal:
+
+```
+1. Conecta a socket en /var/run/json-router/nodes/
+2. Envía HELLO:
+   {
+     "meta": { "type": "system", "msg": "HELLO" },
+     "payload": {
+       "name": "SY.admin",
+       "version": "1.0"
+     }
+   }
+3. Router lo registra con nombre L2 "SY.admin"
+4. SY.admin envía/recibe mensajes normalmente
+```
+
+**Requisito de deployment:** SY.admin debe correr en la primera isla del bus (la que tiene conectividad directa o transitiva a todas las demás islas).
+
+### 5.3 Arquitectura
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -1030,7 +1051,7 @@ Gateway HTTP REST único para toda la infraestructura. Punto de entrada para hum
 - Sin autenticación propia (delegar a proxy externo)
 - Traduce HTTP REST a mensajes del protocolo
 - Envía por socket, nunca lee SHM directo
-- Conoce las islas (config estática o autodescubrimiento)
+- Conoce las islas por configuración
 
 ### 5.3 API REST
 
@@ -1240,8 +1261,6 @@ Estado de OPA en routers.
 ```yaml
 # /etc/json-router/sy-admin.yaml
 
-listen: "0.0.0.0:8080"
-
 islands:
   - id: produccion
     orchestrator: "SY.orchestrator.produccion"
@@ -1255,7 +1274,60 @@ islands:
 
 Los nombres son capa 2. SY.admin usa el router para llegar a cada uno.
 
-### 5.6 Systemd
+**Listen:** SY.admin expone HTTP en `0.0.0.0:8080` por defecto. Para cambiarlo, usar `JSR_ADMIN_LISTEN` (o `SY_ADMIN_LISTEN`).
+
+**Nota sobre island_id:** El identificador de isla es un string simple (ej: `produccion`, `staging`), no sigue convención de capa 2. Es solo un identificador de ubicación.
+
+### 5.6 Formato Común de Respuestas
+
+Todas las APIs admin usan el mismo formato de respuesta:
+
+**Éxito:**
+```json
+{
+  "status": "ok",
+  // ... datos específicos de la operación
+}
+```
+
+**Error:**
+```json
+{
+  "status": "error",
+  "error": "ERROR_CODE",
+  "detail": "Mensaje legible para humanos"
+}
+```
+
+**Códigos de error estándar:**
+
+| Código | Descripción |
+|--------|-------------|
+| `NOT_FOUND` | Recurso no existe |
+| `INVALID_REQUEST` | Request malformado o parámetros inválidos |
+| `TIMEOUT` | Timeout esperando respuesta de nodo destino |
+| `UNREACHABLE` | No se puede alcanzar el nodo destino |
+| `CANNOT_KILL_PRIMARY` | Intento de matar router primario |
+| `COMPILATION_FAILED` | Rego no compila (para OPA) |
+| `ROLLBACK` | Operación falló y se revirtió |
+| `ALREADY_EXISTS` | Recurso ya existe (ej: ruta duplicada) |
+| `INTERNAL_ERROR` | Error interno del sistema |
+
+### 5.7 Nombres L2 Estándar de Nodos SY
+
+| Nodo | Nombre L2 que anuncia en HELLO |
+|------|-------------------------------|
+| SY.admin | `SY.admin` |
+| SY.orchestrator | `SY.orchestrator.{isla}` |
+| SY.config.routes | `SY.config.routes.{isla}` |
+| SY.opa.rules | `SY.opa.rules.{isla}` |
+| SY.time | `SY.time.{isla}` |
+
+Donde `{isla}` es el island_id (ej: `produccion`, `staging`).
+
+**Ejemplo:** En isla "produccion", SY.orchestrator anuncia nombre `SY.orchestrator.produccion`.
+
+### 5.8 Systemd
 
 ```ini
 # /etc/systemd/system/sy-admin.service
@@ -1284,12 +1356,51 @@ Orquestación de routers y nodos. Uno por isla.
 
 | Aspecto | Valor |
 |---------|-------|
-| Nombre | `SY.orchestrator.{isla}` (uno por isla) |
+| Nombre L2 | `SY.orchestrator.{isla}` (uno por isla) |
 | Función | Listar, correr, matar routers y nodos |
-| Lectura | SHM de routers locales |
+| Lectura | SHM de routers locales (scan `/dev/shm/jsr-*`) |
 | Ejecución | systemd / docker / proceso directo |
 
-### 6.2 Arquitectura
+### 6.2 Descubrimiento de Routers
+
+SY.orchestrator descubre routers de su isla escaneando shared memory:
+
+```rust
+fn discover_routers(my_island: &str) -> Vec<RouterInfo> {
+    let mut routers = Vec::new();
+    
+    // Scan /dev/shm/jsr-*
+    for entry in glob("/dev/shm/jsr-*") {
+        // Abrir región y leer header
+        let shm = ShmRegion::open(&entry);
+        let header = shm.read_header();
+        
+        // Filtrar por mi isla
+        if header.island_id == my_island {
+            routers.push(RouterInfo {
+                uuid: header.router_uuid,
+                pid: header.owner_pid,
+                heartbeat: header.heartbeat,
+                node_count: header.node_count,
+                route_count: header.route_count,
+                // ...
+            });
+        }
+    }
+    
+    routers
+}
+```
+
+**Información disponible en SHM header:**
+- `router_uuid`: UUID del router
+- `owner_pid`: PID del proceso
+- `island_id`: Isla a la que pertenece
+- `heartbeat`: Último heartbeat (para detectar si está vivo)
+- `node_count`: Cantidad de nodos conectados
+- `route_count`: Cantidad de rutas
+
+### 6.3 Arquitectura
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -1314,7 +1425,7 @@ Orquestación de routers y nodos. Uno por isla.
     (lectura)                       (ejecución)
 ```
 
-### 6.3 Flujo de Arranque de una Isla
+### 6.4 Flujo de Arranque de una Isla
 
 ```
 Systemd inicia servicios base:
@@ -1337,7 +1448,7 @@ SY.orchestrator ejecuta nodos según config:
     └── ...
 ```
 
-### 6.4 API (via mensajes)
+### 6.5 API (via mensajes)
 
 #### 6.4.1 Listar Routers
 
@@ -1484,7 +1595,7 @@ SY.orchestrator ejecuta nodos según config:
 }
 ```
 
-### 6.5 Executors
+### 6.6 Executors
 
 SY.orchestrator soporta diferentes formas de ejecutar procesos:
 
@@ -1496,7 +1607,7 @@ SY.orchestrator soporta diferentes formas de ejecutar procesos:
 
 Configurado por nodo o por defecto de la isla.
 
-### 6.6 Protección del Router Primario
+### 6.7 Protección del Router Primario
 
 El router primario (con WAN activa) no puede ser matado via API:
 
@@ -1511,7 +1622,7 @@ kill_router(uuid):
 
 Para matar el primario, hay que hacerlo manualmente o con shutdown de la isla.
 
-### 6.7 Configuración
+### 6.8 Configuración
 
 ```yaml
 # /etc/json-router/sy-orchestrator.yaml
@@ -1537,7 +1648,7 @@ startup_nodes:
     instance: l1
 ```
 
-### 6.8 Systemd
+### 6.9 Systemd
 
 ```ini
 # /etc/systemd/system/sy-orchestrator.service

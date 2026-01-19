@@ -1,6 +1,6 @@
 # JSON Router - Especificación Técnica
 
-**Estado:** Draft v1.8
+**Estado:** Draft v1.9
 **Fecha:** 2025-01-19
 
 ---
@@ -2420,6 +2420,120 @@ La autenticación se delega al edge proxy (NGINX, Envoy, etc.):
 El proxy no interpreta el protocolo. Es transparente L4.
 
 La validación de `island_id` contra lista de islas autorizadas puede hacerse en el router al recibir HELLO, respondiendo `UPLINK_REJECT` si no está autorizado.
+
+#### 19.12 Topología WAN: Modelo Bus
+
+La topología recomendada es **bus lineal** (similar a fibra óptica). Cada isla solo configura su uplink al "siguiente" en la cadena:
+
+```
+Isla A ──► Isla B ──► Isla C ──► Isla D
+```
+
+**Configuración mínima por isla:**
+
+```yaml
+# Isla A (primera)
+wan:
+  listen: "0.0.0.0:9000"
+  uplink: "10.0.1.2:9000"    # → B
+
+# Isla B
+wan:
+  listen: "0.0.0.0:9000"
+  uplink: "10.0.2.2:9000"    # → C
+
+# Isla C
+wan:
+  listen: "0.0.0.0:9000"
+  uplink: "10.0.3.2:9000"    # → D
+
+# Isla D (última)
+wan:
+  listen: "0.0.0.0:9000"
+  # Sin uplink, es el final del bus
+```
+
+**Ventajas:**
+- Cada isla configura solo UN uplink (excepto la última)
+- Agregar isla nueva: tocar solo 2 configs (nueva + anterior)
+- Simple de entender y mantener
+
+**Variante anillo (más resiliente):**
+
+```
+Isla A ──► Isla B ──► Isla C ──► Isla D
+   ▲                                │
+   └────────────────────────────────┘
+```
+
+La última isla (D) configura uplink de vuelta a la primera (A):
+
+```yaml
+# Isla D (cierra el anillo)
+wan:
+  listen: "0.0.0.0:9000"
+  uplink: "10.0.0.2:9000"    # → A (cierra el anillo)
+```
+
+#### 19.13 Conexiones Bidireccionales Automáticas
+
+Cuando A conecta a B por uplink:
+- A conoce a B (su uplink configurado)
+- B conoce a A (conexión entrante aceptada)
+
+**No es necesario configurar ambos lados.** La conexión entrante se acepta automáticamente si pasa validación de HELLO.
+
+```
+A config: uplink → B
+B config: (nada hacia A)
+
+Resultado:
+  A ────────► B
+    (TCP)
+  
+A sabe de B: por su config
+B sabe de A: por conexión entrante
+```
+
+#### 19.14 Routing Transitivo Inter-Isla
+
+Si A quiere enviar a isla C pero solo tiene uplink a B:
+
+```
+A ──► B ──► C
+
+1. A recibe mensaje para nodo en Isla C
+2. A no tiene uplink directo a C
+3. A consulta tabla inter-isla: "C via B"
+4. A envía a B (su uplink)
+5. B recibe, ve que destino es Isla C
+6. B tiene uplink a C, reenvía
+7. C recibe, entrega al nodo local
+```
+
+**La tabla de rutas inter-isla se construye por LSA:**
+
+```
+Cada router anuncia via LSA:
+  - Su island_id
+  - Islas a las que tiene uplink directo
+
+Los routers calculan rutas:
+  - "Para llegar a C desde A, ir por B"
+```
+
+**TTL previene loops:** El mensaje decrementa TTL en cada hop inter-isla.
+
+#### 19.15 Requisitos de Deployment
+
+**Router principal por isla:**
+- Cada isla tiene UN router con WAN activa (levantado por systemd)
+- Este router es el punto de entrada/salida WAN de la isla
+- No se puede matar via API (protección en SY.orchestrator)
+
+**SY.admin:**
+- Debe correr en la primera isla del bus (o cualquiera con conectividad a todas)
+- Requiere rutas (directas o transitivas) a todas las islas que administra
 
 ---
 
