@@ -232,7 +232,6 @@ fn recreate_region(
     island: &str,
     layout: ConfigLayout,
 ) -> Result<ConfigShmWriter, ConfigShmError> {
-    let cname = CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name"))?;
     let fd = shm_open_with_flags(
         name,
         OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR,
@@ -336,11 +335,12 @@ fn ftruncate_fd(fd: &OwnedFd, len: i64) -> Result<(), ConfigShmError> {
 
 fn shm_open_with_flags(name: &str, flags: OFlag) -> Result<OwnedFd, ConfigShmError> {
     let cname = CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name"))?;
+    let mode = Mode::from_bits_truncate(0o600);
     let fd = unsafe {
         nix::libc::shm_open(
             cname.as_ptr(),
             flags.bits(),
-            Mode::empty().bits() as nix::libc::c_uint,
+            mode.bits() as nix::libc::c_uint,
         )
     };
     if fd < 0 {
