@@ -1,6 +1,6 @@
 # JSON Router - Especificación Técnica
 
-**Estado:** Draft v1.4
+**Estado:** Draft v1.5
 **Fecha:** 2025-01-18
 
 ---
@@ -1826,11 +1826,15 @@ Basados en estándares de OSPF y BGP.
 
 | Timer | Default | Configurable | Propósito |
 |-------|---------|--------------|-----------|
+| **Heartbeat Interval** | 5s | Sí | Actualizar heartbeat en SHM (CRÍTICO) |
+| **Heartbeat Stale** | 30s | Sí | Considerar peer muerto si heartbeat > este valor |
 | **Hello Interval** | 10s | Sí | Cada cuánto anunciar existencia a otros routers |
 | **Dead Interval** | 40s (4x hello) | Sí | Sin hello = router marcado como caído |
 | **Route Refresh** | 300s (5min) | Sí | Refrescar tabla de rutas entre routers |
 | **Connect Backoff Max** | 100ms | Sí | Máximo random delay antes de conectar a socket nuevo |
 | **Time Sync Interval** | 60s | Sí | Cada cuánto emitir TIME_SYNC broadcast |
+
+**IMPORTANTE:** El heartbeat en SHM es crítico para el funcionamiento del fabric intra-isla. Si el router no actualiza su heartbeat, los peers lo considerarán muerto después de 30s y dejarán de usar sus rutas. Esto causa pérdida de conectividad entre routers de la misma isla.
 
 #### 16.3 Timers de Nodo
 
@@ -1848,6 +1852,8 @@ Los timers se configuran en el archivo de configuración del router:
 ttl_default = 16
 message_timeout_ms = 30000
 retransmit_interval_ms = 5000
+heartbeat_interval_ms = 5000      # CRÍTICO: actualizar SHM
+heartbeat_stale_ms = 30000        # CRÍTICO: considerar peer muerto
 hello_interval_ms = 10000
 dead_interval_ms = 40000
 route_refresh_ms = 300000

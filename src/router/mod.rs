@@ -24,9 +24,11 @@ use crate::shm::{
     MATCH_GLOB, MATCH_PREFIX, ROUTE_LSA,
 };
 use crate::socket::connection::{read_frame, write_frame};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const ANNOUNCE_TIMEOUT_MS: u64 = 5_000;
+const BROADCAST_CACHE_TTL_SECS: u64 = 60;
+const CONFIG_SHM_PREFIX: &str = "/jsr-config-";
 
 pub struct Router {
     cfg: Config,
@@ -35,6 +37,8 @@ pub struct Router {
     nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
     local_snapshot: Arc<Mutex<Option<ShmSnapshot>>>,
     uplinks: Arc<Mutex<UplinkManager>>,
+    fabric: Arc<Mutex<FabricManager>>,
+    broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
 }
 
 impl Router {
@@ -47,6 +51,8 @@ impl Router {
             nodes: Arc::new(Mutex::new(HashMap::new())),
             local_snapshot: Arc::new(Mutex::new(None)),
             uplinks: Arc::new(Mutex::new(UplinkManager::new())),
+            fabric: Arc::new(Mutex::new(FabricManager::new())),
+            broadcast_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -55,11 +61,17 @@ impl Router {
         let mut connected: HashSet<PathBuf> = HashSet::new();
         let mut ticker = time::interval(Duration::from_millis(self.cfg.scan_interval_ms));
         let mut fib_ticker = time::interval(Duration::from_millis(self.cfg.fib_refresh_ms));
+        let mut heartbeat_ticker =
+            time::interval(Duration::from_millis(self.cfg.heartbeat_interval_ms));
         let mut peers = PeerManager::new(self.cfg.peer_shm_names.clone());
+        let autodiscover_peers = self.cfg.peer_shm_names.is_empty();
         let fib = Arc::clone(&self.fib);
         let nodes = Arc::clone(&self.nodes);
         let snapshot_cache = Arc::clone(&self.local_snapshot);
         let uplinks = Arc::clone(&self.uplinks);
+        let fabric = Arc::clone(&self.fabric);
+        let broadcast_cache = Arc::clone(&self.broadcast_cache);
+        let local_router_uuid = self.cfg.router_uuid;
 
         if let Some(addr) = self.cfg.uplink_listen.clone() {
             let shm = Arc::clone(&self.shm);
@@ -67,6 +79,8 @@ impl Router {
             let nodes = Arc::clone(&self.nodes);
             let snapshot_cache = Arc::clone(&self.local_snapshot);
             let uplinks = Arc::clone(&self.uplinks);
+            let broadcast_cache = Arc::clone(&self.broadcast_cache);
+            let fabric = Arc::clone(&self.fabric);
             let hello_interval_ms = self.cfg.hello_interval_ms;
             let dead_interval_ms = self.cfg.dead_interval_ms;
             tokio::spawn(async move {
@@ -77,6 +91,9 @@ impl Router {
                     nodes,
                     snapshot_cache,
                     uplinks,
+                    broadcast_cache,
+                    fabric,
+                    local_router_uuid,
                     hello_interval_ms,
                     dead_interval_ms,
                 )
@@ -94,6 +111,8 @@ impl Router {
             let snapshot_cache = Arc::clone(&self.local_snapshot);
             let uplinks = Arc::clone(&self.uplinks);
             let peers_cfg = self.cfg.uplink_peers.clone();
+            let broadcast_cache = Arc::clone(&self.broadcast_cache);
+            let fabric = Arc::clone(&self.fabric);
             let hello_interval_ms = self.cfg.hello_interval_ms;
             let dead_interval_ms = self.cfg.dead_interval_ms;
             tokio::spawn(async move {
@@ -104,6 +123,9 @@ impl Router {
                     nodes,
                     snapshot_cache,
                     uplinks,
+                    broadcast_cache,
+                    fabric,
+                    local_router_uuid,
                     hello_interval_ms,
                     dead_interval_ms,
                 )
@@ -111,8 +133,39 @@ impl Router {
             });
         }
 
+        {
+            let fabric = Arc::clone(&self.fabric);
+            let shm = Arc::clone(&self.shm);
+            let fib = Arc::clone(&self.fib);
+            let nodes = Arc::clone(&self.nodes);
+            let snapshot_cache = Arc::clone(&self.local_snapshot);
+            let uplinks = Arc::clone(&self.uplinks);
+            let broadcast_cache = Arc::clone(&self.broadcast_cache);
+            let socket_path = fabric_socket_path(&self.cfg.node_socket_dir, &self.cfg.router_uuid);
+            tokio::spawn(async move {
+                if let Err(err) = fabric_listen_loop(
+                    socket_path,
+                    shm,
+                    fib,
+                    nodes,
+                    snapshot_cache,
+                    uplinks,
+                    fabric,
+                    broadcast_cache,
+                )
+                .await
+                {
+                    warn!(target: "json_router", "fabric listen error: {}", err);
+                }
+            });
+        }
+
         loop {
             tokio::select! {
+                _ = heartbeat_ticker.tick() => {
+                    let mut shm = self.shm.lock().await;
+                    shm.update_heartbeat();
+                }
                 _ = ticker.tick() => {
                     let new_paths = scan_node_sockets(&self.cfg.node_socket_dir).await;
                     for path in new_paths {
@@ -128,8 +181,22 @@ impl Router {
                                 let nodes = Arc::clone(&nodes);
                                 let snapshot_cache = Arc::clone(&snapshot_cache);
                                 let uplinks = Arc::clone(&uplinks);
+                                let fabric = Arc::clone(&fabric);
+                                let broadcast_cache = Arc::clone(&broadcast_cache);
                                 tokio::spawn(async move {
-                                    handle_node_connection(path.clone(), stream, shm, fib, nodes, snapshot_cache, uplinks).await;
+                                    handle_node_connection(
+                                        path.clone(),
+                                        stream,
+                                        shm,
+                                        fib,
+                                        nodes,
+                                        snapshot_cache,
+                                        uplinks,
+                                        fabric,
+                                        broadcast_cache,
+                                        local_router_uuid,
+                                    )
+                                    .await;
                                     let _ = tx.send(path);
                                 });
                             }
@@ -145,7 +212,57 @@ impl Router {
                         let shm = self.shm.lock().await;
                         shm.read_snapshot()
                     };
+                    if autodiscover_peers {
+                        let names = discover_peer_shm_names(&self.cfg);
+                        peers.update(names);
+                    }
                     let peer_snapshots = peers.refresh();
+                    if !peer_snapshots.is_empty() {
+                        for peer in &peer_snapshots {
+                            let peer_uuid = match Uuid::from_slice(&peer.router_uuid) {
+                                Ok(uuid) => uuid,
+                                Err(_) => continue,
+                            };
+                            if peer_uuid == local_router_uuid {
+                                continue;
+                            }
+                            let should_connect = {
+                                let mut fabric = fabric.lock().await;
+                                fabric.ensure_connect(peer_uuid)
+                            };
+                            if !should_connect {
+                                continue;
+                            }
+                            let socket_path =
+                                fabric_socket_path(&self.cfg.node_socket_dir, &peer_uuid);
+                            let shm = Arc::clone(&self.shm);
+                            let fib = Arc::clone(&self.fib);
+                            let nodes = Arc::clone(&self.nodes);
+                            let snapshot_cache = Arc::clone(&self.local_snapshot);
+                            let uplinks = Arc::clone(&self.uplinks);
+                            let fabric = Arc::clone(&self.fabric);
+                            let broadcast_cache = Arc::clone(&self.broadcast_cache);
+                            tokio::spawn(async move {
+                                fabric_connect_loop(
+                                    peer_uuid,
+                                    socket_path,
+                                    shm,
+                                    fib,
+                                    nodes,
+                                    snapshot_cache,
+                                    uplinks,
+                                    fabric,
+                                    broadcast_cache,
+                                    local_router_uuid,
+                                )
+                                .await;
+                            });
+                        }
+                    }
+                    {
+                        let mut fabric = fabric.lock().await;
+                        fabric.refresh_peer_nodes(&peer_snapshots);
+                    }
                     if let Some(local_snapshot) = snapshot {
                         let uplink_nodes = {
                             let uplinks = uplinks.lock().await;
@@ -197,6 +314,9 @@ async fn handle_node_connection(
     nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
     local_snapshot: Arc<Mutex<Option<ShmSnapshot>>>,
     uplinks: Arc<Mutex<UplinkManager>>,
+    fabric: Arc<Mutex<FabricManager>>,
+    broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
+    local_router_uuid: Uuid,
 ) {
     let (mut reader, mut writer) = stream.into_split();
     if let Err(err) = send_query(&mut writer).await {
@@ -264,7 +384,18 @@ async fn handle_node_connection(
                         break;
                     }
                 }
-                handle_forward(&buf, &shm, &fib, &nodes, &local_snapshot, &uplinks).await;
+                handle_forward(
+                    &buf,
+                    &shm,
+                    &fib,
+                    &nodes,
+                    &local_snapshot,
+                    &uplinks,
+                    &fabric,
+                    &broadcast_cache,
+                    local_router_uuid,
+                )
+                .await;
             }
             Ok(None) => break,
             Err(_) => break,
@@ -322,6 +453,7 @@ where
 enum Resolution {
     Local(Uuid),
     Uplink(u32),
+    Fabric(Uuid),
     None,
 }
 
@@ -332,11 +464,19 @@ async fn handle_forward(
     nodes: &Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
     local_snapshot: &Arc<Mutex<Option<ShmSnapshot>>>,
     uplinks: &Arc<Mutex<UplinkManager>>,
+    fabric: &Arc<Mutex<FabricManager>>,
+    broadcast_cache: &Arc<Mutex<HashMap<Uuid, Instant>>>,
+    local_router_uuid: Uuid,
 ) {
     let value: serde_json::Value = match serde_json::from_slice(buf) {
         Ok(value) => value,
         Err(_) => return,
     };
+
+    let dst_value = value
+        .get("routing")
+        .and_then(|routing| routing.get("dst"))
+        .and_then(|dst| dst.as_str());
 
     let src_uuid = value
         .get("routing")
@@ -372,6 +512,90 @@ async fn handle_forward(
         }
     }
 
+    if matches!(dst_value, Some("broadcast")) {
+        let trace_id = value
+            .get("routing")
+            .and_then(|routing| routing.get("trace_id"))
+            .and_then(|trace_id| trace_id.as_str())
+            .and_then(|trace_id| Uuid::parse_str(trace_id).ok());
+
+        if let Some(trace_id) = trace_id {
+            if broadcast_seen(broadcast_cache, trace_id).await {
+                return;
+            }
+        }
+
+        let snapshot = {
+            let cached = local_snapshot.lock().await;
+            cached.clone()
+        };
+        let snapshot = match snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                let shm = shm.lock().await;
+                match shm.read_snapshot() {
+                    Some(snapshot) => snapshot,
+                    None => return,
+                }
+            }
+        };
+
+        let mut local_targets = Vec::new();
+        {
+            let nodes_map = nodes.lock().await;
+            for node in snapshot.nodes {
+                if !node.is_active() {
+                    continue;
+                }
+                let uuid = match Uuid::from_slice(&node.uuid) {
+                    Ok(uuid) => uuid,
+                    Err(_) => continue,
+                };
+                if src_uuid == Some(uuid) {
+                    continue;
+                }
+                let name_len = node.name_len as usize;
+                let name = &node.name[..name_len];
+                if let Some(target) = &target {
+                    if !target_matches(target, name) {
+                        continue;
+                    }
+                }
+                if let Some(sender) = nodes_map.get(&uuid) {
+                    local_targets.push(sender.clone());
+                }
+            }
+        }
+
+        let local_count = local_targets.len();
+        if let Ok(outgoing) = serde_json::to_vec(&value) {
+            for sender in &local_targets {
+                let _ = sender.send(outgoing.clone());
+            }
+        }
+
+        let forwarded = ttl.unwrap_or(0) > 1;
+        info!(
+            target: "json_router",
+            local = local_count,
+            forwarded = forwarded,
+            "broadcast delivered"
+        );
+
+        if forwarded {
+            let mut outgoing = value;
+            decrement_ttl(&mut outgoing);
+            if let Ok(outgoing) = serde_json::to_vec(&outgoing) {
+                let mut uplinks = uplinks.lock().await;
+                uplinks.broadcast(outgoing.clone());
+                let mut fabric = fabric.lock().await;
+                fabric.broadcast(outgoing);
+            }
+        }
+
+        return;
+    }
+
     let mut outgoing = value;
     if let Some(dst) = dst_uuid {
         if let Some(sender) = {
@@ -400,6 +624,21 @@ async fn handle_forward(
             return;
         }
 
+        let peer_uuid = {
+            let fabric = fabric.lock().await;
+            fabric.route_uuid(&dst)
+        };
+        if let Some(peer_uuid) = peer_uuid {
+            decrement_ttl(&mut outgoing);
+            if let Ok(outgoing) = serde_json::to_vec(&outgoing) {
+                let mut fabric = fabric.lock().await;
+                if fabric.send_to_peer(peer_uuid, outgoing).is_err() {
+                    warn!(target: "json_router", peer = %peer_uuid, "fabric send failed");
+                }
+            }
+            return;
+        }
+
         warn!(
             target: "json_router",
             dst = %dst,
@@ -410,7 +649,7 @@ async fn handle_forward(
     }
 
     let resolution = if let Some(target) = target {
-        resolve_target(&target, shm, fib, local_snapshot).await
+        resolve_target(&target, shm, fib, local_snapshot, local_router_uuid).await
     } else {
         Resolution::None
     };
@@ -468,6 +707,12 @@ async fn handle_forward(
                 warn!(target: "json_router", link_id, "uplink send failed");
             }
         }
+        Resolution::Fabric(peer_uuid) => {
+            let mut fabric = fabric.lock().await;
+            if fabric.send_to_peer(peer_uuid, outgoing).is_err() {
+                warn!(target: "json_router", peer = %peer_uuid, "fabric send failed");
+            }
+        }
         Resolution::None => {}
     }
 }
@@ -477,6 +722,7 @@ async fn resolve_target(
     shm: &Arc<Mutex<ShmWriter>>,
     fib: &Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
     local_snapshot: &Arc<Mutex<Option<ShmSnapshot>>>,
+    local_router_uuid: Uuid,
 ) -> Resolution {
     let snapshot = {
         let cached = local_snapshot.lock().await;
@@ -504,6 +750,12 @@ async fn resolve_target(
 
     if route.out_link != LINK_LOCAL {
         return Resolution::Uplink(route.out_link);
+    }
+
+    if let Ok(next_hop_uuid) = Uuid::from_slice(&route.next_hop_router) {
+        if next_hop_uuid != local_router_uuid {
+            return Resolution::Fabric(next_hop_uuid);
+        }
     }
 
     match_local_node(route, &snapshot.nodes)
@@ -600,6 +852,163 @@ fn decrement_ttl(value: &mut serde_json::Value) {
     }
 }
 
+async fn broadcast_seen(
+    cache: &Arc<Mutex<HashMap<Uuid, Instant>>>,
+    trace_id: Uuid,
+) -> bool {
+    let mut cache = cache.lock().await;
+    let now = Instant::now();
+    let ttl = Duration::from_secs(BROADCAST_CACHE_TTL_SECS);
+    cache.retain(|_, seen_at| now.duration_since(*seen_at) < ttl);
+    if cache.contains_key(&trace_id) {
+        true
+    } else {
+        cache.insert(trace_id, now);
+        false
+    }
+}
+
+fn target_matches(target: &str, name: &[u8]) -> bool {
+    if let Some(prefix) = target.strip_suffix(".*") {
+        let prefix_bytes = prefix.as_bytes();
+        return name.starts_with(prefix_bytes)
+            && (name.len() == prefix_bytes.len() || name.get(prefix_bytes.len()) == Some(&b'.'));
+    }
+
+    if target.contains('*') || target.contains('?') {
+        return wildcard_match(target.as_bytes(), name);
+    }
+
+    name == target.as_bytes()
+}
+
+fn fabric_socket_dir(node_socket_dir: &Path) -> PathBuf {
+    node_socket_dir
+        .parent()
+        .map(|parent| parent.join("routers"))
+        .unwrap_or_else(|| node_socket_dir.to_path_buf())
+}
+
+fn fabric_socket_path(node_socket_dir: &Path, router_uuid: &Uuid) -> PathBuf {
+    let dir = fabric_socket_dir(node_socket_dir);
+    dir.join(format!("{}.sock", router_uuid.simple()))
+}
+
+#[derive(serde::Deserialize)]
+struct DiscoveryRouterConfig {
+    router: DiscoveryRouterSection,
+    #[serde(default)]
+    paths: DiscoveryPaths,
+}
+
+#[derive(serde::Deserialize)]
+struct DiscoveryRouterSection {
+    name: String,
+    island_id: String,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct DiscoveryPaths {
+    #[serde(default = "default_state_dir")]
+    state_dir: PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+struct DiscoveryIdentity {
+    shm: DiscoveryIdentityShm,
+}
+
+#[derive(serde::Deserialize)]
+struct DiscoveryIdentityShm {
+    name: String,
+}
+
+fn default_state_dir() -> PathBuf {
+    PathBuf::from("./state")
+}
+
+fn discover_peer_shm_names(cfg: &Config) -> Vec<String> {
+    let mut names = Vec::new();
+
+    let prefix = cfg.shm_prefix.trim_start_matches('/');
+    if Path::new("/dev/shm").is_dir() {
+        if let Ok(entries) = std::fs::read_dir("/dev/shm") {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let name = file_name.to_string_lossy();
+                if !name.starts_with(prefix) {
+                    continue;
+                }
+                let shm_name = if name.starts_with('/') {
+                    name.to_string()
+                } else {
+                    format!("/{}", name)
+                };
+                if shm_name == cfg.shm_name || shm_name.starts_with(CONFIG_SHM_PREFIX) {
+                    continue;
+                }
+                names.push(shm_name);
+            }
+        }
+    }
+
+    if !names.is_empty() {
+        names.sort();
+        names.dedup();
+        return names;
+    }
+
+    let routers_dir = cfg.config_dir.join("routers");
+    let Ok(entries) = std::fs::read_dir(&routers_dir) else {
+        return names;
+    };
+
+    for entry in entries.flatten() {
+        let router_dir = entry.path();
+        let config_path = router_dir.join("config.yaml");
+        let Ok(config_data) = std::fs::read_to_string(&config_path) else {
+            continue;
+        };
+        let Ok(router_cfg) = serde_yaml::from_str::<DiscoveryRouterConfig>(&config_data) else {
+            continue;
+        };
+        if router_cfg.router.island_id != cfg.island_id {
+            continue;
+        }
+        if router_cfg.router.name == cfg.router_name {
+            continue;
+        }
+        let mut identity_data = None;
+        let state_dir = &router_cfg.paths.state_dir;
+        let candidates = if state_dir.is_relative() {
+            vec![state_dir.clone(), cfg.config_dir.join(state_dir)]
+        } else {
+            vec![state_dir.clone()]
+        };
+        for candidate in candidates {
+            let identity_path = candidate.join(&router_cfg.router.name).join("identity.yaml");
+            if let Ok(data) = std::fs::read_to_string(&identity_path) {
+                identity_data = Some(data);
+                break;
+            }
+        }
+        let Some(identity_data) = identity_data else {
+            continue;
+        };
+        let Ok(identity) = serde_yaml::from_str::<DiscoveryIdentity>(&identity_data) else {
+            continue;
+        };
+        if identity.shm.name == cfg.shm_name {
+            continue;
+        }
+        names.push(identity.shm.name);
+    }
+
+    names.sort();
+    names.dedup();
+    names
+}
+
 struct PeerManager {
     peers: Vec<PeerHandle>,
 }
@@ -627,6 +1036,27 @@ impl PeerManager {
             })
             .collect();
         Self { peers }
+    }
+
+    fn update(&mut self, names: Vec<String>) {
+        let mut existing: HashMap<String, PeerHandle> = self
+            .peers
+            .drain(..)
+            .map(|peer| (peer.name.clone(), peer))
+            .collect();
+        let mut peers = Vec::new();
+        for name in names {
+            if let Some(peer) = existing.remove(&name) {
+                peers.push(peer);
+            } else {
+                peers.push(PeerHandle {
+                    name,
+                    reader: None,
+                    generation: None,
+                });
+            }
+        }
+        self.peers = peers;
     }
 
     fn refresh(&mut self) -> Vec<PeerSnapshot> {
@@ -925,6 +1355,84 @@ async fn handle_sync_request(
     true
 }
 
+struct FabricManager {
+    links: HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>,
+    connecting: HashSet<Uuid>,
+    peer_nodes: HashMap<Uuid, Uuid>,
+}
+
+impl FabricManager {
+    fn new() -> Self {
+        Self {
+            links: HashMap::new(),
+            connecting: HashSet::new(),
+            peer_nodes: HashMap::new(),
+        }
+    }
+
+    fn ensure_connect(&mut self, peer_uuid: Uuid) -> bool {
+        if self.links.contains_key(&peer_uuid) || self.connecting.contains(&peer_uuid) {
+            return false;
+        }
+        self.connecting.insert(peer_uuid);
+        true
+    }
+
+    fn clear_connecting(&mut self, peer_uuid: Uuid) {
+        self.connecting.remove(&peer_uuid);
+    }
+
+    fn register_link(&mut self, peer_uuid: Uuid, sender: mpsc::UnboundedSender<Vec<u8>>) -> bool {
+        if self.links.contains_key(&peer_uuid) {
+            return false;
+        }
+        self.links.insert(peer_uuid, sender);
+        true
+    }
+
+    fn remove_link(&mut self, peer_uuid: Uuid) {
+        self.links.remove(&peer_uuid);
+        self.connecting.remove(&peer_uuid);
+    }
+
+    fn send_to_peer(&mut self, peer_uuid: Uuid, payload: Vec<u8>) -> Result<(), ()> {
+        if let Some(sender) = self.links.get(&peer_uuid) {
+            sender.send(payload).map_err(|_| ())
+        } else {
+            Err(())
+        }
+    }
+
+    fn broadcast(&mut self, payload: Vec<u8>) {
+        for sender in self.links.values() {
+            let _ = sender.send(payload.clone());
+        }
+    }
+
+    fn refresh_peer_nodes(&mut self, peers: &[PeerSnapshot]) {
+        let mut map = HashMap::new();
+        for peer in peers {
+            let peer_uuid = match Uuid::from_slice(&peer.router_uuid) {
+                Ok(uuid) => uuid,
+                Err(_) => continue,
+            };
+            for node in &peer.nodes {
+                if !node.is_active() {
+                    continue;
+                }
+                if let Ok(uuid) = Uuid::from_slice(&node.uuid) {
+                    map.insert(uuid, peer_uuid);
+                }
+            }
+        }
+        self.peer_nodes = map;
+    }
+
+    fn route_uuid(&self, uuid: &Uuid) -> Option<Uuid> {
+        self.peer_nodes.get(uuid).copied()
+    }
+}
+
 struct UplinkManager {
     links: HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>,
     peer_nodes: HashMap<u32, HashMap<Uuid, String>>,
@@ -1011,6 +1519,198 @@ impl UplinkManager {
 
 }
 
+enum FabricRole {
+    Initiator,
+    Acceptor,
+}
+
+async fn fabric_listen_loop(
+    socket_path: PathBuf,
+    shm: Arc<Mutex<ShmWriter>>,
+    fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
+    uplinks: Arc<Mutex<UplinkManager>>,
+    fabric: Arc<Mutex<FabricManager>>,
+    broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
+) -> io::Result<()> {
+    if let Some(parent) = socket_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let _ = tokio::fs::remove_file(&socket_path).await;
+    let listener = tokio::net::UnixListener::bind(&socket_path)?;
+    info!(target: "json_router", socket = %socket_path.display(), "fabric listening");
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let shm = Arc::clone(&shm);
+        let fib = Arc::clone(&fib);
+        let nodes = Arc::clone(&nodes);
+        let snapshot_cache = Arc::clone(&snapshot_cache);
+        let uplinks = Arc::clone(&uplinks);
+        let fabric = Arc::clone(&fabric);
+        let broadcast_cache = Arc::clone(&broadcast_cache);
+        tokio::spawn(async move {
+            if let Err(err) = handle_fabric_connection(
+                stream,
+                FabricRole::Acceptor,
+                shm,
+                fib,
+                nodes,
+                snapshot_cache,
+                uplinks,
+                fabric,
+                broadcast_cache,
+            )
+            .await
+            {
+                warn!(target: "json_router", "fabric accept error: {}", err);
+            }
+        });
+    }
+}
+
+async fn fabric_connect_loop(
+    peer_uuid: Uuid,
+    socket_path: PathBuf,
+    shm: Arc<Mutex<ShmWriter>>,
+    fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
+    uplinks: Arc<Mutex<UplinkManager>>,
+    fabric: Arc<Mutex<FabricManager>>,
+    broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
+    local_router_uuid: Uuid,
+) {
+    let result = UnixStream::connect(&socket_path).await;
+    let ok = result.is_ok();
+    if let Ok(stream) = result {
+        let _ = handle_fabric_connection(
+            stream,
+            FabricRole::Initiator,
+            shm,
+            fib,
+            nodes,
+            snapshot_cache,
+            uplinks,
+            Arc::clone(&fabric),
+            broadcast_cache,
+        )
+        .await;
+    }
+    let mut fabric = fabric.lock().await;
+    fabric.clear_connecting(peer_uuid);
+    if fabric.links.contains_key(&peer_uuid) {
+        return;
+    }
+    if peer_uuid == local_router_uuid {
+        return;
+    }
+    if !ok {
+        debug!(
+            target: "json_router",
+            peer = %peer_uuid,
+            socket = %socket_path.display(),
+            "fabric connect failed"
+        );
+    }
+}
+
+async fn handle_fabric_connection(
+    stream: UnixStream,
+    role: FabricRole,
+    shm: Arc<Mutex<ShmWriter>>,
+    fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
+    uplinks: Arc<Mutex<UplinkManager>>,
+    fabric: Arc<Mutex<FabricManager>>,
+    broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
+) -> io::Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    let (router_uuid, island_id, shm_name) = {
+        let shm = shm.lock().await;
+        let name = shm.name().to_string();
+        let router_uuid = Uuid::from_slice(&shm.header().router_uuid).unwrap_or_else(|_| Uuid::nil());
+        let island_id = {
+            let raw = &shm.header().island_id[..shm.header().island_id_len as usize];
+            String::from_utf8_lossy(raw).to_string()
+        };
+        (router_uuid, island_id, name)
+    };
+
+    let hello = build_hello(
+        router_uuid,
+        &island_id,
+        &shm_name,
+        1,
+        0,
+        0,
+        HelloCapabilities {
+            sync: false,
+            lsa: true,
+            forwarding: true,
+        },
+    );
+
+    let peer = match role {
+        FabricRole::Initiator => {
+            send_system_message(&mut writer, &hello).await?;
+            read_hello(&mut reader).await?
+        }
+        FabricRole::Acceptor => {
+            let peer = read_hello(&mut reader).await?;
+            send_system_message(&mut writer, &hello).await?;
+            peer
+        }
+    };
+
+    let peer_uuid = match Uuid::parse_str(&peer.router_id) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(()),
+    };
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    {
+        let mut fabric = fabric.lock().await;
+        if !fabric.register_link(peer_uuid, tx) {
+            return Ok(());
+        }
+    }
+
+    tokio::spawn(async move {
+        while let Some(payload) = rx.recv().await {
+            if write_frame(&mut writer, &payload).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        match read_frame(&mut reader).await? {
+            Some(buf) => {
+                handle_forward(
+                    &buf,
+                    &shm,
+                    &fib,
+                    &nodes,
+                    &snapshot_cache,
+                    &uplinks,
+                    &fabric,
+                    &broadcast_cache,
+                    router_uuid,
+                )
+                .await;
+            }
+            None => break,
+        }
+    }
+
+    let mut fabric = fabric.lock().await;
+    fabric.remove_link(peer_uuid);
+    Ok(())
+}
+
 async fn uplink_listen_loop(
     addr: String,
     shm: Arc<Mutex<ShmWriter>>,
@@ -1018,6 +1718,9 @@ async fn uplink_listen_loop(
     nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
     snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
     uplinks: Arc<Mutex<UplinkManager>>,
+    broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
+    fabric: Arc<Mutex<FabricManager>>,
+    local_router_uuid: Uuid,
     hello_interval_ms: u64,
     dead_interval_ms: u64,
 ) -> io::Result<()> {
@@ -1030,6 +1733,8 @@ async fn uplink_listen_loop(
         let nodes = Arc::clone(&nodes);
         let snapshot_cache = Arc::clone(&snapshot_cache);
         let uplinks = Arc::clone(&uplinks);
+        let broadcast_cache = Arc::clone(&broadcast_cache);
+        let fabric = Arc::clone(&fabric);
         tokio::spawn(async move {
             let link_id = {
                 let mut uplinks = uplinks.lock().await;
@@ -1044,6 +1749,9 @@ async fn uplink_listen_loop(
                 nodes,
                 snapshot_cache,
                 uplinks,
+                broadcast_cache,
+                fabric,
+                local_router_uuid,
                 hello_interval_ms,
                 dead_interval_ms,
             )
@@ -1062,6 +1770,9 @@ async fn uplink_connect_loop(
     nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
     snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
     uplinks: Arc<Mutex<UplinkManager>>,
+    broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
+    fabric: Arc<Mutex<FabricManager>>,
+    local_router_uuid: Uuid,
     hello_interval_ms: u64,
     dead_interval_ms: u64,
 ) {
@@ -1071,6 +1782,8 @@ async fn uplink_connect_loop(
         let nodes = Arc::clone(&nodes);
         let snapshot_cache = Arc::clone(&snapshot_cache);
         let uplinks = Arc::clone(&uplinks);
+        let broadcast_cache = Arc::clone(&broadcast_cache);
+        let fabric = Arc::clone(&fabric);
         tokio::spawn(async move {
             loop {
                 match TcpStream::connect(&peer.addr).await {
@@ -1085,6 +1798,9 @@ async fn uplink_connect_loop(
                             Arc::clone(&nodes),
                             Arc::clone(&snapshot_cache),
                             Arc::clone(&uplinks),
+                            Arc::clone(&broadcast_cache),
+                            Arc::clone(&fabric),
+                            local_router_uuid,
                             hello_interval_ms,
                             dead_interval_ms,
                         )
@@ -1120,6 +1836,9 @@ async fn handle_uplink_connection(
     nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
     snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
     uplinks: Arc<Mutex<UplinkManager>>,
+    broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
+    fabric: Arc<Mutex<FabricManager>>,
+    local_router_uuid: Uuid,
     hello_interval_ms: u64,
     dead_interval_ms: u64,
 ) -> io::Result<()> {
@@ -1259,7 +1978,18 @@ async fn handle_uplink_connection(
                         if handle_sync_request(&buf, &shm, &tx).await {
                             continue;
                         }
-                        handle_forward(&buf, &shm, &fib, &nodes, &snapshot_cache, &uplinks).await;
+                        handle_forward(
+                            &buf,
+                            &shm,
+                            &fib,
+                            &nodes,
+                            &snapshot_cache,
+                            &uplinks,
+                            &fabric,
+                            &broadcast_cache,
+                            local_router_uuid,
+                        )
+                        .await;
                     }
                     None => break,
                 }
