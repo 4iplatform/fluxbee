@@ -1,7 +1,7 @@
 # JSON Router - Especificación Técnica
 
-**Estado:** Draft v1.7
-**Fecha:** 2025-01-18
+**Estado:** Draft v1.8
+**Fecha:** 2025-01-19
 
 ---
 

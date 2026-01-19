@@ -1,8 +1,8 @@
 # JSON Router - Nodos SY (System)
 
-**Estado:** Draft v0.7
-**Fecha:** 2025-01-18
-**Documento relacionado:** JSON Router Especificación Técnica v1.7
+**Estado:** Draft v0.8
+**Fecha:** 2025-01-19
+**Documento relacionado:** JSON Router Especificación Técnica v1.8
 
 ---
 
@@ -44,14 +44,14 @@ Esto permite que los nodos SY:
 
 ### 1.4 Catálogo de nodos SY
 
-| Nodo | Estado | Descripción |
-|------|--------|-------------|
-| `SY.config.routes` | Especificado | Configuración centralizada de rutas estáticas y VPNs |
-| `SY.opa.rules` | Especificado | Gestión centralizada de policies OPA |
-| `SY.time` | Por especificar | Sincronización de tiempo en la red |
-| `SY.monitor` | Por especificar | Métricas y health checks |
-| `SY.log` | Por especificar | Colector centralizado de logs |
-| `SY.admin` | Por especificar | Consola de administración |
+| Nodo | Instancias | Estado | Descripción |
+|------|------------|--------|-------------|
+| `SY.admin` | Único global | Especificado | Gateway HTTP REST para toda la infraestructura |
+| `SY.orchestrator` | Uno por isla | Especificado | Orquestación de routers y nodos |
+| `SY.config.routes` | Uno por isla | Especificado | Configuración de rutas estáticas y VPNs |
+| `SY.opa.rules` | Uno por isla | Especificado | Gestión de policies OPA |
+| `SY.time` | Uno por isla | Por especificar | Sincronización de tiempo |
+| `SY.log` | Uno por isla | Por especificar | Colector de logs |
 
 ---
 
@@ -983,102 +983,648 @@ Sincronización de tiempo en la red.
 
 ---
 
-## 5. SY.monitor
+## 5. SY.admin
 
-Métricas y health checks.
-
-### 4.1 Resumen
-
-| Aspecto | Valor |
-|---------|-------|
-| Nombre | `SY.monitor.<instancia>` |
-| Función | Recolectar métricas, exponer health checks |
-| Dependencias | Lee SHM de routers y config |
-
-### 4.2 Funcionalidad
-
-- Lee todas las regiones SHM para reportar estado
-- Expone endpoint HTTP para health checks (Kubernetes, load balancers)
-- Puede enviar métricas a sistemas externos (Prometheus, InfluxDB)
-
-### 4.3 Métricas a recolectar
-
-| Métrica | Fuente | Descripción |
-|---------|--------|-------------|
-| `router_nodes_total` | SHM router | Nodos conectados por router |
-| `router_routes_total` | SHM router | Rutas por router |
-| `router_heartbeat_age_ms` | SHM router | Edad del heartbeat |
-| `config_routes_total` | SHM config | Rutas estáticas configuradas |
-| `config_vpns_total` | SHM config | VPNs configuradas |
-| `config_version` | SHM config | Versión de la config |
-
-### 4.4 Health check endpoint
-
-```
-GET /health
-```
-
-```json
-{
-  "status": "healthy",
-  "timestamp": "2025-01-17T10:30:00Z",
-  "components": {
-    "routers": {
-      "RT.produccion.primary": "alive",
-      "RT.produccion.secondary": "alive"
-    },
-    "config": {
-      "SY.config.routes.primary": "alive"
-    }
-  }
-}
-```
-
-### 4.5 Por especificar
-
-- Puerto HTTP para health checks
-- Formato de métricas (Prometheus exposition format)
-- Alertas y thresholds
-
----
-
-## 6. SY.log
-
-Colector centralizado de logs.
+Gateway HTTP REST único para toda la infraestructura. Punto de entrada para humanos y AI de infraestructura.
 
 ### 5.1 Resumen
 
 | Aspecto | Valor |
 |---------|-------|
-| Nombre | `SY.log.<instancia>` |
-| Función | Recibir y consolidar logs de todos los nodos |
-| Salida | Archivo, stdout, o sistema externo |
+| Nombre | `SY.admin` (único en todo el sistema) |
+| Función | Gateway HTTP → protocolo interno |
+| Interfaz | HTTP REST |
+| Seguridad | Ninguna (usar nginx/proxy externo si se requiere) |
 
-### 5.2 Por especificar
+### 5.2 Arquitectura
 
-- Formato de mensajes de log
-- Rotación y retención
-- Integración con sistemas externos (Loki, Elasticsearch)
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                           SY.admin                                  │
+│                      (único en todo el sistema)                     │
+│                                                                      │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐          │
+│  │ HTTP Server  │    │  Translator  │    │  Router Conn │          │
+│  │              │    │              │    │              │          │
+│  │ REST API     │───►│ HTTP → Frame │───►│ Socket Unix  │          │
+│  │ JSON in/out  │◄───│ Frame → HTTP │◄───│              │          │
+│  └──────────────┘    └──────────────┘    └──────────────┘          │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+                           Router local
+                                │
+            ┌───────────────────┼───────────────────┐
+            │                   │                   │
+            ▼                   ▼                   ▼
+    ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+    │ Isla A       │   │ Isla B       │   │ Isla C       │
+    │              │   │              │   │              │
+    │ SY.orch      │   │ SY.orch      │   │ SY.orch      │
+    │ SY.config    │   │ SY.config    │   │ SY.config    │
+    │ SY.opa       │   │ SY.opa       │   │ SY.opa       │
+    └──────────────┘   └──────────────┘   └──────────────┘
+```
+
+**Principios:**
+- Sin autenticación propia (delegar a proxy externo)
+- Traduce HTTP REST a mensajes del protocolo
+- Envía por socket, nunca lee SHM directo
+- Conoce las islas (config estática o autodescubrimiento)
+
+### 5.3 API REST
+
+#### 5.3.1 Islas
+
+```
+GET /islands
+```
+Lista todas las islas conocidas.
+
+```json
+{
+  "islands": [
+    { "id": "produccion", "status": "online" },
+    { "id": "staging", "status": "online" },
+    { "id": "desarrollo", "status": "offline" }
+  ]
+}
+```
+
+```
+GET /islands/{isla}/status
+```
+Estado detallado de una isla.
+
+#### 5.3.2 Routers (→ SY.orchestrator)
+
+```
+GET /islands/{isla}/routers
+```
+Lista routers de la isla.
+
+```json
+{
+  "routers": [
+    {
+      "uuid": "uuid-router-a",
+      "name": "RT.produccion.primary",
+      "is_primary": true,
+      "wan_enabled": true,
+      "nodes_count": 12,
+      "status": "alive"
+    }
+  ]
+}
+```
+
+```
+POST /islands/{isla}/routers
+```
+Levantar router secundario.
+
+```json
+{
+  "name": "RT.produccion.secondary",
+  "config": { ... }
+}
+```
+
+```
+DELETE /islands/{isla}/routers/{uuid}
+```
+Matar router (no permite matar el primario).
+
+#### 5.3.3 Nodos (→ SY.orchestrator)
+
+```
+GET /islands/{isla}/nodes
+```
+Lista todos los nodos conectados.
+
+```json
+{
+  "nodes": [
+    {
+      "uuid": "uuid-node-1",
+      "name": "AI.soporte.l1.español",
+      "router": "uuid-router-a",
+      "connected_at": "2025-01-19T10:00:00Z",
+      "status": "active"
+    }
+  ]
+}
+```
+
+```
+POST /islands/{isla}/nodes
+```
+Correr nuevo nodo.
+
+```json
+{
+  "type": "AI.soporte",
+  "instance": "l1.español",
+  "config": { ... }
+}
+```
+
+```
+DELETE /islands/{isla}/nodes/{uuid}
+```
+Matar nodo.
+
+#### 5.3.4 Rutas Estáticas (→ SY.config.routes)
+
+```
+GET /islands/{isla}/routes
+```
+Lista rutas estáticas.
+
+```json
+{
+  "version": 42,
+  "routes": [
+    {
+      "prefix": "AI.soporte.*",
+      "match_kind": "PREFIX",
+      "action": "FORWARD",
+      "metric": 10
+    }
+  ]
+}
+```
+
+```
+POST /islands/{isla}/routes
+```
+Agregar ruta.
+
+```json
+{
+  "prefix": "AI.ventas.*",
+  "match_kind": "PREFIX",
+  "action": "FORWARD",
+  "metric": 20
+}
+```
+
+```
+DELETE /islands/{isla}/routes/{prefix}
+```
+Eliminar ruta (prefix URL-encoded).
+
+#### 5.3.5 VPNs (→ SY.config.routes)
+
+```
+GET /islands/{isla}/vpns
+POST /islands/{isla}/vpns
+DELETE /islands/{isla}/vpns/{id}
+```
+
+#### 5.3.6 OPA Policies (→ SY.opa.rules)
+
+```
+GET /islands/{isla}/opa/policy
+```
+Obtener policy actual.
+
+```json
+{
+  "version": 42,
+  "rego": "package router\n...",
+  "updated_at": "2025-01-19T10:00:00Z"
+}
+```
+
+```
+POST /islands/{isla}/opa/policy
+```
+Actualizar policy.
+
+```json
+{
+  "rego": "package router\n\ndefault target = null\n..."
+}
+```
+
+```
+GET /islands/{isla}/opa/status
+```
+Estado de OPA en routers.
+
+```json
+{
+  "version": 42,
+  "routers": [
+    { "uuid": "uuid-a", "version": 42, "status": "ok" },
+    { "uuid": "uuid-b", "version": 42, "status": "ok" }
+  ]
+}
+```
+
+### 5.4 Traducción HTTP → Mensajes
+
+| HTTP | Destino | meta.action |
+|------|---------|-------------|
+| `GET /islands/{isla}/routes` | `SY.config.routes` de isla | `list_routes` |
+| `POST /islands/{isla}/routes` | `SY.config.routes` de isla | `add_route` |
+| `DELETE /islands/{isla}/routes/{p}` | `SY.config.routes` de isla | `delete_route` |
+| `POST /islands/{isla}/opa/policy` | `SY.opa.rules` de isla | `update_policy` |
+| `GET /islands/{isla}/nodes` | `SY.orchestrator` de isla | `list_nodes` |
+| `POST /islands/{isla}/nodes` | `SY.orchestrator` de isla | `run_node` |
+| `DELETE /islands/{isla}/nodes/{id}` | `SY.orchestrator` de isla | `kill_node` |
+
+### 5.5 Configuración
+
+```yaml
+# /etc/json-router/sy-admin.yaml
+
+listen: "0.0.0.0:8080"
+
+islands:
+  - id: produccion
+    orchestrator: "SY.orchestrator.produccion"
+    config_routes: "SY.config.routes.produccion"
+    opa_rules: "SY.opa.rules.produccion"
+  - id: staging
+    orchestrator: "SY.orchestrator.staging"
+    config_routes: "SY.config.routes.staging"
+    opa_rules: "SY.opa.rules.staging"
+```
+
+Los nombres son capa 2. SY.admin usa el router para llegar a cada uno.
+
+### 5.6 Systemd
+
+```ini
+# /etc/systemd/system/sy-admin.service
+
+[Unit]
+Description=JSON Router Admin Gateway
+After=network.target json-router.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sy-admin
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ---
 
-## 7. SY.admin
+## 6. SY.orchestrator
 
-Consola de administración.
+Orquestación de routers y nodos. Uno por isla.
 
 ### 6.1 Resumen
 
 | Aspecto | Valor |
 |---------|-------|
-| Nombre | `SY.admin.<instancia>` |
-| Función | Interfaz para administradores |
-| Interfaz | CLI interactivo o web UI |
+| Nombre | `SY.orchestrator.{isla}` (uno por isla) |
+| Función | Listar, correr, matar routers y nodos |
+| Lectura | SHM de routers locales |
+| Ejecución | systemd / docker / proceso directo |
 
-### 6.2 Por especificar
+### 6.2 Arquitectura
 
-- Comandos disponibles
-- Autenticación/autorización
-- Web UI vs CLI
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   SY.orchestrator.{isla}                    │
+│                                                              │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
+│  │ API Handler │  │ SHM Reader  │  │ Executor    │         │
+│  │             │  │             │  │             │         │
+│  │ - list_*    │  │ - scan shm  │  │ - systemd   │         │
+│  │ - run_*     │  │ - read hdrs │  │ - docker    │         │
+│  │ - kill_*    │  │             │  │ - process   │         │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘         │
+│         │                │                │                 │
+│         └────────────────┼────────────────┘                 │
+│                          │                                  │
+└──────────────────────────┼──────────────────────────────────┘
+                           │
+           ┌───────────────┴───────────────┐
+           │                               │
+           ▼                               ▼
+    /dev/shm/jsr-*                  systemd / docker
+    (lectura)                       (ejecución)
+```
+
+### 6.3 Flujo de Arranque de una Isla
+
+```
+Systemd inicia servicios base:
+    │
+    ├── json-router (router principal, WAN activa)
+    ├── sy-orchestrator
+    ├── sy-config-routes
+    └── sy-opa-rules
+           │
+           ▼
+SY.orchestrator conecta al router
+           │
+           ▼
+SY.orchestrator lee config de nodos a levantar
+           │
+           ▼
+SY.orchestrator ejecuta nodos según config:
+    ├── systemctl start ai-soporte@l1
+    ├── systemctl start ai-ventas@l1
+    └── ...
+```
+
+### 6.4 API (via mensajes)
+
+#### 6.4.1 Listar Routers
+
+**Request:**
+```json
+{
+  "meta": { "type": "admin", "action": "list_routers" },
+  "payload": {}
+}
+```
+
+**Response:**
+```json
+{
+  "meta": { "type": "admin", "action": "list_routers" },
+  "payload": {
+    "routers": [
+      {
+        "uuid": "uuid-router-a",
+        "name": "RT.produccion.primary",
+        "pid": 1234,
+        "is_primary": true,
+        "wan_enabled": true,
+        "nodes_count": 12,
+        "routes_count": 5,
+        "heartbeat_age_ms": 2500,
+        "status": "alive"
+      }
+    ]
+  }
+}
+```
+
+#### 6.4.2 Listar Nodos
+
+**Request:**
+```json
+{
+  "meta": { "type": "admin", "action": "list_nodes" },
+  "payload": {}
+}
+```
+
+**Response:**
+```json
+{
+  "meta": { "type": "admin", "action": "list_nodes" },
+  "payload": {
+    "nodes": [
+      {
+        "uuid": "uuid-node-1",
+        "name": "AI.soporte.l1.español",
+        "router_uuid": "uuid-router-a",
+        "connected_at": "2025-01-19T10:00:00Z",
+        "status": "active"
+      }
+    ]
+  }
+}
+```
+
+#### 6.4.3 Correr Nodo
+
+**Request:**
+```json
+{
+  "meta": { "type": "admin", "action": "run_node" },
+  "payload": {
+    "type": "AI.soporte",
+    "instance": "l1.español",
+    "executor": "systemd",
+    "config": { ... }
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "meta": { "type": "admin", "action": "run_node" },
+  "payload": {
+    "status": "ok",
+    "pid": 5678,
+    "name": "AI.soporte.l1.español"
+  }
+}
+```
+
+#### 6.4.4 Matar Nodo
+
+**Request:**
+```json
+{
+  "meta": { "type": "admin", "action": "kill_node" },
+  "payload": {
+    "uuid": "uuid-node-1"
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "meta": { "type": "admin", "action": "kill_node" },
+  "payload": {
+    "status": "ok",
+    "name": "AI.soporte.l1.español"
+  }
+}
+```
+
+#### 6.4.5 Correr Router Secundario
+
+**Request:**
+```json
+{
+  "meta": { "type": "admin", "action": "run_router" },
+  "payload": {
+    "name": "RT.produccion.secondary"
+  }
+}
+```
+
+#### 6.4.6 Matar Router
+
+**Request:**
+```json
+{
+  "meta": { "type": "admin", "action": "kill_router" },
+  "payload": {
+    "uuid": "uuid-router-b"
+  }
+}
+```
+
+**Error si intenta matar el primario:**
+```json
+{
+  "payload": {
+    "status": "error",
+    "error": "CANNOT_KILL_PRIMARY",
+    "detail": "Cannot kill primary router with active WAN"
+  }
+}
+```
+
+### 6.5 Executors
+
+SY.orchestrator soporta diferentes formas de ejecutar procesos:
+
+| Executor | Comando | Uso |
+|----------|---------|-----|
+| `systemd` | `systemctl start {unit}` | Producción |
+| `docker` | `docker run {image}` | Contenedores |
+| `process` | `{binary} {args}` | Desarrollo |
+
+Configurado por nodo o por defecto de la isla.
+
+### 6.6 Protección del Router Primario
+
+El router primario (con WAN activa) no puede ser matado via API:
+
+```
+kill_router(uuid):
+    router = find_router(uuid)
+    if router.is_primary and router.wan_enabled:
+        return error("CANNOT_KILL_PRIMARY")
+    else:
+        executor.kill(router.pid)
+```
+
+Para matar el primario, hay que hacerlo manualmente o con shutdown de la isla.
+
+### 6.7 Configuración
+
+```yaml
+# /etc/json-router/sy-orchestrator.yaml
+
+executor: systemd  # default executor
+
+node_templates:
+  AI.soporte:
+    executor: systemd
+    unit: "ai-soporte@{instance}"
+    
+  AI.ventas:
+    executor: docker
+    image: "ai-ventas:latest"
+    args: ["--instance", "{instance}"]
+
+startup_nodes:
+  - type: AI.soporte
+    instance: l1.español
+  - type: AI.soporte
+    instance: l1.ingles
+  - type: AI.ventas
+    instance: l1
+```
+
+### 6.8 Systemd
+
+```ini
+# /etc/systemd/system/sy-orchestrator.service
+
+[Unit]
+Description=JSON Router Orchestrator
+After=network.target json-router.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sy-orchestrator
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+## 7. SY.time
+
+Sincronización de tiempo en la red.
+
+### 7.1 Resumen
+
+| Aspecto | Valor |
+|---------|-------|
+| Nombre | `SY.time.{isla}` (uno por isla) |
+| Función | Broadcast periódico de tiempo UTC |
+| Dependencias | Ninguna (puede usar NTP del sistema) |
+
+### 7.2 Funcionalidad
+
+- Broadcast periódico (cada 1s o configurable) con timestamp UTC
+- Los nodos pueden usar este tiempo para sincronizar operaciones
+- No requiere región SHM propia (usa mensajes)
+
+### 7.3 Mensaje TIME_SYNC
+
+```json
+{
+  "routing": {
+    "src": "<uuid-sy-time>",
+    "dst": "broadcast",
+    "ttl": 1,
+    "trace_id": "<uuid>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "TIME_SYNC"
+  },
+  "payload": {
+    "timestamp_utc": "2025-01-19T10:30:00.123Z",
+    "epoch_ms": 1737110400123,
+    "seq": 12345
+  }
+}
+```
+
+**dst: "broadcast"** envía a todos los nodos. **TTL=1** limita a la isla local (no cruza WAN).
+
+### 7.4 Por especificar
+
+- Precisión requerida
+- Manejo de drift
+- Stratum/jerarquía de tiempo
+
+---
+
+## 8. SY.log
+
+Colector centralizado de logs.
+
+### 8.1 Resumen
+
+| Aspecto | Valor |
+|---------|-------|
+| Nombre | `SY.log.{isla}` (uno por isla) |
+| Función | Recibir y consolidar logs de todos los nodos |
+| Salida | Archivo, stdout, o sistema externo |
+
+### 8.2 Por especificar
+
+- Formato de mensajes de log
+- Rotación y retención
+- Integración con sistemas externos (Loki, Elasticsearch)
 
 ---
 
@@ -1090,20 +1636,16 @@ json-router/
 ├── src/
 │   ├── bin/
 │   │   ├── json-router.rs       # Router principal
-│   │   ├── sy-config-routes.rs  # Nodo SY.config.routes
-│   │   ├── sy-time.rs           # Nodo SY.time
-│   │   ├── sy-monitor.rs        # Nodo SY.monitor
+│   │   ├── sy-admin.rs          # Gateway HTTP
+│   │   ├── sy-orchestrator.rs   # Orquestador
+│   │   ├── sy-config-routes.rs  # Rutas estáticas
+│   │   ├── sy-opa-rules.rs      # Policies OPA
+│   │   ├── sy-time.rs           # Tiempo
 │   │   └── shm-watch.rs         # Herramienta de diagnóstico
 │   ├── lib.rs                   # Biblioteca compartida
+│   ├── protocol/                # Mensajes (pub)
+│   ├── socket/                  # Framing (pub)
 │   ├── shm/                     # Shared memory
-│   │   ├── mod.rs
-│   │   ├── router_region.rs     # Región de router
-│   │   ├── config_region.rs     # Región de config
-│   │   └── seqlock.rs
-│   ├── protocol/                # Mensajes JSON
-│   │   ├── mod.rs
-│   │   ├── routing.rs
-│   │   └── admin.rs
 │   └── ...
 └── tests/
 ```
@@ -1115,7 +1657,8 @@ json-router/
 | Prioridad | Nodo | Razón |
 |-----------|------|-------|
 | 1 | `SY.config.routes` | Necesario para rutas estáticas y VPNs |
-| 2 | `SY.monitor` | Necesario para operación en producción |
-| 3 | `SY.time` | Útil pero no crítico inicialmente |
-| 4 | `SY.log` | Puede usar logging estándar por ahora |
-| 5 | `SY.admin` | Puede administrarse con herramientas externas |
+| 2 | `SY.opa.rules` | Necesario para routing dinámico |
+| 3 | `SY.orchestrator` | Necesario para gestión de nodos |
+| 4 | `SY.admin` | Gateway HTTP para administración |
+| 5 | `SY.time` | Útil pero no crítico inicialmente |
+| 6 | `SY.log` | Puede usar logging estándar por ahora |
