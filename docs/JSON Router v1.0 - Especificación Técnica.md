@@ -2534,6 +2534,10 @@ Los routers calculan rutas:
 **SY.admin:**
 - Debe correr en la primera isla del bus (o cualquiera con conectividad a todas)
 - Requiere rutas (directas o transitivas) a todas las islas que administra
+- Deriva automáticamente los nombres L2 por isla:
+  - `SY.orchestrator.{isla}`
+  - `SY.config.routes.{isla}`
+  - `SY.opa.rules.{isla}`
 
 ---
 

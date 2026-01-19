@@ -1263,16 +1263,23 @@ Estado de OPA en routers.
 
 islands:
   - id: produccion
+  - id: staging
+```
+
+**Resolución de nombres L2:** SY.admin construye los destinos automáticamente:
+- `SY.orchestrator.{isla}`
+- `SY.config.routes.{isla}`
+- `SY.opa.rules.{isla}`
+
+Opcionalmente se puede sobrescribir por isla si se necesita:
+
+```yaml
+islands:
+  - id: produccion
     orchestrator: "SY.orchestrator.produccion"
     config_routes: "SY.config.routes.produccion"
     opa_rules: "SY.opa.rules.produccion"
-  - id: staging
-    orchestrator: "SY.orchestrator.staging"
-    config_routes: "SY.config.routes.staging"
-    opa_rules: "SY.opa.rules.staging"
 ```
-
-Los nombres son capa 2. SY.admin usa el router para llegar a cada uno.
 
 **Listen:** SY.admin expone HTTP en `0.0.0.0:8080` por defecto. Para cambiarlo, usar `JSR_ADMIN_LISTEN` (o `SY_ADMIN_LISTEN`).
 

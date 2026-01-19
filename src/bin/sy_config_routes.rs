@@ -136,6 +136,7 @@ async fn main() -> io::Result<()> {
 
     info!(target: "sy_config_routes", socket = %socket_path.display(), "sy-config-routes listening");
 
+    let node_name = format!("SY.config.routes.{}", island.island.id);
     let state = Arc::new(Mutex::new(ConfigState {
         config_dir: args.config_dir.clone(),
         island_id: island.island.id.clone(),
@@ -148,12 +149,14 @@ async fn main() -> io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let node_uuid = node_uuid;
+        let node_name = node_name.clone();
         let state_handle = Arc::clone(&state);
         let config_shm = Arc::clone(&config_shm);
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
                 stream,
                 node_uuid,
+                node_name,
                 state_handle,
                 config_shm,
             )
@@ -168,6 +171,7 @@ async fn main() -> io::Result<()> {
 async fn handle_connection(
     stream: UnixStream,
     uuid: Uuid,
+    name: String,
     state: Arc<Mutex<ConfigState>>,
     config_shm: Arc<Mutex<ConfigShmWriter>>,
 ) -> io::Result<()> {
@@ -186,7 +190,7 @@ async fn handle_connection(
         .and_then(|meta| meta.get("msg"))
         .and_then(|msg| msg.as_str());
     if msg_kind == Some("system") && msg_type == Some(MSG_QUERY) {
-        send_announce(&mut writer, &uuid).await?;
+        send_announce(&mut writer, &uuid, &name).await?;
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -298,7 +302,7 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn send_announce<W>(writer: &mut W, uuid: &Uuid) -> io::Result<()>
+async fn send_announce<W>(writer: &mut W, uuid: &Uuid, name: &str) -> io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -307,7 +311,7 @@ where
         "meta": { "type": "system", "msg": MSG_ANNOUNCE },
         "payload": AnnouncePayload {
             uuid: uuid.to_string(),
-            name: "SY.config.routes".to_string(),
+            name: name.to_string(),
         },
     });
     let data = serde_json::to_vec(&msg)?;

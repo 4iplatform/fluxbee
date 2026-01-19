@@ -280,15 +280,7 @@ async fn handle_routes(
     island: IslandConfig,
     segments: Vec<&str>,
 ) -> Response<Body> {
-    let target = match island.config_routes {
-        Some(value) => value,
-        None => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "config_routes not configured for island",
-            )
-        }
-    };
+    let target = config_target(&island, "config.routes");
 
     match *req.method() {
         Method::GET if segments.len() == 3 => {
@@ -329,15 +321,7 @@ async fn handle_vpns(
     island: IslandConfig,
     segments: Vec<&str>,
 ) -> Response<Body> {
-    let target = match island.config_routes {
-        Some(value) => value,
-        None => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "config_routes not configured for island",
-            )
-        }
-    };
+    let target = config_target(&island, "config.routes");
 
     match *req.method() {
         Method::GET if segments.len() == 3 => {
@@ -477,6 +461,24 @@ fn resolve_listen_addr() -> String {
     env::var("JSR_ADMIN_LISTEN")
         .or_else(|_| env::var("SY_ADMIN_LISTEN"))
         .unwrap_or_else(|_| DEFAULT_LISTEN.to_string())
+}
+
+fn config_target(island: &IslandConfig, service: &str) -> String {
+    match service {
+        "orchestrator" => island
+            .orchestrator
+            .clone()
+            .unwrap_or_else(|| format!("SY.orchestrator.{}", island.id)),
+        "config.routes" => island
+            .config_routes
+            .clone()
+            .unwrap_or_else(|| format!("SY.config.routes.{}", island.id)),
+        "opa.rules" => island
+            .opa_rules
+            .clone()
+            .unwrap_or_else(|| format!("SY.opa.rules.{}", island.id)),
+        _ => format!("SY.{}.{}", service, island.id),
+    }
 }
 
 fn load_admin_config(config_dir: &Path) -> io::Result<AdminConfig> {
