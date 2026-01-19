@@ -65,7 +65,7 @@ struct AppState {
 }
 
 struct RouterState {
-    sender: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    senders: Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>,
     node_uuid: Uuid,
 }
@@ -99,7 +99,7 @@ async fn main() -> io::Result<()> {
     });
 
     let router_state = Arc::new(RouterState {
-        sender: Mutex::new(None),
+        senders: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashMap::new()),
         node_uuid,
     });
@@ -145,16 +145,21 @@ async fn router_listener(path: PathBuf, state: Arc<RouterState>) -> io::Result<(
         let (stream, _) = listener.accept().await?;
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            info!(target: "sy_admin", "router connected");
-            if let Err(err) = handle_router_connection(stream, state).await {
-                warn!(target: "sy_admin", "router connection error: {}", err);
+            let conn_id = Uuid::new_v4();
+            info!(target: "sy_admin", conn_id = %conn_id, "router connected");
+            if let Err(err) = handle_router_connection(stream, state, conn_id).await {
+                warn!(target: "sy_admin", conn_id = %conn_id, "router connection error: {}", err);
             }
-            info!(target: "sy_admin", "router disconnected");
+            info!(target: "sy_admin", conn_id = %conn_id, "router disconnected");
         });
     }
 }
 
-async fn handle_router_connection(stream: UnixStream, state: Arc<RouterState>) -> io::Result<()> {
+async fn handle_router_connection(
+    stream: UnixStream,
+    state: Arc<RouterState>,
+    conn_id: Uuid,
+) -> io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     if let Some(frame) = read_frame(&mut reader).await? {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&frame) {
@@ -176,8 +181,8 @@ async fn handle_router_connection(stream: UnixStream, state: Arc<RouterState>) -
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     {
-        let mut sender = state.sender.lock().await;
-        *sender = Some(tx);
+        let mut senders = state.senders.lock().await;
+        senders.insert(conn_id, tx);
     }
 
     let mut write_task = tokio::spawn(async move {
@@ -212,8 +217,8 @@ async fn handle_router_connection(stream: UnixStream, state: Arc<RouterState>) -
     }
 
     {
-        let mut sender = state.sender.lock().await;
-        *sender = None;
+        let mut senders = state.senders.lock().await;
+        senders.remove(&conn_id);
     }
     write_task.abort();
     Ok(())
@@ -394,8 +399,8 @@ async fn send_admin(
     payload: serde_json::Value,
 ) -> Result<serde_json::Value, AdminError> {
     let sender = {
-        let sender = router.sender.lock().await;
-        sender.clone()
+        let senders = router.senders.lock().await;
+        senders.values().next().cloned()
     };
     let sender = sender.ok_or(AdminError::Unavailable)?;
     let trace_id = Uuid::new_v4().to_string();
