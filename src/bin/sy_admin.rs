@@ -145,9 +145,11 @@ async fn router_listener(path: PathBuf, state: Arc<RouterState>) -> io::Result<(
         let (stream, _) = listener.accept().await?;
         let state = Arc::clone(&state);
         tokio::spawn(async move {
+            info!(target: "sy_admin", "router connected");
             if let Err(err) = handle_router_connection(stream, state).await {
                 warn!(target: "sy_admin", "router connection error: {}", err);
             }
+            info!(target: "sy_admin", "router disconnected");
         });
     }
 }
@@ -165,7 +167,9 @@ async fn handle_router_connection(stream: UnixStream, state: Arc<RouterState>) -
                 .and_then(|meta| meta.get("msg"))
                 .and_then(|msg| msg.as_str());
             if msg_kind == Some("system") && msg_type == Some(MSG_QUERY) {
+                info!(target: "sy_admin", "router QUERY received");
                 send_announce(&mut writer, &state.node_uuid).await?;
+                info!(target: "sy_admin", "ANNOUNCE sent");
             }
         }
     }
@@ -185,7 +189,7 @@ async fn handle_router_connection(stream: UnixStream, state: Arc<RouterState>) -
     });
 
     loop {
-        match read_frame(&mut reader).await? {
+        match read_frame(&mut reader).await {
             Some(frame) => {
                 if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&frame) {
                     if let Some(trace_id) = value
@@ -200,6 +204,10 @@ async fn handle_router_connection(stream: UnixStream, state: Arc<RouterState>) -
                 }
             }
             None => break,
+            Err(err) => {
+                warn!(target: "sy_admin", "router read error: {}", err);
+                break;
+            }
         }
     }
 
@@ -438,7 +446,9 @@ enum AdminError {
 impl AdminError {
     fn to_response(&self) -> Response<Body> {
         match self {
-            AdminError::Unavailable => error_response(StatusCode::SERVICE_UNAVAILABLE, "router not connected"),
+            AdminError::Unavailable => {
+                error_response(StatusCode::SERVICE_UNAVAILABLE, "router not connected")
+            }
             AdminError::Timeout => error_response(StatusCode::GATEWAY_TIMEOUT, "request timed out"),
             AdminError::InvalidPayload => error_response(StatusCode::BAD_REQUEST, "invalid payload"),
         }
