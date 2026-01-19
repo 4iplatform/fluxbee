@@ -6,7 +6,7 @@ router:
 
 paths:
   state_dir: ./state
-  node_socket_dir: /tmp/json-router/nodes
+  node_socket_dir: /var/run/json-router/nodes
   shm_prefix: /jsr-
 
 timers:
