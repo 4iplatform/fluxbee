@@ -127,9 +127,11 @@ async fn main() -> io::Result<()> {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     }
 
-    let socket_path = args
-        .node_socket
-        .unwrap_or_else(|| args.socket_dir.join("SY.config.routes.sock"));
+    let socket_path = args.node_socket.unwrap_or_else(|| {
+        args.socket_dir
+            .join("nodes")
+            .join("SY.config.routes.sock")
+    });
     ensure_parent_dir(&socket_path)?;
     let _ = fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
