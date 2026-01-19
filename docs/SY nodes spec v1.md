@@ -1,8 +1,8 @@
 # JSON Router - Nodos SY (System)
 
-**Estado:** Draft v0.5
+**Estado:** Draft v0.7
 **Fecha:** 2025-01-18
-**Documento relacionado:** JSON Router Especificación Técnica v1.4
+**Documento relacionado:** JSON Router Especificación Técnica v1.7
 
 ---
 
@@ -17,12 +17,37 @@ Los nodos SY (System) son componentes de infraestructura que proveen servicios e
 - **Privilegios:** Pueden acceder a shared memory directamente
 - **Ciclo de vida:** Gestionados por systemd junto con los routers
 - **Nomenclatura:** `SY.<servicio>.<instancia>`
+- **Librería compartida:** Usan módulos públicos del router (`protocol`, `socket`)
 
-### 1.2 Catálogo de nodos SY
+### 1.3 Uso de la Librería del Router
+
+Los nodos SY reutilizan código del router para protocolo y comunicación:
+
+```rust
+// En sy_config_routes/main.rs
+use json_router::protocol::{Message, Meta, Routing, Destination};
+use json_router::socket::{read_frame, write_frame};
+```
+
+Los módulos `protocol` y `socket` deben estar expuestos públicamente en la librería:
+
+```rust
+// json_router/lib.rs
+pub mod protocol;  // Message, Meta, Routing, Destination
+pub mod socket;    // read_frame, write_frame, framing utilities
+```
+
+Esto permite que los nodos SY:
+- Serialicen/deserialicen mensajes con las mismas estructuras
+- Usen el mismo framing (length-prefix)
+- Mantengan compatibilidad de protocolo garantizada
+
+### 1.4 Catálogo de nodos SY
 
 | Nodo | Estado | Descripción |
 |------|--------|-------------|
 | `SY.config.routes` | Especificado | Configuración centralizada de rutas estáticas y VPNs |
+| `SY.opa.rules` | Especificado | Gestión centralizada de policies OPA |
 | `SY.time` | Por especificar | Sincronización de tiempo en la red |
 | `SY.monitor` | Por especificar | Métricas y health checks |
 | `SY.log` | Por especificar | Colector centralizado de logs |
@@ -594,7 +619,321 @@ routes:
 
 ---
 
-## 3. SY.time
+## 3. SY.opa.rules
+
+Gestión centralizada de policies OPA para routing dinámico.
+
+### 3.1 Resumen
+
+| Aspecto | Valor |
+|---------|-------|
+| Nombre | `SY.opa.rules` (uno por isla) |
+| Función | Compilar y distribuir policies Rego/WASM |
+| Persistencia | `/var/lib/json-router/policy.wasm` |
+| Propagación | Broadcast `OPA_RELOAD` |
+
+### 3.2 Arquitectura
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      SY.opa.rules                           │
+│                                                              │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
+│  │ API Handler │  │ Compiler    │  │ Distributor │         │
+│  │             │  │             │  │             │         │
+│  │ - update    │  │ - opa build │  │ - write     │         │
+│  │ - get       │  │ - validate  │  │   policy    │         │
+│  │ - status    │  │             │  │ - broadcast │         │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘         │
+│         │                │                │                 │
+│         └────────────────┼────────────────┘                 │
+│                          │                                  │
+│  ┌───────────────────────┴───────────────────────┐         │
+│  │              Verification Handler              │         │
+│  │                                                │         │
+│  │  - Lee SHM de todos los routers               │         │
+│  │  - Verifica opa_policy_version                │         │
+│  │  - Rollback si falla                          │         │
+│  └───────────────────────────────────────────────┘         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 3.3 Directorios
+
+```
+/var/lib/json-router/
+├── policy.wasm          # WASM activo (runtime)
+├── policy.wasm.bak      # Backup para rollback
+└── policy.wasm.new      # Temporal durante actualización
+
+/etc/json-router/
+└── policy.rego          # Fuente Rego (opcional, referencia)
+```
+
+**Nota:** El directorio `/var/lib/json-router/` es compartido por todos los routers de la isla. SY.opa.rules escribe ahí; los routers leen.
+
+### 3.4 Flujo de Arranque
+
+```
+sy-opa-rules
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Leer configuración                                       │
+│    - /etc/json-router/island.yaml → island_id              │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Verificar instancia única                                │
+│    - Lock file o similar                                    │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Conectar al router local                                 │
+│    - Registrarse como SY.opa.rules                         │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. Loop principal                                           │
+│    - Escuchar API (update_policy, get_policy, status)      │
+│    - Monitorear estado de routers en SHM                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 3.5 API
+
+#### 3.5.1 Actualizar Policy
+
+**Request:**
+```json
+{
+  "meta": { "type": "admin", "action": "update_policy" },
+  "payload": {
+    "rego": "package router\n\ndefault target = null\n\ntarget = \"AI.soporte.l1\" {\n    input.meta.context.cliente_tier == \"standard\"\n}\n"
+  }
+}
+```
+
+**Response OK:**
+```json
+{
+  "meta": { "type": "admin", "action": "update_policy" },
+  "payload": {
+    "status": "ok",
+    "version": 42,
+    "routers_updated": 3,
+    "routers_total": 3
+  }
+}
+```
+
+**Response ERROR (compilación):**
+```json
+{
+  "meta": { "type": "admin", "action": "update_policy" },
+  "payload": {
+    "status": "error",
+    "error": "compilation_failed",
+    "detail": "policy.rego:5: rego_parse_error: unexpected token"
+  }
+}
+```
+
+**Response ERROR (rollback):**
+```json
+{
+  "meta": { "type": "admin", "action": "update_policy" },
+  "payload": {
+    "status": "error",
+    "error": "rollback",
+    "detail": "1 router failed to load new policy",
+    "failed_routers": ["uuid-router-b"],
+    "version": 41
+  }
+}
+```
+
+#### 3.5.2 Obtener Policy Actual
+
+**Request:**
+```json
+{
+  "meta": { "type": "admin", "action": "get_policy" },
+  "payload": {}
+}
+```
+
+**Response:**
+```json
+{
+  "meta": { "type": "admin", "action": "get_policy" },
+  "payload": {
+    "version": 42,
+    "rego": "package router\n...",
+    "updated_at": "2025-01-18T10:00:00Z"
+  }
+}
+```
+
+#### 3.5.3 Estado de Routers
+
+**Request:**
+```json
+{
+  "meta": { "type": "admin", "action": "policy_status" },
+  "payload": {}
+}
+```
+
+**Response:**
+```json
+{
+  "meta": { "type": "admin", "action": "policy_status" },
+  "payload": {
+    "current_version": 42,
+    "routers": [
+      {
+        "uuid": "uuid-router-a",
+        "opa_policy_version": 42,
+        "opa_load_status": 0,
+        "status": "ok"
+      },
+      {
+        "uuid": "uuid-router-b",
+        "opa_policy_version": 42,
+        "opa_load_status": 0,
+        "status": "ok"
+      }
+    ]
+  }
+}
+```
+
+### 3.6 Flujo de Actualización con Rollback
+
+```
+Recibe update_policy con nuevo Rego
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Compilar Rego → WASM                                     │
+│    - Ejecutar: opa build -t wasm -e router/target          │
+│    - Si falla → responder error, FIN                       │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Preparar archivos                                        │
+│    - Guardar WASM nuevo como policy.wasm.new               │
+│    - version_nueva = version_actual + 1                     │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Swap atómico                                             │
+│    - Renombrar policy.wasm → policy.wasm.bak               │
+│    - Renombrar policy.wasm.new → policy.wasm               │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. Broadcast OPA_RELOAD                                     │
+│    - dst: "broadcast", TTL: 16                             │
+│    - payload: { version: 42 }                              │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 5. Esperar verificación (5s configurable)                   │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 6. Verificar routers (leer SHM)                            │
+│    - Escanear /dev/shm/jsr-*                               │
+│    - Leer opa_policy_version de cada header                │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ├─► Todos OK (version == version_nueva)
+    │       │
+    │       ▼
+    │   ┌─────────────────────────────────────────────────────┐
+    │   │ 7a. Éxito                                           │
+    │   │    - Borrar policy.wasm.bak                        │
+    │   │    - Guardar Rego fuente (opcional)                │
+    │   │    - Responder OK                                  │
+    │   └─────────────────────────────────────────────────────┘
+    │
+    └─► Alguno FALLÓ (version != version_nueva o status == ERROR)
+            │
+            ▼
+        ┌─────────────────────────────────────────────────────┐
+        │ 7b. Rollback                                        │
+        │    - Renombrar policy.wasm.bak → policy.wasm       │
+        │    - Broadcast OPA_RELOAD con version_anterior     │
+        │    - Esperar verificación                          │
+        │    - Responder ERROR con lista de routers fallidos │
+        └─────────────────────────────────────────────────────┘
+```
+
+### 3.7 Mensaje OPA_RELOAD
+
+```json
+{
+  "routing": {
+    "src": "<uuid-sy-opa-rules>",
+    "dst": "broadcast",
+    "ttl": 16,
+    "trace_id": "<uuid>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "OPA_RELOAD"
+  },
+  "payload": {
+    "version": 42,
+    "hash": "sha256:abc123..."
+  }
+}
+```
+
+El router usa `version` para actualizar `opa_policy_version` en su SHM después de cargar exitosamente.
+
+### 3.8 Códigos de Error
+
+| Error | Descripción |
+|-------|-------------|
+| `COMPILATION_FAILED` | Rego no compila |
+| `INVALID_REGO` | Sintaxis inválida |
+| `ROLLBACK` | Algunos routers no cargaron, se revirtió |
+| `TIMEOUT` | Routers no respondieron a tiempo |
+| `NO_ROUTERS` | No hay routers activos en la isla |
+
+### 3.9 Systemd
+
+```ini
+# /etc/systemd/system/sy-opa-rules.service
+
+[Unit]
+Description=JSON Router OPA Rules Service
+After=network.target json-router.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sy-opa-rules
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+## 4. SY.time
 
 Sincronización de tiempo en la red.
 
@@ -644,7 +983,7 @@ Sincronización de tiempo en la red.
 
 ---
 
-## 4. SY.monitor
+## 5. SY.monitor
 
 Métricas y health checks.
 
@@ -703,7 +1042,7 @@ GET /health
 
 ---
 
-## 5. SY.log
+## 6. SY.log
 
 Colector centralizado de logs.
 
@@ -723,7 +1062,7 @@ Colector centralizado de logs.
 
 ---
 
-## 6. SY.admin
+## 7. SY.admin
 
 Consola de administración.
 

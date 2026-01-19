@@ -1,6 +1,6 @@
 # JSON Router - Especificación Técnica
 
-**Estado:** Draft v1.5
+**Estado:** Draft v1.7
 **Fecha:** 2025-01-18
 
 ---
@@ -493,13 +493,14 @@ Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisi
 | `ttl` | int | Sí | Time-to-live, decrementa en cada hop. Si llega a 0, drop. |
 | `trace_id` | UUID | Sí | ID de correlación para trazabilidad |
 
-#### 7.2 Sección `meta` (Metadata para OPA)
+#### 7.2 Sección `meta` (Metadata para OPA y Sistema)
 
-Usado por OPA para decisiones de capa 2. El router pasa esta sección completa a OPA sin interpretarla.
+Usado por OPA para decisiones de capa 2, y por el router para broadcast filtrado.
 
 ```json
 {
   "meta": {
+    "type": "user",
     "target": "AI.soporte.l1.español",
     "priority": "high",
     "context": {
@@ -513,9 +514,40 @@ Usado por OPA para decisiones de capa 2. El router pasa esta sección completa a
 
 | Campo | Tipo | Obligatorio | Descripción |
 |-------|------|-------------|-------------|
-| `target` | string (nombre capa 2) | Sí si dst es null | Perfil/capacidad requerida |
+| `type` | string | Sí | Tipo de mensaje: `"user"`, `"system"`, `"admin"` |
+| `msg` | string | Sí si type=system | Tipo de mensaje de sistema (ej: `"CONFIG_ANNOUNCE"`, `"TIME_SYNC"`) |
+| `target` | string (nombre capa 2) | Condicional | Para OPA: perfil/capacidad requerida (si dst=null). Para broadcast: filtro de destinatarios (si dst="broadcast") |
 | `priority` | string | No | Hint de prioridad para OPA |
 | `context` | object | No | Datos adicionales para reglas OPA |
+| `action` | string | No | Para mensajes admin: acción a ejecutar (ej: `"add_route"`, `"list_routes"`) |
+
+**Uso de `target` según contexto:**
+
+| `dst` | `meta.target` | Comportamiento |
+|-------|---------------|----------------|
+| `null` | nombre capa 2 | OPA resuelve destino usando target |
+| `"broadcast"` | patrón capa 2 | Router filtra: solo entrega a nodos que matchean el patrón |
+| `"broadcast"` | ausente | Router entrega a todos los nodos |
+| UUID | - | Ignorado (unicast directo) |
+
+**Ejemplo mensaje de sistema (broadcast filtrado):**
+
+```json
+{
+  "routing": {
+    "src": "uuid-sy-config",
+    "dst": "broadcast",
+    "ttl": 16,
+    "trace_id": "uuid"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "CONFIG_ANNOUNCE",
+    "target": "SY.config.*"
+  },
+  "payload": { ... }
+}
+```
 
 La estructura de `context` es libre y depende de las policies definidas.
 
@@ -534,6 +566,75 @@ El contenido del mensaje. Ni el router ni OPA lo leen. Solo el nodo destino lo p
 ```
 
 La estructura interna es libre y la definen los nodos.
+
+#### 7.4 Estructuras Rust del Protocolo
+
+Las siguientes estructuras definen el formato de mensajes. Deben exponerse públicamente en la librería para uso de nodos SY y otros componentes.
+
+```rust
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Mensaje completo del protocolo
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    pub routing: Routing,
+    pub meta: Meta,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+/// Header de routing (capa 1)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Routing {
+    pub src: String,                    // UUID del nodo origen
+    #[serde(deserialize_with = "deserialize_dst")]
+    pub dst: Destination,               // UUID, "broadcast", o null
+    pub ttl: u8,
+    pub trace_id: String,
+}
+
+/// Destino del mensaje
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Destination {
+    Unicast(String),                    // UUID específico
+    Broadcast,                          // Literal "broadcast"
+    Resolve,                            // null - resolver via OPA
+}
+
+/// Metadata (capa 2 y sistema)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Meta {
+    #[serde(rename = "type")]
+    pub msg_type: String,               // "user", "system", "admin"
+    
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub msg: Option<String>,            // Para system: "CONFIG_ANNOUNCE", "TIME_SYNC", etc.
+    
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,         // Para OPA o broadcast filter
+    
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,         // Para admin: "add_route", "list_routes", etc.
+    
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,       // Hint para OPA
+    
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,         // Datos adicionales para OPA
+}
+```
+
+**Exposición en librería:**
+
+```rust
+// lib.rs
+pub mod protocol;  // Expone Message, Routing, Meta, Destination
+pub mod socket;    // Expone funciones de framing (read_frame, write_frame)
+```
+
+Los módulos `protocol` y `socket` deben ser públicos para que `sy_config_routes` y otros nodos SY puedan reutilizar el código de serialización y framing.
 
 ### 8. Framing de Mensajes
 
@@ -1363,8 +1464,13 @@ pub struct ShmHeader {
     pub island_id: [u8; 64],        // "produccion", "staging", etc.
     pub island_id_len: u16,
     
-    // === RESERVADO (30 bytes para llegar a 192) ===
-    pub _reserved: [u8; 30],
+    // === OPA POLICY (12 bytes) ===
+    pub opa_policy_version: u64,    // Versión del policy cargado (0 = no cargado)
+    pub opa_load_status: u8,        // 0=OK, 1=ERROR, 2=LOADING
+    pub _pad1: [u8; 3],             // Padding
+    
+    // === RESERVADO (18 bytes para llegar a 192) ===
+    pub _reserved: [u8; 18],
 }
 // Total: 192 bytes (alineado a 64)
 ```
@@ -2372,7 +2478,156 @@ Recibidas de otros routers via mensajes LSA. El router instala estas rutas con `
 
 ### 21. Policies OPA
 
-*Por definir: estructura de policies, input/output contract, ejemplos.*
+Las policies OPA permiten decisiones de routing dinámicas basadas en metadata del mensaje.
+
+#### 21.1 Arquitectura
+
+```
+                                    ┌─────────────────────┐
+                                    │   SY.opa.rules      │
+                                    │                     │
+Nodo AI ──► API (Rego) ──────────► │ 1. Compila Rego     │
+                                    │ 2. Guarda WASM      │
+                                    │ 3. Broadcast RELOAD │
+                                    └──────────┬──────────┘
+                                               │
+                                               ▼
+                              /var/lib/json-router/policy.wasm
+                                               │
+                    ┌──────────────────────────┼──────────────────────────┐
+                    │                          │                          │
+                    ▼                          ▼                          ▼
+              ┌──────────┐              ┌──────────┐              ┌──────────┐
+              │ Router A │              │ Router B │              │ Router C │
+              │ WASM     │              │ WASM     │              │ WASM     │
+              │ en RAM   │              │ en RAM   │              │ en RAM   │
+              └──────────┘              └──────────┘              └──────────┘
+```
+
+#### 21.2 Lenguaje Rego
+
+Las policies se escriben en **Rego**, el lenguaje estándar de OPA:
+
+```rego
+package router
+
+default target = null
+
+# Clientes VIP van a soporte L2
+target = "AI.soporte.l2" {
+    input.meta.context.cliente_tier == "vip"
+}
+
+# Clientes standard van a soporte L1
+target = "AI.soporte.l1" {
+    input.meta.context.cliente_tier == "standard"
+}
+
+# Horario nocturno va a equipo nocturno
+target = "AI.soporte.l1.nocturno" {
+    input.meta.context.horario == "nocturno"
+}
+```
+
+**Input disponible para policies:**
+```json
+{
+  "meta": { ... },           // Sección meta completa del mensaje
+  "routing": {
+    "src": "uuid-origen"     // Solo src, no dst (eso es lo que resolvemos)
+  }
+}
+```
+
+**Output esperado:**
+```json
+{
+  "target": "AI.soporte.l1"  // Nombre capa 2 del destino
+}
+```
+
+#### 21.3 Compilación y Distribución
+
+El archivo `.wasm` se genera compilando Rego:
+
+```bash
+# Compilar policy.rego a policy.wasm
+opa build -t wasm -e router/target policy.rego -o bundle.tar.gz
+tar -xzf bundle.tar.gz /policy.wasm
+```
+
+**Directorio estándar:**
+```
+/var/lib/json-router/policy.wasm    # Runtime (WASM compilado)
+/etc/json-router/policy.rego        # Fuente (opcional, para referencia)
+```
+
+#### 21.4 Carga en el Router
+
+Al iniciar, el router:
+1. Lee `/var/lib/json-router/policy.wasm`
+2. Carga WASM en memoria (Wasmtime)
+3. Actualiza `opa_policy_version` en SHM
+4. `opa_load_status = 0` (OK)
+
+Si falla:
+- `opa_load_status = 1` (ERROR)
+- Router continúa sin OPA (solo routing directo por UUID)
+
+#### 21.5 Reload Atómico (OPA_RELOAD)
+
+Cuando el router recibe mensaje `OPA_RELOAD`:
+
+```
+1. opa_load_status = 2 (LOADING)
+2. Entrar en modo drain:
+   - Dejar de aceptar mensajes nuevos
+   - Esperar que terminen los en vuelo (max 1s timeout)
+3. Recargar policy.wasm desde disco
+4. Si éxito:
+   - opa_policy_version = version del mensaje
+   - opa_load_status = 0 (OK)
+5. Si falla:
+   - opa_load_status = 1 (ERROR)
+   - Mantener policy anterior si es posible
+6. Salir de modo drain, continuar operación
+```
+
+**Mensaje OPA_RELOAD:**
+```json
+{
+  "routing": {
+    "src": "uuid-sy-opa-rules",
+    "dst": "broadcast",
+    "ttl": 16,
+    "trace_id": "uuid"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "OPA_RELOAD"
+  },
+  "payload": {
+    "version": 42,
+    "hash": "sha256-del-wasm"
+  }
+}
+```
+
+#### 21.6 Estado OPA en SHM
+
+```rust
+// En ShmHeader
+pub opa_policy_version: u64,    // Versión cargada (0 = no cargado)
+pub opa_load_status: u8,        // 0=OK, 1=ERROR, 2=LOADING
+```
+
+| opa_load_status | Significado |
+|-----------------|-------------|
+| 0 | OK - Policy cargado y funcionando |
+| 1 | ERROR - Falló la carga, sin OPA |
+| 2 | LOADING - Recargando, en modo drain |
+
+Esto permite a `SY.opa.rules` verificar que todos los routers cargaron la policy correctamente.
 
 ### 22. Balanceo entre Nodos del Mismo Rol
 
@@ -2552,6 +2807,7 @@ Esto aplica tanto para nodos locales como para reenvío a otros routers.
 |---------|--------|-----|-----------|
 | `TIME_SYNC` | - | 1 | Tiempo a nodos de este router |
 | `CONFIG_ANNOUNCE` | `SY.config.*` | 16 | Anunciar rutas entre islas |
+| `OPA_RELOAD` | - | 16 | Recargar policies OPA en todos los routers |
 | `BCAST_SHUTDOWN` | - | 16 | Shutdown de toda la red |
 | `BCAST_RELOAD` | - | 2 | Recargar config en isla |
 

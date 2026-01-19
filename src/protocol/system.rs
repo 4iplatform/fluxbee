@@ -7,6 +7,8 @@ pub struct Meta {
     #[serde(rename = "type")]
     pub kind: String,
     pub msg: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,6 +150,7 @@ pub fn build_query() -> Message<QueryPayload> {
         meta: Meta {
             kind: SYSTEM_KIND.to_string(),
             msg: MSG_QUERY.to_string(),
+            target: None,
         },
         payload: QueryPayload::default(),
     }
@@ -173,6 +176,7 @@ pub fn build_hello(
         meta: Meta {
             kind: SYSTEM_KIND.to_string(),
             msg: MSG_HELLO.to_string(),
+            target: None,
         },
         payload: HelloPayload {
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -196,6 +200,7 @@ pub fn build_lsa(router_uuid: Uuid, nodes: Vec<NodeDescriptor>) -> Message<LsaPa
         meta: Meta {
             kind: SYSTEM_KIND.to_string(),
             msg: MSG_LSA.to_string(),
+            target: None,
         },
         payload: LsaPayload {
             router_id: router_uuid.to_string(),
@@ -210,6 +215,7 @@ pub fn build_sync_request(router_uuid: Uuid) -> Message<SyncRequestPayload> {
         meta: Meta {
             kind: SYSTEM_KIND.to_string(),
             msg: MSG_SYNC_REQUEST.to_string(),
+            target: None,
         },
         payload: SyncRequestPayload {
             router_id: router_uuid.to_string(),
@@ -223,6 +229,7 @@ pub fn build_sync_reply(router_uuid: Uuid, nodes: Vec<NodeDescriptor>) -> Messag
         meta: Meta {
             kind: SYSTEM_KIND.to_string(),
             msg: MSG_SYNC_REPLY.to_string(),
+            target: None,
         },
         payload: SyncReplyPayload {
             router_id: router_uuid.to_string(),
@@ -242,6 +249,7 @@ pub fn build_config_sync(
         meta: Meta {
             kind: SYSTEM_KIND.to_string(),
             msg: MSG_CONFIG_SYNC.to_string(),
+            target: None,
         },
         payload: ConfigSyncPayload {
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -263,6 +271,7 @@ pub fn build_uplink_accept(
         meta: Meta {
             kind: SYSTEM_KIND.to_string(),
             msg: MSG_UPLINK_ACCEPT.to_string(),
+            target: None,
         },
         payload: UplinkAcceptPayload {
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -286,6 +295,7 @@ pub fn build_uplink_reject(
         meta: Meta {
             kind: SYSTEM_KIND.to_string(),
             msg: MSG_UPLINK_REJECT.to_string(),
+            target: None,
         },
         payload: UplinkRejectPayload {
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -314,6 +324,7 @@ pub fn build_error(msg: &str, reason: &str, detail: &str, src: &str) -> Message<
         meta: Meta {
             kind: SYSTEM_KIND.to_string(),
             msg: msg.to_string(),
+            target: None,
         },
         payload: ErrorPayload {
             reason: reason.to_string(),
