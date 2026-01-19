@@ -312,12 +312,22 @@ pub struct ErrorPayload {
     pub detail: String,
 }
 
-pub fn build_error(msg: &str, reason: &str, detail: &str, src: &str) -> Message<ErrorPayload> {
+pub fn build_error(
+    msg: &str,
+    reason: &str,
+    detail: &str,
+    src: &str,
+    trace_id: Option<&str>,
+) -> Message<ErrorPayload> {
+    let trace_id = trace_id
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let routing = serde_json::json!({
         "src": null,
         "dst": src,
         "ttl": 1,
-        "trace_id": Uuid::new_v4().to_string(),
+        "trace_id": trace_id,
     });
     Message {
         routing,

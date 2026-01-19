@@ -493,6 +493,11 @@ async fn handle_forward(
         .and_then(|routing| routing.get("dst"))
         .and_then(|dst| dst.as_str())
         .and_then(|dst| Uuid::parse_str(dst).ok());
+    let trace_id = value
+        .get("routing")
+        .and_then(|routing| routing.get("trace_id"))
+        .and_then(|trace_id| trace_id.as_str())
+        .map(|value| value.to_string());
 
     let target = value
         .get("meta")
@@ -507,7 +512,15 @@ async fn handle_forward(
                 src = src_uuid.as_ref().map(|id| id.to_string()).unwrap_or_else(|| "unknown".to_string()),
                 "TTL exceeded"
             );
-            send_error(nodes, src_uuid, MSG_TTL_EXCEEDED, "ttl", "ttl exhausted").await;
+            send_error(
+                nodes,
+                src_uuid,
+                trace_id.clone(),
+                MSG_TTL_EXCEEDED,
+                "ttl",
+                "ttl exhausted",
+            )
+            .await;
             return;
         }
     }
@@ -644,7 +657,15 @@ async fn handle_forward(
             dst = %dst,
             "no route found"
         );
-        send_error(nodes, src_uuid, MSG_UNREACHABLE, "no_route", "destination not found").await;
+        send_error(
+            nodes,
+            src_uuid,
+            trace_id.clone(),
+            MSG_UNREACHABLE,
+            "no_route",
+            "destination not found",
+        )
+        .await;
         return;
     }
 
@@ -661,7 +682,15 @@ async fn handle_forward(
             src = src_uuid.as_ref().map(|id| id.to_string()).unwrap_or_else(|| "unknown".to_string()),
             "no route found"
         );
-        send_error(nodes, src_uuid, MSG_UNREACHABLE, "no_route", "destination not found").await;
+        send_error(
+            nodes,
+            src_uuid,
+            trace_id.clone(),
+            MSG_UNREACHABLE,
+            "no_route",
+            "destination not found",
+        )
+        .await;
         return;
     }
 
@@ -698,7 +727,15 @@ async fn handle_forward(
                     dst = %dst_uuid,
                     "destination not connected"
                 );
-                send_error(nodes, src_uuid, MSG_UNREACHABLE, "no_route", "destination not connected").await;
+                send_error(
+                    nodes,
+                    src_uuid,
+                    trace_id.clone(),
+                    MSG_UNREACHABLE,
+                    "no_route",
+                    "destination not connected",
+                )
+                .await;
             }
         }
         Resolution::Uplink(link_id) => {
@@ -1194,6 +1231,7 @@ fn now_epoch_ms() -> u64 {
 async fn send_error(
     nodes: &Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
     src_uuid: Option<Uuid>,
+    trace_id: Option<String>,
     msg: &str,
     reason: &str,
     detail: &str,
@@ -1201,7 +1239,13 @@ async fn send_error(
     let Some(src_uuid) = src_uuid else {
         return;
     };
-    let payload = build_error(msg, reason, detail, &src_uuid.to_string());
+    let payload = build_error(
+        msg,
+        reason,
+        detail,
+        &src_uuid.to_string(),
+        trace_id.as_deref(),
+    );
     let data = match serde_json::to_vec(&payload) {
         Ok(data) => data,
         Err(_) => return,
