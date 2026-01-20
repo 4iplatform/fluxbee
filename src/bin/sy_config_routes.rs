@@ -178,21 +178,21 @@ async fn handle_connection(
     config_shm: Arc<Mutex<ConfigShmWriter>>,
 ) -> io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
-    let Some(frame) = read_frame(&mut reader).await? else {
-        return Ok(());
-    };
+    send_hello(&mut writer, &uuid, &name).await?;
 
-    let msg: serde_json::Value = serde_json::from_slice(&frame)?;
-    let msg_kind = msg
-        .get("meta")
-        .and_then(|meta| meta.get("type"))
-        .and_then(|kind| kind.as_str());
-    let msg_type = msg
-        .get("meta")
-        .and_then(|meta| meta.get("msg"))
-        .and_then(|msg| msg.as_str());
-    if msg_kind == Some("system") && msg_type == Some(MSG_QUERY) {
-        send_announce(&mut writer, &uuid, &name).await?;
+    if let Some(frame) = read_frame(&mut reader).await? {
+        let msg: serde_json::Value = serde_json::from_slice(&frame)?;
+        let msg_kind = msg
+            .get("meta")
+            .and_then(|meta| meta.get("type"))
+            .and_then(|kind| kind.as_str());
+        let msg_type = msg
+            .get("meta")
+            .and_then(|meta| meta.get("msg"))
+            .and_then(|msg| msg.as_str());
+        if msg_kind == Some("system") && msg_type == Some(MSG_QUERY) {
+            send_announce(&mut writer, &uuid, &name).await?;
+        }
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -314,6 +314,23 @@ where
         "payload": AnnouncePayload {
             uuid: uuid.to_string(),
             name: name.to_string(),
+        },
+    });
+    let data = serde_json::to_vec(&msg)?;
+    write_frame(writer, &data).await
+}
+
+async fn send_hello<W>(writer: &mut W, uuid: &Uuid, name: &str) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let msg = serde_json::json!({
+        "routing": null,
+        "meta": { "type": "system", "msg": "HELLO" },
+        "payload": {
+            "name": name,
+            "version": "1.0",
+            "uuid": uuid.to_string(),
         },
     });
     let data = serde_json::to_vec(&msg)?;

@@ -1,6 +1,6 @@
 # JSON Router - Especificación Técnica
 
-**Estado:** Draft v1.9
+**Estado:** Draft v1.11
 **Fecha:** 2025-01-19
 
 ---
@@ -845,9 +845,9 @@ Nomenclatura basada en estándares de red existentes.
 
 | Mensaje | Origen | Destino | Propósito |
 |---------|--------|---------|-----------|
-| `ANNOUNCE` | Nodo | Router | Nodo anuncia existencia (UUID + nombre capa 2) |
+| `HELLO` | Nodo | Router | Nodo anuncia existencia (UUID + nombre capa 2) |
+| `ANNOUNCE` | Router | Nodo | Router confirma registro del nodo |
 | `WITHDRAW` | Nodo | Router | Nodo anuncia shutdown limpio |
-| `QUERY` | Router | Nodo | Router pregunta identidad a socket nuevo |
 
 #### 11.2 Health y Diagnóstico (ICMP-like)
 
@@ -984,6 +984,490 @@ Cada componente define su propio mensaje de estado con información relevante a 
 El campo `meta.type: "system"` distingue mensajes de control de mensajes normales.
 
 **Nota:** Todos los timestamps en mensajes del sistema DEBEN ser UTC (ISO-8601 con sufijo Z).
+
+---
+
+## Parte II-B: Librería de Nodos (node-lib)
+
+Esta sección especifica la librería estándar que **todos los nodos** deben usar para comunicarse con el router. La librería encapsula toda la complejidad de conexión, protocolo, y manejo de identidad.
+
+### 11. Objetivos de la Librería
+
+#### 11.1 Problema que Resuelve
+
+Sin librería estándar, cada nodo implementa:
+- Generación de UUID
+- Conexión al socket del router
+- Framing de mensajes
+- Handshake HELLO
+- Reconexión automática
+- Manejo de errores
+
+Esto lleva a código duplicado, bugs inconsistentes, y dificultad de mantenimiento.
+
+#### 11.2 Principio: Un Solo Lugar
+
+**La librería es el único lugar donde se implementa la comunicación con el router.**
+
+| Responsabilidad | Dónde se implementa |
+|-----------------|---------------------|
+| Generar UUID | Librería |
+| Persistir UUID | Librería |
+| Conexión socket | Librería |
+| Framing (read/write) | Librería |
+| Handshake HELLO | Librería |
+| Reconexión automática | Librería |
+| Enviar mensajes | Librería |
+| Recibir mensajes | Librería |
+
+**El nodo solo debe:**
+- Configurar nombre L2 e island_id
+- Llamar `connect()`
+- Usar `send()` y `recv()`
+- Implementar su lógica de negocio
+
+### 12. Arquitectura de la Librería
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         NODO (cualquier tipo)                   │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                    Lógica de Negocio                       │ │
+│  │         (AI, WF, IO, SY.config.routes, etc.)               │ │
+│  └──────────────────────────┬─────────────────────────────────┘ │
+│                             │                                    │
+│                             │ send() / recv()                   │
+│                             ▼                                    │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                     NODE-LIB                                │ │
+│  │                                                              │ │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │ │
+│  │  │   Identity   │  │  Connection  │  │   Protocol   │      │ │
+│  │  │              │  │              │  │              │      │ │
+│  │  │ - gen UUID   │  │ - socket    │  │ - framing    │      │ │
+│  │  │ - persist    │  │ - reconnect │  │ - HELLO      │      │ │
+│  │  │ - load       │  │ - timeouts  │  │ - serialize  │      │ │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘      │ │
+│  │                                                              │ │
+│  └──────────────────────────┬─────────────────────────────────┘ │
+│                             │                                    │
+└─────────────────────────────┼────────────────────────────────────┘
+                              │
+                              ▼
+                    Unix Socket al Router
+```
+
+### 13. Gestión de Identidad (UUID)
+
+#### 13.1 Generación de UUID
+
+**El nodo genera su propio UUID. El router NO asigna UUIDs.**
+
+```rust
+// En la librería
+impl NodeIdentity {
+    pub fn new_or_load(persistence_path: &Path) -> Self {
+        if let Ok(uuid) = Self::load_from_file(persistence_path) {
+            // UUID existente, reutilizar
+            Self { uuid }
+        } else {
+            // Primera ejecución, generar nuevo
+            let uuid = Uuid::new_v4();
+            Self::save_to_file(persistence_path, &uuid);
+            Self { uuid }
+        }
+    }
+}
+```
+
+#### 13.2 Persistencia de UUID
+
+El UUID se persiste en un archivo para sobrevivir reinicios:
+
+```
+/var/lib/json-router/nodes/<nombre>.uuid
+```
+
+Ejemplo:
+```
+/var/lib/json-router/nodes/SY.config.routes.produccion.uuid
+```
+
+**Contenido:** UUID en formato texto (36 caracteres).
+
+#### 13.3 Flujo de Identidad
+
+```
+Primera ejecución:
+  1. Librería busca archivo UUID → no existe
+  2. Librería genera UUID v4
+  3. Librería guarda en archivo
+  4. Librería usa UUID para HELLO
+
+Ejecuciones siguientes:
+  1. Librería busca archivo UUID → existe
+  2. Librería lee UUID del archivo
+  3. Librería usa UUID para HELLO
+```
+
+### 14. Handshake: HELLO es el Estándar
+
+#### 14.1 Protocolo Oficial
+
+**HELLO es el único handshake para nodos.** No hay otro mecanismo.
+
+| Mensaje | Dirección | Propósito |
+|---------|-----------|-----------|
+| `HELLO` | Nodo → Router | Registrar nodo |
+| `ANNOUNCE` | Router → Nodo | Confirmar registro |
+
+**Nota:** Cualquier código legacy usando QUERY/ANNOUNCE debe eliminarse (no deprecarse, eliminarse).
+
+#### 14.2 Flujo del Handshake
+
+```
+NodeClient.connect():
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 1. Cargar o generar UUID                │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 2. Conectar al socket del router        │
+│    (timeout: 5s)                        │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 3. Enviar HELLO                         │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 4. Esperar ANNOUNCE (timeout: 5s)       │
+│    - status: "registered" → OK          │
+│    - status: "error" → log y continuar  │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 5. Retornar cliente conectado           │
+└─────────────────────────────────────────┘
+```
+
+#### 14.3 Mensaje HELLO (enviado por librería)
+
+```json
+{
+  "routing": {
+    "src": "<uuid-nodo>",
+    "dst": null,
+    "ttl": 1,
+    "trace_id": "<uuid>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "HELLO"
+  },
+  "payload": {
+    "uuid": "<uuid-nodo>",
+    "name": "SY.config.routes.produccion",
+    "version": "1.0"
+  }
+}
+```
+
+**Campos obligatorios:**
+- `uuid`: Generado/cargado por la librería (obligatorio)
+- `name`: Nombre L2 del nodo (obligatorio)
+- `version`: Versión del protocolo (obligatorio)
+
+#### 14.4 Mensaje ANNOUNCE (respuesta del router)
+
+**Éxito:**
+```json
+{
+  "meta": {
+    "type": "system",
+    "msg": "ANNOUNCE"
+  },
+  "payload": {
+    "uuid": "<uuid-nodo>",
+    "name": "SY.config.routes.produccion",
+    "status": "registered"
+  }
+}
+```
+
+**Error:**
+```json
+{
+  "meta": {
+    "type": "system",
+    "msg": "ANNOUNCE"
+  },
+  "payload": {
+    "status": "error",
+    "error": "UUID_CONFLICT",
+    "detail": "UUID already registered by another node"
+  }
+}
+```
+
+**Códigos de error en ANNOUNCE:**
+
+| Código | Descripción | Acción de la librería |
+|--------|-------------|----------------------|
+| `UUID_CONFLICT` | UUID ya registrado | Log error, continuar |
+| `INVALID_NAME` | Nombre L2 malformado | Log error, continuar |
+| `VERSION_UNSUPPORTED` | Versión no soportada | Log error, continuar |
+
+**Nota:** En caso de error, la librería loguea y continúa operando. No regenera UUID ni aborta.
+
+#### 14.5 Compatibilidad de Versión
+
+```
+Política de versiones:
+- version "1.0" es la versión actual
+- Router acepta versiones menores o iguales
+- Si version > soportada → ANNOUNCE con error VERSION_UNSUPPORTED
+```
+
+### 15. API de la Librería
+
+#### 15.1 Configuración
+
+```rust
+pub struct NodeConfig {
+    /// Nombre L2 del nodo (ej: "SY.config.routes.produccion")
+    pub name: String,
+    
+    /// Island ID (ej: "produccion")
+    pub island_id: String,
+    
+    /// Path al socket del router
+    pub router_socket: PathBuf,
+    
+    /// Directorio para persistir UUID
+    pub uuid_persistence_dir: PathBuf,
+}
+```
+
+#### 15.2 Rust (nodos SY)
+
+```rust
+use json_router::node_client::{NodeClient, NodeConfig};
+use json_router::protocol::{Message, Meta, Routing};
+
+// Configuración
+let config = NodeConfig {
+    name: format!("SY.config.routes.{}", island_id),
+    island_id: island_id.clone(),
+    router_socket: "/var/run/json-router/router.sock".into(),
+    uuid_persistence_dir: "/var/lib/json-router/nodes/".into(),
+};
+
+// Conectar (UUID y HELLO automáticos)
+let client = NodeClient::connect(config).await?;
+
+// Enviar mensaje
+client.send(message).await?;
+
+// Recibir mensaje (bloquea hasta recibir)
+let msg = client.recv().await?;
+
+// Recibir con timeout
+let msg = client.recv_timeout(Duration::from_secs(30)).await?;
+
+// UUID disponible
+println!("Mi UUID: {}", client.uuid());
+```
+
+#### 15.3 Node.js (nodos AI, WF, IO)
+
+```javascript
+const { NodeClient } = require('json-router-node');
+
+const config = {
+    name: 'AI.soporte.l1.español',
+    islandId: 'produccion',
+    routerSocket: '/var/run/json-router/router.sock',
+    uuidPersistenceDir: '/var/lib/json-router/nodes/'
+};
+
+const client = await NodeClient.connect(config);
+
+await client.send(message);
+const msg = await client.recv();
+const msgWithTimeout = await client.recv({ timeout: 30000 });
+
+console.log('Mi UUID:', client.uuid);
+```
+
+### 16. Parámetros y Límites
+
+#### 16.1 Timeouts
+
+| Parámetro | Valor | Descripción |
+|-----------|-------|-------------|
+| Connect timeout | 5s | Tiempo máximo para conectar al socket |
+| HELLO timeout | 5s | Tiempo máximo esperando ANNOUNCE |
+| Read timeout | 0 (infinito) | `recv()` bloquea indefinidamente |
+| Read timeout configurable | N/A | Usar `recv_timeout(duration)` |
+
+#### 16.2 Reconexión
+
+| Parámetro | Valor | Descripción |
+|-----------|-------|-------------|
+| Backoff inicial | 100ms | Delay inicial entre reintentos |
+| Backoff máximo | 30s | Delay máximo entre reintentos |
+| Backoff factor | 2x | Multiplicador exponencial |
+| Reintentos en send | 3 | Intentos antes de propagar error |
+
+#### 16.3 Límites de Mensajes
+
+| Parámetro | Valor | Descripción |
+|-----------|-------|-------------|
+| Max frame size | 64KB | Tamaño máximo de mensaje |
+| Frame header | 4 bytes | uint32 big-endian (length) |
+
+### 17. Modelo de Errores
+
+#### 17.1 Tipos de Error
+
+```rust
+pub enum NodeError {
+    /// No se pudo conectar al router
+    ConnectionFailed { reason: String },
+    
+    /// Timeout en operación
+    Timeout { operation: String },
+    
+    /// Conexión perdida (EOF o error de socket)
+    Disconnected,
+    
+    /// Mensaje excede 64KB
+    FrameTooLarge { size: usize },
+    
+    /// JSON inválido o estructura incorrecta
+    InvalidMessage { detail: String },
+    
+    /// Error retornado por el router
+    RouterError { code: String, detail: String },
+    
+    /// Error de I/O
+    Io(std::io::Error),
+}
+```
+
+#### 17.2 Errores del Router (en mensajes)
+
+Cuando el router no puede entregar un mensaje, responde con error:
+
+```json
+{
+  "meta": {
+    "type": "system",
+    "msg": "ERROR"
+  },
+  "payload": {
+    "error": "UNREACHABLE",
+    "detail": "No route to destination",
+    "original_trace_id": "<trace-id-del-mensaje-original>"
+  }
+}
+```
+
+**Códigos de error del router:**
+
+| Código | Descripción |
+|--------|-------------|
+| `UNREACHABLE` | No hay ruta al destino |
+| `TTL_EXCEEDED` | TTL llegó a 0 |
+| `NO_ROUTE` | Destino no encontrado en tabla |
+| `QUEUE_FULL` | Cola del destino llena |
+
+La librería expone estos como `NodeError::RouterError { code, detail }`.
+
+### 18. Reconexión Automática
+
+La librería maneja reconexión de forma transparente:
+
+```rust
+impl NodeClient {
+    pub async fn send(&self, msg: Message) -> Result<(), NodeError> {
+        let mut attempts = 0;
+        loop {
+            match self.try_send(&msg).await {
+                Ok(_) => return Ok(()),
+                Err(e) if e.is_disconnected() && attempts < 3 => {
+                    attempts += 1;
+                    self.reconnect().await?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    
+    async fn reconnect(&self) -> Result<(), NodeError> {
+        let mut delay = Duration::from_millis(100);
+        loop {
+            match self.try_connect().await {
+                Ok(_) => {
+                    self.send_hello().await?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
+    }
+}
+```
+
+**Detección de desconexión:**
+- `send()` falla con error de socket → reconecta
+- `recv()` recibe EOF → reconecta
+- No hay heartbeat activo desde la librería
+
+### 19. Módulos Expuestos
+
+La librería del router expone módulos públicos:
+
+```rust
+// json_router/lib.rs
+
+/// Estructuras de protocolo
+pub mod protocol {
+    pub use crate::protocol::{Message, Routing, Meta, Destination};
+}
+
+/// Framing de mensajes
+pub mod framing {
+    pub use crate::socket::{read_frame, write_frame};
+}
+
+/// Cliente de nodo
+pub mod node_client {
+    pub use crate::node::{NodeClient, NodeConfig, NodeError};
+}
+```
+
+### 20. Resumen de Responsabilidades
+
+| Componente | Responsabilidad |
+|------------|-----------------|
+| **Librería** | UUID (generar, persistir), conexión, HELLO/ANNOUNCE, framing, reconexión, errores |
+| **Nodo** | Configurar nombre/isla, lógica de negocio |
+| **Router** | Aceptar HELLO, registrar, rutear, responder ANNOUNCE |
+
+**Regla de oro:** Si un nodo necesita tocar sockets, framing, o UUIDs directamente, algo está mal. Todo debe pasar por la librería.
 
 ---
 
@@ -1796,19 +2280,13 @@ Redondeado a **512 KB** para tener margen.
 
 ```
 1. Nodo arranca
-2. Genera UUID (capa 1)
-3. Crea socket en /var/run/mesh/nodes/<uuid>.sock
-4. listen(1)
-5. Router detecta socket nuevo (inotify)
-6. Router espera random backoff (0-100ms)
-7. Router intenta connect()
-   - Éxito: Router registra nodo en shared memory
-   - Falla: Otro router lo tomó, ignorar
-8. Router envía QUERY al nodo
-9. Nodo responde ANNOUNCE con su nombre capa 2
-10. Router actualiza registro con nombre
-11. Router crea RouteEntry tipo CONNECTED
-12. Router envía BCAST_ANNOUNCE a la red
+2. Librería carga o genera UUID
+3. Librería conecta al socket del router
+4. Librería envía HELLO (uuid, name, version)
+5. Router valida y registra nodo en shared memory
+6. Router responde ANNOUNCE (status: registered)
+7. Router crea RouteEntry tipo CONNECTED
+8. Router envía LSA a otros routers
 ```
 
 #### 14.2 Operación Normal
@@ -1848,10 +2326,9 @@ Nodo ←──socket──→ Router ←──shared memory──→ Otros Route
 
 ```
 1. Nodo se recupera, arranca de nuevo
-2. Genera mismo o nuevo UUID (política del nodo)
-3. Crea socket, listen()
-4. Router detecta, conecta, registra
-5. Flujo normal de QUERY/ANNOUNCE
+2. Librería carga UUID persistido (mismo UUID)
+3. Librería conecta al router
+4. Flujo normal de HELLO/ANNOUNCE
 ```
 
 ### 15. Coordinación entre Routers

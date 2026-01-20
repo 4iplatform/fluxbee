@@ -161,6 +161,8 @@ async fn handle_router_connection(
     conn_id: Uuid,
 ) -> io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
+    send_hello(&mut writer, &state.node_uuid).await?;
+
     if let Some(frame) = read_frame(&mut reader).await? {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&frame) {
             let msg_kind = value
@@ -232,6 +234,23 @@ where
         "routing": null,
         "meta": { "type": "system", "msg": MSG_ANNOUNCE },
         "payload": { "uuid": uuid.to_string(), "name": "SY.admin" },
+    });
+    let data = serde_json::to_vec(&msg)?;
+    write_frame(writer, &data).await
+}
+
+async fn send_hello<W>(writer: &mut W, uuid: &Uuid) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let msg = serde_json::json!({
+        "routing": null,
+        "meta": { "type": "system", "msg": "HELLO" },
+        "payload": {
+            "name": "SY.admin",
+            "version": "1.0",
+            "uuid": uuid.to_string(),
+        },
     });
     let data = serde_json::to_vec(&msg)?;
     write_frame(writer, &data).await

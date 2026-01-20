@@ -1,8 +1,8 @@
 # JSON Router - Nodos SY (System)
 
-**Estado:** Draft v0.9
+**Estado:** Draft v0.11
 **Fecha:** 2025-01-19
-**Documento relacionado:** JSON Router Especificación Técnica v1.9
+**Documento relacionado:** JSON Router Especificación Técnica v1.11
 
 ---
 
@@ -16,31 +16,47 @@ Los nodos SY (System) son componentes de infraestructura que proveen servicios e
 - **Distribución:** Parte del paquete `json-router`
 - **Privilegios:** Pueden acceder a shared memory directamente
 - **Ciclo de vida:** Gestionados por systemd junto con los routers
-- **Nomenclatura:** `SY.<servicio>.<instancia>`
-- **Librería compartida:** Usan módulos públicos del router (`protocol`, `socket`)
+- **Nomenclatura:** `SY.<servicio>.{isla}`
+- **Librería compartida:** Usan `node-lib` del router (ver Parte II-B de la spec principal)
 
-### 1.3 Uso de la Librería del Router
+### 1.3 Uso de la Librería de Nodos (node-lib)
 
-Los nodos SY reutilizan código del router para protocolo y comunicación:
+**IMPORTANTE:** Todos los nodos SY deben usar la librería estándar `node-lib` para comunicación con el router. Ver **Parte II-B: Librería de Nodos** en la especificación técnica del router para detalles completos.
+
+La librería maneja:
+- **Generación y persistencia de UUID** (el nodo no genera UUIDs manualmente)
+- **Conexión al router** (socket Unix)
+- **Handshake HELLO** (automático al conectar)
+- **Framing de mensajes** (length-prefix)
+- **Reconexión automática** (con backoff)
+
+**Uso en nodo SY:**
 
 ```rust
-// En sy_config_routes/main.rs
-use json_router::protocol::{Message, Meta, Routing, Destination};
-use json_router::socket::{read_frame, write_frame};
+use json_router::node_client::{NodeClient, NodeConfig};
+use json_router::protocol::{Message, Meta};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config = NodeConfig {
+        name: format!("SY.config.routes.{}", island_id),
+        island_id: island_id.clone(),
+        router_socket: "/var/run/json-router/router.sock".into(),
+        uuid_persistence_dir: "/var/lib/json-router/nodes/".into(),
+    };
+    
+    // Conectar (UUID y HELLO automáticos)
+    let client = NodeClient::connect(config).await?;
+    
+    // Usar send/recv para comunicación
+    client.send(message).await?;
+    let msg = client.recv().await?;
+    
+    Ok(())
+}
 ```
 
-Los módulos `protocol` y `socket` deben estar expuestos públicamente en la librería:
-
-```rust
-// json_router/lib.rs
-pub mod protocol;  // Message, Meta, Routing, Destination
-pub mod socket;    // read_frame, write_frame, framing utilities
-```
-
-Esto permite que los nodos SY:
-- Serialicen/deserialicen mensajes con las mismas estructuras
-- Usen el mismo framing (length-prefix)
-- Mantengan compatibilidad de protocolo garantizada
+**Regla:** Si un nodo SY toca sockets, framing, o UUIDs directamente, debe refactorizarse para usar la librería.
 
 ### 1.4 Catálogo de nodos SY
 

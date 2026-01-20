@@ -324,7 +324,7 @@ async fn handle_node_connection(
         return;
     }
 
-    let announce = match read_announce(&mut reader).await {
+    let (announce, assigned_uuid) = match read_node_handshake(&mut reader).await {
         Ok(announce) => announce,
         Err(_) => return,
     };
@@ -333,6 +333,10 @@ async fn handle_node_connection(
         Ok(uuid) => uuid,
         Err(_) => return,
     };
+
+    if assigned_uuid {
+        let _ = send_announce_message(&mut writer, &announce).await;
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     {
@@ -429,7 +433,9 @@ where
     Ok(())
 }
 
-async fn read_announce<R>(stream: &mut R) -> Result<AnnouncePayload, ShmError>
+async fn read_node_handshake<R>(
+    stream: &mut R,
+) -> Result<(AnnouncePayload, bool), ShmError>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -442,12 +448,53 @@ where
     };
 
     let msg = serde_json::from_slice::<Message>(&buf)?;
-    if msg.meta.kind != SYSTEM_KIND || msg.meta.msg != MSG_ANNOUNCE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected ANNOUNCE").into());
+    if msg.meta.kind != SYSTEM_KIND {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected system message").into());
     }
 
-    let payload = serde_json::from_value::<AnnouncePayload>(msg.payload)?;
-    Ok(payload)
+    if msg.meta.msg == MSG_ANNOUNCE {
+        let payload = serde_json::from_value::<AnnouncePayload>(msg.payload)?;
+        return Ok((payload, false));
+    }
+
+    if msg.meta.msg == MSG_HELLO {
+        let payload = msg.payload;
+        let name = payload
+            .get("name")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "hello name"))?;
+        let uuid = payload
+            .get("uuid")
+            .and_then(|value| value.as_str())
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .unwrap_or_else(Uuid::new_v4);
+        let assigned = payload.get("uuid").is_none();
+        let announce = AnnouncePayload {
+            uuid: uuid.to_string(),
+            name: name.to_string(),
+        };
+        return Ok((announce, assigned));
+    }
+
+    Err(io::Error::new(io::ErrorKind::InvalidData, "expected HELLO/ANNOUNCE").into())
+}
+
+async fn send_announce_message<W>(stream: &mut W, payload: &AnnouncePayload) -> Result<(), ShmError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let msg = Message {
+        routing: serde_json::Value::Null,
+        meta: Meta {
+            kind: SYSTEM_KIND.to_string(),
+            msg: MSG_ANNOUNCE.to_string(),
+            target: None,
+        },
+        payload: serde_json::to_value(payload)?,
+    };
+    let data = serde_json::to_vec(&msg)?;
+    write_frame(stream, &data).await?;
+    Ok(())
 }
 
 enum Resolution {
