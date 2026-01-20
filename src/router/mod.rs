@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::config_shm::{
-    ConfigShmReader, ConfigSnapshot, ACTION_DROP, ACTION_FORWARD, ACTION_VPN,
+    ConfigRouteEntry, ConfigShmReader, ConfigSnapshot, ACTION_DROP, ACTION_FORWARD, ACTION_VPN,
     CONFIG_HEARTBEAT_STALE_MS,
 };
 use crate::protocol::system::{
@@ -240,19 +240,19 @@ impl Router {
                     }
                     let peer_snapshots = peers.refresh();
                     if !peer_snapshots.is_empty() {
-        let peer_uuids: HashSet<Uuid> = peer_snapshots
-            .iter()
-            .filter_map(|peer| Uuid::from_slice(&peer.router_uuid).ok())
-            .collect();
+                        let peer_uuids: HashSet<Uuid> = peer_snapshots
+                            .iter()
+                            .filter_map(|peer| Uuid::from_slice(&peer.router_uuid).ok())
+                            .collect();
 
-        for peer in &peer_snapshots {
-            let peer_uuid = match Uuid::from_slice(&peer.router_uuid) {
-                Ok(uuid) => uuid,
-                Err(_) => continue,
-            };
-            if peer_uuid == local_router_uuid {
-                continue;
-            }
+                        for peer in &peer_snapshots {
+                            let peer_uuid = match Uuid::from_slice(&peer.router_uuid) {
+                                Ok(uuid) => uuid,
+                                Err(_) => continue,
+                            };
+                            if peer_uuid == local_router_uuid {
+                                continue;
+                            }
                             let should_connect = {
                                 let mut fabric = fabric.lock().await;
                                 fabric.ensure_connect(peer_uuid)
@@ -287,12 +287,12 @@ impl Router {
                                 .await;
                             });
                         }
+                        {
+                            let mut fabric = fabric.lock().await;
+                            fabric.refresh_peer_nodes(&peer_snapshots);
+                            fabric.prune_missing(&peer_uuids);
+                        }
                     }
-        {
-            let mut fabric = fabric.lock().await;
-            fabric.refresh_peer_nodes(&peer_snapshots);
-            fabric.prune_missing(&peer_uuids);
-        }
                     if let Some(local_snapshot) = snapshot {
                         let uplink_nodes = {
                             let uplinks = uplinks.lock().await;
@@ -925,6 +925,7 @@ async fn handle_forward(
                 warn!(target: "json_router", peer = %peer_uuid, "fabric send failed");
             }
         }
+        Resolution::Drop => {}
         Resolution::None => {}
     }
 }
@@ -1555,7 +1556,7 @@ fn build_config_rules(cfg: &Config, snapshot: &ConfigSnapshot) -> Vec<ConfigRule
 
 fn config_entry_to_route(
     cfg: &Config,
-    entry: &crate::config_shm::ConfigRouteEntry,
+    entry: &ConfigRouteEntry,
     island: Option<&str>,
     local_router_uuid: Uuid,
 ) -> Option<crate::shm::RouteEntry> {
@@ -1605,7 +1606,7 @@ fn config_entry_to_route(
 
 fn config_entry_to_rule(
     cfg: &Config,
-    entry: &crate::config_shm::ConfigRouteEntry,
+    entry: &ConfigRouteEntry,
     island: Option<&str>,
 ) -> Option<ConfigRule> {
     if entry.flags == 0 || entry.prefix_len == 0 {
@@ -1637,7 +1638,7 @@ fn config_rule_cmp(a: &ConfigRule, b: &ConfigRule) -> std::cmp::Ordering {
         .then_with(|| a.metric.cmp(&b.metric))
 }
 
-fn read_config_island(entry: &crate::config_shm::ConfigRouteEntry) -> Option<String> {
+fn read_config_island(entry: &ConfigRouteEntry) -> Option<String> {
     if entry.island_len == 0 {
         return None;
     }
@@ -1651,7 +1652,7 @@ fn read_config_island(entry: &crate::config_shm::ConfigRouteEntry) -> Option<Str
 }
 
 fn read_config_next_hop_island(
-    entry: &crate::config_shm::ConfigRouteEntry,
+    entry: &ConfigRouteEntry,
 ) -> Option<String> {
     if entry.next_hop_island_len == 0 {
         return None;

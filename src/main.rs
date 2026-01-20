@@ -1,4 +1,5 @@
 mod config;
+mod config_shm;
 mod shm;
 mod socket;
 mod opa;
