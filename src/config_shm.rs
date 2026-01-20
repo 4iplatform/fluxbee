@@ -38,7 +38,7 @@ pub enum ConfigShmError {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ConfigHeader {
     pub magic: u32,
     pub version: u32,
@@ -54,7 +54,7 @@ pub struct ConfigHeader {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ConfigRouteEntry {
     pub prefix_len: u8,
     pub prefix: [u8; PREFIX_MAX_LEN],
