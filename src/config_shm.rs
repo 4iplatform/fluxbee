@@ -1,6 +1,7 @@
 use std::ffi::CString;
 use std::io;
 use std::mem::size_of;
+use std::sync::atomic::{self, AtomicU64, Ordering};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use memmap2::{Mmap, MmapMut, MmapOptions};
@@ -38,10 +39,11 @@ pub enum ConfigShmError {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct ConfigHeader {
     pub magic: u32,
     pub version: u32,
+    pub seq: AtomicU64,
     pub owner_pid: u32,
     pub heartbeat: u64,
     pub local_version: u64,
@@ -115,9 +117,18 @@ pub struct ConfigShmReader {
     layout: ConfigLayout,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ConfigHeaderSnapshot {
+    pub heartbeat: u64,
+    pub local_version: u64,
+    pub global_version: u64,
+    pub local_route_count: u32,
+    pub global_route_count: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct ConfigSnapshot {
-    pub header: ConfigHeader,
+    pub header: ConfigHeaderSnapshot,
     pub local_routes: Vec<ConfigRouteEntry>,
     pub global_routes: Vec<ConfigRouteEntry>,
 }
@@ -149,15 +160,18 @@ impl ConfigShmWriter {
     }
 
     pub fn update_heartbeat(&mut self) {
+        self.begin_write();
         let header = self.header_mut();
         header.heartbeat = now_epoch_ms();
+        self.end_write();
     }
 
     pub fn write_local_routes(&mut self, routes: &[LocalRoute]) -> Result<(), ConfigShmError> {
         if routes.len() > MAX_LOCAL_ROUTES {
             return Err(ConfigShmError::ValueTooLong);
         }
-        let mut local = unsafe {
+        self.begin_write();
+        let local = unsafe {
             std::slice::from_raw_parts_mut(
                 self.mmap.as_mut_ptr().add(self.layout.local_offset) as *mut ConfigRouteEntry,
                 MAX_LOCAL_ROUTES,
@@ -173,6 +187,7 @@ impl ConfigShmWriter {
         header.local_route_count = routes.len() as u32;
         header.local_version = header.local_version.saturating_add(1);
         header.heartbeat = now_epoch_ms();
+        self.end_write();
         Ok(())
     }
 
@@ -185,7 +200,8 @@ impl ConfigShmWriter {
         if routes.len() > MAX_GLOBAL_ROUTES {
             return Err(ConfigShmError::ValueTooLong);
         }
-        let mut global = unsafe {
+        self.begin_write();
+        let global = unsafe {
             std::slice::from_raw_parts_mut(
                 self.mmap.as_mut_ptr().add(self.layout.global_offset) as *mut ConfigRouteEntry,
                 MAX_GLOBAL_ROUTES,
@@ -223,17 +239,29 @@ impl ConfigShmWriter {
         header.global_route_count = global.iter().filter(|r| r.island_len > 0).count() as u32;
         header.global_version = header.global_version.saturating_add(1);
         header.heartbeat = now_epoch_ms();
+        self.end_write();
         Ok(())
+    }
+
+    fn begin_write(&self) {
+        self.header().seq.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn end_write(&self) {
+        atomic::fence(Ordering::Release);
+        self.header().seq.fetch_add(1, Ordering::Relaxed);
     }
 
     fn header_mut(&mut self) -> &mut ConfigHeader {
         unsafe { &mut *(self.mmap.as_mut_ptr().add(self.layout.header_offset) as *mut ConfigHeader) }
     }
 
+    fn header(&self) -> &ConfigHeader {
+        unsafe { &*(self.mmap.as_ptr().add(self.layout.header_offset) as *const ConfigHeader) }
+    }
+
     fn is_valid(&self) -> bool {
-        let header = unsafe {
-            &*(self.mmap.as_ptr().add(self.layout.header_offset) as *const ConfigHeader)
-        };
+        let header = self.header();
         header.magic == CONFIG_MAGIC && header.version == CONFIG_VERSION
     }
 }
@@ -266,18 +294,29 @@ impl ConfigShmReader {
     pub fn read_snapshot(&self) -> Option<ConfigSnapshot> {
         loop {
             let header = self.header();
+            let s1 = header.seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            atomic::fence(Ordering::Acquire);
             let local_count = header.local_route_count as usize;
             let global_count = header.global_route_count as usize;
             let local = self.local_slice().get(..local_count)?.to_vec();
             let global = self.global_slice().get(..global_count)?.to_vec();
-            let header_after = self.header();
-            if header.local_version == header_after.local_version
-                && header.global_version == header_after.global_version
-                && header.local_route_count == header_after.local_route_count
-                && header.global_route_count == header_after.global_route_count
-            {
+            let header_snapshot = ConfigHeaderSnapshot {
+                heartbeat: header.heartbeat,
+                local_version: header.local_version,
+                global_version: header.global_version,
+                local_route_count: header.local_route_count,
+                global_route_count: header.global_route_count,
+            };
+            atomic::fence(Ordering::Acquire);
+            let s2 = header.seq.load(Ordering::Acquire);
+            if s1 == s2 {
                 return Some(ConfigSnapshot {
-                    header: *header_after,
+                    header: header_snapshot,
                     local_routes: local,
                     global_routes: global,
                 });
@@ -358,6 +397,7 @@ fn initialize_header(header: &mut ConfigHeader, island: &str) {
     let mut hdr = ConfigHeader {
         magic: CONFIG_MAGIC,
         version: CONFIG_VERSION,
+        seq: AtomicU64::new(0),
         owner_pid: std::process::id(),
         heartbeat: now_epoch_ms(),
         local_version: 1,
