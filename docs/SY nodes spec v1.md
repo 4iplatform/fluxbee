@@ -12,16 +12,32 @@ Los nodos SY (System) son componentes de infraestructura que proveen servicios e
 
 ### 1.1 Características comunes
 
-- **Lenguaje:** Rust (mismo stack que el router)
+- **Lenguaje:** Rust **(obligatorio, sin excepciones)**
 - **Distribución:** Parte del paquete `json-router`
 - **Privilegios:** Pueden acceder a shared memory directamente
 - **Ciclo de vida:** Gestionados por systemd junto con los routers
 - **Nomenclatura:** `SY.<servicio>.{isla}`
-- **Librería compartida:** Usan `node-lib` del router (ver Parte II-B de la spec principal)
+- **Librería:** `json_router::node_client` (mismo crate que el router)
 
-### 1.3 Uso de la Librería de Nodos (node-lib)
+### 1.3 Convención: Nodos SY en Rust
 
-**IMPORTANTE:** Todos los nodos SY deben usar la librería estándar `node-lib` para comunicación con el router. Ver **Parte II-B: Librería de Nodos** en la especificación técnica del router para detalles completos.
+**Todos los nodos SY DEBEN implementarse en Rust.** Esta es una convención del sistema, no una sugerencia.
+
+| Tipo de nodo | Lenguaje | Razón |
+|--------------|----------|-------|
+| SY.* | **Rust (obligatorio)** | Infraestructura crítica, mismo crate que router |
+| AI.*, WF.*, IO.* | Rust o Node.js | Lógica de negocio, flexibilidad permitida |
+
+**Razones de la convención:**
+- Los nodos SY son infraestructura crítica del sistema
+- Comparten crate con el router (consistencia garantizada)
+- Sin overhead de FFI o serialización entre lenguajes
+- Un solo binario por nodo SY
+- Acceso directo a shared memory cuando es necesario
+
+### 1.4 Uso de node_client
+
+**IMPORTANTE:** Todos los nodos SY deben usar `json_router::node_client` para comunicación con el router. Ver **Parte II-B: Librería de Nodos** en la especificación técnica del router para detalles completos.
 
 La librería maneja:
 - **Generación y persistencia de UUID** (el nodo no genera UUIDs manualmente)
@@ -30,35 +46,66 @@ La librería maneja:
 - **Framing de mensajes** (length-prefix)
 - **Reconexión automática** (con backoff)
 
-**Uso en nodo SY:**
+**Estructura del proyecto:**
+
+```
+json-router/
+├── json_router/           # Crate principal
+│   ├── src/
+│   │   ├── lib.rs         # Expone: protocol, framing, node_client
+│   │   ├── main.rs        # Binario del router
+│   │   ├── node_client/   # Módulo para nodos
+│   │   └── ...
+│   └── Cargo.toml
+├── sy_config_routes/      # Nodo SY
+│   ├── src/main.rs
+│   └── Cargo.toml         # Dependencia: json_router = { path = "../json_router" }
+├── sy_admin/              # Nodo SY
+│   ├── src/main.rs
+│   └── Cargo.toml
+└── sy_orchestrator/       # Nodo SY
+    ├── src/main.rs
+    └── Cargo.toml
+```
+
+**Ejemplo completo de nodo SY:**
 
 ```rust
-use json_router::node_client::{NodeClient, NodeConfig};
-use json_router::protocol::{Message, Meta};
+use json_router::node_client::{NodeClient, NodeConfig, NodeError};
+use json_router::protocol::{Message, Meta, Routing};
+use std::path::PathBuf;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), NodeError> {
+    let island_id = std::env::var("ISLAND_ID").unwrap_or("sandbox".into());
+    
     let config = NodeConfig {
         name: format!("SY.config.routes.{}", island_id),
         island_id: island_id.clone(),
-        router_socket: "/var/run/json-router/router.sock".into(),
-        uuid_persistence_dir: "/var/lib/json-router/nodes/".into(),
+        router_socket: PathBuf::from("/var/run/json-router/router.sock"),
+        uuid_persistence_dir: PathBuf::from("/var/lib/json-router/nodes/"),
     };
     
     // Conectar (UUID y HELLO automáticos)
     let client = NodeClient::connect(config).await?;
     
-    // Usar send/recv para comunicación
-    client.send(message).await?;
-    let msg = client.recv().await?;
+    println!("Conectado como {} (UUID: {})", client.name(), client.uuid());
     
-    Ok(())
+    // Loop principal
+    loop {
+        let msg = client.recv().await?;
+        // Procesar mensaje...
+        // client.send(response).await?;
+    }
 }
 ```
 
-**Regla:** Si un nodo SY toca sockets, framing, o UUIDs directamente, debe refactorizarse para usar la librería.
+**Reglas:**
+1. Nodos SY **DEBEN** ser Rust
+2. Nodos SY **DEBEN** usar `json_router::node_client`
+3. Si un nodo SY toca sockets, framing, o UUIDs directamente → refactorizar
 
-### 1.4 Catálogo de nodos SY
+### 1.5 Catálogo de nodos SY
 
 | Nodo | Instancias | Estado | Descripción |
 |------|------------|--------|-------------|

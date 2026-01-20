@@ -11,11 +11,16 @@ use tokio::time::{self, Duration, Instant};
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::config_shm::{
+    ConfigShmReader, ConfigSnapshot, ACTION_DROP, ACTION_FORWARD, ACTION_VPN,
+    CONFIG_HEARTBEAT_STALE_MS,
+};
 use crate::protocol::system::{
-    build_error, build_hello, build_lsa, build_query, build_sync_reply, build_sync_request,
-    build_uplink_accept, build_uplink_reject, AnnouncePayload, HelloCapabilities, HelloPayload,
-    LsaPayload, Message, NodeDescriptor, SyncReplyPayload, SyncRequestPayload, UplinkAcceptPayload,
-    UplinkRejectPayload, WithdrawPayload, MSG_ANNOUNCE, MSG_HELLO, MSG_LSA, MSG_SYNC_REPLY,
+    build_error, build_hello, build_lsa, build_node_announce_error, build_node_announce_registered,
+    build_sync_reply, build_sync_request, build_uplink_accept, build_uplink_reject,
+    HelloCapabilities, HelloPayload, LsaPayload, Message, NodeAnnouncePayload, NodeDescriptor,
+    NodeHelloPayload, SyncReplyPayload, SyncRequestPayload, UplinkAcceptPayload, UplinkRejectPayload,
+    WithdrawPayload, MSG_HELLO, MSG_LSA, MSG_NO_ROUTE, MSG_QUEUE_FULL, MSG_SYNC_REPLY,
     MSG_SYNC_REQUEST, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_UPLINK_ACCEPT, MSG_UPLINK_REJECT,
     MSG_WITHDRAW, SYSTEM_KIND,
 };
@@ -29,13 +34,16 @@ use tracing::{debug, info, warn};
 const ANNOUNCE_TIMEOUT_MS: u64 = 5_000;
 const BROADCAST_CACHE_TTL_SECS: u64 = 60;
 const CONFIG_SHM_PREFIX: &str = "/jsr-config-";
+const NODE_PROTOCOL_VERSION: &str = "1.0";
+const NODE_QUEUE_CAPACITY: usize = 256;
 
 pub struct Router {
     cfg: Config,
     shm: Arc<Mutex<ShmWriter>>,
     fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
-    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::Sender<Vec<u8>>>>>,
     local_snapshot: Arc<Mutex<Option<ShmSnapshot>>>,
+    config_state: Arc<Mutex<ConfigState>>,
     uplinks: Arc<Mutex<UplinkManager>>,
     fabric: Arc<Mutex<FabricManager>>,
     broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
@@ -50,6 +58,7 @@ impl Router {
             fib: Arc::new(Mutex::new(Vec::new())),
             nodes: Arc::new(Mutex::new(HashMap::new())),
             local_snapshot: Arc::new(Mutex::new(None)),
+            config_state: Arc::new(Mutex::new(ConfigState::new())),
             uplinks: Arc::new(Mutex::new(UplinkManager::new())),
             fabric: Arc::new(Mutex::new(FabricManager::new())),
             broadcast_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -68,6 +77,7 @@ impl Router {
         let fib = Arc::clone(&self.fib);
         let nodes = Arc::clone(&self.nodes);
         let snapshot_cache = Arc::clone(&self.local_snapshot);
+        let config_state = Arc::clone(&self.config_state);
         let uplinks = Arc::clone(&self.uplinks);
         let fabric = Arc::clone(&self.fabric);
         let broadcast_cache = Arc::clone(&self.broadcast_cache);
@@ -78,6 +88,7 @@ impl Router {
             let fib = Arc::clone(&self.fib);
             let nodes = Arc::clone(&self.nodes);
             let snapshot_cache = Arc::clone(&self.local_snapshot);
+            let config_state = Arc::clone(&self.config_state);
             let uplinks = Arc::clone(&self.uplinks);
             let broadcast_cache = Arc::clone(&self.broadcast_cache);
             let fabric = Arc::clone(&self.fabric);
@@ -90,6 +101,7 @@ impl Router {
                     fib,
                     nodes,
                     snapshot_cache,
+                    config_state,
                     uplinks,
                     broadcast_cache,
                     fabric,
@@ -109,6 +121,7 @@ impl Router {
             let fib = Arc::clone(&self.fib);
             let nodes = Arc::clone(&self.nodes);
             let snapshot_cache = Arc::clone(&self.local_snapshot);
+            let config_state = Arc::clone(&self.config_state);
             let uplinks = Arc::clone(&self.uplinks);
             let peers_cfg = self.cfg.uplink_peers.clone();
             let broadcast_cache = Arc::clone(&self.broadcast_cache);
@@ -122,6 +135,7 @@ impl Router {
                     fib,
                     nodes,
                     snapshot_cache,
+                    config_state,
                     uplinks,
                     broadcast_cache,
                     fabric,
@@ -139,6 +153,7 @@ impl Router {
             let fib = Arc::clone(&self.fib);
             let nodes = Arc::clone(&self.nodes);
             let snapshot_cache = Arc::clone(&self.local_snapshot);
+            let config_state = Arc::clone(&self.config_state);
             let uplinks = Arc::clone(&self.uplinks);
             let broadcast_cache = Arc::clone(&self.broadcast_cache);
             let socket_path = fabric_socket_path(&self.cfg.node_socket_dir, &self.cfg.router_uuid);
@@ -149,6 +164,7 @@ impl Router {
                     fib,
                     nodes,
                     snapshot_cache,
+                    config_state,
                     uplinks,
                     fabric,
                     broadcast_cache,
@@ -183,6 +199,7 @@ impl Router {
                                 let uplinks = Arc::clone(&uplinks);
                                 let fabric = Arc::clone(&fabric);
                                 let broadcast_cache = Arc::clone(&broadcast_cache);
+                                let config_state = Arc::clone(&config_state);
                                 tokio::spawn(async move {
                                     handle_node_connection(
                                         path.clone(),
@@ -194,6 +211,7 @@ impl Router {
                                         uplinks,
                                         fabric,
                                         broadcast_cache,
+                                        config_state,
                                         local_router_uuid,
                                     )
                                     .await;
@@ -208,6 +226,10 @@ impl Router {
                     connected.remove(&path);
                 }
                 _ = fib_ticker.tick() => {
+                    let config_routes = {
+                        let mut state = config_state.lock().await;
+                        update_config_routes(&self.cfg, &mut state, local_router_uuid)
+                    };
                     let snapshot = {
                         let shm = self.shm.lock().await;
                         shm.read_snapshot()
@@ -218,14 +240,19 @@ impl Router {
                     }
                     let peer_snapshots = peers.refresh();
                     if !peer_snapshots.is_empty() {
-                        for peer in &peer_snapshots {
-                            let peer_uuid = match Uuid::from_slice(&peer.router_uuid) {
-                                Ok(uuid) => uuid,
-                                Err(_) => continue,
-                            };
-                            if peer_uuid == local_router_uuid {
-                                continue;
-                            }
+        let peer_uuids: HashSet<Uuid> = peer_snapshots
+            .iter()
+            .filter_map(|peer| Uuid::from_slice(&peer.router_uuid).ok())
+            .collect();
+
+        for peer in &peer_snapshots {
+            let peer_uuid = match Uuid::from_slice(&peer.router_uuid) {
+                Ok(uuid) => uuid,
+                Err(_) => continue,
+            };
+            if peer_uuid == local_router_uuid {
+                continue;
+            }
                             let should_connect = {
                                 let mut fabric = fabric.lock().await;
                                 fabric.ensure_connect(peer_uuid)
@@ -239,6 +266,7 @@ impl Router {
                             let fib = Arc::clone(&self.fib);
                             let nodes = Arc::clone(&self.nodes);
                             let snapshot_cache = Arc::clone(&self.local_snapshot);
+                            let config_state = Arc::clone(&self.config_state);
                             let uplinks = Arc::clone(&self.uplinks);
                             let fabric = Arc::clone(&self.fabric);
                             let broadcast_cache = Arc::clone(&self.broadcast_cache);
@@ -250,6 +278,7 @@ impl Router {
                                     fib,
                                     nodes,
                                     snapshot_cache,
+                                    config_state,
                                     uplinks,
                                     fabric,
                                     broadcast_cache,
@@ -259,17 +288,22 @@ impl Router {
                             });
                         }
                     }
-                    {
-                        let mut fabric = fabric.lock().await;
-                        fabric.refresh_peer_nodes(&peer_snapshots);
-                    }
+        {
+            let mut fabric = fabric.lock().await;
+            fabric.refresh_peer_nodes(&peer_snapshots);
+            fabric.prune_missing(&peer_uuids);
+        }
                     if let Some(local_snapshot) = snapshot {
                         let uplink_nodes = {
                             let uplinks = uplinks.lock().await;
                             uplinks.snapshot_nodes()
                         };
-                        let mut new_fib =
-                            build_fib(&local_snapshot, &peer_snapshots, &uplink_nodes);
+                        let mut new_fib = build_fib(
+                            &local_snapshot,
+                            &peer_snapshots,
+                            &uplink_nodes,
+                            &config_routes,
+                        );
                         new_fib.sort_by(route_cmp);
                         info!(
                             target: "json_router",
@@ -311,42 +345,102 @@ async fn handle_node_connection(
     stream: UnixStream,
     shm: Arc<Mutex<ShmWriter>>,
     fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
-    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::Sender<Vec<u8>>>>>,
     local_snapshot: Arc<Mutex<Option<ShmSnapshot>>>,
     uplinks: Arc<Mutex<UplinkManager>>,
     fabric: Arc<Mutex<FabricManager>>,
     broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
+    config_state: Arc<Mutex<ConfigState>>,
     local_router_uuid: Uuid,
 ) {
     let (mut reader, mut writer) = stream.into_split();
-    if let Err(err) = send_query(&mut writer).await {
-        let _ = err;
+    let hello = match read_node_hello(&mut reader).await {
+        Ok(hello) => hello,
+        Err(_) => return,
+    };
+
+    let Some(uuid_value) = hello.uuid.as_deref() else {
+        let _ = send_node_announce(
+            &mut writer,
+            build_node_announce_error("UUID_INVALID", "missing uuid"),
+        )
+        .await;
+        return;
+    };
+    let Some(name_value) = hello.name.as_deref() else {
+        let _ = send_node_announce(
+            &mut writer,
+            build_node_announce_error("INVALID_NAME", "missing name"),
+        )
+        .await;
+        return;
+    };
+    let Some(version_value) = hello.version.as_deref() else {
+        let _ = send_node_announce(
+            &mut writer,
+            build_node_announce_error("VERSION_UNSUPPORTED", "missing version"),
+        )
+        .await;
+        return;
+    };
+
+    let node_uuid = match Uuid::parse_str(uuid_value) {
+        Ok(uuid) => uuid,
+        Err(_) => {
+            let _ = send_node_announce(
+                &mut writer,
+                build_node_announce_error("UUID_INVALID", "invalid uuid"),
+            )
+            .await;
+            return;
+        }
+    };
+
+    if !is_supported_node_version(version_value) {
+        let _ = send_node_announce(
+            &mut writer,
+            build_node_announce_error("VERSION_UNSUPPORTED", "unsupported version"),
+        )
+        .await;
         return;
     }
 
-    let (announce, assigned_uuid) = match read_node_handshake(&mut reader).await {
-        Ok(announce) => announce,
-        Err(_) => return,
-    };
-
-    let node_uuid = match Uuid::parse_str(&announce.uuid) {
-        Ok(uuid) => uuid,
-        Err(_) => return,
-    };
-
-    if assigned_uuid {
-        let _ = send_announce_message(&mut writer, &announce).await;
+    if is_uuid_in_use(&node_uuid, &nodes, &shm).await {
+        let _ = send_node_announce(
+            &mut writer,
+            build_node_announce_error("UUID_CONFLICT", "uuid already registered"),
+        )
+        .await;
+        return;
     }
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(NODE_QUEUE_CAPACITY);
     {
         let mut shm = shm.lock().await;
-        let _ = shm.register_node(node_uuid, &announce.name);
+        if let Err(err) = shm.register_node(node_uuid, name_value) {
+            let (code, detail) = match err {
+                ShmError::InvalidName => ("INVALID_NAME", "invalid name"),
+                ShmError::ValueTooLong(_, _) => ("INVALID_NAME", "invalid name"),
+                ShmError::SlotFull => ("QUEUE_FULL", "node table full"),
+                _ => ("UUID_CONFLICT", "registration failed"),
+            };
+            let _ = send_node_announce(
+                &mut writer,
+                build_node_announce_error(code, detail),
+            )
+            .await;
+            return;
+        }
     }
+    let _ = send_node_announce(
+        &mut writer,
+        build_node_announce_registered(uuid_value, name_value),
+    )
+    .await;
     send_lsa(&shm, &uplinks).await;
     info!(
         target: "json_router",
-        node = %announce.name,
+        node = %name_value,
         uuid = %node_uuid,
         "node registered"
     );
@@ -394,6 +488,7 @@ async fn handle_node_connection(
                     &fib,
                     &nodes,
                     &local_snapshot,
+                    &config_state,
                     &uplinks,
                     &fabric,
                     &broadcast_cache,
@@ -423,84 +518,82 @@ async fn handle_node_connection(
     write_task.abort();
 }
 
-async fn send_query<W>(stream: &mut W) -> Result<(), ShmError>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let msg = build_query();
-    let payload = serde_json::to_vec(&msg)?;
-    write_frame(stream, &payload).await?;
-    Ok(())
-}
-
-async fn read_node_handshake<R>(
-    stream: &mut R,
-) -> Result<(AnnouncePayload, bool), ShmError>
+async fn read_node_hello<R>(stream: &mut R) -> Result<NodeHelloPayload, ShmError>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let buf = time::timeout(Duration::from_millis(ANNOUNCE_TIMEOUT_MS), read_frame(stream))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "announce timeout"))??;
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "hello timeout"))??;
 
     let Some(buf) = buf else {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "announce eof").into());
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "hello eof").into());
     };
 
-    let msg = serde_json::from_slice::<Message>(&buf)?;
-    if msg.meta.kind != SYSTEM_KIND {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected system message").into());
+    let msg = serde_json::from_slice::<Message<NodeHelloPayload>>(&buf)?;
+    if msg.meta.kind != SYSTEM_KIND || msg.meta.msg != MSG_HELLO {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected HELLO").into());
     }
-
-    if msg.meta.msg == MSG_ANNOUNCE {
-        let payload = serde_json::from_value::<AnnouncePayload>(msg.payload)?;
-        return Ok((payload, false));
-    }
-
-    if msg.meta.msg == MSG_HELLO {
-        let payload = msg.payload;
-        let name = payload
-            .get("name")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "hello name"))?;
-        let uuid = payload
-            .get("uuid")
-            .and_then(|value| value.as_str())
-            .and_then(|value| Uuid::parse_str(value).ok())
-            .unwrap_or_else(Uuid::new_v4);
-        let assigned = payload.get("uuid").is_none();
-        let announce = AnnouncePayload {
-            uuid: uuid.to_string(),
-            name: name.to_string(),
-        };
-        return Ok((announce, assigned));
-    }
-
-    Err(io::Error::new(io::ErrorKind::InvalidData, "expected HELLO/ANNOUNCE").into())
+    Ok(msg.payload)
 }
 
-async fn send_announce_message<W>(stream: &mut W, payload: &AnnouncePayload) -> Result<(), ShmError>
+async fn send_node_announce<W>(
+    stream: &mut W,
+    payload: Message<NodeAnnouncePayload>,
+) -> Result<(), ShmError>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let msg = Message {
-        routing: serde_json::Value::Null,
-        meta: Meta {
-            kind: SYSTEM_KIND.to_string(),
-            msg: MSG_ANNOUNCE.to_string(),
-            target: None,
-        },
-        payload: serde_json::to_value(payload)?,
-    };
-    let data = serde_json::to_vec(&msg)?;
+    let data = serde_json::to_vec(&payload)?;
     write_frame(stream, &data).await?;
     Ok(())
+}
+
+async fn is_uuid_in_use(
+    uuid: &Uuid,
+    nodes: &Arc<Mutex<HashMap<Uuid, mpsc::Sender<Vec<u8>>>>>,
+    shm: &Arc<Mutex<ShmWriter>>,
+) -> bool {
+    {
+        let nodes = nodes.lock().await;
+        if nodes.contains_key(uuid) {
+            return true;
+        }
+    }
+    let snapshot = {
+        let shm = shm.lock().await;
+        shm.read_snapshot()
+    };
+    if let Some(snapshot) = snapshot {
+        return snapshot
+            .nodes
+            .iter()
+            .any(|node| node.is_active() && node.uuid == *uuid.as_bytes());
+    }
+    false
+}
+
+fn is_supported_node_version(version: &str) -> bool {
+    let parse = |value: &str| -> Option<(u32, u32)> {
+        let mut parts = value.split('.');
+        let major = parts.next()?.parse::<u32>().ok()?;
+        let minor = parts.next()?.parse::<u32>().ok()?;
+        Some((major, minor))
+    };
+    let Some(requested) = parse(version) else {
+        return false;
+    };
+    let Some(supported) = parse(NODE_PROTOCOL_VERSION) else {
+        return false;
+    };
+    requested <= supported
 }
 
 enum Resolution {
     Local(Uuid),
     Uplink(u32),
     Fabric(Uuid),
+    Drop,
     None,
 }
 
@@ -508,8 +601,9 @@ async fn handle_forward(
     buf: &[u8],
     shm: &Arc<Mutex<ShmWriter>>,
     fib: &Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
-    nodes: &Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    nodes: &Arc<Mutex<HashMap<Uuid, mpsc::Sender<Vec<u8>>>>>,
     local_snapshot: &Arc<Mutex<Option<ShmSnapshot>>>,
+    config_state: &Arc<Mutex<ConfigState>>,
     uplinks: &Arc<Mutex<UplinkManager>>,
     fabric: &Arc<Mutex<FabricManager>>,
     broadcast_cache: &Arc<Mutex<HashMap<Uuid, Instant>>>,
@@ -564,7 +658,6 @@ async fn handle_forward(
                 src_uuid,
                 trace_id.clone(),
                 MSG_TTL_EXCEEDED,
-                "ttl",
                 "ttl exhausted",
             )
             .await;
@@ -630,7 +723,7 @@ async fn handle_forward(
         let local_count = local_targets.len();
         if let Ok(outgoing) = serde_json::to_vec(&value) {
             for sender in &local_targets {
-                let _ = sender.send(outgoing.clone());
+                let _ = sender.try_send(outgoing.clone());
             }
         }
 
@@ -643,14 +736,16 @@ async fn handle_forward(
         );
 
         if forwarded {
-            let mut outgoing = value;
+            let mut outgoing = value.clone();
             decrement_ttl(&mut outgoing);
             if let Ok(outgoing) = serde_json::to_vec(&outgoing) {
                 let mut uplinks = uplinks.lock().await;
-                uplinks.broadcast(outgoing.clone());
-                let mut fabric = fabric.lock().await;
-                fabric.broadcast(outgoing);
+                uplinks.broadcast(outgoing);
             }
+        }
+        if let Ok(outgoing) = serde_json::to_vec(&value) {
+            let mut fabric = fabric.lock().await;
+            fabric.broadcast(outgoing);
         }
 
         return;
@@ -662,9 +757,17 @@ async fn handle_forward(
             let nodes = nodes.lock().await;
             nodes.get(&dst).cloned()
         } {
-            decrement_ttl(&mut outgoing);
             if let Ok(outgoing) = serde_json::to_vec(&outgoing) {
-                let _ = sender.send(outgoing);
+                if sender.try_send(outgoing).is_err() {
+                    send_error(
+                        nodes,
+                        src_uuid,
+                        trace_id.clone(),
+                        MSG_QUEUE_FULL,
+                        "destination queue full",
+                    )
+                    .await;
+                }
             }
             return;
         }
@@ -689,7 +792,6 @@ async fn handle_forward(
             fabric.route_uuid(&dst)
         };
         if let Some(peer_uuid) = peer_uuid {
-            decrement_ttl(&mut outgoing);
             if let Ok(outgoing) = serde_json::to_vec(&outgoing) {
                 let mut fabric = fabric.lock().await;
                 if fabric.send_to_peer(peer_uuid, outgoing).is_err() {
@@ -709,7 +811,6 @@ async fn handle_forward(
             src_uuid,
             trace_id.clone(),
             MSG_UNREACHABLE,
-            "no_route",
             "destination not found",
         )
         .await;
@@ -717,10 +818,23 @@ async fn handle_forward(
     }
 
     let resolution = if let Some(target) = target {
-        resolve_target(&target, shm, fib, local_snapshot, local_router_uuid).await
+        resolve_target(
+            &target,
+            shm,
+            fib,
+            local_snapshot,
+            config_state,
+            local_router_uuid,
+        )
+        .await
     } else {
         Resolution::None
     };
+
+    if matches!(resolution, Resolution::Drop) {
+        info!(target: "json_router", "message dropped by config rule");
+        return;
+    }
 
     if matches!(resolution, Resolution::None) {
         let _ = fib;
@@ -733,8 +847,7 @@ async fn handle_forward(
             nodes,
             src_uuid,
             trace_id.clone(),
-            MSG_UNREACHABLE,
-            "no_route",
+            MSG_NO_ROUTE,
             "destination not found",
         )
         .await;
@@ -747,12 +860,6 @@ async fn handle_forward(
         }
     }
 
-    decrement_ttl(&mut outgoing);
-    let outgoing = match serde_json::to_vec(&outgoing) {
-        Ok(data) => data,
-        Err(_) => return,
-    };
-
     match resolution {
         Resolution::Local(dst_uuid) => {
             let sender = {
@@ -761,13 +868,26 @@ async fn handle_forward(
             };
 
             if let Some(sender) = sender {
+                let outgoing = match serde_json::to_vec(&outgoing) {
+                    Ok(data) => data,
+                    Err(_) => return,
+                };
                 info!(
                     target: "json_router",
                     src = src_uuid.as_ref().map(|id| id.to_string()).unwrap_or_else(|| "unknown".to_string()),
                     dst = %dst_uuid,
                     "forwarded"
                 );
-                let _ = sender.send(outgoing);
+                if sender.try_send(outgoing).is_err() {
+                    send_error(
+                        nodes,
+                        src_uuid,
+                        trace_id.clone(),
+                        MSG_QUEUE_FULL,
+                        "destination queue full",
+                    )
+                    .await;
+                }
             } else {
                 warn!(
                     target: "json_router",
@@ -779,19 +899,27 @@ async fn handle_forward(
                     src_uuid,
                     trace_id.clone(),
                     MSG_UNREACHABLE,
-                    "no_route",
                     "destination not connected",
                 )
                 .await;
             }
         }
         Resolution::Uplink(link_id) => {
+            decrement_ttl(&mut outgoing);
+            let outgoing = match serde_json::to_vec(&outgoing) {
+                Ok(data) => data,
+                Err(_) => return,
+            };
             let mut uplinks = uplinks.lock().await;
             if uplinks.send_on_link(link_id, outgoing).is_err() {
                 warn!(target: "json_router", link_id, "uplink send failed");
             }
         }
         Resolution::Fabric(peer_uuid) => {
+            let outgoing = match serde_json::to_vec(&outgoing) {
+                Ok(data) => data,
+                Err(_) => return,
+            };
             let mut fabric = fabric.lock().await;
             if fabric.send_to_peer(peer_uuid, outgoing).is_err() {
                 warn!(target: "json_router", peer = %peer_uuid, "fabric send failed");
@@ -806,6 +934,7 @@ async fn resolve_target(
     shm: &Arc<Mutex<ShmWriter>>,
     fib: &Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
     local_snapshot: &Arc<Mutex<Option<ShmSnapshot>>>,
+    config_state: &Arc<Mutex<ConfigState>>,
     local_router_uuid: Uuid,
 ) -> Resolution {
     let snapshot = {
@@ -822,6 +951,34 @@ async fn resolve_target(
             }
         }
     };
+
+    let config_rules = {
+        let state = config_state.lock().await;
+        state.rules.clone()
+    };
+    for rule in config_rules {
+        if !pattern_matches(rule.match_kind, &rule.prefix, target.as_bytes()) {
+            continue;
+        }
+        match rule.action {
+            ACTION_DROP => return Resolution::Drop,
+            ACTION_FORWARD => {
+                if let Some(link_id) = rule.out_link {
+                    return Resolution::Uplink(link_id);
+                }
+                if let Some(dst_uuid) = match_local_rule(&rule, &snapshot.nodes) {
+                    return Resolution::Local(dst_uuid);
+                }
+            }
+            ACTION_VPN => {
+                if let Some(link_id) = rule.out_link {
+                    return Resolution::Uplink(link_id);
+                }
+                return Resolution::None;
+            }
+            _ => {}
+        }
+    }
 
     let fib = fib.lock().await;
     let route = match fib
@@ -854,13 +1011,18 @@ fn route_matches(route: &crate::shm::RouteEntry, target: &str) -> bool {
         return false;
     }
     let pattern = &route.prefix[..prefix_len];
-    match route.match_kind {
-        MATCH_EXACT => target_bytes == pattern,
+    pattern_matches(route.match_kind, pattern, target_bytes)
+}
+
+fn pattern_matches(match_kind: u8, pattern: &[u8], text: &[u8]) -> bool {
+    let prefix_len = pattern.len();
+    match match_kind {
+        MATCH_EXACT => text == pattern,
         MATCH_PREFIX => {
-            target_bytes.starts_with(pattern)
-                && (target_bytes.len() == prefix_len || target_bytes.get(prefix_len) == Some(&b'.'))
+            text.starts_with(pattern)
+                && (text.len() == prefix_len || text.get(prefix_len) == Some(&b'.'))
         }
-        MATCH_GLOB => wildcard_match(pattern, target_bytes),
+        MATCH_GLOB => wildcard_match(pattern, text),
         _ => false,
     }
 }
@@ -903,16 +1065,22 @@ fn match_local_node(
         }
         let name_len = node.name_len as usize;
         let name = &node.name[..name_len];
-        let matches = match route.match_kind {
-            MATCH_EXACT => name == pattern,
-            MATCH_PREFIX => {
-                name.starts_with(pattern)
-                    && (name.len() == pattern.len() || name.get(pattern.len()) == Some(&b'.'))
-            }
-            MATCH_GLOB => wildcard_match(route_prefix(route), name),
-            _ => false,
-        };
+        let matches = pattern_matches(route.match_kind, pattern, name);
         if matches {
+            return Uuid::from_slice(&node.uuid).ok();
+        }
+    }
+    None
+}
+
+fn match_local_rule(rule: &ConfigRule, nodes: &[crate::shm::nodes::NodeEntry]) -> Option<Uuid> {
+    for node in nodes {
+        if !node.is_active() {
+            continue;
+        }
+        let name_len = node.name_len as usize;
+        let name = &node.name[..name_len];
+        if pattern_matches(rule.match_kind, &rule.prefix, name) {
             return Uuid::from_slice(&node.uuid).ok();
         }
     }
@@ -1197,12 +1365,45 @@ struct UplinkNode {
     router_id: Option<Uuid>,
 }
 
+struct ConfigState {
+    reader: Option<ConfigShmReader>,
+    last_local_version: u64,
+    last_global_version: u64,
+    routes: Vec<crate::shm::RouteEntry>,
+    rules: Vec<ConfigRule>,
+}
+
+impl ConfigState {
+    fn new() -> Self {
+        Self {
+            reader: None,
+            last_local_version: 0,
+            last_global_version: 0,
+            routes: Vec::new(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ConfigRule {
+    prefix: Vec<u8>,
+    match_kind: u8,
+    action: u8,
+    out_link: Option<u32>,
+    priority: u16,
+    metric: u16,
+}
+
 fn build_fib(
     local: &ShmSnapshot,
     peers: &[PeerSnapshot],
     uplink_nodes: &[UplinkNode],
+    config_routes: &[crate::shm::RouteEntry],
 ) -> Vec<crate::shm::RouteEntry> {
     let mut fib = Vec::new();
+
+    fib.extend_from_slice(config_routes);
 
     for route in &local.routes {
         if route.is_active() {
@@ -1262,9 +1463,227 @@ fn route_cmp(a: &crate::shm::RouteEntry, b: &crate::shm::RouteEntry) -> std::cmp
         .then_with(|| a.metric.cmp(&b.metric))
 }
 
+fn update_config_routes(
+    cfg: &Config,
+    state: &mut ConfigState,
+    local_router_uuid: Uuid,
+) -> Vec<crate::shm::RouteEntry> {
+    if state.reader.is_none() {
+        let name = format!("{}{}", CONFIG_SHM_PREFIX, cfg.island_id);
+        if let Ok(reader) = ConfigShmReader::open_read_only(&name) {
+            state.reader = Some(reader);
+        } else {
+            return state.routes.clone();
+        }
+    }
+
+    let Some(reader) = state.reader.as_ref() else {
+        return state.routes.clone();
+    };
+
+    let Some(snapshot) = reader.read_snapshot() else {
+        return state.routes.clone();
+    };
+
+    if config_heartbeat_stale(snapshot.header.heartbeat) {
+        warn!(
+            target: "json_router",
+            "config shm heartbeat stale"
+        );
+        return state.routes.clone();
+    }
+
+    if snapshot.header.local_version == state.last_local_version
+        && snapshot.header.global_version == state.last_global_version
+    {
+        return state.routes.clone();
+    }
+
+    let routes = build_config_routes(cfg, &snapshot, local_router_uuid);
+    let rules = build_config_rules(cfg, &snapshot);
+    state.last_local_version = snapshot.header.local_version;
+    state.last_global_version = snapshot.header.global_version;
+    state.routes = routes.clone();
+    state.rules = rules;
+    routes
+}
+
+fn build_config_routes(
+    cfg: &Config,
+    snapshot: &ConfigSnapshot,
+    local_router_uuid: Uuid,
+) -> Vec<crate::shm::RouteEntry> {
+    let mut routes = Vec::new();
+
+    for entry in &snapshot.local_routes {
+        if let Some(route) = config_entry_to_route(cfg, entry, None, local_router_uuid) {
+            routes.push(route);
+        }
+    }
+
+    for entry in &snapshot.global_routes {
+        let island = read_config_island(entry);
+        if let Some(route) =
+            config_entry_to_route(cfg, entry, island.as_deref(), local_router_uuid)
+        {
+            routes.push(route);
+        }
+    }
+
+    routes
+}
+
+fn build_config_rules(cfg: &Config, snapshot: &ConfigSnapshot) -> Vec<ConfigRule> {
+    let mut rules = Vec::new();
+
+    for entry in &snapshot.local_routes {
+        if let Some(rule) = config_entry_to_rule(cfg, entry, None) {
+            rules.push(rule);
+        }
+    }
+
+    for entry in &snapshot.global_routes {
+        let island = read_config_island(entry);
+        if let Some(rule) = config_entry_to_rule(cfg, entry, island.as_deref()) {
+            rules.push(rule);
+        }
+    }
+
+    rules.sort_by(config_rule_cmp);
+    rules
+}
+
+fn config_entry_to_route(
+    cfg: &Config,
+    entry: &crate::config_shm::ConfigRouteEntry,
+    island: Option<&str>,
+    local_router_uuid: Uuid,
+) -> Option<crate::shm::RouteEntry> {
+    if entry.flags == 0 || entry.prefix_len == 0 {
+        return None;
+    }
+
+    match entry.action {
+        ACTION_FORWARD => {}
+        ACTION_VPN => {}
+        ACTION_DROP => return None,
+        _ => return None,
+    }
+
+    let prefix_len = entry.prefix_len as usize;
+    let mut route = crate::shm::RouteEntry::default();
+    route.prefix[..prefix_len].copy_from_slice(&entry.prefix[..prefix_len]);
+    route.prefix_len = entry.prefix_len as u16;
+    route.match_kind = match entry.match_kind {
+        MATCH_PREFIX => MATCH_PREFIX,
+        MATCH_GLOB => MATCH_GLOB,
+        _ => MATCH_EXACT,
+    };
+    route.route_type = crate::shm::ROUTE_STATIC;
+    route.admin_distance = crate::shm::AD_STATIC;
+    route.metric = merge_priority_metric(entry.priority, entry.metric);
+    route.flags = crate::shm::FLAG_ACTIVE;
+    route.installed_at = now_epoch_ms();
+
+    if let Some(next_hop) = read_config_next_hop_island(entry).or(island.map(|value| value.to_string())) {
+        if let Some(link_id) = uplink_link_for_island(cfg, &next_hop) {
+            route.out_link = link_id;
+            return Some(route);
+        }
+        warn!(
+            target: "json_router",
+            island = next_hop.as_str(),
+            "no uplink for config route island"
+        );
+        return None;
+    }
+
+    route.out_link = LINK_LOCAL;
+    route.next_hop_router = *local_router_uuid.as_bytes();
+    Some(route)
+}
+
+fn config_entry_to_rule(
+    cfg: &Config,
+    entry: &crate::config_shm::ConfigRouteEntry,
+    island: Option<&str>,
+) -> Option<ConfigRule> {
+    if entry.flags == 0 || entry.prefix_len == 0 {
+        return None;
+    }
+
+    let prefix_len = entry.prefix_len as usize;
+    let mut prefix = Vec::with_capacity(prefix_len);
+    prefix.extend_from_slice(&entry.prefix[..prefix_len]);
+    let next_hop = read_config_next_hop_island(entry).or(island.map(|value| value.to_string()));
+    let out_link = next_hop
+        .as_deref()
+        .and_then(|value| uplink_link_for_island(cfg, value));
+
+    Some(ConfigRule {
+        prefix,
+        match_kind: entry.match_kind,
+        action: entry.action,
+        out_link,
+        priority: entry.priority,
+        metric: entry.metric,
+    })
+}
+
+fn config_rule_cmp(a: &ConfigRule, b: &ConfigRule) -> std::cmp::Ordering {
+    b.prefix.len()
+        .cmp(&a.prefix.len())
+        .then_with(|| a.priority.cmp(&b.priority))
+        .then_with(|| a.metric.cmp(&b.metric))
+}
+
+fn read_config_island(entry: &crate::config_shm::ConfigRouteEntry) -> Option<String> {
+    if entry.island_len == 0 {
+        return None;
+    }
+    let len = entry.island_len as usize;
+    let island = String::from_utf8_lossy(&entry.island[..len]).to_string();
+    if island.is_empty() {
+        None
+    } else {
+        Some(island)
+    }
+}
+
+fn read_config_next_hop_island(
+    entry: &crate::config_shm::ConfigRouteEntry,
+) -> Option<String> {
+    if entry.next_hop_island_len == 0 {
+        return None;
+    }
+    let len = entry.next_hop_island_len as usize;
+    let island = String::from_utf8_lossy(&entry.next_hop_island[..len]).to_string();
+    if island.is_empty() {
+        None
+    } else {
+        Some(island)
+    }
+}
+
+fn uplink_link_for_island(cfg: &Config, island: &str) -> Option<u32> {
+    cfg.uplink_peers
+        .iter()
+        .find(|peer| peer.island.as_deref() == Some(island))
+        .map(|peer| peer.link_id)
+}
+
+fn merge_priority_metric(priority: u16, metric: u16) -> u32 {
+    ((priority as u32) << 16) | metric as u32
+}
+
 fn heartbeat_stale(heartbeat: u64) -> bool {
     let now = now_epoch_ms();
     now.saturating_sub(heartbeat) > crate::shm::HEARTBEAT_STALE_MS
+}
+
+fn config_heartbeat_stale(heartbeat: u64) -> bool {
+    let now = now_epoch_ms();
+    now.saturating_sub(heartbeat) > CONFIG_HEARTBEAT_STALE_MS
 }
 
 fn now_epoch_ms() -> u64 {
@@ -1276,23 +1695,16 @@ fn now_epoch_ms() -> u64 {
 }
 
 async fn send_error(
-    nodes: &Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    nodes: &Arc<Mutex<HashMap<Uuid, mpsc::Sender<Vec<u8>>>>>,
     src_uuid: Option<Uuid>,
     trace_id: Option<String>,
-    msg: &str,
-    reason: &str,
+    error: &str,
     detail: &str,
 ) {
     let Some(src_uuid) = src_uuid else {
         return;
     };
-    let payload = build_error(
-        msg,
-        reason,
-        detail,
-        &src_uuid.to_string(),
-        trace_id.as_deref(),
-    );
+    let payload = build_error(error, detail, &src_uuid.to_string(), trace_id.as_deref());
     let data = match serde_json::to_vec(&payload) {
         Ok(data) => data,
         Err(_) => return,
@@ -1302,7 +1714,7 @@ async fn send_error(
         nodes.get(&src_uuid).cloned()
     };
     if let Some(sender) = sender {
-        let _ = sender.send(data);
+        let _ = sender.try_send(data);
     }
 }
 
@@ -1519,6 +1931,11 @@ impl FabricManager {
         self.peer_nodes = map;
     }
 
+    fn prune_missing(&mut self, active: &HashSet<Uuid>) {
+        self.links.retain(|uuid, _| active.contains(uuid));
+        self.connecting.retain(|uuid| active.contains(uuid));
+    }
+
     fn route_uuid(&self, uuid: &Uuid) -> Option<Uuid> {
         self.peer_nodes.get(uuid).copied()
     }
@@ -1553,6 +1970,12 @@ impl UplinkManager {
 
     fn register_peer_router(&mut self, link_id: u32, router_id: Uuid) {
         self.peer_router_ids.insert(link_id, router_id);
+    }
+
+    fn remove_link(&mut self, link_id: u32) {
+        self.links.remove(&link_id);
+        self.peer_nodes.remove(&link_id);
+        self.peer_router_ids.remove(&link_id);
     }
 
     fn send_on_link(&mut self, link_id: u32, payload: Vec<u8>) -> Result<(), ()> {
@@ -1619,8 +2042,9 @@ async fn fabric_listen_loop(
     socket_path: PathBuf,
     shm: Arc<Mutex<ShmWriter>>,
     fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
-    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::Sender<Vec<u8>>>>>,
     snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
+    config_state: Arc<Mutex<ConfigState>>,
     uplinks: Arc<Mutex<UplinkManager>>,
     fabric: Arc<Mutex<FabricManager>>,
     broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
@@ -1641,6 +2065,7 @@ async fn fabric_listen_loop(
         let uplinks = Arc::clone(&uplinks);
         let fabric = Arc::clone(&fabric);
         let broadcast_cache = Arc::clone(&broadcast_cache);
+        let config_state = Arc::clone(&config_state);
         tokio::spawn(async move {
             if let Err(err) = handle_fabric_connection(
                 stream,
@@ -1649,6 +2074,7 @@ async fn fabric_listen_loop(
                 fib,
                 nodes,
                 snapshot_cache,
+                config_state,
                 uplinks,
                 fabric,
                 broadcast_cache,
@@ -1666,8 +2092,9 @@ async fn fabric_connect_loop(
     socket_path: PathBuf,
     shm: Arc<Mutex<ShmWriter>>,
     fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
-    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::Sender<Vec<u8>>>>>,
     snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
+    config_state: Arc<Mutex<ConfigState>>,
     uplinks: Arc<Mutex<UplinkManager>>,
     fabric: Arc<Mutex<FabricManager>>,
     broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
@@ -1683,6 +2110,7 @@ async fn fabric_connect_loop(
             fib,
             nodes,
             snapshot_cache,
+            config_state,
             uplinks,
             Arc::clone(&fabric),
             broadcast_cache,
@@ -1712,8 +2140,9 @@ async fn handle_fabric_connection(
     role: FabricRole,
     shm: Arc<Mutex<ShmWriter>>,
     fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
-    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::Sender<Vec<u8>>>>>,
     snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
+    config_state: Arc<Mutex<ConfigState>>,
     uplinks: Arc<Mutex<UplinkManager>>,
     fabric: Arc<Mutex<FabricManager>>,
     broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
@@ -1786,6 +2215,7 @@ async fn handle_fabric_connection(
                     &fib,
                     &nodes,
                     &snapshot_cache,
+                    &config_state,
                     &uplinks,
                     &fabric,
                     &broadcast_cache,
@@ -1806,8 +2236,9 @@ async fn uplink_listen_loop(
     addr: String,
     shm: Arc<Mutex<ShmWriter>>,
     fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
-    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::Sender<Vec<u8>>>>>,
     snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
+    config_state: Arc<Mutex<ConfigState>>,
     uplinks: Arc<Mutex<UplinkManager>>,
     broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
     fabric: Arc<Mutex<FabricManager>>,
@@ -1823,6 +2254,7 @@ async fn uplink_listen_loop(
         let fib = Arc::clone(&fib);
         let nodes = Arc::clone(&nodes);
         let snapshot_cache = Arc::clone(&snapshot_cache);
+        let config_state = Arc::clone(&config_state);
         let uplinks = Arc::clone(&uplinks);
         let broadcast_cache = Arc::clone(&broadcast_cache);
         let fabric = Arc::clone(&fabric);
@@ -1839,6 +2271,7 @@ async fn uplink_listen_loop(
                 fib,
                 nodes,
                 snapshot_cache,
+                config_state,
                 uplinks,
                 broadcast_cache,
                 fabric,
@@ -1858,8 +2291,9 @@ async fn uplink_connect_loop(
     peers: Vec<crate::config::UplinkPeerConfig>,
     shm: Arc<Mutex<ShmWriter>>,
     fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
-    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::Sender<Vec<u8>>>>>,
     snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
+    config_state: Arc<Mutex<ConfigState>>,
     uplinks: Arc<Mutex<UplinkManager>>,
     broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
     fabric: Arc<Mutex<FabricManager>>,
@@ -1872,6 +2306,7 @@ async fn uplink_connect_loop(
         let fib = Arc::clone(&fib);
         let nodes = Arc::clone(&nodes);
         let snapshot_cache = Arc::clone(&snapshot_cache);
+        let config_state = Arc::clone(&config_state);
         let uplinks = Arc::clone(&uplinks);
         let broadcast_cache = Arc::clone(&broadcast_cache);
         let fabric = Arc::clone(&fabric);
@@ -1888,6 +2323,7 @@ async fn uplink_connect_loop(
                             Arc::clone(&fib),
                             Arc::clone(&nodes),
                             Arc::clone(&snapshot_cache),
+                            Arc::clone(&config_state),
                             Arc::clone(&uplinks),
                             Arc::clone(&broadcast_cache),
                             Arc::clone(&fabric),
@@ -1924,8 +2360,9 @@ async fn handle_uplink_connection(
     link_id: u32,
     shm: Arc<Mutex<ShmWriter>>,
     fib: Arc<Mutex<Vec<crate::shm::RouteEntry>>>,
-    nodes: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>,
+    nodes: Arc<Mutex<HashMap<Uuid, mpsc::Sender<Vec<u8>>>>>,
     snapshot_cache: Arc<Mutex<Option<ShmSnapshot>>>,
+    config_state: Arc<Mutex<ConfigState>>,
     uplinks: Arc<Mutex<UplinkManager>>,
     broadcast_cache: Arc<Mutex<HashMap<Uuid, Instant>>>,
     fabric: Arc<Mutex<FabricManager>>,
@@ -2075,6 +2512,7 @@ async fn handle_uplink_connection(
                             &fib,
                             &nodes,
                             &snapshot_cache,
+                            &config_state,
                             &uplinks,
                             &fabric,
                             &broadcast_cache,
@@ -2088,6 +2526,11 @@ async fn handle_uplink_connection(
         }
     }
 
+    {
+        let mut uplinks = uplinks.lock().await;
+        uplinks.remove_link(link_id);
+    }
+    send_lsa(&shm, &uplinks).await;
     Ok(())
 }
 

@@ -1236,11 +1236,67 @@ Política de versiones:
 - Si version > soportada → ANNOUNCE con error VERSION_UNSUPPORTED
 ```
 
-### 15. API de la Librería
+### 15. Lenguajes y Bindings
 
-#### 15.1 Configuración
+#### 15.1 Convención: Nodos SY en Rust (obligatorio)
+
+**Todos los nodos SY DEBEN implementarse en Rust.** Esta es una convención del sistema, no una sugerencia.
+
+| Tipo de nodo | Lenguaje | Binding |
+|--------------|----------|---------|
+| SY.* (system) | **Rust (obligatorio)** | `json_router::node_client` |
+| AI.* (agentes) | Rust o Node.js | `json_router` o `json-router-node` |
+| WF.* (workflows) | Rust o Node.js | `json_router` o `json-router-node` |
+| IO.* (integraciones) | Rust o Node.js | `json_router` o `json-router-node` |
+
+**Razones:**
+- Los nodos SY son infraestructura crítica
+- Comparten crate con el router (consistencia garantizada)
+- Sin overhead de FFI o serialización entre lenguajes
+- Un solo binario por nodo SY
+
+#### 15.2 Arquitectura del Crate
+
+El módulo `node_client` es parte del crate `json_router`, no una librería separada:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    json_router (crate)                       │
+│                                                              │
+│  ┌────────────────┐  ┌────────────────┐  ┌──────────────┐  │
+│  │     Router     │  │   node_client  │  │   protocol   │  │
+│  │   (bin/main)   │  │    (módulo)    │  │   (módulo)   │  │
+│  │                │  │                │  │              │  │
+│  │  - routing     │  │  - NodeClient  │  │  - Message   │  │
+│  │  - shm         │  │  - NodeConfig  │  │  - Routing   │  │
+│  │  - wan         │  │  - NodeError   │  │  - Meta      │  │
+│  └────────────────┘  └────────────────┘  └──────────────┘  │
+│                              │                              │
+└──────────────────────────────┼──────────────────────────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                │
+              ▼                ▼                ▼
+        SY.admin        SY.config.routes   SY.orchestrator
+        (binario)          (binario)          (binario)
+```
+
+**Los nodos SY importan del mismo crate que el router:**
 
 ```rust
+// Cargo.toml de sy_config_routes
+[dependencies]
+json_router = { path = "../json_router" }
+```
+
+#### 15.3 API Rust (nodos SY)
+
+**Configuración:**
+
+```rust
+use json_router::node_client::{NodeClient, NodeConfig, NodeError};
+use json_router::protocol::{Message, Meta, Routing};
+
 pub struct NodeConfig {
     /// Nombre L2 del nodo (ej: "SY.config.routes.produccion")
     pub name: String,
@@ -1256,37 +1312,106 @@ pub struct NodeConfig {
 }
 ```
 
-#### 15.2 Rust (nodos SY)
+**Ejemplo completo de nodo SY:**
 
 ```rust
-use json_router::node_client::{NodeClient, NodeConfig};
+use json_router::node_client::{NodeClient, NodeConfig, NodeError};
 use json_router::protocol::{Message, Meta, Routing};
+use std::path::PathBuf;
+use std::time::Duration;
 
-// Configuración
-let config = NodeConfig {
-    name: format!("SY.config.routes.{}", island_id),
-    island_id: island_id.clone(),
-    router_socket: "/var/run/json-router/router.sock".into(),
-    uuid_persistence_dir: "/var/lib/json-router/nodes/".into(),
-};
-
-// Conectar (UUID y HELLO automáticos)
-let client = NodeClient::connect(config).await?;
-
-// Enviar mensaje
-client.send(message).await?;
-
-// Recibir mensaje (bloquea hasta recibir)
-let msg = client.recv().await?;
-
-// Recibir con timeout
-let msg = client.recv_timeout(Duration::from_secs(30)).await?;
-
-// UUID disponible
-println!("Mi UUID: {}", client.uuid());
+#[tokio::main]
+async fn main() -> Result<(), NodeError> {
+    let island_id = std::env::var("ISLAND_ID").unwrap_or("sandbox".into());
+    
+    // Configuración
+    let config = NodeConfig {
+        name: format!("SY.config.routes.{}", island_id),
+        island_id: island_id.clone(),
+        router_socket: PathBuf::from("/var/run/json-router/router.sock"),
+        uuid_persistence_dir: PathBuf::from("/var/lib/json-router/nodes/"),
+    };
+    
+    // Conectar (UUID y HELLO automáticos)
+    let client = NodeClient::connect(config).await?;
+    
+    println!("Conectado como {} (UUID: {})", client.name(), client.uuid());
+    
+    // Loop principal
+    loop {
+        // Recibir mensaje (bloquea)
+        let msg = client.recv().await?;
+        
+        // Procesar según tipo
+        match msg.meta.msg.as_deref() {
+            Some("add_route") => {
+                // Lógica de negocio...
+                let response = Message {
+                    routing: Routing {
+                        src: Some(client.uuid().to_string()),
+                        dst: msg.routing.src,
+                        ttl: 16,
+                        trace_id: msg.routing.trace_id,
+                    },
+                    meta: Meta {
+                        msg_type: "system".into(),
+                        msg: Some("add_route_response".into()),
+                        ..Default::default()
+                    },
+                    payload: serde_json::json!({ "status": "ok" }),
+                };
+                client.send(response).await?;
+            }
+            _ => {
+                // Mensaje desconocido
+            }
+        }
+    }
+}
 ```
 
-#### 15.3 Node.js (nodos AI, WF, IO)
+**Métodos de NodeClient:**
+
+```rust
+impl NodeClient {
+    /// Conectar al router (genera/carga UUID, envía HELLO)
+    pub async fn connect(config: NodeConfig) -> Result<Self, NodeError>;
+    
+    /// UUID del nodo
+    pub fn uuid(&self) -> &str;
+    
+    /// Nombre L2 del nodo
+    pub fn name(&self) -> &str;
+    
+    /// Enviar mensaje (con reconexión automática)
+    pub async fn send(&self, msg: Message) -> Result<(), NodeError>;
+    
+    /// Recibir mensaje (bloquea indefinidamente)
+    pub async fn recv(&self) -> Result<Message, NodeError>;
+    
+    /// Recibir con timeout
+    pub async fn recv_timeout(&self, timeout: Duration) -> Result<Message, NodeError>;
+    
+    /// Cerrar conexión limpiamente (envía WITHDRAW)
+    pub async fn close(&self) -> Result<(), NodeError>;
+}
+```
+
+#### 15.4 API Node.js (nodos AI, WF, IO)
+
+Para nodos que no son SY, existe un binding Node.js como paquete npm separado:
+
+```
+┌─────────────────────────────────────┐
+│      json-router-node (npm)         │
+│                                     │
+│  - Port de node_client a JS         │
+│  - Misma API, mismo protocolo       │
+│  - Para nodos AI, WF, IO            │
+└─────────────────────────────────────┘
+```
+
+**Ejemplo:**
 
 ```javascript
 const { NodeClient } = require('json-router-node');
@@ -1300,12 +1425,26 @@ const config = {
 
 const client = await NodeClient.connect(config);
 
-await client.send(message);
-const msg = await client.recv();
-const msgWithTimeout = await client.recv({ timeout: 30000 });
+console.log(`Conectado como ${client.name} (UUID: ${client.uuid})`);
 
-console.log('Mi UUID:', client.uuid);
+// Enviar
+await client.send({
+    routing: { dst: 'WF.tickets.crear', ttl: 16 },
+    meta: { type: 'user' },
+    payload: { texto: 'crear ticket' }
+});
+
+// Recibir
+const msg = await client.recv();
+
+// Recibir con timeout
+const msg = await client.recv({ timeout: 30000 });
+
+// Cerrar
+await client.close();
 ```
+
+**Nota:** El paquete `json-router-node` no existe aún. Se implementará cuando haya nodos AI/WF/IO. Los nodos SY usan Rust exclusivamente.
 
 ### 16. Parámetros y Límites
 
@@ -1436,38 +1575,57 @@ impl NodeClient {
 - `recv()` recibe EOF → reconecta
 - No hay heartbeat activo desde la librería
 
-### 19. Módulos Expuestos
+### 19. Módulos Expuestos del Crate
 
-La librería del router expone módulos públicos:
+El crate `json_router` expone estos módulos públicos para uso de nodos SY:
 
 ```rust
 // json_router/lib.rs
 
-/// Estructuras de protocolo
-pub mod protocol {
-    pub use crate::protocol::{Message, Routing, Meta, Destination};
-}
+/// Estructuras de protocolo (Message, Routing, Meta)
+pub mod protocol;
 
-/// Framing de mensajes
-pub mod framing {
-    pub use crate::socket::{read_frame, write_frame};
-}
+/// Framing de mensajes (read_frame, write_frame)
+pub mod framing;
 
-/// Cliente de nodo
-pub mod node_client {
-    pub use crate::node::{NodeClient, NodeConfig, NodeError};
-}
+/// Cliente de nodo (NodeClient, NodeConfig, NodeError)
+pub mod node_client;
+```
+
+**Uso típico en un nodo SY:**
+
+```rust
+// Cargo.toml
+[package]
+name = "sy_config_routes"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+json_router = { path = "../json_router" }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+```
+
+```rust
+// main.rs
+use json_router::node_client::{NodeClient, NodeConfig, NodeError};
+use json_router::protocol::{Message, Meta, Routing};
 ```
 
 ### 20. Resumen de Responsabilidades
 
 | Componente | Responsabilidad |
 |------------|-----------------|
-| **Librería** | UUID (generar, persistir), conexión, HELLO/ANNOUNCE, framing, reconexión, errores |
-| **Nodo** | Configurar nombre/isla, lógica de negocio |
+| **Crate json_router** | Router + node_client + protocol (todo en uno) |
+| **node_client** | UUID, conexión, HELLO/ANNOUNCE, framing, reconexión, errores |
+| **Nodo SY** | Configurar nombre/isla, lógica de negocio |
 | **Router** | Aceptar HELLO, registrar, rutear, responder ANNOUNCE |
 
-**Regla de oro:** Si un nodo necesita tocar sockets, framing, o UUIDs directamente, algo está mal. Todo debe pasar por la librería.
+**Reglas:**
+1. Nodos SY **DEBEN** ser Rust
+2. Nodos SY **DEBEN** usar `json_router::node_client`
+3. Si un nodo toca sockets, framing, o UUIDs directamente → refactorizar
 
 ---
 

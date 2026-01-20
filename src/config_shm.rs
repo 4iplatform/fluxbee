@@ -3,8 +3,9 @@ use std::io;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use memmap2::{MmapMut, MmapOptions};
+use memmap2::{Mmap, MmapMut, MmapOptions};
 use nix::fcntl::OFlag;
+use nix::sys::stat::fstat;
 use nix::sys::stat::Mode;
 
 use crate::shm::SHM_NAME_MAX_LEN;
@@ -12,9 +13,15 @@ use crate::shm::SHM_NAME_MAX_LEN;
 const CONFIG_MAGIC: u32 = 0x4A534352; // "JSCR"
 const CONFIG_VERSION: u32 = 1;
 const ISLAND_MAX_LEN: usize = 32;
+const NEXT_HOP_MAX_LEN: usize = 64;
 const PREFIX_MAX_LEN: usize = 64;
 const MAX_LOCAL_ROUTES: usize = 256;
 const MAX_GLOBAL_ROUTES: usize = 512;
+pub const CONFIG_HEARTBEAT_STALE_MS: u64 = 30_000;
+
+pub const ACTION_FORWARD: u8 = 0;
+pub const ACTION_DROP: u8 = 1;
+pub const ACTION_VPN: u8 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigShmError {
@@ -53,10 +60,15 @@ pub struct ConfigRouteEntry {
     pub prefix: [u8; PREFIX_MAX_LEN],
     pub match_kind: u8,
     pub action: u8,
+    pub next_hop_island_len: u8,
+    pub _pad1: u8,
+    pub next_hop_island: [u8; NEXT_HOP_MAX_LEN],
+    pub vpn_id: u32,
     pub metric: u16,
     pub priority: u16,
     pub flags: u16,
     pub island_len: u8,
+    pub _pad2: u8,
     pub island: [u8; ISLAND_MAX_LEN],
     pub version: u64,
 }
@@ -74,6 +86,8 @@ pub struct LocalRoute {
     pub prefix: String,
     pub match_kind: u8,
     pub action: u8,
+    pub next_hop_island: Option<String>,
+    pub vpn_id: Option<u32>,
     pub metric: u16,
     pub priority: u16,
 }
@@ -93,6 +107,19 @@ pub struct ConfigShmWriter {
     name: String,
     mmap: MmapMut,
     layout: ConfigLayout,
+}
+
+pub struct ConfigShmReader {
+    name: String,
+    mmap: Mmap,
+    layout: ConfigLayout,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigSnapshot {
+    pub header: ConfigHeader,
+    pub local_routes: Vec<ConfigRouteEntry>,
+    pub global_routes: Vec<ConfigRouteEntry>,
 }
 
 impl ConfigShmWriter {
@@ -211,6 +238,68 @@ impl ConfigShmWriter {
     }
 }
 
+impl ConfigShmReader {
+    pub fn open_read_only(name: &str) -> Result<Self, ConfigShmError> {
+        if name.len() > SHM_NAME_MAX_LEN {
+            return Err(ConfigShmError::NameTooLong);
+        }
+        let layout = layout_for();
+        let fd = shm_open_with_flags(name, OFlag::O_RDONLY)?;
+        let stat = fstat(&fd)?;
+        if stat.st_size < layout.total_len as i64 {
+            return Err(ConfigShmError::InvalidHeader);
+        }
+        let mmap = unsafe { MmapOptions::new().len(layout.total_len).map(fd.as_raw_fd())? };
+        let header = unsafe {
+            &*(mmap.as_ptr().add(layout.header_offset) as *const ConfigHeader)
+        };
+        if header.magic != CONFIG_MAGIC || header.version != CONFIG_VERSION {
+            return Err(ConfigShmError::InvalidHeader);
+        }
+        Ok(Self {
+            name: name.to_string(),
+            mmap,
+            layout,
+        })
+    }
+
+    pub fn read_snapshot(&self) -> Option<ConfigSnapshot> {
+        loop {
+            let header = self.header();
+            let local_count = header.local_route_count as usize;
+            let global_count = header.global_route_count as usize;
+            let local = self.local_slice().get(..local_count)?.to_vec();
+            let global = self.global_slice().get(..global_count)?.to_vec();
+            let header_after = self.header();
+            if header.local_version == header_after.local_version
+                && header.global_version == header_after.global_version
+                && header.local_route_count == header_after.local_route_count
+                && header.global_route_count == header_after.global_route_count
+            {
+                return Some(ConfigSnapshot {
+                    header: *header_after,
+                    local_routes: local,
+                    global_routes: global,
+                });
+            }
+        }
+    }
+
+    fn header(&self) -> &ConfigHeader {
+        unsafe { &*(self.mmap.as_ptr().add(self.layout.header_offset) as *const ConfigHeader) }
+    }
+
+    fn local_slice(&self) -> &[ConfigRouteEntry] {
+        let ptr = unsafe { self.mmap.as_ptr().add(self.layout.local_offset) };
+        unsafe { std::slice::from_raw_parts(ptr as *const ConfigRouteEntry, MAX_LOCAL_ROUTES) }
+    }
+
+    fn global_slice(&self) -> &[ConfigRouteEntry] {
+        let ptr = unsafe { self.mmap.as_ptr().add(self.layout.global_offset) };
+        unsafe { std::slice::from_raw_parts(ptr as *const ConfigRouteEntry, MAX_GLOBAL_ROUTES) }
+    }
+}
+
 fn layout_for() -> ConfigLayout {
     let header_offset = 0usize;
     let local_offset = align_up(header_offset + size_of::<ConfigHeader>(), 8);
@@ -294,6 +383,13 @@ fn build_route(route: &LocalRoute, island: Option<&str>) -> ConfigRouteEntry {
     entry.prefix[..len].copy_from_slice(&prefix_bytes[..len]);
     entry.match_kind = route.match_kind;
     entry.action = route.action;
+    if let Some(next_hop) = route.next_hop_island.as_ref() {
+        let bytes = next_hop.as_bytes();
+        let next_len = bytes.len().min(NEXT_HOP_MAX_LEN);
+        entry.next_hop_island_len = next_len as u8;
+        entry.next_hop_island[..next_len].copy_from_slice(&bytes[..next_len]);
+    }
+    entry.vpn_id = route.vpn_id.unwrap_or(0);
     entry.metric = route.metric;
     entry.priority = route.priority;
     entry.flags = 1;
@@ -312,10 +408,15 @@ fn empty_route() -> ConfigRouteEntry {
         prefix: [0u8; PREFIX_MAX_LEN],
         match_kind: 0,
         action: 0,
+        next_hop_island_len: 0,
+        _pad1: 0,
+        next_hop_island: [0u8; NEXT_HOP_MAX_LEN],
+        vpn_id: 0,
         metric: 0,
         priority: 0,
         flags: 0,
         island_len: 0,
+        _pad2: 0,
         island: [0u8; ISLAND_MAX_LEN],
         version: 0,
     }

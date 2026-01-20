@@ -389,6 +389,8 @@ fn routes_to_shm(routes: &[RouteConfig]) -> Vec<LocalRoute> {
                 "VPN" => 2,
                 _ => 0,
             },
+            next_hop_island: route.next_hop_island.clone(),
+            vpn_id: route.vpn_id,
             metric: route.metric.unwrap_or(1),
             priority: route.priority.unwrap_or(100),
         })

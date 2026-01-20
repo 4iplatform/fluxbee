@@ -3,6 +3,8 @@ use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 
+const MAX_FRAME_SIZE: usize = 64 * 1024;
+
 pub async fn read_frame<R>(stream: &mut R) -> io::Result<Option<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
@@ -21,6 +23,9 @@ where
     }
 
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+    }
     let mut buf = vec![0u8; len];
     let mut read = 0usize;
     while read < buf.len() {
@@ -37,6 +42,9 @@ pub async fn write_frame<W>(stream: &mut W, payload: &[u8]) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    if payload.len() > MAX_FRAME_SIZE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+    }
     let len = payload.len() as u32;
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(payload).await?;

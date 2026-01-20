@@ -26,6 +26,29 @@ pub struct AnnouncePayload {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct NodeHelloPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NodeAnnouncePayload {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct WithdrawPayload {
     pub uuid: String,
 }
@@ -134,8 +157,11 @@ pub const SYSTEM_KIND: &str = "system";
 pub const MSG_QUERY: &str = "QUERY";
 pub const MSG_ANNOUNCE: &str = "ANNOUNCE";
 pub const MSG_WITHDRAW: &str = "WITHDRAW";
+pub const MSG_ERROR: &str = "ERROR";
 pub const MSG_UNREACHABLE: &str = "UNREACHABLE";
 pub const MSG_TTL_EXCEEDED: &str = "TTL_EXCEEDED";
+pub const MSG_NO_ROUTE: &str = "NO_ROUTE";
+pub const MSG_QUEUE_FULL: &str = "QUEUE_FULL";
 pub const MSG_HELLO: &str = "HELLO";
 pub const MSG_LSA: &str = "LSA";
 pub const MSG_UPLINK_ACCEPT: &str = "UPLINK_ACCEPT";
@@ -153,6 +179,42 @@ pub fn build_query() -> Message<QueryPayload> {
             target: None,
         },
         payload: QueryPayload::default(),
+    }
+}
+
+pub fn build_node_announce_registered(uuid: &str, name: &str) -> Message<NodeAnnouncePayload> {
+    Message {
+        routing: Value::Null,
+        meta: Meta {
+            kind: SYSTEM_KIND.to_string(),
+            msg: MSG_ANNOUNCE.to_string(),
+            target: None,
+        },
+        payload: NodeAnnouncePayload {
+            status: "registered".to_string(),
+            uuid: Some(uuid.to_string()),
+            name: Some(name.to_string()),
+            error: None,
+            detail: None,
+        },
+    }
+}
+
+pub fn build_node_announce_error(code: &str, detail: &str) -> Message<NodeAnnouncePayload> {
+    Message {
+        routing: Value::Null,
+        meta: Meta {
+            kind: SYSTEM_KIND.to_string(),
+            msg: MSG_ANNOUNCE.to_string(),
+            target: None,
+        },
+        payload: NodeAnnouncePayload {
+            status: "error".to_string(),
+            uuid: None,
+            name: None,
+            error: Some(code.to_string()),
+            detail: Some(detail.to_string()),
+        },
     }
 }
 
@@ -308,20 +370,23 @@ pub fn build_uplink_reject(
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorPayload {
-    pub reason: String,
+    pub error: String,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_trace_id: Option<String>,
 }
 
 pub fn build_error(
-    msg: &str,
-    reason: &str,
+    error: &str,
     detail: &str,
     src: &str,
     trace_id: Option<&str>,
 ) -> Message<ErrorPayload> {
-    let trace_id = trace_id
+    let original_trace_id = trace_id
         .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
+        .map(|value| value.to_string());
+    let trace_id = original_trace_id
+        .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let routing = serde_json::json!({
         "src": null,
@@ -333,12 +398,13 @@ pub fn build_error(
         routing,
         meta: Meta {
             kind: SYSTEM_KIND.to_string(),
-            msg: msg.to_string(),
+            msg: MSG_ERROR.to_string(),
             target: None,
         },
         payload: ErrorPayload {
-            reason: reason.to_string(),
+            error: error.to_string(),
             detail: detail.to_string(),
+            original_trace_id,
         },
     }
 }

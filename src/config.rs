@@ -52,6 +52,7 @@ pub struct Config {
 pub struct UplinkPeerConfig {
     pub link_id: u32,
     pub addr: String,
+    pub island: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -226,6 +227,7 @@ impl Config {
             .map(|(idx, uplink)| UplinkPeerConfig {
                 link_id: (idx + 1) as u32,
                 addr: uplink.address.clone(),
+                island: uplink.island.clone(),
             })
             .collect();
         let static_routes = router_config
