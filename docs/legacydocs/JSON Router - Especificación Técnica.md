@@ -1,7 +1,7 @@
 # JSON Router - Especificación Técnica
 
-**Estado:** Draft v1.11
-**Fecha:** 2025-01-19
+**Estado:** Draft v1.12
+**Fecha:** 2025-01-20
 
 ---
 
@@ -1528,6 +1528,8 @@ Cuando el router no puede entregar un mensaje, responde con error:
 | `TTL_EXCEEDED` | TTL llegó a 0 |
 | `NO_ROUTE` | Destino no encontrado en tabla |
 | `QUEUE_FULL` | Cola del destino llena |
+| `VPN_NOT_FOUND` | VPN ID referenciado no existe |
+| `NO_ROUTE_TO_ISLAND` | No hay uplink hacia la isla destino de VPN |
 
 La librería expone estos como `NodeError::RouterError { code, detail }`.
 
@@ -2362,13 +2364,161 @@ Cuando el router necesita encontrar destino para un mensaje:
    b. admin_distance ascendente (menor = preferido)
    c. metric ascendente (menor costo)
 4. Tomar la primera (ganadora)
-5. Si out_link == LINK_LOCAL:
+5. Según action de la ruta:
+   - ACTION_FORWARD (0): continuar a paso 6
+   - ACTION_DROP (1): descartar mensaje, fin
+   - ACTION_VPN (2): resolver VPN (ver 13.16.1)
+6. Si out_link == LINK_LOCAL:
    → Nodo conectado a MI socket, entregar directamente
-6. Si out_link > 0:
+7. Si out_link > 0:
    → Enviar por ese uplink al next_hop_router
 ```
 
-#### 13.17 Operaciones de Escritura (solo el router dueño)
+#### 13.16.1 Resolución de VPN
+
+Cuando una ruta tiene `action == ACTION_VPN`, el router debe resolver el túnel VPN para determinar el uplink de salida:
+
+```
+Entrada: RouteEntry con action = ACTION_VPN, vpn_id = X
+
+1. Buscar VPNEntry en config SHM donde vpn_id == X
+2. Si no existe VPNEntry:
+   → Responder UNREACHABLE al origen
+   → Log error: "VPN not found: vpn_id=X"
+   → Fin
+
+3. Leer remote_island de VPNEntry
+4. Buscar uplink activo hacia remote_island:
+   - Escanear uplinks WAN conectados
+   - Buscar uno cuyo peer.island_id == remote_island
+
+5. Si no hay uplink directo hacia remote_island:
+   → Buscar ruta transitiva via routing inter-isla (ver 19.14)
+   → Si no hay ruta transitiva: UNREACHABLE
+
+6. Enviar mensaje por el uplink encontrado
+```
+
+**Diagrama de resolución:**
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│ RouteEntry  │     │  VPNEntry   │     │   Uplinks   │
+│             │     │             │     │             │
+│ vpn_id: 5 ──┼────►│ vpn_id: 5   │     │ link_1: B   │
+│             │     │ remote: "B" ├────►│ link_2: C   │
+└─────────────┘     └─────────────┘     └─────────────┘
+                                              │
+                                              ▼
+                                        Enviar por link_1
+```
+
+#### 13.16.1.1 Mapeo island_id → uplink
+
+El router mantiene una tabla de uplinks activos con su `island_id` asociado:
+
+```rust
+struct UplinkEntry {
+    link_id: u32,                    // ID interno del link
+    peer_router_uuid: [u8; 16],      // UUID del router peer
+    peer_island_id: String,          // Island del peer (de HELLO WAN)
+    socket: TcpStream,               // Conexión activa
+    state: UplinkState,              // CONNECTING, CONNECTED, DEAD
+}
+```
+
+**El `peer_island_id` se obtiene del HELLO WAN:**
+
+```
+1. Router A conecta a Router B por uplink WAN
+2. B envía HELLO con island_id = "staging"
+3. A guarda: uplinks[link_id] = { peer_island_id: "staging", ... }
+4. Cuando A necesita enviar a isla "staging", busca en uplinks
+```
+
+**Pseudocódigo de búsqueda:**
+
+```rust
+fn find_uplink_to_island(&self, island_id: &str) -> Option<&UplinkEntry> {
+    self.uplinks
+        .iter()
+        .find(|u| u.peer_island_id == island_id && u.state == UplinkState::CONNECTED)
+}
+```
+
+**Pseudocódigo completo de resolve_vpn:**
+
+```rust
+fn resolve_vpn(route: &RouteEntry, config_shm: &ConfigRegion) -> Result<LinkId, RouterError> {
+    // 1. Buscar VPN por ID
+    let vpn = config_shm.vpns
+        .iter()
+        .find(|v| v.vpn_id == route.vpn_id && v.flags & FLAG_ACTIVE != 0)
+        .ok_or(RouterError::VpnNotFound(route.vpn_id))?;
+    
+    // 2. Obtener isla destino
+    let remote_island = vpn.remote_island_as_str();
+    
+    // 3. Buscar uplink hacia esa isla
+    let uplink = self.find_uplink_to_island(remote_island)
+        .ok_or(RouterError::NoRouteToIsland(remote_island.to_string()))?;
+    
+    Ok(uplink.link_id)
+}
+```
+
+**Tabla de resolución de acciones:**
+
+| action | Valor | Resolución |
+|--------|-------|------------|
+| ACTION_FORWARD | 0 | Usar `out_link` directamente de RouteEntry |
+| ACTION_DROP | 1 | Descartar mensaje silenciosamente |
+| ACTION_VPN | 2 | `vpn_id` → `VPNEntry.remote_island` → uplink por island |
+
+#### 13.16.2 Forwarding Completo
+
+Flujo completo de forwarding de un mensaje:
+
+```
+Mensaje entrante con dst = "AI.soporte.l1"
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 1. Buscar ruta en FIB (LPM)             │
+│    Resultado: RouteEntry                │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 2. Evaluar action                       │
+│    - FORWARD → paso 3                   │
+│    - DROP → descartar, fin              │
+│    - VPN → resolver VPN, luego paso 3   │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 3. Determinar link de salida            │
+│    - out_link == 0 → entrega local      │
+│    - out_link > 0 → uplink WAN          │
+│    - VPN resuelto → uplink de VPN       │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 4. Decrementar TTL                      │
+│    - TTL == 0 → TTL_EXCEEDED, fin       │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 5. Enviar por link determinado          │
+│    - Local: write al socket del nodo    │
+│    - WAN: write al socket TCP del uplink│
+└─────────────────────────────────────────┘
+```
+
+#### 13.19 Operaciones de Escritura (solo el router dueño)
 
 **Registrar nodo (cuando conecta):**
 ```
@@ -2401,7 +2551,7 @@ Cuando el router necesita encontrar destino para un mensaje:
 3. seqlock_end_write()
 ```
 
-#### 13.18 Cleanup de Slots FLAG_DELETED
+#### 13.20 Cleanup de Slots FLAG_DELETED
 
 **Política:** No compactar en tiempo real. Reusar slots.
 
@@ -3692,15 +3842,15 @@ Nueva región de shared memory dedicada a configuración global.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     ConfigHeader (128 bytes)                │
+│                     ConfigHeader (192 bytes)                │
 ├─────────────────────────────────────────────────────────────┤
 │                 StaticRouteEntry[MAX_STATIC_ROUTES]         │
-│                       (304 * 256 = 77,824 bytes)            │
+│                       (360 * 256 = 92,160 bytes)            │
 ├─────────────────────────────────────────────────────────────┤
 │                     VPNEntry[MAX_VPNS]                      │
 │                       (256 * 64 = 16,384 bytes)             │
 └─────────────────────────────────────────────────────────────┘
-Total: ~94 KB
+Total: ~106 KB
 ```
 
 ##### ConfigHeader
@@ -3708,7 +3858,7 @@ Total: ~94 KB
 ```rust
 #[repr(C)]
 pub struct ConfigHeader {
-    // === IDENTIFICACIÓN (32 bytes) ===
+    // === IDENTIFICACIÓN (80 bytes) ===
     pub magic: u32,                   // CONFIG_MAGIC = 0x4A534343 ("JSCC")
     pub version: u32,                 // Versión del formato
     pub island_id: [u8; 64],          // ID de la isla
@@ -3718,7 +3868,7 @@ pub struct ConfigHeader {
     // === OWNERSHIP (40 bytes) ===
     pub owner_pid: u64,               // PID del SY.config.routes
     pub owner_start_time: u64,        // Para detectar PID reuse
-    pub owner_uuid: [u8; 16],         // UUID del nodo SY.config.routes
+    pub owner_uuid: [u8; 16],         // UUID del nodo SY.config.routes (binario)
     pub heartbeat: u64,               // Epoch ms, actualizado periódicamente
     
     // === SEQLOCK (8 bytes) ===
@@ -3733,15 +3883,13 @@ pub struct ConfigHeader {
     pub created_at: u64,              // Epoch ms de creación
     pub updated_at: u64,              // Epoch ms de última modificación
     
-    // === RESERVED (16 bytes) ===
-    pub _reserved: [u8; 16],
+    // === RESERVED (32 bytes para alinear a 192) ===
+    pub _reserved: [u8; 32],
 }
-// Total: 128 bytes
+// Total: 192 bytes
 ```
 
 ##### StaticRouteEntry
-
-Igual que `RouteEntry` de la sección 13.11, pero solo para rutas estáticas globales:
 
 ```rust
 #[repr(C)]
@@ -3752,7 +3900,7 @@ pub struct StaticRouteEntry {
     pub match_kind: u8,               // MATCH_EXACT, MATCH_PREFIX, MATCH_GLOB
     pub _pad1: u8,
     
-    // === FORWARDING (24 bytes) ===
+    // === FORWARDING (76 bytes) ===
     pub next_hop_island: [u8; 64],    // Island destino (para VPN/WAN)
     pub next_hop_island_len: u16,
     pub action: u8,                   // ACTION_FORWARD, ACTION_DROP, ACTION_VPN
@@ -3765,11 +3913,11 @@ pub struct StaticRouteEntry {
     pub priority: u16,                // Para ordenar (menor = más prioritario)
     pub _pad3: [u8; 4],
     
-    // === METADATA (12 bytes) ===
+    // === METADATA (16 bytes) ===
     pub installed_at: u64,
-    pub _reserved: [u8; 4],
+    pub _reserved: [u8; 8],
 }
-// Total: 304 bytes (igual que RouteEntry para consistencia)
+// Total: 360 bytes
 ```
 
 **Acciones:**
@@ -3796,18 +3944,20 @@ pub struct VPNEntry {
     pub remote_island_len: u16,
     pub _pad2: [u8; 6],
     
-    // === ENDPOINTS (96 bytes) ===
+    // === ENDPOINTS (98 bytes) ===
     pub endpoint_count: u32,
     pub endpoints: [[u8; 46]; 2],     // Hasta 2 endpoints (IP:puerto)
     pub _pad3: [u8; 2],
     
-    // === ESTADO (16 bytes) ===
+    // === ESTADO (14 bytes) ===
     pub flags: u16,
-    pub _pad4: [u8; 6],
+    pub _pad4: [u8; 4],
     pub created_at: u64,
 }
 // Total: 256 bytes
 ```
+
+**Uso de VPNEntry:** El router usa `vpn_id` de RouteEntry para buscar VPNEntry, luego usa `remote_island` para determinar el uplink de salida. Ver **sección 13.16.1** para el algoritmo completo de resolución de VPN.
 
 #### 27.4 Constantes
 
@@ -3900,6 +4050,23 @@ El nodo expone una API via socket Unix para administración:
 }
 ```
 
+Respuesta:
+```json
+{
+  "payload": {
+    "status": "ok",
+    "vpns": [
+      {
+        "vpn_id": 1,
+        "vpn_name": "vpn-staging",
+        "remote_island": "staging",
+        "endpoints": ["10.0.1.100:9000"]
+      }
+    ]
+  }
+}
+```
+
 **Agregar VPN:**
 ```json
 {
@@ -3910,6 +4077,29 @@ El nodo expone una API via socket Unix para administración:
     "endpoints": ["10.0.1.100:9000", "10.0.1.101:9000"]
   }
 }
+```
+
+Respuesta (vpn_id generado automáticamente):
+```json
+{
+  "payload": {
+    "status": "ok",
+    "vpn_id": 1
+  }
+}
+```
+
+**Eliminar VPN:**
+```json
+{
+  "meta": { "type": "admin", "action": "delete_vpn" },
+  "payload": {
+    "vpn_id": 1
+  }
+}
+```
+
+**Nota sobre VPN y rutas:** Para usar una VPN, se debe crear una ruta con `action: "VPN"` y `vpn_id` referenciando la VPN creada. El router resuelve `vpn_id → remote_island → uplink` automáticamente (ver sección 13.16.1).
 ```
 
 #### 27.6 Flujo del Router al Leer Config
@@ -3995,6 +4185,34 @@ vpns:
     endpoints:
       - "10.0.1.100:9000"
       - "10.0.1.101:9000"
+```
+
+**Ejemplo: Ruta que usa VPN:**
+
+```yaml
+static_routes:
+  # Tráfico a AI.staging.* va por VPN a isla staging
+  - prefix: "AI.staging.*"
+    match_kind: PREFIX
+    action: VPN
+    vpn_id: 1          # Referencia a vpn-staging
+    metric: 10
+
+vpns:
+  - vpn_id: 1
+    vpn_name: vpn-staging
+    remote_island: staging
+    endpoints:
+      - "10.0.1.100:9000"
+```
+
+**Flujo de resolución:**
+```
+1. Mensaje llega con dst = "AI.staging.worker1"
+2. Router busca en FIB → matchea "AI.staging.*" con action=VPN, vpn_id=1
+3. Router busca VPNEntry con vpn_id=1 → remote_island="staging"
+4. Router busca uplink hacia isla "staging"
+5. Router envía mensaje por ese uplink
 ```
 
 **Flujo al iniciar:**

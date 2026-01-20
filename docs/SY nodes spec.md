@@ -1,8 +1,8 @@
 # JSON Router - Nodos SY (System)
 
-**Estado:** Draft v0.11
-**Fecha:** 2025-01-19
-**Documento relacionado:** JSON Router Especificación Técnica v1.11
+**Estado:** Draft v0.12
+**Fecha:** 2025-01-20
+**Documento relacionado:** JSON Router Especificación Técnica v1.12
 
 ---
 
@@ -287,16 +287,18 @@ sy-config-routes
     │
     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 5. Conectar al router local                                 │
-│    - Crear socket en node_socket_dir                       │
-│    - Enviar HELLO, recibir asignación de UUID              │
+│ 5. Conectar al router local (via node_client)              │
+│    - node_client genera/carga UUID automáticamente         │
+│    - node_client conecta al socket del router              │
+│    - node_client envía HELLO con UUID y nombre             │
+│    - node_client recibe ANNOUNCE confirmando registro      │
 └─────────────────────────────────────────────────────────────┘
     │
     ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 6. Loop principal                                           │
 │    - Actualizar heartbeat en SHM cada 5s                   │
-│    - Escuchar mensajes de API                              │
+│    - Escuchar mensajes de API (via node_client.recv())     │
 │    - Procesar requests, actualizar SHM, persistir          │
 └─────────────────────────────────────────────────────────────┘
 ```
