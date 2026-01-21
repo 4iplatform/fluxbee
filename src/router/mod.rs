@@ -46,6 +46,11 @@ impl Router {
         ensure_parent_dir(&self.cfg.node_socket_path)?;
         let _ = std::fs::remove_file(&self.cfg.node_socket_path);
         let listener = UnixListener::bind(&self.cfg.node_socket_path)?;
+        tracing::info!(
+            router = %self.cfg.router_l2_name,
+            socket = %self.cfg.node_socket_path.display(),
+            "router listening"
+        );
 
         loop {
             let (stream, _) = listener.accept().await?;
