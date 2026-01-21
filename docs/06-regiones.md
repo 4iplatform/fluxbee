@@ -142,13 +142,22 @@ vpns:
 3. SY.config.routes persiste en YAML
 4. SY.config.routes escribe en jsr-config-<island>
 5. SY.config.routes incrementa config_version
-6. Routers detectan cambio de config_version
-7. Routers actualizan su FIB
+6. SY.config.routes envía broadcast CONFIG_CHANGED
+7. Routers re-leen config, actualizan FIB
+8. Routers re-evalúan VPN de nodos conectados y actualizan vpn_id en SHM
 ```
 
-### 2.6 Notificación de Cambio
+### 2.6 Notificación y Aplicación de Cambios
 
-SY.config.routes puede notificar cambios via broadcast:
+Cuando SY.config.routes actualiza la región:
+
+```
+1. SY.config.routes escribe en jsr-config-<island>
+2. SY.config.routes incrementa config_version
+3. SY.config.routes envía broadcast CONFIG_CHANGED
+```
+
+**Mensaje CONFIG_CHANGED:**
 
 ```json
 {
@@ -164,13 +173,46 @@ SY.config.routes puede notificar cambios via broadcast:
     "target": "RT.*"
   },
   "payload": {
-    "config_version": 42,
-    "changed": ["routes", "vpns"]
+    "config_version": 42
   }
 }
 ```
 
-Los routers pueden usar esto para actualizar inmediatamente en lugar de esperar el polling.
+**Cada router al recibir CONFIG_CHANGED:**
+
+```rust
+fn handle_config_changed(&mut self, new_version: u64) {
+    // 1. Re-leer config
+    let config = self.read_config_region();
+    if config.header.config_version <= self.last_config_version {
+        return;  // Ya procesado
+    }
+    
+    // 2. Actualizar rutas estáticas
+    self.static_routes = config.routes.clone();
+    
+    // 3. Actualizar tabla VPN
+    self.vpn_table = config.vpns.clone();
+    
+    // 4. Re-evaluar VPN de TODOS los nodos conectados
+    for node in self.my_nodes.iter_mut() {
+        let new_vpn = self.evaluate_vpn(&node.name);
+        if node.vpn_id != new_vpn {
+            log::info!("Node {} VPN changed: {} -> {}", 
+                       node.name, node.vpn_id, new_vpn);
+            node.vpn_id = new_vpn;
+        }
+    }
+    
+    // 5. Escribir cambios en SHM
+    self.write_nodes_to_shm();
+    
+    // 6. Recordar versión
+    self.last_config_version = config.header.config_version;
+}
+```
+
+**IMPORTANTE:** Los cambios de VPN se aplican **en tiempo real** a nodos ya conectados. No es necesario reconectar.
 
 ---
 

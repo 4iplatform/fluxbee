@@ -51,10 +51,15 @@ WF.crm.*          → 20
 
 ### 3.3 Asignación de VPN
 
-Cuando un nodo conecta y envía HELLO:
+El router asigna VPN cuando un nodo conecta **y re-evalúa cuando cambia la config**:
 
 ```rust
 fn assign_vpn(&self, node_name: &str) -> u32 {
+    // SY.* y RT.* siempre en VPN global
+    if node_name.starts_with("SY.") || node_name.starts_with("RT.") {
+        return 0;
+    }
+    
     // Evaluar reglas en orden de priority (menor primero)
     for rule in self.vpn_table.iter()
         .filter(|r| r.flags & FLAG_ACTIVE != 0)
@@ -67,6 +72,12 @@ fn assign_vpn(&self, node_name: &str) -> u32 {
     0  // Default: VPN global
 }
 ```
+
+**Cuándo se evalúa:**
+- Al conectar (HELLO → ANNOUNCE)
+- Cuando llega CONFIG_CHANGED (re-evalúa todos los nodos)
+
+**Los cambios de VPN se aplican en tiempo real.** No es necesario reconectar nodos. El router actualiza el `vpn_id` de los nodos en su región `jsr-<uuid>`.
 
 ### 3.4 Filtro VPN en Routing
 

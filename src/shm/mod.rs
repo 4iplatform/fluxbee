@@ -457,6 +457,30 @@ impl RouterRegionWriter {
         Ok(())
     }
 
+    pub fn update_node_vpn(&mut self, node_uuid: Uuid, vpn_id: u32) -> Result<(), ShmError> {
+        let (header, nodes): (&mut ShmHeader, &mut [NodeEntry]) =
+            router_header_and_nodes_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
+        let mut updated = false;
+        seqlock_begin_write(&header.seq);
+        for entry in nodes.iter_mut() {
+            if entry.flags & FLAG_ACTIVE == 0 {
+                continue;
+            }
+            if entry.uuid == *node_uuid.as_bytes() {
+                entry.vpn_id = vpn_id;
+                updated = true;
+                break;
+            }
+        }
+        if updated {
+            header.updated_at = now_epoch_ms();
+            header.heartbeat = header.updated_at;
+        }
+        seqlock_end_write(&header.seq);
+        Ok(())
+    }
+
     fn header_ref(&self) -> Option<&ShmHeader> {
         header_ref::<ShmHeader>(self.mmap.as_ref(), self.layout.header_offset)
     }

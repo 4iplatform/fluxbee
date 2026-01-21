@@ -155,6 +155,8 @@ async fn handle_node(
         &static_routes,
         &config_version,
         island_id,
+        &nodes,
+        &shm,
     )
     .await;
     let vpn_id = assign_vpn(&node_name, snapshot.as_ref());
@@ -219,6 +221,8 @@ async fn handle_node(
                         &static_routes,
                         &config_version,
                         island_id,
+                        &nodes,
+                        &shm,
                     )
                     .await;
                     handle_message(
@@ -457,6 +461,8 @@ async fn refresh_config(
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
     config_version: &Arc<Mutex<u64>>,
     island_id: &str,
+    nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
+    shm: &Arc<Mutex<RouterRegionWriter>>,
 ) -> Option<ConfigSnapshot> {
     let snapshot = {
         let mut reader = config_reader.lock().await;
@@ -504,6 +510,7 @@ async fn refresh_config(
             vpns = snapshot.vpns.len(),
             "config snapshot updated"
         );
+        reassign_vpns(&snapshot, nodes, shm).await;
     }
     Some(snapshot)
 }
@@ -547,6 +554,41 @@ fn assign_vpn(name: &str, snapshot: Option<&ConfigSnapshot>) -> u32 {
         }
     }
     0
+}
+
+async fn reassign_vpns(
+    snapshot: &ConfigSnapshot,
+    nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
+    shm: &Arc<Mutex<RouterRegionWriter>>,
+) {
+    let mut updates: Vec<(Uuid, u32)> = Vec::new();
+    {
+        let nodes_guard = nodes.lock().await;
+        for (uuid, handle) in nodes_guard.iter() {
+            let new_vpn = assign_vpn(&handle.name, Some(snapshot));
+            if new_vpn != handle.vpn_id {
+                updates.push((*uuid, new_vpn));
+            }
+        }
+    }
+    if updates.is_empty() {
+        return;
+    }
+    {
+        let mut nodes_guard = nodes.lock().await;
+        for (uuid, vpn_id) in updates.iter() {
+            if let Some(handle) = nodes_guard.get_mut(uuid) {
+                handle.vpn_id = *vpn_id;
+            }
+        }
+    }
+    {
+        let mut shm = shm.lock().await;
+        for (uuid, vpn_id) in updates {
+            let _ = shm.update_node_vpn(uuid, vpn_id);
+            tracing::info!(node = %uuid, vpn_id, "vpn updated");
+        }
+    }
 }
 
 fn bytes_to_string(buf: &[u8], len: usize) -> &str {

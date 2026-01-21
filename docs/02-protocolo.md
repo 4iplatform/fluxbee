@@ -255,7 +255,15 @@ socket.on('data', (chunk) => {
 |---------|--------|---------|-----------|
 | `LSA` | Gateway | Gateway | Intercambio de topología entre islas |
 
-### 7.4 Tiempo
+### 7.4 Configuración
+
+| Mensaje | Origen | Destino | Propósito |
+|---------|--------|---------|-----------|
+| `CONFIG_CHANGED` | SY.config.routes | Broadcast RT.* | Notificar cambio en jsr-config |
+
+**Regla:** Al recibir `CONFIG_CHANGED` (o detectar `config_version` nuevo), el router re-lee la config, actualiza rutas estáticas, re-evalúa VPN de todos sus nodos conectados, y actualiza `vpn_id` en su región SHM.
+
+### 7.5 Tiempo
 
 | Mensaje | Origen | Destino | Propósito |
 |---------|--------|---------|-----------|
