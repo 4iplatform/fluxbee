@@ -399,8 +399,9 @@ impl RouterRegionWriter {
                 max: 256,
             });
         }
-        let (header, nodes) = router_header_and_nodes_mut(&mut self.mmap, &self.layout)
-            .ok_or(ShmError::InvalidHeader)?;
+        let (header, nodes): (&mut ShmHeader, &mut [NodeEntry]) =
+            router_header_and_nodes_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
         let mut slot = None;
         for entry in nodes.iter_mut() {
             if entry.flags & FLAG_ACTIVE == 0 {
@@ -431,8 +432,9 @@ impl RouterRegionWriter {
     }
 
     pub fn unregister_node(&mut self, node_uuid: Uuid) -> Result<(), ShmError> {
-        let (header, nodes) = router_header_and_nodes_mut(&mut self.mmap, &self.layout)
-            .ok_or(ShmError::InvalidHeader)?;
+        let (header, nodes): (&mut ShmHeader, &mut [NodeEntry]) =
+            router_header_and_nodes_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
         let mut found = false;
         seqlock_begin_write(&header.seq);
         for entry in nodes.iter_mut() {
@@ -533,8 +535,9 @@ impl ConfigRegionWriter {
                 max: MAX_STATIC_ROUTES as usize,
             });
         }
-        let (header, entries) = config_header_and_routes_mut(&mut self.mmap, &self.layout)
-            .ok_or(ShmError::InvalidHeader)?;
+        let (header, entries): (&mut ConfigHeader, &mut [StaticRouteEntry]) =
+            config_header_and_routes_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
         seqlock_begin_write(&header.seq);
         for entry in entries.iter_mut() {
             *entry = empty_static_route();
@@ -563,8 +566,9 @@ impl ConfigRegionWriter {
                 max: MAX_VPN_ASSIGNMENTS as usize,
             });
         }
-        let (header, entries) = config_header_and_vpns_mut(&mut self.mmap, &self.layout)
-            .ok_or(ShmError::InvalidHeader)?;
+        let (header, entries): (&mut ConfigHeader, &mut [VpnAssignment]) =
+            config_header_and_vpns_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
         seqlock_begin_write(&header.seq);
         for entry in entries.iter_mut() {
             *entry = empty_vpn_assignment();
@@ -685,9 +689,20 @@ impl LsaRegionWriter {
                 max: MAX_REMOTE_VPNS as usize,
             });
         }
-        let (header, island_entries, node_entries, route_entries, vpn_entries) =
-            lsa_header_and_entries_mut(&mut self.mmap, &self.layout)
-                .ok_or(ShmError::InvalidHeader)?;
+        let (
+            header,
+            island_entries,
+            node_entries,
+            route_entries,
+            vpn_entries,
+        ): (
+            &mut LsaHeader,
+            &mut [RemoteIslandEntry],
+            &mut [RemoteNodeEntry],
+            &mut [RemoteRouteEntry],
+            &mut [RemoteVpnEntry],
+        ) = lsa_header_and_entries_mut(&mut self.mmap, &self.layout)
+            .ok_or(ShmError::InvalidHeader)?;
 
         seqlock_begin_write(&header.seq);
         for entry in island_entries.iter_mut() {
@@ -1189,20 +1204,20 @@ fn header_mut<T>(mmap: &mut MmapMut, offset: usize) -> Option<&mut T> {
     Some(unsafe { &mut *ptr })
 }
 
-fn router_header_and_nodes_mut(
-    mmap: &mut MmapMut,
+fn router_header_and_nodes_mut<'a>(
+    mmap: &'a mut MmapMut,
     layout: &RegionLayout,
-) -> Option<(&mut ShmHeader, &mut [NodeEntry])> {
+) -> Option<(&'a mut ShmHeader, &'a mut [NodeEntry])> {
     let header_offset = layout.header_offset;
     let nodes_offset = layout.node_offset;
     let nodes_len = MAX_NODES as usize;
     header_and_slice_mut::<ShmHeader, NodeEntry>(mmap, header_offset, nodes_offset, nodes_len)
 }
 
-fn config_header_and_routes_mut(
-    mmap: &mut MmapMut,
+fn config_header_and_routes_mut<'a>(
+    mmap: &'a mut MmapMut,
     layout: &RegionLayout,
-) -> Option<(&mut ConfigHeader, &mut [StaticRouteEntry])> {
+) -> Option<(&'a mut ConfigHeader, &'a mut [StaticRouteEntry])> {
     let header_offset = layout.header_offset;
     let routes_offset = layout.static_offset;
     let routes_len = MAX_STATIC_ROUTES as usize;
@@ -1214,10 +1229,10 @@ fn config_header_and_routes_mut(
     )
 }
 
-fn config_header_and_vpns_mut(
-    mmap: &mut MmapMut,
+fn config_header_and_vpns_mut<'a>(
+    mmap: &'a mut MmapMut,
     layout: &RegionLayout,
-) -> Option<(&mut ConfigHeader, &mut [VpnAssignment])> {
+) -> Option<(&'a mut ConfigHeader, &'a mut [VpnAssignment])> {
     let header_offset = layout.header_offset;
     let vpns_offset = layout.vpn_offset;
     let vpns_len = MAX_VPN_ASSIGNMENTS as usize;
@@ -1229,15 +1244,15 @@ fn config_header_and_vpns_mut(
     )
 }
 
-fn lsa_header_and_entries_mut(
-    mmap: &mut MmapMut,
+fn lsa_header_and_entries_mut<'a>(
+    mmap: &'a mut MmapMut,
     layout: &RegionLayout,
 ) -> Option<(
-    &mut LsaHeader,
-    &mut [RemoteIslandEntry],
-    &mut [RemoteNodeEntry],
-    &mut [RemoteRouteEntry],
-    &mut [RemoteVpnEntry],
+    &'a mut LsaHeader,
+    &'a mut [RemoteIslandEntry],
+    &'a mut [RemoteNodeEntry],
+    &'a mut [RemoteRouteEntry],
+    &'a mut [RemoteVpnEntry],
 )> {
     let header_offset = layout.header_offset;
     let islands_offset = layout.island_offset;
