@@ -22,15 +22,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("echo");
-    let target = args
-        .get(2)
-        .map(|s| s.as_str())
-        .unwrap_or("WF.listen");
+    let target = args.get(2).map(|s| s.as_str()).unwrap_or("WF.listen");
     let node_name = match mode {
         "listen" => "WF.listen",
         _ => "WF.echo",
     };
 
+    let island_id = load_island_id(&config_dir)?;
+    let target_name = normalize_target(target, &island_id);
     let mut client = NodeClient::connect(NodeConfig {
         name: node_name.to_string(),
         router_socket: socket_dir.join("router.sock"),
@@ -65,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seq = 1u64;
     loop {
         let (dst, target_name) = if mode == "unicast" {
-            (Destination::Resolve, Some(target.to_string()))
+            (Destination::Resolve, Some(target_name.clone()))
         } else {
             (Destination::Broadcast, None)
         };
@@ -126,4 +125,22 @@ fn now_epoch_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn load_island_id(config_dir: &PathBuf) -> Result<String, Box<dyn std::error::Error>> {
+    let data = std::fs::read_to_string(config_dir.join("island.yaml"))?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&data)?;
+    let island_id = value
+        .get("island_id")
+        .and_then(|v| v.as_str())
+        .ok_or("missing island_id")?;
+    Ok(island_id.to_string())
+}
+
+fn normalize_target(target: &str, island_id: &str) -> String {
+    if target.contains('@') {
+        target.to_string()
+    } else {
+        format!("{}@{}", target, island_id)
+    }
 }
