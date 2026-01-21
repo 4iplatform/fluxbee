@@ -149,6 +149,7 @@ async fn handle_node(
     }
 
     let node_name = normalize_name(&payload.name, island_id);
+    tracing::info!(node = %node_name, "loading config snapshot");
     let snapshot = refresh_config(
         &config_reader,
         &static_routes,
@@ -157,12 +158,14 @@ async fn handle_node(
     )
     .await;
     let vpn_id = assign_vpn(&node_name, snapshot.as_ref());
+    tracing::info!(node = %node_name, vpn_id = vpn_id, "vpn assigned");
     let connected_at = now_epoch_ms();
     {
         let mut shm = shm.lock().await;
         shm.register_node(node_uuid, &node_name, vpn_id, connected_at)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     }
+    tracing::info!(node = %node_uuid, "node registered in shm");
     {
         let mut nodes = nodes.lock().await;
         nodes.insert(
@@ -189,7 +192,11 @@ async fn handle_node(
         },
     );
     let data = serde_json::to_vec(&announce)?;
-    let _ = tx.send(data);
+    if tx.send(data).is_err() {
+        tracing::warn!("failed to enqueue ANNOUNCE");
+    } else {
+        tracing::info!("announce queued");
+    }
 
     loop {
         match read_frame(&mut reader).await? {
