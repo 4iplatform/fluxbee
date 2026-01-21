@@ -135,7 +135,6 @@ pub const SYSTEM_KIND: &str = "system";
 
 pub const MSG_HELLO: &str = "HELLO";
 pub const MSG_ANNOUNCE: &str = "ANNOUNCE";
-pub const MSG_WITHDRAW: &str = "WITHDRAW";
 pub const MSG_UNREACHABLE: &str = "UNREACHABLE";
 pub const MSG_TTL_EXCEEDED: &str = "TTL_EXCEEDED";
 pub const MSG_ECHO: &str = "ECHO";
