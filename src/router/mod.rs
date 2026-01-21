@@ -12,8 +12,8 @@ use crate::protocol::{
     NodeAnnouncePayload, NodeHelloPayload, MSG_HELLO, MSG_WITHDRAW, SYSTEM_KIND,
 };
 use crate::shm::{
-    now_epoch_ms, ConfigRegionReader, ConfigSnapshot, RouterRegionWriter, FLAG_ACTIVE, MATCH_EXACT,
-    MATCH_GLOB, MATCH_PREFIX,
+    now_epoch_ms, ConfigRegionReader, ConfigSnapshot, RouterRegionWriter, ACTION_DROP,
+    ACTION_FORWARD, FLAG_ACTIVE, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
 };
 use crate::socket::connection::{read_frame, write_frame};
 
@@ -30,6 +30,8 @@ pub struct Router {
     shm: Arc<Mutex<RouterRegionWriter>>,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     config_reader: Arc<Mutex<Option<ConfigRegionReader>>>,
+    static_routes: Arc<Mutex<Vec<StaticRoute>>>,
+    config_version: Arc<Mutex<u64>>,
 }
 
 impl Router {
@@ -54,6 +56,8 @@ impl Router {
             shm: Arc::new(Mutex::new(shm)),
             nodes: Arc::new(Mutex::new(std::collections::HashMap::new())),
             config_reader: Arc::new(Mutex::new(config_reader)),
+            static_routes: Arc::new(Mutex::new(Vec::new())),
+            config_version: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -75,12 +79,16 @@ impl Router {
             let island_id = self.cfg.island_id.clone();
             let nodes = Arc::clone(&self.nodes);
             let config_reader = Arc::clone(&self.config_reader);
+            let static_routes = Arc::clone(&self.static_routes);
+            let config_version = Arc::clone(&self.config_version);
             tokio::spawn(async move {
                 if let Err(err) = handle_node(
                     stream,
                     shm,
                     nodes,
                     config_reader,
+                    static_routes,
+                    config_version,
                     router_uuid,
                     &router_name,
                     &island_id,
@@ -99,6 +107,8 @@ async fn handle_node(
     shm: Arc<Mutex<RouterRegionWriter>>,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     config_reader: Arc<Mutex<Option<ConfigRegionReader>>>,
+    static_routes: Arc<Mutex<Vec<StaticRoute>>>,
+    config_version: Arc<Mutex<u64>>,
     router_uuid: Uuid,
     router_name: &str,
     island_id: &str,
@@ -137,20 +147,14 @@ async fn handle_node(
     }
 
     let node_name = normalize_name(&payload.name, island_id);
-    let vpn_id = {
-        let snapshot = {
-            let mut reader = config_reader.lock().await;
-            if reader.is_none() {
-                if let Ok(new_reader) =
-                    ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", island_id))
-                {
-                    *reader = Some(new_reader);
-                }
-            }
-            reader.as_ref().and_then(|r| r.read_snapshot())
-        };
-        assign_vpn(&node_name, snapshot.as_ref())
-    };
+    let snapshot = refresh_config(
+        &config_reader,
+        &static_routes,
+        &config_version,
+        island_id,
+    )
+    .await;
+    let vpn_id = assign_vpn(&node_name, snapshot.as_ref());
     let connected_at = now_epoch_ms();
     {
         let mut shm = shm.lock().await;
@@ -201,7 +205,21 @@ async fn handle_node(
                     {
                         break;
                     }
-                    handle_message(&msg, &nodes, router_uuid).await?;
+                    let snapshot = refresh_config(
+                        &config_reader,
+                        &static_routes,
+                        &config_version,
+                        island_id,
+                    )
+                    .await;
+                    handle_message(
+                        &msg,
+                        &nodes,
+                        router_uuid,
+                        &static_routes,
+                        snapshot.as_ref(),
+                    )
+                    .await?;
                 } else {
                     tracing::warn!("received invalid message frame");
                 }
@@ -227,6 +245,8 @@ async fn handle_message(
     msg: &Message,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     router_uuid: Uuid,
+    static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
+    snapshot: Option<&ConfigSnapshot>,
 ) -> Result<(), RouterError> {
     if msg.routing.ttl == 0 {
         send_ttl_exceeded(msg, nodes, router_uuid).await?;
@@ -275,7 +295,27 @@ async fn handle_message(
             }
         }
         Destination::Resolve => {
-            send_unreachable(msg, nodes, router_uuid, "OPA_UNAVAILABLE").await?;
+            let Some(target) = msg.meta.target.as_deref() else {
+                send_unreachable(msg, nodes, router_uuid, "MISSING_TARGET").await?;
+                return Ok(());
+            };
+            let route = resolve_by_name(target, src_handle, &nodes_guard, static_routes).await?;
+            match route {
+                ResolvedRoute::Drop => {}
+                ResolvedRoute::Unreachable(reason) => {
+                    send_unreachable(msg, nodes, router_uuid, reason).await?;
+                }
+                ResolvedRoute::Deliver(dst_uuid) => {
+                    if let Some(dst_handle) = nodes_guard.get(&dst_uuid) {
+                        let _ = dst_handle.sender.send(serde_json::to_vec(msg)?);
+                    } else {
+                        send_unreachable(msg, nodes, router_uuid, "NODE_NOT_FOUND").await?;
+                    }
+                }
+                ResolvedRoute::ForwardIsland(_) => {
+                    send_unreachable(msg, nodes, router_uuid, "INTER_ISLAND_UNSUPPORTED").await?;
+                }
+            }
         }
     }
     Ok(())
@@ -365,6 +405,73 @@ struct NodeHandle {
     sender: mpsc::UnboundedSender<Vec<u8>>,
 }
 
+#[derive(Clone, Debug)]
+struct StaticRoute {
+    pattern: String,
+    match_kind: u8,
+    action: u8,
+    next_hop_island: String,
+    priority: u16,
+    metric: u32,
+}
+
+enum ResolvedRoute {
+    Drop,
+    Unreachable(&'static str),
+    Deliver(Uuid),
+    ForwardIsland(String),
+}
+
+async fn refresh_config(
+    config_reader: &Arc<Mutex<Option<ConfigRegionReader>>>,
+    static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
+    config_version: &Arc<Mutex<u64>>,
+    island_id: &str,
+) -> Option<ConfigSnapshot> {
+    let snapshot = {
+        let mut reader = config_reader.lock().await;
+        if reader.is_none() {
+            if let Ok(new_reader) =
+                ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", island_id))
+            {
+                *reader = Some(new_reader);
+            }
+        }
+        reader.as_ref().and_then(|r| r.read_snapshot())
+    };
+    let Some(snapshot) = snapshot else {
+        return None;
+    };
+    let mut version_guard = config_version.lock().await;
+    if snapshot.header.config_version != *version_guard {
+        let mut routes_guard = static_routes.lock().await;
+        *routes_guard = snapshot
+            .routes
+            .iter()
+            .filter(|route| {
+                route.flags == 0 || (route.flags & FLAG_ACTIVE != 0)
+            })
+            .map(|route| StaticRoute {
+                pattern: bytes_to_string(&route.prefix, route.prefix_len as usize).to_string(),
+                match_kind: route.match_kind,
+                action: route.action,
+                next_hop_island: bytes_to_string(
+                    &route.next_hop_island,
+                    route.next_hop_island_len as usize,
+                )
+                .to_string(),
+                priority: route.priority,
+                metric: route.metric,
+            })
+            .collect();
+        routes_guard.sort_by(|a, b| {
+            (a.priority, a.metric).cmp(&(b.priority, b.metric))
+        });
+        *version_guard = snapshot.header.config_version;
+    }
+    Some(snapshot)
+}
+
 fn assign_vpn(name: &str, snapshot: Option<&ConfigSnapshot>) -> u32 {
     if name.starts_with("SY.") || name.starts_with("RT.") {
         return 0;
@@ -446,4 +553,37 @@ fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
         pi += 1;
     }
     pi == pattern.len()
+}
+
+async fn resolve_by_name(
+    target: &str,
+    src: &NodeHandle,
+    nodes: &std::collections::HashMap<Uuid, NodeHandle>,
+    static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
+) -> Result<ResolvedRoute, RouterError> {
+    let routes = static_routes.lock().await;
+    for route in routes.iter() {
+        if !pattern_match_kind(route.match_kind, &route.pattern, target) {
+            continue;
+        }
+        match route.action {
+            ACTION_DROP => return Ok(ResolvedRoute::Drop),
+            ACTION_FORWARD => {
+                if !route.next_hop_island.is_empty() {
+                    return Ok(ResolvedRoute::ForwardIsland(route.next_hop_island.clone()));
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    for (uuid, handle) in nodes.iter() {
+        if handle.name == target {
+            if can_route(src, handle) {
+                return Ok(ResolvedRoute::Deliver(*uuid));
+            }
+            return Ok(ResolvedRoute::Unreachable("VPN_BLOCKED"));
+        }
+    }
+    Ok(ResolvedRoute::Unreachable("NODE_NOT_FOUND"))
 }
