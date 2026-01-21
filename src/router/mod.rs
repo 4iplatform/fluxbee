@@ -515,6 +515,11 @@ fn assign_vpn(name: &str, snapshot: Option<&ConfigSnapshot>) -> u32 {
     let Some(snapshot) = snapshot else {
         return 0;
     };
+    tracing::debug!(
+        config_version = snapshot.header.config_version,
+        vpns = snapshot.header.vpn_assignment_count,
+        "vpn assignment snapshot"
+    );
     if snapshot.vpns.is_empty() {
         tracing::warn!("vpn table empty in config snapshot");
     }
@@ -525,11 +530,19 @@ fn assign_vpn(name: &str, snapshot: Option<&ConfigSnapshot>) -> u32 {
             continue;
         }
         let pattern = bytes_to_string(&entry.pattern, entry.pattern_len as usize);
+        tracing::debug!(
+            pattern = %pattern,
+            match_kind = entry.match_kind,
+            vpn_id = entry.vpn_id,
+            priority = entry.priority,
+            "vpn rule candidate"
+        );
         rules.push((entry.priority, pattern, entry.match_kind, entry.vpn_id, flags));
     }
     rules.sort_by_key(|rule| rule.0);
     for (_, pattern, match_kind, vpn_id, _) in rules {
         if pattern_match_kind(match_kind, pattern, name) {
+            tracing::debug!(node = %name, vpn_id, "vpn matched");
             return vpn_id;
         }
     }

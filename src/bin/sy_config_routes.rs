@@ -85,8 +85,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let routes = build_routes(&sy_config.routes)?;
     let vpns = build_vpns(&sy_config.vpns)?;
 
-    writer.write_static_routes(&routes, true)?;
-    writer.write_vpn_assignments(&vpns, false)?;
+    writer.write_static_routes(&routes, false)?;
+    writer.write_vpn_assignments(&vpns, true)?;
 
     tracing::info!(
         routes = routes.len(),
