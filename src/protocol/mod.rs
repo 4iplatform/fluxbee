@@ -83,6 +83,24 @@ pub struct TtlExceededPayload {
     pub last_hop: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EchoPayload {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EchoReplyPayload {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeSyncPayload {
+    pub timestamp_utc: String,
+    pub epoch_ms: u64,
+    pub seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WithdrawPayload {
+    pub uuid: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LsaPayload {
     pub island: String,
@@ -124,6 +142,7 @@ pub const MSG_ECHO: &str = "ECHO";
 pub const MSG_ECHO_REPLY: &str = "ECHO_REPLY";
 pub const MSG_LSA: &str = "LSA";
 pub const MSG_TIME_SYNC: &str = "TIME_SYNC";
+pub const MSG_WITHDRAW: &str = "WITHDRAW";
 
 pub fn build_system_message(
     src: &str,
@@ -236,6 +255,43 @@ pub fn build_lsa(
         trace_id,
         MSG_LSA,
         json!(payload),
+    )
+}
+
+pub fn build_echo(src: &str, dst: Destination, trace_id: &str) -> Message {
+    build_system_message(src, dst, 1, trace_id, MSG_ECHO, json!(EchoPayload {}))
+}
+
+pub fn build_echo_reply(src: &str, dst: Destination, trace_id: &str) -> Message {
+    build_system_message(
+        src,
+        dst,
+        1,
+        trace_id,
+        MSG_ECHO_REPLY,
+        json!(EchoReplyPayload {}),
+    )
+}
+
+pub fn build_time_sync(
+    src: &str,
+    dst: Destination,
+    trace_id: &str,
+    payload: TimeSyncPayload,
+) -> Message {
+    build_system_message(src, dst, 1, trace_id, MSG_TIME_SYNC, json!(payload))
+}
+
+pub fn build_withdraw(src: &str, dst: Destination, trace_id: &str, uuid: &str) -> Message {
+    build_system_message(
+        src,
+        dst,
+        1,
+        trace_id,
+        MSG_WITHDRAW,
+        json!(WithdrawPayload {
+            uuid: uuid.to_string(),
+        }),
     )
 }
 
