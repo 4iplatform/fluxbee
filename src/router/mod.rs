@@ -334,7 +334,7 @@ async fn send_ttl_exceeded(
         &msg.routing.src,
         &msg.routing.trace_id,
         &original_dst,
-        router_name(router_uuid),
+        &router_name(router_uuid),
     );
     let _ = src_handle.sender.send(serde_json::to_vec(&err)?);
     Ok(())
