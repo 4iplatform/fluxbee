@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::mem::size_of;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{self, AtomicU64, Ordering};
@@ -399,12 +399,8 @@ impl RouterRegionWriter {
                 max: 256,
             });
         }
-        let Some(header) = self.header_mut() else {
-            return Err(ShmError::InvalidHeader);
-        };
-        let Some(nodes) = self.nodes_mut() else {
-            return Err(ShmError::InvalidHeader);
-        };
+        let (header, nodes) = router_header_and_nodes_mut(&mut self.mmap, &self.layout)
+            .ok_or(ShmError::InvalidHeader)?;
         let mut slot = None;
         for entry in nodes.iter_mut() {
             if entry.flags & FLAG_ACTIVE == 0 {
@@ -435,12 +431,8 @@ impl RouterRegionWriter {
     }
 
     pub fn unregister_node(&mut self, node_uuid: Uuid) -> Result<(), ShmError> {
-        let Some(header) = self.header_mut() else {
-            return Err(ShmError::InvalidHeader);
-        };
-        let Some(nodes) = self.nodes_mut() else {
-            return Err(ShmError::InvalidHeader);
-        };
+        let (header, nodes) = router_header_and_nodes_mut(&mut self.mmap, &self.layout)
+            .ok_or(ShmError::InvalidHeader)?;
         let mut found = false;
         seqlock_begin_write(&header.seq);
         for entry in nodes.iter_mut() {
@@ -464,7 +456,7 @@ impl RouterRegionWriter {
     }
 
     fn header_ref(&self) -> Option<&ShmHeader> {
-        header_ref::<ShmHeader>(&self.mmap, self.layout.header_offset)
+        header_ref::<ShmHeader>(self.mmap.as_ref(), self.layout.header_offset)
     }
 
     fn header_mut(&mut self) -> Option<&mut ShmHeader> {
@@ -495,7 +487,7 @@ impl RouterRegionReader {
     }
 
     fn header_ref(&self) -> Option<&ShmHeader> {
-        header_ref::<ShmHeader>(&self.mmap, self.layout.header_offset)
+        header_ref::<ShmHeader>(self.mmap.as_ref(), self.layout.header_offset)
     }
 }
 
@@ -541,12 +533,8 @@ impl ConfigRegionWriter {
                 max: MAX_STATIC_ROUTES as usize,
             });
         }
-        let Some(header) = self.header_mut() else {
-            return Err(ShmError::InvalidHeader);
-        };
-        let Some(entries) = self.routes_mut() else {
-            return Err(ShmError::InvalidHeader);
-        };
+        let (header, entries) = config_header_and_routes_mut(&mut self.mmap, &self.layout)
+            .ok_or(ShmError::InvalidHeader)?;
         seqlock_begin_write(&header.seq);
         for entry in entries.iter_mut() {
             *entry = empty_static_route();
@@ -575,12 +563,8 @@ impl ConfigRegionWriter {
                 max: MAX_VPN_ASSIGNMENTS as usize,
             });
         }
-        let Some(header) = self.header_mut() else {
-            return Err(ShmError::InvalidHeader);
-        };
-        let Some(entries) = self.vpns_mut() else {
-            return Err(ShmError::InvalidHeader);
-        };
+        let (header, entries) = config_header_and_vpns_mut(&mut self.mmap, &self.layout)
+            .ok_or(ShmError::InvalidHeader)?;
         seqlock_begin_write(&header.seq);
         for entry in entries.iter_mut() {
             *entry = empty_vpn_assignment();
@@ -599,7 +583,7 @@ impl ConfigRegionWriter {
     }
 
     fn header_ref(&self) -> Option<&ConfigHeader> {
-        header_ref::<ConfigHeader>(&self.mmap, self.layout.header_offset)
+        header_ref::<ConfigHeader>(self.mmap.as_ref(), self.layout.header_offset)
     }
 
     fn header_mut(&mut self) -> Option<&mut ConfigHeader> {
@@ -635,7 +619,7 @@ impl ConfigRegionReader {
     }
 
     fn header_ref(&self) -> Option<&ConfigHeader> {
-        header_ref::<ConfigHeader>(&self.mmap, self.layout.header_offset)
+        header_ref::<ConfigHeader>(self.mmap.as_ref(), self.layout.header_offset)
     }
 }
 
@@ -701,21 +685,9 @@ impl LsaRegionWriter {
                 max: MAX_REMOTE_VPNS as usize,
             });
         }
-        let Some(header) = self.header_mut() else {
-            return Err(ShmError::InvalidHeader);
-        };
-        let Some(island_entries) = self.islands_mut() else {
-            return Err(ShmError::InvalidHeader);
-        };
-        let Some(node_entries) = self.remote_nodes_mut() else {
-            return Err(ShmError::InvalidHeader);
-        };
-        let Some(route_entries) = self.remote_routes_mut() else {
-            return Err(ShmError::InvalidHeader);
-        };
-        let Some(vpn_entries) = self.remote_vpns_mut() else {
-            return Err(ShmError::InvalidHeader);
-        };
+        let (header, island_entries, node_entries, route_entries, vpn_entries) =
+            lsa_header_and_entries_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
 
         seqlock_begin_write(&header.seq);
         for entry in island_entries.iter_mut() {
@@ -755,7 +727,7 @@ impl LsaRegionWriter {
     }
 
     fn header_ref(&self) -> Option<&LsaHeader> {
-        header_ref::<LsaHeader>(&self.mmap, self.layout.header_offset)
+        header_ref::<LsaHeader>(self.mmap.as_ref(), self.layout.header_offset)
     }
 
     fn header_mut(&mut self) -> Option<&mut LsaHeader> {
@@ -801,7 +773,7 @@ impl LsaRegionReader {
     }
 
     fn header_ref(&self) -> Option<&LsaHeader> {
-        header_ref::<LsaHeader>(&self.mmap, self.layout.header_offset)
+        header_ref::<LsaHeader>(self.mmap.as_ref(), self.layout.header_offset)
     }
 }
 
@@ -913,11 +885,12 @@ where
     F: FnOnce(&mut MmapMut),
 {
     let cstr = CString::new(name).map_err(|_| ShmError::NameTooLong)?;
-    match shm_open(&cstr, OFlag::O_RDWR, nix::sys::stat::Mode::empty()) {
+    let name_cstr: &CStr = cstr.as_c_str();
+    match shm_open(name_cstr, OFlag::O_RDWR, nix::sys::stat::Mode::empty()) {
         Ok(fd) => {
-            let stat = fstat(&fd)?;
+            let stat = fstat(fd.as_raw_fd())?;
             if stat.st_size < len as i64 {
-                let _ = shm_unlink(&cstr);
+                let _ = shm_unlink(name_cstr);
             } else {
                 let mmap = unsafe { MmapOptions::new().len(len).map_mut(fd.as_raw_fd())? };
                 if is_region_valid(&mmap) {
@@ -933,7 +906,7 @@ where
     }
 
     let fd = shm_open(
-        &cstr,
+        name_cstr,
         OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR,
         nix::sys::stat::Mode::from_bits_truncate(0o600),
     )?;
@@ -948,7 +921,7 @@ where
 
 fn open_read_only_region(name: &str, len: usize) -> Result<Mmap, ShmError> {
     let cstr = CString::new(name).map_err(|_| ShmError::NameTooLong)?;
-    let fd = shm_open(&cstr, OFlag::O_RDONLY, nix::sys::stat::Mode::empty())?;
+    let fd = shm_open(cstr.as_c_str(), OFlag::O_RDONLY, nix::sys::stat::Mode::empty())?;
     let mmap = unsafe { MmapOptions::new().len(len).map(fd.as_raw_fd())? };
     Ok(mmap)
 }
@@ -1200,7 +1173,7 @@ fn slice_mut<T: Copy>(mmap: &mut MmapMut, offset: usize, len: usize) -> Option<&
     Some(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
 }
 
-fn header_ref<T>(mmap: &Mmap, offset: usize) -> Option<&T> {
+fn header_ref<T>(mmap: &[u8], offset: usize) -> Option<&T> {
     if offset + size_of::<T>() > mmap.len() {
         return None;
     }
@@ -1214,6 +1187,114 @@ fn header_mut<T>(mmap: &mut MmapMut, offset: usize) -> Option<&mut T> {
     }
     let ptr = mmap.as_mut_ptr().wrapping_add(offset) as *mut T;
     Some(unsafe { &mut *ptr })
+}
+
+fn router_header_and_nodes_mut(
+    mmap: &mut MmapMut,
+    layout: &RegionLayout,
+) -> Option<(&mut ShmHeader, &mut [NodeEntry])> {
+    let header_offset = layout.header_offset;
+    let nodes_offset = layout.node_offset;
+    let nodes_len = MAX_NODES as usize;
+    header_and_slice_mut::<ShmHeader, NodeEntry>(mmap, header_offset, nodes_offset, nodes_len)
+}
+
+fn config_header_and_routes_mut(
+    mmap: &mut MmapMut,
+    layout: &RegionLayout,
+) -> Option<(&mut ConfigHeader, &mut [StaticRouteEntry])> {
+    let header_offset = layout.header_offset;
+    let routes_offset = layout.static_offset;
+    let routes_len = MAX_STATIC_ROUTES as usize;
+    header_and_slice_mut::<ConfigHeader, StaticRouteEntry>(
+        mmap,
+        header_offset,
+        routes_offset,
+        routes_len,
+    )
+}
+
+fn config_header_and_vpns_mut(
+    mmap: &mut MmapMut,
+    layout: &RegionLayout,
+) -> Option<(&mut ConfigHeader, &mut [VpnAssignment])> {
+    let header_offset = layout.header_offset;
+    let vpns_offset = layout.vpn_offset;
+    let vpns_len = MAX_VPN_ASSIGNMENTS as usize;
+    header_and_slice_mut::<ConfigHeader, VpnAssignment>(
+        mmap,
+        header_offset,
+        vpns_offset,
+        vpns_len,
+    )
+}
+
+fn lsa_header_and_entries_mut(
+    mmap: &mut MmapMut,
+    layout: &RegionLayout,
+) -> Option<(
+    &mut LsaHeader,
+    &mut [RemoteIslandEntry],
+    &mut [RemoteNodeEntry],
+    &mut [RemoteRouteEntry],
+    &mut [RemoteVpnEntry],
+)> {
+    let header_offset = layout.header_offset;
+    let islands_offset = layout.island_offset;
+    let nodes_offset = layout.remote_node_offset;
+    let routes_offset = layout.remote_route_offset;
+    let vpns_offset = layout.remote_vpn_offset;
+    let islands_len = MAX_REMOTE_ISLANDS as usize;
+    let nodes_len = MAX_REMOTE_NODES as usize;
+    let routes_len = MAX_REMOTE_ROUTES as usize;
+    let vpns_len = MAX_REMOTE_VPNS as usize;
+    let len = mmap.len();
+    let base = mmap.as_mut_ptr();
+    if header_offset + size_of::<LsaHeader>() > len {
+        return None;
+    }
+    if vpns_offset + size_of::<RemoteVpnEntry>() * vpns_len > len {
+        return None;
+    }
+    unsafe {
+        let header_ptr = base.add(header_offset) as *mut LsaHeader;
+        let islands_ptr = base.add(islands_offset) as *mut RemoteIslandEntry;
+        let nodes_ptr = base.add(nodes_offset) as *mut RemoteNodeEntry;
+        let routes_ptr = base.add(routes_offset) as *mut RemoteRouteEntry;
+        let vpns_ptr = base.add(vpns_offset) as *mut RemoteVpnEntry;
+        Some((
+            &mut *header_ptr,
+            std::slice::from_raw_parts_mut(islands_ptr, islands_len),
+            std::slice::from_raw_parts_mut(nodes_ptr, nodes_len),
+            std::slice::from_raw_parts_mut(routes_ptr, routes_len),
+            std::slice::from_raw_parts_mut(vpns_ptr, vpns_len),
+        ))
+    }
+}
+
+fn header_and_slice_mut<T, U>(
+    mmap: &mut MmapMut,
+    header_offset: usize,
+    slice_offset: usize,
+    slice_len: usize,
+) -> Option<(&mut T, &mut [U])> {
+    let header_size = size_of::<T>();
+    let slice_size = size_of::<U>().checked_mul(slice_len)?;
+    if header_offset + header_size > mmap.len() {
+        return None;
+    }
+    if slice_offset + slice_size > mmap.len() {
+        return None;
+    }
+    let base = mmap.as_mut_ptr();
+    unsafe {
+        let header_ptr = base.add(header_offset) as *mut T;
+        let slice_ptr = base.add(slice_offset) as *mut U;
+        Some((
+            &mut *header_ptr,
+            std::slice::from_raw_parts_mut(slice_ptr, slice_len),
+        ))
+    }
 }
 
 fn align_up(value: usize, align: usize) -> usize {
