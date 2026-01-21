@@ -93,6 +93,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vpns = vpns.len(),
         "config region written"
     );
+    for vpn in &sy_config.vpns {
+        tracing::info!(
+            pattern = %vpn.pattern,
+            match_kind = %vpn.match_kind,
+            vpn_id = vpn.vpn_id,
+            "vpn rule loaded"
+        );
+    }
 
     let _client = NodeClient::connect(NodeConfig {
         name: "SY.config.routes".to_string(),

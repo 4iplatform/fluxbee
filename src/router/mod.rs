@@ -498,6 +498,12 @@ async fn refresh_config(
             (a.priority, a.metric).cmp(&(b.priority, b.metric))
         });
         *version_guard = snapshot.header.config_version;
+        tracing::info!(
+            config_version = snapshot.header.config_version,
+            routes = snapshot.routes.len(),
+            vpns = snapshot.vpns.len(),
+            "config snapshot updated"
+        );
     }
     Some(snapshot)
 }
@@ -509,6 +515,9 @@ fn assign_vpn(name: &str, snapshot: Option<&ConfigSnapshot>) -> u32 {
     let Some(snapshot) = snapshot else {
         return 0;
     };
+    if snapshot.vpns.is_empty() {
+        tracing::warn!("vpn table empty in config snapshot");
+    }
     let mut rules: Vec<(u16, &str, u8, u32, u16)> = Vec::new();
     for entry in &snapshot.vpns {
         let flags = entry.flags;
