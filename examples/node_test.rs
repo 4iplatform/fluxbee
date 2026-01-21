@@ -20,8 +20,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/var/lib/json-router/nodes"));
 
+    let args: Vec<String> = std::env::args().collect();
+    let mode = args.get(1).map(|s| s.as_str()).unwrap_or("echo");
+    let node_name = match mode {
+        "listen" => "WF.listen",
+        _ => "WF.echo",
+    };
+
     let mut client = NodeClient::connect(NodeConfig {
-        name: "WF.test".to_string(),
+        name: node_name.to_string(),
         router_socket: socket_dir.join("router.sock"),
         uuid_persistence_dir: nodes_dir,
         config_dir,
@@ -35,6 +42,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.uuid(),
         client.vpn_id()
     );
+
+    if mode == "listen" {
+        println!("listen mode: waiting for messages");
+        loop {
+            let msg = client.recv().await?;
+            println!(
+                "received: src={} dst={:?} type={} msg={:?} payload={}",
+                msg.routing.src,
+                msg.routing.dst,
+                msg.meta.msg_type,
+                msg.meta.msg,
+                msg.payload
+            );
+        }
+    }
 
     let mut seq = 1u64;
     loop {
@@ -53,21 +75,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 priority: None,
                 context: None,
             },
-            payload: json!({"type": "text", "content": format!("HOLA {}", seq)}),
+            payload: json!({\"type\": \"text\", \"content\": format!(\"HOLA {}\", seq)}),
         };
         client.send(&msg).await?;
-        println!("sent HOLA {}", seq);
+        println!(\"sent HOLA {}\", seq);
 
         let trace_id = Uuid::new_v4().to_string();
         let echo = build_echo(&client.uuid().to_string(), Destination::Broadcast, &trace_id);
         client.send(&echo).await?;
-        println!("sent ECHO");
+        println!(\"sent ECHO\");
 
         let trace_id = Uuid::new_v4().to_string();
         let echo_reply =
             build_echo_reply(&client.uuid().to_string(), Destination::Broadcast, &trace_id);
         client.send(&echo_reply).await?;
-        println!("sent ECHO_REPLY");
+        println!(\"sent ECHO_REPLY\");
 
         let trace_id = Uuid::new_v4().to_string();
         let now_ms = now_epoch_ms();
@@ -76,23 +98,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Destination::Broadcast,
             &trace_id,
             TimeSyncPayload {
-                timestamp_utc: "1970-01-01T00:00:00Z".to_string(),
+                timestamp_utc: \"1970-01-01T00:00:00Z\".to_string(),
                 epoch_ms: now_ms,
                 seq,
             },
         );
         client.send(&time_sync).await?;
-        println!("sent TIME_SYNC");
-
-        let trace_id = Uuid::new_v4().to_string();
-        let withdraw = build_withdraw(
-            &client.uuid().to_string(),
-            Destination::Broadcast,
-            &trace_id,
-            &client.uuid().to_string(),
-        );
-        client.send(&withdraw).await?;
-        println!("sent WITHDRAW");
+        println!(\"sent TIME_SYNC\");
 
         seq += 1;
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
