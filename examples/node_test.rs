@@ -30,6 +30,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let island_id = load_island_id(&config_dir)?;
     let target_name = normalize_target(target, &island_id);
+    println!(
+        "connecting: name={} socket={} config={} uuid_dir={}",
+        node_name,
+        socket_dir.join("router.sock").display(),
+        config_dir.display(),
+        nodes_dir.display()
+    );
+
     let mut client = NodeClient::connect(NodeConfig {
         name: node_name.to_string(),
         router_socket: socket_dir.join("router.sock"),
@@ -40,10 +48,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     println!(
-        "connected as {} (uuid={}, vpn={})",
+        "connected as {} (uuid={}, vpn={}, router={})",
         client.name(),
         client.uuid(),
-        client.vpn_id()
+        client.vpn_id(),
+        client.router_name()
     );
 
     if mode == "listen" {

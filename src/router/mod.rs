@@ -73,6 +73,7 @@ impl Router {
 
         loop {
             let (stream, _) = listener.accept().await?;
+            tracing::info!("incoming connection accepted");
             let shm = Arc::clone(&self.shm);
             let router_name = self.cfg.router_l2_name.clone();
             let router_uuid = self.cfg.router_uuid;
