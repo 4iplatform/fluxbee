@@ -57,7 +57,7 @@ impl Router {
                 if let Err(err) =
                     handle_node(stream, shm, router_uuid, &router_name, &island_id).await
                 {
-                    eprintln!("node connection error: {err}");
+                    tracing::warn!("node connection error: {err}");
                 }
             });
         }
@@ -104,6 +104,7 @@ async fn handle_node(
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     }
 
+    tracing::info!(node = %node_uuid, name = %node_name, "node registered");
     let announce = build_announce(
         &router_uuid.to_string(),
         &msg.routing.src,
@@ -130,6 +131,7 @@ async fn handle_node(
         let mut shm = shm.lock().await;
         let _ = shm.unregister_node(node_uuid);
     }
+    tracing::info!(node = %node_uuid, "node disconnected");
     Ok(())
 }
 
