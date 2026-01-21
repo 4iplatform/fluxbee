@@ -17,6 +17,17 @@ JSR_SOCKET_DIR=./run \\
 cargo run
 ```
 
+## Nodo de prueba
+
+Ejecutar un nodo de prueba que envía un mensaje `HOLA`:
+
+```sh
+JSR_CONFIG_DIR=/etc/json-router \
+JSR_SOCKET_DIR=/var/run/json-router \
+JSR_NODE_UUID_DIR=/var/lib/json-router/nodes \
+cargo run --example node_test
+```
+
 ## Instalación rápida (server de prueba)
 
 Script de instalación base:
