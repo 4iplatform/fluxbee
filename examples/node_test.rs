@@ -6,10 +6,16 @@ use json_router::protocol::{
     Routing, TimeSyncPayload,
 };
 use serde_json::json;
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(log_level))
+        .init();
+
     let config_dir = std::env::var("JSR_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/etc/json-router"));

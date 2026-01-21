@@ -135,6 +135,7 @@ async fn handle_node(
             "expected HELLO",
         )));
     }
+    tracing::info!(src = %msg.routing.src, "hello received");
     let payload: NodeHelloPayload = serde_json::from_value(msg.payload)?;
     let src_uuid = Uuid::parse_str(&msg.routing.src)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid routing.src"))?;

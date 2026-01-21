@@ -53,6 +53,11 @@ impl NodeClient {
         let (full_name, base_name) = normalize_name(&config.name, &island_id);
         let uuid = load_or_create_uuid(&config.uuid_persistence_dir, &base_name)?;
         let mut stream = UnixStream::connect(&config.router_socket).await?;
+        tracing::info!(
+            socket = %config.router_socket.display(),
+            name = %full_name,
+            "connected to router socket"
+        );
 
         let trace_id = Uuid::new_v4().to_string();
         let hello = build_hello(
@@ -65,8 +70,10 @@ impl NodeClient {
             },
         );
         let payload = serde_json::to_vec(&hello)?;
+        tracing::info!(name = %full_name, "sending HELLO");
         write_frame(&mut stream, &payload).await?;
 
+        tracing::info!("waiting for ANNOUNCE");
         let announce = read_frame(&mut stream)
             .await?
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "announce"))?;
