@@ -22,6 +22,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("echo");
+    let target = args
+        .get(2)
+        .map(|s| s.as_str())
+        .unwrap_or("WF.listen");
     let node_name = match mode {
         "listen" => "WF.listen",
         _ => "WF.echo",
@@ -60,36 +64,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut seq = 1u64;
     loop {
+        let (dst, target_name) = if mode == "unicast" {
+            (Destination::Resolve, Some(target.to_string()))
+        } else {
+            (Destination::Broadcast, None)
+        };
         let msg = Message {
             routing: Routing {
                 src: client.uuid().to_string(),
-                dst: Destination::Broadcast,
+                dst,
                 ttl: 1,
                 trace_id: Uuid::new_v4().to_string(),
             },
             meta: Meta {
                 msg_type: "user".to_string(),
                 msg: None,
-                target: None,
+                target: target_name,
                 action: None,
                 priority: None,
                 context: None,
             },
-            payload: json!({\"type\": \"text\", \"content\": format!(\"HOLA {}\", seq)}),
+            payload: json!({"type": "text", "content": format!("HOLA {}", seq)}),
         };
         client.send(&msg).await?;
-        println!(\"sent HOLA {}\", seq);
+        println!("sent HOLA {}", seq);
 
         let trace_id = Uuid::new_v4().to_string();
         let echo = build_echo(&client.uuid().to_string(), Destination::Broadcast, &trace_id);
         client.send(&echo).await?;
-        println!(\"sent ECHO\");
+        println!("sent ECHO");
 
         let trace_id = Uuid::new_v4().to_string();
         let echo_reply =
             build_echo_reply(&client.uuid().to_string(), Destination::Broadcast, &trace_id);
         client.send(&echo_reply).await?;
-        println!(\"sent ECHO_REPLY\");
+        println!("sent ECHO_REPLY");
 
         let trace_id = Uuid::new_v4().to_string();
         let now_ms = now_epoch_ms();
@@ -98,13 +107,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Destination::Broadcast,
             &trace_id,
             TimeSyncPayload {
-                timestamp_utc: \"1970-01-01T00:00:00Z\".to_string(),
+                timestamp_utc: "1970-01-01T00:00:00Z".to_string(),
                 epoch_ms: now_ms,
                 seq,
             },
         );
         client.send(&time_sync).await?;
-        println!(\"sent TIME_SYNC\");
+        println!("sent TIME_SYNC");
 
         seq += 1;
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
