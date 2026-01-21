@@ -43,3 +43,14 @@ Variables opcionales:
 - `JSR_SOCKET_DIR` (default `/var/run/json-router`)
 - `JSR_ISLAND_ID` (default `sandbox`)
 - `JSR_ROUTER_NAME` (default `RT.primary`)
+
+## SY.config.routes
+
+Ejecutar el servicio de config:
+
+```sh
+JSR_CONFIG_DIR=/etc/json-router \
+JSR_STATE_DIR=/var/lib/json-router \
+JSR_SOCKET_DIR=/var/run/json-router \
+cargo run --bin sy_config_routes
+```
