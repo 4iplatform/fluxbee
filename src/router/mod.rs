@@ -255,44 +255,54 @@ async fn handle_message(
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     router_uuid: Uuid,
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
-    snapshot: Option<&ConfigSnapshot>,
+    _snapshot: Option<&ConfigSnapshot>,
 ) -> Result<(), RouterError> {
-    if msg.routing.ttl == 0 {
-        send_ttl_exceeded(msg, nodes, router_uuid).await?;
-        return Ok(());
-    }
-
     let src_uuid = match Uuid::parse_str(&msg.routing.src) {
         Ok(uuid) => uuid,
         Err(_) => return Ok(()),
     };
-    let nodes_guard = nodes.lock().await;
-    let Some(src_handle) = nodes_guard.get(&src_uuid) else {
+    let mut senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = Vec::new();
+    let src_handle = {
+        let nodes_guard = nodes.lock().await;
+        nodes_guard.get(&src_uuid).cloned()
+    };
+    let Some(src_handle) = src_handle else {
         return Ok(());
     };
+
+    if msg.routing.ttl == 0 {
+        send_ttl_exceeded_to(msg, &src_handle.sender, router_uuid)?;
+        return Ok(());
+    }
+
     match &msg.routing.dst {
         Destination::Unicast(dst) => {
             let Ok(dst_uuid) = Uuid::parse_str(dst) else {
-                send_unreachable(msg, nodes, router_uuid, "INVALID_DST").await?;
+                send_unreachable_to(msg, &src_handle.sender, router_uuid, "INVALID_DST")?;
                 return Ok(());
             };
-            if let Some(dst_handle) = nodes_guard.get(&dst_uuid) {
-                if can_route(src_handle, dst_handle) {
-                    let _ = dst_handle.sender.send(serde_json::to_vec(msg)?);
+            let dst_handle = {
+                let nodes_guard = nodes.lock().await;
+                nodes_guard.get(&dst_uuid).cloned()
+            };
+            if let Some(dst_handle) = dst_handle {
+                if can_route(&src_handle, &dst_handle) {
+                    senders.push(dst_handle.sender);
                 } else {
-                    send_unreachable(msg, nodes, router_uuid, "VPN_BLOCKED").await?;
+                    send_unreachable_to(msg, &src_handle.sender, router_uuid, "VPN_BLOCKED")?;
                 }
             } else {
-                send_unreachable(msg, nodes, router_uuid, "NODE_NOT_FOUND").await?;
+                send_unreachable_to(msg, &src_handle.sender, router_uuid, "NODE_NOT_FOUND")?;
             }
         }
         Destination::Broadcast => {
             let target = msg.meta.target.as_deref();
+            let nodes_guard = nodes.lock().await;
             for (uuid, handle) in nodes_guard.iter() {
                 if *uuid == src_uuid {
                     continue;
                 }
-                if !can_route(src_handle, handle) {
+                if !can_route(&src_handle, handle) {
                     continue;
                 }
                 if let Some(pattern) = target {
@@ -300,50 +310,59 @@ async fn handle_message(
                         continue;
                     }
                 }
-                let _ = handle.sender.send(serde_json::to_vec(msg)?);
+                senders.push(handle.sender.clone());
             }
         }
         Destination::Resolve => {
             let Some(target) = msg.meta.target.as_deref() else {
-                send_unreachable(msg, nodes, router_uuid, "MISSING_TARGET").await?;
+                send_unreachable_to(msg, &src_handle.sender, router_uuid, "MISSING_TARGET")?;
                 return Ok(());
             };
-            let route = resolve_by_name(target, src_handle, &nodes_guard, static_routes).await?;
+            let nodes_guard = nodes.lock().await;
+            let route = resolve_by_name(target, &src_handle, &nodes_guard, static_routes).await?;
             match route {
                 ResolvedRoute::Drop => {}
                 ResolvedRoute::Unreachable(reason) => {
-                    send_unreachable(msg, nodes, router_uuid, reason).await?;
+                    send_unreachable_to(msg, &src_handle.sender, router_uuid, reason)?;
                 }
                 ResolvedRoute::Deliver(dst_uuid) => {
                     if let Some(dst_handle) = nodes_guard.get(&dst_uuid) {
-                        let _ = dst_handle.sender.send(serde_json::to_vec(msg)?);
+                        if can_route(&src_handle, dst_handle) {
+                            senders.push(dst_handle.sender.clone());
+                        } else {
+                            send_unreachable_to(msg, &src_handle.sender, router_uuid, "VPN_BLOCKED")?;
+                        }
                     } else {
-                        send_unreachable(msg, nodes, router_uuid, "NODE_NOT_FOUND").await?;
+                        send_unreachable_to(msg, &src_handle.sender, router_uuid, "NODE_NOT_FOUND")?;
                     }
                 }
                 ResolvedRoute::ForwardIsland(_) => {
-                    send_unreachable(msg, nodes, router_uuid, "INTER_ISLAND_UNSUPPORTED").await?;
+                    send_unreachable_to(
+                        msg,
+                        &src_handle.sender,
+                        router_uuid,
+                        "INTER_ISLAND_UNSUPPORTED",
+                    )?;
                 }
             }
+        }
+    }
+
+    if !senders.is_empty() {
+        let data = serde_json::to_vec(msg)?;
+        for sender in senders {
+            let _ = sender.send(data.clone());
         }
     }
     Ok(())
 }
 
-async fn send_unreachable(
+fn send_unreachable_to(
     msg: &Message,
-    nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
+    sender: &mpsc::UnboundedSender<Vec<u8>>,
     router_uuid: Uuid,
     reason: &str,
 ) -> Result<(), RouterError> {
-    let src_uuid = match Uuid::parse_str(&msg.routing.src) {
-        Ok(uuid) => uuid,
-        Err(_) => return Ok(()),
-    };
-    let nodes_guard = nodes.lock().await;
-    let Some(src_handle) = nodes_guard.get(&src_uuid) else {
-        return Ok(());
-    };
     let original_dst = match &msg.routing.dst {
         Destination::Unicast(value) => value.clone(),
         Destination::Broadcast => "broadcast".to_string(),
@@ -356,23 +375,15 @@ async fn send_unreachable(
         &original_dst,
         reason,
     );
-    let _ = src_handle.sender.send(serde_json::to_vec(&err)?);
+    let _ = sender.send(serde_json::to_vec(&err)?);
     Ok(())
 }
 
-async fn send_ttl_exceeded(
+fn send_ttl_exceeded_to(
     msg: &Message,
-    nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
+    sender: &mpsc::UnboundedSender<Vec<u8>>,
     router_uuid: Uuid,
 ) -> Result<(), RouterError> {
-    let src_uuid = match Uuid::parse_str(&msg.routing.src) {
-        Ok(uuid) => uuid,
-        Err(_) => return Ok(()),
-    };
-    let nodes_guard = nodes.lock().await;
-    let Some(src_handle) = nodes_guard.get(&src_uuid) else {
-        return Ok(());
-    };
     let original_dst = match &msg.routing.dst {
         Destination::Unicast(value) => value.clone(),
         Destination::Broadcast => "broadcast".to_string(),
@@ -385,7 +396,7 @@ async fn send_ttl_exceeded(
         &original_dst,
         &router_name(router_uuid),
     );
-    let _ = src_handle.sender.send(serde_json::to_vec(&err)?);
+    let _ = sender.send(serde_json::to_vec(&err)?);
     Ok(())
 }
 
@@ -412,6 +423,16 @@ struct NodeHandle {
     name: String,
     vpn_id: u32,
     sender: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl Clone for NodeHandle {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            vpn_id: self.vpn_id,
+            sender: self.sender.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
