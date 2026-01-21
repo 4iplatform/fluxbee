@@ -10,472 +10,379 @@
 
 | Concepto | En redes IP | En este sistema |
 |----------|-------------|-----------------|
-| **RIB** | Todas las rutas candidatas | Datos en todas las regiones shm |
-| **FIB** | Rutas ganadoras para forwarding | Cache en memoria local del router |
-| **Next-hop** | Router vecino al que enviar | `next_hop_router` en RouteEntry |
-| **Admin distance** | Preferencia por origen | `admin_distance` (CONNECTED < STATIC < LSA) |
-| **LPM** | Matcheo más específico gana | `prefix_len` + `match_kind` |
-| **VRF** | Tabla de routing aislada | `vpn_id` (v1.13) |
+| **RIB** | Todas las rutas candidatas | Datos en todas las regiones SHM |
+| **FIB** | Rutas ganadoras | Cache en memoria local del router |
+| **Next-hop** | Router vecino | UUID del router o isla destino |
+| **Admin distance** | Preferencia por origen | LOCAL < STATIC < LSA |
+| **LPM** | Matcheo más específico | `prefix_len` + `match_kind` |
 
 ---
 
-## 2. VPN = Zonas / VRF dentro de una Isla (v1.13)
+## 2. Fuentes de Rutas
 
-### 2.1 Definición
+El router construye su FIB a partir de tres fuentes:
 
-Una **VPN** es una zona lógica (VRF-like) dentro de una isla:
-
-- El router mantiene una vista de routing separada (RIB/FIB por `vpn_id`)
-- Los nodos en una VPN solo ven nodos/rutas de su misma VPN
-- El aislamiento es **arquitectónico**, no "policy best-effort"
-
-**Dominio efectivo:**
-
-```
-domain = (island_id, vpn_id)
-```
-
-**Convención:**
-- `vpn_id = 0` es "global" (default, todos se ven)
-- `vpn_id != 0` son zonas aisladas
-
-### 2.2 Pertenencia de Nodo a VPN
-
-Cada nodo pertenece a **exactamente una VPN** (`vpn_id`).
-
-- Default: `vpn_id = 0` (global)
-- La pertenencia la decide el **router por configuración**, no el nodo
-- Se asigna al nodo al conectar (via membership rules)
-
-### 2.3 Routing por VPN
-
-Cuando el router resuelve `dst` dentro de isla:
-
-```
-1. Obtener vpn_id del nodo origen (o del mensaje)
-2. Lookup se hace en la tabla del dominio vpn_id
-3. Si no existe destino en esa VPN → UNREACHABLE_IN_VPN
-```
-
-### 2.4 Forwarding
-
-Un mensaje con `routing.vpn = X` solo puede rutear a destinos dentro de la misma VPN X, **salvo reglas explícitas de leak**.
-
-### 2.5 Broadcast
-
-- **Broadcast de negocio** respeta VPN: se entrega solo a nodos de la misma VPN
-- **Broadcast de sistema** (`meta.type="system"`) ignora VPN (infra esencial)
-
-### 2.6 Leak entre VPNs
-
-Se permiten reglas explícitas de **leak**:
-
-```
-from_vpn → to_vpn
-pattern de destinos permitidos
-```
-
-Sin leak, el aislamiento es total.
+| Fuente | Región SHM | Admin Distance | Descripción |
+|--------|------------|----------------|-------------|
+| LOCAL | `jsr-<uuid>` (propios + peers) | 0 | Nodos conectados a routers de esta isla |
+| STATIC | `jsr-config-<island>` | 1 | Rutas configuradas |
+| REMOTE | `jsr-lsa-<island>` | 2 | Nodos de otras islas (via LSA) |
 
 ---
 
-## 3. Tabla de Ruteo (RIB)
+## 3. VPN = Zonas de Aislamiento
 
-### 3.1 Tipos de Ruta
+### 3.1 Concepto
 
-| Tipo | route_type | admin_distance | Origen |
-|------|------------|----------------|--------|
-| CONNECTED | 0 | 0 | Nodo conectado directamente al router |
-| STATIC | 1 | 1 | Configurada en región de config |
-| LSA | 2 | 10 | Aprendida de otro router |
+Una VPN es una subred aislada dentro de la isla. Nodos en distintas VPNs no se ven entre sí.
 
-### 3.2 Selección de Mejor Ruta
+### 3.2 Tabla VPN
 
-Cuando hay múltiples rutas al mismo destino:
-
-1. **Longest Prefix Match (LPM)**: La ruta más específica gana
-2. **Admin Distance**: Menor valor gana (CONNECTED < STATIC < LSA)
-3. **Metric**: Menor costo gana
-4. **Installed At**: La más vieja gana (estabilidad)
-
-### 3.3 Rutas CONNECTED (automáticas)
-
-Cuando un nodo conecta, el router crea automáticamente una ruta CONNECTED:
+La tabla VPN vive en `jsr-config-<island>`:
 
 ```
-prefix: <nombre capa 2 del nodo>
-prefix_len: longitud exacta
-match_kind: EXACT
-next_hop_router: <uuid del router local>
-out_link: LINK_LOCAL (0)
-admin_distance: AD_CONNECTED (0)
-route_type: ROUTE_CONNECTED
-vpn_id: <vpn asignado al nodo>
+pattern           → vpn_id
+─────────────────────────────
+AI.soporte.*      → 10
+AI.ventas.*       → 20
+WF.crm.*          → 20
+(default)         → 0
 ```
 
-### 3.4 Rutas STATIC (configuradas)
+### 3.3 Asignación de VPN
 
-Las rutas estáticas se configuran centralizadamente mediante `SY.config.routes`. Ver documento `06-config-shm.md`.
+Cuando un nodo conecta y envía HELLO:
 
+```rust
+fn assign_vpn(&self, node_name: &str) -> u32 {
+    // Evaluar reglas en orden de priority (menor primero)
+    for rule in self.vpn_table.iter()
+        .filter(|r| r.flags & FLAG_ACTIVE != 0)
+        .sorted_by_key(|r| r.priority)
+    {
+        if pattern_match(&rule.pattern, rule.match_kind, node_name) {
+            return rule.vpn_id;
+        }
+    }
+    0  // Default: VPN global
+}
 ```
-SY.config.routes → /jsr-config-<island> → Routers leen → FIB actualizada
+
+### 3.4 Filtro VPN en Routing
+
+Al buscar destino:
+
+```rust
+fn find_route(&self, dst_name: &str, src_vpn: u32, src_is_sy: bool) -> Option<Route> {
+    // Nodos SY.* ignoran filtro VPN
+    if src_is_sy {
+        return self.fib.lookup(dst_name);
+    }
+    
+    // Otros nodos solo ven su VPN
+    self.fib.lookup_in_vpn(dst_name, src_vpn)
+}
 ```
 
-### 3.5 Rutas LSA (aprendidas)
+### 3.5 Excepción: Nodos SY.*
 
-Recibidas de otros routers de la misma isla via SHM. El router instala estas rutas con `admin_distance = AD_LSA`.
+Los nodos de sistema (`SY.*`) son **inmunes a VPN**:
+
+- Pueden enviar a cualquier nodo de cualquier VPN
+- Pueden recibir mensajes de cualquier VPN
+- Esto permite que `SY.config.routes`, `SY.admin`, etc. operen sin restricciones
+
+```rust
+fn is_system_node(name: &str) -> bool {
+    name.starts_with("SY.") || name.starts_with("RT.")
+}
+```
 
 ---
 
 ## 4. Construcción de la FIB
 
-El router construye su FIB en memoria local leyendo todas las regiones.
-
-### 4.1 Tabla peer_links
-
-El router mantiene una tabla local que mapea cada peer a su link:
+### 4.1 Algoritmo
 
 ```rust
-peer_links: HashMap<Uuid, u32>  // peer_uuid → link_id
-```
-
-**Cómo se llena:**
-- Al recibir un HELLO por un uplink, se registra el link
-- `peer_links[peer_uuid] = link_id`
-
-### 4.2 Algoritmo de construcción
-
-```
-FIB = []  // Separada por vpn_id
-
-// 1. Agregar mis rutas CONNECTED (nodos locales)
-for node in mi_region.nodes:
-    if node.flags & FLAG_ACTIVE:
-        FIB[node.vpn_id].add(RouteEntry {
-            prefix: node.name,
+fn build_fib(&mut self) {
+    self.fib.clear();
+    
+    // 1. Nodos locales (mi región)
+    for node in self.my_nodes.iter() {
+        self.fib.add(FibEntry {
+            prefix: node.name.clone(),
             match_kind: MATCH_EXACT,
-            out_link: LINK_LOCAL (0),
-            admin_distance: AD_CONNECTED,
-            route_type: ROUTE_CONNECTED,
-        })
-
-// 2. Agregar nodos de peers como rutas LSA
-for peer_region in peers_mapeados:
-    if peer_region.heartbeat es reciente:
-        let link_id = peer_links.get(peer_region.router_uuid)
-        if link_id.is_none():
-            continue
-        
-        for node in peer_region.nodes:
-            if node.flags & FLAG_ACTIVE:
-                FIB[node.vpn_id].add(RouteEntry {
-                    prefix: node.name,
+            vpn_id: node.vpn_id,
+            next_hop: NextHop::Local(node.uuid),
+            admin_distance: 0,  // LOCAL
+            source: RouteSource::Local,
+        });
+    }
+    
+    // 2. Nodos de peers (misma isla)
+    for peer in self.peer_regions.iter() {
+        if is_region_stale(&peer.header) {
+            continue;
+        }
+        for node in peer.nodes.iter() {
+            self.fib.add(FibEntry {
+                prefix: node.name.clone(),
+                match_kind: MATCH_EXACT,
+                vpn_id: node.vpn_id,
+                next_hop: NextHop::Router(peer.router_uuid),
+                admin_distance: 0,  // LOCAL (mismo admin_distance que local)
+                source: RouteSource::Peer,
+            });
+        }
+    }
+    
+    // 3. Rutas estáticas (config)
+    if let Some(config) = &self.config_region {
+        for route in config.static_routes.iter() {
+            self.fib.add(FibEntry {
+                prefix: route.prefix.clone(),
+                match_kind: route.match_kind,
+                vpn_id: 0,  // Las estáticas aplican a todas las VPNs
+                next_hop: if route.next_hop_island.is_empty() {
+                    NextHop::Resolve  // Resolver localmente
+                } else {
+                    NextHop::Island(route.next_hop_island.clone())
+                },
+                admin_distance: 1,  // STATIC
+                source: RouteSource::Static,
+                action: route.action,
+            });
+        }
+    }
+    
+    // 4. Nodos remotos (LSA)
+    if let Some(lsa) = &self.lsa_region {
+        for island in lsa.islands.iter() {
+            for node in island.nodes.iter() {
+                self.fib.add(FibEntry {
+                    prefix: node.name.clone(),
                     match_kind: MATCH_EXACT,
-                    next_hop_router: peer_region.router_uuid,
-                    out_link: link_id,
-                    admin_distance: AD_LSA,
-                    route_type: ROUTE_LSA,
-                })
-
-// 3. Agregar rutas STATIC de config (por vpn_scope)
-for route in config_region.static_routes:
-    if route.flags & FLAG_ACTIVE:
-        if route.vpn_scope == 0:
-            // Instalar en todas las VPNs
-            for vpn_id in all_vpns:
-                FIB[vpn_id].add(route)
-        else:
-            // Instalar solo en esa VPN
-            FIB[route.vpn_scope].add(route)
-
-// 4. Ordenar cada FIB[vpn] para lookup rápido
-for vpn_id in all_vpns:
-    FIB[vpn_id].sort_by(|a, b| {
-        // LPM: más específico primero (prefix_len desc)
-        // Luego admin_distance menor
-        // Luego metric menor
-    })
-```
-
-### 4.3 Semántica de LINK_LOCAL
-
-**LINK_LOCAL (0) significa:** El nodo está conectado directamente a MIS sockets.
-
-**Para nodos de otros routers:** Siempre se usa un `link_id` de uplink (1..N), incluso si el peer está en el mismo host.
-
----
-
-## 5. Algoritmo de Selección de Ruta
-
-Cuando el router necesita encontrar destino para un mensaje:
-
-```
-1. Obtener vpn_id del mensaje (del nodo origen o routing.vpn)
-
-2. Parsear @isla del destino (nombre L2)
-   - Si isla_destino != isla_local → forwarding inter-isla (ver sección 6)
-
-3. Buscar en FIB[vpn_id] todas las rutas que matchean el destino
-
-4. Filtrar solo FLAG_ACTIVE
-
-5. Ordenar por:
-   a. prefix_len descendente (LPM: más específico primero)
-   b. admin_distance ascendente (menor = preferido)
-   c. metric ascendente (menor costo)
-
-6. Tomar la primera (ganadora)
-
-7. Según action de la ruta:
-   - ACTION_FORWARD (0): continuar a paso 8
-   - ACTION_DROP (1): descartar mensaje, fin
-
-8. Si out_link == LINK_LOCAL:
-   → Nodo conectado a MI socket, entregar directamente
-
-9. Si out_link > 0:
-   → Enviar por ese uplink al next_hop_router (IRP)
-```
-
-### 5.1 Verificación de VPN Leaks
-
-Si el lookup en `FIB[vpn_id]` no encuentra destino, verificar leak rules:
-
-```
-for leak_rule in vpn_leak_rules:
-    if leak_rule.from_vpn == vpn_id:
-        if destination matches leak_rule.pattern:
-            // Buscar en FIB[leak_rule.to_vpn]
-            route = lookup(FIB[leak_rule.to_vpn], destination)
-            if route:
-                return route
-```
-
----
-
-## 6. Orden de Evaluación Recomendado (v1.13)
-
-```
-(1) Validar/normalizar destino (parsear @isla)
-
-(2) Resolver vpn efectivo:
-    - Por nodo origen (vpn_id asignado)
-    - O por routing.vpn del mensaje (normalizado)
-
-(3) Aplicar rutas estáticas (FORWARD/DROP) dentro del vpn_scope
-
-(4) Resolver destino:
-    - Si @isla == local: lookup en FIB[vpn]
-    - Si @isla != local: enviar al gateway inter-isla
-
-(5) Si no se encuentra en FIB[vpn]:
-    - Verificar leak rules
-    - Si no hay leak: UNREACHABLE_IN_VPN
-
-(6) OPA solo si corresponde (dst=null, policies de negocio)
-```
-
----
-
-## 7. Forwarding Inter-Isla (v1.13)
-
-### 7.1 Principio
-
-El routing inter-isla se decide parseando `@isla` del destino. **No hay LSA de nodos entre islas.**
-
-### 7.2 Algoritmo
-
-```
-1. Parsear dst_island desde el nombre L2 destino (@isla)
-
-2. Si dst_island == local_island:
-   → Routing intra-isla normal (ver sección 5)
-
-3. Si dst_island != local_island:
-   a. Si router actual NO es gateway:
-      → Forward al gateway por IRP (fabric intra-isla)
-   b. Si router actual ES gateway:
-      → Buscar conexión a dst_island
-      → Si existe: enviar por TCP
-      → Si no existe: NO_ROUTE_TO_ISLAND
-
-4. TTL: decrementa al cruzar inter-isla
-```
-
-### 7.3 Gateway Único por Isla (v1.13)
-
-Cada isla tiene **un único Router Gateway** que mantiene uplinks TCP hacia otras islas.
-
-- Los demás routers de la isla NO levantan WAN
-- Los demás routers reenvían tráfico inter-isla al gateway por IRP
-
-Ver documento `05-conectividad.md` para detalles.
-
----
-
-## 8. Forwarding Completo
-
-```
-Mensaje entrante con dst = "AI.soporte.l1@staging"
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│ 1. Parsear @isla del destino            │
-│    → isla_destino = "staging"           │
-└─────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│ 2. ¿isla_destino == isla_local?         │
-│    → No (staging != produccion)         │
-└─────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│ 3. ¿Soy el gateway?                     │
-│    → No                                 │
-└─────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│ 4. Forward al gateway por IRP           │
-│    (fabric intra-isla)                  │
-└─────────────────────────────────────────┘
-    │
-    ▼
-[Gateway recibe]
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│ 5. Buscar conexión a isla "staging"     │
-│    → Encontrada en uplinks[]            │
-└─────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│ 6. Decrementar TTL                      │
-│    → TTL > 0, continuar                 │
-└─────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│ 7. Enviar por TCP a gateway de staging  │
-└─────────────────────────────────────────┘
-```
-
----
-
-## 9. Policies OPA
-
-Las policies OPA permiten decisiones de routing dinámicas basadas en metadata del mensaje.
-
-### 9.1 Cuándo se usa OPA
-
-OPA se consulta cuando `routing.dst = null`. El router necesita resolver el destino.
-
-### 9.2 Input para OPA
-
-```json
-{
-  "meta": { ... },
-  "routing": {
-    "src": "uuid-origen",
-    "vpn": 10
-  }
+                    vpn_id: node.vpn_id,
+                    next_hop: NextHop::Island(island.island_id.clone()),
+                    admin_distance: 2,  // REMOTE
+                    source: RouteSource::Lsa,
+                });
+            }
+        }
+    }
+    
+    // 5. Ordenar para lookup eficiente
+    self.fib.sort();
 }
 ```
 
-### 9.3 Output de OPA
+### 4.2 Orden de Prioridad
 
-```json
-{
-  "target": "AI.soporte.l1@produccion"
-}
-```
+Cuando hay múltiples rutas al mismo destino:
 
-### 9.4 Ejemplo de Policy (Rego)
-
-```rego
-package router
-
-default target = null
-
-# Clientes VIP van a soporte L2
-target = "AI.soporte.l2@produccion" {
-    input.meta.context.cliente_tier == "vip"
-}
-
-# Clientes standard van a soporte L1
-target = "AI.soporte.l1@produccion" {
-    input.meta.context.cliente_tier == "standard"
-}
-```
-
-### 9.5 Relación OPA vs VPN
-
-- **VPN** es aislamiento arquitectónico (el router lo impone)
-- **OPA** es decisión de negocio (resuelve destino)
-- VPN existe sin OPA
-- OPA opera dentro del contexto del VPN del nodo origen
+1. **Longest Prefix Match (LPM)**: Más específico gana
+2. **Admin Distance**: Menor gana (LOCAL < STATIC < REMOTE)
+3. **Metric**: Menor gana
+4. **Installed At**: Más viejo gana (estabilidad)
 
 ---
 
-## 10. Broadcast y Multicast
+## 5. Algoritmo de Routing
 
-### 10.1 Tipos de Destino
+### 5.1 Flujo Completo
+
+```
+Mensaje llega
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 1. Parsear destino                      │
+│    - Si dst = UUID → buscar por UUID    │
+│    - Si dst = null → OPA resuelve       │
+│    - Si dst = broadcast → multicast     │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 2. Extraer @isla del nombre destino     │
+│    "AI.soporte.l1@staging" → staging    │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 3. ¿Isla destino == mi isla?            │
+└─────────────────────────────────────────┘
+    │ Sí                    │ No
+    ▼                       ▼
+  Routing                 Routing
+  Intra-Isla             Inter-Isla
+```
+
+### 5.2 Routing Intra-Isla
+
+```rust
+fn route_intra_isla(&self, msg: &Message, dst_name: &str) -> Result<Action> {
+    let src_node = self.find_node_by_uuid(&msg.routing.src)?;
+    let src_vpn = src_node.vpn_id;
+    let src_is_sy = is_system_node(&src_node.name);
+    
+    // 1. Verificar rutas estáticas (tienen prioridad)
+    if let Some(static_route) = self.find_static_route(dst_name) {
+        match static_route.action {
+            ACTION_DROP => return Ok(Action::Drop),
+            ACTION_FORWARD => {
+                if !static_route.next_hop_island.is_empty() {
+                    return Ok(Action::SendToIsland(static_route.next_hop_island));
+                }
+                // Continuar con lookup normal
+            }
+        }
+    }
+    
+    // 2. Buscar en FIB (con filtro VPN)
+    let route = self.find_route(dst_name, src_vpn, src_is_sy)?;
+    
+    match route.next_hop {
+        NextHop::Local(uuid) => {
+            // Nodo está en mis sockets
+            Ok(Action::DeliverLocal(uuid))
+        }
+        NextHop::Router(router_uuid) => {
+            // Nodo está en otro router de la isla
+            Ok(Action::ForwardToRouter(router_uuid))
+        }
+        _ => Err(RouteError::Unreachable),
+    }
+}
+```
+
+### 5.3 Routing Inter-Isla
+
+```rust
+fn route_inter_isla(&self, msg: &Message, dst_name: &str, dst_island: &str) -> Result<Action> {
+    // 1. Verificar que conozco esa isla (vía LSA)
+    if !self.lsa_has_island(dst_island) {
+        return Err(RouteError::UnknownIsland(dst_island.to_string()));
+    }
+    
+    // 2. Verificar que el nodo existe en esa isla
+    if !self.lsa_has_node(dst_island, dst_name) {
+        return Err(RouteError::UnreachableRemote(dst_name.to_string()));
+    }
+    
+    // 3. ¿Soy el gateway?
+    if self.is_gateway {
+        // Enviar directo por TCP
+        Ok(Action::SendWan(dst_island.to_string()))
+    } else {
+        // Forward al gateway de mi isla por IRP
+        Ok(Action::ForwardToGateway)
+    }
+}
+```
+
+---
+
+## 6. Rutas Estáticas
+
+### 6.1 Prioridad
+
+Las rutas estáticas son **override explícito** y se evalúan **antes** del lookup normal.
+
+### 6.2 Acciones
+
+| Acción | Efecto |
+|--------|--------|
+| `ACTION_FORWARD` | Rutear normalmente (o a `next_hop_island` si está definido) |
+| `ACTION_DROP` | Descartar mensaje (blackhole) |
+
+### 6.3 Ejemplos
+
+```yaml
+# Bloquear acceso a nodos internos
+- prefix: "AI.interno.*"
+  action: DROP
+
+# Forzar backup a otra isla
+- prefix: "AI.backup.*"
+  action: FORWARD
+  next_hop_island: "disaster-recovery"
+
+# Ruta normal (solo para documentar)
+- prefix: "AI.soporte.*"
+  action: FORWARD
+```
+
+---
+
+## 7. Broadcast y Multicast
+
+### 7.1 Tipos
 
 | `dst` | `meta.target` | Comportamiento |
 |-------|---------------|----------------|
-| UUID | - | Unicast: entregar a ese nodo |
-| `null` | nombre capa 2 | Resolver via OPA, luego unicast |
-| `"broadcast"` | - | Broadcast: entregar a todos (respetando VPN) |
-| `"broadcast"` | patrón capa 2 | Multicast: entregar a nodos que matchean |
+| `"broadcast"` | ausente | A todos los nodos (respetando VPN) |
+| `"broadcast"` | patrón | A nodos que matchean el patrón (respetando VPN) |
 
-### 10.2 Broadcast respeta VPN
+### 7.2 Broadcast respeta VPN
 
-**Broadcast de negocio** (`meta.type != "system"`):
-
+```rust
+fn broadcast(&self, msg: &Message) -> Vec<Action> {
+    let src_node = self.find_node_by_uuid(&msg.routing.src)?;
+    let src_vpn = src_node.vpn_id;
+    let src_is_sy = is_system_node(&src_node.name);
+    let target_pattern = msg.meta.target.as_deref();
+    
+    let mut actions = Vec::new();
+    
+    for node in self.all_nodes() {
+        // Filtro VPN (excepto para SY.*)
+        if !src_is_sy && node.vpn_id != src_vpn {
+            continue;
+        }
+        
+        // Filtro por pattern (si existe)
+        if let Some(pattern) = target_pattern {
+            if !pattern_match(pattern, &node.name) {
+                continue;
+            }
+        }
+        
+        // No enviar al origen
+        if node.uuid == msg.routing.src {
+            continue;
+        }
+        
+        actions.push(Action::DeliverTo(node.uuid));
+    }
+    
+    actions
+}
 ```
-Para cada nodo en mi isla:
-    if nodo.vpn_id == mensaje.vpn:
-        if nodo.name matchea meta.target (si existe):
-            entregar
-```
 
-**Broadcast de sistema** (`meta.type == "system"`):
-
-```
-Para cada nodo en mi isla:
-    if nodo.name matchea meta.target (si existe):
-        entregar
-    // Ignora VPN - infra esencial
-```
-
-### 10.3 TTL en Broadcast
+### 7.3 TTL en Broadcast
 
 | TTL | Alcance |
 |-----|---------|
-| 1 | Solo nodos conectados a ESTE router |
-| 2 | Toda la isla (este router + peers via IRP) |
+| 1 | Solo mis nodos locales |
+| 2 | Toda la isla (mis nodos + peers via IRP) |
 | 3+ | Cruza WAN a otras islas |
 
-### 10.4 Prevención de Loops
-
-Cada router mantiene cache de `trace_id`:
+### 7.4 Prevención de Loops
 
 ```rust
 struct BroadcastCache {
     seen: HashMap<Uuid, Instant>,
-    ttl: Duration,  // 60 segundos
 }
 
 impl BroadcastCache {
-    fn check_and_add(&mut self, trace_id: Uuid) -> bool {
+    fn check_and_add(&mut self, trace_id: &Uuid) -> bool {
         self.cleanup_expired();
-        if self.seen.contains_key(&trace_id) {
-            false  // Ya visto, DROP
+        if self.seen.contains_key(trace_id) {
+            false  // Ya procesado, DROP
         } else {
-            self.seen.insert(trace_id, Instant::now());
+            self.seen.insert(*trace_id, Instant::now());
             true   // Nuevo, procesar
         }
     }
@@ -484,22 +391,138 @@ impl BroadcastCache {
 
 ---
 
-## 11. Balanceo entre Nodos del Mismo Rol
+## 8. OPA
 
-Cuando hay múltiples nodos con la capacidad requerida (mismo nombre capa 2, mismo VPN):
+### 8.1 Cuándo se usa
 
-- **Round-robin** por defecto
-- **Least-connections** opcional
-- **Sticky** por `trace_id` opcional
+Cuando `routing.dst = null`, el router consulta OPA para resolver el destino.
 
-*Detalles de implementación por definir.*
+### 8.2 Input
+
+```json
+{
+  "meta": { ... },
+  "routing": {
+    "src": "uuid-origen"
+  }
+}
+```
+
+### 8.3 Output
+
+```json
+{
+  "target": "AI.soporte.l1@produccion"
+}
+```
+
+### 8.4 Ejemplo de Policy (Rego)
+
+```rego
+package router
+
+default target = null
+
+target = "AI.soporte.l2@produccion" {
+    input.meta.context.cliente_tier == "vip"
+}
+
+target = "AI.soporte.l1@produccion" {
+    input.meta.context.cliente_tier == "standard"
+}
+```
 
 ---
 
-## 12. Referencias
+## 9. Pattern Matching
+
+### 9.1 Tipos de Match
+
+| Tipo | Ejemplo | Matchea |
+|------|---------|---------|
+| EXACT | `AI.soporte.l1` | Solo `AI.soporte.l1` |
+| PREFIX | `AI.soporte.*` | `AI.soporte.l1`, `AI.soporte.l2`, etc. |
+| GLOB | `AI.*.l1` | `AI.soporte.l1`, `AI.ventas.l1`, etc. |
+
+### 9.2 Implementación
+
+```rust
+fn pattern_match(pattern: &str, name: &str, match_kind: u8) -> bool {
+    match match_kind {
+        MATCH_EXACT => pattern == name,
+        MATCH_PREFIX => {
+            let prefix = pattern.trim_end_matches(".*");
+            name.starts_with(prefix)
+        }
+        MATCH_GLOB => {
+            // Convertir * a regex .*
+            let regex = pattern.replace("*", ".*");
+            Regex::new(&format!("^{}$", regex))
+                .map(|r| r.is_match(name))
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+```
+
+---
+
+## 10. Casos Especiales
+
+### 10.1 Destino con @* (wildcard de isla)
+
+Si el destino es `AI.soporte.l1@*`:
+
+```rust
+fn route_wildcard_island(&self, dst_name_base: &str) -> Result<Action> {
+    // Buscar en isla local primero
+    let local_name = format!("{}@{}", dst_name_base, self.island_id);
+    if let Ok(action) = self.route_intra_isla(&local_name) {
+        return Ok(action);
+    }
+    
+    // Buscar en islas remotas (LSA)
+    for island in self.lsa_islands() {
+        let remote_name = format!("{}@{}", dst_name_base, island.island_id);
+        if self.lsa_has_node(&island.island_id, &remote_name) {
+            return Ok(Action::SendToIsland(island.island_id.clone()));
+        }
+    }
+    
+    Err(RouteError::Unreachable)
+}
+```
+
+### 10.2 Mensaje UNREACHABLE
+
+Cuando no se encuentra destino:
+
+```json
+{
+  "routing": {
+    "src": "<uuid-router>",
+    "dst": "<uuid-nodo-origen>",
+    "ttl": 16,
+    "trace_id": "<trace-id-original>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "UNREACHABLE"
+  },
+  "payload": {
+    "original_dst": "AI.soporte.l1@staging",
+    "reason": "NODE_NOT_FOUND"
+  }
+}
+```
+
+---
+
+## 11. Referencias
 
 | Tema | Documento |
 |------|-----------|
-| Shared memory, estructuras | `03-shm.md` |
-| Conectividad IRP/WAN | `05-conectividad.md` |
-| Región config, VPN zones | `06-config-shm.md` |
+| Shared memory | `03-shm.md` |
+| Conectividad, LSA | `05-conectividad.md` |
+| Config de rutas | `06-regiones.md` |

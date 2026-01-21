@@ -8,109 +8,97 @@
 
 ## 1. Resumen de Conectividad
 
-| Escenario | Nombre | Transporte | Configuración |
-|-----------|--------|------------|---------------|
-| Routers misma isla | IRP | Unix socket | Automática (SHM) |
-| Routers islas distintas | IIL (WAN) | TCP | Explícita (config) |
-| Nodo → Router local | - | Unix socket | Automática |
+| Escenario | Nombre | Transporte | Quién |
+|-----------|--------|------------|-------|
+| Nodo ↔ Router | - | Unix socket | Todos |
+| Router ↔ Router (misma isla) | IRP | Unix socket | Todos los routers |
+| Gateway ↔ Gateway (distintas islas) | WAN | TCP | Solo gateways |
 
 ---
 
-## 2. IRP — Inter-Router Peering Intra-Isla (v1.13)
+## 2. IRP — Inter-Router Peering (Intra-Isla)
 
-### 2.1 Motivación
+### 2.1 Concepto
 
-Si hay múltiples routers en la misma isla:
-
-- Todos ven SHM y toman decisiones localmente (no consultan)
-- Pero cada nodo está conectado físicamente a **un router dueño**
-- Para entregar frames al router dueño se usa **IRP**
-
-### 2.2 Principio Clave
+Los routers de una misma isla se comunican via IRP (Unix sockets) para reenviar mensajes a nodos que están en otros routers.
 
 ```
-Decisión: lookup por SHM local
-Transporte: IRP al router dueño si corresponde
-```
-
-**Diagrama:**
-
-```
-[Node X] → [Router A] --IRP--> [Router B] → [Node Y]
-            (misma isla, mismo SHM)
-```
-
-### 2.3 Forwarding Intra-Isla: El Router como Switch
-
-**IMPORTANTE:** Dentro de una isla, los routers actúan como un **switch de capa 2**. El forwarding entre routers es transparente.
-
-```
-Isla A (un solo host)
+Isla "produccion"
 ┌─────────────────────────────────────────────────────────────┐
-│                                                              │
-│   [Nodo X]                              [Nodo Y]            │
-│      │                                      │                │
-│      │ socket                               │ socket         │
-│      ▼                                      ▼                │
-│  ┌──────────┐    IRP (socket)        ┌──────────┐          │
-│  │ Router A │◄──────────────────────►│ Router B │          │
-│  └──────────┘                        └──────────┘          │
-│                                                              │
-│                    /dev/shm                                 │
-│              (todos leen todo)                              │
+│                                                             │
+│   [Nodo X]                              [Nodo Y]           │
+│      │                                      │               │
+│      ▼                                      ▼               │
+│  ┌──────────┐    IRP (Unix socket)   ┌──────────┐         │
+│  │ Router A │◄──────────────────────►│ Router B │         │
+│  └──────────┘                        └──────────┘         │
+│                                                             │
+│                    /dev/shm                                │
+│              (todos leen todo)                             │
 └─────────────────────────────────────────────────────────────┘
-
-Mensaje de Nodo X a Nodo Y:
-  1. Nodo X envía a Router A (su router local)
-  2. Router A lee SHM, ve que Nodo Y está en Router B
-  3. Router A reenvía a Router B por IRP (Unix socket)
-  4. Router B entrega a Nodo Y
-
-El mensaje NO cambia. No se modifica routing.src ni routing.dst.
-Router A y Router B actúan como UN SOLO switch lógico.
 ```
 
-### 2.4 Reglas del Forwarding Intra-Isla
+### 2.2 Principio
+
+```
+Decisión: lookup en SHM local (FIB)
+Transporte: IRP al router dueño del nodo destino
+```
+
+**El router NO consulta a otros routers.** Cada router lee SHM y toma decisiones localmente.
+
+### 2.3 Reglas del IRP
 
 1. **Sin modificación de headers**: El mensaje pasa intacto
-2. **Sin TTL decrement**: No es salto de capa 1, es forwarding de capa 2
-3. **Sin tablas de rutas para IRP**: Se descubre peers por SHM
-4. **Transparente para los nodos**: Un nodo no sabe si el destino está en su router
+2. **Sin TTL decrement**: No es salto inter-isla
+3. **Descubrimiento via SHM**: No hay config manual de peers
+4. **Transparente para nodos**: El nodo no sabe si el destino está en otro router
 
-### 2.5 Aclaración Importante (v1.13)
+### 2.4 Flujo
 
-> Dentro de una isla, **ningún router consulta a otro router** para tomar decisiones.
-> Cada router lee SHM de todos (snapshot) y construye su FIB local.
->
-> El forwarding a un nodo que vive en otro router es:
-> 1. Lookup en FIB local
-> 2. Enviar por IRP (fabric) al router dueño
->
-> El IRP es **solo transporte**; la decisión sale de SHM.
+```
+1. Nodo X envía mensaje para Nodo Y a Router A
+2. Router A busca en FIB: Nodo Y está en Router B
+3. Router A envía por IRP a Router B
+4. Router B entrega a Nodo Y
+```
 
 ---
 
-## 3. IIL — Inter-Isla Links (WAN) (v1.13)
+## 3. WAN — Conectividad Inter-Isla
 
-### 3.1 Regla Operativa: Gateway Único por Isla
+### 3.1 Gateway Único por Isla
 
-**v1.13 simplifica:**
+Cada isla tiene **un único router gateway**:
 
-- Cada isla tiene **1 router gateway** inter-isla
-- El gateway expone un puerto fijo (ej: 9000)
-- El gateway puede tener uplinks directos a varias islas remotas
-- Se mantiene **1 conexión activa por isla remota** (por gateway)
+- Es el único que mantiene conexiones TCP a otras islas
+- Es el único que escribe en `jsr-lsa-<island>`
+- Los demás routers reenvían tráfico inter-isla al gateway via IRP
 
-**Los demás routers de la isla:**
+### 3.2 Identificación del Gateway
 
-- NO corren WAN (no levantan TCP listener)
-- Reenvían tráfico inter-isla al gateway por IRP
+El gateway se identifica por un flag en su región SHM:
 
-### 3.2 Ventajas del Gateway Único
+```rust
+// En ShmHeader
+pub is_gateway: u8,  // 1 si es gateway
+```
 
-- No hay ambigüedad de "¿a cuál uplink salgo?"
-- Evitás routing transitivo intra-isla por múltiples gateways
-- WAN queda como borde claro del dominio (como en redes reales)
+Los demás routers leen las regiones de peers y detectan cuál es el gateway:
+
+```rust
+fn find_gateway(&self) -> Option<RouterInfo> {
+    for peer in self.peer_regions.iter() {
+        if peer.header.is_gateway == 1 {
+            return Some(RouterInfo {
+                uuid: peer.header.router_uuid,
+                name: peer.header.router_name,
+            });
+        }
+    }
+    None
+}
+```
 
 ### 3.3 Configuración del Gateway
 
@@ -119,93 +107,239 @@ Router A y Router B actúan como UN SOLO switch lógico.
 router:
   name: RT.gateway
   island_id: produccion
+  is_gateway: true
 
-inter_isla:
+wan:
   listen: "0.0.0.0:9000"
   uplinks:
-    - "10.0.1.100:9000"    # staging
-    - "10.0.2.100:9000"    # desarrollo
+    - address: "10.0.1.100:9000"    # staging
+    - address: "10.0.2.100:9000"    # desarrollo
 ```
 
-### 3.4 Impacto en Forwarding
-
-Si un router **no-gateway** recibe un mensaje cuyo destino está en otra isla:
+### 3.4 Topología WAN
 
 ```
-1. Lookup local: detecta "remote_island != local_island"
-2. Reenvía al gateway por IRP
-3. El gateway lo manda por TCP/WAN
+         ┌─────────────────┐
+         │   produccion    │
+         │   (Gateway)     │
+         └────────┬────────┘
+                  │ TCP
+        ┌─────────┴─────────┐
+        │                   │
+        ▼                   ▼
+┌───────────────┐   ┌───────────────┐
+│    staging    │   │  desarrollo   │
+│   (Gateway)   │   │   (Gateway)   │
+└───────────────┘   └───────────────┘
 ```
-
-Esto mantiene el principio: **la decisión se toma local** (por SHM/config) y **el transporte se ejecuta en el router correcto**.
 
 ---
 
-## 4. Comparación IRP vs WAN
+## 4. LSA — Link State Advertisement
 
-| Aspecto | IRP (Intra-Isla) | WAN (Inter-Isla) |
-|---------|------------------|------------------|
-| Transporte | Unix socket | TCP |
-| Configuración | Automática (SHM) | Explícita (config.yaml) |
-| TTL | No decrementa | Decrementa |
-| Visibilidad | Transparente | Salto explícito |
-| En tabla de rutas | No (implícito) | Sí (`out_link = 1..N`) |
-| Quién lo usa | Todos los routers de isla | Solo el gateway |
+### 4.1 Concepto
+
+El gateway intercambia información de topología con otros gateways via mensajes **LSA**.
+
+### 4.2 ¿Qué contiene el LSA?
+
+El gateway consolida **toda** la información de su isla:
+
+| Dato | Fuente | Descripción |
+|------|--------|-------------|
+| Nodos | `jsr-<router-uuid>` de todos los routers | Todos los nodos conectados |
+| Rutas | `jsr-config-<island>` | Rutas estáticas |
+| VPNs | `jsr-config-<island>` | Tabla de asignación VPN |
+
+### 4.3 Formato del Mensaje LSA
+
+```json
+{
+  "routing": {
+    "src": "<uuid-gateway-prod>",
+    "dst": "<uuid-gateway-staging>",
+    "ttl": 1,
+    "trace_id": "<uuid>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "LSA"
+  },
+  "payload": {
+    "island": "produccion",
+    "seq": 42,
+    "timestamp": "2025-01-20T10:00:00Z",
+    "nodes": [
+      {
+        "uuid": "a1b2c3d4-...",
+        "name": "AI.soporte.l1@produccion",
+        "vpn_id": 10
+      },
+      {
+        "uuid": "b2c3d4e5-...",
+        "name": "RT.primary@produccion",
+        "vpn_id": 0
+      },
+      {
+        "uuid": "c3d4e5f6-...",
+        "name": "SY.config.routes@produccion",
+        "vpn_id": 0
+      }
+    ],
+    "routes": [
+      {
+        "prefix": "AI.backup.*",
+        "match_kind": "PREFIX",
+        "action": "FORWARD",
+        "next_hop_island": "disaster-recovery",
+        "metric": 10
+      }
+    ],
+    "vpns": [
+      {
+        "pattern": "AI.soporte.*",
+        "match_kind": "PREFIX",
+        "vpn_id": 10
+      },
+      {
+        "pattern": "AI.ventas.*",
+        "match_kind": "PREFIX",
+        "vpn_id": 20
+      }
+    ]
+  }
+}
+```
+
+### 4.4 ¿Cuándo se envía LSA?
+
+| Evento | Acción |
+|--------|--------|
+| Conexión establecida | Enviar LSA completo |
+| Nodo conecta/desconecta | Enviar LSA actualizado |
+| Ruta estática cambia | Enviar LSA actualizado |
+| VPN cambia | Enviar LSA actualizado |
+| Periódicamente | Enviar como heartbeat |
+
+### 4.5 Flujo de LSA
+
+```
+Gateway Prod                              Gateway Staging
+     │                                          │
+     │◄────────── TCP connect ─────────────────►│
+     │                                          │
+     ├─────────── LSA (prod) ──────────────────►│
+     │                                          │ (escribe en jsr-lsa-staging)
+     │◄────────── LSA (staging) ────────────────┤
+     │ (escribe en jsr-lsa-prod)                │
+     │                                          │
+     │         (operación normal)               │
+     │                                          │
+     │ [nodo conecta en prod]                   │
+     ├─────────── LSA (prod) ──────────────────►│
+     │                                          │
+     │                    [nodo conecta en staging]
+     │◄────────── LSA (staging) ────────────────┤
+     │                                          │
+```
+
+### 4.6 Gateway Escribe en jsr-lsa
+
+Cuando el gateway recibe LSA de otra isla:
+
+```rust
+fn handle_lsa(&mut self, lsa: LsaMessage) {
+    // 1. Validar LSA
+    if lsa.seq <= self.last_lsa_seq.get(&lsa.island).unwrap_or(&0) {
+        return;  // LSA viejo, ignorar
+    }
+    
+    // 2. Escribir en jsr-lsa-<mi-isla>
+    self.lsa_region.seqlock_begin_write();
+    
+    // Actualizar o crear entrada para esta isla
+    let island_entry = self.lsa_region.find_or_create_island(&lsa.island);
+    island_entry.last_lsa_seq = lsa.seq;
+    island_entry.last_updated = now_epoch_ms();
+    
+    // Reemplazar nodos, rutas, VPNs de esa isla
+    self.lsa_region.replace_nodes(&lsa.island, &lsa.nodes);
+    self.lsa_region.replace_routes(&lsa.island, &lsa.routes);
+    self.lsa_region.replace_vpns(&lsa.island, &lsa.vpns);
+    
+    self.lsa_region.seqlock_end_write();
+    
+    // 3. Recordar seq para evitar duplicados
+    self.last_lsa_seq.insert(lsa.island.clone(), lsa.seq);
+}
+```
+
+### 4.7 Routers Leen jsr-lsa
+
+Todos los routers de la isla leen `jsr-lsa-<island>` para saber:
+
+- Qué islas remotas existen
+- Qué nodos hay en cada isla remota
+- Qué rutas estáticas tienen
+- Cómo están asignados sus VPNs
+
+```rust
+fn lookup_remote(&self, dst_name: &str, dst_island: &str) -> Option<RemoteNodeEntry> {
+    let lsa = self.lsa_region.as_ref()?;
+    
+    for island in lsa.islands.iter() {
+        if island.island_id == dst_island {
+            for node in island.nodes.iter() {
+                if node.name == dst_name {
+                    return Some(node.clone());
+                }
+            }
+        }
+    }
+    None
+}
+```
 
 ---
 
 ## 5. Handshake WAN
 
-### 5.1 Flujo de Establecimiento
+### 5.1 Flujo
 
 ```
-Router A (iniciador)              Router B (receptor)
+Gateway A (iniciador)              Gateway B (receptor)
     │                                     │
     │◄────────TCP connect─────────────────┤
     │                                     │
     ├─────────HELLO──────────────────────►│
     │◄────────HELLO───────────────────────┤
     │                                     │
-    │         (validación de HELLO)       │
+    │         (validación)                │
     │                                     │
-    ├─────────UPLINK_ACCEPT──────────────►│  (o UPLINK_REJECT)
-    │◄────────UPLINK_ACCEPT───────────────┤  (o UPLINK_REJECT)
+    ├─────────WAN_ACCEPT─────────────────►│
+    │◄────────WAN_ACCEPT──────────────────┤
     │                                     │
-    ├─────────SYNC_REQUEST───────────────►│
-    │◄────────SYNC_REPLY──────────────────┤
+    ├─────────LSA────────────────────────►│
+    │◄────────LSA─────────────────────────┤
     │                                     │
     │         (operación normal)          │
     │                                     │
-    ├─────────HELLO periódico────────────►│
-    │◄────────HELLO periódico─────────────┤
 ```
 
-### 5.2 Payload del HELLO WAN
+### 5.2 Mensaje HELLO (WAN)
 
 ```json
 {
-  "routing": {
-    "src": "uuid-router-a",
-    "dst": "uuid-router-b",
-    "ttl": 16,
-    "trace_id": "uuid",
-    "vpn": 0
-  },
   "meta": {
     "type": "system",
     "msg": "HELLO"
   },
   "payload": {
-    "timestamp": "2025-01-15T10:00:00Z",
-    "seq": 1,
-    "protocol": "json-router/1",
-    "router_id": "uuid-router-a",
+    "protocol": "json-router/1.13",
+    "router_id": "<uuid>",
+    "router_name": "RT.gateway@produccion",
     "island_id": "produccion",
-    "shm_name": "/jsr-a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-    "capabilities": {
-      "sync": true,
-      "forwarding": true
-    },
+    "capabilities": ["lsa", "forwarding"],
     "timers": {
       "hello_interval_ms": 10000,
       "dead_interval_ms": 40000
@@ -214,28 +348,18 @@ Router A (iniciador)              Router B (receptor)
 }
 ```
 
-| Campo | Propósito |
-|-------|-----------|
-| `protocol` | Versión del protocolo |
-| `router_id` | UUID del router |
-| `island_id` | Identificador de la isla |
-| `shm_name` | Nombre de región SHM (para descubrimiento local) |
-| `capabilities` | Qué soporta este router |
-| `timers` | Intervalos de hello/dead |
-
-### 5.3 Payload de UPLINK_ACCEPT
+### 5.3 Mensaje WAN_ACCEPT
 
 ```json
 {
   "meta": {
     "type": "system",
-    "msg": "UPLINK_ACCEPT"
+    "msg": "WAN_ACCEPT"
   },
   "payload": {
-    "timestamp": "2025-01-15T10:00:01Z",
-    "peer_router_id": "uuid-router-b",
+    "peer_router_id": "<uuid>",
     "negotiated": {
-      "protocol": "json-router/1",
+      "protocol": "json-router/1.13",
       "hello_interval_ms": 10000,
       "dead_interval_ms": 40000
     }
@@ -243,219 +367,157 @@ Router A (iniciador)              Router B (receptor)
 }
 ```
 
-### 5.4 Payload de UPLINK_REJECT
+### 5.4 Mensaje WAN_REJECT
 
 ```json
 {
   "meta": {
     "type": "system",
-    "msg": "UPLINK_REJECT"
+    "msg": "WAN_REJECT"
   },
   "payload": {
-    "timestamp": "2025-01-15T10:00:01Z",
     "reason": "ISLAND_NOT_AUTHORIZED",
     "message": "Island 'unknown' not in authorized list"
   }
 }
 ```
 
-| Reason | Descripción |
-|--------|-------------|
-| `PROTOCOL_MISMATCH` | Versión de protocolo no soportada |
-| `ISLAND_NOT_AUTHORIZED` | Island ID no está en lista de permitidos |
-| `CAPABILITY_MISSING` | Falta capability requerida |
-| `OVERLOADED` | Router no puede aceptar más uplinks |
-
 ---
 
-## 6. Identidad del Enlace Inter-Isla (v1.13)
+## 6. Heartbeat entre Gateways
 
-El enlace se identifica por el par de islas:
+El LSA también funciona como heartbeat:
 
-```
-link_id = min(islaA, islaB) + "<->" + max(islaA, islaB)
-```
+- Se envía periódicamente (cada `hello_interval_ms`)
+- Si no se recibe LSA por `dead_interval_ms`, se considera el peer muerto
+- Al detectar peer muerto, se marcan sus nodos como inaccesibles
 
-Ejemplo:
-```
-produccion<->staging
-```
-
-Si se crean dos sockets por carrera (ambos gateways intentan conectar), se conserva 1 usando tie-break determinista por `router_uuid` (menor gana).
-
----
-
-## 7. Forwarding Inter-Isla (v1.13)
-
-### 7.1 Algoritmo
-
-```
-1. Parsear dst_island desde el nombre L2 destino (@isla)
-
-2. Si dst_island == local_island:
-   → Routing intra-isla normal
-
-3. Si dst_island != local_island:
-   a. Si router actual NO es gateway:
-      → Forward al gateway por IRP
-   b. Si router actual ES gateway:
-      → Buscar conexión a dst_island
-      → Si existe: enviar
-      → Si no existe: NO_ROUTE_TO_ISLAND
-
-4. TTL: decrementa al cruzar inter-isla
-```
-
-### 7.2 No hay LSA para Nodos (v1.13)
-
-**No se anuncian "rutas de nodos" entre islas.**
-
-Con el naming `@isla`, solo hace falta conectividad al gateway remoto. El gateway remoto resuelve el nodo localmente.
-
----
-
-## 8. Operación Normal WAN
-
-Una vez establecido el uplink:
-
-- **HELLO periódico** cada `hello_interval_ms`
-- **Dead detection**: sin HELLO por `dead_interval_ms` = peer caído
-- **TTL**: se decrementa por hop, previene loops entre islas
-
----
-
-## 9. Topología WAN: Modelo Bus/Estrella
-
-### 9.1 Topología Bus (Lineal)
-
-```
-Isla A ──► Isla B ──► Isla C ──► Isla D
-```
-
-**Configuración mínima:**
-
-```yaml
-# Isla A (primera)
-inter_isla:
-  listen: "0.0.0.0:9000"
-  uplinks:
-    - "10.0.1.2:9000"    # → B
-
-# Isla B
-inter_isla:
-  listen: "0.0.0.0:9000"
-  uplinks:
-    - "10.0.2.2:9000"    # → C
-
-# Isla C
-inter_isla:
-  listen: "0.0.0.0:9000"
-  uplinks:
-    - "10.0.3.2:9000"    # → D
-
-# Isla D (última)
-inter_isla:
-  listen: "0.0.0.0:9000"
-  # Sin uplink, es el final
-```
-
-### 9.2 Topología Estrella
-
-```
-         Isla A (hub)
-        /    |    \
-   Isla B  Isla C  Isla D
-```
-
-**Isla A configura uplinks a todas:**
-
-```yaml
-# Isla A (hub)
-inter_isla:
-  listen: "0.0.0.0:9000"
-  uplinks:
-    - "10.0.1.100:9000"  # → B
-    - "10.0.2.100:9000"  # → C
-    - "10.0.3.100:9000"  # → D
-```
-
-### 9.3 Conexiones Bidireccionales Automáticas
-
-Cuando A conecta a B por uplink:
-- A conoce a B (su uplink configurado)
-- B conoce a A (conexión entrante aceptada)
-
-**No es necesario configurar ambos lados.**
-
-```
-A config: uplink → B
-B config: (nada hacia A)
-
-Resultado:
-  A ◄────────► B
-      (TCP)
-  
-A sabe de B: por su config
-B sabe de A: por conexión entrante
+```rust
+fn check_peer_health(&mut self) {
+    let now = now_epoch_ms();
+    
+    for (island, last_seen) in self.peer_last_seen.iter() {
+        if now - last_seen > self.dead_interval_ms {
+            log::warn!("Peer island {} appears dead", island);
+            self.mark_island_unreachable(island);
+        }
+    }
+}
 ```
 
 ---
 
-## 10. Routing Transitivo Inter-Isla
+## 7. Forwarding Inter-Isla
 
-Si A quiere enviar a isla C pero solo tiene uplink a B:
+### 7.1 Desde Router Normal
 
+```rust
+fn route_to_remote_island(&self, msg: &Message, dst_island: &str) -> Action {
+    // Soy router normal, reenviar al gateway
+    let gateway = self.find_gateway()
+        .expect("No gateway found in this island");
+    
+    Action::ForwardToRouter(gateway.uuid)
+}
 ```
-A ──► B ──► C
 
-1. A recibe mensaje para nodo en Isla C
-2. A no tiene uplink directo a C
-3. A envía a B (único uplink)
-4. B recibe, ve que destino es Isla C
-5. B tiene uplink a C, reenvía
-6. C recibe, entrega al nodo local
+### 7.2 Desde Gateway
+
+```rust
+fn route_to_remote_island(&self, msg: &Message, dst_island: &str) -> Action {
+    // Soy gateway, buscar conexión a esa isla
+    if let Some(conn) = self.wan_connections.get(dst_island) {
+        // Decrementar TTL
+        let mut msg = msg.clone();
+        msg.routing.ttl -= 1;
+        if msg.routing.ttl == 0 {
+            return Action::TtlExceeded;
+        }
+        
+        Action::SendWan(conn.clone(), msg)
+    } else {
+        Action::NoRouteToIsland(dst_island.to_string())
+    }
+}
 ```
-
-**TTL previene loops:** El mensaje decrementa TTL en cada hop inter-isla.
 
 ---
 
-## 11. Seguridad WAN
+## 8. TTL
 
-La autenticación se delega al edge proxy (NGINX, Envoy, etc.):
+### 8.1 Reglas de Decremento
+
+| Escenario | TTL decrementa |
+|-----------|----------------|
+| IRP (intra-isla) | No |
+| WAN (inter-isla) | Sí |
+| Broadcast forwarding | Sí |
+
+### 8.2 Alcance por TTL
+
+| TTL | Alcance |
+|-----|---------|
+| 1 | Solo nodos locales del router |
+| 2 | Toda la isla (incluye peers via IRP) |
+| 3+ | Cruza a otras islas |
+
+### 8.3 TTL Exceeded
+
+```json
+{
+  "meta": {
+    "type": "system",
+    "msg": "TTL_EXCEEDED"
+  },
+  "payload": {
+    "original_dst": "AI.soporte.l1@staging",
+    "last_hop": "RT.gateway@produccion"
+  }
+}
+```
+
+---
+
+## 9. Seguridad WAN
+
+### 9.1 Capas de Seguridad
 
 | Capa | Responsable | Mecanismo |
 |------|-------------|-----------|
 | Transporte | Edge proxy | TLS/mTLS |
-| Autorización | Edge proxy | Allowlist de IPs/certs |
-| Rate limiting | Edge proxy | Por conexión/bytes |
-| Protocolo | Router | HELLO + UPLINK_ACCEPT/REJECT |
+| Autorización | Edge proxy | Allowlist IPs/certs |
+| Protocolo | Gateway | HELLO + WAN_ACCEPT/REJECT |
 
-El proxy no interpreta el protocolo. Es transparente L4.
+### 9.2 Validación de Island ID
 
-La validación de `island_id` contra lista de islas autorizadas puede hacerse en el router al recibir HELLO.
+El gateway valida que el `island_id` del peer esté en su lista de autorizados:
 
----
-
-## 12. Requisitos de Deployment (v1.13)
-
-### 12.1 Gateway por Isla
-
-- Cada isla tiene UN router con WAN activa
-- Este router es el punto de entrada/salida inter-isla
-- No se puede matar via API (protegido)
-
-### 12.2 SY.admin
-
-- Debe correr en una isla con conectividad a todas las demás
-- Requiere rutas (directas o transitivas) a todas las islas que administra
+```yaml
+wan:
+  authorized_islands:
+    - staging
+    - desarrollo
+```
 
 ---
 
-## 13. Referencias
+## 10. Comparación IRP vs WAN
+
+| Aspecto | IRP (Intra-Isla) | WAN (Inter-Isla) |
+|---------|------------------|------------------|
+| Transporte | Unix socket | TCP |
+| Configuración | Automática (SHM) | Explícita (config) |
+| TTL | No decrementa | Decrementa |
+| Quién lo usa | Todos los routers | Solo gateways |
+| Descubrimiento | Via SHM | Via config + HELLO |
+| LSA | No necesario | Obligatorio |
+
+---
+
+## 11. Referencias
 
 | Tema | Documento |
 |------|-----------|
-| Arquitectura, islas | `01-arquitectura.md` |
-| Routing, FIB | `04-routing.md` |
-| Operaciones, systemd | `07-operaciones.md` |
+| Arquitectura | `01-arquitectura.md` |
+| Shared memory, jsr-lsa | `03-shm.md` |
+| Routing | `04-routing.md` |

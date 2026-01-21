@@ -1,4 +1,4 @@
-# JSON Router - 06 Región de Configuración (Config SHM)
+# JSON Router - 06 Regiones Config y LSA
 
 **Estado:** v1.13  
 **Fecha:** 2025-01-20  
@@ -6,353 +6,35 @@
 
 ---
 
-## 1. Propósito
+## 1. Visión General
 
-La región de configuración (`/jsr-config-<island>`) es una área de shared memory **separada** de las regiones de routers. Contiene:
+Este documento detalla las dos regiones de memoria compartida que NO son de routers:
 
-- Rutas estáticas (FORWARD/DROP) con alcance por VPN
-- Definición de VPN zones (VRF)
-- Membership rules (asignación de nodos a VPN)
-- Leak rules (permisos entre VPNs)
-
-**Un único proceso escribe:** `SY.config.routes@<isla>`
-
-**Todos los routers leen** esta región y actualizan su FIB.
+| Región | Writer | Propósito |
+|--------|--------|-----------|
+| `jsr-config-<island>` | SY.config.routes | Rutas estáticas, tabla VPN |
+| `jsr-lsa-<island>` | Gateway | Topología de islas remotas |
 
 ---
 
-## 2. Arquitectura
+## 2. Región Config: jsr-config-<island>
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      SY.config.routes                       │
-│                                                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
-│  │ API Handler │  │ SHM Writer  │  │ Persistence │         │
-│  │             │  │             │  │             │         │
-│  │ - add_*     │  │ - seqlock   │  │ - sy-config │         │
-│  │ - del_*     │  │ - heartbeat │  │   -routes   │         │
-│  │ - list_*    │  │ - version++ │  │   .yaml     │         │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘         │
-│         │                │                │                 │
-│         └────────────────┼────────────────┘                 │
-│                          │                                  │
-└──────────────────────────┼──────────────────────────────────┘
-                           │
-                           ▼
-                 /dev/shm/jsr-config-<island_id>
-                 ┌─────────────────────────────┐
-                 │ ConfigHeader                │
-                 │ StaticRouteEntry[]          │
-                 │ VpnZoneEntry[]              │
-                 │ VpnMemberRuleEntry[]        │
-                 │ VpnLeakRuleEntry[]          │
-                 └─────────────────────────────┘
-```
+### 2.1 Propósito
 
-**Separación de responsabilidades:**
-- **Router:** data plane + routing core. Lee config desde SHM, no la propaga.
-- **SY.config.routes:** escribe config LOCAL en SHM y persiste YAML.
+Almacena la configuración centralizada de la isla:
 
----
+- **Rutas estáticas**: Override explícito de routing
+- **Tabla VPN**: Asignación de nodos a zonas de aislamiento
 
-## 3. Layout de la Región (v1.13)
+### 2.2 Writer Único
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│ ConfigHeader (224 bytes)                                    │
-│ - magic, version, owner info, seqlock, timestamps           │
-│ - contadores actualizados                                   │
-├─────────────────────────────────────────────────────────────┤
-│ StaticRouteEntry[MAX_STATIC_ROUTES] (256 entries)          │
-│ - 256 × 368 bytes = ~92 KB                                  │
-├─────────────────────────────────────────────────────────────┤
-│ VpnZoneEntry[MAX_VPN_ZONES] (64 entries)                   │
-│ - 64 × 128 bytes = ~8 KB                                    │
-├─────────────────────────────────────────────────────────────┤
-│ VpnMemberRuleEntry[MAX_VPN_MEMBER_RULES] (256 entries)     │
-│ - 256 × 304 bytes = ~76 KB                                  │
-├─────────────────────────────────────────────────────────────┤
-│ VpnLeakRuleEntry[MAX_VPN_LEAK_RULES] (128 entries)         │
-│ - 128 × 304 bytes = ~38 KB                                  │
-└─────────────────────────────────────────────────────────────┘
-Total aproximado: ~215 KB
-```
+Solo `SY.config.routes@<island>` escribe en esta región. Los routers solo leen.
 
----
+### 2.3 API de SY.config.routes
 
-## 4. Constantes (v1.13)
+#### Rutas Estáticas
 
-```rust
-// Región de configuración
-pub const CONFIG_MAGIC: u32 = 0x4A534343;  // "JSCC"
-pub const CONFIG_VERSION: u32 = 2;          // v1.13
-pub const CONFIG_SHM_PREFIX: &str = "/jsr-config-";
-
-// Capacidades
-pub const MAX_STATIC_ROUTES: u32 = 256;
-pub const MAX_VPN_ZONES: u32 = 64;
-pub const MAX_VPN_MEMBER_RULES: u32 = 256;
-pub const MAX_VPN_LEAK_RULES: u32 = 128;
-
-// Acciones de ruta (v1.13: ACTION_VPN eliminado)
-pub const ACTION_FORWARD: u8 = 0;
-pub const ACTION_DROP: u8 = 1;
-
-// Timers
-pub const CONFIG_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
-pub const CONFIG_HEARTBEAT_STALE_MS: u64 = 30_000;
-```
-
----
-
-## 5. Estructuras de Datos (v1.13)
-
-### 5.1 ConfigHeader
-
-```rust
-#[repr(C)]
-pub struct ConfigHeader {
-    // === IDENTIFICACIÓN (80 bytes) ===
-    pub magic: u32,                   // CONFIG_MAGIC = 0x4A534343
-    pub version: u32,                 // CONFIG_VERSION = 2
-    pub island_id: [u8; 64],
-    pub island_id_len: u16,
-    pub _pad1: [u8; 6],
-    
-    // === OWNERSHIP (40 bytes) ===
-    pub owner_pid: u64,
-    pub owner_start_time: u64,
-    pub owner_uuid: [u8; 16],         // UUID de SY.config.routes
-    pub heartbeat: u64,
-    
-    // === SEQLOCK (8 bytes) ===
-    pub seq: u64,                     // AtomicU64
-    
-    // === CONTADORES (v1.13: actualizados) (24 bytes) ===
-    pub static_route_count: u32,
-    pub vpn_zone_count: u32,          // Nuevo
-    pub vpn_member_rule_count: u32,   // Nuevo
-    pub vpn_leak_rule_count: u32,     // Nuevo
-    pub config_version: u64,          // Incrementa con cada cambio
-    
-    // === TIMESTAMPS (16 bytes) ===
-    pub created_at: u64,
-    pub updated_at: u64,
-    
-    // === RESERVED (56 bytes para llegar a 224) ===
-    pub _reserved: [u8; 56],
-}
-// Total: 224 bytes
-```
-
-### 5.2 StaticRouteEntry (v1.13)
-
-```rust
-#[repr(C)]
-pub struct StaticRouteEntry {
-    // === MATCHING (260 bytes) ===
-    pub prefix: [u8; 256],            // Pattern: "AI.soporte.*"
-    pub prefix_len: u16,
-    pub match_kind: u8,               // MATCH_EXACT, MATCH_PREFIX, MATCH_GLOB
-    pub _pad1: u8,
-
-    // === FORWARDING (76 bytes) ===
-    pub next_hop_island: [u8; 64],    // "" = local; si no vacío = inter-isla via gateway
-    pub next_hop_island_len: u16,
-    pub action: u8,                   // ACTION_FORWARD o ACTION_DROP
-    pub _pad2: u8,
-    pub metric: u32,
-
-    // === VPN SCOPE (v1.13) (8 bytes) ===
-    pub vpn_scope: u32,               // 0 = instala en todas las VPNs; !=0 = solo en esa VPN
-    pub _pad_vpn: u32,
-
-    // === ESTADO (8 bytes) ===
-    pub flags: u16,
-    pub priority: u16,
-    pub _pad3: [u8; 4],
-
-    // === METADATA (16 bytes) ===
-    pub installed_at: u64,
-    pub _reserved: [u8; 8],
-}
-// Total: 368 bytes
-```
-
-**Acciones válidas (v1.13):**
-
-| action | Valor | Descripción |
-|--------|-------|-------------|
-| ACTION_FORWARD | 0 | Rutear normalmente |
-| ACTION_DROP | 1 | Descartar (blackhole) |
-
-**Nota v1.13:** `ACTION_VPN` se elimina. El forwarding inter-isla se resuelve por `next_hop_island` + gateway único.
-
-### 5.3 VpnZoneEntry (v1.13 - Nueva)
-
-```rust
-#[repr(C)]
-pub struct VpnZoneEntry {
-    pub vpn_id: u32,                  // ID único de la zona
-    pub flags: u16,
-    pub _pad0: u16,
-
-    pub vpn_name: [u8; 64],           // Nombre descriptivo
-    pub vpn_name_len: u16,
-    pub _pad1: [u8; 6],
-
-    pub parent_vpn_id: u32,           // 0 = sin padre (top-level)
-    pub _pad2: u32,
-
-    pub created_at: u64,
-    pub _reserved: [u8; 40],
-}
-// Total: 128 bytes
-```
-
-**Semántica:**
-- Define una zona VRF dentro de la isla
-- `vpn_id = 0` es implícito (global), no necesita entrada
-- `parent_vpn_id` permite jerarquía opcional
-
-### 5.4 VpnMemberRuleEntry (v1.13 - Nueva)
-
-```rust
-#[repr(C)]
-pub struct VpnMemberRuleEntry {
-    pub pattern: [u8; 256],           // "AI.soporte.*"
-    pub pattern_len: u16,
-    pub match_kind: u8,
-    pub _pad0: u8,
-
-    pub vpn_id: u32,                  // A qué VPN asigna
-    pub flags: u16,
-    pub _pad1: u16,
-
-    pub priority: u16,                // menor = evalúa primero
-    pub _pad2: [u8; 6],
-
-    pub installed_at: u64,
-    pub _reserved: [u8; 16],
-}
-// Total: 304 bytes
-```
-
-**Semántica:**
-- El router asigna `vpn_id` al nodo al conectar, según estas reglas
-- Se evalúan en orden de `priority` (menor primero)
-- Si ninguna regla matchea, `vpn_id = 0` (global)
-
-### 5.5 VpnLeakRuleEntry (v1.13 - Nueva)
-
-```rust
-#[repr(C)]
-pub struct VpnLeakRuleEntry {
-    pub from_vpn: u32,
-    pub to_vpn: u32,
-
-    pub pattern: [u8; 256],           // Targets permitidos a ver/rutear
-    pub pattern_len: u16,
-    pub match_kind: u8,
-    pub _pad0: u8,
-
-    pub flags: u16,
-    pub _pad1: [u8; 2],
-
-    pub priority: u16,
-    pub _pad2: [u8; 6],
-
-    pub installed_at: u64,
-    pub _reserved: [u8; 16],
-}
-// Total: 304 bytes
-```
-
-**Semántica:**
-- Permite route leaking desde `from_vpn` hacia `to_vpn`
-- Solo para destinos que matchean `pattern`
-- Sin leak rules, el aislamiento entre VPNs es total
-
----
-
-## 6. Flujo del Router al Leer Config
-
-```rust
-fn update_fib_from_config(&mut self) {
-    // 1. Abrir región de config si no está mapeada
-    let config_shm_name = format!("{}{}", CONFIG_SHM_PREFIX, self.island_id);
-    if self.config_region.is_none() {
-        self.config_region = map_config_region(&config_shm_name);
-    }
-    
-    // 2. Leer con seqlock
-    let config = match &self.config_region {
-        Some(region) => seqlock_read(region),
-        None => return,
-    };
-    
-    // 3. Verificar heartbeat
-    if is_config_stale(&config.header) {
-        log::warn!("Config region stale, SY.config.routes may be down");
-    }
-    
-    // 4. Si config_version cambió, actualizar
-    if config.header.config_version != self.last_config_version {
-        // Cargar VPN zones
-        self.load_vpn_zones(&config.vpn_zones);
-        
-        // Cargar membership rules
-        self.load_membership_rules(&config.vpn_member_rules);
-        
-        // Cargar leak rules
-        self.load_leak_rules(&config.vpn_leak_rules);
-        
-        // Instalar rutas estáticas (por vpn_scope)
-        self.install_static_routes(&config.static_routes);
-        
-        self.last_config_version = config.header.config_version;
-    }
-}
-```
-
-**El router NO propaga configuración.** Solo lee y aplica.
-
----
-
-## 7. Asignación de VPN a Nodos
-
-Cuando un nodo conecta y envía HELLO:
-
-```rust
-fn assign_vpn_to_node(&self, node_name: &str) -> u32 {
-    // Evaluar membership rules en orden de priority
-    for rule in self.vpn_member_rules.iter()
-        .filter(|r| r.flags & FLAG_ACTIVE != 0)
-        .sorted_by_key(|r| r.priority)
-    {
-        if pattern_match(&rule.pattern, rule.match_kind, node_name) {
-            return rule.vpn_id;
-        }
-    }
-    
-    // Default: VPN global
-    0
-}
-```
-
-El `vpn_id` asignado se:
-1. Guarda en `NodeEntry.vpn_id`
-2. Envía al nodo en el ANNOUNCE
-3. Se usa para normalizar `routing.vpn` de mensajes del nodo
-
----
-
-## 8. API de SY.config.routes (v1.13)
-
-### 8.1 Rutas Estáticas
-
-**Listar rutas:**
+**Listar:**
 ```json
 {
   "meta": { "type": "admin", "action": "list_routes" },
@@ -360,7 +42,7 @@ El `vpn_id` asignado se:
 }
 ```
 
-**Agregar ruta:**
+**Agregar:**
 ```json
 {
   "meta": { "type": "admin", "action": "add_route" },
@@ -370,13 +52,12 @@ El `vpn_id` asignado se:
     "action": "FORWARD",
     "next_hop_island": "",
     "metric": 10,
-    "priority": 100,
-    "vpn_scope": 0
+    "priority": 100
   }
 }
 ```
 
-**Eliminar ruta:**
+**Eliminar:**
 ```json
 {
   "meta": { "type": "admin", "action": "delete_route" },
@@ -386,9 +67,9 @@ El `vpn_id` asignado se:
 }
 ```
 
-### 8.2 VPN Zones
+#### Tabla VPN
 
-**Listar VPNs:**
+**Listar:**
 ```json
 {
   "meta": { "type": "admin", "action": "list_vpns" },
@@ -396,45 +77,10 @@ El `vpn_id` asignado se:
 }
 ```
 
-**Respuesta:**
-```json
-{
-  "payload": {
-    "vpns": [
-      { "vpn_id": 0, "vpn_name": "global" },
-      { "vpn_id": 10, "vpn_name": "soporte" },
-      { "vpn_id": 20, "vpn_name": "ventas" }
-    ]
-  }
-}
-```
-
-**Agregar VPN:**
+**Agregar:**
 ```json
 {
   "meta": { "type": "admin", "action": "add_vpn" },
-  "payload": {
-    "vpn_id": 10,
-    "vpn_name": "soporte",
-    "parent_vpn_id": 0
-  }
-}
-```
-
-### 8.3 Membership Rules
-
-**Listar membership rules:**
-```json
-{
-  "meta": { "type": "admin", "action": "list_vpn_member_rules" },
-  "payload": {}
-}
-```
-
-**Agregar membership rule:**
-```json
-{
-  "meta": { "type": "admin", "action": "add_vpn_member_rule" },
   "payload": {
     "pattern": "AI.soporte.*",
     "match_kind": "PREFIX",
@@ -444,84 +90,272 @@ El `vpn_id` asignado se:
 }
 ```
 
-### 8.4 Leak Rules
-
-**Listar leak rules:**
+**Eliminar:**
 ```json
 {
-  "meta": { "type": "admin", "action": "list_vpn_leak_rules" },
-  "payload": {}
-}
-```
-
-**Agregar leak rule:**
-```json
-{
-  "meta": { "type": "admin", "action": "add_vpn_leak_rule" },
+  "meta": { "type": "admin", "action": "delete_vpn" },
   "payload": {
-    "from_vpn": 10,
-    "to_vpn": 0,
-    "pattern": "WF.route.handoff",
-    "match_kind": "EXACT",
-    "priority": 100
+    "pattern": "AI.soporte.*"
   }
 }
 ```
 
----
+### 2.4 Persistencia
 
-## 9. Persistencia: sy-config-routes.yaml (v2)
+SY.config.routes persiste la configuración en YAML:
 
 ```yaml
-version: 2
-updated_at: "2025-01-20T00:00:00Z"
+# /etc/json-router/sy-config-routes.yaml
+version: 1
+updated_at: "2025-01-20T10:00:00Z"
 
 routes:
-  - prefix: "AI.soporte.*"
+  - prefix: "AI.backup.*"
     match_kind: PREFIX
     action: FORWARD
-    next_hop_island: ""
+    next_hop_island: "disaster-recovery"
     metric: 10
     priority: 100
-    vpn_scope: 10
-
-  - prefix: "AI.ventas.interno"
-    match_kind: EXACT
+    
+  - prefix: "AI.interno.*"
+    match_kind: PREFIX
     action: DROP
     priority: 50
-    vpn_scope: 0
 
 vpns:
-  - vpn_id: 0
-    vpn_name: global
-    parent_vpn_id: 0
-
-  - vpn_id: 10
-    vpn_name: soporte
-    parent_vpn_id: 0
-
-vpn_member_rules:
   - pattern: "AI.soporte.*"
     match_kind: PREFIX
     vpn_id: 10
     priority: 100
-
-vpn_leak_rules:
-  - from_vpn: 10
-    to_vpn: 0
-    pattern: "WF.route.handoff"
-    match_kind: EXACT
+    
+  - pattern: "AI.ventas.*"
+    match_kind: PREFIX
+    vpn_id: 20
     priority: 100
 ```
 
-**Notas v1.13:**
-- No hay rutas "globales de otras islas"
-- No hay endpoints de VPN (modelo viejo eliminado)
-- VPN es zona intra-isla, no túnel inter-isla
+### 2.5 Flujo de Actualización
+
+```
+1. Admin/API envía mensaje a SY.config.routes
+2. SY.config.routes valida
+3. SY.config.routes persiste en YAML
+4. SY.config.routes escribe en jsr-config-<island>
+5. SY.config.routes incrementa config_version
+6. Routers detectan cambio de config_version
+7. Routers actualizan su FIB
+```
+
+### 2.6 Notificación de Cambio
+
+SY.config.routes puede notificar cambios via broadcast:
+
+```json
+{
+  "routing": {
+    "src": "<uuid-sy-config>",
+    "dst": "broadcast",
+    "ttl": 2,
+    "trace_id": "<uuid>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "CONFIG_CHANGED",
+    "target": "RT.*"
+  },
+  "payload": {
+    "config_version": 42,
+    "changed": ["routes", "vpns"]
+  }
+}
+```
+
+Los routers pueden usar esto para actualizar inmediatamente en lugar de esperar el polling.
 
 ---
 
-## 10. Códigos de Error
+## 3. Región LSA: jsr-lsa-<island>
+
+### 3.1 Propósito
+
+Almacena la topología de **otras islas** recibida via LSA del gateway.
+
+### 3.2 Writer Único
+
+Solo el **Gateway** de la isla escribe en esta región. Los routers solo leen.
+
+### 3.3 Contenido por Isla Remota
+
+Para cada isla remota, se almacena:
+
+| Dato | Descripción |
+|------|-------------|
+| `island_id` | Nombre de la isla remota |
+| `last_lsa_seq` | Último número de secuencia LSA recibido |
+| `last_updated` | Timestamp de última actualización |
+| `nodes[]` | Nodos de esa isla (uuid, name, vpn_id) |
+| `routes[]` | Rutas estáticas de esa isla |
+| `vpns[]` | Tabla VPN de esa isla |
+
+### 3.4 Flujo de Actualización
+
+```
+1. Gateway recibe LSA de isla remota
+2. Gateway valida seq > last_seq (evitar duplicados)
+3. Gateway escribe en jsr-lsa-<local-island>
+4. Routers leen jsr-lsa y actualizan FIB
+```
+
+### 3.5 Detección de Isla Muerta
+
+Si no se recibe LSA por `dead_interval_ms`:
+
+```rust
+fn check_remote_islands(&mut self) {
+    let now = now_epoch_ms();
+    
+    for island in self.lsa_region.islands.iter_mut() {
+        if now - island.last_updated > self.dead_interval_ms {
+            island.flags |= FLAG_STALE;
+            // Los routers deberían ignorar nodos de islas stale
+        }
+    }
+}
+```
+
+---
+
+## 4. Cómo el Router Lee Ambas Regiones
+
+```rust
+impl Router {
+    fn update_from_config_and_lsa(&mut self) {
+        // 1. Leer config
+        if let Some(config) = self.map_region(&self.config_shm_name) {
+            if config.header.config_version != self.last_config_version {
+                // Actualizar rutas estáticas
+                self.static_routes = config.routes.clone();
+                
+                // Actualizar tabla VPN
+                self.vpn_table = config.vpns.clone();
+                
+                self.last_config_version = config.header.config_version;
+            }
+        }
+        
+        // 2. Leer LSA (si no soy gateway)
+        if !self.is_gateway {
+            if let Some(lsa) = self.map_region(&self.lsa_shm_name) {
+                for island in lsa.islands.iter() {
+                    if island.flags & FLAG_STALE == 0 {
+                        for node in island.nodes.iter() {
+                            self.add_remote_route(node, &island.island_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+---
+
+## 5. Tabla VPN: Detalle
+
+### 5.1 Semántica
+
+La tabla VPN define a qué zona pertenece cada nodo basado en pattern matching de su nombre L2.
+
+### 5.2 Evaluación
+
+```rust
+fn assign_vpn(&self, node_name: &str) -> u32 {
+    // Ordenar por priority (menor primero)
+    let sorted = self.vpn_table.iter()
+        .filter(|v| v.flags & FLAG_ACTIVE != 0)
+        .sorted_by_key(|v| v.priority);
+    
+    for vpn in sorted {
+        if pattern_match(&vpn.pattern, vpn.match_kind, node_name) {
+            return vpn.vpn_id;
+        }
+    }
+    
+    0  // Default: VPN global
+}
+```
+
+### 5.3 Ejemplos
+
+| Pattern | Match Kind | VPN ID | Resultado |
+|---------|------------|--------|-----------|
+| `AI.soporte.*` | PREFIX | 10 | `AI.soporte.l1` → VPN 10 |
+| `AI.ventas.*` | PREFIX | 20 | `AI.ventas.closer` → VPN 20 |
+| `WF.crm` | EXACT | 20 | `WF.crm` → VPN 20 |
+| (ninguno) | - | 0 | `IO.wapp.123` → VPN 0 (global) |
+
+### 5.4 Nodos SY.* y RT.*
+
+Los nodos de sistema (`SY.*`) y routers (`RT.*`) **ignoran VPN**:
+
+- Siempre se les asigna `vpn_id = 0`
+- Pueden comunicarse con cualquier nodo de cualquier VPN
+- Esto es hardcoded, no configurable
+
+```rust
+fn assign_vpn(&self, node_name: &str) -> u32 {
+    // SY.* y RT.* siempre en VPN global
+    if node_name.starts_with("SY.") || node_name.starts_with("RT.") {
+        return 0;
+    }
+    
+    // ... evaluación normal de tabla VPN
+}
+```
+
+---
+
+## 6. Rutas Estáticas: Detalle
+
+### 6.1 Acciones
+
+| Acción | Efecto |
+|--------|--------|
+| `FORWARD` | Rutear normalmente, o a `next_hop_island` si está definido |
+| `DROP` | Descartar mensaje (blackhole) |
+
+### 6.2 Prioridad
+
+Las rutas estáticas se evalúan **antes** del lookup normal y tienen prioridad absoluta.
+
+### 6.3 Ejemplos de Uso
+
+**Blackhole para nodos internos:**
+```yaml
+- prefix: "AI.interno.*"
+  action: DROP
+```
+
+**Forzar tráfico a otra isla:**
+```yaml
+- prefix: "AI.backup.*"
+  action: FORWARD
+  next_hop_island: "disaster-recovery"
+```
+
+**Documentar ruta existente (sin efecto real):**
+```yaml
+- prefix: "AI.soporte.*"
+  action: FORWARD
+  next_hop_island: ""  # Local
+```
+
+---
+
+## 7. Códigos de Error
+
+### 7.1 Config
 
 | Código | Descripción |
 |--------|-------------|
@@ -529,37 +363,47 @@ vpn_leak_rules:
 | `PREFIX_NOT_FOUND` | Ruta no existe |
 | `INVALID_PREFIX` | Formato de prefix inválido |
 | `INVALID_ACTION` | Acción desconocida |
-| `INVALID_MATCH_KIND` | Match kind desconocido |
-| `VPN_NOT_FOUND` | VPN referenciado no existe |
-| `DUPLICATE_VPN_NAME` | Ya existe VPN con ese nombre |
-| `MAX_ROUTES_EXCEEDED` | Límite de rutas alcanzado |
-| `MAX_VPNS_EXCEEDED` | Límite de VPNs alcanzado |
-| `PERSISTENCE_ERROR` | Error guardando en disco |
-| `DUPLICATE_RULE` | Regla duplicada |
-| `RULE_NOT_FOUND` | Regla no existe |
-| `INVALID_VPN_SCOPE` | VPN scope inválido |
+| `MAX_ROUTES_EXCEEDED` | Límite de 256 rutas alcanzado |
+
+### 7.2 VPN
+
+| Código | Descripción |
+|--------|-------------|
+| `DUPLICATE_PATTERN` | Ya existe VPN con ese pattern |
+| `PATTERN_NOT_FOUND` | VPN no existe |
+| `INVALID_PATTERN` | Formato de pattern inválido |
+| `MAX_VPNS_EXCEEDED` | Límite de 256 VPNs alcanzado |
 
 ---
 
-## 11. Nota v1.13: VPN ya no es túnel WAN
+## 8. Alta Disponibilidad
 
-En v1.12, "VPN" se usaba para forzar caminos WAN con `ACTION_VPN` y endpoints.
+### 8.1 SY.config.routes HA
 
-**En v1.13:**
-- VPN significa **zona/VRF dentro de la isla**
-- `ACTION_VPN` se elimina
-- El forwarding inter-isla se resuelve por:
-  - `next_hop_island` en rutas estáticas
-  - Gateway único por isla
+```
+SY.config.routes.primary@prod   (activo, escribe)
+SY.config.routes.backup@prod    (standby, monitorea)
+```
 
-La segmentación lógica se resuelve por `routing.vpn` + tablas separadas por VPN.
+El backup monitorea el heartbeat del primary. Si detecta stale:
+
+1. Verifica que el primary realmente murió
+2. Reclama la región
+3. Se convierte en primary
+4. Lee YAML y reescribe la región
+
+### 8.2 Gateway HA
+
+El gateway es único por diseño. Si muere, la isla queda aislada inter-isla hasta que se reinicie.
+
+Para v2 se puede considerar gateway secundario con failover.
 
 ---
 
-## 12. Referencias
+## 9. Referencias
 
 | Tema | Documento |
 |------|-----------|
-| Shared memory routers | `03-shm.md` |
-| Routing, VPN semantics | `04-routing.md` |
+| Estructuras SHM | `03-shm.md` |
+| Routing | `04-routing.md` |
 | SY.config.routes completo | `SY_nodes_spec.md` |

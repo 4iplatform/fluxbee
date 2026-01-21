@@ -6,194 +6,592 @@
 
 ---
 
-## 1. Modelo: Una Región por Router
+## 1. Modelo de Tres Regiones
 
-La shared memory es el mecanismo de coordinación entre routers. Cada router tiene su propia región que solo él escribe, y todos los demás leen.
+El sistema usa tres tipos de regiones de memoria compartida:
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           Isla "produccion"                              │
-│                                                                          │
-│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐             │
-│  │  Router A    │     │  Router B    │     │  Router C    │             │
-│  │              │     │              │     │              │             │
-│  │ ┌──────────┐ │     │ ┌──────────┐ │     │ ┌──────────┐ │             │
-│  │ │ SHM-A    │ │     │ │ SHM-A    │ │     │ │ SHM-A    │ │             │
-│  │ │(WRITER)  │◄├────►├─┤(reader)  │◄├────►├─┤(reader)  │ │             │
-│  │ └──────────┘ │     │ └──────────┘ │     │ └──────────┘ │             │
-│  │ ┌──────────┐ │     │ ┌──────────┐ │     │ ┌──────────┐ │             │
-│  │ │ SHM-B    │ │     │ │ SHM-B    │ │     │ │ SHM-B    │ │             │
-│  │ │(reader)  │◄├────►├─┤(WRITER)  │◄├────►├─┤(reader)  │ │             │
-│  │ └──────────┘ │     │ └──────────┘ │     │ └──────────┘ │             │
-│  │ ┌──────────┐ │     │ ┌──────────┐ │     │ ┌──────────┐ │             │
-│  │ │ SHM-C    │ │     │ │ SHM-C    │ │     │ │ SHM-C    │ │             │
-│  │ │(reader)  │◄├────►├─┤(reader)  │◄├────►├─┤(WRITER)  │ │             │
-│  │ └──────────┘ │     │ └──────────┘ │     │ └──────────┘ │             │
-│  └──────────────┘     └──────────────┘     └──────────────┘             │
-│                                                                          │
-│  Cada router:                                                            │
-│  - ESCRIBE solo en SU región (es el único writer)                       │
-│  - LEE las regiones de TODOS los otros routers                          │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+/dev/shm/
+├── jsr-<router-uuid>        # Una por router
+├── jsr-config-<island>      # Una por isla
+└── jsr-lsa-<island>         # Una por isla
 ```
 
-**Principio clave:** Cada región tiene exactamente un writer (su dueño) y múltiples readers (todos los demás). Esto permite usar seqlock sin conflictos.
+| Región | Writer | Contenido |
+|--------|--------|-----------|
+| `jsr-<uuid>` | Router dueño | Nodos CONNECTED a ese router |
+| `jsr-config-<island>` | SY.config.routes | Rutas estáticas, tabla VPN |
+| `jsr-lsa-<island>` | Gateway | Topología de islas remotas |
+
+**Principio clave:** Cada región tiene **un único writer** y múltiples readers. Esto permite usar seqlock sin conflictos.
 
 ---
 
-## 2. Naming de Regiones
+## 2. Región del Router: jsr-<uuid>
 
-El nombre de la región incluye el UUID del router dueño:
+Cada router escribe únicamente en su propia región.
+
+### 2.1 Naming
 
 ```
 /jsr-<router_uuid>
+
+Ejemplo: /jsr-a1b2c3d4-e5f6-7890-abcd-ef1234567890
 ```
 
-Ejemplo:
-```
-/jsr-a1b2c3d4-e5f6-7890-abcd-ef1234567890
-```
+**En macOS:** Truncar a 31 caracteres (primeros 16 hex del UUID).
 
-**En macOS:** El nombre se trunca a 31 caracteres (usar primeros 16 hex del UUID).
-
----
-
-## 3. Contenido de Cada Región
-
-Cada router escribe en SU región únicamente:
+### 2.2 Contenido
 
 | Dato | Descripción |
 |------|-------------|
-| **Sus nodos** | Nodos conectados directamente a este router |
-| **Sus rutas CONNECTED** | Rutas automáticas por nodos locales |
-| **Su estado** | owner_pid, heartbeat, timestamps |
+| Header | Identificación, seqlock, heartbeat |
+| Nodos | Nodos conectados directamente a este router |
 
-**NO escribe:**
-- Rutas de otros routers (esas las lee de sus regiones)
-- Nodos de otros routers (esas las lee de sus regiones)
-
----
-
-## 4. Layout de la Región
+### 2.3 Layout
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ ShmHeader (192 bytes)                                       │
-│ - magic, version, owner info, seqlock, timestamps           │
 ├─────────────────────────────────────────────────────────────┤
-│ NodeEntry[MAX_NODES] (1024 entries × 312 bytes)             │
-│ - Nodos conectados a ESTE router                            │
-│ - Total: ~312 KB                                            │
-├─────────────────────────────────────────────────────────────┤
-│ RouteEntry[MAX_ROUTES] (256 entries × 304 bytes)            │
-│ - Rutas CONNECTED de ESTE router                            │
-│ - Total: ~76 KB                                             │
+│ NodeEntry[MAX_NODES] (1024 entries × 320 bytes)             │
+│ Total: ~320 KB                                              │
 └─────────────────────────────────────────────────────────────┘
-Total aproximado: ~390 KB por router
+Total aproximado: ~320 KB por router
 ```
 
-**Nota:** No hay `RouterEntry[]` en cada región. La lista de routers se construye dinámicamente a partir de los HELLOs recibidos.
+### 2.4 Estructuras
+
+```rust
+pub const SHM_MAGIC: u32 = 0x4A535352;  // "JSSR"
+pub const SHM_VERSION: u32 = 1;
+pub const MAX_NODES: u32 = 1024;
+
+#[repr(C)]
+pub struct ShmHeader {
+    // Identificación (8 bytes)
+    pub magic: u32,
+    pub version: u32,
+    
+    // Owner (40 bytes)
+    pub router_uuid: [u8; 16],
+    pub owner_pid: u32,
+    pub _pad0: u32,
+    pub owner_start_time: u64,
+    pub generation: u64,
+    
+    // Seqlock (8 bytes)
+    pub seq: u64,  // AtomicU64
+    
+    // Contadores (8 bytes)
+    pub node_count: u32,
+    pub node_max: u32,
+    
+    // Timestamps (24 bytes)
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub heartbeat: u64,
+    
+    // Isla (66 bytes)
+    pub island_id: [u8; 64],
+    pub island_id_len: u16,
+    
+    // Router info (66 bytes)
+    pub router_name: [u8; 64],      // "RT.primary@produccion"
+    pub router_name_len: u16,
+    
+    // Flags (4 bytes)
+    pub is_gateway: u8,              // 1 si este router es el gateway
+    pub _flags_reserved: [u8; 3],
+    
+    // Reserved (para llegar a 224 bytes)
+    pub _reserved: [u8; 6],
+}
+// Total: 224 bytes
+
+#[repr(C)]
+pub struct NodeEntry {
+    // Identificación (16 bytes)
+    pub uuid: [u8; 16],
+    
+    // Nombre L2 (258 bytes)
+    pub name: [u8; 256],             // "AI.soporte.l1@produccion"
+    pub name_len: u16,
+    
+    // VPN (4 bytes)
+    pub vpn_id: u32,
+    
+    // Estado (10 bytes)
+    pub flags: u16,
+    pub connected_at: u64,
+    
+    // Reserved (32 bytes)
+    pub _reserved: [u8; 32],
+}
+// Total: 320 bytes
+```
+
+---
+
+## 3. Región de Config: jsr-config-<island>
+
+Una sola región por isla, escrita únicamente por `SY.config.routes`.
+
+### 3.1 Naming
+
+```
+/jsr-config-<island_id>
+
+Ejemplo: /jsr-config-produccion
+```
+
+### 3.2 Contenido
+
+| Dato | Descripción |
+|------|-------------|
+| Header | Identificación, seqlock, contadores |
+| Rutas estáticas | Configuración de routing |
+| Tabla VPN | Asignación de nodos a VPN |
+
+### 3.3 Layout
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ ConfigHeader (128 bytes)                                    │
+├─────────────────────────────────────────────────────────────┤
+│ StaticRouteEntry[MAX_STATIC_ROUTES] (256 × 320 bytes)      │
+│ Total: ~80 KB                                               │
+├─────────────────────────────────────────────────────────────┤
+│ VpnAssignment[MAX_VPN_ASSIGNMENTS] (256 × 288 bytes)       │
+│ Total: ~72 KB                                               │
+└─────────────────────────────────────────────────────────────┘
+Total aproximado: ~153 KB
+```
+
+### 3.4 Estructuras
+
+```rust
+pub const CONFIG_MAGIC: u32 = 0x4A534343;  // "JSCC"
+pub const CONFIG_VERSION: u32 = 1;
+pub const MAX_STATIC_ROUTES: u32 = 256;
+pub const MAX_VPN_ASSIGNMENTS: u32 = 256;
+
+#[repr(C)]
+pub struct ConfigHeader {
+    // Identificación (8 bytes)
+    pub magic: u32,
+    pub version: u32,
+    
+    // Owner (40 bytes)
+    pub owner_uuid: [u8; 16],        // UUID de SY.config.routes
+    pub owner_pid: u32,
+    pub _pad0: u32,
+    pub owner_start_time: u64,
+    pub heartbeat: u64,
+    
+    // Seqlock (8 bytes)
+    pub seq: u64,
+    
+    // Contadores (16 bytes)
+    pub static_route_count: u32,
+    pub vpn_assignment_count: u32,
+    pub config_version: u64,         // Incrementa con cada cambio
+    
+    // Isla (66 bytes)
+    pub island_id: [u8; 64],
+    pub island_id_len: u16,
+    
+    // Timestamps (16 bytes)
+    pub created_at: u64,
+    pub updated_at: u64,
+    
+    // Reserved
+    pub _reserved: [u8; 38],
+}
+// Total: 128 bytes
+
+// Acciones de ruta
+pub const ACTION_FORWARD: u8 = 0;
+pub const ACTION_DROP: u8 = 1;
+
+#[repr(C)]
+pub struct StaticRouteEntry {
+    // Pattern (260 bytes)
+    pub prefix: [u8; 256],           // "AI.soporte.*"
+    pub prefix_len: u16,
+    pub match_kind: u8,              // EXACT, PREFIX, GLOB
+    pub action: u8,                  // FORWARD, DROP
+    
+    // Forwarding (36 bytes)
+    pub next_hop_island: [u8; 32],   // "" = local, "staging" = inter-isla
+    pub next_hop_island_len: u8,
+    pub _pad: [u8; 3],
+    
+    // Metadata (24 bytes)
+    pub metric: u32,
+    pub priority: u16,               // Menor = evalúa primero
+    pub flags: u16,
+    pub installed_at: u64,
+    pub _reserved: [u8; 8],
+}
+// Total: 320 bytes
+
+#[repr(C)]
+pub struct VpnAssignment {
+    // Pattern (260 bytes)
+    pub pattern: [u8; 256],          // "AI.soporte.*"
+    pub pattern_len: u16,
+    pub match_kind: u8,
+    pub _pad0: u8,
+    
+    // Asignación (8 bytes)
+    pub vpn_id: u32,
+    pub priority: u16,               // Menor = evalúa primero
+    pub flags: u16,
+    
+    // Reserved (20 bytes)
+    pub _reserved: [u8; 20],
+}
+// Total: 288 bytes
+```
+
+---
+
+## 4. Región LSA: jsr-lsa-<island>
+
+Una sola región por isla, escrita únicamente por el **Gateway**.
+
+### 4.1 Naming
+
+```
+/jsr-lsa-<island_id>
+
+Ejemplo: /jsr-lsa-produccion
+```
+
+### 4.2 Contenido
+
+Topología de **otras islas** (no la local):
+
+| Dato | Descripción |
+|------|-------------|
+| Header | Identificación, lista de islas remotas |
+| Por cada isla remota | Nodos, rutas, VPNs de esa isla |
+
+### 4.3 Layout
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ LsaHeader (128 bytes)                                       │
+├─────────────────────────────────────────────────────────────┤
+│ RemoteIslandEntry[MAX_REMOTE_ISLANDS] (16 × 96 bytes)      │
+│ Total: ~1.5 KB                                              │
+├─────────────────────────────────────────────────────────────┤
+│ RemoteNodeEntry[MAX_REMOTE_NODES] (1024 × 288 bytes)       │
+│ Total: ~288 KB                                              │
+├─────────────────────────────────────────────────────────────┤
+│ RemoteRouteEntry[MAX_REMOTE_ROUTES] (256 × 320 bytes)      │
+│ Total: ~80 KB                                               │
+├─────────────────────────────────────────────────────────────┤
+│ RemoteVpnEntry[MAX_REMOTE_VPNS] (256 × 288 bytes)          │
+│ Total: ~72 KB                                               │
+└─────────────────────────────────────────────────────────────┘
+Total aproximado: ~442 KB
+```
+
+### 4.4 Estructuras
+
+```rust
+pub const LSA_MAGIC: u32 = 0x4A534C41;  // "JSLA"
+pub const LSA_VERSION: u32 = 1;
+pub const MAX_REMOTE_ISLANDS: u32 = 16;
+pub const MAX_REMOTE_NODES: u32 = 1024;      // Total entre todas las islas
+pub const MAX_REMOTE_ROUTES: u32 = 256;
+pub const MAX_REMOTE_VPNS: u32 = 256;
+
+#[repr(C)]
+pub struct LsaHeader {
+    // Identificación (8 bytes)
+    pub magic: u32,
+    pub version: u32,
+    
+    // Owner (40 bytes)
+    pub gateway_uuid: [u8; 16],
+    pub owner_pid: u32,
+    pub _pad0: u32,
+    pub owner_start_time: u64,
+    pub heartbeat: u64,
+    
+    // Seqlock (8 bytes)
+    pub seq: u64,
+    
+    // Contadores (16 bytes)
+    pub island_count: u32,
+    pub total_node_count: u32,
+    pub total_route_count: u32,
+    pub total_vpn_count: u32,
+    
+    // Timestamps (16 bytes)
+    pub created_at: u64,
+    pub updated_at: u64,
+    
+    // Isla local (66 bytes)
+    pub local_island_id: [u8; 64],
+    pub local_island_id_len: u16,
+    
+    // Reserved
+    pub _reserved: [u8; 38],
+}
+// Total: 128 bytes
+
+#[repr(C)]
+pub struct RemoteIslandEntry {
+    // Isla (66 bytes)
+    pub island_id: [u8; 64],         // "staging"
+    pub island_id_len: u16,
+    
+    // Estado (18 bytes)
+    pub last_lsa_seq: u64,
+    pub last_updated: u64,
+    pub flags: u16,
+    
+    // Contadores (12 bytes)
+    pub node_count: u32,
+    pub route_count: u32,
+    pub vpn_count: u32,
+}
+// Total: 96 bytes
+
+#[repr(C)]
+pub struct RemoteNodeEntry {
+    // Identificación (16 bytes)
+    pub uuid: [u8; 16],
+    
+    // Nombre L2 (258 bytes)
+    pub name: [u8; 256],             // "AI.soporte.l1@staging"
+    pub name_len: u16,
+    
+    // VPN y isla (6 bytes)
+    pub vpn_id: u32,
+    pub island_index: u16,           // Índice en RemoteIslandEntry[]
+    
+    // Flags (8 bytes)
+    pub flags: u16,
+    pub _reserved: [u8; 6],
+}
+// Total: 288 bytes
+
+#[repr(C)]
+pub struct RemoteRouteEntry {
+    // Pattern (260 bytes)
+    pub prefix: [u8; 256],
+    pub prefix_len: u16,
+    pub match_kind: u8,
+    pub action: u8,
+    
+    // Forwarding (36 bytes)
+    pub next_hop_island: [u8; 32],
+    pub next_hop_island_len: u8,
+    pub _pad: [u8; 3],
+    
+    // Metadata (24 bytes)
+    pub metric: u32,
+    pub priority: u16,
+    pub flags: u16,
+    pub island_index: u16,
+    pub _reserved: [u8; 14],
+}
+// Total: 320 bytes
+
+#[repr(C)]
+pub struct RemoteVpnEntry {
+    // Pattern (260 bytes)
+    pub pattern: [u8; 256],
+    pub pattern_len: u16,
+    pub match_kind: u8,
+    pub _pad0: u8,
+    
+    // Asignación (8 bytes)
+    pub vpn_id: u32,
+    pub priority: u16,
+    pub flags: u16,
+    
+    // Isla (4 bytes)
+    pub island_index: u16,
+    pub _reserved: [u8; 18],
+}
+// Total: 288 bytes
+```
 
 ---
 
 ## 5. Sincronización: Seqlock
 
-Cada región tiene exactamente un writer (su dueño), lo que permite usar seqlock sin conflictos:
+Todas las regiones usan seqlock para sincronización.
 
-- Header contiene `seq: AtomicU64`
-- Sin locks, sin deadlocks, sin contención
-- Usa memory orderings para coherencia entre procesos
-
-### 5.1 Protocolo del Writer (solo el router dueño)
+### 5.1 Protocolo del Writer
 
 ```rust
-// Comenzar escritura (seq queda impar = "escribiendo")
+// Comenzar escritura (seq queda impar)
 header.seq.fetch_add(1, Ordering::Relaxed);
 
-// Escribir datos en la región
+// Escribir datos
 // ...
 
-// Finalizar escritura (seq queda par = "snapshot consistente")
+// Finalizar escritura (seq queda par)
 atomic::fence(Ordering::Release);
 header.seq.fetch_add(1, Ordering::Relaxed);
 ```
 
-### 5.2 Protocolo del Reader (todos los demás)
+### 5.2 Protocolo del Reader
 
 ```rust
 loop {
-    // Leer seq
     let s1 = header.seq.load(Ordering::Acquire);
-    
-    // Si impar, el writer está escribiendo, reintentar
     if s1 & 1 != 0 {
         std::hint::spin_loop();
         continue;
     }
     
-    // Barrera antes de leer datos
     atomic::fence(Ordering::Acquire);
-    
-    // Copiar datos que necesita
     let data = /* copiar snapshot */;
-    
-    // Barrera después de leer datos
     atomic::fence(Ordering::Acquire);
     
-    // Verificar que seq no cambió durante la lectura
     let s2 = header.seq.load(Ordering::Acquire);
     if s1 == s2 {
-        break; // Snapshot consistente
+        break;  // Snapshot consistente
     }
-    // Si cambió, descartar y reintentar
 }
 ```
 
-**Importante:** `seq` debe estar alineado a 8 bytes para garantizar atomicidad.
+---
+
+## 6. Heartbeat y Detección de Stale
+
+Cada writer actualiza `heartbeat` cada 5 segundos.
+
+```rust
+pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
+pub const HEARTBEAT_STALE_MS: u64 = 30_000;
+```
+
+**Detección de región stale:**
+
+```rust
+fn is_region_stale(header: &impl HasHeartbeat) -> bool {
+    let now = current_epoch_ms();
+    now - header.heartbeat() > HEARTBEAT_STALE_MS
+}
+```
 
 ---
 
-## 6. Constantes
+## 7. Flujo de Lectura del Router
+
+El router lee las tres categorías de regiones:
 
 ```rust
-// Identificación
-pub const SHM_MAGIC: u32 = 0x4A535352;  // "JSSR" en ASCII
+fn build_routing_table(&mut self) {
+    // 1. Leer mis nodos (jsr-<mi-uuid>)
+    //    → Ya los tengo, soy el writer
+    
+    // 2. Leer nodos de peers (jsr-<peer-uuid>)
+    for peer_shm in self.discover_peer_regions() {
+        if !is_region_stale(&peer_shm.header) {
+            for node in peer_shm.nodes {
+                self.add_route_to_peer(node, peer_shm.router_uuid);
+            }
+        }
+    }
+    
+    // 3. Leer config (jsr-config-<island>)
+    if let Some(config) = self.map_config_region() {
+        // Rutas estáticas
+        for route in config.static_routes {
+            self.add_static_route(route);
+        }
+        // Tabla VPN (para asignar VPN a nodos nuevos)
+        self.vpn_table = config.vpn_assignments.clone();
+    }
+    
+    // 4. Leer LSA (jsr-lsa-<island>)
+    if let Some(lsa) = self.map_lsa_region() {
+        for remote_island in lsa.islands {
+            for node in remote_island.nodes {
+                self.add_remote_route(node, remote_island.island_id);
+            }
+        }
+    }
+}
+```
+
+---
+
+## 8. Descubrimiento de Regiones
+
+### 8.1 Regiones de Routers
+
+Via mensaje HELLO entre routers:
+
+```json
+{
+  "meta": { "type": "system", "msg": "HELLO" },
+  "payload": {
+    "router_id": "uuid",
+    "router_name": "RT.primary@produccion",
+    "shm_name": "/jsr-a1b2c3d4..."
+  }
+}
+```
+
+### 8.2 Región de Config
+
+Nombre fijo basado en island_id:
+
+```rust
+let config_shm = format!("/jsr-config-{}", island_id);
+```
+
+### 8.3 Región de LSA
+
+Nombre fijo basado en island_id:
+
+```rust
+let lsa_shm = format!("/jsr-lsa-{}", island_id);
+```
+
+---
+
+## 9. Constantes Consolidadas
+
+```rust
+// Región de routers
+pub const SHM_MAGIC: u32 = 0x4A535352;
 pub const SHM_VERSION: u32 = 1;
-pub const SHM_NAME_PREFIX: &str = "/jsr-";
+pub const MAX_NODES: u32 = 1024;
 
-// Capacidades por router
-pub const MAX_NODES: u32 = 1024;    // Nodos por router
-pub const MAX_ROUTES: u32 = 256;    // Rutas por router
-pub const MAX_PEERS: usize = 16;    // Máximo de peers mapeados
+// Región de config
+pub const CONFIG_MAGIC: u32 = 0x4A534343;
+pub const CONFIG_VERSION: u32 = 1;
+pub const MAX_STATIC_ROUTES: u32 = 256;
+pub const MAX_VPN_ASSIGNMENTS: u32 = 256;
 
-// Tamaños de campos
-pub const NAME_MAX_LEN: usize = 256;
-pub const ISLAND_ID_MAX_LEN: usize = 64;
-pub const SHM_NAME_MAX_LEN: usize = 64;
+// Región LSA
+pub const LSA_MAGIC: u32 = 0x4A534C41;
+pub const LSA_VERSION: u32 = 1;
+pub const MAX_REMOTE_ISLANDS: u32 = 16;
+pub const MAX_REMOTE_NODES: u32 = 1024;
+pub const MAX_REMOTE_ROUTES: u32 = 256;
+pub const MAX_REMOTE_VPNS: u32 = 256;
 
-// Flags de estado
+// Match kinds
+pub const MATCH_EXACT: u8 = 0;
+pub const MATCH_PREFIX: u8 = 1;
+pub const MATCH_GLOB: u8 = 2;
+
+// Flags
 pub const FLAG_ACTIVE: u16 = 0x0001;
-pub const FLAG_DELETED: u16 = 0x0002;  // Marcado para reusar slot
-
-// Match kinds (para rutas)
-pub const MATCH_EXACT: u8 = 0;   // "AI.soporte.l1" matchea solo eso
-pub const MATCH_PREFIX: u8 = 1;  // "AI.soporte" matchea "AI.soporte.*"
-pub const MATCH_GLOB: u8 = 2;    // Patterns con wildcards
-
-// Tipos de ruta (route_type)
-pub const ROUTE_CONNECTED: u8 = 0;  // Nodo conectado directamente
-pub const ROUTE_STATIC: u8 = 1;     // Configurada (viene de config shm)
-pub const ROUTE_LSA: u8 = 2;        // Aprendida de otro router
-
-// Admin distances (menor = preferido)
-pub const AD_CONNECTED: u16 = 0;    // Siempre preferir nodos locales
-pub const AD_STATIC: u16 = 1;       // Rutas manuales
-pub const AD_LSA: u16 = 10;         // Rutas aprendidas
-
-// Identificadores de link
-pub const LINK_LOCAL: u32 = 0;      // Nodo conectado localmente
-// LINK 1..N = uplinks a otros routers
+pub const FLAG_DELETED: u16 = 0x0002;
 
 // Timers
 pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
@@ -202,316 +600,11 @@ pub const HEARTBEAT_STALE_MS: u64 = 30_000;
 
 ---
 
-## 7. Estructuras de Datos
-
-Todas las estructuras usan `#[repr(C)]` para layout determinístico en memoria.
-
-### 7.1 ShmHeader
-
-```rust
-use std::sync::atomic::AtomicU64;
-
-#[repr(C)]
-pub struct ShmHeader {
-    // === IDENTIFICACIÓN (8 bytes) ===
-    pub magic: u32,                 // SHM_MAGIC para validar
-    pub version: u32,               // SHM_VERSION para compatibilidad
-    
-    // === OWNER (40 bytes) ===
-    pub router_uuid: [u8; 16],      // UUID del router dueño
-    pub owner_pid: u32,             // PID del proceso dueño
-    pub _pad0: u32,                 // Padding para alineación
-    pub owner_start_time: u64,      // Epoch ms cuando arrancó (anti PID-reuse)
-    pub generation: u64,            // Incrementa en cada recreación
-    
-    // === SEQLOCK (8 bytes, alineado) ===
-    pub seq: AtomicU64,             // Impar=escribiendo, par=consistente
-    
-    // === CONTADORES (8 bytes) ===
-    pub node_count: u32,            // Nodos activos
-    pub route_count: u32,           // Rutas activas
-    
-    // === CAPACIDADES (8 bytes) ===
-    pub node_max: u32,              // MAX_NODES
-    pub route_max: u32,             // MAX_ROUTES
-    
-    // === TIMESTAMPS (24 bytes) ===
-    pub created_at: u64,            // Epoch ms creación
-    pub updated_at: u64,            // Epoch ms última modificación
-    pub heartbeat: u64,             // Epoch ms último heartbeat
-    
-    // === ISLA (66 bytes) ===
-    pub island_id: [u8; 64],        // "produccion", "staging", etc.
-    pub island_id_len: u16,
-    
-    // === OPA POLICY (12 bytes) ===
-    pub opa_policy_version: u64,    // Versión del policy cargado
-    pub opa_load_status: u8,        // 0=OK, 1=ERROR, 2=LOADING
-    pub _pad1: [u8; 3],
-    
-    // === RESERVADO (18 bytes para llegar a 192) ===
-    pub _reserved: [u8; 18],
-}
-// Total: 192 bytes
-```
-
-### 7.2 NodeEntry
-
-Registro de un nodo conectado a este router.
-
-```rust
-#[repr(C)]
-pub struct NodeEntry {
-    // === IDENTIFICACIÓN (16 bytes) ===
-    pub uuid: [u8; 16],          // UUID del nodo (capa 1)
-    
-    // === NOMBRE CAPA 2 (258 bytes) ===
-    pub name: [u8; 256],         // "AI.soporte.l1@produccion" (UTF-8)
-    pub name_len: u16,           // Longitud en bytes
-    
-    // === VPN (v1.13) (4 bytes) ===
-    pub vpn_id: u32,             // VPN asignado al nodo
-    
-    // === ESTADO (10 bytes) ===
-    pub flags: u16,              // FLAG_ACTIVE, FLAG_DELETED
-    pub connected_at: u64,       // Epoch ms cuando conectó
-    
-    // === RESERVADO (24 bytes) ===
-    pub _reserved: [u8; 24],
-}
-// Total: 312 bytes
-// Con 1024 entries: ~312 KB
-```
-
-**Nota v1.13:** Se agregó `vpn_id` para registrar el VPN asignado al nodo.
-
-### 7.3 RouteEntry
-
-Entrada en la tabla de ruteo. Solo rutas CONNECTED de este router.
-
-```rust
-#[repr(C)]
-pub struct RouteEntry {
-    // === MATCHING (260 bytes) ===
-    pub prefix: [u8; 256],       // Pattern: "AI.soporte.*" (UTF-8)
-    pub prefix_len: u16,         // Longitud en bytes
-    pub match_kind: u8,          // MATCH_EXACT, MATCH_PREFIX, MATCH_GLOB
-    pub route_type: u8,          // ROUTE_CONNECTED, ROUTE_LSA
-    
-    // === FORWARDING (24 bytes) ===
-    pub next_hop_router: [u8; 16], // UUID del router next-hop
-    pub out_link: u32,           // 0=local, 1..N=uplink id
-    pub metric: u32,             // Costo de esta ruta
-    
-    // === SELECCIÓN (4 bytes) ===
-    pub admin_distance: u16,     // AD_CONNECTED, AD_LSA
-    pub flags: u16,              // FLAG_ACTIVE, FLAG_DELETED
-    
-    // === METADATA (16 bytes) ===
-    pub installed_at: u64,       // Epoch ms cuando se instaló
-    pub _reserved: [u8; 8],
-}
-// Total: 304 bytes
-// Con 256 entries: ~76 KB
-```
-
----
-
-## 8. Inicialización y Recuperación
-
-### 8.1 ¿Quién crea la región?
-
-Cada router crea su propia región al arrancar.
-
-### 8.2 Detección de región stale (crash anterior)
-
-```
-1. Intentar abrir región existente con mi UUID
-2. Si existe:
-   a. Leer owner_pid y owner_start_time
-   b. Verificar si el proceso está vivo:
-      - kill(owner_pid, 0) == OK
-      - Y owner_start_time coincide con start_time real
-   c. Si el proceso NO existe o start_time no coincide → región stale
-   d. Si heartbeat > HEARTBEAT_STALE_MS → región stale
-   e. Si región stale:
-      - shm_unlink(shm_name)
-      - Crear región nueva con generation++
-   f. Si proceso vivo y heartbeat reciente → ERROR: otro proceso usa mi UUID
-3. Si no existe:
-   a. Crear región nueva
-   b. Inicializar header con magic, version, mi pid, start_time, generation=1
-```
-
-### 8.3 Obtener start_time del proceso
-
-```rust
-fn get_process_start_time(pid: u32) -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        // Leer /proc/<pid>/stat, campo 22 (starttime en ticks)
-        let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-        let fields: Vec<&str> = stat.split_whitespace().collect();
-        let start_ticks: u64 = fields.get(21)?.parse().ok()?;
-        Some(start_ticks)
-    }
-    
-    #[cfg(not(target_os = "linux"))]
-    {
-        None  // Fallback a heartbeat
-    }
-}
-
-fn is_owner_alive(header: &ShmHeader) -> bool {
-    if unsafe { libc::kill(header.owner_pid as i32, 0) } != 0 {
-        return false;
-    }
-    
-    match get_process_start_time(header.owner_pid) {
-        Some(actual_start) => header.owner_start_time == actual_start,
-        None => true,  // OS no soporta, confiar en heartbeat
-    }
-}
-```
-
-### 8.4 Heartbeat
-
-El router dueño actualiza `heartbeat` cada 5 segundos:
-
-```rust
-loop {
-    // ... procesar mensajes ...
-    
-    if tiempo_desde_ultimo_heartbeat > HEARTBEAT_INTERVAL_MS {
-        seqlock_write_begin();
-        header.heartbeat = now_epoch_ms();
-        seqlock_write_end();
-    }
-}
-```
-
-### 8.5 Detección de peer muerto
-
-```
-1. Verificar heartbeat del peer
-2. Si heartbeat > HEARTBEAT_STALE_MS (30s):
-   a. Considerar peer como muerto
-   b. Dejar de usar sus rutas en la FIB
-   c. munmap() la región
-   d. Intentar re-abrir periódicamente
-3. Si generation cambió:
-   a. munmap() y re-abrir para obtener nueva generación
-```
-
----
-
-## 9. Operaciones de Escritura
-
-Solo el router dueño escribe en su región.
-
-### 9.1 Registrar nodo (cuando conecta)
-
-```
-1. Buscar slot libre en NodeEntry[] (flags == 0 o FLAG_DELETED)
-2. seqlock_begin_write()
-3. Escribir uuid, name, name_len, vpn_id, connected_at
-4. flags = FLAG_ACTIVE
-5. node_count++
-6. updated_at = now()
-7. seqlock_end_write()
-8. Crear RouteEntry CONNECTED para el nodo
-```
-
-### 9.2 Desregistrar nodo (cuando desconecta)
-
-```
-1. Buscar NodeEntry por uuid
-2. seqlock_begin_write()
-3. flags = FLAG_DELETED
-4. node_count--
-5. Marcar RouteEntry asociada como FLAG_DELETED
-6. route_count--
-7. updated_at = now()
-8. seqlock_end_write()
-```
-
----
-
-## 10. Descubrimiento de Regiones via HELLO
-
-Los routers descubren las regiones de sus peers mediante el mensaje HELLO:
-
-```json
-{
-  "meta": {
-    "type": "system",
-    "msg": "HELLO"
-  },
-  "payload": {
-    "router_id": "uuid-router-a",
-    "island_id": "produccion",
-    "shm_name": "/jsr-a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-  }
-}
-```
-
-**Flujo:**
-
-```
-1. Router A arranca, crea su región /jsr-<uuid-A>
-2. Router A envía HELLO
-3. Router B recibe HELLO de A
-4. Router B extrae shm_name del HELLO
-5. Router B mapea /jsr-<uuid-A> en modo read-only
-6. Router B ahora puede leer los nodos de A
-7. Router B responde con su propio HELLO
-8. Router A mapea /jsr-<uuid-B>
-```
-
----
-
-## 11. Encoding de Strings
-
-**UTF-8** para `name`, `prefix`, e `island_id`.
-
-- Los nombres pueden contener Unicode: "AI.soporte.español@produccion"
-- `name_len`, `prefix_len` son longitud en **bytes**, no caracteres
-- Validación de caracteres permitidos aplica a code points:
-
-```rust
-fn validate_name(name: &str) -> bool {
-    name.chars().all(|c| {
-        c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '@'
-    })
-}
-```
-
----
-
-## 12. Qué vive en Shared Memory
-
-| Dato | Quién escribe | Descripción |
-|------|---------------|-------------|
-| Header | Router dueño | Identificación, seqlock, heartbeat |
-| Nodos | Router dueño | Nodos conectados a este router |
-| Rutas CONNECTED | Router dueño | Una por cada nodo local |
-
-## 13. Qué NO vive en Shared Memory
-
-| Dato | Por qué no | Dónde vive |
-|------|------------|------------|
-| Lista de routers peers | Dinámica, via HELLOs | Memoria local |
-| FIB compilada | Derivada de todas las regiones | Memoria local |
-| Estado del socket | El socket lo indica | Local |
-| Rutas de otros routers | Cada uno las tiene en su región | Se leen, no se copian |
-| Rutas STATIC | En región de config separada | `/jsr-config-<island>` |
-
----
-
-## 14. Referencias
+## 10. Referencias
 
 | Tema | Documento |
 |------|-----------|
-| Arquitectura, islas | `01-arquitectura.md` |
+| Arquitectura | `01-arquitectura.md` |
 | Routing, FIB | `04-routing.md` |
-| Región de config (rutas estáticas, VPN) | `06-config-shm.md` |
+| LSA entre gateways | `05-conectividad.md` |
+| SY.config.routes | `06-regiones.md` |

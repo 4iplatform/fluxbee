@@ -17,7 +17,7 @@ Este documento especifica un router de mensajes JSON diseñado para interconecta
 
 El sistema se configura mediante dos mecanismos ortogonales:
 
-- **Tabla de ruteo**: Configuración estática de caminos (IP lógica, forwards, zonas VPN).
+- **Tabla de ruteo**: Configuración estática de caminos y zonas VPN.
 - **Policies OPA**: Reglas de negocio para resolución dinámica por rol/capacidad.
 
 ---
@@ -91,7 +91,8 @@ Forward directo      ┌──────────────────�
 | Nodo IO | Adapta medios externos (WhatsApp, email, etc.) al protocolo interno. |
 | Nodo SY | Provee servicios de infraestructura (tiempo, monitoreo, admin). |
 | Router | Detecta nodos, conecta sockets, mantiene tabla local, consulta OPA si hace falta, rutea, detecta link down. |
-| Shared Memory | Tabla de ruteo y estado de nodos. Compartida entre routers, no accesible por nodos. |
+| Gateway | Router especial que conecta islas entre sí via TCP/WAN. |
+| Shared Memory | Tablas de estado compartidas. Tres tipos de regiones (ver sección 7). |
 | OPA (WASM) | Evalúa policies de negocio. No accede a estado del sistema. |
 | Librería de Nodo | Común a todos los nodos. Maneja protocolo de socket, framing, retry, reconexión. |
 
@@ -108,11 +109,11 @@ Forward directo      ┌──────────────────�
 
 ---
 
-## 6. Islas y Naming con @isla (v1.13)
+## 6. Islas y Naming con @isla
 
 ### 6.1 Identidad de Isla
 
-Toda instancia (routers y nodos) opera dentro de una **isla**, definida por el archivo:
+Toda instancia (routers y nodos) opera dentro de una **isla**, definida por:
 
 ```
 /etc/json-router/island.yaml
@@ -124,9 +125,10 @@ Contenido mínimo:
 island_id: "produccion"
 ```
 
-**Regla:**
-- Todos los procesos de la isla leen este archivo.
-- La isla no se infiere por hostname ni por parámetros sueltos.
+**Reglas:**
+- Todos los procesos de la isla leen este archivo al arrancar.
+- Si no existe `island.yaml`, el proceso NO arranca.
+- La isla se asigna una vez al inicio y no cambia durante la ejecución.
 
 ### 6.2 Definición de Isla
 
@@ -139,28 +141,29 @@ island_id: "produccion"
 ┌─────────────────────────────────────────────────────────────┐
 │                        HOST FÍSICO                          │
 │                         (Isla A)                            │
-│                                                              │
+│                                                             │
 │   ┌──────────┐   ┌──────────┐   ┌──────────┐              │
-│   │ Router 1 │   │ Router 2 │   │ Router 3 │              │
+│   │ Router 1 │   │ Router 2 │   │ Gateway  │              │
 │   └────┬─────┘   └────┬─────┘   └────┬─────┘              │
-│        │              │              │                      │
-│        └──────────────┼──────────────┘                      │
-│                       │                                      │
-│                       ▼                                      │
-│              ┌─────────────────┐                            │
-│              │   /dev/shm      │  ← Memoria compartida      │
-│              │                 │    (todas las regiones)    │
-│              │ /jsr-router-1   │                            │
-│              │ /jsr-router-2   │                            │
-│              │ /jsr-router-3   │                            │
-│              │ /jsr-config-a   │                            │
-│              └─────────────────┘                            │
-│                                                              │
-│   [Nodos]  [Nodos]  [Nodos]                                │
+│        │              │              │                     │
+│        └──────────────┼──────────────┘                     │
+│                       │                                    │
+│                       ▼                                    │
+│              ┌─────────────────┐                           │
+│              │   /dev/shm      │                           │
+│              │                 │                           │
+│              │ jsr-<uuid-1>    │  ← Región Router 1        │
+│              │ jsr-<uuid-2>    │  ← Región Router 2        │
+│              │ jsr-<uuid-gw>   │  ← Región Gateway         │
+│              │ jsr-config-A    │  ← Región Config          │
+│              │ jsr-lsa-A       │  ← Región LSA (remoto)    │
+│              └─────────────────┘                           │
+│                                                             │
+│   [Nodos]  [Nodos]  [Nodos]                               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 6.3 Naming L2 con @isla (v1.13 - OBLIGATORIO)
+### 6.3 Naming L2 con @isla (OBLIGATORIO)
 
 Todo nombre L2 **incluye isla** con el sufijo `@`:
 
@@ -172,104 +175,109 @@ TYPE.campo1.campo2@isla
 
 ```
 AI.soporte.l1@produccion
-WF.invoice.1@staging
+WF.invoice.process@staging
 SY.config.routes@produccion
-SY.orchestrator@produccion
 RT.primary@produccion
+RT.gateway@produccion
 ```
 
 **Reglas:**
 - `TYPE` ∈ {AI, WF, IO, SY, RT}
-- La isla es el sufijo luego de `@`
-- **No se usa** el formato viejo `SY.xxx.{isla}` (deprecado)
+- La isla es el sufijo después de `@`
+- La **librería de nodo agrega @isla automáticamente** desde `island.yaml`
+- El nodo solo configura `name: "AI.soporte.l1"`, la librería lo convierte a `AI.soporte.l1@produccion`
 
-### 6.4 Consecuencia sobre Routing Inter-Isla
+### 6.4 Routing Inter-Isla
 
-El routing inter-isla se decide parseando `@isla` del destino. No hay propagación de rutas de nodos por broadcast entre islas.
+El routing inter-isla se decide parseando `@isla` del destino:
 
 ```
 Destino: AI.soporte.l1@staging
 
 1. Parsear @isla → "staging"
-2. Si staging == local_island → routing intra-isla
-3. Si staging != local_island → enviar al gateway inter-isla
+2. Si staging == mi_isla → routing intra-isla (SHM local)
+3. Si staging != mi_isla → buscar en jsr-lsa, enviar al gateway
 ```
 
 ---
 
-## 7. Identificadores
+## 7. Regiones de Shared Memory
+
+El sistema usa **tres tipos** de regiones de memoria compartida:
+
+```
+/dev/shm/
+├── jsr-<router-uuid>        # Una por router (nodos conectados)
+├── jsr-config-<island>      # Una por isla (rutas estáticas, VPN)
+└── jsr-lsa-<island>         # Una por isla (topología remota)
+```
+
+| Región | Quién escribe | Contenido | Quién lee |
+|--------|---------------|-----------|-----------|
+| `jsr-<uuid>` | Router dueño | Sus nodos CONNECTED | Todos los routers de la isla |
+| `jsr-config-<island>` | SY.config.routes | Rutas estáticas, tabla VPN | Todos los routers de la isla |
+| `jsr-lsa-<island>` | Gateway | Nodos, rutas, VPNs de **otras islas** | Todos los routers de la isla |
+
+**Principio:** Un solo writer por región. Múltiples readers. Seqlock para sincronización.
+
+---
+
+## 8. Identificadores
 
 El sistema usa dos capas de identificación independientes.
 
-### 7.1 Identificador Capa 1 (UUID)
+### 8.1 Identificador Capa 1 (UUID)
 
 - **Formato**: UUID v4 (128 bits, auto-generado)
 - **Propósito**: Identificación única del nodo en la red
 - **Generación**: El nodo lo genera al arrancar, sin coordinación central
-- **Unicidad**: Garantizada por probabilidad matemática, no por validación
 
 ```
 Ejemplo: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 ```
 
-### 7.2 Identificador Capa 2 (Nombre Descriptivo)
+### 8.2 Identificador Capa 2 (Nombre Descriptivo)
 
 - **Formato**: Campos separados por punto (`.`), con sufijo `@isla`
 - **Máximo**: 10 campos (sin contar @isla)
-- **Caracteres permitidos**: Alfanuméricos, guión bajo (`_`), guión medio (`-`). Sin espacios.
-- **Primer campo**: Obligatorio, indica tipo de nodo: `AI`, `IO`, `WF`, `SY`, `RT`.
+- **Caracteres permitidos**: Alfanuméricos, guión bajo (`_`), guión medio (`-`)
+- **Primer campo**: Tipo de nodo: `AI`, `IO`, `WF`, `SY`, `RT`
 
 ```
 Formato: <tipo>.<campo2>.<campo3>...<campoN>@<isla>
 
 Ejemplos:
   AI.soporte.l1.español@produccion
-  AI.ventas.bdr.tecnico@staging
   IO.wapp.+5491155551234@produccion
   WF.notify.email@produccion
-  SY.time.primary@produccion
-  RT.primary@produccion
+  SY.config.routes@produccion
+  RT.gateway@produccion
 ```
 
-### 7.3 Relación entre Capas
+### 8.3 Relación entre Capas
 
 | Capa | Identifica | Único | Quién lo usa |
 |------|-----------|-------|--------------|
-| Capa 1 (UUID) | Instancia física del nodo | Sí, globalmente | Router para forwarding directo |
-| Capa 2 (Nombre) | Perfil/capacidad del nodo | No necesariamente | OPA para decisión de routing |
-
-Un mismo nombre capa 2 puede tener múltiples UUIDs (varios nodos con mismo perfil). El router resuelve cuál de ellos recibe el mensaje.
+| Capa 1 (UUID) | Instancia física | Sí, globalmente | Router para forwarding directo |
+| Capa 2 (Nombre) | Perfil/capacidad | No necesariamente | OPA para decisión de routing |
 
 ---
 
-## 8. Caracterización de Nodos por Tipo
+## 9. Caracterización de Nodos por Tipo
 
-### 8.1 Nodos AI (Agentes LLM)
-
-Los agentes AI emulan personas con roles funcionales. La nomenclatura sigue el modelo de **Recursos Humanos**:
+### 9.1 Nodos AI (Agentes LLM)
 
 ```
-AI.<área>.<cargo>.<nivel>.<especialización>.<turno>@<isla>
+AI.<área>.<cargo>.<nivel>.<especialización>@<isla>
 ```
-
-| Campo | Descripción | Ejemplos |
-|-------|-------------|----------|
-| área | Departamento funcional | soporte, ventas, cobranzas, legal |
-| cargo | Puesto o función | analista, ejecutivo, asesor |
-| nivel | Seniority o tier | l1, l2, jr, sr, lead |
-| especialización | Nicho de expertise | tecnico, comercial, enterprise |
-| turno | Disponibilidad | diurno, nocturno, 24-7 |
 
 **Ejemplos:**
 ```
-AI.soporte.analista.l1.tecnico.diurno@produccion
-AI.ventas.ejecutivo.closer.enterprise@produccion
-AI.cobranzas.analista.jr.amigable@produccion
+AI.soporte.analista.l1.tecnico@produccion
+AI.ventas.ejecutivo.closer@produccion
 ```
 
-### 8.2 Nodos IO (Adaptación de Medio)
-
-Los nodos IO son infraestructura de comunicación. Representan canales, no personas:
+### 9.2 Nodos IO (Adaptación de Medio)
 
 ```
 IO.<medio>.<identificador>@<isla>
@@ -279,28 +287,21 @@ IO.<medio>.<identificador>@<isla>
 ```
 IO.wapp.+5491155551234@produccion
 IO.email.ventas@empresa.com@produccion
-IO.telegram.@bot_empresa@produccion
 ```
 
-### 8.3 Nodos WF (Workflows Estáticos)
-
-Los nodos WF ejecutan acciones determinísticas:
+### 9.3 Nodos WF (Workflows Estáticos)
 
 ```
-WF.<verbo>.<objeto>.<variante>@<isla>
+WF.<verbo>.<objeto>@<isla>
 ```
 
 **Ejemplos:**
 ```
 WF.send.email@produccion
 WF.query.crm@produccion
-WF.validate.kyc@produccion
-WF.route.handoff@produccion
 ```
 
-### 8.4 Nodos SY (Sistema)
-
-Los nodos SY proveen servicios fundamentales para la operación de la red:
+### 9.4 Nodos SY (Sistema)
 
 ```
 SY.<servicio>@<isla>
@@ -310,14 +311,12 @@ SY.<servicio>@<isla>
 ```
 SY.config.routes@produccion
 SY.opa.rules@produccion
-SY.orchestrator@produccion
-SY.admin@produccion
 SY.time@produccion
 ```
 
-### 8.5 Nodos RT (Routers)
+**IMPORTANTE:** Los nodos SY.* son **inmunes a filtros VPN**. Pueden ver y comunicarse con todos los nodos de la isla, independientemente del VPN.
 
-Los routers también tienen identificador capa 2:
+### 9.5 Nodos RT (Routers)
 
 ```
 RT.<rol>@<isla>
@@ -327,80 +326,118 @@ RT.<rol>@<isla>
 ```
 RT.primary@produccion
 RT.secondary@produccion
-RT.gateway@staging
+RT.gateway@produccion
 ```
-
-### 8.6 Resumen de Convenciones
-
-| Tipo | Modelo conceptual | Estructura |
-|------|------------------|------------|
-| AI | Recursos Humanos (personas con roles) | `AI.<área>.<cargo>.<nivel>@<isla>` |
-| IO | Infraestructura de comunicación | `IO.<medio>.<identificador>@<isla>` |
-| WF | APIs/Programación (acciones) | `WF.<verbo>.<objeto>@<isla>` |
-| SY | Infraestructura del sistema | `SY.<servicio>@<isla>` |
-| RT | Routers (infraestructura de red) | `RT.<rol>@<isla>` |
 
 ---
 
-## 9. VPN = Zonas / VRF dentro de una Isla (v1.13)
+## 10. VPN = Zonas de Aislamiento
 
-### 9.1 Definición
+### 10.1 Definición
 
-Una **VPN** es una zona lógica (VRF-like) **dentro de una isla**. Es una "isla lógica" dentro de la isla física.
+Una **VPN** es una subred aislada dentro de una isla. Sirve para que sistemas que corren en la misma isla (ej: contable y soporte) **nunca se vean entre sí**.
 
-- Cada VPN tiene su tabla de visibilidad/routing separada.
-- Los nodos en una VPN solo pueden rutear hacia nodos visibles en esa VPN.
-- El aislamiento es **arquitectónico**, no "policy best effort".
-- OPA es otra capa; VPN existe sin OPA.
+- Es como tener "mini-islas" dentro de la isla física
+- El aislamiento es **arquitectónico**, no policy
+- Sin configuración de leak, el aislamiento es total
 
-**Dominio efectivo de un nodo:**
+### 10.2 Modelo Simple
+
+Solo una tabla de asignación en `jsr-config-<island>`:
 
 ```
-domain = (island_id, vpn_id)
+pattern           → vpn_id
+─────────────────────────────
+AI.soporte.*      → 10
+AI.ventas.*       → 20
+WF.crm.*          → 20
+(default)         → 0
 ```
 
-**Convención:**
-- `vpn_id = 0` es "global" (default, todos se ven)
-- `vpn_id != 0` son zonas aisladas
+**Reglas:**
+- Cuando un nodo conecta, el router busca en la tabla qué VPN le corresponde
+- Si no matchea ningún pattern → `vpn_id = 0` (global)
+- Al rutear, el nodo solo ve nodos de su mismo VPN
+- **Excepción:** Nodos SY.* ignoran VPN, ven todo
 
-### 9.2 Ejemplo Visual
+### 10.3 Ejemplo Visual
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Isla "produccion"                         │
-│                                                              │
+│                    Isla "produccion"                        │
+│                                                             │
 │   ┌─────────────────────┐    ┌─────────────────────┐       │
-│   │     VPN 0 (global)  │    │     VPN 10 (soporte)│       │
+│   │   VPN 0 (global)    │    │   VPN 10 (soporte)  │       │
 │   │                     │    │                     │       │
-│   │  AI.ventas@prod     │    │  AI.soporte.l1@prod │       │
-│   │  WF.crm@prod        │    │  AI.soporte.l2@prod │       │
-│   │                     │    │  WF.ticket@prod     │       │
+│   │  SY.config.routes   │    │  AI.soporte.l1      │       │
+│   │  SY.time            │    │  AI.soporte.l2      │       │
+│   │  RT.gateway         │    │  WF.ticket          │       │
 │   └─────────────────────┘    └─────────────────────┘       │
-│              │                         │                    │
-│              │    (leak rules)         │                    │
-│              └─────────────────────────┘                    │
-│                                                              │
+│            │                           │                    │
+│            │  SY.* ve todo             │ No se ven         │
+│            │◄──────────────────────────┤                    │
+│            │                           │                    │
+│   ┌─────────────────────┐              │                    │
+│   │   VPN 20 (ventas)   │◄─────────────┘                    │
+│   │                     │   (aislados entre sí)             │
+│   │  AI.ventas.closer   │                                   │
+│   │  WF.crm             │                                   │
+│   └─────────────────────┘                                   │
+│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 9.3 Relación con Inter-Isla
+---
 
-**VPN es intra-isla.** No cruza entre islas.
+## 11. Gateway e Inter-Isla
 
-- Para comunicación entre islas se usa el gateway inter-isla (IIL).
-- VPN aísla dentro de una isla; WAN conecta entre islas.
+### 11.1 Gateway Único por Isla
+
+Cada isla tiene **un único router gateway** que:
+
+- Mantiene conexiones TCP a otras islas
+- Recibe LSA de otras islas y lo escribe en `jsr-lsa-<island>`
+- Envía LSA de su isla a los gateways remotos
+
+### 11.2 LSA entre Gateways
+
+El gateway consolida toda la información de su isla y la envía a los peers:
+
+```
+Gateway lee:
+  - Todas las jsr-<router-uuid> → nodos locales
+  - jsr-config-<island> → rutas y VPNs
+
+Gateway envía LSA con:
+  - Lista de nodos (uuid, name@isla, vpn)
+  - Lista de rutas estáticas
+  - Lista de asignaciones VPN
+
+Gateway remoto recibe y escribe en:
+  - jsr-lsa-<island> → topología de islas remotas
+```
+
+### 11.3 Visibilidad Inter-Isla
+
+Todos los routers de la isla pueden leer `jsr-lsa-<island>` y saber:
+
+- Qué nodos existen en @staging, @desarrollo, etc.
+- Qué rutas estáticas tienen
+- Cómo están configuradas sus VPNs
+
+Esto permite routing informado sin consultar al gateway.
 
 ---
 
-## 10. Referencias a Otros Documentos
+## 12. Referencias a Otros Documentos
 
 | Tema | Documento |
 |------|-----------|
 | Estructura de mensajes, framing, HELLO | `02-protocolo.md` |
 | Shared memory, estructuras Rust | `03-shm.md` |
-| Routing, FIB, VPN zones, algoritmos | `04-routing.md` |
-| IRP intra-isla, Inter-Isla WAN | `05-conectividad.md` |
-| Región config, estructuras VPN | `06-config-shm.md` |
+| Routing, FIB, algoritmos | `04-routing.md` |
+| IRP intra-isla, WAN inter-isla, LSA | `05-conectividad.md` |
+| Región config y LSA, estructuras | `06-regiones.md` |
 | Arranque, YAML, systemd | `07-operaciones.md` |
 | Glosario, decisiones de diseño | `08-apendices.md` |
-| Nodos SY (config.routes, opa.rules, etc.) | `SY_nodes_spec.md` |
+| Nodos SY | `SY_nodes_spec.md` |

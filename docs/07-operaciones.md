@@ -6,38 +6,21 @@
 
 ---
 
-## 1. Principio de Diseño
-
-**El router arranca con su propio config, no depende de island.yaml.**
-
-Una vez que un router tiene su `config.yaml`, es autosuficiente. El `island.yaml` solo se usa como template para crear el config de un router nuevo.
-
-```
-Primera vez:
-  island.yaml → genera → config.yaml
-  Luego genera → identity.yaml
-
-Siguientes veces:
-  config.yaml + identity.yaml (island.yaml no se toca)
-```
-
----
-
-## 2. Estructura de Directorios
+## 1. Estructura de Directorios
 
 ```
 /etc/json-router/                      # Configuración
-├── island.yaml                        # Identidad de isla + template
-├── sy-config-routes.yaml              # Config de SY.config.routes
+├── island.yaml                        # Identidad de isla (OBLIGATORIO)
+├── sy-config-routes.yaml              # Config de rutas y VPN
 └── routers/                           # Config por router
     ├── RT.primary@produccion/
     │   └── config.yaml
-    └── RT.secondary@produccion/
+    └── RT.gateway@produccion/
         └── config.yaml
 
 /var/lib/json-router/                  # Estado persistente
 ├── nodes/                             # UUIDs de nodos
-│   └── AI.soporte.l1@produccion.uuid
+│   └── AI.soporte.l1.uuid
 └── state/                             # Estado de runtime
     └── RT.primary@produccion/
         └── identity.yaml
@@ -49,60 +32,65 @@ Siguientes veces:
 
 /dev/shm/                              # Shared memory
 ├── jsr-<router-uuid>                  # Región de cada router
-└── jsr-config-<island>                # Región de config
+├── jsr-config-<island>                # Región de config
+└── jsr-lsa-<island>                   # Región de LSA
 ```
 
 ---
 
-## 3. Archivo: island.yaml
+## 2. Archivo: island.yaml (OBLIGATORIO)
 
-Identidad de la isla. **Todos los procesos de la isla lo leen.**
+Define la identidad de la isla. **Todos los procesos lo leen al arrancar.**
 
 ```yaml
 # /etc/json-router/island.yaml
 
 island_id: "produccion"
-
-# Defaults para routers nuevos (opcional)
-defaults:
-  paths:
-    state_dir: /var/lib/json-router/state
-    node_socket_dir: /var/run/json-router/nodes
-    shm_prefix: /jsr-
-  
-  timers:
-    hello_interval_ms: 10000
-    dead_interval_ms: 40000
-    heartbeat_interval_ms: 5000
-    heartbeat_stale_ms: 30000
-
-# Lista de routers autorizados en esta isla
-routers:
-  - name: RT.primary
-  - name: RT.secondary
-  - name: RT.gateway
 ```
 
-### 3.1 Campos de island.yaml
+**Sin este archivo, ningún proceso arranca.**
+
+### 2.1 Campos
 
 | Campo | Obligatorio | Descripción |
 |-------|-------------|-------------|
 | `island_id` | Sí | Identificador único de la isla |
-| `routers[].name` | No | Lista de routers autorizados (sin @isla) |
-| `defaults.*` | No | Valores por defecto para config de routers nuevos |
 
 ---
 
-## 4. Archivo: config.yaml (Router)
+## 3. Archivo: config.yaml (Router)
 
-Configuración real y completa del router. **Autosuficiente.**
+Configuración del router. Autosuficiente.
 
 ```yaml
 # /etc/json-router/routers/RT.primary@produccion/config.yaml
 
 router:
-  name: RT.primary                     # Sin @isla (se agrega de island_id)
+  name: RT.primary                     # Sin @isla
   island_id: produccion
+  is_gateway: false
+
+paths:
+  state_dir: /var/lib/json-router/state
+  node_socket_dir: /var/run/json-router/nodes
+  shm_prefix: /jsr-
+
+timers:
+  hello_interval_ms: 10000
+  dead_interval_ms: 40000
+  heartbeat_interval_ms: 5000
+  heartbeat_stale_ms: 30000
+```
+
+### 3.1 Config de Gateway
+
+```yaml
+# /etc/json-router/routers/RT.gateway@produccion/config.yaml
+
+router:
+  name: RT.gateway
+  island_id: produccion
+  is_gateway: true                     # <-- Diferencia clave
 
 paths:
   state_dir: /var/lib/json-router/state
@@ -115,32 +103,21 @@ timers:
   heartbeat_interval_ms: 5000
   heartbeat_stale_ms: 30000
 
-# WAN solo si es gateway (v1.13)
-inter_isla:
-  listen: "10.0.1.1:9000"
+wan:
+  listen: "0.0.0.0:9000"
   uplinks:
-    - address: "10.0.1.2:9000"
-    - address: "staging.internal:9000"
+    - address: "10.0.1.100:9000"       # staging
+    - address: "10.0.2.100:9000"       # desarrollo
+  authorized_islands:
+    - staging
+    - desarrollo
 ```
-
-### 4.1 Campos de config.yaml
-
-| Campo | Obligatorio | Descripción |
-|-------|-------------|-------------|
-| `router.name` | Sí | Nombre capa 2 del router (sin @isla) |
-| `router.island_id` | Sí | Isla a la que pertenece |
-| `paths.state_dir` | Sí | Directorio para identity.yaml |
-| `paths.node_socket_dir` | Sí | Directorio de sockets de nodos |
-| `paths.shm_prefix` | Sí | Prefijo para nombre de SHM |
-| `timers.*` | Sí | Todos los timers deben estar definidos |
-| `inter_isla.listen` | No | IP:puerto para conexiones WAN (solo gateway) |
-| `inter_isla.uplinks[]` | No | Lista de gateways de otras islas |
 
 ---
 
-## 5. Archivo: identity.yaml (Auto-generado)
+## 4. Archivo: identity.yaml (Auto-generado)
 
-Estado de hardware/runtime del router. **Se genera en primer arranque.**
+Estado de hardware/runtime. **Se genera en primer arranque.**
 
 ```yaml
 # /var/lib/json-router/state/RT.primary@produccion/identity.yaml
@@ -155,62 +132,88 @@ shm:
   name: /jsr-a1b2c3d4-e5f6-7890-abcd-ef1234567890
 
 created_at: 2025-01-17T10:30:00Z
-created_at_ms: 1737110400000
-
-system:
-  hostname: server-prod-01
-  pid_at_creation: 12345
 ```
 
-**Nunca se edita manualmente.** El UUID es estable una vez generado.
+**Nunca se edita manualmente.**
 
 ---
 
-## 6. Variables de Entorno
+## 5. Flujo de Arranque
 
-| Variable | Propósito | Default |
-|----------|-----------|---------|
-| `JSR_ROUTER_NAME` | Nombre del router | Requerido |
-| `JSR_CONFIG_DIR` | Directorio de configuración | `/etc/json-router` |
-| `JSR_LOG_LEVEL` | Nivel de log | `info` |
+### 5.1 Router Normal
+
+```
+1. Leer /etc/json-router/island.yaml
+   → Si no existe: EXIT con error
+
+2. Leer config.yaml del router
+   → Si no existe: usar defaults
+
+3. Leer o generar identity.yaml
+   → Si no existe: generar UUID, crear archivo
+
+4. Crear/reclamar región SHM jsr-<uuid>
+   → Verificar si es stale
+   → Inicializar header
+
+5. Leer jsr-config-<island> (si existe)
+   → Cargar rutas estáticas y VPN
+
+6. Leer jsr-lsa-<island> (si existe)
+   → Cargar topología remota
+
+7. Iniciar loop principal:
+   - Aceptar conexiones de nodos
+   - Procesar mensajes
+   - Actualizar heartbeat
+```
+
+### 5.2 Gateway
+
+```
+1-4. (Igual que router normal)
+
+5. Crear región SHM jsr-lsa-<island>
+   → Solo el gateway la crea
+
+6. Leer jsr-config-<island>
+
+7. Establecer conexiones WAN:
+   - listen en wan.listen
+   - connect a cada wan.uplinks[]
+
+8. Iniciar loop principal:
+   - (Igual que router normal)
+   - Recibir/enviar LSA
+   - Escribir en jsr-lsa
+```
+
+### 5.3 SY.config.routes
+
+```
+1. Leer /etc/json-router/island.yaml
+
+2. Leer sy-config-routes.yaml
+   → Si no existe: crear vacío
+
+3. Crear/reclamar región jsr-config-<island>
+
+4. Escribir rutas y VPNs en la región
+
+5. Conectar al router como nodo normal (HELLO)
+
+6. Iniciar loop principal:
+   - Escuchar requests de API
+   - Actualizar config
+   - Escribir en SHM
+   - Persistir en YAML
+```
 
 ---
 
-## 7. Flujo de Arranque del Router
+## 6. Systemd
 
-### 7.1 Primer Arranque
-
-```
-1. Leer JSR_ROUTER_NAME y JSR_CONFIG_DIR
-2. Buscar /etc/json-router/routers/<name>/config.yaml
-   → No existe
-3. Leer /etc/json-router/island.yaml
-4. Validar que router está en lista de autorizados
-5. Generar config.yaml desde defaults
-6. Generar identity.yaml:
-   - Crear UUID v4
-   - Guardar en /var/lib/json-router/state/<name>/identity.yaml
-7. Crear región SHM /jsr-<uuid>
-8. Inicializar header (magic, version, owner_pid, etc.)
-9. Arrancar loop principal
-```
-
-### 7.2 Arranques Siguientes
-
-```
-1. Leer JSR_ROUTER_NAME y JSR_CONFIG_DIR
-2. Leer config.yaml
-3. Leer identity.yaml → obtener UUID
-4. Verificar/reclamar región SHM
-5. Actualizar header si es necesario
-6. Arrancar loop principal
-```
-
----
-
-## 8. Systemd
-
-### 8.1 Router Service (template)
+### 6.1 Router Service (template)
 
 ```ini
 # /etc/systemd/system/json-router@.service
@@ -227,7 +230,6 @@ ExecStart=/usr/bin/json-router
 Restart=always
 RestartSec=5
 
-# Seguridad
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -240,18 +242,11 @@ WantedBy=multi-user.target
 **Uso:**
 
 ```bash
-# Habilitar y arrancar
 systemctl enable json-router@RT.primary
 systemctl start json-router@RT.primary
-
-# Ver logs
-journalctl -u json-router@RT.primary -f
-
-# Reiniciar
-systemctl restart json-router@RT.primary
 ```
 
-### 8.2 SY.config.routes Service
+### 6.2 SY.config.routes Service
 
 ```ini
 # /etc/systemd/system/sy-config-routes.service
@@ -269,114 +264,126 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-**Nota:** No hay template `@` porque es 1 por isla/máquina.
+### 6.3 Orden de Arranque
 
-### 8.3 SY.opa.rules Service
-
-```ini
-# /etc/systemd/system/sy-opa-rules.service
-[Unit]
-Description=JSON Router OPA Rules Service
-After=network.target json-router@RT.primary.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/sy-opa-rules
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
+```
+1. json-router@RT.gateway (si existe)
+2. json-router@RT.primary
+3. json-router@RT.secondary (si existe)
+4. sy-config-routes
+5. Otros nodos SY.*
+6. Nodos de aplicación (AI, WF, IO)
 ```
 
 ---
 
-## 9. Ejemplo: Deployment Completo
+## 7. Variables de Entorno
 
-### 9.1 Preparar Isla
+| Variable | Propósito | Default |
+|----------|-----------|---------|
+| `JSR_ROUTER_NAME` | Nombre del router | Requerido |
+| `JSR_CONFIG_DIR` | Directorio de config | `/etc/json-router` |
+| `JSR_LOG_LEVEL` | Nivel de log | `info` |
+
+---
+
+## 8. Deployment: Ejemplo Completo
+
+### 8.1 Preparar Isla
 
 ```bash
-# Crear directorio de config
+# Crear directorios
 mkdir -p /etc/json-router/routers
+mkdir -p /var/lib/json-router/{nodes,state}
+mkdir -p /var/run/json-router/nodes
 
 # Crear island.yaml
 cat > /etc/json-router/island.yaml << 'EOF'
 island_id: "produccion"
-
-defaults:
-  timers:
-    hello_interval_ms: 10000
-    dead_interval_ms: 40000
-    heartbeat_interval_ms: 5000
-    heartbeat_stale_ms: 30000
-
-routers:
-  - name: RT.primary
-  - name: RT.secondary
 EOF
 ```
 
-### 9.2 Primer Arranque de Router
+### 8.2 Configurar Gateway
 
 ```bash
-# Arrancar router
-systemctl start json-router@RT.primary
+mkdir -p /etc/json-router/routers/RT.gateway@produccion
 
-# El sistema:
-# 1. No encuentra config.yaml
-# 2. Lee island.yaml, valida autorización
-# 3. Crea config.yaml
-# 4. Genera identity.yaml con UUID
-# 5. Arranca
-```
+cat > /etc/json-router/routers/RT.gateway@produccion/config.yaml << 'EOF'
+router:
+  name: RT.gateway
+  island_id: produccion
+  is_gateway: true
 
-### 9.3 Configurar WAN (si es gateway)
+paths:
+  state_dir: /var/lib/json-router/state
+  node_socket_dir: /var/run/json-router/nodes
+  shm_prefix: /jsr-
 
-```bash
-# Editar config generado
-vi /etc/json-router/routers/RT.primary/config.yaml
-```
+timers:
+  hello_interval_ms: 10000
+  dead_interval_ms: 40000
+  heartbeat_interval_ms: 5000
+  heartbeat_stale_ms: 30000
 
-Agregar:
-
-```yaml
-inter_isla:
-  listen: "10.0.1.1:9000"
+wan:
+  listen: "0.0.0.0:9000"
   uplinks:
-    - address: "10.0.1.2:9000"
-```
-
-```bash
-# Reiniciar para aplicar
-systemctl restart json-router@RT.primary
-```
-
-### 9.4 Arrancar SY.config.routes
-
-```bash
-# Crear config de rutas inicial
-cat > /etc/json-router/sy-config-routes.yaml << 'EOF'
-version: 2
-routes: []
-vpns:
-  - vpn_id: 0
-    vpn_name: global
-vpn_member_rules: []
-vpn_leak_rules: []
+    - address: "staging.internal:9000"
+  authorized_islands:
+    - staging
 EOF
+```
 
-# Arrancar servicio
+### 8.3 Configurar Router Normal
+
+```bash
+mkdir -p /etc/json-router/routers/RT.primary@produccion
+
+cat > /etc/json-router/routers/RT.primary@produccion/config.yaml << 'EOF'
+router:
+  name: RT.primary
+  island_id: produccion
+  is_gateway: false
+
+paths:
+  state_dir: /var/lib/json-router/state
+  node_socket_dir: /var/run/json-router/nodes
+  shm_prefix: /jsr-
+
+timers:
+  hello_interval_ms: 10000
+  dead_interval_ms: 40000
+  heartbeat_interval_ms: 5000
+  heartbeat_stale_ms: 30000
+EOF
+```
+
+### 8.4 Configurar SY.config.routes
+
+```bash
+cat > /etc/json-router/sy-config-routes.yaml << 'EOF'
+version: 1
+routes: []
+vpns: []
+EOF
+```
+
+### 8.5 Arrancar Servicios
+
+```bash
+systemctl start json-router@RT.gateway
+systemctl start json-router@RT.primary
 systemctl start sy-config-routes
 ```
 
 ---
 
-## 10. Monitoreo
+## 9. Monitoreo
 
-### 10.1 Health Check
+### 9.1 Health Check
 
 ```bash
-# Verificar proceso
+# Verificar procesos
 systemctl status json-router@RT.primary
 
 # Verificar SHM
@@ -386,18 +393,11 @@ ls -la /dev/shm/jsr-*
 ls -la /var/run/json-router/nodes/
 ```
 
-### 10.2 Métricas
-
-*Por definir: endpoint de métricas, Prometheus, etc.*
-
-### 10.3 Logs
+### 9.2 Logs
 
 ```bash
 # Logs del router
 journalctl -u json-router@RT.primary -f
-
-# Logs de config service
-journalctl -u sy-config-routes -f
 
 # Filtrar por nivel
 journalctl -u json-router@RT.primary -p err
@@ -405,77 +405,60 @@ journalctl -u json-router@RT.primary -p err
 
 ---
 
-## 11. Troubleshooting
+## 10. Troubleshooting
 
-### 11.1 Router no arranca
+### 10.1 Router no arranca
 
 ```bash
-# Verificar config
-cat /etc/json-router/routers/RT.primary/config.yaml
-
 # Verificar island.yaml
 cat /etc/json-router/island.yaml
 
-# Ver logs detallados
+# Verificar config
+cat /etc/json-router/routers/RT.primary@produccion/config.yaml
+
+# Ver logs
 JSR_LOG_LEVEL=debug json-router
 ```
 
-### 11.2 SHM stale
+### 10.2 SHM stale
 
 ```bash
-# Verificar regiones
+# Ver regiones
 ls -la /dev/shm/jsr-*
 
 # Limpiar manualmente (si el proceso no existe)
 rm /dev/shm/jsr-<uuid>
 ```
 
-### 11.3 Nodos no conectan
+### 10.3 Nodos no conectan
 
 ```bash
-# Verificar socket del router
+# Verificar socket
 ls -la /var/run/json-router/router.sock
 
 # Verificar permisos
 stat /var/run/json-router/nodes/
+```
 
-# Ver nodos en SHM
-shm-watch /dev/shm/jsr-<uuid>
+### 10.4 Inter-isla no funciona
+
+```bash
+# Verificar que hay gateway
+grep is_gateway /etc/json-router/routers/*/config.yaml
+
+# Verificar conexiones WAN
+netstat -an | grep 9000
+
+# Verificar LSA region
+ls -la /dev/shm/jsr-lsa-*
 ```
 
 ---
 
-## 12. Alta Disponibilidad
-
-### 12.1 Múltiples Routers por Isla
-
-```yaml
-# island.yaml
-routers:
-  - name: RT.primary
-  - name: RT.secondary
-```
-
-Ambos routers:
-- Ven todos los nodos via SHM
-- Pueden atender cualquier nodo de la isla
-- Solo uno es gateway WAN (RT.primary en este caso)
-
-### 12.2 SY.config.routes HA
-
-```
-SY.config.routes.primary   (activo, escribe en SHM)
-SY.config.routes.backup    (standby, monitorea heartbeat)
-```
-
-El backup toma el control si detecta que el primary murió.
-
----
-
-## 13. Referencias
+## 11. Referencias
 
 | Tema | Documento |
 |------|-----------|
-| Arquitectura, islas | `01-arquitectura.md` |
+| Arquitectura | `01-arquitectura.md` |
 | Conectividad WAN | `05-conectividad.md` |
-| SY nodes completo | `SY_nodes_spec.md` |
+| Regiones config/LSA | `06-regiones.md` |
