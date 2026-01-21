@@ -127,7 +127,19 @@ async fn handle_node(
 
     loop {
         match read_frame(&mut reader).await? {
-            Some(_) => {}
+            Some(frame) => {
+                if let Ok(msg) = serde_json::from_slice::<Message>(&frame) {
+                    tracing::info!(
+                        src = %msg.routing.src,
+                        dst = ?msg.routing.dst,
+                        msg_type = %msg.meta.msg_type,
+                        msg = ?msg.meta.msg,
+                        "message received"
+                    );
+                } else {
+                    tracing::warn!("received invalid message frame");
+                }
+            }
             None => break,
         }
     }
