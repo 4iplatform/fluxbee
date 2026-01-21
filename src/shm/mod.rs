@@ -901,37 +901,49 @@ where
 {
     let cstr = CString::new(name).map_err(|_| ShmError::NameTooLong)?;
     let name_cstr: &CStr = cstr.as_c_str();
-    match shm_open(name_cstr, OFlag::O_RDWR, nix::sys::stat::Mode::empty()) {
-        Ok(fd) => {
-            let stat = fstat(fd.as_raw_fd())?;
-            if stat.st_size < len as i64 {
-                let _ = shm_unlink(name_cstr);
-            } else {
-                let mmap = unsafe { MmapOptions::new().len(len).map_mut(fd.as_raw_fd())? };
-                if is_region_valid(&mmap) {
-                    return Ok(mmap);
+    loop {
+        match shm_open(name_cstr, OFlag::O_RDWR, nix::sys::stat::Mode::empty()) {
+            Ok(fd) => {
+                let stat = fstat(fd.as_raw_fd())?;
+                if stat.st_size < len as i64 {
+                    let _ = shm_unlink(name_cstr);
+                } else {
+                    let mmap = unsafe { MmapOptions::new().len(len).map_mut(fd.as_raw_fd())? };
+                    if is_region_valid(&mmap) {
+                        return Ok(mmap);
+                    }
+                    let _ = shm_unlink(name_cstr);
+                }
+            }
+            Err(err) => {
+                if err != nix::Error::ENOENT {
+                    return Err(err.into());
                 }
             }
         }
-        Err(err) => {
-            if err != nix::Error::ENOENT {
+
+        match shm_open(
+            name_cstr,
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR,
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        ) {
+            Ok(fd) => {
+                ftruncate(&fd, len as i64)?;
+                let mut mmap = unsafe { MmapOptions::new().len(len).map_mut(fd.as_raw_fd())? };
+                for byte in mmap.iter_mut() {
+                    *byte = 0;
+                }
+                init(&mut mmap);
+                return Ok(mmap);
+            }
+            Err(err) => {
+                if err == nix::Error::EEXIST {
+                    continue;
+                }
                 return Err(err.into());
             }
         }
     }
-
-    let fd = shm_open(
-        name_cstr,
-        OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR,
-        nix::sys::stat::Mode::from_bits_truncate(0o600),
-    )?;
-    ftruncate(&fd, len as i64)?;
-    let mut mmap = unsafe { MmapOptions::new().len(len).map_mut(fd.as_raw_fd())? };
-    for byte in mmap.iter_mut() {
-        *byte = 0;
-    }
-    init(&mut mmap);
-    Ok(mmap)
 }
 
 fn open_read_only_region(name: &str, len: usize) -> Result<Mmap, ShmError> {
