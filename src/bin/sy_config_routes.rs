@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -22,7 +22,7 @@ struct IslandFile {
     island_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct SyConfigFile {
     version: u64,
     updated_at: String,
@@ -32,7 +32,7 @@ struct SyConfigFile {
     vpns: Vec<VpnConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct RouteConfig {
     prefix: String,
     #[serde(default = "default_match_kind")]
@@ -46,7 +46,7 @@ struct RouteConfig {
     priority: Option<u16>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct VpnConfig {
     pattern: String,
     #[serde(default = "default_match_kind")]
