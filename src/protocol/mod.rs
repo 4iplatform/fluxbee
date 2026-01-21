@@ -102,6 +102,12 @@ pub struct WithdrawPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigChangedPayload {
+    pub config_version: u64,
+    pub changed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LsaPayload {
     pub island: String,
     pub seq: u64,
@@ -142,6 +148,7 @@ pub const MSG_ECHO_REPLY: &str = "ECHO_REPLY";
 pub const MSG_LSA: &str = "LSA";
 pub const MSG_TIME_SYNC: &str = "TIME_SYNC";
 pub const MSG_WITHDRAW: &str = "WITHDRAW";
+pub const MSG_CONFIG_CHANGED: &str = "CONFIG_CHANGED";
 
 pub fn build_system_message(
     src: &str,

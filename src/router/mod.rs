@@ -9,7 +9,8 @@ use uuid::Uuid;
 use crate::config::RouterConfig;
 use crate::protocol::{
     build_announce, build_ttl_exceeded, build_unreachable, Destination, Message,
-    NodeAnnouncePayload, NodeHelloPayload, MSG_HELLO, MSG_WITHDRAW, SYSTEM_KIND,
+    NodeAnnouncePayload, NodeHelloPayload, MSG_CONFIG_CHANGED, MSG_HELLO, MSG_WITHDRAW,
+    SYSTEM_KIND,
 };
 use crate::shm::{
     now_epoch_ms, ConfigRegionReader, ConfigSnapshot, RouterRegionWriter, ACTION_DROP,
@@ -157,6 +158,7 @@ async fn handle_node(
         island_id,
         &nodes,
         &shm,
+        false,
     )
     .await;
     let vpn_id = assign_vpn(&node_name, snapshot.as_ref());
@@ -211,10 +213,23 @@ async fn handle_node(
                         msg = ?msg.meta.msg,
                         "message received"
                     );
-                    if msg.meta.msg_type == SYSTEM_KIND
-                        && msg.meta.msg.as_deref() == Some(MSG_WITHDRAW)
-                    {
-                        break;
+                    if msg.meta.msg_type == SYSTEM_KIND {
+                        if msg.meta.msg.as_deref() == Some(MSG_WITHDRAW) {
+                            break;
+                        }
+                        if msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
+                            let _ = refresh_config(
+                                &config_reader,
+                                &static_routes,
+                                &config_version,
+                                island_id,
+                                &nodes,
+                                &shm,
+                                true,
+                            )
+                            .await;
+                            continue;
+                        }
                     }
                     let snapshot = refresh_config(
                         &config_reader,
@@ -223,6 +238,7 @@ async fn handle_node(
                         island_id,
                         &nodes,
                         &shm,
+                        false,
                     )
                     .await;
                     handle_message(
@@ -463,6 +479,7 @@ async fn refresh_config(
     island_id: &str,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     shm: &Arc<Mutex<RouterRegionWriter>>,
+    force: bool,
 ) -> Option<ConfigSnapshot> {
     let snapshot = {
         let mut reader = config_reader.lock().await;
@@ -479,7 +496,7 @@ async fn refresh_config(
         return None;
     };
     let mut version_guard = config_version.lock().await;
-    if snapshot.header.config_version != *version_guard {
+    if force || snapshot.header.config_version != *version_guard {
         let mut routes_guard = static_routes.lock().await;
         *routes_guard = snapshot
             .routes

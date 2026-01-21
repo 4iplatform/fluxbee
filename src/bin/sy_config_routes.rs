@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use json_router::node_client::{NodeClient, NodeConfig};
+use json_router::protocol::{ConfigChangedPayload, Destination, Message, Meta, Routing, SYSTEM_KIND};
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, VpnAssignment,
     ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
@@ -76,33 +77,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_dir(&state_dir)?;
 
     let island = load_island(&config_dir)?;
-    let sy_config = load_config(&config_dir)?;
+    let mut sy_config = load_config(&config_dir)?;
+    let mut last_modified = config_mtime(&config_dir)?;
 
     let shm_name = format!("/jsr-config-{}", island.island_id);
     let node_uuid = load_or_create_uuid(&state_dir.join("nodes"), "SY.config.routes")?;
     let mut writer = ConfigRegionWriter::open_or_create(&shm_name, node_uuid, &island.island_id)?;
 
-    let routes = build_routes(&sy_config.routes)?;
-    let vpns = build_vpns(&sy_config.vpns)?;
+    apply_config(&mut writer, &sy_config)?;
 
-    writer.write_static_routes(&routes, false)?;
-    writer.write_vpn_assignments(&vpns, true)?;
-
-    tracing::info!(
-        routes = routes.len(),
-        vpns = vpns.len(),
-        "config region written"
-    );
-    for vpn in &sy_config.vpns {
-        tracing::info!(
-            pattern = %vpn.pattern,
-            match_kind = %vpn.match_kind,
-            vpn_id = vpn.vpn_id,
-            "vpn rule loaded"
-        );
-    }
-
-    let _client = NodeClient::connect(NodeConfig {
+    let mut client = NodeClient::connect(NodeConfig {
         name: "SY.config.routes".to_string(),
         router_socket: socket_dir.join("router.sock"),
         uuid_persistence_dir: state_dir.join("nodes"),
@@ -112,11 +96,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     tracing::info!("connected to router");
+    send_config_changed(&mut client, &mut writer, &sy_config).await?;
 
     let mut ticker = time::interval(Duration::from_secs(5));
     loop {
         ticker.tick().await;
         writer.update_heartbeat();
+        let current = config_mtime(&config_dir)?;
+        if current > last_modified {
+            sy_config = load_config(&config_dir)?;
+            apply_config(&mut writer, &sy_config)?;
+            send_config_changed(&mut client, &mut writer, &sy_config).await?;
+            last_modified = current;
+        }
     }
 }
 
@@ -140,6 +132,35 @@ fn load_config(config_dir: &Path) -> Result<SyConfigFile, Box<dyn std::error::Er
     }
     let data = fs::read_to_string(&path)?;
     Ok(serde_yaml::from_str(&data)?)
+}
+
+fn apply_config(
+    writer: &mut ConfigRegionWriter,
+    sy_config: &SyConfigFile,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let routes = build_routes(&sy_config.routes)?;
+    let vpns = build_vpns(&sy_config.vpns)?;
+    writer.write_static_routes(&routes, false)?;
+    writer.write_vpn_assignments(&vpns, true)?;
+    tracing::info!(
+        routes = routes.len(),
+        vpns = vpns.len(),
+        "config region written"
+    );
+    for vpn in &sy_config.vpns {
+        tracing::info!(
+            pattern = %vpn.pattern,
+            match_kind = %vpn.match_kind,
+            vpn_id = vpn.vpn_id,
+            "vpn rule loaded"
+        );
+    }
+    Ok(())
+}
+
+fn config_mtime(config_dir: &Path) -> Result<std::time::SystemTime, Box<dyn std::error::Error>> {
+    let path = config_dir.join("sy-config-routes.yaml");
+    Ok(fs::metadata(&path)?.modified()?)
 }
 
 fn build_routes(routes: &[RouteConfig]) -> Result<Vec<StaticRouteEntry>, Box<dyn std::error::Error>> {
@@ -241,4 +262,38 @@ fn empty_vpn_assignment() -> VpnAssignment {
         flags: 0,
         _reserved: [0u8; 20],
     }
+}
+
+async fn send_config_changed(
+    client: &mut NodeClient,
+    writer: &mut ConfigRegionWriter,
+    _config: &SyConfigFile,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let version = writer
+        .read_snapshot()
+        .map(|s| s.header.config_version)
+        .unwrap_or(0);
+    let msg = Message {
+        routing: Routing {
+            src: client.uuid().to_string(),
+            dst: Destination::Broadcast,
+            ttl: 2,
+            trace_id: Uuid::new_v4().to_string(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some("CONFIG_CHANGED".to_string()),
+            target: Some("RT.*".to_string()),
+            action: None,
+            priority: None,
+            context: None,
+        },
+        payload: serde_json::to_value(ConfigChangedPayload {
+            config_version: version,
+            changed: vec!["routes".to_string(), "vpns".to_string()],
+        })?,
+    };
+    client.send(&msg).await?;
+    tracing::info!(version = version, "config changed broadcast sent");
+    Ok(())
 }
