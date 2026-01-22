@@ -937,7 +937,7 @@ where
                     let _ = shm_unlink(name_cstr);
                 } else {
                     let mmap = unsafe { MmapOptions::new().len(len).map_mut(fd.as_raw_fd())? };
-                    if is_region_valid(&mmap) {
+                    if is_region_valid(mmap.as_ref()) {
                         return Ok(mmap);
                     }
                     let _ = shm_unlink(name_cstr);
@@ -978,15 +978,29 @@ fn open_read_only_region(name: &str, len: usize) -> Result<Mmap, ShmError> {
     let cstr = CString::new(name).map_err(|_| ShmError::NameTooLong)?;
     let fd = shm_open(cstr.as_c_str(), OFlag::O_RDONLY, nix::sys::stat::Mode::empty())?;
     let mmap = unsafe { MmapOptions::new().len(len).map(fd.as_raw_fd())? };
+    if !is_region_valid(mmap.as_ref()) {
+        return Err(ShmError::InvalidHeader);
+    }
     Ok(mmap)
 }
 
-fn is_region_valid(mmap: &MmapMut) -> bool {
-    let Some(magic) = mmap.get(0..4) else {
+fn is_region_valid(mmap: &[u8]) -> bool {
+    let Some(magic_bytes) = mmap.get(0..4) else {
         return false;
     };
+    let Ok(magic_bytes) = <[u8; 4]>::try_from(magic_bytes) else {
+        return false;
+    };
+    let magic = u32::from_ne_bytes(magic_bytes);
     match magic {
-        [0x4A, 0x53, 0x53, 0x52] | [0x4A, 0x53, 0x43, 0x43] | [0x4A, 0x53, 0x4C, 0x41] => true,
+        SHM_MAGIC => {
+            header_ref::<ShmHeader>(mmap, 0).is_some_and(|header| header.version == SHM_VERSION)
+        }
+        CONFIG_MAGIC => header_ref::<ConfigHeader>(mmap, 0)
+            .is_some_and(|header| header.version == CONFIG_VERSION),
+        LSA_MAGIC => {
+            header_ref::<LsaHeader>(mmap, 0).is_some_and(|header| header.version == LSA_VERSION)
+        }
         _ => false,
     }
 }
