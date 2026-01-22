@@ -32,6 +32,7 @@ pub struct Router {
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     config_reader: Arc<Mutex<Option<ConfigRegionReader>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
+    fib: Arc<Mutex<Vec<FibEntry>>>,
     config_version: Arc<Mutex<u64>>,
 }
 
@@ -58,6 +59,7 @@ impl Router {
             nodes: Arc::new(Mutex::new(std::collections::HashMap::new())),
             config_reader: Arc::new(Mutex::new(config_reader)),
             static_routes: Arc::new(Mutex::new(Vec::new())),
+            fib: Arc::new(Mutex::new(Vec::new())),
             config_version: Arc::new(Mutex::new(0)),
         }
     }
@@ -82,6 +84,7 @@ impl Router {
             let nodes = Arc::clone(&self.nodes);
             let config_reader = Arc::clone(&self.config_reader);
             let static_routes = Arc::clone(&self.static_routes);
+            let fib = Arc::clone(&self.fib);
             let config_version = Arc::clone(&self.config_version);
             tokio::spawn(async move {
                 if let Err(err) = handle_node(
@@ -90,6 +93,7 @@ impl Router {
                     nodes,
                     config_reader,
                     static_routes,
+                    fib,
                     config_version,
                     router_uuid,
                     &router_name,
@@ -110,6 +114,7 @@ async fn handle_node(
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     config_reader: Arc<Mutex<Option<ConfigRegionReader>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
+    fib: Arc<Mutex<Vec<FibEntry>>>,
     config_version: Arc<Mutex<u64>>,
     router_uuid: Uuid,
     router_name: &str,
@@ -158,6 +163,7 @@ async fn handle_node(
         island_id,
         &nodes,
         &shm,
+        &fib,
         false,
     )
     .await;
@@ -178,9 +184,11 @@ async fn handle_node(
                 name: node_name.clone(),
                 vpn_id,
                 sender: tx.clone(),
+                connected_at,
             },
         );
     }
+    rebuild_fib(&fib, &nodes, &static_routes).await;
 
     tracing::info!(node = %node_uuid, name = %node_name, "node registered");
     let announce = build_announce(
@@ -225,6 +233,7 @@ async fn handle_node(
                                 island_id,
                                 &nodes,
                                 &shm,
+                                &fib,
                                 true,
                             )
                             .await;
@@ -239,14 +248,15 @@ async fn handle_node(
                         island_id,
                         &nodes,
                         &shm,
+                        &fib,
                         false,
                     )
                     .await;
                     handle_message(
                         &msg,
                         &nodes,
+                        &fib,
                         router_uuid,
-                        &static_routes,
                         snapshot.as_ref(),
                     )
                     .await?;
@@ -266,6 +276,7 @@ async fn handle_node(
         let mut nodes = nodes.lock().await;
         nodes.remove(&node_uuid);
     }
+    rebuild_fib(&fib, &nodes, &static_routes).await;
     writer_task.abort();
     tracing::info!(node = %node_uuid, "node disconnected");
     Ok(())
@@ -274,8 +285,8 @@ async fn handle_node(
 async fn handle_message(
     msg: &Message,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
+    fib: &Arc<Mutex<Vec<FibEntry>>>,
     router_uuid: Uuid,
-    static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
     _snapshot: Option<&ConfigSnapshot>,
 ) -> Result<(), RouterError> {
     let src_uuid = match Uuid::parse_str(&msg.routing.src) {
@@ -444,6 +455,7 @@ struct NodeHandle {
     name: String,
     vpn_id: u32,
     sender: mpsc::UnboundedSender<Vec<u8>>,
+    connected_at: u64,
 }
 
 impl Clone for NodeHandle {
@@ -452,6 +464,7 @@ impl Clone for NodeHandle {
             name: self.name.clone(),
             vpn_id: self.vpn_id,
             sender: self.sender.clone(),
+            connected_at: self.connected_at,
         }
     }
 }
@@ -464,6 +477,36 @@ struct StaticRoute {
     next_hop_island: String,
     priority: u16,
     metric: u32,
+    installed_at: u64,
+}
+
+const ADMIN_DISTANCE_LOCAL: u8 = 0;
+const ADMIN_DISTANCE_STATIC: u8 = 1;
+
+#[derive(Clone, Debug)]
+enum FibSource {
+    LocalNode,
+    StaticRoute,
+}
+
+#[derive(Clone, Debug)]
+enum FibNextHop {
+    Local(Uuid),
+    Island(String),
+}
+
+#[derive(Clone, Debug)]
+struct FibEntry {
+    pattern: String,
+    match_kind: u8,
+    vpn_id: u32,
+    source: FibSource,
+    next_hop: Option<FibNextHop>,
+    admin_distance: u8,
+    priority: u16,
+    metric: u32,
+    installed_at: u64,
+    action: u8,
 }
 
 enum ResolvedRoute {
@@ -480,6 +523,7 @@ async fn refresh_config(
     island_id: &str,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     shm: &Arc<Mutex<RouterRegionWriter>>,
+    fib: &Arc<Mutex<Vec<FibEntry>>>,
     force: bool,
 ) -> Option<ConfigSnapshot> {
     let mut last_snapshot = None;
@@ -523,31 +567,34 @@ async fn refresh_config(
                 .filter(|route| {
                     route.flags == 0 || (route.flags & FLAG_ACTIVE != 0)
                 })
-                .map(|route| StaticRoute {
-                    pattern: bytes_to_string(&route.prefix, route.prefix_len as usize).to_string(),
-                    match_kind: route.match_kind,
-                    action: route.action,
-                    next_hop_island: bytes_to_string(
-                        &route.next_hop_island,
-                        route.next_hop_island_len as usize,
-                    )
-                    .to_string(),
-                    priority: route.priority,
-                    metric: route.metric,
-                })
-                .collect();
-            routes_guard.sort_by(|a, b| {
-                (a.priority, a.metric).cmp(&(b.priority, b.metric))
-            });
-            *version_guard = snapshot.header.config_version;
-            tracing::info!(
-                config_version = snapshot.header.config_version,
-                routes = snapshot.routes.len(),
-                vpns = snapshot.vpns.len(),
-                "config snapshot updated"
-            );
-            reassign_vpns(&snapshot, nodes, shm).await;
-        }
+            .map(|route| StaticRoute {
+                pattern: bytes_to_string(&route.prefix, route.prefix_len as usize).to_string(),
+                match_kind: route.match_kind,
+                action: route.action,
+                next_hop_island: bytes_to_string(
+                    &route.next_hop_island,
+                    route.next_hop_island_len as usize,
+                )
+                .to_string(),
+                priority: route.priority,
+                metric: route.metric,
+                installed_at: route.installed_at,
+            })
+            .collect();
+        routes_guard.sort_by(|a, b| {
+            (a.priority, a.metric).cmp(&(b.priority, b.metric))
+        });
+        drop(routes_guard);
+        *version_guard = snapshot.header.config_version;
+        tracing::info!(
+            config_version = snapshot.header.config_version,
+            routes = snapshot.routes.len(),
+            vpns = snapshot.vpns.len(),
+            "config snapshot updated"
+        );
+        reassign_vpns(&snapshot, nodes, shm).await;
+        rebuild_fib(fib, nodes, static_routes).await;
+    }
         last_snapshot = Some(snapshot);
         break;
     }
@@ -631,6 +678,72 @@ async fn reassign_vpns(
     }
 }
 
+async fn rebuild_fib(
+    fib: &Arc<Mutex<Vec<FibEntry>>>,
+    nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
+    static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
+) {
+    let nodes_snapshot: Vec<(Uuid, NodeHandle)> = {
+        let nodes_guard = nodes.lock().await;
+        nodes_guard
+            .iter()
+            .map(|(uuid, handle)| (*uuid, handle.clone()))
+            .collect()
+    };
+    let routes_snapshot: Vec<StaticRoute> = {
+        let routes_guard = static_routes.lock().await;
+        routes_guard.clone()
+    };
+    let mut entries: Vec<FibEntry> = Vec::new();
+    for (uuid, handle) in nodes_snapshot {
+        entries.push(FibEntry {
+            pattern: handle.name.clone(),
+            match_kind: MATCH_EXACT,
+            vpn_id: handle.vpn_id,
+            source: FibSource::LocalNode,
+            next_hop: Some(FibNextHop::Local(uuid)),
+            admin_distance: ADMIN_DISTANCE_LOCAL,
+            priority: 0,
+            metric: 0,
+            installed_at: handle.connected_at,
+            action: ACTION_FORWARD,
+        });
+    }
+    for route in routes_snapshot {
+        let next_hop = if route.next_hop_island.is_empty() {
+            None
+        } else {
+            Some(FibNextHop::Island(route.next_hop_island.clone()))
+        };
+        entries.push(FibEntry {
+            pattern: route.pattern,
+            match_kind: route.match_kind,
+            vpn_id: 0,
+            source: FibSource::StaticRoute,
+            next_hop,
+            admin_distance: ADMIN_DISTANCE_STATIC,
+            priority: route.priority,
+            metric: route.metric,
+            installed_at: route.installed_at,
+            action: route.action,
+        });
+    }
+
+    entries.sort_by(|a, b| {
+        let sa = fib_specificity(a);
+        let sb = fib_specificity(b);
+        sb.cmp(&sa)
+            .then_with(|| a.admin_distance.cmp(&b.admin_distance))
+            .then_with(|| a.priority.cmp(&b.priority))
+            .then_with(|| a.metric.cmp(&b.metric))
+            .then_with(|| a.installed_at.cmp(&b.installed_at))
+    });
+
+    let mut fib_guard = fib.lock().await;
+    *fib_guard = entries;
+    tracing::debug!(fib_entries = fib_guard.len(), "fib rebuilt");
+}
+
 fn bytes_to_string(buf: &[u8], len: usize) -> &str {
     let len = len.min(buf.len());
     std::str::from_utf8(&buf[..len]).unwrap_or("")
@@ -660,6 +773,22 @@ fn pattern_match_kind(match_kind: u8, pattern: &str, name: &str) -> bool {
         MATCH_GLOB => wildcard_match(pattern.as_bytes(), name.as_bytes()),
         _ => false,
     }
+}
+
+fn fib_specificity(entry: &FibEntry) -> (usize, u8) {
+    let len = match entry.match_kind {
+        MATCH_EXACT => entry.pattern.len(),
+        MATCH_PREFIX => entry.pattern.trim_end_matches(".*").len(),
+        MATCH_GLOB => entry.pattern.chars().filter(|c| *c != '*').count(),
+        _ => 0,
+    };
+    let rank = match entry.match_kind {
+        MATCH_EXACT => 3,
+        MATCH_PREFIX => 2,
+        MATCH_GLOB => 1,
+        _ => 0,
+    };
+    (len, rank)
 }
 
 fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
@@ -693,30 +822,38 @@ async fn resolve_by_name(
     target: &str,
     src: &NodeHandle,
     nodes: &std::collections::HashMap<Uuid, NodeHandle>,
-    static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
+    fib: &Arc<Mutex<Vec<FibEntry>>>,
 ) -> Result<ResolvedRoute, RouterError> {
-    let routes = static_routes.lock().await;
-    for route in routes.iter() {
-        if !pattern_match_kind(route.match_kind, &route.pattern, target) {
+    let fib_guard = fib.lock().await;
+    for entry in fib_guard.iter() {
+        if !pattern_match_kind(entry.match_kind, &entry.pattern, target) {
             continue;
         }
-        match route.action {
-            ACTION_DROP => return Ok(ResolvedRoute::Drop),
-            ACTION_FORWARD => {
-                if !route.next_hop_island.is_empty() {
-                    return Ok(ResolvedRoute::ForwardIsland(route.next_hop_island.clone()));
+        match entry.source {
+            FibSource::StaticRoute => {
+                match entry.action {
+                    ACTION_DROP => return Ok(ResolvedRoute::Drop),
+                    ACTION_FORWARD => {
+                        if let Some(FibNextHop::Island(island)) = &entry.next_hop {
+                            return Ok(ResolvedRoute::ForwardIsland(island.clone()));
+                        }
+                        continue;
+                    }
+                    _ => continue,
                 }
-                break;
             }
-            _ => break,
-        }
-    }
-    for (uuid, handle) in nodes.iter() {
-        if handle.name == target {
-            if can_route(src, handle) {
-                return Ok(ResolvedRoute::Deliver(*uuid));
+            FibSource::LocalNode => {
+                let Some(FibNextHop::Local(dst_uuid)) = &entry.next_hop else {
+                    continue;
+                };
+                let Some(dst_handle) = nodes.get(dst_uuid) else {
+                    continue;
+                };
+                if can_route(src, dst_handle) {
+                    return Ok(ResolvedRoute::Deliver(*dst_uuid));
+                }
+                return Ok(ResolvedRoute::Unreachable("VPN_BLOCKED"));
             }
-            return Ok(ResolvedRoute::Unreachable("VPN_BLOCKED"));
         }
     }
     Ok(ResolvedRoute::Unreachable("NODE_NOT_FOUND"))
