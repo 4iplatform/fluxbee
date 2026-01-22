@@ -105,6 +105,7 @@ dependencies = [
 name = "json-router"
 version = "0.1.0"
 dependencies = [
+ "jsr-client",
  "memmap2",
  "nix",
  "serde",
@@ -114,6 +115,19 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "jsr-client"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

@@ -2,6 +2,13 @@ use json_router::config::RouterConfig;
 use json_router::router::Router;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("json-router supports only Linux targets.");
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());

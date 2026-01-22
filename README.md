@@ -23,6 +23,10 @@ cargo run --example node_test
 ```
 Si querés apuntar a un router específico: `JSR_ROUTER_NAME=RT.primary ...`
 
+## Librería de cliente
+
+La librería para conectar nodos al router vive en `crates/jsr_client`.
+
 ## Instalación rápida (server de prueba)
 
 Script de instalación base:

@@ -10,17 +10,17 @@ use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 use crate::config::RouterConfig;
-use crate::protocol::{
-    build_announce, build_router_hello, build_ttl_exceeded, build_unreachable, Destination, Meta,
-    Message, NodeAnnouncePayload, NodeHelloPayload, RouterHelloPayload, MSG_CONFIG_CHANGED,
-    MSG_HELLO, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
-};
 use crate::shm::{
     now_epoch_ms, ConfigRegionReader, ConfigSnapshot, RouterRegionReader, RouterRegionWriter,
     ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE, HEARTBEAT_INTERVAL_MS,
     HEARTBEAT_STALE_MS, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
 };
-use crate::socket::connection::{read_frame, write_frame};
+use jsr_client::protocol::{
+    build_announce, build_router_hello, build_ttl_exceeded, build_unreachable, Destination, Meta,
+    Message, NodeAnnouncePayload, NodeHelloPayload, RouterHelloPayload, MSG_CONFIG_CHANGED,
+    MSG_HELLO, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
+};
+use jsr_client::socket::connection::{read_frame, write_frame};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RouterError {

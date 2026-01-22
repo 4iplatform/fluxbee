@@ -7,8 +7,8 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use json_router::node_client::{NodeClient, NodeConfig};
-use json_router::protocol::{
+use jsr_client::{NodeClient, NodeConfig};
+use jsr_client::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use json_router::shm::{
@@ -61,6 +61,10 @@ struct VpnConfig {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if cfg!(not(target_os = "linux")) {
+        eprintln!("sy_config_routes supports only Linux targets.");
+        std::process::exit(1);
+    }
     let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(log_level))

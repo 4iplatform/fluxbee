@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use json_router::node_client::{NodeClient, NodeConfig};
-use json_router::protocol::{
+use jsr_client::{NodeClient, NodeConfig};
+use jsr_client::protocol::{
     build_echo, build_echo_reply, build_time_sync, build_withdraw, Destination, Message, Meta,
     Routing, TimeSyncPayload,
 };
@@ -11,6 +11,10 @@ use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if cfg!(not(target_os = "linux")) {
+        eprintln!("node_test supports only Linux targets.");
+        std::process::exit(1);
+    }
     let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(log_level))
