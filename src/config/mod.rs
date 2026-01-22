@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/json-router";
 const DEFAULT_STATE_DIR: &str = "/var/lib/json-router/state";
-const DEFAULT_SOCKET_DIR: &str = "/var/run/json-router";
+const DEFAULT_SOCKET_DIR: &str = "/var/run/json-router/routers";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -72,7 +72,6 @@ impl RouterConfig {
         let config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
         let state_dir = PathBuf::from(DEFAULT_STATE_DIR);
         let socket_dir = PathBuf::from(DEFAULT_SOCKET_DIR);
-        let node_socket_path = socket_dir.join("router.sock");
         let shm_prefix = "/jsr-".to_string();
         let island_path = config_dir.join("island.yaml");
         if !island_path.exists() {
@@ -95,6 +94,7 @@ impl RouterConfig {
             fs::write(&identity_path, identity)?;
             (uuid, shm_name)
         };
+        let node_socket_path = socket_dir.join(format!("{}.sock", router_uuid.simple()));
         Ok(Self {
             router_name,
             router_l2_name,

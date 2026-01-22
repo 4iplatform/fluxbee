@@ -19,16 +19,16 @@
         └── config.yaml
 
 /var/lib/json-router/                  # Estado persistente
-├── nodes/                             # UUIDs de nodos
-│   └── AI.soporte.l1.uuid
 └── state/                             # Estado de runtime
+    ├── nodes/                         # UUIDs de nodos
+    │   └── AI.soporte.l1.uuid
     └── RT.primary@produccion/
         └── identity.yaml
 
 /var/run/json-router/                  # Runtime (volátil)
-├── router.sock                        # Socket del router
-└── nodes/                             # Sockets de nodos
-    └── <uuid>.sock
+├── routers/
+│   └── <router-uuid>.sock             # Socket del router
+└── irp-<router-uuid>.sock             # Socket IRP del router
 
 /dev/shm/                              # Shared memory
 ├── jsr-<router-uuid>                  # Región de cada router
@@ -72,7 +72,7 @@ router:
 
 paths:
   state_dir: /var/lib/json-router/state
-  node_socket_dir: /var/run/json-router
+  node_socket_dir: /var/run/json-router/routers
   shm_prefix: /jsr-
 
 timers:
@@ -94,7 +94,7 @@ router:
 
 paths:
   state_dir: /var/lib/json-router/state
-  node_socket_dir: /var/run/json-router
+  node_socket_dir: /var/run/json-router/routers
   shm_prefix: /jsr-
 
 timers:
@@ -135,6 +135,9 @@ created_at: 2025-01-17T10:30:00Z
 ```
 
 **Nunca se edita manualmente.**
+
+El socket del router se nombra con ese UUID:
+`/var/run/json-router/routers/<uuid>.sock`
 
 ---
 
@@ -283,7 +286,7 @@ WantedBy=multi-user.target
 | `JSR_ROUTER_NAME` | Nombre del router | Requerido |
 | `JSR_LOG_LEVEL` | Nivel de log | `info` |
 
-Rutas fijas: `/etc/json-router`, `/var/lib/json-router/state`, `/var/run/json-router`.
+Rutas fijas: `/etc/json-router`, `/var/lib/json-router/state`, `/var/run/json-router/routers`.
 
 ---
 
@@ -295,7 +298,7 @@ Rutas fijas: `/etc/json-router`, `/var/lib/json-router/state`, `/var/run/json-ro
 # Crear directorios
 mkdir -p /etc/json-router/routers
 mkdir -p /var/lib/json-router/state/nodes
-mkdir -p /var/run/json-router
+mkdir -p /var/run/json-router/routers
 
 # Crear island.yaml
 cat > /etc/json-router/island.yaml << 'EOF'
@@ -316,7 +319,7 @@ router:
 
 paths:
   state_dir: /var/lib/json-router/state
-  node_socket_dir: /var/run/json-router
+  node_socket_dir: /var/run/json-router/routers
   shm_prefix: /jsr-
 
 timers:
@@ -347,7 +350,7 @@ router:
 
 paths:
   state_dir: /var/lib/json-router/state
-  node_socket_dir: /var/run/json-router
+  node_socket_dir: /var/run/json-router/routers
   shm_prefix: /jsr-
 
 timers:
@@ -390,7 +393,7 @@ systemctl status json-router@RT.primary
 ls -la /dev/shm/jsr-*
 
 # Verificar sockets
-ls -la /var/run/json-router/
+ls -la /var/run/json-router/routers/
 ```
 
 ### 9.2 Logs
@@ -434,10 +437,10 @@ rm /dev/shm/jsr-<uuid>
 
 ```bash
 # Verificar socket
-ls -la /var/run/json-router/router.sock
+ls -la /var/run/json-router/routers/
 
 # Verificar permisos
-stat /var/run/json-router/
+stat /var/run/json-router/routers/
 ```
 
 ### 10.4 Inter-isla no funciona

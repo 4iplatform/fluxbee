@@ -277,8 +277,12 @@ pub struct ShmSnapshot {
     pub nodes: Vec<NodeEntry>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ShmHeaderSnapshot {
+    pub router_uuid: Uuid,
+    pub router_name: String,
+    pub island_id: String,
+    pub is_gateway: bool,
     pub node_count: u32,
     pub heartbeat: u64,
     pub generation: u64,
@@ -1071,8 +1075,15 @@ fn read_router_snapshot(
         atomic::fence(Ordering::Acquire);
         let s2 = header.seq.load(Ordering::Acquire);
         if s1 == s2 {
+            let router_uuid = Uuid::from_bytes(header.router_uuid);
+            let router_name = read_string(&header.router_name, header.router_name_len as usize);
+            let island_id = read_string(&header.island_id, header.island_id_len as usize);
             return Some(ShmSnapshot {
                 header: ShmHeaderSnapshot {
+                    router_uuid,
+                    router_name,
+                    island_id,
+                    is_gateway: header.is_gateway != 0,
                     node_count: header.node_count,
                     heartbeat: header.heartbeat,
                     generation: header.generation,
@@ -1081,6 +1092,13 @@ fn read_router_snapshot(
             });
         }
     }
+}
+
+fn read_string(buf: &[u8], len: usize) -> String {
+    let len = len.min(buf.len());
+    std::str::from_utf8(&buf[..len])
+        .unwrap_or("")
+        .to_string()
 }
 
 fn read_config_snapshot(

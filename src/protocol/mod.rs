@@ -63,6 +63,14 @@ pub struct NodeHelloPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouterHelloPayload {
+    pub router_id: String,
+    pub router_name: String,
+    pub shm_name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeAnnouncePayload {
     pub uuid: String,
     pub name: String,
@@ -181,6 +189,21 @@ pub fn build_hello(
     src: &str,
     trace_id: &str,
     payload: NodeHelloPayload,
+) -> Message {
+    build_system_message(
+        src,
+        Destination::Resolve,
+        1,
+        trace_id,
+        MSG_HELLO,
+        json!(payload),
+    )
+}
+
+pub fn build_router_hello(
+    src: &str,
+    trace_id: &str,
+    payload: RouterHelloPayload,
 ) -> Message {
     build_system_message(
         src,

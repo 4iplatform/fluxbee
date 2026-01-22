@@ -16,7 +16,7 @@ use json_router::shm::{
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/json-router";
 const DEFAULT_STATE_DIR: &str = "/var/lib/json-router/state";
-const DEFAULT_SOCKET_DIR: &str = "/var/run/json-router";
+const DEFAULT_SOCKET_DIR: &str = "/var/run/json-router/routers";
 
 #[derive(Debug, Deserialize)]
 struct IslandFile {
@@ -71,6 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_dir(&state_dir)?;
 
     let island = load_island(&config_dir)?;
+    let router_name =
+        std::env::var("JSR_ROUTER_NAME").unwrap_or_else(|_| "RT.primary".to_string());
+    let router_l2_name = ensure_l2_name(&router_name, &island.island_id);
+    let router_uuid = load_router_uuid(&state_dir, &router_l2_name)?;
     let mut sy_config = load_config(&config_dir)?;
     let mut last_modified = config_mtime(&config_dir)?;
 
@@ -82,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut client = NodeClient::connect(NodeConfig {
         name: "SY.config.routes".to_string(),
-        router_socket: socket_dir.join("router.sock"),
+        router_socket: socket_dir.join(format!("{}.sock", router_uuid.simple())),
         uuid_persistence_dir: state_dir.join("nodes"),
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
@@ -109,6 +113,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn load_island(config_dir: &Path) -> Result<IslandFile, Box<dyn std::error::Error>> {
     let data = fs::read_to_string(config_dir.join("island.yaml"))?;
     Ok(serde_yaml::from_str(&data)?)
+}
+
+fn ensure_l2_name(name: &str, island_id: &str) -> String {
+    if name.contains('@') {
+        name.to_string()
+    } else {
+        format!("{}@{}", name, island_id)
+    }
+}
+
+fn load_router_uuid(state_dir: &Path, router_l2_name: &str) -> Result<Uuid, Box<dyn std::error::Error>> {
+    let identity_path = state_dir.join(router_l2_name).join("identity.yaml");
+    let data = fs::read_to_string(identity_path)?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&data)?;
+    let uuid = value
+        .get("layer1")
+        .and_then(|v| v.get("uuid"))
+        .and_then(|v| v.as_str())
+        .ok_or("missing layer1.uuid")?;
+    Ok(Uuid::parse_str(uuid)?)
 }
 
 fn load_config(config_dir: &Path) -> Result<SyConfigFile, Box<dyn std::error::Error>> {

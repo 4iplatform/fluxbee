@@ -10,7 +10,7 @@ ROUTER_NAME="RT.primary"
 mkdir -p "${BASE_ETC}/routers" \
   "${BASE_STATE}" \
   "${BASE_STATE}/nodes" \
-  "${BASE_RUN}"
+  "${BASE_RUN}/routers"
 
 if [ ! -f "${BASE_ETC}/island.yaml" ]; then
   cat > "${BASE_ETC}/island.yaml" <<EOF_ISLAND
@@ -30,7 +30,7 @@ router:
 
 paths:
   state_dir: ${BASE_STATE}
-  node_socket_dir: ${BASE_RUN}
+  node_socket_dir: ${BASE_RUN}/routers
   shm_prefix: /jsr-
 
 timers:

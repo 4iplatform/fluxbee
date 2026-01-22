@@ -17,8 +17,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config_dir = PathBuf::from("/etc/json-router");
-    let socket_dir = PathBuf::from("/var/run/json-router");
-    let nodes_dir = PathBuf::from("/var/lib/json-router/state/nodes");
+    let socket_dir = PathBuf::from("/var/run/json-router/routers");
+    let state_dir = PathBuf::from("/var/lib/json-router/state");
+    let nodes_dir = state_dir.join("nodes");
 
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("echo");
@@ -29,18 +30,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let island_id = load_island_id(&config_dir)?;
+    let router_name =
+        std::env::var("JSR_ROUTER_NAME").unwrap_or_else(|_| "RT.primary".to_string());
+    let router_l2_name = ensure_l2_name(&router_name, &island_id);
+    let router_uuid = load_router_uuid(&state_dir, &router_l2_name)?;
+    let router_socket = socket_dir.join(format!("{}.sock", router_uuid.simple()));
     let target_name = normalize_target(target, &island_id);
     println!(
         "connecting: name={} socket={} config={} uuid_dir={}",
         node_name,
-        socket_dir.join("router.sock").display(),
+        router_socket.display(),
         config_dir.display(),
         nodes_dir.display()
     );
 
     let mut client = NodeClient::connect(NodeConfig {
         name: node_name.to_string(),
-        router_socket: socket_dir.join("router.sock"),
+        router_socket,
         uuid_persistence_dir: nodes_dir,
         config_dir,
         version: "1.0".to_string(),
@@ -152,4 +158,30 @@ fn normalize_target(target: &str, island_id: &str) -> String {
     } else {
         format!("{}@{}", target, island_id)
     }
+}
+
+fn ensure_l2_name(name: &str, island_id: &str) -> String {
+    if name.contains('@') {
+        name.to_string()
+    } else {
+        format!("{}@{}", name, island_id)
+    }
+}
+
+fn load_router_uuid(
+    state_dir: &PathBuf,
+    router_l2_name: &str,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
+    let data = std::fs::read_to_string(
+        state_dir
+            .join(router_l2_name)
+            .join("identity.yaml"),
+    )?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&data)?;
+    let uuid = value
+        .get("layer1")
+        .and_then(|v| v.get("uuid"))
+        .and_then(|v| v.as_str())
+        .ok_or("missing layer1.uuid")?;
+    Ok(Uuid::parse_str(uuid)?)
 }

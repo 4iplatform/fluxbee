@@ -455,9 +455,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // La librería lee island.yaml automáticamente
     let config = NodeConfig {
         name: "AI.soporte.l1".to_string(),  // SIN @isla
-        router_socket: "/var/run/json-router/router.sock".into(),
-        uuid_persistence_dir: "/var/lib/json-router/nodes/".into(),
+        router_socket: "/var/run/json-router/routers/<router-uuid>.sock".into(),
+        uuid_persistence_dir: "/var/lib/json-router/state/nodes/".into(),
+        config_dir: "/etc/json-router".into(),
+        version: "1.0".to_string(),
     };
+    // router-uuid se obtiene desde:
+    // /var/lib/json-router/state/<router>@<isla>/identity.yaml (layer1.uuid)
 
     let client = NodeClient::connect(config).await?;
     
@@ -478,10 +482,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### 10.4 Persistencia de UUID
 
 ```
-/var/lib/json-router/nodes/<nombre-sin-isla>.uuid
+/var/lib/json-router/state/nodes/<nombre-sin-isla>.uuid
 ```
 
-Ejemplo: `/var/lib/json-router/nodes/AI.soporte.l1.uuid`
+Ejemplo: `/var/lib/json-router/state/nodes/AI.soporte.l1.uuid`
 
 ---
 

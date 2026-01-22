@@ -19,7 +19,7 @@ JSR_ROUTER_NAME=RT.primary cargo run --bin json-router
 Ejecutar un nodo de prueba que envía un mensaje `HOLA`:
 
 ```sh
-cargo run --example node_test
+JSR_ROUTER_NAME=RT.primary cargo run --example node_test
 ```
 
 ## Instalación rápida (server de prueba)
@@ -34,12 +34,12 @@ Rutas fijas:
 
 - `/etc/json-router` (config)
 - `/var/lib/json-router/state` (state)
-- `/var/run/json-router` (socket)
+- `/var/run/json-router/routers` (sockets por UUID)
 
 ## SY.config.routes
 
 Ejecutar el servicio de config:
 
 ```sh
-cargo run --bin sy_config_routes
+JSR_ROUTER_NAME=RT.primary cargo run --bin sy_config_routes
 ```
