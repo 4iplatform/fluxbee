@@ -493,6 +493,10 @@ async fn handle_message(
                         src_handle.vpn_id,
                         peer_node.vpn_id,
                     ) {
+                        if msg.routing.ttl <= 1 {
+                            send_ttl_exceeded_to(msg, &src_handle.sender, router_uuid)?;
+                            return Ok(());
+                        }
                         if send_to_peer_router(peers, peer_node.router_uuid, msg).await? {
                             return Ok(());
                         }
@@ -571,6 +575,10 @@ async fn handle_message(
                     }
                 }
                 ResolvedRoute::ForwardRouter(peer_uuid) => {
+                    if msg.routing.ttl <= 1 {
+                        send_ttl_exceeded_to(msg, &src_handle.sender, router_uuid)?;
+                        return Ok(());
+                    }
                     if send_to_peer_router(peers, peer_uuid, msg).await? {
                         return Ok(());
                     }
@@ -652,7 +660,11 @@ async fn send_to_peer_router(
     let Some(peer) = peer else {
         return Ok(false);
     };
-    let data = serde_json::to_vec(msg)?;
+    let mut forward = msg.clone();
+    if forward.routing.ttl > 0 {
+        forward.routing.ttl = forward.routing.ttl.saturating_sub(1);
+    }
+    let data = serde_json::to_vec(&forward)?;
     let _ = peer.sender.send(data);
     Ok(true)
 }
@@ -665,7 +677,11 @@ async fn broadcast_to_peers(
     if peers_guard.is_empty() {
         return Ok(());
     }
-    let data = serde_json::to_vec(msg)?;
+    let mut forward = msg.clone();
+    if forward.routing.ttl > 0 {
+        forward.routing.ttl = forward.routing.ttl.saturating_sub(1);
+    }
+    let data = serde_json::to_vec(&forward)?;
     for peer in peers_guard.values() {
         let _ = peer.sender.send(data.clone());
     }
