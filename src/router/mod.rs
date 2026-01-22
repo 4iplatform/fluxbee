@@ -356,6 +356,10 @@ async fn handle_node(
                             )
                             .await;
                             tracing::info!("config changed applied");
+                            if msg.routing.ttl >= 2 {
+                                broadcast_to_peers(&peers, &msg).await?;
+                                tracing::info!("config changed forwarded to peers");
+                            }
                             continue;
                         }
                     }
