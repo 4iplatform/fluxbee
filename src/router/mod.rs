@@ -4,12 +4,11 @@ use std::sync::Arc;
 
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::Duration;
 use uuid::Uuid;
 
 use crate::config::RouterConfig;
 use crate::protocol::{
-    build_announce, build_ttl_exceeded, build_unreachable, ConfigChangedPayload, Destination,
+    build_announce, build_ttl_exceeded, build_unreachable, Destination,
     Message, NodeAnnouncePayload, NodeHelloPayload, MSG_CONFIG_CHANGED, MSG_HELLO, MSG_WITHDRAW,
     SYSTEM_KIND,
 };
@@ -483,79 +482,76 @@ async fn refresh_config(
     shm: &Arc<Mutex<RouterRegionWriter>>,
     force: bool,
 ) -> Option<ConfigSnapshot> {
-    let snapshot = {
-        let mut reader = config_reader.lock().await;
-        if force {
+    let mut last_snapshot = None;
+    for attempt in 0..2 {
+        let snapshot = {
+            let mut reader = config_reader.lock().await;
+            if force && attempt == 0 {
+                *reader = None;
+            }
+            if reader.is_none() {
+                if let Ok(new_reader) =
+                    ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", island_id))
+                {
+                    *reader = Some(new_reader);
+                }
+            }
+            reader.as_ref().and_then(|r| r.read_snapshot())
+        };
+        let Some(snapshot) = snapshot else {
+            return None;
+        };
+
+        let mut version_guard = config_version.lock().await;
+        if force && attempt == 0 && snapshot.header.config_version == *version_guard {
+            drop(version_guard);
+            let mut reader = config_reader.lock().await;
             *reader = None;
-        }
-        if reader.is_none() {
             if let Ok(new_reader) =
                 ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", island_id))
             {
                 *reader = Some(new_reader);
             }
+            continue;
         }
-        reader.as_ref().and_then(|r| r.read_snapshot())
-    };
-    let Some(snapshot) = snapshot else {
-        return None;
-    };
-    let mut version_guard = config_version.lock().await;
-    if force && snapshot.header.config_version == *version_guard {
-        let mut reader = config_reader.lock().await;
-        *reader = None;
-        if let Ok(new_reader) = ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", island_id)) {
-            *reader = Some(new_reader);
+
+        if force || snapshot.header.config_version != *version_guard {
+            let mut routes_guard = static_routes.lock().await;
+            *routes_guard = snapshot
+                .routes
+                .iter()
+                .filter(|route| {
+                    route.flags == 0 || (route.flags & FLAG_ACTIVE != 0)
+                })
+                .map(|route| StaticRoute {
+                    pattern: bytes_to_string(&route.prefix, route.prefix_len as usize).to_string(),
+                    match_kind: route.match_kind,
+                    action: route.action,
+                    next_hop_island: bytes_to_string(
+                        &route.next_hop_island,
+                        route.next_hop_island_len as usize,
+                    )
+                    .to_string(),
+                    priority: route.priority,
+                    metric: route.metric,
+                })
+                .collect();
+            routes_guard.sort_by(|a, b| {
+                (a.priority, a.metric).cmp(&(b.priority, b.metric))
+            });
+            *version_guard = snapshot.header.config_version;
+            tracing::info!(
+                config_version = snapshot.header.config_version,
+                routes = snapshot.routes.len(),
+                vpns = snapshot.vpns.len(),
+                "config snapshot updated"
+            );
+            reassign_vpns(&snapshot, nodes, shm).await;
         }
-        if let Some(new_snapshot) = reader.as_ref().and_then(|r| r.read_snapshot()) {
-            if new_snapshot.header.config_version != snapshot.header.config_version {
-                return refresh_config(
-                    config_reader,
-                    static_routes,
-                    config_version,
-                    island_id,
-                    nodes,
-                    shm,
-                    false,
-                )
-                .await;
-            }
-        }
+        last_snapshot = Some(snapshot);
+        break;
     }
-    if force || snapshot.header.config_version != *version_guard {
-        let mut routes_guard = static_routes.lock().await;
-        *routes_guard = snapshot
-            .routes
-            .iter()
-            .filter(|route| {
-                route.flags == 0 || (route.flags & FLAG_ACTIVE != 0)
-            })
-            .map(|route| StaticRoute {
-                pattern: bytes_to_string(&route.prefix, route.prefix_len as usize).to_string(),
-                match_kind: route.match_kind,
-                action: route.action,
-                next_hop_island: bytes_to_string(
-                    &route.next_hop_island,
-                    route.next_hop_island_len as usize,
-                )
-                .to_string(),
-                priority: route.priority,
-                metric: route.metric,
-            })
-            .collect();
-        routes_guard.sort_by(|a, b| {
-            (a.priority, a.metric).cmp(&(b.priority, b.metric))
-        });
-        *version_guard = snapshot.header.config_version;
-        tracing::info!(
-            config_version = snapshot.header.config_version,
-            routes = snapshot.routes.len(),
-            vpns = snapshot.vpns.len(),
-            "config snapshot updated"
-        );
-        reassign_vpns(&snapshot, nodes, shm).await;
-    }
-    Some(snapshot)
+    last_snapshot
 }
 
 fn assign_vpn(name: &str, snapshot: Option<&ConfigSnapshot>) -> u32 {
