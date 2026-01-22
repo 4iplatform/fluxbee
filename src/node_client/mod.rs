@@ -52,8 +52,30 @@ impl NodeClient {
         let island_id = load_island_id(&config.config_dir)?;
         let (full_name, base_name) = normalize_name(&config.name, &island_id);
         let uuid = load_or_create_uuid(&config.uuid_persistence_dir, &base_name)?;
-        let socket_path = resolve_router_socket(&config.router_socket, &base_name)?;
-        let mut stream = UnixStream::connect(&socket_path).await?;
+        let candidates = router_socket_candidates(&config.router_socket, &base_name)?;
+        let mut last_err = None;
+        let mut connected = None;
+        for socket_path in candidates {
+            match UnixStream::connect(&socket_path).await {
+                Ok(stream) => {
+                    connected = Some((socket_path, stream));
+                    break;
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    continue;
+                }
+            }
+        }
+        let (socket_path, mut stream) = match connected {
+            Some(value) => value,
+            None => {
+                let err = last_err.unwrap_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "no router sockets found")
+                });
+                return Err(err.into());
+            }
+        };
         tracing::info!(
             socket = %socket_path.display(),
             name = %full_name,
@@ -150,7 +172,7 @@ fn load_or_create_uuid(dir: &Path, base_name: &str) -> Result<Uuid, NodeError> {
     Ok(uuid)
 }
 
-fn resolve_router_socket(path: &Path, node_name: &str) -> Result<PathBuf, NodeError> {
+fn router_socket_candidates(path: &Path, node_name: &str) -> Result<Vec<PathBuf>, NodeError> {
     if path.is_dir() {
         let mut sockets: Vec<PathBuf> = fs::read_dir(path)?
             .filter_map(|entry| entry.ok())
@@ -171,10 +193,15 @@ fn resolve_router_socket(path: &Path, node_name: &str) -> Result<PathBuf, NodeEr
             )
             .into());
         }
-        let idx = (fnv1a64(node_name.as_bytes()) % sockets.len() as u64) as usize;
-        return Ok(sockets[idx].clone());
+        let start = (fnv1a64(node_name.as_bytes()) % sockets.len() as u64) as usize;
+        let mut ordered = Vec::with_capacity(sockets.len());
+        for offset in 0..sockets.len() {
+            let idx = (start + offset) % sockets.len();
+            ordered.push(sockets[idx].clone());
+        }
+        return Ok(ordered);
     }
-    Ok(path.to_path_buf())
+    Ok(vec![path.to_path_buf()])
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
