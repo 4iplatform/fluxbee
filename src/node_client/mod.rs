@@ -52,9 +52,10 @@ impl NodeClient {
         let island_id = load_island_id(&config.config_dir)?;
         let (full_name, base_name) = normalize_name(&config.name, &island_id);
         let uuid = load_or_create_uuid(&config.uuid_persistence_dir, &base_name)?;
-        let mut stream = UnixStream::connect(&config.router_socket).await?;
+        let socket_path = resolve_router_socket(&config.router_socket, &base_name)?;
+        let mut stream = UnixStream::connect(&socket_path).await?;
         tracing::info!(
-            socket = %config.router_socket.display(),
+            socket = %socket_path.display(),
             name = %full_name,
             "connected to router socket"
         );
@@ -147,4 +148,40 @@ fn load_or_create_uuid(dir: &Path, base_name: &str) -> Result<Uuid, NodeError> {
     let uuid = Uuid::new_v4();
     fs::write(&path, uuid.to_string())?;
     Ok(uuid)
+}
+
+fn resolve_router_socket(path: &Path, node_name: &str) -> Result<PathBuf, NodeError> {
+    if path.is_dir() {
+        let mut sockets: Vec<PathBuf> = fs::read_dir(path)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|entry| {
+                entry
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext == "sock")
+                    .unwrap_or(false)
+            })
+            .collect();
+        sockets.sort();
+        if sockets.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no router sockets found",
+            )
+            .into());
+        }
+        let idx = (fnv1a64(node_name.as_bytes()) % sockets.len() as u64) as usize;
+        return Ok(sockets[idx].clone());
+    }
+    Ok(path.to_path_buf())
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }

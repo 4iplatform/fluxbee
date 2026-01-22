@@ -30,11 +30,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let island_id = load_island_id(&config_dir)?;
-    let router_name =
-        std::env::var("JSR_ROUTER_NAME").unwrap_or_else(|_| "RT.primary".to_string());
-    let router_l2_name = ensure_l2_name(&router_name, &island_id);
-    let router_uuid = load_router_uuid(&state_dir, &router_l2_name)?;
-    let router_socket = socket_dir.join(format!("{}.sock", router_uuid.simple()));
+    let router_socket = match std::env::var("JSR_ROUTER_NAME") {
+        Ok(router_name) => {
+            let router_l2_name = ensure_l2_name(&router_name, &island_id);
+            match load_router_uuid(&state_dir, &router_l2_name) {
+                Ok(router_uuid) => socket_dir.join(format!("{}.sock", router_uuid.simple())),
+                Err(_) => socket_dir.clone(),
+            }
+        }
+        Err(_) => socket_dir.clone(),
+    };
     let target_name = normalize_target(target, &island_id);
     println!(
         "connecting: name={} socket={} config={} uuid_dir={}",

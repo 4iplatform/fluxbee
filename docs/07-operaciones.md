@@ -30,6 +30,8 @@
 │   └── <router-uuid>.sock             # Socket del router
 └── irp-<router-uuid>.sock             # Socket IRP del router
 
+Los clientes pueden conectar a `/var/run/json-router/routers` y la librería elige un router disponible.
+
 /dev/shm/                              # Shared memory
 ├── jsr-<router-uuid>                  # Región de cada router
 ├── jsr-config-<island>                # Región de config

@@ -455,13 +455,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // La librería lee island.yaml automáticamente
     let config = NodeConfig {
         name: "AI.soporte.l1".to_string(),  // SIN @isla
-        router_socket: "/var/run/json-router/routers/<router-uuid>.sock".into(),
+        router_socket: "/var/run/json-router/routers".into(),
         uuid_persistence_dir: "/var/lib/json-router/state/nodes/".into(),
         config_dir: "/etc/json-router".into(),
         version: "1.0".to_string(),
     };
-    // router-uuid se obtiene desde:
-    // /var/lib/json-router/state/<router>@<isla>/identity.yaml (layer1.uuid)
+    // Si se quiere un router específico:
+    // router_socket: "/var/run/json-router/routers/<router-uuid>.sock"
 
     let client = NodeClient::connect(config).await?;
     

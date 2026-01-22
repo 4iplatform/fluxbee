@@ -109,6 +109,9 @@ impl Router {
         let nodes = Arc::clone(&self.nodes);
         let static_routes = Arc::clone(&self.static_routes);
         let fib = Arc::clone(&self.fib);
+        let config_reader = Arc::clone(&self.config_reader);
+        let config_version = Arc::clone(&self.config_version);
+        let shm = Arc::clone(&self.shm);
         let router_uuid = self.cfg.router_uuid;
         let router_name = self.cfg.router_l2_name.clone();
         let shm_name = self.cfg.shm_name.clone();
@@ -122,7 +125,10 @@ impl Router {
                 peers,
                 peer_nodes,
                 nodes,
+                config_reader,
                 static_routes,
+                config_version,
+                shm,
                 fib,
             )
             .await;
@@ -132,6 +138,11 @@ impl Router {
         let peer_nodes = Arc::clone(&self.peer_nodes);
         let nodes = Arc::clone(&self.nodes);
         let fib = Arc::clone(&self.fib);
+        let config_reader = Arc::clone(&self.config_reader);
+        let static_routes = Arc::clone(&self.static_routes);
+        let config_version = Arc::clone(&self.config_version);
+        let shm = Arc::clone(&self.shm);
+        let island_id = self.cfg.island_id.clone();
         let router_uuid = self.cfg.router_uuid;
         tokio::spawn(async move {
             loop {
@@ -146,6 +157,11 @@ impl Router {
                 let peer_nodes = Arc::clone(&peer_nodes);
                 let nodes = Arc::clone(&nodes);
                 let fib = Arc::clone(&fib);
+                let config_reader = Arc::clone(&config_reader);
+                let static_routes = Arc::clone(&static_routes);
+                let config_version = Arc::clone(&config_version);
+                let shm = Arc::clone(&shm);
+                let island_id = island_id.clone();
                 tokio::spawn(async move {
                     if let Err(err) = handle_peer_incoming(
                         stream,
@@ -154,6 +170,11 @@ impl Router {
                         peer_nodes,
                         nodes,
                         fib,
+                        config_reader,
+                        static_routes,
+                        config_version,
+                        shm,
+                        island_id,
                     )
                     .await
                     {
@@ -603,7 +624,10 @@ async fn peer_discovery_loop(
     peers: Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
+    config_reader: Arc<Mutex<Option<ConfigRegionReader>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
+    config_version: Arc<Mutex<u64>>,
+    shm: Arc<Mutex<RouterRegionWriter>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
 ) {
     let mut ticker = time::interval(Duration::from_secs(5));
@@ -634,6 +658,11 @@ async fn peer_discovery_loop(
                     let peer_nodes = Arc::clone(&peer_nodes);
                     let nodes = Arc::clone(&nodes);
                     let fib = Arc::clone(&fib);
+                    let config_reader = Arc::clone(&config_reader);
+                    let static_routes = Arc::clone(&static_routes);
+                    let config_version = Arc::clone(&config_version);
+                    let shm = Arc::clone(&shm);
+                    let island_id = island_id.to_string();
                     let self_router_name = self_router_name.to_string();
                     let self_shm_name = self_shm_name.to_string();
                     tokio::spawn(async move {
@@ -645,6 +674,11 @@ async fn peer_discovery_loop(
                             peers,
                             peer_nodes,
                             nodes,
+                            config_reader,
+                            static_routes,
+                            config_version,
+                            shm,
+                            &island_id,
                             fib,
                         )
                         .await;
@@ -732,6 +766,11 @@ async fn connect_to_peer(
     peers: Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
+    config_reader: Arc<Mutex<Option<ConfigRegionReader>>>,
+    static_routes: Arc<Mutex<Vec<StaticRoute>>>,
+    config_version: Arc<Mutex<u64>>,
+    shm: Arc<Mutex<RouterRegionWriter>>,
+    island_id: &str,
     fib: Arc<Mutex<Vec<FibEntry>>>,
 ) -> Result<(), RouterError> {
     let socket_path = peer_socket_path(peer_uuid);
@@ -776,6 +815,11 @@ async fn connect_to_peer(
                         &peers,
                         &peer_nodes,
                         &nodes,
+                        &config_reader,
+                        &static_routes,
+                        &config_version,
+                        &shm,
+                        island_id,
                         &fib,
                         self_uuid,
                     )
@@ -800,6 +844,11 @@ async fn handle_peer_incoming(
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
+    config_reader: Arc<Mutex<Option<ConfigRegionReader>>>,
+    static_routes: Arc<Mutex<Vec<StaticRoute>>>,
+    config_version: Arc<Mutex<u64>>,
+    shm: Arc<Mutex<RouterRegionWriter>>,
+    island_id: String,
 ) -> Result<(), RouterError> {
     let (mut reader, mut writer) = stream.into_split();
     let frame = read_frame(&mut reader)
@@ -841,6 +890,11 @@ async fn handle_peer_incoming(
                         &peers,
                         &peer_nodes,
                         &nodes,
+                        &config_reader,
+                        &static_routes,
+                        &config_version,
+                        &shm,
+                        &island_id,
                         &fib,
                         router_uuid,
                     )
@@ -864,6 +918,11 @@ async fn handle_peer_message(
     peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
+    config_reader: &Arc<Mutex<Option<ConfigRegionReader>>>,
+    static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
+    config_version: &Arc<Mutex<u64>>,
+    shm: &Arc<Mutex<RouterRegionWriter>>,
+    island_id: &str,
     fib: &Arc<Mutex<Vec<FibEntry>>>,
     router_uuid: Uuid,
 ) -> Result<(), RouterError> {
@@ -871,6 +930,24 @@ async fn handle_peer_message(
         Ok(uuid) => uuid,
         Err(_) => return Ok(()),
     };
+    if msg.meta.msg_type == SYSTEM_KIND
+        && msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED)
+    {
+        let _ = refresh_config(
+            config_reader,
+            static_routes,
+            config_version,
+            island_id,
+            nodes,
+            peer_nodes,
+            shm,
+            fib,
+            true,
+        )
+        .await;
+        tracing::info!("config changed applied (peer)");
+        return Ok(());
+    }
     let src_node = {
         let peer_guard = peer_nodes.lock().await;
         peer_guard.get(&src_uuid).cloned()

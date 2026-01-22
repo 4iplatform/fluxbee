@@ -19,8 +19,9 @@ JSR_ROUTER_NAME=RT.primary cargo run --bin json-router
 Ejecutar un nodo de prueba que envía un mensaje `HOLA`:
 
 ```sh
-JSR_ROUTER_NAME=RT.primary cargo run --example node_test
+cargo run --example node_test
 ```
+Si querés apuntar a un router específico: `JSR_ROUTER_NAME=RT.primary ...`
 
 ## Instalación rápida (server de prueba)
 
@@ -41,5 +42,6 @@ Rutas fijas:
 Ejecutar el servicio de config:
 
 ```sh
-JSR_ROUTER_NAME=RT.primary cargo run --bin sy_config_routes
+cargo run --bin sy_config_routes
 ```
+Si querés apuntar a un router específico: `JSR_ROUTER_NAME=RT.primary ...`

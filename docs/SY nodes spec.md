@@ -82,7 +82,7 @@ async fn main() -> Result<(), NodeError> {
     let config = NodeConfig {
         name: format!("SY.config.routes.{}", island_id),
         island_id: island_id.clone(),
-        router_socket: PathBuf::from("/var/run/json-router/routers/<router-uuid>.sock"),
+        router_socket: PathBuf::from("/var/run/json-router/routers"),
         uuid_persistence_dir: PathBuf::from("/var/lib/json-router/state/nodes/"),
     };
     

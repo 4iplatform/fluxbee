@@ -71,10 +71,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_dir(&state_dir)?;
 
     let island = load_island(&config_dir)?;
-    let router_name =
-        std::env::var("JSR_ROUTER_NAME").unwrap_or_else(|_| "RT.primary".to_string());
-    let router_l2_name = ensure_l2_name(&router_name, &island.island_id);
-    let router_uuid = load_router_uuid(&state_dir, &router_l2_name)?;
+    let router_socket = match std::env::var("JSR_ROUTER_NAME") {
+        Ok(router_name) => {
+            let router_l2_name = ensure_l2_name(&router_name, &island.island_id);
+            match load_router_uuid(&state_dir, &router_l2_name) {
+                Ok(router_uuid) => socket_dir.join(format!("{}.sock", router_uuid.simple())),
+                Err(_) => socket_dir.clone(),
+            }
+        }
+        Err(_) => socket_dir.clone(),
+    };
     let mut sy_config = load_config(&config_dir)?;
     let mut last_modified = config_mtime(&config_dir)?;
 
@@ -86,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut client = NodeClient::connect(NodeConfig {
         name: "SY.config.routes".to_string(),
-        router_socket: socket_dir.join(format!("{}.sock", router_uuid.simple())),
+        router_socket: router_socket.clone(),
         uuid_persistence_dir: state_dir.join("nodes"),
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
