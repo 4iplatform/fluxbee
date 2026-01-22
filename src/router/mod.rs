@@ -219,41 +219,17 @@ async fn handle_node(
                             break;
                         }
                         if msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
-                            let target_version = serde_json::from_value::<ConfigChangedPayload>(
-                                msg.payload.clone(),
+                            let _ = refresh_config(
+                                &config_reader,
+                                &static_routes,
+                                &config_version,
+                                island_id,
+                                &nodes,
+                                &shm,
+                                true,
                             )
-                            .map(|p| p.config_version)
-                            .unwrap_or(0);
-                            let mut attempts = 0;
-                            loop {
-                                let snapshot = refresh_config(
-                                    &config_reader,
-                                    &static_routes,
-                                    &config_version,
-                                    island_id,
-                                    &nodes,
-                                    &shm,
-                                    true,
-                                )
-                                .await;
-                                let current = snapshot
-                                    .as_ref()
-                                    .map(|s| s.header.config_version)
-                                    .unwrap_or(0);
-                                if current >= target_version {
-                                    break;
-                                }
-                                attempts += 1;
-                                if attempts >= 3 {
-                                    tracing::warn!(
-                                        current_version = current,
-                                        target_version = target_version,
-                                        "config changed not yet visible"
-                                    );
-                                    break;
-                                }
-                                tokio::time::sleep(Duration::from_millis(200)).await;
-                            }
+                            .await;
+                            tracing::info!("config changed applied");
                             continue;
                         }
                     }
@@ -614,6 +590,7 @@ async fn reassign_vpns(
             }
         }
     }
+    tracing::info!(nodes = updates.len(), "vpn reassignment scan completed");
     if updates.is_empty() {
         return;
     }
