@@ -46,6 +46,7 @@ pub struct Router {
     fib: Arc<Mutex<Vec<FibEntry>>>,
     config_version: Arc<Mutex<u64>>,
     opa: Arc<Mutex<OpaResolver>>,
+    broadcast_cache: Arc<Mutex<BroadcastCache>>,
 }
 
 impl Router {
@@ -79,6 +80,7 @@ impl Router {
             fib: Arc::new(Mutex::new(Vec::new())),
             config_version: Arc::new(Mutex::new(0)),
             opa,
+            broadcast_cache: Arc::new(Mutex::new(BroadcastCache::new())),
         }
     }
 
@@ -224,6 +226,7 @@ impl Router {
             let fib = Arc::clone(&self.fib);
             let config_version = Arc::clone(&self.config_version);
             let opa = Arc::clone(&self.opa);
+            let broadcast_cache = Arc::clone(&self.broadcast_cache);
             tokio::spawn(async move {
                 if let Err(err) = handle_node(
                     stream,
@@ -236,6 +239,7 @@ impl Router {
                     fib,
                     config_version,
                     opa,
+                    broadcast_cache,
                     router_uuid,
                     &router_name,
                     &island_id,
@@ -260,6 +264,7 @@ async fn handle_node(
     fib: Arc<Mutex<Vec<FibEntry>>>,
     config_version: Arc<Mutex<u64>>,
     opa: Arc<Mutex<OpaResolver>>,
+    broadcast_cache: Arc<Mutex<BroadcastCache>>,
     router_uuid: Uuid,
     router_name: &str,
     island_id: &str,
@@ -410,6 +415,7 @@ async fn handle_node(
                         &peer_nodes,
                         &peers,
                         &opa,
+                        &broadcast_cache,
                         router_uuid,
                         snapshot.as_ref(),
                     )
@@ -443,6 +449,7 @@ async fn handle_message(
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     opa: &Arc<Mutex<OpaResolver>>,
+    broadcast_cache: &Arc<Mutex<BroadcastCache>>,
     router_uuid: Uuid,
     _snapshot: Option<&ConfigSnapshot>,
 ) -> Result<(), RouterError> {
@@ -510,6 +517,17 @@ async fn handle_message(
             }
         }
         Destination::Broadcast => {
+            let trace_id = match Uuid::parse_str(&msg.routing.trace_id) {
+                Ok(value) => value,
+                Err(_) => return Ok(()),
+            };
+            {
+                let mut cache = broadcast_cache.lock().await;
+                if !cache.check_and_add(trace_id) {
+                    tracing::debug!(trace_id = %msg.routing.trace_id, "broadcast duplicate dropped");
+                    return Ok(());
+                }
+            }
             let target = msg.meta.target.as_deref();
             let nodes_guard = nodes.lock().await;
             for (uuid, handle) in nodes_guard.iter() {
@@ -1286,6 +1304,30 @@ enum ResolvedRoute {
 struct PeerRegion {
     router_uuid: Uuid,
     nodes: Vec<PeerNode>,
+}
+
+struct BroadcastCache {
+    seen: HashMap<Uuid, u64>,
+    ttl_ms: u64,
+}
+
+impl BroadcastCache {
+    fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+            ttl_ms: 30_000,
+        }
+    }
+
+    fn check_and_add(&mut self, trace_id: Uuid) -> bool {
+        let now = now_epoch_ms();
+        self.seen.retain(|_, ts| now.saturating_sub(*ts) <= self.ttl_ms);
+        if self.seen.contains_key(&trace_id) {
+            return false;
+        }
+        self.seen.insert(trace_id, now);
+        true
+    }
 }
 
 async fn refresh_config(
