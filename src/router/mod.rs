@@ -10,6 +10,7 @@ use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 use crate::config::RouterConfig;
+use crate::opa::OpaResolver;
 use crate::shm::{
     now_epoch_ms, ConfigRegionReader, ConfigSnapshot, RouterRegionReader, RouterRegionWriter,
     ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE, HEARTBEAT_INTERVAL_MS,
@@ -30,6 +31,8 @@ pub enum RouterError {
     Json(#[from] serde_json::Error),
     #[error("uuid error: {0}")]
     Uuid(#[from] uuid::Error),
+    #[error("opa error: {0}")]
+    Opa(#[from] crate::opa::OpaError),
 }
 
 pub struct Router {
@@ -42,6 +45,7 @@ pub struct Router {
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
     config_version: Arc<Mutex<u64>>,
+    opa: Arc<Mutex<OpaResolver>>,
 }
 
 impl Router {
@@ -61,6 +65,9 @@ impl Router {
             Ok(reader) => Some(reader),
             Err(_) => None,
         };
+        let opa = Arc::new(Mutex::new(OpaResolver::new(PathBuf::from(
+            "/var/lib/json-router/policy.wasm",
+        ))));
         Self {
             cfg,
             shm: Arc::new(Mutex::new(shm)),
@@ -71,6 +78,7 @@ impl Router {
             static_routes: Arc::new(Mutex::new(Vec::new())),
             fib: Arc::new(Mutex::new(Vec::new())),
             config_version: Arc::new(Mutex::new(0)),
+            opa,
         }
     }
 
@@ -112,6 +120,7 @@ impl Router {
         let config_reader = Arc::clone(&self.config_reader);
         let config_version = Arc::clone(&self.config_version);
         let shm = Arc::clone(&self.shm);
+        let opa = Arc::clone(&self.opa);
         let router_uuid = self.cfg.router_uuid;
         let router_name = self.cfg.router_l2_name.clone();
         let shm_name = self.cfg.shm_name.clone();
@@ -129,6 +138,7 @@ impl Router {
                 static_routes,
                 config_version,
                 shm,
+                opa,
                 fib,
             )
             .await;
@@ -142,6 +152,7 @@ impl Router {
         let static_routes = Arc::clone(&self.static_routes);
         let config_version = Arc::clone(&self.config_version);
         let shm = Arc::clone(&self.shm);
+        let opa = Arc::clone(&self.opa);
         let island_id = self.cfg.island_id.clone();
         let router_uuid = self.cfg.router_uuid;
         tokio::spawn(async move {
@@ -161,6 +172,7 @@ impl Router {
                 let static_routes = Arc::clone(&static_routes);
                 let config_version = Arc::clone(&config_version);
                 let shm = Arc::clone(&shm);
+                let opa = Arc::clone(&opa);
                 let island_id = island_id.clone();
                 tokio::spawn(async move {
                     if let Err(err) = handle_peer_incoming(
@@ -174,6 +186,7 @@ impl Router {
                         static_routes,
                         config_version,
                         shm,
+                        opa,
                         island_id,
                     )
                     .await
@@ -198,6 +211,7 @@ impl Router {
             let static_routes = Arc::clone(&self.static_routes);
             let fib = Arc::clone(&self.fib);
             let config_version = Arc::clone(&self.config_version);
+            let opa = Arc::clone(&self.opa);
             tokio::spawn(async move {
                 if let Err(err) = handle_node(
                     stream,
@@ -209,6 +223,7 @@ impl Router {
                     static_routes,
                     fib,
                     config_version,
+                    opa,
                     router_uuid,
                     &router_name,
                     &island_id,
@@ -232,6 +247,7 @@ async fn handle_node(
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
     config_version: Arc<Mutex<u64>>,
+    opa: Arc<Mutex<OpaResolver>>,
     router_uuid: Uuid,
     router_name: &str,
     island_id: &str,
@@ -381,6 +397,7 @@ async fn handle_node(
                         &fib,
                         &peer_nodes,
                         &peers,
+                        &opa,
                         router_uuid,
                         snapshot.as_ref(),
                     )
@@ -413,6 +430,7 @@ async fn handle_message(
     fib: &Arc<Mutex<Vec<FibEntry>>>,
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
+    opa: &Arc<Mutex<OpaResolver>>,
     router_uuid: Uuid,
     _snapshot: Option<&ConfigSnapshot>,
 ) -> Result<(), RouterError> {
@@ -502,7 +520,18 @@ async fn handle_message(
             }
         }
         Destination::Resolve => {
-            let Some(target) = msg.meta.target.as_deref() else {
+            let resolved_target = match {
+                let mut opa = opa.lock().await;
+                opa.resolve_target(msg)
+            } {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!("opa resolve failed: {err}");
+                    send_unreachable_to(msg, &src_handle.sender, router_uuid, "OPA_ERROR")?;
+                    return Ok(());
+                }
+            };
+            let Some(target) = resolved_target.as_deref() else {
                 send_unreachable_to(msg, &src_handle.sender, router_uuid, "MISSING_TARGET")?;
                 return Ok(());
             };
@@ -648,6 +677,7 @@ async fn peer_discovery_loop(
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
+    opa: Arc<Mutex<OpaResolver>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
 ) {
     let mut ticker = time::interval(Duration::from_secs(5));
@@ -682,6 +712,7 @@ async fn peer_discovery_loop(
                     let static_routes = Arc::clone(&static_routes);
                     let config_version = Arc::clone(&config_version);
                     let shm = Arc::clone(&shm);
+                    let opa = Arc::clone(&opa);
                     let island_id = island_id.to_string();
                     let self_router_name = self_router_name.to_string();
                     let self_shm_name = self_shm_name.to_string();
@@ -698,6 +729,7 @@ async fn peer_discovery_loop(
                             static_routes,
                             config_version,
                             shm,
+                            opa,
                             &island_id,
                             fib,
                         )
@@ -790,6 +822,7 @@ async fn connect_to_peer(
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
+    opa: Arc<Mutex<OpaResolver>>,
     island_id: &str,
     fib: Arc<Mutex<Vec<FibEntry>>>,
 ) -> Result<(), RouterError> {
@@ -839,6 +872,7 @@ async fn connect_to_peer(
                         &static_routes,
                         &config_version,
                         &shm,
+                        &opa,
                         island_id,
                         &fib,
                         self_uuid,
@@ -868,6 +902,7 @@ async fn handle_peer_incoming(
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
+    opa: Arc<Mutex<OpaResolver>>,
     island_id: String,
 ) -> Result<(), RouterError> {
     let (mut reader, mut writer) = stream.into_split();
@@ -914,6 +949,7 @@ async fn handle_peer_incoming(
                         &static_routes,
                         &config_version,
                         &shm,
+                        &opa,
                         &island_id,
                         &fib,
                         router_uuid,
@@ -942,6 +978,7 @@ async fn handle_peer_message(
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
     config_version: &Arc<Mutex<u64>>,
     shm: &Arc<Mutex<RouterRegionWriter>>,
+    opa: &Arc<Mutex<OpaResolver>>,
     island_id: &str,
     fib: &Arc<Mutex<Vec<FibEntry>>>,
     router_uuid: Uuid,
@@ -1049,7 +1086,20 @@ async fn handle_peer_message(
             }
         }
         Destination::Resolve => {
-            let Some(target) = msg.meta.target.as_deref() else {
+            let resolved_target = match {
+                let mut opa = opa.lock().await;
+                opa.resolve_target(msg)
+            } {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!("opa resolve failed: {err}");
+                    if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
+                        send_unreachable_to(msg, &peer.sender, router_uuid, "OPA_ERROR")?;
+                    }
+                    return Ok(());
+                }
+            };
+            let Some(target) = resolved_target.as_deref() else {
                 return Ok(());
             };
             let nodes_guard = nodes.lock().await;
