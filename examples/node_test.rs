@@ -98,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             meta: Meta {
                 msg_type: "user".to_string(),
                 msg: None,
+                scope: None,
                 target: target_name,
                 action: None,
                 priority: None,

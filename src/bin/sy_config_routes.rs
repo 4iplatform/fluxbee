@@ -8,7 +8,9 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use json_router::node_client::{NodeClient, NodeConfig};
-use json_router::protocol::{ConfigChangedPayload, Destination, Message, Meta, Routing, SYSTEM_KIND};
+use json_router::protocol::{
+    ConfigChangedPayload, Destination, Message, Meta, Routing, SCOPE_GLOBAL, SYSTEM_KIND,
+};
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, VpnAssignment,
     ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
@@ -307,6 +309,7 @@ async fn send_config_changed(
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some("CONFIG_CHANGED".to_string()),
+            scope: Some(SCOPE_GLOBAL.to_string()),
             target: Some("RT.*".to_string()),
             action: None,
             priority: None,

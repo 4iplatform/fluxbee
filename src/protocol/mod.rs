@@ -46,6 +46,8 @@ pub struct Meta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub msg: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
@@ -158,6 +160,9 @@ pub const MSG_TIME_SYNC: &str = "TIME_SYNC";
 pub const MSG_WITHDRAW: &str = "WITHDRAW";
 pub const MSG_CONFIG_CHANGED: &str = "CONFIG_CHANGED";
 
+pub const SCOPE_VPN: &str = "vpn";
+pub const SCOPE_GLOBAL: &str = "global";
+
 pub fn build_system_message(
     src: &str,
     dst: Destination,
@@ -176,6 +181,7 @@ pub fn build_system_message(
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(msg.to_string()),
+            scope: None,
             target: None,
             action: None,
             priority: None,
@@ -308,7 +314,9 @@ pub fn build_time_sync(
     trace_id: &str,
     payload: TimeSyncPayload,
 ) -> Message {
-    build_system_message(src, dst, 1, trace_id, MSG_TIME_SYNC, json!(payload))
+    let mut msg = build_system_message(src, dst, 1, trace_id, MSG_TIME_SYNC, json!(payload));
+    msg.meta.scope = Some(SCOPE_GLOBAL.to_string());
+    msg
 }
 
 pub fn build_withdraw(src: &str, dst: Destination, trace_id: &str, uuid: &str) -> Message {

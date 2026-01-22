@@ -60,6 +60,7 @@ Usado por OPA para decisiones de capa 2, y por el router para broadcast filtrado
 {
   "meta": {
     "type": "user",
+    "scope": "vpn",
     "target": "AI.soporte.l1@produccion",
     "priority": "high",
     "context": {
@@ -74,10 +75,13 @@ Usado por OPA para decisiones de capa 2, y por el router para broadcast filtrado
 |-------|------|-------------|-------------|
 | `type` | string | Sí | Tipo de mensaje: `"user"`, `"system"`, `"admin"` |
 | `msg` | string | Sí si type=system | Tipo de mensaje de sistema (ej: `"HELLO"`, `"LSA"`) |
+| `scope` | string | No | Alcance VPN para broadcast/multicast: `"vpn"` (default) o `"global"` (solo system) |
 | `target` | string | Condicional | Para OPA o broadcast filter (nombre L2 con @isla) |
 | `priority` | string | No | Hint de prioridad para OPA |
 | `context` | object | No | Datos adicionales para reglas OPA |
 | `action` | string | No | Para mensajes admin: acción a ejecutar |
+
+**Regla:** si `type="system"` y `scope="global"`, el router ignora el filtro de VPN para broadcast/multicast.
 
 ### 3.1 Uso de `target` según contexto
 
@@ -267,7 +271,7 @@ socket.on('data', (chunk) => {
 
 | Mensaje | Origen | Destino | Propósito |
 |---------|--------|---------|-----------|
-| `TIME_SYNC` | SY.time / Router | Broadcast | Sincronización UTC |
+| `TIME_SYNC` | SY.time / Router | Broadcast | Sincronización UTC (scope=`"global"`) |
 
 ---
 

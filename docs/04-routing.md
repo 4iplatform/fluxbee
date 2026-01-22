@@ -335,6 +335,7 @@ Las rutas estáticas son **override explícito** y se evalúan **antes** del loo
 |-------|---------------|----------------|
 | `"broadcast"` | ausente | A todos los nodos (respetando VPN) |
 | `"broadcast"` | patrón | A nodos que matchean el patrón (respetando VPN) |
+| `"broadcast"` | ausente/patrón + `meta.scope="global"` | A todos los nodos, ignorando VPN (solo system) |
 
 ### 7.2 Broadcast respeta VPN
 
@@ -343,13 +344,15 @@ fn broadcast(&self, msg: &Message) -> Vec<Action> {
     let src_node = self.find_node_by_uuid(&msg.routing.src)?;
     let src_vpn = src_node.vpn_id;
     let src_is_sy = is_system_node(&src_node.name);
+    let scope_global = msg.meta.type == "system"
+        && msg.meta.scope.as_deref() == Some("global");
     let target_pattern = msg.meta.target.as_deref();
     
     let mut actions = Vec::new();
     
     for node in self.all_nodes() {
-        // Filtro VPN (excepto para SY.*)
-        if !src_is_sy && node.vpn_id != src_vpn {
+        // Filtro VPN (excepto para SY.* o scope=global)
+        if !src_is_sy && !scope_global && node.vpn_id != src_vpn {
             continue;
         }
         
