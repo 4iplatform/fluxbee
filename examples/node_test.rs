@@ -106,6 +106,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut seq = 1u64;
     loop {
+        if mode == "opa" {
+            let msg = Message {
+                routing: Routing {
+                    src: client.uuid().to_string(),
+                    dst: Destination::Resolve,
+                    ttl: 1,
+                    trace_id: Uuid::new_v4().to_string(),
+                },
+                meta: Meta {
+                    msg_type: "user".to_string(),
+                    msg: None,
+                    scope: None,
+                    target: Some(target_name.clone()),
+                    action: None,
+                    priority: None,
+                    context: Some(json!({"opa_test": true, "seq": seq})),
+                },
+                payload: json!({"type": "opa_test", "content": format!("OPA {}", seq)}),
+            };
+            if let Err(err) = client.send(&msg).await {
+                eprintln!("send error: {err} (reconnecting)");
+                client = NodeClient::connect_with_retry(
+                    &node_config,
+                    std::time::Duration::from_secs(1),
+                )
+                .await?;
+                continue;
+            }
+            println!("sent OPA {}", seq);
+            seq += 1;
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            continue;
+        }
         let (dst, target_name) = if mode == "unicast" {
             (Destination::Resolve, Some(target_name.clone()))
         } else {
