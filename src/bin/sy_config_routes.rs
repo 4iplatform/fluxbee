@@ -92,17 +92,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     apply_config(&mut writer, &sy_config)?;
 
-    let mut client = NodeClient::connect(NodeConfig {
+    let node_config = NodeConfig {
         name: "SY.config.routes".to_string(),
         router_socket: router_socket.clone(),
         uuid_persistence_dir: state_dir.join("nodes"),
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
-    })
-    .await?;
+    };
+    let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
 
     tracing::info!("connected to router");
-    send_config_changed(&mut client, &mut writer, &sy_config).await?;
+    if let Err(err) = send_config_changed(&mut client, &mut writer, &sy_config).await {
+        tracing::warn!("config broadcast failed: {err} (reconnecting)");
+        client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+        send_config_changed(&mut client, &mut writer, &sy_config).await?;
+    }
 
     let mut ticker = time::interval(Duration::from_secs(5));
     loop {
@@ -112,7 +116,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if current > last_modified {
             sy_config = load_config(&config_dir)?;
             apply_config(&mut writer, &sy_config)?;
-            send_config_changed(&mut client, &mut writer, &sy_config).await?;
+            if let Err(err) = send_config_changed(&mut client, &mut writer, &sy_config).await {
+                tracing::warn!("config broadcast failed: {err} (reconnecting)");
+                client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1))
+                    .await?;
+                send_config_changed(&mut client, &mut writer, &sy_config).await?;
+            }
             last_modified = current;
         }
     }

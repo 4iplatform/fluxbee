@@ -49,14 +49,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         nodes_dir.display()
     );
 
-    let mut client = NodeClient::connect(NodeConfig {
+    let node_config = NodeConfig {
         name: node_name.to_string(),
         router_socket,
         uuid_persistence_dir: nodes_dir,
         config_dir,
         version: "1.0".to_string(),
-    })
-    .await?;
+    };
+    let mut client = NodeClient::connect_with_retry(&node_config, std::time::Duration::from_secs(1))
+        .await?;
 
     println!(
         "connected as {} (uuid={}, vpn={}, router={})",
@@ -69,15 +70,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if mode == "listen" {
         println!("listen mode: waiting for messages");
         loop {
-            let msg = client.recv().await?;
-            println!(
-                "received: src={} dst={:?} type={} msg={:?} payload={}",
-                msg.routing.src,
-                msg.routing.dst,
-                msg.meta.msg_type,
-                msg.meta.msg,
-                msg.payload
-            );
+            match client.recv().await {
+                Ok(msg) => {
+                    println!(
+                        "received: src={} dst={:?} type={} msg={:?} payload={}",
+                        msg.routing.src,
+                        msg.routing.dst,
+                        msg.meta.msg_type,
+                        msg.meta.msg,
+                        msg.payload
+                    );
+                }
+                Err(err) => {
+                    eprintln!("recv error: {err} (reconnecting)");
+                    client = NodeClient::connect_with_retry(
+                        &node_config,
+                        std::time::Duration::from_secs(1),
+                    )
+                    .await?;
+                    println!(
+                        "reconnected as {} (uuid={}, vpn={}, router={})",
+                        client.name(),
+                        client.uuid(),
+                        client.vpn_id(),
+                        client.router_name()
+                    );
+                }
+            }
         }
     }
 
@@ -106,18 +125,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             payload: json!({"type": "text", "content": format!("HOLA {}", seq)}),
         };
-        client.send(&msg).await?;
+        if let Err(err) = client.send(&msg).await {
+            eprintln!("send error: {err} (reconnecting)");
+            client =
+                NodeClient::connect_with_retry(&node_config, std::time::Duration::from_secs(1))
+                    .await?;
+            continue;
+        }
         println!("sent HOLA {}", seq);
 
         let trace_id = Uuid::new_v4().to_string();
         let echo = build_echo(&client.uuid().to_string(), Destination::Broadcast, &trace_id);
-        client.send(&echo).await?;
+        if let Err(err) = client.send(&echo).await {
+            eprintln!("send error: {err} (reconnecting)");
+            client =
+                NodeClient::connect_with_retry(&node_config, std::time::Duration::from_secs(1))
+                    .await?;
+            continue;
+        }
         println!("sent ECHO");
 
         let trace_id = Uuid::new_v4().to_string();
         let echo_reply =
             build_echo_reply(&client.uuid().to_string(), Destination::Broadcast, &trace_id);
-        client.send(&echo_reply).await?;
+        if let Err(err) = client.send(&echo_reply).await {
+            eprintln!("send error: {err} (reconnecting)");
+            client =
+                NodeClient::connect_with_retry(&node_config, std::time::Duration::from_secs(1))
+                    .await?;
+            continue;
+        }
         println!("sent ECHO_REPLY");
 
         let trace_id = Uuid::new_v4().to_string();
@@ -132,7 +169,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 seq,
             },
         );
-        client.send(&time_sync).await?;
+        if let Err(err) = client.send(&time_sync).await {
+            eprintln!("send error: {err} (reconnecting)");
+            client =
+                NodeClient::connect_with_retry(&node_config, std::time::Duration::from_secs(1))
+                    .await?;
+            continue;
+        }
         println!("sent TIME_SYNC");
 
         seq += 1;

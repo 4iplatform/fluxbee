@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use tokio::net::UnixStream;
+use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 use crate::protocol::{
@@ -48,7 +49,7 @@ struct IslandFile {
 }
 
 impl NodeClient {
-    pub async fn connect(config: NodeConfig) -> Result<Self, NodeError> {
+    pub async fn connect(config: &NodeConfig) -> Result<Self, NodeError> {
         let island_id = load_island_id(&config.config_dir)?;
         let (full_name, base_name) = normalize_name(&config.name, &island_id);
         let uuid = load_or_create_uuid(&config.uuid_persistence_dir, &base_name)?;
@@ -113,6 +114,21 @@ impl NodeClient {
             vpn_id: payload.vpn_id,
             router_name: payload.router_name,
         })
+    }
+
+    pub async fn connect_with_retry(
+        config: &NodeConfig,
+        delay: Duration,
+    ) -> Result<Self, NodeError> {
+        loop {
+            match Self::connect(config).await {
+                Ok(client) => return Ok(client),
+                Err(err) => {
+                    tracing::warn!("connect failed: {err}");
+                    time::sleep(delay).await;
+                }
+            }
+        }
     }
 
     pub fn uuid(&self) -> Uuid {
