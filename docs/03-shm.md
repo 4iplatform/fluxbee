@@ -64,7 +64,7 @@ Total aproximado: ~320 KB por router
 
 ```rust
 pub const SHM_MAGIC: u32 = 0x4A535352;  // "JSSR"
-pub const SHM_VERSION: u32 = 1;
+pub const SHM_VERSION: u32 = 2;
 pub const MAX_NODES: u32 = 1024;
 
 #[repr(C)]
@@ -103,6 +103,11 @@ pub struct ShmHeader {
     // Flags (4 bytes)
     pub is_gateway: u8,              // 1 si este router es el gateway
     pub _flags_reserved: [u8; 3],
+
+    // OPA policy (16 bytes)
+    pub opa_policy_version: u64,    // Versión del policy cargado (0 = no cargado)
+    pub opa_load_status: u8,        // 0=OK, 1=ERROR, 2=LOADING
+    pub _opa_pad: [u8; 7],
     
     // Reserved (para llegar a 224 bytes)
     pub _reserved: [u8; 6],

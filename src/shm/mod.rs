@@ -12,7 +12,7 @@ use nix::unistd::ftruncate;
 use uuid::Uuid;
 
 pub const SHM_MAGIC: u32 = 0x4A535352; // "JSSR"
-pub const SHM_VERSION: u32 = 1;
+pub const SHM_VERSION: u32 = 2;
 
 pub const CONFIG_MAGIC: u32 = 0x4A534343; // "JSCC"
 pub const CONFIG_VERSION: u32 = 1;
@@ -91,6 +91,10 @@ pub struct ShmHeader {
 
     pub is_gateway: u8,
     pub _flags_reserved: [u8; 3],
+
+    pub opa_policy_version: u64,
+    pub opa_load_status: u8,
+    pub _opa_pad: [u8; 7],
 
     pub _reserved: [u8; 6],
 }
@@ -286,6 +290,8 @@ pub struct ShmHeaderSnapshot {
     pub node_count: u32,
     pub heartbeat: u64,
     pub generation: u64,
+    pub opa_policy_version: u64,
+    pub opa_load_status: u8,
 }
 
 #[derive(Debug)]
@@ -388,6 +394,21 @@ impl RouterRegionWriter {
             header.heartbeat = now_epoch_ms();
             seqlock_end_write(&header.seq);
         }
+    }
+
+    pub fn update_opa_status(&mut self, policy_version: u64, load_status: u8) {
+        let Some(header) = self.header_mut() else {
+            return;
+        };
+        if header.opa_policy_version == policy_version && header.opa_load_status == load_status {
+            return;
+        }
+        seqlock_begin_write(&header.seq);
+        header.opa_policy_version = policy_version;
+        header.opa_load_status = load_status;
+        header.updated_at = now_epoch_ms();
+        header.heartbeat = header.updated_at;
+        seqlock_end_write(&header.seq);
     }
 
     pub fn register_node(
@@ -1028,6 +1049,8 @@ fn initialize_router_header(
         header.island_id_len = copy_bytes_with_len(&mut header.island_id, island_id) as u16;
         header.router_name_len = copy_bytes_with_len(&mut header.router_name, router_name) as u16;
         header.is_gateway = if is_gateway { 1 } else { 0 };
+        header.opa_policy_version = 0;
+        header.opa_load_status = 0;
     }
 }
 
@@ -1101,6 +1124,8 @@ fn read_router_snapshot(
                     node_count: header.node_count,
                     heartbeat: header.heartbeat,
                     generation: header.generation,
+                    opa_policy_version: header.opa_policy_version,
+                    opa_load_status: header.opa_load_status,
                 },
                 nodes: snapshot,
             });

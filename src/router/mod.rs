@@ -103,12 +103,24 @@ impl Router {
         );
 
         let shm = Arc::clone(&self.shm);
+        let opa = Arc::clone(&self.opa);
         tokio::spawn(async move {
             let mut ticker = time::interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
             loop {
                 ticker.tick().await;
+                let (policy_version, load_status) = {
+                    let mut opa = opa.lock().await;
+                    match opa.refresh_status() {
+                        Ok(status) => status,
+                        Err(err) => {
+                            tracing::warn!("opa status refresh failed: {err}");
+                            opa.status()
+                        }
+                    }
+                };
                 let mut shm = shm.lock().await;
                 shm.update_heartbeat();
+                shm.update_opa_status(policy_version, load_status);
             }
         });
 
@@ -532,7 +544,7 @@ async fn handle_message(
                 }
             };
             let Some(target) = resolved_target.as_deref() else {
-                send_unreachable_to(msg, &src_handle.sender, router_uuid, "MISSING_TARGET")?;
+                send_unreachable_to(msg, &src_handle.sender, router_uuid, "OPA_NO_TARGET")?;
                 return Ok(());
             };
             let nodes_guard = nodes.lock().await;
@@ -1100,6 +1112,9 @@ async fn handle_peer_message(
                 }
             };
             let Some(target) = resolved_target.as_deref() else {
+                if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
+                    send_unreachable_to(msg, &peer.sender, router_uuid, "OPA_NO_TARGET")?;
+                }
                 return Ok(());
             };
             let nodes_guard = nodes.lock().await;
