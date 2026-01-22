@@ -28,6 +28,8 @@ pub enum RouterError {
     Io(#[from] io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("uuid error: {0}")]
+    Uuid(#[from] uuid::Error),
 }
 
 pub struct Router {
@@ -1031,7 +1033,6 @@ struct PeerHandle {
     sender: mpsc::UnboundedSender<Vec<u8>>,
 }
 
-#[derive(Clone, Debug)]
 #[derive(Clone, Debug)]
 struct StaticRoute {
     pattern: String,
