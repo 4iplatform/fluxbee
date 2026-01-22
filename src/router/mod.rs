@@ -482,8 +482,13 @@ async fn handle_message(
                 nodes_guard.get(&dst_uuid).cloned()
             };
             if let Some(dst_handle) = dst_handle {
-                if vpn_allows_meta(&msg.meta, &src_handle.name, src_handle.vpn_id, dst_handle.vpn_id)
-                {
+                if vpn_allows_between(
+                    &msg.meta,
+                    &src_handle.name,
+                    src_handle.vpn_id,
+                    &dst_handle.name,
+                    dst_handle.vpn_id,
+                ) {
                     senders.push(dst_handle.sender);
                 } else {
                     send_unreachable_to(msg, &src_handle.sender, router_uuid, "VPN_BLOCKED")?;
@@ -494,10 +499,11 @@ async fn handle_message(
                     peer_guard.get(&dst_uuid).cloned()
                 };
                 if let Some(peer_node) = peer {
-                    if vpn_allows_meta(
+                    if vpn_allows_between(
                         &msg.meta,
                         &src_handle.name,
                         src_handle.vpn_id,
+                        &peer_node.name,
                         peer_node.vpn_id,
                     ) {
                         if msg.routing.ttl <= 1 {
@@ -534,10 +540,11 @@ async fn handle_message(
                 if *uuid == src_uuid {
                     continue;
                 }
-                if !vpn_allows_meta(
+                if !vpn_allows_between(
                     &msg.meta,
                     &src_handle.name,
                     src_handle.vpn_id,
+                    &handle.name,
                     handle.vpn_id,
                 ) {
                     continue;
@@ -578,10 +585,11 @@ async fn handle_message(
                 }
                 ResolvedRoute::Deliver(dst_uuid) => {
                     if let Some(dst_handle) = nodes_guard.get(&dst_uuid) {
-                        if vpn_allows_meta(
+                        if vpn_allows_between(
                             &msg.meta,
                             &src_handle.name,
                             src_handle.vpn_id,
+                            &dst_handle.name,
                             dst_handle.vpn_id,
                         ) {
                             senders.push(dst_handle.sender.clone());
@@ -1094,10 +1102,11 @@ async fn handle_peer_message(
                 nodes_guard.get(&dst_uuid).cloned()
             };
             if let Some(dst_handle) = dst_handle {
-                if vpn_allows_meta(
+                if vpn_allows_between(
                     &msg.meta,
                     &src_node.name,
                     src_node.vpn_id,
+                    &dst_handle.name,
                     dst_handle.vpn_id,
                 ) {
                     senders.push(dst_handle.sender);
@@ -1115,10 +1124,11 @@ async fn handle_peer_message(
                 if *uuid == src_uuid {
                     continue;
                 }
-                if !vpn_allows_meta(
+                if !vpn_allows_between(
                     &msg.meta,
                     &src_node.name,
                     src_node.vpn_id,
+                    &handle.name,
                     handle.vpn_id,
                 ) {
                     continue;
@@ -1169,10 +1179,11 @@ async fn handle_peer_message(
                 ResolvedRoute::Drop => {}
                 ResolvedRoute::Deliver(dst_uuid) => {
                     if let Some(dst_handle) = nodes_guard.get(&dst_uuid) {
-                        if vpn_allows_meta(
+                        if vpn_allows_between(
                             &msg.meta,
                             &src_node.name,
                             src_node.vpn_id,
+                            &dst_handle.name,
                             dst_handle.vpn_id,
                         ) {
                             senders.push(dst_handle.sender.clone());
@@ -1601,11 +1612,20 @@ fn vpn_allows(src_name: &str, src_vpn: u32, dst_vpn: u32) -> bool {
     src_vpn == dst_vpn
 }
 
-fn vpn_allows_meta(meta: &Meta, src_name: &str, src_vpn: u32, dst_vpn: u32) -> bool {
+fn vpn_allows_between(
+    meta: &Meta,
+    src_name: &str,
+    src_vpn: u32,
+    dst_name: &str,
+    dst_vpn: u32,
+) -> bool {
     if meta.msg_type == SYSTEM_KIND && is_global_scope(meta) {
         return true;
     }
-    vpn_allows(src_name, src_vpn, dst_vpn)
+    if is_system_node(src_name) || is_system_node(dst_name) {
+        return true;
+    }
+    src_vpn == dst_vpn
 }
 
 fn can_route(src: &NodeHandle, dst: &NodeHandle) -> bool {
@@ -1706,7 +1726,13 @@ async fn resolve_by_name(
                 let Some(dst_handle) = nodes.get(dst_uuid) else {
                     continue;
                 };
-                if vpn_allows_meta(meta, &src.name, src.vpn_id, dst_handle.vpn_id) {
+                if vpn_allows_between(
+                    meta,
+                    &src.name,
+                    src.vpn_id,
+                    &dst_handle.name,
+                    dst_handle.vpn_id,
+                ) {
                     return Ok(ResolvedRoute::Deliver(*dst_uuid));
                 }
                 return Ok(ResolvedRoute::Unreachable("VPN_BLOCKED"));
@@ -1715,7 +1741,7 @@ async fn resolve_by_name(
                 let Some(FibNextHop::Router(peer_uuid)) = &entry.next_hop else {
                     continue;
                 };
-                if vpn_allows_meta(meta, &src.name, src.vpn_id, entry.vpn_id) {
+                if vpn_allows_between(meta, &src.name, src.vpn_id, &entry.pattern, entry.vpn_id) {
                     return Ok(ResolvedRoute::ForwardRouter(*peer_uuid));
                 }
                 return Ok(ResolvedRoute::Unreachable("VPN_BLOCKED"));
