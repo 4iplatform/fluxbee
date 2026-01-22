@@ -351,7 +351,7 @@ async fn handle_message(
                 return Ok(());
             };
             let nodes_guard = nodes.lock().await;
-            let route = resolve_by_name(target, &src_handle, &nodes_guard, static_routes).await?;
+            let route = resolve_by_name(target, &src_handle, &nodes_guard, fib).await?;
             match route {
                 ResolvedRoute::Drop => {}
                 ResolvedRoute::Unreachable(reason) => {
