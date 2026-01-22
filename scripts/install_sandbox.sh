@@ -1,16 +1,16 @@
 #!/usr/bin/env sh
 set -eu
 
-BASE_ETC="${JSR_CONFIG_DIR:-/etc/json-router}"
-BASE_VAR="${JSR_STATE_DIR:-/var/lib/json-router}"
-BASE_RUN="${JSR_SOCKET_DIR:-/var/run/json-router}"
-ISLAND_ID="${JSR_ISLAND_ID:-sandbox}"
-ROUTER_NAME="${JSR_ROUTER_NAME:-RT.primary}"
+BASE_ETC="/etc/json-router"
+BASE_STATE="/var/lib/json-router/state"
+BASE_RUN="/var/run/json-router"
+ISLAND_ID="sandbox"
+ROUTER_NAME="RT.primary"
 
 mkdir -p "${BASE_ETC}/routers" \
-  "${BASE_VAR}/state" \
-  "${BASE_VAR}/nodes" \
-  "${BASE_RUN}/nodes"
+  "${BASE_STATE}" \
+  "${BASE_STATE}/nodes" \
+  "${BASE_RUN}"
 
 if [ ! -f "${BASE_ETC}/island.yaml" ]; then
   cat > "${BASE_ETC}/island.yaml" <<EOF_ISLAND
@@ -29,8 +29,8 @@ router:
   is_gateway: false
 
 paths:
-  state_dir: ${BASE_VAR}/state
-  node_socket_dir: ${BASE_RUN}/nodes
+  state_dir: ${BASE_STATE}
+  node_socket_dir: ${BASE_RUN}
   shm_prefix: /jsr-
 
 timers:

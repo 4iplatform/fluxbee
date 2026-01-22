@@ -15,7 +15,7 @@ use json_router::shm::{
 };
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/json-router";
-const DEFAULT_STATE_DIR: &str = "/var/lib/json-router";
+const DEFAULT_STATE_DIR: &str = "/var/lib/json-router/state";
 const DEFAULT_SOCKET_DIR: &str = "/var/run/json-router";
 
 #[derive(Debug, Deserialize)]
@@ -64,15 +64,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
-    let config_dir = std::env::var("JSR_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_CONFIG_DIR));
-    let state_dir = std::env::var("JSR_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_STATE_DIR));
-    let socket_dir = std::env::var("JSR_SOCKET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_SOCKET_DIR));
+    let config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
+    let state_dir = PathBuf::from(DEFAULT_STATE_DIR);
+    let socket_dir = PathBuf::from(DEFAULT_SOCKET_DIR);
 
     ensure_dir(&state_dir)?;
 

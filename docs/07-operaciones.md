@@ -72,7 +72,7 @@ router:
 
 paths:
   state_dir: /var/lib/json-router/state
-  node_socket_dir: /var/run/json-router/nodes
+  node_socket_dir: /var/run/json-router
   shm_prefix: /jsr-
 
 timers:
@@ -94,7 +94,7 @@ router:
 
 paths:
   state_dir: /var/lib/json-router/state
-  node_socket_dir: /var/run/json-router/nodes
+  node_socket_dir: /var/run/json-router
   shm_prefix: /jsr-
 
 timers:
@@ -224,7 +224,6 @@ After=network.target
 [Service]
 Type=simple
 Environment=JSR_ROUTER_NAME=%i
-Environment=JSR_CONFIG_DIR=/etc/json-router
 Environment=JSR_LOG_LEVEL=info
 ExecStart=/usr/bin/json-router
 Restart=always
@@ -282,8 +281,9 @@ WantedBy=multi-user.target
 | Variable | Propósito | Default |
 |----------|-----------|---------|
 | `JSR_ROUTER_NAME` | Nombre del router | Requerido |
-| `JSR_CONFIG_DIR` | Directorio de config | `/etc/json-router` |
 | `JSR_LOG_LEVEL` | Nivel de log | `info` |
+
+Rutas fijas: `/etc/json-router`, `/var/lib/json-router/state`, `/var/run/json-router`.
 
 ---
 
@@ -294,8 +294,8 @@ WantedBy=multi-user.target
 ```bash
 # Crear directorios
 mkdir -p /etc/json-router/routers
-mkdir -p /var/lib/json-router/{nodes,state}
-mkdir -p /var/run/json-router/nodes
+mkdir -p /var/lib/json-router/state/nodes
+mkdir -p /var/run/json-router
 
 # Crear island.yaml
 cat > /etc/json-router/island.yaml << 'EOF'
@@ -316,7 +316,7 @@ router:
 
 paths:
   state_dir: /var/lib/json-router/state
-  node_socket_dir: /var/run/json-router/nodes
+  node_socket_dir: /var/run/json-router
   shm_prefix: /jsr-
 
 timers:
@@ -347,7 +347,7 @@ router:
 
 paths:
   state_dir: /var/lib/json-router/state
-  node_socket_dir: /var/run/json-router/nodes
+  node_socket_dir: /var/run/json-router
   shm_prefix: /jsr-
 
 timers:
@@ -390,7 +390,7 @@ systemctl status json-router@RT.primary
 ls -la /dev/shm/jsr-*
 
 # Verificar sockets
-ls -la /var/run/json-router/nodes/
+ls -la /var/run/json-router/
 ```
 
 ### 9.2 Logs
@@ -437,7 +437,7 @@ rm /dev/shm/jsr-<uuid>
 ls -la /var/run/json-router/router.sock
 
 # Verificar permisos
-stat /var/run/json-router/nodes/
+stat /var/run/json-router/
 ```
 
 ### 10.4 Inter-isla no funciona

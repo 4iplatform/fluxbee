@@ -16,15 +16,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
-    let config_dir = std::env::var("JSR_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/etc/json-router"));
-    let socket_dir = std::env::var("JSR_SOCKET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/var/run/json-router"));
-    let nodes_dir = std::env::var("JSR_NODE_UUID_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/var/lib/json-router/nodes"));
+    let config_dir = PathBuf::from("/etc/json-router");
+    let socket_dir = PathBuf::from("/var/run/json-router");
+    let nodes_dir = PathBuf::from("/var/lib/json-router/state/nodes");
 
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("echo");

@@ -1,10 +1,13 @@
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use uuid::Uuid;
+
+const DEFAULT_CONFIG_DIR: &str = "/etc/json-router";
+const DEFAULT_STATE_DIR: &str = "/var/lib/json-router/state";
+const DEFAULT_SOCKET_DIR: &str = "/var/run/json-router";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -64,17 +67,11 @@ struct IdentityShm {
 
 impl RouterConfig {
     pub fn load_from_env() -> Result<Self, ConfigError> {
-        let router_name = env::var("JSR_ROUTER_NAME")
+        let router_name = std::env::var("JSR_ROUTER_NAME")
             .map_err(|_| ConfigError::MissingRouterName)?;
-        let config_dir = env::var("JSR_CONFIG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/etc/json-router"));
-        let state_dir = env::var("JSR_STATE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/var/lib/json-router/state"));
-        let socket_dir = env::var("JSR_SOCKET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/var/run/json-router"));
+        let config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
+        let state_dir = PathBuf::from(DEFAULT_STATE_DIR);
+        let socket_dir = PathBuf::from(DEFAULT_SOCKET_DIR);
         let node_socket_path = socket_dir.join("router.sock");
         let shm_prefix = "/jsr-".to_string();
         let island_path = config_dir.join("island.yaml");

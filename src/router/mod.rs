@@ -485,6 +485,9 @@ async fn refresh_config(
 ) -> Option<ConfigSnapshot> {
     let snapshot = {
         let mut reader = config_reader.lock().await;
+        if force {
+            *reader = None;
+        }
         if reader.is_none() {
             if let Ok(new_reader) =
                 ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", island_id))
@@ -498,6 +501,27 @@ async fn refresh_config(
         return None;
     };
     let mut version_guard = config_version.lock().await;
+    if force && snapshot.header.config_version == *version_guard {
+        let mut reader = config_reader.lock().await;
+        *reader = None;
+        if let Ok(new_reader) = ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", island_id)) {
+            *reader = Some(new_reader);
+        }
+        if let Some(new_snapshot) = reader.as_ref().and_then(|r| r.read_snapshot()) {
+            if new_snapshot.header.config_version != snapshot.header.config_version {
+                return refresh_config(
+                    config_reader,
+                    static_routes,
+                    config_version,
+                    island_id,
+                    nodes,
+                    shm,
+                    false,
+                )
+                .await;
+            }
+        }
+    }
     if force || snapshot.header.config_version != *version_guard {
         let mut routes_guard = static_routes.lock().await;
         *routes_guard = snapshot
