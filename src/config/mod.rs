@@ -8,6 +8,11 @@ use uuid::Uuid;
 const DEFAULT_CONFIG_DIR: &str = "/etc/json-router";
 const DEFAULT_STATE_DIR: &str = "/var/lib/json-router/state";
 const DEFAULT_SOCKET_DIR: &str = "/var/run/json-router/routers";
+const DEFAULT_SHM_PREFIX: &str = "/jsr-";
+const DEFAULT_HELLO_INTERVAL_MS: u64 = 10_000;
+const DEFAULT_DEAD_INTERVAL_MS: u64 = 40_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_HEARTBEAT_STALE_MS: u64 = 30_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -31,15 +36,66 @@ pub struct RouterConfig {
     pub island_id: String,
     pub config_dir: PathBuf,
     pub state_dir: PathBuf,
+    pub node_socket_dir: PathBuf,
     pub node_socket_path: PathBuf,
     pub shm_name: String,
     pub shm_prefix: String,
     pub is_gateway: bool,
+    pub hello_interval_ms: u64,
+    pub dead_interval_ms: u64,
+    pub heartbeat_interval_ms: u64,
+    pub heartbeat_stale_ms: u64,
+    pub wan_listen: Option<String>,
+    pub wan_uplinks: Vec<String>,
+    pub wan_authorized_islands: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct IslandFile {
     island_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RouterConfigFile {
+    router: RouterSection,
+    paths: Option<PathsSection>,
+    timers: Option<TimersSection>,
+    wan: Option<WanSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RouterSection {
+    name: String,
+    island_id: String,
+    #[serde(default)]
+    is_gateway: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PathsSection {
+    state_dir: Option<String>,
+    node_socket_dir: Option<String>,
+    shm_prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TimersSection {
+    hello_interval_ms: Option<u64>,
+    dead_interval_ms: Option<u64>,
+    heartbeat_interval_ms: Option<u64>,
+    heartbeat_stale_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WanSection {
+    listen: Option<String>,
+    uplinks: Option<Vec<WanUplink>>,
+    authorized_islands: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WanUplink {
+    address: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,17 +125,90 @@ impl RouterConfig {
     pub fn load_from_env() -> Result<Self, ConfigError> {
         let router_name = std::env::var("JSR_ROUTER_NAME")
             .map_err(|_| ConfigError::MissingRouterName)?;
-        let config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
-        let state_dir = PathBuf::from(DEFAULT_STATE_DIR);
-        let socket_dir = PathBuf::from(DEFAULT_SOCKET_DIR);
-        let shm_prefix = "/jsr-".to_string();
-        let island_path = config_dir.join("island.yaml");
-        if !island_path.exists() {
-            return Err(ConfigError::MissingIsland);
+        let config_dir = PathBuf::from(
+            std::env::var("JSR_CONFIG_DIR").unwrap_or_else(|_| DEFAULT_CONFIG_DIR.to_string()),
+        );
+
+        let mut router_name_cfg = None;
+        let island_id_cfg;
+        let mut is_gateway = false;
+        let mut state_dir = PathBuf::from(DEFAULT_STATE_DIR);
+        let mut node_socket_dir = PathBuf::from(DEFAULT_SOCKET_DIR);
+        let mut shm_prefix = DEFAULT_SHM_PREFIX.to_string();
+        let mut hello_interval_ms = DEFAULT_HELLO_INTERVAL_MS;
+        let mut dead_interval_ms = DEFAULT_DEAD_INTERVAL_MS;
+        let mut heartbeat_interval_ms = DEFAULT_HEARTBEAT_INTERVAL_MS;
+        let mut heartbeat_stale_ms = DEFAULT_HEARTBEAT_STALE_MS;
+        let mut wan_listen = None;
+        let mut wan_uplinks = Vec::new();
+        let mut wan_authorized_islands = Vec::new();
+
+        if let Some(config_path) = find_router_config(&config_dir, &router_name) {
+            let data = std::fs::read_to_string(&config_path)?;
+            let cfg: RouterConfigFile = serde_yaml::from_str(&data)?;
+            router_name_cfg = Some(cfg.router.name);
+            island_id_cfg = Some(cfg.router.island_id);
+            is_gateway = cfg.router.is_gateway;
+
+            if let Some(paths) = cfg.paths {
+                if let Some(value) = paths.state_dir {
+                    state_dir = PathBuf::from(value);
+                }
+                if let Some(value) = paths.node_socket_dir {
+                    node_socket_dir = PathBuf::from(value);
+                }
+                if let Some(value) = paths.shm_prefix {
+                    shm_prefix = value;
+                }
+            }
+            if let Some(timers) = cfg.timers {
+                if let Some(value) = timers.hello_interval_ms {
+                    hello_interval_ms = value;
+                }
+                if let Some(value) = timers.dead_interval_ms {
+                    dead_interval_ms = value;
+                }
+                if let Some(value) = timers.heartbeat_interval_ms {
+                    heartbeat_interval_ms = value;
+                }
+                if let Some(value) = timers.heartbeat_stale_ms {
+                    heartbeat_stale_ms = value;
+                }
+            }
+            if let Some(wan) = cfg.wan {
+                wan_listen = wan.listen;
+                if let Some(uplinks) = wan.uplinks {
+                    for uplink in uplinks {
+                        wan_uplinks.push(uplink.address);
+                    }
+                }
+                if let Some(islands) = wan.authorized_islands {
+                    wan_authorized_islands = islands;
+                }
+            }
+        } else {
+            let island_path = config_dir.join("island.yaml");
+            if !island_path.exists() {
+                return Err(ConfigError::MissingIsland);
+            }
+            let data = std::fs::read_to_string(&island_path)?;
+            let island: IslandFile = serde_yaml::from_str(&data)?;
+            island_id_cfg = Some(island.island_id);
         }
-        let data = std::fs::read_to_string(&island_path)?;
-        let island: IslandFile = serde_yaml::from_str(&data)?;
-        let router_l2_name = ensure_l2_name(&router_name, &island.island_id);
+
+        if let Ok(value) = std::env::var("JSR_STATE_DIR") {
+            state_dir = PathBuf::from(value);
+        }
+        if let Ok(value) = std::env::var("JSR_SOCKET_DIR") {
+            node_socket_dir = PathBuf::from(value);
+        }
+        if let Ok(value) = std::env::var("JSR_SHM_PREFIX") {
+            shm_prefix = value;
+        }
+
+        let router_name = router_name_cfg.unwrap_or(router_name);
+        let island_id = island_id_cfg.ok_or(ConfigError::MissingIsland)?;
+        let router_l2_name = ensure_l2_name(&router_name, &island_id);
         let identity_path = identity_path(&state_dir, &router_l2_name);
         let (router_uuid, shm_name) = if identity_path.exists() {
             let identity_raw = fs::read_to_string(&identity_path)?;
@@ -94,18 +223,26 @@ impl RouterConfig {
             fs::write(&identity_path, identity)?;
             (uuid, shm_name)
         };
-        let node_socket_path = socket_dir.join(format!("{}.sock", router_uuid.simple()));
+        let node_socket_path = node_socket_dir.join(format!("{}.sock", router_uuid.simple()));
         Ok(Self {
             router_name,
             router_l2_name,
             router_uuid,
-            island_id: island.island_id,
+            island_id,
             config_dir,
             state_dir,
+            node_socket_dir,
             node_socket_path,
             shm_name,
             shm_prefix,
-            is_gateway: false,
+            is_gateway,
+            hello_interval_ms,
+            dead_interval_ms,
+            heartbeat_interval_ms,
+            heartbeat_stale_ms,
+            wan_listen,
+            wan_uplinks,
+            wan_authorized_islands,
         })
     }
 }
@@ -120,6 +257,22 @@ fn ensure_l2_name(name: &str, island_id: &str) -> String {
 
 fn identity_path(state_dir: &Path, router_l2_name: &str) -> PathBuf {
     state_dir.join(router_l2_name).join("identity.yaml")
+}
+
+fn find_router_config(config_dir: &Path, router_name: &str) -> Option<PathBuf> {
+    let routers_dir = config_dir.join("routers");
+    let entries = std::fs::read_dir(&routers_dir).ok()?;
+    let mut matches = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(&format!("{}@", router_name)) {
+            matches.push(entry.path().join("config.yaml"));
+        }
+    }
+    if matches.len() == 1 {
+        return Some(matches.remove(0));
+    }
+    None
 }
 
 fn build_identity_yaml(router_l2_name: &str, uuid: Uuid, shm_name: &str) -> Result<String, ConfigError> {

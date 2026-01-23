@@ -73,6 +73,41 @@ pub struct RouterHelloPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WanHelloPayload {
+    pub protocol: String,
+    pub router_id: String,
+    pub router_name: String,
+    pub island_id: String,
+    pub capabilities: Vec<String>,
+    pub timers: WanTimers,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WanTimers {
+    pub hello_interval_ms: u64,
+    pub dead_interval_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WanAcceptPayload {
+    pub peer_router_id: String,
+    pub negotiated: WanNegotiated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WanNegotiated {
+    pub protocol: String,
+    pub hello_interval_ms: u64,
+    pub dead_interval_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WanRejectPayload {
+    pub reason: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeAnnouncePayload {
     pub uuid: String,
     pub name: String,
@@ -137,13 +172,16 @@ pub struct LsaNode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LsaRoute {
     pub prefix: String,
+    pub match_kind: String,
     pub action: String,
     pub next_hop_island: String,
+    pub metric: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LsaVpn {
     pub pattern: String,
+    pub match_kind: String,
     pub vpn_id: u32,
 }
 
@@ -156,6 +194,8 @@ pub const MSG_TTL_EXCEEDED: &str = "TTL_EXCEEDED";
 pub const MSG_ECHO: &str = "ECHO";
 pub const MSG_ECHO_REPLY: &str = "ECHO_REPLY";
 pub const MSG_LSA: &str = "LSA";
+pub const MSG_WAN_ACCEPT: &str = "WAN_ACCEPT";
+pub const MSG_WAN_REJECT: &str = "WAN_REJECT";
 pub const MSG_TIME_SYNC: &str = "TIME_SYNC";
 pub const MSG_WITHDRAW: &str = "WITHDRAW";
 pub const MSG_CONFIG_CHANGED: &str = "CONFIG_CHANGED";
@@ -217,6 +257,53 @@ pub fn build_router_hello(
         1,
         trace_id,
         MSG_HELLO,
+        json!(payload),
+    )
+}
+
+pub fn build_wan_hello(
+    src: &str,
+    trace_id: &str,
+    payload: WanHelloPayload,
+) -> Message {
+    build_system_message(
+        src,
+        Destination::Resolve,
+        1,
+        trace_id,
+        MSG_HELLO,
+        json!(payload),
+    )
+}
+
+pub fn build_wan_accept(
+    src: &str,
+    dst: &str,
+    trace_id: &str,
+    payload: WanAcceptPayload,
+) -> Message {
+    build_system_message(
+        src,
+        Destination::Unicast(dst.to_string()),
+        1,
+        trace_id,
+        MSG_WAN_ACCEPT,
+        json!(payload),
+    )
+}
+
+pub fn build_wan_reject(
+    src: &str,
+    dst: &str,
+    trace_id: &str,
+    payload: WanRejectPayload,
+) -> Message {
+    build_system_message(
+        src,
+        Destination::Unicast(dst.to_string()),
+        1,
+        trace_id,
+        MSG_WAN_REJECT,
         json!(payload),
     )
 }

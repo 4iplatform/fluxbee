@@ -309,7 +309,7 @@ pub struct ConfigHeaderSnapshot {
     pub heartbeat: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LsaSnapshot {
     pub header: LsaHeaderSnapshot,
     pub islands: Vec<RemoteIslandEntry>,
