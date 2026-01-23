@@ -1701,6 +1701,26 @@ async fn resolve_by_name(
     fib: &Arc<Mutex<Vec<FibEntry>>>,
     meta: &Meta,
 ) -> Result<ResolvedRoute, RouterError> {
+    if let Some(base) = target.strip_suffix("@*") {
+        if let Some(src_island) = extract_island(&src.name) {
+            let local_target = format!("{}@{}", base, src_island);
+            let local = resolve_by_name_inner(&local_target, src, nodes, fib, meta).await?;
+            if !matches!(local, ResolvedRoute::Unreachable("NODE_NOT_FOUND")) {
+                return Ok(local);
+            }
+        }
+        return resolve_by_name_any_island(base, src, nodes, fib, meta).await;
+    }
+    resolve_by_name_inner(target, src, nodes, fib, meta).await
+}
+
+async fn resolve_by_name_inner(
+    target: &str,
+    src: &NodeHandle,
+    nodes: &std::collections::HashMap<Uuid, NodeHandle>,
+    fib: &Arc<Mutex<Vec<FibEntry>>>,
+    meta: &Meta,
+) -> Result<ResolvedRoute, RouterError> {
     let fib_guard = fib.lock().await;
     for entry in fib_guard.iter() {
         if !pattern_match_kind(entry.match_kind, &entry.pattern, target) {
@@ -1749,4 +1769,76 @@ async fn resolve_by_name(
         }
     }
     Ok(ResolvedRoute::Unreachable("NODE_NOT_FOUND"))
+}
+
+async fn resolve_by_name_any_island(
+    base: &str,
+    src: &NodeHandle,
+    nodes: &std::collections::HashMap<Uuid, NodeHandle>,
+    fib: &Arc<Mutex<Vec<FibEntry>>>,
+    meta: &Meta,
+) -> Result<ResolvedRoute, RouterError> {
+    let fib_guard = fib.lock().await;
+    for entry in fib_guard.iter() {
+        let matched = match entry.source {
+            FibSource::LocalNode | FibSource::PeerNode => {
+                match_any_island(base, &entry.pattern)
+            }
+            FibSource::StaticRoute => {
+                let target = format!("{}@*", base);
+                pattern_match_kind(entry.match_kind, &entry.pattern, &target)
+            }
+        };
+        if !matched {
+            continue;
+        }
+        match entry.source {
+            FibSource::StaticRoute => match entry.action {
+                ACTION_DROP => return Ok(ResolvedRoute::Drop),
+                ACTION_FORWARD => {
+                    if let Some(FibNextHop::Island(island)) = &entry.next_hop {
+                        return Ok(ResolvedRoute::ForwardIsland(island.clone()));
+                    }
+                    continue;
+                }
+                _ => continue,
+            },
+            FibSource::LocalNode => {
+                let Some(FibNextHop::Local(dst_uuid)) = &entry.next_hop else {
+                    continue;
+                };
+                let Some(dst_handle) = nodes.get(dst_uuid) else {
+                    continue;
+                };
+                if vpn_allows_between(meta, &src.name, src.vpn_id, &dst_handle.name, dst_handle.vpn_id) {
+                    return Ok(ResolvedRoute::Deliver(*dst_uuid));
+                }
+                return Ok(ResolvedRoute::Unreachable("VPN_BLOCKED"));
+            }
+            FibSource::PeerNode => {
+                let Some(FibNextHop::Router(peer_uuid)) = &entry.next_hop else {
+                    continue;
+                };
+                if vpn_allows_between(meta, &src.name, src.vpn_id, &entry.pattern, entry.vpn_id) {
+                    return Ok(ResolvedRoute::ForwardRouter(*peer_uuid));
+                }
+                return Ok(ResolvedRoute::Unreachable("VPN_BLOCKED"));
+            }
+        }
+    }
+    Ok(ResolvedRoute::Unreachable("NODE_NOT_FOUND"))
+}
+
+fn extract_island(name: &str) -> Option<&str> {
+    name.split_once('@').map(|(_, island)| island)
+}
+
+fn match_any_island(base: &str, full_name: &str) -> bool {
+    let Some((name_base, _)) = full_name.split_once('@') else {
+        return false;
+    };
+    if base.contains('*') {
+        return wildcard_match(base.as_bytes(), name_base.as_bytes());
+    }
+    name_base == base
 }
