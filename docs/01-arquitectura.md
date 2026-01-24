@@ -92,9 +92,29 @@ Forward directo      ┌──────────────────�
 | Nodo SY | Provee servicios de infraestructura (tiempo, monitoreo, admin). |
 | Router | Detecta nodos, conecta sockets, mantiene tabla local, consulta OPA si hace falta, rutea, detecta link down. |
 | Gateway | Router especial que conecta islas entre sí via TCP/WAN. |
+| **SY.orchestrator** | **Proceso raíz de la isla. Levanta router, nodos SY, y gestiona ciclo de vida.** |
 | Shared Memory | Tablas de estado compartidas. Tres tipos de regiones (ver sección 7). |
 | OPA (WASM) | Evalúa policies de negocio. No accede a estado del sistema. |
 | Librería de Nodo | Común a todos los nodos. Maneja protocolo de socket, framing, retry, reconexión. |
+
+### 4.1 Arranque de la Isla
+
+```
+Usuario ejecuta: systemctl start sy-orchestrator
+                        │
+                        ▼
+              ┌─────────────────────┐
+              │  SY.orchestrator    │ ← Proceso raíz
+              └─────────────────────┘
+                        │
+          ┌─────────────┼─────────────┐
+          ▼             ▼             ▼
+    RT.gateway     SY.admin     SY.config.routes
+    (router)       (API HTTP)   (rutas/VPN)
+          │
+          ▼
+    Isla operativa
+```
 
 ---
 
@@ -113,22 +133,37 @@ Forward directo      ┌──────────────────�
 
 ### 6.1 Identidad de Isla
 
-Toda instancia (routers y nodos) opera dentro de una **isla**, definida por:
+Toda instancia opera dentro de una **isla**, definida por el **único archivo de configuración**:
 
 ```
 /etc/json-router/island.yaml
 ```
 
-Contenido mínimo:
+**Ejemplo mínimo:**
 
 ```yaml
 island_id: "produccion"
 ```
 
+**Ejemplo con WAN:**
+
+```yaml
+island_id: "produccion"
+
+wan:
+  listen: "0.0.0.0:9000"
+  uplinks:
+    - address: "staging.internal:9000"
+
+admin:
+  listen: "127.0.0.1:8080"
+```
+
 **Reglas:**
-- Todos los procesos de la isla leen este archivo al arrancar.
-- Si no existe `island.yaml`, el proceso NO arranca.
-- La isla se asigna una vez al inicio y no cambia durante la ejecución.
+- Es el **único archivo** que el usuario crea/edita.
+- Si no existe, el sistema NO arranca.
+- Todo lo demás (rutas, VPN, nodos) se configura via API.
+- Ver `07-operaciones.md` para detalle completo.
 
 ### 6.2 Definición de Isla
 

@@ -1,239 +1,223 @@
 # JSON Router - 07 Operaciones
 
 **Estado:** v1.13  
-**Fecha:** 2025-01-20  
+**Fecha:** 2025-01-22  
 **Audiencia:** Ops/SRE, desarrolladores de deployment
 
 ---
 
-## 1. Estructura de Directorios
+## 1. Filosofía de Configuración
 
-```
-/etc/json-router/                      # Configuración
-├── island.yaml                        # Identidad de isla (OBLIGATORIO)
-├── sy-config-routes.yaml              # Config de rutas y VPN
-└── routers/                           # Config por router
-    ├── RT.primary@produccion/
-    │   └── config.yaml
-    └── RT.gateway@produccion/
-        └── config.yaml
+**Principio:** El usuario configura solo lo que depende de su infraestructura. El sistema maneja todo lo demás con defaults internos.
 
-/var/lib/json-router/                  # Estado persistente
-└── state/                             # Estado de runtime
-    ├── nodes/                         # UUIDs de nodos
-    │   └── AI.soporte.l1.uuid
-    └── RT.primary@produccion/
-        └── identity.yaml
-
-/var/run/json-router/                  # Runtime (volátil)
-├── routers/
-│   └── <router-uuid>.sock             # Socket del router
-└── irp-<router-uuid>.sock             # Socket IRP del router
-
-Los clientes pueden conectar a `/var/run/json-router/routers` y la librería elige un router disponible.
-
-/dev/shm/                              # Shared memory
-├── jsr-<router-uuid>                  # Región de cada router
-├── jsr-config-<island>                # Región de config
-└── jsr-lsa-<island>                   # Región de LSA
-```
+| Configura el usuario | Maneja el sistema |
+|---------------------|-------------------|
+| `island_id` | Qué nodos SY arrancan |
+| IP/puerto del gateway WAN | Timers internos |
+| Uplinks a otras islas | Límites (MAX_NODES, etc.) |
+| Puerto del API HTTP | Paths de directorios |
+| Node registry (opcional) | Orden de arranque |
 
 ---
 
-## 2. Archivo: island.yaml (OBLIGATORIO)
+## 2. Un Solo Archivo: island.yaml
 
-Define la identidad de la isla. **Todos los procesos lo leen al arrancar.**
+```
+/etc/json-router/
+└── island.yaml    ← ÚNICO archivo de configuración
+```
+
+Todo lo demás es auto-generado o manejado via API.
+
+### 2.1 Ejemplo Mínimo (desarrollo local)
 
 ```yaml
 # /etc/json-router/island.yaml
-
-island_id: "produccion"
+island_id: dev
 ```
 
-**Sin este archivo, ningún proceso arranca.**
+Con esto el sistema:
+- Levanta RT.gateway (sin WAN, isla standalone)
+- Levanta SY.admin en puerto 8080
+- Levanta SY.config.routes
+- Levanta SY.opa.rules
+- Queda listo para recibir conexiones
 
-### 2.1 Campos
-
-| Campo | Obligatorio | Descripción |
-|-------|-------------|-------------|
-| `island_id` | Sí | Identificador único de la isla |
-
----
-
-## 3. Archivo: config.yaml (Router)
-
-Configuración del router. Autosuficiente.
+### 2.2 Ejemplo Producción
 
 ```yaml
-# /etc/json-router/routers/RT.primary@produccion/config.yaml
+# /etc/json-router/island.yaml
+island_id: produccion
 
-router:
-  name: RT.primary                     # Sin @isla
-  island_id: produccion
-  is_gateway: false
+# WAN - conexión a otras islas (opcional)
+wan:
+  listen: "0.0.0.0:9000"
+  uplinks:
+    - address: "staging.internal:9000"
+    - address: "desarrollo.internal:9000"
 
-paths:
-  state_dir: /var/lib/json-router/state
-  node_socket_dir: /var/run/json-router/routers
-  shm_prefix: /jsr-
-
-timers:
-  hello_interval_ms: 10000
-  dead_interval_ms: 40000
-  heartbeat_interval_ms: 5000
-  heartbeat_stale_ms: 30000
+# API HTTP (opcional, default: 0.0.0.0:8080)
+admin:
+  listen: "127.0.0.1:8080"
 ```
 
-### 3.1 Config de Gateway
+### 2.3 Ejemplo con Node Registry
 
 ```yaml
-# /etc/json-router/routers/RT.gateway@produccion/config.yaml
-
-router:
-  name: RT.gateway
-  island_id: produccion
-  is_gateway: true                     # <-- Diferencia clave
-
-paths:
-  state_dir: /var/lib/json-router/state
-  node_socket_dir: /var/run/json-router/routers
-  shm_prefix: /jsr-
-
-timers:
-  hello_interval_ms: 10000
-  dead_interval_ms: 40000
-  heartbeat_interval_ms: 5000
-  heartbeat_stale_ms: 30000
+# /etc/json-router/island.yaml
+island_id: produccion
 
 wan:
   listen: "0.0.0.0:9000"
   uplinks:
-    - address: "10.0.1.100:9000"       # staging
-    - address: "10.0.2.100:9000"       # desarrollo
-  authorized_islands:
-    - staging
-    - desarrollo
+    - address: "staging.internal:9000"
+
+# Registry de nodos disponibles para run_node
+nodes:
+  AI.soporte:
+    executor: docker
+    image: "ai-soporte:1.2.0"
+    
+  AI.ventas:
+    executor: docker
+    image: "ai-ventas:latest"
+    
+  WF.crm:
+    executor: process
+    binary: /opt/wf/crm
+```
+
+### 2.4 Campos de island.yaml
+
+| Campo | Obligatorio | Default | Descripción |
+|-------|-------------|---------|-------------|
+| `island_id` | **Sí** | - | Identificador único de la isla |
+| `wan.listen` | No | (sin WAN) | IP:puerto para conexiones de otras islas |
+| `wan.uplinks[]` | No | [] | Lista de gateways remotos |
+| `admin.listen` | No | `0.0.0.0:8080` | IP:puerto del API HTTP |
+| `nodes` | No | {} | Registry de tipos de nodo |
+
+---
+
+## 3. SY.orchestrator: Proceso Raíz
+
+El único proceso que se inicia manualmente. Él levanta todo lo demás.
+
+```bash
+# Esto es todo lo que el usuario ejecuta:
+systemctl start sy-orchestrator
+```
+
+### 3.1 Secuencia de Bootstrap
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ FASE 0: Inicialización                                       │
+├──────────────────────────────────────────────────────────────┤
+│ - Leer /etc/json-router/island.yaml                         │
+│ - Validar island_id presente                                │
+│ - Crear directorios si no existen                           │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ FASE 1: Router Gateway                                       │
+├──────────────────────────────────────────────────────────────┤
+│ - Ejecutar RT.gateway                                        │
+│ - Esperar creación de jsr-<uuid> en /dev/shm                │
+│ - Esperar socket disponible                                  │
+│ - Si WAN configurado: establecer conexiones                  │
+│ - Timeout 30s → FATAL                                        │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ FASE 2: SY.orchestrator se conecta                           │
+├──────────────────────────────────────────────────────────────┤
+│ - Conectar al router como nodo                               │
+│ - HELLO → ANNOUNCE                                           │
+│ - Ahora puede enviar/recibir mensajes                        │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ FASE 3: Nodos SY de Infraestructura                          │
+├──────────────────────────────────────────────────────────────┤
+│ - Ejecutar SY.admin (API HTTP)                               │
+│ - Ejecutar SY.config.routes (crea jsr-config-<island>)       │
+│ - Ejecutar SY.opa.rules                                      │
+│ - Esperar que todos conecten al router                       │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ FASE 4: Isla Operativa                                       │
+├──────────────────────────────────────────────────────────────┤
+│ - Log: "Island {island_id} ready"                            │
+│ - API disponible en admin.listen                             │
+│ - Entrar en loop principal:                                  │
+│   • Procesar mensajes admin (run_node, kill_node, etc.)     │
+│   • Monitorear salud de procesos hijos                       │
+│   • Reiniciar procesos caídos (política interna)            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 Lo que el Sistema Decide (No Configurable)
+
+| Aspecto | Valor | Razón |
+|---------|-------|-------|
+| Nodos SY que arrancan | admin, config.routes, opa.rules | Infraestructura mínima |
+| Orden de arranque | gateway → orchestrator → SY.* | Dependencias |
+| Timeouts de arranque | 30s por componente | Suficiente para cualquier hardware |
+| Política de restart | Reintentar 3 veces, luego log error | Balance entre resiliencia y no loops infinitos |
+| Paths de directorios | /etc, /var/lib, /var/run, /dev/shm | Estándar Linux |
+
+---
+
+## 4. Estructura de Directorios
+
+```
+/etc/json-router/                      # Configuración
+└── island.yaml                        # ÚNICO archivo
+
+/var/lib/json-router/                  # Estado persistente (auto-generado)
+├── state/
+│   ├── identity.yaml                  # UUID del router gateway
+│   └── nodes/                         # UUIDs de nodos
+│       └── AI.soporte.l1.uuid
+├── config-routes.yaml                 # Rutas/VPN (modificado via API)
+└── opa-rules/                         # Policies (modificado via API)
+
+/var/run/json-router/                  # Runtime (volátil)
+├── routers/
+│   └── <router-uuid>.sock             # Socket del router
+└── orchestrator.pid                   # PID del orchestrator
+
+/dev/shm/                              # Shared memory
+├── jsr-<router-uuid>                  # Región del router
+├── jsr-config-<island>                # Región de config
+└── jsr-lsa-<island>                   # Región LSA (si hay WAN)
 ```
 
 ---
 
-## 4. Archivo: identity.yaml (Auto-generado)
+## 5. Systemd
 
-Estado de hardware/runtime. **Se genera en primer arranque.**
-
-```yaml
-# /var/lib/json-router/state/RT.primary@produccion/identity.yaml
-
-layer1:
-  uuid: a1b2c3d4-e5f6-7890-abcd-ef1234567890
-
-layer2:
-  name: RT.primary@produccion
-
-shm:
-  name: /jsr-a1b2c3d4-e5f6-7890-abcd-ef1234567890
-
-created_at: 2025-01-17T10:30:00Z
-```
-
-**Nunca se edita manualmente.**
-
-El socket del router se nombra con ese UUID:
-`/var/run/json-router/routers/<uuid>.sock`
-
----
-
-## 5. Flujo de Arranque
-
-### 5.1 Router Normal
-
-```
-1. Leer /etc/json-router/island.yaml
-   → Si no existe: EXIT con error
-
-2. Leer config.yaml del router
-   → Si no existe: usar defaults
-
-3. Leer o generar identity.yaml
-   → Si no existe: generar UUID, crear archivo
-
-4. Crear/reclamar región SHM jsr-<uuid>
-   → Verificar si es stale
-   → Inicializar header
-
-5. Leer jsr-config-<island> (si existe)
-   → Cargar rutas estáticas y VPN
-
-6. Leer jsr-lsa-<island> (si existe)
-   → Cargar topología remota
-
-7. Iniciar loop principal:
-   - Aceptar conexiones de nodos
-   - Procesar mensajes
-   - Actualizar heartbeat
-```
-
-### 5.2 Gateway
-
-```
-1-4. (Igual que router normal)
-
-5. Crear región SHM jsr-lsa-<island>
-   → Solo el gateway la crea
-
-6. Leer jsr-config-<island>
-
-7. Establecer conexiones WAN:
-   - listen en wan.listen
-   - connect a cada wan.uplinks[]
-
-8. Iniciar loop principal:
-   - (Igual que router normal)
-   - Recibir/enviar LSA
-   - Escribir en jsr-lsa
-```
-
-### 5.3 SY.config.routes
-
-```
-1. Leer /etc/json-router/island.yaml
-
-2. Leer sy-config-routes.yaml
-   → Si no existe: crear vacío
-
-3. Crear/reclamar región jsr-config-<island>
-
-4. Escribir rutas y VPNs en la región
-
-5. Conectar al router como nodo normal (HELLO)
-
-6. Iniciar loop principal:
-   - Escuchar requests de API
-   - Actualizar config
-   - Escribir en SHM
-   - Persistir en YAML
-```
-
----
-
-## 6. Systemd
-
-### 6.1 Router Service (template)
+### 5.1 Único Service Necesario
 
 ```ini
-# /etc/systemd/system/json-router@.service
+# /etc/systemd/system/sy-orchestrator.service
 [Unit]
-Description=JSON Router %i
+Description=JSON Router Island Orchestrator
 After=network.target
 
 [Service]
 Type=simple
-Environment=JSR_ROUTER_NAME=%i
-Environment=JSR_LOG_LEVEL=info
-ExecStart=/usr/bin/json-router
+ExecStart=/usr/bin/sy-orchestrator
 Restart=always
-RestartSec=5
+RestartSec=10
 
+# Seguridad
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -243,143 +227,153 @@ ReadWritePaths=/var/lib/json-router /var/run/json-router /dev/shm
 WantedBy=multi-user.target
 ```
 
-**Uso:**
+### 5.2 Uso
 
 ```bash
-systemctl enable json-router@RT.primary
-systemctl start json-router@RT.primary
-```
+# Instalar
+systemctl enable sy-orchestrator
 
-### 6.2 SY.config.routes Service
+# Arrancar isla
+systemctl start sy-orchestrator
 
-```ini
-# /etc/systemd/system/sy-config-routes.service
-[Unit]
-Description=JSON Router Config Service
-After=network.target json-router@RT.primary.service
+# Ver estado
+systemctl status sy-orchestrator
 
-[Service]
-Type=simple
-ExecStart=/usr/bin/sy-config-routes
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### 6.3 Orden de Arranque
-
-```
-1. json-router@RT.gateway (si existe)
-2. json-router@RT.primary
-3. json-router@RT.secondary (si existe)
-4. sy-config-routes
-5. Otros nodos SY.*
-6. Nodos de aplicación (AI, WF, IO)
+# Parar isla (shutdown ordenado)
+systemctl stop sy-orchestrator
 ```
 
 ---
 
-## 7. Variables de Entorno
+## 6. Deployment: Ejemplos
 
-| Variable | Propósito | Default |
-|----------|-----------|---------|
-| `JSR_ROUTER_NAME` | Nombre del router | Requerido |
-| `JSR_LOG_LEVEL` | Nivel de log | `info` |
-
-Rutas fijas: `/etc/json-router`, `/var/lib/json-router/state`, `/var/run/json-router/routers`.
-
----
-
-## 8. Deployment: Ejemplo Completo
-
-### 8.1 Preparar Isla
+### 6.1 Isla Standalone (Desarrollo)
 
 ```bash
-# Crear directorios
-mkdir -p /etc/json-router/routers
-mkdir -p /var/lib/json-router/state/nodes
-mkdir -p /var/run/json-router/routers
+# 1. Crear directorio
+mkdir -p /etc/json-router
 
-# Crear island.yaml
+# 2. Crear config mínima
+echo 'island_id: dev' > /etc/json-router/island.yaml
+
+# 3. Arrancar
+systemctl start sy-orchestrator
+
+# 4. Verificar
+curl http://localhost:8080/health
+```
+
+### 6.2 Isla Conectada (Producción)
+
+```bash
+# 1. Crear config
 cat > /etc/json-router/island.yaml << 'EOF'
-island_id: "produccion"
-EOF
-```
-
-### 8.2 Configurar Gateway
-
-```bash
-mkdir -p /etc/json-router/routers/RT.gateway@produccion
-
-cat > /etc/json-router/routers/RT.gateway@produccion/config.yaml << 'EOF'
-router:
-  name: RT.gateway
-  island_id: produccion
-  is_gateway: true
-
-paths:
-  state_dir: /var/lib/json-router/state
-  node_socket_dir: /var/run/json-router/routers
-  shm_prefix: /jsr-
-
-timers:
-  hello_interval_ms: 10000
-  dead_interval_ms: 40000
-  heartbeat_interval_ms: 5000
-  heartbeat_stale_ms: 30000
+island_id: produccion
 
 wan:
   listen: "0.0.0.0:9000"
   uplinks:
-    - address: "staging.internal:9000"
-  authorized_islands:
-    - staging
+    - address: "staging.example.com:9000"
+
+admin:
+  listen: "127.0.0.1:8080"
+
+nodes:
+  AI.soporte:
+    executor: docker
+    image: "myregistry/ai-soporte:1.0"
 EOF
+
+# 2. Arrancar
+systemctl start sy-orchestrator
+
+# 3. Levantar nodos via API
+curl -X POST http://localhost:8080/nodes \
+  -H "Content-Type: application/json" \
+  -d '{"type": "AI.soporte", "instance": "l1"}'
 ```
 
-### 8.3 Configurar Router Normal
+---
 
-```bash
-mkdir -p /etc/json-router/routers/RT.primary@produccion
+## 7. API del Orchestrator
 
-cat > /etc/json-router/routers/RT.primary@produccion/config.yaml << 'EOF'
-router:
-  name: RT.primary
-  island_id: produccion
-  is_gateway: false
+El orchestrator expone su funcionalidad via mensajes JSON Router (a través de SY.admin HTTP).
 
-paths:
-  state_dir: /var/lib/json-router/state
-  node_socket_dir: /var/run/json-router/routers
-  shm_prefix: /jsr-
+### 7.1 Gestión de Nodos
 
-timers:
-  hello_interval_ms: 10000
-  dead_interval_ms: 40000
-  heartbeat_interval_ms: 5000
-  heartbeat_stale_ms: 30000
-EOF
+| Endpoint HTTP | Action | Descripción |
+|---------------|--------|-------------|
+| `GET /nodes` | `list_nodes` | Lista nodos conectados |
+| `POST /nodes` | `run_node` | Levanta nodo |
+| `DELETE /nodes/{name}` | `kill_node` | Mata nodo |
+| `POST /nodes/{name}/restart` | `restart_node` | Reinicia nodo |
+| `GET /nodes/{name}/status` | `node_status` | Estado detallado |
+| `GET /nodes/{name}/logs` | `node_logs` | Últimas líneas de log |
+
+### 7.2 Gestión de Node Registry
+
+| Endpoint HTTP | Action | Descripción |
+|---------------|--------|-------------|
+| `GET /registry` | `list_node_types` | Lista tipos disponibles |
+| `POST /registry` | `register_node_type` | Agrega tipo |
+| `DELETE /registry/{type}` | `unregister_node_type` | Elimina tipo |
+
+### 7.3 Gestión de Isla
+
+| Endpoint HTTP | Action | Descripción |
+|---------------|--------|-------------|
+| `GET /island/status` | `island_status` | Estado general |
+| `GET /island/routers` | `list_routers` | Lista routers |
+| `POST /island/shutdown` | `shutdown_island` | Shutdown ordenado |
+
+### 7.4 Ejemplos de Mensajes
+
+**run_node:**
+```json
+{
+  "meta": { "type": "admin", "action": "run_node" },
+  "payload": {
+    "type": "AI.soporte",
+    "instance": "l1"
+  }
+}
 ```
 
-### 8.4 Configurar SY.config.routes
-
-```bash
-cat > /etc/json-router/sy-config-routes.yaml << 'EOF'
-version: 1
-routes: []
-vpns: []
-EOF
+**Response:**
+```json
+{
+  "payload": {
+    "status": "ok",
+    "name": "AI.soporte.l1@produccion",
+    "pid": 12345
+  }
+}
 ```
 
-### 8.5 Arrancar Servicios
-
-```bash
-systemctl start json-router@RT.gateway
-systemctl start json-router@RT.primary
-systemctl start sy-config-routes
+**register_node_type:**
+```json
+{
+  "meta": { "type": "admin", "action": "register_node_type" },
+  "payload": {
+    "type": "WF.nuevo",
+    "executor": "docker",
+    "image": "wf-nuevo:latest"
+  }
+}
 ```
+
+---
+
+## 8. Protecciones
+
+| Componente | ¿Se puede matar via API? | Razón |
+|------------|--------------------------|-------|
+| RT.gateway | ❌ No | Router raíz de la isla |
+| SY.orchestrator | ❌ No | Proceso raíz |
+| SY.admin | ❌ No | Sin él no hay API |
+| SY.config.routes | ⚠️ Warning | Isla queda sin config dinámica |
+| SY.opa.rules | ⚠️ Warning | Isla queda sin policies |
+| AI.*, WF.*, IO.* | ✅ Sí | Nodos de aplicación |
 
 ---
 
@@ -388,82 +382,140 @@ systemctl start sy-config-routes
 ### 9.1 Health Check
 
 ```bash
-# Verificar procesos
-systemctl status json-router@RT.primary
+# Estado del orchestrator
+systemctl status sy-orchestrator
 
-# Verificar SHM
-ls -la /dev/shm/jsr-*
+# Health via API
+curl http://localhost:8080/health
 
-# Verificar sockets
-ls -la /var/run/json-router/routers/
+# Estado de la isla
+curl http://localhost:8080/island/status
 ```
 
 ### 9.2 Logs
 
 ```bash
-# Logs del router
-journalctl -u json-router@RT.primary -f
+# Logs del orchestrator (incluye todos los componentes)
+journalctl -u sy-orchestrator -f
 
-# Filtrar por nivel
-journalctl -u json-router@RT.primary -p err
+# Solo errores
+journalctl -u sy-orchestrator -p err
+```
+
+### 9.3 Shared Memory
+
+```bash
+# Ver regiones
+ls -la /dev/shm/jsr-*
+
+# Ver contenido (debug)
+# Usar herramienta jsr-inspect (si existe)
 ```
 
 ---
 
 ## 10. Troubleshooting
 
-### 10.1 Router no arranca
+### 10.1 Isla no arranca
 
 ```bash
-# Verificar island.yaml
+# Verificar config
 cat /etc/json-router/island.yaml
 
-# Verificar config
-cat /etc/json-router/routers/RT.primary@produccion/config.yaml
+# Verificar logs
+journalctl -u sy-orchestrator -n 100
 
-# Ver logs
-JSR_LOG_LEVEL=debug json-router
+# Ejecutar manualmente con debug
+JSR_LOG_LEVEL=debug /usr/bin/sy-orchestrator
 ```
 
-### 10.2 SHM stale
+### 10.2 Nodos no conectan
 
 ```bash
-# Ver regiones
-ls -la /dev/shm/jsr-*
-
-# Limpiar manualmente (si el proceso no existe)
-rm /dev/shm/jsr-<uuid>
-```
-
-### 10.3 Nodos no conectan
-
-```bash
-# Verificar socket
+# Verificar que hay routers
 ls -la /var/run/json-router/routers/
 
-# Verificar permisos
-stat /var/run/json-router/routers/
+# Verificar SHM
+ls -la /dev/shm/jsr-*
+
+# Ver nodos conectados
+curl http://localhost:8080/nodes
 ```
 
-### 10.4 Inter-isla no funciona
+### 10.3 WAN no funciona
 
 ```bash
-# Verificar que hay gateway
-grep is_gateway /etc/json-router/routers/*/config.yaml
+# Verificar config WAN
+grep -A5 "wan:" /etc/json-router/island.yaml
 
-# Verificar conexiones WAN
+# Verificar puerto
 netstat -an | grep 9000
 
 # Verificar LSA region
 ls -la /dev/shm/jsr-lsa-*
+
+# Ver islas conectadas
+curl http://localhost:8080/island/status
+```
+
+### 10.4 Limpiar estado (reset completo)
+
+```bash
+# Parar
+systemctl stop sy-orchestrator
+
+# Limpiar todo
+rm -rf /var/lib/json-router/*
+rm -rf /var/run/json-router/*
+rm -f /dev/shm/jsr-*
+
+# Reiniciar
+systemctl start sy-orchestrator
 ```
 
 ---
 
-## 11. Referencias
+## 11. Defaults del Sistema (Referencia Interna)
+
+Estos valores están hardcodeados. El usuario no los configura.
+
+```rust
+// Timers
+pub const HELLO_INTERVAL_MS: u64 = 10_000;
+pub const DEAD_INTERVAL_MS: u64 = 40_000;
+pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
+pub const HEARTBEAT_STALE_MS: u64 = 30_000;
+pub const BOOTSTRAP_TIMEOUT_MS: u64 = 30_000;
+
+// Límites
+pub const MAX_NODES_PER_ROUTER: u32 = 1024;
+pub const MAX_STATIC_ROUTES: u32 = 256;
+pub const MAX_VPN_ASSIGNMENTS: u32 = 256;
+pub const MAX_REMOTE_ISLANDS: u32 = 16;
+pub const MAX_REMOTE_NODES: u32 = 1024;
+
+// Paths
+pub const CONFIG_DIR: &str = "/etc/json-router";
+pub const STATE_DIR: &str = "/var/lib/json-router";
+pub const RUN_DIR: &str = "/var/run/json-router";
+pub const SHM_PREFIX: &str = "/jsr-";
+
+// Nodos SY que siempre arrancan
+pub const BOOTSTRAP_SY_NODES: &[&str] = &[
+    "SY.admin",
+    "SY.config.routes", 
+    "SY.opa.rules",
+];
+```
+
+---
+
+## 12. Referencias
 
 | Tema | Documento |
 |------|-----------|
 | Arquitectura | `01-arquitectura.md` |
+| Protocolo | `02-protocolo.md` |
 | Conectividad WAN | `05-conectividad.md` |
 | Regiones config/LSA | `06-regiones.md` |
+| API completa de SY.* | `SY_nodes_spec.md` |
