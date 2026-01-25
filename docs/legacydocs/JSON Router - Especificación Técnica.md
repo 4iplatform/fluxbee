@@ -5,6 +5,10 @@
 
 ---
 
+**Nota (v1.13):** Este documento es legacy. La configuración por router en `config.yaml` fue eliminada.  
+El **único** archivo de configuración que edita el usuario es `island.yaml`.  
+Ver `docs/07-operaciones.md` para el esquema vigente.
+
 ## Parte I: Fundamentos
 
 ### 1. Introducción

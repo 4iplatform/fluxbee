@@ -53,37 +53,7 @@ pub struct RouterConfig {
 #[derive(Debug, Deserialize)]
 struct IslandFile {
     island_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RouterConfigFile {
-    router: RouterSection,
-    paths: Option<PathsSection>,
-    timers: Option<TimersSection>,
     wan: Option<WanSection>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RouterSection {
-    name: String,
-    island_id: String,
-    #[serde(default)]
-    is_gateway: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct PathsSection {
-    state_dir: Option<String>,
-    node_socket_dir: Option<String>,
-    shm_prefix: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TimersSection {
-    hello_interval_ms: Option<u64>,
-    dead_interval_ms: Option<u64>,
-    heartbeat_interval_ms: Option<u64>,
-    heartbeat_stale_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,9 +99,6 @@ impl RouterConfig {
             std::env::var("JSR_CONFIG_DIR").unwrap_or_else(|_| DEFAULT_CONFIG_DIR.to_string()),
         );
 
-        let mut router_name_cfg = None;
-        let island_id_cfg;
-        let mut is_gateway = false;
         let mut state_dir = PathBuf::from(DEFAULT_STATE_DIR);
         let mut node_socket_dir = PathBuf::from(DEFAULT_SOCKET_DIR);
         let mut shm_prefix = DEFAULT_SHM_PREFIX.to_string();
@@ -143,57 +110,23 @@ impl RouterConfig {
         let mut wan_uplinks = Vec::new();
         let mut wan_authorized_islands = Vec::new();
 
-        if let Some(config_path) = find_router_config(&config_dir, &router_name) {
-            let data = std::fs::read_to_string(&config_path)?;
-            let cfg: RouterConfigFile = serde_yaml::from_str(&data)?;
-            router_name_cfg = Some(cfg.router.name);
-            island_id_cfg = Some(cfg.router.island_id);
-            is_gateway = cfg.router.is_gateway;
-
-            if let Some(paths) = cfg.paths {
-                if let Some(value) = paths.state_dir {
-                    state_dir = PathBuf::from(value);
-                }
-                if let Some(value) = paths.node_socket_dir {
-                    node_socket_dir = PathBuf::from(value);
-                }
-                if let Some(value) = paths.shm_prefix {
-                    shm_prefix = value;
+        let island_path = config_dir.join("island.yaml");
+        if !island_path.exists() {
+            return Err(ConfigError::MissingIsland);
+        }
+        let data = std::fs::read_to_string(&island_path)?;
+        let island: IslandFile = serde_yaml::from_str(&data)?;
+        let island_id = island.island_id;
+        if let Some(wan) = island.wan {
+            wan_listen = wan.listen;
+            if let Some(uplinks) = wan.uplinks {
+                for uplink in uplinks {
+                    wan_uplinks.push(uplink.address);
                 }
             }
-            if let Some(timers) = cfg.timers {
-                if let Some(value) = timers.hello_interval_ms {
-                    hello_interval_ms = value;
-                }
-                if let Some(value) = timers.dead_interval_ms {
-                    dead_interval_ms = value;
-                }
-                if let Some(value) = timers.heartbeat_interval_ms {
-                    heartbeat_interval_ms = value;
-                }
-                if let Some(value) = timers.heartbeat_stale_ms {
-                    heartbeat_stale_ms = value;
-                }
+            if let Some(islands) = wan.authorized_islands {
+                wan_authorized_islands = islands;
             }
-            if let Some(wan) = cfg.wan {
-                wan_listen = wan.listen;
-                if let Some(uplinks) = wan.uplinks {
-                    for uplink in uplinks {
-                        wan_uplinks.push(uplink.address);
-                    }
-                }
-                if let Some(islands) = wan.authorized_islands {
-                    wan_authorized_islands = islands;
-                }
-            }
-        } else {
-            let island_path = config_dir.join("island.yaml");
-            if !island_path.exists() {
-                return Err(ConfigError::MissingIsland);
-            }
-            let data = std::fs::read_to_string(&island_path)?;
-            let island: IslandFile = serde_yaml::from_str(&data)?;
-            island_id_cfg = Some(island.island_id);
         }
 
         if let Ok(value) = std::env::var("JSR_STATE_DIR") {
@@ -206,8 +139,7 @@ impl RouterConfig {
             shm_prefix = value;
         }
 
-        let router_name = router_name_cfg.unwrap_or(router_name);
-        let island_id = island_id_cfg.ok_or(ConfigError::MissingIsland)?;
+        let is_gateway = is_gateway_name(&router_name);
         let router_l2_name = ensure_l2_name(&router_name, &island_id);
         let identity_path = identity_path(&state_dir, &router_l2_name);
         let (router_uuid, shm_name) = if identity_path.exists() {
@@ -259,20 +191,9 @@ fn identity_path(state_dir: &Path, router_l2_name: &str) -> PathBuf {
     state_dir.join(router_l2_name).join("identity.yaml")
 }
 
-fn find_router_config(config_dir: &Path, router_name: &str) -> Option<PathBuf> {
-    let routers_dir = config_dir.join("routers");
-    let entries = std::fs::read_dir(&routers_dir).ok()?;
-    let mut matches = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(&format!("{}@", router_name)) {
-            matches.push(entry.path().join("config.yaml"));
-        }
-    }
-    if matches.len() == 1 {
-        return Some(matches.remove(0));
-    }
-    None
+fn is_gateway_name(router_name: &str) -> bool {
+    let base = router_name.split('@').next().unwrap_or(router_name);
+    base == "RT.gateway"
 }
 
 fn build_identity_yaml(router_l2_name: &str, uuid: Uuid, shm_name: &str) -> Result<String, ConfigError> {

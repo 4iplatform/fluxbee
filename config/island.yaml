@@ -1,1 +1,15 @@
 island_id: "sandbox"
+
+# WAN (gateway). Optional: remove block if no inter-island connectivity.
+wan:
+  listen: "0.0.0.0:9000"
+  uplinks:
+    - address: "staging.internal:9000"
+    - address: "prod.internal:9000"
+  authorized_islands:
+    - staging
+    - prod
+
+# Admin API (optional).
+admin:
+  listen: "127.0.0.1:8080"

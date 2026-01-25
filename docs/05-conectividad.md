@@ -102,18 +102,21 @@ fn find_gateway(&self) -> Option<RouterInfo> {
 
 ### 3.3 Configuración del Gateway
 
+No existe `config.yaml` por router. El gateway se identifica via `is_gateway` en SHM (set por el orchestrator).  
+La configuración WAN se declara **solo** en `island.yaml` y aplica al gateway.
+
 ```yaml
-# /etc/json-router/routers/RT.gateway@produccion/config.yaml
-router:
-  name: RT.gateway
-  island_id: produccion
-  is_gateway: true
+# /etc/json-router/island.yaml
+island_id: produccion
 
 wan:
   listen: "0.0.0.0:9000"
   uplinks:
     - address: "10.0.1.100:9000"    # staging
     - address: "10.0.2.100:9000"    # desarrollo
+  authorized_islands:
+    - staging
+    - desarrollo
 ```
 
 ### 3.4 Topología WAN
@@ -493,6 +496,7 @@ fn route_to_remote_island(&self, msg: &Message, dst_island: &str) -> Action {
 El gateway valida que el `island_id` del peer esté en su lista de autorizados:
 
 ```yaml
+# /etc/json-router/island.yaml
 wan:
   authorized_islands:
     - staging
@@ -506,7 +510,7 @@ wan:
 | Aspecto | IRP (Intra-Isla) | WAN (Inter-Isla) |
 |---------|------------------|------------------|
 | Transporte | Unix socket | TCP |
-| Configuración | Automática (SHM) | Explícita (config) |
+| Configuración | Automática (SHM) | Explícita (`island.yaml`) |
 | TTL | No decrementa | Decrementa |
 | Quién lo usa | Todos los routers | Solo gateways |
 | Descubrimiento | Via SHM | Via config + HELLO |
