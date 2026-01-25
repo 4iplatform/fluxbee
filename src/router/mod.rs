@@ -132,7 +132,7 @@ impl Router {
             "router listening"
         );
 
-        let irp_path = peer_socket_path(self.cfg.router_uuid);
+        let irp_path = peer_socket_path(&self.cfg.node_socket_dir, self.cfg.router_uuid);
         ensure_parent_dir(&irp_path)?;
         let _ = std::fs::remove_file(&irp_path);
         let irp_listener = UnixListener::bind(&irp_path)?;
@@ -184,12 +184,14 @@ impl Router {
         let shm_name = self.cfg.shm_name.clone();
         let island_id = self.cfg.island_id.clone();
         let is_gateway = self.cfg.is_gateway;
+        let peer_socket_dir = self.cfg.node_socket_dir.clone();
         tokio::spawn(async move {
             peer_discovery_loop(
                 router_uuid,
                 &router_name,
                 &shm_name,
                 &island_id,
+                peer_socket_dir,
                 peers_pd,
                 peer_nodes_pd,
                 peer_routers_pd,
@@ -1895,9 +1897,9 @@ async fn handle_wan_message(
     Ok(())
 }
 
-fn peer_socket_path(router_uuid: Uuid) -> PathBuf {
+fn peer_socket_path(socket_dir: &Path, router_uuid: Uuid) -> PathBuf {
     let name = format!("irp-{}.sock", router_uuid.simple());
-    PathBuf::from("/var/run/json-router").join(name)
+    socket_dir.join(name)
 }
 
 async fn peer_discovery_loop(
@@ -1905,6 +1907,7 @@ async fn peer_discovery_loop(
     self_router_name: &str,
     self_shm_name: &str,
     island_id: &str,
+    socket_dir: PathBuf,
     peers: Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     peer_routers: Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
@@ -1976,12 +1979,14 @@ async fn peer_discovery_loop(
                     let vpn_rules = Arc::clone(&vpn_rules);
                     let lsa_snapshot = Arc::clone(&lsa_snapshot);
                     let is_gateway = is_gateway;
+                    let socket_dir = socket_dir.clone();
                     tokio::spawn(async move {
                         let _ = connect_to_peer(
                             peer_uuid,
                             self_uuid,
                             &self_router_name,
                             &self_shm_name,
+                            &socket_dir,
                             peers,
                             peer_nodes,
                             peer_routers,
@@ -2083,6 +2088,7 @@ async fn connect_to_peer(
     self_uuid: Uuid,
     self_router_name: &str,
     self_shm_name: &str,
+    socket_dir: &Path,
     peers: Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     peer_routers: Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
@@ -2100,7 +2106,7 @@ async fn connect_to_peer(
     fib: Arc<Mutex<Vec<FibEntry>>>,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
-    let socket_path = peer_socket_path(peer_uuid);
+    let socket_path = peer_socket_path(socket_dir, peer_uuid);
     let stream = UnixStream::connect(&socket_path).await?;
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
