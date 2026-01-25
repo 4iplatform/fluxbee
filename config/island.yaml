@@ -3,6 +3,7 @@ island_id: "sandbox"
 # WAN (gateway). Optional: remove block if no inter-island connectivity.
 wan:
   listen: "0.0.0.0:9000"
+  gateway_name: "RT.gateway"
   uplinks:
     - address: "staging.internal:9000"
     - address: "prod.internal:9000"

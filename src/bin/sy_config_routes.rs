@@ -70,9 +70,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
-    let config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
-    let state_dir = PathBuf::from(DEFAULT_STATE_DIR);
-    let socket_dir = PathBuf::from(DEFAULT_SOCKET_DIR);
+    let config_dir = PathBuf::from(
+        std::env::var("JSR_CONFIG_DIR").unwrap_or_else(|_| DEFAULT_CONFIG_DIR.to_string()),
+    );
+    let state_dir = PathBuf::from(
+        std::env::var("JSR_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string()),
+    );
+    let socket_dir = PathBuf::from(
+        std::env::var("JSR_SOCKET_DIR").unwrap_or_else(|_| DEFAULT_SOCKET_DIR.to_string()),
+    );
 
     ensure_dir(&state_dir)?;
 

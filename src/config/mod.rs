@@ -61,6 +61,7 @@ struct WanSection {
     listen: Option<String>,
     uplinks: Option<Vec<WanUplink>>,
     authorized_islands: Option<Vec<String>>,
+    gateway_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +118,7 @@ impl RouterConfig {
         let data = std::fs::read_to_string(&island_path)?;
         let island: IslandFile = serde_yaml::from_str(&data)?;
         let island_id = island.island_id;
+        let mut gateway_name = "RT.gateway".to_string();
         if let Some(wan) = island.wan {
             wan_listen = wan.listen;
             if let Some(uplinks) = wan.uplinks {
@@ -126,6 +128,9 @@ impl RouterConfig {
             }
             if let Some(islands) = wan.authorized_islands {
                 wan_authorized_islands = islands;
+            }
+            if let Some(name) = wan.gateway_name {
+                gateway_name = name;
             }
         }
 
@@ -139,7 +144,7 @@ impl RouterConfig {
             shm_prefix = value;
         }
 
-        let is_gateway = is_gateway_name(&router_name);
+        let is_gateway = is_gateway_name(&router_name, &gateway_name);
         let router_l2_name = ensure_l2_name(&router_name, &island_id);
         let identity_path = identity_path(&state_dir, &router_l2_name);
         let (router_uuid, shm_name) = if identity_path.exists() {
@@ -191,9 +196,10 @@ fn identity_path(state_dir: &Path, router_l2_name: &str) -> PathBuf {
     state_dir.join(router_l2_name).join("identity.yaml")
 }
 
-fn is_gateway_name(router_name: &str) -> bool {
+fn is_gateway_name(router_name: &str, gateway_name: &str) -> bool {
     let base = router_name.split('@').next().unwrap_or(router_name);
-    base == "RT.gateway"
+    let gateway_base = gateway_name.split('@').next().unwrap_or(gateway_name);
+    base == gateway_base
 }
 
 fn build_identity_yaml(router_l2_name: &str, uuid: Uuid, shm_name: &str) -> Result<String, ConfigError> {
