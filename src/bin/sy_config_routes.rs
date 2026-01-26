@@ -8,9 +8,6 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use jsr_client::{NodeClient, NodeConfig};
-use jsr_client::protocol::{
-    ConfigChangedPayload, Destination, Message, Meta, Routing, SCOPE_GLOBAL, SYSTEM_KIND,
-};
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, VpnAssignment,
     ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
@@ -109,14 +106,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
     };
-    let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
-
+    let _client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     tracing::info!("connected to router");
-    if let Err(err) = send_config_changed(&mut client, &mut writer, &sy_config).await {
-        tracing::warn!("config broadcast failed: {err} (reconnecting)");
-        client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
-        send_config_changed(&mut client, &mut writer, &sy_config).await?;
-    }
 
     let mut ticker = time::interval(Duration::from_secs(5));
     loop {
@@ -126,12 +117,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if current > last_modified {
             sy_config = load_config(&config_dir)?;
             apply_config(&mut writer, &sy_config)?;
-            if let Err(err) = send_config_changed(&mut client, &mut writer, &sy_config).await {
-                tracing::warn!("config broadcast failed: {err} (reconnecting)");
-                client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1))
-                    .await?;
-                send_config_changed(&mut client, &mut writer, &sy_config).await?;
-            }
             last_modified = current;
         }
     }
@@ -309,37 +294,4 @@ fn empty_vpn_assignment() -> VpnAssignment {
     }
 }
 
-async fn send_config_changed(
-    client: &mut NodeClient,
-    writer: &mut ConfigRegionWriter,
-    _config: &SyConfigFile,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let version = writer
-        .read_snapshot()
-        .map(|s| s.header.config_version)
-        .unwrap_or(0);
-    let msg = Message {
-        routing: Routing {
-            src: client.uuid().to_string(),
-            dst: Destination::Broadcast,
-            ttl: 2,
-            trace_id: Uuid::new_v4().to_string(),
-        },
-        meta: Meta {
-            msg_type: SYSTEM_KIND.to_string(),
-            msg: Some("CONFIG_CHANGED".to_string()),
-            scope: Some(SCOPE_GLOBAL.to_string()),
-            target: Some("RT.*".to_string()),
-            action: None,
-            priority: None,
-            context: None,
-        },
-        payload: serde_json::to_value(ConfigChangedPayload {
-            config_version: version,
-            changed: vec!["routes".to_string(), "vpns".to_string()],
-        })?,
-    };
-    client.send(&msg).await?;
-    tracing::info!(version = version, "config changed broadcast sent");
-    Ok(())
-}
+// CONFIG_CHANGED lo emite SY.admin (mother island).

@@ -148,8 +148,10 @@ pub struct WithdrawPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigChangedPayload {
-    pub config_version: u64,
-    pub changed: Vec<String>,
+    pub subsystem: String,
+    pub version: u64,
+    #[serde(default)]
+    pub config: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

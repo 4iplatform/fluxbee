@@ -1,4 +1,5 @@
 island_id: "sandbox"
+role: mother
 
 # WAN (gateway). Optional: remove block if no inter-island connectivity.
 wan:
