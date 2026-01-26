@@ -158,24 +158,20 @@ async fn run_broadcast_loop(
         if config.version <= last_version {
             continue;
         }
-        if config.routes != last_config.routes {
-            broadcast_config_changed(
-                &mut client,
-                "routes",
-                config.version,
-                serde_json::json!({ "routes": config.routes }),
-            )
-            .await?;
-        }
-        if config.vpns != last_config.vpns {
-            broadcast_config_changed(
-                &mut client,
-                "vpn",
-                config.version,
-                serde_json::json!({ "vpns": config.vpns }),
-            )
-            .await?;
-        }
+        broadcast_config_changed(
+            &mut client,
+            "routes",
+            config.version,
+            serde_json::json!({ "routes": config.routes }),
+        )
+        .await?;
+        broadcast_config_changed(
+            &mut client,
+            "vpn",
+            config.version,
+            serde_json::json!({ "vpns": config.vpns }),
+        )
+        .await?;
         last_config = config;
         last_version = last_config.version;
     }
@@ -301,7 +297,8 @@ async fn handle_http(
             current.version = next_version;
             current.updated_at = now_epoch_ms().to_string();
             write_config(config_dir, &current)?;
-    notify.notify_one();
+            notify.notify_one();
+            tracing::info!(version = current.version, "config routes updated");
             respond_json(stream, 200, &serde_json::to_string(&current)?).await?;
         }
         ("PUT", "/config/vpns") => {
@@ -316,7 +313,8 @@ async fn handle_http(
             current.version = next_version;
             current.updated_at = now_epoch_ms().to_string();
             write_config(config_dir, &current)?;
-    notify.notify_one();
+            notify.notify_one();
+            tracing::info!(version = current.version, "config vpns updated");
             respond_json(stream, 200, &serde_json::to_string(&current)?).await?;
         }
         _ => {
