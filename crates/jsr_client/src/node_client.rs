@@ -200,6 +200,13 @@ fn router_socket_candidates(path: &Path, node_name: &str) -> Result<Vec<PathBuf>
                     .map(|ext| ext == "sock")
                     .unwrap_or(false)
             })
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| !name.starts_with("irp-"))
+                    .unwrap_or(true)
+            })
             .collect();
         sockets.sort();
         if sockets.is_empty() {
