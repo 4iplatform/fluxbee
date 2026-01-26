@@ -326,7 +326,16 @@ El orchestrator expone su funcionalidad via mensajes JSON Router (a través de S
 | `GET /island/routers` | `list_routers` | Lista routers |
 | `POST /island/shutdown` | `shutdown_island` | Shutdown ordenado |
 
-### 7.4 Ejemplos de Mensajes
+### 7.4 Gestión de Islas Remotas (Solo Mother Island)
+
+| Endpoint HTTP | Action | Descripción |
+|---------------|--------|-------------|
+| `GET /islands` | `list_islands` | Lista islas hijas |
+| `POST /islands` | `add_island` | Bootstrap isla remota |
+| `DELETE /islands/{id}` | `remove_island` | Elimina registro de isla |
+| `GET /islands/{id}/status` | `island_remote_status` | Estado de isla remota |
+
+### 7.5 Ejemplos de Mensajes
 
 **run_node:**
 ```json
@@ -364,7 +373,269 @@ El orchestrator expone su funcionalidad via mensajes JSON Router (a través de S
 
 ---
 
-## 8. Protecciones
+## 8. Bootstrap de Islas Remotas
+
+El orchestrator de la **isla madre** (mother island) puede instalar y configurar islas remotas automáticamente via SSH.
+
+### 8.1 Requisitos de la Máquina Nueva
+
+| Requisito | Valor | Notas |
+|-----------|-------|-------|
+| OS | Linux (cualquier distro) | Con systemd |
+| SSH | Puerto 22, habilitado | Instalado por defecto en la mayoría de distros |
+| Usuario | `root` | Acceso root requerido para instalación |
+| Password | `magicAI` | **Password fijo del sistema** |
+| Red | Alcanzable desde mother island | Por IP o hostname |
+
+**El password `magicAI` es el "cordón umbilical"** - solo se usa una vez para el bootstrap inicial.
+
+### 8.2 API
+
+**Endpoint HTTP:**
+```
+POST /islands
+```
+
+**Request:**
+```json
+{
+  "island_id": "staging",
+  "address": "192.168.1.50"
+}
+```
+
+**Mensaje interno (SY.admin → SY.orchestrator):**
+```json
+{
+  "meta": { "type": "admin", "action": "add_island" },
+  "payload": {
+    "island_id": "staging",
+    "address": "192.168.1.50"
+  }
+}
+```
+
+**Response OK:**
+```json
+{
+  "payload": {
+    "status": "ok",
+    "island_id": "staging",
+    "address": "192.168.1.50",
+    "wan_connected": true
+  }
+}
+```
+
+**Response ERROR:**
+```json
+{
+  "payload": {
+    "status": "error",
+    "code": "SSH_AUTH_FAILED",
+    "message": "Verificar: user=root, pass=magicAI, port=22"
+  }
+}
+```
+
+### 8.3 Flujo de Bootstrap
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  SY.orchestrator (mother island) recibe add_island          │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ PASO 1: Conexión SSH                                         │
+├──────────────────────────────────────────────────────────────┤
+│ - Conectar a root@{address}:22 con password "magicAI"       │
+│ - Si falla → ERROR SSH_AUTH_FAILED                          │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ PASO 2: Generar SSH Key para esta isla                       │
+├──────────────────────────────────────────────────────────────┤
+│ - ssh-keygen -t ed25519 -f /tmp/staging.key -N ""           │
+│ - Guardar en /var/lib/json-router/islands/staging/          │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ PASO 3: Instalar SSH Key en máquina remota                   │
+├──────────────────────────────────────────────────────────────┤
+│ - mkdir -p ~/.ssh                                            │
+│ - Agregar key pública a ~/.ssh/authorized_keys              │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ PASO 4: Hardening SSH                                        │
+├──────────────────────────────────────────────────────────────┤
+│ - Deshabilitar PasswordAuthentication                        │
+│ - systemctl restart sshd                                     │
+│ - A partir de ahora solo acceso por key                     │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ PASO 5: Copiar binario sy-orchestrator                       │
+├──────────────────────────────────────────────────────────────┤
+│ - scp /usr/bin/sy-orchestrator root@{address}:/usr/bin/     │
+│ - chmod +x /usr/bin/sy-orchestrator                         │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ PASO 6: Crear configuración                                  │
+├──────────────────────────────────────────────────────────────┤
+│ - mkdir -p /etc/json-router                                  │
+│ - Crear /etc/json-router/island.yaml:                       │
+│     island_id: staging                                       │
+│     wan:                                                     │
+│       uplinks:                                               │
+│         - address: "{mother_ip}:9000"                       │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ PASO 7: Instalar y arrancar servicio                         │
+├──────────────────────────────────────────────────────────────┤
+│ - Crear /etc/systemd/system/sy-orchestrator.service         │
+│ - systemctl daemon-reload                                    │
+│ - systemctl enable --now sy-orchestrator                    │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ PASO 8: Esperar conexión WAN                                 │
+├──────────────────────────────────────────────────────────────┤
+│ - Timeout 30s esperando HELLO del gateway remoto            │
+│ - Verificar en jsr-lsa que la isla aparece                  │
+│ - Si timeout → ERROR WAN_TIMEOUT                            │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ PASO 9: Registrar en repo de islas                           │
+├──────────────────────────────────────────────────────────────┤
+│ - Guardar keys y metadata en:                                │
+│   /var/lib/json-router/islands/staging/                     │
+│     ├── ssh.key                                             │
+│     ├── ssh.key.pub                                         │
+│     └── info.yaml                                           │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+                    Responder OK
+```
+
+### 8.4 Estructura del Repo de Islas
+
+En la mother island:
+
+```
+/var/lib/json-router/
+├── state/
+├── config-routes.yaml
+├── opa-rules/
+└── islands/                          # Repo de islas hijas
+    ├── staging/
+    │   ├── ssh.key                   # Key privada (permisos 600)
+    │   ├── ssh.key.pub               # Key pública
+    │   └── info.yaml                 # Metadata
+    └── desarrollo/
+        ├── ssh.key
+        ├── ssh.key.pub
+        └── info.yaml
+```
+
+**info.yaml:**
+```yaml
+island_id: staging
+address: 192.168.1.50
+created_at: 2025-01-22T10:00:00Z
+last_wan_seen: 2025-01-22T15:30:00Z
+status: connected  # connected | unreachable | unknown
+```
+
+### 8.5 Credenciales del Sistema
+
+```rust
+// Hardcoded - NO configurable
+pub const BOOTSTRAP_SSH_USER: &str = "root";
+pub const BOOTSTRAP_SSH_PASS: &str = "magicAI";
+pub const BOOTSTRAP_SSH_PORT: u16 = 22;
+```
+
+**Seguridad:**
+- El password `magicAI` solo funciona **antes** del bootstrap
+- Después del paso 4, el password queda deshabilitado en SSH
+- Acceso posterior solo con la key que tiene la mother island
+- El password nunca se persiste en disco
+
+### 8.6 Gestión de Islas
+
+**Listar islas:**
+```
+GET /islands
+```
+
+```json
+{
+  "payload": {
+    "islands": [
+      {
+        "island_id": "staging",
+        "address": "192.168.1.50",
+        "status": "connected",
+        "last_seen": "2025-01-22T15:30:00Z"
+      },
+      {
+        "island_id": "desarrollo",
+        "address": "192.168.1.51",
+        "status": "unreachable",
+        "last_seen": "2025-01-22T10:00:00Z"
+      }
+    ]
+  }
+}
+```
+
+**Eliminar isla:**
+```
+DELETE /islands/{island_id}
+```
+
+Esto solo elimina el registro local. No apaga la isla remota.
+
+### 8.7 Reconexión SSH (Emergencias)
+
+Si necesitás acceder a una isla remota para debug:
+
+```bash
+# Desde la mother island
+ssh -i /var/lib/json-router/islands/staging/ssh.key root@192.168.1.50
+```
+
+La key está guardada en el repo de islas.
+
+### 8.8 Códigos de Error
+
+| Código | Descripción |
+|--------|-------------|
+| `SSH_AUTH_FAILED` | Password incorrecto o SSH no disponible |
+| `SSH_CONNECTION_REFUSED` | Puerto 22 cerrado o host inalcanzable |
+| `SSH_TIMEOUT` | Host no responde |
+| `COPY_FAILED` | Error copiando binario |
+| `SERVICE_START_FAILED` | systemctl falló |
+| `WAN_TIMEOUT` | La isla no conectó por WAN en 30s |
+| `ISLAND_EXISTS` | Ya existe una isla con ese ID |
+
+---
+
+## 9. Protecciones
 
 | Componente | ¿Se puede matar via API? | Razón |
 |------------|--------------------------|-------|
@@ -377,7 +648,7 @@ El orchestrator expone su funcionalidad via mensajes JSON Router (a través de S
 
 ---
 
-## 9. Monitoreo
+## 10. Monitoreo
 
 ### 9.1 Health Check
 
@@ -414,7 +685,7 @@ ls -la /dev/shm/jsr-*
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 ### 10.1 Isla no arranca
 
@@ -475,7 +746,7 @@ systemctl start sy-orchestrator
 
 ---
 
-## 11. Defaults del Sistema (Referencia Interna)
+## 12. Defaults del Sistema (Referencia Interna)
 
 Estos valores están hardcodeados. El usuario no los configura.
 
@@ -506,11 +777,16 @@ pub const BOOTSTRAP_SY_NODES: &[&str] = &[
     "SY.config.routes", 
     "SY.opa.rules",
 ];
+
+// Bootstrap SSH (para add_island)
+pub const BOOTSTRAP_SSH_USER: &str = "root";
+pub const BOOTSTRAP_SSH_PASS: &str = "magicAI";
+pub const BOOTSTRAP_SSH_PORT: u16 = 22;
 ```
 
 ---
 
-## 12. Referencias
+## 13. Referencias
 
 | Tema | Documento |
 |------|-----------|
