@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString};
 use std::mem::size_of;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{self, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use nix::fcntl::OFlag;
@@ -19,6 +19,8 @@ pub const CONFIG_VERSION: u32 = 1;
 
 pub const LSA_MAGIC: u32 = 0x4A534C41; // "JSLA"
 pub const LSA_VERSION: u32 = 1;
+
+const SEQLOCK_READ_TIMEOUT_MS: u64 = 5;
 
 pub const MAX_NODES: u32 = 1024;
 pub const MAX_STATIC_ROUTES: u32 = 256;
@@ -1096,7 +1098,11 @@ fn read_router_snapshot(
     mmap: &[u8],
     layout: &RegionLayout,
 ) -> Option<ShmSnapshot> {
+    let start = Instant::now();
     loop {
+        if start.elapsed() > Duration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            return None;
+        }
         let s1 = header.seq.load(Ordering::Acquire);
         if s1 & 1 != 0 {
             std::hint::spin_loop();
@@ -1145,7 +1151,11 @@ fn read_config_snapshot(
     mmap: &[u8],
     layout: &RegionLayout,
 ) -> Option<ConfigSnapshot> {
+    let start = Instant::now();
     loop {
+        if start.elapsed() > Duration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            return None;
+        }
         let s1 = header.seq.load(Ordering::Acquire);
         if s1 & 1 != 0 {
             std::hint::spin_loop();
@@ -1194,7 +1204,11 @@ fn read_lsa_snapshot(
     mmap: &[u8],
     layout: &RegionLayout,
 ) -> Option<LsaSnapshot> {
+    let start = Instant::now();
     loop {
+        if start.elapsed() > Duration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            return None;
+        }
         let s1 = header.seq.load(Ordering::Acquire);
         if s1 & 1 != 0 {
             std::hint::spin_loop();
