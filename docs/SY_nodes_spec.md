@@ -120,7 +120,7 @@ async fn main() -> Result<(), NodeError> {
 
 ## 2. SY.config.routes
 
-Responsable de la configuración centralizada de rutas estáticas y VPNs.
+Responsable de la configuración centralizada de rutas estáticas y VPNs en cada isla.
 
 ### 2.1 Resumen
 
@@ -128,8 +128,8 @@ Responsable de la configuración centralizada de rutas estáticas y VPNs.
 |---------|-------|
 | Nombre | `SY.config.routes` (uno por isla, sin instancia) |
 | Región SHM | `/jsr-config-<island_id>` |
-| Persistencia | `/etc/json-router/sy-config-routes.yaml` |
-| Propagación | Broadcast (CONFIG_ANNOUNCE) |
+| Persistencia | `/var/lib/json-router/config-routes.yaml` |
+| Input | CONFIG_CHANGED broadcast (de SY.admin) |
 
 **Restricciones:**
 - Solo puede correr UNO por isla
@@ -139,39 +139,43 @@ Responsable de la configuración centralizada de rutas estáticas y VPNs.
 ### 2.2 Arquitectura
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      SY.config.routes                       │
-│                                                              │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
-│  │ API Handler │  │ SHM Writer  │  │ Persistence │         │
-│  │             │  │             │  │             │         │
-│  │ - add_route │  │ - seqlock   │  │ - sy-config │         │
-│  │ - del_route │  │ - heartbeat │  │   -routes.  │         │
-│  │ - list_*    │  │ - version++ │  │   yaml      │         │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘         │
-│         │                │                │                 │
-│         └────────────────┼────────────────┘                 │
-│                          │                                  │
-│  ┌───────────────────────┴───────────────────────┐         │
-│  │              Broadcast Handler                 │         │
-│  │                                                │         │
-│  │  - Envía CONFIG_ANNOUNCE (broadcast)          │         │
-│  │  - Recibe CONFIG_ANNOUNCE de otras islas      │         │
-│  │  - Actualiza zona global en shm               │         │
-│  └───────────────────────────────────────────────┘         │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                      SY.config.routes                           │
+│                                                                 │
+│  ┌───────────────────────────────────────────────────────────┐ │
+│  │              CONFIG_CHANGED Handler                        │ │
+│  │                                                            │ │
+│  │  Recibe broadcast de SY.admin (subsystem: routes/vpn)     │ │
+│  │  Mismo mensaje llega a TODAS las islas                    │ │
+│  └──────────────────────────┬────────────────────────────────┘ │
+│                             │                                   │
+│         ┌───────────────────┼───────────────────┐              │
+│         ▼                   ▼                   ▼              │
+│  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐      │
+│  │  Validator  │     │ SHM Writer  │     │ Persistence │      │
+│  │             │     │             │     │             │      │
+│  │ - Valida    │     │ - seqlock   │     │ - config-   │      │
+│  │   config    │     │ - version++ │     │   routes.   │      │
+│  │ - Rechaza   │     │ - heartbeat │     │   yaml      │      │
+│  │   inválidos │     │             │     │             │      │
+│  └─────────────┘     └─────────────┘     └─────────────┘      │
+└─────────────────────────────────────────────────────────────────┘
                            │
                            ▼
               /jsr-config-<island_id>
               ┌─────────────────────┐
-              │ LocalRoutes[]       │ ← De archivo local
-              │ GlobalRoutes[]      │ ← De broadcasts recibidos
+              │ Routes[]            │
+              │ VPNs[]              │
+              │ config_version      │
               └─────────────────────┘
 ```
 
-**Separación de responsabilidades:**
-- **Router:** Solo mueve mensajes (data plane). Lee config de shm, no la propaga.
-- **SY.config.routes:** Escribe config local, hace broadcast, recibe broadcasts de otras islas.
+**Flujo:**
+1. SY.admin (en mother) hace broadcast CONFIG_CHANGED
+2. TODOS los SY.config.routes (en todas las islas) reciben el mismo mensaje
+3. Cada uno valida, escribe en su SHM local, persiste en YAML local
+
+**No hay trato especial para el local.** Mother y hijas reciben el mismo broadcast.
 
 ### 2.3 Línea de comandos
 

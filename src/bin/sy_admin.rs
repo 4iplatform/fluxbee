@@ -1,8 +1,12 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -12,6 +16,7 @@ use jsr_client::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SCOPE_GLOBAL,
     SYSTEM_KIND,
 };
+use json_router::shm::now_epoch_ms;
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/json-router";
 const DEFAULT_STATE_DIR: &str = "/var/lib/json-router/state";
@@ -21,9 +26,15 @@ const DEFAULT_SOCKET_DIR: &str = "/var/run/json-router/routers";
 struct IslandFile {
     island_id: String,
     role: Option<String>,
+    admin: Option<AdminSection>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
+struct AdminSection {
+    listen: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct SyConfigFile {
     version: u64,
     updated_at: String,
@@ -33,7 +44,7 @@ struct SyConfigFile {
     vpns: Vec<VpnConfig>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct RouteConfig {
     prefix: String,
     #[serde(default)]
@@ -47,7 +58,7 @@ struct RouteConfig {
     priority: Option<u16>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct VpnConfig {
     pattern: String,
     #[serde(default)]
@@ -83,6 +94,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("SY.admin solo corre en mother island; role != mother");
         return Ok(());
     }
+    let admin_listen = island
+        .admin
+        .and_then(|admin| admin.listen)
+        .unwrap_or_else(|| "0.0.0.0:8080".to_string());
 
     let node_config = NodeConfig {
         name: "SY.admin".to_string(),
@@ -94,29 +109,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     tracing::info!("connected to router");
 
-    let mut last_version = 0u64;
+    let notify = std::sync::Arc::new(Notify::new());
+    let notify_http = std::sync::Arc::clone(&notify);
+    let http_config_dir = config_dir.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_http_server(&admin_listen, &http_config_dir, &notify_http).await {
+            tracing::error!("http server error: {err}");
+        }
+    });
+
+    let mut last_config = load_config(&config_dir)?;
+    let mut last_version = last_config.version;
     let mut ticker = time::interval(Duration::from_secs(2));
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {},
+            _ = notify.notified() => {},
+        }
         let config = load_config(&config_dir)?;
         if config.version <= last_version {
             continue;
         }
-        broadcast_config_changed(
-            &mut client,
-            "routes",
-            config.version,
-            serde_json::to_value(&config.routes)?,
-        )
-        .await?;
-        broadcast_config_changed(
-            &mut client,
-            "vpn",
-            config.version,
-            serde_json::to_value(&config.vpns)?,
-        )
-        .await?;
-        last_version = config.version;
+        if config.routes != last_config.routes {
+            broadcast_config_changed(
+                &mut client,
+                "routes",
+                config.version,
+                serde_json::json!({ "routes": config.routes }),
+            )
+            .await?;
+        }
+        if config.vpns != last_config.vpns {
+            broadcast_config_changed(
+                &mut client,
+                "vpn",
+                config.version,
+                serde_json::json!({ "vpns": config.vpns }),
+            )
+            .await?;
+        }
+        last_config = config;
+        last_version = last_config.version;
     }
 }
 
@@ -130,7 +163,7 @@ fn load_config(config_dir: &Path) -> Result<SyConfigFile, Box<dyn std::error::Er
     if !path.exists() {
         let empty = SyConfigFile {
             version: 1,
-            updated_at: "".to_string(),
+            updated_at: now_epoch_ms().to_string(),
             routes: Vec::new(),
             vpns: Vec::new(),
         };
@@ -140,6 +173,13 @@ fn load_config(config_dir: &Path) -> Result<SyConfigFile, Box<dyn std::error::Er
     }
     let data = fs::read_to_string(&path)?;
     Ok(serde_yaml::from_str(&data)?)
+}
+
+fn write_config(config_dir: &Path, config: &SyConfigFile) -> Result<(), Box<dyn std::error::Error>> {
+    let path = config_dir.join("sy-config-routes.yaml");
+    let data = serde_yaml::to_string(config)?;
+    fs::write(&path, data)?;
+    Ok(())
 }
 
 async fn broadcast_config_changed(
@@ -172,5 +212,162 @@ async fn broadcast_config_changed(
     };
     client.send(&msg).await?;
     tracing::info!(subsystem = subsystem, version = version, "config changed broadcast sent");
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigUpdate {
+    #[serde(default)]
+    routes: Option<Vec<RouteConfig>>,
+    #[serde(default)]
+    vpns: Option<Vec<VpnConfig>>,
+    #[serde(default)]
+    version: Option<u64>,
+}
+
+async fn run_http_server(
+    listen: &str,
+    config_dir: &Path,
+    notify: &std::sync::Arc<Notify>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(listen).await?;
+    tracing::info!(addr = %listen, "sy.admin http listening");
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        let config_dir = config_dir.to_path_buf();
+        let notify = std::sync::Arc::clone(&notify);
+        tokio::spawn(async move {
+            if let Err(err) = handle_http(&mut stream, &config_dir, &notify).await {
+                tracing::warn!("http handler error: {err}");
+            }
+        });
+    }
+}
+
+async fn handle_http(
+    stream: &mut tokio::net::TcpStream,
+    config_dir: &Path,
+    notify: &std::sync::Arc<Notify>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (method, path, headers, body) = read_http_request(stream).await?;
+    match (method.as_str(), path.as_str()) {
+        ("GET", "/health") => {
+            respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
+        }
+        ("GET", "/config/routes") => {
+            let config = load_config(config_dir)?;
+            respond_json(stream, 200, &serde_json::to_string(&config)?).await?;
+        }
+        ("PUT", "/config/routes") => {
+            let update: ConfigUpdate = serde_json::from_slice(&body)?;
+            let mut current = load_config(config_dir)?;
+            if let Some(routes) = update.routes {
+                current.routes = routes;
+            }
+            if let Some(vpns) = update.vpns {
+                current.vpns = vpns;
+            }
+            let next_version = update
+                .version
+                .unwrap_or_else(|| current.version.saturating_add(1));
+            current.version = next_version;
+            current.updated_at = now_epoch_ms().to_string();
+            write_config(config_dir, &current)?;
+    notify.notify_one();
+            respond_json(stream, 200, &serde_json::to_string(&current)?).await?;
+        }
+        ("PUT", "/config/vpns") => {
+            let update: ConfigUpdate = serde_json::from_slice(&body)?;
+            let mut current = load_config(config_dir)?;
+            if let Some(vpns) = update.vpns {
+                current.vpns = vpns;
+            }
+            let next_version = update
+                .version
+                .unwrap_or_else(|| current.version.saturating_add(1));
+            current.version = next_version;
+            current.updated_at = now_epoch_ms().to_string();
+            write_config(config_dir, &current)?;
+    notify.notify_one();
+            respond_json(stream, 200, &serde_json::to_string(&current)?).await?;
+        }
+        _ => {
+            let _ = headers;
+            respond_json(stream, 404, r#"{"error":"not_found"}"#).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn read_http_request(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<(String, String, HashMap<String, String>, Vec<u8>), Box<dyn std::error::Error>> {
+    let mut buf = Vec::new();
+    let mut header_end = None;
+    loop {
+        let mut chunk = [0u8; 1024];
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = find_double_crlf(&buf) {
+            header_end = Some(pos + 4);
+            break;
+        }
+    }
+    let header_end = header_end.ok_or("invalid http request")?;
+    let header_str = String::from_utf8_lossy(&buf[..header_end]);
+    let mut lines = header_str.split("\r\n");
+    let request_line = lines.next().ok_or("missing request line")?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().ok_or("missing method")?.to_string();
+    let path = parts.next().ok_or("missing path")?.to_string();
+    let mut headers = HashMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            headers.insert(k.trim().to_lowercase(), v.trim().to_string());
+        }
+    }
+    let content_length = headers
+        .get("content-length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = buf[header_end..].to_vec();
+    while body.len() < content_length {
+        let mut chunk = vec![0u8; content_length - body.len()];
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    Ok((method, path, headers, body))
+}
+
+fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+async fn respond_json(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    body: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status_line = match status {
+        200 => "HTTP/1.1 200 OK",
+        400 => "HTTP/1.1 400 Bad Request",
+        404 => "HTTP/1.1 404 Not Found",
+        _ => "HTTP/1.1 500 Internal Server Error",
+    };
+    let response = format!(
+        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.as_bytes().len(),
+        body
+    );
+    stream.write_all(response.as_bytes()).await?;
     Ok(())
 }

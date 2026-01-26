@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use jsr_client::{NodeClient, NodeConfig};
+use jsr_client::protocol::{ConfigChangedPayload, MSG_CONFIG_CHANGED, SYSTEM_KIND};
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, VpnAssignment,
     ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
@@ -91,7 +92,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => socket_dir.clone(),
     };
     let mut sy_config = load_config(&config_dir)?;
-    let mut last_modified = config_mtime(&config_dir)?;
 
     let shm_name = format!("/jsr-config-{}", island.island_id);
     let node_uuid = load_or_create_uuid(&state_dir.join("nodes"), "SY.config.routes")?;
@@ -106,18 +106,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
     };
-    let _client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     tracing::info!("connected to router");
 
     let mut ticker = time::interval(Duration::from_secs(5));
     loop {
-        ticker.tick().await;
-        writer.update_heartbeat();
-        let current = config_mtime(&config_dir)?;
-        if current > last_modified {
-            sy_config = load_config(&config_dir)?;
-            apply_config(&mut writer, &sy_config)?;
-            last_modified = current;
+        tokio::select! {
+            _ = ticker.tick() => {
+                writer.update_heartbeat();
+            }
+            msg = client.recv() => {
+                let msg = msg?;
+                if msg.meta.msg_type != SYSTEM_KIND || msg.meta.msg.as_deref() != Some(MSG_CONFIG_CHANGED) {
+                    continue;
+                }
+                let payload: ConfigChangedPayload = serde_json::from_value(msg.payload)?;
+                if payload.version <= sy_config.version {
+                    continue;
+                }
+                match payload.subsystem.as_str() {
+                    "routes" => {
+                        if let Some(routes) = parse_routes(&payload.config)? {
+                            sy_config.routes = routes;
+                        }
+                    }
+                    "vpn" | "vpns" => {
+                        if let Some(vpns) = parse_vpns(&payload.config)? {
+                            sy_config.vpns = vpns;
+                        }
+                    }
+                    _ => {
+                        continue;
+                    }
+                }
+                sy_config.version = payload.version;
+                sy_config.updated_at = now_epoch_ms().to_string();
+                apply_config(&mut writer, &sy_config)?;
+                write_config(&config_dir, &sy_config)?;
+                tracing::info!(
+                    subsystem = %payload.subsystem,
+                    version = payload.version,
+                    "config changed applied"
+                );
+            }
         }
     }
 }
@@ -164,6 +195,13 @@ fn load_config(config_dir: &Path) -> Result<SyConfigFile, Box<dyn std::error::Er
     Ok(serde_yaml::from_str(&data)?)
 }
 
+fn write_config(config_dir: &Path, config: &SyConfigFile) -> Result<(), Box<dyn std::error::Error>> {
+    let path = config_dir.join("sy-config-routes.yaml");
+    let data = serde_yaml::to_string(config)?;
+    fs::write(&path, data)?;
+    Ok(())
+}
+
 fn apply_config(
     writer: &mut ConfigRegionWriter,
     sy_config: &SyConfigFile,
@@ -186,11 +224,6 @@ fn apply_config(
         );
     }
     Ok(())
-}
-
-fn config_mtime(config_dir: &Path) -> Result<std::time::SystemTime, Box<dyn std::error::Error>> {
-    let path = config_dir.join("sy-config-routes.yaml");
-    Ok(fs::metadata(&path)?.modified()?)
 }
 
 fn build_routes(routes: &[RouteConfig]) -> Result<Vec<StaticRouteEntry>, Box<dyn std::error::Error>> {
@@ -225,6 +258,40 @@ fn build_vpns(vpns: &[VpnConfig]) -> Result<Vec<VpnAssignment>, Box<dyn std::err
         out.push(entry);
     }
     Ok(out)
+}
+
+fn parse_routes(
+    value: &serde_json::Value,
+) -> Result<Option<Vec<RouteConfig>>, Box<dyn std::error::Error>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    if value.is_array() {
+        let routes: Vec<RouteConfig> = serde_json::from_value(value.clone())?;
+        return Ok(Some(routes));
+    }
+    if let Some(routes_value) = value.get("routes") {
+        let routes: Vec<RouteConfig> = serde_json::from_value(routes_value.clone())?;
+        return Ok(Some(routes));
+    }
+    Ok(None)
+}
+
+fn parse_vpns(
+    value: &serde_json::Value,
+) -> Result<Option<Vec<VpnConfig>>, Box<dyn std::error::Error>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    if value.is_array() {
+        let vpns: Vec<VpnConfig> = serde_json::from_value(value.clone())?;
+        return Ok(Some(vpns));
+    }
+    if let Some(vpns_value) = value.get("vpns") {
+        let vpns: Vec<VpnConfig> = serde_json::from_value(vpns_value.clone())?;
+        return Ok(Some(vpns));
+    }
+    Ok(None)
 }
 
 fn match_kind(value: &str) -> Result<u8, Box<dyn std::error::Error>> {
