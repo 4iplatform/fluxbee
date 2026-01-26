@@ -6,10 +6,8 @@ wan:
   listen: "0.0.0.0:9000"
   gateway_name: "RT.gateway"
   uplinks:
-    - address: "staging.internal:9000"
-    - address: "prod.internal:9000"
+    - address: "192.168.8.220:9000"
   authorized_islands:
-    - staging
     - prod
 
 # Admin API (optional).
