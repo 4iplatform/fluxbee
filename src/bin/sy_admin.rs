@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use std::future;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -99,6 +100,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|admin| admin.listen)
         .unwrap_or_else(|| "0.0.0.0:8080".to_string());
 
+    let notify = std::sync::Arc::new(Notify::new());
+    let notify_http = std::sync::Arc::clone(&notify);
+    let http_config_dir = config_dir.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_http_server(&admin_listen, &http_config_dir, &notify_http).await {
+            tracing::error!("http server error: {err}");
+        }
+    });
+
+    let notify_loop = std::sync::Arc::clone(&notify);
+    let loop_config_dir = config_dir.clone();
+    let loop_state_dir = state_dir.clone();
+    let loop_socket_dir = socket_dir.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_broadcast_loop(
+            loop_config_dir,
+            loop_state_dir,
+            loop_socket_dir,
+            notify_loop,
+        )
+        .await
+        {
+            tracing::error!("broadcast loop error: {err}");
+        }
+    });
+
+    future::pending::<()>().await;
+    Ok(())
+}
+
+async fn run_broadcast_loop(
+    config_dir: PathBuf,
+    state_dir: PathBuf,
+    socket_dir: PathBuf,
+    notify: std::sync::Arc<Notify>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let node_config = NodeConfig {
         name: "SY.admin".to_string(),
         router_socket: socket_dir,
@@ -108,15 +145,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     tracing::info!("connected to router");
-
-    let notify = std::sync::Arc::new(Notify::new());
-    let notify_http = std::sync::Arc::clone(&notify);
-    let http_config_dir = config_dir.clone();
-    tokio::spawn(async move {
-        if let Err(err) = run_http_server(&admin_listen, &http_config_dir, &notify_http).await {
-            tracing::error!("http server error: {err}");
-        }
-    });
 
     let mut last_config = load_config(&config_dir)?;
     let mut last_version = last_config.version;
