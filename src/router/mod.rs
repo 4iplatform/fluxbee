@@ -476,16 +476,27 @@ async fn handle_node(
         false,
     )
     .await;
-    let _ = refresh_lsa(
-        &lsa_reader,
-        &lsa_snapshot,
-        island_id,
-        &nodes,
-        &peer_nodes,
-        &static_routes,
-        &fib,
-    )
-    .await;
+    {
+        let lsa_reader = Arc::clone(&lsa_reader);
+        let lsa_snapshot = Arc::clone(&lsa_snapshot);
+        let nodes = Arc::clone(&nodes);
+        let peer_nodes = Arc::clone(&peer_nodes);
+        let static_routes = Arc::clone(&static_routes);
+        let fib = Arc::clone(&fib);
+        let island_id = island_id.to_string();
+        tokio::spawn(async move {
+            let _ = refresh_lsa(
+                &lsa_reader,
+                &lsa_snapshot,
+                &island_id,
+                &nodes,
+                &peer_nodes,
+                &static_routes,
+                &fib,
+            )
+            .await;
+        });
+    }
     let vpn_id = assign_vpn(&node_name, snapshot.as_ref());
     tracing::info!(node = %node_name, vpn_id = vpn_id, "vpn assigned");
     let connected_at = now_epoch_ms();
