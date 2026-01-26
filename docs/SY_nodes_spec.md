@@ -1050,24 +1050,67 @@ Sincronización de tiempo en la red.
 
 ## 5. SY.admin
 
-Gateway HTTP REST único para toda la infraestructura. Punto de entrada para humanos y AI de infraestructura.
+Gateway HTTP REST único para toda la infraestructura. Punto de entrada para humanos y AI de infraestructura. **Solo corre en mother island.**
 
 ### 5.1 Resumen
 
 | Aspecto | Valor |
 |---------|-------|
 | Nombre L2 | `SY.admin` (único en todo el sistema) |
+| Ubicación | **Solo en mother island** |
 | Función | Gateway HTTP → protocolo interno |
 | Interfaz | HTTP REST |
 | Seguridad | Ninguna (usar nginx/proxy externo si se requiere) |
-| Socket | `/var/run/json-router/nodes/` (como cualquier nodo) |
+| Socket | `/var/run/json-router/routers/` (como cualquier nodo) |
+| Broadcast | **Único emisor de CONFIG_CHANGED** |
 
-### 5.2 Conexión al Router
+### 5.2 Mother Island
+
+SY.admin **solo existe en mother island**. Las islas hijas no tienen SY.admin, solo reciben CONFIG_CHANGED via broadcast.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       MOTHER ISLAND                             │
+│                                                                 │
+│   Internet ──► Reverse Proxy ──► SY.admin:8080                 │
+│                                       │                         │
+│                                       ▼                         │
+│                              ┌─────────────────┐                │
+│                              │    SY.admin     │                │
+│                              │ (único global)  │                │
+│                              └────────┬────────┘                │
+│                                       │                         │
+│                          CONFIG_CHANGED (broadcast)             │
+│                                       │                         │
+│         ┌─────────────────────────────┼─────────────────────────┤
+│         ▼                             ▼                         │
+│  SY.orchestrator              SY.config.routes                  │
+│  SY.opa.rules                 RT.gateway                        │
+└─────────────────────────────────────────────────────────────────┘
+                            │ WAN
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+        ▼                   ▼                   ▼
+┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+│  Isla Hija    │   │  Isla Hija    │   │  Isla Hija    │
+│               │   │               │   │               │
+│ SY.orchestrator   │ SY.orchestrator   │ SY.orchestrator
+│ SY.config.routes  │ SY.config.routes  │ SY.config.routes
+│ SY.opa.rules  │   │ SY.opa.rules  │   │ SY.opa.rules  │
+│ RT.gateway    │   │ RT.gateway    │   │ RT.gateway    │
+│               │   │               │   │               │
+│ (sin SY.admin)│   │ (sin SY.admin)│   │ (sin SY.admin)│
+│ Solo escuchan │   │ Solo escuchan │   │ Solo escuchan │
+│ CONFIG_CHANGED│   │ CONFIG_CHANGED│   │ CONFIG_CHANGED│
+└───────────────┘   └───────────────┘   └───────────────┘
+```
+
+### 5.3 Conexión al Router
 
 SY.admin se conecta como un nodo normal:
 
 ```
-1. Conecta a socket en /var/run/json-router/nodes/
+1. Conecta a socket en /var/run/json-router/routers/
 2. Envía HELLO:
    {
      "meta": { "type": "system", "msg": "HELLO" },
@@ -1076,47 +1119,38 @@ SY.admin se conecta como un nodo normal:
        "version": "1.0"
      }
    }
-3. Router lo registra con nombre L2 "SY.admin"
+3. Router lo registra con nombre L2 "SY.admin@<mother-island>"
 4. SY.admin envía/recibe mensajes normalmente
 ```
 
-**Requisito de deployment:** SY.admin debe correr en la primera isla del bus (la que tiene conectividad directa o transitiva a todas las demás islas).
-
-### 5.3 Arquitectura
+### 5.4 Arquitectura
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                           SY.admin                                  │
-│                      (único en todo el sistema)                     │
+│                 (único global, solo en mother island)               │
 │                                                                      │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐          │
 │  │ HTTP Server  │    │  Translator  │    │  Router Conn │          │
 │  │              │    │              │    │              │          │
-│  │ REST API     │───►│ HTTP → Frame │───►│ Socket Unix  │          │
-│  │ JSON in/out  │◄───│ Frame → HTTP │◄───│              │          │
+│  │ REST API     │───►│ HTTP → JSON  │───►│ Socket Unix  │          │
+│  │ JSON in/out  │◄───│ JSON → HTTP  │◄───│              │          │
 │  └──────────────┘    └──────────────┘    └──────────────┘          │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────┐          │
+│  │                  CONFIG_CHANGED                       │          │
+│  │                                                       │          │
+│  │  SY.admin es el ÚNICO que emite CONFIG_CHANGED       │          │
+│  │  Todos los demás nodos (en todas las islas) escuchan │          │
+│  └──────────────────────────────────────────────────────┘          │
 └─────────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-                           Router local
-                                │
-            ┌───────────────────┼───────────────────┐
-            │                   │                   │
-            ▼                   ▼                   ▼
-    ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-    │ Isla A       │   │ Isla B       │   │ Isla C       │
-    │              │   │              │   │              │
-    │ SY.orch      │   │ SY.orch      │   │ SY.orch      │
-    │ SY.config    │   │ SY.config    │   │ SY.config    │
-    │ SY.opa       │   │ SY.opa       │   │ SY.opa       │
-    └──────────────┘   └──────────────┘   └──────────────┘
 ```
 
 **Principios:**
 - Sin autenticación propia (delegar a proxy externo)
-- Traduce HTTP REST a mensajes del protocolo
+- Traduce HTTP REST a tramas JSON del protocolo
+- **Único emisor de CONFIG_CHANGED** (broadcast a todas las islas)
 - Envía por socket, nunca lee SHM directo
-- Conoce las islas por configuración
 
 ### 5.3 API REST
 

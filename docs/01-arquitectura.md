@@ -165,7 +165,75 @@ admin:
 - Todo lo demás (rutas, VPN, nodos) se configura via API.
 - Ver `07-operaciones.md` para detalle completo.
 
-### 6.2 Definición de Isla
+### 6.2 Mother Island
+
+El sistema tiene una jerarquía de islas con una **mother island** (isla madre) en la raíz:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       MOTHER ISLAND                             │
+│                                                                 │
+│   • Única isla con SY.admin (punto de entrada API)             │
+│   • Única isla con acceso a Internet (via reverse proxy)       │
+│   • Origen de todos los CONFIG_CHANGED (broadcast)             │
+│   • Puede hacer add_island para crear islas hijas              │
+│   • wan.listen activo (recibe conexiones de hijas)             │
+│   • wan.uplinks vacío (no se conecta a nadie)                  │
+│                                                                 │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ WAN
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+        ▼                   ▼                   ▼
+┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+│  Isla Hija A  │   │  Isla Hija B  │   │  Isla Hija C  │
+│               │   │               │   │               │
+│ • Sin SY.admin│   │ • Sin SY.admin│   │ • Sin SY.admin│
+│ • Sin Internet│   │ • Sin Internet│   │ • Sin Internet│
+│ • Solo escucha│   │ • Solo escucha│   │ • Solo escucha│
+│   CONFIG_CHANGED  │   CONFIG_CHANGED  │   CONFIG_CHANGED
+│ • wan.uplinks │   │ • wan.uplinks │   │ • wan.uplinks │
+│   → mother    │   │   → mother    │   │   → mother    │
+└───────────────┘   └───────────────┘   └───────────────┘
+```
+
+| Característica | Mother Island | Isla Hija |
+|---------------|---------------|-----------|
+| SY.admin | ✅ Único global | ❌ No tiene |
+| Internet | ✅ Via reverse proxy | ❌ Red interna |
+| CONFIG_CHANGED | ✅ Emite broadcast | Solo escucha |
+| add_island | ✅ Puede crear hijas | ❌ No puede |
+| wan.listen | ✅ Recibe conexiones | ❌ No recibe |
+| wan.uplinks | ❌ Vacío | ✅ Apunta a mother |
+| Storage | Source of truth | Cache/mount de mother |
+
+**island.yaml de Mother:**
+```yaml
+island_id: produccion
+
+wan:
+  gateway_name: RT.gateway
+  listen: "0.0.0.0:9000"
+  # Sin uplinks - es el origen
+
+admin:
+  listen: "0.0.0.0:8080"
+```
+
+**island.yaml de Hija (generado por add_island):**
+```yaml
+island_id: staging
+
+wan:
+  gateway_name: RT.gateway
+  uplinks:
+    - address: "192.168.1.10:9000"   # Mother
+  # Sin listen - no recibe conexiones
+  
+# Sin admin - solo mother tiene
+```
+
+### 6.3 Definición de Isla
 
 > **Isla = Host = Shared Memory**
 >
@@ -198,7 +266,7 @@ admin:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 6.3 Naming L2 con @isla (OBLIGATORIO)
+### 6.4 Naming L2 con @isla (OBLIGATORIO)
 
 Todo nombre L2 **incluye isla** con el sufijo `@`:
 
@@ -222,7 +290,7 @@ RT.gateway@produccion
 - La **librería de nodo agrega @isla automáticamente** desde `island.yaml`
 - El nodo solo configura `name: "AI.soporte.l1"`, la librería lo convierte a `AI.soporte.l1@produccion`
 
-### 6.4 Routing Inter-Isla
+### 6.5 Routing Inter-Isla
 
 El routing inter-isla se decide parseando `@isla` del destino:
 

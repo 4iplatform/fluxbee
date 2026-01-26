@@ -263,9 +263,81 @@ socket.on('data', (chunk) => {
 
 | Mensaje | Origen | Destino | Propósito |
 |---------|--------|---------|-----------|
-| `CONFIG_CHANGED` | SY.config.routes | Broadcast RT.* | Notificar cambio en jsr-config |
+| `CONFIG_CHANGED` | SY.admin | Broadcast (todos) | Notificar cambio de configuración |
 
-**Regla:** Al recibir `CONFIG_CHANGED` (o detectar `config_version` nuevo), el router re-lee la config, actualiza rutas estáticas, re-evalúa VPN de todos sus nodos conectados, y actualiza `vpn_id` en su región SHM.
+**CONFIG_CHANGED** es el mensaje unificado para todos los cambios de configuración del sistema. SY.admin (único, en mother island) es el único que lo emite.
+
+#### 7.4.1 Formato
+
+```json
+{
+  "routing": {
+    "src": "<uuid-sy-admin>",
+    "dst": "broadcast",
+    "ttl": 16,
+    "trace_id": "<uuid>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "CONFIG_CHANGED"
+  },
+  "payload": {
+    "subsystem": "routes",
+    "version": 42,
+    "config": { ... }
+  }
+}
+```
+
+#### 7.4.2 Subsystems
+
+| Subsystem | Quién actúa | Contenido de `config` |
+|-----------|-------------|----------------------|
+| `routes` | SY.config.routes, RT.* | Rutas estáticas |
+| `vpn` | SY.config.routes, RT.* | Tabla VPN |
+| `opa` | SY.opa.rules, RT.* | Policies OPA |
+| `storage` | SY.orchestrator | Path del storage |
+| `islands` | SY.orchestrator | Lista de islas |
+
+#### 7.4.3 Ejemplos
+
+**Cambio de rutas:**
+```json
+{
+  "payload": {
+    "subsystem": "routes",
+    "version": 43,
+    "config": {
+      "routes": [
+        { "prefix": "AI.soporte.*", "action": "FORWARD" }
+      ]
+    }
+  }
+}
+```
+
+**Cambio de storage:**
+```json
+{
+  "payload": {
+    "subsystem": "storage",
+    "version": 1,
+    "config": {
+      "path": "/mnt/jsr-shared"
+    }
+  }
+}
+```
+
+#### 7.4.4 Reglas de procesamiento
+
+Cada nodo al recibir CONFIG_CHANGED:
+
+1. Verificar si `subsystem` le incumbe (sino ignorar)
+2. Verificar `version > last_version` (sino ignorar)
+3. Aplicar cambios en memoria
+4. Persistir en archivo local (para restart)
+5. Actualizar `last_version`
 
 ### 7.5 Tiempo
 

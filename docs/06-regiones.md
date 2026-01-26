@@ -137,64 +137,84 @@ vpns:
 ### 2.5 Flujo de Actualización
 
 ```
-1. Admin/API envía mensaje a SY.config.routes
-2. SY.config.routes valida
-3. SY.config.routes persiste en YAML
+1. SY.admin recibe request HTTP (ej: POST /routes)
+2. SY.admin envía trama JSON a SY.config.routes
+3. SY.config.routes valida
 4. SY.config.routes escribe en jsr-config-<island>
 5. SY.config.routes incrementa config_version
-6. SY.config.routes envía broadcast CONFIG_CHANGED
-7. Routers re-leen config, actualizan FIB
-8. Routers re-evalúan VPN de nodos conectados y actualizan vpn_id en SHM
+6. SY.config.routes persiste en YAML
+7. SY.config.routes responde OK a SY.admin
+8. SY.admin envía broadcast CONFIG_CHANGED (subsystem: routes)
+9. Todos los nodos (incluido routers de otras islas) re-leen config
 ```
+
+**IMPORTANTE:** CONFIG_CHANGED lo emite SY.admin, no SY.config.routes. SY.admin es el único emisor de CONFIG_CHANGED en todo el sistema.
 
 ### 2.6 Notificación y Aplicación de Cambios
 
-Cuando SY.config.routes actualiza la región:
+Cuando SY.admin completa una operación de config:
 
 ```
 1. SY.config.routes escribe en jsr-config-<island>
 2. SY.config.routes incrementa config_version
-3. SY.config.routes envía broadcast CONFIG_CHANGED
+3. SY.config.routes responde OK a SY.admin
+4. SY.admin envía broadcast CONFIG_CHANGED (subsystem: routes)
 ```
 
-**Mensaje CONFIG_CHANGED:**
+**Mensaje CONFIG_CHANGED (emitido por SY.admin):**
 
 ```json
 {
   "routing": {
-    "src": "<uuid-sy-config>",
+    "src": "<uuid-sy-admin>",
     "dst": "broadcast",
-    "ttl": 2,
+    "ttl": 16,
     "trace_id": "<uuid>"
   },
   "meta": {
     "type": "system",
-    "msg": "CONFIG_CHANGED",
-    "target": "RT.*"
+    "msg": "CONFIG_CHANGED"
   },
   "payload": {
-    "config_version": 42
+    "subsystem": "routes",
+    "version": 42,
+    "config": {
+      "routes": [ ... ]
+    }
   }
 }
 ```
 
-**Cada router al recibir CONFIG_CHANGED:**
+**Cada nodo al recibir CONFIG_CHANGED:**
+
+1. Verificar si `subsystem` le incumbe (routers: routes, vpn, opa)
+2. Verificar `version > last_version`
+3. Aplicar cambios
+
+**Ejemplo para routers:**
 
 ```rust
-fn handle_config_changed(&mut self, new_version: u64) {
-    // 1. Re-leer config
-    let config = self.read_config_region();
-    if config.header.config_version <= self.last_config_version {
+fn handle_config_changed(&mut self, payload: &ConfigChangedPayload) {
+    // 1. Verificar subsystem
+    if payload.subsystem != "routes" && payload.subsystem != "vpn" {
+        return;  // No me incumbe
+    }
+    
+    // 2. Verificar versión
+    if payload.version <= self.last_config_version {
         return;  // Ya procesado
     }
     
-    // 2. Actualizar rutas estáticas
+    // 3. Re-leer config de SHM
+    let config = self.read_config_region();
+    
+    // 4. Actualizar rutas estáticas
     self.static_routes = config.routes.clone();
     
-    // 3. Actualizar tabla VPN
+    // 5. Actualizar tabla VPN
     self.vpn_table = config.vpns.clone();
     
-    // 4. Re-evaluar VPN de TODOS los nodos conectados
+    // 6. Re-evaluar VPN de TODOS los nodos conectados
     for node in self.my_nodes.iter_mut() {
         let new_vpn = self.evaluate_vpn(&node.name);
         if node.vpn_id != new_vpn {
@@ -204,11 +224,11 @@ fn handle_config_changed(&mut self, new_version: u64) {
         }
     }
     
-    // 5. Escribir cambios en SHM
+    // 7. Escribir cambios en SHM
     self.write_nodes_to_shm();
     
-    // 6. Recordar versión
-    self.last_config_version = config.header.config_version;
+    // 8. Recordar versión
+    self.last_config_version = payload.version;
 }
 ```
 

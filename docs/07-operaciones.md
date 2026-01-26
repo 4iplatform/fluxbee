@@ -25,16 +25,19 @@ El usuario configura **solo** lo que depende de su infraestructura. El sistema m
 Todos los binarios conocen estos paths por código:
 
 ```
-/etc/json-router/                  # Configuración
-├── island.yaml                    # Identidad y WAN
-└── config-routes.yaml             # Rutas estáticas y VPN
+/etc/json-router/                  # Configuración (solo island.yaml lo toca el humano)
+└── island.yaml                    # Identidad y WAN (ÚNICO archivo que edita el humano)
 
-/var/lib/json-router/              # Estado persistente
+/var/lib/json-router/              # Estado persistente (auto-generado, persistido por SY.*)
 ├── identity.yaml                  # UUID del gateway (auto-generado)
-├── opa-rules/                     # Policies OPA
+├── orchestrator.yaml              # Config de SY.orchestrator (storage.path, etc.)
+├── config-routes.yaml             # Rutas/VPN (persiste SY.config.routes)
+├── opa-rules/                     # Policies OPA (persiste SY.opa.rules)
+├── modules/                       # Módulos/binarios de nodos
+├── blob/                          # Blobs de mensajes grandes
 ├── nodes/                         # UUIDs de nodos
 │   └── AI.soporte.l1.uuid
-└── islands/                       # Repo de islas hijas (si es mother)
+└── islands/                       # Repo de islas hijas (solo en mother)
     └── staging/
         ├── ssh.key
         ├── ssh.key.pub
@@ -499,22 +502,27 @@ Después de `add_island` exitoso:
 **En isla remota (staging):**
 ```
 /etc/json-router/
-├── island.yaml       # Con uplink a mother
-└── config-routes.yaml
+└── island.yaml       # Con uplink a mother (sin admin)
+
+/var/lib/json-router/
+├── identity.yaml
+├── orchestrator.yaml
+├── config-routes.yaml
+└── opa-rules/
 
 /usr/bin/
 ├── sy-orchestrator
 ├── rt-gateway
 ├── sy-config-routes
-├── sy-opa-rules
-└── sy-admin
+└── sy-opa-rules
+# NOTA: NO tiene sy-admin (solo mother tiene)
 
 Procesos corriendo:
 ├── sy-orchestrator
 ├── rt-gateway (conectado a mother:9000)
 ├── sy-config-routes
-├── sy-opa-rules
-└── sy-admin
+└── sy-opa-rules
+# SIN sy-admin - solo escucha CONFIG_CHANGED de mother
 ```
 
 ### 4.9 Acceso SSH Post-Bootstrap
@@ -554,11 +562,148 @@ ssh -i /var/lib/json-router/islands/staging/ssh.key root@192.168.1.50
 | `GET /health` | - | Health check básico |
 | `GET /island/status` | `island_status` | Estado completo de la isla |
 
+### 5.4 Storage y Módulos
+
+| Endpoint HTTP | Action | Descripción |
+|---------------|--------|-------------|
+| `GET /config/storage` | `get_storage` | Path actual de storage |
+| `PUT /config/storage` | `set_storage` | Cambiar path (broadcast CONFIG_CHANGED) |
+| `GET /modules` | `list_modules` | Lista módulos disponibles |
+| `GET /modules/{name}` | `list_versions` | Lista versiones de un módulo |
+| `GET /modules/{name}/{version}` | `get_module` | Descarga módulo |
+| `POST /modules/{name}/{version}` | `upload_module` | Sube módulo (solo mother) |
+
 ---
 
-## 6. Systemd
+## 6. Storage y Módulos
 
-### 6.1 Service del Orchestrator
+### 6.1 Modelo de Storage
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         STORAGE                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  DEFAULT (sin NFS):                  CON NFS (usuario monta):   │
+│  ─────────────────                   ──────────────────────     │
+│                                                                 │
+│  Mother:                             Mother + Hijas:            │
+│  /var/lib/json-router/               /mnt/jsr-shared/           │
+│  ├── modules/                        ├── modules/               │
+│  └── blob/                           └── blob/                  │
+│       │                                   │                     │
+│       │ HTTP (API)                        │ (mismo fs)          │
+│       ▼                                   │                     │
+│  Hijas: piden a mother,                   │                     │
+│         cachean local                     │                     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 Configuración de Storage
+
+**Default:** `/var/lib/json-router` (local, hijas piden por HTTP)
+
+**Con NFS:** El usuario monta NFS manualmente y cambia el path via API:
+
+```bash
+# 1. Usuario monta NFS (manual, fuera de JSON Router)
+mount -t nfs nas.internal:/exports/json-router /mnt/jsr-shared
+
+# 2. Cambiar storage via API
+curl -X PUT http://localhost:8080/config/storage \
+  -H "Content-Type: application/json" \
+  -d '{"path": "/mnt/jsr-shared"}'
+```
+
+Esto envía **CONFIG_CHANGED** con `subsystem: storage` a todas las islas.
+
+### 6.3 Flujo de Módulos (sin NFS)
+
+```
+Hija necesita módulo AI.soporte:1.2.0
+        │
+        ▼
+¿Existe en /var/lib/json-router/modules/AI.soporte/1.2.0/?
+        │
+    ┌───┴───┐
+    │       │
+   SÍ      NO
+    │       │
+    ▼       ▼
+  Usar   GET http://mother:8080/modules/AI.soporte/1.2.0
+  local         │
+                ▼
+          Guardar en cache local
+                │
+                ▼
+              Usar
+```
+
+### 6.4 Flujo de Módulos (con NFS)
+
+```
+Hija necesita módulo AI.soporte:1.2.0
+        │
+        ▼
+Leer de /mnt/jsr-shared/modules/AI.soporte/1.2.0/
+        │
+        ▼
+      Usar
+```
+
+Con NFS no hay HTTP, todas las islas leen del mismo filesystem.
+
+### 6.5 CONFIG_CHANGED para Storage
+
+```json
+{
+  "routing": {
+    "src": "<uuid-sy-admin>",
+    "dst": "broadcast",
+    "ttl": 16,
+    "trace_id": "<uuid>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "CONFIG_CHANGED"
+  },
+  "payload": {
+    "subsystem": "storage",
+    "version": 1,
+    "config": {
+      "path": "/mnt/jsr-shared"
+    }
+  }
+}
+```
+
+Cada SY.orchestrator al recibir esto:
+1. Actualiza `storage_path` en memoria
+2. Persiste en `/var/lib/json-router/orchestrator.yaml`
+3. Próximas operaciones de módulos usan el nuevo path
+
+### 6.6 Transición HTTP → NFS
+
+1. **Infra monta NFS** en todas las máquinas (mother + hijas) en el mismo path
+2. **Copiar datos** de mother al NFS (una vez):
+   ```bash
+   cp -r /var/lib/json-router/modules /mnt/jsr-shared/
+   cp -r /var/lib/json-router/blob /mnt/jsr-shared/
+   ```
+3. **Cambiar config via API** (propaga a todas las islas):
+   ```bash
+   curl -X PUT http://localhost:8080/config/storage \
+     -d '{"path": "/mnt/jsr-shared"}'
+   ```
+
+**Sin reiniciar nada.** El cambio es en caliente via CONFIG_CHANGED.
+
+---
+
+## 7. Systemd
+
+### 7.1 Service del Orchestrator
 
 ```ini
 # /etc/systemd/system/sy-orchestrator.service
@@ -579,7 +724,7 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-### 6.2 Uso
+### 7.2 Uso
 
 ```bash
 # Primera isla (mother)
@@ -594,7 +739,7 @@ curl -X POST http://localhost:8080/islands \
 
 ---
 
-## 7. Protecciones
+## 8. Protecciones
 
 | Componente | ¿Se puede matar via API? | Razón |
 |------------|--------------------------|-------|
@@ -607,9 +752,9 @@ curl -X POST http://localhost:8080/islands \
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
-### 8.1 Isla no arranca
+### 9.1 Isla no arranca
 
 ```bash
 # Verificar config
@@ -622,7 +767,7 @@ JSR_LOG_LEVEL=debug /usr/bin/sy-orchestrator
 journalctl -u sy-orchestrator -f
 ```
 
-### 8.2 add_island falla
+### 9.2 add_island falla
 
 ```bash
 # Verificar conectividad
@@ -637,7 +782,7 @@ ssh root@192.168.1.50
 grep PasswordAuthentication /etc/ssh/sshd_config
 ```
 
-### 8.3 WAN no conecta
+### 9.3 WAN no conecta
 
 ```bash
 # En mother, verificar que escucha
@@ -650,14 +795,14 @@ cat /etc/json-router/island.yaml
 journalctl -u sy-orchestrator | grep -i wan
 ```
 
-### 8.4 Acceder a isla remota post-bootstrap
+### 9.4 Acceder a isla remota post-bootstrap
 
 ```bash
 # Desde mother island
 ssh -i /var/lib/json-router/islands/staging/ssh.key root@192.168.1.50
 ```
 
-### 8.5 Reset completo de isla
+### 9.5 Reset completo de isla
 
 ```bash
 systemctl stop sy-orchestrator
@@ -670,7 +815,7 @@ systemctl start sy-orchestrator
 
 ---
 
-## 9. Defaults del Sistema
+## 10. Defaults del Sistema
 
 Valores hardcodeados, no configurables:
 
@@ -709,7 +854,7 @@ pub const DEFAULT_GATEWAY_NAME: &str = "RT.gateway";
 
 ---
 
-## 10. Fases de Implementación
+## 11. Fases de Implementación
 
 | Fase | Funcionalidad | Estado |
 |------|---------------|--------|
@@ -719,7 +864,7 @@ pub const DEFAULT_GATEWAY_NAME: &str = "RT.gateway";
 
 ---
 
-## 11. Referencias
+## 12. Referencias
 
 | Tema | Documento |
 |------|-----------|
