@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use jsr_client::{NodeClient, NodeConfig};
 use jsr_client::protocol::{
     build_echo, build_echo_reply, build_time_sync, build_withdraw, Destination, Message, Meta,
-    Routing, TimeSyncPayload,
+    Routing, TimeSyncPayload, MSG_OPA_RELOAD, SYSTEM_KIND,
 };
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target = args.get(2).map(|s| s.as_str()).unwrap_or("WF.listen");
     let node_name = match mode {
         "listen" => "WF.listen",
+        "opa_reload" => "SY.opa.rules",
         _ => "WF.echo",
     };
 
@@ -103,6 +104,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+    }
+
+    if mode == "opa_reload" {
+        let version = args
+            .get(2)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1);
+        let msg = Message {
+            routing: Routing {
+                src: client.uuid().to_string(),
+                dst: Destination::Broadcast,
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_OPA_RELOAD.to_string()),
+                scope: None,
+                target: None,
+                action: None,
+                priority: None,
+                context: None,
+            },
+            payload: json!({"version": version, "hash": null}),
+        };
+        client.send(&msg).await?;
+        println!("sent OPA_RELOAD version={version}");
+        return Ok(());
     }
 
     let mut seq = 1u64;

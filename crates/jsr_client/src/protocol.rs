@@ -201,9 +201,17 @@ pub const MSG_WAN_REJECT: &str = "WAN_REJECT";
 pub const MSG_TIME_SYNC: &str = "TIME_SYNC";
 pub const MSG_WITHDRAW: &str = "WITHDRAW";
 pub const MSG_CONFIG_CHANGED: &str = "CONFIG_CHANGED";
+pub const MSG_OPA_RELOAD: &str = "OPA_RELOAD";
 
 pub const SCOPE_VPN: &str = "vpn";
 pub const SCOPE_GLOBAL: &str = "global";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpaReloadPayload {
+    pub version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+}
 
 pub fn build_system_message(
     src: &str,

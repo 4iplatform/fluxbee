@@ -18,3 +18,5 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jsr-client = { path = "crates/jsr_client" }
+wasmtime = "19.0.0"
+regex = "1.10"

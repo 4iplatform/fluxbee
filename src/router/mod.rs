@@ -22,9 +22,9 @@ use jsr_client::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
     build_wan_accept, build_wan_hello, build_wan_reject, Destination, LsaNode, LsaPayload,
     LsaRoute, LsaVpn, Message, Meta, NodeAnnouncePayload, NodeHelloPayload, RouterHelloPayload,
-    WanAcceptPayload, WanHelloPayload, WanNegotiated, WanRejectPayload, WanTimers,
-    MSG_CONFIG_CHANGED, MSG_HELLO, MSG_LSA, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW,
-    SCOPE_GLOBAL, SYSTEM_KIND,
+    OpaReloadPayload, WanAcceptPayload, WanHelloPayload, WanNegotiated, WanRejectPayload,
+    WanTimers, MSG_CONFIG_CHANGED, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED,
+    MSG_UNREACHABLE, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use jsr_client::socket::connection::{read_frame, write_frame};
 
@@ -150,14 +150,8 @@ impl Router {
             loop {
                 ticker.tick().await;
                 let (policy_version, load_status) = {
-                    let mut opa = opa.lock().await;
-                    match opa.refresh_status() {
-                        Ok(status) => status,
-                        Err(err) => {
-                            tracing::warn!("opa status refresh failed: {err}");
-                            opa.status()
-                        }
-                    }
+                    let opa = opa.lock().await;
+                    opa.status()
                 };
                 let mut shm = shm.lock().await;
                 shm.update_heartbeat();
@@ -621,6 +615,36 @@ async fn handle_node(
                                     &lsa_seq,
                                 )
                                 .await;
+                            }
+                            continue;
+                        }
+                        if msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
+                            let payload: OpaReloadPayload = serde_json::from_value(msg.payload.clone())?;
+                            apply_opa_reload(&opa, &shm, &payload).await;
+                            let src_uuid = Uuid::parse_str(&msg.routing.src).ok();
+                            let local_senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = {
+                                let nodes_guard = nodes.lock().await;
+                                nodes_guard
+                                    .iter()
+                                    .filter_map(|(uuid, handle)| {
+                                        if src_uuid.is_some_and(|value| value == *uuid) {
+                                            None
+                                        } else {
+                                            Some(handle.sender.clone())
+                                        }
+                                    })
+                                    .collect()
+                            };
+                            if !local_senders.is_empty() {
+                                let data = serde_json::to_vec(&msg)?;
+                                for sender in local_senders {
+                                    let _ = sender.send(data.clone());
+                                }
+                                tracing::info!("opa reload forwarded to local nodes");
+                            }
+                            if msg.routing.ttl >= 2 {
+                                broadcast_to_peers(&peers, &msg).await?;
+                                tracing::info!("opa reload forwarded to peers");
                             }
                             continue;
                         }
@@ -2343,6 +2367,14 @@ async fn handle_peer_message(
         tracing::info!("config changed applied (peer)");
         return Ok(());
     }
+    if msg.meta.msg_type == SYSTEM_KIND
+        && msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD)
+    {
+        let payload: OpaReloadPayload = serde_json::from_value(msg.payload.clone())?;
+        apply_opa_reload(opa, shm, &payload).await;
+        tracing::info!("opa reload applied (peer)");
+        return Ok(());
+    }
     let src_node = {
         let peer_guard = peer_nodes.lock().await;
         peer_guard.get(&src_uuid).cloned()
@@ -2896,6 +2928,37 @@ async fn refresh_config(
         break;
     }
     last_snapshot
+}
+
+async fn apply_opa_reload(
+    opa: &Arc<Mutex<OpaResolver>>,
+    shm: &Arc<Mutex<RouterRegionWriter>>,
+    payload: &OpaReloadPayload,
+) {
+    {
+        let mut shm_guard = shm.lock().await;
+        shm_guard.update_opa_status(payload.version, 2);
+    }
+    let result = {
+        let mut opa_guard = opa.lock().await;
+        opa_guard.reload(payload.version)
+    };
+    let (version, status) = {
+        let opa_guard = opa.lock().await;
+        opa_guard.status()
+    };
+    {
+        let mut shm_guard = shm.lock().await;
+        shm_guard.update_opa_status(version, status);
+    }
+    match result {
+        Ok(()) => {
+            tracing::info!(version = version, "opa reload applied");
+        }
+        Err(err) => {
+            tracing::warn!(version = payload.version, "opa reload failed: {err}");
+        }
+    }
 }
 
 async fn refresh_lsa(
