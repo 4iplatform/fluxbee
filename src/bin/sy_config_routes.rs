@@ -23,7 +23,7 @@ struct IslandFile {
     island_id: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct SyConfigFile {
     version: u64,
     updated_at: String,
@@ -33,7 +33,7 @@ struct SyConfigFile {
     vpns: Vec<VpnConfig>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct RouteConfig {
     prefix: String,
     #[serde(default = "default_match_kind")]
@@ -47,7 +47,7 @@ struct RouteConfig {
     priority: Option<u16>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct VpnConfig {
     pattern: String,
     #[serde(default = "default_match_kind")]
@@ -124,25 +124,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if payload.version <= sy_config.version {
                     continue;
                 }
+                let mut next_config = sy_config.clone();
                 match payload.subsystem.as_str() {
                     "routes" => {
                         if let Some(routes) = parse_routes(&payload.config)? {
-                            sy_config.routes = routes;
+                            next_config.routes = routes;
                         }
                     }
                     "vpn" | "vpns" => {
                         if let Some(vpns) = parse_vpns(&payload.config)? {
-                            sy_config.vpns = vpns;
+                            next_config.vpns = vpns;
                         }
                     }
                     _ => {
                         continue;
                     }
                 }
-                sy_config.version = payload.version;
-                sy_config.updated_at = now_epoch_ms().to_string();
-                apply_config(&mut writer, &sy_config)?;
-                write_config(&config_dir, &sy_config)?;
+                if next_config.routes == sy_config.routes && next_config.vpns == sy_config.vpns {
+                    tracing::info!(
+                        subsystem = %payload.subsystem,
+                        version = payload.version,
+                        "config unchanged; skipping apply"
+                    );
+                    continue;
+                }
+                next_config.version = payload.version;
+                next_config.updated_at = now_epoch_ms().to_string();
+                apply_config(&mut writer, &next_config)?;
+                write_config(&config_dir, &next_config)?;
+                sy_config = next_config;
                 tracing::info!(
                     subsystem = %payload.subsystem,
                     version = payload.version,

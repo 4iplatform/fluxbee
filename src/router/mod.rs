@@ -2826,6 +2826,11 @@ async fn refresh_config(
             continue;
         }
 
+        if snapshot.header.config_version == *version_guard {
+            last_snapshot = Some(snapshot);
+            break;
+        }
+
         if force || snapshot.header.config_version != *version_guard {
             let mut routes_guard = static_routes.lock().await;
             *routes_guard = snapshot
