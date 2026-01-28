@@ -122,6 +122,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let payload: ConfigChangedPayload = serde_json::from_value(msg.payload)?;
                 if payload.version <= sy_config.version {
+                    tracing::info!(
+                        payload_version = payload.version,
+                        current_version = sy_config.version,
+                        "config version not newer; skipping"
+                    );
                     continue;
                 }
                 let mut next_config = sy_config.clone();

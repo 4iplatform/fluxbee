@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::future;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
-use tokio::time;
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -17,7 +16,6 @@ use jsr_client::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SCOPE_GLOBAL,
     SYSTEM_KIND,
 };
-use json_router::shm::now_epoch_ms;
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/json-router";
 const DEFAULT_STATE_DIR: &str = "/var/lib/json-router/state";
@@ -33,16 +31,6 @@ struct IslandFile {
 #[derive(Debug, Deserialize)]
 struct AdminSection {
     listen: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-struct SyConfigFile {
-    version: u64,
-    updated_at: String,
-    #[serde(default)]
-    routes: Vec<RouteConfig>,
-    #[serde(default)]
-    vpns: Vec<VpnConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -100,51 +88,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|admin| admin.listen)
         .unwrap_or_else(|| "0.0.0.0:8080".to_string());
 
-    let notify = std::sync::Arc::new(Notify::new());
-    let shared_config = std::sync::Arc::new(tokio::sync::Mutex::new(SyConfigFile {
-        version: 1,
-        updated_at: now_epoch_ms().to_string(),
-        routes: Vec::new(),
-        vpns: Vec::new(),
-    }));
-    let notify_http = std::sync::Arc::clone(&notify);
-    let config_http = std::sync::Arc::clone(&shared_config);
+    let (broadcast_tx, broadcast_rx) = mpsc::unbounded_channel::<BroadcastRequest>();
+    let http_tx = broadcast_tx.clone();
     tokio::spawn(async move {
-        if let Err(err) = run_http_server(&admin_listen, &config_http, &notify_http).await {
+        if let Err(err) = run_http_server(&admin_listen, &http_tx).await {
             tracing::error!("http server error: {err}");
         }
     });
 
-    let notify_loop = std::sync::Arc::clone(&notify);
-    let loop_config = std::sync::Arc::clone(&shared_config);
     let loop_config_dir = config_dir.clone();
     let loop_state_dir = state_dir.clone();
     let loop_socket_dir = socket_dir.clone();
     tokio::spawn(async move {
-        if let Err(err) = run_broadcast_loop(
-            loop_config,
-            loop_config_dir,
-            loop_state_dir,
-            loop_socket_dir,
-            notify_loop,
-        )
-        .await
-        {
-            tracing::error!("broadcast loop error: {err}");
-        }
+        run_broadcast_loop(broadcast_rx, loop_config_dir, loop_state_dir, loop_socket_dir).await;
     });
 
     future::pending::<()>().await;
     Ok(())
 }
 
+enum BroadcastRequest {
+    Routes(Vec<RouteConfig>),
+    Vpns(Vec<VpnConfig>),
+}
+
 async fn run_broadcast_loop(
-    shared_config: std::sync::Arc<tokio::sync::Mutex<SyConfigFile>>,
+    mut rx: mpsc::UnboundedReceiver<BroadcastRequest>,
     config_dir: PathBuf,
     state_dir: PathBuf,
     socket_dir: PathBuf,
-    notify: std::sync::Arc<Notify>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) {
     let node_config = NodeConfig {
         name: "SY.admin".to_string(),
         router_socket: socket_dir,
@@ -152,41 +125,62 @@ async fn run_broadcast_loop(
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
     };
-    let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let mut client = match NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await
+    {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::error!("broadcast loop connect failed: {err}");
+            return;
+        }
+    };
     tracing::info!("connected to router");
 
-    let mut last_version = {
-        let guard = shared_config.lock().await;
-        guard.version
-    };
-    let mut ticker = time::interval(Duration::from_secs(2));
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {},
-            _ = notify.notified() => {},
-        }
-        let config = {
-            let guard = shared_config.lock().await;
-            guard.clone()
+    while let Some(req) = rx.recv().await {
+        let failed = match req {
+            BroadcastRequest::Routes(routes) => {
+                match broadcast_config_changed(
+                    &mut client,
+                    "routes",
+                    0,
+                    serde_json::json!({ "routes": routes }),
+                )
+                .await
+                {
+                    Ok(()) => false,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "broadcast failed");
+                        true
+                    }
+                }
+            }
+            BroadcastRequest::Vpns(vpns) => {
+                match broadcast_config_changed(
+                    &mut client,
+                    "vpn",
+                    0,
+                    serde_json::json!({ "vpns": vpns }),
+                )
+                .await
+                {
+                    Ok(()) => false,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "broadcast failed");
+                        true
+                    }
+                }
+            }
         };
-        if config.version <= last_version {
-            continue;
+        if failed {
+            match NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await {
+                Ok(new_client) => {
+                    client = new_client;
+                    tracing::info!("reconnected to router");
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "reconnect failed");
+                }
+            }
         }
-        broadcast_config_changed(
-            &mut client,
-            "routes",
-            config.version,
-            serde_json::json!({ "routes": config.routes }),
-        )
-        .await?;
-        broadcast_config_changed(
-            &mut client,
-            "vpn",
-            config.version,
-            serde_json::json!({ "vpns": config.vpns }),
-        )
-        .await?;
-        last_version = config.version;
     }
 }
 
@@ -240,17 +234,15 @@ struct ConfigUpdate {
 
 async fn run_http_server(
     listen: &str,
-    shared_config: &std::sync::Arc<tokio::sync::Mutex<SyConfigFile>>,
-    notify: &std::sync::Arc<Notify>,
+    tx: &mpsc::UnboundedSender<BroadcastRequest>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(addr = %listen, "sy.admin http listening");
     loop {
         let (mut stream, _) = listener.accept().await?;
-        let config = std::sync::Arc::clone(shared_config);
-        let notify = std::sync::Arc::clone(&notify);
+        let tx = tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_http(&mut stream, &config, &notify).await {
+            if let Err(err) = handle_http(&mut stream, &tx).await {
                 tracing::warn!("http handler error: {err}");
             }
         });
@@ -259,53 +251,31 @@ async fn run_http_server(
 
 async fn handle_http(
     stream: &mut tokio::net::TcpStream,
-    shared_config: &std::sync::Arc<tokio::sync::Mutex<SyConfigFile>>,
-    notify: &std::sync::Arc<Notify>,
+    tx: &mpsc::UnboundedSender<BroadcastRequest>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (method, path, headers, body) = read_http_request(stream).await?;
     match (method.as_str(), path.as_str()) {
         ("GET", "/health") => {
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
         }
-        ("GET", "/config/routes") => {
-            let config = {
-                let guard = shared_config.lock().await;
-                guard.clone()
-            };
-            respond_json(stream, 200, &serde_json::to_string(&config)?).await?;
-        }
         ("PUT", "/config/routes") => {
             let update: ConfigUpdate = serde_json::from_slice(&body)?;
-            let mut current = shared_config.lock().await;
             if let Some(routes) = update.routes {
-                current.routes = routes;
+                let _ = tx.send(BroadcastRequest::Routes(routes));
             }
             if let Some(vpns) = update.vpns {
-                current.vpns = vpns;
+                let _ = tx.send(BroadcastRequest::Vpns(vpns));
             }
-            let next_version = update
-                .version
-                .unwrap_or_else(|| current.version.saturating_add(1));
-            current.version = next_version;
-            current.updated_at = now_epoch_ms().to_string();
-            notify.notify_one();
-            tracing::info!(version = current.version, "config routes updated");
-            respond_json(stream, 200, &serde_json::to_string(&*current)?).await?;
+            tracing::info!("config routes update received");
+            respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
         }
         ("PUT", "/config/vpns") => {
             let update: ConfigUpdate = serde_json::from_slice(&body)?;
-            let mut current = shared_config.lock().await;
             if let Some(vpns) = update.vpns {
-                current.vpns = vpns;
+                let _ = tx.send(BroadcastRequest::Vpns(vpns));
             }
-            let next_version = update
-                .version
-                .unwrap_or_else(|| current.version.saturating_add(1));
-            current.version = next_version;
-            current.updated_at = now_epoch_ms().to_string();
-            notify.notify_one();
-            tracing::info!(version = current.version, "config vpns updated");
-            respond_json(stream, 200, &serde_json::to_string(&*current)?).await?;
+            tracing::info!("config vpns update received");
+            respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
         }
         _ => {
             let _ = headers;
