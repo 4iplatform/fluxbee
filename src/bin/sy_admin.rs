@@ -117,11 +117,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let notify_loop = std::sync::Arc::clone(&notify);
     let loop_config = std::sync::Arc::clone(&shared_config);
+    let loop_config_dir = config_dir.clone();
     let loop_state_dir = state_dir.clone();
     let loop_socket_dir = socket_dir.clone();
     tokio::spawn(async move {
         if let Err(err) = run_broadcast_loop(
             loop_config,
+            loop_config_dir,
             loop_state_dir,
             loop_socket_dir,
             notify_loop,
@@ -138,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_broadcast_loop(
     shared_config: std::sync::Arc<tokio::sync::Mutex<SyConfigFile>>,
+    config_dir: PathBuf,
     state_dir: PathBuf,
     socket_dir: PathBuf,
     notify: std::sync::Arc<Notify>,
