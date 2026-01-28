@@ -101,21 +101,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "0.0.0.0:8080".to_string());
 
     let notify = std::sync::Arc::new(Notify::new());
+    let shared_config = std::sync::Arc::new(tokio::sync::Mutex::new(SyConfigFile {
+        version: 1,
+        updated_at: now_epoch_ms().to_string(),
+        routes: Vec::new(),
+        vpns: Vec::new(),
+    }));
     let notify_http = std::sync::Arc::clone(&notify);
-    let http_config_dir = config_dir.clone();
+    let config_http = std::sync::Arc::clone(&shared_config);
     tokio::spawn(async move {
-        if let Err(err) = run_http_server(&admin_listen, &http_config_dir, &notify_http).await {
+        if let Err(err) = run_http_server(&admin_listen, &config_http, &notify_http).await {
             tracing::error!("http server error: {err}");
         }
     });
 
     let notify_loop = std::sync::Arc::clone(&notify);
-    let loop_config_dir = config_dir.clone();
+    let loop_config = std::sync::Arc::clone(&shared_config);
     let loop_state_dir = state_dir.clone();
     let loop_socket_dir = socket_dir.clone();
     tokio::spawn(async move {
         if let Err(err) = run_broadcast_loop(
-            loop_config_dir,
+            loop_config,
             loop_state_dir,
             loop_socket_dir,
             notify_loop,
@@ -131,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_broadcast_loop(
-    config_dir: PathBuf,
+    shared_config: std::sync::Arc<tokio::sync::Mutex<SyConfigFile>>,
     state_dir: PathBuf,
     socket_dir: PathBuf,
     notify: std::sync::Arc<Notify>,
@@ -146,15 +152,20 @@ async fn run_broadcast_loop(
     let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     tracing::info!("connected to router");
 
-    let mut last_config = load_config(&config_dir)?;
-    let mut last_version = last_config.version;
+    let mut last_version = {
+        let guard = shared_config.lock().await;
+        guard.version
+    };
     let mut ticker = time::interval(Duration::from_secs(2));
     loop {
         tokio::select! {
             _ = ticker.tick() => {},
             _ = notify.notified() => {},
         }
-        let config = load_config(&config_dir)?;
+        let config = {
+            let guard = shared_config.lock().await;
+            guard.clone()
+        };
         if config.version <= last_version {
             continue;
         }
@@ -172,38 +183,13 @@ async fn run_broadcast_loop(
             serde_json::json!({ "vpns": config.vpns }),
         )
         .await?;
-        last_config = config;
-        last_version = last_config.version;
+        last_version = config.version;
     }
 }
 
 fn load_island(config_dir: &Path) -> Result<IslandFile, Box<dyn std::error::Error>> {
     let data = fs::read_to_string(config_dir.join("island.yaml"))?;
     Ok(serde_yaml::from_str(&data)?)
-}
-
-fn load_config(config_dir: &Path) -> Result<SyConfigFile, Box<dyn std::error::Error>> {
-    let path = config_dir.join("sy-config-routes.yaml");
-    if !path.exists() {
-        let empty = SyConfigFile {
-            version: 1,
-            updated_at: now_epoch_ms().to_string(),
-            routes: Vec::new(),
-            vpns: Vec::new(),
-        };
-        let data = serde_yaml::to_string(&empty)?;
-        fs::write(&path, data)?;
-        return Ok(empty);
-    }
-    let data = fs::read_to_string(&path)?;
-    Ok(serde_yaml::from_str(&data)?)
-}
-
-fn write_config(config_dir: &Path, config: &SyConfigFile) -> Result<(), Box<dyn std::error::Error>> {
-    let path = config_dir.join("sy-config-routes.yaml");
-    let data = serde_yaml::to_string(config)?;
-    fs::write(&path, data)?;
-    Ok(())
 }
 
 async fn broadcast_config_changed(
@@ -251,17 +237,17 @@ struct ConfigUpdate {
 
 async fn run_http_server(
     listen: &str,
-    config_dir: &Path,
+    shared_config: &std::sync::Arc<tokio::sync::Mutex<SyConfigFile>>,
     notify: &std::sync::Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(addr = %listen, "sy.admin http listening");
     loop {
         let (mut stream, _) = listener.accept().await?;
-        let config_dir = config_dir.to_path_buf();
+        let config = std::sync::Arc::clone(shared_config);
         let notify = std::sync::Arc::clone(&notify);
         tokio::spawn(async move {
-            if let Err(err) = handle_http(&mut stream, &config_dir, &notify).await {
+            if let Err(err) = handle_http(&mut stream, &config, &notify).await {
                 tracing::warn!("http handler error: {err}");
             }
         });
@@ -270,7 +256,7 @@ async fn run_http_server(
 
 async fn handle_http(
     stream: &mut tokio::net::TcpStream,
-    config_dir: &Path,
+    shared_config: &std::sync::Arc<tokio::sync::Mutex<SyConfigFile>>,
     notify: &std::sync::Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (method, path, headers, body) = read_http_request(stream).await?;
@@ -279,12 +265,15 @@ async fn handle_http(
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
         }
         ("GET", "/config/routes") => {
-            let config = load_config(config_dir)?;
+            let config = {
+                let guard = shared_config.lock().await;
+                guard.clone()
+            };
             respond_json(stream, 200, &serde_json::to_string(&config)?).await?;
         }
         ("PUT", "/config/routes") => {
             let update: ConfigUpdate = serde_json::from_slice(&body)?;
-            let mut current = load_config(config_dir)?;
+            let mut current = shared_config.lock().await;
             if let Some(routes) = update.routes {
                 current.routes = routes;
             }
@@ -296,14 +285,13 @@ async fn handle_http(
                 .unwrap_or_else(|| current.version.saturating_add(1));
             current.version = next_version;
             current.updated_at = now_epoch_ms().to_string();
-            write_config(config_dir, &current)?;
             notify.notify_one();
             tracing::info!(version = current.version, "config routes updated");
-            respond_json(stream, 200, &serde_json::to_string(&current)?).await?;
+            respond_json(stream, 200, &serde_json::to_string(&*current)?).await?;
         }
         ("PUT", "/config/vpns") => {
             let update: ConfigUpdate = serde_json::from_slice(&body)?;
-            let mut current = load_config(config_dir)?;
+            let mut current = shared_config.lock().await;
             if let Some(vpns) = update.vpns {
                 current.vpns = vpns;
             }
@@ -312,10 +300,9 @@ async fn handle_http(
                 .unwrap_or_else(|| current.version.saturating_add(1));
             current.version = next_version;
             current.updated_at = now_epoch_ms().to_string();
-            write_config(config_dir, &current)?;
             notify.notify_one();
             tracing::info!(version = current.version, "config vpns updated");
-            respond_json(stream, 200, &serde_json::to_string(&current)?).await?;
+            respond_json(stream, 200, &serde_json::to_string(&*current)?).await?;
         }
         _ => {
             let _ = headers;
