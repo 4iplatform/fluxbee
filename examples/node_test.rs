@@ -148,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let msg = Message {
             routing: Routing {
                 src: client.uuid().to_string(),
-                dst,
+                dst: dst.clone(),
                 ttl: 1,
                 trace_id: Uuid::new_v4().to_string(),
             },
