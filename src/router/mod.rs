@@ -2893,8 +2893,10 @@ async fn refresh_lsa(
         reader.as_ref().and_then(|r| r.read_snapshot())
     };
     if let Some(snapshot) = snapshot.clone() {
-        let mut guard = lsa_snapshot.lock().await;
-        *guard = Some(snapshot.clone());
+        {
+            let mut guard = lsa_snapshot.lock().await;
+            *guard = Some(snapshot.clone());
+        }
         rebuild_fib(fib, nodes, peer_nodes, static_routes, lsa_snapshot).await;
     }
     snapshot
