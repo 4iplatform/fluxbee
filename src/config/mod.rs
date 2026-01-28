@@ -5,9 +5,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use uuid::Uuid;
 
-const DEFAULT_CONFIG_DIR: &str = "/etc/json-router";
-const DEFAULT_STATE_DIR: &str = "/var/lib/json-router/state";
-const DEFAULT_SOCKET_DIR: &str = "/var/run/json-router/routers";
 const DEFAULT_SHM_PREFIX: &str = "/jsr-";
 const DEFAULT_HELLO_INTERVAL_MS: u64 = 10_000;
 const DEFAULT_DEAD_INTERVAL_MS: u64 = 40_000;
@@ -96,17 +93,14 @@ impl RouterConfig {
     pub fn load_from_env() -> Result<Self, ConfigError> {
         let router_name = std::env::var("JSR_ROUTER_NAME")
             .map_err(|_| ConfigError::MissingRouterName)?;
-        let config_dir = PathBuf::from(
-            std::env::var("JSR_CONFIG_DIR").unwrap_or_else(|_| DEFAULT_CONFIG_DIR.to_string()),
-        );
-
-        let mut state_dir = PathBuf::from(DEFAULT_STATE_DIR);
-        let mut node_socket_dir = PathBuf::from(DEFAULT_SOCKET_DIR);
-        let mut shm_prefix = DEFAULT_SHM_PREFIX.to_string();
-        let mut hello_interval_ms = DEFAULT_HELLO_INTERVAL_MS;
-        let mut dead_interval_ms = DEFAULT_DEAD_INTERVAL_MS;
-        let mut heartbeat_interval_ms = DEFAULT_HEARTBEAT_INTERVAL_MS;
-        let mut heartbeat_stale_ms = DEFAULT_HEARTBEAT_STALE_MS;
+        let config_dir = PathBuf::from(crate::paths::CONFIG_DIR);
+        let state_dir = PathBuf::from(crate::paths::STATE_DIR);
+        let node_socket_dir = PathBuf::from(crate::paths::ROUTER_SOCKET_DIR);
+        let shm_prefix = DEFAULT_SHM_PREFIX.to_string();
+        let hello_interval_ms = DEFAULT_HELLO_INTERVAL_MS;
+        let dead_interval_ms = DEFAULT_DEAD_INTERVAL_MS;
+        let heartbeat_interval_ms = DEFAULT_HEARTBEAT_INTERVAL_MS;
+        let heartbeat_stale_ms = DEFAULT_HEARTBEAT_STALE_MS;
         let mut wan_listen = None;
         let mut wan_uplinks = Vec::new();
         let mut wan_authorized_islands = Vec::new();
@@ -132,16 +126,6 @@ impl RouterConfig {
             if let Some(name) = wan.gateway_name {
                 gateway_name = name;
             }
-        }
-
-        if let Ok(value) = std::env::var("JSR_STATE_DIR") {
-            state_dir = PathBuf::from(value);
-        }
-        if let Ok(value) = std::env::var("JSR_SOCKET_DIR") {
-            node_socket_dir = PathBuf::from(value);
-        }
-        if let Ok(value) = std::env::var("JSR_SHM_PREFIX") {
-            shm_prefix = value;
         }
 
         let is_gateway = is_gateway_name(&router_name, &gateway_name);

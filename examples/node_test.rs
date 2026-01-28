@@ -20,9 +20,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
-    let config_dir = PathBuf::from("/etc/json-router");
-    let socket_dir = PathBuf::from("/var/run/json-router/routers");
-    let state_dir = PathBuf::from("/var/lib/json-router/state");
+    let config_dir = PathBuf::from(json_router::paths::CONFIG_DIR);
+    let socket_dir = PathBuf::from(json_router::paths::ROUTER_SOCKET_DIR);
+    let state_dir = PathBuf::from(json_router::paths::STATE_DIR);
     let nodes_dir = state_dir.join("nodes");
 
     let args: Vec<String> = std::env::args().collect();

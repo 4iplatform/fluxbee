@@ -1,4 +1,5 @@
 pub mod config;
+pub mod paths;
 pub mod router;
 pub mod shm;
 mod opa;

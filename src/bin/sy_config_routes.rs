@@ -14,9 +14,6 @@ use json_router::shm::{
     ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
 };
 
-const DEFAULT_CONFIG_DIR: &str = "/etc/json-router";
-const DEFAULT_STATE_DIR: &str = "/var/lib/json-router/state";
-const DEFAULT_SOCKET_DIR: &str = "/var/run/json-router/routers";
 
 #[derive(Debug, Deserialize)]
 struct IslandFile {
@@ -68,15 +65,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
-    let config_dir = PathBuf::from(
-        std::env::var("JSR_CONFIG_DIR").unwrap_or_else(|_| DEFAULT_CONFIG_DIR.to_string()),
-    );
-    let state_dir = PathBuf::from(
-        std::env::var("JSR_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string()),
-    );
-    let socket_dir = PathBuf::from(
-        std::env::var("JSR_SOCKET_DIR").unwrap_or_else(|_| DEFAULT_SOCKET_DIR.to_string()),
-    );
+    let config_dir = PathBuf::from(json_router::paths::CONFIG_DIR);
+    let state_dir = PathBuf::from(json_router::paths::STATE_DIR);
+    let socket_dir = PathBuf::from(json_router::paths::ROUTER_SOCKET_DIR);
 
     ensure_dir(&state_dir)?;
 
