@@ -584,6 +584,27 @@ async fn handle_node(
                             )
                             .await;
                             tracing::info!("config changed applied");
+                            let src_uuid = Uuid::parse_str(&msg.routing.src).ok();
+                            let local_senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = {
+                                let nodes_guard = nodes.lock().await;
+                                nodes_guard
+                                    .iter()
+                                    .filter_map(|(uuid, handle)| {
+                                        if src_uuid.is_some_and(|value| value == *uuid) {
+                                            None
+                                        } else {
+                                            Some(handle.sender.clone())
+                                        }
+                                    })
+                                    .collect()
+                            };
+                            if !local_senders.is_empty() {
+                                let data = serde_json::to_vec(&msg)?;
+                                for sender in local_senders {
+                                    let _ = sender.send(data.clone());
+                                }
+                                tracing::info!("config changed forwarded to local nodes");
+                            }
                             if msg.routing.ttl >= 2 {
                                 broadcast_to_peers(&peers, &msg).await?;
                                 tracing::info!("config changed forwarded to peers");
