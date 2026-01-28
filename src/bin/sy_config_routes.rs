@@ -107,7 +107,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 writer.update_heartbeat();
             }
             msg = client.recv() => {
-                let msg = msg?;
+                let msg = match msg {
+                    Ok(msg) => msg,
+                    Err(err) => {
+                        tracing::warn!("recv error: {err} (reconnecting)");
+                        client = NodeClient::connect_with_retry(
+                            &node_config,
+                            Duration::from_secs(1),
+                        )
+                        .await?;
+                        tracing::info!("reconnected to router");
+                        continue;
+                    }
+                };
                 if msg.meta.msg_type != SYSTEM_KIND || msg.meta.msg.as_deref() != Some(MSG_CONFIG_CHANGED) {
                     continue;
                 }
