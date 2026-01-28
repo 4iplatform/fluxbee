@@ -114,7 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let payload: ConfigChangedPayload = serde_json::from_value(msg.payload)?;
                 tracing::info!(
                     subsystem = %payload.subsystem,
-                    version = payload.version,
+                    payload_version = payload.version,
+                    current_version = sy_config.version,
                     "config changed received"
                 );
                 if payload.version != 0 && payload.version <= sy_config.version {
@@ -160,7 +161,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sy_config = next_config;
                 tracing::info!(
                     subsystem = %payload.subsystem,
-                    version = payload.version,
+                    payload_version = payload.version,
+                    applied_version = sy_config.version,
                     "config changed applied"
                 );
             }

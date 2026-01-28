@@ -76,13 +76,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match client.recv().await {
                 Ok(msg) => {
+                    let summary = payload_summary(&msg.payload);
                     println!(
-                        "received: src={} dst={:?} type={} msg={:?} payload={}",
-                        msg.routing.src,
-                        msg.routing.dst,
+                        "received: kind={} msg={:?} src={} dst={:?} payload={}",
                         msg.meta.msg_type,
                         msg.meta.msg,
-                        msg.payload
+                        msg.routing.src,
+                        msg.routing.dst,
+                        summary
                     );
                 }
                 Err(err) => {
@@ -169,7 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
             continue;
         }
-        println!("sent HOLA {}", seq);
+        println!("sent HOLA {} (dst={:?})", seq, dst);
 
         let trace_id = Uuid::new_v4().to_string();
         let echo = build_echo(&client.uuid().to_string(), Destination::Broadcast, &trace_id);
@@ -180,7 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
             continue;
         }
-        println!("sent ECHO");
+        println!("sent ECHO (dst=Broadcast)");
 
         let trace_id = Uuid::new_v4().to_string();
         let echo_reply =
@@ -192,7 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
             continue;
         }
-        println!("sent ECHO_REPLY");
+        println!("sent ECHO_REPLY (dst=Broadcast)");
 
         let trace_id = Uuid::new_v4().to_string();
         let now_ms = now_epoch_ms();
@@ -213,7 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
             continue;
         }
-        println!("sent TIME_SYNC");
+        println!("sent TIME_SYNC (dst=Broadcast)");
 
         seq += 1;
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -226,6 +227,21 @@ fn now_epoch_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn payload_summary(payload: &serde_json::Value) -> String {
+    if let Some(obj) = payload.as_object() {
+        let kind = obj.get("type").and_then(|v| v.as_str());
+        let content = obj.get("content").and_then(|v| v.as_str());
+        match (kind, content) {
+            (Some(kind), Some(content)) => format!("{kind}:\"{content}\""),
+            (Some(kind), None) => kind.to_string(),
+            (None, Some(content)) => format!("\"{content}\""),
+            _ => payload.to_string(),
+        }
+    } else {
+        payload.to_string()
+    }
 }
 
 fn load_island_id(config_dir: &PathBuf) -> Result<String, Box<dyn std::error::Error>> {
