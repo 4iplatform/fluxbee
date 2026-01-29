@@ -149,6 +149,8 @@ pub struct WithdrawPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigChangedPayload {
     pub subsystem: String,
+    #[serde(default)]
+    pub action: Option<String>,
     pub version: u64,
     #[serde(default)]
     pub config: Value,

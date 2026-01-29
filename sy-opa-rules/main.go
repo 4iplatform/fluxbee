@@ -599,13 +599,18 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 		if err != nil {
 			return s.respondConfigError(src, action, version, "COMPILE_ERROR", err.Error(), broadcast)
 		}
+		meta := PolicyMetadata{
+			Version:    version,
+			Hash:       hash,
+			Entrypoint: entrypoint,
+			CompiledAt: time.Now().UTC().Format(time.RFC3339),
+			WasmSize:   len(wasm),
+		}
+		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), cfg.Rego, meta); err != nil {
+			return s.respondConfigError(src, action, version, "IO_ERROR", err.Error(), broadcast)
+		}
 		if broadcast {
-			s.sendConfigResponse(src, action, version, "ok", PolicyMetadata{
-				Version:    version,
-				Hash:       hash,
-				Entrypoint: entrypoint,
-				WasmSize:   len(wasm),
-			}, compileMs)
+			s.sendConfigResponse(src, action, version, "ok", meta, compileMs)
 		}
 		return true, nil
 	}

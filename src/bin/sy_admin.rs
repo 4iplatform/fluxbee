@@ -23,11 +23,26 @@ struct IslandFile {
     island_id: String,
     role: Option<String>,
     admin: Option<AdminSection>,
+    wan: Option<WanSection>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AdminSection {
     listen: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WanSection {
+    authorized_islands: Option<Vec<String>>,
+}
+
+#[derive(Clone)]
+struct AdminContext {
+    config_dir: PathBuf,
+    state_dir: PathBuf,
+    socket_dir: PathBuf,
+    island_id: String,
+    authorized_islands: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -70,6 +85,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_dir = PathBuf::from(json_router::paths::ROUTER_SOCKET_DIR);
 
     let island = load_island(&config_dir)?;
+    let island_id = island.island_id.clone();
+    let authorized_islands = island
+        .wan
+        .as_ref()
+        .and_then(|wan| wan.authorized_islands.clone())
+        .unwrap_or_default();
     if island.role.as_deref() != Some("mother") {
         tracing::warn!("SY.admin solo corre en mother island; role != mother");
         return Ok(());
@@ -81,8 +102,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (broadcast_tx, broadcast_rx) = mpsc::unbounded_channel::<BroadcastRequest>();
     let http_tx = broadcast_tx.clone();
+    let http_ctx = AdminContext {
+        config_dir: config_dir.clone(),
+        state_dir: state_dir.clone(),
+        socket_dir: socket_dir.clone(),
+        island_id,
+        authorized_islands,
+    };
     tokio::spawn(async move {
-        if let Err(err) = run_http_server(&admin_listen, &http_tx).await {
+        if let Err(err) = run_http_server(&admin_listen, &http_tx, http_ctx).await {
             tracing::error!("http server error: {err}");
         }
     });
@@ -101,6 +129,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 enum BroadcastRequest {
     Routes(Vec<RouteConfig>),
     Vpns(Vec<VpnConfig>),
+    Opa(OpaRequest),
+}
+
+#[derive(Debug, Deserialize)]
+struct OpaRequest {
+    #[serde(default)]
+    rego: Option<String>,
+    #[serde(default)]
+    entrypoint: Option<String>,
+    #[serde(default)]
+    version: Option<u64>,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default, alias = "target")]
+    island: Option<String>,
 }
 
 async fn run_broadcast_loop(
@@ -132,8 +175,10 @@ async fn run_broadcast_loop(
                 match broadcast_config_changed(
                     &mut client,
                     "routes",
+                    None,
                     0,
                     serde_json::json!({ "routes": routes }),
+                    None,
                 )
                 .await
                 {
@@ -148,14 +193,25 @@ async fn run_broadcast_loop(
                 match broadcast_config_changed(
                     &mut client,
                     "vpn",
+                    None,
                     0,
                     serde_json::json!({ "vpns": vpns }),
+                    None,
                 )
                 .await
                 {
                     Ok(()) => false,
                     Err(err) => {
                         tracing::warn!(error = %err, "broadcast failed");
+                        true
+                    }
+                }
+            }
+            BroadcastRequest::Opa(req) => {
+                match broadcast_opa_changed(&mut client, req).await {
+                    Ok(()) => false,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "opa broadcast failed");
                         true
                     }
                 }
@@ -183,13 +239,19 @@ fn load_island(config_dir: &Path) -> Result<IslandFile, Box<dyn std::error::Erro
 async fn broadcast_config_changed(
     client: &mut NodeClient,
     subsystem: &str,
+    action: Option<String>,
     version: u64,
     config: serde_json::Value,
+    target_island: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let dst = match target_island {
+        Some(island) => Destination::Unicast(format!("SY.opa.rules@{}", island)),
+        None => Destination::Broadcast,
+    };
     let msg = Message {
         routing: Routing {
             src: client.uuid().to_string(),
-            dst: Destination::Broadcast,
+            dst,
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
         },
@@ -204,6 +266,7 @@ async fn broadcast_config_changed(
         },
         payload: serde_json::to_value(ConfigChangedPayload {
             subsystem: subsystem.to_string(),
+            action,
             version,
             config,
         })?,
@@ -211,6 +274,35 @@ async fn broadcast_config_changed(
     client.send(&msg).await?;
     tracing::info!(subsystem = subsystem, version = version, "config changed broadcast sent");
     Ok(())
+}
+
+async fn broadcast_opa_changed(
+    client: &mut NodeClient,
+    req: OpaRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let action = req.action.unwrap_or_else(|| "compile_apply".to_string());
+    let version = req.version.unwrap_or(0);
+    let entrypoint = req.entrypoint.clone().unwrap_or_else(|| "router/target".to_string());
+    let mut config = serde_json::json!({});
+    if matches!(action.as_str(), "compile" | "compile_apply" | "check") {
+        let rego = req.rego.ok_or("rego missing")?;
+        config = serde_json::json!({
+            "rego": rego,
+            "entrypoint": entrypoint,
+        });
+    }
+    if matches!(action.as_str(), "apply") && version == 0 {
+        return Err("version required for apply".into());
+    }
+    broadcast_config_changed(
+        client,
+        "opa",
+        Some(action),
+        version,
+        config,
+        req.island,
+    )
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,17 +315,92 @@ struct ConfigUpdate {
     version: Option<u64>,
 }
 
+enum OpaAction {
+    Compile,
+    CompileApply,
+    Apply,
+    Rollback,
+    Check,
+}
+
+impl OpaAction {
+    fn as_str(&self) -> &'static str {
+        match self {
+            OpaAction::Compile => "compile",
+            OpaAction::CompileApply => "compile_apply",
+            OpaAction::Apply => "apply",
+            OpaAction::Rollback => "rollback",
+            OpaAction::Check => "compile",
+        }
+    }
+
+    fn needs_rego(&self) -> bool {
+        matches!(self, OpaAction::Compile | OpaAction::CompileApply | OpaAction::Check)
+    }
+
+    fn apply_after(&self) -> bool {
+        matches!(self, OpaAction::CompileApply)
+    }
+
+    fn check_only(&self) -> bool {
+        matches!(self, OpaAction::Check)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigResponsePayload {
+    subsystem: String,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    version: Option<u64>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    island: Option<String>,
+    #[serde(default)]
+    compile_time_ms: Option<u64>,
+    #[serde(default)]
+    wasm_size_bytes: Option<u64>,
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
+    error_code: Option<String>,
+    #[serde(default)]
+    error_detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpaResponseEntry {
+    island: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compile_time_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wasm_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_detail: Option<String>,
+}
+
 async fn run_http_server(
     listen: &str,
     tx: &mpsc::UnboundedSender<BroadcastRequest>,
+    ctx: AdminContext,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(addr = %listen, "sy.admin http listening");
     loop {
         let (mut stream, _) = listener.accept().await?;
         let tx = tx.clone();
+        let ctx = ctx.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_http(&mut stream, &tx).await {
+            if let Err(err) = handle_http(&mut stream, &tx, &ctx).await {
                 tracing::warn!("http handler error: {err}");
             }
         });
@@ -243,6 +410,7 @@ async fn run_http_server(
 async fn handle_http(
     stream: &mut tokio::net::TcpStream,
     tx: &mpsc::UnboundedSender<BroadcastRequest>,
+    ctx: &AdminContext,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (method, path, headers, body) = read_http_request(stream).await?;
     match (method.as_str(), path.as_str()) {
@@ -267,6 +435,31 @@ async fn handle_http(
             }
             tracing::info!("config vpns update received");
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
+        }
+        ("POST", "/opa/policy") => {
+            let req: OpaRequest = serde_json::from_slice(&body)?;
+            let (status, resp) = handle_opa_http(ctx, req, OpaAction::CompileApply).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/opa/policy/compile") => {
+            let req: OpaRequest = serde_json::from_slice(&body)?;
+            let (status, resp) = handle_opa_http(ctx, req, OpaAction::Compile).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/opa/policy/apply") => {
+            let req: OpaRequest = serde_json::from_slice(&body)?;
+            let (status, resp) = handle_opa_http(ctx, req, OpaAction::Apply).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/opa/policy/rollback") => {
+            let req: OpaRequest = serde_json::from_slice(&body)?;
+            let (status, resp) = handle_opa_http(ctx, req, OpaAction::Rollback).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/opa/policy/check") => {
+            let req: OpaRequest = serde_json::from_slice(&body)?;
+            let (status, resp) = handle_opa_http(ctx, req, OpaAction::Check).await?;
+            respond_json(stream, status, &resp).await?;
         }
         _ => {
             let _ = headers;
@@ -347,4 +540,194 @@ async fn respond_json(
     );
     stream.write_all(response.as_bytes()).await?;
     Ok(())
+}
+
+async fn handle_opa_http(
+    ctx: &AdminContext,
+    mut req: OpaRequest,
+    action: OpaAction,
+) -> Result<(u16, String), Box<dyn std::error::Error>> {
+    let version = req
+        .version
+        .unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64);
+    let entrypoint = req.entrypoint.clone().unwrap_or_else(|| "router/target".to_string());
+    let target = req.island.take();
+
+    if action.needs_rego() && req.rego.as_deref().unwrap_or("").is_empty() {
+        let resp = serde_json::json!({
+            "status": "error",
+            "error": "rego_missing"
+        });
+        return Ok((400, resp.to_string()));
+    }
+
+    let mut responses = Vec::new();
+    if matches!(action, OpaAction::Compile | OpaAction::CompileApply | OpaAction::Check) {
+        responses = send_opa_action(
+            ctx,
+            "compile",
+            version,
+            req.rego.clone(),
+            Some(entrypoint.clone()),
+            target.clone(),
+        )
+        .await?;
+        if responses.is_empty() || responses.iter().any(|r| r.status != "ok") {
+            return Ok(build_opa_http_response(ctx, action, version, responses, target));
+        }
+    }
+
+    if action.apply_after() {
+        let apply_responses =
+            send_opa_action(ctx, "apply", version, None, None, target.clone()).await?;
+        if apply_responses.is_empty() || apply_responses.iter().any(|r| r.status != "ok") {
+            let mut combined = responses;
+            combined.extend(apply_responses);
+            return Ok(build_opa_http_response(ctx, action, version, combined, target));
+        }
+        responses.extend(apply_responses);
+    } else if matches!(action, OpaAction::Apply | OpaAction::Rollback) {
+        let apply_action = action.as_str();
+        responses = send_opa_action(ctx, apply_action, version, None, None, target.clone()).await?;
+    }
+
+    Ok(build_opa_http_response(ctx, action, version, responses, target))
+}
+
+async fn send_opa_action(
+    ctx: &AdminContext,
+    action: &str,
+    version: u64,
+    rego: Option<String>,
+    entrypoint: Option<String>,
+    target: Option<String>,
+) -> Result<Vec<OpaResponseEntry>, Box<dyn std::error::Error>> {
+    let node_config = NodeConfig {
+        name: "SY.admin".to_string(),
+        router_socket: ctx.socket_dir.clone(),
+        uuid_persistence_dir: ctx.state_dir.join("nodes"),
+        config_dir: ctx.config_dir.clone(),
+        version: "1.0".to_string(),
+    };
+    let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let mut cfg = serde_json::json!({});
+    if let Some(rego) = rego {
+        cfg = serde_json::json!({
+            "rego": rego,
+            "entrypoint": entrypoint.unwrap_or_else(|| "router/target".to_string()),
+        });
+    }
+    broadcast_config_changed(
+        &mut client,
+        "opa",
+        Some(action.to_string()),
+        version,
+        cfg,
+        target.clone(),
+    )
+    .await?;
+
+    let expected = expected_islands(ctx, target.as_deref());
+    let responses = collect_opa_responses(&mut client, action, version, &expected).await;
+    Ok(responses)
+}
+
+fn expected_islands(ctx: &AdminContext, target: Option<&str>) -> Vec<String> {
+    if let Some(target) = target {
+        return vec![target.to_string()];
+    }
+    let mut islands = Vec::new();
+    islands.push(ctx.island_id.clone());
+    for island in &ctx.authorized_islands {
+        if island != &ctx.island_id {
+            islands.push(island.clone());
+        }
+    }
+    islands
+}
+
+async fn collect_opa_responses(
+    client: &mut NodeClient,
+    action: &str,
+    version: u64,
+    expected: &[String],
+) -> Vec<OpaResponseEntry> {
+    use tokio::time::{timeout, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut responses: HashMap<String, OpaResponseEntry> = HashMap::new();
+
+    while responses.len() < expected.len() && Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let msg = match timeout(remaining, client.recv()).await {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(err)) => {
+                tracing::warn!("opa response recv error: {err}");
+                break;
+            }
+            Err(_) => break,
+        };
+        if msg.meta.msg.as_deref() != Some("CONFIG_RESPONSE") {
+            continue;
+        }
+        let payload: ConfigResponsePayload = match serde_json::from_value(msg.payload) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::warn!("invalid config response payload: {err}");
+                continue;
+            }
+        };
+        if payload.subsystem != "opa" {
+            continue;
+        }
+        if payload.action.as_deref() != Some(action) {
+            continue;
+        }
+        if payload.version.unwrap_or(version) != version {
+            continue;
+        }
+        let island = payload.island.clone().unwrap_or_else(|| "unknown".to_string());
+        let entry = OpaResponseEntry {
+            island: island.clone(),
+            status: payload.status.unwrap_or_else(|| "error".to_string()),
+            version: payload.version,
+            compile_time_ms: payload.compile_time_ms,
+            wasm_size_bytes: payload.wasm_size_bytes,
+            hash: payload.hash,
+            error_code: payload.error_code,
+            error_detail: payload.error_detail,
+        };
+        responses.insert(island, entry);
+    }
+
+    responses.into_values().collect()
+}
+
+fn build_opa_http_response(
+    ctx: &AdminContext,
+    action: OpaAction,
+    version: u64,
+    responses: Vec<OpaResponseEntry>,
+    target: Option<String>,
+) -> (u16, String) {
+    let expected = expected_islands(ctx, target.as_deref());
+    let pending: Vec<String> = expected
+        .into_iter()
+        .filter(|island| !responses.iter().any(|r| r.island == *island))
+        .collect();
+    let status = if responses.is_empty() || responses.iter().any(|r| r.status != "ok") {
+        500
+    } else {
+        200
+    };
+    let body = serde_json::json!({
+        "status": if status == 200 { "ok" } else { "error" },
+        "version": version,
+        "action": action.as_str(),
+        "check_only": action.check_only(),
+        "responses": responses,
+        "pending": pending,
+    })
+    .to_string();
+    (status, body)
 }
