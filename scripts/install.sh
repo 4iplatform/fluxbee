@@ -6,7 +6,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 sudo install -d /etc/json-router
 sudo install -d /var/lib/json-router
 sudo install -d /var/lib/json-router/state/nodes
-sudo install -d /var/lib/json-router/opa-rules
+sudo install -d /var/lib/json-router/opa
+sudo install -d /var/lib/json-router/opa/current
+sudo install -d /var/lib/json-router/opa/staged
+sudo install -d /var/lib/json-router/opa/backup
 sudo install -d /var/lib/json-router/modules
 sudo install -d /var/lib/json-router/blob
 sudo install -d /var/run/json-router

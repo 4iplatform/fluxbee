@@ -20,6 +20,14 @@ pub const CONFIG_VERSION: u32 = 1;
 pub const LSA_MAGIC: u32 = 0x4A534C41; // "JSLA"
 pub const LSA_VERSION: u32 = 1;
 
+pub const OPA_MAGIC: u32 = 0x4A534F50; // "JSOP"
+pub const OPA_VERSION: u32 = 1;
+pub const OPA_MAX_WASM_SIZE: usize = 4 * 1024 * 1024;
+
+pub const OPA_STATUS_OK: u8 = 0;
+pub const OPA_STATUS_ERROR: u8 = 1;
+pub const OPA_STATUS_LOADING: u8 = 2;
+
 const SEQLOCK_READ_TIMEOUT_MS: u64 = 5;
 
 pub const MAX_NODES: u32 = 1024;
@@ -201,6 +209,34 @@ pub struct LsaHeader {
 }
 
 #[repr(C)]
+pub struct OpaHeader {
+    pub magic: u32,
+    pub version: u32,
+
+    pub seq: AtomicU64,
+
+    pub policy_version: u64,
+    pub wasm_size: u32,
+    pub _pad0: u32,
+    pub wasm_hash: [u8; 32],
+
+    pub updated_at: u64,
+    pub heartbeat: u64,
+
+    pub status: u8,
+    pub _pad1: u8,
+
+    pub entrypoint: [u8; 64],
+    pub entrypoint_len: u16,
+
+    pub owner_uuid: [u8; 16],
+    pub owner_pid: u32,
+    pub _pad2: u32,
+
+    pub _reserved: [u8; 20],
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct RemoteIslandEntry {
     pub island_id: [u8; 64],
@@ -329,6 +365,25 @@ pub struct LsaHeaderSnapshot {
     pub heartbeat: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct OpaSnapshot {
+    pub header: OpaHeaderSnapshot,
+    pub wasm: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpaHeaderSnapshot {
+    pub policy_version: u64,
+    pub wasm_size: u32,
+    pub wasm_hash: [u8; 32],
+    pub updated_at: u64,
+    pub heartbeat: u64,
+    pub status: u8,
+    pub entrypoint: String,
+    pub owner_uuid: Uuid,
+    pub owner_pid: u32,
+}
+
 pub struct RouterRegionWriter {
     name: String,
     mmap: MmapMut,
@@ -363,6 +418,11 @@ pub struct LsaRegionReader {
     name: String,
     mmap: Mmap,
     layout: RegionLayout,
+}
+
+pub struct OpaRegionReader {
+    name: String,
+    mmap: Mmap,
 }
 
 impl RouterRegionWriter {
@@ -843,6 +903,31 @@ impl LsaRegionReader {
     }
 }
 
+impl OpaRegionReader {
+    pub fn open_read_only(name: &str) -> Result<Self, ShmError> {
+        validate_name(name)?;
+        let mmap = open_read_only_opa_region(name)?;
+        Ok(Self {
+            name: name.to_string(),
+            mmap,
+        })
+    }
+
+    pub fn read_snapshot(&self) -> Option<OpaSnapshot> {
+        let header = self.header_ref()?;
+        read_opa_snapshot(header, self.mmap.as_ref())
+    }
+
+    pub fn read_header(&self) -> Option<OpaHeaderSnapshot> {
+        let header = self.header_ref()?;
+        read_opa_header_snapshot(header)
+    }
+
+    fn header_ref(&self) -> Option<&OpaHeader> {
+        header_ref::<OpaHeader>(self.mmap.as_ref(), 0)
+    }
+}
+
 pub fn build_shm_name(prefix: &str, router_uuid: Uuid) -> String {
     let simple = router_uuid.simple().to_string();
     let name = format!("{}{}", prefix, simple);
@@ -946,6 +1031,10 @@ fn layout_lsa() -> RegionLayout {
     }
 }
 
+fn opa_region_len() -> usize {
+    size_of::<OpaHeader>() + OPA_MAX_WASM_SIZE
+}
+
 fn open_or_create_region<F>(name: &str, len: usize, init: F) -> Result<MmapMut, ShmError>
 where
     F: FnOnce(&mut MmapMut),
@@ -1007,6 +1096,16 @@ fn open_read_only_region(name: &str, len: usize) -> Result<Mmap, ShmError> {
     Ok(mmap)
 }
 
+fn open_read_only_opa_region(name: &str) -> Result<Mmap, ShmError> {
+    let cstr = CString::new(name).map_err(|_| ShmError::NameTooLong)?;
+    let fd = shm_open(cstr.as_c_str(), OFlag::O_RDONLY, nix::sys::stat::Mode::empty())?;
+    let mmap = unsafe { MmapOptions::new().len(opa_region_len()).map(fd.as_raw_fd())? };
+    if !is_opa_region_valid(mmap.as_ref()) {
+        return Err(ShmError::InvalidHeader);
+    }
+    Ok(mmap)
+}
+
 fn is_region_valid(mmap: &[u8]) -> bool {
     let Some(magic_bytes) = mmap.get(0..4) else {
         return false;
@@ -1026,6 +1125,23 @@ fn is_region_valid(mmap: &[u8]) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_opa_region_valid(mmap: &[u8]) -> bool {
+    if mmap.len() < size_of::<OpaHeader>() {
+        return false;
+    }
+    let Some(magic_bytes) = mmap.get(0..4) else {
+        return false;
+    };
+    let Ok(magic_bytes) = <[u8; 4]>::try_from(magic_bytes) else {
+        return false;
+    };
+    let magic = u32::from_ne_bytes(magic_bytes);
+    if magic != OPA_MAGIC {
+        return false;
+    }
+    header_ref::<OpaHeader>(mmap, 0).is_some_and(|header| header.version == OPA_VERSION)
 }
 
 fn initialize_router_header(
@@ -1272,6 +1388,86 @@ fn read_lsa_snapshot(
                 nodes: node_snapshot,
                 routes: route_snapshot,
                 vpns: vpn_snapshot,
+            });
+        }
+    }
+}
+
+fn read_opa_header_snapshot(header: &OpaHeader) -> Option<OpaHeaderSnapshot> {
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > Duration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            return None;
+        }
+        let s1 = header.seq.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        atomic::fence(Ordering::Acquire);
+        let entrypoint =
+            read_string(&header.entrypoint, header.entrypoint_len as usize);
+        let snapshot = OpaHeaderSnapshot {
+            policy_version: header.policy_version,
+            wasm_size: header.wasm_size,
+            wasm_hash: header.wasm_hash,
+            updated_at: header.updated_at,
+            heartbeat: header.heartbeat,
+            status: header.status,
+            entrypoint,
+            owner_uuid: Uuid::from_bytes(header.owner_uuid),
+            owner_pid: header.owner_pid,
+        };
+        atomic::fence(Ordering::Acquire);
+        let s2 = header.seq.load(Ordering::Acquire);
+        if s1 == s2 {
+            return Some(snapshot);
+        }
+    }
+}
+
+fn read_opa_snapshot(header: &OpaHeader, mmap: &[u8]) -> Option<OpaSnapshot> {
+    let start = Instant::now();
+    let header_size = size_of::<OpaHeader>();
+    loop {
+        if start.elapsed() > Duration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            return None;
+        }
+        let s1 = header.seq.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        atomic::fence(Ordering::Acquire);
+        let wasm_size = header.wasm_size as usize;
+        if wasm_size > OPA_MAX_WASM_SIZE {
+            return None;
+        }
+        let entrypoint =
+            read_string(&header.entrypoint, header.entrypoint_len as usize);
+        let header_snapshot = OpaHeaderSnapshot {
+            policy_version: header.policy_version,
+            wasm_size: header.wasm_size,
+            wasm_hash: header.wasm_hash,
+            updated_at: header.updated_at,
+            heartbeat: header.heartbeat,
+            status: header.status,
+            entrypoint,
+            owner_uuid: Uuid::from_bytes(header.owner_uuid),
+            owner_pid: header.owner_pid,
+        };
+        let wasm = if wasm_size == 0 {
+            Vec::new()
+        } else {
+            let data = mmap.get(header_size..header_size + wasm_size)?;
+            data.to_vec()
+        };
+        atomic::fence(Ordering::Acquire);
+        let s2 = header.seq.load(Ordering::Acquire);
+        if s1 == s2 {
+            return Some(OpaSnapshot {
+                header: header_snapshot,
+                wasm,
             });
         }
     }

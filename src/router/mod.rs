@@ -14,9 +14,9 @@ use crate::opa::OpaResolver;
 use crate::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionReader, ConfigSnapshot, LsaRegionReader,
     LsaRegionWriter, LsaSnapshot, RemoteIslandEntry, RemoteNodeEntry, RemoteRouteEntry,
-    RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, VpnAssignment, ACTION_DROP,
-    ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS, MATCH_EXACT,
-    MATCH_GLOB, MATCH_PREFIX,
+    RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, VpnAssignment, OpaRegionReader,
+    OpaSnapshot, OPA_STATUS_ERROR, OPA_STATUS_LOADING, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE,
+    FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
 };
 use jsr_client::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
@@ -56,6 +56,7 @@ pub struct Router {
     fib: Arc<Mutex<Vec<FibEntry>>>,
     config_version: Arc<Mutex<u64>>,
     opa: Arc<Mutex<OpaResolver>>,
+    opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_state: Arc<Mutex<std::collections::HashMap<String, RemoteIslandState>>>,
@@ -96,9 +97,7 @@ impl Router {
         } else {
             None
         };
-        let opa = Arc::new(Mutex::new(OpaResolver::new(PathBuf::from(
-            "/var/lib/json-router/policy.wasm",
-        ))));
+        let opa = Arc::new(Mutex::new(OpaResolver::new()));
         Self {
             cfg,
             shm: Arc::new(Mutex::new(shm)),
@@ -115,6 +114,7 @@ impl Router {
             fib: Arc::new(Mutex::new(Vec::new())),
             config_version: Arc::new(Mutex::new(0)),
             opa,
+            opa_reader: Arc::new(Mutex::new(None)),
             broadcast_cache: Arc::new(Mutex::new(BroadcastCache::new())),
             wan_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lsa_state: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -144,11 +144,14 @@ impl Router {
 
         let shm = Arc::clone(&self.shm);
         let opa = Arc::clone(&self.opa);
+        let opa_reader = Arc::clone(&self.opa_reader);
+        let island_id = self.cfg.island_id.clone();
         let heartbeat_interval = self.cfg.heartbeat_interval_ms;
         tokio::spawn(async move {
             let mut ticker = time::interval(Duration::from_millis(heartbeat_interval));
             loop {
                 ticker.tick().await;
+                maybe_refresh_opa_from_shm(&opa_reader, &opa, &shm, &island_id).await;
                 let (policy_version, load_status) = {
                     let opa = opa.lock().await;
                     opa.status()
@@ -173,6 +176,7 @@ impl Router {
         let config_version_pd = Arc::clone(&self.config_version);
         let shm_pd = Arc::clone(&self.shm);
         let opa_pd = Arc::clone(&self.opa);
+        let opa_reader_pd = Arc::clone(&self.opa_reader);
         let router_uuid = self.cfg.router_uuid;
         let router_name = self.cfg.router_l2_name.clone();
         let shm_name = self.cfg.shm_name.clone();
@@ -198,6 +202,7 @@ impl Router {
                 config_version_pd,
                 shm_pd,
                 opa_pd,
+                opa_reader_pd,
                 lsa_snapshot_pd,
                 fib_pd,
                 is_gateway,
@@ -237,6 +242,7 @@ impl Router {
         let config_version = Arc::clone(&self.config_version);
         let shm = Arc::clone(&self.shm);
         let opa = Arc::clone(&self.opa);
+        let opa_reader = Arc::clone(&self.opa_reader);
         let island_id = self.cfg.island_id.clone();
         let wan_peers = Arc::clone(&self.wan_peers);
         let lsa_snapshot = Arc::clone(&self.lsa_snapshot);
@@ -262,6 +268,7 @@ impl Router {
                 let config_version = Arc::clone(&config_version);
                 let shm = Arc::clone(&shm);
                 let opa = Arc::clone(&opa);
+                let opa_reader = Arc::clone(&opa_reader);
                 let island_id = island_id.clone();
                 let wan_peers = Arc::clone(&wan_peers);
                 let lsa_reader = Arc::clone(&lsa_reader);
@@ -283,6 +290,7 @@ impl Router {
                         config_version,
                         shm,
                         opa,
+                        opa_reader,
                         island_id,
                         wan_peers,
                         lsa_snapshot,
@@ -361,6 +369,7 @@ impl Router {
             let fib = Arc::clone(&self.fib);
             let config_version = Arc::clone(&self.config_version);
             let opa = Arc::clone(&self.opa);
+            let opa_reader = Arc::clone(&self.opa_reader);
             let broadcast_cache = Arc::clone(&self.broadcast_cache);
             let lsa_seq = Arc::clone(&self.lsa_seq);
             let is_gateway = self.cfg.is_gateway;
@@ -381,6 +390,7 @@ impl Router {
                     fib,
                     config_version,
                     opa,
+                    opa_reader,
                     broadcast_cache,
                     lsa_seq,
                     router_uuid,
@@ -413,6 +423,7 @@ async fn handle_node(
     fib: Arc<Mutex<Vec<FibEntry>>>,
     config_version: Arc<Mutex<u64>>,
     opa: Arc<Mutex<OpaResolver>>,
+    opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
     router_uuid: Uuid,
@@ -620,7 +631,7 @@ async fn handle_node(
                         }
                         if msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
                             let payload: OpaReloadPayload = serde_json::from_value(msg.payload.clone())?;
-                            apply_opa_reload(&opa, &shm, &payload).await;
+                            apply_opa_reload(&opa, &opa_reader, &shm, island_id, &payload).await;
                             let src_uuid = Uuid::parse_str(&msg.routing.src).ok();
                             let local_senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = {
                                 let nodes_guard = nodes.lock().await;
@@ -1976,6 +1987,7 @@ async fn peer_discovery_loop(
     config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
+    opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
     is_gateway: bool,
@@ -2029,6 +2041,7 @@ async fn peer_discovery_loop(
                     let config_version = Arc::clone(&config_version);
                     let shm = Arc::clone(&shm);
                     let opa = Arc::clone(&opa);
+                    let opa_reader = Arc::clone(&opa_reader);
                     let island_id = island_id.to_string();
                     let self_router_name = self_router_name.to_string();
                     let self_shm_name = self_shm_name.to_string();
@@ -2055,6 +2068,7 @@ async fn peer_discovery_loop(
                             config_version,
                             shm,
                             opa,
+                            opa_reader,
                             &island_id,
                             lsa_snapshot,
                             fib,
@@ -2157,6 +2171,7 @@ async fn connect_to_peer(
     config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
+    opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     island_id: &str,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
@@ -2213,6 +2228,7 @@ async fn connect_to_peer(
                         &config_version,
                         &shm,
                         &opa,
+                        &opa_reader,
                         island_id,
                         &fib,
                         self_uuid,
@@ -2248,6 +2264,7 @@ async fn handle_peer_incoming(
     config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
+    opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     island_id: String,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
@@ -2302,6 +2319,7 @@ async fn handle_peer_incoming(
                         &config_version,
                         &shm,
                         &opa,
+                        &opa_reader,
                         &island_id,
                         &fib,
                         router_uuid,
@@ -2337,6 +2355,7 @@ async fn handle_peer_message(
     config_version: &Arc<Mutex<u64>>,
     shm: &Arc<Mutex<RouterRegionWriter>>,
     opa: &Arc<Mutex<OpaResolver>>,
+    opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
     island_id: &str,
     fib: &Arc<Mutex<Vec<FibEntry>>>,
     router_uuid: Uuid,
@@ -2371,7 +2390,7 @@ async fn handle_peer_message(
         && msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD)
     {
         let payload: OpaReloadPayload = serde_json::from_value(msg.payload.clone())?;
-        apply_opa_reload(opa, shm, &payload).await;
+        apply_opa_reload(opa, opa_reader, shm, island_id, &payload).await;
         tracing::info!("opa reload applied (peer)");
         return Ok(());
     }
@@ -2932,16 +2951,115 @@ async fn refresh_config(
 
 async fn apply_opa_reload(
     opa: &Arc<Mutex<OpaResolver>>,
+    opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
     shm: &Arc<Mutex<RouterRegionWriter>>,
+    island_id: &str,
     payload: &OpaReloadPayload,
 ) {
+    let Some(snapshot) = read_opa_snapshot(opa_reader, island_id).await else {
+        tracing::warn!("opa reload ignored: opa region not available");
+        return;
+    };
+    if payload.version != 0 && payload.version != snapshot.header.policy_version {
+        tracing::warn!(
+            payload_version = payload.version,
+            shm_version = snapshot.header.policy_version,
+            "opa reload version mismatch"
+        );
+    }
+    apply_opa_snapshot(opa, shm, &snapshot).await;
+}
+
+async fn maybe_refresh_opa_from_shm(
+    opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
+    opa: &Arc<Mutex<OpaResolver>>,
+    shm: &Arc<Mutex<RouterRegionWriter>>,
+    island_id: &str,
+) {
+    let header = read_opa_header(opa_reader, island_id).await;
+    let Some(header) = header else {
+        return;
+    };
+    if header.policy_version == 0 || header.wasm_size == 0 {
+        return;
+    }
+    if header.status == OPA_STATUS_LOADING {
+        return;
+    }
+    if header.status == OPA_STATUS_ERROR {
+        return;
+    }
+    let (current_version, _) = {
+        let guard = opa.lock().await;
+        guard.status()
+    };
+    if header.policy_version == current_version {
+        return;
+    }
+    let Some(snapshot) = read_opa_snapshot(opa_reader, island_id).await else {
+        tracing::warn!(
+            version = header.policy_version,
+            "opa refresh skipped: unable to read snapshot"
+        );
+        return;
+    };
+    apply_opa_snapshot(opa, shm, &snapshot).await;
+}
+
+async fn read_opa_header(
+    opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
+    island_id: &str,
+) -> Option<crate::shm::OpaHeaderSnapshot> {
+    let mut guard = opa_reader.lock().await;
+    if guard.is_none() {
+        if let Ok(reader) = OpaRegionReader::open_read_only(&format!("/jsr-opa-{}", island_id)) {
+            *guard = Some(reader);
+        } else {
+            return None;
+        }
+    }
+    guard.as_ref().and_then(|reader| reader.read_header())
+}
+
+async fn read_opa_snapshot(
+    opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
+    island_id: &str,
+) -> Option<OpaSnapshot> {
+    let mut guard = opa_reader.lock().await;
+    if guard.is_none() {
+        if let Ok(reader) = OpaRegionReader::open_read_only(&format!("/jsr-opa-{}", island_id)) {
+            *guard = Some(reader);
+        } else {
+            return None;
+        }
+    }
+    guard.as_ref().and_then(|reader| reader.read_snapshot())
+}
+
+async fn apply_opa_snapshot(
+    opa: &Arc<Mutex<OpaResolver>>,
+    shm: &Arc<Mutex<RouterRegionWriter>>,
+    snapshot: &OpaSnapshot,
+) {
+    if snapshot.wasm.is_empty() {
+        tracing::warn!(
+            version = snapshot.header.policy_version,
+            "opa reload skipped: empty policy"
+        );
+        return;
+    }
     {
         let mut shm_guard = shm.lock().await;
-        shm_guard.update_opa_status(payload.version, 2);
+        shm_guard.update_opa_status(snapshot.header.policy_version, OPA_STATUS_LOADING);
     }
+    let entrypoint = if snapshot.header.entrypoint.is_empty() {
+        None
+    } else {
+        Some(snapshot.header.entrypoint.clone())
+    };
     let result = {
         let mut opa_guard = opa.lock().await;
-        opa_guard.reload(payload.version)
+        opa_guard.reload(snapshot.header.policy_version, entrypoint, &snapshot.wasm)
     };
     let (version, status) = {
         let opa_guard = opa.lock().await;
@@ -2956,7 +3074,7 @@ async fn apply_opa_reload(
             tracing::info!(version = version, "opa reload applied");
         }
         Err(err) => {
-            tracing::warn!(version = payload.version, "opa reload failed: {err}");
+            tracing::warn!(version = snapshot.header.policy_version, "opa reload failed: {err}");
         }
     }
 }

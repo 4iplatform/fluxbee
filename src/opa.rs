@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
 
 use serde_json::Value;
 use wasmtime::{Caller, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
@@ -24,11 +24,11 @@ pub enum OpaError {
 }
 
 pub struct OpaResolver {
-    policy_path: PathBuf,
     policy_loaded: bool,
     policy_version: u64,
     opa_load_status: u8,
     logged_missing: bool,
+    entrypoint: Option<String>,
     engine: Engine,
     module: Option<Module>,
     wasm: Option<OpaWasm>,
@@ -44,6 +44,7 @@ struct OpaWasm {
     store: Store<OpaRuntimeState>,
     instance: Instance,
     memory: Memory,
+    entrypoints: HashMap<String, i32>,
     opa_malloc: TypedFunc<i32, i32>,
     opa_json_parse: TypedFunc<(i32, i32), i32>,
     opa_eval_ctx_new: TypedFunc<(), i32>,
@@ -58,13 +59,13 @@ struct OpaWasm {
 }
 
 impl OpaResolver {
-    pub fn new(policy_path: PathBuf) -> Self {
+    pub fn new() -> Self {
         Self {
-            policy_path,
             policy_loaded: false,
             policy_version: 0,
             opa_load_status: OPA_STATUS_ERROR,
             logged_missing: false,
+            entrypoint: None,
             engine: Engine::default(),
             module: None,
             wasm: None,
@@ -78,10 +79,7 @@ impl OpaResolver {
         }
         if !self.policy_loaded && !self.logged_missing {
             self.logged_missing = true;
-            tracing::warn!(
-                path = %self.policy_path.display(),
-                "opa policy not loaded; resolver disabled"
-            );
+            tracing::warn!("opa policy not loaded; resolver disabled");
         }
         if !self.policy_loaded {
             return Err(OpaError::NotLoaded);
@@ -95,28 +93,28 @@ impl OpaResolver {
         self.eval_target(&input)
     }
 
-    pub fn reload(&mut self, version: u64) -> Result<(), OpaError> {
+    pub fn reload(&mut self, version: u64, entrypoint: Option<String>, wasm_bytes: &[u8]) -> Result<(), OpaError> {
         let prev_module = self.module.take();
         let prev_wasm = self.wasm.take();
         let prev_version = self.policy_version;
         let prev_loaded = self.policy_loaded;
+        let prev_entrypoint = self.entrypoint.clone();
 
         self.opa_load_status = OPA_STATUS_LOADING;
         let result = (|| {
-            let bytes = std::fs::read(&self.policy_path)?;
-            let module = Module::from_binary(&self.engine, &bytes)?;
+            if wasm_bytes.is_empty() {
+                return Err(OpaError::NotLoaded);
+            }
+            let module = Module::from_binary(&self.engine, wasm_bytes)?;
             let wasm = OpaWasm::instantiate(&self.engine, &module)?;
             self.module = Some(module);
             self.wasm = Some(wasm);
             self.policy_loaded = true;
             self.policy_version = version;
+            self.entrypoint = entrypoint;
             self.opa_load_status = OPA_STATUS_OK;
             self.logged_missing = false;
-            tracing::info!(
-                path = %self.policy_path.display(),
-                version = version,
-                "opa policy loaded"
-            );
+            tracing::info!(version = version, "opa policy loaded");
             Ok(())
         })();
         if let Err(err) = result {
@@ -124,6 +122,7 @@ impl OpaResolver {
             self.wasm = prev_wasm;
             self.policy_loaded = prev_loaded;
             self.policy_version = prev_version;
+            self.entrypoint = prev_entrypoint;
             self.opa_load_status = OPA_STATUS_ERROR;
             return Err(err);
         }
@@ -148,7 +147,12 @@ impl OpaResolver {
             }
         }
         if let Some(set_entry) = &wasm.opa_eval_ctx_set_entrypoint {
-            set_entry.call(&mut wasm.store, (ctx, 0))?;
+            let entrypoint_id = self
+                .entrypoint
+                .as_ref()
+                .and_then(|name| wasm.entrypoints.get(name).copied())
+                .unwrap_or(0);
+            set_entry.call(&mut wasm.store, (ctx, entrypoint_id))?;
         }
         wasm.opa_eval_ctx_set_input.call(&mut wasm.store, (ctx, input_val))?;
 
@@ -281,6 +285,18 @@ impl OpaWasm {
         } else {
             tracing::warn!("opa wasm missing builtins export; builtin map unavailable");
         }
+        let mut entrypoints = HashMap::new();
+        if let Some(entrypoints_fn) = instance
+            .get_typed_func::<(), i32>(&mut store, "entrypoints")
+            .ok()
+        {
+            if let Ok(ptr) = entrypoints_fn.call(&mut store, ()) {
+                let json = read_cstr_store(&memory, &mut store, ptr);
+                entrypoints = parse_entrypoints(&json);
+            }
+        } else {
+            tracing::warn!("opa wasm missing entrypoints export; entrypoint map unavailable");
+        }
         let opa_malloc = instance
             .get_typed_func::<i32, i32>(&mut store, "opa_malloc")
             .map_err(|_| OpaError::MissingExport("opa_malloc"))?;
@@ -321,6 +337,7 @@ impl OpaWasm {
             store,
             instance,
             memory,
+            entrypoints,
             opa_malloc,
             opa_json_parse,
             opa_eval_ctx_new,
@@ -437,6 +454,20 @@ fn parse_builtins(json: &str) -> Vec<String> {
     }
 }
 
+fn parse_entrypoints(json: &str) -> HashMap<String, i32> {
+    let value: Result<Value, _> = serde_json::from_str(json);
+    let Ok(value) = value else {
+        return HashMap::new();
+    };
+    match value {
+        Value::Object(map) => map
+            .into_iter()
+            .filter_map(|(key, value)| value.as_i64().map(|id| (key, id as i32)))
+            .collect(),
+        _ => HashMap::new(),
+    }
+}
+
 fn eval_builtin(
     caller: &mut Caller<'_, OpaRuntimeState>,
     builtin_id: i32,
@@ -519,9 +550,9 @@ fn dump_value(caller: &mut Caller<'_, OpaRuntimeState>, addr: i32) -> Result<Val
         .and_then(|e| e.into_func())
         .or_else(|| caller.get_export("opa_json_dump").and_then(|e| e.into_func()))
         .ok_or(OpaError::MissingExport("opa_value_dump/opa_json_dump"))?;
-    let dump = dump_func.typed::<i32, i32>(caller)?;
-    let ptr = dump.call(caller, addr)?;
-    let json = read_cstr(&memory, caller, ptr);
+    let dump = dump_func.typed::<i32, i32>(&mut *caller)?;
+    let ptr = dump.call(&mut *caller, addr)?;
+    let json = read_cstr(&memory, &mut *caller, ptr);
     Ok(serde_json::from_str(&json)?)
 }
 
@@ -541,12 +572,12 @@ fn json_to_opa_value(
         .get_export("opa_json_parse")
         .and_then(|e| e.into_func())
         .ok_or(OpaError::MissingExport("opa_json_parse"))?;
-    let malloc = malloc.typed::<i32, i32>(caller)?;
-    let parse = parse.typed::<(i32, i32), i32>(caller)?;
+    let malloc = malloc.typed::<i32, i32>(&mut *caller)?;
+    let parse = parse.typed::<(i32, i32), i32>(&mut *caller)?;
     let json = serde_json::to_string(value)?;
-    let ptr = malloc.call(caller, json.len() as i32)?;
-    if let Err(err) = memory.write(caller, ptr as usize, json.as_bytes()) {
+    let ptr = malloc.call(&mut *caller, json.len() as i32)?;
+    if let Err(err) = memory.write(&mut *caller, ptr as usize, json.as_bytes()) {
         return Err(OpaError::Eval(err.to_string()));
     }
-    Ok(parse.call(caller, (ptr, json.len() as i32))?)
+    Ok(parse.call(&mut *caller, (ptr, json.len() as i32))?)
 }
