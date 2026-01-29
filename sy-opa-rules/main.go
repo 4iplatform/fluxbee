@@ -1107,11 +1107,28 @@ func compileRego(rego string, entrypoint string) ([]byte, string, int64, error) 
 		return nil, "", 0, err
 	}
 	wasm := buf.Bytes()
+	if err := validateWasm(wasm); err != nil {
+		return nil, "", 0, err
+	}
 	if len(wasm) > opaMaxWasmSize {
 		return nil, "", 0, fmt.Errorf("wasm too large (%d bytes)", len(wasm))
 	}
 	hash := sha256.Sum256(wasm)
 	return wasm, "sha256:" + hex.EncodeToString(hash[:]), time.Since(start).Milliseconds(), nil
+}
+
+func validateWasm(wasm []byte) error {
+	if len(wasm) < 8 {
+		return fmt.Errorf("invalid wasm output: too short (%d bytes)", len(wasm))
+	}
+	if !bytes.Equal(wasm[:4], []byte{0x00, 0x61, 0x73, 0x6d}) {
+		return fmt.Errorf("invalid wasm magic: %x", wasm[:4])
+	}
+	version := binary.LittleEndian.Uint32(wasm[4:8])
+	if version != 1 {
+		return fmt.Errorf("unsupported wasm version: %d", version)
+	}
+	return nil
 }
 
 func writePolicyFiles(dir string, rego string, meta PolicyMetadata) error {
