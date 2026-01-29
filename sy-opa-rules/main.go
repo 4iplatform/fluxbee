@@ -1108,10 +1108,9 @@ func compileRego(rego string, entrypoint string) ([]byte, string, int64, error) 
 		return nil, "", 0, err
 	}
 	wasm := buf.Bytes()
-	var err error
-	wasm, err = normalizeWasmBytes(wasm)
-	if err != nil {
-		return nil, "", 0, err
+	wasm, normErr := normalizeWasmBytes(wasm)
+	if normErr != nil {
+		return nil, "", 0, normErr
 	}
 	if err := validateWasm(wasm); err != nil {
 		return nil, "", 0, err
