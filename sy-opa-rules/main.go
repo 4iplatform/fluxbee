@@ -92,6 +92,7 @@ type OpaConfigPayload struct {
 type ConfigChangedPayload struct {
 	Subsystem string            `json:"subsystem"`
 	Action    string            `json:"action"`
+	AutoApply *bool             `json:"auto_apply,omitempty"`
 	Version   uint64            `json:"version"`
 	Config    *OpaConfigPayload `json:"config,omitempty"`
 }
@@ -451,7 +452,11 @@ func (s *Service) handleMessage(msg Message) {
 			if payload.Subsystem != "opa" {
 				return
 			}
-			s.handleOpaAction(msg.Routing.Src, payload.Action, payload.Version, payload.Config, true)
+			autoApply := false
+			if payload.AutoApply != nil {
+				autoApply = *payload.AutoApply
+			}
+			s.handleOpaAction(msg.Routing.Src, payload.Action, payload.Version, payload.Config, autoApply, true)
 		}
 	case "command":
 		s.handleCommand(msg)
@@ -476,7 +481,7 @@ func (s *Service) handleCommand(msg Message) {
 		_, err := s.handleOpaAction(msg.Routing.Src, "compile", req.Version, &OpaConfigPayload{
 			Rego:       req.Rego,
 			Entrypoint: req.Entrypoint,
-		}, false)
+		}, false, false)
 		if err != nil {
 			return
 		}
@@ -488,7 +493,7 @@ func (s *Service) handleCommand(msg Message) {
 	case "apply_policy":
 		var req VersionRequest
 		_ = json.Unmarshal(msg.Payload, &req)
-		_, err := s.handleOpaAction(msg.Routing.Src, "apply", req.Version, nil, false)
+		_, err := s.handleOpaAction(msg.Routing.Src, "apply", req.Version, nil, false, false)
 		if err != nil {
 			return
 		}
@@ -497,7 +502,7 @@ func (s *Service) handleCommand(msg Message) {
 			"version": req.Version,
 		})
 	case "rollback_policy":
-		_, err := s.handleOpaAction(msg.Routing.Src, "rollback", 0, nil, false)
+		_, err := s.handleOpaAction(msg.Routing.Src, "rollback", 0, nil, false, false)
 		if err != nil {
 			return
 		}
@@ -537,7 +542,7 @@ func (s *Service) handleQuery(msg Message) {
 	}
 }
 
-func (s *Service) handleOpaAction(src string, action string, version uint64, cfg *OpaConfigPayload, broadcast bool) (bool, error) {
+func (s *Service) handleOpaAction(src string, action string, version uint64, cfg *OpaConfigPayload, autoApply bool, broadcast bool) (bool, error) {
 	action = strings.ToLower(action)
 	switch action {
 	case "compile", "compile_apply":
@@ -562,7 +567,7 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), cfg.Rego, meta); err != nil {
 			return s.respondConfigError(src, action, version, "IO_ERROR", err.Error(), broadcast)
 		}
-		if action == "compile_apply" {
+		if action == "compile_apply" || autoApply {
 			if err := s.applyPolicy(version); err != nil {
 				return s.respondConfigError(src, "apply", version, "APPLY_ERROR", err.Error(), broadcast)
 			}

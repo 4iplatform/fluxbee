@@ -129,7 +129,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 enum BroadcastRequest {
     Routes(Vec<RouteConfig>),
     Vpns(Vec<VpnConfig>),
-    Opa(OpaRequest),
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +175,7 @@ async fn run_broadcast_loop(
                     &mut client,
                     "routes",
                     None,
+                    None,
                     0,
                     serde_json::json!({ "routes": routes }),
                     None,
@@ -194,6 +194,7 @@ async fn run_broadcast_loop(
                     &mut client,
                     "vpn",
                     None,
+                    None,
                     0,
                     serde_json::json!({ "vpns": vpns }),
                     None,
@@ -203,15 +204,6 @@ async fn run_broadcast_loop(
                     Ok(()) => false,
                     Err(err) => {
                         tracing::warn!(error = %err, "broadcast failed");
-                        true
-                    }
-                }
-            }
-            BroadcastRequest::Opa(req) => {
-                match broadcast_opa_changed(&mut client, req).await {
-                    Ok(()) => false,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "opa broadcast failed");
                         true
                     }
                 }
@@ -240,6 +232,7 @@ async fn broadcast_config_changed(
     client: &mut NodeClient,
     subsystem: &str,
     action: Option<String>,
+    auto_apply: Option<bool>,
     version: u64,
     config: serde_json::Value,
     target_island: Option<String>,
@@ -267,6 +260,7 @@ async fn broadcast_config_changed(
         payload: serde_json::to_value(ConfigChangedPayload {
             subsystem: subsystem.to_string(),
             action,
+            auto_apply,
             version,
             config,
         })?,
@@ -274,35 +268,6 @@ async fn broadcast_config_changed(
     client.send(&msg).await?;
     tracing::info!(subsystem = subsystem, version = version, "config changed broadcast sent");
     Ok(())
-}
-
-async fn broadcast_opa_changed(
-    client: &mut NodeClient,
-    req: OpaRequest,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let action = req.action.unwrap_or_else(|| "compile_apply".to_string());
-    let version = req.version.unwrap_or(0);
-    let entrypoint = req.entrypoint.clone().unwrap_or_else(|| "router/target".to_string());
-    let mut config = serde_json::json!({});
-    if matches!(action.as_str(), "compile" | "compile_apply" | "check") {
-        let rego = req.rego.ok_or("rego missing")?;
-        config = serde_json::json!({
-            "rego": rego,
-            "entrypoint": entrypoint,
-        });
-    }
-    if matches!(action.as_str(), "apply") && version == 0 {
-        return Err("version required for apply".into());
-    }
-    broadcast_config_changed(
-        client,
-        "opa",
-        Some(action),
-        version,
-        config,
-        req.island,
-    )
-    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,7 +292,7 @@ impl OpaAction {
     fn as_str(&self) -> &'static str {
         match self {
             OpaAction::Compile => "compile",
-            OpaAction::CompileApply => "compile_apply",
+            OpaAction::CompileApply => "compile",
             OpaAction::Apply => "apply",
             OpaAction::Rollback => "rollback",
             OpaAction::Check => "compile",
@@ -344,6 +309,15 @@ impl OpaAction {
 
     fn check_only(&self) -> bool {
         matches!(self, OpaAction::Check)
+    }
+
+    fn auto_apply_flag(&self) -> Option<bool> {
+        match self {
+            OpaAction::Compile => Some(false),
+            OpaAction::CompileApply => Some(true),
+            OpaAction::Check => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -542,14 +516,53 @@ async fn respond_json(
     Ok(())
 }
 
+fn next_opa_version(
+    state_dir: &Path,
+    requested: Option<u64>,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let path = state_dir.join("opa-version.txt");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let current = fs::read_to_string(&path)
+        .ok()
+        .and_then(|data| data.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let next = match requested {
+        Some(version) => {
+            if version <= current {
+                return Err(format!(
+                    "version must be greater than current (current={current})"
+                )
+                .into());
+            }
+            version
+        }
+        None => current + 1,
+    };
+    fs::write(&path, next.to_string())?;
+    Ok(next)
+}
+
 async fn handle_opa_http(
     ctx: &AdminContext,
     mut req: OpaRequest,
     action: OpaAction,
 ) -> Result<(u16, String), Box<dyn std::error::Error>> {
-    let version = req
-        .version
-        .unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64);
+    let version = match action {
+        OpaAction::Apply => {
+            let Some(version) = req.version else {
+                let resp = serde_json::json!({
+                    "status": "error",
+                    "error": "version_required"
+                });
+                return Ok((400, resp.to_string()));
+            };
+            version
+        }
+        OpaAction::Rollback => req.version.unwrap_or(0),
+        _ => next_opa_version(&ctx.state_dir, req.version)?,
+    };
     let entrypoint = req.entrypoint.clone().unwrap_or_else(|| "router/target".to_string());
     let target = req.island.take();
 
@@ -569,6 +582,7 @@ async fn handle_opa_http(
             version,
             req.rego.clone(),
             Some(entrypoint.clone()),
+            action.auto_apply_flag(),
             target.clone(),
         )
         .await?;
@@ -579,7 +593,7 @@ async fn handle_opa_http(
 
     if action.apply_after() {
         let apply_responses =
-            send_opa_action(ctx, "apply", version, None, None, target.clone()).await?;
+            send_opa_action(ctx, "apply", version, None, None, None, target.clone()).await?;
         if apply_responses.is_empty() || apply_responses.iter().any(|r| r.status != "ok") {
             let mut combined = responses;
             combined.extend(apply_responses);
@@ -588,7 +602,8 @@ async fn handle_opa_http(
         responses.extend(apply_responses);
     } else if matches!(action, OpaAction::Apply | OpaAction::Rollback) {
         let apply_action = action.as_str();
-        responses = send_opa_action(ctx, apply_action, version, None, None, target.clone()).await?;
+        responses =
+            send_opa_action(ctx, apply_action, version, None, None, None, target.clone()).await?;
     }
 
     Ok(build_opa_http_response(ctx, action, version, responses, target))
@@ -600,6 +615,7 @@ async fn send_opa_action(
     version: u64,
     rego: Option<String>,
     entrypoint: Option<String>,
+    auto_apply: Option<bool>,
     target: Option<String>,
 ) -> Result<Vec<OpaResponseEntry>, Box<dyn std::error::Error>> {
     let node_config = NodeConfig {
@@ -621,6 +637,7 @@ async fn send_opa_action(
         &mut client,
         "opa",
         Some(action.to_string()),
+        auto_apply,
         version,
         cfg,
         target.clone(),

@@ -243,6 +243,8 @@ SY.opa.rules recibe dos tipos de mensajes:
 
 #### 3.5.1 Broadcast: CONFIG_CHANGED (subsystem: opa)
 
+**Versionado:** SY.admin asigna números de versión usando un contador monotónico persistido en `/var/lib/json-router/opa-version.txt`. El contador siempre incrementa, incluso si la operación falla.
+
 **Compilar nuevo código (queda staged):**
 
 ```json
@@ -260,6 +262,7 @@ SY.opa.rules recibe dos tipos de mensajes:
     "subsystem": "opa",
     "action": "compile",
     "version": 43,
+    "auto_apply": false,
     "config": {
       "rego": "package router\n\ndefault target = null\n...",
       "entrypoint": "router/target"
@@ -275,7 +278,8 @@ SY.opa.rules recibe dos tipos de mensajes:
   "payload": {
     "subsystem": "opa",
     "action": "compile",
-    "version": 43
+    "version": 43,
+    "auto_apply": false
     // Sin config.rego = usa el rego actual
   }
 }
@@ -299,8 +303,9 @@ SY.opa.rules recibe dos tipos de mensajes:
 {
   "payload": {
     "subsystem": "opa",
-    "action": "compile_apply",
+    "action": "compile",
     "version": 43,
+    "auto_apply": true,
     "config": {
       "rego": "package router\n...",
       "entrypoint": "router/target"
@@ -684,7 +689,19 @@ impl Router {
 
 ### 3.10 Flujo desde SY.admin (API HTTP)
 
-#### Caso A: Broadcast a todas las islas (3 fases)
+**Versionado:** SY.admin mantiene un contador monotónico en `/var/lib/json-router/opa-version.txt`. Cada operación que requiere versión incrementa el contador antes de enviar el mensaje.
+
+#### Endpoints HTTP
+
+| Endpoint | Acción mensaje | auto_apply | Descripción |
+|----------|----------------|------------|-------------|
+| POST /opa/policy | compile + apply | - | Compila, si OK aplica |
+| POST /opa/policy/compile | compile | false | Solo compila, queda staged |
+| POST /opa/policy/check | compile | false | Alias de /compile (validación) |
+| POST /opa/policy/apply | apply | - | Aplica versión staged |
+| POST /opa/policy/rollback | rollback | - | Vuelve a backup |
+
+#### Caso A: Broadcast a todas las islas (compile + apply)
 
 ```
 POST /opa/policy
@@ -694,10 +711,11 @@ POST /opa/policy
 }
 
 SY.admin:
-  1. Broadcast CONFIG_CHANGED {action: compile}
-  2. Espera respuestas (timeout 30s)
-  3. Si TODAS OK → Broadcast CONFIG_CHANGED {action: apply}
-  4. Si alguna ERROR → NO aplica, retorna error
+  1. Incrementar version (persistir en archivo)
+  2. Broadcast CONFIG_CHANGED {action: compile, auto_apply: false}
+  3. Espera CONFIG_RESPONSE de todas las islas (timeout 30s)
+  4. Si TODAS OK → Broadcast CONFIG_CHANGED {action: apply}
+  5. Si alguna ERROR → NO aplica, retorna error
 
 HTTP Response:
 {
@@ -860,13 +878,16 @@ sy-opa-rules/                    # Proyecto separado en Go
 
 | Mensaje | Tipo | Origen | Destino | Propósito |
 |---------|------|--------|---------|-----------|
-| CONFIG_CHANGED (compile) | broadcast | SY.admin | todas las islas | Compilar en todas |
+| CONFIG_CHANGED (compile, auto_apply=false) | broadcast | SY.admin | todas las islas | Compilar, queda staged |
+| CONFIG_CHANGED (compile, auto_apply=true) | broadcast | SY.admin | todas las islas | Compilar + aplicar |
 | CONFIG_CHANGED (apply) | broadcast | SY.admin | todas las islas | Aplicar staged |
-| CONFIG_CHANGED (compile_apply) | broadcast | SY.admin | todas las islas | Compilar + aplicar |
 | CONFIG_CHANGED (rollback) | broadcast | SY.admin | todas las islas | Rollback |
+| CONFIG_RESPONSE | unicast | SY.opa.rules | SY.admin | Resultado de operación |
 | COMPILE_POLICY | unicast | SY.admin | SY.opa.rules@X | Compilar en isla X |
 | APPLY_POLICY | unicast | SY.admin | SY.opa.rules@X | Aplicar en isla X |
 | ROLLBACK_POLICY | unicast | SY.admin | SY.opa.rules@X | Rollback en isla X |
 | GET_POLICY | unicast | cualquiera | SY.opa.rules@X | Obtener rego actual |
 | GET_STATUS | unicast | cualquiera | SY.opa.rules@X | Estado del nodo |
 | OPA_RELOAD | broadcast local | SY.opa.rules | routers locales | Recargar WASM |
+
+**Nota sobre versionado:** SY.admin mantiene contador monotónico en `/var/lib/json-router/opa-version.txt`.

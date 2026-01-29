@@ -343,23 +343,42 @@ Cada nodo al recibir CONFIG_CHANGED:
 
 El subsystem `opa` tiene un campo adicional `action` que define la operación:
 
-| Action | Con rego | Comportamiento |
-|--------|----------|----------------|
-| `compile` | SÍ | Compilar nuevo rego, guardar como staged |
-| `compile` | NO | Recompilar rego actual (refresh) |
-| `apply` | - | Activar versión staged |
-| `compile_apply` | SÍ | Compilar Y activar en un paso |
-| `rollback` | - | Volver a versión backup |
+| Action | Con rego | auto_apply | Comportamiento |
+|--------|----------|------------|----------------|
+| `compile` | SÍ | false (default) | Compilar nuevo rego, guardar como staged |
+| `compile` | NO | false | Recompilar rego actual (refresh) |
+| `compile` | SÍ | true | Compilar Y aplicar en un paso |
+| `apply` | - | - | Activar versión staged |
+| `rollback` | - | - | Volver a versión backup |
 
-**Ejemplo: Compilar nueva policy:**
+**Versionado:** SY.admin es el único que asigna números de versión usando un contador monotónico persistido en `/var/lib/json-router/opa-version.txt`. El contador siempre incrementa, incluso si la operación falla.
+
+**Ejemplo: Compilar nueva policy (queda staged):**
 ```json
 {
   "payload": {
     "subsystem": "opa",
     "action": "compile",
     "version": 43,
+    "auto_apply": false,
     "config": {
       "rego": "package router\n\ndefault target = null\n...",
+      "entrypoint": "router/target"
+    }
+  }
+}
+```
+
+**Ejemplo: Compilar Y aplicar en un paso:**
+```json
+{
+  "payload": {
+    "subsystem": "opa",
+    "action": "compile",
+    "version": 43,
+    "auto_apply": true,
+    "config": {
+      "rego": "package router\n...",
       "entrypoint": "router/target"
     }
   }

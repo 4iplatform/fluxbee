@@ -151,6 +151,8 @@ pub struct ConfigChangedPayload {
     pub subsystem: String,
     #[serde(default)]
     pub action: Option<String>,
+    #[serde(default)]
+    pub auto_apply: Option<bool>,
     pub version: u64,
     #[serde(default)]
     pub config: Value,

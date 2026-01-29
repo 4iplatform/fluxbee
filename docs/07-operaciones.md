@@ -32,6 +32,7 @@ Todos los binarios conocen estos paths por código:
 ├── identity.yaml                  # UUID del gateway (auto-generado)
 ├── orchestrator.yaml              # Config de SY.orchestrator (storage.path, etc.)
 ├── config-routes.yaml             # Rutas/VPN (persiste SY.config.routes)
+├── opa-version.txt                # Contador monotónico de versión OPA (SY.admin)
 ├── opa/                           # Policies OPA (persiste SY.opa.rules)
 │   ├── current/
 │   │   ├── policy.rego            # Fuente Rego activo
