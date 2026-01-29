@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -1048,7 +1050,7 @@ func compileRego(rego string, entrypoint string) ([]byte, string, int64, error) 
 	start := time.Now()
 	compiler := compile.New().
 		WithTarget(compile.TargetWasm).
-		WithEntrypoint(entrypoint).
+		WithEntrypoints([]string{entrypoint}).
 		WithPaths(regoPath).
 		WithOutput(outPath)
 	if err := compiler.Build(context.Background()); err != nil {
