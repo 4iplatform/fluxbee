@@ -362,6 +362,13 @@ struct OpaResponseEntry {
     error_detail: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct OpaQueryEntry {
+    island: String,
+    status: String,
+    payload: serde_json::Value,
+}
+
 async fn run_http_server(
     listen: &str,
     tx: &mpsc::UnboundedSender<BroadcastRequest>,
@@ -387,7 +394,8 @@ async fn handle_http(
     ctx: &AdminContext,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (method, path, headers, body) = read_http_request(stream).await?;
-    match (method.as_str(), path.as_str()) {
+    let (path, query) = split_path_query(&path);
+    match (method.as_str(), path) {
         ("GET", "/health") => {
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
         }
@@ -433,6 +441,22 @@ async fn handle_http(
         ("POST", "/opa/policy/check") => {
             let req: OpaRequest = serde_json::from_slice(&body)?;
             let (status, resp) = handle_opa_http(ctx, req, OpaAction::Check).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("GET", "/opa/policy") => {
+            let target = query
+                .get("island")
+                .cloned()
+                .or_else(|| query.get("target").cloned());
+            let (status, resp) = handle_opa_query(ctx, "get_policy", target).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("GET", "/opa/status") => {
+            let target = query
+                .get("island")
+                .cloned()
+                .or_else(|| query.get("target").cloned());
+            let (status, resp) = handle_opa_query(ctx, "get_status", target).await?;
             respond_json(stream, status, &resp).await?;
         }
         _ => {
@@ -494,6 +518,29 @@ async fn read_http_request(
 
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn split_path_query(path: &str) -> (&str, HashMap<String, String>) {
+    if let Some((base, query)) = path.split_once('?') {
+        (base, parse_query(query))
+    } else {
+        (path, HashMap::new())
+    }
+}
+
+fn parse_query(query: &str) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = match pair.split_once('=') {
+            Some(parts) => parts,
+            None => (pair, ""),
+        };
+        params.insert(key.to_string(), value.to_string());
+    }
+    params
 }
 
 async fn respond_json(
@@ -609,6 +656,15 @@ async fn handle_opa_http(
     Ok(build_opa_http_response(ctx, action, version, responses, target))
 }
 
+async fn handle_opa_query(
+    ctx: &AdminContext,
+    action: &str,
+    target: Option<String>,
+) -> Result<(u16, String), Box<dyn std::error::Error>> {
+    let responses = send_opa_query(ctx, action, target.clone()).await?;
+    Ok(build_opa_query_response(ctx, action, responses, target))
+}
+
 async fn send_opa_action(
     ctx: &AdminContext,
     action: &str,
@@ -646,6 +702,49 @@ async fn send_opa_action(
 
     let expected = expected_islands(ctx, target.as_deref());
     let responses = collect_opa_responses(&mut client, action, version, &expected).await;
+    Ok(responses)
+}
+
+async fn send_opa_query(
+    ctx: &AdminContext,
+    action: &str,
+    target: Option<String>,
+) -> Result<Vec<OpaQueryEntry>, Box<dyn std::error::Error>> {
+    let node_config = NodeConfig {
+        name: "SY.admin".to_string(),
+        router_socket: ctx.socket_dir.clone(),
+        uuid_persistence_dir: ctx.state_dir.join("nodes"),
+        config_dir: ctx.config_dir.clone(),
+        version: "1.0".to_string(),
+    };
+    let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let dst = if let Some(island) = target.as_deref() {
+        Destination::Unicast(format!("SY.opa.rules@{}", island))
+    } else {
+        Destination::Broadcast
+    };
+    let msg = Message {
+        routing: Routing {
+            src: client.uuid().to_string(),
+            dst,
+            ttl: 16,
+            trace_id: Uuid::new_v4().to_string(),
+        },
+        meta: Meta {
+            msg_type: "query".to_string(),
+            action: Some(action.to_string()),
+            msg: None,
+            scope: None,
+            target: None,
+            priority: None,
+            context: None,
+        },
+        payload: serde_json::json!({}),
+    };
+    client.send(&msg).await?;
+
+    let expected = expected_islands(ctx, target.as_deref());
+    let responses = collect_opa_query_responses(&mut client, action, &expected).await;
     Ok(responses)
 }
 
@@ -720,6 +819,56 @@ async fn collect_opa_responses(
     responses.into_values().collect()
 }
 
+async fn collect_opa_query_responses(
+    client: &mut NodeClient,
+    action: &str,
+    expected: &[String],
+) -> Vec<OpaQueryEntry> {
+    use tokio::time::{timeout, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut responses: HashMap<String, OpaQueryEntry> = HashMap::new();
+
+    while responses.len() < expected.len() && Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let msg = match timeout(remaining, client.recv()).await {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(err)) => {
+                tracing::warn!("opa query recv error: {err}");
+                break;
+            }
+            Err(_) => break,
+        };
+        if msg.meta.msg_type != "query_response" {
+            continue;
+        }
+        if msg.meta.action.as_deref() != Some(action) {
+            continue;
+        }
+        let payload = msg.payload;
+        let island = payload
+            .get("island")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let status = payload
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ok")
+            .to_string();
+        responses.insert(
+            island.clone(),
+            OpaQueryEntry {
+                island,
+                status,
+                payload,
+            },
+        );
+    }
+
+    responses.into_values().collect()
+}
+
 fn build_opa_http_response(
     ctx: &AdminContext,
     action: OpaAction,
@@ -732,7 +881,8 @@ fn build_opa_http_response(
         .into_iter()
         .filter(|island| !responses.iter().any(|r| r.island == *island))
         .collect();
-    let status = if responses.is_empty() || responses.iter().any(|r| r.status != "ok") {
+    let timed_out = !pending.is_empty();
+    let status = if timed_out || responses.is_empty() || responses.iter().any(|r| r.status != "ok") {
         500
     } else {
         200
@@ -744,6 +894,43 @@ fn build_opa_http_response(
         "check_only": action.check_only(),
         "responses": responses,
         "pending": pending,
+        "error_code": if timed_out {
+            Some("TIMEOUT".to_string())
+        } else {
+            None
+        },
+    })
+    .to_string();
+    (status, body)
+}
+
+fn build_opa_query_response(
+    ctx: &AdminContext,
+    action: &str,
+    responses: Vec<OpaQueryEntry>,
+    target: Option<String>,
+) -> (u16, String) {
+    let expected = expected_islands(ctx, target.as_deref());
+    let pending: Vec<String> = expected
+        .into_iter()
+        .filter(|island| !responses.iter().any(|r| r.island == *island))
+        .collect();
+    let timed_out = !pending.is_empty();
+    let status = if timed_out || responses.is_empty() || responses.iter().any(|r| r.status != "ok") {
+        500
+    } else {
+        200
+    };
+    let body = serde_json::json!({
+        "status": if status == 200 { "ok" } else { "error" },
+        "action": action,
+        "responses": responses,
+        "pending": pending,
+        "error_code": if timed_out {
+            Some("TIMEOUT".to_string())
+        } else {
+            None
+        },
     })
     .to_string();
     (status, body)

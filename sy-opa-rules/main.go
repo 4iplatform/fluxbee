@@ -3,8 +3,8 @@
 package main
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -35,7 +35,7 @@ const (
 	nodesDir            = "/var/lib/json-router/nodes"
 	routerSockDir       = "/var/run/json-router/routers"
 	lockPath            = "/var/run/json-router/sy-opa-rules.lock"
-	opaShmPrefix         = "/jsr-opa-"
+	opaShmPrefix        = "/jsr-opa-"
 	opaMagic            = 0x4A534F50 // "JSOP"
 	opaVersion          = 1
 	opaMaxWasmSize      = 4 * 1024 * 1024
@@ -114,6 +114,30 @@ type PolicyMetadata struct {
 	CompiledAt  string `json:"compiled_at"`
 	WasmSize    int    `json:"wasm_size_bytes,omitempty"`
 	ErrorDetail string `json:"error_detail,omitempty"`
+}
+
+type OpaError struct {
+	Code   string
+	Detail string
+}
+
+func (e OpaError) Error() string {
+	return e.Detail
+}
+
+func classifyOpaError(err error) (string, string) {
+	if err == nil {
+		return "SHM_ERROR", "unknown error"
+	}
+	var oe OpaError
+	if errors.As(err, &oe) {
+		return oe.Code, oe.Detail
+	}
+	var oePtr *OpaError
+	if errors.As(err, &oePtr) && oePtr != nil {
+		return oePtr.Code, oePtr.Detail
+	}
+	return "SHM_ERROR", err.Error()
 }
 
 type OpaRegion struct {
@@ -518,12 +542,13 @@ func (s *Service) handleQuery(msg Message) {
 	case "get_policy":
 		meta, rego := readCurrentPolicy()
 		resp := map[string]any{
-			"status":     "ok",
-			"version":    meta.Version,
-			"rego":       rego,
-			"hash":       meta.Hash,
+			"status":      "ok",
+			"island":      s.islandID,
+			"version":     meta.Version,
+			"rego":        rego,
+			"hash":        meta.Hash,
 			"compiled_at": meta.CompiledAt,
-			"entrypoint": meta.Entrypoint,
+			"entrypoint":  meta.Entrypoint,
 		}
 		s.sendQueryResponse(msg, action, resp)
 	case "get_status":
@@ -547,7 +572,7 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 	switch action {
 	case "compile", "compile_apply":
 		if cfg == nil || cfg.Rego == "" {
-			return s.respondConfigError(src, action, version, "INVALID_PAYLOAD", "rego missing", broadcast)
+			return s.respondConfigError(src, action, version, "COMPILE_ERROR", "rego missing", broadcast)
 		}
 		entrypoint := cfg.Entrypoint
 		if entrypoint == "" {
@@ -565,11 +590,12 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 			WasmSize:   len(wasm),
 		}
 		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), cfg.Rego, meta); err != nil {
-			return s.respondConfigError(src, action, version, "IO_ERROR", err.Error(), broadcast)
+			return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
 		}
 		if action == "compile_apply" || autoApply {
 			if err := s.applyPolicy(version); err != nil {
-				return s.respondConfigError(src, "apply", version, "APPLY_ERROR", err.Error(), broadcast)
+				code, detail := classifyOpaError(err)
+				return s.respondConfigError(src, "apply", version, code, detail, broadcast)
 			}
 		}
 		if broadcast {
@@ -578,7 +604,8 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 		return true, nil
 	case "apply":
 		if err := s.applyPolicy(version); err != nil {
-			return s.respondConfigError(src, action, version, "APPLY_ERROR", err.Error(), broadcast)
+			code, detail := classifyOpaError(err)
+			return s.respondConfigError(src, action, version, code, detail, broadcast)
 		}
 		if broadcast {
 			s.sendConfigResponse(src, action, version, "ok", PolicyMetadata{Version: version}, 0)
@@ -586,7 +613,8 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 		return true, nil
 	case "rollback":
 		if err := s.rollbackPolicy(); err != nil {
-			return s.respondConfigError(src, action, version, "ROLLBACK_ERROR", err.Error(), broadcast)
+			code, detail := classifyOpaError(err)
+			return s.respondConfigError(src, action, version, code, detail, broadcast)
 		}
 		if broadcast {
 			s.sendConfigResponse(src, action, version, "ok", PolicyMetadata{Version: version}, 0)
@@ -594,7 +622,7 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 		return true, nil
 	case "check":
 		if cfg == nil || cfg.Rego == "" {
-			return s.respondConfigError(src, action, version, "INVALID_PAYLOAD", "rego missing", broadcast)
+			return s.respondConfigError(src, action, version, "COMPILE_ERROR", "rego missing", broadcast)
 		}
 		entrypoint := cfg.Entrypoint
 		if entrypoint == "" {
@@ -612,7 +640,7 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 			WasmSize:   len(wasm),
 		}
 		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), cfg.Rego, meta); err != nil {
-			return s.respondConfigError(src, action, version, "IO_ERROR", err.Error(), broadcast)
+			return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
 		}
 		if broadcast {
 			s.sendConfigResponse(src, action, version, "ok", meta, compileMs)
@@ -628,7 +656,7 @@ func (s *Service) applyPolicy(version uint64) error {
 	stagedMeta := filepath.Join(stagedDir, "metadata.json")
 	rego, err := os.ReadFile(stagedRego)
 	if err != nil {
-		return fmt.Errorf("staged policy missing")
+		return OpaError{Code: "NOTHING_STAGED", Detail: "staged policy missing"}
 	}
 	meta, _ := readMetadata(stagedMeta)
 	entrypoint := meta.Entrypoint
@@ -636,14 +664,14 @@ func (s *Service) applyPolicy(version uint64) error {
 		entrypoint = defaultEntrypoint
 	}
 	if version != 0 && meta.Version != 0 && version != meta.Version {
-		return fmt.Errorf("version mismatch: staged=%d requested=%d", meta.Version, version)
+		return OpaError{Code: "VERSION_MISMATCH", Detail: fmt.Sprintf("version mismatch: staged=%d requested=%d", meta.Version, version)}
 	}
 	if version == 0 {
 		version = meta.Version
 	}
 	wasm, hash, _, err := compileRego(string(rego), entrypoint)
 	if err != nil {
-		return err
+		return OpaError{Code: "COMPILE_ERROR", Detail: err.Error()}
 	}
 	meta.Version = version
 	meta.Hash = hash
@@ -655,7 +683,7 @@ func (s *Service) applyPolicy(version uint64) error {
 	currentDir := filepath.Join(stateDir, "current")
 	_ = copyDir(currentDir, backupDir)
 	if err := writePolicyFiles(currentDir, string(rego), meta); err != nil {
-		return err
+		return OpaError{Code: "SHM_ERROR", Detail: err.Error()}
 	}
 	s.opaRegion.writePolicy(version, wasm, entrypoint)
 	s.broadcastOpaReload(version, hash)
@@ -669,7 +697,7 @@ func (s *Service) rollbackPolicy() error {
 	backupMeta := filepath.Join(backupDir, "metadata.json")
 	rego, err := os.ReadFile(backupRego)
 	if err != nil {
-		return fmt.Errorf("backup policy missing")
+		return OpaError{Code: "NO_BACKUP", Detail: "backup policy missing"}
 	}
 	meta, _ := readMetadata(backupMeta)
 	entrypoint := meta.Entrypoint
@@ -678,14 +706,14 @@ func (s *Service) rollbackPolicy() error {
 	}
 	wasm, hash, _, err := compileRego(string(rego), entrypoint)
 	if err != nil {
-		return err
+		return OpaError{Code: "COMPILE_ERROR", Detail: err.Error()}
 	}
 	currentDir := filepath.Join(stateDir, "current")
 	meta.Hash = hash
 	meta.CompiledAt = time.Now().UTC().Format(time.RFC3339)
 	meta.WasmSize = len(wasm)
 	if err := writePolicyFiles(currentDir, string(rego), meta); err != nil {
-		return err
+		return OpaError{Code: "SHM_ERROR", Detail: err.Error()}
 	}
 	s.opaRegion.writePolicy(meta.Version, wasm, entrypoint)
 	s.broadcastOpaReload(meta.Version, meta.Hash)
@@ -714,14 +742,14 @@ func (s *Service) respondConfigError(src, action string, version uint64, code, d
 
 func (s *Service) sendConfigResponse(dst, action string, version uint64, status string, meta PolicyMetadata, compileMs int64) {
 	payload := map[string]any{
-		"subsystem":         "opa",
-		"action":            action,
-		"version":           version,
-		"status":            status,
-		"island":            s.islandID,
-		"compile_time_ms":   compileMs,
-		"wasm_size_bytes":   meta.WasmSize,
-		"hash":              meta.Hash,
+		"subsystem":       "opa",
+		"action":          action,
+		"version":         version,
+		"status":          status,
+		"island":          s.islandID,
+		"compile_time_ms": compileMs,
+		"wasm_size_bytes": meta.WasmSize,
+		"hash":            meta.Hash,
 	}
 	s.sendSystemMessage(dst, "CONFIG_RESPONSE", payload)
 }
