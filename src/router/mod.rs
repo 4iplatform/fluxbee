@@ -2967,7 +2967,50 @@ async fn apply_opa_reload(
             "opa reload version mismatch"
         );
     }
+    if let Some(hash) = payload.hash.as_deref() {
+        match parse_sha256_hash(hash) {
+            Some(expected) => {
+                if snapshot.header.wasm_hash != expected {
+                    tracing::error!(
+                        payload_hash = %hash,
+                        shm_hash = %format_sha256(&snapshot.header.wasm_hash),
+                        "opa reload rejected: hash mismatch"
+                    );
+                    return;
+                }
+            }
+            None => {
+                tracing::error!(payload_hash = %hash, "opa reload rejected: hash invalid");
+                return;
+            }
+        }
+    } else {
+        tracing::error!("opa reload rejected: hash missing");
+        return;
+    }
     apply_opa_snapshot(opa, shm, &snapshot).await;
+}
+
+fn parse_sha256_hash(value: &str) -> Option<[u8; 32]> {
+    let value = value.strip_prefix("sha256:").unwrap_or(value);
+    if value.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (idx, chunk) in value.as_bytes().chunks(2).enumerate() {
+        let hi = (*chunk.get(0)? as char).to_digit(16)? as u8;
+        let lo = (*chunk.get(1)? as char).to_digit(16)? as u8;
+        out[idx] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn format_sha256(bytes: &[u8; 32]) -> String {
+    let mut out = String::from("sha256:");
+    for byte in bytes {
+        out.push_str(&format!("{:02x}", byte));
+    }
+    out
 }
 
 async fn maybe_refresh_opa_from_shm(
