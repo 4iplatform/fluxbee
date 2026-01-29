@@ -260,8 +260,9 @@ func loadOrCreateUUID(dir, base string) (uuid.UUID, error) {
 
 func openOrCreateOpaRegion(name string, owner uuid.UUID) (*OpaRegion, error) {
 	filePath := filepath.Join("/dev/shm", strings.TrimPrefix(name, "/"))
-	fd, err := openFileFd(filePath, unix.O_RDWR, 0o600)
+	fd, err := openFileFd(filePath, unix.O_RDWR, 0o666)
 	if err == nil {
+		_ = unix.Fchmod(fd, 0o666)
 		if err := ensureShmSize(fd, opaHeaderSize+opaMaxWasmSize); err == nil {
 			mmap, err := unix.Mmap(fd, 0, opaHeaderSize+opaMaxWasmSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 			if err == nil {
@@ -282,10 +283,11 @@ func openOrCreateOpaRegion(name string, owner uuid.UUID) (*OpaRegion, error) {
 		_ = os.Remove(filePath)
 	}
 
-	fd, err = openFileFd(filePath, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL, 0o600)
+	fd, err = openFileFd(filePath, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL, 0o666)
 	if err != nil {
 		return nil, err
 	}
+	_ = unix.Fchmod(fd, 0o666)
 	if err := ensureShmSize(fd, opaHeaderSize+opaMaxWasmSize); err != nil {
 		_ = unix.Close(fd)
 		_ = os.Remove(filePath)

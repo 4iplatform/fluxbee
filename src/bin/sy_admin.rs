@@ -314,7 +314,7 @@ impl OpaAction {
     fn auto_apply_flag(&self) -> Option<bool> {
         match self {
             OpaAction::Compile => Some(false),
-            OpaAction::CompileApply => Some(true),
+            OpaAction::CompileApply => Some(false),
             OpaAction::Check => Some(false),
             _ => None,
         }
