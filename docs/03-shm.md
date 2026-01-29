@@ -6,15 +6,16 @@
 
 ---
 
-## 1. Modelo de Tres Regiones
+## 1. Modelo de Cuatro Regiones
 
-El sistema usa tres tipos de regiones de memoria compartida:
+El sistema usa cuatro tipos de regiones de memoria compartida:
 
 ```
 /dev/shm/
 ├── jsr-<router-uuid>        # Una por router
 ├── jsr-config-<island>      # Una por isla
-└── jsr-lsa-<island>         # Una por isla
+├── jsr-lsa-<island>         # Una por isla
+└── jsr-opa-<island>         # Una por isla (WASM de policies)
 ```
 
 | Región | Writer | Contenido |
@@ -22,6 +23,7 @@ El sistema usa tres tipos de regiones de memoria compartida:
 | `jsr-<uuid>` | Router dueño | Nodos CONNECTED a ese router |
 | `jsr-config-<island>` | SY.config.routes | Rutas estáticas, tabla VPN |
 | `jsr-lsa-<island>` | Gateway | Topología de islas remotas |
+| `jsr-opa-<island>` | SY.opa.rules | WASM compilado de policy OPA |
 
 **Principio clave:** Cada región tiene **un único writer** y múltiples readers. Esto permite usar seqlock sin conflictos.
 
@@ -567,7 +569,174 @@ let lsa_shm = format!("/jsr-lsa-{}", island_id);
 
 ---
 
-## 9. Constantes Consolidadas
+## 9. Región OPA: jsr-opa-<island>
+
+Una sola región por isla, escrita únicamente por `SY.opa.rules`.
+
+### 9.1 Naming
+
+```
+/jsr-opa-<island_id>
+
+Ejemplo: /jsr-opa-produccion
+```
+
+### 9.2 Contenido
+
+| Dato | Descripción |
+|------|-------------|
+| Header | Identificación, seqlock, versión de policy |
+| WASM | Bytes del policy compilado |
+
+**Propósito:** Los routers leen el WASM compilado directamente de SHM para máxima performance en evaluación OPA.
+
+### 9.3 Layout
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ OpaHeader (128 bytes)                                          │
+├────────────────────────────────────────────────────────────────┤
+│ WASM Data (variable, hasta OPA_MAX_WASM_SIZE)                  │
+│ Total máximo: ~4 MB                                            │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 9.4 Estructuras
+
+```rust
+pub const OPA_MAGIC: u32 = 0x4A534F50;  // "JSOP"
+pub const OPA_VERSION: u32 = 1;
+pub const OPA_MAX_WASM_SIZE: u32 = 4 * 1024 * 1024;  // 4MB
+
+#[repr(C)]
+pub struct OpaHeader {
+    // Identificación (8 bytes)
+    pub magic: u32,
+    pub version: u32,
+    
+    // Seqlock (8 bytes)
+    pub seq: u64,  // AtomicU64
+    
+    // Policy info (48 bytes)
+    pub policy_version: u64,        // Versión de la policy (0 = no cargada)
+    pub wasm_size: u32,             // Tamaño del WASM en bytes
+    pub _pad0: u32,
+    pub wasm_hash: [u8; 32],        // SHA256 del WASM
+    
+    // Timestamps (16 bytes)
+    pub updated_at: u64,
+    pub heartbeat: u64,
+    
+    // Estado (2 bytes)
+    pub status: u8,                 // 0=OK, 1=ERROR, 2=LOADING
+    pub _pad1: u8,
+    
+    // Entrypoint (66 bytes)
+    pub entrypoint: [u8; 64],       // "router/target"
+    pub entrypoint_len: u16,
+    
+    // Owner (24 bytes)
+    pub owner_uuid: [u8; 16],
+    pub owner_pid: u32,
+    pub _pad2: u32,
+    
+    // Reserved
+    pub _reserved: [u8; 20],
+}
+// Total: 128 bytes
+
+// Status values
+pub const OPA_STATUS_OK: u8 = 0;
+pub const OPA_STATUS_ERROR: u8 = 1;
+pub const OPA_STATUS_LOADING: u8 = 2;
+```
+
+### 9.5 Writer: SY.opa.rules
+
+SY.opa.rules (escrito en Go) es el único writer de esta región:
+
+```go
+func (w *OpaWriter) WritePolicy(wasm []byte, version uint64, hash []byte, entrypoint string) error {
+    // Begin seqlock write
+    atomic.AddUint64(&w.header.Seq, 1)
+    
+    // Update header
+    w.header.PolicyVersion = version
+    w.header.WasmSize = uint32(len(wasm))
+    copy(w.header.WasmHash[:], hash)
+    w.header.UpdatedAt = uint64(time.Now().UnixMilli())
+    w.header.Status = OPA_STATUS_OK
+    copy(w.header.Entrypoint[:], entrypoint)
+    w.header.EntrypointLen = uint16(len(entrypoint))
+    
+    // Copy WASM data
+    copy(w.wasmData[:len(wasm)], wasm)
+    
+    // End seqlock write
+    atomic.StoreUint64(&w.header.Seq, w.header.Seq+1)
+    
+    return nil
+}
+```
+
+### 9.6 Reader: Routers (Rust)
+
+Los routers leen el WASM para cargarlo en Wasmtime:
+
+```rust
+impl Router {
+    fn load_opa_policy(&mut self) -> Result<()> {
+        let shm = self.map_opa_region()?;
+        
+        loop {
+            // Seqlock read protocol
+            let seq = shm.header.seq.load(Ordering::Acquire);
+            if seq & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            
+            // Read data
+            let version = shm.header.policy_version;
+            let size = shm.header.wasm_size as usize;
+            
+            if size == 0 || version == 0 {
+                return Ok(());  // No policy loaded yet
+            }
+            
+            let wasm = shm.wasm_data[..size].to_vec();
+            
+            // Verify consistency
+            std::sync::atomic::fence(Ordering::Acquire);
+            if shm.header.seq.load(Ordering::Acquire) != seq {
+                continue;
+            }
+            
+            // Load in Wasmtime if new version
+            if version != self.opa_policy_version {
+                let module = Module::new(&self.engine, &wasm)?;
+                self.opa_instance = Some(Instance::new(&mut self.store, &module, &[])?);
+                self.opa_policy_version = version;
+                log::info!("Loaded OPA policy v{}", version);
+            }
+            
+            return Ok(());
+        }
+    }
+}
+```
+
+### 9.7 Descubrimiento
+
+Nombre fijo basado en island_id:
+
+```rust
+let opa_shm = format!("/jsr-opa-{}", island_id);
+```
+
+---
+
+## 10. Constantes Consolidadas
 
 ```rust
 // Región de routers
@@ -589,6 +758,14 @@ pub const MAX_REMOTE_NODES: u32 = 1024;
 pub const MAX_REMOTE_ROUTES: u32 = 256;
 pub const MAX_REMOTE_VPNS: u32 = 256;
 
+// Región OPA
+pub const OPA_MAGIC: u32 = 0x4A534F50;  // "JSOP"
+pub const OPA_VERSION: u32 = 1;
+pub const OPA_MAX_WASM_SIZE: u32 = 4 * 1024 * 1024;  // 4MB
+pub const OPA_STATUS_OK: u8 = 0;
+pub const OPA_STATUS_ERROR: u8 = 1;
+pub const OPA_STATUS_LOADING: u8 = 2;
+
 // Match kinds
 pub const MATCH_EXACT: u8 = 0;
 pub const MATCH_PREFIX: u8 = 1;
@@ -605,7 +782,7 @@ pub const HEARTBEAT_STALE_MS: u64 = 30_000;
 
 ---
 
-## 10. Referencias
+## 11. Referencias
 
 | Tema | Documento |
 |------|-----------|
@@ -613,3 +790,4 @@ pub const HEARTBEAT_STALE_MS: u64 = 30_000;
 | Routing, FIB | `04-routing.md` |
 | LSA entre gateways | `05-conectividad.md` |
 | SY.config.routes | `06-regiones.md` |
+| SY.opa.rules | `SY_nodes_spec.md` |

@@ -32,7 +32,16 @@ Todos los binarios conocen estos paths por código:
 ├── identity.yaml                  # UUID del gateway (auto-generado)
 ├── orchestrator.yaml              # Config de SY.orchestrator (storage.path, etc.)
 ├── config-routes.yaml             # Rutas/VPN (persiste SY.config.routes)
-├── opa-rules/                     # Policies OPA (persiste SY.opa.rules)
+├── opa/                           # Policies OPA (persiste SY.opa.rules)
+│   ├── current/
+│   │   ├── policy.rego            # Fuente Rego activo
+│   │   └── metadata.json          # {version, hash, entrypoint, compiled_at}
+│   ├── staged/                    # Compilado OK, pendiente apply
+│   │   ├── policy.rego
+│   │   └── metadata.json
+│   └── backup/                    # Para rollback
+│       ├── policy.rego
+│       └── metadata.json
 ├── modules/                       # Módulos/binarios de nodos
 ├── blob/                          # Blobs de mensajes grandes
 ├── nodes/                         # UUIDs de nodos
@@ -51,7 +60,8 @@ Todos los binarios conocen estos paths por código:
 /dev/shm/                          # Shared memory
 ├── jsr-<router-uuid>
 ├── jsr-config-<island>
-└── jsr-lsa-<island>
+├── jsr-lsa-<island>
+└── jsr-opa-<island>               # WASM de policy OPA
 ```
 
 ---

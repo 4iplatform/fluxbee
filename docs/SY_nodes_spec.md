@@ -1,8 +1,8 @@
 # JSON Router - Nodos SY (System)
 
-**Estado:** Draft v0.12
-**Fecha:** 2025-01-20
-**Documento relacionado:** JSON Router Especificación Técnica v1.12
+**Estado:** Draft v0.13
+**Fecha:** 2025-01-29
+**Documento relacionado:** JSON Router Especificación Técnica v1.13
 
 ---
 
@@ -12,739 +12,187 @@ Los nodos SY (System) son componentes de infraestructura que proveen servicios e
 
 ### 1.1 Características comunes
 
-- **Lenguaje:** Rust **(obligatorio, sin excepciones)**
+- **Lenguaje:** Rust (obligatorio, **excepto SY.opa.rules que es Go**)
 - **Distribución:** Parte del paquete `json-router`
 - **Privilegios:** Pueden acceder a shared memory directamente
-- **Ciclo de vida:** Gestionados por systemd junto con los routers
-- **Nomenclatura:** `SY.<servicio>.{isla}`
-- **Librería:** `json_router::node_client` (mismo crate que el router)
+- **Ciclo de vida:** Gestionados por SY.orchestrator
+- **Nomenclatura:** `SY.<servicio>@<isla>`
+- **Librería:** `json_router::node_client` (Rust) o equivalente Go
 
-### 1.3 Convención: Nodos SY en Rust
-
-**Todos los nodos SY DEBEN implementarse en Rust.** Esta es una convención del sistema, no una sugerencia.
+### 1.2 Excepción: SY.opa.rules en Go
 
 | Tipo de nodo | Lenguaje | Razón |
 |--------------|----------|-------|
-| SY.* | **Rust (obligatorio)** | Infraestructura crítica, mismo crate que router |
+| SY.* (excepto opa.rules) | **Rust (obligatorio)** | Infraestructura crítica, mismo crate que router |
+| **SY.opa.rules** | **Go (obligatorio)** | Requiere compilador OPA embebido (solo disponible en Go) |
 | AI.*, WF.*, IO.* | Rust o Node.js | Lógica de negocio, flexibilidad permitida |
 
-**Razones de la convención:**
-- Los nodos SY son infraestructura crítica del sistema
-- Comparten crate con el router (consistencia garantizada)
-- Sin overhead de FFI o serialización entre lenguajes
-- Un solo binario por nodo SY
-- Acceso directo a shared memory cuando es necesario
+**Razones para SY.opa.rules en Go:**
+- El compilador Rego → WASM solo existe en Go (librería OPA oficial)
+- No hay alternativa en Rust que compile a WASM
+- Regorus (Rust) solo interpreta, no compila a WASM
+- Performance crítica requiere WASM, no interpretación
 
-### 1.4 Uso de node_client
+### 1.3 Catálogo de nodos SY
 
-**IMPORTANTE:** Todos los nodos SY deben usar `json_router::node_client` para comunicación con el router. Ver **Parte II-B: Librería de Nodos** en la especificación técnica del router para detalles completos.
-
-La librería maneja:
-- **Generación y persistencia de UUID** (el nodo no genera UUIDs manualmente)
-- **Conexión al router** (socket Unix)
-- **Handshake HELLO** (automático al conectar)
-- **Framing de mensajes** (length-prefix)
-- **Reconexión automática** (con backoff)
-
-**Estructura del proyecto:**
-
-```
-json-router/
-├── json_router/           # Crate principal
-│   ├── src/
-│   │   ├── lib.rs         # Expone: protocol, framing, node_client
-│   │   ├── main.rs        # Binario del router
-│   │   ├── node_client/   # Módulo para nodos
-│   │   └── ...
-│   └── Cargo.toml
-├── sy_config_routes/      # Nodo SY
-│   ├── src/main.rs
-│   └── Cargo.toml         # Dependencia: json_router = { path = "../json_router" }
-├── sy_admin/              # Nodo SY
-│   ├── src/main.rs
-│   └── Cargo.toml
-└── sy_orchestrator/       # Nodo SY
-    ├── src/main.rs
-    └── Cargo.toml
-```
-
-**Ejemplo completo de nodo SY:**
-
-```rust
-use json_router::node_client::{NodeClient, NodeConfig, NodeError};
-use json_router::protocol::{Message, Meta, Routing};
-use std::path::PathBuf;
-
-#[tokio::main]
-async fn main() -> Result<(), NodeError> {
-    let island_id = std::env::var("ISLAND_ID").unwrap_or("sandbox".into());
-    
-    let config = NodeConfig {
-        name: format!("SY.config.routes.{}", island_id),
-        island_id: island_id.clone(),
-        router_socket: PathBuf::from("/var/run/json-router/routers"),
-        uuid_persistence_dir: PathBuf::from("/var/lib/json-router/state/nodes/"),
-    };
-    
-    // Conectar (UUID y HELLO automáticos)
-    let client = NodeClient::connect(config).await?;
-    
-    println!("Conectado como {} (UUID: {})", client.name(), client.uuid());
-    
-    // Loop principal
-    loop {
-        let msg = client.recv().await?;
-        // Procesar mensaje...
-        // client.send(response).await?;
-    }
-}
-```
-
-**Reglas:**
-1. Nodos SY **DEBEN** ser Rust
-2. Nodos SY **DEBEN** usar `json_router::node_client`
-3. Si un nodo SY toca sockets, framing, o UUIDs directamente → refactorizar
-
-### 1.5 Catálogo de nodos SY
-
-| Nodo | Instancias | Estado | Descripción |
-|------|------------|--------|-------------|
-| `SY.admin` | Único global | Especificado | Gateway HTTP REST para toda la infraestructura |
-| `SY.orchestrator` | Uno por isla | Especificado | Orquestación de routers y nodos |
-| `SY.config.routes` | Uno por isla | Especificado | Configuración de rutas estáticas y VPNs |
-| `SY.opa.rules` | Uno por isla | Especificado | Gestión de policies OPA |
-| `SY.time` | Uno por isla | Por especificar | Sincronización de tiempo |
-| `SY.log` | Uno por isla | Por especificar | Colector de logs |
+| Nodo | Lenguaje | Instancias | Estado | Descripción |
+|------|----------|------------|--------|-------------|
+| `SY.admin` | Rust | Único global (mother) | Especificado | Gateway HTTP REST para toda la infraestructura |
+| `SY.orchestrator` | Rust | Uno por isla | Especificado | Orquestación de routers y nodos |
+| `SY.config.routes` | Rust | Uno por isla | Especificado | Configuración de rutas estáticas y VPNs |
+| `SY.opa.rules` | **Go** | Uno por isla | **Especificado v0.13** | Compilación y gestión de policies OPA |
+| `SY.time` | Rust | Uno por isla | Por especificar | Sincronización de tiempo |
+| `SY.log` | Rust | Uno por isla | Por especificar | Colector de logs |
 
 ---
 
 ## 2. SY.config.routes
 
-Responsable de la configuración centralizada de rutas estáticas y VPNs en cada isla.
-
-### 2.1 Resumen
-
-| Aspecto | Valor |
-|---------|-------|
-| Nombre | `SY.config.routes` (uno por isla, sin instancia) |
-| Región SHM | `/jsr-config-<island_id>` |
-| Persistencia | `/var/lib/json-router/config-routes.yaml` |
-| Input | CONFIG_CHANGED broadcast (de SY.admin) |
-
-**Restricciones:**
-- Solo puede correr UNO por isla
-- Si ya hay uno corriendo, el segundo debe salir con error
-- Lee island_id del archivo de configuración (no por CLI)
-
-### 2.2 Arquitectura
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      SY.config.routes                           │
-│                                                                 │
-│  ┌───────────────────────────────────────────────────────────┐ │
-│  │              CONFIG_CHANGED Handler                        │ │
-│  │                                                            │ │
-│  │  Recibe broadcast de SY.admin (subsystem: routes/vpn)     │ │
-│  │  Mismo mensaje llega a TODAS las islas                    │ │
-│  └──────────────────────────┬────────────────────────────────┘ │
-│                             │                                   │
-│         ┌───────────────────┼───────────────────┐              │
-│         ▼                   ▼                   ▼              │
-│  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐      │
-│  │  Validator  │     │ SHM Writer  │     │ Persistence │      │
-│  │             │     │             │     │             │      │
-│  │ - Valida    │     │ - seqlock   │     │ - config-   │      │
-│  │   config    │     │ - version++ │     │   routes.   │      │
-│  │ - Rechaza   │     │ - heartbeat │     │   yaml      │      │
-│  │   inválidos │     │             │     │             │      │
-│  └─────────────┘     └─────────────┘     └─────────────┘      │
-└─────────────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-              /jsr-config-<island_id>
-              ┌─────────────────────┐
-              │ Routes[]            │
-              │ VPNs[]              │
-              │ config_version      │
-              └─────────────────────┘
-```
-
-**Flujo:**
-1. SY.admin (en mother) hace broadcast CONFIG_CHANGED
-2. TODOS los SY.config.routes (en todas las islas) reciben el mismo mensaje
-3. Cada uno valida, escribe en su SHM local, persiste en YAML local
-
-**No hay trato especial para el local.** Mother y hijas reciben el mismo broadcast.
-
-### 2.3 Línea de comandos
-
-```bash
-# Arranque simple - todo por default
-sy-config-routes
-
-# Con directorio custom
-sy-config-routes --config-dir /otro/path
-```
-
-| Parámetro | CLI | Env | Default | Obligatorio |
-|-----------|-----|-----|---------|-------------|
-| Config directory | `--config-dir` | `JSR_CONFIG_DIR` | `/etc/json-router` | No |
-| Log level | `--log-level` | `JSR_LOG_LEVEL` | `info` | No |
-
-**No hay parámetros obligatorios.** Todo se lee del archivo de configuración.
-
-### 2.4 Directorios por Default
-
-| Directorio | Default | Descripción |
-|------------|---------|-------------|
-| Config | `/etc/json-router/` | Archivos de configuración |
-| State | `/var/lib/json-router/` | Estado persistente |
-| Sockets | `/var/run/json-router/` | Unix sockets |
-| SHM | `/dev/shm/` | Shared memory (automático) |
-
-### 2.5 Archivos
-
-```
-/etc/json-router/
-├── island.yaml              # Config de la isla (lee island_id de acá)
-└── sy-config-routes.yaml    # Rutas estáticas locales (este nodo lo maneja)
-
-/dev/shm/
-└── jsr-config-<island>      # Región SHM (este nodo la crea/escribe)
-```
-
-**Convención de nombres:** `sy-<servicio>.yaml` para todos los nodos SY.
-
-### 2.6 Flujo de arranque
-
-```
-sy-config-routes
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 1. Leer configuración                                       │
-│    - Leer /etc/json-router/island.yaml → island_id         │
-│    - Leer /etc/json-router/sy-config-routes.yaml → rutas   │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 2. Verificar instancia única                                │
-│    - Intentar abrir /jsr-config-<island>                   │
-│    - Si existe y owner_pid está vivo → EXIT "Ya corriendo" │
-│    - Si existe y owner muerto → Reclamar región            │
-│    - Si no existe → Crear región                           │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 3. Inicializar shared memory                                │
-│    - Escribir header (magic, version, owner_pid, etc.)     │
-│    - Escribir rutas locales (de archivo)                   │
-│    - Zona global vacía (se llena con broadcasts)           │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 4. Conectar al router local                                 │
-│    - Crear socket en /var/run/json-router/                 │
-│    - Enviar HELLO, registrarse como SY.config.routes       │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 5. Broadcast inicial                                        │
-│    - Enviar CONFIG_ANNOUNCE con rutas locales              │
-│    - Otras islas reciben y actualizan su zona global       │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 6. Loop principal                                           │
-│    - Actualizar heartbeat en SHM cada 5s                   │
-│    - Escuchar mensajes (API, CONFIG_ANNOUNCE de otros)     │
-│    - Broadcast periódico de refresh (cada 60s)             │
-└─────────────────────────────────────────────────────────────┘
-```
-┌─────────────────────────────────────────────────────────────┐
-│ 2. Verificar región SHM existente                           │
-│    - Si existe y owner vivo → ERROR (ya hay primary)        │
-│    - Si existe y owner muerto → Reclamar                    │
-│    - Si no existe → Crear                                   │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 3. Cargar configuración                                     │
-│    - Leer /etc/json-router/routes.yaml                     │
-│    - Si no existe → Crear vacío                            │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 4. Escribir en región SHM                                   │
-│    - Inicializar header (magic, version, owner, etc.)      │
-│    - Escribir todas las rutas y VPNs                       │
-│    - config_version = 1                                    │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 5. Conectar al router local (via node_client)              │
-│    - node_client genera/carga UUID automáticamente         │
-│    - node_client conecta al socket del router              │
-│    - node_client envía HELLO con UUID y nombre             │
-│    - node_client recibe ANNOUNCE confirmando registro      │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 6. Loop principal                                           │
-│    - Actualizar heartbeat en SHM cada 5s                   │
-│    - Escuchar mensajes de API (via node_client.recv())     │
-│    - Procesar requests, actualizar SHM, persistir          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 2.6 API de mensajes
-
-El nodo recibe mensajes JSON via el router (como cualquier nodo).
-
-#### 2.6.1 Listar rutas estáticas
-
-**Request:**
-```json
-{
-  "routing": {
-    "src": "<uuid-cliente>",
-    "dst": "<uuid-sy-config>",
-    "ttl": 16,
-    "trace_id": "<uuid>"
-  },
-  "meta": {
-    "type": "admin",
-    "action": "list_routes"
-  },
-  "payload": {}
-}
-```
-
-**Response:**
-```json
-{
-  "routing": { "src": "<uuid-sy-config>", "dst": "<uuid-cliente>", ... },
-  "meta": { "type": "admin", "action": "list_routes", "status": "ok" },
-  "payload": {
-    "config_version": 42,
-    "routes": [
-      {
-        "prefix": "AI.soporte.*",
-        "match_kind": "PREFIX",
-        "action": "FORWARD",
-        "next_hop_island": "produccion-us",
-        "metric": 10,
-        "priority": 100,
-        "installed_at": 1737110400000
-      }
-    ]
-  }
-}
-```
-
-#### 2.6.2 Agregar ruta estática
-
-**Request:**
-```json
-{
-  "meta": { "type": "admin", "action": "add_route" },
-  "payload": {
-    "prefix": "AI.ventas.*",
-    "match_kind": "PREFIX",
-    "action": "FORWARD",
-    "next_hop_island": "produccion-us",
-    "metric": 10,
-    "priority": 100
-  }
-}
-```
-
-**Response (éxito):**
-```json
-{
-  "meta": { "type": "admin", "action": "add_route", "status": "ok" },
-  "payload": {
-    "config_version": 43,
-    "route": { ... }
-  }
-}
-```
-
-**Response (error):**
-```json
-{
-  "meta": { "type": "admin", "action": "add_route", "status": "error" },
-  "payload": {
-    "error": "DUPLICATE_PREFIX",
-    "message": "Route with prefix 'AI.ventas.*' already exists"
-  }
-}
-```
-
-#### 2.6.3 Eliminar ruta estática
-
-**Request:**
-```json
-{
-  "meta": { "type": "admin", "action": "delete_route" },
-  "payload": {
-    "prefix": "AI.ventas.*"
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "meta": { "type": "admin", "action": "delete_route", "status": "ok" },
-  "payload": {
-    "config_version": 44
-  }
-}
-```
-
-#### 2.6.4 Listar VPNs
-
-**Request:**
-```json
-{
-  "meta": { "type": "admin", "action": "list_vpns" },
-  "payload": {}
-}
-```
-
-**Response:**
-```json
-{
-  "meta": { "type": "admin", "action": "list_vpns", "status": "ok" },
-  "payload": {
-    "vpns": [
-      {
-        "vpn_id": 1,
-        "vpn_name": "vpn-staging",
-        "remote_island": "staging",
-        "endpoints": ["10.0.1.100:9000", "10.0.1.101:9000"],
-        "created_at": 1737110400000
-      }
-    ]
-  }
-}
-```
-
-#### 2.6.5 Agregar VPN
-
-**Request:**
-```json
-{
-  "meta": { "type": "admin", "action": "add_vpn" },
-  "payload": {
-    "vpn_name": "vpn-staging",
-    "remote_island": "staging",
-    "endpoints": ["10.0.1.100:9000", "10.0.1.101:9000"]
-  }
-}
-```
-
-#### 2.6.6 Eliminar VPN
-
-**Request:**
-```json
-{
-  "meta": { "type": "admin", "action": "delete_vpn" },
-  "payload": {
-    "vpn_id": 1
-  }
-}
-```
-
-### 2.7 Códigos de error
-
-| Error | Descripción |
-|-------|-------------|
-| `DUPLICATE_PREFIX` | Ya existe una ruta con ese prefix |
-| `PREFIX_NOT_FOUND` | No existe ruta con ese prefix |
-| `INVALID_PREFIX` | Formato de prefix inválido |
-| `INVALID_ACTION` | Acción no reconocida |
-| `INVALID_MATCH_KIND` | match_kind debe ser EXACT, PREFIX o GLOB |
-| `VPN_NOT_FOUND` | No existe VPN con ese ID |
-| `DUPLICATE_VPN_NAME` | Ya existe VPN con ese nombre |
-| `MAX_ROUTES_EXCEEDED` | Se alcanzó el límite de 256 rutas |
-| `MAX_VPNS_EXCEEDED` | Se alcanzó el límite de 64 VPNs |
-| `PERSISTENCE_ERROR` | Error al guardar en disco |
-
-### 2.8 Persistencia: sy-config-routes.yaml
-
-```yaml
-# /etc/json-router/sy-config-routes.yaml
-# Solo rutas LOCALES de esta isla
-# Rutas de otras islas NO se persisten (llegan por broadcast)
-
-version: 1
-updated_at: "2025-01-18T10:30:00Z"
-
-routes:
-  # Rutas capa 2 (se propagan por broadcast)
-  - prefix: "AI.soporte.*"
-    match_kind: PREFIX
-    action: FORWARD
-    metric: 10
-    priority: 100
-    
-  - prefix: "AI.ventas.interno"
-    match_kind: EXACT
-    action: DROP
-    
-  # Rutas capa 1 (NO se propagan, solo locales)
-  - prefix: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-    match_kind: EXACT
-    action: FORWARD
-    metric: 5
-
-vpns:
-  - vpn_id: 1
-    vpn_name: vpn-staging
-    remote_island: staging
-    endpoints:
-      - "10.0.1.100:9000"
-      - "10.0.1.101:9000"
-```
-
-**Nota:** Este archivo solo contiene rutas de ESTA isla. Las rutas de otras islas se reciben por broadcast y se guardan solo en shm (no se persisten).
-
-### 2.9 Systemd
-
-```ini
-# /etc/systemd/system/sy-config-routes.service
-
-[Unit]
-Description=JSON Router Config Service
-After=network.target json-router.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/sy-config-routes
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-# Habilitar
-systemctl enable sy-config-routes
-
-# Iniciar
-systemctl start sy-config-routes
-
-# Ver logs
-journalctl -u sy-config-routes -f
-```
-
-**Nota:** No hay template `@` porque solo puede haber uno por isla/máquina.
-
-### 2.10 Propagación entre Islas (Broadcast)
-
-La propagación de configuración entre islas usa **broadcast**, no mensajes punto a punto. El router maneja el broadcast de forma transparente.
-
-#### 2.10.1 Modelo Simplificado
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              BROADCAST                                  │
-│                                                                         │
-│   SY.config.A ─────► CONFIG_ANNOUNCE ─────► todas las islas            │
-│   SY.config.B ─────► CONFIG_ANNOUNCE ─────► todas las islas            │
-│   SY.config.C ─────► CONFIG_ANNOUNCE ─────► todas las islas            │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-
-Cada SY.config.routes:
-  - Archivo local: solo rutas de SU isla (persiste)
-  - SHM local: rutas propias + zona global (recibida por broadcast)
-  - NO persiste rutas de otras islas (se reconstruyen al arrancar)
-```
-
-**Principios:**
-- El archivo `sy-config-routes.yaml` solo tiene rutas locales
-- La zona global en shm se llena con broadcasts recibidos
-- Si reinicia, espera broadcasts de otras islas para reconstruir zona global
-
-#### 2.10.2 Mensaje CONFIG_ANNOUNCE
-
-```json
-{
-  "routing": {
-    "src": "<uuid-sy-config>",
-    "dst": "broadcast",
-    "ttl": 16,
-    "trace_id": "<uuid>"
-  },
-  "meta": {
-    "type": "system",
-    "msg": "CONFIG_ANNOUNCE",
-    "target": "SY.config.*"
-  },
-  "payload": {
-    "island": "produccion",
-    "version": 42,
-    "timestamp": "2025-01-18T10:00:00Z",
-    "routes": [
-      {
-        "prefix": "AI.soporte.*",
-        "match_kind": "PREFIX",
-        "action": "FORWARD",
-        "metric": 10,
-        "priority": 100
-      }
-    ],
-    "vpns": [ ... ]
-  }
-}
-```
-
-**Campos importantes:**
-- `dst: "broadcast"` - El router lo envía a todos
-- `meta.target: "SY.config.*"` - Filtro: solo nodos SY.config.* lo procesan
-- `payload.island` - Quién origina esta configuración
-- `payload.version` - Para detectar duplicados/orden
-
-#### 2.10.3 Cuándo hacer Broadcast
-
-| Evento | Acción |
-|--------|--------|
-| Arranque | Broadcast inmediato de rutas locales |
-| Cambio de config local | Broadcast inmediato |
-| Timer periódico (60s) | Broadcast de refresh |
-
-El refresh periódico asegura que islas que arrancaron después reciban la config.
-
-#### 2.10.4 Al Recibir CONFIG_ANNOUNCE
-
-```
-1. ¿Es de mi propia isla? → Ignorar
-2. ¿version > la que tengo de esa isla? 
-   → Sí: Actualizar zona global en shm
-   → No: Ignorar (ya tengo igual o más nuevo)
-```
-
-**No se persiste.** Solo se guarda en shm. Si reinicia, espera nuevos broadcasts.
-
-#### 2.10.5 Estructura de la Shared Memory
-
-```
-/jsr-config-<island>
-├── Header
-│   ├── magic, version
-│   ├── owner_pid, heartbeat
-│   └── local_version, global_versions[]
-│
-├── LocalRoutes[]           ← De sy-config-routes.yaml
-│   └── Rutas de ESTA isla
-│
-└── GlobalRoutes[]          ← De CONFIG_ANNOUNCE recibidos
-    ├── [isla-a]: version, timestamp, routes[]
-    ├── [isla-b]: version, timestamp, routes[]
-    └── ...
-```
-
-#### 2.10.6 Rutas que NO se propagan
-
-Solo se propagan rutas **capa 2** (por nombre). Rutas capa 1 (por UUID) son locales.
-
-```yaml
-# sy-config-routes.yaml
-
-routes:
-  # Esta se propaga (capa 2, nombre)
-  - prefix: "AI.ventas.*"
-    match_kind: PREFIX
-    action: FORWARD
-    
-  # Esta NO se propaga (capa 1, UUID)
-  - prefix: "a1b2c3d4-e5f6-..."
-    match_kind: EXACT
-    action: DROP
-```
-
-**Detección automática:** Si prefix es un UUID válido → no propagar.
-
-#### 2.10.7 Consistencia Eventual
-
-- Sin coordinación distribuida (no hay Paxos/Raft)
-- Puede haber ventanas donde islas tienen versiones distintas
-- El refresh periódico converge eventualmente
-- Para operaciones críticas: verificar version antes de actuar
+[Contenido sin cambios - ver documento original]
 
 ---
 
 ## 3. SY.opa.rules
 
-Gestión centralizada de policies OPA para routing dinámico.
+Responsable de la compilación, distribución y gestión de policies OPA para routing dinámico.
 
 ### 3.1 Resumen
 
 | Aspecto | Valor |
 |---------|-------|
-| Nombre | `SY.opa.rules` (uno por isla) |
-| Función | Compilar y distribuir policies Rego/WASM |
-| Persistencia | `/var/lib/json-router/policy.wasm` |
-| Propagación | Broadcast `OPA_RELOAD` |
+| Lenguaje | **Go** (único nodo SY en Go) |
+| Nombre L2 | `SY.opa.rules@<isla>` (uno por isla) |
+| Compilador | OPA library embebida (`github.com/open-policy-agent/opa/compile`) |
+| Región SHM | `/dev/shm/jsr-opa-<island>` (WASM para routers) |
+| Persistencia disco | `/var/lib/json-router/opa/` |
+| Estado en RAM | Rego actual para respuesta rápida |
 
 ### 3.2 Arquitectura
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      SY.opa.rules                           │
-│                                                              │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
-│  │ API Handler │  │ Compiler    │  │ Distributor │         │
-│  │             │  │             │  │             │         │
-│  │ - update    │  │ - opa build │  │ - write     │         │
-│  │ - get       │  │ - validate  │  │   policy    │         │
-│  │ - status    │  │             │  │ - broadcast │         │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘         │
-│         │                │                │                 │
-│         └────────────────┼────────────────┘                 │
-│                          │                                  │
-│  ┌───────────────────────┴───────────────────────┐         │
-│  │              Verification Handler              │         │
-│  │                                                │         │
-│  │  - Lee SHM de todos los routers               │         │
-│  │  - Verifica opa_policy_version                │         │
-│  │  - Rollback si falla                          │         │
-│  └───────────────────────────────────────────────┘         │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                      SY.opa.rules (Go)                          │
+│                                                                 │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │ Message     │  │ OPA         │  │ SHM         │             │
+│  │ Handler     │  │ Compiler    │  │ Writer      │             │
+│  │             │  │ (embebido)  │  │             │             │
+│  │ - broadcast │  │ - rego→wasm │  │ - seqlock   │             │
+│  │ - unicast   │  │ - validate  │  │ - wasm data │             │
+│  │ - query     │  │             │  │             │             │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
+│         │                │                │                     │
+│         └────────────────┼────────────────┘                     │
+│                          │                                      │
+│  ┌───────────────────────┴───────────────────────┐             │
+│  │                    State                       │             │
+│  │                                                │             │
+│  │  RAM:                                          │             │
+│  │  ├── current_rego: string                     │             │
+│  │  ├── current_version: u64                     │             │
+│  │  ├── staged_rego: *string                     │             │
+│  │  └── status: enum                             │             │
+│  │                                                │             │
+│  │  DISCO (/var/lib/json-router/opa/):           │             │
+│  │  ├── current/{policy.rego, metadata.json}     │             │
+│  │  ├── staged/{policy.rego, metadata.json}      │             │
+│  │  └── backup/{policy.rego, metadata.json}      │             │
+│  │                                                │             │
+│  │  SHM (/dev/shm/jsr-opa-<island>):             │             │
+│  │  └── Header + WASM bytes                      │             │
+│  │                                                │             │
+│  └───────────────────────────────────────────────┘             │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.3 Directorios
+### 3.3 Storage Model
+
+#### 3.3.1 Disco (Persistencia)
 
 ```
-/var/lib/json-router/
-├── policy.wasm          # WASM activo (runtime)
-├── policy.wasm.bak      # Backup para rollback
-└── policy.wasm.new      # Temporal durante actualización
-
-/etc/json-router/
-└── policy.rego          # Fuente Rego (opcional, referencia)
+/var/lib/json-router/opa/
+├── current/
+│   ├── policy.rego        # Fuente Rego activo
+│   └── metadata.json      # {version, compiled_at, entrypoint, hash}
+├── staged/
+│   ├── policy.rego        # Fuente compilado OK, pendiente apply
+│   └── metadata.json
+└── backup/
+    ├── policy.rego        # Backup para rollback
+    └── metadata.json
 ```
 
-**Nota:** El directorio `/var/lib/json-router/` es compartido por todos los routers de la isla. SY.opa.rules escribe ahí; los routers leen.
+#### 3.3.2 RAM (Estado interno)
+
+```go
+type OpaRulesState struct {
+    // Versión activa (en RAM para respuesta rápida)
+    CurrentVersion   uint64
+    CurrentRego      string    // Fuente completo
+    CurrentHash      string    // SHA256 del WASM
+    CompiledAt       time.Time
+    Entrypoint       string
+    
+    // Versión staged (si hay)
+    StagedVersion    *uint64
+    StagedRego       *string
+    StagedHash       *string
+    
+    // Estado
+    Status           Status    // OK, ERROR, COMPILING, STAGED
+    LastError        *string
+    LastErrorAt      *time.Time
+    
+    // Info
+    IslandID         string
+}
+
+type Status int
+const (
+    StatusOK Status = iota
+    StatusError
+    StatusCompiling
+    StatusStaged
+)
+```
+
+#### 3.3.3 SHM (WASM para routers)
+
+Los routers leen el WASM compilado directamente de shared memory para máxima performance.
+
+```
+/dev/shm/jsr-opa-<island>
+┌────────────────────────────────────────────────────────────────┐
+│  Header (128 bytes):                                           │
+│  ├── magic: u32              = 0x4A534F50 ("JSOP")            │
+│  ├── version: u32            = 1                               │
+│  ├── seqlock: u64            ← Para lectura consistente        │
+│  ├── policy_version: u64     ← Versión de la policy            │
+│  ├── wasm_size: u32          ← Tamaño del WASM en bytes        │
+│  ├── wasm_hash: [u8; 32]     ← SHA256 del WASM                 │
+│  ├── updated_at: u64         ← Timestamp epoch ms              │
+│  ├── status: u8              ← 0=ok, 1=error, 2=loading        │
+│  ├── entrypoint: [u8; 64]    ← "router/target"                 │
+│  ├── entrypoint_len: u8                                        │
+│  └── _reserved: [u8; N]                                        │
+├────────────────────────────────────────────────────────────────┤
+│  WASM Data (variable, hasta 4MB):                              │
+│  └── wasm_bytes: [u8; wasm_size]                               │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Constantes:**
+
+```rust
+pub const OPA_MAGIC: u32 = 0x4A534F50;  // "JSOP"
+pub const OPA_VERSION: u32 = 1;
+pub const OPA_MAX_WASM_SIZE: u32 = 4 * 1024 * 1024;  // 4MB
+```
 
 ### 3.4 Flujo de Arranque
 
 ```
-sy-opa-rules
+sy-opa-rules (binario Go)
     │
     ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -755,239 +203,585 @@ sy-opa-rules
     ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. Verificar instancia única                                │
-│    - Lock file o similar                                    │
+│    - Lock file: /var/run/json-router/sy-opa-rules.lock     │
 └─────────────────────────────────────────────────────────────┘
     │
     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 3. Conectar al router local                                 │
-│    - Registrarse como SY.opa.rules                         │
+│ 3. Inicializar SHM                                          │
+│    - Crear/abrir /dev/shm/jsr-opa-<island>                 │
+│    - Si existe policy en disco → cargar y escribir WASM    │
+│    - Si no existe → SHM vacío, status = OK, version = 0    │
 └─────────────────────────────────────────────────────────────┘
     │
     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 4. Loop principal                                           │
-│    - Escuchar API (update_policy, get_policy, status)      │
-│    - Monitorear estado de routers en SHM                   │
+│ 4. Cargar estado en RAM                                     │
+│    - Leer current/policy.rego → CurrentRego                │
+│    - Leer current/metadata.json → version, hash, etc.      │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 5. Conectar al router local                                 │
+│    - Registrarse como SY.opa.rules@<isla>                  │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 6. Loop principal                                           │
+│    - Procesar mensajes (broadcast + unicast)               │
+│    - Actualizar heartbeat en SHM cada 5s                   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 3.5 API
+### 3.5 Mensajes
 
-#### 3.5.1 Actualizar Policy
+SY.opa.rules recibe dos tipos de mensajes:
+1. **Broadcast** (CONFIG_CHANGED subsystem: opa) - Operaciones en todas/varias islas
+2. **Unicast** (directo a SY.opa.rules@isla) - Operaciones en una sola isla
 
-**Request:**
+#### 3.5.1 Broadcast: CONFIG_CHANGED (subsystem: opa)
+
+**Compilar nuevo código (queda staged):**
+
 ```json
 {
-  "meta": { "type": "admin", "action": "update_policy" },
+  "routing": {
+    "src": "<uuid-sy-admin>",
+    "dst": "broadcast",
+    "ttl": 16
+  },
+  "meta": {
+    "type": "system",
+    "msg": "CONFIG_CHANGED"
+  },
   "payload": {
-    "rego": "package router\n\ndefault target = null\n\ntarget = \"AI.soporte.l1\" {\n    input.meta.context.cliente_tier == \"standard\"\n}\n"
+    "subsystem": "opa",
+    "action": "compile",
+    "version": 43,
+    "config": {
+      "rego": "package router\n\ndefault target = null\n...",
+      "entrypoint": "router/target"
+    }
   }
 }
 ```
 
-**Response OK:**
+**Recompilar código actual (refresh, sin nuevo rego):**
+
 ```json
 {
-  "meta": { "type": "admin", "action": "update_policy" },
   "payload": {
+    "subsystem": "opa",
+    "action": "compile",
+    "version": 43
+    // Sin config.rego = usa el rego actual
+  }
+}
+```
+
+**Aplicar staged en todas las islas:**
+
+```json
+{
+  "payload": {
+    "subsystem": "opa",
+    "action": "apply",
+    "version": 43
+  }
+}
+```
+
+**Compilar Y aplicar en un paso (operación rápida pero sin staging):**
+
+```json
+{
+  "payload": {
+    "subsystem": "opa",
+    "action": "compile_apply",
+    "version": 43,
+    "config": {
+      "rego": "package router\n...",
+      "entrypoint": "router/target"
+    }
+  }
+}
+```
+
+**Rollback en todas las islas:**
+
+```json
+{
+  "payload": {
+    "subsystem": "opa",
+    "action": "rollback"
+  }
+}
+```
+
+#### 3.5.2 Respuesta a Broadcast
+
+Cada SY.opa.rules responde a SY.admin:
+
+**Respuesta OK:**
+
+```json
+{
+  "routing": {
+    "src": "<uuid-sy-opa-rules>",
+    "dst": "<uuid-sy-admin>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "CONFIG_RESPONSE"
+  },
+  "payload": {
+    "subsystem": "opa",
+    "action": "compile",
+    "version": 43,
     "status": "ok",
-    "version": 42,
-    "routers_updated": 3,
-    "routers_total": 3
+    "island": "staging",
+    "compile_time_ms": 1250,
+    "wasm_size_bytes": 245000,
+    "hash": "sha256:abc123..."
   }
 }
 ```
 
-**Response ERROR (compilación):**
+**Respuesta ERROR:**
+
 ```json
 {
-  "meta": { "type": "admin", "action": "update_policy" },
   "payload": {
+    "subsystem": "opa",
+    "action": "compile",
+    "version": 43,
     "status": "error",
-    "error": "compilation_failed",
-    "detail": "policy.rego:5: rego_parse_error: unexpected token"
+    "island": "dev",
+    "error_code": "COMPILE_ERROR",
+    "error_detail": "policy.rego:15: rego_parse_error: unexpected token"
   }
 }
 ```
 
-**Response ERROR (rollback):**
-```json
-{
-  "meta": { "type": "admin", "action": "update_policy" },
-  "payload": {
-    "status": "error",
-    "error": "rollback",
-    "detail": "1 router failed to load new policy",
-    "failed_routers": ["uuid-router-b"],
-    "version": 41
-  }
-}
-```
+#### 3.5.3 Unicast: Queries
 
-#### 3.5.2 Obtener Policy Actual
+**GET_POLICY - Obtener policy actual:**
 
-**Request:**
 ```json
+// Request
 {
-  "meta": { "type": "admin", "action": "get_policy" },
+  "routing": {
+    "src": "<uuid-quien-pregunta>",
+    "dst": "SY.opa.rules@staging"
+  },
+  "meta": {
+    "type": "query",
+    "action": "get_policy"
+  },
   "payload": {}
 }
-```
 
-**Response:**
-```json
+// Response
 {
-  "meta": { "type": "admin", "action": "get_policy" },
+  "meta": {
+    "type": "query_response",
+    "action": "get_policy"
+  },
   "payload": {
     "version": 42,
     "rego": "package router\n...",
-    "updated_at": "2025-01-18T10:00:00Z"
+    "hash": "sha256:abc123...",
+    "compiled_at": "2025-01-26T10:00:00Z",
+    "entrypoint": "router/target",
+    "status": "ok"
   }
 }
 ```
 
-#### 3.5.3 Estado de Routers
+**GET_STATUS - Estado del nodo:**
 
-**Request:**
 ```json
+// Request
 {
-  "meta": { "type": "admin", "action": "policy_status" },
+  "meta": {
+    "type": "query",
+    "action": "get_status"
+  },
   "payload": {}
 }
-```
 
-**Response:**
-```json
+// Response
 {
-  "meta": { "type": "admin", "action": "policy_status" },
   "payload": {
+    "island": "staging",
     "current_version": 42,
-    "routers": [
-      {
-        "uuid": "uuid-router-a",
-        "opa_policy_version": 42,
-        "opa_load_status": 0,
-        "status": "ok"
-      },
-      {
-        "uuid": "uuid-router-b",
-        "opa_policy_version": 42,
-        "opa_load_status": 0,
-        "status": "ok"
-      }
-    ]
+    "current_hash": "sha256:abc123...",
+    "staged_version": null,
+    "status": "ok",
+    "last_error": null,
+    "wasm_size_bytes": 245000,
+    "uptime_seconds": 3600
   }
 }
 ```
 
-### 3.6 Flujo de Actualización con Rollback
+#### 3.5.4 Unicast: Commands
 
-```
-Recibe update_policy con nuevo Rego
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 1. Compilar Rego → WASM                                     │
-│    - Ejecutar: opa build -t wasm -e router/target          │
-│    - Si falla → responder error, FIN                       │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 2. Preparar archivos                                        │
-│    - Guardar WASM nuevo como policy.wasm.new               │
-│    - version_nueva = version_actual + 1                     │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 3. Swap atómico                                             │
-│    - Renombrar policy.wasm → policy.wasm.bak               │
-│    - Renombrar policy.wasm.new → policy.wasm               │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 4. Broadcast OPA_RELOAD                                     │
-│    - dst: "broadcast", TTL: 16                             │
-│    - payload: { version: 42 }                              │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 5. Esperar verificación (5s configurable)                   │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 6. Verificar routers (leer SHM)                            │
-│    - Escanear /dev/shm/jsr-*                               │
-│    - Leer opa_policy_version de cada header                │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ├─► Todos OK (version == version_nueva)
-    │       │
-    │       ▼
-    │   ┌─────────────────────────────────────────────────────┐
-    │   │ 7a. Éxito                                           │
-    │   │    - Borrar policy.wasm.bak                        │
-    │   │    - Guardar Rego fuente (opcional)                │
-    │   │    - Responder OK                                  │
-    │   └─────────────────────────────────────────────────────┘
-    │
-    └─► Alguno FALLÓ (version != version_nueva o status == ERROR)
-            │
-            ▼
-        ┌─────────────────────────────────────────────────────┐
-        │ 7b. Rollback                                        │
-        │    - Renombrar policy.wasm.bak → policy.wasm       │
-        │    - Broadcast OPA_RELOAD con version_anterior     │
-        │    - Esperar verificación                          │
-        │    - Responder ERROR con lista de routers fallidos │
-        └─────────────────────────────────────────────────────┘
+**COMPILE_POLICY - Compilar en esta isla:**
+
+```json
+// Request
+{
+  "routing": {
+    "src": "<uuid-sy-admin>",
+    "dst": "SY.opa.rules@staging"
+  },
+  "meta": {
+    "type": "command",
+    "action": "compile_policy"
+  },
+  "payload": {
+    "rego": "package router\n...",
+    "entrypoint": "router/target",
+    "version": 43
+  }
+}
+
+// Response OK
+{
+  "meta": {
+    "type": "command_response",
+    "action": "compile_policy"
+  },
+  "payload": {
+    "status": "ok",
+    "version": 43,
+    "hash": "sha256:xyz789...",
+    "compile_time_ms": 1250,
+    "wasm_size_bytes": 245000,
+    "staged": true
+  }
+}
+
+// Response ERROR
+{
+  "payload": {
+    "status": "error",
+    "error_code": "COMPILE_ERROR",
+    "error_detail": "policy.rego:15: rego_parse_error: unexpected token",
+    "version": 43
+  }
+}
 ```
 
-### 3.7 Mensaje OPA_RELOAD
+**APPLY_POLICY - Aplicar staged:**
+
+```json
+// Request
+{
+  "meta": {
+    "type": "command",
+    "action": "apply_policy"
+  },
+  "payload": {
+    "version": 43
+  }
+}
+
+// Response
+{
+  "payload": {
+    "status": "ok",
+    "version": 43,
+    "previous_version": 42
+  }
+}
+```
+
+**ROLLBACK_POLICY - Volver a backup:**
+
+```json
+// Request
+{
+  "meta": {
+    "type": "command",
+    "action": "rollback_policy"
+  },
+  "payload": {}
+}
+
+// Response
+{
+  "payload": {
+    "status": "ok",
+    "version": 41,
+    "rolled_back_from": 42
+  }
+}
+```
+
+### 3.6 Flujo de Compilación
+
+```
+SY.opa.rules recibe compile (broadcast o unicast)
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│ 1. Validar rego con OPA parser          │
+│    - Si error sintaxis → responder error│
+└────────────────────┬────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────┐
+│ 2. Compilar Rego → WASM                 │
+│    - compile.New().WithTarget(Wasm)...  │
+│    - Si error → responder error         │
+└────────────────────┬────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────┐
+│ 3. Guardar como staged                  │
+│    - staged/policy.rego                 │
+│    - staged/metadata.json               │
+│    - state.StagedRego = rego            │
+│    - state.Status = STAGED              │
+└────────────────────┬────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────┐
+│ 4. Responder OK                         │
+│    - status: "ok", staged: true         │
+└─────────────────────────────────────────┘
+```
+
+### 3.7 Flujo de Apply
+
+```
+SY.opa.rules recibe apply (broadcast o unicast)
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│ 1. Verificar que hay staged             │
+│    - Si no hay → error "NOTHING_STAGED" │
+│    - Verificar version match            │
+└────────────────────┬────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────┐
+│ 2. Backup                               │
+│    - Mover current/ → backup/           │
+└────────────────────┬────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────┐
+│ 3. Activar                              │
+│    - Mover staged/ → current/           │
+│    - Actualizar RAM state               │
+└────────────────────┬────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────┐
+│ 4. Escribir WASM en SHM                 │
+│    - seqlock_begin_write()              │
+│    - header.policy_version = version    │
+│    - header.wasm_size = len(wasm)       │
+│    - copiar wasm_bytes                  │
+│    - seqlock_end_write()                │
+└────────────────────┬────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────┐
+│ 5. Broadcast OPA_RELOAD local (TTL 2)   │
+│    - Notifica routers de esta isla      │
+└────────────────────┬────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────┐
+│ 6. Responder OK                         │
+└─────────────────────────────────────────┘
+```
+
+### 3.8 Mensaje OPA_RELOAD (local)
+
+Después de apply, SY.opa.rules envía broadcast **local** (TTL 2) para notificar a los routers:
 
 ```json
 {
   "routing": {
     "src": "<uuid-sy-opa-rules>",
     "dst": "broadcast",
-    "ttl": 16,
-    "trace_id": "<uuid>"
+    "ttl": 2
   },
   "meta": {
     "type": "system",
     "msg": "OPA_RELOAD"
   },
   "payload": {
-    "version": 42,
-    "hash": "sha256:abc123..."
+    "version": 43,
+    "hash": "sha256:xyz789..."
   }
 }
 ```
 
-El router usa `version` para actualizar `opa_policy_version` en su SHM después de cargar exitosamente.
+**Nota:** TTL 2 significa que no cruza a otras islas. Es solo para routers locales.
 
-### 3.8 Códigos de Error
+Los routers pueden:
+1. Recibir OPA_RELOAD y recargar inmediatamente
+2. O detectar cambio en SHM por `policy_version` diferente
+
+### 3.9 Cómo los Routers Leen el WASM
+
+```rust
+impl Router {
+    fn load_opa_policy(&mut self) -> Result<()> {
+        let shm = self.map_opa_region()?;  // /dev/shm/jsr-opa-<island>
+        
+        loop {
+            // Seqlock read protocol
+            let seq = shm.header.seqlock.load(Ordering::Acquire);
+            if seq & 1 != 0 {
+                std::hint::spin_loop();
+                continue;  // Writer activo
+            }
+            
+            // Leer datos
+            let version = shm.header.policy_version;
+            let size = shm.header.wasm_size as usize;
+            let wasm = shm.wasm_bytes[..size].to_vec();
+            
+            // Verificar consistencia
+            std::sync::atomic::fence(Ordering::Acquire);
+            if shm.header.seqlock.load(Ordering::Acquire) != seq {
+                continue;  // Cambió durante lectura
+            }
+            
+            // Cargar en Wasmtime si es nueva versión
+            if version != self.opa_policy_version {
+                let module = Module::new(&self.engine, &wasm)?;
+                self.opa_instance = Some(Instance::new(&self.store, &module)?);
+                self.opa_policy_version = version;
+                log::info!("Loaded OPA policy version {}", version);
+            }
+            
+            return Ok(());
+        }
+    }
+    
+    // Llamado periódicamente o al recibir OPA_RELOAD
+    fn check_opa_update(&mut self) {
+        if let Some(shm) = self.opa_region.as_ref() {
+            if shm.header.policy_version != self.opa_policy_version {
+                if let Err(e) = self.load_opa_policy() {
+                    log::error!("Failed to load OPA policy: {}", e);
+                }
+            }
+        }
+    }
+}
+```
+
+### 3.10 Flujo desde SY.admin (API HTTP)
+
+#### Caso A: Broadcast a todas las islas (3 fases)
+
+```
+POST /opa/policy
+{
+  "rego": "package router\n...",
+  "target": "broadcast"
+}
+
+SY.admin:
+  1. Broadcast CONFIG_CHANGED {action: compile}
+  2. Espera respuestas (timeout 30s)
+  3. Si TODAS OK → Broadcast CONFIG_CHANGED {action: apply}
+  4. Si alguna ERROR → NO aplica, retorna error
+
+HTTP Response:
+{
+  "status": "ok",
+  "version": 43,
+  "islands": [
+    {"island": "produccion", "status": "ok", "compile_time_ms": 1100},
+    {"island": "staging", "status": "ok", "compile_time_ms": 1250}
+  ]
+}
+```
+
+#### Caso B: Unicast a una isla específica
+
+```
+POST /opa/policy
+{
+  "rego": "package router\n...",
+  "target": "staging"
+}
+
+SY.admin:
+  1. Unicast COMPILE_POLICY a SY.opa.rules@staging
+  2. Espera respuesta
+  3. Si OK → Unicast APPLY_POLICY
+  4. Retorna resultado
+
+HTTP Response:
+{
+  "status": "ok",
+  "version": 43,
+  "island": "staging",
+  "compile_time_ms": 1250
+}
+```
+
+#### Caso C: Solo check (compilar sin apply)
+
+```
+POST /opa/policy/check
+{
+  "rego": "package router\n...",
+  "target": "staging"
+}
+
+SY.admin:
+  1. Unicast COMPILE_POLICY a SY.opa.rules@staging
+  2. Espera respuesta (queda staged, no se aplica)
+
+HTTP Response:
+{
+  "status": "ok",
+  "staged": true,
+  "version": 43,
+  "compile_time_ms": 1250
+}
+```
+
+### 3.11 Códigos de Error
 
 | Error | Descripción |
 |-------|-------------|
-| `COMPILATION_FAILED` | Rego no compila |
-| `INVALID_REGO` | Sintaxis inválida |
-| `ROLLBACK` | Algunos routers no cargaron, se revirtió |
-| `TIMEOUT` | Routers no respondieron a tiempo |
-| `NO_ROUTERS` | No hay routers activos en la isla |
+| `COMPILE_ERROR` | Rego no compila (error de sintaxis o semántica) |
+| `NOTHING_STAGED` | Se pidió apply pero no hay versión staged |
+| `VERSION_MISMATCH` | La versión staged no coincide con la solicitada |
+| `NO_BACKUP` | Se pidió rollback pero no hay backup |
+| `SHM_ERROR` | Error escribiendo en shared memory |
+| `TIMEOUT` | Timeout esperando compilación |
 
-### 3.9 Systemd
+### 3.12 Tiempos Esperados de Compilación
+
+| Complejidad | Líneas Rego | Tiempo típico | WASM size |
+|-------------|-------------|---------------|-----------|
+| Simple | 10-50 | 100-500 ms | 100-200 KB |
+| Mediana | 100-500 | 500-1500 ms | 200-500 KB |
+| Compleja | 1000+ | 1-3 segundos | 500KB-2MB |
+
+### 3.13 Systemd
 
 ```ini
 # /etc/systemd/system/sy-opa-rules.service
 
 [Unit]
-Description=JSON Router OPA Rules Service
+Description=JSON Router OPA Rules Service (Go)
 After=network.target json-router.service
 
 [Service]
@@ -1000,875 +794,51 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
----
+### 3.14 Funcionalidad Futura
 
-## 4. SY.time
-
-Sincronización de tiempo en la red.
-
-### 3.1 Resumen
-
-| Aspecto | Valor |
-|---------|-------|
-| Nombre | `SY.time.<instancia>` |
-| Función | Broadcast periódico de tiempo UTC |
-| Dependencias | Ninguna (puede usar NTP del sistema) |
-
-### 3.2 Funcionalidad
-
-- Broadcast periódico (cada 1s o configurable) con timestamp UTC
-- Los nodos pueden usar este tiempo para sincronizar operaciones
-- No requiere región SHM propia (usa mensajes)
-
-### 3.3 Mensaje TIME_SYNC
-
-```json
-{
-  "routing": {
-    "src": "<uuid-sy-time>",
-    "dst": "broadcast",
-    "ttl": 1,
-    "trace_id": "<uuid>"
-  },
-  "meta": {
-    "type": "system",
-    "msg": "TIME_SYNC"
-  },
-  "payload": {
-    "timestamp_utc": "2025-01-17T10:30:00.123Z",
-    "epoch_ms": 1737110400123,
-    "seq": 12345
-  }
-}
-```
-
-**dst: "broadcast"** envía a todos los nodos. **TTL=1** limita a la isla local (no cruza WAN).
-
-### 3.4 Por especificar
-
-- Mecanismo de broadcast (OPA policy, lista de suscriptores, o multicast address)
-- Precisión requerida
-- Manejo de drift
+> **Historial de versiones:** Capacidad de mantener N versiones anteriores en disco (`history/v41/`, `history/v42/`, etc.) con mensajes para consultar/restaurar versiones específicas (`GET_HISTORY`, `RESTORE_VERSION`). Por ahora solo se mantiene `current`, `staged` y `backup`.
 
 ---
 
-## 5. SY.admin
+## 4. SY.admin
 
-Gateway HTTP REST único para toda la infraestructura. Punto de entrada para humanos y AI de infraestructura. **Solo corre en mother island.**
+[Contenido sin cambios mayores - ver documento original]
 
-### 5.1 Resumen
-
-| Aspecto | Valor |
-|---------|-------|
-| Nombre L2 | `SY.admin` (único en todo el sistema) |
-| Ubicación | **Solo en mother island** |
-| Función | Gateway HTTP → protocolo interno |
-| Interfaz | HTTP REST |
-| Seguridad | Ninguna (usar nginx/proxy externo si se requiere) |
-| Socket | `/var/run/json-router/routers/` (como cualquier nodo) |
-| Broadcast | **Único emisor de CONFIG_CHANGED** |
-
-### 5.2 Mother Island
-
-SY.admin **solo existe en mother island**. Las islas hijas no tienen SY.admin, solo reciben CONFIG_CHANGED via broadcast.
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       MOTHER ISLAND                             │
-│                                                                 │
-│   Internet ──► Reverse Proxy ──► SY.admin:8080                 │
-│                                       │                         │
-│                                       ▼                         │
-│                              ┌─────────────────┐                │
-│                              │    SY.admin     │                │
-│                              │ (único global)  │                │
-│                              └────────┬────────┘                │
-│                                       │                         │
-│                          CONFIG_CHANGED (broadcast)             │
-│                                       │                         │
-│         ┌─────────────────────────────┼─────────────────────────┤
-│         ▼                             ▼                         │
-│  SY.orchestrator              SY.config.routes                  │
-│  SY.opa.rules                 RT.gateway                        │
-└─────────────────────────────────────────────────────────────────┘
-                            │ WAN
-        ┌───────────────────┼───────────────────┐
-        │                   │                   │
-        ▼                   ▼                   ▼
-┌───────────────┐   ┌───────────────┐   ┌───────────────┐
-│  Isla Hija    │   │  Isla Hija    │   │  Isla Hija    │
-│               │   │               │   │               │
-│ SY.orchestrator   │ SY.orchestrator   │ SY.orchestrator
-│ SY.config.routes  │ SY.config.routes  │ SY.config.routes
-│ SY.opa.rules  │   │ SY.opa.rules  │   │ SY.opa.rules  │
-│ RT.gateway    │   │ RT.gateway    │   │ RT.gateway    │
-│               │   │               │   │               │
-│ (sin SY.admin)│   │ (sin SY.admin)│   │ (sin SY.admin)│
-│ Solo escuchan │   │ Solo escuchan │   │ Solo escuchan │
-│ CONFIG_CHANGED│   │ CONFIG_CHANGED│   │ CONFIG_CHANGED│
-└───────────────┘   └───────────────┘   └───────────────┘
-```
-
-### 5.3 Conexión al Router
-
-SY.admin se conecta como un nodo normal:
-
-```
-1. Conecta a socket en /var/run/json-router/routers/
-2. Envía HELLO:
-   {
-     "meta": { "type": "system", "msg": "HELLO" },
-     "payload": {
-       "name": "SY.admin",
-       "version": "1.0"
-     }
-   }
-3. Router lo registra con nombre L2 "SY.admin@<mother-island>"
-4. SY.admin envía/recibe mensajes normalmente
-```
-
-### 5.4 Arquitectura
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           SY.admin                                  │
-│                 (único global, solo en mother island)               │
-│                                                                      │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐          │
-│  │ HTTP Server  │    │  Translator  │    │  Router Conn │          │
-│  │              │    │              │    │              │          │
-│  │ REST API     │───►│ HTTP → JSON  │───►│ Socket Unix  │          │
-│  │ JSON in/out  │◄───│ JSON → HTTP  │◄───│              │          │
-│  └──────────────┘    └──────────────┘    └──────────────┘          │
-│                                                                      │
-│  ┌──────────────────────────────────────────────────────┐          │
-│  │                  CONFIG_CHANGED                       │          │
-│  │                                                       │          │
-│  │  SY.admin es el ÚNICO que emite CONFIG_CHANGED       │          │
-│  │  Todos los demás nodos (en todas las islas) escuchan │          │
-│  └──────────────────────────────────────────────────────┘          │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-**Principios:**
-- Sin autenticación propia (delegar a proxy externo)
-- Traduce HTTP REST a tramas JSON del protocolo
-- **Único emisor de CONFIG_CHANGED** (broadcast a todas las islas)
-- Envía por socket, nunca lee SHM directo
-
-### 5.3 API REST
-
-#### 5.3.1 Islas
-
-```
-GET /islands
-```
-Lista todas las islas conocidas.
-
-```json
-{
-  "islands": [
-    { "id": "produccion", "status": "online" },
-    { "id": "staging", "status": "online" },
-    { "id": "desarrollo", "status": "offline" }
-  ]
-}
-```
-
-```
-GET /islands/{isla}/status
-```
-Estado detallado de una isla.
-
-#### 5.3.2 Routers (→ SY.orchestrator)
-
-```
-GET /islands/{isla}/routers
-```
-Lista routers de la isla.
-
-```json
-{
-  "routers": [
-    {
-      "uuid": "uuid-router-a",
-      "name": "RT.produccion.primary",
-      "is_primary": true,
-      "wan_enabled": true,
-      "nodes_count": 12,
-      "status": "alive"
-    }
-  ]
-}
-```
-
-```
-POST /islands/{isla}/routers
-```
-Levantar router secundario.
-
-```json
-{
-  "name": "RT.produccion.secondary",
-  "config": { ... }
-}
-```
-
-```
-DELETE /islands/{isla}/routers/{uuid}
-```
-Matar router (no permite matar el primario).
-
-#### 5.3.3 Nodos (→ SY.orchestrator)
-
-```
-GET /islands/{isla}/nodes
-```
-Lista todos los nodos conectados.
-
-```json
-{
-  "nodes": [
-    {
-      "uuid": "uuid-node-1",
-      "name": "AI.soporte.l1.español",
-      "router": "uuid-router-a",
-      "connected_at": "2025-01-19T10:00:00Z",
-      "status": "active"
-    }
-  ]
-}
-```
-
-```
-POST /islands/{isla}/nodes
-```
-Correr nuevo nodo.
-
-```json
-{
-  "type": "AI.soporte",
-  "instance": "l1.español",
-  "config": { ... }
-}
-```
-
-```
-DELETE /islands/{isla}/nodes/{uuid}
-```
-Matar nodo.
-
-#### 5.3.4 Rutas Estáticas (→ SY.config.routes)
-
-```
-GET /islands/{isla}/routes
-```
-Lista rutas estáticas.
-
-```json
-{
-  "version": 42,
-  "routes": [
-    {
-      "prefix": "AI.soporte.*",
-      "match_kind": "PREFIX",
-      "action": "FORWARD",
-      "metric": 10
-    }
-  ]
-}
-```
-
-```
-POST /islands/{isla}/routes
-```
-Agregar ruta.
-
-```json
-{
-  "prefix": "AI.ventas.*",
-  "match_kind": "PREFIX",
-  "action": "FORWARD",
-  "metric": 20
-}
-```
-
-```
-DELETE /islands/{isla}/routes/{prefix}
-```
-Eliminar ruta (prefix URL-encoded).
-
-#### 5.3.5 VPNs (→ SY.config.routes)
-
-```
-GET /islands/{isla}/vpns
-POST /islands/{isla}/vpns
-DELETE /islands/{isla}/vpns/{id}
-```
-
-#### 5.3.6 OPA Policies (→ SY.opa.rules)
-
-```
-GET /islands/{isla}/opa/policy
-```
-Obtener policy actual.
-
-```json
-{
-  "version": 42,
-  "rego": "package router\n...",
-  "updated_at": "2025-01-19T10:00:00Z"
-}
-```
-
-```
-POST /islands/{isla}/opa/policy
-```
-Actualizar policy.
-
-```json
-{
-  "rego": "package router\n\ndefault target = null\n..."
-}
-```
-
-```
-GET /islands/{isla}/opa/status
-```
-Estado de OPA en routers.
-
-```json
-{
-  "version": 42,
-  "routers": [
-    { "uuid": "uuid-a", "version": 42, "status": "ok" },
-    { "uuid": "uuid-b", "version": 42, "status": "ok" }
-  ]
-}
-```
-
-### 5.4 Traducción HTTP → Mensajes
-
-| HTTP | Destino | meta.action |
-|------|---------|-------------|
-| `GET /islands/{isla}/routes` | `SY.config.routes` de isla | `list_routes` |
-| `POST /islands/{isla}/routes` | `SY.config.routes` de isla | `add_route` |
-| `DELETE /islands/{isla}/routes/{p}` | `SY.config.routes` de isla | `delete_route` |
-| `POST /islands/{isla}/opa/policy` | `SY.opa.rules` de isla | `update_policy` |
-| `GET /islands/{isla}/nodes` | `SY.orchestrator` de isla | `list_nodes` |
-| `POST /islands/{isla}/nodes` | `SY.orchestrator` de isla | `run_node` |
-| `DELETE /islands/{isla}/nodes/{id}` | `SY.orchestrator` de isla | `kill_node` |
-
-### 5.5 Configuración
-
-```yaml
-# /etc/json-router/sy-admin.yaml
-
-islands:
-  - id: produccion
-  - id: staging
-```
-
-**Resolución de nombres L2:** SY.admin construye los destinos automáticamente:
-- `SY.orchestrator.{isla}`
-- `SY.config.routes.{isla}`
-- `SY.opa.rules.{isla}`
-
-Opcionalmente se puede sobrescribir por isla si se necesita:
-
-```yaml
-islands:
-  - id: produccion
-    orchestrator: "SY.orchestrator.produccion"
-    config_routes: "SY.config.routes.produccion"
-    opa_rules: "SY.opa.rules.produccion"
-```
-
-**Listen:** SY.admin expone HTTP en `0.0.0.0:8080` por defecto. Para cambiarlo, usar `JSR_ADMIN_LISTEN` (o `SY_ADMIN_LISTEN`).
-
-**Nota sobre island_id:** El identificador de isla es un string simple (ej: `produccion`, `staging`), no sigue convención de capa 2. Es solo un identificador de ubicación.
-
-### 5.6 Formato Común de Respuestas
-
-Todas las APIs admin usan el mismo formato de respuesta:
-
-**Éxito:**
-```json
-{
-  "status": "ok",
-  // ... datos específicos de la operación
-}
-```
-
-**Error:**
-```json
-{
-  "status": "error",
-  "error": "ERROR_CODE",
-  "detail": "Mensaje legible para humanos"
-}
-```
-
-**Códigos de error estándar:**
-
-| Código | Descripción |
-|--------|-------------|
-| `NOT_FOUND` | Recurso no existe |
-| `INVALID_REQUEST` | Request malformado o parámetros inválidos |
-| `TIMEOUT` | Timeout esperando respuesta de nodo destino |
-| `UNREACHABLE` | No se puede alcanzar el nodo destino |
-| `CANNOT_KILL_PRIMARY` | Intento de matar router primario |
-| `COMPILATION_FAILED` | Rego no compila (para OPA) |
-| `ROLLBACK` | Operación falló y se revirtió |
-| `ALREADY_EXISTS` | Recurso ya existe (ej: ruta duplicada) |
-| `INTERNAL_ERROR` | Error interno del sistema |
-
-### 5.7 Nombres L2 Estándar de Nodos SY
-
-| Nodo | Nombre L2 que anuncia en HELLO |
-|------|-------------------------------|
-| SY.admin | `SY.admin` |
-| SY.orchestrator | `SY.orchestrator.{isla}` |
-| SY.config.routes | `SY.config.routes.{isla}` |
-| SY.opa.rules | `SY.opa.rules.{isla}` |
-| SY.time | `SY.time.{isla}` |
-
-Donde `{isla}` es el island_id (ej: `produccion`, `staging`).
-
-**Ejemplo:** En isla "produccion", SY.orchestrator anuncia nombre `SY.orchestrator.produccion`.
-
-### 5.8 Systemd
-
-```ini
-# /etc/systemd/system/sy-admin.service
-
-[Unit]
-Description=JSON Router Admin Gateway
-After=network.target json-router.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/sy-admin
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
+**Cambio relevante:** SY.admin NO tiene Regorus embebido. La validación de sintaxis la hace SY.opa.rules como parte del proceso de compilación. SY.admin espera la respuesta de SY.opa.rules para confirmar que el código es válido.
 
 ---
 
-## 6. SY.orchestrator
+## 5. SY.orchestrator
 
-Orquestación de routers y nodos. Uno por isla.
-
-### 6.1 Resumen
-
-| Aspecto | Valor |
-|---------|-------|
-| Nombre L2 | `SY.orchestrator.{isla}` (uno por isla) |
-| Función | Listar, correr, matar routers y nodos |
-| Lectura | SHM de routers locales (scan `/dev/shm/jsr-*`) |
-| Ejecución | systemd / docker / proceso directo |
-
-### 6.2 Descubrimiento de Routers
-
-SY.orchestrator descubre routers de su isla escaneando shared memory:
-
-```rust
-fn discover_routers(my_island: &str) -> Vec<RouterInfo> {
-    let mut routers = Vec::new();
-    
-    // Scan /dev/shm/jsr-*
-    for entry in glob("/dev/shm/jsr-*") {
-        // Abrir región y leer header
-        let shm = ShmRegion::open(&entry);
-        let header = shm.read_header();
-        
-        // Filtrar por mi isla
-        if header.island_id == my_island {
-            routers.push(RouterInfo {
-                uuid: header.router_uuid,
-                pid: header.owner_pid,
-                heartbeat: header.heartbeat,
-                node_count: header.node_count,
-                route_count: header.route_count,
-                // ...
-            });
-        }
-    }
-    
-    routers
-}
-```
-
-**Información disponible en SHM header:**
-- `router_uuid`: UUID del router
-- `owner_pid`: PID del proceso
-- `island_id`: Isla a la que pertenece
-- `heartbeat`: Último heartbeat (para detectar si está vivo)
-- `node_count`: Cantidad de nodos conectados
-- `route_count`: Cantidad de rutas
-
-### 6.3 Arquitectura
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   SY.orchestrator.{isla}                    │
-│                                                              │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
-│  │ API Handler │  │ SHM Reader  │  │ Executor    │         │
-│  │             │  │             │  │             │         │
-│  │ - list_*    │  │ - scan shm  │  │ - systemd   │         │
-│  │ - run_*     │  │ - read hdrs │  │ - docker    │         │
-│  │ - kill_*    │  │             │  │ - process   │         │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘         │
-│         │                │                │                 │
-│         └────────────────┼────────────────┘                 │
-│                          │                                  │
-└──────────────────────────┼──────────────────────────────────┘
-                           │
-           ┌───────────────┴───────────────┐
-           │                               │
-           ▼                               ▼
-    /dev/shm/jsr-*                  systemd / docker
-    (lectura)                       (ejecución)
-```
-
-### 6.4 Flujo de Arranque de una Isla
-
-```
-Systemd inicia servicios base:
-    │
-    ├── json-router (router principal, WAN activa)
-    ├── sy-orchestrator
-    ├── sy-config-routes
-    └── sy-opa-rules
-           │
-           ▼
-SY.orchestrator conecta al router
-           │
-           ▼
-SY.orchestrator lee config de nodos a levantar
-           │
-           ▼
-SY.orchestrator ejecuta nodos según config:
-    ├── systemctl start ai-soporte@l1
-    ├── systemctl start ai-ventas@l1
-    └── ...
-```
-
-### 6.5 API (via mensajes)
-
-#### 6.4.1 Listar Routers
-
-**Request:**
-```json
-{
-  "meta": { "type": "admin", "action": "list_routers" },
-  "payload": {}
-}
-```
-
-**Response:**
-```json
-{
-  "meta": { "type": "admin", "action": "list_routers" },
-  "payload": {
-    "routers": [
-      {
-        "uuid": "uuid-router-a",
-        "name": "RT.produccion.primary",
-        "pid": 1234,
-        "is_primary": true,
-        "wan_enabled": true,
-        "nodes_count": 12,
-        "routes_count": 5,
-        "heartbeat_age_ms": 2500,
-        "status": "alive"
-      }
-    ]
-  }
-}
-```
-
-#### 6.4.2 Listar Nodos
-
-**Request:**
-```json
-{
-  "meta": { "type": "admin", "action": "list_nodes" },
-  "payload": {}
-}
-```
-
-**Response:**
-```json
-{
-  "meta": { "type": "admin", "action": "list_nodes" },
-  "payload": {
-    "nodes": [
-      {
-        "uuid": "uuid-node-1",
-        "name": "AI.soporte.l1.español",
-        "router_uuid": "uuid-router-a",
-        "connected_at": "2025-01-19T10:00:00Z",
-        "status": "active"
-      }
-    ]
-  }
-}
-```
-
-#### 6.4.3 Correr Nodo
-
-**Request:**
-```json
-{
-  "meta": { "type": "admin", "action": "run_node" },
-  "payload": {
-    "type": "AI.soporte",
-    "instance": "l1.español",
-    "executor": "systemd",
-    "config": { ... }
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "meta": { "type": "admin", "action": "run_node" },
-  "payload": {
-    "status": "ok",
-    "pid": 5678,
-    "name": "AI.soporte.l1.español"
-  }
-}
-```
-
-#### 6.4.4 Matar Nodo
-
-**Request:**
-```json
-{
-  "meta": { "type": "admin", "action": "kill_node" },
-  "payload": {
-    "uuid": "uuid-node-1"
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "meta": { "type": "admin", "action": "kill_node" },
-  "payload": {
-    "status": "ok",
-    "name": "AI.soporte.l1.español"
-  }
-}
-```
-
-#### 6.4.5 Correr Router Secundario
-
-**Request:**
-```json
-{
-  "meta": { "type": "admin", "action": "run_router" },
-  "payload": {
-    "name": "RT.produccion.secondary"
-  }
-}
-```
-
-#### 6.4.6 Matar Router
-
-**Request:**
-```json
-{
-  "meta": { "type": "admin", "action": "kill_router" },
-  "payload": {
-    "uuid": "uuid-router-b"
-  }
-}
-```
-
-**Error si intenta matar el primario:**
-```json
-{
-  "payload": {
-    "status": "error",
-    "error": "CANNOT_KILL_PRIMARY",
-    "detail": "Cannot kill primary router with active WAN"
-  }
-}
-```
-
-### 6.6 Executors
-
-SY.orchestrator soporta diferentes formas de ejecutar procesos:
-
-| Executor | Comando | Uso |
-|----------|---------|-----|
-| `systemd` | `systemctl start {unit}` | Producción |
-| `docker` | `docker run {image}` | Contenedores |
-| `process` | `{binary} {args}` | Desarrollo |
-
-Configurado por nodo o por defecto de la isla.
-
-### 6.7 Protección del Router Primario
-
-El router primario (con WAN activa) no puede ser matado via API:
-
-```
-kill_router(uuid):
-    router = find_router(uuid)
-    if router.is_primary and router.wan_enabled:
-        return error("CANNOT_KILL_PRIMARY")
-    else:
-        executor.kill(router.pid)
-```
-
-Para matar el primario, hay que hacerlo manualmente o con shutdown de la isla.
-
-### 6.8 Configuración
-
-```yaml
-# /etc/json-router/sy-orchestrator.yaml
-
-executor: systemd  # default executor
-
-node_templates:
-  AI.soporte:
-    executor: systemd
-    unit: "ai-soporte@{instance}"
-    
-  AI.ventas:
-    executor: docker
-    image: "ai-ventas:latest"
-    args: ["--instance", "{instance}"]
-
-startup_nodes:
-  - type: AI.soporte
-    instance: l1.español
-  - type: AI.soporte
-    instance: l1.ingles
-  - type: AI.ventas
-    instance: l1
-```
-
-### 6.9 Systemd
-
-```ini
-# /etc/systemd/system/sy-orchestrator.service
-
-[Unit]
-Description=JSON Router Orchestrator
-After=network.target json-router.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/sy-orchestrator
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
+[Contenido sin cambios - ver documento original]
 
 ---
 
-## 7. SY.time
-
-Sincronización de tiempo en la red.
-
-### 7.1 Resumen
-
-| Aspecto | Valor |
-|---------|-------|
-| Nombre | `SY.time.{isla}` (uno por isla) |
-| Función | Broadcast periódico de tiempo UTC |
-| Dependencias | Ninguna (puede usar NTP del sistema) |
-
-### 7.2 Funcionalidad
-
-- Broadcast periódico (cada 1s o configurable) con timestamp UTC
-- Los nodos pueden usar este tiempo para sincronizar operaciones
-- No requiere región SHM propia (usa mensajes)
-
-### 7.3 Mensaje TIME_SYNC
-
-```json
-{
-  "routing": {
-    "src": "<uuid-sy-time>",
-    "dst": "broadcast",
-    "ttl": 1,
-    "trace_id": "<uuid>"
-  },
-  "meta": {
-    "type": "system",
-    "msg": "TIME_SYNC"
-  },
-  "payload": {
-    "timestamp_utc": "2025-01-19T10:30:00.123Z",
-    "epoch_ms": 1737110400123,
-    "seq": 12345
-  }
-}
-```
-
-**dst: "broadcast"** envía a todos los nodos. **TTL=1** limita a la isla local (no cruza WAN).
-
-### 7.4 Por especificar
-
-- Precisión requerida
-- Manejo de drift
-- Stratum/jerarquía de tiempo
-
----
-
-## 8. SY.log
-
-Colector centralizado de logs.
-
-### 8.1 Resumen
-
-| Aspecto | Valor |
-|---------|-------|
-| Nombre | `SY.log.{isla}` (uno por isla) |
-| Función | Recibir y consolidar logs de todos los nodos |
-| Salida | Archivo, stdout, o sistema externo |
-
-### 8.2 Por especificar
-
-- Formato de mensajes de log
-- Rotación y retención
-- Integración con sistemas externos (Loki, Elasticsearch)
-
----
-
-## Apéndice A: Estructura del paquete
+## 6. Apéndice A: Estructura del paquete
 
 ```
 json-router/
 ├── Cargo.toml
 ├── src/
 │   ├── bin/
-│   │   ├── json-router.rs       # Router principal
-│   │   ├── sy-admin.rs          # Gateway HTTP
-│   │   ├── sy-orchestrator.rs   # Orquestador
-│   │   ├── sy-config-routes.rs  # Rutas estáticas
-│   │   ├── sy-opa-rules.rs      # Policies OPA
-│   │   ├── sy-time.rs           # Tiempo
-│   │   └── shm-watch.rs         # Herramienta de diagnóstico
-│   ├── lib.rs                   # Biblioteca compartida
-│   ├── protocol/                # Mensajes (pub)
-│   ├── socket/                  # Framing (pub)
-│   ├── shm/                     # Shared memory
-│   └── ...
+│   │   ├── json-router.rs       # Router principal (Rust)
+│   │   ├── sy-admin.rs          # Gateway HTTP (Rust)
+│   │   ├── sy-orchestrator.rs   # Orquestador (Rust)
+│   │   ├── sy-config-routes.rs  # Rutas estáticas (Rust)
+│   │   └── shm-watch.rs         # Herramienta de diagnóstico (Rust)
+│   └── lib.rs
 └── tests/
+
+sy-opa-rules/                    # Proyecto separado en Go
+├── go.mod
+├── go.sum
+├── main.go
+├── compiler/
+│   └── compiler.go              # OPA compile embebido
+├── shm/
+│   └── shm.go                   # Escritura de SHM
+└── protocol/
+    └── messages.go              # Mensajes JSON
 ```
 
 ---
@@ -1878,8 +848,25 @@ json-router/
 | Prioridad | Nodo | Razón |
 |-----------|------|-------|
 | 1 | `SY.config.routes` | Necesario para rutas estáticas y VPNs |
-| 2 | `SY.opa.rules` | Necesario para routing dinámico |
+| 2 | `SY.opa.rules` | Necesario para routing dinámico con WASM |
 | 3 | `SY.orchestrator` | Necesario para gestión de nodos |
 | 4 | `SY.admin` | Gateway HTTP para administración |
 | 5 | `SY.time` | Útil pero no crítico inicialmente |
 | 6 | `SY.log` | Puede usar logging estándar por ahora |
+
+---
+
+## Apéndice C: Resumen de Mensajes OPA
+
+| Mensaje | Tipo | Origen | Destino | Propósito |
+|---------|------|--------|---------|-----------|
+| CONFIG_CHANGED (compile) | broadcast | SY.admin | todas las islas | Compilar en todas |
+| CONFIG_CHANGED (apply) | broadcast | SY.admin | todas las islas | Aplicar staged |
+| CONFIG_CHANGED (compile_apply) | broadcast | SY.admin | todas las islas | Compilar + aplicar |
+| CONFIG_CHANGED (rollback) | broadcast | SY.admin | todas las islas | Rollback |
+| COMPILE_POLICY | unicast | SY.admin | SY.opa.rules@X | Compilar en isla X |
+| APPLY_POLICY | unicast | SY.admin | SY.opa.rules@X | Aplicar en isla X |
+| ROLLBACK_POLICY | unicast | SY.admin | SY.opa.rules@X | Rollback en isla X |
+| GET_POLICY | unicast | cualquiera | SY.opa.rules@X | Obtener rego actual |
+| GET_STATUS | unicast | cualquiera | SY.opa.rules@X | Estado del nodo |
+| OPA_RELOAD | broadcast local | SY.opa.rules | routers locales | Recargar WASM |

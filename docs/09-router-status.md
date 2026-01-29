@@ -1,0 +1,80 @@
+# JSON Router - Estado de Implementación (Router)
+
+Checklist de cobertura **según spec v1.13**.  
+Objetivo: revisar punto por punto y marcar pendientes.
+
+---
+
+## 1. Routing local (intra‑isla)
+
+- [x] FIB (LPM + prioridad/metric)
+- [x] Rutas estáticas (`ACTION_DROP` / `ACTION_FORWARD`)
+- [x] Resolución por UUID (L1)
+- [x] Resolución por nombre (L2)
+- [x] Rebuild FIB en cambios de config/LSA
+
+## 2. VPN
+
+- [x] Asignación por reglas (SHM config)
+- [x] Filtro de routing por VPN
+- [x] Excepción `SY.*`
+- [x] Broadcast transversal (system)
+
+## 3. Broadcast / Multicast
+
+- [x] Broadcast local
+- [x] Broadcast inter‑router (IRP)
+- [x] Broadcast inter‑isla (WAN)
+- [x] TTL en broadcast
+- [x] Cache anti‑loops
+
+## 4. IRP (Intra‑router peering)
+
+- [x] IRP sockets por UUID
+- [x] Forward al router dueño del nodo destino
+- [x] Transparente para nodos
+
+## 5. WAN (Inter‑isla)
+
+- [x] WAN hello/accept/reject básico
+- [x] Conexión gateway ↔ gateway
+- [x] Forward inter‑isla vía gateway
+- [x] LSA local + remoto (propagación)
+
+## 6. OPA (Resolver)
+
+### 6.1 Lifecycle OPA (router)
+- [x] `OPA_RELOAD` (system broadcast)
+- [x] Carga `policy.wasm` desde `/var/lib/json-router/policy.wasm`
+- [x] SHM: `opa_policy_version` + `opa_load_status`
+
+### 6.2 Resolver real
+- [x] Evaluación OPA en‑process (Wasmtime)
+- [x] `OPA_NO_TARGET` si OPA devuelve null
+- [x] `OPA_ERROR` si falla evaluación
+
+### 6.3 Pendientes OPA
+- [ ] Builtins OPA completos (solo hay subset básico)
+- [ ] Resolver entrypoint real (hoy usa índice 0 si existe)
+- [ ] Carga de `data` bundle (si policy usa data)
+- [ ] Validación de `hash` en `OPA_RELOAD`
+- [ ] Lectura de WASM desde SHM `/dev/shm/jsr-opa-<island>` (nueva región)
+
+## 7. Casos especiales
+
+- [x] `@*` wildcard de isla
+- [x] `UNREACHABLE` + `TTL_EXCEEDED`
+
+## 8. Estado / Observabilidad
+
+- [x] Logs básicos de routing y config
+- [ ] Métricas/telemetría (no especificado, pendiente)
+
+---
+
+## Notas
+
+- SY.opa.rules es **control plane** (Go), no router. Compila Rego → WASM y escribe en SHM.
+- Routers (Rust) leen WASM de `/dev/shm/jsr-opa-<island>` y ejecutan con Wasmtime.
+- Si la policy usa builtins no implementados → `OPA_ERROR`.
+

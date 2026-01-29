@@ -339,7 +339,85 @@ Cada nodo al recibir CONFIG_CHANGED:
 4. Persistir en archivo local (para restart)
 5. Actualizar `last_version`
 
-### 7.5 Tiempo
+#### 7.4.5 Subsystem OPA: Acciones especiales
+
+El subsystem `opa` tiene un campo adicional `action` que define la operación:
+
+| Action | Con rego | Comportamiento |
+|--------|----------|----------------|
+| `compile` | SÍ | Compilar nuevo rego, guardar como staged |
+| `compile` | NO | Recompilar rego actual (refresh) |
+| `apply` | - | Activar versión staged |
+| `compile_apply` | SÍ | Compilar Y activar en un paso |
+| `rollback` | - | Volver a versión backup |
+
+**Ejemplo: Compilar nueva policy:**
+```json
+{
+  "payload": {
+    "subsystem": "opa",
+    "action": "compile",
+    "version": 43,
+    "config": {
+      "rego": "package router\n\ndefault target = null\n...",
+      "entrypoint": "router/target"
+    }
+  }
+}
+```
+
+**Ejemplo: Aplicar policy staged:**
+```json
+{
+  "payload": {
+    "subsystem": "opa",
+    "action": "apply",
+    "version": 43
+  }
+}
+```
+
+**Ejemplo: Rollback:**
+```json
+{
+  "payload": {
+    "subsystem": "opa",
+    "action": "rollback"
+  }
+}
+```
+
+### 7.5 OPA_RELOAD (local)
+
+| Mensaje | Origen | Destino | Propósito |
+|---------|--------|---------|-----------|
+| `OPA_RELOAD` | SY.opa.rules | Broadcast local (TTL 2) | Notificar routers que recarguen WASM |
+
+Este mensaje lo emite SY.opa.rules después de aplicar una policy. Es **local** a la isla (TTL 2).
+
+```json
+{
+  "routing": {
+    "src": "<uuid-sy-opa-rules>",
+    "dst": "broadcast",
+    "ttl": 2
+  },
+  "meta": {
+    "type": "system",
+    "msg": "OPA_RELOAD"
+  },
+  "payload": {
+    "version": 43,
+    "hash": "sha256:abc123..."
+  }
+}
+```
+
+Los routers pueden:
+1. Escuchar OPA_RELOAD y recargar el WASM de SHM
+2. O detectar cambio en SHM por `policy_version` diferente
+
+### 7.6 Tiempo
 
 | Mensaje | Origen | Destino | Propósito |
 |---------|--------|---------|-----------|
