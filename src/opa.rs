@@ -499,6 +499,100 @@ fn eval_builtin(
             Some(Value::String(pattern)) => Ok(Value::Bool(regex::Regex::new(pattern).is_ok())),
             _ => Err("regex.is_valid expects (string)".to_string()),
         },
+        "regex.find" => match (values.get(0), values.get(1)) {
+            (Some(Value::String(pattern)), Some(Value::String(text))) => {
+                match regex::Regex::new(pattern) {
+                    Ok(re) => Ok(Value::String(
+                        re.find(text).map(|m| m.as_str().to_string()).unwrap_or_default(),
+                    )),
+                    Err(err) => Err(format!("regex.find error: {err}")),
+                }
+            }
+            _ => Err("regex.find expects (string,string)".to_string()),
+        },
+        "regex.find_n" => match (values.get(0), values.get(1), values.get(2)) {
+            (Some(Value::String(pattern)), Some(Value::String(text)), Some(Value::Number(n))) => {
+                if let Some(n) = n.as_i64() {
+                    match regex::Regex::new(pattern) {
+                        Ok(re) => {
+                            let matches: Vec<Value> = re
+                                .find_iter(text)
+                                .take(n.max(0) as usize)
+                                .map(|m| Value::String(m.as_str().to_string()))
+                                .collect();
+                            Ok(Value::Array(matches))
+                        }
+                        Err(err) => Err(format!("regex.find_n error: {err}")),
+                    }
+                } else {
+                    Err("regex.find_n expects integer n".to_string())
+                }
+            }
+            _ => Err("regex.find_n expects (string,string,number)".to_string()),
+        },
+        "regex.find_all_string_submatch_n" => match (values.get(0), values.get(1), values.get(2)) {
+            (Some(Value::String(pattern)), Some(Value::String(text)), Some(Value::Number(n))) => {
+                if let Some(n) = n.as_i64() {
+                    match regex::Regex::new(pattern) {
+                        Ok(re) => {
+                            let mut out = Vec::new();
+                            for caps in re.captures_iter(text).take(n.max(0) as usize) {
+                                let mut row = Vec::new();
+                                for idx in 0..caps.len() {
+                                    row.push(Value::String(
+                                        caps.get(idx).map(|m| m.as_str()).unwrap_or("").to_string(),
+                                    ));
+                                }
+                                out.push(Value::Array(row));
+                            }
+                            Ok(Value::Array(out))
+                        }
+                        Err(err) => Err(format!("regex.find_all_string_submatch_n error: {err}")),
+                    }
+                } else {
+                    Err("regex.find_all_string_submatch_n expects integer n".to_string())
+                }
+            }
+            _ => Err("regex.find_all_string_submatch_n expects (string,string,number)".to_string()),
+        },
+        "regex.split" => match (values.get(0), values.get(1)) {
+            (Some(Value::String(pattern)), Some(Value::String(text))) => {
+                match regex::Regex::new(pattern) {
+                    Ok(re) => {
+                        let parts = re
+                            .split(text)
+                            .map(|s| Value::String(s.to_string()))
+                            .collect();
+                        Ok(Value::Array(parts))
+                    }
+                    Err(err) => Err(format!("regex.split error: {err}")),
+                }
+            }
+            _ => Err("regex.split expects (string,string)".to_string()),
+        },
+        "glob.match" => match (values.get(0), values.get(1), values.get(2)) {
+            (Some(Value::String(pattern)), Some(delims), Some(Value::String(text))) => {
+                let delims = match delims {
+                    Value::Array(items) => items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .flat_map(|s| s.chars())
+                        .collect::<Vec<char>>(),
+                    Value::String(value) => value.chars().collect::<Vec<char>>(),
+                    _ => Vec::new(),
+                };
+                let regex = glob_to_regex(pattern, &delims);
+                match regex::Regex::new(&regex) {
+                    Ok(re) => Ok(Value::Bool(re.is_match(text))),
+                    Err(err) => Err(format!("glob.match error: {err}")),
+                }
+            }
+            _ => Err("glob.match expects (string, array|string, string)".to_string()),
+        },
+        "glob.quote_meta" => match values.get(0) {
+            Some(Value::String(text)) => Ok(Value::String(glob_quote_meta(text))),
+            _ => Err("glob.quote_meta expects (string)".to_string()),
+        },
         "contains" => match (values.get(0), values.get(1)) {
             (Some(Value::String(hay)), Some(Value::String(needle))) => {
                 Ok(Value::Bool(hay.contains(needle)))
@@ -507,6 +601,34 @@ fn eval_builtin(
                 Ok(Value::Bool(list.iter().any(|item| item == value)))
             }
             _ => Err("contains expects (string,string) or (array,any)".to_string()),
+        },
+        "split" | "strings.split" => match (values.get(0), values.get(1)) {
+            (Some(Value::String(text)), Some(Value::String(sep))) => {
+                let parts = text.split(sep).map(|s| Value::String(s.to_string())).collect();
+                Ok(Value::Array(parts))
+            }
+            _ => Err("split expects (string,string)".to_string()),
+        },
+        "concat" => match (values.get(0), values.get(1)) {
+            (Some(Value::String(sep)), Some(Value::Array(items))) => {
+                let mut out = Vec::new();
+                let mut valid = true;
+                for item in items {
+                    match item {
+                        Value::String(value) => out.push(value.clone()),
+                        _ => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !valid {
+                    Err("concat expects array of strings".to_string())
+                } else {
+                    Ok(Value::String(out.join(sep)))
+                }
+            }
+            _ => Err("concat expects (string,array)".to_string()),
         },
         "startswith" => match (values.get(0), values.get(1)) {
             (Some(Value::String(text)), Some(Value::String(prefix))) => {
@@ -528,6 +650,198 @@ fn eval_builtin(
             Some(Value::String(text)) => Ok(Value::String(text.to_uppercase())),
             _ => Err("upper expects (string)".to_string()),
         },
+        "trim" => match values.get(0) {
+            Some(Value::String(text)) => Ok(Value::String(text.trim().to_string())),
+            _ => Err("trim expects (string)".to_string()),
+        },
+        "trim_left" => match values.get(0) {
+            Some(Value::String(text)) => Ok(Value::String(text.trim_start().to_string())),
+            _ => Err("trim_left expects (string)".to_string()),
+        },
+        "trim_right" => match values.get(0) {
+            Some(Value::String(text)) => Ok(Value::String(text.trim_end().to_string())),
+            _ => Err("trim_right expects (string)".to_string()),
+        },
+        "replace" => match (values.get(0), values.get(1), values.get(2)) {
+            (Some(Value::String(text)), Some(Value::String(old)), Some(Value::String(new))) => {
+                Ok(Value::String(text.replace(old, new)))
+            }
+            _ => Err("replace expects (string,string,string)".to_string()),
+        },
+        "substring" => {
+            if values.len() < 2 {
+                Err("substring expects (string,number[,number])".to_string())
+            } else {
+                match (values.get(0), values.get(1), values.get(2)) {
+                    (Some(Value::String(text)), Some(Value::Number(start)), Some(Value::Number(len))) => {
+                        match (start.as_i64(), len.as_i64()) {
+                            (Some(start), Some(len)) => {
+                                let chars: Vec<char> = text.chars().collect();
+                                let start = start.max(0) as usize;
+                                let end = (start + len.max(0) as usize).min(chars.len());
+                                Ok(Value::String(chars[start..end].iter().collect()))
+                            }
+                            _ => Err("substring expects integer start/len".to_string()),
+                        }
+                    }
+                    (Some(Value::String(text)), Some(Value::Number(start)), None) => {
+                        if let Some(start) = start.as_i64() {
+                            let chars: Vec<char> = text.chars().collect();
+                            let start = start.max(0) as usize;
+                            Ok(Value::String(chars[start..].iter().collect()))
+                        } else {
+                            Err("substring expects integer start".to_string())
+                        }
+                    }
+                    _ => Err("substring expects (string,number[,number])".to_string()),
+                }
+            }
+        }
+        "indexof" => match (values.get(0), values.get(1)) {
+            (Some(Value::String(text)), Some(Value::String(needle))) => {
+                Ok(Value::Number(
+                    (text.find(needle).map(|idx| idx as i64).unwrap_or(-1)).into(),
+                ))
+            }
+            _ => Err("indexof expects (string,string)".to_string()),
+        },
+        "sprintf" => match (values.get(0), values.get(1)) {
+            (Some(Value::String(fmt)), Some(Value::Array(args))) => {
+                sprintf_simple(fmt, args)
+            }
+            _ => Err("sprintf expects (string,array)".to_string()),
+        },
+        "count" => match values.get(0) {
+            Some(Value::Array(items)) => Ok(Value::Number((items.len() as i64).into())),
+            Some(Value::Object(map)) => Ok(Value::Number((map.len() as i64).into())),
+            Some(Value::String(text)) => Ok(Value::Number((text.chars().count() as i64).into())),
+            _ => Err("count expects (array|object|string)".to_string()),
+        },
+        "sum" => sum_numbers(&values, "sum"),
+        "product" => product_numbers(&values, "product"),
+        "max" => max_numbers(&values, "max"),
+        "min" => min_numbers(&values, "min"),
+        "array.concat" => match (values.get(0), values.get(1)) {
+            (Some(Value::Array(a)), Some(Value::Array(b))) => {
+                let mut out = a.clone();
+                out.extend(b.iter().cloned());
+                Ok(Value::Array(out))
+            }
+            _ => Err("array.concat expects (array,array)".to_string()),
+        },
+        "array.slice" => match (values.get(0), values.get(1), values.get(2)) {
+            (Some(Value::Array(items)), Some(Value::Number(start)), Some(Value::Number(end))) => {
+                match (start.as_i64(), end.as_i64()) {
+                    (Some(start), Some(end)) => {
+                        let start = start.max(0) as usize;
+                        let end = end.max(start as i64) as usize;
+                        Ok(Value::Array(
+                            items
+                                .iter()
+                                .skip(start)
+                                .take(end.saturating_sub(start))
+                                .cloned()
+                                .collect(),
+                        ))
+                    }
+                    _ => Err("array.slice expects integer start/end".to_string()),
+                }
+            }
+            _ => Err("array.slice expects (array,number,number)".to_string()),
+        },
+        "array.reverse" => match values.get(0) {
+            Some(Value::Array(items)) => {
+                let mut out = items.clone();
+                out.reverse();
+                Ok(Value::Array(out))
+            }
+            _ => Err("array.reverse expects (array)".to_string()),
+        },
+        "array.append" => match (values.get(0), values.get(1)) {
+            (Some(Value::Array(items)), Some(value)) => {
+                let mut out = items.clone();
+                out.push(value.clone());
+                Ok(Value::Array(out))
+            }
+            _ => Err("array.append expects (array,any)".to_string()),
+        },
+        "array.contains" => match (values.get(0), values.get(1)) {
+            (Some(Value::Array(items)), Some(value)) => {
+                Ok(Value::Bool(items.iter().any(|item| item == value)))
+            }
+            _ => Err("array.contains expects (array,any)".to_string()),
+        },
+        "object.get" => match (values.get(0), values.get(1), values.get(2)) {
+            (Some(Value::Object(map)), Some(Value::String(key)), Some(default)) => {
+                Ok(map.get(key).cloned().unwrap_or_else(|| default.clone()))
+            }
+            (Some(Value::Object(map)), Some(Value::String(key)), None) => {
+                Ok(map.get(key).cloned().unwrap_or(Value::Null))
+            }
+            _ => Err("object.get expects (object,string,any?)".to_string()),
+        },
+        "object.remove" => match (values.get(0), values.get(1)) {
+            (Some(Value::Object(map)), Some(Value::String(key))) => {
+                let mut out = map.clone();
+                out.remove(key);
+                Ok(Value::Object(out))
+            }
+            (Some(Value::Object(map)), Some(Value::Array(keys))) => {
+                let mut out = map.clone();
+                for key in keys {
+                    if let Some(key) = key.as_str() {
+                        out.remove(key);
+                    }
+                }
+                Ok(Value::Object(out))
+            }
+            _ => Err("object.remove expects (object,string|array)".to_string()),
+        },
+        "object.union" => match (values.get(0), values.get(1)) {
+            (Some(Value::Object(a)), Some(Value::Object(b))) => {
+                let mut out = a.clone();
+                for (k, v) in b {
+                    out.insert(k.clone(), v.clone());
+                }
+                Ok(Value::Object(out))
+            }
+            _ => Err("object.union expects (object,object)".to_string()),
+        },
+        "object.subset" => match (values.get(0), values.get(1)) {
+            (Some(Value::Object(a)), Some(Value::Object(b))) => {
+                Ok(Value::Bool(a.iter().all(|(k, v)| b.get(k) == Some(v))))
+            }
+            _ => Err("object.subset expects (object,object)".to_string()),
+        },
+        "json.marshal" => match values.get(0) {
+            Some(value) => match serde_json::to_string(value) {
+                Ok(text) => Ok(Value::String(text)),
+                Err(err) => Err(format!("json.marshal error: {err}")),
+            },
+            _ => Err("json.marshal expects (any)".to_string()),
+        },
+        "json.unmarshal" => match values.get(0) {
+            Some(Value::String(text)) => match serde_json::from_str(text) {
+                Ok(value) => Ok(value),
+                Err(err) => Err(format!("json.unmarshal error: {err}")),
+            },
+            _ => Err("json.unmarshal expects (string)".to_string()),
+        },
+        "is_null" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_null()))),
+        "is_boolean" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_boolean()))),
+        "is_number" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_number()))),
+        "is_string" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_string()))),
+        "is_array" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_array()))),
+        "is_object" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_object()))),
+        "type_name" => match values.get(0) {
+            Some(Value::Null) => Ok(Value::String("null".to_string())),
+            Some(Value::Bool(_)) => Ok(Value::String("boolean".to_string())),
+            Some(Value::Number(_)) => Ok(Value::String("number".to_string())),
+            Some(Value::String(_)) => Ok(Value::String("string".to_string())),
+            Some(Value::Array(_)) => Ok(Value::String("array".to_string())),
+            Some(Value::Object(_)) => Ok(Value::String("object".to_string())),
+            None => Err("type_name expects (any)".to_string()),
+        },
         _ => Err(format!("builtin not implemented: {name}")),
     };
 
@@ -538,6 +852,159 @@ fn eval_builtin(
             0
         }
     }
+}
+
+fn glob_to_regex(pattern: &str, delims: &[char]) -> String {
+    let mut out = String::from("^");
+    let mut chars = pattern.chars().peekable();
+    let delim_class = if delims.is_empty() {
+        String::new()
+    } else {
+        let mut class = String::new();
+        for ch in delims {
+            class.push_str(&regex::escape(&ch.to_string()));
+        }
+        class
+    };
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' => {
+                if let Some('*') = chars.peek() {
+                    chars.next();
+                    out.push_str(".*");
+                } else if delim_class.is_empty() {
+                    out.push_str(".*");
+                } else {
+                    out.push_str(&format!("[^{}]*", delim_class));
+                }
+            }
+            '?' => {
+                if delim_class.is_empty() {
+                    out.push('.');
+                } else {
+                    out.push_str(&format!("[^{}]", delim_class));
+                }
+            }
+            _ => out.push_str(&regex::escape(&ch.to_string())),
+        }
+    }
+    out.push('$');
+    out
+}
+
+fn glob_quote_meta(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.chars() {
+        if matches!(ch, '*' | '?' | '[' | ']' | '{' | '}' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn value_to_string(value: &Value) -> Result<String, String> {
+    match value {
+        Value::String(text) => Ok(text.clone()),
+        other => serde_json::to_string(other).map_err(|err| format!("stringify error: {err}")),
+    }
+}
+
+fn sprintf_simple(fmt: &str, args: &[Value]) -> Result<Value, String> {
+    let mut out = String::new();
+    let mut iter = fmt.chars().peekable();
+    let mut index = 0usize;
+    while let Some(ch) = iter.next() {
+        if ch == '%' {
+            if let Some('%') = iter.peek() {
+                iter.next();
+                out.push('%');
+                continue;
+            }
+            let spec = iter.next().ok_or("sprintf missing format specifier")?;
+            let value = args.get(index).ok_or("sprintf missing arg")?;
+            index += 1;
+            match spec {
+                's' => {
+                    let text = value
+                        .as_str()
+                        .ok_or("sprintf %s expects string")?;
+                    out.push_str(text);
+                }
+                'v' => {
+                    out.push_str(&value_to_string(value)?);
+                }
+                'd' => {
+                    let num = value
+                        .as_i64()
+                        .ok_or("sprintf %d expects integer")?;
+                    out.push_str(&num.to_string());
+                }
+                'f' => {
+                    let num = value
+                        .as_f64()
+                        .ok_or("sprintf %f expects number")?;
+                    out.push_str(&num.to_string());
+                }
+                other => return Err(format!("sprintf unsupported format %{other}")),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    Ok(Value::String(out))
+}
+
+fn sum_numbers(values: &[Value], name: &str) -> Result<Value, String> {
+    let list = match values.get(0) {
+        Some(Value::Array(items)) => items,
+        _ => return Err(format!("{name} expects (array)")),
+    };
+    let mut sum = 0.0;
+    for item in list {
+        sum += item.as_f64().ok_or_else(|| format!("{name} expects numeric array"))?;
+    }
+    Ok(Value::Number(serde_json::Number::from_f64(sum).ok_or_else(|| format!("{name} invalid number"))?))
+}
+
+fn product_numbers(values: &[Value], name: &str) -> Result<Value, String> {
+    let list = match values.get(0) {
+        Some(Value::Array(items)) => items,
+        _ => return Err(format!("{name} expects (array)")),
+    };
+    let mut prod = 1.0;
+    for item in list {
+        prod *= item.as_f64().ok_or_else(|| format!("{name} expects numeric array"))?;
+    }
+    Ok(Value::Number(serde_json::Number::from_f64(prod).ok_or_else(|| format!("{name} invalid number"))?))
+}
+
+fn max_numbers(values: &[Value], name: &str) -> Result<Value, String> {
+    let list = match values.get(0) {
+        Some(Value::Array(items)) => items,
+        _ => return Err(format!("{name} expects (array)")),
+    };
+    let mut max = None::<f64>;
+    for item in list {
+        let num = item.as_f64().ok_or_else(|| format!("{name} expects numeric array"))?;
+        max = Some(max.map_or(num, |m| m.max(num)));
+    }
+    let max = max.ok_or_else(|| format!("{name} expects non-empty array"))?;
+    Ok(Value::Number(serde_json::Number::from_f64(max).ok_or_else(|| format!("{name} invalid number"))?))
+}
+
+fn min_numbers(values: &[Value], name: &str) -> Result<Value, String> {
+    let list = match values.get(0) {
+        Some(Value::Array(items)) => items,
+        _ => return Err(format!("{name} expects (array)")),
+    };
+    let mut min = None::<f64>;
+    for item in list {
+        let num = item.as_f64().ok_or_else(|| format!("{name} expects numeric array"))?;
+        min = Some(min.map_or(num, |m| m.min(num)));
+    }
+    let min = min.ok_or_else(|| format!("{name} expects non-empty array"))?;
+    Ok(Value::Number(serde_json::Number::from_f64(min).ok_or_else(|| format!("{name} invalid number"))?))
 }
 
 fn dump_value(caller: &mut Caller<'_, OpaRuntimeState>, addr: i32) -> Result<Value, OpaError> {
