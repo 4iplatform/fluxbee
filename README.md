@@ -132,3 +132,75 @@ Ejecutar el servicio de config:
 cargo run --bin sy_config_routes
 ```
 Si querés apuntar a un router específico: `JSR_ROUTER_NAME=RT.primary ...`
+
+## SY.admin (API HTTP) - ejemplos CURL
+
+Health:
+
+```sh
+curl http://127.0.0.1:8080/health
+```
+
+Config rutas:
+
+```sh
+curl -X PUT http://127.0.0.1:8080/config/routes \
+  -H "Content-Type: application/json" \
+  -d '{"routes":[{"prefix":"WF.echo.*","match_kind":"PREFIX","action":"LOCAL","priority":10}]}'
+```
+
+Config VPNs:
+
+```sh
+curl -X PUT http://127.0.0.1:8080/config/vpns \
+  -H "Content-Type: application/json" \
+  -d '{"vpns":[{"pattern":"WF.echo.*","match_kind":"PREFIX","vpn_id":10}]}'
+```
+
+OPA: compile + apply (autoversion):
+
+```sh
+curl -X POST http://127.0.0.1:8080/opa/policy \
+  -H "Content-Type: application/json" \
+  -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'
+```
+
+OPA: compile (staged, sin apply):
+
+```sh
+curl -X POST http://127.0.0.1:8080/opa/policy/compile \
+  -H "Content-Type: application/json" \
+  -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'
+```
+
+OPA: check (alias compile, queda staged):
+
+```sh
+curl -X POST http://127.0.0.1:8080/opa/policy/check \
+  -H "Content-Type: application/json" \
+  -d '{"rego":"package router\n\ndefault target = null\n"}'
+```
+
+OPA: apply (requiere version):
+
+```sh
+curl -X POST http://127.0.0.1:8080/opa/policy/apply \
+  -H "Content-Type: application/json" \
+  -d '{"version":43}'
+```
+
+OPA: rollback:
+
+```sh
+curl -X POST http://127.0.0.1:8080/opa/policy/rollback \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+Target por isla (unicast a SY.opa.rules@<isla>):
+
+```sh
+curl -X POST http://127.0.0.1:8080/opa/policy \
+  -H "Content-Type: application/json" \
+  -d '{"rego":"package router\n\ndefault target = null\n","target":"staging"}'
+```
