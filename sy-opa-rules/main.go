@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -1107,6 +1108,11 @@ func compileRego(rego string, entrypoint string) ([]byte, string, int64, error) 
 		return nil, "", 0, err
 	}
 	wasm := buf.Bytes()
+	var err error
+	wasm, err = normalizeWasmBytes(wasm)
+	if err != nil {
+		return nil, "", 0, err
+	}
 	if err := validateWasm(wasm); err != nil {
 		return nil, "", 0, err
 	}
@@ -1115,6 +1121,22 @@ func compileRego(rego string, entrypoint string) ([]byte, string, int64, error) 
 	}
 	hash := sha256.Sum256(wasm)
 	return wasm, "sha256:" + hex.EncodeToString(hash[:]), time.Since(start).Milliseconds(), nil
+}
+
+func normalizeWasmBytes(data []byte) ([]byte, error) {
+	if len(data) >= 4 && bytes.Equal(data[:4], []byte{0x1f, 0x8b, 0x08, 0x00}) {
+		reader, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("invalid gzip wasm: %w", err)
+		}
+		defer reader.Close()
+		decoded, err := io.ReadAll(reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode gzip wasm: %w", err)
+		}
+		return decoded, nil
+	}
+	return data, nil
 }
 
 func validateWasm(wasm []byte) error {
