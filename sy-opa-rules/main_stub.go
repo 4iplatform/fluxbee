@@ -1,6 +1,8 @@
 //go:build !linux
+// +build !linux
 
 package main
 
-const _ = int("sy-opa-rules supports only Linux targets.")
-
+func main() {
+	panic("sy-opa-rules supports only Linux targets.")
+}

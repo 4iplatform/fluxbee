@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -233,7 +234,8 @@ func loadOrCreateUUID(dir, base string) (uuid.UUID, error) {
 }
 
 func openOrCreateOpaRegion(name string, owner uuid.UUID) (*OpaRegion, error) {
-	fd, err := unix.ShmOpen(name, unix.O_RDWR, 0)
+	filePath := filepath.Join("/dev/shm", strings.TrimPrefix(name, "/"))
+	fd, err := openFileFd(filePath, unix.O_RDWR, 0o600)
 	if err == nil {
 		if err := ensureShmSize(fd, opaHeaderSize+opaMaxWasmSize); err == nil {
 			mmap, err := unix.Mmap(fd, 0, opaHeaderSize+opaMaxWasmSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
@@ -243,7 +245,7 @@ func openOrCreateOpaRegion(name string, owner uuid.UUID) (*OpaRegion, error) {
 						name:     name,
 						fd:       fd,
 						mmap:     mmap,
-					seqPtr:   (*uint64)(unsafe.Pointer(&mmap[8])),
+						seqPtr:   (*uint64)(unsafe.Pointer(&mmap[8])),
 						ownerID:  owner,
 						ownerPID: uint32(os.Getpid()),
 					}, nil
@@ -252,22 +254,22 @@ func openOrCreateOpaRegion(name string, owner uuid.UUID) (*OpaRegion, error) {
 			}
 		}
 		_ = unix.Close(fd)
-		_ = unix.ShmUnlink(name)
+		_ = os.Remove(filePath)
 	}
 
-	fd, err = unix.ShmOpen(name, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL, 0o600)
+	fd, err = openFileFd(filePath, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	if err := ensureShmSize(fd, opaHeaderSize+opaMaxWasmSize); err != nil {
 		_ = unix.Close(fd)
-		_ = unix.ShmUnlink(name)
+		_ = os.Remove(filePath)
 		return nil, err
 	}
 	mmap, err := unix.Mmap(fd, 0, opaHeaderSize+opaMaxWasmSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
 		_ = unix.Close(fd)
-		_ = unix.ShmUnlink(name)
+		_ = os.Remove(filePath)
 		return nil, err
 	}
 	for i := range mmap {
@@ -294,6 +296,14 @@ func ensureShmSize(fd int, size int) error {
 		return nil
 	}
 	return unix.Ftruncate(fd, int64(size))
+}
+
+func openFileFd(path string, flags int, perm uint32) (int, error) {
+	fd, err := unix.Open(path, flags, perm)
+	if err != nil {
+		return -1, err
+	}
+	return fd, nil
 }
 
 func isValidOpaRegion(mmap []byte) bool {
@@ -1046,20 +1056,17 @@ func compileRego(rego string, entrypoint string) ([]byte, string, int64, error) 
 	if err := os.WriteFile(regoPath, []byte(rego), 0o644); err != nil {
 		return nil, "", 0, err
 	}
-	outPath := filepath.Join(tmpDir, "policy.wasm")
 	start := time.Now()
+	var buf bytes.Buffer
 	compiler := compile.New().
 		WithTarget(compile.TargetWasm).
-		WithEntrypoints([]string{entrypoint}).
+		WithEntrypoints(entrypoint).
 		WithPaths(regoPath).
-		WithOutput(outPath)
+		WithOutput(&buf)
 	if err := compiler.Build(context.Background()); err != nil {
 		return nil, "", 0, err
 	}
-	wasm, err := os.ReadFile(outPath)
-	if err != nil {
-		return nil, "", 0, err
-	}
+	wasm := buf.Bytes()
 	if len(wasm) > opaMaxWasmSize {
 		return nil, "", 0, fmt.Errorf("wasm too large (%d bytes)", len(wasm))
 	}
