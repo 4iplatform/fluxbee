@@ -45,7 +45,7 @@ Objetivo: revisar punto por punto y marcar pendientes.
 
 ### 6.1 Lifecycle OPA (router)
 - [x] `OPA_RELOAD` (system broadcast)
-- [x] Carga `policy.wasm` desde `/var/lib/json-router/policy.wasm`
+- [x] Carga WASM desde SHM `/dev/shm/jsr-opa-<island>`
 - [x] SHM: `opa_policy_version` + `opa_load_status`
 
 ### 6.2 Resolver real
@@ -54,11 +54,10 @@ Objetivo: revisar punto por punto y marcar pendientes.
 - [x] `OPA_ERROR` si falla evaluación
 
 ### 6.3 Pendientes OPA
-- [ ] Builtins OPA completos (solo hay subset básico)
-- [ ] Resolver entrypoint real (hoy usa índice 0 si existe)
+- [x] Builtins OPA completos
+- [x] Resolver entrypoint (usa `entrypoints` + `opa_eval_ctx_set_entrypoint` si existe)
 - [ ] Carga de `data` bundle (si policy usa data)
-- [ ] Validación de `hash` en `OPA_RELOAD`
-- [ ] Lectura de WASM desde SHM `/dev/shm/jsr-opa-<island>` (nueva región)
+- [x] Validación de `hash` en `OPA_RELOAD`
 
 ## 7. Casos especiales
 
@@ -77,4 +76,3 @@ Objetivo: revisar punto por punto y marcar pendientes.
 - SY.opa.rules es **control plane** (Go), no router. Compila Rego → WASM y escribe en SHM.
 - Routers (Rust) leen WASM de `/dev/shm/jsr-opa-<island>` y ejecutan con Wasmtime.
 - Si la policy usa builtins no implementados → `OPA_ERROR`.
-

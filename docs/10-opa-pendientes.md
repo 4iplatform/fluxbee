@@ -3,7 +3,7 @@
 Estado de implementación contra la especificación actual (docs/01–09 + SY_nodes_spec.md).
 
 ## Pendientes críticos (funcionales)
-1) **Builtins OPA completos**
+1) **Builtins OPA completos** ✅
    - Implementar el set de builtins esperado por OPA WASM (regex, glob, string ops, etc.).
    - Verificar mapeos correctos en el runtime del router.
 
@@ -19,7 +19,7 @@ Estado de implementación contra la especificación actual (docs/01–09 + SY_no
    - `opa_policy_version` y `opa_load_status` en SHM local del router deben reflejar la carga.
    - `SY.opa.rules` debe poder verificar si los routers aplicaron la versión.
 
-5) **Lock file de sy-opa-rules**
+5) **Lock file de sy-opa-rules** ✅
    - Implementar `/var/run/json-router/sy-opa-rules.lock` (evitar procesos duplicados).
 
 ## Pendientes de API / Control plane

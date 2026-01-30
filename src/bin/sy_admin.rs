@@ -285,6 +285,13 @@ struct ConfigUpdate {
     version: Option<u64>,
 }
 
+#[derive(Debug)]
+struct AdminRequest {
+    action: String,
+    payload: serde_json::Value,
+    target: String,
+}
+
 enum OpaAction {
     Compile,
     CompileApply,
@@ -403,6 +410,94 @@ async fn handle_http(
     match (method.as_str(), path) {
         ("GET", "/health") => {
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
+        }
+        ("GET", "/routes") => {
+            let island = query.get("island").cloned();
+            let (status, resp) = handle_admin_query(ctx, "list_routes", island).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/routes") => {
+            let route: RouteConfig = serde_json::from_slice(&body)?;
+            let island = query.get("island").cloned();
+            let (status, resp) =
+                handle_admin_command(ctx, "add_route", serde_json::to_value(route)?, island).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("DELETE", "/routes") => {
+            let prefix = query.get("prefix").cloned().unwrap_or_default();
+            let island = query.get("island").cloned();
+            let payload = serde_json::json!({ "prefix": prefix });
+            let (status, resp) =
+                handle_admin_command(ctx, "delete_route", payload, island).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("GET", "/vpns") => {
+            let island = query.get("island").cloned();
+            let (status, resp) = handle_admin_query(ctx, "list_vpns", island).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/vpns") => {
+            let vpn: VpnConfig = serde_json::from_slice(&body)?;
+            let island = query.get("island").cloned();
+            let (status, resp) =
+                handle_admin_command(ctx, "add_vpn", serde_json::to_value(vpn)?, island).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("DELETE", "/vpns") => {
+            let pattern = query.get("pattern").cloned().unwrap_or_default();
+            let island = query.get("island").cloned();
+            let payload = serde_json::json!({ "pattern": pattern });
+            let (status, resp) =
+                handle_admin_command(ctx, "delete_vpn", payload, island).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("GET", "/nodes") => {
+            let island = query.get("island").cloned();
+            let (status, resp) = handle_admin_query(ctx, "list_nodes", island).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/nodes") => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(&body)?
+            };
+            let island = query.get("island").cloned();
+            let (status, resp) =
+                handle_admin_command(ctx, "run_node", payload, island).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("DELETE", "/nodes") => {
+            let name = query.get("name").cloned().unwrap_or_default();
+            let island = query.get("island").cloned();
+            let payload = serde_json::json!({ "name": name });
+            let (status, resp) =
+                handle_admin_command(ctx, "kill_node", payload, island).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("GET", "/routers") => {
+            let island = query.get("island").cloned();
+            let (status, resp) = handle_admin_query(ctx, "list_routers", island).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/routers") => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(&body)?
+            };
+            let island = query.get("island").cloned();
+            let (status, resp) =
+                handle_admin_command(ctx, "run_router", payload, island).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("DELETE", "/routers") => {
+            let name = query.get("name").cloned().unwrap_or_default();
+            let island = query.get("island").cloned();
+            let payload = serde_json::json!({ "name": name });
+            let (status, resp) =
+                handle_admin_command(ctx, "kill_router", payload, island).await?;
+            respond_json(stream, status, &resp).await?;
         }
         ("PUT", "/config/routes") => {
             let update: ConfigUpdate = serde_json::from_slice(&body)?;
@@ -670,6 +765,139 @@ async fn handle_opa_query(
 ) -> Result<(u16, String), Box<dyn std::error::Error>> {
     let responses = send_opa_query(ctx, action, target.clone()).await?;
     Ok(build_opa_query_response(ctx, action, responses, target))
+}
+
+async fn handle_admin_query(
+    ctx: &AdminContext,
+    action: &str,
+    island: Option<String>,
+) -> Result<(u16, String), Box<dyn std::error::Error>> {
+    let request = build_admin_request(ctx, action, serde_json::json!({}), island);
+    let response = send_admin_request(ctx, request).await;
+    Ok(build_admin_http_response(action, response))
+}
+
+async fn handle_admin_command(
+    ctx: &AdminContext,
+    action: &str,
+    payload: serde_json::Value,
+    island: Option<String>,
+) -> Result<(u16, String), Box<dyn std::error::Error>> {
+    let request = build_admin_request(ctx, action, payload, island);
+    let response = send_admin_request(ctx, request).await;
+    Ok(build_admin_http_response(action, response))
+}
+
+fn build_admin_request(
+    ctx: &AdminContext,
+    action: &str,
+    payload: serde_json::Value,
+    island: Option<String>,
+) -> AdminRequest {
+    let island_id = island.unwrap_or_else(|| ctx.island_id.clone());
+    let base = match action {
+        "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn"
+        | "delete_vpn" => "SY.config.routes",
+        "list_nodes" | "run_node" | "kill_node" | "list_routers" | "run_router"
+        | "kill_router" => "SY.orchestrator",
+        _ => "SY.config.routes",
+    };
+    let target = if island_id.contains('@') {
+        island_id
+    } else {
+        format!("{}@{}", base, island_id)
+    };
+    AdminRequest {
+        action: action.to_string(),
+        payload,
+        target,
+    }
+}
+
+async fn send_admin_request(
+    ctx: &AdminContext,
+    request: AdminRequest,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let node_config = NodeConfig {
+        name: "SY.admin".to_string(),
+        router_socket: ctx.socket_dir.clone(),
+        uuid_persistence_dir: ctx.state_dir.join("nodes"),
+        config_dir: ctx.config_dir.clone(),
+        version: "1.0".to_string(),
+    };
+    let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let msg = Message {
+        routing: Routing {
+            src: client.uuid().to_string(),
+            dst: Destination::Unicast(request.target),
+            ttl: 16,
+            trace_id: Uuid::new_v4().to_string(),
+        },
+        meta: Meta {
+            msg_type: "admin".to_string(),
+            msg: None,
+            scope: None,
+            target: None,
+            action: Some(request.action.clone()),
+            priority: None,
+            context: None,
+        },
+        payload: request.payload,
+    };
+    client.send(&msg).await?;
+
+    use tokio::time::{timeout, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let msg = match timeout(remaining, client.recv()).await {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_) => break,
+        };
+        if msg.meta.msg_type != "admin" {
+            continue;
+        }
+        if msg.meta.action.as_deref() != Some(request.action.as_str()) {
+            continue;
+        }
+        return Ok(msg.payload);
+    }
+    Err("admin request timeout".into())
+}
+
+fn build_admin_http_response(
+    action: &str,
+    response: Result<serde_json::Value, Box<dyn std::error::Error>>,
+) -> (u16, String) {
+    match response {
+        Ok(payload) => {
+            let status = payload
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ok");
+            let code = if status == "ok" { 200 } else { 500 };
+            (
+                code,
+                serde_json::json!({
+                    "status": status,
+                    "action": action,
+                    "payload": payload,
+                })
+                .to_string(),
+            )
+        }
+        Err(err) => (
+            500,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "error_code": "TIMEOUT",
+                "error_detail": err.to_string(),
+            })
+            .to_string(),
+        ),
+    }
 }
 
 async fn send_opa_action(

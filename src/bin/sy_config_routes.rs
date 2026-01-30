@@ -8,7 +8,9 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use jsr_client::{NodeClient, NodeConfig};
-use jsr_client::protocol::{ConfigChangedPayload, MSG_CONFIG_CHANGED, SYSTEM_KIND};
+use jsr_client::protocol::{
+    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SYSTEM_KIND,
+};
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, VpnAssignment,
     ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
@@ -120,6 +122,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                 };
+                if msg.meta.msg_type == "admin" {
+                    if let Err(err) = handle_admin_action(
+                        &mut client,
+                        &msg,
+                        &config_dir,
+                        &mut sy_config,
+                        &mut writer,
+                    )
+                    .await {
+                        tracing::warn!("admin action error: {err}");
+                    }
+                    continue;
+                }
                 if msg.meta.msg_type != SYSTEM_KIND || msg.meta.msg.as_deref() != Some(MSG_CONFIG_CHANGED) {
                     continue;
                 }
@@ -180,6 +195,146 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+async fn handle_admin_action(
+    client: &mut NodeClient,
+    msg: &Message,
+    config_dir: &Path,
+    sy_config: &mut SyConfigFile,
+    writer: &mut ConfigRegionWriter,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let action = msg.meta.action.as_deref().unwrap_or("");
+    let reply_payload = match action {
+        "list_routes" => serde_json::json!({
+            "status": "ok",
+            "config_version": sy_config.version,
+            "routes": sy_config.routes.clone(),
+        }),
+        "list_vpns" => serde_json::json!({
+            "status": "ok",
+            "config_version": sy_config.version,
+            "vpns": sy_config.vpns.clone(),
+        }),
+        "add_route" => {
+            let route: RouteConfig = serde_json::from_value(msg.payload.clone())?;
+            if sy_config.routes.iter().any(|r| r.prefix == route.prefix) {
+                serde_json::json!({
+                    "status": "error",
+                    "error": "DUPLICATE_PREFIX",
+                    "message": format!("Route with prefix '{}' already exists", route.prefix),
+                })
+            } else {
+                sy_config.routes.push(route.clone());
+                sy_config.version = sy_config.version.saturating_add(1);
+                sy_config.updated_at = now_epoch_ms().to_string();
+                apply_config(writer, sy_config)?;
+                write_config(config_dir, sy_config)?;
+                serde_json::json!({
+                    "status": "ok",
+                    "config_version": sy_config.version,
+                    "route": route,
+                })
+            }
+        }
+        "delete_route" => {
+            let payload: serde_json::Value = msg.payload.clone();
+            let prefix = payload
+                .get("prefix")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let before = sy_config.routes.len();
+            sy_config.routes.retain(|r| r.prefix != prefix);
+            if sy_config.routes.len() == before {
+                serde_json::json!({
+                    "status": "error",
+                    "error": "NOT_FOUND",
+                    "message": format!("Route with prefix '{}' not found", prefix),
+                })
+            } else {
+                sy_config.version = sy_config.version.saturating_add(1);
+                sy_config.updated_at = now_epoch_ms().to_string();
+                apply_config(writer, sy_config)?;
+                write_config(config_dir, sy_config)?;
+                serde_json::json!({
+                    "status": "ok",
+                    "config_version": sy_config.version,
+                })
+            }
+        }
+        "add_vpn" => {
+            let vpn: VpnConfig = serde_json::from_value(msg.payload.clone())?;
+            if sy_config.vpns.iter().any(|v| v.pattern == vpn.pattern) {
+                serde_json::json!({
+                    "status": "error",
+                    "error": "DUPLICATE_PATTERN",
+                    "message": format!("VPN with pattern '{}' already exists", vpn.pattern),
+                })
+            } else {
+                sy_config.vpns.push(vpn.clone());
+                sy_config.version = sy_config.version.saturating_add(1);
+                sy_config.updated_at = now_epoch_ms().to_string();
+                apply_config(writer, sy_config)?;
+                write_config(config_dir, sy_config)?;
+                serde_json::json!({
+                    "status": "ok",
+                    "config_version": sy_config.version,
+                    "vpn": vpn,
+                })
+            }
+        }
+        "delete_vpn" => {
+            let payload: serde_json::Value = msg.payload.clone();
+            let pattern = payload
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let before = sy_config.vpns.len();
+            sy_config.vpns.retain(|v| v.pattern != pattern);
+            if sy_config.vpns.len() == before {
+                serde_json::json!({
+                    "status": "error",
+                    "error": "NOT_FOUND",
+                    "message": format!("VPN with pattern '{}' not found", pattern),
+                })
+            } else {
+                sy_config.version = sy_config.version.saturating_add(1);
+                sy_config.updated_at = now_epoch_ms().to_string();
+                apply_config(writer, sy_config)?;
+                write_config(config_dir, sy_config)?;
+                serde_json::json!({
+                    "status": "ok",
+                    "config_version": sy_config.version,
+                })
+            }
+        }
+        _ => serde_json::json!({
+            "status": "error",
+            "error": "UNKNOWN_ACTION",
+            "message": format!("Unsupported admin action '{}'", action),
+        }),
+    };
+
+    let reply = Message {
+        routing: Routing {
+            src: client.uuid().to_string(),
+            dst: Destination::Unicast(msg.routing.src.clone()),
+            ttl: 16,
+            trace_id: Uuid::new_v4().to_string(),
+        },
+        meta: Meta {
+            msg_type: "admin".to_string(),
+            msg: None,
+            scope: None,
+            target: None,
+            action: Some(action.to_string()),
+            priority: None,
+            context: None,
+        },
+        payload: reply_payload,
+    };
+    client.send(&reply).await?;
+    Ok(())
 }
 
 fn load_island(config_dir: &Path) -> Result<IslandFile, Box<dyn std::error::Error>> {
