@@ -419,7 +419,7 @@ fn apply_config(
     for vpn in &sy_config.vpns {
         tracing::info!(
             pattern = %vpn.pattern,
-            match_kind = %vpn.match_kind,
+            match_kind = %vpn.match_kind.as_deref().unwrap_or("PREFIX"),
             vpn_id = vpn.vpn_id,
             "vpn rule loaded"
         );
