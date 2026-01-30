@@ -160,22 +160,24 @@ async fn connection_manager_loop(
                         let (read_half, write_half) = stream.into_split();
                         let rx_state = Arc::clone(&state);
                         let tx_state = Arc::clone(&state);
-                        let rx_task = tokio::spawn(rx_loop(
+                        let mut rx_task = tokio::spawn(rx_loop(
                             read_half,
                             app_rx_tx.clone(),
                             rx_state,
                         ));
-                        let tx_task = tokio::spawn(tx_loop(
+                        let mut tx_task = tokio::spawn(tx_loop(
                             write_half,
                             Arc::clone(&app_tx_rx),
                             tx_state,
                         ));
                         tokio::select! {
-                            _ = rx_task => {},
-                            _ = tx_task => {},
+                            _ = &mut rx_task => {
+                                tx_task.abort();
+                            }
+                            _ = &mut tx_task => {
+                                rx_task.abort();
+                            }
                         }
-                        rx_task.abort();
-                        tx_task.abort();
                         state.set_connected(false);
                         backoff = Duration::from_millis(100);
                         continue;

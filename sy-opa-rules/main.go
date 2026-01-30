@@ -1021,8 +1021,8 @@ type RouterClient struct {
 	nodeUUID uuid.UUID
 	nodeName string
 	nodeBase string
+	tx       chan []byte
 	mu       sync.Mutex
-	conn     net.Conn
 	lastDst  string
 }
 
@@ -1031,7 +1031,12 @@ func NewRouterClient(nodeUUID uuid.UUID, nodeName string) *RouterClient {
 	if parts := strings.Split(nodeName, "@"); len(parts) > 1 {
 		base = parts[0]
 	}
-	return &RouterClient{nodeUUID: nodeUUID, nodeName: nodeName, nodeBase: base}
+	return &RouterClient{
+		nodeUUID: nodeUUID,
+		nodeName: nodeName,
+		nodeBase: base,
+		tx:       make(chan []byte, 256),
+	}
 }
 
 func (c *RouterClient) LastPeer() string {
@@ -1041,27 +1046,30 @@ func (c *RouterClient) LastPeer() string {
 }
 
 func (c *RouterClient) Run(service *Service) {
+	backoff := 100 * time.Millisecond
 	for {
+		c.drainTxQueue()
 		conn, err := c.connect()
 		if err != nil {
 			log.Printf("connect failed: %v", err)
-			time.Sleep(1 * time.Second)
+			time.Sleep(backoff)
+			backoff = nextBackoff(backoff)
 			continue
 		}
-		c.mu.Lock()
-		c.conn = conn
-		c.mu.Unlock()
 		if err := c.handshake(conn); err != nil {
 			log.Printf("handshake failed: %v", err)
 			conn.Close()
-			time.Sleep(1 * time.Second)
+			time.Sleep(backoff)
+			backoff = nextBackoff(backoff)
 			continue
 		}
-		if err := c.readLoop(conn, service); err != nil {
-			log.Printf("router read error: %v", err)
+		backoff = 100 * time.Millisecond
+		if err := c.runConn(conn, service); err != nil {
+			log.Printf("router connection error: %v", err)
 		}
 		conn.Close()
-		time.Sleep(1 * time.Second)
+		time.Sleep(backoff)
+		backoff = nextBackoff(backoff)
 	}
 }
 
@@ -1147,16 +1155,39 @@ func (c *RouterClient) readLoop(conn net.Conn, service *Service) error {
 	}
 }
 
+func (c *RouterClient) runConn(conn net.Conn, service *Service) error {
+	errCh := make(chan error, 2)
+	done := make(chan struct{})
+	go func() {
+		errCh <- c.readLoop(conn, service)
+	}()
+	go func() {
+		errCh <- c.writeLoop(conn, done)
+	}()
+	err := <-errCh
+	close(done)
+	return err
+}
+
+func (c *RouterClient) writeLoop(conn net.Conn, done <-chan struct{}) error {
+	for {
+		select {
+		case <-done:
+			return nil
+		case frame, ok := <-c.tx:
+			if !ok {
+				return io.EOF
+			}
+			if err := writeFrame(conn, frame); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 func (c *RouterClient) Send(msg Message) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conn == nil {
-		return
-	}
 	data := mustJSON(msg)
-	if err := writeFrame(c.conn, data); err != nil {
-		log.Printf("send error: %v", err)
-	}
+	c.tx <- data
 }
 
 func readFrame(conn net.Conn) ([]byte, error) {
@@ -1216,6 +1247,24 @@ func routerSocketCandidates(dir string, nodeName string) ([]string, error) {
 	ordered = append(ordered, sockets[idx:]...)
 	ordered = append(ordered, sockets[:idx]...)
 	return ordered, nil
+}
+
+func (c *RouterClient) drainTxQueue() {
+	for {
+		select {
+		case <-c.tx:
+		default:
+			return
+		}
+	}
+}
+
+func nextBackoff(current time.Duration) time.Duration {
+	next := current * 2
+	if next > 30*time.Second {
+		return 30 * time.Second
+	}
+	return next
 }
 
 func fnv1a64(data []byte) uint64 {
