@@ -8,10 +8,11 @@ use std::future;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use jsr_client::{NodeClient, NodeConfig};
+use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
 use jsr_client::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SCOPE_GLOBAL,
     SYSTEM_KIND,
@@ -159,9 +160,9 @@ async fn run_broadcast_loop(
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
     };
-    let mut client = match NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await
+    let (mut sender, mut _receiver) = match connect_with_retry(&node_config, Duration::from_secs(1)).await
     {
-        Ok(client) => client,
+        Ok((sender, receiver)) => (sender, receiver),
         Err(err) => {
             tracing::error!("broadcast loop connect failed: {err}");
             return;
@@ -173,7 +174,7 @@ async fn run_broadcast_loop(
         let failed = match req {
             BroadcastRequest::Routes(routes) => {
                 match broadcast_config_changed(
-                    &mut client,
+                    &sender,
                     "routes",
                     None,
                     None,
@@ -192,7 +193,7 @@ async fn run_broadcast_loop(
             }
             BroadcastRequest::Vpns(vpns) => {
                 match broadcast_config_changed(
-                    &mut client,
+                    &sender,
                     "vpn",
                     None,
                     None,
@@ -211,9 +212,10 @@ async fn run_broadcast_loop(
             }
         };
         if failed {
-            match NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await {
-                Ok(new_client) => {
-                    client = new_client;
+            match connect_with_retry(&node_config, Duration::from_secs(1)).await {
+                Ok((new_sender, new_receiver)) => {
+                    sender = new_sender;
+                    _receiver = new_receiver;
                     tracing::info!("reconnected to router");
                 }
                 Err(err) => {
@@ -230,7 +232,7 @@ fn load_island(config_dir: &Path) -> Result<IslandFile, AdminError> {
 }
 
 async fn broadcast_config_changed(
-    client: &mut NodeClient,
+    sender: &NodeSender,
     subsystem: &str,
     action: Option<String>,
     auto_apply: Option<bool>,
@@ -244,7 +246,7 @@ async fn broadcast_config_changed(
     };
     let msg = Message {
         routing: Routing {
-            src: client.uuid().to_string(),
+            src: sender.uuid().to_string(),
             dst,
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
@@ -266,7 +268,7 @@ async fn broadcast_config_changed(
             config,
         })?,
     };
-    client.send(&msg).await?;
+    sender.send(msg).await?;
     tracing::info!(
         subsystem = subsystem,
         action = action.as_deref().unwrap_or(""),
@@ -857,14 +859,14 @@ async fn send_admin_request(
         config_dir: ctx.config_dir.clone(),
         version: "1.0".to_string(),
     };
-    let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let (sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     let dst = request
         .unicast
         .clone()
         .unwrap_or_else(|| request.target.clone());
     let msg = Message {
         routing: Routing {
-            src: client.uuid().to_string(),
+            src: sender.uuid().to_string(),
             dst: Destination::Unicast(dst),
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
@@ -880,13 +882,13 @@ async fn send_admin_request(
         },
         payload: request.payload,
     };
-    client.send(&msg).await?;
+    sender.send(msg).await?;
 
     use tokio::time::{timeout, Instant};
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let msg = match timeout(remaining, client.recv()).await {
+        let msg = match timeout(remaining, receiver.recv()).await {
             Ok(Ok(msg)) => msg,
             Ok(Err(err)) => return Err(err.into()),
             Err(_) => break,
@@ -971,10 +973,10 @@ async fn broadcast_full_config(
         config_dir: ctx.config_dir.clone(),
         version: "1.0".to_string(),
     };
-    let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let (sender, _receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     let subsystem = if list_action == "list_routes" { "routes" } else { "vpn" };
     broadcast_config_changed(
-        &mut client,
+        &sender,
         subsystem,
         None,
         None,
@@ -1002,7 +1004,7 @@ async fn send_opa_action(
         config_dir: ctx.config_dir.clone(),
         version: "1.0".to_string(),
     };
-    let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let (sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     let mut cfg = serde_json::json!({});
     if let Some(rego) = rego {
         cfg = serde_json::json!({
@@ -1011,7 +1013,7 @@ async fn send_opa_action(
         });
     }
     broadcast_config_changed(
-        &mut client,
+        &sender,
         "opa",
         Some(action.to_string()),
         auto_apply,
@@ -1022,7 +1024,7 @@ async fn send_opa_action(
     .await?;
 
     let expected = expected_islands(ctx, target.as_deref());
-    let responses = collect_opa_responses(&mut client, action, version, &expected).await;
+    let responses = collect_opa_responses(&mut receiver, action, version, &expected).await;
     Ok(responses)
 }
 
@@ -1038,14 +1040,14 @@ async fn send_opa_query(
         config_dir: ctx.config_dir.clone(),
         version: "1.0".to_string(),
     };
-    let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let (sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     let target_pattern = target
         .as_deref()
         .map(|island| format!("SY.opa.rules@{}", island));
     let dst = Destination::Broadcast;
     let msg = Message {
         routing: Routing {
-            src: client.uuid().to_string(),
+            src: sender.uuid().to_string(),
             dst,
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
@@ -1061,10 +1063,10 @@ async fn send_opa_query(
         },
         payload: serde_json::json!({}),
     };
-    client.send(&msg).await?;
+    sender.send(msg).await?;
 
     let expected = expected_islands(ctx, target.as_deref());
-    let responses = collect_opa_query_responses(&mut client, action, &expected).await;
+    let responses = collect_opa_query_responses(&mut receiver, action, &expected).await;
     Ok(responses)
 }
 
@@ -1083,7 +1085,7 @@ fn expected_islands(ctx: &AdminContext, target: Option<&str>) -> Vec<String> {
 }
 
 async fn collect_opa_responses(
-    client: &mut NodeClient,
+    receiver: &mut NodeReceiver,
     action: &str,
     version: u64,
     expected: &[String],
@@ -1095,7 +1097,7 @@ async fn collect_opa_responses(
 
     while responses.len() < expected.len() && Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let msg = match timeout(remaining, client.recv()).await {
+        let msg = match timeout(remaining, receiver.recv()).await {
             Ok(Ok(msg)) => msg,
             Ok(Err(err)) => {
                 tracing::warn!("opa response recv error: {err}");
@@ -1140,7 +1142,7 @@ async fn collect_opa_responses(
 }
 
 async fn collect_opa_query_responses(
-    client: &mut NodeClient,
+    receiver: &mut NodeReceiver,
     action: &str,
     expected: &[String],
 ) -> Vec<OpaQueryEntry> {
@@ -1151,7 +1153,7 @@ async fn collect_opa_query_responses(
 
     while responses.len() < expected.len() && Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let msg = match timeout(remaining, client.recv()).await {
+        let msg = match timeout(remaining, receiver.recv()).await {
             Ok(Ok(msg)) => msg,
             Ok(Err(err)) => {
                 tracing::warn!("opa query recv error: {err}");
@@ -1187,6 +1189,21 @@ async fn collect_opa_query_responses(
     }
 
     responses.into_values().collect()
+}
+
+async fn connect_with_retry(
+    config: &NodeConfig,
+    delay: Duration,
+) -> Result<(NodeSender, NodeReceiver), jsr_client::NodeError> {
+    loop {
+        match connect(config).await {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                tracing::warn!("connect failed: {err}");
+                time::sleep(delay).await;
+            }
+        }
+    }
 }
 
 fn build_opa_http_response(

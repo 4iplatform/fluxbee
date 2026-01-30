@@ -56,21 +56,18 @@ jsr-client = { git = "ssh://git@github.com/<org>/jsr-client.git", rev = "<commit
    - `version`: versión del nodo (string)
 
 2) Conectar:
-   - `NodeClient::connect_with_retry(&config, Duration::from_secs(1))`
+   - `connect(&config).await?` → retorna `(NodeSender, NodeReceiver)`
 
 3) Enviar:
-   - `client.send(&msg).await?`
+   - `sender.send(msg).await?`
 
 4) Recibir:
-   - `client.recv().await?`
-
-5) Reconectar:
-   - Si `recv()` o `send()` falla, reconectar con `connect_with_retry`.
+   - `receiver.recv().await?`
 
 ### Ejemplo mínimo
 
 ```rust
-use jsr_client::{NodeClient, NodeConfig};
+use jsr_client::{connect, NodeConfig};
 use jsr_client::protocol::{Message, Meta, Routing, Destination};
 use serde_json::json;
 use std::path::PathBuf;
@@ -84,11 +81,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_dir: PathBuf::from("/etc/json-router"),
         version: "1.0".to_string(),
     };
-    let mut client = NodeClient::connect_with_retry(&config, std::time::Duration::from_secs(1)).await?;
+    let (sender, mut receiver) = connect(&config).await?;
 
     let msg = Message {
         routing: Routing {
-            src: client.uuid().to_string(),
+            src: sender.uuid().to_string(),
             dst: Destination::Resolve,
             ttl: 1,
             trace_id: uuid::Uuid::new_v4().to_string(),
@@ -105,7 +102,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         payload: json!({"type": "text", "content": "HOLA"}),
     };
 
-    client.send(&msg).await?;
+    sender.send(msg).await?;
+    let _ = receiver.recv().await?;
     Ok(())
 }
 ```

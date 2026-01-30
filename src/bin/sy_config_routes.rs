@@ -7,7 +7,7 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use jsr_client::{NodeClient, NodeConfig};
+use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
 use jsr_client::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SYSTEM_KIND,
 };
@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
     };
-    let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let (mut sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     tracing::info!("connected to router");
 
     let mut ticker = time::interval(Duration::from_secs(5));
@@ -108,23 +108,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = ticker.tick() => {
                 writer.update_heartbeat();
             }
-            msg = client.recv() => {
+            msg = receiver.recv() => {
                 let msg = match msg {
                     Ok(msg) => msg,
                     Err(err) => {
                         tracing::warn!("recv error: {err} (reconnecting)");
-                        client = NodeClient::connect_with_retry(
+                        let (new_sender, new_receiver) = connect_with_retry(
                             &node_config,
                             Duration::from_secs(1),
                         )
                         .await?;
+                        sender = new_sender;
+                        receiver = new_receiver;
                         tracing::info!("reconnected to router");
                         continue;
                     }
                 };
                 if msg.meta.msg_type == "admin" {
                     if let Err(err) = handle_admin_action(
-                        &mut client,
+                        &sender,
                         &msg,
                         &config_dir,
                         &mut sy_config,
@@ -198,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn handle_admin_action(
-    client: &mut NodeClient,
+    sender: &NodeSender,
     msg: &Message,
     config_dir: &Path,
     sy_config: &mut SyConfigFile,
@@ -317,7 +319,7 @@ async fn handle_admin_action(
 
     let reply = Message {
         routing: Routing {
-            src: client.uuid().to_string(),
+            src: sender.uuid().to_string(),
             dst: Destination::Unicast(msg.routing.src.clone()),
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
@@ -333,8 +335,23 @@ async fn handle_admin_action(
         },
         payload: reply_payload,
     };
-    client.send(&reply).await?;
+    sender.send(reply).await?;
     Ok(())
+}
+
+async fn connect_with_retry(
+    config: &NodeConfig,
+    delay: Duration,
+) -> Result<(NodeSender, NodeReceiver), jsr_client::NodeError> {
+    loop {
+        match connect(config).await {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                tracing::warn!("connect failed: {err}");
+                time::sleep(delay).await;
+            }
+        }
+    }
 }
 
 fn load_island(config_dir: &Path) -> Result<IslandFile, Box<dyn std::error::Error>> {

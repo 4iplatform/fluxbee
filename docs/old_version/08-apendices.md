@@ -1,0 +1,191 @@
+# JSON Router - 08 Apéndices
+
+**Estado:** v1.13  
+**Fecha:** 2025-01-20  
+**Audiencia:** Todos (referencia)
+
+---
+
+## A. Glosario
+
+### Conceptos Fundamentales
+
+- **Nodo**: Proceso que procesa mensajes (AI, WF, IO, o SY).
+
+- **Router**: Proceso que mueve mensajes entre nodos, identificado como RT.
+
+- **Gateway**: Router especial que conecta islas entre sí via TCP/WAN. Único por isla.
+
+- **Link**: Conexión socket entre nodo y router.
+
+- **UUID (Capa 1)**: Identificador único de un nodo (128 bits, auto-generado).
+
+- **Nombre L2 (Capa 2)**: Identificador descriptivo con isla. Formato: `TYPE.campo1.campo2@isla`.
+
+- **Framing**: Delimitación de mensajes (4 bytes length prefix, big-endian).
+
+### Islas y Conectividad
+
+- **Isla**: Dominio local de routing donde los routers comparten `/dev/shm`. Un host físico = una isla.
+
+- **island.yaml**: Archivo que define la identidad de la isla. Obligatorio para todos los procesos.
+
+- **@isla**: Sufijo en nombres L2 que indica la isla. Agregado automáticamente por la librería de nodo.
+
+- **IRP (Inter-Router Peering)**: Comunicación entre routers de la misma isla via Unix sockets.
+
+- **WAN**: Comunicación entre islas via TCP. Solo entre gateways.
+
+- **LSA (Link State Advertisement)**: Mensaje que intercambian los gateways con topología completa de su isla.
+
+### Shared Memory
+
+- **jsr-<uuid>**: Región de memoria compartida de un router. Contiene sus nodos conectados.
+
+- **jsr-config-<island>**: Región de configuración. Contiene rutas estáticas y tabla VPN. Writer: SY.config.routes.
+
+- **jsr-lsa-<island>**: Región de topología remota. Contiene nodos/rutas/VPNs de otras islas. Writer: Gateway.
+
+- **Seqlock**: Mecanismo de sincronización para un writer y múltiples readers.
+
+- **Heartbeat**: Timestamp actualizado periódicamente para detectar procesos muertos.
+
+### Routing
+
+- **FIB (Forwarding Information Base)**: Tabla de rutas compilada en memoria local del router.
+
+- **Next-hop**: Router o isla destino del siguiente salto.
+
+- **LPM (Longest Prefix Match)**: La ruta más específica gana.
+
+- **Admin Distance**: Preferencia por origen de ruta. LOCAL=0, STATIC=1, REMOTE=2.
+
+### VPN
+
+- **VPN**: Zona de aislamiento dentro de una isla. Los nodos en distintas VPNs no se ven entre sí.
+
+- **vpn_id**: Identificador de la zona. 0 = global (default).
+
+- **Tabla VPN**: Mapping de patterns a vpn_id. Vive en jsr-config-<island>.
+
+- **Inmunidad SY.***: Los nodos SY.* y RT.* ignoran filtros VPN, ven todo.
+
+---
+
+## B. Decisiones de Diseño v1.13
+
+| Decisión | Razón |
+|----------|-------|
+| Naming con @isla obligatorio | Simplifica routing inter-isla (parsear @isla del destino) |
+| Librería agrega @isla automáticamente | El nodo no necesita saber su isla, la lee de island.yaml |
+| Gateway único por isla | Evita ambigüedad de salida, simplifica modelo |
+| Tres regiones SHM separadas | Un writer por región, evita conflictos |
+| jsr-lsa para topología remota | Todos los routers ven islas remotas sin consultar al gateway |
+| LSA incluye nodos + rutas + VPNs | Visibilidad completa de islas remotas |
+| VPN como tabla simple | Sin jerarquías ni leaks, aislamiento total |
+| SY.* inmune a VPN | Nodos de sistema deben poder operar sin restricciones |
+| Sin LSA de nodos individuales | Con @isla, solo hace falta saber que la isla existe |
+| Rutas estáticas como override | Prioridad absoluta sobre routing normal |
+
+---
+
+## C. Cambios vs Versiones Anteriores
+
+### vs v1.12
+
+| Aspecto | v1.12 | v1.13 |
+|---------|-------|-------|
+| Naming | Sin @isla | Con @isla obligatorio |
+| VPN | Túnel inter-isla | Zona intra-isla |
+| Regiones SHM | 2 (router + config) | 3 (router + config + lsa) |
+| LSA | No definido | Gateway ↔ Gateway |
+| Gateway | Múltiples posibles | Único por isla |
+
+### Estructuras Eliminadas (v1.12)
+
+- `ACTION_VPN` en rutas
+- `VpnZoneEntry` con jerarquía
+- `VpnLeakRuleEntry`
+- `next_hop_router` en rutas estáticas (reemplazado por `next_hop_island`)
+
+### Estructuras Nuevas (v1.13)
+
+- `jsr-lsa-<island>` región
+- `LsaHeader`, `RemoteIslandEntry`, `RemoteNodeEntry`
+- `is_gateway` flag en ShmHeader
+- `router_name` en ShmHeader
+
+---
+
+## D. Límites del Sistema
+
+| Límite | Valor | Notas |
+|--------|-------|-------|
+| MAX_NODES | 1024 | Por router |
+| MAX_STATIC_ROUTES | 256 | Por isla |
+| MAX_VPN_ASSIGNMENTS | 256 | Por isla |
+| MAX_REMOTE_ISLANDS | 16 | En jsr-lsa |
+| MAX_REMOTE_NODES | 1024 | Total entre todas las islas remotas |
+| MAX_REMOTE_ROUTES | 256 | Total |
+| MAX_REMOTE_VPNS | 256 | Total |
+| Nombre L2 max | 256 bytes | UTF-8 |
+| Island ID max | 64 bytes | ASCII recomendado |
+| Mensaje inline max | 64 KB | Usar blob_ref para mayores |
+
+---
+
+## E. Constantes Importantes
+
+```rust
+// Regiones
+pub const SHM_MAGIC: u32 = 0x4A535352;      // "JSSR" - Router
+pub const CONFIG_MAGIC: u32 = 0x4A534343;   // "JSCC" - Config
+pub const LSA_MAGIC: u32 = 0x4A534C41;      // "JSLA" - LSA
+
+// Match kinds
+pub const MATCH_EXACT: u8 = 0;
+pub const MATCH_PREFIX: u8 = 1;
+pub const MATCH_GLOB: u8 = 2;
+
+// Acciones de ruta
+pub const ACTION_FORWARD: u8 = 0;
+pub const ACTION_DROP: u8 = 1;
+
+// Flags
+pub const FLAG_ACTIVE: u16 = 0x0001;
+pub const FLAG_DELETED: u16 = 0x0002;
+pub const FLAG_STALE: u16 = 0x0004;
+
+// Timers
+pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
+pub const HEARTBEAT_STALE_MS: u64 = 30_000;
+pub const HELLO_INTERVAL_MS: u64 = 10_000;
+pub const DEAD_INTERVAL_MS: u64 = 40_000;
+```
+
+---
+
+## F. Índice de Documentos
+
+| # | Documento | Descripción |
+|---|-----------|-------------|
+| 01 | `01-arquitectura.md` | Fundamentos, islas, naming @isla, VPN overview |
+| 02 | `02-protocolo.md` | Mensajes, framing, HELLO, LSA, librería de nodos |
+| 03 | `03-shm.md` | Tres regiones SHM, estructuras Rust |
+| 04 | `04-routing.md` | FIB, VPN, algoritmos, OPA |
+| 05 | `05-conectividad.md` | IRP, WAN, LSA entre gateways |
+| 06 | `06-regiones.md` | Detalle de config y LSA regions |
+| 07 | `07-operaciones.md` | Arranque, YAML, systemd |
+| 08 | `08-apendices.md` | Glosario, decisiones, límites |
+| -- | `SY_nodes_spec.md` | Nodos SY (config.routes, etc.) |
+
+---
+
+## G. Referencias Externas
+
+- [OPA WASM](https://www.openpolicyagent.org/docs/latest/wasm/)
+- [Unix domain sockets](https://man7.org/linux/man-pages/man7/unix.7.html)
+- [POSIX shared memory](https://man7.org/linux/man-pages/man7/shm_overview.7.html)
+- [Seqlock](https://en.wikipedia.org/wiki/Seqlock)
+- [YAML 1.2 Spec](https://yaml.org/spec/1.2.2/)
+- [UUID RFC 4122](https://datatracker.ietf.org/doc/html/rfc4122)
