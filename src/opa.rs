@@ -325,9 +325,12 @@ impl OpaWasm {
         let opa_eval_ctx_get_result = instance
             .get_typed_func::<i32, i32>(&mut store, "opa_eval_ctx_get_result")
             .map_err(|_| OpaError::MissingExport("opa_eval_ctx_get_result"))?;
-        let opa_eval = instance
-            .get_typed_func::<i32, i32>(&mut store, "opa_eval")
-            .map_err(|_| OpaError::MissingExport("opa_eval"))?;
+        let opa_eval = match instance.get_typed_func::<i32, i32>(&mut store, "opa_eval") {
+            Ok(func) => func,
+            Err(_) => instance
+                .get_typed_func::<i32, i32>(&mut store, "eval")
+                .map_err(|_| OpaError::MissingExport("opa_eval/eval"))?,
+        };
 
         let opa_eval_ctx_set_data = instance
             .get_typed_func::<(i32, i32), ()>(&mut store, "opa_eval_ctx_set_data")
