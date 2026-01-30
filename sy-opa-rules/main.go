@@ -685,7 +685,7 @@ func (s *Service) applyPolicy(version uint64) error {
 		return OpaError{Code: "SHM_ERROR", Detail: err.Error()}
 	}
 	s.opaRegion.writePolicy(version, wasm, entrypoint)
-	s.broadcastOpaReload(version, hash)
+	s.broadcastOpaReload(version, "sha256:"+hex.EncodeToString(hash[:]))
 	log.Printf("applied opa policy version=%d", version)
 	return nil
 }
