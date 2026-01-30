@@ -23,7 +23,7 @@ Estado de implementación contra la especificación actual (docs/01–09 + SY_no
    - Implementar `/var/run/json-router/sy-opa-rules.lock` (evitar procesos duplicados).
 
 ## Pendientes de API / Control plane
-6) **Endpoints SY.admin (OPA)**
+6) **Endpoints SY.admin (OPA)** ✅
    - Confirmar/implementar:
      - `POST /opa/policy` (compile + apply)
      - `POST /opa/policy/compile` (compile, staged)
@@ -33,7 +33,7 @@ Estado de implementación contra la especificación actual (docs/01–09 + SY_no
      - `GET /opa/policy`
      - `GET /opa/status`
 
-7) **Códigos de error normalizados**
+7) **Códigos de error normalizados** ✅
    - Solo usar: `COMPILE_ERROR`, `NOTHING_STAGED`, `VERSION_MISMATCH`, `NO_BACKUP`, `SHM_ERROR`, `TIMEOUT`.
    - Alinear respuestas de `SY.opa.rules` y `SY.admin`.
 

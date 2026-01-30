@@ -606,7 +606,8 @@ async fn handle_opa_http(
             let Some(version) = req.version else {
                 let resp = serde_json::json!({
                     "status": "error",
-                    "error": "version_required"
+                    "error_code": "VERSION_MISMATCH",
+                    "error_detail": "version_required"
                 });
                 return Ok((400, resp.to_string()));
             };
@@ -621,7 +622,8 @@ async fn handle_opa_http(
     if action.needs_rego() && req.rego.as_deref().unwrap_or("").is_empty() {
         let resp = serde_json::json!({
             "status": "error",
-            "error": "rego_missing"
+            "error_code": "COMPILE_ERROR",
+            "error_detail": "rego_missing"
         });
         return Ok((400, resp.to_string()));
     }

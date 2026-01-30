@@ -625,7 +625,7 @@ func (s *Service) handleCommand(msg Message) {
 		if err := json.Unmarshal(msg.Payload, &req); err != nil {
 			s.sendCommandResponse(msg, action, map[string]any{
 				"status":       "error",
-				"error_code":   "INVALID_PAYLOAD",
+				"error_code":   "COMPILE_ERROR",
 				"error_detail": err.Error(),
 			})
 			return
