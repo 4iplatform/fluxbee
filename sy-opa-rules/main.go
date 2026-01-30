@@ -3,6 +3,7 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -1133,9 +1134,35 @@ func normalizeWasmBytes(data []byte) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode gzip wasm: %w", err)
 		}
-		return decoded, nil
+		data = decoded
+	}
+	if len(data) >= 4 && bytes.Equal(data[:4], []byte{0x00, 0x61, 0x73, 0x6d}) {
+		return data, nil
+	}
+	if wasm, err := extractWasmFromBundle(data); err == nil {
+		return wasm, nil
 	}
 	return data, nil
+}
+
+func extractWasmFromBundle(data []byte) ([]byte, error) {
+	tr := tar.NewReader(bytes.NewReader(data))
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		if strings.HasSuffix(hdr.Name, ".wasm") {
+			return io.ReadAll(tr)
+		}
+	}
+	return nil, fmt.Errorf("no wasm entry found in bundle")
 }
 
 func validateWasm(wasm []byte) error {
