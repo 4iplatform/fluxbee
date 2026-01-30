@@ -1146,6 +1146,7 @@ func extractWasmFromBundle(data []byte, entrypoint string) ([]byte, error) {
 	var entrypointMatch []byte
 	var policyMatch []byte
 	var opaEvalMatch []byte
+	debug := os.Getenv("OPA_DEBUG_BUNDLE") == "1"
 	entrypoint = strings.TrimPrefix(entrypoint, "/")
 	entrypoint = strings.TrimSuffix(entrypoint, "/")
 	entrypointFile := ""
@@ -1169,7 +1170,11 @@ func extractWasmFromBundle(data []byte, entrypoint string) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			if bytes.Contains(wasm, []byte("opa_eval")) {
+			hasEval := wasmHasExport(wasm, "opa_eval")
+			if debug {
+				log.Printf("bundle wasm entry=%s size=%d opa_eval=%v", hdr.Name, len(wasm), hasEval)
+			}
+			if hasEval {
 				opaEvalMatch = wasm
 			}
 			if entrypoint != "" && strings.HasSuffix(hdr.Name, entrypoint+".wasm") {
@@ -1184,18 +1189,104 @@ func extractWasmFromBundle(data []byte, entrypoint string) ([]byte, error) {
 		}
 	}
 	if opaEvalMatch != nil {
+		if debug {
+			log.Printf("bundle selected wasm by export opa_eval")
+		}
 		return opaEvalMatch, nil
 	}
 	if entrypointMatch != nil {
+		if debug {
+			log.Printf("bundle selected wasm by entrypoint")
+		}
 		return entrypointMatch, nil
 	}
 	if policyMatch != nil {
+		if debug {
+			log.Printf("bundle selected wasm policy.wasm")
+		}
 		return policyMatch, nil
 	}
 	if fallback != nil {
+		if debug {
+			log.Printf("bundle selected wasm fallback")
+		}
 		return fallback, nil
 	}
 	return nil, fmt.Errorf("no wasm entry found in bundle")
+}
+
+func wasmHasExport(wasm []byte, name string) bool {
+	if len(wasm) < 8 {
+		return false
+	}
+	if !bytes.Equal(wasm[:4], []byte{0x00, 0x61, 0x73, 0x6d}) {
+		return false
+	}
+	off := 8
+	for off < len(wasm) {
+		sectionID := wasm[off]
+		off++
+		secLen, n := readU32LEB(wasm[off:])
+		if n == 0 {
+			return false
+		}
+		off += n
+		if off+int(secLen) > len(wasm) {
+			return false
+		}
+		if sectionID == 7 {
+			sec := wasm[off : off+int(secLen)]
+			count, n := readU32LEB(sec)
+			if n == 0 {
+				return false
+			}
+			cursor := n
+			for i := 0; i < int(count); i++ {
+				nameLen, n := readU32LEB(sec[cursor:])
+				if n == 0 {
+					return false
+				}
+				cursor += n
+				if cursor+int(nameLen) > len(sec) {
+					return false
+				}
+				expName := string(sec[cursor : cursor+int(nameLen)])
+				cursor += int(nameLen)
+				if cursor >= len(sec) {
+					return false
+				}
+				cursor++ // kind
+				_, n = readU32LEB(sec[cursor:])
+				if n == 0 {
+					return false
+				}
+				cursor += n
+				if expName == name {
+					return true
+				}
+			}
+			return false
+		}
+		off += int(secLen)
+	}
+	return false
+}
+
+func readU32LEB(data []byte) (uint32, int) {
+	var result uint32
+	var shift uint
+	for i := 0; i < len(data); i++ {
+		b := data[i]
+		result |= uint32(b&0x7f) << shift
+		if b&0x80 == 0 {
+			return result, i + 1
+		}
+		shift += 7
+		if shift >= 32 {
+			break
+		}
+	}
+	return 0, 0
 }
 
 func validateWasm(wasm []byte) error {
