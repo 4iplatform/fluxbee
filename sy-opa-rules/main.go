@@ -543,6 +543,7 @@ func (s *Service) handleCommand(msg Message) {
 
 func (s *Service) handleQuery(msg Message) {
 	action := strings.ToLower(msg.Meta.Action)
+	log.Printf("query received action=%s src=%s", action, msg.Routing.Src)
 	switch action {
 	case "get_policy":
 		meta, rego := readCurrentPolicy()

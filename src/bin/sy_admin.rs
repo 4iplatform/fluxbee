@@ -266,7 +266,12 @@ async fn broadcast_config_changed(
         })?,
     };
     client.send(&msg).await?;
-    tracing::info!(subsystem = subsystem, version = version, "config changed broadcast sent");
+    tracing::info!(
+        subsystem = subsystem,
+        action = action.as_deref().unwrap_or(""),
+        version = version,
+        "config changed broadcast sent"
+    );
     Ok(())
 }
 
@@ -718,11 +723,10 @@ async fn send_opa_query(
         version: "1.0".to_string(),
     };
     let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
-    let dst = if let Some(island) = target.as_deref() {
-        Destination::Unicast(format!("SY.opa.rules@{}", island))
-    } else {
-        Destination::Broadcast
-    };
+    let target_pattern = target
+        .as_deref()
+        .map(|island| format!("SY.opa.rules@{}", island));
+    let dst = Destination::Broadcast;
     let msg = Message {
         routing: Routing {
             src: client.uuid().to_string(),
@@ -735,7 +739,7 @@ async fn send_opa_query(
             action: Some(action.to_string()),
             msg: None,
             scope: None,
-            target: None,
+            target: target_pattern,
             priority: None,
             context: None,
         },
