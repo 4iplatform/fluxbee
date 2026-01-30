@@ -851,9 +851,9 @@ async fn send_admin_request(
     request: AdminRequest,
 ) -> Result<serde_json::Value, AdminError> {
     let node_config = NodeConfig {
-        name: "SY.admin".to_string(),
+        name: "SY.admin.request".to_string(),
         router_socket: ctx.socket_dir.clone(),
-        uuid_persistence_dir: ctx.state_dir.join("nodes"),
+        uuid_persistence_dir: ctx.state_dir.join("requests"),
         config_dir: ctx.config_dir.clone(),
         version: "1.0".to_string(),
     };
