@@ -291,6 +291,7 @@ struct AdminRequest {
     action: String,
     payload: serde_json::Value,
     target: String,
+    unicast: Option<String>,
 }
 
 enum OpaAction {
@@ -644,6 +645,13 @@ fn parse_query(query: &str) -> HashMap<String, String> {
     params
 }
 
+fn load_node_uuid(dir: &Path, base_name: &str) -> Result<String, AdminError> {
+    let path = dir.join(format!("{base_name}.uuid"));
+    let data = fs::read_to_string(&path)?;
+    let uuid = Uuid::parse_str(data.trim())?;
+    Ok(uuid.to_string())
+}
+
 async fn respond_json(
     stream: &mut tokio::net::TcpStream,
     status: u16,
@@ -825,10 +833,16 @@ fn build_admin_request(
     } else {
         format!("{}@{}", base, island_id)
     };
+    let unicast = if target.ends_with(&format!("@{}", ctx.island_id)) {
+        load_node_uuid(&ctx.state_dir.join("nodes"), base).ok()
+    } else {
+        None
+    };
     AdminRequest {
         action: action.to_string(),
         payload,
         target,
+        unicast,
     }
 }
 
@@ -844,10 +858,14 @@ async fn send_admin_request(
         version: "1.0".to_string(),
     };
     let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let dst = request
+        .unicast
+        .clone()
+        .unwrap_or_else(|| request.target.clone());
     let msg = Message {
         routing: Routing {
             src: client.uuid().to_string(),
-            dst: Destination::Unicast(request.target),
+            dst: Destination::Unicast(dst),
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
         },
@@ -855,7 +873,7 @@ async fn send_admin_request(
             msg_type: "admin".to_string(),
             msg: None,
             scope: None,
-            target: None,
+            target: Some(request.target.clone()),
             action: Some(request.action.clone()),
             priority: None,
             context: None,
