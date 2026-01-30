@@ -891,6 +891,7 @@ func (s *Service) sendConfigResponse(dst, action string, version uint64, status 
 		"wasm_size_bytes": meta.WasmSize,
 		"hash":            meta.Hash,
 	}
+	log.Printf("config response action=%s version=%d hash=%s", action, version, meta.Hash)
 	s.sendSystemMessage(dst, "CONFIG_RESPONSE", payload)
 }
 
@@ -955,6 +956,11 @@ func (s *Service) sendQueryResponse(msg Message, action string, payload map[stri
 			Action: action,
 		},
 		Payload: mustJSON(payload),
+	}
+	if version, ok := payload["version"]; ok {
+		log.Printf("query response action=%s version=%v", action, version)
+	} else {
+		log.Printf("query response action=%s", action)
 	}
 	s.routerConn.Send(resp)
 }

@@ -38,7 +38,7 @@ Estado de implementación contra la especificación actual (docs/01–09 + SY_no
    - Alinear respuestas de `SY.opa.rules` y `SY.admin`.
 
 ## Pendientes de observabilidad
-8) **Logs OPA mínimos por evento**
+8) **Logs OPA mínimos por evento** ✅
    - Router: loggear acción (`compile/apply/rollback`) y versión al recibir `CONFIG_CHANGED`.
    - `SY.opa.rules`: log de `query` y `config_response` con versión y hash.
 

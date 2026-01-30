@@ -589,6 +589,18 @@ async fn handle_node(
                             )
                             .await;
                             tracing::info!("config changed applied");
+                            if msg.meta.action.as_deref().is_some_and(|v| v == "compile" || v == "apply" || v == "rollback") {
+                                let version = msg
+                                    .payload
+                                    .get("version")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                tracing::info!(
+                                    action = ?msg.meta.action,
+                                    version = version,
+                                    "opa config changed received"
+                                );
+                            }
                             let src_uuid = Uuid::parse_str(&msg.routing.src).ok();
                             let local_senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = {
                                 let nodes_guard = nodes.lock().await;
