@@ -446,6 +446,12 @@ func (s *Service) loadCurrentPolicy() error {
 		log.Printf("opa wasm error: %v", err)
 		return err
 	}
+	if !wasmHasExport(wasm, "opa_eval") {
+		s.lastError = "opa wasm missing export: opa_eval"
+		s.opaRegion.writeStatus(opaStatusError)
+		log.Printf("opa wasm error: %s", s.lastError)
+		return errors.New(s.lastError)
+	}
 	entrypoint := meta.Entrypoint
 	if entrypoint == "" {
 		entrypoint = defaultEntrypoint
@@ -670,6 +676,12 @@ func (s *Service) applyPolicy(version uint64) error {
 	}
 	if err := validateWasm(wasm); err != nil {
 		return OpaError{Code: "COMPILE_ERROR", Detail: err.Error()}
+	}
+	if !wasmHasExport(wasm, "opa_eval") {
+		return OpaError{Code: "COMPILE_ERROR", Detail: "opa wasm missing export: opa_eval"}
+	}
+	if !wasmHasExport(wasm, "opa_eval") {
+		return OpaError{Code: "COMPILE_ERROR", Detail: "opa wasm missing export: opa_eval"}
 	}
 	hash := sha256.Sum256(wasm)
 	meta.Version = version
@@ -1110,6 +1122,9 @@ func compileRego(rego string, entrypoint string) ([]byte, string, int64, error) 
 	}
 	if err := validateWasm(wasm); err != nil {
 		return nil, "", 0, err
+	}
+	if !wasmHasExport(wasm, "opa_eval") {
+		return nil, "", 0, fmt.Errorf("opa wasm missing export: opa_eval")
 	}
 	if len(wasm) > opaMaxWasmSize {
 		return nil, "", 0, fmt.Errorf("wasm too large (%d bytes)", len(wasm))
