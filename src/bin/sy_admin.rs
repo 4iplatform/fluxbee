@@ -259,7 +259,7 @@ async fn broadcast_config_changed(
         },
         payload: serde_json::to_value(ConfigChangedPayload {
             subsystem: subsystem.to_string(),
-            action,
+            action: action.clone(),
             auto_apply,
             version,
             config,
