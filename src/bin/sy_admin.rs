@@ -17,6 +17,7 @@ use jsr_client::protocol::{
     SYSTEM_KIND,
 };
 
+type AdminError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Deserialize)]
 struct IslandFile {
@@ -70,7 +71,7 @@ struct VpnConfig {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), AdminError> {
     if cfg!(not(target_os = "linux")) {
         eprintln!("sy_admin supports only Linux targets.");
         std::process::exit(1);
@@ -223,7 +224,7 @@ async fn run_broadcast_loop(
     }
 }
 
-fn load_island(config_dir: &Path) -> Result<IslandFile, Box<dyn std::error::Error>> {
+fn load_island(config_dir: &Path) -> Result<IslandFile, AdminError> {
     let data = fs::read_to_string(config_dir.join("island.yaml"))?;
     Ok(serde_yaml::from_str(&data)?)
 }
@@ -236,7 +237,7 @@ async fn broadcast_config_changed(
     version: u64,
     config: serde_json::Value,
     target_island: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), AdminError> {
     let dst = match target_island {
         Some(island) => Destination::Unicast(format!("SY.opa.rules@{}", island)),
         None => Destination::Broadcast,
@@ -385,7 +386,7 @@ async fn run_http_server(
     listen: &str,
     tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: AdminContext,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), AdminError> {
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(addr = %listen, "sy.admin http listening");
     loop {
@@ -404,7 +405,7 @@ async fn handle_http(
     stream: &mut tokio::net::TcpStream,
     tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: &AdminContext,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), AdminError> {
     let (method, path, headers, body) = read_http_request(stream).await?;
     let (path, query) = split_path_query(&path);
     match (method.as_str(), path) {
@@ -569,7 +570,7 @@ async fn handle_http(
 
 async fn read_http_request(
     stream: &mut tokio::net::TcpStream,
-) -> Result<(String, String, HashMap<String, String>, Vec<u8>), Box<dyn std::error::Error>> {
+) -> Result<(String, String, HashMap<String, String>, Vec<u8>), AdminError> {
     let mut buf = Vec::new();
     let mut header_end = None;
     loop {
@@ -647,7 +648,7 @@ async fn respond_json(
     stream: &mut tokio::net::TcpStream,
     status: u16,
     body: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), AdminError> {
     let status_line = match status {
         200 => "HTTP/1.1 200 OK",
         400 => "HTTP/1.1 400 Bad Request",
@@ -666,7 +667,7 @@ async fn respond_json(
 fn next_opa_version(
     state_dir: &Path,
     requested: Option<u64>,
-) -> Result<u64, Box<dyn std::error::Error>> {
+) -> Result<u64, AdminError> {
     let path = state_dir.join("opa-version.txt");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -695,7 +696,7 @@ async fn handle_opa_http(
     ctx: &AdminContext,
     mut req: OpaRequest,
     action: OpaAction,
-) -> Result<(u16, String), Box<dyn std::error::Error>> {
+) -> Result<(u16, String), AdminError> {
     let version = match action {
         OpaAction::Apply => {
             let Some(version) = req.version else {
@@ -762,7 +763,7 @@ async fn handle_opa_query(
     ctx: &AdminContext,
     action: &str,
     target: Option<String>,
-) -> Result<(u16, String), Box<dyn std::error::Error>> {
+) -> Result<(u16, String), AdminError> {
     let responses = send_opa_query(ctx, action, target.clone()).await?;
     Ok(build_opa_query_response(ctx, action, responses, target))
 }
@@ -771,7 +772,7 @@ async fn handle_admin_query(
     ctx: &AdminContext,
     action: &str,
     island: Option<String>,
-) -> Result<(u16, String), Box<dyn std::error::Error>> {
+) -> Result<(u16, String), AdminError> {
     let request = build_admin_request(ctx, action, serde_json::json!({}), island);
     let response = send_admin_request(ctx, request).await;
     Ok(build_admin_http_response(action, response))
@@ -782,9 +783,26 @@ async fn handle_admin_command(
     action: &str,
     payload: serde_json::Value,
     island: Option<String>,
-) -> Result<(u16, String), Box<dyn std::error::Error>> {
+) -> Result<(u16, String), AdminError> {
     let request = build_admin_request(ctx, action, payload, island);
+    let target_island = extract_island_from_target(&request.target);
     let response = send_admin_request(ctx, request).await;
+    if let Ok(ref payload) = response {
+        if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
+            if status == "ok" {
+                if matches!(
+                    action,
+                    "add_route" | "delete_route" | "add_vpn" | "delete_vpn"
+                ) {
+                    if let Err(err) =
+                        broadcast_full_config(ctx, action, target_island.as_deref()).await
+                    {
+                        tracing::warn!("broadcast after admin action failed: {err}");
+                    }
+                }
+            }
+        }
+    }
     Ok(build_admin_http_response(action, response))
 }
 
@@ -817,7 +835,7 @@ fn build_admin_request(
 async fn send_admin_request(
     ctx: &AdminContext,
     request: AdminRequest,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+) -> Result<serde_json::Value, AdminError> {
     let node_config = NodeConfig {
         name: "SY.admin".to_string(),
         router_socket: ctx.socket_dir.clone(),
@@ -868,7 +886,7 @@ async fn send_admin_request(
 
 fn build_admin_http_response(
     action: &str,
-    response: Result<serde_json::Value, Box<dyn std::error::Error>>,
+    response: Result<serde_json::Value, AdminError>,
 ) -> (u16, String) {
     match response {
         Ok(payload) => {
@@ -900,6 +918,56 @@ fn build_admin_http_response(
     }
 }
 
+fn extract_island_from_target(target: &str) -> Option<String> {
+    target.split_once('@').map(|(_, island)| island.to_string())
+}
+
+async fn broadcast_full_config(
+    ctx: &AdminContext,
+    action: &str,
+    target_island: Option<&str>,
+) -> Result<(), AdminError> {
+    let list_action = if action.contains("route") {
+        "list_routes"
+    } else {
+        "list_vpns"
+    };
+    let list_req = build_admin_request(ctx, list_action, serde_json::json!({}), target_island.map(|s| s.to_string()));
+    let response = send_admin_request(ctx, list_req).await?;
+    let payload = response
+        .get("status")
+        .and_then(|v| v.as_str())
+        .filter(|v| *v == "ok")
+        .and_then(|_| response.get("routes").or_else(|| response.get("vpns")))
+        .ok_or("list response missing routes/vpns")?;
+    let config = if list_action == "list_routes" {
+        serde_json::json!({ "routes": payload })
+    } else {
+        serde_json::json!({ "vpns": payload })
+    };
+
+    let node_config = NodeConfig {
+        name: "SY.admin".to_string(),
+        router_socket: ctx.socket_dir.clone(),
+        uuid_persistence_dir: ctx.state_dir.join("nodes"),
+        config_dir: ctx.config_dir.clone(),
+        version: "1.0".to_string(),
+    };
+    let mut client = NodeClient::connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let subsystem = if list_action == "list_routes" { "routes" } else { "vpn" };
+    broadcast_config_changed(
+        &mut client,
+        subsystem,
+        None,
+        None,
+        0,
+        config,
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
 async fn send_opa_action(
     ctx: &AdminContext,
     action: &str,
@@ -908,7 +976,7 @@ async fn send_opa_action(
     entrypoint: Option<String>,
     auto_apply: Option<bool>,
     target: Option<String>,
-) -> Result<Vec<OpaResponseEntry>, Box<dyn std::error::Error>> {
+) -> Result<Vec<OpaResponseEntry>, AdminError> {
     let node_config = NodeConfig {
         name: "SY.admin".to_string(),
         router_socket: ctx.socket_dir.clone(),
@@ -944,7 +1012,7 @@ async fn send_opa_query(
     ctx: &AdminContext,
     action: &str,
     target: Option<String>,
-) -> Result<Vec<OpaQueryEntry>, Box<dyn std::error::Error>> {
+) -> Result<Vec<OpaQueryEntry>, AdminError> {
     let node_config = NodeConfig {
         name: "SY.admin".to_string(),
         router_socket: ctx.socket_dir.clone(),
