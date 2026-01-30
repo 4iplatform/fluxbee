@@ -719,9 +719,9 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 			CompiledAt: time.Now().UTC().Format(time.RFC3339),
 			WasmSize:   len(wasm),
 		}
-		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta); err != nil {
-			return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
-		}
+        if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta, cfg.Rego); err != nil {
+            return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
+        }
 		if action == "compile_apply" || autoApply {
 			if err := s.applyPolicy(version); err != nil {
 				code, detail := classifyOpaError(err)
@@ -769,9 +769,9 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 			CompiledAt: time.Now().UTC().Format(time.RFC3339),
 			WasmSize:   len(wasm),
 		}
-		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta); err != nil {
-			return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
-		}
+        if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta, cfg.Rego); err != nil {
+            return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
+        }
 		if broadcast {
 			s.sendConfigResponse(src, action, version, "ok", meta, compileMs)
 		}
@@ -784,10 +784,13 @@ func (s *Service) applyPolicy(version uint64) error {
 	stagedDir := filepath.Join(stateDir, "staged")
 	stagedMeta := filepath.Join(stagedDir, "metadata.json")
 	stagedWasm := filepath.Join(stagedDir, "policy.wasm")
+	stagedRego := filepath.Join(stagedDir, "policy.rego")
 	wasm, err := os.ReadFile(stagedWasm)
 	if err != nil {
 		return OpaError{Code: "NOTHING_STAGED", Detail: "staged policy missing"}
 	}
+	regoBytes, _ := os.ReadFile(stagedRego)
+	rego := string(regoBytes)
 	meta, _ := readMetadata(stagedMeta)
 	entrypoint := meta.Entrypoint
 	if entrypoint == "" {
@@ -817,7 +820,7 @@ func (s *Service) applyPolicy(version uint64) error {
 	backupDir := filepath.Join(stateDir, "backup")
 	currentDir := filepath.Join(stateDir, "current")
 	_ = copyDir(currentDir, backupDir)
-	if err := writePolicyFiles(currentDir, wasm, meta); err != nil {
+	if err := writePolicyFiles(currentDir, wasm, meta, rego); err != nil {
 		return OpaError{Code: "SHM_ERROR", Detail: err.Error()}
 	}
 	s.opaRegion.writePolicy(version, wasm, entrypoint)
@@ -830,10 +833,13 @@ func (s *Service) rollbackPolicy() error {
 	backupDir := filepath.Join(stateDir, "backup")
 	backupMeta := filepath.Join(backupDir, "metadata.json")
 	backupWasm := filepath.Join(backupDir, "policy.wasm")
+	backupRego := filepath.Join(backupDir, "policy.rego")
 	wasm, err := os.ReadFile(backupWasm)
 	if err != nil {
 		return OpaError{Code: "NO_BACKUP", Detail: "backup policy missing"}
 	}
+	regoBytes, _ := os.ReadFile(backupRego)
+	rego := string(regoBytes)
 	meta, _ := readMetadata(backupMeta)
 	entrypoint := meta.Entrypoint
 	if entrypoint == "" {
@@ -852,7 +858,7 @@ func (s *Service) rollbackPolicy() error {
 	meta.Hash = "sha256:" + hex.EncodeToString(hash[:])
 	meta.CompiledAt = time.Now().UTC().Format(time.RFC3339)
 	meta.WasmSize = len(wasm)
-	if err := writePolicyFiles(currentDir, wasm, meta); err != nil {
+	if err := writePolicyFiles(currentDir, wasm, meta, rego); err != nil {
 		return OpaError{Code: "SHM_ERROR", Detail: err.Error()}
 	}
 	s.opaRegion.writePolicy(meta.Version, wasm, entrypoint)
@@ -1453,12 +1459,17 @@ func validateWasm(wasm []byte) error {
 	return nil
 }
 
-func writePolicyFiles(dir string, wasm []byte, meta PolicyMetadata) error {
+func writePolicyFiles(dir string, wasm []byte, meta PolicyMetadata, rego string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(dir, "policy.wasm"), wasm, 0o644); err != nil {
 		return err
+	}
+	if rego != "" {
+		if err := os.WriteFile(filepath.Join(dir, "policy.rego"), []byte(rego), 0o644); err != nil {
+			return err
+		}
 	}
 	return writeMetadata(filepath.Join(dir, "metadata.json"), meta)
 }
