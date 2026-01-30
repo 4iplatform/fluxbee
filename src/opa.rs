@@ -489,12 +489,13 @@ fn eval_builtin(
     builtin_id: i32,
     args: &[i32],
 ) -> i32 {
-    let name = caller
+    let mut name = caller
         .data()
         .builtin_names
         .get(builtin_id as usize)
         .cloned()
         .unwrap_or_else(|| format!("builtin#{builtin_id}"));
+    name = normalize_builtin_name(&name);
     let values: Result<Vec<Value>, _> =
         args.iter().map(|addr| dump_value(caller, *addr)).collect();
     let Ok(values) = values else {
@@ -545,6 +546,15 @@ fn eval_builtin(
                 }
             }
             _ => Err("regex.find_n expects (string,string,number)".to_string()),
+        },
+        "regex.replace" => match (values.get(0), values.get(1), values.get(2)) {
+            (Some(Value::String(pattern)), Some(Value::String(text)), Some(Value::String(repl))) => {
+                match regex::Regex::new(pattern) {
+                    Ok(re) => Ok(Value::String(re.replace_all(text, repl.as_str()).to_string())),
+                    Err(err) => Err(format!("regex.replace error: {err}")),
+                }
+            }
+            _ => Err("regex.replace expects (string,string,string)".to_string()),
         },
         "regex.find_all_string_submatch_n" => match (values.get(0), values.get(1), values.get(2)) {
             (Some(Value::String(pattern)), Some(Value::String(text)), Some(Value::Number(n))) => {
@@ -721,6 +731,10 @@ fn eval_builtin(
             }
             _ => Err("indexof expects (string,string)".to_string()),
         },
+        "array.length" => match values.get(0) {
+            Some(Value::Array(items)) => Ok(Value::Number((items.len() as i64).into())),
+            _ => Err("array.length expects (array)".to_string()),
+        },
         "sprintf" => match (values.get(0), values.get(1)) {
             (Some(Value::String(fmt)), Some(Value::Array(args))) => {
                 sprintf_simple(fmt, args)
@@ -796,6 +810,16 @@ fn eval_builtin(
             }
             _ => Err("object.get expects (object,string,any?)".to_string()),
         },
+        "object.keys" => match values.get(0) {
+            Some(Value::Object(map)) => {
+                Ok(Value::Array(map.keys().cloned().map(Value::String).collect()))
+            }
+            _ => Err("object.keys expects (object)".to_string()),
+        },
+        "object.values" => match values.get(0) {
+            Some(Value::Object(map)) => Ok(Value::Array(map.values().cloned().collect())),
+            _ => Err("object.values expects (object)".to_string()),
+        },
         "object.remove" => match (values.get(0), values.get(1)) {
             (Some(Value::Object(map)), Some(Value::String(key))) => {
                 let mut out = map.clone();
@@ -843,6 +867,10 @@ fn eval_builtin(
             },
             _ => Err("json.unmarshal expects (string)".to_string()),
         },
+        "json.is_valid" => match values.get(0) {
+            Some(Value::String(text)) => Ok(Value::Bool(serde_json::from_str::<Value>(text).is_ok())),
+            _ => Err("json.is_valid expects (string)".to_string()),
+        },
         "is_null" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_null()))),
         "is_boolean" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_boolean()))),
         "is_number" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_number()))),
@@ -868,6 +896,29 @@ fn eval_builtin(
             0
         }
     }
+}
+
+fn normalize_builtin_name(name: &str) -> String {
+    if let Some(stripped) = name.strip_prefix("strings.") {
+        return match stripped {
+            "contains" => "contains",
+            "has_prefix" | "startswith" | "starts_with" => "startswith",
+            "has_suffix" | "endswith" | "ends_with" => "endswith",
+            "lower" | "to_lower" | "lowercase" => "lower",
+            "upper" | "to_upper" | "uppercase" => "upper",
+            "trim" | "trim_space" => "trim",
+            "trim_left" | "trim_left_space" | "trim_start" => "trim_left",
+            "trim_right" | "trim_right_space" | "trim_end" => "trim_right",
+            "replace" => "replace",
+            "substring" => "substring",
+            "indexof" => "indexof",
+            "split" => "strings.split",
+            "concat" => "concat",
+            _ => stripped,
+        }
+        .to_string();
+    }
+    name.to_string()
 }
 
 fn glob_to_regex(pattern: &str, delims: &[char]) -> String {
