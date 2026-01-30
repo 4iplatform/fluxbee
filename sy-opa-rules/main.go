@@ -38,6 +38,7 @@ const (
 	routerSockDir       = "/var/run/json-router/routers"
 	lockPath            = "/var/run/json-router/sy-opa-rules.lock"
 	opaShmPrefix        = "/jsr-opa-"
+	routerShmPrefix     = "/jsr-"
 	opaMagic            = 0x4A534F50 // "JSOP"
 	opaVersion          = 1
 	opaMaxWasmSize      = 4 * 1024 * 1024
@@ -47,6 +48,11 @@ const (
 	opaHeaderSize       = 192
 	defaultEntrypoint   = "router/target"
 	defaultNodeBaseName = "SY.opa.rules"
+)
+
+const (
+	routerMagic   = 0x4A535352 // "JSSR"
+	routerVersion = 2
 )
 
 type IslandConfig struct {
@@ -152,6 +158,32 @@ type OpaRegion struct {
 	mu       sync.Mutex
 }
 
+type RouterHeader struct {
+	Magic            uint32
+	Version          uint32
+	RouterUUID       [16]byte
+	OwnerPID         uint32
+	Pad0             uint32
+	OwnerStartTime   uint64
+	Generation       uint64
+	Seq              uint64
+	NodeCount        uint32
+	NodeMax          uint32
+	CreatedAt        uint64
+	UpdatedAt        uint64
+	Heartbeat        uint64
+	IslandID         [64]byte
+	IslandIDLen      uint16
+	RouterName       [64]byte
+	RouterNameLen    uint16
+	IsGateway        uint8
+	FlagsReserved    [3]byte
+	OpaPolicyVersion uint64
+	OpaLoadStatus    uint8
+	OpaPad           [7]byte
+	Reserved         [6]byte
+}
+
 type Service struct {
 	islandID   string
 	nodeUUID   uuid.UUID
@@ -160,6 +192,14 @@ type Service struct {
 	opaRegion  *OpaRegion
 
 	lastError string
+}
+
+type RouterStatus struct {
+	RouterID      string `json:"router_id"`
+	PolicyVersion uint64 `json:"policy_version"`
+	LoadStatus    uint8  `json:"load_status"`
+	Status        string `json:"status"`
+	Error         string `json:"error,omitempty"`
 }
 
 func main() {
@@ -413,6 +453,7 @@ func (r *OpaRegion) writeHeader(version uint64, wasm []byte, entrypoint string, 
 }
 
 func (r *OpaRegion) writePolicy(version uint64, wasm []byte, entrypoint string) {
+	r.writeStatus(opaStatusLoading)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(wasm) > opaMaxWasmSize {
@@ -426,6 +467,88 @@ func (r *OpaRegion) writePolicy(version uint64, wasm []byte, entrypoint string) 
 func (r *OpaRegion) policyHash() string {
 	hash := r.mmap[32:64]
 	return "sha256:" + hex.EncodeToString(hash)
+}
+
+func listRouterStatuses() []RouterStatus {
+	entries, err := os.ReadDir(routerSockDir)
+	if err != nil {
+		return nil
+	}
+	var out []RouterStatus
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, "irp-") || !strings.HasSuffix(name, ".sock") {
+			continue
+		}
+		routerID := strings.TrimSuffix(name, ".sock")
+		shmName := routerShmPrefix + routerID
+		status := readRouterStatus(routerID, shmName)
+		out = append(out, status)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].RouterID < out[j].RouterID })
+	return out
+}
+
+func readRouterStatus(routerID, shmName string) RouterStatus {
+	path := filepath.Join("/dev/shm", strings.TrimPrefix(shmName, "/"))
+	fd, err := unix.Open(path, unix.O_RDONLY, 0)
+	if err != nil {
+		return RouterStatus{RouterID: routerID, Status: "error", Error: err.Error()}
+	}
+	defer unix.Close(fd)
+	headerSize := int(unsafe.Sizeof(RouterHeader{}))
+	mmap, err := unix.Mmap(fd, 0, headerSize, unix.PROT_READ, unix.MAP_SHARED)
+	if err != nil {
+		return RouterStatus{RouterID: routerID, Status: "error", Error: err.Error()}
+	}
+	defer unix.Munmap(mmap)
+
+	if len(mmap) < 8 {
+		return RouterStatus{RouterID: routerID, Status: "error", Error: "header too small"}
+	}
+	magic := binary.LittleEndian.Uint32(mmap[0:4])
+	version := binary.LittleEndian.Uint32(mmap[4:8])
+	if magic != routerMagic || version != routerVersion {
+		return RouterStatus{
+			RouterID: routerID,
+			Status:   "error",
+			Error:    fmt.Sprintf("invalid header magic=0x%x version=%d", magic, version),
+		}
+	}
+
+	seqOffset := int(unsafe.Offsetof(RouterHeader{}.Seq))
+	policyOffset := int(unsafe.Offsetof(RouterHeader{}.OpaPolicyVersion))
+	statusOffset := int(unsafe.Offsetof(RouterHeader{}.OpaLoadStatus))
+
+	for i := 0; i < 100; i++ {
+		seq1 := binary.LittleEndian.Uint64(mmap[seqOffset : seqOffset+8])
+		if seq1&1 != 0 {
+			time.Sleep(1 * time.Millisecond)
+			continue
+		}
+		policy := binary.LittleEndian.Uint64(mmap[policyOffset : policyOffset+8])
+		load := mmap[statusOffset]
+		seq2 := binary.LittleEndian.Uint64(mmap[seqOffset : seqOffset+8])
+		if seq1 != seq2 {
+			continue
+		}
+		status := "ok"
+		if load == opaStatusLoading {
+			status = "loading"
+		} else if load == opaStatusError {
+			status = "error"
+		}
+		return RouterStatus{
+			RouterID:      routerID,
+			PolicyVersion: policy,
+			LoadStatus:    load,
+			Status:        status,
+		}
+	}
+	return RouterStatus{RouterID: routerID, Status: "error", Error: "seqlock timeout"}
 }
 
 func (s *Service) loadCurrentPolicy() error {
@@ -568,6 +691,7 @@ func (s *Service) handleQuery(msg Message) {
 			"status":          "ok",
 			"last_error":      s.lastError,
 			"wasm_size_bytes": current.WasmSize,
+			"routers":         listRouterStatuses(),
 		}
 		s.sendQueryResponse(msg, action, resp)
 	}
@@ -676,12 +800,11 @@ func (s *Service) applyPolicy(version uint64) error {
 		version = meta.Version
 	}
 	if err := validateWasm(wasm); err != nil {
+		s.opaRegion.writeStatus(opaStatusError)
 		return OpaError{Code: "COMPILE_ERROR", Detail: err.Error()}
 	}
 	if !wasmHasExport(wasm, "opa_eval") {
-		return OpaError{Code: "COMPILE_ERROR", Detail: "opa wasm missing export: opa_eval"}
-	}
-	if !wasmHasExport(wasm, "opa_eval") {
+		s.opaRegion.writeStatus(opaStatusError)
 		return OpaError{Code: "COMPILE_ERROR", Detail: "opa wasm missing export: opa_eval"}
 	}
 	hash := sha256.Sum256(wasm)
@@ -717,7 +840,12 @@ func (s *Service) rollbackPolicy() error {
 		entrypoint = defaultEntrypoint
 	}
 	if err := validateWasm(wasm); err != nil {
+		s.opaRegion.writeStatus(opaStatusError)
 		return OpaError{Code: "COMPILE_ERROR", Detail: err.Error()}
+	}
+	if !wasmHasExport(wasm, "opa_eval") {
+		s.opaRegion.writeStatus(opaStatusError)
+		return OpaError{Code: "COMPILE_ERROR", Detail: "opa wasm missing export: opa_eval"}
 	}
 	currentDir := filepath.Join(stateDir, "current")
 	hash := sha256.Sum256(wasm)

@@ -7,15 +7,15 @@ Estado de implementación contra la especificación actual (docs/01–09 + SY_no
    - Implementar el set de builtins esperado por OPA WASM (regex, glob, string ops, etc.).
    - Verificar mapeos correctos en el runtime del router.
 
-2) **SHM OPA dedicada (lectura por router)**
-   - Router debe leer **WASM exclusivamente desde** `/dev/shm/jsr-opa-<island>`.
-   - `SY.opa.rules` es el **único writer** de esa región.
+2) **SHM OPA dedicada (lectura por router)** ✅
+   - Router lee **WASM exclusivamente desde** `/dev/shm/jsr-opa-<island>` (via `OpaRegionReader`).
+   - `SY.opa.rules` es el **único writer** de esa región (Go).
 
-3) **Header OPA en SHM**
+3) **Header OPA en SHM** ✅
    - Validar `OPA_MAGIC`, `OPA_VERSION`, `OPA_MAX_WASM_SIZE`.
    - Actualizar `opa_load_status` (LOADING/OK/ERROR) en recargas.
 
-4) **Estado OPA por router**
+4) **Estado OPA por router** ✅
    - `opa_policy_version` y `opa_load_status` en SHM local del router deben reflejar la carga.
    - `SY.opa.rules` debe poder verificar si los routers aplicaron la versión.
 
