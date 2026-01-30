@@ -181,6 +181,18 @@ impl OpaWasm {
     fn instantiate(engine: &Engine, module: &Module) -> Result<Self, OpaError> {
         let mut store = Store::new(engine, OpaRuntimeState::default());
         let mut linker = Linker::new(engine);
+        let mut imported_memory: Option<Memory> = None;
+
+        for import in module.imports() {
+            if import.module() == "env" && import.name() == "memory" {
+                if let wasmtime::ExternType::Memory(mem_ty) = import.ty() {
+                    let memory = Memory::new(&mut store, mem_ty)?;
+                    linker.define(&mut store, "env", "memory", memory)?;
+                    imported_memory = Some(memory);
+                }
+                break;
+            }
+        }
 
         linker.func_wrap("env", "opa_abort", move |mut caller: Caller<'_, OpaRuntimeState>, ptr: i32| {
             if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
@@ -276,6 +288,7 @@ impl OpaWasm {
         let instance = linker.instantiate(&mut store, module)?;
         let memory = instance
             .get_memory(&mut store, "memory")
+            .or(imported_memory)
             .ok_or(OpaError::MissingExport("memory"))?;
         if let Some(builtins) = instance.get_typed_func::<(), i32>(&mut store, "builtins").ok() {
             if let Ok(ptr) = builtins.call(&mut store, ()) {
