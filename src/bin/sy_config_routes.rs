@@ -35,8 +35,8 @@ struct SyConfigFile {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct RouteConfig {
     prefix: String,
-    #[serde(default = "default_match_kind")]
-    match_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    match_kind: Option<String>,
     action: String,
     #[serde(default)]
     next_hop_island: Option<String>,
@@ -49,8 +49,8 @@ struct RouteConfig {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct VpnConfig {
     pattern: String,
-    #[serde(default = "default_match_kind")]
-    match_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    match_kind: Option<String>,
     vpn_id: u32,
     #[serde(default)]
     priority: Option<u16>,
@@ -432,7 +432,7 @@ fn build_routes(routes: &[RouteConfig]) -> Result<Vec<StaticRouteEntry>, Box<dyn
     for route in routes {
         let mut entry = empty_static_route();
         entry.prefix_len = copy_bytes_with_len(&mut entry.prefix, &route.prefix) as u16;
-        entry.match_kind = match_kind(&route.match_kind)?;
+        entry.match_kind = match_kind(route.match_kind.as_deref())?;
         entry.action = action_kind(&route.action)?;
         if let Some(next) = &route.next_hop_island {
             entry.next_hop_island_len =
@@ -452,7 +452,7 @@ fn build_vpns(vpns: &[VpnConfig]) -> Result<Vec<VpnAssignment>, Box<dyn std::err
     for vpn in vpns {
         let mut entry = empty_vpn_assignment();
         entry.pattern_len = copy_bytes_with_len(&mut entry.pattern, &vpn.pattern) as u16;
-        entry.match_kind = match_kind(&vpn.match_kind)?;
+        entry.match_kind = match_kind(vpn.match_kind.as_deref())?;
         entry.vpn_id = vpn.vpn_id;
         entry.priority = vpn.priority.unwrap_or(100);
         entry.flags = FLAG_ACTIVE;
@@ -495,8 +495,8 @@ fn parse_vpns(
     Ok(None)
 }
 
-fn match_kind(value: &str) -> Result<u8, Box<dyn std::error::Error>> {
-    match value {
+fn match_kind(value: Option<&str>) -> Result<u8, Box<dyn std::error::Error>> {
+    match value.unwrap_or("PREFIX") {
         "EXACT" => Ok(MATCH_EXACT),
         "PREFIX" => Ok(MATCH_PREFIX),
         "GLOB" => Ok(MATCH_GLOB),
@@ -510,10 +510,6 @@ fn action_kind(value: &str) -> Result<u8, Box<dyn std::error::Error>> {
         "DROP" => Ok(ACTION_DROP),
         _ => Err("invalid action".into()),
     }
-}
-
-fn default_match_kind() -> String {
-    "PREFIX".to_string()
 }
 
 fn ensure_dir(path: &Path) -> Result<(), std::io::Error> {
