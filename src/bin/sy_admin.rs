@@ -1,13 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use std::future;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -45,6 +46,110 @@ struct AdminContext {
     socket_dir: PathBuf,
     island_id: String,
     authorized_islands: Vec<String>,
+}
+
+struct AdminRouterClient {
+    sender: NodeSender,
+    pending_admin: Mutex<HashMap<String, VecDeque<oneshot::Sender<Message>>>>,
+    system_tx: broadcast::Sender<Message>,
+    query_tx: broadcast::Sender<Message>,
+}
+
+impl AdminRouterClient {
+    fn new(sender: NodeSender) -> Self {
+        let (system_tx, _) = broadcast::channel(256);
+        let (query_tx, _) = broadcast::channel(256);
+        Self {
+            sender,
+            pending_admin: Mutex::new(HashMap::new()),
+            system_tx,
+            query_tx,
+        }
+    }
+
+    async fn connect_with_retry(
+        config: NodeConfig,
+        delay: Duration,
+    ) -> Result<Arc<Self>, jsr_client::NodeError> {
+        loop {
+            match connect(&config).await {
+                Ok((sender, receiver)) => {
+                    let client = Arc::new(Self::new(sender));
+                    client.start(receiver);
+                    return Ok(client);
+                }
+                Err(err) => {
+                    tracing::warn!("connect failed: {err}");
+                    time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    fn start(self: &Arc<Self>, receiver: NodeReceiver) {
+        let client = Arc::clone(self);
+        tokio::spawn(async move {
+            client.recv_loop(receiver).await;
+        });
+    }
+
+    async fn recv_loop(self: Arc<Self>, mut receiver: NodeReceiver) {
+        loop {
+            match receiver.recv().await {
+                Ok(msg) => self.dispatch(msg).await,
+                Err(err) => {
+                    tracing::warn!("router recv error: {err}");
+                }
+            }
+        }
+    }
+
+    async fn dispatch(&self, msg: Message) {
+        if msg.meta.msg_type == "admin" {
+            if let Some(action) = msg.meta.action.clone() {
+                let mut pending = self.pending_admin.lock().await;
+                if let Some(queue) = pending.get_mut(&action) {
+                    if let Some(tx) = queue.pop_front() {
+                        let _ = tx.send(msg);
+                    }
+                    if queue.is_empty() {
+                        pending.remove(&action);
+                    }
+                }
+            }
+            return;
+        }
+        if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some("CONFIG_RESPONSE") {
+            let _ = self.system_tx.send(msg);
+            return;
+        }
+        if msg.meta.msg_type == "query_response" {
+            let _ = self.query_tx.send(msg);
+        }
+    }
+
+    async fn enqueue_admin_waiter(&self, action: String, tx: oneshot::Sender<Message>) {
+        let mut pending = self.pending_admin.lock().await;
+        pending.entry(action).or_default().push_back(tx);
+    }
+
+    async fn drop_admin_waiter(&self, action: String) {
+        let mut pending = self.pending_admin.lock().await;
+        if let Some(queue) = pending.get_mut(&action) {
+            queue.pop_front();
+            if queue.is_empty() {
+                pending.remove(&action);
+            }
+        }
+    }
+
+    fn subscribe_system(&self) -> broadcast::Receiver<Message> {
+        self.system_tx.subscribe()
+    }
+
+    fn subscribe_query(&self) -> broadcast::Receiver<Message> {
+        self.query_tx.subscribe()
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -102,6 +207,20 @@ async fn main() -> Result<(), AdminError> {
         .and_then(|admin| admin.listen)
         .unwrap_or_else(|| "0.0.0.0:8080".to_string());
 
+    let node_config = NodeConfig {
+        name: "SY.admin".to_string(),
+        router_socket: socket_dir.clone(),
+        uuid_persistence_dir: state_dir.join("nodes"),
+        config_dir: config_dir.clone(),
+        version: "1.0".to_string(),
+    };
+    let router_client = AdminRouterClient::connect_with_retry(node_config, Duration::from_secs(1))
+        .await
+        .map_err(|err| {
+            tracing::error!("router client connect failed: {err}");
+            err
+        })?;
+
     let (broadcast_tx, broadcast_rx) = mpsc::unbounded_channel::<BroadcastRequest>();
     let http_tx = broadcast_tx.clone();
     let http_ctx = AdminContext {
@@ -111,17 +230,16 @@ async fn main() -> Result<(), AdminError> {
         island_id,
         authorized_islands,
     };
+    let http_client = router_client.clone();
     tokio::spawn(async move {
-        if let Err(err) = run_http_server(&admin_listen, &http_tx, http_ctx).await {
+        if let Err(err) = run_http_server(&admin_listen, &http_tx, http_ctx, http_client).await {
             tracing::error!("http server error: {err}");
         }
     });
 
-    let loop_config_dir = config_dir.clone();
-    let loop_state_dir = state_dir.clone();
-    let loop_socket_dir = socket_dir.clone();
+    let loop_client = router_client.clone();
     tokio::spawn(async move {
-        run_broadcast_loop(broadcast_rx, loop_config_dir, loop_state_dir, loop_socket_dir).await;
+        run_broadcast_loop(broadcast_rx, loop_client).await;
     });
 
     future::pending::<()>().await;
@@ -149,32 +267,13 @@ struct OpaRequest {
 
 async fn run_broadcast_loop(
     mut rx: mpsc::UnboundedReceiver<BroadcastRequest>,
-    config_dir: PathBuf,
-    state_dir: PathBuf,
-    socket_dir: PathBuf,
+    client: Arc<AdminRouterClient>,
 ) {
-    let node_config = NodeConfig {
-        name: "SY.admin".to_string(),
-        router_socket: socket_dir,
-        uuid_persistence_dir: state_dir.join("nodes"),
-        config_dir: config_dir.clone(),
-        version: "1.0".to_string(),
-    };
-    let (mut sender, mut _receiver) = match connect_with_retry(&node_config, Duration::from_secs(1)).await
-    {
-        Ok((sender, receiver)) => (sender, receiver),
-        Err(err) => {
-            tracing::error!("broadcast loop connect failed: {err}");
-            return;
-        }
-    };
-    tracing::info!("connected to router");
-
     while let Some(req) = rx.recv().await {
         let failed = match req {
             BroadcastRequest::Routes(routes) => {
                 match broadcast_config_changed(
-                    &sender,
+                    &client,
                     "routes",
                     None,
                     None,
@@ -193,7 +292,7 @@ async fn run_broadcast_loop(
             }
             BroadcastRequest::Vpns(vpns) => {
                 match broadcast_config_changed(
-                    &sender,
+                    &client,
                     "vpn",
                     None,
                     None,
@@ -212,16 +311,7 @@ async fn run_broadcast_loop(
             }
         };
         if failed {
-            match connect_with_retry(&node_config, Duration::from_secs(1)).await {
-                Ok((new_sender, new_receiver)) => {
-                    sender = new_sender;
-                    _receiver = new_receiver;
-                    tracing::info!("reconnected to router");
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "reconnect failed");
-                }
-            }
+            tracing::warn!("broadcast failed; message dropped");
         }
     }
 }
@@ -232,7 +322,7 @@ fn load_island(config_dir: &Path) -> Result<IslandFile, AdminError> {
 }
 
 async fn broadcast_config_changed(
-    sender: &NodeSender,
+    client: &AdminRouterClient,
     subsystem: &str,
     action: Option<String>,
     auto_apply: Option<bool>,
@@ -246,7 +336,7 @@ async fn broadcast_config_changed(
     };
     let msg = Message {
         routing: Routing {
-            src: sender.uuid().to_string(),
+            src: client.sender.uuid().to_string(),
             dst,
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
@@ -268,7 +358,7 @@ async fn broadcast_config_changed(
             config,
         })?,
     };
-    sender.send(msg).await?;
+    client.sender.send(msg).await?;
     tracing::info!(
         subsystem = subsystem,
         action = action.as_deref().unwrap_or(""),
@@ -389,6 +479,7 @@ async fn run_http_server(
     listen: &str,
     tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: AdminContext,
+    client: Arc<AdminRouterClient>,
 ) -> Result<(), AdminError> {
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(addr = %listen, "sy.admin http listening");
@@ -396,8 +487,9 @@ async fn run_http_server(
         let (mut stream, _) = listener.accept().await?;
         let tx = tx.clone();
         let ctx = ctx.clone();
+        let client = client.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_http(&mut stream, &tx, &ctx).await {
+            if let Err(err) = handle_http(&mut stream, &tx, &ctx, &client).await {
                 tracing::warn!("http handler error: {err}");
             }
         });
@@ -408,6 +500,7 @@ async fn handle_http(
     stream: &mut tokio::net::TcpStream,
     tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: &AdminContext,
+    client: &AdminRouterClient,
 ) -> Result<(), AdminError> {
     let (method, path, headers, body) = read_http_request(stream).await?;
     let (path, query) = split_path_query(&path);
@@ -417,14 +510,15 @@ async fn handle_http(
         }
         ("GET", "/routes") => {
             let island = query.get("island").cloned();
-            let (status, resp) = handle_admin_query(ctx, "list_routes", island).await?;
+            let (status, resp) = handle_admin_query(ctx, client, "list_routes", island).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/routes") => {
             let route: RouteConfig = serde_json::from_slice(&body)?;
             let island = query.get("island").cloned();
             let (status, resp) =
-                handle_admin_command(ctx, "add_route", serde_json::to_value(route)?, island).await?;
+                handle_admin_command(ctx, client, "add_route", serde_json::to_value(route)?, island)
+                    .await?;
             respond_json(stream, status, &resp).await?;
         }
         ("DELETE", "/routes") => {
@@ -432,19 +526,20 @@ async fn handle_http(
             let island = query.get("island").cloned();
             let payload = serde_json::json!({ "prefix": prefix });
             let (status, resp) =
-                handle_admin_command(ctx, "delete_route", payload, island).await?;
+                handle_admin_command(ctx, client, "delete_route", payload, island).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", "/vpns") => {
             let island = query.get("island").cloned();
-            let (status, resp) = handle_admin_query(ctx, "list_vpns", island).await?;
+            let (status, resp) = handle_admin_query(ctx, client, "list_vpns", island).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/vpns") => {
             let vpn: VpnConfig = serde_json::from_slice(&body)?;
             let island = query.get("island").cloned();
             let (status, resp) =
-                handle_admin_command(ctx, "add_vpn", serde_json::to_value(vpn)?, island).await?;
+                handle_admin_command(ctx, client, "add_vpn", serde_json::to_value(vpn)?, island)
+                    .await?;
             respond_json(stream, status, &resp).await?;
         }
         ("DELETE", "/vpns") => {
@@ -452,12 +547,12 @@ async fn handle_http(
             let island = query.get("island").cloned();
             let payload = serde_json::json!({ "pattern": pattern });
             let (status, resp) =
-                handle_admin_command(ctx, "delete_vpn", payload, island).await?;
+                handle_admin_command(ctx, client, "delete_vpn", payload, island).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", "/nodes") => {
             let island = query.get("island").cloned();
-            let (status, resp) = handle_admin_query(ctx, "list_nodes", island).await?;
+            let (status, resp) = handle_admin_query(ctx, client, "list_nodes", island).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/nodes") => {
@@ -468,7 +563,7 @@ async fn handle_http(
             };
             let island = query.get("island").cloned();
             let (status, resp) =
-                handle_admin_command(ctx, "run_node", payload, island).await?;
+                handle_admin_command(ctx, client, "run_node", payload, island).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("DELETE", "/nodes") => {
@@ -476,12 +571,12 @@ async fn handle_http(
             let island = query.get("island").cloned();
             let payload = serde_json::json!({ "name": name });
             let (status, resp) =
-                handle_admin_command(ctx, "kill_node", payload, island).await?;
+                handle_admin_command(ctx, client, "kill_node", payload, island).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", "/routers") => {
             let island = query.get("island").cloned();
-            let (status, resp) = handle_admin_query(ctx, "list_routers", island).await?;
+            let (status, resp) = handle_admin_query(ctx, client, "list_routers", island).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/routers") => {
@@ -492,7 +587,7 @@ async fn handle_http(
             };
             let island = query.get("island").cloned();
             let (status, resp) =
-                handle_admin_command(ctx, "run_router", payload, island).await?;
+                handle_admin_command(ctx, client, "run_router", payload, island).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("DELETE", "/routers") => {
@@ -500,7 +595,7 @@ async fn handle_http(
             let island = query.get("island").cloned();
             let payload = serde_json::json!({ "name": name });
             let (status, resp) =
-                handle_admin_command(ctx, "kill_router", payload, island).await?;
+                handle_admin_command(ctx, client, "kill_router", payload, island).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("PUT", "/config/routes") => {
@@ -524,27 +619,27 @@ async fn handle_http(
         }
         ("POST", "/opa/policy") => {
             let req: OpaRequest = serde_json::from_slice(&body)?;
-            let (status, resp) = handle_opa_http(ctx, req, OpaAction::CompileApply).await?;
+            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::CompileApply).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/opa/policy/compile") => {
             let req: OpaRequest = serde_json::from_slice(&body)?;
-            let (status, resp) = handle_opa_http(ctx, req, OpaAction::Compile).await?;
+            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Compile).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/opa/policy/apply") => {
             let req: OpaRequest = serde_json::from_slice(&body)?;
-            let (status, resp) = handle_opa_http(ctx, req, OpaAction::Apply).await?;
+            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Apply).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/opa/policy/rollback") => {
             let req: OpaRequest = serde_json::from_slice(&body)?;
-            let (status, resp) = handle_opa_http(ctx, req, OpaAction::Rollback).await?;
+            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Rollback).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/opa/policy/check") => {
             let req: OpaRequest = serde_json::from_slice(&body)?;
-            let (status, resp) = handle_opa_http(ctx, req, OpaAction::Check).await?;
+            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Check).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", "/opa/policy") => {
@@ -552,7 +647,7 @@ async fn handle_http(
                 .get("island")
                 .cloned()
                 .or_else(|| query.get("target").cloned());
-            let (status, resp) = handle_opa_query(ctx, "get_policy", target).await?;
+            let (status, resp) = handle_opa_query(ctx, client, "get_policy", target).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", "/opa/status") => {
@@ -560,7 +655,7 @@ async fn handle_http(
                 .get("island")
                 .cloned()
                 .or_else(|| query.get("target").cloned());
-            let (status, resp) = handle_opa_query(ctx, "get_status", target).await?;
+            let (status, resp) = handle_opa_query(ctx, client, "get_status", target).await?;
             respond_json(stream, status, &resp).await?;
         }
         _ => {
@@ -704,6 +799,7 @@ fn next_opa_version(
 
 async fn handle_opa_http(
     ctx: &AdminContext,
+    client: &AdminRouterClient,
     mut req: OpaRequest,
     action: OpaAction,
 ) -> Result<(u16, String), AdminError> {
@@ -738,6 +834,7 @@ async fn handle_opa_http(
     if matches!(action, OpaAction::Compile | OpaAction::CompileApply | OpaAction::Check) {
         responses = send_opa_action(
             ctx,
+            client,
             "compile",
             version,
             req.rego.clone(),
@@ -753,7 +850,7 @@ async fn handle_opa_http(
 
     if action.apply_after() {
         let apply_responses =
-            send_opa_action(ctx, "apply", version, None, None, None, target.clone()).await?;
+            send_opa_action(ctx, client, "apply", version, None, None, None, target.clone()).await?;
         if apply_responses.is_empty() || apply_responses.iter().any(|r| r.status != "ok") {
             let mut combined = responses;
             combined.extend(apply_responses);
@@ -762,8 +859,17 @@ async fn handle_opa_http(
         responses.extend(apply_responses);
     } else if matches!(action, OpaAction::Apply | OpaAction::Rollback) {
         let apply_action = action.as_str();
-        responses =
-            send_opa_action(ctx, apply_action, version, None, None, None, target.clone()).await?;
+        responses = send_opa_action(
+            ctx,
+            client,
+            apply_action,
+            version,
+            None,
+            None,
+            None,
+            target.clone(),
+        )
+        .await?;
     }
 
     Ok(build_opa_http_response(ctx, action, version, responses, target))
@@ -771,32 +877,35 @@ async fn handle_opa_http(
 
 async fn handle_opa_query(
     ctx: &AdminContext,
+    client: &AdminRouterClient,
     action: &str,
     target: Option<String>,
 ) -> Result<(u16, String), AdminError> {
-    let responses = send_opa_query(ctx, action, target.clone()).await?;
+    let responses = send_opa_query(ctx, client, action, target.clone()).await?;
     Ok(build_opa_query_response(ctx, action, responses, target))
 }
 
 async fn handle_admin_query(
     ctx: &AdminContext,
+    client: &AdminRouterClient,
     action: &str,
     island: Option<String>,
 ) -> Result<(u16, String), AdminError> {
     let request = build_admin_request(ctx, action, serde_json::json!({}), island);
-    let response = send_admin_request(ctx, request).await;
+    let response = send_admin_request(client, request).await;
     Ok(build_admin_http_response(action, response))
 }
 
 async fn handle_admin_command(
     ctx: &AdminContext,
+    client: &AdminRouterClient,
     action: &str,
     payload: serde_json::Value,
     island: Option<String>,
 ) -> Result<(u16, String), AdminError> {
     let request = build_admin_request(ctx, action, payload, island);
     let target_island = extract_island_from_target(&request.target);
-    let response = send_admin_request(ctx, request).await;
+    let response = send_admin_request(client, request).await;
     if let Ok(ref payload) = response {
         if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
             if status == "ok" {
@@ -805,7 +914,7 @@ async fn handle_admin_command(
                     "add_route" | "delete_route" | "add_vpn" | "delete_vpn"
                 ) {
                     if let Err(err) =
-                        broadcast_full_config(ctx, action, target_island.as_deref()).await
+                        broadcast_full_config(ctx, client, action, target_island.as_deref()).await
                     {
                         tracing::warn!("broadcast after admin action failed: {err}");
                     }
@@ -849,27 +958,20 @@ fn build_admin_request(
 }
 
 async fn send_admin_request(
-    ctx: &AdminContext,
+    client: &AdminRouterClient,
     request: AdminRequest,
 ) -> Result<serde_json::Value, AdminError> {
-    let node_config = NodeConfig {
-        name: "SY.admin.request".to_string(),
-        router_socket: ctx.socket_dir.clone(),
-        uuid_persistence_dir: ctx.state_dir.join("requests"),
-        config_dir: ctx.config_dir.clone(),
-        version: "1.0".to_string(),
-    };
-    let (sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     let dst = request
         .unicast
         .clone()
         .unwrap_or_else(|| request.target.clone());
+    let trace_id = Uuid::new_v4().to_string();
     let msg = Message {
         routing: Routing {
-            src: sender.uuid().to_string(),
+            src: client.sender.uuid().to_string(),
             dst: Destination::Unicast(dst),
             ttl: 16,
-            trace_id: Uuid::new_v4().to_string(),
+            trace_id,
         },
         meta: Meta {
             msg_type: "admin".to_string(),
@@ -882,26 +984,24 @@ async fn send_admin_request(
         },
         payload: request.payload,
     };
-    sender.send(msg).await?;
+    let (tx, rx) = oneshot::channel::<Message>();
+    client
+        .enqueue_admin_waiter(request.action.clone(), tx)
+        .await;
+    client.sender.send(msg).await?;
 
     use tokio::time::{timeout, Instant};
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let msg = match timeout(remaining, receiver.recv()).await {
-            Ok(Ok(msg)) => msg,
-            Ok(Err(err)) => return Err(err.into()),
-            Err(_) => break,
-        };
-        if msg.meta.msg_type != "admin" {
-            continue;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let msg = match timeout(remaining, rx).await {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(_)) => return Err("admin response channel closed".into()),
+        Err(_) => {
+            client.drop_admin_waiter(request.action.clone()).await;
+            return Err("admin request timeout".into());
         }
-        if msg.meta.action.as_deref() != Some(request.action.as_str()) {
-            continue;
-        }
-        return Ok(msg.payload);
-    }
-    Err("admin request timeout".into())
+    };
+    Ok(msg.payload)
 }
 
 fn build_admin_http_response(
@@ -944,6 +1044,7 @@ fn extract_island_from_target(target: &str) -> Option<String> {
 
 async fn broadcast_full_config(
     ctx: &AdminContext,
+    client: &AdminRouterClient,
     action: &str,
     target_island: Option<&str>,
 ) -> Result<(), AdminError> {
@@ -953,7 +1054,7 @@ async fn broadcast_full_config(
         "list_vpns"
     };
     let list_req = build_admin_request(ctx, list_action, serde_json::json!({}), target_island.map(|s| s.to_string()));
-    let response = send_admin_request(ctx, list_req).await?;
+    let response = send_admin_request(client, list_req).await?;
     let payload = response
         .get("status")
         .and_then(|v| v.as_str())
@@ -966,17 +1067,9 @@ async fn broadcast_full_config(
         serde_json::json!({ "vpns": payload })
     };
 
-    let node_config = NodeConfig {
-        name: "SY.admin".to_string(),
-        router_socket: ctx.socket_dir.clone(),
-        uuid_persistence_dir: ctx.state_dir.join("nodes"),
-        config_dir: ctx.config_dir.clone(),
-        version: "1.0".to_string(),
-    };
-    let (sender, _receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     let subsystem = if list_action == "list_routes" { "routes" } else { "vpn" };
     broadcast_config_changed(
-        &sender,
+        client,
         subsystem,
         None,
         None,
@@ -990,6 +1083,7 @@ async fn broadcast_full_config(
 
 async fn send_opa_action(
     ctx: &AdminContext,
+    client: &AdminRouterClient,
     action: &str,
     version: u64,
     rego: Option<String>,
@@ -997,14 +1091,6 @@ async fn send_opa_action(
     auto_apply: Option<bool>,
     target: Option<String>,
 ) -> Result<Vec<OpaResponseEntry>, AdminError> {
-    let node_config = NodeConfig {
-        name: "SY.admin".to_string(),
-        router_socket: ctx.socket_dir.clone(),
-        uuid_persistence_dir: ctx.state_dir.join("nodes"),
-        config_dir: ctx.config_dir.clone(),
-        version: "1.0".to_string(),
-    };
-    let (sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     let mut cfg = serde_json::json!({});
     if let Some(rego) = rego {
         cfg = serde_json::json!({
@@ -1013,7 +1099,7 @@ async fn send_opa_action(
         });
     }
     broadcast_config_changed(
-        &sender,
+        client,
         "opa",
         Some(action.to_string()),
         auto_apply,
@@ -1024,30 +1110,24 @@ async fn send_opa_action(
     .await?;
 
     let expected = expected_islands(ctx, target.as_deref());
+    let mut receiver = client.subscribe_system();
     let responses = collect_opa_responses(&mut receiver, action, version, &expected).await;
     Ok(responses)
 }
 
 async fn send_opa_query(
     ctx: &AdminContext,
+    client: &AdminRouterClient,
     action: &str,
     target: Option<String>,
 ) -> Result<Vec<OpaQueryEntry>, AdminError> {
-    let node_config = NodeConfig {
-        name: "SY.admin".to_string(),
-        router_socket: ctx.socket_dir.clone(),
-        uuid_persistence_dir: ctx.state_dir.join("nodes"),
-        config_dir: ctx.config_dir.clone(),
-        version: "1.0".to_string(),
-    };
-    let (sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     let target_pattern = target
         .as_deref()
         .map(|island| format!("SY.opa.rules@{}", island));
     let dst = Destination::Broadcast;
     let msg = Message {
         routing: Routing {
-            src: sender.uuid().to_string(),
+            src: client.sender.uuid().to_string(),
             dst,
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
@@ -1063,9 +1143,10 @@ async fn send_opa_query(
         },
         payload: serde_json::json!({}),
     };
-    sender.send(msg).await?;
+    client.sender.send(msg).await?;
 
     let expected = expected_islands(ctx, target.as_deref());
+    let mut receiver = client.subscribe_query();
     let responses = collect_opa_query_responses(&mut receiver, action, &expected).await;
     Ok(responses)
 }
@@ -1085,7 +1166,7 @@ fn expected_islands(ctx: &AdminContext, target: Option<&str>) -> Vec<String> {
 }
 
 async fn collect_opa_responses(
-    receiver: &mut NodeReceiver,
+    receiver: &mut broadcast::Receiver<Message>,
     action: &str,
     version: u64,
     expected: &[String],
@@ -1099,6 +1180,7 @@ async fn collect_opa_responses(
         let remaining = deadline.saturating_duration_since(Instant::now());
         let msg = match timeout(remaining, receiver.recv()).await {
             Ok(Ok(msg)) => msg,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(err)) => {
                 tracing::warn!("opa response recv error: {err}");
                 break;
@@ -1142,7 +1224,7 @@ async fn collect_opa_responses(
 }
 
 async fn collect_opa_query_responses(
-    receiver: &mut NodeReceiver,
+    receiver: &mut broadcast::Receiver<Message>,
     action: &str,
     expected: &[String],
 ) -> Vec<OpaQueryEntry> {
@@ -1155,6 +1237,7 @@ async fn collect_opa_query_responses(
         let remaining = deadline.saturating_duration_since(Instant::now());
         let msg = match timeout(remaining, receiver.recv()).await {
             Ok(Ok(msg)) => msg,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(err)) => {
                 tracing::warn!("opa query recv error: {err}");
                 break;
@@ -1189,21 +1272,6 @@ async fn collect_opa_query_responses(
     }
 
     responses.into_values().collect()
-}
-
-async fn connect_with_retry(
-    config: &NodeConfig,
-    delay: Duration,
-) -> Result<(NodeSender, NodeReceiver), jsr_client::NodeError> {
-    loop {
-        match connect(config).await {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                tracing::warn!("connect failed: {err}");
-                time::sleep(delay).await;
-            }
-        }
-    }
 }
 
 fn build_opa_http_response(
