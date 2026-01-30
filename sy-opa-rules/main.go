@@ -1109,7 +1109,7 @@ func compileRego(rego string, entrypoint string) ([]byte, string, int64, error) 
 		return nil, "", 0, err
 	}
 	wasm := buf.Bytes()
-	wasm, normErr := normalizeWasmBytes(wasm)
+	wasm, normErr := normalizeWasmBytes(wasm, entrypoint)
 	if normErr != nil {
 		return nil, "", 0, normErr
 	}
@@ -1123,7 +1123,7 @@ func compileRego(rego string, entrypoint string) ([]byte, string, int64, error) 
 	return wasm, "sha256:" + hex.EncodeToString(hash[:]), time.Since(start).Milliseconds(), nil
 }
 
-func normalizeWasmBytes(data []byte) ([]byte, error) {
+func normalizeWasmBytes(data []byte, entrypoint string) ([]byte, error) {
 	if len(data) >= 4 && bytes.Equal(data[:4], []byte{0x1f, 0x8b, 0x08, 0x00}) {
 		reader, err := gzip.NewReader(bytes.NewReader(data))
 		if err != nil {
@@ -1139,15 +1139,24 @@ func normalizeWasmBytes(data []byte) ([]byte, error) {
 	if len(data) >= 4 && bytes.Equal(data[:4], []byte{0x00, 0x61, 0x73, 0x6d}) {
 		return data, nil
 	}
-	if wasm, err := extractWasmFromBundle(data); err == nil {
+	if wasm, err := extractWasmFromBundle(data, entrypoint); err == nil {
 		return wasm, nil
 	}
 	return data, nil
 }
 
-func extractWasmFromBundle(data []byte) ([]byte, error) {
+func extractWasmFromBundle(data []byte, entrypoint string) ([]byte, error) {
 	tr := tar.NewReader(bytes.NewReader(data))
 	var fallback []byte
+	var entrypointMatch []byte
+	var policyMatch []byte
+	entrypoint = strings.TrimPrefix(entrypoint, "/")
+	entrypoint = strings.TrimSuffix(entrypoint, "/")
+	entrypointFile := ""
+	if entrypoint != "" {
+		parts := strings.Split(entrypoint, "/")
+		entrypointFile = parts[len(parts)-1] + ".wasm"
+	}
 	for {
 		hdr, err := tr.Next()
 		if err != nil {
@@ -1164,13 +1173,22 @@ func extractWasmFromBundle(data []byte) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			if strings.HasSuffix(hdr.Name, "policy.wasm") {
-				return wasm, nil
-			}
-			if fallback == nil {
+			if entrypoint != "" && strings.HasSuffix(hdr.Name, entrypoint+".wasm") {
+				entrypointMatch = wasm
+			} else if entrypointFile != "" && strings.HasSuffix(hdr.Name, entrypointFile) {
+				entrypointMatch = wasm
+			} else if strings.HasSuffix(hdr.Name, "policy.wasm") {
+				policyMatch = wasm
+			} else if fallback == nil {
 				fallback = wasm
 			}
 		}
+	}
+	if entrypointMatch != nil {
+		return entrypointMatch, nil
+	}
+	if policyMatch != nil {
+		return policyMatch, nil
 	}
 	if fallback != nil {
 		return fallback, nil
