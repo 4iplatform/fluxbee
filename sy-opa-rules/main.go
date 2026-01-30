@@ -429,16 +429,22 @@ func (r *OpaRegion) policyHash() string {
 }
 
 func (s *Service) loadCurrentPolicy() error {
-	currentRego := filepath.Join(stateDir, "current", "policy.rego")
 	metaPath := filepath.Join(stateDir, "current", "metadata.json")
-	data, err := os.ReadFile(currentRego)
+	wasmPath := filepath.Join(stateDir, "current", "policy.wasm")
+	meta := PolicyMetadata{}
+	if metaBytes, err := os.ReadFile(metaPath); err == nil {
+		_ = json.Unmarshal(metaBytes, &meta)
+	}
+	wasm, err := os.ReadFile(wasmPath)
 	if err != nil {
 		s.opaRegion.writeStatus(opaStatusOK)
 		return nil
 	}
-	meta := PolicyMetadata{}
-	if metaBytes, err := os.ReadFile(metaPath); err == nil {
-		_ = json.Unmarshal(metaBytes, &meta)
+	if err := validateWasm(wasm); err != nil {
+		s.lastError = err.Error()
+		s.opaRegion.writeStatus(opaStatusError)
+		log.Printf("opa wasm error: %v", err)
+		return err
 	}
 	entrypoint := meta.Entrypoint
 	if entrypoint == "" {
@@ -448,23 +454,12 @@ func (s *Service) loadCurrentPolicy() error {
 	if version == 0 {
 		version = 1
 	}
-	wasm, hash, compileMs, err := compileRego(string(data), entrypoint)
-	if err != nil {
-		s.lastError = err.Error()
-		s.opaRegion.writeStatus(opaStatusError)
-		log.Printf("opa compile error: %v", err)
-		return err
-	}
+	hash := sha256.Sum256(wasm)
+	meta.Hash = "sha256:" + hex.EncodeToString(hash[:])
+	meta.WasmSize = len(wasm)
 	s.opaRegion.writePolicy(version, wasm, entrypoint)
-	meta = PolicyMetadata{
-		Version:    version,
-		Hash:       hash,
-		Entrypoint: entrypoint,
-		CompiledAt: time.Now().UTC().Format(time.RFC3339),
-		WasmSize:   len(wasm),
-	}
 	_ = writeMetadata(metaPath, meta)
-	log.Printf("loaded current policy version=%d compile_time_ms=%d", version, compileMs)
+	log.Printf("loaded current policy version=%d", version)
 	return nil
 }
 
@@ -593,7 +588,7 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 			CompiledAt: time.Now().UTC().Format(time.RFC3339),
 			WasmSize:   len(wasm),
 		}
-		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), cfg.Rego, meta); err != nil {
+		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta); err != nil {
 			return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
 		}
 		if action == "compile_apply" || autoApply {
@@ -643,7 +638,7 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 			CompiledAt: time.Now().UTC().Format(time.RFC3339),
 			WasmSize:   len(wasm),
 		}
-		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), cfg.Rego, meta); err != nil {
+		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta); err != nil {
 			return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
 		}
 		if broadcast {
@@ -656,9 +651,9 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 
 func (s *Service) applyPolicy(version uint64) error {
 	stagedDir := filepath.Join(stateDir, "staged")
-	stagedRego := filepath.Join(stagedDir, "policy.rego")
 	stagedMeta := filepath.Join(stagedDir, "metadata.json")
-	rego, err := os.ReadFile(stagedRego)
+	stagedWasm := filepath.Join(stagedDir, "policy.wasm")
+	wasm, err := os.ReadFile(stagedWasm)
 	if err != nil {
 		return OpaError{Code: "NOTHING_STAGED", Detail: "staged policy missing"}
 	}
@@ -673,12 +668,12 @@ func (s *Service) applyPolicy(version uint64) error {
 	if version == 0 {
 		version = meta.Version
 	}
-	wasm, hash, _, err := compileRego(string(rego), entrypoint)
-	if err != nil {
+	if err := validateWasm(wasm); err != nil {
 		return OpaError{Code: "COMPILE_ERROR", Detail: err.Error()}
 	}
+	hash := sha256.Sum256(wasm)
 	meta.Version = version
-	meta.Hash = hash
+	meta.Hash = "sha256:" + hex.EncodeToString(hash[:])
 	meta.Entrypoint = entrypoint
 	meta.CompiledAt = time.Now().UTC().Format(time.RFC3339)
 	meta.WasmSize = len(wasm)
@@ -686,7 +681,7 @@ func (s *Service) applyPolicy(version uint64) error {
 	backupDir := filepath.Join(stateDir, "backup")
 	currentDir := filepath.Join(stateDir, "current")
 	_ = copyDir(currentDir, backupDir)
-	if err := writePolicyFiles(currentDir, string(rego), meta); err != nil {
+	if err := writePolicyFiles(currentDir, wasm, meta); err != nil {
 		return OpaError{Code: "SHM_ERROR", Detail: err.Error()}
 	}
 	s.opaRegion.writePolicy(version, wasm, entrypoint)
@@ -697,9 +692,9 @@ func (s *Service) applyPolicy(version uint64) error {
 
 func (s *Service) rollbackPolicy() error {
 	backupDir := filepath.Join(stateDir, "backup")
-	backupRego := filepath.Join(backupDir, "policy.rego")
 	backupMeta := filepath.Join(backupDir, "metadata.json")
-	rego, err := os.ReadFile(backupRego)
+	backupWasm := filepath.Join(backupDir, "policy.wasm")
+	wasm, err := os.ReadFile(backupWasm)
 	if err != nil {
 		return OpaError{Code: "NO_BACKUP", Detail: "backup policy missing"}
 	}
@@ -708,15 +703,15 @@ func (s *Service) rollbackPolicy() error {
 	if entrypoint == "" {
 		entrypoint = defaultEntrypoint
 	}
-	wasm, hash, _, err := compileRego(string(rego), entrypoint)
-	if err != nil {
+	if err := validateWasm(wasm); err != nil {
 		return OpaError{Code: "COMPILE_ERROR", Detail: err.Error()}
 	}
 	currentDir := filepath.Join(stateDir, "current")
-	meta.Hash = hash
+	hash := sha256.Sum256(wasm)
+	meta.Hash = "sha256:" + hex.EncodeToString(hash[:])
 	meta.CompiledAt = time.Now().UTC().Format(time.RFC3339)
 	meta.WasmSize = len(wasm)
-	if err := writePolicyFiles(currentDir, string(rego), meta); err != nil {
+	if err := writePolicyFiles(currentDir, wasm, meta); err != nil {
 		return OpaError{Code: "SHM_ERROR", Detail: err.Error()}
 	}
 	s.opaRegion.writePolicy(meta.Version, wasm, entrypoint)
@@ -1150,6 +1145,7 @@ func extractWasmFromBundle(data []byte, entrypoint string) ([]byte, error) {
 	var fallback []byte
 	var entrypointMatch []byte
 	var policyMatch []byte
+	var opaEvalMatch []byte
 	entrypoint = strings.TrimPrefix(entrypoint, "/")
 	entrypoint = strings.TrimSuffix(entrypoint, "/")
 	entrypointFile := ""
@@ -1173,6 +1169,9 @@ func extractWasmFromBundle(data []byte, entrypoint string) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
+			if bytes.Contains(wasm, []byte("opa_eval")) {
+				opaEvalMatch = wasm
+			}
 			if entrypoint != "" && strings.HasSuffix(hdr.Name, entrypoint+".wasm") {
 				entrypointMatch = wasm
 			} else if entrypointFile != "" && strings.HasSuffix(hdr.Name, entrypointFile) {
@@ -1183,6 +1182,9 @@ func extractWasmFromBundle(data []byte, entrypoint string) ([]byte, error) {
 				fallback = wasm
 			}
 		}
+	}
+	if opaEvalMatch != nil {
+		return opaEvalMatch, nil
 	}
 	if entrypointMatch != nil {
 		return entrypointMatch, nil
@@ -1210,11 +1212,11 @@ func validateWasm(wasm []byte) error {
 	return nil
 }
 
-func writePolicyFiles(dir string, rego string, meta PolicyMetadata) error {
+func writePolicyFiles(dir string, wasm []byte, meta PolicyMetadata) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "policy.rego"), []byte(rego), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "policy.wasm"), wasm, 0o644); err != nil {
 		return err
 	}
 	return writeMetadata(filepath.Join(dir, "metadata.json"), meta)
