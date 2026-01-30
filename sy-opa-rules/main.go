@@ -1147,6 +1147,7 @@ func normalizeWasmBytes(data []byte) ([]byte, error) {
 
 func extractWasmFromBundle(data []byte) ([]byte, error) {
 	tr := tar.NewReader(bytes.NewReader(data))
+	var fallback []byte
 	for {
 		hdr, err := tr.Next()
 		if err != nil {
@@ -1159,8 +1160,20 @@ func extractWasmFromBundle(data []byte) ([]byte, error) {
 			continue
 		}
 		if strings.HasSuffix(hdr.Name, ".wasm") {
-			return io.ReadAll(tr)
+			wasm, err := io.ReadAll(tr)
+			if err != nil {
+				return nil, err
+			}
+			if strings.HasSuffix(hdr.Name, "policy.wasm") {
+				return wasm, nil
+			}
+			if fallback == nil {
+				fallback = wasm
+			}
 		}
+	}
+	if fallback != nil {
+		return fallback, nil
 	}
 	return nil, fmt.Errorf("no wasm entry found in bundle")
 }
