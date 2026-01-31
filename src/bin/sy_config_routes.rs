@@ -141,7 +141,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if msg.meta.msg_type != SYSTEM_KIND || msg.meta.msg.as_deref() != Some(MSG_CONFIG_CHANGED) {
                     continue;
                 }
-                let payload: ConfigChangedPayload = match serde_json::from_value(msg.payload) {
+                let payload_value = msg.payload.clone();
+                let payload: ConfigChangedPayload = match serde_json::from_value(payload_value) {
                     Ok(payload) => payload,
                     Err(err) => {
                         tracing::warn!("invalid config changed payload: {err}");
@@ -154,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Some("INVALID_PAYLOAD".to_string()),
                             Some(err.to_string()),
                             &island_id,
-                        );
+                        ).await;
                         continue;
                     }
                 };
@@ -188,7 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Some("INVALID_CONFIG".to_string()),
                                     Some(err.to_string()),
                                     &island_id,
-                                );
+                                ).await;
                                 continue;
                             }
                         };
@@ -210,7 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Some("INVALID_CONFIG".to_string()),
                                     Some(err.to_string()),
                                     &island_id,
-                                );
+                                ).await;
                                 continue;
                             }
                         };
@@ -247,7 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Some("APPLY_FAILED".to_string()),
                         Some(err.to_string()),
                         &island_id,
-                    );
+                    ).await;
                     continue;
                 }
                 if let Err(err) = write_config(&config_dir, &next_config) {
@@ -261,7 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Some("PERSIST_FAILED".to_string()),
                         Some(err.to_string()),
                         &island_id,
-                    );
+                    ).await;
                     continue;
                 }
                 sy_config = next_config;
@@ -280,13 +281,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None,
                     None,
                     &island_id,
-                );
+                ).await;
             }
         }
     }
 }
 
-fn send_config_response(
+async fn send_config_response(
     sender: &NodeSender,
     request: &Message,
     subsystem: &str,
@@ -326,7 +327,7 @@ fn send_config_response(
         },
         payload,
     };
-    sender.send(reply)?;
+    sender.send(reply).await?;
     Ok(())
 }
 
