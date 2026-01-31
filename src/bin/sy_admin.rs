@@ -465,7 +465,7 @@ struct OpaQueryEntry {
 
 async fn run_http_server(
     listen: &str,
-    _tx: &mpsc::UnboundedSender<BroadcastRequest>,
+    tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: AdminContext,
     client: Arc<AdminRouterClient>,
 ) -> Result<(), AdminError> {
