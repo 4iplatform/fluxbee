@@ -259,6 +259,21 @@ Key documents:
 - `04-routing.md` - FIB, VPNs, OPA integration
 - `10-identity-layer3.md` - Identity system and L3 routing
 
+### Functional Specification (Docs)
+
+The functional specification lives in `docs/`. There is no cross-navigation between files yet, so here is the full index:
+- `01-arquitectura.md` - Architecture overview
+- `02-protocolo.md` - Protocol and node library behavior
+- `03-shm.md` - Shared memory regions and layout
+- `04-routing.md` - Routing, FIB, VPNs, OPA integration
+- `05-conectividad.md` - WAN connectivity and gateway behavior
+- `06-regiones.md` - Config/LSA regions and update flows
+- `07-operaciones.md` - Ops, deployment, and admin workflows
+- `08-apendices.md` - Appendix and reference notes
+- `09-router-status.md` - Router implementation status checklist
+- `10-identity-layer3.md` - Identity system and L3 routing
+- `SY_nodes_spec.md` - System nodes specification
+
 ---
 
 ## License
