@@ -1,7 +1,7 @@
 # JSON Router - 08 Apéndices
 
-**Estado:** v1.13  
-**Fecha:** 2025-01-20  
+**Estado:** v1.15  
+**Fecha:** 2026-01-31  
 **Audiencia:** Todos (referencia)
 
 ---
@@ -25,6 +25,12 @@
 - **ILK (Capa 3)**: Interlocutor Key. Identificador único de entidades que conversan (personas, agentes, sistemas). Formato: `ilk:<uuid>`.
 
 - **Framing**: Delimitación de mensajes (4 bytes length prefix, big-endian).
+
+### Mensajes de Sistema
+
+- **CONFIG_CHANGED**: Broadcast emitido por SY.admin para distribuir cambios de configuración. Contiene `subsystem`, `version` y `config`.
+
+- **CONFIG_RESPONSE**: Unicast de respuesta a CONFIG_CHANGED. Confirma aplicación (`status: ok`) o reporta error (`status: error`). Obligatorio para todos los nodos SY que reciben configuración.
 
 ### Islas y Conectividad
 

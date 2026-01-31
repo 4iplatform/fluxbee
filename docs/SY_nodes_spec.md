@@ -1,8 +1,8 @@
 # JSON Router - Nodos SY (System)
 
-**Estado:** Draft v0.13
-**Fecha:** 2025-01-29
-**Documento relacionado:** JSON Router Especificación Técnica v1.13
+**Estado:** v1.15
+**Fecha:** 2026-01-31
+**Documento relacionado:** Fluxbee Especificación Técnica v1.15
 
 ---
 
@@ -40,15 +40,255 @@ Los nodos SY (System) son componentes de infraestructura que proveen servicios e
 | `SY.admin` | Rust | Único global (mother) | Especificado | Gateway HTTP REST para toda la infraestructura |
 | `SY.orchestrator` | Rust | Uno por isla | Especificado | Orquestación de routers y nodos |
 | `SY.config.routes` | Rust | Uno por isla | Especificado | Configuración de rutas estáticas y VPNs |
-| `SY.opa.rules` | **Go** | Uno por isla | **Especificado v0.13** | Compilación y gestión de policies OPA |
+| `SY.opa.rules` | **Go** | Uno por isla | Especificado | Compilación y gestión de policies OPA |
+| `SY.identity` | Rust | Uno por isla | Especificado | Registro de ILKs, degrees, modules |
 | `SY.time` | Rust | Uno por isla | Por especificar | Sincronización de tiempo |
 | `SY.log` | Rust | Uno por isla | Por especificar | Colector de logs |
+
+### 1.4 Patrón CONFIG_CHANGED / CONFIG_RESPONSE
+
+Todo nodo SY que reciba configuración via broadcast CONFIG_CHANGED **DEBE** responder con CONFIG_RESPONSE. Este patrón permite a SY.admin:
+
+1. Confirmar que la configuración fue aplicada
+2. Detectar errores de validación o aplicación
+3. Identificar islas/nodos caídos (timeout sin respuesta)
+
+**Subsystems que usan este patrón:**
+
+| Subsystem | Nodo responsable | Descripción |
+|-----------|------------------|-------------|
+| `routes` | SY.config.routes | Rutas estáticas |
+| `vpn` | SY.config.routes | Tabla VPN |
+| `opa` | SY.opa.rules | Policies OPA |
+| `identity` | SY.identity | ILKs, modules, degrees |
+
+**Flujo estándar:**
+
+```
+SY.admin
+    │
+    ├─── broadcast CONFIG_CHANGED
+    │    {
+    │      subsystem: "<subsystem>",
+    │      version: N,
+    │      config: { ... }
+    │    }
+    │
+    │         ┌───────────────────────────────────────┐
+    │         ▼                                       ▼
+    │   SY.<nodo>@island-A                    SY.<nodo>@island-B
+    │         │                                       │
+    │         │ (validate, apply)                     │ (validate, apply)
+    │         │                                       │
+    │         ▼                                       ▼
+    │   CONFIG_RESPONSE                        CONFIG_RESPONSE
+    │   (status: ok/error)                    (status: ok/error)
+    │         │                                       │
+    └─────────┴───────────────┬───────────────────────┘
+                              │
+                              ▼
+                         SY.admin
+                 (collects responses, timeout 5s)
+```
+
+**Mensaje CONFIG_RESPONSE estándar:**
+
+```json
+{
+  "routing": {
+    "src": "<uuid-nodo-sy>",
+    "dst": "<uuid-sy-admin>",
+    "ttl": 16,
+    "trace_id": "<uuid-del-config-changed>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "CONFIG_RESPONSE"
+  },
+  "payload": {
+    "subsystem": "<subsystem>",
+    "version": N,
+    "island": "<island-id>",
+    "node": "SY.<nodo>@<island>",
+    "status": "ok|error",
+    "error_code": "<code>",           // Solo si status=error
+    "error_message": "<descripción>"  // Solo si status=error
+  }
+}
+```
+
+**Reglas:**
+
+1. El `trace_id` **DEBE** coincidir con el del CONFIG_CHANGED para correlación
+2. El response es **unicast** a SY.admin, no broadcast
+3. Timeout: SY.admin espera ~5 segundos para respuestas
+4. Si una isla no responde, se asume proceso caído (alerta operacional)
+5. Si `status=error`, el nodo **NO** debe aplicar la configuración
 
 ---
 
 ## 2. SY.config.routes
 
-[Contenido sin cambios - ver documento original]
+Responsable de la configuración de rutas estáticas y tabla VPN.
+
+### 2.1 Resumen
+
+| Aspecto | Valor |
+|---------|-------|
+| Lenguaje | Rust |
+| Nombre L2 | `SY.config.routes@<isla>` (uno por isla) |
+| Región SHM | `/dev/shm/jsr-config-<island>` |
+| Persistencia disco | `/etc/json-router/sy-config-routes.yaml` |
+| Subsystems | `routes`, `vpn` |
+
+### 2.2 Mensajes: CONFIG_CHANGED
+
+**Agregar ruta (broadcast):**
+
+```json
+{
+  "routing": {
+    "src": "<uuid-sy-admin>",
+    "dst": "broadcast",
+    "ttl": 16,
+    "trace_id": "<uuid>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "CONFIG_CHANGED"
+  },
+  "payload": {
+    "subsystem": "routes",
+    "version": 42,
+    "config": {
+      "routes": [
+        {
+          "prefix": "AI.ventas.*",
+          "match_kind": "PREFIX",
+          "action": "FORWARD",
+          "metric": 10
+        }
+      ]
+    }
+  }
+}
+```
+
+**Agregar VPN (broadcast):**
+
+```json
+{
+  "payload": {
+    "subsystem": "vpn",
+    "version": 43,
+    "config": {
+      "vpns": [
+        {
+          "pattern": "AI.soporte.*",
+          "match_kind": "PREFIX",
+          "vpn_id": 10
+        }
+      ]
+    }
+  }
+}
+```
+
+### 2.3 Mensajes: CONFIG_RESPONSE
+
+**Respuesta OK:**
+
+```json
+{
+  "routing": {
+    "src": "<uuid-sy-config-routes>",
+    "dst": "<uuid-sy-admin>",
+    "ttl": 16,
+    "trace_id": "<uuid-del-config-changed>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "CONFIG_RESPONSE"
+  },
+  "payload": {
+    "subsystem": "routes",
+    "version": 42,
+    "island": "production",
+    "node": "SY.config.routes@production",
+    "status": "ok"
+  }
+}
+```
+
+**Respuesta ERROR:**
+
+```json
+{
+  "payload": {
+    "subsystem": "routes",
+    "version": 42,
+    "island": "staging",
+    "node": "SY.config.routes@staging",
+    "status": "error",
+    "error_code": "INVALID_PATTERN",
+    "error_message": "Pattern 'AI.[invalid' has unclosed bracket"
+  }
+}
+```
+
+### 2.4 Códigos de Error
+
+| Código | Descripción |
+|--------|-------------|
+| `DUPLICATE_PREFIX` | Ya existe ruta con ese prefix |
+| `PREFIX_NOT_FOUND` | Ruta no existe (en delete) |
+| `INVALID_PATTERN` | Formato de pattern inválido |
+| `INVALID_ACTION` | Acción desconocida |
+| `MAX_ROUTES_EXCEEDED` | Límite de 256 rutas alcanzado |
+| `DUPLICATE_VPN_PATTERN` | Ya existe VPN con ese pattern |
+| `MAX_VPNS_EXCEEDED` | Límite de 256 VPNs alcanzado |
+
+### 2.5 Procesamiento
+
+```rust
+fn handle_config_changed(&mut self, msg: &Message) {
+    let payload = &msg.payload;
+    let trace_id = &msg.routing.trace_id;
+    let admin_uuid = &msg.routing.src;
+    
+    // 1. Verificar subsystem
+    if payload.subsystem != "routes" && payload.subsystem != "vpn" {
+        return;  // No me incumbe
+    }
+    
+    // 2. Verificar versión (idempotencia)
+    if payload.version <= self.last_version {
+        self.send_response(trace_id, admin_uuid, &payload.subsystem, 
+                          payload.version, "ok", None);
+        return;
+    }
+    
+    // 3. Validar configuración
+    if let Err(e) = self.validate(&payload.config) {
+        self.send_response(trace_id, admin_uuid, &payload.subsystem,
+                          payload.version, "error", Some(e));
+        return;
+    }
+    
+    // 4. Aplicar a SHM
+    self.write_to_shm(&payload.config);
+    
+    // 5. Persistir a disco
+    self.persist_to_yaml(&payload.config);
+    
+    // 6. Actualizar versión
+    self.last_version = payload.version;
+    
+    // 7. Confirmar
+    self.send_response(trace_id, admin_uuid, &payload.subsystem,
+                      payload.version, "ok", None);
+}
+```
 
 ---
 

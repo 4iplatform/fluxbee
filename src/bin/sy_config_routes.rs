@@ -74,6 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_dir(&state_dir)?;
 
     let island = load_island(&config_dir)?;
+    let island_id = island.island_id.clone();
     let router_socket = match std::env::var("JSR_ROUTER_NAME") {
         Ok(router_name) => {
             let router_l2_name = ensure_l2_name(&router_name, &island.island_id);
@@ -140,7 +141,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if msg.meta.msg_type != SYSTEM_KIND || msg.meta.msg.as_deref() != Some(MSG_CONFIG_CHANGED) {
                     continue;
                 }
-                let payload: ConfigChangedPayload = serde_json::from_value(msg.payload)?;
+                let payload: ConfigChangedPayload = match serde_json::from_value(msg.payload) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        tracing::warn!("invalid config changed payload: {err}");
+                        let _ = send_config_response(
+                            &sender,
+                            &msg,
+                            "unknown",
+                            0,
+                            "error",
+                            Some("INVALID_PAYLOAD".to_string()),
+                            Some(err.to_string()),
+                            &island_id,
+                        );
+                        continue;
+                    }
+                };
                 tracing::info!(
                     subsystem = %payload.subsystem,
                     payload_version = payload.version,
@@ -162,6 +179,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(routes) => routes,
                             Err(err) => {
                                 tracing::warn!("invalid routes payload: {err}");
+                                let _ = send_config_response(
+                                    &sender,
+                                    &msg,
+                                    "routes",
+                                    payload.version,
+                                    "error",
+                                    Some("INVALID_CONFIG".to_string()),
+                                    Some(err.to_string()),
+                                    &island_id,
+                                );
                                 continue;
                             }
                         };
@@ -174,6 +201,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(vpns) => vpns,
                             Err(err) => {
                                 tracing::warn!("invalid vpns payload: {err}");
+                                let _ = send_config_response(
+                                    &sender,
+                                    &msg,
+                                    "vpn",
+                                    payload.version,
+                                    "error",
+                                    Some("INVALID_CONFIG".to_string()),
+                                    Some(err.to_string()),
+                                    &island_id,
+                                );
                                 continue;
                             }
                         };
@@ -201,10 +238,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 next_config.updated_at = now_epoch_ms().to_string();
                 if let Err(err) = apply_config(&mut writer, &next_config) {
                     tracing::warn!("apply config failed: {err}");
+                    let _ = send_config_response(
+                        &sender,
+                        &msg,
+                        payload.subsystem.as_str(),
+                        next_config.version,
+                        "error",
+                        Some("APPLY_FAILED".to_string()),
+                        Some(err.to_string()),
+                        &island_id,
+                    );
                     continue;
                 }
                 if let Err(err) = write_config(&config_dir, &next_config) {
                     tracing::warn!("persist config failed: {err}");
+                    let _ = send_config_response(
+                        &sender,
+                        &msg,
+                        payload.subsystem.as_str(),
+                        next_config.version,
+                        "error",
+                        Some("PERSIST_FAILED".to_string()),
+                        Some(err.to_string()),
+                        &island_id,
+                    );
                     continue;
                 }
                 sy_config = next_config;
@@ -214,9 +271,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     applied_version = sy_config.version,
                     "config changed applied"
                 );
+                let _ = send_config_response(
+                    &sender,
+                    &msg,
+                    payload.subsystem.as_str(),
+                    sy_config.version,
+                    "ok",
+                    None,
+                    None,
+                    &island_id,
+                );
             }
         }
     }
+}
+
+fn send_config_response(
+    sender: &NodeSender,
+    request: &Message,
+    subsystem: &str,
+    version: u64,
+    status: &str,
+    error_code: Option<String>,
+    error_detail: Option<String>,
+    island: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut payload = serde_json::json!({
+        "subsystem": subsystem,
+        "version": version,
+        "status": status,
+        "island": island,
+    });
+    if let Some(code) = error_code {
+        payload["error_code"] = serde_json::Value::String(code);
+    }
+    if let Some(detail) = error_detail {
+        payload["error_detail"] = serde_json::Value::String(detail);
+    }
+    let reply = Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            dst: Destination::Unicast(request.routing.src.clone()),
+            ttl: 16,
+            trace_id: request.routing.trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some("CONFIG_RESPONSE".to_string()),
+            scope: None,
+            target: None,
+            action: None,
+            priority: None,
+            context: None,
+        },
+        payload,
+    };
+    sender.send(reply)?;
+    Ok(())
 }
 
 async fn handle_admin_action(

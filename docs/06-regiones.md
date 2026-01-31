@@ -1,7 +1,7 @@
 # JSON Router - 06 Regiones Config y LSA
 
-**Estado:** v1.13  
-**Fecha:** 2025-01-20  
+**Estado:** v1.15  
+**Fecha:** 2026-01-31  
 **Audiencia:** Desarrolladores de router core, SY.config.routes
 
 ---
@@ -187,7 +187,7 @@ vpns:
 **Cada SY.config.routes al recibir CONFIG_CHANGED (subsystem: routes):**
 
 ```rust
-fn handle_config_changed(&mut self, payload: &ConfigChangedPayload) {
+fn handle_config_changed(&mut self, payload: &ConfigChangedPayload, trace_id: &str, admin_uuid: &str) {
     // 1. Verificar subsystem
     if payload.subsystem != "routes" && payload.subsystem != "vpn" {
         return;  // No me incumbe
@@ -195,12 +195,14 @@ fn handle_config_changed(&mut self, payload: &ConfigChangedPayload) {
     
     // 2. Verificar versión
     if payload.version <= self.last_config_version {
+        self.send_config_response(trace_id, admin_uuid, payload, "ok", None);
         return;  // Ya procesado
     }
     
     // 3. Validar config recibida
     if let Err(e) = self.validate_config(&payload.config) {
         log::error!("Invalid config: {}", e);
+        self.send_config_response(trace_id, admin_uuid, payload, "error", Some(e));
         return;
     }
     
@@ -212,8 +214,96 @@ fn handle_config_changed(&mut self, payload: &ConfigChangedPayload) {
     
     // 6. Actualizar versión
     self.last_config_version = payload.version;
+    
+    // 7. Enviar confirmación
+    self.send_config_response(trace_id, admin_uuid, payload, "ok", None);
 }
 ```
+
+### 2.7 CONFIG_RESPONSE (confirmación/error)
+
+Todo proceso que recibe CONFIG_CHANGED **DEBE** responder con CONFIG_RESPONSE para confirmar aplicación o reportar errores.
+
+**Mensaje CONFIG_RESPONSE:**
+
+```json
+{
+  "routing": {
+    "src": "<uuid-sy-config-routes>",
+    "dst": "<uuid-sy-admin>",
+    "ttl": 16,
+    "trace_id": "<uuid-del-config-changed>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "CONFIG_RESPONSE"
+  },
+  "payload": {
+    "subsystem": "routes",
+    "version": 42,
+    "island": "production",
+    "node": "SY.config.routes@production",
+    "status": "ok"
+  }
+}
+```
+
+**CONFIG_RESPONSE con error:**
+
+```json
+{
+  "routing": {
+    "src": "<uuid-sy-config-routes>",
+    "dst": "<uuid-sy-admin>",
+    "ttl": 16,
+    "trace_id": "<uuid-del-config-changed>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "CONFIG_RESPONSE"
+  },
+  "payload": {
+    "subsystem": "routes",
+    "version": 42,
+    "island": "staging",
+    "node": "SY.config.routes@staging",
+    "status": "error",
+    "error_code": "INVALID_PATTERN",
+    "error_message": "Pattern 'AI.[invalid' has unclosed bracket"
+  }
+}
+```
+
+**Flujo completo:**
+
+```
+SY.admin
+    │
+    ├─── broadcast CONFIG_CHANGED (version: 42, subsystem: routes)
+    │
+    │         ┌─────────────────────────────────────────────────────┐
+    │         │                                                     │
+    │         ▼                                                     ▼
+    │   SY.config.routes@mother                    SY.config.routes@production
+    │         │                                                     │
+    │         │ (validate, apply, persist)                         │ (validate, apply, persist)
+    │         │                                                     │
+    │         ▼                                                     ▼
+    │   CONFIG_RESPONSE (ok)                       CONFIG_RESPONSE (ok)
+    │         │                                                     │
+    └─────────┴──────────────────┬──────────────────────────────────┘
+                                 │
+                                 ▼
+                            SY.admin
+                    (collects responses, logs errors)
+```
+
+**Reglas:**
+
+1. El `trace_id` del CONFIG_RESPONSE **DEBE** coincidir con el del CONFIG_CHANGED para correlación
+2. El response es **unicast** a SY.admin, no broadcast
+3. Timeout: SY.admin espera ~5 segundos para respuestas antes de loggear islas no respondidas
+4. Si una isla no responde, se asume que el proceso está caído (alerta operacional)
 
 **Cada router al detectar cambio en SHM:**
 
