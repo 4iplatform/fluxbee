@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,7 +50,7 @@ struct AdminContext {
 
 struct AdminRouterClient {
     sender: NodeSender,
-    pending_admin: Mutex<HashMap<String, VecDeque<oneshot::Sender<Message>>>>,
+    pending_admin: Mutex<HashMap<String, oneshot::Sender<Message>>>,
     system_tx: broadcast::Sender<Message>,
     query_tx: broadcast::Sender<Message>,
 }
@@ -106,16 +106,9 @@ impl AdminRouterClient {
 
     async fn dispatch(&self, msg: Message) {
         if msg.meta.msg_type == "admin" {
-            if let Some(action) = msg.meta.action.clone() {
-                let mut pending = self.pending_admin.lock().await;
-                if let Some(queue) = pending.get_mut(&action) {
-                    if let Some(tx) = queue.pop_front() {
-                        let _ = tx.send(msg);
-                    }
-                    if queue.is_empty() {
-                        pending.remove(&action);
-                    }
-                }
+            let mut pending = self.pending_admin.lock().await;
+            if let Some(tx) = pending.remove(&msg.routing.trace_id) {
+                let _ = tx.send(msg);
             }
             return;
         }
@@ -128,19 +121,14 @@ impl AdminRouterClient {
         }
     }
 
-    async fn enqueue_admin_waiter(&self, action: String, tx: oneshot::Sender<Message>) {
+    async fn enqueue_admin_waiter(&self, trace_id: String, tx: oneshot::Sender<Message>) {
         let mut pending = self.pending_admin.lock().await;
-        pending.entry(action).or_default().push_back(tx);
+        pending.insert(trace_id, tx);
     }
 
-    async fn drop_admin_waiter(&self, action: String) {
+    async fn drop_admin_waiter(&self, trace_id: &str) {
         let mut pending = self.pending_admin.lock().await;
-        if let Some(queue) = pending.get_mut(&action) {
-            queue.pop_front();
-            if queue.is_empty() {
-                pending.remove(&action);
-            }
-        }
+        pending.remove(trace_id);
     }
 
     fn subscribe_system(&self) -> broadcast::Receiver<Message> {
@@ -504,6 +492,12 @@ async fn handle_http(
 ) -> Result<(), AdminError> {
     let (method, path, headers, body) = read_http_request(stream).await?;
     let (path, query) = split_path_query(&path);
+    if let Some((status, resp)) =
+        handle_island_paths(method.as_str(), path, &query, &body, tx, ctx, client).await?
+    {
+        respond_json(stream, status, &resp).await?;
+        return Ok(());
+    }
     match (method.as_str(), path) {
         ("GET", "/health") => {
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
@@ -643,18 +637,22 @@ async fn handle_http(
             respond_json(stream, status, &resp).await?;
         }
         ("GET", "/opa/policy") => {
-            let target = query
-                .get("island")
-                .cloned()
-                .or_else(|| query.get("target").cloned());
+            let target = normalize_opa_target(
+                query
+                    .get("island")
+                    .cloned()
+                    .or_else(|| query.get("target").cloned()),
+            );
             let (status, resp) = handle_opa_query(ctx, client, "get_policy", target).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", "/opa/status") => {
-            let target = query
-                .get("island")
-                .cloned()
-                .or_else(|| query.get("target").cloned());
+            let target = normalize_opa_target(
+                query
+                    .get("island")
+                    .cloned()
+                    .or_else(|| query.get("target").cloned()),
+            );
             let (status, resp) = handle_opa_query(ctx, client, "get_status", target).await?;
             respond_json(stream, status, &resp).await?;
         }
@@ -664,6 +662,194 @@ async fn handle_http(
         }
     }
     Ok(())
+}
+
+async fn handle_island_paths(
+    method: &str,
+    path: &str,
+    _query: &HashMap<String, String>,
+    body: &[u8],
+    tx: &mpsc::UnboundedSender<BroadcastRequest>,
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+) -> Result<Option<(u16, String)>, AdminError> {
+    let trimmed = path.trim_matches('/');
+    let parts = trimmed.split('/').collect::<Vec<_>>();
+    if parts.first().copied() != Some("islands") {
+        return Ok(None);
+    }
+    if parts.len() < 2 {
+        return Ok(None);
+    }
+    let island = parts[1].to_string();
+    let rest = &parts[2..];
+    match (method, rest) {
+        ("GET", ["routes"]) => {
+            let (status, resp) = handle_admin_query(ctx, client, "list_routes", Some(island))
+                .await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["routes"]) => {
+            let route: RouteConfig = serde_json::from_slice(body)?;
+            let (status, resp) = handle_admin_command(
+                ctx,
+                client,
+                "add_route",
+                serde_json::to_value(route)?,
+                Some(island),
+            )
+            .await?;
+            Ok(Some((status, resp)))
+        }
+        ("DELETE", ["routes", prefix]) => {
+            let payload = serde_json::json!({ "prefix": decode_percent(prefix) });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "delete_route", payload, Some(island)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["vpns"]) => {
+            let (status, resp) =
+                handle_admin_query(ctx, client, "list_vpns", Some(island)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["vpns"]) => {
+            let vpn: VpnConfig = serde_json::from_slice(body)?;
+            let (status, resp) = handle_admin_command(
+                ctx,
+                client,
+                "add_vpn",
+                serde_json::to_value(vpn)?,
+                Some(island),
+            )
+            .await?;
+            Ok(Some((status, resp)))
+        }
+        ("DELETE", ["vpns", pattern]) => {
+            let payload = serde_json::json!({ "pattern": decode_percent(pattern) });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "delete_vpn", payload, Some(island)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["nodes"]) => {
+            let (status, resp) =
+                handle_admin_query(ctx, client, "list_nodes", Some(island)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["nodes"]) => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let (status, resp) =
+                handle_admin_command(ctx, client, "run_node", payload, Some(island)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("DELETE", ["nodes", name]) => {
+            let payload = serde_json::json!({ "name": decode_percent(name) });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "kill_node", payload, Some(island)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["routers"]) => {
+            let (status, resp) =
+                handle_admin_query(ctx, client, "list_routers", Some(island)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["routers"]) => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let (status, resp) =
+                handle_admin_command(ctx, client, "run_router", payload, Some(island)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("DELETE", ["routers", name]) => {
+            let payload = serde_json::json!({ "name": decode_percent(name) });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "kill_router", payload, Some(island)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["opa", "policy"]) => {
+            let req: OpaRequest = serde_json::from_slice(body)?;
+            let mut req = req;
+            req.island = Some(island);
+            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::CompileApply).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["opa", "policy", "compile"]) => {
+            let req: OpaRequest = serde_json::from_slice(body)?;
+            let mut req = req;
+            req.island = Some(island);
+            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Compile).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["opa", "policy", "apply"]) => {
+            let req: OpaRequest = serde_json::from_slice(body)?;
+            let mut req = req;
+            req.island = Some(island);
+            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Apply).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["opa", "policy", "rollback"]) => {
+            let req: OpaRequest = serde_json::from_slice(body)?;
+            let mut req = req;
+            req.island = Some(island);
+            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Rollback).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["opa", "policy", "check"]) => {
+            let req: OpaRequest = serde_json::from_slice(body)?;
+            let mut req = req;
+            req.island = Some(island);
+            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Check).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["opa", "policy"]) => {
+            let (status, resp) =
+                handle_opa_query(ctx, client, "get_policy", Some(island)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["opa", "status"]) => {
+            let (status, resp) =
+                handle_opa_query(ctx, client, "get_status", Some(island)).await?;
+            Ok(Some((status, resp)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn decode_percent(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 async fn read_http_request(
@@ -769,11 +955,8 @@ async fn respond_json(
     Ok(())
 }
 
-fn next_opa_version(
-    state_dir: &Path,
-    requested: Option<u64>,
-) -> Result<u64, AdminError> {
-    let path = state_dir.join("opa-version.txt");
+fn next_opa_version(requested: Option<u64>) -> Result<u64, AdminError> {
+    let path = PathBuf::from(json_router::paths::OPA_VERSION_PATH);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -816,10 +999,10 @@ async fn handle_opa_http(
             version
         }
         OpaAction::Rollback => req.version.unwrap_or(0),
-        _ => next_opa_version(&ctx.state_dir, req.version)?,
+        _ => next_opa_version(req.version)?,
     };
     let entrypoint = req.entrypoint.clone().unwrap_or_else(|| "router/target".to_string());
-    let target = req.island.take();
+    let target = normalize_opa_target(req.island.take());
 
     if action.needs_rego() && req.rego.as_deref().unwrap_or("").is_empty() {
         let resp = serde_json::json!({
@@ -985,9 +1168,7 @@ async fn send_admin_request(
         payload: request.payload,
     };
     let (tx, rx) = oneshot::channel::<Message>();
-    client
-        .enqueue_admin_waiter(request.action.clone(), tx)
-        .await;
+    client.enqueue_admin_waiter(trace_id.clone(), tx).await;
     client.sender.send(msg).await?;
 
     use tokio::time::{timeout, Instant};
@@ -997,7 +1178,7 @@ async fn send_admin_request(
         Ok(Ok(msg)) => msg,
         Ok(Err(_)) => return Err("admin response channel closed".into()),
         Err(_) => {
-            client.drop_admin_waiter(request.action.clone()).await;
+            client.drop_admin_waiter(&trace_id).await;
             return Err("admin request timeout".into());
         }
     };
@@ -1124,7 +1305,10 @@ async fn send_opa_query(
     let target_pattern = target
         .as_deref()
         .map(|island| format!("SY.opa.rules@{}", island));
-    let dst = Destination::Broadcast;
+    let dst = match target.as_deref() {
+        Some(island) => Destination::Unicast(format!("SY.opa.rules@{}", island)),
+        None => Destination::Broadcast,
+    };
     let msg = Message {
         routing: Routing {
             src: client.sender.uuid().to_string(),
@@ -1151,6 +1335,17 @@ async fn send_opa_query(
     Ok(responses)
 }
 
+fn normalize_opa_target(target: Option<String>) -> Option<String> {
+    target.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("broadcast") {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
 fn expected_islands(ctx: &AdminContext, target: Option<&str>) -> Vec<String> {
     if let Some(target) = target {
         return vec![target.to_string()];
@@ -1173,7 +1368,7 @@ async fn collect_opa_responses(
 ) -> Vec<OpaResponseEntry> {
     use tokio::time::{timeout, Instant};
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut responses: HashMap<String, OpaResponseEntry> = HashMap::new();
 
     while responses.len() < expected.len() && Instant::now() < deadline {
@@ -1230,7 +1425,7 @@ async fn collect_opa_query_responses(
 ) -> Vec<OpaQueryEntry> {
     use tokio::time::{timeout, Instant};
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut responses: HashMap<String, OpaQueryEntry> = HashMap::new();
 
     while responses.len() < expected.len() && Instant::now() < deadline {

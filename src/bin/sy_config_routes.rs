@@ -322,7 +322,7 @@ async fn handle_admin_action(
             src: sender.uuid().to_string(),
             dst: Destination::Unicast(msg.routing.src.clone()),
             ttl: 16,
-            trace_id: Uuid::new_v4().to_string(),
+            trace_id: msg.routing.trace_id.clone(),
         },
         meta: Meta {
             msg_type: "admin".to_string(),
