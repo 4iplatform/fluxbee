@@ -465,7 +465,7 @@ struct OpaQueryEntry {
 
 async fn run_http_server(
     listen: &str,
-    tx: &mpsc::UnboundedSender<BroadcastRequest>,
+    _tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: AdminContext,
     client: Arc<AdminRouterClient>,
 ) -> Result<(), AdminError> {
@@ -493,7 +493,7 @@ async fn handle_http(
     let (method, path, headers, body) = read_http_request(stream).await?;
     let (path, query) = split_path_query(&path);
     if let Some((status, resp)) =
-        handle_island_paths(method.as_str(), path, &query, &body, tx, ctx, client).await?
+        handle_island_paths(method.as_str(), path, &query, &body, ctx, client).await?
     {
         respond_json(stream, status, &resp).await?;
         return Ok(());
@@ -669,7 +669,6 @@ async fn handle_island_paths(
     path: &str,
     _query: &HashMap<String, String>,
     body: &[u8],
-    tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: &AdminContext,
     client: &AdminRouterClient,
 ) -> Result<Option<(u16, String)>, AdminError> {
@@ -1154,7 +1153,7 @@ async fn send_admin_request(
             src: client.sender.uuid().to_string(),
             dst: Destination::Unicast(dst),
             ttl: 16,
-            trace_id,
+            trace_id: trace_id.clone(),
         },
         meta: Meta {
             msg_type: "admin".to_string(),
