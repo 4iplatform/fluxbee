@@ -248,6 +248,10 @@ This is a working specification with partial implementation. The core router, sh
 
 See the [Technical Specification](./docs/) for complete details.
 
+### Development Guide
+
+This README explains the system and concepts. For how to run, build, and develop locally, see `DEVELOPMENT.md`.
+
 Key documents:
 - `01-arquitectura.md` - Architecture and concepts
 - `02-protocolo.md` - Message protocol and node library
