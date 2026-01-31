@@ -22,6 +22,8 @@
 
 - **Nombre L2 (Capa 2)**: Identificador descriptivo con isla. Formato: `TYPE.campo1.campo2@isla`.
 
+- **ILK (Capa 3)**: Interlocutor Key. Identificador único de entidades que conversan (personas, agentes, sistemas). Formato: `ilk:<uuid>`.
+
 - **Framing**: Delimitación de mensajes (4 bytes length prefix, big-endian).
 
 ### Islas y Conectividad
@@ -171,13 +173,15 @@ pub const DEAD_INTERVAL_MS: u64 = 40_000;
 |---|-----------|-------------|
 | 01 | `01-arquitectura.md` | Fundamentos, islas, naming @isla, VPN overview |
 | 02 | `02-protocolo.md` | Mensajes, framing, HELLO, LSA, librería de nodos |
-| 03 | `03-shm.md` | Tres regiones SHM, estructuras Rust |
+| 03 | `03-shm.md` | Regiones SHM, estructuras Rust |
 | 04 | `04-routing.md` | FIB, VPN, algoritmos, OPA |
 | 05 | `05-conectividad.md` | IRP, WAN, LSA entre gateways |
 | 06 | `06-regiones.md` | Detalle de config y LSA regions |
 | 07 | `07-operaciones.md` | Arranque, YAML, systemd |
 | 08 | `08-apendices.md` | Glosario, decisiones, límites |
-| -- | `SY_nodes_spec.md` | Nodos SY (config.routes, etc.) |
+| 09 | `09-router-status.md` | Estado de implementación del router |
+| 10 | `10-identity-layer3.md` | **ILK, SY.identity, routing L3** |
+| -- | `SY_nodes_spec.md` | Nodos SY (config.routes, opa.rules, identity) |
 
 ---
 

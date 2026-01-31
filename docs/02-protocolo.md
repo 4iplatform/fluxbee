@@ -678,8 +678,8 @@ impl NodeReceiver {
 
 ### 10.3 Equivalencia con POSIX y Tokio
 
-| Operación | POSIX Socket | Tokio mpsc | NodeSender/NodeReceiver |
-|-----------|--------------|------------|--------------------------|
+| Operación | POSIX Socket | Tokio mpsc | NodeClient |
+|-----------|--------------|------------|------------|
 | Enviar (espera si lleno) | `send()` | `tx.send().await` | `sender.send().await` |
 | Recibir (bloquea) | `recv()` | `rx.recv().await` | `receiver.recv().await` |
 | Recibir (con timeout) | `setsockopt(SO_RCVTIMEO)` | `timeout(d, rx.recv())` | `receiver.recv_timeout(d).await` |

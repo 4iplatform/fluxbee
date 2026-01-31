@@ -242,7 +242,7 @@ socket.on('data', (chunk) => {
 |---------|--------|---------|-----------|
 | `HELLO` | Nodo | Router | Registrar nodo |
 | `ANNOUNCE` | Router | Nodo | Confirmar registro |
-| `WITHDRAW` | Nodo | Router | Shutdown limpio |
+| `WITHDRAW` | Nodo | Router | Cierre limpio (enviado por `close()`) |
 
 ### 7.2 Health y Diagnóstico
 
@@ -585,19 +585,261 @@ El gateway consolida la topología de su isla y la envía a gateways remotos.
 
 ## 10. Librería de Nodos (node_client)
 
-### 10.1 Responsabilidades
+### 10.1 Principio de Diseño
 
-| Responsabilidad | Dónde se implementa |
-|-----------------|---------------------|
-| Generar UUID | Librería |
-| Persistir UUID | Librería |
-| **Agregar @isla al nombre** | **Librería** (desde island.yaml) |
+La librería sigue el **modelo POSIX socket** con colas desacopladas y **split sender/receiver** (como Tokio). No inventamos mecanismos nuevos; replicamos patrones probados.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Connection Manager                           │
+│                        (interno, Arc)                            │
+│                                                                  │
+│  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐       │
+│  │   Socket    │────►│  RX Queue   │────►│ NodeReceiver│       │
+│  │  (recv)     │     │ (mpsc 256)  │     │   recv()    │       │
+│  └─────────────┘     └─────────────┘     └─────────────┘       │
+│                                                                  │
+│  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐       │
+│  │   Socket    │◄────│  TX Queue   │◄────│ NodeSender  │       │
+│  │  (send)     │     │ (mpsc 256)  │     │   send()    │       │
+│  └─────────────┘     └─────────────┘     └─────────────┘       │
+│                                                                  │
+│  Tasks internos:                                                 │
+│  • RX Task: socket.read() → rx_queue.send()                     │
+│  • TX Task: tx_queue.recv() → socket.write()                    │
+│  • Reconnect: backoff exponencial, re-HELLO                     │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Características clave:**
+- **Full duplex real:** Sender y Receiver son independientes, sin locks
+- **Colas desacopladas:** Capacidad fija de 256 mensajes, backpressure natural
+- **Reconnect automático:** La librería reconecta con backoff exponencial
+
+### 10.2 API Pública (Split Model)
+
+La conexión retorna dos handles separados, como `TcpStream::into_split()` de Tokio:
+
+```rust
+/// Conectar al router. Retorna handles separados para send/recv.
+pub async fn connect(config: NodeConfig) -> Result<(NodeSender, NodeReceiver), NodeError>;
+
+pub struct NodeSender {
+    // interno: mpsc::Sender + Arc<ConnectionManager>
+}
+
+pub struct NodeReceiver {
+    // interno: mpsc::Receiver + Arc<ConnectionManager>
+}
+```
+
+#### NodeSender
+
+```rust
+impl NodeSender {
+    /// Enviar mensaje. Await si la cola está llena (backpressure).
+    pub async fn send(&self, msg: Message) -> Result<(), NodeError>;
+    
+    /// Cierre limpio. Envía WITHDRAW al router.
+    pub async fn close(self) -> Result<(), NodeError>;
+    
+    /// Info del nodo
+    pub fn uuid(&self) -> &str;
+    pub fn full_name(&self) -> &str;
+}
+```
+
+#### NodeReceiver
+
+```rust
+impl NodeReceiver {
+    /// Recibir mensaje. Bloquea hasta que hay mensaje.
+    pub async fn recv(&mut self) -> Result<Message, NodeError>;
+    
+    /// Recibir con timeout.
+    pub async fn recv_timeout(&mut self, timeout: Duration) -> Result<Message, NodeError>;
+    
+    /// Recibir sin bloquear. None si la cola está vacía.
+    pub fn try_recv(&mut self) -> Option<Message>;
+    
+    /// ¿Estamos conectados?
+    pub fn is_connected(&self) -> bool;
+    
+    /// Esperar hasta estar conectado.
+    pub async fn wait_connected(&self);
+    
+    /// Info del nodo
+    pub fn uuid(&self) -> &str;
+    pub fn full_name(&self) -> &str;
+    pub fn vpn_id(&self) -> u32;
+}
+```
+
+### 10.3 Equivalencia con POSIX y Tokio
+
+| Operación | POSIX Socket | Tokio mpsc | NodeSender/NodeReceiver |
+|-----------|--------------|------------|--------------------------|
+| Enviar (espera si lleno) | `send()` | `tx.send().await` | `sender.send().await` |
+| Recibir (bloquea) | `recv()` | `rx.recv().await` | `receiver.recv().await` |
+| Recibir (con timeout) | `setsockopt(SO_RCVTIMEO)` | `timeout(d, rx.recv())` | `receiver.recv_timeout(d).await` |
+| Recibir (no bloquea) | `recv()` + `O_NONBLOCK` | `rx.try_recv()` | `receiver.try_recv()` |
+| Cerrar | `close()` | drop | `sender.close().await` |
+| Split | `dup()` + disciplina | `into_split()` | `connect()` retorna tupla |
+
+### 10.4 Errores
+
+```rust
+pub enum NodeError {
+    /// Socket desconectado, reconexión en progreso o fallida
+    Disconnected,
+    
+    /// Timeout esperando mensaje
+    Timeout,
+    
+    /// Error en HELLO/ANNOUNCE
+    HandshakeFailed(String),
+    
+    /// Error de I/O
+    Io(std::io::Error),
+    
+    /// Error de serialización
+    Json(serde_json::Error),
+}
+```
+
+### 10.5 Restricción Fundamental
+
+> **Un nodo = Un UUID = Una conexión**
+
+El router asocia cada UUID a exactamente una conexión. Si un proceso abre dos conexiones con el mismo UUID, el router desconecta la anterior.
+
+### 10.6 Reconexión Automática
+
+La librería maneja la reconexión de forma transparente:
+
+| Evento | Acción |
+|--------|--------|
+| Socket cae | Estado = Reconnecting, **vaciar TX queue** |
+| Intento fallido | Backoff exponencial (100ms → 200ms → 400ms → ... → 30s max) |
+| Conexión OK | Enviar HELLO, esperar ANNOUNCE |
+| ANNOUNCE recibido | Estado = Connected |
+
+**Importante:** Al reconectar se vacía la cola TX. Los mensajes pendientes se pierden. Es responsabilidad del nodo re-enviar si es necesario (el nodo puede detectar desconexión via `is_connected()`).
+
+```
+        CONNECTED
+            │
+            ▼
+    ┌───────────────┐
+    │  Socket cae   │
+    └───────┬───────┘
+            │
+            ▼
+      RECONNECTING ──── vaciar TX queue
+            │
+            ▼
+    ┌───────────────┐
+    │ Backoff 100ms │──► connect() ──► ¿OK?
+    └───────────────┘                    │
+            ▲                       ┌────┴────┐
+            │                      NO        SÍ
+            │                       │         │
+            └─────── Backoff x2 ────┘         ▼
+                     (max 30s)             HELLO
+                                              │
+                                              ▼
+                                          ANNOUNCE
+                                              │
+                                              ▼
+                                         CONNECTED
+```
+
+### 10.7 Mensaje WITHDRAW (cierre limpio)
+
+Cuando el nodo llama `close()`, la librería envía WITHDRAW antes de cerrar:
+
+```json
+{
+  "routing": {
+    "src": "<uuid-nodo>",
+    "dst": null,
+    "ttl": 1,
+    "trace_id": "<uuid>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "WITHDRAW"
+  },
+  "payload": {
+    "reason": "shutdown"
+  }
+}
+```
+
+El router al recibir WITHDRAW remueve el nodo de su tabla inmediatamente.
+
+**Nota:** Si el nodo hace `drop()` sin llamar `close()`, no se envía WITHDRAW. El router detectará la desconexión por el socket cerrado.
+
+### 10.8 Patrón Request/Response (responsabilidad del nodo)
+
+La librería NO implementa request/response. El nodo que necesite este patrón debe implementarlo usando `trace_id` para correlación:
+
+```rust
+struct PendingRequests {
+    pending: HashMap<String, oneshot::Sender<Message>>,
+}
+
+impl MyNode {
+    async fn request(&mut self, msg: Message, timeout: Duration) -> Result<Message> {
+        let trace_id = msg.routing.trace_id.clone();
+        
+        let (tx, rx) = oneshot::channel();
+        self.pending.insert(trace_id.clone(), tx);
+        
+        self.sender.send(msg).await?;
+        
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err(Error::ChannelClosed),
+            Err(_) => {
+                self.pending.remove(&trace_id);
+                Err(Error::Timeout)
+            }
+        }
+    }
+    
+    async fn run(&mut self) {
+        loop {
+            let msg = self.receiver.recv().await.unwrap();
+            
+            if let Some(sender) = self.pending.remove(&msg.routing.trace_id) {
+                sender.send(msg).ok();
+            } else {
+                self.handle_message(msg).await;
+            }
+        }
+    }
+}
+```
+
+### 10.9 Responsabilidades
+
+| Responsabilidad | Quién |
+|-----------------|-------|
 | Conexión socket | Librería |
-| Framing | Librería |
-| Handshake HELLO | Librería |
-| Reconexión automática | Librería |
+| Framing (length-prefix) | Librería |
+| Colas TX/RX desacopladas (256 cap) | Librería |
+| Handshake HELLO/ANNOUNCE | Librería |
+| Reconexión automática con backoff | Librería |
+| Envío de WITHDRAW en close() | Librería |
+| Generar y persistir UUID | Librería |
+| Agregar @isla al nombre | Librería |
+| Request/response (correlación) | **Nodo** |
+| Qué hacer post-reconexión | **Nodo** |
+| Timeouts de aplicación | **Nodo** |
 
-### 10.2 Flujo de Conexión
+### 10.10 Flujo de Conexión
 
 ```
 1. Leer /etc/json-router/island.yaml → obtener island_id
@@ -611,21 +853,32 @@ El gateway consolida la topología de su isla y la envía a gateways remotos.
 
 4. Conectar al socket del router
 
-5. Enviar HELLO con nombre completo
+5. Crear colas internas (mpsc, capacidad 256)
 
-6. Esperar ANNOUNCE → obtener vpn_id asignado
+6. Spawn tasks internos (RX task, TX task)
 
-7. Listo para enviar/recibir mensajes
+7. Enviar HELLO con nombre completo
+
+8. Esperar ANNOUNCE → obtener vpn_id asignado
+
+9. Retornar (NodeSender, NodeReceiver)
 ```
 
-### 10.3 Ejemplo de Uso (Rust)
+### 10.11 Persistencia de UUID
+
+```
+/var/lib/json-router/state/nodes/<nombre-sin-isla>.uuid
+```
+
+Ejemplo: `/var/lib/json-router/state/nodes/AI.soporte.l1.uuid`
+
+### 10.12 Ejemplo de Uso
 
 ```rust
-use json_router::node_client::{NodeClient, NodeConfig};
+use json_router::node_client::{connect, NodeConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // La librería lee island.yaml automáticamente
     let config = NodeConfig {
         name: "AI.soporte.l1".to_string(),  // SIN @isla
         router_socket: "/var/run/json-router/routers".into(),
@@ -633,32 +886,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_dir: "/etc/json-router".into(),
         version: "1.0".to_string(),
     };
-    // Si se quiere un router específico:
-    // router_socket: "/var/run/json-router/routers/<router-uuid>.sock"
 
-    let client = NodeClient::connect(config).await?;
+    let (sender, mut receiver) = connect(config).await?;
     
-    // La librería agregó @isla automáticamente
-    println!("Conectado como: {}", client.full_name());  
+    println!("Conectado como: {}", receiver.full_name());  
     // → "AI.soporte.l1@produccion"
-    
-    println!("VPN asignado: {}", client.vpn_id());
-    // → 10
 
+    // Sender en otro task si hace falta
+    let sender = Arc::new(sender);
+    
+    // Loop principal
     loop {
-        let msg = client.recv().await?;
-        // Procesar...
+        // Detectar reconexión
+        if !receiver.is_connected() {
+            receiver.wait_connected().await;
+            println!("Reconectado, re-sincronizando...");
+        }
+        
+        let msg = receiver.recv().await?;
+        let response = process_message(&msg);
+        sender.send(response).await?;
     }
 }
 ```
-
-### 10.4 Persistencia de UUID
-
 ```
-/var/lib/json-router/state/nodes/<nombre-sin-isla>.uuid
-```
-
-Ejemplo: `/var/lib/json-router/state/nodes/AI.soporte.l1.uuid`
 
 ---
 
