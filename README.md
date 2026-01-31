@@ -1,204 +1,272 @@
-# json-router
+# Fluxbee
 
-Reinicio del código para alinear con la especificación v1.13.
+**Distributed intelligence infrastructure**
 
-- Especificación: `docs/01-arquitectura.md` → `docs/08-apendices.md`
-- Nodos SY: `docs/legacydocs/SY_nodes_spec.md` (pendiente de actualización a v1.13)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Sandbox local
+> *fluxbee.ai*
 
-Copiar `config/island.yaml` a `/etc/json-router/island.yaml` (o ejecutar el script) y correr el router con:
+---z
 
-```sh
-sudo ./scripts/install.sh
-JSR_ROUTER_NAME=RT.primary cargo run --bin json-router
+## What is this?
+
+Fluxbee is infrastructure for building systems where AI agents, humans, and automated workflows communicate seamlessly across any channel. It's the nervous system for organizations that want to operate with AI at the center, not at the edges.
+
+Think of it as a phone system, but instead of connecting phone numbers, it connects:
+- AI agents with specialized knowledge
+- Human operators and customers
+- Workflows and integrations
+- Any communication channel (WhatsApp, Email, Slack, etc.)
+
+Every message flows through a unified routing layer that knows who's talking, who they're talking to, what they're capable of, and where to send the conversation next.
+
+---
+
+## Why does this exist?
+
+**The problem:** Today's AI integrations are point-to-point. You connect an AI to WhatsApp. Another to your CRM. Another to email. Each one is an island. They don't share context. They can't hand off conversations. They can't be managed as a coherent system.
+
+**The insight:** What if we treated AI agents the way organizations treat employees? Each one has a role, capabilities, and credentials. They're trained (prompted) for specific jobs. They work together, escalate to each other, and when they can't handle something, they bring in a human.
+
+**The solution:** A routing layer that understands identity (who), capability (what they can do), and conversation flow (where things go next). Built for AI-first but works just as well for humans.
+
+---
+
+## Core Concepts
+
+### Three Layers of Routing
+
+| Layer | What it routes | Example |
+|-------|----------------|---------|
+| **L1 - Connection** | Raw sockets | Which process on which machine |
+| **L2 - Node** | Named services | `AI.support.l1@production` |
+| **L3 - Interlocutor** | Identities | Customer "John" or Agent "Support-L1" |
+
+Most systems only have L1. Some have L2. Fluxbee has all three, which means you can route based on *who someone is* and *what they need*, not just where the bytes go.
+
+### Islands
+
+An **island** is a deployment unit - a cluster of nodes that share memory and communicate via Unix sockets. Fast, local, zero serialization overhead.
+
+Islands connect to each other over the network. A customer in São Paulo talks to an AI agent in the São Paulo island. If that agent needs to escalate, the message routes to the Buenos Aires island where the senior agents live. The customer doesn't know. The routing is automatic.
+
+### The Identity System (ILK)
+
+Every participant in the system has an **ILK** (Interlocutor Key) - a unique identifier that follows them everywhere:
+
+```
+ilk:550e8400-e29b-41d4-a716-446655440000
 ```
 
-## Nodo de prueba
+ILKs have types:
+- **Tenant** - An organization (for billing, isolation, contracts)
+- **Agent** - An AI with a specific degree (training)
+- **Human/Internal** - An operator who can see inside the system
+- **Human/External** - A customer who interacts from outside
 
-Ejecutar un nodo de prueba que envía un mensaje `HOLA`:
+The routing layer uses ILKs to make decisions: this customer belongs to this tenant, should talk to agents with these capabilities, and if things go wrong, escalate to this human.
 
-```sh
-cargo run --example node_test
+### The University Model
+
+AI agents don't just exist - they **graduate**.
+
+1. **Modules** are fragments of knowledge: "You speak Spanish", "You know our product catalog", "You escalate after 3 failed attempts"
+
+2. **Degrees** combine modules into a complete training: "Support-L1-Spanish" = Spanish + Product Knowledge + Basic Troubleshooting + Escalation Rules
+
+3. **Graduation** assigns a degree to an agent with a cryptographic seal. The agent cannot operate without a valid degree. If someone tampers with the training, the hash breaks, and the agent refuses to run.
+
+This means:
+- You can audit exactly what an agent knows
+- You can version and roll back training
+- You can't accidentally deploy an untrained agent
+- The AI manages the AI (humans write modules, but compilation and verification is automatic)
+
+---
+
+## Architecture
+
 ```
-Si querés apuntar a un router específico: `JSR_ROUTER_NAME=RT.primary ...`
-
-## Librería de cliente (jsr-client)
-
-La librería para conectar nodos al router vive en `crates/jsr_client`. Es **solo Linux**.
-
-### Instalación paso a paso (proyecto nuevo)
-
-Opción A: copiar el crate dentro de tu repo.
-
-1) Copiá `crates/jsr_client` a tu repo, por ejemplo `vendor/jsr_client`.
-2) En tu `Cargo.toml`:
-
-```toml
-[dependencies]
-jsr-client = { path = "vendor/jsr_client" }
+┌─────────────────────────────────────────────────────────────────┐
+│                         Mother Island                            │
+│                                                                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
+│  │ PostgreSQL   │  │ SY.identity  │  │ SY.admin     │          │
+│  │ (source of   │  │ (graduates   │  │ (human       │          │
+│  │  truth)      │  │  agents)     │  │  interface)  │          │
+│  └──────────────┘  └──────────────┘  └──────────────┘          │
+│                                                                  │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           │ WAN (broadcast replication)
+                           │
+┌──────────────────────────┼──────────────────────────────────────┐
+│                          ▼                                       │
+│                    Production Island                             │
+│                                                                  │
+│  ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐      │
+│  │ Router  │    │ Router  │    │ Gateway │    │ SY.*    │      │
+│  │ (RT)    │    │ (RT)    │    │ (to WAN)│    │ (system)│      │
+│  └────┬────┘    └────┬────┘    └─────────┘    └─────────┘      │
+│       │              │                                          │
+│       │   Unix Sockets (fast, local)                           │
+│       │              │                                          │
+│  ┌────┴────┐    ┌────┴────┐    ┌─────────┐    ┌─────────┐      │
+│  │ AI.     │    │ AI.     │    │ IO.     │    │ WF.     │      │
+│  │ support │    │ sales   │    │ whatsapp│    │ crm     │      │
+│  │ (agent) │    │ (agent) │    │ (edge)  │    │ (flow)  │      │
+│  └─────────┘    └─────────┘    └─────────┘    └─────────┘      │
+│                                      │                          │
+└──────────────────────────────────────┼──────────────────────────┘
+                                       │
+                                       │ HTTPS (WhatsApp API)
+                                       │
+                                  ┌────┴────┐
+                                  │ Customer│
+                                  │ (phone) │
+                                  └─────────┘
 ```
 
-Opción B: repo separado (git).
+### Node Types
 
-```toml
-[dependencies]
-jsr-client = { git = "ssh://git@github.com/<org>/jsr-client.git", rev = "<commit>" }
-```
+| Prefix | Purpose | Examples |
+|--------|---------|----------|
+| **RT** | Router - moves messages | `RT.main@production` |
+| **SY** | System - configuration, identity, admin | `SY.identity@mother` |
+| **IO** | Edge - connects to external channels | `IO.whatsapp@production` |
+| **AI** | Agent - processes conversations | `AI.support.l1@production` |
+| **WF** | Workflow - orchestrates processes | `WF.onboarding@production` |
 
-### Primitivas mínimas que debe usar tu app
+### Shared Memory
 
-1) Crear `NodeConfig`:
-   - `name`: nombre L2 del nodo (ej: `WF.echo`)
-   - `router_socket`: socket del router (por UUID o directorio)
-   - `uuid_persistence_dir`: donde persistir el UUID del nodo
-   - `config_dir`: `/etc/json-router`
-   - `version`: versión del nodo (string)
+Within an island, nodes communicate through shared memory regions:
+- **Node table** - Who's connected right now
+- **Config** - Routes and VPNs
+- **Identity** - ILKs, degrees, capabilities
+- **OPA** - Compiled routing policies
 
-2) Conectar:
-   - `connect(&config).await?` → retorna `(NodeSender, NodeReceiver)`
+No serialization. No network calls. Just memory reads. This is why it's fast.
 
-3) Enviar:
-   - `sender.send(msg).await?`
+### OPA Policies
 
-4) Recibir:
-   - `receiver.recv().await?`
+Routing decisions are made by [OPA](https://www.openpolicyagent.org/) (Open Policy Agent). You write rules like:
 
-### Ejemplo mínimo
+```rego
+# Route to agent with required capability
+target = node {
+    required := input.meta.context.required_capability
+    some ilk
+    data.identity[ilk].type == "agent"
+    required in data.identity[ilk].capabilities
+    node := data.identity[ilk].handler_node
+}
 
-```rust
-use jsr_client::{connect, NodeConfig};
-use jsr_client::protocol::{Message, Meta, Routing, Destination};
-use serde_json::json;
-use std::path::PathBuf;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = NodeConfig {
-        name: "WF.echo".to_string(),
-        router_socket: PathBuf::from("/var/run/json-router/routers"),
-        uuid_persistence_dir: PathBuf::from("/var/lib/json-router/state/nodes"),
-        config_dir: PathBuf::from("/etc/json-router"),
-        version: "1.0".to_string(),
-    };
-    let (sender, mut receiver) = connect(&config).await?;
-
-    let msg = Message {
-        routing: Routing {
-            src: sender.uuid().to_string(),
-            dst: Destination::Resolve,
-            ttl: 1,
-            trace_id: uuid::Uuid::new_v4().to_string(),
-        },
-        meta: Meta {
-            msg_type: "user".to_string(),
-            msg: None,
-            scope: None,
-            target: Some("WF.listen@sandbox".to_string()),
-            action: None,
-            priority: None,
-            context: None,
-        },
-        payload: json!({"type": "text", "content": "HOLA"}),
-    };
-
-    sender.send(msg).await?;
-    let _ = receiver.recv().await?;
-    Ok(())
+# Only internal humans can see system status
+allow {
+    input.meta.action == "system_status"
+    data.identity[input.meta.src_ilk].human_subtype == "internal"
 }
 ```
 
-## Instalación rápida (server de prueba)
+Policies are compiled to WASM and distributed to all islands. Changes propagate in seconds.
 
-Script de instalación base:
+---
 
-```sh
-sudo ./scripts/install.sh
-```
+## What can you build with this?
 
-Rutas fijas:
+### Multi-channel Customer Support
+- Customer writes on WhatsApp → AI agent responds
+- Same customer emails later → Same context, same agent knowledge
+- Agent can't solve it → Escalates to senior AI → Escalates to human
+- Human resolves → AI learns for next time
 
-- `/etc/json-router` (config)
-- `/var/lib/json-router/state` (state)
-- `/var/run/json-router/routers` (sockets por UUID)
+### AI-Native Sales Team
+- Lead comes in → AI qualifier assesses fit
+- Qualified → AI sales rep handles objections
+- Ready to close → Senior AI or human closer takes over
+- All in the same conversation thread, all with full context
 
-## SY.config.routes
+### Operations Dashboard
+- Internal operators (human/internal) can query system status
+- See which agents are handling what
+- Monitor escalation rates
+- Adjust routing in real-time
 
-Ejecutar el servicio de config:
+### Multi-tenant SaaS
+- Each tenant gets isolated agents, routing, and data
+- Billing per tenant
+- Custom training per tenant
+- Shared infrastructure, separated concerns
 
-```sh
-cargo run --bin sy_config_routes
-```
-Si querés apuntar a un router específico: `JSR_ROUTER_NAME=RT.primary ...`
+---
 
-## SY.admin (API HTTP) - ejemplos CURL
+## Design Principles
 
-Health:
+### 1. AI-Native, Human-Compatible
+The system assumes AI is the primary operator. Humans are escalation points, not the main workforce. But when humans are needed, they have full visibility.
 
-```sh
-curl http://127.0.0.1:8080/health
-```
+### 2. Identity is Everything
+Every message carries who sent it, who it's for, and what conversation it belongs to. You can't lose context. You can't have orphan messages.
 
-Config rutas:
+### 3. Verified Knowledge
+Agents can't operate without valid credentials. Training is versioned, hashed, and auditable. No "oops, we deployed the wrong prompt."
 
-```sh
-curl -X PUT http://127.0.0.1:8080/config/routes \
-  -H "Content-Type: application/json" \
-  -d '{"routes":[{"prefix":"WF.echo.*","match_kind":"PREFIX","action":"LOCAL","priority":10}]}'
-```
+### 4. Local Speed, Global Reach
+Within an island: shared memory, microsecond latency.
+Between islands: async replication, eventual consistency.
+Best of both worlds.
 
-Config VPNs:
+### 5. Policy-Driven Routing
+Business rules live in OPA policies, not in code. Change who handles what without deploying code. Audit routing decisions after the fact.
 
-```sh
-curl -X PUT http://127.0.0.1:8080/config/vpns \
-  -H "Content-Type: application/json" \
-  -d '{"vpns":[{"pattern":"WF.echo.*","match_kind":"PREFIX","vpn_id":10}]}'
-```
+### 6. The System Doesn't Self-Modify
+Configuration comes from outside (admins, APIs). The system executes but doesn't decide its own rules. This is intentional. AI managing AI is powerful, but there's always a human-controlled layer at the top.
 
-OPA: compile + apply (autoversion):
+---
 
-```sh
-curl -X POST http://127.0.0.1:8080/opa/policy \
-  -H "Content-Type: application/json" \
-  -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'
-```
+## Current Status
 
-OPA: compile (staged, sin apply):
+This is a working specification with partial implementation. The core router, shared memory regions, and node communication are functional. The identity system and university model are specified but not yet implemented.
 
-```sh
-curl -X POST http://127.0.0.1:8080/opa/policy/compile \
-  -H "Content-Type: application/json" \
-  -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'
-```
+### Implemented
+- Core router with FIB and shared memory
+- Node library with split sender/receiver model
+- Inter-island gateway communication
+- OPA policy compilation and distribution
+- Configuration broadcast and replication
 
-OPA: check (alias compile, queda staged):
+### Specified, Not Yet Implemented
+- SY.identity service
+- Module/Degree/Graduation system
+- IO nodes (WhatsApp, Email, etc.)
+- AI agent framework
+- Workflow engine
 
-```sh
-curl -X POST http://127.0.0.1:8080/opa/policy/check \
-  -H "Content-Type: application/json" \
-  -d '{"rego":"package router\n\ndefault target = null\n"}'
-```
+---
 
-OPA: apply (requiere version):
+## Getting Started
 
-```sh
-curl -X POST http://127.0.0.1:8080/opa/policy/apply \
-  -H "Content-Type: application/json" \
-  -d '{"version":43}'
-```
+See the [Technical Specification](./docs/) for complete details.
 
-OPA: rollback:
+Key documents:
+- `01-arquitectura.md` - Architecture and concepts
+- `02-protocolo.md` - Message protocol and node library
+- `03-shm.md` - Shared memory structures
+- `04-routing.md` - FIB, VPNs, OPA integration
+- `10-identity-layer3.md` - Identity system and L3 routing
 
-```sh
-curl -X POST http://127.0.0.1:8080/opa/policy/rollback \
-  -H "Content-Type: application/json" \
-  -d '{}'
-```
+---
 
-Target por isla (unicast a SY.opa.rules@<isla>):
+## License
 
-```sh
-curl -X POST http://127.0.0.1:8080/opa/policy \
-  -H "Content-Type: application/json" \
-  -d '{"rego":"package router\n\ndefault target = null\n","target":"staging"}'
-```
+MIT License - see [LICENSE](LICENSE) for details.
+
+---
+
+## Contributing
+
+Contributions welcome. Please read the technical specifications first.
+
+---
+
+**Fluxbee** — *Where AI agents work together*
