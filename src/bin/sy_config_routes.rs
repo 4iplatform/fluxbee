@@ -158,12 +158,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut next_config = sy_config.clone();
                 match payload.subsystem.as_str() {
                     "routes" => {
-                        if let Some(routes) = parse_routes(&payload.config)? {
+                        let routes = match parse_routes(&payload.config) {
+                            Ok(routes) => routes,
+                            Err(err) => {
+                                tracing::warn!("invalid routes payload: {err}");
+                                continue;
+                            }
+                        };
+                        if let Some(routes) = routes {
                             next_config.routes = routes;
                         }
                     }
                     "vpn" | "vpns" => {
-                        if let Some(vpns) = parse_vpns(&payload.config)? {
+                        let vpns = match parse_vpns(&payload.config) {
+                            Ok(vpns) => vpns,
+                            Err(err) => {
+                                tracing::warn!("invalid vpns payload: {err}");
+                                continue;
+                            }
+                        };
+                        if let Some(vpns) = vpns {
                             next_config.vpns = vpns;
                         }
                     }
@@ -185,8 +199,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     next_config.version = payload.version;
                 }
                 next_config.updated_at = now_epoch_ms().to_string();
-                apply_config(&mut writer, &next_config)?;
-                write_config(&config_dir, &next_config)?;
+                if let Err(err) = apply_config(&mut writer, &next_config) {
+                    tracing::warn!("apply config failed: {err}");
+                    continue;
+                }
+                if let Err(err) = write_config(&config_dir, &next_config) {
+                    tracing::warn!("persist config failed: {err}");
+                    continue;
+                }
                 sy_config = next_config;
                 tracing::info!(
                     subsystem = %payload.subsystem,
@@ -508,7 +528,7 @@ fn action_kind(value: &str) -> Result<u8, Box<dyn std::error::Error>> {
     match value {
         "FORWARD" => Ok(ACTION_FORWARD),
         "DROP" => Ok(ACTION_DROP),
-        _ => Err("invalid action".into()),
+        _ => Err(format!("invalid action '{value}'").into()),
     }
 }
 
