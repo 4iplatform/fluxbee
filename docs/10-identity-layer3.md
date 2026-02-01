@@ -91,7 +91,6 @@ ilk:tenant-acme (tenant)
     "type": "user",
     "target": "AI.support.*",
     
-    "tenant": "ilk:tenant-acme",
     "src_ilk": "ilk:550e8400-e29b-41d4-a716-446655440000",
     "dst_ilk": "ilk:7c9e6679-7425-40de-944b-e07fc1f90ae7",
     "conversation_id": "conv:a1b2c3d4-5678-90ab-cdef-1234567890ab",
@@ -112,23 +111,24 @@ ilk:tenant-acme (tenant)
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `tenant` | string | Yes (L3) | ILK of tenant. OPA uses this to filter rules |
-| `src_ilk` | string | Yes (L3) | ILK of sending interlocutor |
+| `src_ilk` | string | Yes (L3) | ILK of sending interlocutor. OPA derives tenant via `data.identity` lookup |
 | `dst_ilk` | string | No | ILK of destination interlocutor (if known) |
 | `conversation_id` | string | Recommended | Conversation/thread ID |
 
-### 3.2 How tenant is resolved
+### 3.2 Tenant is derived, not sent
 
-The IO node resolves `tenant` from `src_ilk`:
+The message does NOT carry `tenant`. OPA derives it from `src_ilk`:
 
+```rego
+# OPA reads tenant from identity table
+tenant := data.identity[input.meta.src_ilk].tenant_ilk
 ```
-1. IO receives message from external channel (WhatsApp, email, etc.)
-2. IO reads SHM identity: resolve(channel, external_id) → src_ilk
-3. IO reads SHM identity: get(src_ilk).tenant_ilk → tenant
-4. IO puts both src_ilk and tenant in meta
-5. Message goes to router
-6. OPA filters rules by meta.tenant
-```
+
+**Why this is better:**
+- Single source of truth (identity table)
+- No redundancy in messages
+- Impossible to have ilk/tenant mismatch
+- Simpler IO nodes (just resolve ilk, done)
 
 ---
 
@@ -813,14 +813,39 @@ Emitted by SY.identity@mother when changes occur.
 
 ## 11. OPA and Layer 3
 
-OPA uses `meta.tenant` to filter which rules apply. All rules **MUST** include tenant condition:
+OPA derives `tenant` from `src_ilk` via `data.identity`. Rules can filter by tenant OR by specific ilk:
 
 ```rego
 package router
 
+# Helper: get tenant from ilk
+get_tenant(ilk) = tenant {
+    tenant := data.identity[ilk].tenant_ilk
+}
+
+# ============================================
+# RULES BY SPECIFIC ILK (highest priority)
+# ============================================
+
+# VIP client gets direct CEO support
+target = "AI.support.ceo@production" {
+    input.meta.src_ilk == "ilk:cliente-vip-especial"
+}
+
+# New agent needs supervision
+target = "AI.supervisor@production" {
+    input.meta.src_ilk == "ilk:agente-nuevo"
+    input.meta.context.needs_review == true
+}
+
+# ============================================
+# RULES BY TENANT
+# ============================================
+
 # ACME: Route based on dst_ilk (if it's an agent)
 target = node {
-    input.meta.tenant == "ilk:tenant-acme"
+    tenant := get_tenant(input.meta.src_ilk)
+    tenant == "ilk:tenant-acme"
     ilk := input.meta.dst_ilk
     ilk != null
     handler := data.identity[ilk].handler_node
@@ -830,7 +855,8 @@ target = node {
 
 # ACME: Route based on required capability
 target = node {
-    input.meta.tenant == "ilk:tenant-acme"
+    tenant := get_tenant(input.meta.src_ilk)
+    tenant == "ilk:tenant-acme"
     required := input.meta.context.required_capability
     some ilk
     data.identity[ilk].type == "agent"
@@ -840,9 +866,14 @@ target = node {
 
 # BETA: Different routing logic for this tenant
 target = "AI.support.premium@production" {
-    input.meta.tenant == "ilk:tenant-beta"
+    tenant := get_tenant(input.meta.src_ilk)
+    tenant == "ilk:tenant-beta"
     # All BETA traffic goes to premium support
 }
+
+# ============================================
+# AUTHORIZATION RULES
+# ============================================
 
 # Only internal humans can query system status (any tenant)
 allow {
@@ -853,7 +884,11 @@ allow {
 }
 ```
 
-**Key principle:** One policy file per island, containing rules for ALL tenants. Each rule filters by `input.meta.tenant`.
+**Key principles:**
+- One policy file per island, containing rules for ALL tenants
+- Rules by specific ilk have highest priority (most specific)
+- Rules by tenant are general (apply to all ilks of that tenant)
+- Tenant is derived from `src_ilk`, never sent in message
 
 ---
 
@@ -880,46 +915,43 @@ allow {
                    Receive ilk:new-uuid
                         │
                         ▼
-4. IO.whatsapp reads tenant from ILK:
-   get(ilk:abc123).tenant_ilk → ilk:tenant-acme
+4. IO.whatsapp builds message with src_ilk (NO tenant)
                 │
                 ▼
-5. IO.whatsapp builds message with src_ilk AND tenant
-                │
-                ▼
-6. Send to router:
+5. Send to router:
    {
      routing: { dst: null },
      meta: { 
        target: "AI.support.*",
-       tenant: "ilk:tenant-acme",
        src_ilk: "ilk:abc123"
      }
    }
                 │
                 ▼
-7. Router invokes OPA
+6. Router invokes OPA
                 │
                 ▼
-8. OPA filters rules by meta.tenant, decides: → AI.support.l1@production
+7. OPA derives tenant: data.identity["ilk:abc123"].tenant_ilk
+   OPA evaluates rules by tenant and/or ilk
+   OPA decides: → AI.support.l1@production
                 │
                 ▼
-9. Router delivers to AI.support.l1
+8. Router delivers to AI.support.l1
                 │
                 ▼
-10. AI.support.l1 reads degree from SHM:
-   - Verifies degree_hash integrity
-   - Gets compiled_prompt
-   - Processes message
+9. AI.support.l1 reads degree from SHM:
+    - Verifies degree_hash integrity
+    - Gets compiled_prompt
+    - Processes message
                 │
                 ▼
-11. AI.support.l1 responds with dst_ilk and tenant
+10. AI.support.l1 responds with dst_ilk
                 │
                 ▼
-12. OPA resolves dst_ilk → IO.whatsapp
+11. OPA resolves dst_ilk → IO.whatsapp
                 │
                 ▼
-13. IO.whatsapp sends to WhatsApp
+12. IO.whatsapp sends to WhatsApp
 ```
 
 ---

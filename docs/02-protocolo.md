@@ -62,7 +62,6 @@ Usado por OPA para decisiones de capa 2/3, y por el router para broadcast filtra
     "type": "user",
     "scope": "vpn",
     "target": "AI.soporte.l1@produccion",
-    "tenant": "ilk:tenant-acme",
     "src_ilk": "ilk:550e8400-e29b-41d4-a716-446655440000",
     "dst_ilk": "ilk:7c9e6679-7425-40de-944b-e07fc1f90ae7",
     "priority": "high",
@@ -80,8 +79,7 @@ Usado por OPA para decisiones de capa 2/3, y por el router para broadcast filtra
 | `msg` | string | Sí si type=system | Tipo de mensaje de sistema (ej: `"HELLO"`, `"LSA"`) |
 | `scope` | string | No | Alcance VPN para broadcast/multicast: `"vpn"` (default) o `"global"` (solo system) |
 | `target` | string | Condicional | Para OPA o broadcast filter (nombre L2 con @isla) |
-| `tenant` | string | Sí (L3) | ILK del tenant al que pertenece el mensaje. OPA filtra reglas por este campo |
-| `src_ilk` | string | Sí (L3) | ILK del interlocutor que envía |
+| `src_ilk` | string | Sí (L3) | ILK del interlocutor que envía. OPA deriva tenant de este campo via `data.identity` |
 | `dst_ilk` | string | No | ILK del interlocutor destino (si se conoce) |
 | `priority` | string | No | Hint de prioridad para OPA |
 | `context` | object | No | Datos adicionales para reglas OPA |
@@ -164,11 +162,7 @@ pub struct Meta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     
-    /// ILK del tenant (obligatorio para mensajes L3)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tenant: Option<String>,
-    
-    /// ILK del interlocutor origen
+    /// ILK del interlocutor origen. OPA deriva tenant via data.identity lookup
     #[serde(skip_serializing_if = "Option::is_none")]
     pub src_ilk: Option<String>,
     

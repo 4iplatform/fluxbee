@@ -413,7 +413,7 @@ Cuando `routing.dst = null`, el router consulta OPA para resolver el destino.
 
 ### 8.2 Input
 
-OPA recibe el mensaje completo (excepto payload) incluyendo `tenant` para filtrar reglas:
+OPA recibe el mensaje completo (excepto payload). El `src_ilk` permite derivar tenant via `data.identity`:
 
 ```json
 {
@@ -423,7 +423,6 @@ OPA recibe el mensaje completo (excepto payload) incluyendo `tenant` para filtra
   "meta": {
     "type": "user",
     "target": "AI.soporte.*",
-    "tenant": "ilk:tenant-acme",
     "src_ilk": "ilk:cliente-juan",
     "context": {
       "channel": "whatsapp"
@@ -440,61 +439,106 @@ OPA recibe el mensaje completo (excepto payload) incluyendo `tenant` para filtra
 }
 ```
 
-### 8.4 Reglas por Tenant
+### 8.4 Derivar tenant desde src_ilk
 
-Las reglas OPA **DEBEN** filtrar por `tenant`. Una policy por isla contiene reglas para todos los tenants:
+OPA accede a `data.identity` (cargado desde SHM) para obtener el tenant del ilk:
+
+```rego
+package router
+
+# Helper: obtener tenant de un ilk
+get_tenant(ilk) = tenant {
+    tenant := data.identity[ilk].tenant_ilk
+}
+```
+
+### 8.5 Reglas por Tenant
+
+Las reglas filtran por tenant derivado del `src_ilk`:
+
+```rego
+# Regla para tenant ACME: VIP va a L2
+target = "AI.soporte.l2@produccion" {
+    tenant := get_tenant(input.meta.src_ilk)
+    tenant == "ilk:tenant-acme"
+    input.meta.context.cliente_tier == "vip"
+}
+
+# Regla para tenant ACME: standard va a L1
+target = "AI.soporte.l1@produccion" {
+    tenant := get_tenant(input.meta.src_ilk)
+    tenant == "ilk:tenant-acme"
+    input.meta.context.cliente_tier == "standard"
+}
+
+# Regla para tenant BETA: todo va a L2 (política diferente)
+target = "AI.soporte.l2@produccion" {
+    tenant := get_tenant(input.meta.src_ilk)
+    tenant == "ilk:tenant-beta"
+}
+```
+
+### 8.6 Reglas por ILK específico
+
+También se pueden crear reglas para un ilk específico (cliente VIP, caso especial, etc.):
+
+```rego
+# Regla para un cliente específico (VIP máximo)
+target = "AI.soporte.ceo@produccion" {
+    input.meta.src_ilk == "ilk:cliente-importante-uuid"
+}
+
+# Regla para un agente específico
+target = "AI.supervisor@produccion" {
+    input.meta.src_ilk == "ilk:agente-nuevo-uuid"
+    input.meta.context.needs_review == true
+}
+```
+
+### 8.7 Orden de evaluación
+
+OPA evalúa reglas en orden. Reglas más específicas (por ilk) deben ir primero:
 
 ```rego
 package router
 
 default target = null
 
-# Regla para tenant ACME: VIP va a L2
-target = "AI.soporte.l2@produccion" {
-    input.meta.tenant == "ilk:tenant-acme"
-    input.meta.context.cliente_tier == "vip"
+# 1. Reglas por ILK específico (más específicas)
+target = "AI.soporte.ceo@produccion" {
+    input.meta.src_ilk == "ilk:cliente-vip-especial"
 }
 
-# Regla para tenant ACME: standard va a L1
+# 2. Reglas por tenant (generales)
 target = "AI.soporte.l1@produccion" {
-    input.meta.tenant == "ilk:tenant-acme"
-    input.meta.context.cliente_tier == "standard"
+    tenant := get_tenant(input.meta.src_ilk)
+    tenant == "ilk:tenant-acme"
 }
 
-# Regla para tenant BETA: todo va a L2 (política diferente)
-target = "AI.soporte.l2@produccion" {
-    input.meta.tenant == "ilk:tenant-beta"
-}
-
-# Regla para tenant GAMMA: escalar a humano si es queja
-target = "AI.soporte.human@produccion" {
-    input.meta.tenant == "ilk:tenant-gamma"
-    input.meta.context.intent == "complaint"
+# 3. Fallback (si no matchea nada)
+target = "AI.default@produccion" {
+    input.meta.src_ilk  # Solo si tiene ilk
 }
 ```
 
-### 8.5 Flujo de resolución tenant
+### 8.8 Acceso a data.identity
 
-```
-1. Mensaje llega a IO.whatsapp
-2. IO resuelve src_ilk del external_id (via SHM identity)
-3. IO lee tenant_ilk del src_ilk (via SHM identity)
-4. IO pone meta.tenant en el mensaje
-5. Router pasa mensaje a OPA
-6. OPA evalúa reglas que matchean meta.tenant
-7. OPA retorna target
-```
-
-### 8.6 Sin tenant = Sin routing OPA
-
-Si el mensaje no tiene `meta.tenant`, OPA puede:
-- Retornar `null` (no hay destino)
-- Tener una regla default sin tenant (no recomendado)
+`data.identity` contiene la tabla de ILKs cargada desde SHM:
 
 ```rego
-# NO RECOMENDADO: regla sin tenant
-target = "AI.default@produccion" {
-    not input.meta.tenant
+# Estructura disponible en data.identity[ilk]:
+# {
+#   "type": "human",
+#   "human_subtype": "external", 
+#   "tenant_ilk": "ilk:tenant-acme",
+#   "handler_node": null,
+#   "capabilities": []
+# }
+
+# Ejemplo: verificar tipo de ilk
+allow {
+    data.identity[input.meta.src_ilk].type == "human"
+    data.identity[input.meta.src_ilk].human_subtype == "internal"
 }
 ```
 
