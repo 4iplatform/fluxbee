@@ -1,7 +1,7 @@
 # JSON Router - 04 Routing
 
-**Estado:** v1.13  
-**Fecha:** 2025-01-20  
+**Estado:** v1.15  
+**Fecha:** 2026-02-01  
 **Audiencia:** Desarrolladores de router core
 
 ---
@@ -413,11 +413,21 @@ Cuando `routing.dst = null`, el router consulta OPA para resolver el destino.
 
 ### 8.2 Input
 
+OPA recibe el mensaje completo (excepto payload) incluyendo `tenant` para filtrar reglas:
+
 ```json
 {
-  "meta": { ... },
   "routing": {
     "src": "uuid-origen"
+  },
+  "meta": {
+    "type": "user",
+    "target": "AI.soporte.*",
+    "tenant": "ilk:tenant-acme",
+    "src_ilk": "ilk:cliente-juan",
+    "context": {
+      "channel": "whatsapp"
+    }
   }
 }
 ```
@@ -430,19 +440,61 @@ Cuando `routing.dst = null`, el router consulta OPA para resolver el destino.
 }
 ```
 
-### 8.4 Ejemplo de Policy (Rego)
+### 8.4 Reglas por Tenant
+
+Las reglas OPA **DEBEN** filtrar por `tenant`. Una policy por isla contiene reglas para todos los tenants:
 
 ```rego
 package router
 
 default target = null
 
+# Regla para tenant ACME: VIP va a L2
 target = "AI.soporte.l2@produccion" {
+    input.meta.tenant == "ilk:tenant-acme"
     input.meta.context.cliente_tier == "vip"
 }
 
+# Regla para tenant ACME: standard va a L1
 target = "AI.soporte.l1@produccion" {
+    input.meta.tenant == "ilk:tenant-acme"
     input.meta.context.cliente_tier == "standard"
+}
+
+# Regla para tenant BETA: todo va a L2 (política diferente)
+target = "AI.soporte.l2@produccion" {
+    input.meta.tenant == "ilk:tenant-beta"
+}
+
+# Regla para tenant GAMMA: escalar a humano si es queja
+target = "AI.soporte.human@produccion" {
+    input.meta.tenant == "ilk:tenant-gamma"
+    input.meta.context.intent == "complaint"
+}
+```
+
+### 8.5 Flujo de resolución tenant
+
+```
+1. Mensaje llega a IO.whatsapp
+2. IO resuelve src_ilk del external_id (via SHM identity)
+3. IO lee tenant_ilk del src_ilk (via SHM identity)
+4. IO pone meta.tenant en el mensaje
+5. Router pasa mensaje a OPA
+6. OPA evalúa reglas que matchean meta.tenant
+7. OPA retorna target
+```
+
+### 8.6 Sin tenant = Sin routing OPA
+
+Si el mensaje no tiene `meta.tenant`, OPA puede:
+- Retornar `null` (no hay destino)
+- Tener una regla default sin tenant (no recomendado)
+
+```rego
+# NO RECOMENDADO: regla sin tenant
+target = "AI.default@produccion" {
+    not input.meta.tenant
 }
 ```
 

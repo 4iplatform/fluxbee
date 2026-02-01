@@ -1,7 +1,7 @@
 # JSON Router - 02 Protocolo de Mensajes
 
-**Estado:** v1.13  
-**Fecha:** 2025-01-20  
+**Estado:** v1.15  
+**Fecha:** 2026-02-01  
 **Audiencia:** Desarrolladores de librería de nodo, desarrolladores de nodos
 
 ---
@@ -54,7 +54,7 @@ Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisi
 
 ## 3. Sección `meta` (Metadata para OPA y Sistema)
 
-Usado por OPA para decisiones de capa 2, y por el router para broadcast filtrado.
+Usado por OPA para decisiones de capa 2/3, y por el router para broadcast filtrado.
 
 ```json
 {
@@ -62,10 +62,13 @@ Usado por OPA para decisiones de capa 2, y por el router para broadcast filtrado
     "type": "user",
     "scope": "vpn",
     "target": "AI.soporte.l1@produccion",
+    "tenant": "ilk:tenant-acme",
+    "src_ilk": "ilk:550e8400-e29b-41d4-a716-446655440000",
+    "dst_ilk": "ilk:7c9e6679-7425-40de-944b-e07fc1f90ae7",
     "priority": "high",
     "context": {
-      "cliente_tier": "vip",
-      "caso_id": "12345"
+      "channel": "whatsapp",
+      "external_id": "+5491155551234"
     }
   }
 }
@@ -77,6 +80,9 @@ Usado por OPA para decisiones de capa 2, y por el router para broadcast filtrado
 | `msg` | string | Sí si type=system | Tipo de mensaje de sistema (ej: `"HELLO"`, `"LSA"`) |
 | `scope` | string | No | Alcance VPN para broadcast/multicast: `"vpn"` (default) o `"global"` (solo system) |
 | `target` | string | Condicional | Para OPA o broadcast filter (nombre L2 con @isla) |
+| `tenant` | string | Sí (L3) | ILK del tenant al que pertenece el mensaje. OPA filtra reglas por este campo |
+| `src_ilk` | string | Sí (L3) | ILK del interlocutor que envía |
+| `dst_ilk` | string | No | ILK del interlocutor destino (si se conoce) |
 | `priority` | string | No | Hint de prioridad para OPA |
 | `context` | object | No | Datos adicionales para reglas OPA |
 | `action` | string | No | Para mensajes admin: acción a ejecutar |
@@ -157,6 +163,18 @@ pub struct Meta {
     
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    
+    /// ILK del tenant (obligatorio para mensajes L3)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    
+    /// ILK del interlocutor origen
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_ilk: Option<String>,
+    
+    /// ILK del interlocutor destino
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_ilk: Option<String>,
     
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,

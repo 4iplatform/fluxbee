@@ -1,7 +1,7 @@
 # JSON Router - 10 Identity and Layer 3 (ILK)
 
-**Status:** v1.14  
-**Date:** 2026-01-30  
+**Status:** v1.15  
+**Date:** 2026-02-01  
 **Audience:** IO, AI, WF node developers, L3 routing
 
 ---
@@ -91,13 +91,13 @@ ilk:tenant-acme (tenant)
     "type": "user",
     "target": "AI.support.*",
     
+    "tenant": "ilk:tenant-acme",
     "src_ilk": "ilk:550e8400-e29b-41d4-a716-446655440000",
     "dst_ilk": "ilk:7c9e6679-7425-40de-944b-e07fc1f90ae7",
     "conversation_id": "conv:a1b2c3d4-5678-90ab-cdef-1234567890ab",
     
     "context": {
       "channel": "whatsapp",
-      "tenant_ilk": "ilk:tenant-acme",
       "external_id": "+5491155551234"
     }
   },
@@ -112,9 +112,23 @@ ilk:tenant-acme (tenant)
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| `tenant` | string | Yes (L3) | ILK of tenant. OPA uses this to filter rules |
 | `src_ilk` | string | Yes (L3) | ILK of sending interlocutor |
 | `dst_ilk` | string | No | ILK of destination interlocutor (if known) |
 | `conversation_id` | string | Recommended | Conversation/thread ID |
+
+### 3.2 How tenant is resolved
+
+The IO node resolves `tenant` from `src_ilk`:
+
+```
+1. IO receives message from external channel (WhatsApp, email, etc.)
+2. IO reads SHM identity: resolve(channel, external_id) → src_ilk
+3. IO reads SHM identity: get(src_ilk).tenant_ilk → tenant
+4. IO puts both src_ilk and tenant in meta
+5. Message goes to router
+6. OPA filters rules by meta.tenant
+```
 
 ---
 
@@ -799,13 +813,14 @@ Emitted by SY.identity@mother when changes occur.
 
 ## 11. OPA and Layer 3
 
-OPA can use L3 fields for routing decisions:
+OPA uses `meta.tenant` to filter which rules apply. All rules **MUST** include tenant condition:
 
 ```rego
 package router
 
-# Route based on dst_ilk (if it's an agent)
+# ACME: Route based on dst_ilk (if it's an agent)
 target = node {
+    input.meta.tenant == "ilk:tenant-acme"
     ilk := input.meta.dst_ilk
     ilk != null
     handler := data.identity[ilk].handler_node
@@ -813,8 +828,9 @@ target = node {
     node := handler
 }
 
-# Route based on required capability
+# ACME: Route based on required capability
 target = node {
+    input.meta.tenant == "ilk:tenant-acme"
     required := input.meta.context.required_capability
     some ilk
     data.identity[ilk].type == "agent"
@@ -822,7 +838,13 @@ target = node {
     node := data.identity[ilk].handler_node
 }
 
-# Only internal humans can query system status
+# BETA: Different routing logic for this tenant
+target = "AI.support.premium@production" {
+    input.meta.tenant == "ilk:tenant-beta"
+    # All BETA traffic goes to premium support
+}
+
+# Only internal humans can query system status (any tenant)
 allow {
     input.meta.action == "system_status"
     ilk := input.meta.src_ilk
@@ -830,6 +852,8 @@ allow {
     data.identity[ilk].human_subtype == "internal"
 }
 ```
+
+**Key principle:** One policy file per island, containing rules for ALL tenants. Each rule filters by `input.meta.tenant`.
 
 ---
 
@@ -843,7 +867,7 @@ allow {
                 │
                 ▼
 3. IO.whatsapp reads SHM jsr-identity:
-   resolve("whatsapp", "+5491155551234", "ilk:tenant-acme")
+   resolve("whatsapp", "+5491155551234") → ilk:abc123
                 │
         ┌───────┴───────┐
         │               │
@@ -856,41 +880,46 @@ allow {
                    Receive ilk:new-uuid
                         │
                         ▼
-4. IO.whatsapp builds message with src_ilk
+4. IO.whatsapp reads tenant from ILK:
+   get(ilk:abc123).tenant_ilk → ilk:tenant-acme
                 │
                 ▼
-5. Send to router:
+5. IO.whatsapp builds message with src_ilk AND tenant
+                │
+                ▼
+6. Send to router:
    {
      routing: { dst: null },
      meta: { 
        target: "AI.support.*",
+       tenant: "ilk:tenant-acme",
        src_ilk: "ilk:abc123"
      }
    }
                 │
                 ▼
-6. Router invokes OPA
+7. Router invokes OPA
                 │
                 ▼
-7. OPA decides: → AI.support.l1@production
+8. OPA filters rules by meta.tenant, decides: → AI.support.l1@production
                 │
                 ▼
-8. Router delivers to AI.support.l1
+9. Router delivers to AI.support.l1
                 │
                 ▼
-9. AI.support.l1 reads degree from SHM:
+10. AI.support.l1 reads degree from SHM:
    - Verifies degree_hash integrity
    - Gets compiled_prompt
    - Processes message
                 │
                 ▼
-10. AI.support.l1 responds with dst_ilk
+11. AI.support.l1 responds with dst_ilk and tenant
                 │
                 ▼
-11. OPA resolves dst_ilk → IO.whatsapp
+12. OPA resolves dst_ilk → IO.whatsapp
                 │
                 ▼
-12. IO.whatsapp sends to WhatsApp
+13. IO.whatsapp sends to WhatsApp
 ```
 
 ---
