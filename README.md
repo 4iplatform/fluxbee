@@ -252,6 +252,84 @@ See the [Technical Specification](./docs/) for complete details.
 
 This README explains the system and concepts. For how to run, build, and develop locally, see `DEVELOPMENT.md`.
 
+### Node Development Template (Rust)
+
+If you want to build a node in another repo, copy the client library and use it as a path dependency.
+
+**What to copy**
+```
+json-router/crates/jsr_client/
+```
+
+**Suggested structure**
+```
+my-node/
+├── Cargo.toml
+├── src/
+│   └── main.rs
+└── jsr_client/        # copied from json-router/crates/jsr_client
+```
+
+**Cargo.toml**
+```toml
+[package]
+name = "my-node"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.37", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.7", features = ["v4"] }
+jsr-client = { path = "./jsr_client" }
+```
+
+**Minimal node example**
+```rust
+use jsr_client::{connect, NodeConfig};
+use jsr_client::protocol::{Destination, Message, Meta, Routing};
+use uuid::Uuid;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = NodeConfig {
+        name: "WF.test".to_string(),
+        router_socket: "/var/run/json-router/routers".into(),
+        uuid_persistence_dir: "/var/lib/json-router/state/nodes".into(),
+        config_dir: "/etc/json-router".into(),
+        version: "1.0".to_string(),
+    };
+
+    let (sender, mut receiver) = connect(&config).await?;
+
+    let msg = Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            dst: Destination::Broadcast,
+            ttl: 16,
+            trace_id: Uuid::new_v4().to_string(),
+        },
+        meta: Meta {
+            msg_type: "user".to_string(),
+            msg: Some("HELLO".to_string()),
+            scope: None,
+            target: None,
+            action: None,
+            priority: None,
+            context: None,
+        },
+        payload: serde_json::json!({"hello":"world"}),
+    };
+    sender.send(msg).await?;
+
+    loop {
+        let msg = receiver.recv().await?;
+        println!("received: {:?}", msg);
+    }
+}
+```
+
 Key documents:
 - `01-arquitectura.md` - Architecture and concepts
 - `02-protocolo.md` - Message protocol and node library
