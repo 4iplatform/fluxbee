@@ -17,6 +17,9 @@ use json_router::shm::{
 
 type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 
+const BOOTSTRAP_SSH_USER: &str = "administrator";
+const BOOTSTRAP_SSH_PASS: &str = "magicAI";
+
 #[derive(Debug, Deserialize)]
 struct IslandFile {
     island_id: String,
@@ -603,15 +606,8 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
             "message": "wan.listen missing in island.yaml",
         });
     }
-    if !sshpass_available() {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SSH_NOT_AVAILABLE",
-            "message": "sshpass not available",
-        });
-    }
 
-    if let Err(err) = ssh_with_pass(address, "true") {
+    if let Err(err) = ssh_with_pass(address, "true", BOOTSTRAP_SSH_USER) {
         return serde_json::json!({
             "status": "error",
             "error_code": "SSH_AUTH_FAILED",
@@ -629,16 +625,15 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
     }
     let key_path = island_dir.join("ssh.key");
     let key_pub = island_dir.join("ssh.key.pub");
-    if let Err(err) = run_cmd(
-        Command::new("ssh-keygen")
-            .arg("-t")
-            .arg("ed25519")
-            .arg("-N")
-            .arg("")
-            .arg("-f")
-            .arg(&key_path),
-        "ssh-keygen",
-    ) {
+    let mut keygen = Command::new("ssh-keygen");
+    keygen
+        .arg("-t")
+        .arg("ed25519")
+        .arg("-N")
+        .arg("")
+        .arg("-f")
+        .arg(&key_path);
+    if let Err(err) = run_cmd(keygen, "ssh-keygen") {
         return serde_json::json!({
             "status": "error",
             "error_code": "SSH_KEY_FAILED",
@@ -656,7 +651,11 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
         }
     };
 
-    if let Err(err) = ssh_with_pass(address, "mkdir -p /root/.ssh && chmod 700 /root/.ssh") {
+    if let Err(err) = ssh_with_pass(
+        address,
+        &sudo_wrap("mkdir -p /root/.ssh && chmod 700 /root/.ssh"),
+        BOOTSTRAP_SSH_USER,
+    ) {
         return serde_json::json!({
             "status": "error",
             "error_code": "SSH_AUTH_FAILED",
@@ -664,15 +663,22 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
         });
     }
     let escaped = pub_key.replace('\'', "'\"'\"'");
-    let append_cmd = format!("printf '%s\\n' '{}' >> /root/.ssh/authorized_keys", escaped);
-    if let Err(err) = ssh_with_pass(address, &append_cmd) {
+    let append_cmd = format!(
+        "bash -lc \"printf '%s\\\\n' '{}' >> /root/.ssh/authorized_keys\"",
+        escaped
+    );
+    if let Err(err) = ssh_with_pass(address, &sudo_wrap(&append_cmd), BOOTSTRAP_SSH_USER) {
         return serde_json::json!({
             "status": "error",
             "error_code": "SSH_KEY_FAILED",
             "message": err.to_string(),
         });
     }
-    let _ = ssh_with_pass(address, "chmod 600 /root/.ssh/authorized_keys");
+    let _ = ssh_with_pass(
+        address,
+        &sudo_wrap("chmod 600 /root/.ssh/authorized_keys"),
+        BOOTSTRAP_SSH_USER,
+    );
 
     // NOTE: PasswordAuthentication disable step intentionally skipped for testing safety.
     // Spec: set PasswordAuthentication no and restart sshd.
@@ -693,7 +699,7 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
             });
         }
     }
-    if let Err(err) = scp_with_key(address, &key_path, &binaries, "/usr/bin/") {
+    if let Err(err) = scp_with_key(address, &key_path, &binaries, "/tmp/", BOOTSTRAP_SSH_USER) {
         return serde_json::json!({
             "status": "error",
             "error_code": "COPY_FAILED",
@@ -703,13 +709,15 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
     let _ = ssh_with_key(
         address,
         &key_path,
-        "chmod +x /usr/bin/sy-* /usr/bin/rt-*",
+        &sudo_wrap("mv /tmp/sy-* /usr/bin/ && mv /tmp/rt-* /usr/bin/ && chmod +x /usr/bin/sy-* /usr/bin/rt-*"),
+        BOOTSTRAP_SSH_USER,
     );
 
     let _ = ssh_with_key(
         address,
         &key_path,
-        "mkdir -p /etc/json-router /var/lib/json-router/nodes /var/lib/json-router/opa-rules /var/run/json-router/routers",
+        &sudo_wrap("mkdir -p /etc/json-router /var/lib/json-router/nodes /var/lib/json-router/opa-rules /var/run/json-router/routers"),
+        BOOTSTRAP_SSH_USER,
     );
 
     let wan_listen = state.wan_listen.clone().unwrap_or_default();
@@ -717,7 +725,12 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
         "island_id: {}\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\n",
         island_id, wan_listen
     );
-    if let Err(err) = write_remote_file(address, &key_path, "/etc/json-router/island.yaml", &island_yaml) {
+    if let Err(err) = write_remote_file(
+        address,
+        &key_path,
+        "/etc/json-router/island.yaml",
+        &island_yaml,
+    ) {
         return serde_json::json!({
             "status": "error",
             "error_code": "CONFIG_FAILED",
@@ -752,9 +765,24 @@ WantedBy=multi-user.target
         "/etc/systemd/system/sy-orchestrator.service",
         service,
     );
-    let _ = ssh_with_key(address, &key_path, "systemctl daemon-reload");
-    let _ = ssh_with_key(address, &key_path, "systemctl enable sy-orchestrator");
-    if let Err(err) = ssh_with_key(address, &key_path, "systemctl start sy-orchestrator") {
+    let _ = ssh_with_key(
+        address,
+        &key_path,
+        &sudo_wrap("systemctl daemon-reload"),
+        BOOTSTRAP_SSH_USER,
+    );
+    let _ = ssh_with_key(
+        address,
+        &key_path,
+        &sudo_wrap("systemctl enable sy-orchestrator"),
+        BOOTSTRAP_SSH_USER,
+    );
+    if let Err(err) = ssh_with_key(
+        address,
+        &key_path,
+        &sudo_wrap("systemctl start sy-orchestrator"),
+        BOOTSTRAP_SSH_USER,
+    ) {
         return serde_json::json!({
             "status": "error",
             "error_code": "SERVICE_FAILED",
@@ -849,49 +877,55 @@ fn run_cmd(mut cmd: Command, label: &str) -> Result<(), OrchestratorError> {
     Err(format!("{label} failed: {stderr}").into())
 }
 
-fn sshpass_available() -> bool {
-    Command::new("sshpass")
-        .arg("-V")
-        .output()
-        .is_ok()
+fn askpass_script(password: &str) -> Result<PathBuf, OrchestratorError> {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("jsr-askpass-{}.sh", now_epoch_ms()));
+    let contents = format!("#!/bin/sh\necho \"{}\"\n", password.replace('"', "\\\""));
+    fs::write(&path, contents)?;
+    let mut perms = fs::metadata(&path)?.permissions();
+    perms.set_readonly(false);
+    fs::set_permissions(&path, perms)?;
+    run_cmd(Command::new("chmod").arg("700").arg(&path), "chmod")?;
+    Ok(path)
 }
 
-fn ssh_with_pass(address: &str, command: &str) -> Result<(), OrchestratorError> {
-    if !sshpass_available() {
-        return Err("sshpass not available".into());
-    }
-    run_cmd(
-        Command::new("sshpass")
-            .arg("-p")
-            .arg("magicAI")
-            .arg("ssh")
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
-            .arg("-o")
-            .arg("UserKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg(format!("root@{address}"))
-            .arg(command),
-        "ssh",
-    )
+fn ssh_with_pass(address: &str, command: &str, user: &str) -> Result<(), OrchestratorError> {
+    let askpass = askpass_script(BOOTSTRAP_SSH_PASS)?;
+    let mut cmd = Command::new("setsid");
+    cmd.arg("ssh")
+        .arg("-o")
+        .arg("PreferredAuthentications=password")
+        .arg("-o")
+        .arg("PubkeyAuthentication=no")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(format!("{user}@{address}"))
+        .arg(command)
+        .env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", "jsr");
+    let result = run_cmd(cmd, "ssh");
+    let _ = fs::remove_file(&askpass);
+    result
 }
 
-fn ssh_with_key(address: &str, key_path: &Path, command: &str) -> Result<(), OrchestratorError> {
-    run_cmd(
-        Command::new("ssh")
-            .arg("-i")
-            .arg(key_path)
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
-            .arg("-o")
-            .arg("UserKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg(format!("root@{address}"))
-            .arg(command),
-        "ssh",
-    )
+fn ssh_with_key(address: &str, key_path: &Path, command: &str, user: &str) -> Result<(), OrchestratorError> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-i")
+        .arg(key_path)
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(format!("{user}@{address}"))
+        .arg(command);
+    run_cmd(cmd, "ssh")
 }
 
 fn scp_with_key(
@@ -899,6 +933,7 @@ fn scp_with_key(
     key_path: &Path,
     sources: &[&str],
     dest: &str,
+    user: &str,
 ) -> Result<(), OrchestratorError> {
     let mut cmd = Command::new("scp");
     cmd.arg("-i")
@@ -912,7 +947,7 @@ fn scp_with_key(
     for src in sources {
         cmd.arg(src);
     }
-    cmd.arg(format!("root@{address}:{dest}"));
+    cmd.arg(format!("{user}@{address}:{dest}"));
     run_cmd(cmd, "scp")
 }
 
@@ -924,7 +959,8 @@ fn write_remote_file(
 ) -> Result<(), OrchestratorError> {
     let escaped = contents.replace('\'', "'\"'\"'");
     let cmd = format!("cat > {} <<'EOF'\n{}\nEOF", remote_path, escaped);
-    ssh_with_key(address, key_path, &cmd)
+    let sudo_cmd = sudo_wrap(&format!("bash -lc \"{}\"", cmd.replace('"', "\\\"")));
+    ssh_with_key(address, key_path, &sudo_cmd, BOOTSTRAP_SSH_USER)
 }
 
 fn wait_for_wan(island_id: &str, remote_id: &str, timeout: Duration) -> Result<(), OrchestratorError> {
@@ -953,6 +989,11 @@ fn remote_island_match(entry: &RemoteIslandEntry, target: &str) -> bool {
     let len = entry.island_id_len as usize;
     let name = String::from_utf8_lossy(&entry.island_id[..len]);
     name == target
+}
+
+fn sudo_wrap(cmd: &str) -> String {
+    let pass = BOOTSTRAP_SSH_PASS.replace('\'', "'\"'\"'");
+    format!("echo '{}' | sudo -S -p '' {}", pass, cmd)
 }
 
 fn load_storage_path(config_dir: &Path) -> String {
