@@ -736,11 +736,44 @@ async fn handle_island_paths(
     if parts.first().copied() != Some("islands") {
         return Ok(None);
     }
-    if parts.len() < 2 {
-        return Ok(None);
+    if parts.len() == 1 {
+        match method {
+            "GET" => {
+                let (status, resp) = handle_admin_query(ctx, client, "list_islands", None).await?;
+                return Ok(Some((status, resp)));
+            }
+            "POST" => {
+                let payload = if body.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_slice(body)?
+                };
+                let (status, resp) =
+                    handle_admin_command(ctx, client, "add_island", payload, None).await?;
+                return Ok(Some((status, resp)));
+            }
+            _ => return Ok(None),
+        }
     }
     let island = parts[1].to_string();
     let rest = &parts[2..];
+    if rest.is_empty() {
+        return match method {
+            "GET" => {
+                let payload = serde_json::json!({ "island_id": island });
+                let (status, resp) =
+                    handle_admin_command(ctx, client, "get_island", payload, None).await?;
+                Ok(Some((status, resp)))
+            }
+            "DELETE" => {
+                let payload = serde_json::json!({ "island_id": island });
+                let (status, resp) =
+                    handle_admin_command(ctx, client, "remove_island", payload, None).await?;
+                Ok(Some((status, resp)))
+            }
+            _ => Ok(None),
+        };
+    }
     match (method, rest) {
         ("GET", ["routes"]) => {
             let (status, resp) = handle_admin_query(ctx, client, "list_routes", Some(island))
@@ -1336,7 +1369,8 @@ fn build_admin_request(
         "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn"
         | "delete_vpn" => "SY.config.routes",
         "list_nodes" | "run_node" | "kill_node" | "list_routers" | "run_router"
-        | "kill_router" | "island_status" | "get_storage" => "SY.orchestrator",
+        | "kill_router" | "island_status" | "get_storage" | "list_islands"
+        | "get_island" | "remove_island" | "add_island" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
     let target = if island_id.contains('@') {

@@ -31,7 +31,7 @@ Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `do
 - [x] Usar path default `/var/lib/json-router` si no hay config.
 
 ## 5) add_island (bootstrap remoto)
-- [ ] Validar `island_id` y `address` (errores: `ISLAND_EXISTS`, `INVALID_ADDRESS`).
+- [x] Validar `island_id` y `address` (errores: `ISLAND_EXISTS`, `INVALID_ADDRESS`).
 - [ ] SSH root@{address}:22 con pass `magicAI` (timeout 10s).
 - [ ] Generar key ed25519 en `/var/lib/json-router/islands/{id}/` (600).
 - [ ] Configurar SSH remoto: authorized_keys + disable password + restart sshd.

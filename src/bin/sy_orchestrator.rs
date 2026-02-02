@@ -320,6 +320,51 @@ async fn handle_admin(
                 }
             }
         }
+        "add_island" => {
+            let island_id = msg
+                .payload
+                .get("island_id")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string());
+            let address = msg
+                .payload
+                .get("address")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string());
+            let Some(island_id) = island_id else {
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "INVALID_REQUEST",
+                    "message": "missing island_id",
+                })
+            } else if island_exists(&state.state_dir, &island_id) {
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "ISLAND_EXISTS",
+                    "message": "island already exists",
+                })
+            } else if !valid_island_id(&island_id) {
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "INVALID_ISLAND_ID",
+                    "message": "invalid island_id",
+                })
+            } else if address.as_deref().map(valid_address).unwrap_or(false) == false {
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "INVALID_ADDRESS",
+                    "message": "invalid address",
+                })
+            } else {
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "SSH_NOT_IMPLEMENTED",
+                    "message": "ssh bootstrap not implemented yet",
+                    "island_id": island_id,
+                    "address": address,
+                })
+            }
+        }
         _ => serde_json::json!({
             "status": "error",
             "error_code": "NOT_IMPLEMENTED",
@@ -541,6 +586,42 @@ fn read_island_info(
     let yaml: serde_yaml::Value = serde_yaml::from_str(&data)?;
     let json = serde_json::to_value(yaml)?;
     Ok(json)
+}
+
+fn island_exists(state_dir: &Path, island_id: &str) -> bool {
+    state_dir.join("islands").join(island_id).exists()
+}
+
+fn valid_island_id(value: &str) -> bool {
+    if value.is_empty() || value.len() > 64 {
+        return false;
+    }
+    value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn valid_address(value: &str) -> bool {
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let value = value.trim();
+    if value.is_empty() || value.len() > 253 {
+        return false;
+    }
+    let labels = value.split('.').collect::<Vec<_>>();
+    if labels.iter().any(|label| label.is_empty() || label.len() > 63) {
+        return false;
+    }
+    labels.iter().all(|label| {
+        let bytes = label.as_bytes();
+        if bytes.first() == Some(&b'-') || bytes.last() == Some(&b'-') {
+            return false;
+        }
+        bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+    })
 }
 
 fn load_storage_path(config_dir: &Path) -> String {
