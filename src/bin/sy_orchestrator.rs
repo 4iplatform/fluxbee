@@ -128,6 +128,42 @@ async fn handle_admin(
                 "path": path,
             })
         }
+        "list_nodes" => {
+            serde_json::json!({
+                "status": "ok",
+                "nodes": [],
+            })
+        }
+        "list_routers" => {
+            serde_json::json!({
+                "status": "ok",
+                "routers": [],
+            })
+        }
+        "run_node" => {
+            serde_json::json!({
+                "status": "ok",
+                "message": "run_node stub",
+            })
+        }
+        "kill_node" => {
+            serde_json::json!({
+                "status": "ok",
+                "message": "kill_node stub",
+            })
+        }
+        "run_router" => {
+            serde_json::json!({
+                "status": "ok",
+                "message": "run_router stub",
+            })
+        }
+        "kill_router" => {
+            serde_json::json!({
+                "status": "ok",
+                "message": "kill_router stub",
+            })
+        }
         _ => serde_json::json!({
             "status": "error",
             "error_code": "NOT_IMPLEMENTED",

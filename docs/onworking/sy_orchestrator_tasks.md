@@ -18,10 +18,10 @@ Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `do
 - [ ] Shutdown ordenado (SIGTERM): AI/WF/IO → SY.* → RT.gateway, con espera 10s.
 
 ## 3) API interna (mensajes admin)
-- [ ] `list_nodes`, `run_node`, `kill_node`.
-- [ ] `list_routers`, `run_router`, `kill_router`.
-- [ ] `island_status` (estado completo de la isla).
-- [ ] `get_storage` (path actual).
+- [x] `list_nodes`, `run_node`, `kill_node` (stubs básicos).
+- [x] `list_routers`, `run_router`, `kill_router` (stubs básicos).
+- [x] `island_status` (estado completo de la isla).
+- [x] `get_storage` (path actual).
 - [ ] `set_storage` via CONFIG_CHANGED `subsystem=storage` (aplicar + persistir).
 
 ## 4) Storage (orchestrator.yaml)
