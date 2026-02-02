@@ -3,12 +3,21 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "Error: cargo not found. Install Rust toolchain first (https://rustup.rs) or run on a machine with cargo." >&2
+  exit 1
+fi
+
 echo "Building Rust binaries..."
 cargo build --release --bin json-router --bin sy-admin --bin sy-config-routes --bin sy-orchestrator
 
 if [[ -d "$ROOT_DIR/sy-opa-rules" ]]; then
-  echo "Building sy-opa-rules (Go)..."
-  (cd "$ROOT_DIR/sy-opa-rules" && go build -o sy-opa-rules .)
+  if ! command -v go >/dev/null 2>&1; then
+    echo "Warning: go not found. Skipping sy-opa-rules build." >&2
+  else
+    echo "Building sy-opa-rules (Go)..."
+    (cd "$ROOT_DIR/sy-opa-rules" && go build -o sy-opa-rules .)
+  fi
 fi
 
 sudo install -d /etc/json-router
