@@ -5,15 +5,33 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use tokio::time;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
 use jsr_client::protocol::{Destination, Message, Meta, Routing};
+use json_router::shm::{NodeEntry, RouterRegionReader, ShmSnapshot};
 
 type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Deserialize)]
 struct IslandFile {
     island_id: String,
+    wan: Option<WanSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentityFile {
+    shm: IdentityShm,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentityShm {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WanSection {
+    gateway_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +52,8 @@ struct OrchestratorState {
     island_id: String,
     started_at: Instant,
     config_dir: PathBuf,
+    state_dir: PathBuf,
+    gateway_name: String,
 }
 
 #[tokio::main]
@@ -54,10 +74,17 @@ async fn main() -> Result<(), OrchestratorError> {
     let socket_dir = PathBuf::from(json_router::paths::ROUTER_SOCKET_DIR);
 
     let island = load_island(&config_dir)?;
+    let gateway_name = island
+        .wan
+        .as_ref()
+        .and_then(|wan| wan.gateway_name.clone())
+        .unwrap_or_else(|| "RT.gateway".to_string());
     let state = OrchestratorState {
         island_id: island.island_id.clone(),
         started_at: Instant::now(),
         config_dir: config_dir.clone(),
+        state_dir: state_dir.clone(),
+        gateway_name,
     };
     ensure_dirs(&config_dir, &state_dir, &run_dir)?;
     write_pid(&run_dir)?;
@@ -128,18 +155,55 @@ async fn handle_admin(
                 "path": path,
             })
         }
-        "list_nodes" => {
-            serde_json::json!({
-                "status": "ok",
-                "nodes": [],
-            })
+        "set_storage" => {
+            let path = msg
+                .payload
+                .get("path")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string());
+            let Some(path) = path else {
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "INVALID_REQUEST",
+                    "message": "missing path",
+                })
+            } else {
+                if let Err(err) = persist_storage_path(&state.config_dir, &path) {
+                    serde_json::json!({
+                        "status": "error",
+                        "error_code": "PERSIST_FAILED",
+                        "message": err.to_string(),
+                    })
+                } else {
+                    serde_json::json!({
+                        "status": "ok",
+                        "path": path,
+                    })
+                }
+            }
         }
-        "list_routers" => {
-            serde_json::json!({
+        "list_nodes" => match load_router_snapshot(state) {
+            Ok(snapshot) => serde_json::json!({
                 "status": "ok",
-                "routers": [],
-            })
-        }
+                "nodes": nodes_from_snapshot(&snapshot),
+            }),
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "SHM_NOT_FOUND",
+                "message": err.to_string(),
+            }),
+        },
+        "list_routers" => match load_router_snapshot(state) {
+            Ok(snapshot) => serde_json::json!({
+                "status": "ok",
+                "routers": routers_from_snapshot(&snapshot),
+            }),
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "SHM_NOT_FOUND",
+                "message": err.to_string(),
+            }),
+        },
         "run_node" => {
             serde_json::json!({
                 "status": "ok",
@@ -228,6 +292,69 @@ fn write_pid(run_dir: &Path) -> Result<(), OrchestratorError> {
     Ok(())
 }
 
+fn ensure_l2_name(name: &str, island_id: &str) -> String {
+    if name.contains('@') {
+        name.to_string()
+    } else {
+        format!("{}@{}", name, island_id)
+    }
+}
+
+fn load_router_snapshot(state: &OrchestratorState) -> Result<ShmSnapshot, OrchestratorError> {
+    let router_l2_name = ensure_l2_name(&state.gateway_name, &state.island_id);
+    let identity_path = state
+        .state_dir
+        .join(&router_l2_name)
+        .join("identity.yaml");
+    let data = fs::read_to_string(&identity_path)?;
+    let identity: IdentityFile = serde_yaml::from_str(&data)?;
+    let shm_name = identity.shm.name;
+    let reader = RouterRegionReader::open_read_only(&shm_name)?;
+    reader
+        .read_snapshot()
+        .ok_or_else(|| "shm snapshot unavailable".into())
+}
+
+fn routers_from_snapshot(snapshot: &ShmSnapshot) -> Vec<serde_json::Value> {
+    vec![serde_json::json!({
+        "uuid": snapshot.header.router_uuid.to_string(),
+        "name": snapshot.header.router_name,
+        "is_gateway": snapshot.header.is_gateway,
+        "nodes_count": snapshot.header.node_count,
+        "heartbeat": snapshot.header.heartbeat,
+        "status": "alive",
+    })]
+}
+
+fn nodes_from_snapshot(snapshot: &ShmSnapshot) -> Vec<serde_json::Value> {
+    snapshot
+        .nodes
+        .iter()
+        .filter_map(|node| node_entry_to_json(node))
+        .collect()
+}
+
+fn node_entry_to_json(entry: &NodeEntry) -> Option<serde_json::Value> {
+    if entry.name_len == 0 {
+        return None;
+    }
+    let name = node_name(entry);
+    let uuid = Uuid::from_slice(&entry.uuid).ok()?;
+    Some(serde_json::json!({
+        "uuid": uuid.to_string(),
+        "name": name,
+        "vpn_id": entry.vpn_id,
+        "connected_at": entry.connected_at,
+        "status": "active",
+    }))
+}
+
+fn node_name(entry: &NodeEntry) -> String {
+    let len = entry.name_len as usize;
+    let name_bytes = &entry.name[..len];
+    String::from_utf8_lossy(name_bytes).into_owned()
+}
+
 fn load_storage_path(config_dir: &Path) -> String {
     let default_root = "/var/lib/json-router".to_string();
     let path = config_dir.join("orchestrator.yaml");
@@ -249,4 +376,13 @@ fn load_storage_path(config_dir: &Path) -> String {
         }
     }
     default_root
+}
+
+fn persist_storage_path(config_dir: &Path, path: &str) -> Result<(), OrchestratorError> {
+    let file_path = config_dir.join("orchestrator.yaml");
+    let data = serde_yaml::to_string(&serde_json::json!({
+        "storage": { "path": path }
+    }))?;
+    fs::write(file_path, data)?;
+    Ok(())
 }

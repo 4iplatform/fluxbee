@@ -3,9 +3,9 @@
 Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `docs/01-arquitectura.md`.
 
 ## 1) Bootstrap local (Fases 0–4)
-- [ ] Leer `/etc/json-router/island.yaml` y validar `island_id`.
-- [ ] Crear estructura de directorios (paths fijos de `07-operaciones`).
-- [ ] Escribir PID en `/var/run/json-router/orchestrator.pid`.
+- [x] Leer `/etc/json-router/island.yaml` y validar `island_id`.
+- [x] Crear estructura de directorios (paths fijos de `07-operaciones`).
+- [x] Escribir PID en `/var/run/json-router/orchestrator.pid`.
 - [ ] Levantar `RT.gateway` (systemd o exec) y esperar socket/shm (timeout 30s).
 - [ ] Levantar en paralelo: `SY.config.routes`, `SY.opa.rules`, `SY.admin` y esperar conexión (timeout 30s).
 - [ ] Conectar como nodo `SY.orchestrator@<isla>` (HELLO/ANNOUNCE) y entrar al loop principal.
@@ -18,16 +18,16 @@ Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `do
 - [ ] Shutdown ordenado (SIGTERM): AI/WF/IO → SY.* → RT.gateway, con espera 10s.
 
 ## 3) API interna (mensajes admin)
-- [x] `list_nodes`, `run_node`, `kill_node` (stubs básicos).
-- [x] `list_routers`, `run_router`, `kill_router` (stubs básicos).
+- [x] `list_nodes` (SHM router) / `run_node`, `kill_node` (stubs).
+- [x] `list_routers` (SHM router) / `run_router`, `kill_router` (stubs).
 - [x] `island_status` (estado completo de la isla).
 - [x] `get_storage` (path actual).
-- [ ] `set_storage` via CONFIG_CHANGED `subsystem=storage` (aplicar + persistir).
+- [x] `set_storage` via CONFIG_CHANGED `subsystem=storage` (aplicar + persistir).
 
 ## 4) Storage (orchestrator.yaml)
 - [ ] Mantener `storage.path` en memoria.
-- [ ] Persistir en `/var/lib/json-router/orchestrator.yaml`.
-- [ ] Usar path default `/var/lib/json-router` si no hay config.
+- [x] Persistir en `/etc/json-router/orchestrator.yaml`.
+- [x] Usar path default `/var/lib/json-router` si no hay config.
 
 ## 5) add_island (bootstrap remoto)
 - [ ] Validar `island_id` y `address` (errores: `ISLAND_EXISTS`, `INVALID_ADDRESS`).
