@@ -274,13 +274,7 @@ async fn handle_admin(
                 .get("island_id")
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
-            let Some(island_id) = island else {
-                serde_json::json!({
-                    "status": "error",
-                    "error_code": "INVALID_REQUEST",
-                    "message": "missing island_id",
-                })
-            } else {
+            if let Some(island_id) = island {
                 match get_island(&state.state_dir, &island_id) {
                     Ok(payload) => serde_json::json!({
                         "status": "ok",
@@ -292,6 +286,12 @@ async fn handle_admin(
                         "message": err.to_string(),
                     }),
                 }
+            } else {
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "INVALID_REQUEST",
+                    "message": "missing island_id",
+                })
             }
         }
         "remove_island" => {
@@ -300,13 +300,7 @@ async fn handle_admin(
                 .get("island_id")
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
-            let Some(island_id) = island else {
-                serde_json::json!({
-                    "status": "error",
-                    "error_code": "INVALID_REQUEST",
-                    "message": "missing island_id",
-                })
-            } else {
+            if let Some(island_id) = island {
                 match remove_island(&state.state_dir, &island_id) {
                     Ok(()) => serde_json::json!({
                         "status": "ok",
@@ -318,6 +312,12 @@ async fn handle_admin(
                         "message": err.to_string(),
                     }),
                 }
+            } else {
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "INVALID_REQUEST",
+                    "message": "missing island_id",
+                })
             }
         }
         "add_island" => {
@@ -331,37 +331,39 @@ async fn handle_admin(
                 .get("address")
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
-            let Some(island_id) = island_id else {
+            if let Some(island_id) = island_id {
+                if island_exists(&state.state_dir, &island_id) {
+                    serde_json::json!({
+                        "status": "error",
+                        "error_code": "ISLAND_EXISTS",
+                        "message": "island already exists",
+                    })
+                } else if !valid_island_id(&island_id) {
+                    serde_json::json!({
+                        "status": "error",
+                        "error_code": "INVALID_ISLAND_ID",
+                        "message": "invalid island_id",
+                    })
+                } else if address.as_deref().map(valid_address).unwrap_or(false) == false {
+                    serde_json::json!({
+                        "status": "error",
+                        "error_code": "INVALID_ADDRESS",
+                        "message": "invalid address",
+                    })
+                } else {
+                    serde_json::json!({
+                        "status": "error",
+                        "error_code": "SSH_NOT_IMPLEMENTED",
+                        "message": "ssh bootstrap not implemented yet",
+                        "island_id": island_id,
+                        "address": address,
+                    })
+                }
+            } else {
                 serde_json::json!({
                     "status": "error",
                     "error_code": "INVALID_REQUEST",
                     "message": "missing island_id",
-                })
-            } else if island_exists(&state.state_dir, &island_id) {
-                serde_json::json!({
-                    "status": "error",
-                    "error_code": "ISLAND_EXISTS",
-                    "message": "island already exists",
-                })
-            } else if !valid_island_id(&island_id) {
-                serde_json::json!({
-                    "status": "error",
-                    "error_code": "INVALID_ISLAND_ID",
-                    "message": "invalid island_id",
-                })
-            } else if address.as_deref().map(valid_address).unwrap_or(false) == false {
-                serde_json::json!({
-                    "status": "error",
-                    "error_code": "INVALID_ADDRESS",
-                    "message": "invalid address",
-                })
-            } else {
-                serde_json::json!({
-                    "status": "error",
-                    "error_code": "SSH_NOT_IMPLEMENTED",
-                    "message": "ssh bootstrap not implemented yet",
-                    "island_id": island_id,
-                    "address": address,
                 })
             }
         }
