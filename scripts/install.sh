@@ -10,7 +10,7 @@ if [[ "${SKIP_BUILD:-}" != "1" ]]; then
   fi
 
   echo "Building Rust binaries..."
-  cargo build --release --bin json-router --bin sy-admin --bin sy-config-routes --bin sy-orchestrator
+  cargo build --release --bins
 fi
 
 if [[ -d "$ROOT_DIR/sy-opa-rules" ]]; then
@@ -37,11 +37,20 @@ sudo install -d /var/lib/json-router/blob
 sudo install -d /var/run/json-router
 sudo install -d /var/run/json-router/routers
 
-echo "Installing binaries to /usr/bin..."
-sudo install -m 0755 "$ROOT_DIR/target/release/json-router" /usr/bin/rt-gateway
-sudo install -m 0755 "$ROOT_DIR/target/release/sy-admin" /usr/bin/sy-admin
-sudo install -m 0755 "$ROOT_DIR/target/release/sy-config-routes" /usr/bin/sy-config-routes
-sudo install -m 0755 "$ROOT_DIR/target/release/sy-orchestrator" /usr/bin/sy-orchestrator
+BIN_DIR="${BIN_DIR:-$ROOT_DIR/target/release}"
+if [[ "${SKIP_BUILD:-}" == "1" ]]; then
+  if [[ -d "$ROOT_DIR/target/release" ]]; then
+    BIN_DIR="$ROOT_DIR/target/release"
+  elif [[ -d "$ROOT_DIR/target/debug" ]]; then
+    BIN_DIR="$ROOT_DIR/target/debug"
+  fi
+fi
+
+echo "Installing binaries to /usr/bin from $BIN_DIR..."
+sudo install -m 0755 "$BIN_DIR/json-router" /usr/bin/rt-gateway
+sudo install -m 0755 "$BIN_DIR/sy-admin" /usr/bin/sy-admin
+sudo install -m 0755 "$BIN_DIR/sy-config-routes" /usr/bin/sy-config-routes
+sudo install -m 0755 "$BIN_DIR/sy-orchestrator" /usr/bin/sy-orchestrator
 if [[ -f "$ROOT_DIR/sy-opa-rules/sy-opa-rules" ]]; then
   sudo install -m 0755 "$ROOT_DIR/sy-opa-rules/sy-opa-rules" /usr/bin/sy-opa-rules
 fi
