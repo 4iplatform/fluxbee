@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tokio::time;
@@ -14,6 +14,26 @@ type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Debug, Deserialize)]
 struct IslandFile {
     island_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrchestratorFile {
+    #[serde(default)]
+    storage: Option<StorageSection>,
+    #[serde(default)]
+    storage_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StorageSection {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+struct OrchestratorState {
+    island_id: String,
+    started_at: Instant,
+    config_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -34,6 +54,11 @@ async fn main() -> Result<(), OrchestratorError> {
     let socket_dir = PathBuf::from(json_router::paths::ROUTER_SOCKET_DIR);
 
     let island = load_island(&config_dir)?;
+    let state = OrchestratorState {
+        island_id: island.island_id.clone(),
+        started_at: Instant::now(),
+        config_dir: config_dir.clone(),
+    };
     ensure_dirs(&config_dir, &state_dir, &run_dir)?;
     write_pid(&run_dir)?;
 
@@ -72,7 +97,7 @@ async fn main() -> Result<(), OrchestratorError> {
                 if msg.meta.msg_type != "admin" {
                     continue;
                 }
-                if let Err(err) = handle_admin(&sender, &msg).await {
+                if let Err(err) = handle_admin(&sender, &msg, &state).await {
                     tracing::warn!("admin action error: {err}");
                 }
             }
@@ -80,13 +105,35 @@ async fn main() -> Result<(), OrchestratorError> {
     }
 }
 
-async fn handle_admin(sender: &NodeSender, msg: &Message) -> Result<(), OrchestratorError> {
+async fn handle_admin(
+    sender: &NodeSender,
+    msg: &Message,
+    state: &OrchestratorState,
+) -> Result<(), OrchestratorError> {
     let action = msg.meta.action.as_deref().unwrap_or("");
-    let payload = serde_json::json!({
-        "status": "error",
-        "error_code": "NOT_IMPLEMENTED",
-        "message": format!("action '{action}' not implemented"),
-    });
+    let payload = match action {
+        "island_status" => {
+            let uptime_ms = state.started_at.elapsed().as_millis() as u64;
+            serde_json::json!({
+                "status": "ok",
+                "island_id": state.island_id,
+                "pid": std::process::id(),
+                "uptime_ms": uptime_ms,
+            })
+        }
+        "get_storage" => {
+            let path = load_storage_path(&state.config_dir);
+            serde_json::json!({
+                "status": "ok",
+                "path": path,
+            })
+        }
+        _ => serde_json::json!({
+            "status": "error",
+            "error_code": "NOT_IMPLEMENTED",
+            "message": format!("action '{action}' not implemented"),
+        }),
+    };
 
     let reply = Message {
         routing: Routing {
@@ -143,4 +190,27 @@ fn write_pid(run_dir: &Path) -> Result<(), OrchestratorError> {
     let pid = std::process::id();
     fs::write(pid_path, pid.to_string())?;
     Ok(())
+}
+
+fn load_storage_path(config_dir: &Path) -> String {
+    let default_root = "/var/lib/json-router".to_string();
+    let path = config_dir.join("orchestrator.yaml");
+    let data = match fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(_) => return default_root,
+    };
+    let parsed: OrchestratorFile = match serde_yaml::from_str(&data) {
+        Ok(parsed) => parsed,
+        Err(_) => return default_root,
+    };
+    if let Some(path) = parsed
+        .storage
+        .and_then(|storage| storage.path)
+        .or(parsed.storage_path)
+    {
+        if !path.trim().is_empty() {
+            return path;
+        }
+    }
+    default_root
 }
