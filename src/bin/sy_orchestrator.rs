@@ -161,26 +161,26 @@ async fn handle_admin(
                 .get("path")
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
-            let Some(path) = path else {
+            let payload = if let Some(path) = path {
+                match persist_storage_path(&state.config_dir, &path) {
+                    Ok(()) => serde_json::json!({
+                        "status": "ok",
+                        "path": path,
+                    }),
+                    Err(err) => serde_json::json!({
+                        "status": "error",
+                        "error_code": "PERSIST_FAILED",
+                        "message": err.to_string(),
+                    }),
+                }
+            } else {
                 serde_json::json!({
                     "status": "error",
                     "error_code": "INVALID_REQUEST",
                     "message": "missing path",
                 })
-            } else {
-                if let Err(err) = persist_storage_path(&state.config_dir, &path) {
-                    serde_json::json!({
-                        "status": "error",
-                        "error_code": "PERSIST_FAILED",
-                        "message": err.to_string(),
-                    })
-                } else {
-                    serde_json::json!({
-                        "status": "ok",
-                        "path": path,
-                    })
-                }
-            }
+            };
+            payload
         }
         "list_nodes" => match load_router_snapshot(state) {
             Ok(snapshot) => serde_json::json!({
