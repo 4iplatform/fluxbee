@@ -885,7 +885,9 @@ fn askpass_script(password: &str) -> Result<PathBuf, OrchestratorError> {
     let mut perms = fs::metadata(&path)?.permissions();
     perms.set_readonly(false);
     fs::set_permissions(&path, perms)?;
-    run_cmd(Command::new("chmod").arg("700").arg(&path), "chmod")?;
+    let mut chmod = Command::new("chmod");
+    chmod.arg("700").arg(&path);
+    run_cmd(chmod, "chmod")?;
     Ok(path)
 }
 
