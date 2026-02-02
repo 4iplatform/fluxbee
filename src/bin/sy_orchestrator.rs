@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -10,7 +11,9 @@ use tokio::sync::Mutex;
 
 use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
 use jsr_client::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
-use json_router::shm::{NodeEntry, RouterRegionReader, ShmSnapshot};
+use json_router::shm::{
+    now_epoch_ms, LsaRegionReader, NodeEntry, RemoteIslandEntry, RouterRegionReader, ShmSnapshot,
+};
 
 type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -33,6 +36,7 @@ struct IdentityShm {
 #[derive(Debug, Deserialize)]
 struct WanSection {
     gateway_name: Option<String>,
+    listen: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +60,7 @@ struct OrchestratorState {
     state_dir: PathBuf,
     gateway_name: String,
     storage_path: Mutex<String>,
+    wan_listen: Option<String>,
 }
 
 #[tokio::main]
@@ -81,6 +86,7 @@ async fn main() -> Result<(), OrchestratorError> {
         .as_ref()
         .and_then(|wan| wan.gateway_name.clone())
         .unwrap_or_else(|| "RT.gateway".to_string());
+    let wan_listen = island.wan.as_ref().and_then(|wan| wan.listen.clone());
     let storage_path = load_storage_path(&config_dir);
     let state = OrchestratorState {
         island_id: island.island_id.clone(),
@@ -89,6 +95,7 @@ async fn main() -> Result<(), OrchestratorError> {
         state_dir: state_dir.clone(),
         gateway_name,
         storage_path: Mutex::new(storage_path),
+        wan_listen,
     };
     ensure_dirs(&config_dir, &state_dir, &run_dir)?;
     write_pid(&run_dir)?;
@@ -332,33 +339,8 @@ async fn handle_admin(
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
             if let Some(island_id) = island_id {
-                if island_exists(&state.state_dir, &island_id) {
-                    serde_json::json!({
-                        "status": "error",
-                        "error_code": "ISLAND_EXISTS",
-                        "message": "island already exists",
-                    })
-                } else if !valid_island_id(&island_id) {
-                    serde_json::json!({
-                        "status": "error",
-                        "error_code": "INVALID_ISLAND_ID",
-                        "message": "invalid island_id",
-                    })
-                } else if address.as_deref().map(valid_address).unwrap_or(false) == false {
-                    serde_json::json!({
-                        "status": "error",
-                        "error_code": "INVALID_ADDRESS",
-                        "message": "invalid address",
-                    })
-                } else {
-                    serde_json::json!({
-                        "status": "error",
-                        "error_code": "SSH_NOT_IMPLEMENTED",
-                        "message": "ssh bootstrap not implemented yet",
-                        "island_id": island_id,
-                        "address": address,
-                    })
-                }
+                let address = address.unwrap_or_default();
+                add_island_flow(state, &island_id, &address)
             } else {
                 serde_json::json!({
                     "status": "error",
@@ -419,7 +401,9 @@ fn load_island(config_dir: &Path) -> Result<IslandFile, OrchestratorError> {
 fn ensure_dirs(config_dir: &Path, state_dir: &Path, run_dir: &Path) -> Result<(), OrchestratorError> {
     fs::create_dir_all(config_dir)?;
     fs::create_dir_all(state_dir.join("nodes"))?;
-    fs::create_dir_all(state_dir.join("islands"))?;
+    fs::create_dir_all(islands_root())?;
+    fs::create_dir_all(Path::new("/var/lib/json-router"))?;
+    fs::create_dir_all(Path::new("/var/lib/json-router/opa-rules"))?;
     fs::create_dir_all(run_dir)?;
     Ok(())
 }
@@ -538,8 +522,8 @@ async fn send_config_response(
     Ok(())
 }
 
-fn list_islands(state_dir: &Path) -> Result<Vec<serde_json::Value>, OrchestratorError> {
-    let root = state_dir.join("islands");
+fn list_islands(_state_dir: &Path) -> Result<Vec<serde_json::Value>, OrchestratorError> {
+    let root = islands_root();
     if !root.exists() {
         return Ok(Vec::new());
     }
@@ -564,13 +548,13 @@ fn list_islands(state_dir: &Path) -> Result<Vec<serde_json::Value>, Orchestrator
     Ok(out)
 }
 
-fn get_island(state_dir: &Path, island_id: &str) -> Result<serde_json::Value, OrchestratorError> {
-    let root = state_dir.join("islands");
+fn get_island(_state_dir: &Path, island_id: &str) -> Result<serde_json::Value, OrchestratorError> {
+    let root = islands_root();
     read_island_info(&root, island_id)
 }
 
-fn remove_island(state_dir: &Path, island_id: &str) -> Result<(), OrchestratorError> {
-    let root = state_dir.join("islands");
+fn remove_island(_state_dir: &Path, island_id: &str) -> Result<(), OrchestratorError> {
+    let root = islands_root();
     let dir = root.join(island_id);
     if !dir.exists() {
         return Err("island not found".into());
@@ -590,8 +574,230 @@ fn read_island_info(
     Ok(json)
 }
 
+fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) -> serde_json::Value {
+    if island_exists(&state.state_dir, island_id) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "ISLAND_EXISTS",
+            "message": "island already exists",
+        });
+    }
+    if !valid_island_id(island_id) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_ISLAND_ID",
+            "message": "invalid island_id",
+        });
+    }
+    if !valid_address(address) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_ADDRESS",
+            "message": "invalid address",
+        });
+    }
+    if state.wan_listen.as_deref().unwrap_or("").is_empty() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "MISSING_WAN_LISTEN",
+            "message": "wan.listen missing in island.yaml",
+        });
+    }
+    if !sshpass_available() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_NOT_AVAILABLE",
+            "message": "sshpass not available",
+        });
+    }
+
+    if let Err(err) = ssh_with_pass(address, "true") {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_AUTH_FAILED",
+            "message": err.to_string(),
+        });
+    }
+
+    let island_dir = islands_root().join(island_id);
+    if let Err(err) = fs::create_dir_all(&island_dir) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "IO_ERROR",
+            "message": err.to_string(),
+        });
+    }
+    let key_path = island_dir.join("ssh.key");
+    let key_pub = island_dir.join("ssh.key.pub");
+    if let Err(err) = run_cmd(
+        Command::new("ssh-keygen")
+            .arg("-t")
+            .arg("ed25519")
+            .arg("-N")
+            .arg("")
+            .arg("-f")
+            .arg(&key_path),
+        "ssh-keygen",
+    ) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_KEY_FAILED",
+            "message": err.to_string(),
+        });
+    }
+    let pub_key = match fs::read_to_string(&key_pub) {
+        Ok(data) => data.trim().to_string(),
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_KEY_FAILED",
+                "message": err.to_string(),
+            })
+        }
+    };
+
+    if let Err(err) = ssh_with_pass(address, "mkdir -p /root/.ssh && chmod 700 /root/.ssh") {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_AUTH_FAILED",
+            "message": err.to_string(),
+        });
+    }
+    let escaped = pub_key.replace('\'', "'\"'\"'");
+    let append_cmd = format!("printf '%s\\n' '{}' >> /root/.ssh/authorized_keys", escaped);
+    if let Err(err) = ssh_with_pass(address, &append_cmd) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_KEY_FAILED",
+            "message": err.to_string(),
+        });
+    }
+    let _ = ssh_with_pass(address, "chmod 600 /root/.ssh/authorized_keys");
+
+    // NOTE: PasswordAuthentication disable step intentionally skipped for testing safety.
+    // Spec: set PasswordAuthentication no and restart sshd.
+
+    let binaries = [
+        "/usr/bin/sy-orchestrator",
+        "/usr/bin/rt-gateway",
+        "/usr/bin/sy-config-routes",
+        "/usr/bin/sy-opa-rules",
+        "/usr/bin/sy-admin",
+    ];
+    for bin in binaries {
+        if !Path::new(bin).exists() {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "COPY_FAILED",
+                "message": format!("missing binary {bin}"),
+            });
+        }
+    }
+    if let Err(err) = scp_with_key(address, &key_path, &binaries, "/usr/bin/") {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "COPY_FAILED",
+            "message": err.to_string(),
+        });
+    }
+    let _ = ssh_with_key(
+        address,
+        &key_path,
+        "chmod +x /usr/bin/sy-* /usr/bin/rt-*",
+    );
+
+    let _ = ssh_with_key(
+        address,
+        &key_path,
+        "mkdir -p /etc/json-router /var/lib/json-router/nodes /var/lib/json-router/opa-rules /var/run/json-router/routers",
+    );
+
+    let wan_listen = state.wan_listen.clone().unwrap_or_default();
+    let island_yaml = format!(
+        "island_id: {}\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\n",
+        island_id, wan_listen
+    );
+    if let Err(err) = write_remote_file(address, &key_path, "/etc/json-router/island.yaml", &island_yaml) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "CONFIG_FAILED",
+            "message": err.to_string(),
+        });
+    }
+
+    let config_routes_yaml = "version: 1\nroutes: []\nvpns: []\n";
+    let _ = write_remote_file(
+        address,
+        &key_path,
+        "/etc/json-router/config-routes.yaml",
+        config_routes_yaml,
+    );
+
+    let service = r#"[Unit]
+Description=JSON Router Orchestrator
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sy-orchestrator
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"#;
+    let _ = write_remote_file(
+        address,
+        &key_path,
+        "/etc/systemd/system/sy-orchestrator.service",
+        service,
+    );
+    let _ = ssh_with_key(address, &key_path, "systemctl daemon-reload");
+    let _ = ssh_with_key(address, &key_path, "systemctl enable sy-orchestrator");
+    if let Err(err) = ssh_with_key(address, &key_path, "systemctl start sy-orchestrator") {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SERVICE_FAILED",
+            "message": err.to_string(),
+        });
+    }
+
+    let mut wan_connected = true;
+    if let Err(_) = wait_for_wan(&state.island_id, island_id, Duration::from_secs(60)) {
+        wan_connected = false;
+    }
+
+    let info_path = islands_root().join(island_id).join("info.yaml");
+    let info = serde_yaml::to_string(&serde_json::json!({
+        "island_id": island_id,
+        "address": address,
+        "created_at": now_epoch_ms().to_string(),
+        "status": if wan_connected { "connected" } else { "pending" },
+    }))
+    .unwrap_or_default();
+    let _ = fs::write(info_path, info);
+
+    if !wan_connected {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "WAN_TIMEOUT",
+            "island_id": island_id,
+            "address": address,
+            "wan_connected": false,
+        });
+    }
+
+    serde_json::json!({
+        "status": "ok",
+        "island_id": island_id,
+        "address": address,
+        "wan_connected": true,
+    })
+}
+
 fn island_exists(state_dir: &Path, island_id: &str) -> bool {
-    state_dir.join("islands").join(island_id).exists()
+    let _ = state_dir;
+    islands_root().join(island_id).exists()
 }
 
 fn valid_island_id(value: &str) -> bool {
@@ -626,9 +832,133 @@ fn valid_address(value: &str) -> bool {
     })
 }
 
+fn islands_root() -> PathBuf {
+    PathBuf::from("/var/lib/json-router/islands")
+}
+
+fn orchestrator_file_path() -> PathBuf {
+    PathBuf::from("/var/lib/json-router/orchestrator.yaml")
+}
+
+fn run_cmd(mut cmd: Command, label: &str) -> Result<(), OrchestratorError> {
+    let output = cmd.output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!("{label} failed: {stderr}").into())
+}
+
+fn sshpass_available() -> bool {
+    Command::new("sshpass")
+        .arg("-V")
+        .output()
+        .is_ok()
+}
+
+fn ssh_with_pass(address: &str, command: &str) -> Result<(), OrchestratorError> {
+    if !sshpass_available() {
+        return Err("sshpass not available".into());
+    }
+    run_cmd(
+        Command::new("sshpass")
+            .arg("-p")
+            .arg("magicAI")
+            .arg("ssh")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(format!("root@{address}"))
+            .arg(command),
+        "ssh",
+    )
+}
+
+fn ssh_with_key(address: &str, key_path: &Path, command: &str) -> Result<(), OrchestratorError> {
+    run_cmd(
+        Command::new("ssh")
+            .arg("-i")
+            .arg(key_path)
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(format!("root@{address}"))
+            .arg(command),
+        "ssh",
+    )
+}
+
+fn scp_with_key(
+    address: &str,
+    key_path: &Path,
+    sources: &[&str],
+    dest: &str,
+) -> Result<(), OrchestratorError> {
+    let mut cmd = Command::new("scp");
+    cmd.arg("-i")
+        .arg(key_path)
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("ConnectTimeout=10");
+    for src in sources {
+        cmd.arg(src);
+    }
+    cmd.arg(format!("root@{address}:{dest}"));
+    run_cmd(cmd, "scp")
+}
+
+fn write_remote_file(
+    address: &str,
+    key_path: &Path,
+    remote_path: &str,
+    contents: &str,
+) -> Result<(), OrchestratorError> {
+    let escaped = contents.replace('\'', "'\"'\"'");
+    let cmd = format!("cat > {} <<'EOF'\n{}\nEOF", remote_path, escaped);
+    ssh_with_key(address, key_path, &cmd)
+}
+
+fn wait_for_wan(island_id: &str, remote_id: &str, timeout: Duration) -> Result<(), OrchestratorError> {
+    let shm_name = format!("/jsr-lsa-{}", island_id);
+    let reader = LsaRegionReader::open_read_only(&shm_name)?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(snapshot) = reader.read_snapshot() {
+            if snapshot
+                .islands
+                .iter()
+                .any(|entry| remote_island_match(entry, remote_id))
+            {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Err("wan timeout".into())
+}
+
+fn remote_island_match(entry: &RemoteIslandEntry, target: &str) -> bool {
+    if entry.island_id_len == 0 {
+        return false;
+    }
+    let len = entry.island_id_len as usize;
+    let name = String::from_utf8_lossy(&entry.island_id[..len]);
+    name == target
+}
+
 fn load_storage_path(config_dir: &Path) -> String {
+    let _ = config_dir;
     let default_root = "/var/lib/json-router".to_string();
-    let path = config_dir.join("orchestrator.yaml");
+    let path = orchestrator_file_path();
     let data = match fs::read_to_string(&path) {
         Ok(data) => data,
         Err(_) => return default_root,
@@ -650,7 +980,8 @@ fn load_storage_path(config_dir: &Path) -> String {
 }
 
 fn persist_storage_path(config_dir: &Path, path: &str) -> Result<(), OrchestratorError> {
-    let file_path = config_dir.join("orchestrator.yaml");
+    let _ = config_dir;
+    let file_path = orchestrator_file_path();
     let data = serde_yaml::to_string(&serde_json::json!({
         "storage": { "path": path }
     }))?;

@@ -32,17 +32,17 @@ Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `do
 
 ## 5) add_island (bootstrap remoto)
 - [x] Validar `island_id` y `address` (errores: `ISLAND_EXISTS`, `INVALID_ADDRESS`).
-- [ ] SSH root@{address}:22 con pass `magicAI` (timeout 10s).
-- [ ] Generar key ed25519 en `/var/lib/json-router/islands/{id}/` (600).
-- [ ] Configurar SSH remoto: authorized_keys + disable password + restart sshd.
-- [ ] Copiar binarios `/usr/bin/sy-*` y `rt-*` (scp) + chmod +x.
-- [ ] Crear dirs remotos `/etc/json-router`, `/var/lib/json-router/*`, `/var/run/json-router/routers`.
-- [ ] Crear `/etc/json-router/island.yaml` remoto (uplink hacia mother).
-- [ ] Crear `/etc/json-router/config-routes.yaml` vacío.
-- [ ] Instalar `sy-orchestrator.service` y `systemctl enable`.
-- [ ] `systemctl start sy-orchestrator`.
-- [ ] Esperar WAN (60s), validar LSA; si falla → `WAN_TIMEOUT`.
-- [ ] Registrar `/var/lib/json-router/islands/{id}/info.yaml` (status, address, created_at).
+- [x] SSH root@{address}:22 con pass `magicAI` (timeout 10s).
+- [x] Generar key ed25519 en `/var/lib/json-router/islands/{id}/` (600).
+- [ ] Configurar SSH remoto: authorized_keys + disable password + restart sshd. (password disable pendiente)
+- [x] Copiar binarios `/usr/bin/sy-*` y `rt-*` (scp) + chmod +x.
+- [x] Crear dirs remotos `/etc/json-router`, `/var/lib/json-router/*`, `/var/run/json-router/routers`.
+- [x] Crear `/etc/json-router/island.yaml` remoto (uplink hacia mother).
+- [x] Crear `/etc/json-router/config-routes.yaml` vacío.
+- [x] Instalar `sy-orchestrator.service` y `systemctl enable`.
+- [x] `systemctl start sy-orchestrator`.
+- [x] Esperar WAN (60s), validar LSA; si falla → `WAN_TIMEOUT`.
+- [x] Registrar `/var/lib/json-router/islands/{id}/info.yaml` (status, address, created_at).
 
 ## 6) Repo de islas
 - [x] `list_islands`, `get_island`, `remove_island` (solo registro local).
