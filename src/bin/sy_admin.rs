@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use std::future;
+use tar::{Archive, Builder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
@@ -366,6 +368,27 @@ struct ConfigUpdate {
     version: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct StorageUpdate {
+    path: String,
+    #[serde(default)]
+    version: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrchestratorFile {
+    #[serde(default)]
+    storage: Option<StorageSection>,
+    #[serde(default)]
+    storage_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StorageSection {
+    #[serde(default)]
+    path: Option<String>,
+}
+
 #[derive(Debug)]
 struct AdminRequest {
     action: String,
@@ -498,9 +521,25 @@ async fn handle_http(
         respond_json(stream, status, &resp).await?;
         return Ok(());
     }
+    if let Some((status, resp, content_type)) =
+        handle_modules_paths(method.as_str(), path, &body).await?
+    {
+        match content_type {
+            Some(ct) => respond_bytes(stream, status, &ct, &resp).await?,
+            None => {
+                let body = String::from_utf8_lossy(&resp);
+                respond_json(stream, status, &body).await?
+            }
+        }
+        return Ok(());
+    }
     match (method.as_str(), path) {
         ("GET", "/health") => {
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
+        }
+        ("GET", "/island/status") => {
+            let (status, resp) = handle_admin_query(ctx, client, "island_status", None).await?;
+            respond_json(stream, status, &resp).await?;
         }
         ("GET", "/routes") => {
             let island = query.get("island").cloned();
@@ -609,6 +648,26 @@ async fn handle_http(
                 let _ = tx.send(BroadcastRequest::Vpns(vpns));
             }
             tracing::info!("config vpns update received");
+            respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
+        }
+        ("GET", "/config/storage") => {
+            let (status, resp) = handle_admin_query(ctx, client, "get_storage", None).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("PUT", "/config/storage") => {
+            let update: StorageUpdate = serde_json::from_slice(&body)?;
+            let version = update.version.unwrap_or(0);
+            broadcast_config_changed(
+                client,
+                "storage",
+                None,
+                None,
+                version,
+                serde_json::json!({ "path": update.path }),
+                None,
+            )
+            .await?;
+            tracing::info!("config storage update received");
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
         }
         ("POST", "/opa/policy") => {
@@ -820,6 +879,102 @@ async fn handle_island_paths(
     }
 }
 
+async fn handle_modules_paths(
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<Option<(u16, Vec<u8>, Option<String>)>, AdminError> {
+    let trimmed = path.trim_matches('/');
+    let parts = trimmed.split('/').collect::<Vec<_>>();
+    if parts.first().copied() != Some("modules") {
+        return Ok(None);
+    }
+    let storage_root = storage_root();
+    let modules_root = storage_root.join("modules");
+    match (method, parts.as_slice()) {
+        ("GET", ["modules"]) => {
+            let modules = list_dirs(&modules_root)?;
+            let body = serde_json::json!({
+                "status": "ok",
+                "modules": modules,
+            })
+            .to_string()
+            .into_bytes();
+            Ok(Some((200, body, None)))
+        }
+        ("GET", ["modules", name]) => {
+            let name = decode_percent(name);
+            let versions = list_dirs(&modules_root.join(&name))?;
+            let body = serde_json::json!({
+                "status": "ok",
+                "name": name,
+                "versions": versions,
+            })
+            .to_string()
+            .into_bytes();
+            Ok(Some((200, body, None)))
+        }
+        ("GET", ["modules", name, version]) => {
+            let name = decode_percent(name);
+            let version = decode_percent(version);
+            let module_path = modules_root.join(&name).join(&version);
+            if !module_path.exists() {
+                let body = serde_json::json!({
+                    "status": "error",
+                    "error_code": "NOT_FOUND",
+                })
+                .to_string()
+                .into_bytes();
+                return Ok(Some((404, body, None)));
+            }
+            if module_path.is_file() {
+                let data = fs::read(&module_path)?;
+                return Ok(Some((200, data, Some("application/octet-stream".to_string()))));
+            }
+            let mut builder = Builder::new(Vec::new());
+            builder.append_dir_all(".", &module_path)?;
+            let data = builder.into_inner()?;
+            Ok(Some((200, data, Some("application/x-tar".to_string()))))
+        }
+        ("POST", ["modules", name, version]) => {
+            let name = decode_percent(name);
+            let version = decode_percent(version);
+            let module_dir = modules_root.join(&name).join(&version);
+            if module_dir.exists() {
+                let body = serde_json::json!({
+                    "status": "error",
+                    "error_code": "MODULE_EXISTS",
+                })
+                .to_string()
+                .into_bytes();
+                return Ok(Some((409, body, None)));
+            }
+            fs::create_dir_all(&module_dir)?;
+            let mut archive = Archive::new(Cursor::new(body));
+            if let Err(err) = archive.unpack(&module_dir) {
+                let _ = fs::remove_dir_all(&module_dir);
+                let body = serde_json::json!({
+                    "status": "error",
+                    "error_code": "INVALID_ARCHIVE",
+                    "error_detail": err.to_string(),
+                })
+                .to_string()
+                .into_bytes();
+                return Ok(Some((400, body, None)));
+            }
+            let body = serde_json::json!({
+                "status": "ok",
+                "name": name,
+                "version": version,
+            })
+            .to_string()
+            .into_bytes();
+            Ok(Some((200, body, None)))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn decode_percent(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -849,6 +1004,46 @@ fn from_hex(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+fn storage_root() -> PathBuf {
+    let default_root = PathBuf::from("/var/lib/json-router");
+    let path = default_root.join("orchestrator.yaml");
+    let data = match fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(_) => return default_root,
+    };
+    let parsed: OrchestratorFile = match serde_yaml::from_str(&data) {
+        Ok(parsed) => parsed,
+        Err(_) => return default_root,
+    };
+    if let Some(path) = parsed
+        .storage
+        .and_then(|storage| storage.path)
+        .or(parsed.storage_path)
+    {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    default_root
+}
+
+fn list_dirs(path: &Path) -> Result<Vec<String>, AdminError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            if let Some(name) = entry.file_name().to_str() {
+                entries.push(name.to_string());
+            }
+        }
+    }
+    entries.sort();
+    Ok(entries)
 }
 
 async fn read_http_request(
@@ -943,6 +1138,7 @@ async fn respond_json(
         200 => "HTTP/1.1 200 OK",
         400 => "HTTP/1.1 400 Bad Request",
         404 => "HTTP/1.1 404 Not Found",
+        409 => "HTTP/1.1 409 Conflict",
         _ => "HTTP/1.1 500 Internal Server Error",
     };
     let response = format!(
@@ -951,6 +1147,28 @@ async fn respond_json(
         body
     );
     stream.write_all(response.as_bytes()).await?;
+    Ok(())
+}
+
+async fn respond_bytes(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(), AdminError> {
+    let status_line = match status {
+        200 => "HTTP/1.1 200 OK",
+        400 => "HTTP/1.1 400 Bad Request",
+        404 => "HTTP/1.1 404 Not Found",
+        409 => "HTTP/1.1 409 Conflict",
+        _ => "HTTP/1.1 500 Internal Server Error",
+    };
+    let header = format!(
+        "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(body).await?;
     Ok(())
 }
 
@@ -1118,7 +1336,7 @@ fn build_admin_request(
         "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn"
         | "delete_vpn" => "SY.config.routes",
         "list_nodes" | "run_node" | "kill_node" | "list_routers" | "run_router"
-        | "kill_router" => "SY.orchestrator",
+        | "kill_router" | "island_status" | "get_storage" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
     let target = if island_id.contains('@') {

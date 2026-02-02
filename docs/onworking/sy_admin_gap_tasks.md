@@ -4,9 +4,9 @@ Lista de tareas para alinear `SY.admin` con la especificación actual.
 
 ## Endpoints y flujos faltantes
 - [ ] Implementar `/islands` (POST/GET/GET {id}/DELETE) + `add_island` completo (SSH bootstrap, keygen, scp, systemd, espera WAN, repo en `/var/lib/json-router/islands`).
-- [ ] Implementar `GET /island/status` (estado completo de isla).
-- [ ] Implementar `GET/PUT /config/storage` con broadcast `CONFIG_CHANGED` subsystem `storage`.
-- [ ] Implementar API de módulos: `/modules`, `/modules/{name}`, `/modules/{name}/{version}` (list/get/upload).
+- [x] Implementar `GET /island/status` (estado completo de isla).
+- [x] Implementar `GET/PUT /config/storage` con broadcast `CONFIG_CHANGED` subsystem `storage`.
+- [x] Implementar API de módulos: `/modules`, `/modules/{name}`, `/modules/{name}/{version}` (list/get/upload).
 - [ ] Revisar presencia/ausencia de `SY.orchestrator` en el repo y ajustar `/nodes` y `/routers` si el binario no existe.
 
 ## Desalineaciones con la spec
