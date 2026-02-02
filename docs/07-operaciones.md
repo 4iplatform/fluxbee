@@ -1,7 +1,7 @@
 # JSON Router - 07 Operaciones
 
-**Estado:** v1.13  
-**Fecha:** 2025-01-26  
+**Estado:** v1.15  
+**Fecha:** 2026-02-01  
 **Audiencia:** Ops/SRE, desarrolladores de deployment
 
 ---
@@ -62,7 +62,8 @@ Todos los binarios conocen estos paths por código:
 ├── jsr-<router-uuid>
 ├── jsr-config-<island>
 ├── jsr-lsa-<island>
-└── jsr-opa-<island>               # WASM de policy OPA
+├── jsr-opa-<island>               # WASM de policy OPA
+└── jsr-identity-<island>          # Identity table (ILKs, degrees, modules)
 ```
 
 ---
@@ -167,9 +168,10 @@ systemctl start sy-orchestrator
 ├──────────────────────────────────────────────────────────────┤
 │ En paralelo:                                                 │
 │ 1. Ejecutar SY.config.routes → crea jsr-config-<island>     │
-│ 2. Ejecutar SY.opa.rules                                    │
-│ 3. Ejecutar SY.admin → API HTTP disponible                  │
-│ 4. Esperar que todos conecten al router (30s timeout)       │
+│ 2. Ejecutar SY.opa.rules     → crea jsr-opa-<island>        │
+│ 3. Ejecutar SY.identity      → crea jsr-identity-<island>   │
+│ 4. Ejecutar SY.admin         → API HTTP disponible          │
+│ 5. Esperar que todos conecten al router (30s timeout)       │
 └──────────────────────────────────────────────────────────────┘
                             │
                             ▼
@@ -202,6 +204,7 @@ El orchestrator verifica periódicamente (cada 5s) que los componentes críticos
 | RT.gateway | Reiniciar inmediatamente |
 | SY.config.routes | Reiniciar inmediatamente |
 | SY.opa.rules | Reiniciar inmediatamente |
+| SY.identity | Reiniciar inmediatamente |
 | SY.admin | Reiniciar inmediatamente |
 | AI.*, WF.*, IO.* | Log warning, no reiniciar (el usuario decide) |
 
@@ -214,7 +217,7 @@ systemctl stop sy-orchestrator
 El orchestrator hace shutdown ordenado:
 1. Envía SIGTERM a todos los nodos AI/WF/IO que levantó
 2. Espera 10s
-3. Envía SIGTERM a SY.admin, SY.config.routes, SY.opa.rules
+3. Envía SIGTERM a SY.admin, SY.config.routes, SY.opa.rules, SY.identity
 4. Envía SIGTERM a RT.gateway
 5. Sale
 
@@ -692,7 +695,32 @@ Con NFS no hay HTTP, todas las islas leen del mismo filesystem.
 Cada SY.orchestrator al recibir esto:
 1. Actualiza `storage_path` en memoria
 2. Persiste en `/var/lib/json-router/orchestrator.yaml`
-3. Próximas operaciones de módulos usan el nuevo path
+3. Envía CONFIG_RESPONSE a SY.admin
+4. Próximas operaciones de módulos usan el nuevo path
+
+**CONFIG_RESPONSE:**
+
+```json
+{
+  "routing": {
+    "src": "<uuid-sy-orchestrator>",
+    "dst": "<uuid-sy-admin>",
+    "ttl": 16,
+    "trace_id": "<uuid-del-config-changed>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "CONFIG_RESPONSE"
+  },
+  "payload": {
+    "subsystem": "storage",
+    "version": 1,
+    "island": "staging",
+    "node": "SY.orchestrator@staging",
+    "status": "ok"
+  }
+}
+```
 
 ### 6.6 Transición HTTP → NFS
 
@@ -759,6 +787,7 @@ curl -X POST http://localhost:8080/islands \
 | SY.admin | ❌ No | Sin él no hay API |
 | SY.config.routes | ❌ No | Crítico para routing |
 | SY.opa.rules | ❌ No | Crítico para policies |
+| SY.identity | ❌ No | Crítico para L3/ILKs |
 | AI.*, WF.*, IO.* | ✅ Sí | Nodos de aplicación |
 
 ---
@@ -856,6 +885,7 @@ pub const WATCHDOG_INTERVAL_MS: u64 = 5_000;
 pub const BOOTSTRAP_SY_NODES: &[&str] = &[
     "SY.config.routes",
     "SY.opa.rules",
+    "SY.identity",
     "SY.admin",
 ];
 

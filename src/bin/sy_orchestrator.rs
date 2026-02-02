@@ -6,9 +6,10 @@ use serde::Deserialize;
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+use tokio::sync::Mutex;
 
 use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
-use jsr_client::protocol::{Destination, Message, Meta, Routing};
+use jsr_client::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use json_router::shm::{NodeEntry, RouterRegionReader, ShmSnapshot};
 
 type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
@@ -54,6 +55,7 @@ struct OrchestratorState {
     config_dir: PathBuf,
     state_dir: PathBuf,
     gateway_name: String,
+    storage_path: Mutex<String>,
 }
 
 #[tokio::main]
@@ -79,12 +81,14 @@ async fn main() -> Result<(), OrchestratorError> {
         .as_ref()
         .and_then(|wan| wan.gateway_name.clone())
         .unwrap_or_else(|| "RT.gateway".to_string());
+    let storage_path = load_storage_path(&config_dir);
     let state = OrchestratorState {
         island_id: island.island_id.clone(),
         started_at: Instant::now(),
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
         gateway_name,
+        storage_path: Mutex::new(storage_path),
     };
     ensure_dirs(&config_dir, &state_dir, &run_dir)?;
     write_pid(&run_dir)?;
@@ -149,7 +153,7 @@ async fn handle_admin(
             })
         }
         "get_storage" => {
-            let path = load_storage_path(&state.config_dir);
+            let path = state.storage_path.lock().await.clone();
             serde_json::json!({
                 "status": "ok",
                 "path": path,
@@ -180,6 +184,36 @@ async fn handle_admin(
                     "message": "missing path",
                 })
             };
+            let status = payload
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("error");
+            if status == "ok" {
+                if let Some(path) = payload.get("path").and_then(|value| value.as_str()) {
+                    let mut guard = state.storage_path.lock().await;
+                    *guard = path.to_string();
+                }
+            }
+            let error_code = payload
+                .get("error_code")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string());
+            let error_detail = payload
+                .get("message")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string());
+            let version = msg.payload.get("version").and_then(|value| value.as_u64()).unwrap_or(0);
+            let _ = send_config_response(
+                sender,
+                msg,
+                "storage",
+                version,
+                status,
+                error_code,
+                error_detail,
+                &state.island_id,
+            )
+            .await;
             payload
         }
         "list_nodes" => match load_router_snapshot(state) {
@@ -227,6 +261,64 @@ async fn handle_admin(
                 "status": "ok",
                 "message": "kill_router stub",
             })
+        }
+        "list_islands" => {
+            serde_json::json!({
+                "status": "ok",
+                "islands": list_islands(&state.state_dir)?,
+            })
+        }
+        "get_island" => {
+            let island = msg
+                .payload
+                .get("island_id")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string());
+            let Some(island_id) = island else {
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "INVALID_REQUEST",
+                    "message": "missing island_id",
+                })
+            } else {
+                match get_island(&state.state_dir, &island_id) {
+                    Ok(payload) => serde_json::json!({
+                        "status": "ok",
+                        "island": payload,
+                    }),
+                    Err(err) => serde_json::json!({
+                        "status": "error",
+                        "error_code": "NOT_FOUND",
+                        "message": err.to_string(),
+                    }),
+                }
+            }
+        }
+        "remove_island" => {
+            let island = msg
+                .payload
+                .get("island_id")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string());
+            let Some(island_id) = island else {
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "INVALID_REQUEST",
+                    "message": "missing island_id",
+                })
+            } else {
+                match remove_island(&state.state_dir, &island_id) {
+                    Ok(()) => serde_json::json!({
+                        "status": "ok",
+                        "island_id": island_id,
+                    }),
+                    Err(err) => serde_json::json!({
+                        "status": "error",
+                        "error_code": "NOT_FOUND",
+                        "message": err.to_string(),
+                    }),
+                }
+            }
         }
         _ => serde_json::json!({
             "status": "error",
@@ -353,6 +445,102 @@ fn node_name(entry: &NodeEntry) -> String {
     let len = entry.name_len as usize;
     let name_bytes = &entry.name[..len];
     String::from_utf8_lossy(name_bytes).into_owned()
+}
+
+async fn send_config_response(
+    sender: &NodeSender,
+    request: &Message,
+    subsystem: &str,
+    version: u64,
+    status: &str,
+    error_code: Option<String>,
+    error_detail: Option<String>,
+    island: &str,
+) -> Result<(), OrchestratorError> {
+    let mut payload = serde_json::json!({
+        "subsystem": subsystem,
+        "version": version,
+        "status": status,
+        "island": island,
+    });
+    if let Some(code) = error_code {
+        payload["error_code"] = serde_json::Value::String(code);
+    }
+    if let Some(detail) = error_detail {
+        payload["error_detail"] = serde_json::Value::String(detail);
+    }
+    let reply = Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            dst: Destination::Unicast(request.routing.src.clone()),
+            ttl: 16,
+            trace_id: request.routing.trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some("CONFIG_RESPONSE".to_string()),
+            scope: None,
+            target: None,
+            action: None,
+            priority: None,
+            context: None,
+        },
+        payload,
+    };
+    sender.send(reply).await?;
+    Ok(())
+}
+
+fn list_islands(state_dir: &Path) -> Result<Vec<serde_json::Value>, OrchestratorError> {
+    let root = state_dir.join("islands");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let island_id = entry.file_name().to_string_lossy().to_string();
+        if let Ok(info) = read_island_info(&root, &island_id) {
+            out.push(info);
+        } else {
+            out.push(serde_json::json!({ "island_id": island_id }));
+        }
+    }
+    out.sort_by(|a, b| {
+        let a = a.get("island_id").and_then(|v| v.as_str()).unwrap_or("");
+        let b = b.get("island_id").and_then(|v| v.as_str()).unwrap_or("");
+        a.cmp(b)
+    });
+    Ok(out)
+}
+
+fn get_island(state_dir: &Path, island_id: &str) -> Result<serde_json::Value, OrchestratorError> {
+    let root = state_dir.join("islands");
+    read_island_info(&root, island_id)
+}
+
+fn remove_island(state_dir: &Path, island_id: &str) -> Result<(), OrchestratorError> {
+    let root = state_dir.join("islands");
+    let dir = root.join(island_id);
+    if !dir.exists() {
+        return Err("island not found".into());
+    }
+    fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+fn read_island_info(
+    root: &Path,
+    island_id: &str,
+) -> Result<serde_json::Value, OrchestratorError> {
+    let path = root.join(island_id).join("info.yaml");
+    let data = fs::read_to_string(&path)?;
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&data)?;
+    let json = serde_json::to_value(yaml)?;
+    Ok(json)
 }
 
 fn load_storage_path(config_dir: &Path) -> String {

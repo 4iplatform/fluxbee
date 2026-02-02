@@ -61,6 +61,7 @@ Todo nodo SY que reciba configuración via broadcast CONFIG_CHANGED **DEBE** res
 | `vpn` | SY.config.routes | Tabla VPN |
 | `opa` | SY.opa.rules | Policies OPA |
 | `identity` | SY.identity | ILKs, modules, degrees |
+| `storage` | SY.orchestrator | Path de storage compartido |
 
 **Flujo estándar:**
 

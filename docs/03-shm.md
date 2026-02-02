@@ -1,21 +1,22 @@
 # JSON Router - 03 Shared Memory
 
-**Estado:** v1.13  
-**Fecha:** 2025-01-20  
+**Estado:** v1.15  
+**Fecha:** 2026-02-01  
 **Audiencia:** Desarrolladores de router core
 
 ---
 
-## 1. Modelo de Cuatro Regiones
+## 1. Modelo de Cinco Regiones
 
-El sistema usa cuatro tipos de regiones de memoria compartida:
+El sistema usa cinco tipos de regiones de memoria compartida:
 
 ```
 /dev/shm/
 ├── jsr-<router-uuid>        # Una por router
 ├── jsr-config-<island>      # Una por isla
 ├── jsr-lsa-<island>         # Una por isla
-└── jsr-opa-<island>         # Una por isla (WASM de policies)
+├── jsr-opa-<island>         # Una por isla (WASM de policies)
+└── jsr-identity-<island>    # Una por isla (ILKs, degrees, modules)
 ```
 
 | Región | Writer | Contenido |
@@ -24,6 +25,7 @@ El sistema usa cuatro tipos de regiones de memoria compartida:
 | `jsr-config-<island>` | SY.config.routes | Rutas estáticas, tabla VPN |
 | `jsr-lsa-<island>` | Gateway | Topología de islas remotas |
 | `jsr-opa-<island>` | SY.opa.rules | WASM compilado de policy OPA |
+| `jsr-identity-<island>` | SY.identity | ILKs, degrees, modules, external mappings |
 
 **Principio clave:** Cada región tiene **un único writer** y múltiples readers. Esto permite usar seqlock sin conflictos.
 
@@ -736,7 +738,180 @@ let opa_shm = format!("/jsr-opa-{}", island_id);
 
 ---
 
-## 10. Constantes Consolidadas
+## 10. Región Identity: jsr-identity-<island>
+
+Una sola región por isla, escrita únicamente por `SY.identity`.
+
+### 10.1 Naming
+
+```
+/jsr-identity-<island_id>
+
+Ejemplo: /jsr-identity-produccion
+```
+
+### 10.2 Contenido
+
+| Dato | Descripción |
+|------|-------------|
+| Header | Identificación, seqlock, versión |
+| ILKs | Tabla de interlocutores (tenant, agent, human, system) |
+| Modules | Tabla de módulos de conocimiento |
+| Degrees | Tabla de títulos (combinaciones de módulos) |
+| External mappings | Mapeo channel+external_id → ILK |
+
+**Propósito:** OPA y nodos IO/AI leen esta región para resolver ILKs, obtener tenant, verificar degrees.
+
+### 10.3 Layout
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ IdentityHeader (128 bytes)                                      │
+├────────────────────────────────────────────────────────────────┤
+│ IlkEntry[MAX_ILKS] (8192 entries × 256 bytes)                  │
+│ Total: ~2 MB                                                    │
+├────────────────────────────────────────────────────────────────┤
+│ ModuleEntry[MAX_MODULES] (1024 entries × 512 bytes)            │
+│ Total: ~512 KB                                                  │
+├────────────────────────────────────────────────────────────────┤
+│ DegreeEntry[MAX_DEGREES] (512 entries × 1024 bytes)            │
+│ Total: ~512 KB                                                  │
+├────────────────────────────────────────────────────────────────┤
+│ ExternalMappingEntry[MAX_EXTERNAL_MAPPINGS] (16384 entries)    │
+│ Total: ~1 MB                                                    │
+└────────────────────────────────────────────────────────────────┘
+Total aproximado: ~4 MB por isla
+```
+
+### 10.4 Estructuras
+
+```rust
+pub const IDENTITY_MAGIC: u32 = 0x4A534944;  // "JSID"
+pub const IDENTITY_VERSION: u32 = 1;
+pub const MAX_ILKS: u32 = 8192;
+pub const MAX_MODULES: u32 = 1024;
+pub const MAX_DEGREES: u32 = 512;
+pub const MAX_EXTERNAL_MAPPINGS: u32 = 16384;
+
+#[repr(C)]
+pub struct IdentityHeader {
+    // Identificación (8 bytes)
+    pub magic: u32,
+    pub version: u32,
+    
+    // Seqlock (8 bytes)
+    pub seq: u64,
+    
+    // Counts (16 bytes)
+    pub ilk_count: u32,
+    pub module_count: u32,
+    pub degree_count: u32,
+    pub mapping_count: u32,
+    
+    // Timestamps (16 bytes)
+    pub updated_at: u64,
+    pub heartbeat: u64,
+    
+    // Owner (24 bytes)
+    pub owner_uuid: [u8; 16],
+    pub owner_pid: u32,
+    pub is_primary: u8,  // 1 si es PRIMARY, 0 si es REPLICA
+    pub _pad: [u8; 3],
+    
+    // Reserved
+    pub _reserved: [u8; 56],
+}
+// Total: 128 bytes
+
+#[repr(C)]
+pub struct IlkEntry {
+    pub ilk: [u8; 48],              // "ilk:<uuid>" (null-terminated)
+    pub ilk_type: u8,               // 0=tenant, 1=agent, 2=human, 3=system
+    pub human_subtype: u8,          // 0=internal, 1=external (solo si type=human)
+    pub flags: u16,                 // FLAG_ACTIVE, FLAG_DELETED
+    pub tenant_ilk: [u8; 48],       // ILK del tenant al que pertenece
+    pub handler_node: [u8; 64],     // Nodo L2 que maneja este ILK (para agents)
+    pub degree_hash: [u8; 32],      // Hash del degree asignado (para agents)
+    pub capabilities: [u8; 64],     // Lista de capabilities (comma-separated)
+    // Total: 256 bytes
+}
+
+#[repr(C)]
+pub struct ExternalMappingEntry {
+    pub channel: [u8; 16],          // "whatsapp", "email", etc.
+    pub external_id: [u8; 64],      // "+5491155551234", "user@example.com"
+    pub ilk: [u8; 48],              // ILK resuelto
+    pub flags: u16,
+    pub _pad: [u8; 6],
+    // Total: 64 bytes (aprox)
+}
+```
+
+### 10.5 Writer: SY.identity
+
+SY.identity es el único writer. En modo PRIMARY escribe cambios; en modo REPLICA recibe replicación de mother.
+
+```rust
+impl IdentityWriter {
+    fn write_ilk(&mut self, ilk: &Ilk) -> Result<()> {
+        self.header.seq.fetch_add(1, Ordering::SeqCst);
+        
+        // Find or allocate slot
+        let slot = self.find_or_create_slot(&ilk.ilk)?;
+        
+        // Write entry
+        slot.ilk_type = ilk.ilk_type as u8;
+        slot.human_subtype = ilk.human_subtype.unwrap_or(0) as u8;
+        copy_string(&mut slot.tenant_ilk, &ilk.tenant_ilk);
+        copy_string(&mut slot.handler_node, &ilk.handler_node.unwrap_or_default());
+        // ...
+        
+        self.header.seq.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+```
+
+### 10.6 Reader: OPA (via data.identity)
+
+OPA carga esta región como `data.identity` para usar en reglas:
+
+```rego
+# Derivar tenant de src_ilk
+tenant := data.identity[input.meta.src_ilk].tenant_ilk
+
+# Verificar capabilities de un agent
+data.identity[ilk].capabilities
+```
+
+### 10.7 Reader: Nodos IO
+
+Los nodos IO resuelven external_id → ILK:
+
+```rust
+fn resolve_ilk(&self, channel: &str, external_id: &str) -> Option<String> {
+    let shm = self.identity_region.as_ref()?;
+    
+    for mapping in shm.external_mappings.iter() {
+        if mapping.channel == channel && mapping.external_id == external_id {
+            return Some(mapping.ilk.to_string());
+        }
+    }
+    None
+}
+```
+
+### 10.8 Descubrimiento
+
+Nombre fijo basado en island_id:
+
+```rust
+let identity_shm = format!("/jsr-identity-{}", island_id);
+```
+
+---
+
+## 11. Constantes Consolidadas
 
 ```rust
 // Región de routers
@@ -765,6 +940,24 @@ pub const OPA_MAX_WASM_SIZE: u32 = 4 * 1024 * 1024;  // 4MB
 pub const OPA_STATUS_OK: u8 = 0;
 pub const OPA_STATUS_ERROR: u8 = 1;
 pub const OPA_STATUS_LOADING: u8 = 2;
+
+// Región Identity
+pub const IDENTITY_MAGIC: u32 = 0x4A534944;  // "JSID"
+pub const IDENTITY_VERSION: u32 = 1;
+pub const MAX_ILKS: u32 = 8192;
+pub const MAX_MODULES: u32 = 1024;
+pub const MAX_DEGREES: u32 = 512;
+pub const MAX_EXTERNAL_MAPPINGS: u32 = 16384;
+
+// ILK types
+pub const ILK_TYPE_TENANT: u8 = 0;
+pub const ILK_TYPE_AGENT: u8 = 1;
+pub const ILK_TYPE_HUMAN: u8 = 2;
+pub const ILK_TYPE_SYSTEM: u8 = 3;
+
+// Human subtypes
+pub const HUMAN_SUBTYPE_INTERNAL: u8 = 0;
+pub const HUMAN_SUBTYPE_EXTERNAL: u8 = 1;
 
 // Match kinds
 pub const MATCH_EXACT: u8 = 0;
