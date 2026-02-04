@@ -47,10 +47,36 @@ if [[ "${SKIP_BUILD:-}" == "1" ]]; then
 fi
 
 echo "Installing binaries to /usr/bin from $BIN_DIR..."
-sudo install -m 0755 "$BIN_DIR/json-router" /usr/bin/rt-gateway
-sudo install -m 0755 "$BIN_DIR/sy-admin" /usr/bin/sy-admin
-sudo install -m 0755 "$BIN_DIR/sy-config-routes" /usr/bin/sy-config-routes
-sudo install -m 0755 "$BIN_DIR/sy-orchestrator" /usr/bin/sy-orchestrator
+
+pick_bin() {
+  local primary="$1"
+  local fallback="$2"
+  if [[ -f "$BIN_DIR/$primary" ]]; then
+    echo "$BIN_DIR/$primary"
+    return 0
+  fi
+  if [[ -n "$fallback" && -f "$BIN_DIR/$fallback" ]]; then
+    echo "$BIN_DIR/$fallback"
+    return 0
+  fi
+  return 1
+}
+
+missing=0
+json_router_bin="$(pick_bin json-router "")" || { echo "Missing binary: $BIN_DIR/json-router" >&2; missing=1; }
+sy_admin_bin="$(pick_bin sy-admin sy_admin)" || { echo "Missing binary: $BIN_DIR/sy-admin or $BIN_DIR/sy_admin" >&2; missing=1; }
+sy_config_bin="$(pick_bin sy-config-routes sy_config_routes)" || { echo "Missing binary: $BIN_DIR/sy-config-routes or $BIN_DIR/sy_config_routes" >&2; missing=1; }
+sy_orch_bin="$(pick_bin sy-orchestrator sy_orchestrator)" || { echo "Missing binary: $BIN_DIR/sy-orchestrator or $BIN_DIR/sy_orchestrator" >&2; missing=1; }
+
+if [[ "$missing" -eq 1 ]]; then
+  echo "Build them first (e.g. cargo build --release --bins) or set BIN_DIR to where they exist." >&2
+  exit 1
+fi
+
+sudo install -m 0755 "$json_router_bin" /usr/bin/rt-gateway
+sudo install -m 0755 "$sy_admin_bin" /usr/bin/sy-admin
+sudo install -m 0755 "$sy_config_bin" /usr/bin/sy-config-routes
+sudo install -m 0755 "$sy_orch_bin" /usr/bin/sy-orchestrator
 if [[ -f "$ROOT_DIR/sy-opa-rules/sy-opa-rules" ]]; then
   sudo install -m 0755 "$ROOT_DIR/sy-opa-rules/sy-opa-rules" /usr/bin/sy-opa-rules
 fi
