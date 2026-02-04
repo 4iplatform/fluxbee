@@ -1,7 +1,7 @@
 # JSON Router - 03 Shared Memory
 
-**Estado:** v1.16  
-**Fecha:** 2026-02-04  
+**Estado:** v1.15  
+**Fecha:** 2026-02-01  
 **Audiencia:** Desarrolladores de router core
 
 ---
@@ -16,7 +16,7 @@ El sistema usa cinco tipos de regiones de memoria compartida:
 ├── jsr-config-<island>      # Una por isla
 ├── jsr-lsa-<island>         # Una por isla
 ├── jsr-opa-<island>         # Una por isla (WASM de policies)
-└── jsr-identity-<island>    # Una por isla (ILKs, ICHs, degrees, modules)
+└── jsr-identity-<island>    # Una por isla (ILKs, degrees, modules)
 ```
 
 | Región | Writer | Contenido |
@@ -25,7 +25,7 @@ El sistema usa cinco tipos de regiones de memoria compartida:
 | `jsr-config-<island>` | SY.config.routes | Rutas estáticas, tabla VPN |
 | `jsr-lsa-<island>` | Gateway | Topología de islas remotas |
 | `jsr-opa-<island>` | SY.opa.rules | WASM compilado de policy OPA |
-| `jsr-identity-<island>` | SY.identity | ILKs, ICHs, modules, degrees, external mappings |
+| `jsr-identity-<island>` | SY.identity | ILKs, degrees, modules, external mappings |
 
 **Principio clave:** Cada región tiene **un único writer** y múltiples readers. Esto permite usar seqlock sin conflictos.
 
@@ -756,12 +756,11 @@ Ejemplo: /jsr-identity-produccion
 |------|-------------|
 | Header | Identificación, seqlock, versión |
 | ILKs | Tabla de interlocutores (tenant, agent, human, system) |
-| ICHs | Tabla de canales (WhatsApp, Slack, email, etc.) |
 | Modules | Tabla de módulos de conocimiento |
 | Degrees | Tabla de títulos (combinaciones de módulos) |
-| ICH Mappings | Mapeo (channel_type, external_id) → ICH |
+| External mappings | Mapeo channel+external_id → ILK |
 
-**Propósito:** OPA y nodos IO/AI leen esta región para resolver ILKs, ICHs, obtener tenant, verificar degrees.
+**Propósito:** OPA y nodos IO/AI leen esta región para resolver ILKs, obtener tenant, verificar degrees.
 
 ### 10.3 Layout
 
@@ -772,19 +771,16 @@ Ejemplo: /jsr-identity-produccion
 │ IlkEntry[MAX_ILKS] (8192 entries × 256 bytes)                  │
 │ Total: ~2 MB                                                    │
 ├────────────────────────────────────────────────────────────────┤
-│ IchEntry[MAX_ICHS] (4096 entries × 256 bytes)                  │
-│ Total: ~1 MB                                                    │
-├────────────────────────────────────────────────────────────────┤
-│ IchMappingEntry[MAX_ICH_MAPPINGS] (8192 entries × 256 bytes)   │
-│ Total: ~2 MB                                                    │
-├────────────────────────────────────────────────────────────────┤
 │ ModuleEntry[MAX_MODULES] (1024 entries × 512 bytes)            │
 │ Total: ~512 KB                                                  │
 ├────────────────────────────────────────────────────────────────┤
 │ DegreeEntry[MAX_DEGREES] (512 entries × 1024 bytes)            │
 │ Total: ~512 KB                                                  │
+├────────────────────────────────────────────────────────────────┤
+│ ExternalMappingEntry[MAX_EXTERNAL_MAPPINGS] (16384 entries)    │
+│ Total: ~1 MB                                                    │
 └────────────────────────────────────────────────────────────────┘
-Total aproximado: ~6 MB por isla
+Total aproximado: ~4 MB por isla
 ```
 
 ### 10.4 Estructuras
@@ -793,10 +789,9 @@ Total aproximado: ~6 MB por isla
 pub const IDENTITY_MAGIC: u32 = 0x4A534944;  // "JSID"
 pub const IDENTITY_VERSION: u32 = 1;
 pub const MAX_ILKS: u32 = 8192;
-pub const MAX_ICHS: u32 = 4096;
-pub const MAX_ICH_MAPPINGS: u32 = 8192;
 pub const MAX_MODULES: u32 = 1024;
 pub const MAX_DEGREES: u32 = 512;
+pub const MAX_EXTERNAL_MAPPINGS: u32 = 16384;
 
 #[repr(C)]
 pub struct IdentityHeader {
@@ -807,12 +802,11 @@ pub struct IdentityHeader {
     // Seqlock (8 bytes)
     pub seq: u64,
     
-    // Counts (20 bytes)
+    // Counts (16 bytes)
     pub ilk_count: u32,
-    pub ich_count: u32,
-    pub ich_mapping_count: u32,
     pub module_count: u32,
     pub degree_count: u32,
+    pub mapping_count: u32,
     
     // Timestamps (16 bytes)
     pub updated_at: u64,
@@ -843,24 +837,13 @@ pub struct IlkEntry {
 }
 
 #[repr(C)]
-pub struct IchEntry {
-    pub ich: [u8; 48],              // "ich:<uuid>" (null-terminated)
-    pub channel_type: [u8; 16],     // "whatsapp", "slack", "email", etc.
-    pub external_id: [u8; 128],     // "+5491155551234", "U12345", "user@mail.com"
-    pub ilk: [u8; 48],              // ILK dueño de este canal
-    pub flags: u16,                 // FLAG_ACTIVE, FLAG_DELETED
-    pub _pad: [u8; 14],
-    // Total: 256 bytes
-}
-
-#[repr(C)]
-pub struct IchMappingEntry {
-    pub channel_type: [u8; 16],     // "whatsapp", "slack", etc.
-    pub external_id: [u8; 128],     // "+5491155551234", etc.
-    pub ich: [u8; 48],              // ICH resuelto
+pub struct ExternalMappingEntry {
+    pub channel: [u8; 16],          // "whatsapp", "email", etc.
+    pub external_id: [u8; 64],      // "+5491155551234", "user@example.com"
+    pub ilk: [u8; 48],              // ILK resuelto
     pub flags: u16,
-    pub _pad: [u8; 62],
-    // Total: 256 bytes
+    pub _pad: [u8; 6],
+    // Total: 64 bytes (aprox)
 }
 ```
 
@@ -873,27 +856,15 @@ impl IdentityWriter {
     fn write_ilk(&mut self, ilk: &Ilk) -> Result<()> {
         self.header.seq.fetch_add(1, Ordering::SeqCst);
         
+        // Find or allocate slot
         let slot = self.find_or_create_slot(&ilk.ilk)?;
+        
+        // Write entry
         slot.ilk_type = ilk.ilk_type as u8;
         slot.human_subtype = ilk.human_subtype.unwrap_or(0) as u8;
         copy_string(&mut slot.tenant_ilk, &ilk.tenant_ilk);
         copy_string(&mut slot.handler_node, &ilk.handler_node.unwrap_or_default());
-        
-        self.header.seq.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-    
-    fn write_ich(&mut self, ich: &Ich) -> Result<()> {
-        self.header.seq.fetch_add(1, Ordering::SeqCst);
-        
-        let slot = self.find_or_create_ich_slot(&ich.ich)?;
-        copy_string(&mut slot.channel_type, &ich.channel_type);
-        copy_string(&mut slot.external_id, &ich.external_id);
-        copy_string(&mut slot.ilk, &ich.ilk);
-        slot.flags = FLAG_ACTIVE;
-        
-        // Also create mapping for fast lookup
-        self.create_ich_mapping(&ich.channel_type, &ich.external_id, &ich.ich)?;
+        // ...
         
         self.header.seq.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -915,26 +886,15 @@ data.identity[ilk].capabilities
 
 ### 10.7 Reader: Nodos IO
 
-Los nodos IO resuelven (channel_type, external_id) → ICH → ILK:
+Los nodos IO resuelven external_id → ILK:
 
 ```rust
-fn resolve_ich(&self, channel_type: &str, external_id: &str) -> Option<String> {
+fn resolve_ilk(&self, channel: &str, external_id: &str) -> Option<String> {
     let shm = self.identity_region.as_ref()?;
     
-    for mapping in shm.ich_mappings.iter() {
-        if mapping.channel_type == channel_type && mapping.external_id == external_id {
-            return Some(mapping.ich.to_string());
-        }
-    }
-    None
-}
-
-fn get_ilk_for_ich(&self, ich: &str) -> Option<String> {
-    let shm = self.identity_region.as_ref()?;
-    
-    for entry in shm.ichs.iter() {
-        if entry.ich == ich {
-            return Some(entry.ilk.to_string());
+    for mapping in shm.external_mappings.iter() {
+        if mapping.channel == channel && mapping.external_id == external_id {
+            return Some(mapping.ilk.to_string());
         }
     }
     None

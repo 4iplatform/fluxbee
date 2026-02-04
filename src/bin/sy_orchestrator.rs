@@ -66,6 +66,14 @@ struct OrchestratorState {
     wan_listen: Option<String>,
 }
 
+const CRITICAL_SERVICES: [&str; 5] = [
+    "rt-gateway",
+    "sy-config-routes",
+    "sy-opa-rules",
+    "sy-admin",
+    "sy-identity",
+];
+
 #[tokio::main]
 async fn main() -> Result<(), OrchestratorError> {
     if cfg!(not(target_os = "linux")) {
@@ -119,7 +127,7 @@ async fn main() -> Result<(), OrchestratorError> {
     loop {
         tokio::select! {
             _ = watchdog.tick() => {
-                // Placeholder for watchdog checks (RT.gateway, SY.*)
+                watchdog_tick().await;
             }
             msg = receiver.recv() => {
                 let msg = match msg {
@@ -141,6 +149,17 @@ async fn main() -> Result<(), OrchestratorError> {
                 if let Err(err) = handle_admin(&sender, &msg, &state).await {
                     tracing::warn!("admin action error: {err}");
                 }
+            }
+        }
+    }
+}
+
+async fn watchdog_tick() {
+    for service in CRITICAL_SERVICES {
+        if !systemd_is_active(service) {
+            tracing::warn!(service = service, "service not active; attempting restart");
+            if let Err(err) = systemd_start(service) {
+                tracing::warn!(service = service, error = %err, "service restart failed");
             }
         }
     }
@@ -875,6 +894,20 @@ fn run_cmd(mut cmd: Command, label: &str) -> Result<(), OrchestratorError> {
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     Err(format!("{label} failed: {stderr}").into())
+}
+
+fn systemd_is_active(service: &str) -> bool {
+    Command::new("systemctl")
+        .arg("is-active")
+        .arg("--quiet")
+        .arg(service)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn systemd_start(service: &str) -> Result<(), OrchestratorError> {
+    run_cmd(Command::new("systemctl").arg("start").arg(service), "systemctl start")
 }
 
 fn askpass_script(password: &str) -> Result<PathBuf, OrchestratorError> {

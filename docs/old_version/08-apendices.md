@@ -1,7 +1,7 @@
 # JSON Router - 08 Apéndices
 
-**Estado:** v1.16  
-**Fecha:** 2026-02-04  
+**Estado:** v1.15  
+**Fecha:** 2026-01-31  
 **Audiencia:** Todos (referencia)
 
 ---
@@ -23,12 +23,6 @@
 - **Nombre L2 (Capa 2)**: Identificador descriptivo con isla. Formato: `TYPE.campo1.campo2@isla`.
 
 - **ILK (Capa 3)**: Interlocutor Key. Identificador único de entidades que conversan (personas, agentes, sistemas). Formato: `ilk:<uuid>`.
-
-- **ICH (Capa 3)**: Interlocutor Channel. Canal de comunicación asociado a un ILK (WhatsApp, Slack, email, etc.). Formato: `ich:<uuid>`.
-
-- **CTX (Capa 3)**: Context. Identificador de conversación, calculado como `hash(ilk + ich)`. Formato: `ctx:<hash>`.
-
-- **Turn**: Un mensaje individual dentro de un contexto/conversación.
 
 - **Framing**: Delimitación de mensajes (4 bytes length prefix, big-endian).
 
@@ -60,8 +54,6 @@
 
 - **jsr-lsa-<island>**: Región de topología remota. Contiene nodos/rutas/VPNs de otras islas. Writer: Gateway.
 
-- **jsr-identity-<island>**: Región de identidad. Contiene ILKs, ICHs, modules, degrees. Writer: SY.identity.
-
 - **Seqlock**: Mecanismo de sincronización para un writer y múltiples readers.
 
 - **Heartbeat**: Timestamp actualizado periódicamente para detectar procesos muertos.
@@ -85,14 +77,6 @@
 - **Tabla VPN**: Mapping de patterns a vpn_id. Vive en jsr-config-<island>.
 
 - **Inmunidad SY.***: Los nodos SY.* y RT.* ignoran filtros VPN, ven todo.
-
-### Contexto y Conversaciones
-
-- **ctx_client**: Librería común para acceder a contextos. Provee cache local + fallback a PostgreSQL.
-
-- **ctx_seq**: Número de secuencia del último mensaje conocido en un contexto.
-
-- **Persistencia de turns**: El router persiste cada mensaje con ctx en PostgreSQL (async).
 
 ---
 
@@ -196,14 +180,13 @@ pub const DEAD_INTERVAL_MS: u64 = 40_000;
 | 01 | `01-arquitectura.md` | Fundamentos, islas, naming @isla, VPN overview |
 | 02 | `02-protocolo.md` | Mensajes, framing, HELLO, LSA, librería de nodos |
 | 03 | `03-shm.md` | Regiones SHM, estructuras Rust |
-| 04 | `04-routing.md` | FIB, VPN, algoritmos, OPA, persistencia de contexto |
+| 04 | `04-routing.md` | FIB, VPN, algoritmos, OPA |
 | 05 | `05-conectividad.md` | IRP, WAN, LSA entre gateways |
 | 06 | `06-regiones.md` | Detalle de config y LSA regions |
-| 07 | `07-operaciones.md` | Arranque, YAML, systemd, PostgreSQL |
+| 07 | `07-operaciones.md` | Arranque, YAML, systemd |
 | 08 | `08-apendices.md` | Glosario, decisiones, límites |
 | 09 | `09-router-status.md` | Estado de implementación del router |
 | 10 | `10-identity-layer3.md` | **ILK, SY.identity, routing L3** |
-| 11 | `11-context.md` | **ICH, CTX, conversaciones, ctx_client** |
 | -- | `SY_nodes_spec.md` | Nodos SY (config.routes, opa.rules, identity) |
 
 ---
@@ -216,6 +199,3 @@ pub const DEAD_INTERVAL_MS: u64 = 40_000;
 - [Seqlock](https://en.wikipedia.org/wiki/Seqlock)
 - [YAML 1.2 Spec](https://yaml.org/spec/1.2.2/)
 - [UUID RFC 4122](https://datatracker.ietf.org/doc/html/rfc4122)
-- [PostgreSQL](https://www.postgresql.org/docs/)
-- [sqlx (Rust)](https://github.com/launchbadge/sqlx)
-- [tokio-postgres](https://docs.rs/tokio-postgres/)

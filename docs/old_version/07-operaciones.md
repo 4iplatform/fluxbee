@@ -1,7 +1,7 @@
 # JSON Router - 07 Operaciones
 
-**Estado:** v1.16  
-**Fecha:** 2026-02-04  
+**Estado:** v1.15  
+**Fecha:** 2026-02-01  
 **Audiencia:** Ops/SRE, desarrolladores de deployment
 
 ---
@@ -79,7 +79,7 @@ El **único** archivo que el usuario crea/edita.
 island_id: dev
 ```
 
-Con esto el sistema levanta una isla funcional sin conexión WAN (usa SQLite embebido para contextos).
+Con esto el sistema levanta una isla funcional sin conexión WAN.
 
 ### 2.2 Ejemplo Producción (mother island)
 
@@ -94,11 +94,6 @@ wan:
 
 admin:
   listen: "0.0.0.0:8080"           # Opcional, default: 0.0.0.0:8080
-
-database:
-  url: "postgresql://fluxbee:password@localhost:5432/fluxbee"
-  pool_size: 10                    # Opcional, default: 10
-  connect_timeout_ms: 5000         # Opcional, default: 5000
 ```
 
 ### 2.3 Ejemplo Isla Hija (creada por add_island)
@@ -111,9 +106,6 @@ wan:
   gateway_name: RT.gateway
   uplinks:
     - address: "192.168.1.10:9000"  # Mother island
-
-database:
-  url: "postgresql://fluxbee:password@db.internal:5432/fluxbee"
 ```
 
 ### 2.4 Campos de island.yaml
@@ -125,9 +117,6 @@ database:
 | `wan.listen` | No | (sin escucha) | IP:puerto para recibir conexiones WAN |
 | `wan.uplinks[]` | No | [] | Lista de gateways a conectar |
 | `admin.listen` | No | `0.0.0.0:8080` | IP:puerto del API HTTP |
-| `database.url` | No | SQLite local | Connection string PostgreSQL |
-| `database.pool_size` | No | 10 | Conexiones en el pool |
-| `database.connect_timeout_ms` | No | 5000 | Timeout de conexión |
 
 ---
 

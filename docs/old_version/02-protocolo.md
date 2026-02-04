@@ -1,7 +1,7 @@
 # JSON Router - 02 Protocolo de Mensajes
 
-**Estado:** v1.16  
-**Fecha:** 2026-02-04  
+**Estado:** v1.15  
+**Fecha:** 2026-02-01  
 **Audiencia:** Desarrolladores de librería de nodo, desarrolladores de nodos
 
 ---
@@ -54,7 +54,7 @@ Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisi
 
 ## 3. Sección `meta` (Metadata para OPA y Sistema)
 
-Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado y persistencia de contexto.
+Usado por OPA para decisiones de capa 2/3, y por el router para broadcast filtrado.
 
 ```json
 {
@@ -64,12 +64,10 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
     "target": "AI.soporte.l1@produccion",
     "src_ilk": "ilk:550e8400-e29b-41d4-a716-446655440000",
     "dst_ilk": "ilk:7c9e6679-7425-40de-944b-e07fc1f90ae7",
-    "ich": "ich:a1b2c3d4-5678-90ab-cdef-1234567890ab",
-    "ctx": "ctx:abc123def456789012345678901234ab",
-    "ctx_seq": 47,
     "priority": "high",
     "context": {
-      "intent": "billing_question"
+      "channel": "whatsapp",
+      "external_id": "+5491155551234"
     }
   }
 }
@@ -81,11 +79,8 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 | `msg` | string | Sí si type=system | Tipo de mensaje de sistema (ej: `"HELLO"`, `"LSA"`) |
 | `scope` | string | No | Alcance VPN para broadcast/multicast: `"vpn"` (default) o `"global"` (solo system) |
 | `target` | string | Condicional | Para OPA o broadcast filter (nombre L2 con @isla) |
-| `src_ilk` | string | Sí (L3) | ILK del interlocutor que envía. OPA deriva tenant via `data.identity` |
+| `src_ilk` | string | Sí (L3) | ILK del interlocutor que envía. OPA deriva tenant de este campo via `data.identity` |
 | `dst_ilk` | string | No | ILK del interlocutor destino (si se conoce) |
-| `ich` | string | Sí (L3) | ICH (Interlocutor Channel) por el cual se comunica |
-| `ctx` | string | Sí (L3) | Context ID. Calculado: `hash(src_ilk + ich)` |
-| `ctx_seq` | integer | Sí (L3) | Último número de secuencia conocido del contexto |
 | `priority` | string | No | Hint de prioridad para OPA |
 | `context` | object | No | Datos adicionales para reglas OPA |
 | `action` | string | No | Para mensajes admin: acción a ejecutar |
@@ -100,19 +95,6 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 | `"broadcast"` | patrón L2 | Router filtra: solo entrega a nodos que matchean |
 | `"broadcast"` | ausente | Router entrega a todos los nodos |
 | UUID | - | Ignorado (unicast directo) |
-
-### 3.2 Campos de Contexto (ich, ctx, ctx_seq)
-
-Estos campos permiten mantener conversaciones con historia:
-
-- **`ich`**: Canal por el cual el interlocutor se comunica (WhatsApp, Slack, email, etc.)
-- **`ctx`**: Identificador único de la conversación, calculado como `hash(src_ilk + ich)`
-- **`ctx_seq`**: Número de secuencia del último mensaje conocido en este contexto
-
-El router usa `ctx` y `ctx_seq` para persistir la historia de la conversación en PostgreSQL.
-Los nodos usan `ctx_client` para reconstruir la historia cuando la necesitan.
-
-Ver `11-context.md` para detalles completos.
 
 ---
 
@@ -187,18 +169,6 @@ pub struct Meta {
     /// ILK del interlocutor destino
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dst_ilk: Option<String>,
-    
-    /// ICH (Interlocutor Channel) - canal de comunicación
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ich: Option<String>,
-    
-    /// Context ID - hash(src_ilk + ich), identifica la conversación
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ctx: Option<String>,
-    
-    /// Último número de secuencia conocido del contexto
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ctx_seq: Option<u64>,
     
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,

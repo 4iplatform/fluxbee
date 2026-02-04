@@ -1,7 +1,7 @@
 # JSON Router - 04 Routing
 
-**Estado:** v1.16  
-**Fecha:** 2026-02-04  
+**Estado:** v1.15  
+**Fecha:** 2026-02-01  
 **Audiencia:** Desarrolladores de router core
 
 ---
@@ -629,89 +629,10 @@ Cuando no se encuentra destino:
 
 ---
 
-## 11. Persistencia de Contexto
-
-### 11.1 Rol del Router
-
-El router es el único componente que ve **todos** los mensajes. Cuando un mensaje tiene `meta.ctx`, el router persiste el turn en PostgreSQL.
-
-### 11.2 Flujo
-
-```
-Mensaje llega
-      │
-      ▼
-¿Tiene meta.ctx?
-      │
-  ┌───┴───┐
-  │       │
- NO      SÍ
-  │       │
-  │       ▼
-  │   INSERT INTO turns (async)
-  │   - ctx: meta.ctx
-  │   - seq: meta.ctx_seq + 1
-  │   - from_ilk: meta.src_ilk
-  │   - content: payload
-  │       │
-  └───┬───┘
-      │
-      ▼
-  Routing normal
-```
-
-### 11.3 Implementación
-
-```rust
-impl Router {
-    async fn handle_message(&mut self, msg: Message) -> Result<()> {
-        // 1. Persistir turn si tiene contexto (async, no bloquea)
-        if let Some(ctx) = &msg.meta.ctx {
-            self.persist_turn(&msg);
-        }
-        
-        // 2. Routing normal
-        self.route_message(msg).await
-    }
-    
-    fn persist_turn(&self, msg: &Message) {
-        let pool = self.db_pool.clone();
-        let ctx = msg.meta.ctx.clone().unwrap();
-        let seq = msg.meta.ctx_seq.unwrap_or(0) + 1;
-        let from_ilk = msg.meta.src_ilk.clone().unwrap_or_default();
-        let to_ilk = msg.meta.dst_ilk.clone();
-        let ich = msg.meta.ich.clone().unwrap_or_default();
-        let content = msg.payload.clone();
-        
-        // Fire-and-forget: no bloquea el routing
-        tokio::spawn(async move {
-            let _ = sqlx::query!(
-                r#"INSERT INTO turns (ctx, seq, ts, from_ilk, to_ilk, ich, msg_type, content)
-                   VALUES ($1, $2, now(), $3, $4, $5, 'message', $6)
-                   ON CONFLICT (ctx, seq) DO NOTHING"#,
-                ctx, seq as i64, from_ilk, to_ilk, ich, content
-            )
-            .execute(&pool)
-            .await;
-        });
-    }
-}
-```
-
-### 11.4 Notas
-
-- La persistencia es **asíncrona** y no bloquea el routing
-- Si PostgreSQL falla, el mensaje se rutea igual (graceful degradation)
-- Los nodos destino reconstruyen la historia via `ctx_client` si la necesitan
-- Ver `11-context.md` para detalles completos del sistema de contexto
-
----
-
-## 12. Referencias
+## 11. Referencias
 
 | Tema | Documento |
 |------|-----------|
 | Shared memory | `03-shm.md` |
 | Conectividad, LSA | `05-conectividad.md` |
 | Config de rutas | `06-regiones.md` |
-| Contexto (ICH, CTX) | `11-context.md` |

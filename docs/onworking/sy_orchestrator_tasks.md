@@ -12,8 +12,8 @@ Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `do
 - [ ] Log `Island {island_id} ready`.
 
 ## 2) Watchdog y lifecycle
-- [ ] Tick cada 5s: verificar que RT.gateway y SY.* sigan vivos.
-- [ ] Reiniciar automáticamente RT.gateway, SY.config.routes, SY.opa.rules, SY.admin, SY.identity.
+- [x] Tick cada 5s: verificar que RT.gateway y SY.* sigan vivos.
+- [x] Reiniciar automáticamente RT.gateway, SY.config.routes, SY.opa.rules, SY.admin, SY.identity.
 - [ ] Para AI/WF/IO: solo log warning (no auto-restart).
 - [ ] Shutdown ordenado (SIGTERM): AI/WF/IO → SY.identity + SY.* → RT.gateway, con espera 10s.
 
@@ -54,3 +54,4 @@ Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `do
 - [x] SY.identity agregado a bootstrap/watchdog/shutdown y no-killable.
 - [x] jsr-identity-<island> está documentado y corresponde al writer SY.identity.
 - [x] subsystem=storage → SY.orchestrator documentado.
+- [ ] Estandarizar nombres de binarios (`sy_admin` vs `sy-admin`, etc.) y alinear install/build.
