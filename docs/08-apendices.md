@@ -88,9 +88,11 @@
 
 ### Contexto y Conversaciones
 
-- **ctx_client**: Librería común para acceder a contextos. Provee cache local + fallback a PostgreSQL.
+- **ctx_client**: Librería para acceder a historia completa de contextos. Uso raro (cuando ctx_window no es suficiente).
 
 - **ctx_seq**: Número de secuencia del último mensaje conocido en un contexto.
+
+- **ctx_window**: Array con los últimos 20 turns de un contexto. Agregado por el router al mensaje. Permite que el nodo responda sin consultar DB.
 
 - **Persistencia de turns**: El router persiste cada mensaje con ctx en PostgreSQL (async).
 
@@ -185,6 +187,10 @@ pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 pub const HEARTBEAT_STALE_MS: u64 = 30_000;
 pub const HELLO_INTERVAL_MS: u64 = 10_000;
 pub const DEAD_INTERVAL_MS: u64 = 40_000;
+
+// Contexto
+pub const CTX_WINDOW_SIZE: usize = 20;          // Turns en ctx_window
+pub const CTX_WINDOW_FETCH_TIMEOUT_MS: u64 = 50; // Timeout para fetch de window
 ```
 
 ---

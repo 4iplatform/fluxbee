@@ -189,6 +189,8 @@ Un **Turn** es un mensaje individual dentro de un contexto:
 
 ### 5.1 Estructura del Mensaje
 
+El mensaje que el **nodo IO** envía (sin ctx_window):
+
 ```json
 {
   "routing": {
@@ -212,6 +214,37 @@ Un **Turn** es un mensaje individual dentro de un contexto:
 }
 ```
 
+El mensaje que el **router** entrega al nodo destino (con ctx_window):
+
+```json
+{
+  "routing": {
+    "src": "uuid-io-whatsapp",
+    "dst": "uuid-ai-soporte",
+    "ttl": 16,
+    "trace_id": "uuid-trace"
+  },
+  "meta": {
+    "type": "user",
+    "src_ilk": "ilk:john-doe",
+    "dst_ilk": "ilk:agent-soporte",
+    "ich": "ich:wapp-john",
+    "ctx": "ctx:abc123def456...",
+    "ctx_seq": 47,
+    "ctx_window": [
+      { "seq": 28, "ts": "2026-02-04T14:30:00Z", "from": "ilk:john-doe", "type": "text", "text": "Hola" },
+      { "seq": 29, "ts": "2026-02-04T14:30:05Z", "from": "ilk:agent-soporte", "type": "text", "text": "¡Hola! ¿En qué puedo ayudarte?" },
+      { "seq": 30, "ts": "2026-02-04T14:31:00Z", "from": "ilk:john-doe", "type": "text", "text": "Quiero consultar mi saldo" },
+      { "seq": 47, "ts": "2026-02-04T15:00:00Z", "from": "ilk:john-doe", "type": "text", "text": "Tengo un problema con mi factura" }
+    ]
+  },
+  "payload": {
+    "type": "text",
+    "content": "Tengo un problema con mi factura"
+  }
+}
+```
+
 ### 5.2 Campos de Contexto en meta
 
 | Campo | Tipo | Obligatorio | Descripción |
@@ -221,14 +254,56 @@ Un **Turn** es un mensaje individual dentro de un contexto:
 | `ich` | string | Sí | Canal por el cual llegó/sale el mensaje |
 | `ctx` | string | Sí | Context ID (calculado de src_ilk + ich) |
 | `ctx_seq` | integer | Sí | Último seq conocido de este contexto |
+| `ctx_window` | array | Sí* | Últimos 20 turns. *Agregado por el router |
 
-### 5.3 Mensaje Liviano
+### 5.3 ctx_window — Historia Reciente
 
-**El mensaje NO lleva la historia completa.** Solo lleva:
-- El turno actual (en payload)
-- Metadata del contexto (ctx, ctx_seq)
+El **router** agrega `ctx_window` al mensaje antes de hacer forward:
 
-El nodo destino reconstruye la historia si la necesita.
+```
+ctx_window = últimos 20 turns del contexto (o menos si hay menos)
+```
+
+**Estructura de cada turn en ctx_window:**
+
+```json
+{
+  "seq": 47,
+  "ts": "2026-02-04T15:00:00Z",
+  "from": "ilk:john-doe",
+  "type": "text",
+  "text": "Tengo un problema con mi factura"
+}
+```
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `seq` | integer | Número de secuencia |
+| `ts` | string | Timestamp ISO 8601 |
+| `from` | string | ILK que envió |
+| `type` | string | Tipo: `text`, `image`, `file`, etc. |
+| `text` | string | Contenido (si type=text) |
+| `data` | object | Datos adicionales (si type≠text) |
+
+### 5.4 Beneficios de ctx_window
+
+| Beneficio | Descripción |
+|-----------|-------------|
+| **Latencia cero** | Nodo AI responde inmediato sin consultar DB |
+| **Resiliencia** | Si DB está lenta/caída, conversaciones activas funcionan |
+| **OPA** | Puede usar ctx_window para reglas basadas en historial |
+| **Simplicidad** | El 99% de los casos no necesita más de 20 turns |
+
+### 5.5 Caso Raro: Necesita más historia
+
+Si el nodo necesita más de 20 turns, usa `ctx_client` para consultar la DB:
+
+```rust
+if msg.meta.ctx_window.len() >= 20 && self.needs_full_history(&msg) {
+    let full = self.ctx_client.get_turns(ctx, 0).await?;
+    // usar full en lugar de ctx_window
+}
+```
 
 ---
 
@@ -288,15 +363,15 @@ database:
 
 ---
 
-## 7. Router — Persistencia de Turns
+## 7. Router — Persistencia y ctx_window
 
 ### 7.1 Rol del Router
 
 El router es el único componente que ve **todos** los mensajes. Cuando pasa un mensaje con contexto:
 
-1. Extrae ctx, seq, contenido
-2. Inserta turn en PostgreSQL (async, no bloquea routing)
-3. Reenvía mensaje sin modificar
+1. Persiste turn en PostgreSQL (async, no bloquea routing)
+2. Agrega `ctx_window` con los últimos 20 turns
+3. Reenvía mensaje enriquecido
 
 ### 7.2 Flujo
 
@@ -313,61 +388,100 @@ Mensaje llega al router
     │       ▼
     │   INSERT INTO turns (async)
     │       │
+    │       ▼
+    │   Fetch últimos 20 turns
+    │       │
+    │       ▼
+    │   Agregar ctx_window al mensaje
+    │       │
     └───┬───┘
         │
         ▼
-    Forward normal
+    Forward
 ```
 
 ### 7.3 Implementación (Rust)
 
 ```rust
+const CTX_WINDOW_SIZE: usize = 20;
+
 impl Router {
     async fn handle_message(&mut self, msg: Message) -> Result<()> {
-        // Persistir turn si tiene contexto
+        // Si tiene contexto, persistir y enriquecer
         if let Some(ctx) = &msg.meta.ctx {
-            self.persist_turn(&msg).await;  // async, no espera
+            // 1. Persistir turn (async, no bloquea)
+            self.persist_turn(&msg);
+            
+            // 2. Agregar ctx_window si no viene ya poblado
+            if msg.meta.ctx_window.is_none() {
+                let window = self.fetch_ctx_window(ctx).await;
+                msg.meta.ctx_window = Some(window);
+            }
         }
         
         // Routing normal
         self.route_message(msg).await
     }
     
-    async fn persist_turn(&self, msg: &Message) {
-        let ctx = msg.meta.ctx.as_ref().unwrap();
-        let seq = msg.meta.ctx_seq.unwrap_or(0) + 1;
+    fn persist_turn(&self, msg: &Message) {
+        let pool = self.db_pool.clone();
+        let turn = Turn::from_message(msg);
         
         // Fire-and-forget, no bloquea
-        let pool = self.db_pool.clone();
-        let turn = Turn::from_message(msg, seq);
-        
         tokio::spawn(async move {
-            if let Err(e) = sqlx::query!(
+            let _ = sqlx::query!(
                 r#"INSERT INTO turns (ctx, seq, ts, from_ilk, to_ilk, ich, msg_type, content)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                   VALUES ($1, $2, now(), $3, $4, $5, $6, $7)
                    ON CONFLICT (ctx, seq) DO NOTHING"#,
-                turn.ctx, turn.seq, turn.ts, turn.from_ilk, turn.to_ilk,
+                turn.ctx, turn.seq, turn.from_ilk, turn.to_ilk,
                 turn.ich, turn.msg_type, turn.content
             )
             .execute(&pool)
-            .await {
-                log::warn!("Failed to persist turn: {}", e);
-            }
+            .await;
         });
+    }
+    
+    async fn fetch_ctx_window(&self, ctx: &str) -> Vec<CtxTurn> {
+        // Timeout corto para no bloquear routing
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            self.query_recent_turns(ctx)
+        ).await;
+        
+        match result {
+            Ok(Ok(turns)) => turns,
+            _ => vec![],  // Si falla, continuar sin window
+        }
+    }
+    
+    async fn query_recent_turns(&self, ctx: &str) -> Result<Vec<CtxTurn>> {
+        sqlx::query_as!(
+            CtxTurn,
+            r#"SELECT seq, ts, from_ilk as "from", msg_type as "type",
+                      content->>'text' as text
+               FROM turns WHERE ctx = $1
+               ORDER BY seq DESC LIMIT $2"#,
+            ctx, CTX_WINDOW_SIZE as i64
+        )
+        .fetch_all(&self.db_pool)
+        .await
+        .map(|mut v| { v.reverse(); v })  // Orden cronológico
     }
 }
 ```
 
 ---
 
-## 8. ctx_client — Librería de Contexto
+## 8. ctx_client — Librería de Contexto (Uso Raro)
 
 ### 8.1 Propósito
 
-Librería común para todos los nodos que necesitan acceder al contexto. Provee:
-- Cache local en memoria
-- Fallback a PostgreSQL
-- Gestión de memoria (eviction)
+**En el 99% de los casos, el nodo usa `ctx_window` que viene en el mensaje.**
+
+`ctx_client` solo se necesita cuando:
+- El nodo necesita más de 20 turns de historia
+- Necesita buscar contextos anteriores
+- Procesa batch de contextos offline
 
 ### 8.2 Interfaz
 
@@ -376,13 +490,6 @@ pub struct CtxClient {
     db_pool: PgPool,
     cache: HashMap<String, CtxState>,
     config: CtxClientConfig,
-}
-
-pub struct CtxState {
-    ctx: String,
-    seq: u64,
-    turns: Vec<Turn>,
-    last_access: Instant,
 }
 
 pub struct CtxClientConfig {
@@ -395,44 +502,41 @@ impl CtxClient {
     /// Crea cliente conectado a PostgreSQL
     pub async fn new(db_url: &str, config: CtxClientConfig) -> Result<Self>;
     
-    /// Obtiene historia del contexto
-    /// Usa cache si está actualizado, sino va a DB
-    pub async fn get_turns(&mut self, ctx: &str, expected_seq: u64) -> Result<Vec<Turn>>;
-    
-    /// Registra un turno nuevo en cache local
-    /// (No escribe a DB, eso lo hace el router)
-    pub fn record_turn(&mut self, ctx: &str, turn: Turn);
-    
-    /// Limpia contextos viejos del cache
-    pub fn evict_stale(&mut self);
+    /// Obtiene historia COMPLETA del contexto (va a DB)
+    pub async fn get_full_history(&mut self, ctx: &str) -> Result<Vec<Turn>>;
     
     /// Calcula CTX a partir de ILK + ICH
     pub fn compute_ctx(ilk: &str, ich: &str) -> String;
 }
 ```
 
-### 8.3 Uso en Nodo AI
+### 8.3 Uso Típico en Nodo AI (con ctx_window)
 
 ```rust
+const CTX_WINDOW_SIZE: usize = 20;
+
 impl AiNode {
     async fn handle_message(&mut self, msg: Message) -> Result<()> {
-        let ctx = msg.meta.ctx.as_ref().ok_or("Missing ctx")?;
-        let expected_seq = msg.meta.ctx_seq.unwrap_or(0);
+        // Caso común: usar ctx_window del mensaje
+        let window = msg.meta.ctx_window.as_ref().unwrap_or(&vec![]);
         
-        // Obtener historia (cache o DB)
-        let turns = self.ctx_client.get_turns(ctx, expected_seq).await?;
+        // ¿Necesita más historia? (raro)
+        if self.needs_full_history(&msg) && window.len() >= CTX_WINDOW_SIZE {
+            let ctx = msg.meta.ctx.as_ref().unwrap();
+            let full = self.ctx_client.get_full_history(ctx).await?;
+            return self.process_with_full_history(&msg, &full).await;
+        }
         
-        // Procesar con contexto completo
-        let response = self.process_with_context(&msg, &turns).await?;
-        
-        // Registrar respuesta en cache local
-        self.ctx_client.record_turn(ctx, Turn::from_response(&response));
-        
-        // Enviar respuesta
-        self.send_response(response).await
+        // Caso normal: ctx_window es suficiente
+        self.process_with_window(&msg, window).await
+    }
+    
+    fn needs_full_history(&self, msg: &Message) -> bool {
+        // Ejemplo: si el usuario dice "resumen de toda la conversación"
+        // o si es un handoff a otro agente que necesita contexto completo
+        msg.payload.get("intent") == Some(&"full_summary".into())
     }
 }
-```
 
 ### 8.4 Lógica de Cache
 

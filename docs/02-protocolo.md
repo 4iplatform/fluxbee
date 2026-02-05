@@ -67,6 +67,11 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
     "ich": "ich:a1b2c3d4-5678-90ab-cdef-1234567890ab",
     "ctx": "ctx:abc123def456789012345678901234ab",
     "ctx_seq": 47,
+    "ctx_window": [
+      { "seq": 28, "ts": "2026-02-04T14:30:00Z", "from": "ilk:550e8400-...", "type": "text", "text": "Hola" },
+      { "seq": 29, "ts": "2026-02-04T14:30:05Z", "from": "ilk:7c9e6679-...", "type": "text", "text": "¿En qué puedo ayudarte?" },
+      { "seq": 47, "ts": "2026-02-04T15:00:00Z", "from": "ilk:550e8400-...", "type": "text", "text": "Tengo un problema con mi factura" }
+    ],
     "priority": "high",
     "context": {
       "intent": "billing_question"
@@ -86,6 +91,7 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 | `ich` | string | Sí (L3) | ICH (Interlocutor Channel) por el cual se comunica |
 | `ctx` | string | Sí (L3) | Context ID. Calculado: `hash(src_ilk + ich)` |
 | `ctx_seq` | integer | Sí (L3) | Último número de secuencia conocido del contexto |
+| `ctx_window` | array | Sí (L3) | Últimos N turns del contexto (max 20). Incluye el mensaje actual |
 | `priority` | string | No | Hint de prioridad para OPA |
 | `context` | object | No | Datos adicionales para reglas OPA |
 | `action` | string | No | Para mensajes admin: acción a ejecutar |
@@ -101,16 +107,28 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 | `"broadcast"` | ausente | Router entrega a todos los nodos |
 | UUID | - | Ignorado (unicast directo) |
 
-### 3.2 Campos de Contexto (ich, ctx, ctx_seq)
+### 3.2 Campos de Contexto (ich, ctx, ctx_seq, ctx_window)
 
 Estos campos permiten mantener conversaciones con historia:
 
 - **`ich`**: Canal por el cual el interlocutor se comunica (WhatsApp, Slack, email, etc.)
 - **`ctx`**: Identificador único de la conversación, calculado como `hash(src_ilk + ich)`
 - **`ctx_seq`**: Número de secuencia del último mensaje conocido en este contexto
+- **`ctx_window`**: Array con los últimos 20 turns del contexto (o menos si hay menos)
 
 El router usa `ctx` y `ctx_seq` para persistir la historia de la conversación en PostgreSQL.
-Los nodos usan `ctx_client` para reconstruir la historia cuando la necesitan.
+El router incluye `ctx_window` al hacer forward, permitiendo que el nodo destino responda inmediatamente sin consultar la DB en el caso común.
+
+**Estructura de cada turn en ctx_window:**
+```json
+{
+  "seq": 47,
+  "ts": "2026-02-04T15:00:00Z",
+  "from": "ilk:...",
+  "type": "text",
+  "text": "contenido del mensaje"
+}
+```
 
 Ver `11-context.md` para detalles completos.
 
@@ -200,6 +218,10 @@ pub struct Meta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctx_seq: Option<u64>,
     
+    /// Últimos N turns del contexto (max 20). El router los incluye al forward.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ctx_window: Option<Vec<CtxTurn>>,
+    
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
     
@@ -208,6 +230,20 @@ pub struct Meta {
     
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<Value>,
+}
+
+/// Turn dentro de ctx_window
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CtxTurn {
+    pub seq: u64,
+    pub ts: String,
+    pub from: String,
+    #[serde(rename = "type")]
+    pub turn_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 ```
 

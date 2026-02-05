@@ -629,11 +629,14 @@ Cuando no se encuentra destino:
 
 ---
 
-## 11. Persistencia de Contexto
+## 11. Persistencia de Contexto y ctx_window
 
 ### 11.1 Rol del Router
 
-El router es el único componente que ve **todos** los mensajes. Cuando un mensaje tiene `meta.ctx`, el router persiste el turn en PostgreSQL.
+El router es el único componente que ve **todos** los mensajes. Cuando un mensaje tiene `meta.ctx`:
+
+1. Persiste el turn en PostgreSQL (async)
+2. Agrega `ctx_window` con los últimos 20 turns antes de hacer forward
 
 ### 11.2 Flujo
 
@@ -649,25 +652,36 @@ Mensaje llega
   │       │
   │       ▼
   │   INSERT INTO turns (async)
-  │   - ctx: meta.ctx
-  │   - seq: meta.ctx_seq + 1
-  │   - from_ilk: meta.src_ilk
-  │   - content: payload
+  │       │
+  │       ▼
+  │   Fetch últimos 20 turns
+  │       │
+  │       ▼
+  │   Agregar ctx_window al mensaje
   │       │
   └───┬───┘
       │
       ▼
-  Routing normal
+  Forward normal
 ```
 
 ### 11.3 Implementación
 
 ```rust
+const CTX_WINDOW_SIZE: usize = 20;
+
 impl Router {
     async fn handle_message(&mut self, msg: Message) -> Result<()> {
-        // 1. Persistir turn si tiene contexto (async, no bloquea)
+        // 1. Si tiene contexto, persistir y enriquecer
         if let Some(ctx) = &msg.meta.ctx {
+            // Persistir turn actual (async, no bloquea)
             self.persist_turn(&msg);
+            
+            // Agregar ctx_window si no viene ya poblado
+            if msg.meta.ctx_window.is_none() {
+                let window = self.fetch_ctx_window(ctx).await;
+                msg.meta.ctx_window = Some(window);
+            }
         }
         
         // 2. Routing normal
@@ -695,15 +709,68 @@ impl Router {
             .await;
         });
     }
+    
+    async fn fetch_ctx_window(&self, ctx: &str) -> Vec<CtxTurn> {
+        // Intentar fetch de DB con timeout corto
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            self.query_recent_turns(ctx, CTX_WINDOW_SIZE)
+        ).await;
+        
+        match result {
+            Ok(Ok(turns)) => turns,
+            _ => vec![],  // Si falla o timeout, continuar sin window
+        }
+    }
+    
+    async fn query_recent_turns(&self, ctx: &str, limit: usize) -> Result<Vec<CtxTurn>> {
+        sqlx::query_as!(
+            CtxTurn,
+            r#"SELECT seq, ts, from_ilk as "from", msg_type as turn_type, 
+                      content->>'text' as text
+               FROM turns 
+               WHERE ctx = $1 
+               ORDER BY seq DESC 
+               LIMIT $2"#,
+            ctx, limit as i64
+        )
+        .fetch_all(&self.db_pool)
+        .await
+        .map(|mut v| { v.reverse(); v })  // Ordenar cronológicamente
+    }
 }
 ```
 
-### 11.4 Notas
+### 11.4 Beneficios de ctx_window
 
-- La persistencia es **asíncrona** y no bloquea el routing
-- Si PostgreSQL falla, el mensaje se rutea igual (graceful degradation)
-- Los nodos destino reconstruyen la historia via `ctx_client` si la necesitan
-- Ver `11-context.md` para detalles completos del sistema de contexto
+| Beneficio | Descripción |
+|-----------|-------------|
+| Latencia cero | Nodo AI responde inmediato si 20 turns son suficientes |
+| Resiliencia | Si DB está lenta/caída, conversaciones activas funcionan |
+| OPA | Puede usar ctx_window para reglas basadas en historial |
+| Simplicidad | Nodo no necesita ctx_client si ctx_window es suficiente |
+
+### 11.5 Cuándo el nodo necesita más historia
+
+Si el nodo necesita más de 20 turns (raro):
+
+```rust
+impl AiNode {
+    async fn handle_message(&mut self, msg: Message) -> Result<()> {
+        let window = msg.meta.ctx_window.as_ref().unwrap_or(&vec![]);
+        
+        if self.needs_full_history(&msg) && window.len() >= CTX_WINDOW_SIZE {
+            // Caso raro: necesita más historia
+            let ctx = msg.meta.ctx.as_ref().unwrap();
+            let full_history = self.ctx_client.get_turns(ctx, 0).await?;
+            return self.process_with_full_history(&msg, &full_history).await;
+        }
+        
+        // Caso común: ctx_window es suficiente
+        self.process_with_window(&msg, window).await
+    }
+}
+```
 
 ---
 
