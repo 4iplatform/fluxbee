@@ -236,6 +236,11 @@ pub struct Meta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctx_window: Option<Vec<CtxTurn>>,
     
+    /// Antecedentes episódicos relevantes. El router los incluye si disponibles.
+    /// Max 32KB. Si excede, se truncan highlights.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_package: Option<MemoryPackage>,
+    
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
     
@@ -244,6 +249,98 @@ pub struct Meta {
     
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<Value>,
+}
+
+/// Paquete de antecedentes cognitivos
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryPackage {
+    pub package_version: String,
+    pub query: MemoryQuery,
+    pub events: Vec<MemoryEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_expand: Option<EvidenceExpand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryQuery {
+    pub ctx: String,
+    pub cues_turn: Vec<String>,
+    pub limits: MemoryLimits,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryLimits {
+    pub max_events: usize,
+    pub max_items: usize,
+    pub max_highlights_per_event: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEvent {
+    pub event_id: i64,
+    pub header: MemoryEventHeader,
+    pub highlights: Vec<Highlight>,
+    pub items: Vec<MemoryItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEventHeader {
+    pub ctx: String,
+    pub start_seq: i64,
+    pub end_seq: i64,
+    pub boundary_reason: String,
+    pub cues_agg: Vec<String>,
+    pub outcome: Outcome,
+    pub priority_state: PriorityState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Outcome {
+    pub status: String,
+    pub duration_ms: i64,
+    pub escalations: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriorityState {
+    pub activation_strength: f32,
+    pub context_inhibition: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Highlight {
+    pub seq: i64,
+    pub role: String,
+    pub text: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryItem {
+    pub memory_id: String,
+    #[serde(rename = "type")]
+    pub item_type: String,
+    pub confidence: f32,
+    pub content: Value,
+    pub cues_signature: Vec<String>,
+    pub evidence_refs: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceExpand {
+    pub available: bool,
+    pub how: String,
+    pub ranges: Vec<EvidenceRange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceRange {
+    pub event_id: i64,
+    pub ctx: String,
+    pub start_seq: i64,
+    pub end_seq: i64,
 }
 
 /// Turn dentro de ctx_window
@@ -533,6 +630,98 @@ Los routers pueden:
 | Mensaje | Origen | Destino | Propósito |
 |---------|--------|---------|-----------|
 | `TIME_SYNC` | SY.time / Router | Broadcast | Sincronización UTC (scope=`"global"`) |
+
+### 7.7 Cognición y Memoria
+
+| Mensaje | Origen | Destino | Propósito |
+|---------|--------|---------|-----------|
+| `LSA_MEMORY` | Gateway | Gateway | Propagación de activaciones entre islas |
+| `MEMORY_FETCH` | SY.cognition | Gateway destino | Request: obtener EventPackage de otra isla |
+| `MEMORY_RESPONSE` | Gateway | SY.cognition | Response: EventPackage solicitado |
+
+#### 7.7.1 LSA_MEMORY
+
+Propaga punteros de eventos con alta activación para que otras islas sepan que existen:
+
+```json
+{
+  "routing": {
+    "src": "<uuid-gateway>",
+    "dst": "gateway@otra-isla",
+    "ttl": 8
+  },
+  "meta": {
+    "type": "system",
+    "msg": "LSA_MEMORY"
+  },
+  "payload": {
+    "island": "produccion",
+    "epoch": 12345,
+    "events": [
+      {
+        "event_id": 98,
+        "cues_signature_digest": "a1b2c3d4",
+        "intent_primary": "billing.issue",
+        "tenant_id": "acme",
+        "activation_strength": 0.82,
+        "package_digest": "xyz789"
+      }
+    ]
+  }
+}
+```
+
+#### 7.7.2 MEMORY_FETCH / MEMORY_RESPONSE
+
+Request/response para obtener EventPackage completo de otra isla:
+
+**Request:**
+```json
+{
+  "routing": {
+    "src": "<uuid-sy-cognition>",
+    "dst": "gateway@isla-origen",
+    "ttl": 8
+  },
+  "meta": {
+    "type": "system",
+    "msg": "MEMORY_FETCH"
+  },
+  "payload": {
+    "request_id": "<uuid>",
+    "event_ids": [98, 122],
+    "include_highlights": true,
+    "include_items": true
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "routing": {
+    "src": "<uuid-gateway>",
+    "dst": "<uuid-sy-cognition>",
+    "ttl": 8
+  },
+  "meta": {
+    "type": "system",
+    "msg": "MEMORY_RESPONSE"
+  },
+  "payload": {
+    "request_id": "<uuid>",
+    "status": "ok",
+    "events": [
+      {
+        "event_id": 98,
+        "header": { ... },
+        "highlights": [ ... ],
+        "items": [ ... ]
+      }
+    ]
+  }
+}
+```
 
 ---
 

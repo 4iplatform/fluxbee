@@ -208,10 +208,12 @@ SY.cognition es el único proceso que escribe en LanceDB y jsr-memory:
 ```
 SY.cognition
 │
-├── INPUTS (lee):
-│   ├── turns de PostgreSQL (poll o notify)
-│   ├── reactivation events (de nodos AI)
-│   └── LSA de otras islas (via Gateway)
+├── INPUTS ONLINE (consume NATS local):
+│   ├── turns.local (turns nuevos)
+│   └── reactivations (ajustes de prioridad)
+│
+├── INPUTS REBUILD (socket a SY.storage, solo cold start):
+│   └── turns históricos de PostgreSQL
 │
 ├── PROCESA:
 │   ├── Segmenta turns en episodios (boundaries)
@@ -224,7 +226,8 @@ SY.cognition
 ├── OUTPUTS (escribe):
 │   ├── LanceDB: EventPackages
 │   ├── jsr-memory: índice de tags
-│   └── LSA de activación (para otras islas)
+│   ├── NATS storage.events (para SY.storage → PostgreSQL)
+│   └── NATS storage.items (para SY.storage → PostgreSQL)
 │
 └── WORKERS (orquesta):
     ├── AI.tagger: extrae tags de turns
@@ -470,37 +473,50 @@ pub const TAG_MAX_LEN: usize = 64;
 pub const TOP_K_DEFAULT: usize = 10;
 ```
 
-### 5.4 Algoritmo de Consulta
+### 5.4 Algoritmo de Consulta (Must/Should)
+
+En lugar de intersección pura (que puede dar vacío), usamos must/should:
+
+- **Must (gating):** `tenant:` es obligatorio, filtra la partición
+- **Should (scoring):** `intent:`, `kw:`, `ent:`, `chan:` suman score por match
 
 ```rust
 impl MemoryIndex {
     pub fn query(&self, tenant_id: &str, cues: &[String], top_k: usize) -> Vec<EventCandidate> {
-        // 1. Encontrar partición del tenant
-        let partition = self.find_tenant(tenant_id)?;
+        // 1. Encontrar partición del tenant (MUST)
+        let partition = match self.find_tenant(tenant_id) {
+            Some(p) => p,
+            None => return vec![],  // Sin tenant, no hay resultados
+        };
         
-        // 2. Mapear tags a posting lists
-        let mut posting_lists: Vec<&[Posting]> = vec![];
-        for cue in cues {
+        // 2. Separar must vs should
+        let must_cues: Vec<_> = cues.iter()
+            .filter(|c| c.starts_with("tenant:"))
+            .collect();
+        let should_cues: Vec<_> = cues.iter()
+            .filter(|c| !c.starts_with("tenant:"))
+            .collect();
+        
+        // 3. Obtener todos los eventos del tenant
+        let mut candidates: HashMap<u32, f32> = HashMap::new();
+        
+        // 4. Calcular score por cada should cue que matchea
+        for cue in &should_cues {
             if let Some(postings) = partition.get_postings(cue) {
-                posting_lists.push(postings);
+                for posting in postings {
+                    let base_score = posting.activation_strength 
+                        * (1.0 - posting.context_inhibition.clamp(0.0, 1.0));
+                    
+                    *candidates.entry(posting.event_id).or_insert(0.0) += base_score;
+                }
             }
         }
         
-        // 3. Intersecar (empezar por lista más corta)
-        posting_lists.sort_by_key(|p| p.len());
-        let candidates = self.intersect_postings(&posting_lists);
-        
-        // 4. Calcular score y ordenar
-        let mut scored: Vec<_> = candidates.iter()
-            .map(|p| {
-                let score = p.activation_strength * (1.0 - p.context_inhibition);
-                (p.event_id, score)
-            })
-            .collect();
-        
+        // 5. Ordenar por score total
+        let mut scored: Vec<_> = candidates.into_iter().collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         
-        // 5. Devolver Top-K con headers
+        // 6. Devolver Top-K con headers
         scored.truncate(top_k);
         scored.iter()
             .map(|(id, score)| EventCandidate {
@@ -515,23 +531,24 @@ impl MemoryIndex {
 
 ### 5.5 Publicación (Single Writer)
 
+jsr-memory usa el mismo mecanismo epoch/RCU que todas las regiones SHM (ver `03-shm.md`):
+
 ```rust
 impl CognitionWriter {
     pub fn publish_index(&mut self, events: &[Event], tags: &HashMap<String, Vec<i64>>) {
         // 1. Construir nuevas estructuras en shadow region
         let shadow = self.build_shadow_index(events, tags);
         
-        // 2. Incrementar epoch
-        let new_epoch = self.header.epoch + 1;
-        shadow.header.epoch = new_epoch;
+        // 2. Incrementar epoch (impar = transición)
+        self.header.epoch.fetch_add(1, Ordering::Release);
         
         // 3. Swap atómico
-        std::ptr::swap(&mut self.active_region, &mut shadow);
+        std::mem::swap(&mut self.active_region, &mut shadow);
         
-        // 4. Publicar epoch (los readers lo ven)
-        self.header.epoch.store(new_epoch, Ordering::Release);
+        // 4. Publicar epoch (par = listo)
+        self.header.epoch.fetch_add(1, Ordering::Release);
         
-        // 5. Esperar a que readers terminen con región vieja (RCU)
+        // 5. Esperar a que readers terminen con región vieja (grace period)
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -571,30 +588,59 @@ fn normalize_tag(raw: &str) -> String {
 
 ### 6.3 Extracción de Tags
 
-**Tags exactos (metadata, sin AI):**
+#### 6.3.1 Tags Exactos (Router, sin AI)
+
+El router extrae estos tags **inmediatamente** de metadata, sin llamar a ningún modelo:
+
+| Tag | Fuente | Siempre presente |
+|-----|--------|------------------|
+| `tenant:<id>` | Derivado de src_ilk via jsr-identity | Sí (must) |
+| `chan:<type>` | Derivado de ich (whatsapp, slack, email) | Sí |
+| `ilk:<id>` | meta.src_ilk | Sí |
+| `ctx:<hash>` | meta.ctx | Sí |
 
 ```rust
 fn extract_exact_tags(msg: &Message) -> Vec<String> {
     let mut tags = vec![];
     
-    // Del routing/meta
-    if let Some(ich) = &msg.meta.ich {
-        if ich.contains("whatsapp") {
-            tags.push("chan:whatsapp".into());
-        }
-        // ...
-    }
-    
-    // Del tenant (derivado de src_ilk)
+    // Tenant (MUST para query)
     if let Some(tenant) = derive_tenant(&msg.meta.src_ilk) {
         tags.push(format!("tenant:{}", tenant));
+    }
+    
+    // Canal
+    if let Some(ich) = &msg.meta.ich {
+        let chan = if ich.contains("whatsapp") { "whatsapp" }
+                   else if ich.contains("slack") { "slack" }
+                   else if ich.contains("email") { "email" }
+                   else { "other" };
+        tags.push(format!("chan:{}", chan));
+    }
+    
+    // ILK
+    if let Some(ilk) = &msg.meta.src_ilk {
+        tags.push(format!("ilk:{}", ilk));
+    }
+    
+    // Context
+    if let Some(ctx) = &msg.meta.ctx {
+        tags.push(format!("ctx:{}", ctx));
     }
     
     tags
 }
 ```
 
-**Tags semánticos (requiere AI):**
+#### 6.3.2 Tags Semánticos (AI.tagger, async)
+
+SY.cognition extrae estos tags **después** del hot path:
+
+| Tag | Descripción | Ejemplo |
+|-----|-------------|---------|
+| `intent:<category>` | Clasificación de tarea | `intent:billing.issue` |
+| `kw:<keyword>` | Keywords normalizadas | `kw:doble_cobro` |
+| `ent:<type>:<value>` | Entidades extraídas | `ent:invoice_id:INV-123` |
+| `topic:<cluster>` | Cluster semántico | `topic:facturacion` |
 
 ```rust
 // SY.cognition llama a AI.tagger (async, no en hot path)
@@ -609,24 +655,42 @@ async fn extract_semantic_tags(&self, episode: &Episode) -> Vec<String> {
 }
 ```
 
-### 6.4 Flujo de Enriquecimiento (Opción C)
+#### 6.3.3 Comportamiento con Solo Tags Exactos
+
+En la primera interacción (antes de que SY.cognition procese):
+
+```
+Query: [tenant:acme, chan:whatsapp]
+
+Resultado:
+- Pocos candidatos (todos los eventos de acme por whatsapp)
+- Score bajo (solo 1-2 tags matchean)
+- memory_package con eventos menos relevantes o vacío
+- El sistema funciona, pero sin especificidad
+
+Después de SY.cognition:
+- Episodio enriquecido con intent:, kw:, ent:
+- Próximas queries similares encuentran este episodio
+```
+
+### 6.4 Flujo de Enriquecimiento
 
 ```
 Primera interacción:
-├── Router extrae tags exactos (chan, tenant)
-├── jsr-memory: pocos candidatos o ninguno
-├── Forward con ctx_window, sin memory_package rico
+├── Router extrae tags exactos (tenant, chan, ilk, ctx)
+├── jsr-memory: pocos candidatos o ninguno (score bajo)
+├── Forward con ctx_window, memory_package vacío o pobre
 ├── AI.soporte responde (funciona, sin antecedentes)
-└── SY.cognition (async):
-    ├── Lee turns de PostgreSQL
+└── SY.cognition (async, consume NATS):
+    ├── Recibe turn de NATS local
     ├── Llama AI.tagger → tags semánticos
-    ├── Consolida episodio
+    ├── Consolida episodio con todos los tags
     └── Actualiza jsr-memory
 
 Segunda interacción (similar):
 ├── Router extrae tags exactos
-├── jsr-memory: encuentra episodio anterior
-├── Fetch LanceDB → memory_package
+├── jsr-memory: encuentra episodio anterior (score alto por tags semánticos)
+├── Fetch LanceDB → memory_package rico
 ├── Forward con ctx_window + memory_package
 └── AI.soporte responde con antecedentes
 ```
@@ -724,7 +788,55 @@ Segunda interacción (similar):
 }
 ```
 
-### 7.2 Campos en meta (mensaje enriquecido)
+### 7.2 Límites y Truncamiento
+
+El mensaje inline tiene límite de 64KB. Para evitar excederlo:
+
+| Límite | Valor | Propósito |
+|--------|-------|-----------|
+| `MEMORY_PACKAGE_MAX_BYTES` | 32KB | Mitad del inline, deja espacio para ctx_window |
+| `max_events` | 3 | Top-3 eventos más relevantes |
+| `max_items` | 12 | ~4 items por evento |
+| `max_highlights_per_event` | 8 | Highlights más representativos |
+
+**Algoritmo de truncamiento:**
+
+```rust
+fn truncate_package(pkg: &mut MemoryPackage) {
+    // 1. Limitar eventos
+    pkg.events.truncate(MEMORY_PACKAGE_MAX_EVENTS);
+    
+    // 2. Limitar highlights por evento
+    for event in &mut pkg.events {
+        event.highlights.truncate(MEMORY_PACKAGE_MAX_HIGHLIGHTS_PER_EVENT);
+    }
+    
+    // 3. Limitar items totales
+    let mut total_items = 0;
+    for event in &mut pkg.events {
+        let remaining = MEMORY_PACKAGE_MAX_ITEMS - total_items;
+        event.items.truncate(remaining);
+        total_items += event.items.len();
+    }
+    
+    // 4. Verificar tamaño final
+    let size = serde_json::to_vec(pkg).map(|v| v.len()).unwrap_or(0);
+    if size > MEMORY_PACKAGE_MAX_BYTES {
+        // Truncar highlights más viejos hasta que quepa
+        for event in &mut pkg.events {
+            while event.highlights.len() > 2 {
+                event.highlights.pop();
+                let new_size = serde_json::to_vec(pkg).map(|v| v.len()).unwrap_or(0);
+                if new_size <= MEMORY_PACKAGE_MAX_BYTES {
+                    break;
+                }
+            }
+        }
+    }
+}
+```
+
+### 7.3 Campos en meta (mensaje enriquecido)
 
 ```json
 {
@@ -737,6 +849,7 @@ Segunda interacción (similar):
     "memory_package": { ... }
   }
 }
+```
 ```
 
 ---
@@ -1026,6 +1139,12 @@ pub const MAX_EVENTS_PER_TENANT: usize = 65536;
 // Consultas
 pub const TOP_K_DEFAULT: usize = 10;
 pub const MEMORY_FETCH_TIMEOUT_MS: u64 = 50;
+
+// MemoryPackage (límites inline)
+pub const MEMORY_PACKAGE_MAX_BYTES: usize = 32 * 1024;  // 32KB (mitad del inline 64KB)
+pub const MEMORY_PACKAGE_MAX_EVENTS: usize = 3;
+pub const MEMORY_PACKAGE_MAX_ITEMS: usize = 12;
+pub const MEMORY_PACKAGE_MAX_HIGHLIGHTS_PER_EVENT: usize = 8;
 
 // Prioridad
 pub const ACTIVATION_INITIAL: f32 = 0.5;

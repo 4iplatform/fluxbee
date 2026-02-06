@@ -62,7 +62,9 @@
 
 - **jsr-identity-<island>**: Región de identidad. Contiene ILKs, ICHs, modules, degrees. Writer: SY.identity.
 
-- **Seqlock**: Mecanismo de sincronización para un writer y múltiples readers.
+- **jsr-memory-<island>**: Región de índice cognitivo. Contiene inverted index de tags → event_ids. Writer: SY.cognition.
+
+- **Epoch/RCU**: Mecanismo de sincronización para un writer y múltiples readers. Writer usa shadow region + epoch bump + swap. Readers nunca copian, leen in-place.
 
 - **Heartbeat**: Timestamp actualizado periódicamente para detectar procesos muertos.
 
@@ -242,6 +244,21 @@ pub const DEAD_INTERVAL_MS: u64 = 40_000;
 // Contexto
 pub const CTX_WINDOW_SIZE: usize = 20;          // Turns en ctx_window
 pub const CTX_WINDOW_FETCH_TIMEOUT_MS: u64 = 50; // Timeout para fetch de window
+
+// Cognición (jsr-memory)
+pub const MEMORY_MAGIC: u32 = 0x4A534D45;       // "JSME"
+pub const MEMORY_VERSION: u32 = 1;
+pub const MAX_TENANTS: usize = 256;
+pub const MAX_TAGS_PER_TENANT: usize = 16384;
+pub const MAX_EVENTS_PER_TENANT: usize = 65536;
+pub const MEMORY_FETCH_TIMEOUT_MS: u64 = 50;
+pub const MEMORY_PACKAGE_MAX_BYTES: usize = 32 * 1024;  // 32KB
+
+// NATS
+pub const NATS_DEFAULT_PORT: u16 = 4222;
+pub const NATS_STREAM_MAX_AGE_DAYS: u64 = 7;
+pub const WAN_BATCH_SIZE: usize = 100;
+pub const WAN_BATCH_TIMEOUT_MS: u64 = 100;
 ```
 
 ---

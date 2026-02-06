@@ -29,7 +29,7 @@ El sistema usa seis tipos de regiones de memoria compartida:
 | `jsr-identity-<island>` | SY.identity | ILKs, ICHs, modules, degrees, external mappings |
 | `jsr-memory-<island>` | SY.cognition | Índice de activación: tags → event_ids |
 
-**Principio clave:** Cada región tiene **un único writer** y múltiples readers. Esto permite usar seqlock sin conflictos.
+**Principio clave:** Cada región tiene **un único writer** y múltiples readers. Esto permite usar epoch/RCU (Read-Copy-Update) sin locks.
 
 ---
 
@@ -51,7 +51,7 @@ Ejemplo: /jsr-a1b2c3d4-e5f6-7890-abcd-ef1234567890
 
 | Dato | Descripción |
 |------|-------------|
-| Header | Identificación, seqlock, heartbeat |
+| Header | Identificación, epoch, heartbeat |
 | Nodos | Nodos conectados directamente a este router |
 
 ### 2.3 Layout
@@ -86,8 +86,8 @@ pub struct ShmHeader {
     pub owner_start_time: u64,
     pub generation: u64,
     
-    // Seqlock (8 bytes)
-    pub seq: u64,  // AtomicU64
+    // Epoch (sincronización RCU) (8 bytes)
+    pub epoch: u64,  // AtomicU64 - par = listo, impar = escribiendo
     
     // Contadores (8 bytes)
     pub node_count: u32,
@@ -160,7 +160,7 @@ Ejemplo: /jsr-config-produccion
 
 | Dato | Descripción |
 |------|-------------|
-| Header | Identificación, seqlock, contadores |
+| Header | Identificación, epoch, contadores |
 | Rutas estáticas | Configuración de routing |
 | Tabla VPN | Asignación de nodos a VPN |
 
@@ -436,43 +436,98 @@ pub struct RemoteVpnEntry {
 
 ---
 
-## 5. Sincronización: Seqlock
+## 5. Sincronización: Epoch/RCU
 
-Todas las regiones usan seqlock para sincronización.
+Todas las regiones usan epoch/RCU para sincronización lock-free.
 
-### 5.1 Protocolo del Writer
+### 5.1 Modelo Conceptual
 
-```rust
-// Comenzar escritura (seq queda impar)
-header.seq.fetch_add(1, Ordering::Relaxed);
+```
+Writer tiene:
+  - active: puntero a región en uso por readers
+  - shadow: puntero a región para próxima escritura
 
-// Escribir datos
-// ...
+Readers:
+  - Leen epoch, usan datos directamente (sin copiar)
+  - Nunca reintentan, siempre ven snapshot consistente
 
-// Finalizar escritura (seq queda par)
-atomic::fence(Ordering::Release);
-header.seq.fetch_add(1, Ordering::Relaxed);
+Writer:
+  - Escribe en shadow
+  - Incrementa epoch
+  - Swap active ↔ shadow
+  - Grace period (espera a que readers terminen)
 ```
 
-### 5.2 Protocolo del Reader
+### 5.2 Protocolo del Writer
 
 ```rust
-loop {
-    let s1 = header.seq.load(Ordering::Acquire);
-    if s1 & 1 != 0 {
-        std::hint::spin_loop();
-        continue;
-    }
-    
-    atomic::fence(Ordering::Acquire);
-    let data = /* copiar snapshot */;
-    atomic::fence(Ordering::Acquire);
-    
-    let s2 = header.seq.load(Ordering::Acquire);
-    if s1 == s2 {
-        break;  // Snapshot consistente
+impl<T> EpochRegion<T> {
+    pub fn write<F: FnOnce(&mut T)>(&mut self, f: F) {
+        // 1. Escribir en shadow (sin afectar readers)
+        f(&mut self.shadow);
+        
+        // 2. Incrementar epoch (impar = transición)
+        let new_epoch = self.header.epoch.fetch_add(1, Ordering::Release) + 1;
+        
+        // 3. Swap punteros
+        std::mem::swap(&mut self.active, &mut self.shadow);
+        
+        // 4. Publicar epoch (par = listo)
+        self.header.epoch.store(new_epoch + 1, Ordering::Release);
+        
+        // 5. Grace period: esperar a que readers en vuelo terminen
+        //    (los readers típicamente tardan < 1ms)
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
+```
+
+### 5.3 Protocolo del Reader
+
+```rust
+impl<T> EpochRegion<T> {
+    pub fn read<F: FnOnce(&T) -> R, R>(&self, f: F) -> R {
+        loop {
+            // 1. Leer epoch
+            let epoch = self.header.epoch.load(Ordering::Acquire);
+            
+            // 2. Si impar, writer está en transición → spin
+            if epoch & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            
+            // 3. Leer puntero active
+            let active = &*self.active;
+            
+            // 4. Usar datos directamente (sin copiar)
+            let result = f(active);
+            
+            // 5. Verificar que epoch no cambió
+            atomic::fence(Ordering::Acquire);
+            let epoch2 = self.header.epoch.load(Ordering::Acquire);
+            
+            if epoch == epoch2 {
+                return result;  // Lectura consistente
+            }
+            // Si cambió, reintentar (raro, solo durante transición)
+        }
+    }
+}
+```
+
+### 5.4 Ventajas sobre Seqlock
+
+| Aspecto | Seqlock | Epoch/RCU |
+|---------|---------|-----------|
+| Reader copia datos | Sí (toda la región) | No (lee in-place) |
+| Reintentos en región grande | Frecuentes | Raros |
+| Latencia de lectura | Variable | Predecible |
+| Memoria extra | No | Sí (shadow) |
+| Complejidad | Baja | Media |
+
+**Para regiones pequeñas** (config, lsa) el overhead de shadow es despreciable (~150KB extra).  
+**Para regiones grandes** (memory, ~MBs) la diferencia de rendimiento es significativa.
 ```
 
 ---
