@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -64,6 +66,7 @@ struct OrchestratorState {
     gateway_name: String,
     storage_path: Mutex<String>,
     wan_listen: Option<String>,
+    tracked_nodes: Mutex<HashSet<String>>,
 }
 
 const CRITICAL_SERVICES: [&str; 5] = [
@@ -107,6 +110,7 @@ async fn main() -> Result<(), OrchestratorError> {
         gateway_name,
         storage_path: Mutex::new(storage_path),
         wan_listen,
+        tracked_nodes: Mutex::new(HashSet::new()),
     };
     ensure_dirs(&config_dir, &state_dir, &run_dir)?;
     write_pid(&run_dir)?;
@@ -123,11 +127,23 @@ async fn main() -> Result<(), OrchestratorError> {
     tracing::info!("connected to router");
     tracing::info!(island = %island.island_id, "island ready");
 
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
     let mut watchdog = time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
             _ = watchdog.tick() => {
-                watchdog_tick().await;
+                watchdog_tick(&state).await;
+            }
+            _ = sigterm.recv() => {
+                tracing::warn!("SIGTERM received; shutting down");
+                shutdown_sequence(&state).await;
+                return Ok(());
+            }
+            _ = sigint.recv() => {
+                tracing::warn!("SIGINT received; shutting down");
+                shutdown_sequence(&state).await;
+                return Ok(());
             }
             msg = receiver.recv() => {
                 let msg = match msg {
@@ -154,7 +170,7 @@ async fn main() -> Result<(), OrchestratorError> {
     }
 }
 
-async fn watchdog_tick() {
+async fn watchdog_tick(state: &OrchestratorState) {
     for service in CRITICAL_SERVICES {
         if !systemd_is_active(service) {
             tracing::warn!(service = service, "service not active; attempting restart");
@@ -162,6 +178,43 @@ async fn watchdog_tick() {
                 tracing::warn!(service = service, error = %err, "service restart failed");
             }
         }
+    }
+
+    if let Ok(snapshot) = load_router_snapshot(state) {
+        let mut current = HashSet::new();
+        for node in &snapshot.nodes {
+            if node.name_len == 0 {
+                continue;
+            }
+            let name = node_name(node);
+            if name.starts_with("AI.") || name.starts_with("WF.") || name.starts_with("IO.") {
+                current.insert(name);
+            }
+        }
+        let mut tracked = state.tracked_nodes.lock().await;
+        for missing in tracked.difference(&current) {
+            tracing::warn!(node = missing.as_str(), "node disconnected");
+        }
+        *tracked = current;
+    }
+}
+
+async fn shutdown_sequence(state: &OrchestratorState) {
+    let tracked = state.tracked_nodes.lock().await;
+    for node in tracked.iter() {
+        tracing::warn!(node = node.as_str(), "shutdown pending; node still connected");
+    }
+    drop(tracked);
+
+    time::sleep(Duration::from_secs(10)).await;
+
+    for service in ["sy-identity", "sy-admin", "sy-config-routes", "sy-opa-rules"] {
+        if let Err(err) = systemd_stop(service) {
+            tracing::warn!(service = service, error = %err, "failed to stop service");
+        }
+    }
+    if let Err(err) = systemd_stop("rt-gateway") {
+        tracing::warn!(service = "rt-gateway", error = %err, "failed to stop service");
     }
 }
 
@@ -908,6 +961,10 @@ fn systemd_is_active(service: &str) -> bool {
 
 fn systemd_start(service: &str) -> Result<(), OrchestratorError> {
     run_cmd(Command::new("systemctl").arg("start").arg(service), "systemctl start")
+}
+
+fn systemd_stop(service: &str) -> Result<(), OrchestratorError> {
+    run_cmd(Command::new("systemctl").arg("stop").arg(service), "systemctl stop")
 }
 
 fn askpass_script(password: &str) -> Result<PathBuf, OrchestratorError> {

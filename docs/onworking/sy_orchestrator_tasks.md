@@ -14,8 +14,8 @@ Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `do
 ## 2) Watchdog y lifecycle
 - [x] Tick cada 5s: verificar que RT.gateway y SY.* sigan vivos.
 - [x] Reiniciar automáticamente RT.gateway, SY.config.routes, SY.opa.rules, SY.admin, SY.identity.
-- [ ] Para AI/WF/IO: solo log warning (no auto-restart).
-- [ ] Shutdown ordenado (SIGTERM): AI/WF/IO → SY.identity + SY.* → RT.gateway, con espera 10s.
+- [x] Para AI/WF/IO: solo log warning (no auto-restart).
+- [x] Shutdown ordenado (SIGTERM): AI/WF/IO → SY.identity + SY.* → RT.gateway, con espera 10s.
 
 ## 3) API interna (mensajes admin)
 - [x] `list_nodes` (SHM router) / `run_node`, `kill_node` (stubs).
