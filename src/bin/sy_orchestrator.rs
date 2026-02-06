@@ -115,6 +115,8 @@ async fn main() -> Result<(), OrchestratorError> {
     ensure_dirs(&config_dir, &state_dir, &run_dir)?;
     write_pid(&run_dir)?;
 
+    bootstrap_local(&state, &socket_dir).await?;
+
     let node_config = NodeConfig {
         name: "SY.orchestrator".to_string(),
         router_socket: socket_dir.clone(),
@@ -167,6 +169,84 @@ async fn main() -> Result<(), OrchestratorError> {
                 }
             }
         }
+    }
+}
+
+async fn bootstrap_local(state: &OrchestratorState, socket_dir: &Path) -> Result<(), OrchestratorError> {
+    tracing::info!("starting rt-gateway");
+    systemd_start("rt-gateway")?;
+    wait_for_router_ready(state, socket_dir, Duration::from_secs(30)).await?;
+
+    let services = ["sy-config-routes", "sy-opa-rules", "sy-identity", "sy-admin"];
+    for service in services {
+        tracing::info!(service = service, "starting service");
+        if let Err(err) = systemd_start(service) {
+            tracing::warn!(service = service, error = %err, "failed to start service");
+        }
+    }
+
+    wait_for_sy_nodes(state, Duration::from_secs(30)).await?;
+    Ok(())
+}
+
+async fn wait_for_router_ready(
+    state: &OrchestratorState,
+    socket_dir: &Path,
+    timeout: Duration,
+) -> Result<(), OrchestratorError> {
+    let start = Instant::now();
+    loop {
+        let socket_ready = socket_dir
+            .read_dir()
+            .ok()
+            .and_then(|mut entries| entries.find(|entry| {
+                entry
+                    .as_ref()
+                    .ok()
+                    .and_then(|entry| entry.path().extension().map(|ext| ext == "sock"))
+                    .unwrap_or(false)
+            }))
+            .is_some();
+        let shm_ready = load_router_snapshot(state).is_ok();
+        if socket_ready && shm_ready {
+            tracing::info!("router socket + shm ready");
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err("router bootstrap timeout".into());
+        }
+        time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_sy_nodes(state: &OrchestratorState, timeout: Duration) -> Result<(), OrchestratorError> {
+    let required = ["SY.config.routes", "SY.opa.rules", "SY.identity", "SY.admin"];
+    let start = Instant::now();
+    loop {
+        if let Ok(snapshot) = load_router_snapshot(state) {
+            let mut missing = Vec::new();
+            for name in &required {
+                let expected = ensure_l2_name(name, &state.island_id);
+                let found = snapshot.nodes.iter().any(|node| {
+                    if node.name_len == 0 {
+                        return false;
+                    }
+                    let node_name = node_name(node);
+                    node_name == *name || node_name == expected
+                });
+                if !found {
+                    missing.push(name);
+                }
+            }
+            if missing.is_empty() {
+                tracing::info!("sy nodes connected");
+                return Ok(());
+            }
+        }
+        if start.elapsed() >= timeout {
+            return Err("sy nodes bootstrap timeout".into());
+        }
+        time::sleep(Duration::from_millis(250)).await;
     }
 }
 

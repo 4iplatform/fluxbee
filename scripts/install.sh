@@ -39,11 +39,12 @@ sudo install -d /var/run/json-router/routers
 
 BIN_DIR="${BIN_DIR:-$ROOT_DIR/target/release}"
 if [[ "${SKIP_BUILD:-}" == "1" ]]; then
-  if [[ -d "$ROOT_DIR/target/release" ]]; then
-    BIN_DIR="$ROOT_DIR/target/release"
-  elif [[ -d "$ROOT_DIR/target/debug" ]]; then
-    BIN_DIR="$ROOT_DIR/target/debug"
-  fi
+  for candidate in "$ROOT_DIR/target/release" "$ROOT_DIR/target/debug" "$ROOT_DIR/bin" "$ROOT_DIR/dist"; do
+    if [[ -d "$candidate" ]]; then
+      BIN_DIR="$candidate"
+      break
+    fi
+  done
 fi
 
 echo "Installing binaries to /usr/bin from $BIN_DIR..."
@@ -67,6 +68,7 @@ json_router_bin="$(pick_bin json-router "")" || { echo "Missing binary: $BIN_DIR
 sy_admin_bin="$(pick_bin sy-admin sy_admin)" || { echo "Missing binary: $BIN_DIR/sy-admin or $BIN_DIR/sy_admin" >&2; missing=1; }
 sy_config_bin="$(pick_bin sy-config-routes sy_config_routes)" || { echo "Missing binary: $BIN_DIR/sy-config-routes or $BIN_DIR/sy_config_routes" >&2; missing=1; }
 sy_orch_bin="$(pick_bin sy-orchestrator sy_orchestrator)" || { echo "Missing binary: $BIN_DIR/sy-orchestrator or $BIN_DIR/sy_orchestrator" >&2; missing=1; }
+sy_identity_bin="$(pick_bin sy-identity sy_identity || true)"
 
 if [[ "$missing" -eq 1 ]]; then
   echo "Build them first (e.g. cargo build --release --bins) or set BIN_DIR to where they exist." >&2
@@ -77,6 +79,11 @@ sudo install -m 0755 "$json_router_bin" /usr/bin/rt-gateway
 sudo install -m 0755 "$sy_admin_bin" /usr/bin/sy-admin
 sudo install -m 0755 "$sy_config_bin" /usr/bin/sy-config-routes
 sudo install -m 0755 "$sy_orch_bin" /usr/bin/sy-orchestrator
+if [[ -n "${sy_identity_bin:-}" ]]; then
+  sudo install -m 0755 "$sy_identity_bin" /usr/bin/sy-identity
+else
+  echo "Warning: sy-identity binary not found; skipping install." >&2
+fi
 if [[ -f "$ROOT_DIR/sy-opa-rules/sy-opa-rules" ]]; then
   sudo install -m 0755 "$ROOT_DIR/sy-opa-rules/sy-opa-rules" /usr/bin/sy-opa-rules
 fi
@@ -87,6 +94,48 @@ fi
 
 if [[ -f "$ROOT_DIR/config/sy-config-routes.yaml" ]]; then
   sudo install -m 0644 "$ROOT_DIR/config/sy-config-routes.yaml" /etc/json-router/sy-config-routes.yaml
+else
+  if [[ ! -f "/etc/json-router/sy-config-routes.yaml" ]]; then
+    echo "Creating default /etc/json-router/sy-config-routes.yaml"
+    cat <<'EOF' | sudo tee /etc/json-router/sy-config-routes.yaml >/dev/null
+version: 1
+routes: []
+vpns: []
+EOF
+  fi
 fi
 
-echo "Installed config to /etc/json-router, binaries to /usr/bin, and created runtime directories."
+install_unit() {
+  local name="$1"
+  local exec="$2"
+  local path="/etc/systemd/system/${name}.service"
+  cat <<EOF | sudo tee "$path" >/dev/null
+[Unit]
+Description=JSON Router ${name}
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${exec}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+echo "Installing systemd units..."
+install_unit "rt-gateway" "/usr/bin/rt-gateway"
+install_unit "sy-config-routes" "/usr/bin/sy-config-routes"
+install_unit "sy-opa-rules" "/usr/bin/sy-opa-rules"
+install_unit "sy-admin" "/usr/bin/sy-admin"
+install_unit "sy-orchestrator" "/usr/bin/sy-orchestrator"
+if [[ -n "${sy_identity_bin:-}" ]]; then
+  install_unit "sy-identity" "/usr/bin/sy-identity"
+else
+  echo "Warning: sy-identity unit not installed (binary missing)." >&2
+fi
+sudo systemctl daemon-reload
+
+echo "Installed config to /etc/json-router, binaries to /usr/bin, systemd units, and created runtime directories."

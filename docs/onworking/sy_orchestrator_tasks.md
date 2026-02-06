@@ -6,10 +6,10 @@ Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `do
 - [x] Leer `/etc/json-router/island.yaml` y validar `island_id`.
 - [x] Crear estructura de directorios (paths fijos de `07-operaciones`).
 - [x] Escribir PID en `/var/run/json-router/orchestrator.pid`.
-- [ ] Levantar `RT.gateway` (systemd o exec) y esperar socket/shm (timeout 30s).
-- [ ] Levantar en paralelo: `SY.config.routes`, `SY.opa.rules`, `SY.admin`, `SY.identity` y esperar conexión (timeout 30s).
-- [ ] Conectar como nodo `SY.orchestrator@<isla>` (HELLO/ANNOUNCE) y entrar al loop principal.
-- [ ] Log `Island {island_id} ready`.
+- [x] Levantar `RT.gateway` (systemd o exec) y esperar socket/shm (timeout 30s).
+- [x] Levantar en paralelo: `SY.config.routes`, `SY.opa.rules`, `SY.admin`, `SY.identity` y esperar conexión (timeout 30s).
+- [x] Conectar como nodo `SY.orchestrator@<isla>` (HELLO/ANNOUNCE) y entrar al loop principal.
+- [x] Log `Island {island_id} ready`.
 
 ## 2) Watchdog y lifecycle
 - [x] Tick cada 5s: verificar que RT.gateway y SY.* sigan vivos.
