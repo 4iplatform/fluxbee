@@ -54,7 +54,7 @@ Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisi
 
 ## 3. Sección `meta` (Metadata para OPA y Sistema)
 
-Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado y persistencia de contexto.
+Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado, persistencia de contexto y enriquecimiento cognitivo.
 
 ```json
 {
@@ -72,6 +72,10 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
       { "seq": 29, "ts": "2026-02-04T14:30:05Z", "from": "ilk:7c9e6679-...", "type": "text", "text": "¿En qué puedo ayudarte?" },
       { "seq": 47, "ts": "2026-02-04T15:00:00Z", "from": "ilk:550e8400-...", "type": "text", "text": "Tengo un problema con mi factura" }
     ],
+    "memory_package": {
+      "events": [...],
+      "evidence_expand": {...}
+    },
     "priority": "high",
     "context": {
       "intent": "billing_question"
@@ -91,7 +95,8 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 | `ich` | string | Sí (L3) | ICH (Interlocutor Channel) por el cual se comunica |
 | `ctx` | string | Sí (L3) | Context ID. Calculado: `hash(src_ilk + ich)` |
 | `ctx_seq` | integer | Sí (L3) | Último número de secuencia conocido del contexto |
-| `ctx_window` | array | Sí (L3) | Últimos N turns del contexto (max 20). Incluye el mensaje actual |
+| `ctx_window` | array | Sí (L3) | Últimos 20 turns del contexto. Agregado por router |
+| `memory_package` | object | No | Antecedentes episódicos relevantes. Agregado por router |
 | `priority` | string | No | Hint de prioridad para OPA |
 | `context` | object | No | Datos adicionales para reglas OPA |
 | `action` | string | No | Para mensajes admin: acción a ejecutar |
@@ -118,6 +123,15 @@ Estos campos permiten mantener conversaciones con historia:
 
 El router usa `ctx` y `ctx_seq` para persistir la historia de la conversación en PostgreSQL.
 El router incluye `ctx_window` al hacer forward, permitiendo que el nodo destino responda inmediatamente sin consultar la DB en el caso común.
+
+### 3.3 Antecedentes Cognitivos (memory_package)
+
+El router consulta `jsr-memory` y `LanceDB` para incluir episodios relevantes:
+
+- **`memory_package.events`**: Episodios pasados que matchean los tags del mensaje actual
+- **`memory_package.evidence_expand`**: Punteros para expandir a evidencia completa si se necesita
+
+Ver `12-cognition.md` para detalles del sistema cognitivo.
 
 **Estructura de cada turn en ctx_window:**
 ```json

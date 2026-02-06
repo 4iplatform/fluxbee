@@ -96,28 +96,56 @@
 
 - **Persistencia de turns**: El router persiste cada mensaje con ctx en PostgreSQL (async).
 
+### Cognición y Memoria
+
+- **Event (Episodio)**: Unidad de experiencia consolidada. Rango de turns con boundaries claros.
+
+- **Highlight**: Turns verbatim seleccionados que capturan la esencia de un episodio.
+
+- **Memory Item**: Conclusión accionable derivada de un episodio (fact, procedure, constraint, preference).
+
+- **Cue (Tag)**: Etiqueta normalizada para indexación y recuperación. Ej: `intent:billing.issue`, `kw:doble_cobro`.
+
+- **activation_strength**: Probabilidad de que un evento/item sea recuperado. Sube con uso exitoso.
+
+- **context_inhibition**: Supresión contextual de un evento/item. Permite reemplazo funcional sin borrado.
+
+- **jsr-memory-<island>**: Región SHM con índice invertido de tags → eventos. Writer: SY.cognition.
+
+- **LanceDB**: Base de datos embebida para episodios y items. Cache reconstruible desde PostgreSQL.
+
+- **MemoryPackage**: Paquete de antecedentes relevantes que el router agrega al mensaje.
+
+- **SY.cognition**: Proceso que consolida evidencia en memoria episódica. Single-writer de jsr-memory y LanceDB.
+
+- **Cold Start**: Reconstrucción de memoria desde PostgreSQL cuando LanceDB está vacío/corrupto.
+
 ---
 
-## B. Decisiones de Diseño v1.13
+## B. Decisiones de Diseño v1.16
 
 | Decisión | Razón |
 |----------|-------|
 | Naming con @isla obligatorio | Simplifica routing inter-isla (parsear @isla del destino) |
 | Librería agrega @isla automáticamente | El nodo no necesita saber su isla, la lee de island.yaml |
 | Gateway único por isla | Evita ambigüedad de salida, simplifica modelo |
-| Tres regiones SHM separadas | Un writer por región, evita conflictos |
+| Seis regiones SHM separadas | Un writer por región, evita conflictos |
 | jsr-lsa para topología remota | Todos los routers ven islas remotas sin consultar al gateway |
 | LSA incluye nodos + rutas + VPNs | Visibilidad completa de islas remotas |
 | VPN como tabla simple | Sin jerarquías ni leaks, aislamiento total |
 | SY.* inmune a VPN | Nodos de sistema deben poder operar sin restricciones |
 | Sin LSA de nodos individuales | Con @isla, solo hace falta saber que la isla existe |
 | Rutas estáticas como override | Prioridad absoluta sobre routing normal |
+| PostgreSQL centralizado (madre) | Source of truth, auditoría, backup único |
+| LanceDB local por isla | Latencia baja, serverless, cache reconstruible |
+| Tags exactos + semánticos async | Router no bloquea; SY.cognition enriquece después |
+| Prioridad dinámica sin borrado | Evidencia inmutable, solo cambia activación/inhibición |
 
 ---
 
 ## C. Cambios vs Versiones Anteriores
 
-### vs v1.12
+### vs v1.15
 
 | Aspecto | v1.12 | v1.13 |
 |---------|-------|-------|
@@ -209,8 +237,9 @@ pub const CTX_WINDOW_FETCH_TIMEOUT_MS: u64 = 50; // Timeout para fetch de window
 | 08 | `08-apendices.md` | Glosario, decisiones, límites |
 | 09 | `09-router-status.md` | Estado de implementación del router |
 | 10 | `10-identity-layer3.md` | **ILK, SY.identity, routing L3** |
-| 11 | `11-context.md` | **ICH, CTX, conversaciones, ctx_client** |
-| -- | `SY_nodes_spec.md` | Nodos SY (config.routes, opa.rules, identity) |
+| 11 | `11-context.md` | **ICH, CTX, conversaciones, ctx_window** |
+| 12 | `12-cognition.md` | **SY.cognition, episodios, jsr-memory, LanceDB** |
+| -- | `SY_nodes_spec.md` | Nodos SY (config.routes, opa.rules, identity, cognition) |
 
 ---
 
@@ -225,3 +254,4 @@ pub const CTX_WINDOW_FETCH_TIMEOUT_MS: u64 = 50; // Timeout para fetch de window
 - [PostgreSQL](https://www.postgresql.org/docs/)
 - [sqlx (Rust)](https://github.com/launchbadge/sqlx)
 - [tokio-postgres](https://docs.rs/tokio-postgres/)
+- [LanceDB](https://lancedb.github.io/lancedb/)

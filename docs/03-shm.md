@@ -1,14 +1,14 @@
 # JSON Router - 03 Shared Memory
 
 **Estado:** v1.16  
-**Fecha:** 2026-02-04  
+**Fecha:** 2026-02-05  
 **Audiencia:** Desarrolladores de router core
 
 ---
 
-## 1. Modelo de Cinco Regiones
+## 1. Modelo de Seis Regiones
 
-El sistema usa cinco tipos de regiones de memoria compartida:
+El sistema usa seis tipos de regiones de memoria compartida:
 
 ```
 /dev/shm/
@@ -16,7 +16,8 @@ El sistema usa cinco tipos de regiones de memoria compartida:
 ├── jsr-config-<island>      # Una por isla
 ├── jsr-lsa-<island>         # Una por isla
 ├── jsr-opa-<island>         # Una por isla (WASM de policies)
-└── jsr-identity-<island>    # Una por isla (ILKs, ICHs, degrees, modules)
+├── jsr-identity-<island>    # Una por isla (ILKs, ICHs, degrees, modules)
+└── jsr-memory-<island>      # Una por isla (índice de activación cognitiva)
 ```
 
 | Región | Writer | Contenido |
@@ -26,6 +27,7 @@ El sistema usa cinco tipos de regiones de memoria compartida:
 | `jsr-lsa-<island>` | Gateway | Topología de islas remotas |
 | `jsr-opa-<island>` | SY.opa.rules | WASM compilado de policy OPA |
 | `jsr-identity-<island>` | SY.identity | ILKs, ICHs, modules, degrees, external mappings |
+| `jsr-memory-<island>` | SY.cognition | Índice de activación: tags → event_ids |
 
 **Principio clave:** Cada región tiene **un único writer** y múltiples readers. Esto permite usar seqlock sin conflictos.
 
