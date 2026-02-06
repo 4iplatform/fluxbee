@@ -1040,11 +1040,15 @@ fn systemd_is_active(service: &str) -> bool {
 }
 
 fn systemd_start(service: &str) -> Result<(), OrchestratorError> {
-    run_cmd(Command::new("systemctl").arg("start").arg(service), "systemctl start")
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("start").arg(service);
+    run_cmd(cmd, "systemctl start")
 }
 
 fn systemd_stop(service: &str) -> Result<(), OrchestratorError> {
-    run_cmd(Command::new("systemctl").arg("stop").arg(service), "systemctl stop")
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("stop").arg(service);
+    run_cmd(cmd, "systemctl stop")
 }
 
 fn askpass_script(password: &str) -> Result<PathBuf, OrchestratorError> {
