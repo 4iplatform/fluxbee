@@ -120,6 +120,24 @@
 
 - **Cold Start**: Reconstrucción de memoria desde PostgreSQL cuando LanceDB está vacío/corrupto.
 
+### Persistencia y NATS
+
+- **NATS embebido**: Servidor NATS JetStream embebido en el router (si config). Buffer local con persistencia.
+
+- **JetStream**: Capa de persistencia de NATS. Garantiza entrega at-least-once.
+
+- **fire & forget**: Patrón donde el router publica a NATS sin esperar confirmación de PostgreSQL (~1ms).
+
+- **SY.storage**: Proceso que consume NATS y escribe a PostgreSQL. Solo corre en isla madre.
+
+- **WAN bridge**: Funcionalidad del router que consume NATS local y forward por TCP a isla madre.
+
+- **WorkQueue**: Tipo de stream NATS donde cada mensaje es entregado a un solo consumer.
+
+- **Idempotencia**: Propiedad de las escrituras: `ON CONFLICT DO NOTHING` permite re-envíos sin duplicados.
+
+- **Batch**: Agrupación de turns antes de enviar por WAN (100 turns o 100ms).
+
 ---
 
 ## B. Decisiones de Diseño v1.16
@@ -140,6 +158,11 @@
 | LanceDB local por isla | Latencia baja, serverless, cache reconstruible |
 | Tags exactos + semánticos async | Router no bloquea; SY.cognition enriquece después |
 | Prioridad dinámica sin borrado | Evidencia inmutable, solo cambia activación/inhibición |
+| NATS embebido en router | Sin servidor externo, mismo binario, config decide |
+| Router no espera a DB | Fire & forget a NATS (~1ms), SY.storage persiste async |
+| SY.storage solo en madre | Único punto de escritura a PostgreSQL, simplicidad |
+| WAN bridge en router con config | Mismo binario, NATS consume → forward TCP |
+| Múltiples NATS independientes OK | DB deduplica por (ctx, seq), idempotencia |
 
 ---
 
@@ -239,7 +262,8 @@ pub const CTX_WINDOW_FETCH_TIMEOUT_MS: u64 = 50; // Timeout para fetch de window
 | 10 | `10-identity-layer3.md` | **ILK, SY.identity, routing L3** |
 | 11 | `11-context.md` | **ICH, CTX, conversaciones, ctx_window** |
 | 12 | `12-cognition.md` | **SY.cognition, episodios, jsr-memory, LanceDB** |
-| -- | `SY_nodes_spec.md` | Nodos SY (config.routes, opa.rules, identity, cognition) |
+| 13 | `13-storage.md` | **NATS embebido, SY.storage, persistencia** |
+| -- | `SY_nodes_spec.md` | Nodos SY (config.routes, opa.rules, identity, cognition, storage) |
 
 ---
 
@@ -255,3 +279,5 @@ pub const CTX_WINDOW_FETCH_TIMEOUT_MS: u64 = 50; // Timeout para fetch de window
 - [sqlx (Rust)](https://github.com/launchbadge/sqlx)
 - [tokio-postgres](https://docs.rs/tokio-postgres/)
 - [LanceDB](https://lancedb.github.io/lancedb/)
+- [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream)
+- [async-nats (Rust)](https://docs.rs/async-nats/)

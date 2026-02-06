@@ -48,40 +48,49 @@ El sistema cognitivo permite que Fluxbee **aprenda de la experiencia** sin acumu
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     ISLA MADRE (PostgreSQL)                     │
+│                         ISLA (cualquiera)                       │
 │                                                                 │
 │  ┌───────────────────────────────────────────────────────────┐ │
-│  │ PostgreSQL                                                 │ │
-│  │ ├── turns (evidencia inmutable)                           │ │
-│  │ └── contexts (metadata de conversaciones)                 │ │
+│  │ Router + NATS embebido (si config)                        │ │
 │  │                                                           │ │
-│  │ Source of truth. Auditoría. Backup.                       │ │
+│  │ Publica turns a NATS local (~1ms, fire & forget)         │ │
 │  └───────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-           │
-           │ Todas las islas escriben aquí (async)
-           │ SY.cognition lee de aquí
-           │
-┌──────────┴──────────────────────────────────────────────────────┐
-│                     ISLA HIJA (o Madre también)                 │
-│                                                                 │
-│  /dev/shm/                                                      │
-│  └── jsr-memory-<island>     ← Índice de activación (SHM)      │
-│      Writer: SY.cognition                                       │
-│      Readers: Router, nodos                                     │
-│                                                                 │
-│  /var/lib/fluxbee/                                             │
-│  └── memory.lance            ← Cache cognitiva (LanceDB)       │
-│      Writer: SY.cognition                                       │
-│      Readers: Router, nodos                                     │
+│                          │                                      │
+│           ┌──────────────┼──────────────┐                      │
+│           │              │              │                       │
+│           ▼              ▼              ▼                       │
+│    SY.cognition    WAN bridge     (otros)                      │
+│    (consume)       (forward)                                    │
+│         │                                                       │
+│         ▼                                                       │
+│  /var/lib/fluxbee/memory.lance  ← Cache cognitiva (LanceDB)   │
+│  /dev/shm/jsr-memory-<island>   ← Índice de activación (SHM)  │
 │                                                                 │
 │  Ambos son RECONSTRUIBLES desde PostgreSQL                     │
 └─────────────────────────────────────────────────────────────────┘
+                            │
+                            │ WAN (NATS → TCP → NATS)
+                            │
+┌───────────────────────────┼─────────────────────────────────────┐
+│                      ISLA MADRE                                 │
+│                           │                                     │
+│                    ┌──────▼──────┐                             │
+│                    │ SY.storage  │  ← Único que toca PostgreSQL│
+│                    │             │                              │
+│                    │ NATS in     │                              │
+│                    │ Socket in   │                              │
+│                    │     │       │                              │
+│                    │     ▼       │                              │
+│                    │ PostgreSQL  │  ← Source of truth          │
+│                    └─────────────┘                              │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+**Principio clave:** Ningún proceso espera a PostgreSQL. NATS es el buffer. Ver `13-storage.md` para detalles.
 
 ### 2.2 PostgreSQL: Source of Truth
 
-PostgreSQL centralizado en la isla madre. Todas las islas escriben aquí.
+PostgreSQL centralizado en la isla madre. **Solo SY.storage escribe/lee.**
 
 ```sql
 -- Evidencia inmutable
@@ -94,34 +103,53 @@ CREATE TABLE turns (
     ich         TEXT NOT NULL,
     msg_type    TEXT NOT NULL,
     content     JSONB NOT NULL,
-    tags        TEXT[],           -- Tags extraídos (puede ser NULL inicialmente)
+    tags        TEXT[],
     PRIMARY KEY (ctx, seq)
 );
 
-CREATE INDEX idx_turns_ctx ON turns (ctx);
-CREATE INDEX idx_turns_ts ON turns (ts);
-CREATE INDEX idx_turns_ilk ON turns (from_ilk);
-
--- Metadata de contextos
-CREATE TABLE contexts (
-    ctx             TEXT PRIMARY KEY,
-    ilk             TEXT NOT NULL,
-    ich             TEXT NOT NULL,
-    tenant_ilk      TEXT NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_activity   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    turn_count      BIGINT NOT NULL DEFAULT 0,
-    status          TEXT NOT NULL DEFAULT 'active',
-    metadata        JSONB
+-- Episodios consolidados
+CREATE TABLE events (
+    event_id        BIGSERIAL PRIMARY KEY,
+    ctx             TEXT NOT NULL,
+    start_seq       BIGINT NOT NULL,
+    end_seq         BIGINT NOT NULL,
+    boundary_reason TEXT NOT NULL,
+    cues_agg        TEXT[] NOT NULL,
+    outcome_status  TEXT,
+    outcome_duration_ms BIGINT,
+    activation_strength REAL DEFAULT 0.5,
+    context_inhibition  REAL DEFAULT 0.0,
+    use_count       INT DEFAULT 0,
+    success_count   INT DEFAULT 0,
+    last_used_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT now()
 );
+
+-- Items derivados
+CREATE TABLE memory_items (
+    memory_id       TEXT PRIMARY KEY,
+    event_id        BIGINT REFERENCES events(event_id),
+    item_type       TEXT NOT NULL,
+    content         JSONB NOT NULL,
+    confidence      REAL NOT NULL,
+    cues_signature  TEXT[] NOT NULL,
+    activation_strength REAL DEFAULT 0.5,
+    created_at      TIMESTAMPTZ DEFAULT now()
+);
+
+-- Índices para queries frecuentes
+CREATE INDEX idx_turns_ctx ON turns (ctx);
+CREATE INDEX idx_events_cues ON events USING GIN(cues_agg);
+CREATE INDEX idx_events_activation ON events(activation_strength DESC);
+CREATE INDEX idx_items_cues ON memory_items USING GIN(cues_signature);
 ```
 
-**¿Por qué centralizado?**
+**¿Por qué centralizado + buffer NATS?**
 
 - Un solo lugar para auditoría y compliance
-- Backup simple
-- Las islas hijas son workers, no necesitan PostgreSQL propio
-- La escritura es async, no afecta el hot path
+- Router nunca bloquea esperando DB (~1ms a NATS local)
+- Si WAN/DB falla, NATS bufferea (hasta 7 días)
+- Idempotencia: `ON CONFLICT DO NOTHING`
 
 ### 2.3 LanceDB: Cache Cognitiva Local
 
@@ -722,13 +750,15 @@ IO.whatsapp recibe mensaje
         │
         ▼
 Router
-├── 1. Persiste turn en PostgreSQL Madre (async)
-├── 2. Extrae tags exactos (metadata, sin AI)
-├── 3. Consulta jsr-memory con tags (SHM, µs)
+├── 1. Routing normal (forward al destino)
+├── 2. Publica turn a NATS local (~1ms, fire & forget)
+├── 3. Extrae tags exactos (metadata, sin AI)
+├── 4. Consulta jsr-memory con tags (SHM, µs)
 │       └── Top-K event_ids
-├── 4. Fetch MemoryPackage de LanceDB (ms, timeout 50ms)
-├── 5. Arma ctx_window (últimos 20 turns)
-├── 6. Forward con ctx_window + memory_package
+├── 5. Fetch MemoryPackage de LanceDB (ms, timeout 50ms)
+│       └── Si timeout: continuar sin memory_package
+├── 6. Arma ctx_window (últimos 20 turns, de SHM o cache)
+├── 7. Forward con ctx_window + memory_package
         │
         ▼
 AI.soporte
@@ -736,47 +766,89 @@ AI.soporte
 ├── Usa memory_package.events[].highlights (vivencias)
 ├── Usa memory_package.events[].items (procedures, constraints)
 ├── Responde
-└── Emite reactivation event
+└── Emite reactivation event a NATS
 ```
+
+**Tiempos:**
+| Paso | Latencia | Bloquea Router |
+|------|----------|----------------|
+| NATS publish | ~1ms | No (fire & forget) |
+| jsr-memory query | ~10µs | No |
+| LanceDB fetch | ~5-50ms | Timeout 50ms |
+| Forward | ~1ms | Sí (necesario) |
 
 ### 8.2 Offline (Paralelo)
 
 ```
-SY.cognition (loop continuo)
+SY.cognition (consume NATS)
         │
-        ├── Lee turns nuevos de PostgreSQL
+        ├── Recibe turns de NATS local (no poll a PostgreSQL)
         │
-        ├── Detecta boundaries → episodios
-        │       └── Reglas simples, no AI
+        ├── Bufferea por ctx hasta detectar boundary
         │
-        ├── Para cada episodio:
+        ├── Para cada episodio completo:
         │   ├── Llama AI.tagger → tags semánticos
         │   ├── Selecciona highlights (top N turns)
         │   ├── Llama AI.consolidator → items derivados
         │   ├── Calcula activation_strength inicial
-        │   └── Escribe EventPackage en LanceDB
+        │   ├── Escribe en LanceDB local
+        │   └── Publica event/items a NATS ("storage.events", "storage.items")
         │
         ├── Actualiza jsr-memory (epoch bump)
         │
-        ├── Lee reactivation events
-        │   ├── Ajusta activation_strength por uso/éxito
-        │   └── Ajusta context_inhibition si aplica
-        │
-        └── Si activation > threshold:
-            └── Publica en LSA para otras islas
+        └── Recibe reactivation events de NATS
+            ├── Ajusta activation_strength por uso/éxito
+            ├── Ajusta context_inhibition si aplica
+            └── Publica ajustes a NATS ("storage.reactivation")
 ```
 
-### 8.3 Cold Start
+### 8.3 Persistencia (SY.storage en madre)
+
+```
+SY.storage (solo isla madre)
+        │
+        ├── Consume de NATS local:
+        │   ├── "storage.turns" → INSERT turns
+        │   ├── "storage.events" → INSERT events  
+        │   ├── "storage.items" → INSERT memory_items
+        │   └── "storage.reactivation" → UPDATE activation
+        │
+        ├── PostgreSQL write con retry
+        │   └── ON CONFLICT DO NOTHING (idempotente)
+        │
+        └── Socket server para queries:
+            ├── GetTurns, GetEvents, GetItems
+            └── Usado por SY.cognition para rebuild
+```
+
+### 8.4 WAN Bridge (Router con config WAN)
+
+```
+Router con WAN (en isla hija)
+        │
+        ├── Consume de NATS local ("turns.local")
+        │
+        ├── Batch cada 100ms o 100 turns
+        │
+        ├── Forward por TCP a isla madre
+        │   └── Si WAN falla: NATS local bufferea, retry
+        │
+        └── Madre recibe, publica a NATS madre ("storage.turns")
+```
+
+### 8.5 Cold Start
 
 Cuando una isla arranca sin memoria:
 
 ```
-1. jsr-memory vacío → consultas devuelven []
-2. Router forward sin memory_package (solo ctx_window)
-3. AI.soporte funciona (degradado, sin antecedentes)
-4. SY.cognition lee turns de PostgreSQL Madre
-5. Re-genera episodios → LanceDB → jsr-memory
-6. Próximas consultas ya tienen memoria
+1. NATS local vacío → SY.cognition no tiene turns
+2. jsr-memory vacío → consultas devuelven []
+3. Router forward sin memory_package (solo ctx_window)
+4. AI.soporte funciona (degradado, sin antecedentes)
+5. SY.cognition conecta socket a SY.storage (madre)
+6. Solicita turns históricos del tenant
+7. Re-genera episodios → LanceDB → jsr-memory
+8. Próximas consultas ya tienen memoria
 ```
 
 ### 8.4 Reconstrucción desde PostgreSQL
@@ -989,9 +1061,11 @@ pub const LANCEDB_PATH: &str = "/var/lib/fluxbee/memory.lance";
 
 | Tema | Documento |
 |------|-----------|
+| Persistencia (NATS, SY.storage) | `13-storage.md` |
 | Contexto (ICH, CTX, turns) | `11-context.md` |
 | Routing | `04-routing.md` |
 | Shared Memory | `03-shm.md` |
 | Protocolo de mensajes | `02-protocolo.md` |
+| Conectividad WAN | `05-conectividad.md` |
 | Operaciones | `07-operaciones.md` |
 | Nodos SY | `SY_nodes_spec.md` |
