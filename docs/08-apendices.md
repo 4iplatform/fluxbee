@@ -42,13 +42,17 @@
 
 - **Isla**: Dominio local de routing donde los routers comparten `/dev/shm`. Un host físico = una isla.
 
-- **island.yaml**: Archivo que define la identidad de la isla. Obligatorio para todos los procesos.
+- **Motherbee**: Isla madre. Contiene PostgreSQL, SY.storage, SY.orchestrator, SY.admin. Cerebro del cluster.
+
+- **Worker**: Isla hija. Stateless, reconstruible. Contiene router, NATS, SY.cognition, nodos AI/IO/WF. Músculo del cluster.
+
+- **island.yaml**: Archivo que define la identidad de la isla. Campo `role: motherbee` o `role: worker`.
 
 - **@isla**: Sufijo en nombres L2 que indica la isla. Agregado automáticamente por la librería de nodo.
 
 - **IRP (Inter-Router Peering)**: Comunicación entre routers de la misma isla via Unix sockets.
 
-- **WAN**: Comunicación entre islas via TCP. Solo entre gateways.
+- **WAN**: Comunicación entre islas via TCP. Solo entre gateways. Workers conectan a Motherbee.
 
 - **LSA (Link State Advertisement)**: Mensaje que intercambian los gateways con topología completa de su isla.
 
@@ -165,6 +169,21 @@
 | SY.storage solo en madre | Único punto de escritura a PostgreSQL, simplicidad |
 | WAN bridge en router con config | Mismo binario, NATS consume → forward TCP |
 | Múltiples NATS independientes OK | DB deduplica por (ctx, seq), idempotencia |
+| Orchestrator solo en Motherbee | Workers son stateless, systemd local basta |
+| Workers reconstruibles | LanceDB/jsr-memory se regeneran desde PostgreSQL |
+
+### Distribución Motherbee / Worker
+
+| Componente | Motherbee | Worker |
+|------------|:---------:|:------:|
+| PostgreSQL | ✓ | - |
+| SY.storage | ✓ | - |
+| SY.orchestrator | ✓ | - |
+| SY.admin | ✓ | - |
+| Router + NATS | ✓ | ✓ |
+| SY.identity/config/opa | ✓ | ✓ (cache) |
+| SY.cognition + LanceDB | ✓ | ✓ |
+| AI/IO/WF nodes | opcional | ✓ |
 
 ---
 

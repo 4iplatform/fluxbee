@@ -81,39 +81,41 @@ island_id: dev
 
 Con esto el sistema levanta una isla funcional sin conexión WAN (usa SQLite embebido para contextos).
 
-### 2.2 Ejemplo Producción (mother island)
+### 2.2 Ejemplo Motherbee (isla madre)
 
 ```yaml
-# /etc/json-router/island.yaml
+# /etc/fluxbee/island.yaml
 island_id: produccion
+role: motherbee
 
 wan:
   gateway_name: RT.gateway         # Opcional, default: RT.gateway
-  listen: "0.0.0.0:9000"           # Escuchar conexiones de otras islas
-  uplinks: []                      # Mother no tiene uplinks
+  listen: "0.0.0.0:9000"           # Escuchar conexiones de workers
 
-admin:
-  listen: "0.0.0.0:8080"           # Opcional, default: 0.0.0.0:8080
+nats:
+  mode: embedded
+  port: 4222
 
 database:
   url: "postgresql://fluxbee:password@localhost:5432/fluxbee"
-  pool_size: 10                    # Opcional, default: 10
-  connect_timeout_ms: 5000         # Opcional, default: 5000
+  pool_size: 10
 ```
 
-### 2.3 Ejemplo Isla Hija (creada por add_island)
+### 2.3 Ejemplo Worker (isla hija)
 
 ```yaml
-# /etc/json-router/island.yaml (generado automáticamente)
+# /etc/fluxbee/island.yaml (generado por add_island o manual)
 island_id: staging
+role: worker
 
 wan:
   gateway_name: RT.gateway
   uplinks:
-    - address: "192.168.1.10:9000"  # Mother island
+    - address: "192.168.1.10:9000"  # Motherbee
 
-database:
-  url: "postgresql://fluxbee:password@db.internal:5432/fluxbee"
+nats:
+  mode: embedded
+  port: 4222
 ```
 
 ### 2.4 Campos de island.yaml
@@ -121,73 +123,239 @@ database:
 | Campo | Obligatorio | Default | Descripción |
 |-------|-------------|---------|-------------|
 | `island_id` | **Sí** | - | Identificador único de la isla |
+| `role` | No | `worker` | `motherbee` o `worker` |
 | `wan.gateway_name` | No | `RT.gateway` | Nombre del router gateway |
 | `wan.listen` | No | (sin escucha) | IP:puerto para recibir conexiones WAN |
-| `wan.uplinks[]` | No | [] | Lista de gateways a conectar |
-| `admin.listen` | No | `0.0.0.0:8080` | IP:puerto del API HTTP |
-| `database.url` | No | SQLite local | Connection string PostgreSQL |
+| `wan.uplinks[]` | No | [] | Lista de gateways a conectar (workers) |
+| `nats.mode` | No | `embedded` | `embedded` o `client` |
+| `nats.port` | No | 4222 | Puerto NATS si embedded |
+| `nats.url` | No | - | URL si mode=client |
+| `database.url` | Solo Motherbee | - | Connection string PostgreSQL |
 | `database.pool_size` | No | 10 | Conexiones en el pool |
-| `database.connect_timeout_ms` | No | 5000 | Timeout de conexión |
 
 ---
 
-## 3. SY.orchestrator: Proceso Raíz
+## 3. Distribución Motherbee / Worker
 
-### 3.1 Rol
+### 3.1 Modelo de Deployment
 
-SY.orchestrator es el **único proceso que se inicia manualmente**. Él:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         MOTHERBEE                               │
+│                    (isla madre, cerebro)                        │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Componentes exclusivos de Motherbee:                    │   │
+│  │  • PostgreSQL (source of truth)                         │   │
+│  │  • SY.storage (único que escribe DB)                    │   │
+│  │  • SY.orchestrator (supervisa todo)                     │   │
+│  │  • SY.admin (API admin, comandos)                       │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Componentes compartidos (también en Motherbee):         │   │
+│  │  • Router + NATS embebido                               │   │
+│  │  • SY.identity, SY.config.routes, SY.opa.rules         │   │
+│  │  • SY.cognition + LanceDB + jsr-memory                 │   │
+│  │  • Nodos AI/IO/WF (opcional)                           │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ WAN (TCP)
+          ┌───────────────────┼───────────────────┐
+          │                   │                   │
+          ▼                   ▼                   ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│     WORKER      │  │     WORKER      │  │     WORKER      │
+│   (isla hija)   │  │   (isla hija)   │  │   (isla hija)   │
+│                 │  │                 │  │                 │
+│ • Router + NATS │  │ • Router + NATS │  │ • Router + NATS │
+│ • SY.identity*  │  │ • SY.identity*  │  │ • SY.identity*  │
+│ • SY.cognition  │  │ • SY.cognition  │  │ • SY.cognition  │
+│ • LanceDB       │  │ • LanceDB       │  │ • LanceDB       │
+│ • AI/IO/WF      │  │ • AI/IO/WF      │  │ • AI/IO/WF      │
+│                 │  │                 │  │                 │
+│ *cache de madre │  │ *cache de madre │  │ *cache de madre │
+└─────────────────┘  └─────────────────┘  └─────────────────┘
+    Stateless           Stateless           Stateless
+    (reconstruible)     (reconstruible)     (reconstruible)
+```
 
-1. **Levanta** todos los componentes de la isla (via systemd o exec)
-2. **Monitorea** que sigan vivos (watchdog)
+### 3.2 Tabla de Componentes por Rol
+
+| Componente | Motherbee | Worker | Notas |
+|------------|:---------:|:------:|-------|
+| **Infraestructura** |
+| PostgreSQL | ✓ | - | Source of truth |
+| SY.storage | ✓ | - | Único que escribe DB |
+| SY.orchestrator | ✓ | - | Supervisa todo el cluster |
+| SY.admin | ✓ | - | API admin HTTP |
+| **Router** |
+| Router | ✓ | ✓ | |
+| NATS embebido | ✓ | ✓ | Buffer local |
+| WAN bridge | ✓ | ✓ | Si config.wan presente |
+| **Sistema** |
+| SY.identity | ✓ | ✓ (cache) | Worker sincroniza de Motherbee |
+| SY.config.routes | ✓ | ✓ (cache) | Worker sincroniza de Motherbee |
+| SY.opa.rules | ✓ | ✓ (cache) | Worker sincroniza de Motherbee |
+| **Cognición** |
+| SY.cognition | ✓ | ✓ | Procesa local |
+| LanceDB | ✓ | ✓ | Cache reconstruible |
+| jsr-memory | ✓ | ✓ | Índice local |
+| **Aplicación** |
+| AI.* | opcional | ✓ | Nodos de aplicación |
+| IO.* | opcional | ✓ | Conectores externos |
+| WF.* | opcional | ✓ | Workflows |
+
+### 3.3 Workers son Stateless
+
+Los workers pueden destruirse y recrearse sin pérdida de datos:
+
+```
+Worker muere/se destruye:
+├── NATS local tenía buffer → perdido (pero ya estaba en Motherbee o en tránsito)
+├── LanceDB local → se reconstruye desde PostgreSQL (via SY.storage)
+├── jsr-memory → se regenera desde LanceDB
+└── Nodos AI/IO/WF → se reinician, sin estado
+
+Worker nuevo arranca:
+├── Conecta a Motherbee (WAN)
+├── SY.cognition hace cold start (rebuild desde PostgreSQL)
+├── SY.identity/config/opa sincronizan de Motherbee
+└── Listo para recibir trabajo
+```
+
+Esto hace que los workers sean ideales para containers (Docker, K8s).
+
+---
+
+## 4. SY.orchestrator: Supervisor del Cluster
+
+### 4.1 Ubicación
+
+**SY.orchestrator SOLO corre en Motherbee.** Los workers no tienen orchestrator propio; systemd local basta para mantener el router vivo.
+
+### 4.2 Rol
+
+SY.orchestrator es el **único proceso que se inicia manualmente** en Motherbee. Él:
+
+1. **Levanta** todos los componentes de Motherbee
+2. **Monitorea** heartbeats en SHM (watchdog)
 3. **Gestiona** ciclo de vida de nodos de aplicación
-4. **Ejecuta** bootstrap de islas remotas (add_island)
+4. **Ejecuta** bootstrap de workers remotos (add_island)
+5. **Supervisa** salud de NATS (buffer levels)
 
-Los procesos que levanta **no son hijos** del orchestrator. Cada uno vive su vida independiente, pero el orchestrator tiene potestad sobre su vida y muerte.
+### 4.3 Métodos de Supervisión
 
-### 3.2 Arranque
+| Componente | Método de inicio | Supervisión | Si muere |
+|------------|------------------|-------------|----------|
+| RT.gateway | systemd | SHM heartbeat | `systemctl restart` |
+| SY.storage | systemd | SHM heartbeat | `systemctl restart` |
+| SY.identity | systemd | SHM heartbeat | `systemctl restart` |
+| SY.config.routes | systemd | SHM heartbeat | `systemctl restart` |
+| SY.opa.rules | systemd | SHM heartbeat | `systemctl restart` |
+| SY.admin | systemd | SHM heartbeat | `systemctl restart` |
+| SY.cognition | systemd | SHM heartbeat | `systemctl restart` |
+| AI.* / IO.* / WF.* | exec/spawn | Proceso hijo | Log warning, respawn opcional |
+
+**Core via systemd:** Máxima estabilidad, el kernel reinicia si falla.  
+**App via exec:** Agilidad, control directo, fácil escalar.
+
+### 4.4 Watchdog
+
+El orchestrator verifica cada 5 segundos:
+
+```rust
+impl Orchestrator {
+    async fn watchdog_loop(&mut self) {
+        loop {
+            // 1. Verificar heartbeats en SHM
+            for component in &self.core_components {
+                let shm = self.read_shm(component);
+                
+                if shm.heartbeat_stale() {
+                    log::error!("{} heartbeat stale, restarting", component);
+                    self.restart_via_systemd(component).await;
+                }
+            }
+            
+            // 2. Verificar NATS health
+            if let Some(nats_stats) = self.get_nats_stats() {
+                if nats_stats.free_bytes < NATS_LOW_MEMORY_THRESHOLD {
+                    log::warn!("NATS buffer low: {} bytes free", nats_stats.free_bytes);
+                    // Podría: alertar, purgar mensajes viejos, etc.
+                }
+            }
+            
+            // 3. Verificar procesos app (spawn)
+            for (name, child) in &mut self.app_processes {
+                if child.try_wait().is_some() {
+                    log::warn!("{} exited", name);
+                    // Opcionalmente respawnear según config
+                }
+            }
+            
+            sleep(Duration::from_secs(5)).await;
+        }
+    }
+}
+```
+
+### 4.5 Arranque de Motherbee
 
 ```bash
-# Esto es todo lo que ejecuta el usuario/systemd:
+# Esto es todo lo que ejecuta el operador:
 systemctl start sy-orchestrator
 ```
 
-### 3.3 Secuencia de Bootstrap Local
+### 4.6 Secuencia de Bootstrap
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │ FASE 0: Inicialización                                       │
 ├──────────────────────────────────────────────────────────────┤
-│ 1. Leer /etc/json-router/island.yaml                        │
-│ 2. Validar island_id presente                               │
+│ 1. Leer /etc/fluxbee/island.yaml                            │
+│ 2. Verificar role: motherbee                                │
 │ 3. Crear directorios si no existen                          │
-│ 4. Escribir PID en /var/run/json-router/orchestrator.pid    │
+│ 4. Escribir PID en /var/run/fluxbee/orchestrator.pid        │
 └──────────────────────────────────────────────────────────────┘
                             │
                             ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ FASE 1: Router Gateway                                       │
+│ FASE 1: PostgreSQL y Storage                                 │
 ├──────────────────────────────────────────────────────────────┤
-│ 1. Ejecutar RT.gateway (systemctl start o exec)             │
-│ 2. Esperar socket disponible en /var/run/json-router/routers│
-│ 3. Esperar región SHM jsr-<uuid> creada                     │
-│ 4. Timeout 30s → FATAL, abortar arranque                    │
+│ 1. Verificar PostgreSQL disponible                          │
+│ 2. systemctl start sy-storage                               │
+│ 3. Esperar que SY.storage conecte (30s timeout)             │
 └──────────────────────────────────────────────────────────────┘
                             │
                             ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ FASE 2: Nodos SY de Infraestructura                          │
+│ FASE 2: Router Gateway                                       │
+├──────────────────────────────────────────────────────────────┤
+│ 1. systemctl start rt-gateway                               │
+│ 2. Esperar socket disponible                                │
+│ 3. Esperar región SHM jsr-<uuid> creada                     │
+│ 4. Esperar NATS embebido listo                              │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ FASE 3: Nodos SY de Sistema                                  │
 ├──────────────────────────────────────────────────────────────┤
 │ En paralelo:                                                 │
-│ 1. Ejecutar SY.config.routes → crea jsr-config-<island>     │
-│ 2. Ejecutar SY.opa.rules     → crea jsr-opa-<island>        │
-│ 3. Ejecutar SY.identity      → crea jsr-identity-<island>   │
-│ 4. Ejecutar SY.admin         → API HTTP disponible          │
-│ 5. Esperar que todos conecten al router (30s timeout)       │
+│ 1. systemctl start sy-identity     → jsr-identity           │
+│ 2. systemctl start sy-config       → jsr-config             │
+│ 3. systemctl start sy-opa          → jsr-opa                │
+│ 4. systemctl start sy-cognition    → jsr-memory + LanceDB   │
+│ 5. systemctl start sy-admin        → API HTTP               │
+│ 6. Esperar que todos conecten al router (30s timeout)       │
 └──────────────────────────────────────────────────────────────┘
                             │
                             ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ FASE 3: Orchestrator se conecta                              │
+│ FASE 4: Orchestrator se conecta                              │
 ├──────────────────────────────────────────────────────────────┤
 │ 1. Conectar al router como nodo SY.orchestrator@<isla>      │
 │ 2. HELLO → ANNOUNCE                                          │
@@ -196,31 +364,42 @@ systemctl start sy-orchestrator
                             │
                             ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ FASE 4: Isla Operativa                                       │
+│ FASE 5: Motherbee Operativa                                  │
 ├──────────────────────────────────────────────────────────────┤
-│ 1. Log: "Island {island_id} ready"                          │
+│ 1. Log: "Motherbee {island_id} ready"                       │
 │ 2. Entrar en loop principal:                                │
-│    • Watchdog: verificar que RT y SY.* sigan vivos         │
-│    • Procesar mensajes (add_island, run_node, etc.)        │
-│    • Reiniciar componentes caídos                          │
+│    • Watchdog: verificar heartbeats y NATS                  │
+│    • Procesar mensajes (add_island, run_node, etc.)         │
+│    • Reiniciar componentes caídos                           │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 3.4 Watchdog
+### 4.7 Arranque de Worker
 
-El orchestrator verifica periódicamente (cada 5s) que los componentes críticos sigan vivos:
+Los workers son más simples. Solo necesitan systemd local:
 
-| Componente | Si muere... |
-|------------|-------------|
-| RT.gateway | Reiniciar inmediatamente |
-| SY.config.routes | Reiniciar inmediatamente |
-| SY.opa.rules | Reiniciar inmediatamente |
-| SY.identity | Reiniciar inmediatamente |
-| SY.admin | Reiniciar inmediatamente |
-| AI.*, WF.*, IO.* | Log warning, no reiniciar (el usuario decide) |
+```bash
+# En el worker (o via add_island desde Motherbee)
+systemctl start fluxbee-worker
+```
 
-### 3.5 Shutdown
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Worker Bootstrap                                             │
+├──────────────────────────────────────────────────────────────┤
+│ 1. Leer /etc/fluxbee/island.yaml (role: worker)            │
+│ 2. Iniciar router + NATS embebido                           │
+│ 3. Conectar WAN a Motherbee                                 │
+│ 4. Iniciar SY.cognition (cold start → rebuild desde PG)    │
+│ 5. Sincronizar identity/config/opa de Motherbee            │
+│ 6. Iniciar nodos AI/IO/WF según config                     │
+│ 7. Log: "Worker {island_id} ready"                          │
+└──────────────────────────────────────────────────────────────┘
+```
 
+### 4.8 Shutdown
+
+**Motherbee:**
 ```bash
 systemctl stop sy-orchestrator
 ```
@@ -228,17 +407,24 @@ systemctl stop sy-orchestrator
 El orchestrator hace shutdown ordenado:
 1. Envía SIGTERM a todos los nodos AI/WF/IO que levantó
 2. Espera 10s
-3. Envía SIGTERM a SY.admin, SY.config.routes, SY.opa.rules, SY.identity
-4. Envía SIGTERM a RT.gateway
+3. Detiene SY.* via systemctl stop
+4. Detiene RT.gateway
 5. Sale
+
+**Worker:**
+```bash
+systemctl stop fluxbee-worker
+```
+
+Más simple: detiene router (que detiene NATS), los nodos se desconectan.
 
 ---
 
-## 4. Bootstrap de Islas Remotas (add_island)
+## 5. Bootstrap de Workers Remotos (add_island)
 
-Esta es la funcionalidad principal del orchestrator en Fase 1. Permite instalar y configurar islas remotas automáticamente.
+Esta funcionalidad permite instalar y configurar workers remotos automáticamente desde Motherbee.
 
-### 4.1 Escenario
+### 5.1 Escenario
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -247,8 +433,8 @@ Esta es la funcionalidad principal del orchestrator en Fase 1. Permite instalar 
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    MOTHER ISLAND                                │
-│                  (tiene internet)                               │
+│                        MOTHERBEE                                │
+│                    (tiene internet)                             │
 │                  island_id: produccion                          │
 │                                                                 │
 │   SY.orchestrator ← ejecuta add_island                         │
@@ -264,31 +450,22 @@ Esta es la funcionalidad principal del orchestrator en Fase 1. Permite instalar 
     ┌──────────┐         ┌──────────┐         ┌──────────┐
     │ Máquina  │         │ Máquina  │         │ Máquina  │
     │  nueva   │         │  nueva   │         │  nueva   │
-    │ (staging)│         │ (dev)    │         │ (test)   │
+    │ (worker1)│         │ (worker2)│         │ (worker3)│
     └──────────┘         └──────────┘         └──────────┘
     
-    Solo tienen: Linux + SSH (port 22) + user root + pass magicAI
+    Solo tienen: Linux + SSH (port 22) + user root
 ```
 
-### 4.2 Requisitos de la Máquina Nueva
+### 5.2 Requisitos de la Máquina Nueva
 
 | Requisito | Valor | Notas |
 |-----------|-------|-------|
 | OS | Linux (cualquier distro con systemd) | Ubuntu, Debian, RHEL, etc. |
 | SSH | Puerto 22, habilitado | Viene por defecto en la mayoría |
 | Usuario | `root` | Requerido para instalación |
-| Password | `magicAI` | **Password fijo del sistema** |
-| Red | Alcanzable desde mother island | IP o hostname |
+| Red | Alcanzable desde Motherbee | IP o hostname |
 
-**Preparación de la máquina nueva:**
-```bash
-# Solo esto. Nada más.
-# (En muchas distros ya viene así)
-sudo passwd root
-# Ingresar: magicAI
-```
-
-### 4.3 Credenciales Fijas
+### 5.3 Credenciales
 
 ```rust
 // Hardcoded en el sistema - NO configurable
