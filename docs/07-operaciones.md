@@ -418,6 +418,158 @@ systemctl stop fluxbee-worker
 
 Más simple: detiene router (que detiene NATS), los nodos se desconectan.
 
+### 4.9 Gestión de Runtimes
+
+El orchestrator mantiene sincronizados los binarios ejecutables (runtimes) en todos los workers.
+
+#### 4.9.1 Modelo
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        MOTHERBEE                                │
+│                                                                 │
+│  /var/lib/fluxbee/runtimes/         ← REPO MASTER              │
+│  ├── AI.soporte/                                                │
+│  │   ├── 1.2.0/                                                │
+│  │   └── 1.3.0/                                                │
+│  ├── IO.whatsapp/                                               │
+│  └── manifest.json                  ← Estado actual            │
+│                                                                 │
+│  SY.orchestrator                                                │
+│  ├── Recibe notificaciones de nuevas versiones                 │
+│  ├── Persiste manifest en /var/lib/fluxbee/orchestrator/       │
+│  ├── Sincroniza workers via SSH/rsync                          │
+│  └── Verifica periódicamente consistencia                      │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ SSH (sync)
+                              ▼
+                          WORKERS
+```
+
+#### 4.9.2 Notificación de Nueva Versión
+
+El orchestrator recibe un mensaje JSON (via router) cuando hay nuevas versiones:
+
+```json
+{
+  "routing": {
+    "src": "<quien-sea>",
+    "dst": "SY.orchestrator@motherbee"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "RUNTIME_UPDATE"
+  },
+  "payload": {
+    "version": 43,
+    "updated_at": "2026-02-08T10:00:00Z",
+    "runtimes": {
+      "AI.soporte": {
+        "current": "1.3.0",
+        "available": ["1.2.0", "1.3.0"]
+      },
+      "IO.whatsapp": {
+        "current": "2.1.0",
+        "available": ["2.0.0", "2.1.0"]
+      }
+    },
+    "hash": "sha256:abc123..."
+  }
+}
+```
+
+#### 4.9.3 Persistencia Local
+
+El orchestrator guarda el manifest para sí mismo:
+
+```
+/var/lib/fluxbee/orchestrator/
+└── runtime-manifest.json    ← Copia local, solo orchestrator lee/escribe
+```
+
+#### 4.9.4 Flujo de Sincronización
+
+```
+1. Orchestrator recibe RUNTIME_UPDATE
+        │
+        ▼
+2. Compara con manifest actual
+        │
+        ├── Sin cambios → ignorar
+        │
+        └── Hay cambios:
+                │
+                ▼
+3. Persiste nuevo manifest local
+        │
+        ▼
+4. Para cada worker:
+        │
+        ├── rsync /var/lib/fluxbee/runtimes/ → worker
+        │
+        └── Reinicia nodos afectados (si corrían versión vieja)
+        │
+        ▼
+5. Log: "Runtimes synced to version {version}"
+```
+
+#### 4.9.5 Verificación Periódica
+
+Cada 5 minutos, el orchestrator verifica que los workers estén en sync:
+
+```rust
+impl Orchestrator {
+    async fn runtime_verify_loop(&mut self) {
+        loop {
+            for worker in &self.workers {
+                // Comparar hash del manifest remoto vs local
+                let remote_hash = self.ssh_exec(
+                    worker,
+                    "sha256sum /var/lib/fluxbee/runtimes/manifest.json"
+                ).await;
+                
+                if remote_hash != self.local_manifest_hash {
+                    log::warn!("Worker {} drift detected, syncing", worker.id);
+                    self.sync_worker(worker).await;
+                }
+            }
+            
+            sleep(Duration::from_secs(300)).await;  // 5 min
+        }
+    }
+}
+```
+
+#### 4.9.6 Spawn de Nodos
+
+Cuando se pide ejecutar un nodo:
+
+```json
+{
+  "meta": { "msg": "SPAWN_NODE" },
+  "payload": {
+    "runtime": "AI.soporte",
+    "version": "1.3.0",        // Opcional, default = current
+    "target": "worker-3",       // Opcional, orchestrator decide si no se especifica
+    "config": { ... }
+  }
+}
+```
+
+El orchestrator:
+1. Verifica que el runtime exista en el manifest
+2. Verifica que el worker tenga el runtime (o lo sincroniza)
+3. Ejecuta via SSH: `/var/lib/fluxbee/runtimes/AI.soporte/1.3.0/bin/start.sh`
+
+#### 4.9.7 Constantes
+
+```rust
+pub const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;  // 5 minutos
+pub const RUNTIME_SYNC_TIMEOUT_SECS: u64 = 300;     // 5 minutos max
+```
+
 ---
 
 ## 5. Bootstrap de Workers Remotos (add_island)

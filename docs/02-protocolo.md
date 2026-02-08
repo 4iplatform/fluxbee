@@ -725,6 +725,96 @@ Request/response para obtener EventPackage completo de otra isla:
 
 ---
 
+### 7.8 Orchestrator (Runtimes y Nodos)
+
+| Mensaje | Origen | Destino | Propósito |
+|---------|--------|---------|-----------|
+| `RUNTIME_UPDATE` | (externo) | SY.orchestrator | Notificar nueva versión de runtimes |
+| `SPAWN_NODE` | SY.admin | SY.orchestrator | Solicitar ejecución de nodo |
+| `KILL_NODE` | SY.admin | SY.orchestrator | Solicitar terminación de nodo |
+
+#### 7.8.1 RUNTIME_UPDATE
+
+Notifica al orchestrator que hay nuevas versiones de runtimes:
+
+```json
+{
+  "routing": {
+    "src": "<quien-notifica>",
+    "dst": "SY.orchestrator@motherbee"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "RUNTIME_UPDATE"
+  },
+  "payload": {
+    "version": 43,
+    "updated_at": "2026-02-08T10:00:00Z",
+    "runtimes": {
+      "AI.soporte": {
+        "current": "1.3.0",
+        "available": ["1.2.0", "1.3.0"]
+      },
+      "IO.whatsapp": {
+        "current": "2.1.0",
+        "available": ["2.0.0", "2.1.0"]
+      }
+    },
+    "hash": "sha256:abc123..."
+  }
+}
+```
+
+#### 7.8.2 SPAWN_NODE
+
+Solicita al orchestrator que ejecute un nodo:
+
+```json
+{
+  "routing": {
+    "src": "SY.admin@motherbee",
+    "dst": "SY.orchestrator@motherbee"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "SPAWN_NODE"
+  },
+  "payload": {
+    "runtime": "AI.soporte",
+    "version": "1.3.0",
+    "target": "worker-3",
+    "config": {
+      "degree": "degree:soporte-l1",
+      "instance_id": "ai-soporte-001"
+    }
+  }
+}
+```
+
+#### 7.8.3 KILL_NODE
+
+Solicita al orchestrator que termine un nodo:
+
+```json
+{
+  "routing": {
+    "src": "SY.admin@motherbee",
+    "dst": "SY.orchestrator@motherbee"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "KILL_NODE"
+  },
+  "payload": {
+    "node_name": "AI.soporte.001@worker-3",
+    "signal": "SIGTERM",
+    "timeout_ms": 10000
+  }
+}
+```
+
+---
+
 ## 8. Handshake: HELLO
 
 ### 8.1 Flujo
