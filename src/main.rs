@@ -4,7 +4,7 @@ use tracing_subscriber::EnvFilter;
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("json-router supports only Linux targets.");
+    eprintln!("fluxbee-router supports only Linux targets.");
     std::process::exit(1);
 }
 

@@ -605,11 +605,7 @@ impl RouterRegionReader {
 }
 
 impl ConfigRegionWriter {
-    pub fn open_or_create(
-        name: &str,
-        owner_uuid: Uuid,
-        island_id: &str,
-    ) -> Result<Self, ShmError> {
+    pub fn open_or_create(name: &str, owner_uuid: Uuid, island_id: &str) -> Result<Self, ShmError> {
         validate_name(name)?;
         let layout = layout_config();
         let mmap = open_or_create_region(name, layout.total_len, |mmap| {
@@ -800,13 +796,7 @@ impl LsaRegionWriter {
                 max: MAX_REMOTE_VPNS as usize,
             });
         }
-        let (
-            header,
-            island_entries,
-            node_entries,
-            route_entries,
-            vpn_entries,
-        ): (
+        let (header, island_entries, node_entries, route_entries, vpn_entries): (
             &mut LsaHeader,
             &mut [RemoteIslandEntry],
             &mut [RemoteNodeEntry],
@@ -1088,7 +1078,11 @@ where
 
 fn open_read_only_region(name: &str, len: usize) -> Result<Mmap, ShmError> {
     let cstr = CString::new(name).map_err(|_| ShmError::NameTooLong)?;
-    let fd = shm_open(cstr.as_c_str(), OFlag::O_RDONLY, nix::sys::stat::Mode::empty())?;
+    let fd = shm_open(
+        cstr.as_c_str(),
+        OFlag::O_RDONLY,
+        nix::sys::stat::Mode::empty(),
+    )?;
     let mmap = unsafe { MmapOptions::new().len(len).map(fd.as_raw_fd())? };
     if !is_region_valid(mmap.as_ref()) {
         return Err(ShmError::InvalidHeader);
@@ -1098,8 +1092,16 @@ fn open_read_only_region(name: &str, len: usize) -> Result<Mmap, ShmError> {
 
 fn open_read_only_opa_region(name: &str) -> Result<Mmap, ShmError> {
     let cstr = CString::new(name).map_err(|_| ShmError::NameTooLong)?;
-    let fd = shm_open(cstr.as_c_str(), OFlag::O_RDONLY, nix::sys::stat::Mode::empty())?;
-    let mmap = unsafe { MmapOptions::new().len(opa_region_len()).map(fd.as_raw_fd())? };
+    let fd = shm_open(
+        cstr.as_c_str(),
+        OFlag::O_RDONLY,
+        nix::sys::stat::Mode::empty(),
+    )?;
+    let mmap = unsafe {
+        MmapOptions::new()
+            .len(opa_region_len())
+            .map(fd.as_raw_fd())?
+    };
     if !is_opa_region_valid(mmap.as_ref()) {
         return Err(ShmError::InvalidHeader);
     }
@@ -1203,7 +1205,8 @@ fn initialize_lsa_header(mmap: &mut MmapMut, gateway_uuid: Uuid, island_id: &str
         header.total_node_count = 0;
         header.total_route_count = 0;
         header.total_vpn_count = 0;
-        header.local_island_id_len = copy_bytes_with_len(&mut header.local_island_id, island_id) as u16;
+        header.local_island_id_len =
+            copy_bytes_with_len(&mut header.local_island_id, island_id) as u16;
         header.created_at = now_epoch_ms();
         header.updated_at = header.created_at;
     }
@@ -1257,9 +1260,7 @@ fn read_router_snapshot(
 
 fn read_string(buf: &[u8], len: usize) -> String {
     let len = len.min(buf.len());
-    std::str::from_utf8(&buf[..len])
-        .unwrap_or("")
-        .to_string()
+    std::str::from_utf8(&buf[..len]).unwrap_or("").to_string()
 }
 
 fn read_config_snapshot(
@@ -1280,16 +1281,10 @@ fn read_config_snapshot(
         atomic::fence(Ordering::Acquire);
         let route_count = header.static_route_count as usize;
         let vpn_count = header.vpn_assignment_count as usize;
-        let routes = read_slice::<StaticRouteEntry>(
-            mmap,
-            layout.static_offset,
-            MAX_STATIC_ROUTES as usize,
-        )?;
-        let vpns = read_slice::<VpnAssignment>(
-            mmap,
-            layout.vpn_offset,
-            MAX_VPN_ASSIGNMENTS as usize,
-        )?;
+        let routes =
+            read_slice::<StaticRouteEntry>(mmap, layout.static_offset, MAX_STATIC_ROUTES as usize)?;
+        let vpns =
+            read_slice::<VpnAssignment>(mmap, layout.vpn_offset, MAX_VPN_ASSIGNMENTS as usize)?;
         let mut route_snapshot = Vec::new();
         for route in routes.iter().take(route_count) {
             route_snapshot.push(*route);
@@ -1351,11 +1346,8 @@ fn read_lsa_snapshot(
             layout.remote_route_offset,
             MAX_REMOTE_ROUTES as usize,
         )?;
-        let vpns = read_slice::<RemoteVpnEntry>(
-            mmap,
-            layout.remote_vpn_offset,
-            MAX_REMOTE_VPNS as usize,
-        )?;
+        let vpns =
+            read_slice::<RemoteVpnEntry>(mmap, layout.remote_vpn_offset, MAX_REMOTE_VPNS as usize)?;
 
         let mut island_snapshot = Vec::new();
         for island in islands.iter().take(island_count) {
@@ -1405,8 +1397,7 @@ fn read_opa_header_snapshot(header: &OpaHeader) -> Option<OpaHeaderSnapshot> {
             continue;
         }
         atomic::fence(Ordering::Acquire);
-        let entrypoint =
-            read_string(&header.entrypoint, header.entrypoint_len as usize);
+        let entrypoint = read_string(&header.entrypoint, header.entrypoint_len as usize);
         let snapshot = OpaHeaderSnapshot {
             policy_version: header.policy_version,
             wasm_size: header.wasm_size,
@@ -1443,8 +1434,7 @@ fn read_opa_snapshot(header: &OpaHeader, mmap: &[u8]) -> Option<OpaSnapshot> {
         if wasm_size > OPA_MAX_WASM_SIZE {
             return None;
         }
-        let entrypoint =
-            read_string(&header.entrypoint, header.entrypoint_len as usize);
+        let entrypoint = read_string(&header.entrypoint, header.entrypoint_len as usize);
         let header_snapshot = OpaHeaderSnapshot {
             policy_version: header.policy_version,
             wasm_size: header.wasm_size,
@@ -1539,12 +1529,7 @@ fn config_header_and_vpns_mut<'a>(
     let header_offset = layout.header_offset;
     let vpns_offset = layout.vpn_offset;
     let vpns_len = MAX_VPN_ASSIGNMENTS as usize;
-    header_and_slice_mut::<ConfigHeader, VpnAssignment>(
-        mmap,
-        header_offset,
-        vpns_offset,
-        vpns_len,
-    )
+    header_and_slice_mut::<ConfigHeader, VpnAssignment>(mmap, header_offset, vpns_offset, vpns_len)
 }
 
 fn lsa_header_and_entries_mut<'a>(

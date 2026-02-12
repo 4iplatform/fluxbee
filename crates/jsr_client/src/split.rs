@@ -51,7 +51,12 @@ pub(crate) struct ConnectionInfo {
 }
 
 impl ConnectionInfo {
-    pub(crate) fn new(uuid: String, full_name: String, vpn_id: u32, state: Arc<ConnectionState>) -> Self {
+    pub(crate) fn new(
+        uuid: String,
+        full_name: String,
+        vpn_id: u32,
+        state: Arc<ConnectionState>,
+    ) -> Self {
         Self {
             uuid,
             full_name,
@@ -79,13 +84,10 @@ impl NodeSender {
 
     pub async fn send(&self, msg: Message) -> Result<(), NodeError> {
         let data = serde_json::to_vec(&msg)?;
-        self.tx
-            .send(data)
-            .await
-            .map_err(|_| {
-                self.info.state.set_connected(false);
-                NodeError::Disconnected
-            })?;
+        self.tx.send(data).await.map_err(|_| {
+            self.info.state.set_connected(false);
+            NodeError::Disconnected
+        })?;
         Ok(())
     }
 

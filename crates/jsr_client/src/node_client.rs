@@ -10,11 +10,11 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
-use crate::split::{ConnectionInfo, ConnectionState, NodeReceiver, NodeSender};
 use crate::protocol::{
     build_hello, Message, NodeAnnouncePayload, NodeHelloPayload, MSG_ANNOUNCE, SYSTEM_KIND,
 };
 use crate::socket::connection::{read_frame, write_frame};
+use crate::split::{ConnectionInfo, ConnectionState, NodeReceiver, NodeSender};
 
 #[derive(Debug)]
 pub struct NodeConfig {
@@ -50,9 +50,7 @@ struct IslandFile {
     island_id: String,
 }
 
-pub async fn connect(
-    config: &NodeConfig,
-) -> Result<(NodeSender, NodeReceiver), NodeError> {
+pub async fn connect(config: &NodeConfig) -> Result<(NodeSender, NodeReceiver), NodeError> {
     let parts = connect_parts(config).await?;
     let info = Arc::new(ConnectionInfo::new(
         parts.uuid.to_string(),
@@ -150,45 +148,36 @@ async fn connection_manager_loop(
         state.set_connected(false);
         drain_tx_queue(&app_tx_rx).await;
         match connect_stream(&cfg.router_socket, &cfg.base_name).await {
-            Ok(mut stream) => {
-                match perform_handshake(&mut stream, &cfg).await {
-                    Ok(announce) => {
-                        if let Some(tx) = announce_tx.take() {
-                            let _ = tx.send(Ok(announce));
-                        }
-                        state.set_connected(true);
-                        let (read_half, write_half) = stream.into_split();
-                        let rx_state = Arc::clone(&state);
-                        let tx_state = Arc::clone(&state);
-                        let mut rx_task = tokio::spawn(rx_loop(
-                            read_half,
-                            app_rx_tx.clone(),
-                            rx_state,
-                        ));
-                        let mut tx_task = tokio::spawn(tx_loop(
-                            write_half,
-                            Arc::clone(&app_tx_rx),
-                            tx_state,
-                        ));
-                        tokio::select! {
-                            _ = &mut rx_task => {
-                                tx_task.abort();
-                            }
-                            _ = &mut tx_task => {
-                                rx_task.abort();
-                            }
-                        }
-                        state.set_connected(false);
-                        backoff = Duration::from_millis(100);
-                        continue;
+            Ok(mut stream) => match perform_handshake(&mut stream, &cfg).await {
+                Ok(announce) => {
+                    if let Some(tx) = announce_tx.take() {
+                        let _ = tx.send(Ok(announce));
                     }
-                    Err(err) => {
-                        if let Some(tx) = announce_tx.take() {
-                            let _ = tx.send(Err(err));
+                    state.set_connected(true);
+                    let (read_half, write_half) = stream.into_split();
+                    let rx_state = Arc::clone(&state);
+                    let tx_state = Arc::clone(&state);
+                    let mut rx_task = tokio::spawn(rx_loop(read_half, app_rx_tx.clone(), rx_state));
+                    let mut tx_task =
+                        tokio::spawn(tx_loop(write_half, Arc::clone(&app_tx_rx), tx_state));
+                    tokio::select! {
+                        _ = &mut rx_task => {
+                            tx_task.abort();
                         }
+                        _ = &mut tx_task => {
+                            rx_task.abort();
+                        }
+                    }
+                    state.set_connected(false);
+                    backoff = Duration::from_millis(100);
+                    continue;
+                }
+                Err(err) => {
+                    if let Some(tx) = announce_tx.take() {
+                        let _ = tx.send(Err(err));
                     }
                 }
-            }
+            },
             Err(err) => {
                 if let Some(tx) = announce_tx.take() {
                     let _ = tx.send(Err(err));
@@ -200,10 +189,7 @@ async fn connection_manager_loop(
     }
 }
 
-async fn connect_stream(
-    router_socket: &Path,
-    base_name: &str,
-) -> Result<UnixStream, NodeError> {
+async fn connect_stream(router_socket: &Path, base_name: &str) -> Result<UnixStream, NodeError> {
     let candidates = router_socket_candidates(router_socket, base_name)?;
     let mut last_err = None;
     for socket_path in candidates {

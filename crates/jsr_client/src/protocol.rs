@@ -245,11 +245,7 @@ pub fn build_system_message(
     }
 }
 
-pub fn build_hello(
-    src: &str,
-    trace_id: &str,
-    payload: NodeHelloPayload,
-) -> Message {
+pub fn build_hello(src: &str, trace_id: &str, payload: NodeHelloPayload) -> Message {
     build_system_message(
         src,
         Destination::Resolve,
@@ -260,11 +256,7 @@ pub fn build_hello(
     )
 }
 
-pub fn build_router_hello(
-    src: &str,
-    trace_id: &str,
-    payload: RouterHelloPayload,
-) -> Message {
+pub fn build_router_hello(src: &str, trace_id: &str, payload: RouterHelloPayload) -> Message {
     build_system_message(
         src,
         Destination::Resolve,
@@ -275,11 +267,7 @@ pub fn build_router_hello(
     )
 }
 
-pub fn build_wan_hello(
-    src: &str,
-    trace_id: &str,
-    payload: WanHelloPayload,
-) -> Message {
+pub fn build_wan_hello(src: &str, trace_id: &str, payload: WanHelloPayload) -> Message {
     build_system_message(
         src,
         Destination::Resolve,
@@ -378,12 +366,7 @@ pub fn build_ttl_exceeded(
     )
 }
 
-pub fn build_lsa(
-    src: &str,
-    dst: &str,
-    trace_id: &str,
-    payload: LsaPayload,
-) -> Message {
+pub fn build_lsa(src: &str, dst: &str, trace_id: &str, payload: LsaPayload) -> Message {
     build_system_message(
         src,
         Destination::Unicast(dst.to_string()),

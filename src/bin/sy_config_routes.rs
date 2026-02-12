@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -7,15 +7,14 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
-use jsr_client::protocol::{
-    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SYSTEM_KIND,
-};
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, VpnAssignment,
     ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
 };
-
+use jsr_client::protocol::{
+    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SYSTEM_KIND,
+};
+use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
 
 #[derive(Debug, Deserialize)]
 struct IslandFile {
@@ -67,9 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
-    let config_dir = PathBuf::from(json_router::paths::CONFIG_DIR);
-    let state_dir = PathBuf::from(json_router::paths::STATE_DIR);
-    let socket_dir = PathBuf::from(json_router::paths::ROUTER_SOCKET_DIR);
+    let config_dir = json_router::paths::config_dir();
+    let state_dir = json_router::paths::state_dir();
+    let socket_dir = json_router::paths::router_socket_dir();
 
     ensure_dir(&state_dir)?;
 
@@ -100,7 +99,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
     };
-    let (mut sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let (mut sender, mut receiver) =
+        connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     tracing::info!("connected to router");
 
     let mut ticker = time::interval(Duration::from_secs(5));
@@ -373,10 +373,7 @@ async fn handle_admin_action(
         }
         "delete_route" => {
             let payload: serde_json::Value = msg.payload.clone();
-            let prefix = payload
-                .get("prefix")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let prefix = payload.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
             let before = sy_config.routes.len();
             sy_config.routes.retain(|r| r.prefix != prefix);
             if sy_config.routes.len() == before {
@@ -499,7 +496,10 @@ fn ensure_l2_name(name: &str, island_id: &str) -> String {
     }
 }
 
-fn load_router_uuid(state_dir: &Path, router_l2_name: &str) -> Result<Uuid, Box<dyn std::error::Error>> {
+fn load_router_uuid(
+    state_dir: &Path,
+    router_l2_name: &str,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
     let identity_path = state_dir.join(router_l2_name).join("identity.yaml");
     let data = fs::read_to_string(identity_path)?;
     let value: serde_yaml::Value = serde_yaml::from_str(&data)?;
@@ -528,7 +528,10 @@ fn load_config(config_dir: &Path) -> Result<SyConfigFile, Box<dyn std::error::Er
     Ok(serde_yaml::from_str(&data)?)
 }
 
-fn write_config(config_dir: &Path, config: &SyConfigFile) -> Result<(), Box<dyn std::error::Error>> {
+fn write_config(
+    config_dir: &Path,
+    config: &SyConfigFile,
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = config_dir.join("sy-config-routes.yaml");
     let data = serde_yaml::to_string(config)?;
     fs::write(&path, data)?;
@@ -559,7 +562,9 @@ fn apply_config(
     Ok(())
 }
 
-fn build_routes(routes: &[RouteConfig]) -> Result<Vec<StaticRouteEntry>, Box<dyn std::error::Error>> {
+fn build_routes(
+    routes: &[RouteConfig],
+) -> Result<Vec<StaticRouteEntry>, Box<dyn std::error::Error>> {
     let mut out = Vec::new();
     for route in routes {
         let mut entry = empty_static_route();
@@ -567,8 +572,7 @@ fn build_routes(routes: &[RouteConfig]) -> Result<Vec<StaticRouteEntry>, Box<dyn
         entry.match_kind = match_kind(route.match_kind.as_deref())?;
         entry.action = action_kind(&route.action)?;
         if let Some(next) = &route.next_hop_island {
-            entry.next_hop_island_len =
-                copy_bytes_with_len(&mut entry.next_hop_island, next) as u8;
+            entry.next_hop_island_len = copy_bytes_with_len(&mut entry.next_hop_island, next) as u8;
         }
         entry.metric = route.metric.unwrap_or(0);
         entry.priority = route.priority.unwrap_or(100);
@@ -690,4 +694,4 @@ fn empty_vpn_assignment() -> VpnAssignment {
     }
 }
 
-// CONFIG_CHANGED lo emite SY.admin (mother island).
+// CONFIG_CHANGED lo emite SY.admin (motherbee).

@@ -93,7 +93,12 @@ impl OpaResolver {
         self.eval_target(&input)
     }
 
-    pub fn reload(&mut self, version: u64, entrypoint: Option<String>, wasm_bytes: &[u8]) -> Result<(), OpaError> {
+    pub fn reload(
+        &mut self,
+        version: u64,
+        entrypoint: Option<String>,
+        wasm_bytes: &[u8],
+    ) -> Result<(), OpaError> {
         let prev_module = self.module.take();
         let prev_wasm = self.wasm.take();
         let prev_version = self.policy_version;
@@ -154,7 +159,8 @@ impl OpaResolver {
                 .unwrap_or(0);
             set_entry.call(&mut wasm.store, (ctx, entrypoint_id))?;
         }
-        wasm.opa_eval_ctx_set_input.call(&mut wasm.store, (ctx, input_val))?;
+        wasm.opa_eval_ctx_set_input
+            .call(&mut wasm.store, (ctx, input_val))?;
 
         let eval_rc = wasm.opa_eval.call(&mut wasm.store, ctx)?;
         if eval_rc != 0 {
@@ -194,20 +200,28 @@ impl OpaWasm {
             }
         }
 
-        linker.func_wrap("env", "opa_abort", move |mut caller: Caller<'_, OpaRuntimeState>, ptr: i32| {
-            if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
-                let msg = read_cstr(&memory, &mut caller, ptr);
-                caller.data_mut().last_error = Some(msg);
-            } else {
-                caller.data_mut().last_error = Some("opa_abort".to_string());
-            }
-        })?;
-        linker.func_wrap("env", "opa_println", move |mut caller: Caller<'_, OpaRuntimeState>, ptr: i32| {
-            if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
-                let msg = read_cstr(&memory, &mut caller, ptr);
-                tracing::debug!("opa println: {msg}");
-            }
-        })?;
+        linker.func_wrap(
+            "env",
+            "opa_abort",
+            move |mut caller: Caller<'_, OpaRuntimeState>, ptr: i32| {
+                if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    let msg = read_cstr(&memory, &mut caller, ptr);
+                    caller.data_mut().last_error = Some(msg);
+                } else {
+                    caller.data_mut().last_error = Some("opa_abort".to_string());
+                }
+            },
+        )?;
+        linker.func_wrap(
+            "env",
+            "opa_println",
+            move |mut caller: Caller<'_, OpaRuntimeState>, ptr: i32| {
+                if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    let msg = read_cstr(&memory, &mut caller, ptr);
+                    tracing::debug!("opa println: {msg}");
+                }
+            },
+        )?;
 
         for (name, arity) in [
             ("opa_builtin0", 0),
@@ -232,7 +246,11 @@ impl OpaWasm {
                     linker.func_wrap(
                         "env",
                         name,
-                        |mut caller: Caller<'_, OpaRuntimeState>, _ctx: i32, builtin: i32, a0: i32| -> i32 {
+                        |mut caller: Caller<'_, OpaRuntimeState>,
+                         _ctx: i32,
+                         builtin: i32,
+                         a0: i32|
+                         -> i32 {
                             eval_builtin(&mut caller, builtin, &[a0])
                         },
                     )?;
@@ -241,7 +259,12 @@ impl OpaWasm {
                     linker.func_wrap(
                         "env",
                         name,
-                        |mut caller: Caller<'_, OpaRuntimeState>, _ctx: i32, builtin: i32, a0: i32, a1: i32| -> i32 {
+                        |mut caller: Caller<'_, OpaRuntimeState>,
+                         _ctx: i32,
+                         builtin: i32,
+                         a0: i32,
+                         a1: i32|
+                         -> i32 {
                             eval_builtin(&mut caller, builtin, &[a0, a1])
                         },
                     )?;
@@ -250,7 +273,13 @@ impl OpaWasm {
                     linker.func_wrap(
                         "env",
                         name,
-                        |mut caller: Caller<'_, OpaRuntimeState>, _ctx: i32, builtin: i32, a0: i32, a1: i32, a2: i32| -> i32 {
+                        |mut caller: Caller<'_, OpaRuntimeState>,
+                         _ctx: i32,
+                         builtin: i32,
+                         a0: i32,
+                         a1: i32,
+                         a2: i32|
+                         -> i32 {
                             eval_builtin(&mut caller, builtin, &[a0, a1, a2])
                         },
                     )?;
@@ -259,7 +288,14 @@ impl OpaWasm {
                     linker.func_wrap(
                         "env",
                         name,
-                        |mut caller: Caller<'_, OpaRuntimeState>, _ctx: i32, builtin: i32, a0: i32, a1: i32, a2: i32, a3: i32| -> i32 {
+                        |mut caller: Caller<'_, OpaRuntimeState>,
+                         _ctx: i32,
+                         builtin: i32,
+                         a0: i32,
+                         a1: i32,
+                         a2: i32,
+                         a3: i32|
+                         -> i32 {
                             eval_builtin(&mut caller, builtin, &[a0, a1, a2, a3])
                         },
                     )?;
@@ -268,7 +304,15 @@ impl OpaWasm {
                     linker.func_wrap(
                         "env",
                         name,
-                        |mut caller: Caller<'_, OpaRuntimeState>, _ctx: i32, builtin: i32, a0: i32, a1: i32, a2: i32, a3: i32, a4: i32| -> i32 {
+                        |mut caller: Caller<'_, OpaRuntimeState>,
+                         _ctx: i32,
+                         builtin: i32,
+                         a0: i32,
+                         a1: i32,
+                         a2: i32,
+                         a3: i32,
+                         a4: i32|
+                         -> i32 {
                             eval_builtin(&mut caller, builtin, &[a0, a1, a2, a3, a4])
                         },
                     )?;
@@ -277,7 +321,16 @@ impl OpaWasm {
                     linker.func_wrap(
                         "env",
                         name,
-                        |mut caller: Caller<'_, OpaRuntimeState>, _ctx: i32, builtin: i32, a0: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32| -> i32 {
+                        |mut caller: Caller<'_, OpaRuntimeState>,
+                         _ctx: i32,
+                         builtin: i32,
+                         a0: i32,
+                         a1: i32,
+                         a2: i32,
+                         a3: i32,
+                         a4: i32,
+                         a5: i32|
+                         -> i32 {
                             eval_builtin(&mut caller, builtin, &[a0, a1, a2, a3, a4, a5])
                         },
                     )?;
@@ -290,7 +343,10 @@ impl OpaWasm {
             .get_memory(&mut store, "memory")
             .or(imported_memory)
             .ok_or(OpaError::MissingExport("memory"))?;
-        if let Some(builtins) = instance.get_typed_func::<(), i32>(&mut store, "builtins").ok() {
+        if let Some(builtins) = instance
+            .get_typed_func::<(), i32>(&mut store, "builtins")
+            .ok()
+        {
             if let Ok(ptr) = builtins.call(&mut store, ()) {
                 let json = read_cstr_store(&memory, &mut store, ptr);
                 store.data_mut().builtin_names = parse_builtins(&json);
@@ -484,11 +540,7 @@ fn parse_entrypoints(json: &str) -> HashMap<String, i32> {
     }
 }
 
-fn eval_builtin(
-    caller: &mut Caller<'_, OpaRuntimeState>,
-    builtin_id: i32,
-    args: &[i32],
-) -> i32 {
+fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args: &[i32]) -> i32 {
     let mut name = caller
         .data()
         .builtin_names
@@ -496,8 +548,7 @@ fn eval_builtin(
         .cloned()
         .unwrap_or_else(|| format!("builtin#{builtin_id}"));
     name = normalize_builtin_name(&name);
-    let values: Result<Vec<Value>, _> =
-        args.iter().map(|addr| dump_value(caller, *addr)).collect();
+    let values: Result<Vec<Value>, _> = args.iter().map(|addr| dump_value(caller, *addr)).collect();
     let Ok(values) = values else {
         caller.data_mut().last_error = Some(format!("builtin {name} args parse failed"));
         return 0;
@@ -520,7 +571,9 @@ fn eval_builtin(
             (Some(Value::String(pattern)), Some(Value::String(text))) => {
                 match regex::Regex::new(pattern) {
                     Ok(re) => Ok(Value::String(
-                        re.find(text).map(|m| m.as_str().to_string()).unwrap_or_default(),
+                        re.find(text)
+                            .map(|m| m.as_str().to_string())
+                            .unwrap_or_default(),
                     )),
                     Err(err) => Err(format!("regex.find error: {err}")),
                 }
@@ -548,12 +601,16 @@ fn eval_builtin(
             _ => Err("regex.find_n expects (string,string,number)".to_string()),
         },
         "regex.replace" => match (values.get(0), values.get(1), values.get(2)) {
-            (Some(Value::String(pattern)), Some(Value::String(text)), Some(Value::String(repl))) => {
-                match regex::Regex::new(pattern) {
-                    Ok(re) => Ok(Value::String(re.replace_all(text, repl.as_str()).to_string())),
-                    Err(err) => Err(format!("regex.replace error: {err}")),
-                }
-            }
+            (
+                Some(Value::String(pattern)),
+                Some(Value::String(text)),
+                Some(Value::String(repl)),
+            ) => match regex::Regex::new(pattern) {
+                Ok(re) => Ok(Value::String(
+                    re.replace_all(text, repl.as_str()).to_string(),
+                )),
+                Err(err) => Err(format!("regex.replace error: {err}")),
+            },
             _ => Err("regex.replace expects (string,string,string)".to_string()),
         },
         "regex.find_all_string_submatch_n" => match (values.get(0), values.get(1), values.get(2)) {
@@ -630,7 +687,10 @@ fn eval_builtin(
         },
         "split" | "strings.split" => match (values.get(0), values.get(1)) {
             (Some(Value::String(text)), Some(Value::String(sep))) => {
-                let parts = text.split(sep).map(|s| Value::String(s.to_string())).collect();
+                let parts = text
+                    .split(sep)
+                    .map(|s| Value::String(s.to_string()))
+                    .collect();
                 Ok(Value::Array(parts))
             }
             _ => Err("split expects (string,string)".to_string()),
@@ -699,17 +759,19 @@ fn eval_builtin(
                 Err("substring expects (string,number[,number])".to_string())
             } else {
                 match (values.get(0), values.get(1), values.get(2)) {
-                    (Some(Value::String(text)), Some(Value::Number(start)), Some(Value::Number(len))) => {
-                        match (start.as_i64(), len.as_i64()) {
-                            (Some(start), Some(len)) => {
-                                let chars: Vec<char> = text.chars().collect();
-                                let start = start.max(0) as usize;
-                                let end = (start + len.max(0) as usize).min(chars.len());
-                                Ok(Value::String(chars[start..end].iter().collect()))
-                            }
-                            _ => Err("substring expects integer start/len".to_string()),
+                    (
+                        Some(Value::String(text)),
+                        Some(Value::Number(start)),
+                        Some(Value::Number(len)),
+                    ) => match (start.as_i64(), len.as_i64()) {
+                        (Some(start), Some(len)) => {
+                            let chars: Vec<char> = text.chars().collect();
+                            let start = start.max(0) as usize;
+                            let end = (start + len.max(0) as usize).min(chars.len());
+                            Ok(Value::String(chars[start..end].iter().collect()))
                         }
-                    }
+                        _ => Err("substring expects integer start/len".to_string()),
+                    },
                     (Some(Value::String(text)), Some(Value::Number(start)), None) => {
                         if let Some(start) = start.as_i64() {
                             let chars: Vec<char> = text.chars().collect();
@@ -724,11 +786,9 @@ fn eval_builtin(
             }
         }
         "indexof" => match (values.get(0), values.get(1)) {
-            (Some(Value::String(text)), Some(Value::String(needle))) => {
-                Ok(Value::Number(
-                    (text.find(needle).map(|idx| idx as i64).unwrap_or(-1)).into(),
-                ))
-            }
+            (Some(Value::String(text)), Some(Value::String(needle))) => Ok(Value::Number(
+                (text.find(needle).map(|idx| idx as i64).unwrap_or(-1)).into(),
+            )),
             _ => Err("indexof expects (string,string)".to_string()),
         },
         "array.length" => match values.get(0) {
@@ -736,9 +796,7 @@ fn eval_builtin(
             _ => Err("array.length expects (array)".to_string()),
         },
         "sprintf" => match (values.get(0), values.get(1)) {
-            (Some(Value::String(fmt)), Some(Value::Array(args))) => {
-                sprintf_simple(fmt, args)
-            }
+            (Some(Value::String(fmt)), Some(Value::Array(args))) => sprintf_simple(fmt, args),
             _ => Err("sprintf expects (string,array)".to_string()),
         },
         "count" => match values.get(0) {
@@ -811,9 +869,9 @@ fn eval_builtin(
             _ => Err("object.get expects (object,string,any?)".to_string()),
         },
         "object.keys" => match values.get(0) {
-            Some(Value::Object(map)) => {
-                Ok(Value::Array(map.keys().cloned().map(Value::String).collect()))
-            }
+            Some(Value::Object(map)) => Ok(Value::Array(
+                map.keys().cloned().map(Value::String).collect(),
+            )),
             _ => Err("object.keys expects (object)".to_string()),
         },
         "object.values" => match values.get(0) {
@@ -868,7 +926,9 @@ fn eval_builtin(
             _ => Err("json.unmarshal expects (string)".to_string()),
         },
         "json.is_valid" => match values.get(0) {
-            Some(Value::String(text)) => Ok(Value::Bool(serde_json::from_str::<Value>(text).is_ok())),
+            Some(Value::String(text)) => {
+                Ok(Value::Bool(serde_json::from_str::<Value>(text).is_ok()))
+            }
             _ => Err("json.is_valid expects (string)".to_string()),
         },
         "is_null" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_null()))),
@@ -993,24 +1053,18 @@ fn sprintf_simple(fmt: &str, args: &[Value]) -> Result<Value, String> {
             index += 1;
             match spec {
                 's' => {
-                    let text = value
-                        .as_str()
-                        .ok_or("sprintf %s expects string")?;
+                    let text = value.as_str().ok_or("sprintf %s expects string")?;
                     out.push_str(text);
                 }
                 'v' => {
                     out.push_str(&value_to_string(value)?);
                 }
                 'd' => {
-                    let num = value
-                        .as_i64()
-                        .ok_or("sprintf %d expects integer")?;
+                    let num = value.as_i64().ok_or("sprintf %d expects integer")?;
                     out.push_str(&num.to_string());
                 }
                 'f' => {
-                    let num = value
-                        .as_f64()
-                        .ok_or("sprintf %f expects number")?;
+                    let num = value.as_f64().ok_or("sprintf %f expects number")?;
                     out.push_str(&num.to_string());
                 }
                 other => return Err(format!("sprintf unsupported format %{other}")),
@@ -1029,9 +1083,13 @@ fn sum_numbers(values: &[Value], name: &str) -> Result<Value, String> {
     };
     let mut sum = 0.0;
     for item in list {
-        sum += item.as_f64().ok_or_else(|| format!("{name} expects numeric array"))?;
+        sum += item
+            .as_f64()
+            .ok_or_else(|| format!("{name} expects numeric array"))?;
     }
-    Ok(Value::Number(serde_json::Number::from_f64(sum).ok_or_else(|| format!("{name} invalid number"))?))
+    Ok(Value::Number(
+        serde_json::Number::from_f64(sum).ok_or_else(|| format!("{name} invalid number"))?,
+    ))
 }
 
 fn product_numbers(values: &[Value], name: &str) -> Result<Value, String> {
@@ -1041,9 +1099,13 @@ fn product_numbers(values: &[Value], name: &str) -> Result<Value, String> {
     };
     let mut prod = 1.0;
     for item in list {
-        prod *= item.as_f64().ok_or_else(|| format!("{name} expects numeric array"))?;
+        prod *= item
+            .as_f64()
+            .ok_or_else(|| format!("{name} expects numeric array"))?;
     }
-    Ok(Value::Number(serde_json::Number::from_f64(prod).ok_or_else(|| format!("{name} invalid number"))?))
+    Ok(Value::Number(
+        serde_json::Number::from_f64(prod).ok_or_else(|| format!("{name} invalid number"))?,
+    ))
 }
 
 fn max_numbers(values: &[Value], name: &str) -> Result<Value, String> {
@@ -1053,11 +1115,15 @@ fn max_numbers(values: &[Value], name: &str) -> Result<Value, String> {
     };
     let mut max = None::<f64>;
     for item in list {
-        let num = item.as_f64().ok_or_else(|| format!("{name} expects numeric array"))?;
+        let num = item
+            .as_f64()
+            .ok_or_else(|| format!("{name} expects numeric array"))?;
         max = Some(max.map_or(num, |m| m.max(num)));
     }
     let max = max.ok_or_else(|| format!("{name} expects non-empty array"))?;
-    Ok(Value::Number(serde_json::Number::from_f64(max).ok_or_else(|| format!("{name} invalid number"))?))
+    Ok(Value::Number(
+        serde_json::Number::from_f64(max).ok_or_else(|| format!("{name} invalid number"))?,
+    ))
 }
 
 fn min_numbers(values: &[Value], name: &str) -> Result<Value, String> {
@@ -1067,11 +1133,15 @@ fn min_numbers(values: &[Value], name: &str) -> Result<Value, String> {
     };
     let mut min = None::<f64>;
     for item in list {
-        let num = item.as_f64().ok_or_else(|| format!("{name} expects numeric array"))?;
+        let num = item
+            .as_f64()
+            .ok_or_else(|| format!("{name} expects numeric array"))?;
         min = Some(min.map_or(num, |m| m.min(num)));
     }
     let min = min.ok_or_else(|| format!("{name} expects non-empty array"))?;
-    Ok(Value::Number(serde_json::Number::from_f64(min).ok_or_else(|| format!("{name} invalid number"))?))
+    Ok(Value::Number(
+        serde_json::Number::from_f64(min).ok_or_else(|| format!("{name} invalid number"))?,
+    ))
 }
 
 fn dump_value(caller: &mut Caller<'_, OpaRuntimeState>, addr: i32) -> Result<Value, OpaError> {
@@ -1082,7 +1152,11 @@ fn dump_value(caller: &mut Caller<'_, OpaRuntimeState>, addr: i32) -> Result<Val
     let dump_func = caller
         .get_export("opa_value_dump")
         .and_then(|e| e.into_func())
-        .or_else(|| caller.get_export("opa_json_dump").and_then(|e| e.into_func()))
+        .or_else(|| {
+            caller
+                .get_export("opa_json_dump")
+                .and_then(|e| e.into_func())
+        })
         .ok_or(OpaError::MissingExport("opa_value_dump/opa_json_dump"))?;
     let dump = dump_func.typed::<i32, i32>(&mut *caller)?;
     let ptr = dump.call(&mut *caller, addr)?;

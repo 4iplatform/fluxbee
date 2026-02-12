@@ -10,19 +10,20 @@ use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 use crate::config::RouterConfig;
+use crate::nats::{NatsPublisher, SUBJECT_STORAGE_TURNS};
 use crate::opa::OpaResolver;
 use crate::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionReader, ConfigSnapshot, LsaRegionReader,
-    LsaRegionWriter, LsaSnapshot, RemoteIslandEntry, RemoteNodeEntry, RemoteRouteEntry,
-    RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, VpnAssignment, OpaRegionReader,
-    OpaSnapshot, OPA_STATUS_ERROR, OPA_STATUS_LOADING, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE,
-    FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
+    LsaRegionWriter, LsaSnapshot, OpaRegionReader, OpaSnapshot, RemoteIslandEntry, RemoteNodeEntry,
+    RemoteRouteEntry, RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, VpnAssignment,
+    ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
+    MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
 };
 use jsr_client::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
     build_wan_accept, build_wan_hello, build_wan_reject, Destination, LsaNode, LsaPayload,
-    LsaRoute, LsaVpn, Message, Meta, NodeAnnouncePayload, NodeHelloPayload, RouterHelloPayload,
-    OpaReloadPayload, WanAcceptPayload, WanHelloPayload, WanNegotiated, WanRejectPayload,
+    LsaRoute, LsaVpn, Message, Meta, NodeAnnouncePayload, NodeHelloPayload, OpaReloadPayload,
+    RouterHelloPayload, WanAcceptPayload, WanHelloPayload, WanNegotiated, WanRejectPayload,
     WanTimers, MSG_CONFIG_CHANGED, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED,
     MSG_UNREACHABLE, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
 };
@@ -61,6 +62,7 @@ pub struct Router {
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_state: Arc<Mutex<std::collections::HashMap<String, RemoteIslandState>>>,
     lsa_seq: Arc<Mutex<u64>>,
+    nats_publisher: Option<Arc<NatsPublisher>>,
 }
 
 impl Router {
@@ -73,20 +75,16 @@ impl Router {
             cfg.is_gateway,
         )
         .expect("shm init");
-        let config_reader = match ConfigRegionReader::open_read_only(&format!(
-            "/jsr-config-{}",
-            cfg.island_id
-        )) {
-            Ok(reader) => Some(reader),
-            Err(_) => None,
-        };
-        let lsa_reader = match LsaRegionReader::open_read_only(&format!(
-            "/jsr-lsa-{}",
-            cfg.island_id
-        )) {
-            Ok(reader) => Some(reader),
-            Err(_) => None,
-        };
+        let config_reader =
+            match ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", cfg.island_id)) {
+                Ok(reader) => Some(reader),
+                Err(_) => None,
+            };
+        let lsa_reader =
+            match LsaRegionReader::open_read_only(&format!("/jsr-lsa-{}", cfg.island_id)) {
+                Ok(reader) => Some(reader),
+                Err(_) => None,
+            };
         let lsa_writer = if cfg.is_gateway {
             LsaRegionWriter::open_or_create(
                 &format!("/jsr-lsa-{}", cfg.island_id),
@@ -98,6 +96,10 @@ impl Router {
             None
         };
         let opa = Arc::new(Mutex::new(OpaResolver::new()));
+        let nats_publisher = Some(Arc::new(NatsPublisher::new(
+            cfg.nats_url.clone(),
+            SUBJECT_STORAGE_TURNS.to_string(),
+        )));
         Self {
             cfg,
             shm: Arc::new(Mutex::new(shm)),
@@ -119,10 +121,12 @@ impl Router {
             wan_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lsa_state: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lsa_seq: Arc::new(Mutex::new(0)),
+            nats_publisher,
         }
     }
 
     pub async fn run(&self) -> Result<(), RouterError> {
+        prepare_nats_runtime(&self.cfg)?;
         ensure_parent_dir(&self.cfg.node_socket_path)?;
         let _ = std::fs::remove_file(&self.cfg.node_socket_path);
         let listener = UnixListener::bind(&self.cfg.node_socket_path)?;
@@ -372,6 +376,7 @@ impl Router {
             let opa_reader = Arc::clone(&self.opa_reader);
             let broadcast_cache = Arc::clone(&self.broadcast_cache);
             let lsa_seq = Arc::clone(&self.lsa_seq);
+            let nats_publisher = self.nats_publisher.clone();
             let is_gateway = self.cfg.is_gateway;
             tokio::spawn(async move {
                 if let Err(err) = handle_node(
@@ -393,6 +398,7 @@ impl Router {
                     opa_reader,
                     broadcast_cache,
                     lsa_seq,
+                    nats_publisher,
                     router_uuid,
                     &router_name,
                     &island_id,
@@ -426,6 +432,7 @@ async fn handle_node(
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
+    nats_publisher: Option<Arc<NatsPublisher>>,
     router_uuid: Uuid,
     router_name: &str,
     island_id: &str,
@@ -569,6 +576,7 @@ async fn handle_node(
                         msg = ?msg.meta.msg,
                         "message received"
                     );
+                    maybe_publish_turn(&nats_publisher, &msg);
                     if msg.meta.msg_type == SYSTEM_KIND {
                         if msg.meta.msg.as_deref() == Some(MSG_WITHDRAW) {
                             break;
@@ -589,7 +597,12 @@ async fn handle_node(
                             )
                             .await;
                             tracing::info!("config changed applied");
-                            if msg.meta.action.as_deref().is_some_and(|v| v == "compile" || v == "apply" || v == "rollback") {
+                            if msg
+                                .meta
+                                .action
+                                .as_deref()
+                                .is_some_and(|v| v == "compile" || v == "apply" || v == "rollback")
+                            {
                                 let version = msg
                                     .payload
                                     .get("version")
@@ -642,7 +655,8 @@ async fn handle_node(
                             continue;
                         }
                         if msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
-                            let payload: OpaReloadPayload = serde_json::from_value(msg.payload.clone())?;
+                            let payload: OpaReloadPayload =
+                                serde_json::from_value(msg.payload.clone())?;
                             apply_opa_reload(&opa, &opa_reader, &shm, island_id, &payload).await;
                             let src_uuid = Uuid::parse_str(&msg.routing.src).ok();
                             let local_senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = {
@@ -822,7 +836,12 @@ async fn handle_message(
                         if send_to_peer_router(peers, peer_node.router_uuid, msg).await? {
                             return Ok(());
                         }
-                        send_unreachable_to(msg, &src_handle.sender, router_uuid, "PEER_UNAVAILABLE")?;
+                        send_unreachable_to(
+                            msg,
+                            &src_handle.sender,
+                            router_uuid,
+                            "PEER_UNAVAILABLE",
+                        )?;
                     } else {
                         send_unreachable_to(msg, &src_handle.sender, router_uuid, "VPN_BLOCKED")?;
                     }
@@ -851,10 +870,20 @@ async fn handle_message(
                             )
                             .await?;
                         } else {
-                            send_unreachable_to(msg, &src_handle.sender, router_uuid, "VPN_BLOCKED")?;
+                            send_unreachable_to(
+                                msg,
+                                &src_handle.sender,
+                                router_uuid,
+                                "VPN_BLOCKED",
+                            )?;
                         }
                     } else {
-                        send_unreachable_to(msg, &src_handle.sender, router_uuid, "NODE_NOT_FOUND")?;
+                        send_unreachable_to(
+                            msg,
+                            &src_handle.sender,
+                            router_uuid,
+                            "NODE_NOT_FOUND",
+                        )?;
                     }
                 }
             }
@@ -943,10 +972,20 @@ async fn handle_message(
                         ) {
                             senders.push(dst_handle.sender.clone());
                         } else {
-                            send_unreachable_to(msg, &src_handle.sender, router_uuid, "VPN_BLOCKED")?;
+                            send_unreachable_to(
+                                msg,
+                                &src_handle.sender,
+                                router_uuid,
+                                "VPN_BLOCKED",
+                            )?;
                         }
                     } else {
-                        send_unreachable_to(msg, &src_handle.sender, router_uuid, "NODE_NOT_FOUND")?;
+                        send_unreachable_to(
+                            msg,
+                            &src_handle.sender,
+                            router_uuid,
+                            "NODE_NOT_FOUND",
+                        )?;
                     }
                 }
                 ResolvedRoute::ForwardRouter(peer_uuid) => {
@@ -1289,10 +1328,7 @@ async fn build_local_lsa_payload(
     }
 }
 
-async fn broadcast_lsa(
-    ctx: &WanContext,
-    target_island: Option<&str>,
-) -> Result<(), RouterError> {
+async fn broadcast_lsa(ctx: &WanContext, target_island: Option<&str>) -> Result<(), RouterError> {
     let peers: Vec<(String, WanPeer)> = {
         let guard = ctx.wan_peers.lock().await;
         guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
@@ -1353,8 +1389,7 @@ async fn broadcast_lsa_direct(
     let seq = *seq_guard;
     drop(seq_guard);
     let payload =
-        build_local_lsa_payload(island_id, seq, nodes, peer_nodes, static_routes, vpn_rules)
-            .await;
+        build_local_lsa_payload(island_id, seq, nodes, peer_nodes, static_routes, vpn_rules).await;
     for (_island, peer) in peers {
         let msg = build_lsa(
             &router_uuid.to_string(),
@@ -1373,9 +1408,7 @@ async fn apply_lsa_payload(
     payload: LsaPayload,
 ) -> bool {
     let mut state_guard = lsa_state.lock().await;
-    let entry = state_guard
-        .entry(payload.island.clone())
-        .or_default();
+    let entry = state_guard.entry(payload.island.clone()).or_default();
     if payload.seq <= entry.last_seq {
         return false;
     }
@@ -1489,12 +1522,9 @@ async fn write_lsa_state(
         }
     }
 
-    if let Err(err) = writer.write_snapshot(
-        &island_entries,
-        &node_entries,
-        &route_entries,
-        &vpn_entries,
-    ) {
+    if let Err(err) =
+        writer.write_snapshot(&island_entries, &node_entries, &route_entries, &vpn_entries)
+    {
         tracing::warn!("lsa snapshot write failed: {err}");
         return;
     }
@@ -1625,7 +1655,7 @@ async fn handle_wan_connection(
     });
 
     let hello_payload = WanHelloPayload {
-        protocol: "json-router/1.13".to_string(),
+        protocol: "fluxbee/1.16".to_string(),
         router_id: ctx.router_uuid.to_string(),
         router_name: ctx.router_name.clone(),
         island_id: ctx.island_id.clone(),
@@ -1636,7 +1666,11 @@ async fn handle_wan_connection(
         },
     };
     if initiator {
-        let hello = build_wan_hello(&ctx.router_uuid.to_string(), &Uuid::new_v4().to_string(), hello_payload.clone());
+        let hello = build_wan_hello(
+            &ctx.router_uuid.to_string(),
+            &Uuid::new_v4().to_string(),
+            hello_payload.clone(),
+        );
         let _ = tx.send(serde_json::to_vec(&hello)?);
     }
 
@@ -1649,8 +1683,7 @@ async fn handle_wan_connection(
         return Ok(());
     }
     let peer_hello: WanHelloPayload = serde_json::from_value(msg.payload)?;
-    if !ctx.authorized_islands.is_empty()
-        && !ctx.authorized_islands.contains(&peer_hello.island_id)
+    if !ctx.authorized_islands.is_empty() && !ctx.authorized_islands.contains(&peer_hello.island_id)
     {
         let reject = build_wan_reject(
             &ctx.router_uuid.to_string(),
@@ -1667,7 +1700,11 @@ async fn handle_wan_connection(
     }
 
     if !initiator {
-        let hello = build_wan_hello(&ctx.router_uuid.to_string(), &Uuid::new_v4().to_string(), hello_payload);
+        let hello = build_wan_hello(
+            &ctx.router_uuid.to_string(),
+            &Uuid::new_v4().to_string(),
+            hello_payload,
+        );
         let _ = tx.send(serde_json::to_vec(&hello)?);
     }
 
@@ -1679,7 +1716,7 @@ async fn handle_wan_connection(
         WanAcceptPayload {
             peer_router_id: peer_hello.router_id.clone(),
             negotiated: WanNegotiated {
-                protocol: "json-router/1.13".to_string(),
+                protocol: "fluxbee/1.16".to_string(),
                 hello_interval_ms: ctx.hello_interval_ms,
                 dead_interval_ms: ctx.dead_interval_ms,
             },
@@ -2099,11 +2136,7 @@ fn should_initiate_peer(self_uuid: Uuid, peer_uuid: Uuid) -> bool {
     self_uuid.as_u128() < peer_uuid.as_u128()
 }
 
-fn discover_peer_regions(
-    self_uuid: Uuid,
-    self_shm_name: &str,
-    island_id: &str,
-) -> Vec<PeerRegion> {
+fn discover_peer_regions(self_uuid: Uuid, self_shm_name: &str, island_id: &str) -> Vec<PeerRegion> {
     let mut regions = Vec::new();
     let Ok(entries) = fs::read_dir("/dev/shm") else {
         return regions;
@@ -2378,9 +2411,7 @@ async fn handle_peer_message(
         Ok(uuid) => uuid,
         Err(_) => return Ok(()),
     };
-    if msg.meta.msg_type == SYSTEM_KIND
-        && msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED)
-    {
+    if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
         let _ = refresh_config(
             config_reader,
             static_routes,
@@ -2398,9 +2429,7 @@ async fn handle_peer_message(
         tracing::info!("config changed applied (peer)");
         return Ok(());
     }
-    if msg.meta.msg_type == SYSTEM_KIND
-        && msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD)
-    {
+    if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
         let payload: OpaReloadPayload = serde_json::from_value(msg.payload.clone())?;
         apply_opa_reload(opa, opa_reader, shm, island_id, &payload).await;
         tracing::info!("opa reload applied (peer)");
@@ -2855,7 +2884,8 @@ impl BroadcastCache {
 
     fn check_and_add(&mut self, trace_id: Uuid) -> bool {
         let now = now_epoch_ms();
-        self.seen.retain(|_, ts| now.saturating_sub(*ts) <= self.ttl_ms);
+        self.seen
+            .retain(|_, ts| now.saturating_sub(*ts) <= self.ttl_ms);
         if self.seen.contains_key(&trace_id) {
             return false;
         }
@@ -2920,41 +2950,37 @@ async fn refresh_config(
             *routes_guard = snapshot
                 .routes
                 .iter()
-                .filter(|route| {
-                    route.flags == 0 || (route.flags & FLAG_ACTIVE != 0)
+                .filter(|route| route.flags == 0 || (route.flags & FLAG_ACTIVE != 0))
+                .map(|route| StaticRoute {
+                    pattern: bytes_to_string(&route.prefix, route.prefix_len as usize).to_string(),
+                    match_kind: route.match_kind,
+                    action: route.action,
+                    next_hop_island: bytes_to_string(
+                        &route.next_hop_island,
+                        route.next_hop_island_len as usize,
+                    )
+                    .to_string(),
+                    priority: route.priority,
+                    metric: route.metric,
+                    installed_at: route.installed_at,
                 })
-            .map(|route| StaticRoute {
-                pattern: bytes_to_string(&route.prefix, route.prefix_len as usize).to_string(),
-                match_kind: route.match_kind,
-                action: route.action,
-                next_hop_island: bytes_to_string(
-                    &route.next_hop_island,
-                    route.next_hop_island_len as usize,
-                )
-                .to_string(),
-                priority: route.priority,
-                metric: route.metric,
-                installed_at: route.installed_at,
-            })
-            .collect();
-        routes_guard.sort_by(|a, b| {
-            (a.priority, a.metric).cmp(&(b.priority, b.metric))
-        });
-        drop(routes_guard);
-        {
-            let mut vpn_guard = vpn_rules.lock().await;
-            *vpn_guard = snapshot.vpns.clone();
+                .collect();
+            routes_guard.sort_by(|a, b| (a.priority, a.metric).cmp(&(b.priority, b.metric)));
+            drop(routes_guard);
+            {
+                let mut vpn_guard = vpn_rules.lock().await;
+                *vpn_guard = snapshot.vpns.clone();
+            }
+            *version_guard = snapshot.header.config_version;
+            tracing::info!(
+                config_version = snapshot.header.config_version,
+                routes = snapshot.routes.len(),
+                vpns = snapshot.vpns.len(),
+                "config snapshot updated"
+            );
+            reassign_vpns(&snapshot, nodes, shm).await;
+            rebuild_fib(fib, nodes, peer_nodes, static_routes, lsa_snapshot).await;
         }
-        *version_guard = snapshot.header.config_version;
-        tracing::info!(
-            config_version = snapshot.header.config_version,
-            routes = snapshot.routes.len(),
-            vpns = snapshot.vpns.len(),
-            "config snapshot updated"
-        );
-        reassign_vpns(&snapshot, nodes, shm).await;
-        rebuild_fib(fib, nodes, peer_nodes, static_routes, lsa_snapshot).await;
-    }
         last_snapshot = Some(snapshot);
         break;
     }
@@ -3129,7 +3155,10 @@ async fn apply_opa_snapshot(
             tracing::info!(version = version, "opa reload applied");
         }
         Err(err) => {
-            tracing::warn!(version = snapshot.header.policy_version, "opa reload failed: {err}");
+            tracing::warn!(
+                version = snapshot.header.policy_version,
+                "opa reload failed: {err}"
+            );
         }
     }
 }
@@ -3193,7 +3222,13 @@ fn assign_vpn(name: &str, snapshot: Option<&ConfigSnapshot>) -> u32 {
             priority = entry.priority,
             "vpn rule candidate"
         );
-        rules.push((entry.priority, pattern, entry.match_kind, entry.vpn_id, flags));
+        rules.push((
+            entry.priority,
+            pattern,
+            entry.match_kind,
+            entry.vpn_id,
+            flags,
+        ));
     }
     rules.sort_by_key(|rule| rule.0);
     for (_, pattern, match_kind, vpn_id, _) in rules {
@@ -3326,7 +3361,12 @@ async fn rebuild_fib(
             if island.flags & FLAG_STALE != 0 {
                 continue;
             }
-            island_map.push((name.to_string(), idx as u16, island.flags, island.last_updated));
+            island_map.push((
+                name.to_string(),
+                idx as u16,
+                island.flags,
+                island.last_updated,
+            ));
         }
 
         for node in snapshot.nodes.iter() {
@@ -3549,18 +3589,16 @@ async fn resolve_by_name_inner(
             continue;
         }
         match entry.source {
-            FibSource::StaticRoute => {
-                match entry.action {
-                    ACTION_DROP => return Ok(ResolvedRoute::Drop),
-                    ACTION_FORWARD => {
-                        if let Some(FibNextHop::Island(island)) = &entry.next_hop {
-                            return Ok(ResolvedRoute::ForwardIsland(island.clone()));
-                        }
-                        continue;
+            FibSource::StaticRoute => match entry.action {
+                ACTION_DROP => return Ok(ResolvedRoute::Drop),
+                ACTION_FORWARD => {
+                    if let Some(FibNextHop::Island(island)) = &entry.next_hop {
+                        return Ok(ResolvedRoute::ForwardIsland(island.clone()));
                     }
-                    _ => continue,
+                    continue;
                 }
-            }
+                _ => continue,
+            },
             FibSource::LsaRoute => match entry.action {
                 ACTION_DROP => return Ok(ResolvedRoute::Drop),
                 ACTION_FORWARD => {
@@ -3661,7 +3699,13 @@ async fn resolve_by_name_any_island(
                 let Some(dst_handle) = nodes.get(dst_uuid) else {
                     continue;
                 };
-                if vpn_allows_between(meta, &src.name, src.vpn_id, &dst_handle.name, dst_handle.vpn_id) {
+                if vpn_allows_between(
+                    meta,
+                    &src.name,
+                    src.vpn_id,
+                    &dst_handle.name,
+                    dst_handle.vpn_id,
+                ) {
                     return Ok(ResolvedRoute::Deliver(*dst_uuid));
                 }
                 return Ok(ResolvedRoute::Unreachable("VPN_BLOCKED"));
@@ -3701,4 +3745,56 @@ fn match_any_island(base: &str, full_name: &str) -> bool {
         return wildcard_match(base.as_bytes(), name_base.as_bytes());
     }
     name_base == base
+}
+
+fn prepare_nats_runtime(cfg: &RouterConfig) -> Result<(), RouterError> {
+    if cfg.nats_mode == "embedded" {
+        fs::create_dir_all(&cfg.nats_storage_dir)?;
+        tracing::info!(
+            mode = %cfg.nats_mode,
+            port = cfg.nats_port,
+            storage_dir = %cfg.nats_storage_dir.display(),
+            endpoint = %cfg.nats_url,
+            "nats configured"
+        );
+    } else {
+        tracing::info!(
+            mode = %cfg.nats_mode,
+            endpoint = %cfg.nats_url,
+            "nats configured"
+        );
+    }
+    Ok(())
+}
+
+fn maybe_publish_turn(nats_publisher: &Option<Arc<NatsPublisher>>, msg: &Message) {
+    if !should_publish_turn(msg) {
+        return;
+    }
+    let Some(publisher) = nats_publisher else {
+        return;
+    };
+    let publisher = Arc::clone(publisher);
+    let payload = match serde_json::to_vec(msg) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::warn!(error = %err, "turn serialize failed");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        if let Err(err) = publisher.publish(&payload).await {
+            tracing::warn!(error = %err, "nats publish failed");
+        }
+    });
+}
+
+fn should_publish_turn(msg: &Message) -> bool {
+    if msg.meta.msg_type == SYSTEM_KIND {
+        return false;
+    }
+    if msg.meta.msg_type == "admin" || msg.meta.msg_type == "query_response" {
+        return false;
+    }
+    true
 }

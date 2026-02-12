@@ -15,11 +15,11 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
 use jsr_client::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SCOPE_GLOBAL,
     SYSTEM_KIND,
 };
+use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
 
 type AdminError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -177,9 +177,9 @@ async fn main() -> Result<(), AdminError> {
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
-    let config_dir = PathBuf::from(json_router::paths::CONFIG_DIR);
-    let state_dir = PathBuf::from(json_router::paths::STATE_DIR);
-    let socket_dir = PathBuf::from(json_router::paths::ROUTER_SOCKET_DIR);
+    let config_dir = json_router::paths::config_dir();
+    let state_dir = json_router::paths::state_dir();
+    let socket_dir = json_router::paths::router_socket_dir();
 
     let island = load_island(&config_dir)?;
     let island_id = island.island_id.clone();
@@ -188,8 +188,8 @@ async fn main() -> Result<(), AdminError> {
         .as_ref()
         .and_then(|wan| wan.authorized_islands.clone())
         .unwrap_or_default();
-    if island.role.as_deref() != Some("mother") {
-        tracing::warn!("SY.admin solo corre en mother island; role != mother");
+    if !is_mother_role(island.role.as_deref()) {
+        tracing::warn!("SY.admin solo corre en motherbee; role != motherbee");
         return Ok(());
     }
     let admin_listen = island
@@ -417,7 +417,10 @@ impl OpaAction {
     }
 
     fn needs_rego(&self) -> bool {
-        matches!(self, OpaAction::Compile | OpaAction::CompileApply | OpaAction::Check)
+        matches!(
+            self,
+            OpaAction::Compile | OpaAction::CompileApply | OpaAction::Check
+        )
     }
 
     fn apply_after(&self) -> bool {
@@ -549,9 +552,14 @@ async fn handle_http(
         ("POST", "/routes") => {
             let route: RouteConfig = serde_json::from_slice(&body)?;
             let island = query.get("island").cloned();
-            let (status, resp) =
-                handle_admin_command(ctx, client, "add_route", serde_json::to_value(route)?, island)
-                    .await?;
+            let (status, resp) = handle_admin_command(
+                ctx,
+                client,
+                "add_route",
+                serde_json::to_value(route)?,
+                island,
+            )
+            .await?;
             respond_json(stream, status, &resp).await?;
         }
         ("DELETE", "/routes") => {
@@ -776,8 +784,8 @@ async fn handle_island_paths(
     }
     match (method, rest) {
         ("GET", ["routes"]) => {
-            let (status, resp) = handle_admin_query(ctx, client, "list_routes", Some(island))
-                .await?;
+            let (status, resp) =
+                handle_admin_query(ctx, client, "list_routes", Some(island)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["routes"]) => {
@@ -799,8 +807,7 @@ async fn handle_island_paths(
             Ok(Some((status, resp)))
         }
         ("GET", ["vpns"]) => {
-            let (status, resp) =
-                handle_admin_query(ctx, client, "list_vpns", Some(island)).await?;
+            let (status, resp) = handle_admin_query(ctx, client, "list_vpns", Some(island)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["vpns"]) => {
@@ -899,13 +906,11 @@ async fn handle_island_paths(
             Ok(Some((status, resp)))
         }
         ("GET", ["opa", "policy"]) => {
-            let (status, resp) =
-                handle_opa_query(ctx, client, "get_policy", Some(island)).await?;
+            let (status, resp) = handle_opa_query(ctx, client, "get_policy", Some(island)).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["opa", "status"]) => {
-            let (status, resp) =
-                handle_opa_query(ctx, client, "get_status", Some(island)).await?;
+            let (status, resp) = handle_opa_query(ctx, client, "get_status", Some(island)).await?;
             Ok(Some((status, resp)))
         }
         _ => Ok(None),
@@ -962,7 +967,11 @@ async fn handle_modules_paths(
             }
             if module_path.is_file() {
                 let data = fs::read(&module_path)?;
-                return Ok(Some((200, data, Some("application/octet-stream".to_string()))));
+                return Ok(Some((
+                    200,
+                    data,
+                    Some("application/octet-stream".to_string()),
+                )));
             }
             let mut builder = Builder::new(Vec::new());
             builder.append_dir_all(".", &module_path)?;
@@ -1040,7 +1049,7 @@ fn from_hex(b: u8) -> Option<u8> {
 }
 
 fn storage_root() -> PathBuf {
-    let default_root = PathBuf::from("/var/lib/json-router");
+    let default_root = json_router::paths::storage_root_dir();
     let path = default_root.join("orchestrator.yaml");
     let data = match fs::read_to_string(&path) {
         Ok(data) => data,
@@ -1162,6 +1171,10 @@ fn load_node_uuid(dir: &Path, base_name: &str) -> Result<String, AdminError> {
     Ok(uuid.to_string())
 }
 
+fn is_mother_role(role: Option<&str>) -> bool {
+    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee" || r == "mother")
+}
+
 async fn respond_json(
     stream: &mut tokio::net::TcpStream,
     status: u16,
@@ -1206,7 +1219,7 @@ async fn respond_bytes(
 }
 
 fn next_opa_version(requested: Option<u64>) -> Result<u64, AdminError> {
-    let path = PathBuf::from(json_router::paths::OPA_VERSION_PATH);
+    let path = json_router::paths::opa_version_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1217,10 +1230,9 @@ fn next_opa_version(requested: Option<u64>) -> Result<u64, AdminError> {
     let next = match requested {
         Some(version) => {
             if version <= current {
-                return Err(format!(
-                    "version must be greater than current (current={current})"
-                )
-                .into());
+                return Err(
+                    format!("version must be greater than current (current={current})").into(),
+                );
             }
             version
         }
@@ -1251,7 +1263,10 @@ async fn handle_opa_http(
         OpaAction::Rollback => req.version.unwrap_or(0),
         _ => next_opa_version(req.version)?,
     };
-    let entrypoint = req.entrypoint.clone().unwrap_or_else(|| "router/target".to_string());
+    let entrypoint = req
+        .entrypoint
+        .clone()
+        .unwrap_or_else(|| "router/target".to_string());
     let target = normalize_opa_target(req.island.take());
 
     if action.needs_rego() && req.rego.as_deref().unwrap_or("").is_empty() {
@@ -1264,7 +1279,10 @@ async fn handle_opa_http(
     }
 
     let mut responses = Vec::new();
-    if matches!(action, OpaAction::Compile | OpaAction::CompileApply | OpaAction::Check) {
+    if matches!(
+        action,
+        OpaAction::Compile | OpaAction::CompileApply | OpaAction::Check
+    ) {
         responses = send_opa_action(
             ctx,
             client,
@@ -1277,17 +1295,30 @@ async fn handle_opa_http(
         )
         .await?;
         if responses.is_empty() || responses.iter().any(|r| r.status != "ok") {
-            return Ok(build_opa_http_response(ctx, action, version, responses, target));
+            return Ok(build_opa_http_response(
+                ctx, action, version, responses, target,
+            ));
         }
     }
 
     if action.apply_after() {
-        let apply_responses =
-            send_opa_action(ctx, client, "apply", version, None, None, None, target.clone()).await?;
+        let apply_responses = send_opa_action(
+            ctx,
+            client,
+            "apply",
+            version,
+            None,
+            None,
+            None,
+            target.clone(),
+        )
+        .await?;
         if apply_responses.is_empty() || apply_responses.iter().any(|r| r.status != "ok") {
             let mut combined = responses;
             combined.extend(apply_responses);
-            return Ok(build_opa_http_response(ctx, action, version, combined, target));
+            return Ok(build_opa_http_response(
+                ctx, action, version, combined, target,
+            ));
         }
         responses.extend(apply_responses);
     } else if matches!(action, OpaAction::Apply | OpaAction::Rollback) {
@@ -1305,7 +1336,9 @@ async fn handle_opa_http(
         .await?;
     }
 
-    Ok(build_opa_http_response(ctx, action, version, responses, target))
+    Ok(build_opa_http_response(
+        ctx, action, version, responses, target,
+    ))
 }
 
 async fn handle_opa_query(
@@ -1366,11 +1399,12 @@ fn build_admin_request(
 ) -> AdminRequest {
     let island_id = island.unwrap_or_else(|| ctx.island_id.clone());
     let base = match action {
-        "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn"
-        | "delete_vpn" => "SY.config.routes",
-        "list_nodes" | "run_node" | "kill_node" | "list_routers" | "run_router"
-        | "kill_router" | "island_status" | "get_storage" | "list_islands"
-        | "get_island" | "remove_island" | "add_island" => "SY.orchestrator",
+        "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn" | "delete_vpn" => {
+            "SY.config.routes"
+        }
+        "list_nodes" | "run_node" | "kill_node" | "list_routers" | "run_router" | "kill_router"
+        | "island_status" | "get_storage" | "list_islands" | "get_island" | "remove_island"
+        | "add_island" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
     let target = if island_id.contains('@') {
@@ -1485,7 +1519,12 @@ async fn broadcast_full_config(
     } else {
         "list_vpns"
     };
-    let list_req = build_admin_request(ctx, list_action, serde_json::json!({}), target_island.map(|s| s.to_string()));
+    let list_req = build_admin_request(
+        ctx,
+        list_action,
+        serde_json::json!({}),
+        target_island.map(|s| s.to_string()),
+    );
     let response = send_admin_request(client, list_req).await?;
     let payload = response
         .get("status")
@@ -1499,17 +1538,12 @@ async fn broadcast_full_config(
         serde_json::json!({ "vpns": payload })
     };
 
-    let subsystem = if list_action == "list_routes" { "routes" } else { "vpn" };
-    broadcast_config_changed(
-        client,
-        subsystem,
-        None,
-        None,
-        0,
-        config,
-        None,
-    )
-    .await?;
+    let subsystem = if list_action == "list_routes" {
+        "routes"
+    } else {
+        "vpn"
+    };
+    broadcast_config_changed(client, subsystem, None, None, 0, config, None).await?;
     Ok(())
 }
 
@@ -1652,7 +1686,10 @@ async fn collect_opa_responses(
         if payload.version.unwrap_or(version) != version {
             continue;
         }
-        let island = payload.island.clone().unwrap_or_else(|| "unknown".to_string());
+        let island = payload
+            .island
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         let entry = OpaResponseEntry {
             island: island.clone(),
             status: payload.status.unwrap_or_else(|| "error".to_string()),
@@ -1733,7 +1770,8 @@ fn build_opa_http_response(
         .filter(|island| !responses.iter().any(|r| r.island == *island))
         .collect();
     let timed_out = !pending.is_empty();
-    let status = if timed_out || responses.is_empty() || responses.iter().any(|r| r.status != "ok") {
+    let status = if timed_out || responses.is_empty() || responses.iter().any(|r| r.status != "ok")
+    {
         500
     } else {
         200
@@ -1767,7 +1805,8 @@ fn build_opa_query_response(
         .filter(|island| !responses.iter().any(|r| r.island == *island))
         .collect();
     let timed_out = !pending.is_empty();
-    let status = if timed_out || responses.is_empty() || responses.iter().any(|r| r.status != "ok") {
+    let status = if timed_out || responses.is_empty() || responses.iter().any(|r| r.status != "ok")
+    {
         500
     } else {
         200

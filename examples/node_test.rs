@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
-use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
 use jsr_client::protocol::{
     build_echo, build_echo_reply, build_time_sync, build_withdraw, Destination, Message, Meta,
     Routing, TimeSyncPayload, MSG_OPA_RELOAD, SYSTEM_KIND,
 };
+use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -80,18 +80,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let summary = payload_summary(&msg.payload);
                     println!(
                         "received: kind={} msg={:?} src={} dst={:?} payload={}",
-                        msg.meta.msg_type,
-                        msg.meta.msg,
-                        msg.routing.src,
-                        msg.routing.dst,
-                        summary
+                        msg.meta.msg_type, msg.meta.msg, msg.routing.src, msg.routing.dst, summary
                     );
                 }
                 Err(err) => {
                     eprintln!("recv error: {err} (reconnecting)");
                     let (new_sender, new_receiver) =
-                        connect_with_retry(&node_config, std::time::Duration::from_secs(1))
-                            .await?;
+                        connect_with_retry(&node_config, std::time::Duration::from_secs(1)).await?;
                     sender = new_sender;
                     receiver = new_receiver;
                     println!(
@@ -202,7 +197,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("sent HOLA {} (dst={:?})", seq, dst);
 
         let trace_id = Uuid::new_v4().to_string();
-        let echo = build_echo(&sender.uuid().to_string(), Destination::Broadcast, &trace_id);
+        let echo = build_echo(
+            &sender.uuid().to_string(),
+            Destination::Broadcast,
+            &trace_id,
+        );
         if let Err(err) = sender.send(echo).await {
             eprintln!("send error: {err} (reconnecting)");
             let (new_sender, new_receiver) =
@@ -214,8 +213,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("sent ECHO (dst=Broadcast)");
 
         let trace_id = Uuid::new_v4().to_string();
-        let echo_reply =
-            build_echo_reply(&sender.uuid().to_string(), Destination::Broadcast, &trace_id);
+        let echo_reply = build_echo_reply(
+            &sender.uuid().to_string(),
+            Destination::Broadcast,
+            &trace_id,
+        );
         if let Err(err) = sender.send(echo_reply).await {
             eprintln!("send error: {err} (reconnecting)");
             let (new_sender, new_receiver) =
@@ -321,11 +323,7 @@ fn load_router_uuid(
     state_dir: &PathBuf,
     router_l2_name: &str,
 ) -> Result<Uuid, Box<dyn std::error::Error>> {
-    let data = std::fs::read_to_string(
-        state_dir
-            .join(router_l2_name)
-            .join("identity.yaml"),
-    )?;
+    let data = std::fs::read_to_string(state_dir.join(router_l2_name).join("identity.yaml"))?;
     let value: serde_yaml::Value = serde_yaml::from_str(&data)?;
     let uuid = value
         .get("layer1")

@@ -16,21 +16,30 @@ where
             if read == 0 {
                 return Ok(None);
             }
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "partial frame header"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "partial frame header",
+            ));
         }
         read += n;
     }
 
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     let mut buf = vec![0u8; len];
     let mut read = 0usize;
     while read < buf.len() {
         let n = stream.read(&mut buf[read..]).await?;
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "partial frame body"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "partial frame body",
+            ));
         }
         read += n;
     }
@@ -42,7 +51,10 @@ where
     W: AsyncWrite + Unpin,
 {
     if payload.len() > MAX_FRAME_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     let len = payload.len() as u32;
     stream.write_all(&len.to_be_bytes()).await?;

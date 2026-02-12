@@ -10,6 +10,10 @@ const DEFAULT_HELLO_INTERVAL_MS: u64 = 10_000;
 const DEFAULT_DEAD_INTERVAL_MS: u64 = 40_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_HEARTBEAT_STALE_MS: u64 = 30_000;
+const DEFAULT_ISLAND_ROLE: &str = "worker";
+const DEFAULT_NATS_MODE: &str = "embedded";
+const DEFAULT_NATS_PORT: u16 = 4222;
+const DEFAULT_NATS_STORAGE_DIR: &str = "/var/lib/fluxbee/nats";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -45,12 +49,19 @@ pub struct RouterConfig {
     pub wan_listen: Option<String>,
     pub wan_uplinks: Vec<String>,
     pub wan_authorized_islands: Vec<String>,
+    pub island_role: String,
+    pub nats_mode: String,
+    pub nats_port: u16,
+    pub nats_url: String,
+    pub nats_storage_dir: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
 struct IslandFile {
     island_id: String,
+    role: Option<String>,
     wan: Option<WanSection>,
+    nats: Option<NatsSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +75,14 @@ struct WanSection {
 #[derive(Debug, Deserialize)]
 struct WanUplink {
     address: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NatsSection {
+    mode: Option<String>,
+    port: Option<u16>,
+    url: Option<String>,
+    storage_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,11 +110,11 @@ struct IdentityShm {
 
 impl RouterConfig {
     pub fn load_from_env() -> Result<Self, ConfigError> {
-        let router_name = std::env::var("JSR_ROUTER_NAME")
-            .map_err(|_| ConfigError::MissingRouterName)?;
-        let config_dir = PathBuf::from(crate::paths::CONFIG_DIR);
-        let state_dir = PathBuf::from(crate::paths::STATE_DIR);
-        let node_socket_dir = PathBuf::from(crate::paths::ROUTER_SOCKET_DIR);
+        let router_name =
+            std::env::var("JSR_ROUTER_NAME").map_err(|_| ConfigError::MissingRouterName)?;
+        let config_dir = crate::paths::config_dir();
+        let state_dir = crate::paths::state_dir();
+        let node_socket_dir = crate::paths::router_socket_dir();
         let shm_prefix = DEFAULT_SHM_PREFIX.to_string();
         let hello_interval_ms = DEFAULT_HELLO_INTERVAL_MS;
         let dead_interval_ms = DEFAULT_DEAD_INTERVAL_MS;
@@ -104,6 +123,11 @@ impl RouterConfig {
         let mut wan_listen = None;
         let mut wan_uplinks = Vec::new();
         let mut wan_authorized_islands = Vec::new();
+        let mut island_role = DEFAULT_ISLAND_ROLE.to_string();
+        let mut nats_mode = DEFAULT_NATS_MODE.to_string();
+        let mut nats_port = DEFAULT_NATS_PORT;
+        let mut nats_url = String::new();
+        let mut nats_storage_dir = PathBuf::from(DEFAULT_NATS_STORAGE_DIR);
 
         let island_path = config_dir.join("island.yaml");
         if !island_path.exists() {
@@ -112,6 +136,12 @@ impl RouterConfig {
         let data = std::fs::read_to_string(&island_path)?;
         let island: IslandFile = serde_yaml::from_str(&data)?;
         let island_id = island.island_id;
+        if let Some(role) = island.role {
+            let role = role.trim().to_ascii_lowercase();
+            if !role.is_empty() {
+                island_role = role;
+            }
+        }
         let mut gateway_name = "RT.gateway".to_string();
         if let Some(wan) = island.wan {
             wan_listen = wan.listen;
@@ -126,6 +156,32 @@ impl RouterConfig {
             if let Some(name) = wan.gateway_name {
                 gateway_name = name;
             }
+        }
+        if let Some(nats) = island.nats {
+            if let Some(mode) = nats.mode {
+                let mode = mode.trim().to_ascii_lowercase();
+                if !mode.is_empty() {
+                    nats_mode = mode;
+                }
+            }
+            if let Some(port) = nats.port {
+                nats_port = port;
+            }
+            if let Some(url) = nats.url {
+                let url = url.trim().to_string();
+                if !url.is_empty() {
+                    nats_url = url;
+                }
+            }
+            if let Some(storage_dir) = nats.storage_dir {
+                let storage_dir = storage_dir.trim();
+                if !storage_dir.is_empty() {
+                    nats_storage_dir = PathBuf::from(storage_dir);
+                }
+            }
+        }
+        if nats_url.is_empty() {
+            nats_url = format!("nats://127.0.0.1:{nats_port}");
         }
 
         let is_gateway = is_gateway_name(&router_name, &gateway_name);
@@ -164,6 +220,11 @@ impl RouterConfig {
             wan_listen,
             wan_uplinks,
             wan_authorized_islands,
+            island_role,
+            nats_mode,
+            nats_port,
+            nats_url,
+            nats_storage_dir,
         })
     }
 }
@@ -186,7 +247,11 @@ fn is_gateway_name(router_name: &str, gateway_name: &str) -> bool {
     base == gateway_base
 }
 
-fn build_identity_yaml(router_l2_name: &str, uuid: Uuid, shm_name: &str) -> Result<String, ConfigError> {
+fn build_identity_yaml(
+    router_l2_name: &str,
+    uuid: Uuid,
+    shm_name: &str,
+) -> Result<String, ConfigError> {
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

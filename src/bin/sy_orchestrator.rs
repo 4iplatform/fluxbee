@@ -6,16 +6,16 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::Mutex;
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
-use tokio::sync::Mutex;
 
-use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
-use jsr_client::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, NodeEntry, RemoteIslandEntry, RouterRegionReader, ShmSnapshot,
 };
+use jsr_client::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
 
 type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -25,6 +25,7 @@ const BOOTSTRAP_SSH_PASS: &str = "magicAI";
 #[derive(Debug, Deserialize)]
 struct IslandFile {
     island_id: String,
+    role: Option<String>,
     wan: Option<WanSection>,
 }
 
@@ -89,12 +90,16 @@ async fn main() -> Result<(), OrchestratorError> {
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
-    let config_dir = PathBuf::from(json_router::paths::CONFIG_DIR);
-    let state_dir = PathBuf::from(json_router::paths::STATE_DIR);
-    let run_dir = PathBuf::from(json_router::paths::RUN_DIR);
-    let socket_dir = PathBuf::from(json_router::paths::ROUTER_SOCKET_DIR);
+    let config_dir = json_router::paths::config_dir();
+    let state_dir = json_router::paths::state_dir();
+    let run_dir = json_router::paths::run_dir();
+    let socket_dir = json_router::paths::router_socket_dir();
 
     let island = load_island(&config_dir)?;
+    if !is_mother_role(island.role.as_deref()) {
+        tracing::warn!("SY.orchestrator solo corre en motherbee; role != motherbee");
+        return Ok(());
+    }
     let gateway_name = island
         .wan
         .as_ref()
@@ -125,7 +130,8 @@ async fn main() -> Result<(), OrchestratorError> {
         version: "1.0".to_string(),
     };
 
-    let (mut sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let (mut sender, mut receiver) =
+        connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     tracing::info!("connected to router");
     tracing::info!(island = %island.island_id, "island ready");
 
@@ -172,12 +178,20 @@ async fn main() -> Result<(), OrchestratorError> {
     }
 }
 
-async fn bootstrap_local(state: &OrchestratorState, socket_dir: &Path) -> Result<(), OrchestratorError> {
+async fn bootstrap_local(
+    state: &OrchestratorState,
+    socket_dir: &Path,
+) -> Result<(), OrchestratorError> {
     tracing::info!("starting rt-gateway");
     systemd_start("rt-gateway")?;
     wait_for_router_ready(state, socket_dir, Duration::from_secs(30)).await?;
 
-    let services = ["sy-config-routes", "sy-opa-rules", "sy-identity", "sy-admin"];
+    let services = [
+        "sy-config-routes",
+        "sy-opa-rules",
+        "sy-identity",
+        "sy-admin",
+    ];
     for service in services {
         tracing::info!(service = service, "starting service");
         if let Err(err) = systemd_start(service) {
@@ -199,13 +213,15 @@ async fn wait_for_router_ready(
         let socket_ready = socket_dir
             .read_dir()
             .ok()
-            .and_then(|mut entries| entries.find(|entry| {
-                entry
-                    .as_ref()
-                    .ok()
-                    .and_then(|entry| entry.path().extension().map(|ext| ext == "sock"))
-                    .unwrap_or(false)
-            }))
+            .and_then(|mut entries| {
+                entries.find(|entry| {
+                    entry
+                        .as_ref()
+                        .ok()
+                        .and_then(|entry| entry.path().extension().map(|ext| ext == "sock"))
+                        .unwrap_or(false)
+                })
+            })
             .is_some();
         let shm_ready = load_router_snapshot(state).is_ok();
         if socket_ready && shm_ready {
@@ -219,8 +235,16 @@ async fn wait_for_router_ready(
     }
 }
 
-async fn wait_for_sy_nodes(state: &OrchestratorState, timeout: Duration) -> Result<(), OrchestratorError> {
-    let required = ["SY.config.routes", "SY.opa.rules", "SY.identity", "SY.admin"];
+async fn wait_for_sy_nodes(
+    state: &OrchestratorState,
+    timeout: Duration,
+) -> Result<(), OrchestratorError> {
+    let required = [
+        "SY.config.routes",
+        "SY.opa.rules",
+        "SY.identity",
+        "SY.admin",
+    ];
     let start = Instant::now();
     loop {
         if let Ok(snapshot) = load_router_snapshot(state) {
@@ -282,13 +306,21 @@ async fn watchdog_tick(state: &OrchestratorState) {
 async fn shutdown_sequence(state: &OrchestratorState) {
     let tracked = state.tracked_nodes.lock().await;
     for node in tracked.iter() {
-        tracing::warn!(node = node.as_str(), "shutdown pending; node still connected");
+        tracing::warn!(
+            node = node.as_str(),
+            "shutdown pending; node still connected"
+        );
     }
     drop(tracked);
 
     time::sleep(Duration::from_secs(10)).await;
 
-    for service in ["sy-identity", "sy-admin", "sy-config-routes", "sy-opa-rules"] {
+    for service in [
+        "sy-identity",
+        "sy-admin",
+        "sy-config-routes",
+        "sy-opa-rules",
+    ] {
         if let Err(err) = systemd_stop(service) {
             tracing::warn!(service = service, error = %err, "failed to stop service");
         }
@@ -364,7 +396,11 @@ async fn handle_admin(
                 .get("message")
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
-            let version = msg.payload.get("version").and_then(|value| value.as_u64()).unwrap_or(0);
+            let version = msg
+                .payload
+                .get("version")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
             let _ = send_config_response(
                 sender,
                 msg,
@@ -553,12 +589,17 @@ fn load_island(config_dir: &Path) -> Result<IslandFile, OrchestratorError> {
     Ok(serde_yaml::from_str(&data)?)
 }
 
-fn ensure_dirs(config_dir: &Path, state_dir: &Path, run_dir: &Path) -> Result<(), OrchestratorError> {
+fn ensure_dirs(
+    config_dir: &Path,
+    state_dir: &Path,
+    run_dir: &Path,
+) -> Result<(), OrchestratorError> {
+    let storage_root = json_router::paths::storage_root_dir();
     fs::create_dir_all(config_dir)?;
     fs::create_dir_all(state_dir.join("nodes"))?;
     fs::create_dir_all(islands_root())?;
-    fs::create_dir_all(Path::new("/var/lib/json-router"))?;
-    fs::create_dir_all(Path::new("/var/lib/json-router/opa-rules"))?;
+    fs::create_dir_all(&storage_root)?;
+    fs::create_dir_all(storage_root.join("opa-rules"))?;
     fs::create_dir_all(run_dir)?;
     Ok(())
 }
@@ -580,10 +621,7 @@ fn ensure_l2_name(name: &str, island_id: &str) -> String {
 
 fn load_router_snapshot(state: &OrchestratorState) -> Result<ShmSnapshot, OrchestratorError> {
     let router_l2_name = ensure_l2_name(&state.gateway_name, &state.island_id);
-    let identity_path = state
-        .state_dir
-        .join(&router_l2_name)
-        .join("identity.yaml");
+    let identity_path = state.state_dir.join(&router_l2_name).join("identity.yaml");
     let data = fs::read_to_string(&identity_path)?;
     let identity: IdentityFile = serde_yaml::from_str(&data)?;
     let shm_name = identity.shm.name;
@@ -718,10 +756,7 @@ fn remove_island(_state_dir: &Path, island_id: &str) -> Result<(), OrchestratorE
     Ok(())
 }
 
-fn read_island_info(
-    root: &Path,
-    island_id: &str,
-) -> Result<serde_json::Value, OrchestratorError> {
+fn read_island_info(root: &Path, island_id: &str) -> Result<serde_json::Value, OrchestratorError> {
     let path = root.join(island_id).join("info.yaml");
     let data = fs::read_to_string(&path)?;
     let yaml: serde_yaml::Value = serde_yaml::from_str(&data)?;
@@ -868,21 +903,18 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
     let _ = ssh_with_key(
         address,
         &key_path,
-        &sudo_wrap("mkdir -p /etc/json-router /var/lib/json-router/nodes /var/lib/json-router/opa-rules /var/run/json-router/routers"),
+        &sudo_wrap("mkdir -p /etc/fluxbee /var/lib/fluxbee/nodes /var/lib/fluxbee/opa-rules /var/lib/fluxbee/nats /var/run/fluxbee/routers"),
         BOOTSTRAP_SSH_USER,
     );
 
     let wan_listen = state.wan_listen.clone().unwrap_or_default();
     let island_yaml = format!(
-        "island_id: {}\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\n",
+        "island_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\n",
         island_id, wan_listen
     );
-    if let Err(err) = write_remote_file(
-        address,
-        &key_path,
-        "/etc/json-router/island.yaml",
-        &island_yaml,
-    ) {
+    if let Err(err) =
+        write_remote_file(address, &key_path, "/etc/fluxbee/island.yaml", &island_yaml)
+    {
         return serde_json::json!({
             "status": "error",
             "error_code": "CONFIG_FAILED",
@@ -894,12 +926,12 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
     let _ = write_remote_file(
         address,
         &key_path,
-        "/etc/json-router/config-routes.yaml",
+        "/etc/fluxbee/config-routes.yaml",
         config_routes_yaml,
     );
 
     let service = r#"[Unit]
-Description=JSON Router Orchestrator
+Description=Fluxbee Orchestrator
 After=network.target
 
 [Service]
@@ -998,7 +1030,10 @@ fn valid_address(value: &str) -> bool {
         return false;
     }
     let labels = value.split('.').collect::<Vec<_>>();
-    if labels.iter().any(|label| label.is_empty() || label.len() > 63) {
+    if labels
+        .iter()
+        .any(|label| label.is_empty() || label.len() > 63)
+    {
         return false;
     }
     labels.iter().all(|label| {
@@ -1013,11 +1048,11 @@ fn valid_address(value: &str) -> bool {
 }
 
 fn islands_root() -> PathBuf {
-    PathBuf::from("/var/lib/json-router/islands")
+    json_router::paths::storage_root_dir().join("islands")
 }
 
 fn orchestrator_file_path() -> PathBuf {
-    PathBuf::from("/var/lib/json-router/orchestrator.yaml")
+    json_router::paths::storage_root_dir().join("orchestrator.yaml")
 }
 
 fn run_cmd(mut cmd: Command, label: &str) -> Result<(), OrchestratorError> {
@@ -1089,7 +1124,12 @@ fn ssh_with_pass(address: &str, command: &str, user: &str) -> Result<(), Orchest
     result
 }
 
-fn ssh_with_key(address: &str, key_path: &Path, command: &str, user: &str) -> Result<(), OrchestratorError> {
+fn ssh_with_key(
+    address: &str,
+    key_path: &Path,
+    command: &str,
+    user: &str,
+) -> Result<(), OrchestratorError> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-i")
         .arg(key_path)
@@ -1139,7 +1179,11 @@ fn write_remote_file(
     ssh_with_key(address, key_path, &sudo_cmd, BOOTSTRAP_SSH_USER)
 }
 
-fn wait_for_wan(island_id: &str, remote_id: &str, timeout: Duration) -> Result<(), OrchestratorError> {
+fn wait_for_wan(
+    island_id: &str,
+    remote_id: &str,
+    timeout: Duration,
+) -> Result<(), OrchestratorError> {
     let shm_name = format!("/jsr-lsa-{}", island_id);
     let reader = LsaRegionReader::open_read_only(&shm_name)?;
     let deadline = Instant::now() + timeout;
@@ -1174,7 +1218,9 @@ fn sudo_wrap(cmd: &str) -> String {
 
 fn load_storage_path(config_dir: &Path) -> String {
     let _ = config_dir;
-    let default_root = "/var/lib/json-router".to_string();
+    let default_root = json_router::paths::storage_root_dir()
+        .to_string_lossy()
+        .to_string();
     let path = orchestrator_file_path();
     let data = match fs::read_to_string(&path) {
         Ok(data) => data,
@@ -1204,4 +1250,8 @@ fn persist_storage_path(config_dir: &Path, path: &str) -> Result<(), Orchestrato
     }))?;
     fs::write(file_path, data)?;
     Ok(())
+}
+
+fn is_mother_role(role: Option<&str>) -> bool {
+    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee" || r == "mother")
 }
