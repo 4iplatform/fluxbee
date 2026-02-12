@@ -75,7 +75,7 @@ const CRITICAL_SERVICES: [&str; 5] = [
     "sy-config-routes",
     "sy-opa-rules",
     "sy-admin",
-    "sy-identity",
+    "sy-storage",
 ];
 
 #[tokio::main]
@@ -186,12 +186,10 @@ async fn bootstrap_local(
     systemd_start("rt-gateway")?;
     wait_for_router_ready(state, socket_dir, Duration::from_secs(30)).await?;
 
-    let services = [
-        "sy-config-routes",
-        "sy-opa-rules",
-        "sy-identity",
-        "sy-admin",
-    ];
+    let mut services = vec!["sy-config-routes", "sy-opa-rules", "sy-admin", "sy-storage"];
+    if identity_available() {
+        services.push("sy-identity");
+    }
     for service in services {
         tracing::info!(service = service, "starting service");
         if let Err(err) = systemd_start(service) {
@@ -239,24 +237,22 @@ async fn wait_for_sy_nodes(
     state: &OrchestratorState,
     timeout: Duration,
 ) -> Result<(), OrchestratorError> {
-    let required = [
-        "SY.config.routes",
-        "SY.opa.rules",
-        "SY.identity",
-        "SY.admin",
-    ];
+    let mut required = vec!["SY.config.routes", "SY.opa.rules", "SY.admin"];
+    if identity_available() {
+        required.push("SY.identity");
+    }
     let start = Instant::now();
     loop {
         if let Ok(snapshot) = load_router_snapshot(state) {
             let mut missing = Vec::new();
-            for name in &required {
+            for name in required.iter().copied() {
                 let expected = ensure_l2_name(name, &state.island_id);
                 let found = snapshot.nodes.iter().any(|node| {
                     if node.name_len == 0 {
                         return false;
                     }
                     let node_name = node_name(node);
-                    node_name == *name || node_name == expected
+                    node_name == name || node_name == expected
                 });
                 if !found {
                     missing.push(name);
@@ -281,6 +277,16 @@ async fn watchdog_tick(state: &OrchestratorState) {
             if let Err(err) = systemd_start(service) {
                 tracing::warn!(service = service, error = %err, "service restart failed");
             }
+        }
+    }
+    if identity_available() && !systemd_is_active("sy-identity") {
+        tracing::warn!(service = "sy-identity", "service not active; attempting restart");
+        if let Err(err) = systemd_start("sy-identity") {
+            tracing::warn!(
+                service = "sy-identity",
+                error = %err,
+                "service restart failed"
+            );
         }
     }
 
@@ -315,14 +321,18 @@ async fn shutdown_sequence(state: &OrchestratorState) {
 
     time::sleep(Duration::from_secs(10)).await;
 
-    for service in [
-        "sy-identity",
-        "sy-admin",
-        "sy-config-routes",
-        "sy-opa-rules",
-    ] {
+    for service in ["sy-storage", "sy-admin", "sy-config-routes", "sy-opa-rules"] {
         if let Err(err) = systemd_stop(service) {
             tracing::warn!(service = service, error = %err, "failed to stop service");
+        }
+    }
+    if identity_available() {
+        if let Err(err) = systemd_stop("sy-identity") {
+            tracing::warn!(
+                service = "sy-identity",
+                error = %err,
+                "failed to stop service"
+            );
         }
     }
     if let Err(err) = systemd_stop("rt-gateway") {
@@ -840,7 +850,7 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
 
     if let Err(err) = ssh_with_pass(
         address,
-        &sudo_wrap("mkdir -p /root/.ssh && chmod 700 /root/.ssh"),
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh",
         BOOTSTRAP_SSH_USER,
     ) {
         return serde_json::json!({
@@ -851,33 +861,27 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
     }
     let escaped = pub_key.replace('\'', "'\"'\"'");
     let append_cmd = format!(
-        "bash -lc \"printf '%s\\\\n' '{}' >> /root/.ssh/authorized_keys\"",
+        "bash -lc \"printf '%s\\\\n' '{}' >> ~/.ssh/authorized_keys\"",
         escaped
     );
-    if let Err(err) = ssh_with_pass(address, &sudo_wrap(&append_cmd), BOOTSTRAP_SSH_USER) {
+    if let Err(err) = ssh_with_pass(address, &append_cmd, BOOTSTRAP_SSH_USER) {
         return serde_json::json!({
             "status": "error",
             "error_code": "SSH_KEY_FAILED",
             "message": err.to_string(),
         });
     }
-    let _ = ssh_with_pass(
-        address,
-        &sudo_wrap("chmod 600 /root/.ssh/authorized_keys"),
-        BOOTSTRAP_SSH_USER,
-    );
+    let _ = ssh_with_pass(address, "chmod 600 ~/.ssh/authorized_keys", BOOTSTRAP_SSH_USER);
 
     // NOTE: PasswordAuthentication disable step intentionally skipped for testing safety.
     // Spec: set PasswordAuthentication no and restart sshd.
 
-    let binaries = [
-        "/usr/bin/sy-orchestrator",
+    let required_binaries = [
         "/usr/bin/rt-gateway",
         "/usr/bin/sy-config-routes",
         "/usr/bin/sy-opa-rules",
-        "/usr/bin/sy-admin",
     ];
-    for bin in binaries {
+    for bin in required_binaries {
         if !Path::new(bin).exists() {
             return serde_json::json!({
                 "status": "error",
@@ -885,6 +889,14 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
                 "message": format!("missing binary {bin}"),
             });
         }
+    }
+    let mut binaries = vec![
+        "/usr/bin/rt-gateway",
+        "/usr/bin/sy-config-routes",
+        "/usr/bin/sy-opa-rules",
+    ];
+    if identity_available() {
+        binaries.push("/usr/bin/sy-identity");
     }
     if let Err(err) = scp_with_key(address, &key_path, &binaries, "/tmp/", BOOTSTRAP_SSH_USER) {
         return serde_json::json!({
@@ -903,7 +915,7 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
     let _ = ssh_with_key(
         address,
         &key_path,
-        &sudo_wrap("mkdir -p /etc/fluxbee /var/lib/fluxbee/nodes /var/lib/fluxbee/opa-rules /var/lib/fluxbee/nats /var/run/fluxbee/routers"),
+        &sudo_wrap("mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa-rules /var/lib/fluxbee/nats /var/run/fluxbee/routers"),
         BOOTSTRAP_SSH_USER,
     );
 
@@ -926,52 +938,50 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
     let _ = write_remote_file(
         address,
         &key_path,
-        "/etc/fluxbee/config-routes.yaml",
+        "/etc/fluxbee/sy-config-routes.yaml",
         config_routes_yaml,
     );
 
-    let service = r#"[Unit]
-Description=Fluxbee Orchestrator
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/sy-orchestrator
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-"#;
-    let _ = write_remote_file(
-        address,
-        &key_path,
-        "/etc/systemd/system/sy-orchestrator.service",
-        service,
-    );
+    let mut worker_units = vec![
+        ("rt-gateway", "/usr/bin/rt-gateway"),
+        ("sy-config-routes", "/usr/bin/sy-config-routes"),
+        ("sy-opa-rules", "/usr/bin/sy-opa-rules"),
+    ];
+    if identity_available() {
+        worker_units.push(("sy-identity", "/usr/bin/sy-identity"));
+    }
+    for (name, exec_path) in &worker_units {
+        let unit = format!(
+            "[Unit]\nDescription=Fluxbee {name}\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
+        );
+        let unit_path = format!("/etc/systemd/system/{name}.service");
+        let _ = write_remote_file(address, &key_path, &unit_path, &unit);
+    }
     let _ = ssh_with_key(
         address,
         &key_path,
         &sudo_wrap("systemctl daemon-reload"),
         BOOTSTRAP_SSH_USER,
     );
-    let _ = ssh_with_key(
-        address,
-        &key_path,
-        &sudo_wrap("systemctl enable sy-orchestrator"),
-        BOOTSTRAP_SSH_USER,
-    );
-    if let Err(err) = ssh_with_key(
-        address,
-        &key_path,
-        &sudo_wrap("systemctl start sy-orchestrator"),
-        BOOTSTRAP_SSH_USER,
-    ) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SERVICE_FAILED",
-            "message": err.to_string(),
-        });
+    for (name, _) in &worker_units {
+        let _ = ssh_with_key(
+            address,
+            &key_path,
+            &sudo_wrap(&format!("systemctl enable {name}")),
+            BOOTSTRAP_SSH_USER,
+        );
+        if let Err(err) = ssh_with_key(
+            address,
+            &key_path,
+            &sudo_wrap(&format!("systemctl start {name}")),
+            BOOTSTRAP_SSH_USER,
+        ) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SERVICE_FAILED",
+                "message": format!("{name}: {err}"),
+            });
+        }
     }
 
     let mut wan_connected = true;
@@ -1084,6 +1094,10 @@ fn systemd_stop(service: &str) -> Result<(), OrchestratorError> {
     let mut cmd = Command::new("systemctl");
     cmd.arg("stop").arg(service);
     run_cmd(cmd, "systemctl stop")
+}
+
+fn identity_available() -> bool {
+    Path::new("/usr/bin/sy-identity").exists()
 }
 
 fn askpass_script(password: &str) -> Result<PathBuf, OrchestratorError> {

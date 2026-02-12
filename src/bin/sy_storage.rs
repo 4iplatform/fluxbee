@@ -1,13 +1,19 @@
-use std::path::{Path, PathBuf};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use serde_json::Value;
 use tokio::time;
+use tokio_postgres::{Client, NoTls};
 use tracing_subscriber::EnvFilter;
 
-use json_router::nats::{NatsSubscriber, SUBJECT_STORAGE_TURNS};
+use json_router::nats::{
+    NatsSubscriber, SUBJECT_STORAGE_EVENTS, SUBJECT_STORAGE_ITEMS, SUBJECT_STORAGE_REACTIVATION,
+    SUBJECT_STORAGE_TURNS,
+};
 
 type StorageError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -16,6 +22,7 @@ struct IslandFile {
     island_id: String,
     role: Option<String>,
     nats: Option<NatsSection>,
+    database: Option<DatabaseSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +30,54 @@ struct NatsSection {
     mode: Option<String>,
     port: Option<u16>,
     url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DatabaseSection {
+    url: Option<String>,
+}
+
+struct Storage {
+    client: Client,
+}
+
+#[derive(Debug)]
+struct TurnRecord {
+    ctx: String,
+    seq: i64,
+    from_ilk: String,
+    to_ilk: Option<String>,
+    ich: String,
+    msg_type: String,
+    content: Value,
+    tags: Vec<String>,
+}
+
+#[derive(Debug)]
+struct EventRecord {
+    event_id: Option<i64>,
+    ctx: String,
+    start_seq: i64,
+    end_seq: i64,
+    boundary_reason: String,
+    cues_agg: Vec<String>,
+    outcome_status: Option<String>,
+    outcome_duration_ms: Option<i64>,
+    activation_strength: f64,
+    context_inhibition: f64,
+    use_count: i32,
+    success_count: i32,
+}
+
+#[derive(Debug)]
+struct MemoryItemRecord {
+    memory_id: String,
+    event_id: Option<i64>,
+    item_type: String,
+    content: Value,
+    confidence: f64,
+    cues_signature: Vec<String>,
+    activation_strength: f64,
 }
 
 #[tokio::main]
@@ -37,7 +92,6 @@ async fn main() -> Result<(), StorageError> {
         .init();
 
     let config_dir = json_router::paths::config_dir();
-    let storage_root = json_router::paths::storage_root_dir();
     let island = load_island(&config_dir).await?;
     if !is_mother_role(island.role.as_deref()) {
         tracing::warn!(
@@ -48,36 +102,329 @@ async fn main() -> Result<(), StorageError> {
     }
 
     let endpoint = nats_endpoint(&island);
-    let storage_dir = storage_root.join("storage");
-    fs::create_dir_all(&storage_dir).await?;
-    let turns_log = storage_dir.join("turns.ndjson");
+    let database_url = database_url(&island)?;
+    let storage = Arc::new(Storage::connect(&database_url).await?);
+    storage.ensure_schema().await?;
 
     tracing::info!(
         island = %island.island_id,
         endpoint = %endpoint,
-        file = %turns_log.display(),
         "sy.storage started"
     );
 
+    let turns_task = tokio::spawn(run_turns_loop(endpoint.clone(), Arc::clone(&storage)));
+    let events_task = tokio::spawn(run_events_loop(endpoint.clone(), Arc::clone(&storage)));
+    let items_task = tokio::spawn(run_items_loop(endpoint.clone(), Arc::clone(&storage)));
+    let react_task = tokio::spawn(run_reactivation_loop(endpoint, Arc::clone(&storage)));
+
+    let _ = tokio::join!(turns_task, events_task, items_task, react_task);
+    Ok(())
+}
+
+impl Storage {
+    async fn connect(database_url: &str) -> Result<Self, StorageError> {
+        let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::error!(error = %err, "postgres connection closed");
+            }
+        });
+        Ok(Self { client })
+    }
+
+    async fn ensure_schema(&self) -> Result<(), StorageError> {
+        self.client
+            .batch_execute(
+                r#"
+CREATE TABLE IF NOT EXISTS turns (
+    ctx         TEXT NOT NULL,
+    seq         BIGINT NOT NULL,
+    ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    from_ilk    TEXT NOT NULL,
+    to_ilk      TEXT,
+    ich         TEXT NOT NULL,
+    msg_type    TEXT NOT NULL,
+    content     JSONB NOT NULL,
+    tags        TEXT[],
+    PRIMARY KEY (ctx, seq)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    event_id        BIGSERIAL PRIMARY KEY,
+    ctx             TEXT NOT NULL,
+    start_seq       BIGINT NOT NULL,
+    end_seq         BIGINT NOT NULL,
+    boundary_reason TEXT NOT NULL,
+    cues_agg        TEXT[] NOT NULL,
+    outcome_status  TEXT,
+    outcome_duration_ms BIGINT,
+    activation_strength REAL DEFAULT 0.5,
+    context_inhibition  REAL DEFAULT 0.0,
+    use_count       INT DEFAULT 0,
+    success_count   INT DEFAULT 0,
+    last_used_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS memory_items (
+    memory_id       TEXT PRIMARY KEY,
+    event_id        BIGINT REFERENCES events(event_id),
+    item_type       TEXT NOT NULL,
+    content         JSONB NOT NULL,
+    confidence      REAL NOT NULL,
+    cues_signature  TEXT[] NOT NULL,
+    activation_strength REAL DEFAULT 0.5,
+    created_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_turns_ctx ON turns (ctx);
+CREATE INDEX IF NOT EXISTS idx_events_cues ON events USING GIN(cues_agg);
+CREATE INDEX IF NOT EXISTS idx_events_activation ON events(activation_strength DESC);
+CREATE INDEX IF NOT EXISTS idx_items_cues ON memory_items USING GIN(cues_signature);
+"#,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn handle_turn(&self, payload: &[u8]) -> Result<(), StorageError> {
+        let value: Value = serde_json::from_slice(payload)?;
+        let turn = parse_turn(value)?;
+        self.client
+            .execute(
+                r#"
+INSERT INTO turns (ctx, seq, ts, from_ilk, to_ilk, ich, msg_type, content, tags)
+VALUES ($1, $2, now(), $3, $4, $5, $6, $7, $8)
+ON CONFLICT (ctx, seq) DO NOTHING
+"#,
+                &[
+                    &turn.ctx,
+                    &turn.seq,
+                    &turn.from_ilk,
+                    &turn.to_ilk,
+                    &turn.ich,
+                    &turn.msg_type,
+                    &turn.content,
+                    &turn.tags,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn handle_event(&self, payload: &[u8]) -> Result<(), StorageError> {
+        let value: Value = serde_json::from_slice(payload)?;
+        let event = parse_event(value)?;
+        if let Some(event_id) = event.event_id {
+            self.client
+                .execute(
+                    r#"
+INSERT INTO events (
+    event_id, ctx, start_seq, end_seq, boundary_reason, cues_agg,
+    outcome_status, outcome_duration_ms, activation_strength, context_inhibition,
+    use_count, success_count
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+ON CONFLICT (event_id) DO UPDATE SET
+    ctx = EXCLUDED.ctx,
+    start_seq = EXCLUDED.start_seq,
+    end_seq = EXCLUDED.end_seq,
+    boundary_reason = EXCLUDED.boundary_reason,
+    cues_agg = EXCLUDED.cues_agg,
+    outcome_status = EXCLUDED.outcome_status,
+    outcome_duration_ms = EXCLUDED.outcome_duration_ms,
+    activation_strength = EXCLUDED.activation_strength,
+    context_inhibition = EXCLUDED.context_inhibition,
+    use_count = EXCLUDED.use_count,
+    success_count = EXCLUDED.success_count
+"#,
+                    &[
+                        &event_id,
+                        &event.ctx,
+                        &event.start_seq,
+                        &event.end_seq,
+                        &event.boundary_reason,
+                        &event.cues_agg,
+                        &event.outcome_status,
+                        &event.outcome_duration_ms,
+                        &event.activation_strength,
+                        &event.context_inhibition,
+                        &event.use_count,
+                        &event.success_count,
+                    ],
+                )
+                .await?;
+        } else {
+            self.client
+                .execute(
+                    r#"
+INSERT INTO events (
+    ctx, start_seq, end_seq, boundary_reason, cues_agg,
+    outcome_status, outcome_duration_ms, activation_strength, context_inhibition,
+    use_count, success_count
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+"#,
+                    &[
+                        &event.ctx,
+                        &event.start_seq,
+                        &event.end_seq,
+                        &event.boundary_reason,
+                        &event.cues_agg,
+                        &event.outcome_status,
+                        &event.outcome_duration_ms,
+                        &event.activation_strength,
+                        &event.context_inhibition,
+                        &event.use_count,
+                        &event.success_count,
+                    ],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_item(&self, payload: &[u8]) -> Result<(), StorageError> {
+        let value: Value = serde_json::from_slice(payload)?;
+        let item = parse_memory_item(value)?;
+        self.client
+            .execute(
+                r#"
+INSERT INTO memory_items (
+    memory_id, event_id, item_type, content, confidence, cues_signature, activation_strength
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7)
+ON CONFLICT (memory_id) DO NOTHING
+"#,
+                &[
+                    &item.memory_id,
+                    &item.event_id,
+                    &item.item_type,
+                    &item.content,
+                    &item.confidence,
+                    &item.cues_signature,
+                    &item.activation_strength,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn handle_reactivation(&self, payload: &[u8]) -> Result<(), StorageError> {
+        let value: Value = serde_json::from_slice(payload)?;
+        let outcome_ok =
+            get_str(&value, &["outcome", "status"]).is_some_and(|s| s.eq_ignore_ascii_case("resolved"));
+        let events = get_array(&value, &["reactivated", "events"])
+            .or_else(|| get_array(&value, &["events"]))
+            .cloned()
+            .unwrap_or_default();
+
+        for ev in events {
+            let event_id = get_i64(&ev, &["event_id"]);
+            let used = get_bool(&ev, &["used"]).unwrap_or(false);
+            let Some(event_id) = event_id else {
+                continue;
+            };
+            if used {
+                self.client
+                    .execute(
+                        r#"
+UPDATE events SET
+    activation_strength = LEAST(COALESCE(activation_strength, 0.5) * 1.1, 1.0),
+    use_count = COALESCE(use_count, 0) + 1,
+    success_count = COALESCE(success_count, 0) + CASE WHEN $2 THEN 1 ELSE 0 END,
+    last_used_at = now()
+WHERE event_id = $1
+"#,
+                        &[&event_id, &outcome_ok],
+                    )
+                    .await?;
+            } else {
+                self.client
+                    .execute(
+                        r#"
+UPDATE events SET
+    activation_strength = GREATEST(COALESCE(activation_strength, 0.5) * 0.95, 0.1)
+WHERE event_id = $1
+"#,
+                        &[&event_id],
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn run_turns_loop(endpoint: String, storage: Arc<Storage>) {
+    run_subject_loop(endpoint, SUBJECT_STORAGE_TURNS, 10, storage, HandlerKind::Turns).await;
+}
+
+async fn run_events_loop(endpoint: String, storage: Arc<Storage>) {
+    run_subject_loop(endpoint, SUBJECT_STORAGE_EVENTS, 11, storage, HandlerKind::Events).await;
+}
+
+async fn run_items_loop(endpoint: String, storage: Arc<Storage>) {
+    run_subject_loop(endpoint, SUBJECT_STORAGE_ITEMS, 12, storage, HandlerKind::Items).await;
+}
+
+async fn run_reactivation_loop(endpoint: String, storage: Arc<Storage>) {
+    run_subject_loop(
+        endpoint,
+        SUBJECT_STORAGE_REACTIVATION,
+        13,
+        storage,
+        HandlerKind::Reactivation,
+    )
+    .await;
+}
+
+#[derive(Clone, Copy)]
+enum HandlerKind {
+    Turns,
+    Events,
+    Items,
+    Reactivation,
+}
+
+async fn run_subject_loop(
+    endpoint: String,
+    subject: &str,
+    sid: u32,
+    storage: Arc<Storage>,
+    kind: HandlerKind,
+) {
     loop {
-        let subscriber =
-            NatsSubscriber::new(endpoint.clone(), SUBJECT_STORAGE_TURNS.to_string(), 10);
-        let file_path = turns_log.clone();
+        let subscriber = NatsSubscriber::new(endpoint.clone(), subject.to_string(), sid);
+        let worker = Arc::clone(&storage);
+        let subject_name = subject.to_string();
         let run_result = subscriber
             .run(move |payload| {
-                let file_path = file_path.clone();
-                async move { append_line(&file_path, &payload).await }
+                let worker = Arc::clone(&worker);
+                let subject_name = subject_name.clone();
+                async move {
+                    let result = match kind {
+                        HandlerKind::Turns => worker.handle_turn(&payload).await,
+                        HandlerKind::Events => worker.handle_event(&payload).await,
+                        HandlerKind::Items => worker.handle_item(&payload).await,
+                        HandlerKind::Reactivation => worker.handle_reactivation(&payload).await,
+                    };
+                    if let Err(err) = result {
+                        tracing::warn!(subject = %subject_name, error = %err, "storage handler failed");
+                    }
+                    Ok(())
+                }
             })
             .await;
         if let Err(err) = run_result {
-            tracing::warn!(error = %err, "nats subscribe loop failed; retrying");
-            time::sleep(Duration::from_secs(1)).await;
+            tracing::warn!(subject = %subject, error = %err, "nats subscribe loop failed; retrying");
         }
+        time::sleep(Duration::from_secs(1)).await;
     }
 }
 
 async fn load_island(config_dir: &Path) -> Result<IslandFile, StorageError> {
-    let data = fs::read_to_string(config_dir.join("island.yaml")).await?;
+    let data = tokio::fs::read_to_string(config_dir.join("island.yaml")).await?;
     Ok(serde_yaml::from_str(&data)?)
 }
 
@@ -105,16 +452,201 @@ fn nats_endpoint(island: &IslandFile) -> String {
     }
 }
 
-async fn append_line(path: &PathBuf, payload: &[u8]) -> Result<(), std::io::Error> {
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await?;
-    file.write_all(payload).await?;
-    file.write_all(b"\n").await?;
-    file.flush().await?;
-    Ok(())
+fn database_url(island: &IslandFile) -> Result<String, StorageError> {
+    if let Ok(url) = std::env::var("FLUXBEE_DATABASE_URL") {
+        if !url.trim().is_empty() {
+            return Ok(url);
+        }
+    }
+    if let Ok(url) = std::env::var("JSR_DATABASE_URL") {
+        if !url.trim().is_empty() {
+            return Ok(url);
+        }
+    }
+    let Some(db) = island.database.as_ref() else {
+        return Err("database.url missing in island.yaml and env".into());
+    };
+    let Some(url) = db.url.as_ref() else {
+        return Err("database.url missing in island.yaml and env".into());
+    };
+    if url.trim().is_empty() {
+        return Err("database.url empty".into());
+    }
+    Ok(url.clone())
+}
+
+fn parse_turn(value: Value) -> Result<TurnRecord, StorageError> {
+    let trace_id =
+        get_str(&value, &["routing", "trace_id"]).unwrap_or_else(|| "missing-trace".to_string());
+    let ctx = get_str(&value, &["meta", "ctx"]).unwrap_or_else(|| format!("trace:{trace_id}"));
+    let seq = get_i64(&value, &["meta", "ctx_seq"]).unwrap_or_else(|| stable_i64(&trace_id));
+    let from_ilk = get_str(&value, &["meta", "src_ilk"])
+        .or_else(|| get_str(&value, &["routing", "src"]))
+        .unwrap_or_else(|| "unknown".to_string());
+    let to_ilk = get_str(&value, &["meta", "dst_ilk"]);
+    let ich = get_str(&value, &["meta", "ich"]).unwrap_or_else(|| "unknown".to_string());
+    let msg_type =
+        get_str(&value, &["meta", "type"]).unwrap_or_else(|| "unknown".to_string());
+    let content = value.get("payload").cloned().unwrap_or(Value::Null);
+    let mut tags = get_string_vec(&value, &["payload", "tags"]).unwrap_or_default();
+    if tags.is_empty() {
+        tags = get_string_vec(&value, &["meta", "tags"]).unwrap_or_default();
+    }
+    dedup_sort(&mut tags);
+    Ok(TurnRecord {
+        ctx,
+        seq,
+        from_ilk,
+        to_ilk,
+        ich,
+        msg_type,
+        content,
+        tags,
+    })
+}
+
+fn parse_event(value: Value) -> Result<EventRecord, StorageError> {
+    let event_root = if value.get("event").is_some() {
+        value.get("event").cloned().unwrap_or(Value::Null)
+    } else {
+        value
+    };
+    let ctx = get_str(&event_root, &["ctx"]).unwrap_or_else(|| "unknown".to_string());
+    let start_seq = get_i64(&event_root, &["start_seq"]).unwrap_or(0);
+    let end_seq = get_i64(&event_root, &["end_seq"]).unwrap_or(start_seq);
+    let boundary_reason =
+        get_str(&event_root, &["boundary_reason"]).unwrap_or_else(|| "unknown".to_string());
+    let mut cues_agg = get_string_vec(&event_root, &["cues_agg"])
+        .or_else(|| get_string_vec(&event_root, &["tags"]))
+        .unwrap_or_default();
+    if cues_agg.is_empty() {
+        cues_agg.push("untagged".to_string());
+    }
+    dedup_sort(&mut cues_agg);
+    Ok(EventRecord {
+        event_id: get_i64(&event_root, &["event_id"]),
+        ctx,
+        start_seq,
+        end_seq,
+        boundary_reason,
+        cues_agg,
+        outcome_status: get_str(&event_root, &["outcome_status"]),
+        outcome_duration_ms: get_i64(&event_root, &["outcome_duration_ms"]),
+        activation_strength: get_f64(&event_root, &["activation_strength"]).unwrap_or(0.5),
+        context_inhibition: get_f64(&event_root, &["context_inhibition"]).unwrap_or(0.0),
+        use_count: get_i64(&event_root, &["use_count"]).unwrap_or(0) as i32,
+        success_count: get_i64(&event_root, &["success_count"]).unwrap_or(0) as i32,
+    })
+}
+
+fn parse_memory_item(value: Value) -> Result<MemoryItemRecord, StorageError> {
+    let item_root = if value.get("item").is_some() {
+        value.get("item").cloned().unwrap_or(Value::Null)
+    } else {
+        value
+    };
+    let content = item_root
+        .get("content")
+        .cloned()
+        .unwrap_or_else(|| item_root.clone());
+    let mut cues_signature = get_string_vec(&item_root, &["cues_signature"])
+        .or_else(|| get_string_vec(&item_root, &["tags"]))
+        .unwrap_or_default();
+    if cues_signature.is_empty() {
+        cues_signature.push("untagged".to_string());
+    }
+    dedup_sort(&mut cues_signature);
+    let memory_id = get_str(&item_root, &["memory_id"]).unwrap_or_else(|| {
+        let canonical = serde_json::to_string(&item_root).unwrap_or_else(|_| "item".to_string());
+        format!("mid-{:x}", stable_u64(&canonical))
+    });
+    Ok(MemoryItemRecord {
+        memory_id,
+        event_id: get_i64(&item_root, &["event_id"]),
+        item_type: get_str(&item_root, &["item_type"]).unwrap_or_else(|| "unknown".to_string()),
+        content,
+        confidence: get_f64(&item_root, &["confidence"]).unwrap_or(0.5),
+        cues_signature,
+        activation_strength: get_f64(&item_root, &["activation_strength"]).unwrap_or(0.5),
+    })
+}
+
+fn get_value<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn get_str(value: &Value, path: &[&str]) -> Option<String> {
+    match get_value(value, path) {
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+        Some(v) if !v.is_null() => Some(v.to_string()),
+        _ => None,
+    }
+}
+
+fn get_i64(value: &Value, path: &[&str]) -> Option<i64> {
+    let v = get_value(value, path)?;
+    if let Some(i) = v.as_i64() {
+        return Some(i);
+    }
+    v.as_str()?.parse::<i64>().ok()
+}
+
+fn get_f64(value: &Value, path: &[&str]) -> Option<f64> {
+    let v = get_value(value, path)?;
+    if let Some(f) = v.as_f64() {
+        return Some(f);
+    }
+    v.as_str()?.parse::<f64>().ok()
+}
+
+fn get_bool(value: &Value, path: &[&str]) -> Option<bool> {
+    let v = get_value(value, path)?;
+    if let Some(b) = v.as_bool() {
+        return Some(b);
+    }
+    let s = v.as_str()?.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn get_string_vec(value: &Value, path: &[&str]) -> Option<Vec<String>> {
+    let array = get_value(value, path)?.as_array()?;
+    let mut out = Vec::new();
+    for item in array {
+        if let Some(s) = item.as_str() {
+            let s = s.trim();
+            if !s.is_empty() {
+                out.push(s.to_string());
+            }
+        }
+    }
+    Some(out)
+}
+
+fn get_array<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Vec<Value>> {
+    get_value(value, path)?.as_array()
+}
+
+fn dedup_sort(values: &mut Vec<String>) {
+    values.sort();
+    values.dedup();
+}
+
+fn stable_u64(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn stable_i64(value: &str) -> i64 {
+    (stable_u64(value) & (i64::MAX as u64)) as i64
 }
 
 fn is_mother_role(role: Option<&str>) -> bool {

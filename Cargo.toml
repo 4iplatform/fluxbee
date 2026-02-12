@@ -21,3 +21,4 @@ jsr-client = { path = "crates/jsr_client" }
 wasmtime = "19.0.0"
 regex = "1.10"
 tar = "0.4"
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }

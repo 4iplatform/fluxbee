@@ -4,6 +4,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 pub const SUBJECT_STORAGE_TURNS: &str = "storage.turns";
+pub const SUBJECT_STORAGE_EVENTS: &str = "storage.events";
+pub const SUBJECT_STORAGE_ITEMS: &str = "storage.items";
+pub const SUBJECT_STORAGE_REACTIVATION: &str = "storage.reactivation";
 
 const CONNECT_LINE: &str = "CONNECT {\"lang\":\"rust\",\"version\":\"0.1\",\"verbose\":false,\"pedantic\":false,\"tls_required\":false}\r\n";
 
