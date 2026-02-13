@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -130,6 +131,7 @@ impl Router {
         ensure_parent_dir(&self.cfg.node_socket_path)?;
         let _ = std::fs::remove_file(&self.cfg.node_socket_path);
         let listener = UnixListener::bind(&self.cfg.node_socket_path)?;
+        set_socket_mode(&self.cfg.node_socket_path, 0o666)?;
         tracing::info!(
             router = %self.cfg.router_l2_name,
             socket = %self.cfg.node_socket_path.display(),
@@ -140,6 +142,7 @@ impl Router {
         ensure_parent_dir(&irp_path)?;
         let _ = std::fs::remove_file(&irp_path);
         let irp_listener = UnixListener::bind(&irp_path)?;
+        set_socket_mode(&irp_path, 0o600)?;
         tracing::info!(
             router = %self.cfg.router_l2_name,
             socket = %irp_path.display(),
@@ -2729,6 +2732,12 @@ fn ensure_parent_dir(path: &Path) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+fn set_socket_mode(path: &Path, mode: u32) -> io::Result<()> {
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(mode & 0o777);
+    fs::set_permissions(path, perms)
 }
 
 struct NodeHandle {
