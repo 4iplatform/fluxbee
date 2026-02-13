@@ -46,8 +46,8 @@ pub enum NodeError {
 }
 
 #[derive(Debug, Deserialize)]
-struct IslandFile {
-    island_id: String,
+struct HiveFile {
+    hive_id: String,
 }
 
 pub async fn connect(config: &NodeConfig) -> Result<(NodeSender, NodeReceiver), NodeError> {
@@ -75,8 +75,8 @@ struct ConnectedParts {
 }
 
 async fn connect_parts(config: &NodeConfig) -> Result<ConnectedParts, NodeError> {
-    let island_id = load_island_id(&config.config_dir)?;
-    let (full_name, base_name) = normalize_name(&config.name, &island_id);
+    let hive_id = load_hive_id(&config.config_dir)?;
+    let (full_name, base_name) = normalize_name(&config.name, &hive_id);
     let uuid = load_or_create_uuid(&config.uuid_persistence_dir, &base_name)?;
 
     let state = Arc::new(ConnectionState::new_connected());
@@ -316,18 +316,18 @@ async fn tx_queue_closed(rx: &Arc<Mutex<mpsc::Receiver<Vec<u8>>>>) -> bool {
     guard.is_closed() && guard.is_empty()
 }
 
-fn load_island_id(config_dir: &Path) -> Result<String, NodeError> {
-    let path = config_dir.join("island.yaml");
+fn load_hive_id(config_dir: &Path) -> Result<String, NodeError> {
+    let path = config_dir.join("hive.yaml");
     let data = fs::read_to_string(&path)?;
-    let island: IslandFile = serde_yaml::from_str(&data)?;
-    Ok(island.island_id)
+    let hive: HiveFile = serde_yaml::from_str(&data)?;
+    Ok(hive.hive_id)
 }
 
-fn normalize_name(name: &str, island_id: &str) -> (String, String) {
+fn normalize_name(name: &str, hive_id: &str) -> (String, String) {
     if let Some((base, _)) = name.split_once('@') {
         (name.to_string(), base.to_string())
     } else {
-        (format!("{}@{}", name, island_id), name.to_string())
+        (format!("{}@{}", name, hive_id), name.to_string())
     }
 }
 

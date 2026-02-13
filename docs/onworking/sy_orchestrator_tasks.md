@@ -3,13 +3,13 @@
 Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `docs/01-arquitectura.md`.
 
 ## 1) Bootstrap local (Fases 0–4)
-- [x] Leer `/etc/fluxbee/island.yaml` y validar `island_id`.
+- [x] Leer `/etc/fluxbee/hive.yaml` y validar `hive_id`.
 - [x] Crear estructura de directorios (paths fijos de `07-operaciones`).
 - [x] Escribir PID en `/var/run/fluxbee/orchestrator.pid`.
 - [x] Levantar `RT.gateway` (systemd o exec) y esperar socket/shm (timeout 30s).
 - [x] Levantar en paralelo: `SY.config.routes`, `SY.opa.rules`, `SY.admin`, `SY.storage` y `SY.identity` opcional si existe binario.
 - [x] Conectar como nodo `SY.orchestrator@<isla>` (HELLO/ANNOUNCE) y entrar al loop principal.
-- [x] Log `Island {island_id} ready`.
+- [x] Log `Hive {hive_id} ready`.
 
 ## 2) Watchdog y lifecycle
 - [x] Tick cada 5s: verificar que RT.gateway y SY.* sigan vivos.
@@ -20,7 +20,7 @@ Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `do
 ## 3) API interna (mensajes admin)
 - [x] `list_nodes` (SHM router) / `run_node`, `kill_node` (stubs).
 - [x] `list_routers` (SHM router) / `run_router`, `kill_router` (stubs).
-- [x] `island_status` (estado completo de la isla).
+- [x] `hive_status` (estado completo de la isla).
 - [x] `get_storage` (path actual).
 - [x] `set_storage` via CONFIG_CHANGED `subsystem=storage` (aplicar + persistir).
 - [x] `set_storage` responde `CONFIG_RESPONSE` (según spec actualizada).
@@ -30,28 +30,28 @@ Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `do
 - [x] Persistir en `/var/lib/fluxbee/orchestrator.yaml`.
 - [x] Usar path default `/var/lib/fluxbee` si no hay config.
 
-## 5) add_island (bootstrap remoto)
-- [x] Validar `island_id` y `address` (errores: `ISLAND_EXISTS`, `INVALID_ADDRESS`).
+## 5) add_hive (bootstrap remoto)
+- [x] Validar `hive_id` y `address` (errores: `HIVE_EXISTS`, `INVALID_ADDRESS`).
 - [x] SSH `administrator@{address}:22` con pass `magicAI` (timeout 10s).
-- [x] Generar key ed25519 en `/var/lib/fluxbee/islands/{id}/` (600).
-- [x] Configurar SSH remoto: authorized_keys + disable password + restart sshd (opcional por flag `harden_ssh` o env `FLUXBEE_ADD_ISLAND_HARDEN_SSH`/`JSR_ADD_ISLAND_HARDEN_SSH`).
+- [x] Generar key ed25519 en `/var/lib/fluxbee/hives/{id}/` (600).
+- [x] Configurar SSH remoto: authorized_keys + disable password + restart sshd (opcional por flag `harden_ssh` o env `FLUXBEE_ADD_HIVE_HARDEN_SSH`/`JSR_ADD_HIVE_HARDEN_SSH`).
 - [x] Copiar binarios `/usr/bin/sy-*` y `rt-*` (scp) + chmod +x.
 - [x] Crear dirs remotos `/etc/fluxbee`, `/var/lib/fluxbee/*`, `/var/run/fluxbee/routers`.
-- [x] Crear `/etc/fluxbee/island.yaml` remoto (uplink hacia mother).
+- [x] Crear `/etc/fluxbee/hive.yaml` remoto (uplink hacia mother).
 - [x] Crear `/etc/fluxbee/sy-config-routes.yaml` vacío.
 - [x] Instalar units worker (`rt-gateway`, `sy-config-routes`, `sy-opa-rules`, `sy-identity` opcional) y `systemctl enable`.
 - [x] Iniciar units worker remotas (sin `sy-orchestrator` en worker).
 - [x] Esperar WAN (60s), validar LSA; si falla → `WAN_TIMEOUT`.
-- [x] Registrar `/var/lib/fluxbee/islands/{id}/info.yaml` (status, address, created_at).
+- [x] Registrar `/var/lib/fluxbee/hives/{id}/info.yaml` (status, address, created_at).
 
 ## 6) Repo de islas
-- [x] `list_islands`, `get_island`, `remove_island` (solo registro local).
+- [x] `list_hives`, `get_hive`, `remove_hive` (solo registro local).
 
 ## 7) Consideraciones
 - [x] SY.orchestrator es proceso raíz y único por isla.
 - [x] Los procesos levantados no son hijos (usarlo en el diseño de watchdog).
 - [x] Mantener compatibilidad con `SY.admin` (acciones actuales ya esperan estas respuestas).
 - [x] SY.identity se gestiona si el binario está instalado (ctx pendiente en v1.16).
-- [x] jsr-identity-<island> está documentado y corresponde al writer SY.identity.
+- [x] jsr-identity-<hive> está documentado y corresponde al writer SY.identity.
 - [x] subsystem=storage → SY.orchestrator documentado.
 - [x] Estandarizar runtime names en `/usr/bin` (`sy-admin`, `sy-config-routes`, `sy-orchestrator`, `sy-storage`) con fallback de build (`sy_admin`, etc.).

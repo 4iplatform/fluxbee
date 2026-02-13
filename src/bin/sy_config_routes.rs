@@ -17,8 +17,8 @@ use jsr_client::protocol::{
 use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
 
 #[derive(Debug, Deserialize)]
-struct IslandFile {
-    island_id: String,
+struct HiveFile {
+    hive_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -38,7 +38,7 @@ struct RouteConfig {
     match_kind: Option<String>,
     action: String,
     #[serde(default)]
-    next_hop_island: Option<String>,
+    next_hop_hive: Option<String>,
     #[serde(default)]
     metric: Option<u32>,
     #[serde(default)]
@@ -72,11 +72,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ensure_dir(&state_dir)?;
 
-    let island = load_island(&config_dir)?;
-    let island_id = island.island_id.clone();
+    let hive = load_hive(&config_dir)?;
+    let hive_id = hive.hive_id.clone();
     let router_socket = match std::env::var("JSR_ROUTER_NAME") {
         Ok(router_name) => {
-            let router_l2_name = ensure_l2_name(&router_name, &island.island_id);
+            let router_l2_name = ensure_l2_name(&router_name, &hive.hive_id);
             match load_router_uuid(&state_dir, &router_l2_name) {
                 Ok(router_uuid) => socket_dir.join(format!("{}.sock", router_uuid.simple())),
                 Err(_) => socket_dir.clone(),
@@ -86,9 +86,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut sy_config = load_config(&config_dir)?;
 
-    let shm_name = format!("/jsr-config-{}", island.island_id);
+    let shm_name = format!("/jsr-config-{}", hive.hive_id);
     let node_uuid = load_or_create_uuid(&state_dir.join("nodes"), "SY.config.routes")?;
-    let mut writer = ConfigRegionWriter::open_or_create(&shm_name, node_uuid, &island.island_id)?;
+    let mut writer = ConfigRegionWriter::open_or_create(&shm_name, node_uuid, &hive.hive_id)?;
 
     apply_config(&mut writer, &sy_config)?;
 
@@ -154,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "error",
                             Some("INVALID_PAYLOAD".to_string()),
                             Some(err.to_string()),
-                            &island_id,
+                            &hive_id,
                         ).await;
                         continue;
                     }
@@ -188,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     "error",
                                     Some("INVALID_CONFIG".to_string()),
                                     Some(err.to_string()),
-                                    &island_id,
+                                    &hive_id,
                                 ).await;
                                 continue;
                             }
@@ -210,7 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     "error",
                                     Some("INVALID_CONFIG".to_string()),
                                     Some(err.to_string()),
-                                    &island_id,
+                                    &hive_id,
                                 ).await;
                                 continue;
                             }
@@ -247,7 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "error",
                         Some("APPLY_FAILED".to_string()),
                         Some(err.to_string()),
-                        &island_id,
+                        &hive_id,
                     ).await;
                     continue;
                 }
@@ -261,7 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "error",
                         Some("PERSIST_FAILED".to_string()),
                         Some(err.to_string()),
-                        &island_id,
+                        &hive_id,
                     ).await;
                     continue;
                 }
@@ -280,7 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "ok",
                     None,
                     None,
-                    &island_id,
+                    &hive_id,
                 ).await;
             }
         }
@@ -295,13 +295,13 @@ async fn send_config_response(
     status: &str,
     error_code: Option<String>,
     error_detail: Option<String>,
-    island: &str,
+    hive: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut payload = serde_json::json!({
         "subsystem": subsystem,
         "version": version,
         "status": status,
-        "island": island,
+        "hive": hive,
     });
     if let Some(code) = error_code {
         payload["error_code"] = serde_json::Value::String(code);
@@ -483,16 +483,16 @@ async fn connect_with_retry(
     }
 }
 
-fn load_island(config_dir: &Path) -> Result<IslandFile, Box<dyn std::error::Error>> {
-    let data = fs::read_to_string(config_dir.join("island.yaml"))?;
+fn load_hive(config_dir: &Path) -> Result<HiveFile, Box<dyn std::error::Error>> {
+    let data = fs::read_to_string(config_dir.join("hive.yaml"))?;
     Ok(serde_yaml::from_str(&data)?)
 }
 
-fn ensure_l2_name(name: &str, island_id: &str) -> String {
+fn ensure_l2_name(name: &str, hive_id: &str) -> String {
     if name.contains('@') {
         name.to_string()
     } else {
-        format!("{}@{}", name, island_id)
+        format!("{}@{}", name, hive_id)
     }
 }
 
@@ -571,8 +571,8 @@ fn build_routes(
         entry.prefix_len = copy_bytes_with_len(&mut entry.prefix, &route.prefix) as u16;
         entry.match_kind = match_kind(route.match_kind.as_deref())?;
         entry.action = action_kind(&route.action)?;
-        if let Some(next) = &route.next_hop_island {
-            entry.next_hop_island_len = copy_bytes_with_len(&mut entry.next_hop_island, next) as u8;
+        if let Some(next) = &route.next_hop_hive {
+            entry.next_hop_hive_len = copy_bytes_with_len(&mut entry.next_hop_hive, next) as u8;
         }
         entry.metric = route.metric.unwrap_or(0);
         entry.priority = route.priority.unwrap_or(100);
@@ -670,8 +670,8 @@ fn empty_static_route() -> StaticRouteEntry {
         prefix_len: 0,
         match_kind: 0,
         action: 0,
-        next_hop_island: [0u8; 32],
-        next_hop_island_len: 0,
+        next_hop_hive: [0u8; 32],
+        next_hop_hive_len: 0,
         _pad: [0u8; 3],
         metric: 0,
         priority: 0,

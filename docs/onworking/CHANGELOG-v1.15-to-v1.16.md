@@ -49,7 +49,7 @@ La versión 1.16+ introduce cambios significativos en:
 ```
 
 **Acción requerida:**
-- Agregar campo `role: motherbee | worker` a island.yaml
+- Agregar campo `role: motherbee | worker` a hive.yaml
 - Ver `07-operaciones.md` sección 3
 
 ### 1.2 Distribución de Componentes
@@ -83,7 +83,7 @@ El router ahora tiene NATS JetStream embebido para buffering local.
 Router → NATS local (~1ms) → WAN → NATS madre → SY.storage → PostgreSQL
 ```
 
-### 2.2 Configuración Nueva en island.yaml
+### 2.2 Configuración Nueva en hive.yaml
 
 ```yaml
 # NUEVO en v1.16
@@ -120,9 +120,9 @@ pub struct Router {
 ```
 /dev/shm/
 ├── jsr-<router-uuid>
-├── jsr-config-<island>
-├── jsr-lsa-<island>
-└── jsr-opa-<island>
+├── jsr-config-<hive>
+├── jsr-lsa-<hive>
+└── jsr-opa-<hive>
 ```
 
 **AHORA (v1.16):** 6 regiones
@@ -130,11 +130,11 @@ pub struct Router {
 ```
 /dev/shm/
 ├── jsr-<router-uuid>
-├── jsr-config-<island>
-├── jsr-lsa-<island>
-├── jsr-opa-<island>
-├── jsr-identity-<island>    # NUEVO
-└── jsr-memory-<island>      # NUEVO
+├── jsr-config-<hive>
+├── jsr-lsa-<hive>
+├── jsr-opa-<hive>
+├── jsr-identity-<hive>    # NUEVO
+└── jsr-memory-<hive>      # NUEVO
 ```
 
 ### 3.2 Nuevo Proceso: SY.cognition
@@ -345,18 +345,18 @@ pub const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
 
 ## 10. Archivos de Configuración
 
-### 10.1 island.yaml (CAMBIOS)
+### 10.1 hive.yaml (CAMBIOS)
 
 ```yaml
 # v1.15
-island_id: produccion
+hive_id: produccion
 wan:
   listen: "0.0.0.0:9000"
 database:
   url: "postgresql://..."
 
 # v1.16 - NUEVOS campos
-island_id: produccion
+hive_id: produccion
 role: motherbee              # NUEVO: motherbee | worker
 
 wan:
@@ -453,7 +453,7 @@ database:
 | seqlock → epoch | Readers/writers incompatibles | Actualizar todo junto |
 | Nuevo campo en Meta | Parseo puede fallar | Usar `#[serde(default)]` |
 | NATS requerido | Router no arranca sin NATS | Embebido por default |
-| role en island.yaml | Orchestrator no arranca | Agregar campo |
+| role en hive.yaml | Orchestrator no arranca | Agregar campo |
 
 ---
 

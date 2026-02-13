@@ -55,8 +55,8 @@ const (
 	routerVersion = 2
 )
 
-type IslandConfig struct {
-	IslandID string `yaml:"island_id"`
+type HiveConfig struct {
+	HiveID string `yaml:"hive_id"`
 }
 
 type Meta struct {
@@ -172,8 +172,8 @@ type RouterHeader struct {
 	CreatedAt        uint64
 	UpdatedAt        uint64
 	Heartbeat        uint64
-	IslandID         [64]byte
-	IslandIDLen      uint16
+	HiveID           [64]byte
+	HiveIDLen        uint16
 	RouterName       [64]byte
 	RouterNameLen    uint16
 	IsGateway        uint8
@@ -185,7 +185,7 @@ type RouterHeader struct {
 }
 
 type Service struct {
-	islandID   string
+	hiveID     string
 	nodeUUID   uuid.UUID
 	nodeName   string
 	routerConn *RouterClient
@@ -205,9 +205,9 @@ type RouterStatus struct {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	islandID, err := loadIslandID()
+	hiveID, err := loadHiveID()
 	if err != nil {
-		log.Fatalf("failed to load island.yaml: %v", err)
+		log.Fatalf("failed to load hive.yaml: %v", err)
 	}
 	if err := ensureDirs(); err != nil {
 		log.Fatalf("failed to create dirs: %v", err)
@@ -225,15 +225,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load uuid: %v", err)
 	}
-	nodeName := fmt.Sprintf("%s@%s", defaultNodeBaseName, islandID)
+	nodeName := fmt.Sprintf("%s@%s", defaultNodeBaseName, hiveID)
 
-	opaRegion, err := openOrCreateOpaRegion(opaShmPrefix+islandID, nodeUUID)
+	opaRegion, err := openOrCreateOpaRegion(opaShmPrefix+hiveID, nodeUUID)
 	if err != nil {
 		log.Fatalf("failed to open opa shm: %v", err)
 	}
 
 	service := &Service{
-		islandID:  islandID,
+		hiveID:    hiveID,
 		nodeUUID:  nodeUUID,
 		nodeName:  nodeName,
 		opaRegion: opaRegion,
@@ -269,20 +269,20 @@ func ensureDirs() error {
 	return nil
 }
 
-func loadIslandID() (string, error) {
-	path := filepath.Join(configDir, "island.yaml")
+func loadHiveID() (string, error) {
+	path := filepath.Join(configDir, "hive.yaml")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
-	var cfg IslandConfig
+	var cfg HiveConfig
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return "", err
 	}
-	if cfg.IslandID == "" {
-		return "", errors.New("island_id missing")
+	if cfg.HiveID == "" {
+		return "", errors.New("hive_id missing")
 	}
-	return cfg.IslandID, nil
+	return cfg.HiveID, nil
 }
 
 func loadOrCreateUUID(dir, base string) (uuid.UUID, error) {
@@ -672,7 +672,7 @@ func (s *Service) handleQuery(msg Message) {
 		meta, rego := readCurrentPolicy()
 		resp := map[string]any{
 			"status":      "ok",
-			"island":      s.islandID,
+			"hive":        s.hiveID,
 			"version":     meta.Version,
 			"rego":        rego,
 			"hash":        meta.Hash,
@@ -684,7 +684,7 @@ func (s *Service) handleQuery(msg Message) {
 		current, _ := readMetadata(filepath.Join(stateDir, "current", "metadata.json"))
 		staged, _ := readMetadata(filepath.Join(stateDir, "staged", "metadata.json"))
 		resp := map[string]any{
-			"island":          s.islandID,
+			"hive":            s.hiveID,
 			"current_version": current.Version,
 			"current_hash":    current.Hash,
 			"staged_version":  staged.Version,
@@ -719,9 +719,9 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 			CompiledAt: time.Now().UTC().Format(time.RFC3339),
 			WasmSize:   len(wasm),
 		}
-        if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta, cfg.Rego); err != nil {
-            return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
-        }
+		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta, cfg.Rego); err != nil {
+			return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
+		}
 		if action == "compile_apply" || autoApply {
 			if err := s.applyPolicy(version); err != nil {
 				code, detail := classifyOpaError(err)
@@ -769,9 +769,9 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 			CompiledAt: time.Now().UTC().Format(time.RFC3339),
 			WasmSize:   len(wasm),
 		}
-        if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta, cfg.Rego); err != nil {
-            return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
-        }
+		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta, cfg.Rego); err != nil {
+			return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
+		}
 		if broadcast {
 			s.sendConfigResponse(src, action, version, "ok", meta, compileMs)
 		}
@@ -875,7 +875,7 @@ func (s *Service) respondConfigError(src, action string, version uint64, code, d
 			"action":       action,
 			"version":      version,
 			"status":       "error",
-			"island":       s.islandID,
+			"hive":         s.hiveID,
 			"error_code":   code,
 			"error_detail": detail,
 		}
@@ -892,7 +892,7 @@ func (s *Service) sendConfigResponse(dst, action string, version uint64, status 
 		"action":          action,
 		"version":         version,
 		"status":          status,
-		"island":          s.islandID,
+		"hive":            s.hiveID,
 		"compile_time_ms": compileMs,
 		"wasm_size_bytes": meta.WasmSize,
 		"hash":            meta.Hash,

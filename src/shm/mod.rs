@@ -33,7 +33,7 @@ const SEQLOCK_READ_TIMEOUT_MS: u64 = 5;
 pub const MAX_NODES: u32 = 1024;
 pub const MAX_STATIC_ROUTES: u32 = 256;
 pub const MAX_VPN_ASSIGNMENTS: u32 = 256;
-pub const MAX_REMOTE_ISLANDS: u32 = 16;
+pub const MAX_REMOTE_HIVES: u32 = 16;
 pub const MAX_REMOTE_NODES: u32 = 1024;
 pub const MAX_REMOTE_ROUTES: u32 = 256;
 pub const MAX_REMOTE_VPNS: u32 = 256;
@@ -93,8 +93,8 @@ pub struct ShmHeader {
     pub updated_at: u64,
     pub heartbeat: u64,
 
-    pub island_id: [u8; 64],
-    pub island_id_len: u16,
+    pub hive_id: [u8; 64],
+    pub hive_id_len: u16,
 
     pub router_name: [u8; 64],
     pub router_name_len: u16,
@@ -138,8 +138,8 @@ pub struct ConfigHeader {
     pub vpn_assignment_count: u32,
     pub config_version: u64,
 
-    pub island_id: [u8; 64],
-    pub island_id_len: u16,
+    pub hive_id: [u8; 64],
+    pub hive_id_len: u16,
 
     pub created_at: u64,
     pub updated_at: u64,
@@ -155,8 +155,8 @@ pub struct StaticRouteEntry {
     pub match_kind: u8,
     pub action: u8,
 
-    pub next_hop_island: [u8; 32],
-    pub next_hop_island_len: u8,
+    pub next_hop_hive: [u8; 32],
+    pub next_hop_hive_len: u8,
     pub _pad: [u8; 3],
 
     pub metric: u32,
@@ -194,7 +194,7 @@ pub struct LsaHeader {
 
     pub seq: AtomicU64,
 
-    pub island_count: u32,
+    pub hive_count: u32,
     pub total_node_count: u32,
     pub total_route_count: u32,
     pub total_vpn_count: u32,
@@ -202,8 +202,8 @@ pub struct LsaHeader {
     pub created_at: u64,
     pub updated_at: u64,
 
-    pub local_island_id: [u8; 64],
-    pub local_island_id_len: u16,
+    pub local_hive_id: [u8; 64],
+    pub local_hive_id_len: u16,
 
     pub _reserved: [u8; 38],
 }
@@ -238,9 +238,9 @@ pub struct OpaHeader {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct RemoteIslandEntry {
-    pub island_id: [u8; 64],
-    pub island_id_len: u16,
+pub struct RemoteHiveEntry {
+    pub hive_id: [u8; 64],
+    pub hive_id_len: u16,
 
     pub last_lsa_seq: u64,
     pub last_updated: u64,
@@ -259,7 +259,7 @@ pub struct RemoteNodeEntry {
     pub name_len: u16,
 
     pub vpn_id: u32,
-    pub island_index: u16,
+    pub hive_index: u16,
 
     pub flags: u16,
     pub _reserved: [u8; 6],
@@ -273,14 +273,14 @@ pub struct RemoteRouteEntry {
     pub match_kind: u8,
     pub action: u8,
 
-    pub next_hop_island: [u8; 32],
-    pub next_hop_island_len: u8,
+    pub next_hop_hive: [u8; 32],
+    pub next_hop_hive_len: u8,
     pub _pad: [u8; 3],
 
     pub metric: u32,
     pub priority: u16,
     pub flags: u16,
-    pub island_index: u16,
+    pub hive_index: u16,
     pub _reserved: [u8; 14],
 }
 
@@ -296,7 +296,7 @@ pub struct RemoteVpnEntry {
     pub priority: u16,
     pub flags: u16,
 
-    pub island_index: u16,
+    pub hive_index: u16,
     pub _reserved: [u8; 18],
 }
 
@@ -306,7 +306,7 @@ struct RegionLayout {
     node_offset: usize,
     static_offset: usize,
     vpn_offset: usize,
-    island_offset: usize,
+    hive_offset: usize,
     remote_node_offset: usize,
     remote_route_offset: usize,
     remote_vpn_offset: usize,
@@ -323,7 +323,7 @@ pub struct ShmSnapshot {
 pub struct ShmHeaderSnapshot {
     pub router_uuid: Uuid,
     pub router_name: String,
-    pub island_id: String,
+    pub hive_id: String,
     pub is_gateway: bool,
     pub node_count: u32,
     pub heartbeat: u64,
@@ -350,7 +350,7 @@ pub struct ConfigHeaderSnapshot {
 #[derive(Debug, Clone)]
 pub struct LsaSnapshot {
     pub header: LsaHeaderSnapshot,
-    pub islands: Vec<RemoteIslandEntry>,
+    pub hives: Vec<RemoteHiveEntry>,
     pub nodes: Vec<RemoteNodeEntry>,
     pub routes: Vec<RemoteRouteEntry>,
     pub vpns: Vec<RemoteVpnEntry>,
@@ -358,7 +358,7 @@ pub struct LsaSnapshot {
 
 #[derive(Debug, Clone, Copy)]
 pub struct LsaHeaderSnapshot {
-    pub island_count: u32,
+    pub hive_count: u32,
     pub total_node_count: u32,
     pub total_route_count: u32,
     pub total_vpn_count: u32,
@@ -429,14 +429,14 @@ impl RouterRegionWriter {
     pub fn open_or_create(
         name: &str,
         router_uuid: Uuid,
-        island_id: &str,
+        hive_id: &str,
         router_name: &str,
         is_gateway: bool,
     ) -> Result<Self, ShmError> {
         validate_name(name)?;
         let layout = layout_router();
         let mmap = open_or_create_region(name, layout.total_len, |mmap| {
-            initialize_router_header(mmap, router_uuid, island_id, router_name, is_gateway);
+            initialize_router_header(mmap, router_uuid, hive_id, router_name, is_gateway);
         })?;
         Ok(Self {
             name: name.to_string(),
@@ -605,11 +605,11 @@ impl RouterRegionReader {
 }
 
 impl ConfigRegionWriter {
-    pub fn open_or_create(name: &str, owner_uuid: Uuid, island_id: &str) -> Result<Self, ShmError> {
+    pub fn open_or_create(name: &str, owner_uuid: Uuid, hive_id: &str) -> Result<Self, ShmError> {
         validate_name(name)?;
         let layout = layout_config();
         let mmap = open_or_create_region(name, layout.total_len, |mmap| {
-            initialize_config_header(mmap, owner_uuid, island_id);
+            initialize_config_header(mmap, owner_uuid, hive_id);
         })?;
         Ok(Self {
             name: name.to_string(),
@@ -738,12 +738,12 @@ impl LsaRegionWriter {
     pub fn open_or_create(
         name: &str,
         gateway_uuid: Uuid,
-        island_id: &str,
+        hive_id: &str,
     ) -> Result<Self, ShmError> {
         validate_name(name)?;
         let layout = layout_lsa();
         let mmap = open_or_create_region(name, layout.total_len, |mmap| {
-            initialize_lsa_header(mmap, gateway_uuid, island_id);
+            initialize_lsa_header(mmap, gateway_uuid, hive_id);
         })?;
         Ok(Self {
             name: name.to_string(),
@@ -767,15 +767,15 @@ impl LsaRegionWriter {
 
     pub fn write_snapshot(
         &mut self,
-        islands: &[RemoteIslandEntry],
+        hives: &[RemoteHiveEntry],
         nodes: &[RemoteNodeEntry],
         routes: &[RemoteRouteEntry],
         vpns: &[RemoteVpnEntry],
     ) -> Result<(), ShmError> {
-        if islands.len() > MAX_REMOTE_ISLANDS as usize {
+        if hives.len() > MAX_REMOTE_HIVES as usize {
             return Err(ShmError::ValueTooLong {
-                len: islands.len(),
-                max: MAX_REMOTE_ISLANDS as usize,
+                len: hives.len(),
+                max: MAX_REMOTE_HIVES as usize,
             });
         }
         if nodes.len() > MAX_REMOTE_NODES as usize {
@@ -796,9 +796,9 @@ impl LsaRegionWriter {
                 max: MAX_REMOTE_VPNS as usize,
             });
         }
-        let (header, island_entries, node_entries, route_entries, vpn_entries): (
+        let (header, hive_entries, node_entries, route_entries, vpn_entries): (
             &mut LsaHeader,
-            &mut [RemoteIslandEntry],
+            &mut [RemoteHiveEntry],
             &mut [RemoteNodeEntry],
             &mut [RemoteRouteEntry],
             &mut [RemoteVpnEntry],
@@ -806,8 +806,8 @@ impl LsaRegionWriter {
             .ok_or(ShmError::InvalidHeader)?;
 
         seqlock_begin_write(&header.seq);
-        for entry in island_entries.iter_mut() {
-            *entry = empty_remote_island();
+        for entry in hive_entries.iter_mut() {
+            *entry = empty_remote_hive();
         }
         for entry in node_entries.iter_mut() {
             *entry = empty_remote_node();
@@ -819,8 +819,8 @@ impl LsaRegionWriter {
             *entry = empty_remote_vpn();
         }
 
-        for (idx, island) in islands.iter().enumerate() {
-            island_entries[idx] = *island;
+        for (idx, hive) in hives.iter().enumerate() {
+            hive_entries[idx] = *hive;
         }
         for (idx, node) in nodes.iter().enumerate() {
             node_entries[idx] = *node;
@@ -832,7 +832,7 @@ impl LsaRegionWriter {
             vpn_entries[idx] = *vpn;
         }
 
-        header.island_count = islands.len() as u32;
+        header.hive_count = hives.len() as u32;
         header.total_node_count = nodes.len() as u32;
         header.total_route_count = routes.len() as u32;
         header.total_vpn_count = vpns.len() as u32;
@@ -850,9 +850,9 @@ impl LsaRegionWriter {
         header_mut::<LsaHeader>(&mut self.mmap, self.layout.header_offset)
     }
 
-    fn islands_mut(&mut self) -> Option<&mut [RemoteIslandEntry]> {
-        let offset = self.layout.island_offset;
-        slice_mut::<RemoteIslandEntry>(&mut self.mmap, offset, MAX_REMOTE_ISLANDS as usize)
+    fn hives_mut(&mut self) -> Option<&mut [RemoteHiveEntry]> {
+        let offset = self.layout.hive_offset;
+        slice_mut::<RemoteHiveEntry>(&mut self.mmap, offset, MAX_REMOTE_HIVES as usize)
     }
 
     fn remote_nodes_mut(&mut self) -> Option<&mut [RemoteNodeEntry]> {
@@ -963,7 +963,7 @@ fn layout_router() -> RegionLayout {
         node_offset,
         static_offset: 0,
         vpn_offset: 0,
-        island_offset: 0,
+        hive_offset: 0,
         remote_node_offset: 0,
         remote_route_offset: 0,
         remote_vpn_offset: 0,
@@ -986,7 +986,7 @@ fn layout_config() -> RegionLayout {
         node_offset: 0,
         static_offset,
         vpn_offset,
-        island_offset: 0,
+        hive_offset: 0,
         remote_node_offset: 0,
         remote_route_offset: 0,
         remote_vpn_offset: 0,
@@ -996,14 +996,14 @@ fn layout_config() -> RegionLayout {
 
 fn layout_lsa() -> RegionLayout {
     let header_size = size_of::<LsaHeader>();
-    let island_size = size_of::<RemoteIslandEntry>() * MAX_REMOTE_ISLANDS as usize;
+    let hive_size = size_of::<RemoteHiveEntry>() * MAX_REMOTE_HIVES as usize;
     let node_size = size_of::<RemoteNodeEntry>() * MAX_REMOTE_NODES as usize;
     let route_size = size_of::<RemoteRouteEntry>() * MAX_REMOTE_ROUTES as usize;
     let vpn_size = size_of::<RemoteVpnEntry>() * MAX_REMOTE_VPNS as usize;
 
     let header_offset = 0;
-    let island_offset = align_up(header_offset + header_size, REGION_ALIGNMENT);
-    let remote_node_offset = align_up(island_offset + island_size, REGION_ALIGNMENT);
+    let hive_offset = align_up(header_offset + header_size, REGION_ALIGNMENT);
+    let remote_node_offset = align_up(hive_offset + hive_size, REGION_ALIGNMENT);
     let remote_route_offset = align_up(remote_node_offset + node_size, REGION_ALIGNMENT);
     let remote_vpn_offset = align_up(remote_route_offset + route_size, REGION_ALIGNMENT);
     let total_len = align_up(remote_vpn_offset + vpn_size, REGION_ALIGNMENT);
@@ -1013,7 +1013,7 @@ fn layout_lsa() -> RegionLayout {
         node_offset: 0,
         static_offset: 0,
         vpn_offset: 0,
-        island_offset,
+        hive_offset,
         remote_node_offset,
         remote_route_offset,
         remote_vpn_offset,
@@ -1149,7 +1149,7 @@ fn is_opa_region_valid(mmap: &[u8]) -> bool {
 fn initialize_router_header(
     mmap: &mut MmapMut,
     router_uuid: Uuid,
-    island_id: &str,
+    hive_id: &str,
     router_name: &str,
     is_gateway: bool,
 ) {
@@ -1166,7 +1166,7 @@ fn initialize_router_header(
         header.created_at = now_epoch_ms();
         header.updated_at = header.created_at;
         header.heartbeat = header.created_at;
-        header.island_id_len = copy_bytes_with_len(&mut header.island_id, island_id) as u16;
+        header.hive_id_len = copy_bytes_with_len(&mut header.hive_id, hive_id) as u16;
         header.router_name_len = copy_bytes_with_len(&mut header.router_name, router_name) as u16;
         header.is_gateway = if is_gateway { 1 } else { 0 };
         header.opa_policy_version = 0;
@@ -1174,7 +1174,7 @@ fn initialize_router_header(
     }
 }
 
-fn initialize_config_header(mmap: &mut MmapMut, owner_uuid: Uuid, island_id: &str) {
+fn initialize_config_header(mmap: &mut MmapMut, owner_uuid: Uuid, hive_id: &str) {
     if let Some(header) = header_mut::<ConfigHeader>(mmap, 0) {
         header.magic = CONFIG_MAGIC;
         header.version = CONFIG_VERSION;
@@ -1186,13 +1186,13 @@ fn initialize_config_header(mmap: &mut MmapMut, owner_uuid: Uuid, island_id: &st
         header.static_route_count = 0;
         header.vpn_assignment_count = 0;
         header.config_version = 1;
-        header.island_id_len = copy_bytes_with_len(&mut header.island_id, island_id) as u16;
+        header.hive_id_len = copy_bytes_with_len(&mut header.hive_id, hive_id) as u16;
         header.created_at = now_epoch_ms();
         header.updated_at = header.created_at;
     }
 }
 
-fn initialize_lsa_header(mmap: &mut MmapMut, gateway_uuid: Uuid, island_id: &str) {
+fn initialize_lsa_header(mmap: &mut MmapMut, gateway_uuid: Uuid, hive_id: &str) {
     if let Some(header) = header_mut::<LsaHeader>(mmap, 0) {
         header.magic = LSA_MAGIC;
         header.version = LSA_VERSION;
@@ -1201,12 +1201,12 @@ fn initialize_lsa_header(mmap: &mut MmapMut, gateway_uuid: Uuid, island_id: &str
         header.owner_start_time = now_epoch_ms();
         header.heartbeat = now_epoch_ms();
         header.seq = AtomicU64::new(0);
-        header.island_count = 0;
+        header.hive_count = 0;
         header.total_node_count = 0;
         header.total_route_count = 0;
         header.total_vpn_count = 0;
-        header.local_island_id_len =
-            copy_bytes_with_len(&mut header.local_island_id, island_id) as u16;
+        header.local_hive_id_len =
+            copy_bytes_with_len(&mut header.local_hive_id, hive_id) as u16;
         header.created_at = now_epoch_ms();
         header.updated_at = header.created_at;
     }
@@ -1239,12 +1239,12 @@ fn read_router_snapshot(
         if s1 == s2 {
             let router_uuid = Uuid::from_bytes(header.router_uuid);
             let router_name = read_string(&header.router_name, header.router_name_len as usize);
-            let island_id = read_string(&header.island_id, header.island_id_len as usize);
+            let hive_id = read_string(&header.hive_id, header.hive_id_len as usize);
             return Some(ShmSnapshot {
                 header: ShmHeaderSnapshot {
                     router_uuid,
                     router_name,
-                    island_id,
+                    hive_id,
                     is_gateway: header.is_gateway != 0,
                     node_count: header.node_count,
                     heartbeat: header.heartbeat,
@@ -1326,15 +1326,15 @@ fn read_lsa_snapshot(
             continue;
         }
         atomic::fence(Ordering::Acquire);
-        let island_count = header.island_count as usize;
+        let hive_count = header.hive_count as usize;
         let total_nodes = header.total_node_count as usize;
         let total_routes = header.total_route_count as usize;
         let total_vpns = header.total_vpn_count as usize;
 
-        let islands = read_slice::<RemoteIslandEntry>(
+        let hives = read_slice::<RemoteHiveEntry>(
             mmap,
-            layout.island_offset,
-            MAX_REMOTE_ISLANDS as usize,
+            layout.hive_offset,
+            MAX_REMOTE_HIVES as usize,
         )?;
         let nodes = read_slice::<RemoteNodeEntry>(
             mmap,
@@ -1349,9 +1349,9 @@ fn read_lsa_snapshot(
         let vpns =
             read_slice::<RemoteVpnEntry>(mmap, layout.remote_vpn_offset, MAX_REMOTE_VPNS as usize)?;
 
-        let mut island_snapshot = Vec::new();
-        for island in islands.iter().take(island_count) {
-            island_snapshot.push(*island);
+        let mut hive_snapshot = Vec::new();
+        for hive in hives.iter().take(hive_count) {
+            hive_snapshot.push(*hive);
         }
         let mut node_snapshot = Vec::new();
         for node in nodes.iter().take(total_nodes) {
@@ -1370,13 +1370,13 @@ fn read_lsa_snapshot(
         if s1 == s2 {
             return Some(LsaSnapshot {
                 header: LsaHeaderSnapshot {
-                    island_count: header.island_count,
+                    hive_count: header.hive_count,
                     total_node_count: header.total_node_count,
                     total_route_count: header.total_route_count,
                     total_vpn_count: header.total_vpn_count,
                     heartbeat: header.heartbeat,
                 },
-                islands: island_snapshot,
+                hives: hive_snapshot,
                 nodes: node_snapshot,
                 routes: route_snapshot,
                 vpns: vpn_snapshot,
@@ -1537,17 +1537,17 @@ fn lsa_header_and_entries_mut<'a>(
     layout: &RegionLayout,
 ) -> Option<(
     &'a mut LsaHeader,
-    &'a mut [RemoteIslandEntry],
+    &'a mut [RemoteHiveEntry],
     &'a mut [RemoteNodeEntry],
     &'a mut [RemoteRouteEntry],
     &'a mut [RemoteVpnEntry],
 )> {
     let header_offset = layout.header_offset;
-    let islands_offset = layout.island_offset;
+    let hives_offset = layout.hive_offset;
     let nodes_offset = layout.remote_node_offset;
     let routes_offset = layout.remote_route_offset;
     let vpns_offset = layout.remote_vpn_offset;
-    let islands_len = MAX_REMOTE_ISLANDS as usize;
+    let hives_len = MAX_REMOTE_HIVES as usize;
     let nodes_len = MAX_REMOTE_NODES as usize;
     let routes_len = MAX_REMOTE_ROUTES as usize;
     let vpns_len = MAX_REMOTE_VPNS as usize;
@@ -1561,13 +1561,13 @@ fn lsa_header_and_entries_mut<'a>(
     }
     unsafe {
         let header_ptr = base.add(header_offset) as *mut LsaHeader;
-        let islands_ptr = base.add(islands_offset) as *mut RemoteIslandEntry;
+        let hives_ptr = base.add(hives_offset) as *mut RemoteHiveEntry;
         let nodes_ptr = base.add(nodes_offset) as *mut RemoteNodeEntry;
         let routes_ptr = base.add(routes_offset) as *mut RemoteRouteEntry;
         let vpns_ptr = base.add(vpns_offset) as *mut RemoteVpnEntry;
         Some((
             &mut *header_ptr,
-            std::slice::from_raw_parts_mut(islands_ptr, islands_len),
+            std::slice::from_raw_parts_mut(hives_ptr, hives_len),
             std::slice::from_raw_parts_mut(nodes_ptr, nodes_len),
             std::slice::from_raw_parts_mut(routes_ptr, routes_len),
             std::slice::from_raw_parts_mut(vpns_ptr, vpns_len),
@@ -1637,8 +1637,8 @@ fn empty_static_route() -> StaticRouteEntry {
         prefix_len: 0,
         match_kind: 0,
         action: 0,
-        next_hop_island: [0u8; 32],
-        next_hop_island_len: 0,
+        next_hop_hive: [0u8; 32],
+        next_hop_hive_len: 0,
         _pad: [0u8; 3],
         metric: 0,
         priority: 0,
@@ -1661,10 +1661,10 @@ fn empty_vpn_assignment() -> VpnAssignment {
     }
 }
 
-fn empty_remote_island() -> RemoteIslandEntry {
-    RemoteIslandEntry {
-        island_id: [0u8; 64],
-        island_id_len: 0,
+fn empty_remote_hive() -> RemoteHiveEntry {
+    RemoteHiveEntry {
+        hive_id: [0u8; 64],
+        hive_id_len: 0,
         last_lsa_seq: 0,
         last_updated: 0,
         flags: 0,
@@ -1680,7 +1680,7 @@ fn empty_remote_node() -> RemoteNodeEntry {
         name: [0u8; 256],
         name_len: 0,
         vpn_id: 0,
-        island_index: 0,
+        hive_index: 0,
         flags: 0,
         _reserved: [0u8; 6],
     }
@@ -1692,13 +1692,13 @@ fn empty_remote_route() -> RemoteRouteEntry {
         prefix_len: 0,
         match_kind: 0,
         action: 0,
-        next_hop_island: [0u8; 32],
-        next_hop_island_len: 0,
+        next_hop_hive: [0u8; 32],
+        next_hop_hive_len: 0,
         _pad: [0u8; 3],
         metric: 0,
         priority: 0,
         flags: 0,
-        island_index: 0,
+        hive_index: 0,
         _reserved: [0u8; 14],
     }
 }
@@ -1712,7 +1712,7 @@ fn empty_remote_vpn() -> RemoteVpnEntry {
         vpn_id: 0,
         priority: 0,
         flags: 0,
-        island_index: 0,
+        hive_index: 0,
         _reserved: [0u8; 18],
     }
 }

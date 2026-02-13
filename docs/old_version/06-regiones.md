@@ -12,12 +12,12 @@ Este documento detalla las dos regiones de memoria compartida que NO son de rout
 
 | Región | Writer | Propósito |
 |--------|--------|-----------|
-| `jsr-config-<island>` | SY.config.routes | Rutas estáticas, tabla VPN |
-| `jsr-lsa-<island>` | Gateway | Topología de islas remotas |
+| `jsr-config-<hive>` | SY.config.routes | Rutas estáticas, tabla VPN |
+| `jsr-lsa-<hive>` | Gateway | Topología de islas remotas |
 
 ---
 
-## 2. Región Config: jsr-config-<island>
+## 2. Región Config: jsr-config-<hive>
 
 ### 2.1 Propósito
 
@@ -28,7 +28,7 @@ Almacena la configuración centralizada de la isla:
 
 ### 2.2 Writer Único
 
-Solo `SY.config.routes@<island>` escribe en esta región. Los routers solo leen.
+Solo `SY.config.routes@<hive>` escribe en esta región. Los routers solo leen.
 
 ### 2.3 API de SY.config.routes
 
@@ -50,7 +50,7 @@ Solo `SY.config.routes@<island>` escribe en esta región. Los routers solo leen.
     "prefix": "AI.ventas.*",
     "match_kind": "PREFIX",
     "action": "FORWARD",
-    "next_hop_island": "",
+    "next_hop_hive": "",
     "metric": 10,
     "priority": 100
   }
@@ -113,7 +113,7 @@ routes:
   - prefix: "AI.backup.*"
     match_kind: PREFIX
     action: FORWARD
-    next_hop_island: "disaster-recovery"
+    next_hop_hive: "disaster-recovery"
     metric: 10
     priority: 100
     
@@ -143,7 +143,7 @@ vpns:
 4. TODOS los SY.config.routes (local + remotos) reciben el broadcast
 5. Cada SY.config.routes:
    - Valida la config
-   - Escribe en su jsr-config-<island> local
+   - Escribe en su jsr-config-<hive> local
    - Incrementa config_version
    - Persiste en YAML local
 6. Routers detectan cambio en SHM, actualizan FIB
@@ -241,7 +241,7 @@ Todo proceso que recibe CONFIG_CHANGED **DEBE** responder con CONFIG_RESPONSE pa
   "payload": {
     "subsystem": "routes",
     "version": 42,
-    "island": "production",
+    "hive": "production",
     "node": "SY.config.routes@production",
     "status": "ok"
   }
@@ -265,7 +265,7 @@ Todo proceso que recibe CONFIG_CHANGED **DEBE** responder con CONFIG_RESPONSE pa
   "payload": {
     "subsystem": "routes",
     "version": 42,
-    "island": "staging",
+    "hive": "staging",
     "node": "SY.config.routes@staging",
     "status": "error",
     "error_code": "INVALID_PATTERN",
@@ -342,7 +342,7 @@ fn check_config_version(&mut self) {
 
 ---
 
-## 3. Región LSA: jsr-lsa-<island>
+## 3. Región LSA: jsr-lsa-<hive>
 
 ### 3.1 Propósito
 
@@ -358,7 +358,7 @@ Para cada isla remota, se almacena:
 
 | Dato | Descripción |
 |------|-------------|
-| `island_id` | Nombre de la isla remota |
+| `hive_id` | Nombre de la isla remota |
 | `last_lsa_seq` | Último número de secuencia LSA recibido |
 | `last_updated` | Timestamp de última actualización |
 | `nodes[]` | Nodos de esa isla (uuid, name, vpn_id) |
@@ -370,7 +370,7 @@ Para cada isla remota, se almacena:
 ```
 1. Gateway recibe LSA de isla remota
 2. Gateway valida seq > last_seq (evitar duplicados)
-3. Gateway escribe en jsr-lsa-<local-island>
+3. Gateway escribe en jsr-lsa-<local-hive>
 4. Routers leen jsr-lsa y actualizan FIB
 ```
 
@@ -379,12 +379,12 @@ Para cada isla remota, se almacena:
 Si no se recibe LSA por `dead_interval_ms`:
 
 ```rust
-fn check_remote_islands(&mut self) {
+fn check_remote_hives(&mut self) {
     let now = now_epoch_ms();
     
-    for island in self.lsa_region.islands.iter_mut() {
-        if now - island.last_updated > self.dead_interval_ms {
-            island.flags |= FLAG_STALE;
+    for hive in self.lsa_region.hives.iter_mut() {
+        if now - hive.last_updated > self.dead_interval_ms {
+            hive.flags |= FLAG_STALE;
             // Los routers deberían ignorar nodos de islas stale
         }
     }
@@ -414,10 +414,10 @@ impl Router {
         // 2. Leer LSA (si no soy gateway)
         if !self.is_gateway {
             if let Some(lsa) = self.map_region(&self.lsa_shm_name) {
-                for island in lsa.islands.iter() {
-                    if island.flags & FLAG_STALE == 0 {
-                        for node in island.nodes.iter() {
-                            self.add_remote_route(node, &island.island_id);
+                for hive in lsa.hives.iter() {
+                    if hive.flags & FLAG_STALE == 0 {
+                        for node in hive.nodes.iter() {
+                            self.add_remote_route(node, &hive.hive_id);
                         }
                     }
                 }
@@ -490,7 +490,7 @@ fn assign_vpn(&self, node_name: &str) -> u32 {
 
 | Acción | Efecto |
 |--------|--------|
-| `FORWARD` | Rutear normalmente, o a `next_hop_island` si está definido |
+| `FORWARD` | Rutear normalmente, o a `next_hop_hive` si está definido |
 | `DROP` | Descartar mensaje (blackhole) |
 
 ### 6.2 Prioridad
@@ -509,14 +509,14 @@ Las rutas estáticas se evalúan **antes** del lookup normal y tienen prioridad 
 ```yaml
 - prefix: "AI.backup.*"
   action: FORWARD
-  next_hop_island: "disaster-recovery"
+  next_hop_hive: "disaster-recovery"
 ```
 
 **Documentar ruta existente (sin efecto real):**
 ```yaml
 - prefix: "AI.soporte.*"
   action: FORWARD
-  next_hop_island: ""  # Local
+  next_hop_hive: ""  # Local
 ```
 
 ---

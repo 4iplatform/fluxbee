@@ -45,7 +45,7 @@ Objetivo: revisar punto por punto y marcar pendientes.
 
 ### 6.1 Lifecycle OPA (router)
 - [x] `OPA_RELOAD` (system broadcast)
-- [x] Carga WASM desde SHM `/dev/shm/jsr-opa-<island>`
+- [x] Carga WASM desde SHM `/dev/shm/jsr-opa-<hive>`
 - [x] SHM: `opa_policy_version` + `opa_load_status`
 
 ### 6.2 Resolver real
@@ -74,5 +74,5 @@ Objetivo: revisar punto por punto y marcar pendientes.
 ## Notas
 
 - SY.opa.rules es **control plane** (Go), no router. Compila Rego → WASM y escribe en SHM.
-- Routers (Rust) leen WASM de `/dev/shm/jsr-opa-<island>` y ejecutan con Wasmtime.
+- Routers (Rust) leen WASM de `/dev/shm/jsr-opa-<hive>` y ejecutan con Wasmtime.
 - Si la policy usa builtins no implementados → `OPA_ERROR`.

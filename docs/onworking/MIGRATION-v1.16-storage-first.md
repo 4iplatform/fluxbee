@@ -24,7 +24,7 @@ Entregar una base funcional y estable para desacoplar el router de persistencia:
   - `/var/lib/fluxbee`
   - `/var/run/fluxbee`
 - `SY.admin` y `SY.orchestrator` validados para `role=motherbee` (aceptando `mother` solo como compatibilidad transitoria).
-- `add_island` actualizado para generar worker con:
+- `add_hive` actualizado para generar worker con:
   - `role: worker`
   - bloque `nats` embebido.
 - `RouterConfig` extendido con configuracion NATS:
@@ -61,7 +61,7 @@ Entregar una base funcional y estable para desacoplar el router de persistencia:
 - `database.url` se toma de:
   1. `FLUXBEE_DATABASE_URL`
   2. `JSR_DATABASE_URL`
-  3. `island.yaml -> database.url`
+  3. `hive.yaml -> database.url`
 
 ## Pendiente inmediato (siguiente bloque)
 
@@ -81,7 +81,7 @@ Entregar una base funcional y estable para desacoplar el router de persistencia:
   - bootstrap local
   - watchdog de servicios criticos
   - shutdown ordenado
-- `add_island` ajustado para workers:
+- `add_hive` ajustado para workers:
   - ya no instala ni arranca `sy-orchestrator` remoto
   - instala units worker (`rt-gateway`, `sy-config-routes`, `sy-opa-rules`, `sy-identity` opcional)
   - corrige path remoto de config a `/etc/fluxbee/sy-config-routes.yaml`
@@ -93,11 +93,11 @@ Entregar una base funcional y estable para desacoplar el router de persistencia:
 
 ## Actualizacion Iteracion 4 (hardening orchestrator)
 
-- `add_island` corrige bootstrap SSH por clave:
+- `add_hive` corrige bootstrap SSH por clave:
   - `authorized_keys` ahora se configura en el usuario de bootstrap (`administrator`) para que `ssh/scp -i` funcionen de forma consistente.
 - Hardening SSH opcional implementado:
   - deshabilita `PasswordAuthentication` y reinicia `sshd/ssh` cuando se activa flag
-  - activacion por request `add_island.harden_ssh=true` o env `FLUXBEE_ADD_ISLAND_HARDEN_SSH=1` (compat: `JSR_ADD_ISLAND_HARDEN_SSH=1`)
+  - activacion por request `add_hive.harden_ssh=true` o env `FLUXBEE_ADD_HIVE_HARDEN_SSH=1` (compat: `JSR_ADD_HIVE_HARDEN_SSH=1`)
 - `SY.identity` queda en modo opcional temporal en orchestrator:
   - se inicia/watchdog/shutdown solo si existe `/usr/bin/sy-identity` (ctx pendiente fuera de este bloque).
 - `scripts/install.sh` valida ejecutables requeridos para worker:

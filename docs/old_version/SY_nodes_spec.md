@@ -77,7 +77,7 @@ SY.admin
     │
     │         ┌───────────────────────────────────────┐
     │         ▼                                       ▼
-    │   SY.<nodo>@island-A                    SY.<nodo>@island-B
+    │   SY.<nodo>@hive-A                    SY.<nodo>@hive-B
     │         │                                       │
     │         │ (validate, apply)                     │ (validate, apply)
     │         │                                       │
@@ -109,8 +109,8 @@ SY.admin
   "payload": {
     "subsystem": "<subsystem>",
     "version": N,
-    "island": "<island-id>",
-    "node": "SY.<nodo>@<island>",
+    "hive": "<hive-id>",
+    "node": "SY.<nodo>@<hive>",
     "status": "ok|error",
     "error_code": "<code>",           // Solo si status=error
     "error_message": "<descripción>"  // Solo si status=error
@@ -138,7 +138,7 @@ Responsable de la configuración de rutas estáticas y tabla VPN.
 |---------|-------|
 | Lenguaje | Rust |
 | Nombre L2 | `SY.config.routes@<isla>` (uno por isla) |
-| Región SHM | `/dev/shm/jsr-config-<island>` |
+| Región SHM | `/dev/shm/jsr-config-<hive>` |
 | Persistencia disco | `/etc/json-router/sy-config-routes.yaml` |
 | Subsystems | `routes`, `vpn` |
 
@@ -214,7 +214,7 @@ Responsable de la configuración de rutas estáticas y tabla VPN.
   "payload": {
     "subsystem": "routes",
     "version": 42,
-    "island": "production",
+    "hive": "production",
     "node": "SY.config.routes@production",
     "status": "ok"
   }
@@ -228,7 +228,7 @@ Responsable de la configuración de rutas estáticas y tabla VPN.
   "payload": {
     "subsystem": "routes",
     "version": 42,
-    "island": "staging",
+    "hive": "staging",
     "node": "SY.config.routes@staging",
     "status": "error",
     "error_code": "INVALID_PATTERN",
@@ -304,7 +304,7 @@ Responsable de la compilación, distribución y gestión de policies OPA para ro
 | Lenguaje | **Go** (único nodo SY en Go) |
 | Nombre L2 | `SY.opa.rules@<isla>` (uno por isla) |
 | Compilador | OPA library embebida (`github.com/open-policy-agent/opa/compile`) |
-| Región SHM | `/dev/shm/jsr-opa-<island>` (WASM para routers) |
+| Región SHM | `/dev/shm/jsr-opa-<hive>` (WASM para routers) |
 | Persistencia disco | `/var/lib/json-router/opa/` |
 | Estado en RAM | Rego actual para respuesta rápida |
 
@@ -339,7 +339,7 @@ Responsable de la compilación, distribución y gestión de policies OPA para ro
 │  │  ├── staged/{policy.rego, metadata.json}      │             │
 │  │  └── backup/{policy.rego, metadata.json}      │             │
 │  │                                                │             │
-│  │  SHM (/dev/shm/jsr-opa-<island>):             │             │
+│  │  SHM (/dev/shm/jsr-opa-<hive>):             │             │
 │  │  └── Header + WASM bytes                      │             │
 │  │                                                │             │
 │  └───────────────────────────────────────────────┘             │
@@ -385,7 +385,7 @@ type OpaRulesState struct {
     LastErrorAt      *time.Time
     
     // Info
-    IslandID         string
+    HiveID         string
 }
 
 type Status int
@@ -402,7 +402,7 @@ const (
 Los routers leen el WASM compilado directamente de shared memory para máxima performance.
 
 ```
-/dev/shm/jsr-opa-<island>
+/dev/shm/jsr-opa-<hive>
 ┌────────────────────────────────────────────────────────────────┐
 │  Header (128 bytes):                                           │
 │  ├── magic: u32              = 0x4A534F50 ("JSOP")            │
@@ -438,7 +438,7 @@ sy-opa-rules (binario Go)
     ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 1. Leer configuración                                       │
-│    - /etc/json-router/island.yaml → island_id              │
+│    - /etc/json-router/hive.yaml → hive_id              │
 └─────────────────────────────────────────────────────────────┘
     │
     ▼
@@ -450,7 +450,7 @@ sy-opa-rules (binario Go)
     ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 3. Inicializar SHM                                          │
-│    - Crear/abrir /dev/shm/jsr-opa-<island>                 │
+│    - Crear/abrir /dev/shm/jsr-opa-<hive>                 │
 │    - Si existe policy en disco → cargar y escribir WASM    │
 │    - Si no existe → SHM vacío, status = OK, version = 0    │
 └─────────────────────────────────────────────────────────────┘
@@ -587,7 +587,7 @@ Cada SY.opa.rules responde a SY.admin:
     "action": "compile",
     "version": 43,
     "status": "ok",
-    "island": "staging",
+    "hive": "staging",
     "compile_time_ms": 1250,
     "wasm_size_bytes": 245000,
     "hash": "sha256:abc123..."
@@ -604,7 +604,7 @@ Cada SY.opa.rules responde a SY.admin:
     "action": "compile",
     "version": 43,
     "status": "error",
-    "island": "dev",
+    "hive": "dev",
     "error_code": "COMPILE_ERROR",
     "error_detail": "policy.rego:15: rego_parse_error: unexpected token"
   }
@@ -661,7 +661,7 @@ Cada SY.opa.rules responde a SY.admin:
 // Response
 {
   "payload": {
-    "island": "staging",
+    "hive": "staging",
     "current_version": 42,
     "current_hash": "sha256:abc123...",
     "staged_version": null,
@@ -882,7 +882,7 @@ Los routers pueden:
 ```rust
 impl Router {
     fn load_opa_policy(&mut self) -> Result<()> {
-        let shm = self.map_opa_region()?;  // /dev/shm/jsr-opa-<island>
+        let shm = self.map_opa_region()?;  // /dev/shm/jsr-opa-<hive>
         
         loop {
             // Seqlock read protocol
@@ -962,9 +962,9 @@ HTTP Response:
 {
   "status": "ok",
   "version": 43,
-  "islands": [
-    {"island": "produccion", "status": "ok", "compile_time_ms": 1100},
-    {"island": "staging", "status": "ok", "compile_time_ms": 1250}
+  "hives": [
+    {"hive": "produccion", "status": "ok", "compile_time_ms": 1100},
+    {"hive": "staging", "status": "ok", "compile_time_ms": 1250}
   ]
 }
 ```
@@ -988,7 +988,7 @@ HTTP Response:
 {
   "status": "ok",
   "version": 43,
-  "island": "staging",
+  "hive": "staging",
   "compile_time_ms": 1250
 }
 ```

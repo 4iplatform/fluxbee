@@ -4,7 +4,7 @@ set -eu
 BASE_ETC="/etc/fluxbee"
 BASE_STATE="/var/lib/fluxbee/state"
 BASE_RUN="/var/run/fluxbee"
-ISLAND_ID="sandbox"
+HIVE_ID="sandbox"
 ROUTER_NAME="RT.primary"
 
 mkdir -p "${BASE_ETC}/routers" \
@@ -12,20 +12,20 @@ mkdir -p "${BASE_ETC}/routers" \
   "${BASE_STATE}/nodes" \
   "${BASE_RUN}/routers"
 
-if [ ! -f "${BASE_ETC}/island.yaml" ]; then
-  cat > "${BASE_ETC}/island.yaml" <<EOF_ISLAND
-island_id: "${ISLAND_ID}"
-EOF_ISLAND
+if [ ! -f "${BASE_ETC}/hive.yaml" ]; then
+  cat > "${BASE_ETC}/hive.yaml" <<EOF_HIVE
+hive_id: "${HIVE_ID}"
+EOF_HIVE
 fi
 
-ROUTER_DIR="${BASE_ETC}/routers/${ROUTER_NAME}@${ISLAND_ID}"
+ROUTER_DIR="${BASE_ETC}/routers/${ROUTER_NAME}@${HIVE_ID}"
 mkdir -p "${ROUTER_DIR}"
 
 if [ ! -f "${ROUTER_DIR}/config.yaml" ]; then
   cat > "${ROUTER_DIR}/config.yaml" <<EOF_ROUTER
 router:
   name: ${ROUTER_NAME}
-  island_id: ${ISLAND_ID}
+  hive_id: ${HIVE_ID}
   is_gateway: false
 
 paths:

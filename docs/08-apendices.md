@@ -46,7 +46,7 @@
 
 - **Worker**: Isla hija. Stateless, reconstruible. Contiene router, NATS, SY.cognition, nodos AI/IO/WF. Músculo del cluster.
 
-- **island.yaml**: Archivo que define la identidad de la isla. Campo `role: motherbee` o `role: worker`.
+- **hive.yaml**: Archivo que define la identidad de la isla. Campo `role: motherbee` o `role: worker`.
 
 - **@isla**: Sufijo en nombres L2 que indica la isla. Agregado automáticamente por la librería de nodo.
 
@@ -60,13 +60,13 @@
 
 - **jsr-<uuid>**: Región de memoria compartida de un router. Contiene sus nodos conectados.
 
-- **jsr-config-<island>**: Región de configuración. Contiene rutas estáticas y tabla VPN. Writer: SY.config.routes.
+- **jsr-config-<hive>**: Región de configuración. Contiene rutas estáticas y tabla VPN. Writer: SY.config.routes.
 
-- **jsr-lsa-<island>**: Región de topología remota. Contiene nodos/rutas/VPNs de otras islas. Writer: Gateway.
+- **jsr-lsa-<hive>**: Región de topología remota. Contiene nodos/rutas/VPNs de otras islas. Writer: Gateway.
 
-- **jsr-identity-<island>**: Región de identidad. Contiene ILKs, ICHs, modules, degrees. Writer: SY.identity.
+- **jsr-identity-<hive>**: Región de identidad. Contiene ILKs, ICHs, modules, degrees. Writer: SY.identity.
 
-- **jsr-memory-<island>**: Región de índice cognitivo. Contiene inverted index de tags → event_ids. Writer: SY.cognition.
+- **jsr-memory-<hive>**: Región de índice cognitivo. Contiene inverted index de tags → event_ids. Writer: SY.cognition.
 
 - **Epoch/RCU**: Mecanismo de sincronización para un writer y múltiples readers. Writer usa shadow region + epoch bump + swap. Readers nunca copian, leen in-place.
 
@@ -88,7 +88,7 @@
 
 - **vpn_id**: Identificador de la zona. 0 = global (default).
 
-- **Tabla VPN**: Mapping de patterns a vpn_id. Vive en jsr-config-<island>.
+- **Tabla VPN**: Mapping de patterns a vpn_id. Vive en jsr-config-<hive>.
 
 - **Inmunidad SY.***: Los nodos SY.* y RT.* ignoran filtros VPN, ven todo.
 
@@ -116,7 +116,7 @@
 
 - **context_inhibition**: Supresión contextual de un evento/item. Permite reemplazo funcional sin borrado.
 
-- **jsr-memory-<island>**: Región SHM con índice invertido de tags → eventos. Writer: SY.cognition.
+- **jsr-memory-<hive>**: Región SHM con índice invertido de tags → eventos. Writer: SY.cognition.
 
 - **LanceDB**: Base de datos embebida para episodios y items. Cache reconstruible desde PostgreSQL.
 
@@ -151,7 +151,7 @@
 | Decisión | Razón |
 |----------|-------|
 | Naming con @isla obligatorio | Simplifica routing inter-isla (parsear @isla del destino) |
-| Librería agrega @isla automáticamente | El nodo no necesita saber su isla, la lee de island.yaml |
+| Librería agrega @isla automáticamente | El nodo no necesita saber su isla, la lee de hive.yaml |
 | Gateway único por isla | Evita ambigüedad de salida, simplifica modelo |
 | Seis regiones SHM separadas | Un writer por región, evita conflictos |
 | jsr-lsa para topología remota | Todos los routers ven islas remotas sin consultar al gateway |
@@ -204,12 +204,12 @@
 - `ACTION_VPN` en rutas
 - `VpnZoneEntry` con jerarquía
 - `VpnLeakRuleEntry`
-- `next_hop_router` en rutas estáticas (reemplazado por `next_hop_island`)
+- `next_hop_router` en rutas estáticas (reemplazado por `next_hop_hive`)
 
 ### Estructuras Nuevas (v1.13)
 
-- `jsr-lsa-<island>` región
-- `LsaHeader`, `RemoteIslandEntry`, `RemoteNodeEntry`
+- `jsr-lsa-<hive>` región
+- `LsaHeader`, `RemoteHiveEntry`, `RemoteNodeEntry`
 - `is_gateway` flag en ShmHeader
 - `router_name` en ShmHeader
 
@@ -222,12 +222,12 @@
 | MAX_NODES | 1024 | Por router |
 | MAX_STATIC_ROUTES | 256 | Por isla |
 | MAX_VPN_ASSIGNMENTS | 256 | Por isla |
-| MAX_REMOTE_ISLANDS | 16 | En jsr-lsa |
+| MAX_REMOTE_HIVES | 16 | En jsr-lsa |
 | MAX_REMOTE_NODES | 1024 | Total entre todas las islas remotas |
 | MAX_REMOTE_ROUTES | 256 | Total |
 | MAX_REMOTE_VPNS | 256 | Total |
 | Nombre L2 max | 256 bytes | UTF-8 |
-| Island ID max | 64 bytes | ASCII recomendado |
+| Hive ID max | 64 bytes | ASCII recomendado |
 | Mensaje inline max | 64 KB | Usar blob_ref para mayores |
 
 ---

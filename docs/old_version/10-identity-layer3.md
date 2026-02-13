@@ -11,7 +11,7 @@
 | Layer | Identifies | Format | Resolver | Location |
 |-------|------------|--------|----------|----------|
 | **L1** | Connection/Socket | UUID | Router (FIB) | routing.src/dst |
-| **L2** | Process/Node | `TYPE.name@island` | Router (SHM lookup) | routing.dst or meta.target |
+| **L2** | Process/Node | `TYPE.name@hive` | Router (SHM lookup) | routing.dst or meta.target |
 | **L3** | Interlocutor | `ilk:<uuid>` | OPA (reads meta) | meta.src_ilk/dst_ilk |
 
 ---
@@ -404,7 +404,7 @@ SY.identity is the central registry for all ILKs, modules, and degrees. It maint
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        Mother Island                         │
+│                        Mother Hive                         │
 │                                                              │
 │  ┌──────────────┐      ┌─────────────────────────────────┐ │
 │  │ PostgreSQL   │◄────►│ SY.identity@mother              │ │
@@ -421,7 +421,7 @@ SY.identity is the central registry for all ILKs, modules, and degrees. It maint
                                      │ WAN
                                      ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                      Production Island                       │
+│                      Production Hive                       │
 │                                                              │
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │ SY.identity@production                               │   │
@@ -448,23 +448,23 @@ SY.identity is the central registry for all ILKs, modules, and degrees. It maint
 
 | Mode | Condition | Capabilities |
 |------|-----------|-------------|
-| **PRIMARY** | `island.yaml` has `database.connection` | Read/write DB, emit broadcast |
+| **PRIMARY** | `hive.yaml` has `database.connection` | Read/write DB, emit broadcast |
 | **REPLICA** | No `database.connection` | Receive broadcast, write local SHM |
 
-### 7.4 Configuration (island.yaml)
+### 7.4 Configuration (hive.yaml)
 
 **Mother (primary):**
 ```yaml
-island_id: mother
+hive_id: mother
 is_mother: true
 
 database:
   connection: "postgres://user:pass@localhost:5432/jsonrouter"
 ```
 
-**Other islands (replica):**
+**Other hives (replica):**
 ```yaml
-island_id: production
+hive_id: production
 is_mother: false
 # No database.connection → REPLICA mode automatic
 ```
@@ -590,7 +590,7 @@ CREATE INDEX idx_degrees_capabilities ON degrees USING GIN(capabilities);
 
 ---
 
-## 9. SHM Region: jsr-identity-\<island\>
+## 9. SHM Region: jsr-identity-\<hive\>
 
 ### 9.1 Purpose
 
@@ -598,7 +598,7 @@ Stores ILK table, degrees, and capabilities for fast local read by any node.
 
 ### 9.2 Single Writer
 
-Only `SY.identity@<island>` writes to this region.
+Only `SY.identity@<hive>` writes to this region.
 
 ### 9.3 Structure
 
@@ -885,7 +885,7 @@ allow {
 ```
 
 **Key principles:**
-- One policy file per island, containing rules for ALL tenants
+- One policy file per hive, containing rules for ALL tenants
 - Rules by specific ilk have highest priority (most specific)
 - Rules by tenant are general (apply to all ilks of that tenant)
 - Tenant is derived from `src_ilk`, never sent in message
@@ -1000,10 +1000,10 @@ allow {
 | Region | Writer | Content | Magic |
 |--------|--------|---------|-------|
 | `jsr-<router-uuid>` | Router | Connected nodes | 0x4A535352 |
-| `jsr-config-<island>` | SY.config.routes | Routes, VPNs | 0x4A534343 |
-| `jsr-lsa-<island>` | Gateway | Remote topology | 0x4A534C41 |
-| `jsr-opa-<island>` | SY.opa.rules | Compiled WASM | 0x4A534F50 |
-| **`jsr-identity-<island>`** | **SY.identity** | **ILKs, degrees, modules** | **0x4A534944** |
+| `jsr-config-<hive>` | SY.config.routes | Routes, VPNs | 0x4A534343 |
+| `jsr-lsa-<hive>` | Gateway | Remote topology | 0x4A534C41 |
+| `jsr-opa-<hive>` | SY.opa.rules | Compiled WASM | 0x4A534F50 |
+| **`jsr-identity-<hive>`** | **SY.identity** | **ILKs, degrees, modules** | **0x4A534944** |
 
 ---
 

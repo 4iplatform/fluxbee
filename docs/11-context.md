@@ -354,7 +354,7 @@ CREATE INDEX idx_contexts_status ON contexts (status);
 ### 6.3 Connection String
 
 ```yaml
-# /etc/fluxbee/island.yaml
+# /etc/fluxbee/hive.yaml
 database:
   url: "postgresql://fluxbee:password@localhost:5432/fluxbee"
   pool_size: 10

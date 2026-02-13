@@ -34,10 +34,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => "WF.echo",
     };
 
-    let island_id = load_island_id(&config_dir)?;
+    let hive_id = load_hive_id(&config_dir)?;
     let router_socket = match std::env::var("JSR_ROUTER_NAME") {
         Ok(router_name) => {
-            let router_l2_name = ensure_l2_name(&router_name, &island_id);
+            let router_l2_name = ensure_l2_name(&router_name, &hive_id);
             match load_router_uuid(&state_dir, &router_l2_name) {
                 Ok(router_uuid) => socket_dir.join(format!("{}.sock", router_uuid.simple())),
                 Err(_) => socket_dir.clone(),
@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(_) => socket_dir.clone(),
     };
-    let target_name = normalize_target(target, &island_id);
+    let target_name = normalize_target(target, &hive_id);
     println!(
         "connecting: name={} socket={} config={} uuid_dir={}",
         node_name,
@@ -293,29 +293,29 @@ fn payload_summary(payload: &serde_json::Value) -> String {
     }
 }
 
-fn load_island_id(config_dir: &PathBuf) -> Result<String, Box<dyn std::error::Error>> {
-    let data = std::fs::read_to_string(config_dir.join("island.yaml"))?;
+fn load_hive_id(config_dir: &PathBuf) -> Result<String, Box<dyn std::error::Error>> {
+    let data = std::fs::read_to_string(config_dir.join("hive.yaml"))?;
     let value: serde_yaml::Value = serde_yaml::from_str(&data)?;
-    let island_id = value
-        .get("island_id")
+    let hive_id = value
+        .get("hive_id")
         .and_then(|v| v.as_str())
-        .ok_or("missing island_id")?;
-    Ok(island_id.to_string())
+        .ok_or("missing hive_id")?;
+    Ok(hive_id.to_string())
 }
 
-fn normalize_target(target: &str, island_id: &str) -> String {
+fn normalize_target(target: &str, hive_id: &str) -> String {
     if target.contains('@') {
         target.to_string()
     } else {
-        format!("{}@{}", target, island_id)
+        format!("{}@{}", target, hive_id)
     }
 }
 
-fn ensure_l2_name(name: &str, island_id: &str) -> String {
+fn ensure_l2_name(name: &str, hive_id: &str) -> String {
     if name.contains('@') {
         name.to_string()
     } else {
-        format!("{}@{}", name, island_id)
+        format!("{}@{}", name, hive_id)
     }
 }
 

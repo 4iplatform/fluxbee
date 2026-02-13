@@ -10,15 +10,15 @@ const DEFAULT_HELLO_INTERVAL_MS: u64 = 10_000;
 const DEFAULT_DEAD_INTERVAL_MS: u64 = 40_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_HEARTBEAT_STALE_MS: u64 = 30_000;
-const DEFAULT_ISLAND_ROLE: &str = "worker";
+const DEFAULT_HIVE_ROLE: &str = "worker";
 const DEFAULT_NATS_MODE: &str = "embedded";
 const DEFAULT_NATS_PORT: u16 = 4222;
 const DEFAULT_NATS_STORAGE_DIR: &str = "/var/lib/fluxbee/nats";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("missing island.yaml")]
-    MissingIsland,
+    #[error("missing hive.yaml")]
+    MissingHive,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("yaml error: {0}")]
@@ -32,7 +32,7 @@ pub struct RouterConfig {
     pub router_name: String,
     pub router_l2_name: String,
     pub router_uuid: Uuid,
-    pub island_id: String,
+    pub hive_id: String,
     pub config_dir: PathBuf,
     pub state_dir: PathBuf,
     pub node_socket_dir: PathBuf,
@@ -46,8 +46,8 @@ pub struct RouterConfig {
     pub heartbeat_stale_ms: u64,
     pub wan_listen: Option<String>,
     pub wan_uplinks: Vec<String>,
-    pub wan_authorized_islands: Vec<String>,
-    pub island_role: String,
+    pub wan_authorized_hives: Vec<String>,
+    pub hive_role: String,
     pub nats_mode: String,
     pub nats_port: u16,
     pub nats_url: String,
@@ -55,8 +55,8 @@ pub struct RouterConfig {
 }
 
 #[derive(Debug, Deserialize)]
-struct IslandFile {
-    island_id: String,
+struct HiveFile {
+    hive_id: String,
     role: Option<String>,
     wan: Option<WanSection>,
     nats: Option<NatsSection>,
@@ -66,7 +66,7 @@ struct IslandFile {
 struct WanSection {
     listen: Option<String>,
     uplinks: Option<Vec<WanUplink>>,
-    authorized_islands: Option<Vec<String>>,
+    authorized_hives: Option<Vec<String>>,
     gateway_name: Option<String>,
 }
 
@@ -118,42 +118,42 @@ impl RouterConfig {
         let heartbeat_stale_ms = DEFAULT_HEARTBEAT_STALE_MS;
         let mut wan_listen = None;
         let mut wan_uplinks = Vec::new();
-        let mut wan_authorized_islands = Vec::new();
-        let mut island_role = DEFAULT_ISLAND_ROLE.to_string();
+        let mut wan_authorized_hives = Vec::new();
+        let mut hive_role = DEFAULT_HIVE_ROLE.to_string();
         let mut nats_mode = DEFAULT_NATS_MODE.to_string();
         let mut nats_port = DEFAULT_NATS_PORT;
         let mut nats_url = String::new();
         let mut nats_storage_dir = PathBuf::from(DEFAULT_NATS_STORAGE_DIR);
 
-        let island_path = config_dir.join("island.yaml");
-        if !island_path.exists() {
-            return Err(ConfigError::MissingIsland);
+        let hive_path = config_dir.join("hive.yaml");
+        if !hive_path.exists() {
+            return Err(ConfigError::MissingHive);
         }
-        let data = std::fs::read_to_string(&island_path)?;
-        let island: IslandFile = serde_yaml::from_str(&data)?;
-        let island_id = island.island_id;
-        if let Some(role) = island.role {
+        let data = std::fs::read_to_string(&hive_path)?;
+        let hive: HiveFile = serde_yaml::from_str(&data)?;
+        let hive_id = hive.hive_id;
+        if let Some(role) = hive.role {
             let role = role.trim().to_ascii_lowercase();
             if !role.is_empty() {
-                island_role = role;
+                hive_role = role;
             }
         }
         let mut gateway_name = "RT.gateway".to_string();
-        if let Some(wan) = island.wan {
+        if let Some(wan) = hive.wan {
             wan_listen = wan.listen;
             if let Some(uplinks) = wan.uplinks {
                 for uplink in uplinks {
                     wan_uplinks.push(uplink.address);
                 }
             }
-            if let Some(islands) = wan.authorized_islands {
-                wan_authorized_islands = islands;
+            if let Some(hives) = wan.authorized_hives {
+                wan_authorized_hives = hives;
             }
             if let Some(name) = wan.gateway_name {
                 gateway_name = name;
             }
         }
-        if let Some(nats) = island.nats {
+        if let Some(nats) = hive.nats {
             if let Some(mode) = nats.mode {
                 let mode = mode.trim().to_ascii_lowercase();
                 if !mode.is_empty() {
@@ -182,7 +182,7 @@ impl RouterConfig {
 
         let router_name = std::env::var("JSR_ROUTER_NAME").unwrap_or_else(|_| gateway_name.clone());
         let is_gateway = is_gateway_name(&router_name, &gateway_name);
-        let router_l2_name = ensure_l2_name(&router_name, &island_id);
+        let router_l2_name = ensure_l2_name(&router_name, &hive_id);
         let identity_path = identity_path(&state_dir, &router_l2_name);
         let (router_uuid, shm_name) = if identity_path.exists() {
             let identity_raw = fs::read_to_string(&identity_path)?;
@@ -202,7 +202,7 @@ impl RouterConfig {
             router_name,
             router_l2_name,
             router_uuid,
-            island_id,
+            hive_id,
             config_dir,
             state_dir,
             node_socket_dir,
@@ -216,8 +216,8 @@ impl RouterConfig {
             heartbeat_stale_ms,
             wan_listen,
             wan_uplinks,
-            wan_authorized_islands,
-            island_role,
+            wan_authorized_hives,
+            hive_role,
             nats_mode,
             nats_port,
             nats_url,
@@ -226,11 +226,11 @@ impl RouterConfig {
     }
 }
 
-fn ensure_l2_name(name: &str, island_id: &str) -> String {
+fn ensure_l2_name(name: &str, hive_id: &str) -> String {
     if name.contains('@') {
         name.to_string()
     } else {
-        format!("{}@{}", name, island_id)
+        format!("{}@{}", name, hive_id)
     }
 }
 

@@ -77,7 +77,7 @@ pub struct WanHelloPayload {
     pub protocol: String,
     pub router_id: String,
     pub router_name: String,
-    pub island_id: String,
+    pub hive_id: String,
     pub capabilities: Vec<String>,
     pub timers: WanTimers,
 }
@@ -160,7 +160,7 @@ pub struct ConfigChangedPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LsaPayload {
-    pub island: String,
+    pub hive: String,
     pub seq: u64,
     pub timestamp: String,
     pub nodes: Vec<LsaNode>,
@@ -180,7 +180,7 @@ pub struct LsaRoute {
     pub prefix: String,
     pub match_kind: String,
     pub action: String,
-    pub next_hop_island: String,
+    pub next_hop_hive: String,
     pub metric: u32,
 }
 

@@ -13,19 +13,19 @@ El sistema usa cinco tipos de regiones de memoria compartida:
 ```
 /dev/shm/
 ├── jsr-<router-uuid>        # Una por router
-├── jsr-config-<island>      # Una por isla
-├── jsr-lsa-<island>         # Una por isla
-├── jsr-opa-<island>         # Una por isla (WASM de policies)
-└── jsr-identity-<island>    # Una por isla (ILKs, degrees, modules)
+├── jsr-config-<hive>      # Una por isla
+├── jsr-lsa-<hive>         # Una por isla
+├── jsr-opa-<hive>         # Una por isla (WASM de policies)
+└── jsr-identity-<hive>    # Una por isla (ILKs, degrees, modules)
 ```
 
 | Región | Writer | Contenido |
 |--------|--------|-----------|
 | `jsr-<uuid>` | Router dueño | Nodos CONNECTED a ese router |
-| `jsr-config-<island>` | SY.config.routes | Rutas estáticas, tabla VPN |
-| `jsr-lsa-<island>` | Gateway | Topología de islas remotas |
-| `jsr-opa-<island>` | SY.opa.rules | WASM compilado de policy OPA |
-| `jsr-identity-<island>` | SY.identity | ILKs, degrees, modules, external mappings |
+| `jsr-config-<hive>` | SY.config.routes | Rutas estáticas, tabla VPN |
+| `jsr-lsa-<hive>` | Gateway | Topología de islas remotas |
+| `jsr-opa-<hive>` | SY.opa.rules | WASM compilado de policy OPA |
+| `jsr-identity-<hive>` | SY.identity | ILKs, degrees, modules, external mappings |
 
 **Principio clave:** Cada región tiene **un único writer** y múltiples readers. Esto permite usar seqlock sin conflictos.
 
@@ -97,8 +97,8 @@ pub struct ShmHeader {
     pub heartbeat: u64,
     
     // Isla (66 bytes)
-    pub island_id: [u8; 64],
-    pub island_id_len: u16,
+    pub hive_id: [u8; 64],
+    pub hive_id_len: u16,
     
     // Router info (66 bytes)
     pub router_name: [u8; 64],      // "RT.primary@produccion"
@@ -142,14 +142,14 @@ pub struct NodeEntry {
 
 ---
 
-## 3. Región de Config: jsr-config-<island>
+## 3. Región de Config: jsr-config-<hive>
 
 Una sola región por isla, escrita únicamente por `SY.config.routes`.
 
 ### 3.1 Naming
 
 ```
-/jsr-config-<island_id>
+/jsr-config-<hive_id>
 
 Ejemplo: /jsr-config-produccion
 ```
@@ -207,8 +207,8 @@ pub struct ConfigHeader {
     pub config_version: u64,         // Incrementa con cada cambio
     
     // Isla (66 bytes)
-    pub island_id: [u8; 64],
-    pub island_id_len: u16,
+    pub hive_id: [u8; 64],
+    pub hive_id_len: u16,
     
     // Timestamps (16 bytes)
     pub created_at: u64,
@@ -232,8 +232,8 @@ pub struct StaticRouteEntry {
     pub action: u8,                  // FORWARD, DROP
     
     // Forwarding (36 bytes)
-    pub next_hop_island: [u8; 32],   // "" = local, "staging" = inter-isla
-    pub next_hop_island_len: u8,
+    pub next_hop_hive: [u8; 32],   // "" = local, "staging" = inter-isla
+    pub next_hop_hive_len: u8,
     pub _pad: [u8; 3],
     
     // Metadata (24 bytes)
@@ -266,14 +266,14 @@ pub struct VpnAssignment {
 
 ---
 
-## 4. Región LSA: jsr-lsa-<island>
+## 4. Región LSA: jsr-lsa-<hive>
 
 Una sola región por isla, escrita únicamente por el **Gateway**.
 
 ### 4.1 Naming
 
 ```
-/jsr-lsa-<island_id>
+/jsr-lsa-<hive_id>
 
 Ejemplo: /jsr-lsa-produccion
 ```
@@ -293,7 +293,7 @@ Topología de **otras islas** (no la local):
 ┌─────────────────────────────────────────────────────────────┐
 │ LsaHeader (128 bytes)                                       │
 ├─────────────────────────────────────────────────────────────┤
-│ RemoteIslandEntry[MAX_REMOTE_ISLANDS] (16 × 96 bytes)      │
+│ RemoteHiveEntry[MAX_REMOTE_HIVES] (16 × 96 bytes)      │
 │ Total: ~1.5 KB                                              │
 ├─────────────────────────────────────────────────────────────┤
 │ RemoteNodeEntry[MAX_REMOTE_NODES] (1024 × 288 bytes)       │
@@ -313,7 +313,7 @@ Total aproximado: ~442 KB
 ```rust
 pub const LSA_MAGIC: u32 = 0x4A534C41;  // "JSLA"
 pub const LSA_VERSION: u32 = 1;
-pub const MAX_REMOTE_ISLANDS: u32 = 16;
+pub const MAX_REMOTE_HIVES: u32 = 16;
 pub const MAX_REMOTE_NODES: u32 = 1024;      // Total entre todas las islas
 pub const MAX_REMOTE_ROUTES: u32 = 256;
 pub const MAX_REMOTE_VPNS: u32 = 256;
@@ -335,7 +335,7 @@ pub struct LsaHeader {
     pub seq: u64,
     
     // Contadores (16 bytes)
-    pub island_count: u32,
+    pub hive_count: u32,
     pub total_node_count: u32,
     pub total_route_count: u32,
     pub total_vpn_count: u32,
@@ -345,8 +345,8 @@ pub struct LsaHeader {
     pub updated_at: u64,
     
     // Isla local (66 bytes)
-    pub local_island_id: [u8; 64],
-    pub local_island_id_len: u16,
+    pub local_hive_id: [u8; 64],
+    pub local_hive_id_len: u16,
     
     // Reserved
     pub _reserved: [u8; 38],
@@ -354,10 +354,10 @@ pub struct LsaHeader {
 // Total: 128 bytes
 
 #[repr(C)]
-pub struct RemoteIslandEntry {
+pub struct RemoteHiveEntry {
     // Isla (66 bytes)
-    pub island_id: [u8; 64],         // "staging"
-    pub island_id_len: u16,
+    pub hive_id: [u8; 64],         // "staging"
+    pub hive_id_len: u16,
     
     // Estado (18 bytes)
     pub last_lsa_seq: u64,
@@ -382,7 +382,7 @@ pub struct RemoteNodeEntry {
     
     // VPN y isla (6 bytes)
     pub vpn_id: u32,
-    pub island_index: u16,           // Índice en RemoteIslandEntry[]
+    pub hive_index: u16,           // Índice en RemoteHiveEntry[]
     
     // Flags (8 bytes)
     pub flags: u16,
@@ -399,15 +399,15 @@ pub struct RemoteRouteEntry {
     pub action: u8,
     
     // Forwarding (36 bytes)
-    pub next_hop_island: [u8; 32],
-    pub next_hop_island_len: u8,
+    pub next_hop_hive: [u8; 32],
+    pub next_hop_hive_len: u8,
     pub _pad: [u8; 3],
     
     // Metadata (24 bytes)
     pub metric: u32,
     pub priority: u16,
     pub flags: u16,
-    pub island_index: u16,
+    pub hive_index: u16,
     pub _reserved: [u8; 14],
 }
 // Total: 320 bytes
@@ -426,7 +426,7 @@ pub struct RemoteVpnEntry {
     pub flags: u16,
     
     // Isla (4 bytes)
-    pub island_index: u16,
+    pub hive_index: u16,
     pub _reserved: [u8; 18],
 }
 // Total: 288 bytes
@@ -513,7 +513,7 @@ fn build_routing_table(&mut self) {
         }
     }
     
-    // 3. Leer config (jsr-config-<island>)
+    // 3. Leer config (jsr-config-<hive>)
     if let Some(config) = self.map_config_region() {
         // Rutas estáticas
         for route in config.static_routes {
@@ -523,11 +523,11 @@ fn build_routing_table(&mut self) {
         self.vpn_table = config.vpn_assignments.clone();
     }
     
-    // 4. Leer LSA (jsr-lsa-<island>)
+    // 4. Leer LSA (jsr-lsa-<hive>)
     if let Some(lsa) = self.map_lsa_region() {
-        for remote_island in lsa.islands {
-            for node in remote_island.nodes {
-                self.add_remote_route(node, remote_island.island_id);
+        for remote_hive in lsa.hives {
+            for node in remote_hive.nodes {
+                self.add_remote_route(node, remote_hive.hive_id);
             }
         }
     }
@@ -555,30 +555,30 @@ Via mensaje HELLO entre routers:
 
 ### 8.2 Región de Config
 
-Nombre fijo basado en island_id:
+Nombre fijo basado en hive_id:
 
 ```rust
-let config_shm = format!("/jsr-config-{}", island_id);
+let config_shm = format!("/jsr-config-{}", hive_id);
 ```
 
 ### 8.3 Región de LSA
 
-Nombre fijo basado en island_id:
+Nombre fijo basado en hive_id:
 
 ```rust
-let lsa_shm = format!("/jsr-lsa-{}", island_id);
+let lsa_shm = format!("/jsr-lsa-{}", hive_id);
 ```
 
 ---
 
-## 9. Región OPA: jsr-opa-<island>
+## 9. Región OPA: jsr-opa-<hive>
 
 Una sola región por isla, escrita únicamente por `SY.opa.rules`.
 
 ### 9.1 Naming
 
 ```
-/jsr-opa-<island_id>
+/jsr-opa-<hive_id>
 
 Ejemplo: /jsr-opa-produccion
 ```
@@ -730,22 +730,22 @@ impl Router {
 
 ### 9.7 Descubrimiento
 
-Nombre fijo basado en island_id:
+Nombre fijo basado en hive_id:
 
 ```rust
-let opa_shm = format!("/jsr-opa-{}", island_id);
+let opa_shm = format!("/jsr-opa-{}", hive_id);
 ```
 
 ---
 
-## 10. Región Identity: jsr-identity-<island>
+## 10. Región Identity: jsr-identity-<hive>
 
 Una sola región por isla, escrita únicamente por `SY.identity`.
 
 ### 10.1 Naming
 
 ```
-/jsr-identity-<island_id>
+/jsr-identity-<hive_id>
 
 Ejemplo: /jsr-identity-produccion
 ```
@@ -903,10 +903,10 @@ fn resolve_ilk(&self, channel: &str, external_id: &str) -> Option<String> {
 
 ### 10.8 Descubrimiento
 
-Nombre fijo basado en island_id:
+Nombre fijo basado en hive_id:
 
 ```rust
-let identity_shm = format!("/jsr-identity-{}", island_id);
+let identity_shm = format!("/jsr-identity-{}", hive_id);
 ```
 
 ---
@@ -928,7 +928,7 @@ pub const MAX_VPN_ASSIGNMENTS: u32 = 256;
 // Región LSA
 pub const LSA_MAGIC: u32 = 0x4A534C41;
 pub const LSA_VERSION: u32 = 1;
-pub const MAX_REMOTE_ISLANDS: u32 = 16;
+pub const MAX_REMOTE_HIVES: u32 = 16;
 pub const MAX_REMOTE_NODES: u32 = 1024;
 pub const MAX_REMOTE_ROUTES: u32 = 256;
 pub const MAX_REMOTE_VPNS: u32 = 256;

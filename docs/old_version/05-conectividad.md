@@ -72,7 +72,7 @@ Transporte: IRP al router dueño del nodo destino
 Cada isla tiene **un único router gateway**:
 
 - Es el único que mantiene conexiones TCP a otras islas
-- Es el único que escribe en `jsr-lsa-<island>`
+- Es el único que escribe en `jsr-lsa-<hive>`
 - Los demás routers reenvían tráfico inter-isla al gateway via IRP
 
 ### 3.2 Identificación del Gateway
@@ -103,18 +103,18 @@ fn find_gateway(&self) -> Option<RouterInfo> {
 ### 3.3 Configuración del Gateway
 
 No existe `config.yaml` por router. El gateway se identifica via `is_gateway` en SHM (set por el orchestrator).  
-La configuración WAN se declara **solo** en `island.yaml` y aplica al gateway.
+La configuración WAN se declara **solo** en `hive.yaml` y aplica al gateway.
 
 ```yaml
-# /etc/json-router/island.yaml
-island_id: produccion
+# /etc/json-router/hive.yaml
+hive_id: produccion
 
 wan:
   listen: "0.0.0.0:9000"
   uplinks:
     - address: "10.0.1.100:9000"    # staging
     - address: "10.0.2.100:9000"    # desarrollo
-  authorized_islands:
+  authorized_hives:
     - staging
     - desarrollo
 ```
@@ -151,8 +151,8 @@ El gateway consolida **toda** la información de su isla:
 | Dato | Fuente | Descripción |
 |------|--------|-------------|
 | Nodos | `jsr-<router-uuid>` de todos los routers | Todos los nodos conectados |
-| Rutas | `jsr-config-<island>` | Rutas estáticas |
-| VPNs | `jsr-config-<island>` | Tabla de asignación VPN |
+| Rutas | `jsr-config-<hive>` | Rutas estáticas |
+| VPNs | `jsr-config-<hive>` | Tabla de asignación VPN |
 
 ### 4.3 Formato del Mensaje LSA
 
@@ -169,7 +169,7 @@ El gateway consolida **toda** la información de su isla:
     "msg": "LSA"
   },
   "payload": {
-    "island": "produccion",
+    "hive": "produccion",
     "seq": 42,
     "timestamp": "2025-01-20T10:00:00Z",
     "nodes": [
@@ -194,7 +194,7 @@ El gateway consolida **toda** la información de su isla:
         "prefix": "AI.backup.*",
         "match_kind": "PREFIX",
         "action": "FORWARD",
-        "next_hop_island": "disaster-recovery",
+        "next_hop_hive": "disaster-recovery",
         "metric": 10
       }
     ],
@@ -253,7 +253,7 @@ Cuando el gateway recibe LSA de otra isla:
 ```rust
 fn handle_lsa(&mut self, lsa: LsaMessage) {
     // 1. Validar LSA
-    if lsa.seq <= self.last_lsa_seq.get(&lsa.island).unwrap_or(&0) {
+    if lsa.seq <= self.last_lsa_seq.get(&lsa.hive).unwrap_or(&0) {
         return;  // LSA viejo, ignorar
     }
     
@@ -261,25 +261,25 @@ fn handle_lsa(&mut self, lsa: LsaMessage) {
     self.lsa_region.seqlock_begin_write();
     
     // Actualizar o crear entrada para esta isla
-    let island_entry = self.lsa_region.find_or_create_island(&lsa.island);
-    island_entry.last_lsa_seq = lsa.seq;
-    island_entry.last_updated = now_epoch_ms();
+    let hive_entry = self.lsa_region.find_or_create_hive(&lsa.hive);
+    hive_entry.last_lsa_seq = lsa.seq;
+    hive_entry.last_updated = now_epoch_ms();
     
     // Reemplazar nodos, rutas, VPNs de esa isla
-    self.lsa_region.replace_nodes(&lsa.island, &lsa.nodes);
-    self.lsa_region.replace_routes(&lsa.island, &lsa.routes);
-    self.lsa_region.replace_vpns(&lsa.island, &lsa.vpns);
+    self.lsa_region.replace_nodes(&lsa.hive, &lsa.nodes);
+    self.lsa_region.replace_routes(&lsa.hive, &lsa.routes);
+    self.lsa_region.replace_vpns(&lsa.hive, &lsa.vpns);
     
     self.lsa_region.seqlock_end_write();
     
     // 3. Recordar seq para evitar duplicados
-    self.last_lsa_seq.insert(lsa.island.clone(), lsa.seq);
+    self.last_lsa_seq.insert(lsa.hive.clone(), lsa.seq);
 }
 ```
 
 ### 4.7 Routers Leen jsr-lsa
 
-Todos los routers de la isla leen `jsr-lsa-<island>` para saber:
+Todos los routers de la isla leen `jsr-lsa-<hive>` para saber:
 
 - Qué islas remotas existen
 - Qué nodos hay en cada isla remota
@@ -287,12 +287,12 @@ Todos los routers de la isla leen `jsr-lsa-<island>` para saber:
 - Cómo están asignados sus VPNs
 
 ```rust
-fn lookup_remote(&self, dst_name: &str, dst_island: &str) -> Option<RemoteNodeEntry> {
+fn lookup_remote(&self, dst_name: &str, dst_hive: &str) -> Option<RemoteNodeEntry> {
     let lsa = self.lsa_region.as_ref()?;
     
-    for island in lsa.islands.iter() {
-        if island.island_id == dst_island {
-            for node in island.nodes.iter() {
+    for hive in lsa.hives.iter() {
+        if hive.hive_id == dst_hive {
+            for node in hive.nodes.iter() {
                 if node.name == dst_name {
                     return Some(node.clone());
                 }
@@ -341,7 +341,7 @@ Gateway A (iniciador)              Gateway B (receptor)
     "protocol": "json-router/1.13",
     "router_id": "<uuid>",
     "router_name": "RT.gateway@produccion",
-    "island_id": "produccion",
+    "hive_id": "produccion",
     "capabilities": ["lsa", "forwarding"],
     "timers": {
       "hello_interval_ms": 10000,
@@ -379,8 +379,8 @@ Gateway A (iniciador)              Gateway B (receptor)
     "msg": "WAN_REJECT"
   },
   "payload": {
-    "reason": "ISLAND_NOT_AUTHORIZED",
-    "message": "Island 'unknown' not in authorized list"
+    "reason": "HIVE_NOT_AUTHORIZED",
+    "message": "Hive 'unknown' not in authorized list"
   }
 }
 ```
@@ -399,10 +399,10 @@ El LSA también funciona como heartbeat:
 fn check_peer_health(&mut self) {
     let now = now_epoch_ms();
     
-    for (island, last_seen) in self.peer_last_seen.iter() {
+    for (hive, last_seen) in self.peer_last_seen.iter() {
         if now - last_seen > self.dead_interval_ms {
-            log::warn!("Peer island {} appears dead", island);
-            self.mark_island_unreachable(island);
+            log::warn!("Peer hive {} appears dead", hive);
+            self.mark_hive_unreachable(hive);
         }
     }
 }
@@ -415,10 +415,10 @@ fn check_peer_health(&mut self) {
 ### 7.1 Desde Router Normal
 
 ```rust
-fn route_to_remote_island(&self, msg: &Message, dst_island: &str) -> Action {
+fn route_to_remote_hive(&self, msg: &Message, dst_hive: &str) -> Action {
     // Soy router normal, reenviar al gateway
     let gateway = self.find_gateway()
-        .expect("No gateway found in this island");
+        .expect("No gateway found in this hive");
     
     Action::ForwardToRouter(gateway.uuid)
 }
@@ -427,9 +427,9 @@ fn route_to_remote_island(&self, msg: &Message, dst_island: &str) -> Action {
 ### 7.2 Desde Gateway
 
 ```rust
-fn route_to_remote_island(&self, msg: &Message, dst_island: &str) -> Action {
+fn route_to_remote_hive(&self, msg: &Message, dst_hive: &str) -> Action {
     // Soy gateway, buscar conexión a esa isla
-    if let Some(conn) = self.wan_connections.get(dst_island) {
+    if let Some(conn) = self.wan_connections.get(dst_hive) {
         // Decrementar TTL
         let mut msg = msg.clone();
         msg.routing.ttl -= 1;
@@ -439,7 +439,7 @@ fn route_to_remote_island(&self, msg: &Message, dst_island: &str) -> Action {
         
         Action::SendWan(conn.clone(), msg)
     } else {
-        Action::NoRouteToIsland(dst_island.to_string())
+        Action::NoRouteToHive(dst_hive.to_string())
     }
 }
 ```
@@ -491,14 +491,14 @@ fn route_to_remote_island(&self, msg: &Message, dst_island: &str) -> Action {
 | Autorización | Edge proxy | Allowlist IPs/certs |
 | Protocolo | Gateway | HELLO + WAN_ACCEPT/REJECT |
 
-### 9.2 Validación de Island ID
+### 9.2 Validación de Hive ID
 
-El gateway valida que el `island_id` del peer esté en su lista de autorizados:
+El gateway valida que el `hive_id` del peer esté en su lista de autorizados:
 
 ```yaml
-# /etc/json-router/island.yaml
+# /etc/json-router/hive.yaml
 wan:
-  authorized_islands:
+  authorized_hives:
     - staging
     - desarrollo
 ```
@@ -510,7 +510,7 @@ wan:
 | Aspecto | IRP (Intra-Isla) | WAN (Inter-Isla) |
 |---------|------------------|------------------|
 | Transporte | Unix socket | TCP |
-| Configuración | Automática (SHM) | Explícita (`island.yaml`) |
+| Configuración | Automática (SHM) | Explícita (`hive.yaml`) |
 | TTL | No decrementa | Decrementa |
 | Quién lo usa | Todos los routers | Solo gateways |
 | Descubrimiento | Via SHM | Via config + HELLO |

@@ -25,8 +25,8 @@ El router construye su FIB a partir de tres fuentes:
 | Fuente | Región SHM | Admin Distance | Descripción |
 |--------|------------|----------------|-------------|
 | LOCAL | `jsr-<uuid>` (propios + peers) | 0 | Nodos conectados a routers de esta isla |
-| STATIC | `jsr-config-<island>` | 1 | Rutas configuradas |
-| REMOTE | `jsr-lsa-<island>` | 2 | Nodos de otras islas (via LSA) |
+| STATIC | `jsr-config-<hive>` | 1 | Rutas configuradas |
+| REMOTE | `jsr-lsa-<hive>` | 2 | Nodos de otras islas (via LSA) |
 
 ---
 
@@ -38,7 +38,7 @@ Una VPN es una subred aislada dentro de la isla. Nodos en distintas VPNs no se v
 
 ### 3.2 Tabla VPN
 
-La tabla VPN vive en `jsr-config-<island>`:
+La tabla VPN vive en `jsr-config-<hive>`:
 
 ```
 pattern           → vpn_id
@@ -155,10 +155,10 @@ fn build_fib(&mut self) {
                 prefix: route.prefix.clone(),
                 match_kind: route.match_kind,
                 vpn_id: 0,  // Las estáticas aplican a todas las VPNs
-                next_hop: if route.next_hop_island.is_empty() {
+                next_hop: if route.next_hop_hive.is_empty() {
                     NextHop::Resolve  // Resolver localmente
                 } else {
-                    NextHop::Island(route.next_hop_island.clone())
+                    NextHop::Hive(route.next_hop_hive.clone())
                 },
                 admin_distance: 1,  // STATIC
                 source: RouteSource::Static,
@@ -169,13 +169,13 @@ fn build_fib(&mut self) {
     
     // 4. Nodos remotos (LSA)
     if let Some(lsa) = &self.lsa_region {
-        for island in lsa.islands.iter() {
-            for node in island.nodes.iter() {
+        for hive in lsa.hives.iter() {
+            for node in hive.nodes.iter() {
                 self.fib.add(FibEntry {
                     prefix: node.name.clone(),
                     match_kind: MATCH_EXACT,
                     vpn_id: node.vpn_id,
-                    next_hop: NextHop::Island(island.island_id.clone()),
+                    next_hop: NextHop::Hive(hive.hive_id.clone()),
                     admin_distance: 2,  // REMOTE
                     source: RouteSource::Lsa,
                 });
@@ -243,8 +243,8 @@ fn route_intra_isla(&self, msg: &Message, dst_name: &str) -> Result<Action> {
         match static_route.action {
             ACTION_DROP => return Ok(Action::Drop),
             ACTION_FORWARD => {
-                if !static_route.next_hop_island.is_empty() {
-                    return Ok(Action::SendToIsland(static_route.next_hop_island));
+                if !static_route.next_hop_hive.is_empty() {
+                    return Ok(Action::SendToHive(static_route.next_hop_hive));
                 }
                 // Continuar con lookup normal
             }
@@ -271,21 +271,21 @@ fn route_intra_isla(&self, msg: &Message, dst_name: &str) -> Result<Action> {
 ### 5.3 Routing Inter-Isla
 
 ```rust
-fn route_inter_isla(&self, msg: &Message, dst_name: &str, dst_island: &str) -> Result<Action> {
+fn route_inter_isla(&self, msg: &Message, dst_name: &str, dst_hive: &str) -> Result<Action> {
     // 1. Verificar que conozco esa isla (vía LSA)
-    if !self.lsa_has_island(dst_island) {
-        return Err(RouteError::UnknownIsland(dst_island.to_string()));
+    if !self.lsa_has_hive(dst_hive) {
+        return Err(RouteError::UnknownHive(dst_hive.to_string()));
     }
     
     // 2. Verificar que el nodo existe en esa isla
-    if !self.lsa_has_node(dst_island, dst_name) {
+    if !self.lsa_has_node(dst_hive, dst_name) {
         return Err(RouteError::UnreachableRemote(dst_name.to_string()));
     }
     
     // 3. ¿Soy el gateway?
     if self.is_gateway {
         // Enviar directo por TCP
-        Ok(Action::SendWan(dst_island.to_string()))
+        Ok(Action::SendWan(dst_hive.to_string()))
     } else {
         // Forward al gateway de mi isla por IRP
         Ok(Action::ForwardToGateway)
@@ -305,7 +305,7 @@ Las rutas estáticas son **override explícito** y se evalúan **antes** del loo
 
 | Acción | Efecto |
 |--------|--------|
-| `ACTION_FORWARD` | Rutear normalmente (o a `next_hop_island` si está definido) |
+| `ACTION_FORWARD` | Rutear normalmente (o a `next_hop_hive` si está definido) |
 | `ACTION_DROP` | Descartar mensaje (blackhole) |
 
 ### 6.3 Ejemplos
@@ -318,7 +318,7 @@ Las rutas estáticas son **override explícito** y se evalúan **antes** del loo
 # Forzar backup a otra isla
 - prefix: "AI.backup.*"
   action: FORWARD
-  next_hop_island: "disaster-recovery"
+  next_hop_hive: "disaster-recovery"
 
 # Ruta normal (solo para documentar)
 - prefix: "AI.soporte.*"
@@ -585,18 +585,18 @@ fn pattern_match(pattern: &str, name: &str, match_kind: u8) -> bool {
 Si el destino es `AI.soporte.l1@*`:
 
 ```rust
-fn route_wildcard_island(&self, dst_name_base: &str) -> Result<Action> {
+fn route_wildcard_hive(&self, dst_name_base: &str) -> Result<Action> {
     // Buscar en isla local primero
-    let local_name = format!("{}@{}", dst_name_base, self.island_id);
+    let local_name = format!("{}@{}", dst_name_base, self.hive_id);
     if let Ok(action) = self.route_intra_isla(&local_name) {
         return Ok(action);
     }
     
     // Buscar en islas remotas (LSA)
-    for island in self.lsa_islands() {
-        let remote_name = format!("{}@{}", dst_name_base, island.island_id);
-        if self.lsa_has_node(&island.island_id, &remote_name) {
-            return Ok(Action::SendToIsland(island.island_id.clone()));
+    for hive in self.lsa_hives() {
+        let remote_name = format!("{}@{}", dst_name_base, hive.hive_id);
+        if self.lsa_has_node(&hive.hive_id, &remote_name) {
+            return Ok(Action::SendToHive(hive.hive_id.clone()));
         }
     }
     

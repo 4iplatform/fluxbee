@@ -7,7 +7,7 @@ Reinicio del código para alinear con la especificación v1.13.
 
 ## Sandbox local
 
-Copiar `config/island.yaml` a `/etc/json-router/island.yaml` (o ejecutar el script) y correr el router con:
+Copiar `config/hive.yaml` a `/etc/json-router/hive.yaml` (o ejecutar el script) y correr el router con:
 
 ```sh
 sudo ./scripts/install.sh

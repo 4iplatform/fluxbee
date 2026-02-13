@@ -14,7 +14,7 @@ El usuario configura **solo** lo que depende de su infraestructura. El sistema m
 
 | Configura el usuario | Hardcodeado en el sistema |
 |---------------------|---------------------------|
-| `island_id` | Paths de directorios |
+| `hive_id` | Paths de directorios |
 | `wan.gateway_name` (opcional) | Qué nodos SY arrancan |
 | `wan.listen` (IP:puerto) | Timers internos |
 | `wan.uplinks[]` | Límites (MAX_NODES, etc.) |
@@ -25,8 +25,8 @@ El usuario configura **solo** lo que depende de su infraestructura. El sistema m
 Todos los binarios conocen estos paths por código:
 
 ```
-/etc/json-router/                  # Configuración (solo island.yaml lo toca el humano)
-└── island.yaml                    # Identidad y WAN (ÚNICO archivo que edita el humano)
+/etc/json-router/                  # Configuración (solo hive.yaml lo toca el humano)
+└── hive.yaml                    # Identidad y WAN (ÚNICO archivo que edita el humano)
 
 /var/lib/json-router/              # Estado persistente (auto-generado, persistido por SY.*)
 ├── identity.yaml                  # UUID del gateway (auto-generado)
@@ -47,7 +47,7 @@ Todos los binarios conocen estos paths por código:
 ├── blob/                          # Blobs de mensajes grandes
 ├── nodes/                         # UUIDs de nodos
 │   └── AI.soporte.l1.uuid
-└── islands/                       # Repo de islas hijas (solo en mother)
+└── hives/                       # Repo de islas hijas (solo en mother)
     └── staging/
         ├── ssh.key
         ├── ssh.key.pub
@@ -60,23 +60,23 @@ Todos los binarios conocen estos paths por código:
 
 /dev/shm/                          # Shared memory
 ├── jsr-<router-uuid>
-├── jsr-config-<island>
-├── jsr-lsa-<island>
-├── jsr-opa-<island>               # WASM de policy OPA
-└── jsr-identity-<island>          # Identity table (ILKs, degrees, modules)
+├── jsr-config-<hive>
+├── jsr-lsa-<hive>
+├── jsr-opa-<hive>               # WASM de policy OPA
+└── jsr-identity-<hive>          # Identity table (ILKs, degrees, modules)
 ```
 
 ---
 
-## 2. Archivo island.yaml
+## 2. Archivo hive.yaml
 
 El **único** archivo que el usuario crea/edita.
 
 ### 2.1 Ejemplo Mínimo (isla standalone)
 
 ```yaml
-# /etc/json-router/island.yaml
-island_id: dev
+# /etc/json-router/hive.yaml
+hive_id: dev
 ```
 
 Con esto el sistema levanta una isla funcional sin conexión WAN (usa SQLite embebido para contextos).
@@ -84,8 +84,8 @@ Con esto el sistema levanta una isla funcional sin conexión WAN (usa SQLite emb
 ### 2.2 Ejemplo Motherbee (isla madre)
 
 ```yaml
-# /etc/fluxbee/island.yaml
-island_id: produccion
+# /etc/fluxbee/hive.yaml
+hive_id: produccion
 role: motherbee
 
 wan:
@@ -104,8 +104,8 @@ database:
 ### 2.3 Ejemplo Worker (isla hija)
 
 ```yaml
-# /etc/fluxbee/island.yaml (generado por add_island o manual)
-island_id: staging
+# /etc/fluxbee/hive.yaml (generado por add_hive o manual)
+hive_id: staging
 role: worker
 
 wan:
@@ -118,11 +118,11 @@ nats:
   port: 4222
 ```
 
-### 2.4 Campos de island.yaml
+### 2.4 Campos de hive.yaml
 
 | Campo | Obligatorio | Default | Descripción |
 |-------|-------------|---------|-------------|
-| `island_id` | **Sí** | - | Identificador único de la isla |
+| `hive_id` | **Sí** | - | Identificador único de la isla |
 | `role` | No | `worker` | `motherbee` o `worker` |
 | `wan.gateway_name` | No | `RT.gateway` | Nombre del router gateway |
 | `wan.listen` | No | (sin escucha) | IP:puerto para recibir conexiones WAN |
@@ -243,7 +243,7 @@ SY.orchestrator es el **único proceso que se inicia manualmente** en Motherbee.
 1. **Levanta** todos los componentes de Motherbee
 2. **Monitorea** heartbeats en SHM (watchdog)
 3. **Gestiona** ciclo de vida de nodos de aplicación
-4. **Ejecuta** bootstrap de workers remotos (add_island)
+4. **Ejecuta** bootstrap de workers remotos (add_hive)
 5. **Supervisa** salud de NATS (buffer levels)
 
 ### 4.3 Métodos de Supervisión
@@ -315,7 +315,7 @@ systemctl start sy-orchestrator
 ┌──────────────────────────────────────────────────────────────┐
 │ FASE 0: Inicialización                                       │
 ├──────────────────────────────────────────────────────────────┤
-│ 1. Leer /etc/fluxbee/island.yaml                            │
+│ 1. Leer /etc/fluxbee/hive.yaml                            │
 │ 2. Verificar role: motherbee                                │
 │ 3. Crear directorios si no existen                          │
 │ 4. Escribir PID en /var/run/fluxbee/orchestrator.pid        │
@@ -366,10 +366,10 @@ systemctl start sy-orchestrator
 ┌──────────────────────────────────────────────────────────────┐
 │ FASE 5: Motherbee Operativa                                  │
 ├──────────────────────────────────────────────────────────────┤
-│ 1. Log: "Motherbee {island_id} ready"                       │
+│ 1. Log: "Motherbee {hive_id} ready"                       │
 │ 2. Entrar en loop principal:                                │
 │    • Watchdog: verificar heartbeats y NATS                  │
-│    • Procesar mensajes (add_island, run_node, etc.)         │
+│    • Procesar mensajes (add_hive, run_node, etc.)         │
 │    • Reiniciar componentes caídos                           │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -379,7 +379,7 @@ systemctl start sy-orchestrator
 Los workers son más simples. Solo necesitan systemd local:
 
 ```bash
-# En el worker (o via add_island desde Motherbee)
+# En el worker (o via add_hive desde Motherbee)
 systemctl start fluxbee-worker
 ```
 
@@ -387,13 +387,13 @@ systemctl start fluxbee-worker
 ┌──────────────────────────────────────────────────────────────┐
 │ Worker Bootstrap                                             │
 ├──────────────────────────────────────────────────────────────┤
-│ 1. Leer /etc/fluxbee/island.yaml (role: worker)            │
+│ 1. Leer /etc/fluxbee/hive.yaml (role: worker)            │
 │ 2. Iniciar router + NATS embebido                           │
 │ 3. Conectar WAN a Motherbee                                 │
 │ 4. Iniciar SY.cognition (cold start → rebuild desde PG)    │
 │ 5. Sincronizar identity/config/opa de Motherbee            │
 │ 6. Iniciar nodos AI/IO/WF según config                     │
-│ 7. Log: "Worker {island_id} ready"                          │
+│ 7. Log: "Worker {hive_id} ready"                          │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -572,7 +572,7 @@ pub const RUNTIME_SYNC_TIMEOUT_SECS: u64 = 300;     // 5 minutos max
 
 ---
 
-## 5. Bootstrap de Workers Remotos (add_island)
+## 5. Bootstrap de Workers Remotos (add_hive)
 
 Esta funcionalidad permite instalar y configurar workers remotos automáticamente desde Motherbee.
 
@@ -587,9 +587,9 @@ Esta funcionalidad permite instalar y configurar workers remotos automáticament
 ┌─────────────────────────────────────────────────────────────────┐
 │                        MOTHERBEE                                │
 │                    (tiene internet)                             │
-│                  island_id: produccion                          │
+│                  hive_id: produccion                          │
 │                                                                 │
-│   SY.orchestrator ← ejecuta add_island                         │
+│   SY.orchestrator ← ejecuta add_hive                         │
 │         │                                                       │
 │         ▼                                                       │
 │   RT.gateway:9000 ← espera conexiones WAN                      │
@@ -632,11 +632,11 @@ El password `magicAI` es el **"cordón umbilical"** - solo funciona para el boot
 
 **HTTP (via SY.admin):**
 ```
-POST /islands
+POST /hives
 Content-Type: application/json
 
 {
-  "island_id": "staging",
+  "hive_id": "staging",
   "address": "192.168.1.50"
 }
 ```
@@ -652,24 +652,24 @@ Content-Type: application/json
   },
   "meta": {
     "type": "admin",
-    "action": "add_island"
+    "action": "add_hive"
   },
   "payload": {
-    "island_id": "staging",
+    "hive_id": "staging",
     "address": "192.168.1.50"
   }
 }
 ```
 
-### 4.5 Flujo Detallado de add_island
+### 4.5 Flujo Detallado de add_hive
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │ PASO 1: Validación                                               │
 ├──────────────────────────────────────────────────────────────────┤
-│ • Verificar que island_id no exista ya                          │
+│ • Verificar que hive_id no exista ya                          │
 │ • Verificar formato de address (IP o hostname)                  │
-│ • Si error → responder ISLAND_EXISTS o INVALID_ADDRESS          │
+│ • Si error → responder HIVE_EXISTS o INVALID_ADDRESS          │
 └──────────────────────────────────────────────────────────────────┘
                             │
                             ▼
@@ -687,7 +687,7 @@ Content-Type: application/json
 │ PASO 3: Generar SSH Key para esta isla                           │
 ├──────────────────────────────────────────────────────────────────┤
 │ • ssh-keygen -t ed25519 -N "" → key única para esta isla        │
-│ • Guardar en /var/lib/json-router/islands/{island_id}/          │
+│ • Guardar en /var/lib/json-router/hives/{hive_id}/          │
 │   ├── ssh.key      (privada, permisos 600)                      │
 │   └── ssh.key.pub  (pública)                                    │
 └──────────────────────────────────────────────────────────────────┘
@@ -733,11 +733,11 @@ Content-Type: application/json
                             │
                             ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│ PASO 7: Crear island.yaml                                        │
+│ PASO 7: Crear hive.yaml                                        │
 ├──────────────────────────────────────────────────────────────────┤
-│ Crear /etc/json-router/island.yaml:                             │
+│ Crear /etc/json-router/hive.yaml:                             │
 │                                                                  │
-│   island_id: staging                                            │
+│   hive_id: staging                                            │
 │   wan:                                                          │
 │     gateway_name: RT.gateway                                    │
 │     uplinks:                                                    │
@@ -779,10 +779,10 @@ Content-Type: application/json
 ┌──────────────────────────────────────────────────────────────────┐
 │ PASO 11: Esperar conexión WAN                                    │
 ├──────────────────────────────────────────────────────────────────┤
-│ En mother island:                                                │
+│ En mother hive:                                                │
 │ • Esperar que RT.gateway reciba conexión de staging             │
 │ • Esperar HELLO + LSA de la isla remota                         │
-│ • Verificar en jsr-lsa-<island> que staging aparece             │
+│ • Verificar en jsr-lsa-<hive> que staging aparece             │
 │ • Timeout: 60s                                                  │
 │ • Si timeout → responder WAN_TIMEOUT (pero isla queda instalada)│
 └──────────────────────────────────────────────────────────────────┘
@@ -791,9 +791,9 @@ Content-Type: application/json
 ┌──────────────────────────────────────────────────────────────────┐
 │ PASO 12: Registrar en repo de islas                              │
 ├──────────────────────────────────────────────────────────────────┤
-│ Crear /var/lib/json-router/islands/{island_id}/info.yaml:       │
+│ Crear /var/lib/json-router/hives/{hive_id}/info.yaml:       │
 │                                                                  │
-│   island_id: staging                                            │
+│   hive_id: staging                                            │
 │   address: 192.168.1.50                                         │
 │   created_at: 2025-01-26T10:00:00Z                              │
 │   status: connected                                             │
@@ -809,7 +809,7 @@ Content-Type: application/json
 {
   "payload": {
     "status": "ok",
-    "island_id": "staging",
+    "hive_id": "staging",
     "address": "192.168.1.50",
     "wan_connected": true
   }
@@ -831,7 +831,7 @@ Content-Type: application/json
 
 | Código | Paso | Descripción |
 |--------|------|-------------|
-| `ISLAND_EXISTS` | 1 | Ya existe isla con ese ID |
+| `HIVE_EXISTS` | 1 | Ya existe isla con ese ID |
 | `INVALID_ADDRESS` | 1 | Formato de dirección inválido |
 | `SSH_TIMEOUT` | 2 | Host no responde en 10s |
 | `SSH_CONNECTION_REFUSED` | 2 | Puerto 22 cerrado |
@@ -843,11 +843,11 @@ Content-Type: application/json
 
 ### 4.8 Resultado Final
 
-Después de `add_island` exitoso:
+Después de `add_hive` exitoso:
 
-**En mother island:**
+**En mother hive:**
 ```
-/var/lib/json-router/islands/staging/
+/var/lib/json-router/hives/staging/
 ├── ssh.key           # Para acceso SSH de emergencia
 ├── ssh.key.pub
 └── info.yaml         # Metadata de la isla
@@ -856,7 +856,7 @@ Después de `add_island` exitoso:
 **En isla remota (staging):**
 ```
 /etc/json-router/
-└── island.yaml       # Con uplink a mother (sin admin)
+└── hive.yaml       # Con uplink a mother (sin admin)
 
 /var/lib/json-router/
 ├── identity.yaml
@@ -884,8 +884,8 @@ Procesos corriendo:
 El password `magicAI` ya no funciona. Para acceder a la isla remota:
 
 ```bash
-# Desde mother island
-ssh -i /var/lib/json-router/islands/staging/ssh.key root@192.168.1.50
+# Desde mother hive
+ssh -i /var/lib/json-router/hives/staging/ssh.key root@192.168.1.50
 ```
 
 ---
@@ -896,10 +896,10 @@ ssh -i /var/lib/json-router/islands/staging/ssh.key root@192.168.1.50
 
 | Endpoint HTTP | Action | Descripción |
 |---------------|--------|-------------|
-| `POST /islands` | `add_island` | Bootstrap isla remota |
-| `GET /islands` | `list_islands` | Lista islas hijas |
-| `GET /islands/{id}` | `get_island` | Info de isla específica |
-| `DELETE /islands/{id}` | `remove_island` | Elimina registro (no apaga isla) |
+| `POST /hives` | `add_hive` | Bootstrap isla remota |
+| `GET /hives` | `list_hives` | Lista islas hijas |
+| `GET /hives/{id}` | `get_hive` | Info de isla específica |
+| `DELETE /hives/{id}` | `remove_hive` | Elimina registro (no apaga isla) |
 
 ### 5.2 Gestión de Nodos (Fase 2 - Futuro)
 
@@ -914,7 +914,7 @@ ssh -i /var/lib/json-router/islands/staging/ssh.key root@192.168.1.50
 | Endpoint HTTP | Action | Descripción |
 |---------------|--------|-------------|
 | `GET /health` | - | Health check básico |
-| `GET /island/status` | `island_status` | Estado completo de la isla |
+| `GET /hive/status` | `hive_status` | Estado completo de la isla |
 
 ### 5.4 Storage y Módulos
 
@@ -1055,7 +1055,7 @@ Cada SY.orchestrator al recibir esto:
   "payload": {
     "subsystem": "storage",
     "version": 1,
-    "island": "staging",
+    "hive": "staging",
     "node": "SY.orchestrator@staging",
     "status": "ok"
   }
@@ -1087,7 +1087,7 @@ Cada SY.orchestrator al recibir esto:
 ```ini
 # /etc/systemd/system/sy-orchestrator.service
 [Unit]
-Description=JSON Router Island Orchestrator
+Description=JSON Router Hive Orchestrator
 After=network.target
 
 [Service]
@@ -1107,13 +1107,13 @@ WantedBy=multi-user.target
 
 ```bash
 # Primera isla (mother)
-echo 'island_id: produccion' > /etc/json-router/island.yaml
+echo 'hive_id: produccion' > /etc/json-router/hive.yaml
 systemctl enable --now sy-orchestrator
 
 # Agregar isla remota (desde mother)
-curl -X POST http://localhost:8080/islands \
+curl -X POST http://localhost:8080/hives \
   -H "Content-Type: application/json" \
-  -d '{"island_id": "staging", "address": "192.168.1.50"}'
+  -d '{"hive_id": "staging", "address": "192.168.1.50"}'
 ```
 
 ---
@@ -1138,7 +1138,7 @@ curl -X POST http://localhost:8080/islands \
 
 ```bash
 # Verificar config
-cat /etc/json-router/island.yaml
+cat /etc/json-router/hive.yaml
 
 # Ejecutar manualmente con debug
 JSR_LOG_LEVEL=debug /usr/bin/sy-orchestrator
@@ -1147,7 +1147,7 @@ JSR_LOG_LEVEL=debug /usr/bin/sy-orchestrator
 journalctl -u sy-orchestrator -f
 ```
 
-### 9.2 add_island falla
+### 9.2 add_hive falla
 
 ```bash
 # Verificar conectividad
@@ -1169,7 +1169,7 @@ grep PasswordAuthentication /etc/ssh/sshd_config
 netstat -tlnp | grep 9000
 
 # En isla hija, verificar config
-cat /etc/json-router/island.yaml
+cat /etc/json-router/hive.yaml
 
 # Verificar logs del gateway
 journalctl -u sy-orchestrator | grep -i wan
@@ -1178,8 +1178,8 @@ journalctl -u sy-orchestrator | grep -i wan
 ### 9.4 Acceder a isla remota post-bootstrap
 
 ```bash
-# Desde mother island
-ssh -i /var/lib/json-router/islands/staging/ssh.key root@192.168.1.50
+# Desde mother hive
+ssh -i /var/lib/json-router/hives/staging/ssh.key root@192.168.1.50
 ```
 
 ### 9.5 Reset completo de isla
@@ -1189,7 +1189,7 @@ systemctl stop sy-orchestrator
 rm -rf /var/lib/json-router/*
 rm -rf /var/run/json-router/*
 rm -f /dev/shm/jsr-*
-# Mantener /etc/json-router/island.yaml
+# Mantener /etc/json-router/hive.yaml
 systemctl start sy-orchestrator
 ```
 
@@ -1207,7 +1207,7 @@ pub const RUN_DIR: &str = "/var/run/json-router";
 pub const SHM_PREFIX: &str = "/jsr-";
 
 // Archivos
-pub const ISLAND_CONFIG: &str = "/etc/json-router/island.yaml";
+pub const HIVE_CONFIG: &str = "/etc/json-router/hive.yaml";
 pub const ROUTES_CONFIG: &str = "/etc/json-router/config-routes.yaml";
 pub const IDENTITY_FILE: &str = "/var/lib/json-router/identity.yaml";
 
@@ -1239,7 +1239,7 @@ pub const DEFAULT_GATEWAY_NAME: &str = "RT.gateway";
 
 | Fase | Funcionalidad | Estado |
 |------|---------------|--------|
-| **1** | `add_island` - Bootstrap SSH de islas remotas | Prioridad |
+| **1** | `add_hive` - Bootstrap SSH de islas remotas | Prioridad |
 | **2** | MVP local: `run_node`, `kill_node`, `list_nodes` | Siguiente |
 | **3** | Health monitoring, restart policies, dinámicos | Futuro |
 

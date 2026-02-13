@@ -18,8 +18,8 @@ use json_router::nats::{
 type StorageError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Deserialize)]
-struct IslandFile {
-    island_id: String,
+struct HiveFile {
+    hive_id: String,
     role: Option<String>,
     nats: Option<NatsSection>,
     database: Option<DatabaseSection>,
@@ -92,22 +92,22 @@ async fn main() -> Result<(), StorageError> {
         .init();
 
     let config_dir = json_router::paths::config_dir();
-    let island = load_island(&config_dir).await?;
-    if !is_mother_role(island.role.as_deref()) {
+    let hive = load_hive(&config_dir).await?;
+    if !is_mother_role(hive.role.as_deref()) {
         tracing::warn!(
-            island = %island.island_id,
+            hive = %hive.hive_id,
             "SY.storage solo corre en motherbee; role != motherbee"
         );
         return Ok(());
     }
 
-    let endpoint = nats_endpoint(&island);
-    let database_url = database_url(&island)?;
+    let endpoint = nats_endpoint(&hive);
+    let database_url = database_url(&hive)?;
     let storage = Arc::new(Storage::connect(&database_url).await?);
     storage.ensure_schema().await?;
 
     tracing::info!(
-        island = %island.island_id,
+        hive = %hive.hive_id,
         endpoint = %endpoint,
         "sy.storage started"
     );
@@ -423,13 +423,13 @@ async fn run_subject_loop(
     }
 }
 
-async fn load_island(config_dir: &Path) -> Result<IslandFile, StorageError> {
-    let data = tokio::fs::read_to_string(config_dir.join("island.yaml")).await?;
+async fn load_hive(config_dir: &Path) -> Result<HiveFile, StorageError> {
+    let data = tokio::fs::read_to_string(config_dir.join("hive.yaml")).await?;
     Ok(serde_yaml::from_str(&data)?)
 }
 
-fn nats_endpoint(island: &IslandFile) -> String {
-    let Some(nats) = island.nats.as_ref() else {
+fn nats_endpoint(hive: &HiveFile) -> String {
+    let Some(nats) = hive.nats.as_ref() else {
         return "nats://127.0.0.1:4222".to_string();
     };
     if let Some(url) = nats.url.as_ref() {
@@ -452,7 +452,7 @@ fn nats_endpoint(island: &IslandFile) -> String {
     }
 }
 
-fn database_url(island: &IslandFile) -> Result<String, StorageError> {
+fn database_url(hive: &HiveFile) -> Result<String, StorageError> {
     if let Ok(url) = std::env::var("FLUXBEE_DATABASE_URL") {
         if !url.trim().is_empty() {
             return Ok(url);
@@ -463,11 +463,11 @@ fn database_url(island: &IslandFile) -> Result<String, StorageError> {
             return Ok(url);
         }
     }
-    let Some(db) = island.database.as_ref() else {
-        return Err("database.url missing in island.yaml and env".into());
+    let Some(db) = hive.database.as_ref() else {
+        return Err("database.url missing in hive.yaml and env".into());
     };
     let Some(url) = db.url.as_ref() else {
-        return Err("database.url missing in island.yaml and env".into());
+        return Err("database.url missing in hive.yaml and env".into());
     };
     if url.trim().is_empty() {
         return Err("database.url empty".into());

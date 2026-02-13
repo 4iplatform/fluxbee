@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use json_router::shm::{
-    now_epoch_ms, LsaRegionReader, NodeEntry, RemoteIslandEntry, RouterRegionReader, ShmSnapshot,
+    now_epoch_ms, LsaRegionReader, NodeEntry, RemoteHiveEntry, RouterRegionReader, ShmSnapshot,
 };
 use jsr_client::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
@@ -23,8 +23,8 @@ const BOOTSTRAP_SSH_USER: &str = "administrator";
 const BOOTSTRAP_SSH_PASS: &str = "magicAI";
 
 #[derive(Debug, Deserialize)]
-struct IslandFile {
-    island_id: String,
+struct HiveFile {
+    hive_id: String,
     role: Option<String>,
     wan: Option<WanSection>,
 }
@@ -60,7 +60,7 @@ struct StorageSection {
 }
 
 struct OrchestratorState {
-    island_id: String,
+    hive_id: String,
     started_at: Instant,
     config_dir: PathBuf,
     state_dir: PathBuf,
@@ -95,20 +95,20 @@ async fn main() -> Result<(), OrchestratorError> {
     let run_dir = json_router::paths::run_dir();
     let socket_dir = json_router::paths::router_socket_dir();
 
-    let island = load_island(&config_dir)?;
-    if !is_mother_role(island.role.as_deref()) {
+    let hive = load_hive(&config_dir)?;
+    if !is_mother_role(hive.role.as_deref()) {
         tracing::warn!("SY.orchestrator solo corre en motherbee; role != motherbee");
         return Ok(());
     }
-    let gateway_name = island
+    let gateway_name = hive
         .wan
         .as_ref()
         .and_then(|wan| wan.gateway_name.clone())
         .unwrap_or_else(|| "RT.gateway".to_string());
-    let wan_listen = island.wan.as_ref().and_then(|wan| wan.listen.clone());
+    let wan_listen = hive.wan.as_ref().and_then(|wan| wan.listen.clone());
     let storage_path = load_storage_path(&config_dir);
     let state = OrchestratorState {
-        island_id: island.island_id.clone(),
+        hive_id: hive.hive_id.clone(),
         started_at: Instant::now(),
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
@@ -133,7 +133,7 @@ async fn main() -> Result<(), OrchestratorError> {
     let (mut sender, mut receiver) =
         connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     tracing::info!("connected to router");
-    tracing::info!(island = %island.island_id, "island ready");
+    tracing::info!(hive = %hive.hive_id, "hive ready");
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -246,7 +246,7 @@ async fn wait_for_sy_nodes(
         if let Ok(snapshot) = load_router_snapshot(state) {
             let mut missing = Vec::new();
             for name in required.iter().copied() {
-                let expected = ensure_l2_name(name, &state.island_id);
+                let expected = ensure_l2_name(name, &state.hive_id);
                 let found = snapshot.nodes.iter().any(|node| {
                     if node.name_len == 0 {
                         return false;
@@ -347,11 +347,11 @@ async fn handle_admin(
 ) -> Result<(), OrchestratorError> {
     let action = msg.meta.action.as_deref().unwrap_or("");
     let payload = match action {
-        "island_status" => {
+        "hive_status" => {
             let uptime_ms = state.started_at.elapsed().as_millis() as u64;
             serde_json::json!({
                 "status": "ok",
-                "island_id": state.island_id,
+                "hive_id": state.hive_id,
                 "pid": std::process::id(),
                 "uptime_ms": uptime_ms,
             })
@@ -419,7 +419,7 @@ async fn handle_admin(
                 status,
                 error_code,
                 error_detail,
-                &state.island_id,
+                &state.hive_id,
             )
             .await;
             payload
@@ -470,23 +470,23 @@ async fn handle_admin(
                 "message": "kill_router stub",
             })
         }
-        "list_islands" => {
+        "list_hives" => {
             serde_json::json!({
                 "status": "ok",
-                "islands": list_islands(&state.state_dir)?,
+                "hives": list_hives(&state.state_dir)?,
             })
         }
-        "get_island" => {
-            let island = msg
+        "get_hive" => {
+            let hive = msg
                 .payload
-                .get("island_id")
+                .get("hive_id")
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
-            if let Some(island_id) = island {
-                match get_island(&state.state_dir, &island_id) {
+            if let Some(hive_id) = hive {
+                match get_hive(&state.state_dir, &hive_id) {
                     Ok(payload) => serde_json::json!({
                         "status": "ok",
-                        "island": payload,
+                        "hive": payload,
                     }),
                     Err(err) => serde_json::json!({
                         "status": "error",
@@ -498,21 +498,21 @@ async fn handle_admin(
                 serde_json::json!({
                     "status": "error",
                     "error_code": "INVALID_REQUEST",
-                    "message": "missing island_id",
+                    "message": "missing hive_id",
                 })
             }
         }
-        "remove_island" => {
-            let island = msg
+        "remove_hive" => {
+            let hive = msg
                 .payload
-                .get("island_id")
+                .get("hive_id")
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
-            if let Some(island_id) = island {
-                match remove_island(&state.state_dir, &island_id) {
+            if let Some(hive_id) = hive {
+                match remove_hive(&state.state_dir, &hive_id) {
                     Ok(()) => serde_json::json!({
                         "status": "ok",
-                        "island_id": island_id,
+                        "hive_id": hive_id,
                     }),
                     Err(err) => serde_json::json!({
                         "status": "error",
@@ -524,14 +524,14 @@ async fn handle_admin(
                 serde_json::json!({
                     "status": "error",
                     "error_code": "INVALID_REQUEST",
-                    "message": "missing island_id",
+                    "message": "missing hive_id",
                 })
             }
         }
-        "add_island" => {
-            let island_id = msg
+        "add_hive" => {
+            let hive_id = msg
                 .payload
-                .get("island_id")
+                .get("hive_id")
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
             let address = msg
@@ -539,15 +539,15 @@ async fn handle_admin(
                 .get("address")
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
-            if let Some(island_id) = island_id {
+            if let Some(hive_id) = hive_id {
                 let address = address.unwrap_or_default();
-                let harden_ssh = resolve_add_island_harden_ssh(&msg.payload);
-                add_island_flow(state, &island_id, &address, harden_ssh)
+                let harden_ssh = resolve_add_hive_harden_ssh(&msg.payload);
+                add_hive_flow(state, &hive_id, &address, harden_ssh)
             } else {
                 serde_json::json!({
                     "status": "error",
                     "error_code": "INVALID_REQUEST",
-                    "message": "missing island_id",
+                    "message": "missing hive_id",
                 })
             }
         }
@@ -595,8 +595,8 @@ async fn connect_with_retry(
     }
 }
 
-fn load_island(config_dir: &Path) -> Result<IslandFile, OrchestratorError> {
-    let data = fs::read_to_string(config_dir.join("island.yaml"))?;
+fn load_hive(config_dir: &Path) -> Result<HiveFile, OrchestratorError> {
+    let data = fs::read_to_string(config_dir.join("hive.yaml"))?;
     Ok(serde_yaml::from_str(&data)?)
 }
 
@@ -608,7 +608,7 @@ fn ensure_dirs(
     let storage_root = json_router::paths::storage_root_dir();
     fs::create_dir_all(config_dir)?;
     fs::create_dir_all(state_dir.join("nodes"))?;
-    fs::create_dir_all(islands_root())?;
+    fs::create_dir_all(hives_root())?;
     fs::create_dir_all(&storage_root)?;
     fs::create_dir_all(storage_root.join("opa-rules"))?;
     fs::create_dir_all(run_dir)?;
@@ -622,16 +622,16 @@ fn write_pid(run_dir: &Path) -> Result<(), OrchestratorError> {
     Ok(())
 }
 
-fn ensure_l2_name(name: &str, island_id: &str) -> String {
+fn ensure_l2_name(name: &str, hive_id: &str) -> String {
     if name.contains('@') {
         name.to_string()
     } else {
-        format!("{}@{}", name, island_id)
+        format!("{}@{}", name, hive_id)
     }
 }
 
 fn load_router_snapshot(state: &OrchestratorState) -> Result<ShmSnapshot, OrchestratorError> {
-    let router_l2_name = ensure_l2_name(&state.gateway_name, &state.island_id);
+    let router_l2_name = ensure_l2_name(&state.gateway_name, &state.hive_id);
     let identity_path = state.state_dir.join(&router_l2_name).join("identity.yaml");
     let data = fs::read_to_string(&identity_path)?;
     let identity: IdentityFile = serde_yaml::from_str(&data)?;
@@ -690,13 +690,13 @@ async fn send_config_response(
     status: &str,
     error_code: Option<String>,
     error_detail: Option<String>,
-    island: &str,
+    hive: &str,
 ) -> Result<(), OrchestratorError> {
     let mut payload = serde_json::json!({
         "subsystem": subsystem,
         "version": version,
         "status": status,
-        "island": island,
+        "hive": hive,
     });
     if let Some(code) = error_code {
         payload["error_code"] = serde_json::Value::String(code);
@@ -726,8 +726,8 @@ async fn send_config_response(
     Ok(())
 }
 
-fn list_islands(_state_dir: &Path) -> Result<Vec<serde_json::Value>, OrchestratorError> {
-    let root = islands_root();
+fn list_hives(_state_dir: &Path) -> Result<Vec<serde_json::Value>, OrchestratorError> {
+    let root = hives_root();
     if !root.exists() {
         return Ok(Vec::new());
     }
@@ -737,62 +737,62 @@ fn list_islands(_state_dir: &Path) -> Result<Vec<serde_json::Value>, Orchestrato
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        let island_id = entry.file_name().to_string_lossy().to_string();
-        if let Ok(info) = read_island_info(&root, &island_id) {
+        let hive_id = entry.file_name().to_string_lossy().to_string();
+        if let Ok(info) = read_hive_info(&root, &hive_id) {
             out.push(info);
         } else {
-            out.push(serde_json::json!({ "island_id": island_id }));
+            out.push(serde_json::json!({ "hive_id": hive_id }));
         }
     }
     out.sort_by(|a, b| {
-        let a = a.get("island_id").and_then(|v| v.as_str()).unwrap_or("");
-        let b = b.get("island_id").and_then(|v| v.as_str()).unwrap_or("");
+        let a = a.get("hive_id").and_then(|v| v.as_str()).unwrap_or("");
+        let b = b.get("hive_id").and_then(|v| v.as_str()).unwrap_or("");
         a.cmp(b)
     });
     Ok(out)
 }
 
-fn get_island(_state_dir: &Path, island_id: &str) -> Result<serde_json::Value, OrchestratorError> {
-    let root = islands_root();
-    read_island_info(&root, island_id)
+fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, OrchestratorError> {
+    let root = hives_root();
+    read_hive_info(&root, hive_id)
 }
 
-fn remove_island(_state_dir: &Path, island_id: &str) -> Result<(), OrchestratorError> {
-    let root = islands_root();
-    let dir = root.join(island_id);
+fn remove_hive(_state_dir: &Path, hive_id: &str) -> Result<(), OrchestratorError> {
+    let root = hives_root();
+    let dir = root.join(hive_id);
     if !dir.exists() {
-        return Err("island not found".into());
+        return Err("hive not found".into());
     }
     fs::remove_dir_all(dir)?;
     Ok(())
 }
 
-fn read_island_info(root: &Path, island_id: &str) -> Result<serde_json::Value, OrchestratorError> {
-    let path = root.join(island_id).join("info.yaml");
+fn read_hive_info(root: &Path, hive_id: &str) -> Result<serde_json::Value, OrchestratorError> {
+    let path = root.join(hive_id).join("info.yaml");
     let data = fs::read_to_string(&path)?;
     let yaml: serde_yaml::Value = serde_yaml::from_str(&data)?;
     let json = serde_json::to_value(yaml)?;
     Ok(json)
 }
 
-fn add_island_flow(
+fn add_hive_flow(
     state: &OrchestratorState,
-    island_id: &str,
+    hive_id: &str,
     address: &str,
     harden_ssh: bool,
 ) -> serde_json::Value {
-    if island_exists(&state.state_dir, island_id) {
+    if hive_exists(&state.state_dir, hive_id) {
         return serde_json::json!({
             "status": "error",
-            "error_code": "ISLAND_EXISTS",
-            "message": "island already exists",
+            "error_code": "HIVE_EXISTS",
+            "message": "hive already exists",
         });
     }
-    if !valid_island_id(island_id) {
+    if !valid_hive_id(hive_id) {
         return serde_json::json!({
             "status": "error",
-            "error_code": "INVALID_ISLAND_ID",
-            "message": "invalid island_id",
+            "error_code": "INVALID_HIVE_ID",
+            "message": "invalid hive_id",
         });
     }
     if !valid_address(address) {
@@ -806,7 +806,7 @@ fn add_island_flow(
         return serde_json::json!({
             "status": "error",
             "error_code": "MISSING_WAN_LISTEN",
-            "message": "wan.listen missing in island.yaml",
+            "message": "wan.listen missing in hive.yaml",
         });
     }
 
@@ -818,16 +818,16 @@ fn add_island_flow(
         });
     }
 
-    let island_dir = islands_root().join(island_id);
-    if let Err(err) = fs::create_dir_all(&island_dir) {
+    let hive_dir = hives_root().join(hive_id);
+    if let Err(err) = fs::create_dir_all(&hive_dir) {
         return serde_json::json!({
             "status": "error",
             "error_code": "IO_ERROR",
             "message": err.to_string(),
         });
     }
-    let key_path = island_dir.join("ssh.key");
-    let key_pub = island_dir.join("ssh.key.pub");
+    let key_path = hive_dir.join("ssh.key");
+    let key_pub = hive_dir.join("ssh.key.pub");
     let mut keygen = Command::new("ssh-keygen");
     keygen
         .arg("-t")
@@ -933,12 +933,12 @@ fn add_island_flow(
     );
 
     let wan_listen = state.wan_listen.clone().unwrap_or_default();
-    let island_yaml = format!(
-        "island_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\n",
-        island_id, wan_listen
+    let hive_yaml = format!(
+        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\n",
+        hive_id, wan_listen
     );
     if let Err(err) =
-        write_remote_file(address, &key_path, "/etc/fluxbee/island.yaml", &island_yaml)
+        write_remote_file(address, &key_path, "/etc/fluxbee/hive.yaml", &hive_yaml)
     {
         return serde_json::json!({
             "status": "error",
@@ -998,13 +998,13 @@ fn add_island_flow(
     }
 
     let mut wan_connected = true;
-    if let Err(_) = wait_for_wan(&state.island_id, island_id, Duration::from_secs(60)) {
+    if let Err(_) = wait_for_wan(&state.hive_id, hive_id, Duration::from_secs(60)) {
         wan_connected = false;
     }
 
-    let info_path = islands_root().join(island_id).join("info.yaml");
+    let info_path = hives_root().join(hive_id).join("info.yaml");
     let info = serde_yaml::to_string(&serde_json::json!({
-        "island_id": island_id,
+        "hive_id": hive_id,
         "address": address,
         "created_at": now_epoch_ms().to_string(),
         "status": if wan_connected { "connected" } else { "pending" },
@@ -1016,7 +1016,7 @@ fn add_island_flow(
         return serde_json::json!({
             "status": "error",
             "error_code": "WAN_TIMEOUT",
-            "island_id": island_id,
+            "hive_id": hive_id,
             "address": address,
             "harden_ssh": harden_ssh,
             "wan_connected": false,
@@ -1025,19 +1025,19 @@ fn add_island_flow(
 
     serde_json::json!({
         "status": "ok",
-        "island_id": island_id,
+        "hive_id": hive_id,
         "address": address,
         "harden_ssh": harden_ssh,
         "wan_connected": true,
     })
 }
 
-fn island_exists(state_dir: &Path, island_id: &str) -> bool {
+fn hive_exists(state_dir: &Path, hive_id: &str) -> bool {
     let _ = state_dir;
-    islands_root().join(island_id).exists()
+    hives_root().join(hive_id).exists()
 }
 
-fn valid_island_id(value: &str) -> bool {
+fn valid_hive_id(value: &str) -> bool {
     if value.is_empty() || value.len() > 64 {
         return false;
     }
@@ -1072,12 +1072,12 @@ fn valid_address(value: &str) -> bool {
     })
 }
 
-fn resolve_add_island_harden_ssh(payload: &serde_json::Value) -> bool {
+fn resolve_add_hive_harden_ssh(payload: &serde_json::Value) -> bool {
     if let Some(value) = payload.get("harden_ssh").and_then(parse_bool_value) {
         return value;
     }
-    env_flag_enabled("FLUXBEE_ADD_ISLAND_HARDEN_SSH")
-        || env_flag_enabled("JSR_ADD_ISLAND_HARDEN_SSH")
+    env_flag_enabled("FLUXBEE_ADD_HIVE_HARDEN_SSH")
+        || env_flag_enabled("JSR_ADD_HIVE_HARDEN_SSH")
 }
 
 fn parse_bool_value(value: &serde_json::Value) -> Option<bool> {
@@ -1104,8 +1104,8 @@ fn parse_bool_str(raw: &str) -> Option<bool> {
     }
 }
 
-fn islands_root() -> PathBuf {
-    json_router::paths::storage_root_dir().join("islands")
+fn hives_root() -> PathBuf {
+    json_router::paths::storage_root_dir().join("hives")
 }
 
 fn orchestrator_file_path() -> PathBuf {
@@ -1254,19 +1254,19 @@ fn write_remote_file(
 }
 
 fn wait_for_wan(
-    island_id: &str,
+    hive_id: &str,
     remote_id: &str,
     timeout: Duration,
 ) -> Result<(), OrchestratorError> {
-    let shm_name = format!("/jsr-lsa-{}", island_id);
+    let shm_name = format!("/jsr-lsa-{}", hive_id);
     let reader = LsaRegionReader::open_read_only(&shm_name)?;
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(snapshot) = reader.read_snapshot() {
             if snapshot
-                .islands
+                .hives
                 .iter()
-                .any(|entry| remote_island_match(entry, remote_id))
+                .any(|entry| remote_hive_match(entry, remote_id))
             {
                 return Ok(());
             }
@@ -1276,12 +1276,12 @@ fn wait_for_wan(
     Err("wan timeout".into())
 }
 
-fn remote_island_match(entry: &RemoteIslandEntry, target: &str) -> bool {
-    if entry.island_id_len == 0 {
+fn remote_hive_match(entry: &RemoteHiveEntry, target: &str) -> bool {
+    if entry.hive_id_len == 0 {
         return false;
     }
-    let len = entry.island_id_len as usize;
-    let name = String::from_utf8_lossy(&entry.island_id[..len]);
+    let len = entry.hive_id_len as usize;
+    let name = String::from_utf8_lossy(&entry.hive_id[..len]);
     name == target
 }
 

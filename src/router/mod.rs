@@ -15,7 +15,7 @@ use crate::nats::{NatsPublisher, SUBJECT_STORAGE_TURNS};
 use crate::opa::OpaResolver;
 use crate::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionReader, ConfigSnapshot, LsaRegionReader,
-    LsaRegionWriter, LsaSnapshot, OpaRegionReader, OpaSnapshot, RemoteIslandEntry, RemoteNodeEntry,
+    LsaRegionWriter, LsaSnapshot, OpaRegionReader, OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry,
     RemoteRouteEntry, RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, VpnAssignment,
     ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
     MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
@@ -61,7 +61,7 @@ pub struct Router {
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
-    lsa_state: Arc<Mutex<std::collections::HashMap<String, RemoteIslandState>>>,
+    lsa_state: Arc<Mutex<std::collections::HashMap<String, RemoteHiveState>>>,
     lsa_seq: Arc<Mutex<u64>>,
     nats_publisher: Option<Arc<NatsPublisher>>,
 }
@@ -71,26 +71,26 @@ impl Router {
         let shm = RouterRegionWriter::open_or_create(
             &cfg.shm_name,
             cfg.router_uuid,
-            &cfg.island_id,
+            &cfg.hive_id,
             &cfg.router_l2_name,
             cfg.is_gateway,
         )
         .expect("shm init");
         let config_reader =
-            match ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", cfg.island_id)) {
+            match ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", cfg.hive_id)) {
                 Ok(reader) => Some(reader),
                 Err(_) => None,
             };
         let lsa_reader =
-            match LsaRegionReader::open_read_only(&format!("/jsr-lsa-{}", cfg.island_id)) {
+            match LsaRegionReader::open_read_only(&format!("/jsr-lsa-{}", cfg.hive_id)) {
                 Ok(reader) => Some(reader),
                 Err(_) => None,
             };
         let lsa_writer = if cfg.is_gateway {
             LsaRegionWriter::open_or_create(
-                &format!("/jsr-lsa-{}", cfg.island_id),
+                &format!("/jsr-lsa-{}", cfg.hive_id),
                 cfg.router_uuid,
-                &cfg.island_id,
+                &cfg.hive_id,
             )
             .ok()
         } else {
@@ -152,13 +152,13 @@ impl Router {
         let shm = Arc::clone(&self.shm);
         let opa = Arc::clone(&self.opa);
         let opa_reader = Arc::clone(&self.opa_reader);
-        let island_id = self.cfg.island_id.clone();
+        let hive_id = self.cfg.hive_id.clone();
         let heartbeat_interval = self.cfg.heartbeat_interval_ms;
         tokio::spawn(async move {
             let mut ticker = time::interval(Duration::from_millis(heartbeat_interval));
             loop {
                 ticker.tick().await;
-                maybe_refresh_opa_from_shm(&opa_reader, &opa, &shm, &island_id).await;
+                maybe_refresh_opa_from_shm(&opa_reader, &opa, &shm, &hive_id).await;
                 let (policy_version, load_status) = {
                     let opa = opa.lock().await;
                     opa.status()
@@ -187,7 +187,7 @@ impl Router {
         let router_uuid = self.cfg.router_uuid;
         let router_name = self.cfg.router_l2_name.clone();
         let shm_name = self.cfg.shm_name.clone();
-        let island_id = self.cfg.island_id.clone();
+        let hive_id = self.cfg.hive_id.clone();
         let is_gateway = self.cfg.is_gateway;
         let peer_socket_dir = self.cfg.node_socket_dir.clone();
         tokio::spawn(async move {
@@ -195,7 +195,7 @@ impl Router {
                 router_uuid,
                 &router_name,
                 &shm_name,
-                &island_id,
+                &hive_id,
                 peer_socket_dir,
                 peers_pd,
                 peer_nodes_pd,
@@ -223,12 +223,12 @@ impl Router {
         let peer_nodes = Arc::clone(&self.peer_nodes);
         let static_routes = Arc::clone(&self.static_routes);
         let fib = Arc::clone(&self.fib);
-        let island_id = self.cfg.island_id.clone();
+        let hive_id = self.cfg.hive_id.clone();
         tokio::spawn(async move {
             lsa_refresh_loop(
                 lsa_reader,
                 lsa_snapshot,
-                &island_id,
+                &hive_id,
                 nodes,
                 peer_nodes,
                 static_routes,
@@ -250,7 +250,7 @@ impl Router {
         let shm = Arc::clone(&self.shm);
         let opa = Arc::clone(&self.opa);
         let opa_reader = Arc::clone(&self.opa_reader);
-        let island_id = self.cfg.island_id.clone();
+        let hive_id = self.cfg.hive_id.clone();
         let wan_peers = Arc::clone(&self.wan_peers);
         let lsa_snapshot = Arc::clone(&self.lsa_snapshot);
         let is_gateway = self.cfg.is_gateway;
@@ -276,7 +276,7 @@ impl Router {
                 let shm = Arc::clone(&shm);
                 let opa = Arc::clone(&opa);
                 let opa_reader = Arc::clone(&opa_reader);
-                let island_id = island_id.clone();
+                let hive_id = hive_id.clone();
                 let wan_peers = Arc::clone(&wan_peers);
                 let lsa_reader = Arc::clone(&lsa_reader);
                 let lsa_snapshot = Arc::clone(&lsa_snapshot);
@@ -298,7 +298,7 @@ impl Router {
                         shm,
                         opa,
                         opa_reader,
-                        island_id,
+                        hive_id,
                         wan_peers,
                         lsa_snapshot,
                         is_gateway,
@@ -315,10 +315,10 @@ impl Router {
             let ctx = Arc::new(WanContext {
                 router_uuid: self.cfg.router_uuid,
                 router_name: self.cfg.router_l2_name.clone(),
-                island_id: self.cfg.island_id.clone(),
+                hive_id: self.cfg.hive_id.clone(),
                 hello_interval_ms: self.cfg.hello_interval_ms,
                 dead_interval_ms: self.cfg.dead_interval_ms,
-                authorized_islands: self.cfg.wan_authorized_islands.clone(),
+                authorized_hives: self.cfg.wan_authorized_hives.clone(),
                 nodes: Arc::clone(&self.nodes),
                 peer_nodes: Arc::clone(&self.peer_nodes),
                 peer_routers: Arc::clone(&self.peer_routers),
@@ -362,7 +362,7 @@ impl Router {
             let shm = Arc::clone(&self.shm);
             let router_name = self.cfg.router_l2_name.clone();
             let router_uuid = self.cfg.router_uuid;
-            let island_id = self.cfg.island_id.clone();
+            let hive_id = self.cfg.hive_id.clone();
             let nodes = Arc::clone(&self.nodes);
             let peer_nodes = Arc::clone(&self.peer_nodes);
             let peer_routers = Arc::clone(&self.peer_routers);
@@ -404,7 +404,7 @@ impl Router {
                     nats_publisher,
                     router_uuid,
                     &router_name,
-                    &island_id,
+                    &hive_id,
                     is_gateway,
                 )
                 .await
@@ -438,7 +438,7 @@ async fn handle_node(
     nats_publisher: Option<Arc<NatsPublisher>>,
     router_uuid: Uuid,
     router_name: &str,
-    island_id: &str,
+    hive_id: &str,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
     let (mut reader, mut writer) = stream.into_split();
@@ -475,14 +475,14 @@ async fn handle_node(
         )));
     }
 
-    let node_name = normalize_name(&payload.name, island_id);
+    let node_name = normalize_name(&payload.name, hive_id);
     tracing::info!(node = %node_name, "loading config snapshot");
     let snapshot = refresh_config(
         &config_reader,
         &static_routes,
         &vpn_rules,
         &config_version,
-        island_id,
+        hive_id,
         &nodes,
         &peer_nodes,
         &shm,
@@ -498,12 +498,12 @@ async fn handle_node(
         let peer_nodes = Arc::clone(&peer_nodes);
         let static_routes = Arc::clone(&static_routes);
         let fib = Arc::clone(&fib);
-        let island_id = island_id.to_string();
+        let hive_id = hive_id.to_string();
         tokio::spawn(async move {
             let _ = refresh_lsa(
                 &lsa_reader,
                 &lsa_snapshot,
-                &island_id,
+                &hive_id,
                 &nodes,
                 &peer_nodes,
                 &static_routes,
@@ -537,7 +537,7 @@ async fn handle_node(
     if is_gateway {
         let _ = broadcast_lsa_direct(
             router_uuid,
-            island_id,
+            hive_id,
             &nodes,
             &peer_nodes,
             &static_routes,
@@ -590,7 +590,7 @@ async fn handle_node(
                                 &static_routes,
                                 &vpn_rules,
                                 &config_version,
-                                island_id,
+                                hive_id,
                                 &nodes,
                                 &peer_nodes,
                                 &shm,
@@ -645,7 +645,7 @@ async fn handle_node(
                             if is_gateway {
                                 let _ = broadcast_lsa_direct(
                                     router_uuid,
-                                    island_id,
+                                    hive_id,
                                     &nodes,
                                     &peer_nodes,
                                     &static_routes,
@@ -660,7 +660,7 @@ async fn handle_node(
                         if msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
                             let payload: OpaReloadPayload =
                                 serde_json::from_value(msg.payload.clone())?;
-                            apply_opa_reload(&opa, &opa_reader, &shm, island_id, &payload).await;
+                            apply_opa_reload(&opa, &opa_reader, &shm, hive_id, &payload).await;
                             let src_uuid = Uuid::parse_str(&msg.routing.src).ok();
                             let local_senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = {
                                 let nodes_guard = nodes.lock().await;
@@ -694,7 +694,7 @@ async fn handle_node(
                         &static_routes,
                         &vpn_rules,
                         &config_version,
-                        island_id,
+                        hive_id,
                         &nodes,
                         &peer_nodes,
                         &shm,
@@ -706,7 +706,7 @@ async fn handle_node(
                     let _ = refresh_lsa(
                         &lsa_reader,
                         &lsa_snapshot,
-                        island_id,
+                        hive_id,
                         &nodes,
                         &peer_nodes,
                         &static_routes,
@@ -749,7 +749,7 @@ async fn handle_node(
     if is_gateway {
         let _ = broadcast_lsa_direct(
             router_uuid,
-            island_id,
+            hive_id,
             &nodes,
             &peer_nodes,
             &static_routes,
@@ -861,8 +861,8 @@ async fn handle_message(
                             &remote.name,
                             remote.vpn_id,
                         ) {
-                            forward_to_island(
-                                &remote.island_id,
+                            forward_to_hive(
+                                &remote.hive_id,
                                 msg,
                                 is_gateway,
                                 peer_routers,
@@ -1001,9 +1001,9 @@ async fn handle_message(
                     }
                     send_unreachable_to(msg, &src_handle.sender, router_uuid, "PEER_UNAVAILABLE")?;
                 }
-                ResolvedRoute::ForwardIsland(island_id) => {
-                    forward_to_island(
-                        &island_id,
+                ResolvedRoute::ForwardHive(hive_id) => {
+                    forward_to_hive(
+                        &hive_id,
                         msg,
                         is_gateway,
                         peer_routers,
@@ -1093,12 +1093,12 @@ async fn send_to_peer_router(
 
 async fn send_to_wan_peer(
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
-    island_id: &str,
+    hive_id: &str,
     msg: &Message,
 ) -> Result<bool, RouterError> {
     let peer = {
         let peers_guard = wan_peers.lock().await;
-        peers_guard.get(island_id).cloned()
+        peers_guard.get(hive_id).cloned()
     };
     let Some(peer) = peer else {
         return Ok(false);
@@ -1150,8 +1150,8 @@ async fn broadcast_to_wan(
     Ok(())
 }
 
-async fn forward_to_island(
-    island_id: &str,
+async fn forward_to_hive(
+    hive_id: &str,
     msg: &Message,
     is_gateway: bool,
     peer_routers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
@@ -1165,7 +1165,7 @@ async fn forward_to_island(
         return Ok(());
     }
     if is_gateway {
-        if send_to_wan_peer(wan_peers, island_id, msg).await? {
+        if send_to_wan_peer(wan_peers, hive_id, msg).await? {
             return Ok(());
         }
         send_unreachable_to(msg, sender, router_uuid, "WAN_UNAVAILABLE")?;
@@ -1254,7 +1254,7 @@ fn action_from_label(label: &str) -> Option<u8> {
 }
 
 async fn build_local_lsa_payload(
-    island_id: &str,
+    hive_id: &str,
     seq: u64,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
@@ -1299,7 +1299,7 @@ async fn build_local_lsa_payload(
             prefix: route.pattern,
             match_kind: match_kind_label(route.match_kind).to_string(),
             action: action_label(route.action).to_string(),
-            next_hop_island: route.next_hop_island,
+            next_hop_hive: route.next_hop_hive,
             metric: route.metric,
         })
         .collect();
@@ -1322,7 +1322,7 @@ async fn build_local_lsa_payload(
         });
     }
     LsaPayload {
-        island: island_id.to_string(),
+        hive: hive_id.to_string(),
         seq,
         timestamp: now_epoch_ms().to_string(),
         nodes,
@@ -1331,7 +1331,7 @@ async fn build_local_lsa_payload(
     }
 }
 
-async fn broadcast_lsa(ctx: &WanContext, target_island: Option<&str>) -> Result<(), RouterError> {
+async fn broadcast_lsa(ctx: &WanContext, target_hive: Option<&str>) -> Result<(), RouterError> {
     let peers: Vec<(String, WanPeer)> = {
         let guard = ctx.wan_peers.lock().await;
         guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
@@ -1344,7 +1344,7 @@ async fn broadcast_lsa(ctx: &WanContext, target_island: Option<&str>) -> Result<
     let seq = *seq_guard;
     drop(seq_guard);
     let payload = build_local_lsa_payload(
-        &ctx.island_id,
+        &ctx.hive_id,
         seq,
         &ctx.nodes,
         &ctx.peer_nodes,
@@ -1352,9 +1352,9 @@ async fn broadcast_lsa(ctx: &WanContext, target_island: Option<&str>) -> Result<
         &ctx.vpn_rules,
     )
     .await;
-    for (island, peer) in peers.iter() {
-        if let Some(target) = target_island {
-            if target != island {
+    for (hive, peer) in peers.iter() {
+        if let Some(target) = target_hive {
+            if target != hive {
                 continue;
             }
         }
@@ -1372,7 +1372,7 @@ async fn broadcast_lsa(ctx: &WanContext, target_island: Option<&str>) -> Result<
 
 async fn broadcast_lsa_direct(
     router_uuid: Uuid,
-    island_id: &str,
+    hive_id: &str,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
@@ -1392,8 +1392,8 @@ async fn broadcast_lsa_direct(
     let seq = *seq_guard;
     drop(seq_guard);
     let payload =
-        build_local_lsa_payload(island_id, seq, nodes, peer_nodes, static_routes, vpn_rules).await;
-    for (_island, peer) in peers {
+        build_local_lsa_payload(hive_id, seq, nodes, peer_nodes, static_routes, vpn_rules).await;
+    for (_hive, peer) in peers {
         let msg = build_lsa(
             &router_uuid.to_string(),
             &peer.router_uuid.to_string(),
@@ -1407,11 +1407,11 @@ async fn broadcast_lsa_direct(
 }
 
 async fn apply_lsa_payload(
-    lsa_state: &Arc<Mutex<std::collections::HashMap<String, RemoteIslandState>>>,
+    lsa_state: &Arc<Mutex<std::collections::HashMap<String, RemoteHiveState>>>,
     payload: LsaPayload,
 ) -> bool {
     let mut state_guard = lsa_state.lock().await;
-    let entry = state_guard.entry(payload.island.clone()).or_default();
+    let entry = state_guard.entry(payload.hive.clone()).or_default();
     if payload.seq <= entry.last_seq {
         return false;
     }
@@ -1425,7 +1425,7 @@ async fn apply_lsa_payload(
 }
 
 async fn write_lsa_state(
-    lsa_state: &Arc<Mutex<std::collections::HashMap<String, RemoteIslandState>>>,
+    lsa_state: &Arc<Mutex<std::collections::HashMap<String, RemoteHiveState>>>,
     lsa_writer: &Arc<Mutex<Option<LsaRegionWriter>>>,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
 ) {
@@ -1434,22 +1434,22 @@ async fn write_lsa_state(
         return;
     };
     let state_guard = lsa_state.lock().await;
-    let mut islands: Vec<(String, RemoteIslandState)> = state_guard
+    let mut hives: Vec<(String, RemoteHiveState)> = state_guard
         .iter()
         .map(|(name, state)| (name.clone(), state.clone()))
         .collect();
-    islands.sort_by(|a, b| a.0.cmp(&b.0));
+    hives.sort_by(|a, b| a.0.cmp(&b.0));
     drop(state_guard);
 
-    let mut island_entries: Vec<RemoteIslandEntry> = Vec::new();
+    let mut hive_entries: Vec<RemoteHiveEntry> = Vec::new();
     let mut node_entries: Vec<RemoteNodeEntry> = Vec::new();
     let mut route_entries: Vec<RemoteRouteEntry> = Vec::new();
     let mut vpn_entries: Vec<RemoteVpnEntry> = Vec::new();
 
-    for (index, (island_id, state)) in islands.iter().enumerate() {
-        let mut island_entry = RemoteIslandEntry {
-            island_id: [0u8; 64],
-            island_id_len: 0,
+    for (index, (hive_id, state)) in hives.iter().enumerate() {
+        let mut hive_entry = RemoteHiveEntry {
+            hive_id: [0u8; 64],
+            hive_id_len: 0,
             last_lsa_seq: state.last_seq,
             last_updated: state.last_updated,
             flags: state.flags,
@@ -1457,9 +1457,9 @@ async fn write_lsa_state(
             route_count: state.routes.len() as u32,
             vpn_count: state.vpns.len() as u32,
         };
-        island_entry.island_id_len =
-            copy_bytes_with_len(&mut island_entry.island_id, island_id) as u16;
-        island_entries.push(island_entry);
+        hive_entry.hive_id_len =
+            copy_bytes_with_len(&mut hive_entry.hive_id, hive_id) as u16;
+        hive_entries.push(hive_entry);
 
         for node in state.nodes.iter() {
             let Ok(uuid) = Uuid::parse_str(&node.uuid) else {
@@ -1470,7 +1470,7 @@ async fn write_lsa_state(
                 name: [0u8; 256],
                 name_len: 0,
                 vpn_id: node.vpn_id,
-                island_index: index as u16,
+                hive_index: index as u16,
                 flags: FLAG_ACTIVE,
                 _reserved: [0u8; 6],
             };
@@ -1490,18 +1490,18 @@ async fn write_lsa_state(
                 prefix_len: 0,
                 match_kind,
                 action,
-                next_hop_island: [0u8; 32],
-                next_hop_island_len: 0,
+                next_hop_hive: [0u8; 32],
+                next_hop_hive_len: 0,
                 _pad: [0u8; 3],
                 metric: route.metric,
                 priority: 0,
                 flags: FLAG_ACTIVE,
-                island_index: index as u16,
+                hive_index: index as u16,
                 _reserved: [0u8; 14],
             };
             entry.prefix_len = copy_bytes_with_len(&mut entry.prefix, &route.prefix) as u16;
-            entry.next_hop_island_len =
-                copy_bytes_with_len(&mut entry.next_hop_island, &route.next_hop_island) as u8;
+            entry.next_hop_hive_len =
+                copy_bytes_with_len(&mut entry.next_hop_hive, &route.next_hop_hive) as u8;
             route_entries.push(entry);
         }
 
@@ -1517,7 +1517,7 @@ async fn write_lsa_state(
                 vpn_id: vpn.vpn_id,
                 priority: 0,
                 flags: FLAG_ACTIVE,
-                island_index: index as u16,
+                hive_index: index as u16,
                 _reserved: [0u8; 18],
             };
             entry.pattern_len = copy_bytes_with_len(&mut entry.pattern, &vpn.pattern) as u16;
@@ -1526,7 +1526,7 @@ async fn write_lsa_state(
     }
 
     if let Err(err) =
-        writer.write_snapshot(&island_entries, &node_entries, &route_entries, &vpn_entries)
+        writer.write_snapshot(&hive_entries, &node_entries, &route_entries, &vpn_entries)
     {
         tracing::warn!("lsa snapshot write failed: {err}");
         return;
@@ -1540,7 +1540,7 @@ async fn write_lsa_state(
 async fn lsa_refresh_loop(
     lsa_reader: Arc<Mutex<Option<LsaRegionReader>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
-    island_id: &str,
+    hive_id: &str,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
@@ -1552,7 +1552,7 @@ async fn lsa_refresh_loop(
         let _ = refresh_lsa(
             &lsa_reader,
             &lsa_snapshot,
-            island_id,
+            hive_id,
             &nodes,
             &peer_nodes,
             &static_routes,
@@ -1661,7 +1661,7 @@ async fn handle_wan_connection(
         protocol: "fluxbee/1.16".to_string(),
         router_id: ctx.router_uuid.to_string(),
         router_name: ctx.router_name.clone(),
-        island_id: ctx.island_id.clone(),
+        hive_id: ctx.hive_id.clone(),
         capabilities: vec!["lsa".to_string(), "forwarding".to_string()],
         timers: WanTimers {
             hello_interval_ms: ctx.hello_interval_ms,
@@ -1686,15 +1686,15 @@ async fn handle_wan_connection(
         return Ok(());
     }
     let peer_hello: WanHelloPayload = serde_json::from_value(msg.payload)?;
-    if !ctx.authorized_islands.is_empty() && !ctx.authorized_islands.contains(&peer_hello.island_id)
+    if !ctx.authorized_hives.is_empty() && !ctx.authorized_hives.contains(&peer_hello.hive_id)
     {
         let reject = build_wan_reject(
             &ctx.router_uuid.to_string(),
             &peer_hello.router_id,
             &Uuid::new_v4().to_string(),
             WanRejectPayload {
-                reason: "ISLAND_NOT_AUTHORIZED".to_string(),
-                message: format!("Island '{}' not authorized", peer_hello.island_id),
+                reason: "HIVE_NOT_AUTHORIZED".to_string(),
+                message: format!("Hive '{}' not authorized", peer_hello.hive_id),
             },
         );
         let _ = tx.send(serde_json::to_vec(&reject)?);
@@ -1730,16 +1730,16 @@ async fn handle_wan_connection(
     {
         let mut guard = ctx.wan_peers.lock().await;
         guard.insert(
-            peer_hello.island_id.clone(),
+            peer_hello.hive_id.clone(),
             WanPeer {
                 sender: tx.clone(),
                 router_uuid: peer_uuid,
-                island_id: peer_hello.island_id.clone(),
+                hive_id: peer_hello.hive_id.clone(),
             },
         );
     }
 
-    let _ = broadcast_lsa(&ctx, Some(&peer_hello.island_id)).await;
+    let _ = broadcast_lsa(&ctx, Some(&peer_hello.hive_id)).await;
 
     loop {
         match read_frame(&mut reader).await? {
@@ -1753,7 +1753,7 @@ async fn handle_wan_connection(
     }
     {
         let mut guard = ctx.wan_peers.lock().await;
-        guard.remove(&peer_hello.island_id);
+        guard.remove(&peer_hello.hive_id);
     }
     writer_task.abort();
     Ok(())
@@ -1868,8 +1868,8 @@ async fn handle_wan_message(
                             &remote.name,
                             remote.vpn_id,
                         ) {
-                            forward_to_island(
-                                &remote.island_id,
+                            forward_to_hive(
+                                &remote.hive_id,
                                 msg,
                                 true,
                                 &ctx.peer_routers,
@@ -1990,9 +1990,9 @@ async fn handle_wan_message(
                     }
                     send_unreachable_to(msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
                 }
-                ResolvedRoute::ForwardIsland(island_id) => {
-                    forward_to_island(
-                        &island_id,
+                ResolvedRoute::ForwardHive(hive_id) => {
+                    forward_to_hive(
+                        &hive_id,
                         msg,
                         true,
                         &ctx.peer_routers,
@@ -2025,7 +2025,7 @@ async fn peer_discovery_loop(
     self_uuid: Uuid,
     self_router_name: &str,
     self_shm_name: &str,
-    island_id: &str,
+    hive_id: &str,
     socket_dir: PathBuf,
     peers: Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
@@ -2046,7 +2046,7 @@ async fn peer_discovery_loop(
 ) {
     let mut ticker = time::interval(Duration::from_secs(5));
     loop {
-        let regions = discover_peer_regions(self_uuid, self_shm_name, island_id);
+        let regions = discover_peer_regions(self_uuid, self_shm_name, hive_id);
         let mut updated_nodes: HashMap<Uuid, PeerNode> = HashMap::new();
         let mut peer_uuids: Vec<Uuid> = Vec::new();
         let mut updated_routers: HashMap<Uuid, PeerRouter> = HashMap::new();
@@ -2094,7 +2094,7 @@ async fn peer_discovery_loop(
                     let shm = Arc::clone(&shm);
                     let opa = Arc::clone(&opa);
                     let opa_reader = Arc::clone(&opa_reader);
-                    let island_id = island_id.to_string();
+                    let hive_id = hive_id.to_string();
                     let self_router_name = self_router_name.to_string();
                     let self_shm_name = self_shm_name.to_string();
                     let vpn_rules = Arc::clone(&vpn_rules);
@@ -2121,7 +2121,7 @@ async fn peer_discovery_loop(
                             shm,
                             opa,
                             opa_reader,
-                            &island_id,
+                            &hive_id,
                             lsa_snapshot,
                             fib,
                             is_gateway,
@@ -2139,7 +2139,7 @@ fn should_initiate_peer(self_uuid: Uuid, peer_uuid: Uuid) -> bool {
     self_uuid.as_u128() < peer_uuid.as_u128()
 }
 
-fn discover_peer_regions(self_uuid: Uuid, self_shm_name: &str, island_id: &str) -> Vec<PeerRegion> {
+fn discover_peer_regions(self_uuid: Uuid, self_shm_name: &str, hive_id: &str) -> Vec<PeerRegion> {
     let mut regions = Vec::new();
     let Ok(entries) = fs::read_dir("/dev/shm") else {
         return regions;
@@ -2164,7 +2164,7 @@ fn discover_peer_regions(self_uuid: Uuid, self_shm_name: &str, island_id: &str) 
         let Some(snapshot) = reader.read_snapshot() else {
             continue;
         };
-        if snapshot.header.island_id != island_id {
+        if snapshot.header.hive_id != hive_id {
             continue;
         }
         if snapshot.header.router_uuid == self_uuid {
@@ -2220,7 +2220,7 @@ async fn connect_to_peer(
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
-    island_id: &str,
+    hive_id: &str,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
     is_gateway: bool,
@@ -2277,7 +2277,7 @@ async fn connect_to_peer(
                         &shm,
                         &opa,
                         &opa_reader,
-                        island_id,
+                        hive_id,
                         &fib,
                         self_uuid,
                         is_gateway,
@@ -2313,7 +2313,7 @@ async fn handle_peer_incoming(
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
-    island_id: String,
+    hive_id: String,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     is_gateway: bool,
@@ -2368,7 +2368,7 @@ async fn handle_peer_incoming(
                         &shm,
                         &opa,
                         &opa_reader,
-                        &island_id,
+                        &hive_id,
                         &fib,
                         router_uuid,
                         is_gateway,
@@ -2404,7 +2404,7 @@ async fn handle_peer_message(
     shm: &Arc<Mutex<RouterRegionWriter>>,
     opa: &Arc<Mutex<OpaResolver>>,
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
-    island_id: &str,
+    hive_id: &str,
     fib: &Arc<Mutex<Vec<FibEntry>>>,
     router_uuid: Uuid,
     is_gateway: bool,
@@ -2420,7 +2420,7 @@ async fn handle_peer_message(
             static_routes,
             vpn_rules,
             config_version,
-            island_id,
+            hive_id,
             nodes,
             peer_nodes,
             shm,
@@ -2434,7 +2434,7 @@ async fn handle_peer_message(
     }
     if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
         let payload: OpaReloadPayload = serde_json::from_value(msg.payload.clone())?;
-        apply_opa_reload(opa, opa_reader, shm, island_id, &payload).await;
+        apply_opa_reload(opa, opa_reader, shm, hive_id, &payload).await;
         tracing::info!("opa reload applied (peer)");
         return Ok(());
     }
@@ -2466,7 +2466,7 @@ async fn handle_peer_message(
     let _ = refresh_lsa(
         lsa_reader,
         lsa_snapshot,
-        island_id,
+        hive_id,
         nodes,
         peer_nodes,
         static_routes,
@@ -2516,8 +2516,8 @@ async fn handle_peer_message(
                         remote.vpn_id,
                     ) {
                         if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            forward_to_island(
-                                &remote.island_id,
+                            forward_to_hive(
+                                &remote.hive_id,
                                 msg,
                                 is_gateway,
                                 peer_routers,
@@ -2646,10 +2646,10 @@ async fn handle_peer_message(
                         send_unreachable_to(msg, &peer.sender, router_uuid, "PEER_UNAVAILABLE")?;
                     }
                 }
-                ResolvedRoute::ForwardIsland(island_id) => {
+                ResolvedRoute::ForwardHive(hive_id) => {
                     if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        forward_to_island(
-                            &island_id,
+                        forward_to_hive(
+                            &hive_id,
                             msg,
                             is_gateway,
                             peer_routers,
@@ -2678,32 +2678,32 @@ fn router_name(router_uuid: Uuid) -> String {
     format!("router:{}", router_uuid)
 }
 
-fn normalize_name(name: &str, island_id: &str) -> String {
+fn normalize_name(name: &str, hive_id: &str) -> String {
     if name.contains('@') {
         name.to_string()
     } else {
-        format!("{}@{}", name, island_id)
+        format!("{}@{}", name, hive_id)
     }
 }
 
 struct RemoteNodeInfo {
     name: String,
     vpn_id: u32,
-    island_id: String,
+    hive_id: String,
 }
 
 fn find_remote_node(snapshot: &Option<LsaSnapshot>, uuid: Uuid) -> Option<RemoteNodeInfo> {
     let snapshot = snapshot.as_ref()?;
-    let mut islands: HashMap<u16, String> = HashMap::new();
-    for (idx, island) in snapshot.islands.iter().enumerate() {
-        if island.island_id_len == 0 {
+    let mut hives: HashMap<u16, String> = HashMap::new();
+    for (idx, hive) in snapshot.hives.iter().enumerate() {
+        if hive.hive_id_len == 0 {
             continue;
         }
-        if island.flags & FLAG_STALE != 0 {
+        if hive.flags & FLAG_STALE != 0 {
             continue;
         }
-        let name = bytes_to_string(&island.island_id, island.island_id_len as usize).to_string();
-        islands.insert(idx as u16, name);
+        let name = bytes_to_string(&hive.hive_id, hive.hive_id_len as usize).to_string();
+        hives.insert(idx as u16, name);
     }
     for node in snapshot.nodes.iter() {
         if node.name_len == 0 {
@@ -2716,12 +2716,12 @@ fn find_remote_node(snapshot: &Option<LsaSnapshot>, uuid: Uuid) -> Option<Remote
         if node_uuid != uuid {
             continue;
         }
-        let island_id = islands.get(&node.island_index)?.to_string();
+        let hive_id = hives.get(&node.hive_index)?.to_string();
         let name = bytes_to_string(&node.name, node.name_len as usize).to_string();
         return Some(RemoteNodeInfo {
             name,
             vpn_id: node.vpn_id,
-            island_id,
+            hive_id,
         });
     }
     None
@@ -2782,11 +2782,11 @@ struct PeerHandle {
 struct WanPeer {
     sender: mpsc::UnboundedSender<Vec<u8>>,
     router_uuid: Uuid,
-    island_id: String,
+    hive_id: String,
 }
 
 #[derive(Clone, Debug, Default)]
-struct RemoteIslandState {
+struct RemoteHiveState {
     last_seq: u64,
     last_updated: u64,
     flags: u16,
@@ -2798,16 +2798,16 @@ struct RemoteIslandState {
 struct WanContext {
     router_uuid: Uuid,
     router_name: String,
-    island_id: String,
+    hive_id: String,
     hello_interval_ms: u64,
     dead_interval_ms: u64,
-    authorized_islands: Vec<String>,
+    authorized_hives: Vec<String>,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     peer_routers: Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
     peers: Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
-    lsa_state: Arc<Mutex<std::collections::HashMap<String, RemoteIslandState>>>,
+    lsa_state: Arc<Mutex<std::collections::HashMap<String, RemoteHiveState>>>,
     lsa_writer: Arc<Mutex<Option<LsaRegionWriter>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
@@ -2823,7 +2823,7 @@ struct StaticRoute {
     pattern: String,
     match_kind: u8,
     action: u8,
-    next_hop_island: String,
+    next_hop_hive: String,
     priority: u16,
     metric: u32,
     installed_at: u64,
@@ -2846,7 +2846,7 @@ enum FibSource {
 enum FibNextHop {
     Local(Uuid),
     Router(Uuid),
-    Island(String),
+    Hive(String),
 }
 
 #[derive(Clone, Debug)]
@@ -2868,7 +2868,7 @@ enum ResolvedRoute {
     Unreachable(&'static str),
     Deliver(Uuid),
     ForwardRouter(Uuid),
-    ForwardIsland(String),
+    ForwardHive(String),
 }
 
 struct PeerRegion {
@@ -2908,7 +2908,7 @@ async fn refresh_config(
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: &Arc<Mutex<Vec<VpnAssignment>>>,
     config_version: &Arc<Mutex<u64>>,
-    island_id: &str,
+    hive_id: &str,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     shm: &Arc<Mutex<RouterRegionWriter>>,
@@ -2925,7 +2925,7 @@ async fn refresh_config(
             }
             if reader.is_none() {
                 if let Ok(new_reader) =
-                    ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", island_id))
+                    ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", hive_id))
                 {
                     *reader = Some(new_reader);
                 }
@@ -2942,7 +2942,7 @@ async fn refresh_config(
             let mut reader = config_reader.lock().await;
             *reader = None;
             if let Ok(new_reader) =
-                ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", island_id))
+                ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", hive_id))
             {
                 *reader = Some(new_reader);
             }
@@ -2964,9 +2964,9 @@ async fn refresh_config(
                     pattern: bytes_to_string(&route.prefix, route.prefix_len as usize).to_string(),
                     match_kind: route.match_kind,
                     action: route.action,
-                    next_hop_island: bytes_to_string(
-                        &route.next_hop_island,
-                        route.next_hop_island_len as usize,
+                    next_hop_hive: bytes_to_string(
+                        &route.next_hop_hive,
+                        route.next_hop_hive_len as usize,
                     )
                     .to_string(),
                     priority: route.priority,
@@ -3000,10 +3000,10 @@ async fn apply_opa_reload(
     opa: &Arc<Mutex<OpaResolver>>,
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
     shm: &Arc<Mutex<RouterRegionWriter>>,
-    island_id: &str,
+    hive_id: &str,
     payload: &OpaReloadPayload,
 ) {
-    let Some(snapshot) = read_opa_snapshot(opa_reader, island_id).await else {
+    let Some(snapshot) = read_opa_snapshot(opa_reader, hive_id).await else {
         tracing::warn!("opa reload ignored: opa region not available");
         return;
     };
@@ -3064,9 +3064,9 @@ async fn maybe_refresh_opa_from_shm(
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
     opa: &Arc<Mutex<OpaResolver>>,
     shm: &Arc<Mutex<RouterRegionWriter>>,
-    island_id: &str,
+    hive_id: &str,
 ) {
-    let header = read_opa_header(opa_reader, island_id).await;
+    let header = read_opa_header(opa_reader, hive_id).await;
     let Some(header) = header else {
         return;
     };
@@ -3086,7 +3086,7 @@ async fn maybe_refresh_opa_from_shm(
     if header.policy_version == current_version {
         return;
     }
-    let Some(snapshot) = read_opa_snapshot(opa_reader, island_id).await else {
+    let Some(snapshot) = read_opa_snapshot(opa_reader, hive_id).await else {
         tracing::warn!(
             version = header.policy_version,
             "opa refresh skipped: unable to read snapshot"
@@ -3098,11 +3098,11 @@ async fn maybe_refresh_opa_from_shm(
 
 async fn read_opa_header(
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
-    island_id: &str,
+    hive_id: &str,
 ) -> Option<crate::shm::OpaHeaderSnapshot> {
     let mut guard = opa_reader.lock().await;
     if guard.is_none() {
-        if let Ok(reader) = OpaRegionReader::open_read_only(&format!("/jsr-opa-{}", island_id)) {
+        if let Ok(reader) = OpaRegionReader::open_read_only(&format!("/jsr-opa-{}", hive_id)) {
             *guard = Some(reader);
         } else {
             return None;
@@ -3113,11 +3113,11 @@ async fn read_opa_header(
 
 async fn read_opa_snapshot(
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
-    island_id: &str,
+    hive_id: &str,
 ) -> Option<OpaSnapshot> {
     let mut guard = opa_reader.lock().await;
     if guard.is_none() {
-        if let Ok(reader) = OpaRegionReader::open_read_only(&format!("/jsr-opa-{}", island_id)) {
+        if let Ok(reader) = OpaRegionReader::open_read_only(&format!("/jsr-opa-{}", hive_id)) {
             *guard = Some(reader);
         } else {
             return None;
@@ -3175,7 +3175,7 @@ async fn apply_opa_snapshot(
 async fn refresh_lsa(
     lsa_reader: &Arc<Mutex<Option<LsaRegionReader>>>,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
-    island_id: &str,
+    hive_id: &str,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
@@ -3185,7 +3185,7 @@ async fn refresh_lsa(
         let mut reader = lsa_reader.lock().await;
         if reader.is_none() {
             if let Ok(new_reader) =
-                LsaRegionReader::open_read_only(&format!("/jsr-lsa-{}", island_id))
+                LsaRegionReader::open_read_only(&format!("/jsr-lsa-{}", hive_id))
             {
                 *reader = Some(new_reader);
             }
@@ -3341,10 +3341,10 @@ async fn rebuild_fib(
         });
     }
     for route in routes_snapshot {
-        let next_hop = if route.next_hop_island.is_empty() {
+        let next_hop = if route.next_hop_hive.is_empty() {
             None
         } else {
-            Some(FibNextHop::Island(route.next_hop_island.clone()))
+            Some(FibNextHop::Hive(route.next_hop_hive.clone()))
         };
         entries.push(FibEntry {
             pattern: route.pattern,
@@ -3361,20 +3361,20 @@ async fn rebuild_fib(
     }
 
     if let Some(snapshot) = lsa_snapshot {
-        let mut island_map: Vec<(String, u16, u16, u64)> = Vec::new();
-        for (idx, island) in snapshot.islands.iter().enumerate() {
-            if island.island_id_len == 0 {
+        let mut hive_map: Vec<(String, u16, u16, u64)> = Vec::new();
+        for (idx, hive) in snapshot.hives.iter().enumerate() {
+            if hive.hive_id_len == 0 {
                 continue;
             }
-            let name = bytes_to_string(&island.island_id, island.island_id_len as usize);
-            if island.flags & FLAG_STALE != 0 {
+            let name = bytes_to_string(&hive.hive_id, hive.hive_id_len as usize);
+            if hive.flags & FLAG_STALE != 0 {
                 continue;
             }
-            island_map.push((
+            hive_map.push((
                 name.to_string(),
                 idx as u16,
-                island.flags,
-                island.last_updated,
+                hive.flags,
+                hive.last_updated,
             ));
         }
 
@@ -3385,11 +3385,11 @@ async fn rebuild_fib(
             if node.flags & (FLAG_DELETED | FLAG_STALE) != 0 {
                 continue;
             }
-            let island = island_map
+            let hive = hive_map
                 .iter()
-                .find(|(_, idx, _, _)| *idx == node.island_index)
+                .find(|(_, idx, _, _)| *idx == node.hive_index)
                 .map(|(name, _, _, updated)| (name.clone(), *updated));
-            let Some((island_id, updated_at)) = island else {
+            let Some((hive_id, updated_at)) = hive else {
                 continue;
             };
             let name = bytes_to_string(&node.name, node.name_len as usize).to_string();
@@ -3398,7 +3398,7 @@ async fn rebuild_fib(
                 match_kind: MATCH_EXACT,
                 vpn_id: node.vpn_id,
                 source: FibSource::LsaNode,
-                next_hop: Some(FibNextHop::Island(island_id)),
+                next_hop: Some(FibNextHop::Hive(hive_id)),
                 admin_distance: ADMIN_DISTANCE_LSA,
                 priority: 0,
                 metric: 0,
@@ -3414,24 +3414,24 @@ async fn rebuild_fib(
             if route.flags & (FLAG_DELETED | FLAG_STALE) != 0 {
                 continue;
             }
-            let island = island_map
+            let hive = hive_map
                 .iter()
-                .find(|(_, idx, _, _)| *idx == route.island_index)
+                .find(|(_, idx, _, _)| *idx == route.hive_index)
                 .map(|(name, _, _, updated)| (name.clone(), *updated));
-            let Some((island_id, updated_at)) = island else {
+            let Some((hive_id, updated_at)) = hive else {
                 continue;
             };
             let prefix = bytes_to_string(&route.prefix, route.prefix_len as usize).to_string();
-            let mut next_hop_island =
-                bytes_to_string(&route.next_hop_island, route.next_hop_island_len as usize)
+            let mut next_hop_hive =
+                bytes_to_string(&route.next_hop_hive, route.next_hop_hive_len as usize)
                     .to_string();
-            if next_hop_island.is_empty() {
-                next_hop_island = island_id.clone();
+            if next_hop_hive.is_empty() {
+                next_hop_hive = hive_id.clone();
             }
-            let next_hop = if next_hop_island.is_empty() {
+            let next_hop = if next_hop_hive.is_empty() {
                 None
             } else {
-                Some(FibNextHop::Island(next_hop_island))
+                Some(FibNextHop::Hive(next_hop_hive))
             };
             entries.push(FibEntry {
                 pattern: prefix,
@@ -3573,14 +3573,14 @@ async fn resolve_by_name(
     meta: &Meta,
 ) -> Result<ResolvedRoute, RouterError> {
     if let Some(base) = target.strip_suffix("@*") {
-        if let Some(src_island) = extract_island(&src.name) {
-            let local_target = format!("{}@{}", base, src_island);
+        if let Some(src_hive) = extract_hive(&src.name) {
+            let local_target = format!("{}@{}", base, src_hive);
             let local = resolve_by_name_inner(&local_target, src, nodes, fib, meta).await?;
             if !matches!(local, ResolvedRoute::Unreachable("NODE_NOT_FOUND")) {
                 return Ok(local);
             }
         }
-        return resolve_by_name_any_island(base, src, nodes, fib, meta).await;
+        return resolve_by_name_any_hive(base, src, nodes, fib, meta).await;
     }
     resolve_by_name_inner(target, src, nodes, fib, meta).await
 }
@@ -3601,8 +3601,8 @@ async fn resolve_by_name_inner(
             FibSource::StaticRoute => match entry.action {
                 ACTION_DROP => return Ok(ResolvedRoute::Drop),
                 ACTION_FORWARD => {
-                    if let Some(FibNextHop::Island(island)) = &entry.next_hop {
-                        return Ok(ResolvedRoute::ForwardIsland(island.clone()));
+                    if let Some(FibNextHop::Hive(hive)) = &entry.next_hop {
+                        return Ok(ResolvedRoute::ForwardHive(hive.clone()));
                     }
                     continue;
                 }
@@ -3611,8 +3611,8 @@ async fn resolve_by_name_inner(
             FibSource::LsaRoute => match entry.action {
                 ACTION_DROP => return Ok(ResolvedRoute::Drop),
                 ACTION_FORWARD => {
-                    if let Some(FibNextHop::Island(island)) = &entry.next_hop {
-                        return Ok(ResolvedRoute::ForwardIsland(island.clone()));
+                    if let Some(FibNextHop::Hive(hive)) = &entry.next_hop {
+                        return Ok(ResolvedRoute::ForwardHive(hive.clone()));
                     }
                     continue;
                 }
@@ -3646,11 +3646,11 @@ async fn resolve_by_name_inner(
                 return Ok(ResolvedRoute::Unreachable("VPN_BLOCKED"));
             }
             FibSource::LsaNode => {
-                let Some(FibNextHop::Island(island)) = &entry.next_hop else {
+                let Some(FibNextHop::Hive(hive)) = &entry.next_hop else {
                     continue;
                 };
                 if vpn_allows_between(meta, &src.name, src.vpn_id, &entry.pattern, entry.vpn_id) {
-                    return Ok(ResolvedRoute::ForwardIsland(island.clone()));
+                    return Ok(ResolvedRoute::ForwardHive(hive.clone()));
                 }
                 return Ok(ResolvedRoute::Unreachable("VPN_BLOCKED"));
             }
@@ -3659,7 +3659,7 @@ async fn resolve_by_name_inner(
     Ok(ResolvedRoute::Unreachable("NODE_NOT_FOUND"))
 }
 
-async fn resolve_by_name_any_island(
+async fn resolve_by_name_any_hive(
     base: &str,
     src: &NodeHandle,
     nodes: &std::collections::HashMap<Uuid, NodeHandle>,
@@ -3670,7 +3670,7 @@ async fn resolve_by_name_any_island(
     for entry in fib_guard.iter() {
         let matched = match entry.source {
             FibSource::LocalNode | FibSource::PeerNode | FibSource::LsaNode => {
-                match_any_island(base, &entry.pattern)
+                match_any_hive(base, &entry.pattern)
             }
             FibSource::StaticRoute | FibSource::LsaRoute => {
                 let target = format!("{}@*", base);
@@ -3684,8 +3684,8 @@ async fn resolve_by_name_any_island(
             FibSource::StaticRoute => match entry.action {
                 ACTION_DROP => return Ok(ResolvedRoute::Drop),
                 ACTION_FORWARD => {
-                    if let Some(FibNextHop::Island(island)) = &entry.next_hop {
-                        return Ok(ResolvedRoute::ForwardIsland(island.clone()));
+                    if let Some(FibNextHop::Hive(hive)) = &entry.next_hop {
+                        return Ok(ResolvedRoute::ForwardHive(hive.clone()));
                     }
                     continue;
                 }
@@ -3694,8 +3694,8 @@ async fn resolve_by_name_any_island(
             FibSource::LsaRoute => match entry.action {
                 ACTION_DROP => return Ok(ResolvedRoute::Drop),
                 ACTION_FORWARD => {
-                    if let Some(FibNextHop::Island(island)) = &entry.next_hop {
-                        return Ok(ResolvedRoute::ForwardIsland(island.clone()));
+                    if let Some(FibNextHop::Hive(hive)) = &entry.next_hop {
+                        return Ok(ResolvedRoute::ForwardHive(hive.clone()));
                     }
                     continue;
                 }
@@ -3729,11 +3729,11 @@ async fn resolve_by_name_any_island(
                 return Ok(ResolvedRoute::Unreachable("VPN_BLOCKED"));
             }
             FibSource::LsaNode => {
-                let Some(FibNextHop::Island(island)) = &entry.next_hop else {
+                let Some(FibNextHop::Hive(hive)) = &entry.next_hop else {
                     continue;
                 };
                 if vpn_allows_between(meta, &src.name, src.vpn_id, &entry.pattern, entry.vpn_id) {
-                    return Ok(ResolvedRoute::ForwardIsland(island.clone()));
+                    return Ok(ResolvedRoute::ForwardHive(hive.clone()));
                 }
                 return Ok(ResolvedRoute::Unreachable("VPN_BLOCKED"));
             }
@@ -3742,11 +3742,11 @@ async fn resolve_by_name_any_island(
     Ok(ResolvedRoute::Unreachable("NODE_NOT_FOUND"))
 }
 
-fn extract_island(name: &str) -> Option<&str> {
-    name.split_once('@').map(|(_, island)| island)
+fn extract_hive(name: &str) -> Option<&str> {
+    name.split_once('@').map(|(_, hive)| hive)
 }
 
-fn match_any_island(base: &str, full_name: &str) -> bool {
+fn match_any_hive(base: &str, full_name: &str) -> bool {
     let Some((name_base, _)) = full_name.split_once('@') else {
         return false;
     };

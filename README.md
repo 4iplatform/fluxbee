@@ -24,7 +24,7 @@ Every message flows through a unified routing layer that knows who's talking, wh
 
 ## Why does this exist?
 
-**The problem:** Today's AI integrations are point-to-point. You connect an AI to WhatsApp. Another to your CRM. Another to email. Each one is an island. They don't share context. They can't hand off conversations. They can't be managed as a coherent system.
+**The problem:** Today's AI integrations are point-to-point. You connect an AI to WhatsApp. Another to your CRM. Another to email. Each one is an hive. They don't share context. They can't hand off conversations. They can't be managed as a coherent system.
 
 **The insight:** What if we treated AI agents the way organizations treat employees? Each one has a role, capabilities, and credentials. They're trained (prompted) for specific jobs. They work together, escalate to each other, and when they can't handle something, they bring in a human.
 
@@ -44,11 +44,11 @@ Every message flows through a unified routing layer that knows who's talking, wh
 
 Most systems only have L1. Some have L2. Fluxbee has all three, which means you can route based on *who someone is* and *what they need*, not just where the bytes go.
 
-### Islands
+### Hives
 
-An **island** is a deployment unit - a cluster of nodes that share memory and communicate via Unix sockets. Fast, local, zero serialization overhead.
+An **hive** is a deployment unit - a cluster of nodes that share memory and communicate via Unix sockets. Fast, local, zero serialization overhead.
 
-Islands connect to each other over the network. A customer in São Paulo talks to an AI agent in the São Paulo island. If that agent needs to escalate, the message routes to the Buenos Aires island where the senior agents live. The customer doesn't know. The routing is automatic.
+Hives connect to each other over the network. A customer in São Paulo talks to an AI agent in the São Paulo hive. If that agent needs to escalate, the message routes to the Buenos Aires hive where the senior agents live. The customer doesn't know. The routing is automatic.
 
 ### The Identity System (ILK)
 
@@ -88,7 +88,7 @@ This means:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         Mother Island                            │
+│                         Mother Hive                            │
 │                                                                  │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
 │  │ PostgreSQL   │  │ SY.identity  │  │ SY.admin     │          │
@@ -102,7 +102,7 @@ This means:
                            │
 ┌──────────────────────────┼──────────────────────────────────────┐
 │                          ▼                                       │
-│                    Production Island                             │
+│                    Production Hive                             │
 │                                                                  │
 │  ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐      │
 │  │ Router  │    │ Router  │    │ Gateway │    │ SY.*    │      │
@@ -139,7 +139,7 @@ This means:
 
 ### Shared Memory
 
-Within an island, nodes communicate through shared memory regions:
+Within an hive, nodes communicate through shared memory regions:
 - **Node table** - Who's connected right now
 - **Config** - Routes and VPNs
 - **Identity** - ILKs, degrees, capabilities
@@ -168,7 +168,7 @@ allow {
 }
 ```
 
-Policies are compiled to WASM and distributed to all islands. Changes propagate in seconds.
+Policies are compiled to WASM and distributed to all hives. Changes propagate in seconds.
 
 ---
 
@@ -212,8 +212,8 @@ Every message carries who sent it, who it's for, and what conversation it belong
 Agents can't operate without valid credentials. Training is versioned, hashed, and auditable. No "oops, we deployed the wrong prompt."
 
 ### 4. Local Speed, Global Reach
-Within an island: shared memory, microsecond latency.
-Between islands: async replication, eventual consistency.
+Within an hive: shared memory, microsecond latency.
+Between hives: async replication, eventual consistency.
 Best of both worlds.
 
 ### 5. Policy-Driven Routing
@@ -231,7 +231,7 @@ This is a working specification with partial implementation. The core router, sh
 ### Implemented
 - Core router with FIB and shared memory
 - Node library with split sender/receiver model
-- Inter-island gateway communication
+- Inter-hive gateway communication
 - OPA policy compilation and distribution
 - Configuration broadcast and replication
 

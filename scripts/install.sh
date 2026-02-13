@@ -34,7 +34,7 @@ fi
 sudo install -d "$CONFIG_DIR"
 sudo install -d "$STATE_DIR"
 sudo install -d "$STATE_DIR/state/nodes"
-sudo install -d "$STATE_DIR/islands"
+sudo install -d "$STATE_DIR/hives"
 sudo install -d "$STATE_DIR/opa"
 sudo install -d "$STATE_DIR/opa/current"
 sudo install -d "$STATE_DIR/opa/staged"
@@ -106,8 +106,8 @@ else
 fi
 sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
 
-if [[ -f "$ROOT_DIR/config/island.yaml" ]]; then
-  sudo install -m 0644 "$ROOT_DIR/config/island.yaml" "$CONFIG_DIR/island.yaml"
+if [[ -f "$ROOT_DIR/config/hive.yaml" ]]; then
+  sudo install -m 0644 "$ROOT_DIR/config/hive.yaml" "$CONFIG_DIR/hive.yaml"
 fi
 
 if [[ -f "$ROOT_DIR/config/sy-config-routes.yaml" ]]; then
@@ -160,7 +160,7 @@ sudo systemctl daemon-reload
 if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then
   echo "Applying ownership for test/dev user: $INSTALL_OWNER"
   sudo chown -R "$INSTALL_OWNER":"$INSTALL_OWNER" "$CONFIG_DIR" "$STATE_DIR" "$RUN_DIR"
-  sudo chown "$INSTALL_OWNER":"$INSTALL_OWNER" "$CONFIG_DIR/sy-config-routes.yaml" "$CONFIG_DIR/island.yaml" 2>/dev/null || true
+  sudo chown "$INSTALL_OWNER":"$INSTALL_OWNER" "$CONFIG_DIR/sy-config-routes.yaml" "$CONFIG_DIR/hive.yaml" 2>/dev/null || true
 fi
 
 echo "Installed config to $CONFIG_DIR, binaries to /usr/bin, systemd units, and runtime directories."

@@ -1,13 +1,13 @@
-island_id: "sandbox"
+hive_id: "sandbox"
 role: motherbee
 
-# WAN (gateway). Optional: remove block if no inter-island connectivity.
+# WAN (gateway). Optional: remove block if no inter-hive connectivity.
 wan:
   listen: "0.0.0.0:9000"
   gateway_name: "RT.gateway"
   uplinks:
     - address: "192.168.8.220:9000"
-  authorized_islands:
+  authorized_hives:
     - prod
 
 # Admin API (optional).

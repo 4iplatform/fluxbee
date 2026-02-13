@@ -24,8 +24,8 @@ use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
 type AdminError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Deserialize)]
-struct IslandFile {
-    island_id: String,
+struct HiveFile {
+    hive_id: String,
     role: Option<String>,
     admin: Option<AdminSection>,
     wan: Option<WanSection>,
@@ -38,7 +38,7 @@ struct AdminSection {
 
 #[derive(Debug, Deserialize)]
 struct WanSection {
-    authorized_islands: Option<Vec<String>>,
+    authorized_hives: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -46,8 +46,8 @@ struct AdminContext {
     config_dir: PathBuf,
     state_dir: PathBuf,
     socket_dir: PathBuf,
-    island_id: String,
-    authorized_islands: Vec<String>,
+    hive_id: String,
+    authorized_hives: Vec<String>,
 }
 
 struct AdminRouterClient {
@@ -149,7 +149,7 @@ struct RouteConfig {
     match_kind: Option<String>,
     action: String,
     #[serde(default)]
-    next_hop_island: Option<String>,
+    next_hop_hive: Option<String>,
     #[serde(default)]
     metric: Option<u32>,
     #[serde(default)]
@@ -181,18 +181,18 @@ async fn main() -> Result<(), AdminError> {
     let state_dir = json_router::paths::state_dir();
     let socket_dir = json_router::paths::router_socket_dir();
 
-    let island = load_island(&config_dir)?;
-    let island_id = island.island_id.clone();
-    let authorized_islands = island
+    let hive = load_hive(&config_dir)?;
+    let hive_id = hive.hive_id.clone();
+    let authorized_hives = hive
         .wan
         .as_ref()
-        .and_then(|wan| wan.authorized_islands.clone())
+        .and_then(|wan| wan.authorized_hives.clone())
         .unwrap_or_default();
-    if !is_mother_role(island.role.as_deref()) {
+    if !is_mother_role(hive.role.as_deref()) {
         tracing::warn!("SY.admin solo corre en motherbee; role != motherbee");
         return Ok(());
     }
-    let admin_listen = island
+    let admin_listen = hive
         .admin
         .and_then(|admin| admin.listen)
         .unwrap_or_else(|| "0.0.0.0:8080".to_string());
@@ -217,8 +217,8 @@ async fn main() -> Result<(), AdminError> {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
         socket_dir: socket_dir.clone(),
-        island_id,
-        authorized_islands,
+        hive_id,
+        authorized_hives,
     };
     let http_client = router_client.clone();
     tokio::spawn(async move {
@@ -252,7 +252,7 @@ struct OpaRequest {
     #[serde(default)]
     action: Option<String>,
     #[serde(default, alias = "target")]
-    island: Option<String>,
+    hive: Option<String>,
 }
 
 async fn run_broadcast_loop(
@@ -306,8 +306,8 @@ async fn run_broadcast_loop(
     }
 }
 
-fn load_island(config_dir: &Path) -> Result<IslandFile, AdminError> {
-    let data = fs::read_to_string(config_dir.join("island.yaml"))?;
+fn load_hive(config_dir: &Path) -> Result<HiveFile, AdminError> {
+    let data = fs::read_to_string(config_dir.join("hive.yaml"))?;
     Ok(serde_yaml::from_str(&data)?)
 }
 
@@ -318,10 +318,10 @@ async fn broadcast_config_changed(
     auto_apply: Option<bool>,
     version: u64,
     config: serde_json::Value,
-    target_island: Option<String>,
+    target_hive: Option<String>,
 ) -> Result<(), AdminError> {
-    let dst = match target_island {
-        Some(island) => Destination::Unicast(format!("SY.opa.rules@{}", island)),
+    let dst = match target_hive {
+        Some(hive) => Destination::Unicast(format!("SY.opa.rules@{}", hive)),
         None => Destination::Broadcast,
     };
     let msg = Message {
@@ -451,7 +451,7 @@ struct ConfigResponsePayload {
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
-    island: Option<String>,
+    hive: Option<String>,
     #[serde(default)]
     compile_time_ms: Option<u64>,
     #[serde(default)]
@@ -466,7 +466,7 @@ struct ConfigResponsePayload {
 
 #[derive(Debug, Serialize)]
 struct OpaResponseEntry {
-    island: String,
+    hive: String,
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<u64>,
@@ -484,7 +484,7 @@ struct OpaResponseEntry {
 
 #[derive(Debug, Serialize)]
 struct OpaQueryEntry {
-    island: String,
+    hive: String,
     status: String,
     payload: serde_json::Value,
 }
@@ -519,7 +519,7 @@ async fn handle_http(
     let (method, path, headers, body) = read_http_request(stream).await?;
     let (path, query) = split_path_query(&path);
     if let Some((status, resp)) =
-        handle_island_paths(method.as_str(), path, &query, &body, ctx, client).await?
+        handle_hive_paths(method.as_str(), path, &query, &body, ctx, client).await?
     {
         respond_json(stream, status, &resp).await?;
         return Ok(());
@@ -540,60 +540,60 @@ async fn handle_http(
         ("GET", "/health") => {
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
         }
-        ("GET", "/island/status") => {
-            let (status, resp) = handle_admin_query(ctx, client, "island_status", None).await?;
+        ("GET", "/hive/status") => {
+            let (status, resp) = handle_admin_query(ctx, client, "hive_status", None).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", "/routes") => {
-            let island = query.get("island").cloned();
-            let (status, resp) = handle_admin_query(ctx, client, "list_routes", island).await?;
+            let hive = query.get("hive").cloned();
+            let (status, resp) = handle_admin_query(ctx, client, "list_routes", hive).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/routes") => {
             let route: RouteConfig = serde_json::from_slice(&body)?;
-            let island = query.get("island").cloned();
+            let hive = query.get("hive").cloned();
             let (status, resp) = handle_admin_command(
                 ctx,
                 client,
                 "add_route",
                 serde_json::to_value(route)?,
-                island,
+                hive,
             )
             .await?;
             respond_json(stream, status, &resp).await?;
         }
         ("DELETE", "/routes") => {
             let prefix = query.get("prefix").cloned().unwrap_or_default();
-            let island = query.get("island").cloned();
+            let hive = query.get("hive").cloned();
             let payload = serde_json::json!({ "prefix": prefix });
             let (status, resp) =
-                handle_admin_command(ctx, client, "delete_route", payload, island).await?;
+                handle_admin_command(ctx, client, "delete_route", payload, hive).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", "/vpns") => {
-            let island = query.get("island").cloned();
-            let (status, resp) = handle_admin_query(ctx, client, "list_vpns", island).await?;
+            let hive = query.get("hive").cloned();
+            let (status, resp) = handle_admin_query(ctx, client, "list_vpns", hive).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/vpns") => {
             let vpn: VpnConfig = serde_json::from_slice(&body)?;
-            let island = query.get("island").cloned();
+            let hive = query.get("hive").cloned();
             let (status, resp) =
-                handle_admin_command(ctx, client, "add_vpn", serde_json::to_value(vpn)?, island)
+                handle_admin_command(ctx, client, "add_vpn", serde_json::to_value(vpn)?, hive)
                     .await?;
             respond_json(stream, status, &resp).await?;
         }
         ("DELETE", "/vpns") => {
             let pattern = query.get("pattern").cloned().unwrap_or_default();
-            let island = query.get("island").cloned();
+            let hive = query.get("hive").cloned();
             let payload = serde_json::json!({ "pattern": pattern });
             let (status, resp) =
-                handle_admin_command(ctx, client, "delete_vpn", payload, island).await?;
+                handle_admin_command(ctx, client, "delete_vpn", payload, hive).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", "/nodes") => {
-            let island = query.get("island").cloned();
-            let (status, resp) = handle_admin_query(ctx, client, "list_nodes", island).await?;
+            let hive = query.get("hive").cloned();
+            let (status, resp) = handle_admin_query(ctx, client, "list_nodes", hive).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/nodes") => {
@@ -602,22 +602,22 @@ async fn handle_http(
             } else {
                 serde_json::from_slice(&body)?
             };
-            let island = query.get("island").cloned();
+            let hive = query.get("hive").cloned();
             let (status, resp) =
-                handle_admin_command(ctx, client, "run_node", payload, island).await?;
+                handle_admin_command(ctx, client, "run_node", payload, hive).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("DELETE", "/nodes") => {
             let name = query.get("name").cloned().unwrap_or_default();
-            let island = query.get("island").cloned();
+            let hive = query.get("hive").cloned();
             let payload = serde_json::json!({ "name": name });
             let (status, resp) =
-                handle_admin_command(ctx, client, "kill_node", payload, island).await?;
+                handle_admin_command(ctx, client, "kill_node", payload, hive).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", "/routers") => {
-            let island = query.get("island").cloned();
-            let (status, resp) = handle_admin_query(ctx, client, "list_routers", island).await?;
+            let hive = query.get("hive").cloned();
+            let (status, resp) = handle_admin_query(ctx, client, "list_routers", hive).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/routers") => {
@@ -626,17 +626,17 @@ async fn handle_http(
             } else {
                 serde_json::from_slice(&body)?
             };
-            let island = query.get("island").cloned();
+            let hive = query.get("hive").cloned();
             let (status, resp) =
-                handle_admin_command(ctx, client, "run_router", payload, island).await?;
+                handle_admin_command(ctx, client, "run_router", payload, hive).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("DELETE", "/routers") => {
             let name = query.get("name").cloned().unwrap_or_default();
-            let island = query.get("island").cloned();
+            let hive = query.get("hive").cloned();
             let payload = serde_json::json!({ "name": name });
             let (status, resp) =
-                handle_admin_command(ctx, client, "kill_router", payload, island).await?;
+                handle_admin_command(ctx, client, "kill_router", payload, hive).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("PUT", "/config/routes") => {
@@ -706,7 +706,7 @@ async fn handle_http(
         ("GET", "/opa/policy") => {
             let target = normalize_opa_target(
                 query
-                    .get("island")
+                    .get("hive")
                     .cloned()
                     .or_else(|| query.get("target").cloned()),
             );
@@ -716,7 +716,7 @@ async fn handle_http(
         ("GET", "/opa/status") => {
             let target = normalize_opa_target(
                 query
-                    .get("island")
+                    .get("hive")
                     .cloned()
                     .or_else(|| query.get("target").cloned()),
             );
@@ -731,7 +731,7 @@ async fn handle_http(
     Ok(())
 }
 
-async fn handle_island_paths(
+async fn handle_hive_paths(
     method: &str,
     path: &str,
     _query: &HashMap<String, String>,
@@ -741,13 +741,13 @@ async fn handle_island_paths(
 ) -> Result<Option<(u16, String)>, AdminError> {
     let trimmed = path.trim_matches('/');
     let parts = trimmed.split('/').collect::<Vec<_>>();
-    if parts.first().copied() != Some("islands") {
+    if parts.first().copied() != Some("hives") {
         return Ok(None);
     }
     if parts.len() == 1 {
         match method {
             "GET" => {
-                let (status, resp) = handle_admin_query(ctx, client, "list_islands", None).await?;
+                let (status, resp) = handle_admin_query(ctx, client, "list_hives", None).await?;
                 return Ok(Some((status, resp)));
             }
             "POST" => {
@@ -757,26 +757,26 @@ async fn handle_island_paths(
                     serde_json::from_slice(body)?
                 };
                 let (status, resp) =
-                    handle_admin_command(ctx, client, "add_island", payload, None).await?;
+                    handle_admin_command(ctx, client, "add_hive", payload, None).await?;
                 return Ok(Some((status, resp)));
             }
             _ => return Ok(None),
         }
     }
-    let island = parts[1].to_string();
+    let hive = parts[1].to_string();
     let rest = &parts[2..];
     if rest.is_empty() {
         return match method {
             "GET" => {
-                let payload = serde_json::json!({ "island_id": island });
+                let payload = serde_json::json!({ "hive_id": hive });
                 let (status, resp) =
-                    handle_admin_command(ctx, client, "get_island", payload, None).await?;
+                    handle_admin_command(ctx, client, "get_hive", payload, None).await?;
                 Ok(Some((status, resp)))
             }
             "DELETE" => {
-                let payload = serde_json::json!({ "island_id": island });
+                let payload = serde_json::json!({ "hive_id": hive });
                 let (status, resp) =
-                    handle_admin_command(ctx, client, "remove_island", payload, None).await?;
+                    handle_admin_command(ctx, client, "remove_hive", payload, None).await?;
                 Ok(Some((status, resp)))
             }
             _ => Ok(None),
@@ -785,7 +785,7 @@ async fn handle_island_paths(
     match (method, rest) {
         ("GET", ["routes"]) => {
             let (status, resp) =
-                handle_admin_query(ctx, client, "list_routes", Some(island)).await?;
+                handle_admin_query(ctx, client, "list_routes", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["routes"]) => {
@@ -795,7 +795,7 @@ async fn handle_island_paths(
                 client,
                 "add_route",
                 serde_json::to_value(route)?,
-                Some(island),
+                Some(hive),
             )
             .await?;
             Ok(Some((status, resp)))
@@ -803,11 +803,11 @@ async fn handle_island_paths(
         ("DELETE", ["routes", prefix]) => {
             let payload = serde_json::json!({ "prefix": decode_percent(prefix) });
             let (status, resp) =
-                handle_admin_command(ctx, client, "delete_route", payload, Some(island)).await?;
+                handle_admin_command(ctx, client, "delete_route", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["vpns"]) => {
-            let (status, resp) = handle_admin_query(ctx, client, "list_vpns", Some(island)).await?;
+            let (status, resp) = handle_admin_query(ctx, client, "list_vpns", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["vpns"]) => {
@@ -817,7 +817,7 @@ async fn handle_island_paths(
                 client,
                 "add_vpn",
                 serde_json::to_value(vpn)?,
-                Some(island),
+                Some(hive),
             )
             .await?;
             Ok(Some((status, resp)))
@@ -825,12 +825,12 @@ async fn handle_island_paths(
         ("DELETE", ["vpns", pattern]) => {
             let payload = serde_json::json!({ "pattern": decode_percent(pattern) });
             let (status, resp) =
-                handle_admin_command(ctx, client, "delete_vpn", payload, Some(island)).await?;
+                handle_admin_command(ctx, client, "delete_vpn", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["nodes"]) => {
             let (status, resp) =
-                handle_admin_query(ctx, client, "list_nodes", Some(island)).await?;
+                handle_admin_query(ctx, client, "list_nodes", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["nodes"]) => {
@@ -840,18 +840,18 @@ async fn handle_island_paths(
                 serde_json::from_slice(body)?
             };
             let (status, resp) =
-                handle_admin_command(ctx, client, "run_node", payload, Some(island)).await?;
+                handle_admin_command(ctx, client, "run_node", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("DELETE", ["nodes", name]) => {
             let payload = serde_json::json!({ "name": decode_percent(name) });
             let (status, resp) =
-                handle_admin_command(ctx, client, "kill_node", payload, Some(island)).await?;
+                handle_admin_command(ctx, client, "kill_node", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["routers"]) => {
             let (status, resp) =
-                handle_admin_query(ctx, client, "list_routers", Some(island)).await?;
+                handle_admin_query(ctx, client, "list_routers", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["routers"]) => {
@@ -861,56 +861,56 @@ async fn handle_island_paths(
                 serde_json::from_slice(body)?
             };
             let (status, resp) =
-                handle_admin_command(ctx, client, "run_router", payload, Some(island)).await?;
+                handle_admin_command(ctx, client, "run_router", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("DELETE", ["routers", name]) => {
             let payload = serde_json::json!({ "name": decode_percent(name) });
             let (status, resp) =
-                handle_admin_command(ctx, client, "kill_router", payload, Some(island)).await?;
+                handle_admin_command(ctx, client, "kill_router", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["opa", "policy"]) => {
             let req: OpaRequest = serde_json::from_slice(body)?;
             let mut req = req;
-            req.island = Some(island);
+            req.hive = Some(hive);
             let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::CompileApply).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["opa", "policy", "compile"]) => {
             let req: OpaRequest = serde_json::from_slice(body)?;
             let mut req = req;
-            req.island = Some(island);
+            req.hive = Some(hive);
             let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Compile).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["opa", "policy", "apply"]) => {
             let req: OpaRequest = serde_json::from_slice(body)?;
             let mut req = req;
-            req.island = Some(island);
+            req.hive = Some(hive);
             let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Apply).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["opa", "policy", "rollback"]) => {
             let req: OpaRequest = serde_json::from_slice(body)?;
             let mut req = req;
-            req.island = Some(island);
+            req.hive = Some(hive);
             let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Rollback).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["opa", "policy", "check"]) => {
             let req: OpaRequest = serde_json::from_slice(body)?;
             let mut req = req;
-            req.island = Some(island);
+            req.hive = Some(hive);
             let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Check).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["opa", "policy"]) => {
-            let (status, resp) = handle_opa_query(ctx, client, "get_policy", Some(island)).await?;
+            let (status, resp) = handle_opa_query(ctx, client, "get_policy", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["opa", "status"]) => {
-            let (status, resp) = handle_opa_query(ctx, client, "get_status", Some(island)).await?;
+            let (status, resp) = handle_opa_query(ctx, client, "get_status", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         _ => Ok(None),
@@ -1267,7 +1267,7 @@ async fn handle_opa_http(
         .entrypoint
         .clone()
         .unwrap_or_else(|| "router/target".to_string());
-    let target = normalize_opa_target(req.island.take());
+    let target = normalize_opa_target(req.hive.take());
 
     if action.needs_rego() && req.rego.as_deref().unwrap_or("").is_empty() {
         let resp = serde_json::json!({
@@ -1355,9 +1355,9 @@ async fn handle_admin_query(
     ctx: &AdminContext,
     client: &AdminRouterClient,
     action: &str,
-    island: Option<String>,
+    hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
-    let request = build_admin_request(ctx, action, serde_json::json!({}), island);
+    let request = build_admin_request(ctx, action, serde_json::json!({}), hive);
     let response = send_admin_request(client, request).await;
     Ok(build_admin_http_response(action, response))
 }
@@ -1367,10 +1367,10 @@ async fn handle_admin_command(
     client: &AdminRouterClient,
     action: &str,
     payload: serde_json::Value,
-    island: Option<String>,
+    hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
-    let request = build_admin_request(ctx, action, payload, island);
-    let target_island = extract_island_from_target(&request.target);
+    let request = build_admin_request(ctx, action, payload, hive);
+    let target_hive = extract_hive_from_target(&request.target);
     let response = send_admin_request(client, request).await;
     if let Ok(ref payload) = response {
         if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
@@ -1380,7 +1380,7 @@ async fn handle_admin_command(
                     "add_route" | "delete_route" | "add_vpn" | "delete_vpn"
                 ) {
                     if let Err(err) =
-                        broadcast_full_config(ctx, client, action, target_island.as_deref()).await
+                        broadcast_full_config(ctx, client, action, target_hive.as_deref()).await
                     {
                         tracing::warn!("broadcast after admin action failed: {err}");
                     }
@@ -1395,24 +1395,24 @@ fn build_admin_request(
     ctx: &AdminContext,
     action: &str,
     payload: serde_json::Value,
-    island: Option<String>,
+    hive: Option<String>,
 ) -> AdminRequest {
-    let island_id = island.unwrap_or_else(|| ctx.island_id.clone());
+    let hive_id = hive.unwrap_or_else(|| ctx.hive_id.clone());
     let base = match action {
         "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn" | "delete_vpn" => {
             "SY.config.routes"
         }
         "list_nodes" | "run_node" | "kill_node" | "list_routers" | "run_router" | "kill_router"
-        | "island_status" | "get_storage" | "list_islands" | "get_island" | "remove_island"
-        | "add_island" => "SY.orchestrator",
+        | "hive_status" | "get_storage" | "list_hives" | "get_hive" | "remove_hive"
+        | "add_hive" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
-    let target = if island_id.contains('@') {
-        island_id
+    let target = if hive_id.contains('@') {
+        hive_id
     } else {
-        format!("{}@{}", base, island_id)
+        format!("{}@{}", base, hive_id)
     };
-    let unicast = if target.ends_with(&format!("@{}", ctx.island_id)) {
+    let unicast = if target.ends_with(&format!("@{}", ctx.hive_id)) {
         load_node_uuid(&ctx.state_dir.join("nodes"), base).ok()
     } else {
         None
@@ -1504,15 +1504,15 @@ fn build_admin_http_response(
     }
 }
 
-fn extract_island_from_target(target: &str) -> Option<String> {
-    target.split_once('@').map(|(_, island)| island.to_string())
+fn extract_hive_from_target(target: &str) -> Option<String> {
+    target.split_once('@').map(|(_, hive)| hive.to_string())
 }
 
 async fn broadcast_full_config(
     ctx: &AdminContext,
     client: &AdminRouterClient,
     action: &str,
-    target_island: Option<&str>,
+    target_hive: Option<&str>,
 ) -> Result<(), AdminError> {
     let list_action = if action.contains("route") {
         "list_routes"
@@ -1523,7 +1523,7 @@ async fn broadcast_full_config(
         ctx,
         list_action,
         serde_json::json!({}),
-        target_island.map(|s| s.to_string()),
+        target_hive.map(|s| s.to_string()),
     );
     let response = send_admin_request(client, list_req).await?;
     let payload = response
@@ -1575,7 +1575,7 @@ async fn send_opa_action(
     )
     .await?;
 
-    let expected = expected_islands(ctx, target.as_deref());
+    let expected = expected_hives(ctx, target.as_deref());
     let mut receiver = client.subscribe_system();
     let responses = collect_opa_responses(&mut receiver, action, version, &expected).await;
     Ok(responses)
@@ -1589,9 +1589,9 @@ async fn send_opa_query(
 ) -> Result<Vec<OpaQueryEntry>, AdminError> {
     let target_pattern = target
         .as_deref()
-        .map(|island| format!("SY.opa.rules@{}", island));
+        .map(|hive| format!("SY.opa.rules@{}", hive));
     let dst = match target.as_deref() {
-        Some(island) => Destination::Unicast(format!("SY.opa.rules@{}", island)),
+        Some(hive) => Destination::Unicast(format!("SY.opa.rules@{}", hive)),
         None => Destination::Broadcast,
     };
     let msg = Message {
@@ -1614,7 +1614,7 @@ async fn send_opa_query(
     };
     client.sender.send(msg).await?;
 
-    let expected = expected_islands(ctx, target.as_deref());
+    let expected = expected_hives(ctx, target.as_deref());
     let mut receiver = client.subscribe_query();
     let responses = collect_opa_query_responses(&mut receiver, action, &expected).await;
     Ok(responses)
@@ -1631,18 +1631,18 @@ fn normalize_opa_target(target: Option<String>) -> Option<String> {
     })
 }
 
-fn expected_islands(ctx: &AdminContext, target: Option<&str>) -> Vec<String> {
+fn expected_hives(ctx: &AdminContext, target: Option<&str>) -> Vec<String> {
     if let Some(target) = target {
         return vec![target.to_string()];
     }
-    let mut islands = Vec::new();
-    islands.push(ctx.island_id.clone());
-    for island in &ctx.authorized_islands {
-        if island != &ctx.island_id {
-            islands.push(island.clone());
+    let mut hives = Vec::new();
+    hives.push(ctx.hive_id.clone());
+    for hive in &ctx.authorized_hives {
+        if hive != &ctx.hive_id {
+            hives.push(hive.clone());
         }
     }
-    islands
+    hives
 }
 
 async fn collect_opa_responses(
@@ -1686,12 +1686,12 @@ async fn collect_opa_responses(
         if payload.version.unwrap_or(version) != version {
             continue;
         }
-        let island = payload
-            .island
+        let hive = payload
+            .hive
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
         let entry = OpaResponseEntry {
-            island: island.clone(),
+            hive: hive.clone(),
             status: payload.status.unwrap_or_else(|| "error".to_string()),
             version: payload.version,
             compile_time_ms: payload.compile_time_ms,
@@ -1700,7 +1700,7 @@ async fn collect_opa_responses(
             error_code: payload.error_code,
             error_detail: payload.error_detail,
         };
-        responses.insert(island, entry);
+        responses.insert(hive, entry);
     }
 
     responses.into_values().collect()
@@ -1734,8 +1734,8 @@ async fn collect_opa_query_responses(
             continue;
         }
         let payload = msg.payload;
-        let island = payload
-            .get("island")
+        let hive = payload
+            .get("hive")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
@@ -1745,9 +1745,9 @@ async fn collect_opa_query_responses(
             .unwrap_or("ok")
             .to_string();
         responses.insert(
-            island.clone(),
+            hive.clone(),
             OpaQueryEntry {
-                island,
+                hive,
                 status,
                 payload,
             },
@@ -1764,10 +1764,10 @@ fn build_opa_http_response(
     responses: Vec<OpaResponseEntry>,
     target: Option<String>,
 ) -> (u16, String) {
-    let expected = expected_islands(ctx, target.as_deref());
+    let expected = expected_hives(ctx, target.as_deref());
     let pending: Vec<String> = expected
         .into_iter()
-        .filter(|island| !responses.iter().any(|r| r.island == *island))
+        .filter(|hive| !responses.iter().any(|r| r.hive == *hive))
         .collect();
     let timed_out = !pending.is_empty();
     let status = if timed_out || responses.is_empty() || responses.iter().any(|r| r.status != "ok")
@@ -1799,10 +1799,10 @@ fn build_opa_query_response(
     responses: Vec<OpaQueryEntry>,
     target: Option<String>,
 ) -> (u16, String) {
-    let expected = expected_islands(ctx, target.as_deref());
+    let expected = expected_hives(ctx, target.as_deref());
     let pending: Vec<String> = expected
         .into_iter()
-        .filter(|island| !responses.iter().any(|r| r.island == *island))
+        .filter(|hive| !responses.iter().any(|r| r.hive == *hive))
         .collect();
     let timed_out = !pending.is_empty();
     let status = if timed_out || responses.is_empty() || responses.iter().any(|r| r.status != "ok")

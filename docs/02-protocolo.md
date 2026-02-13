@@ -454,7 +454,7 @@ socket.on('data', (chunk) => {
 |---------|--------|---------|-----------|
 | `CONFIG_CHANGED` | SY.admin | Broadcast (todos) | Notificar cambio de configuración |
 
-**CONFIG_CHANGED** es el mensaje unificado para todos los cambios de configuración del sistema. SY.admin (único, en mother island) es el único que lo emite.
+**CONFIG_CHANGED** es el mensaje unificado para todos los cambios de configuración del sistema. SY.admin (único, en mother hive) es el único que lo emite.
 
 #### 7.4.1 Formato
 
@@ -486,7 +486,7 @@ socket.on('data', (chunk) => {
 | `vpn` | SY.config.routes, RT.* | Tabla VPN |
 | `opa` | SY.opa.rules, RT.* | Policies OPA |
 | `storage` | SY.orchestrator | Path del storage |
-| `islands` | SY.orchestrator | Lista de islas |
+| `hives` | SY.orchestrator | Lista de islas |
 
 #### 7.4.3 Ejemplos
 
@@ -655,7 +655,7 @@ Propaga punteros de eventos con alta activación para que otras islas sepan que 
     "msg": "LSA_MEMORY"
   },
   "payload": {
-    "island": "produccion",
+    "hive": "produccion",
     "epoch": 12345,
     "events": [
       {
@@ -902,7 +902,7 @@ El gateway consolida la topología de su isla y la envía a gateways remotos.
     "msg": "LSA"
   },
   "payload": {
-    "island": "produccion",
+    "hive": "produccion",
     "seq": 42,
     "timestamp": "2025-01-20T10:00:00Z",
     "nodes": [
@@ -921,7 +921,7 @@ El gateway consolida la topología de su isla y la envía a gateways remotos.
       {
         "prefix": "AI.backup.*",
         "action": "FORWARD",
-        "next_hop_island": "disaster-recovery"
+        "next_hop_hive": "disaster-recovery"
       }
     ],
     "vpns": [
@@ -1213,7 +1213,7 @@ impl MyNode {
 ### 10.10 Flujo de Conexión
 
 ```
-1. Leer /etc/json-router/island.yaml → obtener island_id
+1. Leer /etc/json-router/hive.yaml → obtener hive_id
    - Si no existe → ERROR, no arrancar
    
 2. Cargar o generar UUID desde archivo de persistencia

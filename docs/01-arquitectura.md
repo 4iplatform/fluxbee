@@ -136,19 +136,19 @@ Usuario ejecuta: systemctl start sy-orchestrator
 Toda instancia opera dentro de una **isla**, definida por el **único archivo de configuración**:
 
 ```
-/etc/json-router/island.yaml
+/etc/json-router/hive.yaml
 ```
 
 **Ejemplo mínimo:**
 
 ```yaml
-island_id: "produccion"
+hive_id: "produccion"
 ```
 
 **Ejemplo con WAN:**
 
 ```yaml
-island_id: "produccion"
+hive_id: "produccion"
 
 wan:
   listen: "0.0.0.0:9000"
@@ -165,18 +165,18 @@ admin:
 - Todo lo demás (rutas, VPN, nodos) se configura via API.
 - Ver `07-operaciones.md` para detalle completo.
 
-### 6.2 Mother Island
+### 6.2 Mother Hive
 
-El sistema tiene una jerarquía de islas con una **mother island** (isla madre) en la raíz:
+El sistema tiene una jerarquía de islas con una **mother hive** (isla madre) en la raíz:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                       MOTHER ISLAND                             │
+│                       MOTHER HIVE                             │
 │                                                                 │
 │   • Única isla con SY.admin (punto de entrada API)             │
 │   • Única isla con acceso a Internet (via reverse proxy)       │
 │   • Origen de todos los CONFIG_CHANGED (broadcast)             │
-│   • Puede hacer add_island para crear islas hijas              │
+│   • Puede hacer add_hive para crear islas hijas              │
 │   • wan.listen activo (recibe conexiones de hijas)             │
 │   • wan.uplinks vacío (no se conecta a nadie)                  │
 │                                                                 │
@@ -197,19 +197,19 @@ El sistema tiene una jerarquía de islas con una **mother island** (isla madre) 
 └───────────────┘   └───────────────┘   └───────────────┘
 ```
 
-| Característica | Mother Island | Isla Hija |
+| Característica | Mother Hive | Isla Hija |
 |---------------|---------------|-----------|
 | SY.admin | ✅ Único global | ❌ No tiene |
 | Internet | ✅ Via reverse proxy | ❌ Red interna |
 | CONFIG_CHANGED | ✅ Emite broadcast | Solo escucha |
-| add_island | ✅ Puede crear hijas | ❌ No puede |
+| add_hive | ✅ Puede crear hijas | ❌ No puede |
 | wan.listen | ✅ Recibe conexiones | ❌ No recibe |
 | wan.uplinks | ❌ Vacío | ✅ Apunta a mother |
 | Storage | Source of truth | Cache/mount de mother |
 
-**island.yaml de Mother:**
+**hive.yaml de Mother:**
 ```yaml
-island_id: produccion
+hive_id: produccion
 
 wan:
   gateway_name: RT.gateway
@@ -220,9 +220,9 @@ admin:
   listen: "0.0.0.0:8080"
 ```
 
-**island.yaml de Hija (generado por add_island):**
+**hive.yaml de Hija (generado por add_hive):**
 ```yaml
-island_id: staging
+hive_id: staging
 
 wan:
   gateway_name: RT.gateway
@@ -287,7 +287,7 @@ RT.gateway@produccion
 **Reglas:**
 - `TYPE` ∈ {AI, WF, IO, SY, RT}
 - La isla es el sufijo después de `@`
-- La **librería de nodo agrega @isla automáticamente** desde `island.yaml`
+- La **librería de nodo agrega @isla automáticamente** desde `hive.yaml`
 - El nodo solo configura `name: "AI.soporte.l1"`, la librería lo convierte a `AI.soporte.l1@produccion`
 
 ### 6.5 Routing Inter-Isla
@@ -311,15 +311,15 @@ El sistema usa **tres tipos** de regiones de memoria compartida:
 ```
 /dev/shm/
 ├── jsr-<router-uuid>        # Una por router (nodos conectados)
-├── jsr-config-<island>      # Una por isla (rutas estáticas, VPN)
-└── jsr-lsa-<island>         # Una por isla (topología remota)
+├── jsr-config-<hive>      # Una por isla (rutas estáticas, VPN)
+└── jsr-lsa-<hive>         # Una por isla (topología remota)
 ```
 
 | Región | Quién escribe | Contenido | Quién lee |
 |--------|---------------|-----------|-----------|
 | `jsr-<uuid>` | Router dueño | Sus nodos CONNECTED | Todos los routers de la isla |
-| `jsr-config-<island>` | SY.config.routes | Rutas estáticas, tabla VPN | Todos los routers de la isla |
-| `jsr-lsa-<island>` | Gateway | Nodos, rutas, VPNs de **otras islas** | Todos los routers de la isla |
+| `jsr-config-<hive>` | SY.config.routes | Rutas estáticas, tabla VPN | Todos los routers de la isla |
+| `jsr-lsa-<hive>` | Gateway | Nodos, rutas, VPNs de **otras islas** | Todos los routers de la isla |
 
 **Principio:** Un solo writer por región. Múltiples readers. Seqlock para sincronización.
 
@@ -446,7 +446,7 @@ Una **VPN** es una subred aislada dentro de una isla. Sirve para que sistemas qu
 
 ### 10.2 Modelo Simple
 
-Solo una tabla de asignación en `jsr-config-<island>`:
+Solo una tabla de asignación en `jsr-config-<hive>`:
 
 ```
 pattern           → vpn_id
@@ -499,7 +499,7 @@ WF.crm.*          → 20
 Cada isla tiene **un único router gateway** que:
 
 - Mantiene conexiones TCP a otras islas
-- Recibe LSA de otras islas y lo escribe en `jsr-lsa-<island>`
+- Recibe LSA de otras islas y lo escribe en `jsr-lsa-<hive>`
 - Envía LSA de su isla a los gateways remotos
 
 ### 11.2 LSA entre Gateways
@@ -509,7 +509,7 @@ El gateway consolida toda la información de su isla y la envía a los peers:
 ```
 Gateway lee:
   - Todas las jsr-<router-uuid> → nodos locales
-  - jsr-config-<island> → rutas y VPNs
+  - jsr-config-<hive> → rutas y VPNs
 
 Gateway envía LSA con:
   - Lista de nodos (uuid, name@isla, vpn)
@@ -517,12 +517,12 @@ Gateway envía LSA con:
   - Lista de asignaciones VPN
 
 Gateway remoto recibe y escribe en:
-  - jsr-lsa-<island> → topología de islas remotas
+  - jsr-lsa-<hive> → topología de islas remotas
 ```
 
 ### 11.3 Visibilidad Inter-Isla
 
-Todos los routers de la isla pueden leer `jsr-lsa-<island>` y saber:
+Todos los routers de la isla pueden leer `jsr-lsa-<hive>` y saber:
 
 - Qué nodos existen en @staging, @desarrollo, etc.
 - Qué rutas estáticas tienen

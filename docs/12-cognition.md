@@ -64,7 +64,7 @@ El sistema cognitivo permite que Fluxbee **aprenda de la experiencia** sin acumu
 │         │                                                       │
 │         ▼                                                       │
 │  /var/lib/fluxbee/memory.lance  ← Cache cognitiva (LanceDB)   │
-│  /dev/shm/jsr-memory-<island>   ← Índice de activación (SHM)  │
+│  /dev/shm/jsr-memory-<hive>   ← Índice de activación (SHM)  │
 │                                                                 │
 │  Ambos son RECONSTRUIBLES desde PostgreSQL                     │
 └─────────────────────────────────────────────────────────────────┘
@@ -186,7 +186,7 @@ LanceDB embebida en cada isla. **Es reconstruible desde PostgreSQL.**
 Región de memoria compartida para consultas de micro-latencia.
 
 ```
-/dev/shm/jsr-memory-<island>
+/dev/shm/jsr-memory-<hive>
 ```
 
 **Contenido:**
@@ -414,7 +414,7 @@ Dado `cues_turn[]` (tags), devolver en micro-latencia:
 ### 5.2 Layout
 
 ```
-/dev/shm/jsr-memory-<island>
+/dev/shm/jsr-memory-<hive>
 │
 ├── Header (64 bytes)
 │   ├── magic: u32              // 0x4A534D45 "JSME"
@@ -455,7 +455,7 @@ Dado `cues_turn[]` (tags), devolver en micro-latencia:
         ├── end_seq: u32
         ├── intent_primary: [u8; 32]
         ├── outcome_status: u8
-        └── origin_island_id: u8
+        └── origin_hive_id: u8
 ```
 
 ### 5.3 Constantes
@@ -1096,7 +1096,7 @@ El Gateway no replica todo LanceDB. Propaga punteros:
     "msg": "LSA_MEMORY"
   },
   "payload": {
-    "island": "produccion",
+    "hive": "produccion",
     "events": [
       {
         "event_id": 98,
@@ -1117,7 +1117,7 @@ Si Isla B necesita un evento de Isla A:
 
 ```
 1. Isla B consulta jsr-memory local
-2. Encuentra event_id con origin_island=A
+2. Encuentra event_id con origin_hive=A
 3. Envía SY.memory.fetch a Gateway
 4. Gateway A responde con EventPackage
 5. Isla B persiste en LanceDB local (cache)
