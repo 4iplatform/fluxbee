@@ -19,8 +19,6 @@ const DEFAULT_NATS_STORAGE_DIR: &str = "/var/lib/fluxbee/nats";
 pub enum ConfigError {
     #[error("missing island.yaml")]
     MissingIsland,
-    #[error("missing router name (JSR_ROUTER_NAME)")]
-    MissingRouterName,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("yaml error: {0}")]
@@ -110,8 +108,6 @@ struct IdentityShm {
 
 impl RouterConfig {
     pub fn load_from_env() -> Result<Self, ConfigError> {
-        let router_name =
-            std::env::var("JSR_ROUTER_NAME").map_err(|_| ConfigError::MissingRouterName)?;
         let config_dir = crate::paths::config_dir();
         let state_dir = crate::paths::state_dir();
         let node_socket_dir = crate::paths::router_socket_dir();
@@ -184,6 +180,7 @@ impl RouterConfig {
             nats_url = format!("nats://127.0.0.1:{nats_port}");
         }
 
+        let router_name = std::env::var("JSR_ROUTER_NAME").unwrap_or_else(|_| gateway_name.clone());
         let is_gateway = is_gateway_name(&router_name, &gateway_name);
         let router_l2_name = ensure_l2_name(&router_name, &island_id);
         let identity_path = identity_path(&state_dir, &router_l2_name);
