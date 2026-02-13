@@ -6,7 +6,7 @@
 
 > *fluxbee.ai*
 
----z
+---
 
 ## What is this?
 
@@ -295,9 +295,9 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = NodeConfig {
         name: "WF.test".to_string(),
-        router_socket: "/var/run/json-router/routers".into(),
-        uuid_persistence_dir: "/var/lib/json-router/state/nodes".into(),
-        config_dir: "/etc/json-router".into(),
+        router_socket: "/var/run/fluxbee/routers".into(),
+        uuid_persistence_dir: "/var/lib/fluxbee/state/nodes".into(),
+        config_dir: "/etc/fluxbee".into(),
         version: "1.0".to_string(),
     };
 

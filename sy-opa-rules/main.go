@@ -32,11 +32,11 @@ import (
 )
 
 const (
-	configDir           = "/etc/json-router"
-	stateDir            = "/var/lib/json-router/opa"
-	nodesDir            = "/var/lib/json-router/nodes"
-	routerSockDir       = "/var/run/json-router/routers"
-	lockPath            = "/var/run/json-router/sy-opa-rules.lock"
+	configDir           = "/etc/fluxbee"
+	stateDir            = "/var/lib/fluxbee/opa"
+	nodesDir            = "/var/lib/fluxbee/state/nodes"
+	routerSockDir       = "/var/run/fluxbee/routers"
+	lockPath            = "/var/run/fluxbee/sy-opa-rules.lock"
 	opaShmPrefix        = "/jsr-opa-"
 	routerShmPrefix     = "/jsr-"
 	opaMagic            = 0x4A534F50 // "JSOP"
@@ -258,7 +258,7 @@ func ensureDirs() error {
 		filepath.Join(stateDir, "staged"),
 		filepath.Join(stateDir, "backup"),
 		nodesDir,
-		"/var/run/json-router",
+		"/var/run/fluxbee",
 		routerSockDir,
 	}
 	for _, path := range paths {

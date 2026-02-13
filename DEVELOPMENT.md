@@ -1,4 +1,4 @@
-# json-router
+# Fluxbee
 
 Reinicio del código para alinear con la especificación v1.13.
 
@@ -7,7 +7,7 @@ Reinicio del código para alinear con la especificación v1.13.
 
 ## Sandbox local
 
-Copiar `config/hive.yaml` a `/etc/json-router/hive.yaml` (o ejecutar el script) y correr el router con:
+Copiar `config/hive.yaml` a `/etc/fluxbee/hive.yaml` (o ejecutar el script) y correr el router con:
 
 ```sh
 sudo ./scripts/install.sh
@@ -52,7 +52,7 @@ jsr-client = { git = "ssh://git@github.com/<org>/jsr-client.git", rev = "<commit
    - `name`: nombre L2 del nodo (ej: `WF.echo`)
    - `router_socket`: socket del router (por UUID o directorio)
    - `uuid_persistence_dir`: donde persistir el UUID del nodo
-   - `config_dir`: `/etc/json-router`
+   - `config_dir`: `/etc/fluxbee`
    - `version`: versión del nodo (string)
 
 2) Conectar:
@@ -76,9 +76,9 @@ use std::path::PathBuf;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = NodeConfig {
         name: "WF.echo".to_string(),
-        router_socket: PathBuf::from("/var/run/json-router/routers"),
-        uuid_persistence_dir: PathBuf::from("/var/lib/json-router/state/nodes"),
-        config_dir: PathBuf::from("/etc/json-router"),
+        router_socket: PathBuf::from("/var/run/fluxbee/routers"),
+        uuid_persistence_dir: PathBuf::from("/var/lib/fluxbee/state/nodes"),
+        config_dir: PathBuf::from("/etc/fluxbee"),
         version: "1.0".to_string(),
     };
     let (sender, mut receiver) = connect(&config).await?;
@@ -118,9 +118,9 @@ sudo ./scripts/install.sh
 
 Rutas fijas:
 
-- `/etc/json-router` (config)
-- `/var/lib/json-router/state` (state)
-- `/var/run/json-router/routers` (sockets por UUID)
+- `/etc/fluxbee` (config)
+- `/var/lib/fluxbee/state` (state)
+- `/var/run/fluxbee/routers` (sockets por UUID)
 
 ## SY.config.routes
 

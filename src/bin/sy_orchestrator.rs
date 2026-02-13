@@ -606,11 +606,15 @@ fn ensure_dirs(
     run_dir: &Path,
 ) -> Result<(), OrchestratorError> {
     let storage_root = json_router::paths::storage_root_dir();
+    let opa_root = storage_root.join("opa");
     fs::create_dir_all(config_dir)?;
     fs::create_dir_all(state_dir.join("nodes"))?;
     fs::create_dir_all(hives_root())?;
     fs::create_dir_all(&storage_root)?;
-    fs::create_dir_all(storage_root.join("opa-rules"))?;
+    fs::create_dir_all(opa_root.join("current"))?;
+    fs::create_dir_all(opa_root.join("staged"))?;
+    fs::create_dir_all(opa_root.join("backup"))?;
+    fs::create_dir_all(storage_root.join("nats"))?;
     fs::create_dir_all(run_dir)?;
     Ok(())
 }
@@ -928,7 +932,7 @@ fn add_hive_flow(
     let _ = ssh_with_key(
         address,
         &key_path,
-        &sudo_wrap("mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa-rules /var/lib/fluxbee/nats /var/run/fluxbee/routers"),
+        &sudo_wrap("mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/run/fluxbee/routers"),
         BOOTSTRAP_SSH_USER,
     );
 
