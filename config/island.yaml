@@ -1,5 +1,5 @@
 island_id: "sandbox"
-role: mother
+role: motherbee
 
 # WAN (gateway). Optional: remove block if no inter-island connectivity.
 wan:
@@ -13,3 +13,7 @@ wan:
 # Admin API (optional).
 admin:
   listen: "127.0.0.1:8080"
+
+# Storage DB (local PostgreSQL for SY.storage).
+database:
+  url: "postgresql://fluxbee:magicAI@127.0.0.1:5432/fluxbee"
