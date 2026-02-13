@@ -19,14 +19,15 @@ if [[ "${SKIP_BUILD:-}" != "1" ]]; then
 fi
 
 if [[ -d "$ROOT_DIR/sy-opa-rules" ]]; then
-  if [[ "${SKIP_BUILD:-}" == "1" ]]; then
-    echo "SKIP_BUILD=1 set; skipping sy-opa-rules build."
+  if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
+    echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping sy-opa-rules build."
+  elif [[ -x "$ROOT_DIR/sy-opa-rules/sy-opa-rules" && "${FORCE_GO_BUILD:-}" != "1" ]]; then
+    echo "sy-opa-rules binary already exists; skipping Go build (set FORCE_GO_BUILD=1 to rebuild)."
   elif ! command -v go >/dev/null 2>&1; then
     echo "Warning: go not found. Skipping sy-opa-rules build." >&2
   else
-    GO_CACHE_DIR="${GOCACHE:-$ROOT_DIR/.gocache}"
     echo "Building sy-opa-rules (Go)..."
-    (cd "$ROOT_DIR/sy-opa-rules" && GOCACHE="$GO_CACHE_DIR" go build -o sy-opa-rules .)
+    (cd "$ROOT_DIR/sy-opa-rules" && go build -o sy-opa-rules .)
   fi
 fi
 
