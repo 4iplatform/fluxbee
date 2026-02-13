@@ -95,6 +95,9 @@ Entregar una base funcional y estable para desacoplar el router de persistencia:
 
 - `add_island` corrige bootstrap SSH por clave:
   - `authorized_keys` ahora se configura en el usuario de bootstrap (`administrator`) para que `ssh/scp -i` funcionen de forma consistente.
+- Hardening SSH opcional implementado:
+  - deshabilita `PasswordAuthentication` y reinicia `sshd/ssh` cuando se activa flag
+  - activacion por request `add_island.harden_ssh=true` o env `FLUXBEE_ADD_ISLAND_HARDEN_SSH=1` (compat: `JSR_ADD_ISLAND_HARDEN_SSH=1`)
 - `SY.identity` queda en modo opcional temporal en orchestrator:
   - se inicia/watchdog/shutdown solo si existe `/usr/bin/sy-identity` (ctx pendiente fuera de este bloque).
 - `scripts/install.sh` valida ejecutables requeridos para worker:

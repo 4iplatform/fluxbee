@@ -541,7 +541,8 @@ async fn handle_admin(
                 .map(|value| value.to_string());
             if let Some(island_id) = island_id {
                 let address = address.unwrap_or_default();
-                add_island_flow(state, &island_id, &address)
+                let harden_ssh = resolve_add_island_harden_ssh(&msg.payload);
+                add_island_flow(state, &island_id, &address, harden_ssh)
             } else {
                 serde_json::json!({
                     "status": "error",
@@ -774,7 +775,12 @@ fn read_island_info(root: &Path, island_id: &str) -> Result<serde_json::Value, O
     Ok(json)
 }
 
-fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) -> serde_json::Value {
+fn add_island_flow(
+    state: &OrchestratorState,
+    island_id: &str,
+    address: &str,
+    harden_ssh: bool,
+) -> serde_json::Value {
     if island_exists(&state.state_dir, island_id) {
         return serde_json::json!({
             "status": "error",
@@ -873,8 +879,15 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
     }
     let _ = ssh_with_pass(address, "chmod 600 ~/.ssh/authorized_keys", BOOTSTRAP_SSH_USER);
 
-    // NOTE: PasswordAuthentication disable step intentionally skipped for testing safety.
-    // Spec: set PasswordAuthentication no and restart sshd.
+    if harden_ssh {
+        if let Err(err) = disable_remote_password_auth(address) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_HARDEN_FAILED",
+                "message": err.to_string(),
+            });
+        }
+    }
 
     let required_binaries = [
         "/usr/bin/rt-gateway",
@@ -1005,6 +1018,7 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
             "error_code": "WAN_TIMEOUT",
             "island_id": island_id,
             "address": address,
+            "harden_ssh": harden_ssh,
             "wan_connected": false,
         });
     }
@@ -1013,6 +1027,7 @@ fn add_island_flow(state: &OrchestratorState, island_id: &str, address: &str) ->
         "status": "ok",
         "island_id": island_id,
         "address": address,
+        "harden_ssh": harden_ssh,
         "wan_connected": true,
     })
 }
@@ -1057,6 +1072,38 @@ fn valid_address(value: &str) -> bool {
     })
 }
 
+fn resolve_add_island_harden_ssh(payload: &serde_json::Value) -> bool {
+    if let Some(value) = payload.get("harden_ssh").and_then(parse_bool_value) {
+        return value;
+    }
+    env_flag_enabled("FLUXBEE_ADD_ISLAND_HARDEN_SSH")
+        || env_flag_enabled("JSR_ADD_ISLAND_HARDEN_SSH")
+}
+
+fn parse_bool_value(value: &serde_json::Value) -> Option<bool> {
+    if let Some(boolean) = value.as_bool() {
+        return Some(boolean);
+    }
+    let raw = value.as_str()?;
+    parse_bool_str(raw)
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    let raw = match std::env::var(name) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    parse_bool_str(&raw).unwrap_or(false)
+}
+
+fn parse_bool_str(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 fn islands_root() -> PathBuf {
     json_router::paths::storage_root_dir().join("islands")
 }
@@ -1094,6 +1141,19 @@ fn systemd_stop(service: &str) -> Result<(), OrchestratorError> {
     let mut cmd = Command::new("systemctl");
     cmd.arg("stop").arg(service);
     run_cmd(cmd, "systemctl stop")
+}
+
+fn disable_remote_password_auth(address: &str) -> Result<(), OrchestratorError> {
+    let set_password_auth_cmd = r#"bash -lc "if grep -Eq '^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+' /etc/ssh/sshd_config; then sed -i.bak -E 's/^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+.*/PasswordAuthentication no/' /etc/ssh/sshd_config; else printf '\nPasswordAuthentication no\n' >> /etc/ssh/sshd_config; fi""#;
+    ssh_with_pass(
+        address,
+        &sudo_wrap(set_password_auth_cmd),
+        BOOTSTRAP_SSH_USER,
+    )?;
+
+    let restart_ssh_cmd = r#"bash -lc "systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart""#;
+    ssh_with_pass(address, &sudo_wrap(restart_ssh_cmd), BOOTSTRAP_SSH_USER)?;
+    Ok(())
 }
 
 fn identity_available() -> bool {

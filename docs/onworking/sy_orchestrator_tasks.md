@@ -34,7 +34,7 @@ Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `do
 - [x] Validar `island_id` y `address` (errores: `ISLAND_EXISTS`, `INVALID_ADDRESS`).
 - [x] SSH `administrator@{address}:22` con pass `magicAI` (timeout 10s).
 - [x] Generar key ed25519 en `/var/lib/fluxbee/islands/{id}/` (600).
-- [ ] Configurar SSH remoto: authorized_keys + disable password + restart sshd. (password disable pendiente)
+- [x] Configurar SSH remoto: authorized_keys + disable password + restart sshd (opcional por flag `harden_ssh` o env `FLUXBEE_ADD_ISLAND_HARDEN_SSH`/`JSR_ADD_ISLAND_HARDEN_SSH`).
 - [x] Copiar binarios `/usr/bin/sy-*` y `rt-*` (scp) + chmod +x.
 - [x] Crear dirs remotos `/etc/fluxbee`, `/var/lib/fluxbee/*`, `/var/run/fluxbee/routers`.
 - [x] Crear `/etc/fluxbee/island.yaml` remoto (uplink hacia mother).
