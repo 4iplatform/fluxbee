@@ -1,9 +1,9 @@
 #!/usr/bin/env sh
 set -eu
 
-BASE_ETC="/etc/json-router"
-BASE_STATE="/var/lib/json-router/state"
-BASE_RUN="/var/run/json-router"
+BASE_ETC="/etc/fluxbee"
+BASE_STATE="/var/lib/fluxbee/state"
+BASE_RUN="/var/run/fluxbee"
 ISLAND_ID="sandbox"
 ROUTER_NAME="RT.primary"
 

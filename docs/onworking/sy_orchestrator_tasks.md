@@ -3,9 +3,9 @@
 Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `docs/01-arquitectura.md`.
 
 ## 1) Bootstrap local (Fases 0–4)
-- [x] Leer `/etc/fluxbee/island.yaml` (fallback legacy) y validar `island_id`.
+- [x] Leer `/etc/fluxbee/island.yaml` y validar `island_id`.
 - [x] Crear estructura de directorios (paths fijos de `07-operaciones`).
-- [x] Escribir PID en `/var/run/fluxbee/orchestrator.pid` (fallback legacy).
+- [x] Escribir PID en `/var/run/fluxbee/orchestrator.pid`.
 - [x] Levantar `RT.gateway` (systemd o exec) y esperar socket/shm (timeout 30s).
 - [x] Levantar en paralelo: `SY.config.routes`, `SY.opa.rules`, `SY.admin`, `SY.storage` y `SY.identity` opcional si existe binario.
 - [x] Conectar como nodo `SY.orchestrator@<isla>` (HELLO/ANNOUNCE) y entrar al loop principal.
@@ -27,7 +27,7 @@ Checklist para implementar SY.orchestrator según `docs/07-operaciones.md` y `do
 
 ## 4) Storage (orchestrator.yaml)
 - [x] Mantener `storage.path` en memoria.
-- [x] Persistir en `/var/lib/fluxbee/orchestrator.yaml` (fallback legacy).
+- [x] Persistir en `/var/lib/fluxbee/orchestrator.yaml`.
 - [x] Usar path default `/var/lib/fluxbee` si no hay config.
 
 ## 5) add_island (bootstrap remoto)

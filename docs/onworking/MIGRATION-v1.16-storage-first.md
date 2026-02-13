@@ -5,7 +5,7 @@ Fecha: 2026-02-12
 ## Decisiones acordadas
 
 1. Roles canonicos: `motherbee` y `worker`.
-2. Nombre consolidado: `fluxbee` (manteniendo compatibilidad temporal con rutas legacy `json-router`).
+2. Nombre consolidado: `fluxbee`.
 3. No iniciar por `ctx`/`memory_package` ni cambios cognitivos.
 4. Prioridad inicial: base de `NATS + SY.storage`.
 
@@ -19,7 +19,7 @@ Entregar una base funcional y estable para desacoplar el router de persistencia:
 
 ## Cambios implementados en este bloque
 
-- Paths primarios migrados a `fluxbee` con fallback automatico a legacy:
+- Paths runtime migrados a `fluxbee`:
   - `/etc/fluxbee`
   - `/var/lib/fluxbee`
   - `/var/run/fluxbee`
@@ -89,7 +89,7 @@ Entregar una base funcional y estable para desacoplar el router de persistencia:
 - `scripts/install.sh` alineado:
   - instala `sy-storage` en `/usr/bin/sy-storage`
   - crea `sy-storage.service`
-  - prepara layout primario `fluxbee` y mantiene layout legacy temporal.
+  - prepara layout `fluxbee`.
 
 ## Actualizacion Iteracion 4 (hardening orchestrator)
 
@@ -102,3 +102,6 @@ Entregar una base funcional y estable para desacoplar el router de persistencia:
   - se inicia/watchdog/shutdown solo si existe `/usr/bin/sy-identity` (ctx pendiente fuera de este bloque).
 - `scripts/install.sh` valida ejecutables requeridos para worker:
   - `sy-opa-rules` pasa a ser requerido y se instala de forma explicita en `/usr/bin/sy-opa-rules`.
+- `scripts/install.sh` integra ownership para test/dev:
+  - `APPLY_DEV_OWNERSHIP=1` (default) aplica `chown` sobre `/etc/fluxbee`, `/var/lib/fluxbee`, `/var/run/fluxbee`
+  - `INSTALL_OWNER=<user>` permite fijar usuario destino.
