@@ -338,20 +338,10 @@ ON CONFLICT (memory_id) DO NOTHING
 
     async fn handle_reactivation(&self, payload: &[u8]) -> Result<(), StorageError> {
         let value: Value = serde_json::from_slice(payload)?;
-        let outcome_ok = get_str(&value, &["outcome", "status"])
-            .is_some_and(|s| s.eq_ignore_ascii_case("resolved"));
-        let events = get_array(&value, &["reactivated", "events"])
-            .or_else(|| get_array(&value, &["events"]))
-            .cloned()
-            .unwrap_or_default();
+        let parsed = parse_reactivation_payload(value)?;
 
-        for ev in events {
-            let event_id = get_i64(&ev, &["event_id"]);
-            let used = get_bool(&ev, &["used"]).unwrap_or(false);
-            let Some(event_id) = event_id else {
-                continue;
-            };
-            if used {
+        for ev in parsed.events {
+            if ev.used {
                 self.client
                     .execute(
                         r#"
@@ -362,7 +352,7 @@ UPDATE events SET
     last_used_at = now()
 WHERE event_id = $1
 "#,
-                        &[&event_id, &outcome_ok],
+                        &[&ev.event_id, &parsed.outcome_ok],
                     )
                     .await?;
             } else {
@@ -373,7 +363,7 @@ UPDATE events SET
     activation_strength = GREATEST(COALESCE(activation_strength, 0.5) * 0.95, 0.1)
 WHERE event_id = $1
 "#,
-                        &[&event_id],
+                        &[&ev.event_id],
                     )
                     .await?;
             }
@@ -572,21 +562,21 @@ fn database_url(hive: &HiveFile) -> Result<String, StorageError> {
 }
 
 fn parse_turn(value: Value) -> Result<TurnRecord, StorageError> {
-    let trace_id =
-        get_str(&value, &["routing", "trace_id"]).unwrap_or_else(|| "missing-trace".to_string());
+    let trace_id = required_str(&value, &["routing", "trace_id"], "routing.trace_id")?;
     let ctx = get_str(&value, &["meta", "ctx"]).unwrap_or_else(|| format!("trace:{trace_id}"));
     let seq = get_i64(&value, &["meta", "ctx_seq"]).unwrap_or_else(|| stable_i64(&trace_id));
     let from_ilk = get_str(&value, &["meta", "src_ilk"])
         .or_else(|| get_str(&value, &["routing", "src"]))
-        .unwrap_or_else(|| "unknown".to_string());
+        .ok_or_else(|| missing_field("meta.src_ilk|routing.src"))?;
     let to_ilk = get_str(&value, &["meta", "dst_ilk"]);
     let ich = get_str(&value, &["meta", "ich"]).unwrap_or_else(|| "unknown".to_string());
-    let msg_type = get_str(&value, &["meta", "type"]).unwrap_or_else(|| "unknown".to_string());
+    let msg_type = get_str(&value, &["meta", "msg_type"])
+        .or_else(|| get_str(&value, &["meta", "type"]))
+        .unwrap_or_else(|| "unknown".to_string());
     let content = value.get("payload").cloned().unwrap_or(Value::Null);
-    let mut tags = get_string_vec(&value, &["payload", "tags"]).unwrap_or_default();
-    if tags.is_empty() {
-        tags = get_string_vec(&value, &["meta", "tags"]).unwrap_or_default();
-    }
+    let mut tags = get_string_vec(&value, &["payload", "tags"])
+        .or_else(|| get_string_vec(&value, &["meta", "tags"]))
+        .unwrap_or_default();
     dedup_sort(&mut tags);
     Ok(TurnRecord {
         ctx,
@@ -606,18 +596,26 @@ fn parse_event(value: Value) -> Result<EventRecord, StorageError> {
     } else {
         value
     };
-    let ctx = get_str(&event_root, &["ctx"]).unwrap_or_else(|| "unknown".to_string());
-    let start_seq = get_i64(&event_root, &["start_seq"]).unwrap_or(0);
-    let end_seq = get_i64(&event_root, &["end_seq"]).unwrap_or(start_seq);
-    let boundary_reason =
-        get_str(&event_root, &["boundary_reason"]).unwrap_or_else(|| "unknown".to_string());
+    if !event_root.is_object() {
+        return Err(missing_field("event"));
+    }
+
+    let ctx = required_str(&event_root, &["ctx"], "ctx")?;
+    let start_seq = required_i64(&event_root, &["start_seq"], "start_seq")?;
+    let end_seq = required_i64(&event_root, &["end_seq"], "end_seq")?;
+    if end_seq < start_seq {
+        return Err("invalid payload: end_seq < start_seq".into());
+    }
+    let boundary_reason = required_str(&event_root, &["boundary_reason"], "boundary_reason")?;
+
     let mut cues_agg = get_string_vec(&event_root, &["cues_agg"])
         .or_else(|| get_string_vec(&event_root, &["tags"]))
         .unwrap_or_default();
     if cues_agg.is_empty() {
-        cues_agg.push("untagged".to_string());
+        return Err(missing_field("cues_agg|tags"));
     }
     dedup_sort(&mut cues_agg);
+
     Ok(EventRecord {
         event_id: get_i64(&event_root, &["event_id"]),
         ctx,
@@ -640,30 +638,94 @@ fn parse_memory_item(value: Value) -> Result<MemoryItemRecord, StorageError> {
     } else {
         value
     };
-    let content = item_root
-        .get("content")
-        .cloned()
-        .unwrap_or_else(|| item_root.clone());
+    if !item_root.is_object() {
+        return Err(missing_field("item"));
+    }
+
+    let content = required_value(&item_root, &["content"], "content")?.clone();
+    let item_type = required_str(&item_root, &["item_type"], "item_type")?;
+    let confidence = required_f64(&item_root, &["confidence"], "confidence")?;
+
     let mut cues_signature = get_string_vec(&item_root, &["cues_signature"])
         .or_else(|| get_string_vec(&item_root, &["tags"]))
         .unwrap_or_default();
     if cues_signature.is_empty() {
-        cues_signature.push("untagged".to_string());
+        return Err(missing_field("cues_signature|tags"));
     }
     dedup_sort(&mut cues_signature);
+
     let memory_id = get_str(&item_root, &["memory_id"]).unwrap_or_else(|| {
         let canonical = serde_json::to_string(&item_root).unwrap_or_else(|_| "item".to_string());
         format!("mid-{:x}", stable_u64(&canonical))
     });
+
     Ok(MemoryItemRecord {
         memory_id,
         event_id: get_i64(&item_root, &["event_id"]),
-        item_type: get_str(&item_root, &["item_type"]).unwrap_or_else(|| "unknown".to_string()),
+        item_type,
         content,
-        confidence: get_f64(&item_root, &["confidence"]).unwrap_or(0.5),
+        confidence,
         cues_signature,
         activation_strength: get_f64(&item_root, &["activation_strength"]).unwrap_or(0.5),
     })
+}
+
+#[derive(Debug)]
+struct ReactivationEventUse {
+    event_id: i64,
+    used: bool,
+}
+
+#[derive(Debug)]
+struct ReactivationPayload {
+    outcome_ok: bool,
+    events: Vec<ReactivationEventUse>,
+}
+
+fn parse_reactivation_payload(value: Value) -> Result<ReactivationPayload, StorageError> {
+    let outcome_ok =
+        get_str(&value, &["outcome", "status"]).is_some_and(|s| s.eq_ignore_ascii_case("resolved"));
+
+    let events = get_array(&value, &["reactivated", "events"])
+        .or_else(|| get_array(&value, &["events"]))
+        .ok_or_else(|| missing_field("reactivated.events|events"))?;
+
+    let mut parsed = Vec::with_capacity(events.len());
+    for (idx, ev) in events.iter().enumerate() {
+        let field = format!("events[{idx}].event_id");
+        let event_id = required_i64(ev, &["event_id"], &field)?;
+        let used = get_bool(ev, &["used"]).unwrap_or(false);
+        parsed.push(ReactivationEventUse { event_id, used });
+    }
+
+    Ok(ReactivationPayload {
+        outcome_ok,
+        events: parsed,
+    })
+}
+
+fn missing_field(field: &str) -> StorageError {
+    format!("invalid payload: missing or invalid {field}").into()
+}
+
+fn required_value<'a>(
+    value: &'a Value,
+    path: &[&str],
+    field: &str,
+) -> Result<&'a Value, StorageError> {
+    get_value(value, path).ok_or_else(|| missing_field(field))
+}
+
+fn required_str(value: &Value, path: &[&str], field: &str) -> Result<String, StorageError> {
+    get_str(value, path).ok_or_else(|| missing_field(field))
+}
+
+fn required_i64(value: &Value, path: &[&str], field: &str) -> Result<i64, StorageError> {
+    get_i64(value, path).ok_or_else(|| missing_field(field))
+}
+
+fn required_f64(value: &Value, path: &[&str], field: &str) -> Result<f64, StorageError> {
+    get_f64(value, path).ok_or_else(|| missing_field(field))
 }
 
 fn get_value<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {

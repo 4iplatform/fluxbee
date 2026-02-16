@@ -12,7 +12,10 @@ use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 use crate::config::RouterConfig;
-use crate::nats::{check_endpoint as nats_check_endpoint, NatsPublisher, SUBJECT_STORAGE_TURNS};
+use crate::nats::{
+    check_endpoint as nats_check_endpoint, start_embedded_broker, NatsPublisher,
+    SUBJECT_STORAGE_TURNS,
+};
 use crate::opa::OpaResolver;
 use crate::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionReader, ConfigSnapshot, LsaRegionReader,
@@ -136,7 +139,7 @@ impl Router {
     }
 
     pub async fn run(&self) -> Result<(), RouterError> {
-        prepare_nats_runtime(&self.cfg)?;
+        prepare_nats_runtime(&self.cfg).await?;
         wait_for_nats_ready(&self.cfg, Duration::from_secs(NATS_READY_TIMEOUT_SECS)).await?;
         ensure_parent_dir(&self.cfg.node_socket_path)?;
         let _ = std::fs::remove_file(&self.cfg.node_socket_path);
@@ -3782,15 +3785,16 @@ async fn wait_for_nats_ready(cfg: &RouterConfig, timeout: Duration) -> Result<()
     }
 }
 
-fn prepare_nats_runtime(cfg: &RouterConfig) -> Result<(), RouterError> {
+async fn prepare_nats_runtime(cfg: &RouterConfig) -> Result<(), RouterError> {
     if cfg.nats_mode == "embedded" {
         fs::create_dir_all(&cfg.nats_storage_dir)?;
+        start_embedded_broker(&cfg.nats_url).await?;
         tracing::info!(
             mode = %cfg.nats_mode,
             port = cfg.nats_port,
             storage_dir = %cfg.nats_storage_dir.display(),
             endpoint = %cfg.nats_url,
-            "nats configured"
+            "embedded nats broker started"
         );
     } else {
         tracing::info!(

@@ -552,14 +552,9 @@ async fn handle_http(
         ("POST", "/routes") => {
             let route: RouteConfig = serde_json::from_slice(&body)?;
             let hive = query.get("hive").cloned();
-            let (status, resp) = handle_admin_command(
-                ctx,
-                client,
-                "add_route",
-                serde_json::to_value(route)?,
-                hive,
-            )
-            .await?;
+            let (status, resp) =
+                handle_admin_command(ctx, client, "add_route", serde_json::to_value(route)?, hive)
+                    .await?;
             respond_json(stream, status, &resp).await?;
         }
         ("DELETE", "/routes") => {
@@ -784,8 +779,7 @@ async fn handle_hive_paths(
     }
     match (method, rest) {
         ("GET", ["routes"]) => {
-            let (status, resp) =
-                handle_admin_query(ctx, client, "list_routes", Some(hive)).await?;
+            let (status, resp) = handle_admin_query(ctx, client, "list_routes", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["routes"]) => {
@@ -829,8 +823,7 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("GET", ["nodes"]) => {
-            let (status, resp) =
-                handle_admin_query(ctx, client, "list_nodes", Some(hive)).await?;
+            let (status, resp) = handle_admin_query(ctx, client, "list_nodes", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["nodes"]) => {

@@ -735,11 +735,7 @@ impl ConfigRegionReader {
 }
 
 impl LsaRegionWriter {
-    pub fn open_or_create(
-        name: &str,
-        gateway_uuid: Uuid,
-        hive_id: &str,
-    ) -> Result<Self, ShmError> {
+    pub fn open_or_create(name: &str, gateway_uuid: Uuid, hive_id: &str) -> Result<Self, ShmError> {
         validate_name(name)?;
         let layout = layout_lsa();
         let mmap = open_or_create_region(name, layout.total_len, |mmap| {
@@ -1205,8 +1201,7 @@ fn initialize_lsa_header(mmap: &mut MmapMut, gateway_uuid: Uuid, hive_id: &str) 
         header.total_node_count = 0;
         header.total_route_count = 0;
         header.total_vpn_count = 0;
-        header.local_hive_id_len =
-            copy_bytes_with_len(&mut header.local_hive_id, hive_id) as u16;
+        header.local_hive_id_len = copy_bytes_with_len(&mut header.local_hive_id, hive_id) as u16;
         header.created_at = now_epoch_ms();
         header.updated_at = header.created_at;
     }
@@ -1331,11 +1326,8 @@ fn read_lsa_snapshot(
         let total_routes = header.total_route_count as usize;
         let total_vpns = header.total_vpn_count as usize;
 
-        let hives = read_slice::<RemoteHiveEntry>(
-            mmap,
-            layout.hive_offset,
-            MAX_REMOTE_HIVES as usize,
-        )?;
+        let hives =
+            read_slice::<RemoteHiveEntry>(mmap, layout.hive_offset, MAX_REMOTE_HIVES as usize)?;
         let nodes = read_slice::<RemoteNodeEntry>(
             mmap,
             layout.remote_node_offset,

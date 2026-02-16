@@ -7,7 +7,7 @@ Objetivo: priorizar una base estable para pruebas de `SY.storage`, sin perder el
 - Router:
   - Publica solo `storage.turns` (mensajes no-system/admin/query).
   - Usa `src/nats/mod.rs` (cliente TCP NATS minimo, sin JetStream/acks).
-  - En `nats.mode=embedded` hoy solo prepara directorio y loguea; no levanta servidor NATS embebido real.
+  - En `nats.mode=embedded` ahora levanta broker NATS minimo en el propio proceso del router (sin `nats-server` externo).
 - SY.storage:
   - Consume `storage.turns`, `storage.events`, `storage.items`, `storage.reactivation`.
   - Reintenta suscripcion en loop cuando NATS no esta disponible.
@@ -15,9 +15,9 @@ Objetivo: priorizar una base estable para pruebas de `SY.storage`, sin perder el
 
 ## Gap principal contra spec v1.16+
 
-1. Falta ownership real de NATS embebido en router.
-2. Falta semantica de entrega robusta (JetStream/acks/durable consumers).
-3. Falta contrato completo de productores para `events/items/reactivation`.
+1. Falta semantica de entrega robusta (JetStream/acks/durable consumers).
+2. Falta contrato completo de productores para `events/items/reactivation`.
+3. Falta completar lifecycle de NATS embebido para shutdown/recovery explicito.
 
 ## Prioridad recomendada (orden de ejecucion)
 
@@ -36,27 +36,31 @@ Nota actual:
 - El chequeo de `sy-storage` valida estado `systemd active`; queda pendiente chequeo explicito de conexion DB al bootstrap.
 
 ## Fase 1 - Contrato de datos de storage
-- [ ] Definir y documentar payload canonico para:
-  - [ ] `storage.turns`
-  - [ ] `storage.events`
-  - [ ] `storage.items`
-  - [ ] `storage.reactivation`
-- [ ] Endurecer validacion en `sy_storage` (rechazo + log estructurado por campo invalido).
+- [x] Definir y documentar payload canonico para:
+  - [x] `storage.turns`
+  - [x] `storage.events`
+  - [x] `storage.items`
+  - [x] `storage.reactivation`
+- [x] Endurecer validacion en `sy_storage` (rechazo + log estructurado por campo invalido).
 - [ ] Acordar productores por subject (router/cognition/u otros).
 
 Criterio de salida:
 - Se pueden reproducir tests de ingestion con fixtures validos e invalidos y resultado determinista.
 
+Avance de implementacion:
+- Contrato canonico documentado en `docs/onworking/storage_subject_contract.md`.
+- Validacion endurecida aplicada en parser de `SY.storage` para events/items/reactivation y campos minimos de turns.
+
 ## Fase 2 - NATS embebido real en router
-- [ ] Definir mecanismo de embebido (decision tecnica):
+- [x] Definir mecanismo de embebido (decision tecnica):
   - [ ] Opcion A: proceso `nats-server` gestionado por router/orchestrator.
-  - [ ] Opcion B: server embebido en proceso Rust (si hay libreria viable y madura).
+  - [x] Opcion B: broker NATS minimo embebido en proceso Rust del router.
 - [ ] Implementar lifecycle completo:
-  - [ ] start
-  - [ ] health
+  - [x] start
+  - [x] health
   - [ ] stop
   - [ ] recovery post-crash.
-- [ ] Alinear config `nats.mode=embedded|client` con comportamiento real.
+- [x] Alinear config `nats.mode=embedded|client` con comportamiento real.
 
 Criterio de salida:
 - En `embedded`, el router garantiza NATS local operativo sin dependencia manual externa.
@@ -71,14 +75,12 @@ Criterio de salida:
 
 ## Primer bloque sugerido para arrancar ya
 
-1. Implementar readiness NATS en router (`rt-gateway`) y en orchestrator bootstrap.
-2. Agregar smoke test de arranque:
-   - `systemctl restart rt-gateway sy-storage sy-orchestrator`
-   - validar logs y estado estable >= 60s.
-3. Documentar payload canonico de `storage.turns` (actual) y dejar fixtures para pruebas de storage.
+1. Cerrar lifecycle faltante del broker embebido (stop/recovery) y agregar smoke test de restart.
+2. Acordar y alinear productores de `storage.events/items/reactivation` al contrato canonico.
+3. Preparar migracion de cliente NATS minimo a cliente con soporte de durabilidad (siguiente fase).
 
 ## Riesgos abiertos
 
-- Si se mantiene cliente TCP minimo, no hay ack real ni durabilidad semantica de consumidor.
-- Si `embedded` sigue siendo solo config sin server, pruebas dependen de NATS externo (fragil para QA).
-- Hay riesgo de drift entre lo documentado en spec y lo implementado en runtime.
+- El broker embebido actual es minimo y no cubre semantica JetStream.
+- Sin ack/durable consumer todavia puede haber perdida de mensajes ante reinicios.
+- Hay riesgo de drift entre lo documentado en spec y lo implementado en runtime si no se cierran pruebas E2E de subjects.
