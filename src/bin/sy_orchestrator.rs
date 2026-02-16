@@ -269,11 +269,13 @@ async fn wait_for_sy_nodes(
     state: &OrchestratorState,
     timeout: Duration,
 ) -> Result<(), OrchestratorError> {
-    let mut required = vec!["SY.config.routes", "SY.opa.rules", "SY.admin", "SY.storage"];
+    // Only router-connected SY nodes are visible in router SHM.
+    let mut required = vec!["SY.config.routes", "SY.opa.rules", "SY.admin"];
     if identity_available() {
         required.push("SY.identity");
     }
     let start = Instant::now();
+    let mut last_missing: Vec<String> = required.iter().map(|name| (*name).to_string()).collect();
     loop {
         if let Ok(snapshot) = load_router_snapshot(state) {
             let mut missing = Vec::new();
@@ -287,16 +289,22 @@ async fn wait_for_sy_nodes(
                     node_name == name || node_name == expected
                 });
                 if !found {
-                    missing.push(name);
+                    missing.push(name.to_string());
                 }
             }
             if missing.is_empty() {
                 tracing::info!("sy nodes connected");
                 return Ok(());
             }
+            last_missing = missing;
         }
         if start.elapsed() >= timeout {
-            return Err("sy nodes bootstrap timeout".into());
+            tracing::error!(missing = ?last_missing, "sy nodes bootstrap timeout");
+            return Err(format!(
+                "sy nodes bootstrap timeout (missing: {})",
+                last_missing.join(", ")
+            )
+            .into());
         }
         time::sleep(Duration::from_millis(250)).await;
     }
