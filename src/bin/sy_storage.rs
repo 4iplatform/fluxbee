@@ -1,6 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +17,8 @@ use json_router::nats::{
 };
 
 type StorageError = Box<dyn std::error::Error + Send + Sync>;
+
+const NATS_ERROR_LOG_EVERY: u64 = 20;
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -112,10 +115,33 @@ async fn main() -> Result<(), StorageError> {
         "sy.storage started"
     );
 
-    let turns_task = tokio::spawn(run_turns_loop(endpoint.clone(), Arc::clone(&storage)));
-    let events_task = tokio::spawn(run_events_loop(endpoint.clone(), Arc::clone(&storage)));
-    let items_task = tokio::spawn(run_items_loop(endpoint.clone(), Arc::clone(&storage)));
-    let react_task = tokio::spawn(run_reactivation_loop(endpoint, Arc::clone(&storage)));
+    let nats_subscribe_errors = Arc::new(AtomicU64::new(0));
+    let storage_handler_errors = Arc::new(AtomicU64::new(0));
+
+    let turns_task = tokio::spawn(run_turns_loop(
+        endpoint.clone(),
+        Arc::clone(&storage),
+        Arc::clone(&nats_subscribe_errors),
+        Arc::clone(&storage_handler_errors),
+    ));
+    let events_task = tokio::spawn(run_events_loop(
+        endpoint.clone(),
+        Arc::clone(&storage),
+        Arc::clone(&nats_subscribe_errors),
+        Arc::clone(&storage_handler_errors),
+    ));
+    let items_task = tokio::spawn(run_items_loop(
+        endpoint.clone(),
+        Arc::clone(&storage),
+        Arc::clone(&nats_subscribe_errors),
+        Arc::clone(&storage_handler_errors),
+    ));
+    let react_task = tokio::spawn(run_reactivation_loop(
+        endpoint,
+        Arc::clone(&storage),
+        Arc::clone(&nats_subscribe_errors),
+        Arc::clone(&storage_handler_errors),
+    ));
 
     let _ = tokio::join!(turns_task, events_task, items_task, react_task);
     Ok(())
@@ -312,8 +338,8 @@ ON CONFLICT (memory_id) DO NOTHING
 
     async fn handle_reactivation(&self, payload: &[u8]) -> Result<(), StorageError> {
         let value: Value = serde_json::from_slice(payload)?;
-        let outcome_ok =
-            get_str(&value, &["outcome", "status"]).is_some_and(|s| s.eq_ignore_ascii_case("resolved"));
+        let outcome_ok = get_str(&value, &["outcome", "status"])
+            .is_some_and(|s| s.eq_ignore_ascii_case("resolved"));
         let events = get_array(&value, &["reactivated", "events"])
             .or_else(|| get_array(&value, &["events"]))
             .cloned()
@@ -356,25 +382,74 @@ WHERE event_id = $1
     }
 }
 
-async fn run_turns_loop(endpoint: String, storage: Arc<Storage>) {
-    run_subject_loop(endpoint, SUBJECT_STORAGE_TURNS, 10, storage, HandlerKind::Turns).await;
+async fn run_turns_loop(
+    endpoint: String,
+    storage: Arc<Storage>,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
+) {
+    run_subject_loop(
+        endpoint,
+        SUBJECT_STORAGE_TURNS,
+        10,
+        storage,
+        HandlerKind::Turns,
+        nats_subscribe_errors,
+        storage_handler_errors,
+    )
+    .await;
 }
 
-async fn run_events_loop(endpoint: String, storage: Arc<Storage>) {
-    run_subject_loop(endpoint, SUBJECT_STORAGE_EVENTS, 11, storage, HandlerKind::Events).await;
+async fn run_events_loop(
+    endpoint: String,
+    storage: Arc<Storage>,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
+) {
+    run_subject_loop(
+        endpoint,
+        SUBJECT_STORAGE_EVENTS,
+        11,
+        storage,
+        HandlerKind::Events,
+        nats_subscribe_errors,
+        storage_handler_errors,
+    )
+    .await;
 }
 
-async fn run_items_loop(endpoint: String, storage: Arc<Storage>) {
-    run_subject_loop(endpoint, SUBJECT_STORAGE_ITEMS, 12, storage, HandlerKind::Items).await;
+async fn run_items_loop(
+    endpoint: String,
+    storage: Arc<Storage>,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
+) {
+    run_subject_loop(
+        endpoint,
+        SUBJECT_STORAGE_ITEMS,
+        12,
+        storage,
+        HandlerKind::Items,
+        nats_subscribe_errors,
+        storage_handler_errors,
+    )
+    .await;
 }
 
-async fn run_reactivation_loop(endpoint: String, storage: Arc<Storage>) {
+async fn run_reactivation_loop(
+    endpoint: String,
+    storage: Arc<Storage>,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
+) {
     run_subject_loop(
         endpoint,
         SUBJECT_STORAGE_REACTIVATION,
         13,
         storage,
         HandlerKind::Reactivation,
+        nats_subscribe_errors,
+        storage_handler_errors,
     )
     .await;
 }
@@ -393,15 +468,20 @@ async fn run_subject_loop(
     sid: u32,
     storage: Arc<Storage>,
     kind: HandlerKind,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
 ) {
     loop {
         let subscriber = NatsSubscriber::new(endpoint.clone(), subject.to_string(), sid);
         let worker = Arc::clone(&storage);
         let subject_name = subject.to_string();
+        let nats_subscribe_errors = Arc::clone(&nats_subscribe_errors);
+        let storage_handler_errors = Arc::clone(&storage_handler_errors);
         let run_result = subscriber
             .run(move |payload| {
                 let worker = Arc::clone(&worker);
                 let subject_name = subject_name.clone();
+                let storage_handler_errors = Arc::clone(&storage_handler_errors);
                 async move {
                     let result = match kind {
                         HandlerKind::Turns => worker.handle_turn(&payload).await,
@@ -410,14 +490,30 @@ async fn run_subject_loop(
                         HandlerKind::Reactivation => worker.handle_reactivation(&payload).await,
                     };
                     if let Err(err) = result {
-                        tracing::warn!(subject = %subject_name, error = %err, "storage handler failed");
+                        let count = storage_handler_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                        if count == 1 || count % NATS_ERROR_LOG_EVERY == 0 {
+                            tracing::warn!(
+                                subject = %subject_name,
+                                error = %err,
+                                failures = count,
+                                "storage handler failed"
+                            );
+                        }
                     }
                     Ok(())
                 }
             })
             .await;
         if let Err(err) = run_result {
-            tracing::warn!(subject = %subject, error = %err, "nats subscribe loop failed; retrying");
+            let count = nats_subscribe_errors.fetch_add(1, Ordering::Relaxed) + 1;
+            if count == 1 || count % NATS_ERROR_LOG_EVERY == 0 {
+                tracing::warn!(
+                    subject = %subject,
+                    error = %err,
+                    failures = count,
+                    "nats subscribe loop failed; retrying"
+                );
+            }
         }
         time::sleep(Duration::from_secs(1)).await;
     }
@@ -485,8 +581,7 @@ fn parse_turn(value: Value) -> Result<TurnRecord, StorageError> {
         .unwrap_or_else(|| "unknown".to_string());
     let to_ilk = get_str(&value, &["meta", "dst_ilk"]);
     let ich = get_str(&value, &["meta", "ich"]).unwrap_or_else(|| "unknown".to_string());
-    let msg_type =
-        get_str(&value, &["meta", "type"]).unwrap_or_else(|| "unknown".to_string());
+    let msg_type = get_str(&value, &["meta", "type"]).unwrap_or_else(|| "unknown".to_string());
     let content = value.get("payload").cloned().unwrap_or(Value::Null);
     let mut tags = get_string_vec(&value, &["payload", "tags"]).unwrap_or_default();
     if tags.is_empty() {

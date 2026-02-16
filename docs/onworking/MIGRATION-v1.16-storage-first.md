@@ -105,3 +105,35 @@ Entregar una base funcional y estable para desacoplar el router de persistencia:
 - `scripts/install.sh` integra ownership para test/dev:
   - `APPLY_DEV_OWNERSHIP=1` (default) aplica `chown` sobre `/etc/fluxbee`, `/var/lib/fluxbee`, `/var/run/fluxbee`
   - `INSTALL_OWNER=<user>` permite fijar usuario destino.
+
+## Actualizacion Iteracion 5 (prioridad storage + NATS)
+
+Se agrega plan operativo de prioridad en:
+- `docs/onworking/NATS-router-storage-priority.md`
+
+Resumen:
+- Baseline confirmado:
+  - router publica `storage.turns` con cliente NATS liviano,
+  - `sy-storage` consume 4 subjects y persiste en PostgreSQL.
+- Gap principal:
+  - `nats.mode=embedded` aun no levanta servidor embebido real.
+- Siguiente bloque recomendado:
+  1. readiness explicito de NATS en router + orchestrator,
+  2. endurecer contratos de payload en storage,
+  3. definir implementacion de NATS embebido real,
+  4. migrar a semantica JetStream/acks.
+
+## Actualizacion Iteracion 6 (fase 0 iniciada en codigo)
+
+Implementado en esta iteracion:
+- Router (`rt-gateway`): readiness explicito de endpoint NATS al arranque.
+  - Si no conecta a NATS en timeout, falla con error de startup claro.
+- Orchestrator (`sy-orchestrator`): bootstrap ahora valida:
+  - readiness de NATS,
+  - `sy-storage` activo en systemd tras levantar servicios base.
+- Observabilidad minima de NATS:
+  - contador acumulado de fallos de publish en router (log throttled por cantidad),
+  - contador acumulado de fallos de subscribe/handler en `sy-storage` (log throttled por cantidad).
+
+Pendiente de esta misma fase:
+- ampliar readiness de `sy-storage` para confirmar conexion DB al bootstrap (no solo estado `active`).

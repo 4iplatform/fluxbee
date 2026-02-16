@@ -23,12 +23,15 @@ const BOOTSTRAP_SSH_USER: &str = "administrator";
 const BOOTSTRAP_SSH_PASS: &str = "magicAI";
 const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
 const RUNTIME_MANIFEST_FILE: &str = "runtime-manifest.json";
+const NATS_BOOTSTRAP_TIMEOUT_SECS: u64 = 20;
+const STORAGE_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
     hive_id: String,
     role: Option<String>,
     wan: Option<WanSection>,
+    nats: Option<NatsSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +48,13 @@ struct IdentityShm {
 struct WanSection {
     gateway_name: Option<String>,
     listen: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NatsSection {
+    mode: Option<String>,
+    port: Option<u16>,
+    url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +100,7 @@ struct OrchestratorState {
     tracked_nodes: Mutex<HashSet<String>>,
     runtime_manifest: Mutex<Option<RuntimeManifest>>,
     last_runtime_verify: Mutex<Instant>,
+    nats_endpoint: String,
 }
 
 const CRITICAL_SERVICES: [&str; 5] = [
@@ -128,6 +139,7 @@ async fn main() -> Result<(), OrchestratorError> {
         .and_then(|wan| wan.gateway_name.clone())
         .unwrap_or_else(|| "RT.gateway".to_string());
     let wan_listen = hive.wan.as_ref().and_then(|wan| wan.listen.clone());
+    let nats_endpoint = nats_endpoint_from_hive(&hive);
     let storage_path = load_storage_path(&config_dir);
     let runtime_manifest = load_runtime_manifest();
     let state = OrchestratorState {
@@ -141,6 +153,7 @@ async fn main() -> Result<(), OrchestratorError> {
         tracked_nodes: Mutex::new(HashSet::new()),
         runtime_manifest: Mutex::new(runtime_manifest),
         last_runtime_verify: Mutex::new(Instant::now()),
+        nats_endpoint,
     };
     ensure_dirs(&config_dir, &state_dir, &run_dir)?;
     write_pid(&run_dir)?;
@@ -217,6 +230,11 @@ async fn bootstrap_local(
     tracing::info!("starting rt-gateway");
     systemd_start("rt-gateway")?;
     wait_for_router_ready(state, socket_dir, Duration::from_secs(30)).await?;
+    wait_for_nats_ready(
+        &state.nats_endpoint,
+        Duration::from_secs(NATS_BOOTSTRAP_TIMEOUT_SECS),
+    )
+    .await?;
 
     let mut services = vec!["sy-config-routes", "sy-opa-rules", "sy-admin", "sy-storage"];
     if identity_available() {
@@ -230,6 +248,11 @@ async fn bootstrap_local(
     }
 
     wait_for_sy_nodes(state, Duration::from_secs(30)).await?;
+    wait_for_service_active(
+        "sy-storage",
+        Duration::from_secs(STORAGE_BOOTSTRAP_TIMEOUT_SECS),
+    )
+    .await?;
     Ok(())
 }
 
@@ -666,6 +689,71 @@ async fn send_system_action_response(
     };
     sender.send(reply).await?;
     Ok(())
+}
+
+async fn wait_for_nats_ready(endpoint: &str, timeout: Duration) -> Result<(), OrchestratorError> {
+    let start = Instant::now();
+    loop {
+        match json_router::nats::check_endpoint(endpoint, Duration::from_secs(2)).await {
+            Ok(()) => {
+                tracing::info!(endpoint = %endpoint, "nats endpoint ready");
+                return Ok(());
+            }
+            Err(err) => {
+                if start.elapsed() >= timeout {
+                    return Err(format!(
+                        "nats bootstrap timeout endpoint={} error={}",
+                        endpoint, err
+                    )
+                    .into());
+                }
+            }
+        }
+        time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_service_active(
+    service: &str,
+    timeout: Duration,
+) -> Result<(), OrchestratorError> {
+    let start = Instant::now();
+    loop {
+        if systemd_is_active(service) {
+            tracing::info!(service = service, "service active");
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!("{} bootstrap timeout (systemd inactive)", service).into());
+        }
+        time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn nats_endpoint_from_hive(hive: &HiveFile) -> String {
+    let Some(nats) = hive.nats.as_ref() else {
+        return "nats://127.0.0.1:4222".to_string();
+    };
+
+    if let Some(url) = nats.url.as_ref() {
+        let url = url.trim();
+        if !url.is_empty() {
+            return url.to_string();
+        }
+    }
+
+    let mode = nats
+        .mode
+        .as_deref()
+        .unwrap_or("embedded")
+        .trim()
+        .to_ascii_lowercase();
+    let port = nats.port.unwrap_or(4222);
+    if mode == "embedded" || mode == "client" {
+        format!("nats://127.0.0.1:{port}")
+    } else {
+        "nats://127.0.0.1:4222".to_string()
+    }
 }
 
 async fn connect_with_retry(

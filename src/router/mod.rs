@@ -3,6 +3,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -11,7 +12,7 @@ use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 use crate::config::RouterConfig;
-use crate::nats::{NatsPublisher, SUBJECT_STORAGE_TURNS};
+use crate::nats::{check_endpoint as nats_check_endpoint, NatsPublisher, SUBJECT_STORAGE_TURNS};
 use crate::opa::OpaResolver;
 use crate::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionReader, ConfigSnapshot, LsaRegionReader,
@@ -40,6 +41,8 @@ pub enum RouterError {
     Uuid(#[from] uuid::Error),
     #[error("opa error: {0}")]
     Opa(#[from] crate::opa::OpaError),
+    #[error("startup error: {0}")]
+    Startup(String),
 }
 
 pub struct Router {
@@ -64,7 +67,12 @@ pub struct Router {
     lsa_state: Arc<Mutex<std::collections::HashMap<String, RemoteHiveState>>>,
     lsa_seq: Arc<Mutex<u64>>,
     nats_publisher: Option<Arc<NatsPublisher>>,
+    nats_publish_errors: Arc<AtomicU64>,
 }
+
+const NATS_READY_TIMEOUT_SECS: u64 = 20;
+const NATS_READY_RETRY_MS: u64 = 250;
+const NATS_PUBLISH_ERROR_LOG_EVERY: u64 = 25;
 
 impl Router {
     pub fn new(cfg: RouterConfig) -> Self {
@@ -81,11 +89,11 @@ impl Router {
                 Ok(reader) => Some(reader),
                 Err(_) => None,
             };
-        let lsa_reader =
-            match LsaRegionReader::open_read_only(&format!("/jsr-lsa-{}", cfg.hive_id)) {
-                Ok(reader) => Some(reader),
-                Err(_) => None,
-            };
+        let lsa_reader = match LsaRegionReader::open_read_only(&format!("/jsr-lsa-{}", cfg.hive_id))
+        {
+            Ok(reader) => Some(reader),
+            Err(_) => None,
+        };
         let lsa_writer = if cfg.is_gateway {
             LsaRegionWriter::open_or_create(
                 &format!("/jsr-lsa-{}", cfg.hive_id),
@@ -123,11 +131,13 @@ impl Router {
             lsa_state: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lsa_seq: Arc::new(Mutex::new(0)),
             nats_publisher,
+            nats_publish_errors: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub async fn run(&self) -> Result<(), RouterError> {
         prepare_nats_runtime(&self.cfg)?;
+        wait_for_nats_ready(&self.cfg, Duration::from_secs(NATS_READY_TIMEOUT_SECS)).await?;
         ensure_parent_dir(&self.cfg.node_socket_path)?;
         let _ = std::fs::remove_file(&self.cfg.node_socket_path);
         let listener = UnixListener::bind(&self.cfg.node_socket_path)?;
@@ -380,6 +390,7 @@ impl Router {
             let broadcast_cache = Arc::clone(&self.broadcast_cache);
             let lsa_seq = Arc::clone(&self.lsa_seq);
             let nats_publisher = self.nats_publisher.clone();
+            let nats_publish_errors = Arc::clone(&self.nats_publish_errors);
             let is_gateway = self.cfg.is_gateway;
             tokio::spawn(async move {
                 if let Err(err) = handle_node(
@@ -402,6 +413,7 @@ impl Router {
                     broadcast_cache,
                     lsa_seq,
                     nats_publisher,
+                    nats_publish_errors,
                     router_uuid,
                     &router_name,
                     &hive_id,
@@ -436,6 +448,7 @@ async fn handle_node(
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
     nats_publisher: Option<Arc<NatsPublisher>>,
+    nats_publish_errors: Arc<AtomicU64>,
     router_uuid: Uuid,
     router_name: &str,
     hive_id: &str,
@@ -579,7 +592,7 @@ async fn handle_node(
                         msg = ?msg.meta.msg,
                         "message received"
                     );
-                    maybe_publish_turn(&nats_publisher, &msg);
+                    maybe_publish_turn(&nats_publisher, &nats_publish_errors, &msg);
                     if msg.meta.msg_type == SYSTEM_KIND {
                         if msg.meta.msg.as_deref() == Some(MSG_WITHDRAW) {
                             break;
@@ -1457,8 +1470,7 @@ async fn write_lsa_state(
             route_count: state.routes.len() as u32,
             vpn_count: state.vpns.len() as u32,
         };
-        hive_entry.hive_id_len =
-            copy_bytes_with_len(&mut hive_entry.hive_id, hive_id) as u16;
+        hive_entry.hive_id_len = copy_bytes_with_len(&mut hive_entry.hive_id, hive_id) as u16;
         hive_entries.push(hive_entry);
 
         for node in state.nodes.iter() {
@@ -1686,8 +1698,7 @@ async fn handle_wan_connection(
         return Ok(());
     }
     let peer_hello: WanHelloPayload = serde_json::from_value(msg.payload)?;
-    if !ctx.authorized_hives.is_empty() && !ctx.authorized_hives.contains(&peer_hello.hive_id)
-    {
+    if !ctx.authorized_hives.is_empty() && !ctx.authorized_hives.contains(&peer_hello.hive_id) {
         let reject = build_wan_reject(
             &ctx.router_uuid.to_string(),
             &peer_hello.router_id,
@@ -3370,12 +3381,7 @@ async fn rebuild_fib(
             if hive.flags & FLAG_STALE != 0 {
                 continue;
             }
-            hive_map.push((
-                name.to_string(),
-                idx as u16,
-                hive.flags,
-                hive.last_updated,
-            ));
+            hive_map.push((name.to_string(), idx as u16, hive.flags, hive.last_updated));
         }
 
         for node in snapshot.nodes.iter() {
@@ -3423,8 +3429,7 @@ async fn rebuild_fib(
             };
             let prefix = bytes_to_string(&route.prefix, route.prefix_len as usize).to_string();
             let mut next_hop_hive =
-                bytes_to_string(&route.next_hop_hive, route.next_hop_hive_len as usize)
-                    .to_string();
+                bytes_to_string(&route.next_hop_hive, route.next_hop_hive_len as usize).to_string();
             if next_hop_hive.is_empty() {
                 next_hop_hive = hive_id.clone();
             }
@@ -3756,6 +3761,27 @@ fn match_any_hive(base: &str, full_name: &str) -> bool {
     name_base == base
 }
 
+async fn wait_for_nats_ready(cfg: &RouterConfig, timeout: Duration) -> Result<(), RouterError> {
+    let start = time::Instant::now();
+    loop {
+        match nats_check_endpoint(&cfg.nats_url, Duration::from_secs(2)).await {
+            Ok(()) => {
+                tracing::info!(endpoint = %cfg.nats_url, "nats endpoint ready");
+                return Ok(());
+            }
+            Err(err) => {
+                if start.elapsed() >= timeout {
+                    return Err(RouterError::Startup(format!(
+                        "nats readiness timeout endpoint={} error={}",
+                        cfg.nats_url, err
+                    )));
+                }
+            }
+        }
+        time::sleep(Duration::from_millis(NATS_READY_RETRY_MS)).await;
+    }
+}
+
 fn prepare_nats_runtime(cfg: &RouterConfig) -> Result<(), RouterError> {
     if cfg.nats_mode == "embedded" {
         fs::create_dir_all(&cfg.nats_storage_dir)?;
@@ -3776,7 +3802,11 @@ fn prepare_nats_runtime(cfg: &RouterConfig) -> Result<(), RouterError> {
     Ok(())
 }
 
-fn maybe_publish_turn(nats_publisher: &Option<Arc<NatsPublisher>>, msg: &Message) {
+fn maybe_publish_turn(
+    nats_publisher: &Option<Arc<NatsPublisher>>,
+    nats_publish_errors: &Arc<AtomicU64>,
+    msg: &Message,
+) {
     if !should_publish_turn(msg) {
         return;
     }
@@ -3784,6 +3814,7 @@ fn maybe_publish_turn(nats_publisher: &Option<Arc<NatsPublisher>>, msg: &Message
         return;
     };
     let publisher = Arc::clone(publisher);
+    let nats_publish_errors = Arc::clone(nats_publish_errors);
     let payload = match serde_json::to_vec(msg) {
         Ok(payload) => payload,
         Err(err) => {
@@ -3793,7 +3824,15 @@ fn maybe_publish_turn(nats_publisher: &Option<Arc<NatsPublisher>>, msg: &Message
     };
     tokio::spawn(async move {
         if let Err(err) = publisher.publish(&payload).await {
-            tracing::warn!(error = %err, "nats publish failed");
+            let count = nats_publish_errors.fetch_add(1, Ordering::Relaxed) + 1;
+            if count == 1 || count % NATS_PUBLISH_ERROR_LOG_EVERY == 0 {
+                tracing::warn!(
+                    error = %err,
+                    failures = count,
+                    subject = SUBJECT_STORAGE_TURNS,
+                    "nats publish failed"
+                );
+            }
         }
     });
 }

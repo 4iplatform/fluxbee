@@ -1,26 +1,45 @@
-# SY.admin - Tareas pendientes vs spec
+# SY.admin - Tareas pendientes vs spec (estado real)
 
-Lista de tareas para alinear `SY.admin` con la especificación actual.
+Lista de tareas para alinear `SY.admin` con la especificacion actual y con el modelo motherbee/worker.
 
-## Endpoints y flujos faltantes
-- [ ] Implementar `/hives` (POST/GET/GET {id}/DELETE) + `add_hive` completo (SSH bootstrap, keygen, scp, systemd, espera WAN, repo en `/var/lib/fluxbee/hives`).
-- [x] Implementar `GET /hive/status` (estado completo de isla).
-- [x] Implementar `GET/PUT /config/storage` con broadcast `CONFIG_CHANGED` subsystem `storage`.
-- [x] Implementar API de módulos: `/modules`, `/modules/{name}`, `/modules/{name}/{version}` (list/get/upload).
-- [ ] Revisar presencia/ausencia de `SY.orchestrator` en el repo y ajustar `/nodes` y `/routers` si el binario no existe.
+## Cerrado
+- [x] Endpoints REST de hives implementados:
+  - [x] `POST /hives`
+  - [x] `GET /hives`
+  - [x] `GET /hives/{id}`
+  - [x] `DELETE /hives/{id}`
+- [x] `GET /hive/status`.
+- [x] `GET/PUT /config/storage` con `CONFIG_CHANGED` (`subsystem=storage`).
+- [x] API de modulos: `/modules`, `/modules/{name}`, `/modules/{name}/{version}`.
+- [x] Correlacion request/response por `trace_id` para admin y OPA.
+- [x] OPA target broadcast/unicast alineado y timeout de OPA en 30s.
 
-## Desalineaciones con la spec
-- [x] Mover `opa-version.txt` a `/var/lib/fluxbee/opa-version.txt` (hoy usa `/var/lib/fluxbee/state/opa-version.txt`).
-- [x] Alinear paths HTTP con spec (`/hives/{id}/...` en lugar de query params).
-- [x] Correlacionar request/response por `trace_id` (hoy se hace por `action`).
-- [x] OPA target: tratar `"broadcast"` como broadcast real y unicast a isla solo si `target` es un ID válido.
-- [x] `send_opa_query` debería usar unicast cuando hay `target` específico.
-- [x] Ajustar timeout de OPA (spec indica 30s en ejemplos; hoy 10s).
+## Pendiente critico (impacta pruebas)
+- [ ] Corregir routing multi-hive de acciones de nodos/routers:
+  - Hoy `/hives/{hive}/nodes|routers` envia destino `SY.orchestrator@{hive}`.
+  - En el modelo actual solo existe orchestrator en motherbee.
+  - Debe enviar a orchestrator local y pasar `target` en payload.
+- [ ] Corregir contrato de payload para `kill_node`:
+  - Hoy HTTP envia `{"name": ...}`.
+  - Orchestrator espera `node_name` o `unit`.
+- [ ] Corregir contrato de payload para `kill_router`:
+  - Hoy HTTP envia `{"name": ...}`.
+  - Orchestrator espera `service` (default `rt-gateway`).
 
-## Validaciones / consistencia
-- [ ] Validar `hive_id` y `address` en `add_hive` con códigos de error de spec.
-- [ ] Asegurar que `SY.admin` emite `CONFIG_CHANGED` con `version` monotónica (especialmente storage/opa).
-- [ ] Confirmar que todas las respuestas HTTP tengan formato común (status + payload/errores).
+## Pendiente alto (consistencia API)
+- [ ] Definir y aplicar version monotona para `CONFIG_CHANGED` en routes/vpns/storage.
+- [ ] Unificar formato de respuesta HTTP y codigos (hoy muchos errores salen como 500 generico).
+- [ ] Revisar coexistencia de rutas legacy (`/nodes?hive=...`) vs rutas nuevas (`/hives/{id}/nodes`) y dejar una estrategia canonica.
+
+## Pendiente medio
+- [ ] Revalidar `add_hive` desde API con matriz de errores esperados de spec (`HIVE_EXISTS`, `INVALID_ADDRESS`, `SSH_*`, `WAN_TIMEOUT`).
+- [ ] Agregar pruebas de integracion end-to-end para:
+  - [ ] `/hives/{id}/nodes` (run/kill)
+  - [ ] `/hives/{id}/routers` (run/kill)
+  - [ ] `/config/storage` (broadcast + confirmacion)
 
 ## Seguimiento
-- [ ] Registrar en el plan global qué endpoints van a `SY.config.routes` vs `SY.orchestrator` vs `SY.opa.rules`.
+- [ ] Registrar mapeo final de endpoints por ownership:
+  - `SY.config.routes`
+  - `SY.orchestrator`
+  - `SY.opa.rules`

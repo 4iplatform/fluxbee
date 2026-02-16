@@ -1,7 +1,9 @@
 use std::io;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 
 pub const SUBJECT_STORAGE_TURNS: &str = "storage.turns";
 pub const SUBJECT_STORAGE_EVENTS: &str = "storage.events";
@@ -36,6 +38,48 @@ pub async fn publish(endpoint: &str, subject: &str, payload: &[u8]) -> Result<()
     stream.write_all(payload).await?;
     stream.write_all(b"\r\n").await?;
     stream.flush().await?;
+    Ok(())
+}
+
+pub async fn check_endpoint(endpoint: &str, timeout_duration: Duration) -> Result<(), io::Error> {
+    let addr = endpoint_to_addr(endpoint)?;
+    let mut stream = timeout(timeout_duration, TcpStream::connect(addr))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("nats connect timeout to {endpoint}"),
+            )
+        })??;
+
+    stream.write_all(CONNECT_LINE.as_bytes()).await?;
+    stream.write_all(b"PING\r\n").await?;
+    stream.flush().await?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let n = timeout(timeout_duration, reader.read_line(&mut line))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("nats handshake timeout from {endpoint}"),
+            )
+        })??;
+    if n == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "nats handshake closed",
+        ));
+    }
+
+    let line = line.trim_end_matches(['\r', '\n']);
+    if line.starts_with("-ERR") {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("nats handshake error: {line}"),
+        ));
+    }
     Ok(())
 }
 
