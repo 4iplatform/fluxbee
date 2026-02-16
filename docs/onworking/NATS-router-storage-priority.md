@@ -84,3 +84,22 @@ Criterio de salida:
 - El broker embebido actual es minimo y no cubre semantica JetStream.
 - Sin ack/durable consumer todavia puede haber perdida de mensajes ante reinicios.
 - Hay riesgo de drift entre lo documentado en spec y lo implementado en runtime si no se cierran pruebas E2E de subjects.
+
+## Smoke E2E (storage.turns)
+
+Para validar rapidamente el camino `NATS -> SY.storage -> PostgreSQL`:
+
+```bash
+sudo bash scripts/storage_smoke.sh
+```
+
+Opciones utiles:
+
+```bash
+sudo HIVE_CONFIG=/etc/fluxbee/hive.yaml SMOKE_TIMEOUT_SECS=20 bash scripts/storage_smoke.sh
+sudo DB_URL='postgresql://fluxbee:magicAI@127.0.0.1:5432/fluxbee' NATS_URL='nats://127.0.0.1:4222' bash scripts/storage_smoke.sh
+```
+
+Salida esperada:
+- `OK: insert observed in turns ...`
+- select final mostrando la fila insertada en `turns`.
