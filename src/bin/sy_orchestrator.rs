@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 use tokio::time;
@@ -21,6 +21,8 @@ type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 
 const BOOTSTRAP_SSH_USER: &str = "administrator";
 const BOOTSTRAP_SSH_PASS: &str = "magicAI";
+const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
+const RUNTIME_MANIFEST_FILE: &str = "runtime-manifest.json";
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -59,6 +61,24 @@ struct StorageSection {
     path: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct HiveInfoFile {
+    #[serde(default)]
+    address: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RuntimeManifest {
+    #[serde(default)]
+    version: u64,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    runtimes: serde_json::Value,
+    #[serde(default)]
+    hash: Option<String>,
+}
+
 struct OrchestratorState {
     hive_id: String,
     started_at: Instant,
@@ -68,6 +88,8 @@ struct OrchestratorState {
     storage_path: Mutex<String>,
     wan_listen: Option<String>,
     tracked_nodes: Mutex<HashSet<String>>,
+    runtime_manifest: Mutex<Option<RuntimeManifest>>,
+    last_runtime_verify: Mutex<Instant>,
 }
 
 const CRITICAL_SERVICES: [&str; 5] = [
@@ -107,6 +129,7 @@ async fn main() -> Result<(), OrchestratorError> {
         .unwrap_or_else(|| "RT.gateway".to_string());
     let wan_listen = hive.wan.as_ref().and_then(|wan| wan.listen.clone());
     let storage_path = load_storage_path(&config_dir);
+    let runtime_manifest = load_runtime_manifest();
     let state = OrchestratorState {
         hive_id: hive.hive_id.clone(),
         started_at: Instant::now(),
@@ -116,6 +139,8 @@ async fn main() -> Result<(), OrchestratorError> {
         storage_path: Mutex::new(storage_path),
         wan_listen,
         tracked_nodes: Mutex::new(HashSet::new()),
+        runtime_manifest: Mutex::new(runtime_manifest),
+        last_runtime_verify: Mutex::new(Instant::now()),
     };
     ensure_dirs(&config_dir, &state_dir, &run_dir)?;
     write_pid(&run_dir)?;
@@ -167,11 +192,18 @@ async fn main() -> Result<(), OrchestratorError> {
                         continue;
                     }
                 };
-                if msg.meta.msg_type != "admin" {
-                    continue;
-                }
-                if let Err(err) = handle_admin(&sender, &msg, &state).await {
-                    tracing::warn!("admin action error: {err}");
+                match msg.meta.msg_type.as_str() {
+                    "admin" => {
+                        if let Err(err) = handle_admin(&sender, &msg, &state).await {
+                            tracing::warn!("admin action error: {err}");
+                        }
+                    }
+                    SYSTEM_KIND => {
+                        if let Err(err) = handle_system_message(&sender, &msg, &state).await {
+                            tracing::warn!("system message error: {err}");
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -237,7 +269,7 @@ async fn wait_for_sy_nodes(
     state: &OrchestratorState,
     timeout: Duration,
 ) -> Result<(), OrchestratorError> {
-    let mut required = vec!["SY.config.routes", "SY.opa.rules", "SY.admin"];
+    let mut required = vec!["SY.config.routes", "SY.opa.rules", "SY.admin", "SY.storage"];
     if identity_available() {
         required.push("SY.identity");
     }
@@ -280,7 +312,10 @@ async fn watchdog_tick(state: &OrchestratorState) {
         }
     }
     if identity_available() && !systemd_is_active("sy-identity") {
-        tracing::warn!(service = "sy-identity", "service not active; attempting restart");
+        tracing::warn!(
+            service = "sy-identity",
+            "service not active; attempting restart"
+        );
         if let Err(err) = systemd_start("sy-identity") {
             tracing::warn!(
                 service = "sy-identity",
@@ -306,6 +341,12 @@ async fn watchdog_tick(state: &OrchestratorState) {
             tracing::warn!(node = missing.as_str(), "node disconnected");
         }
         *tracked = current;
+    }
+
+    if should_verify_runtimes(state).await {
+        if let Err(err) = runtime_verify_and_sync(state).await {
+            tracing::warn!(error = %err, "runtime verify/sync failed");
+        }
     }
 }
 
@@ -446,30 +487,10 @@ async fn handle_admin(
                 "message": err.to_string(),
             }),
         },
-        "run_node" => {
-            serde_json::json!({
-                "status": "ok",
-                "message": "run_node stub",
-            })
-        }
-        "kill_node" => {
-            serde_json::json!({
-                "status": "ok",
-                "message": "kill_node stub",
-            })
-        }
-        "run_router" => {
-            serde_json::json!({
-                "status": "ok",
-                "message": "run_router stub",
-            })
-        }
-        "kill_router" => {
-            serde_json::json!({
-                "status": "ok",
-                "message": "kill_router stub",
-            })
-        }
+        "run_node" => run_node_flow(state, &msg.payload),
+        "kill_node" => kill_node_flow(state, &msg.payload),
+        "run_router" => run_router_flow(state, &msg.payload),
+        "kill_router" => kill_router_flow(state, &msg.payload),
         "list_hives" => {
             serde_json::json!({
                 "status": "ok",
@@ -580,6 +601,65 @@ async fn handle_admin(
     Ok(())
 }
 
+async fn handle_system_message(
+    sender: &NodeSender,
+    msg: &Message,
+    state: &OrchestratorState,
+) -> Result<(), OrchestratorError> {
+    match msg.meta.msg.as_deref() {
+        Some("RUNTIME_UPDATE") => {
+            let manifest = parse_runtime_manifest(&msg.payload)?;
+            persist_runtime_manifest(&manifest)?;
+            {
+                let mut guard = state.runtime_manifest.lock().await;
+                *guard = Some(manifest.clone());
+            }
+            tracing::info!(version = manifest.version, "runtime manifest updated");
+            runtime_sync_workers(state, &manifest).await?;
+        }
+        Some("SPAWN_NODE") => {
+            let result = run_node_flow(state, &msg.payload);
+            tracing::info!(result = %result, "SPAWN_NODE processed");
+            let _ = send_system_action_response(sender, msg, "SPAWN_NODE_RESPONSE", result).await;
+        }
+        Some("KILL_NODE") => {
+            let result = kill_node_flow(state, &msg.payload);
+            tracing::info!(result = %result, "KILL_NODE processed");
+            let _ = send_system_action_response(sender, msg, "KILL_NODE_RESPONSE", result).await;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn send_system_action_response(
+    sender: &NodeSender,
+    request: &Message,
+    msg_name: &str,
+    payload: serde_json::Value,
+) -> Result<(), OrchestratorError> {
+    let reply = Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            dst: Destination::Unicast(request.routing.src.clone()),
+            ttl: 16,
+            trace_id: request.routing.trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(msg_name.to_string()),
+            scope: None,
+            target: None,
+            action: None,
+            priority: None,
+            context: None,
+        },
+        payload,
+    };
+    sender.send(reply).await?;
+    Ok(())
+}
+
 async fn connect_with_retry(
     config: &NodeConfig,
     delay: Duration,
@@ -615,6 +695,8 @@ fn ensure_dirs(
     fs::create_dir_all(opa_root.join("staged"))?;
     fs::create_dir_all(opa_root.join("backup"))?;
     fs::create_dir_all(storage_root.join("nats"))?;
+    fs::create_dir_all(runtimes_root())?;
+    fs::create_dir_all(orchestrator_runtime_dir())?;
     fs::create_dir_all(run_dir)?;
     Ok(())
 }
@@ -779,6 +861,623 @@ fn read_hive_info(root: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
     Ok(json)
 }
 
+fn parse_runtime_manifest(
+    payload: &serde_json::Value,
+) -> Result<RuntimeManifest, OrchestratorError> {
+    if !payload.is_object() {
+        return Err("runtime manifest payload must be an object".into());
+    }
+    let manifest: RuntimeManifest = serde_json::from_value(payload.clone())?;
+    if manifest.version == 0 {
+        return Err("runtime manifest missing version".into());
+    }
+    Ok(manifest)
+}
+
+fn runtimes_root() -> PathBuf {
+    json_router::paths::storage_root_dir().join("runtimes")
+}
+
+fn orchestrator_runtime_dir() -> PathBuf {
+    json_router::paths::storage_root_dir().join("orchestrator")
+}
+
+fn orchestrator_runtime_manifest_path() -> PathBuf {
+    orchestrator_runtime_dir().join(RUNTIME_MANIFEST_FILE)
+}
+
+fn load_runtime_manifest() -> Option<RuntimeManifest> {
+    let primary = orchestrator_runtime_manifest_path();
+    let fallback = runtimes_root().join("manifest.json");
+    for path in [primary, fallback] {
+        let data = match fs::read_to_string(&path) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+        if let Ok(manifest) = serde_json::from_str::<RuntimeManifest>(&data) {
+            return Some(manifest);
+        }
+    }
+    None
+}
+
+fn persist_runtime_manifest(manifest: &RuntimeManifest) -> Result<(), OrchestratorError> {
+    fs::create_dir_all(orchestrator_runtime_dir())?;
+    fs::create_dir_all(runtimes_root())?;
+    let data = serde_json::to_string_pretty(manifest)?;
+    fs::write(orchestrator_runtime_manifest_path(), &data)?;
+    fs::write(runtimes_root().join("manifest.json"), data)?;
+    Ok(())
+}
+
+async fn should_verify_runtimes(state: &OrchestratorState) -> bool {
+    let mut guard = state.last_runtime_verify.lock().await;
+    if guard.elapsed() < Duration::from_secs(RUNTIME_VERIFY_INTERVAL_SECS) {
+        return false;
+    }
+    *guard = Instant::now();
+    true
+}
+
+async fn runtime_verify_and_sync(state: &OrchestratorState) -> Result<(), OrchestratorError> {
+    let manifest = {
+        let guard = state.runtime_manifest.lock().await;
+        guard.clone()
+    }
+    .or_else(load_runtime_manifest);
+
+    let Some(manifest) = manifest else {
+        return Ok(());
+    };
+
+    {
+        let mut guard = state.runtime_manifest.lock().await;
+        *guard = Some(manifest.clone());
+    }
+
+    runtime_sync_workers(state, &manifest).await
+}
+
+async fn runtime_sync_workers(
+    _state: &OrchestratorState,
+    manifest: &RuntimeManifest,
+) -> Result<(), OrchestratorError> {
+    if manifest.version == 0 {
+        return Ok(());
+    }
+    let local_hash = local_runtime_manifest_hash()?;
+    let workers = list_worker_access();
+    for (hive_id, address, key_path) in workers {
+        let remote_hash = remote_runtime_manifest_hash(&address, &key_path)
+            .ok()
+            .flatten();
+        if local_hash.is_some() && remote_hash == local_hash {
+            continue;
+        }
+        if let Err(err) = sync_runtime_to_worker(&hive_id, &address, &key_path) {
+            tracing::warn!(hive = %hive_id, error = %err, "runtime sync failed");
+        }
+    }
+    Ok(())
+}
+
+fn list_worker_access() -> Vec<(String, String, PathBuf)> {
+    let mut out = Vec::new();
+    let root = hives_root();
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(_) => return out,
+    };
+
+    for entry in entries.flatten() {
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        let hive_id = entry.file_name().to_string_lossy().to_string();
+        let hive_dir = root.join(&hive_id);
+        let key_path = hive_dir.join("ssh.key");
+        if !key_path.exists() {
+            continue;
+        }
+        let info_path = hive_dir.join("info.yaml");
+        let data = match fs::read_to_string(&info_path) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+        let info: HiveInfoFile = match serde_yaml::from_str(&data) {
+            Ok(info) => info,
+            Err(_) => continue,
+        };
+        let Some(address) = info.address else {
+            continue;
+        };
+        if address.trim().is_empty() {
+            continue;
+        }
+        out.push((hive_id, address, key_path));
+    }
+
+    out
+}
+
+fn local_runtime_manifest_hash() -> Result<Option<String>, OrchestratorError> {
+    let manifest_path = runtimes_root().join("manifest.json");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let mut cmd = Command::new("sha256sum");
+    cmd.arg(&manifest_path);
+    let out = run_cmd_output(cmd, "sha256sum local manifest")?;
+    let hash = out
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if hash.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(hash))
+}
+
+fn remote_runtime_manifest_hash(
+    address: &str,
+    key_path: &Path,
+) -> Result<Option<String>, OrchestratorError> {
+    let cmd = r#"bash -lc "if [ -f /var/lib/fluxbee/runtimes/manifest.json ]; then sha256sum /var/lib/fluxbee/runtimes/manifest.json | awk '{print $1}'; fi""#;
+    let out = ssh_with_key_output(address, key_path, &sudo_wrap(cmd), BOOTSTRAP_SSH_USER)?;
+    let hash = out.trim().to_string();
+    if hash.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(hash))
+}
+
+fn sync_runtime_to_worker(
+    hive_id: &str,
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    let local_root = runtimes_root();
+    if !local_root.exists() {
+        return Ok(());
+    }
+
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap("mkdir -p /var/lib/fluxbee/runtimes"),
+        BOOTSTRAP_SSH_USER,
+    )?;
+
+    let mut cmd = Command::new("rsync");
+    cmd.arg("-az")
+        .arg("--delete")
+        .arg("-e")
+        .arg(format!(
+            "ssh -i {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10",
+            key_path.display()
+        ))
+        .arg(format!("{}/", local_root.display()))
+        .arg(format!(
+            "{}@{}:/var/lib/fluxbee/runtimes/",
+            BOOTSTRAP_SSH_USER, address
+        ));
+    run_cmd(cmd, &format!("rsync runtime ({hive_id})"))
+}
+
+fn target_hive_from_payload(payload: &serde_json::Value, local_hive: &str) -> String {
+    payload
+        .get("target")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("hive_id").and_then(|v| v.as_str()))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| local_hive.to_string())
+}
+
+fn valid_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+fn sanitize_unit_suffix(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+}
+
+fn resolve_runtime_version(
+    manifest: &RuntimeManifest,
+    runtime: &str,
+    requested_version: &str,
+) -> Result<String, OrchestratorError> {
+    let runtimes = manifest
+        .runtimes
+        .as_object()
+        .ok_or_else(|| "runtime manifest invalid: runtimes must be object".to_string())?;
+    let entry = runtimes
+        .get(runtime)
+        .ok_or_else(|| format!("runtime '{runtime}' not found in manifest"))?;
+
+    let current = entry
+        .get("current")
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim())
+        .unwrap_or("");
+    let available: Vec<&str> = entry
+        .get("available")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    if requested_version.is_empty() || requested_version == "current" {
+        if !current.is_empty() {
+            return Ok(current.to_string());
+        }
+        return Err(format!("runtime '{runtime}' has no current version").into());
+    }
+
+    if available.contains(&requested_version)
+        || (!current.is_empty() && current == requested_version)
+    {
+        return Ok(requested_version.to_string());
+    }
+    Err(format!("version '{requested_version}' not available for runtime '{runtime}'").into())
+}
+
+fn runtime_start_script(runtime: &str, version: &str) -> String {
+    format!("/var/lib/fluxbee/runtimes/{runtime}/{version}/bin/start.sh")
+}
+
+fn hive_has_runtime_script(
+    state: &OrchestratorState,
+    target_hive: &str,
+    script_path: &str,
+) -> Result<bool, OrchestratorError> {
+    if target_hive == state.hive_id {
+        return Ok(Path::new(script_path).exists());
+    }
+    let (address, key_path) = hive_access(target_hive)?;
+    let cmd = format!(
+        "bash -lc \"if [ -x '{}' ]; then echo 1; else echo 0; fi\"",
+        script_path
+    );
+    let out = ssh_with_key_output(&address, &key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
+    Ok(out.trim() == "1")
+}
+
+fn sync_runtime_to_hive(
+    state: &OrchestratorState,
+    target_hive: &str,
+) -> Result<(), OrchestratorError> {
+    if target_hive == state.hive_id {
+        return Ok(());
+    }
+    let (address, key_path) = hive_access(target_hive)?;
+    sync_runtime_to_worker(target_hive, &address, &key_path)
+}
+
+fn run_node_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+    let runtime = payload
+        .get("runtime")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if runtime.is_empty() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "missing runtime",
+        });
+    }
+    if !valid_token(runtime) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "invalid runtime",
+        });
+    }
+
+    let requested_version = payload
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("current")
+        .trim();
+    if !valid_token(requested_version) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "invalid version",
+        });
+    }
+
+    let manifest = match load_runtime_manifest() {
+        Some(manifest) => manifest,
+        None => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "RUNTIME_MANIFEST_MISSING",
+                "message": "runtime manifest not found",
+            });
+        }
+    };
+    let version = match resolve_runtime_version(&manifest, runtime, requested_version) {
+        Ok(version) => version,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "RUNTIME_NOT_AVAILABLE",
+                "message": err.to_string(),
+            });
+        }
+    };
+
+    let target_hive = target_hive_from_payload(payload, &state.hive_id);
+    let unit = payload
+        .get("unit")
+        .and_then(|v| v.as_str())
+        .map(|v| sanitize_unit_suffix(v.trim()))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            let base = payload
+                .get("config")
+                .and_then(|v| v.get("instance_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(runtime);
+            format!(
+                "fluxbee-node-{}-{}",
+                sanitize_unit_suffix(base),
+                now_epoch_ms()
+            )
+        });
+
+    let start_script = runtime_start_script(runtime, &version);
+    match hive_has_runtime_script(state, &target_hive, &start_script) {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Err(err) = sync_runtime_to_hive(state, &target_hive) {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "RUNTIME_SYNC_FAILED",
+                    "message": err.to_string(),
+                    "target": target_hive,
+                });
+            }
+            match hive_has_runtime_script(state, &target_hive, &start_script) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "RUNTIME_NOT_PRESENT",
+                        "message": format!("runtime script missing after sync: {start_script}"),
+                        "target": target_hive,
+                    });
+                }
+                Err(err) => {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "RUNTIME_CHECK_FAILED",
+                        "message": err.to_string(),
+                        "target": target_hive,
+                    });
+                }
+            }
+        }
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "RUNTIME_CHECK_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+            });
+        }
+    }
+
+    let cmd = format!(
+        "systemd-run --unit {} --collect --property Restart=always --property RestartSec=5 {}",
+        unit, start_script
+    );
+
+    match execute_on_hive(state, &target_hive, &cmd, "run_node") {
+        Ok(()) => serde_json::json!({
+            "status": "ok",
+            "runtime": runtime,
+            "version": version,
+            "requested_version": requested_version,
+            "target": target_hive,
+            "unit": unit,
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "SPAWN_FAILED",
+            "message": err.to_string(),
+            "target": target_hive,
+            "unit": unit,
+        }),
+    }
+}
+
+fn kill_node_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+    let node_name = payload
+        .get("node_name")
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default();
+
+    let mut target_hive = target_hive_from_payload(payload, &state.hive_id);
+    if target_hive == state.hive_id {
+        if let Some((_, hive)) = node_name.split_once('@') {
+            if !hive.trim().is_empty() {
+                target_hive = hive.trim().to_string();
+            }
+        }
+    }
+
+    let unit = payload
+        .get("unit")
+        .and_then(|v| v.as_str())
+        .map(|v| sanitize_unit_suffix(v.trim()))
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            if node_name.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "fluxbee-node-{}",
+                    sanitize_unit_suffix(node_name.split('@').next().unwrap_or(&node_name))
+                ))
+            }
+        });
+
+    let Some(unit) = unit else {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "missing unit or node_name",
+        });
+    };
+
+    let signal = payload
+        .get("signal")
+        .and_then(|v| v.as_str())
+        .unwrap_or("SIGTERM")
+        .to_ascii_uppercase();
+
+    let cmd = if signal == "SIGKILL" {
+        format!(
+            "systemctl kill -s KILL {unit} || true; systemctl stop {unit} || true; systemctl reset-failed {unit} || true"
+        )
+    } else {
+        format!("systemctl stop {unit} || true; systemctl reset-failed {unit} || true")
+    };
+
+    match execute_on_hive(state, &target_hive, &cmd, "kill_node") {
+        Ok(()) => serde_json::json!({
+            "status": "ok",
+            "target": target_hive,
+            "unit": unit,
+            "signal": signal,
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "KILL_FAILED",
+            "message": err.to_string(),
+            "target": target_hive,
+            "unit": unit,
+        }),
+    }
+}
+
+fn run_router_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+    let target_hive = target_hive_from_payload(payload, &state.hive_id);
+    let service = payload
+        .get("service")
+        .and_then(|v| v.as_str())
+        .unwrap_or("rt-gateway")
+        .trim();
+
+    if !valid_token(service) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "invalid service",
+        });
+    }
+
+    let cmd = format!("systemctl start {service}");
+    match execute_on_hive(state, &target_hive, &cmd, "run_router") {
+        Ok(()) => serde_json::json!({
+            "status": "ok",
+            "target": target_hive,
+            "service": service,
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "SERVICE_FAILED",
+            "message": err.to_string(),
+            "target": target_hive,
+            "service": service,
+        }),
+    }
+}
+
+fn kill_router_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+    let target_hive = target_hive_from_payload(payload, &state.hive_id);
+    let service = payload
+        .get("service")
+        .and_then(|v| v.as_str())
+        .unwrap_or("rt-gateway")
+        .trim();
+
+    if !valid_token(service) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "invalid service",
+        });
+    }
+
+    let cmd = format!("systemctl stop {service}");
+    match execute_on_hive(state, &target_hive, &cmd, "kill_router") {
+        Ok(()) => serde_json::json!({
+            "status": "ok",
+            "target": target_hive,
+            "service": service,
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "SERVICE_FAILED",
+            "message": err.to_string(),
+            "target": target_hive,
+            "service": service,
+        }),
+    }
+}
+
+fn execute_on_hive(
+    state: &OrchestratorState,
+    target_hive: &str,
+    command: &str,
+    label: &str,
+) -> Result<(), OrchestratorError> {
+    if target_hive == state.hive_id {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-lc").arg(command);
+        return run_cmd(cmd, label);
+    }
+
+    let (address, key_path) = hive_access(target_hive)?;
+    ssh_with_key(&address, &key_path, &sudo_wrap(command), BOOTSTRAP_SSH_USER)
+}
+
+fn hive_access(hive_id: &str) -> Result<(String, PathBuf), OrchestratorError> {
+    let root = hives_root();
+    let hive_dir = root.join(hive_id);
+    let key_path = hive_dir.join("ssh.key");
+    if !key_path.exists() {
+        return Err(format!("missing ssh key for hive '{hive_id}'").into());
+    }
+
+    let info_path = hive_dir.join("info.yaml");
+    let data = fs::read_to_string(&info_path)?;
+    let info: HiveInfoFile = serde_yaml::from_str(&data)?;
+    let address = info
+        .address
+        .ok_or_else(|| format!("missing address for hive '{hive_id}'"))?;
+    Ok((address, key_path))
+}
+
 fn add_hive_flow(
     state: &OrchestratorState,
     hive_id: &str,
@@ -815,11 +1514,7 @@ fn add_hive_flow(
     }
 
     if let Err(err) = ssh_with_pass(address, "true", BOOTSTRAP_SSH_USER) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SSH_AUTH_FAILED",
-            "message": err.to_string(),
-        });
+        return ssh_bootstrap_error_payload(&err.to_string());
     }
 
     let hive_dir = hives_root().join(hive_id);
@@ -830,6 +1525,7 @@ fn add_hive_flow(
             "message": err.to_string(),
         });
     }
+
     let key_path = hive_dir.join("ssh.key");
     let key_pub = hive_dir.join("ssh.key.pub");
     let mut keygen = Command::new("ssh-keygen");
@@ -847,6 +1543,17 @@ fn add_hive_flow(
             "message": err.to_string(),
         });
     }
+
+    let mut chmod = Command::new("chmod");
+    chmod.arg("600").arg(&key_path);
+    if let Err(err) = run_cmd(chmod, "chmod") {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_KEY_FAILED",
+            "message": err.to_string(),
+        });
+    }
+
     let pub_key = match fs::read_to_string(&key_pub) {
         Ok(data) => data.trim().to_string(),
         Err(err) => {
@@ -863,15 +1570,12 @@ fn add_hive_flow(
         "mkdir -p ~/.ssh && chmod 700 ~/.ssh",
         BOOTSTRAP_SSH_USER,
     ) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SSH_AUTH_FAILED",
-            "message": err.to_string(),
-        });
+        return ssh_bootstrap_error_payload(&err.to_string());
     }
+
     let escaped = pub_key.replace('\'', "'\"'\"'");
     let append_cmd = format!(
-        "bash -lc \"printf '%s\\\\n' '{}' >> ~/.ssh/authorized_keys\"",
+        "bash -lc \"printf '%s\\n' '{}' >> ~/.ssh/authorized_keys\"",
         escaped
     );
     if let Err(err) = ssh_with_pass(address, &append_cmd, BOOTSTRAP_SSH_USER) {
@@ -881,7 +1585,17 @@ fn add_hive_flow(
             "message": err.to_string(),
         });
     }
-    let _ = ssh_with_pass(address, "chmod 600 ~/.ssh/authorized_keys", BOOTSTRAP_SSH_USER);
+    if let Err(err) = ssh_with_pass(
+        address,
+        "chmod 600 ~/.ssh/authorized_keys",
+        BOOTSTRAP_SSH_USER,
+    ) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_KEY_FAILED",
+            "message": err.to_string(),
+        });
+    }
 
     if harden_ssh {
         if let Err(err) = disable_remote_password_auth(address) {
@@ -907,6 +1621,7 @@ fn add_hive_flow(
             });
         }
     }
+
     let mut binaries = vec![
         "/usr/bin/rt-gateway",
         "/usr/bin/sy-config-routes",
@@ -922,28 +1637,39 @@ fn add_hive_flow(
             "message": err.to_string(),
         });
     }
-    let _ = ssh_with_key(
+
+    if let Err(err) = ssh_with_key(
         address,
         &key_path,
         &sudo_wrap("mv /tmp/sy-* /usr/bin/ && mv /tmp/rt-* /usr/bin/ && chmod +x /usr/bin/sy-* /usr/bin/rt-*"),
         BOOTSTRAP_SSH_USER,
-    );
+    ) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "COPY_FAILED",
+            "message": err.to_string(),
+        });
+    }
 
-    let _ = ssh_with_key(
+    if let Err(err) = ssh_with_key(
         address,
         &key_path,
-        &sudo_wrap("mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/run/fluxbee/routers"),
+        &sudo_wrap("mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/runtimes /var/run/fluxbee/routers"),
         BOOTSTRAP_SSH_USER,
-    );
+    ) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "CONFIG_FAILED",
+            "message": err.to_string(),
+        });
+    }
 
     let wan_listen = state.wan_listen.clone().unwrap_or_default();
     let hive_yaml = format!(
         "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\n",
         hive_id, wan_listen
     );
-    if let Err(err) =
-        write_remote_file(address, &key_path, "/etc/fluxbee/hive.yaml", &hive_yaml)
-    {
+    if let Err(err) = write_remote_file(address, &key_path, "/etc/fluxbee/hive.yaml", &hive_yaml) {
         return serde_json::json!({
             "status": "error",
             "error_code": "CONFIG_FAILED",
@@ -952,12 +1678,18 @@ fn add_hive_flow(
     }
 
     let config_routes_yaml = "version: 1\nroutes: []\nvpns: []\n";
-    let _ = write_remote_file(
+    if let Err(err) = write_remote_file(
         address,
         &key_path,
         "/etc/fluxbee/sy-config-routes.yaml",
         config_routes_yaml,
-    );
+    ) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "CONFIG_FAILED",
+            "message": err.to_string(),
+        });
+    }
 
     let mut worker_units = vec![
         ("rt-gateway", "/usr/bin/rt-gateway"),
@@ -967,26 +1699,47 @@ fn add_hive_flow(
     if identity_available() {
         worker_units.push(("sy-identity", "/usr/bin/sy-identity"));
     }
+
     for (name, exec_path) in &worker_units {
         let unit = format!(
             "[Unit]\nDescription=Fluxbee {name}\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
         );
         let unit_path = format!("/etc/systemd/system/{name}.service");
-        let _ = write_remote_file(address, &key_path, &unit_path, &unit);
+        if let Err(err) = write_remote_file(address, &key_path, &unit_path, &unit) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SERVICE_FAILED",
+                "message": format!("{name}: {err}"),
+            });
+        }
     }
-    let _ = ssh_with_key(
+
+    if let Err(err) = ssh_with_key(
         address,
         &key_path,
         &sudo_wrap("systemctl daemon-reload"),
         BOOTSTRAP_SSH_USER,
-    );
+    ) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SERVICE_FAILED",
+            "message": err.to_string(),
+        });
+    }
+
     for (name, _) in &worker_units {
-        let _ = ssh_with_key(
+        if let Err(err) = ssh_with_key(
             address,
             &key_path,
             &sudo_wrap(&format!("systemctl enable {name}")),
             BOOTSTRAP_SSH_USER,
-        );
+        ) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SERVICE_FAILED",
+                "message": format!("enable {name}: {err}"),
+            });
+        }
         if let Err(err) = ssh_with_key(
             address,
             &key_path,
@@ -996,13 +1749,13 @@ fn add_hive_flow(
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SERVICE_FAILED",
-                "message": format!("{name}: {err}"),
+                "message": format!("start {name}: {err}"),
             });
         }
     }
 
     let mut wan_connected = true;
-    if let Err(_) = wait_for_wan(&state.hive_id, hive_id, Duration::from_secs(60)) {
+    if wait_for_wan(&state.hive_id, hive_id, Duration::from_secs(60)).is_err() {
         wan_connected = false;
     }
 
@@ -1014,7 +1767,13 @@ fn add_hive_flow(
         "status": if wan_connected { "connected" } else { "pending" },
     }))
     .unwrap_or_default();
-    let _ = fs::write(info_path, info);
+    if let Err(err) = fs::write(info_path, info) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "IO_ERROR",
+            "message": err.to_string(),
+        });
+    }
 
     if !wan_connected {
         return serde_json::json!({
@@ -1033,6 +1792,22 @@ fn add_hive_flow(
         "address": address,
         "harden_ssh": harden_ssh,
         "wan_connected": true,
+    })
+}
+
+fn ssh_bootstrap_error_payload(error: &str) -> serde_json::Value {
+    let lower = error.to_ascii_lowercase();
+    let code = if lower.contains("connection timed out") || lower.contains("operation timed out") {
+        "SSH_TIMEOUT"
+    } else if lower.contains("connection refused") {
+        "SSH_CONNECTION_REFUSED"
+    } else {
+        "SSH_AUTH_FAILED"
+    };
+    serde_json::json!({
+        "status": "error",
+        "error_code": code,
+        "message": error,
     })
 }
 
@@ -1080,8 +1855,7 @@ fn resolve_add_hive_harden_ssh(payload: &serde_json::Value) -> bool {
     if let Some(value) = payload.get("harden_ssh").and_then(parse_bool_value) {
         return value;
     }
-    env_flag_enabled("FLUXBEE_ADD_HIVE_HARDEN_SSH")
-        || env_flag_enabled("JSR_ADD_HIVE_HARDEN_SSH")
+    env_flag_enabled("FLUXBEE_ADD_HIVE_HARDEN_SSH") || env_flag_enabled("JSR_ADD_HIVE_HARDEN_SSH")
 }
 
 fn parse_bool_value(value: &serde_json::Value) -> Option<bool> {
@@ -1120,6 +1894,15 @@ fn run_cmd(mut cmd: Command, label: &str) -> Result<(), OrchestratorError> {
     let output = cmd.output()?;
     if output.status.success() {
         return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!("{label} failed: {stderr}").into())
+}
+
+fn run_cmd_output(mut cmd: Command, label: &str) -> Result<String, OrchestratorError> {
+    let output = cmd.output()?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     Err(format!("{label} failed: {stderr}").into())
@@ -1220,6 +2003,26 @@ fn ssh_with_key(
         .arg(format!("{user}@{address}"))
         .arg(command);
     run_cmd(cmd, "ssh")
+}
+
+fn ssh_with_key_output(
+    address: &str,
+    key_path: &Path,
+    command: &str,
+    user: &str,
+) -> Result<String, OrchestratorError> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-i")
+        .arg(key_path)
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(format!("{user}@{address}"))
+        .arg(command);
+    run_cmd_output(cmd, "ssh")
 }
 
 fn scp_with_key(
