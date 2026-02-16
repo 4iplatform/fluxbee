@@ -261,31 +261,57 @@ async fn wait_for_router_ready(
     socket_dir: &Path,
     timeout: Duration,
 ) -> Result<(), OrchestratorError> {
+    const ROUTER_SHM_MAX_STALE_MS: u64 = 30_000;
+
     let start = Instant::now();
+    let socket_age_limit = timeout + Duration::from_secs(10);
     loop {
-        let socket_ready = socket_dir
-            .read_dir()
-            .ok()
-            .and_then(|mut entries| {
-                entries.find(|entry| {
-                    entry
-                        .as_ref()
-                        .ok()
-                        .and_then(|entry| entry.path().extension().map(|ext| ext == "sock"))
-                        .unwrap_or(false)
-                })
-            })
-            .is_some();
-        let shm_ready = load_router_snapshot(state).is_ok();
-        if socket_ready && shm_ready {
-            tracing::info!("router socket + shm ready");
+        let rt_gateway_active = systemd_is_active("rt-gateway");
+
+        let mut socket_ready = false;
+        let mut shm_ready = false;
+        let mut socket_path = String::from("unknown");
+        let mut heartbeat_age_ms = u64::MAX;
+
+        if let Ok(snapshot) = load_router_snapshot(state) {
+            let expected_socket =
+                socket_dir.join(format!("{}.sock", snapshot.header.router_uuid.simple()));
+            socket_path = expected_socket.display().to_string();
+            socket_ready =
+                expected_socket.exists() && socket_file_recent(&expected_socket, socket_age_limit);
+
+            heartbeat_age_ms = now_epoch_ms().saturating_sub(snapshot.header.heartbeat);
+            shm_ready = heartbeat_age_ms <= ROUTER_SHM_MAX_STALE_MS;
+        }
+
+        if rt_gateway_active && socket_ready && shm_ready {
+            tracing::info!(
+                socket = %socket_path,
+                heartbeat_age_ms,
+                "router socket + shm ready"
+            );
             return Ok(());
         }
+
         if start.elapsed() >= timeout {
-            return Err("router bootstrap timeout".into());
+            return Err(format!(
+                "router bootstrap timeout rt_gateway_active={} socket_ready={} shm_ready={} socket={} heartbeat_age_ms={}",
+                rt_gateway_active, socket_ready, shm_ready, socket_path, heartbeat_age_ms
+            )
+            .into());
         }
+
         time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+fn socket_file_recent(path: &Path, max_age: Duration) -> bool {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|age| age <= max_age)
+        .unwrap_or(false)
 }
 
 async fn wait_for_sy_nodes(
