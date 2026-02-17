@@ -1350,7 +1350,8 @@ async fn handle_admin_query(
     action: &str,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
-    let request = build_admin_request(ctx, action, serde_json::json!({}), hive);
+    let payload = normalize_admin_payload(action, serde_json::json!({}), hive.as_deref());
+    let request = build_admin_request(ctx, action, payload, hive);
     let response = send_admin_request(client, request).await;
     Ok(build_admin_http_response(action, response))
 }
@@ -1362,6 +1363,7 @@ async fn handle_admin_command(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
+    let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
     let target_hive = extract_hive_from_target(&request.target);
     let response = send_admin_request(client, request).await;
@@ -1390,7 +1392,7 @@ fn build_admin_request(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> AdminRequest {
-    let hive_id = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    let requested_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
     let base = match action {
         "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn" | "delete_vpn" => {
             "SY.config.routes"
@@ -1400,10 +1402,15 @@ fn build_admin_request(
         | "add_hive" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
-    let target = if hive_id.contains('@') {
-        hive_id
+    let route_hive = if action_routes_via_local_orchestrator(action) {
+        ctx.hive_id.clone()
     } else {
-        format!("{}@{}", base, hive_id)
+        requested_hive.clone()
+    };
+    let target = if route_hive.contains('@') {
+        route_hive
+    } else {
+        format!("{}@{}", base, route_hive)
     };
     let unicast = if target.ends_with(&format!("@{}", ctx.hive_id)) {
         load_node_uuid(&ctx.state_dir.join("nodes"), base).ok()
@@ -1499,6 +1506,57 @@ fn build_admin_http_response(
 
 fn extract_hive_from_target(target: &str) -> Option<String> {
     target.split_once('@').map(|(_, hive)| hive.to_string())
+}
+
+fn action_routes_via_local_orchestrator(action: &str) -> bool {
+    matches!(
+        action,
+        "list_nodes"
+            | "run_node"
+            | "kill_node"
+            | "list_routers"
+            | "run_router"
+            | "kill_router"
+            | "hive_status"
+            | "get_storage"
+            | "list_hives"
+            | "get_hive"
+            | "remove_hive"
+            | "add_hive"
+    )
+}
+
+fn normalize_admin_payload(
+    action: &str,
+    mut payload: serde_json::Value,
+    hive: Option<&str>,
+) -> serde_json::Value {
+    if !action_routes_via_local_orchestrator(action) {
+        return payload;
+    }
+
+    if let Some(hive_id) = hive
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        if payload.get("target").is_none() {
+            payload["target"] = serde_json::Value::String(hive_id.to_string());
+        }
+    }
+
+    if action == "kill_node" && payload.get("node_name").is_none() {
+        if let Some(name) = payload.get("name").and_then(|value| value.as_str()) {
+            payload["node_name"] = serde_json::Value::String(name.to_string());
+        }
+    }
+
+    if (action == "run_router" || action == "kill_router") && payload.get("service").is_none() {
+        if let Some(name) = payload.get("name").and_then(|value| value.as_str()) {
+            payload["service"] = serde_json::Value::String(name.to_string());
+        }
+    }
+
+    payload
 }
 
 async fn broadcast_full_config(

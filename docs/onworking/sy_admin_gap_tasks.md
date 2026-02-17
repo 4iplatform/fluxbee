@@ -15,16 +15,15 @@ Lista de tareas para alinear `SY.admin` con la especificacion actual y con el mo
 - [x] OPA target broadcast/unicast alineado y timeout de OPA en 30s.
 
 ## Pendiente critico (impacta pruebas)
-- [ ] Corregir routing multi-hive de acciones de nodos/routers:
-  - Hoy `/hives/{hive}/nodes|routers` envia destino `SY.orchestrator@{hive}`.
-  - En el modelo actual solo existe orchestrator en motherbee.
-  - Debe enviar a orchestrator local y pasar `target` en payload.
-- [ ] Corregir contrato de payload para `kill_node`:
-  - Hoy HTTP envia `{"name": ...}`.
-  - Orchestrator espera `node_name` o `unit`.
-- [ ] Corregir contrato de payload para `kill_router`:
-  - Hoy HTTP envia `{"name": ...}`.
-  - Orchestrator espera `service` (default `rt-gateway`).
+- [x] Corregir routing multi-hive de acciones de nodos/routers:
+  - `/hives/{hive}/nodes|routers` ahora enruta a orchestrator local (`SY.orchestrator@motherbee`).
+  - Se propaga `target` en payload para que orchestrator ejecute sobre hive remota.
+- [x] Corregir contrato de payload para `kill_node`:
+  - HTTP mantiene `{"name": ...}` por compatibilidad.
+  - `SY.admin` normaliza a `node_name` antes de enviar a orchestrator.
+- [x] Corregir contrato de payload para `kill_router`:
+  - HTTP mantiene `{"name": ...}` por compatibilidad.
+  - `SY.admin` normaliza a `service` antes de enviar a orchestrator.
 
 ## Pendiente alto (consistencia API)
 - [ ] Definir y aplicar version monotona para `CONFIG_CHANGED` en routes/vpns/storage.
