@@ -901,13 +901,16 @@ ssh -i /var/lib/json-router/hives/staging/ssh.key root@192.168.1.50
 | `GET /hives/{id}` | `get_hive` | Info de isla específica |
 | `DELETE /hives/{id}` | `remove_hive` | Elimina registro (no apaga isla) |
 
-### 5.2 Gestión de Nodos (Fase 2 - Futuro)
+### 5.2 Gestión de Nodos/Router por Hive (Canónico)
 
 | Endpoint HTTP | Action | Descripción |
 |---------------|--------|-------------|
-| `GET /nodes` | `list_nodes` | Lista nodos conectados |
-| `POST /nodes` | `run_node` | Levanta nodo |
-| `DELETE /nodes/{name}` | `kill_node` | Mata nodo |
+| `GET /hives/{id}/nodes` | `list_nodes` | Lista nodos de hive |
+| `POST /hives/{id}/nodes` | `run_node` | Levanta nodo en hive |
+| `DELETE /hives/{id}/nodes/{name}` | `kill_node` | Mata nodo en hive |
+| `GET /hives/{id}/routers` | `list_routers` | Lista routers de hive |
+| `POST /hives/{id}/routers` | `run_router` | Levanta router en hive |
+| `DELETE /hives/{id}/routers/{name}` | `kill_router` | Mata router en hive |
 
 ### 5.3 Estado de Isla
 

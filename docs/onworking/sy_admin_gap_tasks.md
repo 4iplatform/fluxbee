@@ -34,10 +34,15 @@ Lista de tareas para alinear `SY.admin` con la especificacion actual y con el mo
 - [x] Unificar formato de respuesta HTTP y codigos:
   - `SY.admin` ahora mapea `error_code -> HTTP status` (400/404/409/422/501/502/503/504).
   - respuestas de admin/OPA incluyen envelope consistente con `status`, `action`, `payload`, `error_code`, `error_detail`.
-- [ ] Revisar coexistencia de rutas legacy (`/nodes?hive=...`) vs rutas nuevas (`/hives/{id}/nodes`) y dejar una estrategia canonica.
+- [x] Eliminar coexistencia de rutas legacy para nodos/routers y dejar estrategia canónica:
+  - removidos handlers legacy `/nodes` y `/routers` en `SY.admin`.
+  - canónico único: `/hives/{id}/nodes` y `/hives/{id}/routers`.
 
 ## Pendiente medio
-- [ ] Revalidar `add_hive` desde API con matriz de errores esperados de spec (`HIVE_EXISTS`, `INVALID_ADDRESS`, `SSH_*`, `WAN_TIMEOUT`).
+- [x] Revalidar contrato `add_hive` desde API con matriz de errores esperados de spec.
+  - mapeo HTTP en `SY.admin` ajustado para `SSH_*`, `INVALID_HIVE_ID`, `MISSING_WAN_LISTEN`, `COPY_FAILED`, `CONFIG_FAILED`.
+  - smoke E2E agregado: `scripts/admin_add_hive_matrix.sh`.
+  - checklist actualizado con cobertura manual de `WAN_TIMEOUT`.
 - [ ] Agregar pruebas de integracion end-to-end para:
   - [ ] `/hives/{id}/nodes` (run/kill)
   - [ ] `/hives/{id}/routers` (run/kill)

@@ -49,6 +49,24 @@ Esperado:
 - `status=ok` + datos en get hive
 - `status=ok` en delete
 
+### 2.1 Matriz de errores add_hive (rápido)
+
+Script automático:
+
+```bash
+bash scripts/admin_add_hive_matrix.sh
+```
+
+Casos cubiertos por script:
+- `INVALID_ADDRESS` -> HTTP `400`
+- `INVALID_HIVE_ID` -> HTTP `400`
+- `HIVE_EXISTS` -> HTTP `409` (si existe al menos una hive)
+- `SSH_*` -> HTTP `502/504`
+
+Caso manual adicional:
+- `WAN_TIMEOUT` -> HTTP `504`
+  - Requiere host remoto que bootstrappee pero no logre conexión WAN dentro de 60s.
+
 ## 3) Router remoto por hive
 
 ```bash
@@ -131,4 +149,13 @@ Si con proxy falla `/control/*` con `not_found`, revisar que el `location /contr
 location /control/ {
   proxy_pass http://127.0.0.1:8080/;
 }
+```
+
+## 9) Sin legacy
+
+Estos endpoints legacy ya no existen y deben devolver `404`:
+
+```bash
+curl -sS "$BASE/nodes"
+curl -sS "$BASE/routers"
 ```

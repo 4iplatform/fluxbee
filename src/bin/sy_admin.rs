@@ -650,54 +650,6 @@ async fn handle_http(
                 handle_admin_command(ctx, client, "delete_vpn", payload, hive).await?;
             respond_json(stream, status, &resp).await?;
         }
-        ("GET", "/nodes") => {
-            let hive = query.get("hive").cloned();
-            let (status, resp) = handle_admin_query(ctx, client, "list_nodes", hive).await?;
-            respond_json(stream, status, &resp).await?;
-        }
-        ("POST", "/nodes") => {
-            let payload = if body.is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_slice(&body)?
-            };
-            let hive = query.get("hive").cloned();
-            let (status, resp) =
-                handle_admin_command(ctx, client, "run_node", payload, hive).await?;
-            respond_json(stream, status, &resp).await?;
-        }
-        ("DELETE", "/nodes") => {
-            let name = query.get("name").cloned().unwrap_or_default();
-            let hive = query.get("hive").cloned();
-            let payload = serde_json::json!({ "name": name });
-            let (status, resp) =
-                handle_admin_command(ctx, client, "kill_node", payload, hive).await?;
-            respond_json(stream, status, &resp).await?;
-        }
-        ("GET", "/routers") => {
-            let hive = query.get("hive").cloned();
-            let (status, resp) = handle_admin_query(ctx, client, "list_routers", hive).await?;
-            respond_json(stream, status, &resp).await?;
-        }
-        ("POST", "/routers") => {
-            let payload = if body.is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_slice(&body)?
-            };
-            let hive = query.get("hive").cloned();
-            let (status, resp) =
-                handle_admin_command(ctx, client, "run_router", payload, hive).await?;
-            respond_json(stream, status, &resp).await?;
-        }
-        ("DELETE", "/routers") => {
-            let name = query.get("name").cloned().unwrap_or_default();
-            let hive = query.get("hive").cloned();
-            let payload = serde_json::json!({ "name": name });
-            let (status, resp) =
-                handle_admin_command(ctx, client, "kill_router", payload, hive).await?;
-            respond_json(stream, status, &resp).await?;
-        }
         ("PUT", "/config/routes") => {
             let update: ConfigUpdate = serde_json::from_slice(&body)?;
             let mut broadcasts = usize::from(update.routes.is_some());
@@ -1298,8 +1250,15 @@ fn http_status_line(status: u16) -> &'static str {
 }
 
 fn error_code_to_http_status(error_code: &str) -> u16 {
-    match error_code.trim().to_ascii_uppercase().as_str() {
-        "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" => 400,
+    let code = error_code.trim().to_ascii_uppercase();
+    if code == "TIMEOUT" || code == "WAN_TIMEOUT" || code == "SSH_TIMEOUT" {
+        return 504;
+    }
+    if code.starts_with("SSH_") {
+        return 502;
+    }
+    match code.as_str() {
+        "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID" => 400,
         "NOT_FOUND" | "RUNTIME_NOT_AVAILABLE" => 404,
         "HIVE_EXISTS" | "MODULE_EXISTS" | "VERSION_MISMATCH" => 409,
         "COMPILE_ERROR" => 422,
@@ -1307,14 +1266,13 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         "SERVICE_FAILED"
         | "SPAWN_FAILED"
         | "KILL_FAILED"
-        | "SSH_FAILED"
-        | "SSH_TIMEOUT"
+        | "COPY_FAILED"
+        | "CONFIG_FAILED"
         | "RUNTIME_ERROR"
         | "RUNTIME_COMMAND_FAILED"
         | "RUNTIME_UNAVAILABLE"
         | "TRANSPORT_ERROR" => 502,
-        "SHM_NOT_FOUND" | "RUNTIME_MANIFEST_MISSING" => 503,
-        "TIMEOUT" | "WAN_TIMEOUT" => 504,
+        "SHM_NOT_FOUND" | "RUNTIME_MANIFEST_MISSING" | "MISSING_WAN_LISTEN" => 503,
         _ => 500,
     }
 }
