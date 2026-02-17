@@ -26,7 +26,11 @@ Lista de tareas para alinear `SY.admin` con la especificacion actual y con el mo
   - `SY.admin` normaliza a `service` antes de enviar a orchestrator.
 
 ## Pendiente alto (consistencia API)
-- [ ] Definir y aplicar version monotona para `CONFIG_CHANGED` en routes/vpns/storage.
+- [x] Definir y aplicar version monotona para `CONFIG_CHANGED` en routes/vpns/storage.
+  - `routes` y `vpns` comparten stream monotono (`routes-vpns`) para evitar conflictos en `SY.config.routes`.
+  - `storage` usa stream monotono separado.
+  - Persistencia local en `state/config_versions/*.txt` (sobre `json_router::paths::state_dir()`).
+  - Si se envia `version` manual <= actual, responde `409 VERSION_MISMATCH`.
 - [x] Unificar formato de respuesta HTTP y codigos:
   - `SY.admin` ahora mapea `error_code -> HTTP status` (400/404/409/422/501/502/503/504).
   - respuestas de admin/OPA incluyen envelope consistente con `status`, `action`, `payload`, `error_code`, `error_detail`.

@@ -237,8 +237,14 @@ async fn main() -> Result<(), AdminError> {
 }
 
 enum BroadcastRequest {
-    Routes(Vec<RouteConfig>),
-    Vpns(Vec<VpnConfig>),
+    Routes {
+        routes: Vec<RouteConfig>,
+        version: u64,
+    },
+    Vpns {
+        vpns: Vec<VpnConfig>,
+        version: u64,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,13 +267,13 @@ async fn run_broadcast_loop(
 ) {
     while let Some(req) = rx.recv().await {
         let failed = match req {
-            BroadcastRequest::Routes(routes) => {
+            BroadcastRequest::Routes { routes, version } => {
                 match broadcast_config_changed(
                     &client,
                     "routes",
                     None,
                     None,
-                    0,
+                    version,
                     serde_json::json!({ "routes": routes }),
                     None,
                 )
@@ -280,13 +286,13 @@ async fn run_broadcast_loop(
                     }
                 }
             }
-            BroadcastRequest::Vpns(vpns) => {
+            BroadcastRequest::Vpns { vpns, version } => {
                 match broadcast_config_changed(
                     &client,
                     "vpn",
                     None,
                     None,
-                    0,
+                    version,
                     serde_json::json!({ "vpns": vpns }),
                     None,
                 )
@@ -309,6 +315,64 @@ async fn run_broadcast_loop(
 fn load_hive(config_dir: &Path) -> Result<HiveFile, AdminError> {
     let data = fs::read_to_string(config_dir.join("hive.yaml"))?;
     Ok(serde_yaml::from_str(&data)?)
+}
+
+fn config_changed_version_channel(subsystem: &str) -> &'static str {
+    match subsystem {
+        // routes + vpn share version stream because SY.config.routes keeps one config version.
+        "routes" | "vpn" | "vpns" => "routes-vpns",
+        "storage" => "storage",
+        _ => "general",
+    }
+}
+
+fn config_changed_version_path(state_dir: &Path, subsystem: &str) -> PathBuf {
+    state_dir
+        .join("config_versions")
+        .join(format!("{}.txt", config_changed_version_channel(subsystem)))
+}
+
+fn allocate_config_changed_versions(
+    state_dir: &Path,
+    subsystem: &str,
+    count: usize,
+    requested_start: Option<u64>,
+) -> Result<Vec<u64>, AdminError> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let path = config_changed_version_path(state_dir, subsystem);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let current = fs::read_to_string(&path)
+        .ok()
+        .and_then(|data| data.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let start = match requested_start {
+        Some(requested) => {
+            if requested <= current {
+                return Err(
+                    format!("version must be greater than current (current={current})").into(),
+                );
+            }
+            requested
+        }
+        None => current.saturating_add(1),
+    };
+    let end = start.saturating_add(count as u64 - 1);
+    fs::write(&path, end.to_string())?;
+    Ok((start..=end).collect())
+}
+
+fn next_config_changed_version(
+    state_dir: &Path,
+    subsystem: &str,
+    requested: Option<u64>,
+) -> Result<u64, AdminError> {
+    let mut versions = allocate_config_changed_versions(state_dir, subsystem, 1, requested)?;
+    Ok(versions.remove(0))
 }
 
 async fn broadcast_config_changed(
@@ -636,11 +700,33 @@ async fn handle_http(
         }
         ("PUT", "/config/routes") => {
             let update: ConfigUpdate = serde_json::from_slice(&body)?;
+            let mut broadcasts = usize::from(update.routes.is_some());
+            broadcasts += usize::from(update.vpns.is_some());
+            let mut versions = match allocate_config_changed_versions(
+                &ctx.state_dir,
+                "routes",
+                broadcasts,
+                update.version,
+            ) {
+                Ok(versions) => versions,
+                Err(err) => {
+                    let body = serde_json::json!({
+                        "status": "error",
+                        "error_code": "VERSION_MISMATCH",
+                        "error_detail": err.to_string(),
+                    })
+                    .to_string();
+                    respond_json(stream, 409, &body).await?;
+                    return Ok(());
+                }
+            };
             if let Some(routes) = update.routes {
-                let _ = tx.send(BroadcastRequest::Routes(routes));
+                let version = versions.remove(0);
+                let _ = tx.send(BroadcastRequest::Routes { routes, version });
             }
             if let Some(vpns) = update.vpns {
-                let _ = tx.send(BroadcastRequest::Vpns(vpns));
+                let version = versions.remove(0);
+                let _ = tx.send(BroadcastRequest::Vpns { vpns, version });
             }
             tracing::info!("config routes update received");
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
@@ -648,7 +734,21 @@ async fn handle_http(
         ("PUT", "/config/vpns") => {
             let update: ConfigUpdate = serde_json::from_slice(&body)?;
             if let Some(vpns) = update.vpns {
-                let _ = tx.send(BroadcastRequest::Vpns(vpns));
+                let version =
+                    match next_config_changed_version(&ctx.state_dir, "vpn", update.version) {
+                        Ok(version) => version,
+                        Err(err) => {
+                            let body = serde_json::json!({
+                                "status": "error",
+                                "error_code": "VERSION_MISMATCH",
+                                "error_detail": err.to_string(),
+                            })
+                            .to_string();
+                            respond_json(stream, 409, &body).await?;
+                            return Ok(());
+                        }
+                    };
+                let _ = tx.send(BroadcastRequest::Vpns { vpns, version });
             }
             tracing::info!("config vpns update received");
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
@@ -659,7 +759,20 @@ async fn handle_http(
         }
         ("PUT", "/config/storage") => {
             let update: StorageUpdate = serde_json::from_slice(&body)?;
-            let version = update.version.unwrap_or(0);
+            let version =
+                match next_config_changed_version(&ctx.state_dir, "storage", update.version) {
+                    Ok(version) => version,
+                    Err(err) => {
+                        let body = serde_json::json!({
+                            "status": "error",
+                            "error_code": "VERSION_MISMATCH",
+                            "error_detail": err.to_string(),
+                        })
+                        .to_string();
+                        respond_json(stream, 409, &body).await?;
+                        return Ok(());
+                    }
+                };
             broadcast_config_changed(
                 client,
                 "storage",
@@ -1670,7 +1783,8 @@ async fn broadcast_full_config(
     } else {
         "vpn"
     };
-    broadcast_config_changed(client, subsystem, None, None, 0, config, None).await?;
+    let version = next_config_changed_version(&ctx.state_dir, subsystem, None)?;
+    broadcast_config_changed(client, subsystem, None, None, version, config, None).await?;
     Ok(())
 }
 

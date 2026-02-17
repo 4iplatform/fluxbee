@@ -90,12 +90,13 @@ curl -sS "$BASE/config/storage"
 
 curl -sS -X PUT "$BASE/config/storage" \
   -H 'Content-Type: application/json' \
-  -d '{"path":"/var/lib/fluxbee/storage","version":1}'
+  -d '{"path":"/var/lib/fluxbee/storage"}'
 ```
 
 Esperado:
 - `GET` devuelve `status=ok` y `path`
 - `PUT` devuelve `status=ok`
+- `version` es opcional; si se envia manual y no es mayor al actual, responde `409 VERSION_MISMATCH`
 
 ## 6) Config VPN (sanity)
 
