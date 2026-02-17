@@ -87,7 +87,7 @@ Criterio de salida:
 
 ## Smoke E2E (storage.turns)
 
-Para validar rapidamente el camino `NATS -> SY.storage -> PostgreSQL`:
+Para validar rapidamente el camino `NATS -> SY.storage -> PostgreSQL` con ciclo completo `write -> read -> delete`:
 
 ```bash
 sudo bash scripts/storage_smoke.sh
@@ -102,4 +102,11 @@ sudo DB_URL='postgresql://fluxbee:magicAI@127.0.0.1:5432/fluxbee' NATS_URL='nats
 
 Salida esperada:
 - `OK: insert observed in turns ...`
-- select final mostrando la fila insertada en `turns`.
+- `OK: read observed in turns`
+- `OK: delete observed and verified ...`
+
+Si queres conservar la fila para inspeccion manual:
+
+```bash
+sudo SMOKE_KEEP_ROW=1 bash scripts/storage_smoke.sh
+```
