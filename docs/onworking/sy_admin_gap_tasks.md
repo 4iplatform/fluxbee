@@ -27,7 +27,9 @@ Lista de tareas para alinear `SY.admin` con la especificacion actual y con el mo
 
 ## Pendiente alto (consistencia API)
 - [ ] Definir y aplicar version monotona para `CONFIG_CHANGED` en routes/vpns/storage.
-- [ ] Unificar formato de respuesta HTTP y codigos (hoy muchos errores salen como 500 generico).
+- [x] Unificar formato de respuesta HTTP y codigos:
+  - `SY.admin` ahora mapea `error_code -> HTTP status` (400/404/409/422/501/502/503/504).
+  - respuestas de admin/OPA incluyen envelope consistente con `status`, `action`, `payload`, `error_code`, `error_detail`.
 - [ ] Revisar coexistencia de rutas legacy (`/nodes?hive=...`) vs rutas nuevas (`/hives/{id}/nodes`) y dejar una estrategia canonica.
 
 ## Pendiente medio
@@ -42,3 +44,6 @@ Lista de tareas para alinear `SY.admin` con la especificacion actual y con el mo
   - `SY.config.routes`
   - `SY.orchestrator`
   - `SY.opa.rules`
+
+## Artefactos de validacion
+- [x] Checklist manual E2E con `curl` para API admin/orchestrator: `docs/onworking/sy_admin_e2e_curl_checklist.md`.

@@ -1168,18 +1168,78 @@ fn is_mother_role(role: Option<&str>) -> bool {
     matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee" || r == "mother")
 }
 
+fn http_status_line(status: u16) -> &'static str {
+    match status {
+        200 => "HTTP/1.1 200 OK",
+        400 => "HTTP/1.1 400 Bad Request",
+        404 => "HTTP/1.1 404 Not Found",
+        409 => "HTTP/1.1 409 Conflict",
+        422 => "HTTP/1.1 422 Unprocessable Entity",
+        500 => "HTTP/1.1 500 Internal Server Error",
+        501 => "HTTP/1.1 501 Not Implemented",
+        502 => "HTTP/1.1 502 Bad Gateway",
+        503 => "HTTP/1.1 503 Service Unavailable",
+        504 => "HTTP/1.1 504 Gateway Timeout",
+        _ => "HTTP/1.1 500 Internal Server Error",
+    }
+}
+
+fn error_code_to_http_status(error_code: &str) -> u16 {
+    match error_code.trim().to_ascii_uppercase().as_str() {
+        "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" => 400,
+        "NOT_FOUND" | "RUNTIME_NOT_AVAILABLE" => 404,
+        "HIVE_EXISTS" | "MODULE_EXISTS" | "VERSION_MISMATCH" => 409,
+        "COMPILE_ERROR" => 422,
+        "NOT_IMPLEMENTED" => 501,
+        "SERVICE_FAILED"
+        | "SPAWN_FAILED"
+        | "KILL_FAILED"
+        | "SSH_FAILED"
+        | "SSH_TIMEOUT"
+        | "RUNTIME_ERROR"
+        | "RUNTIME_COMMAND_FAILED"
+        | "RUNTIME_UNAVAILABLE"
+        | "TRANSPORT_ERROR" => 502,
+        "SHM_NOT_FOUND" | "RUNTIME_MANIFEST_MISSING" => 503,
+        "TIMEOUT" | "WAN_TIMEOUT" => 504,
+        _ => 500,
+    }
+}
+
+fn infer_transport_error_code(error_detail: &str) -> &'static str {
+    let lower = error_detail.to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        "TIMEOUT"
+    } else {
+        "TRANSPORT_ERROR"
+    }
+}
+
+fn value_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+}
+
+fn payload_error_code(payload: &serde_json::Value) -> Option<String> {
+    value_string_field(payload, "error_code")
+}
+
+fn payload_error_detail(payload: &serde_json::Value) -> Option<String> {
+    value_string_field(payload, "error_detail").or_else(|| value_string_field(payload, "message"))
+}
+
+fn is_ok_status(status: Option<&str>) -> bool {
+    matches!(status, Some(value) if value.eq_ignore_ascii_case("ok"))
+}
+
 async fn respond_json(
     stream: &mut tokio::net::TcpStream,
     status: u16,
     body: &str,
 ) -> Result<(), AdminError> {
-    let status_line = match status {
-        200 => "HTTP/1.1 200 OK",
-        400 => "HTTP/1.1 400 Bad Request",
-        404 => "HTTP/1.1 404 Not Found",
-        409 => "HTTP/1.1 409 Conflict",
-        _ => "HTTP/1.1 500 Internal Server Error",
-    };
+    let status_line = http_status_line(status);
     let response = format!(
         "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         body.as_bytes().len(),
@@ -1195,13 +1255,7 @@ async fn respond_bytes(
     content_type: &str,
     body: &[u8],
 ) -> Result<(), AdminError> {
-    let status_line = match status {
-        200 => "HTTP/1.1 200 OK",
-        400 => "HTTP/1.1 400 Bad Request",
-        404 => "HTTP/1.1 404 Not Found",
-        409 => "HTTP/1.1 409 Conflict",
-        _ => "HTTP/1.1 500 Internal Server Error",
-    };
+    let status_line = http_status_line(status);
     let header = format!(
         "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
         body.len()
@@ -1476,31 +1530,53 @@ fn build_admin_http_response(
 ) -> (u16, String) {
     match response {
         Ok(payload) => {
-            let status = payload
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("ok");
-            let code = if status == "ok" { 200 } else { 500 };
+            let status = payload.get("status").and_then(|v| v.as_str());
+            if is_ok_status(status) {
+                return (
+                    200,
+                    serde_json::json!({
+                        "status": "ok",
+                        "action": action,
+                        "payload": payload,
+                        "error_code": serde_json::Value::Null,
+                        "error_detail": serde_json::Value::Null,
+                    })
+                    .to_string(),
+                );
+            }
+
+            let error_code =
+                payload_error_code(&payload).unwrap_or_else(|| "SERVICE_FAILED".into());
+            let error_detail = payload_error_detail(&payload);
+            let status_code = error_code_to_http_status(&error_code);
             (
-                code,
+                status_code,
                 serde_json::json!({
-                    "status": status,
+                    "status": "error",
                     "action": action,
                     "payload": payload,
+                    "error_code": error_code,
+                    "error_detail": error_detail,
                 })
                 .to_string(),
             )
         }
-        Err(err) => (
-            500,
-            serde_json::json!({
-                "status": "error",
-                "action": action,
-                "error_code": "TIMEOUT",
-                "error_detail": err.to_string(),
-            })
-            .to_string(),
-        ),
+        Err(err) => {
+            let error_detail = err.to_string();
+            let error_code = infer_transport_error_code(&error_detail).to_string();
+            let status_code = error_code_to_http_status(&error_code);
+            (
+                status_code,
+                serde_json::json!({
+                    "status": "error",
+                    "action": action,
+                    "payload": serde_json::Value::Null,
+                    "error_code": error_code,
+                    "error_detail": error_detail,
+                })
+                .to_string(),
+            )
+        }
     }
 }
 
@@ -1821,12 +1897,39 @@ fn build_opa_http_response(
         .filter(|hive| !responses.iter().any(|r| r.hive == *hive))
         .collect();
     let timed_out = !pending.is_empty();
-    let status = if timed_out || responses.is_empty() || responses.iter().any(|r| r.status != "ok")
-    {
-        500
+
+    let (error_code, error_detail) = if timed_out {
+        (
+            Some("TIMEOUT".to_string()),
+            Some(format!("pending_hives={}", pending.join(","))),
+        )
+    } else if responses.is_empty() {
+        (
+            Some("SERVICE_FAILED".to_string()),
+            Some("no responses received".to_string()),
+        )
+    } else {
+        match responses
+            .iter()
+            .find(|r| !r.status.eq_ignore_ascii_case("ok"))
+        {
+            Some(entry) => (
+                entry
+                    .error_code
+                    .clone()
+                    .or_else(|| Some("SERVICE_FAILED".to_string())),
+                entry.error_detail.clone(),
+            ),
+            None => (None, None),
+        }
+    };
+
+    let status = if let Some(code) = error_code.as_deref() {
+        error_code_to_http_status(code)
     } else {
         200
     };
+
     let body = serde_json::json!({
         "status": if status == 200 { "ok" } else { "error" },
         "version": version,
@@ -1834,11 +1937,8 @@ fn build_opa_http_response(
         "check_only": action.check_only(),
         "responses": responses,
         "pending": pending,
-        "error_code": if timed_out {
-            Some("TIMEOUT".to_string())
-        } else {
-            None
-        },
+        "error_code": error_code,
+        "error_detail": error_detail,
     })
     .to_string();
     (status, body)
@@ -1856,22 +1956,43 @@ fn build_opa_query_response(
         .filter(|hive| !responses.iter().any(|r| r.hive == *hive))
         .collect();
     let timed_out = !pending.is_empty();
-    let status = if timed_out || responses.is_empty() || responses.iter().any(|r| r.status != "ok")
-    {
-        500
+
+    let (error_code, error_detail) = if timed_out {
+        (
+            Some("TIMEOUT".to_string()),
+            Some(format!("pending_hives={}", pending.join(","))),
+        )
+    } else if responses.is_empty() {
+        (
+            Some("SERVICE_FAILED".to_string()),
+            Some("no responses received".to_string()),
+        )
+    } else {
+        match responses
+            .iter()
+            .find(|r| !r.status.eq_ignore_ascii_case("ok"))
+        {
+            Some(entry) => (
+                payload_error_code(&entry.payload).or_else(|| Some("SERVICE_FAILED".to_string())),
+                payload_error_detail(&entry.payload),
+            ),
+            None => (None, None),
+        }
+    };
+
+    let status = if let Some(code) = error_code.as_deref() {
+        error_code_to_http_status(code)
     } else {
         200
     };
+
     let body = serde_json::json!({
         "status": if status == 200 { "ok" } else { "error" },
         "action": action,
         "responses": responses,
         "pending": pending,
-        "error_code": if timed_out {
-            Some("TIMEOUT".to_string())
-        } else {
-            None
-        },
+        "error_code": error_code,
+        "error_detail": error_detail,
     })
     .to_string();
     (status, body)
