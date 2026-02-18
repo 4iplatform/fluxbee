@@ -32,6 +32,73 @@ Every message flows through a unified routing layer that knows who's talking, wh
 
 ---
 
+## API Quickstart (SY.admin)
+
+Operational API for motherbee control is exposed by `SY.admin` (default `127.0.0.1:8080`).
+
+### Base URL
+
+```bash
+BASE="http://127.0.0.1:8080"
+```
+
+### Health and local status
+
+```bash
+curl -sS "$BASE/health"
+curl -sS "$BASE/hive/status"
+curl -sS "$BASE/hives"
+```
+
+### Add and remove a worker hive
+
+```bash
+HIVE_ID="worker-220"
+HIVE_ADDR="192.168.8.220"
+
+# bootstrap worker + connect WAN
+curl -sS -X POST "$BASE/hives" \
+  -H "Content-Type: application/json" \
+  -d "{\"hive_id\":\"$HIVE_ID\",\"address\":\"$HIVE_ADDR\"}"
+
+# inspect hive metadata
+curl -sS "$BASE/hives/$HIVE_ID"
+
+# deprovision worker services + remove hive metadata
+curl -sS -X DELETE "$BASE/hives/$HIVE_ID"
+```
+
+### Query remote worker state (from motherbee API)
+
+```bash
+curl -sS "$BASE/hives/$HIVE_ID/nodes"
+curl -sS "$BASE/hives/$HIVE_ID/routers"
+```
+
+Expected for remote hive responses:
+- `payload.target` should match requested hive (for example `worker-220`)
+- node names should match target hive (for example `SY.config.routes@worker-220`)
+- router names should match target hive (for example `RT.gateway@worker-220`)
+
+### Common config calls
+
+```bash
+curl -sS "$BASE/config/storage"
+
+curl -sS -X PUT "$BASE/config/vpns" \
+  -H "Content-Type: application/json" \
+  -d '{"vpns":[
+    {"pattern":"WF.echo","match_kind":"PREFIX","vpn_id":20},
+    {"pattern":"WF.listen","match_kind":"PREFIX","vpn_id":20}
+  ]}'
+```
+
+For a larger E2E checklist and error matrix, see:
+- `docs/onworking/sy_admin_e2e_curl_checklist.md`
+- `scripts/admin_add_hive_matrix.sh`
+
+---
+
 ## Core Concepts
 
 ### Three Layers of Routing
