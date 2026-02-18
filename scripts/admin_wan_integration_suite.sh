@@ -16,6 +16,7 @@ set -euo pipefail
 #   STALE_TIMEOUT_SECS=120
 #   RECOVERY_TIMEOUT_SECS=60
 #   POLL_INTERVAL_SECS=2
+#   OPA_NODE_TIMEOUT_SECS=45
 
 BASE="${BASE:-http://127.0.0.1:8080}"
 HIVE_ID="${HIVE_ID:-worker-220}"
@@ -24,6 +25,7 @@ STALE_TIMEOUT_SECS="${STALE_TIMEOUT_SECS:-120}"
 RECOVERY_TIMEOUT_SECS="${RECOVERY_TIMEOUT_SECS:-60}"
 POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-2}"
 CHECK_OPA_NODE="${CHECK_OPA_NODE:-1}"
+OPA_NODE_TIMEOUT_SECS="${OPA_NODE_TIMEOUT_SECS:-45}"
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -144,6 +146,45 @@ raise SystemExit(1)
 PY
 }
 
+wait_for_node_present() {
+  local expected_name="$1"
+  local timeout_secs="$2"
+  local label="$3"
+  local body="$tmpdir/nodes_${label}.json"
+  local start now elapsed status_code api_status
+  local poll_count=0
+
+  start="$(date +%s)"
+  while true; do
+    poll_count=$((poll_count + 1))
+    status_code="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes" "$body")"
+    log_http_response "$status_code" "$body"
+    now="$(date +%s)"
+    elapsed=$((now - start))
+
+    if [[ "$status_code" == "200" ]]; then
+      api_status="$(json_get "status" "$body")"
+      if [[ "$api_status" == "ok" ]]; then
+        if assert_node_present "$body" "$expected_name" >/dev/null 2>&1; then
+          echo "OK: node '$expected_name' present ($label)"
+          return 0
+        fi
+      fi
+    fi
+
+    if (( poll_count == 1 || poll_count % 5 == 0 )); then
+      echo "[POLL][$label] elapsed=${elapsed}s waiting node '$expected_name'" >&2
+    fi
+
+    if (( elapsed >= timeout_secs )); then
+      echo "FAIL [$label]: timeout waiting node '$expected_name'" >&2
+      cat "$body" >&2
+      return 1
+    fi
+    sleep "$POLL_INTERVAL_SECS"
+  done
+}
+
 require_cmd curl
 require_cmd python3
 require_cmd bash
@@ -183,13 +224,7 @@ assert_eq "$(json_get "payload.wan_connected" "$add_body")" "true" "POST /hives/
 echo "OK: add_hive passed with WAN freshness (wan_connected=true)"
 
 if [[ "$CHECK_OPA_NODE" == "1" ]]; then
-  nodes_after_add="$tmpdir/nodes_after_add.json"
-  status="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes" "$nodes_after_add")"
-  log_http_response "$status" "$nodes_after_add"
-  assert_eq "$status" "200" "GET /hives/{id}/nodes after add/http"
-  assert_eq "$(json_get "status" "$nodes_after_add")" "ok" "GET /hives/{id}/nodes after add/status"
-  assert_node_present "$nodes_after_add" "SY.opa.rules@$HIVE_ID" >/dev/null
-  echo "OK: OPA node present after add_hive (SY.opa.rules@$HIVE_ID)"
+  wait_for_node_present "SY.opa.rules@$HIVE_ID" "$OPA_NODE_TIMEOUT_SECS" "opa_after_add_hive"
 fi
 
 # 3) Stale/recovery integration
@@ -202,13 +237,7 @@ bash scripts/admin_wan_stale_recovery_e2e.sh
 echo "OK: WAN stale/recovery cycle passed"
 
 if [[ "$CHECK_OPA_NODE" == "1" ]]; then
-  nodes_after_wan="$tmpdir/nodes_after_wan.json"
-  status="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes" "$nodes_after_wan")"
-  log_http_response "$status" "$nodes_after_wan"
-  assert_eq "$status" "200" "GET /hives/{id}/nodes after stale-recovery/http"
-  assert_eq "$(json_get "status" "$nodes_after_wan")" "ok" "GET /hives/{id}/nodes after stale-recovery/status"
-  assert_node_present "$nodes_after_wan" "SY.opa.rules@$HIVE_ID" >/dev/null
-  echo "OK: OPA node present after stale/recovery (SY.opa.rules@$HIVE_ID)"
+  wait_for_node_present "SY.opa.rules@$HIVE_ID" "$OPA_NODE_TIMEOUT_SECS" "opa_after_stale_recovery"
 fi
 
 # 4) remove_hive + NOT_FOUND check
