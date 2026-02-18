@@ -86,6 +86,7 @@ curl -sS -X DELETE "$BASE/hives/$HIVE_ID/routers/rt-gateway"
 
 Esperado:
 - `list_routers` responde `status=ok`
+- en hive remoto, el `name` debe quedar con sufijo `@{hive}` (ej: `RT.gateway@worker-220`), no `@sandbox`.
 - start/stop router responde `status=ok`
 
 ## 4) Node remoto por hive
@@ -103,6 +104,7 @@ curl -sS "$BASE/hives/$HIVE_ID/nodes"
 
 Nota:
 - `DELETE /hives/{id}/nodes/{name}` existe, pero para casos con unit generado automaticamente conviene validar primero el identificador operativo a matar.
+- en hive remoto, los `name` listados deben pertenecer al hive target (ej: `SY.config.routes@worker-220`), no al motherbee.
 
 ## 5) Config storage (broadcast)
 

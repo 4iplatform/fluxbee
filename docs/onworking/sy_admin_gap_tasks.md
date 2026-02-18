@@ -18,6 +18,8 @@ Lista de tareas para alinear `SY.admin` con la especificacion actual y con el mo
 - [x] Corregir routing multi-hive de acciones de nodos/routers:
   - `/hives/{hive}/nodes|routers` ahora enruta a orchestrator local (`SY.orchestrator@motherbee`).
   - Se propaga `target` en payload para que orchestrator ejecute sobre hive remota.
+- [x] Corregir listado multi-hive de nodos/routers:
+  - `GET /hives/{hive}/nodes` y `GET /hives/{hive}/routers` ahora devuelven vista del hive target (no snapshot local de motherbee).
 - [x] Corregir contrato de payload para `kill_node`:
   - HTTP mantiene `{"name": ...}` por compatibilidad.
   - `SY.admin` normaliza a `node_name` antes de enviar a orchestrator.

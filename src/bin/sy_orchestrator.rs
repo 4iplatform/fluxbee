@@ -12,7 +12,8 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use json_router::shm::{
-    now_epoch_ms, LsaRegionReader, NodeEntry, RemoteHiveEntry, RouterRegionReader, ShmSnapshot,
+    now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RemoteHiveEntry, RemoteNodeEntry,
+    RouterRegionReader, ShmSnapshot, HEARTBEAT_STALE_MS,
 };
 use jsr_client::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
@@ -531,28 +532,8 @@ async fn handle_admin(
             .await;
             payload
         }
-        "list_nodes" => match load_router_snapshot(state) {
-            Ok(snapshot) => serde_json::json!({
-                "status": "ok",
-                "nodes": nodes_from_snapshot(&snapshot),
-            }),
-            Err(err) => serde_json::json!({
-                "status": "error",
-                "error_code": "SHM_NOT_FOUND",
-                "message": err.to_string(),
-            }),
-        },
-        "list_routers" => match load_router_snapshot(state) {
-            Ok(snapshot) => serde_json::json!({
-                "status": "ok",
-                "routers": routers_from_snapshot(&snapshot),
-            }),
-            Err(err) => serde_json::json!({
-                "status": "error",
-                "error_code": "SHM_NOT_FOUND",
-                "message": err.to_string(),
-            }),
-        },
+        "list_nodes" => list_nodes_flow(state, &msg.payload),
+        "list_routers" => list_routers_flow(state, &msg.payload),
         "run_node" => run_node_flow(state, &msg.payload),
         "kill_node" => kill_node_flow(state, &msg.payload),
         "run_router" => run_router_flow(state, &msg.payload),
@@ -849,6 +830,14 @@ fn load_router_snapshot(state: &OrchestratorState) -> Result<ShmSnapshot, Orches
         .ok_or_else(|| "shm snapshot unavailable".into())
 }
 
+fn load_lsa_snapshot(state: &OrchestratorState) -> Result<LsaSnapshot, OrchestratorError> {
+    let shm_name = format!("/jsr-lsa-{}", state.hive_id);
+    let reader = LsaRegionReader::open_read_only(&shm_name)?;
+    reader
+        .read_snapshot()
+        .ok_or_else(|| "lsa snapshot unavailable".into())
+}
+
 fn routers_from_snapshot(snapshot: &ShmSnapshot) -> Vec<serde_json::Value> {
     vec![serde_json::json!({
         "uuid": snapshot.header.router_uuid.to_string(),
@@ -866,6 +855,66 @@ fn nodes_from_snapshot(snapshot: &ShmSnapshot) -> Vec<serde_json::Value> {
         .iter()
         .filter_map(|node| node_entry_to_json(node))
         .collect()
+}
+
+fn list_nodes_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+    let target_hive = target_hive_from_payload(payload, &state.hive_id);
+    if target_hive == state.hive_id {
+        return match load_router_snapshot(state) {
+            Ok(snapshot) => serde_json::json!({
+                "status": "ok",
+                "nodes": nodes_from_snapshot(&snapshot),
+            }),
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "SHM_NOT_FOUND",
+                "message": err.to_string(),
+            }),
+        };
+    }
+
+    match load_lsa_snapshot(state) {
+        Ok(snapshot) => serde_json::json!({
+            "status": "ok",
+            "target": target_hive,
+            "nodes": remote_nodes_for_hive(&snapshot, &target_hive),
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "SHM_NOT_FOUND",
+            "message": err.to_string(),
+        }),
+    }
+}
+
+fn list_routers_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+    let target_hive = target_hive_from_payload(payload, &state.hive_id);
+    if target_hive == state.hive_id {
+        return match load_router_snapshot(state) {
+            Ok(snapshot) => serde_json::json!({
+                "status": "ok",
+                "routers": routers_from_snapshot(&snapshot),
+            }),
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "SHM_NOT_FOUND",
+                "message": err.to_string(),
+            }),
+        };
+    }
+
+    match load_lsa_snapshot(state) {
+        Ok(snapshot) => serde_json::json!({
+            "status": "ok",
+            "target": target_hive,
+            "routers": remote_routers_for_hive(state, &snapshot, &target_hive),
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "SHM_NOT_FOUND",
+            "message": err.to_string(),
+        }),
+    }
 }
 
 fn node_entry_to_json(entry: &NodeEntry) -> Option<serde_json::Value> {
@@ -887,6 +936,76 @@ fn node_name(entry: &NodeEntry) -> String {
     let len = entry.name_len as usize;
     let name_bytes = &entry.name[..len];
     String::from_utf8_lossy(name_bytes).into_owned()
+}
+
+fn remote_nodes_for_hive(snapshot: &LsaSnapshot, target_hive: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for node in &snapshot.nodes {
+        let hive_idx = node.hive_index as usize;
+        let Some(hive_entry) = snapshot.hives.get(hive_idx) else {
+            continue;
+        };
+        let Some(hive_id) = remote_hive_name(hive_entry) else {
+            continue;
+        };
+        if hive_id != target_hive {
+            continue;
+        }
+        let Some(node_json) = remote_node_to_json(node, hive_entry.last_updated) else {
+            continue;
+        };
+        out.push(node_json);
+    }
+    out
+}
+
+fn remote_node_to_json(entry: &RemoteNodeEntry, connected_at: u64) -> Option<serde_json::Value> {
+    if entry.name_len == 0 {
+        return None;
+    }
+    let len = entry.name_len as usize;
+    let name = String::from_utf8_lossy(&entry.name[..len]).into_owned();
+    let uuid = Uuid::from_slice(&entry.uuid).ok()?;
+    Some(serde_json::json!({
+        "uuid": uuid.to_string(),
+        "name": name,
+        "vpn_id": entry.vpn_id,
+        "connected_at": connected_at,
+        "status": "active",
+    }))
+}
+
+fn remote_routers_for_hive(
+    state: &OrchestratorState,
+    snapshot: &LsaSnapshot,
+    target_hive: &str,
+) -> Vec<serde_json::Value> {
+    let now = now_epoch_ms();
+    let gateway_base = state
+        .gateway_name
+        .split('@')
+        .next()
+        .unwrap_or(&state.gateway_name)
+        .to_string();
+    for hive in &snapshot.hives {
+        let Some(hive_id) = remote_hive_name(hive) else {
+            continue;
+        };
+        if hive_id != target_hive {
+            continue;
+        }
+        let stale = now.saturating_sub(hive.last_updated) > HEARTBEAT_STALE_MS;
+        let status = if stale { "stale" } else { "alive" };
+        return vec![serde_json::json!({
+            "uuid": Uuid::nil().to_string(),
+            "name": format!("{gateway_base}@{hive_id}"),
+            "is_gateway": true,
+            "nodes_count": hive.node_count,
+            "status": status,
+            "heartbeat": hive.last_updated,
+        })];
+    }
+    Vec::new()
 }
 
 async fn send_config_response(
@@ -1000,7 +1119,22 @@ fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_json::Val
         }
     };
 
-    let cleanup_cmd = r#"for unit in rt-gateway sy-config-routes sy-opa-rules sy-identity; do systemctl disable --now "$unit" >/dev/null 2>&1 || true; systemctl stop "$unit" >/dev/null 2>&1 || true; systemctl kill -s KILL "$unit" >/dev/null 2>&1 || true; systemctl reset-failed "$unit" >/dev/null 2>&1 || true; done"#;
+    let cleanup_cmd = "systemctl disable --now rt-gateway >/dev/null 2>&1 || true; \
+systemctl stop rt-gateway >/dev/null 2>&1 || true; \
+systemctl kill -s KILL rt-gateway >/dev/null 2>&1 || true; \
+systemctl reset-failed rt-gateway >/dev/null 2>&1 || true; \
+systemctl disable --now sy-config-routes >/dev/null 2>&1 || true; \
+systemctl stop sy-config-routes >/dev/null 2>&1 || true; \
+systemctl kill -s KILL sy-config-routes >/dev/null 2>&1 || true; \
+systemctl reset-failed sy-config-routes >/dev/null 2>&1 || true; \
+systemctl disable --now sy-opa-rules >/dev/null 2>&1 || true; \
+systemctl stop sy-opa-rules >/dev/null 2>&1 || true; \
+systemctl kill -s KILL sy-opa-rules >/dev/null 2>&1 || true; \
+systemctl reset-failed sy-opa-rules >/dev/null 2>&1 || true; \
+systemctl disable --now sy-identity >/dev/null 2>&1 || true; \
+systemctl stop sy-identity >/dev/null 2>&1 || true; \
+systemctl kill -s KILL sy-identity >/dev/null 2>&1 || true; \
+systemctl reset-failed sy-identity >/dev/null 2>&1 || true";
     if let Err(err) = ssh_with_key(
         &address,
         &key_path,
