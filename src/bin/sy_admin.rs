@@ -1477,7 +1477,7 @@ async fn handle_admin_query(
 ) -> Result<(u16, String), AdminError> {
     let payload = normalize_admin_payload(action, serde_json::json!({}), hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
-    let response = send_admin_request(client, request).await;
+    let response = send_admin_request(client, request, admin_action_timeout(action)).await;
     Ok(build_admin_http_response(action, response))
 }
 
@@ -1491,7 +1491,7 @@ async fn handle_admin_command(
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
     let target_hive = extract_hive_from_target(&request.target);
-    let response = send_admin_request(client, request).await;
+    let response = send_admin_request(client, request, admin_action_timeout(action)).await;
     if let Ok(ref payload) = response {
         if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
             if status == "ok" {
@@ -1553,6 +1553,7 @@ fn build_admin_request(
 async fn send_admin_request(
     client: &AdminRouterClient,
     request: AdminRequest,
+    timeout_window: Duration,
 ) -> Result<serde_json::Value, AdminError> {
     let dst = request
         .unicast
@@ -1582,17 +1583,40 @@ async fn send_admin_request(
     client.sender.send(msg).await?;
 
     use tokio::time::{timeout, Instant};
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + timeout_window;
     let remaining = deadline.saturating_duration_since(Instant::now());
     let msg = match timeout(remaining, rx).await {
         Ok(Ok(msg)) => msg,
         Ok(Err(_)) => return Err("admin response channel closed".into()),
         Err(_) => {
             client.drop_admin_waiter(&trace_id).await;
-            return Err("admin request timeout".into());
+            return Err(format!(
+                "admin request timeout action={} timeout_secs={}",
+                request.action,
+                timeout_window.as_secs()
+            )
+            .into());
         }
     };
     Ok(msg.payload)
+}
+
+fn env_timeout_secs(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.trim().parse::<u64>().ok()
+}
+
+fn admin_action_timeout(action: &str) -> Duration {
+    match action {
+        // add_hive runs remote bootstrap + WAN wait and is expected to be long.
+        "add_hive" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS").unwrap_or(180))
+        }
+        // other orchestrator mutating actions can also take longer than default.
+        "run_node" | "kill_node" | "run_router" | "kill_router" | "remove_hive" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30))
+        }
+        _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5)),
+    }
 }
 
 fn build_admin_http_response(
@@ -1723,7 +1747,7 @@ async fn broadcast_full_config(
         serde_json::json!({}),
         target_hive.map(|s| s.to_string()),
     );
-    let response = send_admin_request(client, list_req).await?;
+    let response = send_admin_request(client, list_req, admin_action_timeout(list_action)).await?;
     let payload = response
         .get("status")
         .and_then(|v| v.as_str())
