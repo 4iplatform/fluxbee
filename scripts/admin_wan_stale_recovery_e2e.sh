@@ -53,6 +53,17 @@ value = data
 for part in key.split("."):
     if isinstance(value, dict):
         value = value.get(part, "")
+    elif isinstance(value, list):
+        if part.isdigit():
+            idx = int(part)
+            if 0 <= idx < len(value):
+                value = value[idx]
+            else:
+                value = ""
+                break
+        else:
+            value = ""
+            break
     else:
         value = ""
         break
