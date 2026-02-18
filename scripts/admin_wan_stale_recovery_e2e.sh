@@ -71,6 +71,8 @@ for part in key.split("."):
 
 if isinstance(value, (dict, list)):
     print(json.dumps(value))
+elif isinstance(value, bool):
+    print("true" if value else "false")
 else:
     print(value if value is not None else "")
 PY
