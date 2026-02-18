@@ -1266,6 +1266,7 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         "SERVICE_FAILED"
         | "SPAWN_FAILED"
         | "KILL_FAILED"
+        | "REMOVE_FAILED"
         | "COPY_FAILED"
         | "CONFIG_FAILED"
         | "RUNTIME_ERROR"

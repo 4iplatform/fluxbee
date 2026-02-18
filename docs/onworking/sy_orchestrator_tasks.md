@@ -12,6 +12,7 @@ Checklist operativo para cerrar SY.orchestrator segun:
 - [x] Watchdog de servicios criticos + shutdown ordenado.
 - [x] `add_hive` robusto (sin pasos criticos ignorados) con clasificacion de errores SSH inicial.
 - [x] `add_hive` fail-fast cuando `wan.authorized_hives` bloquea el `hive_id` (`WAN_NOT_AUTHORIZED`), evitando timeout opaco de WAN.
+- [x] `remove_hive` con cleanup remoto: `disable/stop/kill/reset-failed` de servicios worker antes de borrar metadata local.
 - [x] `run_node` funcional (local/remoto) con:
   - [x] validacion de `runtime/version` contra `runtime-manifest.json`.
   - [x] verificacion de presencia del runtime en target.

@@ -596,17 +596,7 @@ async fn handle_admin(
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
             if let Some(hive_id) = hive {
-                match remove_hive(&state.state_dir, &hive_id) {
-                    Ok(()) => serde_json::json!({
-                        "status": "ok",
-                        "hive_id": hive_id,
-                    }),
-                    Err(err) => serde_json::json!({
-                        "status": "error",
-                        "error_code": "NOT_FOUND",
-                        "message": err.to_string(),
-                    }),
-                }
+                remove_hive_flow(state, &hive_id)
             } else {
                 serde_json::json!({
                     "status": "error",
@@ -974,14 +964,74 @@ fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
     read_hive_info(&root, hive_id)
 }
 
-fn remove_hive(_state_dir: &Path, hive_id: &str) -> Result<(), OrchestratorError> {
+fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_json::Value {
+    if !valid_hive_id(hive_id) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_HIVE_ID",
+            "message": "invalid hive_id",
+        });
+    }
+    if hive_id == state.hive_id {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "cannot remove local motherbee hive",
+        });
+    }
     let root = hives_root();
     let dir = root.join(hive_id);
     if !dir.exists() {
-        return Err("hive not found".into());
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "NOT_FOUND",
+            "message": "hive not found",
+        });
     }
-    fs::remove_dir_all(dir)?;
-    Ok(())
+
+    let (address, key_path) = match hive_access(hive_id) {
+        Ok(parts) => parts,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "REMOVE_FAILED",
+                "message": format!("cannot resolve hive access for remote cleanup: {err}"),
+            })
+        }
+    };
+
+    let cleanup_cmd = r#"for unit in rt-gateway sy-config-routes sy-opa-rules sy-identity; do systemctl disable --now "$unit" >/dev/null 2>&1 || true; systemctl stop "$unit" >/dev/null 2>&1 || true; systemctl kill -s KILL "$unit" >/dev/null 2>&1 || true; systemctl reset-failed "$unit" >/dev/null 2>&1 || true; done"#;
+    if let Err(err) = ssh_with_key(
+        &address,
+        &key_path,
+        &sudo_wrap(cleanup_cmd),
+        BOOTSTRAP_SSH_USER,
+    ) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "REMOVE_FAILED",
+            "message": format!("remote cleanup failed: {err}"),
+            "hive_id": hive_id,
+            "address": address,
+        });
+    }
+
+    if let Err(err) = fs::remove_dir_all(dir) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "IO_ERROR",
+            "message": err.to_string(),
+            "hive_id": hive_id,
+            "address": address,
+        });
+    }
+
+    serde_json::json!({
+        "status": "ok",
+        "hive_id": hive_id,
+        "address": address,
+        "remote_cleanup": "stopped",
+    })
 }
 
 fn read_hive_info(root: &Path, hive_id: &str) -> Result<serde_json::Value, OrchestratorError> {

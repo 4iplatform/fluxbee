@@ -48,6 +48,7 @@ Esperado:
 - `status=ok` en alta
 - `status=ok` + datos en get hive
 - `status=ok` en delete
+- `delete` detiene y deshabilita servicios Fluxbee remotos del worker (`rt-gateway`, `sy-config-routes`, `sy-opa-rules`, `sy-identity`) antes de borrar metadata local.
 
 ### 2.1 Matriz de errores add_hive (rápido)
 
