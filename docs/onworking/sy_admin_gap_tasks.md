@@ -45,10 +45,11 @@ Lista de tareas para alinear `SY.admin` con la especificacion actual y con el mo
   - mapeo HTTP en `SY.admin` ajustado para `SSH_*`, `INVALID_HIVE_ID`, `MISSING_WAN_LISTEN`, `COPY_FAILED`, `CONFIG_FAILED`.
   - smoke E2E agregado: `scripts/admin_add_hive_matrix.sh`.
   - checklist actualizado con cobertura manual de `WAN_TIMEOUT`.
-- [ ] Agregar pruebas de integracion end-to-end para:
-  - [ ] `/hives/{id}/nodes` (run/kill)
-  - [ ] `/hives/{id}/routers` (run/kill)
-  - [ ] `/config/storage` (broadcast + confirmacion)
+- [x] Agregar pruebas de integracion end-to-end para:
+  - [x] `/hives/{id}/nodes` (run/kill)
+  - [x] `/hives/{id}/routers` (run/kill)
+  - [x] `/config/storage` (broadcast + confirmacion)
+  - Script E2E agregado: `scripts/admin_nodes_routers_storage_e2e.sh`.
 
 ## Seguimiento
 - [ ] Registrar mapeo final de endpoints por ownership:

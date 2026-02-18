@@ -164,3 +164,22 @@ Estos endpoints legacy ya no existen y deben devolver `404`:
 curl -sS "$BASE/nodes"
 curl -sS "$BASE/routers"
 ```
+
+## 10) E2E script (batch)
+
+Script automatizado para cubrir en una sola corrida:
+- `GET/POST/DELETE /hives/{id}/routers`
+- `GET/POST/DELETE /hives/{id}/nodes`
+- `GET/PUT /config/storage` (incluye restore)
+
+```bash
+BASE="http://127.0.0.1:8080" \
+HIVE_ID="worker-220" \
+bash scripts/admin_nodes_routers_storage_e2e.sh
+```
+
+Opcionales:
+- `RUN_ROUTER_CYCLE=0` para desactivar kill/start de router.
+- `RUN_NODE_CYCLE=0` para desactivar run/kill de runtime.
+- `NODE_RUNTIME=wf.echo NODE_VERSION=current` para runtime específico.
+- `SKIP_NODE_IF_RUNTIME_MISSING=1` para entorno sin runtime-manifest/assets.
