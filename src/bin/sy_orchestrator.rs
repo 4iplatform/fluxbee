@@ -1850,12 +1850,15 @@ fn add_hive_flow(
         });
     }
 
-    let config_routes_yaml = "version: 1\nroutes: []\nvpns: []\n";
+    let config_routes_yaml = format!(
+        "version: 1\nupdated_at: \"{}\"\nroutes: []\nvpns: []\n",
+        now_epoch_ms()
+    );
     if let Err(err) = write_remote_file(
         address,
         &key_path,
         "/etc/fluxbee/sy-config-routes.yaml",
-        config_routes_yaml,
+        &config_routes_yaml,
     ) {
         return serde_json::json!({
             "status": "error",

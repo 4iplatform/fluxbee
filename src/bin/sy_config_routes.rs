@@ -24,6 +24,7 @@ struct HiveFile {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct SyConfigFile {
     version: u64,
+    #[serde(default)]
     updated_at: String,
     #[serde(default)]
     routes: Vec<RouteConfig>,
@@ -525,7 +526,13 @@ fn load_config(config_dir: &Path) -> Result<SyConfigFile, Box<dyn std::error::Er
         return Ok(empty);
     }
     let data = fs::read_to_string(&path)?;
-    Ok(serde_yaml::from_str(&data)?)
+    let mut cfg: SyConfigFile = serde_yaml::from_str(&data)?;
+    if cfg.updated_at.trim().is_empty() {
+        cfg.updated_at = now_epoch_ms().to_string();
+        let data = serde_yaml::to_string(&cfg)?;
+        fs::write(&path, data)?;
+    }
+    Ok(cfg)
 }
 
 fn write_config(

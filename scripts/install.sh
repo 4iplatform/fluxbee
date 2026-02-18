@@ -117,6 +117,7 @@ else
     echo "Creating default $CONFIG_DIR/sy-config-routes.yaml"
     cat <<'EOF' | sudo tee "$CONFIG_DIR/sy-config-routes.yaml" >/dev/null
 version: 1
+updated_at: ""
 routes: []
 vpns: []
 EOF
