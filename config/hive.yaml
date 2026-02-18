@@ -7,8 +7,6 @@ wan:
   gateway_name: "RT.gateway"
   uplinks:
     - address: "192.168.8.220:9000"
-  authorized_hives:
-    - prod
 
 # Admin API (optional).
 admin:

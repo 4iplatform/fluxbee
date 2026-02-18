@@ -1260,7 +1260,7 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
     match code.as_str() {
         "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID" => 400,
         "NOT_FOUND" | "RUNTIME_NOT_AVAILABLE" => 404,
-        "HIVE_EXISTS" | "MODULE_EXISTS" | "VERSION_MISMATCH" => 409,
+        "HIVE_EXISTS" | "MODULE_EXISTS" | "VERSION_MISMATCH" | "WAN_NOT_AUTHORIZED" => 409,
         "COMPILE_ERROR" => 422,
         "NOT_IMPLEMENTED" => 501,
         "SERVICE_FAILED"

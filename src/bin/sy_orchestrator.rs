@@ -48,6 +48,7 @@ struct IdentityShm {
 struct WanSection {
     gateway_name: Option<String>,
     listen: Option<String>,
+    authorized_hives: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +98,7 @@ struct OrchestratorState {
     gateway_name: String,
     storage_path: Mutex<String>,
     wan_listen: Option<String>,
+    wan_authorized_hives: Vec<String>,
     tracked_nodes: Mutex<HashSet<String>>,
     runtime_manifest: Mutex<Option<RuntimeManifest>>,
     last_runtime_verify: Mutex<Instant>,
@@ -139,6 +141,11 @@ async fn main() -> Result<(), OrchestratorError> {
         .and_then(|wan| wan.gateway_name.clone())
         .unwrap_or_else(|| "RT.gateway".to_string());
     let wan_listen = hive.wan.as_ref().and_then(|wan| wan.listen.clone());
+    let wan_authorized_hives = hive
+        .wan
+        .as_ref()
+        .and_then(|wan| wan.authorized_hives.clone())
+        .unwrap_or_default();
     let nats_endpoint = nats_endpoint_from_hive(&hive);
     let storage_path = load_storage_path(&config_dir);
     let runtime_manifest = load_runtime_manifest();
@@ -150,6 +157,7 @@ async fn main() -> Result<(), OrchestratorError> {
         gateway_name,
         storage_path: Mutex::new(storage_path),
         wan_listen,
+        wan_authorized_hives,
         tracked_nodes: Mutex::new(HashSet::new()),
         runtime_manifest: Mutex::new(runtime_manifest),
         last_runtime_verify: Mutex::new(Instant::now()),
@@ -1648,6 +1656,22 @@ fn add_hive_flow(
             "status": "error",
             "error_code": "MISSING_WAN_LISTEN",
             "message": "wan.listen missing in hive.yaml",
+        });
+    }
+    if !state.wan_authorized_hives.is_empty()
+        && !state
+            .wan_authorized_hives
+            .iter()
+            .any(|allowed| allowed.trim() == hive_id)
+    {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "WAN_NOT_AUTHORIZED",
+            "message": format!(
+                "hive '{}' not present in wan.authorized_hives; update /etc/fluxbee/hive.yaml or leave authorized_hives empty",
+                hive_id
+            ),
+            "hive_id": hive_id,
         });
     }
 

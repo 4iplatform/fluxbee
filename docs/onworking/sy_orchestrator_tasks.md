@@ -11,6 +11,7 @@ Checklist operativo para cerrar SY.orchestrator segun:
 - [x] Timeout de bootstrap de SY nodes ahora reporta el detalle de nodos faltantes.
 - [x] Watchdog de servicios criticos + shutdown ordenado.
 - [x] `add_hive` robusto (sin pasos criticos ignorados) con clasificacion de errores SSH inicial.
+- [x] `add_hive` fail-fast cuando `wan.authorized_hives` bloquea el `hive_id` (`WAN_NOT_AUTHORIZED`), evitando timeout opaco de WAN.
 - [x] `run_node` funcional (local/remoto) con:
   - [x] validacion de `runtime/version` contra `runtime-manifest.json`.
   - [x] verificacion de presencia del runtime en target.

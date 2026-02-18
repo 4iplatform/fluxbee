@@ -64,6 +64,8 @@ Casos cubiertos por script:
 - `SSH_*` -> HTTP `502/504`
 
 Caso manual adicional:
+- `WAN_NOT_AUTHORIZED` -> HTTP `409`
+  - Cuando motherbee tiene `wan.authorized_hives` no vacio y falta el `hive_id` solicitado.
 - `WAN_TIMEOUT` -> HTTP `504`
   - Requiere host remoto que bootstrappee pero no logre conexión WAN dentro de 60s.
 
