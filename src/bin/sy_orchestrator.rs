@@ -444,6 +444,7 @@ async fn handle_admin(
     state: &OrchestratorState,
 ) -> Result<(), OrchestratorError> {
     let action = msg.meta.action.as_deref().unwrap_or("");
+    tracing::info!(action = action, trace_id = %msg.routing.trace_id, "admin action received");
     let payload = match action {
         "hive_status" => {
             let uptime_ms = state.started_at.elapsed().as_millis() as u64;
@@ -1777,7 +1778,9 @@ fn add_hive_flow(
     if let Err(err) = ssh_with_key(
         address,
         &key_path,
-        &sudo_wrap("mv /tmp/sy-* /usr/bin/ && mv /tmp/rt-* /usr/bin/ && chmod +x /usr/bin/sy-* /usr/bin/rt-*"),
+        &sudo_wrap(
+            r#"bash -lc "mv /tmp/sy-* /usr/bin/ && mv /tmp/rt-* /usr/bin/ && chmod +x /usr/bin/sy-* /usr/bin/rt-*""#,
+        ),
         BOOTSTRAP_SSH_USER,
     ) {
         return serde_json::json!({
