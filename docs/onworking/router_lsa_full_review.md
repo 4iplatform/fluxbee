@@ -113,13 +113,13 @@ Acceptance:
   - [x] LSA apply with stale seq/restart seq.
   - [x] Hive mismatch rejection.
   - [x] Flag projection for orchestrator API.
-- [ ] Integration tests:
-  - two-hive WAN bootstrap, disconnect/reconnect, stale transition.
-  - add/remove hive with LSA freshness gate.
+- [x] Integration tests:
+  - [x] two-hive WAN bootstrap/disconnect/reconnect/stale transition covered with admin WAN scripts (`scripts/admin_wan_stale_recovery_e2e.sh`, `scripts/admin_wan_integration_suite.sh`).
+  - [x] add/remove hive with LSA freshness gate covered (`scripts/admin_wan_integration_suite.sh`: requires `payload.wan_connected=true` on add and `NOT_FOUND` after remove).
 - [x] E2E checks:
   - [x] admin endpoints return real remote router UUID after P2.
   - [x] add_hive/list_nodes/list_routers/router-cycle/storage-cycle validated via `scripts/admin_nodes_routers_storage_e2e.sh`.
-  - [ ] stale transitions visible through API.
+  - [x] stale transitions visible through API (`scripts/admin_wan_stale_recovery_e2e.sh`: `alive -> stale -> alive` validated on `worker-220`).
 
 Implemented tests:
 - `src/router/mod.rs`:
@@ -134,6 +134,8 @@ Operational integration script prepared:
 - `scripts/admin_wan_stale_recovery_e2e.sh`
   - validates `alive -> stale -> alive` via admin API against a real worker hive.
   - validates remote router UUID remains non-nil after recovery.
+- `scripts/admin_wan_integration_suite.sh`
+  - validates `add_hive` with WAN freshness gate (`wan_connected=true`), stale/recovery cycle, and `remove_hive` closure (`NOT_FOUND` post-delete).
 
 ## Suggested delivery order
 

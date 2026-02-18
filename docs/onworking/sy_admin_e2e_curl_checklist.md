@@ -205,3 +205,22 @@ Opcionales:
 - `POLL_INTERVAL_SECS=2`
 - `EXPECTED_STALE_AFTER_SECS=30` (solo para logging de progreso; default `30`)
 - `AUTO_RECOVER_ON_EXIT=1` (intenta levantar router si el script se interrumpe tras un kill)
+
+## 12) WAN integration suite (add/remove + freshness gate + stale/recovery)
+
+Suite de integración completa para cerrar flujo WAN de orchestrator:
+- `add_hive` con gate de frescura (`payload.wan_connected=true`)
+- transición `alive -> stale -> alive`
+- `remove_hive` y validación `NOT_FOUND` posterior
+
+```bash
+BASE="http://127.0.0.1:8080" \
+HIVE_ID="worker-220" \
+HIVE_ADDR="192.168.8.220" \
+bash scripts/admin_wan_integration_suite.sh
+```
+
+Opcionales:
+- `STALE_TIMEOUT_SECS=120`
+- `RECOVERY_TIMEOUT_SECS=60`
+- `POLL_INTERVAL_SECS=2`
