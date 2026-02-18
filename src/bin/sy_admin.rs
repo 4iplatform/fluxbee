@@ -725,18 +725,30 @@ async fn handle_http(
                         return Ok(());
                     }
                 };
-            broadcast_config_changed(
+            let storage_payload = serde_json::json!({ "path": update.path });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "set_storage", storage_payload.clone(), None)
+                    .await?;
+            if status != 200 {
+                respond_json(stream, status, &resp).await?;
+                return Ok(());
+            }
+
+            if let Err(err) = broadcast_config_changed(
                 client,
                 "storage",
                 None,
                 None,
                 version,
-                serde_json::json!({ "path": update.path }),
+                storage_payload,
                 None,
             )
-            .await?;
+            .await
+            {
+                tracing::warn!("config storage broadcast failed after set_storage: {err}");
+            }
             tracing::info!("config storage update received");
-            respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
+            respond_json(stream, 200, &resp).await?;
         }
         ("POST", "/opa/policy") => {
             let req: OpaRequest = serde_json::from_slice(&body)?;
@@ -1523,8 +1535,18 @@ fn build_admin_request(
         "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn" | "delete_vpn" => {
             "SY.config.routes"
         }
-        "list_nodes" | "run_node" | "kill_node" | "list_routers" | "run_router" | "kill_router"
-        | "hive_status" | "get_storage" | "list_hives" | "get_hive" | "remove_hive"
+        "list_nodes"
+        | "run_node"
+        | "kill_node"
+        | "list_routers"
+        | "run_router"
+        | "kill_router"
+        | "hive_status"
+        | "get_storage"
+        | "set_storage"
+        | "list_hives"
+        | "get_hive"
+        | "remove_hive"
         | "add_hive" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
@@ -1691,6 +1713,7 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "kill_router"
             | "hive_status"
             | "get_storage"
+            | "set_storage"
             | "list_hives"
             | "get_hive"
             | "remove_hive"
