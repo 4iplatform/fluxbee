@@ -23,6 +23,7 @@ STALE_TIMEOUT_SECS="${STALE_TIMEOUT_SECS:-90}"
 RECOVERY_TIMEOUT_SECS="${RECOVERY_TIMEOUT_SECS:-60}"
 POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-2}"
 AUTO_RECOVER_ON_EXIT="${AUTO_RECOVER_ON_EXIT:-1}"
+EXPECTED_STALE_AFTER_SECS="${EXPECTED_STALE_AFTER_SECS:-30}"
 
 ROUTER_KILLED="0"
 
@@ -145,25 +146,46 @@ poll_router_status() {
   local label="$3"
   local start now elapsed
   local body="$tmpdir/poll_${label}.json"
-  local status_code router_status api_status router_uuid
+  local status_code router_status api_status router_uuid heartbeat_ms heartbeat_age_s
+  local poll_count=0
 
   start="$(date +%s)"
   while true; do
+    poll_count=$((poll_count + 1))
     status_code="$(http_call "GET" "$BASE/hives/$HIVE_ID/routers" "$body")"
     log_http_response "$status_code" "$body"
+    now="$(date +%s)"
+    elapsed=$((now - start))
 
     if [[ "$status_code" == "200" ]]; then
       api_status="$(json_get "status" "$body")"
       router_status="$(json_get "payload.routers.0.status" "$body")"
       router_uuid="$(json_get "payload.routers.0.uuid" "$body")"
+      heartbeat_ms="$(json_get "payload.routers.0.heartbeat" "$body")"
+      heartbeat_age_s="n/a"
+      if [[ "$heartbeat_ms" =~ ^[0-9]+$ ]]; then
+        local now_ms
+        now_ms=$((now * 1000))
+        local age_ms
+        age_ms=$((now_ms - heartbeat_ms))
+        if (( age_ms < 0 )); then
+          age_ms=0
+        fi
+        heartbeat_age_s=$((age_ms / 1000))
+      fi
       if [[ "$api_status" == "ok" && "$router_status" == "$expected" ]]; then
         echo "OK: router status reached '$expected' (uuid=$router_uuid)"
         return 0
       fi
+      if (( poll_count == 1 || poll_count % 5 == 0 )); then
+        if [[ "$expected" == "stale" ]]; then
+          echo "[POLL][$label] elapsed=${elapsed}s status=${router_status:-n/a} heartbeat_age_s=${heartbeat_age_s} waiting_for=stale (target~${EXPECTED_STALE_AFTER_SECS}s)" >&2
+        else
+          echo "[POLL][$label] elapsed=${elapsed}s status=${router_status:-n/a} heartbeat_age_s=${heartbeat_age_s} waiting_for=$expected" >&2
+        fi
+      fi
     fi
 
-    now="$(date +%s)"
-    elapsed=$((now - start))
     if (( elapsed >= timeout_secs )); then
       echo "FAIL [$label]: timeout waiting router status '$expected' (last_http=$status_code, last_status=${router_status:-})" >&2
       cat "$body" >&2

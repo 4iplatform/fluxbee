@@ -203,4 +203,5 @@ Opcionales:
 - `STALE_TIMEOUT_SECS=90` (default `90`)
 - `RECOVERY_TIMEOUT_SECS=60` (default `60`)
 - `POLL_INTERVAL_SECS=2`
+- `EXPECTED_STALE_AFTER_SECS=30` (solo para logging de progreso; default `30`)
 - `AUTO_RECOVER_ON_EXIT=1` (intenta levantar router si el script se interrumpe tras un kill)
