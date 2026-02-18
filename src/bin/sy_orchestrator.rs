@@ -2626,3 +2626,96 @@ fn persist_storage_path(config_dir: &Path, path: &str) -> Result<(), Orchestrato
 fn is_mother_role(role: Option<&str>) -> bool {
     matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee" || r == "mother")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use json_router::shm::LsaHeaderSnapshot;
+
+    fn write_name(buf: &mut [u8], value: &str) -> u16 {
+        let bytes = value.as_bytes();
+        let len = bytes.len().min(buf.len());
+        buf[..len].copy_from_slice(&bytes[..len]);
+        len as u16
+    }
+
+    fn test_state() -> OrchestratorState {
+        OrchestratorState {
+            hive_id: "sandbox".to_string(),
+            started_at: Instant::now(),
+            config_dir: PathBuf::from("/tmp"),
+            state_dir: PathBuf::from("/tmp"),
+            gateway_name: "RT.gateway@sandbox".to_string(),
+            storage_path: Mutex::new("/var/lib/fluxbee".to_string()),
+            wan_listen: None,
+            wan_authorized_hives: Vec::new(),
+            tracked_nodes: Mutex::new(HashSet::new()),
+            runtime_manifest: Mutex::new(None),
+            last_runtime_verify: Mutex::new(Instant::now()),
+            nats_endpoint: "nats://127.0.0.1:4222".to_string(),
+        }
+    }
+
+    #[test]
+    fn remote_routers_projection_uses_real_uuid_and_name() {
+        let router_uuid = Uuid::new_v4();
+        let mut hive = RemoteHiveEntry {
+            hive_id: [0u8; 64],
+            hive_id_len: 0,
+            router_uuid: *router_uuid.as_bytes(),
+            router_name: [0u8; 64],
+            router_name_len: 0,
+            last_lsa_seq: 10,
+            last_updated: now_epoch_ms(),
+            flags: 0,
+            node_count: 2,
+            route_count: 0,
+            vpn_count: 0,
+        };
+        hive.hive_id_len = write_name(&mut hive.hive_id, "worker-220");
+        hive.router_name_len = write_name(&mut hive.router_name, "RT.gateway@worker-220");
+
+        let snapshot = LsaSnapshot {
+            header: LsaHeaderSnapshot {
+                hive_count: 1,
+                total_node_count: 0,
+                total_route_count: 0,
+                total_vpn_count: 0,
+                heartbeat: now_epoch_ms(),
+            },
+            hives: vec![hive],
+            nodes: Vec::new(),
+            routes: Vec::new(),
+            vpns: Vec::new(),
+        };
+        let state = test_state();
+        let routers = remote_routers_for_hive(&state, &snapshot, "worker-220");
+
+        assert_eq!(routers.len(), 1);
+        assert_eq!(routers[0]["uuid"], router_uuid.to_string());
+        assert_eq!(routers[0]["name"], "RT.gateway@worker-220");
+    }
+
+    #[test]
+    fn remote_node_projection_reports_status_from_flags() {
+        let mut node = RemoteNodeEntry {
+            uuid: *Uuid::new_v4().as_bytes(),
+            name: [0u8; 256],
+            name_len: 0,
+            vpn_id: 20,
+            hive_index: 0,
+            flags: 0,
+            _reserved: [0u8; 6],
+        };
+        node.name_len = write_name(&mut node.name, "WF.echo@worker-220");
+
+        let active = remote_node_to_json(&node, 1000, 0).expect("active node");
+        assert_eq!(active["status"], "active");
+
+        let stale = remote_node_to_json(&node, 1000, FLAG_STALE).expect("stale node");
+        assert_eq!(stale["status"], "stale");
+
+        let deleted = remote_node_to_json(&node, 1000, FLAG_DELETED).expect("deleted node");
+        assert_eq!(deleted["status"], "deleted");
+    }
+}

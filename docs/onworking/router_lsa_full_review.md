@@ -109,16 +109,31 @@ Acceptance:
 
 ## P3 - Tests and operational validation
 
-- [ ] Unit tests:
-  - LSA apply with stale seq/restart seq.
-  - Hive mismatch rejection.
-  - Flag projection for orchestrator API.
+- [x] Unit tests:
+  - [x] LSA apply with stale seq/restart seq.
+  - [x] Hive mismatch rejection.
+  - [x] Flag projection for orchestrator API.
 - [ ] Integration tests:
   - two-hive WAN bootstrap, disconnect/reconnect, stale transition.
   - add/remove hive with LSA freshness gate.
-- [ ] E2E checks:
-  - admin endpoints return real remote router UUID after P2.
-  - stale transitions visible through API.
+- [x] E2E checks:
+  - [x] admin endpoints return real remote router UUID after P2.
+  - [x] add_hive/list_nodes/list_routers/router-cycle/storage-cycle validated via `scripts/admin_nodes_routers_storage_e2e.sh`.
+  - [ ] stale transitions visible through API.
+
+Implemented tests:
+- `src/router/mod.rs`:
+  - `lsa_rejects_hive_mismatch`
+  - `lsa_sequence_resets_on_new_session_epoch`
+  - `lsa_uses_peer_identity_when_payload_identity_missing`
+- `src/bin/sy_orchestrator.rs`:
+  - `remote_routers_projection_uses_real_uuid_and_name`
+  - `remote_node_projection_reports_status_from_flags`
+
+Operational integration script prepared:
+- `scripts/admin_wan_stale_recovery_e2e.sh`
+  - validates `alive -> stale -> alive` via admin API against a real worker hive.
+  - validates remote router UUID remains non-nil after recovery.
 
 ## Suggested delivery order
 
@@ -130,4 +145,4 @@ Acceptance:
 ## Notes
 
 - Existing docs still reference older naming in some sections (`json-router` paths); keep this review focused on LSA behavior first.
-- Current UUID `0000...` is expected with current model and should be treated as temporary technical debt, not as a random runtime glitch.
+- If remote router UUID appears as `0000...` after P2, treat it as deployment/version drift between mother/worker (not expected steady-state behavior).

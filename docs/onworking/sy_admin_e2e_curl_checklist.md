@@ -185,3 +185,22 @@ Opcionales:
 - `RUN_NODE_CYCLE=0` para desactivar run/kill de runtime.
 - `NODE_RUNTIME=wf.echo NODE_VERSION=current` para runtime específico.
 - `SKIP_NODE_IF_RUNTIME_MISSING=1` para entorno sin runtime-manifest/assets.
+
+## 11) WAN stale/recovery E2E (router remoto)
+
+Script automatizado para validar transicion:
+- `alive -> stale` (al detener router remoto)
+- `stale -> alive` (al levantar router remoto)
+- UUID remoto no-nil despues de recovery
+
+```bash
+BASE="http://127.0.0.1:8080" \
+HIVE_ID="worker-220" \
+bash scripts/admin_wan_stale_recovery_e2e.sh
+```
+
+Opcionales:
+- `STALE_TIMEOUT_SECS=90` (default `90`)
+- `RECOVERY_TIMEOUT_SECS=60` (default `60`)
+- `POLL_INTERVAL_SECS=2`
+- `AUTO_RECOVER_ON_EXIT=1` (intenta levantar router si el script se interrumpe tras un kill)

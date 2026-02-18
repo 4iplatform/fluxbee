@@ -4032,3 +4032,142 @@ fn should_publish_turn(msg: &Message) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn lsa_payload(hive: &str, seq: u64, router_id: &str, router_name: &str) -> LsaPayload {
+        LsaPayload {
+            hive: hive.to_string(),
+            router_id: router_id.to_string(),
+            router_name: router_name.to_string(),
+            seq,
+            timestamp: "0".to_string(),
+            nodes: Vec::new(),
+            routes: Vec::new(),
+            vpns: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn lsa_rejects_hive_mismatch() {
+        let lsa_state = Arc::new(Mutex::new(HashMap::<String, RemoteHiveState>::new()));
+        let peer_router_uuid = Uuid::new_v4();
+
+        let result = apply_lsa_payload(
+            &lsa_state,
+            "worker-220",
+            peer_router_uuid,
+            "RT.gateway@worker-220",
+            1,
+            lsa_payload(
+                "sandbox",
+                1,
+                &peer_router_uuid.to_string(),
+                "RT.gateway@sandbox",
+            ),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            LsaApplyResult::Rejected {
+                reason: LSA_REJECT_HIVE_MISMATCH,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn lsa_sequence_resets_on_new_session_epoch() {
+        let lsa_state = Arc::new(Mutex::new(HashMap::<String, RemoteHiveState>::new()));
+        let peer_router_uuid = Uuid::new_v4();
+        let peer_router_name = "RT.gateway@worker-220";
+        let expected_hive = "worker-220";
+
+        let first = apply_lsa_payload(
+            &lsa_state,
+            expected_hive,
+            peer_router_uuid,
+            peer_router_name,
+            1,
+            lsa_payload(
+                expected_hive,
+                10,
+                &peer_router_uuid.to_string(),
+                peer_router_name,
+            ),
+        )
+        .await;
+        assert!(matches!(first, LsaApplyResult::Applied));
+
+        let stale_same_session = apply_lsa_payload(
+            &lsa_state,
+            expected_hive,
+            peer_router_uuid,
+            peer_router_name,
+            1,
+            lsa_payload(
+                expected_hive,
+                2,
+                &peer_router_uuid.to_string(),
+                peer_router_name,
+            ),
+        )
+        .await;
+        assert!(matches!(
+            stale_same_session,
+            LsaApplyResult::Rejected {
+                reason: LSA_REJECT_STALE_SEQ,
+                ..
+            }
+        ));
+
+        let after_reconnect = apply_lsa_payload(
+            &lsa_state,
+            expected_hive,
+            peer_router_uuid,
+            peer_router_name,
+            2,
+            lsa_payload(
+                expected_hive,
+                2,
+                &peer_router_uuid.to_string(),
+                peer_router_name,
+            ),
+        )
+        .await;
+        assert!(matches!(after_reconnect, LsaApplyResult::Applied));
+
+        let guard = lsa_state.lock().await;
+        let entry = guard.get(expected_hive).expect("missing hive state");
+        assert_eq!(entry.session_epoch, 2);
+        assert_eq!(entry.last_seq, 2);
+    }
+
+    #[tokio::test]
+    async fn lsa_uses_peer_identity_when_payload_identity_missing() {
+        let lsa_state = Arc::new(Mutex::new(HashMap::<String, RemoteHiveState>::new()));
+        let peer_router_uuid = Uuid::new_v4();
+        let peer_router_name = "RT.gateway@worker-220";
+        let expected_hive = "worker-220";
+
+        let result = apply_lsa_payload(
+            &lsa_state,
+            expected_hive,
+            peer_router_uuid,
+            peer_router_name,
+            1,
+            lsa_payload(expected_hive, 1, "", ""),
+        )
+        .await;
+        assert!(matches!(result, LsaApplyResult::Applied));
+
+        let guard = lsa_state.lock().await;
+        let entry = guard.get(expected_hive).expect("missing hive state");
+        assert_eq!(entry.router_uuid, *peer_router_uuid.as_bytes());
+        assert_eq!(entry.router_name, peer_router_name);
+    }
+}
