@@ -1804,9 +1804,19 @@ fn add_hive_flow(
     }
 
     let wan_listen = state.wan_listen.clone().unwrap_or_default();
+    let worker_uplink = match resolve_worker_uplink_address(&wan_listen, address) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "CONFIG_FAILED",
+                "message": format!("resolve worker uplink failed: {err}"),
+            });
+        }
+    };
     let hive_yaml = format!(
         "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\n",
-        hive_id, wan_listen
+        hive_id, worker_uplink
     );
     if let Err(err) = write_remote_file(address, &key_path, "/etc/fluxbee/hive.yaml", &hive_yaml) {
         return serde_json::json!({
@@ -2234,6 +2244,51 @@ fn remote_hive_match(entry: &RemoteHiveEntry, target: &str) -> bool {
     let len = entry.hive_id_len as usize;
     let name = String::from_utf8_lossy(&entry.hive_id[..len]);
     name == target
+}
+
+fn resolve_worker_uplink_address(
+    wan_listen: &str,
+    worker_address: &str,
+) -> Result<String, OrchestratorError> {
+    let listen = wan_listen.trim();
+    if listen.is_empty() {
+        return Err("wan.listen empty".into());
+    }
+
+    let (host, port) = parse_host_port(listen)?;
+    if host == "0.0.0.0" || host == "::" || host == "[::]" || host == "*" {
+        let src = detect_source_ip_for_target(worker_address)?;
+        return Ok(format!("{src}:{port}"));
+    }
+    Ok(format!("{host}:{port}"))
+}
+
+fn parse_host_port(listen: &str) -> Result<(String, u16), OrchestratorError> {
+    if let Ok(addr) = listen.parse::<std::net::SocketAddr>() {
+        return Ok((addr.ip().to_string(), addr.port()));
+    }
+    if let Some((host, port_raw)) = listen.rsplit_once(':') {
+        let port = port_raw
+            .parse::<u16>()
+            .map_err(|_| format!("invalid port in wan.listen: {listen}"))?;
+        return Ok((host.trim().to_string(), port));
+    }
+    Ok((listen.to_string(), 9000))
+}
+
+fn detect_source_ip_for_target(target: &str) -> Result<String, OrchestratorError> {
+    let mut cmd = Command::new("ip");
+    cmd.arg("-4").arg("route").arg("get").arg(target);
+    let out = run_cmd_output(cmd, "ip route get")?;
+    let mut parts = out.split_whitespace();
+    while let Some(part) = parts.next() {
+        if part == "src" {
+            if let Some(src) = parts.next() {
+                return Ok(src.to_string());
+            }
+        }
+    }
+    Err(format!("could not resolve source ip for target {target}").into())
 }
 
 fn sudo_wrap(cmd: &str) -> String {
