@@ -23,6 +23,7 @@ HIVE_ADDR="${HIVE_ADDR:-192.168.8.220}"
 STALE_TIMEOUT_SECS="${STALE_TIMEOUT_SECS:-120}"
 RECOVERY_TIMEOUT_SECS="${RECOVERY_TIMEOUT_SECS:-60}"
 POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-2}"
+CHECK_OPA_NODE="${CHECK_OPA_NODE:-1}"
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -120,6 +121,29 @@ assert_eq() {
   fi
 }
 
+assert_node_present() {
+  local file="$1"
+  local expected_name="$2"
+  python3 - "$file" "$expected_name" <<'PY'
+import json
+import sys
+
+path, expected = sys.argv[1], sys.argv[2]
+data = json.load(open(path, "r", encoding="utf-8"))
+nodes = (
+    data.get("payload", {}).get("nodes", [])
+    if isinstance(data, dict)
+    else []
+)
+for node in nodes:
+    if isinstance(node, dict) and node.get("name") == expected:
+        print("ok")
+        raise SystemExit(0)
+print("")
+raise SystemExit(1)
+PY
+}
+
 require_cmd curl
 require_cmd python3
 require_cmd bash
@@ -158,6 +182,16 @@ assert_eq "$(json_get "status" "$add_body")" "ok" "POST /hives/status"
 assert_eq "$(json_get "payload.wan_connected" "$add_body")" "true" "POST /hives/payload.wan_connected"
 echo "OK: add_hive passed with WAN freshness (wan_connected=true)"
 
+if [[ "$CHECK_OPA_NODE" == "1" ]]; then
+  nodes_after_add="$tmpdir/nodes_after_add.json"
+  status="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes" "$nodes_after_add")"
+  log_http_response "$status" "$nodes_after_add"
+  assert_eq "$status" "200" "GET /hives/{id}/nodes after add/http"
+  assert_eq "$(json_get "status" "$nodes_after_add")" "ok" "GET /hives/{id}/nodes after add/status"
+  assert_node_present "$nodes_after_add" "SY.opa.rules@$HIVE_ID" >/dev/null
+  echo "OK: OPA node present after add_hive (SY.opa.rules@$HIVE_ID)"
+fi
+
 # 3) Stale/recovery integration
 BASE="$BASE" \
 HIVE_ID="$HIVE_ID" \
@@ -166,6 +200,16 @@ RECOVERY_TIMEOUT_SECS="$RECOVERY_TIMEOUT_SECS" \
 POLL_INTERVAL_SECS="$POLL_INTERVAL_SECS" \
 bash scripts/admin_wan_stale_recovery_e2e.sh
 echo "OK: WAN stale/recovery cycle passed"
+
+if [[ "$CHECK_OPA_NODE" == "1" ]]; then
+  nodes_after_wan="$tmpdir/nodes_after_wan.json"
+  status="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes" "$nodes_after_wan")"
+  log_http_response "$status" "$nodes_after_wan"
+  assert_eq "$status" "200" "GET /hives/{id}/nodes after stale-recovery/http"
+  assert_eq "$(json_get "status" "$nodes_after_wan")" "ok" "GET /hives/{id}/nodes after stale-recovery/status"
+  assert_node_present "$nodes_after_wan" "SY.opa.rules@$HIVE_ID" >/dev/null
+  echo "OK: OPA node present after stale/recovery (SY.opa.rules@$HIVE_ID)"
+fi
 
 # 4) remove_hive + NOT_FOUND check
 remove_body="$tmpdir/remove.json"
