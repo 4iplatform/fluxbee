@@ -1606,12 +1606,27 @@ fn add_hive_flow(
     address: &str,
     harden_ssh: bool,
 ) -> serde_json::Value {
+    let root = hives_root();
+    let hive_dir = root.join(hive_id);
     if hive_exists(&state.state_dir, hive_id) {
         return serde_json::json!({
             "status": "error",
             "error_code": "HIVE_EXISTS",
             "message": "hive already exists",
         });
+    }
+    if hive_partial_exists(hive_id) {
+        tracing::warn!(
+            hive_id = hive_id,
+            "stale hive state detected (missing info.yaml); cleaning before bootstrap"
+        );
+        if let Err(err) = fs::remove_dir_all(&hive_dir) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "IO_ERROR",
+                "message": format!("failed to clean stale hive dir: {err}"),
+            });
+        }
     }
     if !valid_hive_id(hive_id) {
         return serde_json::json!({
@@ -1639,7 +1654,6 @@ fn add_hive_flow(
         return ssh_bootstrap_error_payload(&err.to_string());
     }
 
-    let hive_dir = hives_root().join(hive_id);
     if let Err(err) = fs::create_dir_all(&hive_dir) {
         return serde_json::json!({
             "status": "error",
@@ -1935,7 +1949,12 @@ fn ssh_bootstrap_error_payload(error: &str) -> serde_json::Value {
 
 fn hive_exists(state_dir: &Path, hive_id: &str) -> bool {
     let _ = state_dir;
-    hives_root().join(hive_id).exists()
+    hives_root().join(hive_id).join("info.yaml").exists()
+}
+
+fn hive_partial_exists(hive_id: &str) -> bool {
+    let dir = hives_root().join(hive_id);
+    dir.exists() && !dir.join("info.yaml").exists()
 }
 
 fn valid_hive_id(value: &str) -> bool {

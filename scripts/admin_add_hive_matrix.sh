@@ -149,11 +149,11 @@ items = data.get("payload", {}).get("hives", [])
 if not items:
     print("")
     raise SystemExit(0)
-first = items[0]
-if isinstance(first, dict):
-    print(first.get("hive_id", ""))
-else:
-    print("")
+for item in items:
+    if isinstance(item, dict) and item.get("hive_id") and item.get("address"):
+        print(item.get("hive_id", ""))
+        raise SystemExit(0)
+print("")
 PY
 )"
 
