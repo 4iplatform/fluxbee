@@ -1916,20 +1916,23 @@ fn add_hive_flow(
         if let Err(err) = ssh_with_key(
             address,
             &key_path,
-            &sudo_wrap(&format!("systemctl start {name}")),
+            &sudo_wrap(&format!("systemctl restart {name}")),
             BOOTSTRAP_SSH_USER,
         ) {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SERVICE_FAILED",
-                "message": format!("start {name}: {err}"),
+                "message": format!("restart {name}: {err}"),
             });
         }
     }
 
     let mut wan_connected = true;
-    if wait_for_wan(&state.hive_id, hive_id, Duration::from_secs(60)).is_err() {
+    let mut wan_wait_error = None;
+    if let Err(err) = wait_for_wan(&state.hive_id, hive_id, Duration::from_secs(60)) {
+        tracing::warn!(hive_id = hive_id, error = %err, "worker WAN did not become ready in time");
         wan_connected = false;
+        wan_wait_error = Some(err.to_string());
     }
 
     let info_path = hives_root().join(hive_id).join("info.yaml");
@@ -1949,9 +1952,11 @@ fn add_hive_flow(
     }
 
     if !wan_connected {
+        let detail = wan_wait_error.unwrap_or_else(|| "wan timeout".to_string());
         return serde_json::json!({
             "status": "error",
             "error_code": "WAN_TIMEOUT",
+            "message": detail,
             "hive_id": hive_id,
             "address": address,
             "harden_ssh": harden_ssh,
@@ -2246,8 +2251,17 @@ fn wait_for_wan(
     let shm_name = format!("/jsr-lsa-{}", hive_id);
     let reader = LsaRegionReader::open_read_only(&shm_name)?;
     let deadline = Instant::now() + timeout;
+    let mut last_visible: Vec<String> = Vec::new();
     while Instant::now() < deadline {
         if let Some(snapshot) = reader.read_snapshot() {
+            let mut visible: Vec<String> = snapshot
+                .hives
+                .iter()
+                .filter_map(remote_hive_name)
+                .collect();
+            visible.sort();
+            visible.dedup();
+            last_visible = visible;
             if snapshot
                 .hives
                 .iter()
@@ -2258,7 +2272,15 @@ fn wait_for_wan(
         }
         std::thread::sleep(Duration::from_secs(1));
     }
-    Err("wan timeout".into())
+    if last_visible.is_empty() {
+        Err(format!("wan timeout: no remote hives observed in lsa for '{remote_id}'").into())
+    } else {
+        Err(format!(
+            "wan timeout: remote hive '{remote_id}' not found in lsa (visible: {})",
+            last_visible.join(", ")
+        )
+        .into())
+    }
 }
 
 fn remote_hive_match(entry: &RemoteHiveEntry, target: &str) -> bool {
@@ -2268,6 +2290,14 @@ fn remote_hive_match(entry: &RemoteHiveEntry, target: &str) -> bool {
     let len = entry.hive_id_len as usize;
     let name = String::from_utf8_lossy(&entry.hive_id[..len]);
     name == target
+}
+
+fn remote_hive_name(entry: &RemoteHiveEntry) -> Option<String> {
+    if entry.hive_id_len == 0 {
+        return None;
+    }
+    let len = entry.hive_id_len as usize;
+    Some(String::from_utf8_lossy(&entry.hive_id[..len]).into_owned())
 }
 
 fn resolve_worker_uplink_address(
