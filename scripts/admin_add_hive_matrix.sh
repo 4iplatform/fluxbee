@@ -27,16 +27,27 @@ require_cmd() {
 
 json_get() {
   local key="$1"
-  python3 - "$key" <<'PY'
+  local file="$2"
+  python3 - "$key" "$file" <<'PY'
 import json
 import sys
 key = sys.argv[1]
+path = sys.argv[2]
 try:
-    data = json.load(sys.stdin)
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 except Exception:
     print("")
     raise SystemExit(0)
-value = data.get(key, "")
+
+value = data
+for part in key.split("."):
+    if isinstance(value, dict):
+        value = value.get(part, "")
+    else:
+        value = ""
+        break
+
 if isinstance(value, (dict, list)):
     print(json.dumps(value))
 else:
@@ -101,7 +112,10 @@ body="$tmpdir/invalid_address.json"
 hid="e2e-invalid-address-$RANDOM"
 status="$(call_post_hives "{\"hive_id\":\"$hid\",\"address\":\"bad address\"}" "$body")"
 log_http_response "$status" "$body"
-code="$(cat "$body" | json_get "error_code")"
+code="$(json_get "error_code" "$body")"
+if [[ -z "$code" ]]; then
+  code="$(json_get "payload.error_code" "$body")"
+fi
 assert_eq "$status" "400" "INVALID_ADDRESS/http"
 assert_eq "$code" "INVALID_ADDRESS" "INVALID_ADDRESS/code"
 echo "OK: INVALID_ADDRESS -> HTTP 400"
@@ -110,7 +124,10 @@ echo "OK: INVALID_ADDRESS -> HTTP 400"
 body="$tmpdir/invalid_hive_id.json"
 status="$(call_post_hives "{\"hive_id\":\"bad id\",\"address\":\"127.0.0.1\"}" "$body")"
 log_http_response "$status" "$body"
-code="$(cat "$body" | json_get "error_code")"
+code="$(json_get "error_code" "$body")"
+if [[ -z "$code" ]]; then
+  code="$(json_get "payload.error_code" "$body")"
+fi
 assert_eq "$status" "400" "INVALID_HIVE_ID/http"
 assert_eq "$code" "INVALID_HIVE_ID" "INVALID_HIVE_ID/code"
 echo "OK: INVALID_HIVE_ID -> HTTP 400"
@@ -144,7 +161,10 @@ if [[ -n "$existing_hive" ]]; then
   body="$tmpdir/hive_exists.json"
   status="$(call_post_hives "{\"hive_id\":\"$existing_hive\",\"address\":\"127.0.0.1\"}" "$body")"
   log_http_response "$status" "$body"
-  code="$(cat "$body" | json_get "error_code")"
+  code="$(json_get "error_code" "$body")"
+  if [[ -z "$code" ]]; then
+    code="$(json_get "payload.error_code" "$body")"
+  fi
   assert_eq "$status" "409" "HIVE_EXISTS/http"
   assert_eq "$code" "HIVE_EXISTS" "HIVE_EXISTS/code"
   echo "OK: HIVE_EXISTS -> HTTP 409"
@@ -157,7 +177,10 @@ body="$tmpdir/ssh_error.json"
 hid="e2e-ssh-$RANDOM"
 status="$(call_post_hives "{\"hive_id\":\"$hid\",\"address\":\"$SSH_TEST_ADDRESS\"}" "$body")"
 log_http_response "$status" "$body"
-code="$(cat "$body" | json_get "error_code")"
+code="$(json_get "error_code" "$body")"
+if [[ -z "$code" ]]; then
+  code="$(json_get "payload.error_code" "$body")"
+fi
 if [[ "$status" != "502" && "$status" != "504" ]]; then
   echo "FAIL [SSH_*/http]: expected 502 or 504, got '$status'" >&2
   cat "$body" >&2
