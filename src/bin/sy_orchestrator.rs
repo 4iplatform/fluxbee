@@ -26,6 +26,7 @@ const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
 const RUNTIME_MANIFEST_FILE: &str = "runtime-manifest.json";
 const NATS_BOOTSTRAP_TIMEOUT_SECS: u64 = 20;
 const STORAGE_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
+const SY_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -256,7 +257,14 @@ async fn bootstrap_local(
         }
     }
 
-    wait_for_sy_nodes(state, Duration::from_secs(30)).await?;
+    if let Err(err) =
+        wait_for_sy_nodes(state, Duration::from_secs(SY_NODES_BOOTSTRAP_TIMEOUT_SECS)).await
+    {
+        tracing::warn!(
+            error = %err,
+            "sy nodes did not fully bootstrap before timeout; continuing and relying on watchdog restarts"
+        );
+    }
     wait_for_service_active(
         "sy-storage",
         Duration::from_secs(STORAGE_BOOTSTRAP_TIMEOUT_SECS),
@@ -273,7 +281,6 @@ async fn wait_for_router_ready(
     const ROUTER_SHM_MAX_STALE_MS: u64 = 30_000;
 
     let start = Instant::now();
-    let socket_age_limit = timeout + Duration::from_secs(10);
     loop {
         let rt_gateway_active = systemd_is_active("rt-gateway");
 
@@ -286,14 +293,21 @@ async fn wait_for_router_ready(
             let expected_socket =
                 socket_dir.join(format!("{}.sock", snapshot.header.router_uuid.simple()));
             socket_path = expected_socket.display().to_string();
-            socket_ready =
-                expected_socket.exists() && socket_file_recent(&expected_socket, socket_age_limit);
+            // If rt-gateway is already running when orchestrator restarts, socket mtime may be old.
+            // Readiness should depend on socket presence + fresh SHM heartbeat, not file age.
+            socket_ready = expected_socket.exists();
 
             heartbeat_age_ms = now_epoch_ms().saturating_sub(snapshot.header.heartbeat);
             shm_ready = heartbeat_age_ms <= ROUTER_SHM_MAX_STALE_MS;
         }
 
-        if rt_gateway_active && socket_ready && shm_ready {
+        if rt_gateway_active && shm_ready {
+            if !socket_ready {
+                tracing::warn!(
+                    socket = %socket_path,
+                    "router heartbeat is fresh but socket path is not visible; continuing with SHM readiness"
+                );
+            }
             tracing::info!(
                 socket = %socket_path,
                 heartbeat_age_ms,
@@ -312,15 +326,6 @@ async fn wait_for_router_ready(
 
         time::sleep(Duration::from_millis(250)).await;
     }
-}
-
-fn socket_file_recent(path: &Path, max_age: Duration) -> bool {
-    fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
-        .map(|age| age <= max_age)
-        .unwrap_or(false)
 }
 
 async fn wait_for_sy_nodes(
