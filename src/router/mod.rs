@@ -76,6 +76,10 @@ pub struct Router {
 const NATS_READY_TIMEOUT_SECS: u64 = 20;
 const NATS_READY_RETRY_MS: u64 = 250;
 const NATS_PUBLISH_ERROR_LOG_EVERY: u64 = 25;
+const LSA_REJECT_HIVE_MISMATCH: &str = "hive_mismatch";
+const LSA_REJECT_STALE_SEQ: &str = "stale_seq";
+const LSA_REJECT_PARSE_ERROR: &str = "parse_error";
+const LSA_REJECT_UNAUTHORIZED: &str = "unauthorized";
 
 impl Router {
     pub fn new(cfg: RouterConfig) -> Self {
@@ -346,6 +350,8 @@ impl Router {
                 broadcast_cache: Arc::clone(&self.broadcast_cache),
                 lsa_seq: Arc::clone(&self.lsa_seq),
                 opa: Arc::clone(&self.opa),
+                wan_session_epochs: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                lsa_reject_counters: Arc::new(Mutex::new(std::collections::HashMap::new())),
             });
             if let Some(listen) = self.cfg.wan_listen.clone() {
                 let ctx_listen = Arc::clone(&ctx);
@@ -553,6 +559,7 @@ async fn handle_node(
     if is_gateway {
         let _ = broadcast_lsa_direct(
             router_uuid,
+            router_name,
             hive_id,
             &nodes,
             &peer_nodes,
@@ -661,6 +668,7 @@ async fn handle_node(
                             if is_gateway {
                                 let _ = broadcast_lsa_direct(
                                     router_uuid,
+                                    router_name,
                                     hive_id,
                                     &nodes,
                                     &peer_nodes,
@@ -765,6 +773,7 @@ async fn handle_node(
     if is_gateway {
         let _ = broadcast_lsa_direct(
             router_uuid,
+            router_name,
             hive_id,
             &nodes,
             &peer_nodes,
@@ -1270,6 +1279,8 @@ fn action_from_label(label: &str) -> Option<u8> {
 }
 
 async fn build_local_lsa_payload(
+    router_uuid: Uuid,
+    router_name: &str,
     hive_id: &str,
     seq: u64,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
@@ -1339,6 +1350,8 @@ async fn build_local_lsa_payload(
     }
     LsaPayload {
         hive: hive_id.to_string(),
+        router_id: router_uuid.to_string(),
+        router_name: router_name.to_string(),
         seq,
         timestamp: now_epoch_ms().to_string(),
         nodes,
@@ -1360,6 +1373,8 @@ async fn broadcast_lsa(ctx: &WanContext, target_hive: Option<&str>) -> Result<()
     let seq = *seq_guard;
     drop(seq_guard);
     let payload = build_local_lsa_payload(
+        ctx.router_uuid,
+        &ctx.router_name,
         &ctx.hive_id,
         seq,
         &ctx.nodes,
@@ -1388,6 +1403,7 @@ async fn broadcast_lsa(ctx: &WanContext, target_hive: Option<&str>) -> Result<()
 
 async fn broadcast_lsa_direct(
     router_uuid: Uuid,
+    router_name: &str,
     hive_id: &str,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
@@ -1407,8 +1423,17 @@ async fn broadcast_lsa_direct(
     *seq_guard = seq_guard.saturating_add(1);
     let seq = *seq_guard;
     drop(seq_guard);
-    let payload =
-        build_local_lsa_payload(hive_id, seq, nodes, peer_nodes, static_routes, vpn_rules).await;
+    let payload = build_local_lsa_payload(
+        router_uuid,
+        router_name,
+        hive_id,
+        seq,
+        nodes,
+        peer_nodes,
+        static_routes,
+        vpn_rules,
+    )
+    .await;
     for (_hive, peer) in peers {
         let msg = build_lsa(
             &router_uuid.to_string(),
@@ -1422,22 +1447,87 @@ async fn broadcast_lsa_direct(
     Ok(())
 }
 
+#[derive(Debug)]
+enum LsaApplyResult {
+    Applied,
+    Rejected {
+        reason: &'static str,
+        payload_hive: String,
+        seq: u64,
+        last_seq: u64,
+        session_epoch: u64,
+    },
+}
+
+async fn bump_lsa_reject_counter(ctx: &WanContext, reason: &'static str) -> u64 {
+    let mut guard = ctx.lsa_reject_counters.lock().await;
+    let value = guard.entry(reason.to_string()).or_insert(0);
+    *value = value.saturating_add(1);
+    *value
+}
+
 async fn apply_lsa_payload(
     lsa_state: &Arc<Mutex<std::collections::HashMap<String, RemoteHiveState>>>,
+    expected_hive: &str,
+    peer_router_uuid: Uuid,
+    peer_router_name: &str,
+    session_epoch: u64,
     payload: LsaPayload,
-) -> bool {
-    let mut state_guard = lsa_state.lock().await;
-    let entry = state_guard.entry(payload.hive.clone()).or_default();
-    if payload.seq <= entry.last_seq {
-        return false;
+) -> LsaApplyResult {
+    if payload.hive != expected_hive {
+        return LsaApplyResult::Rejected {
+            reason: LSA_REJECT_HIVE_MISMATCH,
+            payload_hive: payload.hive,
+            seq: payload.seq,
+            last_seq: 0,
+            session_epoch,
+        };
     }
+
+    let mut state_guard = lsa_state.lock().await;
+    let entry = state_guard.entry(expected_hive.to_string()).or_default();
+    if entry.session_epoch != session_epoch {
+        entry.session_epoch = session_epoch;
+        entry.last_seq = 0;
+    }
+    if payload.seq <= entry.last_seq {
+        return LsaApplyResult::Rejected {
+            reason: LSA_REJECT_STALE_SEQ,
+            payload_hive: payload.hive,
+            seq: payload.seq,
+            last_seq: entry.last_seq,
+            session_epoch: entry.session_epoch,
+        };
+    }
+    let router_uuid = if payload.router_id.is_empty() {
+        peer_router_uuid
+    } else {
+        match Uuid::parse_str(&payload.router_id) {
+            Ok(router_uuid) => router_uuid,
+            Err(_) => {
+                return LsaApplyResult::Rejected {
+                    reason: LSA_REJECT_PARSE_ERROR,
+                    payload_hive: payload.hive,
+                    seq: payload.seq,
+                    last_seq: entry.last_seq,
+                    session_epoch: entry.session_epoch,
+                };
+            }
+        }
+    };
     entry.last_seq = payload.seq;
     entry.last_updated = now_epoch_ms();
     entry.flags &= !FLAG_STALE;
+    entry.router_uuid = *router_uuid.as_bytes();
+    entry.router_name = if payload.router_name.is_empty() {
+        peer_router_name.to_string()
+    } else {
+        payload.router_name.clone()
+    };
     entry.nodes = payload.nodes;
     entry.routes = payload.routes;
     entry.vpns = payload.vpns;
-    true
+    LsaApplyResult::Applied
 }
 
 async fn write_lsa_state(
@@ -1466,6 +1556,9 @@ async fn write_lsa_state(
         let mut hive_entry = RemoteHiveEntry {
             hive_id: [0u8; 64],
             hive_id_len: 0,
+            router_uuid: state.router_uuid,
+            router_name: [0u8; 64],
+            router_name_len: 0,
             last_lsa_seq: state.last_seq,
             last_updated: state.last_updated,
             flags: state.flags,
@@ -1474,6 +1567,8 @@ async fn write_lsa_state(
             vpn_count: state.vpns.len() as u32,
         };
         hive_entry.hive_id_len = copy_bytes_with_len(&mut hive_entry.hive_id, hive_id) as u16;
+        hive_entry.router_name_len =
+            copy_bytes_with_len(&mut hive_entry.router_name, &state.router_name) as u16;
         hive_entries.push(hive_entry);
 
         for node in state.nodes.iter() {
@@ -1702,6 +1797,7 @@ async fn handle_wan_connection(
     }
     let peer_hello: WanHelloPayload = serde_json::from_value(msg.payload)?;
     if !ctx.authorized_hives.is_empty() && !ctx.authorized_hives.contains(&peer_hello.hive_id) {
+        let reject_count = bump_lsa_reject_counter(ctx.as_ref(), LSA_REJECT_UNAUTHORIZED).await;
         let reject = build_wan_reject(
             &ctx.router_uuid.to_string(),
             &peer_hello.router_id,
@@ -1712,6 +1808,12 @@ async fn handle_wan_connection(
             },
         );
         let _ = tx.send(serde_json::to_vec(&reject)?);
+        tracing::warn!(
+            peer_hive = %peer_hello.hive_id,
+            peer_router_id = %peer_hello.router_id,
+            reject_count = reject_count,
+            "wan peer rejected: hive not authorized"
+        );
         writer_task.abort();
         return Ok(());
     }
@@ -1726,6 +1828,16 @@ async fn handle_wan_connection(
     }
 
     let peer_uuid = Uuid::parse_str(&peer_hello.router_id)?;
+    let session_epoch = {
+        let mut guard = ctx.wan_session_epochs.lock().await;
+        let next = guard
+            .get(&peer_hello.hive_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        guard.insert(peer_hello.hive_id.clone(), next);
+        next
+    };
     let accept = build_wan_accept(
         &ctx.router_uuid.to_string(),
         &peer_hello.router_id,
@@ -1748,7 +1860,6 @@ async fn handle_wan_connection(
             WanPeer {
                 sender: tx.clone(),
                 router_uuid: peer_uuid,
-                hive_id: peer_hello.hive_id.clone(),
             },
         );
     }
@@ -1757,11 +1868,31 @@ async fn handle_wan_connection(
 
     loop {
         match read_frame(&mut reader).await? {
-            Some(frame) => {
-                if let Ok(msg) = serde_json::from_slice::<Message>(&frame) {
-                    handle_wan_message(&msg, &tx, &ctx).await?;
+            Some(frame) => match serde_json::from_slice::<Message>(&frame) {
+                Ok(msg) => {
+                    handle_wan_message(
+                        &msg,
+                        &tx,
+                        &ctx,
+                        &peer_hello.hive_id,
+                        peer_uuid,
+                        &peer_hello.router_name,
+                        session_epoch,
+                    )
+                    .await?;
                 }
-            }
+                Err(err) => {
+                    let reject_count =
+                        bump_lsa_reject_counter(ctx.as_ref(), LSA_REJECT_PARSE_ERROR).await;
+                    tracing::warn!(
+                        peer_hive = %peer_hello.hive_id,
+                        session_epoch = session_epoch,
+                        reject_count = reject_count,
+                        error = %err,
+                        "wan frame parse error"
+                    );
+                }
+            },
             None => break,
         }
     }
@@ -1777,12 +1908,59 @@ async fn handle_wan_message(
     msg: &Message,
     sender: &mpsc::UnboundedSender<Vec<u8>>,
     ctx: &WanContext,
+    peer_hive: &str,
+    peer_router_uuid: Uuid,
+    peer_router_name: &str,
+    session_epoch: u64,
 ) -> Result<(), RouterError> {
     if msg.meta.msg_type == SYSTEM_KIND {
         if msg.meta.msg.as_deref() == Some(MSG_LSA) {
-            let payload: LsaPayload = serde_json::from_value(msg.payload.clone())?;
-            if apply_lsa_payload(&ctx.lsa_state, payload).await {
-                write_lsa_state(&ctx.lsa_state, &ctx.lsa_writer, &ctx.lsa_snapshot).await;
+            let payload: LsaPayload = match serde_json::from_value(msg.payload.clone()) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    let reject_count = bump_lsa_reject_counter(ctx, LSA_REJECT_PARSE_ERROR).await;
+                    tracing::warn!(
+                        peer_hive = %peer_hive,
+                        session_epoch = session_epoch,
+                        reject_count = reject_count,
+                        error = %err,
+                        "lsa payload parse error"
+                    );
+                    return Ok(());
+                }
+            };
+            match apply_lsa_payload(
+                &ctx.lsa_state,
+                peer_hive,
+                peer_router_uuid,
+                peer_router_name,
+                session_epoch,
+                payload,
+            )
+            .await
+            {
+                LsaApplyResult::Applied => {
+                    write_lsa_state(&ctx.lsa_state, &ctx.lsa_writer, &ctx.lsa_snapshot).await;
+                }
+                LsaApplyResult::Rejected {
+                    reason,
+                    payload_hive,
+                    seq,
+                    last_seq,
+                    session_epoch,
+                } => {
+                    let reject_count = bump_lsa_reject_counter(ctx, reason).await;
+                    tracing::warn!(
+                        reason = reason,
+                        peer_hive = %peer_hive,
+                        payload_hive = %payload_hive,
+                        seq = seq,
+                        last_seq = last_seq,
+                        session_epoch = session_epoch,
+                        reject_count = reject_count,
+                        "lsa payload rejected"
+                    );
+                }
             }
             return Ok(());
         }
@@ -2796,14 +2974,16 @@ struct PeerHandle {
 struct WanPeer {
     sender: mpsc::UnboundedSender<Vec<u8>>,
     router_uuid: Uuid,
-    hive_id: String,
 }
 
 #[derive(Clone, Debug, Default)]
 struct RemoteHiveState {
+    session_epoch: u64,
     last_seq: u64,
     last_updated: u64,
     flags: u16,
+    router_uuid: [u8; 16],
+    router_name: String,
     nodes: Vec<LsaNode>,
     routes: Vec<LsaRoute>,
     vpns: Vec<LsaVpn>,
@@ -2830,6 +3010,8 @@ struct WanContext {
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
     opa: Arc<Mutex<OpaResolver>>,
+    wan_session_epochs: Arc<Mutex<std::collections::HashMap<String, u64>>>,
+    lsa_reject_counters: Arc<Mutex<std::collections::HashMap<String, u64>>>,
 }
 
 #[derive(Clone, Debug)]

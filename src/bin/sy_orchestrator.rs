@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RemoteHiveEntry, RemoteNodeEntry,
-    RouterRegionReader, ShmSnapshot, HEARTBEAT_STALE_MS,
+    RouterRegionReader, ShmSnapshot, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
 };
 use jsr_client::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
@@ -939,6 +939,7 @@ fn node_name(entry: &NodeEntry) -> String {
 }
 
 fn remote_nodes_for_hive(snapshot: &LsaSnapshot, target_hive: &str) -> Vec<serde_json::Value> {
+    let now = now_epoch_ms();
     let mut out = Vec::new();
     for node in &snapshot.nodes {
         let hive_idx = node.hive_index as usize;
@@ -951,7 +952,13 @@ fn remote_nodes_for_hive(snapshot: &LsaSnapshot, target_hive: &str) -> Vec<serde
         if hive_id != target_hive {
             continue;
         }
-        let Some(node_json) = remote_node_to_json(node, hive_entry.last_updated) else {
+        if remote_hive_is_stale(hive_entry, now) {
+            continue;
+        }
+        if node.flags & (FLAG_DELETED | FLAG_STALE) != 0 {
+            continue;
+        }
+        let Some(node_json) = remote_node_to_json(node, hive_entry.last_updated, node.flags) else {
             continue;
         };
         out.push(node_json);
@@ -959,7 +966,11 @@ fn remote_nodes_for_hive(snapshot: &LsaSnapshot, target_hive: &str) -> Vec<serde
     out
 }
 
-fn remote_node_to_json(entry: &RemoteNodeEntry, connected_at: u64) -> Option<serde_json::Value> {
+fn remote_node_to_json(
+    entry: &RemoteNodeEntry,
+    connected_at: u64,
+    flags: u16,
+) -> Option<serde_json::Value> {
     if entry.name_len == 0 {
         return None;
     }
@@ -971,7 +982,7 @@ fn remote_node_to_json(entry: &RemoteNodeEntry, connected_at: u64) -> Option<ser
         "name": name,
         "vpn_id": entry.vpn_id,
         "connected_at": connected_at,
-        "status": "active",
+        "status": remote_flags_status(flags),
     }))
 }
 
@@ -994,11 +1005,13 @@ fn remote_routers_for_hive(
         if hive_id != target_hive {
             continue;
         }
-        let stale = now.saturating_sub(hive.last_updated) > HEARTBEAT_STALE_MS;
-        let status = if stale { "stale" } else { "alive" };
+        let status = remote_hive_status(hive, now);
+        let router_uuid = Uuid::from_bytes(hive.router_uuid);
+        let router_name =
+            remote_router_name(hive).unwrap_or_else(|| format!("{gateway_base}@{hive_id}"));
         return vec![serde_json::json!({
-            "uuid": Uuid::nil().to_string(),
-            "name": format!("{gateway_base}@{hive_id}"),
+            "uuid": router_uuid.to_string(),
+            "name": router_name,
             "is_gateway": true,
             "nodes_count": hive.node_count,
             "status": status,
@@ -2441,19 +2454,23 @@ fn wait_for_wan(
     let mut last_visible: Vec<String> = Vec::new();
     while Instant::now() < deadline {
         if let Some(snapshot) = reader.read_snapshot() {
+            let now = now_epoch_ms();
             let mut visible: Vec<String> = snapshot
                 .hives
                 .iter()
-                .filter_map(remote_hive_name)
+                .filter_map(|entry| {
+                    let hive = remote_hive_name(entry)?;
+                    let status = remote_hive_status(entry, now);
+                    let age_ms = now.saturating_sub(entry.last_updated);
+                    Some(format!("{hive}({status},age_ms={age_ms})"))
+                })
                 .collect();
             visible.sort();
             visible.dedup();
             last_visible = visible;
-            if snapshot
-                .hives
-                .iter()
-                .any(|entry| remote_hive_match(entry, remote_id))
-            {
+            if snapshot.hives.iter().any(|entry| {
+                remote_hive_match(entry, remote_id) && !remote_hive_is_stale(entry, now)
+            }) {
                 return Ok(());
             }
         }
@@ -2463,7 +2480,7 @@ fn wait_for_wan(
         Err(format!("wan timeout: no remote hives observed in lsa for '{remote_id}'").into())
     } else {
         Err(format!(
-            "wan timeout: remote hive '{remote_id}' not found in lsa (visible: {})",
+            "wan timeout: remote hive '{remote_id}' not fresh/alive in lsa (visible: {})",
             last_visible.join(", ")
         )
         .into())
@@ -2485,6 +2502,39 @@ fn remote_hive_name(entry: &RemoteHiveEntry) -> Option<String> {
     }
     let len = entry.hive_id_len as usize;
     Some(String::from_utf8_lossy(&entry.hive_id[..len]).into_owned())
+}
+
+fn remote_router_name(entry: &RemoteHiveEntry) -> Option<String> {
+    if entry.router_name_len == 0 {
+        return None;
+    }
+    let len = entry.router_name_len as usize;
+    Some(String::from_utf8_lossy(&entry.router_name[..len]).into_owned())
+}
+
+fn remote_flags_status(flags: u16) -> &'static str {
+    if flags & FLAG_DELETED != 0 {
+        "deleted"
+    } else if flags & FLAG_STALE != 0 {
+        "stale"
+    } else {
+        "active"
+    }
+}
+
+fn remote_hive_is_stale(entry: &RemoteHiveEntry, now: u64) -> bool {
+    (entry.flags & (FLAG_DELETED | FLAG_STALE)) != 0
+        || now.saturating_sub(entry.last_updated) > HEARTBEAT_STALE_MS
+}
+
+fn remote_hive_status(entry: &RemoteHiveEntry, now: u64) -> &'static str {
+    if entry.flags & FLAG_DELETED != 0 {
+        "deleted"
+    } else if remote_hive_is_stale(entry, now) {
+        "stale"
+    } else {
+        "alive"
+    }
 }
 
 fn resolve_worker_uplink_address(

@@ -18,7 +18,7 @@ pub const CONFIG_MAGIC: u32 = 0x4A534343; // "JSCC"
 pub const CONFIG_VERSION: u32 = 1;
 
 pub const LSA_MAGIC: u32 = 0x4A534C41; // "JSLA"
-pub const LSA_VERSION: u32 = 1;
+pub const LSA_VERSION: u32 = 2;
 
 pub const OPA_MAGIC: u32 = 0x4A534F50; // "JSOP"
 pub const OPA_VERSION: u32 = 1;
@@ -241,6 +241,9 @@ pub struct OpaHeader {
 pub struct RemoteHiveEntry {
     pub hive_id: [u8; 64],
     pub hive_id_len: u16,
+    pub router_uuid: [u8; 16],
+    pub router_name: [u8; 64],
+    pub router_name_len: u16,
 
     pub last_lsa_seq: u64,
     pub last_updated: u64,
@@ -1657,6 +1660,9 @@ fn empty_remote_hive() -> RemoteHiveEntry {
     RemoteHiveEntry {
         hive_id: [0u8; 64],
         hive_id_len: 0,
+        router_uuid: [0u8; 16],
+        router_name: [0u8; 64],
+        router_name_len: 0,
         last_lsa_seq: 0,
         last_updated: 0,
         flags: 0,

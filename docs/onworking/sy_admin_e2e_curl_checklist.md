@@ -87,6 +87,8 @@ curl -sS -X DELETE "$BASE/hives/$HIVE_ID/routers/rt-gateway"
 Esperado:
 - `list_routers` responde `status=ok`
 - en hive remoto, el `name` debe quedar con sufijo `@{hive}` (ej: `RT.gateway@worker-220`), no `@sandbox`.
+- en hive remoto, `uuid` debe venir del router remoto (no `00000000-0000-0000-0000-000000000000`).
+  Si aparece nil UUID, revisar mismatch de versiones/instalacion entre mother y worker.
 - start/stop router responde `status=ok`
 
 ## 4) Node remoto por hive

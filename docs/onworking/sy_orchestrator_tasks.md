@@ -34,6 +34,8 @@ Checklist operativo para cerrar SY.orchestrator segun:
 - [ ] Validacion explicita de readiness profunda de `sy-storage` (hoy valida servicio activo; falta validar DB conectada al inicio).
 - [ ] Tests de integracion de `RUNTIME_UPDATE` + `SPAWN_NODE` remoto con worker real.
 - [ ] Homogeneizar documentacion vieja de bootstrap (`root` vs `administrator`, ejemplos legacy y paths `/json-router`).
+- [ ] Cierre completo de LSA router/WAN (estado, seguridad, secuencia y UUID remoto):
+  - Ver plan detallado en `docs/onworking/router_lsa_full_review.md`.
 
 ## Notas de compatibilidad
 - API admin actual (`run_node`, `kill_node`, `run_router`, `kill_router`, `add_hive`) se mantiene compatible.

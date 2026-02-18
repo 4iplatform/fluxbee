@@ -161,6 +161,10 @@ pub struct ConfigChangedPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LsaPayload {
     pub hive: String,
+    #[serde(default)]
+    pub router_id: String,
+    #[serde(default)]
+    pub router_name: String,
     pub seq: u64,
     pub timestamp: String,
     pub nodes: Vec<LsaNode>,
