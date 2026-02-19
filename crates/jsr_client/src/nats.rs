@@ -3,9 +3,10 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
 const CONNECT_LINE: &str = "CONNECT {\"lang\":\"rust\",\"version\":\"0.1\",\"verbose\":false,\"pedantic\":false,\"tls_required\":false}\r\n";
+const NATS_LOG_LINE_MAX_LEN: usize = 220;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NatsError {
@@ -46,10 +47,42 @@ pub async fn request(
     sid: u32,
     timeout_duration: Duration,
 ) -> Result<Vec<u8>, NatsError> {
+    let request_started = Instant::now();
+    tracing::info!(
+        endpoint = %endpoint,
+        request_subject = %request_subject,
+        response_subject = %response_subject,
+        sid = sid,
+        timeout_ms = timeout_duration.as_millis() as u64,
+        request_bytes = request_payload.len(),
+        "nats request start"
+    );
+
     let addr = endpoint_to_addr(endpoint)?;
+    let connect_started = Instant::now();
     let stream = timeout(timeout_duration, TcpStream::connect(&addr))
         .await
-        .map_err(|_| NatsError::Timeout(format!("connect timeout to {endpoint}")))??;
+        .map_err(|_| {
+            tracing::warn!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                timeout_ms = timeout_duration.as_millis() as u64,
+                elapsed_ms = connect_started.elapsed().as_millis() as u64,
+                "nats request connect timeout"
+            );
+            NatsError::Timeout(format!("connect timeout to {endpoint}"))
+        })??;
+    tracing::info!(
+        endpoint = %endpoint,
+        request_subject = %request_subject,
+        response_subject = %response_subject,
+        sid = sid,
+        elapsed_ms = connect_started.elapsed().as_millis() as u64,
+        "nats request tcp connected"
+    );
+
     let (reader_half, mut writer_half) = stream.into_split();
     writer_half.write_all(CONNECT_LINE.as_bytes()).await?;
     writer_half
@@ -57,13 +90,31 @@ pub async fn request(
         .await?;
     writer_half.write_all(b"PING\r\n").await?;
     writer_half.flush().await?;
+    tracing::info!(
+        endpoint = %endpoint,
+        request_subject = %request_subject,
+        response_subject = %response_subject,
+        sid = sid,
+        elapsed_ms = request_started.elapsed().as_millis() as u64,
+        "nats request sent CONNECT/SUB/PING"
+    );
 
     let mut reader = BufReader::new(reader_half);
     let deadline = tokio::time::Instant::now() + timeout_duration;
+    let sync_started = Instant::now();
     loop {
         let remaining = deadline
             .saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            tracing::warn!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                sync_elapsed_ms = sync_started.elapsed().as_millis() as u64,
+                "nats request timeout waiting subscription ack"
+            );
             return Err(NatsError::Timeout(format!(
                 "request timeout waiting subscription ack on {response_subject}"
             )));
@@ -73,11 +124,28 @@ pub async fn request(
         let n = timeout(remaining, reader.read_line(&mut line))
             .await
             .map_err(|_| {
+                tracing::warn!(
+                    endpoint = %endpoint,
+                    request_subject = %request_subject,
+                    response_subject = %response_subject,
+                    sid = sid,
+                    elapsed_ms = request_started.elapsed().as_millis() as u64,
+                    sync_elapsed_ms = sync_started.elapsed().as_millis() as u64,
+                    "nats request timeout while reading subscription ack line"
+                );
                 NatsError::Timeout(format!(
                     "request timeout waiting subscription ack on {response_subject}"
                 ))
             })??;
         if n == 0 {
+            tracing::warn!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                "nats request socket closed while waiting subscription ack"
+            );
             return Err(NatsError::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "nats socket closed",
@@ -85,17 +153,50 @@ pub async fn request(
         }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() || line.starts_with("INFO ") || line.starts_with("+OK") {
+            tracing::debug!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                line = %summarize_nats_line(line),
+                "nats request sync loop ignored server line"
+            );
             continue;
         }
         if line == "PING" {
+            tracing::debug!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                "nats request sync loop received PING; sending PONG"
+            );
             writer_half.write_all(b"PONG\r\n").await?;
             writer_half.flush().await?;
             continue;
         }
         if line == "PONG" {
+            tracing::info!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                sync_elapsed_ms = sync_started.elapsed().as_millis() as u64,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                "nats request subscription sync completed"
+            );
             break;
         }
         if line.starts_with("-ERR") {
+            tracing::warn!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                error_line = %summarize_nats_line(line),
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                "nats request server returned error during sync"
+            );
             return Err(NatsError::Protocol(format!("nats error: {line}")));
         }
         if line.starts_with("MSG ") {
@@ -104,20 +205,76 @@ pub async fn request(
             timeout(remaining, reader.read_exact(&mut payload))
                 .await
                 .map_err(|_| {
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        request_subject = %request_subject,
+                        response_subject = %response_subject,
+                        sid = sid,
+                        message_subject = %msg.subject,
+                        payload_len = msg.payload_len,
+                        elapsed_ms = request_started.elapsed().as_millis() as u64,
+                        "nats request timeout draining pre-ack payload"
+                    );
                     NatsError::Timeout(format!(
                         "request timeout draining pre-ack payload on {response_subject}"
                     ))
                 })??;
+            tracing::debug!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                message_subject = %msg.subject,
+                payload_len = msg.payload_len,
+                "nats request drained pre-ack message frame"
+            );
             continue;
         }
     }
 
-    publish(endpoint, request_subject, request_payload).await?;
+    let publish_started = Instant::now();
+    match publish(endpoint, request_subject, request_payload).await {
+        Ok(()) => {
+            tracing::info!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                publish_elapsed_ms = publish_started.elapsed().as_millis() as u64,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                request_bytes = request_payload.len(),
+                "nats request payload published"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                publish_elapsed_ms = publish_started.elapsed().as_millis() as u64,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                error = %err,
+                "nats request publish failed"
+            );
+            return Err(err);
+        }
+    }
 
+    let wait_response_started = Instant::now();
     loop {
         let remaining = deadline
             .saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            tracing::warn!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                wait_response_elapsed_ms = wait_response_started.elapsed().as_millis() as u64,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                "nats request timeout waiting response message"
+            );
             return Err(NatsError::Timeout(format!(
                 "request timeout waiting response on {response_subject}"
             )));
@@ -127,11 +284,29 @@ pub async fn request(
         let n = timeout(remaining, reader.read_line(&mut line))
             .await
             .map_err(|_| {
+                tracing::warn!(
+                    endpoint = %endpoint,
+                    request_subject = %request_subject,
+                    response_subject = %response_subject,
+                    sid = sid,
+                    wait_response_elapsed_ms = wait_response_started.elapsed().as_millis() as u64,
+                    elapsed_ms = request_started.elapsed().as_millis() as u64,
+                    "nats request timeout waiting response header"
+                );
                 NatsError::Timeout(format!(
                     "request timeout waiting response header on {response_subject}"
                 ))
             })??;
         if n == 0 {
+            tracing::warn!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                wait_response_elapsed_ms = wait_response_started.elapsed().as_millis() as u64,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                "nats request socket closed while waiting response"
+            );
             return Err(NatsError::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "nats socket closed",
@@ -139,17 +314,49 @@ pub async fn request(
         }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() || line.starts_with("INFO ") || line.starts_with("+OK") {
+            tracing::debug!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                line = %summarize_nats_line(line),
+                "nats request response loop ignored server line"
+            );
             continue;
         }
         if line == "PING" {
+            tracing::debug!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                "nats request response loop received PING; sending PONG"
+            );
             writer_half.write_all(b"PONG\r\n").await?;
             writer_half.flush().await?;
             continue;
         }
         if line == "PONG" {
+            tracing::debug!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                "nats request response loop received PONG"
+            );
             continue;
         }
         if line.starts_with("-ERR") {
+            tracing::warn!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                error_line = %summarize_nats_line(line),
+                wait_response_elapsed_ms = wait_response_started.elapsed().as_millis() as u64,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                "nats request server returned error while waiting response"
+            );
             return Err(NatsError::Protocol(format!("nats error: {line}")));
         }
         if line.starts_with("MSG ") {
@@ -158,14 +365,44 @@ pub async fn request(
             timeout(remaining, reader.read_exact(&mut payload))
                 .await
                 .map_err(|_| {
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        request_subject = %request_subject,
+                        response_subject = %response_subject,
+                        sid = sid,
+                        message_subject = %msg.subject,
+                        payload_len = msg.payload_len,
+                        wait_response_elapsed_ms = wait_response_started.elapsed().as_millis() as u64,
+                        elapsed_ms = request_started.elapsed().as_millis() as u64,
+                        "nats request timeout reading response payload"
+                    );
                     NatsError::Timeout(format!(
                         "request timeout reading response payload on {response_subject}"
                     ))
                 })??;
             payload.truncate(msg.payload_len);
             if msg.subject == response_subject {
+                tracing::info!(
+                    endpoint = %endpoint,
+                    request_subject = %request_subject,
+                    response_subject = %response_subject,
+                    sid = sid,
+                    payload_bytes = payload.len(),
+                    wait_response_elapsed_ms = wait_response_started.elapsed().as_millis() as u64,
+                    elapsed_ms = request_started.elapsed().as_millis() as u64,
+                    "nats request response matched reply subject"
+                );
                 return Ok(payload);
             }
+            tracing::debug!(
+                endpoint = %endpoint,
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                sid = sid,
+                message_subject = %msg.subject,
+                payload_len = msg.payload_len,
+                "nats request response loop ignored unrelated message"
+            );
         }
     }
 }
@@ -271,6 +508,15 @@ fn endpoint_to_addr(endpoint: &str) -> Result<String, NatsError> {
         return Ok(rest.to_string());
     }
     Ok(trimmed.to_string())
+}
+
+fn summarize_nats_line(line: &str) -> String {
+    if line.len() <= NATS_LOG_LINE_MAX_LEN {
+        return line.to_string();
+    }
+    let mut out = line[..NATS_LOG_LINE_MAX_LEN].to_string();
+    out.push_str("...");
+    out
 }
 
 #[derive(Debug)]

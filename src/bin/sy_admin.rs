@@ -1426,6 +1426,7 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
         reply_subject = %reply_subject,
         sid = sid,
         timeout_secs = STORAGE_METRICS_NATS_TIMEOUT_SECS,
+        request_bytes = request_body.len(),
         "storage metrics nats request send"
     );
     let response_body = match nats_request(
@@ -1514,6 +1515,19 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
             );
         }
     };
+    tracing::info!(
+        trace_id = %trace_id,
+        endpoint = %ctx.nats_endpoint,
+        request_subject = SUBJECT_STORAGE_METRICS_GET,
+        reply_subject = %reply_subject,
+        sid = sid,
+        elapsed_ms = request_started.elapsed().as_millis() as u64,
+        response_status = %response.status,
+        has_metrics = response.metrics.is_some(),
+        response_error_code = ?response.error_code,
+        response_error_detail = ?response.error_detail,
+        "storage metrics nats response decoded"
+    );
     if response.trace_id != trace_id {
         let error_detail = format!(
             "trace_id mismatch expected={} got={}",
@@ -1548,20 +1562,36 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
     }
 
     match (response.status.as_str(), response.metrics) {
-        ("ok", Some(metrics)) => (
-            200,
-            serde_json::json!({
-                "status": "ok",
-                "action": action,
-                "payload": {
+        ("ok", Some(metrics)) => {
+            tracing::info!(
+                trace_id = %trace_id,
+                endpoint = %ctx.nats_endpoint,
+                request_subject = SUBJECT_STORAGE_METRICS_GET,
+                reply_subject = %reply_subject,
+                sid = sid,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                pending = metrics.pending,
+                pending_with_error = metrics.pending_with_error,
+                oldest_pending_age_s = metrics.oldest_pending_age_s,
+                max_attempts = metrics.max_attempts,
+                processed_total = metrics.processed_total,
+                "storage metrics nats request success"
+            );
+            (
+                200,
+                serde_json::json!({
                     "status": "ok",
-                    "metrics": metrics,
-                },
-                "error_code": serde_json::Value::Null,
-                "error_detail": serde_json::Value::Null,
-            })
-            .to_string(),
-        ),
+                    "action": action,
+                    "payload": {
+                        "status": "ok",
+                        "metrics": metrics,
+                    },
+                    "error_code": serde_json::Value::Null,
+                    "error_detail": serde_json::Value::Null,
+                })
+                .to_string(),
+            )
+        }
         _ => {
             let error_code = response
                 .error_code
@@ -1569,6 +1599,17 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
             let error_detail = response
                 .error_detail
                 .unwrap_or_else(|| "storage metrics request failed".to_string());
+            tracing::warn!(
+                trace_id = %trace_id,
+                endpoint = %ctx.nats_endpoint,
+                request_subject = SUBJECT_STORAGE_METRICS_GET,
+                reply_subject = %reply_subject,
+                sid = sid,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                error_code = %error_code,
+                error_detail = %error_detail,
+                "storage metrics nats request returned error payload"
+            );
             (
                 503,
                 serde_json::json!({

@@ -912,12 +912,21 @@ async fn run_storage_metrics_query_loop(
                 let endpoint_out = endpoint_out.clone();
                 let storage_handler_errors = Arc::clone(&storage_handler_errors);
                 async move {
+                    tracing::info!(
+                        request_subject = SUBJECT_STORAGE_METRICS_GET,
+                        message_subject = %msg.subject,
+                        sid = %msg.sid,
+                        reply_to = ?msg.reply_to,
+                        payload_bytes = msg.payload.len(),
+                        "storage metrics nats raw message received"
+                    );
                     let req: StorageMetricsRequest = match serde_json::from_slice(&msg.payload) {
                         Ok(req) => req,
                         Err(err) => {
                             tracing::warn!(
                                 error = %err,
                                 subject = SUBJECT_STORAGE_METRICS_GET,
+                                payload_bytes = msg.payload.len(),
                                 "invalid storage metrics request payload"
                             );
                             return Ok(());
@@ -937,33 +946,85 @@ async fn run_storage_metrics_query_loop(
                         trace_id = %trace_id,
                         request_subject = SUBJECT_STORAGE_METRICS_GET,
                         reply_subject = %reply_subject,
+                        payload_bytes = msg.payload.len(),
                         "storage metrics nats request received"
                     );
 
                     let db_started = Instant::now();
+                    tracing::info!(
+                        trace_id = %trace_id,
+                        request_subject = SUBJECT_STORAGE_METRICS_GET,
+                        reply_subject = %reply_subject,
+                        "storage metrics db snapshot start"
+                    );
                     let (response, response_status) = match storage.inbox_metrics_snapshot().await {
-                        Ok(metrics) => (
-                            serde_json::json!({
+                        Ok(metrics) => {
+                            tracing::info!(
+                                trace_id = %trace_id,
+                                request_subject = SUBJECT_STORAGE_METRICS_GET,
+                                reply_subject = %reply_subject,
+                                pending = metrics.pending,
+                                pending_with_error = metrics.pending_with_error,
+                                oldest_pending_age_s = metrics.oldest_pending_age_s,
+                                max_attempts = metrics.max_attempts,
+                                processed_total = metrics.processed_total,
+                                "storage metrics db snapshot success"
+                            );
+                            (
+                                serde_json::json!({
                                 "trace_id": trace_id,
                                 "status": "ok",
                                 "metrics": metrics,
                             }),
-                            "ok",
-                        ),
-                        Err(err) => (
-                            serde_json::json!({
+                                "ok",
+                            )
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                trace_id = %trace_id,
+                                request_subject = SUBJECT_STORAGE_METRICS_GET,
+                                reply_subject = %reply_subject,
+                                error = %err,
+                                "storage metrics db snapshot failed"
+                            );
+                            (
+                                serde_json::json!({
                                 "trace_id": trace_id,
                                 "status": "error",
                                 "error_code": "STORAGE_METRICS_UNAVAILABLE",
                                 "error_detail": err.to_string(),
                             }),
-                            "error",
-                        ),
+                                "error",
+                            )
+                        }
                     };
                     let db_elapsed_ms = db_started.elapsed().as_millis() as u64;
+                    tracing::info!(
+                        trace_id = %trace_id,
+                        request_subject = SUBJECT_STORAGE_METRICS_GET,
+                        reply_subject = %reply_subject,
+                        status = response_status,
+                        db_elapsed_ms = db_elapsed_ms,
+                        "storage metrics db snapshot finished"
+                    );
                     let body = serde_json::to_vec(&response)
                         .map_err(|err| ClientNatsError::Protocol(err.to_string()))?;
+                    tracing::info!(
+                        trace_id = %trace_id,
+                        request_subject = SUBJECT_STORAGE_METRICS_GET,
+                        reply_subject = %reply_subject,
+                        response_bytes = body.len(),
+                        status = response_status,
+                        "storage metrics response serialized"
+                    );
                     let publish_started = Instant::now();
+                    tracing::info!(
+                        trace_id = %trace_id,
+                        request_subject = SUBJECT_STORAGE_METRICS_GET,
+                        reply_subject = %reply_subject,
+                        response_bytes = body.len(),
+                        "storage metrics response publish start"
+                    );
                     if let Err(err) =
                         client_nats_publish(&endpoint_out, &reply_subject, &body).await
                     {
