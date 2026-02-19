@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::time;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{Client, GenericClient, NoTls};
 use tracing_subscriber::EnvFilter;
 
 use json_router::nats::{
@@ -19,6 +19,9 @@ use json_router::nats::{
 type StorageError = Box<dyn std::error::Error + Send + Sync>;
 
 const NATS_ERROR_LOG_EVERY: u64 = 20;
+const INBOX_REPLAY_BATCH_SIZE: i64 = 200;
+const INBOX_REPLAY_MAX_ROUNDS: u32 = 20;
+const INBOX_ERROR_MAX_LEN: usize = 1024;
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -108,6 +111,12 @@ async fn main() -> Result<(), StorageError> {
     let database_url = database_url(&hive)?;
     let storage = Arc::new(Storage::connect(&database_url).await?);
     storage.ensure_schema().await?;
+    let replayed = storage
+        .replay_pending_messages(INBOX_REPLAY_BATCH_SIZE, INBOX_REPLAY_MAX_ROUNDS)
+        .await?;
+    if replayed > 0 {
+        tracing::info!(count = replayed, "replayed pending storage inbox messages");
+    }
 
     tracing::info!(
         hive = %hive.hive_id,
@@ -203,50 +212,250 @@ CREATE TABLE IF NOT EXISTS memory_items (
     created_at      TIMESTAMPTZ DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS storage_inbox (
+    dedupe_key  TEXT PRIMARY KEY,
+    subject     TEXT NOT NULL,
+    payload     BYTEA NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    attempts    INT NOT NULL DEFAULT 0,
+    processed_at TIMESTAMPTZ,
+    last_error  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS storage_reactivation_applied (
+    dedupe_key  TEXT NOT NULL,
+    event_id    BIGINT NOT NULL,
+    used        BOOLEAN NOT NULL,
+    outcome_ok  BOOLEAN NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (dedupe_key, event_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_turns_ctx ON turns (ctx);
 CREATE INDEX IF NOT EXISTS idx_events_cues ON events USING GIN(cues_agg);
 CREATE INDEX IF NOT EXISTS idx_events_activation ON events(activation_strength DESC);
+CREATE INDEX IF NOT EXISTS idx_events_natural_key ON events(ctx, start_seq, end_seq, boundary_reason);
 CREATE INDEX IF NOT EXISTS idx_items_cues ON memory_items USING GIN(cues_signature);
+CREATE INDEX IF NOT EXISTS idx_storage_inbox_pending ON storage_inbox(processed_at, received_at);
 "#,
             )
             .await?;
         Ok(())
     }
 
-    async fn handle_turn(&self, payload: &[u8]) -> Result<(), StorageError> {
-        let value: Value = serde_json::from_slice(payload)?;
-        let turn = parse_turn(value)?;
-        self.client
-            .execute(
+    async fn replay_pending_messages(
+        &self,
+        batch_size: i64,
+        max_rounds: u32,
+    ) -> Result<u64, StorageError> {
+        let mut replayed = 0u64;
+        for _ in 0..max_rounds {
+            let rows = self
+                .client
+                .query(
+                    r#"
+SELECT dedupe_key, subject, payload
+FROM storage_inbox
+WHERE processed_at IS NULL
+ORDER BY received_at ASC
+LIMIT $1
+"#,
+                    &[&batch_size],
+                )
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+            let rows_len = rows.len();
+            for row in rows {
+                let dedupe_key: String = row.get(0);
+                let subject: String = row.get(1);
+                let payload: Vec<u8> = row.get(2);
+                let Some(kind) = handler_kind_for_subject(&subject) else {
+                    let err_msg = format!("unsupported subject in inbox replay: {subject}");
+                    self.client
+                        .execute(
+                            r#"
+UPDATE storage_inbox
+SET attempts = attempts + 1, last_error = $2
+WHERE dedupe_key = $1
+"#,
+                            &[&dedupe_key, &err_msg],
+                        )
+                        .await?;
+                    continue;
+                };
+
+                if let Err(err) = self
+                    .process_inbox_message(&dedupe_key, &subject, kind, &payload)
+                    .await
+                {
+                    tracing::warn!(
+                        subject = %subject,
+                        dedupe_key = %dedupe_key,
+                        error = %err,
+                        "failed processing pending inbox message"
+                    );
+                } else {
+                    replayed += 1;
+                }
+            }
+            if rows_len < batch_size as usize {
+                break;
+            }
+        }
+        Ok(replayed)
+    }
+
+    async fn ingest_message(
+        &self,
+        subject: &str,
+        kind: HandlerKind,
+        payload: &[u8],
+    ) -> Result<(), StorageError> {
+        let dedupe_key = message_dedupe_key(subject, payload);
+        let already_processed = self
+            .upsert_inbox_message(&dedupe_key, subject, payload)
+            .await?;
+        if already_processed {
+            return Ok(());
+        }
+        self.process_inbox_message(&dedupe_key, subject, kind, payload)
+            .await
+    }
+
+    async fn upsert_inbox_message(
+        &self,
+        dedupe_key: &str,
+        subject: &str,
+        payload: &[u8],
+    ) -> Result<bool, StorageError> {
+        let row = self
+            .client
+            .query_one(
                 r#"
+INSERT INTO storage_inbox (dedupe_key, subject, payload, attempts, last_error)
+VALUES ($1, $2, $3, 1, NULL)
+ON CONFLICT (dedupe_key) DO UPDATE SET
+    attempts = storage_inbox.attempts + 1,
+    last_error = NULL
+RETURNING processed_at IS NOT NULL
+"#,
+                &[&dedupe_key, &subject, &payload],
+            )
+            .await?;
+        Ok(row.get::<_, bool>(0))
+    }
+
+    async fn process_inbox_message(
+        &self,
+        dedupe_key: &str,
+        subject: &str,
+        kind: HandlerKind,
+        payload: &[u8],
+    ) -> Result<(), StorageError> {
+        let result = self.process_subject_payload(kind, payload, dedupe_key).await;
+        match result {
+            Ok(()) => {
+                self.client
+                    .execute(
+                        r#"
+UPDATE storage_inbox
+SET processed_at = now(), last_error = NULL
+WHERE dedupe_key = $1
+"#,
+                        &[&dedupe_key],
+                    )
+                    .await?;
+                Ok(())
+            }
+            Err(err) => {
+                let err_text = truncate_error(&err.to_string(), INBOX_ERROR_MAX_LEN);
+                self.client
+                    .execute(
+                        r#"
+UPDATE storage_inbox
+SET last_error = $2
+WHERE dedupe_key = $1
+"#,
+                        &[&dedupe_key, &err_text],
+                    )
+                    .await?;
+                tracing::warn!(
+                    subject = %subject,
+                    dedupe_key = %dedupe_key,
+                    error = %err,
+                    "storage message processing failed"
+                );
+                Err(err)
+            }
+        }
+    }
+
+    async fn process_subject_payload(
+        &self,
+        kind: HandlerKind,
+        payload: &[u8],
+        dedupe_key: &str,
+    ) -> Result<(), StorageError> {
+        match kind {
+            HandlerKind::Turns => {
+                let value: Value = serde_json::from_slice(payload)?;
+                let turn = parse_turn(value)?;
+                self.persist_turn(&self.client, &turn).await
+            }
+            HandlerKind::Events => {
+                let value: Value = serde_json::from_slice(payload)?;
+                let event = parse_event(value)?;
+                self.persist_event(&self.client, &event).await
+            }
+            HandlerKind::Items => {
+                let value: Value = serde_json::from_slice(payload)?;
+                let item = parse_memory_item(value)?;
+                self.persist_item(&self.client, &item).await
+            }
+            HandlerKind::Reactivation => {
+                let value: Value = serde_json::from_slice(payload)?;
+                let parsed = parse_reactivation_payload(value)?;
+                self.apply_reactivation(&self.client, dedupe_key, &parsed).await
+            }
+        }
+    }
+
+    async fn persist_turn<C>(&self, db: &C, turn: &TurnRecord) -> Result<(), StorageError>
+    where
+        C: GenericClient + Sync,
+    {
+        db.execute(
+            r#"
 INSERT INTO turns (ctx, seq, ts, from_ilk, to_ilk, ich, msg_type, content, tags)
 VALUES ($1, $2, now(), $3, $4, $5, $6, $7, $8)
 ON CONFLICT (ctx, seq) DO NOTHING
 "#,
-                &[
-                    &turn.ctx,
-                    &turn.seq,
-                    &turn.from_ilk,
-                    &turn.to_ilk,
-                    &turn.ich,
-                    &turn.msg_type,
-                    &turn.content,
-                    &turn.tags,
-                ],
-            )
-            .await?;
+            &[
+                &turn.ctx,
+                &turn.seq,
+                &turn.from_ilk,
+                &turn.to_ilk,
+                &turn.ich,
+                &turn.msg_type,
+                &turn.content,
+                &turn.tags,
+            ],
+        )
+        .await?;
         Ok(())
     }
 
-    async fn handle_event(&self, payload: &[u8]) -> Result<(), StorageError> {
-        let value: Value = serde_json::from_slice(payload)?;
-        let event = parse_event(value)?;
+    async fn persist_event<C>(&self, db: &C, event: &EventRecord) -> Result<(), StorageError>
+    where
+        C: GenericClient + Sync,
+    {
         let activation_strength = event.activation_strength as f32;
         let context_inhibition = event.context_inhibition as f32;
         if let Some(event_id) = event.event_id {
-            self.client
-                .execute(
-                    r#"
+            db.execute(
+                r#"
 INSERT INTO events (
     event_id, ctx, start_seq, end_seq, boundary_reason, cues_agg,
     outcome_status, outcome_duration_ms, activation_strength, context_inhibition,
@@ -266,111 +475,129 @@ ON CONFLICT (event_id) DO UPDATE SET
     use_count = EXCLUDED.use_count,
     success_count = EXCLUDED.success_count
 "#,
-                    &[
-                        &event_id,
-                        &event.ctx,
-                        &event.start_seq,
-                        &event.end_seq,
-                        &event.boundary_reason,
-                        &event.cues_agg,
-                        &event.outcome_status,
-                        &event.outcome_duration_ms,
-                        &activation_strength,
-                        &context_inhibition,
-                        &event.use_count,
-                        &event.success_count,
-                    ],
-                )
-                .await?;
+                &[
+                    &event_id,
+                    &event.ctx,
+                    &event.start_seq,
+                    &event.end_seq,
+                    &event.boundary_reason,
+                    &event.cues_agg,
+                    &event.outcome_status,
+                    &event.outcome_duration_ms,
+                    &activation_strength,
+                    &context_inhibition,
+                    &event.use_count,
+                    &event.success_count,
+                ],
+            )
+            .await?;
         } else {
-            self.client
-                .execute(
-                    r#"
+            db.execute(
+                r#"
+WITH updated AS (
+    UPDATE events
+    SET
+        cues_agg = $5,
+        outcome_status = $6,
+        outcome_duration_ms = $7,
+        activation_strength = $8,
+        context_inhibition = $9,
+        use_count = $10,
+        success_count = $11
+    WHERE
+        ctx = $1
+        AND start_seq = $2
+        AND end_seq = $3
+        AND boundary_reason = $4
+    RETURNING event_id
+)
 INSERT INTO events (
     ctx, start_seq, end_seq, boundary_reason, cues_agg,
     outcome_status, outcome_duration_ms, activation_strength, context_inhibition,
     use_count, success_count
 )
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11
+WHERE NOT EXISTS (SELECT 1 FROM updated)
 "#,
-                    &[
-                        &event.ctx,
-                        &event.start_seq,
-                        &event.end_seq,
-                        &event.boundary_reason,
-                        &event.cues_agg,
-                        &event.outcome_status,
-                        &event.outcome_duration_ms,
-                        &activation_strength,
-                        &context_inhibition,
-                        &event.use_count,
-                        &event.success_count,
-                    ],
-                )
-                .await?;
+                &[
+                    &event.ctx,
+                    &event.start_seq,
+                    &event.end_seq,
+                    &event.boundary_reason,
+                    &event.cues_agg,
+                    &event.outcome_status,
+                    &event.outcome_duration_ms,
+                    &activation_strength,
+                    &context_inhibition,
+                    &event.use_count,
+                    &event.success_count,
+                ],
+            )
+            .await?;
         }
         Ok(())
     }
 
-    async fn handle_item(&self, payload: &[u8]) -> Result<(), StorageError> {
-        let value: Value = serde_json::from_slice(payload)?;
-        let item = parse_memory_item(value)?;
+    async fn persist_item<C>(&self, db: &C, item: &MemoryItemRecord) -> Result<(), StorageError>
+    where
+        C: GenericClient + Sync,
+    {
         let confidence = item.confidence as f32;
         let activation_strength = item.activation_strength as f32;
-        self.client
-            .execute(
-                r#"
+        db.execute(
+            r#"
 INSERT INTO memory_items (
     memory_id, event_id, item_type, content, confidence, cues_signature, activation_strength
 )
 VALUES ($1,$2,$3,$4,$5,$6,$7)
 ON CONFLICT (memory_id) DO NOTHING
 "#,
-                &[
-                    &item.memory_id,
-                    &item.event_id,
-                    &item.item_type,
-                    &item.content,
-                    &confidence,
-                    &item.cues_signature,
-                    &activation_strength,
-                ],
-            )
-            .await?;
+            &[
+                &item.memory_id,
+                &item.event_id,
+                &item.item_type,
+                &item.content,
+                &confidence,
+                &item.cues_signature,
+                &activation_strength,
+            ],
+        )
+        .await?;
         Ok(())
     }
 
-    async fn handle_reactivation(&self, payload: &[u8]) -> Result<(), StorageError> {
-        let value: Value = serde_json::from_slice(payload)?;
-        let parsed = parse_reactivation_payload(value)?;
-
-        for ev in parsed.events {
-            if ev.used {
-                self.client
-                    .execute(
-                        r#"
+    async fn apply_reactivation<C>(
+        &self,
+        db: &C,
+        dedupe_key: &str,
+        parsed: &ReactivationPayload,
+    ) -> Result<(), StorageError>
+    where
+        C: GenericClient + Sync,
+    {
+        for ev in &parsed.events {
+            db.execute(
+                r#"
+WITH marker AS (
+    INSERT INTO storage_reactivation_applied (dedupe_key, event_id, used, outcome_ok)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (dedupe_key, event_id) DO NOTHING
+    RETURNING 1
+)
 UPDATE events SET
-    activation_strength = LEAST(COALESCE(activation_strength, 0.5) * 1.1, 1.0),
-    use_count = COALESCE(use_count, 0) + 1,
-    success_count = COALESCE(success_count, 0) + CASE WHEN $2 THEN 1 ELSE 0 END,
-    last_used_at = now()
-WHERE event_id = $1
+    activation_strength = CASE
+        WHEN $3 THEN LEAST(COALESCE(activation_strength, 0.5) * 1.1, 1.0)
+        ELSE GREATEST(COALESCE(activation_strength, 0.5) * 0.95, 0.1)
+    END,
+    use_count = COALESCE(use_count, 0) + CASE WHEN $3 THEN 1 ELSE 0 END,
+    success_count = COALESCE(success_count, 0) + CASE WHEN $3 AND $4 THEN 1 ELSE 0 END,
+    last_used_at = CASE WHEN $3 THEN now() ELSE last_used_at END
+WHERE event_id = $2
+  AND EXISTS (SELECT 1 FROM marker)
 "#,
-                        &[&ev.event_id, &parsed.outcome_ok],
-                    )
-                    .await?;
-            } else {
-                self.client
-                    .execute(
-                        r#"
-UPDATE events SET
-    activation_strength = GREATEST(COALESCE(activation_strength, 0.5) * 0.95, 0.1)
-WHERE event_id = $1
-"#,
-                        &[&ev.event_id],
-                    )
-                    .await?;
-            }
+                &[&dedupe_key, &ev.event_id, &ev.used, &parsed.outcome_ok],
+            )
+            .await?;
         }
         Ok(())
     }
@@ -456,6 +683,32 @@ enum HandlerKind {
     Reactivation,
 }
 
+fn handler_kind_for_subject(subject: &str) -> Option<HandlerKind> {
+    match subject {
+        SUBJECT_STORAGE_TURNS => Some(HandlerKind::Turns),
+        SUBJECT_STORAGE_EVENTS => Some(HandlerKind::Events),
+        SUBJECT_STORAGE_ITEMS => Some(HandlerKind::Items),
+        SUBJECT_STORAGE_REACTIVATION => Some(HandlerKind::Reactivation),
+        _ => None,
+    }
+}
+
+fn message_dedupe_key(subject: &str, payload: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in subject.as_bytes().iter().chain(payload.iter()) {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{subject}:{hash:016x}:{}", payload.len())
+}
+
+fn truncate_error(input: &str, max_len: usize) -> String {
+    if input.len() <= max_len {
+        return input.to_string();
+    }
+    input.chars().take(max_len).collect()
+}
+
 async fn run_subject_loop(
     endpoint: String,
     subject: &str,
@@ -477,12 +730,7 @@ async fn run_subject_loop(
                 let subject_name = subject_name.clone();
                 let storage_handler_errors = Arc::clone(&storage_handler_errors);
                 async move {
-                    let result = match kind {
-                        HandlerKind::Turns => worker.handle_turn(&payload).await,
-                        HandlerKind::Events => worker.handle_event(&payload).await,
-                        HandlerKind::Items => worker.handle_item(&payload).await,
-                        HandlerKind::Reactivation => worker.handle_reactivation(&payload).await,
-                    };
+                    let result = worker.ingest_message(&subject_name, kind, &payload).await;
                     if let Err(err) = result {
                         let count = storage_handler_errors.fetch_add(1, Ordering::Relaxed) + 1;
                         if count == 1 || count % NATS_ERROR_LOG_EVERY == 0 {
@@ -493,6 +741,7 @@ async fn run_subject_loop(
                                 "storage handler failed"
                             );
                         }
+                        return Err(std::io::Error::new(std::io::ErrorKind::Other, err.to_string()));
                     }
                     Ok(())
                 }

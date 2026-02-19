@@ -93,19 +93,40 @@ Avance Fase 2 (2026-02-19):
 Criterio de salida:
 - En `embedded`, el router garantiza NATS local operativo sin dependencia manual externa.
 
-## Fase 3 - Garantias de entrega (JetStream)
+## Fase 3A - Infra de entrega (JetStream, independiente del contrato final)
 - [ ] Migrar de cliente TCP minimo a cliente con soporte JetStream.
-- [ ] Durable consumers para `SY.storage`.
+- [ ] Streams + consumers durables para subjects de storage.
 - [ ] Ack/retry controlado + metricas de lag.
+- [x] Ack/retry basico en broker embebido actual (pre-JetStream):
+  - [x] `reply-to` de ack por mensaje y ack automatico post-handler exitoso en subscriber.
+  - [x] Redelivery en broker cuando no llega ack dentro de timeout.
+  - [x] Test unitario de redelivery por falta de ack.
+- [x] Base de ack post-persistencia en `SY.storage` (sin JetStream aun):
+  - [x] `storage_inbox` durable en PostgreSQL para registrar mensajes recibidos.
+  - [x] Replay automatico de pendientes al bootstrap de `SY.storage`.
+  - [x] Dedupe por mensaje (`dedupe_key`) y guardado de `last_error`.
+  - [x] Dedupe de `storage.reactivation` por `(dedupe_key, event_id)` para evitar doble aplicacion en retries.
+- [x] Reforzar idempotencia de ingesta para tolerar redeliveries:
+  - [x] `storage.events` sin `event_id` ahora hace upsert por clave natural (`ctx/start_seq/end_seq/boundary_reason`) en `SY.storage`.
 
 Criterio de salida:
 - Reinicios de router/storage no pierden mensajes en ventana de prueba definida.
+- Reintentos/redeliveries no generan duplicados no deseados en tablas de storage.
+- Nota: la durabilidad total cross-restart del broker requiere JetStream/streams persistentes (pendiente).
 
-## Primer bloque sugerido para arrancar ya
+## Fase 3B - Cierre de contrato (cuando modelo cognitivo quede congelado)
+- [ ] Versionado de payload (`schema_version`) y politica de compatibilidad.
+- [ ] Validaciones estrictas de campos finales por subject.
+- [ ] Ajuste final de esquema/indices/constraints segun contrato definitivo.
 
-1. Cerrar lifecycle faltante del broker embebido (stop/recovery) y agregar smoke test de restart.
-2. Activar productor real de `storage.events/items/reactivation` (SY.cognition) para validar pipeline E2E completo.
-3. Preparar migracion de cliente NATS minimo a cliente con soporte de durabilidad (siguiente fase).
+Criterio de salida:
+- Contrato de producers y storage cerrado, con compatibilidad y migracion definidas.
+
+## Proximo bloque sugerido (orden de ejecucion)
+
+1. Implementar JetStream base (streams + durable consumers + ack explicito post-persistencia) sin depender del cierre final de payload.
+2. Activar productor real de `storage.events/items/reactivation` (SY.cognition) para validar pipeline E2E completo sobre infraestructura durable.
+3. Cerrar contrato final (Fase 3B) con versionado y validaciones estrictas.
 
 Avance:
 - Se agrego smoke de lifecycle para NATS embebido: `scripts/nats_embedded_lifecycle_smoke.sh`.

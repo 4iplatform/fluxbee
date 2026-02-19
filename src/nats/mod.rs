@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
 pub const SUBJECT_STORAGE_TURNS: &str = "storage.turns";
 pub const SUBJECT_STORAGE_EVENTS: &str = "storage.events";
@@ -19,6 +19,10 @@ pub const SUBJECT_STORAGE_REACTIVATION: &str = "storage.reactivation";
 const CONNECT_LINE: &str = "CONNECT {\"lang\":\"rust\",\"version\":\"0.1\",\"verbose\":false,\"pedantic\":false,\"tls_required\":false}\r\n";
 const EMBEDDED_INFO_LINE: &str =
     "INFO {\"server_id\":\"fluxbee-router\",\"server_name\":\"fluxbee-router\",\"version\":\"1.0.0\",\"proto\":1,\"max_payload\":1048576}\r\n";
+const EMBEDDED_ACK_SUBJECT_PREFIX: &str = "_JSR.ACK.";
+const EMBEDDED_ACK_TIMEOUT_SECS: u64 = 2;
+const EMBEDDED_ACK_MAX_ATTEMPTS: u32 = 8;
+const EMBEDDED_REDELIVERY_TICK_MS: u64 = 250;
 
 #[derive(Clone)]
 struct EmbeddedSubscriber {
@@ -28,9 +32,23 @@ struct EmbeddedSubscriber {
     tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
+struct PendingDelivery {
+    connection_id: u64,
+    subject: String,
+    sid: String,
+    payload: Vec<u8>,
+    attempts: u32,
+    last_sent_at: Instant,
+}
+
 #[derive(Default)]
 struct EmbeddedBrokerState {
     subscribers: Vec<EmbeddedSubscriber>,
+    pending: HashMap<String, PendingDelivery>,
+    next_delivery_id: u64,
+    acked_count: u64,
+    redelivery_count: u64,
+    dropped_count: u64,
 }
 
 struct EmbeddedBrokerHandle {
@@ -171,11 +189,16 @@ async fn run_embedded_broker(
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<(), io::Error> {
     let mut connection_tasks = JoinSet::new();
+    let mut redelivery_ticker =
+        tokio::time::interval(Duration::from_millis(EMBEDDED_REDELIVERY_TICK_MS));
     loop {
         tokio::select! {
             _ = &mut shutdown_rx => {
                 tracing::debug!("embedded nats broker shutdown requested");
                 break;
+            }
+            _ = redelivery_ticker.tick() => {
+                redeliver_embedded_pending(&state).await;
             }
             accepted = listener.accept() => {
                 let (stream, _) = match accepted {
@@ -199,6 +222,17 @@ async fn run_embedded_broker(
                 });
             }
         }
+    }
+
+    {
+        let state = state.lock().await;
+        tracing::debug!(
+            pending = state.pending.len(),
+            acks = state.acked_count,
+            redeliveries = state.redelivery_count,
+            dropped = state.dropped_count,
+            "embedded nats broker stopping"
+        );
     }
 
     connection_tasks.abort_all();
@@ -291,7 +325,11 @@ async fn handle_embedded_connection(
             let mut payload = vec![0u8; payload_len + 2];
             reader.read_exact(&mut payload).await?;
             payload.truncate(payload_len);
-            publish_embedded_subject(&state, &subject, &payload).await;
+            if subject.starts_with(EMBEDDED_ACK_SUBJECT_PREFIX) {
+                mark_embedded_ack(&state, &subject).await;
+            } else {
+                publish_embedded_subject(&state, &subject, &payload).await;
+            }
             continue;
         }
 
@@ -323,6 +361,9 @@ async fn remove_embedded_sid(
     state
         .subscribers
         .retain(|entry| !(entry.connection_id == connection_id && entry.sid == sid));
+    state
+        .pending
+        .retain(|_, pending| !(pending.connection_id == connection_id && pending.sid == sid));
 }
 
 async fn remove_embedded_connection(state: &Arc<Mutex<EmbeddedBrokerState>>, connection_id: u64) {
@@ -330,6 +371,9 @@ async fn remove_embedded_connection(state: &Arc<Mutex<EmbeddedBrokerState>>, con
     state
         .subscribers
         .retain(|entry| entry.connection_id != connection_id);
+    state
+        .pending
+        .retain(|_, pending| pending.connection_id != connection_id);
 }
 
 async fn publish_embedded_subject(
@@ -337,27 +381,137 @@ async fn publish_embedded_subject(
     subject: &str,
     payload: &[u8],
 ) {
+    let mut state = state.lock().await;
+    let targets: Vec<EmbeddedSubscriber> = state
+        .subscribers
+        .iter()
+        .filter(|s| s.subject == subject)
+        .cloned()
+        .collect();
     let mut stale_connections = Vec::new();
-    {
-        let state = state.lock().await;
-        for subscriber in state.subscribers.iter().filter(|s| s.subject == subject) {
-            let mut frame =
-                format!("MSG {} {} {}\r\n", subject, subscriber.sid, payload.len()).into_bytes();
-            frame.extend_from_slice(payload);
-            frame.extend_from_slice(b"\r\n");
-            if subscriber.tx.send(frame).is_err() {
-                stale_connections.push(subscriber.connection_id);
-            }
+
+    for subscriber in targets {
+        state.next_delivery_id = state.next_delivery_id.wrapping_add(1);
+        if state.next_delivery_id == 0 {
+            state.next_delivery_id = 1;
         }
+        let ack_subject = format!("{}{}", EMBEDDED_ACK_SUBJECT_PREFIX, state.next_delivery_id);
+        let frame = build_msg_frame(subject, &subscriber.sid, Some(&ack_subject), payload);
+        if subscriber.tx.send(frame).is_err() {
+            stale_connections.push(subscriber.connection_id);
+            continue;
+        }
+        state.pending.insert(
+            ack_subject,
+            PendingDelivery {
+                connection_id: subscriber.connection_id,
+                subject: subject.to_string(),
+                sid: subscriber.sid,
+                payload: payload.to_vec(),
+                attempts: 1,
+                last_sent_at: Instant::now(),
+            },
+        );
     }
+
     if stale_connections.is_empty() {
         return;
     }
 
-    let mut state = state.lock().await;
     state
         .subscribers
         .retain(|entry| !stale_connections.contains(&entry.connection_id));
+    state
+        .pending
+        .retain(|_, pending| !stale_connections.contains(&pending.connection_id));
+}
+
+async fn mark_embedded_ack(state: &Arc<Mutex<EmbeddedBrokerState>>, ack_subject: &str) {
+    let mut state = state.lock().await;
+    if state.pending.remove(ack_subject).is_some() {
+        state.acked_count = state.acked_count.saturating_add(1);
+    }
+}
+
+async fn redeliver_embedded_pending(state: &Arc<Mutex<EmbeddedBrokerState>>) {
+    let now = Instant::now();
+    let mut state = state.lock().await;
+    if state.pending.is_empty() {
+        return;
+    }
+
+    let subscribers = state.subscribers.clone();
+    let mut remove_keys = Vec::new();
+    let mut redelivered = 0u64;
+    let mut dropped = 0u64;
+
+    for (ack_subject, pending) in state.pending.iter_mut() {
+        if now.duration_since(pending.last_sent_at) < Duration::from_secs(EMBEDDED_ACK_TIMEOUT_SECS) {
+            continue;
+        }
+        if pending.attempts >= EMBEDDED_ACK_MAX_ATTEMPTS {
+            remove_keys.push(ack_subject.clone());
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
+        let target = subscribers.iter().find(|subscriber| {
+            subscriber.connection_id == pending.connection_id
+                && subscriber.sid == pending.sid
+                && subscriber.subject == pending.subject
+        });
+        let Some(subscriber) = target else {
+            remove_keys.push(ack_subject.clone());
+            dropped = dropped.saturating_add(1);
+            continue;
+        };
+
+        let frame = build_msg_frame(
+            &pending.subject,
+            &pending.sid,
+            Some(ack_subject.as_str()),
+            &pending.payload,
+        );
+        if subscriber.tx.send(frame).is_ok() {
+            pending.attempts = pending.attempts.saturating_add(1);
+            pending.last_sent_at = now;
+            redelivered = redelivered.saturating_add(1);
+        } else {
+            remove_keys.push(ack_subject.clone());
+            dropped = dropped.saturating_add(1);
+        }
+    }
+
+    for key in remove_keys {
+        state.pending.remove(&key);
+    }
+    state.redelivery_count = state.redelivery_count.saturating_add(redelivered);
+    state.dropped_count = state.dropped_count.saturating_add(dropped);
+
+    if redelivered > 0 {
+        tracing::debug!(
+            count = redelivered,
+            pending = state.pending.len(),
+            "embedded nats redelivered unacked messages"
+        );
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            count = dropped,
+            pending = state.pending.len(),
+            "embedded nats dropped unacked messages"
+        );
+    }
+}
+
+fn build_msg_frame(subject: &str, sid: &str, reply_to: Option<&str>, payload: &[u8]) -> Vec<u8> {
+    let mut frame = if let Some(reply) = reply_to {
+        format!("MSG {subject} {sid} {reply} {}\r\n", payload.len()).into_bytes()
+    } else {
+        format!("MSG {subject} {sid} {}\r\n", payload.len()).into_bytes()
+    };
+    frame.extend_from_slice(payload);
+    frame.extend_from_slice(b"\r\n");
+    frame
 }
 
 pub async fn publish(endpoint: &str, subject: &str, payload: &[u8]) -> Result<(), io::Error> {
@@ -474,11 +628,25 @@ impl NatsSubscriber {
                 ));
             }
             if line.starts_with("MSG ") {
-                let payload_len = parse_payload_len(line)?;
-                let mut payload = vec![0u8; payload_len + 2];
+                let msg = parse_msg_line(line)?;
+                let mut payload = vec![0u8; msg.payload_len + 2];
                 reader.read_exact(&mut payload).await?;
-                payload.truncate(payload_len);
-                handler(payload).await?;
+                payload.truncate(msg.payload_len);
+                if let Err(err) = handler(payload).await {
+                    tracing::warn!(
+                        subject = %msg.subject,
+                        sid = %msg.sid,
+                        error = %err,
+                        "nats subscriber handler error (message not acked)"
+                    );
+                    continue;
+                }
+                if let Some(reply_to) = msg.reply_to.as_deref() {
+                    writer_half
+                        .write_all(format!("PUB {reply_to} 0\r\n\r\n").as_bytes())
+                        .await?;
+                    writer_half.flush().await?;
+                }
             }
         }
     }
@@ -560,28 +728,52 @@ fn parse_pub_command(line: &str) -> Result<(String, usize), io::Error> {
     Ok((subject.to_string(), payload_len))
 }
 
-fn parse_payload_len(msg_line: &str) -> Result<usize, io::Error> {
-    let mut parts = msg_line.split_whitespace();
-    let _ = parts.next(); // MSG
-    let _subject = parts.next();
-    let _sid = parts.next();
-    let maybe_reply_or_len = parts.next();
-    let last = parts.next();
-    let len_str = match (maybe_reply_or_len, last) {
-        (Some(len), None) => len,
-        (Some(_reply), Some(len)) => len,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid MSG line: {msg_line}"),
-            ))
-        }
+struct MsgFrameHeader {
+    subject: String,
+    sid: String,
+    reply_to: Option<String>,
+    payload_len: usize,
+}
+
+fn parse_msg_line(msg_line: &str) -> Result<MsgFrameHeader, io::Error> {
+    let parts: Vec<&str> = msg_line.split_whitespace().collect();
+    if parts.len() != 4 && parts.len() != 5 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid MSG line: {msg_line}"),
+        ));
+    }
+    if parts[0] != "MSG" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid MSG line: {msg_line}"),
+        ));
+    }
+    let subject = parts[1].trim();
+    let sid = parts[2].trim();
+    if subject.is_empty() || sid.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid MSG line: {msg_line}"),
+        ));
+    }
+    let (reply_to, len_raw) = if parts.len() == 4 {
+        (None, parts[3])
+    } else {
+        (Some(parts[3]), parts[4])
     };
-    len_str.parse::<usize>().map_err(|err| {
+    let payload_len = len_raw.parse::<usize>().map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("invalid MSG length '{len_str}': {err}"),
+            format!("invalid MSG length '{len_raw}': {err}"),
         )
+    })?;
+
+    Ok(MsgFrameHeader {
+        subject: subject.to_string(),
+        sid: sid.to_string(),
+        reply_to: reply_to.map(|value| value.to_string()),
+        payload_len,
     })
 }
 
@@ -589,6 +781,8 @@ fn parse_payload_len(msg_line: &str) -> Result<usize, io::Error> {
 mod tests {
     use super::*;
     use std::net::TcpListener as StdTcpListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
     use tokio::time::sleep;
 
     fn free_endpoint() -> String {
@@ -647,5 +841,55 @@ mod tests {
         stop_embedded_broker(&endpoint)
             .await
             .expect("final stop after recovery");
+    }
+
+    #[tokio::test]
+    async fn embedded_broker_redelivers_when_message_not_acked() {
+        let endpoint = free_endpoint();
+        start_embedded_broker(&endpoint)
+            .await
+            .expect("start embedded broker");
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let subscriber = NatsSubscriber::new(endpoint.clone(), "test.redelivery".to_string(), 77);
+        let calls_for_task = Arc::clone(&calls);
+        let subscriber_task = tokio::spawn(async move {
+            let _ = subscriber
+                .run(move |_payload| {
+                    let calls_for_handler = Arc::clone(&calls_for_task);
+                    async move {
+                        let call = calls_for_handler.fetch_add(1, Ordering::Relaxed) + 1;
+                        if call == 1 {
+                            return Err(io::Error::new(io::ErrorKind::Other, "fail-first-attempt"));
+                        }
+                        Ok(())
+                    }
+                })
+                .await;
+        });
+
+        sleep(Duration::from_millis(200)).await;
+        publish(&endpoint, "test.redelivery", b"hello")
+            .await
+            .expect("publish");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while tokio::time::Instant::now() < deadline {
+            if calls.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            calls.load(Ordering::Relaxed) >= 2,
+            "expected redelivery after missing ack"
+        );
+
+        subscriber_task.abort();
+        let _ = subscriber_task.await;
+        stop_embedded_broker(&endpoint)
+            .await
+            .expect("stop embedded broker");
     }
 }
