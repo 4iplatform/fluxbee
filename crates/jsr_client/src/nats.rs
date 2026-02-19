@@ -7,6 +7,7 @@ use tokio::time::{timeout, Instant};
 
 const CONNECT_LINE: &str = "CONNECT {\"lang\":\"rust\",\"version\":\"0.1\",\"verbose\":false,\"pedantic\":false,\"tls_required\":false}\r\n";
 const NATS_LOG_LINE_MAX_LEN: usize = 220;
+const PUBLISH_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum NatsError {
@@ -28,14 +29,59 @@ pub struct NatsMessage {
 
 pub async fn publish(endpoint: &str, subject: &str, payload: &[u8]) -> Result<(), NatsError> {
     let addr = endpoint_to_addr(endpoint)?;
-    let mut stream = TcpStream::connect(addr).await?;
-    stream.write_all(CONNECT_LINE.as_bytes()).await?;
-    stream
+    let publish_started = Instant::now();
+    let stream = timeout(PUBLISH_SYNC_TIMEOUT, TcpStream::connect(&addr))
+        .await
+        .map_err(|_| NatsError::Timeout(format!("publish connect timeout to {endpoint}")))??;
+    let (reader_half, mut writer_half) = stream.into_split();
+    writer_half.write_all(CONNECT_LINE.as_bytes()).await?;
+    writer_half
         .write_all(format!("PUB {subject} {}\r\n", payload.len()).as_bytes())
         .await?;
-    stream.write_all(payload).await?;
-    stream.write_all(b"\r\n").await?;
-    stream.flush().await?;
+    writer_half.write_all(payload).await?;
+    writer_half.write_all(b"\r\n").await?;
+    writer_half.write_all(b"PING\r\n").await?;
+    writer_half.flush().await?;
+
+    let mut reader = BufReader::new(reader_half);
+    let sync_started = Instant::now();
+    loop {
+        let mut line = String::new();
+        let n = timeout(PUBLISH_SYNC_TIMEOUT, reader.read_line(&mut line))
+            .await
+            .map_err(|_| {
+                NatsError::Timeout(format!("publish timeout waiting server ack on subject {subject}"))
+            })??;
+        if n == 0 {
+            return Err(NatsError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "nats socket closed",
+            )));
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() || line.starts_with("INFO ") || line.starts_with("+OK") {
+            continue;
+        }
+        if line == "PING" {
+            writer_half.write_all(b"PONG\r\n").await?;
+            writer_half.flush().await?;
+            continue;
+        }
+        if line == "PONG" {
+            tracing::debug!(
+                endpoint = %endpoint,
+                subject = %subject,
+                payload_bytes = payload.len(),
+                sync_elapsed_ms = sync_started.elapsed().as_millis() as u64,
+                elapsed_ms = publish_started.elapsed().as_millis() as u64,
+                "nats publish completed with server ack"
+            );
+            break;
+        }
+        if line.starts_with("-ERR") {
+            return Err(NatsError::Protocol(format!("nats error: {line}")));
+        }
+    }
     Ok(())
 }
 
