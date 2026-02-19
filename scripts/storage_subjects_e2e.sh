@@ -92,7 +92,12 @@ wait_sql_true() {
   deadline=$(( $(date +%s) + TIMEOUT_SECS ))
   while [[ $(date +%s) -le $deadline ]]; do
     local res
-    res="$(psql "$DB_URL" -tA -c "$sql" 2>/dev/null || echo "0")"
+    if ! res="$(psql "$DB_URL" -v ON_ERROR_STOP=1 -tA -c "$sql" 2>&1)"; then
+      echo "FAIL: SQL error while waiting '$label'" >&2
+      echo "SQL: $sql" >&2
+      echo "$res" >&2
+      exit 1
+    fi
     res="${res//[[:space:]]/}"
     if [[ "$res" == "1" ]]; then
       echo "OK: $label"
@@ -140,17 +145,34 @@ fi
 
 TRACE_ID="subjects-$(date +%s)-$RANDOM"
 CTX="ctx:${TRACE_ID}"
-EVENT_ID="$(python3 - <<'PY'
-import time
-print(int(time.time() * 1000))
-PY
-)"
+EVENT_START_SEQ="$(date +%s)"
+EVENT_END_SEQ="$((EVENT_START_SEQ + 10))"
 MEMORY_ID="mid-${TRACE_ID}"
 
 EVENT_PAYLOAD="$(cat <<JSON
-{"event":{"event_id":$EVENT_ID,"ctx":"$CTX","start_seq":10,"end_seq":20,"boundary_reason":"smoke_e2e","cues_agg":["smoke","event"],"outcome_status":"open","outcome_duration_ms":1000,"activation_strength":0.5,"context_inhibition":0.0,"use_count":0,"success_count":0}}
+{"event":{"ctx":"$CTX","start_seq":$EVENT_START_SEQ,"end_seq":$EVENT_END_SEQ,"boundary_reason":"smoke_e2e","cues_agg":["smoke","event"],"outcome_status":"open","outcome_duration_ms":1000,"activation_strength":0.5,"context_inhibition":0.0,"use_count":0,"success_count":0}}
 JSON
 )"
+
+echo "Publishing E2E fixtures trace_id=$TRACE_ID memory_id=$MEMORY_ID endpoint=$NATS_URL"
+
+ack="$(publish_nats "$NATS_URL" "$SUBJECT_EVENTS" "$EVENT_PAYLOAD")"
+echo "Published subject=$SUBJECT_EVENTS"
+if [[ -n "$ack" ]]; then
+  echo "NATS response: $ack"
+fi
+
+wait_sql_true \
+  "event inserted in events table" \
+  "SELECT CASE WHEN EXISTS (SELECT 1 FROM events WHERE ctx = '$CTX' AND start_seq = $EVENT_START_SEQ AND end_seq = $EVENT_END_SEQ) THEN 1 ELSE 0 END;"
+
+EVENT_ID="$(psql "$DB_URL" -v ON_ERROR_STOP=1 -tA -c "SELECT event_id FROM events WHERE ctx = '$CTX' AND start_seq = $EVENT_START_SEQ AND end_seq = $EVENT_END_SEQ ORDER BY event_id DESC LIMIT 1;")"
+EVENT_ID="${EVENT_ID//[[:space:]]/}"
+if [[ -z "$EVENT_ID" ]]; then
+  echo "FAIL: could not resolve event_id after insert (ctx=$CTX)" >&2
+  exit 1
+fi
+echo "Resolved event_id=$EVENT_ID"
 
 ITEM_PAYLOAD="$(cat <<JSON
 {"item":{"memory_id":"$MEMORY_ID","event_id":$EVENT_ID,"item_type":"fact","content":{"source":"smoke","trace_id":"$TRACE_ID"},"confidence":0.91,"cues_signature":["smoke","item"],"activation_strength":0.6}}
@@ -161,18 +183,6 @@ REACTIVATION_PAYLOAD="$(cat <<JSON
 {"outcome":{"status":"resolved"},"reactivated":{"events":[{"event_id":$EVENT_ID,"used":true}]}}
 JSON
 )"
-
-echo "Publishing E2E fixtures trace_id=$TRACE_ID event_id=$EVENT_ID memory_id=$MEMORY_ID endpoint=$NATS_URL"
-
-ack="$(publish_nats "$NATS_URL" "$SUBJECT_EVENTS" "$EVENT_PAYLOAD")"
-echo "Published subject=$SUBJECT_EVENTS"
-if [[ -n "$ack" ]]; then
-  echo "NATS response: $ack"
-fi
-
-wait_sql_true \
-  "event inserted in events table" \
-  "SELECT CASE WHEN EXISTS (SELECT 1 FROM events WHERE event_id = $EVENT_ID) THEN 1 ELSE 0 END;"
 
 ack="$(publish_nats "$NATS_URL" "$SUBJECT_ITEMS" "$ITEM_PAYLOAD")"
 echo "Published subject=$SUBJECT_ITEMS"
