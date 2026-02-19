@@ -101,6 +101,11 @@ Criterio de salida:
   - [x] `reply-to` de ack por mensaje y ack automatico post-handler exitoso en subscriber.
   - [x] Redelivery en broker cuando no llega ack dentro de timeout.
   - [x] Test unitario de redelivery por falta de ack.
+- [x] Observabilidad operativa de lag/reintentos (pre-JetStream):
+  - [x] loop periodico en `SY.storage` con metricas de `storage_inbox` (pendientes, pendientes con error, edad del mas viejo).
+  - [x] warning por umbral de backlog/edad para deteccion temprana.
+  - [x] exposicion de contadores acumulados (`nats_subscribe_failures`, `storage_handler_failures`) en logs de metricas.
+  - [x] endpoint admin `GET /config/storage/metrics` para consultar backlog/edad de inbox via API.
 - [x] Base de ack post-persistencia en `SY.storage` (sin JetStream aun):
   - [x] `storage_inbox` durable en PostgreSQL para registrar mensajes recibidos.
   - [x] Replay automatico de pendientes al bootstrap de `SY.storage`.

@@ -22,6 +22,9 @@ const NATS_ERROR_LOG_EVERY: u64 = 20;
 const INBOX_REPLAY_BATCH_SIZE: i64 = 200;
 const INBOX_REPLAY_MAX_ROUNDS: u32 = 20;
 const INBOX_ERROR_MAX_LEN: usize = 1024;
+const STORAGE_METRICS_LOG_INTERVAL_SECS: u64 = 30;
+const STORAGE_METRICS_WARN_PENDING: i64 = 100;
+const STORAGE_METRICS_WARN_AGE_SECS: i64 = 120;
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -151,8 +154,13 @@ async fn main() -> Result<(), StorageError> {
         Arc::clone(&nats_subscribe_errors),
         Arc::clone(&storage_handler_errors),
     ));
+    let metrics_task = tokio::spawn(run_storage_metrics_loop(
+        Arc::clone(&storage),
+        Arc::clone(&nats_subscribe_errors),
+        Arc::clone(&storage_handler_errors),
+    ));
 
-    let _ = tokio::join!(turns_task, events_task, items_task, react_task);
+    let _ = tokio::join!(turns_task, events_task, items_task, react_task, metrics_task);
     Ok(())
 }
 
@@ -305,6 +313,28 @@ WHERE dedupe_key = $1
             }
         }
         Ok(replayed)
+    }
+
+    async fn inbox_metrics(&self) -> Result<InboxMetrics, StorageError> {
+        let row = self
+            .client
+            .query_one(
+                r#"
+SELECT
+    COUNT(*) AS pending,
+    COUNT(*) FILTER (WHERE last_error IS NOT NULL) AS pending_with_error,
+    COALESCE(EXTRACT(EPOCH FROM (now() - MIN(received_at)))::BIGINT, 0) AS oldest_pending_age_s
+FROM storage_inbox
+WHERE processed_at IS NULL
+"#,
+                &[],
+            )
+            .await?;
+        Ok(InboxMetrics {
+            pending: row.get::<_, i64>(0),
+            pending_with_error: row.get::<_, i64>(1),
+            oldest_pending_age_s: row.get::<_, i64>(2),
+        })
     }
 
     async fn ingest_message(
@@ -683,6 +713,12 @@ enum HandlerKind {
     Reactivation,
 }
 
+struct InboxMetrics {
+    pending: i64,
+    pending_with_error: i64,
+    oldest_pending_age_s: i64,
+}
+
 fn handler_kind_for_subject(subject: &str) -> Option<HandlerKind> {
     match subject {
         SUBJECT_STORAGE_TURNS => Some(HandlerKind::Turns),
@@ -759,6 +795,48 @@ async fn run_subject_loop(
             }
         }
         time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn run_storage_metrics_loop(
+    storage: Arc<Storage>,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
+) {
+    let mut ticker = time::interval(Duration::from_secs(STORAGE_METRICS_LOG_INTERVAL_SECS));
+    loop {
+        ticker.tick().await;
+        match storage.inbox_metrics().await {
+            Ok(metrics) => {
+                let subscribe_failures = nats_subscribe_errors.load(Ordering::Relaxed);
+                let handler_failures = storage_handler_errors.load(Ordering::Relaxed);
+                if metrics.pending >= STORAGE_METRICS_WARN_PENDING
+                    || metrics.oldest_pending_age_s >= STORAGE_METRICS_WARN_AGE_SECS
+                    || metrics.pending_with_error > 0
+                {
+                    tracing::warn!(
+                        pending = metrics.pending,
+                        pending_with_error = metrics.pending_with_error,
+                        oldest_pending_age_s = metrics.oldest_pending_age_s,
+                        nats_subscribe_failures = subscribe_failures,
+                        storage_handler_failures = handler_failures,
+                        "storage inbox lag is above threshold"
+                    );
+                } else {
+                    tracing::info!(
+                        pending = metrics.pending,
+                        pending_with_error = metrics.pending_with_error,
+                        oldest_pending_age_s = metrics.oldest_pending_age_s,
+                        nats_subscribe_failures = subscribe_failures,
+                        storage_handler_failures = handler_failures,
+                        "storage inbox metrics"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to collect storage inbox metrics");
+            }
+        }
     }
 }
 

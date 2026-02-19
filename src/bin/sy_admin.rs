@@ -10,6 +10,7 @@ use std::future;
 use tar::{Archive, Builder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio_postgres::NoTls;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time;
 use tracing_subscriber::EnvFilter;
@@ -29,6 +30,7 @@ struct HiveFile {
     role: Option<String>,
     admin: Option<AdminSection>,
     wan: Option<WanSection>,
+    database: Option<DatabaseSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +43,11 @@ struct WanSection {
     authorized_hives: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DatabaseSection {
+    url: Option<String>,
+}
+
 #[derive(Clone)]
 struct AdminContext {
     config_dir: PathBuf,
@@ -48,6 +55,7 @@ struct AdminContext {
     socket_dir: PathBuf,
     hive_id: String,
     authorized_hives: Vec<String>,
+    database_url: Option<String>,
 }
 
 struct AdminRouterClient {
@@ -194,8 +202,10 @@ async fn main() -> Result<(), AdminError> {
     }
     let admin_listen = hive
         .admin
-        .and_then(|admin| admin.listen)
+        .as_ref()
+        .and_then(|admin| admin.listen.clone())
         .unwrap_or_else(|| "0.0.0.0:8080".to_string());
+    let database_url = resolve_database_url(&hive);
 
     let node_config = NodeConfig {
         name: "SY.admin".to_string(),
@@ -219,6 +229,7 @@ async fn main() -> Result<(), AdminError> {
         socket_dir: socket_dir.clone(),
         hive_id,
         authorized_hives,
+        database_url,
     };
     let http_client = router_client.clone();
     tokio::spawn(async move {
@@ -315,6 +326,27 @@ async fn run_broadcast_loop(
 fn load_hive(config_dir: &Path) -> Result<HiveFile, AdminError> {
     let data = fs::read_to_string(config_dir.join("hive.yaml"))?;
     Ok(serde_yaml::from_str(&data)?)
+}
+
+fn resolve_database_url(hive: &HiveFile) -> Option<String> {
+    if let Ok(url) = std::env::var("FLUXBEE_DATABASE_URL") {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Ok(url) = std::env::var("JSR_DATABASE_URL") {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    hive.database
+        .as_ref()
+        .and_then(|db| db.url.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
 }
 
 fn config_changed_version_channel(subsystem: &str) -> &'static str {
@@ -553,6 +585,15 @@ struct OpaQueryEntry {
     payload: serde_json::Value,
 }
 
+#[derive(Debug, Serialize)]
+struct StorageInboxMetrics {
+    pending: i64,
+    pending_with_error: i64,
+    oldest_pending_age_s: i64,
+    processed_total: i64,
+    max_attempts: i32,
+}
+
 async fn run_http_server(
     listen: &str,
     tx: &mpsc::UnboundedSender<BroadcastRequest>,
@@ -707,6 +748,10 @@ async fn handle_http(
         }
         ("GET", "/config/storage") => {
             let (status, resp) = handle_admin_query(ctx, client, "get_storage", None).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("GET", "/config/storage/metrics") => {
+            let (status, resp) = handle_storage_metrics_http(ctx).await;
             respond_json(stream, status, &resp).await?;
         }
         ("PUT", "/config/storage") => {
@@ -1312,6 +1357,93 @@ fn payload_error_code(payload: &serde_json::Value) -> Option<String> {
 
 fn payload_error_detail(payload: &serde_json::Value) -> Option<String> {
     value_string_field(payload, "error_detail").or_else(|| value_string_field(payload, "message"))
+}
+
+async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
+    let action = "get_storage_metrics";
+    let Some(database_url) = ctx.database_url.as_deref() else {
+        let error_detail = "database.url missing in hive.yaml and env".to_string();
+        return (
+            503,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": {
+                    "status": "error",
+                    "error_code": "STORAGE_METRICS_UNAVAILABLE",
+                    "message": error_detail,
+                },
+                "error_code": "STORAGE_METRICS_UNAVAILABLE",
+                "error_detail": error_detail,
+            })
+            .to_string(),
+        );
+    };
+
+    match fetch_storage_inbox_metrics(database_url).await {
+        Ok(metrics) => (
+            200,
+            serde_json::json!({
+                "status": "ok",
+                "action": action,
+                "payload": {
+                    "status": "ok",
+                    "metrics": metrics,
+                },
+                "error_code": serde_json::Value::Null,
+                "error_detail": serde_json::Value::Null,
+            })
+            .to_string(),
+        ),
+        Err(err) => {
+            let error_detail = err.to_string();
+            (
+                503,
+                serde_json::json!({
+                    "status": "error",
+                    "action": action,
+                    "payload": {
+                        "status": "error",
+                        "error_code": "STORAGE_METRICS_UNAVAILABLE",
+                        "message": error_detail,
+                    },
+                    "error_code": "STORAGE_METRICS_UNAVAILABLE",
+                    "error_detail": error_detail,
+                })
+                .to_string(),
+            )
+        }
+    }
+}
+
+async fn fetch_storage_inbox_metrics(database_url: &str) -> Result<StorageInboxMetrics, AdminError> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!("storage metrics postgres connection closed: {err}");
+        }
+    });
+    let row = client
+        .query_one(
+            r#"
+SELECT
+    COUNT(*) FILTER (WHERE processed_at IS NULL) AS pending,
+    COUNT(*) FILTER (WHERE processed_at IS NULL AND last_error IS NOT NULL) AS pending_with_error,
+    COALESCE(EXTRACT(EPOCH FROM (now() - MIN(received_at) FILTER (WHERE processed_at IS NULL)))::BIGINT, 0) AS oldest_pending_age_s,
+    COUNT(*) FILTER (WHERE processed_at IS NOT NULL) AS processed_total,
+    COALESCE(MAX(attempts), 0) AS max_attempts
+FROM storage_inbox
+"#,
+            &[],
+        )
+        .await?;
+    Ok(StorageInboxMetrics {
+        pending: row.get::<_, i64>(0),
+        pending_with_error: row.get::<_, i64>(1),
+        oldest_pending_age_s: row.get::<_, i64>(2),
+        processed_total: row.get::<_, i64>(3),
+        max_attempts: row.get::<_, i32>(4),
+    })
 }
 
 fn is_ok_status(status: Option<&str>) -> bool {
