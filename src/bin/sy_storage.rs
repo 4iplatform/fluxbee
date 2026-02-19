@@ -241,6 +241,8 @@ ON CONFLICT (ctx, seq) DO NOTHING
     async fn handle_event(&self, payload: &[u8]) -> Result<(), StorageError> {
         let value: Value = serde_json::from_slice(payload)?;
         let event = parse_event(value)?;
+        let activation_strength = event.activation_strength as f32;
+        let context_inhibition = event.context_inhibition as f32;
         if let Some(event_id) = event.event_id {
             self.client
                 .execute(
@@ -273,8 +275,8 @@ ON CONFLICT (event_id) DO UPDATE SET
                         &event.cues_agg,
                         &event.outcome_status,
                         &event.outcome_duration_ms,
-                        &event.activation_strength,
-                        &event.context_inhibition,
+                        &activation_strength,
+                        &context_inhibition,
                         &event.use_count,
                         &event.success_count,
                     ],
@@ -299,8 +301,8 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                         &event.cues_agg,
                         &event.outcome_status,
                         &event.outcome_duration_ms,
-                        &event.activation_strength,
-                        &event.context_inhibition,
+                        &activation_strength,
+                        &context_inhibition,
                         &event.use_count,
                         &event.success_count,
                     ],
@@ -313,6 +315,8 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
     async fn handle_item(&self, payload: &[u8]) -> Result<(), StorageError> {
         let value: Value = serde_json::from_slice(payload)?;
         let item = parse_memory_item(value)?;
+        let confidence = item.confidence as f32;
+        let activation_strength = item.activation_strength as f32;
         self.client
             .execute(
                 r#"
@@ -327,9 +331,9 @@ ON CONFLICT (memory_id) DO NOTHING
                     &item.event_id,
                     &item.item_type,
                     &item.content,
-                    &item.confidence,
+                    &confidence,
                     &item.cues_signature,
-                    &item.activation_strength,
+                    &activation_strength,
                 ],
             )
             .await?;
