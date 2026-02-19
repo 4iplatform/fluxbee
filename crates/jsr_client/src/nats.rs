@@ -58,10 +58,62 @@ pub async fn request(
     writer_half.write_all(b"PING\r\n").await?;
     writer_half.flush().await?;
 
-    publish(endpoint, request_subject, request_payload).await?;
-
     let mut reader = BufReader::new(reader_half);
     let deadline = tokio::time::Instant::now() + timeout_duration;
+    loop {
+        let remaining = deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(NatsError::Timeout(format!(
+                "request timeout waiting subscription ack on {response_subject}"
+            )));
+        }
+
+        let mut line = String::new();
+        let n = timeout(remaining, reader.read_line(&mut line))
+            .await
+            .map_err(|_| {
+                NatsError::Timeout(format!(
+                    "request timeout waiting subscription ack on {response_subject}"
+                ))
+            })??;
+        if n == 0 {
+            return Err(NatsError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "nats socket closed",
+            )));
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() || line.starts_with("INFO ") || line.starts_with("+OK") {
+            continue;
+        }
+        if line == "PING" {
+            writer_half.write_all(b"PONG\r\n").await?;
+            writer_half.flush().await?;
+            continue;
+        }
+        if line == "PONG" {
+            break;
+        }
+        if line.starts_with("-ERR") {
+            return Err(NatsError::Protocol(format!("nats error: {line}")));
+        }
+        if line.starts_with("MSG ") {
+            let msg = parse_msg_line(line)?;
+            let mut payload = vec![0u8; msg.payload_len + 2];
+            timeout(remaining, reader.read_exact(&mut payload))
+                .await
+                .map_err(|_| {
+                    NatsError::Timeout(format!(
+                        "request timeout draining pre-ack payload on {response_subject}"
+                    ))
+                })??;
+            continue;
+        }
+    }
+
+    publish(endpoint, request_subject, request_payload).await?;
+
     loop {
         let remaining = deadline
             .saturating_duration_since(tokio::time::Instant::now());
