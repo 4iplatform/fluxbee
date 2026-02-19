@@ -15,6 +15,8 @@ set -euo pipefail
 #   RUN_ROUTER_CYCLE="1"
 #   RUN_NODE_CYCLE="1"
 #   RUN_STORAGE_METRICS_CHECK="1"
+#   STORAGE_METRICS_TIMEOUT_SECS="30"
+#   STORAGE_METRICS_POLL_SECS="2"
 #   NODE_RUNTIME="wf.echo"
 #   NODE_VERSION="current"
 #   STORAGE_TEST_PATH="/var/lib/fluxbee/storage-e2e"
@@ -27,6 +29,8 @@ ROUTER_SERVICE="${ROUTER_SERVICE:-rt-gateway}"
 RUN_ROUTER_CYCLE="${RUN_ROUTER_CYCLE:-1}"
 RUN_NODE_CYCLE="${RUN_NODE_CYCLE:-1}"
 RUN_STORAGE_METRICS_CHECK="${RUN_STORAGE_METRICS_CHECK:-1}"
+STORAGE_METRICS_TIMEOUT_SECS="${STORAGE_METRICS_TIMEOUT_SECS:-30}"
+STORAGE_METRICS_POLL_SECS="${STORAGE_METRICS_POLL_SECS:-2}"
 NODE_RUNTIME="${NODE_RUNTIME:-wf.echo}"
 NODE_VERSION="${NODE_VERSION:-current}"
 RESTORE_STORAGE="${RESTORE_STORAGE:-1}"
@@ -267,11 +271,25 @@ fi
 # 6) /config/storage/metrics via SY.admin -> NATS -> SY.storage
 if [[ "$RUN_STORAGE_METRICS_CHECK" == "1" ]]; then
   storage_metrics_body="$tmpdir/storage_metrics.json"
-  status="$(http_call "GET" "$BASE/config/storage/metrics" "$storage_metrics_body")"
-  log_http_response "$status" "$storage_metrics_body"
-  assert_eq "$status" "200" "GET /config/storage/metrics/http"
-  assert_eq "$(json_get "status" "$storage_metrics_body")" "ok" "GET /config/storage/metrics/status"
-  assert_eq "$(json_get "payload.status" "$storage_metrics_body")" "ok" "GET /config/storage/metrics/payload.status"
+  metrics_ok="0"
+  elapsed="0"
+  while (( elapsed <= STORAGE_METRICS_TIMEOUT_SECS )); do
+    status="$(http_call "GET" "$BASE/config/storage/metrics" "$storage_metrics_body")"
+    log_http_response "$status" "$storage_metrics_body"
+    if [[ "$status" == "200" ]] && \
+       [[ "$(json_get "status" "$storage_metrics_body")" == "ok" ]] && \
+       [[ "$(json_get "payload.status" "$storage_metrics_body")" == "ok" ]]; then
+      metrics_ok="1"
+      break
+    fi
+    if (( elapsed == STORAGE_METRICS_TIMEOUT_SECS )); then
+      break
+    fi
+    echo "[POLL][storage_metrics] elapsed=${elapsed}s waiting for /config/storage/metrics=200" >&2
+    sleep "$STORAGE_METRICS_POLL_SECS"
+    elapsed=$((elapsed + STORAGE_METRICS_POLL_SECS))
+  done
+  assert_eq "$metrics_ok" "1" "GET /config/storage/metrics/http+status"
 
   for metric_key in pending pending_with_error oldest_pending_age_s processed_total max_attempts; do
     metric_val="$(json_get "payload.metrics.${metric_key}" "$storage_metrics_body")"
