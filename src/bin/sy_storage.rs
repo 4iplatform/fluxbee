@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -930,36 +930,74 @@ async fn run_storage_metrics_query_loop(
                         );
                         return Ok(());
                     }
+                    let request_started = Instant::now();
+                    let trace_id = req.trace_id.clone();
+                    let reply_subject = req.reply_subject.clone();
+                    tracing::info!(
+                        trace_id = %trace_id,
+                        request_subject = SUBJECT_STORAGE_METRICS_GET,
+                        reply_subject = %reply_subject,
+                        "storage metrics nats request received"
+                    );
 
-                    let response = match storage.inbox_metrics_snapshot().await {
-                        Ok(metrics) => serde_json::json!({
-                            "trace_id": req.trace_id,
-                            "status": "ok",
-                            "metrics": metrics,
-                        }),
-                        Err(err) => serde_json::json!({
-                            "trace_id": req.trace_id,
-                            "status": "error",
-                            "error_code": "STORAGE_METRICS_UNAVAILABLE",
-                            "error_detail": err.to_string(),
-                        }),
+                    let db_started = Instant::now();
+                    let (response, response_status) = match storage.inbox_metrics_snapshot().await {
+                        Ok(metrics) => (
+                            serde_json::json!({
+                                "trace_id": trace_id,
+                                "status": "ok",
+                                "metrics": metrics,
+                            }),
+                            "ok",
+                        ),
+                        Err(err) => (
+                            serde_json::json!({
+                                "trace_id": trace_id,
+                                "status": "error",
+                                "error_code": "STORAGE_METRICS_UNAVAILABLE",
+                                "error_detail": err.to_string(),
+                            }),
+                            "error",
+                        ),
                     };
+                    let db_elapsed_ms = db_started.elapsed().as_millis() as u64;
                     let body = serde_json::to_vec(&response)
                         .map_err(|err| ClientNatsError::Protocol(err.to_string()))?;
+                    let publish_started = Instant::now();
                     if let Err(err) =
-                        client_nats_publish(&endpoint_out, &req.reply_subject, &body).await
+                        client_nats_publish(&endpoint_out, &reply_subject, &body).await
                     {
                         let count = storage_handler_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                        let publish_elapsed_ms = publish_started.elapsed().as_millis() as u64;
+                        let total_elapsed_ms = request_started.elapsed().as_millis() as u64;
                         if count == 1 || count % NATS_ERROR_LOG_EVERY == 0 {
                             tracing::warn!(
+                                trace_id = %trace_id,
                                 error = %err,
                                 failures = count,
+                                request_subject = SUBJECT_STORAGE_METRICS_GET,
+                                reply_subject = %reply_subject,
+                                db_elapsed_ms = db_elapsed_ms,
+                                publish_elapsed_ms = publish_elapsed_ms,
+                                total_elapsed_ms = total_elapsed_ms,
                                 subject = SUBJECT_STORAGE_METRICS_GET,
                                 "storage metrics response publish failed"
                             );
                         }
                         return Err(err);
                     }
+                    let publish_elapsed_ms = publish_started.elapsed().as_millis() as u64;
+                    let total_elapsed_ms = request_started.elapsed().as_millis() as u64;
+                    tracing::info!(
+                        trace_id = %trace_id,
+                        request_subject = SUBJECT_STORAGE_METRICS_GET,
+                        reply_subject = %reply_subject,
+                        status = response_status,
+                        db_elapsed_ms = db_elapsed_ms,
+                        publish_elapsed_ms = publish_elapsed_ms,
+                        total_elapsed_ms = total_elapsed_ms,
+                        "storage metrics nats response sent"
+                    );
                     Ok(())
                 }
             })

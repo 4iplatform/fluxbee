@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use std::future;
@@ -1418,6 +1418,16 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
         }
     };
     let sid = storage_metrics_sid(&trace_id);
+    let request_started = Instant::now();
+    tracing::info!(
+        trace_id = %trace_id,
+        endpoint = %ctx.nats_endpoint,
+        request_subject = SUBJECT_STORAGE_METRICS_GET,
+        reply_subject = %reply_subject,
+        sid = sid,
+        timeout_secs = STORAGE_METRICS_NATS_TIMEOUT_SECS,
+        "storage metrics nats request send"
+    );
     let response_body = match nats_request(
         &ctx.nats_endpoint,
         SUBJECT_STORAGE_METRICS_GET,
@@ -1428,9 +1438,33 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
     )
     .await
     {
-        Ok(body) => body,
+        Ok(body) => {
+            let elapsed_ms = request_started.elapsed().as_millis() as u64;
+            tracing::info!(
+                trace_id = %trace_id,
+                endpoint = %ctx.nats_endpoint,
+                request_subject = SUBJECT_STORAGE_METRICS_GET,
+                reply_subject = %reply_subject,
+                sid = sid,
+                elapsed_ms = elapsed_ms,
+                response_bytes = body.len(),
+                "storage metrics nats response received"
+            );
+            body
+        }
         Err(err) => {
             let error_detail = err.to_string();
+            let elapsed_ms = request_started.elapsed().as_millis() as u64;
+            tracing::warn!(
+                trace_id = %trace_id,
+                endpoint = %ctx.nats_endpoint,
+                request_subject = SUBJECT_STORAGE_METRICS_GET,
+                reply_subject = %reply_subject,
+                sid = sid,
+                elapsed_ms = elapsed_ms,
+                error = %error_detail,
+                "storage metrics nats request failed"
+            );
             return (
                 503,
                 serde_json::json!({
@@ -1452,6 +1486,17 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
         Ok(resp) => resp,
         Err(err) => {
             let error_detail = err.to_string();
+            let elapsed_ms = request_started.elapsed().as_millis() as u64;
+            tracing::warn!(
+                trace_id = %trace_id,
+                endpoint = %ctx.nats_endpoint,
+                request_subject = SUBJECT_STORAGE_METRICS_GET,
+                reply_subject = %reply_subject,
+                sid = sid,
+                elapsed_ms = elapsed_ms,
+                error = %error_detail,
+                "storage metrics nats response decode failed"
+            );
             return (
                 502,
                 serde_json::json!({
@@ -1473,6 +1518,17 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
         let error_detail = format!(
             "trace_id mismatch expected={} got={}",
             trace_id, response.trace_id
+        );
+        let elapsed_ms = request_started.elapsed().as_millis() as u64;
+        tracing::warn!(
+            trace_id = %trace_id,
+            endpoint = %ctx.nats_endpoint,
+            request_subject = SUBJECT_STORAGE_METRICS_GET,
+            reply_subject = %reply_subject,
+            sid = sid,
+            elapsed_ms = elapsed_ms,
+            error = %error_detail,
+            "storage metrics nats response trace mismatch"
         );
         return (
             502,
