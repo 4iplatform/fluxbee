@@ -82,12 +82,13 @@ Avance de implementacion:
   - [x] start
   - [x] health
   - [x] stop
-  - [ ] recovery post-crash.
+  - [x] recovery post-crash.
 - [x] Alinear config `nats.mode=embedded|client` con comportamiento real.
 
 Avance Fase 2 (2026-02-19):
 - `stop` explicito implementado en broker embebido (`stop_embedded_broker`) y conectado a `SIGTERM/SIGINT` de `rt-gateway`.
-- Recovery parcial: `start_embedded_broker` ahora tolera `AddrInUse` si el endpoint ya responde health.
+- Recovery post-crash/end-point down: loop de autorecuperacion en router (`embedded`), con health-check periodico + restart del broker cuando cae.
+- Recovery de estado inconsistente: `start_embedded_broker` ahora recupera instancia registrada no saludable.
 
 Criterio de salida:
 - En `embedded`, el router garantiza NATS local operativo sin dependencia manual externa.

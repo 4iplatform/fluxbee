@@ -45,16 +45,35 @@ fn embedded_registry() -> &'static Mutex<HashMap<String, EmbeddedBrokerHandle>> 
 
 pub async fn start_embedded_broker(endpoint: &str) -> Result<(), io::Error> {
     let addr = endpoint_to_addr(endpoint)?;
-
-    {
+    let existing = {
         let mut registry = embedded_registry().lock().await;
-        if let Some(handle) = registry.get(&addr) {
-            if !handle.task.is_finished() {
+        registry.retain(|_, handle| !handle.task.is_finished());
+        registry.remove(&addr)
+    };
+
+    if let Some(handle) = existing {
+        if !handle.task.is_finished() {
+            if check_endpoint(endpoint, Duration::from_millis(400))
+                .await
+                .is_ok()
+            {
+                let mut registry = embedded_registry().lock().await;
+                registry.insert(addr.clone(), handle);
                 tracing::debug!(endpoint = %endpoint, "embedded nats broker already running");
                 return Ok(());
             }
+            tracing::warn!(
+                endpoint = %endpoint,
+                "embedded nats registry had a non-responsive broker; forcing restart"
+            );
+            if let Err(err) = stop_embedded_broker_handle(&addr, handle).await {
+                tracing::warn!(
+                    endpoint = %endpoint,
+                    error = %err,
+                    "failed to stop stale embedded nats broker handle before restart"
+                );
+            }
         }
-        registry.retain(|_, handle| !handle.task.is_finished());
     }
 
     let listener = match TcpListener::bind(&addr).await {
@@ -601,7 +620,9 @@ mod tests {
         start_embedded_broker(&endpoint)
             .await
             .expect("start embedded broker");
-        check_endpoint(&endpoint, Duration::from_secs(2)).await.expect("health");
+        check_endpoint(&endpoint, Duration::from_secs(2))
+            .await
+            .expect("health");
 
         // Idempotent start on same endpoint should not fail.
         start_embedded_broker(&endpoint)
@@ -615,5 +636,16 @@ mod tests {
             wait_endpoint_down(&endpoint, 1500).await,
             "endpoint stayed up after stop"
         );
+
+        // Recovery: start again after stop.
+        start_embedded_broker(&endpoint)
+            .await
+            .expect("start after stop");
+        check_endpoint(&endpoint, Duration::from_secs(2))
+            .await
+            .expect("health after recovery");
+        stop_embedded_broker(&endpoint)
+            .await
+            .expect("final stop after recovery");
     }
 }

@@ -75,6 +75,7 @@ pub struct Router {
 
 const NATS_READY_TIMEOUT_SECS: u64 = 20;
 const NATS_READY_RETRY_MS: u64 = 250;
+const NATS_EMBEDDED_RECOVERY_INTERVAL_SECS: u64 = 5;
 const NATS_PUBLISH_ERROR_LOG_EVERY: u64 = 25;
 const LSA_REJECT_HIVE_MISMATCH: &str = "hive_mismatch";
 const LSA_REJECT_STALE_SEQ: &str = "stale_seq";
@@ -145,6 +146,9 @@ impl Router {
     pub async fn run(&self) -> Result<(), RouterError> {
         prepare_nats_runtime(&self.cfg).await?;
         wait_for_nats_ready(&self.cfg, Duration::from_secs(NATS_READY_TIMEOUT_SECS)).await?;
+        if self.cfg.nats_mode == "embedded" {
+            spawn_embedded_nats_recovery_loop(&self.cfg);
+        }
         ensure_parent_dir(&self.cfg.node_socket_path)?;
         let _ = std::fs::remove_file(&self.cfg.node_socket_path);
         let listener = UnixListener::bind(&self.cfg.node_socket_path)?;
@@ -3946,25 +3950,72 @@ fn match_any_hive(base: &str, full_name: &str) -> bool {
     name_base == base
 }
 
-async fn wait_for_nats_ready(cfg: &RouterConfig, timeout: Duration) -> Result<(), RouterError> {
+async fn wait_for_nats_endpoint(endpoint: &str, timeout: Duration) -> Result<(), RouterError> {
     let start = time::Instant::now();
     loop {
-        match nats_check_endpoint(&cfg.nats_url, Duration::from_secs(2)).await {
+        match nats_check_endpoint(endpoint, Duration::from_secs(2)).await {
             Ok(()) => {
-                tracing::info!(endpoint = %cfg.nats_url, "nats endpoint ready");
+                tracing::info!(endpoint = %endpoint, "nats endpoint ready");
                 return Ok(());
             }
             Err(err) => {
                 if start.elapsed() >= timeout {
                     return Err(RouterError::Startup(format!(
                         "nats readiness timeout endpoint={} error={}",
-                        cfg.nats_url, err
+                        endpoint, err
                     )));
                 }
             }
         }
         time::sleep(Duration::from_millis(NATS_READY_RETRY_MS)).await;
     }
+}
+
+async fn wait_for_nats_ready(cfg: &RouterConfig, timeout: Duration) -> Result<(), RouterError> {
+    wait_for_nats_endpoint(&cfg.nats_url, timeout).await
+}
+
+fn spawn_embedded_nats_recovery_loop(cfg: &RouterConfig) {
+    let endpoint = cfg.nats_url.clone();
+    tokio::spawn(async move {
+        let mut ticker = time::interval(Duration::from_secs(NATS_EMBEDDED_RECOVERY_INTERVAL_SECS));
+        loop {
+            ticker.tick().await;
+            if nats_check_endpoint(&endpoint, Duration::from_secs(2))
+                .await
+                .is_ok()
+            {
+                continue;
+            }
+            tracing::warn!(
+                endpoint = %endpoint,
+                "embedded nats health-check failed; attempting recovery"
+            );
+            if let Err(err) = start_embedded_broker(&endpoint).await {
+                tracing::warn!(
+                    endpoint = %endpoint,
+                    error = %err,
+                    "embedded nats recovery start failed"
+                );
+                continue;
+            }
+            if let Err(err) =
+                wait_for_nats_endpoint(&endpoint, Duration::from_secs(NATS_READY_TIMEOUT_SECS))
+                    .await
+            {
+                tracing::warn!(
+                    endpoint = %endpoint,
+                    error = %err,
+                    "embedded nats recovery health-check failed"
+                );
+                continue;
+            }
+            tracing::info!(
+                endpoint = %endpoint,
+                "embedded nats recovery succeeded"
+            );
+        }
+    });
 }
 
 async fn prepare_nats_runtime(cfg: &RouterConfig) -> Result<(), RouterError> {
