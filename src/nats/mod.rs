@@ -54,6 +54,16 @@ struct EmbeddedBrokerState {
 struct EmbeddedBrokerHandle {
     shutdown_tx: oneshot::Sender<()>,
     task: JoinHandle<Result<(), io::Error>>,
+    state: Arc<Mutex<EmbeddedBrokerState>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EmbeddedBrokerMetrics {
+    pub subscribers: usize,
+    pub pending_unacked: usize,
+    pub acked_count: u64,
+    pub redelivery_count: u64,
+    pub dropped_count: u64,
 }
 
 fn embedded_registry() -> &'static Mutex<HashMap<String, EmbeddedBrokerHandle>> {
@@ -114,13 +124,20 @@ pub async fn start_embedded_broker(endpoint: &str) -> Result<(), io::Error> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(run_embedded_broker(
         listener,
-        state,
+        Arc::clone(&state),
         next_connection_id,
         shutdown_rx,
     ));
 
     let mut registry = embedded_registry().lock().await;
-    registry.insert(addr, EmbeddedBrokerHandle { shutdown_tx, task });
+    registry.insert(
+        addr,
+        EmbeddedBrokerHandle {
+            shutdown_tx,
+            task,
+            state,
+        },
+    );
 
     Ok(())
 }
@@ -154,6 +171,28 @@ pub async fn stop_all_embedded_brokers() -> Result<(), io::Error> {
     Ok(())
 }
 
+pub async fn embedded_broker_metrics(
+    endpoint: &str,
+) -> Result<Option<EmbeddedBrokerMetrics>, io::Error> {
+    let addr = endpoint_to_addr(endpoint)?;
+    let state = {
+        let mut registry = embedded_registry().lock().await;
+        registry.retain(|_, handle| !handle.task.is_finished());
+        let Some(handle) = registry.get(&addr) else {
+            return Ok(None);
+        };
+        Arc::clone(&handle.state)
+    };
+    let state = state.lock().await;
+    Ok(Some(EmbeddedBrokerMetrics {
+        subscribers: state.subscribers.len(),
+        pending_unacked: state.pending.len(),
+        acked_count: state.acked_count,
+        redelivery_count: state.redelivery_count,
+        dropped_count: state.dropped_count,
+    }))
+}
+
 async fn stop_embedded_broker_handle(
     endpoint: &str,
     handle: EmbeddedBrokerHandle,
@@ -161,6 +200,7 @@ async fn stop_embedded_broker_handle(
     let EmbeddedBrokerHandle {
         shutdown_tx,
         mut task,
+        state: _,
     } = handle;
     let _ = shutdown_tx.send(());
 
