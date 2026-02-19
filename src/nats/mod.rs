@@ -1,10 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -23,12 +26,16 @@ const EMBEDDED_ACK_SUBJECT_PREFIX: &str = "_JSR.ACK.";
 const EMBEDDED_ACK_TIMEOUT_SECS: u64 = 2;
 const EMBEDDED_ACK_MAX_ATTEMPTS: u32 = 8;
 const EMBEDDED_REDELIVERY_TICK_MS: u64 = 250;
+const EMBEDDED_STATE_FLUSH_TICK_MS: u64 = 500;
+const DURABLE_QUEUE_PREFIX: &str = "durable.";
+const DURABLE_STREAM_MAX_MESSAGES: usize = 50_000;
 
 #[derive(Clone)]
 struct EmbeddedSubscriber {
     connection_id: u64,
     subject: String,
     sid: String,
+    durable_consumer: Option<String>,
     tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
@@ -39,6 +46,33 @@ struct PendingDelivery {
     payload: Vec<u8>,
     attempts: u32,
     last_sent_at: Instant,
+    durable_consumer: Option<String>,
+    stream_seq: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DurableMessage {
+    seq: u64,
+    payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct DurableStream {
+    last_seq: u64,
+    messages: VecDeque<DurableMessage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DurableConsumer {
+    subject: String,
+    durable_name: String,
+    acked_seq: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct DurableStateSnapshot {
+    streams: HashMap<String, DurableStream>,
+    consumers: HashMap<String, DurableConsumer>,
 }
 
 #[derive(Default)]
@@ -49,6 +83,10 @@ struct EmbeddedBrokerState {
     acked_count: u64,
     redelivery_count: u64,
     dropped_count: u64,
+    durable_streams: HashMap<String, DurableStream>,
+    durable_consumers: HashMap<String, DurableConsumer>,
+    durable_state_path: Option<PathBuf>,
+    durable_dirty: bool,
 }
 
 struct EmbeddedBrokerHandle {
@@ -72,7 +110,17 @@ fn embedded_registry() -> &'static Mutex<HashMap<String, EmbeddedBrokerHandle>> 
 }
 
 pub async fn start_embedded_broker(endpoint: &str) -> Result<(), io::Error> {
+    start_embedded_broker_with_storage(endpoint, None::<&Path>).await
+}
+
+pub async fn start_embedded_broker_with_storage<P: AsRef<Path>>(
+    endpoint: &str,
+    storage_dir: Option<P>,
+) -> Result<(), io::Error> {
     let addr = endpoint_to_addr(endpoint)?;
+    let durable_state_path = storage_dir
+        .map(|path| durable_state_path(path.as_ref(), &addr))
+        .transpose()?;
     let existing = {
         let mut registry = embedded_registry().lock().await;
         registry.retain(|_, handle| !handle.task.is_finished());
@@ -119,7 +167,17 @@ pub async fn start_embedded_broker(endpoint: &str) -> Result<(), io::Error> {
         Err(err) => return Err(err),
     };
 
-    let state = Arc::new(Mutex::new(EmbeddedBrokerState::default()));
+    let snapshot = if let Some(path) = durable_state_path.as_ref() {
+        load_durable_snapshot(path)?
+    } else {
+        DurableStateSnapshot::default()
+    };
+    let state = Arc::new(Mutex::new(EmbeddedBrokerState {
+        durable_streams: snapshot.streams,
+        durable_consumers: snapshot.consumers,
+        durable_state_path: durable_state_path.clone(),
+        ..Default::default()
+    }));
     let next_connection_id = Arc::new(AtomicU64::new(1));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(run_embedded_broker(
@@ -193,6 +251,104 @@ pub async fn embedded_broker_metrics(
     }))
 }
 
+fn sanitize_addr_for_path(addr: &str) -> String {
+    addr.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => c,
+            _ => '_',
+        })
+        .collect()
+}
+
+fn durable_state_path(storage_dir: &Path, addr: &str) -> Result<PathBuf, io::Error> {
+    fs::create_dir_all(storage_dir)?;
+    Ok(storage_dir.join(format!("embedded-js-{}.json", sanitize_addr_for_path(addr))))
+}
+
+fn load_durable_snapshot(path: &Path) -> Result<DurableStateSnapshot, io::Error> {
+    if !path.exists() {
+        return Ok(DurableStateSnapshot::default());
+    }
+    let raw = fs::read(path)?;
+    if raw.is_empty() {
+        return Ok(DurableStateSnapshot::default());
+    }
+    serde_json::from_slice::<DurableStateSnapshot>(&raw).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid durable embedded nats snapshot {}: {err}",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn save_durable_snapshot(path: &Path, snapshot: &DurableStateSnapshot) -> Result<(), io::Error> {
+    let body = serde_json::to_vec(snapshot).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("serialize durable embedded nats snapshot failed: {err}"),
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, body)?;
+    fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+fn build_durable_snapshot(state: &EmbeddedBrokerState) -> DurableStateSnapshot {
+    DurableStateSnapshot {
+        streams: state.durable_streams.clone(),
+        consumers: state.durable_consumers.clone(),
+    }
+}
+
+async fn flush_durable_state_if_dirty(state: &Arc<Mutex<EmbeddedBrokerState>>) {
+    let (path, snapshot) = {
+        let mut guard = state.lock().await;
+        if !guard.durable_dirty {
+            return;
+        }
+        let Some(path) = guard.durable_state_path.clone() else {
+            guard.durable_dirty = false;
+            return;
+        };
+        guard.durable_dirty = false;
+        (path, build_durable_snapshot(&guard))
+    };
+    if let Err(err) = save_durable_snapshot(&path, &snapshot) {
+        let mut guard = state.lock().await;
+        guard.durable_dirty = true;
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "failed flushing embedded durable nats state"
+        );
+    }
+}
+
+async fn flush_durable_state_force(state: &Arc<Mutex<EmbeddedBrokerState>>) {
+    let (path, snapshot) = {
+        let mut guard = state.lock().await;
+        let Some(path) = guard.durable_state_path.clone() else {
+            return;
+        };
+        guard.durable_dirty = false;
+        (path, build_durable_snapshot(&guard))
+    };
+    if let Err(err) = save_durable_snapshot(&path, &snapshot) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "failed final flush of embedded durable nats state"
+        );
+    }
+}
+
 async fn stop_embedded_broker_handle(
     endpoint: &str,
     handle: EmbeddedBrokerHandle,
@@ -231,6 +387,8 @@ async fn run_embedded_broker(
     let mut connection_tasks = JoinSet::new();
     let mut redelivery_ticker =
         tokio::time::interval(Duration::from_millis(EMBEDDED_REDELIVERY_TICK_MS));
+    let mut flush_ticker =
+        tokio::time::interval(Duration::from_millis(EMBEDDED_STATE_FLUSH_TICK_MS));
     loop {
         tokio::select! {
             _ = &mut shutdown_rx => {
@@ -239,6 +397,9 @@ async fn run_embedded_broker(
             }
             _ = redelivery_ticker.tick() => {
                 redeliver_embedded_pending(&state).await;
+            }
+            _ = flush_ticker.tick() => {
+                flush_durable_state_if_dirty(&state).await;
             }
             accepted = listener.accept() => {
                 let (stream, _) = match accepted {
@@ -274,7 +435,20 @@ async fn run_embedded_broker(
             "embedded nats broker stopping"
         );
     }
-
+    let drain_deadline = Instant::now() + Duration::from_millis(1200);
+    while !connection_tasks.is_empty() && Instant::now() < drain_deadline {
+        let remaining = drain_deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, connection_tasks.join_next()).await {
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(err))) => {
+                if !err.is_cancelled() {
+                    tracing::debug!(error = %err, "embedded nats connection task join failed");
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
     connection_tasks.abort_all();
     while let Some(result) = connection_tasks.join_next().await {
         if let Err(err) = result {
@@ -283,6 +457,7 @@ async fn run_embedded_broker(
             }
         }
     }
+    flush_durable_state_force(&state).await;
 
     Ok(())
 }
@@ -341,13 +516,16 @@ async fn handle_embedded_connection(
             continue;
         }
         if line.starts_with("SUB ") {
-            let (subject, sid) = parse_sub_command(line)?;
+            let (subject, sid, queue) = parse_sub_command(line)?;
+            let durable_consumer =
+                queue.and_then(|value| parse_durable_consumer_key(&subject, &value));
             add_embedded_subscriber(
                 &state,
                 EmbeddedSubscriber {
                     connection_id,
                     subject,
                     sid,
+                    durable_consumer,
                     tx: tx.clone(),
                 },
             )
@@ -389,7 +567,31 @@ async fn add_embedded_subscriber(
     subscriber: EmbeddedSubscriber,
 ) {
     let mut state = state.lock().await;
+    if let Some(consumer_key) = subscriber.durable_consumer.clone() {
+        state
+            .durable_consumers
+            .entry(consumer_key.clone())
+            .or_insert_with(|| DurableConsumer {
+                subject: subscriber.subject.clone(),
+                durable_name: consumer_key.clone(),
+                acked_seq: 0,
+            });
+        state.durable_dirty = true;
+        state.subscribers.retain(|entry| {
+            !entry
+                .durable_consumer
+                .as_deref()
+                .is_some_and(|key| key == consumer_key)
+        });
+    }
     state.subscribers.push(subscriber);
+    if let Some(consumer_key) = state
+        .subscribers
+        .last()
+        .and_then(|entry| entry.durable_consumer.clone())
+    {
+        let _ = deliver_next_durable_message(&mut state, &consumer_key);
+    }
 }
 
 async fn remove_embedded_sid(
@@ -422,6 +624,9 @@ async fn publish_embedded_subject(
     payload: &[u8],
 ) {
     let mut state = state.lock().await;
+    if should_persist_subject(&state, subject) {
+        append_stream_message(&mut state, subject, payload.to_vec());
+    }
     let targets: Vec<EmbeddedSubscriber> = state
         .subscribers
         .iter()
@@ -431,6 +636,10 @@ async fn publish_embedded_subject(
     let mut stale_connections = Vec::new();
 
     for subscriber in targets {
+        if let Some(consumer_key) = subscriber.durable_consumer.clone() {
+            let _ = deliver_next_durable_message(&mut state, &consumer_key);
+            continue;
+        }
         state.next_delivery_id = state.next_delivery_id.wrapping_add(1);
         if state.next_delivery_id == 0 {
             state.next_delivery_id = 1;
@@ -450,6 +659,8 @@ async fn publish_embedded_subject(
                 payload: payload.to_vec(),
                 attempts: 1,
                 last_sent_at: Instant::now(),
+                durable_consumer: None,
+                stream_seq: None,
             },
         );
     }
@@ -468,8 +679,26 @@ async fn publish_embedded_subject(
 
 async fn mark_embedded_ack(state: &Arc<Mutex<EmbeddedBrokerState>>, ack_subject: &str) {
     let mut state = state.lock().await;
-    if state.pending.remove(ack_subject).is_some() {
+    if let Some(pending) = state.pending.remove(ack_subject) {
         state.acked_count = state.acked_count.saturating_add(1);
+        if let (Some(consumer_key), Some(seq)) = (pending.durable_consumer, pending.stream_seq) {
+            let mut subject_to_prune = None::<String>;
+            let mut updated_consumer = false;
+            if let Some(consumer) = state.durable_consumers.get_mut(&consumer_key) {
+                if seq > consumer.acked_seq {
+                    consumer.acked_seq = seq;
+                    updated_consumer = true;
+                }
+                subject_to_prune = Some(consumer.subject.clone());
+            }
+            if updated_consumer {
+                state.durable_dirty = true;
+            }
+            if let Some(subject) = subject_to_prune {
+                prune_stream_for_subject(&mut state, &subject);
+            }
+            let _ = deliver_next_durable_message(&mut state, &consumer_key);
+        }
     }
 }
 
@@ -486,22 +715,31 @@ async fn redeliver_embedded_pending(state: &Arc<Mutex<EmbeddedBrokerState>>) {
     let mut dropped = 0u64;
 
     for (ack_subject, pending) in state.pending.iter_mut() {
-        if now.duration_since(pending.last_sent_at) < Duration::from_secs(EMBEDDED_ACK_TIMEOUT_SECS) {
+        if now.duration_since(pending.last_sent_at) < Duration::from_secs(EMBEDDED_ACK_TIMEOUT_SECS)
+        {
             continue;
         }
-        if pending.attempts >= EMBEDDED_ACK_MAX_ATTEMPTS {
-            remove_keys.push(ack_subject.clone());
-            dropped = dropped.saturating_add(1);
-            continue;
-        }
-        let target = subscribers.iter().find(|subscriber| {
-            subscriber.connection_id == pending.connection_id
-                && subscriber.sid == pending.sid
-                && subscriber.subject == pending.subject
-        });
+        let target = if let Some(consumer_key) = pending.durable_consumer.as_deref() {
+            subscribers
+                .iter()
+                .find(|subscriber| subscriber.durable_consumer.as_deref() == Some(consumer_key))
+        } else {
+            if pending.attempts >= EMBEDDED_ACK_MAX_ATTEMPTS {
+                remove_keys.push(ack_subject.clone());
+                dropped = dropped.saturating_add(1);
+                continue;
+            }
+            subscribers.iter().find(|subscriber| {
+                subscriber.connection_id == pending.connection_id
+                    && subscriber.sid == pending.sid
+                    && subscriber.subject == pending.subject
+            })
+        };
         let Some(subscriber) = target else {
-            remove_keys.push(ack_subject.clone());
-            dropped = dropped.saturating_add(1);
+            if pending.durable_consumer.is_none() {
+                remove_keys.push(ack_subject.clone());
+                dropped = dropped.saturating_add(1);
+            }
             continue;
         };
 
@@ -512,12 +750,16 @@ async fn redeliver_embedded_pending(state: &Arc<Mutex<EmbeddedBrokerState>>) {
             &pending.payload,
         );
         if subscriber.tx.send(frame).is_ok() {
+            pending.connection_id = subscriber.connection_id;
+            pending.sid = subscriber.sid.clone();
             pending.attempts = pending.attempts.saturating_add(1);
             pending.last_sent_at = now;
             redelivered = redelivered.saturating_add(1);
         } else {
-            remove_keys.push(ack_subject.clone());
-            dropped = dropped.saturating_add(1);
+            if pending.durable_consumer.is_none() {
+                remove_keys.push(ack_subject.clone());
+                dropped = dropped.saturating_add(1);
+            }
         }
     }
 
@@ -540,6 +782,161 @@ async fn redeliver_embedded_pending(state: &Arc<Mutex<EmbeddedBrokerState>>) {
             pending = state.pending.len(),
             "embedded nats dropped unacked messages"
         );
+    }
+}
+
+fn should_persist_subject(state: &EmbeddedBrokerState, subject: &str) -> bool {
+    is_storage_subject(subject)
+        || state
+            .durable_consumers
+            .values()
+            .any(|consumer| consumer.subject == subject)
+}
+
+fn is_storage_subject(subject: &str) -> bool {
+    matches!(
+        subject,
+        SUBJECT_STORAGE_TURNS
+            | SUBJECT_STORAGE_EVENTS
+            | SUBJECT_STORAGE_ITEMS
+            | SUBJECT_STORAGE_REACTIVATION
+    )
+}
+
+fn append_stream_message(state: &mut EmbeddedBrokerState, subject: &str, payload: Vec<u8>) -> u64 {
+    let stream = state
+        .durable_streams
+        .entry(subject.to_string())
+        .or_default();
+    stream.last_seq = stream.last_seq.saturating_add(1);
+    if stream.last_seq == 0 {
+        stream.last_seq = 1;
+    }
+    let seq = stream.last_seq;
+    stream.messages.push_back(DurableMessage { seq, payload });
+    while stream.messages.len() > DURABLE_STREAM_MAX_MESSAGES {
+        let _ = stream.messages.pop_front();
+    }
+    state.durable_dirty = true;
+    seq
+}
+
+fn consumer_has_pending(state: &EmbeddedBrokerState, consumer_key: &str) -> bool {
+    state.pending.values().any(|pending| {
+        pending
+            .durable_consumer
+            .as_deref()
+            .is_some_and(|value| value == consumer_key)
+    })
+}
+
+fn deliver_next_durable_message(state: &mut EmbeddedBrokerState, consumer_key: &str) -> bool {
+    if consumer_has_pending(state, consumer_key) {
+        return false;
+    }
+    let Some(consumer) = state.durable_consumers.get(consumer_key).cloned() else {
+        return false;
+    };
+    let Some(subscriber) = state
+        .subscribers
+        .iter()
+        .find(|entry| entry.durable_consumer.as_deref() == Some(consumer_key))
+        .cloned()
+    else {
+        return false;
+    };
+    let next_seq = consumer.acked_seq.saturating_add(1);
+    let Some(stream) = state.durable_streams.get(&consumer.subject) else {
+        return false;
+    };
+    let mut next_seq = next_seq;
+    let message = if let Some(message) = stream
+        .messages
+        .iter()
+        .find(|msg| msg.seq == next_seq)
+        .cloned()
+    {
+        message
+    } else if let Some(front) = stream.messages.front().cloned() {
+        if front.seq > next_seq {
+            if let Some(consumer_mut) = state.durable_consumers.get_mut(consumer_key) {
+                consumer_mut.acked_seq = front.seq.saturating_sub(1);
+                state.durable_dirty = true;
+                next_seq = consumer_mut.acked_seq.saturating_add(1);
+            }
+            stream
+                .messages
+                .iter()
+                .find(|msg| msg.seq == next_seq)
+                .cloned()
+                .unwrap_or(front)
+        } else {
+            return false;
+        }
+    } else {
+        return false;
+    };
+
+    state.next_delivery_id = state.next_delivery_id.wrapping_add(1);
+    if state.next_delivery_id == 0 {
+        state.next_delivery_id = 1;
+    }
+    let ack_subject = format!("{}{}", EMBEDDED_ACK_SUBJECT_PREFIX, state.next_delivery_id);
+    let frame = build_msg_frame(
+        &consumer.subject,
+        &subscriber.sid,
+        Some(&ack_subject),
+        &message.payload,
+    );
+    if subscriber.tx.send(frame).is_err() {
+        state
+            .subscribers
+            .retain(|entry| entry.connection_id != subscriber.connection_id);
+        return false;
+    }
+    state.pending.insert(
+        ack_subject,
+        PendingDelivery {
+            connection_id: subscriber.connection_id,
+            subject: consumer.subject,
+            sid: subscriber.sid,
+            payload: message.payload,
+            attempts: 1,
+            last_sent_at: Instant::now(),
+            durable_consumer: Some(consumer_key.to_string()),
+            stream_seq: Some(message.seq),
+        },
+    );
+    true
+}
+
+fn prune_stream_for_subject(state: &mut EmbeddedBrokerState, subject: &str) {
+    let min_acked = state
+        .durable_consumers
+        .values()
+        .filter(|consumer| consumer.subject == subject)
+        .map(|consumer| consumer.acked_seq)
+        .min();
+    let Some(stream) = state.durable_streams.get_mut(subject) else {
+        return;
+    };
+    let mut changed = false;
+    if let Some(min_acked) = min_acked {
+        while stream
+            .messages
+            .front()
+            .is_some_and(|msg| msg.seq <= min_acked)
+        {
+            let _ = stream.messages.pop_front();
+            changed = true;
+        }
+    }
+    while stream.messages.len() > DURABLE_STREAM_MAX_MESSAGES {
+        let _ = stream.messages.pop_front();
+        changed = true;
+    }
+    if changed {
+        state.durable_dirty = true;
     }
 }
 
@@ -613,6 +1010,7 @@ pub struct NatsSubscriber {
     endpoint: String,
     subject: String,
     sid: u32,
+    queue: Option<String>,
 }
 
 impl NatsSubscriber {
@@ -621,7 +1019,13 @@ impl NatsSubscriber {
             endpoint,
             subject,
             sid,
+            queue: None,
         }
+    }
+
+    pub fn with_queue(mut self, queue: impl Into<String>) -> Self {
+        self.queue = Some(queue.into());
+        self
     }
 
     pub async fn run<F, Fut>(&self, mut handler: F) -> Result<(), io::Error>
@@ -633,9 +1037,13 @@ impl NatsSubscriber {
         let stream = TcpStream::connect(addr).await?;
         let (reader_half, mut writer_half) = stream.into_split();
         writer_half.write_all(CONNECT_LINE.as_bytes()).await?;
-        writer_half
-            .write_all(format!("SUB {} {}\r\n", self.subject, self.sid).as_bytes())
-            .await?;
+        let sub_line = match self.queue.as_deref() {
+            Some(queue) if !queue.trim().is_empty() => {
+                format!("SUB {} {} {}\r\n", self.subject, queue.trim(), self.sid)
+            }
+            _ => format!("SUB {} {}\r\n", self.subject, self.sid),
+        };
+        writer_half.write_all(sub_line.as_bytes()).await?;
         writer_half.write_all(b"PING\r\n").await?;
         writer_half.flush().await?;
 
@@ -712,9 +1120,9 @@ fn endpoint_to_addr(endpoint: &str) -> Result<String, io::Error> {
     Ok(trimmed.to_string())
 }
 
-fn parse_sub_command(line: &str) -> Result<(String, String), io::Error> {
+fn parse_sub_command(line: &str) -> Result<(String, String, Option<String>), io::Error> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 3 {
+    if parts.len() != 3 && parts.len() != 4 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid SUB line: {line}"),
@@ -728,7 +1136,25 @@ fn parse_sub_command(line: &str) -> Result<(String, String), io::Error> {
             format!("invalid SUB line: {line}"),
         ));
     }
-    Ok((subject.to_string(), sid.to_string()))
+    let queue = if parts.len() == 4 {
+        let queue = parts[2].trim();
+        if queue.is_empty() {
+            None
+        } else {
+            Some(queue.to_string())
+        }
+    } else {
+        None
+    };
+    Ok((subject.to_string(), sid.to_string(), queue))
+}
+
+fn parse_durable_consumer_key(subject: &str, queue: &str) -> Option<String> {
+    let trimmed = queue.trim();
+    if trimmed.is_empty() || !trimmed.starts_with(DURABLE_QUEUE_PREFIX) {
+        return None;
+    }
+    Some(format!("{subject}|{trimmed}"))
 }
 
 fn parse_unsub_command(line: &str) -> Option<String> {
@@ -820,7 +1246,9 @@ fn parse_msg_line(msg_line: &str) -> Result<MsgFrameHeader, io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hash::{Hash, Hasher};
     use std::net::TcpListener as StdTcpListener;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use tokio::time::sleep;
@@ -830,6 +1258,18 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         drop(listener);
         format!("nats://127.0.0.1:{port}")
+    }
+
+    fn temp_storage_dir(name: &str) -> PathBuf {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("unix time")
+            .as_nanos()
+            .hash(&mut hasher);
+        std::process::id().hash(&mut hasher);
+        let suffix = hasher.finish();
+        std::env::temp_dir().join(format!("fluxbee-nats-{name}-{suffix:016x}"))
     }
 
     async fn wait_endpoint_down(endpoint: &str, timeout_ms: u64) -> bool {
@@ -931,5 +1371,66 @@ mod tests {
         stop_embedded_broker(&endpoint)
             .await
             .expect("stop embedded broker");
+    }
+
+    #[tokio::test]
+    async fn embedded_broker_recovers_durable_stream_after_restart() {
+        let endpoint = free_endpoint();
+        let storage_dir = temp_storage_dir("durable-restart");
+        start_embedded_broker_with_storage(&endpoint, Some(storage_dir.as_path()))
+            .await
+            .expect("start embedded broker with durable storage");
+
+        publish(&endpoint, SUBJECT_STORAGE_TURNS, br#"{"seq":1}"#)
+            .await
+            .expect("publish first");
+        publish(&endpoint, SUBJECT_STORAGE_TURNS, br#"{"seq":2}"#)
+            .await
+            .expect("publish second");
+
+        stop_embedded_broker(&endpoint)
+            .await
+            .expect("stop embedded broker");
+
+        start_embedded_broker_with_storage(&endpoint, Some(storage_dir.as_path()))
+            .await
+            .expect("restart embedded broker with durable storage");
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let subscriber =
+            NatsSubscriber::new(endpoint.clone(), SUBJECT_STORAGE_TURNS.to_string(), 10)
+                .with_queue("durable.sy-storage.turns");
+        let calls_for_task = Arc::clone(&calls);
+        let subscriber_task = tokio::spawn(async move {
+            let _ = subscriber
+                .run(move |_payload| {
+                    let calls_for_handler = Arc::clone(&calls_for_task);
+                    async move {
+                        calls_for_handler.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
+                })
+                .await;
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while tokio::time::Instant::now() < deadline {
+            if calls.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            calls.load(Ordering::Relaxed) >= 2,
+            "expected durable replay after restart"
+        );
+
+        subscriber_task.abort();
+        let _ = subscriber_task.await;
+        stop_embedded_broker(&endpoint)
+            .await
+            .expect("final stop embedded broker");
+        let _ = std::fs::remove_dir_all(storage_dir);
     }
 }

@@ -1,3 +1,4 @@
+pub mod nats;
 pub mod node_client;
 pub mod protocol;
 pub mod socket;

@@ -5,15 +5,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time;
 use tokio_postgres::{Client, GenericClient, NoTls};
 use tracing_subscriber::EnvFilter;
 
+use jsr_client::nats::{
+    publish as client_nats_publish, NatsError as ClientNatsError,
+    NatsSubscriber as ClientNatsSubscriber,
+};
 use json_router::nats::{
-    NatsSubscriber, SUBJECT_STORAGE_EVENTS, SUBJECT_STORAGE_ITEMS, SUBJECT_STORAGE_REACTIVATION,
-    SUBJECT_STORAGE_TURNS,
+    NatsSubscriber as RouterNatsSubscriber, SUBJECT_STORAGE_EVENTS, SUBJECT_STORAGE_ITEMS,
+    SUBJECT_STORAGE_REACTIVATION, SUBJECT_STORAGE_TURNS,
 };
 
 type StorageError = Box<dyn std::error::Error + Send + Sync>;
@@ -25,6 +29,12 @@ const INBOX_ERROR_MAX_LEN: usize = 1024;
 const STORAGE_METRICS_LOG_INTERVAL_SECS: u64 = 30;
 const STORAGE_METRICS_WARN_PENDING: i64 = 100;
 const STORAGE_METRICS_WARN_AGE_SECS: i64 = 120;
+const DURABLE_QUEUE_TURNS: &str = "durable.sy-storage.turns";
+const DURABLE_QUEUE_EVENTS: &str = "durable.sy-storage.events";
+const DURABLE_QUEUE_ITEMS: &str = "durable.sy-storage.items";
+const DURABLE_QUEUE_REACTIVATION: &str = "durable.sy-storage.reactivation";
+const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
+const STORAGE_METRICS_QUERY_SID: u32 = 19;
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -89,6 +99,21 @@ struct MemoryItemRecord {
     activation_strength: f64,
 }
 
+#[derive(Debug, Deserialize)]
+struct StorageMetricsRequest {
+    trace_id: String,
+    reply_subject: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StorageInboxMetricsSnapshot {
+    pending: i64,
+    pending_with_error: i64,
+    oldest_pending_age_s: i64,
+    processed_total: i64,
+    max_attempts: i32,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), StorageError> {
     if cfg!(not(target_os = "linux")) {
@@ -111,6 +136,12 @@ async fn main() -> Result<(), StorageError> {
     }
 
     let endpoint = nats_endpoint(&hive);
+    let use_durable_consumer = hive
+        .nats
+        .as_ref()
+        .and_then(|n| n.mode.as_deref())
+        .map(|mode| mode.trim().eq_ignore_ascii_case("embedded"))
+        .unwrap_or(true);
     let database_url = database_url(&hive)?;
     let storage = Arc::new(Storage::connect(&database_url).await?);
     storage.ensure_schema().await?;
@@ -132,23 +163,33 @@ async fn main() -> Result<(), StorageError> {
 
     let turns_task = tokio::spawn(run_turns_loop(
         endpoint.clone(),
+        use_durable_consumer,
         Arc::clone(&storage),
         Arc::clone(&nats_subscribe_errors),
         Arc::clone(&storage_handler_errors),
     ));
     let events_task = tokio::spawn(run_events_loop(
         endpoint.clone(),
+        use_durable_consumer,
         Arc::clone(&storage),
         Arc::clone(&nats_subscribe_errors),
         Arc::clone(&storage_handler_errors),
     ));
     let items_task = tokio::spawn(run_items_loop(
         endpoint.clone(),
+        use_durable_consumer,
         Arc::clone(&storage),
         Arc::clone(&nats_subscribe_errors),
         Arc::clone(&storage_handler_errors),
     ));
     let react_task = tokio::spawn(run_reactivation_loop(
+        endpoint.clone(),
+        use_durable_consumer,
+        Arc::clone(&storage),
+        Arc::clone(&nats_subscribe_errors),
+        Arc::clone(&storage_handler_errors),
+    ));
+    let metrics_query_task = tokio::spawn(run_storage_metrics_query_loop(
         endpoint,
         Arc::clone(&storage),
         Arc::clone(&nats_subscribe_errors),
@@ -160,7 +201,14 @@ async fn main() -> Result<(), StorageError> {
         Arc::clone(&storage_handler_errors),
     ));
 
-    let _ = tokio::join!(turns_task, events_task, items_task, react_task, metrics_task);
+    let _ = tokio::join!(
+        turns_task,
+        events_task,
+        items_task,
+        react_task,
+        metrics_query_task,
+        metrics_task
+    );
     Ok(())
 }
 
@@ -337,6 +385,31 @@ WHERE processed_at IS NULL
         })
     }
 
+    async fn inbox_metrics_snapshot(&self) -> Result<StorageInboxMetricsSnapshot, StorageError> {
+        let row = self
+            .client
+            .query_one(
+                r#"
+SELECT
+    COUNT(*) FILTER (WHERE processed_at IS NULL) AS pending,
+    COUNT(*) FILTER (WHERE processed_at IS NULL AND last_error IS NOT NULL) AS pending_with_error,
+    COALESCE(EXTRACT(EPOCH FROM (now() - MIN(received_at) FILTER (WHERE processed_at IS NULL)))::BIGINT, 0) AS oldest_pending_age_s,
+    COUNT(*) FILTER (WHERE processed_at IS NOT NULL) AS processed_total,
+    COALESCE(MAX(attempts), 0) AS max_attempts
+FROM storage_inbox
+"#,
+                &[],
+            )
+            .await?;
+        Ok(StorageInboxMetricsSnapshot {
+            pending: row.get::<_, i64>(0),
+            pending_with_error: row.get::<_, i64>(1),
+            oldest_pending_age_s: row.get::<_, i64>(2),
+            processed_total: row.get::<_, i64>(3),
+            max_attempts: row.get::<_, i32>(4),
+        })
+    }
+
     async fn ingest_message(
         &self,
         subject: &str,
@@ -384,7 +457,9 @@ RETURNING processed_at IS NOT NULL
         kind: HandlerKind,
         payload: &[u8],
     ) -> Result<(), StorageError> {
-        let result = self.process_subject_payload(kind, payload, dedupe_key).await;
+        let result = self
+            .process_subject_payload(kind, payload, dedupe_key)
+            .await;
         match result {
             Ok(()) => {
                 self.client
@@ -447,7 +522,8 @@ WHERE dedupe_key = $1
             HandlerKind::Reactivation => {
                 let value: Value = serde_json::from_slice(payload)?;
                 let parsed = parse_reactivation_payload(value)?;
-                self.apply_reactivation(&self.client, dedupe_key, &parsed).await
+                self.apply_reactivation(&self.client, dedupe_key, &parsed)
+                    .await
             }
         }
     }
@@ -635,6 +711,7 @@ WHERE event_id = $2
 
 async fn run_turns_loop(
     endpoint: String,
+    use_durable_consumer: bool,
     storage: Arc<Storage>,
     nats_subscribe_errors: Arc<AtomicU64>,
     storage_handler_errors: Arc<AtomicU64>,
@@ -643,6 +720,7 @@ async fn run_turns_loop(
         endpoint,
         SUBJECT_STORAGE_TURNS,
         10,
+        use_durable_consumer.then_some(DURABLE_QUEUE_TURNS),
         storage,
         HandlerKind::Turns,
         nats_subscribe_errors,
@@ -653,6 +731,7 @@ async fn run_turns_loop(
 
 async fn run_events_loop(
     endpoint: String,
+    use_durable_consumer: bool,
     storage: Arc<Storage>,
     nats_subscribe_errors: Arc<AtomicU64>,
     storage_handler_errors: Arc<AtomicU64>,
@@ -661,6 +740,7 @@ async fn run_events_loop(
         endpoint,
         SUBJECT_STORAGE_EVENTS,
         11,
+        use_durable_consumer.then_some(DURABLE_QUEUE_EVENTS),
         storage,
         HandlerKind::Events,
         nats_subscribe_errors,
@@ -671,6 +751,7 @@ async fn run_events_loop(
 
 async fn run_items_loop(
     endpoint: String,
+    use_durable_consumer: bool,
     storage: Arc<Storage>,
     nats_subscribe_errors: Arc<AtomicU64>,
     storage_handler_errors: Arc<AtomicU64>,
@@ -679,6 +760,7 @@ async fn run_items_loop(
         endpoint,
         SUBJECT_STORAGE_ITEMS,
         12,
+        use_durable_consumer.then_some(DURABLE_QUEUE_ITEMS),
         storage,
         HandlerKind::Items,
         nats_subscribe_errors,
@@ -689,6 +771,7 @@ async fn run_items_loop(
 
 async fn run_reactivation_loop(
     endpoint: String,
+    use_durable_consumer: bool,
     storage: Arc<Storage>,
     nats_subscribe_errors: Arc<AtomicU64>,
     storage_handler_errors: Arc<AtomicU64>,
@@ -697,6 +780,7 @@ async fn run_reactivation_loop(
         endpoint,
         SUBJECT_STORAGE_REACTIVATION,
         13,
+        use_durable_consumer.then_some(DURABLE_QUEUE_REACTIVATION),
         storage,
         HandlerKind::Reactivation,
         nats_subscribe_errors,
@@ -749,13 +833,18 @@ async fn run_subject_loop(
     endpoint: String,
     subject: &str,
     sid: u32,
+    durable_queue: Option<&'static str>,
     storage: Arc<Storage>,
     kind: HandlerKind,
     nats_subscribe_errors: Arc<AtomicU64>,
     storage_handler_errors: Arc<AtomicU64>,
 ) {
     loop {
-        let subscriber = NatsSubscriber::new(endpoint.clone(), subject.to_string(), sid);
+        let subscriber = if let Some(queue) = durable_queue {
+            RouterNatsSubscriber::new(endpoint.clone(), subject.to_string(), sid).with_queue(queue)
+        } else {
+            RouterNatsSubscriber::new(endpoint.clone(), subject.to_string(), sid)
+        };
         let worker = Arc::clone(&storage);
         let subject_name = subject.to_string();
         let nats_subscribe_errors = Arc::clone(&nats_subscribe_errors);
@@ -777,7 +866,10 @@ async fn run_subject_loop(
                                 "storage handler failed"
                             );
                         }
-                        return Err(std::io::Error::new(std::io::ErrorKind::Other, err.to_string()));
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            err.to_string(),
+                        ));
                     }
                     Ok(())
                 }
@@ -791,6 +883,96 @@ async fn run_subject_loop(
                     error = %err,
                     failures = count,
                     "nats subscribe loop failed; retrying"
+                );
+            }
+        }
+        time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn run_storage_metrics_query_loop(
+    endpoint: String,
+    storage: Arc<Storage>,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
+) {
+    loop {
+        let subscriber = ClientNatsSubscriber::new(
+            endpoint.clone(),
+            SUBJECT_STORAGE_METRICS_GET.to_string(),
+            STORAGE_METRICS_QUERY_SID,
+        );
+        let storage = Arc::clone(&storage);
+        let endpoint_out = endpoint.clone();
+        let nats_subscribe_errors = Arc::clone(&nats_subscribe_errors);
+        let storage_handler_errors = Arc::clone(&storage_handler_errors);
+        let run_result = subscriber
+            .run(move |msg| {
+                let storage = Arc::clone(&storage);
+                let endpoint_out = endpoint_out.clone();
+                let storage_handler_errors = Arc::clone(&storage_handler_errors);
+                async move {
+                    let req: StorageMetricsRequest = match serde_json::from_slice(&msg.payload) {
+                        Ok(req) => req,
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                subject = SUBJECT_STORAGE_METRICS_GET,
+                                "invalid storage metrics request payload"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    if req.reply_subject.trim().is_empty() {
+                        tracing::warn!(
+                            subject = SUBJECT_STORAGE_METRICS_GET,
+                            "storage metrics request missing reply_subject"
+                        );
+                        return Ok(());
+                    }
+
+                    let response = match storage.inbox_metrics_snapshot().await {
+                        Ok(metrics) => serde_json::json!({
+                            "trace_id": req.trace_id,
+                            "status": "ok",
+                            "metrics": metrics,
+                        }),
+                        Err(err) => serde_json::json!({
+                            "trace_id": req.trace_id,
+                            "status": "error",
+                            "error_code": "STORAGE_METRICS_UNAVAILABLE",
+                            "error_detail": err.to_string(),
+                        }),
+                    };
+                    let body = serde_json::to_vec(&response)
+                        .map_err(|err| ClientNatsError::Protocol(err.to_string()))?;
+                    if let Err(err) =
+                        client_nats_publish(&endpoint_out, &req.reply_subject, &body).await
+                    {
+                        let count = storage_handler_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                        if count == 1 || count % NATS_ERROR_LOG_EVERY == 0 {
+                            tracing::warn!(
+                                error = %err,
+                                failures = count,
+                                subject = SUBJECT_STORAGE_METRICS_GET,
+                                "storage metrics response publish failed"
+                            );
+                        }
+                        return Err(err);
+                    }
+                    Ok(())
+                }
+            })
+            .await;
+
+        if let Err(err) = run_result {
+            let count = nats_subscribe_errors.fetch_add(1, Ordering::Relaxed) + 1;
+            if count == 1 || count % NATS_ERROR_LOG_EVERY == 0 {
+                tracing::warn!(
+                    subject = SUBJECT_STORAGE_METRICS_GET,
+                    error = %err,
+                    failures = count,
+                    "storage metrics nats loop failed; retrying"
                 );
             }
         }

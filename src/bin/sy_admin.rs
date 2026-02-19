@@ -10,12 +10,12 @@ use std::future;
 use tar::{Archive, Builder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio_postgres::NoTls;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+use jsr_client::nats::request as nats_request;
 use jsr_client::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SCOPE_GLOBAL,
     SYSTEM_KIND,
@@ -30,7 +30,7 @@ struct HiveFile {
     role: Option<String>,
     admin: Option<AdminSection>,
     wan: Option<WanSection>,
-    database: Option<DatabaseSection>,
+    nats: Option<NatsSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,7 +44,9 @@ struct WanSection {
 }
 
 #[derive(Debug, Deserialize)]
-struct DatabaseSection {
+struct NatsSection {
+    mode: Option<String>,
+    port: Option<u16>,
     url: Option<String>,
 }
 
@@ -55,7 +57,7 @@ struct AdminContext {
     socket_dir: PathBuf,
     hive_id: String,
     authorized_hives: Vec<String>,
-    database_url: Option<String>,
+    nats_endpoint: String,
 }
 
 struct AdminRouterClient {
@@ -205,7 +207,7 @@ async fn main() -> Result<(), AdminError> {
         .as_ref()
         .and_then(|admin| admin.listen.clone())
         .unwrap_or_else(|| "0.0.0.0:8080".to_string());
-    let database_url = resolve_database_url(&hive);
+    let nats_endpoint = nats_endpoint(&hive);
 
     let node_config = NodeConfig {
         name: "SY.admin".to_string(),
@@ -229,7 +231,7 @@ async fn main() -> Result<(), AdminError> {
         socket_dir: socket_dir.clone(),
         hive_id,
         authorized_hives,
-        database_url,
+        nats_endpoint,
     };
     let http_client = router_client.clone();
     tokio::spawn(async move {
@@ -328,25 +330,28 @@ fn load_hive(config_dir: &Path) -> Result<HiveFile, AdminError> {
     Ok(serde_yaml::from_str(&data)?)
 }
 
-fn resolve_database_url(hive: &HiveFile) -> Option<String> {
-    if let Ok(url) = std::env::var("FLUXBEE_DATABASE_URL") {
-        let trimmed = url.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+fn nats_endpoint(hive: &HiveFile) -> String {
+    let Some(nats) = hive.nats.as_ref() else {
+        return "nats://127.0.0.1:4222".to_string();
+    };
+    if let Some(url) = nats.url.as_ref() {
+        let url = url.trim();
+        if !url.is_empty() {
+            return url.to_string();
         }
     }
-    if let Ok(url) = std::env::var("JSR_DATABASE_URL") {
-        let trimmed = url.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
+    let mode = nats
+        .mode
+        .as_deref()
+        .unwrap_or("embedded")
+        .trim()
+        .to_ascii_lowercase();
+    let port = nats.port.unwrap_or(4222);
+    if mode == "embedded" || mode == "client" {
+        format!("nats://127.0.0.1:{port}")
+    } else {
+        "nats://127.0.0.1:4222".to_string()
     }
-    hive.database
-        .as_ref()
-        .and_then(|db| db.url.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
 }
 
 fn config_changed_version_channel(subsystem: &str) -> &'static str {
@@ -585,7 +590,7 @@ struct OpaQueryEntry {
     payload: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct StorageInboxMetrics {
     pending: i64,
     pending_with_error: i64,
@@ -593,6 +598,30 @@ struct StorageInboxMetrics {
     processed_total: i64,
     max_attempts: i32,
 }
+
+#[derive(Debug, Serialize)]
+struct StorageMetricsRequestPayload {
+    trace_id: String,
+    reply_subject: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StorageMetricsResponsePayload {
+    trace_id: String,
+    status: String,
+    #[serde(default)]
+    metrics: Option<StorageInboxMetrics>,
+    #[serde(default)]
+    error_code: Option<String>,
+    #[serde(default)]
+    error_detail: Option<String>,
+}
+
+const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
+const SUBJECT_STORAGE_METRICS_REPLY_PREFIX: &str = "storage.metrics.reply.";
+const STORAGE_METRICS_NATS_TIMEOUT_SECS: u64 = 8;
+const STORAGE_METRICS_SID_BASE: u32 = 1000;
+const STORAGE_METRICS_SID_RANGE: u64 = 50_000;
 
 async fn run_http_server(
     listen: &str,
@@ -1361,43 +1390,48 @@ fn payload_error_detail(payload: &serde_json::Value) -> Option<String> {
 
 async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
     let action = "get_storage_metrics";
-    let Some(database_url) = ctx.database_url.as_deref() else {
-        let error_detail = "database.url missing in hive.yaml and env".to_string();
-        return (
-            503,
-            serde_json::json!({
-                "status": "error",
-                "action": action,
-                "payload": {
-                    "status": "error",
-                    "error_code": "STORAGE_METRICS_UNAVAILABLE",
-                    "message": error_detail,
-                },
-                "error_code": "STORAGE_METRICS_UNAVAILABLE",
-                "error_detail": error_detail,
-            })
-            .to_string(),
-        );
+    let trace_id = Uuid::new_v4().to_string();
+    let reply_subject = format!("{SUBJECT_STORAGE_METRICS_REPLY_PREFIX}{trace_id}");
+    let request_payload = StorageMetricsRequestPayload {
+        trace_id: trace_id.clone(),
+        reply_subject: reply_subject.clone(),
     };
-
-    match fetch_storage_inbox_metrics(database_url).await {
-        Ok(metrics) => (
-            200,
-            serde_json::json!({
-                "status": "ok",
-                "action": action,
-                "payload": {
-                    "status": "ok",
-                    "metrics": metrics,
-                },
-                "error_code": serde_json::Value::Null,
-                "error_detail": serde_json::Value::Null,
-            })
-            .to_string(),
-        ),
+    let request_body = match serde_json::to_vec(&request_payload) {
+        Ok(body) => body,
         Err(err) => {
             let error_detail = err.to_string();
-            (
+            return (
+                500,
+                serde_json::json!({
+                    "status": "error",
+                    "action": action,
+                    "payload": {
+                        "status": "error",
+                        "error_code": "INVALID_REQUEST",
+                        "message": error_detail,
+                    },
+                    "error_code": "INVALID_REQUEST",
+                    "error_detail": error_detail,
+                })
+                .to_string(),
+            );
+        }
+    };
+    let sid = storage_metrics_sid(&trace_id);
+    let response_body = match nats_request(
+        &ctx.nats_endpoint,
+        SUBJECT_STORAGE_METRICS_GET,
+        &request_body,
+        &reply_subject,
+        sid,
+        Duration::from_secs(STORAGE_METRICS_NATS_TIMEOUT_SECS),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(err) => {
+            let error_detail = err.to_string();
+            return (
                 503,
                 serde_json::json!({
                     "status": "error",
@@ -1411,39 +1445,104 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
                     "error_detail": error_detail,
                 })
                 .to_string(),
+            );
+        }
+    };
+    let response: StorageMetricsResponsePayload = match serde_json::from_slice(&response_body) {
+        Ok(resp) => resp,
+        Err(err) => {
+            let error_detail = err.to_string();
+            return (
+                502,
+                serde_json::json!({
+                    "status": "error",
+                    "action": action,
+                    "payload": {
+                        "status": "error",
+                        "error_code": "TRANSPORT_ERROR",
+                        "message": error_detail,
+                    },
+                    "error_code": "TRANSPORT_ERROR",
+                    "error_detail": error_detail,
+                })
+                .to_string(),
+            );
+        }
+    };
+    if response.trace_id != trace_id {
+        let error_detail = format!(
+            "trace_id mismatch expected={} got={}",
+            trace_id, response.trace_id
+        );
+        return (
+            502,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": {
+                    "status": "error",
+                    "error_code": "TRANSPORT_ERROR",
+                    "message": error_detail,
+                },
+                "error_code": "TRANSPORT_ERROR",
+                "error_detail": error_detail,
+            })
+            .to_string(),
+        );
+    }
+
+    match (response.status.as_str(), response.metrics) {
+        ("ok", Some(metrics)) => (
+            200,
+            serde_json::json!({
+                "status": "ok",
+                "action": action,
+                "payload": {
+                    "status": "ok",
+                    "metrics": metrics,
+                },
+                "error_code": serde_json::Value::Null,
+                "error_detail": serde_json::Value::Null,
+            })
+            .to_string(),
+        ),
+        _ => {
+            let error_code = response
+                .error_code
+                .unwrap_or_else(|| "STORAGE_METRICS_UNAVAILABLE".to_string());
+            let error_detail = response
+                .error_detail
+                .unwrap_or_else(|| "storage metrics request failed".to_string());
+            (
+                503,
+                serde_json::json!({
+                    "status": "error",
+                    "action": action,
+                    "payload": {
+                        "status": "error",
+                        "error_code": error_code,
+                        "message": error_detail,
+                    },
+                    "error_code": error_code,
+                    "error_detail": error_detail,
+                })
+                .to_string(),
             )
         }
     }
 }
 
-async fn fetch_storage_inbox_metrics(database_url: &str) -> Result<StorageInboxMetrics, AdminError> {
-    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            tracing::warn!("storage metrics postgres connection closed: {err}");
-        }
-    });
-    let row = client
-        .query_one(
-            r#"
-SELECT
-    COUNT(*) FILTER (WHERE processed_at IS NULL) AS pending,
-    COUNT(*) FILTER (WHERE processed_at IS NULL AND last_error IS NOT NULL) AS pending_with_error,
-    COALESCE(EXTRACT(EPOCH FROM (now() - MIN(received_at) FILTER (WHERE processed_at IS NULL)))::BIGINT, 0) AS oldest_pending_age_s,
-    COUNT(*) FILTER (WHERE processed_at IS NOT NULL) AS processed_total,
-    COALESCE(MAX(attempts), 0) AS max_attempts
-FROM storage_inbox
-"#,
-            &[],
-        )
-        .await?;
-    Ok(StorageInboxMetrics {
-        pending: row.get::<_, i64>(0),
-        pending_with_error: row.get::<_, i64>(1),
-        oldest_pending_age_s: row.get::<_, i64>(2),
-        processed_total: row.get::<_, i64>(3),
-        max_attempts: row.get::<_, i32>(4),
-    })
+fn storage_metrics_sid(trace_id: &str) -> u32 {
+    STORAGE_METRICS_SID_BASE + (fnv1a64(trace_id.as_bytes()) % STORAGE_METRICS_SID_RANGE) as u32
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn is_ok_status(status: Option<&str>) -> bool {

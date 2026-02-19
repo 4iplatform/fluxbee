@@ -94,9 +94,9 @@ Criterio de salida:
 - En `embedded`, el router garantiza NATS local operativo sin dependencia manual externa.
 
 ## Fase 3A - Infra de entrega (JetStream, independiente del contrato final)
-- [ ] Migrar de cliente TCP minimo a cliente con soporte JetStream.
-- [ ] Streams + consumers durables para subjects de storage.
-- [ ] Ack/retry controlado + metricas de lag.
+- [x] Migrar de cliente TCP minimo a base JetStream embebida (work-queue durable sobre broker in-process actual).
+- [x] Streams + consumers durables para subjects de storage.
+- [x] Ack/retry controlado + metricas de lag.
 - [x] Ack/retry basico en broker embebido actual (pre-JetStream):
   - [x] `reply-to` de ack por mensaje y ack automatico post-handler exitoso en subscriber.
   - [x] Redelivery en broker cuando no llega ack dentro de timeout.
@@ -106,6 +106,7 @@ Criterio de salida:
   - [x] warning por umbral de backlog/edad para deteccion temprana.
   - [x] exposicion de contadores acumulados (`nats_subscribe_failures`, `storage_handler_failures`) en logs de metricas.
   - [x] endpoint admin `GET /config/storage/metrics` para consultar backlog/edad de inbox via API.
+    - `SY.admin` ya no consulta PostgreSQL directo para este endpoint; usa request/reply NATS (`storage.metrics.get`) y `SY.storage` responde como gateway de DB.
 - [x] Base de ack post-persistencia en `SY.storage` (sin JetStream aun):
   - [x] `storage_inbox` durable en PostgreSQL para registrar mensajes recibidos.
   - [x] Replay automatico de pendientes al bootstrap de `SY.storage`.
@@ -117,7 +118,54 @@ Criterio de salida:
 Criterio de salida:
 - Reinicios de router/storage no pierden mensajes en ventana de prueba definida.
 - Reintentos/redeliveries no generan duplicados no deseados en tablas de storage.
-- Nota: la durabilidad total cross-restart del broker requiere JetStream/streams persistentes (pendiente).
+- Nota: se implemento durabilidad base en broker embebido; queda pendiente alineacion completa al protocolo JetStream oficial.
+
+Avance JetStream-base (2026-02-19):
+- Broker embebido persiste estado durable por endpoint en `nats.storage_dir` (`embedded-js-<endpoint>.json`):
+  - stream por subject (storage.*) con secuencia monotona.
+  - consumer durable por `SUB` con queue `durable.*` (ej. `durable.sy-storage.turns`).
+  - cursor `acked_seq` persistente y replay post-restart.
+- `SY.storage` consume `storage.turns/events/items/reactivation` con durable queues en `embedded`.
+- Ack explicito post-handler exitoso mantiene semantica at-least-once y replay en reconnect/restart.
+- Test unitario agregado para replay durable cross-restart del broker.
+
+## Checklist de cierre - Libreria cliente (socket + NATS)
+
+Regla de arquitectura objetivo:
+- todo trafico entre nodos pasa por router local (socket y broker NATS embebido del `rt-gateway` local), nunca proceso-a-proceso directo.
+
+Estado y pendientes:
+- [x] Exponer modulo NATS compartido en `jsr_client` (`publish`, `request`, `NatsSubscriber`).
+- [x] Migrar `SY.admin` storage metrics a request/reply NATS (`storage.metrics.get`) via `SY.storage`.
+- [ ] Definir API strict router-local en libreria (`request_local`, `publish_local`, `subscribe_local`) para no depender de endpoint raw pasado por caller.
+- [ ] Resolver `NATS endpoint` local desde config del nodo (`hive.yaml`) dentro de la libreria (alineado a discovery de socket local).
+- [ ] Rechazar endpoints no locales en modo strict (evitar bypass de router).
+- [ ] Unificar config de cliente para socket + nats en una sola estructura de libreria.
+- [ ] Cliente NATS persistente con reconnect/backoff (evitar connect por operacion).
+- [ ] Auto-resubscribe robusto para subscribers tras caida/restart de broker.
+- [ ] Correlacion request/reply robusta (inbox por sesion + `trace_id`).
+- [ ] Envelope comun de mensajes (versionado/meta minima) para callers NATS.
+- [ ] Metricas del cliente NATS (timeouts, reconnects, in-flight, last error).
+- [ ] Tests de integracion de libreria contra broker embebido (restart, reconnect, req/reply, sub).
+- [ ] Migrar nodos callers a API strict (evitar uso directo de endpoint string).
+- [ ] Documentar quickstart de nodo nuevo (`AI.test`) usando libreria para socket + NATS.
+
+## Cierre admin - prueba recomendada (estado actual)
+
+Smoke recomendado:
+
+```bash
+BASE="http://127.0.0.1:8080" HIVE_ID="worker-220" bash scripts/admin_nodes_routers_storage_e2e.sh
+```
+
+Este E2E ahora cubre tambien:
+- `GET /config/storage/metrics` (camino `SY.admin -> NATS -> SY.storage -> DB`).
+
+Chequeo puntual rapido:
+
+```bash
+curl -sS http://127.0.0.1:8080/config/storage/metrics
+```
 
 ## Fase 3B - Cierre de contrato (cuando modelo cognitivo quede congelado)
 - [ ] Versionado de payload (`schema_version`) y politica de compatibilidad.

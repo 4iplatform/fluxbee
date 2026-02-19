@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::config::RouterConfig;
 use crate::nats::{
-    check_endpoint as nats_check_endpoint, start_embedded_broker, NatsPublisher,
+    check_endpoint as nats_check_endpoint, start_embedded_broker_with_storage, NatsPublisher,
     SUBJECT_STORAGE_TURNS,
 };
 use crate::opa::OpaResolver;
@@ -3977,6 +3977,7 @@ async fn wait_for_nats_ready(cfg: &RouterConfig, timeout: Duration) -> Result<()
 
 fn spawn_embedded_nats_recovery_loop(cfg: &RouterConfig) {
     let endpoint = cfg.nats_url.clone();
+    let storage_dir = cfg.nats_storage_dir.clone();
     tokio::spawn(async move {
         let mut ticker = time::interval(Duration::from_secs(NATS_EMBEDDED_RECOVERY_INTERVAL_SECS));
         loop {
@@ -3991,7 +3992,9 @@ fn spawn_embedded_nats_recovery_loop(cfg: &RouterConfig) {
                 endpoint = %endpoint,
                 "embedded nats health-check failed; attempting recovery"
             );
-            if let Err(err) = start_embedded_broker(&endpoint).await {
+            if let Err(err) =
+                start_embedded_broker_with_storage(&endpoint, Some(storage_dir.as_path())).await
+            {
                 tracing::warn!(
                     endpoint = %endpoint,
                     error = %err,
@@ -4021,7 +4024,8 @@ fn spawn_embedded_nats_recovery_loop(cfg: &RouterConfig) {
 async fn prepare_nats_runtime(cfg: &RouterConfig) -> Result<(), RouterError> {
     if cfg.nats_mode == "embedded" {
         fs::create_dir_all(&cfg.nats_storage_dir)?;
-        start_embedded_broker(&cfg.nats_url).await?;
+        start_embedded_broker_with_storage(&cfg.nats_url, Some(cfg.nats_storage_dir.as_path()))
+            .await?;
         tracing::info!(
             mode = %cfg.nats_mode,
             port = cfg.nats_port,

@@ -14,6 +14,7 @@ set -euo pipefail
 #   ROUTER_SERVICE="rt-gateway"
 #   RUN_ROUTER_CYCLE="1"
 #   RUN_NODE_CYCLE="1"
+#   RUN_STORAGE_METRICS_CHECK="1"
 #   NODE_RUNTIME="wf.echo"
 #   NODE_VERSION="current"
 #   STORAGE_TEST_PATH="/var/lib/fluxbee/storage-e2e"
@@ -25,6 +26,7 @@ HIVE_ID="${HIVE_ID:-worker-220}"
 ROUTER_SERVICE="${ROUTER_SERVICE:-rt-gateway}"
 RUN_ROUTER_CYCLE="${RUN_ROUTER_CYCLE:-1}"
 RUN_NODE_CYCLE="${RUN_NODE_CYCLE:-1}"
+RUN_STORAGE_METRICS_CHECK="${RUN_STORAGE_METRICS_CHECK:-1}"
 NODE_RUNTIME="${NODE_RUNTIME:-wf.echo}"
 NODE_VERSION="${NODE_VERSION:-current}"
 RESTORE_STORAGE="${RESTORE_STORAGE:-1}"
@@ -260,6 +262,28 @@ if [[ "$RESTORE_STORAGE" == "1" && -n "$before_path" ]]; then
   echo "OK: /config/storage restored to previous path"
 else
   echo "SKIP: storage restore disabled or previous path empty"
+fi
+
+# 6) /config/storage/metrics via SY.admin -> NATS -> SY.storage
+if [[ "$RUN_STORAGE_METRICS_CHECK" == "1" ]]; then
+  storage_metrics_body="$tmpdir/storage_metrics.json"
+  status="$(http_call "GET" "$BASE/config/storage/metrics" "$storage_metrics_body")"
+  log_http_response "$status" "$storage_metrics_body"
+  assert_eq "$status" "200" "GET /config/storage/metrics/http"
+  assert_eq "$(json_get "status" "$storage_metrics_body")" "ok" "GET /config/storage/metrics/status"
+  assert_eq "$(json_get "payload.status" "$storage_metrics_body")" "ok" "GET /config/storage/metrics/payload.status"
+
+  for metric_key in pending pending_with_error oldest_pending_age_s processed_total max_attempts; do
+    metric_val="$(json_get "payload.metrics.${metric_key}" "$storage_metrics_body")"
+    if [[ -z "$metric_val" ]]; then
+      echo "FAIL [GET /config/storage/metrics/${metric_key}]: missing metric value" >&2
+      cat "$storage_metrics_body" >&2
+      exit 1
+    fi
+  done
+  echo "OK: /config/storage/metrics returns metrics snapshot"
+else
+  echo "SKIP: storage metrics check disabled (RUN_STORAGE_METRICS_CHECK=0)"
 fi
 
 echo "admin nodes/routers/storage E2E passed."
