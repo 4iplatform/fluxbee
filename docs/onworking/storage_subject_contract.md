@@ -8,6 +8,12 @@ Documento operativo para alinear productores/consumidor (`SY.storage`) en los su
 - `storage.items`
 - `storage.reactivation`
 
+Ownership acordado (2026-02-19):
+- `storage.turns`: `rt-gateway` (activo en codigo).
+- `storage.events`: `SY.cognition` (objetivo; pipeline productor pendiente de cierre E2E).
+- `storage.items`: `SY.cognition` (objetivo; pipeline productor pendiente de cierre E2E).
+- `storage.reactivation`: `SY.cognition` (objetivo; pipeline productor pendiente de cierre E2E).
+
 ## 1) storage.turns
 
 Productor actual: router (`rt-gateway`).

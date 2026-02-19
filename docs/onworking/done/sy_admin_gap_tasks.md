@@ -52,10 +52,35 @@ Lista de tareas para alinear `SY.admin` con la especificacion actual y con el mo
   - Script E2E agregado: `scripts/admin_nodes_routers_storage_e2e.sh`.
 
 ## Seguimiento
-- [ ] Registrar mapeo final de endpoints por ownership:
+- [x] Registrar mapeo final de endpoints por ownership:
   - `SY.config.routes`
-  - `SY.orchestrator`
+    - `GET/POST/DELETE /routes`
+    - `GET/POST/DELETE /vpns`
+    - `GET/POST/DELETE /hives/{hive}/routes`
+    - `GET/POST/DELETE /hives/{hive}/vpns`
+    - `PUT /config/routes` y `PUT /config/vpns` (ownership funcional de config, aplicado via `CONFIG_CHANGED`).
+  - `SY.orchestrator` (via orchestrator local en motherbee para operaciones multi-hive)
+    - `GET /hive/status`
+    - `GET/PUT /config/storage`
+    - `GET/POST /hives`
+    - `GET/DELETE /hives/{id}`
+    - `GET/POST/DELETE /hives/{hive}/nodes`
+    - `GET/POST/DELETE /hives/{hive}/routers`
   - `SY.opa.rules`
+    - `POST /opa/policy`
+    - `POST /opa/policy/compile`
+    - `POST /opa/policy/apply`
+    - `POST /opa/policy/rollback`
+    - `POST /opa/policy/check`
+    - `GET /opa/policy`
+    - `GET /opa/status`
+    - `POST /hives/{hive}/opa/policy`
+    - `POST /hives/{hive}/opa/policy/compile`
+    - `POST /hives/{hive}/opa/policy/apply`
+    - `POST /hives/{hive}/opa/policy/rollback`
+    - `POST /hives/{hive}/opa/policy/check`
+    - `GET /hives/{hive}/opa/policy`
+    - `GET /hives/{hive}/opa/status`
 
 ## Artefactos de validacion
 - [x] Checklist manual E2E con `curl` para API admin/orchestrator: `docs/onworking/sy_admin_e2e_curl_checklist.md`.

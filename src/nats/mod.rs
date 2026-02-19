@@ -1,11 +1,14 @@
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 
 pub const SUBJECT_STORAGE_TURNS: &str = "storage.turns";
@@ -30,35 +33,163 @@ struct EmbeddedBrokerState {
     subscribers: Vec<EmbeddedSubscriber>,
 }
 
+struct EmbeddedBrokerHandle {
+    shutdown_tx: oneshot::Sender<()>,
+    task: JoinHandle<Result<(), io::Error>>,
+}
+
+fn embedded_registry() -> &'static Mutex<HashMap<String, EmbeddedBrokerHandle>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, EmbeddedBrokerHandle>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 pub async fn start_embedded_broker(endpoint: &str) -> Result<(), io::Error> {
     let addr = endpoint_to_addr(endpoint)?;
-    let listener = TcpListener::bind(&addr).await?;
+
+    {
+        let mut registry = embedded_registry().lock().await;
+        if let Some(handle) = registry.get(&addr) {
+            if !handle.task.is_finished() {
+                tracing::debug!(endpoint = %endpoint, "embedded nats broker already running");
+                return Ok(());
+            }
+        }
+        registry.retain(|_, handle| !handle.task.is_finished());
+    }
+
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+            if check_endpoint(endpoint, Duration::from_secs(2))
+                .await
+                .is_ok()
+            {
+                tracing::info!(endpoint = %endpoint, "embedded nats broker already reachable");
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Err(err) => return Err(err),
+    };
+
     let state = Arc::new(Mutex::new(EmbeddedBrokerState::default()));
     let next_connection_id = Arc::new(AtomicU64::new(1));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(run_embedded_broker(
+        listener,
+        state,
+        next_connection_id,
+        shutdown_rx,
+    ));
 
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(value) => value,
-                Err(err) => {
-                    tracing::warn!(error = %err, "embedded nats accept failed");
-                    continue;
-                }
-            };
+    let mut registry = embedded_registry().lock().await;
+    registry.insert(addr, EmbeddedBrokerHandle { shutdown_tx, task });
 
-            let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
-            let state = Arc::clone(&state);
-            tokio::spawn(async move {
-                if let Err(err) = handle_embedded_connection(stream, connection_id, state).await {
-                    tracing::warn!(
-                        connection_id,
-                        error = %err,
-                        "embedded nats connection closed with error"
-                    );
-                }
-            });
+    Ok(())
+}
+
+pub async fn stop_embedded_broker(endpoint: &str) -> Result<(), io::Error> {
+    let addr = endpoint_to_addr(endpoint)?;
+    let handle = {
+        let mut registry = embedded_registry().lock().await;
+        registry.remove(&addr)
+    };
+
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+    stop_embedded_broker_handle(&addr, handle).await
+}
+
+pub async fn stop_all_embedded_brokers() -> Result<(), io::Error> {
+    let handles = {
+        let mut registry = embedded_registry().lock().await;
+        registry
+            .drain()
+            .map(|(endpoint, handle)| (endpoint, handle))
+            .collect::<Vec<_>>()
+    };
+
+    for (endpoint, handle) in handles {
+        stop_embedded_broker_handle(&endpoint, handle).await?;
+    }
+
+    Ok(())
+}
+
+async fn stop_embedded_broker_handle(
+    endpoint: &str,
+    handle: EmbeddedBrokerHandle,
+) -> Result<(), io::Error> {
+    let EmbeddedBrokerHandle {
+        shutdown_tx,
+        mut task,
+    } = handle;
+    let _ = shutdown_tx.send(());
+
+    match timeout(Duration::from_secs(5), &mut task).await {
+        Ok(join_result) => match join_result {
+            Ok(inner) => inner,
+            Err(err) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("embedded nats task join failed for {endpoint}: {err}"),
+            )),
+        },
+        Err(_) => {
+            task.abort();
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("embedded nats shutdown timeout for {endpoint}"),
+            ))
         }
-    });
+    }
+}
+
+async fn run_embedded_broker(
+    listener: TcpListener,
+    state: Arc<Mutex<EmbeddedBrokerState>>,
+    next_connection_id: Arc<AtomicU64>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) -> Result<(), io::Error> {
+    let mut connection_tasks = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_rx => {
+                tracing::debug!("embedded nats broker shutdown requested");
+                break;
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = match accepted {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "embedded nats accept failed");
+                        continue;
+                    }
+                };
+
+                let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
+                let state = Arc::clone(&state);
+                connection_tasks.spawn(async move {
+                    if let Err(err) = handle_embedded_connection(stream, connection_id, state).await {
+                        tracing::warn!(
+                            connection_id,
+                            error = %err,
+                            "embedded nats connection closed with error"
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    connection_tasks.abort_all();
+    while let Some(result) = connection_tasks.join_next().await {
+        if let Err(err) = result {
+            if !err.is_cancelled() {
+                tracing::debug!(error = %err, "embedded nats connection task join failed");
+            }
+        }
+    }
 
     Ok(())
 }
@@ -433,4 +564,56 @@ fn parse_payload_len(msg_line: &str) -> Result<usize, io::Error> {
             format!("invalid MSG length '{len_str}': {err}"),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener as StdTcpListener;
+    use tokio::time::sleep;
+
+    fn free_endpoint() -> String {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        format!("nats://127.0.0.1:{port}")
+    }
+
+    async fn wait_endpoint_down(endpoint: &str, timeout_ms: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            if check_endpoint(endpoint, Duration::from_millis(100))
+                .await
+                .is_err()
+            {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_broker_start_health_stop_cycle() {
+        let endpoint = free_endpoint();
+        start_embedded_broker(&endpoint)
+            .await
+            .expect("start embedded broker");
+        check_endpoint(&endpoint, Duration::from_secs(2)).await.expect("health");
+
+        // Idempotent start on same endpoint should not fail.
+        start_embedded_broker(&endpoint)
+            .await
+            .expect("idempotent start");
+
+        stop_embedded_broker(&endpoint)
+            .await
+            .expect("stop embedded broker");
+        assert!(
+            wait_endpoint_down(&endpoint, 1500).await,
+            "endpoint stayed up after stop"
+        );
+    }
 }

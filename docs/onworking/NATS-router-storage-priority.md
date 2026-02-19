@@ -13,6 +13,24 @@ Objetivo: priorizar una base estable para pruebas de `SY.storage`, sin perder el
   - Reintenta suscripcion en loop cuando NATS no esta disponible.
   - Persiste en PostgreSQL con esquema base e inserciones idempotentes.
 
+## Revision spec vs codigo (2026-02-19)
+
+Resumen contra `docs/13-storage.md` y estado real del repo:
+
+- Alineado:
+  - Router con `nats.mode=embedded` levanta broker in-process (`start_embedded_broker`).
+  - Readiness de NATS en router y orchestrator implementada.
+  - `SY.storage` consume los 4 subjects y aplica validacion/ingesta robusta.
+- Parcial:
+  - Lifecycle embebido:
+    - `start`: implementado.
+    - `health`: implementado.
+    - `stop/recovery` explicito: pendiente de contrato formal (hoy depende del lifecycle del proceso/router + systemd).
+- No alineado todavia con spec objetivo:
+  - No hay JetStream/durable consumers/acks.
+  - No hay garantias de entrega at-least-once en reinicios.
+  - Productores de `storage.events/items/reactivation` no estan activos end-to-end en runtime (aunque el contrato de `SY.storage` ya esta listo).
+
 ## Gap principal contra spec v1.16+
 
 1. Falta semantica de entrega robusta (JetStream/acks/durable consumers).
@@ -42,7 +60,12 @@ Nota actual:
   - [x] `storage.items`
   - [x] `storage.reactivation`
 - [x] Endurecer validacion en `sy_storage` (rechazo + log estructurado por campo invalido).
-- [ ] Acordar productores por subject (router/cognition/u otros).
+- [x] Acordar productores por subject (router/cognition/u otros).
+  - `storage.turns`: `rt-gateway` (publicacion actual implementada).
+  - `storage.events`: `SY.cognition` (productor objetivo; `SY.storage` ya preparado para consumir).
+  - `storage.items`: `SY.cognition` (productor objetivo; `SY.storage` ya preparado para consumir).
+  - `storage.reactivation`: `SY.cognition` (productor objetivo; `SY.storage` ya preparado para consumir).
+  - Nota operativa: hasta cerrar el pipeline cognitivo/WAN completo, el unico flujo E2E validado es `storage.turns`.
 
 Criterio de salida:
 - Se pueden reproducir tests de ingestion con fixtures validos e invalidos y resultado determinista.
@@ -58,9 +81,13 @@ Avance de implementacion:
 - [ ] Implementar lifecycle completo:
   - [x] start
   - [x] health
-  - [ ] stop
+  - [x] stop
   - [ ] recovery post-crash.
 - [x] Alinear config `nats.mode=embedded|client` con comportamiento real.
+
+Avance Fase 2 (2026-02-19):
+- `stop` explicito implementado en broker embebido (`stop_embedded_broker`) y conectado a `SIGTERM/SIGINT` de `rt-gateway`.
+- Recovery parcial: `start_embedded_broker` ahora tolera `AddrInUse` si el endpoint ya responde health.
 
 Criterio de salida:
 - En `embedded`, el router garantiza NATS local operativo sin dependencia manual externa.
@@ -76,8 +103,12 @@ Criterio de salida:
 ## Primer bloque sugerido para arrancar ya
 
 1. Cerrar lifecycle faltante del broker embebido (stop/recovery) y agregar smoke test de restart.
-2. Acordar y alinear productores de `storage.events/items/reactivation` al contrato canonico.
+2. Activar productor real de `storage.events/items/reactivation` (SY.cognition) para validar pipeline E2E completo.
 3. Preparar migracion de cliente NATS minimo a cliente con soporte de durabilidad (siguiente fase).
+
+Avance:
+- Se agrego smoke de lifecycle para NATS embebido: `scripts/nats_embedded_lifecycle_smoke.sh`.
+- Este smoke valida `restart` y (opcional) `stop/start` del `rt-gateway` con chequeo del endpoint NATS.
 
 ## Riesgos abiertos
 
@@ -109,4 +140,46 @@ Si queres conservar la fila para inspeccion manual:
 
 ```bash
 sudo SMOKE_KEEP_ROW=1 bash scripts/storage_smoke.sh
+```
+
+## Smoke E2E (storage.events/items/reactivation)
+
+Para validar ingestion completa de subjects de storage (fixtures validos):
+
+```bash
+sudo bash scripts/storage_subjects_e2e.sh
+```
+
+Opciones utiles:
+
+```bash
+sudo HIVE_CONFIG=/etc/fluxbee/hive.yaml SMOKE_TIMEOUT_SECS=30 bash scripts/storage_subjects_e2e.sh
+sudo DB_URL='postgresql://fluxbee:magicAI@127.0.0.1:5432/fluxbee' NATS_URL='nats://127.0.0.1:4222' bash scripts/storage_subjects_e2e.sh
+```
+
+Salida esperada:
+- `OK: event inserted in events table`
+- `OK: item inserted in memory_items table`
+- `OK: reactivation applied in events table`
+- `OK: cleanup verified (...)`
+
+Si queres conservar filas para inspeccion manual:
+
+```bash
+sudo SMOKE_KEEP_ROWS=1 bash scripts/storage_subjects_e2e.sh
+```
+
+## Smoke lifecycle NATS embebido (router)
+
+Para validar rapido el lifecycle de NATS embebido atado al router:
+
+```bash
+bash scripts/nats_embedded_lifecycle_smoke.sh
+```
+
+Opciones utiles:
+
+```bash
+SERVICE=rt-gateway NATS_URL=nats://127.0.0.1:4222 TIMEOUT_SECS=30 bash scripts/nats_embedded_lifecycle_smoke.sh
+CHECK_STOP_START=0 bash scripts/nats_embedded_lifecycle_smoke.sh
 ```
