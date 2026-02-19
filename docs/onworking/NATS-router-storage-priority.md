@@ -107,6 +107,10 @@ Criterio de salida:
   - [x] exposicion de contadores acumulados (`nats_subscribe_failures`, `storage_handler_failures`) en logs de metricas.
   - [x] endpoint admin `GET /config/storage/metrics` para consultar backlog/edad de inbox via API.
     - `SY.admin` ya no consulta PostgreSQL directo para este endpoint; usa request/reply NATS (`storage.metrics.get`) y `SY.storage` responde como gateway de DB.
+  - [x] hardening de request/reply para metricas:
+    - `jsr_client::nats::publish` ahora sincroniza con broker (`PING/PONG`) antes de cerrar socket en conexiones cortas.
+    - evita timeouts intermitentes donde `SY.storage` procesaba en ~1-2ms pero `SY.admin` no recibia reply.
+    - trazas finas quedan disponibles en nivel `debug` (`jsr_client::nats`, `sy_admin`, `sy_storage`) para diagnostico puntual sin ruido operativo por defecto.
 - [x] Base de ack post-persistencia en `SY.storage` (sin JetStream aun):
   - [x] `storage_inbox` durable en PostgreSQL para registrar mensajes recibidos.
   - [x] Replay automatico de pendientes al bootstrap de `SY.storage`.
@@ -128,6 +132,14 @@ Avance JetStream-base (2026-02-19):
 - `SY.storage` consume `storage.turns/events/items/reactivation` con durable queues en `embedded`.
 - Ack explicito post-handler exitoso mantiene semantica at-least-once y replay en reconnect/restart.
 - Test unitario agregado para replay durable cross-restart del broker.
+
+Incidencia operativa cerrada (2026-02-19, storage metrics):
+- Sintoma: `GET /config/storage/metrics` podia fallar con timeout de 8s en varios retries, aunque el siguiente intento respondia en milisegundos.
+- Causa: falta de sincronizacion en `publish` de cliente NATS sobre sockets efimeros (publish-and-close), con perdida intermitente de frame en el cierre.
+- Correccion aplicada: sync `PING/PONG` post-`PUB` en `jsr_client::nats::publish`.
+- Alcance:
+  - afecta camino NATS del cliente `jsr_client` (admin/storage en este flujo).
+  - no modifica el modulo NATS del router (`src/nats/mod.rs`), ni cambia contratos de subjects.
 
 ## Checklist de cierre - Libreria cliente (socket + NATS)
 

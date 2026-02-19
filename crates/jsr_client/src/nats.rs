@@ -94,7 +94,7 @@ pub async fn request(
     timeout_duration: Duration,
 ) -> Result<Vec<u8>, NatsError> {
     let request_started = Instant::now();
-    tracing::info!(
+    tracing::debug!(
         endpoint = %endpoint,
         request_subject = %request_subject,
         response_subject = %response_subject,
@@ -120,7 +120,7 @@ pub async fn request(
             );
             NatsError::Timeout(format!("connect timeout to {endpoint}"))
         })??;
-    tracing::info!(
+    tracing::debug!(
         endpoint = %endpoint,
         request_subject = %request_subject,
         response_subject = %response_subject,
@@ -136,7 +136,7 @@ pub async fn request(
         .await?;
     writer_half.write_all(b"PING\r\n").await?;
     writer_half.flush().await?;
-    tracing::info!(
+    tracing::debug!(
         endpoint = %endpoint,
         request_subject = %request_subject,
         response_subject = %response_subject,
@@ -222,7 +222,7 @@ pub async fn request(
             continue;
         }
         if line == "PONG" {
-            tracing::info!(
+            tracing::debug!(
                 endpoint = %endpoint,
                 request_subject = %request_subject,
                 response_subject = %response_subject,
@@ -281,7 +281,7 @@ pub async fn request(
     let publish_started = Instant::now();
     match publish(endpoint, request_subject, request_payload).await {
         Ok(()) => {
-            tracing::info!(
+            tracing::debug!(
                 endpoint = %endpoint,
                 request_subject = %request_subject,
                 response_subject = %response_subject,
@@ -428,7 +428,7 @@ pub async fn request(
                 })??;
             payload.truncate(msg.payload_len);
             if msg.subject == response_subject {
-                tracing::info!(
+                tracing::debug!(
                     endpoint = %endpoint,
                     request_subject = %request_subject,
                     response_subject = %response_subject,

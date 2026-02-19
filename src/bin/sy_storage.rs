@@ -912,7 +912,7 @@ async fn run_storage_metrics_query_loop(
                 let endpoint_out = endpoint_out.clone();
                 let storage_handler_errors = Arc::clone(&storage_handler_errors);
                 async move {
-                    tracing::info!(
+                    tracing::debug!(
                         request_subject = SUBJECT_STORAGE_METRICS_GET,
                         message_subject = %msg.subject,
                         sid = %msg.sid,
@@ -942,7 +942,7 @@ async fn run_storage_metrics_query_loop(
                     let request_started = Instant::now();
                     let trace_id = req.trace_id.clone();
                     let reply_subject = req.reply_subject.clone();
-                    tracing::info!(
+                    tracing::debug!(
                         trace_id = %trace_id,
                         request_subject = SUBJECT_STORAGE_METRICS_GET,
                         reply_subject = %reply_subject,
@@ -951,7 +951,7 @@ async fn run_storage_metrics_query_loop(
                     );
 
                     let db_started = Instant::now();
-                    tracing::info!(
+                    tracing::debug!(
                         trace_id = %trace_id,
                         request_subject = SUBJECT_STORAGE_METRICS_GET,
                         reply_subject = %reply_subject,
@@ -959,7 +959,7 @@ async fn run_storage_metrics_query_loop(
                     );
                     let (response, response_status) = match storage.inbox_metrics_snapshot().await {
                         Ok(metrics) => {
-                            tracing::info!(
+                            tracing::debug!(
                                 trace_id = %trace_id,
                                 request_subject = SUBJECT_STORAGE_METRICS_GET,
                                 reply_subject = %reply_subject,
@@ -999,7 +999,7 @@ async fn run_storage_metrics_query_loop(
                         }
                     };
                     let db_elapsed_ms = db_started.elapsed().as_millis() as u64;
-                    tracing::info!(
+                    tracing::debug!(
                         trace_id = %trace_id,
                         request_subject = SUBJECT_STORAGE_METRICS_GET,
                         reply_subject = %reply_subject,
@@ -1009,7 +1009,7 @@ async fn run_storage_metrics_query_loop(
                     );
                     let body = serde_json::to_vec(&response)
                         .map_err(|err| ClientNatsError::Protocol(err.to_string()))?;
-                    tracing::info!(
+                    tracing::debug!(
                         trace_id = %trace_id,
                         request_subject = SUBJECT_STORAGE_METRICS_GET,
                         reply_subject = %reply_subject,
@@ -1018,7 +1018,7 @@ async fn run_storage_metrics_query_loop(
                         "storage metrics response serialized"
                     );
                     let publish_started = Instant::now();
-                    tracing::info!(
+                    tracing::debug!(
                         trace_id = %trace_id,
                         request_subject = SUBJECT_STORAGE_METRICS_GET,
                         reply_subject = %reply_subject,
@@ -1049,7 +1049,7 @@ async fn run_storage_metrics_query_loop(
                     }
                     let publish_elapsed_ms = publish_started.elapsed().as_millis() as u64;
                     let total_elapsed_ms = request_started.elapsed().as_millis() as u64;
-                    tracing::info!(
+                    tracing::debug!(
                         trace_id = %trace_id,
                         request_subject = SUBJECT_STORAGE_METRICS_GET,
                         reply_subject = %reply_subject,
@@ -1104,7 +1104,7 @@ async fn run_storage_metrics_loop(
                         "storage inbox lag is above threshold"
                     );
                 } else {
-                    tracing::info!(
+                    tracing::debug!(
                         pending = metrics.pending,
                         pending_with_error = metrics.pending_with_error,
                         oldest_pending_age_s = metrics.oldest_pending_age_s,
