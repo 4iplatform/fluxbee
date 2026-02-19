@@ -170,6 +170,21 @@ Si queres conservar filas para inspeccion manual:
 sudo SMOKE_KEEP_ROWS=1 bash scripts/storage_subjects_e2e.sh
 ```
 
+## Suite E2E (storage.turns + storage subjects)
+
+Para correr ambos tests de ingestion en una sola pasada:
+
+```bash
+sudo bash scripts/storage_ingestion_suite.sh
+```
+
+Opciones utiles:
+
+```bash
+sudo HIVE_CONFIG=/etc/fluxbee/hive.yaml SMOKE_TIMEOUT_SECS=30 bash scripts/storage_ingestion_suite.sh
+sudo DB_URL='postgresql://fluxbee:magicAI@127.0.0.1:5432/fluxbee' NATS_URL='nats://127.0.0.1:4222' bash scripts/storage_ingestion_suite.sh
+```
+
 ## Smoke lifecycle NATS embebido (router)
 
 Para validar rapido el lifecycle de NATS embebido atado al router:
