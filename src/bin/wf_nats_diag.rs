@@ -33,6 +33,13 @@ fn now_epoch_ms() -> u128 {
         .as_millis()
 }
 
+fn short_id(value: &str) -> String {
+    if value.len() <= 12 {
+        return value.to_string();
+    }
+    format!("{}..{}", &value[..6], &value[value.len() - 6..])
+}
+
 async fn run_server(endpoint: String, subject: String, sid: u32) -> Result<(), Box<dyn Error>> {
     tracing::info!(
         mode = "server",
@@ -52,7 +59,6 @@ async fn run_server(endpoint: String, subject: String, sid: u32) -> Result<(), B
                     mode = "server",
                     subject = %msg.subject,
                     sid = %msg.sid,
-                    reply_to = ?msg.reply_to,
                     payload_bytes = msg.payload.len(),
                     "wf nats diag server message received"
                 );
@@ -86,6 +92,8 @@ async fn run_server(endpoint: String, subject: String, sid: u32) -> Result<(), B
                     return Ok(());
                 }
 
+                let seq = payload.get("seq").and_then(|v| v.as_u64());
+
                 let response_payload = json!({
                     "echo_subject": msg.subject,
                     "echo_payload": payload,
@@ -95,7 +103,7 @@ async fn run_server(endpoint: String, subject: String, sid: u32) -> Result<(), B
                 let body = serde_json::to_vec(&response)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-                tracing::info!(
+                tracing::debug!(
                     mode = "server",
                     trace_id = %trace_id,
                     reply_subject = %reply_subject,
@@ -108,8 +116,8 @@ async fn run_server(endpoint: String, subject: String, sid: u32) -> Result<(), B
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
                 tracing::info!(
                     mode = "server",
-                    trace_id = %trace_id,
-                    reply_subject = %reply_subject,
+                    trace = %short_id(&trace_id),
+                    seq = ?seq,
                     response_bytes = body.len(),
                     total_elapsed_ms = handler_started.elapsed().as_millis() as u64,
                     "wf nats diag server response published"
@@ -162,11 +170,18 @@ async fn run_client(
 
         tracing::info!(
             mode = "client",
-            trace_id = %trace_id,
+            seq = i,
+            trace = %short_id(&trace_id),
             request_subject = %subject,
-            reply_subject = %reply_subject,
             request_bytes = body.len(),
             "wf nats diag client request send"
+        );
+        tracing::debug!(
+            mode = "client",
+            seq = i,
+            trace_id = %trace_id,
+            reply_subject = %reply_subject,
+            "wf nats diag client request route"
         );
 
         let started = std::time::Instant::now();
@@ -178,16 +193,17 @@ async fn run_client(
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 tracing::info!(
                     mode = "client",
-                    trace_id = %trace_id,
-                    reply_subject = %reply_subject,
+                    seq = i,
+                    trace = %short_id(&trace_id),
                     elapsed_ms = elapsed_ms,
                     response_bytes = reply.len(),
                     "wf nats diag client response received"
                 );
                 match serde_json::from_slice::<NatsResponseEnvelope<Value>>(&reply) {
                     Ok(decoded) => {
-                        tracing::info!(
+                        tracing::debug!(
                             mode = "client",
+                            seq = i,
                             trace_id = %trace_id,
                             response_status = %decoded.status,
                             response_action = %decoded.action,
@@ -213,9 +229,9 @@ async fn run_client(
                 let metrics = client.metrics_snapshot();
                 tracing::warn!(
                     mode = "client",
-                    trace_id = %trace_id,
+                    seq = i,
+                    trace = %short_id(&trace_id),
                     request_subject = %subject,
-                    reply_subject = %reply_subject,
                     elapsed_ms = elapsed_ms,
                     error = %err,
                     nats_timeouts = metrics.timeouts,

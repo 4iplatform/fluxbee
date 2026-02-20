@@ -22,6 +22,7 @@ set -euo pipefail
 #   STREAM_CLIENT_LOG="1"
 #   STREAM_SERVER_LOG="0"
 #   SHOW_TIMING_SUMMARY="1"
+#   SHOW_FULL_LOGS="0"
 
 NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
 WF_DIAG_SUBJECT="${WF_DIAG_SUBJECT:-wf.diag.echo}"
@@ -36,6 +37,7 @@ DIAG_ROUTER_LOG_LINES="${DIAG_ROUTER_LOG_LINES:-200}"
 STREAM_CLIENT_LOG="${STREAM_CLIENT_LOG:-1}"
 STREAM_SERVER_LOG="${STREAM_SERVER_LOG:-0}"
 SHOW_TIMING_SUMMARY="${SHOW_TIMING_SUMMARY:-1}"
+SHOW_FULL_LOGS="${SHOW_FULL_LOGS:-0}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_PATH="${WF_DIAG_BIN_PATH:-$ROOT_DIR/target/release/wf_nats_diag}"
@@ -54,7 +56,7 @@ print_timing_stats() {
   local label="$4"
   awk -v marker="$marker" -v key="$key" -v label="$label" '
     index($0, marker) {
-      pattern = key "=[0-9]+"
+      pattern = key "=[0-9][0-9]*"
       if (match($0, pattern)) {
         value = substr($0, RSTART + length(key) + 1, RLENGTH - length(key) - 1) + 0
         count += 1
@@ -72,6 +74,20 @@ print_timing_stats() {
       }
     }
   ' "$file"
+}
+
+sanitize_diag_line() {
+  sed -E \
+    -e 's/[0-9a-f]{8}-[0-9a-f-]{27,}/<uuid>/g' \
+    -e 's/_INBOX\.JSR\.[^ ]+/<inbox>/g' \
+    -e 's/_JSR\.ACK\.[0-9]+/<ack>/g'
+}
+
+print_compact_timeline() {
+  echo "---- WF diag compact timeline ----"
+  {
+    grep -h -E "wf nats diag client request send|wf nats diag client response received|wf nats diag client request failed|wf nats diag server message received|wf nats diag server response published|nats publish completed with server ack|nats multiplexed request timeout waiting response header" "$client_log" "$server_log" || true
+  } | sanitize_diag_line
 }
 
 print_timing_summary() {
@@ -197,10 +213,14 @@ if [[ -n "${tail_server_pid:-}" ]] && kill -0 "$tail_server_pid" >/dev/null 2>&1
   kill "$tail_server_pid" >/dev/null 2>&1 || true
 fi
 
-echo "---- WF diag client log ----"
-cat "$client_log"
-echo "---- WF diag server log ----"
-cat "$server_log"
+if [[ "$SHOW_FULL_LOGS" == "1" ]]; then
+  echo "---- WF diag client log ----"
+  cat "$client_log"
+  echo "---- WF diag server log ----"
+  cat "$server_log"
+else
+  print_compact_timeline
+fi
 print_timing_summary
 print_router_journal_if_available
 
