@@ -161,7 +161,7 @@ Estado y pendientes:
 - [x] Correlacion request/reply robusta (inbox por sesion + `trace_id`).
 - [x] Envelope comun de mensajes (versionado/meta minima) para callers NATS.
 - [x] Metricas del cliente NATS (timeouts, reconnects, in-flight, last error).
-- [ ] Tests de integracion de libreria contra broker embebido (restart, reconnect, req/reply, sub).
+- [x] Tests de integracion de libreria contra broker embebido (restart, reconnect, req/reply, sub).
 - [ ] Migrar nodos callers a API strict (evitar uso directo de endpoint string).
 - [ ] Documentar quickstart de nodo nuevo (`AI.test`) usando libreria para socket + NATS.
 
@@ -208,6 +208,8 @@ Criterio de salida:
 Avance:
 - Se agrego smoke de lifecycle para NATS embebido: `scripts/nats_embedded_lifecycle_smoke.sh`.
 - Este smoke valida `restart` y (opcional) `stop/start` del `rt-gateway` con chequeo del endpoint NATS.
+- Se agrego `scripts/nats_client_transport_e2e.sh` para validar request/reply (`SY.admin -> NATS -> SY.storage`) en escenarios de restart/reconnect.
+- Se agrego `scripts/nats_full_suite.sh` para ejecutar en orden lifecycle + transport + admin E2E en una sola corrida.
 
 ## Riesgos abiertos
 
@@ -296,4 +298,27 @@ Opciones utiles:
 ```bash
 SERVICE=rt-gateway NATS_URL=nats://127.0.0.1:4222 TIMEOUT_SECS=30 bash scripts/nats_embedded_lifecycle_smoke.sh
 CHECK_STOP_START=0 bash scripts/nats_embedded_lifecycle_smoke.sh
+```
+
+## E2E transporte NATS (cliente/libreria)
+
+Para validar reconnect/request-reply/resubscribe en camino `SY.admin -> NATS -> SY.storage`:
+
+```bash
+BASE="http://127.0.0.1:8080" bash scripts/nats_client_transport_e2e.sh
+```
+
+Opciones utiles:
+
+```bash
+BASE="http://127.0.0.1:8080" METRICS_TIMEOUT_SECS=60 POLL_INTERVAL_SECS=2 bash scripts/nats_client_transport_e2e.sh
+RUN_ROUTER_STOP_START=0 RUN_STORAGE_RESTART=0 bash scripts/nats_client_transport_e2e.sh
+```
+
+## Suite NATS completa (lifecycle + transporte + admin)
+
+Para ejecutar todo junto en una sola corrida:
+
+```bash
+BASE="http://127.0.0.1:8080" HIVE_ID="worker-220" bash scripts/nats_full_suite.sh
 ```
