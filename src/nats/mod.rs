@@ -414,11 +414,19 @@ async fn run_embedded_broker(
                 let state = Arc::clone(&state);
                 connection_tasks.spawn(async move {
                     if let Err(err) = handle_embedded_connection(stream, connection_id, state).await {
-                        tracing::warn!(
-                            connection_id,
-                            error = %err,
-                            "embedded nats connection closed with error"
-                        );
+                        if is_expected_embedded_disconnect(&err) {
+                            tracing::debug!(
+                                connection_id,
+                                error = %err,
+                                "embedded nats connection closed"
+                            );
+                        } else {
+                            tracing::warn!(
+                                connection_id,
+                                error = %err,
+                                "embedded nats connection closed with error"
+                            );
+                        }
                     }
                 });
             }
@@ -460,6 +468,16 @@ async fn run_embedded_broker(
     flush_durable_state_force(&state).await;
 
     Ok(())
+}
+
+fn is_expected_embedded_disconnect(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 #[derive(Clone)]
