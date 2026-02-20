@@ -158,9 +158,9 @@ Estado y pendientes:
 - [x] Mantener inbox/reply subjects en sesion persistente (multiplexado), evitando handshake TCP por cada operacion local.
 - [ ] Objetivo operativo de este bloque: eliminar jitter/picos locales observados (~40ms) por connect/close repetido.
 - [x] Auto-resubscribe robusto para subscribers tras caida/restart de broker.
-- [ ] Correlacion request/reply robusta (inbox por sesion + `trace_id`).
-- [ ] Envelope comun de mensajes (versionado/meta minima) para callers NATS.
-- [ ] Metricas del cliente NATS (timeouts, reconnects, in-flight, last error).
+- [x] Correlacion request/reply robusta (inbox por sesion + `trace_id`).
+- [x] Envelope comun de mensajes (versionado/meta minima) para callers NATS.
+- [x] Metricas del cliente NATS (timeouts, reconnects, in-flight, last error).
 - [ ] Tests de integracion de libreria contra broker embebido (restart, reconnect, req/reply, sub).
 - [ ] Migrar nodos callers a API strict (evitar uso directo de endpoint string).
 - [ ] Documentar quickstart de nodo nuevo (`AI.test`) usando libreria para socket + NATS.
@@ -169,8 +169,10 @@ Nota de estado:
 - La API strict ya existe en `jsr_client::nats`; queda pendiente migrar callers (`SY.*`/otros nodos) para eliminar uso de endpoint string directo.
 - `jsr_client::nats::request` ya publica el request en el mismo socket donde espera el reply (se elimino el segundo socket interno de `publish`).
 - `SY.admin` (`/config/storage/metrics`) ya usa `jsr_client::nats::NatsClient` persistente con reconnect/backoff.
-- `SY.admin` storage metrics ahora usa reply subject por request (`storage.metrics.reply.<trace_id>`) sobre una sola suscripcion persistente wildcard (`storage.metrics.reply.*`) en la sesion NATS.
+- `SY.admin` storage metrics ahora usa `reply_subject` por request sobre inbox de sesion (`_INBOX.JSR.<session>.<trace_id>`), evitando colisiones entre procesos.
 - `jsr_client::nats::NatsSubscriber` ahora incluye `run_with_reconnect` (backoff exponencial) para re-suscribir automaticamente tras caidas/restarts del broker.
+- `jsr_client::nats::NatsClient` ahora genera inbox de sesion (`_INBOX.JSR.<session>.*`) y correlaciona requests con `reply_subject` por `trace_id` dentro de esa sesion compartida.
+- `jsr_client::nats::NatsClient` expone `metrics_snapshot()` con `timeouts/reconnects/in_flight/last_error` para observabilidad del caller.
 
 ## Cierre admin - prueba recomendada (estado actual)
 

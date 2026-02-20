@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Instant};
+use uuid::Uuid;
 
 use crate::client_config::ClientConfig;
 
@@ -22,6 +25,10 @@ const DEFAULT_CLIENT_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_CLIENT_RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const DEFAULT_CLIENT_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const DEFAULT_CLIENT_RECONNECT_ATTEMPTS: usize = 4;
+const SESSION_INBOX_PREFIX: &str = "_INBOX.JSR";
+const SESSION_INBOX_SID_BASE: u32 = 20_000;
+const SESSION_INBOX_SID_RANGE: u64 = 20_000;
+pub const NATS_ENVELOPE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NatsError {
@@ -39,6 +46,78 @@ pub struct NatsMessage {
     pub sid: String,
     pub reply_to: Option<String>,
     pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NatsRequestEnvelope<T> {
+    pub schema_version: u16,
+    pub action: String,
+    pub trace_id: String,
+    pub reply_subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<T>,
+}
+
+impl<T> NatsRequestEnvelope<T> {
+    pub fn new(
+        action: impl Into<String>,
+        trace_id: impl Into<String>,
+        reply_subject: impl Into<String>,
+        payload: Option<T>,
+    ) -> Self {
+        Self {
+            schema_version: NATS_ENVELOPE_SCHEMA_VERSION,
+            action: action.into(),
+            trace_id: trace_id.into(),
+            reply_subject: reply_subject.into(),
+            payload,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NatsResponseEnvelope<T> {
+    pub schema_version: u16,
+    pub action: String,
+    pub trace_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
+}
+
+impl<T> NatsResponseEnvelope<T> {
+    pub fn ok(action: impl Into<String>, trace_id: impl Into<String>, payload: T) -> Self {
+        Self {
+            schema_version: NATS_ENVELOPE_SCHEMA_VERSION,
+            action: action.into(),
+            trace_id: trace_id.into(),
+            status: "ok".to_string(),
+            payload: Some(payload),
+            error_code: None,
+            error_detail: None,
+        }
+    }
+
+    pub fn error(
+        action: impl Into<String>,
+        trace_id: impl Into<String>,
+        error_code: impl Into<String>,
+        error_detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: NATS_ENVELOPE_SCHEMA_VERSION,
+            action: action.into(),
+            trace_id: trace_id.into(),
+            status: "error".to_string(),
+            payload: None,
+            error_code: Some(error_code.into()),
+            error_detail: Some(error_detail.into()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -70,11 +149,64 @@ struct NatsConnection {
 struct NatsClientState {
     connection: Option<NatsConnection>,
     response_subscriptions: HashMap<String, u32>,
+    has_connected_once: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NatsClientMetricsSnapshot {
+    pub timeouts: u64,
+    pub reconnects: u64,
+    pub in_flight: u64,
+    pub last_error: Option<String>,
+}
+
+struct NatsClientMetrics {
+    timeouts: AtomicU64,
+    reconnects: AtomicU64,
+    in_flight: AtomicU64,
+    last_error: StdMutex<Option<String>>,
+}
+
+impl NatsClientMetrics {
+    fn snapshot(&self) -> NatsClientMetricsSnapshot {
+        let last_error = self
+            .last_error
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_else(|_| Some("metrics.last_error lock poisoned".to_string()));
+        NatsClientMetricsSnapshot {
+            timeouts: self.timeouts.load(Ordering::Relaxed),
+            reconnects: self.reconnects.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+            last_error,
+        }
+    }
+}
+
+struct NatsInFlightGuard {
+    metrics: Arc<NatsClientMetrics>,
+}
+
+impl NatsInFlightGuard {
+    fn new(metrics: Arc<NatsClientMetrics>) -> Self {
+        metrics.in_flight.fetch_add(1, Ordering::Relaxed);
+        Self { metrics }
+    }
+}
+
+impl Drop for NatsInFlightGuard {
+    fn drop(&mut self) {
+        self.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 pub struct NatsClient {
     endpoint: String,
     options: NatsClientOptions,
+    session_inbox_prefix: String,
+    session_inbox_subscription: String,
+    session_inbox_sid: u32,
+    metrics: Arc<NatsClientMetrics>,
     state: Mutex<NatsClientState>,
 }
 
@@ -84,14 +216,72 @@ impl NatsClient {
     }
 
     pub fn with_options(endpoint: impl Into<String>, options: NatsClientOptions) -> Self {
+        let session = Uuid::new_v4().simple().to_string();
+        let session_inbox_prefix = format!("{SESSION_INBOX_PREFIX}.{session}");
+        let session_inbox_subscription = format!("{session_inbox_prefix}.*");
+        let session_inbox_sid = SESSION_INBOX_SID_BASE
+            + (fnv1a64(session_inbox_prefix.as_bytes()) % SESSION_INBOX_SID_RANGE) as u32;
         Self {
             endpoint: endpoint.into(),
             options,
+            session_inbox_prefix,
+            session_inbox_subscription,
+            session_inbox_sid,
+            metrics: Arc::new(NatsClientMetrics {
+                timeouts: AtomicU64::new(0),
+                reconnects: AtomicU64::new(0),
+                in_flight: AtomicU64::new(0),
+                last_error: StdMutex::new(None),
+            }),
             state: Mutex::new(NatsClientState {
                 connection: None,
                 response_subscriptions: HashMap::new(),
+                has_connected_once: false,
             }),
         }
+    }
+
+    pub fn inbox_reply_subject(&self, correlation_id: &str) -> String {
+        let token = sanitize_inbox_token(correlation_id);
+        format!("{}.{}", self.session_inbox_prefix, token)
+    }
+
+    pub fn metrics_snapshot(&self) -> NatsClientMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    fn record_error(&self, err: &NatsError) {
+        if matches!(err, NatsError::Timeout(_)) {
+            self.metrics.timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Ok(mut last_error) = self.metrics.last_error.lock() {
+            *last_error = Some(err.to_string());
+        }
+    }
+
+    fn on_connect_success(&self, state: &mut NatsClientState) {
+        if state.has_connected_once {
+            self.metrics.reconnects.fetch_add(1, Ordering::Relaxed);
+        }
+        state.has_connected_once = true;
+    }
+
+    pub async fn request_with_session_inbox(
+        &self,
+        request_subject: &str,
+        request_payload: &[u8],
+        response_subject: &str,
+        timeout_duration: Duration,
+    ) -> Result<Vec<u8>, NatsError> {
+        self.request_multiplexed(
+            request_subject,
+            request_payload,
+            response_subject,
+            &self.session_inbox_subscription,
+            self.session_inbox_sid,
+            timeout_duration,
+        )
+        .await
     }
 
     pub async fn publish(&self, subject: &str, payload: &[u8]) -> Result<(), NatsError> {
@@ -109,9 +299,11 @@ impl NatsClient {
                         if state.connection.is_none() {
                             state.connection = Some(conn);
                             state.response_subscriptions.clear();
+                            self.on_connect_success(&mut state);
                         }
                     }
                     Err(err) => {
+                        self.record_error(&err);
                         last_err = Some(err);
                         if attempt == attempts {
                             break;
@@ -146,6 +338,7 @@ impl NatsClient {
                     let retryable = is_retryable_nats_error(&err);
                     state.connection = None;
                     state.response_subscriptions.clear();
+                    self.record_error(&err);
                     last_err = Some(err);
                     if attempt == attempts || !retryable {
                         break;
@@ -173,6 +366,7 @@ impl NatsClient {
         sid: u32,
         timeout_duration: Duration,
     ) -> Result<Vec<u8>, NatsError> {
+        let _in_flight = NatsInFlightGuard::new(Arc::clone(&self.metrics));
         let attempts = self.options.reconnect_attempts.max(1);
         let mut backoff = self.options.reconnect_initial_backoff;
         let mut last_err = None;
@@ -187,9 +381,11 @@ impl NatsClient {
                         if state.connection.is_none() {
                             state.connection = Some(conn);
                             state.response_subscriptions.clear();
+                            self.on_connect_success(&mut state);
                         }
                     }
                     Err(err) => {
+                        self.record_error(&err);
                         last_err = Some(err);
                         if attempt == attempts {
                             break;
@@ -222,6 +418,7 @@ impl NatsClient {
                     let retryable = is_retryable_nats_error(&err);
                     state.connection = None;
                     state.response_subscriptions.clear();
+                    self.record_error(&err);
                     last_err = Some(err);
                     if attempt == attempts || !retryable {
                         break;
@@ -249,6 +446,7 @@ impl NatsClient {
         sid: u32,
         timeout_duration: Duration,
     ) -> Result<Vec<u8>, NatsError> {
+        let _in_flight = NatsInFlightGuard::new(Arc::clone(&self.metrics));
         let attempts = self.options.reconnect_attempts.max(1);
         let mut backoff = self.options.reconnect_initial_backoff;
         let mut last_err = None;
@@ -263,9 +461,11 @@ impl NatsClient {
                         if state.connection.is_none() {
                             state.connection = Some(conn);
                             state.response_subscriptions.clear();
+                            self.on_connect_success(&mut state);
                         }
                     }
                     Err(err) => {
+                        self.record_error(&err);
                         last_err = Some(err);
                         if attempt == attempts {
                             break;
@@ -283,6 +483,7 @@ impl NatsClient {
             let NatsClientState {
                 connection,
                 response_subscriptions,
+                ..
             } = &mut *state;
             let result = match connection.as_mut() {
                 Some(conn) => {
@@ -307,6 +508,7 @@ impl NatsClient {
                     let retryable = is_retryable_nats_error(&err);
                     state.connection = None;
                     state.response_subscriptions.clear();
+                    self.record_error(&err);
                     last_err = Some(err);
                     if attempt == attempts || !retryable {
                         break;
@@ -1398,6 +1600,30 @@ fn extract_host(addr: &str) -> Result<&str, NatsError> {
     )))
 }
 
+fn sanitize_inbox_token(token: &str) -> String {
+    let mut out = String::with_capacity(token.len().max(1));
+    for ch in token.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn summarize_nats_line(line: &str) -> String {
     if line.len() <= NATS_LOG_LINE_MAX_LEN {
         return line.to_string();
@@ -1767,6 +1993,116 @@ nats:
             .publish(subject, &payload)
             .await
             .expect("persistent client publish should recover after reconnect");
+        let metrics = client.metrics_snapshot();
+        assert_eq!(metrics.reconnects, 1, "expected exactly one reconnect");
+        assert_eq!(metrics.in_flight, 0, "publish should not leave in-flight requests");
+        server_task.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn request_timeout_records_metrics_snapshot() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test nats listener");
+        let endpoint = format!("nats://{}", listener.local_addr().expect("listener local addr"));
+        let request_subject = "storage.metrics.get";
+        let response_subject = "storage.metrics.reply.timeout";
+        let sid = 4242;
+        let request_payload = br#"{"trace_id":"timeout"}"#.to_vec();
+        let request_payload_for_server = request_payload.clone();
+        let request_subject_for_server = request_subject.to_string();
+        let response_subject_for_server = response_subject.to_string();
+
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("connection accepted");
+            let mut reader = BufReader::new(socket);
+            let mut line = String::new();
+
+            reader.read_line(&mut line).await.expect("read CONNECT");
+            assert!(line.starts_with("CONNECT "), "expected CONNECT");
+            line.clear();
+
+            reader.read_line(&mut line).await.expect("read handshake PING");
+            assert_eq!(line.trim_end_matches(['\r', '\n']), "PING");
+            reader
+                .get_mut()
+                .write_all(b"PONG\r\n")
+                .await
+                .expect("write handshake PONG");
+            reader.get_mut().flush().await.expect("flush handshake PONG");
+            line.clear();
+
+            reader.read_line(&mut line).await.expect("read UNSUB");
+            assert_eq!(
+                line.trim_end_matches(['\r', '\n']),
+                format!("UNSUB {sid}")
+            );
+            line.clear();
+
+            reader.read_line(&mut line).await.expect("read SUB");
+            assert_eq!(
+                line.trim_end_matches(['\r', '\n']),
+                format!("SUB {response_subject_for_server} {sid}")
+            );
+            line.clear();
+
+            reader.read_line(&mut line).await.expect("read sync PING");
+            assert_eq!(line.trim_end_matches(['\r', '\n']), "PING");
+            reader
+                .get_mut()
+                .write_all(b"PONG\r\n")
+                .await
+                .expect("write sync PONG");
+            reader.get_mut().flush().await.expect("flush sync PONG");
+            line.clear();
+
+            reader.read_line(&mut line).await.expect("read PUB");
+            assert_eq!(
+                line.trim_end_matches(['\r', '\n']),
+                format!(
+                    "PUB {} {}",
+                    request_subject_for_server,
+                    request_payload_for_server.len()
+                )
+            );
+            let mut published = vec![0u8; request_payload_for_server.len() + 2];
+            reader
+                .read_exact(&mut published)
+                .await
+                .expect("read request payload");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let client = NatsClient::with_options(
+            endpoint,
+            NatsClientOptions {
+                reconnect_attempts: 1,
+                ..NatsClientOptions::default()
+            },
+        );
+        let err = client
+            .request(
+                request_subject,
+                &request_payload,
+                response_subject,
+                sid,
+                Duration::from_millis(100),
+            )
+            .await
+            .expect_err("request must timeout");
+        assert!(
+            err.to_string().contains("timeout"),
+            "expected timeout error, got {err}"
+        );
+        let metrics = client.metrics_snapshot();
+        assert_eq!(metrics.timeouts, 1, "expected timeout counter increment");
+        assert_eq!(metrics.in_flight, 0, "in-flight must be released after timeout");
+        let last_error = metrics.last_error.unwrap_or_default();
+        assert!(
+            last_error.contains("timeout"),
+            "expected last_error with timeout, got {last_error}"
+        );
+
         server_task.await.expect("server task should finish");
     }
 
@@ -2091,6 +2427,193 @@ nats:
 
         subscriber_task.abort();
         let _ = subscriber_task.await;
+        server_task.await.expect("server task should finish");
+    }
+
+    #[test]
+    fn session_inbox_subject_sanitizes_trace_token() {
+        let client = NatsClient::new("nats://127.0.0.1:4222");
+        let subject = client.inbox_reply_subject("trace.id/with space");
+        assert!(
+            subject.starts_with("_INBOX.JSR."),
+            "expected session inbox prefix, got {subject}"
+        );
+        assert!(
+            subject.ends_with(".trace_id_with_space"),
+            "expected sanitized suffix, got {subject}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_with_session_inbox_reuses_session_subscription() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test nats listener");
+        let endpoint = format!("nats://{}", listener.local_addr().expect("listener local addr"));
+        let request_subject = "storage.metrics.get";
+        let request_payload_1 = br#"{"trace_id":"t1"}"#.to_vec();
+        let request_payload_2 = br#"{"trace_id":"t2"}"#.to_vec();
+        let response_payload_1 = br#"{"status":"ok","trace_id":"t1"}"#.to_vec();
+        let response_payload_2 = br#"{"status":"ok","trace_id":"t2"}"#.to_vec();
+        let request_payload_1_for_server = request_payload_1.clone();
+        let request_payload_2_for_server = request_payload_2.clone();
+        let response_payload_1_for_server = response_payload_1.clone();
+        let response_payload_2_for_server = response_payload_2.clone();
+
+        let client = NatsClient::new(endpoint.clone());
+        let response_subject_1 = client.inbox_reply_subject("t1");
+        let response_subject_2 = client.inbox_reply_subject("t2");
+        let response_subject_1_for_server = response_subject_1.clone();
+        let response_subject_2_for_server = response_subject_2.clone();
+
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("connection accepted");
+            let mut reader = BufReader::new(socket);
+            let mut line = String::new();
+
+            reader.read_line(&mut line).await.expect("read CONNECT");
+            assert!(line.starts_with("CONNECT "), "expected CONNECT");
+            line.clear();
+
+            reader.read_line(&mut line).await.expect("read initial PING");
+            assert_eq!(line.trim_end_matches(['\r', '\n']), "PING");
+            reader
+                .get_mut()
+                .write_all(b"PONG\r\n")
+                .await
+                .expect("write initial PONG");
+            reader.get_mut().flush().await.expect("flush initial PONG");
+            line.clear();
+
+            reader.read_line(&mut line).await.expect("read SUB wildcard");
+            let sub_line = line.trim_end_matches(['\r', '\n']).to_string();
+            let parts: Vec<&str> = sub_line.split_whitespace().collect();
+            assert_eq!(parts.len(), 3, "expected SUB <subject> <sid>, got {sub_line}");
+            assert_eq!(parts[0], "SUB");
+            assert!(
+                parts[1].starts_with("_INBOX.JSR."),
+                "expected inbox wildcard subject, got {}",
+                parts[1]
+            );
+            assert!(parts[1].ends_with(".*"), "expected wildcard suffix, got {}", parts[1]);
+            let sid = parts[2];
+            line.clear();
+
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read sync PING after SUB");
+            assert_eq!(line.trim_end_matches(['\r', '\n']), "PING");
+            reader
+                .get_mut()
+                .write_all(b"PONG\r\n")
+                .await
+                .expect("write sync PONG after SUB");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush sync PONG after SUB");
+            line.clear();
+
+            reader.read_line(&mut line).await.expect("read first PUB");
+            assert_eq!(
+                line.trim_end_matches(['\r', '\n']),
+                format!("PUB {request_subject} {}", request_payload_1_for_server.len())
+            );
+            let mut payload_1 = vec![0u8; request_payload_1_for_server.len() + 2];
+            reader
+                .read_exact(&mut payload_1)
+                .await
+                .expect("read first payload");
+            payload_1.truncate(request_payload_1_for_server.len());
+            assert_eq!(payload_1, request_payload_1_for_server);
+            line.clear();
+
+            reader
+                .get_mut()
+                .write_all(
+                    format!(
+                        "MSG {response_subject_1_for_server} {sid} {}\r\n",
+                        response_payload_1_for_server.len()
+                    )
+                        .as_bytes(),
+                )
+                .await
+                .expect("write first MSG header");
+            reader
+                .get_mut()
+                .write_all(&response_payload_1_for_server)
+                .await
+                .expect("write first MSG payload");
+            reader
+                .get_mut()
+                .write_all(b"\r\n")
+                .await
+                .expect("write first MSG terminator");
+            reader.get_mut().flush().await.expect("flush first MSG");
+
+            // Second request should not emit SUB again.
+            reader.read_line(&mut line).await.expect("read second PUB");
+            assert_eq!(
+                line.trim_end_matches(['\r', '\n']),
+                format!("PUB {request_subject} {}", request_payload_2_for_server.len())
+            );
+            let mut payload_2 = vec![0u8; request_payload_2_for_server.len() + 2];
+            reader
+                .read_exact(&mut payload_2)
+                .await
+                .expect("read second payload");
+            payload_2.truncate(request_payload_2_for_server.len());
+            assert_eq!(payload_2, request_payload_2_for_server);
+            line.clear();
+
+            reader
+                .get_mut()
+                .write_all(
+                    format!(
+                        "MSG {response_subject_2_for_server} {sid} {}\r\n",
+                        response_payload_2_for_server.len()
+                    )
+                        .as_bytes(),
+                )
+                .await
+                .expect("write second MSG header");
+            reader
+                .get_mut()
+                .write_all(&response_payload_2_for_server)
+                .await
+                .expect("write second MSG payload");
+            reader
+                .get_mut()
+                .write_all(b"\r\n")
+                .await
+                .expect("write second MSG terminator");
+            reader.get_mut().flush().await.expect("flush second MSG");
+        });
+
+        let first = client
+            .request_with_session_inbox(
+                request_subject,
+                &request_payload_1,
+                &response_subject_1,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("first session-inbox request should succeed");
+        assert_eq!(first, response_payload_1);
+
+        let second = client
+            .request_with_session_inbox(
+                request_subject,
+                &request_payload_2,
+                &response_subject_2,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("second session-inbox request should succeed");
+        assert_eq!(second, response_payload_2);
+
         server_task.await.expect("server task should finish");
     }
 }

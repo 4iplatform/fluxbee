@@ -13,7 +13,8 @@ use tracing_subscriber::EnvFilter;
 
 use jsr_client::nats::{
     publish as client_nats_publish, NatsError as ClientNatsError,
-    NatsSubscriber as ClientNatsSubscriber,
+    NatsRequestEnvelope, NatsResponseEnvelope, NatsSubscriber as ClientNatsSubscriber,
+    NATS_ENVELOPE_SCHEMA_VERSION,
 };
 use json_router::nats::{
     NatsSubscriber as RouterNatsSubscriber, SUBJECT_STORAGE_EVENTS, SUBJECT_STORAGE_ITEMS,
@@ -97,12 +98,6 @@ struct MemoryItemRecord {
     confidence: f64,
     cues_signature: Vec<String>,
     activation_strength: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct StorageMetricsRequest {
-    trace_id: String,
-    reply_subject: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -920,7 +915,7 @@ async fn run_storage_metrics_query_loop(
                         payload_bytes = msg.payload.len(),
                         "storage metrics nats raw message received"
                     );
-                    let req: StorageMetricsRequest = match serde_json::from_slice(&msg.payload) {
+                    let req: NatsRequestEnvelope<Value> = match serde_json::from_slice(&msg.payload) {
                         Ok(req) => req,
                         Err(err) => {
                             tracing::warn!(
@@ -932,6 +927,53 @@ async fn run_storage_metrics_query_loop(
                             return Ok(());
                         }
                     };
+                    if req.schema_version != NATS_ENVELOPE_SCHEMA_VERSION {
+                        tracing::warn!(
+                            trace_id = %req.trace_id,
+                            subject = SUBJECT_STORAGE_METRICS_GET,
+                            schema_version = req.schema_version,
+                            expected_schema_version = NATS_ENVELOPE_SCHEMA_VERSION,
+                            "storage metrics request rejected due to schema version mismatch"
+                        );
+                        if !req.reply_subject.trim().is_empty() {
+                            let response = NatsResponseEnvelope::<StorageInboxMetricsSnapshot>::error(
+                                SUBJECT_STORAGE_METRICS_GET,
+                                req.trace_id.clone(),
+                                "UNSUPPORTED_SCHEMA_VERSION",
+                                format!(
+                                    "unsupported schema_version={} expected={}",
+                                    req.schema_version, NATS_ENVELOPE_SCHEMA_VERSION
+                                ),
+                            );
+                            if let Ok(body) = serde_json::to_vec(&response) {
+                                let _ = client_nats_publish(&endpoint_out, &req.reply_subject, &body).await;
+                            }
+                        }
+                        return Ok(());
+                    }
+                    if req.action != SUBJECT_STORAGE_METRICS_GET {
+                        tracing::warn!(
+                            trace_id = %req.trace_id,
+                            subject = SUBJECT_STORAGE_METRICS_GET,
+                            action = %req.action,
+                            "storage metrics request rejected due to action mismatch"
+                        );
+                        if !req.reply_subject.trim().is_empty() {
+                            let response = NatsResponseEnvelope::<StorageInboxMetricsSnapshot>::error(
+                                SUBJECT_STORAGE_METRICS_GET,
+                                req.trace_id.clone(),
+                                "ACTION_MISMATCH",
+                                format!(
+                                    "action mismatch expected={} got={}",
+                                    SUBJECT_STORAGE_METRICS_GET, req.action
+                                ),
+                            );
+                            if let Ok(body) = serde_json::to_vec(&response) {
+                                let _ = client_nats_publish(&endpoint_out, &req.reply_subject, &body).await;
+                            }
+                        }
+                        return Ok(());
+                    }
                     if req.reply_subject.trim().is_empty() {
                         tracing::warn!(
                             subject = SUBJECT_STORAGE_METRICS_GET,
@@ -971,11 +1013,11 @@ async fn run_storage_metrics_query_loop(
                                 "storage metrics db snapshot success"
                             );
                             (
-                                serde_json::json!({
-                                "trace_id": trace_id,
-                                "status": "ok",
-                                "metrics": metrics,
-                            }),
+                                NatsResponseEnvelope::ok(
+                                    SUBJECT_STORAGE_METRICS_GET,
+                                    trace_id.clone(),
+                                    metrics,
+                                ),
                                 "ok",
                             )
                         }
@@ -988,12 +1030,12 @@ async fn run_storage_metrics_query_loop(
                                 "storage metrics db snapshot failed"
                             );
                             (
-                                serde_json::json!({
-                                "trace_id": trace_id,
-                                "status": "error",
-                                "error_code": "STORAGE_METRICS_UNAVAILABLE",
-                                "error_detail": err.to_string(),
-                            }),
+                                NatsResponseEnvelope::<StorageInboxMetricsSnapshot>::error(
+                                    SUBJECT_STORAGE_METRICS_GET,
+                                    trace_id.clone(),
+                                    "STORAGE_METRICS_UNAVAILABLE",
+                                    err.to_string(),
+                                ),
                                 "error",
                             )
                         }
