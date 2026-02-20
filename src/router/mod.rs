@@ -1739,19 +1739,54 @@ async fn wan_listen_loop(listen_addr: String, ctx: Arc<WanContext>) {
 }
 
 async fn wan_connect_loop(address: String, ctx: Arc<WanContext>) {
+    const WAN_RETRY_BASE_SECS: u64 = 5;
+    const WAN_RETRY_MAX_SECS: u64 = 60;
+    const WAN_WARN_EVERY_ATTEMPTS: u64 = 12;
+
+    let mut backoff_secs = WAN_RETRY_BASE_SECS;
+    let mut failures: u64 = 0;
     loop {
         match TcpStream::connect(&address).await {
             Ok(stream) => {
-                tracing::info!(addr = %address, "wan connected");
+                if failures > 0 {
+                    tracing::info!(
+                        addr = %address,
+                        failures,
+                        "wan reconnect succeeded"
+                    );
+                } else {
+                    tracing::info!(addr = %address, "wan connected");
+                }
+                failures = 0;
+                backoff_secs = WAN_RETRY_BASE_SECS;
                 if let Err(err) = handle_wan_connection(stream, Arc::clone(&ctx), true).await {
                     tracing::warn!("wan uplink error: {err}");
+                    failures = failures.saturating_add(1);
                 }
             }
             Err(err) => {
-                tracing::warn!(addr = %address, "wan connect failed: {err}");
+                failures = failures.saturating_add(1);
+                if failures == 1 || failures % WAN_WARN_EVERY_ATTEMPTS == 0 {
+                    tracing::warn!(
+                        addr = %address,
+                        failures,
+                        retry_in_secs = backoff_secs,
+                        "wan connect failed: {err}"
+                    );
+                } else {
+                    tracing::debug!(
+                        addr = %address,
+                        failures,
+                        retry_in_secs = backoff_secs,
+                        "wan connect failed: {err}"
+                    );
+                }
             }
         }
-        time::sleep(Duration::from_secs(5)).await;
+        time::sleep(Duration::from_secs(backoff_secs)).await;
+        if failures > 0 {
+            backoff_secs = (backoff_secs.saturating_mul(2)).min(WAN_RETRY_MAX_SECS);
+        }
     }
 }
 
