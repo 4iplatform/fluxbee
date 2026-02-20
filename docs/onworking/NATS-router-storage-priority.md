@@ -141,6 +141,20 @@ Incidencia operativa cerrada (2026-02-19, storage metrics):
   - afecta camino NATS del cliente `jsr_client` (admin/storage en este flujo).
   - no modifica el modulo NATS del router (`src/nats/mod.rs`), ni cambia contratos de subjects.
 
+Incidencia operativa cerrada (2026-02-20, inbox wildcard `_INBOX.JSR.*`):
+- Sintoma:
+  - request/reply multiplexado (`request_with_session_inbox`) quedaba en timeout con `messages_seen=0`, aunque el subscriber servidor recibia y publicaba response.
+- Causa:
+  - el broker embebido hacia delivery solo por igualdad exacta de subject (`subscriber.subject == subject`), sin soporte de wildcard NATS (`*`, `>`).
+  - por eso replies a `_INBOX.JSR.<session>.<trace>` no matcheaban contra subscripcion `_INBOX.JSR.<session>.*`.
+- Correccion aplicada:
+  - matching de subject en broker embebido alineado a wildcard NATS (`*` y `>`), usado en `publish_embedded_subject`.
+  - tests agregados:
+    - `subject_matching_supports_nats_wildcards`
+    - `embedded_broker_delivers_to_wildcard_subscriptions`
+- Impacto esperado:
+  - `SY.admin`/`jsr_client::NatsClient` con inbox de sesion multiplexado ya no pierde replies por mismatch de subject.
+
 ## Checklist de cierre - Libreria cliente (socket + NATS)
 
 Regla de arquitectura objetivo:

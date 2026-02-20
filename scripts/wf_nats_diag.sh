@@ -21,6 +21,7 @@ set -euo pipefail
 #   DIAG_ROUTER_LOG_LINES="200"
 #   STREAM_CLIENT_LOG="1"
 #   STREAM_SERVER_LOG="0"
+#   SHOW_TIMING_SUMMARY="1"
 
 NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
 WF_DIAG_SUBJECT="${WF_DIAG_SUBJECT:-wf.diag.echo}"
@@ -34,6 +35,7 @@ INCLUDE_ROUTER_JOURNAL="${INCLUDE_ROUTER_JOURNAL:-1}"
 DIAG_ROUTER_LOG_LINES="${DIAG_ROUTER_LOG_LINES:-200}"
 STREAM_CLIENT_LOG="${STREAM_CLIENT_LOG:-1}"
 STREAM_SERVER_LOG="${STREAM_SERVER_LOG:-0}"
+SHOW_TIMING_SUMMARY="${SHOW_TIMING_SUMMARY:-1}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_PATH="${WF_DIAG_BIN_PATH:-$ROOT_DIR/target/release/wf_nats_diag}"
@@ -43,6 +45,46 @@ require_cmd() {
     echo "Error: missing command '$1'" >&2
     exit 1
   fi
+}
+
+print_timing_stats() {
+  local file="$1"
+  local marker="$2"
+  local key="$3"
+  local label="$4"
+  awk -v marker="$marker" -v key="$key" -v label="$label" '
+    index($0, marker) {
+      pattern = key "=[0-9]+"
+      if (match($0, pattern)) {
+        value = substr($0, RSTART + length(key) + 1, RLENGTH - length(key) - 1) + 0
+        count += 1
+        sum += value
+        if (count == 1 || value < min) min = value
+        if (count == 1 || value > max) max = value
+      }
+    }
+    END {
+      if (count > 0) {
+        avg = sum / count
+        printf("%s: count=%d min=%dms avg=%.2fms max=%dms\n", label, count, min, avg, max)
+      } else {
+        printf("%s: count=0\n", label)
+      }
+    }
+  ' "$file"
+}
+
+print_timing_summary() {
+  if [[ "$SHOW_TIMING_SUMMARY" != "1" ]]; then
+    return 0
+  fi
+  echo "---- WF diag timing summary ----"
+  print_timing_stats "$client_log" "wf nats diag client response received" "elapsed_ms" "client_response_elapsed"
+  print_timing_stats "$client_log" "wf nats diag client request failed" "elapsed_ms" "client_failure_elapsed"
+  print_timing_stats "$server_log" "wf nats diag server response published" "total_elapsed_ms" "server_handler_elapsed"
+  local timeout_count
+  timeout_count="$(grep -c "nats multiplexed request timeout waiting response header" "$client_log" || true)"
+  echo "client_timeout_events=${timeout_count}"
 }
 
 print_router_journal_if_available() {
@@ -159,6 +201,7 @@ echo "---- WF diag client log ----"
 cat "$client_log"
 echo "---- WF diag server log ----"
 cat "$server_log"
+print_timing_summary
 print_router_journal_if_available
 
 if [[ "$client_rc" -ne 0 ]]; then

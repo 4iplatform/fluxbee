@@ -648,7 +648,7 @@ async fn publish_embedded_subject(
     let targets: Vec<EmbeddedSubscriber> = state
         .subscribers
         .iter()
-        .filter(|s| s.subject == subject)
+        .filter(|s| subject_matches_subscription(&s.subject, subject))
         .cloned()
         .collect();
     let mut stale_connections = Vec::new();
@@ -693,6 +693,40 @@ async fn publish_embedded_subject(
     state
         .pending
         .retain(|_, pending| !stale_connections.contains(&pending.connection_id));
+}
+
+fn subject_matches_subscription(subscription: &str, subject: &str) -> bool {
+    if subscription == subject {
+        return true;
+    }
+
+    let sub_tokens: Vec<&str> = subscription.split('.').collect();
+    let msg_tokens: Vec<&str> = subject.split('.').collect();
+
+    let mut sub_idx = 0usize;
+    let mut msg_idx = 0usize;
+
+    while sub_idx < sub_tokens.len() && msg_idx < msg_tokens.len() {
+        match sub_tokens[sub_idx] {
+            ">" => return sub_idx == sub_tokens.len() - 1,
+            "*" => {
+                sub_idx += 1;
+                msg_idx += 1;
+            }
+            token if token == msg_tokens[msg_idx] => {
+                sub_idx += 1;
+                msg_idx += 1;
+            }
+            _ => return false,
+        }
+    }
+
+    if sub_idx == sub_tokens.len() && msg_idx == msg_tokens.len() {
+        return true;
+    }
+
+    // Allow trailing `>` to match zero remaining tokens (e.g. `foo.>` matches `foo`).
+    sub_idx == sub_tokens.len() - 1 && sub_tokens[sub_idx] == ">" && msg_idx == msg_tokens.len()
 }
 
 async fn mark_embedded_ack(state: &Arc<Mutex<EmbeddedBrokerState>>, ack_subject: &str) {
@@ -750,7 +784,7 @@ async fn redeliver_embedded_pending(state: &Arc<Mutex<EmbeddedBrokerState>>) {
             subscribers.iter().find(|subscriber| {
                 subscriber.connection_id == pending.connection_id
                     && subscriber.sid == pending.sid
-                    && subscriber.subject == pending.subject
+                    && subject_matches_subscription(&subscriber.subject, &pending.subject)
             })
         };
         let Some(subscriber) = target else {
@@ -1341,6 +1375,72 @@ mod tests {
             .expect("final stop after recovery");
     }
 
+    #[test]
+    fn subject_matching_supports_nats_wildcards() {
+        assert!(subject_matches_subscription("storage.metrics.get", "storage.metrics.get"));
+        assert!(subject_matches_subscription("_INBOX.JSR.a.*", "_INBOX.JSR.a.reply"));
+        assert!(!subject_matches_subscription("_INBOX.JSR.a.*", "_INBOX.JSR.a.x.y"));
+        assert!(subject_matches_subscription("storage.>", "storage.metrics.get"));
+        assert!(subject_matches_subscription("storage.>", "storage"));
+        assert!(subject_matches_subscription(">", "any.subject"));
+        assert!(!subject_matches_subscription("storage.events", "storage.items"));
+    }
+
+    #[tokio::test]
+    async fn embedded_broker_delivers_to_wildcard_subscriptions() {
+        let endpoint = free_endpoint();
+        start_embedded_broker(&endpoint)
+            .await
+            .expect("start embedded broker");
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let subscriber = NatsSubscriber::new(
+            endpoint.clone(),
+            "_INBOX.JSR.test-session.*".to_string(),
+            77,
+        );
+        let calls_for_task = Arc::clone(&calls);
+        let subscriber_task = tokio::spawn(async move {
+            let _ = subscriber
+                .run(move |_payload| {
+                    let calls_for_handler = Arc::clone(&calls_for_task);
+                    async move {
+                        calls_for_handler.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
+                })
+                .await;
+        });
+
+        sleep(Duration::from_millis(200)).await;
+        publish(
+            &endpoint,
+            "_INBOX.JSR.test-session.correlation-1",
+            br#"{"status":"ok"}"#,
+        )
+        .await
+        .expect("publish wildcard target");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if calls.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            calls.load(Ordering::Relaxed) >= 1,
+            "expected wildcard subscriber to receive reply subject message"
+        );
+
+        subscriber_task.abort();
+        let _ = subscriber_task.await;
+        stop_embedded_broker(&endpoint)
+            .await
+            .expect("stop embedded broker");
+    }
+
     #[tokio::test]
     async fn embedded_broker_redelivers_when_message_not_acked() {
         let endpoint = free_endpoint();
@@ -1382,6 +1482,56 @@ mod tests {
         assert!(
             calls.load(Ordering::Relaxed) >= 2,
             "expected redelivery after missing ack"
+        );
+
+        subscriber_task.abort();
+        let _ = subscriber_task.await;
+        stop_embedded_broker(&endpoint)
+            .await
+            .expect("stop embedded broker");
+    }
+
+    #[tokio::test]
+    async fn embedded_broker_redelivers_wildcard_subscription_when_not_acked() {
+        let endpoint = free_endpoint();
+        start_embedded_broker(&endpoint)
+            .await
+            .expect("start embedded broker");
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let subscriber = NatsSubscriber::new(endpoint.clone(), "test.redelivery.*".to_string(), 177);
+        let calls_for_task = Arc::clone(&calls);
+        let subscriber_task = tokio::spawn(async move {
+            let _ = subscriber
+                .run(move |_payload| {
+                    let calls_for_handler = Arc::clone(&calls_for_task);
+                    async move {
+                        let call = calls_for_handler.fetch_add(1, Ordering::Relaxed) + 1;
+                        if call == 1 {
+                            return Err(io::Error::new(io::ErrorKind::Other, "fail-first-attempt"));
+                        }
+                        Ok(())
+                    }
+                })
+                .await;
+        });
+
+        sleep(Duration::from_millis(200)).await;
+        publish(&endpoint, "test.redelivery.wild", b"hello")
+            .await
+            .expect("publish");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while tokio::time::Instant::now() < deadline {
+            if calls.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            calls.load(Ordering::Relaxed) >= 2,
+            "expected wildcard redelivery after missing ack"
         );
 
         subscriber_task.abort();

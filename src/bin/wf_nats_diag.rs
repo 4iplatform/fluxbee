@@ -47,6 +47,7 @@ async fn run_server(endpoint: String, subject: String, sid: u32) -> Result<(), B
             let endpoint = endpoint.clone();
             let subject = subject.clone();
             async move {
+                let handler_started = std::time::Instant::now();
                 tracing::info!(
                     mode = "server",
                     subject = %msg.subject,
@@ -99,6 +100,7 @@ async fn run_server(endpoint: String, subject: String, sid: u32) -> Result<(), B
                     trace_id = %trace_id,
                     reply_subject = %reply_subject,
                     response_bytes = body.len(),
+                    handler_elapsed_ms = handler_started.elapsed().as_millis() as u64,
                     "wf nats diag server response publish start"
                 );
                 publish(&endpoint, &reply_subject, &body)
@@ -109,6 +111,7 @@ async fn run_server(endpoint: String, subject: String, sid: u32) -> Result<(), B
                     trace_id = %trace_id,
                     reply_subject = %reply_subject,
                     response_bytes = body.len(),
+                    total_elapsed_ms = handler_started.elapsed().as_millis() as u64,
                     "wf nats diag server response published"
                 );
                 Ok(())
