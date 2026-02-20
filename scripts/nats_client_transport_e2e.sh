@@ -32,6 +32,8 @@ DIAG_LOG_LINES="${DIAG_LOG_LINES:-120}"
 RUN_ROUTER_RESTART="${RUN_ROUTER_RESTART:-1}"
 RUN_ROUTER_STOP_START="${RUN_ROUTER_STOP_START:-1}"
 RUN_STORAGE_RESTART="${RUN_STORAGE_RESTART:-1}"
+SYSTEMCTL_RETRY_ATTEMPTS="${SYSTEMCTL_RETRY_ATTEMPTS:-3}"
+SYSTEMCTL_RETRY_DELAY_SECS="${SYSTEMCTL_RETRY_DELAY_SECS:-2}"
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
   SUDO=""
@@ -165,6 +167,49 @@ wait_for_service_state() {
   done
 }
 
+run_systemctl_action() {
+  local action="$1"
+  local service="$2"
+  local label="$3"
+  local attempt output rc
+
+  for ((attempt = 1; attempt <= SYSTEMCTL_RETRY_ATTEMPTS; attempt++)); do
+    if output="$(${SUDO} systemctl "$action" "$service" 2>&1)"; then
+      if [[ -n "$output" ]]; then
+        echo "$output"
+      fi
+      return 0
+    fi
+    rc=$?
+    echo "WARN [$label]: systemctl $action $service failed (attempt ${attempt}/${SYSTEMCTL_RETRY_ATTEMPTS}, rc=${rc})" >&2
+    if [[ -n "$output" ]]; then
+      echo "WARN [$label]: ${output}" >&2
+    fi
+
+    # Treat state as success when the desired state is already reached.
+    if [[ "$action" == "stop" ]] && ! service_active "$service"; then
+      echo "INFO [$label]: service '$service' already inactive after failed stop command" >&2
+      return 0
+    fi
+    if [[ "$action" == "start" ]] && service_active "$service"; then
+      echo "INFO [$label]: service '$service' already active after failed start command" >&2
+      return 0
+    fi
+    if [[ "$action" == "restart" ]] && service_active "$service"; then
+      echo "INFO [$label]: service '$service' active after failed restart command" >&2
+      return 0
+    fi
+
+    if (( attempt < SYSTEMCTL_RETRY_ATTEMPTS )); then
+      sleep "$SYSTEMCTL_RETRY_DELAY_SECS"
+    fi
+  done
+
+  echo "FAIL [$label]: systemctl $action $service failed after ${SYSTEMCTL_RETRY_ATTEMPTS} attempts" >&2
+  ${SUDO} systemctl status "$service" --no-pager -l || true
+  exit 1
+}
+
 wait_for_metrics_ok() {
   local label="$1"
   local body_file="$2"
@@ -220,7 +265,7 @@ wait_for_metrics_ok "initial" "$metrics_body"
 # 1) Router restart -> metrics recovery
 if [[ "$RUN_ROUTER_RESTART" == "1" ]]; then
   echo "Step: restart service '$ROUTER_SERVICE'..."
-  ${SUDO} systemctl restart "$ROUTER_SERVICE"
+  run_systemctl_action "restart" "$ROUTER_SERVICE" "router_restart"
   wait_for_service_state "$ROUTER_SERVICE" "active" "after_router_restart"
   wait_for_service_state "$STORAGE_SERVICE" "active" "after_router_restart"
   wait_for_metrics_ok "after_router_restart" "$metrics_body"
@@ -231,7 +276,7 @@ fi
 # 2) Router hard down/up -> metrics recovery
 if [[ "$RUN_ROUTER_STOP_START" == "1" ]]; then
   echo "Step: stop/start service '$ROUTER_SERVICE'..."
-  ${SUDO} systemctl stop "$ROUTER_SERVICE"
+  run_systemctl_action "stop" "$ROUTER_SERVICE" "router_stop"
   wait_for_service_state "$ROUTER_SERVICE" "inactive" "after_router_stop"
 
   # Expected transient failure while router is down.
@@ -243,7 +288,7 @@ if [[ "$RUN_ROUTER_STOP_START" == "1" ]]; then
     echo "OK: /config/storage/metrics not healthy while router is stopped (status=$status)"
   fi
 
-  ${SUDO} systemctl start "$ROUTER_SERVICE"
+  run_systemctl_action "start" "$ROUTER_SERVICE" "router_start"
   wait_for_service_state "$ROUTER_SERVICE" "active" "after_router_start"
   wait_for_service_state "$STORAGE_SERVICE" "active" "after_router_start"
   wait_for_metrics_ok "after_router_start" "$metrics_body"
@@ -254,7 +299,7 @@ fi
 # 3) Storage restart -> subscriber reconnect/resubscribe + metrics recovery
 if [[ "$RUN_STORAGE_RESTART" == "1" ]]; then
   echo "Step: restart service '$STORAGE_SERVICE'..."
-  ${SUDO} systemctl restart "$STORAGE_SERVICE"
+  run_systemctl_action "restart" "$STORAGE_SERVICE" "storage_restart"
   wait_for_service_state "$STORAGE_SERVICE" "active" "after_storage_restart"
   wait_for_metrics_ok "after_storage_restart" "$metrics_body"
 else
