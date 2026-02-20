@@ -733,9 +733,9 @@ async fn ensure_response_subscription(
     response_subscription: &str,
     sid: u32,
     sync_timeout: Duration,
-) -> Result<(), NatsError> {
+) -> Result<bool, NatsError> {
     if subscriptions.contains_key(response_subscription) {
-        return Ok(());
+        return Ok(false);
     }
     conn.writer
         .write_all(format!("SUB {response_subscription} {sid}\r\n").as_bytes())
@@ -743,7 +743,7 @@ async fn ensure_response_subscription(
     conn.writer.flush().await?;
     sync_connection(conn, sync_timeout, "request multiplexed subscription sync").await?;
     subscriptions.insert(response_subscription.to_string(), sid);
-    Ok(())
+    Ok(true)
 }
 
 async fn request_multiplexed_on_connection(
@@ -757,7 +757,11 @@ async fn request_multiplexed_on_connection(
     timeout_duration: Duration,
     sync_timeout: Duration,
 ) -> Result<Vec<u8>, NatsError> {
-    ensure_response_subscription(
+    let request_started = Instant::now();
+    let mut messages_seen = 0u64;
+    let mut ignored_messages = 0u64;
+    let mut pings_seen = 0u64;
+    let subscription_installed = ensure_response_subscription(
         conn,
         subscriptions,
         response_subscription,
@@ -765,13 +769,42 @@ async fn request_multiplexed_on_connection(
         sync_timeout,
     )
     .await?;
+    tracing::debug!(
+        request_subject = %request_subject,
+        response_subject = %response_subject,
+        response_subscription = %response_subscription,
+        sid = sid,
+        subscription_installed = subscription_installed,
+        request_bytes = request_payload.len(),
+        timeout_ms = timeout_duration.as_millis() as u64,
+        "nats multiplexed request start"
+    );
 
     publish_on_connection(conn, request_subject, request_payload).await?;
+    tracing::debug!(
+        request_subject = %request_subject,
+        response_subject = %response_subject,
+        response_subscription = %response_subscription,
+        sid = sid,
+        elapsed_ms = request_started.elapsed().as_millis() as u64,
+        "nats multiplexed request payload published"
+    );
 
     let deadline = tokio::time::Instant::now() + timeout_duration;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            tracing::warn!(
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                response_subscription = %response_subscription,
+                sid = sid,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                messages_seen = messages_seen,
+                ignored_messages = ignored_messages,
+                pings_seen = pings_seen,
+                "nats multiplexed request timeout waiting response header"
+            );
             return Err(NatsError::Timeout(format!(
                 "request timeout waiting response header on {response_subject}"
             )));
@@ -780,11 +813,33 @@ async fn request_multiplexed_on_connection(
         let n = timeout(remaining, conn.reader.read_line(&mut line))
             .await
             .map_err(|_| {
+                tracing::warn!(
+                    request_subject = %request_subject,
+                    response_subject = %response_subject,
+                    response_subscription = %response_subscription,
+                    sid = sid,
+                    elapsed_ms = request_started.elapsed().as_millis() as u64,
+                    messages_seen = messages_seen,
+                    ignored_messages = ignored_messages,
+                    pings_seen = pings_seen,
+                    "nats multiplexed request timeout waiting response header"
+                );
                 NatsError::Timeout(format!(
                     "request timeout waiting response header on {response_subject}"
                 ))
             })??;
         if n == 0 {
+            tracing::warn!(
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                response_subscription = %response_subscription,
+                sid = sid,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                messages_seen = messages_seen,
+                ignored_messages = ignored_messages,
+                pings_seen = pings_seen,
+                "nats multiplexed request socket closed while waiting response"
+            );
             return Err(NatsError::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "nats socket closed",
@@ -795,6 +850,7 @@ async fn request_multiplexed_on_connection(
             continue;
         }
         if line == "PING" {
+            pings_seen = pings_seen.saturating_add(1);
             conn.writer.write_all(b"PONG\r\n").await?;
             conn.writer.flush().await?;
             continue;
@@ -803,10 +859,23 @@ async fn request_multiplexed_on_connection(
             continue;
         }
         if line.starts_with("-ERR") {
+            tracing::warn!(
+                request_subject = %request_subject,
+                response_subject = %response_subject,
+                response_subscription = %response_subscription,
+                sid = sid,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                error_line = %summarize_nats_line(line),
+                messages_seen = messages_seen,
+                ignored_messages = ignored_messages,
+                pings_seen = pings_seen,
+                "nats multiplexed request server error while waiting response"
+            );
             return Err(NatsError::Protocol(format!("nats error: {line}")));
         }
         if line.starts_with("MSG ") {
             let msg = parse_msg_line(line)?;
+            messages_seen = messages_seen.saturating_add(1);
             let mut payload = vec![0u8; msg.payload_len + 2];
             timeout(remaining, conn.reader.read_exact(&mut payload))
                 .await
@@ -817,7 +886,35 @@ async fn request_multiplexed_on_connection(
                 })??;
             payload.truncate(msg.payload_len);
             if msg.subject == response_subject {
+                tracing::debug!(
+                    request_subject = %request_subject,
+                    response_subject = %response_subject,
+                    response_subscription = %response_subscription,
+                    sid = sid,
+                    elapsed_ms = request_started.elapsed().as_millis() as u64,
+                    payload_bytes = payload.len(),
+                    messages_seen = messages_seen,
+                    ignored_messages = ignored_messages,
+                    pings_seen = pings_seen,
+                    "nats multiplexed request matched response subject"
+                );
                 return Ok(payload);
+            }
+            ignored_messages = ignored_messages.saturating_add(1);
+            if ignored_messages <= 3 || ignored_messages % 10 == 0 {
+                tracing::debug!(
+                    request_subject = %request_subject,
+                    response_subject = %response_subject,
+                    response_subscription = %response_subscription,
+                    sid = sid,
+                    message_subject = %msg.subject,
+                    message_sid = %msg.sid,
+                    payload_len = msg.payload_len,
+                    elapsed_ms = request_started.elapsed().as_millis() as u64,
+                    messages_seen = messages_seen,
+                    ignored_messages = ignored_messages,
+                    "nats multiplexed request ignored non-matching response subject"
+                );
             }
         }
     }

@@ -17,6 +17,7 @@ set -euo pipefail
 #   METRICS_TIMEOUT_SECS="120"
 #   POLL_INTERVAL_SECS="2"
 #   INITIAL_STABILIZE_SECS="2"
+#   DIAG_LOG_LINES="120"
 #   RUN_ROUTER_RESTART="1"
 #   RUN_ROUTER_STOP_START="1"
 #   RUN_STORAGE_RESTART="1"
@@ -27,6 +28,7 @@ STORAGE_SERVICE="${STORAGE_SERVICE:-sy-storage}"
 METRICS_TIMEOUT_SECS="${METRICS_TIMEOUT_SECS:-120}"
 POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-2}"
 INITIAL_STABILIZE_SECS="${INITIAL_STABILIZE_SECS:-2}"
+DIAG_LOG_LINES="${DIAG_LOG_LINES:-120}"
 RUN_ROUTER_RESTART="${RUN_ROUTER_RESTART:-1}"
 RUN_ROUTER_STOP_START="${RUN_ROUTER_STOP_START:-1}"
 RUN_STORAGE_RESTART="${RUN_STORAGE_RESTART:-1}"
@@ -112,6 +114,31 @@ service_active() {
   ${SUDO} systemctl is-active --quiet "$svc"
 }
 
+dump_transport_diagnostics() {
+  if ! command -v journalctl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local -a jcmd
+  if [[ -z "$SUDO" ]]; then
+    jcmd=(journalctl)
+  else
+    if ${SUDO} -n true >/dev/null 2>&1; then
+      jcmd=(${SUDO} -n journalctl)
+    else
+      echo "INFO: skipping journal diagnostics (sudo password required)." >&2
+      return 0
+    fi
+  fi
+
+  echo "---- DIAG: sy-admin (last ${DIAG_LOG_LINES}) ----" >&2
+  "${jcmd[@]}" -u sy-admin -n "$DIAG_LOG_LINES" --no-pager || true
+  echo "---- DIAG: sy-storage (last ${DIAG_LOG_LINES}) ----" >&2
+  "${jcmd[@]}" -u sy-storage -n "$DIAG_LOG_LINES" --no-pager || true
+  echo "---- DIAG: rt-gateway (last ${DIAG_LOG_LINES}) ----" >&2
+  "${jcmd[@]}" -u rt-gateway -n "$DIAG_LOG_LINES" --no-pager || true
+}
+
 wait_for_service_state() {
   local service="$1"
   local expected="$2" # active|inactive
@@ -158,6 +185,7 @@ wait_for_metrics_ok() {
     if (( elapsed >= METRICS_TIMEOUT_SECS )); then
       echo "FAIL [$label]: timeout waiting /config/storage/metrics healthy" >&2
       cat "$body_file" >&2
+      dump_transport_diagnostics
       exit 1
     fi
     echo "[POLL][${label}] elapsed=${elapsed}s waiting /config/storage/metrics=200" >&2

@@ -1403,7 +1403,7 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
     };
     let sid = 0u32;
     let request_started = Instant::now();
-    tracing::debug!(
+    tracing::info!(
         trace_id = %trace_id,
         endpoint = %ctx.nats_endpoint,
         request_subject = SUBJECT_STORAGE_METRICS_GET,
@@ -1423,7 +1423,7 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
     {
         Ok(body) => {
             let elapsed_ms = request_started.elapsed().as_millis() as u64;
-            tracing::debug!(
+            tracing::info!(
                 trace_id = %trace_id,
                 endpoint = %ctx.nats_endpoint,
                 request_subject = SUBJECT_STORAGE_METRICS_GET,
@@ -1498,7 +1498,7 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
                 );
             }
         };
-    tracing::debug!(
+    tracing::info!(
         trace_id = %trace_id,
         endpoint = %ctx.nats_endpoint,
         request_subject = SUBJECT_STORAGE_METRICS_GET,
@@ -1578,7 +1578,7 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
 
     match (response.status.as_str(), response.payload) {
         ("ok", Some(metrics)) => {
-            tracing::debug!(
+            tracing::info!(
                 trace_id = %trace_id,
                 endpoint = %ctx.nats_endpoint,
                 request_subject = SUBJECT_STORAGE_METRICS_GET,

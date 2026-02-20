@@ -907,7 +907,7 @@ async fn run_storage_metrics_query_loop(
                 let endpoint_out = endpoint_out.clone();
                 let storage_handler_errors = Arc::clone(&storage_handler_errors);
                 async move {
-                    tracing::debug!(
+                    tracing::info!(
                         request_subject = SUBJECT_STORAGE_METRICS_GET,
                         message_subject = %msg.subject,
                         sid = %msg.sid,
@@ -984,7 +984,7 @@ async fn run_storage_metrics_query_loop(
                     let request_started = Instant::now();
                     let trace_id = req.trace_id.clone();
                     let reply_subject = req.reply_subject.clone();
-                    tracing::debug!(
+                    tracing::info!(
                         trace_id = %trace_id,
                         request_subject = SUBJECT_STORAGE_METRICS_GET,
                         reply_subject = %reply_subject,
@@ -1041,7 +1041,7 @@ async fn run_storage_metrics_query_loop(
                         }
                     };
                     let db_elapsed_ms = db_started.elapsed().as_millis() as u64;
-                    tracing::debug!(
+                    tracing::info!(
                         trace_id = %trace_id,
                         request_subject = SUBJECT_STORAGE_METRICS_GET,
                         reply_subject = %reply_subject,
