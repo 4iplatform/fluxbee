@@ -15,7 +15,7 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use jsr_client::nats::request as nats_request;
+use jsr_client::nats::NatsClient;
 use jsr_client::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SCOPE_GLOBAL,
     SYSTEM_KIND,
@@ -58,6 +58,7 @@ struct AdminContext {
     hive_id: String,
     authorized_hives: Vec<String>,
     nats_endpoint: String,
+    nats_client: Arc<NatsClient>,
 }
 
 struct AdminRouterClient {
@@ -225,6 +226,7 @@ async fn main() -> Result<(), AdminError> {
 
     let (broadcast_tx, broadcast_rx) = mpsc::unbounded_channel::<BroadcastRequest>();
     let http_tx = broadcast_tx.clone();
+    let nats_client = Arc::new(NatsClient::new(nats_endpoint.clone()));
     let http_ctx = AdminContext {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
@@ -232,6 +234,7 @@ async fn main() -> Result<(), AdminError> {
         hive_id,
         authorized_hives,
         nats_endpoint,
+        nats_client,
     };
     let http_client = router_client.clone();
     tokio::spawn(async move {
@@ -619,9 +622,9 @@ struct StorageMetricsResponsePayload {
 
 const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const SUBJECT_STORAGE_METRICS_REPLY_PREFIX: &str = "storage.metrics.reply.";
+const SUBJECT_STORAGE_METRICS_REPLY_SUB: &str = "storage.metrics.reply.*";
 const STORAGE_METRICS_NATS_TIMEOUT_SECS: u64 = 8;
-const STORAGE_METRICS_SID_BASE: u32 = 1000;
-const STORAGE_METRICS_SID_RANGE: u64 = 50_000;
+const STORAGE_METRICS_REPLY_SID: u32 = 40_001;
 
 async fn run_http_server(
     listen: &str,
@@ -1417,7 +1420,7 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
             );
         }
     };
-    let sid = storage_metrics_sid(&trace_id);
+    let sid = STORAGE_METRICS_REPLY_SID;
     let request_started = Instant::now();
     tracing::debug!(
         trace_id = %trace_id,
@@ -1429,11 +1432,11 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
         request_bytes = request_body.len(),
         "storage metrics nats request send"
     );
-    let response_body = match nats_request(
-        &ctx.nats_endpoint,
+    let response_body = match ctx.nats_client.request_multiplexed(
         SUBJECT_STORAGE_METRICS_GET,
         &request_body,
         &reply_subject,
+        SUBJECT_STORAGE_METRICS_REPLY_SUB,
         sid,
         Duration::from_secs(STORAGE_METRICS_NATS_TIMEOUT_SECS),
     )
@@ -1627,19 +1630,6 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
             )
         }
     }
-}
-
-fn storage_metrics_sid(trace_id: &str) -> u32 {
-    STORAGE_METRICS_SID_BASE + (fnv1a64(trace_id.as_bytes()) % STORAGE_METRICS_SID_RANGE) as u32
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for b in bytes {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }
 
 fn is_ok_status(status: Option<&str>) -> bool {

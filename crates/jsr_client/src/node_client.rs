@@ -15,8 +15,9 @@ use crate::protocol::{
 };
 use crate::socket::connection::{read_frame, write_frame};
 use crate::split::{ConnectionInfo, ConnectionState, NodeReceiver, NodeSender};
+use crate::client_config::ClientConfig;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NodeConfig {
     pub name: String,
     pub router_socket: PathBuf,
@@ -61,6 +62,12 @@ pub async fn connect(config: &NodeConfig) -> Result<(NodeSender, NodeReceiver), 
     let sender = NodeSender::new(parts.tx, Arc::clone(&info));
     let receiver = NodeReceiver::new(parts.rx, info);
     Ok((sender, receiver))
+}
+
+pub async fn connect_with_client_config(
+    config: &ClientConfig,
+) -> Result<(NodeSender, NodeReceiver), NodeError> {
+    connect(&config.node).await
 }
 
 struct ConnectedParts {

@@ -149,18 +149,28 @@ Regla de arquitectura objetivo:
 Estado y pendientes:
 - [x] Exponer modulo NATS compartido en `jsr_client` (`publish`, `request`, `NatsSubscriber`).
 - [x] Migrar `SY.admin` storage metrics a request/reply NATS (`storage.metrics.get`) via `SY.storage`.
-- [ ] Definir API strict router-local en libreria (`request_local`, `publish_local`, `subscribe_local`) para no depender de endpoint raw pasado por caller.
-- [ ] Resolver `NATS endpoint` local desde config del nodo (`hive.yaml`) dentro de la libreria (alineado a discovery de socket local).
-- [ ] Rechazar endpoints no locales en modo strict (evitar bypass de router).
-- [ ] Unificar config de cliente para socket + nats en una sola estructura de libreria.
-- [ ] Cliente NATS persistente con reconnect/backoff (evitar connect por operacion).
-- [ ] Auto-resubscribe robusto para subscribers tras caida/restart de broker.
+- [x] Definir API strict router-local en libreria (`request_local`, `publish_local`, `subscribe_local`) para no depender de endpoint raw pasado por caller.
+- [x] Resolver `NATS endpoint` local desde config del nodo (`hive.yaml`) dentro de la libreria (alineado a discovery de socket local).
+- [x] Rechazar endpoints no locales en modo strict (evitar bypass de router).
+- [x] Unificar config de cliente para socket + nats en una sola estructura de libreria.
+- [x] Cliente NATS persistente con reconnect/backoff (evitar connect por operacion).
+- [x] Reescribir `request` NATS para usar una sola conexion por request/reply (sin `request -> publish` en segundo socket).
+- [x] Mantener inbox/reply subjects en sesion persistente (multiplexado), evitando handshake TCP por cada operacion local.
+- [ ] Objetivo operativo de este bloque: eliminar jitter/picos locales observados (~40ms) por connect/close repetido.
+- [x] Auto-resubscribe robusto para subscribers tras caida/restart de broker.
 - [ ] Correlacion request/reply robusta (inbox por sesion + `trace_id`).
 - [ ] Envelope comun de mensajes (versionado/meta minima) para callers NATS.
 - [ ] Metricas del cliente NATS (timeouts, reconnects, in-flight, last error).
 - [ ] Tests de integracion de libreria contra broker embebido (restart, reconnect, req/reply, sub).
 - [ ] Migrar nodos callers a API strict (evitar uso directo de endpoint string).
 - [ ] Documentar quickstart de nodo nuevo (`AI.test`) usando libreria para socket + NATS.
+
+Nota de estado:
+- La API strict ya existe en `jsr_client::nats`; queda pendiente migrar callers (`SY.*`/otros nodos) para eliminar uso de endpoint string directo.
+- `jsr_client::nats::request` ya publica el request en el mismo socket donde espera el reply (se elimino el segundo socket interno de `publish`).
+- `SY.admin` (`/config/storage/metrics`) ya usa `jsr_client::nats::NatsClient` persistente con reconnect/backoff.
+- `SY.admin` storage metrics ahora usa reply subject por request (`storage.metrics.reply.<trace_id>`) sobre una sola suscripcion persistente wildcard (`storage.metrics.reply.*`) en la sesion NATS.
+- `jsr_client::nats::NatsSubscriber` ahora incluye `run_with_reconnect` (backoff exponencial) para re-suscribir automaticamente tras caidas/restarts del broker.
 
 ## Cierre admin - prueba recomendada (estado actual)
 
