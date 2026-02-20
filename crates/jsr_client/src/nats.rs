@@ -215,6 +215,19 @@ impl NatsClient {
         Self::with_options(endpoint, NatsClientOptions::default())
     }
 
+    pub fn from_client_config(config: &ClientConfig) -> Result<Self, NatsError> {
+        let endpoint = config.resolved_nats_endpoint()?;
+        Ok(Self::new(endpoint))
+    }
+
+    pub fn from_client_config_with_options(
+        config: &ClientConfig,
+        options: NatsClientOptions,
+    ) -> Result<Self, NatsError> {
+        let endpoint = config.resolved_nats_endpoint()?;
+        Ok(Self::with_options(endpoint, options))
+    }
+
     pub fn with_options(endpoint: impl Into<String>, options: NatsClientOptions) -> Self {
         let session = Uuid::new_v4().simple().to_string();
         let session_inbox_prefix = format!("{SESSION_INBOX_PREFIX}.{session}");
@@ -239,6 +252,10 @@ impl NatsClient {
                 has_connected_once: false,
             }),
         }
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     pub fn inbox_reply_subject(&self, correlation_id: &str) -> String {

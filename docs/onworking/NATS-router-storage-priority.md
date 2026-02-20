@@ -176,17 +176,61 @@ Estado y pendientes:
 - [x] Envelope comun de mensajes (versionado/meta minima) para callers NATS.
 - [x] Metricas del cliente NATS (timeouts, reconnects, in-flight, last error).
 - [x] Tests de integracion de libreria contra broker embebido (restart, reconnect, req/reply, sub).
-- [ ] Migrar nodos callers a API strict (evitar uso directo de endpoint string).
-- [ ] Documentar quickstart de nodo nuevo (`AI.test`) usando libreria para socket + NATS.
+- [x] Migrar nodos callers a API strict (evitar uso directo de endpoint string).
+- [x] Documentar quickstart de nodo nuevo (`AI.test`) usando libreria para socket + NATS.
 
 Nota de estado:
-- La API strict ya existe en `jsr_client::nats`; queda pendiente migrar callers (`SY.*`/otros nodos) para eliminar uso de endpoint string directo.
+- La API strict ya existe en `jsr_client::nats` y ya esta aplicada en `SY.admin` + `SY.storage`; queda como mejora incremental migrar otros callers auxiliares.
+- `SY.admin` ahora crea `NatsClient` via `ClientConfig` (`NatsClient::from_client_config`) y deja de construir endpoint NATS manualmente.
+- `SY.storage` (`storage.metrics.get`) ahora usa `subscribe_local/publish_local` (strict) y deja de usar endpoint string directo para request/reply.
 - `jsr_client::nats::request` ya publica el request en el mismo socket donde espera el reply (se elimino el segundo socket interno de `publish`).
 - `SY.admin` (`/config/storage/metrics`) ya usa `jsr_client::nats::NatsClient` persistente con reconnect/backoff.
 - `SY.admin` storage metrics ahora usa `reply_subject` por request sobre inbox de sesion (`_INBOX.JSR.<session>.<trace_id>`), evitando colisiones entre procesos.
 - `jsr_client::nats::NatsSubscriber` ahora incluye `run_with_reconnect` (backoff exponencial) para re-suscribir automaticamente tras caidas/restarts del broker.
 - `jsr_client::nats::NatsClient` ahora genera inbox de sesion (`_INBOX.JSR.<session>.*`) y correlaciona requests con `reply_subject` por `trace_id` dentro de esa sesion compartida.
 - `jsr_client::nats::NatsClient` expone `metrics_snapshot()` con `timeouts/reconnects/in_flight/last_error` para observabilidad del caller.
+
+### Quickstart nodo nuevo (`AI.test`) con libreria (socket + NATS)
+
+1. Definir `NodeConfig` con `config_dir` y `router_socket` locales (flujo normal de socket al router).
+2. Crear `ClientConfig` desde ese `NodeConfig`.
+3. Resolver NATS local via API strict:
+   - `NatsClient::from_client_config(&client_cfg)` para request/reply persistente.
+   - `publish_local/subscribe_local` para publish/subscribe estricto router-local.
+4. No pasar `nats://...` manual en código de nodo (solo override por config si la infraestructura lo define).
+
+Snippet base:
+
+```rust
+use std::time::Duration;
+use jsr_client::{connect, ClientConfig, NodeConfig};
+use jsr_client::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
+
+let node_cfg = NodeConfig {
+    name: "AI.test".to_string(),
+    router_socket: json_router::paths::router_socket_dir(),
+    uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
+    config_dir: json_router::paths::config_dir(),
+    version: "0.1".to_string(),
+};
+let client_cfg = ClientConfig::new(node_cfg.clone());
+let (_tx, _rx) = connect(&node_cfg).await?;
+
+let nats = NatsClient::from_client_config(&client_cfg)?;
+let trace_id = uuid::Uuid::new_v4().to_string();
+let reply_subject = nats.inbox_reply_subject(&trace_id);
+let req = NatsRequestEnvelope::<serde_json::Value>::new(
+    "ai.test.action",
+    trace_id.clone(),
+    reply_subject.clone(),
+    None,
+);
+let body = serde_json::to_vec(&req)?;
+let resp = nats
+    .request_with_session_inbox("ai.test.action", &body, &reply_subject, Duration::from_secs(3))
+    .await?;
+let _decoded: NatsResponseEnvelope<serde_json::Value> = serde_json::from_slice(&resp)?;
+```
 
 ## Cierre admin - prueba recomendada (estado actual)
 

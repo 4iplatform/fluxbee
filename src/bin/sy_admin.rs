@@ -20,7 +20,7 @@ use jsr_client::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SCOPE_GLOBAL,
     SYSTEM_KIND,
 };
-use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
+use jsr_client::{connect, ClientConfig, NodeConfig, NodeReceiver, NodeSender};
 
 type AdminError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -30,7 +30,6 @@ struct HiveFile {
     role: Option<String>,
     admin: Option<AdminSection>,
     wan: Option<WanSection>,
-    nats: Option<NatsSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,13 +40,6 @@ struct AdminSection {
 #[derive(Debug, Deserialize)]
 struct WanSection {
     authorized_hives: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NatsSection {
-    mode: Option<String>,
-    port: Option<u16>,
-    url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -208,8 +200,6 @@ async fn main() -> Result<(), AdminError> {
         .as_ref()
         .and_then(|admin| admin.listen.clone())
         .unwrap_or_else(|| "0.0.0.0:8080".to_string());
-    let nats_endpoint = nats_endpoint(&hive);
-
     let node_config = NodeConfig {
         name: "SY.admin".to_string(),
         router_socket: socket_dir.clone(),
@@ -217,6 +207,7 @@ async fn main() -> Result<(), AdminError> {
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
     };
+    let client_config = ClientConfig::new(node_config.clone());
     let router_client = AdminRouterClient::connect_with_retry(node_config, Duration::from_secs(1))
         .await
         .map_err(|err| {
@@ -226,14 +217,14 @@ async fn main() -> Result<(), AdminError> {
 
     let (broadcast_tx, broadcast_rx) = mpsc::unbounded_channel::<BroadcastRequest>();
     let http_tx = broadcast_tx.clone();
-    let nats_client = Arc::new(NatsClient::new(nats_endpoint.clone()));
+    let nats_client = Arc::new(NatsClient::from_client_config(&client_config)?);
     let http_ctx = AdminContext {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
         socket_dir: socket_dir.clone(),
         hive_id,
         authorized_hives,
-        nats_endpoint,
+        nats_endpoint: nats_client.endpoint().to_string(),
         nats_client,
     };
     let http_client = router_client.clone();
@@ -331,30 +322,6 @@ async fn run_broadcast_loop(
 fn load_hive(config_dir: &Path) -> Result<HiveFile, AdminError> {
     let data = fs::read_to_string(config_dir.join("hive.yaml"))?;
     Ok(serde_yaml::from_str(&data)?)
-}
-
-fn nats_endpoint(hive: &HiveFile) -> String {
-    let Some(nats) = hive.nats.as_ref() else {
-        return "nats://127.0.0.1:4222".to_string();
-    };
-    if let Some(url) = nats.url.as_ref() {
-        let url = url.trim();
-        if !url.is_empty() {
-            return url.to_string();
-        }
-    }
-    let mode = nats
-        .mode
-        .as_deref()
-        .unwrap_or("embedded")
-        .trim()
-        .to_ascii_lowercase();
-    let port = nats.port.unwrap_or(4222);
-    if mode == "embedded" || mode == "client" {
-        format!("nats://127.0.0.1:{port}")
-    } else {
-        "nats://127.0.0.1:4222".to_string()
-    }
 }
 
 fn config_changed_version_channel(subsystem: &str) -> &'static str {

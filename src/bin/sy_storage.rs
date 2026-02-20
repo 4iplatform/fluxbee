@@ -1,6 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,14 +11,14 @@ use tokio::time;
 use tokio_postgres::{Client, GenericClient, NoTls};
 use tracing_subscriber::EnvFilter;
 
-use jsr_client::nats::{
-    publish as client_nats_publish, NatsError as ClientNatsError,
-    NatsRequestEnvelope, NatsResponseEnvelope, NatsSubscriber as ClientNatsSubscriber,
-    NATS_ENVELOPE_SCHEMA_VERSION,
-};
 use json_router::nats::{
     NatsSubscriber as RouterNatsSubscriber, SUBJECT_STORAGE_EVENTS, SUBJECT_STORAGE_ITEMS,
     SUBJECT_STORAGE_REACTIVATION, SUBJECT_STORAGE_TURNS,
+};
+use jsr_client::nats::{
+    publish_local as client_nats_publish_local, resolve_local_nats_endpoint, subscribe_local,
+    NatsError as ClientNatsError, NatsRequestEnvelope, NatsResponseEnvelope,
+    NATS_ENVELOPE_SCHEMA_VERSION,
 };
 
 type StorageError = Box<dyn std::error::Error + Send + Sync>;
@@ -48,8 +48,6 @@ struct HiveFile {
 #[derive(Debug, Deserialize)]
 struct NatsSection {
     mode: Option<String>,
-    port: Option<u16>,
-    url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,7 +128,7 @@ async fn main() -> Result<(), StorageError> {
         return Ok(());
     }
 
-    let endpoint = nats_endpoint(&hive);
+    let endpoint = resolve_local_nats_endpoint(&config_dir)?;
     let use_durable_consumer = hive
         .nats
         .as_ref()
@@ -185,7 +183,7 @@ async fn main() -> Result<(), StorageError> {
         Arc::clone(&storage_handler_errors),
     ));
     let metrics_query_task = tokio::spawn(run_storage_metrics_query_loop(
-        endpoint,
+        config_dir.clone(),
         Arc::clone(&storage),
         Arc::clone(&nats_subscribe_errors),
         Arc::clone(&storage_handler_errors),
@@ -886,25 +884,40 @@ async fn run_subject_loop(
 }
 
 async fn run_storage_metrics_query_loop(
-    endpoint: String,
+    config_dir: PathBuf,
     storage: Arc<Storage>,
     nats_subscribe_errors: Arc<AtomicU64>,
     storage_handler_errors: Arc<AtomicU64>,
 ) {
     loop {
-        let subscriber = ClientNatsSubscriber::new(
-            endpoint.clone(),
+        let subscriber = match subscribe_local(
+            &config_dir,
             SUBJECT_STORAGE_METRICS_GET.to_string(),
             STORAGE_METRICS_QUERY_SID,
-        );
+        ) {
+            Ok(subscriber) => subscriber,
+            Err(err) => {
+                let count = nats_subscribe_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                if count == 1 || count % NATS_ERROR_LOG_EVERY == 0 {
+                    tracing::warn!(
+                        subject = SUBJECT_STORAGE_METRICS_GET,
+                        error = %err,
+                        failures = count,
+                        "storage metrics nats subscribe setup failed; retrying"
+                    );
+                }
+                time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
         let storage = Arc::clone(&storage);
-        let endpoint_out = endpoint.clone();
+        let config_dir_out = config_dir.clone();
         let nats_subscribe_errors = Arc::clone(&nats_subscribe_errors);
         let storage_handler_errors = Arc::clone(&storage_handler_errors);
         let run_result = subscriber
             .run(move |msg| {
                 let storage = Arc::clone(&storage);
-                let endpoint_out = endpoint_out.clone();
+                let config_dir_out = config_dir_out.clone();
                 let storage_handler_errors = Arc::clone(&storage_handler_errors);
                 async move {
                     tracing::info!(
@@ -915,7 +928,8 @@ async fn run_storage_metrics_query_loop(
                         payload_bytes = msg.payload.len(),
                         "storage metrics nats raw message received"
                     );
-                    let req: NatsRequestEnvelope<Value> = match serde_json::from_slice(&msg.payload) {
+                    let req: NatsRequestEnvelope<Value> = match serde_json::from_slice(&msg.payload)
+                    {
                         Ok(req) => req,
                         Err(err) => {
                             tracing::warn!(
@@ -936,17 +950,23 @@ async fn run_storage_metrics_query_loop(
                             "storage metrics request rejected due to schema version mismatch"
                         );
                         if !req.reply_subject.trim().is_empty() {
-                            let response = NatsResponseEnvelope::<StorageInboxMetricsSnapshot>::error(
-                                SUBJECT_STORAGE_METRICS_GET,
-                                req.trace_id.clone(),
-                                "UNSUPPORTED_SCHEMA_VERSION",
-                                format!(
-                                    "unsupported schema_version={} expected={}",
-                                    req.schema_version, NATS_ENVELOPE_SCHEMA_VERSION
-                                ),
-                            );
+                            let response =
+                                NatsResponseEnvelope::<StorageInboxMetricsSnapshot>::error(
+                                    SUBJECT_STORAGE_METRICS_GET,
+                                    req.trace_id.clone(),
+                                    "UNSUPPORTED_SCHEMA_VERSION",
+                                    format!(
+                                        "unsupported schema_version={} expected={}",
+                                        req.schema_version, NATS_ENVELOPE_SCHEMA_VERSION
+                                    ),
+                                );
                             if let Ok(body) = serde_json::to_vec(&response) {
-                                let _ = client_nats_publish(&endpoint_out, &req.reply_subject, &body).await;
+                                let _ = client_nats_publish_local(
+                                    &config_dir_out,
+                                    &req.reply_subject,
+                                    &body,
+                                )
+                                .await;
                             }
                         }
                         return Ok(());
@@ -959,17 +979,23 @@ async fn run_storage_metrics_query_loop(
                             "storage metrics request rejected due to action mismatch"
                         );
                         if !req.reply_subject.trim().is_empty() {
-                            let response = NatsResponseEnvelope::<StorageInboxMetricsSnapshot>::error(
-                                SUBJECT_STORAGE_METRICS_GET,
-                                req.trace_id.clone(),
-                                "ACTION_MISMATCH",
-                                format!(
-                                    "action mismatch expected={} got={}",
-                                    SUBJECT_STORAGE_METRICS_GET, req.action
-                                ),
-                            );
+                            let response =
+                                NatsResponseEnvelope::<StorageInboxMetricsSnapshot>::error(
+                                    SUBJECT_STORAGE_METRICS_GET,
+                                    req.trace_id.clone(),
+                                    "ACTION_MISMATCH",
+                                    format!(
+                                        "action mismatch expected={} got={}",
+                                        SUBJECT_STORAGE_METRICS_GET, req.action
+                                    ),
+                                );
                             if let Ok(body) = serde_json::to_vec(&response) {
-                                let _ = client_nats_publish(&endpoint_out, &req.reply_subject, &body).await;
+                                let _ = client_nats_publish_local(
+                                    &config_dir_out,
+                                    &req.reply_subject,
+                                    &body,
+                                )
+                                .await;
                             }
                         }
                         return Ok(());
@@ -1068,7 +1094,7 @@ async fn run_storage_metrics_query_loop(
                         "storage metrics response publish start"
                     );
                     if let Err(err) =
-                        client_nats_publish(&endpoint_out, &reply_subject, &body).await
+                        client_nats_publish_local(&config_dir_out, &reply_subject, &body).await
                     {
                         let count = storage_handler_errors.fetch_add(1, Ordering::Relaxed) + 1;
                         let publish_elapsed_ms = publish_started.elapsed().as_millis() as u64;
@@ -1166,30 +1192,6 @@ async fn run_storage_metrics_loop(
 async fn load_hive(config_dir: &Path) -> Result<HiveFile, StorageError> {
     let data = tokio::fs::read_to_string(config_dir.join("hive.yaml")).await?;
     Ok(serde_yaml::from_str(&data)?)
-}
-
-fn nats_endpoint(hive: &HiveFile) -> String {
-    let Some(nats) = hive.nats.as_ref() else {
-        return "nats://127.0.0.1:4222".to_string();
-    };
-    if let Some(url) = nats.url.as_ref() {
-        let url = url.trim();
-        if !url.is_empty() {
-            return url.to_string();
-        }
-    }
-    let mode = nats
-        .mode
-        .as_deref()
-        .unwrap_or("embedded")
-        .trim()
-        .to_ascii_lowercase();
-    let port = nats.port.unwrap_or(4222);
-    if mode == "embedded" || mode == "client" {
-        format!("nats://127.0.0.1:{port}")
-    } else {
-        "nats://127.0.0.1:4222".to_string()
-    }
 }
 
 fn database_url(hive: &HiveFile) -> Result<String, StorageError> {
