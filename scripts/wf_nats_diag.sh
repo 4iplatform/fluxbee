@@ -54,26 +54,30 @@ print_timing_stats() {
   local marker="$2"
   local key="$3"
   local label="$4"
-  awk -v marker="$marker" -v key="$key" -v label="$label" '
-    index($0, marker) {
-      pattern = key "=[0-9][0-9]*"
-      if (match($0, pattern)) {
-        value = substr($0, RSTART + length(key) + 1, RLENGTH - length(key) - 1) + 0
-        count += 1
-        sum += value
-        if (count == 1 || value < min) min = value
-        if (count == 1 || value > max) max = value
-      }
+  local marker_lines
+  marker_lines="$(grep -cF "$marker" "$file" || true)"
+
+  local values
+  values="$(grep -F "$marker" "$file" 2>/dev/null | sed -nE "s/.*${key}=([0-9]+).*/\\1/p" || true)"
+
+  if [[ -z "${values}" ]]; then
+    echo "${label}: count=0 marker_lines=${marker_lines}"
+    return 0
+  fi
+
+  printf "%s\n" "$values" | awk -v label="$label" -v marker_lines="$marker_lines" '
+    {
+      value = $1 + 0
+      count += 1
+      sum += value
+      if (count == 1 || value < min) min = value
+      if (count == 1 || value > max) max = value
     }
     END {
-      if (count > 0) {
-        avg = sum / count
-        printf("%s: count=%d min=%dms avg=%.2fms max=%dms\n", label, count, min, avg, max)
-      } else {
-        printf("%s: count=0\n", label)
-      }
+      avg = sum / count
+      printf("%s: count=%d min=%dms avg=%.2fms max=%dms marker_lines=%d\n", label, count, min, avg, max, marker_lines)
     }
-  ' "$file"
+  '
 }
 
 sanitize_diag_line() {
