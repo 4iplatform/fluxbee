@@ -322,3 +322,7 @@ Para ejecutar todo junto en una sola corrida:
 ```bash
 BASE="http://127.0.0.1:8080" HIVE_ID="worker-220" bash scripts/nats_full_suite.sh
 ```
+
+Notas:
+- `scripts/nats_full_suite.sh` usa por defecto `FULL_SUITE_SMOKE_CHECK_STOP_START=0` para evitar doble `stop/start` del router antes del transporte E2E.
+- `scripts/nats_client_transport_e2e.sh` usa `METRICS_TIMEOUT_SECS=120` por defecto para contemplar retries internos de `SY.admin` en request/reply NATS.

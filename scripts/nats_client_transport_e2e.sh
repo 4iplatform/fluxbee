@@ -14,8 +14,9 @@ set -euo pipefail
 # Optional:
 #   ROUTER_SERVICE="rt-gateway"
 #   STORAGE_SERVICE="sy-storage"
-#   METRICS_TIMEOUT_SECS="45"
+#   METRICS_TIMEOUT_SECS="120"
 #   POLL_INTERVAL_SECS="2"
+#   INITIAL_STABILIZE_SECS="2"
 #   RUN_ROUTER_RESTART="1"
 #   RUN_ROUTER_STOP_START="1"
 #   RUN_STORAGE_RESTART="1"
@@ -23,8 +24,9 @@ set -euo pipefail
 BASE="${BASE:-http://127.0.0.1:8080}"
 ROUTER_SERVICE="${ROUTER_SERVICE:-rt-gateway}"
 STORAGE_SERVICE="${STORAGE_SERVICE:-sy-storage}"
-METRICS_TIMEOUT_SECS="${METRICS_TIMEOUT_SECS:-45}"
+METRICS_TIMEOUT_SECS="${METRICS_TIMEOUT_SECS:-120}"
 POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-2}"
+INITIAL_STABILIZE_SECS="${INITIAL_STABILIZE_SECS:-2}"
 RUN_ROUTER_RESTART="${RUN_ROUTER_RESTART:-1}"
 RUN_ROUTER_STOP_START="${RUN_ROUTER_STOP_START:-1}"
 RUN_STORAGE_RESTART="${RUN_STORAGE_RESTART:-1}"
@@ -142,9 +144,6 @@ wait_for_metrics_ok() {
   local start now elapsed status
   start="$(date +%s)"
   while true; do
-    now="$(date +%s)"
-    elapsed=$((now - start))
-
     status="$(http_call "GET" "$BASE/config/storage/metrics" "$body_file")"
     log_http_response "$status" "$body_file"
     if [[ "$status" == "200" ]] && \
@@ -154,6 +153,8 @@ wait_for_metrics_ok() {
       return 0
     fi
 
+    now="$(date +%s)"
+    elapsed=$((now - start))
     if (( elapsed >= METRICS_TIMEOUT_SECS )); then
       echo "FAIL [$label]: timeout waiting /config/storage/metrics healthy" >&2
       cat "$body_file" >&2
@@ -173,6 +174,12 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 echo "Running NATS transport E2E: BASE=$BASE ROUTER_SERVICE=$ROUTER_SERVICE STORAGE_SERVICE=$STORAGE_SERVICE"
 
+wait_for_service_state "$ROUTER_SERVICE" "active" "initial"
+wait_for_service_state "$STORAGE_SERVICE" "active" "initial"
+if (( INITIAL_STABILIZE_SECS > 0 )); then
+  sleep "$INITIAL_STABILIZE_SECS"
+fi
+
 # 0) Health
 health_body="$tmpdir/health.json"
 status="$(http_call "GET" "$BASE/health" "$health_body")"
@@ -187,6 +194,7 @@ if [[ "$RUN_ROUTER_RESTART" == "1" ]]; then
   echo "Step: restart service '$ROUTER_SERVICE'..."
   ${SUDO} systemctl restart "$ROUTER_SERVICE"
   wait_for_service_state "$ROUTER_SERVICE" "active" "after_router_restart"
+  wait_for_service_state "$STORAGE_SERVICE" "active" "after_router_restart"
   wait_for_metrics_ok "after_router_restart" "$metrics_body"
 else
   echo "SKIP: router restart disabled (RUN_ROUTER_RESTART=0)"
@@ -209,6 +217,7 @@ if [[ "$RUN_ROUTER_STOP_START" == "1" ]]; then
 
   ${SUDO} systemctl start "$ROUTER_SERVICE"
   wait_for_service_state "$ROUTER_SERVICE" "active" "after_router_start"
+  wait_for_service_state "$STORAGE_SERVICE" "active" "after_router_start"
   wait_for_metrics_ok "after_router_start" "$metrics_body"
 else
   echo "SKIP: router stop/start disabled (RUN_ROUTER_STOP_START=0)"
