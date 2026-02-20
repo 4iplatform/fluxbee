@@ -340,3 +340,26 @@ BASE="http://127.0.0.1:8080" HIVE_ID="worker-220" bash scripts/nats_full_suite.s
 Notas:
 - `scripts/nats_full_suite.sh` usa por defecto `FULL_SUITE_SMOKE_CHECK_STOP_START=0` para evitar doble `stop/start` del router antes del transporte E2E.
 - `scripts/nats_client_transport_e2e.sh` usa `METRICS_TIMEOUT_SECS=120` por defecto para contemplar retries internos de `SY.admin` en request/reply NATS.
+- `scripts/nats_full_suite.sh` expone perfiles:
+  - `FULL_SUITE_PROFILE=resilience` (default): mantiene checks con reinicios/ciclos.
+  - `FULL_SUITE_PROFILE=perf`: desactiva caos forzado para usarlo como tester de infraestructura.
+
+### Perfil perf (tester de infraestructura)
+
+Para medir comportamiento base sin reinicios forzados:
+
+```bash
+BASE="http://127.0.0.1:8080" HIVE_ID="worker-220" \
+FULL_SUITE_PROFILE=perf \
+bash scripts/nats_full_suite.sh
+```
+
+Opcional (solo transporte NATS, sin lifecycle/admin):
+
+```bash
+BASE="http://127.0.0.1:8080" \
+FULL_SUITE_PROFILE=perf \
+FULL_SUITE_INCLUDE_LIFECYCLE=0 \
+FULL_SUITE_INCLUDE_ADMIN=0 \
+bash scripts/nats_full_suite.sh
+```

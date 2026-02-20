@@ -14,6 +14,7 @@ set -euo pipefail
 #   ROUTER_SERVICE="rt-gateway"
 #   RUN_ROUTER_CYCLE="1"
 #   RUN_NODE_CYCLE="1"
+#   RUN_STORAGE_CONFIG_CYCLE="1"
 #   RUN_STORAGE_METRICS_CHECK="1"
 #   STORAGE_METRICS_TIMEOUT_SECS="30"
 #   STORAGE_METRICS_POLL_SECS="2"
@@ -28,6 +29,7 @@ HIVE_ID="${HIVE_ID:-worker-220}"
 ROUTER_SERVICE="${ROUTER_SERVICE:-rt-gateway}"
 RUN_ROUTER_CYCLE="${RUN_ROUTER_CYCLE:-1}"
 RUN_NODE_CYCLE="${RUN_NODE_CYCLE:-1}"
+RUN_STORAGE_CONFIG_CYCLE="${RUN_STORAGE_CONFIG_CYCLE:-1}"
 RUN_STORAGE_METRICS_CHECK="${RUN_STORAGE_METRICS_CHECK:-1}"
 STORAGE_METRICS_TIMEOUT_SECS="${STORAGE_METRICS_TIMEOUT_SECS:-30}"
 STORAGE_METRICS_POLL_SECS="${STORAGE_METRICS_POLL_SECS:-2}"
@@ -231,41 +233,45 @@ else
 fi
 
 # 5) /config/storage write/read/restore
-get_storage_before="$tmpdir/storage_before.json"
-status="$(http_call "GET" "$BASE/config/storage" "$get_storage_before")"
-log_http_response "$status" "$get_storage_before"
-assert_eq "$status" "200" "GET /config/storage/http"
-before_path="$(json_get "payload.path" "$get_storage_before")"
-if [[ -z "$before_path" ]]; then
-  before_path="$(json_get "path" "$get_storage_before")"
-fi
+if [[ "$RUN_STORAGE_CONFIG_CYCLE" == "1" ]]; then
+  get_storage_before="$tmpdir/storage_before.json"
+  status="$(http_call "GET" "$BASE/config/storage" "$get_storage_before")"
+  log_http_response "$status" "$get_storage_before"
+  assert_eq "$status" "200" "GET /config/storage/http"
+  before_path="$(json_get "payload.path" "$get_storage_before")"
+  if [[ -z "$before_path" ]]; then
+    before_path="$(json_get "path" "$get_storage_before")"
+  fi
 
-test_path="${STORAGE_TEST_PATH:-/var/lib/fluxbee/storage-e2e-$(date +%s)-$RANDOM}"
-put_storage_body="$tmpdir/storage_put.json"
-status="$(http_call "PUT" "$BASE/config/storage" "$put_storage_body" "{\"path\":\"$test_path\"}")"
-log_http_response "$status" "$put_storage_body"
-assert_eq "$status" "200" "PUT /config/storage/http"
-assert_eq "$(json_get "status" "$put_storage_body")" "ok" "PUT /config/storage/status"
+  test_path="${STORAGE_TEST_PATH:-/var/lib/fluxbee/storage-e2e-$(date +%s)-$RANDOM}"
+  put_storage_body="$tmpdir/storage_put.json"
+  status="$(http_call "PUT" "$BASE/config/storage" "$put_storage_body" "{\"path\":\"$test_path\"}")"
+  log_http_response "$status" "$put_storage_body"
+  assert_eq "$status" "200" "PUT /config/storage/http"
+  assert_eq "$(json_get "status" "$put_storage_body")" "ok" "PUT /config/storage/status"
 
-get_storage_after="$tmpdir/storage_after.json"
-status="$(http_call "GET" "$BASE/config/storage" "$get_storage_after")"
-log_http_response "$status" "$get_storage_after"
-assert_eq "$status" "200" "GET /config/storage after PUT/http"
-after_path="$(json_get "payload.path" "$get_storage_after")"
-if [[ -z "$after_path" ]]; then
-  after_path="$(json_get "path" "$get_storage_after")"
-fi
-assert_eq "$after_path" "$test_path" "GET /config/storage after PUT/path"
+  get_storage_after="$tmpdir/storage_after.json"
+  status="$(http_call "GET" "$BASE/config/storage" "$get_storage_after")"
+  log_http_response "$status" "$get_storage_after"
+  assert_eq "$status" "200" "GET /config/storage after PUT/http"
+  after_path="$(json_get "payload.path" "$get_storage_after")"
+  if [[ -z "$after_path" ]]; then
+    after_path="$(json_get "path" "$get_storage_after")"
+  fi
+  assert_eq "$after_path" "$test_path" "GET /config/storage after PUT/path"
 
-if [[ "$RESTORE_STORAGE" == "1" && -n "$before_path" ]]; then
-  restore_storage_body="$tmpdir/storage_restore.json"
-  status="$(http_call "PUT" "$BASE/config/storage" "$restore_storage_body" "{\"path\":\"$before_path\"}")"
-  log_http_response "$status" "$restore_storage_body"
-  assert_eq "$status" "200" "PUT /config/storage restore/http"
-  assert_eq "$(json_get "status" "$restore_storage_body")" "ok" "PUT /config/storage restore/status"
-  echo "OK: /config/storage restored to previous path"
+  if [[ "$RESTORE_STORAGE" == "1" && -n "$before_path" ]]; then
+    restore_storage_body="$tmpdir/storage_restore.json"
+    status="$(http_call "PUT" "$BASE/config/storage" "$restore_storage_body" "{\"path\":\"$before_path\"}")"
+    log_http_response "$status" "$restore_storage_body"
+    assert_eq "$status" "200" "PUT /config/storage restore/http"
+    assert_eq "$(json_get "status" "$restore_storage_body")" "ok" "PUT /config/storage restore/status"
+    echo "OK: /config/storage restored to previous path"
+  else
+    echo "SKIP: storage restore disabled or previous path empty"
+  fi
 else
-  echo "SKIP: storage restore disabled or previous path empty"
+  echo "SKIP: /config/storage write/read/restore disabled (RUN_STORAGE_CONFIG_CYCLE=0)"
 fi
 
 # 6) /config/storage/metrics via SY.admin -> NATS -> SY.storage
