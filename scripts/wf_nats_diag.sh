@@ -89,26 +89,36 @@ print_timing_stats() {
   marker_lines="$(grep -cF "$marker" "$file" || true)"
 
   local values
-  values="$(grep -F "$marker" "$file" 2>/dev/null | sed -nE "s/.*${key}=([0-9]+).*/\\1/p" || true)"
+  values="$(
+    awk -v marker="$marker" -v key="$key" '
+      index($0, marker) {
+        if (match($0, key "=[0-9]+")) {
+          value = substr($0, RSTART + length(key) + 1, RLENGTH - length(key) - 1)
+          print value
+        }
+      }
+    ' "$file" 2>/dev/null || true
+  )"
 
   if [[ -z "${values}" ]]; then
     echo "${label}: count=0 marker_lines=${marker_lines}"
     return 0
   fi
 
-  printf "%s\n" "$values" | awk -v label="$label" -v marker_lines="$marker_lines" '
-    {
-      value = $1 + 0
-      count += 1
-      sum += value
-      if (count == 1 || value < min) min = value
-      if (count == 1 || value > max) max = value
-    }
-    END {
-      avg = sum / count
-      printf("%s: count=%d min=%dms avg=%.2fms max=%dms marker_lines=%d\n", label, count, min, avg, max, marker_lines)
-    }
-  '
+  local count min avg max p50 p95
+  count="$(printf "%s\n" "$values" | awk 'NF { c += 1 } END { print c + 0 }')"
+  min="$(printf "%s\n" "$values" | awk 'NF { if (c == 0 || $1 < m) m = $1; c += 1 } END { print m + 0 }')"
+  avg="$(printf "%s\n" "$values" | awk 'NF { c += 1; s += $1 } END { if (c == 0) print "0.00"; else printf "%.2f", s / c }')"
+  max="$(printf "%s\n" "$values" | awk 'NF { if (c == 0 || $1 > m) m = $1; c += 1 } END { print m + 0 }')"
+
+  local p50_rank p95_rank
+  p50_rank="$(( (count + 1) / 2 ))"
+  p95_rank="$(( (95 * count + 99) / 100 ))"
+  p50="$(printf "%s\n" "$values" | awk 'NF' | sort -n | awk -v rank="$p50_rank" 'NR == rank { print; exit }')"
+  p95="$(printf "%s\n" "$values" | awk 'NF' | sort -n | awk -v rank="$p95_rank" 'NR == rank { print; exit }')"
+
+  printf "%s: count=%s min=%sms p50=%sms p95=%sms avg=%sms max=%sms marker_lines=%s\n" \
+    "$label" "$count" "$min" "${p50:-0}" "${p95:-0}" "$avg" "$max" "$marker_lines"
 }
 
 sanitize_diag_line() {
