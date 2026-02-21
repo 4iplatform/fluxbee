@@ -1466,14 +1466,10 @@ fn sync_runtime_to_worker(
         return Ok(());
     }
 
-    let prepare_runtime_root = format!(
-        "mkdir -p /var/lib/fluxbee/runtimes && chown -R {u}:{u} /var/lib/fluxbee/runtimes",
-        u = BOOTSTRAP_SSH_USER
-    );
     ssh_with_key(
         address,
         key_path,
-        &sudo_wrap(&prepare_runtime_root),
+        &sudo_wrap("mkdir -p /var/lib/fluxbee/runtimes"),
         BOOTSTRAP_SSH_USER,
     )?;
 
