@@ -52,3 +52,44 @@ Checklist operativo para cerrar SY.orchestrator segun:
 ## Nota operativa (logs)
 - Para evitar ruido de runs viejos en `journalctl`, filtrar por ventana temporal:
   - `journalctl -u sy-orchestrator --since "YYYY-MM-DD HH:MM:SS" --no-pager`
+
+## TODO - Versionado y propagacion de software (infra)
+
+Objetivo:
+- completar cierre operativo de versionado y rollout para infraestructura, separando:
+  - runtimes de nodos (ya implementado base en 7.8),
+  - binarios core de plataforma (`rt-gateway`, `sy-*`), que hoy no tienen plan de rollout versionado equivalente.
+
+### 1) Contrato de versionado de runtimes (hardening)
+- [ ] Definir `schema_version` del `runtime-manifest.json` y politica de compatibilidad.
+- [ ] Exigir monotonicidad de `payload.version` en `RUNTIME_UPDATE` (rechazo explicito de updates stale).
+- [ ] Formalizar `error_code` de versionado (`VERSION_MISMATCH` / `MANIFEST_INVALID`) para respuestas deterministas.
+- [ ] Documentar politica de rollback de runtime (`current` anterior) y criterio de activacion.
+
+### 2) Rollout de runtimes por worker (robustez operativa)
+- [ ] Registrar resultado por worker en cada sync (`ok/error`, motivo, duracion, hash final).
+- [ ] Agregar modo canary (subset de workers) antes de rollout global.
+- [ ] Definir y aplicar politica de retencion de versiones en `/var/lib/fluxbee/runtimes` (cleanup seguro).
+- [ ] Agregar verificacion post-sync obligatoria por worker (hash remoto == hash local) con retry acotado.
+
+### 3) Versionado de binarios core (gap actual de infraestructura)
+- [ ] Definir manifest de componentes core (servicio, version, hash, build_id).
+- [ ] Diseñar flujo de promocion motherbee -> workers para binarios core (staging + verificacion + switch atomico).
+- [ ] Definir orden de restart por dependencia (`rt-gateway`/`sy-*`) con health-gate entre pasos.
+- [ ] Implementar rollback de core por componente ante falla de health-check.
+
+### 4) API/observabilidad de versiones
+- [ ] Exponer endpoint admin para version efectiva por hive (runtimes + core).
+- [ ] Persistir historial de despliegues (deployment_id, actor, target_hives, resultado).
+- [ ] Agregar alertas de drift versionado (manifest o binarios core) entre motherbee y workers.
+
+### 5) Validacion E2E de versionado
+- [ ] Script E2E: `RUNTIME_UPDATE` canary -> global -> verificacion -> rollback.
+- [ ] Caso negativo E2E: update stale rechazado con `error_code` explicito (sin timeout opaco).
+- [ ] Caso E2E de drift remoto: deteccion + auto-resync + evidencia en API/logs.
+
+### Criterio de salida de este TODO
+- [ ] Se puede desplegar version nueva de runtime y de core en worker real con:
+  - rollout controlado (canary/global),
+  - trazabilidad completa por hive,
+  - rollback verificable en caso de falla.

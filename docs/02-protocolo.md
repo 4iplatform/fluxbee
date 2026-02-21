@@ -730,9 +730,13 @@ Request/response para obtener EventPackage completo de otra isla:
 
 | Mensaje | Origen | Destino | Propósito |
 |---------|--------|---------|-----------|
-| `RUNTIME_UPDATE` | (externo) | SY.orchestrator | Notificar nueva versión de runtimes |
-| `SPAWN_NODE` | SY.admin | SY.orchestrator | Solicitar ejecución de nodo |
-| `KILL_NODE` | SY.admin | SY.orchestrator | Solicitar terminación de nodo |
+| `RUNTIME_UPDATE` | Actor de control-plane autorizado (`SY.admin` o tooling operativo) | SY.orchestrator | Notificar nueva versión de runtimes |
+| `SPAWN_NODE` | SY.admin (tooling E2E solo en entorno controlado) | SY.orchestrator | Solicitar ejecución de nodo |
+| `KILL_NODE` | SY.admin (tooling E2E solo en entorno controlado) | SY.orchestrator | Solicitar terminación de nodo |
+
+Regla operativa 7.8:
+- Para estos mensajes usar `routing.dst` por nombre L2 (`"SY.orchestrator@<hive>"`).
+- No usar `routing.dst = null` (`Destination::Resolve`) en operación normal de control-plane.
 
 #### 7.8.1 RUNTIME_UPDATE
 

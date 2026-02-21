@@ -548,7 +548,14 @@ Cuando se pide ejecutar un nodo:
 
 ```json
 {
-  "meta": { "msg": "SPAWN_NODE" },
+  "routing": {
+    "src": "SY.admin@motherbee",
+    "dst": "SY.orchestrator@motherbee"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "SPAWN_NODE"
+  },
   "payload": {
     "runtime": "AI.soporte",
     "version": "1.3.0",        // Opcional, default = current

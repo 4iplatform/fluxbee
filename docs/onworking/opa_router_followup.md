@@ -39,12 +39,16 @@ Esto indica falla técnica de parseo en el resolver OPA, no un `deny` explícito
 - [x] Unificar spec de `routing.dst` en `docs/02-protocolo.md`:
   - [x] Se admite nombre L2 en `dst` y quedó documentado explícitamente.
   - [x] Router alineado para resolver `dst` string por UUID o por nombre L2 (FIB directo, sin OPA).
-- [ ] Revisar ejemplos operativos de mensajes `system` para evitar ambigüedad (`SY.admin` vs actores externos).
+- [x] Revisar ejemplos operativos de mensajes `system` para evitar ambigüedad (`SY.admin` vs actores externos).
+  - [x] `docs/02-protocolo.md` (7.8) aclara origen operativo por mensaje.
+  - [x] `docs/07-operaciones.md` (4.9.6) usa ejemplo completo (`routing` + `meta.type` + `meta.msg`).
+  - [x] Regla operativa explícita: para control-plane de orchestrator usar `dst` por nombre L2 (`SY.orchestrator@<hive>`), no `dst=null`/`Resolve`.
 
 ### C. Cobertura operativa
 - [ ] Incorporar caso negativo en E2E: `UNREACHABLE/OPA_ERROR` debe ser explícito y no timeout opaco.
 - [ ] Incorporar caso positivo de `Destination::Resolve` para mensajes `system` de control plane permitidos por policy.
 - [ ] Agregar chequeo previo de salud OPA (status/version en SHM) antes de tests de resolve.
+- [ ] Hardening adicional de seguridad: validar origen permitido para `SPAWN_NODE`/`KILL_NODE` en `SY.orchestrator` (allowlist explícita), además de policy/router.
 
 ### D. Pendiente estructural ya existente
 - [ ] Completar carga de `data` bundle en router cuando policy lo requiera (marcado pendiente en `docs/09-router-status.md`).
@@ -59,3 +63,16 @@ Esto indica falla técnica de parseo en el resolver OPA, no un `deny` explícito
 - El flujo de orchestrator para `RUNTIME_UPDATE` / `SPAWN_NODE` / `KILL_NODE` quedó estable con `dst` por nombre L2 (FIB directo, sin pasar por `Resolve`+OPA para control-plane).
 - El E2E con worker real cerró `status=ok` en `SPAWN_NODE_RESPONSE` y `KILL_NODE_RESPONSE`.
 - El bloqueo observado al final no fue OPA/router sino sync de runtimes con permisos remotos, resuelto en `sy_orchestrator` con staging en `/tmp` + promoción con `sudo`.
+
+## Criterio operativo acordado para mensajes `system` (orchestrator)
+
+- `RUNTIME_UPDATE`:
+  - origen: actor de control-plane autorizado (p.ej. `SY.admin` o tooling de diagnóstico como `WF.orch.diag`).
+  - destino: `routing.dst = "SY.orchestrator@<hive>"`.
+- `SPAWN_NODE` y `KILL_NODE`:
+  - origen esperado: `SY.admin` (tooling de diagnóstico solo para E2E controlado).
+  - destino: `routing.dst = "SY.orchestrator@<hive>"`.
+- No usar `routing.dst = null` (`Destination::Resolve`) para estos mensajes de control-plane en operación normal.
+- Nota de seguridad:
+  - hoy `SY.orchestrator` procesa por `meta.msg` sin validar explícitamente nombre de origen; el control de acceso depende de router/OPA.
+  - queda marcado hardening adicional para validar origen en `SY.orchestrator`.

@@ -51,7 +51,7 @@ Criterio de salida:
 - Si NATS no esta disponible, error explicito y accionable en logs.
 
 Nota actual:
-- El chequeo de `sy-storage` valida estado `systemd active`; queda pendiente chequeo explicito de conexion DB al bootstrap.
+- El bootstrap de motherbee ya valida readiness profunda de `SY.storage` via `storage.metrics.get` (camino `SY.orchestrator -> NATS -> SY.storage -> DB`).
 
 ## Fase 1 - Contrato de datos de storage
 - [x] Definir y documentar payload canonico para:
@@ -78,7 +78,7 @@ Avance de implementacion:
 - [x] Definir mecanismo de embebido (decision tecnica):
   - [ ] Opcion A: proceso `nats-server` gestionado por router/orchestrator.
   - [x] Opcion B: broker NATS minimo embebido en proceso Rust del router.
-- [ ] Implementar lifecycle completo:
+- [x] Implementar lifecycle completo:
   - [x] start
   - [x] health
   - [x] stop
@@ -170,7 +170,7 @@ Estado y pendientes:
 - [x] Cliente NATS persistente con reconnect/backoff (evitar connect por operacion).
 - [x] Reescribir `request` NATS para usar una sola conexion por request/reply (sin `request -> publish` en segundo socket).
 - [x] Mantener inbox/reply subjects en sesion persistente (multiplexado), evitando handshake TCP por cada operacion local.
-- [ ] Objetivo operativo de este bloque: eliminar jitter/picos locales observados (~40ms) por connect/close repetido.
+- [x] Objetivo operativo de este bloque: eliminar jitter/picos locales observados (~40ms) por connect/close repetido.
 - [x] Auto-resubscribe robusto para subscribers tras caida/restart de broker.
 - [x] Correlacion request/reply robusta (inbox por sesion + `trace_id`).
 - [x] Envelope comun de mensajes (versionado/meta minima) para callers NATS.
@@ -189,6 +189,9 @@ Nota de estado:
 - `jsr_client::nats::NatsSubscriber` ahora incluye `run_with_reconnect` (backoff exponencial) para re-suscribir automaticamente tras caidas/restarts del broker.
 - `jsr_client::nats::NatsClient` ahora genera inbox de sesion (`_INBOX.JSR.<session>.*`) y correlaciona requests con `reply_subject` por `trace_id` dentro de esa sesion compartida.
 - `jsr_client::nats::NatsClient` expone `metrics_snapshot()` con `timeouts/reconnects/in_flight/last_error` para observabilidad del caller.
+- Validacion remota de campo (2026-02-21):
+  - `scripts/wf_nats_diag.sh` con `WF_DIAG_LOOPS=30`, `WF_DIAG_TIMEOUT_SECS=3`, `WF_DIAG_INTERVAL_MS=100` completo sin timeouts.
+  - Request/reply estable en la corrida (latencia mayormente en banda ~40-50ms, con picos aislados sin perdida de respuesta).
 
 ### Quickstart nodo nuevo (`AI.test`) con libreria (socket + NATS)
 
@@ -259,9 +262,9 @@ Criterio de salida:
 
 ## Proximo bloque sugerido (orden de ejecucion)
 
-1. Implementar JetStream base (streams + durable consumers + ack explicito post-persistencia) sin depender del cierre final de payload.
-2. Activar productor real de `storage.events/items/reactivation` (SY.cognition) para validar pipeline E2E completo sobre infraestructura durable.
-3. Cerrar contrato final (Fase 3B) con versionado y validaciones estrictas.
+1. Activar productor real de `storage.events/items/reactivation` (SY.cognition) para validar pipeline E2E completo sobre infraestructura durable.
+2. Cerrar contrato final (Fase 3B) con versionado y validaciones estrictas.
+3. Ajustar esquema/indices/constraints finales de storage segun contrato definitivo.
 
 Avance:
 - Se agrego smoke de lifecycle para NATS embebido: `scripts/nats_embedded_lifecycle_smoke.sh`.
@@ -272,7 +275,7 @@ Avance:
 ## Riesgos abiertos
 
 - El broker embebido actual es minimo y no cubre semantica JetStream.
-- Sin ack/durable consumer todavia puede haber perdida de mensajes ante reinicios.
+- Aunque ya hay ack/replay durable base, sigue pendiente la alineacion completa al contrato JetStream oficial.
 - Hay riesgo de drift entre lo documentado en spec y lo implementado en runtime si no se cierran pruebas E2E de subjects.
 
 ## Smoke E2E (storage.turns)
