@@ -53,3 +53,9 @@ Esto indica falla técnica de parseo en el resolver OPA, no un `deny` explícito
 
 - No tocar policy/OPA rules hasta cerrar decisión de contrato de `dst` y de origen permitido para `SPAWN_NODE/KILL_NODE`.
 - Priorizar corrección de robustez del resolver (A) antes de ampliar permisos de policy.
+
+## Estado actual (2026-02-21)
+
+- El flujo de orchestrator para `RUNTIME_UPDATE` / `SPAWN_NODE` / `KILL_NODE` quedó estable con `dst` por nombre L2 (FIB directo, sin pasar por `Resolve`+OPA para control-plane).
+- El E2E con worker real cerró `status=ok` en `SPAWN_NODE_RESPONSE` y `KILL_NODE_RESPONSE`.
+- El bloqueo observado al final no fue OPA/router sino sync de runtimes con permisos remotos, resuelto en `sy_orchestrator` con staging en `/tmp` + promoción con `sudo`.
