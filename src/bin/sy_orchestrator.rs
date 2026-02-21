@@ -1474,8 +1474,13 @@ fn sync_runtime_to_worker(
     )?;
 
     let mut cmd = Command::new("rsync");
-    cmd.arg("-az")
+    cmd.arg("-rz")
         .arg("--delete")
+        .arg("--omit-dir-times")
+        .arg("--no-perms")
+        .arg("--no-owner")
+        .arg("--no-group")
+        .arg("--rsync-path=sudo rsync")
         .arg("-e")
         .arg(format!(
             "ssh -i {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10",
