@@ -73,7 +73,9 @@ Entregar una base funcional y estable para desacoplar el router de persistencia:
 ## Riesgos conocidos
 
 - El router actualmente publica sobre `storage.turns`; los subjects de `events/items/reactivation` quedan listos para consumo cuando SY.cognition los emita.
-- NATS embebido real (server in-process) no esta implementado aun; se asume endpoint NATS operativo segun config.
+- NATS:
+  - en `nats.mode=embedded`, el router levanta broker NATS in-process;
+  - en `nats.mode=client`, se usa endpoint externo configurado.
 
 ## Actualizacion Iteracion 3 (Orchestrator + install)
 
@@ -116,11 +118,11 @@ Resumen:
   - router publica `storage.turns` con cliente NATS liviano,
   - `sy-storage` consume 4 subjects y persiste en PostgreSQL.
 - Gap principal:
-  - `nats.mode=embedded` aun no levanta servidor embebido real.
+  - (cerrado en iteraciones posteriores) `nats.mode=embedded` ahora levanta broker embebido real en router.
 - Siguiente bloque recomendado:
   1. readiness explicito de NATS en router + orchestrator,
   2. endurecer contratos de payload en storage,
-  3. definir implementacion de NATS embebido real,
+  3. (cerrado) implementacion de NATS embebido real,
   4. migrar a semantica JetStream/acks.
 
 ## Actualizacion Iteracion 6 (fase 0 iniciada en codigo)

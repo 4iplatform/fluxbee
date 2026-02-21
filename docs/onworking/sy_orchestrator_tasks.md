@@ -37,11 +37,13 @@ Checklist operativo para cerrar SY.orchestrator segun:
   - [x] Contrato payload alineado en `orch_system_diag` (`target`/`unit` en lugar de `hive`/`name`).
   - [x] Sync de runtimes endurecido en `sy_orchestrator` (staging remoto en `/tmp` + promocion con `sudo`), evitando fallas de permisos en `/var/lib/fluxbee/runtimes`.
   - [x] Ejecucion validada end-to-end (2026-02-21) con respuesta `status=ok` en `SPAWN_NODE_RESPONSE` y `KILL_NODE_RESPONSE`.
-- [ ] Homogeneizar documentacion vieja de bootstrap (`root` vs `administrator`, ejemplos legacy y paths `/json-router`).
-- [ ] Resolver inconsistencias OPA/router detectadas en E2E (`Destination::Resolve` + contrato `dst` + parseo OPA).  
-  Ver: `docs/onworking/opa_router_followup.md`.
-- [ ] Cierre completo de LSA router/WAN (estado, seguridad, secuencia y UUID remoto):
-  - Ver plan detallado en `docs/onworking/router_lsa_full_review.md`.
+- [x] Homogeneizar documentacion vieja de bootstrap (`root` vs `administrator`, ejemplos legacy y paths `/json-router`).
+- [x] Resolver inconsistencia OPA/router que bloqueaba E2E (`Destination::Resolve` + contrato `dst` + parseo OPA):
+  - `dst` por nombre L2 documentado y soportado en router (FIB directo).
+  - resolver OPA ajustado a `opa_json_dump` prioritario (fallback `opa_value_dump`).
+  - seguimiento de hardening restante en `docs/onworking/opa_router_followup.md`.
+- [x] Cierre completo de LSA router/WAN (estado, seguridad, secuencia y UUID remoto):
+  - Verificado y cerrado en `docs/onworking/router_lsa_full_review.md` (P0..P3 completos).
 
 ## Notas de compatibilidad
 - API admin actual (`run_node`, `kill_node`, `run_router`, `kill_router`, `add_hive`) se mantiene compatible.
