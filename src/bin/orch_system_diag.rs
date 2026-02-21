@@ -59,7 +59,7 @@ async fn send_system_message(
     let message = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
-            dst: Destination::Resolve,
+            dst: Destination::Unicast(target.to_string()),
             ttl: 16,
             trace_id: trace_id.clone(),
         },
@@ -67,7 +67,7 @@ async fn send_system_message(
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(msg_name.to_string()),
             scope: None,
-            target: Some(target.to_string()),
+            target: None,
             action: None,
             priority: None,
             context: None,

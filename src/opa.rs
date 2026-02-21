@@ -439,11 +439,12 @@ impl OpaWasm {
     }
 
     fn dump_value(&mut self, value_addr: i32) -> Result<String, OpaError> {
-        if let Some(dump) = &self.opa_value_dump {
+        // Prefer JSON dump when available; value_dump may emit non-JSON formats.
+        if let Some(dump) = &self.opa_json_dump {
             let ptr = dump.call(&mut self.store, value_addr)?;
             return Ok(read_cstr_store(&self.memory, &mut self.store, ptr));
         }
-        if let Some(dump) = &self.opa_json_dump {
+        if let Some(dump) = &self.opa_value_dump {
             let ptr = dump.call(&mut self.store, value_addr)?;
             return Ok(read_cstr_store(&self.memory, &mut self.store, ptr));
         }
@@ -1150,11 +1151,11 @@ fn dump_value(caller: &mut Caller<'_, OpaRuntimeState>, addr: i32) -> Result<Val
         .and_then(|e| e.into_memory())
         .ok_or(OpaError::MissingExport("memory"))?;
     let dump_func = caller
-        .get_export("opa_value_dump")
+        .get_export("opa_json_dump")
         .and_then(|e| e.into_func())
         .or_else(|| {
             caller
-                .get_export("opa_json_dump")
+                .get_export("opa_value_dump")
                 .and_then(|e| e.into_func())
         })
         .ok_or(OpaError::MissingExport("opa_value_dump/opa_json_dump"))?;

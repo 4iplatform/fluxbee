@@ -28,7 +28,7 @@ Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisi
 {
   "routing": {
     "src": "uuid-origen",
-    "dst": "uuid-destino | null | \"broadcast\"",
+    "dst": "uuid-destino | nombre-l2@hive | null | \"broadcast\"",
     "ttl": 16,
     "trace_id": "uuid-correlación"
   }
@@ -38,7 +38,7 @@ Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisi
 | Campo | Tipo | Obligatorio | Descripción |
 |-------|------|-------------|-------------|
 | `src` | UUID | Sí | Nodo origen del mensaje |
-| `dst` | UUID, "broadcast", o null | Sí | Unicast / Broadcast / Resolve via OPA |
+| `dst` | UUID, nombre L2, "broadcast", o null | Sí | Unicast (UUID o nombre) / Broadcast / Resolve via OPA |
 | `ttl` | int | Sí | Time-to-live, decrementa por hop WAN y broadcast |
 | `trace_id` | UUID | Sí | ID de correlación para trazabilidad |
 
@@ -47,6 +47,7 @@ Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisi
 | Valor | Comportamiento |
 |-------|----------------|
 | UUID | Unicast directo a ese nodo |
+| Nombre L2 (`SY.admin@motherbee`) | Resolve directo en FIB por nombre (sin OPA) |
 | `"broadcast"` | Entregar a todos (filtrado por `meta.target` si existe) |
 | `null` | Resolver destino via OPA usando `meta.target` |
 
@@ -110,7 +111,7 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 | `null` | nombre L2 | OPA resuelve destino usando target |
 | `"broadcast"` | patrón L2 | Router filtra: solo entrega a nodos que matchean |
 | `"broadcast"` | ausente | Router entrega a todos los nodos |
-| UUID | - | Ignorado (unicast directo) |
+| UUID o nombre L2 | - | Ignorado (unicast directo) |
 
 ### 3.2 Campos de Contexto (ich, ctx, ctx_seq, ctx_window)
 
@@ -195,7 +196,7 @@ pub struct Routing {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Destination {
-    Unicast(String),      // UUID específico
+    Unicast(String),      // UUID específico o nombre L2 (ej: SY.orchestrator@motherbee)
     Broadcast,            // Literal "broadcast"
     Resolve,              // null - resolver via OPA
 }

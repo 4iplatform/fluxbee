@@ -411,6 +411,9 @@ impl BroadcastCache {
 
 Cuando `routing.dst = null`, el router consulta OPA para resolver el destino.
 
+Si `routing.dst` trae un nombre L2 (ej: `SY.orchestrator@motherbee`), el router resuelve
+directo por FIB (sin OPA), igual que cuando recibe un UUID directo.
+
 ### 8.2 Input
 
 OPA recibe el mensaje completo (excepto payload). El `src_ilk` permite derivar tenant via `data.identity`:
@@ -438,6 +441,16 @@ OPA recibe el mensaje completo (excepto payload). El `src_ilk` permite derivar t
   "target": "AI.soporte.l1@produccion"
 }
 ```
+
+### 8.3.1 Resolver OPA (WASM): prioridad de dumps
+
+Para serializar el resultado del policy engine en el resolver OPA del router:
+
+- Se DEBE priorizar `opa_json_dump` cuando esté exportado.
+- `opa_value_dump` se usa solo como fallback de compatibilidad si `opa_json_dump` no existe.
+
+Motivo operativo: `opa_value_dump` puede devolver formatos no JSON estrictos en algunos builds;
+si se intenta parsear ese output como JSON se generan errores de resolución (`OPA_ERROR`).
 
 ### 8.4 Derivar tenant desde src_ilk
 

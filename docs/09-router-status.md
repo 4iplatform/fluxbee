@@ -10,6 +10,7 @@ Objetivo: revisar punto por punto y marcar pendientes.
 - [x] FIB (LPM + prioridad/metric)
 - [x] Rutas estáticas (`ACTION_DROP` / `ACTION_FORWARD`)
 - [x] Resolución por UUID (L1)
+- [x] Resolución directa por nombre L2 en `routing.dst` (sin OPA)
 - [x] Resolución por nombre (L2)
 - [x] Rebuild FIB en cambios de config/LSA
 
