@@ -1498,13 +1498,14 @@ fn sync_runtime_to_worker(
     run_cmd(cmd, &format!("rsync runtime stage ({hive_id})"))?;
 
     let promote_cmd = format!(
-        "mkdir -p /var/lib/fluxbee/runtimes && rsync -a --delete '{stage}/' /var/lib/fluxbee/runtimes/ && rm -rf '{stage}'",
+        "mkdir -p /var/lib/fluxbee/runtimes && rsync -r --delete --omit-dir-times --no-perms --no-owner --no-group '{stage}/' /var/lib/fluxbee/runtimes/ && rm -rf '{stage}'",
         stage = remote_stage
     );
+    let promote_cmd_escaped = promote_cmd.replace('"', "\\\"");
     ssh_with_key(
         address,
         key_path,
-        &sudo_wrap(&promote_cmd),
+        &sudo_wrap(&format!("bash -lc \"{}\"", promote_cmd_escaped)),
         BOOTSTRAP_SSH_USER,
     )
 }
