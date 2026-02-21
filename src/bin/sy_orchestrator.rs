@@ -15,6 +15,7 @@ use json_router::shm::{
     now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RemoteHiveEntry, RemoteNodeEntry,
     RouterRegionReader, ShmSnapshot, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
 };
+use jsr_client::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
 use jsr_client::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
 
@@ -26,6 +27,9 @@ const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
 const RUNTIME_MANIFEST_FILE: &str = "runtime-manifest.json";
 const NATS_BOOTSTRAP_TIMEOUT_SECS: u64 = 20;
 const STORAGE_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
+const STORAGE_DB_READINESS_TIMEOUT_SECS: u64 = 30;
+const STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS: u64 = 3;
+const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const SY_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, Deserialize)]
@@ -270,7 +274,92 @@ async fn bootstrap_local(
         Duration::from_secs(STORAGE_BOOTSTRAP_TIMEOUT_SECS),
     )
     .await?;
+    wait_for_storage_db_ready(
+        &state.config_dir,
+        Duration::from_secs(STORAGE_DB_READINESS_TIMEOUT_SECS),
+    )
+    .await?;
     Ok(())
+}
+
+async fn wait_for_storage_db_ready(
+    config_dir: &Path,
+    timeout: Duration,
+) -> Result<(), OrchestratorError> {
+    let started = Instant::now();
+    let mut attempts: u64 = 0;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let trace_id = Uuid::new_v4().to_string();
+        let reply_subject = format!("storage.metrics.reply.orchestrator.{trace_id}");
+        let sid = 40_019;
+        let request = NatsRequestEnvelope::<serde_json::Value>::new(
+            SUBJECT_STORAGE_METRICS_GET,
+            trace_id.clone(),
+            reply_subject.clone(),
+            None,
+        );
+        let request_body = serde_json::to_vec(&request)?;
+
+        match request_local(
+            config_dir,
+            SUBJECT_STORAGE_METRICS_GET,
+            &request_body,
+            &reply_subject,
+            sid,
+            Duration::from_secs(STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS),
+        )
+        .await
+        {
+            Ok(body) => match serde_json::from_slice::<NatsResponseEnvelope<serde_json::Value>>(&body)
+            {
+                Ok(response) if response.status == "ok" => {
+                    tracing::info!(
+                        attempts = attempts,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "sy-storage DB readiness confirmed via storage.metrics.get"
+                    );
+                    return Ok(());
+                }
+                Ok(response) => {
+                    tracing::warn!(
+                        attempts = attempts,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        status = %response.status,
+                        error_code = ?response.error_code,
+                        error_detail = ?response.error_detail,
+                        "sy-storage readiness probe returned non-ok status; retrying"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        attempts = attempts,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        error = %err,
+                        "sy-storage readiness probe decode failed; retrying"
+                    );
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    attempts = attempts,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    error = %err,
+                    "sy-storage readiness probe failed; retrying"
+                );
+            }
+        }
+
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "sy-storage DB readiness timeout after {}s (attempts={})",
+                timeout.as_secs(),
+                attempts
+            )
+            .into());
+        }
+        time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 async fn wait_for_router_ready(

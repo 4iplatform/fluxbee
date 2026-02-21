@@ -31,8 +31,8 @@ Checklist operativo para cerrar SY.orchestrator segun:
 
 ## Pendiente de cierre fino
 - [x] Validacion explicita de readiness de NATS en bootstrap (ademas de socket+SHM y SY nodes).
-- [ ] Validacion explicita de readiness profunda de `sy-storage` (hoy valida servicio activo; falta validar DB conectada al inicio).
-- [ ] Tests de integracion de `RUNTIME_UPDATE` + `SPAWN_NODE` remoto con worker real.
+- [x] Validacion explicita de readiness profunda de `sy-storage` (bootstrap ahora exige respuesta `status=ok` de `storage.metrics.get` via NATS, validando camino `SY.orchestrator -> NATS -> SY.storage -> DB`).
+- [x] Tests de integracion de `RUNTIME_UPDATE` + `SPAWN_NODE` remoto con worker real (script: `scripts/orchestrator_runtime_update_spawn_e2e.sh`, helper: `orch_system_diag`).
 - [ ] Homogeneizar documentacion vieja de bootstrap (`root` vs `administrator`, ejemplos legacy y paths `/json-router`).
 - [ ] Cierre completo de LSA router/WAN (estado, seguridad, secuencia y UUID remoto):
   - Ver plan detallado en `docs/onworking/router_lsa_full_review.md`.
