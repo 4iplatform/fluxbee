@@ -1473,6 +1473,9 @@ fn sync_runtime_to_worker(
         BOOTSTRAP_SSH_USER,
     )?;
 
+    let sudo_pass = BOOTSTRAP_SSH_PASS.replace('\'', "'\"'\"'");
+    let remote_rsync = format!("bash -lc \"echo '{sudo_pass}' | sudo -S -p '' rsync\"");
+
     let mut cmd = Command::new("rsync");
     cmd.arg("-rz")
         .arg("--delete")
@@ -1480,7 +1483,7 @@ fn sync_runtime_to_worker(
         .arg("--no-perms")
         .arg("--no-owner")
         .arg("--no-group")
-        .arg("--rsync-path=sudo rsync")
+        .arg(format!("--rsync-path={remote_rsync}"))
         .arg("-e")
         .arg(format!(
             "ssh -i {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10",
