@@ -1466,15 +1466,16 @@ fn sync_runtime_to_worker(
         return Ok(());
     }
 
+    let prepare_runtime_root = format!(
+        "mkdir -p /var/lib/fluxbee/runtimes && chown -R {u}:{u} /var/lib/fluxbee/runtimes",
+        u = BOOTSTRAP_SSH_USER
+    );
     ssh_with_key(
         address,
         key_path,
-        &sudo_wrap("mkdir -p /var/lib/fluxbee/runtimes"),
+        &sudo_wrap(&prepare_runtime_root),
         BOOTSTRAP_SSH_USER,
     )?;
-
-    let sudo_pass = BOOTSTRAP_SSH_PASS.replace('\'', "'\"'\"'");
-    let remote_rsync = format!("bash -lc \"echo '{sudo_pass}' | sudo -S -p '' rsync\"");
 
     let mut cmd = Command::new("rsync");
     cmd.arg("-rz")
@@ -1483,7 +1484,6 @@ fn sync_runtime_to_worker(
         .arg("--no-perms")
         .arg("--no-owner")
         .arg("--no-group")
-        .arg(format!("--rsync-path={remote_rsync}"))
         .arg("-e")
         .arg(format!(
             "ssh -i {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10",
