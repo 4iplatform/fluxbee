@@ -1466,10 +1466,15 @@ fn sync_runtime_to_worker(
         return Ok(());
     }
 
+    let remote_stage = format!("/tmp/fluxbee-runtimes-sync-{hive_id}");
+    let prepare_stage = format!(
+        "rm -rf '{stage}' && mkdir -p '{stage}'",
+        stage = remote_stage
+    );
     ssh_with_key(
         address,
         key_path,
-        &sudo_wrap("mkdir -p /var/lib/fluxbee/runtimes"),
+        &prepare_stage,
         BOOTSTRAP_SSH_USER,
     )?;
 
@@ -1487,10 +1492,21 @@ fn sync_runtime_to_worker(
         ))
         .arg(format!("{}/", local_root.display()))
         .arg(format!(
-            "{}@{}:/var/lib/fluxbee/runtimes/",
-            BOOTSTRAP_SSH_USER, address
+            "{}@{}:{}/",
+            BOOTSTRAP_SSH_USER, address, remote_stage
         ));
-    run_cmd(cmd, &format!("rsync runtime ({hive_id})"))
+    run_cmd(cmd, &format!("rsync runtime stage ({hive_id})"))?;
+
+    let promote_cmd = format!(
+        "mkdir -p /var/lib/fluxbee/runtimes && rsync -a --delete '{stage}/' /var/lib/fluxbee/runtimes/ && rm -rf '{stage}'",
+        stage = remote_stage
+    );
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&promote_cmd),
+        BOOTSTRAP_SSH_USER,
+    )
 }
 
 fn target_hive_from_payload(payload: &serde_json::Value, local_hive: &str) -> String {
