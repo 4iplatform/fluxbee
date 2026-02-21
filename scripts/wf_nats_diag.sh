@@ -49,6 +49,37 @@ require_cmd() {
   fi
 }
 
+parse_nats_host_port() {
+  local endpoint="$1"
+  local raw="${endpoint#nats://}"
+  local host="${raw%%:*}"
+  local port="${raw##*:}"
+  if [[ "$raw" == "$host" ]]; then
+    port="4222"
+  fi
+  echo "${host}:${port}"
+}
+
+check_nats_preflight() {
+  local endpoint="$1"
+  if [[ "${SKIP_NATS_PREFLIGHT:-0}" == "1" ]]; then
+    return 0
+  fi
+  if ! command -v nc >/dev/null 2>&1; then
+    echo "WARN: nc not available, skipping NATS endpoint preflight" >&2
+    return 0
+  fi
+  local host_port
+  host_port="$(parse_nats_host_port "$endpoint")"
+  local host="${host_port%%:*}"
+  local port="${host_port##*:}"
+  if ! nc -z "$host" "$port" >/dev/null 2>&1; then
+    echo "FAIL: NATS endpoint is not reachable before diag start: ${endpoint}" >&2
+    echo "Hint: verify rt-gateway/NATS is up, or set SKIP_NATS_PREFLIGHT=1 to force run." >&2
+    exit 1
+  fi
+}
+
 print_timing_stats() {
   local file="$1"
   local marker="$2"
@@ -135,6 +166,8 @@ if [[ "$BUILD_BIN" == "1" || ! -x "$BIN_PATH" ]]; then
   echo "Building wf_nats_diag..."
   (cd "$ROOT_DIR" && cargo build --release --bin wf_nats_diag)
 fi
+
+check_nats_preflight "$NATS_URL"
 
 tmpdir="$(mktemp -d)"
 server_log="$tmpdir/wf_nats_diag_server.log"
