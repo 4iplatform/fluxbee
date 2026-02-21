@@ -213,7 +213,7 @@ async fn main() -> Result<(), DiagError> {
         "runtime": runtime,
         "version": version,
         "unit": unit,
-        "hive": target_hive,
+        "target": target_hive,
     });
     let spawn_trace = send_system_message(&sender, &target, "SPAWN_NODE", spawn_payload).await?;
     let spawn_response =
@@ -240,8 +240,8 @@ async fn main() -> Result<(), DiagError> {
 
     if send_kill {
         let kill_payload = json!({
-            "name": unit,
-            "hive": target_hive,
+            "unit": unit,
+            "target": target_hive,
         });
         let kill_trace = send_system_message(&sender, &target, "KILL_NODE", kill_payload).await?;
         let kill_response =

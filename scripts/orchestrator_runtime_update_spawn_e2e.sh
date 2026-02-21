@@ -69,6 +69,7 @@ fi
 
 echo "Running orchestrator runtime-update + spawn/kill E2E..."
 TARGET_HIVE="${TARGET_HIVE}" \
+ORCH_TARGET_HIVE="${TARGET_HIVE}" \
 ORCH_RUNTIME="${ORCH_RUNTIME}" \
 ORCH_VERSION="${ORCH_VERSION}" \
 ORCH_TIMEOUT_SECS="${ORCH_TIMEOUT_SECS}" \
