@@ -1,7 +1,9 @@
 use std::error::Error;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use jsr_client::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use jsr_client::protocol::{
+    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+};
 use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
 use serde::Deserialize;
 use serde_json::json;
@@ -57,7 +59,7 @@ async fn send_system_message(
     let message = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
-            dst: Destination::Unicast(target.to_string()),
+            dst: Destination::Resolve,
             ttl: 16,
             trace_id: trace_id.clone(),
         },
@@ -92,7 +94,54 @@ async fn wait_system_response(
             )
             .into());
         }
-        let message = timeout(remaining, receiver.recv()).await??;
+        let message = match timeout(remaining, receiver.recv()).await {
+            Ok(message) => message?,
+            Err(_) => {
+                return Err(
+                    format!("timeout waiting {} for trace_id={}", expected_msg, trace_id).into(),
+                );
+            }
+        };
+        if message.meta.msg_type == SYSTEM_KIND
+            && message.routing.trace_id == trace_id
+            && message.meta.msg.as_deref() == Some(MSG_UNREACHABLE)
+        {
+            let reason = message
+                .payload
+                .get("reason")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let original_dst = message
+                .payload
+                .get("original_dst")
+                .and_then(|value| value.as_str())
+                .unwrap_or("-");
+            return Err(format!(
+                "router returned UNREACHABLE while waiting {} trace_id={} reason={} original_dst={}",
+                expected_msg, trace_id, reason, original_dst
+            )
+            .into());
+        }
+        if message.meta.msg_type == SYSTEM_KIND
+            && message.routing.trace_id == trace_id
+            && message.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED)
+        {
+            let original_dst = message
+                .payload
+                .get("original_dst")
+                .and_then(|value| value.as_str())
+                .unwrap_or("-");
+            let last_hop = message
+                .payload
+                .get("last_hop")
+                .and_then(|value| value.as_str())
+                .unwrap_or("-");
+            return Err(format!(
+                "router returned TTL_EXCEEDED while waiting {} trace_id={} original_dst={} last_hop={}",
+                expected_msg, trace_id, original_dst, last_hop
+            )
+            .into());
+        }
         if message.meta.msg_type == SYSTEM_KIND
             && message.meta.msg.as_deref() == Some(expected_msg)
             && message.routing.trace_id == trace_id
