@@ -3581,9 +3581,33 @@ async fn apply_opa_snapshot(
     } else {
         Some(snapshot.header.entrypoint.clone())
     };
+    let data_bundle_path = opa_data_bundle_path();
+    let data_bundle = match load_opa_data_bundle(&data_bundle_path) {
+        Ok(Some(bundle)) => {
+            tracing::info!(
+                path = %data_bundle_path.display(),
+                bytes = bundle.len(),
+                "opa data bundle loaded from disk"
+            );
+            Some(bundle)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                path = %data_bundle_path.display(),
+                "opa data bundle read failed: {err}; using embedded policy data"
+            );
+            None
+        }
+    };
     let result = {
         let mut opa_guard = opa.lock().await;
-        opa_guard.reload(snapshot.header.policy_version, entrypoint, &snapshot.wasm)
+        opa_guard.reload(
+            snapshot.header.policy_version,
+            entrypoint,
+            &snapshot.wasm,
+            data_bundle.as_deref(),
+        )
     };
     let (version, status) = {
         let opa_guard = opa.lock().await;
@@ -3603,6 +3627,27 @@ async fn apply_opa_snapshot(
                 "opa reload failed: {err}"
             );
         }
+    }
+}
+
+fn opa_data_bundle_path() -> PathBuf {
+    crate::paths::storage_root_dir()
+        .join("opa")
+        .join("current")
+        .join("data.json")
+}
+
+fn load_opa_data_bundle(path: &Path) -> Result<Option<String>, io::Error> {
+    match fs::read_to_string(path) {
+        Ok(content) => {
+            if content.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(content))
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
     }
 }
 

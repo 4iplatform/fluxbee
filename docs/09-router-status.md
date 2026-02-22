@@ -57,7 +57,10 @@ Objetivo: revisar punto por punto y marcar pendientes.
 ### 6.3 Pendientes OPA
 - [x] Builtins OPA completos
 - [x] Resolver entrypoint (usa `entrypoints` + `opa_eval_ctx_set_entrypoint` si existe)
-- [ ] Carga de `data` bundle (si policy usa data)
+- [x] Carga de `data` bundle (si policy usa data)
+  - Router carga opcionalmente `data.json` desde `/var/lib/fluxbee/opa/current/data.json`.
+  - Si el archivo no existe, usa `data` embebido en WASM (comportamiento anterior).
+  - Si `data.json` existe pero es inválido, el reload falla en forma explícita (`OPA_ERROR`).
 - [x] Validación de `hash` en `OPA_RELOAD`
 
 ## 7. Casos especiales
@@ -76,4 +79,5 @@ Objetivo: revisar punto por punto y marcar pendientes.
 
 - SY.opa.rules es **control plane** (Go), no router. Compila Rego → WASM y escribe en SHM.
 - Routers (Rust) leen WASM de `/dev/shm/jsr-opa-<hive>` y ejecutan con Wasmtime.
+- Router usa `data bundle` externo opcional (`/var/lib/fluxbee/opa/current/data.json`) para poblar `opa_eval_ctx_set_data`.
 - Si la policy usa builtins no implementados → `OPA_ERROR`.

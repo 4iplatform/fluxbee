@@ -217,7 +217,11 @@ Esto indica falla técnica de parseo en el resolver OPA, no un `deny` explícito
   - Recomendación operación productiva: fijar `ORCH_SYSTEM_ALLOWED_ORIGINS=SY.admin` (dejar `WF.orch.diag` sólo para pruebas controladas).
 
 ### D. Pendiente estructural ya existente
-- [ ] Completar carga de `data` bundle en router cuando policy lo requiera (marcado pendiente en `docs/09-router-status.md`).
+- [x] Completar carga de `data` bundle en router cuando policy lo requiera (marcado en `docs/09-router-status.md`).
+  - Router intenta leer `data bundle` en `/var/lib/fluxbee/opa/current/data.json` en cada `OPA_RELOAD`.
+  - Si existe y no está vacío, lo aplica vía `opa_eval_ctx_set_data`; si no existe, mantiene fallback a `data` embebido en WASM.
+  - Si el archivo no se puede leer, se reporta en log y no bloquea reload (fallback embebido).
+  - Si el JSON del bundle es inválido, el reload falla explícitamente (`OPA_ERROR`) para evitar policy/data inconsistente.
 
 ## Comandos de validación (Checklist C)
 

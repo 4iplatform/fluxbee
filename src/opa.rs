@@ -61,6 +61,7 @@ struct OpaWasm {
     opa_value_dump: Option<TypedFunc<i32, i32>>,
     opa_json_dump: Option<TypedFunc<i32, i32>>,
     data_addr: Option<i32>,
+    external_data_addr: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -118,6 +119,7 @@ impl OpaResolver {
         version: u64,
         entrypoint: Option<String>,
         wasm_bytes: &[u8],
+        data_bundle_json: Option<&str>,
     ) -> Result<(), OpaError> {
         let prev_module = self.module.take();
         let prev_wasm = self.wasm.take();
@@ -131,7 +133,7 @@ impl OpaResolver {
                 return Err(OpaError::NotLoaded);
             }
             let module = Module::from_binary(&self.engine, wasm_bytes)?;
-            let wasm = OpaWasm::instantiate(&self.engine, &module)?;
+            let wasm = OpaWasm::instantiate(&self.engine, &module, data_bundle_json)?;
             self.module = Some(module);
             self.wasm = Some(wasm);
             self.policy_loaded = true;
@@ -166,7 +168,7 @@ impl OpaResolver {
         let input_val = wasm.json_parse(&input_str)?;
         let ctx = wasm.opa_eval_ctx_new.call(&mut wasm.store, ())?;
 
-        if let Some(data_addr) = wasm.data_addr {
+        if let Some(data_addr) = wasm.external_data_addr.or(wasm.data_addr) {
             if let Some(set_data) = &wasm.opa_eval_ctx_set_data {
                 set_data.call(&mut wasm.store, (ctx, data_addr))?;
             }
@@ -212,7 +214,11 @@ const OPA_STATUS_ERROR: u8 = 1;
 const OPA_STATUS_LOADING: u8 = 2;
 
 impl OpaWasm {
-    fn instantiate(engine: &Engine, module: &Module) -> Result<Self, OpaError> {
+    fn instantiate(
+        engine: &Engine,
+        module: &Module,
+        data_bundle_json: Option<&str>,
+    ) -> Result<Self, OpaError> {
         let mut store = Store::new(engine, OpaRuntimeState::default());
         let mut linker = Linker::new(engine);
         let mut imported_memory: Option<Memory> = None;
@@ -433,7 +439,7 @@ impl OpaWasm {
             .get_global(&mut store, "data")
             .and_then(|g| g.get(&mut store).i32());
 
-        Ok(Self {
+        let mut out = Self {
             store,
             instance,
             memory,
@@ -449,7 +455,19 @@ impl OpaWasm {
             opa_value_dump,
             opa_json_dump,
             data_addr,
-        })
+            external_data_addr: None,
+        };
+
+        if let Some(bundle) = data_bundle_json.map(str::trim).filter(|bundle| !bundle.is_empty()) {
+            if out.opa_eval_ctx_set_data.is_none() {
+                return Err(OpaError::MissingExport("opa_eval_ctx_set_data"));
+            }
+            let addr = out.json_parse(bundle)?;
+            out.external_data_addr = Some(addr);
+            tracing::info!(bytes = bundle.len(), "opa external data bundle loaded");
+        }
+
+        Ok(out)
     }
 
     fn json_parse(&mut self, value: &str) -> Result<i32, OpaError> {
@@ -463,6 +481,9 @@ impl OpaWasm {
         let addr = self
             .opa_json_parse
             .call(&mut self.store, (ptr, value.len() as i32))?;
+        if addr == 0 {
+            return Err(OpaError::Eval("opa_json_parse returned null".to_string()));
+        }
         Ok(addr)
     }
 
