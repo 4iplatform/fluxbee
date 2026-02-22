@@ -106,6 +106,7 @@ struct OrchestratorState {
     wan_listen: Option<String>,
     wan_authorized_hives: Vec<String>,
     tracked_nodes: Mutex<HashSet<String>>,
+    system_allowed_origins: HashSet<String>,
     runtime_manifest: Mutex<Option<RuntimeManifest>>,
     last_runtime_verify: Mutex<Instant>,
     nats_endpoint: String,
@@ -155,6 +156,8 @@ async fn main() -> Result<(), OrchestratorError> {
     let nats_endpoint = nats_endpoint_from_hive(&hive);
     let storage_path = load_storage_path(&config_dir);
     let runtime_manifest = load_runtime_manifest();
+    let system_allowed_origins = load_system_allowed_origins(&hive.hive_id);
+    tracing::info!(allowed = ?system_allowed_origins, "system message origin allowlist loaded");
     let state = OrchestratorState {
         hive_id: hive.hive_id.clone(),
         started_at: Instant::now(),
@@ -165,6 +168,7 @@ async fn main() -> Result<(), OrchestratorError> {
         wan_listen,
         wan_authorized_hives,
         tracked_nodes: Mutex::new(HashSet::new()),
+        system_allowed_origins,
         runtime_manifest: Mutex::new(runtime_manifest),
         last_runtime_verify: Mutex::new(Instant::now()),
         nats_endpoint,
@@ -738,6 +742,42 @@ async fn handle_system_message(
     msg: &Message,
     state: &OrchestratorState,
 ) -> Result<(), OrchestratorError> {
+    let action = msg.meta.msg.as_deref().unwrap_or_default();
+    if matches!(action, "RUNTIME_UPDATE" | "SPAWN_NODE" | "KILL_NODE") {
+        let source_name = resolve_system_source_name_with_retry(state, &msg.routing.src).await;
+        let is_allowed = source_name
+            .as_deref()
+            .is_some_and(|name| state.system_allowed_origins.contains(name));
+        if !is_allowed {
+            tracing::warn!(
+                action = action,
+                source_uuid = %msg.routing.src,
+                source_name = ?source_name,
+                allowed = ?state.system_allowed_origins,
+                "blocked system message from unauthorized origin"
+            );
+            let payload = serde_json::json!({
+                "status": "error",
+                "error_code": "FORBIDDEN",
+                "message": "system action origin not allowed",
+                "source_uuid": msg.routing.src,
+                "source_name": source_name,
+            });
+            match action {
+                "SPAWN_NODE" => {
+                    let _ =
+                        send_system_action_response(sender, msg, "SPAWN_NODE_RESPONSE", payload).await;
+                }
+                "KILL_NODE" => {
+                    let _ =
+                        send_system_action_response(sender, msg, "KILL_NODE_RESPONSE", payload).await;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+    }
+
     match msg.meta.msg.as_deref() {
         Some("RUNTIME_UPDATE") => {
             let manifest = parse_runtime_manifest(&msg.payload)?;
@@ -762,6 +802,56 @@ async fn handle_system_message(
         _ => {}
     }
     Ok(())
+}
+
+fn load_system_allowed_origins(hive_id: &str) -> HashSet<String> {
+    let raw =
+        std::env::var("ORCH_SYSTEM_ALLOWED_ORIGINS").unwrap_or_else(|_| "SY.admin,WF.orch.diag".to_string());
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            if item.contains('@') {
+                item.to_string()
+            } else {
+                format!("{item}@{hive_id}")
+            }
+        })
+        .collect()
+}
+
+async fn resolve_system_source_name_with_retry(
+    state: &OrchestratorState,
+    source_uuid: &str,
+) -> Option<String> {
+    let uuid = Uuid::parse_str(source_uuid).ok()?;
+    let start = Instant::now();
+    loop {
+        if let Ok(snapshot) = load_router_snapshot(state) {
+            if let Some(name) = source_name_from_snapshot(&snapshot, uuid) {
+                return Some(name);
+            }
+        }
+        if start.elapsed() >= Duration::from_millis(500) {
+            return None;
+        }
+        time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn source_name_from_snapshot(snapshot: &ShmSnapshot, source_uuid: Uuid) -> Option<String> {
+    for entry in &snapshot.nodes {
+        if entry.name_len == 0 {
+            continue;
+        }
+        let Ok(entry_uuid) = Uuid::from_slice(&entry.uuid) else {
+            continue;
+        };
+        if entry_uuid == source_uuid {
+            return Some(node_name(entry));
+        }
+    }
+    None
 }
 
 async fn send_system_action_response(

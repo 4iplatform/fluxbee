@@ -215,16 +215,25 @@ async fn main() -> Result<(), DiagError> {
     let unit = env_or("ORCH_UNIT", &format!("fluxbee-orch-e2e-{}", now_epoch_ms()));
     let route_mode = RouteMode::from_env(&env_or("ORCH_ROUTE_MODE", "unicast"))?;
     let expected_spawn_unreachable_reason = env_non_empty("ORCH_EXPECT_SPAWN_UNREACHABLE_REASON");
+    let expected_spawn_error_code = env_non_empty("ORCH_EXPECT_SPAWN_ERROR_CODE");
+    let diag_node_name = env_or("ORCH_DIAG_NODE_NAME", "WF.orch.diag");
     let target = format!("SY.orchestrator@{}", local_hive);
+    if expected_spawn_unreachable_reason.is_some() && expected_spawn_error_code.is_some() {
+        return Err(
+            "ORCH_EXPECT_SPAWN_UNREACHABLE_REASON and ORCH_EXPECT_SPAWN_ERROR_CODE are mutually exclusive"
+                .into(),
+        );
+    }
 
     let node_config = NodeConfig {
-        name: "WF.orch.diag".to_string(),
+        name: diag_node_name.clone(),
         router_socket: socket_dir,
         uuid_persistence_dir: state_dir.join("nodes"),
         config_dir,
         version: "1.0".to_string(),
     };
     let (sender, mut receiver) = connect(&node_config).await?;
+    tracing::info!(diag_node = %diag_node_name, target = %target, route_mode = ?route_mode, "orchestrator diag started");
 
     if send_runtime_update {
         let runtime_update_payload = json!({
@@ -349,6 +358,49 @@ async fn main() -> Result<(), DiagError> {
         payload = %spawn_response.payload,
         "received SPAWN_NODE_RESPONSE"
     );
+
+    if let Some(expected_code) = expected_spawn_error_code.as_deref() {
+        let actual_code = spawn_response
+            .payload
+            .get("error_code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if spawn_status == "ok" {
+            return Err(format!(
+                "expected SPAWN_NODE error_code={} but got status=ok payload={}",
+                expected_code, spawn_response.payload
+            )
+            .into());
+        }
+        if actual_code == expected_code {
+            tracing::info!(
+                trace_id = %spawn_trace,
+                expected_error_code = %expected_code,
+                "received expected SPAWN_NODE error code"
+            );
+            println!(
+                "{}",
+                json!({
+                    "status": "ok",
+                    "target": target,
+                    "target_hive": target_hive,
+                    "runtime": runtime,
+                    "version": version,
+                    "unit": unit,
+                    "kill_sent": false,
+                    "route_mode": format!("{route_mode:?}").to_ascii_lowercase(),
+                    "expected_spawn_error_code": expected_code,
+                    "received_spawn_error_code": actual_code,
+                })
+            );
+            return Ok(());
+        }
+        return Err(format!(
+            "expected SPAWN_NODE error_code={} but got error_code={} payload={}",
+            expected_code, actual_code, spawn_response.payload
+        )
+        .into());
+    }
 
     if spawn_status != "ok" {
         return Err(format!("SPAWN_NODE failed: {}", spawn_response.payload).into());

@@ -77,6 +77,8 @@ Alcance:
 - `ORCH_UNIT`
 - `ORCH_ROUTE_MODE=unicast|resolve`
 - `ORCH_EXPECT_SPAWN_UNREACHABLE_REASON`
+- `ORCH_EXPECT_SPAWN_ERROR_CODE` (mutuamente excluyente con `ORCH_EXPECT_SPAWN_UNREACHABLE_REASON`)
+- `ORCH_DIAG_NODE_NAME` (default: `WF.orch.diag`; útil para simular origen no autorizado)
 - `JSR_LOG_LEVEL`
 - `BUILD_BIN`
 
@@ -163,9 +165,20 @@ bash scripts/orchestrator_runtime_update_spawn_e2e.sh
 Orchestrator diag negativo (espera `UNREACHABLE`):
 ```bash
 TARGET_HIVE="worker-220" ORCH_ROUTE_MODE="resolve" ORCH_SEND_RUNTIME_UPDATE=0 ORCH_SEND_KILL=0 \
-ORCH_EXPECT_SPAWN_UNREACHABLE_REASON="OPA_ERROR" BUILD_BIN=0 \
+ORCH_EXPECT_SPAWN_UNREACHABLE_REASON="OPA_NO_TARGET" BUILD_BIN=0 \
 bash scripts/orchestrator_runtime_update_spawn_e2e.sh
 ```
+
+Orchestrator diag (simular origen no autorizado en hardening de `SY.orchestrator`):
+```bash
+TARGET_HIVE="worker-220" ORCH_ROUTE_MODE="unicast" ORCH_DIAG_NODE_NAME="WF.unauthorized" \
+ORCH_SEND_RUNTIME_UPDATE=0 ORCH_SEND_KILL=0 ORCH_EXPECT_SPAWN_ERROR_CODE="FORBIDDEN" BUILD_BIN=0 \
+bash scripts/orchestrator_runtime_update_spawn_e2e.sh
+```
+
+Nota:
+- en la policy actual de `sandbox` (observación 2026-02-22), `Resolve` para `SPAWN_NODE` devuelve `OPA_NO_TARGET`.
+- usar `OPA_ERROR` solo para validar fallas técnicas del resolver OPA.
 
 Pre-check standalone de OPA:
 ```bash

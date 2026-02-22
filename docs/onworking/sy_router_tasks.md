@@ -204,13 +204,17 @@ Esto indica falla técnica de parseo en el resolver OPA, no un `deny` explícito
   - [x] Regla operativa explícita: para control-plane de orchestrator usar `dst` por nombre L2 (`SY.orchestrator@<hive>`), no `dst=null`/`Resolve`.
 
 ### C. Cobertura operativa
-- [x] Incorporar caso negativo en E2E: `UNREACHABLE/OPA_ERROR` debe ser explícito y no timeout opaco.
+- [x] Incorporar caso negativo en E2E: `UNREACHABLE/<reason>` debe ser explícito y no timeout opaco.
   - `orch_system_diag` ahora soporta `ORCH_EXPECT_SPAWN_UNREACHABLE_REASON=<reason>` y falla explícitamente por mismatch (no timeout opaco).
 - [x] Incorporar caso positivo de `Destination::Resolve` para mensajes `system` de control plane permitidos por policy.
   - `orch_system_diag` ahora soporta `ORCH_ROUTE_MODE=resolve` y envía `routing.dst=Resolve` + `meta.target`.
 - [x] Agregar chequeo previo de salud OPA (status/version en SHM) antes de tests de resolve.
   - helper nuevo: `opa_shm_diag` (`/jsr-opa-<hive>`), integrado en `scripts/orchestrator_runtime_update_spawn_e2e.sh` cuando `ORCH_ROUTE_MODE=resolve`.
-- [ ] Hardening adicional de seguridad: validar origen permitido para `SPAWN_NODE`/`KILL_NODE` en `SY.orchestrator` (allowlist explícita), además de policy/router.
+- [x] Hardening adicional de seguridad: validar origen permitido para `SPAWN_NODE`/`KILL_NODE` en `SY.orchestrator` (allowlist explícita), además de policy/router.
+  - `sy_orchestrator` ahora valida origen por nombre L2 resolviendo `routing.src` (UUID) contra SHM del router.
+  - Allowlist configurable por `ORCH_SYSTEM_ALLOWED_ORIGINS` (default: `SY.admin,WF.orch.diag`, expandido a `@<hive>` si no viene sufijo).
+  - Si origen no permitido, responde `*_RESPONSE` con `status=error`, `error_code=FORBIDDEN` (sin timeout opaco).
+  - Recomendación operación productiva: fijar `ORCH_SYSTEM_ALLOWED_ORIGINS=SY.admin` (dejar `WF.orch.diag` sólo para pruebas controladas).
 
 ### D. Pendiente estructural ya existente
 - [ ] Completar carga de `data` bundle en router cuando policy lo requiera (marcado pendiente en `docs/09-router-status.md`).
@@ -233,21 +237,39 @@ TARGET_HIVE="worker-220" \
 ORCH_ROUTE_MODE="resolve" \
 ORCH_SEND_RUNTIME_UPDATE=0 \
 ORCH_SEND_KILL=0 \
-ORCH_EXPECT_SPAWN_UNREACHABLE_REASON="OPA_ERROR" \
+ORCH_EXPECT_SPAWN_UNREACHABLE_REASON="OPA_NO_TARGET" \
 BUILD_BIN=0 \
 bash scripts/orchestrator_runtime_update_spawn_e2e.sh
 ```
 
-## Notas de decisión (antes de implementar)
+Nota:
+- con la policy actual observada en `sandbox` (2026-02-22), el reason esperado es `OPA_NO_TARGET`.
+- `OPA_ERROR` queda para errores técnicos del resolver OPA (parseo/ejecución), no para ausencia de target en policy.
 
-- No tocar policy/OPA rules hasta cerrar decisión de contrato de `dst` y de origen permitido para `SPAWN_NODE/KILL_NODE`.
+Caso hardening de origen (esperando `FORBIDDEN` desde `SY.orchestrator`):
+
+```bash
+TARGET_HIVE="worker-220" \
+ORCH_ROUTE_MODE="unicast" \
+ORCH_DIAG_NODE_NAME="WF.unauthorized" \
+ORCH_SEND_RUNTIME_UPDATE=0 \
+ORCH_SEND_KILL=0 \
+ORCH_EXPECT_SPAWN_ERROR_CODE="FORBIDDEN" \
+BUILD_BIN=0 \
+bash scripts/orchestrator_runtime_update_spawn_e2e.sh
+```
+
+## Notas de decisión
+
+- No tocar policy/OPA rules fuera del contrato de `dst` y origen permitido para `SPAWN_NODE/KILL_NODE`.
 - Priorizar corrección de robustez del resolver (A) antes de ampliar permisos de policy.
 
-## Estado actual (2026-02-21)
+## Estado actual (2026-02-22)
 
 - El flujo de orchestrator para `RUNTIME_UPDATE` / `SPAWN_NODE` / `KILL_NODE` quedó estable con `dst` por nombre L2 (FIB directo, sin pasar por `Resolve`+OPA para control-plane).
 - El E2E con worker real cerró `status=ok` en `SPAWN_NODE_RESPONSE` y `KILL_NODE_RESPONSE`.
 - El bloqueo observado al final no fue OPA/router sino sync de runtimes con permisos remotos, resuelto en `sy_orchestrator` con staging en `/tmp` + promoción con `sudo`.
+- Hardening de origen en `sy_orchestrator` activo: acciones de sistema sólo se aceptan desde orígenes en allowlist.
 
 ## Criterio operativo acordado para mensajes `system` (orchestrator)
 
@@ -259,5 +281,5 @@ bash scripts/orchestrator_runtime_update_spawn_e2e.sh
   - destino: `routing.dst = "SY.orchestrator@<hive>"`.
 - No usar `routing.dst = null` (`Destination::Resolve`) para estos mensajes de control-plane en operación normal.
 - Nota de seguridad:
-  - hoy `SY.orchestrator` procesa por `meta.msg` sin validar explícitamente nombre de origen; el control de acceso depende de router/OPA.
-  - queda marcado hardening adicional para validar origen en `SY.orchestrator`.
+  - además del control en router/OPA, `SY.orchestrator` valida origen permitido para `RUNTIME_UPDATE`/`SPAWN_NODE`/`KILL_NODE`.
+  - default operativo: `SY.admin@<hive>` y `WF.orch.diag@<hive>` (ajustable con `ORCH_SYSTEM_ALLOWED_ORIGINS`).

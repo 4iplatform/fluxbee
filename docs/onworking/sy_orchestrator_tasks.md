@@ -22,6 +22,11 @@ Checklist operativo para cerrar SY.orchestrator segun:
   - [x] `RUNTIME_UPDATE`
   - [x] `SPAWN_NODE`
   - [x] `KILL_NODE`
+- [x] Hardening de origen para mensajes `system` sensibles:
+  - [x] Validación de origen permitido (`routing.src` UUID -> nombre L2 via SHM del router) para `RUNTIME_UPDATE`/`SPAWN_NODE`/`KILL_NODE`.
+  - [x] Allowlist configurable por `ORCH_SYSTEM_ALLOWED_ORIGINS` (default: `SY.admin,WF.orch.diag`, expandido a `@<hive>`).
+  - [x] Recomendación para producción: `ORCH_SYSTEM_ALLOWED_ORIGINS=SY.admin` (reservar `WF.orch.diag` para E2E).
+  - [x] Respuesta explícita `FORBIDDEN` para `SPAWN_NODE_RESPONSE`/`KILL_NODE_RESPONSE` cuando origen no autorizado.
 - [x] Respuesta formal a mensajes `SPAWN_NODE`/`KILL_NODE` (`*_RESPONSE`).
 - [x] Persistencia de runtime manifest local:
   - [x] `/var/lib/fluxbee/orchestrator/runtime-manifest.json`
@@ -41,7 +46,7 @@ Checklist operativo para cerrar SY.orchestrator segun:
 - [x] Resolver inconsistencia OPA/router que bloqueaba E2E (`Destination::Resolve` + contrato `dst` + parseo OPA):
   - `dst` por nombre L2 documentado y soportado en router (FIB directo).
   - resolver OPA ajustado a `opa_json_dump` prioritario (fallback `opa_value_dump`).
-  - seguimiento de hardening restante en `docs/onworking/sy_router_tasks.md`.
+  - hardening de origen en `sy_orchestrator` implementado y documentado en `docs/onworking/sy_router_tasks.md`.
 - [x] Cierre completo de LSA router/WAN (estado, seguridad, secuencia y UUID remoto):
   - Verificado y cerrado en `docs/onworking/sy_router_tasks.md` (P0..P3 completos).
 
