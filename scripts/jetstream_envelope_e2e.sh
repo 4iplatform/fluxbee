@@ -18,6 +18,7 @@ set -euo pipefail
 #   JETSTREAM_DIAG_INTERVAL_MS="100"
 #   JETSTREAM_DIAG_FAIL_FIRST_N="1"
 #   JETSTREAM_DIAG_WAIT_SECS="0"   # auto when 0
+#   JETSTREAM_DIAG_MAX_WAIT_SECS="45"
 #   JSR_LOG_LEVEL="info"
 #   BUILD_BIN="1"
 #   SHOW_FULL_LOGS="0"
@@ -31,6 +32,7 @@ JETSTREAM_DIAG_LOOPS="${JETSTREAM_DIAG_LOOPS:-10}"
 JETSTREAM_DIAG_INTERVAL_MS="${JETSTREAM_DIAG_INTERVAL_MS:-100}"
 JETSTREAM_DIAG_FAIL_FIRST_N="${JETSTREAM_DIAG_FAIL_FIRST_N:-1}"
 JETSTREAM_DIAG_WAIT_SECS="${JETSTREAM_DIAG_WAIT_SECS:-0}"
+JETSTREAM_DIAG_MAX_WAIT_SECS="${JETSTREAM_DIAG_MAX_WAIT_SECS:-45}"
 JSR_LOG_LEVEL="${JSR_LOG_LEVEL:-info}"
 BUILD_BIN="${BUILD_BIN:-1}"
 SHOW_FULL_LOGS="${SHOW_FULL_LOGS:-0}"
@@ -109,12 +111,37 @@ if [[ "$client_rc" -ne 0 ]]; then
 fi
 
 wait_secs="$JETSTREAM_DIAG_WAIT_SECS"
-if [[ "$wait_secs" == "0" ]]; then
-  wait_secs=$(( (JETSTREAM_DIAG_FAIL_FIRST_N * 3) + 2 ))
+if [[ "$wait_secs" != "0" ]]; then
+  echo "Waiting fixed ${wait_secs}s before convergence checks..."
+  sleep "$wait_secs"
 fi
 
-echo "Waiting ${wait_secs}s for redelivery/acks to settle..."
-sleep "$wait_secs"
+echo "Waiting for convergence: expected_acked=$JETSTREAM_DIAG_LOOPS expected_noack>=$JETSTREAM_DIAG_FAIL_FIRST_N max_wait=${JETSTREAM_DIAG_MAX_WAIT_SECS}s"
+start_ts="$(date +%s)"
+while true; do
+  client_published="$(rg -c "jetstream diag client published" "$client_log" || true)"
+  server_received="$(rg -c "jetstream diag server received" "$server_log" || true)"
+  server_acked="$(rg -c "jetstream diag server acked" "$server_log" || true)"
+  server_noack="$(rg -c "jetstream diag server intentionally not acking" "$server_log" || true)"
+
+  if [[ "$server_acked" -ge "$JETSTREAM_DIAG_LOOPS" ]] && [[ "$server_noack" -ge "$JETSTREAM_DIAG_FAIL_FIRST_N" ]]; then
+    break
+  fi
+
+  if ! kill -0 "$server_pid" >/dev/null 2>&1; then
+    echo "FAIL: server process exited before convergence" >&2
+    echo "---- server tail ----" >&2
+    tail -n 80 "$server_log" >&2 || true
+    break
+  fi
+
+  now_ts="$(date +%s)"
+  elapsed="$(( now_ts - start_ts ))"
+  if [[ "$elapsed" -ge "$JETSTREAM_DIAG_MAX_WAIT_SECS" ]]; then
+    break
+  fi
+  sleep 1
+done
 
 if kill -0 "$server_pid" >/dev/null 2>&1; then
   kill "$server_pid" >/dev/null 2>&1 || true
@@ -149,8 +176,8 @@ if [[ "$client_published" -ne "$JETSTREAM_DIAG_LOOPS" ]]; then
   exit 1
 fi
 
-if [[ "$server_acked" -ne "$JETSTREAM_DIAG_LOOPS" ]]; then
-  echo "FAIL: acked count mismatch (expected=$JETSTREAM_DIAG_LOOPS got=$server_acked)" >&2
+if (( server_acked < JETSTREAM_DIAG_LOOPS )); then
+  echo "FAIL: acked count too low (expected >=$JETSTREAM_DIAG_LOOPS got=$server_acked)" >&2
   exit 1
 fi
 

@@ -75,59 +75,77 @@ async fn run_server(
 
     let subscriber = NatsSubscriber::new(endpoint, subject, sid).with_queue(queue);
     let received = Arc::new(AtomicU64::new(0));
-
-    subscriber
-        .run({
-            let received = Arc::clone(&received);
-            move |payload| {
+    let mut reconnect_backoff = Duration::from_millis(100);
+    let reconnect_backoff_max = Duration::from_secs(2);
+    loop {
+        let result = subscriber
+            .run({
                 let received = Arc::clone(&received);
-                async move {
-                    let recv_idx = received.fetch_add(1, Ordering::Relaxed);
-                    let envelope: JetstreamEnvelope = serde_json::from_slice(&payload).map_err(|err| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("invalid envelope payload: {err}"),
-                        )
-                    })?;
-                    let trace = compact_trace(&envelope.trace_id);
-                    tracing::info!(
-                        mode = "server",
-                        seq = envelope.seq,
-                        recv_idx,
-                        trace = %trace,
-                        payload_bytes = payload.len(),
-                        "jetstream diag server received"
-                    );
-
-                    if recv_idx < fail_first_n {
-                        tracing::warn!(
+                move |payload| {
+                    let received = Arc::clone(&received);
+                    async move {
+                        let recv_idx = received.fetch_add(1, Ordering::Relaxed);
+                        let envelope: JetstreamEnvelope =
+                            serde_json::from_slice(&payload).map_err(|err| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("invalid envelope payload: {err}"),
+                                )
+                            })?;
+                        let trace = compact_trace(&envelope.trace_id);
+                        tracing::info!(
                             mode = "server",
                             seq = envelope.seq,
                             recv_idx,
                             trace = %trace,
-                            "jetstream diag server intentionally not acking"
+                            payload_bytes = payload.len(),
+                            "jetstream diag server received"
                         );
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "intentional no-ack for redelivery diagnostics",
-                        ));
+
+                        if recv_idx < fail_first_n {
+                            tracing::warn!(
+                                mode = "server",
+                                seq = envelope.seq,
+                                recv_idx,
+                                trace = %trace,
+                                "jetstream diag server intentionally not acking"
+                            );
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "intentional no-ack for redelivery diagnostics",
+                            ));
+                        }
+
+                        tracing::info!(
+                            mode = "server",
+                            seq = envelope.seq,
+                            recv_idx,
+                            trace = %trace,
+                            "jetstream diag server acked"
+                        );
+                        Ok(())
                     }
-
-                    tracing::info!(
-                        mode = "server",
-                        seq = envelope.seq,
-                        recv_idx,
-                        trace = %trace,
-                        "jetstream diag server acked"
-                    );
-                    Ok(())
                 }
-            }
-        })
-        .await
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+            })
+            .await;
 
-    Ok(())
+        match result {
+            Ok(()) => {
+                reconnect_backoff = Duration::from_millis(100);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    mode = "server",
+                    retry_in_ms = reconnect_backoff.as_millis() as u64,
+                    error = %err,
+                    "jetstream diag server subscriber disconnected; reconnecting"
+                );
+                tokio::time::sleep(reconnect_backoff).await;
+                reconnect_backoff =
+                    std::cmp::min(reconnect_backoff.saturating_mul(2), reconnect_backoff_max);
+            }
+        }
+    }
 }
 
 async fn run_client(
