@@ -262,6 +262,8 @@ if ! wait_for_convergence "$JETSTREAM_DIAG_LOOPS" "$JETSTREAM_DIAG_FAIL_FIRST_N"
   exit 1
 fi
 
+base_server_acked_before_replay="$(rg -c "jetstream diag server acked" "$server_log" || true)"
+
 expected_total_published="$JETSTREAM_DIAG_LOOPS"
 expected_total_acked="$JETSTREAM_DIAG_LOOPS"
 if [[ "$JETSTREAM_DIAG_CHECK_RESTART" == "1" ]] && (( JETSTREAM_DIAG_REPLAY_LOOPS > 0 )); then
@@ -292,35 +294,15 @@ server_acked="$(rg -c "jetstream diag server acked" "$server_log" || true)"
 server_noack="$(rg -c "jetstream diag server intentionally not acking" "$server_log" || true)"
 replay_seq_start="$JETSTREAM_DIAG_LOOPS"
 replay_seq_end="$((JETSTREAM_DIAG_LOOPS + JETSTREAM_DIAG_REPLAY_LOOPS - 1))"
-server_replay_acked="$(
-  awk \
-    -v min_seq="$replay_seq_start" \
-    -v max_seq="$replay_seq_end" \
-    '
-      /jetstream diag server acked/ {
-        # Portable extraction (works on awk variants without "+" regex support nuances).
-        n = split($0, parts, "seq=")
-        if (n >= 2) {
-          seq_raw = parts[2]
-          sub(/[^0-9].*$/, "", seq_raw)
-          if (seq_raw ~ /^[0-9][0-9]*$/) {
-            seq = seq_raw + 0
-            if (seq >= min_seq && seq <= max_seq) {
-              seen[seq] = 1
-            }
-          }
-        }
-      }
-      END {
-        count = 0
-        for (k in seen) {
-          count++
-        }
-        print count + 0
-      }
-    ' \
-    "$server_log"
-)"
+server_replay_acked=0
+if [[ "$JETSTREAM_DIAG_CHECK_RESTART" == "1" ]] && (( JETSTREAM_DIAG_REPLAY_LOOPS > 0 )); then
+  if [[ -z "${base_server_acked_before_replay:-}" ]]; then
+    base_server_acked_before_replay=0
+  fi
+  if (( server_acked > base_server_acked_before_replay )); then
+    server_replay_acked=$((server_acked - base_server_acked_before_replay))
+  fi
+fi
 
 echo "---- JetStream envelope compact timeline ----"
 {
