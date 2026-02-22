@@ -410,3 +410,83 @@ FULL_SUITE_INCLUDE_LIFECYCLE=0 \
 FULL_SUITE_INCLUDE_ADMIN=0 \
 bash scripts/nats_full_suite.sh
 ```
+
+## Bloque activo 2026-02-22 - JetStream E2E sin contrato final de payload
+
+Objetivo de este bloque:
+- avanzar JetStream E2E ahora, sin bloquear por el contrato final de `storage.events/items/reactivation`,
+- mantener separación clara:
+  - transporte/envelope = problema de infraestructura (router + NATS),
+  - payload = problema de cada nodo productor/consumidor.
+
+Base de spec usada:
+- `docs/02-protocolo.md` (sección 4): `payload` libre, no interpretado por router/OPA.
+- `docs/13-storage.md`: NATS/JetStream como buffer durable, con foco en entrega/ack/retry.
+- `docs/onworking/sy_storage_tasks.md`: contrato canónico actual todavía sujeto a cierre fino (Fase 3B).
+
+### Regla operativa del bloque
+
+- Para pruebas JetStream E2E de infraestructura:
+  - validar envelope, routing de subject, ack/retry/replay/reconnect.
+  - tratar `payload` como JSON opaco (sin semántica de negocio obligatoria).
+- Para pruebas de negocio:
+  - usar contrato estricto por subject (Fase 3B), fuera de este bloque.
+
+## Checklist detallado (orden estricto)
+
+### JSE2E-A - Transporte/envelope (arrancar aquí)
+
+- [x] A1. Definir matriz de aceptación "contract-light" (este documento).
+  - Criterios mínimos obligatorios:
+    - `publish -> consume -> ack` sin parseo de payload.
+    - redelivery cuando no hay ack.
+    - replay durable tras restart de broker/router.
+    - reconnect de subscriber sin pérdida de cursor durable.
+    - `UNREACHABLE/timeout` explícito cuando falta consumidor o ruta.
+
+- [ ] A2. Crear suite de diagnóstico JetStream "opaque payload" (nuevo script + binario).
+  - Propuesto:
+    - script: `scripts/jetstream_envelope_e2e.sh`
+    - binario: `src/bin/jetstream_envelope_diag.rs`
+  - Flujo:
+    - publicar JSON opaco con envelope mínimo (`schema_version`, `trace_id`, `payload:any`),
+    - verificar entrega y ack,
+    - forzar caso sin ack para redelivery,
+    - reiniciar router y verificar replay durable.
+  - Avance 2026-02-22:
+    - ya implementado: `scripts/jetstream_envelope_e2e.sh` + `src/bin/jetstream_envelope_diag.rs`
+      (cubre payload opaco + ack + redelivery por no-ack intencional).
+    - pendiente para cerrar A2: escenario explícito de replay durable post-restart de router en la misma suite.
+
+- [ ] A3. Agregar resumen compacto de métricas de transporte para la suite nueva.
+  - `sent`, `acked`, `redelivered`, `replayed_after_restart`, `timeouts`, `reconnects`,
+  - percentiles de latencia (`p50/p95/max`) cuando aplique.
+
+- [ ] A4. Integrar suite nueva en perfil `perf` de `scripts/nats_full_suite.sh` (toggle).
+  - variable propuesta: `FULL_SUITE_INCLUDE_JETSTREAM_ENVELOPE=1`.
+
+### JSE2E-B - Hook de contratos "agregables" (sin congelar contrato final)
+
+- [ ] B1. Introducir capa de parser por subject en `SY.storage` (adapter pattern).
+  - Estado actual: parser directo por `match subject`.
+  - Objetivo: parser registrable por subject, con modo estricto o flexible.
+
+- [ ] B2. Definir modo de compatibilidad para payload opaco en pruebas.
+  - opción propuesta: `STORAGE_CONTRACT_MODE=strict|compat`.
+  - `strict`: comportamiento actual.
+  - `compat`: no rompe pipeline de transporte por campos de negocio faltantes; registra motivo y clasifica.
+
+- [ ] B3. Persistir evidencia mínima en compat mode para trazabilidad.
+  - guardar `subject`, `trace_id` (si existe), hash payload, tamaño, timestamp, estado de parseo.
+  - no sustituye tablas finales de negocio; es diagnóstico de ingestión.
+
+### JSE2E-C - Cierre de contrato (cuando se congele modelo cognitivo)
+
+- [ ] C1. Fijar `schema_version` por subject y política de compatibilidad.
+- [ ] C2. Endurecer validaciones finales por subject (reemplaza compat mode para prod).
+- [ ] C3. Ajustar esquema/índices definitivos en PostgreSQL según contrato congelado.
+
+## Estado de inicio del bloque
+
+- Completado hoy: `A1` (matriz y orden de ejecución formalizados).
+- Siguiente paso inmediato: `A2` (suite JetStream envelope con payload opaco).
