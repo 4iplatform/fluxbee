@@ -78,6 +78,13 @@ fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_non_empty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 fn load_hive_id(config_dir: &std::path::Path) -> Result<String, DiagError> {
     let data = std::fs::read_to_string(config_dir.join("hive.yaml"))?;
     let hive: HiveFile = serde_yaml::from_str(&data)?;
@@ -207,8 +214,7 @@ async fn main() -> Result<(), DiagError> {
     let send_runtime_update = env_bool("ORCH_SEND_RUNTIME_UPDATE", true);
     let unit = env_or("ORCH_UNIT", &format!("fluxbee-orch-e2e-{}", now_epoch_ms()));
     let route_mode = RouteMode::from_env(&env_or("ORCH_ROUTE_MODE", "unicast"))?;
-    let expected_spawn_unreachable_reason =
-        std::env::var("ORCH_EXPECT_SPAWN_UNREACHABLE_REASON").ok();
+    let expected_spawn_unreachable_reason = env_non_empty("ORCH_EXPECT_SPAWN_UNREACHABLE_REASON");
     let target = format!("SY.orchestrator@{}", local_hive);
 
     let node_config = NodeConfig {

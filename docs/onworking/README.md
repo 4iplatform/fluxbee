@@ -17,3 +17,4 @@ Documentos transversales (no de un solo proceso):
 
 - `docs/onworking/CHANGELOG-v1.15-to-v1.16.md`
 - `docs/onworking/MIGRATION-v1.16-storage-first.md`
+- `docs/onworking/diagnostics_tasks.md`
