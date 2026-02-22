@@ -456,6 +456,9 @@ Base de spec usada:
   - Avance 2026-02-22:
     - ya implementado: `scripts/jetstream_envelope_e2e.sh` + `src/bin/jetstream_envelope_diag.rs`
       (cubre payload opaco + ack + redelivery por no-ack intencional).
+    - stack de prueba configurable:
+      - `JETSTREAM_DIAG_STACK=router_nats` (cliente/router NATS directo),
+      - `JETSTREAM_DIAG_STACK=jsr_client` (librería final de cliente NATS).
     - pendiente para cerrar A2: escenario explícito de replay durable post-restart de router en la misma suite.
 
 - [ ] A3. Agregar resumen compacto de métricas de transporte para la suite nueva.
