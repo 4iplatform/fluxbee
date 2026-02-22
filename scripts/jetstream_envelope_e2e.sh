@@ -290,10 +290,30 @@ client_published="$(rg -c "jetstream diag client published" "$client_log" || tru
 server_received="$(rg -c "jetstream diag server received" "$server_log" || true)"
 server_acked="$(rg -c "jetstream diag server acked" "$server_log" || true)"
 server_noack="$(rg -c "jetstream diag server intentionally not acking" "$server_log" || true)"
+replay_seq_start="$JETSTREAM_DIAG_LOOPS"
+replay_seq_end="$((JETSTREAM_DIAG_LOOPS + JETSTREAM_DIAG_REPLAY_LOOPS - 1))"
 server_replay_acked="$(
-  {
-    grep -F "jetstream diag server acked" "$server_log" | grep -F "trace=${JETSTREAM_DIAG_TRACE_PREFIX_REPLAY}.." || true
-  } | wc -l | tr -d '[:space:]'
+  awk \
+    -v min_seq="$replay_seq_start" \
+    -v max_seq="$replay_seq_end" \
+    '
+      /jetstream diag server acked/ {
+        if (match($0, /seq=[0-9]+/)) {
+          seq = substr($0, RSTART + 4, RLENGTH - 4) + 0
+          if (seq >= min_seq && seq <= max_seq) {
+            seen[seq] = 1
+          }
+        }
+      }
+      END {
+        count = 0
+        for (k in seen) {
+          count++
+        }
+        print count + 0
+      }
+    ' \
+    "$server_log"
 )"
 
 echo "---- JetStream envelope compact timeline ----"
@@ -308,6 +328,7 @@ echo "server_acked=${server_acked}"
 echo "server_intentional_noack=${server_noack}"
 if [[ "$JETSTREAM_DIAG_CHECK_RESTART" == "1" ]] && (( JETSTREAM_DIAG_REPLAY_LOOPS > 0 )); then
   echo "server_replayed_after_restart_acked=${server_replay_acked}"
+  echo "server_replay_seq_window=${replay_seq_start}-${replay_seq_end}"
 fi
 
 if [[ "$SHOW_FULL_LOGS" == "1" ]]; then
