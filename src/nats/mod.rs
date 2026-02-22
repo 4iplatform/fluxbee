@@ -27,6 +27,7 @@ const EMBEDDED_ACK_TIMEOUT_SECS: u64 = 2;
 const EMBEDDED_ACK_MAX_ATTEMPTS: u32 = 8;
 const EMBEDDED_REDELIVERY_TICK_MS: u64 = 250;
 const EMBEDDED_STATE_FLUSH_TICK_MS: u64 = 500;
+const PUBLISH_SYNC_TIMEOUT_SECS: u64 = 2;
 const DURABLE_QUEUE_PREFIX: &str = "durable.";
 const DURABLE_STREAM_MAX_MESSAGES: usize = 50_000;
 
@@ -1012,7 +1013,65 @@ pub async fn publish(endpoint: &str, subject: &str, payload: &[u8]) -> Result<()
         .await?;
     stream.write_all(payload).await?;
     stream.write_all(b"\r\n").await?;
+    stream.write_all(b"PING\r\n").await?;
     stream.flush().await?;
+
+    // Sync with broker before closing the socket to avoid publish-and-close drops.
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = String::new();
+        let n = timeout(
+            Duration::from_secs(PUBLISH_SYNC_TIMEOUT_SECS),
+            reader.read_line(&mut line),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("nats publish timeout waiting server sync on {subject}"),
+            )
+        })??;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "nats publish socket closed before sync",
+            ));
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() || line.starts_with("INFO ") || line.starts_with("+OK") {
+            continue;
+        }
+        if line == "PING" {
+            reader.get_mut().write_all(b"PONG\r\n").await?;
+            reader.get_mut().flush().await?;
+            continue;
+        }
+        if line == "PONG" {
+            break;
+        }
+        if line.starts_with("-ERR") {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("nats publish error: {line}"),
+            ));
+        }
+        if line.starts_with("MSG ") {
+            let msg = parse_msg_line(line)?;
+            let mut payload_buf = vec![0u8; msg.payload_len + 2];
+            timeout(
+                Duration::from_secs(PUBLISH_SYNC_TIMEOUT_SECS),
+                reader.read_exact(&mut payload_buf),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "nats publish timeout draining message during sync",
+                )
+            })??;
+            continue;
+        }
+    }
     Ok(())
 }
 
