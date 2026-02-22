@@ -390,6 +390,7 @@ Notas:
 - `scripts/nats_full_suite.sh` expone perfiles:
   - `FULL_SUITE_PROFILE=resilience` (default): mantiene checks con reinicios/ciclos.
   - `FULL_SUITE_PROFILE=perf`: desactiva caos forzado para usarlo como tester de infraestructura.
+  - en `perf`, por defecto habilita `FULL_SUITE_INCLUDE_JETSTREAM_ENVELOPE=1` (puede deshabilitarse en `0`).
 
 ### Perfil perf (tester de infraestructura)
 
@@ -468,8 +469,11 @@ Base de spec usada:
   - Centralizado en la sección de diagnósticos/stats para evitar duplicación entre suites.
   - Incluye contadores funcionales y de comunicación (`timeouts`, `reconnects`, redelivery/replay, latencia).
 
-- [ ] A4. Integrar suite nueva en perfil `perf` de `scripts/nats_full_suite.sh` (toggle).
-  - variable propuesta: `FULL_SUITE_INCLUDE_JETSTREAM_ENVELOPE=1`.
+- [x] A4. Integrar suite nueva en perfil `perf` de `scripts/nats_full_suite.sh` (toggle).
+  - variable: `FULL_SUITE_INCLUDE_JETSTREAM_ENVELOPE=0|1`.
+  - default aplicado:
+    - `perf`: `1` (ejecuta JetStream envelope E2E),
+    - `resilience`: `0` (se mantiene opt-in).
 
 ### JSE2E-B - Hook de contratos "agregables" (sin congelar contrato final)
 

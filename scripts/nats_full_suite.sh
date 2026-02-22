@@ -20,6 +20,7 @@ set -euo pipefail
 #   FULL_SUITE_PROFILE=resilience|perf
 #   FULL_SUITE_INCLUDE_LIFECYCLE=0|1
 #   FULL_SUITE_INCLUDE_ADMIN=0|1
+#   FULL_SUITE_INCLUDE_JETSTREAM_ENVELOPE=0|1
 
 BASE="${BASE:-http://127.0.0.1:8080}"
 HIVE_ID="${HIVE_ID:-worker-220}"
@@ -28,6 +29,7 @@ METRICS_TIMEOUT_SECS="${METRICS_TIMEOUT_SECS:-120}"
 FULL_SUITE_PROFILE="${FULL_SUITE_PROFILE:-resilience}"
 FULL_SUITE_INCLUDE_LIFECYCLE="${FULL_SUITE_INCLUDE_LIFECYCLE:-1}"
 FULL_SUITE_INCLUDE_ADMIN="${FULL_SUITE_INCLUDE_ADMIN:-1}"
+FULL_SUITE_INCLUDE_JETSTREAM_ENVELOPE="${FULL_SUITE_INCLUDE_JETSTREAM_ENVELOPE:-}"
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -60,6 +62,9 @@ esac
 
 if [[ "$FULL_SUITE_PROFILE" == "perf" ]]; then
   FULL_SUITE_SMOKE_CHECK_STOP_START=0
+  if [[ -z "$FULL_SUITE_INCLUDE_JETSTREAM_ENVELOPE" ]]; then
+    FULL_SUITE_INCLUDE_JETSTREAM_ENVELOPE=1
+  fi
   RUN_ROUTER_RESTART="${RUN_ROUTER_RESTART:-0}"
   RUN_ROUTER_STOP_START="${RUN_ROUTER_STOP_START:-0}"
   RUN_STORAGE_RESTART="${RUN_STORAGE_RESTART:-0}"
@@ -69,6 +74,9 @@ if [[ "$FULL_SUITE_PROFILE" == "perf" ]]; then
   RUN_STORAGE_METRICS_CHECK="${RUN_STORAGE_METRICS_CHECK:-1}"
   echo "Running NATS full suite (PERF profile) against BASE=$BASE HIVE_ID=$HIVE_ID"
 else
+  if [[ -z "$FULL_SUITE_INCLUDE_JETSTREAM_ENVELOPE" ]]; then
+    FULL_SUITE_INCLUDE_JETSTREAM_ENVELOPE=0
+  fi
   RUN_ROUTER_RESTART="${RUN_ROUTER_RESTART:-1}"
   RUN_ROUTER_STOP_START="${RUN_ROUTER_STOP_START:-1}"
   RUN_STORAGE_RESTART="${RUN_STORAGE_RESTART:-1}"
@@ -82,14 +90,14 @@ fi
 suite_started="$(date +%s)"
 
 if [[ "$FULL_SUITE_INCLUDE_LIFECYCLE" == "1" ]]; then
-  echo "==> [1/3] Embedded NATS lifecycle smoke"
+  echo "==> [1/4] Embedded NATS lifecycle smoke"
   run_timed_step "embedded lifecycle smoke" \
     env CHECK_STOP_START="$FULL_SUITE_SMOKE_CHECK_STOP_START" bash scripts/nats_embedded_lifecycle_smoke.sh
 else
-  echo "SKIP: [1/3] Embedded NATS lifecycle smoke disabled (FULL_SUITE_INCLUDE_LIFECYCLE=0)"
+  echo "SKIP: [1/4] Embedded NATS lifecycle smoke disabled (FULL_SUITE_INCLUDE_LIFECYCLE=0)"
 fi
 
-echo "==> [2/3] NATS transport E2E"
+echo "==> [2/4] NATS transport E2E"
 run_timed_step "nats transport E2E" \
   env BASE="$BASE" \
       METRICS_TIMEOUT_SECS="$METRICS_TIMEOUT_SECS" \
@@ -99,7 +107,7 @@ run_timed_step "nats transport E2E" \
       bash scripts/nats_client_transport_e2e.sh
 
 if [[ "$FULL_SUITE_INCLUDE_ADMIN" == "1" ]]; then
-  echo "==> [3/3] Admin nodes/routers/storage E2E"
+  echo "==> [3/4] Admin nodes/routers/storage E2E"
   run_timed_step "admin nodes/routers/storage E2E" \
     env BASE="$BASE" \
         HIVE_ID="$HIVE_ID" \
@@ -109,7 +117,16 @@ if [[ "$FULL_SUITE_INCLUDE_ADMIN" == "1" ]]; then
         RUN_STORAGE_METRICS_CHECK="$RUN_STORAGE_METRICS_CHECK" \
         bash scripts/admin_nodes_routers_storage_e2e.sh
 else
-  echo "SKIP: [3/3] Admin nodes/routers/storage E2E disabled (FULL_SUITE_INCLUDE_ADMIN=0)"
+  echo "SKIP: [3/4] Admin nodes/routers/storage E2E disabled (FULL_SUITE_INCLUDE_ADMIN=0)"
+fi
+
+if [[ "$FULL_SUITE_INCLUDE_JETSTREAM_ENVELOPE" == "1" ]]; then
+  echo "==> [4/4] JetStream envelope E2E"
+  run_timed_step "jetstream envelope E2E" \
+    env NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}" \
+        bash scripts/jetstream_envelope_e2e.sh
+else
+  echo "SKIP: [4/4] JetStream envelope E2E disabled (FULL_SUITE_INCLUDE_JETSTREAM_ENVELOPE=0)"
 fi
 
 suite_ended="$(date +%s)"
