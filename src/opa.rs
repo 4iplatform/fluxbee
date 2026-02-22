@@ -21,6 +21,11 @@ pub enum OpaError {
     Eval(String),
     #[error("opa result format invalid")]
     InvalidResult,
+    #[error("opa result parse failed using {dump_source}: {detail}")]
+    ResultParse {
+        dump_source: &'static str,
+        detail: String,
+    },
 }
 
 pub struct OpaResolver {
@@ -56,6 +61,21 @@ struct OpaWasm {
     opa_value_dump: Option<TypedFunc<i32, i32>>,
     opa_json_dump: Option<TypedFunc<i32, i32>>,
     data_addr: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OpaDumpSource {
+    JsonDump,
+    ValueDump,
+}
+
+impl OpaDumpSource {
+    fn as_export_name(self) -> &'static str {
+        match self {
+            Self::JsonDump => "opa_json_dump",
+            Self::ValueDump => "opa_value_dump",
+        }
+    }
 }
 
 impl OpaResolver {
@@ -174,8 +194,16 @@ impl OpaResolver {
         }
 
         let result_ptr = wasm.opa_eval_ctx_get_result.call(&mut wasm.store, ctx)?;
-        let json = wasm.dump_value(result_ptr)?;
-        parse_target_from_result(&json)
+        let (json, dump_source) = wasm.dump_value(result_ptr)?;
+        let target = parse_target_from_result(&json, dump_source);
+        if let Err(err) = &target {
+            tracing::warn!(
+                dump_source = dump_source.as_export_name(),
+                error = %err,
+                "opa resolver result parse failed"
+            );
+        }
+        target
     }
 }
 
@@ -438,15 +466,21 @@ impl OpaWasm {
         Ok(addr)
     }
 
-    fn dump_value(&mut self, value_addr: i32) -> Result<String, OpaError> {
+    fn dump_value(&mut self, value_addr: i32) -> Result<(String, OpaDumpSource), OpaError> {
         // Prefer JSON dump when available; value_dump may emit non-JSON formats.
         if let Some(dump) = &self.opa_json_dump {
             let ptr = dump.call(&mut self.store, value_addr)?;
-            return Ok(read_cstr_store(&self.memory, &mut self.store, ptr));
+            return Ok((
+                read_cstr_store(&self.memory, &mut self.store, ptr),
+                OpaDumpSource::JsonDump,
+            ));
         }
         if let Some(dump) = &self.opa_value_dump {
             let ptr = dump.call(&mut self.store, value_addr)?;
-            return Ok(read_cstr_store(&self.memory, &mut self.store, ptr));
+            return Ok((
+                read_cstr_store(&self.memory, &mut self.store, ptr),
+                OpaDumpSource::ValueDump,
+            ));
         }
         Err(OpaError::MissingExport("opa_value_dump/opa_json_dump"))
     }
@@ -470,8 +504,14 @@ fn read_cstr_store(memory: &Memory, store: &mut Store<OpaRuntimeState>, ptr: i32
     String::from_utf8_lossy(&data[ptr as usize..end]).to_string()
 }
 
-fn parse_target_from_result(json: &str) -> Result<Option<String>, OpaError> {
-    let value: Value = serde_json::from_str(json)?;
+fn parse_target_from_result(
+    json: &str,
+    dump_source: OpaDumpSource,
+) -> Result<Option<String>, OpaError> {
+    let value: Value = serde_json::from_str(json).map_err(|err| OpaError::ResultParse {
+        dump_source: dump_source.as_export_name(),
+        detail: err.to_string(),
+    })?;
     let target = extract_target(&value);
     Ok(target)
 }
@@ -1189,4 +1229,60 @@ fn json_to_opa_value(
         return Err(OpaError::Eval(err.to_string()));
     }
     Ok(parse.call(&mut *caller, (ptr, json.len() as i32))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_target_from_result, OpaDumpSource, OpaError};
+
+    #[test]
+    fn parse_target_from_result_extracts_top_level_target() {
+        let json = r#"{"result":{"target":"SY.orchestrator@sandbox"}}"#;
+        let target = parse_target_from_result(json, OpaDumpSource::JsonDump)
+            .expect("expected parse success");
+        assert_eq!(target.as_deref(), Some("SY.orchestrator@sandbox"));
+    }
+
+    #[test]
+    fn parse_target_from_result_extracts_nested_expression_value() {
+        let json = r#"{"result":[{"expressions":[{"value":{"target":"SY.admin@sandbox"}}]}]}"#;
+        let target = parse_target_from_result(json, OpaDumpSource::JsonDump)
+            .expect("expected parse success");
+        assert_eq!(target.as_deref(), Some("SY.admin@sandbox"));
+    }
+
+    #[test]
+    fn parse_target_from_result_returns_none_for_policy_no_target() {
+        let json = r#"{"result":[{"expressions":[{"value":{"allow":true}}]}]}"#;
+        let target = parse_target_from_result(json, OpaDumpSource::JsonDump)
+            .expect("expected parse success");
+        assert!(
+            target.is_none(),
+            "expected no target when policy does not emit it"
+        );
+    }
+
+    #[test]
+    fn parse_target_from_result_reports_non_json_for_json_dump() {
+        let err = parse_target_from_result("key=value", OpaDumpSource::JsonDump)
+            .expect_err("expected parse failure");
+        match err {
+            OpaError::ResultParse { dump_source, .. } => {
+                assert_eq!(dump_source, "opa_json_dump");
+            }
+            other => panic!("expected OpaError::ResultParse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_target_from_result_reports_non_json_for_value_dump() {
+        let err = parse_target_from_result("target=SY.storage@sandbox", OpaDumpSource::ValueDump)
+            .expect_err("expected parse failure");
+        match err {
+            OpaError::ResultParse { dump_source, .. } => {
+                assert_eq!(dump_source, "opa_value_dump");
+            }
+            other => panic!("expected OpaError::ResultParse, got {other:?}"),
+        }
+    }
 }

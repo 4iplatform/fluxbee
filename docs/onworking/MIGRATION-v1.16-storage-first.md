@@ -111,7 +111,7 @@ Entregar una base funcional y estable para desacoplar el router de persistencia:
 ## Actualizacion Iteracion 5 (prioridad storage + NATS)
 
 Se agrega plan operativo de prioridad en:
-- `docs/onworking/NATS-router-storage-priority.md`
+- `docs/onworking/nats_tasks.md`
 
 Resumen:
 - Baseline confirmado:

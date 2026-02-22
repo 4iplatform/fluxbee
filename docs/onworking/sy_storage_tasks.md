@@ -1,4 +1,4 @@
-# Storage Subjects - Contrato canonico (Fase 1)
+# SY.storage - Contrato canonico de subjects (Fase 1)
 
 Fecha: 2026-02-16
 

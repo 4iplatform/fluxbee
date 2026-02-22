@@ -1,5 +1,114 @@
-# SY.admin - Checklist E2E (curl)
+# SY.admin - Estado actual vs spec (v1.16+)
 
+Checklist operativo consolidado para `SY.admin`.
+
+## Cerrado (histórico consolidado)
+Lista de tareas cerradas para alinear `SY.admin` con la especificacion actual y con el modelo motherbee/worker.
+
+## Cerrado
+- [x] Endpoints REST de hives implementados:
+  - [x] `POST /hives`
+  - [x] `GET /hives`
+  - [x] `GET /hives/{id}`
+  - [x] `DELETE /hives/{id}`
+- [x] `GET /hive/status`.
+- [x] `GET/PUT /config/storage` con `CONFIG_CHANGED` (`subsystem=storage`).
+- [x] API de modulos: `/modules`, `/modules/{name}`, `/modules/{name}/{version}`.
+- [x] Correlacion request/response por `trace_id` para admin y OPA.
+- [x] OPA target broadcast/unicast alineado y timeout de OPA en 30s.
+
+## Pendiente critico (impacta pruebas)
+- [x] Corregir routing multi-hive de acciones de nodos/routers:
+  - `/hives/{hive}/nodes|routers` ahora enruta a orchestrator local (`SY.orchestrator@motherbee`).
+  - Se propaga `target` en payload para que orchestrator ejecute sobre hive remota.
+- [x] Corregir listado multi-hive de nodos/routers:
+  - `GET /hives/{hive}/nodes` y `GET /hives/{hive}/routers` ahora devuelven vista del hive target (no snapshot local de motherbee).
+- [x] Corregir contrato de payload para `kill_node`:
+  - HTTP mantiene `{"name": ...}` por compatibilidad.
+  - `SY.admin` normaliza a `node_name` antes de enviar a orchestrator.
+- [x] Corregir contrato de payload para `kill_router`:
+  - HTTP mantiene `{"name": ...}` por compatibilidad.
+  - `SY.admin` normaliza a `service` antes de enviar a orchestrator.
+
+## Pendiente alto (consistencia API)
+- [x] Definir y aplicar version monotona para `CONFIG_CHANGED` en routes/vpns/storage.
+  - `routes` y `vpns` comparten stream monotono (`routes-vpns`) para evitar conflictos en `SY.config.routes`.
+  - `storage` usa stream monotono separado.
+  - Persistencia local en `state/config_versions/*.txt` (sobre `json_router::paths::state_dir()`).
+  - Si se envia `version` manual <= actual, responde `409 VERSION_MISMATCH`.
+- [x] Unificar formato de respuesta HTTP y codigos:
+  - `SY.admin` ahora mapea `error_code -> HTTP status` (400/404/409/422/501/502/503/504).
+  - respuestas de admin/OPA incluyen envelope consistente con `status`, `action`, `payload`, `error_code`, `error_detail`.
+- [x] Eliminar coexistencia de rutas legacy para nodos/routers y dejar estrategia canónica:
+  - removidos handlers legacy `/nodes` y `/routers` en `SY.admin`.
+  - canónico único: `/hives/{id}/nodes` y `/hives/{id}/routers`.
+
+## Pendiente medio
+- [x] Revalidar contrato `add_hive` desde API con matriz de errores esperados de spec.
+  - mapeo HTTP en `SY.admin` ajustado para `SSH_*`, `INVALID_HIVE_ID`, `MISSING_WAN_LISTEN`, `COPY_FAILED`, `CONFIG_FAILED`.
+  - smoke E2E agregado: `scripts/admin_add_hive_matrix.sh`.
+  - checklist actualizado con cobertura manual de `WAN_TIMEOUT`.
+- [x] Agregar pruebas de integracion end-to-end para:
+  - [x] `/hives/{id}/nodes` (run/kill)
+  - [x] `/hives/{id}/routers` (run/kill)
+  - [x] `/config/storage` (broadcast + confirmacion)
+  - Script E2E agregado: `scripts/admin_nodes_routers_storage_e2e.sh`.
+
+## Seguimiento
+- [x] Registrar mapeo final de endpoints por ownership:
+  - `SY.config.routes`
+    - `GET/POST/DELETE /routes`
+    - `GET/POST/DELETE /vpns`
+    - `GET/POST/DELETE /hives/{hive}/routes`
+    - `GET/POST/DELETE /hives/{hive}/vpns`
+    - `PUT /config/routes` y `PUT /config/vpns` (ownership funcional de config, aplicado via `CONFIG_CHANGED`).
+  - `SY.orchestrator` (via orchestrator local en motherbee para operaciones multi-hive)
+    - `GET /hive/status`
+    - `GET/PUT /config/storage`
+    - `GET/POST /hives`
+    - `GET/DELETE /hives/{id}`
+    - `GET/POST/DELETE /hives/{hive}/nodes`
+    - `GET/POST/DELETE /hives/{hive}/routers`
+  - `SY.opa.rules`
+    - `POST /opa/policy`
+    - `POST /opa/policy/compile`
+    - `POST /opa/policy/apply`
+    - `POST /opa/policy/rollback`
+    - `POST /opa/policy/check`
+    - `GET /opa/policy`
+    - `GET /opa/status`
+    - `POST /hives/{hive}/opa/policy`
+    - `POST /hives/{hive}/opa/policy/compile`
+    - `POST /hives/{hive}/opa/policy/apply`
+    - `POST /hives/{hive}/opa/policy/rollback`
+    - `POST /hives/{hive}/opa/policy/check`
+    - `GET /hives/{hive}/opa/policy`
+    - `GET /hives/{hive}/opa/status`
+
+## Artefactos de validacion
+- [x] Checklist manual E2E con `curl` para API admin/orchestrator: `docs/onworking/sy_admin_tasks.md`.
+
+## Pendientes detectados en revisión spec vs código (2026-02-22)
+
+### P0 - Entrega/configuración confiable
+- [ ] Hacer que fallo de broadcast/config sea error observable en API (no solo warning en logs).
+  - Casos actuales a endurecer:
+    - cola de broadcast con `message dropped`
+    - `broadcast after admin action failed` sin degradar respuesta HTTP.
+
+### P1 - Cobertura real de fanout OPA
+- [ ] Resolver `expected_hives` con fuente de topología real (LSA/SHM) en lugar de depender solo de `authorized_hives`.
+- [ ] Diferenciar en respuesta OPA: `pending_hives` esperadas por topología vs autorizadas por política.
+
+### P1 - Homogeneidad de documentación
+- [ ] Alinear en docs el path canónico del contador de versión OPA con el path real usado por código.
+- [ ] Alinear ejemplo de mensaje interno admin/orchestrator (TTL/dst/meta) con implementación actual.
+
+### P2 - Hardening operativo (infra)
+- [ ] Definir perfil seguro por default para `admin.listen` en despliegues productivos (bind local o detrás de proxy).
+- [ ] Documentar política de exposición de API admin (red, proxy, ACL) para evitar despliegues abiertos por error.
+
+## Anexo - Checklist E2E (migrado)
 Checklist operativo corto para validar `SY.admin -> SY.orchestrator` via API.
 
 ## 0) Base URL

@@ -311,35 +311,36 @@ async fn wait_for_storage_db_ready(
         )
         .await
         {
-            Ok(body) => match serde_json::from_slice::<NatsResponseEnvelope<serde_json::Value>>(&body)
-            {
-                Ok(response) if response.status == "ok" => {
-                    tracing::info!(
-                        attempts = attempts,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "sy-storage DB readiness confirmed via storage.metrics.get"
-                    );
-                    return Ok(());
+            Ok(body) => {
+                match serde_json::from_slice::<NatsResponseEnvelope<serde_json::Value>>(&body) {
+                    Ok(response) if response.status == "ok" => {
+                        tracing::info!(
+                            attempts = attempts,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "sy-storage DB readiness confirmed via storage.metrics.get"
+                        );
+                        return Ok(());
+                    }
+                    Ok(response) => {
+                        tracing::warn!(
+                            attempts = attempts,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            status = %response.status,
+                            error_code = ?response.error_code,
+                            error_detail = ?response.error_detail,
+                            "sy-storage readiness probe returned non-ok status; retrying"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            attempts = attempts,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %err,
+                            "sy-storage readiness probe decode failed; retrying"
+                        );
+                    }
                 }
-                Ok(response) => {
-                    tracing::warn!(
-                        attempts = attempts,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        status = %response.status,
-                        error_code = ?response.error_code,
-                        error_detail = ?response.error_detail,
-                        "sy-storage readiness probe returned non-ok status; retrying"
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        attempts = attempts,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        error = %err,
-                        "sy-storage readiness probe decode failed; retrying"
-                    );
-                }
-            },
+            }
             Err(err) => {
                 tracing::warn!(
                     attempts = attempts,
@@ -1471,12 +1472,7 @@ fn sync_runtime_to_worker(
         "rm -rf '{stage}' && mkdir -p '{stage}'",
         stage = remote_stage
     );
-    ssh_with_key(
-        address,
-        key_path,
-        &prepare_stage,
-        BOOTSTRAP_SSH_USER,
-    )?;
+    ssh_with_key(address, key_path, &prepare_stage, BOOTSTRAP_SSH_USER)?;
 
     let mut cmd = Command::new("rsync");
     cmd.arg("-rz")

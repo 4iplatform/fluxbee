@@ -99,7 +99,8 @@ async fn run_server(endpoint: String, subject: String, sid: u32) -> Result<(), B
                     "echo_payload": payload,
                     "server_epoch_ms": now_epoch_ms(),
                 });
-                let response = NatsResponseEnvelope::ok(subject.clone(), trace_id.clone(), response_payload);
+                let response =
+                    NatsResponseEnvelope::ok(subject.clone(), trace_id.clone(), response_payload);
                 let body = serde_json::to_vec(&response)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
@@ -289,9 +290,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             )
             .await
         }
-        other => Err(format!(
-            "invalid WF_DIAG_MODE='{other}'. expected 'server' or 'client'"
-        )
-        .into()),
+        other => {
+            Err(format!("invalid WF_DIAG_MODE='{other}'. expected 'server' or 'client'").into())
+        }
     }
 }

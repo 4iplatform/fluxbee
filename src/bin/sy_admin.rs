@@ -1380,13 +1380,15 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
         request_bytes = request_body.len(),
         "storage metrics nats request send"
     );
-    let response_body = match ctx.nats_client.request_with_session_inbox(
-        SUBJECT_STORAGE_METRICS_GET,
-        &request_body,
-        &reply_subject,
-        Duration::from_secs(STORAGE_METRICS_NATS_TIMEOUT_SECS),
-    )
-    .await
+    let response_body = match ctx
+        .nats_client
+        .request_with_session_inbox(
+            SUBJECT_STORAGE_METRICS_GET,
+            &request_body,
+            &reply_subject,
+            Duration::from_secs(STORAGE_METRICS_NATS_TIMEOUT_SECS),
+        )
+        .await
     {
         Ok(body) => {
             let elapsed_ms = request_started.elapsed().as_millis() as u64;
@@ -1832,19 +1834,9 @@ fn build_admin_request(
         "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn" | "delete_vpn" => {
             "SY.config.routes"
         }
-        "list_nodes"
-        | "run_node"
-        | "kill_node"
-        | "list_routers"
-        | "run_router"
-        | "kill_router"
-        | "hive_status"
-        | "get_storage"
-        | "set_storage"
-        | "list_hives"
-        | "get_hive"
-        | "remove_hive"
-        | "add_hive" => "SY.orchestrator",
+        "list_nodes" | "run_node" | "kill_node" | "list_routers" | "run_router" | "kill_router"
+        | "hive_status" | "get_storage" | "set_storage" | "list_hives" | "get_hive"
+        | "remove_hive" | "add_hive" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
     let route_hive = if action_routes_via_local_orchestrator(action) {

@@ -10,12 +10,12 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
+use crate::client_config::ClientConfig;
 use crate::protocol::{
     build_hello, Message, NodeAnnouncePayload, NodeHelloPayload, MSG_ANNOUNCE, SYSTEM_KIND,
 };
 use crate::socket::connection::{read_frame, write_frame};
 use crate::split::{ConnectionInfo, ConnectionState, NodeReceiver, NodeSender};
-use crate::client_config::ClientConfig;
 
 #[derive(Debug, Clone)]
 pub struct NodeConfig {

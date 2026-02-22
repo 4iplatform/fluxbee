@@ -41,9 +41,9 @@ Checklist operativo para cerrar SY.orchestrator segun:
 - [x] Resolver inconsistencia OPA/router que bloqueaba E2E (`Destination::Resolve` + contrato `dst` + parseo OPA):
   - `dst` por nombre L2 documentado y soportado en router (FIB directo).
   - resolver OPA ajustado a `opa_json_dump` prioritario (fallback `opa_value_dump`).
-  - seguimiento de hardening restante en `docs/onworking/opa_router_followup.md`.
+  - seguimiento de hardening restante en `docs/onworking/sy_router_tasks.md`.
 - [x] Cierre completo de LSA router/WAN (estado, seguridad, secuencia y UUID remoto):
-  - Verificado y cerrado en `docs/onworking/router_lsa_full_review.md` (P0..P3 completos).
+  - Verificado y cerrado en `docs/onworking/sy_router_tasks.md` (P0..P3 completos).
 
 ## Notas de compatibilidad
 - API admin actual (`run_node`, `kill_node`, `run_router`, `kill_router`, `add_hive`) se mantiene compatible.

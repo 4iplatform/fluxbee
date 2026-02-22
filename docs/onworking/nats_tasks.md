@@ -1,4 +1,4 @@
-# NATS + Router + SY.storage - Plan de prioridad (2026-02-16)
+# NATS - Estado y plan de prioridad (router + SY.storage, 2026-02-16)
 
 Objetivo: priorizar una base estable para pruebas de `SY.storage`, sin perder el rumbo hacia la spec de NATS embebido en router.
 
@@ -71,7 +71,7 @@ Criterio de salida:
 - Se pueden reproducir tests de ingestion con fixtures validos e invalidos y resultado determinista.
 
 Avance de implementacion:
-- Contrato canonico documentado en `docs/onworking/storage_subject_contract.md`.
+- Contrato canonico documentado en `docs/onworking/sy_storage_tasks.md`.
 - Validacion endurecida aplicada en parser de `SY.storage` para events/items/reactivation y campos minimos de turns.
 
 ## Fase 2 - NATS embebido real en router

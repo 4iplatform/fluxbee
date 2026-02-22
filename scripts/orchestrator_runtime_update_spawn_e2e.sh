@@ -19,7 +19,12 @@ set -euo pipefail
 #   ORCH_VERSION="0.0.1"
 #   ORCH_TIMEOUT_SECS="45"
 #   ORCH_SEND_KILL="1"
+#   ORCH_SEND_RUNTIME_UPDATE="1"
 #   ORCH_UNIT="fluxbee-orch-e2e-<custom>"
+#   ORCH_ROUTE_MODE="unicast|resolve"
+#   ORCH_EXPECT_SPAWN_UNREACHABLE_REASON="OPA_ERROR"
+#   ORCH_REQUIRE_OPA_SHM_HEALTH="0|1"   # default: 1 for resolve, 0 for unicast
+#   OPA_MAX_HEARTBEAT_AGE_MS="30000"
 #   BUILD_BIN="1"
 
 TARGET_HIVE="${TARGET_HIVE:-worker-220}"
@@ -27,8 +32,21 @@ ORCH_RUNTIME="${ORCH_RUNTIME:-wf.orch.diag}"
 ORCH_VERSION="${ORCH_VERSION:-0.0.1}"
 ORCH_TIMEOUT_SECS="${ORCH_TIMEOUT_SECS:-45}"
 ORCH_SEND_KILL="${ORCH_SEND_KILL:-1}"
+ORCH_SEND_RUNTIME_UPDATE="${ORCH_SEND_RUNTIME_UPDATE:-1}"
 BUILD_BIN="${BUILD_BIN:-1}"
 ORCH_UNIT="${ORCH_UNIT:-fluxbee-orch-e2e-$(date +%s)}"
+ORCH_ROUTE_MODE="${ORCH_ROUTE_MODE:-unicast}"
+ORCH_EXPECT_SPAWN_UNREACHABLE_REASON="${ORCH_EXPECT_SPAWN_UNREACHABLE_REASON:-}"
+OPA_MAX_HEARTBEAT_AGE_MS="${OPA_MAX_HEARTBEAT_AGE_MS:-30000}"
+ORCH_REQUIRE_OPA_SHM_HEALTH="${ORCH_REQUIRE_OPA_SHM_HEALTH:-}"
+
+if [[ -z "${ORCH_REQUIRE_OPA_SHM_HEALTH}" ]]; then
+  if [[ "${ORCH_ROUTE_MODE}" == "resolve" ]]; then
+    ORCH_REQUIRE_OPA_SHM_HEALTH="1"
+  else
+    ORCH_REQUIRE_OPA_SHM_HEALTH="0"
+  fi
+fi
 
 RUNTIME_DIR="/var/lib/fluxbee/runtimes/${ORCH_RUNTIME}/${ORCH_VERSION}"
 START_SCRIPT="${RUNTIME_DIR}/bin/start.sh"
@@ -63,8 +81,16 @@ EOF
 ${SUDO} chmod +x "${START_SCRIPT}"
 
 if [[ "${BUILD_BIN}" == "1" ]]; then
-  echo "Building orch_system_diag..."
-  cargo build --release --bin orch_system_diag
+  echo "Building orch diagnostics binaries..."
+  cargo build --release --bin orch_system_diag --bin opa_shm_diag
+fi
+
+if [[ "${ORCH_REQUIRE_OPA_SHM_HEALTH}" == "1" ]]; then
+  echo "Pre-check: OPA SHM health (required for resolve mode)"
+  OPA_EXPECT_STATUS="${OPA_EXPECT_STATUS:-ok}" \
+  OPA_MIN_VERSION="${OPA_MIN_VERSION:-1}" \
+  OPA_MAX_HEARTBEAT_AGE_MS="${OPA_MAX_HEARTBEAT_AGE_MS}" \
+  ./target/release/opa_shm_diag
 fi
 
 echo "Running orchestrator runtime-update + spawn/kill E2E..."
@@ -74,7 +100,10 @@ ORCH_RUNTIME="${ORCH_RUNTIME}" \
 ORCH_VERSION="${ORCH_VERSION}" \
 ORCH_TIMEOUT_SECS="${ORCH_TIMEOUT_SECS}" \
 ORCH_SEND_KILL="${ORCH_SEND_KILL}" \
+ORCH_SEND_RUNTIME_UPDATE="${ORCH_SEND_RUNTIME_UPDATE}" \
 ORCH_UNIT="${ORCH_UNIT}" \
+ORCH_ROUTE_MODE="${ORCH_ROUTE_MODE}" \
+ORCH_EXPECT_SPAWN_UNREACHABLE_REASON="${ORCH_EXPECT_SPAWN_UNREACHABLE_REASON}" \
 ./target/release/orch_system_diag
 
 echo "orchestrator runtime update + spawn E2E passed."

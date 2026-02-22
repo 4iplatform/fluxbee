@@ -1,4 +1,11 @@
-# Router LSA/SLA Full Review (Motherbee/Worker)
+# SY.router - Estado actual vs spec (v1.16+)
+
+Documento consolidado de trabajo para router:
+- LSA/WAN/topología remota.
+- Resolver OPA y contrato de routing.
+
+## Bloque A - LSA/WAN (migrado)
+### Router LSA/SLA Full Review (Motherbee/Worker)
 
 Date: 2026-02-18  
 Scope: router WAN+LSA path, SHM `jsr-lsa-*`, and admin/orchestrator remote projections.
@@ -72,7 +79,7 @@ It is one symptom of a broader gap in the remote-topology model:
 - [x] Make `wait_for_wan` freshness-aware:
   - Require matching hive not stale and within `HEARTBEAT_STALE_MS` window.
 - [x] Keep current nil UUID behavior explicitly documented until protocol/model extension lands.
-  - Nota operativa agregada en `docs/onworking/sy_admin_e2e_curl_checklist.md` (sección routers).
+  - Nota operativa agregada en `docs/onworking/sy_admin_tasks.md` (sección routers).
 
 Acceptance:
 - `/hives/{id}/nodes` and `/hives/{id}/routers` reflect stale states correctly.
@@ -148,3 +155,109 @@ Operational integration script prepared:
 
 - Existing docs still reference older naming in some sections (`json-router` paths); keep this review focused on LSA behavior first.
 - If remote router UUID appears as `0000...` after P2, treat it as deployment/version drift between mother/worker (not expected steady-state behavior).
+
+## Bloque B - OPA/Resolve follow-up (migrado)
+### OPA/Router Follow-up (post NATS + orchestrator E2E)
+
+Date: 2026-02-21  
+Scope: resolver OPA en router (`Destination::Resolve`) + consistencia de contrato de protocolo.
+
+## Contexto del incidente
+
+En `orchestrator_runtime_update_spawn_e2e`:
+
+- Router recibe mensajes `system` con `dst=Resolve`.
+- Router responde `UNREACHABLE reason=OPA_ERROR`.
+- Log router: `opa resolve failed: json error: key must be a string at line 1 column 2`.
+
+Esto indica falla técnica de parseo en el resolver OPA, no un `deny` explícito de policy.
+
+## Hallazgos contra especificación
+
+1) Contrato `dst` del protocolo:
+- `docs/02-protocolo.md` define `routing.dst` como `UUID | "broadcast" | null`.
+- Ejemplos de la misma spec en sección 7.8 usan `dst: "SY.orchestrator@motherbee"` (nombre L2), lo cual contradice 2.1.
+
+2) Contrato OPA:
+- `docs/04-routing.md` define salida OPA como JSON con `target`.
+- Router ante error de resolver devuelve `OPA_ERROR` (esperado), pero la causa observada es parseo de formato, no decisión de policy.
+
+3) Implementación actual:
+- `src/opa.rs` prioriza `opa_json_dump` y deja `opa_value_dump` como fallback.
+- El parseo no-JSON ahora se reporta explícitamente como error de parseo de resultado OPA (no como `deny` de policy).
+
+## Checklist de cierre
+
+### A. Robustez técnica OPA resolver
+- [x] Revisar y definir orden de dumps en `src/opa.rs` (`opa_json_dump` preferido, fallback controlado).
+- [x] Agregar manejo explícito para parseo no JSON (error diferenciable vs policy deny).
+- [x] Agregar tests unitarios para `parse_target_from_result` y para flujo con dump no JSON.
+- [x] Agregar logs de diagnóstico mínimos en resolver (fuente de dump usada + causa resumida).
+
+### B. Consistencia contrato protocolo (docs + implementación)
+- [x] Unificar spec de `routing.dst` en `docs/02-protocolo.md`:
+  - [x] Se admite nombre L2 en `dst` y quedó documentado explícitamente.
+  - [x] Router alineado para resolver `dst` string por UUID o por nombre L2 (FIB directo, sin OPA).
+- [x] Revisar ejemplos operativos de mensajes `system` para evitar ambigüedad (`SY.admin` vs actores externos).
+  - [x] `docs/02-protocolo.md` (7.8) aclara origen operativo por mensaje.
+  - [x] `docs/07-operaciones.md` (4.9.6) usa ejemplo completo (`routing` + `meta.type` + `meta.msg`).
+  - [x] Regla operativa explícita: para control-plane de orchestrator usar `dst` por nombre L2 (`SY.orchestrator@<hive>`), no `dst=null`/`Resolve`.
+
+### C. Cobertura operativa
+- [x] Incorporar caso negativo en E2E: `UNREACHABLE/OPA_ERROR` debe ser explícito y no timeout opaco.
+  - `orch_system_diag` ahora soporta `ORCH_EXPECT_SPAWN_UNREACHABLE_REASON=<reason>` y falla explícitamente por mismatch (no timeout opaco).
+- [x] Incorporar caso positivo de `Destination::Resolve` para mensajes `system` de control plane permitidos por policy.
+  - `orch_system_diag` ahora soporta `ORCH_ROUTE_MODE=resolve` y envía `routing.dst=Resolve` + `meta.target`.
+- [x] Agregar chequeo previo de salud OPA (status/version en SHM) antes de tests de resolve.
+  - helper nuevo: `opa_shm_diag` (`/jsr-opa-<hive>`), integrado en `scripts/orchestrator_runtime_update_spawn_e2e.sh` cuando `ORCH_ROUTE_MODE=resolve`.
+- [ ] Hardening adicional de seguridad: validar origen permitido para `SPAWN_NODE`/`KILL_NODE` en `SY.orchestrator` (allowlist explícita), además de policy/router.
+
+### D. Pendiente estructural ya existente
+- [ ] Completar carga de `data` bundle en router cuando policy lo requiera (marcado pendiente en `docs/09-router-status.md`).
+
+## Comandos de validación (Checklist C)
+
+Caso positivo (`Destination::Resolve` + control-plane):
+
+```bash
+TARGET_HIVE="worker-220" \
+ORCH_ROUTE_MODE="resolve" \
+BUILD_BIN=0 \
+bash scripts/orchestrator_runtime_update_spawn_e2e.sh
+```
+
+Caso negativo (esperando `UNREACHABLE` explícito por reason):
+
+```bash
+TARGET_HIVE="worker-220" \
+ORCH_ROUTE_MODE="resolve" \
+ORCH_SEND_RUNTIME_UPDATE=0 \
+ORCH_SEND_KILL=0 \
+ORCH_EXPECT_SPAWN_UNREACHABLE_REASON="OPA_ERROR" \
+BUILD_BIN=0 \
+bash scripts/orchestrator_runtime_update_spawn_e2e.sh
+```
+
+## Notas de decisión (antes de implementar)
+
+- No tocar policy/OPA rules hasta cerrar decisión de contrato de `dst` y de origen permitido para `SPAWN_NODE/KILL_NODE`.
+- Priorizar corrección de robustez del resolver (A) antes de ampliar permisos de policy.
+
+## Estado actual (2026-02-21)
+
+- El flujo de orchestrator para `RUNTIME_UPDATE` / `SPAWN_NODE` / `KILL_NODE` quedó estable con `dst` por nombre L2 (FIB directo, sin pasar por `Resolve`+OPA para control-plane).
+- El E2E con worker real cerró `status=ok` en `SPAWN_NODE_RESPONSE` y `KILL_NODE_RESPONSE`.
+- El bloqueo observado al final no fue OPA/router sino sync de runtimes con permisos remotos, resuelto en `sy_orchestrator` con staging en `/tmp` + promoción con `sudo`.
+
+## Criterio operativo acordado para mensajes `system` (orchestrator)
+
+- `RUNTIME_UPDATE`:
+  - origen: actor de control-plane autorizado (p.ej. `SY.admin` o tooling de diagnóstico como `WF.orch.diag`).
+  - destino: `routing.dst = "SY.orchestrator@<hive>"`.
+- `SPAWN_NODE` y `KILL_NODE`:
+  - origen esperado: `SY.admin` (tooling de diagnóstico solo para E2E controlado).
+  - destino: `routing.dst = "SY.orchestrator@<hive>"`.
+- No usar `routing.dst = null` (`Destination::Resolve`) para estos mensajes de control-plane en operación normal.
+- Nota de seguridad:
+  - hoy `SY.orchestrator` procesa por `meta.msg` sin validar explícitamente nombre de origen; el control de acceso depende de router/OPA.
+  - queda marcado hardening adicional para validar origen en `SY.orchestrator`.

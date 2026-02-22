@@ -1377,13 +1377,28 @@ mod tests {
 
     #[test]
     fn subject_matching_supports_nats_wildcards() {
-        assert!(subject_matches_subscription("storage.metrics.get", "storage.metrics.get"));
-        assert!(subject_matches_subscription("_INBOX.JSR.a.*", "_INBOX.JSR.a.reply"));
-        assert!(!subject_matches_subscription("_INBOX.JSR.a.*", "_INBOX.JSR.a.x.y"));
-        assert!(subject_matches_subscription("storage.>", "storage.metrics.get"));
+        assert!(subject_matches_subscription(
+            "storage.metrics.get",
+            "storage.metrics.get"
+        ));
+        assert!(subject_matches_subscription(
+            "_INBOX.JSR.a.*",
+            "_INBOX.JSR.a.reply"
+        ));
+        assert!(!subject_matches_subscription(
+            "_INBOX.JSR.a.*",
+            "_INBOX.JSR.a.x.y"
+        ));
+        assert!(subject_matches_subscription(
+            "storage.>",
+            "storage.metrics.get"
+        ));
         assert!(subject_matches_subscription("storage.>", "storage"));
         assert!(subject_matches_subscription(">", "any.subject"));
-        assert!(!subject_matches_subscription("storage.events", "storage.items"));
+        assert!(!subject_matches_subscription(
+            "storage.events",
+            "storage.items"
+        ));
     }
 
     #[tokio::test]
@@ -1499,7 +1514,8 @@ mod tests {
             .expect("start embedded broker");
 
         let calls = Arc::new(AtomicU64::new(0));
-        let subscriber = NatsSubscriber::new(endpoint.clone(), "test.redelivery.*".to_string(), 177);
+        let subscriber =
+            NatsSubscriber::new(endpoint.clone(), "test.redelivery.*".to_string(), 177);
         let calls_for_task = Arc::clone(&calls);
         let subscriber_task = tokio::spawn(async move {
             let _ = subscriber

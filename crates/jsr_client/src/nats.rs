@@ -370,9 +370,8 @@ impl NatsClient {
             );
         }
 
-        Err(last_err.unwrap_or_else(|| {
-            NatsError::Protocol("nats client publish failed".to_string())
-        }))
+        Err(last_err
+            .unwrap_or_else(|| NatsError::Protocol("nats client publish failed".to_string())))
     }
 
     pub async fn request(
@@ -408,7 +407,10 @@ impl NatsClient {
                             break;
                         }
                         sleep(backoff).await;
-                        backoff = std::cmp::min(backoff.saturating_mul(2), self.options.reconnect_max_backoff);
+                        backoff = std::cmp::min(
+                            backoff.saturating_mul(2),
+                            self.options.reconnect_max_backoff,
+                        );
                         continue;
                     }
                 }
@@ -566,8 +568,10 @@ impl NatsClient {
                         break;
                     }
                     sleep(backoff).await;
-                    backoff =
-                        std::cmp::min(backoff.saturating_mul(2), self.options.reconnect_max_backoff);
+                    backoff = std::cmp::min(
+                        backoff.saturating_mul(2),
+                        self.options.reconnect_max_backoff,
+                    );
                 }
             }
         }
@@ -611,9 +615,7 @@ async fn sync_connection(
         let n = timeout(timeout_duration, conn.reader.read_line(&mut line))
             .await
             .map_err(|_| {
-                NatsError::Timeout(format!(
-                    "{context} timeout waiting server sync (PONG)"
-                ))
+                NatsError::Timeout(format!("{context} timeout waiting server sync (PONG)"))
             })??;
         if n == 0 {
             return Err(NatsError::Io(io::Error::new(
@@ -960,7 +962,9 @@ pub async fn publish(endpoint: &str, subject: &str, payload: &[u8]) -> Result<()
         let n = timeout(PUBLISH_SYNC_TIMEOUT, reader.read_line(&mut line))
             .await
             .map_err(|_| {
-                NatsError::Timeout(format!("publish timeout waiting server ack on subject {subject}"))
+                NatsError::Timeout(format!(
+                    "publish timeout waiting server ack on subject {subject}"
+                ))
             })??;
         if n == 0 {
             return Err(NatsError::Io(io::Error::new(
@@ -1077,8 +1081,7 @@ pub async fn request(
     let deadline = tokio::time::Instant::now() + timeout_duration;
     let sync_started = Instant::now();
     loop {
-        let remaining = deadline
-            .saturating_duration_since(tokio::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             tracing::warn!(
                 endpoint = %endpoint,
@@ -1247,8 +1250,7 @@ pub async fn request(
 
     let wait_response_started = Instant::now();
     loop {
-        let remaining = deadline
-            .saturating_duration_since(tokio::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             tracing::warn!(
                 endpoint = %endpoint,
@@ -1618,10 +1620,7 @@ pub fn resolve_local_nats_endpoint(config_dir: impl AsRef<Path>) -> Result<Strin
     let config_dir = config_dir.as_ref();
     let hive_path = config_dir.join("hive.yaml");
     let data = std::fs::read_to_string(&hive_path).map_err(|err| {
-        NatsError::Protocol(format!(
-            "failed reading {}: {err}",
-            hive_path.display()
-        ))
+        NatsError::Protocol(format!("failed reading {}: {err}", hive_path.display()))
     })?;
     let hive: LocalHiveFile = serde_yaml::from_str(&data)
         .map_err(|err| NatsError::Protocol(format!("invalid hive.yaml: {err}")))?;
@@ -1660,10 +1659,7 @@ fn endpoint_to_addr(endpoint: &str) -> Result<String, NatsError> {
 }
 
 fn default_local_endpoint(mode: Option<&str>, port: Option<u16>) -> String {
-    let mode = mode
-        .unwrap_or("embedded")
-        .trim()
-        .to_ascii_lowercase();
+    let mode = mode.unwrap_or("embedded").trim().to_ascii_lowercase();
     let port = port.unwrap_or(DEFAULT_LOCAL_NATS_PORT);
     if mode == "embedded" || mode == "client" {
         format!("nats://127.0.0.1:{port}")
@@ -1892,20 +1888,14 @@ nats:
             );
 
             line.clear();
-            reader
-                .read_line(&mut line)
-                .await
-                .expect("read SUB line");
+            reader.read_line(&mut line).await.expect("read SUB line");
             assert_eq!(
                 line.trim_end_matches(['\r', '\n']),
                 format!("SUB {response_subject_for_server} {sid}")
             );
 
             line.clear();
-            reader
-                .read_line(&mut line)
-                .await
-                .expect("read PING line");
+            reader.read_line(&mut line).await.expect("read PING line");
             assert_eq!(line.trim_end_matches(['\r', '\n']), "PING");
 
             reader
@@ -1916,10 +1906,7 @@ nats:
             reader.get_mut().flush().await.expect("flush PONG");
 
             line.clear();
-            reader
-                .read_line(&mut line)
-                .await
-                .expect("read PUB line");
+            reader.read_line(&mut line).await.expect("read PUB line");
             assert_eq!(
                 line.trim_end_matches(['\r', '\n']),
                 format!(
@@ -1960,8 +1947,8 @@ nats:
                 .expect("write MSG terminator");
             reader.get_mut().flush().await.expect("flush MSG response");
 
-            let second_accept = tokio::time::timeout(Duration::from_millis(200), listener.accept())
-                .await;
+            let second_accept =
+                tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
             assert!(
                 second_accept.is_err(),
                 "unexpected second connection from request path"
@@ -1988,7 +1975,10 @@ nats:
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test nats listener");
-        let endpoint = format!("nats://{}", listener.local_addr().expect("listener local addr"));
+        let endpoint = format!(
+            "nats://{}",
+            listener.local_addr().expect("listener local addr")
+        );
         let subject = "storage.metrics.get";
         let payload = br#"{"trace_id":"reconnect"}"#.to_vec();
         let payload_for_server = payload.clone();
@@ -2003,7 +1993,10 @@ nats:
                 .read_line(&mut line)
                 .await
                 .expect("read first CONNECT");
-            assert!(line.starts_with("CONNECT "), "expected CONNECT in first connection");
+            assert!(
+                line.starts_with("CONNECT "),
+                "expected CONNECT in first connection"
+            );
             line.clear();
 
             first_reader
@@ -2048,7 +2041,10 @@ nats:
                 .read_line(&mut line)
                 .await
                 .expect("read second CONNECT");
-            assert!(line.starts_with("CONNECT "), "expected CONNECT in second connection");
+            assert!(
+                line.starts_with("CONNECT "),
+                "expected CONNECT in second connection"
+            );
             line.clear();
 
             second_reader
@@ -2109,7 +2105,10 @@ nats:
             .expect("persistent client publish should recover after reconnect");
         let metrics = client.metrics_snapshot();
         assert_eq!(metrics.reconnects, 1, "expected exactly one reconnect");
-        assert_eq!(metrics.in_flight, 0, "publish should not leave in-flight requests");
+        assert_eq!(
+            metrics.in_flight, 0,
+            "publish should not leave in-flight requests"
+        );
         server_task.await.expect("server task should finish");
     }
 
@@ -2118,7 +2117,10 @@ nats:
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test nats listener");
-        let endpoint = format!("nats://{}", listener.local_addr().expect("listener local addr"));
+        let endpoint = format!(
+            "nats://{}",
+            listener.local_addr().expect("listener local addr")
+        );
         let request_subject = "storage.metrics.get";
         let response_subject = "storage.metrics.reply.timeout";
         let sid = 4242;
@@ -2136,21 +2138,25 @@ nats:
             assert!(line.starts_with("CONNECT "), "expected CONNECT");
             line.clear();
 
-            reader.read_line(&mut line).await.expect("read handshake PING");
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read handshake PING");
             assert_eq!(line.trim_end_matches(['\r', '\n']), "PING");
             reader
                 .get_mut()
                 .write_all(b"PONG\r\n")
                 .await
                 .expect("write handshake PONG");
-            reader.get_mut().flush().await.expect("flush handshake PONG");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush handshake PONG");
             line.clear();
 
             reader.read_line(&mut line).await.expect("read UNSUB");
-            assert_eq!(
-                line.trim_end_matches(['\r', '\n']),
-                format!("UNSUB {sid}")
-            );
+            assert_eq!(line.trim_end_matches(['\r', '\n']), format!("UNSUB {sid}"));
             line.clear();
 
             reader.read_line(&mut line).await.expect("read SUB");
@@ -2210,7 +2216,10 @@ nats:
         );
         let metrics = client.metrics_snapshot();
         assert_eq!(metrics.timeouts, 1, "expected timeout counter increment");
-        assert_eq!(metrics.in_flight, 0, "in-flight must be released after timeout");
+        assert_eq!(
+            metrics.in_flight, 0,
+            "in-flight must be released after timeout"
+        );
         let last_error = metrics.last_error.unwrap_or_default();
         assert!(
             last_error.contains("timeout"),
@@ -2225,7 +2234,10 @@ nats:
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test nats listener");
-        let endpoint = format!("nats://{}", listener.local_addr().expect("listener local addr"));
+        let endpoint = format!(
+            "nats://{}",
+            listener.local_addr().expect("listener local addr")
+        );
         let request_subject = "storage.metrics.get";
         let response_subscription = "storage.metrics.reply.*";
         let response_subject_1 = "storage.metrics.reply.req-1";
@@ -2249,7 +2261,10 @@ nats:
             assert!(line.starts_with("CONNECT "), "expected CONNECT");
             line.clear();
 
-            reader.read_line(&mut line).await.expect("read initial PING");
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read initial PING");
             assert_eq!(line.trim_end_matches(['\r', '\n']), "PING");
             reader
                 .get_mut()
@@ -2260,7 +2275,10 @@ nats:
             line.clear();
 
             // First request installs wildcard subscription once.
-            reader.read_line(&mut line).await.expect("read SUB wildcard");
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read SUB wildcard");
             assert_eq!(
                 line.trim_end_matches(['\r', '\n']),
                 format!("SUB {response_subscription} {sid}")
@@ -2287,7 +2305,10 @@ nats:
             reader.read_line(&mut line).await.expect("read first PUB");
             assert_eq!(
                 line.trim_end_matches(['\r', '\n']),
-                format!("PUB {request_subject} {}", request_payload_1_for_server.len())
+                format!(
+                    "PUB {request_subject} {}",
+                    request_payload_1_for_server.len()
+                )
             );
             let mut payload_1 = vec![0u8; request_payload_1_for_server.len() + 2];
             reader
@@ -2305,7 +2326,7 @@ nats:
                         "MSG {response_subject_1} {sid} {}\r\n",
                         response_payload_1_for_server.len()
                     )
-                        .as_bytes(),
+                    .as_bytes(),
                 )
                 .await
                 .expect("write first MSG header");
@@ -2325,7 +2346,10 @@ nats:
             reader.read_line(&mut line).await.expect("read second PUB");
             assert_eq!(
                 line.trim_end_matches(['\r', '\n']),
-                format!("PUB {request_subject} {}", request_payload_2_for_server.len())
+                format!(
+                    "PUB {request_subject} {}",
+                    request_payload_2_for_server.len()
+                )
             );
             let mut payload_2 = vec![0u8; request_payload_2_for_server.len() + 2];
             reader
@@ -2343,7 +2367,7 @@ nats:
                         "MSG {response_subject_2} {sid} {}\r\n",
                         response_payload_2_for_server.len()
                     )
-                        .as_bytes(),
+                    .as_bytes(),
                 )
                 .await
                 .expect("write second MSG header");
@@ -2395,7 +2419,10 @@ nats:
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test nats listener");
-        let endpoint = format!("nats://{}", listener.local_addr().expect("listener local addr"));
+        let endpoint = format!(
+            "nats://{}",
+            listener.local_addr().expect("listener local addr")
+        );
         let subject = "storage.metrics.get".to_string();
         let sid = 222;
         let payload = br#"{"probe":"ok"}"#.to_vec();
@@ -2406,17 +2433,17 @@ nats:
 
         let server_task = tokio::spawn(async move {
             // First connection: handshake then immediate drop.
-            let (first_socket, _) = listener
-                .accept()
-                .await
-                .expect("first connection accepted");
+            let (first_socket, _) = listener.accept().await.expect("first connection accepted");
             let mut first_reader = BufReader::new(first_socket);
             let mut line = String::new();
             first_reader
                 .read_line(&mut line)
                 .await
                 .expect("read first CONNECT");
-            assert!(line.starts_with("CONNECT "), "expected CONNECT in first connection");
+            assert!(
+                line.starts_with("CONNECT "),
+                "expected CONNECT in first connection"
+            );
             line.clear();
             first_reader
                 .read_line(&mut line)
@@ -2445,17 +2472,17 @@ nats:
             drop(first_reader);
 
             // Second connection: handshake + deliver a message.
-            let (second_socket, _) = listener
-                .accept()
-                .await
-                .expect("second connection accepted");
+            let (second_socket, _) = listener.accept().await.expect("second connection accepted");
             let mut second_reader = BufReader::new(second_socket);
             let mut line = String::new();
             second_reader
                 .read_line(&mut line)
                 .await
                 .expect("read second CONNECT");
-            assert!(line.starts_with("CONNECT "), "expected CONNECT in second connection");
+            assert!(
+                line.starts_with("CONNECT "),
+                "expected CONNECT in second connection"
+            );
             line.clear();
             second_reader
                 .read_line(&mut line)
@@ -2485,8 +2512,11 @@ nats:
             second_reader
                 .get_mut()
                 .write_all(
-                    format!("MSG {subject_for_server} {sid} {}\r\n", payload_for_server.len())
-                        .as_bytes(),
+                    format!(
+                        "MSG {subject_for_server} {sid} {}\r\n",
+                        payload_for_server.len()
+                    )
+                    .as_bytes(),
                 )
                 .await
                 .expect("write MSG header");
@@ -2500,11 +2530,7 @@ nats:
                 .write_all(b"\r\n")
                 .await
                 .expect("write MSG terminator");
-            second_reader
-                .get_mut()
-                .flush()
-                .await
-                .expect("flush MSG");
+            second_reader.get_mut().flush().await.expect("flush MSG");
         });
 
         let subscriber = NatsSubscriber::new(endpoint, subject, sid);
@@ -2563,7 +2589,10 @@ nats:
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test nats listener");
-        let endpoint = format!("nats://{}", listener.local_addr().expect("listener local addr"));
+        let endpoint = format!(
+            "nats://{}",
+            listener.local_addr().expect("listener local addr")
+        );
         let request_subject = "storage.metrics.get";
         let request_payload_1 = br#"{"trace_id":"t1"}"#.to_vec();
         let request_payload_2 = br#"{"trace_id":"t2"}"#.to_vec();
@@ -2589,7 +2618,10 @@ nats:
             assert!(line.starts_with("CONNECT "), "expected CONNECT");
             line.clear();
 
-            reader.read_line(&mut line).await.expect("read initial PING");
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read initial PING");
             assert_eq!(line.trim_end_matches(['\r', '\n']), "PING");
             reader
                 .get_mut()
@@ -2599,17 +2631,28 @@ nats:
             reader.get_mut().flush().await.expect("flush initial PONG");
             line.clear();
 
-            reader.read_line(&mut line).await.expect("read SUB wildcard");
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read SUB wildcard");
             let sub_line = line.trim_end_matches(['\r', '\n']).to_string();
             let parts: Vec<&str> = sub_line.split_whitespace().collect();
-            assert_eq!(parts.len(), 3, "expected SUB <subject> <sid>, got {sub_line}");
+            assert_eq!(
+                parts.len(),
+                3,
+                "expected SUB <subject> <sid>, got {sub_line}"
+            );
             assert_eq!(parts[0], "SUB");
             assert!(
                 parts[1].starts_with("_INBOX.JSR."),
                 "expected inbox wildcard subject, got {}",
                 parts[1]
             );
-            assert!(parts[1].ends_with(".*"), "expected wildcard suffix, got {}", parts[1]);
+            assert!(
+                parts[1].ends_with(".*"),
+                "expected wildcard suffix, got {}",
+                parts[1]
+            );
             let sid = parts[2];
             line.clear();
 
@@ -2633,7 +2676,10 @@ nats:
             reader.read_line(&mut line).await.expect("read first PUB");
             assert_eq!(
                 line.trim_end_matches(['\r', '\n']),
-                format!("PUB {request_subject} {}", request_payload_1_for_server.len())
+                format!(
+                    "PUB {request_subject} {}",
+                    request_payload_1_for_server.len()
+                )
             );
             let mut payload_1 = vec![0u8; request_payload_1_for_server.len() + 2];
             reader
@@ -2651,7 +2697,7 @@ nats:
                         "MSG {response_subject_1_for_server} {sid} {}\r\n",
                         response_payload_1_for_server.len()
                     )
-                        .as_bytes(),
+                    .as_bytes(),
                 )
                 .await
                 .expect("write first MSG header");
@@ -2671,7 +2717,10 @@ nats:
             reader.read_line(&mut line).await.expect("read second PUB");
             assert_eq!(
                 line.trim_end_matches(['\r', '\n']),
-                format!("PUB {request_subject} {}", request_payload_2_for_server.len())
+                format!(
+                    "PUB {request_subject} {}",
+                    request_payload_2_for_server.len()
+                )
             );
             let mut payload_2 = vec![0u8; request_payload_2_for_server.len() + 2];
             reader
@@ -2689,7 +2738,7 @@ nats:
                         "MSG {response_subject_2_for_server} {sid} {}\r\n",
                         response_payload_2_for_server.len()
                     )
-                        .as_bytes(),
+                    .as_bytes(),
                 )
                 .await
                 .expect("write second MSG header");

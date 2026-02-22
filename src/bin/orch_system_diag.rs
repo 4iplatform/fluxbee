@@ -13,6 +13,36 @@ use uuid::Uuid;
 
 type DiagError = Box<dyn Error + Send + Sync>;
 
+#[derive(Clone, Copy, Debug)]
+enum RouteMode {
+    Unicast,
+    Resolve,
+}
+
+impl RouteMode {
+    fn from_env(raw: &str) -> Result<Self, DiagError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "unicast" => Ok(Self::Unicast),
+            "resolve" => Ok(Self::Resolve),
+            other => {
+                Err(format!("invalid ORCH_ROUTE_MODE='{other}' (use: unicast|resolve)").into())
+            }
+        }
+    }
+}
+
+enum WaitOutcome {
+    Response(Message),
+    Unreachable {
+        reason: String,
+        original_dst: String,
+    },
+    TtlExceeded {
+        original_dst: String,
+        last_hop: String,
+    },
+}
+
 #[derive(Debug, Deserialize)]
 struct HiveFile {
     hive_id: String,
@@ -39,7 +69,12 @@ fn env_u64(key: &str, default: u64) -> u64 {
 fn env_bool(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }
 
@@ -52,14 +87,19 @@ fn load_hive_id(config_dir: &std::path::Path) -> Result<String, DiagError> {
 async fn send_system_message(
     sender: &NodeSender,
     target: &str,
+    route_mode: RouteMode,
     msg_name: &str,
     payload: serde_json::Value,
 ) -> Result<String, DiagError> {
     let trace_id = Uuid::new_v4().to_string();
+    let (dst, meta_target) = match route_mode {
+        RouteMode::Unicast => (Destination::Unicast(target.to_string()), None),
+        RouteMode::Resolve => (Destination::Resolve, Some(target.to_string())),
+    };
     let message = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
-            dst: Destination::Unicast(target.to_string()),
+            dst,
             ttl: 16,
             trace_id: trace_id.clone(),
         },
@@ -67,7 +107,7 @@ async fn send_system_message(
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(msg_name.to_string()),
             scope: None,
-            target: None,
+            target: meta_target,
             action: None,
             priority: None,
             context: None,
@@ -83,16 +123,14 @@ async fn wait_system_response(
     trace_id: &str,
     expected_msg: &str,
     timeout_secs: u64,
-) -> Result<Message, DiagError> {
+) -> Result<WaitOutcome, DiagError> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(format!(
-                "timeout waiting {} for trace_id={}",
-                expected_msg, trace_id
-            )
-            .into());
+            return Err(
+                format!("timeout waiting {} for trace_id={}", expected_msg, trace_id).into(),
+            );
         }
         let message = match timeout(remaining, receiver.recv()).await {
             Ok(message) => message?,
@@ -116,11 +154,10 @@ async fn wait_system_response(
                 .get("original_dst")
                 .and_then(|value| value.as_str())
                 .unwrap_or("-");
-            return Err(format!(
-                "router returned UNREACHABLE while waiting {} trace_id={} reason={} original_dst={}",
-                expected_msg, trace_id, reason, original_dst
-            )
-            .into());
+            return Ok(WaitOutcome::Unreachable {
+                reason: reason.to_string(),
+                original_dst: original_dst.to_string(),
+            });
         }
         if message.meta.msg_type == SYSTEM_KIND
             && message.routing.trace_id == trace_id
@@ -136,17 +173,16 @@ async fn wait_system_response(
                 .get("last_hop")
                 .and_then(|value| value.as_str())
                 .unwrap_or("-");
-            return Err(format!(
-                "router returned TTL_EXCEEDED while waiting {} trace_id={} original_dst={} last_hop={}",
-                expected_msg, trace_id, original_dst, last_hop
-            )
-            .into());
+            return Ok(WaitOutcome::TtlExceeded {
+                original_dst: original_dst.to_string(),
+                last_hop: last_hop.to_string(),
+            });
         }
         if message.meta.msg_type == SYSTEM_KIND
             && message.meta.msg.as_deref() == Some(expected_msg)
             && message.routing.trace_id == trace_id
         {
-            return Ok(message);
+            return Ok(WaitOutcome::Response(message));
         }
     }
 }
@@ -168,10 +204,11 @@ async fn main() -> Result<(), DiagError> {
     let version = env_or("ORCH_VERSION", "0.0.1");
     let timeout_secs = env_u64("ORCH_TIMEOUT_SECS", 45);
     let send_kill = env_bool("ORCH_SEND_KILL", true);
-    let unit = env_or(
-        "ORCH_UNIT",
-        &format!("fluxbee-orch-e2e-{}", now_epoch_ms()),
-    );
+    let send_runtime_update = env_bool("ORCH_SEND_RUNTIME_UPDATE", true);
+    let unit = env_or("ORCH_UNIT", &format!("fluxbee-orch-e2e-{}", now_epoch_ms()));
+    let route_mode = RouteMode::from_env(&env_or("ORCH_ROUTE_MODE", "unicast"))?;
+    let expected_spawn_unreachable_reason =
+        std::env::var("ORCH_EXPECT_SPAWN_UNREACHABLE_REASON").ok();
     let target = format!("SY.orchestrator@{}", local_hive);
 
     let node_config = NodeConfig {
@@ -183,31 +220,35 @@ async fn main() -> Result<(), DiagError> {
     };
     let (sender, mut receiver) = connect(&node_config).await?;
 
-    let runtime_update_payload = json!({
-        "version": now_epoch_ms() as u64,
-        "updated_at": format!("{}", now_epoch_ms()),
-        "runtimes": {
-            (runtime.clone()): {
-                "current": version.clone(),
-                "available": [version.clone()],
+    if send_runtime_update {
+        let runtime_update_payload = json!({
+            "version": now_epoch_ms() as u64,
+            "updated_at": format!("{}", now_epoch_ms()),
+            "runtimes": {
+                (runtime.clone()): {
+                    "current": version.clone(),
+                    "available": [version.clone()],
+                }
             }
-        }
-    });
+        });
 
-    let update_trace = send_system_message(
-        &sender,
-        &target,
-        "RUNTIME_UPDATE",
-        runtime_update_payload,
-    )
-    .await?;
-    tracing::info!(
-        trace_id = %update_trace,
-        target = %target,
-        runtime = %runtime,
-        version = %version,
-        "sent RUNTIME_UPDATE"
-    );
+        let update_trace = send_system_message(
+            &sender,
+            &target,
+            route_mode,
+            "RUNTIME_UPDATE",
+            runtime_update_payload,
+        )
+        .await?;
+        tracing::info!(
+            trace_id = %update_trace,
+            target = %target,
+            route_mode = ?route_mode,
+            runtime = %runtime,
+            version = %version,
+            "sent RUNTIME_UPDATE"
+        );
+    }
 
     let spawn_payload = json!({
         "runtime": runtime,
@@ -215,10 +256,78 @@ async fn main() -> Result<(), DiagError> {
         "unit": unit,
         "target": target_hive,
     });
-    let spawn_trace = send_system_message(&sender, &target, "SPAWN_NODE", spawn_payload).await?;
-    let spawn_response =
-        wait_system_response(&mut receiver, &spawn_trace, "SPAWN_NODE_RESPONSE", timeout_secs)
-            .await?;
+    let spawn_trace =
+        send_system_message(&sender, &target, route_mode, "SPAWN_NODE", spawn_payload).await?;
+    let spawn_outcome = wait_system_response(
+        &mut receiver,
+        &spawn_trace,
+        "SPAWN_NODE_RESPONSE",
+        timeout_secs,
+    )
+    .await?;
+    let spawn_response = match spawn_outcome {
+        WaitOutcome::Response(message) => {
+            if let Some(expected_reason) = expected_spawn_unreachable_reason.as_deref() {
+                return Err(format!(
+                    "expected UNREACHABLE reason={} but got SPAWN_NODE_RESPONSE payload={}",
+                    expected_reason, message.payload
+                )
+                .into());
+            }
+            message
+        }
+        WaitOutcome::Unreachable {
+            reason,
+            original_dst,
+        } => {
+            if let Some(expected_reason) = expected_spawn_unreachable_reason.as_deref() {
+                if reason == expected_reason {
+                    tracing::info!(
+                        trace_id = %spawn_trace,
+                        reason = %reason,
+                        original_dst = %original_dst,
+                        "received expected UNREACHABLE for SPAWN_NODE"
+                    );
+                    println!(
+                        "{}",
+                        json!({
+                            "status": "ok",
+                            "target": target,
+                            "target_hive": target_hive,
+                            "runtime": runtime,
+                            "version": version,
+                            "unit": unit,
+                            "kill_sent": false,
+                            "expected_unreachable_reason": expected_reason,
+                            "received_reason": reason,
+                            "route_mode": format!("{route_mode:?}").to_ascii_lowercase(),
+                        })
+                    );
+                    return Ok(());
+                }
+                return Err(format!(
+                    "expected UNREACHABLE reason={} but got reason={} original_dst={}",
+                    expected_reason, reason, original_dst
+                )
+                .into());
+            }
+            return Err(format!(
+                "router returned UNREACHABLE while waiting SPAWN_NODE_RESPONSE trace_id={} reason={} original_dst={}",
+                spawn_trace, reason, original_dst
+            )
+            .into());
+        }
+        WaitOutcome::TtlExceeded {
+            original_dst,
+            last_hop,
+        } => {
+            return Err(format!(
+                "router returned TTL_EXCEEDED while waiting SPAWN_NODE_RESPONSE trace_id={} original_dst={} last_hop={}",
+                spawn_trace, original_dst, last_hop
+            )
+            .into());
+        }
+    };
     let spawn_status = spawn_response
         .payload
         .get("status")
@@ -229,6 +338,7 @@ async fn main() -> Result<(), DiagError> {
         trace_id = %spawn_trace,
         target_hive = %target_hive,
         unit = %unit,
+        route_mode = ?route_mode,
         status = %spawn_status,
         payload = %spawn_response.payload,
         "received SPAWN_NODE_RESPONSE"
@@ -243,10 +353,38 @@ async fn main() -> Result<(), DiagError> {
             "unit": unit,
             "target": target_hive,
         });
-        let kill_trace = send_system_message(&sender, &target, "KILL_NODE", kill_payload).await?;
-        let kill_response =
-            wait_system_response(&mut receiver, &kill_trace, "KILL_NODE_RESPONSE", timeout_secs)
-                .await?;
+        let kill_trace =
+            send_system_message(&sender, &target, route_mode, "KILL_NODE", kill_payload).await?;
+        let kill_outcome = wait_system_response(
+            &mut receiver,
+            &kill_trace,
+            "KILL_NODE_RESPONSE",
+            timeout_secs,
+        )
+        .await?;
+        let kill_response = match kill_outcome {
+            WaitOutcome::Response(message) => message,
+            WaitOutcome::Unreachable {
+                reason,
+                original_dst,
+            } => {
+                return Err(format!(
+                    "router returned UNREACHABLE while waiting KILL_NODE_RESPONSE trace_id={} reason={} original_dst={}",
+                    kill_trace, reason, original_dst
+                )
+                .into())
+            }
+            WaitOutcome::TtlExceeded {
+                original_dst,
+                last_hop,
+            } => {
+                return Err(format!(
+                    "router returned TTL_EXCEEDED while waiting KILL_NODE_RESPONSE trace_id={} original_dst={} last_hop={}",
+                    kill_trace, original_dst, last_hop
+                )
+                .into())
+            }
+        };
         let kill_status = kill_response
             .payload
             .get("status")
@@ -274,6 +412,7 @@ async fn main() -> Result<(), DiagError> {
             "version": version,
             "unit": unit,
             "kill_sent": send_kill,
+            "route_mode": format!("{route_mode:?}").to_ascii_lowercase(),
         })
     );
     Ok(())
