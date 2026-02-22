@@ -57,7 +57,17 @@ async fn main() -> Result<(), DynError> {
             let loops = env_u64("JETSTREAM_DIAG_LOOPS", 10);
             let interval_ms = env_u64("JETSTREAM_DIAG_INTERVAL_MS", 100);
             let trace_prefix = env_or("JETSTREAM_DIAG_TRACE_PREFIX", "js-env");
-            run_client(stack, endpoint, subject, loops, interval_ms, trace_prefix).await
+            let seq_start = env_u64("JETSTREAM_DIAG_SEQ_START", 0);
+            run_client(
+                stack,
+                endpoint,
+                subject,
+                loops,
+                interval_ms,
+                trace_prefix,
+                seq_start,
+            )
+            .await
         }
         other => Err(format!(
             "invalid JETSTREAM_DIAG_MODE={other}; expected server|client"
@@ -103,6 +113,7 @@ async fn run_client(
     loops: u64,
     interval_ms: u64,
     trace_prefix: String,
+    seq_start: u64,
 ) -> Result<(), DynError> {
     tracing::info!(
         mode = "client",
@@ -111,6 +122,7 @@ async fn run_client(
         stack = %stack_label(stack),
         loops,
         interval_ms,
+        seq_start,
         trace_prefix = %trace_prefix,
         "jetstream diag client starting"
     );
@@ -120,7 +132,8 @@ async fn run_client(
         DiagStack::JsrClient => Some(NatsClient::new(endpoint.clone())),
     };
 
-    for seq in 0..loops {
+    for offset in 0..loops {
+        let seq = seq_start.saturating_add(offset);
         let trace_id = format!("{}-{}-{}", trace_prefix, now_unix_ms(), Uuid::new_v4());
         let envelope = JetstreamEnvelope {
             schema_version: NATS_ENVELOPE_SCHEMA_VERSION,

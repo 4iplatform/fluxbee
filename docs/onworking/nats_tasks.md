@@ -444,7 +444,7 @@ Base de spec usada:
     - reconnect de subscriber sin pérdida de cursor durable.
     - `UNREACHABLE/timeout` explícito cuando falta consumidor o ruta.
 
-- [ ] A2. Crear suite de diagnóstico JetStream "opaque payload" (nuevo script + binario).
+- [x] A2. Crear suite de diagnóstico JetStream "opaque payload" (nuevo script + binario).
   - Propuesto:
     - script: `scripts/jetstream_envelope_e2e.sh`
     - binario: `src/bin/jetstream_envelope_diag.rs`
@@ -453,17 +453,20 @@ Base de spec usada:
     - verificar entrega y ack,
     - forzar caso sin ack para redelivery,
     - reiniciar router y verificar replay durable.
-  - Avance 2026-02-22:
+  - Cierre 2026-02-22:
     - ya implementado: `scripts/jetstream_envelope_e2e.sh` + `src/bin/jetstream_envelope_diag.rs`
       (cubre payload opaco + ack + redelivery por no-ack intencional).
     - stack de prueba configurable:
       - `JETSTREAM_DIAG_STACK=router_nats` (cliente/router NATS directo),
       - `JETSTREAM_DIAG_STACK=jsr_client` (librería final de cliente NATS).
-    - pendiente para cerrar A2: escenario explícito de replay durable post-restart de router en la misma suite.
+    - replay durable post-restart en la misma suite:
+      - publica lote de replay con subscriber detenido,
+      - reinicia `rt-gateway`,
+      - relanza subscriber y exige `server_replayed_after_restart_acked >= JETSTREAM_DIAG_REPLAY_LOOPS`.
 
-- [ ] A3. Agregar resumen compacto de métricas de transporte para la suite nueva.
-  - `sent`, `acked`, `redelivered`, `replayed_after_restart`, `timeouts`, `reconnects`,
-  - percentiles de latencia (`p50/p95/max`) cuando aplique.
+- [x] A3. Métricas de transporte movidas a `docs/onworking/diagnostics_tasks.md`.
+  - Centralizado en la sección de diagnósticos/stats para evitar duplicación entre suites.
+  - Incluye contadores funcionales y de comunicación (`timeouts`, `reconnects`, redelivery/replay, latencia).
 
 - [ ] A4. Integrar suite nueva en perfil `perf` de `scripts/nats_full_suite.sh` (toggle).
   - variable propuesta: `FULL_SUITE_INCLUDE_JETSTREAM_ENVELOPE=1`.

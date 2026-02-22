@@ -165,16 +165,30 @@ Alcance:
 - duración total (`NATS full suite passed in Xs`),
 - resultados funcionales de cada bloque.
 
-### 3.5 Métricas JetStream envelope (contract-light)
-- `client_published`.
-- `server_received`.
-- `server_acked`.
-- `server_intentional_noack`.
-- timeline compacto por evento:
+### 3.5 Métricas JetStream envelope (contract-light, transporte/stats)
+- Conteo base:
+  - `client_published` (`sent`),
+  - `server_received`,
+  - `server_acked`,
+  - `server_intentional_noack`.
+- Transporte/comunicación:
+  - `redelivered_detected` (reentrega observada por `recv_idx > 0` o `trace/seq` repetido),
+  - `replayed_after_restart` (entrega durable tras restart del consumidor/router),
+  - `client_timeout_events`,
+  - `nats_reconnects`,
+  - `nats_in_flight_peak`,
+  - `nats_last_error` (si existe).
+- Latencia compacta (cuando aplique):
+  - `latency_ms_p50`,
+  - `latency_ms_p95`,
+  - `latency_ms_max`.
+- Timeline compacto por evento:
   - `client published`,
   - `server received`,
   - `server intentionally not acking`,
-  - `server acked`.
+  - `server acked`,
+  - `client timeout` (si ocurre),
+  - `nats reconnect` (si ocurre).
 
 ## 4) Reglas de interpretación (importante)
 - Estos diagnósticos son herramientas E2E/operativas; no forman parte del runtime normal de `sy-orchestrator` ni `sy-admin`.
@@ -238,6 +252,7 @@ OPA_EXPECT_STATUS=ok OPA_MIN_VERSION=1 OPA_MAX_HEARTBEAT_AGE_MS=30000 \
 - [ ] Publicar un endpoint en `sy-admin` para exponer resumen agregado de diagnósticos.
 - [ ] Definir presupuesto de latencia objetivo por flujo (NATS, system routing, OPA resolve).
 - [ ] Agregar versionado de “perfil de diagnóstico” (resilience/perf/wan/opa).
+- [ ] Implementar resumen compacto de métricas de transporte en suite JetStream envelope (`sent/acked/redelivered/replayed/timeouts/reconnects/p50-p95-max`).
 
 ## 7) Router Stats (propuesta para spec, sin implementación aún)
 
