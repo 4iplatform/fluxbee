@@ -298,10 +298,16 @@ server_replay_acked="$(
     -v max_seq="$replay_seq_end" \
     '
       /jetstream diag server acked/ {
-        if (match($0, /seq=[0-9]+/)) {
-          seq = substr($0, RSTART + 4, RLENGTH - 4) + 0
-          if (seq >= min_seq && seq <= max_seq) {
-            seen[seq] = 1
+        # Portable extraction (works on awk variants without "+" regex support nuances).
+        n = split($0, parts, "seq=")
+        if (n >= 2) {
+          seq_raw = parts[2]
+          sub(/[^0-9].*$/, "", seq_raw)
+          if (seq_raw ~ /^[0-9][0-9]*$/) {
+            seq = seq_raw + 0
+            if (seq >= min_seq && seq <= max_seq) {
+              seen[seq] = 1
+            }
           }
         }
       }
