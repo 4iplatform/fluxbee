@@ -19,16 +19,17 @@ El usuario configura **solo** lo que depende de su infraestructura. El sistema m
 | `wan.listen` (IP:puerto) | Timers internos |
 | `wan.uplinks[]` | Límites (MAX_NODES, etc.) |
 | `admin.listen` (opcional) | Orden de arranque |
+| `blob.*` (opcional) | Implementación interna de sync/tooling |
 
 ### 1.2 Paths Fijos (No Configurables)
 
 Todos los binarios conocen estos paths por código:
 
 ```
-/etc/json-router/                  # Configuración (solo hive.yaml lo toca el humano)
+/etc/fluxbee/                  # Configuración (solo hive.yaml lo toca el humano)
 └── hive.yaml                    # Identidad y WAN (ÚNICO archivo que edita el humano)
 
-/var/lib/json-router/              # Estado persistente (auto-generado, persistido por SY.*)
+/var/lib/fluxbee/              # Estado persistente (auto-generado, persistido por SY.*)
 ├── identity.yaml                  # UUID del gateway (auto-generado)
 ├── orchestrator.yaml              # Config de SY.orchestrator (storage.path, etc.)
 ├── config-routes.yaml             # Rutas/VPN (persiste SY.config.routes)
@@ -45,6 +46,7 @@ Todos los binarios conocen estos paths por código:
 │       └── metadata.json
 ├── modules/                       # Módulos/binarios de nodos
 ├── blob/                          # Blobs de mensajes grandes
+├── syncthing/                     # Estado de Syncthing (solo si blob.sync.enabled=true)
 ├── nodes/                         # UUIDs de nodos
 │   └── AI.soporte.l1.uuid
 └── hives/                       # Repo de islas hijas (solo en mother)
@@ -53,7 +55,7 @@ Todos los binarios conocen estos paths por código:
         ├── ssh.key.pub
         └── info.yaml
 
-/var/run/json-router/              # Runtime (volátil)
+/var/run/fluxbee/              # Runtime (volátil)
 ├── routers/
 │   └── <router-uuid>.sock
 └── orchestrator.pid
@@ -75,7 +77,7 @@ El **único** archivo que el usuario crea/edita.
 ### 2.1 Ejemplo Mínimo (isla standalone)
 
 ```yaml
-# /etc/json-router/hive.yaml
+# /etc/fluxbee/hive.yaml
 hive_id: dev
 ```
 
@@ -95,6 +97,12 @@ wan:
 nats:
   mode: embedded
   port: 4222
+
+blob:
+  enabled: true
+  path: "/var/lib/fluxbee/blob"
+  sync:
+    enabled: false
 
 database:
   url: "postgresql://fluxbee:password@localhost:5432/fluxbee"
@@ -116,6 +124,12 @@ wan:
 nats:
   mode: embedded
   port: 4222
+
+blob:
+  enabled: true
+  path: "/var/lib/fluxbee/blob"
+  sync:
+    enabled: false
 ```
 
 ### 2.4 Campos de hive.yaml
@@ -130,6 +144,12 @@ nats:
 | `nats.mode` | No | `embedded` | `embedded` o `client` |
 | `nats.port` | No | 4222 | Puerto NATS si embedded |
 | `nats.url` | No | - | URL si mode=client |
+| `blob.enabled` | No | `true` | Habilita capa blob local |
+| `blob.path` | No | `/var/lib/fluxbee/blob` | Path base de blobs |
+| `blob.sync.enabled` | No | `false` | Activa sincronización externa de blobs |
+| `blob.sync.tool` | No | `syncthing` | Herramienta de sincronización (actual: Syncthing) |
+| `blob.sync.api_port` | No | 8384 | API local de Syncthing |
+| `blob.sync.data_dir` | No | `/var/lib/fluxbee/syncthing` | Directorio de estado de Syncthing |
 | `database.url` | Solo Motherbee | - | Connection string PostgreSQL |
 | `database.pool_size` | No | 10 | Conexiones en el pool |
 
@@ -195,6 +215,7 @@ nats:
 | Router | ✓ | ✓ | |
 | NATS embebido | ✓ | ✓ | Buffer local |
 | WAN bridge | ✓ | ✓ | Si config.wan presente |
+| Syncthing (opcional) | ✓ | ✓ | Solo si `blob.sync.enabled=true`; orchestrator mantiene lifecycle |
 | **Sistema** |
 | SY.identity | ✓ | ✓ (cache) | Worker sincroniza de Motherbee |
 | SY.config.routes | ✓ | ✓ (cache) | Worker sincroniza de Motherbee |
@@ -612,7 +633,7 @@ Esta funcionalidad permite instalar y configurar workers remotos automáticament
     │ (worker1)│         │ (worker2)│         │ (worker3)│
     └──────────┘         └──────────┘         └──────────┘
     
-    Solo tienen: Linux + SSH (port 22) + user root
+    Solo tienen: Linux + SSH (port 22) + user administrator
 ```
 
 ### 5.2 Requisitos de la Máquina Nueva
@@ -621,14 +642,14 @@ Esta funcionalidad permite instalar y configurar workers remotos automáticament
 |-----------|-------|-------|
 | OS | Linux (cualquier distro con systemd) | Ubuntu, Debian, RHEL, etc. |
 | SSH | Puerto 22, habilitado | Viene por defecto en la mayoría |
-| Usuario | `root` | Requerido para instalación |
+| Usuario | `administrator` | Requerido para instalación |
 | Red | Alcanzable desde Motherbee | IP o hostname |
 
 ### 5.3 Credenciales
 
 ```rust
 // Hardcoded en el sistema - NO configurable
-pub const BOOTSTRAP_SSH_USER: &str = "root";
+pub const BOOTSTRAP_SSH_USER: &str = "administrator";
 pub const BOOTSTRAP_SSH_PASS: &str = "magicAI";
 pub const BOOTSTRAP_SSH_PORT: u16 = 22;
 ```
@@ -683,7 +704,7 @@ Content-Type: application/json
 ┌──────────────────────────────────────────────────────────────────┐
 │ PASO 2: Conexión SSH                                             │
 ├──────────────────────────────────────────────────────────────────┤
-│ • Conectar a root@{address}:22                                  │
+│ • Conectar a administrator@{address}:22                                  │
 │ • Password: "magicAI"                                           │
 │ • Timeout: 10s                                                  │
 │ • Si falla → responder SSH_AUTH_FAILED o SSH_TIMEOUT            │
@@ -694,7 +715,7 @@ Content-Type: application/json
 │ PASO 3: Generar SSH Key para esta isla                           │
 ├──────────────────────────────────────────────────────────────────┤
 │ • ssh-keygen -t ed25519 -N "" → key única para esta isla        │
-│ • Guardar en /var/lib/json-router/hives/{hive_id}/          │
+│ • Guardar en /var/lib/fluxbee/hives/{hive_id}/          │
 │   ├── ssh.key      (privada, permisos 600)                      │
 │   └── ssh.key.pub  (pública)                                    │
 └──────────────────────────────────────────────────────────────────┘
@@ -704,9 +725,9 @@ Content-Type: application/json
 │ PASO 4: Configurar SSH en máquina remota                         │
 ├──────────────────────────────────────────────────────────────────┤
 │ Via SSH con password:                                            │
-│ • mkdir -p /root/.ssh                                           │
-│ • Agregar key pública a /root/.ssh/authorized_keys              │
-│ • chmod 600 /root/.ssh/authorized_keys                          │
+│ • mkdir -p /home/administrator/.ssh                                           │
+│ • Agregar key pública a /home/administrator/.ssh/authorized_keys              │
+│ • chmod 600 /home/administrator/.ssh/authorized_keys                          │
 │ • Modificar /etc/ssh/sshd_config:                               │
 │   - PasswordAuthentication no                                    │
 │ • systemctl restart sshd                                        │
@@ -732,17 +753,17 @@ Content-Type: application/json
 ┌──────────────────────────────────────────────────────────────────┐
 │ PASO 6: Crear estructura de directorios                          │
 ├──────────────────────────────────────────────────────────────────┤
-│ • mkdir -p /etc/json-router                                      │
-│ • mkdir -p /var/lib/json-router/nodes                           │
-│ • mkdir -p /var/lib/json-router/opa-rules                       │
-│ • mkdir -p /var/run/json-router/routers                         │
+│ • mkdir -p /etc/fluxbee                                      │
+│ • mkdir -p /var/lib/fluxbee/nodes                           │
+│ • mkdir -p /var/lib/fluxbee/opa-rules                       │
+│ • mkdir -p /var/run/fluxbee/routers                         │
 └──────────────────────────────────────────────────────────────────┘
                             │
                             ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │ PASO 7: Crear hive.yaml                                        │
 ├──────────────────────────────────────────────────────────────────┤
-│ Crear /etc/json-router/hive.yaml:                             │
+│ Crear /etc/fluxbee/hive.yaml:                             │
 │                                                                  │
 │   hive_id: staging                                            │
 │   wan:                                                          │
@@ -757,7 +778,7 @@ Content-Type: application/json
 ┌──────────────────────────────────────────────────────────────────┐
 │ PASO 8: Crear config-routes.yaml vacío                           │
 ├──────────────────────────────────────────────────────────────────┤
-│ Crear /etc/json-router/config-routes.yaml:                      │
+│ Crear /etc/fluxbee/config-routes.yaml:                      │
 │                                                                  │
 │   version: 1                                                    │
 │   routes: []                                                    │
@@ -798,7 +819,7 @@ Content-Type: application/json
 ┌──────────────────────────────────────────────────────────────────┐
 │ PASO 12: Registrar en repo de islas                              │
 ├──────────────────────────────────────────────────────────────────┤
-│ Crear /var/lib/json-router/hives/{hive_id}/info.yaml:       │
+│ Crear /var/lib/fluxbee/hives/{hive_id}/info.yaml:       │
 │                                                                  │
 │   hive_id: staging                                            │
 │   address: 192.168.1.50                                         │
@@ -829,7 +850,7 @@ Content-Type: application/json
   "payload": {
     "status": "error",
     "code": "SSH_AUTH_FAILED",
-    "message": "No se pudo conectar. Verificar: user=root, pass=magicAI, port=22"
+    "message": "No se pudo conectar. Verificar: user=administrator, pass=magicAI, port=22"
   }
 }
 ```
@@ -854,7 +875,7 @@ Después de `add_hive` exitoso:
 
 **En mother hive:**
 ```
-/var/lib/json-router/hives/staging/
+/var/lib/fluxbee/hives/staging/
 ├── ssh.key           # Para acceso SSH de emergencia
 ├── ssh.key.pub
 └── info.yaml         # Metadata de la isla
@@ -862,10 +883,10 @@ Después de `add_hive` exitoso:
 
 **En isla remota (staging):**
 ```
-/etc/json-router/
+/etc/fluxbee/
 └── hive.yaml       # Con uplink a mother (sin admin)
 
-/var/lib/json-router/
+/var/lib/fluxbee/
 ├── identity.yaml
 ├── orchestrator.yaml
 ├── config-routes.yaml
@@ -892,7 +913,7 @@ El password `magicAI` ya no funciona. Para acceder a la isla remota:
 
 ```bash
 # Desde mother hive
-ssh -i /var/lib/json-router/hives/staging/ssh.key root@192.168.1.50
+ssh -i /var/lib/fluxbee/hives/staging/ssh.key administrator@192.168.1.50
 ```
 
 ---
@@ -952,7 +973,7 @@ ssh -i /var/lib/json-router/hives/staging/ssh.key root@192.168.1.50
 │  ─────────────────                   ──────────────────────     │
 │                                                                 │
 │  Mother:                             Mother + Hijas:            │
-│  /var/lib/json-router/               /mnt/jsr-shared/           │
+│  /var/lib/fluxbee/               /mnt/jsr-shared/           │
 │  ├── modules/                        ├── modules/               │
 │  └── blob/                           └── blob/                  │
 │       │                                   │                     │
@@ -966,7 +987,7 @@ ssh -i /var/lib/json-router/hives/staging/ssh.key root@192.168.1.50
 
 ### 6.2 Configuración de Storage
 
-**Default:** `/var/lib/json-router` (local, hijas piden por HTTP)
+**Default:** `/var/lib/fluxbee` (local, hijas piden por HTTP)
 
 **Con NFS:** El usuario monta NFS manualmente y cambia el path via API:
 
@@ -988,7 +1009,7 @@ Esto envía **CONFIG_CHANGED** con `subsystem: storage` a todas las islas.
 Hija necesita módulo AI.soporte:1.2.0
         │
         ▼
-¿Existe en /var/lib/json-router/modules/AI.soporte/1.2.0/?
+¿Existe en /var/lib/fluxbee/modules/AI.soporte/1.2.0/?
         │
     ┌───┴───┐
     │       │
@@ -1044,7 +1065,7 @@ Con NFS no hay HTTP, todas las islas leen del mismo filesystem.
 
 Cada SY.orchestrator al recibir esto:
 1. Actualiza `storage_path` en memoria
-2. Persiste en `/var/lib/json-router/orchestrator.yaml`
+2. Persiste en `/var/lib/fluxbee/orchestrator.yaml`
 3. Envía CONFIG_RESPONSE a SY.admin
 4. Próximas operaciones de módulos usan el nuevo path
 
@@ -1077,8 +1098,8 @@ Cada SY.orchestrator al recibir esto:
 1. **Infra monta NFS** en todas las máquinas (mother + hijas) en el mismo path
 2. **Copiar datos** de mother al NFS (una vez):
    ```bash
-   cp -r /var/lib/json-router/modules /mnt/jsr-shared/
-   cp -r /var/lib/json-router/blob /mnt/jsr-shared/
+   cp -r /var/lib/fluxbee/modules /mnt/jsr-shared/
+   cp -r /var/lib/fluxbee/blob /mnt/jsr-shared/
    ```
 3. **Cambiar config via API** (propaga a todas las islas):
    ```bash
@@ -1117,7 +1138,7 @@ WantedBy=multi-user.target
 
 ```bash
 # Primera isla (mother)
-echo 'hive_id: produccion' > /etc/json-router/hive.yaml
+echo 'hive_id: produccion' > /etc/fluxbee/hive.yaml
 systemctl enable --now sy-orchestrator
 
 # Agregar isla remota (desde mother)
@@ -1148,7 +1169,7 @@ curl -X POST http://localhost:8080/hives \
 
 ```bash
 # Verificar config
-cat /etc/json-router/hive.yaml
+cat /etc/fluxbee/hive.yaml
 
 # Ejecutar manualmente con debug
 JSR_LOG_LEVEL=debug /usr/bin/sy-orchestrator
@@ -1164,7 +1185,7 @@ journalctl -u sy-orchestrator -f
 ping 192.168.1.50
 
 # Verificar SSH manual
-ssh root@192.168.1.50
+ssh administrator@192.168.1.50
 # Password: magicAI
 
 # Si ya se hizo un intento fallido, el password puede estar deshabilitado
@@ -1179,7 +1200,7 @@ grep PasswordAuthentication /etc/ssh/sshd_config
 netstat -tlnp | grep 9000
 
 # En isla hija, verificar config
-cat /etc/json-router/hive.yaml
+cat /etc/fluxbee/hive.yaml
 
 # Verificar logs del gateway
 journalctl -u sy-orchestrator | grep -i wan
@@ -1189,17 +1210,17 @@ journalctl -u sy-orchestrator | grep -i wan
 
 ```bash
 # Desde mother hive
-ssh -i /var/lib/json-router/hives/staging/ssh.key root@192.168.1.50
+ssh -i /var/lib/fluxbee/hives/staging/ssh.key administrator@192.168.1.50
 ```
 
 ### 9.5 Reset completo de isla
 
 ```bash
 systemctl stop sy-orchestrator
-rm -rf /var/lib/json-router/*
-rm -rf /var/run/json-router/*
+rm -rf /var/lib/fluxbee/*
+rm -rf /var/run/fluxbee/*
 rm -f /dev/shm/jsr-*
-# Mantener /etc/json-router/hive.yaml
+# Mantener /etc/fluxbee/hive.yaml
 systemctl start sy-orchestrator
 ```
 
@@ -1211,18 +1232,18 @@ Valores hardcodeados, no configurables:
 
 ```rust
 // Paths
-pub const CONFIG_DIR: &str = "/etc/json-router";
-pub const STATE_DIR: &str = "/var/lib/json-router";
-pub const RUN_DIR: &str = "/var/run/json-router";
+pub const CONFIG_DIR: &str = "/etc/fluxbee";
+pub const STATE_DIR: &str = "/var/lib/fluxbee";
+pub const RUN_DIR: &str = "/var/run/fluxbee";
 pub const SHM_PREFIX: &str = "/jsr-";
 
 // Archivos
-pub const HIVE_CONFIG: &str = "/etc/json-router/hive.yaml";
-pub const ROUTES_CONFIG: &str = "/etc/json-router/config-routes.yaml";
-pub const IDENTITY_FILE: &str = "/var/lib/json-router/identity.yaml";
+pub const HIVE_CONFIG: &str = "/etc/fluxbee/hive.yaml";
+pub const ROUTES_CONFIG: &str = "/etc/fluxbee/config-routes.yaml";
+pub const IDENTITY_FILE: &str = "/var/lib/fluxbee/identity.yaml";
 
 // Bootstrap SSH
-pub const BOOTSTRAP_SSH_USER: &str = "root";
+pub const BOOTSTRAP_SSH_USER: &str = "administrator";
 pub const BOOTSTRAP_SSH_PASS: &str = "magicAI";
 pub const BOOTSTRAP_SSH_PORT: u16 = 22;
 

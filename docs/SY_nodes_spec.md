@@ -139,7 +139,7 @@ Responsable de la configuración de rutas estáticas y tabla VPN.
 | Lenguaje | Rust |
 | Nombre L2 | `SY.config.routes@<isla>` (uno por isla) |
 | Región SHM | `/dev/shm/jsr-config-<hive>` |
-| Persistencia disco | `/etc/json-router/sy-config-routes.yaml` |
+| Persistencia disco | `/etc/fluxbee/sy-config-routes.yaml` |
 | Subsystems | `routes`, `vpn` |
 
 ### 2.2 Mensajes: CONFIG_CHANGED
@@ -305,7 +305,7 @@ Responsable de la compilación, distribución y gestión de policies OPA para ro
 | Nombre L2 | `SY.opa.rules@<isla>` (uno por isla) |
 | Compilador | OPA library embebida (`github.com/open-policy-agent/opa/compile`) |
 | Región SHM | `/dev/shm/jsr-opa-<hive>` (WASM para routers) |
-| Persistencia disco | `/var/lib/json-router/opa/` |
+| Persistencia disco | `/var/lib/fluxbee/opa/` |
 | Estado en RAM | Rego actual para respuesta rápida |
 
 ### 3.2 Arquitectura
@@ -334,7 +334,7 @@ Responsable de la compilación, distribución y gestión de policies OPA para ro
 │  │  ├── staged_rego: *string                     │             │
 │  │  └── status: enum                             │             │
 │  │                                                │             │
-│  │  DISCO (/var/lib/json-router/opa/):           │             │
+│  │  DISCO (/var/lib/fluxbee/opa/):           │             │
 │  │  ├── current/{policy.rego, metadata.json}     │             │
 │  │  ├── staged/{policy.rego, metadata.json}      │             │
 │  │  └── backup/{policy.rego, metadata.json}      │             │
@@ -351,7 +351,7 @@ Responsable de la compilación, distribución y gestión de policies OPA para ro
 #### 3.3.1 Disco (Persistencia)
 
 ```
-/var/lib/json-router/opa/
+/var/lib/fluxbee/opa/
 ├── current/
 │   ├── policy.rego        # Fuente Rego activo
 │   └── metadata.json      # {version, compiled_at, entrypoint, hash}
@@ -438,13 +438,13 @@ sy-opa-rules (binario Go)
     ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 1. Leer configuración                                       │
-│    - /etc/json-router/hive.yaml → hive_id              │
+│    - /etc/fluxbee/hive.yaml → hive_id              │
 └─────────────────────────────────────────────────────────────┘
     │
     ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. Verificar instancia única                                │
-│    - Lock file: /var/run/json-router/sy-opa-rules.lock     │
+│    - Lock file: /var/run/fluxbee/sy-opa-rules.lock     │
 └─────────────────────────────────────────────────────────────┘
     │
     ▼
@@ -484,7 +484,7 @@ SY.opa.rules recibe dos tipos de mensajes:
 
 #### 3.5.1 Broadcast: CONFIG_CHANGED (subsystem: opa)
 
-**Versionado:** SY.admin asigna números de versión usando un contador monotónico persistido en `/var/lib/json-router/opa-version.txt`. El contador siempre incrementa, incluso si la operación falla.
+**Versionado:** SY.admin asigna números de versión usando un contador monotónico persistido en `/var/lib/fluxbee/opa-version.txt`. El contador siempre incrementa, incluso si la operación falla.
 
 **Compilar nuevo código (queda staged):**
 
@@ -930,7 +930,7 @@ impl Router {
 
 ### 3.10 Flujo desde SY.admin (API HTTP)
 
-**Versionado:** SY.admin mantiene un contador monotónico en `/var/lib/json-router/opa-version.txt`. Cada operación que requiere versión incrementa el contador antes de enviar el mensaje.
+**Versionado:** SY.admin mantiene un contador monotónico en `/var/lib/fluxbee/opa-version.txt`. Cada operación que requiere versión incrementa el contador antes de enviar el mensaje.
 
 #### Endpoints HTTP
 
@@ -1131,4 +1131,4 @@ sy-opa-rules/                    # Proyecto separado en Go
 | GET_STATUS | unicast | cualquiera | SY.opa.rules@X | Estado del nodo |
 | OPA_RELOAD | broadcast local | SY.opa.rules | routers locales | Recargar WASM |
 
-**Nota sobre versionado:** SY.admin mantiene contador monotónico en `/var/lib/json-router/opa-version.txt`.
+**Nota sobre versionado:** SY.admin mantiene contador monotónico en `/var/lib/fluxbee/opa-version.txt`.

@@ -181,6 +181,7 @@
 | SY.orchestrator | ✓ | - |
 | SY.admin | ✓ | - |
 | Router + NATS | ✓ | ✓ |
+| Syncthing (opcional, blobs) | ✓ | ✓ |
 | SY.identity/config/opa | ✓ | ✓ (cache) |
 | SY.cognition + LanceDB | ✓ | ✓ |
 | AI/IO/WF nodes | opcional | ✓ |

@@ -106,7 +106,7 @@ No existe `config.yaml` por router. El gateway se identifica via `is_gateway` en
 La configuración WAN se declara **solo** en `hive.yaml` y aplica al gateway.
 
 ```yaml
-# /etc/json-router/hive.yaml
+# /etc/fluxbee/hive.yaml
 hive_id: produccion
 
 wan:
@@ -496,7 +496,7 @@ fn route_to_remote_hive(&self, msg: &Message, dst_hive: &str) -> Action {
 El gateway valida que el `hive_id` del peer esté en su lista de autorizados:
 
 ```yaml
-# /etc/json-router/hive.yaml
+# /etc/fluxbee/hive.yaml
 wan:
   authorized_hives:
     - staging

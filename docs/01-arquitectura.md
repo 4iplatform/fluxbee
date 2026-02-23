@@ -93,8 +93,9 @@ Forward directo      ┌──────────────────�
 | Router | Detecta nodos, conecta sockets, mantiene tabla local, consulta OPA si hace falta, rutea, detecta link down. |
 | Gateway | Router especial que conecta islas entre sí via TCP/WAN. |
 | **SY.orchestrator** | **Proceso raíz de la isla. Levanta router, nodos SY, y gestiona ciclo de vida.** |
-| Shared Memory | Tablas de estado compartidas. Tres tipos de regiones (ver sección 7). |
+| Shared Memory | Tablas de estado compartidas. Seis tipos de regiones (ver sección 7). |
 | OPA (WASM) | Evalúa policies de negocio. No accede a estado del sistema. |
+| Syncthing (opcional) | Herramienta externa para sync de blobs cuando `blob.sync.enabled=true` (gestionada por orchestrator). |
 | Librería de Nodo | Común a todos los nodos. Maneja protocolo de socket, framing, retry, reconexión. |
 
 ### 4.1 Arranque de la Isla
@@ -136,7 +137,7 @@ Usuario ejecuta: systemctl start sy-orchestrator
 Toda instancia opera dentro de una **isla**, definida por el **único archivo de configuración**:
 
 ```
-/etc/json-router/hive.yaml
+/etc/fluxbee/hive.yaml
 ```
 
 **Ejemplo mínimo:**
@@ -306,13 +307,16 @@ Destino: AI.soporte.l1@staging
 
 ## 7. Regiones de Shared Memory
 
-El sistema usa **tres tipos** de regiones de memoria compartida:
+El sistema usa **seis tipos** de regiones de memoria compartida:
 
 ```
 /dev/shm/
-├── jsr-<router-uuid>        # Una por router (nodos conectados)
-├── jsr-config-<hive>      # Una por isla (rutas estáticas, VPN)
-└── jsr-lsa-<hive>         # Una por isla (topología remota)
+├── jsr-<router-uuid>         # Una por router (nodos conectados)
+├── jsr-config-<hive>         # Una por isla (rutas estáticas, VPN)
+├── jsr-lsa-<hive>            # Una por isla (topología remota)
+├── jsr-opa-<hive>            # Una por isla (policy WASM compilado)
+├── jsr-identity-<hive>       # Una por isla (ILK/ICH/modules/degrees)
+└── jsr-memory-<hive>         # Una por isla (índice cognitivo local)
 ```
 
 | Región | Quién escribe | Contenido | Quién lee |
@@ -320,6 +324,9 @@ El sistema usa **tres tipos** de regiones de memoria compartida:
 | `jsr-<uuid>` | Router dueño | Sus nodos CONNECTED | Todos los routers de la isla |
 | `jsr-config-<hive>` | SY.config.routes | Rutas estáticas, tabla VPN | Todos los routers de la isla |
 | `jsr-lsa-<hive>` | Gateway | Nodos, rutas, VPNs de **otras islas** | Todos los routers de la isla |
+| `jsr-opa-<hive>` | SY.opa.rules | WASM + metadata de policy | Routers de la isla |
+| `jsr-identity-<hive>` | SY.identity | ILKs/ICHs/degrees/modules | Routers + nodos de sistema |
+| `jsr-memory-<hive>` | SY.cognition | Índice de activación cognitiva | SY.cognition + lectores locales |
 
 **Principio:** Un solo writer por región. Múltiples readers. Seqlock para sincronización.
 

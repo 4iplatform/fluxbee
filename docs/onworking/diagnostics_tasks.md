@@ -53,6 +53,12 @@ Alcance:
   - forzar redelivery por no-ack intencional en servidor de diagnóstico,
   - producir resumen simple de conteos (`published/received/acked/no-ack`).
 
+### 1.6 Blob E2E/Stats (pendiente)
+- Estado actual:
+  - no hay aún suite dedicada de diagnóstico blob E2E integrada.
+- Objetivo:
+  - centralizar aquí el plan de métricas/diagnóstico blob para no duplicar en `blob_tasks.md`.
+
 ## 2) Variables de diagnóstico (catálogo operativo)
 
 ## 2.1 `wf_nats_diag.sh` + `wf_nats_diag.rs`
@@ -191,6 +197,19 @@ Alcance:
   - `client timeout` (si ocurre),
   - `nats reconnect` (si ocurre).
 
+### 3.6 Métricas Blob (objetivo)
+- Conteo base:
+  - `blob_put_total`,
+  - `blob_get_total`,
+  - `blob_errors_total`.
+- Capacidad/volumen:
+  - `blob_bytes_stored`,
+  - `blob_gc_deleted_total`,
+  - `blob_gc_reclaimed_bytes`.
+- Latencia (si aplica):
+  - `blob_put_ms_p50/p95/max`,
+  - `blob_get_ms_p50/p95/max`.
+
 ## 4) Reglas de interpretación (importante)
 - Estos diagnósticos son herramientas E2E/operativas; no forman parte del runtime normal de `sy-orchestrator` ni `sy-admin`.
 - Variables `ORCH_*`, `WF_DIAG_*`, `OPA_*` aplican solo al proceso de diagnóstico invocado.
@@ -254,6 +273,8 @@ OPA_EXPECT_STATUS=ok OPA_MIN_VERSION=1 OPA_MAX_HEARTBEAT_AGE_MS=30000 \
 - [ ] Definir presupuesto de latencia objetivo por flujo (NATS, system routing, OPA resolve).
 - [ ] Agregar versionado de “perfil de diagnóstico” (resilience/perf/wan/opa).
 - [ ] Implementar resumen compacto de métricas de transporte en suite JetStream envelope (`sent/acked/redelivered/replayed/timeouts/reconnects/p50-p95-max`).
+- [ ] Implementar suite Blob E2E (`blob_ref` + verificación hash end-to-end) con salida compacta y resumen.
+- [ ] Incorporar resumen de Blob Stats en el mismo formato de reportes (`count/p50/p95/max`, errores y volumen).
 
 ## 7) Router Stats (propuesta para spec, sin implementación aún)
 

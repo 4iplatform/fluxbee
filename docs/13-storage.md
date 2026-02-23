@@ -156,89 +156,41 @@ pub struct Router {
     shm_identity: ShmIdentityReader,
     shm_memory: ShmMemoryReader,
     
-    // Nuevo: NATS
-    nats_mode: NatsMode,
-    nats_client: async_nats::Client,
-    nats_server: Option<async_nats::Server>,  // Solo si embedded
+    // NATS local (implementación actual)
+    nats_mode: String,            // "embedded" | "client"
+    nats_url: String,             // p.ej. nats://127.0.0.1:4222
+    nats_publisher: Option<Arc<NatsPublisher>>,
     
     // Nuevo: WAN (opcional)
     wan: Option<WanBridge>,
 }
 
-pub enum NatsMode {
-    Client { url: String },
-    Embedded { port: u16, storage_dir: PathBuf },
-}
+// Nota: la implementación real usa `json_router::nats` (broker embebido + publish local),
+// no tipos `async_nats::*` directos en el router.
 ```
 
 ### 3.3 Inicialización
 
 ```rust
 impl Router {
-    pub async fn new(config: RouterConfig) -> Result<Self> {
-        // NATS según modo
-        let (nats_client, nats_server) = match &config.nats.mode {
-            NatsMode::Client { url } => {
-                let client = async_nats::connect(url).await?;
-                (client, None)
-            }
-            NatsMode::Embedded { port, storage_dir } => {
-                // Levantar NATS server embebido
-                let server = async_nats::Server::builder()
-                    .port(*port)
-                    .jetstream_storage(storage_dir)
-                    .start()
-                    .await?;
-                
-                let client = server.local_client();
-                (client, Some(server))
-            }
-        };
-        
-        // Crear streams si somos embedded
-        if nats_server.is_some() {
-            Self::setup_streams(&nats_client).await?;
+    pub async fn run(&self) -> Result<()> {
+        if self.nats_mode == "embedded" {
+            start_embedded_broker_with_storage(
+                &self.nats_url,
+                Some(Path::new("/var/lib/fluxbee/nats")),
+            )
+            .await?;
         }
-        
-        // WAN si configurado
-        let wan = if let Some(wan_config) = config.wan {
-            Some(WanBridge::new(wan_config, nats_client.clone()).await?)
-        } else {
-            None
-        };
-        
-        Ok(Self {
-            nats_mode: config.nats.mode,
-            nats_client,
-            nats_server,
-            wan,
-            // ... resto
-        })
-    }
-    
-    async fn setup_streams(client: &async_nats::Client) -> Result<()> {
-        let js = async_nats::jetstream::new(client.clone());
-        
-        // Stream para turns locales
-        js.create_stream(async_nats::jetstream::stream::Config {
-            name: "TURNS_LOCAL".into(),
-            subjects: vec!["turns.local".into()],
-            retention: RetentionPolicy::WorkQueue,
-            storage: StorageType::File,
-            max_age: Duration::from_secs(86400 * 7),  // 7 días
-            ..Default::default()
-        }).await?;
-        
-        // Stream para storage (solo en madre)
-        js.create_stream(async_nats::jetstream::stream::Config {
-            name: "STORAGE".into(),
-            subjects: vec!["storage.>".into()],
-            retention: RetentionPolicy::WorkQueue,
-            storage: StorageType::File,
-            max_age: Duration::from_secs(86400 * 7),
-            ..Default::default()
-        }).await?;
-        
+
+        wait_for_nats_ready(&self.nats_url, Duration::from_secs(20)).await?;
+
+        // Publisher local para persistencia de turns
+        let publisher = NatsPublisher::new(
+            self.nats_url.clone(),
+            "storage.turns".to_string(),
+        );
+        publisher.publish(turn_payload).await?;
+
         Ok(())
     }
 }
@@ -257,9 +209,9 @@ impl Router {
             let turn = Turn::from_message(&msg);
             
             // NO await en el publish, fire & forget
-            let _ = self.nats_client
-                .publish("turns.local", turn.to_bytes())
-                .await;  // Solo espera el ACK de NATS local (~1ms)
+            if let Some(publisher) = &self.nats_publisher {
+                let _ = publisher.publish(&turn.to_bytes()).await;
+            }
         }
         
         Ok(())
@@ -279,8 +231,8 @@ El router con WAN consume de NATS local y forward por TCP a la isla madre.
 pub struct WanBridge {
     peers: Vec<WanPeer>,
     role: WanRole,
-    nats_client: async_nats::Client,
-    subscription: Option<Subscription>,
+    nats_endpoint: String,
+    turns_subject: String, // "turns.local"
 }
 
 pub enum WanRole {
@@ -294,10 +246,12 @@ pub enum WanRole {
 ```rust
 impl WanBridge {
     pub async fn run_hija(&mut self) -> Result<()> {
-        // Suscribirse a turns locales
-        let mut sub = self.nats_client
-            .subscribe("turns.local")
-            .await?;
+        // Suscribirse a turns locales (durable queue del broker embebido)
+        let mut sub = subscribe_local(
+            &config_dir,
+            self.turns_subject.clone(),
+            "durable.wan-bridge.turns",
+        )?;
         
         // Buffer para batching
         let mut batch: Vec<Turn> = Vec::with_capacity(100);
@@ -362,9 +316,12 @@ impl WanBridge {
                 WanMessage::TurnBatch(turns) => {
                     // Publicar a NATS local para SY.storage
                     for turn in turns {
-                        self.nats_client
-                            .publish("storage.turns", turn.to_bytes())
-                            .await?;
+                        publish_local(
+                            &self.nats_endpoint,
+                            "storage.turns",
+                            &turn.to_bytes(),
+                        )
+                        .await?;
                     }
                 }
                 // ... otros tipos
@@ -415,40 +372,45 @@ SY.storage **solo corre en isla madre**, en el mismo host que PostgreSQL.
 
 ```rust
 pub struct Storage {
-    nats_client: async_nats::Client,
+    config_dir: PathBuf,
+    nats_endpoint: String,
     socket_listener: UnixListener,
     pg_pool: PgPool,
 }
 
 impl Storage {
     pub async fn run(&mut self) -> Result<()> {
-        // Suscripciones a NATS
-        let mut turns_sub = self.nats_client.subscribe("storage.turns").await?;
-        let mut events_sub = self.nats_client.subscribe("storage.events").await?;
-        let mut items_sub = self.nats_client.subscribe("storage.items").await?;
-        let mut react_sub = self.nats_client.subscribe("storage.reactivation").await?;
+        // Suscripciones durables locales (ack en éxito, retry en error)
+        let turns_sub = subscribe_local(
+            &self.config_dir,
+            "storage.turns".to_string(),
+            "durable.sy-storage.turns",
+        )?;
+        let events_sub = subscribe_local(
+            &self.config_dir,
+            "storage.events".to_string(),
+            "durable.sy-storage.events",
+        )?;
+        let items_sub = subscribe_local(
+            &self.config_dir,
+            "storage.items".to_string(),
+            "durable.sy-storage.items",
+        )?;
+        let react_sub = subscribe_local(
+            &self.config_dir,
+            "storage.reactivation".to_string(),
+            "durable.sy-storage.reactivation",
+        )?;
         
+        tokio::spawn(self.run_storage_subject(turns_sub, Subject::Turns));
+        tokio::spawn(self.run_storage_subject(events_sub, Subject::Events));
+        tokio::spawn(self.run_storage_subject(items_sub, Subject::Items));
+        tokio::spawn(self.run_storage_subject(react_sub, Subject::Reactivation));
+
+        // Queries síncronos via Socket
         loop {
-            tokio::select! {
-                // Writes async via NATS
-                Some(msg) = turns_sub.next() => {
-                    self.handle_turn(msg).await;
-                }
-                Some(msg) = events_sub.next() => {
-                    self.handle_event(msg).await;
-                }
-                Some(msg) = items_sub.next() => {
-                    self.handle_item(msg).await;
-                }
-                Some(msg) = react_sub.next() => {
-                    self.handle_reactivation(msg).await;
-                }
-                
-                // Queries síncronos via Socket
-                Ok((stream, _)) = self.socket_listener.accept() => {
-                    tokio::spawn(self.handle_socket_query(stream));
-                }
-            }
+            let (stream, _) = self.socket_listener.accept().await?;
+            tokio::spawn(self.handle_socket_query(stream));
         }
     }
 }
@@ -458,7 +420,7 @@ impl Storage {
 
 ```rust
 impl Storage {
-    async fn handle_turn(&self, msg: async_nats::Message) {
+    async fn handle_turn(&self, msg: NatsMessage) {
         let turn: Turn = Turn::from_bytes(&msg.payload)?;
         
         // Idempotente: ON CONFLICT DO NOTHING
@@ -483,17 +445,17 @@ impl Storage {
         
         match result {
             Ok(_) => {
-                // ACK implícito (WorkQueue consumer)
-                msg.ack().await.ok();
+                // Handler OK => ACK del subscriber durable
+                msg.ack().ok();
             }
             Err(e) => {
                 log::error!("PG write failed: {}", e);
-                // NO ack → NATS re-entregará
+                // Handler error => sin ACK, redelivery/retry
             }
         }
     }
     
-    async fn handle_reactivation(&self, msg: async_nats::Message) {
+    async fn handle_reactivation(&self, msg: NatsMessage) {
         let event: ReactivationEvent = serde_json::from_slice(&msg.payload)?;
         
         for ev in &event.reactivated.events {
@@ -527,7 +489,7 @@ impl Storage {
             }
         }
         
-        msg.ack().await.ok();
+        msg.ack().ok();
     }
 }
 ```
@@ -803,24 +765,20 @@ REACTIVATIONS
 ### 9.2 Consumer Groups
 
 ```rust
-// SY.cognition y WAN bridge consumen del mismo stream
-// pero son consumers diferentes (ambos reciben todo)
+// SY.cognition y WAN bridge usan sus propias colas durables.
+// El broker embebido mantiene cursor por durable_name.
 
-// En SY.cognition:
-let consumer = js.create_consumer("TURNS_LOCAL", ConsumerConfig {
-    durable_name: Some("cognition".into()),
-    deliver_policy: DeliverPolicy::All,
-    ack_policy: AckPolicy::Explicit,
-    ..Default::default()
-}).await?;
+let cognition_sub = subscribe_local(
+    &config_dir,
+    "turns.local".to_string(),
+    "durable.sy-cognition.turns",
+)?;
 
-// En WAN bridge:
-let consumer = js.create_consumer("TURNS_LOCAL", ConsumerConfig {
-    durable_name: Some("wan_bridge".into()),
-    deliver_policy: DeliverPolicy::All,
-    ack_policy: AckPolicy::Explicit,
-    ..Default::default()
-}).await?;
+let wan_bridge_sub = subscribe_local(
+    &config_dir,
+    "turns.local".to_string(),
+    "durable.wan-bridge.turns",
+)?;
 ```
 
 ---

@@ -541,7 +541,7 @@ El subsystem `opa` tiene un campo adicional `action` que define la operación:
 | `apply` | - | - | Activar versión staged |
 | `rollback` | - | - | Volver a versión backup |
 
-**Versionado:** SY.admin es el único que asigna números de versión usando un contador monotónico persistido en `/var/lib/json-router/opa-version.txt`. El contador siempre incrementa, incluso si la operación falla.
+**Versionado:** SY.admin es el único que asigna números de versión usando un contador monotónico persistido en `/var/lib/fluxbee/opa-version.txt`. El contador siempre incrementa, incluso si la operación falla.
 
 **Ejemplo: Compilar nueva policy (queda staged):**
 ```json
@@ -1218,7 +1218,7 @@ impl MyNode {
 ### 10.10 Flujo de Conexión
 
 ```
-1. Leer /etc/json-router/hive.yaml → obtener hive_id
+1. Leer /etc/fluxbee/hive.yaml → obtener hive_id
    - Si no existe → ERROR, no arrancar
    
 2. Cargar o generar UUID desde archivo de persistencia
@@ -1243,10 +1243,10 @@ impl MyNode {
 ### 10.11 Persistencia de UUID
 
 ```
-/var/lib/json-router/state/nodes/<nombre-sin-isla>.uuid
+/var/lib/fluxbee/state/nodes/<nombre-sin-isla>.uuid
 ```
 
-Ejemplo: `/var/lib/json-router/state/nodes/AI.soporte.l1.uuid`
+Ejemplo: `/var/lib/fluxbee/state/nodes/AI.soporte.l1.uuid`
 
 ### 10.12 Ejemplo de Uso
 
@@ -1257,9 +1257,9 @@ use json_router::node_client::{connect, NodeConfig};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = NodeConfig {
         name: "AI.soporte.l1".to_string(),  // SIN @isla
-        router_socket: "/var/run/json-router/routers".into(),
-        uuid_persistence_dir: "/var/lib/json-router/state/nodes/".into(),
-        config_dir: "/etc/json-router".into(),
+        router_socket: "/var/run/fluxbee/routers".into(),
+        uuid_persistence_dir: "/var/lib/fluxbee/state/nodes/".into(),
+        config_dir: "/etc/fluxbee".into(),
         version: "1.0".to_string(),
     };
 

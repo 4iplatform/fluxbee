@@ -105,7 +105,7 @@ Solo `SY.config.routes@<hive>` escribe en esta región. Los routers solo leen.
 SY.config.routes persiste la configuración en YAML:
 
 ```yaml
-# /etc/json-router/sy-config-routes.yaml
+# /etc/fluxbee/sy-config-routes.yaml
 version: 1
 updated_at: "2025-01-20T10:00:00Z"
 

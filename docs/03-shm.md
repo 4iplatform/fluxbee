@@ -29,7 +29,7 @@ El sistema usa seis tipos de regiones de memoria compartida:
 | `jsr-identity-<hive>` | SY.identity | ILKs, ICHs, modules, degrees, external mappings |
 | `jsr-memory-<hive>` | SY.cognition | Índice de activación: tags → event_ids |
 
-**Principio clave:** Cada región tiene **un único writer** y múltiples readers. Esto permite usar epoch/RCU (Read-Copy-Update) sin locks.
+**Principio clave:** Cada región tiene **un único writer** y múltiples readers. Esto permite usar `seqlock` (writer único + lecturas lock-free).
 
 ---
 
@@ -51,7 +51,7 @@ Ejemplo: /jsr-a1b2c3d4-e5f6-7890-abcd-ef1234567890
 
 | Dato | Descripción |
 |------|-------------|
-| Header | Identificación, epoch, heartbeat |
+| Header | Identificación, seqlock, heartbeat |
 | Nodos | Nodos conectados directamente a este router |
 
 ### 2.3 Layout
@@ -86,8 +86,8 @@ pub struct ShmHeader {
     pub owner_start_time: u64,
     pub generation: u64,
     
-    // Epoch (sincronización RCU) (8 bytes)
-    pub epoch: u64,  // AtomicU64 - par = listo, impar = escribiendo
+    // Seqlock (8 bytes)
+    pub seq: u64,    // AtomicU64 - impar = escribiendo, par = estable
     
     // Contadores (8 bytes)
     pub node_count: u32,
@@ -160,7 +160,7 @@ Ejemplo: /jsr-config-produccion
 
 | Dato | Descripción |
 |------|-------------|
-| Header | Identificación, epoch, contadores |
+| Header | Identificación, seqlock, contadores |
 | Rutas estáticas | Configuración de routing |
 | Tabla VPN | Asignación de nodos a VPN |
 
@@ -314,7 +314,7 @@ Total aproximado: ~442 KB
 
 ```rust
 pub const LSA_MAGIC: u32 = 0x4A534C41;  // "JSLA"
-pub const LSA_VERSION: u32 = 1;
+pub const LSA_VERSION: u32 = 2;
 pub const MAX_REMOTE_HIVES: u32 = 16;
 pub const MAX_REMOTE_NODES: u32 = 1024;      // Total entre todas las islas
 pub const MAX_REMOTE_ROUTES: u32 = 256;
@@ -436,98 +436,65 @@ pub struct RemoteVpnEntry {
 
 ---
 
-## 5. Sincronización: Epoch/RCU
+## 5. Sincronización: Seqlock
 
-Todas las regiones usan epoch/RCU para sincronización lock-free.
+Las regiones SHM implementadas en Rust usan `seqlock` con `AtomicU64` (`seq`).
 
 ### 5.1 Modelo Conceptual
 
 ```
-Writer tiene:
-  - active: puntero a región en uso por readers
-  - shadow: puntero a región para próxima escritura
+Writer único:
+  - seq impar  => write en progreso
+  - seq par    => snapshot estable
 
 Readers:
-  - Leen epoch, usan datos directamente (sin copiar)
-  - Nunca reintentan, siempre ven snapshot consistente
-
-Writer:
-  - Escribe en shadow
-  - Incrementa epoch
-  - Swap active ↔ shadow
-  - Grace period (espera a que readers terminen)
+  - leen seq (inicio)
+  - copian/leen datos
+  - releen seq (fin)
+  - aceptan lectura solo si ambos valores son iguales y pares
 ```
 
 ### 5.2 Protocolo del Writer
 
 ```rust
-impl<T> EpochRegion<T> {
-    pub fn write<F: FnOnce(&mut T)>(&mut self, f: F) {
-        // 1. Escribir en shadow (sin afectar readers)
-        f(&mut self.shadow);
-        
-        // 2. Incrementar epoch (impar = transición)
-        let new_epoch = self.header.epoch.fetch_add(1, Ordering::Release) + 1;
-        
-        // 3. Swap punteros
-        std::mem::swap(&mut self.active, &mut self.shadow);
-        
-        // 4. Publicar epoch (par = listo)
-        self.header.epoch.store(new_epoch + 1, Ordering::Release);
-        
-        // 5. Grace period: esperar a que readers en vuelo terminen
-        //    (los readers típicamente tardan < 1ms)
-        std::thread::sleep(Duration::from_millis(10));
-    }
+pub fn seqlock_begin_write(seq: &AtomicU64) {
+    seq.fetch_add(1, Ordering::AcqRel); // par -> impar
+}
+
+pub fn seqlock_end_write(seq: &AtomicU64) {
+    seq.fetch_add(1, Ordering::Release); // impar -> par
 }
 ```
 
 ### 5.3 Protocolo del Reader
 
 ```rust
-impl<T> EpochRegion<T> {
-    pub fn read<F: FnOnce(&T) -> R, R>(&self, f: F) -> R {
-        loop {
-            // 1. Leer epoch
-            let epoch = self.header.epoch.load(Ordering::Acquire);
-            
-            // 2. Si impar, writer está en transición → spin
-            if epoch & 1 != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            
-            // 3. Leer puntero active
-            let active = &*self.active;
-            
-            // 4. Usar datos directamente (sin copiar)
-            let result = f(active);
-            
-            // 5. Verificar que epoch no cambió
-            atomic::fence(Ordering::Acquire);
-            let epoch2 = self.header.epoch.load(Ordering::Acquire);
-            
-            if epoch == epoch2 {
-                return result;  // Lectura consistente
-            }
-            // Si cambió, reintentar (raro, solo durante transición)
-        }
+loop {
+    let seq1 = header.seq.load(Ordering::Acquire);
+    if seq1 & 1 != 0 {
+        std::hint::spin_loop();
+        continue;
+    }
+
+    // leer snapshot...
+
+    atomic::fence(Ordering::Acquire);
+    let seq2 = header.seq.load(Ordering::Acquire);
+    if seq1 == seq2 {
+        break; // lectura consistente
     }
 }
 ```
 
-### 5.4 Ventajas sobre Seqlock
+### 5.4 Características
 
-| Aspecto | Seqlock | Epoch/RCU |
-|---------|---------|-----------|
-| Reader copia datos | Sí (toda la región) | No (lee in-place) |
-| Reintentos en región grande | Frecuentes | Raros |
-| Latencia de lectura | Variable | Predecible |
-| Memoria extra | No | Sí (shadow) |
-| Complejidad | Baja | Media |
-
-**Para regiones pequeñas** (config, lsa) el overhead de shadow es despreciable (~150KB extra).  
-**Para regiones grandes** (memory, ~MBs) la diferencia de rendimiento es significativa.
+| Aspecto | Seqlock (actual) |
+|---------|------------------|
+| Writer concurrente | 1 (requerido) |
+| Readers | Múltiples lock-free |
+| Reintentos de reader | Posibles durante escritura |
+| Memoria extra | No (sin shadow buffer) |
+| Complejidad | Baja |
 ```
 
 ---
@@ -1024,7 +991,7 @@ pub const MAX_VPN_ASSIGNMENTS: u32 = 256;
 
 // Región LSA
 pub const LSA_MAGIC: u32 = 0x4A534C41;
-pub const LSA_VERSION: u32 = 1;
+pub const LSA_VERSION: u32 = 2;
 pub const MAX_REMOTE_HIVES: u32 = 16;
 pub const MAX_REMOTE_NODES: u32 = 1024;
 pub const MAX_REMOTE_ROUTES: u32 = 256;
