@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-members = ["crates/jsr_client"]
+members = ["crates/jsr_client", "crates/fluxbee_sdk"]
 
 [dependencies]
 tokio = { version = "1.37", features = ["full"] }
@@ -17,7 +17,7 @@ nix = { version = "0.28", features = ["fs", "mman"] }
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-jsr-client = { path = "crates/jsr_client" }
+fluxbee-sdk = { path = "crates/fluxbee_sdk" }
 wasmtime = "19.0.0"
 regex = "1.10"
 tar = "0.4"

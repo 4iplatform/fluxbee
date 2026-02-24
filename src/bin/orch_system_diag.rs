@@ -1,10 +1,10 @@
 use std::error::Error;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use jsr_client::protocol::{
+use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
-use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::time::{timeout, Instant};

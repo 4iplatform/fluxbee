@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use jsr_client::nats::{
+use fluxbee_sdk::nats::{
     publish, NatsClient, NatsRequestEnvelope, NatsResponseEnvelope, NatsSubscriber,
 };
 use serde_json::{json, Value};

@@ -15,12 +15,12 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use jsr_client::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
-use jsr_client::protocol::{
+use fluxbee_sdk::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
+use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SCOPE_GLOBAL,
     SYSTEM_KIND,
 };
-use jsr_client::{connect, ClientConfig, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::{connect, ClientConfig, NodeConfig, NodeReceiver, NodeSender};
 
 type AdminError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -75,7 +75,7 @@ impl AdminRouterClient {
     async fn connect_with_retry(
         config: NodeConfig,
         delay: Duration,
-    ) -> Result<Arc<Self>, jsr_client::NodeError> {
+    ) -> Result<Arc<Self>, fluxbee_sdk::NodeError> {
         loop {
             match connect(&config).await {
                 Ok((sender, receiver)) => {

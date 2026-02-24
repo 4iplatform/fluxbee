@@ -11,10 +11,10 @@ use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, VpnAssignment,
     ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
 };
-use jsr_client::protocol::{
+use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SYSTEM_KIND,
 };
-use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -472,7 +472,7 @@ async fn handle_admin_action(
 async fn connect_with_retry(
     config: &NodeConfig,
     delay: Duration,
-) -> Result<(NodeSender, NodeReceiver), jsr_client::NodeError> {
+) -> Result<(NodeSender, NodeReceiver), fluxbee_sdk::NodeError> {
     loop {
         match connect(config).await {
             Ok(result) => return Ok(result),

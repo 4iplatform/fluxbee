@@ -15,7 +15,7 @@ use json_router::nats::{
     NatsSubscriber as RouterNatsSubscriber, SUBJECT_STORAGE_EVENTS, SUBJECT_STORAGE_ITEMS,
     SUBJECT_STORAGE_REACTIVATION, SUBJECT_STORAGE_TURNS,
 };
-use jsr_client::nats::{
+use fluxbee_sdk::nats::{
     publish_local as client_nats_publish_local, resolve_local_nats_endpoint, subscribe_local,
     NatsError as ClientNatsError, NatsRequestEnvelope, NatsResponseEnvelope,
     NATS_ENVELOPE_SCHEMA_VERSION,

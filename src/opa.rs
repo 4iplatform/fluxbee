@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 use wasmtime::{Caller, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
 
-use jsr_client::protocol::Message;
+use fluxbee_sdk::protocol::Message;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpaError {

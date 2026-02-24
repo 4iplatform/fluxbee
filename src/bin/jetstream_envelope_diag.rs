@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use json_router::nats::{publish as router_publish, NatsSubscriber as RouterNatsSubscriber};
-use jsr_client::nats::{
+use fluxbee_sdk::nats::{
     NatsClient, NatsError as ClientNatsError, NatsSubscriber as ClientNatsSubscriber,
     NATS_ENVELOPE_SCHEMA_VERSION,
 };

@@ -15,9 +15,9 @@ use json_router::shm::{
     now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RemoteHiveEntry, RemoteNodeEntry,
     RouterRegionReader, ShmSnapshot, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
 };
-use jsr_client::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
-use jsr_client::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
-use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
 
 type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -950,7 +950,7 @@ fn nats_endpoint_from_hive(hive: &HiveFile) -> String {
 async fn connect_with_retry(
     config: &NodeConfig,
     delay: Duration,
-) -> Result<(NodeSender, NodeReceiver), jsr_client::NodeError> {
+) -> Result<(NodeSender, NodeReceiver), fluxbee_sdk::NodeError> {
     loop {
         match connect(config).await {
             Ok(result) => return Ok(result),
