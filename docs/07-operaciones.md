@@ -144,14 +144,42 @@ blob:
 | `nats.mode` | No | `embedded` | `embedded` o `client` |
 | `nats.port` | No | 4222 | Puerto NATS si embedded |
 | `nats.url` | No | - | URL si mode=client |
+| `storage.path` | No | `/var/lib/fluxbee` | Root de storage compartido de módulos/artefactos |
 | `blob.enabled` | No | `true` | Habilita capa blob local |
 | `blob.path` | No | `/var/lib/fluxbee/blob` | Path base de blobs |
-| `blob.sync.enabled` | No | `false` | Activa sincronización externa de blobs |
+| `blob.sync.enabled` | No | `false` | Activa sincronización externa de blobs (gestionada por orchestrator) |
 | `blob.sync.tool` | No | `syncthing` | Herramienta de sincronización (actual: Syncthing) |
 | `blob.sync.api_port` | No | 8384 | API local de Syncthing |
 | `blob.sync.data_dir` | No | `/var/lib/fluxbee/syncthing` | Directorio de estado de Syncthing |
 | `database.url` | Solo Motherbee | - | Connection string PostgreSQL |
 | `database.pool_size` | No | 10 | Conexiones en el pool |
+
+### 2.5 Blob Sync (Syncthing) - Operación
+
+Regla de activación:
+1. Se habilita desde `hive.yaml` de Motherbee (`blob.sync.enabled=true`).
+2. `SY.orchestrator` aplica setup local y propaga setup a hives gestionadas.
+3. En `add_hive`, la isla nueva ya queda con Syncthing instalado/configurado si sync está activo.
+
+Lifecycle gestionado por orchestrator:
+- Unit systemd: `fluxbee-syncthing.service`.
+- Health local: conexión TCP a `127.0.0.1:<blob.sync.api_port>`.
+- Watchdog: restart automático si servicio/API no está sano.
+- Reconciliación por config: si `blob.sync.enabled` pasa a `false` (o se quita en `hive.yaml` de Motherbee), el orchestrator revierte setup local/remoto:
+  - `systemctl stop/disable fluxbee-syncthing`,
+  - remueve unit `fluxbee-syncthing.service`,
+  - ejecuta `daemon-reload`,
+  - elimina reglas de firewall Syncthing en hosts gestionados.
+
+Puertos operativos Syncthing:
+- `22000/tcp` (sync)
+- `22000/udp` (QUIC/sync)
+- `21027/udp` (local discovery)
+- `8384/tcp` (API GUI local; por default enlazada a `127.0.0.1`)
+
+Firewall:
+- El orchestrator intenta abrir puertos con `ufw` o `firewalld` (local y remoto).
+- Si no detecta `ufw/firewalld`, deja warning en logs y la apertura queda a cargo de la política de host.
 
 ---
 
@@ -215,7 +243,7 @@ blob:
 | Router | ✓ | ✓ | |
 | NATS embebido | ✓ | ✓ | Buffer local |
 | WAN bridge | ✓ | ✓ | Si config.wan presente |
-| Syncthing (opcional) | ✓ | ✓ | Solo si `blob.sync.enabled=true`; orchestrator mantiene lifecycle |
+| Syncthing (opcional) | ✓ | ✓ | Solo si `blob.sync.enabled=true`; orchestrator instala/arranca/monitorea local+remoto |
 | **Sistema** |
 | SY.identity | ✓ | ✓ (cache) | Worker sincroniza de Motherbee |
 | SY.config.routes | ✓ | ✓ (cache) | Worker sincroniza de Motherbee |
@@ -266,6 +294,7 @@ SY.orchestrator es el **único proceso que se inicia manualmente** en Motherbee.
 3. **Gestiona** ciclo de vida de nodos de aplicación
 4. **Ejecuta** bootstrap de workers remotos (add_hive)
 5. **Supervisa** salud de NATS (buffer levels)
+6. **Gestiona** Syncthing para blob sync (si `blob.sync.enabled=true`)
 
 ### 4.3 Métodos de Supervisión
 
@@ -278,6 +307,7 @@ SY.orchestrator es el **único proceso que se inicia manualmente** en Motherbee.
 | SY.opa.rules | systemd | SHM heartbeat | `systemctl restart` |
 | SY.admin | systemd | SHM heartbeat | `systemctl restart` |
 | SY.cognition | systemd | SHM heartbeat | `systemctl restart` |
+| fluxbee-syncthing (opcional) | systemd | API local `127.0.0.1:<api_port>` | `systemctl restart` |
 | AI.* / IO.* / WF.* | exec/spawn | Proceso hijo | Log warning, respawn opcional |
 
 **Core via systemd:** Máxima estabilidad, el kernel reinicia si falla.  

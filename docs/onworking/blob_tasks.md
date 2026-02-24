@@ -83,14 +83,14 @@ Salida:
 ### BLOB-S1 - Operación
 - [x] S1. Config runtime para habilitar sync por herramienta externa.
 - [x] S2. Orchestrator: install/start/health/restart de Syncthing.
-- [ ] S3. Documentar rutas, permisos y puertos operativos.
+- [x] S3. Documentar rutas, permisos y puertos operativos.
 
 Salida:
 - sync multi-isla gestionado por orchestrator.
 
 ### BLOB-S2 - E2E multi-isla
-- [ ] S4. E2E con Syncthing activo + `resolve_with_retry`.
-- [ ] S5. Verificar invariancia del contrato blob con/ sin sync.
+- [x] S4. E2E con Syncthing activo + `resolve_with_retry`.
+- [x] S5. Verificar invariancia del contrato blob con/ sin sync.
 
 Salida:
 - mismo contrato blob en ambos modos de operación.

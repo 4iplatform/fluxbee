@@ -53,11 +53,13 @@ Alcance:
   - forzar redelivery por no-ack intencional en servidor de diagnóstico,
   - producir resumen simple de conteos (`published/received/acked/no-ack`).
 
-### 1.6 Blob E2E/Stats (pendiente)
-- Estado actual:
-  - no hay aún suite dedicada de diagnóstico blob E2E integrada.
-- Objetivo:
-  - centralizar aquí el plan de métricas/diagnóstico blob para no duplicar en `blob_tasks.md`.
+### 1.6 Blob Sync E2E + invariancia de contrato
+- Script: `scripts/blob_sync_e2e.sh`
+- Binario: `src/bin/blob_sync_diag.rs`
+- Propósito:
+  - validar `resolve_with_retry` en escenario cross-root (modo sync),
+  - validar invariancia del contrato (`BlobRef` + `text/v1`) entre modo sin sync y modo sync,
+  - producir resumen compacto (`contract_invariant`, `consumer_retry_elapsed_ms`, roots y modo de sync).
 
 ## 2) Variables de diagnóstico (catálogo operativo)
 
@@ -137,6 +139,25 @@ Alcance:
 - `BUILD_BIN`
 - `SHOW_FULL_LOGS`
 
+## 2.6 `blob_sync_e2e.sh` + `blob_sync_diag.rs`
+- `BUILD_BIN`
+- `BLOB_DIAG_BIN_PATH`
+- `BLOB_DIAG_SOURCE_ROOT`
+- `BLOB_DIAG_TARGET_ROOT`
+- `BLOB_DIAG_FILENAME`
+- `BLOB_DIAG_CONTENT`
+- `BLOB_DIAG_MIME`
+- `BLOB_DIAG_PAYLOAD_TEXT`
+- `BLOB_DIAG_SYNC_MODE=copy|external`
+- `BLOB_DIAG_SYNC_DELAY_MS`
+- `BLOB_DIAG_RETRY_MAX_WAIT_MS`
+- `BLOB_DIAG_RETRY_INITIAL_MS`
+- `BLOB_DIAG_RETRY_BACKOFF`
+- `BLOB_DIAG_REQUIRE_SYNCTHING_ACTIVE`
+- `BLOB_DIAG_SYNCTHING_SERVICE`
+- `JSR_LOG_LEVEL`
+- `SHOW_FULL_LOGS`
+
 ## 3) Qué se mide hoy (métricas efectivas)
 
 ### 3.1 Métricas de latencia NATS (WF diag)
@@ -197,18 +218,17 @@ Alcance:
   - `client timeout` (si ocurre),
   - `nats reconnect` (si ocurre).
 
-### 3.6 Métricas Blob (objetivo)
-- Conteo base:
-  - `blob_put_total`,
-  - `blob_get_total`,
-  - `blob_errors_total`.
-- Capacidad/volumen:
-  - `blob_bytes_stored`,
-  - `blob_gc_deleted_total`,
-  - `blob_gc_reclaimed_bytes`.
-- Latencia (si aplica):
-  - `blob_put_ms_p50/p95/max`,
-  - `blob_get_ms_p50/p95/max`.
+### 3.6 Métricas Blob (diag actual)
+- Suite `blob_sync_e2e.sh`:
+  - `contract_invariant=true|false`,
+  - `consumer_retry_elapsed_ms`,
+  - `sync_mode`,
+  - `source_root`, `target_root`,
+  - `syncthing_service_checked`.
+- Binario `blob_sync_diag.rs`:
+  - `ELAPSED_MS` en consumidor (`resolve_with_retry`),
+  - `RESOLVED_BYTES`,
+  - `CONTRACT_SIGNATURE` (productor).
 
 ### 3.7 Blob SDK (estado actual implementado)
 - Cobertura funcional actual en `fluxbee_sdk`:
@@ -274,6 +294,23 @@ cargo test -p fluxbee-sdk blob::tests -- --nocapture
 cargo test -p fluxbee-sdk payload::tests -- --nocapture
 ```
 
+Blob sync E2E (`resolve_with_retry` + invariancia de contrato):
+```bash
+BUILD_BIN=0 \
+BLOB_DIAG_REQUIRE_SYNCTHING_ACTIVE=1 \
+BLOB_DIAG_SYNC_MODE=copy \
+bash scripts/blob_sync_e2e.sh
+```
+
+Blob sync E2E en modo externo (espera propagación real por Syncthing/NFS):
+```bash
+BUILD_BIN=0 \
+BLOB_DIAG_REQUIRE_SYNCTHING_ACTIVE=1 \
+BLOB_DIAG_SYNC_MODE=external \
+BLOB_DIAG_RETRY_MAX_WAIT_MS=30000 \
+bash scripts/blob_sync_e2e.sh
+```
+
 Nota:
 - en la policy actual de `sandbox` (observación 2026-02-22), `Resolve` para `SPAWN_NODE` devuelve `OPA_NO_TARGET`.
 - usar `OPA_ERROR` solo para validar fallas técnicas del resolver OPA.
@@ -291,8 +328,9 @@ OPA_EXPECT_STATUS=ok OPA_MIN_VERSION=1 OPA_MAX_HEARTBEAT_AGE_MS=30000 \
 - [ ] Definir presupuesto de latencia objetivo por flujo (NATS, system routing, OPA resolve).
 - [ ] Agregar versionado de “perfil de diagnóstico” (resilience/perf/wan/opa).
 - [ ] Implementar resumen compacto de métricas de transporte en suite JetStream envelope (`sent/acked/redelivered/replayed/timeouts/reconnects/p50-p95-max`).
-- [ ] Implementar suite Blob E2E (`blob_ref` + verificación hash end-to-end) con salida compacta y resumen.
-- [ ] Incorporar resumen de Blob Stats en el mismo formato de reportes (`count/p50/p95/max`, errores y volumen).
+- [x] Implementar suite Blob E2E (`blob_ref` + verificación end-to-end por contenido) con salida compacta y resumen.
+- [ ] Extender suite Blob E2E con hash end-to-end (`sha256`) en salida estándar.
+- [ ] Incorporar resumen de Blob Stats en formato agregable (`count/p50/p95/max`, errores y volumen).
 
 ## 7) Router Stats (propuesta para spec, sin implementación aún)
 

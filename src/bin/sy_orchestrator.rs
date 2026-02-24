@@ -35,6 +35,9 @@ const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
 const SYNCTHING_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
 const SYNCTHING_HEALTH_TIMEOUT_SECS: u64 = 2;
 const SYNCTHING_INSTALL_USER: &str = "fluxbee";
+const SYNCTHING_SYNC_PORT_TCP: u16 = 22000;
+const SYNCTHING_SYNC_PORT_UDP: u16 = 22000;
+const SYNCTHING_DISCOVERY_PORT_UDP: u16 = 21027;
 const DEFAULT_BLOB_ENABLED: bool = true;
 const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
 const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
@@ -91,7 +94,7 @@ struct BlobSyncSection {
     data_dir: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BlobRuntimeConfig {
     enabled: bool,
     path: PathBuf,
@@ -140,6 +143,7 @@ struct OrchestratorState {
     last_runtime_verify: Mutex<Instant>,
     nats_endpoint: String,
     blob: BlobRuntimeConfig,
+    blob_sync_last_desired: Mutex<BlobRuntimeConfig>,
 }
 
 const CRITICAL_SERVICES: [&str; 5] = [
@@ -203,7 +207,8 @@ async fn main() -> Result<(), OrchestratorError> {
         runtime_manifest: Mutex::new(runtime_manifest),
         last_runtime_verify: Mutex::new(Instant::now()),
         nats_endpoint,
-        blob: blob_runtime,
+        blob: blob_runtime.clone(),
+        blob_sync_last_desired: Mutex::new(blob_runtime),
     };
     tracing::info!(
         blob_enabled = state.blob.enabled,
@@ -294,7 +299,12 @@ async fn bootstrap_local(
         Duration::from_secs(NATS_BOOTSTRAP_TIMEOUT_SECS),
     )
     .await?;
-    ensure_blob_sync_runtime(state).await?;
+    if state.blob.sync_enabled {
+        ensure_blob_sync_runtime(&state.blob).await?;
+    } else {
+        disable_blob_sync_runtime_local()?;
+        disable_remote_blob_sync_all_hives(state);
+    }
 
     let mut services = vec!["sy-config-routes", "sy-opa-rules", "sy-admin", "sy-storage"];
     if identity_available() {
@@ -590,7 +600,7 @@ async fn shutdown_sequence(state: &OrchestratorState) {
     if let Err(err) = systemd_stop("rt-gateway") {
         tracing::warn!(service = "rt-gateway", error = %err, "failed to stop service");
     }
-    if blob_sync_enabled(state) {
+    if systemd_is_active(SYNCTHING_SERVICE_NAME) {
         if let Err(err) = systemd_stop(SYNCTHING_SERVICE_NAME) {
             tracing::warn!(
                 service = SYNCTHING_SERVICE_NAME,
@@ -1101,12 +1111,22 @@ fn ensure_dirs(
     Ok(())
 }
 
-fn blob_sync_enabled(state: &OrchestratorState) -> bool {
-    state.blob.sync_enabled
-}
-
 fn blob_sync_tool_is_syncthing(blob: &BlobRuntimeConfig) -> bool {
     blob.sync_tool.trim().eq_ignore_ascii_case("syncthing")
+}
+
+fn current_blob_runtime_config(state: &OrchestratorState) -> BlobRuntimeConfig {
+    match load_hive(&state.config_dir) {
+        Ok(hive) => blob_runtime_from_hive(&hive),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                config_dir = %state.config_dir.display(),
+                "failed to reload hive.yaml for blob sync reconciliation; using startup config"
+            );
+            state.blob.clone()
+        }
+    }
 }
 
 fn linux_user_exists(user: &str) -> bool {
@@ -1128,6 +1148,128 @@ fn syncthing_binary_available() -> bool {
 
 fn apt_get_available() -> bool {
     Path::new("/usr/bin/apt-get").exists() || Path::new("/bin/apt-get").exists()
+}
+
+fn command_exists(name: &str) -> bool {
+    Command::new("sh")
+        .arg("-lc")
+        .arg(format!("command -v {name} >/dev/null 2>&1"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn ensure_syncthing_firewall_local() {
+    let mut applied = false;
+    if command_exists("ufw") {
+        applied = true;
+        for rule in [
+            format!("{SYNCTHING_SYNC_PORT_TCP}/tcp"),
+            format!("{SYNCTHING_SYNC_PORT_UDP}/udp"),
+            format!("{SYNCTHING_DISCOVERY_PORT_UDP}/udp"),
+        ] {
+            let mut cmd = Command::new("ufw");
+            cmd.arg("allow").arg(&rule);
+            if let Err(err) = run_cmd(cmd, "ufw allow syncthing") {
+                tracing::warn!(rule = %rule, error = %err, "ufw allow failed");
+            }
+        }
+    }
+
+    if command_exists("firewall-cmd") {
+        let mut state_cmd = Command::new("firewall-cmd");
+        state_cmd.arg("--state");
+        if run_cmd(state_cmd, "firewall-cmd --state").is_ok() {
+            applied = true;
+            for rule in [
+                format!("{SYNCTHING_SYNC_PORT_TCP}/tcp"),
+                format!("{SYNCTHING_SYNC_PORT_UDP}/udp"),
+                format!("{SYNCTHING_DISCOVERY_PORT_UDP}/udp"),
+            ] {
+                let mut cmd_now = Command::new("firewall-cmd");
+                cmd_now.arg("--add-port").arg(&rule);
+                if let Err(err) = run_cmd(cmd_now, "firewall-cmd --add-port") {
+                    tracing::warn!(rule = %rule, error = %err, "firewalld runtime port rule failed");
+                }
+
+                let mut cmd_persistent = Command::new("firewall-cmd");
+                cmd_persistent
+                    .arg("--permanent")
+                    .arg("--add-port")
+                    .arg(&rule);
+                if let Err(err) = run_cmd(cmd_persistent, "firewall-cmd --permanent --add-port") {
+                    tracing::warn!(rule = %rule, error = %err, "firewalld permanent port rule failed");
+                }
+            }
+        }
+    }
+
+    if !applied {
+        tracing::warn!(
+            "no ufw/firewalld detected; syncthing ports must be opened by host firewall policy"
+        );
+    }
+}
+
+fn disable_syncthing_firewall_local() {
+    let mut applied = false;
+    if command_exists("ufw") {
+        applied = true;
+        for rule in [
+            format!("{SYNCTHING_SYNC_PORT_TCP}/tcp"),
+            format!("{SYNCTHING_SYNC_PORT_UDP}/udp"),
+            format!("{SYNCTHING_DISCOVERY_PORT_UDP}/udp"),
+        ] {
+            let mut cmd = Command::new("ufw");
+            cmd.arg("--force").arg("delete").arg("allow").arg(&rule);
+            if let Err(err) = run_cmd(cmd, "ufw delete allow syncthing") {
+                tracing::warn!(rule = %rule, error = %err, "ufw delete allow failed");
+            }
+        }
+    }
+
+    if command_exists("firewall-cmd") {
+        let mut state_cmd = Command::new("firewall-cmd");
+        state_cmd.arg("--state");
+        if run_cmd(state_cmd, "firewall-cmd --state").is_ok() {
+            applied = true;
+            for rule in [
+                format!("{SYNCTHING_SYNC_PORT_TCP}/tcp"),
+                format!("{SYNCTHING_SYNC_PORT_UDP}/udp"),
+                format!("{SYNCTHING_DISCOVERY_PORT_UDP}/udp"),
+            ] {
+                let mut cmd_now = Command::new("firewall-cmd");
+                cmd_now.arg("--remove-port").arg(&rule);
+                if let Err(err) = run_cmd(cmd_now, "firewall-cmd --remove-port") {
+                    tracing::warn!(
+                        rule = %rule,
+                        error = %err,
+                        "firewalld runtime port remove failed"
+                    );
+                }
+
+                let mut cmd_persistent = Command::new("firewall-cmd");
+                cmd_persistent
+                    .arg("--permanent")
+                    .arg("--remove-port")
+                    .arg(&rule);
+                if let Err(err) = run_cmd(cmd_persistent, "firewall-cmd --permanent --remove-port")
+                {
+                    tracing::warn!(
+                        rule = %rule,
+                        error = %err,
+                        "firewalld permanent port remove failed"
+                    );
+                }
+            }
+        }
+    }
+
+    if !applied {
+        tracing::warn!(
+            "no ufw/firewalld detected; syncthing ports must be removed by host firewall policy"
+        );
+    }
 }
 
 fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
@@ -1220,20 +1362,21 @@ async fn wait_for_syncthing_health(blob: &BlobRuntimeConfig) -> Result<(), Orche
     }
 }
 
-async fn ensure_blob_sync_runtime(state: &OrchestratorState) -> Result<(), OrchestratorError> {
-    if !blob_sync_enabled(state) {
+async fn ensure_blob_sync_runtime(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {
+    if !blob.sync_enabled {
         return Ok(());
     }
-    if !blob_sync_tool_is_syncthing(&state.blob) {
+    if !blob_sync_tool_is_syncthing(blob) {
         return Err(format!(
             "unsupported blob.sync.tool '{}' (expected syncthing)",
-            state.blob.sync_tool
+            blob.sync_tool
         )
         .into());
     }
 
     ensure_syncthing_installed()?;
-    ensure_syncthing_unit(&state.blob)?;
+    ensure_syncthing_unit(blob)?;
+    ensure_syncthing_firewall_local();
     tracing::info!(
         service = SYNCTHING_SERVICE_NAME,
         "starting blob sync service"
@@ -1244,29 +1387,80 @@ async fn ensure_blob_sync_runtime(state: &OrchestratorState) -> Result<(), Orche
         Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
     )
     .await?;
-    wait_for_syncthing_health(&state.blob).await?;
+    wait_for_syncthing_health(blob).await?;
     tracing::info!(
         service = SYNCTHING_SERVICE_NAME,
-        api_port = state.blob.sync_api_port,
+        api_port = blob.sync_api_port,
         "blob sync service healthy"
     );
+    ensure_remote_blob_sync_all_hives(blob);
+    Ok(())
+}
+
+fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
+    if systemd_is_active(SYNCTHING_SERVICE_NAME) {
+        tracing::info!(
+            service = SYNCTHING_SERVICE_NAME,
+            "stopping blob sync service"
+        );
+        systemd_stop(SYNCTHING_SERVICE_NAME)?;
+    }
+    if let Err(err) = systemd_disable(SYNCTHING_SERVICE_NAME) {
+        tracing::warn!(
+            service = SYNCTHING_SERVICE_NAME,
+            error = %err,
+            "failed to disable blob sync service"
+        );
+    }
+
+    let unit_path =
+        Path::new("/etc/systemd/system").join(format!("{SYNCTHING_SERVICE_NAME}.service"));
+    if unit_path.exists() {
+        fs::remove_file(&unit_path)?;
+        let mut daemon_reload = Command::new("systemctl");
+        daemon_reload.arg("daemon-reload");
+        run_cmd(daemon_reload, "systemctl daemon-reload")?;
+    }
+    disable_syncthing_firewall_local();
     Ok(())
 }
 
 async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), OrchestratorError> {
-    if !blob_sync_enabled(state) {
+    let desired_blob = current_blob_runtime_config(state);
+    let changed = {
+        let mut last = state.blob_sync_last_desired.lock().await;
+        if *last != desired_blob {
+            *last = desired_blob.clone();
+            true
+        } else {
+            false
+        }
+    };
+
+    if !desired_blob.sync_enabled {
+        if changed {
+            tracing::info!("blob sync disabled in hive.yaml; reverting syncthing runtime");
+            disable_blob_sync_runtime_local()?;
+            disable_remote_blob_sync_all_hives(state);
+        }
         return Ok(());
     }
-    if !blob_sync_tool_is_syncthing(&state.blob) {
+    if !blob_sync_tool_is_syncthing(&desired_blob) {
         return Err(format!(
             "unsupported blob.sync.tool '{}' (expected syncthing)",
-            state.blob.sync_tool
+            desired_blob.sync_tool
         )
         .into());
     }
 
+    if changed {
+        tracing::info!("blob sync config changed in hive.yaml; reconciling syncthing runtime");
+        ensure_blob_sync_runtime(&desired_blob).await?;
+        return Ok(());
+    }
+
     let service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
-    let api_healthy = syncthing_api_healthy(state.blob.sync_api_port).await;
+    let api_healthy = syncthing_api_healthy(desired_blob.sync_api_port).await;
     if service_active && api_healthy {
         return Ok(());
     }
@@ -1277,13 +1471,7 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         api_healthy = api_healthy,
         "syncthing unhealthy; restarting"
     );
-    systemd_restart(SYNCTHING_SERVICE_NAME)?;
-    wait_for_service_active(
-        SYNCTHING_SERVICE_NAME,
-        Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
-    )
-    .await?;
-    wait_for_syncthing_health(&state.blob).await?;
+    ensure_blob_sync_runtime(&desired_blob).await?;
     Ok(())
 }
 
@@ -2306,12 +2494,196 @@ fn hive_access(hive_id: &str) -> Result<(String, PathBuf), OrchestratorError> {
     Ok((address, key_path))
 }
 
+fn shell_single_quote(value: &str) -> String {
+    value.replace('\'', "'\"'\"'")
+}
+
+fn list_managed_hive_ids() -> Vec<String> {
+    let mut out = Vec::new();
+    let root = hives_root();
+    let read = match fs::read_dir(root) {
+        Ok(read) => read,
+        Err(_) => return out,
+    };
+    for entry in read.flatten() {
+        if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let hive_id = entry.file_name().to_string_lossy().to_string();
+        if !hive_id.is_empty() {
+            out.push(hive_id);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn ensure_remote_syncthing_firewall(
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    let firewall_cmd = format!(
+        "bash -lc \"if command -v ufw >/dev/null 2>&1; then ufw allow {}/tcp || true; ufw allow {}/udp || true; ufw allow {}/udp || true; fi; if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --add-port={}/tcp || true; firewall-cmd --add-port={}/udp || true; firewall-cmd --add-port={}/udp || true; firewall-cmd --permanent --add-port={}/tcp || true; firewall-cmd --permanent --add-port={}/udp || true; firewall-cmd --permanent --add-port={}/udp || true; fi\"",
+        SYNCTHING_SYNC_PORT_TCP,
+        SYNCTHING_SYNC_PORT_UDP,
+        SYNCTHING_DISCOVERY_PORT_UDP,
+        SYNCTHING_SYNC_PORT_TCP,
+        SYNCTHING_SYNC_PORT_UDP,
+        SYNCTHING_DISCOVERY_PORT_UDP,
+        SYNCTHING_SYNC_PORT_TCP,
+        SYNCTHING_SYNC_PORT_UDP,
+        SYNCTHING_DISCOVERY_PORT_UDP,
+    );
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&firewall_cmd),
+        BOOTSTRAP_SSH_USER,
+    )
+}
+
+fn disable_remote_syncthing_firewall(
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    let firewall_cmd = format!(
+        "bash -lc \"if command -v ufw >/dev/null 2>&1; then ufw --force delete allow {}/tcp || true; ufw --force delete allow {}/udp || true; ufw --force delete allow {}/udp || true; fi; if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --remove-port={}/tcp || true; firewall-cmd --remove-port={}/udp || true; firewall-cmd --remove-port={}/udp || true; firewall-cmd --permanent --remove-port={}/tcp || true; firewall-cmd --permanent --remove-port={}/udp || true; firewall-cmd --permanent --remove-port={}/udp || true; fi\"",
+        SYNCTHING_SYNC_PORT_TCP,
+        SYNCTHING_SYNC_PORT_UDP,
+        SYNCTHING_DISCOVERY_PORT_UDP,
+        SYNCTHING_SYNC_PORT_TCP,
+        SYNCTHING_SYNC_PORT_UDP,
+        SYNCTHING_DISCOVERY_PORT_UDP,
+        SYNCTHING_SYNC_PORT_TCP,
+        SYNCTHING_SYNC_PORT_UDP,
+        SYNCTHING_DISCOVERY_PORT_UDP,
+    );
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&firewall_cmd),
+        BOOTSTRAP_SSH_USER,
+    )
+}
+
+fn ensure_remote_syncthing_runtime(
+    hive_id: &str,
+    blob: &BlobRuntimeConfig,
+) -> Result<(), OrchestratorError> {
+    let (address, key_path) = hive_access(hive_id)?;
+
+    let install_cmd = r#"bash -lc "if ! command -v syncthing >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y syncthing; elif command -v dnf >/dev/null 2>&1; then dnf install -y syncthing; elif command -v yum >/dev/null 2>&1; then yum install -y syncthing; else echo 'no package manager available for syncthing install' >&2; exit 1; fi; fi""#;
+    ssh_with_key(
+        &address,
+        &key_path,
+        &sudo_wrap(install_cmd),
+        BOOTSTRAP_SSH_USER,
+    )?;
+
+    let blob_path_q = shell_single_quote(&blob.path.display().to_string());
+    let sync_data_dir_q = shell_single_quote(&blob.sync_data_dir.display().to_string());
+    let mkdir_cmd = format!("mkdir -p '{blob_path_q}' '{sync_data_dir_q}'");
+    ssh_with_key(
+        &address,
+        &key_path,
+        &sudo_wrap(&mkdir_cmd),
+        BOOTSTRAP_SSH_USER,
+    )?;
+
+    let remote_unit = syncthing_unit_contents(blob, "root");
+    write_remote_file(
+        &address,
+        &key_path,
+        &format!("/etc/systemd/system/{SYNCTHING_SERVICE_NAME}.service"),
+        &remote_unit,
+    )?;
+    ssh_with_key(
+        &address,
+        &key_path,
+        &sudo_wrap("systemctl daemon-reload"),
+        BOOTSTRAP_SSH_USER,
+    )?;
+    ssh_with_key(
+        &address,
+        &key_path,
+        &sudo_wrap(&format!("systemctl enable {SYNCTHING_SERVICE_NAME}")),
+        BOOTSTRAP_SSH_USER,
+    )?;
+    ssh_with_key(
+        &address,
+        &key_path,
+        &sudo_wrap(&format!("systemctl restart {SYNCTHING_SERVICE_NAME}")),
+        BOOTSTRAP_SSH_USER,
+    )?;
+    ensure_remote_syncthing_firewall(&address, &key_path)?;
+    Ok(())
+}
+
+fn ensure_remote_blob_sync_all_hives(blob: &BlobRuntimeConfig) {
+    for hive_id in list_managed_hive_ids() {
+        if let Err(err) = ensure_remote_syncthing_runtime(&hive_id, blob) {
+            tracing::warn!(
+                hive_id = hive_id,
+                error = %err,
+                "failed to ensure syncthing on managed hive"
+            );
+        }
+    }
+}
+
+fn disable_remote_syncthing_runtime(hive_id: &str) {
+    let (address, key_path) = match hive_access(hive_id) {
+        Ok(access) => access,
+        Err(err) => {
+            tracing::warn!(
+                hive_id = hive_id,
+                error = %err,
+                "failed to resolve hive access for syncthing teardown"
+            );
+            return;
+        }
+    };
+
+    let stop_disable_cmd = format!(
+        "bash -lc \"systemctl stop {0} || true; systemctl disable {0} || true; rm -f /etc/systemd/system/{0}.service; systemctl daemon-reload || true\"",
+        SYNCTHING_SERVICE_NAME
+    );
+    if let Err(err) = ssh_with_key(
+        &address,
+        &key_path,
+        &sudo_wrap(&stop_disable_cmd),
+        BOOTSTRAP_SSH_USER,
+    ) {
+        tracing::warn!(
+            hive_id = hive_id,
+            error = %err,
+            "failed to stop/disable remote syncthing"
+        );
+    }
+
+    if let Err(err) = disable_remote_syncthing_firewall(&address, &key_path) {
+        tracing::warn!(
+            hive_id = hive_id,
+            error = %err,
+            "failed to remove remote syncthing firewall rules"
+        );
+    }
+}
+
+fn disable_remote_blob_sync_all_hives(state: &OrchestratorState) {
+    let _ = state;
+    for hive_id in list_managed_hive_ids() {
+        disable_remote_syncthing_runtime(&hive_id);
+    }
+}
+
 fn add_hive_flow(
     state: &OrchestratorState,
     hive_id: &str,
     address: &str,
     harden_ssh: bool,
 ) -> serde_json::Value {
+    let desired_blob = current_blob_runtime_config(state);
     let root = hives_root();
     let hive_dir = root.join(hive_id);
     if hive_exists(&state.state_dir, hive_id) {
@@ -2553,12 +2925,12 @@ fn add_hive_flow(
         hive_id,
         worker_uplink,
         storage_path,
-        state.blob.enabled,
-        state.blob.path.display(),
-        state.blob.sync_enabled,
-        state.blob.sync_tool,
-        state.blob.sync_api_port,
-        state.blob.sync_data_dir.display()
+        desired_blob.enabled,
+        desired_blob.path.display(),
+        desired_blob.sync_enabled,
+        desired_blob.sync_tool,
+        desired_blob.sync_api_port,
+        desired_blob.sync_data_dir.display()
     );
     if let Err(err) = write_remote_file(address, &key_path, "/etc/fluxbee/hive.yaml", &hive_yaml) {
         return serde_json::json!({
@@ -2644,6 +3016,16 @@ fn add_hive_flow(
                 "status": "error",
                 "error_code": "SERVICE_FAILED",
                 "message": format!("restart {name}: {err}"),
+            });
+        }
+    }
+
+    if desired_blob.sync_enabled {
+        if let Err(err) = ensure_remote_syncthing_runtime(hive_id, &desired_blob) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SYNC_SETUP_FAILED",
+                "message": format!("syncthing setup failed: {err}"),
             });
         }
     }
@@ -2830,10 +3212,10 @@ fn systemd_stop(service: &str) -> Result<(), OrchestratorError> {
     run_cmd(cmd, "systemctl stop")
 }
 
-fn systemd_restart(service: &str) -> Result<(), OrchestratorError> {
+fn systemd_disable(service: &str) -> Result<(), OrchestratorError> {
     let mut cmd = Command::new("systemctl");
-    cmd.arg("restart").arg(service);
-    run_cmd(cmd, "systemctl restart")
+    cmd.arg("disable").arg(service);
+    run_cmd(cmd, "systemctl disable")
 }
 
 fn disable_remote_password_auth(address: &str) -> Result<(), OrchestratorError> {
