@@ -8,11 +8,11 @@ use serde_json::{json, Value};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use json_router::nats::{publish as router_publish, NatsSubscriber as RouterNatsSubscriber};
 use fluxbee_sdk::nats::{
     NatsClient, NatsError as ClientNatsError, NatsSubscriber as ClientNatsSubscriber,
     NATS_ENVELOPE_SCHEMA_VERSION,
 };
+use json_router::nats::{publish as router_publish, NatsSubscriber as RouterNatsSubscriber};
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -46,10 +46,7 @@ async fn main() -> Result<(), DynError> {
     match mode.as_str() {
         "server" => {
             let sid = env_u32("JETSTREAM_DIAG_SID", 52_001);
-            let queue = env_or(
-                "JETSTREAM_DIAG_QUEUE",
-                "durable.jetstream.diag.envelope",
-            );
+            let queue = env_or("JETSTREAM_DIAG_QUEUE", "durable.jetstream.diag.envelope");
             let fail_first_n = env_u64("JETSTREAM_DIAG_FAIL_FIRST_N", 0);
             run_server(stack, endpoint, subject, sid, queue, fail_first_n).await
         }
@@ -69,10 +66,7 @@ async fn main() -> Result<(), DynError> {
             )
             .await
         }
-        other => Err(format!(
-            "invalid JETSTREAM_DIAG_MODE={other}; expected server|client"
-        )
-        .into()),
+        other => Err(format!("invalid JETSTREAM_DIAG_MODE={other}; expected server|client").into()),
     }
 }
 
@@ -169,11 +163,7 @@ async fn run_client(
         }
     }
 
-    tracing::info!(
-        mode = "client",
-        loops,
-        "jetstream diag client completed"
-    );
+    tracing::info!(mode = "client", loops, "jetstream diag client completed");
 
     Ok(())
 }

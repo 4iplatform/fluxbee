@@ -14,6 +14,12 @@ const DEFAULT_HIVE_ROLE: &str = "worker";
 const DEFAULT_NATS_MODE: &str = "embedded";
 const DEFAULT_NATS_PORT: u16 = 4222;
 const DEFAULT_NATS_STORAGE_DIR: &str = "/var/lib/fluxbee/nats";
+const DEFAULT_BLOB_ENABLED: bool = true;
+const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
+const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
+const DEFAULT_BLOB_SYNC_TOOL: &str = "syncthing";
+const DEFAULT_BLOB_SYNC_API_PORT: u16 = 8384;
+const DEFAULT_BLOB_SYNC_DATA_DIR: &str = "/var/lib/fluxbee/syncthing";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -52,6 +58,12 @@ pub struct RouterConfig {
     pub nats_port: u16,
     pub nats_url: String,
     pub nats_storage_dir: PathBuf,
+    pub blob_enabled: bool,
+    pub blob_path: PathBuf,
+    pub blob_sync_enabled: bool,
+    pub blob_sync_tool: String,
+    pub blob_sync_api_port: u16,
+    pub blob_sync_data_dir: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +72,7 @@ struct HiveFile {
     role: Option<String>,
     wan: Option<WanSection>,
     nats: Option<NatsSection>,
+    blob: Option<BlobSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +94,21 @@ struct NatsSection {
     port: Option<u16>,
     url: Option<String>,
     storage_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobSection {
+    enabled: Option<bool>,
+    path: Option<String>,
+    sync: Option<BlobSyncSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobSyncSection {
+    enabled: Option<bool>,
+    tool: Option<String>,
+    api_port: Option<u16>,
+    data_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +152,12 @@ impl RouterConfig {
         let mut nats_port = DEFAULT_NATS_PORT;
         let mut nats_url = String::new();
         let mut nats_storage_dir = PathBuf::from(DEFAULT_NATS_STORAGE_DIR);
+        let mut blob_enabled = DEFAULT_BLOB_ENABLED;
+        let mut blob_path = PathBuf::from(DEFAULT_BLOB_PATH);
+        let mut blob_sync_enabled = DEFAULT_BLOB_SYNC_ENABLED;
+        let mut blob_sync_tool = DEFAULT_BLOB_SYNC_TOOL.to_string();
+        let mut blob_sync_api_port = DEFAULT_BLOB_SYNC_API_PORT;
+        let mut blob_sync_data_dir = PathBuf::from(DEFAULT_BLOB_SYNC_DATA_DIR);
 
         let hive_path = config_dir.join("hive.yaml");
         if !hive_path.exists() {
@@ -176,6 +210,37 @@ impl RouterConfig {
                 }
             }
         }
+        if let Some(blob) = hive.blob {
+            if let Some(enabled) = blob.enabled {
+                blob_enabled = enabled;
+            }
+            if let Some(path) = blob.path {
+                let path = path.trim();
+                if !path.is_empty() {
+                    blob_path = PathBuf::from(path);
+                }
+            }
+            if let Some(sync) = blob.sync {
+                if let Some(enabled) = sync.enabled {
+                    blob_sync_enabled = enabled;
+                }
+                if let Some(tool) = sync.tool {
+                    let tool = tool.trim().to_ascii_lowercase();
+                    if !tool.is_empty() {
+                        blob_sync_tool = tool;
+                    }
+                }
+                if let Some(api_port) = sync.api_port {
+                    blob_sync_api_port = api_port;
+                }
+                if let Some(data_dir) = sync.data_dir {
+                    let data_dir = data_dir.trim();
+                    if !data_dir.is_empty() {
+                        blob_sync_data_dir = PathBuf::from(data_dir);
+                    }
+                }
+            }
+        }
         if nats_url.is_empty() {
             nats_url = format!("nats://127.0.0.1:{nats_port}");
         }
@@ -222,6 +287,12 @@ impl RouterConfig {
             nats_port,
             nats_url,
             nats_storage_dir,
+            blob_enabled,
+            blob_path,
+            blob_sync_enabled,
+            blob_sync_tool,
+            blob_sync_api_port,
+            blob_sync_data_dir,
         })
     }
 }

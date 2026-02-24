@@ -73,7 +73,7 @@ Salida:
 ### BLOB-D2 - E2E operativos
 - [x] D4. E2E local productor->consumidor con `blob_ref`.
 - [x] D5. E2E errores (`BLOB_NOT_FOUND`, permisos, IO).
-- [ ] D6. Incorporar métricas/resultados en `docs/onworking/diagnostics_tasks.md`.
+- [x] D6. Incorporar métricas/resultados en `docs/onworking/diagnostics_tasks.md`.
 
 Salida:
 - validación operativa documentada.
@@ -81,8 +81,8 @@ Salida:
 ## Fase B5 - Syncthing (multi-isla)
 
 ### BLOB-S1 - Operación
-- [ ] S1. Config runtime para habilitar sync por herramienta externa.
-- [ ] S2. Orchestrator: install/start/health/restart de Syncthing.
+- [x] S1. Config runtime para habilitar sync por herramienta externa.
+- [x] S2. Orchestrator: install/start/health/restart de Syncthing.
 - [ ] S3. Documentar rutas, permisos y puertos operativos.
 
 Salida:

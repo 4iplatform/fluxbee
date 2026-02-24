@@ -210,6 +210,18 @@ Alcance:
   - `blob_put_ms_p50/p95/max`,
   - `blob_get_ms_p50/p95/max`.
 
+### 3.7 Blob SDK (estado actual implementado)
+- Cobertura funcional actual en `fluxbee_sdk`:
+  - `put`, `put_bytes`, `promote` (`staging -> active`),
+  - `resolve`, `exists`, `stat`, `resolve_with_retry`,
+  - contrato `text/v1` + `content_ref` automático por límite de tamaño.
+- Pruebas existentes:
+  - suite `blob::tests` (E2E local + errores),
+  - suite `payload::tests` (contrato `text/v1`).
+- Resultado esperado actual:
+  - `blob::tests`: `10 passed`,
+  - `payload::tests`: `3 passed`.
+
 ## 4) Reglas de interpretación (importante)
 - Estos diagnósticos son herramientas E2E/operativas; no forman parte del runtime normal de `sy-orchestrator` ni `sy-admin`.
 - Variables `ORCH_*`, `WF_DIAG_*`, `OPA_*` aplican solo al proceso de diagnóstico invocado.
@@ -254,6 +266,12 @@ JETSTREAM_DIAG_LOOPS=20 \
 JETSTREAM_DIAG_FAIL_FIRST_N=1 \
 JETSTREAM_DIAG_INTERVAL_MS=50 \
 bash scripts/jetstream_envelope_e2e.sh
+```
+
+Blob SDK local (E2E + errores):
+```bash
+cargo test -p fluxbee-sdk blob::tests -- --nocapture
+cargo test -p fluxbee-sdk payload::tests -- --nocapture
 ```
 
 Nota:

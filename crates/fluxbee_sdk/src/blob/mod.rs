@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::payload::{PayloadError, TextV1Payload, TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES};
 
@@ -159,7 +159,8 @@ impl BlobToolkit {
         };
         let (blob_ref, staging_path) =
             self.build_blob_ref_and_staging_path(&data, requested_name, None)?;
-        std::fs::write(&staging_path, data).map_err(|err| map_io_error(err, "write staging file"))?;
+        std::fs::write(&staging_path, data)
+            .map_err(|err| map_io_error(err, "write staging file"))?;
         Ok(blob_ref)
     }
 
@@ -174,10 +175,15 @@ impl BlobToolkit {
         } else {
             original_filename
         };
-        let mime_override = if mime.trim().is_empty() { None } else { Some(mime) };
+        let mime_override = if mime.trim().is_empty() {
+            None
+        } else {
+            Some(mime)
+        };
         let (blob_ref, staging_path) =
             self.build_blob_ref_and_staging_path(data, fallback_name, mime_override)?;
-        std::fs::write(&staging_path, data).map_err(|err| map_io_error(err, "write staging file"))?;
+        std::fs::write(&staging_path, data)
+            .map_err(|err| map_io_error(err, "write staging file"))?;
         Ok(blob_ref)
     }
 
@@ -753,7 +759,6 @@ mod tests {
             .expect_err("put_bytes should fail with permission denied");
         assert!(matches!(err, BlobError::Io(_)));
 
-        std::fs::set_permissions(&root.path, Permissions::from_mode(0o755))
-            .expect("restore perms");
+        std::fs::set_permissions(&root.path, Permissions::from_mode(0o755)).expect("restore perms");
     }
 }

@@ -11,13 +11,13 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+use fluxbee_sdk::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RemoteHiveEntry, RemoteNodeEntry,
     RouterRegionReader, ShmSnapshot, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
 };
-use fluxbee_sdk::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
-use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
 
 type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -31,6 +31,16 @@ const STORAGE_DB_READINESS_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS: u64 = 3;
 const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const SY_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
+const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
+const SYNCTHING_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
+const SYNCTHING_HEALTH_TIMEOUT_SECS: u64 = 2;
+const SYNCTHING_INSTALL_USER: &str = "fluxbee";
+const DEFAULT_BLOB_ENABLED: bool = true;
+const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
+const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
+const DEFAULT_BLOB_SYNC_TOOL: &str = "syncthing";
+const DEFAULT_BLOB_SYNC_API_PORT: u16 = 8384;
+const DEFAULT_BLOB_SYNC_DATA_DIR: &str = "/var/lib/fluxbee/syncthing";
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -38,6 +48,8 @@ struct HiveFile {
     role: Option<String>,
     wan: Option<WanSection>,
     nats: Option<NatsSection>,
+    storage: Option<StorageSection>,
+    blob: Option<BlobSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,11 +77,28 @@ struct NatsSection {
 }
 
 #[derive(Debug, Deserialize)]
-struct OrchestratorFile {
-    #[serde(default)]
-    storage: Option<StorageSection>,
-    #[serde(default)]
-    storage_path: Option<String>,
+struct BlobSection {
+    enabled: Option<bool>,
+    path: Option<String>,
+    sync: Option<BlobSyncSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobSyncSection {
+    enabled: Option<bool>,
+    tool: Option<String>,
+    api_port: Option<u16>,
+    data_dir: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BlobRuntimeConfig {
+    enabled: bool,
+    path: PathBuf,
+    sync_enabled: bool,
+    sync_tool: String,
+    sync_api_port: u16,
+    sync_data_dir: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +139,7 @@ struct OrchestratorState {
     runtime_manifest: Mutex<Option<RuntimeManifest>>,
     last_runtime_verify: Mutex<Instant>,
     nats_endpoint: String,
+    blob: BlobRuntimeConfig,
 }
 
 const CRITICAL_SERVICES: [&str; 5] = [
@@ -154,7 +184,8 @@ async fn main() -> Result<(), OrchestratorError> {
         .and_then(|wan| wan.authorized_hives.clone())
         .unwrap_or_default();
     let nats_endpoint = nats_endpoint_from_hive(&hive);
-    let storage_path = load_storage_path(&config_dir);
+    let blob_runtime = blob_runtime_from_hive(&hive);
+    let storage_path = storage_path_from_hive(&hive);
     let runtime_manifest = load_runtime_manifest();
     let system_allowed_origins = load_system_allowed_origins(&hive.hive_id);
     tracing::info!(allowed = ?system_allowed_origins, "system message origin allowlist loaded");
@@ -172,8 +203,18 @@ async fn main() -> Result<(), OrchestratorError> {
         runtime_manifest: Mutex::new(runtime_manifest),
         last_runtime_verify: Mutex::new(Instant::now()),
         nats_endpoint,
+        blob: blob_runtime,
     };
-    ensure_dirs(&config_dir, &state_dir, &run_dir)?;
+    tracing::info!(
+        blob_enabled = state.blob.enabled,
+        blob_path = %state.blob.path.display(),
+        blob_sync_enabled = state.blob.sync_enabled,
+        blob_sync_tool = %state.blob.sync_tool,
+        blob_sync_api_port = state.blob.sync_api_port,
+        blob_sync_data_dir = %state.blob.sync_data_dir.display(),
+        "blob runtime config loaded"
+    );
+    ensure_dirs(&config_dir, &state_dir, &run_dir, &state.blob)?;
     write_pid(&run_dir)?;
 
     bootstrap_local(&state, &socket_dir).await?;
@@ -253,6 +294,7 @@ async fn bootstrap_local(
         Duration::from_secs(NATS_BOOTSTRAP_TIMEOUT_SECS),
     )
     .await?;
+    ensure_blob_sync_runtime(state).await?;
 
     let mut services = vec!["sy-config-routes", "sy-opa-rules", "sy-admin", "sy-storage"];
     if identity_available() {
@@ -513,6 +555,10 @@ async fn watchdog_tick(state: &OrchestratorState) {
             tracing::warn!(error = %err, "runtime verify/sync failed");
         }
     }
+
+    if let Err(err) = watchdog_blob_sync(state).await {
+        tracing::warn!(error = %err, "blob sync watchdog failed");
+    }
 }
 
 async fn shutdown_sequence(state: &OrchestratorState) {
@@ -543,6 +589,15 @@ async fn shutdown_sequence(state: &OrchestratorState) {
     }
     if let Err(err) = systemd_stop("rt-gateway") {
         tracing::warn!(service = "rt-gateway", error = %err, "failed to stop service");
+    }
+    if blob_sync_enabled(state) {
+        if let Err(err) = systemd_stop(SYNCTHING_SERVICE_NAME) {
+            tracing::warn!(
+                service = SYNCTHING_SERVICE_NAME,
+                error = %err,
+                "failed to stop service"
+            );
+        }
     }
 }
 
@@ -577,7 +632,7 @@ async fn handle_admin(
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
             let payload = if let Some(path) = path {
-                match persist_storage_path(&state.config_dir, &path) {
+                match persist_storage_path_in_hive(&state.config_dir, &path) {
                     Ok(()) => serde_json::json!({
                         "status": "ok",
                         "path": path,
@@ -766,11 +821,12 @@ async fn handle_system_message(
             match action {
                 "SPAWN_NODE" => {
                     let _ =
-                        send_system_action_response(sender, msg, "SPAWN_NODE_RESPONSE", payload).await;
+                        send_system_action_response(sender, msg, "SPAWN_NODE_RESPONSE", payload)
+                            .await;
                 }
                 "KILL_NODE" => {
-                    let _ =
-                        send_system_action_response(sender, msg, "KILL_NODE_RESPONSE", payload).await;
+                    let _ = send_system_action_response(sender, msg, "KILL_NODE_RESPONSE", payload)
+                        .await;
                 }
                 _ => {}
             }
@@ -805,8 +861,8 @@ async fn handle_system_message(
 }
 
 fn load_system_allowed_origins(hive_id: &str) -> HashSet<String> {
-    let raw =
-        std::env::var("ORCH_SYSTEM_ALLOWED_ORIGINS").unwrap_or_else(|_| "SY.admin,WF.orch.diag".to_string());
+    let raw = std::env::var("ORCH_SYSTEM_ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "SY.admin,WF.orch.diag".to_string());
     raw.split(',')
         .map(str::trim)
         .filter(|item| !item.is_empty())
@@ -947,6 +1003,56 @@ fn nats_endpoint_from_hive(hive: &HiveFile) -> String {
     }
 }
 
+fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
+    let mut enabled = DEFAULT_BLOB_ENABLED;
+    let mut path = PathBuf::from(DEFAULT_BLOB_PATH);
+    let mut sync_enabled = DEFAULT_BLOB_SYNC_ENABLED;
+    let mut sync_tool = DEFAULT_BLOB_SYNC_TOOL.to_string();
+    let mut sync_api_port = DEFAULT_BLOB_SYNC_API_PORT;
+    let mut sync_data_dir = PathBuf::from(DEFAULT_BLOB_SYNC_DATA_DIR);
+
+    if let Some(blob) = hive.blob.as_ref() {
+        if let Some(value) = blob.enabled {
+            enabled = value;
+        }
+        if let Some(value) = blob.path.as_ref() {
+            let value = value.trim();
+            if !value.is_empty() {
+                path = PathBuf::from(value);
+            }
+        }
+        if let Some(sync) = blob.sync.as_ref() {
+            if let Some(value) = sync.enabled {
+                sync_enabled = value;
+            }
+            if let Some(value) = sync.tool.as_ref() {
+                let value = value.trim().to_ascii_lowercase();
+                if !value.is_empty() {
+                    sync_tool = value;
+                }
+            }
+            if let Some(value) = sync.api_port {
+                sync_api_port = value;
+            }
+            if let Some(value) = sync.data_dir.as_ref() {
+                let value = value.trim();
+                if !value.is_empty() {
+                    sync_data_dir = PathBuf::from(value);
+                }
+            }
+        }
+    }
+
+    BlobRuntimeConfig {
+        enabled,
+        path,
+        sync_enabled,
+        sync_tool,
+        sync_api_port,
+        sync_data_dir,
+    }
+}
+
 async fn connect_with_retry(
     config: &NodeConfig,
     delay: Duration,
@@ -971,6 +1077,7 @@ fn ensure_dirs(
     config_dir: &Path,
     state_dir: &Path,
     run_dir: &Path,
+    blob: &BlobRuntimeConfig,
 ) -> Result<(), OrchestratorError> {
     let storage_root = json_router::paths::storage_root_dir();
     let opa_root = storage_root.join("opa");
@@ -982,9 +1089,201 @@ fn ensure_dirs(
     fs::create_dir_all(opa_root.join("staged"))?;
     fs::create_dir_all(opa_root.join("backup"))?;
     fs::create_dir_all(storage_root.join("nats"))?;
+    if blob.enabled {
+        fs::create_dir_all(&blob.path)?;
+    }
+    if blob.sync_enabled {
+        fs::create_dir_all(&blob.sync_data_dir)?;
+    }
     fs::create_dir_all(runtimes_root())?;
     fs::create_dir_all(orchestrator_runtime_dir())?;
     fs::create_dir_all(run_dir)?;
+    Ok(())
+}
+
+fn blob_sync_enabled(state: &OrchestratorState) -> bool {
+    state.blob.sync_enabled
+}
+
+fn blob_sync_tool_is_syncthing(blob: &BlobRuntimeConfig) -> bool {
+    blob.sync_tool.trim().eq_ignore_ascii_case("syncthing")
+}
+
+fn linux_user_exists(user: &str) -> bool {
+    Command::new("id")
+        .arg("-u")
+        .arg(user)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn syncthing_binary_available() -> bool {
+    Command::new("syncthing")
+        .arg("--version")
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn apt_get_available() -> bool {
+    Path::new("/usr/bin/apt-get").exists() || Path::new("/bin/apt-get").exists()
+}
+
+fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
+    if syncthing_binary_available() {
+        return Ok(());
+    }
+    if !apt_get_available() {
+        return Err(
+            "syncthing binary missing and apt-get not found (install syncthing manually)".into(),
+        );
+    }
+    tracing::warn!("syncthing not found; installing via apt-get");
+    let mut update = Command::new("apt-get");
+    update.arg("update");
+    run_cmd(update, "apt-get update")?;
+    let mut install = Command::new("apt-get");
+    install.arg("install").arg("-y").arg("syncthing");
+    run_cmd(install, "apt-get install syncthing")?;
+    if !syncthing_binary_available() {
+        return Err("syncthing install finished but binary is still missing".into());
+    }
+    Ok(())
+}
+
+fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> String {
+    let service_group = if linux_user_exists(service_user) {
+        service_user
+    } else {
+        "root"
+    };
+    format!(
+        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nExecStart=/usr/bin/syncthing -no-browser -no-restart -home={} -gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+        service_user,
+        service_group,
+        blob.sync_data_dir.display(),
+        blob.sync_data_dir.display(),
+        blob.sync_api_port
+    )
+}
+
+fn ensure_syncthing_unit(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {
+    let service_user = if linux_user_exists(SYNCTHING_INSTALL_USER) {
+        SYNCTHING_INSTALL_USER.to_string()
+    } else {
+        tracing::warn!(
+            user = SYNCTHING_INSTALL_USER,
+            "linux user not found; running syncthing as root"
+        );
+        "root".to_string()
+    };
+    let unit_contents = syncthing_unit_contents(blob, &service_user);
+    let unit_path =
+        Path::new("/etc/systemd/system").join(format!("{SYNCTHING_SERVICE_NAME}.service"));
+    let current = fs::read_to_string(&unit_path).unwrap_or_default();
+    if current == unit_contents {
+        return Ok(());
+    }
+    fs::write(&unit_path, unit_contents)?;
+    let mut daemon_reload = Command::new("systemctl");
+    daemon_reload.arg("daemon-reload");
+    run_cmd(daemon_reload, "systemctl daemon-reload")?;
+    Ok(())
+}
+
+async fn syncthing_api_healthy(api_port: u16) -> bool {
+    let endpoint = format!("127.0.0.1:{api_port}");
+    matches!(
+        time::timeout(
+            Duration::from_secs(SYNCTHING_HEALTH_TIMEOUT_SECS),
+            tokio::net::TcpStream::connect(endpoint)
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+async fn wait_for_syncthing_health(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {
+    let start = Instant::now();
+    let timeout = Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS);
+    loop {
+        if syncthing_api_healthy(blob.sync_api_port).await {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(
+                format!("syncthing health timeout (api port {})", blob.sync_api_port).into(),
+            );
+        }
+        time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn ensure_blob_sync_runtime(state: &OrchestratorState) -> Result<(), OrchestratorError> {
+    if !blob_sync_enabled(state) {
+        return Ok(());
+    }
+    if !blob_sync_tool_is_syncthing(&state.blob) {
+        return Err(format!(
+            "unsupported blob.sync.tool '{}' (expected syncthing)",
+            state.blob.sync_tool
+        )
+        .into());
+    }
+
+    ensure_syncthing_installed()?;
+    ensure_syncthing_unit(&state.blob)?;
+    tracing::info!(
+        service = SYNCTHING_SERVICE_NAME,
+        "starting blob sync service"
+    );
+    systemd_start(SYNCTHING_SERVICE_NAME)?;
+    wait_for_service_active(
+        SYNCTHING_SERVICE_NAME,
+        Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
+    )
+    .await?;
+    wait_for_syncthing_health(&state.blob).await?;
+    tracing::info!(
+        service = SYNCTHING_SERVICE_NAME,
+        api_port = state.blob.sync_api_port,
+        "blob sync service healthy"
+    );
+    Ok(())
+}
+
+async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), OrchestratorError> {
+    if !blob_sync_enabled(state) {
+        return Ok(());
+    }
+    if !blob_sync_tool_is_syncthing(&state.blob) {
+        return Err(format!(
+            "unsupported blob.sync.tool '{}' (expected syncthing)",
+            state.blob.sync_tool
+        )
+        .into());
+    }
+
+    let service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+    let api_healthy = syncthing_api_healthy(state.blob.sync_api_port).await;
+    if service_active && api_healthy {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        service = SYNCTHING_SERVICE_NAME,
+        service_active = service_active,
+        api_healthy = api_healthy,
+        "syncthing unhealthy; restarting"
+    );
+    systemd_restart(SYNCTHING_SERVICE_NAME)?;
+    wait_for_service_active(
+        SYNCTHING_SERVICE_NAME,
+        Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
+    )
+    .await?;
+    wait_for_syncthing_health(&state.blob).await?;
     Ok(())
 }
 
@@ -2215,7 +2514,11 @@ fn add_hive_flow(
     if let Err(err) = ssh_with_key(
         address,
         &key_path,
-        &sudo_wrap("mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/runtimes /var/run/fluxbee/routers"),
+        &sudo_wrap(&format!(
+            "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/runtimes /var/run/fluxbee/routers '{}' '{}'",
+            state.blob.path.display(),
+            state.blob.sync_data_dir.display()
+        )),
         BOOTSTRAP_SSH_USER,
     ) {
         return serde_json::json!({
@@ -2236,9 +2539,26 @@ fn add_hive_flow(
             });
         }
     };
+    let storage_path = state
+        .storage_path
+        .try_lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_else(|_| {
+            json_router::paths::storage_root_dir()
+                .to_string_lossy()
+                .to_string()
+        });
     let hive_yaml = format!(
-        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\n",
-        hive_id, worker_uplink
+        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n",
+        hive_id,
+        worker_uplink,
+        storage_path,
+        state.blob.enabled,
+        state.blob.path.display(),
+        state.blob.sync_enabled,
+        state.blob.sync_tool,
+        state.blob.sync_api_port,
+        state.blob.sync_data_dir.display()
     );
     if let Err(err) = write_remote_file(address, &key_path, "/etc/fluxbee/hive.yaml", &hive_yaml) {
         return serde_json::json!({
@@ -2470,10 +2790,6 @@ fn hives_root() -> PathBuf {
     json_router::paths::storage_root_dir().join("hives")
 }
 
-fn orchestrator_file_path() -> PathBuf {
-    json_router::paths::storage_root_dir().join("orchestrator.yaml")
-}
-
 fn run_cmd(mut cmd: Command, label: &str) -> Result<(), OrchestratorError> {
     let output = cmd.output()?;
     if output.status.success() {
@@ -2512,6 +2828,12 @@ fn systemd_stop(service: &str) -> Result<(), OrchestratorError> {
     let mut cmd = Command::new("systemctl");
     cmd.arg("stop").arg(service);
     run_cmd(cmd, "systemctl stop")
+}
+
+fn systemd_restart(service: &str) -> Result<(), OrchestratorError> {
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("restart").arg(service);
+    run_cmd(cmd, "systemctl restart")
 }
 
 fn disable_remote_password_auth(address: &str) -> Result<(), OrchestratorError> {
@@ -2788,39 +3110,55 @@ fn sudo_wrap(cmd: &str) -> String {
     format!("echo '{}' | sudo -S -p '' {}", pass, cmd)
 }
 
-fn load_storage_path(config_dir: &Path) -> String {
-    let _ = config_dir;
+fn storage_path_from_hive(hive: &HiveFile) -> String {
     let default_root = json_router::paths::storage_root_dir()
         .to_string_lossy()
         .to_string();
-    let path = orchestrator_file_path();
-    let data = match fs::read_to_string(&path) {
-        Ok(data) => data,
-        Err(_) => return default_root,
-    };
-    let parsed: OrchestratorFile = match serde_yaml::from_str(&data) {
-        Ok(parsed) => parsed,
-        Err(_) => return default_root,
-    };
-    if let Some(path) = parsed
+    if let Some(path) = hive
         .storage
-        .and_then(|storage| storage.path)
-        .or(parsed.storage_path)
+        .as_ref()
+        .and_then(|storage| storage.path.as_ref())
     {
         if !path.trim().is_empty() {
-            return path;
+            return path.to_string();
         }
     }
     default_root
 }
 
-fn persist_storage_path(config_dir: &Path, path: &str) -> Result<(), OrchestratorError> {
-    let _ = config_dir;
-    let file_path = orchestrator_file_path();
-    let data = serde_yaml::to_string(&serde_json::json!({
-        "storage": { "path": path }
-    }))?;
-    fs::write(file_path, data)?;
+fn persist_storage_path_in_hive(config_dir: &Path, path: &str) -> Result<(), OrchestratorError> {
+    let hive_path = config_dir.join("hive.yaml");
+    let data = fs::read_to_string(&hive_path)?;
+    let mut root: serde_yaml::Value = serde_yaml::from_str(&data)?;
+    let Some(root_map) = root.as_mapping_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "hive.yaml root must be a map",
+        )
+        .into());
+    };
+
+    let storage_key = serde_yaml::Value::String("storage".to_string());
+    let storage_entry = root_map
+        .entry(storage_key)
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    if !storage_entry.is_mapping() {
+        *storage_entry = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+    let Some(storage_map) = storage_entry.as_mapping_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "hive.yaml storage must be a map",
+        )
+        .into());
+    };
+    storage_map.insert(
+        serde_yaml::Value::String("path".to_string()),
+        serde_yaml::Value::String(path.to_string()),
+    );
+
+    let serialized = serde_yaml::to_string(&root)?;
+    fs::write(hive_path, serialized)?;
     Ok(())
 }
 
@@ -2851,9 +3189,18 @@ mod tests {
             wan_listen: None,
             wan_authorized_hives: Vec::new(),
             tracked_nodes: Mutex::new(HashSet::new()),
+            system_allowed_origins: HashSet::new(),
             runtime_manifest: Mutex::new(None),
             last_runtime_verify: Mutex::new(Instant::now()),
             nats_endpoint: "nats://127.0.0.1:4222".to_string(),
+            blob: BlobRuntimeConfig {
+                enabled: true,
+                path: PathBuf::from("/var/lib/fluxbee/blob"),
+                sync_enabled: false,
+                sync_tool: "syncthing".to_string(),
+                sync_api_port: 8384,
+                sync_data_dir: PathBuf::from("/var/lib/fluxbee/syncthing"),
+            },
         }
     }
 

@@ -15,3 +15,17 @@ admin:
 # Storage DB (local PostgreSQL for SY.storage).
 database:
   url: "postgresql://fluxbee:magicAI@127.0.0.1:5432/fluxbee"
+
+# Shared storage root for modules/artifacts (used by SY.admin/SY.orchestrator).
+storage:
+  path: "/var/lib/fluxbee"
+
+# Blob runtime config (single source of truth).
+blob:
+  enabled: true
+  path: "/var/lib/fluxbee/blob"
+  sync:
+    enabled: false   # true if Syncthing should be managed by orchestrator
+    tool: "syncthing"
+    api_port: 8384
+    data_dir: "/var/lib/fluxbee/syncthing"

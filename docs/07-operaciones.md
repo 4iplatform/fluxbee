@@ -31,7 +31,7 @@ Todos los binarios conocen estos paths por código:
 
 /var/lib/fluxbee/              # Estado persistente (auto-generado, persistido por SY.*)
 ├── identity.yaml                  # UUID del gateway (auto-generado)
-├── orchestrator.yaml              # Config de SY.orchestrator (storage.path, etc.)
+├── orchestrator.yaml              # Estado interno de SY.orchestrator (no fuente de config)
 ├── config-routes.yaml             # Rutas/VPN (persiste SY.config.routes)
 ├── opa-version.txt                # Contador monotónico de versión OPA (SY.admin)
 ├── opa/                           # Policies OPA (persiste SY.opa.rules)
@@ -888,7 +888,7 @@ Después de `add_hive` exitoso:
 
 /var/lib/fluxbee/
 ├── identity.yaml
-├── orchestrator.yaml
+├── orchestrator.yaml   # Estado interno (no fuente de config)
 ├── config-routes.yaml
 └── opa-rules/
 
@@ -1065,7 +1065,7 @@ Con NFS no hay HTTP, todas las islas leen del mismo filesystem.
 
 Cada SY.orchestrator al recibir esto:
 1. Actualiza `storage_path` en memoria
-2. Persiste en `/var/lib/fluxbee/orchestrator.yaml`
+2. Persiste en `/etc/fluxbee/hive.yaml` (`storage.path`)
 3. Envía CONFIG_RESPONSE a SY.admin
 4. Próximas operaciones de módulos usan el nuevo path
 

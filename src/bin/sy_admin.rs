@@ -30,6 +30,7 @@ struct HiveFile {
     role: Option<String>,
     admin: Option<AdminSection>,
     wan: Option<WanSection>,
+    storage: Option<StorageSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -444,14 +445,6 @@ struct StorageUpdate {
     path: String,
     #[serde(default)]
     version: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OrchestratorFile {
-    #[serde(default)]
-    storage: Option<StorageSection>,
-    #[serde(default)]
-    storage_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1143,20 +1136,16 @@ fn from_hex(b: u8) -> Option<u8> {
 
 fn storage_root() -> PathBuf {
     let default_root = json_router::paths::storage_root_dir();
-    let path = default_root.join("orchestrator.yaml");
-    let data = match fs::read_to_string(&path) {
+    let hive_path = json_router::paths::config_dir().join("hive.yaml");
+    let data = match fs::read_to_string(&hive_path) {
         Ok(data) => data,
         Err(_) => return default_root,
     };
-    let parsed: OrchestratorFile = match serde_yaml::from_str(&data) {
+    let parsed: HiveFile = match serde_yaml::from_str(&data) {
         Ok(parsed) => parsed,
         Err(_) => return default_root,
     };
-    if let Some(path) = parsed
-        .storage
-        .and_then(|storage| storage.path)
-        .or(parsed.storage_path)
-    {
+    if let Some(path) = parsed.storage.and_then(|storage| storage.path) {
         if !path.trim().is_empty() {
             return PathBuf::from(path);
         }

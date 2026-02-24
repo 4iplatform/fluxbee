@@ -458,7 +458,10 @@ impl OpaWasm {
             external_data_addr: None,
         };
 
-        if let Some(bundle) = data_bundle_json.map(str::trim).filter(|bundle| !bundle.is_empty()) {
+        if let Some(bundle) = data_bundle_json
+            .map(str::trim)
+            .filter(|bundle| !bundle.is_empty())
+        {
             if out.opa_eval_ctx_set_data.is_none() {
                 return Err(OpaError::MissingExport("opa_eval_ctx_set_data"));
             }
