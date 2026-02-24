@@ -41,6 +41,7 @@ sudo install -d "$STATE_DIR/opa/staged"
 sudo install -d "$STATE_DIR/opa/backup"
 sudo install -d "$STATE_DIR/modules"
 sudo install -d "$STATE_DIR/blob"
+sudo install -d "$STATE_DIR/syncthing"
 sudo install -d "$STATE_DIR/nats"
 sudo install -d "$RUN_DIR"
 sudo install -d "$RUN_DIR/routers"
@@ -165,3 +166,4 @@ if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then
 fi
 
 echo "Installed config to $CONFIG_DIR, binaries to /usr/bin, systemd units, and runtime directories."
+echo "Note: fluxbee-syncthing is managed dynamically by sy-orchestrator from hive.yaml (blob.sync.*)."
