@@ -18,6 +18,7 @@ services=(
   "sy-storage"
   "sy-config-routes"
   "sy-opa-rules"
+  "fluxbee-syncthing"
   "rt-gateway"
 )
 
@@ -85,6 +86,7 @@ residual_procs=(
   "sy_config_routes"
   "sy_opa_rules"
   "sy_identity"
+  "syncthing"
 )
 for proc in "${residual_procs[@]}"; do
   kill_process_name "$proc"

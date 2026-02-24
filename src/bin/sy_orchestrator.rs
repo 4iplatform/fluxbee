@@ -1139,8 +1139,9 @@ fn linux_user_exists(user: &str) -> bool {
 }
 
 fn syncthing_binary_available() -> bool {
-    Command::new("syncthing")
-        .arg("--version")
+    Command::new("sh")
+        .arg("-lc")
+        .arg("command -v syncthing >/dev/null 2>&1")
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -1301,9 +1302,10 @@ fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> Stri
         "root"
     };
     format!(
-        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nExecStart=/usr/bin/syncthing -no-browser -no-restart -home={} -gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nEnvironment=HOME={}\nExecStart=/usr/bin/syncthing -no-browser -no-restart -home={} -gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
         service_user,
         service_group,
+        blob.sync_data_dir.display(),
         blob.sync_data_dir.display(),
         blob.sync_data_dir.display(),
         blob.sync_api_port
