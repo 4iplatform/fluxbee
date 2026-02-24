@@ -3,6 +3,8 @@ use serde_json::{json, Value};
 
 use crate::blob::{BlobError, BlobRef};
 
+pub const TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PayloadError {
     #[error("invalid payload contract: {0}")]

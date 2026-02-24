@@ -1,0 +1,79 @@
+# Blob SDK - Ejemplos por nodo (IO/AI/WF)
+
+Referencia de uso del contrato `text/v1` con `fluxbee_sdk`.
+
+## 1) IO recibe archivo externo y envía a AI
+
+```rust
+use fluxbee_sdk::blob::{BlobConfig, BlobToolkit};
+use fluxbee_sdk::payload::TextV1Payload;
+
+let blob = BlobToolkit::new(BlobConfig::default())?;
+
+// 1) guardar archivo en staging
+let blob_ref = blob.put("/tmp/incoming/factura.png".as_ref(), "Factura Marzo 2026.png")?;
+
+// 2) promover a active cuando está listo
+blob.promote(&blob_ref)?;
+
+// 3) armar payload text/v1
+let payload = TextV1Payload::new("Mirá esta factura", vec![blob_ref]);
+let payload_json = payload.to_value()?;
+```
+
+## 2) AI genera documento y responde a IO
+
+```rust
+use fluxbee_sdk::blob::{BlobConfig, BlobToolkit};
+use fluxbee_sdk::payload::TextV1Payload;
+
+let blob = BlobToolkit::new(BlobConfig::default())?;
+
+let pdf_bytes: Vec<u8> = generar_pdf();
+let pdf_ref = blob.put_bytes(&pdf_bytes, "respuesta.pdf", "application/pdf")?;
+blob.promote(&pdf_ref)?;
+
+let payload = TextV1Payload::new("Adjunto el PDF", vec![pdf_ref]);
+let payload_json = payload.to_value()?;
+```
+
+## 3) WF mensaje largo -> `content_ref` automático
+
+```rust
+use fluxbee_sdk::blob::{BlobConfig, BlobToolkit};
+
+let blob = BlobToolkit::new(BlobConfig::default())?;
+let texto_largo = construir_resumen_largo();
+
+// Si supera límite estimado de mensaje, crea content_ref automáticamente.
+let payload = blob.build_text_v1_payload(&texto_largo, vec![])?;
+let payload_json = payload.to_value()?;
+```
+
+## 4) Consumidor (IO/AI/WF) resuelve attachments
+
+```rust
+use fluxbee_sdk::blob::{BlobConfig, BlobToolkit, ResolveRetryConfig};
+use fluxbee_sdk::payload::TextV1Payload;
+
+let blob = BlobToolkit::new(BlobConfig::default())?;
+let payload: TextV1Payload = TextV1Payload::from_value(&payload_json)?;
+
+for attachment in payload.attachments {
+    // single-isla: resolve directo
+    let path = blob.resolve(&attachment);
+    // multi-isla con sync: resolve_with_retry
+    let _path_retry = blob
+        .resolve_with_retry(&attachment, ResolveRetryConfig::default())
+        .await?;
+    let bytes = std::fs::read(path)?;
+    procesar(bytes);
+}
+```
+
+## 5) Reglas operativas
+
+- Siempre `put`/`put_bytes` -> `promote` -> enviar mensaje.
+- No referenciar blobs en `staging/`.
+- `attachments` siempre array (vacío si no hay adjuntos).
+- Si hay `content_ref`, no incluir `content`.

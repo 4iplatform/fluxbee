@@ -12,6 +12,7 @@ Referencias:
 - `docs/07-operaciones.md`
 - `docs/onworking/sdk_tasks.md`
 - `docs/onworking/diagnostics_tasks.md`
+- `docs/onworking/blob_node_examples.md`
 
 ## Fase B1 - Contrato canónico en SDK
 
@@ -53,8 +54,8 @@ Salida:
 
 ### BLOB-C1 - Contrato `text/v1`
 - [x] C1. Helpers para payload `text/v1` (`content` + `attachments[]`).
-- [ ] C2. Regla de 64KB: soporte `content_ref` cuando texto no entra inline.
-- [ ] C3. Ejemplos y contratos de uso en nodos IO/AI/WF.
+- [x] C2. Regla de 64KB: soporte `content_ref` cuando texto no entra inline.
+- [x] C3. Ejemplos y contratos de uso en nodos IO/AI/WF.
 
 Salida:
 - contrato de aplicación consistente para attachments.
@@ -70,8 +71,8 @@ Salida:
 - garantía funcional del módulo blob.
 
 ### BLOB-D2 - E2E operativos
-- [ ] D4. E2E local productor->consumidor con `blob_ref`.
-- [ ] D5. E2E errores (`BLOB_NOT_FOUND`, permisos, IO).
+- [x] D4. E2E local productor->consumidor con `blob_ref`.
+- [x] D5. E2E errores (`BLOB_NOT_FOUND`, permisos, IO).
 - [ ] D6. Incorporar métricas/resultados en `docs/onworking/diagnostics_tasks.md`.
 
 Salida:

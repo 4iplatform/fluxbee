@@ -9,6 +9,7 @@ Documentos operativos activos organizados por proceso/componente:
 - `docs/onworking/nats_tasks.md`
 - `docs/onworking/blob_tasks.md`
 - `docs/onworking/sdk_tasks.md`
+- `docs/onworking/blob_node_examples.md`
 
 Convención aplicada:
 - nodos/procesos: archivo por proceso con patrón `<proceso>_tasks.md` (ej. `sy_admin_tasks.md`, `ai_<name>_tasks.md`).
@@ -22,3 +23,4 @@ Documentos transversales (no de un solo proceso):
 - `docs/onworking/diagnostics_tasks.md`
 - `docs/onworking/blob_tasks.md`
 - `docs/onworking/sdk_tasks.md`
+- `docs/onworking/blob_node_examples.md`

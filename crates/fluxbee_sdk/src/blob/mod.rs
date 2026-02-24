@@ -5,6 +5,8 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 
+use crate::payload::{PayloadError, TextV1Payload, TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES};
+
 pub mod constants {
     pub const BLOB_NAME_MAX_CHARS: usize = 128;
     pub const BLOB_HASH_LEN: usize = 16;
@@ -16,11 +18,13 @@ pub mod constants {
     pub const BLOB_RETRY_BACKOFF: f64 = 2.0;
     pub const BLOB_STAGING_TTL_HOURS: u64 = 24;
     pub const BLOB_MAX_EXT_CHARS: usize = 10;
+    pub const TEXT_V1_DEFAULT_OVERHEAD_BYTES: usize = 2_048;
 }
 
 pub use constants::{
     BLOB_HASH_LEN, BLOB_MAX_EXT_CHARS, BLOB_NAME_ALLOWED, BLOB_NAME_MAX_CHARS, BLOB_PREFIX_LEN,
     BLOB_RETRY_BACKOFF, BLOB_RETRY_INITIAL_MS, BLOB_RETRY_MAX_MS, BLOB_STAGING_TTL_HOURS,
+    TEXT_V1_DEFAULT_OVERHEAD_BYTES,
 };
 
 #[derive(Debug, Clone)]
@@ -198,6 +202,43 @@ impl BlobToolkit {
             }
         })?;
         Ok(())
+    }
+
+    pub fn build_text_v1_payload(
+        &self,
+        content: &str,
+        attachments: Vec<BlobRef>,
+    ) -> Result<TextV1Payload, PayloadError> {
+        self.build_text_v1_payload_with_limit(
+            content,
+            attachments,
+            TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES,
+            TEXT_V1_DEFAULT_OVERHEAD_BYTES,
+        )
+    }
+
+    pub fn build_text_v1_payload_with_limit(
+        &self,
+        content: &str,
+        attachments: Vec<BlobRef>,
+        max_message_bytes: usize,
+        message_overhead_bytes: usize,
+    ) -> Result<TextV1Payload, PayloadError> {
+        let inline_payload = TextV1Payload::new(content, attachments.clone());
+        let inline_payload_bytes = serde_json::to_vec(&inline_payload)?.len();
+        let estimated_total = inline_payload_bytes.saturating_add(message_overhead_bytes);
+        if estimated_total <= max_message_bytes {
+            inline_payload.validate()?;
+            return Ok(inline_payload);
+        }
+
+        let content_ref = self
+            .put_bytes(content.as_bytes(), "content.txt", "text/plain")
+            .map_err(PayloadError::from)?;
+        self.promote(&content_ref).map_err(PayloadError::from)?;
+        let payload = TextV1Payload::with_content_ref(content_ref, attachments);
+        payload.validate()?;
+        Ok(payload)
     }
 
     pub fn resolve(&self, blob_ref: &BlobRef) -> PathBuf {
@@ -497,6 +538,8 @@ fn guess_mime(filename_original: &str, ext: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(unix)]
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
     static TEST_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -576,6 +619,29 @@ mod tests {
         assert_eq!(stat.size_on_disk, b"file-content".len() as u64);
     }
 
+    #[test]
+    fn producer_consumer_local_e2e_with_blob_ref() {
+        let (producer, root) = test_toolkit();
+        let consumer = BlobToolkit::new(BlobConfig {
+            blob_root: root.path.clone(),
+            name_max_chars: BLOB_NAME_MAX_CHARS,
+        })
+        .expect("consumer toolkit");
+
+        let blob_ref = producer
+            .put_bytes(b"hello-e2e", "e2e.txt", "text/plain")
+            .expect("producer put");
+        producer.promote(&blob_ref).expect("producer promote");
+
+        assert!(consumer.exists(&blob_ref));
+        let payload = TextV1Payload::new("mensaje", vec![blob_ref.clone()]);
+        let value = payload.to_value().expect("payload to value");
+        let parsed = TextV1Payload::from_value(&value).expect("payload from value");
+        let resolved = consumer.resolve(&parsed.attachments[0]);
+        let read = std::fs::read(resolved).expect("consumer read");
+        assert_eq!(read, b"hello-e2e");
+    }
+
     #[tokio::test]
     async fn resolve_with_retry_finds_late_file() {
         let (toolkit, root) = test_toolkit();
@@ -611,5 +677,83 @@ mod tests {
 
         assert!(got.exists());
         drop(root);
+    }
+
+    #[test]
+    fn text_v1_helper_offloads_large_content_to_blob_ref() {
+        let (toolkit, _root) = test_toolkit();
+        let large_content = "x".repeat(8_192);
+        let payload = toolkit
+            .build_text_v1_payload_with_limit(&large_content, vec![], 1_024, 128)
+            .expect("payload helper");
+        assert!(payload.content.is_none());
+        assert!(payload.content_ref.is_some());
+    }
+
+    #[test]
+    fn promote_missing_blob_returns_not_found() {
+        let (toolkit, _root) = test_toolkit();
+        let missing = BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "missing_0123456789abcdef.txt".to_string(),
+            size: 1,
+            mime: "text/plain".to_string(),
+            filename_original: "missing.txt".to_string(),
+            spool_day: "2026-02-24".to_string(),
+        };
+        let err = toolkit.promote(&missing).expect_err("promote should fail");
+        assert!(matches!(err, BlobError::NotFound(_)));
+    }
+
+    #[test]
+    fn put_missing_source_returns_io_error() {
+        let (toolkit, root) = test_toolkit();
+        let missing_src = root.path.join("no-existe.txt");
+        let err = toolkit
+            .put(&missing_src, "no-existe.txt")
+            .expect_err("put should fail");
+        assert!(matches!(err, BlobError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn resolve_with_retry_timeout_returns_not_found() {
+        let (toolkit, _root) = test_toolkit();
+        let missing = BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "timeout_0123456789abcdef.txt".to_string(),
+            size: 1,
+            mime: "text/plain".to_string(),
+            filename_original: "timeout.txt".to_string(),
+            spool_day: "2026-02-24".to_string(),
+        };
+        let err = toolkit
+            .resolve_with_retry(
+                &missing,
+                ResolveRetryConfig {
+                    max_wait_ms: 25,
+                    initial_delay_ms: 5,
+                    backoff_factor: 2.0,
+                },
+            )
+            .await
+            .expect_err("resolve_with_retry should timeout");
+        assert!(matches!(err, BlobError::NotFound(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn put_bytes_permission_error_returns_io() {
+        let (toolkit, root) = test_toolkit();
+        std::fs::create_dir_all(&root.path).expect("create root");
+        std::fs::set_permissions(&root.path, Permissions::from_mode(0o555))
+            .expect("set readonly perms");
+
+        let err = toolkit
+            .put_bytes(b"x", "perm.txt", "text/plain")
+            .expect_err("put_bytes should fail with permission denied");
+        assert!(matches!(err, BlobError::Io(_)));
+
+        std::fs::set_permissions(&root.path, Permissions::from_mode(0o755))
+            .expect("restore perms");
     }
 }
