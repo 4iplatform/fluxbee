@@ -1407,12 +1407,14 @@ fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
         );
         systemd_stop(SYNCTHING_SERVICE_NAME)?;
     }
-    if let Err(err) = systemd_disable(SYNCTHING_SERVICE_NAME) {
-        tracing::warn!(
-            service = SYNCTHING_SERVICE_NAME,
-            error = %err,
-            "failed to disable blob sync service"
-        );
+    if systemd_unit_exists(SYNCTHING_SERVICE_NAME) {
+        if let Err(err) = systemd_disable(SYNCTHING_SERVICE_NAME) {
+            tracing::warn!(
+                service = SYNCTHING_SERVICE_NAME,
+                error = %err,
+                "failed to disable blob sync service"
+            );
+        }
     }
 
     let unit_path =
@@ -3199,6 +3201,24 @@ fn systemd_is_active(service: &str) -> bool {
         .arg(service)
         .status()
         .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn systemd_unit_exists(service: &str) -> bool {
+    Command::new("systemctl")
+        .arg("show")
+        .arg(format!("{service}.service"))
+        .arg("--property=LoadState")
+        .arg("--value")
+        .output()
+        .ok()
+        .map(|output| {
+            if !output.status.success() {
+                return false;
+            }
+            let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            !state.is_empty() && state != "not-found"
+        })
         .unwrap_or(false)
 }
 
