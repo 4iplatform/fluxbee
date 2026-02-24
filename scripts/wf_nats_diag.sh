@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Runs a minimal WF NATS diagnostic pair:
-# - server: subscribes + replies using jsr_client NATS
+# - server: subscribes + replies using fluxbee_sdk NATS
 # - client: sends request_with_session_inbox and validates response path
 #
 # Usage:

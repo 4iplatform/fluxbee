@@ -23,7 +23,11 @@ cargo run --example node_test
 ```
 Si querés apuntar a un router específico: `JSR_ROUTER_NAME=RT.primary ...`
 
-## Librería de cliente (jsr-client)
+## Librería de cliente (`jsr-client`) [LEGACY/DEPRECADA]
+
+`jsr-client` queda solo por compatibilidad temporal.
+Para desarrollo nuevo usar `fluxbee-sdk` (`crates/fluxbee_sdk`).
+Estado de migración: `docs/onworking/sdk_tasks.md`.
 
 La librería para conectar nodos al router vive en `crates/jsr_client`. Es **solo Linux**.
 

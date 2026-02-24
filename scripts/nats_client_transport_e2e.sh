@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# NATS transport E2E for jsr_client + embedded broker path.
+# NATS transport E2E for fluxbee_sdk + embedded broker path.
 #
 # Verifies SY.admin -> NATS -> SY.storage request/reply keeps working across:
 # 1) rt-gateway restart (broker reconnect path)

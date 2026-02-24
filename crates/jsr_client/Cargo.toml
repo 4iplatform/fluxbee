@@ -2,6 +2,8 @@
 name = "jsr-client"
 version = "0.1.0"
 edition = "2021"
+description = "DEPRECATED legacy Fluxbee client crate (use fluxbee-sdk)"
+readme = "README.md"
 
 [dependencies]
 tokio = { version = "1.37", features = ["full"] }

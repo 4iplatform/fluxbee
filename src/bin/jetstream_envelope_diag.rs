@@ -28,7 +28,7 @@ struct JetstreamEnvelope {
 #[derive(Debug, Clone, Copy)]
 enum DiagStack {
     RouterNats,
-    JsrClient,
+    FluxbeeSdk,
 }
 
 #[tokio::main]
@@ -94,8 +94,8 @@ async fn run_server(
         DiagStack::RouterNats => {
             run_server_router_nats(endpoint, subject, sid, queue, fail_first_n, received).await
         }
-        DiagStack::JsrClient => {
-            run_server_jsr_client(endpoint, subject, sid, queue, fail_first_n, received).await
+        DiagStack::FluxbeeSdk => {
+            run_server_fluxbee_sdk(endpoint, subject, sid, queue, fail_first_n, received).await
         }
     }
 }
@@ -123,7 +123,7 @@ async fn run_client(
 
     let client = match stack {
         DiagStack::RouterNats => None,
-        DiagStack::JsrClient => Some(NatsClient::new(endpoint.clone())),
+        DiagStack::FluxbeeSdk => Some(NatsClient::new(endpoint.clone())),
     };
 
     for offset in 0..loops {
@@ -209,7 +209,7 @@ async fn run_server_router_nats(
     }
 }
 
-async fn run_server_jsr_client(
+async fn run_server_fluxbee_sdk(
     endpoint: String,
     subject: String,
     sid: u32,
@@ -278,9 +278,9 @@ fn handle_server_payload(
 fn parse_stack(raw: &str) -> Result<DiagStack, DynError> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "router_nats" | "router" => Ok(DiagStack::RouterNats),
-        "jsr_client" | "jsr" => Ok(DiagStack::JsrClient),
+        "fluxbee_sdk" | "sdk" | "jsr_client" | "jsr" => Ok(DiagStack::FluxbeeSdk),
         other => Err(format!(
-            "invalid JETSTREAM_DIAG_STACK={other}; expected router_nats|jsr_client"
+            "invalid JETSTREAM_DIAG_STACK={other}; expected router_nats|fluxbee_sdk (legacy alias: jsr_client)"
         )
         .into()),
     }
@@ -289,7 +289,7 @@ fn parse_stack(raw: &str) -> Result<DiagStack, DynError> {
 fn stack_label(stack: DiagStack) -> &'static str {
     match stack {
         DiagStack::RouterNats => "router_nats",
-        DiagStack::JsrClient => "jsr_client",
+        DiagStack::FluxbeeSdk => "fluxbee_sdk",
     }
 }
 

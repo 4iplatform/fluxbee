@@ -323,6 +323,9 @@ This README explains the system and concepts. For how to run, build, and develop
 
 If you want to build a node in another repo, copy the client library and use it as a path dependency.
 
+`jsr_client` is a legacy path. For new projects, prefer `fluxbee_sdk`
+(`json-router/crates/fluxbee_sdk`) as the canonical SDK.
+
 **What to copy**
 ```
 json-router/crates/jsr_client/

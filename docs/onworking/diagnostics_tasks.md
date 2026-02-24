@@ -126,7 +126,7 @@ Alcance:
 ## 2.5 `jetstream_envelope_e2e.sh` + `jetstream_envelope_diag.rs`
 - `NATS_URL`
 - `JETSTREAM_DIAG_MODE=server|client` (binario)
-- `JETSTREAM_DIAG_STACK=router_nats|jsr_client`
+- `JETSTREAM_DIAG_STACK=router_nats|fluxbee_sdk` (alias legacy: `jsr_client`)
 - `JETSTREAM_DIAG_SUBJECT`
 - `JETSTREAM_DIAG_QUEUE`
 - `JETSTREAM_DIAG_SID`
@@ -281,7 +281,7 @@ bash scripts/orchestrator_runtime_update_spawn_e2e.sh
 JetStream envelope E2E (payload opaco + redelivery):
 ```bash
 BUILD_BIN=0 \
-JETSTREAM_DIAG_STACK=jsr_client \
+JETSTREAM_DIAG_STACK=fluxbee_sdk \
 JETSTREAM_DIAG_LOOPS=20 \
 JETSTREAM_DIAG_FAIL_FIRST_N=1 \
 JETSTREAM_DIAG_INTERVAL_MS=50 \

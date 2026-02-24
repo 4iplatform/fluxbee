@@ -18,22 +18,27 @@ Regla operativa acordada:
 
 - [x] M4. Migrar imports del repo principal de `jsr_client` a `fluxbee_sdk`.
 - [x] M5. Compilar workspace usando `fluxbee_sdk` como dependencia principal.
-- [ ] M6. Ajustar scripts/diag para nomenclatura neutral (`jsr_client` -> `fluxbee_sdk`) sin romper compatibilidad temporal.
+- [x] M6. Ajustar scripts/diag para nomenclatura neutral (`jsr_client` -> `fluxbee_sdk`) sin romper compatibilidad temporal.
 
 ## Fase M3 - Gate de desarrollo
 
-- [ ] M7. Definir gate CI/local obligatorio: `cargo check` + pruebas diag con ruta `fluxbee_sdk`.
-- [ ] M8. Prohibir nuevos usos directos de `jsr_client` en código productivo.
-- [ ] M9. Agregar aviso de deprecación en `jsr_client` (README/comentarios/docstring).
+- [x] M7. Definir gate CI/local obligatorio: `cargo check` + pruebas diag con ruta `fluxbee_sdk` (`scripts/sdk_gate.sh`).
+- [x] M8. Prohibir nuevos usos directos de `jsr_client` en código productivo (`scripts/check_no_jsr_client_usage.sh` integrado en `scripts/sdk_gate.sh`).
+- [x] M9. Agregar aviso de deprecación en `jsr_client` (README/comentarios/docstring).
 
 ## Fase M4 - Integración de blob en SDK
 
-- [ ] M10. Implementar blob module canónico de `fluxbee_sdk` según `docs/blob-annex-spec.md`.
-- [ ] M11. Integrar contrato `text/v1` y utilidades de attachments en `fluxbee_sdk`.
-- [ ] M12. Validar E2E de comunicación + blob solo usando `fluxbee_sdk`.
+- [x] M10. Implementar blob module canónico de `fluxbee_sdk` según `docs/blob-annex-spec.md`.
+- [x] M11. Integrar contrato `text/v1` y utilidades de attachments en `fluxbee_sdk`.
+- [x] M12. Validar E2E de comunicación + blob usando bins/scripts que ya consumen `fluxbee_sdk`.
 
 ## Fase M5 - Retiro de `jsr_client`
 
 - [ ] M13. Eliminar dependencias remanentes de `jsr_client`.
 - [ ] M14. Retirar crate `crates/jsr_client` del workspace.
 - [ ] M15. Actualizar documentación final de migración (spec + onworking + changelog).
+
+## Pendientes reales para cerrar migración
+
+- Queda limpiar documentación pública final de migración (M15).
+- Queda retiro final del crate legado cuando no haya consumidores remanentes (M13-M14).
