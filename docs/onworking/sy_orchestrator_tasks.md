@@ -61,9 +61,26 @@ Checklist operativo para cerrar SY.orchestrator segun:
 ## TODO - Versionado y propagacion de software (infra)
 
 Objetivo:
-- completar cierre operativo de versionado y rollout para infraestructura, separando:
-  - runtimes de nodos (ya implementado base en 7.8),
-  - binarios core de plataforma (`rt-gateway`, `sy-*`), que hoy no tienen plan de rollout versionado equivalente.
+- compatibilizar e implementar el modelo de `docs/onworking/software-distribution-spec.md` para tres categorias:
+  - **runtimes** de nodos (base ya implementada en 7.8),
+  - **core** de plataforma (`rt-gateway`, `sy-*`),
+  - **vendor** de terceros vendorizados (actualmente Syncthing).
+
+Referencia de diseno:
+- `docs/onworking/software-distribution-spec.md`
+
+Modo de trabajo acordado:
+- `doc-first`: no tocar código de distribución hasta cerrar decisiones de colisiones en documentación.
+
+### 0) Colisiones abiertas spec vs implementacion actual (resolver primero)
+- [x] C1 (decisión): Vendor sin internet; fuente única en repo local (`/var/lib/fluxbee/vendor/*`).
+- [x] C2 (decisión): Contrato canónico `hive.yaml` para blob sync = `blob.sync.enabled/tool/api_port/data_dir`.
+- [x] C3 (decisión): Origen de distribución core = `/var/lib/fluxbee/core/bin/*` (no `/usr/bin/*`).
+- [x] C4 (decisión): Flags vendor quedan hardcodeadas en orchestrator por ahora.
+
+Implementación pendiente de decisiones C1/C3:
+- [ ] Remover fallback de instalación por package manager en orchestrator (local/remoto) para vendor.
+- [ ] Migrar `add_hive`/bootstrap de copia core desde `/usr/bin/*` a `/var/lib/fluxbee/core/bin/*` + manifest.
 
 ### 1) Contrato de versionado de runtimes (hardening)
 - [ ] Definir `schema_version` del `runtime-manifest.json` y politica de compatibilidad.
@@ -77,24 +94,31 @@ Objetivo:
 - [ ] Definir y aplicar politica de retencion de versiones en `/var/lib/fluxbee/runtimes` (cleanup seguro).
 - [ ] Agregar verificacion post-sync obligatoria por worker (hash remoto == hash local) con retry acotado.
 
-### 3) Versionado de binarios core (gap actual de infraestructura)
+### 3) Versionado de binarios core
 - [ ] Definir manifest de componentes core (servicio, version, hash, build_id).
 - [ ] Diseñar flujo de promocion motherbee -> workers para binarios core (staging + verificacion + switch atomico).
 - [ ] Definir orden de restart por dependencia (`rt-gateway`/`sy-*`) con health-gate entre pasos.
 - [ ] Implementar rollback de core por componente ante falla de health-check.
 
-### 4) API/observabilidad de versiones
+### 4) Versionado de vendor (Syncthing y futuros)
+- [ ] Definir/validar `vendor-manifest.json` (version monotona, hash, size, upstream_version).
+- [ ] Implementar propagacion vendor desde repo master (`/var/lib/fluxbee/vendor`) a workers (sin package manager remoto).
+- [ ] Implementar rollback vendor por componente y verificacion de drift por hash en worker.
+- [ ] Alinear unit/service de vendor para usar ruta instalada por orchestrator (sin depender de `/usr/bin` del host).
+
+### 5) API/observabilidad de versiones
 - [ ] Exponer endpoint admin para version efectiva por hive (runtimes + core).
 - [ ] Persistir historial de despliegues (deployment_id, actor, target_hives, resultado).
 - [ ] Agregar alertas de drift versionado (manifest o binarios core) entre motherbee y workers.
 
-### 5) Validacion E2E de versionado
+### 6) Validacion E2E de versionado/distribucion
 - [ ] Script E2E: `RUNTIME_UPDATE` canary -> global -> verificacion -> rollback.
 - [ ] Caso negativo E2E: update stale rechazado con `error_code` explicito (sin timeout opaco).
 - [ ] Caso E2E de drift remoto: deteccion + auto-resync + evidencia en API/logs.
+- [ ] Script E2E de vendor: drift de binario + reconciliacion + health check Syncthing.
 
 ### Criterio de salida de este TODO
-- [ ] Se puede desplegar version nueva de runtime y de core en worker real con:
+- [ ] Se puede desplegar version nueva de runtime, core y vendor en worker real con:
   - rollout controlado (canary/global),
   - trazabilidad completa por hive,
   - rollback verificable en caso de falla.
