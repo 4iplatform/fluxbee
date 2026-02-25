@@ -620,6 +620,16 @@ async fn handle_http(
             let (status, resp) = handle_admin_query(ctx, client, "hive_status", None).await?;
             respond_json(stream, status, &resp).await?;
         }
+        ("GET", "/versions") => {
+            let hive = query.get("hive").cloned();
+            if hive.is_some() {
+                let (status, resp) = handle_admin_query(ctx, client, "get_versions", hive).await?;
+                respond_json(stream, status, &resp).await?;
+            } else {
+                let (status, resp) = handle_admin_query(ctx, client, "list_versions", None).await?;
+                respond_json(stream, status, &resp).await?;
+            }
+        }
         ("GET", "/routes") => {
             let hive = query.get("hive").cloned();
             let (status, resp) = handle_admin_query(ctx, client, "list_routes", hive).await?;
@@ -938,6 +948,11 @@ async fn handle_hive_paths(
         ("GET", ["routers"]) => {
             let (status, resp) =
                 handle_admin_query(ctx, client, "list_routers", Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["versions"]) => {
+            let (status, resp) =
+                handle_admin_query(ctx, client, "get_versions", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["routers"]) => {
@@ -1825,6 +1840,7 @@ fn build_admin_request(
         }
         "list_nodes" | "run_node" | "kill_node" | "list_routers" | "run_router" | "kill_router"
         | "hive_status" | "get_storage" | "set_storage" | "list_hives" | "get_hive"
+        | "list_versions" | "get_versions"
         | "remove_hive" | "add_hive" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
@@ -1994,6 +2010,8 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "set_storage"
             | "list_hives"
             | "get_hive"
+            | "list_versions"
+            | "get_versions"
             | "remove_hive"
             | "add_hive"
     )

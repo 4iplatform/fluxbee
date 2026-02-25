@@ -139,13 +139,13 @@ struct RuntimeManifest {
     hash: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct CoreManifest {
     schema_version: u64,
     components: std::collections::BTreeMap<String, CoreManifestComponent>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct CoreManifestComponent {
     service: String,
     version: String,
@@ -733,6 +733,8 @@ async fn handle_admin(
         }
         "list_nodes" => list_nodes_flow(state, &msg.payload),
         "list_routers" => list_routers_flow(state, &msg.payload),
+        "list_versions" => list_versions_flow(state),
+        "get_versions" => get_versions_flow(state, &msg.payload),
         "run_node" => run_node_flow(state, &msg.payload),
         "kill_node" => kill_node_flow(state, &msg.payload),
         "run_router" => run_router_flow(state, &msg.payload),
@@ -1625,6 +1627,169 @@ fn list_routers_flow(state: &OrchestratorState, payload: &serde_json::Value) -> 
             "message": err.to_string(),
         }),
     }
+}
+
+fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
+    let core = match load_core_manifest() {
+        Ok(manifest) => {
+            let manifest_hash = local_core_manifest_hash().ok().flatten();
+            serde_json::json!({
+                "status": "ok",
+                "schema_version": manifest.schema_version,
+                "manifest_hash": manifest_hash,
+                "components": manifest.components,
+            })
+        }
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "message": err.to_string(),
+        }),
+    };
+
+    let runtimes = match load_runtime_manifest() {
+        Some(manifest) => {
+            let manifest_hash = local_runtime_manifest_hash().ok().flatten();
+            serde_json::json!({
+                "status": "ok",
+                "manifest_version": manifest.version,
+                "manifest_hash": manifest_hash,
+                "runtimes": manifest.runtimes,
+            })
+        }
+        None => serde_json::json!({
+            "status": "missing",
+        }),
+    };
+
+    serde_json::json!({
+        "hive_id": state.hive_id,
+        "core": core,
+        "runtimes": runtimes,
+    })
+}
+
+fn remote_read_file(
+    address: &str,
+    key_path: &Path,
+    path: &str,
+) -> Result<Option<String>, OrchestratorError> {
+    let path_q = shell_single_quote(path);
+    let cmd = format!("bash -lc \"if [ -f '{path_q}' ]; then cat '{path_q}'; fi\"");
+    let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
+    if out.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
+fn remote_versions_snapshot(
+    hive_id: &str,
+    address: &str,
+    key_path: &Path,
+) -> Result<serde_json::Value, OrchestratorError> {
+    let core = match remote_read_file(address, key_path, CORE_MANIFEST_PATH)? {
+        Some(raw) => match serde_json::from_str::<CoreManifest>(&raw) {
+            Ok(manifest) => {
+                let manifest_hash = remote_core_manifest_hash(address, key_path).ok().flatten();
+                serde_json::json!({
+                    "status": "ok",
+                    "schema_version": manifest.schema_version,
+                    "manifest_hash": manifest_hash,
+                    "components": manifest.components,
+                })
+            }
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "message": format!("invalid core manifest: {}", err),
+            }),
+        },
+        None => serde_json::json!({
+            "status": "missing",
+        }),
+    };
+
+    let runtimes = match remote_read_file(address, key_path, "/var/lib/fluxbee/runtimes/manifest.json")? {
+        Some(raw) => match serde_json::from_str::<RuntimeManifest>(&raw) {
+            Ok(manifest) => {
+                let manifest_hash = remote_runtime_manifest_hash(address, key_path).ok().flatten();
+                serde_json::json!({
+                    "status": "ok",
+                    "manifest_version": manifest.version,
+                    "manifest_hash": manifest_hash,
+                    "runtimes": manifest.runtimes,
+                })
+            }
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "message": format!("invalid runtime manifest: {}", err),
+            }),
+        },
+        None => serde_json::json!({
+            "status": "missing",
+        }),
+    };
+
+    Ok(serde_json::json!({
+        "hive_id": hive_id,
+        "core": core,
+        "runtimes": runtimes,
+    }))
+}
+
+fn versions_snapshot_for_hive(
+    state: &OrchestratorState,
+    hive_id: &str,
+) -> Result<serde_json::Value, OrchestratorError> {
+    if hive_id == state.hive_id {
+        return Ok(local_versions_snapshot(state));
+    }
+    let (address, key_path) = hive_access(hive_id)?;
+    remote_versions_snapshot(hive_id, &address, &key_path)
+}
+
+fn get_versions_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+    let target_hive = target_hive_from_payload(payload, &state.hive_id);
+    match versions_snapshot_for_hive(state, &target_hive) {
+        Ok(snapshot) => serde_json::json!({
+            "status": "ok",
+            "hive": snapshot,
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "VERSIONS_FAILED",
+            "message": err.to_string(),
+            "target": target_hive,
+        }),
+    }
+}
+
+fn list_versions_flow(state: &OrchestratorState) -> serde_json::Value {
+    let mut hives = Vec::new();
+    match versions_snapshot_for_hive(state, &state.hive_id) {
+        Ok(snapshot) => hives.push(snapshot),
+        Err(err) => hives.push(serde_json::json!({
+            "hive_id": state.hive_id,
+            "status": "error",
+            "message": err.to_string(),
+        })),
+    }
+    for hive_id in list_managed_hive_ids() {
+        if hive_id == state.hive_id {
+            continue;
+        }
+        match versions_snapshot_for_hive(state, &hive_id) {
+            Ok(snapshot) => hives.push(snapshot),
+            Err(err) => hives.push(serde_json::json!({
+                "hive_id": hive_id,
+                "status": "error",
+                "message": err.to_string(),
+            })),
+        }
+    }
+    serde_json::json!({
+        "status": "ok",
+        "hives": hives,
+    })
 }
 
 fn node_entry_to_json(entry: &NodeEntry) -> Option<serde_json::Value> {
