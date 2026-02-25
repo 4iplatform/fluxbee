@@ -109,7 +109,7 @@ Implementación pendiente de decisiones C1/C3:
 
 ### 5) API/observabilidad de versiones
 - [x] Exponer endpoint admin para version efectiva por hive (runtimes + core).
-- [ ] Persistir historial de despliegues (deployment_id, actor, target_hives, resultado).
+- [x] Persistir historial de despliegues (deployment_id, actor, target_hives, resultado).
 - [ ] Agregar alertas de drift versionado (manifest o binarios core) entre motherbee y workers.
 
 ### 6) Validacion E2E de versionado/distribucion

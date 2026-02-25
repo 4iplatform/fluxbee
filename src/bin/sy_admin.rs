@@ -630,6 +630,19 @@ async fn handle_http(
                 respond_json(stream, status, &resp).await?;
             }
         }
+        ("GET", "/deployments") => {
+            let hive = query.get("hive").cloned();
+            let payload = deployments_payload_from_query(&query);
+            if hive.is_some() {
+                let (status, resp) =
+                    handle_admin_command(ctx, client, "get_deployments", payload, hive).await?;
+                respond_json(stream, status, &resp).await?;
+            } else {
+                let (status, resp) =
+                    handle_admin_command(ctx, client, "list_deployments", payload, None).await?;
+                respond_json(stream, status, &resp).await?;
+            }
+        }
         ("GET", "/routes") => {
             let hive = query.get("hive").cloned();
             let (status, resp) = handle_admin_query(ctx, client, "list_routes", hive).await?;
@@ -832,7 +845,7 @@ async fn handle_http(
 async fn handle_hive_paths(
     method: &str,
     path: &str,
-    _query: &HashMap<String, String>,
+    query: &HashMap<String, String>,
     body: &[u8],
     ctx: &AdminContext,
     client: &AdminRouterClient,
@@ -953,6 +966,12 @@ async fn handle_hive_paths(
         ("GET", ["versions"]) => {
             let (status, resp) =
                 handle_admin_query(ctx, client, "get_versions", Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["deployments"]) => {
+            let payload = deployments_payload_from_query(query);
+            let (status, resp) =
+                handle_admin_command(ctx, client, "get_deployments", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["routers"]) => {
@@ -1259,6 +1278,23 @@ fn parse_query(query: &str) -> HashMap<String, String> {
         params.insert(key.to_string(), value.to_string());
     }
     params
+}
+
+fn deployments_payload_from_query(query: &HashMap<String, String>) -> serde_json::Value {
+    let mut payload = serde_json::json!({});
+    if let Some(limit_raw) = query.get("limit") {
+        if let Ok(limit) = limit_raw.trim().parse::<u64>() {
+            payload["limit"] = serde_json::Value::Number(limit.into());
+        }
+    }
+    if let Some(category) = query
+        .get("category")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        payload["category"] = serde_json::Value::String(category.to_string());
+    }
+    payload
 }
 
 fn load_node_uuid(dir: &Path, base_name: &str) -> Result<String, AdminError> {
@@ -1840,7 +1876,7 @@ fn build_admin_request(
         }
         "list_nodes" | "run_node" | "kill_node" | "list_routers" | "run_router" | "kill_router"
         | "hive_status" | "get_storage" | "set_storage" | "list_hives" | "get_hive"
-        | "list_versions" | "get_versions"
+        | "list_versions" | "get_versions" | "list_deployments" | "get_deployments"
         | "remove_hive" | "add_hive" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
@@ -2012,6 +2048,8 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "get_hive"
             | "list_versions"
             | "get_versions"
+            | "list_deployments"
+            | "get_deployments"
             | "remove_hive"
             | "add_hive"
     )

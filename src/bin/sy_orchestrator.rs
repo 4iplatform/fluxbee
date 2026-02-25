@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -43,6 +44,7 @@ const SYNCTHING_VENDOR_SOURCE_PATH: &str = "/var/lib/fluxbee/vendor/syncthing/sy
 const CORE_BIN_SOURCE_DIR: &str = "/var/lib/fluxbee/core/bin";
 const CORE_MANIFEST_PATH: &str = "/var/lib/fluxbee/core/manifest.json";
 const CORE_SERVICE_HEALTH_TIMEOUT_SECS: u64 = 30;
+const DEPLOYMENT_HISTORY_MAX_LIMIT: usize = 500;
 const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "rt-gateway",
     "sy-config-routes",
@@ -153,6 +155,38 @@ struct CoreManifestComponent {
     sha256: String,
     #[serde(default)]
     size: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct DeploymentWorkerOutcome {
+    hive_id: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_hash_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_hash_after: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct DeploymentHistoryEntry {
+    deployment_id: String,
+    category: String,
+    trigger: String,
+    actor: String,
+    started_at: u64,
+    finished_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_hash: Option<String>,
+    target_hives: Vec<String>,
+    result: String,
+    workers: Vec<DeploymentWorkerOutcome>,
 }
 
 struct OrchestratorState {
@@ -735,6 +769,8 @@ async fn handle_admin(
         "list_routers" => list_routers_flow(state, &msg.payload),
         "list_versions" => list_versions_flow(state),
         "get_versions" => get_versions_flow(state, &msg.payload),
+        "list_deployments" => list_deployments_flow(&msg.payload),
+        "get_deployments" => get_deployments_flow(state, &msg.payload),
         "run_node" => run_node_flow(state, &msg.payload),
         "kill_node" => kill_node_flow(state, &msg.payload),
         "run_router" => run_router_flow(state, &msg.payload),
@@ -845,8 +881,9 @@ async fn handle_system_message(
     state: &OrchestratorState,
 ) -> Result<(), OrchestratorError> {
     let action = msg.meta.msg.as_deref().unwrap_or_default();
+    let mut source_name: Option<String> = None;
     if matches!(action, "RUNTIME_UPDATE" | "SPAWN_NODE" | "KILL_NODE") {
-        let source_name = resolve_system_source_name_with_retry(state, &msg.routing.src).await;
+        source_name = resolve_system_source_name_with_retry(state, &msg.routing.src).await;
         let is_allowed = source_name
             .as_deref()
             .is_some_and(|name| state.system_allowed_origins.contains(name));
@@ -890,7 +927,8 @@ async fn handle_system_message(
                 *guard = Some(manifest.clone());
             }
             tracing::info!(version = manifest.version, "runtime manifest updated");
-            runtime_sync_workers(state, &manifest).await?;
+            let actor = source_name.unwrap_or_else(|| format!("uuid:{}", msg.routing.src));
+            runtime_sync_workers(state, &manifest, "runtime_update", &actor, true).await?;
         }
         Some("SPAWN_NODE") => {
             let result = run_node_flow(state, &msg.payload);
@@ -1708,26 +1746,29 @@ fn remote_versions_snapshot(
         }),
     };
 
-    let runtimes = match remote_read_file(address, key_path, "/var/lib/fluxbee/runtimes/manifest.json")? {
-        Some(raw) => match serde_json::from_str::<RuntimeManifest>(&raw) {
-            Ok(manifest) => {
-                let manifest_hash = remote_runtime_manifest_hash(address, key_path).ok().flatten();
-                serde_json::json!({
-                    "status": "ok",
-                    "manifest_version": manifest.version,
-                    "manifest_hash": manifest_hash,
-                    "runtimes": manifest.runtimes,
-                })
-            }
-            Err(err) => serde_json::json!({
-                "status": "error",
-                "message": format!("invalid runtime manifest: {}", err),
+    let runtimes =
+        match remote_read_file(address, key_path, "/var/lib/fluxbee/runtimes/manifest.json")? {
+            Some(raw) => match serde_json::from_str::<RuntimeManifest>(&raw) {
+                Ok(manifest) => {
+                    let manifest_hash = remote_runtime_manifest_hash(address, key_path)
+                        .ok()
+                        .flatten();
+                    serde_json::json!({
+                        "status": "ok",
+                        "manifest_version": manifest.version,
+                        "manifest_hash": manifest_hash,
+                        "runtimes": manifest.runtimes,
+                    })
+                }
+                Err(err) => serde_json::json!({
+                    "status": "error",
+                    "message": format!("invalid runtime manifest: {}", err),
+                }),
+            },
+            None => serde_json::json!({
+                "status": "missing",
             }),
-        },
-        None => serde_json::json!({
-            "status": "missing",
-        }),
-    };
+        };
 
     Ok(serde_json::json!({
         "hive_id": hive_id,
@@ -1790,6 +1831,157 @@ fn list_versions_flow(state: &OrchestratorState) -> serde_json::Value {
         "status": "ok",
         "hives": hives,
     })
+}
+
+fn deployment_history_path() -> PathBuf {
+    json_router::paths::storage_root_dir()
+        .join("orchestrator")
+        .join("deployments-history.jsonl")
+}
+
+fn deployment_limit_from_payload(payload: &serde_json::Value) -> usize {
+    payload
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(50)
+        .clamp(1, DEPLOYMENT_HISTORY_MAX_LIMIT)
+}
+
+fn read_deployment_history(
+    limit: usize,
+    hive_filter: Option<&str>,
+    category_filter: Option<&str>,
+) -> Result<Vec<DeploymentHistoryEntry>, OrchestratorError> {
+    let path = deployment_history_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed = serde_json::from_str::<DeploymentHistoryEntry>(&line);
+        let entry = match parsed {
+            Ok(entry) => entry,
+            Err(err) => {
+                tracing::warn!(error = %err, "invalid deployment history line; skipping");
+                continue;
+            }
+        };
+        if let Some(category) = category_filter {
+            if entry.category != category {
+                continue;
+            }
+        }
+        if let Some(hive) = hive_filter {
+            let target_match = entry.target_hives.iter().any(|id| id == hive);
+            let worker_match = entry.workers.iter().any(|item| item.hive_id == hive);
+            if !target_match && !worker_match {
+                continue;
+            }
+        }
+        entries.push(entry);
+    }
+
+    entries.reverse();
+    if entries.len() > limit {
+        entries.truncate(limit);
+    }
+    Ok(entries)
+}
+
+fn append_deployment_history(entry: &DeploymentHistoryEntry) -> Result<(), OrchestratorError> {
+    let path = deployment_history_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let line = serde_json::to_string(entry)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
+fn deployment_result(workers: &[DeploymentWorkerOutcome]) -> String {
+    if workers.is_empty() {
+        return "noop".to_string();
+    }
+    let mut ok = 0usize;
+    let mut err = 0usize;
+    for worker in workers {
+        match worker.status.as_str() {
+            "ok" => ok += 1,
+            "error" => err += 1,
+            _ => {}
+        }
+    }
+    if ok == 0 && err == 0 {
+        "noop".to_string()
+    } else if ok > 0 && err > 0 {
+        "partial_error".to_string()
+    } else if err > 0 {
+        "error".to_string()
+    } else {
+        "ok".to_string()
+    }
+}
+
+fn default_deployment_actor(state: &OrchestratorState) -> String {
+    format!("SY.orchestrator@{}", state.hive_id)
+}
+
+fn list_deployments_flow(payload: &serde_json::Value) -> serde_json::Value {
+    let limit = deployment_limit_from_payload(payload);
+    let category = payload
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    match read_deployment_history(limit, None, category) {
+        Ok(entries) => serde_json::json!({
+            "status": "ok",
+            "entries": entries,
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "DEPLOYMENTS_READ_FAILED",
+            "message": err.to_string(),
+        }),
+    }
+}
+
+fn get_deployments_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let target_hive = target_hive_from_payload(payload, &state.hive_id);
+    let limit = deployment_limit_from_payload(payload);
+    let category = payload
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    match read_deployment_history(limit, Some(&target_hive), category) {
+        Ok(entries) => serde_json::json!({
+            "status": "ok",
+            "hive_id": target_hive,
+            "entries": entries,
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "DEPLOYMENTS_READ_FAILED",
+            "message": err.to_string(),
+            "target": target_hive,
+        }),
+    }
 }
 
 fn node_entry_to_json(entry: &NodeEntry) -> Option<serde_json::Value> {
@@ -2138,47 +2330,197 @@ async fn runtime_verify_and_sync(state: &OrchestratorState) -> Result<(), Orches
             let mut guard = state.runtime_manifest.lock().await;
             *guard = Some(manifest.clone());
         }
-        runtime_sync_workers(state, &manifest).await?;
+        let actor = default_deployment_actor(state);
+        runtime_sync_workers(state, &manifest, "watchdog_verify", &actor, false).await?;
     }
 
-    core_sync_workers().await
+    let actor = default_deployment_actor(state);
+    core_sync_workers(state, "watchdog_verify", &actor, false).await
 }
 
 async fn runtime_sync_workers(
     _state: &OrchestratorState,
     manifest: &RuntimeManifest,
+    trigger: &str,
+    actor: &str,
+    force_record: bool,
 ) -> Result<(), OrchestratorError> {
     if manifest.version == 0 {
         return Ok(());
     }
+    let started_at = now_epoch_ms();
+    let started = Instant::now();
+    let deployment_id = Uuid::new_v4().to_string();
     let local_hash = local_runtime_manifest_hash()?;
     let workers = list_worker_access();
+    let mut outcomes: Vec<DeploymentWorkerOutcome> = Vec::new();
+    let mut target_hives = Vec::new();
     for (hive_id, address, key_path) in workers {
+        target_hives.push(hive_id.clone());
         let remote_hash = remote_runtime_manifest_hash(&address, &key_path)
             .ok()
             .flatten();
+        let worker_started = Instant::now();
         if local_hash.is_some() && remote_hash == local_hash {
+            outcomes.push(DeploymentWorkerOutcome {
+                hive_id,
+                status: "skipped".to_string(),
+                reason: Some("up_to_date".to_string()),
+                duration_ms: worker_started.elapsed().as_millis() as u64,
+                local_hash: local_hash.clone(),
+                remote_hash_before: remote_hash.clone(),
+                remote_hash_after: remote_hash,
+            });
             continue;
         }
         if let Err(err) = sync_runtime_to_worker(&hive_id, &address, &key_path) {
             tracing::warn!(hive = %hive_id, error = %err, "runtime sync failed");
+            outcomes.push(DeploymentWorkerOutcome {
+                hive_id,
+                status: "error".to_string(),
+                reason: Some(err.to_string()),
+                duration_ms: worker_started.elapsed().as_millis() as u64,
+                local_hash: local_hash.clone(),
+                remote_hash_before: remote_hash,
+                remote_hash_after: None,
+            });
+            continue;
+        }
+        let remote_after = remote_runtime_manifest_hash(&address, &key_path)
+            .ok()
+            .flatten();
+        if local_hash.is_some() && remote_after != local_hash {
+            outcomes.push(DeploymentWorkerOutcome {
+                hive_id,
+                status: "error".to_string(),
+                reason: Some("post_sync_hash_mismatch".to_string()),
+                duration_ms: worker_started.elapsed().as_millis() as u64,
+                local_hash: local_hash.clone(),
+                remote_hash_before: remote_hash,
+                remote_hash_after: remote_after,
+            });
+            continue;
+        }
+        outcomes.push(DeploymentWorkerOutcome {
+            hive_id,
+            status: "ok".to_string(),
+            reason: None,
+            duration_ms: worker_started.elapsed().as_millis() as u64,
+            local_hash: local_hash.clone(),
+            remote_hash_before: remote_hash,
+            remote_hash_after: remote_after,
+        });
+    }
+
+    let has_non_skipped = outcomes.iter().any(|item| item.status != "skipped");
+    if force_record || has_non_skipped {
+        let entry = DeploymentHistoryEntry {
+            deployment_id,
+            category: "runtime".to_string(),
+            trigger: trigger.to_string(),
+            actor: actor.to_string(),
+            started_at,
+            finished_at: started_at + started.elapsed().as_millis() as u64,
+            manifest_version: Some(manifest.version),
+            manifest_hash: local_hash.clone(),
+            target_hives,
+            result: deployment_result(&outcomes),
+            workers: outcomes,
+        };
+        if let Err(err) = append_deployment_history(&entry) {
+            tracing::warn!(error = %err, "failed to persist runtime deployment history");
         }
     }
     Ok(())
 }
 
-async fn core_sync_workers() -> Result<(), OrchestratorError> {
+async fn core_sync_workers(
+    _state: &OrchestratorState,
+    trigger: &str,
+    actor: &str,
+    force_record: bool,
+) -> Result<(), OrchestratorError> {
+    let started_at = now_epoch_ms();
+    let started = Instant::now();
+    let deployment_id = Uuid::new_v4().to_string();
     let local_hash = local_core_manifest_hash()?;
     let workers = list_worker_access();
+    let mut outcomes: Vec<DeploymentWorkerOutcome> = Vec::new();
+    let mut target_hives = Vec::new();
     for (hive_id, address, key_path) in workers {
+        target_hives.push(hive_id.clone());
         let remote_hash = remote_core_manifest_hash(&address, &key_path)
             .ok()
             .flatten();
+        let worker_started = Instant::now();
         if local_hash.is_some() && remote_hash == local_hash {
+            outcomes.push(DeploymentWorkerOutcome {
+                hive_id,
+                status: "skipped".to_string(),
+                reason: Some("up_to_date".to_string()),
+                duration_ms: worker_started.elapsed().as_millis() as u64,
+                local_hash: local_hash.clone(),
+                remote_hash_before: remote_hash.clone(),
+                remote_hash_after: remote_hash,
+            });
             continue;
         }
         if let Err(err) = sync_core_to_worker(&hive_id, &address, &key_path) {
             tracing::warn!(hive = %hive_id, error = %err, "core sync failed");
+            outcomes.push(DeploymentWorkerOutcome {
+                hive_id,
+                status: "error".to_string(),
+                reason: Some(err.to_string()),
+                duration_ms: worker_started.elapsed().as_millis() as u64,
+                local_hash: local_hash.clone(),
+                remote_hash_before: remote_hash,
+                remote_hash_after: None,
+            });
+            continue;
+        }
+        let remote_after = remote_core_manifest_hash(&address, &key_path)
+            .ok()
+            .flatten();
+        if local_hash.is_some() && remote_after != local_hash {
+            outcomes.push(DeploymentWorkerOutcome {
+                hive_id,
+                status: "error".to_string(),
+                reason: Some("post_sync_hash_mismatch".to_string()),
+                duration_ms: worker_started.elapsed().as_millis() as u64,
+                local_hash: local_hash.clone(),
+                remote_hash_before: remote_hash,
+                remote_hash_after: remote_after,
+            });
+            continue;
+        }
+        outcomes.push(DeploymentWorkerOutcome {
+            hive_id,
+            status: "ok".to_string(),
+            reason: None,
+            duration_ms: worker_started.elapsed().as_millis() as u64,
+            local_hash: local_hash.clone(),
+            remote_hash_before: remote_hash,
+            remote_hash_after: remote_after,
+        });
+    }
+
+    let has_non_skipped = outcomes.iter().any(|item| item.status != "skipped");
+    if force_record || has_non_skipped {
+        let entry = DeploymentHistoryEntry {
+            deployment_id,
+            category: "core".to_string(),
+            trigger: trigger.to_string(),
+            actor: actor.to_string(),
+            started_at,
+            finished_at: started_at + started.elapsed().as_millis() as u64,
+            manifest_version: None,
+            manifest_hash: local_hash.clone(),
+            target_hives,
+            result: deployment_result(&outcomes),
+            workers: outcomes,
+        };
+        if let Err(err) = append_deployment_history(&entry) {
+            tracing::warn!(error = %err, "failed to persist core deployment history");
         }
     }
     Ok(())
@@ -2810,7 +3152,10 @@ fn validate_core_manifest_for_bins(bin_paths: &[String]) -> Result<(), Orchestra
             .to_string();
 
         let expected = manifest.components.get(&component_name).ok_or_else(|| {
-            format!("core manifest missing component '{component_name}' for '{}'", path.display())
+            format!(
+                "core manifest missing component '{component_name}' for '{}'",
+                path.display()
+            )
         })?;
         if expected.service.trim().is_empty()
             || expected.version.trim().is_empty()
@@ -2988,7 +3333,8 @@ fn sync_core_to_worker(
         let rollback_result = rollback_remote_core_to_prev(address, key_path);
         let rollback_note = match rollback_result {
             Ok(()) => {
-                if let Err(rb_err) = restart_remote_core_services_with_health_gate(address, key_path)
+                if let Err(rb_err) =
+                    restart_remote_core_services_with_health_gate(address, key_path)
                 {
                     format!("rollback applied but restart after rollback failed: {rb_err}")
                 } else {
@@ -3028,8 +3374,13 @@ fn remote_wait_service_active(
         "bash -lc \"for i in $(seq 1 {}); do systemctl is-active --quiet '{}' && exit 0; sleep 1; done; exit 1\"",
         timeout_secs, service
     );
-    ssh_with_key(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)
-        .map_err(|err| format!("service '{}' did not become active in {}s: {}", service, timeout_secs, err).into())
+    ssh_with_key(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER).map_err(|err| {
+        format!(
+            "service '{}' did not become active in {}s: {}",
+            service, timeout_secs, err
+        )
+        .into()
+    })
 }
 
 fn restart_remote_core_services_with_health_gate(
@@ -3039,7 +3390,10 @@ fn restart_remote_core_services_with_health_gate(
     for service in CORE_SYNC_RESTART_ORDER {
         let exists = remote_service_exists(address, key_path, service)?;
         if !exists {
-            tracing::info!(service = *service, "core sync: remote service not present; skipping restart");
+            tracing::info!(
+                service = *service,
+                "core sync: remote service not present; skipping restart"
+            );
             continue;
         }
         tracing::info!(service = *service, "core sync: restarting remote service");
@@ -3051,13 +3405,11 @@ fn restart_remote_core_services_with_health_gate(
             BOOTSTRAP_SSH_USER,
         )
         .map_err(|err| format!("failed to restart service '{}': {}", service, err))?;
-        remote_wait_service_active(
-            address,
-            key_path,
-            service,
-            CORE_SERVICE_HEALTH_TIMEOUT_SECS,
-        )?;
-        tracing::info!(service = *service, "core sync: remote service active after restart");
+        remote_wait_service_active(address, key_path, service, CORE_SERVICE_HEALTH_TIMEOUT_SECS)?;
+        tracing::info!(
+            service = *service,
+            "core sync: remote service active after restart"
+        );
     }
     Ok(())
 }
@@ -3160,7 +3512,10 @@ fn ensure_remote_syncthing_runtime(
         .into());
     }
 
-    let remote_tmp_path = format!("/tmp/fluxbee-syncthing-{}.bin", sanitize_unit_suffix(hive_id));
+    let remote_tmp_path = format!(
+        "/tmp/fluxbee-syncthing-{}.bin",
+        sanitize_unit_suffix(hive_id)
+    );
     scp_with_key(
         &address,
         &key_path,
@@ -3448,12 +3803,65 @@ fn add_hive_flow(
     };
     let has_identity_source = core_manifest.components.contains_key("sy-identity");
 
+    let core_deploy_started_at = now_epoch_ms();
+    let core_deploy_started = Instant::now();
+    let local_core_hash = local_core_manifest_hash().ok().flatten();
+    let remote_core_hash_before = remote_core_manifest_hash(address, &key_path).ok().flatten();
     if let Err(err) = sync_core_to_worker(hive_id, address, &key_path) {
+        let entry = DeploymentHistoryEntry {
+            deployment_id: Uuid::new_v4().to_string(),
+            category: "core".to_string(),
+            trigger: "add_hive".to_string(),
+            actor: default_deployment_actor(state),
+            started_at: core_deploy_started_at,
+            finished_at: core_deploy_started_at + core_deploy_started.elapsed().as_millis() as u64,
+            manifest_version: None,
+            manifest_hash: local_core_hash.clone(),
+            target_hives: vec![hive_id.to_string()],
+            result: "error".to_string(),
+            workers: vec![DeploymentWorkerOutcome {
+                hive_id: hive_id.to_string(),
+                status: "error".to_string(),
+                reason: Some(err.to_string()),
+                duration_ms: core_deploy_started.elapsed().as_millis() as u64,
+                local_hash: local_core_hash.clone(),
+                remote_hash_before: remote_core_hash_before,
+                remote_hash_after: None,
+            }],
+        };
+        if let Err(history_err) = append_deployment_history(&entry) {
+            tracing::warn!(error = %history_err, "failed to persist add_hive core deployment history");
+        }
         return serde_json::json!({
             "status": "error",
             "error_code": "COPY_FAILED",
             "message": err.to_string(),
         });
+    }
+    let remote_core_hash_after = remote_core_manifest_hash(address, &key_path).ok().flatten();
+    let entry = DeploymentHistoryEntry {
+        deployment_id: Uuid::new_v4().to_string(),
+        category: "core".to_string(),
+        trigger: "add_hive".to_string(),
+        actor: default_deployment_actor(state),
+        started_at: core_deploy_started_at,
+        finished_at: core_deploy_started_at + core_deploy_started.elapsed().as_millis() as u64,
+        manifest_version: None,
+        manifest_hash: local_core_hash.clone(),
+        target_hives: vec![hive_id.to_string()],
+        result: "ok".to_string(),
+        workers: vec![DeploymentWorkerOutcome {
+            hive_id: hive_id.to_string(),
+            status: "ok".to_string(),
+            reason: None,
+            duration_ms: core_deploy_started.elapsed().as_millis() as u64,
+            local_hash: local_core_hash,
+            remote_hash_before: remote_core_hash_before,
+            remote_hash_after: remote_core_hash_after,
+        }],
+    };
+    if let Err(history_err) = append_deployment_history(&entry) {
+        tracing::warn!(error = %history_err, "failed to persist add_hive core deployment history");
     }
 
     if let Err(err) = ssh_with_key(
