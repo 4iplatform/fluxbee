@@ -45,6 +45,7 @@ const CORE_BIN_SOURCE_DIR: &str = "/var/lib/fluxbee/core/bin";
 const CORE_MANIFEST_PATH: &str = "/var/lib/fluxbee/core/manifest.json";
 const CORE_SERVICE_HEALTH_TIMEOUT_SECS: u64 = 30;
 const DEPLOYMENT_HISTORY_MAX_LIMIT: usize = 500;
+const DRIFT_ALERT_MAX_LIMIT: usize = 500;
 const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "rt-gateway",
     "sy-config-routes",
@@ -187,6 +188,24 @@ struct DeploymentHistoryEntry {
     target_hives: Vec<String>,
     result: String,
     workers: Vec<DeploymentWorkerOutcome>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct DriftAlertEntry {
+    alert_id: String,
+    detected_at: u64,
+    category: String,
+    trigger: String,
+    hive_id: String,
+    severity: String,
+    kind: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_hash_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_hash_after: Option<String>,
 }
 
 struct OrchestratorState {
@@ -771,6 +790,8 @@ async fn handle_admin(
         "get_versions" => get_versions_flow(state, &msg.payload),
         "list_deployments" => list_deployments_flow(&msg.payload),
         "get_deployments" => get_deployments_flow(state, &msg.payload),
+        "list_drift_alerts" => list_drift_alerts_flow(&msg.payload),
+        "get_drift_alerts" => get_drift_alerts_flow(state, &msg.payload),
         "run_node" => run_node_flow(state, &msg.payload),
         "kill_node" => kill_node_flow(state, &msg.payload),
         "run_router" => run_router_flow(state, &msg.payload),
@@ -2025,6 +2046,172 @@ fn get_deployments_flow(
     }
 }
 
+fn drift_alerts_path() -> PathBuf {
+    json_router::paths::storage_root_dir()
+        .join("orchestrator")
+        .join("drift-alerts.jsonl")
+}
+
+fn drift_alert_limit_from_payload(payload: &serde_json::Value) -> usize {
+    payload
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(50)
+        .clamp(1, DRIFT_ALERT_MAX_LIMIT)
+}
+
+fn append_drift_alert(entry: &DriftAlertEntry) -> Result<(), OrchestratorError> {
+    let path = drift_alerts_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let line = serde_json::to_string(entry)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
+fn read_drift_alerts(
+    limit: usize,
+    hive_filter: Option<&str>,
+    category_filter: Option<&str>,
+    severity_filter: Option<&str>,
+    kind_filter: Option<&str>,
+) -> Result<Vec<DriftAlertEntry>, OrchestratorError> {
+    let path = drift_alerts_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed = serde_json::from_str::<DriftAlertEntry>(&line);
+        let entry = match parsed {
+            Ok(entry) => entry,
+            Err(err) => {
+                tracing::warn!(error = %err, "invalid drift alert line; skipping");
+                continue;
+            }
+        };
+        if let Some(hive) = hive_filter {
+            if entry.hive_id != hive {
+                continue;
+            }
+        }
+        if let Some(category) = category_filter {
+            if entry.category != category {
+                continue;
+            }
+        }
+        if let Some(severity) = severity_filter {
+            if entry.severity != severity {
+                continue;
+            }
+        }
+        if let Some(kind) = kind_filter {
+            if entry.kind != kind {
+                continue;
+            }
+        }
+        entries.push(entry);
+    }
+
+    entries.reverse();
+    if entries.len() > limit {
+        entries.truncate(limit);
+    }
+    Ok(entries)
+}
+
+fn drift_filter_str<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    payload
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+fn push_drift_alert(
+    category: &str,
+    trigger: &str,
+    hive_id: &str,
+    severity: &str,
+    kind: &str,
+    message: String,
+    local_hash: Option<String>,
+    remote_hash_before: Option<String>,
+    remote_hash_after: Option<String>,
+) {
+    let entry = DriftAlertEntry {
+        alert_id: Uuid::new_v4().to_string(),
+        detected_at: now_epoch_ms(),
+        category: category.to_string(),
+        trigger: trigger.to_string(),
+        hive_id: hive_id.to_string(),
+        severity: severity.to_string(),
+        kind: kind.to_string(),
+        message,
+        local_hash,
+        remote_hash_before,
+        remote_hash_after,
+    };
+    if let Err(err) = append_drift_alert(&entry) {
+        tracing::warn!(error = %err, "failed to persist drift alert");
+    }
+}
+
+fn list_drift_alerts_flow(payload: &serde_json::Value) -> serde_json::Value {
+    let limit = drift_alert_limit_from_payload(payload);
+    let category = drift_filter_str(payload, "category");
+    let severity = drift_filter_str(payload, "severity");
+    let kind = drift_filter_str(payload, "kind");
+    match read_drift_alerts(limit, None, category, severity, kind) {
+        Ok(entries) => serde_json::json!({
+            "status": "ok",
+            "entries": entries,
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "DRIFT_ALERTS_READ_FAILED",
+            "message": err.to_string(),
+        }),
+    }
+}
+
+fn get_drift_alerts_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let target_hive = target_hive_from_payload(payload, &state.hive_id);
+    let limit = drift_alert_limit_from_payload(payload);
+    let category = drift_filter_str(payload, "category");
+    let severity = drift_filter_str(payload, "severity");
+    let kind = drift_filter_str(payload, "kind");
+    match read_drift_alerts(limit, Some(&target_hive), category, severity, kind) {
+        Ok(entries) => serde_json::json!({
+            "status": "ok",
+            "hive_id": target_hive,
+            "entries": entries,
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "DRIFT_ALERTS_READ_FAILED",
+            "message": err.to_string(),
+            "target": target_hive,
+        }),
+    }
+}
+
 fn node_entry_to_json(entry: &NodeEntry) -> Option<serde_json::Value> {
     if entry.name_len == 0 {
         return None;
@@ -2402,6 +2589,10 @@ async fn runtime_sync_workers(
             .ok()
             .flatten();
         let worker_started = Instant::now();
+        let pre_drift_detected = local_hash.is_some()
+            && remote_hash
+                .as_deref()
+                .is_some_and(|remote| Some(remote) != local_hash.as_deref());
         if local_hash.is_some() && remote_hash == local_hash {
             outcomes.push(DeploymentWorkerOutcome {
                 hive_id,
@@ -2416,6 +2607,19 @@ async fn runtime_sync_workers(
         }
         if let Err(err) = sync_runtime_to_worker(&hive_id, &address, &key_path) {
             tracing::warn!(hive = %hive_id, error = %err, "runtime sync failed");
+            if pre_drift_detected {
+                push_drift_alert(
+                    "runtime",
+                    trigger,
+                    &hive_id,
+                    "error",
+                    "sync_error",
+                    format!("runtime drift detected and auto-resync failed: {}", err),
+                    local_hash.clone(),
+                    remote_hash.clone(),
+                    None,
+                );
+            }
             outcomes.push(DeploymentWorkerOutcome {
                 hive_id,
                 status: "error".to_string(),
@@ -2431,6 +2635,17 @@ async fn runtime_sync_workers(
             .ok()
             .flatten();
         if local_hash.is_some() && remote_after != local_hash {
+            push_drift_alert(
+                "runtime",
+                trigger,
+                &hive_id,
+                "error",
+                "post_sync_mismatch",
+                "runtime drift persists after auto-resync".to_string(),
+                local_hash.clone(),
+                remote_hash.clone(),
+                remote_after.clone(),
+            );
             outcomes.push(DeploymentWorkerOutcome {
                 hive_id,
                 status: "error".to_string(),
@@ -2441,6 +2656,22 @@ async fn runtime_sync_workers(
                 remote_hash_after: remote_after,
             });
             continue;
+        }
+        if pre_drift_detected {
+            push_drift_alert(
+                "runtime",
+                trigger,
+                &hive_id,
+                "warning",
+                "pre_sync_mismatch_resolved",
+                format!(
+                    "runtime drift detected (remote != local) and resolved by auto-resync by {}",
+                    actor
+                ),
+                local_hash.clone(),
+                remote_hash.clone(),
+                remote_after.clone(),
+            );
         }
         outcomes.push(DeploymentWorkerOutcome {
             hive_id,
@@ -2494,6 +2725,10 @@ async fn core_sync_workers(
             .ok()
             .flatten();
         let worker_started = Instant::now();
+        let pre_drift_detected = local_hash.is_some()
+            && remote_hash
+                .as_deref()
+                .is_some_and(|remote| Some(remote) != local_hash.as_deref());
         if local_hash.is_some() && remote_hash == local_hash {
             outcomes.push(DeploymentWorkerOutcome {
                 hive_id,
@@ -2508,6 +2743,19 @@ async fn core_sync_workers(
         }
         if let Err(err) = sync_core_to_worker(&hive_id, &address, &key_path) {
             tracing::warn!(hive = %hive_id, error = %err, "core sync failed");
+            if pre_drift_detected {
+                push_drift_alert(
+                    "core",
+                    trigger,
+                    &hive_id,
+                    "error",
+                    "sync_error",
+                    format!("core drift detected and auto-resync failed: {}", err),
+                    local_hash.clone(),
+                    remote_hash.clone(),
+                    None,
+                );
+            }
             outcomes.push(DeploymentWorkerOutcome {
                 hive_id,
                 status: "error".to_string(),
@@ -2523,6 +2771,17 @@ async fn core_sync_workers(
             .ok()
             .flatten();
         if local_hash.is_some() && remote_after != local_hash {
+            push_drift_alert(
+                "core",
+                trigger,
+                &hive_id,
+                "error",
+                "post_sync_mismatch",
+                "core drift persists after auto-resync".to_string(),
+                local_hash.clone(),
+                remote_hash.clone(),
+                remote_after.clone(),
+            );
             outcomes.push(DeploymentWorkerOutcome {
                 hive_id,
                 status: "error".to_string(),
@@ -2533,6 +2792,22 @@ async fn core_sync_workers(
                 remote_hash_after: remote_after,
             });
             continue;
+        }
+        if pre_drift_detected {
+            push_drift_alert(
+                "core",
+                trigger,
+                &hive_id,
+                "warning",
+                "pre_sync_mismatch_resolved",
+                format!(
+                    "core drift detected (remote != local) and resolved by auto-resync by {}",
+                    actor
+                ),
+                local_hash.clone(),
+                remote_hash.clone(),
+                remote_after.clone(),
+            );
         }
         outcomes.push(DeploymentWorkerOutcome {
             hive_id,

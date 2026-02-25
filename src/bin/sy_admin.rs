@@ -643,6 +643,19 @@ async fn handle_http(
                 respond_json(stream, status, &resp).await?;
             }
         }
+        ("GET", "/drift-alerts") => {
+            let hive = query.get("hive").cloned();
+            let payload = drift_alerts_payload_from_query(&query);
+            if hive.is_some() {
+                let (status, resp) =
+                    handle_admin_command(ctx, client, "get_drift_alerts", payload, hive).await?;
+                respond_json(stream, status, &resp).await?;
+            } else {
+                let (status, resp) =
+                    handle_admin_command(ctx, client, "list_drift_alerts", payload, None).await?;
+                respond_json(stream, status, &resp).await?;
+            }
+        }
         ("GET", "/routes") => {
             let hive = query.get("hive").cloned();
             let (status, resp) = handle_admin_query(ctx, client, "list_routes", hive).await?;
@@ -974,6 +987,12 @@ async fn handle_hive_paths(
                 handle_admin_command(ctx, client, "get_deployments", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("GET", ["drift-alerts"]) => {
+            let payload = drift_alerts_payload_from_query(query);
+            let (status, resp) =
+                handle_admin_command(ctx, client, "get_drift_alerts", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
         ("POST", ["routers"]) => {
             let payload = if body.is_empty() {
                 serde_json::json!({})
@@ -1293,6 +1312,25 @@ fn deployments_payload_from_query(query: &HashMap<String, String>) -> serde_json
         .filter(|value| !value.is_empty())
     {
         payload["category"] = serde_json::Value::String(category.to_string());
+    }
+    payload
+}
+
+fn drift_alerts_payload_from_query(query: &HashMap<String, String>) -> serde_json::Value {
+    let mut payload = deployments_payload_from_query(query);
+    if let Some(severity) = query
+        .get("severity")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        payload["severity"] = serde_json::Value::String(severity.to_string());
+    }
+    if let Some(kind) = query
+        .get("kind")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        payload["kind"] = serde_json::Value::String(kind.to_string());
     }
     payload
 }
@@ -1870,16 +1908,17 @@ fn build_admin_request(
     hive: Option<String>,
 ) -> AdminRequest {
     let requested_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
-    let base = match action {
-        "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn" | "delete_vpn" => {
-            "SY.config.routes"
-        }
-        "list_nodes" | "run_node" | "kill_node" | "list_routers" | "run_router" | "kill_router"
-        | "hive_status" | "get_storage" | "set_storage" | "list_hives" | "get_hive"
-        | "list_versions" | "get_versions" | "list_deployments" | "get_deployments"
-        | "remove_hive" | "add_hive" => "SY.orchestrator",
-        _ => "SY.config.routes",
-    };
+    let base =
+        match action {
+            "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn"
+            | "delete_vpn" => "SY.config.routes",
+            "list_nodes" | "run_node" | "kill_node" | "list_routers" | "run_router"
+            | "kill_router" | "hive_status" | "get_storage" | "set_storage" | "list_hives"
+            | "get_hive" | "list_versions" | "get_versions" | "list_deployments"
+            | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "remove_hive"
+            | "add_hive" => "SY.orchestrator",
+            _ => "SY.config.routes",
+        };
     let route_hive = if action_routes_via_local_orchestrator(action) {
         ctx.hive_id.clone()
     } else {
@@ -2050,6 +2089,8 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "get_versions"
             | "list_deployments"
             | "get_deployments"
+            | "list_drift_alerts"
+            | "get_drift_alerts"
             | "remove_hive"
             | "add_hive"
     )
