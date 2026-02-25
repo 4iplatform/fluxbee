@@ -42,6 +42,13 @@ const SYNCTHING_INSTALL_PATH: &str = "/usr/bin/syncthing";
 const SYNCTHING_VENDOR_SOURCE_PATH: &str = "/var/lib/fluxbee/vendor/syncthing/syncthing";
 const CORE_BIN_SOURCE_DIR: &str = "/var/lib/fluxbee/core/bin";
 const CORE_MANIFEST_PATH: &str = "/var/lib/fluxbee/core/manifest.json";
+const CORE_SERVICE_HEALTH_TIMEOUT_SECS: u64 = 30;
+const CORE_SYNC_RESTART_ORDER: &[&str] = &[
+    "rt-gateway",
+    "sy-config-routes",
+    "sy-opa-rules",
+    "sy-identity",
+];
 const DEFAULT_BLOB_ENABLED: bool = true;
 const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
 const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
@@ -2772,6 +2779,10 @@ fn sync_core_to_worker(
     );
     commands.push("mv /var/lib/fluxbee/core/bin.next /var/lib/fluxbee/core/bin".to_string());
     commands.push(
+        "if [ -f /var/lib/fluxbee/core/manifest.json ]; then cp /var/lib/fluxbee/core/manifest.json /var/lib/fluxbee/core/manifest.prev.json; fi"
+            .to_string(),
+    );
+    commands.push(
         "mv /var/lib/fluxbee/core/manifest.next.json /var/lib/fluxbee/core/manifest.json"
             .to_string(),
     );
@@ -2808,7 +2819,99 @@ fn sync_core_to_worker(
         }
     }
 
+    if let Err(err) = restart_remote_core_services_with_health_gate(address, key_path) {
+        let rollback_result = rollback_remote_core_to_prev(address, key_path);
+        let rollback_note = match rollback_result {
+            Ok(()) => {
+                if let Err(rb_err) = restart_remote_core_services_with_health_gate(address, key_path)
+                {
+                    format!("rollback applied but restart after rollback failed: {rb_err}")
+                } else {
+                    "rollback applied".to_string()
+                }
+            }
+            Err(rb_err) => format!("rollback failed: {rb_err}"),
+        };
+        return Err(
+            format!("core service restart health-gate failed: {err}; {rollback_note}").into(),
+        );
+    }
+
     Ok(())
+}
+
+fn remote_service_exists(
+    address: &str,
+    key_path: &Path,
+    service: &str,
+) -> Result<bool, OrchestratorError> {
+    let cmd = format!(
+        "bash -lc \"state=$(systemctl show '{}.service' --property=LoadState --value 2>/dev/null || true); [ \\\"$state\\\" != \\\"\\\" ] && [ \\\"$state\\\" != \\\"not-found\\\" ] && echo 1 || echo 0\"",
+        service
+    );
+    let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
+    Ok(out.trim() == "1")
+}
+
+fn remote_wait_service_active(
+    address: &str,
+    key_path: &Path,
+    service: &str,
+    timeout_secs: u64,
+) -> Result<(), OrchestratorError> {
+    let cmd = format!(
+        "bash -lc \"for i in $(seq 1 {}); do systemctl is-active --quiet '{}' && exit 0; sleep 1; done; exit 1\"",
+        timeout_secs, service
+    );
+    ssh_with_key(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)
+        .map_err(|err| format!("service '{}' did not become active in {}s: {}", service, timeout_secs, err).into())
+}
+
+fn restart_remote_core_services_with_health_gate(
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    for service in CORE_SYNC_RESTART_ORDER {
+        let exists = remote_service_exists(address, key_path, service)?;
+        if !exists {
+            tracing::info!(service = *service, "core sync: remote service not present; skipping restart");
+            continue;
+        }
+        tracing::info!(service = *service, "core sync: restarting remote service");
+        let restart_cmd = format!("systemctl restart {}", service);
+        ssh_with_key(
+            address,
+            key_path,
+            &sudo_wrap(&restart_cmd),
+            BOOTSTRAP_SSH_USER,
+        )
+        .map_err(|err| format!("failed to restart service '{}': {}", service, err))?;
+        remote_wait_service_active(
+            address,
+            key_path,
+            service,
+            CORE_SERVICE_HEALTH_TIMEOUT_SECS,
+        )?;
+        tracing::info!(service = *service, "core sync: remote service active after restart");
+    }
+    Ok(())
+}
+
+fn rollback_remote_core_to_prev(address: &str, key_path: &Path) -> Result<(), OrchestratorError> {
+    let rollback_cmd = "set -euo pipefail && \
+if [ ! -d /var/lib/fluxbee/core/bin.prev ]; then echo 'missing /var/lib/fluxbee/core/bin.prev' >&2; exit 1; fi && \
+rm -rf /var/lib/fluxbee/core/bin.bad && \
+if [ -d /var/lib/fluxbee/core/bin ]; then mv /var/lib/fluxbee/core/bin /var/lib/fluxbee/core/bin.bad; fi && \
+mv /var/lib/fluxbee/core/bin.prev /var/lib/fluxbee/core/bin && \
+if [ -f /var/lib/fluxbee/core/manifest.prev.json ]; then mv /var/lib/fluxbee/core/manifest.prev.json /var/lib/fluxbee/core/manifest.json; fi && \
+for b in /var/lib/fluxbee/core/bin/*; do [ -f \"$b\" ] || continue; install -m 0755 \"$b\" \"/usr/bin/$(basename \"$b\")\"; done";
+    let rollback_cmd_q = shell_single_quote(rollback_cmd);
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("bash -lc '{}'", rollback_cmd_q)),
+        BOOTSTRAP_SSH_USER,
+    )
 }
 
 fn list_managed_hive_ids() -> Vec<String> {
