@@ -123,6 +123,47 @@ if [[ -n "${sy_identity_bin:-}" ]]; then
 fi
 sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/core/bin/sy-opa-rules"
 
+rt_gateway_sha="$(sha256sum "$STATE_DIR/core/bin/rt-gateway" | awk '{print $1}')"
+rt_gateway_size="$(stat -c %s "$STATE_DIR/core/bin/rt-gateway")"
+sy_admin_sha="$(sha256sum "$STATE_DIR/core/bin/sy-admin" | awk '{print $1}')"
+sy_admin_size="$(stat -c %s "$STATE_DIR/core/bin/sy-admin")"
+sy_config_sha="$(sha256sum "$STATE_DIR/core/bin/sy-config-routes" | awk '{print $1}')"
+sy_config_size="$(stat -c %s "$STATE_DIR/core/bin/sy-config-routes")"
+sy_opa_sha="$(sha256sum "$STATE_DIR/core/bin/sy-opa-rules" | awk '{print $1}')"
+sy_opa_size="$(stat -c %s "$STATE_DIR/core/bin/sy-opa-rules")"
+sy_orch_sha="$(sha256sum "$STATE_DIR/core/bin/sy-orchestrator" | awk '{print $1}')"
+sy_orch_size="$(stat -c %s "$STATE_DIR/core/bin/sy-orchestrator")"
+sy_storage_sha="$(sha256sum "$STATE_DIR/core/bin/sy-storage" | awk '{print $1}')"
+sy_storage_size="$(stat -c %s "$STATE_DIR/core/bin/sy-storage")"
+identity_manifest_entry=""
+if [[ -f "$STATE_DIR/core/bin/sy-identity" ]]; then
+  sy_identity_sha="$(sha256sum "$STATE_DIR/core/bin/sy-identity" | awk '{print $1}')"
+  sy_identity_size="$(stat -c %s "$STATE_DIR/core/bin/sy-identity")"
+  identity_manifest_entry="$(cat <<EOF
+,
+    "sy-identity": {"sha256": "$sy_identity_sha", "size": $sy_identity_size}
+EOF
+)"
+fi
+
+core_manifest_tmp="$(mktemp)"
+cat >"$core_manifest_tmp" <<EOF
+{
+  "schema_version": 1,
+  "components": {
+    "rt-gateway": {"sha256": "$rt_gateway_sha", "size": $rt_gateway_size},
+    "sy-admin": {"sha256": "$sy_admin_sha", "size": $sy_admin_size},
+    "sy-config-routes": {"sha256": "$sy_config_sha", "size": $sy_config_size},
+    "sy-opa-rules": {"sha256": "$sy_opa_sha", "size": $sy_opa_size},
+    "sy-orchestrator": {"sha256": "$sy_orch_sha", "size": $sy_orch_size},
+    "sy-storage": {"sha256": "$sy_storage_sha", "size": $sy_storage_size}${identity_manifest_entry}
+  }
+}
+EOF
+sudo install -m 0644 "$core_manifest_tmp" "$STATE_DIR/core/manifest.json"
+rm -f "$core_manifest_tmp"
+echo "Updated core manifest at $STATE_DIR/core/manifest.json"
+
 seeded_syncthing_vendor=0
 candidate_syncthing_vendor=""
 

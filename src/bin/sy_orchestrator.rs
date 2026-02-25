@@ -41,6 +41,7 @@ const SYNCTHING_DISCOVERY_PORT_UDP: u16 = 21027;
 const SYNCTHING_INSTALL_PATH: &str = "/usr/bin/syncthing";
 const SYNCTHING_VENDOR_SOURCE_PATH: &str = "/var/lib/fluxbee/vendor/syncthing/syncthing";
 const CORE_BIN_SOURCE_DIR: &str = "/var/lib/fluxbee/core/bin";
+const CORE_MANIFEST_PATH: &str = "/var/lib/fluxbee/core/manifest.json";
 const DEFAULT_BLOB_ENABLED: bool = true;
 const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
 const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
@@ -129,6 +130,21 @@ struct RuntimeManifest {
     runtimes: serde_json::Value,
     #[serde(default)]
     hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CoreManifest {
+    #[allow(dead_code)]
+    #[serde(default)]
+    schema_version: Option<u64>,
+    components: std::collections::BTreeMap<String, CoreManifestComponent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CoreManifestComponent {
+    sha256: String,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 struct OrchestratorState {
@@ -294,6 +310,17 @@ async fn bootstrap_local(
     state: &OrchestratorState,
     socket_dir: &Path,
 ) -> Result<(), OrchestratorError> {
+    let mut core_bins = vec![
+        format!("{CORE_BIN_SOURCE_DIR}/rt-gateway"),
+        format!("{CORE_BIN_SOURCE_DIR}/sy-config-routes"),
+        format!("{CORE_BIN_SOURCE_DIR}/sy-opa-rules"),
+    ];
+    let identity_source = format!("{CORE_BIN_SOURCE_DIR}/sy-identity");
+    if Path::new(&identity_source).exists() {
+        core_bins.push(identity_source);
+    }
+    validate_core_manifest_for_bins(&core_bins)?;
+
     tracing::info!("starting rt-gateway");
     systemd_start("rt-gateway")?;
     wait_for_router_ready(state, socket_dir, Duration::from_secs(30)).await?;
@@ -2504,6 +2531,72 @@ fn shell_single_quote(value: &str) -> String {
     value.replace('\'', "'\"'\"'")
 }
 
+fn sha256_file(path: &Path) -> Result<String, OrchestratorError> {
+    let mut cmd = Command::new("sha256sum");
+    cmd.arg(path);
+    let out = run_cmd_output(cmd, "sha256sum core binary")?;
+    Ok(out
+        .split_whitespace()
+        .next()
+        .map(|s| s.to_string())
+        .unwrap_or_default())
+}
+
+fn validate_core_manifest_for_bins(bin_paths: &[String]) -> Result<(), OrchestratorError> {
+    let manifest_path = Path::new(CORE_MANIFEST_PATH);
+    if !manifest_path.exists() {
+        return Err(format!(
+            "core manifest missing at '{}' (run scripts/install.sh)",
+            manifest_path.display()
+        )
+        .into());
+    }
+
+    let data = fs::read_to_string(manifest_path)?;
+    let manifest: CoreManifest = serde_json::from_str(&data)?;
+    if manifest.components.is_empty() {
+        return Err("core manifest has no components".into());
+    }
+
+    for bin_path in bin_paths {
+        let path = Path::new(bin_path);
+        let component_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("invalid core binary path '{}'", path.display()))?
+            .to_string();
+
+        let expected = manifest.components.get(&component_name).ok_or_else(|| {
+            format!("core manifest missing component '{component_name}' for '{}'", path.display())
+        })?;
+
+        let actual_hash = sha256_file(path)?;
+        if actual_hash.is_empty() {
+            return Err(format!("failed to compute sha256 for '{}'", path.display()).into());
+        }
+        if !actual_hash.eq_ignore_ascii_case(expected.sha256.trim()) {
+            return Err(format!(
+                "core manifest hash mismatch for '{}': expected={} actual={}",
+                component_name, expected.sha256, actual_hash
+            )
+            .into());
+        }
+
+        if let Some(expected_size) = expected.size {
+            let actual_size = fs::metadata(path)?.len();
+            if actual_size != expected_size {
+                return Err(format!(
+                    "core manifest size mismatch for '{}': expected={} actual={}",
+                    component_name, expected_size, actual_size
+                )
+                .into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn list_managed_hive_ids() -> Vec<String> {
     let mut out = Vec::new();
     let root = hives_root();
@@ -2881,6 +2974,13 @@ fn add_hive_flow(
     let has_identity_source = Path::new(&identity_source).exists();
     if has_identity_source {
         binaries.push(identity_source);
+    }
+    if let Err(err) = validate_core_manifest_for_bins(&binaries) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "MANIFEST_INVALID",
+            "message": err.to_string(),
+        });
     }
     let binary_refs: Vec<&str> = binaries.iter().map(String::as_str).collect();
     if let Err(err) = scp_with_key(
