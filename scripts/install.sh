@@ -124,18 +124,34 @@ fi
 sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/core/bin/sy-opa-rules"
 
 seeded_syncthing_vendor=0
+candidate_syncthing_vendor=""
+
 for candidate in \
   "$ROOT_DIR/vendor/syncthing/syncthing" \
   "$ROOT_DIR/vendor/syncthing/linux-amd64/syncthing" \
-  "/usr/bin/syncthing"
+  "$ROOT_DIR/vendor/syncthing-linux-amd64-v2.0.14/syncthing"
 do
   if [[ -x "$candidate" ]]; then
-    sudo install -m 0755 "$candidate" "$STATE_DIR/vendor/syncthing/syncthing"
-    seeded_syncthing_vendor=1
-    echo "Seeded Syncthing vendor binary from $candidate"
+    candidate_syncthing_vendor="$candidate"
     break
   fi
 done
+
+if [[ -z "$candidate_syncthing_vendor" ]]; then
+  for candidate in "$ROOT_DIR"/vendor/*/syncthing; do
+    if [[ -x "$candidate" ]]; then
+      candidate_syncthing_vendor="$candidate"
+      break
+    fi
+  done
+fi
+
+if [[ -n "$candidate_syncthing_vendor" ]]; then
+  sudo install -m 0755 "$candidate_syncthing_vendor" "$STATE_DIR/vendor/syncthing/syncthing"
+  seeded_syncthing_vendor=1
+  echo "Seeded Syncthing vendor binary from $candidate_syncthing_vendor"
+fi
+
 if [[ "$seeded_syncthing_vendor" -eq 0 ]] && command -v syncthing >/dev/null 2>&1; then
   syncthing_cmd="$(command -v syncthing)"
   if [[ -x "$syncthing_cmd" ]]; then
@@ -145,7 +161,7 @@ if [[ "$seeded_syncthing_vendor" -eq 0 ]] && command -v syncthing >/dev/null 2>&
   fi
 fi
 if [[ "$seeded_syncthing_vendor" -eq 0 ]]; then
-  echo "Warning: Syncthing vendor binary not found. Place it at $ROOT_DIR/vendor/syncthing/syncthing or install syncthing before running orchestrator blob sync." >&2
+  echo "Warning: Syncthing vendor binary not found in vendor/. Put it at vendor/syncthing/syncthing or vendor/<bundle>/syncthing, or install syncthing before running orchestrator blob sync." >&2
 fi
 
 if [[ -f "$ROOT_DIR/config/hive.yaml" ]]; then
