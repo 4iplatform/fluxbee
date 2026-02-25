@@ -1824,17 +1824,8 @@ fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_json::Val
         });
     }
 
-    let (address, key_path) = match hive_access(hive_id) {
-        Ok(parts) => parts,
-        Err(err) => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "REMOVE_FAILED",
-                "message": format!("cannot resolve hive access for remote cleanup: {err}"),
-            })
-        }
-    };
-
+    let mut remote_cleanup = "stopped";
+    let mut address = String::new();
     let cleanup_cmd = "systemctl disable --now rt-gateway >/dev/null 2>&1 || true; \
 systemctl stop rt-gateway >/dev/null 2>&1 || true; \
 systemctl kill -s KILL rt-gateway >/dev/null 2>&1 || true; \
@@ -1851,19 +1842,32 @@ systemctl disable --now sy-identity >/dev/null 2>&1 || true; \
 systemctl stop sy-identity >/dev/null 2>&1 || true; \
 systemctl kill -s KILL sy-identity >/dev/null 2>&1 || true; \
 systemctl reset-failed sy-identity >/dev/null 2>&1 || true";
-    if let Err(err) = ssh_with_key(
-        &address,
-        &key_path,
-        &sudo_wrap(cleanup_cmd),
-        BOOTSTRAP_SSH_USER,
-    ) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "REMOVE_FAILED",
-            "message": format!("remote cleanup failed: {err}"),
-            "hive_id": hive_id,
-            "address": address,
-        });
+    match hive_access(hive_id) {
+        Ok((addr, key_path)) => {
+            address = addr;
+            if let Err(err) = ssh_with_key(
+                &address,
+                &key_path,
+                &sudo_wrap(cleanup_cmd),
+                BOOTSTRAP_SSH_USER,
+            ) {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "REMOVE_FAILED",
+                    "message": format!("remote cleanup failed: {err}"),
+                    "hive_id": hive_id,
+                    "address": address,
+                });
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                hive_id = hive_id,
+                error = %err,
+                "cannot resolve hive access for remote cleanup; proceeding with local hive state removal"
+            );
+            remote_cleanup = "skipped_no_access";
+        }
     }
 
     if let Err(err) = fs::remove_dir_all(dir) {
@@ -1880,7 +1884,7 @@ systemctl reset-failed sy-identity >/dev/null 2>&1 || true";
         "status": "ok",
         "hive_id": hive_id,
         "address": address,
-        "remote_cleanup": "stopped",
+        "remote_cleanup": remote_cleanup,
     })
 }
 
@@ -2074,7 +2078,12 @@ fn remote_runtime_manifest_hash(
 ) -> Result<Option<String>, OrchestratorError> {
     let cmd = r#"bash -lc "if [ -f /var/lib/fluxbee/runtimes/manifest.json ]; then sha256sum /var/lib/fluxbee/runtimes/manifest.json | awk '{print $1}'; fi""#;
     let out = ssh_with_key_output(address, key_path, &sudo_wrap(cmd), BOOTSTRAP_SSH_USER)?;
-    let hash = out.trim().to_string();
+    let hash = out
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if hash.is_empty() {
         return Ok(None);
     }
@@ -2110,7 +2119,12 @@ fn remote_core_manifest_hash(
         CORE_MANIFEST_PATH, CORE_MANIFEST_PATH
     );
     let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
-    let hash = out.trim().to_string();
+    let hash = out
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if hash.is_empty() {
         return Ok(None);
     }
