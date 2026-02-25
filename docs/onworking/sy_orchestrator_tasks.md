@@ -115,7 +115,7 @@ Implementación pendiente de decisiones C1/C3:
 ### 6) Validacion E2E de versionado/distribucion
 - [ ] Script E2E: `RUNTIME_UPDATE` canary -> global -> verificacion -> rollback.
 - [ ] Caso negativo E2E: update stale rechazado con `error_code` explicito (sin timeout opaco).
-- [ ] Caso E2E de drift remoto: deteccion + auto-resync + evidencia en API/logs.
+- [x] Caso E2E de drift remoto: deteccion + auto-resync + evidencia en API/logs. (`scripts/orchestrator_drift_runtime_e2e.sh`)
 - [ ] Script E2E de vendor: drift de binario + reconciliacion + health check Syncthing.
 
 ### Criterio de salida de este TODO
