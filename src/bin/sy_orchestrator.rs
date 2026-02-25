@@ -2773,11 +2773,11 @@ fn sync_core_to_worker(
     ));
 
     let promote_cmd = commands.join(" && ");
-    let promote_cmd_escaped = promote_cmd.replace('"', "\\\"");
+    let promote_cmd_q = shell_single_quote(&promote_cmd);
     ssh_with_key(
         address,
         key_path,
-        &sudo_wrap(&format!("bash -lc \"{}\"", promote_cmd_escaped)),
+        &sudo_wrap(&format!("bash -lc '{}'", promote_cmd_q)),
         BOOTSTRAP_SSH_USER,
     )?;
 
