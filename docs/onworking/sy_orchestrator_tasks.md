@@ -79,7 +79,7 @@ Modo de trabajo acordado:
 - [x] C4 (decisión): Flags vendor quedan hardcodeadas en orchestrator por ahora.
 
 Implementación pendiente de decisiones C1/C3:
-- [ ] Remover fallback de instalación por package manager en orchestrator (local/remoto) para vendor.
+- [x] Remover fallback de instalación por package manager en orchestrator (local/remoto) para vendor.
 - [x] Migrar `add_hive`/bootstrap de copia core desde `/usr/bin/*` a `/var/lib/fluxbee/core/bin/*`.
 - [ ] Completar validación por manifest core durante bootstrap/add_hive.
 

@@ -38,6 +38,8 @@ const SYNCTHING_INSTALL_USER: &str = "fluxbee";
 const SYNCTHING_SYNC_PORT_TCP: u16 = 22000;
 const SYNCTHING_SYNC_PORT_UDP: u16 = 22000;
 const SYNCTHING_DISCOVERY_PORT_UDP: u16 = 21027;
+const SYNCTHING_INSTALL_PATH: &str = "/usr/bin/syncthing";
+const SYNCTHING_VENDOR_SOURCE_PATH: &str = "/var/lib/fluxbee/vendor/syncthing/syncthing";
 const CORE_BIN_SOURCE_DIR: &str = "/var/lib/fluxbee/core/bin";
 const DEFAULT_BLOB_ENABLED: bool = true;
 const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
@@ -1140,16 +1142,7 @@ fn linux_user_exists(user: &str) -> bool {
 }
 
 fn syncthing_binary_available() -> bool {
-    Command::new("sh")
-        .arg("-lc")
-        .arg("command -v syncthing >/dev/null 2>&1")
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn apt_get_available() -> bool {
-    Path::new("/usr/bin/apt-get").exists() || Path::new("/bin/apt-get").exists()
+    Path::new(SYNCTHING_INSTALL_PATH).exists()
 }
 
 fn command_exists(name: &str) -> bool {
@@ -1278,20 +1271,27 @@ fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
     if syncthing_binary_available() {
         return Ok(());
     }
-    if !apt_get_available() {
-        return Err(
-            "syncthing binary missing and apt-get not found (install syncthing manually)".into(),
-        );
+    if !Path::new(SYNCTHING_VENDOR_SOURCE_PATH).exists() {
+        return Err(format!(
+            "syncthing vendor binary missing at '{}' (seed local vendor repo first)",
+            SYNCTHING_VENDOR_SOURCE_PATH
+        )
+        .into());
     }
-    tracing::warn!("syncthing not found; installing via apt-get");
-    let mut update = Command::new("apt-get");
-    update.arg("update");
-    run_cmd(update, "apt-get update")?;
-    let mut install = Command::new("apt-get");
-    install.arg("install").arg("-y").arg("syncthing");
-    run_cmd(install, "apt-get install syncthing")?;
+    tracing::info!(
+        source = SYNCTHING_VENDOR_SOURCE_PATH,
+        target = SYNCTHING_INSTALL_PATH,
+        "installing syncthing from vendor source"
+    );
+    let mut install = Command::new("install");
+    install
+        .arg("-m")
+        .arg("0755")
+        .arg(SYNCTHING_VENDOR_SOURCE_PATH)
+        .arg(SYNCTHING_INSTALL_PATH);
+    run_cmd(install, "install syncthing from vendor source")?;
     if !syncthing_binary_available() {
-        return Err("syncthing install finished but binary is still missing".into());
+        return Err("syncthing install finished but installed binary is still missing".into());
     }
     Ok(())
 }
@@ -1303,11 +1303,12 @@ fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> Stri
         "root"
     };
     format!(
-        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nEnvironment=HOME={}\nExecStart=/usr/bin/syncthing -no-browser -no-restart -home={} -gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nEnvironment=HOME={}\nExecStart={} -no-browser -no-restart -home={} -gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
         service_user,
         service_group,
         blob.sync_data_dir.display(),
         blob.sync_data_dir.display(),
+        SYNCTHING_INSTALL_PATH,
         blob.sync_data_dir.display(),
         blob.sync_api_port
     )
@@ -2576,12 +2577,30 @@ fn ensure_remote_syncthing_runtime(
     blob: &BlobRuntimeConfig,
 ) -> Result<(), OrchestratorError> {
     let (address, key_path) = hive_access(hive_id)?;
+    if !Path::new(SYNCTHING_VENDOR_SOURCE_PATH).exists() {
+        return Err(format!(
+            "syncthing vendor binary missing at '{}' (seed local vendor repo first)",
+            SYNCTHING_VENDOR_SOURCE_PATH
+        )
+        .into());
+    }
 
-    let install_cmd = r#"bash -lc "if ! command -v syncthing >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y syncthing; elif command -v dnf >/dev/null 2>&1; then dnf install -y syncthing; elif command -v yum >/dev/null 2>&1; then yum install -y syncthing; else echo 'no package manager available for syncthing install' >&2; exit 1; fi; fi""#;
+    let remote_tmp_path = format!("/tmp/fluxbee-syncthing-{}.bin", sanitize_unit_suffix(hive_id));
+    scp_with_key(
+        &address,
+        &key_path,
+        &[SYNCTHING_VENDOR_SOURCE_PATH],
+        &remote_tmp_path,
+        BOOTSTRAP_SSH_USER,
+    )?;
+    let install_cmd = format!(
+        "install -m 0755 '{}' '{}' && rm -f '{}'",
+        remote_tmp_path, SYNCTHING_INSTALL_PATH, remote_tmp_path
+    );
     ssh_with_key(
         &address,
         &key_path,
-        &sudo_wrap(install_cmd),
+        &sudo_wrap(&install_cmd),
         BOOTSTRAP_SSH_USER,
     )?;
 

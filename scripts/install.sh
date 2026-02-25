@@ -42,6 +42,8 @@ sudo install -d "$STATE_DIR/opa/backup"
 sudo install -d "$STATE_DIR/modules"
 sudo install -d "$STATE_DIR/blob"
 sudo install -d "$STATE_DIR/syncthing"
+sudo install -d "$STATE_DIR/vendor"
+sudo install -d "$STATE_DIR/vendor/syncthing"
 sudo install -d "$STATE_DIR/nats"
 sudo install -d "$STATE_DIR/core"
 sudo install -d "$STATE_DIR/core/bin"
@@ -120,6 +122,31 @@ if [[ -n "${sy_identity_bin:-}" ]]; then
   sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/core/bin/sy-identity"
 fi
 sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/core/bin/sy-opa-rules"
+
+seeded_syncthing_vendor=0
+for candidate in \
+  "$ROOT_DIR/vendor/syncthing/syncthing" \
+  "$ROOT_DIR/vendor/syncthing/linux-amd64/syncthing" \
+  "/usr/bin/syncthing"
+do
+  if [[ -x "$candidate" ]]; then
+    sudo install -m 0755 "$candidate" "$STATE_DIR/vendor/syncthing/syncthing"
+    seeded_syncthing_vendor=1
+    echo "Seeded Syncthing vendor binary from $candidate"
+    break
+  fi
+done
+if [[ "$seeded_syncthing_vendor" -eq 0 ]] && command -v syncthing >/dev/null 2>&1; then
+  syncthing_cmd="$(command -v syncthing)"
+  if [[ -x "$syncthing_cmd" ]]; then
+    sudo install -m 0755 "$syncthing_cmd" "$STATE_DIR/vendor/syncthing/syncthing"
+    seeded_syncthing_vendor=1
+    echo "Seeded Syncthing vendor binary from $syncthing_cmd"
+  fi
+fi
+if [[ "$seeded_syncthing_vendor" -eq 0 ]]; then
+  echo "Warning: Syncthing vendor binary not found. Place it at $ROOT_DIR/vendor/syncthing/syncthing or install syncthing before running orchestrator blob sync." >&2
+fi
 
 if [[ -f "$ROOT_DIR/config/hive.yaml" ]]; then
   sudo install -m 0644 "$ROOT_DIR/config/hive.yaml" "$CONFIG_DIR/hive.yaml"
