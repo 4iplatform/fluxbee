@@ -38,6 +38,7 @@ const SYNCTHING_INSTALL_USER: &str = "fluxbee";
 const SYNCTHING_SYNC_PORT_TCP: u16 = 22000;
 const SYNCTHING_SYNC_PORT_UDP: u16 = 22000;
 const SYNCTHING_DISCOVERY_PORT_UDP: u16 = 21027;
+const CORE_BIN_SOURCE_DIR: &str = "/var/lib/fluxbee/core/bin";
 const DEFAULT_BLOB_ENABLED: bool = true;
 const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
 const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
@@ -2841,30 +2842,35 @@ fn add_hive_flow(
         }
     }
 
-    let required_binaries = [
-        "/usr/bin/rt-gateway",
-        "/usr/bin/sy-config-routes",
-        "/usr/bin/sy-opa-rules",
+    let required_binaries = vec![
+        format!("{CORE_BIN_SOURCE_DIR}/rt-gateway"),
+        format!("{CORE_BIN_SOURCE_DIR}/sy-config-routes"),
+        format!("{CORE_BIN_SOURCE_DIR}/sy-opa-rules"),
     ];
-    for bin in required_binaries {
+    for bin in &required_binaries {
         if !Path::new(bin).exists() {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "COPY_FAILED",
-                "message": format!("missing binary {bin}"),
+                "message": format!("missing core source binary {bin}"),
             });
         }
     }
 
-    let mut binaries = vec![
-        "/usr/bin/rt-gateway",
-        "/usr/bin/sy-config-routes",
-        "/usr/bin/sy-opa-rules",
-    ];
-    if identity_available() {
-        binaries.push("/usr/bin/sy-identity");
+    let mut binaries = required_binaries;
+    let identity_source = format!("{CORE_BIN_SOURCE_DIR}/sy-identity");
+    let has_identity_source = Path::new(&identity_source).exists();
+    if has_identity_source {
+        binaries.push(identity_source);
     }
-    if let Err(err) = scp_with_key(address, &key_path, &binaries, "/tmp/", BOOTSTRAP_SSH_USER) {
+    let binary_refs: Vec<&str> = binaries.iter().map(String::as_str).collect();
+    if let Err(err) = scp_with_key(
+        address,
+        &key_path,
+        &binary_refs,
+        "/tmp/",
+        BOOTSTRAP_SSH_USER,
+    ) {
         return serde_json::json!({
             "status": "error",
             "error_code": "COPY_FAILED",
@@ -2966,7 +2972,7 @@ fn add_hive_flow(
         ("sy-config-routes", "/usr/bin/sy-config-routes"),
         ("sy-opa-rules", "/usr/bin/sy-opa-rules"),
     ];
-    if identity_available() {
+    if has_identity_source {
         worker_units.push(("sy-identity", "/usr/bin/sy-identity"));
     }
 

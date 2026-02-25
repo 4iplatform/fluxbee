@@ -43,6 +43,9 @@ sudo install -d "$STATE_DIR/modules"
 sudo install -d "$STATE_DIR/blob"
 sudo install -d "$STATE_DIR/syncthing"
 sudo install -d "$STATE_DIR/nats"
+sudo install -d "$STATE_DIR/core"
+sudo install -d "$STATE_DIR/core/bin"
+sudo install -d "$STATE_DIR/core/bin.prev"
 sudo install -d "$RUN_DIR"
 sudo install -d "$RUN_DIR/routers"
 
@@ -107,6 +110,17 @@ else
 fi
 sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
 
+echo "Updating core source repo in $STATE_DIR/core/bin..."
+sudo install -m 0755 "$json_router_bin" "$STATE_DIR/core/bin/rt-gateway"
+sudo install -m 0755 "$sy_admin_bin" "$STATE_DIR/core/bin/sy-admin"
+sudo install -m 0755 "$sy_config_bin" "$STATE_DIR/core/bin/sy-config-routes"
+sudo install -m 0755 "$sy_orch_bin" "$STATE_DIR/core/bin/sy-orchestrator"
+sudo install -m 0755 "$sy_storage_bin" "$STATE_DIR/core/bin/sy-storage"
+if [[ -n "${sy_identity_bin:-}" ]]; then
+  sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/core/bin/sy-identity"
+fi
+sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/core/bin/sy-opa-rules"
+
 if [[ -f "$ROOT_DIR/config/hive.yaml" ]]; then
   sudo install -m 0644 "$ROOT_DIR/config/hive.yaml" "$CONFIG_DIR/hive.yaml"
 fi
@@ -165,5 +179,5 @@ if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then
   sudo chown "$INSTALL_OWNER":"$INSTALL_OWNER" "$CONFIG_DIR/sy-config-routes.yaml" "$CONFIG_DIR/hive.yaml" 2>/dev/null || true
 fi
 
-echo "Installed config to $CONFIG_DIR, binaries to /usr/bin, systemd units, and runtime directories."
+echo "Installed config to $CONFIG_DIR, binaries to /usr/bin, core source repo to $STATE_DIR/core/bin, systemd units, and runtime directories."
 echo "Note: fluxbee-syncthing is managed dynamically by sy-orchestrator from hive.yaml (blob.sync.*)."

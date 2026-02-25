@@ -80,7 +80,8 @@ Modo de trabajo acordado:
 
 Implementación pendiente de decisiones C1/C3:
 - [ ] Remover fallback de instalación por package manager en orchestrator (local/remoto) para vendor.
-- [ ] Migrar `add_hive`/bootstrap de copia core desde `/usr/bin/*` a `/var/lib/fluxbee/core/bin/*` + manifest.
+- [x] Migrar `add_hive`/bootstrap de copia core desde `/usr/bin/*` a `/var/lib/fluxbee/core/bin/*`.
+- [ ] Completar validación por manifest core durante bootstrap/add_hive.
 
 ### 1) Contrato de versionado de runtimes (hardening)
 - [ ] Definir `schema_version` del `runtime-manifest.json` y politica de compatibilidad.
