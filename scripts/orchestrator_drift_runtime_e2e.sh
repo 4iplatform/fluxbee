@@ -170,7 +170,7 @@ remote_ssh() {
 }
 
 remote_runtime_hash() {
-  remote_ssh "sudo bash -lc \"if [ -f /var/lib/fluxbee/runtimes/manifest.json ]; then sha256sum /var/lib/fluxbee/runtimes/manifest.json | awk '{print \\$1}'; fi\""
+  remote_ssh "sudo bash -lc \"if [ -f /var/lib/fluxbee/runtimes/manifest.json ]; then sha256sum /var/lib/fluxbee/runtimes/manifest.json | awk '{print \$1}'; fi\""
 }
 
 local_runtime_hash() {
