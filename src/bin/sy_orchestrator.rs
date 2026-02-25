@@ -134,14 +134,15 @@ struct RuntimeManifest {
 
 #[derive(Debug, Deserialize)]
 struct CoreManifest {
-    #[allow(dead_code)]
-    #[serde(default)]
-    schema_version: Option<u64>,
+    schema_version: u64,
     components: std::collections::BTreeMap<String, CoreManifestComponent>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CoreManifestComponent {
+    service: String,
+    version: String,
+    build_id: String,
     sha256: String,
     #[serde(default)]
     size: Option<u64>,
@@ -2554,6 +2555,9 @@ fn validate_core_manifest_for_bins(bin_paths: &[String]) -> Result<(), Orchestra
 
     let data = fs::read_to_string(manifest_path)?;
     let manifest: CoreManifest = serde_json::from_str(&data)?;
+    if manifest.schema_version == 0 {
+        return Err("core manifest invalid: schema_version must be >= 1".into());
+    }
     if manifest.components.is_empty() {
         return Err("core manifest has no components".into());
     }
@@ -2569,6 +2573,23 @@ fn validate_core_manifest_for_bins(bin_paths: &[String]) -> Result<(), Orchestra
         let expected = manifest.components.get(&component_name).ok_or_else(|| {
             format!("core manifest missing component '{component_name}' for '{}'", path.display())
         })?;
+        if expected.service.trim().is_empty()
+            || expected.version.trim().is_empty()
+            || expected.build_id.trim().is_empty()
+        {
+            return Err(format!(
+                "core manifest component '{}' missing service/version/build_id",
+                component_name
+            )
+            .into());
+        }
+        if expected.service.trim() != component_name {
+            return Err(format!(
+                "core manifest component '{}' has service='{}' (expected '{}')",
+                component_name, expected.service, component_name
+            )
+            .into());
+        }
 
         let actual_hash = sha256_file(path)?;
         if actual_hash.is_empty() {

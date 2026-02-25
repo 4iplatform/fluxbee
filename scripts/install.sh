@@ -135,13 +135,22 @@ sy_orch_sha="$(sha256sum "$STATE_DIR/core/bin/sy-orchestrator" | awk '{print $1}
 sy_orch_size="$(stat -c %s "$STATE_DIR/core/bin/sy-orchestrator")"
 sy_storage_sha="$(sha256sum "$STATE_DIR/core/bin/sy-storage" | awk '{print $1}')"
 sy_storage_size="$(stat -c %s "$STATE_DIR/core/bin/sy-storage")"
+core_version="${FLUXBEE_CORE_VERSION:-dev}"
+if [[ -n "${FLUXBEE_CORE_BUILD_ID:-}" ]]; then
+  core_build_id="$FLUXBEE_CORE_BUILD_ID"
+elif command -v git >/dev/null 2>&1; then
+  core_build_id="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+fi
+if [[ -z "${core_build_id:-}" ]]; then
+  core_build_id="$(date -u +%Y%m%d%H%M%S)"
+fi
 identity_manifest_entry=""
 if [[ -f "$STATE_DIR/core/bin/sy-identity" ]]; then
   sy_identity_sha="$(sha256sum "$STATE_DIR/core/bin/sy-identity" | awk '{print $1}')"
   sy_identity_size="$(stat -c %s "$STATE_DIR/core/bin/sy-identity")"
   identity_manifest_entry="$(cat <<EOF
 ,
-    "sy-identity": {"sha256": "$sy_identity_sha", "size": $sy_identity_size}
+    "sy-identity": {"service": "sy-identity", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_identity_sha", "size": $sy_identity_size}
 EOF
 )"
 fi
@@ -151,12 +160,12 @@ cat >"$core_manifest_tmp" <<EOF
 {
   "schema_version": 1,
   "components": {
-    "rt-gateway": {"sha256": "$rt_gateway_sha", "size": $rt_gateway_size},
-    "sy-admin": {"sha256": "$sy_admin_sha", "size": $sy_admin_size},
-    "sy-config-routes": {"sha256": "$sy_config_sha", "size": $sy_config_size},
-    "sy-opa-rules": {"sha256": "$sy_opa_sha", "size": $sy_opa_size},
-    "sy-orchestrator": {"sha256": "$sy_orch_sha", "size": $sy_orch_size},
-    "sy-storage": {"sha256": "$sy_storage_sha", "size": $sy_storage_size}${identity_manifest_entry}
+    "rt-gateway": {"service": "rt-gateway", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$rt_gateway_sha", "size": $rt_gateway_size},
+    "sy-admin": {"service": "sy-admin", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_admin_sha", "size": $sy_admin_size},
+    "sy-config-routes": {"service": "sy-config-routes", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_config_sha", "size": $sy_config_size},
+    "sy-opa-rules": {"service": "sy-opa-rules", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_opa_sha", "size": $sy_opa_size},
+    "sy-orchestrator": {"service": "sy-orchestrator", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_orch_sha", "size": $sy_orch_size},
+    "sy-storage": {"service": "sy-storage", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_storage_sha", "size": $sy_storage_size}${identity_manifest_entry}
   }
 }
 EOF

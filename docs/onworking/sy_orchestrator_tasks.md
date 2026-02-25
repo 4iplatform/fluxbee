@@ -96,7 +96,7 @@ Implementación pendiente de decisiones C1/C3:
 - [ ] Agregar verificacion post-sync obligatoria por worker (hash remoto == hash local) con retry acotado.
 
 ### 3) Versionado de binarios core
-- [ ] Definir manifest de componentes core (servicio, version, hash, build_id).
+- [x] Definir manifest de componentes core (servicio, version, hash, build_id).
 - [ ] Diseñar flujo de promocion motherbee -> workers para binarios core (staging + verificacion + switch atomico).
 - [ ] Definir orden de restart por dependencia (`rt-gateway`/`sy-*`) con health-gate entre pasos.
 - [ ] Implementar rollback de core por componente ante falla de health-check.
