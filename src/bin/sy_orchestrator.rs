@@ -1938,6 +1938,47 @@ fn default_deployment_actor(state: &OrchestratorState) -> String {
     format!("SY.orchestrator@{}", state.hive_id)
 }
 
+fn append_single_deployment_history(
+    state: &OrchestratorState,
+    category: &str,
+    trigger: &str,
+    hive_id: &str,
+    status: &str,
+    reason: Option<String>,
+    manifest_hash: Option<String>,
+) {
+    let started_at = now_epoch_ms();
+    let worker = DeploymentWorkerOutcome {
+        hive_id: hive_id.to_string(),
+        status: status.to_string(),
+        reason,
+        duration_ms: 0,
+        local_hash: manifest_hash.clone(),
+        remote_hash_before: None,
+        remote_hash_after: None,
+    };
+    let entry = DeploymentHistoryEntry {
+        deployment_id: Uuid::new_v4().to_string(),
+        category: category.to_string(),
+        trigger: trigger.to_string(),
+        actor: default_deployment_actor(state),
+        started_at,
+        finished_at: started_at,
+        manifest_version: None,
+        manifest_hash,
+        target_hives: vec![hive_id.to_string()],
+        result: if status == "ok" {
+            "ok".to_string()
+        } else {
+            "error".to_string()
+        },
+        workers: vec![worker],
+    };
+    if let Err(err) = append_deployment_history(&entry) {
+        tracing::warn!(error = %err, "failed to persist single deployment history");
+    }
+}
+
 fn list_deployments_flow(payload: &serde_json::Value) -> serde_json::Value {
     let limit = deployment_limit_from_payload(payload);
     let category = payload
@@ -3641,6 +3682,15 @@ fn add_hive_flow(
     let root = hives_root();
     let hive_dir = root.join(hive_id);
     if hive_exists(&state.state_dir, hive_id) {
+        append_single_deployment_history(
+            state,
+            "core",
+            "add_hive",
+            hive_id,
+            "error",
+            Some("HIVE_EXISTS".to_string()),
+            local_core_manifest_hash().ok().flatten(),
+        );
         return serde_json::json!({
             "status": "error",
             "error_code": "HIVE_EXISTS",
