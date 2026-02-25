@@ -22,6 +22,7 @@ set -euo pipefail
 #   WAIT_TIMEOUT_SECS="60"
 #   POLL_INTERVAL_SECS="2"
 #   BUILD_BIN="0|1"
+#   REMOTE_SUDO_PASS="magicAI"
 
 BASE="${BASE:-http://127.0.0.1:8080}"
 HIVE_ID="${HIVE_ID:-worker-220}"
@@ -32,6 +33,7 @@ ORCH_TIMEOUT_SECS="${ORCH_TIMEOUT_SECS:-45}"
 WAIT_TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-60}"
 POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-2}"
 BUILD_BIN="${BUILD_BIN:-0}"
+REMOTE_SUDO_PASS="${REMOTE_SUDO_PASS:-magicAI}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INFO_FILE="/var/lib/fluxbee/hives/${HIVE_ID}/info.yaml"
@@ -164,13 +166,29 @@ remote_ssh() {
   ssh -i "$KEY_PATH" \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR \
     -o ConnectTimeout=10 \
     "administrator@${HIVE_ADDR}" \
     "$remote_cmd"
 }
 
+remote_root() {
+  local root_cmd="$1"
+  local escaped
+  escaped="$(printf "%s" "$root_cmd" | sed "s/'/'\"'\"'/g")"
+  if remote_ssh "sudo -n true" >/dev/null 2>&1; then
+    remote_ssh "sudo bash -lc '$escaped'"
+    return
+  fi
+  if [[ -z "$REMOTE_SUDO_PASS" ]]; then
+    echo "FAIL: remote sudo requires password; set REMOTE_SUDO_PASS" >&2
+    return 1
+  fi
+  remote_ssh "printf '%s\n' '$REMOTE_SUDO_PASS' | sudo -S -p '' bash -lc '$escaped'"
+}
+
 remote_runtime_hash() {
-  remote_ssh "sudo bash -lc \"if [ -f /var/lib/fluxbee/runtimes/manifest.json ]; then sha256sum /var/lib/fluxbee/runtimes/manifest.json | awk '{print \$1}'; fi\""
+  remote_root "if [ -f /var/lib/fluxbee/runtimes/manifest.json ]; then sha256sum /var/lib/fluxbee/runtimes/manifest.json | awk '{print \$1}'; fi"
 }
 
 local_runtime_hash() {
@@ -316,7 +334,7 @@ echo "Baseline hashes: local=$baseline_local_hash remote=$baseline_remote_hash"
 
 echo "Step 2/4: tamper remote runtime manifest to inject drift"
 drift_start_ms="$(epoch_ms)"
-remote_ssh "sudo bash -lc \"printf '\n# drift-e2e-$(date +%s)' >> /var/lib/fluxbee/runtimes/manifest.json\""
+remote_root "printf '\n# drift-e2e-$(date +%s)' >> /var/lib/fluxbee/runtimes/manifest.json"
 tampered_remote_hash="$(remote_runtime_hash || true)"
 if [[ -z "$tampered_remote_hash" || "$tampered_remote_hash" == "$baseline_local_hash" ]]; then
   echo "FAIL: tamper did not change remote runtime manifest hash" >&2
