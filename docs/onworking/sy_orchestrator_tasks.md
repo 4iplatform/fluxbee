@@ -97,7 +97,7 @@ Implementación pendiente de decisiones C1/C3:
 
 ### 3) Versionado de binarios core
 - [x] Definir manifest de componentes core (servicio, version, hash, build_id).
-- [ ] Diseñar flujo de promocion motherbee -> workers para binarios core (staging + verificacion + switch atomico).
+- [x] Diseñar flujo de promocion motherbee -> workers para binarios core (staging + verificacion + switch atomico).
 - [ ] Definir orden de restart por dependencia (`rt-gateway`/`sy-*`) con health-gate entre pasos.
 - [ ] Implementar rollback de core por componente ante falla de health-check.
 

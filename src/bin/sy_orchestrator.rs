@@ -132,13 +132,13 @@ struct RuntimeManifest {
     hash: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct CoreManifest {
     schema_version: u64,
     components: std::collections::BTreeMap<String, CoreManifestComponent>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct CoreManifestComponent {
     service: String,
     version: String,
@@ -311,15 +311,12 @@ async fn bootstrap_local(
     state: &OrchestratorState,
     socket_dir: &Path,
 ) -> Result<(), OrchestratorError> {
-    let mut core_bins = vec![
-        format!("{CORE_BIN_SOURCE_DIR}/rt-gateway"),
-        format!("{CORE_BIN_SOURCE_DIR}/sy-config-routes"),
-        format!("{CORE_BIN_SOURCE_DIR}/sy-opa-rules"),
-    ];
-    let identity_source = format!("{CORE_BIN_SOURCE_DIR}/sy-identity");
-    if Path::new(&identity_source).exists() {
-        core_bins.push(identity_source);
-    }
+    let core_manifest = load_core_manifest()?;
+    let core_bins: Vec<String> = core_manifest
+        .components
+        .keys()
+        .map(|name| format!("{CORE_BIN_SOURCE_DIR}/{name}"))
+        .collect();
     validate_core_manifest_for_bins(&core_bins)?;
 
     tracing::info!("starting rt-gateway");
@@ -1960,16 +1957,15 @@ async fn runtime_verify_and_sync(state: &OrchestratorState) -> Result<(), Orches
     }
     .or_else(load_runtime_manifest);
 
-    let Some(manifest) = manifest else {
-        return Ok(());
-    };
-
-    {
-        let mut guard = state.runtime_manifest.lock().await;
-        *guard = Some(manifest.clone());
+    if let Some(manifest) = manifest {
+        {
+            let mut guard = state.runtime_manifest.lock().await;
+            *guard = Some(manifest.clone());
+        }
+        runtime_sync_workers(state, &manifest).await?;
     }
 
-    runtime_sync_workers(state, &manifest).await
+    core_sync_workers().await
 }
 
 async fn runtime_sync_workers(
@@ -1990,6 +1986,23 @@ async fn runtime_sync_workers(
         }
         if let Err(err) = sync_runtime_to_worker(&hive_id, &address, &key_path) {
             tracing::warn!(hive = %hive_id, error = %err, "runtime sync failed");
+        }
+    }
+    Ok(())
+}
+
+async fn core_sync_workers() -> Result<(), OrchestratorError> {
+    let local_hash = local_core_manifest_hash()?;
+    let workers = list_worker_access();
+    for (hive_id, address, key_path) in workers {
+        let remote_hash = remote_core_manifest_hash(&address, &key_path)
+            .ok()
+            .flatten();
+        if local_hash.is_some() && remote_hash == local_hash {
+            continue;
+        }
+        if let Err(err) = sync_core_to_worker(&hive_id, &address, &key_path) {
+            tracing::warn!(hive = %hive_id, error = %err, "core sync failed");
         }
     }
     Ok(())
@@ -2061,6 +2074,42 @@ fn remote_runtime_manifest_hash(
 ) -> Result<Option<String>, OrchestratorError> {
     let cmd = r#"bash -lc "if [ -f /var/lib/fluxbee/runtimes/manifest.json ]; then sha256sum /var/lib/fluxbee/runtimes/manifest.json | awk '{print $1}'; fi""#;
     let out = ssh_with_key_output(address, key_path, &sudo_wrap(cmd), BOOTSTRAP_SSH_USER)?;
+    let hash = out.trim().to_string();
+    if hash.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(hash))
+}
+
+fn local_core_manifest_hash() -> Result<Option<String>, OrchestratorError> {
+    let manifest_path = Path::new(CORE_MANIFEST_PATH);
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let mut cmd = Command::new("sha256sum");
+    cmd.arg(manifest_path);
+    let out = run_cmd_output(cmd, "sha256sum local core manifest")?;
+    let hash = out
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if hash.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(hash))
+}
+
+fn remote_core_manifest_hash(
+    address: &str,
+    key_path: &Path,
+) -> Result<Option<String>, OrchestratorError> {
+    let cmd = format!(
+        "bash -lc \"if [ -f '{}' ]; then sha256sum '{}' | awk '{{print $1}}'; fi\"",
+        CORE_MANIFEST_PATH, CORE_MANIFEST_PATH
+    );
+    let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
     let hash = out.trim().to_string();
     if hash.is_empty() {
         return Ok(None);
@@ -2543,7 +2592,7 @@ fn sha256_file(path: &Path) -> Result<String, OrchestratorError> {
         .unwrap_or_default())
 }
 
-fn validate_core_manifest_for_bins(bin_paths: &[String]) -> Result<(), OrchestratorError> {
+fn load_core_manifest() -> Result<CoreManifest, OrchestratorError> {
     let manifest_path = Path::new(CORE_MANIFEST_PATH);
     if !manifest_path.exists() {
         return Err(format!(
@@ -2552,7 +2601,6 @@ fn validate_core_manifest_for_bins(bin_paths: &[String]) -> Result<(), Orchestra
         )
         .into());
     }
-
     let data = fs::read_to_string(manifest_path)?;
     let manifest: CoreManifest = serde_json::from_str(&data)?;
     if manifest.schema_version == 0 {
@@ -2561,6 +2609,11 @@ fn validate_core_manifest_for_bins(bin_paths: &[String]) -> Result<(), Orchestra
     if manifest.components.is_empty() {
         return Err("core manifest has no components".into());
     }
+    Ok(manifest)
+}
+
+fn validate_core_manifest_for_bins(bin_paths: &[String]) -> Result<(), OrchestratorError> {
+    let manifest = load_core_manifest()?;
 
     for bin_path in bin_paths {
         let path = Path::new(bin_path);
@@ -2612,6 +2665,132 @@ fn validate_core_manifest_for_bins(bin_paths: &[String]) -> Result<(), Orchestra
                 )
                 .into());
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn sync_core_to_worker(
+    hive_id: &str,
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    let manifest = load_core_manifest()?;
+    let component_names: Vec<String> = manifest.components.keys().cloned().collect();
+    if component_names.is_empty() {
+        return Err("core manifest has no components to sync".into());
+    }
+
+    let mut local_paths = Vec::new();
+    for name in &component_names {
+        if !valid_token(name) {
+            return Err(format!("core manifest has invalid component name '{}'", name).into());
+        }
+        let path = Path::new(CORE_BIN_SOURCE_DIR).join(name);
+        if !path.exists() {
+            return Err(format!("missing core source binary '{}'", path.display()).into());
+        }
+        local_paths.push(path.display().to_string());
+    }
+    validate_core_manifest_for_bins(&local_paths)?;
+
+    let mut upload_paths = local_paths.clone();
+    upload_paths.push(CORE_MANIFEST_PATH.to_string());
+    let upload_refs: Vec<&str> = upload_paths.iter().map(String::as_str).collect();
+
+    let remote_stage = format!("/tmp/fluxbee-core-sync-{}", sanitize_unit_suffix(hive_id));
+    let prepare_stage = format!(
+        "rm -rf '{stage}' && mkdir -p '{stage}'",
+        stage = shell_single_quote(&remote_stage)
+    );
+    ssh_with_key(address, key_path, &prepare_stage, BOOTSTRAP_SSH_USER)?;
+    scp_with_key(
+        address,
+        key_path,
+        &upload_refs,
+        &format!("{remote_stage}/"),
+        BOOTSTRAP_SSH_USER,
+    )?;
+
+    let mut commands = vec![
+        "set -euo pipefail".to_string(),
+        "mkdir -p /var/lib/fluxbee/core".to_string(),
+        "rm -rf /var/lib/fluxbee/core/bin.next".to_string(),
+        "mkdir -p /var/lib/fluxbee/core/bin.next".to_string(),
+    ];
+
+    for name in &component_names {
+        commands.push(format!(
+            "install -m 0755 '{stage}/{name}' '/var/lib/fluxbee/core/bin.next/{name}'",
+            stage = shell_single_quote(&remote_stage),
+            name = shell_single_quote(name),
+        ));
+    }
+    commands.push(format!(
+        "install -m 0644 '{stage}/manifest.json' '/var/lib/fluxbee/core/manifest.next.json'",
+        stage = shell_single_quote(&remote_stage)
+    ));
+
+    for name in &component_names {
+        let expected = manifest
+            .components
+            .get(name)
+            .ok_or_else(|| format!("core manifest missing component '{}'", name))?;
+        commands.push(format!(
+            "test \"$(sha256sum '/var/lib/fluxbee/core/bin.next/{name}' | awk '{{print $1}}')\" = '{sha}'",
+            name = shell_single_quote(name),
+            sha = shell_single_quote(expected.sha256.trim()),
+        ));
+        if let Some(size) = expected.size {
+            commands.push(format!(
+                "test \"$(stat -c %s '/var/lib/fluxbee/core/bin.next/{name}')\" = '{size}'",
+                name = shell_single_quote(name),
+                size = size
+            ));
+        }
+    }
+
+    commands.push("rm -rf /var/lib/fluxbee/core/bin.prev".to_string());
+    commands.push(
+        "if [ -d /var/lib/fluxbee/core/bin ]; then mv /var/lib/fluxbee/core/bin /var/lib/fluxbee/core/bin.prev; fi"
+            .to_string(),
+    );
+    commands.push("mv /var/lib/fluxbee/core/bin.next /var/lib/fluxbee/core/bin".to_string());
+    commands.push(
+        "mv /var/lib/fluxbee/core/manifest.next.json /var/lib/fluxbee/core/manifest.json"
+            .to_string(),
+    );
+    for name in &component_names {
+        commands.push(format!(
+            "install -m 0755 '/var/lib/fluxbee/core/bin/{name}' '/usr/bin/{name}'",
+            name = shell_single_quote(name),
+        ));
+    }
+    commands.push(format!(
+        "rm -rf '{stage}'",
+        stage = shell_single_quote(&remote_stage)
+    ));
+
+    let promote_cmd = commands.join(" && ");
+    let promote_cmd_escaped = promote_cmd.replace('"', "\\\"");
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("bash -lc \"{}\"", promote_cmd_escaped)),
+        BOOTSTRAP_SSH_USER,
+    )?;
+
+    if let Some(local_hash) = local_core_manifest_hash()? {
+        let remote_hash = remote_core_manifest_hash(address, key_path)?;
+        if remote_hash.as_deref() != Some(local_hash.as_str()) {
+            return Err(format!(
+                "core manifest hash mismatch after sync hive='{}' local={} remote={}",
+                hive_id,
+                local_hash,
+                remote_hash.unwrap_or_else(|| "<none>".to_string())
+            )
+            .into());
         }
     }
 
@@ -2975,57 +3154,19 @@ fn add_hive_flow(
         }
     }
 
-    let required_binaries = vec![
-        format!("{CORE_BIN_SOURCE_DIR}/rt-gateway"),
-        format!("{CORE_BIN_SOURCE_DIR}/sy-config-routes"),
-        format!("{CORE_BIN_SOURCE_DIR}/sy-opa-rules"),
-    ];
-    for bin in &required_binaries {
-        if !Path::new(bin).exists() {
+    let core_manifest = match load_core_manifest() {
+        Ok(manifest) => manifest,
+        Err(err) => {
             return serde_json::json!({
                 "status": "error",
-                "error_code": "COPY_FAILED",
-                "message": format!("missing core source binary {bin}"),
+                "error_code": "MANIFEST_INVALID",
+                "message": err.to_string(),
             });
         }
-    }
+    };
+    let has_identity_source = core_manifest.components.contains_key("sy-identity");
 
-    let mut binaries = required_binaries;
-    let identity_source = format!("{CORE_BIN_SOURCE_DIR}/sy-identity");
-    let has_identity_source = Path::new(&identity_source).exists();
-    if has_identity_source {
-        binaries.push(identity_source);
-    }
-    if let Err(err) = validate_core_manifest_for_bins(&binaries) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "MANIFEST_INVALID",
-            "message": err.to_string(),
-        });
-    }
-    let binary_refs: Vec<&str> = binaries.iter().map(String::as_str).collect();
-    if let Err(err) = scp_with_key(
-        address,
-        &key_path,
-        &binary_refs,
-        "/tmp/",
-        BOOTSTRAP_SSH_USER,
-    ) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "COPY_FAILED",
-            "message": err.to_string(),
-        });
-    }
-
-    if let Err(err) = ssh_with_key(
-        address,
-        &key_path,
-        &sudo_wrap(
-            r#"bash -lc "mv /tmp/sy-* /usr/bin/ && mv /tmp/rt-* /usr/bin/ && chmod +x /usr/bin/sy-* /usr/bin/rt-*""#,
-        ),
-        BOOTSTRAP_SSH_USER,
-    ) {
+    if let Err(err) = sync_core_to_worker(hive_id, address, &key_path) {
         return serde_json::json!({
             "status": "error",
             "error_code": "COPY_FAILED",
