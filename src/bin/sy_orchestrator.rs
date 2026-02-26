@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -41,12 +41,15 @@ const SYNCTHING_SYNC_PORT_TCP: u16 = 22000;
 const SYNCTHING_SYNC_PORT_UDP: u16 = 22000;
 const SYNCTHING_DISCOVERY_PORT_UDP: u16 = 21027;
 const SYNCTHING_INSTALL_PATH: &str = "/usr/bin/syncthing";
+const SYNCTHING_REMOTE_BACKUP_PATH: &str = "/var/lib/fluxbee/vendor/syncthing.prev";
 const SYNCTHING_VENDOR_SOURCE_PATH: &str = "/var/lib/fluxbee/vendor/syncthing/syncthing";
 const VENDOR_ROOT_DIR: &str = "/var/lib/fluxbee/vendor";
 const VENDOR_MANIFEST_PATH: &str = "/var/lib/fluxbee/vendor/manifest.json";
 const CORE_BIN_SOURCE_DIR: &str = "/var/lib/fluxbee/core/bin";
 const CORE_MANIFEST_PATH: &str = "/var/lib/fluxbee/core/manifest.json";
 const CORE_SERVICE_HEALTH_TIMEOUT_SECS: u64 = 30;
+const POST_SYNC_HASH_VERIFY_ATTEMPTS: usize = 3;
+const POST_SYNC_HASH_VERIFY_DELAY_MS: u64 = 500;
 const DEPLOYMENT_HISTORY_MAX_LIMIT: usize = 500;
 const DRIFT_ALERT_MAX_LIMIT: usize = 500;
 const CORE_SYNC_RESTART_ORDER: &[&str] = &[
@@ -235,6 +238,12 @@ struct DriftAlertEntry {
     remote_hash_before: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     remote_hash_after: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RuntimeRetentionStats {
+    removed_runtime_dirs: u64,
+    removed_version_dirs: u64,
 }
 
 struct OrchestratorState {
@@ -1072,6 +1081,19 @@ async fn handle_system_message(
                     send_system_action_response(sender, msg, "RUNTIME_UPDATE_RESPONSE", payload)
                         .await;
                 return Ok(());
+            }
+
+            match apply_runtime_retention(&incoming) {
+                Ok(stats) => {
+                    tracing::info!(
+                        removed_runtime_dirs = stats.removed_runtime_dirs,
+                        removed_version_dirs = stats.removed_version_dirs,
+                        "runtime retention applied"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "runtime retention failed after runtime update");
+                }
             }
 
             {
@@ -2919,6 +2941,113 @@ fn parse_runtime_update_target_hives(
     Ok(Some(targets))
 }
 
+fn runtime_keep_versions(
+    manifest: &RuntimeManifest,
+) -> Result<HashMap<String, HashSet<String>>, OrchestratorError> {
+    let runtimes = manifest
+        .runtimes
+        .as_object()
+        .ok_or_else(|| "runtime manifest invalid: runtimes must be object".to_string())?;
+    let mut keep_map: HashMap<String, HashSet<String>> = HashMap::new();
+    for (runtime, entry) in runtimes {
+        if !valid_token(runtime) {
+            return Err(format!("runtime manifest invalid runtime name '{}'", runtime).into());
+        }
+        let mut keep: HashSet<String> = HashSet::new();
+        if let Some(current) = entry.get("current").and_then(|v| v.as_str()) {
+            let current = current.trim();
+            if !current.is_empty() {
+                if !valid_token(current) {
+                    return Err(
+                        format!("runtime manifest invalid current version '{}'", current).into(),
+                    );
+                }
+                keep.insert(current.to_string());
+            }
+        }
+        if let Some(available) = entry.get("available").and_then(|v| v.as_array()) {
+            for value in available {
+                let version = value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        format!(
+                            "runtime manifest invalid available version for runtime '{}'",
+                            runtime
+                        )
+                    })?;
+                if !valid_token(version) {
+                    return Err(format!(
+                        "runtime manifest invalid available version '{}'",
+                        version
+                    )
+                    .into());
+                }
+                keep.insert(version.to_string());
+            }
+        }
+        if !keep.is_empty() {
+            keep_map.insert(runtime.clone(), keep);
+        }
+    }
+    Ok(keep_map)
+}
+
+fn apply_runtime_retention(
+    manifest: &RuntimeManifest,
+) -> Result<RuntimeRetentionStats, OrchestratorError> {
+    let keep_map = runtime_keep_versions(manifest)?;
+    let root = runtimes_root();
+    if !root.exists() {
+        return Ok(RuntimeRetentionStats::default());
+    }
+
+    let mut stats = RuntimeRetentionStats::default();
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let runtime = entry.file_name().to_string_lossy().to_string();
+        if !valid_token(&runtime) {
+            tracing::warn!(
+                runtime = %runtime,
+                "runtime retention skipping non-token directory name"
+            );
+            continue;
+        }
+        let runtime_dir = entry.path();
+        let Some(keep_versions) = keep_map.get(&runtime) else {
+            fs::remove_dir_all(&runtime_dir)?;
+            stats.removed_runtime_dirs += 1;
+            continue;
+        };
+
+        for version_entry in fs::read_dir(&runtime_dir)? {
+            let version_entry = version_entry?;
+            if !version_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let version = version_entry.file_name().to_string_lossy().to_string();
+            if !valid_token(&version) {
+                tracing::warn!(
+                    runtime = %runtime,
+                    version = %version,
+                    "runtime retention skipping non-token version directory name"
+                );
+                continue;
+            }
+            if keep_versions.contains(&version) {
+                continue;
+            }
+            fs::remove_dir_all(version_entry.path())?;
+            stats.removed_version_dirs += 1;
+        }
+    }
+    Ok(stats)
+}
+
 enum RuntimeUpdateDecision {
     Apply,
     NoopSameVersion,
@@ -3042,6 +3171,9 @@ async fn runtime_verify_and_sync(state: &OrchestratorState) -> Result<(), Orches
     .or_else(load_runtime_manifest);
 
     if let Some(manifest) = manifest {
+        if let Err(err) = apply_runtime_retention(&manifest) {
+            tracing::warn!(error = %err, "runtime retention failed during watchdog verify");
+        }
         {
             let mut guard = state.runtime_manifest.lock().await;
             *guard = Some(manifest.clone());
@@ -3126,9 +3258,11 @@ async fn runtime_sync_workers(
             });
             continue;
         }
-        let remote_after = remote_runtime_manifest_hash(&address, &key_path)
-            .ok()
-            .flatten();
+        let remote_after = verify_remote_hash_with_retry(local_hash.as_deref(), || {
+            remote_runtime_manifest_hash(&address, &key_path)
+        })
+        .ok()
+        .flatten();
         if local_hash.is_some() && remote_after != local_hash {
             push_drift_alert(
                 "runtime",
@@ -3144,7 +3278,7 @@ async fn runtime_sync_workers(
             outcomes.push(DeploymentWorkerOutcome {
                 hive_id,
                 status: "error".to_string(),
-                reason: Some("post_sync_hash_mismatch".to_string()),
+                reason: Some("post_sync_hash_mismatch_after_retry".to_string()),
                 duration_ms: worker_started.elapsed().as_millis() as u64,
                 local_hash: local_hash.clone(),
                 remote_hash_before: remote_hash,
@@ -3262,9 +3396,11 @@ async fn core_sync_workers(
             });
             continue;
         }
-        let remote_after = remote_core_manifest_hash(&address, &key_path)
-            .ok()
-            .flatten();
+        let remote_after = verify_remote_hash_with_retry(local_hash.as_deref(), || {
+            remote_core_manifest_hash(&address, &key_path)
+        })
+        .ok()
+        .flatten();
         if local_hash.is_some() && remote_after != local_hash {
             push_drift_alert(
                 "core",
@@ -3280,7 +3416,7 @@ async fn core_sync_workers(
             outcomes.push(DeploymentWorkerOutcome {
                 hive_id,
                 status: "error".to_string(),
-                reason: Some("post_sync_hash_mismatch".to_string()),
+                reason: Some("post_sync_hash_mismatch_after_retry".to_string()),
                 duration_ms: worker_started.elapsed().as_millis() as u64,
                 local_hash: local_hash.clone(),
                 remote_hash_before: remote_hash,
@@ -3381,6 +3517,8 @@ async fn vendor_sync_workers(
         }
         if let Err(err) = ensure_remote_syncthing_runtime(&hive_id, &desired_blob) {
             tracing::warn!(hive = %hive_id, error = %err, "vendor sync failed");
+            let rollback_note = attempt_remote_syncthing_rollback_note(&address, &key_path);
+            let reason = format!("vendor sync failed: {err}; {rollback_note}");
             if pre_drift_detected {
                 push_drift_alert(
                     "vendor",
@@ -3388,7 +3526,10 @@ async fn vendor_sync_workers(
                     &hive_id,
                     "error",
                     "sync_error",
-                    format!("vendor drift detected and auto-resync failed: {}", err),
+                    format!(
+                        "vendor drift detected and auto-resync failed: {}; {}",
+                        err, rollback_note
+                    ),
                     local_hash.clone(),
                     remote_hash.clone(),
                     None,
@@ -3397,7 +3538,7 @@ async fn vendor_sync_workers(
             outcomes.push(DeploymentWorkerOutcome {
                 hive_id,
                 status: "error".to_string(),
-                reason: Some(err.to_string()),
+                reason: Some(reason),
                 duration_ms: worker_started.elapsed().as_millis() as u64,
                 local_hash: local_hash.clone(),
                 remote_hash_before: remote_hash,
@@ -3411,7 +3552,8 @@ async fn vendor_sync_workers(
             SYNCTHING_SERVICE_NAME,
             SYNCTHING_BOOTSTRAP_TIMEOUT_SECS,
         ) {
-            let reason = format!("service not active after vendor sync: {}", err);
+            let rollback_note = attempt_remote_syncthing_rollback_note(&address, &key_path);
+            let reason = format!("service not active after vendor sync: {err}; {rollback_note}");
             push_drift_alert(
                 "vendor",
                 trigger,
@@ -3435,17 +3577,21 @@ async fn vendor_sync_workers(
             continue;
         }
 
-        let remote_after = remote_syncthing_installed_hash(&address, &key_path)
-            .ok()
-            .flatten();
+        let remote_after = verify_remote_hash_with_retry(local_hash.as_deref(), || {
+            remote_syncthing_installed_hash(&address, &key_path)
+        })
+        .ok()
+        .flatten();
         if local_hash.is_some() && remote_after != local_hash {
+            let rollback_note = attempt_remote_syncthing_rollback_note(&address, &key_path);
+            let reason = format!("post_sync_hash_mismatch_after_retry; {rollback_note}");
             push_drift_alert(
                 "vendor",
                 trigger,
                 &hive_id,
                 "error",
                 "post_sync_mismatch",
-                "vendor drift persists after auto-resync".to_string(),
+                format!("vendor drift persists after auto-resync; {}", rollback_note),
                 local_hash.clone(),
                 remote_hash.clone(),
                 remote_after.clone(),
@@ -3453,7 +3599,7 @@ async fn vendor_sync_workers(
             outcomes.push(DeploymentWorkerOutcome {
                 hive_id,
                 status: "error".to_string(),
-                reason: Some("post_sync_hash_mismatch".to_string()),
+                reason: Some(reason),
                 duration_ms: worker_started.elapsed().as_millis() as u64,
                 local_hash: local_hash.clone(),
                 remote_hash_before: remote_hash,
@@ -3568,6 +3714,27 @@ fn local_runtime_manifest_hash() -> Result<Option<String>, OrchestratorError> {
         return Ok(None);
     }
     Ok(Some(hash))
+}
+
+fn verify_remote_hash_with_retry<F>(
+    expected_hash: Option<&str>,
+    mut fetch_remote_hash: F,
+) -> Result<Option<String>, OrchestratorError>
+where
+    F: FnMut() -> Result<Option<String>, OrchestratorError>,
+{
+    let mut last_seen: Option<String> = None;
+    for attempt in 0..POST_SYNC_HASH_VERIFY_ATTEMPTS {
+        let remote_hash = fetch_remote_hash()?;
+        if expected_hash.is_none() || remote_hash.as_deref() == expected_hash {
+            return Ok(remote_hash);
+        }
+        last_seen = remote_hash;
+        if attempt + 1 < POST_SYNC_HASH_VERIFY_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(POST_SYNC_HASH_VERIFY_DELAY_MS));
+        }
+    }
+    Ok(last_seen)
 }
 
 fn remote_runtime_manifest_hash(
@@ -4436,6 +4603,59 @@ for b in /var/lib/fluxbee/core/bin/*; do [ -f \"$b\" ] || continue; install -m 0
     )
 }
 
+fn remote_syncthing_backup_exists(
+    address: &str,
+    key_path: &Path,
+) -> Result<bool, OrchestratorError> {
+    let cmd = format!(
+        "bash -lc \"if [ -f '{}' ]; then echo 1; else echo 0; fi\"",
+        SYNCTHING_REMOTE_BACKUP_PATH
+    );
+    let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
+    Ok(out.trim() == "1")
+}
+
+fn rollback_remote_syncthing_to_prev(
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    let rollback_cmd = format!(
+        "set -euo pipefail && \
+if [ ! -f '{backup}' ]; then echo 'missing {backup}' >&2; exit 1; fi && \
+install -m 0755 '{backup}' '{install_path}' && \
+systemctl restart {service}",
+        backup = SYNCTHING_REMOTE_BACKUP_PATH,
+        install_path = SYNCTHING_INSTALL_PATH,
+        service = SYNCTHING_SERVICE_NAME
+    );
+    let rollback_cmd_q = shell_single_quote(&rollback_cmd);
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("bash -lc '{}'", rollback_cmd_q)),
+        BOOTSTRAP_SSH_USER,
+    )
+}
+
+fn attempt_remote_syncthing_rollback_note(address: &str, key_path: &Path) -> String {
+    match remote_syncthing_backup_exists(address, key_path) {
+        Ok(false) => "rollback skipped (no previous vendor backup)".to_string(),
+        Ok(true) => match rollback_remote_syncthing_to_prev(address, key_path) {
+            Ok(()) => match remote_wait_service_active(
+                address,
+                key_path,
+                SYNCTHING_SERVICE_NAME,
+                SYNCTHING_BOOTSTRAP_TIMEOUT_SECS,
+            ) {
+                Ok(()) => "rollback applied".to_string(),
+                Err(err) => format!("rollback applied but service health check failed: {err}"),
+            },
+            Err(err) => format!("rollback failed: {err}"),
+        },
+        Err(err) => format!("rollback precheck failed: {err}"),
+    }
+}
+
 fn list_managed_hive_ids() -> Vec<String> {
     let mut out = Vec::new();
     let root = hives_root();
@@ -4523,6 +4743,19 @@ fn ensure_remote_syncthing_runtime(
         &key_path,
         &source_refs,
         &remote_tmp_path,
+        BOOTSTRAP_SSH_USER,
+    )?;
+    let backup_cmd = format!(
+        "set -euo pipefail && mkdir -p '{vendor_root}' && if [ -f '{installed}' ]; then install -m 0755 '{installed}' '{backup}'; fi",
+        vendor_root = shell_single_quote(VENDOR_ROOT_DIR),
+        installed = shell_single_quote(SYNCTHING_INSTALL_PATH),
+        backup = shell_single_quote(SYNCTHING_REMOTE_BACKUP_PATH),
+    );
+    let backup_cmd_q = shell_single_quote(&backup_cmd);
+    ssh_with_key(
+        &address,
+        &key_path,
+        &sudo_wrap(&format!("bash -lc '{}'", backup_cmd_q)),
         BOOTSTRAP_SSH_USER,
     )?;
     let install_cmd = format!(
@@ -5020,6 +5253,8 @@ fn add_hive_flow(
             .ok()
             .flatten();
         if let Err(err) = ensure_remote_syncthing_runtime(hive_id, &desired_blob) {
+            let rollback_note = attempt_remote_syncthing_rollback_note(address, &key_path);
+            let reason = format!("syncthing setup failed: {err}; {rollback_note}");
             let entry = DeploymentHistoryEntry {
                 deployment_id: Uuid::new_v4().to_string(),
                 category: "vendor".to_string(),
@@ -5034,7 +5269,7 @@ fn add_hive_flow(
                 workers: vec![DeploymentWorkerOutcome {
                     hive_id: hive_id.to_string(),
                     status: "error".to_string(),
-                    reason: Some(err.to_string()),
+                    reason: Some(reason.clone()),
                     duration_ms: vendor_started.elapsed().as_millis() as u64,
                     local_hash: local_vendor_hash.clone(),
                     remote_hash_before: remote_vendor_hash_before.clone(),
@@ -5047,7 +5282,7 @@ fn add_hive_flow(
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SYNC_SETUP_FAILED",
-                "message": format!("syncthing setup failed: {err}"),
+                "message": reason,
             });
         }
         let remote_vendor_hash_after = remote_syncthing_installed_hash(address, &key_path)

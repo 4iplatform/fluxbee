@@ -360,6 +360,12 @@ Flujo operativo:
    - `status=ok, applied=false, reason=up_to_date` en idempotencia
    - `status=error` + `error_code` canónico en rechazo.
 
+Política de retención runtime:
+- fuente de verdad: `runtimes.current + runtimes.available` del manifest vigente.
+- se conservan solo esas versiones por runtime en `/var/lib/fluxbee/runtimes/<runtime>/<version>/`.
+- se purgan directorios/runtime huérfanos no referenciados por el manifest.
+- la purga se aplica al procesar `RUNTIME_UPDATE` y también en `watchdog_verify`.
+
 Política de rollback runtime (documental):
 - rollback se opera como nuevo `RUNTIME_UPDATE` con `version` mayor que la actual, apuntando `current` a la versión anterior deseada.
 - no se habilita rollback automático por `RUNTIME_UPDATE` stale; el stale se rechaza explícitamente.
@@ -493,11 +499,11 @@ Este documento refleja diseño + estado de implementación actual en `sy_orchest
 | TODO | Estado con este doc |
 |------|---------------------|
 | §1 Contrato versionado runtimes | Implementado (`schema_version`, monotonicidad, `MANIFEST_INVALID`/`VERSION_MISMATCH`) |
-| §2 Rollout runtimes por worker | Parcial (falta canary + retención + retry acotado) |
+| §2 Rollout runtimes por worker | Implementado (canary, retención y retry acotado post-sync) |
 | §3 Versionado binarios core | Implementado (manifest, promoción, restart, rollback) |
-| §4 Versionado vendor | Parcial (propagación/drift ok; falta rollback dedicado y path final sin `/usr/bin`) |
+| §4 Versionado vendor | Parcial (propagación/drift/rollback ok; falta path final sin `/usr/bin`) |
 | §5 API/observabilidad versiones | Implementado (versiones/deployments/drift-alerts runtime/core/vendor) |
-| §6 Validación E2E | Parcial (drift runtime/vendor ok; faltan canary/global y stale negativo) |
+| §6 Validación E2E | Implementado (stale negativo, canary/global/rollback runtime, drift runtime/vendor y rollback vendor) |
 
 Adicionalmente resuelve:
 - Integración de vendor (terceros) que no estaba contemplada
