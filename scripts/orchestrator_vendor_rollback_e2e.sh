@@ -286,6 +286,26 @@ print("0")
 PY
 }
 
+diagnose_remote_vendor_missing() {
+  local versions_body="$tmpdir/versions_worker.json"
+  local status_versions
+  status_versions="$(http_call "GET" "$BASE/versions?hive=$HIVE_ID" "$versions_body")"
+  log_http_response "$status_versions" "$versions_body"
+
+  local vendor_status vendor_path
+  vendor_status="$(json_get "payload.hive.vendor.status" "$versions_body")"
+  vendor_path="$(json_get "payload.hive.vendor.syncthing_installed_path" "$versions_body")"
+
+  echo "Diagnostic: worker vendor status='${vendor_status:-<empty>}' path='${vendor_path:-<empty>}'" >&2
+  if [[ -f "config/hive.yaml" ]]; then
+    local blob_sync_line
+    blob_sync_line="$(awk '/^[[:space:]]*sync:[[:space:]]*$/,/^[[:space:]]*[a-zA-Z0-9_-]+:[[:space:]]*$/' config/hive.yaml | awk '/^[[:space:]]*enabled:[[:space:]]*/{print; exit}')"
+    if [[ -n "$blob_sync_line" ]]; then
+      echo "Diagnostic: config/hive.yaml blob.sync ${blob_sync_line}" >&2
+    fi
+  fi
+}
+
 tmpdir="$(mktemp -d)"
 vendor_path=""
 vendor_backup="$tmpdir/vendor.bin.bak"
@@ -360,7 +380,9 @@ if [[ -z "$baseline_local_hash" ]]; then
 fi
 baseline_remote_hash="$(remote_vendor_hash || true)"
 if [[ -z "$baseline_remote_hash" ]]; then
+  diagnose_remote_vendor_missing
   echo "FAIL: remote vendor hash is empty before rollback scenario" >&2
+  echo "Hint: this E2E needs blob sync enabled and Syncthing installed on worker (try blob.sync.enabled=true and restart sy-orchestrator)." >&2
   exit 1
 fi
 if [[ "$baseline_remote_hash" != "$baseline_local_hash" ]]; then
