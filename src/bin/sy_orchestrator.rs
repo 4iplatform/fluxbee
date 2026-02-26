@@ -4551,11 +4551,12 @@ fn remote_wait_service_active(
     service: &str,
     timeout_secs: u64,
 ) -> Result<(), OrchestratorError> {
-    let cmd = format!(
-        "bash -lc \"for i in $(seq 1 {}); do systemctl is-active --quiet '{}' && exit 0; sleep 1; done; exit 1\"",
+    let script = format!(
+        "for i in $(seq 1 {}); do systemctl is-active --quiet '{}' && exit 0; sleep 1; done; exit 1",
         timeout_secs, service
     );
-    ssh_with_key(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER).map_err(|err| {
+    let wrapped = format!("bash -lc '{}'", shell_single_quote(&script));
+    ssh_with_key(address, key_path, &sudo_wrap(&wrapped), BOOTSTRAP_SSH_USER).map_err(|err| {
         format!(
             "service '{}' did not become active in {}s: {}",
             service, timeout_secs, err
