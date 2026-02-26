@@ -58,6 +58,9 @@ const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
+    "sy-admin",
+    "sy-storage",
+    "sy-orchestrator",
 ];
 const DEFAULT_BLOB_ENABLED: bool = true;
 const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
