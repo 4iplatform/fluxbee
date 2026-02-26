@@ -26,6 +26,7 @@ const BOOTSTRAP_SSH_USER: &str = "administrator";
 const BOOTSTRAP_SSH_PASS: &str = "magicAI";
 const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
 const RUNTIME_MANIFEST_FILE: &str = "runtime-manifest.json";
+const RUNTIME_MANIFEST_SCHEMA_VERSION: u64 = 1;
 const NATS_BOOTSTRAP_TIMEOUT_SECS: u64 = 20;
 const STORAGE_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_TIMEOUT_SECS: u64 = 30;
@@ -41,6 +42,8 @@ const SYNCTHING_SYNC_PORT_UDP: u16 = 22000;
 const SYNCTHING_DISCOVERY_PORT_UDP: u16 = 21027;
 const SYNCTHING_INSTALL_PATH: &str = "/usr/bin/syncthing";
 const SYNCTHING_VENDOR_SOURCE_PATH: &str = "/var/lib/fluxbee/vendor/syncthing/syncthing";
+const VENDOR_ROOT_DIR: &str = "/var/lib/fluxbee/vendor";
+const VENDOR_MANIFEST_PATH: &str = "/var/lib/fluxbee/vendor/manifest.json";
 const CORE_BIN_SOURCE_DIR: &str = "/var/lib/fluxbee/core/bin";
 const CORE_MANIFEST_PATH: &str = "/var/lib/fluxbee/core/manifest.json";
 const CORE_SERVICE_HEALTH_TIMEOUT_SECS: u64 = 30;
@@ -130,8 +133,10 @@ struct HiveInfoFile {
     address: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 struct RuntimeManifest {
+    #[serde(default = "default_runtime_manifest_schema_version")]
+    schema_version: u64,
     #[serde(default)]
     version: u64,
     #[serde(default)]
@@ -140,6 +145,10 @@ struct RuntimeManifest {
     runtimes: serde_json::Value,
     #[serde(default)]
     hash: Option<String>,
+}
+
+fn default_runtime_manifest_schema_version() -> u64 {
+    RUNTIME_MANIFEST_SCHEMA_VERSION
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -156,6 +165,26 @@ struct CoreManifestComponent {
     sha256: String,
     #[serde(default)]
     size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct VendorManifest {
+    schema_version: u64,
+    #[serde(default)]
+    version: u64,
+    #[serde(default)]
+    updated_at: Option<String>,
+    components: std::collections::BTreeMap<String, VendorManifestComponent>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct VendorManifestComponent {
+    upstream_version: String,
+    #[serde(alias = "sha256")]
+    hash: String,
+    #[serde(default)]
+    size: Option<u64>,
+    path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -924,6 +953,15 @@ async fn handle_system_message(
                 "source_name": source_name,
             });
             match action {
+                "RUNTIME_UPDATE" => {
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "RUNTIME_UPDATE_RESPONSE",
+                        payload,
+                    )
+                    .await;
+                }
                 "SPAWN_NODE" => {
                     let _ =
                         send_system_action_response(sender, msg, "SPAWN_NODE_RESPONSE", payload)
@@ -941,15 +979,161 @@ async fn handle_system_message(
 
     match msg.meta.msg.as_deref() {
         Some("RUNTIME_UPDATE") => {
-            let manifest = parse_runtime_manifest(&msg.payload)?;
-            persist_runtime_manifest(&manifest)?;
+            let actor = source_name.unwrap_or_else(|| format!("uuid:{}", msg.routing.src));
+            let incoming = match parse_runtime_manifest(&msg.payload) {
+                Ok(manifest) => manifest,
+                Err(err) => {
+                    let payload = serde_json::json!({
+                        "status": "error",
+                        "error_code": "MANIFEST_INVALID",
+                        "message": err.to_string(),
+                        "applied": false,
+                    });
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "RUNTIME_UPDATE_RESPONSE",
+                        payload,
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+
+            let current_manifest = current_runtime_manifest(state).await;
+            match validate_runtime_update_versioning(current_manifest.as_ref(), &incoming) {
+                Ok(RuntimeUpdateDecision::NoopSameVersion) => {
+                    let payload = serde_json::json!({
+                        "status": "ok",
+                        "applied": false,
+                        "reason": "up_to_date",
+                        "version": incoming.version,
+                    });
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "RUNTIME_UPDATE_RESPONSE",
+                        payload,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                Ok(RuntimeUpdateDecision::Apply) => {}
+                Err((error_code, message)) => {
+                    let payload = serde_json::json!({
+                        "status": "error",
+                        "error_code": error_code,
+                        "message": message,
+                        "applied": false,
+                        "incoming_version": incoming.version,
+                        "current_version": current_manifest.as_ref().map(|m| m.version),
+                    });
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "RUNTIME_UPDATE_RESPONSE",
+                        payload,
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
+
+            let target_hives_filter = match parse_runtime_update_target_hives(&msg.payload) {
+                Ok(value) => value,
+                Err(err) => {
+                    let payload = serde_json::json!({
+                        "status": "error",
+                        "error_code": "MANIFEST_INVALID",
+                        "message": err.to_string(),
+                        "applied": false,
+                        "version": incoming.version,
+                    });
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "RUNTIME_UPDATE_RESPONSE",
+                        payload,
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+
+            if let Err(err) = persist_runtime_manifest(&incoming) {
+                let payload = serde_json::json!({
+                    "status": "error",
+                    "error_code": "MANIFEST_INVALID",
+                    "message": format!("failed to persist runtime manifest: {}", err),
+                    "applied": false,
+                    "version": incoming.version,
+                });
+                let _ =
+                    send_system_action_response(sender, msg, "RUNTIME_UPDATE_RESPONSE", payload)
+                        .await;
+                return Ok(());
+            }
+
             {
                 let mut guard = state.runtime_manifest.lock().await;
-                *guard = Some(manifest.clone());
+                *guard = Some(incoming.clone());
             }
-            tracing::info!(version = manifest.version, "runtime manifest updated");
-            let actor = source_name.unwrap_or_else(|| format!("uuid:{}", msg.routing.src));
-            runtime_sync_workers(state, &manifest, "runtime_update", &actor, true).await?;
+            tracing::info!(
+                version = incoming.version,
+                schema_version = incoming.schema_version,
+                "runtime manifest updated"
+            );
+            let sync_result = match runtime_sync_workers(
+                state,
+                &incoming,
+                target_hives_filter.as_ref(),
+                "runtime_update",
+                &actor,
+                true,
+            )
+            .await
+            {
+                Ok(()) => vendor_sync_workers(state, "runtime_update", &actor, false).await,
+                Err(err) => Err(err),
+            };
+            match sync_result {
+                Ok(()) => {
+                    let payload = serde_json::json!({
+                        "status": "ok",
+                        "applied": true,
+                        "version": incoming.version,
+                        "schema_version": incoming.schema_version,
+                        "target_hives": target_hives_filter.as_ref().map(|set| {
+                            let mut v: Vec<String> = set.iter().cloned().collect();
+                            v.sort();
+                            v
+                        }),
+                    });
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "RUNTIME_UPDATE_RESPONSE",
+                        payload,
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    let payload = serde_json::json!({
+                        "status": "error",
+                        "error_code": "SYNC_FAILED",
+                        "message": format!("runtime sync failed: {}", err),
+                        "applied": false,
+                        "version": incoming.version,
+                    });
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "RUNTIME_UPDATE_RESPONSE",
+                        payload,
+                    )
+                    .await;
+                }
+            }
         }
         Some("SPAWN_NODE") => {
             let result = run_node_flow(state, &msg.payload);
@@ -1238,6 +1422,110 @@ fn syncthing_binary_available() -> bool {
     Path::new(SYNCTHING_INSTALL_PATH).exists()
 }
 
+fn normalize_sha256(raw: &str) -> String {
+    raw.trim()
+        .strip_prefix("sha256:")
+        .unwrap_or(raw.trim())
+        .to_string()
+}
+
+fn load_vendor_manifest() -> Result<Option<VendorManifest>, OrchestratorError> {
+    let manifest_path = Path::new(VENDOR_MANIFEST_PATH);
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let data = fs::read_to_string(manifest_path)?;
+    let manifest: VendorManifest = serde_json::from_str(&data)?;
+    if manifest.schema_version == 0 {
+        return Err("vendor manifest invalid: schema_version must be >= 1".into());
+    }
+    if manifest.components.is_empty() {
+        return Err("vendor manifest has no components".into());
+    }
+    Ok(Some(manifest))
+}
+
+fn vendor_syncthing_component() -> Result<Option<VendorManifestComponent>, OrchestratorError> {
+    let Some(manifest) = load_vendor_manifest()? else {
+        return Ok(None);
+    };
+    let component = manifest
+        .components
+        .get("syncthing")
+        .cloned()
+        .ok_or_else(|| "vendor manifest missing 'syncthing' component".to_string())?;
+    if component.path.trim().is_empty() {
+        return Err("vendor manifest syncthing component missing path".into());
+    }
+    if normalize_sha256(&component.hash).is_empty() {
+        return Err("vendor manifest syncthing component missing hash".into());
+    }
+    if component.upstream_version.trim().is_empty() {
+        return Err("vendor manifest syncthing component missing upstream_version".into());
+    }
+    Ok(Some(component))
+}
+
+fn resolve_syncthing_vendor_source_path() -> Result<PathBuf, OrchestratorError> {
+    if let Some(component) = vendor_syncthing_component()? {
+        let path = Path::new(VENDOR_ROOT_DIR).join(component.path);
+        if !path.exists() {
+            return Err(format!(
+                "vendor manifest syncthing path missing at '{}'",
+                path.display()
+            )
+            .into());
+        }
+        return Ok(path);
+    }
+    let fallback = PathBuf::from(SYNCTHING_VENDOR_SOURCE_PATH);
+    if fallback.exists() {
+        return Ok(fallback);
+    }
+    Err(format!(
+        "syncthing vendor binary missing at '{}' and vendor manifest is absent",
+        SYNCTHING_VENDOR_SOURCE_PATH
+    )
+    .into())
+}
+
+fn local_syncthing_vendor_hash() -> Result<Option<String>, OrchestratorError> {
+    let source = resolve_syncthing_vendor_source_path()?;
+    let mut cmd = Command::new("sha256sum");
+    cmd.arg(&source);
+    let out = run_cmd_output(cmd, "sha256sum local syncthing vendor")?;
+    let hash = out
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if hash.is_empty() {
+        return Ok(None);
+    }
+    if let Some(component) = vendor_syncthing_component()? {
+        let expected = normalize_sha256(&component.hash);
+        if !expected.is_empty() && expected != hash {
+            return Err(format!(
+                "vendor manifest hash mismatch for syncthing: expected={} actual={}",
+                expected, hash
+            )
+            .into());
+        }
+        if let Some(size) = component.size {
+            let actual_size = fs::metadata(&source)?.len();
+            if actual_size != size {
+                return Err(format!(
+                    "vendor manifest size mismatch for syncthing: expected={} actual={}",
+                    size, actual_size
+                )
+                .into());
+            }
+        }
+    }
+    Ok(Some(hash))
+}
+
 fn command_exists(name: &str) -> bool {
     Command::new("sh")
         .arg("-lc")
@@ -1361,18 +1649,42 @@ fn disable_syncthing_firewall_local() {
 }
 
 fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
-    if syncthing_binary_available() {
+    let source = resolve_syncthing_vendor_source_path()?;
+    let source_hash = local_syncthing_vendor_hash()?.unwrap_or_default();
+    let mut install_required = !syncthing_binary_available();
+    if !install_required {
+        let mut cmd = Command::new("sha256sum");
+        cmd.arg(SYNCTHING_INSTALL_PATH);
+        match run_cmd_output(cmd, "sha256sum installed syncthing") {
+            Ok(out) => {
+                let installed_hash = out
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if installed_hash.is_empty()
+                    || (!source_hash.is_empty() && installed_hash != source_hash)
+                {
+                    install_required = true;
+                    tracing::warn!(
+                        installed_hash = installed_hash,
+                        source_hash = source_hash,
+                        "syncthing binary drift detected locally; reinstalling from vendor source"
+                    );
+                }
+            }
+            Err(err) => {
+                install_required = true;
+                tracing::warn!(error = %err, "failed to hash installed syncthing; reinstalling");
+            }
+        }
+    }
+    if !install_required {
         return Ok(());
     }
-    if !Path::new(SYNCTHING_VENDOR_SOURCE_PATH).exists() {
-        return Err(format!(
-            "syncthing vendor binary missing at '{}' (seed local vendor repo first)",
-            SYNCTHING_VENDOR_SOURCE_PATH
-        )
-        .into());
-    }
     tracing::info!(
-        source = SYNCTHING_VENDOR_SOURCE_PATH,
+        source = %source.display(),
         target = SYNCTHING_INSTALL_PATH,
         "installing syncthing from vendor source"
     );
@@ -1380,7 +1692,7 @@ fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
     install
         .arg("-m")
         .arg("0755")
-        .arg(SYNCTHING_VENDOR_SOURCE_PATH)
+        .arg(&source)
         .arg(SYNCTHING_INSTALL_PATH);
     run_cmd(install, "install syncthing from vendor source")?;
     if !syncthing_binary_available() {
@@ -1720,10 +2032,42 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
         }),
     };
 
+    let vendor = match load_vendor_manifest() {
+        Ok(Some(manifest)) => {
+            let syncthing_path = manifest
+                .components
+                .get("syncthing")
+                .map(|component| Path::new(VENDOR_ROOT_DIR).join(component.path.clone()));
+            let syncthing_present = syncthing_path.as_ref().is_some_and(|path| path.exists());
+            let manifest_hash = local_syncthing_vendor_hash().ok().flatten();
+            serde_json::json!({
+                "status": "ok",
+                "schema_version": manifest.schema_version,
+                "manifest_version": manifest.version,
+                "manifest_updated_at": manifest.updated_at,
+                "manifest_hash": manifest_hash,
+                "syncthing_present": syncthing_present,
+                "components": manifest.components,
+            })
+        }
+        Ok(None) => {
+            let legacy_present = Path::new(SYNCTHING_VENDOR_SOURCE_PATH).exists();
+            serde_json::json!({
+                "status": if legacy_present { "legacy_no_manifest" } else { "missing" },
+                "syncthing_present": legacy_present,
+            })
+        }
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "message": err.to_string(),
+        }),
+    };
+
     serde_json::json!({
         "hive_id": state.hive_id,
         "core": core,
         "runtimes": runtimes,
+        "vendor": vendor,
     })
 }
 
@@ -1791,10 +2135,32 @@ fn remote_versions_snapshot(
             }),
         };
 
+    let vendor = match remote_syncthing_installed_hash(address, key_path) {
+        Ok(hash) => {
+            if let Some(hash) = hash {
+                serde_json::json!({
+                    "status": "ok",
+                    "syncthing_installed_path": SYNCTHING_INSTALL_PATH,
+                    "manifest_hash": hash,
+                })
+            } else {
+                serde_json::json!({
+                    "status": "missing",
+                    "syncthing_installed_path": SYNCTHING_INSTALL_PATH,
+                })
+            }
+        }
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "message": err.to_string(),
+        }),
+    };
+
     Ok(serde_json::json!({
         "hive_id": hive_id,
         "core": core,
         "runtimes": runtimes,
+        "vendor": vendor,
     }))
 }
 
@@ -2495,10 +2861,115 @@ fn parse_runtime_manifest(
         return Err("runtime manifest payload must be an object".into());
     }
     let manifest: RuntimeManifest = serde_json::from_value(payload.clone())?;
+    if manifest.schema_version != RUNTIME_MANIFEST_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported runtime manifest schema_version={} (expected={})",
+            manifest.schema_version, RUNTIME_MANIFEST_SCHEMA_VERSION
+        )
+        .into());
+    }
     if manifest.version == 0 {
         return Err("runtime manifest missing version".into());
     }
     Ok(manifest)
+}
+
+fn parse_runtime_update_target_hives(
+    payload: &serde_json::Value,
+) -> Result<Option<HashSet<String>>, OrchestratorError> {
+    let Some(raw) = payload.get("target_hives") else {
+        return Ok(None);
+    };
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| "runtime update target_hives must be an array".to_string())?;
+    if arr.is_empty() {
+        return Err("runtime update target_hives cannot be empty".into());
+    }
+    let managed: HashSet<String> = list_worker_access()
+        .into_iter()
+        .map(|(hive_id, _, _)| hive_id)
+        .collect();
+    let mut targets = HashSet::new();
+    for item in arr {
+        let hive_id = item
+            .as_str()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| "runtime update target_hives contains invalid value".to_string())?;
+        if !valid_hive_id(hive_id) {
+            return Err(format!(
+                "runtime update target_hives contains invalid hive_id '{}'",
+                hive_id
+            )
+            .into());
+        }
+        if !managed.contains(hive_id) {
+            return Err(format!(
+                "runtime update target_hives contains unmanaged hive '{}'",
+                hive_id
+            )
+            .into());
+        }
+        targets.insert(hive_id.to_string());
+    }
+    if targets.is_empty() {
+        return Err("runtime update target_hives resolved empty set".into());
+    }
+    Ok(Some(targets))
+}
+
+enum RuntimeUpdateDecision {
+    Apply,
+    NoopSameVersion,
+}
+
+fn validate_runtime_update_versioning(
+    current: Option<&RuntimeManifest>,
+    incoming: &RuntimeManifest,
+) -> Result<RuntimeUpdateDecision, (&'static str, String)> {
+    if incoming.schema_version != RUNTIME_MANIFEST_SCHEMA_VERSION {
+        return Err((
+            "MANIFEST_INVALID",
+            format!(
+                "unsupported runtime manifest schema_version={} (expected={})",
+                incoming.schema_version, RUNTIME_MANIFEST_SCHEMA_VERSION
+            ),
+        ));
+    }
+    if incoming.version == 0 {
+        return Err((
+            "MANIFEST_INVALID",
+            "runtime manifest missing version".to_string(),
+        ));
+    }
+
+    let Some(current) = current else {
+        return Ok(RuntimeUpdateDecision::Apply);
+    };
+
+    if incoming.version < current.version {
+        return Err((
+            "VERSION_MISMATCH",
+            format!(
+                "stale runtime manifest version={} (current={})",
+                incoming.version, current.version
+            ),
+        ));
+    }
+    if incoming.version > current.version {
+        return Ok(RuntimeUpdateDecision::Apply);
+    }
+    if incoming == current {
+        return Ok(RuntimeUpdateDecision::NoopSameVersion);
+    }
+    Err((
+        "VERSION_MISMATCH",
+        format!(
+            "runtime manifest conflict at version={} (payload differs from current)",
+            incoming.version
+        ),
+    ))
 }
 
 fn runtimes_root() -> PathBuf {
@@ -2522,10 +2993,27 @@ fn load_runtime_manifest() -> Option<RuntimeManifest> {
             Err(_) => continue,
         };
         if let Ok(manifest) = serde_json::from_str::<RuntimeManifest>(&data) {
+            if manifest.schema_version != RUNTIME_MANIFEST_SCHEMA_VERSION || manifest.version == 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    schema_version = manifest.schema_version,
+                    version = manifest.version,
+                    "ignoring invalid local runtime manifest"
+                );
+                continue;
+            }
             return Some(manifest);
         }
     }
     None
+}
+
+async fn current_runtime_manifest(state: &OrchestratorState) -> Option<RuntimeManifest> {
+    let cached = {
+        let guard = state.runtime_manifest.lock().await;
+        guard.clone()
+    };
+    cached.or_else(load_runtime_manifest)
 }
 
 fn persist_runtime_manifest(manifest: &RuntimeManifest) -> Result<(), OrchestratorError> {
@@ -2559,16 +3047,18 @@ async fn runtime_verify_and_sync(state: &OrchestratorState) -> Result<(), Orches
             *guard = Some(manifest.clone());
         }
         let actor = default_deployment_actor(state);
-        runtime_sync_workers(state, &manifest, "watchdog_verify", &actor, false).await?;
+        runtime_sync_workers(state, &manifest, None, "watchdog_verify", &actor, false).await?;
     }
 
     let actor = default_deployment_actor(state);
-    core_sync_workers(state, "watchdog_verify", &actor, false).await
+    core_sync_workers(state, "watchdog_verify", &actor, false).await?;
+    vendor_sync_workers(state, "watchdog_verify", &actor, false).await
 }
 
 async fn runtime_sync_workers(
     _state: &OrchestratorState,
     manifest: &RuntimeManifest,
+    target_hives_filter: Option<&HashSet<String>>,
     trigger: &str,
     actor: &str,
     force_record: bool,
@@ -2584,6 +3074,11 @@ async fn runtime_sync_workers(
     let mut outcomes: Vec<DeploymentWorkerOutcome> = Vec::new();
     let mut target_hives = Vec::new();
     for (hive_id, address, key_path) in workers {
+        if let Some(filter) = target_hives_filter {
+            if !filter.contains(&hive_id) {
+                continue;
+            }
+        }
         target_hives.push(hive_id.clone());
         let remote_hash = remote_runtime_manifest_hash(&address, &key_path)
             .ok()
@@ -2842,6 +3337,179 @@ async fn core_sync_workers(
     Ok(())
 }
 
+async fn vendor_sync_workers(
+    state: &OrchestratorState,
+    trigger: &str,
+    actor: &str,
+    force_record: bool,
+) -> Result<(), OrchestratorError> {
+    let desired_blob = current_blob_runtime_config(state);
+    if !desired_blob.sync_enabled || !blob_sync_tool_is_syncthing(&desired_blob) {
+        return Ok(());
+    }
+
+    let started_at = now_epoch_ms();
+    let started = Instant::now();
+    let deployment_id = Uuid::new_v4().to_string();
+    let local_hash = local_syncthing_vendor_hash()?;
+    let manifest_version = load_vendor_manifest()?.map(|manifest| manifest.version);
+
+    let workers = list_worker_access();
+    let mut outcomes: Vec<DeploymentWorkerOutcome> = Vec::new();
+    let mut target_hives = Vec::new();
+    for (hive_id, address, key_path) in workers {
+        target_hives.push(hive_id.clone());
+        let remote_hash = remote_syncthing_installed_hash(&address, &key_path)
+            .ok()
+            .flatten();
+        let worker_started = Instant::now();
+        let pre_drift_detected = local_hash.is_some()
+            && remote_hash
+                .as_deref()
+                .is_some_and(|remote| Some(remote) != local_hash.as_deref());
+        if local_hash.is_some() && remote_hash == local_hash {
+            outcomes.push(DeploymentWorkerOutcome {
+                hive_id,
+                status: "skipped".to_string(),
+                reason: Some("up_to_date".to_string()),
+                duration_ms: worker_started.elapsed().as_millis() as u64,
+                local_hash: local_hash.clone(),
+                remote_hash_before: remote_hash.clone(),
+                remote_hash_after: remote_hash,
+            });
+            continue;
+        }
+        if let Err(err) = ensure_remote_syncthing_runtime(&hive_id, &desired_blob) {
+            tracing::warn!(hive = %hive_id, error = %err, "vendor sync failed");
+            if pre_drift_detected {
+                push_drift_alert(
+                    "vendor",
+                    trigger,
+                    &hive_id,
+                    "error",
+                    "sync_error",
+                    format!("vendor drift detected and auto-resync failed: {}", err),
+                    local_hash.clone(),
+                    remote_hash.clone(),
+                    None,
+                );
+            }
+            outcomes.push(DeploymentWorkerOutcome {
+                hive_id,
+                status: "error".to_string(),
+                reason: Some(err.to_string()),
+                duration_ms: worker_started.elapsed().as_millis() as u64,
+                local_hash: local_hash.clone(),
+                remote_hash_before: remote_hash,
+                remote_hash_after: None,
+            });
+            continue;
+        }
+        if let Err(err) = remote_wait_service_active(
+            &address,
+            &key_path,
+            SYNCTHING_SERVICE_NAME,
+            SYNCTHING_BOOTSTRAP_TIMEOUT_SECS,
+        ) {
+            let reason = format!("service not active after vendor sync: {}", err);
+            push_drift_alert(
+                "vendor",
+                trigger,
+                &hive_id,
+                "error",
+                "health_check_failed",
+                reason.clone(),
+                local_hash.clone(),
+                remote_hash.clone(),
+                None,
+            );
+            outcomes.push(DeploymentWorkerOutcome {
+                hive_id,
+                status: "error".to_string(),
+                reason: Some(reason),
+                duration_ms: worker_started.elapsed().as_millis() as u64,
+                local_hash: local_hash.clone(),
+                remote_hash_before: remote_hash,
+                remote_hash_after: None,
+            });
+            continue;
+        }
+
+        let remote_after = remote_syncthing_installed_hash(&address, &key_path)
+            .ok()
+            .flatten();
+        if local_hash.is_some() && remote_after != local_hash {
+            push_drift_alert(
+                "vendor",
+                trigger,
+                &hive_id,
+                "error",
+                "post_sync_mismatch",
+                "vendor drift persists after auto-resync".to_string(),
+                local_hash.clone(),
+                remote_hash.clone(),
+                remote_after.clone(),
+            );
+            outcomes.push(DeploymentWorkerOutcome {
+                hive_id,
+                status: "error".to_string(),
+                reason: Some("post_sync_hash_mismatch".to_string()),
+                duration_ms: worker_started.elapsed().as_millis() as u64,
+                local_hash: local_hash.clone(),
+                remote_hash_before: remote_hash,
+                remote_hash_after: remote_after,
+            });
+            continue;
+        }
+        if pre_drift_detected {
+            push_drift_alert(
+                "vendor",
+                trigger,
+                &hive_id,
+                "warning",
+                "pre_sync_mismatch_resolved",
+                format!(
+                    "vendor drift detected (remote != local) and resolved by auto-resync by {}",
+                    actor
+                ),
+                local_hash.clone(),
+                remote_hash.clone(),
+                remote_after.clone(),
+            );
+        }
+        outcomes.push(DeploymentWorkerOutcome {
+            hive_id,
+            status: "ok".to_string(),
+            reason: None,
+            duration_ms: worker_started.elapsed().as_millis() as u64,
+            local_hash: local_hash.clone(),
+            remote_hash_before: remote_hash,
+            remote_hash_after: remote_after,
+        });
+    }
+
+    let has_non_skipped = outcomes.iter().any(|item| item.status != "skipped");
+    if force_record || has_non_skipped {
+        let entry = DeploymentHistoryEntry {
+            deployment_id,
+            category: "vendor".to_string(),
+            trigger: trigger.to_string(),
+            actor: actor.to_string(),
+            started_at,
+            finished_at: started_at + started.elapsed().as_millis() as u64,
+            manifest_version,
+            manifest_hash: local_hash.clone(),
+            target_hives,
+            result: deployment_result(&outcomes),
+            workers: outcomes,
+        };
+        if let Err(err) = append_deployment_history(&entry) {
+            tracing::warn!(error = %err, "failed to persist vendor deployment history");
+        }
+    }
+    Ok(())
+}
+
 fn list_worker_access() -> Vec<(String, String, PathBuf)> {
     let mut out = Vec::new();
     let root = hives_root();
@@ -2947,6 +3615,27 @@ fn remote_core_manifest_hash(
     let cmd = format!(
         "bash -lc \"if [ -f '{}' ]; then sha256sum '{}' | awk '{{print $1}}'; fi\"",
         CORE_MANIFEST_PATH, CORE_MANIFEST_PATH
+    );
+    let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
+    let hash = out
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if hash.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(hash))
+}
+
+fn remote_syncthing_installed_hash(
+    address: &str,
+    key_path: &Path,
+) -> Result<Option<String>, OrchestratorError> {
+    let cmd = format!(
+        "bash -lc \"if [ -f '{}' ]; then sha256sum '{}' | awk '{{print $1}}'; fi\"",
+        SYNCTHING_INSTALL_PATH, SYNCTHING_INSTALL_PATH
     );
     let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
     let hash = out
@@ -3820,22 +4509,19 @@ fn ensure_remote_syncthing_runtime(
     blob: &BlobRuntimeConfig,
 ) -> Result<(), OrchestratorError> {
     let (address, key_path) = hive_access(hive_id)?;
-    if !Path::new(SYNCTHING_VENDOR_SOURCE_PATH).exists() {
-        return Err(format!(
-            "syncthing vendor binary missing at '{}' (seed local vendor repo first)",
-            SYNCTHING_VENDOR_SOURCE_PATH
-        )
-        .into());
-    }
+    let source = resolve_syncthing_vendor_source_path()?;
+    let _ = local_syncthing_vendor_hash()?;
 
     let remote_tmp_path = format!(
         "/tmp/fluxbee-syncthing-{}.bin",
         sanitize_unit_suffix(hive_id)
     );
+    let source_str = source.to_string_lossy().to_string();
+    let source_refs = [source_str.as_str()];
     scp_with_key(
         &address,
         &key_path,
-        &[SYNCTHING_VENDOR_SOURCE_PATH],
+        &source_refs,
         &remote_tmp_path,
         BOOTSTRAP_SSH_USER,
     )?;
@@ -4327,12 +5013,69 @@ fn add_hive_flow(
     }
 
     if desired_blob.sync_enabled {
+        let vendor_started_at = now_epoch_ms();
+        let vendor_started = Instant::now();
+        let local_vendor_hash = local_syncthing_vendor_hash().ok().flatten();
+        let remote_vendor_hash_before = remote_syncthing_installed_hash(address, &key_path)
+            .ok()
+            .flatten();
         if let Err(err) = ensure_remote_syncthing_runtime(hive_id, &desired_blob) {
+            let entry = DeploymentHistoryEntry {
+                deployment_id: Uuid::new_v4().to_string(),
+                category: "vendor".to_string(),
+                trigger: "add_hive".to_string(),
+                actor: default_deployment_actor(state),
+                started_at: vendor_started_at,
+                finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
+                manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
+                manifest_hash: local_vendor_hash.clone(),
+                target_hives: vec![hive_id.to_string()],
+                result: "error".to_string(),
+                workers: vec![DeploymentWorkerOutcome {
+                    hive_id: hive_id.to_string(),
+                    status: "error".to_string(),
+                    reason: Some(err.to_string()),
+                    duration_ms: vendor_started.elapsed().as_millis() as u64,
+                    local_hash: local_vendor_hash.clone(),
+                    remote_hash_before: remote_vendor_hash_before.clone(),
+                    remote_hash_after: None,
+                }],
+            };
+            if let Err(history_err) = append_deployment_history(&entry) {
+                tracing::warn!(error = %history_err, "failed to persist add_hive vendor deployment history");
+            }
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SYNC_SETUP_FAILED",
                 "message": format!("syncthing setup failed: {err}"),
             });
+        }
+        let remote_vendor_hash_after = remote_syncthing_installed_hash(address, &key_path)
+            .ok()
+            .flatten();
+        let entry = DeploymentHistoryEntry {
+            deployment_id: Uuid::new_v4().to_string(),
+            category: "vendor".to_string(),
+            trigger: "add_hive".to_string(),
+            actor: default_deployment_actor(state),
+            started_at: vendor_started_at,
+            finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
+            manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
+            manifest_hash: local_vendor_hash.clone(),
+            target_hives: vec![hive_id.to_string()],
+            result: "ok".to_string(),
+            workers: vec![DeploymentWorkerOutcome {
+                hive_id: hive_id.to_string(),
+                status: "ok".to_string(),
+                reason: None,
+                duration_ms: vendor_started.elapsed().as_millis() as u64,
+                local_hash: local_vendor_hash,
+                remote_hash_before: remote_vendor_hash_before,
+                remote_hash_after: remote_vendor_hash_after,
+            }],
+        };
+        if let Err(history_err) = append_deployment_history(&entry) {
+            tracing::warn!(error = %history_err, "failed to persist add_hive vendor deployment history");
         }
     }
 

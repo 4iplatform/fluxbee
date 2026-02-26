@@ -731,6 +731,7 @@ Request/response para obtener EventPackage completo de otra isla:
 | Mensaje | Origen | Destino | Propósito |
 |---------|--------|---------|-----------|
 | `RUNTIME_UPDATE` | Actor de control-plane autorizado (`SY.admin` o tooling operativo) | SY.orchestrator | Notificar nueva versión de runtimes |
+| `RUNTIME_UPDATE_RESPONSE` | SY.orchestrator | Originador de `RUNTIME_UPDATE` | Resultado determinista de validación/aplicación de manifest |
 | `SPAWN_NODE` | SY.admin (tooling E2E solo en entorno controlado) | SY.orchestrator | Solicitar ejecución de nodo |
 | `KILL_NODE` | SY.admin (tooling E2E solo en entorno controlado) | SY.orchestrator | Solicitar terminación de nodo |
 
@@ -753,8 +754,10 @@ Notifica al orchestrator que hay nuevas versiones de runtimes:
     "msg": "RUNTIME_UPDATE"
   },
   "payload": {
+    "schema_version": 1,
     "version": 43,
     "updated_at": "2026-02-08T10:00:00Z",
+    "target_hives": ["worker-3"],
     "runtimes": {
       "AI.soporte": {
         "current": "1.3.0",
@@ -769,6 +772,16 @@ Notifica al orchestrator que hay nuevas versiones de runtimes:
   }
 }
 ```
+
+`target_hives` es opcional:
+- ausente => rollout global a todos los workers gestionados.
+- presente => rollout canary al subset indicado.
+
+Respuesta (`RUNTIME_UPDATE_RESPONSE`):
+- `status=ok` + `applied=true` cuando el update se aplica.
+- `status=ok` + `applied=false` + `reason=up_to_date` cuando llega el mismo manifest.
+- `status=error` + `error_code=MANIFEST_INVALID` para payload/schema inválido.
+- `status=error` + `error_code=VERSION_MISMATCH` para stale o conflicto de versión.
 
 #### 7.8.2 SPAWN_NODE
 

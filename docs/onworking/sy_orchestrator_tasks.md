@@ -78,22 +78,22 @@ Modo de trabajo acordado:
 - [x] C3 (decisión): Origen de distribución core = `/var/lib/fluxbee/core/bin/*` (no `/usr/bin/*`).
 - [x] C4 (decisión): Flags vendor quedan hardcodeadas en orchestrator por ahora.
 
-Implementación pendiente de decisiones C1/C3:
+Implementación ejecutada para decisiones C1/C3:
 - [x] Remover fallback de instalación por package manager en orchestrator (local/remoto) para vendor.
 - [x] Migrar `add_hive`/bootstrap de copia core desde `/usr/bin/*` a `/var/lib/fluxbee/core/bin/*`.
 - [x] Completar validación por manifest core durante bootstrap/add_hive.
 
 ### 1) Contrato de versionado de runtimes (hardening)
-- [ ] Definir `schema_version` del `runtime-manifest.json` y politica de compatibilidad.
-- [ ] Exigir monotonicidad de `payload.version` en `RUNTIME_UPDATE` (rechazo explicito de updates stale).
-- [ ] Formalizar `error_code` de versionado (`VERSION_MISMATCH` / `MANIFEST_INVALID`) para respuestas deterministas.
-- [ ] Documentar politica de rollback de runtime (`current` anterior) y criterio de activacion.
+- [x] Definir `schema_version` del `runtime-manifest.json` y politica de compatibilidad.
+- [x] Exigir monotonicidad de `payload.version` en `RUNTIME_UPDATE` (rechazo explicito de updates stale).
+- [x] Formalizar `error_code` de versionado (`VERSION_MISMATCH` / `MANIFEST_INVALID`) para respuestas deterministas.
+- [x] Documentar politica de rollback de runtime (`current` anterior) y criterio de activacion.
 
 ### 2) Rollout de runtimes por worker (robustez operativa)
-- [ ] Registrar resultado por worker en cada sync (`ok/error`, motivo, duracion, hash final).
-- [ ] Agregar modo canary (subset de workers) antes de rollout global.
+- [x] Registrar resultado por worker en cada sync (`ok/error`, motivo, duracion, hash final).
+- [x] Agregar modo canary (subset de workers) antes de rollout global (`RUNTIME_UPDATE.payload.target_hives`).
 - [ ] Definir y aplicar politica de retencion de versiones en `/var/lib/fluxbee/runtimes` (cleanup seguro).
-- [ ] Agregar verificacion post-sync obligatoria por worker (hash remoto == hash local) con retry acotado.
+- [ ] Agregar retry acotado para verificacion post-sync por worker (ya existe validacion hash remoto == hash local).
 
 ### 3) Versionado de binarios core
 - [x] Definir manifest de componentes core (servicio, version, hash, build_id).
@@ -102,21 +102,21 @@ Implementación pendiente de decisiones C1/C3:
 - [x] Implementar rollback de core por componente ante falla de health-check.
 
 ### 4) Versionado de vendor (Syncthing y futuros)
-- [ ] Definir/validar `vendor-manifest.json` (version monotona, hash, size, upstream_version).
-- [ ] Implementar propagacion vendor desde repo master (`/var/lib/fluxbee/vendor`) a workers (sin package manager remoto).
-- [ ] Implementar rollback vendor por componente y verificacion de drift por hash en worker.
+- [x] Definir/validar `vendor-manifest.json` (version monotona, hash, size, upstream_version).
+- [x] Implementar propagacion vendor desde repo master (`/var/lib/fluxbee/vendor`) a workers (sin package manager remoto).
+- [ ] Implementar rollback vendor por componente (la verificacion de drift/hash ya esta activa en worker).
 - [ ] Alinear unit/service de vendor para usar ruta instalada por orchestrator (sin depender de `/usr/bin` del host).
 
 ### 5) API/observabilidad de versiones
-- [x] Exponer endpoint admin para version efectiva por hive (runtimes + core).
+- [x] Exponer endpoint admin para version efectiva por hive (runtimes + core + vendor).
 - [x] Persistir historial de despliegues (deployment_id, actor, target_hives, resultado).
-- [x] Agregar alertas de drift versionado (manifest o binarios core) entre motherbee y workers.
+- [x] Agregar alertas de drift versionado (runtime/core/vendor) entre motherbee y workers.
 
 ### 6) Validacion E2E de versionado/distribucion
-- [ ] Script E2E: `RUNTIME_UPDATE` canary -> global -> verificacion -> rollback.
-- [ ] Caso negativo E2E: update stale rechazado con `error_code` explicito (sin timeout opaco).
+- [x] Script E2E: `RUNTIME_UPDATE` canary -> global -> verificacion -> rollback. (`scripts/orchestrator_runtime_rollout_e2e.sh`)
+- [x] Caso negativo E2E: update stale rechazado con `error_code` explicito (sin timeout opaco). (`scripts/orchestrator_runtime_update_stale_e2e.sh`)
 - [x] Caso E2E de drift remoto: deteccion + auto-resync + evidencia en API/logs. (`scripts/orchestrator_drift_runtime_e2e.sh`)
-- [ ] Script E2E de vendor: drift de binario + reconciliacion + health check Syncthing.
+- [x] Script E2E de vendor: drift de binario + reconciliacion + health check Syncthing. (`scripts/orchestrator_drift_vendor_e2e.sh`)
 
 ### Criterio de salida de este TODO
 - [ ] Se puede desplegar version nueva de runtime, core y vendor en worker real con:

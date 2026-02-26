@@ -66,6 +66,14 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn env_u64_opt(key: &str) -> Option<u64> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()
@@ -83,6 +91,21 @@ fn env_non_empty(key: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+fn env_csv(key: &str) -> Option<Vec<String>> {
+    let raw = env_non_empty(key)?;
+    let values: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
 }
 
 fn load_hive_id(config_dir: &std::path::Path) -> Result<String, DiagError> {
@@ -212,8 +235,18 @@ async fn main() -> Result<(), DiagError> {
     let timeout_secs = env_u64("ORCH_TIMEOUT_SECS", 45);
     let send_kill = env_bool("ORCH_SEND_KILL", true);
     let send_runtime_update = env_bool("ORCH_SEND_RUNTIME_UPDATE", true);
+    let runtime_update_only = env_bool("ORCH_ONLY_RUNTIME_UPDATE", false);
     let unit = env_or("ORCH_UNIT", &format!("fluxbee-orch-e2e-{}", now_epoch_ms()));
     let route_mode = RouteMode::from_env(&env_or("ORCH_ROUTE_MODE", "unicast"))?;
+    let runtime_manifest_version =
+        env_u64_opt("ORCH_RUNTIME_MANIFEST_VERSION").unwrap_or_else(|| now_epoch_ms() as u64);
+    let runtime_manifest_schema_version =
+        env_u64_opt("ORCH_RUNTIME_MANIFEST_SCHEMA_VERSION").unwrap_or(1);
+    let runtime_current_version = env_or("ORCH_RUNTIME_CURRENT", &version);
+    let runtime_available_versions =
+        env_csv("ORCH_RUNTIME_AVAILABLE").unwrap_or_else(|| vec![version.clone()]);
+    let runtime_update_target_hives = env_csv("ORCH_RUNTIME_UPDATE_TARGET_HIVES");
+    let expected_runtime_update_error_code = env_non_empty("ORCH_EXPECT_RUNTIME_UPDATE_ERROR_CODE");
     let expected_spawn_unreachable_reason = env_non_empty("ORCH_EXPECT_SPAWN_UNREACHABLE_REASON");
     let expected_spawn_error_code = env_non_empty("ORCH_EXPECT_SPAWN_ERROR_CODE");
     let diag_node_name = env_or("ORCH_DIAG_NODE_NAME", "WF.orch.diag");
@@ -223,6 +256,9 @@ async fn main() -> Result<(), DiagError> {
             "ORCH_EXPECT_SPAWN_UNREACHABLE_REASON and ORCH_EXPECT_SPAWN_ERROR_CODE are mutually exclusive"
                 .into(),
         );
+    }
+    if runtime_update_only && !send_runtime_update {
+        return Err("ORCH_ONLY_RUNTIME_UPDATE=1 requires ORCH_SEND_RUNTIME_UPDATE=1".into());
     }
 
     let node_config = NodeConfig {
@@ -236,23 +272,27 @@ async fn main() -> Result<(), DiagError> {
     tracing::info!(diag_node = %diag_node_name, target = %target, route_mode = ?route_mode, "orchestrator diag started");
 
     if send_runtime_update {
-        let runtime_update_payload = json!({
-            "version": now_epoch_ms() as u64,
+        let mut runtime_update_payload = json!({
+            "schema_version": runtime_manifest_schema_version,
+            "version": runtime_manifest_version,
             "updated_at": format!("{}", now_epoch_ms()),
             "runtimes": {
                 (runtime.clone()): {
-                    "current": version.clone(),
-                    "available": [version.clone()],
+                    "current": runtime_current_version,
+                    "available": runtime_available_versions,
                 }
             }
         });
+        if let Some(target_hives) = runtime_update_target_hives.clone() {
+            runtime_update_payload["target_hives"] = json!(target_hives);
+        }
 
         let update_trace = send_system_message(
             &sender,
             &target,
             route_mode,
             "RUNTIME_UPDATE",
-            runtime_update_payload,
+            runtime_update_payload.clone(),
         )
         .await?;
         tracing::info!(
@@ -260,9 +300,97 @@ async fn main() -> Result<(), DiagError> {
             target = %target,
             route_mode = ?route_mode,
             runtime = %runtime,
-            version = %version,
+            version = runtime_manifest_version,
+            schema_version = runtime_manifest_schema_version,
             "sent RUNTIME_UPDATE"
         );
+
+        let update_outcome = wait_system_response(
+            &mut receiver,
+            &update_trace,
+            "RUNTIME_UPDATE_RESPONSE",
+            timeout_secs,
+        )
+        .await?;
+        let update_response = match update_outcome {
+            WaitOutcome::Response(message) => message,
+            WaitOutcome::Unreachable {
+                reason,
+                original_dst,
+            } => {
+                return Err(format!(
+                    "router returned UNREACHABLE while waiting RUNTIME_UPDATE_RESPONSE trace_id={} reason={} original_dst={}",
+                    update_trace, reason, original_dst
+                )
+                .into())
+            }
+            WaitOutcome::TtlExceeded {
+                original_dst,
+                last_hop,
+            } => {
+                return Err(format!(
+                    "router returned TTL_EXCEEDED while waiting RUNTIME_UPDATE_RESPONSE trace_id={} original_dst={} last_hop={}",
+                    update_trace, original_dst, last_hop
+                )
+                .into())
+            }
+        };
+        let update_status = update_response
+            .payload
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error");
+        tracing::info!(
+            trace_id = %update_trace,
+            status = %update_status,
+            payload = %update_response.payload,
+            "received RUNTIME_UPDATE_RESPONSE"
+        );
+        if let Some(expected_code) = expected_runtime_update_error_code.as_deref() {
+            let actual_code = update_response
+                .payload
+                .get("error_code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if actual_code != expected_code {
+                return Err(format!(
+                    "expected RUNTIME_UPDATE error_code={} but got error_code={} payload={}",
+                    expected_code, actual_code, update_response.payload
+                )
+                .into());
+            }
+            if runtime_update_only {
+                println!(
+                    "{}",
+                    json!({
+                        "status": "ok",
+                        "target": target,
+                        "runtime": runtime,
+                        "manifest_version": runtime_manifest_version,
+                        "expected_runtime_update_error_code": expected_code,
+                        "received_runtime_update_error_code": actual_code,
+                        "route_mode": format!("{route_mode:?}").to_ascii_lowercase(),
+                    })
+                );
+                return Ok(());
+            }
+        } else if update_status != "ok" {
+            return Err(format!("RUNTIME_UPDATE failed: {}", update_response.payload).into());
+        } else if runtime_update_only {
+            println!(
+                "{}",
+                json!({
+                    "status": "ok",
+                    "target": target,
+                    "runtime": runtime,
+                    "manifest_version": runtime_manifest_version,
+                    "route_mode": format!("{route_mode:?}").to_ascii_lowercase(),
+                    "runtime_update_payload": runtime_update_payload,
+                    "runtime_update_response": update_response.payload,
+                })
+            );
+            return Ok(());
+        }
     }
 
     let spawn_payload = json!({

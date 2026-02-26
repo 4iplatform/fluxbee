@@ -138,7 +138,35 @@ Los argumentos de arranque vendor se mantienen **hardcodeados en orchestrator** 
 
 ### 4.3 Runtime manifest
 
-Ya existe (`runtime-manifest.json`). Sin cambios, se agrega `schema_version` como hardening (TODO §1).
+Contrato canónico de runtime manifest:
+
+```json
+{
+  "schema_version": 1,
+  "version": 43,
+  "updated_at": "2026-02-24T10:00:00Z",
+  "runtimes": {
+    "AI.soporte": {
+      "current": "1.3.0",
+      "available": ["1.2.0", "1.3.0"]
+    }
+  },
+  "hash": "sha256:abc123..."
+}
+```
+
+Política de compatibilidad/versionado:
+- `schema_version`: requerido, valor soportado actual `1`.
+- compatibilidad transitoria: payloads legacy sin `schema_version` se interpretan como `1` (default).
+- monotonicidad de `version`: sólo se acepta si `incoming.version > current.version`.
+- `incoming.version == current.version`:
+  - si payload idéntico: no-op (`up_to_date`)
+  - si payload distinto: rechazo por conflicto de versión.
+- `incoming.version < current.version`: rechazo por update stale.
+
+Códigos de error canónicos en `RUNTIME_UPDATE_RESPONSE`:
+- `MANIFEST_INVALID` (schema/payload inválido)
+- `VERSION_MISMATCH` (stale o conflicto con misma versión)
 
 ---
 
@@ -321,7 +349,20 @@ Mismo flujo que core pero más infrecuente. El operador actualiza el binario en 
 
 ### 7.4 Actualización de runtimes
 
-Ya implementado en §4.9. Sin cambios.
+Flujo operativo:
+1. actor autorizado envía `RUNTIME_UPDATE` con manifest.
+2. orchestrator valida schema + monotonicidad.
+3. si es válido y más nuevo: persiste manifest y sincroniza workers.
+   - rollout canary: `payload.target_hives=[...]`
+   - rollout global: sin `target_hives`
+4. responde `RUNTIME_UPDATE_RESPONSE`:
+   - `status=ok, applied=true` si aplicó
+   - `status=ok, applied=false, reason=up_to_date` en idempotencia
+   - `status=error` + `error_code` canónico en rechazo.
+
+Política de rollback runtime (documental):
+- rollback se opera como nuevo `RUNTIME_UPDATE` con `version` mayor que la actual, apuntando `current` a la versión anterior deseada.
+- no se habilita rollback automático por `RUNTIME_UPDATE` stale; el stale se rechaza explícitamente.
 
 ---
 
@@ -445,17 +486,18 @@ pub const VENDOR_INSTALL_PATH: &str = "/opt/fluxbee/bin";
 
 ---
 
-## 12. Relación con TODO existente (estado de diseño)
+## 12. Relación con TODO existente (estado actualizado)
 
-Este documento **cierra el diseño objetivo**, no la implementación en código, de los ítems abiertos en `sy_orchestrator_tasks.md`:
+Este documento refleja diseño + estado de implementación actual en `sy_orchestrator_tasks.md`:
 
 | TODO | Estado con este doc |
 |------|---------------------|
-| §1 Contrato versionado runtimes | Diseñado (`schema_version`, monotonicidad, errores). Implementación pendiente |
-| §2 Rollout runtimes por worker | Diseñado (verificación post-sync, canary). Implementación pendiente |
-| §3 Versionado binarios core | Diseñado (manifest, promoción, restart, rollback). Implementación pendiente |
-| §4 API/observabilidad versiones | Diseñado. Implementación pendiente |
-| §5 Validación E2E | Diseñado (casos a validar). Implementación pendiente |
+| §1 Contrato versionado runtimes | Implementado (`schema_version`, monotonicidad, `MANIFEST_INVALID`/`VERSION_MISMATCH`) |
+| §2 Rollout runtimes por worker | Parcial (falta canary + retención + retry acotado) |
+| §3 Versionado binarios core | Implementado (manifest, promoción, restart, rollback) |
+| §4 Versionado vendor | Parcial (propagación/drift ok; falta rollback dedicado y path final sin `/usr/bin`) |
+| §5 API/observabilidad versiones | Implementado (versiones/deployments/drift-alerts runtime/core/vendor) |
+| §6 Validación E2E | Parcial (drift runtime/vendor ok; faltan canary/global y stale negativo) |
 
 Adicionalmente resuelve:
 - Integración de vendor (terceros) que no estaba contemplada
