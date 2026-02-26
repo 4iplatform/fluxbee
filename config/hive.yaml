@@ -25,7 +25,7 @@ blob:
   enabled: true
   path: "/var/lib/fluxbee/blob"
   sync:
-    enabled: false   # true if Syncthing should be managed by orchestrator
+    enabled: true   # true if Syncthing should be managed by orchestrator
     tool: "syncthing"
     api_port: 8384
     data_dir: "/var/lib/fluxbee/syncthing"
