@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
-use jsr_client::protocol::{
+use fluxbee_sdk::protocol::{
     build_echo, build_echo_reply, build_time_sync, build_withdraw, Destination, Message, Meta,
     Routing, TimeSyncPayload, MSG_OPA_RELOAD, SYSTEM_KIND,
 };
-use jsr_client::{connect, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -258,7 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn connect_with_retry(
     config: &NodeConfig,
     delay: std::time::Duration,
-) -> Result<(NodeSender, NodeReceiver), jsr_client::NodeError> {
+) -> Result<(NodeSender, NodeReceiver), fluxbee_sdk::NodeError> {
     loop {
         match connect(config).await {
             Ok(result) => return Ok(result),

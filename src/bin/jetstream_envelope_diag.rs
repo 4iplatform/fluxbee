@@ -278,9 +278,9 @@ fn handle_server_payload(
 fn parse_stack(raw: &str) -> Result<DiagStack, DynError> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "router_nats" | "router" => Ok(DiagStack::RouterNats),
-        "fluxbee_sdk" | "sdk" | "jsr_client" | "jsr" => Ok(DiagStack::FluxbeeSdk),
+        "fluxbee_sdk" | "sdk" => Ok(DiagStack::FluxbeeSdk),
         other => Err(format!(
-            "invalid JETSTREAM_DIAG_STACK={other}; expected router_nats|fluxbee_sdk (legacy alias: jsr_client)"
+            "invalid JETSTREAM_DIAG_STACK={other}; expected router_nats|fluxbee_sdk"
         )
         .into()),
     }

@@ -23,31 +23,28 @@ cargo run --example node_test
 ```
 Si querés apuntar a un router específico: `JSR_ROUTER_NAME=RT.primary ...`
 
-## Librería de cliente (`jsr-client`) [LEGACY/DEPRECADA]
+## Librería de cliente (`fluxbee-sdk`)
 
-`jsr-client` queda solo por compatibilidad temporal.
-Para desarrollo nuevo usar `fluxbee-sdk` (`crates/fluxbee_sdk`).
-Estado de migración: `docs/onworking/sdk_tasks.md`.
-
-La librería para conectar nodos al router vive en `crates/jsr_client`. Es **solo Linux**.
+`fluxbee-sdk` es la librería canónica para conectar nodos al router y usar utilidades de protocolo/NATS/blob.
+Vive en `crates/fluxbee_sdk`. Es **solo Linux**.
 
 ### Instalación paso a paso (proyecto nuevo)
 
 Opción A: copiar el crate dentro de tu repo.
 
-1) Copiá `crates/jsr_client` a tu repo, por ejemplo `vendor/jsr_client`.
+1) Copiá `crates/fluxbee_sdk` a tu repo, por ejemplo `vendor/fluxbee_sdk`.
 2) En tu `Cargo.toml`:
 
 ```toml
 [dependencies]
-jsr-client = { path = "vendor/jsr_client" }
+fluxbee-sdk = { path = "vendor/fluxbee_sdk" }
 ```
 
 Opción B: repo separado (git).
 
 ```toml
 [dependencies]
-jsr-client = { git = "ssh://git@github.com/<org>/jsr-client.git", rev = "<commit>" }
+fluxbee-sdk = { git = "ssh://git@github.com/<org>/fluxbee-sdk.git", rev = "<commit>" }
 ```
 
 ### Primitivas mínimas que debe usar tu app
@@ -71,8 +68,8 @@ jsr-client = { git = "ssh://git@github.com/<org>/jsr-client.git", rev = "<commit
 ### Ejemplo mínimo
 
 ```rust
-use jsr_client::{connect, NodeConfig};
-use jsr_client::protocol::{Message, Meta, Routing, Destination};
+use fluxbee_sdk::{connect, NodeConfig};
+use fluxbee_sdk::protocol::{Message, Meta, Routing, Destination};
 use serde_json::json;
 use std::path::PathBuf;
 

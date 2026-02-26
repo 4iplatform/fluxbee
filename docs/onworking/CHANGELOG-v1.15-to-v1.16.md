@@ -18,6 +18,20 @@ La versión 1.16+ introduce cambios significativos en:
 
 ---
 
+## 0. Estado SDK (actualización 2026-02-26)
+
+La migración de SDK quedó cerrada:
+
+- `fluxbee_sdk` es el SDK canónico y único para desarrollo nuevo.
+- `jsr_client` quedó retirado del workspace principal.
+- Las guías de desarrollo (`README.md`, `DEVELOPMENT.md`, `docs/onworking/sdk_tasks.md`) ya referencian `fluxbee_sdk`.
+
+Impacto operativo:
+- No cambia el contrato de mensajes/router.
+- Sí cambia la guía de integración para nodos externos: usar `fluxbee-sdk`.
+
+---
+
 ## 1. Cambios de Arquitectura
 
 ### 1.1 Nuevo Modelo: Motherbee / Worker

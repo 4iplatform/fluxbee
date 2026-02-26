@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -21,6 +21,9 @@ use fluxbee_sdk::protocol::{
     SYSTEM_KIND,
 };
 use fluxbee_sdk::{connect, ClientConfig, NodeConfig, NodeReceiver, NodeSender};
+use json_router::shm::{
+    now_epoch_ms, LsaRegionReader, RemoteHiveEntry, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
+};
 
 type AdminError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -196,11 +199,12 @@ async fn main() -> Result<(), AdminError> {
         tracing::warn!("SY.admin solo corre en motherbee; role != motherbee");
         return Ok(());
     }
-    let admin_listen = hive
-        .admin
-        .as_ref()
-        .and_then(|admin| admin.listen.clone())
-        .unwrap_or_else(|| "0.0.0.0:8080".to_string());
+    // Default to loopback for safer deployments; expose externally only via explicit config/env.
+    let admin_listen = std::env::var("JSR_ADMIN_LISTEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| hive.admin.as_ref().and_then(|admin| admin.listen.clone()))
+        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
     let node_config = NodeConfig {
         name: "SY.admin".to_string(),
         router_socket: socket_dir.clone(),
@@ -248,10 +252,12 @@ enum BroadcastRequest {
     Routes {
         routes: Vec<RouteConfig>,
         version: u64,
+        ack: oneshot::Sender<Result<(), String>>,
     },
     Vpns {
         vpns: Vec<VpnConfig>,
         version: u64,
+        ack: oneshot::Sender<Result<(), String>>,
     },
 }
 
@@ -274,8 +280,12 @@ async fn run_broadcast_loop(
     client: Arc<AdminRouterClient>,
 ) {
     while let Some(req) = rx.recv().await {
-        let failed = match req {
-            BroadcastRequest::Routes { routes, version } => {
+        let result = match req {
+            BroadcastRequest::Routes {
+                routes,
+                version,
+                ack,
+            } => {
                 match broadcast_config_changed(
                     &client,
                     "routes",
@@ -287,14 +297,19 @@ async fn run_broadcast_loop(
                 )
                 .await
                 {
-                    Ok(()) => false,
+                    Ok(()) => {
+                        let _ = ack.send(Ok(()));
+                        Ok(())
+                    }
                     Err(err) => {
+                        let err_msg = err.to_string();
+                        let _ = ack.send(Err(err_msg.clone()));
                         tracing::warn!(error = %err, "broadcast failed");
-                        true
+                        Err(err_msg)
                     }
                 }
             }
-            BroadcastRequest::Vpns { vpns, version } => {
+            BroadcastRequest::Vpns { vpns, version, ack } => {
                 match broadcast_config_changed(
                     &client,
                     "vpn",
@@ -306,17 +321,43 @@ async fn run_broadcast_loop(
                 )
                 .await
                 {
-                    Ok(()) => false,
+                    Ok(()) => {
+                        let _ = ack.send(Ok(()));
+                        Ok(())
+                    }
                     Err(err) => {
+                        let err_msg = err.to_string();
+                        let _ = ack.send(Err(err_msg.clone()));
                         tracing::warn!(error = %err, "broadcast failed");
-                        true
+                        Err(err_msg)
                     }
                 }
             }
         };
-        if failed {
-            tracing::warn!("broadcast failed; message dropped");
+        if let Err(err) = result {
+            tracing::warn!(error = %err, "broadcast failed; message dropped");
         }
+    }
+}
+
+async fn send_broadcast_request<F>(
+    tx: &mpsc::UnboundedSender<BroadcastRequest>,
+    build: F,
+    label: &str,
+) -> Result<(), AdminError>
+where
+    F: FnOnce(oneshot::Sender<Result<(), String>>) -> BroadcastRequest,
+{
+    let (ack_tx, ack_rx) = oneshot::channel::<Result<(), String>>();
+    tx.send(build(ack_tx))
+        .map_err(|_| format!("broadcast queue closed for {label}"))?;
+
+    let timeout_secs = env_timeout_secs("JSR_ADMIN_BROADCAST_TIMEOUT_SECS").unwrap_or(5);
+    match time::timeout(Duration::from_secs(timeout_secs), ack_rx).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(err))) => Err(format!("broadcast failed for {label}: {err}").into()),
+        Ok(Err(_)) => Err(format!("broadcast ack channel closed for {label}").into()),
+        Err(_) => Err(format!("broadcast ack timeout for {label} ({timeout_secs}s)").into()),
     }
 }
 
@@ -722,11 +763,45 @@ async fn handle_http(
             };
             if let Some(routes) = update.routes {
                 let version = versions.remove(0);
-                let _ = tx.send(BroadcastRequest::Routes { routes, version });
+                if let Err(err) = send_broadcast_request(
+                    tx,
+                    |ack| BroadcastRequest::Routes {
+                        routes,
+                        version,
+                        ack,
+                    },
+                    "routes",
+                )
+                .await
+                {
+                    let body = serde_json::json!({
+                        "status": "error",
+                        "error_code": "CONFIG_BROADCAST_FAILED",
+                        "error_detail": err.to_string(),
+                    })
+                    .to_string();
+                    respond_json(stream, 502, &body).await?;
+                    return Ok(());
+                }
             }
             if let Some(vpns) = update.vpns {
                 let version = versions.remove(0);
-                let _ = tx.send(BroadcastRequest::Vpns { vpns, version });
+                if let Err(err) = send_broadcast_request(
+                    tx,
+                    |ack| BroadcastRequest::Vpns { vpns, version, ack },
+                    "vpns",
+                )
+                .await
+                {
+                    let body = serde_json::json!({
+                        "status": "error",
+                        "error_code": "CONFIG_BROADCAST_FAILED",
+                        "error_detail": err.to_string(),
+                    })
+                    .to_string();
+                    respond_json(stream, 502, &body).await?;
+                    return Ok(());
+                }
             }
             tracing::info!("config routes update received");
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
@@ -748,7 +823,22 @@ async fn handle_http(
                             return Ok(());
                         }
                     };
-                let _ = tx.send(BroadcastRequest::Vpns { vpns, version });
+                if let Err(err) = send_broadcast_request(
+                    tx,
+                    |ack| BroadcastRequest::Vpns { vpns, version, ack },
+                    "vpns",
+                )
+                .await
+                {
+                    let body = serde_json::json!({
+                        "status": "error",
+                        "error_code": "CONFIG_BROADCAST_FAILED",
+                        "error_detail": err.to_string(),
+                    })
+                    .to_string();
+                    respond_json(stream, 502, &body).await?;
+                    return Ok(());
+                }
             }
             tracing::info!("config vpns update received");
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
@@ -1382,6 +1472,7 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "REMOVE_FAILED"
         | "COPY_FAILED"
         | "CONFIG_FAILED"
+        | "CONFIG_BROADCAST_FAILED"
         | "RUNTIME_ERROR"
         | "RUNTIME_COMMAND_FAILED"
         | "RUNTIME_UNAVAILABLE"
@@ -1881,7 +1972,7 @@ async fn handle_admin_command(
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
     let target_hive = extract_hive_from_target(&request.target);
-    let response = send_admin_request(client, request, admin_action_timeout(action)).await;
+    let mut response = send_admin_request(client, request, admin_action_timeout(action)).await;
     if let Ok(ref payload) = response {
         if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
             if status == "ok" {
@@ -1892,7 +1983,13 @@ async fn handle_admin_command(
                     if let Err(err) =
                         broadcast_full_config(ctx, client, action, target_hive.as_deref()).await
                     {
-                        tracing::warn!("broadcast after admin action failed: {err}");
+                        let detail = format!("action applied but broadcast failed: {err}");
+                        tracing::warn!(error = %detail, "broadcast after admin action failed");
+                        response = Ok(serde_json::json!({
+                            "status": "error",
+                            "error_code": "CONFIG_BROADCAST_FAILED",
+                            "message": detail,
+                        }));
                     }
                 }
             }
@@ -2197,7 +2294,7 @@ async fn send_opa_action(
     )
     .await?;
 
-    let expected = expected_hives(ctx, target.as_deref());
+    let expected = expected_hive_sets(ctx, target.as_deref()).effective;
     let mut receiver = client.subscribe_system();
     let responses = collect_opa_responses(&mut receiver, action, version, &expected).await;
     Ok(responses)
@@ -2236,7 +2333,7 @@ async fn send_opa_query(
     };
     client.sender.send(msg).await?;
 
-    let expected = expected_hives(ctx, target.as_deref());
+    let expected = expected_hive_sets(ctx, target.as_deref()).effective;
     let mut receiver = client.subscribe_query();
     let responses = collect_opa_query_responses(&mut receiver, action, &expected).await;
     Ok(responses)
@@ -2253,18 +2350,92 @@ fn normalize_opa_target(target: Option<String>) -> Option<String> {
     })
 }
 
-fn expected_hives(ctx: &AdminContext, target: Option<&str>) -> Vec<String> {
-    if let Some(target) = target {
-        return vec![target.to_string()];
+fn remote_hive_name(entry: &RemoteHiveEntry) -> Option<String> {
+    if entry.hive_id_len == 0 {
+        return None;
     }
-    let mut hives = Vec::new();
-    hives.push(ctx.hive_id.clone());
-    for hive in &ctx.authorized_hives {
-        if hive != &ctx.hive_id {
-            hives.push(hive.clone());
+    let len = entry.hive_id_len as usize;
+    Some(String::from_utf8_lossy(&entry.hive_id[..len]).into_owned())
+}
+
+fn remote_hive_is_stale(entry: &RemoteHiveEntry, now: u64) -> bool {
+    (entry.flags & (FLAG_DELETED | FLAG_STALE)) != 0
+        || now.saturating_sub(entry.last_updated) > HEARTBEAT_STALE_MS
+}
+
+fn topology_hives_from_lsa(ctx: &AdminContext) -> Vec<String> {
+    let mut hives = HashSet::new();
+    hives.insert(ctx.hive_id.clone());
+
+    let shm_name = format!("/jsr-lsa-{}", ctx.hive_id);
+    let reader = match LsaRegionReader::open_read_only(&shm_name) {
+        Ok(reader) => reader,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to open lsa region for OPA expected hives");
+            let mut fallback: Vec<String> = hives.into_iter().collect();
+            fallback.sort();
+            return fallback;
+        }
+    };
+    let snapshot = match reader.read_snapshot() {
+        Some(snapshot) => snapshot,
+        None => {
+            tracing::warn!("lsa snapshot unavailable for OPA expected hives");
+            let mut fallback: Vec<String> = hives.into_iter().collect();
+            fallback.sort();
+            return fallback;
+        }
+    };
+    let now = now_epoch_ms();
+    for entry in &snapshot.hives {
+        if remote_hive_is_stale(entry, now) {
+            continue;
+        }
+        if let Some(hive) = remote_hive_name(entry).filter(|name| !name.trim().is_empty()) {
+            hives.insert(hive);
         }
     }
-    hives
+    let mut out: Vec<String> = hives.into_iter().collect();
+    out.sort();
+    out
+}
+
+#[derive(Debug, Clone)]
+struct OpaExpectedHives {
+    effective: Vec<String>,
+    topology: Vec<String>,
+    policy: Vec<String>,
+}
+
+fn expected_hive_sets(ctx: &AdminContext, target: Option<&str>) -> OpaExpectedHives {
+    if let Some(target) = target {
+        let single = vec![target.to_string()];
+        return OpaExpectedHives {
+            effective: single.clone(),
+            topology: single.clone(),
+            policy: single,
+        };
+    }
+
+    let topology = topology_hives_from_lsa(ctx);
+    let mut policy_set = HashSet::new();
+    policy_set.insert(ctx.hive_id.clone());
+    for hive in &ctx.authorized_hives {
+        if !hive.trim().is_empty() {
+            policy_set.insert(hive.clone());
+        }
+    }
+    let mut policy: Vec<String> = policy_set.into_iter().collect();
+    policy.sort();
+
+    // Topology (LSA/SHM) is canonical for fanout expectations.
+    // Policy list is kept for explicit observability in response payload.
+    let effective = topology.clone();
+    OpaExpectedHives {
+        effective,
+        topology,
+        policy,
+    }
 }
 
 async fn collect_opa_responses(
@@ -2386,10 +2557,25 @@ fn build_opa_http_response(
     responses: Vec<OpaResponseEntry>,
     target: Option<String>,
 ) -> (u16, String) {
-    let expected = expected_hives(ctx, target.as_deref());
+    let expected = expected_hive_sets(ctx, target.as_deref());
     let pending: Vec<String> = expected
+        .effective
+        .iter()
+        .filter(|hive| !responses.iter().any(|r| r.hive == **hive))
+        .cloned()
+        .collect();
+    let pending_topology: Vec<String> = expected
+        .topology
+        .iter()
         .into_iter()
-        .filter(|hive| !responses.iter().any(|r| r.hive == *hive))
+        .filter(|hive| !responses.iter().any(|r| r.hive == **hive))
+        .cloned()
+        .collect();
+    let pending_policy: Vec<String> = expected
+        .policy
+        .iter()
+        .filter(|hive| !responses.iter().any(|r| r.hive == **hive))
+        .cloned()
         .collect();
     let timed_out = !pending.is_empty();
 
@@ -2432,6 +2618,10 @@ fn build_opa_http_response(
         "check_only": action.check_only(),
         "responses": responses,
         "pending": pending,
+        "expected_hives_topology": expected.topology,
+        "expected_hives_policy": expected.policy,
+        "pending_hives_topology": pending_topology,
+        "pending_hives_policy": pending_policy,
         "error_code": error_code,
         "error_detail": error_detail,
     })
@@ -2445,10 +2635,24 @@ fn build_opa_query_response(
     responses: Vec<OpaQueryEntry>,
     target: Option<String>,
 ) -> (u16, String) {
-    let expected = expected_hives(ctx, target.as_deref());
+    let expected = expected_hive_sets(ctx, target.as_deref());
     let pending: Vec<String> = expected
-        .into_iter()
-        .filter(|hive| !responses.iter().any(|r| r.hive == *hive))
+        .effective
+        .iter()
+        .filter(|hive| !responses.iter().any(|r| r.hive == **hive))
+        .cloned()
+        .collect();
+    let pending_topology: Vec<String> = expected
+        .topology
+        .iter()
+        .filter(|hive| !responses.iter().any(|r| r.hive == **hive))
+        .cloned()
+        .collect();
+    let pending_policy: Vec<String> = expected
+        .policy
+        .iter()
+        .filter(|hive| !responses.iter().any(|r| r.hive == **hive))
+        .cloned()
         .collect();
     let timed_out = !pending.is_empty();
 
@@ -2486,6 +2690,10 @@ fn build_opa_query_response(
         "action": action,
         "responses": responses,
         "pending": pending,
+        "expected_hives_topology": expected.topology,
+        "expected_hives_policy": expected.policy,
+        "pending_hives_topology": pending_topology,
+        "pending_hives_policy": pending_policy,
         "error_code": error_code,
         "error_detail": error_detail,
     })

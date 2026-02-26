@@ -727,19 +727,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jsr-client"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

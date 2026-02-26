@@ -91,22 +91,26 @@ Lista de tareas cerradas para alinear `SY.admin` con la especificacion actual y 
 ## Pendientes detectados en revisión spec vs código (2026-02-22)
 
 ### P0 - Entrega/configuración confiable
-- [ ] Hacer que fallo de broadcast/config sea error observable en API (no solo warning en logs).
+- [x] Hacer que fallo de broadcast/config sea error observable en API (no solo warning en logs).
   - Casos actuales a endurecer:
-    - cola de broadcast con `message dropped`
-    - `broadcast after admin action failed` sin degradar respuesta HTTP.
+    - [x] cola de broadcast con `message dropped` (ahora responde `CONFIG_BROADCAST_FAILED`).
+    - [x] `broadcast after admin action failed` sin degradar respuesta HTTP (ahora degrada a error explícito).
 
 ### P1 - Cobertura real de fanout OPA
-- [ ] Resolver `expected_hives` con fuente de topología real (LSA/SHM) en lugar de depender solo de `authorized_hives`.
-- [ ] Diferenciar en respuesta OPA: `pending_hives` esperadas por topología vs autorizadas por política.
+- [x] Resolver `expected_hives` con fuente de topología real (LSA/SHM) en lugar de depender solo de `authorized_hives`.
+- [x] Diferenciar en respuesta OPA: `pending_hives` esperadas por topología vs autorizadas por política.
 
 ### P1 - Homogeneidad de documentación
-- [ ] Alinear en docs el path canónico del contador de versión OPA con el path real usado por código.
-- [ ] Alinear ejemplo de mensaje interno admin/orchestrator (TTL/dst/meta) con implementación actual.
+- [x] Alinear en docs el path canónico del contador de versión OPA con el path real usado por código.
+  - Referencia canónica: `json_router::paths::opa_version_path()` => `/var/lib/fluxbee/opa-version.txt`.
+- [x] Alinear ejemplo de mensaje interno admin/orchestrator (TTL/dst/meta) con implementación actual.
+  - Actualizado ejemplo en `docs/07-operaciones.md` (dst por nombre L2, `ttl=16`, `meta.target` canónico).
 
 ### P2 - Hardening operativo (infra)
-- [ ] Definir perfil seguro por default para `admin.listen` en despliegues productivos (bind local o detrás de proxy).
-- [ ] Documentar política de exposición de API admin (red, proxy, ACL) para evitar despliegues abiertos por error.
+- [x] Definir perfil seguro por default para `admin.listen` en despliegues productivos (bind local o detrás de proxy).
+  - Implementado en `SY.admin`: default `127.0.0.1:8080` cuando no hay `admin.listen` ni `JSR_ADMIN_LISTEN`.
+- [x] Documentar política de exposición de API admin (red, proxy, ACL) para evitar despliegues abiertos por error.
+  - Sección nueva: `docs/07-operaciones.md` -> "2.6 Exposición del API Admin (perfil seguro)".
 
 ## Anexo - Checklist E2E (migrado)
 Checklist operativo corto para validar `SY.admin -> SY.orchestrator` via API.

@@ -14,7 +14,7 @@ set -euo pipefail
 #   JETSTREAM_DIAG_SUBJECT="jetstream.diag.envelope.<run_id>"
 #   JETSTREAM_DIAG_QUEUE="durable.jetstream.diag.envelope.<run_id>"
 #   JETSTREAM_DIAG_SID="52001"
-#   JETSTREAM_DIAG_STACK="fluxbee_sdk"   # router_nats | fluxbee_sdk (legacy alias: jsr_client)
+#   JETSTREAM_DIAG_STACK="fluxbee_sdk"   # router_nats | fluxbee_sdk
 #   JETSTREAM_DIAG_TRACE_PREFIX="js-env"
 #   JETSTREAM_DIAG_TRACE_PREFIX_REPLAY="js-rpl"
 #   JETSTREAM_DIAG_LOOPS="10"

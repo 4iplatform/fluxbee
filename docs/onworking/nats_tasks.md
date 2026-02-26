@@ -108,9 +108,9 @@ Criterio de salida:
   - [x] endpoint admin `GET /config/storage/metrics` para consultar backlog/edad de inbox via API.
     - `SY.admin` ya no consulta PostgreSQL directo para este endpoint; usa request/reply NATS (`storage.metrics.get`) y `SY.storage` responde como gateway de DB.
   - [x] hardening de request/reply para metricas:
-    - `jsr_client::nats::publish` ahora sincroniza con broker (`PING/PONG`) antes de cerrar socket en conexiones cortas.
+    - `fluxbee_sdk::nats::publish` ahora sincroniza con broker (`PING/PONG`) antes de cerrar socket en conexiones cortas.
     - evita timeouts intermitentes donde `SY.storage` procesaba en ~1-2ms pero `SY.admin` no recibia reply.
-    - trazas finas quedan disponibles en nivel `debug` (`jsr_client::nats`, `sy_admin`, `sy_storage`) para diagnostico puntual sin ruido operativo por defecto.
+    - trazas finas quedan disponibles en nivel `debug` (`fluxbee_sdk::nats`, `sy_admin`, `sy_storage`) para diagnostico puntual sin ruido operativo por defecto.
 - [x] Base de ack post-persistencia en `SY.storage` (sin JetStream aun):
   - [x] `storage_inbox` durable en PostgreSQL para registrar mensajes recibidos.
   - [x] Replay automatico de pendientes al bootstrap de `SY.storage`.
@@ -136,9 +136,9 @@ Avance JetStream-base (2026-02-19):
 Incidencia operativa cerrada (2026-02-19, storage metrics):
 - Sintoma: `GET /config/storage/metrics` podia fallar con timeout de 8s en varios retries, aunque el siguiente intento respondia en milisegundos.
 - Causa: falta de sincronizacion en `publish` de cliente NATS sobre sockets efimeros (publish-and-close), con perdida intermitente de frame en el cierre.
-- Correccion aplicada: sync `PING/PONG` post-`PUB` en `jsr_client::nats::publish`.
+- Correccion aplicada: sync `PING/PONG` post-`PUB` en `fluxbee_sdk::nats::publish`.
 - Alcance:
-  - afecta camino NATS del cliente `jsr_client` (admin/storage en este flujo).
+  - afecta camino NATS del cliente `fluxbee_sdk` (admin/storage en este flujo).
   - no modifica el modulo NATS del router (`src/nats/mod.rs`), ni cambia contratos de subjects.
 
 Incidencia operativa cerrada (2026-02-20, inbox wildcard `_INBOX.JSR.*`):
@@ -153,7 +153,7 @@ Incidencia operativa cerrada (2026-02-20, inbox wildcard `_INBOX.JSR.*`):
     - `subject_matching_supports_nats_wildcards`
     - `embedded_broker_delivers_to_wildcard_subscriptions`
 - Impacto esperado:
-  - `SY.admin`/`jsr_client::NatsClient` con inbox de sesion multiplexado ya no pierde replies por mismatch de subject.
+  - `SY.admin`/`fluxbee_sdk::NatsClient` con inbox de sesion multiplexado ya no pierde replies por mismatch de subject.
 
 ## Checklist de cierre - Libreria cliente (socket + NATS)
 
@@ -161,7 +161,7 @@ Regla de arquitectura objetivo:
 - todo trafico entre nodos pasa por router local (socket y broker NATS embebido del `rt-gateway` local), nunca proceso-a-proceso directo.
 
 Estado y pendientes:
-- [x] Exponer modulo NATS compartido en `jsr_client` (`publish`, `request`, `NatsSubscriber`).
+- [x] Exponer modulo NATS compartido en `fluxbee_sdk` (`publish`, `request`, `NatsSubscriber`).
 - [x] Migrar `SY.admin` storage metrics a request/reply NATS (`storage.metrics.get`) via `SY.storage`.
 - [x] Definir API strict router-local en libreria (`request_local`, `publish_local`, `subscribe_local`) para no depender de endpoint raw pasado por caller.
 - [x] Resolver `NATS endpoint` local desde config del nodo (`hive.yaml`) dentro de la libreria (alineado a discovery de socket local).
@@ -180,15 +180,15 @@ Estado y pendientes:
 - [x] Documentar quickstart de nodo nuevo (`AI.test`) usando libreria para socket + NATS.
 
 Nota de estado:
-- La API strict ya existe en `jsr_client::nats` y ya esta aplicada en `SY.admin` + `SY.storage`; queda como mejora incremental migrar otros callers auxiliares.
+- La API strict ya existe en `fluxbee_sdk::nats` y ya esta aplicada en `SY.admin` + `SY.storage`; queda como mejora incremental migrar otros callers auxiliares.
 - `SY.admin` ahora crea `NatsClient` via `ClientConfig` (`NatsClient::from_client_config`) y deja de construir endpoint NATS manualmente.
 - `SY.storage` (`storage.metrics.get`) ahora usa `subscribe_local/publish_local` (strict) y deja de usar endpoint string directo para request/reply.
-- `jsr_client::nats::request` ya publica el request en el mismo socket donde espera el reply (se elimino el segundo socket interno de `publish`).
-- `SY.admin` (`/config/storage/metrics`) ya usa `jsr_client::nats::NatsClient` persistente con reconnect/backoff.
+- `fluxbee_sdk::nats::request` ya publica el request en el mismo socket donde espera el reply (se elimino el segundo socket interno de `publish`).
+- `SY.admin` (`/config/storage/metrics`) ya usa `fluxbee_sdk::nats::NatsClient` persistente con reconnect/backoff.
 - `SY.admin` storage metrics ahora usa `reply_subject` por request sobre inbox de sesion (`_INBOX.JSR.<session>.<trace_id>`), evitando colisiones entre procesos.
-- `jsr_client::nats::NatsSubscriber` ahora incluye `run_with_reconnect` (backoff exponencial) para re-suscribir automaticamente tras caidas/restarts del broker.
-- `jsr_client::nats::NatsClient` ahora genera inbox de sesion (`_INBOX.JSR.<session>.*`) y correlaciona requests con `reply_subject` por `trace_id` dentro de esa sesion compartida.
-- `jsr_client::nats::NatsClient` expone `metrics_snapshot()` con `timeouts/reconnects/in_flight/last_error` para observabilidad del caller.
+- `fluxbee_sdk::nats::NatsSubscriber` ahora incluye `run_with_reconnect` (backoff exponencial) para re-suscribir automaticamente tras caidas/restarts del broker.
+- `fluxbee_sdk::nats::NatsClient` ahora genera inbox de sesion (`_INBOX.JSR.<session>.*`) y correlaciona requests con `reply_subject` por `trace_id` dentro de esa sesion compartida.
+- `fluxbee_sdk::nats::NatsClient` expone `metrics_snapshot()` con `timeouts/reconnects/in_flight/last_error` para observabilidad del caller.
 - Validacion remota de campo (2026-02-21):
   - `scripts/wf_nats_diag.sh` con `WF_DIAG_LOOPS=30`, `WF_DIAG_TIMEOUT_SECS=3`, `WF_DIAG_INTERVAL_MS=100` completo sin timeouts.
   - Request/reply estable en la corrida (latencia mayormente en banda ~40-50ms, con picos aislados sin perdida de respuesta).
@@ -206,8 +206,8 @@ Snippet base:
 
 ```rust
 use std::time::Duration;
-use jsr_client::{connect, ClientConfig, NodeConfig};
-use jsr_client::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
+use fluxbee_sdk::{connect, ClientConfig, NodeConfig};
+use fluxbee_sdk::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
 
 let node_cfg = NodeConfig {
     name: "AI.test".to_string(),
@@ -459,7 +459,7 @@ Base de spec usada:
       (cubre payload opaco + ack + redelivery por no-ack intencional).
     - stack de prueba configurable:
       - `JETSTREAM_DIAG_STACK=router_nats` (cliente/router NATS directo),
-      - `JETSTREAM_DIAG_STACK=jsr_client` (librería final de cliente NATS).
+      - `JETSTREAM_DIAG_STACK=fluxbee_sdk` (librería final de cliente NATS).
     - replay durable post-restart en la misma suite:
       - publica lote de replay con subscriber detenido,
       - reinicia `rt-gateway`,

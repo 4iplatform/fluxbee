@@ -2,10 +2,9 @@
 
 Estado objetivo:
 - `fluxbee_sdk` como librería única para nodos (comunicación + blob + futuras herramientas).
-- `jsr_client` queda transitorio y deprecado durante la migración.
+- `jsr_client` retirado del workspace principal (migración cerrada).
 
 Regla operativa acordada:
-- En el intermedio conviven ambos crates.
 - Todo cambio nuevo se valida compilando y ejecutando por `fluxbee_sdk`.
 
 ## Fase M1 - Base de compatibilidad
@@ -34,11 +33,11 @@ Regla operativa acordada:
 
 ## Fase M5 - Retiro de `jsr_client`
 
-- [ ] M13. Eliminar dependencias remanentes de `jsr_client`.
-- [ ] M14. Retirar crate `crates/jsr_client` del workspace.
-- [ ] M15. Actualizar documentación final de migración (spec + onworking + changelog).
+- [x] M13. Eliminar dependencias remanentes de `jsr_client`.
+- [x] M14. Retirar crate `crates/jsr_client` del workspace.
+- [x] M15. Actualizar documentación final de migración (spec + onworking + changelog).
 
 ## Pendientes reales para cerrar migración
 
-- Queda limpiar documentación pública final de migración (M15).
-- Queda retiro final del crate legado cuando no haya consumidores remanentes (M13-M14).
+- Migración SDK cerrada.
+- `fluxbee_sdk` queda como único SDK soportado para nuevos desarrollos.

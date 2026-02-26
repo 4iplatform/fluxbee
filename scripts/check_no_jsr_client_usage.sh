@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Enforces M8:
+# Enforces post-migration SDK policy:
 # - no direct `jsr_client` paths in product Rust code
-# - no new `jsr-client` dependency declarations outside legacy crate
+# - no `jsr-client` dependency declarations in Cargo manifests
 #
 # Scope (product code):
 # - src/**/*.rs
 # - crates/fluxbee_sdk/**/*.rs
-# Exclusions:
-# - crates/jsr_client/** (legacy crate kept during migration)
+# - examples/**/*.rs
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -29,7 +28,7 @@ echo "Checking product Rust code for direct jsr_client usage..."
 if rg -n --no-heading \
   -e '\buse\s+jsr_client\b' \
   -e '\bjsr_client::' \
-  src crates/fluxbee_sdk --glob '*.rs'
+  src crates/fluxbee_sdk examples --glob '*.rs'
 then
   echo "FAIL: direct jsr_client usage detected in product Rust code." >&2
   violations=1
@@ -40,10 +39,9 @@ if rg -n --no-heading \
   -e '^\s*jsr-client\s*=' \
   -e 'package\s*=\s*"jsr-client"' \
   --glob '**/Cargo.toml' \
-  --glob '!crates/jsr_client/Cargo.toml' \
   .
 then
-  echo "FAIL: direct jsr-client dependency detected outside legacy crate." >&2
+  echo "FAIL: direct jsr-client dependency detected in Cargo manifests." >&2
   violations=1
 fi
 

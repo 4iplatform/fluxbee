@@ -151,6 +151,7 @@ blob:
 | `blob.sync.tool` | No | `syncthing` | Herramienta de sincronización (actual: Syncthing) |
 | `blob.sync.api_port` | No | 8384 | API local de Syncthing |
 | `blob.sync.data_dir` | No | `/var/lib/fluxbee/syncthing` | Directorio de estado de Syncthing |
+| `admin.listen` | No | `127.0.0.1:8080` | Bind del API HTTP de SY.admin (recomendado loopback + proxy) |
 | `database.url` | Solo Motherbee | - | Connection string PostgreSQL |
 | `database.pool_size` | No | 10 | Conexiones en el pool |
 
@@ -180,6 +181,18 @@ Puertos operativos Syncthing:
 Firewall:
 - El orchestrator intenta abrir puertos con `ufw` o `firewalld` (local y remoto).
 - Si no detecta `ufw/firewalld`, deja warning en logs y la apertura queda a cargo de la política de host.
+
+### 2.6 Exposición del API Admin (perfil seguro)
+
+Política recomendada:
+1. Mantener `admin.listen` en loopback (`127.0.0.1:8080`) y publicar externamente solo vía proxy.
+2. Si se requiere bind directo (`0.0.0.0`), restringir por firewall/ACL a rangos de administración.
+3. Exigir autenticación/autorización en el proxy (mTLS o auth de red interna).
+4. Registrar auditoría de accesos al API (`POST/DELETE /hives`, `PUT /config/*`, OPA).
+
+Comportamiento actual:
+- Si `admin.listen` no está definido en `hive.yaml`, `SY.admin` usa `127.0.0.1:8080`.
+- Override operativo opcional: variable de entorno `JSR_ADMIN_LISTEN`.
 
 ---
 
@@ -704,13 +717,14 @@ Content-Type: application/json
 {
   "routing": {
     "src": "<uuid-sy-admin>",
-    "dst": "<uuid-sy-orchestrator>",
-    "ttl": 1,
+    "dst": "SY.orchestrator@motherbee",
+    "ttl": 16,
     "trace_id": "<uuid>"
   },
   "meta": {
     "type": "admin",
-    "action": "add_hive"
+    "action": "add_hive",
+    "target": "SY.orchestrator@motherbee"
   },
   "payload": {
     "hive_id": "staging",
@@ -718,6 +732,8 @@ Content-Type: application/json
   }
 }
 ```
+
+Nota: cuando `SY.admin` conoce el UUID local de `SY.orchestrator`, puede enviar `routing.dst` por UUID para optimizar; `meta.target` mantiene el destino canónico por nombre L2.
 
 ### 4.5 Flujo Detallado de add_hive
 

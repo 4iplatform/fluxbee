@@ -126,7 +126,7 @@ Alcance:
 ## 2.5 `jetstream_envelope_e2e.sh` + `jetstream_envelope_diag.rs`
 - `NATS_URL`
 - `JETSTREAM_DIAG_MODE=server|client` (binario)
-- `JETSTREAM_DIAG_STACK=router_nats|fluxbee_sdk` (alias legacy: `jsr_client`)
+- `JETSTREAM_DIAG_STACK=router_nats|fluxbee_sdk`
 - `JETSTREAM_DIAG_SUBJECT`
 - `JETSTREAM_DIAG_QUEUE`
 - `JETSTREAM_DIAG_SID`

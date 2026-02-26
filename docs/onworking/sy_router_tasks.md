@@ -30,7 +30,7 @@ It is one symptom of a broader gap in the remote-topology model:
 - This is because `LsaSnapshot` remote hive entries do not carry remote router UUID.
 
 2) LSA protocol payload has no remote gateway identity fields
-- `crates/jsr_client/src/protocol.rs:162` (`LsaPayload`) contains `hive/seq/timestamp/nodes/routes/vpns`.
+- `crates/fluxbee_sdk/src/protocol.rs:162` (`LsaPayload`) contains `hive/seq/timestamp/nodes/routes/vpns`.
 - No `router_id` / `router_name` in payload.
 
 3) SHM LSA remote hive entry has no remote gateway identity

@@ -218,7 +218,7 @@ wan:
   # Sin uplinks - es el origen
 
 admin:
-  listen: "0.0.0.0:8080"
+  listen: "127.0.0.1:8080"   # Recomendado: exponer externamente via reverse proxy
 ```
 
 **hive.yaml de Hija (generado por add_hive):**

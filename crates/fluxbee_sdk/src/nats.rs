@@ -1798,7 +1798,7 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("jsr-client-nats-test-{nanos}-{seq}"));
+        let dir = std::env::temp_dir().join(format!("fluxbee-sdk-nats-test-{nanos}-{seq}"));
         fs::create_dir_all(&dir).expect("create temp config dir");
         dir
     }

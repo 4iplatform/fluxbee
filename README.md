@@ -321,14 +321,12 @@ This README explains the system and concepts. For how to run, build, and develop
 
 ### Node Development Template (Rust)
 
-If you want to build a node in another repo, copy the client library and use it as a path dependency.
-
-`jsr_client` is a legacy path. For new projects, prefer `fluxbee_sdk`
+If you want to build a node in another repo, use `fluxbee_sdk`
 (`json-router/crates/fluxbee_sdk`) as the canonical SDK.
 
 **What to copy**
 ```
-json-router/crates/jsr_client/
+json-router/crates/fluxbee_sdk/
 ```
 
 **Suggested structure**
@@ -337,7 +335,7 @@ my-node/
 ├── Cargo.toml
 ├── src/
 │   └── main.rs
-└── jsr_client/        # copied from json-router/crates/jsr_client
+└── fluxbee_sdk/       # copied from json-router/crates/fluxbee_sdk
 ```
 
 **Cargo.toml**
@@ -352,13 +350,13 @@ tokio = { version = "1.37", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1.7", features = ["v4"] }
-jsr-client = { path = "./jsr_client" }
+fluxbee-sdk = { path = "./fluxbee_sdk" }
 ```
 
 **Minimal node example**
 ```rust
-use jsr_client::{connect, NodeConfig};
-use jsr_client::protocol::{Destination, Message, Meta, Routing};
+use fluxbee_sdk::{connect, NodeConfig};
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
 use uuid::Uuid;
 
 #[tokio::main]
