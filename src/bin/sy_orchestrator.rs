@@ -427,7 +427,12 @@ async fn bootstrap_local(
     )
     .await?;
     if state.blob.sync_enabled {
-        ensure_blob_sync_runtime(&state.blob).await?;
+        if let Err(err) = ensure_blob_sync_runtime(&state.blob).await {
+            tracing::warn!(
+                error = %err,
+                "blob sync runtime bootstrap failed; continuing startup and relying on watchdog retries"
+            );
+        }
     } else {
         disable_blob_sync_runtime_local()?;
         disable_remote_blob_sync_all_hives(state);
@@ -1734,7 +1739,7 @@ fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> Stri
         "root"
     };
     format!(
-        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nEnvironment=HOME={}\nExecStart={} -no-browser -no-restart -home={} -gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nEnvironment=HOME={}\nExecStart={} --no-browser --no-restart --home={} --gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
         service_user,
         service_group,
         blob.sync_data_dir.display(),
