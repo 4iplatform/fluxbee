@@ -3527,7 +3527,9 @@ async fn vendor_sync_workers(
             });
             continue;
         }
-        if let Err(err) = ensure_remote_syncthing_runtime(&hive_id, &desired_blob) {
+        if let Err(err) =
+            ensure_remote_syncthing_runtime_with_access(&address, &key_path, &desired_blob)
+        {
             tracing::warn!(hive = %hive_id, error = %err, "vendor sync failed");
             let rollback_note = attempt_remote_syncthing_rollback_note(&address, &key_path);
             let reason = format!("vendor sync failed: {err}; {rollback_note}");
@@ -4737,23 +4739,23 @@ fn disable_remote_syncthing_firewall(
     )
 }
 
-fn ensure_remote_syncthing_runtime(
-    hive_id: &str,
+fn ensure_remote_syncthing_runtime_with_access(
+    address: &str,
+    key_path: &Path,
     blob: &BlobRuntimeConfig,
 ) -> Result<(), OrchestratorError> {
-    let (address, key_path) = hive_access(hive_id)?;
     let source = resolve_syncthing_vendor_source_path()?;
     let _ = local_syncthing_vendor_hash()?;
 
     let remote_tmp_path = format!(
         "/tmp/fluxbee-syncthing-{}.bin",
-        sanitize_unit_suffix(hive_id)
+        sanitize_unit_suffix(address)
     );
     let source_str = source.to_string_lossy().to_string();
     let source_refs = [source_str.as_str()];
     scp_with_key(
-        &address,
-        &key_path,
+        address,
+        key_path,
         &source_refs,
         &remote_tmp_path,
         BOOTSTRAP_SSH_USER,
@@ -4767,8 +4769,8 @@ fn ensure_remote_syncthing_runtime(
     );
     let backup_cmd_q = shell_single_quote(&backup_cmd);
     ssh_with_key(
-        &address,
-        &key_path,
+        address,
+        key_path,
         &sudo_wrap(&format!("bash -lc '{}'", backup_cmd_q)),
         BOOTSTRAP_SSH_USER,
     )?;
@@ -4777,8 +4779,8 @@ fn ensure_remote_syncthing_runtime(
         remote_tmp_path, SYNCTHING_INSTALL_PATH, remote_tmp_path
     );
     ssh_with_key(
-        &address,
-        &key_path,
+        address,
+        key_path,
         &sudo_wrap(&install_cmd),
         BOOTSTRAP_SSH_USER,
     )?;
@@ -4787,39 +4789,47 @@ fn ensure_remote_syncthing_runtime(
     let sync_data_dir_q = shell_single_quote(&blob.sync_data_dir.display().to_string());
     let mkdir_cmd = format!("mkdir -p '{blob_path_q}' '{sync_data_dir_q}'");
     ssh_with_key(
-        &address,
-        &key_path,
+        address,
+        key_path,
         &sudo_wrap(&mkdir_cmd),
         BOOTSTRAP_SSH_USER,
     )?;
 
     let remote_unit = syncthing_unit_contents(blob, "root");
     write_remote_file(
-        &address,
-        &key_path,
+        address,
+        key_path,
         &format!("/etc/systemd/system/{SYNCTHING_SERVICE_NAME}.service"),
         &remote_unit,
     )?;
     ssh_with_key(
-        &address,
-        &key_path,
+        address,
+        key_path,
         &sudo_wrap("systemctl daemon-reload"),
         BOOTSTRAP_SSH_USER,
     )?;
     ssh_with_key(
-        &address,
-        &key_path,
+        address,
+        key_path,
         &sudo_wrap(&format!("systemctl enable {SYNCTHING_SERVICE_NAME}")),
         BOOTSTRAP_SSH_USER,
     )?;
     ssh_with_key(
-        &address,
-        &key_path,
+        address,
+        key_path,
         &sudo_wrap(&format!("systemctl restart {SYNCTHING_SERVICE_NAME}")),
         BOOTSTRAP_SSH_USER,
     )?;
-    ensure_remote_syncthing_firewall(&address, &key_path)?;
+    ensure_remote_syncthing_firewall(address, key_path)?;
     Ok(())
+}
+
+fn ensure_remote_syncthing_runtime(
+    hive_id: &str,
+    blob: &BlobRuntimeConfig,
+) -> Result<(), OrchestratorError> {
+    let (address, key_path) = hive_access(hive_id)?;
+    ensure_remote_syncthing_runtime_with_access(&address, &key_path, blob)
 }
 
 fn ensure_remote_blob_sync_all_hives(blob: &BlobRuntimeConfig) {
@@ -5266,7 +5276,7 @@ fn add_hive_flow(
         let remote_vendor_hash_before = remote_syncthing_installed_hash(address, &key_path)
             .ok()
             .flatten();
-        if let Err(err) = ensure_remote_syncthing_runtime(hive_id, &desired_blob) {
+        if let Err(err) = ensure_remote_syncthing_runtime_with_access(address, &key_path, &desired_blob) {
             let rollback_note = attempt_remote_syncthing_rollback_note(address, &key_path);
             let reason = format!("syncthing setup failed: {err}; {rollback_note}");
             let entry = DeploymentHistoryEntry {
