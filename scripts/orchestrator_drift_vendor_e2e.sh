@@ -169,13 +169,18 @@ extract_hive_addr() {
 
 remote_ssh() {
   local remote_cmd="$1"
-  ssh -i "$KEY_PATH" \
+  local -a ssh_cmd=()
+  if [[ "${USE_SUDO_SSH:-0}" == "1" ]]; then
+    ssh_cmd+=(sudo)
+  fi
+  ssh_cmd+=(ssh -i "$KEY_PATH" \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
     -o LogLevel=ERROR \
     -o ConnectTimeout=10 \
     "administrator@${HIVE_ADDR}" \
-    "$remote_cmd"
+    "$remote_cmd")
+  "${ssh_cmd[@]}"
 }
 
 remote_root() {
@@ -336,6 +341,17 @@ fi
 if [[ ! -f "$KEY_PATH" ]]; then
   echo "FAIL: missing key file $KEY_PATH" >&2
   exit 1
+fi
+USE_SUDO_SSH=0
+if [[ ! -r "$KEY_PATH" ]]; then
+  if sudo -n true >/dev/null 2>&1; then
+    USE_SUDO_SSH=1
+    echo "Info: using sudo for local ssh (key not readable by current user): $KEY_PATH" >&2
+  else
+    echo "FAIL: key file is not readable and sudo -n is unavailable: $KEY_PATH" >&2
+    echo "Hint: run with sudo or chown the key to your user." >&2
+    exit 1
+  fi
 fi
 
 echo "Running vendor drift E2E: BASE=$BASE HIVE_ID=$HIVE_ID HIVE_ADDR=$HIVE_ADDR"
