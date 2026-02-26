@@ -377,7 +377,7 @@ echo "Baseline hashes: local=$baseline_local_hash remote=$baseline_remote_hash"
 
 echo "Step 2/4: tamper remote syncthing binary to inject drift"
 drift_start_ms="$(epoch_ms)"
-remote_root "printf '\n# drift-e2e-$(date +%s)' >> '${REMOTE_VENDOR_BIN}'"
+remote_root "set -euo pipefail; tmp='${REMOTE_VENDOR_BIN}.drift.\$\$'; cp '${REMOTE_VENDOR_BIN}' \"\$tmp\"; printf '\n# drift-e2e-$(date +%s)' >> \"\$tmp\"; install -m 0755 \"\$tmp\" '${REMOTE_VENDOR_BIN}'; rm -f \"\$tmp\""
 tampered_remote_hash="$(remote_vendor_hash || true)"
 if [[ -z "$tampered_remote_hash" || "$tampered_remote_hash" == "$baseline_local_hash" ]]; then
   echo "FAIL: tamper did not change remote vendor hash" >&2
