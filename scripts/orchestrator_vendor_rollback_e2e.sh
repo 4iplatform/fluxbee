@@ -42,7 +42,7 @@ INFO_FILE="/var/lib/fluxbee/hives/${HIVE_ID}/info.yaml"
 KEY_PATH="/var/lib/fluxbee/hives/${HIVE_ID}/ssh.key"
 VENDOR_MANIFEST="/var/lib/fluxbee/vendor/manifest.json"
 LEGACY_VENDOR_BIN="/var/lib/fluxbee/vendor/syncthing/syncthing"
-REMOTE_VENDOR_BIN="/usr/bin/syncthing"
+REMOTE_VENDOR_BIN="${REMOTE_VENDOR_BIN:-/var/lib/fluxbee/vendor/bin/syncthing}"
 REMOTE_SYNCTHING_SERVICE="fluxbee-syncthing"
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then

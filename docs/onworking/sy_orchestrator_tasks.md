@@ -105,7 +105,7 @@ Implementación ejecutada para decisiones C1/C3:
 - [x] Definir/validar `vendor-manifest.json` (version monotona, hash, size, upstream_version).
 - [x] Implementar propagacion vendor desde repo master (`/var/lib/fluxbee/vendor`) a workers (sin package manager remoto).
 - [x] Implementar rollback vendor por componente (la verificacion de drift/hash ya esta activa en worker).
-- [ ] Alinear unit/service de vendor para usar ruta instalada por orchestrator (sin depender de `/usr/bin` del host).
+- [x] Alinear unit/service de vendor para usar ruta instalada por orchestrator (sin depender de `/usr/bin` del host).
 
 ### 5) API/observabilidad de versiones
 - [x] Exponer endpoint admin para version efectiva por hive (runtimes + core + vendor).

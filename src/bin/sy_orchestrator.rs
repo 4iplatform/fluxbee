@@ -40,8 +40,9 @@ const SYNCTHING_INSTALL_USER: &str = "fluxbee";
 const SYNCTHING_SYNC_PORT_TCP: u16 = 22000;
 const SYNCTHING_SYNC_PORT_UDP: u16 = 22000;
 const SYNCTHING_DISCOVERY_PORT_UDP: u16 = 21027;
-const SYNCTHING_INSTALL_PATH: &str = "/usr/bin/syncthing";
-const SYNCTHING_REMOTE_BACKUP_PATH: &str = "/var/lib/fluxbee/vendor/syncthing.prev";
+const SYNCTHING_INSTALL_DIR: &str = "/var/lib/fluxbee/vendor/bin";
+const SYNCTHING_INSTALL_PATH: &str = "/var/lib/fluxbee/vendor/bin/syncthing";
+const SYNCTHING_REMOTE_BACKUP_PATH: &str = "/var/lib/fluxbee/vendor/bin/syncthing.prev";
 const SYNCTHING_VENDOR_SOURCE_PATH: &str = "/var/lib/fluxbee/vendor/syncthing/syncthing";
 const VENDOR_ROOT_DIR: &str = "/var/lib/fluxbee/vendor";
 const VENDOR_MANIFEST_PATH: &str = "/var/lib/fluxbee/vendor/manifest.json";
@@ -1673,6 +1674,9 @@ fn disable_syncthing_firewall_local() {
 fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
     let source = resolve_syncthing_vendor_source_path()?;
     let source_hash = local_syncthing_vendor_hash()?.unwrap_or_default();
+    if let Some(parent) = Path::new(SYNCTHING_INSTALL_PATH).parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut install_required = !syncthing_binary_available();
     if !install_required {
         let mut cmd = Command::new("sha256sum");
@@ -4746,8 +4750,9 @@ fn ensure_remote_syncthing_runtime(
         BOOTSTRAP_SSH_USER,
     )?;
     let backup_cmd = format!(
-        "set -euo pipefail && mkdir -p '{vendor_root}' && if [ -f '{installed}' ]; then install -m 0755 '{installed}' '{backup}'; fi",
+        "set -euo pipefail && mkdir -p '{vendor_root}' '{install_dir}' && if [ -f '{installed}' ]; then install -m 0755 '{installed}' '{backup}'; fi",
         vendor_root = shell_single_quote(VENDOR_ROOT_DIR),
+        install_dir = shell_single_quote(SYNCTHING_INSTALL_DIR),
         installed = shell_single_quote(SYNCTHING_INSTALL_PATH),
         backup = shell_single_quote(SYNCTHING_REMOTE_BACKUP_PATH),
     );

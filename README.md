@@ -97,6 +97,73 @@ For a larger E2E checklist and error matrix, see:
 - `docs/onworking/sy_admin_e2e_curl_checklist.md`
 - `scripts/admin_add_hive_matrix.sh`
 
+### Endpoint Reference (SY.admin)
+
+Current HTTP surface exposed by `SY.admin`:
+
+Global endpoints:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Liveness/health probe |
+| `GET` | `/hive/status` | Local hive/orchestrator status |
+| `GET` | `/hives` | List managed hives |
+| `POST` | `/hives` | Add hive (`hive_id`, `address`) |
+| `GET` | `/versions` | Effective versions (local or `?hive=`) |
+| `GET` | `/deployments` | Deployment history (`?hive=`, `?category=`, `?limit=`) |
+| `GET` | `/drift-alerts` | Drift alerts (`?hive=`, `?category=`, `?limit=`) |
+| `GET` | `/routes` | Read global routes |
+| `POST` | `/routes` | Add/update route entry |
+| `DELETE` | `/routes` | Delete route entry |
+| `GET` | `/vpns` | Read global VPN rules |
+| `POST` | `/vpns` | Add/update VPN rule |
+| `DELETE` | `/vpns` | Delete VPN rule |
+| `PUT` | `/config/routes` | Replace routes config |
+| `PUT` | `/config/vpns` | Replace VPN config |
+| `GET` | `/config/storage` | Read storage config |
+| `PUT` | `/config/storage` | Update storage config |
+| `GET` | `/config/storage/metrics` | Storage metrics passthrough |
+| `POST` | `/opa/policy` | Upload policy bundle |
+| `POST` | `/opa/policy/compile` | Compile policy |
+| `POST` | `/opa/policy/apply` | Apply compiled policy |
+| `POST` | `/opa/policy/rollback` | Roll back policy |
+| `POST` | `/opa/policy/check` | Validate policy inputs |
+| `GET` | `/opa/policy` | Read current policy state |
+| `GET` | `/opa/status` | OPA runtime status |
+| `GET` | `/modules` | List modules |
+| `GET` | `/modules/{name}` | List versions for module |
+| `GET` | `/modules/{name}/{version}` | Get module version payload |
+| `POST` | `/modules/{name}/{version}` | Publish/update module version |
+
+Hive-scoped endpoints:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/hives/{hive}` | Get hive metadata |
+| `DELETE` | `/hives/{hive}` | Remove hive |
+| `GET` | `/hives/{hive}/routes` | List routes for hive |
+| `POST` | `/hives/{hive}/routes` | Add/update route on hive |
+| `DELETE` | `/hives/{hive}/routes/{prefix}` | Delete route by prefix |
+| `GET` | `/hives/{hive}/vpns` | List VPN rules for hive |
+| `POST` | `/hives/{hive}/vpns` | Add/update VPN rule on hive |
+| `DELETE` | `/hives/{hive}/vpns/{pattern}` | Delete VPN rule by pattern |
+| `GET` | `/hives/{hive}/nodes` | List nodes on hive |
+| `POST` | `/hives/{hive}/nodes` | Spawn node on hive |
+| `DELETE` | `/hives/{hive}/nodes/{name}` | Kill node on hive |
+| `GET` | `/hives/{hive}/routers` | List routers on hive |
+| `POST` | `/hives/{hive}/routers` | Start router service on hive |
+| `DELETE` | `/hives/{hive}/routers/{name}` | Stop router service on hive |
+| `GET` | `/hives/{hive}/versions` | Effective versions for hive |
+| `GET` | `/hives/{hive}/deployments` | Deployment history for hive |
+| `GET` | `/hives/{hive}/drift-alerts` | Drift alerts for hive |
+| `POST` | `/hives/{hive}/opa/policy` | Upload policy for hive |
+| `POST` | `/hives/{hive}/opa/policy/compile` | Compile policy for hive |
+| `POST` | `/hives/{hive}/opa/policy/apply` | Apply policy on hive |
+| `POST` | `/hives/{hive}/opa/policy/rollback` | Roll back policy on hive |
+| `POST` | `/hives/{hive}/opa/policy/check` | Validate policy on hive |
+| `GET` | `/hives/{hive}/opa/policy` | Read policy state on hive |
+| `GET` | `/hives/{hive}/opa/status` | OPA status on hive |
+
 ---
 
 ## Core Concepts
