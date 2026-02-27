@@ -369,6 +369,12 @@ echo "Tampered remote hash: $tampered_remote_hash"
 
 echo "Step 3/4: trigger runtime_update again to force auto-resync"
 trigger_runtime_update_cycle
+expected_local_hash="$(local_runtime_hash)"
+if [[ -z "$expected_local_hash" ]]; then
+  echo "FAIL: local runtime manifest hash is empty after resync trigger" >&2
+  exit 1
+fi
+echo "Expected converged hash after resync trigger: $expected_local_hash"
 
 echo "Step 4/4: wait for convergence + API evidence"
 start_secs="$(date +%s)"
@@ -407,7 +413,7 @@ while true; do
     alert_gate_ok=0
   fi
 
-  if [[ "$current_remote_hash" == "$baseline_local_hash" && "$deploy_ok" == "1" && "$alert_gate_ok" == "1" ]]; then
+  if [[ "$current_remote_hash" == "$expected_local_hash" && "$deploy_ok" == "1" && "$alert_gate_ok" == "1" ]]; then
     echo "OK: drift reconciled and evidenced via API"
     if [[ "$alerts_ok" != "1" ]]; then
       echo "Note: no recent runtime drift alert found in window; accepted because REQUIRE_DRIFT_ALERT=0" >&2
