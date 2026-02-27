@@ -37,7 +37,9 @@ REMOTE_SUDO_PASS="${REMOTE_SUDO_PASS:-magicAI}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INFO_FILE="/var/lib/fluxbee/hives/${HIVE_ID}/info.yaml"
-KEY_PATH="/var/lib/fluxbee/hives/${HIVE_ID}/ssh.key"
+LEGACY_KEY_PATH="/var/lib/fluxbee/hives/${HIVE_ID}/ssh.key"
+MOTHERBEE_KEY_PATH="/var/lib/fluxbee/ssh/motherbee.key"
+KEY_PATH=""
 LOCAL_RUNTIME_MANIFEST="/var/lib/fluxbee/runtimes/manifest.json"
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
@@ -163,13 +165,19 @@ extract_hive_addr() {
 
 remote_ssh() {
   local remote_cmd="$1"
-  ssh -i "$KEY_PATH" \
+  local -a ssh_cmd=()
+  if [[ "${USE_SUDO_SSH:-0}" == "1" ]]; then
+    ssh_cmd+=(sudo)
+  fi
+  ssh_cmd+=(ssh -i "$KEY_PATH" \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
     -o LogLevel=ERROR \
+    -o BatchMode=yes \
     -o ConnectTimeout=10 \
     "administrator@${HIVE_ADDR}" \
-    "$remote_cmd"
+    "$remote_cmd")
+  "${ssh_cmd[@]}"
 }
 
 remote_root() {
@@ -294,12 +302,27 @@ if [[ -z "$HIVE_ADDR" ]]; then
   echo "FAIL: cannot resolve HIVE_ADDR (set HIVE_ADDR or ensure $INFO_FILE exists)" >&2
   exit 1
 fi
-if [[ ! -f "$KEY_PATH" ]]; then
-  echo "FAIL: missing key file $KEY_PATH" >&2
+if [[ -f "$LEGACY_KEY_PATH" ]]; then
+  KEY_PATH="$LEGACY_KEY_PATH"
+elif [[ -f "$MOTHERBEE_KEY_PATH" ]]; then
+  KEY_PATH="$MOTHERBEE_KEY_PATH"
+else
+  echo "FAIL: missing ssh key file (checked $LEGACY_KEY_PATH and $MOTHERBEE_KEY_PATH)" >&2
   exit 1
 fi
+USE_SUDO_SSH=0
+if [[ ! -r "$KEY_PATH" ]]; then
+  if sudo -n true >/dev/null 2>&1; then
+    USE_SUDO_SSH=1
+    echo "Info: using sudo for local ssh (key not readable by current user): $KEY_PATH" >&2
+  else
+    echo "FAIL: key file is not readable and sudo -n is unavailable: $KEY_PATH" >&2
+    echo "Hint: run with sudo or chown the key to your user." >&2
+    exit 1
+  fi
+fi
 
-echo "Running runtime drift E2E: BASE=$BASE HIVE_ID=$HIVE_ID HIVE_ADDR=$HIVE_ADDR"
+echo "Running runtime drift E2E: BASE=$BASE HIVE_ID=$HIVE_ID HIVE_ADDR=$HIVE_ADDR KEY_PATH=$KEY_PATH"
 
 health_body="$tmpdir/health.json"
 status="$(http_call "GET" "$BASE/health" "$health_body")"
