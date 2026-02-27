@@ -5827,9 +5827,9 @@ fn apply_remote_restricted_authorized_key_with_access(
 mkdir -p ~/.ssh\n\
 chmod 700 ~/.ssh\n\
 touch ~/.ssh/authorized_keys\n\
-grep -Fv {key_material} ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp || true\n\
+grep -Fv '{key_material}' ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp || true\n\
 mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys\n\
-printf '%s\\n' {entry} >> ~/.ssh/authorized_keys\n\
+printf '%s\\n' '{entry}' >> ~/.ssh/authorized_keys\n\
 chmod 600 ~/.ssh/authorized_keys\n",
         key_material = shell_single_quote(key_material),
         entry = shell_single_quote(&restricted_entry),
@@ -5853,9 +5853,9 @@ fn apply_remote_unrestricted_authorized_key_with_access(
 mkdir -p ~/.ssh\n\
 chmod 700 ~/.ssh\n\
 touch ~/.ssh/authorized_keys\n\
-grep -Fv {key_material} ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp || true\n\
+grep -Fv '{key_material}' ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp || true\n\
 mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys\n\
-printf '%s\\n' {entry} >> ~/.ssh/authorized_keys\n\
+printf '%s\\n' '{entry}' >> ~/.ssh/authorized_keys\n\
 chmod 600 ~/.ssh/authorized_keys\n",
         key_material = shell_single_quote(key_material),
         entry = shell_single_quote(pub_key),
@@ -5878,9 +5878,9 @@ fn apply_remote_unrestricted_authorized_key_with_pass(
 mkdir -p ~/.ssh\n\
 chmod 700 ~/.ssh\n\
 touch ~/.ssh/authorized_keys\n\
-grep -Fv {key_material} ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp || true\n\
+grep -Fv '{key_material}' ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp || true\n\
 mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys\n\
-printf '%s\\n' {entry} >> ~/.ssh/authorized_keys\n\
+printf '%s\\n' '{entry}' >> ~/.ssh/authorized_keys\n\
 chmod 600 ~/.ssh/authorized_keys\n",
         key_material = shell_single_quote(key_material),
         entry = shell_single_quote(pub_key),
