@@ -120,7 +120,64 @@ Implementación ejecutada para decisiones C1/C3:
 - [x] Script E2E de vendor rollback: falla inducida + rollback aplicado + evidencia en `/deployments`. (`scripts/orchestrator_vendor_rollback_e2e.sh`)
 
 ### Criterio de salida de este TODO
-- [ ] Se puede desplegar version nueva de runtime, core y vendor en worker real con:
+- [x] Se puede desplegar version nueva de runtime, core y vendor en worker real con:
   - rollout controlado (canary/global),
   - trazabilidad completa por hive,
   - rollback verificable en caso de falla.
+
+Nota de cierre:
+- [x] E2E `scripts/orchestrator_vendor_rollback_e2e.sh` estabilizado para escenario degradado (runtime_update-only + timeouts extendidos), con evidencia de `rollback applied` y convergencia final.
+
+## TODO - Endurecimiento SSH remoto (sin password en operación)
+
+Objetivo:
+- Eliminar dependencia de password remoto en `SY.orchestrator` sin perder capacidad de recuperación operativa.
+- Migrar a key central de motherbee + `sudo -n` + controles de comando en worker.
+
+Principio operativo acordado:
+- **No deshabilitar password al inicio.**
+- La desactivación de password queda para la última fase, cuando todo el flujo remoto esté validado en E2E.
+
+### Fase S1 - Preparación sin riesgo
+- [x] Definir key única de motherbee en `/var/lib/fluxbee/ssh/motherbee.key` (generada una vez por instalación).
+- [x] Mantener compatibilidad transitoria con esquema legacy por-hive (`/var/lib/fluxbee/hives/<id>/ssh.key`) durante migración.
+- [x] Documentar permisos mínimos de archivos/paths de key en motherbee.
+
+Permisos mínimos acordados (S1):
+- Directorio de key global: `/var/lib/fluxbee/ssh` con `0700`.
+- Privada motherbee: `/var/lib/fluxbee/ssh/motherbee.key` con `0600`.
+- Pública motherbee: `/var/lib/fluxbee/ssh/motherbee.key.pub` con `0644`.
+
+### Fase S2 - Privilegios remotos sin password (manteniendo password habilitado)
+- [x] Reemplazar en orchestrator el uso de `sudo -S` por `sudo -n` para comandos remotos.
+- [x] Definir/instalar `sudoers` mínimo en worker (NOPASSWD, allowlist de comandos Fluxbee necesarios).
+- [ ] Validar por E2E que `add_hive`, sync runtime/core/vendor, restart, rollback y health-check operen solo con `sudo -n`.
+
+### Fase S3 - Key central + authorized_keys restringido
+- [ ] Cambiar `add_hive` para usar la key de motherbee (sin generar key nueva por worker).
+- [ ] En worker, registrar pública con restricciones:
+  - `from=<ip/cidr motherbee>`
+  - `command=/usr/local/bin/fluxbee-ssh-gate.sh`
+  - `no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty`
+- [ ] Instalar `fluxbee-ssh-gate.sh` en worker con allowlist de comandos reales usados por orchestrator (ssh/scp/rsync/systemctl/hash/stat/install/etc.).
+- [ ] Agregar logging de denegaciones en gate script para auditoría.
+
+### Fase S4 - Validación integral previa al corte
+- [ ] E2E completo en worker real:
+  - add/remove hive,
+  - runtime rollout canary/global/rollback,
+  - core drift + rollback,
+  - vendor drift + rollback,
+  - reconciliación watchdog.
+- [ ] Simular fallo parcial y verificar recuperación sin intervención manual.
+- [ ] Confirmar acceso de emergencia documentado (break-glass) antes de corte de password.
+
+### Fase S5 - Corte final (password off)
+- [ ] Deshabilitar `PasswordAuthentication` en workers administrados (solo al cerrar S1..S4).
+- [ ] Quitar secretos de password remoto del código/config (`BOOTSTRAP_SSH_PASS` y equivalentes).
+- [ ] Eliminar código legacy de bootstrap por password una vez confirmada estabilidad.
+
+### Criterio de salida de este TODO
+- [ ] Operación remota de orchestrator 100% por key + `sudo -n`, sin password en runtime.
+- [ ] E2E verde en entorno real post-corte.
+- [ ] Auditoría básica: comandos remotos permitidos explícitamente y denegaciones logueadas.

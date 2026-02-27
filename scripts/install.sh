@@ -33,6 +33,7 @@ fi
 
 sudo install -d "$CONFIG_DIR"
 sudo install -d "$STATE_DIR"
+sudo install -d -m 0700 "$STATE_DIR/ssh"
 sudo install -d "$STATE_DIR/state/nodes"
 sudo install -d "$STATE_DIR/hives"
 sudo install -d "$STATE_DIR/opa"
@@ -50,6 +51,18 @@ sudo install -d "$STATE_DIR/core/bin"
 sudo install -d "$STATE_DIR/core/bin.prev"
 sudo install -d "$RUN_DIR"
 sudo install -d "$RUN_DIR/routers"
+
+MOTHERBEE_KEY="$STATE_DIR/ssh/motherbee.key"
+MOTHERBEE_KEY_PUB="$STATE_DIR/ssh/motherbee.key.pub"
+if [[ ! -f "$MOTHERBEE_KEY" ]]; then
+  echo "Generating motherbee SSH key at $MOTHERBEE_KEY"
+  sudo ssh-keygen -t ed25519 -N "" -f "$MOTHERBEE_KEY" >/dev/null
+fi
+sudo chmod 700 "$STATE_DIR/ssh"
+sudo chmod 600 "$MOTHERBEE_KEY"
+if [[ -f "$MOTHERBEE_KEY_PUB" ]]; then
+  sudo chmod 644 "$MOTHERBEE_KEY_PUB"
+fi
 
 BIN_DIR="${BIN_DIR:-$ROOT_DIR/target/release}"
 if [[ "${SKIP_BUILD:-}" == "1" ]]; then

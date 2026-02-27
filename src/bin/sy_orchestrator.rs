@@ -24,6 +24,8 @@ type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 
 const BOOTSTRAP_SSH_USER: &str = "administrator";
 const BOOTSTRAP_SSH_PASS: &str = "magicAI";
+const MOTHERBEE_SSH_KEY_PATH: &str = "/var/lib/fluxbee/ssh/motherbee.key";
+const ORCH_SUDOERS_PATH: &str = "/etc/sudoers.d/fluxbee-orchestrator";
 const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
 const RUNTIME_MANIFEST_FILE: &str = "runtime-manifest.json";
 const RUNTIME_MANIFEST_SCHEMA_VERSION: u64 = 1;
@@ -3224,10 +3226,22 @@ async fn runtime_sync_workers(
             }
         }
         target_hives.push(hive_id.clone());
+        let worker_started = Instant::now();
+        if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(&address, &key_path) {
+            outcomes.push(DeploymentWorkerOutcome {
+                hive_id,
+                status: "error".to_string(),
+                reason: Some(format!("sudo bootstrap failed: {err}")),
+                duration_ms: worker_started.elapsed().as_millis() as u64,
+                local_hash: local_hash.clone(),
+                remote_hash_before: None,
+                remote_hash_after: None,
+            });
+            continue;
+        }
         let remote_hash = remote_runtime_manifest_hash(&address, &key_path)
             .ok()
             .flatten();
-        let worker_started = Instant::now();
         let pre_drift_detected = local_hash.is_some()
             && remote_hash
                 .as_deref()
@@ -3362,10 +3376,22 @@ async fn core_sync_workers(
     let mut target_hives = Vec::new();
     for (hive_id, address, key_path) in workers {
         target_hives.push(hive_id.clone());
+        let worker_started = Instant::now();
+        if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(&address, &key_path) {
+            outcomes.push(DeploymentWorkerOutcome {
+                hive_id,
+                status: "error".to_string(),
+                reason: Some(format!("sudo bootstrap failed: {err}")),
+                duration_ms: worker_started.elapsed().as_millis() as u64,
+                local_hash: local_hash.clone(),
+                remote_hash_before: None,
+                remote_hash_after: None,
+            });
+            continue;
+        }
         let remote_hash = remote_core_manifest_hash(&address, &key_path)
             .ok()
             .flatten();
-        let worker_started = Instant::now();
         let pre_drift_detected = local_hash.is_some()
             && remote_hash
                 .as_deref()
@@ -3507,10 +3533,22 @@ async fn vendor_sync_workers(
     let mut target_hives = Vec::new();
     for (hive_id, address, key_path) in workers {
         target_hives.push(hive_id.clone());
+        let worker_started = Instant::now();
+        if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(&address, &key_path) {
+            outcomes.push(DeploymentWorkerOutcome {
+                hive_id,
+                status: "error".to_string(),
+                reason: Some(format!("sudo bootstrap failed: {err}")),
+                duration_ms: worker_started.elapsed().as_millis() as u64,
+                local_hash: local_hash.clone(),
+                remote_hash_before: None,
+                remote_hash_after: None,
+            });
+            continue;
+        }
         let remote_hash = remote_syncthing_installed_hash(&address, &key_path)
             .ok()
             .flatten();
-        let worker_started = Instant::now();
         let pre_drift_detected = local_hash.is_some()
             && remote_hash
                 .as_deref()
@@ -3672,8 +3710,7 @@ async fn vendor_sync_workers(
 
 fn list_worker_access() -> Vec<(String, String, PathBuf)> {
     let mut out = Vec::new();
-    let root = hives_root();
-    let entries = match fs::read_dir(&root) {
+    let entries = match fs::read_dir(hives_root()) {
         Ok(entries) => entries,
         Err(_) => return out,
     };
@@ -3684,26 +3721,10 @@ fn list_worker_access() -> Vec<(String, String, PathBuf)> {
             continue;
         }
         let hive_id = entry.file_name().to_string_lossy().to_string();
-        let hive_dir = root.join(&hive_id);
-        let key_path = hive_dir.join("ssh.key");
-        if !key_path.exists() {
-            continue;
-        }
-        let info_path = hive_dir.join("info.yaml");
-        let data = match fs::read_to_string(&info_path) {
-            Ok(data) => data,
+        let (address, key_path) = match hive_access(&hive_id) {
+            Ok(access) => access,
             Err(_) => continue,
         };
-        let info: HiveInfoFile = match serde_yaml::from_str(&data) {
-            Ok(info) => info,
-            Err(_) => continue,
-        };
-        let Some(address) = info.address else {
-            continue;
-        };
-        if address.trim().is_empty() {
-            continue;
-        }
         out.push((hive_id, address, key_path));
     }
 
@@ -4271,16 +4292,29 @@ fn execute_on_hive(
     }
 
     let (address, key_path) = hive_access(target_hive)?;
+    ensure_remote_orchestrator_sudoers_with_access(&address, &key_path)?;
     ssh_with_key(&address, &key_path, &sudo_wrap(command), BOOTSTRAP_SSH_USER)
 }
 
 fn hive_access(hive_id: &str) -> Result<(String, PathBuf), OrchestratorError> {
     let root = hives_root();
     let hive_dir = root.join(hive_id);
-    let key_path = hive_dir.join("ssh.key");
-    if !key_path.exists() {
-        return Err(format!("missing ssh key for hive '{hive_id}'").into());
-    }
+    let legacy_key_path = hive_dir.join("ssh.key");
+    let key_path = if legacy_key_path.exists() {
+        legacy_key_path
+    } else {
+        let motherbee_key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
+        if motherbee_key_path.exists() {
+            motherbee_key_path
+        } else {
+            return Err(format!(
+                "missing ssh key for hive '{hive_id}': checked '{}' and '{}'",
+                legacy_key_path.display(),
+                MOTHERBEE_SSH_KEY_PATH
+            )
+            .into());
+        }
+    };
 
     let info_path = hive_dir.join("info.yaml");
     let data = fs::read_to_string(&info_path)?;
@@ -5096,6 +5130,14 @@ fn add_hive_flow(
         });
     }
 
+    if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(address, &key_path) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SUDO_SETUP_FAILED",
+            "message": err.to_string(),
+        });
+    }
+
     if harden_ssh {
         if let Err(err) = disable_remote_password_auth(address) {
             return serde_json::json!({
@@ -5604,6 +5646,52 @@ fn disable_remote_password_auth(address: &str) -> Result<(), OrchestratorError> 
     Ok(())
 }
 
+fn remote_orchestrator_sudoers_contents() -> String {
+    format!(
+        "Defaults:{} !requiretty\n{} ALL=(root) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /usr/bin/install, /bin/mkdir, /bin/rm, /bin/cp, /bin/mv, /usr/bin/sha256sum, /usr/bin/stat, /usr/bin/tee, /bin/chmod, /usr/bin/chmod, /bin/chown, /usr/bin/chown, /usr/bin/rsync, /usr/sbin/ufw, /usr/bin/firewall-cmd, /usr/sbin/service, /bin/bash, /usr/bin/bash\n",
+        BOOTSTRAP_SSH_USER, BOOTSTRAP_SSH_USER
+    )
+}
+
+fn ensure_remote_orchestrator_sudoers_with_access(
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    if ssh_with_key(address, key_path, &sudo_wrap("true"), BOOTSTRAP_SSH_USER).is_ok() {
+        return Ok(());
+    }
+
+    let local_tmp =
+        std::env::temp_dir().join(format!("fluxbee-orchestrator-sudoers-{}.tmp", now_epoch_ms()));
+    fs::write(&local_tmp, remote_orchestrator_sudoers_contents())?;
+    let local_tmp_str = local_tmp.to_string_lossy().to_string();
+    let local_refs = [local_tmp_str.as_str()];
+    let remote_tmp = format!("/tmp/fluxbee-orchestrator-sudoers-{}", now_epoch_ms());
+    let upload_result = scp_with_key(
+        address,
+        key_path,
+        &local_refs,
+        &remote_tmp,
+        BOOTSTRAP_SSH_USER,
+    );
+    if let Err(err) = upload_result {
+        let _ = fs::remove_file(&local_tmp);
+        return Err(format!("failed to upload sudoers bootstrap: {err}").into());
+    }
+    let script = format!(
+        "set -euo pipefail && install -m 0440 '{remote_tmp}' '{sudoers}' && visudo -cf '{sudoers}' >/dev/null && rm -f '{remote_tmp}'",
+        remote_tmp = shell_single_quote(&remote_tmp),
+        sudoers = shell_single_quote(ORCH_SUDOERS_PATH),
+    );
+    let apply_cmd = sudo_wrap_with_pass(&format!("bash -lc '{}'", shell_single_quote(&script)));
+    let apply_result = ssh_with_key(address, key_path, &apply_cmd, BOOTSTRAP_SSH_USER);
+    let _ = fs::remove_file(&local_tmp);
+    apply_result?;
+    ssh_with_key(address, key_path, &sudo_wrap("true"), BOOTSTRAP_SSH_USER).map_err(|err| {
+        format!("sudo -n unavailable after sudoers bootstrap: {err}").into()
+    })
+}
+
 fn identity_available() -> bool {
     Path::new("/usr/bin/sy-identity").exists()
 }
@@ -5861,6 +5949,10 @@ fn detect_source_ip_for_target(target: &str) -> Result<String, OrchestratorError
 }
 
 fn sudo_wrap(cmd: &str) -> String {
+    format!("sudo -n {}", cmd)
+}
+
+fn sudo_wrap_with_pass(cmd: &str) -> String {
     let pass = BOOTSTRAP_SSH_PASS.replace('\'', "'\"'\"'");
     format!("echo '{}' | sudo -S -p '' {}", pass, cmd)
 }
