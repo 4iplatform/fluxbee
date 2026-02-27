@@ -4557,7 +4557,7 @@ fn remote_wait_service_active(
     timeout_secs: u64,
 ) -> Result<(), OrchestratorError> {
     let script = format!(
-        "for i in $(seq 1 {}); do systemctl is-active --quiet '{}' && exit 0; sleep 1; done; exit 1",
+        "i=0; while [ \"$i\" -lt {} ]; do systemctl is-active --quiet {} && exit 0; i=$((i+1)); sleep 1; done; exit 1",
         timeout_secs, service
     );
     let wrapped = format!("bash -lc '{}'", shell_single_quote(&script));
