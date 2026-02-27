@@ -5133,38 +5133,46 @@ fn add_hive_flow(
         });
     }
 
+    let enforce_from = env_flag_enabled("ORCH_AUTHKEY_ENFORCE_FROM");
     let mut source_patterns: Vec<String> = Vec::new();
-    match detect_ssh_client_ip_seen_by_worker(address) {
-        Ok(ip) => source_patterns.push(ip),
-        Err(err) => {
-            tracing::warn!(
-                target = address,
-                error = %err,
-                "failed to detect worker-observed SSH client ip; falling back to local route detection"
-            );
-        }
-    }
-    if let Ok(ip) = detect_source_ip_for_target(address) {
-        if !source_patterns.iter().any(|value| value == &ip) {
-            source_patterns.push(ip);
-        }
-    }
-    let current_patterns = source_patterns.clone();
-    for pattern in current_patterns {
-        if let Ok(ipv4) = pattern.parse::<std::net::Ipv4Addr>() {
-            let octets = ipv4.octets();
-            let wildcard = format!("{}.{}.{}.*", octets[0], octets[1], octets[2]);
-            if !source_patterns.iter().any(|value| value == &wildcard) {
-                source_patterns.push(wildcard);
+    if enforce_from {
+        match detect_ssh_client_ip_seen_by_worker(address) {
+            Ok(ip) => source_patterns.push(ip),
+            Err(err) => {
+                tracing::warn!(
+                    target = address,
+                    error = %err,
+                    "failed to detect worker-observed SSH client ip; falling back to local route detection"
+                );
             }
         }
-    }
-    if source_patterns.is_empty() {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SSH_KEY_FAILED",
-            "message": "failed to resolve source ip for ssh key restriction",
-        });
+        if let Ok(ip) = detect_source_ip_for_target(address) {
+            if !source_patterns.iter().any(|value| value == &ip) {
+                source_patterns.push(ip);
+            }
+        }
+        let current_patterns = source_patterns.clone();
+        for pattern in current_patterns {
+            if let Ok(ipv4) = pattern.parse::<std::net::Ipv4Addr>() {
+                let octets = ipv4.octets();
+                let wildcard = format!("{}.{}.{}.*", octets[0], octets[1], octets[2]);
+                if !source_patterns.iter().any(|value| value == &wildcard) {
+                    source_patterns.push(wildcard);
+                }
+            }
+        }
+        if source_patterns.is_empty() {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_KEY_FAILED",
+                "message": "failed to resolve source ip for ssh key restriction",
+            });
+        }
+    } else {
+        tracing::info!(
+            target = address,
+            "authorized_keys from= restriction disabled (set ORCH_AUTHKEY_ENFORCE_FROM=1 to enable)"
+        );
     }
     if let Err(err) = apply_remote_restricted_authorized_key_with_access(
         address,
@@ -5193,14 +5201,23 @@ fn add_hive_flow(
         if let Err(fallback_err) =
             apply_remote_unrestricted_authorized_key_with_access(address, &key_path, &pub_key)
         {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!(
-                    "key access verification failed after authorized_keys restriction (from patterns={:?}): {}; unrestricted fallback failed: {}",
-                    source_patterns, err, fallback_err
-                ),
-            });
+            tracing::warn!(
+                target = address,
+                error = %fallback_err,
+                "unrestricted fallback via key failed; retrying via password bootstrap channel"
+            );
+            if let Err(pass_fallback_err) =
+                apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key)
+            {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "SSH_KEY_FAILED",
+                    "message": format!(
+                        "key access verification failed after authorized_keys restriction (from patterns={:?}): {}; unrestricted fallback failed: {}; password fallback failed: {}",
+                        source_patterns, err, fallback_err, pass_fallback_err
+                    ),
+                });
+            }
         }
         if let Err(recheck_err) = ssh_with_key(
             address,
@@ -5774,20 +5791,25 @@ fn apply_remote_restricted_authorized_key_with_access(
     pub_key: &str,
     source_patterns: &[String],
 ) -> Result<(), OrchestratorError> {
-    if source_patterns.is_empty() {
-        return Err("missing source patterns for authorized_keys restriction".into());
-    }
     let key_material = pub_key
         .split_whitespace()
         .nth(1)
         .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
-    let from_value = source_patterns.join(",");
-    let restricted_entry = format!(
-        "from=\"{from_value}\",command=\"{gate}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {pub_key}",
-        from_value = from_value,
-        gate = ORCH_SSH_GATE_PATH,
-        pub_key = pub_key
-    );
+    let restricted_entry = if source_patterns.is_empty() {
+        format!(
+            "command=\"{gate}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {pub_key}",
+            gate = ORCH_SSH_GATE_PATH,
+            pub_key = pub_key
+        )
+    } else {
+        let from_value = source_patterns.join(",");
+        format!(
+            "from=\"{from_value}\",command=\"{gate}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {pub_key}",
+            from_value = from_value,
+            gate = ORCH_SSH_GATE_PATH,
+            pub_key = pub_key
+        )
+    };
     let script = format!(
         "set -euo pipefail\n\
 mkdir -p ~/.ssh\n\
@@ -5828,6 +5850,31 @@ chmod 600 ~/.ssh/authorized_keys\n",
     );
     let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
     ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
+    Ok(())
+}
+
+fn apply_remote_unrestricted_authorized_key_with_pass(
+    address: &str,
+    pub_key: &str,
+) -> Result<(), OrchestratorError> {
+    let key_material = pub_key
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
+    let script = format!(
+        "set -euo pipefail\n\
+mkdir -p ~/.ssh\n\
+chmod 700 ~/.ssh\n\
+touch ~/.ssh/authorized_keys\n\
+grep -Fv {key_material} ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp || true\n\
+mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys\n\
+printf '%s\\n' {entry} >> ~/.ssh/authorized_keys\n\
+chmod 600 ~/.ssh/authorized_keys\n",
+        key_material = shell_single_quote(key_material),
+        entry = shell_single_quote(pub_key),
+    );
+    let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
+    ssh_with_pass(address, &cmd, BOOTSTRAP_SSH_USER)?;
     Ok(())
 }
 
