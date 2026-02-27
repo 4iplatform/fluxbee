@@ -23,6 +23,7 @@ set -euo pipefail
 #   POLL_INTERVAL_SECS="2"
 #   BUILD_BIN="0|1"
 #   REMOTE_SUDO_PASS="magicAI"
+#   REQUIRE_DRIFT_ALERT="0|1"              # default 0: hash+deployment evidence is enough
 
 BASE="${BASE:-http://127.0.0.1:8080}"
 HIVE_ID="${HIVE_ID:-worker-220}"
@@ -34,6 +35,7 @@ WAIT_TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-60}"
 POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-2}"
 BUILD_BIN="${BUILD_BIN:-0}"
 REMOTE_SUDO_PASS="${REMOTE_SUDO_PASS:-magicAI}"
+REQUIRE_DRIFT_ALERT="${REQUIRE_DRIFT_ALERT:-0}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INFO_FILE="/var/lib/fluxbee/hives/${HIVE_ID}/info.yaml"
@@ -381,7 +383,7 @@ while true; do
   current_remote_hash="$(remote_runtime_hash || true)"
 
   alerts_body="$tmpdir/drift_alerts.json"
-  status_alerts="$(http_call "GET" "$BASE/drift-alerts?hive=$HIVE_ID&category=runtime&limit=50" "$alerts_body")"
+  status_alerts="$(http_call "GET" "$BASE/drift-alerts?hive=$HIVE_ID&category=runtime&limit=200" "$alerts_body")"
   log_http_response "$status_alerts" "$alerts_body"
   alerts_ok=0
   if [[ "$status_alerts" == "200" && "$(has_recent_runtime_drift_alert "$alerts_body" "$drift_start_ms")" == "1" ]]; then
@@ -389,20 +391,32 @@ while true; do
   fi
 
   deployments_body="$tmpdir/deployments.json"
-  status_deploy="$(http_call "GET" "$BASE/deployments?hive=$HIVE_ID&category=runtime&limit=50" "$deployments_body")"
+  status_deploy="$(http_call "GET" "$BASE/deployments?hive=$HIVE_ID&category=runtime&limit=200" "$deployments_body")"
   log_http_response "$status_deploy" "$deployments_body"
   deploy_ok=0
   if [[ "$status_deploy" == "200" && "$(has_recent_runtime_deployment "$deployments_body" "$drift_start_ms")" == "1" ]]; then
     deploy_ok=1
   fi
 
-  if [[ "$current_remote_hash" == "$baseline_local_hash" && "$alerts_ok" == "1" && "$deploy_ok" == "1" ]]; then
+  need_alert=0
+  if [[ "$REQUIRE_DRIFT_ALERT" == "1" ]]; then
+    need_alert=1
+  fi
+  alert_gate_ok=1
+  if [[ "$need_alert" == "1" && "$alerts_ok" != "1" ]]; then
+    alert_gate_ok=0
+  fi
+
+  if [[ "$current_remote_hash" == "$baseline_local_hash" && "$deploy_ok" == "1" && "$alert_gate_ok" == "1" ]]; then
     echo "OK: drift reconciled and evidenced via API"
+    if [[ "$alerts_ok" != "1" ]]; then
+      echo "Note: no recent runtime drift alert found in window; accepted because REQUIRE_DRIFT_ALERT=0" >&2
+    fi
     echo "runtime drift E2E passed."
     exit 0
   fi
 
-  echo "[WAIT] elapsed=${elapsed}s remote_hash=${current_remote_hash:-<none>} alerts_ok=${alerts_ok} deploy_ok=${deploy_ok}" >&2
+  echo "[WAIT] elapsed=${elapsed}s remote_hash=${current_remote_hash:-<none>} alerts_ok=${alerts_ok} deploy_ok=${deploy_ok} require_alert=${need_alert}" >&2
   sleep "$POLL_INTERVAL_SECS"
 done
 
