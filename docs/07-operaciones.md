@@ -194,6 +194,64 @@ Comportamiento actual:
 - Si `admin.listen` no está definido en `hive.yaml`, `SY.admin` usa `127.0.0.1:8080`.
 - Override operativo opcional: variable de entorno `JSR_ADMIN_LISTEN`.
 
+### 2.7 Break-Glass SSH (acceso de emergencia)
+
+Objetivo:
+- Recuperar control de un worker si el acceso remoto de orchestrator queda degradado por restricciones de `authorized_keys`/gate.
+
+Precondiciones:
+- Acceso administrativo a motherbee (host donde corre `SY.orchestrator`).
+- Acceso out-of-band al worker (consola/hipervisor) para el peor caso.
+
+Escenario A: hay key, pero la restricción bloquea operaciones
+1. Desactivar temporalmente restricciones en motherbee:
+```bash
+sudo mkdir -p /etc/systemd/system/sy-orchestrator.service.d
+cat <<'EOF' | sudo tee /etc/systemd/system/sy-orchestrator.service.d/90-break-glass.conf
+[Service]
+Environment=ORCH_AUTHKEY_ENFORCE_GATE=0
+Environment=ORCH_AUTHKEY_ENFORCE_FROM=0
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart sy-orchestrator
+```
+2. Rebootstrap del worker (reinstala `authorized_keys`/sudoers):
+```bash
+BASE="http://127.0.0.1:8080"
+HIVE_ID="worker-220"
+HIVE_ADDR="192.168.8.220"
+curl -sS -X DELETE "$BASE/hives/$HIVE_ID"; echo
+curl -sS -X POST "$BASE/hives" -H "Content-Type: application/json" \
+  -d "{\"hive_id\":\"$HIVE_ID\",\"address\":\"$HIVE_ADDR\"}"; echo
+```
+3. Volver a modo seguro por defecto:
+```bash
+sudo rm -f /etc/systemd/system/sy-orchestrator.service.d/90-break-glass.conf
+sudo systemctl daemon-reload
+sudo systemctl restart sy-orchestrator
+```
+
+Escenario B (pre-S5): key caída y password aún habilitado
+- Usar login por password solo para recuperación inicial, luego repetir Escenario A.
+- No dejar password en scripts/historial; rotar secreto tras recuperación.
+
+Escenario C (post-S5): key caída y password deshabilitado
+- Recuperar por consola out-of-band y reinstalar manualmente la key pública de motherbee:
+```bash
+sudo install -d -m 700 -o administrator -g administrator /home/administrator/.ssh
+sudo sh -lc 'cat >> /home/administrator/.ssh/authorized_keys' <<'EOF'
+<MOTHERBEE_PUBLIC_KEY_LINE>
+EOF
+sudo chown administrator:administrator /home/administrator/.ssh/authorized_keys
+sudo chmod 600 /home/administrator/.ssh/authorized_keys
+```
+- Luego ejecutar `DELETE/POST /hives/{id}` desde motherbee para reconciliar estado.
+
+Evidencia mínima de recuperación:
+- `GET /hives/<id>` responde `status=ok`.
+- `GET /versions?hive=<id>` devuelve `core/runtime/vendor`.
+- `GET /deployments?hive=<id>&limit=20` contiene entradas recientes de reconciliación.
+
 ---
 
 ## 3. Distribución Motherbee / Worker

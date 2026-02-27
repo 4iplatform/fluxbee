@@ -115,6 +115,9 @@ run_step "runtime rollout canary/global/rollback" \
 run_step "runtime drift reconcile" \
   bash -lc "cd '$ROOT_DIR' && BASE='$BASE' HIVE_ID='$HIVE_ID' HIVE_ADDR='$HIVE_ADDR' BUILD_BIN='$BUILD_BIN' REMOTE_SUDO_PASS='$REMOTE_SUDO_PASS' REQUIRE_DRIFT_ALERT='$REQUIRE_DRIFT_ALERT' bash scripts/orchestrator_drift_runtime_e2e.sh"
 
+run_step "partial failure auto-recovery" \
+  bash -lc "cd '$ROOT_DIR' && BASE='$BASE' HIVE_ID='$HIVE_ID' HIVE_ADDR='$HIVE_ADDR' BUILD_BIN='$BUILD_BIN' REMOTE_SUDO_PASS='$REMOTE_SUDO_PASS' bash scripts/orchestrator_partial_failure_recovery_e2e.sh"
+
 if [[ "$SKIP_VENDOR" != "1" ]]; then
   run_step "vendor drift reconcile" \
     bash -lc "cd '$ROOT_DIR' && BASE='$BASE' HIVE_ID='$HIVE_ID' HIVE_ADDR='$HIVE_ADDR' BUILD_BIN='$BUILD_BIN' REMOTE_SUDO_PASS='$REMOTE_SUDO_PASS' bash scripts/orchestrator_drift_vendor_e2e.sh"

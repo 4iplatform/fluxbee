@@ -5125,7 +5125,7 @@ fn add_hive_flow(
         });
     }
 
-    let enforce_gate = env_flag_enabled("ORCH_AUTHKEY_ENFORCE_GATE");
+    let enforce_gate = env_flag_with_default("ORCH_AUTHKEY_ENFORCE_GATE", true);
     if enforce_gate {
         if let Err(err) = install_remote_ssh_gate_with_access(address, &key_path) {
             return serde_json::json!({
@@ -5135,7 +5135,7 @@ fn add_hive_flow(
             });
         }
 
-        let enforce_from = env_flag_enabled("ORCH_AUTHKEY_ENFORCE_FROM");
+        let enforce_from = env_flag_with_default("ORCH_AUTHKEY_ENFORCE_FROM", true);
         let mut source_patterns: Vec<String> = Vec::new();
         if enforce_from {
             match detect_ssh_client_ip_seen_by_worker(address) {
@@ -5168,7 +5168,7 @@ fn add_hive_flow(
         } else {
             tracing::info!(
                 target = address,
-                "authorized_keys from= restriction disabled (set ORCH_AUTHKEY_ENFORCE_FROM=1 to enable)"
+                "authorized_keys from= restriction disabled by config override"
             );
         }
         if let Err(err) = apply_remote_restricted_authorized_key_with_access(
@@ -5235,7 +5235,7 @@ fn add_hive_flow(
     } else {
         tracing::info!(
             target = address,
-            "authorized_keys gate restriction disabled (set ORCH_AUTHKEY_ENFORCE_GATE=1 to enable)"
+            "authorized_keys gate restriction disabled by config override"
         );
     }
 
@@ -5651,11 +5651,15 @@ fn parse_bool_value(value: &serde_json::Value) -> Option<bool> {
 }
 
 fn env_flag_enabled(name: &str) -> bool {
+    env_flag_with_default(name, false)
+}
+
+fn env_flag_with_default(name: &str, default: bool) -> bool {
     let raw = match std::env::var(name) {
         Ok(value) => value,
-        Err(_) => return false,
+        Err(_) => return default,
     };
-    parse_bool_str(&raw).unwrap_or(false)
+    parse_bool_str(&raw).unwrap_or(default)
 }
 
 fn parse_bool_str(raw: &str) -> Option<bool> {
