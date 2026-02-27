@@ -5657,7 +5657,14 @@ fn ensure_remote_orchestrator_sudoers_with_access(
     address: &str,
     key_path: &Path,
 ) -> Result<(), OrchestratorError> {
-    if ssh_with_key(address, key_path, &sudo_wrap("true"), BOOTSTRAP_SSH_USER).is_ok() {
+    if ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap("/bin/systemctl --version"),
+        BOOTSTRAP_SSH_USER,
+    )
+    .is_ok()
+    {
         return Ok(());
     }
 
@@ -5687,9 +5694,13 @@ fn ensure_remote_orchestrator_sudoers_with_access(
     let apply_result = ssh_with_key(address, key_path, &apply_cmd, BOOTSTRAP_SSH_USER);
     let _ = fs::remove_file(&local_tmp);
     apply_result?;
-    ssh_with_key(address, key_path, &sudo_wrap("true"), BOOTSTRAP_SSH_USER).map_err(|err| {
-        format!("sudo -n unavailable after sudoers bootstrap: {err}").into()
-    })
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap("/bin/systemctl --version"),
+        BOOTSTRAP_SSH_USER,
+    )
+    .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap: {err}").into())
 }
 
 fn identity_available() -> bool {
