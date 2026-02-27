@@ -163,10 +163,10 @@ Permisos mínimos acordados (S1):
 - [x] Agregar logging de denegaciones en gate script para auditoría.
 
 Nota operativa S3:
-- Default actual: `gate` y `from` habilitados por defecto (sin necesidad de variables de entorno).
+- Default actual: `gate` habilitado por defecto y `from` deshabilitado por defecto (sin necesidad de variables de entorno).
 - Override de emergencia:
   - `ORCH_AUTHKEY_ENFORCE_GATE=0` deshabilita temporalmente `command=/usr/local/bin/fluxbee-ssh-gate.sh`.
-  - `ORCH_AUTHKEY_ENFORCE_FROM=0` deshabilita temporalmente `from=<ips detectadas>`.
+  - `ORCH_AUTHKEY_ENFORCE_FROM=1` habilita `from=<ips detectadas>` cuando la red/IP de salida está estable.
 
 ### Fase S4 - Validación integral previa al corte
 - [ ] E2E completo en worker real:

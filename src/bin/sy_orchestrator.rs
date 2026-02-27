@@ -5135,7 +5135,7 @@ fn add_hive_flow(
             });
         }
 
-        let enforce_from = env_flag_with_default("ORCH_AUTHKEY_ENFORCE_FROM", true);
+        let enforce_from = env_flag_with_default("ORCH_AUTHKEY_ENFORCE_FROM", false);
         let mut source_patterns: Vec<String> = Vec::new();
         if enforce_from {
             match detect_ssh_client_ip_seen_by_worker(address) {
