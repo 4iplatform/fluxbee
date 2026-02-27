@@ -5153,9 +5153,9 @@ fn add_hive_flow(
     for pattern in current_patterns {
         if let Ok(ipv4) = pattern.parse::<std::net::Ipv4Addr>() {
             let octets = ipv4.octets();
-            let cidr24 = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
-            if !source_patterns.iter().any(|value| value == &cidr24) {
-                source_patterns.push(cidr24);
+            let wildcard = format!("{}.{}.{}.*", octets[0], octets[1], octets[2]);
+            if !source_patterns.iter().any(|value| value == &wildcard) {
+                source_patterns.push(wildcard);
             }
         }
     }
@@ -5184,14 +5184,39 @@ fn add_hive_flow(
         &sudo_wrap("/bin/systemctl --version"),
         BOOTSTRAP_SSH_USER,
     ) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SSH_KEY_FAILED",
-            "message": format!(
-                "key access verification failed after authorized_keys restriction (from patterns={:?}): {err}",
-                source_patterns
-            ),
-        });
+        tracing::warn!(
+            target = address,
+            from_patterns = ?source_patterns,
+            error = %err,
+            "restricted authorized_keys verification failed; applying temporary unrestricted fallback"
+        );
+        if let Err(fallback_err) =
+            apply_remote_unrestricted_authorized_key_with_access(address, &key_path, &pub_key)
+        {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_KEY_FAILED",
+                "message": format!(
+                    "key access verification failed after authorized_keys restriction (from patterns={:?}): {}; unrestricted fallback failed: {}",
+                    source_patterns, err, fallback_err
+                ),
+            });
+        }
+        if let Err(recheck_err) = ssh_with_key(
+            address,
+            &key_path,
+            &sudo_wrap("/bin/systemctl --version"),
+            BOOTSTRAP_SSH_USER,
+        ) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_KEY_FAILED",
+                "message": format!(
+                    "key access verification failed after authorized_keys restriction (from patterns={:?}) and after unrestricted fallback: {}",
+                    source_patterns, recheck_err
+                ),
+            });
+        }
     }
 
     if harden_ssh {
@@ -5774,6 +5799,32 @@ printf '%s\\n' {entry} >> ~/.ssh/authorized_keys\n\
 chmod 600 ~/.ssh/authorized_keys\n",
         key_material = shell_single_quote(key_material),
         entry = shell_single_quote(&restricted_entry),
+    );
+    let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
+    ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
+    Ok(())
+}
+
+fn apply_remote_unrestricted_authorized_key_with_access(
+    address: &str,
+    key_path: &Path,
+    pub_key: &str,
+) -> Result<(), OrchestratorError> {
+    let key_material = pub_key
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
+    let script = format!(
+        "set -euo pipefail\n\
+mkdir -p ~/.ssh\n\
+chmod 700 ~/.ssh\n\
+touch ~/.ssh/authorized_keys\n\
+grep -Fv {key_material} ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp || true\n\
+mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys\n\
+printf '%s\\n' {entry} >> ~/.ssh/authorized_keys\n\
+chmod 600 ~/.ssh/authorized_keys\n",
+        key_material = shell_single_quote(key_material),
+        entry = shell_single_quote(pub_key),
     );
     let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
     ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
