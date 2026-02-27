@@ -159,8 +159,13 @@ Permisos mínimos acordados (S1):
   - `from=<ip/cidr motherbee>`
   - `command=/usr/local/bin/fluxbee-ssh-gate.sh`
   - `no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty`
-- [ ] Instalar `fluxbee-ssh-gate.sh` en worker con allowlist de comandos reales usados por orchestrator (ssh/scp/rsync/systemctl/hash/stat/install/etc.).
-- [ ] Agregar logging de denegaciones en gate script para auditoría.
+- [x] Instalar `fluxbee-ssh-gate.sh` en worker con allowlist de comandos reales usados por orchestrator (ssh/scp/rsync/systemctl/hash/stat/install/etc.).
+- [x] Agregar logging de denegaciones en gate script para auditoría.
+
+Nota operativa S3:
+- `ORCH_AUTHKEY_ENFORCE_GATE=1` habilita el uso de `command=/usr/local/bin/fluxbee-ssh-gate.sh`.
+- `ORCH_AUTHKEY_ENFORCE_FROM=1` habilita además `from=<ips detectadas>` (sin wildcard automático).
+- Default actual seguro para migración: gate deshabilitado (evita lockout durante transición).
 
 ### Fase S4 - Validación integral previa al corte
 - [ ] E2E completo en worker real:
@@ -169,6 +174,7 @@ Permisos mínimos acordados (S1):
   - core drift + rollback,
   - vendor drift + rollback,
   - reconciliación watchdog.
+- [ ] Ejecutar runner unificado S4: `scripts/orchestrator_ssh_hardening_s4_e2e.sh`.
 - [ ] Simular fallo parcial y verificar recuperación sin intervención manual.
 - [ ] Confirmar acceso de emergencia documentado (break-glass) antes de corte de password.
 

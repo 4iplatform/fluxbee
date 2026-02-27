@@ -5153,16 +5153,6 @@ fn add_hive_flow(
                     source_patterns.push(ip);
                 }
             }
-            let current_patterns = source_patterns.clone();
-            for pattern in current_patterns {
-                if let Ok(ipv4) = pattern.parse::<std::net::Ipv4Addr>() {
-                    let octets = ipv4.octets();
-                    let wildcard = format!("{}.{}.{}.*", octets[0], octets[1], octets[2]);
-                    if !source_patterns.iter().any(|value| value == &wildcard) {
-                        source_patterns.push(wildcard);
-                    }
-                }
-            }
             if source_patterns.is_empty() {
                 return serde_json::json!({
                     "status": "error",
@@ -5170,6 +5160,11 @@ fn add_hive_flow(
                     "message": "failed to resolve source ip for ssh key restriction",
                 });
             }
+            tracing::info!(
+                target = address,
+                from_patterns = ?source_patterns,
+                "authorized_keys from= restriction enabled"
+            );
         } else {
             tracing::info!(
                 target = address,
@@ -5762,15 +5757,61 @@ if [[ -z "${cmd}" ]]; then
   exit 1
 fi
 
+allow_and_exec() {
+  exec /bin/bash -lc "${cmd}"
+}
+
+deny_cmd() {
+  logger -t fluxbee-ssh-gate "DENIED command from ${SSH_CONNECTION:-unknown}: ${cmd}"
+  exit 1
+}
+
 case "${cmd}" in
-  sudo\ -n\ *|echo\ *\|\ sudo\ -S\ -p\ *|scp\ -t\ *|scp\ -f\ *|rsync\ --server*|rm\ -rf\ *fluxbee-*|mkdir\ -p\ *fluxbee-*)
-    exec /bin/bash -lc "${cmd}"
-    ;;
-  *)
-    logger -t fluxbee-ssh-gate "DENIED command from ${SSH_CONNECTION:-unknown}: ${cmd}"
-    exit 1
+  scp\ -t\ *|scp\ -f\ *|rsync\ --server*)
+    allow_and_exec
     ;;
 esac
+
+if [[ "${cmd}" == sudo\ -n\ * ]]; then
+  subcmd="${cmd#sudo -n }"
+  case "${subcmd}" in
+    /bin/systemctl\ *|/usr/bin/systemctl\ *|systemctl\ *|\
+    /bin/systemd-run\ *|/usr/bin/systemd-run\ *|systemd-run\ *|\
+    /usr/bin/install\ *|install\ *|\
+    /bin/mkdir\ *|mkdir\ *|\
+    /bin/rm\ *|rm\ *|\
+    /bin/cp\ *|cp\ *|\
+    /bin/mv\ *|mv\ *|\
+    /usr/bin/sha256sum\ *|sha256sum\ *|\
+    /usr/bin/stat\ *|stat\ *|\
+    /usr/bin/tee\ *|tee\ *|\
+    /bin/chmod\ *|/usr/bin/chmod\ *|chmod\ *|\
+    /bin/chown\ *|/usr/bin/chown\ *|chown\ *|\
+    /usr/bin/rsync\ *|rsync\ *|\
+    /usr/sbin/ufw\ *|ufw\ *|\
+    /usr/bin/firewall-cmd\ *|firewall-cmd\ *|\
+    /usr/sbin/service\ *|service\ *|\
+    /bin/bash\ -lc\ *|/usr/bin/bash\ -lc\ *|bash\ -lc\ *)
+      allow_and_exec
+      ;;
+    *)
+      deny_cmd
+      ;;
+  esac
+fi
+
+# Transitional bootstrap path while password flow exists.
+if [[ "${cmd}" == echo\ *\|\ sudo\ -S\ -p\ * ]]; then
+  allow_and_exec
+fi
+
+case "${cmd}" in
+  rm\ -rf\ /tmp/fluxbee-*|mkdir\ -p\ /tmp/fluxbee-*)
+    allow_and_exec
+    ;;
+esac
+
+deny_cmd
 "#
 }
 
