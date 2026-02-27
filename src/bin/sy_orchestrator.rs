@@ -5133,19 +5133,35 @@ fn add_hive_flow(
         });
     }
 
-    let source_ip = match detect_source_ip_for_target(address) {
-        Ok(ip) => ip,
+    let mut source_patterns: Vec<String> = Vec::new();
+    match detect_ssh_client_ip_seen_by_worker(address) {
+        Ok(ip) => source_patterns.push(ip),
         Err(err) => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!("failed to resolve source ip for ssh key restriction: {err}"),
-            });
+            tracing::warn!(
+                target = address,
+                error = %err,
+                "failed to detect worker-observed SSH client ip; falling back to local route detection"
+            );
         }
-    };
-    if let Err(err) =
-        apply_remote_restricted_authorized_key_with_access(address, &key_path, &pub_key, &source_ip)
-    {
+    }
+    if let Ok(ip) = detect_source_ip_for_target(address) {
+        if !source_patterns.iter().any(|value| value == &ip) {
+            source_patterns.push(ip);
+        }
+    }
+    if source_patterns.is_empty() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_KEY_FAILED",
+            "message": "failed to resolve source ip for ssh key restriction",
+        });
+    }
+    if let Err(err) = apply_remote_restricted_authorized_key_with_access(
+        address,
+        &key_path,
+        &pub_key,
+        &source_patterns,
+    ) {
         return serde_json::json!({
             "status": "error",
             "error_code": "SSH_KEY_FAILED",
@@ -5718,15 +5734,19 @@ fn apply_remote_restricted_authorized_key_with_access(
     address: &str,
     key_path: &Path,
     pub_key: &str,
-    source_ip: &str,
+    source_patterns: &[String],
 ) -> Result<(), OrchestratorError> {
+    if source_patterns.is_empty() {
+        return Err("missing source patterns for authorized_keys restriction".into());
+    }
     let key_material = pub_key
         .split_whitespace()
         .nth(1)
         .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
+    let from_value = source_patterns.join(",");
     let restricted_entry = format!(
-        "from=\"{source_ip}\",command=\"{gate}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {pub_key}",
-        source_ip = source_ip,
+        "from=\"{from_value}\",command=\"{gate}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {pub_key}",
+        from_value = from_value,
         gate = ORCH_SSH_GATE_PATH,
         pub_key = pub_key
     );
@@ -5857,6 +5877,34 @@ fn ssh_with_pass(address: &str, command: &str, user: &str) -> Result<(), Orchest
         .env("SSH_ASKPASS_REQUIRE", "force")
         .env("DISPLAY", "jsr");
     let result = run_cmd(cmd, "ssh");
+    let _ = fs::remove_file(&askpass);
+    result
+}
+
+fn ssh_with_pass_output(
+    address: &str,
+    command: &str,
+    user: &str,
+) -> Result<String, OrchestratorError> {
+    let askpass = askpass_script(BOOTSTRAP_SSH_PASS)?;
+    let mut cmd = Command::new("setsid");
+    cmd.arg("ssh")
+        .arg("-o")
+        .arg("PreferredAuthentications=password")
+        .arg("-o")
+        .arg("PubkeyAuthentication=no")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(format!("{user}@{address}"))
+        .arg(command)
+        .env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", "jsr");
+    let result = run_cmd_output(cmd, "ssh");
     let _ = fs::remove_file(&askpass);
     result
 }
@@ -6058,6 +6106,24 @@ fn parse_host_port(listen: &str) -> Result<(String, u16), OrchestratorError> {
         return Ok((host.trim().to_string(), port));
     }
     Ok((listen.to_string(), 9000))
+}
+
+fn detect_ssh_client_ip_seen_by_worker(address: &str) -> Result<String, OrchestratorError> {
+    let out = ssh_with_pass_output(
+        address,
+        r#"bash -lc 'printf "%s\n" "${SSH_CONNECTION:-}"'"#,
+        BOOTSTRAP_SSH_USER,
+    )?;
+    let candidate = out
+        .split_whitespace()
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "worker did not report SSH_CONNECTION".to_string())?;
+    candidate
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| format!("worker reported invalid SSH client ip '{candidate}'"))?;
+    Ok(candidate.to_string())
 }
 
 fn detect_source_ip_for_target(target: &str) -> Result<String, OrchestratorError> {
