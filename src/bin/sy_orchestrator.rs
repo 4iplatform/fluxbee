@@ -5125,115 +5125,123 @@ fn add_hive_flow(
         });
     }
 
-    if let Err(err) = install_remote_ssh_gate_with_access(address, &key_path) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SSH_KEY_FAILED",
-            "message": format!("failed to install remote ssh gate: {err}"),
-        });
-    }
-
-    let enforce_from = env_flag_enabled("ORCH_AUTHKEY_ENFORCE_FROM");
-    let mut source_patterns: Vec<String> = Vec::new();
-    if enforce_from {
-        match detect_ssh_client_ip_seen_by_worker(address) {
-            Ok(ip) => source_patterns.push(ip),
-            Err(err) => {
-                tracing::warn!(
-                    target = address,
-                    error = %err,
-                    "failed to detect worker-observed SSH client ip; falling back to local route detection"
-                );
-            }
-        }
-        if let Ok(ip) = detect_source_ip_for_target(address) {
-            if !source_patterns.iter().any(|value| value == &ip) {
-                source_patterns.push(ip);
-            }
-        }
-        let current_patterns = source_patterns.clone();
-        for pattern in current_patterns {
-            if let Ok(ipv4) = pattern.parse::<std::net::Ipv4Addr>() {
-                let octets = ipv4.octets();
-                let wildcard = format!("{}.{}.{}.*", octets[0], octets[1], octets[2]);
-                if !source_patterns.iter().any(|value| value == &wildcard) {
-                    source_patterns.push(wildcard);
-                }
-            }
-        }
-        if source_patterns.is_empty() {
+    let enforce_gate = env_flag_enabled("ORCH_AUTHKEY_ENFORCE_GATE");
+    if enforce_gate {
+        if let Err(err) = install_remote_ssh_gate_with_access(address, &key_path) {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SSH_KEY_FAILED",
-                "message": "failed to resolve source ip for ssh key restriction",
+                "message": format!("failed to install remote ssh gate: {err}"),
             });
         }
-    } else {
-        tracing::info!(
-            target = address,
-            "authorized_keys from= restriction disabled (set ORCH_AUTHKEY_ENFORCE_FROM=1 to enable)"
-        );
-    }
-    if let Err(err) = apply_remote_restricted_authorized_key_with_access(
-        address,
-        &key_path,
-        &pub_key,
-        &source_patterns,
-    ) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SSH_KEY_FAILED",
-            "message": format!("failed to restrict remote authorized_keys entry: {err}"),
-        });
-    }
-    if let Err(err) = ssh_with_key(
-        address,
-        &key_path,
-        &sudo_wrap("/bin/systemctl --version"),
-        BOOTSTRAP_SSH_USER,
-    ) {
-        tracing::warn!(
-            target = address,
-            from_patterns = ?source_patterns,
-            error = %err,
-            "restricted authorized_keys verification failed; applying temporary unrestricted fallback"
-        );
-        if let Err(fallback_err) =
-            apply_remote_unrestricted_authorized_key_with_access(address, &key_path, &pub_key)
-        {
-            tracing::warn!(
-                target = address,
-                error = %fallback_err,
-                "unrestricted fallback via key failed; retrying via password bootstrap channel"
-            );
-            if let Err(pass_fallback_err) =
-                apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key)
-            {
+
+        let enforce_from = env_flag_enabled("ORCH_AUTHKEY_ENFORCE_FROM");
+        let mut source_patterns: Vec<String> = Vec::new();
+        if enforce_from {
+            match detect_ssh_client_ip_seen_by_worker(address) {
+                Ok(ip) => source_patterns.push(ip),
+                Err(err) => {
+                    tracing::warn!(
+                        target = address,
+                        error = %err,
+                        "failed to detect worker-observed SSH client ip; falling back to local route detection"
+                    );
+                }
+            }
+            if let Ok(ip) = detect_source_ip_for_target(address) {
+                if !source_patterns.iter().any(|value| value == &ip) {
+                    source_patterns.push(ip);
+                }
+            }
+            let current_patterns = source_patterns.clone();
+            for pattern in current_patterns {
+                if let Ok(ipv4) = pattern.parse::<std::net::Ipv4Addr>() {
+                    let octets = ipv4.octets();
+                    let wildcard = format!("{}.{}.{}.*", octets[0], octets[1], octets[2]);
+                    if !source_patterns.iter().any(|value| value == &wildcard) {
+                        source_patterns.push(wildcard);
+                    }
+                }
+            }
+            if source_patterns.is_empty() {
                 return serde_json::json!({
                     "status": "error",
                     "error_code": "SSH_KEY_FAILED",
-                    "message": format!(
-                        "key access verification failed after authorized_keys restriction (from patterns={:?}): {}; unrestricted fallback failed: {}; password fallback failed: {}",
-                        source_patterns, err, fallback_err, pass_fallback_err
-                    ),
+                    "message": "failed to resolve source ip for ssh key restriction",
                 });
             }
+        } else {
+            tracing::info!(
+                target = address,
+                "authorized_keys from= restriction disabled (set ORCH_AUTHKEY_ENFORCE_FROM=1 to enable)"
+            );
         }
-        if let Err(recheck_err) = ssh_with_key(
+        if let Err(err) = apply_remote_restricted_authorized_key_with_access(
+            address,
+            &key_path,
+            &pub_key,
+            &source_patterns,
+        ) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_KEY_FAILED",
+                "message": format!("failed to restrict remote authorized_keys entry: {err}"),
+            });
+        }
+        if let Err(err) = ssh_with_key(
             address,
             &key_path,
             &sudo_wrap("/bin/systemctl --version"),
             BOOTSTRAP_SSH_USER,
         ) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!(
-                    "key access verification failed after authorized_keys restriction (from patterns={:?}) and after unrestricted fallback: {}",
-                    source_patterns, recheck_err
-                ),
-            });
+            tracing::warn!(
+                target = address,
+                from_patterns = ?source_patterns,
+                error = %err,
+                "restricted authorized_keys verification failed; applying temporary unrestricted fallback"
+            );
+            if let Err(fallback_err) =
+                apply_remote_unrestricted_authorized_key_with_access(address, &key_path, &pub_key)
+            {
+                tracing::warn!(
+                    target = address,
+                    error = %fallback_err,
+                    "unrestricted fallback via key failed; retrying via password bootstrap channel"
+                );
+                if let Err(pass_fallback_err) =
+                    apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key)
+                {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "SSH_KEY_FAILED",
+                        "message": format!(
+                            "key access verification failed after authorized_keys restriction (from patterns={:?}): {}; unrestricted fallback failed: {}; password fallback failed: {}",
+                            source_patterns, err, fallback_err, pass_fallback_err
+                        ),
+                    });
+                }
+            }
+            if let Err(recheck_err) = ssh_with_key(
+                address,
+                &key_path,
+                &sudo_wrap("/bin/systemctl --version"),
+                BOOTSTRAP_SSH_USER,
+            ) {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "SSH_KEY_FAILED",
+                    "message": format!(
+                        "key access verification failed after authorized_keys restriction (from patterns={:?}) and after unrestricted fallback: {}",
+                        source_patterns, recheck_err
+                    ),
+                });
+            }
         }
+    } else {
+        tracing::info!(
+            target = address,
+            "authorized_keys gate restriction disabled (set ORCH_AUTHKEY_ENFORCE_GATE=1 to enable)"
+        );
     }
 
     if harden_ssh {
