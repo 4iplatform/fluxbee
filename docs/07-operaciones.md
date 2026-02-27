@@ -201,42 +201,14 @@ Objetivo:
 
 Precondiciones:
 - Acceso administrativo a motherbee (host donde corre `SY.orchestrator`).
-- Acceso out-of-band al worker (consola/hipervisor) para el peor caso.
+- Acceso out-of-band al worker (consola/hipervisor).
 
-Escenario A: hay key, pero la restricción bloquea operaciones
-1. Desactivar temporalmente restricciones en motherbee:
-```bash
-sudo mkdir -p /etc/systemd/system/sy-orchestrator.service.d
-cat <<'EOF' | sudo tee /etc/systemd/system/sy-orchestrator.service.d/90-break-glass.conf
-[Service]
-Environment=ORCH_AUTHKEY_ENFORCE_GATE=0
-Environment=ORCH_AUTHKEY_ENFORCE_FROM=0
-EOF
-sudo systemctl daemon-reload
-sudo systemctl restart sy-orchestrator
-```
-2. Rebootstrap del worker (reinstala `authorized_keys`/sudoers):
-```bash
-BASE="http://127.0.0.1:8080"
-HIVE_ID="worker-220"
-HIVE_ADDR="192.168.8.220"
-curl -sS -X DELETE "$BASE/hives/$HIVE_ID"; echo
-curl -sS -X POST "$BASE/hives" -H "Content-Type: application/json" \
-  -d "{\"hive_id\":\"$HIVE_ID\",\"address\":\"$HIVE_ADDR\"}"; echo
-```
-3. Volver a modo seguro por defecto:
-```bash
-sudo rm -f /etc/systemd/system/sy-orchestrator.service.d/90-break-glass.conf
-sudo systemctl daemon-reload
-sudo systemctl restart sy-orchestrator
-```
+Política:
+- El modo break-glass **no** usa toggles de entorno en `SY.orchestrator`.
+- La recuperación se hace desde consola del worker y luego reconciliación por API.
 
-Escenario B (pre-S5): key caída y password aún habilitado
-- Usar login por password solo para recuperación inicial, luego repetir Escenario A.
-- No dejar password en scripts/historial; rotar secreto tras recuperación.
-
-Escenario C (post-S5): key caída y password deshabilitado
-- Recuperar por consola out-of-band y reinstalar manualmente la key pública de motherbee:
+Escenario A (pre-S5): password aún habilitado
+1. Desde consola del worker, agregar temporalmente la pública de motherbee en `authorized_keys` (entrada sin restricciones) para recuperar acceso:
 ```bash
 sudo install -d -m 700 -o administrator -g administrator /home/administrator/.ssh
 sudo sh -lc 'cat >> /home/administrator/.ssh/authorized_keys' <<'EOF'
@@ -245,7 +217,28 @@ EOF
 sudo chown administrator:administrator /home/administrator/.ssh/authorized_keys
 sudo chmod 600 /home/administrator/.ssh/authorized_keys
 ```
-- Luego ejecutar `DELETE/POST /hives/{id}` desde motherbee para reconciliar estado.
+2. Desde motherbee, reconciliar worker:
+```bash
+BASE="http://127.0.0.1:8080"
+HIVE_ID="worker-220"
+HIVE_ADDR="192.168.8.220"
+curl -sS -X DELETE "$BASE/hives/$HIVE_ID"; echo
+curl -sS -X POST "$BASE/hives" -H "Content-Type: application/json" \
+  -d "{\"hive_id\":\"$HIVE_ID\",\"address\":\"$HIVE_ADDR\"}"; echo
+```
+3. Desde consola del worker, remover la entrada temporal no restringida y rotar password si fue utilizado.
+
+Escenario B (post-S5): key caída y password deshabilitado
+1. Recuperar por consola out-of-band y reinstalar la pública de motherbee:
+```bash
+sudo install -d -m 700 -o administrator -g administrator /home/administrator/.ssh
+sudo sh -lc 'cat >> /home/administrator/.ssh/authorized_keys' <<'EOF'
+<MOTHERBEE_PUBLIC_KEY_LINE>
+EOF
+sudo chown administrator:administrator /home/administrator/.ssh/authorized_keys
+sudo chmod 600 /home/administrator/.ssh/authorized_keys
+```
+2. Ejecutar `DELETE/POST /hives/{id}` desde motherbee para reconciliar estado y restaurar configuración restringida.
 
 Evidencia mínima de recuperación:
 - `GET /hives/<id>` responde `status=ok`.
