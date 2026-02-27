@@ -43,6 +43,7 @@ KEY_PATH="/var/lib/fluxbee/hives/${HIVE_ID}/ssh.key"
 VENDOR_MANIFEST="/var/lib/fluxbee/vendor/manifest.json"
 LEGACY_VENDOR_BIN="/var/lib/fluxbee/vendor/syncthing/syncthing"
 REMOTE_VENDOR_BIN="${REMOTE_VENDOR_BIN:-/var/lib/fluxbee/vendor/bin/syncthing}"
+REMOTE_VENDOR_BACKUP="${REMOTE_VENDOR_BACKUP:-/var/lib/fluxbee/vendor/bin/syncthing.prev}"
 REMOTE_SYNCTHING_SERVICE="fluxbee-syncthing"
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
@@ -411,6 +412,9 @@ if ! remote_syncthing_service_active; then
   exit 1
 fi
 echo "Baseline hashes: local=$baseline_local_hash remote=$baseline_remote_hash"
+
+# Ensure rollback source exists before inducing failure, so rollback path is deterministic.
+remote_root "mkdir -p \"$(dirname "$REMOTE_VENDOR_BACKUP")\" && install -m 0755 '${REMOTE_VENDOR_BIN}' '${REMOTE_VENDOR_BACKUP}'"
 
 echo "Step 2/6: corrupt local vendor source + manifest (forced bad artifact)"
 vendor_path="$(local_vendor_path)"
