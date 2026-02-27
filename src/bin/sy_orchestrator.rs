@@ -5061,26 +5061,28 @@ fn add_hive_flow(
     }
 
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
-    let key_pub = PathBuf::from(format!("{}.pub", MOTHERBEE_SSH_KEY_PATH));
-    if !key_path.exists() || !key_pub.exists() {
+    if !key_path.exists() {
         return serde_json::json!({
             "status": "error",
             "error_code": "SSH_KEY_FAILED",
             "message": format!(
-                "motherbee ssh key missing (expected '{}' and '{}'); run scripts/install.sh",
-                key_path.display(),
-                key_pub.display()
+                "motherbee ssh key missing (expected '{}'); run scripts/install.sh",
+                key_path.display()
             ),
         });
     }
 
-    let pub_key = match fs::read_to_string(&key_pub) {
-        Ok(data) => data.trim().to_string(),
+    let pub_key = match public_key_from_private_key(&key_path) {
+        Ok(data) => data,
         Err(err) => {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SSH_KEY_FAILED",
-                "message": err.to_string(),
+                "message": format!(
+                    "failed to derive public key from '{}': {}",
+                    key_path.display(),
+                    err
+                ),
             })
         }
     };
@@ -6063,6 +6065,17 @@ fn scp_with_key(
     }
     cmd.arg(format!("{user}@{address}:{dest}"));
     run_cmd(cmd, "scp")
+}
+
+fn public_key_from_private_key(key_path: &Path) -> Result<String, OrchestratorError> {
+    let mut cmd = Command::new("ssh-keygen");
+    cmd.arg("-y").arg("-f").arg(key_path);
+    let out = run_cmd_output(cmd, "ssh-keygen -y")?;
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return Err("derived empty public key".into());
+    }
+    Ok(trimmed.to_string())
 }
 
 fn write_remote_file(
