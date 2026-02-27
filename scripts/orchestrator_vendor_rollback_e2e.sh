@@ -39,7 +39,9 @@ VENDOR_COMPONENT_NAME="${VENDOR_COMPONENT_NAME:-syncthing}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INFO_FILE="/var/lib/fluxbee/hives/${HIVE_ID}/info.yaml"
-KEY_PATH="/var/lib/fluxbee/hives/${HIVE_ID}/ssh.key"
+LEGACY_KEY_PATH="/var/lib/fluxbee/hives/${HIVE_ID}/ssh.key"
+MOTHERBEE_KEY_PATH="/var/lib/fluxbee/ssh/motherbee.key"
+KEY_PATH=""
 VENDOR_MANIFEST="/var/lib/fluxbee/vendor/manifest.json"
 LEGACY_VENDOR_BIN="/var/lib/fluxbee/vendor/syncthing/syncthing"
 REMOTE_VENDOR_BIN="${REMOTE_VENDOR_BIN:-/var/lib/fluxbee/vendor/bin/syncthing}"
@@ -366,8 +368,12 @@ if [[ -z "$HIVE_ADDR" ]]; then
   echo "FAIL: cannot resolve HIVE_ADDR (set HIVE_ADDR or ensure $INFO_FILE exists)" >&2
   exit 1
 fi
-if [[ ! -f "$KEY_PATH" ]]; then
-  echo "FAIL: missing key file $KEY_PATH" >&2
+if [[ -f "$LEGACY_KEY_PATH" ]]; then
+  KEY_PATH="$LEGACY_KEY_PATH"
+elif [[ -f "$MOTHERBEE_KEY_PATH" ]]; then
+  KEY_PATH="$MOTHERBEE_KEY_PATH"
+else
+  echo "FAIL: missing ssh key file (checked $LEGACY_KEY_PATH and $MOTHERBEE_KEY_PATH)" >&2
   exit 1
 fi
 USE_SUDO_SSH=0

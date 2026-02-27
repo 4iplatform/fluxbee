@@ -151,11 +151,11 @@ Permisos mínimos acordados (S1):
 ### Fase S2 - Privilegios remotos sin password (manteniendo password habilitado)
 - [x] Reemplazar en orchestrator el uso de `sudo -S` por `sudo -n` para comandos remotos.
 - [x] Definir/instalar `sudoers` mínimo en worker (NOPASSWD, allowlist de comandos Fluxbee necesarios).
-- [ ] Validar por E2E que `add_hive`, sync runtime/core/vendor, restart, rollback y health-check operen solo con `sudo -n`.
+- [x] Validar por E2E que `add_hive`, sync runtime/core/vendor, restart, rollback y health-check operen solo con `sudo -n`.
 
 ### Fase S3 - Key central + authorized_keys restringido
-- [ ] Cambiar `add_hive` para usar la key de motherbee (sin generar key nueva por worker).
-- [ ] En worker, registrar pública con restricciones:
+- [x] Cambiar `add_hive` para usar la key de motherbee (sin generar key nueva por worker).
+- [x] En worker, registrar pública con restricciones:
   - `from=<ip/cidr motherbee>`
   - `command=/usr/local/bin/fluxbee-ssh-gate.sh`
   - `no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty`

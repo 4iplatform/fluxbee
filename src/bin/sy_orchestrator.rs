@@ -26,6 +26,7 @@ const BOOTSTRAP_SSH_USER: &str = "administrator";
 const BOOTSTRAP_SSH_PASS: &str = "magicAI";
 const MOTHERBEE_SSH_KEY_PATH: &str = "/var/lib/fluxbee/ssh/motherbee.key";
 const ORCH_SUDOERS_PATH: &str = "/etc/sudoers.d/fluxbee-orchestrator";
+const ORCH_SSH_GATE_PATH: &str = "/usr/local/bin/fluxbee-ssh-gate.sh";
 const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
 const RUNTIME_MANIFEST_FILE: &str = "runtime-manifest.json";
 const RUNTIME_MANIFEST_SCHEMA_VERSION: u64 = 1;
@@ -5059,31 +5060,17 @@ fn add_hive_flow(
         });
     }
 
-    let key_path = hive_dir.join("ssh.key");
-    let key_pub = hive_dir.join("ssh.key.pub");
-    let mut keygen = Command::new("ssh-keygen");
-    keygen
-        .arg("-t")
-        .arg("ed25519")
-        .arg("-N")
-        .arg("")
-        .arg("-f")
-        .arg(&key_path);
-    if let Err(err) = run_cmd(keygen, "ssh-keygen") {
+    let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
+    let key_pub = PathBuf::from(format!("{}.pub", MOTHERBEE_SSH_KEY_PATH));
+    if !key_path.exists() || !key_pub.exists() {
         return serde_json::json!({
             "status": "error",
             "error_code": "SSH_KEY_FAILED",
-            "message": err.to_string(),
-        });
-    }
-
-    let mut chmod = Command::new("chmod");
-    chmod.arg("600").arg(&key_path);
-    if let Err(err) = run_cmd(chmod, "chmod") {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SSH_KEY_FAILED",
-            "message": err.to_string(),
+            "message": format!(
+                "motherbee ssh key missing (expected '{}' and '{}'); run scripts/install.sh",
+                key_path.display(),
+                key_pub.display()
+            ),
         });
     }
 
@@ -5135,6 +5122,46 @@ fn add_hive_flow(
             "status": "error",
             "error_code": "SUDO_SETUP_FAILED",
             "message": err.to_string(),
+        });
+    }
+
+    if let Err(err) = install_remote_ssh_gate_with_access(address, &key_path) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_KEY_FAILED",
+            "message": format!("failed to install remote ssh gate: {err}"),
+        });
+    }
+
+    let source_ip = match detect_source_ip_for_target(address) {
+        Ok(ip) => ip,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_KEY_FAILED",
+                "message": format!("failed to resolve source ip for ssh key restriction: {err}"),
+            });
+        }
+    };
+    if let Err(err) =
+        apply_remote_restricted_authorized_key_with_access(address, &key_path, &pub_key, &source_ip)
+    {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_KEY_FAILED",
+            "message": format!("failed to restrict remote authorized_keys entry: {err}"),
+        });
+    }
+    if let Err(err) = ssh_with_key(
+        address,
+        &key_path,
+        &sudo_wrap("/bin/systemctl --version"),
+        BOOTSTRAP_SSH_USER,
+    ) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_KEY_FAILED",
+            "message": format!("key access verification failed after authorized_keys restriction: {err}"),
         });
     }
 
@@ -5643,6 +5670,80 @@ fn disable_remote_password_auth(address: &str) -> Result<(), OrchestratorError> 
 
     let restart_ssh_cmd = r#"bash -lc "systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart""#;
     ssh_with_pass(address, &sudo_wrap(restart_ssh_cmd), BOOTSTRAP_SSH_USER)?;
+    Ok(())
+}
+
+fn remote_ssh_gate_script_contents() -> &'static str {
+    r#"#!/bin/bash
+set -euo pipefail
+
+cmd="${SSH_ORIGINAL_COMMAND:-}"
+if [[ -z "${cmd}" ]]; then
+  logger -t fluxbee-ssh-gate "DENIED empty command from ${SSH_CONNECTION:-unknown}"
+  exit 1
+fi
+
+case "${cmd}" in
+  sudo\ -n\ *|echo\ *\|\ sudo\ -S\ -p\ *|scp\ -t\ *|scp\ -f\ *|rsync\ --server*|rm\ -rf\ *fluxbee-*|mkdir\ -p\ *fluxbee-*)
+    exec /bin/bash -lc "${cmd}"
+    ;;
+  *)
+    logger -t fluxbee-ssh-gate "DENIED command from ${SSH_CONNECTION:-unknown}: ${cmd}"
+    exit 1
+    ;;
+esac
+"#
+}
+
+fn install_remote_ssh_gate_with_access(
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    write_remote_file(
+        address,
+        key_path,
+        ORCH_SSH_GATE_PATH,
+        remote_ssh_gate_script_contents(),
+    )?;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("chmod 0755 {}", shell_single_quote(ORCH_SSH_GATE_PATH))),
+        BOOTSTRAP_SSH_USER,
+    )?;
+    Ok(())
+}
+
+fn apply_remote_restricted_authorized_key_with_access(
+    address: &str,
+    key_path: &Path,
+    pub_key: &str,
+    source_ip: &str,
+) -> Result<(), OrchestratorError> {
+    let key_material = pub_key
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
+    let restricted_entry = format!(
+        "from=\"{source_ip}\",command=\"{gate}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {pub_key}",
+        source_ip = source_ip,
+        gate = ORCH_SSH_GATE_PATH,
+        pub_key = pub_key
+    );
+    let script = format!(
+        "set -euo pipefail\n\
+mkdir -p ~/.ssh\n\
+chmod 700 ~/.ssh\n\
+touch ~/.ssh/authorized_keys\n\
+grep -Fv {key_material} ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp || true\n\
+mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys\n\
+printf '%s\\n' {entry} >> ~/.ssh/authorized_keys\n\
+chmod 600 ~/.ssh/authorized_keys\n",
+        key_material = shell_single_quote(key_material),
+        entry = shell_single_quote(&restricted_entry),
+    );
+    let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
+    ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
     Ok(())
 }
 
