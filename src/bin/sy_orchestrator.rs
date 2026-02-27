@@ -5648,7 +5648,7 @@ fn disable_remote_password_auth(address: &str) -> Result<(), OrchestratorError> 
 
 fn remote_orchestrator_sudoers_contents() -> String {
     format!(
-        "Defaults:{} !requiretty\n{} ALL=(root) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /usr/bin/install, /bin/mkdir, /bin/rm, /bin/cp, /bin/mv, /usr/bin/sha256sum, /usr/bin/stat, /usr/bin/tee, /bin/chmod, /usr/bin/chmod, /bin/chown, /usr/bin/chown, /usr/bin/rsync, /usr/sbin/ufw, /usr/bin/firewall-cmd, /usr/sbin/service, /bin/bash, /usr/bin/bash\n",
+        "Defaults:{} !requiretty\n{} ALL=(root) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /bin/systemd-run, /usr/bin/systemd-run, /usr/bin/install, /bin/mkdir, /bin/rm, /bin/cp, /bin/mv, /usr/bin/sha256sum, /usr/bin/stat, /usr/bin/tee, /bin/chmod, /usr/bin/chmod, /bin/chown, /usr/bin/chown, /usr/bin/rsync, /usr/sbin/ufw, /usr/bin/firewall-cmd, /usr/sbin/service, /bin/bash, /usr/bin/bash\n",
         BOOTSTRAP_SSH_USER, BOOTSTRAP_SSH_USER
     )
 }
@@ -5657,14 +5657,21 @@ fn ensure_remote_orchestrator_sudoers_with_access(
     address: &str,
     key_path: &Path,
 ) -> Result<(), OrchestratorError> {
-    if ssh_with_key(
+    let systemctl_ready = ssh_with_key(
         address,
         key_path,
         &sudo_wrap("/bin/systemctl --version"),
         BOOTSTRAP_SSH_USER,
     )
-    .is_ok()
-    {
+    .is_ok();
+    let systemd_run_ready = ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap("systemd-run --version"),
+        BOOTSTRAP_SSH_USER,
+    )
+    .is_ok();
+    if systemctl_ready && systemd_run_ready {
         return Ok(());
     }
 
@@ -5700,7 +5707,15 @@ fn ensure_remote_orchestrator_sudoers_with_access(
         &sudo_wrap("/bin/systemctl --version"),
         BOOTSTRAP_SSH_USER,
     )
-    .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap: {err}").into())
+    .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (systemctl): {err}"))?;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap("systemd-run --version"),
+        BOOTSTRAP_SSH_USER,
+    )
+    .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (systemd-run): {err}"))?;
+    Ok(())
 }
 
 fn identity_available() -> bool {
