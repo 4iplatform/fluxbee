@@ -64,34 +64,29 @@ fi
 echo "Installing binaries to /usr/bin from $BIN_DIR..."
 
 pick_bin() {
-  local primary="$1"
-  local fallback="$2"
-  if [[ -f "$BIN_DIR/$primary" ]]; then
-    echo "$BIN_DIR/$primary"
-    return 0
-  fi
-  if [[ -n "$fallback" && -f "$BIN_DIR/$fallback" ]]; then
-    echo "$BIN_DIR/$fallback"
+  local name="$1"
+  if [[ -f "$BIN_DIR/$name" ]]; then
+    echo "$BIN_DIR/$name"
     return 0
   fi
   return 1
 }
 
 missing=0
-json_router_bin="$(pick_bin json-router "")" || { echo "Missing binary: $BIN_DIR/json-router" >&2; missing=1; }
-sy_admin_bin="$(pick_bin sy-admin sy_admin)" || { echo "Missing binary: $BIN_DIR/sy-admin or $BIN_DIR/sy_admin" >&2; missing=1; }
-sy_config_bin="$(pick_bin sy-config-routes sy_config_routes)" || { echo "Missing binary: $BIN_DIR/sy-config-routes or $BIN_DIR/sy_config_routes" >&2; missing=1; }
-sy_orch_bin="$(pick_bin sy-orchestrator sy_orchestrator)" || { echo "Missing binary: $BIN_DIR/sy-orchestrator or $BIN_DIR/sy_orchestrator" >&2; missing=1; }
-sy_storage_bin="$(pick_bin sy-storage sy_storage)" || { echo "Missing binary: $BIN_DIR/sy-storage or $BIN_DIR/sy_storage" >&2; missing=1; }
-sy_identity_bin="$(pick_bin sy-identity sy_identity || true)"
+json_router_bin="$(pick_bin json-router)" || { echo "Missing binary: $BIN_DIR/json-router" >&2; missing=1; }
+sy_admin_bin="$(pick_bin sy_admin)" || { echo "Missing binary: $BIN_DIR/sy_admin" >&2; missing=1; }
+sy_config_bin="$(pick_bin sy_config_routes)" || { echo "Missing binary: $BIN_DIR/sy_config_routes" >&2; missing=1; }
+sy_orch_bin="$(pick_bin sy_orchestrator)" || { echo "Missing binary: $BIN_DIR/sy_orchestrator" >&2; missing=1; }
+sy_storage_bin="$(pick_bin sy_storage)" || { echo "Missing binary: $BIN_DIR/sy_storage" >&2; missing=1; }
+sy_identity_bin="$(pick_bin sy_identity || true)"
 sy_opa_rules_bin=""
 if [[ -f "$ROOT_DIR/sy-opa-rules/sy-opa-rules" ]]; then
   sy_opa_rules_bin="$ROOT_DIR/sy-opa-rules/sy-opa-rules"
-elif sy_opa_rules_bin="$(pick_bin sy-opa-rules sy_opa_rules || true)"; then
+elif sy_opa_rules_bin="$(pick_bin sy_opa_rules || true)"; then
   :
 fi
 if [[ -z "${sy_opa_rules_bin:-}" ]]; then
-  echo "Missing binary: $ROOT_DIR/sy-opa-rules/sy-opa-rules or $BIN_DIR/sy-opa-rules or $BIN_DIR/sy_opa_rules" >&2
+  echo "Missing binary: $ROOT_DIR/sy-opa-rules/sy-opa-rules or $BIN_DIR/sy_opa_rules" >&2
   missing=1
 fi
 
