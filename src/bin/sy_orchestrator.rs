@@ -5149,6 +5149,16 @@ fn add_hive_flow(
             source_patterns.push(ip);
         }
     }
+    let current_patterns = source_patterns.clone();
+    for pattern in current_patterns {
+        if let Ok(ipv4) = pattern.parse::<std::net::Ipv4Addr>() {
+            let octets = ipv4.octets();
+            let cidr24 = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
+            if !source_patterns.iter().any(|value| value == &cidr24) {
+                source_patterns.push(cidr24);
+            }
+        }
+    }
     if source_patterns.is_empty() {
         return serde_json::json!({
             "status": "error",
@@ -5177,7 +5187,10 @@ fn add_hive_flow(
         return serde_json::json!({
             "status": "error",
             "error_code": "SSH_KEY_FAILED",
-            "message": format!("key access verification failed after authorized_keys restriction: {err}"),
+            "message": format!(
+                "key access verification failed after authorized_keys restriction (from patterns={:?}): {err}",
+                source_patterns
+            ),
         });
     }
 
