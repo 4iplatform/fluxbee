@@ -53,12 +53,7 @@ sudo install -d "$RUN_DIR/routers"
 
 BIN_DIR="${BIN_DIR:-$ROOT_DIR/target/release}"
 if [[ "${SKIP_BUILD:-}" == "1" ]]; then
-  for candidate in "$ROOT_DIR/target/release" "$ROOT_DIR/target/debug" "$ROOT_DIR/bin" "$ROOT_DIR/dist"; do
-    if [[ -d "$candidate" ]]; then
-      BIN_DIR="$candidate"
-      break
-    fi
-  done
+  echo "SKIP_BUILD=1: installing only binaries from $BIN_DIR" >&2
 fi
 
 echo "Installing binaries to /usr/bin from $BIN_DIR..."

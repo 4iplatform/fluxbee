@@ -4542,12 +4542,19 @@ fn remote_service_exists(
     key_path: &Path,
     service: &str,
 ) -> Result<bool, OrchestratorError> {
+    let service_unit = if service.ends_with(".service") {
+        service.to_string()
+    } else {
+        format!("{service}.service")
+    };
+    let service_q = shell_single_quote(&service_unit);
     let cmd = format!(
-        "bash -lc \"state=$(systemctl show '{}.service' --property=LoadState --value 2>/dev/null || true); [ \\\"$state\\\" != \\\"\\\" ] && [ \\\"$state\\\" != \\\"not-found\\\" ] && echo 1 || echo 0\"",
-        service
+        "systemctl show '{service}' --property=LoadState --value 2>/dev/null || true",
+        service = service_q
     );
     let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
-    Ok(out.trim() == "1")
+    let state = out.trim();
+    Ok(!state.is_empty() && state != "not-found")
 }
 
 fn remote_wait_service_active(
@@ -4556,18 +4563,58 @@ fn remote_wait_service_active(
     service: &str,
     timeout_secs: u64,
 ) -> Result<(), OrchestratorError> {
-    let script = format!(
-        "i=0; while [ \"$i\" -lt {} ]; do systemctl is-active --quiet {} && exit 0; i=$((i+1)); sleep 1; done; exit 1",
-        timeout_secs, service
+    let service_unit = if service.ends_with(".service") {
+        service.to_string()
+    } else {
+        format!("{service}.service")
+    };
+    let service_q = shell_single_quote(&service_unit);
+    let is_active_cmd = format!("systemctl is-active --quiet '{service}'", service = service_q);
+    let substate_cmd = format!(
+        "systemctl show '{service}' --property=SubState --value 2>/dev/null || true",
+        service = service_q
     );
-    let wrapped = format!("bash -lc '{}'", shell_single_quote(&script));
-    ssh_with_key(address, key_path, &sudo_wrap(&wrapped), BOOTSTRAP_SSH_USER).map_err(|err| {
-        format!(
-            "service '{}' did not become active in {}s: {}",
-            service, timeout_secs, err
-        )
-        .into()
-    })
+
+    let mut stable = 0_u8;
+    let mut last_err: Option<String> = None;
+    for _ in 0..timeout_secs {
+        match ssh_with_key(
+            address,
+            key_path,
+            &sudo_wrap(&is_active_cmd),
+            BOOTSTRAP_SSH_USER,
+        ) {
+            Ok(()) => {
+                let substate = ssh_with_key_output(
+                    address,
+                    key_path,
+                    &sudo_wrap(&substate_cmd),
+                    BOOTSTRAP_SSH_USER,
+                )
+                .unwrap_or_default();
+                if substate.trim() == "running" {
+                    stable = stable.saturating_add(1);
+                    if stable >= 3 {
+                        return Ok(());
+                    }
+                } else {
+                    stable = 0;
+                }
+            }
+            Err(err) => {
+                stable = 0;
+                last_err = Some(err.to_string());
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    let detail = last_err.unwrap_or_else(|| "timed out waiting for active/running".to_string());
+    Err(format!(
+        "service '{}' did not become active in {}s: {}",
+        service, timeout_secs, detail
+    )
+    .into())
 }
 
 fn restart_remote_core_services_with_health_gate(
