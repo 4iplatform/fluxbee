@@ -5087,35 +5087,12 @@ fn add_hive_flow(
         }
     };
 
-    if let Err(err) = ssh_with_pass(
-        address,
-        "mkdir -p ~/.ssh && chmod 700 ~/.ssh",
-        BOOTSTRAP_SSH_USER,
-    ) {
-        return ssh_bootstrap_error_payload(&err.to_string());
-    }
-
-    let escaped = pub_key.replace('\'', "'\"'\"'");
-    let append_cmd = format!(
-        "bash -lc \"printf '%s\\n' '{}' >> ~/.ssh/authorized_keys\"",
-        escaped
-    );
-    if let Err(err) = ssh_with_pass(address, &append_cmd, BOOTSTRAP_SSH_USER) {
+    // Seed the key via password channel with the same canonical writer used by fallbacks.
+    if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key) {
         return serde_json::json!({
             "status": "error",
             "error_code": "SSH_KEY_FAILED",
-            "message": err.to_string(),
-        });
-    }
-    if let Err(err) = ssh_with_pass(
-        address,
-        "chmod 600 ~/.ssh/authorized_keys",
-        BOOTSTRAP_SSH_USER,
-    ) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SSH_KEY_FAILED",
-            "message": err.to_string(),
+            "message": format!("failed to seed bootstrap key via password channel: {err}"),
         });
     }
 
