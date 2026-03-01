@@ -5112,59 +5112,17 @@ fn add_hive_flow(
         });
     }
 
-    // Fixed policy: enforce gate command restrictions + from= with motherbee source IP.
-    let source_patterns = match detect_source_ip_for_target(address) {
-        Ok(ip) => vec![ip],
-        Err(err) => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!("failed to resolve source ip for authorized_keys from= restriction: {err}"),
-            });
-        }
-    };
-    tracing::info!(
+    // Transitional mode: keep key unrestricted so add_hive remains operational while
+    // remote execution model is redesigned (agent-per-worker).
+    tracing::warn!(
         target = address,
-        from_patterns = ?source_patterns,
-        "authorized_keys restriction applied (gate enabled, from filter enabled by policy)"
+        "authorized_keys restriction skipped (transitional mode: unrestricted key bootstrap)"
     );
-    if let Err(err) = apply_remote_restricted_authorized_key_with_access(
-        address,
-        &key_path,
-        &pub_key,
-        &source_patterns,
-    ) {
+    if let Err(err) = ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
         return serde_json::json!({
             "status": "error",
             "error_code": "SSH_KEY_FAILED",
-            "message": format!("failed to restrict remote authorized_keys entry: {err}"),
-        });
-    }
-    let verify_bin = ssh_with_key(
-        address,
-        &key_path,
-        &sudo_wrap("/bin/systemctl --version"),
-        BOOTSTRAP_SSH_USER,
-    );
-    let verify_usr_bin = if verify_bin.is_err() {
-        ssh_with_key(
-            address,
-            &key_path,
-            &sudo_wrap("/usr/bin/systemctl --version"),
-            BOOTSTRAP_SSH_USER,
-        )
-    } else {
-        Ok(())
-    };
-    if let (Err(err_bin), Err(err_usr_bin)) = (verify_bin, verify_usr_bin) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SSH_KEY_FAILED",
-            "message": format!(
-                "key access verification failed after authorized_keys restriction: /bin/systemctl check failed: {}; /usr/bin/systemctl check failed: {}",
-                err_bin,
-                err_usr_bin
-            ),
+            "message": format!("key access verification failed after bootstrap seed: {err}"),
         });
     }
 
@@ -5700,12 +5658,19 @@ set -euo pipefail
 
 cmd="${SSH_ORIGINAL_COMMAND:-}"
 if [[ -z "${cmd}" ]]; then
+  echo "DENIED by fluxbee-ssh-gate: empty SSH_ORIGINAL_COMMAND" >&2
   logger -t fluxbee-ssh-gate "DENIED empty command from ${SSH_CONNECTION:-unknown}"
   exit 1
 fi
 
 allow_and_exec() {
-  exec /bin/bash -lc "${cmd}"
+  /bin/bash -lc "${cmd}"
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "GATE_EXEC_FAILED rc=${rc} cmd=${cmd}" >&2
+    logger -t fluxbee-ssh-gate "EXEC FAILED rc=${rc} from ${SSH_CONNECTION:-unknown}: ${cmd}"
+  fi
+  exit $rc
 }
 
 deny_cmd() {
