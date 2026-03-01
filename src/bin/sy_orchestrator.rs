@@ -5140,18 +5140,30 @@ fn add_hive_flow(
             "message": format!("failed to restrict remote authorized_keys entry: {err}"),
         });
     }
-    if let Err(err) = ssh_with_key(
+    let verify_bin = ssh_with_key(
         address,
         &key_path,
-        &sudo_wrap("bash -lc 'systemctl --version >/dev/null 2>&1 || /bin/systemctl --version >/dev/null 2>&1 || /usr/bin/systemctl --version >/dev/null 2>&1'"),
+        &sudo_wrap("/bin/systemctl --version"),
         BOOTSTRAP_SSH_USER,
-    ) {
+    );
+    let verify_usr_bin = if verify_bin.is_err() {
+        ssh_with_key(
+            address,
+            &key_path,
+            &sudo_wrap("/usr/bin/systemctl --version"),
+            BOOTSTRAP_SSH_USER,
+        )
+    } else {
+        Ok(())
+    };
+    if let (Err(err_bin), Err(err_usr_bin)) = (verify_bin, verify_usr_bin) {
         return serde_json::json!({
             "status": "error",
             "error_code": "SSH_KEY_FAILED",
             "message": format!(
-                "key access verification failed after authorized_keys restriction: {}",
-                err
+                "key access verification failed after authorized_keys restriction: /bin/systemctl check failed: {}; /usr/bin/systemctl check failed: {}",
+                err_bin,
+                err_usr_bin
             ),
         });
     }
