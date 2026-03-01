@@ -5725,6 +5725,7 @@ allow_and_exec() {
 }
 
 deny_cmd() {
+  echo "DENIED by fluxbee-ssh-gate: ${cmd}" >&2
   logger -t fluxbee-ssh-gate "DENIED command from ${SSH_CONNECTION:-unknown}: ${cmd}"
   exit 1
 }
@@ -6023,6 +6024,8 @@ fn ssh_with_key(
         .arg("-o")
         .arg("PasswordAuthentication=no")
         .arg("-o")
+        .arg("LogLevel=ERROR")
+        .arg("-o")
         .arg("StrictHostKeyChecking=no")
         .arg("-o")
         .arg("UserKnownHostsFile=/dev/null")
@@ -6048,6 +6051,8 @@ fn ssh_with_key_output(
         .arg("PreferredAuthentications=publickey")
         .arg("-o")
         .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
         .arg("-o")
         .arg("StrictHostKeyChecking=no")
         .arg("-o")
@@ -6075,6 +6080,8 @@ fn scp_with_key(
         .arg("PreferredAuthentications=publickey")
         .arg("-o")
         .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
         .arg("-o")
         .arg("StrictHostKeyChecking=no")
         .arg("-o")
