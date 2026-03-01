@@ -5112,11 +5112,21 @@ fn add_hive_flow(
         });
     }
 
-    // Fixed policy: always enforce gate command restrictions; do not use from= filters.
-    let source_patterns: Vec<String> = Vec::new();
+    // Fixed policy: enforce gate command restrictions + from= with motherbee source IP.
+    let source_patterns = match detect_source_ip_for_target(address) {
+        Ok(ip) => vec![ip],
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_KEY_FAILED",
+                "message": format!("failed to resolve source ip for authorized_keys from= restriction: {err}"),
+            });
+        }
+    };
     tracing::info!(
         target = address,
-        "authorized_keys restriction applied (gate enabled, from filter disabled by policy)"
+        from_patterns = ?source_patterns,
+        "authorized_keys restriction applied (gate enabled, from filter enabled by policy)"
     );
     if let Err(err) = apply_remote_restricted_authorized_key_with_access(
         address,
@@ -5136,47 +5146,14 @@ fn add_hive_flow(
         &sudo_wrap("/bin/systemctl --version"),
         BOOTSTRAP_SSH_USER,
     ) {
-        tracing::warn!(
-            target = address,
-            error = %err,
-            "restricted authorized_keys verification failed; applying temporary unrestricted fallback"
-        );
-        if let Err(fallback_err) =
-            apply_remote_unrestricted_authorized_key_with_access(address, &key_path, &pub_key)
-        {
-            tracing::warn!(
-                target = address,
-                error = %fallback_err,
-                "unrestricted fallback via key failed; retrying via password bootstrap channel"
-            );
-            if let Err(pass_fallback_err) =
-                apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key)
-            {
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": "SSH_KEY_FAILED",
-                    "message": format!(
-                        "key access verification failed after authorized_keys restriction: {}; unrestricted fallback failed: {}; password fallback failed: {}",
-                        err, fallback_err, pass_fallback_err
-                    ),
-                });
-            }
-        }
-        if let Err(recheck_err) = ssh_with_key(
-            address,
-            &key_path,
-            &sudo_wrap("/bin/systemctl --version"),
-            BOOTSTRAP_SSH_USER,
-        ) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!(
-                    "key access verification failed after authorized_keys restriction and after unrestricted fallback: {}",
-                    recheck_err
-                ),
-            });
-        }
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_KEY_FAILED",
+            "message": format!(
+                "key access verification failed after authorized_keys restriction: {}",
+                err
+            ),
+        });
     }
 
     if harden_ssh {
@@ -5802,43 +5779,25 @@ fn apply_remote_restricted_authorized_key_with_access(
     };
     let script = format!(
         "set -euo pipefail\n\
-mkdir -p ~/.ssh\n\
-chmod 700 ~/.ssh\n\
-touch ~/.ssh/authorized_keys\n\
-{{ grep -Fv '{gate_path}' ~/.ssh/authorized_keys | grep -Fv '{key_material}' > ~/.ssh/authorized_keys.tmp; }} || true\n\
-mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys\n\
-printf '%s\\n' '{entry}' >> ~/.ssh/authorized_keys\n\
-chmod 600 ~/.ssh/authorized_keys\n",
+user='{user}'\n\
+home_dir=\"$(getent passwd \"$user\" | cut -d: -f6)\"\n\
+if [[ -z \"$home_dir\" ]]; then home_dir=\"/home/$user\"; fi\n\
+ssh_dir=\"$home_dir/.ssh\"\n\
+auth_keys=\"$ssh_dir/authorized_keys\"\n\
+mkdir -p \"$ssh_dir\"\n\
+chown \"$user:$user\" \"$ssh_dir\"\n\
+chmod 700 \"$ssh_dir\"\n\
+touch \"$auth_keys\"\n\
+chown \"$user:$user\" \"$auth_keys\"\n\
+{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' > \"$auth_keys.tmp\"; }} || true\n\
+mv \"$auth_keys.tmp\" \"$auth_keys\"\n\
+printf '%s\\n' '{entry}' >> \"$auth_keys\"\n\
+chown \"$user:$user\" \"$auth_keys\"\n\
+chmod 600 \"$auth_keys\"\n",
+        user = BOOTSTRAP_SSH_USER,
         gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
         key_material = shell_single_quote(key_material),
         entry = shell_single_quote(&restricted_entry),
-    );
-    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
-    ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
-    Ok(())
-}
-
-fn apply_remote_unrestricted_authorized_key_with_access(
-    address: &str,
-    key_path: &Path,
-    pub_key: &str,
-) -> Result<(), OrchestratorError> {
-    let key_material = pub_key
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
-    let script = format!(
-        "set -euo pipefail\n\
-mkdir -p ~/.ssh\n\
-chmod 700 ~/.ssh\n\
-touch ~/.ssh/authorized_keys\n\
-{{ grep -Fv '{gate_path}' ~/.ssh/authorized_keys | grep -Fv '{key_material}' > ~/.ssh/authorized_keys.tmp; }} || true\n\
-mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys\n\
-printf '%s\\n' '{entry}' >> ~/.ssh/authorized_keys\n\
-chmod 600 ~/.ssh/authorized_keys\n",
-        gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
-        key_material = shell_single_quote(key_material),
-        entry = shell_single_quote(pub_key),
     );
     let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
     ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;

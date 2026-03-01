@@ -165,7 +165,7 @@ Permisos mínimos acordados (S1):
 Nota operativa S3:
 - Política fija en código (sin toggles por entorno):
   - `command=/usr/local/bin/fluxbee-ssh-gate.sh` siempre habilitado.
-  - `from=` deshabilitado por política para evitar lockout por variación de IP de salida.
+  - `from=` habilitado por política usando IP de origen detectada por ruta hacia el worker.
 - Break-glass solo por consola/out-of-band (ver `docs/07-operaciones.md` sección 2.7).
 
 ### Fase S4 - Validación integral previa al corte
