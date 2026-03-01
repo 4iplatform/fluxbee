@@ -5813,7 +5813,7 @@ chmod 600 ~/.ssh/authorized_keys\n",
         key_material = shell_single_quote(key_material),
         entry = shell_single_quote(&restricted_entry),
     );
-    let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
+    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
     ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
     Ok(())
 }
@@ -5840,7 +5840,7 @@ chmod 600 ~/.ssh/authorized_keys\n",
         key_material = shell_single_quote(key_material),
         entry = shell_single_quote(pub_key),
     );
-    let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
+    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
     ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
     Ok(())
 }
