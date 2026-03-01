@@ -5060,6 +5060,46 @@ fn add_hive_flow(
         });
     }
 
+    // Transitional operational mode:
+    // keep add_hive as a simple registration step while remote provisioning is
+    // redesigned around an agent-per-worker model.
+    // Set ORCH_ADD_HIVE_FULL=1 to run the legacy full remote bootstrap path.
+    let run_full_bootstrap = std::env::var("ORCH_ADD_HIVE_FULL")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if !run_full_bootstrap {
+        tracing::warn!(
+            hive_id = hive_id,
+            address = address,
+            "add_hive transitional mode: skipping remote bootstrap (key/gate/sudoers/core/vendor sync)"
+        );
+        let info_path = hives_root().join(hive_id).join("info.yaml");
+        let info = serde_yaml::to_string(&serde_json::json!({
+            "hive_id": hive_id,
+            "address": address,
+            "created_at": now_epoch_ms().to_string(),
+            "status": "connected",
+        }))
+        .unwrap_or_default();
+        if let Err(err) = fs::write(info_path, info) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "IO_ERROR",
+                "message": err.to_string(),
+            });
+        }
+        return serde_json::json!({
+            "status": "ok",
+            "hive_id": hive_id,
+            "address": address,
+            "harden_ssh": harden_ssh,
+            "wan_connected": true,
+            "provisioned": false,
+            "mode": "transitional_register_only",
+        });
+    }
+
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     if !key_path.exists() {
         return serde_json::json!({
