@@ -5060,46 +5060,6 @@ fn add_hive_flow(
         });
     }
 
-    // Transitional operational mode:
-    // keep add_hive as a simple registration step while remote provisioning is
-    // redesigned around an agent-per-worker model.
-    // Set ORCH_ADD_HIVE_FULL=1 to run the legacy full remote bootstrap path.
-    let run_full_bootstrap = std::env::var("ORCH_ADD_HIVE_FULL")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    if !run_full_bootstrap {
-        tracing::warn!(
-            hive_id = hive_id,
-            address = address,
-            "add_hive transitional mode: skipping remote bootstrap (key/gate/sudoers/core/vendor sync)"
-        );
-        let info_path = hives_root().join(hive_id).join("info.yaml");
-        let info = serde_yaml::to_string(&serde_json::json!({
-            "hive_id": hive_id,
-            "address": address,
-            "created_at": now_epoch_ms().to_string(),
-            "status": "connected",
-        }))
-        .unwrap_or_default();
-        if let Err(err) = fs::write(info_path, info) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "IO_ERROR",
-                "message": err.to_string(),
-            });
-        }
-        return serde_json::json!({
-            "status": "ok",
-            "hive_id": hive_id,
-            "address": address,
-            "harden_ssh": harden_ssh,
-            "wan_connected": true,
-            "provisioned": false,
-            "mode": "transitional_register_only",
-        });
-    }
-
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     if !key_path.exists() {
         return serde_json::json!({
@@ -5144,19 +5104,10 @@ fn add_hive_flow(
         });
     }
 
-    if let Err(err) = install_remote_ssh_gate_with_access(address, &key_path) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SSH_KEY_FAILED",
-            "message": format!("failed to install remote ssh gate: {err}"),
-        });
-    }
-
-    // Transitional mode: keep key unrestricted so add_hive remains operational while
-    // remote execution model is redesigned (agent-per-worker).
+    // Insecure transitional mode: keep key unrestricted and skip gate enforcement.
     tracing::warn!(
         target = address,
-        "authorized_keys restriction skipped (transitional mode: unrestricted key bootstrap)"
+        "authorized_keys gate/restriction skipped (legacy insecure mode)"
     );
     if let Err(err) = ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
         return serde_json::json!({
@@ -5876,23 +5827,8 @@ fn ensure_remote_orchestrator_sudoers_with_access(
     address: &str,
     key_path: &Path,
 ) -> Result<(), OrchestratorError> {
-    let systemctl_ready = ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap("/bin/systemctl --version"),
-        BOOTSTRAP_SSH_USER,
-    )
-    .is_ok();
-    let systemd_run_ready = ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap("systemd-run --version"),
-        BOOTSTRAP_SSH_USER,
-    )
-    .is_ok();
-    if systemctl_ready && systemd_run_ready {
-        return Ok(());
-    }
+    // Always rewrite sudoers from known-good template.
+    // This avoids stale/partial states that can leave sudo -n inconsistent.
 
     let local_tmp =
         std::env::temp_dir().join(format!("fluxbee-orchestrator-sudoers-{}.tmp", now_epoch_ms()));
@@ -5934,6 +5870,27 @@ fn ensure_remote_orchestrator_sudoers_with_access(
         BOOTSTRAP_SSH_USER,
     )
     .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (systemd-run): {err}"))?;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap("/usr/bin/install --version"),
+        BOOTSTRAP_SSH_USER,
+    )
+    .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (install): {err}"))?;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap("/bin/chmod --version"),
+        BOOTSTRAP_SSH_USER,
+    )
+    .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (chmod): {err}"))?;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap("/bin/bash -lc 'exit 0'"),
+        BOOTSTRAP_SSH_USER,
+    )
+    .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (bash): {err}"))?;
     Ok(())
 }
 

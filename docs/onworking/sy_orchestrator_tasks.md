@@ -164,9 +164,9 @@ Permisos mínimos acordados (S1):
 
 Nota operativa S3:
 - Política fija en código (sin toggles por entorno):
-  - **Modo transicional operativo (default)**: `add_hive` registra hive sin bootstrap remoto (sin key/gate/sudoers/sync).
-  - Si se necesita el flujo legacy completo temporalmente: `ORCH_ADD_HIVE_FULL=1`.
-  - La restricción completa de `authorized_keys` queda diferida al rediseño con agente por worker.
+  - **Modo transicional operativo (default)**: `add_hive` vuelve a ejecutar provisión remota completa para mantener operación.
+  - Se omite la restricción `authorized_keys` (`from+command`) y no se fuerza `ssh-gate` en el alta (modo inseguro temporal).
+  - La seguridad completa de acceso remoto queda diferida al rediseño con agente por worker.
 - Break-glass solo por consola/out-of-band (ver `docs/07-operaciones.md` sección 2.7).
 
 ### Fase S4 - Validación integral previa al corte
