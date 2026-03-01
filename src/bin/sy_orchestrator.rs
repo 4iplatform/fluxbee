@@ -5143,7 +5143,7 @@ fn add_hive_flow(
     if let Err(err) = ssh_with_key(
         address,
         &key_path,
-        &sudo_wrap("/bin/systemctl --version"),
+        &sudo_wrap("bash -lc 'systemctl --version >/dev/null 2>&1 || /bin/systemctl --version >/dev/null 2>&1 || /usr/bin/systemctl --version >/dev/null 2>&1'"),
         BOOTSTRAP_SSH_USER,
     ) {
         return serde_json::json!({
@@ -5592,8 +5592,17 @@ fn run_cmd(mut cmd: Command, label: &str) -> Result<(), OrchestratorError> {
     if output.status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(format!("{label} failed: {stderr}").into())
+    let code = output.status.code().map_or("signal".to_string(), |c| c.to_string());
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        format!("stderr={stderr}")
+    } else if !stdout.is_empty() {
+        format!("stdout={stdout}")
+    } else {
+        "no stdout/stderr".to_string()
+    };
+    Err(format!("{label} failed (exit={code}): {detail}").into())
 }
 
 fn run_cmd_output(mut cmd: Command, label: &str) -> Result<String, OrchestratorError> {
@@ -5601,8 +5610,17 @@ fn run_cmd_output(mut cmd: Command, label: &str) -> Result<String, OrchestratorE
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).to_string());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(format!("{label} failed: {stderr}").into())
+    let code = output.status.code().map_or("signal".to_string(), |c| c.to_string());
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        format!("stderr={stderr}")
+    } else if !stdout.is_empty() {
+        format!("stdout={stdout}")
+    } else {
+        "no stdout/stderr".to_string()
+    };
+    Err(format!("{label} failed (exit={code}): {detail}").into())
 }
 
 fn systemd_is_active(service: &str) -> bool {
