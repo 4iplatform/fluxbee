@@ -5219,6 +5219,49 @@ for b in /var/lib/fluxbee/core/bin/*; do [ -f \"$b\" ] || continue; install -m 0
     )
 }
 
+fn truncate_for_error(value: &str, max_len: usize) -> String {
+    let compact = value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if compact.len() <= max_len {
+        return compact;
+    }
+    let mut out = compact
+        .chars()
+        .take(max_len.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn remote_service_journal_tail(
+    address: &str,
+    key_path: &Path,
+    service: &str,
+    lines: usize,
+) -> Option<String> {
+    let service_q = shell_single_quote(service);
+    let cmd = format!(
+        "journalctl -u '{service}' -n {lines} --no-pager 2>/dev/null || true",
+        service = service_q,
+        lines = lines
+    );
+    match ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER) {
+        Ok(out) => {
+            let trimmed = out.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(truncate_for_error(trimmed, 800))
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 fn remote_syncthing_backup_exists(
     address: &str,
     key_path: &Path,
@@ -5858,6 +5901,22 @@ fn add_hive_flow(
             });
         }
     }
+    if let Err(err) = remote_wait_service_active(
+        address,
+        &key_path,
+        "sy-orchestrator",
+        CORE_SERVICE_HEALTH_TIMEOUT_SECS,
+    ) {
+        let journal_tail = remote_service_journal_tail(address, &key_path, "sy-orchestrator", 40);
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SERVICE_FAILED",
+            "message": match journal_tail {
+                Some(tail) => format!("sy-orchestrator failed health gate: {err}; journal={tail}"),
+                None => format!("sy-orchestrator failed health gate: {err}"),
+            },
+        });
+    }
 
     if desired_blob.sync_enabled {
         let vendor_started_at = now_epoch_ms();
@@ -5984,10 +6043,14 @@ fn add_hive_flow(
     if !orchestrator_connected {
         let detail = orchestrator_wait_error
             .unwrap_or_else(|| "worker orchestrator not observed in LSA".to_string());
+        let journal_tail = remote_service_journal_tail(address, &key_path, "sy-orchestrator", 40);
         return serde_json::json!({
             "status": "error",
             "error_code": "WORKER_ORCHESTRATOR_TIMEOUT",
-            "message": detail,
+            "message": match journal_tail {
+                Some(tail) => format!("{detail}; sy-orchestrator journal={tail}"),
+                None => detail,
+            },
             "hive_id": hive_id,
             "address": address,
             "harden_ssh": harden_ssh,
