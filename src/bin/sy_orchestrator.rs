@@ -1674,7 +1674,12 @@ async fn resolve_system_source_name_with_retry(
                 return Some(name);
             }
         }
-        if start.elapsed() >= Duration::from_millis(500) {
+        if let Ok(snapshot) = load_lsa_snapshot(state) {
+            if let Some(name) = source_name_from_lsa_snapshot(&snapshot, uuid) {
+                return Some(name);
+            }
+        }
+        if start.elapsed() >= Duration::from_secs(2) {
             return None;
         }
         time::sleep(Duration::from_millis(25)).await;
@@ -1691,6 +1696,23 @@ fn source_name_from_snapshot(snapshot: &ShmSnapshot, source_uuid: Uuid) -> Optio
         };
         if entry_uuid == source_uuid {
             return Some(node_name(entry));
+        }
+    }
+    None
+}
+
+fn source_name_from_lsa_snapshot(snapshot: &LsaSnapshot, source_uuid: Uuid) -> Option<String> {
+    for entry in &snapshot.nodes {
+        if entry.name_len == 0 {
+            continue;
+        }
+        let Ok(entry_uuid) = Uuid::from_slice(&entry.uuid) else {
+            continue;
+        };
+        if entry_uuid == source_uuid {
+            let len = entry.name_len as usize;
+            let name = String::from_utf8_lossy(&entry.name[..len]).into_owned();
+            return Some(name);
         }
     }
     None
