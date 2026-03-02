@@ -1050,6 +1050,8 @@ async fn handle_system_message(
             state.system_allowed_origins.contains(name)
                 || name.starts_with("SY.orchestrator@")
                 || name.starts_with("SY.orchestrator.")
+                || name.starts_with("SY.admin@")
+                || name.starts_with("WF.orch.diag@")
         });
         if !is_allowed {
             tracing::warn!(
