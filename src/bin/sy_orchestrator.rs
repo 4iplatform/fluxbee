@@ -65,6 +65,12 @@ const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "sy-storage",
     "sy-orchestrator",
 ];
+const WORKER_MIN_CORE_COMPONENTS: [&str; 4] = [
+    "rt-gateway",
+    "sy-config-routes",
+    "sy-opa-rules",
+    "sy-orchestrator",
+];
 const DEFAULT_BLOB_ENABLED: bool = true;
 const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
 const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
@@ -432,11 +438,7 @@ async fn bootstrap_local(
     socket_dir: &Path,
 ) -> Result<(), OrchestratorError> {
     let core_manifest = load_core_manifest()?;
-    let core_bins: Vec<String> = core_manifest
-        .components
-        .keys()
-        .map(|name| format!("{CORE_BIN_SOURCE_DIR}/{name}"))
-        .collect();
+    let core_bins = core_bin_paths_for_role(&core_manifest, state.is_motherbee)?;
     validate_core_manifest_for_bins(&core_bins)?;
 
     tracing::info!("starting rt-gateway");
@@ -1398,14 +1400,7 @@ async fn apply_system_update_local(
         }
         "core" => {
             let manifest = load_core_manifest()?;
-            let mut local_paths = Vec::new();
-            for name in manifest.components.keys() {
-                let path = Path::new(CORE_BIN_SOURCE_DIR).join(name);
-                if !path.exists() {
-                    return Err(format!("missing core source binary '{}'", path.display()).into());
-                }
-                local_paths.push(path.display().to_string());
-            }
+            let local_paths = core_bin_paths_for_role(&manifest, state.is_motherbee)?;
             validate_core_manifest_for_bins(&local_paths)?;
             let restarted = restart_local_core_services_with_health_gate().await?;
             let unchanged = manifest.components.keys().cloned().collect::<Vec<_>>();
@@ -3731,7 +3726,7 @@ async fn core_sync_workers(
             });
             continue;
         }
-        if let Err(err) = sync_core_to_worker(&hive_id, &address, &key_path, true) {
+        if let Err(err) = sync_core_to_worker(&hive_id, &address, &key_path, true, false) {
             tracing::warn!(hive = %hive_id, error = %err, "core sync failed");
             if pre_drift_detected {
                 push_drift_alert(
@@ -4954,14 +4949,60 @@ fn validate_core_manifest_for_bins(bin_paths: &[String]) -> Result<(), Orchestra
     Ok(())
 }
 
+fn core_component_names_for_role(
+    manifest: &CoreManifest,
+    is_motherbee: bool,
+) -> Result<Vec<String>, OrchestratorError> {
+    if is_motherbee {
+        return Ok(manifest.components.keys().cloned().collect());
+    }
+
+    let mut out = Vec::new();
+    for name in WORKER_MIN_CORE_COMPONENTS {
+        if !manifest.components.contains_key(name) {
+            return Err(format!("core manifest missing required worker component '{name}'").into());
+        }
+        out.push(name.to_string());
+    }
+    if manifest.components.contains_key("sy-identity") {
+        out.push("sy-identity".to_string());
+    }
+    Ok(out)
+}
+
+fn core_bin_paths_for_role(
+    manifest: &CoreManifest,
+    is_motherbee: bool,
+) -> Result<Vec<String>, OrchestratorError> {
+    Ok(core_component_names_for_role(manifest, is_motherbee)?
+        .into_iter()
+        .map(|name| format!("{CORE_BIN_SOURCE_DIR}/{name}"))
+        .collect())
+}
+
 fn sync_core_to_worker(
     hive_id: &str,
     address: &str,
     key_path: &Path,
     restart_services_with_health_gate: bool,
+    worker_bootstrap_only: bool,
 ) -> Result<(), OrchestratorError> {
     let manifest = load_core_manifest()?;
-    let component_names: Vec<String> = manifest.components.keys().cloned().collect();
+    let component_names = if worker_bootstrap_only {
+        core_component_names_for_role(&manifest, false)?
+    } else {
+        core_component_names_for_role(&manifest, true)?
+    };
+    tracing::info!(
+        hive_id = hive_id,
+        mode = if worker_bootstrap_only {
+            "worker-bootstrap-minimal"
+        } else {
+            "full-core-sync"
+        },
+        components = ?component_names,
+        "sync core to worker"
+    );
     if component_names.is_empty() {
         return Err("core manifest has no components to sync".into());
     }
@@ -5728,7 +5769,7 @@ fn add_hive_flow(
     let core_deploy_started = Instant::now();
     let local_core_hash = local_core_manifest_hash().ok().flatten();
     let remote_core_hash_before = remote_core_manifest_hash(address, &key_path).ok().flatten();
-    if let Err(err) = sync_core_to_worker(hive_id, address, &key_path, false) {
+    if let Err(err) = sync_core_to_worker(hive_id, address, &key_path, false, true) {
         let entry = DeploymentHistoryEntry {
             deployment_id: Uuid::new_v4().to_string(),
             category: "core".to_string(),
