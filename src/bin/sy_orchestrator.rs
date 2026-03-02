@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -1352,10 +1353,101 @@ async fn restart_local_core_services_with_health_gate() -> Result<Vec<String>, O
     Ok(restarted)
 }
 
+#[derive(Debug, Clone)]
+struct SystemUpdateApplyResult {
+    status: String,
+    updated: Vec<String>,
+    unchanged: Vec<String>,
+    restarted: Vec<String>,
+    errors: Vec<String>,
+}
+
+fn set_exec_0755(path: &Path) -> Result<(), OrchestratorError> {
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+fn compute_local_core_update_sets(
+    manifest: &CoreManifest,
+    is_motherbee: bool,
+) -> Result<(Vec<String>, Vec<String>), OrchestratorError> {
+    let component_names = core_component_names_for_role(manifest, is_motherbee)?;
+    let local_paths = component_names
+        .iter()
+        .map(|name| format!("{CORE_BIN_SOURCE_DIR}/{name}"))
+        .collect::<Vec<_>>();
+    validate_core_manifest_for_bins(&local_paths)?;
+
+    let mut updated = Vec::new();
+    let mut unchanged = Vec::new();
+    for name in component_names {
+        let source_path = Path::new(CORE_BIN_SOURCE_DIR).join(&name);
+        let source_hash = sha256_file(&source_path)?;
+        let target_path = Path::new("/usr/bin").join(&name);
+        let target_hash = if target_path.exists() {
+            Some(sha256_file(&target_path)?)
+        } else {
+            None
+        };
+        if target_hash
+            .as_deref()
+            .is_some_and(|hash| hash.eq_ignore_ascii_case(source_hash.trim()))
+        {
+            unchanged.push(name);
+        } else {
+            updated.push(name);
+        }
+    }
+    Ok((updated, unchanged))
+}
+
+fn rollback_local_core_binaries(
+    updated: &[String],
+    backup_dir: &Path,
+    created_without_backup: &HashSet<String>,
+) -> Result<(), OrchestratorError> {
+    let mut rollback_errors = Vec::new();
+    for name in updated {
+        let target_path = Path::new("/usr/bin").join(name);
+        let backup_path = backup_dir.join(name);
+        if backup_path.exists() {
+            if let Err(err) = fs::copy(&backup_path, &target_path) {
+                rollback_errors.push(format!("restore {} failed: {}", target_path.display(), err));
+                continue;
+            }
+            if let Err(err) = set_exec_0755(&target_path) {
+                rollback_errors.push(format!(
+                    "restore chmod {} failed: {}",
+                    target_path.display(),
+                    err
+                ));
+            }
+            continue;
+        }
+        if created_without_backup.contains(name)
+            && target_path.exists()
+            && fs::remove_file(&target_path).is_err()
+        {
+            rollback_errors.push(format!(
+                "remove {} failed during rollback",
+                target_path.display()
+            ));
+        }
+    }
+
+    if rollback_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("rollback errors: {}", rollback_errors.join("; ")).into())
+    }
+}
+
 async fn apply_system_update_local(
     state: &OrchestratorState,
     category: &str,
-) -> Result<(Vec<String>, Vec<String>, Vec<String>), OrchestratorError> {
+) -> Result<SystemUpdateApplyResult, OrchestratorError> {
     match category {
         "runtime" => {
             let manifest = load_runtime_manifest().ok_or("runtime manifest missing locally")?;
@@ -1364,31 +1456,107 @@ async fn apply_system_update_local(
                 let mut guard = state.runtime_manifest.lock().await;
                 *guard = Some(manifest);
             }
-            Ok((Vec::new(), vec!["runtime-manifest".to_string()], Vec::new()))
+            Ok(SystemUpdateApplyResult {
+                status: "ok".to_string(),
+                updated: Vec::new(),
+                unchanged: vec!["runtime-manifest".to_string()],
+                restarted: Vec::new(),
+                errors: Vec::new(),
+            })
         }
         "core" => {
             let manifest = load_core_manifest()?;
-            let local_paths = core_bin_paths_for_role(&manifest, state.is_motherbee)?;
-            validate_core_manifest_for_bins(&local_paths)?;
-            let restarted = restart_local_core_services_with_health_gate().await?;
-            let unchanged = manifest.components.keys().cloned().collect::<Vec<_>>();
-            Ok((Vec::new(), unchanged, restarted))
+            let (updated, unchanged) =
+                compute_local_core_update_sets(&manifest, state.is_motherbee)?;
+            let backup_dir = PathBuf::from("/var/lib/fluxbee/core/bin.prev.local")
+                .join(format!("update-{}", now_epoch_ms()));
+            fs::create_dir_all(&backup_dir)?;
+            let mut created_without_backup = HashSet::new();
+            let mut installed = Vec::new();
+            for name in &updated {
+                let source_path = Path::new(CORE_BIN_SOURCE_DIR).join(name);
+                let target_path = Path::new("/usr/bin").join(name);
+                if target_path.exists() {
+                    fs::copy(&target_path, backup_dir.join(name))?;
+                } else {
+                    created_without_backup.insert(name.clone());
+                }
+
+                let stage_path = Path::new("/usr/bin").join(format!(".{name}.fluxbee.tmp"));
+                if let Err(err) = (|| -> Result<(), OrchestratorError> {
+                    fs::copy(&source_path, &stage_path)?;
+                    set_exec_0755(&stage_path)?;
+                    fs::rename(&stage_path, &target_path)?;
+                    Ok(())
+                })() {
+                    let rollback_note = match rollback_local_core_binaries(
+                        &installed,
+                        &backup_dir,
+                        &created_without_backup,
+                    ) {
+                        Ok(()) => "rollback applied".to_string(),
+                        Err(rb_err) => format!("rollback failed: {rb_err}"),
+                    };
+                    return Err(format!(
+                        "core local install failed for component '{}': {}; {}",
+                        name, err, rollback_note
+                    )
+                    .into());
+                }
+                installed.push(name.clone());
+            }
+
+            match restart_local_core_services_with_health_gate().await {
+                Ok(restarted) => Ok(SystemUpdateApplyResult {
+                    status: "ok".to_string(),
+                    updated,
+                    unchanged,
+                    restarted,
+                    errors: Vec::new(),
+                }),
+                Err(err) => {
+                    let rollback_note = match rollback_local_core_binaries(
+                        &updated,
+                        &backup_dir,
+                        &created_without_backup,
+                    ) {
+                        Ok(()) => match restart_local_core_services_with_health_gate().await {
+                            Ok(_) => "rollback applied and services recovered".to_string(),
+                            Err(rb_restart_err) => {
+                                format!("rollback applied but service recovery failed: {rb_restart_err}")
+                            }
+                        },
+                        Err(rb_err) => format!("rollback failed: {rb_err}"),
+                    };
+                    Ok(SystemUpdateApplyResult {
+                        status: "rollback".to_string(),
+                        updated: Vec::new(),
+                        unchanged,
+                        restarted: Vec::new(),
+                        errors: vec![format!("core health gate failed: {err}; {rollback_note}")],
+                    })
+                }
+            }
         }
         "vendor" => {
             let desired_blob = current_blob_runtime_config(state);
             if desired_blob.sync_enabled && blob_sync_tool_is_syncthing(&desired_blob) {
                 ensure_blob_sync_runtime(&desired_blob).await?;
-                Ok((
-                    Vec::new(),
-                    vec!["syncthing".to_string()],
-                    vec![SYNCTHING_SERVICE_NAME.to_string()],
-                ))
+                Ok(SystemUpdateApplyResult {
+                    status: "ok".to_string(),
+                    updated: Vec::new(),
+                    unchanged: vec!["syncthing".to_string()],
+                    restarted: vec![SYNCTHING_SERVICE_NAME.to_string()],
+                    errors: Vec::new(),
+                })
             } else {
-                Ok((
-                    Vec::new(),
-                    vec!["vendor-sync-disabled".to_string()],
-                    Vec::new(),
-                ))
+                Ok(SystemUpdateApplyResult {
+                    status: "ok".to_string(),
+                    updated: Vec::new(),
+                    unchanged: vec!["vendor-sync-disabled".to_string()],
+                    restarted: Vec::new(),
+                    errors: Vec::new(),
+                })
             }
         }
         _ => Err(format!("unknown system update category '{}'", category).into()),
@@ -1439,32 +1607,41 @@ async fn handle_system_update_message(
         return serde_json::json!({
             "status": "sync_pending",
             "category": category,
+            "hive": state.hive_id.as_str(),
             "manifest_version": expected_version,
             "local_manifest_version": local.version,
             "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
+            "errors": [],
             "message": "Local manifest does not match expected. Sync channel may still be propagating.",
         });
     }
 
     match apply_system_update_local(state, &category).await {
-        Ok((updated, unchanged, restarted)) => serde_json::json!({
-            "status": "ok",
+        Ok(result) => serde_json::json!({
+            "status": result.status,
             "category": category,
+            "hive": state.hive_id.as_str(),
             "manifest_version": expected_version,
             "local_manifest_version": local.version,
             "local_manifest_hash": local_hash,
-            "updated": updated,
-            "unchanged": unchanged,
-            "restarted": restarted,
+            "updated": result.updated,
+            "unchanged": result.unchanged,
+            "restarted": result.restarted,
+            "errors": result.errors,
         }),
         Err(err) => serde_json::json!({
             "status": "error",
             "error_code": "UPDATE_FAILED",
             "message": err.to_string(),
             "category": category,
+            "hive": state.hive_id.as_str(),
             "manifest_version": expected_version,
             "local_manifest_version": local.version,
             "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
+            "updated": [],
+            "unchanged": [],
+            "restarted": [],
+            "errors": [err.to_string()],
         }),
     }
 }

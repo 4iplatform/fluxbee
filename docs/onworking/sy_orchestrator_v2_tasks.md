@@ -96,12 +96,14 @@ Salida:
 
 ### Fase 5 - SYSTEM_UPDATE engine local
 
-- [ ] V5.1 Implementar handler `SYSTEM_UPDATE` en orchestrator.
-- [ ] V5.2 Soportar categorias `runtime`, `core`, `vendor`.
-- [ ] V5.3 Verificar manifest local (version/hash) y responder `sync_pending` si no converge.
+- [x] V5.1 Implementar handler `SYSTEM_UPDATE` en orchestrator.
+- [x] V5.2 Soportar categorias `runtime`, `core`, `vendor`.
+- [x] V5.3 Verificar manifest local (version/hash) y responder `sync_pending` si no converge.
 - [ ] V5.4 Instalar localmente desde `dist/` con hash-gate previo.
-- [ ] V5.5 Health gate + rollback local por categoria.
-- [ ] V5.6 Emitir `SYSTEM_UPDATE_RESPONSE` con detalle de `updated/unchanged/restarted/errors`.
+- [x] V5.5 Health gate + rollback local por categoria.
+- [x] V5.6 Emitir `SYSTEM_UPDATE_RESPONSE` con detalle de `updated/unchanged/restarted/errors`.
+
+Nota (2026-03-02): `SYSTEM_UPDATE` ahora responde con `hive`, `updated`, `unchanged`, `restarted`, `errors` y soporta `status=rollback` para `category=core` cuando falla el health gate y se revierte instalación local. Queda pendiente cerrar V5.4 de forma explícita sobre layout final `dist/` (Fase 7).
 
 Salida:
 
@@ -142,6 +144,8 @@ Salida:
 - [ ] E2E-2 `POST /hives/{id}/update` categoria `runtime` -> `ok`.
 - [ ] E2E-3 `POST /hives/{id}/update` con manifest no convergido -> `sync_pending`.
 - [ ] E2E-4 update `core` fallido -> rollback verificable.
+
+Referencia: `scripts/orchestrator_system_update_api_e2e.sh` valida `sync_pending` + `ok` (y acepta `rollback` en `category=core`).
 
 ### Gate G3 (fin Fase 6)
 
