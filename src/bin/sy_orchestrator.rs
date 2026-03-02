@@ -3716,7 +3716,7 @@ async fn core_sync_workers(
             });
             continue;
         }
-        if let Err(err) = sync_core_to_worker(&hive_id, &address, &key_path) {
+        if let Err(err) = sync_core_to_worker(&hive_id, &address, &key_path, true) {
             tracing::warn!(hive = %hive_id, error = %err, "core sync failed");
             if pre_drift_detected {
                 push_drift_alert(
@@ -4943,6 +4943,7 @@ fn sync_core_to_worker(
     hive_id: &str,
     address: &str,
     key_path: &Path,
+    restart_services_with_health_gate: bool,
 ) -> Result<(), OrchestratorError> {
     let manifest = load_core_manifest()?;
     let component_names: Vec<String> = manifest.components.keys().cloned().collect();
@@ -5066,23 +5067,25 @@ fn sync_core_to_worker(
         }
     }
 
-    if let Err(err) = restart_remote_core_services_with_health_gate(address, key_path) {
-        let rollback_result = rollback_remote_core_to_prev(address, key_path);
-        let rollback_note = match rollback_result {
-            Ok(()) => {
-                if let Err(rb_err) =
-                    restart_remote_core_services_with_health_gate(address, key_path)
-                {
-                    format!("rollback applied but restart after rollback failed: {rb_err}")
-                } else {
-                    "rollback applied".to_string()
+    if restart_services_with_health_gate {
+        if let Err(err) = restart_remote_core_services_with_health_gate(address, key_path) {
+            let rollback_result = rollback_remote_core_to_prev(address, key_path);
+            let rollback_note = match rollback_result {
+                Ok(()) => {
+                    if let Err(rb_err) =
+                        restart_remote_core_services_with_health_gate(address, key_path)
+                    {
+                        format!("rollback applied but restart after rollback failed: {rb_err}")
+                    } else {
+                        "rollback applied".to_string()
+                    }
                 }
-            }
-            Err(rb_err) => format!("rollback failed: {rb_err}"),
-        };
-        return Err(
-            format!("core service restart health-gate failed: {err}; {rollback_note}").into(),
-        );
+                Err(rb_err) => format!("rollback failed: {rb_err}"),
+            };
+            return Err(
+                format!("core service restart health-gate failed: {err}; {rollback_note}").into(),
+            );
+        }
     }
 
     Ok(())
@@ -5705,7 +5708,7 @@ fn add_hive_flow(
     let core_deploy_started = Instant::now();
     let local_core_hash = local_core_manifest_hash().ok().flatten();
     let remote_core_hash_before = remote_core_manifest_hash(address, &key_path).ok().flatten();
-    if let Err(err) = sync_core_to_worker(hive_id, address, &key_path) {
+    if let Err(err) = sync_core_to_worker(hive_id, address, &key_path, false) {
         let entry = DeploymentHistoryEntry {
             deployment_id: Uuid::new_v4().to_string(),
             category: "core".to_string(),
