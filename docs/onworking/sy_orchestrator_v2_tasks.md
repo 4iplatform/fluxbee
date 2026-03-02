@@ -86,9 +86,9 @@ Salida:
 - [x] V4.1 Reescribir `execute_on_hive` para ejecucion exclusivamente local.
 - [x] V4.2 Mover ejecucion remota a unicast de mensajes hacia orchestrator destino.
 - [x] V4.3 Actualizar `run_node`/`kill_node`/`run_router`/`kill_router` para modelo local-only en destino.
-- [ ] V4.4 Quitar rutas de codigo de SSH operativo en flujos de run/kill/update.
+- [x] V4.4 Quitar rutas de codigo de SSH operativo en flujos de run/kill/update.
 
-Nota (2026-03-02): V4.2/V4.3 quedaron implementadas con forward `system` request/response y deshabilitacion explicita de SSH en `execute_on_hive`. La efectividad end-to-end depende de tener `SY.orchestrator` activo en workers (Fase 3).
+Nota (2026-03-02): V4.2/V4.3 quedaron implementadas con forward `system` request/response y deshabilitacion explicita de SSH en `execute_on_hive`. V4.4 desactiva ademas la propagacion SSH de `RUNTIME_UPDATE` y del watchdog de sync remoto; la actualizacion remota pasa por `SYSTEM_UPDATE` (`POST /hives/{id}/update` en `SY.admin`).
 
 Salida:
 

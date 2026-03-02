@@ -1229,57 +1229,25 @@ async fn handle_system_message(
                 schema_version = incoming.schema_version,
                 "runtime manifest updated"
             );
-            let sync_result = match runtime_sync_workers(
-                state,
-                &incoming,
-                target_hives_filter.as_ref(),
-                "runtime_update",
-                &actor,
-                true,
-            )
-            .await
-            {
-                Ok(()) => vendor_sync_workers(state, "runtime_update", &actor, false).await,
-                Err(err) => Err(err),
-            };
-            match sync_result {
-                Ok(()) => {
-                    let payload = serde_json::json!({
-                        "status": "ok",
-                        "applied": true,
-                        "version": incoming.version,
-                        "schema_version": incoming.schema_version,
-                        "target_hives": target_hives_filter.as_ref().map(|set| {
-                            let mut v: Vec<String> = set.iter().cloned().collect();
-                            v.sort();
-                            v
-                        }),
-                    });
-                    let _ = send_system_action_response(
-                        sender,
-                        msg,
-                        "RUNTIME_UPDATE_RESPONSE",
-                        payload,
-                    )
-                    .await;
-                }
-                Err(err) => {
-                    let payload = serde_json::json!({
-                        "status": "error",
-                        "error_code": "SYNC_FAILED",
-                        "message": format!("runtime sync failed: {}", err),
-                        "applied": false,
-                        "version": incoming.version,
-                    });
-                    let _ = send_system_action_response(
-                        sender,
-                        msg,
-                        "RUNTIME_UPDATE_RESPONSE",
-                        payload,
-                    )
-                    .await;
-                }
-            }
+            tracing::warn!(
+                actor = %actor,
+                "RUNTIME_UPDATE accepted in compatibility mode; remote SSH propagation is disabled in v2 (use SYSTEM_UPDATE via SY.admin /hives/{{id}}/update)"
+            );
+            let payload = serde_json::json!({
+                "status": "ok",
+                "applied": true,
+                "version": incoming.version,
+                "schema_version": incoming.schema_version,
+                "target_hives": target_hives_filter.as_ref().map(|set| {
+                    let mut v: Vec<String> = set.iter().cloned().collect();
+                    v.sort();
+                    v
+                }),
+                "compat_mode": true,
+                "propagation": "local_only_use_system_update",
+            });
+            let _ =
+                send_system_action_response(sender, msg, "RUNTIME_UPDATE_RESPONSE", payload).await;
         }
         Some("SPAWN_NODE") => {
             let result = run_node_flow(state, &msg.payload).await;
@@ -3510,13 +3478,11 @@ async fn runtime_verify_and_sync(state: &OrchestratorState) -> Result<(), Orches
             let mut guard = state.runtime_manifest.lock().await;
             *guard = Some(manifest.clone());
         }
-        let actor = default_deployment_actor(state);
-        runtime_sync_workers(state, &manifest, None, "watchdog_verify", &actor, false).await?;
+        tracing::info!(
+            "watchdog verify: remote runtime/core/vendor SSH sync disabled in v2 (use SYSTEM_UPDATE per hive)"
+        );
     }
-
-    let actor = default_deployment_actor(state);
-    core_sync_workers(state, "watchdog_verify", &actor, false).await?;
-    vendor_sync_workers(state, "watchdog_verify", &actor, false).await
+    Ok(())
 }
 
 async fn runtime_sync_workers(
