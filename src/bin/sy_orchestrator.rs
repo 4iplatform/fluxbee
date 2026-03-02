@@ -6121,16 +6121,23 @@ fn add_hive_flow(
                 "message": format!("enable {name}: {err}"),
             });
         }
+        let service_cmd = if *name == "sy-orchestrator" {
+            format!(
+                "systemctl start {name} || (systemctl reset-failed {name} || true; sleep 1; systemctl start {name})"
+            )
+        } else {
+            format!("systemctl restart {name}")
+        };
         if let Err(err) = ssh_with_key(
             address,
             &key_path,
-            &sudo_wrap(&format!("systemctl restart {name}")),
+            &sudo_wrap(&service_cmd),
             BOOTSTRAP_SSH_USER,
         ) {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SERVICE_FAILED",
-                "message": format!("restart {name}: {err}"),
+                "message": format!("start/restart {name}: {err}"),
             });
         }
     }
