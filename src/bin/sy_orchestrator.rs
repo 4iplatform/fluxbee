@@ -3317,10 +3317,11 @@ done";
     match hive_access(hive_id) {
         Ok((addr, key_path)) => {
             address = addr;
+            let cleanup_cmd_q = shell_single_quote(cleanup_cmd);
             if let Err(err) = ssh_with_key(
                 &address,
                 &key_path,
-                &sudo_wrap(cleanup_cmd),
+                &sudo_wrap(&format!("bash -lc '{}'", cleanup_cmd_q)),
                 BOOTSTRAP_SSH_USER,
             ) {
                 tracing::warn!(
@@ -6119,7 +6120,9 @@ fn add_hive_flow(
                 "systemctl start {name} || (systemctl reset-failed {name} || true; sleep 1; systemctl start {name})"
             )
         } else {
-            format!("systemctl restart {name}")
+            format!(
+                "systemctl restart {name} || (systemctl reset-failed {name} || true; sleep 1; systemctl start {name})"
+            )
         };
         if let Err(err) = ssh_with_key(
             address,
