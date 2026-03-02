@@ -255,6 +255,7 @@ struct RuntimeRetentionStats {
 
 struct OrchestratorState {
     hive_id: String,
+    is_motherbee: bool,
     started_at: Instant,
     config_dir: PathBuf,
     state_dir: PathBuf,
@@ -297,8 +298,12 @@ async fn main() -> Result<(), OrchestratorError> {
     let socket_dir = json_router::paths::router_socket_dir();
 
     let hive = load_hive(&config_dir)?;
-    if !is_mother_role(hive.role.as_deref()) {
-        tracing::warn!("SY.orchestrator solo corre en motherbee; role != motherbee");
+    let is_motherbee = is_mother_role(hive.role.as_deref());
+    if !is_motherbee && !is_worker_role(hive.role.as_deref()) {
+        tracing::warn!(
+            role = ?hive.role,
+            "SY.orchestrator supports only role=motherbee|worker; exiting"
+        );
         return Ok(());
     }
     let gateway_name = hive
@@ -320,6 +325,7 @@ async fn main() -> Result<(), OrchestratorError> {
     tracing::info!(allowed = ?system_allowed_origins, "system message origin allowlist loaded");
     let state = OrchestratorState {
         hive_id: hive.hive_id.clone(),
+        is_motherbee,
         started_at: Instant::now(),
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
@@ -361,6 +367,14 @@ async fn main() -> Result<(), OrchestratorError> {
         connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     tracing::info!("connected to router");
     tracing::info!(hive = %hive.hive_id, "hive ready");
+    tracing::info!(
+        mode = if state.is_motherbee {
+            "motherbee-control-plane"
+        } else {
+            "worker-agent"
+        },
+        "orchestrator role mode"
+    );
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -749,6 +763,39 @@ async fn shutdown_sequence(state: &OrchestratorState) {
     }
 }
 
+async fn send_admin_forbidden(
+    sender: &NodeSender,
+    msg: &Message,
+    action: &str,
+    reason: &str,
+) -> Result<(), OrchestratorError> {
+    let payload = serde_json::json!({
+        "status": "error",
+        "error_code": "FORBIDDEN",
+        "message": reason,
+    });
+    let reply = Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            dst: Destination::Unicast(msg.routing.src.clone()),
+            ttl: 16,
+            trace_id: msg.routing.trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: "admin".to_string(),
+            msg: None,
+            scope: None,
+            target: None,
+            action: Some(action.to_string()),
+            priority: None,
+            context: None,
+        },
+        payload,
+    };
+    sender.send(reply).await?;
+    Ok(())
+}
+
 async fn handle_admin(
     sender: &NodeSender,
     msg: &Message,
@@ -842,10 +889,10 @@ async fn handle_admin(
         "get_deployments" => get_deployments_flow(state, &msg.payload),
         "list_drift_alerts" => list_drift_alerts_flow(&msg.payload),
         "get_drift_alerts" => get_drift_alerts_flow(state, &msg.payload),
-        "run_node" => run_node_flow(state, &msg.payload),
-        "kill_node" => kill_node_flow(state, &msg.payload),
-        "run_router" => run_router_flow(state, &msg.payload),
-        "kill_router" => kill_router_flow(state, &msg.payload),
+        "run_node" => run_node_flow(state, &msg.payload).await,
+        "kill_node" => kill_node_flow(state, &msg.payload).await,
+        "run_router" => run_router_flow(state, &msg.payload).await,
+        "kill_router" => kill_router_flow(state, &msg.payload).await,
         "list_hives" => {
             serde_json::json!({
                 "status": "ok",
@@ -879,6 +926,15 @@ async fn handle_admin(
             }
         }
         "remove_hive" => {
+            if !state.is_motherbee {
+                return send_admin_forbidden(
+                    sender,
+                    msg,
+                    action,
+                    "add_hive/remove_hive are motherbee-only",
+                )
+                .await;
+            }
             let hive = msg
                 .payload
                 .get("hive_id")
@@ -895,6 +951,15 @@ async fn handle_admin(
             }
         }
         "add_hive" => {
+            if !state.is_motherbee {
+                return send_admin_forbidden(
+                    sender,
+                    msg,
+                    action,
+                    "add_hive/remove_hive are motherbee-only",
+                )
+                .await;
+            }
             let hive_id = msg
                 .payload
                 .get("hive_id")
@@ -953,11 +1018,21 @@ async fn handle_system_message(
 ) -> Result<(), OrchestratorError> {
     let action = msg.meta.msg.as_deref().unwrap_or_default();
     let mut source_name: Option<String> = None;
-    if matches!(action, "RUNTIME_UPDATE" | "SPAWN_NODE" | "KILL_NODE") {
+    if matches!(
+        action,
+        "RUNTIME_UPDATE"
+            | "SYSTEM_UPDATE"
+            | "SPAWN_NODE"
+            | "KILL_NODE"
+            | "RUN_ROUTER"
+            | "KILL_ROUTER"
+    ) {
         source_name = resolve_system_source_name_with_retry(state, &msg.routing.src).await;
-        let is_allowed = source_name
-            .as_deref()
-            .is_some_and(|name| state.system_allowed_origins.contains(name));
+        let is_allowed = source_name.as_deref().is_some_and(|name| {
+            state.system_allowed_origins.contains(name)
+                || name.starts_with("SY.orchestrator@")
+                || name.starts_with("SY.orchestrator.")
+        });
         if !is_allowed {
             tracing::warn!(
                 action = action,
@@ -983,6 +1058,11 @@ async fn handle_system_message(
                     )
                     .await;
                 }
+                "SYSTEM_UPDATE" => {
+                    let _ =
+                        send_system_action_response(sender, msg, "SYSTEM_UPDATE_RESPONSE", payload)
+                            .await;
+                }
                 "SPAWN_NODE" => {
                     let _ =
                         send_system_action_response(sender, msg, "SPAWN_NODE_RESPONSE", payload)
@@ -992,6 +1072,16 @@ async fn handle_system_message(
                     let _ = send_system_action_response(sender, msg, "KILL_NODE_RESPONSE", payload)
                         .await;
                 }
+                "RUN_ROUTER" => {
+                    let _ =
+                        send_system_action_response(sender, msg, "RUN_ROUTER_RESPONSE", payload)
+                            .await;
+                }
+                "KILL_ROUTER" => {
+                    let _ =
+                        send_system_action_response(sender, msg, "KILL_ROUTER_RESPONSE", payload)
+                            .await;
+                }
                 _ => {}
             }
             return Ok(());
@@ -999,6 +1089,11 @@ async fn handle_system_message(
     }
 
     match msg.meta.msg.as_deref() {
+        Some("SYSTEM_UPDATE") => {
+            let result = handle_system_update_message(state, msg).await;
+            let _ =
+                send_system_action_response(sender, msg, "SYSTEM_UPDATE_RESPONSE", result).await;
+        }
         Some("RUNTIME_UPDATE") => {
             let actor = source_name.unwrap_or_else(|| format!("uuid:{}", msg.routing.src));
             let incoming = match parse_runtime_manifest(&msg.payload) {
@@ -1170,18 +1265,230 @@ async fn handle_system_message(
             }
         }
         Some("SPAWN_NODE") => {
-            let result = run_node_flow(state, &msg.payload);
+            let result = run_node_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "SPAWN_NODE processed");
             let _ = send_system_action_response(sender, msg, "SPAWN_NODE_RESPONSE", result).await;
         }
         Some("KILL_NODE") => {
-            let result = kill_node_flow(state, &msg.payload);
+            let result = kill_node_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "KILL_NODE processed");
             let _ = send_system_action_response(sender, msg, "KILL_NODE_RESPONSE", result).await;
+        }
+        Some("RUN_ROUTER") => {
+            let result = run_router_flow(state, &msg.payload).await;
+            tracing::info!(result = %result, "RUN_ROUTER processed");
+            let _ = send_system_action_response(sender, msg, "RUN_ROUTER_RESPONSE", result).await;
+        }
+        Some("KILL_ROUTER") => {
+            let result = kill_router_flow(state, &msg.payload).await;
+            tracing::info!(result = %result, "KILL_ROUTER processed");
+            let _ = send_system_action_response(sender, msg, "KILL_ROUTER_RESPONSE", result).await;
         }
         _ => {}
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct LocalSystemManifestState {
+    version: Option<u64>,
+    hash: Option<String>,
+}
+
+fn local_system_manifest_state(
+    category: &str,
+) -> Result<LocalSystemManifestState, OrchestratorError> {
+    match category {
+        "runtime" => Ok(LocalSystemManifestState {
+            version: load_runtime_manifest().map(|manifest| manifest.version),
+            hash: local_runtime_manifest_hash()?,
+        }),
+        "core" => Ok(LocalSystemManifestState {
+            version: None,
+            hash: local_core_manifest_hash()?,
+        }),
+        "vendor" => Ok(LocalSystemManifestState {
+            version: load_vendor_manifest()?.map(|manifest| manifest.version),
+            hash: local_syncthing_vendor_hash()?,
+        }),
+        _ => Err(format!("unknown system update category '{}'", category).into()),
+    }
+}
+
+fn parse_system_update_payload(
+    payload: &serde_json::Value,
+) -> Result<(String, u64, String), OrchestratorError> {
+    let category = payload
+        .get("category")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "runtime".to_string());
+    if !matches!(category.as_str(), "runtime" | "core" | "vendor") {
+        return Err("category must be one of runtime/core/vendor".into());
+    }
+
+    let manifest_version = payload
+        .get("manifest_version")
+        .or_else(|| payload.get("version"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+
+    let manifest_hash = payload
+        .get("manifest_hash")
+        .or_else(|| payload.get("hash"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("missing manifest_hash (or hash)")?
+        .to_string();
+
+    Ok((category, manifest_version, manifest_hash))
+}
+
+async fn restart_local_core_services_with_health_gate() -> Result<Vec<String>, OrchestratorError> {
+    let mut restarted = Vec::new();
+    for service in CORE_SYNC_RESTART_ORDER {
+        if *service == "sy-orchestrator" {
+            // Avoid self-restart while processing the request; operator can restart orchestrator separately.
+            continue;
+        }
+        if !systemd_unit_exists(service) {
+            continue;
+        }
+        systemd_start(service)?;
+        wait_for_service_active(
+            service,
+            Duration::from_secs(CORE_SERVICE_HEALTH_TIMEOUT_SECS),
+        )
+        .await?;
+        restarted.push((*service).to_string());
+    }
+    Ok(restarted)
+}
+
+async fn apply_system_update_local(
+    state: &OrchestratorState,
+    category: &str,
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), OrchestratorError> {
+    match category {
+        "runtime" => {
+            let manifest = load_runtime_manifest().ok_or("runtime manifest missing locally")?;
+            apply_runtime_retention(&manifest)?;
+            {
+                let mut guard = state.runtime_manifest.lock().await;
+                *guard = Some(manifest);
+            }
+            Ok((Vec::new(), vec!["runtime-manifest".to_string()], Vec::new()))
+        }
+        "core" => {
+            let manifest = load_core_manifest()?;
+            let mut local_paths = Vec::new();
+            for name in manifest.components.keys() {
+                let path = Path::new(CORE_BIN_SOURCE_DIR).join(name);
+                if !path.exists() {
+                    return Err(format!("missing core source binary '{}'", path.display()).into());
+                }
+                local_paths.push(path.display().to_string());
+            }
+            validate_core_manifest_for_bins(&local_paths)?;
+            let restarted = restart_local_core_services_with_health_gate().await?;
+            let unchanged = manifest.components.keys().cloned().collect::<Vec<_>>();
+            Ok((Vec::new(), unchanged, restarted))
+        }
+        "vendor" => {
+            let desired_blob = current_blob_runtime_config(state);
+            if desired_blob.sync_enabled && blob_sync_tool_is_syncthing(&desired_blob) {
+                ensure_blob_sync_runtime(&desired_blob).await?;
+                Ok((
+                    Vec::new(),
+                    vec!["syncthing".to_string()],
+                    vec![SYNCTHING_SERVICE_NAME.to_string()],
+                ))
+            } else {
+                Ok((
+                    Vec::new(),
+                    vec!["vendor-sync-disabled".to_string()],
+                    Vec::new(),
+                ))
+            }
+        }
+        _ => Err(format!("unknown system update category '{}'", category).into()),
+    }
+}
+
+async fn handle_system_update_message(
+    state: &OrchestratorState,
+    msg: &Message,
+) -> serde_json::Value {
+    let (category, expected_version, expected_hash) =
+        match parse_system_update_payload(&msg.payload) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "MANIFEST_INVALID",
+                    "message": err.to_string(),
+                    "category": msg.payload.get("category").and_then(|v| v.as_str()).unwrap_or(""),
+                });
+            }
+        };
+
+    let local = match local_system_manifest_state(&category) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "MANIFEST_INVALID",
+                "message": err.to_string(),
+                "category": category,
+            });
+        }
+    };
+
+    let local_version = local.version.unwrap_or(0);
+    let local_hash = local.hash.unwrap_or_default();
+    let expected_hash_norm = normalize_sha256(&expected_hash);
+    let local_hash_norm = normalize_sha256(&local_hash);
+    let version_match = if expected_version == 0 || local.version.is_none() {
+        true
+    } else {
+        local_version == expected_version
+    };
+    let hash_match = !local_hash_norm.is_empty() && local_hash_norm == expected_hash_norm;
+
+    if !(version_match && hash_match) {
+        return serde_json::json!({
+            "status": "sync_pending",
+            "category": category,
+            "manifest_version": expected_version,
+            "local_manifest_version": local.version,
+            "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
+            "message": "Local manifest does not match expected. Sync channel may still be propagating.",
+        });
+    }
+
+    match apply_system_update_local(state, &category).await {
+        Ok((updated, unchanged, restarted)) => serde_json::json!({
+            "status": "ok",
+            "category": category,
+            "manifest_version": expected_version,
+            "local_manifest_version": local.version,
+            "local_manifest_hash": local_hash,
+            "updated": updated,
+            "unchanged": unchanged,
+            "restarted": restarted,
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "UPDATE_FAILED",
+            "message": err.to_string(),
+            "category": category,
+            "manifest_version": expected_version,
+            "local_manifest_version": local.version,
+            "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
+        }),
+    }
 }
 
 fn load_system_allowed_origins(hive_id: &str) -> HashSet<String> {
@@ -4003,7 +4310,103 @@ fn sync_runtime_to_hive(
     sync_runtime_to_worker(target_hive, &address, &key_path)
 }
 
-fn run_node_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+fn system_forward_timeout() -> Duration {
+    let secs = std::env::var("JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(45);
+    Duration::from_secs(secs)
+}
+
+async fn forward_system_action_to_hive(
+    state: &OrchestratorState,
+    target_hive: &str,
+    request_msg: &str,
+    response_msg: &str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, OrchestratorError> {
+    let socket_dir = json_router::paths::router_socket_dir();
+    let relay_name = format!("SY.orchestrator.relay.{}", now_epoch_ms());
+    let relay_config = NodeConfig {
+        name: relay_name,
+        router_socket: socket_dir,
+        uuid_persistence_dir: state.state_dir.join("nodes"),
+        config_dir: state.config_dir.clone(),
+        version: "1.0".to_string(),
+    };
+    let connect_timeout = Duration::from_secs(5);
+    let (relay_sender, mut relay_receiver) = match time::timeout(
+        connect_timeout,
+        connect_with_retry(&relay_config, Duration::from_millis(100)),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(format!(
+                "system forward timeout while connecting relay node to local router ({}s)",
+                connect_timeout.as_secs()
+            )
+            .into());
+        }
+    };
+
+    let trace_id = Uuid::new_v4().to_string();
+    let request = Message {
+        routing: Routing {
+            src: relay_sender.uuid().to_string(),
+            dst: Destination::Unicast(format!("SY.orchestrator@{target_hive}")),
+            ttl: 16,
+            trace_id: trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(request_msg.to_string()),
+            scope: None,
+            target: None,
+            action: None,
+            priority: None,
+            context: None,
+        },
+        payload,
+    };
+    relay_sender.send(request).await?;
+
+    let forward_timeout = system_forward_timeout();
+    let wait_response = async {
+        loop {
+            let incoming = relay_receiver.recv().await?;
+            if incoming.meta.msg_type != SYSTEM_KIND {
+                continue;
+            }
+            if incoming.routing.trace_id != trace_id {
+                continue;
+            }
+            if incoming.meta.msg.as_deref() != Some(response_msg) {
+                continue;
+            }
+            return Ok::<serde_json::Value, OrchestratorError>(incoming.payload);
+        }
+    };
+
+    match time::timeout(forward_timeout, wait_response).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "system forward timeout msg={} response={} target={} timeout_secs={}",
+            request_msg,
+            response_msg,
+            target_hive,
+            forward_timeout.as_secs()
+        )
+        .into()),
+    }
+}
+
+async fn run_node_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
     let runtime = payload
         .get("runtime")
         .and_then(|v| v.as_str())
@@ -4077,6 +4480,31 @@ fn run_node_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serd
             )
         });
 
+    if target_hive != state.hive_id {
+        let mut forwarded_payload = payload.clone();
+        if let Some(obj) = forwarded_payload.as_object_mut() {
+            obj.insert("target".to_string(), serde_json::json!(target_hive));
+        }
+        return match forward_system_action_to_hive(
+            state,
+            &target_hive,
+            "SPAWN_NODE",
+            "SPAWN_NODE_RESPONSE",
+            forwarded_payload,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "SPAWN_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+                "unit": unit,
+            }),
+        };
+    }
+
     let start_script = runtime_start_script(runtime, &version);
     match hive_has_runtime_script(state, &target_hive, &start_script) {
         Ok(true) => {}
@@ -4143,7 +4571,10 @@ fn run_node_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serd
     }
 }
 
-fn kill_node_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+async fn kill_node_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
     let node_name = payload
         .get("node_name")
         .and_then(|v| v.as_str())
@@ -4197,6 +4628,33 @@ fn kill_node_flow(state: &OrchestratorState, payload: &serde_json::Value) -> ser
         format!("systemctl stop {unit} || true; systemctl reset-failed {unit} || true")
     };
 
+    if target_hive != state.hive_id {
+        let mut forwarded_payload = payload.clone();
+        if let Some(obj) = forwarded_payload.as_object_mut() {
+            obj.insert("target".to_string(), serde_json::json!(target_hive));
+            obj.insert("unit".to_string(), serde_json::json!(unit));
+            obj.insert("signal".to_string(), serde_json::json!(signal));
+        }
+        return match forward_system_action_to_hive(
+            state,
+            &target_hive,
+            "KILL_NODE",
+            "KILL_NODE_RESPONSE",
+            forwarded_payload,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "KILL_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+                "unit": unit,
+            }),
+        };
+    }
+
     match execute_on_hive(state, &target_hive, &cmd, "kill_node") {
         Ok(()) => serde_json::json!({
             "status": "ok",
@@ -4214,7 +4672,10 @@ fn kill_node_flow(state: &OrchestratorState, payload: &serde_json::Value) -> ser
     }
 }
 
-fn run_router_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+async fn run_router_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
     let target_hive = target_hive_from_payload(payload, &state.hive_id);
     let service = payload
         .get("service")
@@ -4228,6 +4689,32 @@ fn run_router_flow(state: &OrchestratorState, payload: &serde_json::Value) -> se
             "error_code": "INVALID_REQUEST",
             "message": "invalid service",
         });
+    }
+
+    if target_hive != state.hive_id {
+        let mut forwarded_payload = payload.clone();
+        if let Some(obj) = forwarded_payload.as_object_mut() {
+            obj.insert("target".to_string(), serde_json::json!(target_hive));
+            obj.insert("service".to_string(), serde_json::json!(service));
+        }
+        return match forward_system_action_to_hive(
+            state,
+            &target_hive,
+            "RUN_ROUTER",
+            "RUN_ROUTER_RESPONSE",
+            forwarded_payload,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "SERVICE_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+                "service": service,
+            }),
+        };
     }
 
     let cmd = format!("systemctl start {service}");
@@ -4247,7 +4734,10 @@ fn run_router_flow(state: &OrchestratorState, payload: &serde_json::Value) -> se
     }
 }
 
-fn kill_router_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+async fn kill_router_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
     let target_hive = target_hive_from_payload(payload, &state.hive_id);
     let service = payload
         .get("service")
@@ -4261,6 +4751,32 @@ fn kill_router_flow(state: &OrchestratorState, payload: &serde_json::Value) -> s
             "error_code": "INVALID_REQUEST",
             "message": "invalid service",
         });
+    }
+
+    if target_hive != state.hive_id {
+        let mut forwarded_payload = payload.clone();
+        if let Some(obj) = forwarded_payload.as_object_mut() {
+            obj.insert("target".to_string(), serde_json::json!(target_hive));
+            obj.insert("service".to_string(), serde_json::json!(service));
+        }
+        return match forward_system_action_to_hive(
+            state,
+            &target_hive,
+            "KILL_ROUTER",
+            "KILL_ROUTER_RESPONSE",
+            forwarded_payload,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "SERVICE_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+                "service": service,
+            }),
+        };
     }
 
     let cmd = format!("systemctl stop {service}");
@@ -4286,15 +4802,15 @@ fn execute_on_hive(
     command: &str,
     label: &str,
 ) -> Result<(), OrchestratorError> {
-    if target_hive == state.hive_id {
-        let mut cmd = Command::new("bash");
-        cmd.arg("-lc").arg(command);
-        return run_cmd(cmd, label);
+    if target_hive != state.hive_id {
+        return Err(format!(
+            "remote execute disabled for '{label}' in v2 path; forward via SYSTEM message to SY.orchestrator@{target_hive}"
+        )
+        .into());
     }
-
-    let (address, key_path) = hive_access(target_hive)?;
-    ensure_remote_orchestrator_sudoers_with_access(&address, &key_path)?;
-    ssh_with_key(&address, &key_path, &sudo_wrap(command), BOOTSTRAP_SSH_USER)
+    let mut cmd = Command::new("bash");
+    cmd.arg("-lc").arg(command);
+    run_cmd(cmd, label)
 }
 
 fn hive_access(hive_id: &str) -> Result<(String, PathBuf), OrchestratorError> {
@@ -4604,7 +5120,10 @@ fn remote_wait_service_active(
         format!("{service}.service")
     };
     let service_q = shell_single_quote(&service_unit);
-    let is_active_cmd = format!("systemctl is-active --quiet '{service}'", service = service_q);
+    let is_active_cmd = format!(
+        "systemctl is-active --quiet '{service}'",
+        service = service_q
+    );
     let substate_cmd = format!(
         "systemctl show '{service}' --property=SubState --value 2>/dev/null || true",
         service = service_q
@@ -5278,6 +5797,9 @@ fn add_hive_flow(
         ("rt-gateway", "/usr/bin/rt-gateway"),
         ("sy-config-routes", "/usr/bin/sy-config-routes"),
         ("sy-opa-rules", "/usr/bin/sy-opa-rules"),
+        ("sy-admin", "/usr/bin/sy-admin"),
+        ("sy-storage", "/usr/bin/sy-storage"),
+        ("sy-orchestrator", "/usr/bin/sy-orchestrator"),
     ];
     if has_identity_source {
         worker_units.push(("sy-identity", "/usr/bin/sy-identity"));
@@ -5344,7 +5866,9 @@ fn add_hive_flow(
         let remote_vendor_hash_before = remote_syncthing_installed_hash(address, &key_path)
             .ok()
             .flatten();
-        if let Err(err) = ensure_remote_syncthing_runtime_with_access(address, &key_path, &desired_blob) {
+        if let Err(err) =
+            ensure_remote_syncthing_runtime_with_access(address, &key_path, &desired_blob)
+        {
             let rollback_note = attempt_remote_syncthing_rollback_note(address, &key_path);
             let reason = format!("syncthing setup failed: {err}; {rollback_note}");
             let entry = DeploymentHistoryEntry {
@@ -5413,13 +5937,28 @@ fn add_hive_flow(
         wan_connected = false;
         wan_wait_error = Some(err.to_string());
     }
+    let mut orchestrator_connected = true;
+    let mut orchestrator_wait_error = None;
+    if wan_connected {
+        if let Err(err) =
+            wait_for_remote_orchestrator_node(&state.hive_id, hive_id, Duration::from_secs(60))
+        {
+            tracing::warn!(
+                hive_id = hive_id,
+                error = %err,
+                "worker orchestrator did not appear in LSA in time"
+            );
+            orchestrator_connected = false;
+            orchestrator_wait_error = Some(err.to_string());
+        }
+    }
 
     let info_path = hives_root().join(hive_id).join("info.yaml");
     let info = serde_yaml::to_string(&serde_json::json!({
         "hive_id": hive_id,
         "address": address,
         "created_at": now_epoch_ms().to_string(),
-        "status": if wan_connected { "connected" } else { "pending" },
+        "status": if wan_connected && orchestrator_connected { "connected" } else { "pending" },
     }))
     .unwrap_or_default();
     if let Err(err) = fs::write(info_path, info) {
@@ -5442,6 +5981,20 @@ fn add_hive_flow(
             "wan_connected": false,
         });
     }
+    if !orchestrator_connected {
+        let detail = orchestrator_wait_error
+            .unwrap_or_else(|| "worker orchestrator not observed in LSA".to_string());
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "WORKER_ORCHESTRATOR_TIMEOUT",
+            "message": detail,
+            "hive_id": hive_id,
+            "address": address,
+            "harden_ssh": harden_ssh,
+            "wan_connected": true,
+            "orchestrator_connected": false,
+        });
+    }
 
     serde_json::json!({
         "status": "ok",
@@ -5449,6 +6002,7 @@ fn add_hive_flow(
         "address": address,
         "harden_ssh": harden_ssh,
         "wan_connected": true,
+        "orchestrator_connected": true,
     })
 }
 
@@ -5553,7 +6107,10 @@ fn run_cmd(mut cmd: Command, label: &str) -> Result<(), OrchestratorError> {
     if output.status.success() {
         return Ok(());
     }
-    let code = output.status.code().map_or("signal".to_string(), |c| c.to_string());
+    let code = output
+        .status
+        .code()
+        .map_or("signal".to_string(), |c| c.to_string());
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let detail = if !stderr.is_empty() {
@@ -5571,7 +6128,10 @@ fn run_cmd_output(mut cmd: Command, label: &str) -> Result<String, OrchestratorE
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).to_string());
     }
-    let code = output.status.code().map_or("signal".to_string(), |c| c.to_string());
+    let code = output
+        .status
+        .code()
+        .map_or("signal".to_string(), |c| c.to_string());
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let detail = if !stderr.is_empty() {
@@ -5732,7 +6292,10 @@ fn install_remote_ssh_gate_with_access(
     ssh_with_key(
         address,
         key_path,
-        &sudo_wrap(&format!("chmod 0755 {}", shell_single_quote(ORCH_SSH_GATE_PATH))),
+        &sudo_wrap(&format!(
+            "chmod 0755 {}",
+            shell_single_quote(ORCH_SSH_GATE_PATH)
+        )),
         BOOTSTRAP_SSH_USER,
     )?;
     Ok(())
@@ -5830,8 +6393,10 @@ fn ensure_remote_orchestrator_sudoers_with_access(
     // Always rewrite sudoers from known-good template.
     // This avoids stale/partial states that can leave sudo -n inconsistent.
 
-    let local_tmp =
-        std::env::temp_dir().join(format!("fluxbee-orchestrator-sudoers-{}.tmp", now_epoch_ms()));
+    let local_tmp = std::env::temp_dir().join(format!(
+        "fluxbee-orchestrator-sudoers-{}.tmp",
+        now_epoch_ms()
+    ));
     fs::write(&local_tmp, remote_orchestrator_sudoers_contents())?;
     let local_tmp_str = local_tmp.to_string_lossy().to_string();
     let local_refs = [local_tmp_str.as_str()];
@@ -6090,6 +6655,72 @@ fn wait_for_wan(
     }
 }
 
+fn wait_for_remote_orchestrator_node(
+    hive_id: &str,
+    remote_id: &str,
+    timeout: Duration,
+) -> Result<(), OrchestratorError> {
+    let expected_node = ensure_l2_name("SY.orchestrator", remote_id);
+    let shm_name = format!("/jsr-lsa-{}", hive_id);
+    let reader = LsaRegionReader::open_read_only(&shm_name)?;
+    let deadline = Instant::now() + timeout;
+    let mut last_visible_nodes: Vec<String> = Vec::new();
+
+    while Instant::now() < deadline {
+        if let Some(snapshot) = reader.read_snapshot() {
+            let now = now_epoch_ms();
+            let mut visible_nodes = Vec::new();
+            for node in &snapshot.nodes {
+                let hive_idx = node.hive_index as usize;
+                let Some(hive_entry) = snapshot.hives.get(hive_idx) else {
+                    continue;
+                };
+                let Some(hive_name) = remote_hive_name(hive_entry) else {
+                    continue;
+                };
+                if hive_name != remote_id {
+                    continue;
+                }
+                if remote_hive_is_stale(hive_entry, now) {
+                    continue;
+                }
+                if node.flags & (FLAG_DELETED | FLAG_STALE) != 0 {
+                    continue;
+                }
+                if node.name_len == 0 {
+                    continue;
+                }
+                let node_name =
+                    String::from_utf8_lossy(&node.name[..node.name_len as usize]).into_owned();
+                visible_nodes.push(node_name.clone());
+                if node_name == expected_node || node_name == "SY.orchestrator" {
+                    return Ok(());
+                }
+            }
+            visible_nodes.sort();
+            visible_nodes.dedup();
+            last_visible_nodes = visible_nodes;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    if last_visible_nodes.is_empty() {
+        Err(format!(
+            "orchestrator timeout: node '{}' not observed on hive '{}' (no remote nodes visible)",
+            expected_node, remote_id
+        )
+        .into())
+    } else {
+        Err(format!(
+            "orchestrator timeout: node '{}' not observed on hive '{}' (visible: {})",
+            expected_node,
+            remote_id,
+            last_visible_nodes.join(", ")
+        )
+        .into())
+    }
+}
+
 fn remote_hive_match(entry: &RemoteHiveEntry, target: &str) -> bool {
     if entry.hive_id_len == 0 {
         return false;
@@ -6250,6 +6881,10 @@ fn is_mother_role(role: Option<&str>) -> bool {
     matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee" || r == "mother")
 }
 
+fn is_worker_role(role: Option<&str>) -> bool {
+    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "worker")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6265,6 +6900,7 @@ mod tests {
     fn test_state() -> OrchestratorState {
         OrchestratorState {
             hive_id: "sandbox".to_string(),
+            is_motherbee: true,
             started_at: Instant::now(),
             config_dir: PathBuf::from("/tmp"),
             state_dir: PathBuf::from("/tmp"),

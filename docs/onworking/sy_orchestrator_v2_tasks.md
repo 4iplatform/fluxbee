@@ -35,6 +35,7 @@ Cerrar el cambio de arquitectura a:
 - [ ] V0.1 Marcar en docs de trabajo que el modelo remoto-SSH queda deprecado para operacion diaria.
 - [ ] V0.2 Alinear `sy_orchestrator_tasks.md` y `sy_admin_tasks.md` con referencia a este plan v2.
 - [ ] V0.3 Congelar nuevos cambios fuera de spec v2 para evitar desvio.
+- [ ] V0.4 Declarar explicitamente jerarquia documental: `SY.orchestrator — Spec de Cambios v2.md` > `docs/02-protocolo.md` > `docs/07-operaciones.md` mientras dure esta migracion.
 
 Salida:
 
@@ -46,6 +47,8 @@ Salida:
 - [ ] V1.2 Retirar `RUNTIME_UPDATE` del flujo canónico (dejarlo explicitamente obsoleto en docs).
 - [ ] V1.3 Formalizar contrato v2 de `SPAWN_NODE`/`KILL_NODE` (campos, errores, semantica `force`).
 - [ ] V1.4 Definir codigos de error canonicos para update (`ok/sync_pending/partial/error/rollback`).
+- [ ] V1.5 Actualizar `docs/07-operaciones.md` para eliminar flujo remoto por SSH en operacion diaria y reflejar modelo local-only en workers.
+- [ ] V1.6 Revisar y corregir tablas de API/ownership en `docs/07-operaciones.md` segun endpoints y mensajes v2.
 
 Salida:
 
@@ -66,11 +69,13 @@ Salida:
 
 ### Fase 3 - Orchestrator por rol (motherbee vs worker)
 
-- [ ] V3.1 Gatear `add_hive`/`remove_hive` a `role=motherbee`.
-- [ ] V3.2 Hacer que worker rechace provisioning actions con error explicito.
-- [ ] V3.3 En `add_hive`, instalar `sy-orchestrator` + unit systemd en worker y habilitar arranque.
-- [ ] V3.4 Validar readiness del worker por presencia de `SY.orchestrator@worker-*` en L2.
+- [x] V3.1 Gatear `add_hive`/`remove_hive` a `role=motherbee`.
+- [x] V3.2 Hacer que worker rechace provisioning actions con error explicito.
+- [x] V3.3 En `add_hive`, instalar `sy-orchestrator` + unit systemd en worker y habilitar arranque.
+- [x] V3.4 Validar readiness del worker por presencia de `SY.orchestrator@worker-*` en L2.
 - [ ] V3.5 Ajustar bootstrap para que `rt-gateway` sea dependencia de systemd del orchestrator (segun spec v2).
+
+Nota (2026-03-02): `add_hive` ahora espera WAN + presencia de `SY.orchestrator@<worker>` en LSA y devuelve `WORKER_ORCHESTRATOR_TIMEOUT` si no converge.
 
 Salida:
 
@@ -78,10 +83,12 @@ Salida:
 
 ### Fase 4 - Eliminar ejecucion remota SSH en operacion
 
-- [ ] V4.1 Reescribir `execute_on_hive` para ejecucion exclusivamente local.
-- [ ] V4.2 Mover ejecucion remota a unicast de mensajes hacia orchestrator destino.
-- [ ] V4.3 Actualizar `run_node`/`kill_node`/`run_router`/`kill_router` para modelo local-only en destino.
+- [x] V4.1 Reescribir `execute_on_hive` para ejecucion exclusivamente local.
+- [x] V4.2 Mover ejecucion remota a unicast de mensajes hacia orchestrator destino.
+- [x] V4.3 Actualizar `run_node`/`kill_node`/`run_router`/`kill_router` para modelo local-only en destino.
 - [ ] V4.4 Quitar rutas de codigo de SSH operativo en flujos de run/kill/update.
+
+Nota (2026-03-02): V4.2/V4.3 quedaron implementadas con forward `system` request/response y deshabilitacion explicita de SSH en `execute_on_hive`. La efectividad end-to-end depende de tener `SY.orchestrator` activo en workers (Fase 3).
 
 Salida:
 
