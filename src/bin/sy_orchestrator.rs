@@ -5911,9 +5911,15 @@ fn add_hive_flow(
     }
 
     for (name, exec_path) in &worker_units {
-        let unit = format!(
-            "[Unit]\nDescription=Fluxbee {name}\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
-        );
+        let unit = if *name == "sy-orchestrator" {
+            format!(
+                "[Unit]\nDescription=Fluxbee {name}\nAfter=network.target rt-gateway.service\nWants=rt-gateway.service\nRequires=rt-gateway.service\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
+            )
+        } else {
+            format!(
+                "[Unit]\nDescription=Fluxbee {name}\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
+            )
+        };
         let unit_path = format!("/etc/systemd/system/{name}.service");
         if let Err(err) = write_remote_file(address, &key_path, &unit_path, &unit) {
             return serde_json::json!({

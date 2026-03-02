@@ -73,9 +73,9 @@ Salida:
 - [x] V3.2 Hacer que worker rechace provisioning actions con error explicito.
 - [x] V3.3 En `add_hive`, instalar `sy-orchestrator` + unit systemd en worker y habilitar arranque.
 - [x] V3.4 Validar readiness del worker por presencia de `SY.orchestrator@worker-*` en L2.
-- [ ] V3.5 Ajustar bootstrap para que `rt-gateway` sea dependencia de systemd del orchestrator (segun spec v2).
+- [x] V3.5 Ajustar bootstrap para que `rt-gateway` sea dependencia de systemd del orchestrator (segun spec v2).
 
-Nota (2026-03-02): `add_hive` ahora espera WAN + presencia de `SY.orchestrator@<worker>` en LSA y devuelve `WORKER_ORCHESTRATOR_TIMEOUT` si no converge.
+Nota (2026-03-02): `add_hive` ahora espera WAN + presencia de `SY.orchestrator@<worker>` en LSA y devuelve `WORKER_ORCHESTRATOR_TIMEOUT` si no converge. El unit remoto de `sy-orchestrator` se genera con dependencia explícita de `rt-gateway` (`After/Wants/Requires`).
 
 Salida:
 
