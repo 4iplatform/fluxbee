@@ -3307,22 +3307,13 @@ fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_json::Val
 
     let mut remote_cleanup = "stopped";
     let mut address = String::new();
-    let cleanup_cmd = "systemctl disable --now rt-gateway >/dev/null 2>&1 || true; \
-systemctl stop rt-gateway >/dev/null 2>&1 || true; \
-systemctl kill -s KILL rt-gateway >/dev/null 2>&1 || true; \
-systemctl reset-failed rt-gateway >/dev/null 2>&1 || true; \
-systemctl disable --now sy-config-routes >/dev/null 2>&1 || true; \
-systemctl stop sy-config-routes >/dev/null 2>&1 || true; \
-systemctl kill -s KILL sy-config-routes >/dev/null 2>&1 || true; \
-systemctl reset-failed sy-config-routes >/dev/null 2>&1 || true; \
-systemctl disable --now sy-opa-rules >/dev/null 2>&1 || true; \
-systemctl stop sy-opa-rules >/dev/null 2>&1 || true; \
-systemctl kill -s KILL sy-opa-rules >/dev/null 2>&1 || true; \
-systemctl reset-failed sy-opa-rules >/dev/null 2>&1 || true; \
-systemctl disable --now sy-identity >/dev/null 2>&1 || true; \
-systemctl stop sy-identity >/dev/null 2>&1 || true; \
-systemctl kill -s KILL sy-identity >/dev/null 2>&1 || true; \
-systemctl reset-failed sy-identity >/dev/null 2>&1 || true";
+    // Keep remove_hive responsive: cleanup is best-effort and non-blocking.
+    let cleanup_cmd = "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-orchestrator sy-admin sy-storage fluxbee-syncthing; do \
+systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
+systemctl disable \"$s\" >/dev/null 2>&1 || true; \
+systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
+systemctl reset-failed \"$s\" >/dev/null 2>&1 || true; \
+done";
     match hive_access(hive_id) {
         Ok((addr, key_path)) => {
             address = addr;
@@ -3332,13 +3323,13 @@ systemctl reset-failed sy-identity >/dev/null 2>&1 || true";
                 &sudo_wrap(cleanup_cmd),
                 BOOTSTRAP_SSH_USER,
             ) {
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": "REMOVE_FAILED",
-                    "message": format!("remote cleanup failed: {err}"),
-                    "hive_id": hive_id,
-                    "address": address,
-                });
+                tracing::warn!(
+                    hive_id = hive_id,
+                    address = %address,
+                    error = %err,
+                    "remote cleanup failed; proceeding with local hive state removal"
+                );
+                remote_cleanup = "failed_skipped";
             }
         }
         Err(err) => {
