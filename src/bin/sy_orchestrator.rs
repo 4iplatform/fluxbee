@@ -272,13 +272,14 @@ struct OrchestratorState {
     blob_sync_last_desired: Mutex<BlobRuntimeConfig>,
 }
 
-const CRITICAL_SERVICES: [&str; 5] = [
+const MOTHERBEE_CRITICAL_SERVICES: [&str; 5] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-admin",
     "sy-storage",
 ];
+const WORKER_CRITICAL_SERVICES: [&str; 3] = ["rt-gateway", "sy-config-routes", "sy-opa-rules"];
 
 #[tokio::main]
 async fn main() -> Result<(), OrchestratorError> {
@@ -458,7 +459,11 @@ async fn bootstrap_local(
         disable_remote_blob_sync_all_hives(state);
     }
 
-    let mut services = vec!["sy-config-routes", "sy-opa-rules", "sy-admin", "sy-storage"];
+    let mut services = if state.is_motherbee {
+        vec!["sy-config-routes", "sy-opa-rules", "sy-admin", "sy-storage"]
+    } else {
+        vec!["sy-config-routes", "sy-opa-rules"]
+    };
     if identity_available() {
         services.push("sy-identity");
     }
@@ -477,16 +482,18 @@ async fn bootstrap_local(
             "sy nodes did not fully bootstrap before timeout; continuing and relying on watchdog restarts"
         );
     }
-    wait_for_service_active(
-        "sy-storage",
-        Duration::from_secs(STORAGE_BOOTSTRAP_TIMEOUT_SECS),
-    )
-    .await?;
-    wait_for_storage_db_ready(
-        &state.config_dir,
-        Duration::from_secs(STORAGE_DB_READINESS_TIMEOUT_SECS),
-    )
-    .await?;
+    if state.is_motherbee {
+        wait_for_service_active(
+            "sy-storage",
+            Duration::from_secs(STORAGE_BOOTSTRAP_TIMEOUT_SECS),
+        )
+        .await?;
+        wait_for_storage_db_ready(
+            &state.config_dir,
+            Duration::from_secs(STORAGE_DB_READINESS_TIMEOUT_SECS),
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -631,7 +638,10 @@ async fn wait_for_sy_nodes(
     timeout: Duration,
 ) -> Result<(), OrchestratorError> {
     // Only router-connected SY nodes are visible in router SHM.
-    let mut required = vec!["SY.config.routes", "SY.opa.rules", "SY.admin"];
+    let mut required = vec!["SY.config.routes", "SY.opa.rules"];
+    if state.is_motherbee {
+        required.push("SY.admin");
+    }
     if identity_available() {
         required.push("SY.identity");
     }
@@ -672,7 +682,12 @@ async fn wait_for_sy_nodes(
 }
 
 async fn watchdog_tick(state: &OrchestratorState) {
-    for service in CRITICAL_SERVICES {
+    let services: &[&str] = if state.is_motherbee {
+        &MOTHERBEE_CRITICAL_SERVICES
+    } else {
+        &WORKER_CRITICAL_SERVICES
+    };
+    for service in services {
         if !systemd_is_active(service) {
             tracing::warn!(service = service, "service not active; attempting restart");
             if let Err(err) = systemd_start(service) {
@@ -5246,9 +5261,14 @@ fn remote_service_journal_tail(
     service: &str,
     lines: usize,
 ) -> Option<String> {
-    let service_q = shell_single_quote(service);
+    let service_unit = if service.ends_with(".service") {
+        service.to_string()
+    } else {
+        format!("{service}.service")
+    };
+    let service_q = shell_single_quote(&service_unit);
     let cmd = format!(
-        "journalctl -u '{service}' -n {lines} --no-pager 2>/dev/null || true",
+        "systemctl --no-pager -l status '{service}' 2>/dev/null | tail -n {lines} || true",
         service = service_q,
         lines = lines
     );
@@ -5843,8 +5863,6 @@ fn add_hive_flow(
         ("rt-gateway", "/usr/bin/rt-gateway"),
         ("sy-config-routes", "/usr/bin/sy-config-routes"),
         ("sy-opa-rules", "/usr/bin/sy-opa-rules"),
-        ("sy-admin", "/usr/bin/sy-admin"),
-        ("sy-storage", "/usr/bin/sy-storage"),
         ("sy-orchestrator", "/usr/bin/sy-orchestrator"),
     ];
     if has_identity_source {
