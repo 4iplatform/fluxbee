@@ -95,6 +95,48 @@ Salida:
 Salida:
 - mismo contrato blob en ambos modos de operación.
 
+## Fase B6 - Cierre funcional pendiente (gap spec vs implementación)
+
+Contexto:
+- El backlog B1..B5 quedó cerrado en modo operativo.
+- Quedan brechas para considerar Blob "cerrado al 100%" contra `blob-annex-spec.md` y operación real multi-isla.
+
+### BLOB-X1 - Sincronización real de `active/` entre islas
+- [ ] X1. Configurar topología Syncthing gestionada por orchestrator (devices/folders) en add/remove hive.
+- [ ] X2. Garantizar que Syncthing replique solo `blob/active` (no `staging`).
+- [ ] X3. E2E real multi-isla (sin modo `copy`): archivo en isla A visible en isla B por Syncthing y consumo con `resolve_with_retry`.
+
+Salida:
+- replicación de blobs validada end-to-end con Syncthing real entre hives.
+
+### BLOB-X2 - Política de filesystem y seguridad
+- [ ] X4. Alinear owner/permisos de blob con spec (`fluxbee:fluxbee`, dirs `750`, files `640`) en mother/worker.
+- [ ] X5. Eliminar fallback silencioso a root para Syncthing o formalizar política explícita y validable.
+
+Salida:
+- postura de seguridad de Blob consistente y verificable.
+
+### BLOB-X3 - GC y housekeeping
+- [ ] X6. Implementar cleanup de `staging/` huérfano por TTL (24h) con dry-run + modo apply.
+- [ ] X7. Definir/implementar GC de `active/` por `spool_day` (fase inicial conservadora, sin borrar referencias recientes).
+
+Salida:
+- control de crecimiento de storage Blob en operación continua.
+
+### BLOB-X4 - Contrato de errores y límites
+- [ ] X8. Implementar política de tamaño máxima configurable y emitir `BLOB_TOO_LARGE`.
+- [ ] X9. Agregar tests de contrato para `BLOB_TOO_LARGE`, `BLOB_NOT_FOUND` con retry agotado, y fallas de permisos.
+
+Salida:
+- errores Blob completos y comprobados contra el contrato.
+
+### BLOB-X5 - Observabilidad de Blob
+- [ ] X10. Exponer métricas mínimas de Blob (`blob_put_total`, `blob_resolve_total`, `blob_resolve_retry_total`, `blob_errors_total`, bytes).
+- [ ] X11. Agregar diagnóstico E2E Blob multi-isla al paquete de diagnósticos operativos.
+
+Salida:
+- visibilidad operativa suficiente para soporte y capacity planning.
+
 ## Fuera de alcance
 - API HTTP de blobs.
 - Transferencia de blobs por mensaje/router/NATS.

@@ -1,0 +1,166 @@
+# SY.orchestrator v2 - Plan de Implementacion (Piloto, spec-first)
+
+Fecha: 2026-03-02
+Estado: backlog de ejecucion
+Fuente de verdad: `docs/onworking/SY.orchestrator — Spec de Cambios v2.md`
+
+## 1. Decisiones de base
+
+- Este proyecto esta en piloto: no se prioriza backward compatibility.
+- La spec v2 manda sobre el comportamiento actual.
+- Se aceptan cambios breaking en protocolo interno, API y flujo operativo.
+- SSH queda solo para provisioning (`add_hive`/`remove_hive`), no para operacion diaria.
+
+## 2. Objetivo tecnico
+
+Cerrar el cambio de arquitectura a:
+
+- orchestrator local en cada hive,
+- control-plane por socket L2 (`SY.admin` -> `SY.orchestrator@hive`),
+- update unificado por `SYSTEM_UPDATE`,
+- `SPAWN_NODE`/`KILL_NODE` genericos para cualquier tipo de nodo.
+
+## 3. Gaps actuales contra v2 (confirmados)
+
+- `sy_orchestrator` sigue ejecutando remoto por SSH en `execute_on_hive` para targets no locales.
+- `add_hive` no deja orchestrator worker operativo como agente de control-plane.
+- El contrato activo de update es `RUNTIME_UPDATE` (falta `SYSTEM_UPDATE`).
+- `sy_admin` no tiene `POST /hives/{id}/update`.
+- `SPAWN_NODE`/`KILL_NODE` actuales no siguen aun el contrato v2 centrado en `node_name`.
+
+## 4. Backlog por fases (sin modo legacy)
+
+### Fase 0 - Freeze de direccion v2
+
+- [ ] V0.1 Marcar en docs de trabajo que el modelo remoto-SSH queda deprecado para operacion diaria.
+- [ ] V0.2 Alinear `sy_orchestrator_tasks.md` y `sy_admin_tasks.md` con referencia a este plan v2.
+- [ ] V0.3 Congelar nuevos cambios fuera de spec v2 para evitar desvio.
+
+Salida:
+
+- equipo ejecutando una sola hoja de ruta.
+
+### Fase 1 - Contrato de protocolo y mensajes
+
+- [ ] V1.1 Formalizar `SYSTEM_UPDATE`/`SYSTEM_UPDATE_RESPONSE` en `docs/02-protocolo.md`.
+- [ ] V1.2 Retirar `RUNTIME_UPDATE` del flujo canónico (dejarlo explicitamente obsoleto en docs).
+- [ ] V1.3 Formalizar contrato v2 de `SPAWN_NODE`/`KILL_NODE` (campos, errores, semantica `force`).
+- [ ] V1.4 Definir codigos de error canonicos para update (`ok/sync_pending/partial/error/rollback`).
+
+Salida:
+
+- contratos cerrados para implementar codigo sin ambiguedad.
+
+### Fase 2 - Tareas de SY.admin (obligatorias)
+
+- [ ] V2.1 Implementar endpoint `POST /hives/{id}/update`.
+- [ ] V2.2 Validar payload de update (`category`, `manifest_version`, `manifest_hash`).
+- [ ] V2.3 Enviar mensaje `SYSTEM_UPDATE` a `SY.orchestrator@{hive}` por canal `system`.
+- [ ] V2.4 Ajustar timeouts HTTP/admin para updates remotos (caso `sync_pending`).
+- [ ] V2.5 Actualizar handlers de `/hives/{id}/nodes` para contrato v2 (`SPAWN_NODE`/`KILL_NODE`).
+- [ ] V2.6 Ajustar serializacion de respuestas de admin al nuevo contrato de system responses.
+
+Salida:
+
+- admin expone todo el control-plane requerido por v2.
+
+### Fase 3 - Orchestrator por rol (motherbee vs worker)
+
+- [ ] V3.1 Gatear `add_hive`/`remove_hive` a `role=motherbee`.
+- [ ] V3.2 Hacer que worker rechace provisioning actions con error explicito.
+- [ ] V3.3 En `add_hive`, instalar `sy-orchestrator` + unit systemd en worker y habilitar arranque.
+- [ ] V3.4 Validar readiness del worker por presencia de `SY.orchestrator@worker-*` en L2.
+- [ ] V3.5 Ajustar bootstrap para que `rt-gateway` sea dependencia de systemd del orchestrator (segun spec v2).
+
+Salida:
+
+- cada worker queda con orchestrator local funcional.
+
+### Fase 4 - Eliminar ejecucion remota SSH en operacion
+
+- [ ] V4.1 Reescribir `execute_on_hive` para ejecucion exclusivamente local.
+- [ ] V4.2 Mover ejecucion remota a unicast de mensajes hacia orchestrator destino.
+- [ ] V4.3 Actualizar `run_node`/`kill_node`/`run_router`/`kill_router` para modelo local-only en destino.
+- [ ] V4.4 Quitar rutas de codigo de SSH operativo en flujos de run/kill/update.
+
+Salida:
+
+- operaciones de runtime/router/nodos sin SSH remoto.
+
+### Fase 5 - SYSTEM_UPDATE engine local
+
+- [ ] V5.1 Implementar handler `SYSTEM_UPDATE` en orchestrator.
+- [ ] V5.2 Soportar categorias `runtime`, `core`, `vendor`.
+- [ ] V5.3 Verificar manifest local (version/hash) y responder `sync_pending` si no converge.
+- [ ] V5.4 Instalar localmente desde `dist/` con hash-gate previo.
+- [ ] V5.5 Health gate + rollback local por categoria.
+- [ ] V5.6 Emitir `SYSTEM_UPDATE_RESPONSE` con detalle de `updated/unchanged/restarted/errors`.
+
+Salida:
+
+- update determinista por hive, disparado por admin, aplicado localmente.
+
+### Fase 6 - SPAWN/KILL generico de nodos
+
+- [ ] V6.1 Migrar `SPAWN_NODE` a contrato v2 basado en `node_name`.
+- [ ] V6.2 Resolver runtime/version segun regla TYPE.campo1 definida por spec.
+- [ ] V6.3 Ejecutar nodo como unit transient systemd (estrategia unica definida).
+- [ ] V6.4 Migrar `KILL_NODE` con `force=false/true` (SIGTERM/SIGKILL).
+- [ ] V6.5 Ajustar listados y estado para incluir nodos AI/IO/WF/SY/RT bajo mismo contrato.
+
+Salida:
+
+- spawn/kill uniforme para cualquier runtime de negocio o sistema.
+
+### Fase 7 - Dist por Syncthing + provisioning final
+
+- [ ] V7.1 Formalizar layout `/var/lib/fluxbee/dist` en motherbee y worker.
+- [ ] V7.2 Configurar folder `fluxbee-dist` separado de `fluxbee-blob`.
+- [ ] V7.3 Integrar `dist` en `hive.yaml` generado por add_hive.
+- [ ] V7.4 Verificar que add_hive deja worker con dist sincronizando antes de primer update.
+- [ ] V7.5 Cerrar SSH post-bootstrap segun politica final del equipo (cerrado o restringido).
+
+Salida:
+
+- canal de distribucion de software consistente con spec v2.
+
+## 5. E2E imprescindibles (gates de avance)
+
+### Gate G1 (fin Fase 3)
+
+- [ ] E2E-1 add_hive -> worker con `sy-orchestrator` activo y visible por L2.
+
+### Gate G2 (fin Fases 4-5)
+
+- [ ] E2E-2 `POST /hives/{id}/update` categoria `runtime` -> `ok`.
+- [ ] E2E-3 `POST /hives/{id}/update` con manifest no convergido -> `sync_pending`.
+- [ ] E2E-4 update `core` fallido -> rollback verificable.
+
+### Gate G3 (fin Fase 6)
+
+- [ ] E2E-5 spawn/kill de nodo `IO.*` remoto desde admin motherbee sin SSH operativo.
+- [ ] E2E-6 spawn/kill de nodo `AI.*` remoto con `force` en kill.
+
+### Gate G4 (fin Fase 7)
+
+- [ ] E2E-7 update `vendor` completo via `SYSTEM_UPDATE`.
+- [ ] E2E-8 validacion de que no quedan caminos SSH en run/kill/update.
+
+## 6. Definicion de Done v2
+
+- [ ] `SYSTEM_UPDATE` reemplaza operativamente a `RUNTIME_UPDATE`.
+- [ ] `SY.admin` maneja update/spawn/kill remoto por API y socket L2.
+- [ ] `SY.orchestrator` de cada worker ejecuta local; motherbee no hace SSH operativo.
+- [ ] Dist de software por Syncthing funcional para runtime/core/vendor.
+- [ ] E2E G1..G4 en verde.
+
+## 7. Orden recomendado de ejecucion
+
+1. Fase 0
+2. Fase 1
+3. Fase 2
+4. Fase 3
+5. Fase 4
+6. Fase 5
+7. Fase 6
+8. Fase 7

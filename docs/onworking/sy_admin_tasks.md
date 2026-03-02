@@ -1,5 +1,7 @@
 # SY.admin - Estado actual vs spec (v1.16+)
 
+> Nota de direccion (2026-03-02): las tareas activas para la arquitectura nueva (orchestrator v2, `SYSTEM_UPDATE`, control-plane socket L2) estan integradas en `docs/onworking/sy_orchestrator_v2_tasks.md`. Este archivo se mantiene como referencia historica de v1.16.
+
 Checklist operativo consolidado para `SY.admin`.
 
 ## Cerrado (histórico consolidado)
