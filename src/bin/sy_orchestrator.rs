@@ -4516,6 +4516,26 @@ fn resolve_runtime_version(
     Err(format!("version '{requested_version}' not available for runtime '{runtime}'").into())
 }
 
+fn resolve_runtime_key(
+    manifest: &RuntimeManifest,
+    runtime: &str,
+) -> Result<String, OrchestratorError> {
+    let runtimes = manifest
+        .runtimes
+        .as_object()
+        .ok_or_else(|| "runtime manifest invalid: runtimes must be object".to_string())?;
+    if runtimes.contains_key(runtime) {
+        return Ok(runtime.to_string());
+    }
+    if let Some((key, _)) = runtimes
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(runtime))
+    {
+        return Ok(key.clone());
+    }
+    Err(format!("runtime '{runtime}' not found in manifest").into())
+}
+
 fn runtime_start_script(runtime: &str, version: &str) -> String {
     format!("/var/lib/fluxbee/runtimes/{runtime}/{version}/bin/start.sh")
 }
@@ -4817,7 +4837,18 @@ async fn run_node_flow(
             });
         }
     };
-    let version = match resolve_runtime_version(&manifest, &runtime, requested_version) {
+    let runtime_key = match resolve_runtime_key(&manifest, &runtime) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "RUNTIME_NOT_AVAILABLE",
+                "message": err.to_string(),
+            });
+        }
+    };
+
+    let version = match resolve_runtime_version(&manifest, &runtime_key, requested_version) {
         Ok(version) => version,
         Err(err) => {
             return serde_json::json!({
@@ -4828,7 +4859,7 @@ async fn run_node_flow(
         }
     };
 
-    let start_script = runtime_start_script(&runtime, &version);
+    let start_script = runtime_start_script(&runtime_key, &version);
     match hive_has_runtime_script(state, &target_hive, &start_script) {
         Ok(true) => {}
         Ok(false) => {
@@ -4880,7 +4911,7 @@ async fn run_node_flow(
                 "status": "ok",
                 "state": "already_running",
                 "node_name": node_name,
-                "runtime": runtime,
+                "runtime": runtime_key,
                 "version": version,
                 "requested_version": requested_version,
                 "hive": target_hive,
@@ -4910,7 +4941,7 @@ async fn run_node_flow(
         Ok(()) => serde_json::json!({
             "status": "ok",
             "node_name": node_name,
-            "runtime": runtime,
+            "runtime": runtime_key,
             "version": version,
             "requested_version": requested_version,
             "hive": target_hive,
