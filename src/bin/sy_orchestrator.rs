@@ -4564,8 +4564,70 @@ async fn forward_system_action_to_hive(
     response_msg: &str,
     payload: serde_json::Value,
 ) -> Result<serde_json::Value, OrchestratorError> {
+    if target_hive != state.hive_id {
+        if let Ok(snapshot) = load_lsa_snapshot(state) {
+            let now = now_epoch_ms();
+            let hive_visible = snapshot.hives.iter().any(|entry| {
+                remote_hive_name(entry).as_deref() == Some(target_hive)
+                    && !remote_hive_is_stale(entry, now)
+            });
+            if !hive_visible {
+                return Err(format!(
+                    "target hive '{}' not reachable in LSA (stale/missing)",
+                    target_hive
+                )
+                .into());
+            }
+
+            let expected_orchestrator = ensure_l2_name("SY.orchestrator", target_hive);
+            let mut visible_nodes = Vec::new();
+            let mut orchestrator_visible = false;
+            for node in &snapshot.nodes {
+                let hive_idx = node.hive_index as usize;
+                let Some(hive_entry) = snapshot.hives.get(hive_idx) else {
+                    continue;
+                };
+                let Some(hive_name) = remote_hive_name(hive_entry) else {
+                    continue;
+                };
+                if hive_name != target_hive {
+                    continue;
+                }
+                if remote_hive_is_stale(hive_entry, now) {
+                    continue;
+                }
+                if node.flags & (FLAG_DELETED | FLAG_STALE) != 0 {
+                    continue;
+                }
+                if node.name_len == 0 {
+                    continue;
+                }
+                let name =
+                    String::from_utf8_lossy(&node.name[..node.name_len as usize]).into_owned();
+                if name == expected_orchestrator || name == "SY.orchestrator" {
+                    orchestrator_visible = true;
+                }
+                visible_nodes.push(name);
+            }
+            if !orchestrator_visible {
+                visible_nodes.sort();
+                visible_nodes.dedup();
+                let visible = if visible_nodes.is_empty() {
+                    "none".to_string()
+                } else {
+                    visible_nodes.join(", ")
+                };
+                return Err(format!(
+                    "target orchestrator '{}' not visible in LSA for hive '{}' (visible: {})",
+                    expected_orchestrator, target_hive, visible
+                )
+                .into());
+            }
+        }
+    }
+
     let socket_dir = json_router::paths::router_socket_dir();
-    let relay_name = format!("SY.orchestrator.relay.{}", now_epoch_ms());
+    let relay_name = "SY.orchestrator.relay".to_string();
     let relay_config = NodeConfig {
         name: relay_name,
         router_socket: socket_dir,
@@ -4705,27 +4767,6 @@ async fn run_node_flow(
         });
     }
 
-    let manifest = match load_runtime_manifest() {
-        Some(manifest) => manifest,
-        None => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "RUNTIME_MANIFEST_MISSING",
-                "message": "runtime manifest not found",
-            });
-        }
-    };
-    let version = match resolve_runtime_version(&manifest, &runtime, requested_version) {
-        Ok(version) => version,
-        Err(err) => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "RUNTIME_NOT_AVAILABLE",
-                "message": err.to_string(),
-            });
-        }
-    };
-
     let unit = payload
         .get("unit")
         .and_then(|v| v.as_str())
@@ -4765,6 +4806,27 @@ async fn run_node_flow(
             }),
         };
     }
+
+    let manifest = match load_runtime_manifest() {
+        Some(manifest) => manifest,
+        None => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "RUNTIME_MANIFEST_MISSING",
+                "message": "runtime manifest not found",
+            });
+        }
+    };
+    let version = match resolve_runtime_version(&manifest, &runtime, requested_version) {
+        Ok(version) => version,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "RUNTIME_NOT_AVAILABLE",
+                "message": err.to_string(),
+            });
+        }
+    };
 
     let start_script = runtime_start_script(&runtime, &version);
     match hive_has_runtime_script(state, &target_hive, &start_script) {
