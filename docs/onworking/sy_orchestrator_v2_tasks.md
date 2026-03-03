@@ -35,6 +35,7 @@ Cerrar el cambio de arquitectura a:
 - [ ] V0.1 Marcar en docs de trabajo que el modelo remoto-SSH queda deprecado para operacion diaria.
 - [ ] V0.2 Alinear `sy_orchestrator_tasks.md` y `sy_admin_tasks.md` con referencia a este plan v2.
 - [ ] V0.3 Congelar nuevos cambios fuera de spec v2 para evitar desvio.
+- [ ] V0.4 Declarar explicitamente jerarquia documental: `SY.orchestrator — Spec de Cambios v2.md` > `docs/02-protocolo.md` > `docs/07-operaciones.md` mientras dure esta migracion.
 
 Salida:
 
@@ -46,6 +47,8 @@ Salida:
 - [ ] V1.2 Retirar `RUNTIME_UPDATE` del flujo canónico (dejarlo explicitamente obsoleto en docs).
 - [ ] V1.3 Formalizar contrato v2 de `SPAWN_NODE`/`KILL_NODE` (campos, errores, semantica `force`).
 - [ ] V1.4 Definir codigos de error canonicos para update (`ok/sync_pending/partial/error/rollback`).
+- [ ] V1.5 Actualizar `docs/07-operaciones.md` para eliminar flujo remoto por SSH en operacion diaria y reflejar modelo local-only en workers.
+- [ ] V1.6 Revisar y corregir tablas de API/ownership en `docs/07-operaciones.md` segun endpoints y mensajes v2.
 
 Salida:
 
@@ -66,11 +69,13 @@ Salida:
 
 ### Fase 3 - Orchestrator por rol (motherbee vs worker)
 
-- [ ] V3.1 Gatear `add_hive`/`remove_hive` a `role=motherbee`.
-- [ ] V3.2 Hacer que worker rechace provisioning actions con error explicito.
-- [ ] V3.3 En `add_hive`, instalar `sy-orchestrator` + unit systemd en worker y habilitar arranque.
-- [ ] V3.4 Validar readiness del worker por presencia de `SY.orchestrator@worker-*` en L2.
-- [ ] V3.5 Ajustar bootstrap para que `rt-gateway` sea dependencia de systemd del orchestrator (segun spec v2).
+- [x] V3.1 Gatear `add_hive`/`remove_hive` a `role=motherbee`.
+- [x] V3.2 Hacer que worker rechace provisioning actions con error explicito.
+- [x] V3.3 En `add_hive`, instalar `sy-orchestrator` + unit systemd en worker y habilitar arranque.
+- [x] V3.4 Validar readiness del worker por presencia de `SY.orchestrator@worker-*` en L2.
+- [x] V3.5 Ajustar bootstrap para que `rt-gateway` sea dependencia de systemd del orchestrator (segun spec v2).
+
+Nota (2026-03-02): `add_hive` ahora espera WAN + presencia de `SY.orchestrator@<worker>` en LSA y devuelve `WORKER_ORCHESTRATOR_TIMEOUT` si no converge. El unit remoto de `sy-orchestrator` se genera con dependencia explícita de `rt-gateway` (`After/Wants/Requires`).
 
 Salida:
 
@@ -78,10 +83,12 @@ Salida:
 
 ### Fase 4 - Eliminar ejecucion remota SSH en operacion
 
-- [ ] V4.1 Reescribir `execute_on_hive` para ejecucion exclusivamente local.
-- [ ] V4.2 Mover ejecucion remota a unicast de mensajes hacia orchestrator destino.
-- [ ] V4.3 Actualizar `run_node`/`kill_node`/`run_router`/`kill_router` para modelo local-only en destino.
-- [ ] V4.4 Quitar rutas de codigo de SSH operativo en flujos de run/kill/update.
+- [x] V4.1 Reescribir `execute_on_hive` para ejecucion exclusivamente local.
+- [x] V4.2 Mover ejecucion remota a unicast de mensajes hacia orchestrator destino.
+- [x] V4.3 Actualizar `run_node`/`kill_node`/`run_router`/`kill_router` para modelo local-only en destino.
+- [x] V4.4 Quitar rutas de codigo de SSH operativo en flujos de run/kill/update.
+
+Nota (2026-03-02): V4.2/V4.3 quedaron implementadas con forward `system` request/response y deshabilitacion explicita de SSH en `execute_on_hive`. V4.4 desactiva ademas la propagacion SSH de `RUNTIME_UPDATE` y del watchdog de sync remoto; la actualizacion remota pasa por `SYSTEM_UPDATE` (`POST /hives/{id}/update` en `SY.admin`).
 
 Salida:
 
@@ -89,12 +96,14 @@ Salida:
 
 ### Fase 5 - SYSTEM_UPDATE engine local
 
-- [ ] V5.1 Implementar handler `SYSTEM_UPDATE` en orchestrator.
-- [ ] V5.2 Soportar categorias `runtime`, `core`, `vendor`.
-- [ ] V5.3 Verificar manifest local (version/hash) y responder `sync_pending` si no converge.
+- [x] V5.1 Implementar handler `SYSTEM_UPDATE` en orchestrator.
+- [x] V5.2 Soportar categorias `runtime`, `core`, `vendor`.
+- [x] V5.3 Verificar manifest local (version/hash) y responder `sync_pending` si no converge.
 - [ ] V5.4 Instalar localmente desde `dist/` con hash-gate previo.
-- [ ] V5.5 Health gate + rollback local por categoria.
-- [ ] V5.6 Emitir `SYSTEM_UPDATE_RESPONSE` con detalle de `updated/unchanged/restarted/errors`.
+- [x] V5.5 Health gate + rollback local por categoria.
+- [x] V5.6 Emitir `SYSTEM_UPDATE_RESPONSE` con detalle de `updated/unchanged/restarted/errors`.
+
+Nota (2026-03-02): `SYSTEM_UPDATE` ahora responde con `hive`, `updated`, `unchanged`, `restarted`, `errors` y soporta `status=rollback` para `category=core` cuando falla el health gate y se revierte instalación local. Queda pendiente cerrar V5.4 de forma explícita sobre layout final `dist/` (Fase 7).
 
 Salida:
 
@@ -102,11 +111,14 @@ Salida:
 
 ### Fase 6 - SPAWN/KILL generico de nodos
 
-- [ ] V6.1 Migrar `SPAWN_NODE` a contrato v2 basado en `node_name`.
-- [ ] V6.2 Resolver runtime/version segun regla TYPE.campo1 definida por spec.
-- [ ] V6.3 Ejecutar nodo como unit transient systemd (estrategia unica definida).
-- [ ] V6.4 Migrar `KILL_NODE` con `force=false/true` (SIGTERM/SIGKILL).
-- [ ] V6.5 Ajustar listados y estado para incluir nodos AI/IO/WF/SY/RT bajo mismo contrato.
+- [x] V6.1 Migrar `SPAWN_NODE` a contrato v2 basado en `node_name`.
+- [x] V6.2 Resolver runtime/version segun regla TYPE.campo1 definida por spec.
+- [x] V6.3 Ejecutar nodo como unit transient systemd (estrategia unica definida).
+- [x] V6.4 Migrar `KILL_NODE` con `force=false/true` (SIGTERM/SIGKILL).
+- [x] V6.5 Ajustar listados y estado para incluir nodos AI/IO/WF/SY/RT bajo mismo contrato.
+
+Nota (2026-03-03): `SPAWN_NODE` acepta `node_name` (y mantiene compatibilidad con `name`), deriva `runtime` desde `node_name` cuando no se envía explícito y usa `runtime_version` (alias `version`). `KILL_NODE` acepta `force` y lo mapea a `SIGKILL` (o `SIGTERM` por defecto).
+Nota (2026-03-03): `list_nodes` agrega campos uniformes `node_name`, `hive` y `kind` (AI/IO/WF/SY/RT/UNKNOWN) tanto para snapshot local como para nodos remotos por LSA.
 
 Salida:
 
@@ -136,10 +148,14 @@ Salida:
 - [ ] E2E-3 `POST /hives/{id}/update` con manifest no convergido -> `sync_pending`.
 - [ ] E2E-4 update `core` fallido -> rollback verificable.
 
+Referencia: `scripts/orchestrator_system_update_api_e2e.sh` valida `sync_pending` + `ok` (y acepta `rollback` en `category=core`).
+
 ### Gate G3 (fin Fase 6)
 
 - [ ] E2E-5 spawn/kill de nodo `IO.*` remoto desde admin motherbee sin SSH operativo.
 - [ ] E2E-6 spawn/kill de nodo `AI.*` remoto con `force` en kill.
+
+Referencia: `scripts/orchestrator_spawn_kill_v2_e2e.sh` (usa `node_name`, `runtime_version` y valida `SIGTERM`/`SIGKILL`).
 
 ### Gate G4 (fin Fase 7)
 

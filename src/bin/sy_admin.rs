@@ -114,12 +114,12 @@ impl AdminRouterClient {
     }
 
     async fn dispatch(&self, msg: Message) {
-        if msg.meta.msg_type == "admin" {
+        if msg.meta.msg_type == "admin" || msg.meta.msg_type == SYSTEM_KIND {
             let mut pending = self.pending_admin.lock().await;
             if let Some(tx) = pending.remove(&msg.routing.trace_id) {
                 let _ = tx.send(msg);
+                return;
             }
-            return;
         }
         if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some("CONFIG_RESPONSE") {
             let _ = self.system_tx.send(msg);
@@ -1056,7 +1056,14 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("DELETE", ["nodes", name]) => {
-            let payload = serde_json::json!({ "name": decode_percent(name) });
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if payload.get("node_name").is_none() && payload.get("name").is_none() {
+                payload["name"] = serde_json::Value::String(decode_percent(name));
+            }
             let (status, resp) =
                 handle_admin_command(ctx, client, "kill_node", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
@@ -1097,6 +1104,15 @@ async fn handle_hive_paths(
             let payload = serde_json::json!({ "name": decode_percent(name) });
             let (status, resp) =
                 handle_admin_command(ctx, client, "kill_router", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["update"]) => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let (status, resp) = handle_hive_update_command(ctx, client, hive, payload).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["opa", "policy"]) => {
@@ -1998,6 +2014,115 @@ async fn handle_admin_command(
     Ok(build_admin_http_response(action, response))
 }
 
+async fn handle_hive_update_command(
+    _ctx: &AdminContext,
+    client: &AdminRouterClient,
+    hive_id: String,
+    payload: serde_json::Value,
+) -> Result<(u16, String), AdminError> {
+    let category = payload
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("runtime");
+    if !matches!(category, "runtime" | "core" | "vendor") {
+        let body = serde_json::json!({
+            "status": "error",
+            "action": "update",
+            "payload": serde_json::Value::Null,
+            "error_code": "INVALID_REQUEST",
+            "error_detail": "category must be one of runtime/core/vendor",
+        })
+        .to_string();
+        return Ok((400, body));
+    }
+
+    let manifest_version = payload
+        .get("manifest_version")
+        .or_else(|| payload.get("version"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let manifest_hash = payload
+        .get("manifest_hash")
+        .or_else(|| payload.get("hash"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or("missing manifest_hash (or hash)")?;
+
+    let target = format!("SY.orchestrator@{}", hive_id);
+    let system_payload = serde_json::json!({
+        "category": category,
+        "manifest_version": manifest_version,
+        "manifest_hash": manifest_hash,
+    });
+
+    let response = send_system_request(
+        client,
+        &target,
+        "SYSTEM_UPDATE",
+        "SYSTEM_UPDATE_RESPONSE",
+        system_payload,
+        admin_action_timeout("update"),
+    )
+    .await;
+
+    match response {
+        Ok(payload) => {
+            let status = payload
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("error");
+            let http_status = match status {
+                "ok" => 200,
+                "sync_pending" => 202,
+                _ => 502,
+            };
+            let error_code = if status == "ok" || status == "sync_pending" {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(
+                    payload_error_code(&payload).unwrap_or_else(|| "SERVICE_FAILED".into())
+                )
+            };
+            let error_detail = if status == "ok" || status == "sync_pending" {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(payload_error_detail(&payload))
+            };
+            Ok((
+                http_status,
+                serde_json::json!({
+                    "status": if status == "ok" || status == "sync_pending" { "ok" } else { "error" },
+                    "action": "update",
+                    "payload": payload,
+                    "error_code": error_code,
+                    "error_detail": error_detail,
+                })
+                .to_string(),
+            ))
+        }
+        Err(err) => {
+            let error_detail = err.to_string();
+            let error_code = infer_transport_error_code(&error_detail).to_string();
+            let status_code = error_code_to_http_status(&error_code);
+            Ok((
+                status_code,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "update",
+                    "payload": serde_json::Value::Null,
+                    "error_code": error_code,
+                    "error_detail": error_detail,
+                })
+                .to_string(),
+            ))
+        }
+    }
+}
+
 fn build_admin_request(
     ctx: &AdminContext,
     action: &str,
@@ -2090,6 +2215,73 @@ async fn send_admin_request(
     Ok(msg.payload)
 }
 
+async fn send_system_request(
+    client: &AdminRouterClient,
+    target: &str,
+    request_msg: &str,
+    expected_response_msg: &str,
+    payload: serde_json::Value,
+    timeout_window: Duration,
+) -> Result<serde_json::Value, AdminError> {
+    use tokio::time::timeout;
+
+    let trace_id = Uuid::new_v4().to_string();
+    let msg = Message {
+        routing: Routing {
+            src: client.sender.uuid().to_string(),
+            dst: Destination::Unicast(target.to_string()),
+            ttl: 16,
+            trace_id: trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(request_msg.to_string()),
+            scope: None,
+            target: Some(target.to_string()),
+            action: None,
+            priority: None,
+            context: None,
+        },
+        payload,
+    };
+
+    let (tx, rx) = oneshot::channel::<Message>();
+    client.enqueue_admin_waiter(trace_id.clone(), tx).await;
+    client.sender.send(msg).await?;
+
+    let msg = match timeout(timeout_window, rx).await {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(_)) => return Err("system response channel closed".into()),
+        Err(_) => {
+            client.drop_admin_waiter(&trace_id).await;
+            return Err(format!(
+                "system request timeout msg={} target={} timeout_secs={}",
+                request_msg,
+                target,
+                timeout_window.as_secs()
+            )
+            .into());
+        }
+    };
+
+    if msg.meta.msg_type != SYSTEM_KIND {
+        return Err(format!(
+            "invalid response type: expected={} got={}",
+            SYSTEM_KIND, msg.meta.msg_type
+        )
+        .into());
+    }
+    if msg.meta.msg.as_deref() != Some(expected_response_msg) {
+        return Err(format!(
+            "invalid response msg: expected={} got={}",
+            expected_response_msg,
+            msg.meta.msg.as_deref().unwrap_or("")
+        )
+        .into());
+    }
+    Ok(msg.payload)
+}
+
 fn env_timeout_secs(name: &str) -> Option<u64> {
     std::env::var(name).ok()?.trim().parse::<u64>().ok()
 }
@@ -2099,6 +2291,9 @@ fn admin_action_timeout(action: &str) -> Duration {
         // add_hive runs remote bootstrap + WAN wait and is expected to be long.
         "add_hive" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS").unwrap_or(180))
+        }
+        "update" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_UPDATE_TIMEOUT_SECS").unwrap_or(60))
         }
         // other orchestrator mutating actions can also take longer than default.
         "run_node" | "kill_node" | "run_router" | "kill_router" | "remove_hive" => {
@@ -2211,7 +2406,7 @@ fn normalize_admin_payload(
         }
     }
 
-    if action == "kill_node" && payload.get("node_name").is_none() {
+    if (action == "run_node" || action == "kill_node") && payload.get("node_name").is_none() {
         if let Some(name) = payload.get("name").and_then(|value| value.as_str()) {
             payload["node_name"] = serde_json::Value::String(name.to_string());
         }
