@@ -44,6 +44,8 @@ const SYNCTHING_INSTALL_USER: &str = "fluxbee";
 const SYNCTHING_SYNC_PORT_TCP: u16 = 22000;
 const SYNCTHING_SYNC_PORT_UDP: u16 = 22000;
 const SYNCTHING_DISCOVERY_PORT_UDP: u16 = 21027;
+const SYNCTHING_FOLDER_BLOB_ID: &str = "fluxbee-blob";
+const SYNCTHING_FOLDER_DIST_ID: &str = "fluxbee-dist";
 const SYNCTHING_INSTALL_DIR: &str = "/var/lib/fluxbee/vendor/bin";
 const SYNCTHING_INSTALL_PATH: &str = "/var/lib/fluxbee/vendor/bin/syncthing";
 const SYNCTHING_REMOTE_BACKUP_PATH: &str = "/var/lib/fluxbee/vendor/bin/syncthing.prev";
@@ -52,6 +54,15 @@ const VENDOR_ROOT_DIR: &str = "/var/lib/fluxbee/vendor";
 const VENDOR_MANIFEST_PATH: &str = "/var/lib/fluxbee/vendor/manifest.json";
 const CORE_BIN_SOURCE_DIR: &str = "/var/lib/fluxbee/core/bin";
 const CORE_MANIFEST_PATH: &str = "/var/lib/fluxbee/core/manifest.json";
+const LEGACY_RUNTIME_ROOT_DIR: &str = "/var/lib/fluxbee/runtimes";
+const DIST_ROOT_DIR: &str = "/var/lib/fluxbee/dist";
+const DIST_RUNTIME_ROOT_DIR: &str = "/var/lib/fluxbee/dist/runtimes";
+const DIST_RUNTIME_MANIFEST_PATH: &str = "/var/lib/fluxbee/dist/runtimes/manifest.json";
+const DIST_CORE_BIN_SOURCE_DIR: &str = "/var/lib/fluxbee/dist/core/bin";
+const DIST_CORE_MANIFEST_PATH: &str = "/var/lib/fluxbee/dist/core/manifest.json";
+const DIST_VENDOR_ROOT_DIR: &str = "/var/lib/fluxbee/dist/vendor";
+const DIST_VENDOR_MANIFEST_PATH: &str = "/var/lib/fluxbee/dist/vendor/manifest.json";
+const DIST_SYNCTHING_VENDOR_SOURCE_PATH: &str = "/var/lib/fluxbee/dist/vendor/syncthing/syncthing";
 const CORE_SERVICE_HEALTH_TIMEOUT_SECS: u64 = 30;
 const POST_SYNC_HASH_VERIFY_ATTEMPTS: usize = 3;
 const POST_SYNC_HASH_VERIFY_DELAY_MS: u64 = 500;
@@ -78,6 +89,9 @@ const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
 const DEFAULT_BLOB_SYNC_TOOL: &str = "syncthing";
 const DEFAULT_BLOB_SYNC_API_PORT: u16 = 8384;
 const DEFAULT_BLOB_SYNC_DATA_DIR: &str = "/var/lib/fluxbee/syncthing";
+const DEFAULT_DIST_PATH: &str = DIST_ROOT_DIR;
+const DEFAULT_DIST_SYNC_ENABLED: bool = true;
+const DEFAULT_DIST_SYNC_TOOL: &str = "syncthing";
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -87,6 +101,7 @@ struct HiveFile {
     nats: Option<NatsSection>,
     storage: Option<StorageSection>,
     blob: Option<BlobSection>,
+    dist: Option<DistSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +143,18 @@ struct BlobSyncSection {
     data_dir: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DistSection {
+    path: Option<String>,
+    sync: Option<DistSyncSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DistSyncSection {
+    enabled: Option<bool>,
+    tool: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlobRuntimeConfig {
     enabled: bool,
@@ -136,6 +163,13 @@ struct BlobRuntimeConfig {
     sync_tool: String,
     sync_api_port: u16,
     sync_data_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DistRuntimeConfig {
+    path: PathBuf,
+    sync_enabled: bool,
+    sync_tool: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,6 +310,7 @@ struct OrchestratorState {
     last_runtime_verify: Mutex<Instant>,
     nats_endpoint: String,
     blob: BlobRuntimeConfig,
+    dist: DistRuntimeConfig,
     blob_sync_last_desired: Mutex<BlobRuntimeConfig>,
 }
 
@@ -327,6 +362,7 @@ async fn main() -> Result<(), OrchestratorError> {
         .unwrap_or_default();
     let nats_endpoint = nats_endpoint_from_hive(&hive);
     let blob_runtime = blob_runtime_from_hive(&hive);
+    let dist_runtime = dist_runtime_from_hive(&hive);
     let storage_path = storage_path_from_hive(&hive);
     let runtime_manifest = load_runtime_manifest();
     let system_allowed_origins = load_system_allowed_origins(&hive.hive_id);
@@ -347,6 +383,7 @@ async fn main() -> Result<(), OrchestratorError> {
         last_runtime_verify: Mutex::new(Instant::now()),
         nats_endpoint,
         blob: blob_runtime.clone(),
+        dist: dist_runtime,
         blob_sync_last_desired: Mutex::new(blob_runtime),
     };
     tracing::info!(
@@ -356,9 +393,12 @@ async fn main() -> Result<(), OrchestratorError> {
         blob_sync_tool = %state.blob.sync_tool,
         blob_sync_api_port = state.blob.sync_api_port,
         blob_sync_data_dir = %state.blob.sync_data_dir.display(),
-        "blob runtime config loaded"
+        dist_path = %state.dist.path.display(),
+        dist_sync_enabled = state.dist.sync_enabled,
+        dist_sync_tool = %state.dist.sync_tool,
+        "blob/dist runtime config loaded"
     );
-    ensure_dirs(&config_dir, &state_dir, &run_dir, &state.blob)?;
+    ensure_dirs(&config_dir, &state_dir, &run_dir, &state.blob, &state.dist)?;
     write_pid(&run_dir)?;
 
     bootstrap_local(&state, &socket_dir).await?;
@@ -450,8 +490,9 @@ async fn bootstrap_local(
         Duration::from_secs(NATS_BOOTSTRAP_TIMEOUT_SECS),
     )
     .await?;
-    if state.blob.sync_enabled {
-        if let Err(err) = ensure_blob_sync_runtime(&state.blob).await {
+    let startup_sync = effective_syncthing_runtime_config(&state.blob, &state.dist);
+    if startup_sync.sync_enabled {
+        if let Err(err) = ensure_blob_sync_runtime(&startup_sync).await {
             tracing::warn!(
                 error = %err,
                 "blob sync runtime bootstrap failed; continuing startup and relying on watchdog retries"
@@ -1378,14 +1419,14 @@ fn compute_local_core_update_sets(
     let component_names = core_component_names_for_role(manifest, is_motherbee)?;
     let local_paths = component_names
         .iter()
-        .map(|name| format!("{CORE_BIN_SOURCE_DIR}/{name}"))
+        .map(|name| local_core_bin_source_path(name).display().to_string())
         .collect::<Vec<_>>();
     validate_core_manifest_for_bins(&local_paths)?;
 
     let mut updated = Vec::new();
     let mut unchanged = Vec::new();
     for name in component_names {
-        let source_path = Path::new(CORE_BIN_SOURCE_DIR).join(&name);
+        let source_path = local_core_bin_source_path(&name);
         let source_hash = sha256_file(&source_path)?;
         let target_path = Path::new("/usr/bin").join(&name);
         let target_hash = if target_path.exists() {
@@ -1476,7 +1517,7 @@ async fn apply_system_update_local(
             let mut created_without_backup = HashSet::new();
             let mut installed = Vec::new();
             for name in &updated {
-                let source_path = Path::new(CORE_BIN_SOURCE_DIR).join(name);
+                let source_path = local_core_bin_source_path(name);
                 let target_path = Path::new("/usr/bin").join(name);
                 if target_path.exists() {
                     fs::copy(&target_path, backup_dir.join(name))?;
@@ -1542,8 +1583,13 @@ async fn apply_system_update_local(
         }
         "vendor" => {
             let desired_blob = current_blob_runtime_config(state);
-            if desired_blob.sync_enabled && blob_sync_tool_is_syncthing(&desired_blob) {
-                ensure_blob_sync_runtime(&desired_blob).await?;
+            let desired_dist = current_dist_runtime_config(state);
+            let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
+            if desired_sync.sync_enabled
+                && (blob_sync_tool_is_syncthing(&desired_sync)
+                    || dist_sync_tool_is_syncthing(&desired_dist))
+            {
+                ensure_blob_sync_runtime(&desired_sync).await?;
                 Ok(SystemUpdateApplyResult {
                     status: "ok".to_string(),
                     updated: Vec::new(),
@@ -1863,6 +1909,38 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
     }
 }
 
+fn dist_runtime_from_hive(hive: &HiveFile) -> DistRuntimeConfig {
+    let mut path = PathBuf::from(DEFAULT_DIST_PATH);
+    let mut sync_enabled = DEFAULT_DIST_SYNC_ENABLED;
+    let mut sync_tool = DEFAULT_DIST_SYNC_TOOL.to_string();
+
+    if let Some(dist) = hive.dist.as_ref() {
+        if let Some(value) = dist.path.as_ref() {
+            let value = value.trim();
+            if !value.is_empty() {
+                path = PathBuf::from(value);
+            }
+        }
+        if let Some(sync) = dist.sync.as_ref() {
+            if let Some(value) = sync.enabled {
+                sync_enabled = value;
+            }
+            if let Some(value) = sync.tool.as_ref() {
+                let value = value.trim().to_ascii_lowercase();
+                if !value.is_empty() {
+                    sync_tool = value;
+                }
+            }
+        }
+    }
+
+    DistRuntimeConfig {
+        path,
+        sync_enabled,
+        sync_tool,
+    }
+}
+
 async fn connect_with_retry(
     config: &NodeConfig,
     delay: Duration,
@@ -1888,6 +1966,7 @@ fn ensure_dirs(
     state_dir: &Path,
     run_dir: &Path,
     blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
 ) -> Result<(), OrchestratorError> {
     let storage_root = json_router::paths::storage_root_dir();
     let opa_root = storage_root.join("opa");
@@ -1905,7 +1984,16 @@ fn ensure_dirs(
     if blob.sync_enabled {
         fs::create_dir_all(&blob.sync_data_dir)?;
     }
+    fs::create_dir_all(&dist.path)?;
+    fs::create_dir_all(dist.path.join("runtimes"))?;
+    fs::create_dir_all(dist.path.join("core").join("bin"))?;
+    fs::create_dir_all(dist.path.join("vendor"))?;
     fs::create_dir_all(runtimes_root())?;
+    fs::create_dir_all(legacy_runtimes_root())?;
+    fs::create_dir_all(Path::new(DIST_CORE_BIN_SOURCE_DIR))?;
+    fs::create_dir_all(Path::new(DIST_VENDOR_ROOT_DIR))?;
+    fs::create_dir_all(Path::new(CORE_BIN_SOURCE_DIR))?;
+    fs::create_dir_all(Path::new(VENDOR_ROOT_DIR))?;
     fs::create_dir_all(orchestrator_runtime_dir())?;
     fs::create_dir_all(run_dir)?;
     Ok(())
@@ -1913,6 +2001,22 @@ fn ensure_dirs(
 
 fn blob_sync_tool_is_syncthing(blob: &BlobRuntimeConfig) -> bool {
     blob.sync_tool.trim().eq_ignore_ascii_case("syncthing")
+}
+
+fn dist_sync_tool_is_syncthing(dist: &DistRuntimeConfig) -> bool {
+    dist.sync_tool.trim().eq_ignore_ascii_case("syncthing")
+}
+
+fn effective_syncthing_runtime_config(
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) -> BlobRuntimeConfig {
+    let mut effective = blob.clone();
+    if !effective.sync_enabled && dist.sync_enabled {
+        effective.sync_enabled = true;
+        effective.sync_tool = dist.sync_tool.clone();
+    }
+    effective
 }
 
 fn current_blob_runtime_config(state: &OrchestratorState) -> BlobRuntimeConfig {
@@ -1925,6 +2029,20 @@ fn current_blob_runtime_config(state: &OrchestratorState) -> BlobRuntimeConfig {
                 "failed to reload hive.yaml for blob sync reconciliation; using startup config"
             );
             state.blob.clone()
+        }
+    }
+}
+
+fn current_dist_runtime_config(state: &OrchestratorState) -> DistRuntimeConfig {
+    match load_hive(&state.config_dir) {
+        Ok(hive) => dist_runtime_from_hive(&hive),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                config_dir = %state.config_dir.display(),
+                "failed to reload hive.yaml for dist reconciliation; using startup config"
+            );
+            state.dist.clone()
         }
     }
 }
@@ -1950,10 +2068,9 @@ fn normalize_sha256(raw: &str) -> String {
 }
 
 fn load_vendor_manifest() -> Result<Option<VendorManifest>, OrchestratorError> {
-    let manifest_path = Path::new(VENDOR_MANIFEST_PATH);
-    if !manifest_path.exists() {
+    let Some(manifest_path) = local_vendor_manifest_path() else {
         return Ok(None);
-    }
+    };
     let data = fs::read_to_string(manifest_path)?;
     let manifest: VendorManifest = serde_json::from_str(&data)?;
     if manifest.schema_version == 0 {
@@ -1988,23 +2105,29 @@ fn vendor_syncthing_component() -> Result<Option<VendorManifestComponent>, Orche
 
 fn resolve_syncthing_vendor_source_path() -> Result<PathBuf, OrchestratorError> {
     if let Some(component) = vendor_syncthing_component()? {
-        let path = Path::new(VENDOR_ROOT_DIR).join(component.path);
-        if !path.exists() {
-            return Err(format!(
-                "vendor manifest syncthing path missing at '{}'",
-                path.display()
-            )
-            .into());
+        if let Some(path) = local_vendor_component_path(&component.path) {
+            return Ok(path);
         }
-        return Ok(path);
+        let primary = Path::new(DIST_VENDOR_ROOT_DIR).join(&component.path);
+        let legacy = Path::new(VENDOR_ROOT_DIR).join(&component.path);
+        return Err(format!(
+            "vendor manifest syncthing path missing at '{}' and '{}'",
+            primary.display(),
+            legacy.display()
+        )
+        .into());
     }
-    let fallback = PathBuf::from(SYNCTHING_VENDOR_SOURCE_PATH);
+    let fallback = PathBuf::from(DIST_SYNCTHING_VENDOR_SOURCE_PATH);
     if fallback.exists() {
         return Ok(fallback);
     }
+    let legacy_fallback = PathBuf::from(SYNCTHING_VENDOR_SOURCE_PATH);
+    if legacy_fallback.exists() {
+        return Ok(legacy_fallback);
+    }
     Err(format!(
-        "syncthing vendor binary missing at '{}' and vendor manifest is absent",
-        SYNCTHING_VENDOR_SOURCE_PATH
+        "syncthing vendor binary missing at '{}' and '{}' and vendor manifest is absent",
+        DIST_SYNCTHING_VENDOR_SOURCE_PATH, SYNCTHING_VENDOR_SOURCE_PATH
     )
     .into())
 }
@@ -2361,40 +2484,42 @@ fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
 
 async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), OrchestratorError> {
     let desired_blob = current_blob_runtime_config(state);
+    let desired_dist = current_dist_runtime_config(state);
+    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
     let changed = {
         let mut last = state.blob_sync_last_desired.lock().await;
-        if *last != desired_blob {
-            *last = desired_blob.clone();
+        if *last != desired_sync {
+            *last = desired_sync.clone();
             true
         } else {
             false
         }
     };
 
-    if !desired_blob.sync_enabled {
+    if !desired_sync.sync_enabled {
         if changed {
-            tracing::info!("blob sync disabled in hive.yaml; reverting syncthing runtime");
+            tracing::info!("blob/dist sync disabled in hive.yaml; reverting syncthing runtime");
             disable_blob_sync_runtime_local()?;
             disable_remote_blob_sync_all_hives(state);
         }
         return Ok(());
     }
-    if !blob_sync_tool_is_syncthing(&desired_blob) {
+    if !(blob_sync_tool_is_syncthing(&desired_sync) || dist_sync_tool_is_syncthing(&desired_dist)) {
         return Err(format!(
-            "unsupported blob.sync.tool '{}' (expected syncthing)",
-            desired_blob.sync_tool
+            "unsupported sync.tool for blob/dist (blob='{}', dist='{}'; expected syncthing)",
+            desired_blob.sync_tool, desired_dist.sync_tool
         )
         .into());
     }
 
     if changed {
-        tracing::info!("blob sync config changed in hive.yaml; reconciling syncthing runtime");
-        ensure_blob_sync_runtime(&desired_blob).await?;
+        tracing::info!("blob/dist sync config changed in hive.yaml; reconciling syncthing runtime");
+        ensure_blob_sync_runtime(&desired_sync).await?;
         return Ok(());
     }
 
     let service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
-    let api_healthy = syncthing_api_healthy(desired_blob.sync_api_port).await;
+    let api_healthy = syncthing_api_healthy(desired_sync.sync_api_port).await;
     if service_active && api_healthy {
         return Ok(());
     }
@@ -2405,7 +2530,7 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         api_healthy = api_healthy,
         "syncthing unhealthy; restarting"
     );
-    ensure_blob_sync_runtime(&desired_blob).await?;
+    ensure_blob_sync_runtime(&desired_sync).await?;
     Ok(())
 }
 
@@ -2560,7 +2685,7 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
             let syncthing_path = manifest
                 .components
                 .get("syncthing")
-                .map(|component| Path::new(VENDOR_ROOT_DIR).join(component.path.clone()));
+                .and_then(|component| local_vendor_component_path(&component.path));
             let syncthing_present = syncthing_path.as_ref().is_some_and(|path| path.exists());
             let manifest_hash = local_syncthing_vendor_hash().ok().flatten();
             serde_json::json!({
@@ -2574,7 +2699,8 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
             })
         }
         Ok(None) => {
-            let legacy_present = Path::new(SYNCTHING_VENDOR_SOURCE_PATH).exists();
+            let legacy_present = Path::new(DIST_SYNCTHING_VENDOR_SOURCE_PATH).exists()
+                || Path::new(SYNCTHING_VENDOR_SOURCE_PATH).exists();
             serde_json::json!({
                 "status": if legacy_present { "legacy_no_manifest" } else { "missing" },
                 "syncthing_present": legacy_present,
@@ -2613,7 +2739,11 @@ fn remote_versions_snapshot(
     address: &str,
     key_path: &Path,
 ) -> Result<serde_json::Value, OrchestratorError> {
-    let core = match remote_read_file(address, key_path, CORE_MANIFEST_PATH)? {
+    let core_raw = match remote_read_file(address, key_path, DIST_CORE_MANIFEST_PATH)? {
+        Some(raw) => Some(raw),
+        None => remote_read_file(address, key_path, CORE_MANIFEST_PATH)?,
+    };
+    let core = match core_raw {
         Some(raw) => match serde_json::from_str::<CoreManifest>(&raw) {
             Ok(manifest) => {
                 let manifest_hash = remote_core_manifest_hash(address, key_path).ok().flatten();
@@ -2634,29 +2764,32 @@ fn remote_versions_snapshot(
         }),
     };
 
-    let runtimes =
-        match remote_read_file(address, key_path, "/var/lib/fluxbee/runtimes/manifest.json")? {
-            Some(raw) => match serde_json::from_str::<RuntimeManifest>(&raw) {
-                Ok(manifest) => {
-                    let manifest_hash = remote_runtime_manifest_hash(address, key_path)
-                        .ok()
-                        .flatten();
-                    serde_json::json!({
-                        "status": "ok",
-                        "manifest_version": manifest.version,
-                        "manifest_hash": manifest_hash,
-                        "runtimes": manifest.runtimes,
-                    })
-                }
-                Err(err) => serde_json::json!({
-                    "status": "error",
-                    "message": format!("invalid runtime manifest: {}", err),
-                }),
-            },
-            None => serde_json::json!({
-                "status": "missing",
+    let runtime_raw = match remote_read_file(address, key_path, DIST_RUNTIME_MANIFEST_PATH)? {
+        Some(raw) => Some(raw),
+        None => remote_read_file(address, key_path, "/var/lib/fluxbee/runtimes/manifest.json")?,
+    };
+    let runtimes = match runtime_raw {
+        Some(raw) => match serde_json::from_str::<RuntimeManifest>(&raw) {
+            Ok(manifest) => {
+                let manifest_hash = remote_runtime_manifest_hash(address, key_path)
+                    .ok()
+                    .flatten();
+                serde_json::json!({
+                    "status": "ok",
+                    "manifest_version": manifest.version,
+                    "manifest_hash": manifest_hash,
+                    "runtimes": manifest.runtimes,
+                })
+            }
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "message": format!("invalid runtime manifest: {}", err),
             }),
-        };
+        },
+        None => serde_json::json!({
+            "status": "missing",
+        }),
+    };
 
     let vendor = match remote_syncthing_installed_hash(address, key_path) {
         Ok(hash) => {
@@ -3632,7 +3765,78 @@ fn validate_runtime_update_versioning(
 }
 
 fn runtimes_root() -> PathBuf {
-    json_router::paths::storage_root_dir().join("runtimes")
+    PathBuf::from(DIST_RUNTIME_ROOT_DIR)
+}
+
+fn legacy_runtimes_root() -> PathBuf {
+    PathBuf::from(LEGACY_RUNTIME_ROOT_DIR)
+}
+
+fn local_runtime_source_root() -> PathBuf {
+    let dist = runtimes_root();
+    if dist.join("manifest.json").exists() {
+        return dist;
+    }
+    let legacy = legacy_runtimes_root();
+    if legacy.exists() {
+        return legacy;
+    }
+    dist
+}
+
+fn local_runtime_manifest_paths() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from(DIST_RUNTIME_MANIFEST_PATH),
+        PathBuf::from(format!("{LEGACY_RUNTIME_ROOT_DIR}/manifest.json")),
+    ]
+}
+
+fn local_core_manifest_path() -> Option<PathBuf> {
+    let primary = PathBuf::from(DIST_CORE_MANIFEST_PATH);
+    if primary.exists() {
+        return Some(primary);
+    }
+    let legacy = PathBuf::from(CORE_MANIFEST_PATH);
+    if legacy.exists() {
+        return Some(legacy);
+    }
+    None
+}
+
+fn local_core_bin_source_path(name: &str) -> PathBuf {
+    let primary = Path::new(DIST_CORE_BIN_SOURCE_DIR).join(name);
+    if primary.exists() {
+        return primary;
+    }
+    Path::new(CORE_BIN_SOURCE_DIR).join(name)
+}
+
+fn local_vendor_manifest_path() -> Option<PathBuf> {
+    let primary = PathBuf::from(DIST_VENDOR_MANIFEST_PATH);
+    if primary.exists() {
+        return Some(primary);
+    }
+    let legacy = PathBuf::from(VENDOR_MANIFEST_PATH);
+    if legacy.exists() {
+        return Some(legacy);
+    }
+    None
+}
+
+fn local_vendor_component_path(relative_path: &str) -> Option<PathBuf> {
+    let rel = relative_path.trim();
+    if rel.is_empty() {
+        return None;
+    }
+    let primary = Path::new(DIST_VENDOR_ROOT_DIR).join(rel);
+    if primary.exists() {
+        return Some(primary);
+    }
+    let legacy = Path::new(VENDOR_ROOT_DIR).join(rel);
+    if legacy.exists() {
+        return Some(legacy);
+    }
+    None
 }
 
 fn orchestrator_runtime_dir() -> PathBuf {
@@ -3645,8 +3849,9 @@ fn orchestrator_runtime_manifest_path() -> PathBuf {
 
 fn load_runtime_manifest() -> Option<RuntimeManifest> {
     let primary = orchestrator_runtime_manifest_path();
-    let fallback = runtimes_root().join("manifest.json");
-    for path in [primary, fallback] {
+    let mut paths = vec![primary];
+    paths.extend(local_runtime_manifest_paths());
+    for path in paths {
         let data = match fs::read_to_string(&path) {
             Ok(data) => data,
             Err(_) => continue,
@@ -3678,9 +3883,11 @@ async fn current_runtime_manifest(state: &OrchestratorState) -> Option<RuntimeMa
 fn persist_runtime_manifest(manifest: &RuntimeManifest) -> Result<(), OrchestratorError> {
     fs::create_dir_all(orchestrator_runtime_dir())?;
     fs::create_dir_all(runtimes_root())?;
+    fs::create_dir_all(legacy_runtimes_root())?;
     let data = serde_json::to_string_pretty(manifest)?;
     fs::write(orchestrator_runtime_manifest_path(), &data)?;
-    fs::write(runtimes_root().join("manifest.json"), data)?;
+    fs::write(runtimes_root().join("manifest.json"), &data)?;
+    fs::write(legacy_runtimes_root().join("manifest.json"), data)?;
     Ok(())
 }
 
@@ -4032,7 +4239,12 @@ async fn vendor_sync_workers(
     force_record: bool,
 ) -> Result<(), OrchestratorError> {
     let desired_blob = current_blob_runtime_config(state);
-    if !desired_blob.sync_enabled || !blob_sync_tool_is_syncthing(&desired_blob) {
+    let desired_dist = current_dist_runtime_config(state);
+    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
+    if !desired_sync.sync_enabled
+        || !(blob_sync_tool_is_syncthing(&desired_sync)
+            || dist_sync_tool_is_syncthing(&desired_dist))
+    {
         return Ok(());
     }
 
@@ -4080,7 +4292,7 @@ async fn vendor_sync_workers(
             continue;
         }
         if let Err(err) =
-            ensure_remote_syncthing_runtime_with_access(&address, &key_path, &desired_blob)
+            ensure_remote_syncthing_runtime_with_access(&address, &key_path, &desired_sync)
         {
             tracing::warn!(hive = %hive_id, error = %err, "vendor sync failed");
             let rollback_note = attempt_remote_syncthing_rollback_note(&address, &key_path);
@@ -4246,23 +4458,24 @@ fn list_worker_access() -> Vec<(String, String, PathBuf)> {
 }
 
 fn local_runtime_manifest_hash() -> Result<Option<String>, OrchestratorError> {
-    let manifest_path = runtimes_root().join("manifest.json");
-    if !manifest_path.exists() {
-        return Ok(None);
+    for manifest_path in local_runtime_manifest_paths() {
+        if !manifest_path.exists() {
+            continue;
+        }
+        let mut cmd = Command::new("sha256sum");
+        cmd.arg(&manifest_path);
+        let out = run_cmd_output(cmd, "sha256sum local manifest")?;
+        let hash = out
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !hash.is_empty() {
+            return Ok(Some(hash));
+        }
     }
-    let mut cmd = Command::new("sha256sum");
-    cmd.arg(&manifest_path);
-    let out = run_cmd_output(cmd, "sha256sum local manifest")?;
-    let hash = out
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if hash.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(hash))
+    Ok(None)
 }
 
 fn verify_remote_hash_with_retry<F>(
@@ -4290,7 +4503,7 @@ fn remote_runtime_manifest_hash(
     address: &str,
     key_path: &Path,
 ) -> Result<Option<String>, OrchestratorError> {
-    let cmd = r#"bash -lc "if [ -f /var/lib/fluxbee/runtimes/manifest.json ]; then sha256sum /var/lib/fluxbee/runtimes/manifest.json | awk '{print $1}'; fi""#;
+    let cmd = r#"bash -lc "if [ -f /var/lib/fluxbee/dist/runtimes/manifest.json ]; then sha256sum /var/lib/fluxbee/dist/runtimes/manifest.json | awk '{print $1}'; elif [ -f /var/lib/fluxbee/runtimes/manifest.json ]; then sha256sum /var/lib/fluxbee/runtimes/manifest.json | awk '{print $1}'; fi""#;
     let out = ssh_with_key_output(address, key_path, &sudo_wrap(cmd), BOOTSTRAP_SSH_USER)?;
     let hash = out
         .split_whitespace()
@@ -4305,10 +4518,9 @@ fn remote_runtime_manifest_hash(
 }
 
 fn local_core_manifest_hash() -> Result<Option<String>, OrchestratorError> {
-    let manifest_path = Path::new(CORE_MANIFEST_PATH);
-    if !manifest_path.exists() {
+    let Some(manifest_path) = local_core_manifest_path() else {
         return Ok(None);
-    }
+    };
     let mut cmd = Command::new("sha256sum");
     cmd.arg(manifest_path);
     let out = run_cmd_output(cmd, "sha256sum local core manifest")?;
@@ -4328,10 +4540,7 @@ fn remote_core_manifest_hash(
     address: &str,
     key_path: &Path,
 ) -> Result<Option<String>, OrchestratorError> {
-    let cmd = format!(
-        "bash -lc \"if [ -f '{}' ]; then sha256sum '{}' | awk '{{print $1}}'; fi\"",
-        CORE_MANIFEST_PATH, CORE_MANIFEST_PATH
-    );
+    let cmd = "bash -lc \"if [ -f '/var/lib/fluxbee/dist/core/manifest.json' ]; then sha256sum '/var/lib/fluxbee/dist/core/manifest.json' | awk '{print $1}'; elif [ -f '/var/lib/fluxbee/core/manifest.json' ]; then sha256sum '/var/lib/fluxbee/core/manifest.json' | awk '{print $1}'; fi\"".to_string();
     let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
     let hash = out
         .split_whitespace()
@@ -4371,7 +4580,7 @@ fn sync_runtime_to_worker(
     address: &str,
     key_path: &Path,
 ) -> Result<(), OrchestratorError> {
-    let local_root = runtimes_root();
+    let local_root = local_runtime_source_root();
     if !local_root.exists() {
         return Ok(());
     }
@@ -4403,7 +4612,7 @@ fn sync_runtime_to_worker(
     run_cmd(cmd, &format!("rsync runtime stage ({hive_id})"))?;
 
     let promote_cmd = format!(
-        "mkdir -p /var/lib/fluxbee/runtimes && rsync -r --delete --omit-dir-times --no-perms --no-owner --no-group '{stage}/' /var/lib/fluxbee/runtimes/ && rm -rf '{stage}'",
+        "mkdir -p /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/runtimes && rsync -r --delete --omit-dir-times --no-perms --no-owner --no-group '{stage}/' /var/lib/fluxbee/dist/runtimes/ && rsync -r --delete --omit-dir-times --no-perms --no-owner --no-group /var/lib/fluxbee/dist/runtimes/ /var/lib/fluxbee/runtimes/ && rm -rf '{stage}'",
         stage = remote_stage
     );
     let promote_cmd_escaped = promote_cmd.replace('"', "\\\"");
@@ -4568,6 +4777,10 @@ fn resolve_runtime_key(
 }
 
 fn runtime_start_script(runtime: &str, version: &str) -> String {
+    format!("/var/lib/fluxbee/dist/runtimes/{runtime}/{version}/bin/start.sh")
+}
+
+fn runtime_start_script_legacy(runtime: &str, version: &str) -> String {
     format!("/var/lib/fluxbee/runtimes/{runtime}/{version}/bin/start.sh")
 }
 
@@ -4586,17 +4799,6 @@ fn hive_has_runtime_script(
     );
     let out = ssh_with_key_output(&address, &key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
     Ok(out.trim() == "1")
-}
-
-fn sync_runtime_to_hive(
-    state: &OrchestratorState,
-    target_hive: &str,
-) -> Result<(), OrchestratorError> {
-    if target_hive == state.hive_id {
-        return Ok(());
-    }
-    let (address, key_path) = hive_access(target_hive)?;
-    sync_runtime_to_worker(target_hive, &address, &key_path)
 }
 
 fn system_forward_timeout() -> Duration {
@@ -4890,41 +5092,34 @@ async fn run_node_flow(
         }
     };
 
-    let start_script = runtime_start_script(&runtime_key, &version);
-    match hive_has_runtime_script(state, &target_hive, &start_script) {
-        Ok(true) => {}
-        Ok(false) => {
-            if let Err(err) = sync_runtime_to_hive(state, &target_hive) {
+    let start_script_primary = runtime_start_script(&runtime_key, &version);
+    let start_script_legacy = runtime_start_script_legacy(&runtime_key, &version);
+    let start_script = match hive_has_runtime_script(state, &target_hive, &start_script_primary) {
+        Ok(true) => start_script_primary,
+        Ok(false) => match hive_has_runtime_script(state, &target_hive, &start_script_legacy) {
+            Ok(true) => start_script_legacy,
+            Ok(false) => {
                 return serde_json::json!({
                     "status": "error",
-                    "error_code": "RUNTIME_SYNC_FAILED",
+                    "error_code": "RUNTIME_NOT_PRESENT",
+                    "message": format!(
+                        "runtime script missing in dist and legacy paths: {}, {}",
+                        start_script_primary, start_script_legacy
+                    ),
+                    "target": target_hive,
+                    "node_name": node_name,
+                });
+            }
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "RUNTIME_CHECK_FAILED",
                     "message": err.to_string(),
                     "target": target_hive,
                     "node_name": node_name,
                 });
             }
-            match hive_has_runtime_script(state, &target_hive, &start_script) {
-                Ok(true) => {}
-                Ok(false) => {
-                    return serde_json::json!({
-                        "status": "error",
-                        "error_code": "RUNTIME_NOT_PRESENT",
-                        "message": format!("runtime script missing after sync: {start_script}"),
-                        "target": target_hive,
-                        "node_name": node_name,
-                    });
-                }
-                Err(err) => {
-                    return serde_json::json!({
-                        "status": "error",
-                        "error_code": "RUNTIME_CHECK_FAILED",
-                        "message": err.to_string(),
-                        "target": target_hive,
-                        "node_name": node_name,
-                    });
-                }
-            }
-        }
+        },
         Err(err) => {
             return serde_json::json!({
                 "status": "error",
@@ -4934,7 +5129,7 @@ async fn run_node_flow(
                 "node_name": node_name,
             });
         }
-    }
+    };
 
     match systemd_unit_is_active(&unit) {
         Ok(true) => {
@@ -5331,14 +5526,12 @@ fn sha256_file(path: &Path) -> Result<String, OrchestratorError> {
 }
 
 fn load_core_manifest() -> Result<CoreManifest, OrchestratorError> {
-    let manifest_path = Path::new(CORE_MANIFEST_PATH);
-    if !manifest_path.exists() {
-        return Err(format!(
-            "core manifest missing at '{}' (run scripts/install.sh)",
-            manifest_path.display()
+    let manifest_path = local_core_manifest_path().ok_or_else(|| {
+        format!(
+            "core manifest missing at '{}' and '{}' (run scripts/install.sh)",
+            DIST_CORE_MANIFEST_PATH, CORE_MANIFEST_PATH
         )
-        .into());
-    }
+    })?;
     let data = fs::read_to_string(manifest_path)?;
     let manifest: CoreManifest = serde_json::from_str(&data)?;
     if manifest.schema_version == 0 {
@@ -5439,7 +5632,7 @@ fn core_bin_paths_for_role(
 ) -> Result<Vec<String>, OrchestratorError> {
     Ok(core_component_names_for_role(manifest, is_motherbee)?
         .into_iter()
-        .map(|name| format!("{CORE_BIN_SOURCE_DIR}/{name}"))
+        .map(|name| local_core_bin_source_path(&name).display().to_string())
         .collect())
 }
 
@@ -5475,7 +5668,7 @@ fn sync_core_to_worker(
         if !valid_token(name) {
             return Err(format!("core manifest has invalid component name '{}'", name).into());
         }
-        let path = Path::new(CORE_BIN_SOURCE_DIR).join(name);
+        let path = local_core_bin_source_path(name);
         if !path.exists() {
             return Err(format!("missing core source binary '{}'", path.display()).into());
         }
@@ -5484,7 +5677,13 @@ fn sync_core_to_worker(
     validate_core_manifest_for_bins(&local_paths)?;
 
     let mut upload_paths = local_paths.clone();
-    upload_paths.push(CORE_MANIFEST_PATH.to_string());
+    let manifest_source_path = local_core_manifest_path().ok_or_else(|| {
+        format!(
+            "core manifest missing at '{}' and '{}'",
+            DIST_CORE_MANIFEST_PATH, CORE_MANIFEST_PATH
+        )
+    })?;
+    upload_paths.push(manifest_source_path.display().to_string());
     let upload_refs: Vec<&str> = upload_paths.iter().map(String::as_str).collect();
 
     let remote_stage = format!("/tmp/fluxbee-core-sync-{}", sanitize_unit_suffix(hive_id));
@@ -5503,20 +5702,20 @@ fn sync_core_to_worker(
 
     let mut commands = vec![
         "set -euo pipefail".to_string(),
-        "mkdir -p /var/lib/fluxbee/core".to_string(),
-        "rm -rf /var/lib/fluxbee/core/bin.next".to_string(),
-        "mkdir -p /var/lib/fluxbee/core/bin.next".to_string(),
+        "mkdir -p /var/lib/fluxbee/dist/core".to_string(),
+        "rm -rf /var/lib/fluxbee/dist/core/bin.next".to_string(),
+        "mkdir -p /var/lib/fluxbee/dist/core/bin.next".to_string(),
     ];
 
     for name in &component_names {
         commands.push(format!(
-            "install -m 0755 '{stage}/{name}' '/var/lib/fluxbee/core/bin.next/{name}'",
+            "install -m 0755 '{stage}/{name}' '/var/lib/fluxbee/dist/core/bin.next/{name}'",
             stage = shell_single_quote(&remote_stage),
             name = shell_single_quote(name),
         ));
     }
     commands.push(format!(
-        "install -m 0644 '{stage}/manifest.json' '/var/lib/fluxbee/core/manifest.next.json'",
+        "install -m 0644 '{stage}/manifest.json' '/var/lib/fluxbee/dist/core/manifest.next.json'",
         stage = shell_single_quote(&remote_stage)
     ));
 
@@ -5526,36 +5725,46 @@ fn sync_core_to_worker(
             .get(name)
             .ok_or_else(|| format!("core manifest missing component '{}'", name))?;
         commands.push(format!(
-            "test \"$(sha256sum '/var/lib/fluxbee/core/bin.next/{name}' | awk '{{print $1}}')\" = '{sha}'",
+            "test \"$(sha256sum '/var/lib/fluxbee/dist/core/bin.next/{name}' | awk '{{print $1}}')\" = '{sha}'",
             name = shell_single_quote(name),
             sha = shell_single_quote(expected.sha256.trim()),
         ));
         if let Some(size) = expected.size {
             commands.push(format!(
-                "test \"$(stat -c %s '/var/lib/fluxbee/core/bin.next/{name}')\" = '{size}'",
+                "test \"$(stat -c %s '/var/lib/fluxbee/dist/core/bin.next/{name}')\" = '{size}'",
                 name = shell_single_quote(name),
                 size = size
             ));
         }
     }
 
-    commands.push("rm -rf /var/lib/fluxbee/core/bin.prev".to_string());
+    commands.push("rm -rf /var/lib/fluxbee/dist/core/bin.prev".to_string());
     commands.push(
-        "if [ -d /var/lib/fluxbee/core/bin ]; then mv /var/lib/fluxbee/core/bin /var/lib/fluxbee/core/bin.prev; fi"
+        "if [ -d /var/lib/fluxbee/dist/core/bin ]; then mv /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/core/bin.prev; fi"
             .to_string(),
     );
-    commands.push("mv /var/lib/fluxbee/core/bin.next /var/lib/fluxbee/core/bin".to_string());
+    commands
+        .push("mv /var/lib/fluxbee/dist/core/bin.next /var/lib/fluxbee/dist/core/bin".to_string());
     commands.push(
-        "if [ -f /var/lib/fluxbee/core/manifest.json ]; then cp /var/lib/fluxbee/core/manifest.json /var/lib/fluxbee/core/manifest.prev.json; fi"
+        "if [ -f /var/lib/fluxbee/dist/core/manifest.json ]; then cp /var/lib/fluxbee/dist/core/manifest.json /var/lib/fluxbee/dist/core/manifest.prev.json; fi"
             .to_string(),
     );
     commands.push(
-        "mv /var/lib/fluxbee/core/manifest.next.json /var/lib/fluxbee/core/manifest.json"
+        "mv /var/lib/fluxbee/dist/core/manifest.next.json /var/lib/fluxbee/dist/core/manifest.json"
+            .to_string(),
+    );
+    commands.push("mkdir -p /var/lib/fluxbee/core /var/lib/fluxbee/core/bin".to_string());
+    commands.push(
+        "rsync -r --delete --omit-dir-times --no-perms --no-owner --no-group /var/lib/fluxbee/dist/core/bin/ /var/lib/fluxbee/core/bin/"
+            .to_string(),
+    );
+    commands.push(
+        "install -m 0644 /var/lib/fluxbee/dist/core/manifest.json /var/lib/fluxbee/core/manifest.json"
             .to_string(),
     );
     for name in &component_names {
         commands.push(format!(
-            "install -m 0755 '/var/lib/fluxbee/core/bin/{name}' '/usr/bin/{name}'",
+            "install -m 0755 '/var/lib/fluxbee/dist/core/bin/{name}' '/usr/bin/{name}'",
             name = shell_single_quote(name),
         ));
     }
@@ -5726,12 +5935,15 @@ fn restart_remote_core_services_with_health_gate(
 
 fn rollback_remote_core_to_prev(address: &str, key_path: &Path) -> Result<(), OrchestratorError> {
     let rollback_cmd = "set -euo pipefail && \
-if [ ! -d /var/lib/fluxbee/core/bin.prev ]; then echo 'missing /var/lib/fluxbee/core/bin.prev' >&2; exit 1; fi && \
-rm -rf /var/lib/fluxbee/core/bin.bad && \
-if [ -d /var/lib/fluxbee/core/bin ]; then mv /var/lib/fluxbee/core/bin /var/lib/fluxbee/core/bin.bad; fi && \
-mv /var/lib/fluxbee/core/bin.prev /var/lib/fluxbee/core/bin && \
-if [ -f /var/lib/fluxbee/core/manifest.prev.json ]; then mv /var/lib/fluxbee/core/manifest.prev.json /var/lib/fluxbee/core/manifest.json; fi && \
-for b in /var/lib/fluxbee/core/bin/*; do [ -f \"$b\" ] || continue; install -m 0755 \"$b\" \"/usr/bin/$(basename \"$b\")\"; done";
+if [ ! -d /var/lib/fluxbee/dist/core/bin.prev ]; then echo 'missing /var/lib/fluxbee/dist/core/bin.prev' >&2; exit 1; fi && \
+rm -rf /var/lib/fluxbee/dist/core/bin.bad && \
+if [ -d /var/lib/fluxbee/dist/core/bin ]; then mv /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/core/bin.bad; fi && \
+mv /var/lib/fluxbee/dist/core/bin.prev /var/lib/fluxbee/dist/core/bin && \
+if [ -f /var/lib/fluxbee/dist/core/manifest.prev.json ]; then mv /var/lib/fluxbee/dist/core/manifest.prev.json /var/lib/fluxbee/dist/core/manifest.json; fi && \
+mkdir -p /var/lib/fluxbee/core /var/lib/fluxbee/core/bin && \
+rsync -r --delete --omit-dir-times --no-perms --no-owner --no-group /var/lib/fluxbee/dist/core/bin/ /var/lib/fluxbee/core/bin/ && \
+if [ -f /var/lib/fluxbee/dist/core/manifest.json ]; then install -m 0644 /var/lib/fluxbee/dist/core/manifest.json /var/lib/fluxbee/core/manifest.json; fi && \
+for b in /var/lib/fluxbee/dist/core/bin/*; do [ -f \"$b\" ] || continue; install -m 0755 \"$b\" \"/usr/bin/$(basename \"$b\")\"; done";
     let rollback_cmd_q = shell_single_quote(rollback_cmd);
     ssh_with_key(
         address,
@@ -6068,6 +6280,7 @@ fn add_hive_flow(
     harden_ssh: bool,
 ) -> serde_json::Value {
     let desired_blob = current_blob_runtime_config(state);
+    let desired_dist = current_dist_runtime_config(state);
     let root = hives_root();
     let hive_dir = root.join(hive_id);
     if hive_exists(&state.state_dir, hive_id) {
@@ -6293,7 +6506,7 @@ fn add_hive_flow(
         address,
         &key_path,
         &sudo_wrap(&format!(
-            "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/runtimes /var/run/fluxbee/routers '{}' '{}'",
+            "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/runtimes /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}'",
             state.blob.path.display(),
             state.blob.sync_data_dir.display()
         )),
@@ -6327,7 +6540,7 @@ fn add_hive_flow(
                 .to_string()
         });
     let hive_yaml = format!(
-        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n",
+        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n",
         hive_id,
         worker_uplink,
         storage_path,
@@ -6336,7 +6549,10 @@ fn add_hive_flow(
         desired_blob.sync_enabled,
         desired_blob.sync_tool,
         desired_blob.sync_api_port,
-        desired_blob.sync_data_dir.display()
+        desired_blob.sync_data_dir.display(),
+        desired_dist.path.display(),
+        desired_dist.sync_enabled,
+        desired_dist.sync_tool
     );
     if let Err(err) = write_remote_file(address, &key_path, "/etc/fluxbee/hive.yaml", &hive_yaml) {
         return serde_json::json!({
@@ -6458,7 +6674,8 @@ fn add_hive_flow(
         });
     }
 
-    if desired_blob.sync_enabled {
+    if desired_blob.sync_enabled || desired_dist.sync_enabled {
+        let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
         let vendor_started_at = now_epoch_ms();
         let vendor_started = Instant::now();
         let local_vendor_hash = local_syncthing_vendor_hash().ok().flatten();
@@ -6466,7 +6683,7 @@ fn add_hive_flow(
             .ok()
             .flatten();
         if let Err(err) =
-            ensure_remote_syncthing_runtime_with_access(address, &key_path, &desired_blob)
+            ensure_remote_syncthing_runtime_with_access(address, &key_path, &desired_sync)
         {
             let rollback_note = attempt_remote_syncthing_rollback_note(address, &key_path);
             let reason = format!("syncthing setup failed: {err}; {rollback_note}");
@@ -7524,6 +7741,19 @@ mod tests {
                 sync_api_port: 8384,
                 sync_data_dir: PathBuf::from("/var/lib/fluxbee/syncthing"),
             },
+            dist: DistRuntimeConfig {
+                path: PathBuf::from("/var/lib/fluxbee/dist"),
+                sync_enabled: true,
+                sync_tool: "syncthing".to_string(),
+            },
+            blob_sync_last_desired: Mutex::new(BlobRuntimeConfig {
+                enabled: true,
+                path: PathBuf::from("/var/lib/fluxbee/blob"),
+                sync_enabled: false,
+                sync_tool: "syncthing".to_string(),
+                sync_api_port: 8384,
+                sync_data_dir: PathBuf::from("/var/lib/fluxbee/syncthing"),
+            }),
         }
     }
 
@@ -7580,13 +7810,14 @@ mod tests {
         };
         node.name_len = write_name(&mut node.name, "WF.echo@worker-220");
 
-        let active = remote_node_to_json(&node, 1000, 0).expect("active node");
+        let active = remote_node_to_json(&node, 1000, 0, "worker-220").expect("active node");
         assert_eq!(active["status"], "active");
 
-        let stale = remote_node_to_json(&node, 1000, FLAG_STALE).expect("stale node");
+        let stale = remote_node_to_json(&node, 1000, FLAG_STALE, "worker-220").expect("stale node");
         assert_eq!(stale["status"], "stale");
 
-        let deleted = remote_node_to_json(&node, 1000, FLAG_DELETED).expect("deleted node");
+        let deleted =
+            remote_node_to_json(&node, 1000, FLAG_DELETED, "worker-220").expect("deleted node");
         assert_eq!(deleted["status"], "deleted");
     }
 }
