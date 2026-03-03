@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-members = ["crates/fluxbee_sdk"]
+members = [
+    "crates/fluxbee_sdk",
+    "crates/fluxbee_ai_sdk",
+    "crates/fluxbee_ai_nodes",
+]
 
 [dependencies]
 tokio = { version = "1.37", features = ["full"] }
