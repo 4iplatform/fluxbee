@@ -115,9 +115,10 @@ Salida:
 - [ ] V6.2 Resolver runtime/version segun regla TYPE.campo1 definida por spec.
 - [ ] V6.3 Ejecutar nodo como unit transient systemd (estrategia unica definida).
 - [x] V6.4 Migrar `KILL_NODE` con `force=false/true` (SIGTERM/SIGKILL).
-- [ ] V6.5 Ajustar listados y estado para incluir nodos AI/IO/WF/SY/RT bajo mismo contrato.
+- [x] V6.5 Ajustar listados y estado para incluir nodos AI/IO/WF/SY/RT bajo mismo contrato.
 
 Nota (2026-03-03): `SPAWN_NODE` acepta `node_name` (y mantiene compatibilidad con `name`), deriva `runtime` desde `node_name` cuando no se envía explícito y usa `runtime_version` (alias `version`). `KILL_NODE` acepta `force` y lo mapea a `SIGKILL` (o `SIGTERM` por defecto).
+Nota (2026-03-03): `list_nodes` agrega campos uniformes `node_name`, `hive` y `kind` (AI/IO/WF/SY/RT/UNKNOWN) tanto para snapshot local como para nodos remotos por LSA.
 
 Salida:
 

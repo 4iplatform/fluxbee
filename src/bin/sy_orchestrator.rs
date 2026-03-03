@@ -2455,11 +2455,11 @@ fn routers_from_snapshot(snapshot: &ShmSnapshot) -> Vec<serde_json::Value> {
     })]
 }
 
-fn nodes_from_snapshot(snapshot: &ShmSnapshot) -> Vec<serde_json::Value> {
+fn nodes_from_snapshot(snapshot: &ShmSnapshot, local_hive: &str) -> Vec<serde_json::Value> {
     snapshot
         .nodes
         .iter()
-        .filter_map(|node| node_entry_to_json(node))
+        .filter_map(|node| node_entry_to_json(node, local_hive))
         .collect()
 }
 
@@ -2469,7 +2469,7 @@ fn list_nodes_flow(state: &OrchestratorState, payload: &serde_json::Value) -> se
         return match load_router_snapshot(state) {
             Ok(snapshot) => serde_json::json!({
                 "status": "ok",
-                "nodes": nodes_from_snapshot(&snapshot),
+                "nodes": nodes_from_snapshot(&snapshot, &state.hive_id),
             }),
             Err(err) => serde_json::json!({
                 "status": "error",
@@ -3101,15 +3101,45 @@ fn get_drift_alerts_flow(
     }
 }
 
-fn node_entry_to_json(entry: &NodeEntry) -> Option<serde_json::Value> {
+fn node_kind_from_name(name: &str) -> String {
+    let local = name.split('@').next().unwrap_or(name);
+    let prefix = local
+        .split('.')
+        .next()
+        .unwrap_or(local)
+        .trim()
+        .to_ascii_uppercase();
+    match prefix.as_str() {
+        "AI" | "IO" | "WF" | "SY" | "RT" => prefix,
+        _ => "UNKNOWN".to_string(),
+    }
+}
+
+fn node_l2_and_hive(name: &str, default_hive: &str) -> (String, String) {
+    if let Some((local, hive)) = name.rsplit_once('@') {
+        let local = local.trim();
+        let hive = hive.trim();
+        if !local.is_empty() && !hive.is_empty() {
+            return (format!("{local}@{hive}"), hive.to_string());
+        }
+    }
+    let l2 = format!("{}@{}", name.trim(), default_hive);
+    (l2, default_hive.to_string())
+}
+
+fn node_entry_to_json(entry: &NodeEntry, local_hive: &str) -> Option<serde_json::Value> {
     if entry.name_len == 0 {
         return None;
     }
     let name = node_name(entry);
+    let (node_name_l2, hive) = node_l2_and_hive(&name, local_hive);
     let uuid = Uuid::from_slice(&entry.uuid).ok()?;
     Some(serde_json::json!({
         "uuid": uuid.to_string(),
         "name": name,
+        "node_name": node_name_l2,
+        "hive": hive,
+        "kind": node_kind_from_name(&name),
         "vpn_id": entry.vpn_id,
         "connected_at": entry.connected_at,
         "status": "active",
@@ -3142,7 +3172,9 @@ fn remote_nodes_for_hive(snapshot: &LsaSnapshot, target_hive: &str) -> Vec<serde
         if node.flags & (FLAG_DELETED | FLAG_STALE) != 0 {
             continue;
         }
-        let Some(node_json) = remote_node_to_json(node, hive_entry.last_updated, node.flags) else {
+        let Some(node_json) =
+            remote_node_to_json(node, hive_entry.last_updated, node.flags, target_hive)
+        else {
             continue;
         };
         out.push(node_json);
@@ -3154,16 +3186,21 @@ fn remote_node_to_json(
     entry: &RemoteNodeEntry,
     connected_at: u64,
     flags: u16,
+    remote_hive: &str,
 ) -> Option<serde_json::Value> {
     if entry.name_len == 0 {
         return None;
     }
     let len = entry.name_len as usize;
     let name = String::from_utf8_lossy(&entry.name[..len]).into_owned();
+    let (node_name_l2, hive) = node_l2_and_hive(&name, remote_hive);
     let uuid = Uuid::from_slice(&entry.uuid).ok()?;
     Some(serde_json::json!({
         "uuid": uuid.to_string(),
         "name": name,
+        "node_name": node_name_l2,
+        "hive": hive,
+        "kind": node_kind_from_name(&name),
         "vpn_id": entry.vpn_id,
         "connected_at": connected_at,
         "status": remote_flags_status(flags),
