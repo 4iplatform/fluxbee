@@ -1056,7 +1056,14 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("DELETE", ["nodes", name]) => {
-            let payload = serde_json::json!({ "name": decode_percent(name) });
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if payload.get("node_name").is_none() && payload.get("name").is_none() {
+                payload["name"] = serde_json::Value::String(decode_percent(name));
+            }
             let (status, resp) =
                 handle_admin_command(ctx, client, "kill_node", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
@@ -2399,7 +2406,7 @@ fn normalize_admin_payload(
         }
     }
 
-    if action == "kill_node" && payload.get("node_name").is_none() {
+    if (action == "run_node" || action == "kill_node") && payload.get("node_name").is_none() {
         if let Some(name) = payload.get("name").and_then(|value| value.as_str()) {
             payload["node_name"] = serde_json::Value::String(name.to_string());
         }

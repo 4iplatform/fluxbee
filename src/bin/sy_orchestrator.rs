@@ -4408,6 +4408,75 @@ fn sanitize_unit_suffix(value: &str) -> String {
         .collect::<String>()
 }
 
+fn valid_node_local_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+fn normalize_node_name_for_target(
+    raw_node_name: &str,
+    target_hive: &str,
+) -> Result<String, OrchestratorError> {
+    let raw = raw_node_name.trim();
+    if raw.is_empty() {
+        return Err("missing node_name".into());
+    }
+
+    if let Some((local, hive)) = raw.rsplit_once('@') {
+        let local = local.trim();
+        let hive = hive.trim();
+        if local.is_empty() || hive.is_empty() {
+            return Err("invalid node_name".into());
+        }
+        if !valid_node_local_name(local) {
+            return Err("invalid node_name".into());
+        }
+        if !valid_hive_id(hive) {
+            return Err("invalid node_name hive".into());
+        }
+        return Ok(format!("{local}@{hive}"));
+    }
+
+    if !valid_node_local_name(raw) {
+        return Err("invalid node_name".into());
+    }
+    if !valid_hive_id(target_hive) {
+        return Err("invalid target hive".into());
+    }
+    Ok(format!("{raw}@{target_hive}"))
+}
+
+fn node_runtime_from_name(node_name: &str) -> Option<String> {
+    let local = node_name.split('@').next().unwrap_or(node_name);
+    let mut parts = local.split('.');
+    let p0 = parts.next()?.trim();
+    let p1 = parts.next()?.trim();
+    if p0.is_empty() || p1.is_empty() {
+        return None;
+    }
+    let runtime = format!("{p0}.{p1}");
+    if valid_token(&runtime) {
+        Some(runtime)
+    } else {
+        None
+    }
+}
+
+fn unit_from_node_name(node_name: &str) -> String {
+    format!("fluxbee-node-{}", sanitize_unit_suffix(node_name))
+}
+
+fn systemd_unit_is_active(unit: &str) -> Result<bool, OrchestratorError> {
+    let status = Command::new("systemctl")
+        .arg("is-active")
+        .arg("--quiet")
+        .arg(unit)
+        .status()?;
+    Ok(status.success())
+}
+
 fn resolve_runtime_version(
     manifest: &RuntimeManifest,
     runtime: &str,
@@ -4576,19 +4645,45 @@ async fn run_node_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
+    let mut target_hive = target_hive_from_payload(payload, &state.hive_id);
+    let raw_node_name = payload
+        .get("node_name")
+        .or_else(|| payload.get("name"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if let Some((_, hive)) = raw_node_name.rsplit_once('@') {
+        if !hive.trim().is_empty() {
+            target_hive = hive.trim().to_string();
+        }
+    }
+    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+            });
+        }
+    };
+
     let runtime = payload
         .get("runtime")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .or_else(|| node_runtime_from_name(&node_name))
+        .unwrap_or_default();
     if runtime.is_empty() {
         return serde_json::json!({
             "status": "error",
             "error_code": "INVALID_REQUEST",
-            "message": "missing runtime",
+            "message": "missing runtime (or runtime not derivable from node_name)",
         });
     }
-    if !valid_token(runtime) {
+    if !valid_token(&runtime) {
         return serde_json::json!({
             "status": "error",
             "error_code": "INVALID_REQUEST",
@@ -4597,7 +4692,8 @@ async fn run_node_flow(
     }
 
     let requested_version = payload
-        .get("version")
+        .get("runtime_version")
+        .or_else(|| payload.get("version"))
         .and_then(|v| v.as_str())
         .unwrap_or("current")
         .trim();
@@ -4605,7 +4701,7 @@ async fn run_node_flow(
         return serde_json::json!({
             "status": "error",
             "error_code": "INVALID_REQUEST",
-            "message": "invalid version",
+            "message": "invalid runtime_version",
         });
     }
 
@@ -4619,7 +4715,7 @@ async fn run_node_flow(
             });
         }
     };
-    let version = match resolve_runtime_version(&manifest, runtime, requested_version) {
+    let version = match resolve_runtime_version(&manifest, &runtime, requested_version) {
         Ok(version) => version,
         Err(err) => {
             return serde_json::json!({
@@ -4630,29 +4726,24 @@ async fn run_node_flow(
         }
     };
 
-    let target_hive = target_hive_from_payload(payload, &state.hive_id);
     let unit = payload
         .get("unit")
         .and_then(|v| v.as_str())
         .map(|v| sanitize_unit_suffix(v.trim()))
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| {
-            let base = payload
-                .get("config")
-                .and_then(|v| v.get("instance_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(runtime);
-            format!(
-                "fluxbee-node-{}-{}",
-                sanitize_unit_suffix(base),
-                now_epoch_ms()
-            )
-        });
+        .unwrap_or_else(|| unit_from_node_name(&node_name));
 
     if target_hive != state.hive_id {
         let mut forwarded_payload = payload.clone();
         if let Some(obj) = forwarded_payload.as_object_mut() {
             obj.insert("target".to_string(), serde_json::json!(target_hive));
+            obj.insert("node_name".to_string(), serde_json::json!(node_name));
+            obj.insert("runtime".to_string(), serde_json::json!(runtime));
+            obj.insert(
+                "runtime_version".to_string(),
+                serde_json::json!(requested_version),
+            );
+            obj.insert("unit".to_string(), serde_json::json!(unit));
         }
         return match forward_system_action_to_hive(
             state,
@@ -4669,12 +4760,13 @@ async fn run_node_flow(
                 "error_code": "SPAWN_FAILED",
                 "message": err.to_string(),
                 "target": target_hive,
+                "node_name": node_name,
                 "unit": unit,
             }),
         };
     }
 
-    let start_script = runtime_start_script(runtime, &version);
+    let start_script = runtime_start_script(&runtime, &version);
     match hive_has_runtime_script(state, &target_hive, &start_script) {
         Ok(true) => {}
         Ok(false) => {
@@ -4684,6 +4776,7 @@ async fn run_node_flow(
                     "error_code": "RUNTIME_SYNC_FAILED",
                     "message": err.to_string(),
                     "target": target_hive,
+                    "node_name": node_name,
                 });
             }
             match hive_has_runtime_script(state, &target_hive, &start_script) {
@@ -4694,6 +4787,7 @@ async fn run_node_flow(
                         "error_code": "RUNTIME_NOT_PRESENT",
                         "message": format!("runtime script missing after sync: {start_script}"),
                         "target": target_hive,
+                        "node_name": node_name,
                     });
                 }
                 Err(err) => {
@@ -4702,6 +4796,7 @@ async fn run_node_flow(
                         "error_code": "RUNTIME_CHECK_FAILED",
                         "message": err.to_string(),
                         "target": target_hive,
+                        "node_name": node_name,
                     });
                 }
             }
@@ -4712,6 +4807,34 @@ async fn run_node_flow(
                 "error_code": "RUNTIME_CHECK_FAILED",
                 "message": err.to_string(),
                 "target": target_hive,
+                "node_name": node_name,
+            });
+        }
+    }
+
+    match systemd_unit_is_active(&unit) {
+        Ok(true) => {
+            return serde_json::json!({
+                "status": "ok",
+                "state": "already_running",
+                "node_name": node_name,
+                "runtime": runtime,
+                "version": version,
+                "requested_version": requested_version,
+                "hive": target_hive,
+                "target": target_hive,
+                "unit": unit,
+            });
+        }
+        Ok(false) => {}
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SERVICE_FAILED",
+                "message": format!("unable to check unit activity: {err}"),
+                "target": target_hive,
+                "node_name": node_name,
+                "unit": unit,
             });
         }
     }
@@ -4724,9 +4847,11 @@ async fn run_node_flow(
     match execute_on_hive(state, &target_hive, &cmd, "run_node") {
         Ok(()) => serde_json::json!({
             "status": "ok",
+            "node_name": node_name,
             "runtime": runtime,
             "version": version,
             "requested_version": requested_version,
+            "hive": target_hive,
             "target": target_hive,
             "unit": unit,
         }),
@@ -4735,6 +4860,7 @@ async fn run_node_flow(
             "error_code": "SPAWN_FAILED",
             "message": err.to_string(),
             "target": target_hive,
+            "node_name": node_name,
             "unit": unit,
         }),
     }
@@ -4746,6 +4872,7 @@ async fn kill_node_flow(
 ) -> serde_json::Value {
     let node_name = payload
         .get("node_name")
+        .or_else(|| payload.get("name"))
         .and_then(|v| v.as_str())
         .map(|v| v.trim().to_string())
         .unwrap_or_default();
@@ -4759,20 +4886,30 @@ async fn kill_node_flow(
         }
     }
 
+    let normalized_node_name = if node_name.is_empty() {
+        None
+    } else {
+        match normalize_node_name_for_target(&node_name, &target_hive) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "INVALID_REQUEST",
+                    "message": err.to_string(),
+                });
+            }
+        }
+    };
+
     let unit = payload
         .get("unit")
         .and_then(|v| v.as_str())
         .map(|v| sanitize_unit_suffix(v.trim()))
         .filter(|v| !v.is_empty())
         .or_else(|| {
-            if node_name.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "fluxbee-node-{}",
-                    sanitize_unit_suffix(node_name.split('@').next().unwrap_or(&node_name))
-                ))
-            }
+            normalized_node_name
+                .as_ref()
+                .map(|name| unit_from_node_name(name))
         });
 
     let Some(unit) = unit else {
@@ -4783,11 +4920,19 @@ async fn kill_node_flow(
         });
     };
 
-    let signal = payload
-        .get("signal")
-        .and_then(|v| v.as_str())
-        .unwrap_or("SIGTERM")
-        .to_ascii_uppercase();
+    let force = payload
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let signal = if force {
+        "SIGKILL".to_string()
+    } else {
+        payload
+            .get("signal")
+            .and_then(|v| v.as_str())
+            .unwrap_or("SIGTERM")
+            .to_ascii_uppercase()
+    };
 
     let cmd = if signal == "SIGKILL" {
         format!(
@@ -4803,6 +4948,10 @@ async fn kill_node_flow(
             obj.insert("target".to_string(), serde_json::json!(target_hive));
             obj.insert("unit".to_string(), serde_json::json!(unit));
             obj.insert("signal".to_string(), serde_json::json!(signal));
+            obj.insert("force".to_string(), serde_json::json!(force));
+            if let Some(name) = normalized_node_name.as_ref() {
+                obj.insert("node_name".to_string(), serde_json::json!(name));
+            }
         }
         return match forward_system_action_to_hive(
             state,
@@ -4819,23 +4968,54 @@ async fn kill_node_flow(
                 "error_code": "KILL_FAILED",
                 "message": err.to_string(),
                 "target": target_hive,
+                "node_name": normalized_node_name,
                 "unit": unit,
             }),
         };
     }
 
+    match systemd_unit_is_active(&unit) {
+        Ok(false) => {
+            return serde_json::json!({
+                "status": "ok",
+                "state": "not_found",
+                "hive": target_hive,
+                "target": target_hive,
+                "node_name": normalized_node_name,
+                "unit": unit,
+                "signal": signal,
+                "force": force,
+            });
+        }
+        Ok(true) => {}
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SERVICE_FAILED",
+                "message": format!("unable to check unit activity: {err}"),
+                "target": target_hive,
+                "node_name": normalized_node_name,
+                "unit": unit,
+            });
+        }
+    }
+
     match execute_on_hive(state, &target_hive, &cmd, "kill_node") {
         Ok(()) => serde_json::json!({
             "status": "ok",
+            "hive": target_hive,
             "target": target_hive,
+            "node_name": normalized_node_name,
             "unit": unit,
             "signal": signal,
+            "force": force,
         }),
         Err(err) => serde_json::json!({
             "status": "error",
             "error_code": "KILL_FAILED",
             "message": err.to_string(),
             "target": target_hive,
+            "node_name": normalized_node_name,
             "unit": unit,
         }),
     }

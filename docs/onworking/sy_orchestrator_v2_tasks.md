@@ -111,11 +111,13 @@ Salida:
 
 ### Fase 6 - SPAWN/KILL generico de nodos
 
-- [ ] V6.1 Migrar `SPAWN_NODE` a contrato v2 basado en `node_name`.
+- [x] V6.1 Migrar `SPAWN_NODE` a contrato v2 basado en `node_name`.
 - [ ] V6.2 Resolver runtime/version segun regla TYPE.campo1 definida por spec.
 - [ ] V6.3 Ejecutar nodo como unit transient systemd (estrategia unica definida).
-- [ ] V6.4 Migrar `KILL_NODE` con `force=false/true` (SIGTERM/SIGKILL).
+- [x] V6.4 Migrar `KILL_NODE` con `force=false/true` (SIGTERM/SIGKILL).
 - [ ] V6.5 Ajustar listados y estado para incluir nodos AI/IO/WF/SY/RT bajo mismo contrato.
+
+Nota (2026-03-03): `SPAWN_NODE` acepta `node_name` (y mantiene compatibilidad con `name`), deriva `runtime` desde `node_name` cuando no se envía explícito y usa `runtime_version` (alias `version`). `KILL_NODE` acepta `force` y lo mapea a `SIGKILL` (o `SIGTERM` por defecto).
 
 Salida:
 
