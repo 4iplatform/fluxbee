@@ -4564,12 +4564,6 @@ fn resolve_runtime_key(
     if runtimes.contains_key(runtime) {
         return Ok(runtime.to_string());
     }
-    if let Some((key, _)) = runtimes
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(runtime))
-    {
-        return Ok(key.clone());
-    }
     Err(format!("runtime '{runtime}' not found in manifest").into())
 }
 

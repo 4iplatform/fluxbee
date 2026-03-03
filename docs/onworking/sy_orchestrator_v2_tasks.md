@@ -112,8 +112,8 @@ Salida:
 ### Fase 6 - SPAWN/KILL generico de nodos
 
 - [x] V6.1 Migrar `SPAWN_NODE` a contrato v2 basado en `node_name`.
-- [ ] V6.2 Resolver runtime/version segun regla TYPE.campo1 definida por spec.
-- [ ] V6.3 Ejecutar nodo como unit transient systemd (estrategia unica definida).
+- [x] V6.2 Resolver runtime/version segun regla TYPE.campo1 definida por spec.
+- [x] V6.3 Ejecutar nodo como unit transient systemd (estrategia unica definida).
 - [x] V6.4 Migrar `KILL_NODE` con `force=false/true` (SIGTERM/SIGKILL).
 - [x] V6.5 Ajustar listados y estado para incluir nodos AI/IO/WF/SY/RT bajo mismo contrato.
 
@@ -154,6 +154,8 @@ Referencia: `scripts/orchestrator_system_update_api_e2e.sh` valida `sync_pending
 
 - [ ] E2E-5 spawn/kill de nodo `IO.*` remoto desde admin motherbee sin SSH operativo.
 - [ ] E2E-6 spawn/kill de nodo `AI.*` remoto con `force` en kill.
+
+Referencia: `scripts/orchestrator_spawn_kill_v2_e2e.sh` (usa `node_name`, `runtime_version` y valida `SIGTERM`/`SIGKILL`).
 
 ### Gate G4 (fin Fase 7)
 
