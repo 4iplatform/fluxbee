@@ -1,0 +1,78 @@
+#![forbid(unsafe_code)]
+
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
+use serde_json::{Map, Value};
+use uuid::Uuid;
+
+pub const DEFAULT_TTL: u32 = 16;
+
+pub fn new_trace_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+pub fn build_user_message(
+    src_node_uuid: &str,
+    dst_node_uuid: Option<String>,
+    ttl: u32,
+    trace_id: String,
+    src_ilk: Option<String>,
+    dst_ilk: Option<String>,
+    context: Value,
+    payload: Value,
+) -> Message {
+    let mut context_obj: Map<String, Value> = match context {
+        Value::Object(map) => map,
+        other => {
+            let mut map = Map::new();
+            map.insert("io".to_string(), other);
+            map
+        }
+    };
+    context_obj.insert(
+        "src_ilk".to_string(),
+        src_ilk.map(Value::String).unwrap_or(Value::Null),
+    );
+    context_obj.insert(
+        "dst_ilk".to_string(),
+        dst_ilk.map(Value::String).unwrap_or(Value::Null),
+    );
+
+    Message {
+        routing: Routing {
+            src: src_node_uuid.to_string(),
+            dst: dst_node_uuid
+                .map(Destination::Unicast)
+                .unwrap_or(Destination::Resolve),
+            ttl: ttl.try_into().unwrap_or(u8::MAX),
+            trace_id,
+        },
+        meta: Meta {
+            msg_type: "user".to_string(),
+            msg: None,
+            scope: None,
+            target: None,
+            action: None,
+            priority: None,
+            context: Some(Value::Object(context_obj)),
+        },
+        payload,
+    }
+}
+
+pub fn build_inbound_user_message_to_router(
+    src_node_uuid: &str,
+    src_ilk: String,
+    context: Value,
+    payload: Value,
+) -> Message {
+    build_user_message(
+        src_node_uuid,
+        None,
+        DEFAULT_TTL,
+        new_trace_id(),
+        Some(src_ilk),
+        None,
+        context,
+        payload,
+    )
+}

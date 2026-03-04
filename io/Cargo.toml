@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/io-common",
+  "crates/io-sim",
+  "crates/io-slack",
+]
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+anyhow = "1"
+fluxbee-sdk = { path = "../crates/fluxbee_sdk" }
+futures-util = "0.3"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "io-util", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots", "url"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }

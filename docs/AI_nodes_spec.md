@@ -206,3 +206,71 @@ AI node runtime must not assume a fixed cognition schema.
 
 If cognition provides context/memory/episodes metadata, AI nodes consume it as optional message metadata.
 If cognition changes shape, only adapter/parsing layers should change, not the core runtime loop.
+
+## 7) Runbook (Linux)
+
+### 7.1 YAML config for `ai_node_runner`
+
+Use `docs/onworking/ai_node_runner_config.example.yaml` as baseline.
+
+Minimal echo profile:
+
+```yaml
+node:
+  name: "AI.chat"
+  version: "0.1.0"
+  router_socket: "/var/run/fluxbee/routers"
+  uuid_persistence_dir: "/var/lib/fluxbee/state/nodes"
+  config_dir: "/etc/fluxbee"
+
+runtime:
+  read_timeout_ms: 3600000
+  handler_timeout_ms: 60000
+  write_timeout_ms: 10000
+  queue_capacity: 128
+  worker_pool_size: 4
+  retry_max_attempts: 3
+  retry_initial_backoff_ms: 200
+  retry_max_backoff_ms: 2000
+  metrics_log_interval_ms: 30000
+
+behavior:
+  kind: echo
+```
+
+Minimal OpenAI profile:
+
+```yaml
+behavior:
+  kind: openai_chat
+  model: "gpt-4.1-mini"
+  instructions:
+    source: inline
+    value: "Respond briefly and clearly in Spanish."
+    trim: true
+  api_key_env: "OPENAI_API_KEY"
+```
+
+### 7.2 Start `ai_node_runner`
+
+Single node instance:
+
+```bash
+RUST_LOG=info,fluxbee_ai_nodes=debug,fluxbee_ai_sdk=debug,fluxbee_sdk=info \
+cargo run --release -p fluxbee-ai-nodes --bin ai_node_runner -- --config /tmp/ai_chat.yaml
+```
+
+If using `openai_chat`, export the key before startup:
+
+```bash
+export OPENAI_API_KEY="sk-..."
+```
+
+### 7.3 Destination naming
+
+Node names are normalized by SDK as `<node.name>@<hive_id>` using `/etc/fluxbee/hive.yaml`.
+
+Example:
+- `node.name: "AI.chat"`
+- `hive_id: "sandbox"`
+- registered node name: `AI.chat@sandbox`
