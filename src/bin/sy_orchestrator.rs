@@ -2160,9 +2160,15 @@ fn resolve_syncthing_vendor_source_path() -> Result<PathBuf, OrchestratorError> 
     if legacy_fallback.exists() {
         return Ok(legacy_fallback);
     }
+    // Transitional fallback: when dist/vendor source is not present yet, allow using
+    // the currently installed syncthing binary as the vendor source-of-truth.
+    let installed_fallback = PathBuf::from(SYNCTHING_INSTALL_PATH);
+    if installed_fallback.exists() {
+        return Ok(installed_fallback);
+    }
     Err(format!(
-        "syncthing vendor binary missing at '{}' and '{}' and vendor manifest is absent",
-        DIST_SYNCTHING_VENDOR_SOURCE_PATH, SYNCTHING_VENDOR_SOURCE_PATH
+        "syncthing vendor binary missing at '{}' and '{}' and '{}' and vendor manifest is absent",
+        DIST_SYNCTHING_VENDOR_SOURCE_PATH, SYNCTHING_VENDOR_SOURCE_PATH, SYNCTHING_INSTALL_PATH
     )
     .into())
 }
