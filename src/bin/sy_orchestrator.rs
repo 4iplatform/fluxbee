@@ -2388,6 +2388,26 @@ fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
     Ok(())
 }
 
+fn ensure_local_syncthing_vendor_layout() -> Result<(), OrchestratorError> {
+    if !Path::new(SYNCTHING_INSTALL_PATH).exists() {
+        return Err("syncthing installed binary missing while ensuring vendor layout".into());
+    }
+    for target in [DIST_SYNCTHING_VENDOR_SOURCE_PATH, SYNCTHING_VENDOR_SOURCE_PATH] {
+        let target_path = Path::new(target);
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut install = Command::new("install");
+        install
+            .arg("-m")
+            .arg("0755")
+            .arg(SYNCTHING_INSTALL_PATH)
+            .arg(target);
+        run_cmd(install, &format!("install local syncthing vendor source ({target})"))?;
+    }
+    Ok(())
+}
+
 fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> String {
     let service_group = if linux_user_exists(service_user) {
         service_user
@@ -2662,6 +2682,7 @@ async fn ensure_blob_sync_runtime(
     }
 
     ensure_syncthing_installed()?;
+    ensure_local_syncthing_vendor_layout()?;
     ensure_syncthing_unit(&sync)?;
     ensure_syncthing_firewall_local();
     tracing::info!(
@@ -6545,6 +6566,13 @@ fn ensure_remote_syncthing_runtime_with_access(
         &sudo_wrap(&install_cmd),
         BOOTSTRAP_SSH_USER,
     )?;
+    if let Err(err) = ensure_remote_syncthing_vendor_layout(address, key_path) {
+        tracing::warn!(
+            target = %address,
+            error = %err,
+            "failed to mirror syncthing into remote vendor/dist source layout"
+        );
+    }
 
     let blob_path_q = shell_single_quote(&blob.path.display().to_string());
     let dist_path_q = shell_single_quote(&dist.path.display().to_string());
@@ -6616,6 +6644,27 @@ fn ensure_remote_syncthing_runtime_with_access(
     }
     ensure_remote_syncthing_firewall(address, key_path)?;
     Ok(())
+}
+
+fn ensure_remote_syncthing_vendor_layout(
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    let cmd = format!(
+        "set -euo pipefail && install -d -m 0755 '{dist_dir}' '{legacy_dir}' && install -m 0755 '{installed}' '{dist_target}' && install -m 0755 '{installed}' '{legacy_target}'",
+        dist_dir = shell_single_quote("/var/lib/fluxbee/dist/vendor/syncthing"),
+        legacy_dir = shell_single_quote("/var/lib/fluxbee/vendor/syncthing"),
+        installed = shell_single_quote(SYNCTHING_INSTALL_PATH),
+        dist_target = shell_single_quote(DIST_SYNCTHING_VENDOR_SOURCE_PATH),
+        legacy_target = shell_single_quote(SYNCTHING_VENDOR_SOURCE_PATH),
+    );
+    let cmd_q = shell_single_quote(&cmd);
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("bash -lc '{}'", cmd_q)),
+        BOOTSTRAP_SSH_USER,
+    )
 }
 
 fn ensure_remote_syncthing_runtime(
