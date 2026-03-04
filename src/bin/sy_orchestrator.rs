@@ -3746,8 +3746,8 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
         });
     }
 
-    let mut remote_cleanup = "stopped";
-    let mut remote_cleanup_via = "socket";
+    let mut remote_cleanup: &str;
+    let mut remote_cleanup_via: &str;
     let mut address = String::new();
     let cleanup_cmd = remove_hive_cleanup_script();
     let forward_result = forward_system_action_to_hive_with_timeout(
@@ -3763,16 +3763,28 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
     )
     .await;
 
-    let socket_cleanup_ok = matches!(
-        forward_result.as_ref(),
-        Ok(payload)
-            if payload
-                .get("status")
-                .and_then(|value| value.as_str())
-                == Some("ok")
-    );
+    let socket_cleanup_ok = match forward_result.as_ref() {
+        Ok(payload) => payload
+            .get("status")
+            .and_then(|value| value.as_str())
+            == Some("ok"),
+        Err(_) => false,
+    };
+    let socket_cleanup_timed_out = socket_cleanup_timeout(&forward_result);
 
-    if !socket_cleanup_ok {
+    if socket_cleanup_ok {
+        remote_cleanup = "socket_ok";
+        remote_cleanup_via = "socket";
+        if let Ok((addr, _)) = hive_access(hive_id) {
+            address = addr;
+        }
+    } else {
+        remote_cleanup = if socket_cleanup_timed_out {
+            "socket_timeout"
+        } else {
+            "local_only"
+        };
+        remote_cleanup_via = "local_only";
         if let Err(err) = &forward_result {
             tracing::warn!(
                 hive_id = hive_id,
@@ -3802,10 +3814,10 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
                         error = %err,
                         "remote cleanup failed; proceeding with local hive state removal"
                     );
-                    remote_cleanup = "failed_skipped";
+                    remote_cleanup = "ssh_fallback_failed";
                     remote_cleanup_via = "ssh_fallback";
-                }
-                if remote_cleanup == "stopped" {
+                } else {
+                    remote_cleanup = "ssh_fallback_ok";
                     remote_cleanup_via = "ssh_fallback";
                 }
             }
@@ -3815,13 +3827,7 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
                     error = %err,
                     "cannot resolve hive access for remote cleanup; proceeding with local hive state removal"
                 );
-                remote_cleanup = "skipped_no_access";
-                remote_cleanup_via = "local_only";
             }
-        }
-    } else {
-        if let Ok((addr, _)) = hive_access(hive_id) {
-            address = addr;
         }
     }
 
@@ -3842,6 +3848,35 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
         "remote_cleanup": remote_cleanup,
         "remote_cleanup_via": remote_cleanup_via,
     })
+}
+
+fn socket_cleanup_timeout(
+    forward_result: &Result<serde_json::Value, OrchestratorError>,
+) -> bool {
+    match forward_result {
+        Ok(payload) => {
+            if payload
+                .get("status")
+                .and_then(|value| value.as_str())
+                .is_some_and(|status| status.eq_ignore_ascii_case("timeout"))
+            {
+                return true;
+            }
+            if payload
+                .get("error_code")
+                .and_then(|value| value.as_str())
+                .is_some_and(|code| code.eq_ignore_ascii_case("TIMEOUT"))
+            {
+                return true;
+            }
+            payload
+                .get("message")
+                .and_then(|value| value.as_str())
+                .map(|message| message.to_ascii_lowercase().contains("timeout"))
+                .unwrap_or(false)
+        }
+        Err(err) => err.to_string().to_ascii_lowercase().contains("timeout"),
+    }
 }
 
 fn read_hive_info(root: &Path, hive_id: &str) -> Result<serde_json::Value, OrchestratorError> {
