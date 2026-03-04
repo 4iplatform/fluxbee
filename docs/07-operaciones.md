@@ -1,7 +1,7 @@
 # JSON Router - 07 Operaciones
 
-**Estado:** v1.16  
-**Fecha:** 2026-02-04  
+**Estado:** v1.17  
+**Fecha:** 2026-03-04  
 **Audiencia:** Ops/SRE, desarrolladores de deployment
 
 ---
@@ -301,7 +301,7 @@ Evidencia mínima de recuperación:
 | **Infraestructura** |
 | PostgreSQL | ✓ | - | Source of truth |
 | SY.storage | ✓ | - | Único que escribe DB |
-| SY.orchestrator | ✓ | - | Supervisa todo el cluster |
+| SY.orchestrator | ✓ | ✓ | Ejecuta local en cada hive. `add_hive/remove_hive` solo en motherbee |
 | SY.admin | ✓ | - | API admin HTTP |
 | **Router** |
 | Router | ✓ | ✓ | |
@@ -347,18 +347,21 @@ Esto hace que los workers sean ideales para containers (Docker, K8s).
 
 ### 4.1 Ubicación
 
-**SY.orchestrator SOLO corre en Motherbee.** Los workers no tienen orchestrator propio; systemd local basta para mantener el router vivo.
+`SY.orchestrator` corre en **motherbee y workers**.
+
+- En `role: motherbee`: controla provisioning (`add_hive/remove_hive`) y coordinación de cluster.
+- En `role: worker`: ejecuta localmente `SYSTEM_UPDATE`, `SPAWN_NODE`, `KILL_NODE`, watchdog y operaciones de ciclo de vida.
 
 ### 4.2 Rol
 
-SY.orchestrator es el **único proceso que se inicia manualmente** en Motherbee. Él:
+SY.orchestrator se inicia por systemd en cada hive y opera por rol:
 
-1. **Levanta** todos los componentes de Motherbee
+1. **Levanta** componentes locales según rol
 2. **Monitorea** heartbeats en SHM (watchdog)
 3. **Gestiona** ciclo de vida de nodos de aplicación
-4. **Ejecuta** bootstrap de workers remotos (add_hive)
-5. **Supervisa** salud de NATS (buffer levels)
-6. **Gestiona** Syncthing para blob sync (si `blob.sync.enabled=true`)
+4. **Ejecuta** bootstrap remoto solo en motherbee (`add_hive/remove_hive`)
+5. **Procesa** comandos de control por socket L2 (`SYSTEM_UPDATE`, `SPAWN_NODE`, `KILL_NODE`)
+6. **Gestiona** Syncthing para blob/dist sync (si está habilitado)
 
 ### 4.3 Métodos de Supervisión
 
@@ -533,164 +536,42 @@ systemctl stop fluxbee-worker
 
 Más simple: detiene router (que detiene NATS), los nodos se desconectan.
 
-### 4.9 Gestión de Runtimes
+### 4.9 Distribución de Software v2 (dist + SYSTEM_UPDATE)
 
-El orchestrator mantiene sincronizados los binarios ejecutables (runtimes) en todos los workers.
+En v2, la distribución de software diaria no usa SSH operativo.
 
-#### 4.9.1 Modelo
+Modelo:
+- Motherbee publica artefactos y manifests en `/var/lib/fluxbee/dist/`.
+- Syncthing replica `dist/` entre hives.
+- `SY.admin` dispara `POST /hives/{id}/update`.
+- `SY.orchestrator@{hive}` valida manifest local (`version/hash`) y aplica local.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        MOTHERBEE                                │
-│                                                                 │
-│  /var/lib/fluxbee/runtimes/         ← REPO MASTER              │
-│  ├── AI.soporte/                                                │
-│  │   ├── 1.2.0/                                                │
-│  │   └── 1.3.0/                                                │
-│  ├── IO.whatsapp/                                               │
-│  └── manifest.json                  ← Estado actual            │
-│                                                                 │
-│  SY.orchestrator                                                │
-│  ├── Recibe notificaciones de nuevas versiones                 │
-│  ├── Persiste manifest en /var/lib/fluxbee/orchestrator/       │
-│  ├── Sincroniza workers via SSH/rsync                          │
-│  └── Verifica periódicamente consistencia                      │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ SSH (sync)
-                              ▼
-                          WORKERS
-```
+Categorías soportadas por update:
+- `runtime`
+- `core`
+- `vendor`
 
-#### 4.9.2 Notificación de Nueva Versión
+Estados de update (`payload.status`):
+- `ok`
+- `sync_pending`
+- `partial`
+- `error`
+- `rollback`
 
-El orchestrator recibe un mensaje JSON (via router) cuando hay nuevas versiones:
-
-```json
-{
-  "routing": {
-    "src": "<quien-sea>",
-    "dst": "SY.orchestrator@motherbee"
-  },
-  "meta": {
-    "type": "system",
-    "msg": "RUNTIME_UPDATE"
-  },
-  "payload": {
-    "version": 43,
-    "updated_at": "2026-02-08T10:00:00Z",
-    "runtimes": {
-      "AI.soporte": {
-        "current": "1.3.0",
-        "available": ["1.2.0", "1.3.0"]
-      },
-      "IO.whatsapp": {
-        "current": "2.1.0",
-        "available": ["2.0.0", "2.1.0"]
-      }
-    },
-    "hash": "sha256:abc123..."
-  }
-}
-```
-
-#### 4.9.3 Persistencia Local
-
-El orchestrator guarda el manifest para sí mismo:
+Flujo operativo canónico:
 
 ```
-/var/lib/fluxbee/orchestrator/
-└── runtime-manifest.json    ← Copia local, solo orchestrator lee/escribe
+1. Publicar artefactos/manifests en /var/lib/fluxbee/dist/
+2. Esperar convergencia de Syncthing en el worker
+3. POST /hives/{id}/update {category, manifest_version, manifest_hash}
+4. Admin envía SYSTEM_UPDATE -> SY.orchestrator@{hive}
+5. Orchestrator worker instala/reinicia localmente y responde SYSTEM_UPDATE_RESPONSE
+6. Admin devuelve respuesta HTTP (200 ok / 202 sync_pending / error)
 ```
 
-#### 4.9.4 Flujo de Sincronización
-
-```
-1. Orchestrator recibe RUNTIME_UPDATE
-        │
-        ▼
-2. Compara con manifest actual
-        │
-        ├── Sin cambios → ignorar
-        │
-        └── Hay cambios:
-                │
-                ▼
-3. Persiste nuevo manifest local
-        │
-        ▼
-4. Para cada worker:
-        │
-        ├── rsync /var/lib/fluxbee/runtimes/ → worker
-        │
-        └── Reinicia nodos afectados (si corrían versión vieja)
-        │
-        ▼
-5. Log: "Runtimes synced to version {version}"
-```
-
-#### 4.9.5 Verificación Periódica
-
-Cada 5 minutos, el orchestrator verifica que los workers estén en sync:
-
-```rust
-impl Orchestrator {
-    async fn runtime_verify_loop(&mut self) {
-        loop {
-            for worker in &self.workers {
-                // Comparar hash del manifest remoto vs local
-                let remote_hash = self.ssh_exec(
-                    worker,
-                    "sha256sum /var/lib/fluxbee/runtimes/manifest.json"
-                ).await;
-                
-                if remote_hash != self.local_manifest_hash {
-                    log::warn!("Worker {} drift detected, syncing", worker.id);
-                    self.sync_worker(worker).await;
-                }
-            }
-            
-            sleep(Duration::from_secs(300)).await;  // 5 min
-        }
-    }
-}
-```
-
-#### 4.9.6 Spawn de Nodos
-
-Cuando se pide ejecutar un nodo:
-
-```json
-{
-  "routing": {
-    "src": "SY.admin@motherbee",
-    "dst": "SY.orchestrator@motherbee"
-  },
-  "meta": {
-    "type": "system",
-    "msg": "SPAWN_NODE"
-  },
-  "payload": {
-    "runtime": "AI.soporte",
-    "version": "1.3.0",        // Opcional, default = current
-    "target": "worker-3",       // Opcional, orchestrator decide si no se especifica
-    "config": { ... }
-  }
-}
-```
-
-El orchestrator:
-1. Verifica que el runtime exista en el manifest
-2. Verifica que el worker tenga el runtime (o lo sincroniza)
-3. Ejecuta via SSH: `/var/lib/fluxbee/runtimes/AI.soporte/1.3.0/bin/start.sh`
-
-#### 4.9.7 Constantes
-
-```rust
-pub const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;  // 5 minutos
-pub const RUNTIME_SYNC_TIMEOUT_SECS: u64 = 300;     // 5 minutos max
-```
+Regla importante:
+- `RUNTIME_UPDATE` queda en compatibilidad, pero fuera del flujo canónico de operación.
+- El watchdog remoto por SSH para runtime/core/vendor está deshabilitado en v2.
 
 ---
 
@@ -972,10 +853,9 @@ Después de `add_hive` exitoso:
 
 **En mother hive:**
 ```
-/var/lib/fluxbee/hives/staging/
-├── ssh.key           # Para acceso SSH de emergencia
-├── ssh.key.pub
-└── info.yaml         # Metadata de la isla
+/var/lib/fluxbee/ssh/
+├── motherbee.key       # Key operativa de bootstrap/mantenimiento
+└── motherbee.key.pub
 ```
 
 **En isla remota (staging):**
@@ -1010,7 +890,7 @@ El password `magicAI` ya no funciona. Para acceder a la isla remota:
 
 ```bash
 # Desde mother hive
-ssh -i /var/lib/fluxbee/hives/staging/ssh.key administrator@192.168.1.50
+ssh -i /var/lib/fluxbee/ssh/motherbee.key administrator@192.168.1.50
 ```
 
 ---
@@ -1024,15 +904,16 @@ ssh -i /var/lib/fluxbee/hives/staging/ssh.key administrator@192.168.1.50
 | `POST /hives` | `add_hive` | Bootstrap isla remota |
 | `GET /hives` | `list_hives` | Lista islas hijas |
 | `GET /hives/{id}` | `get_hive` | Info de isla específica |
-| `DELETE /hives/{id}` | `remove_hive` | Elimina registro (no apaga isla) |
+| `DELETE /hives/{id}` | `remove_hive` | Cleanup remoto socket-first (`REMOVE_HIVE_CLEANUP`) + fallback SSH técnico |
+| `POST /hives/{id}/update` | `update` | Envía `SYSTEM_UPDATE` al orchestrator del hive |
 
 ### 5.2 Gestión de Nodos/Router por Hive (Canónico)
 
 | Endpoint HTTP | Action | Descripción |
 |---------------|--------|-------------|
 | `GET /hives/{id}/nodes` | `list_nodes` | Lista nodos de hive |
-| `POST /hives/{id}/nodes` | `run_node` | Levanta nodo en hive |
-| `DELETE /hives/{id}/nodes/{name}` | `kill_node` | Mata nodo en hive |
+| `POST /hives/{id}/nodes` | `run_node` | Envía `SPAWN_NODE` (contrato v2: `node_name`, `runtime`, `runtime_version`) |
+| `DELETE /hives/{id}/nodes/{name}` | `kill_node` | Envía `KILL_NODE` (soporta `force=true/false`) |
 | `GET /hives/{id}/routers` | `list_routers` | Lista routers de hive |
 | `POST /hives/{id}/routers` | `run_router` | Levanta router en hive |
 | `DELETE /hives/{id}/routers/{name}` | `kill_router` | Mata router en hive |
@@ -1307,7 +1188,7 @@ journalctl -u sy-orchestrator | grep -i wan
 
 ```bash
 # Desde mother hive
-ssh -i /var/lib/fluxbee/hives/staging/ssh.key administrator@192.168.1.50
+ssh -i /var/lib/fluxbee/ssh/motherbee.key administrator@192.168.1.50
 ```
 
 ### 9.5 Reset completo de isla
@@ -1367,9 +1248,9 @@ pub const DEFAULT_GATEWAY_NAME: &str = "RT.gateway";
 
 | Fase | Funcionalidad | Estado |
 |------|---------------|--------|
-| **1** | `add_hive` - Bootstrap SSH de islas remotas | Prioridad |
-| **2** | MVP local: `run_node`, `kill_node`, `list_nodes` | Siguiente |
-| **3** | Health monitoring, restart policies, dinámicos | Futuro |
+| **1** | Bootstrap inicial (`add_hive/remove_hive`) con canal SSH de provisioning | En uso |
+| **2** | Operación diaria por socket L2 (`SYSTEM_UPDATE`, `SPAWN_NODE`, `KILL_NODE`) | Canónico v2 |
+| **3** | Cierre/restricción de SSH post-bootstrap + validaciones E2E de hardening | En curso |
 
 ---
 

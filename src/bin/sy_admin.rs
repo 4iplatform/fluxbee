@@ -1062,7 +1062,7 @@ async fn handle_hive_paths(
                 serde_json::from_slice(body)?
             };
             if payload.get("node_name").is_none() && payload.get("name").is_none() {
-                payload["name"] = serde_json::Value::String(decode_percent(name));
+                payload["node_name"] = serde_json::Value::String(decode_percent(name));
             }
             let (status, resp) =
                 handle_admin_command(ctx, client, "kill_node", payload, Some(hive)).await?;
@@ -2020,37 +2020,64 @@ async fn handle_hive_update_command(
     hive_id: String,
     payload: serde_json::Value,
 ) -> Result<(u16, String), AdminError> {
-    let category = payload
-        .get("category")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or("runtime");
-    if !matches!(category, "runtime" | "core" | "vendor") {
-        let body = serde_json::json!({
-            "status": "error",
-            "action": "update",
-            "payload": serde_json::Value::Null,
-            "error_code": "INVALID_REQUEST",
-            "error_detail": "category must be one of runtime/core/vendor",
-        })
-        .to_string();
-        return Ok((400, body));
-    }
+    let invalid_request = |detail: &str| {
+        (
+            400u16,
+            serde_json::json!({
+                "status": "error",
+                "action": "update",
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": detail,
+            })
+            .to_string(),
+        )
+    };
 
-    let manifest_version = payload
+    let category = match payload.get("category") {
+        None => "runtime".to_string(),
+        Some(value) => match value
+            .as_str()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_ascii_lowercase())
+        {
+            Some(category) if matches!(category.as_str(), "runtime" | "core" | "vendor") => {
+                category
+            }
+            _ => {
+                return Ok(invalid_request(
+                    "category must be one of runtime/core/vendor",
+                ))
+            }
+        },
+    };
+
+    let manifest_version = match payload
         .get("manifest_version")
         .or_else(|| payload.get("version"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    {
+        None => 0,
+        Some(value) => match value.as_u64() {
+            Some(v) => v,
+            None => {
+                return Ok(invalid_request(
+                    "manifest_version (or version) must be an unsigned integer",
+                ))
+            }
+        },
+    };
 
-    let manifest_hash = payload
+    let manifest_hash = match payload
         .get("manifest_hash")
         .or_else(|| payload.get("hash"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .ok_or("missing manifest_hash (or hash)")?;
+    {
+        Some(value) => value,
+        None => return Ok(invalid_request("missing manifest_hash (or hash)")),
+    };
 
     let target = format!("SY.orchestrator@{}", hive_id);
     let system_payload = serde_json::json!({
@@ -2075,17 +2102,25 @@ async fn handle_hive_update_command(
                 .get("status")
                 .and_then(|v| v.as_str())
                 .unwrap_or("error");
+            let top_status = match status {
+                "ok" => "ok",
+                "sync_pending" => "sync_pending",
+                _ => "error",
+            };
+            let error_code_opt = if matches!(status, "ok" | "sync_pending") {
+                None
+            } else {
+                Some(payload_error_code(&payload).unwrap_or_else(|| "SERVICE_FAILED".into()))
+            };
             let http_status = match status {
                 "ok" => 200,
                 "sync_pending" => 202,
-                _ => 502,
+                _ => error_code_to_http_status(error_code_opt.as_deref().unwrap_or("SERVICE_FAILED")),
             };
-            let error_code = if status == "ok" || status == "sync_pending" {
-                serde_json::Value::Null
+            let error_code = if let Some(code) = error_code_opt {
+                serde_json::json!(code)
             } else {
-                serde_json::json!(
-                    payload_error_code(&payload).unwrap_or_else(|| "SERVICE_FAILED".into())
-                )
+                serde_json::Value::Null
             };
             let error_detail = if status == "ok" || status == "sync_pending" {
                 serde_json::Value::Null
@@ -2095,7 +2130,7 @@ async fn handle_hive_update_command(
             Ok((
                 http_status,
                 serde_json::json!({
-                    "status": if status == "ok" || status == "sync_pending" { "ok" } else { "error" },
+                    "status": top_status,
                     "action": "update",
                     "payload": payload,
                     "error_code": error_code,

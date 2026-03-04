@@ -20,13 +20,11 @@ Cerrar el cambio de arquitectura a:
 - update unificado por `SYSTEM_UPDATE`,
 - `SPAWN_NODE`/`KILL_NODE` genericos para cualquier tipo de nodo.
 
-## 3. Gaps actuales contra v2 (confirmados)
+## 3. Gaps actuales contra v2 (pendientes)
 
-- `sy_orchestrator` sigue ejecutando remoto por SSH en `execute_on_hive` para targets no locales.
-- `add_hive` no deja orchestrator worker operativo como agente de control-plane.
-- El contrato activo de update es `RUNTIME_UPDATE` (falta `SYSTEM_UPDATE`).
-- `sy_admin` no tiene `POST /hives/{id}/update`.
-- `SPAWN_NODE`/`KILL_NODE` actuales no siguen aun el contrato v2 centrado en `node_name`.
+- Cerrar validación E2E de `SYSTEM_UPDATE` en categoría `vendor` (E2E-7).
+- Cerrar validación E2E de ausencia de caminos SSH operativos en `run/kill/update` (E2E-8).
+- Revalidar criterios de Done v2 con G2/G3/G4 completos en verde.
 
 ## 4. Backlog por fases (sin modo legacy)
 
@@ -43,12 +41,12 @@ Salida:
 
 ### Fase 1 - Contrato de protocolo y mensajes
 
-- [ ] V1.1 Formalizar `SYSTEM_UPDATE`/`SYSTEM_UPDATE_RESPONSE` en `docs/02-protocolo.md`.
-- [ ] V1.2 Retirar `RUNTIME_UPDATE` del flujo canónico (dejarlo explicitamente obsoleto en docs).
-- [ ] V1.3 Formalizar contrato v2 de `SPAWN_NODE`/`KILL_NODE` (campos, errores, semantica `force`).
-- [ ] V1.4 Definir codigos de error canonicos para update (`ok/sync_pending/partial/error/rollback`).
-- [ ] V1.5 Actualizar `docs/07-operaciones.md` para eliminar flujo remoto por SSH en operacion diaria y reflejar modelo local-only en workers.
-- [ ] V1.6 Revisar y corregir tablas de API/ownership en `docs/07-operaciones.md` segun endpoints y mensajes v2.
+- [x] V1.1 Formalizar `SYSTEM_UPDATE`/`SYSTEM_UPDATE_RESPONSE` en `docs/02-protocolo.md`.
+- [x] V1.2 Retirar `RUNTIME_UPDATE` del flujo canónico (dejarlo explicitamente obsoleto en docs).
+- [x] V1.3 Formalizar contrato v2 de `SPAWN_NODE`/`KILL_NODE` (campos, errores, semantica `force`).
+- [x] V1.4 Definir codigos de error canonicos para update (`ok/sync_pending/partial/error/rollback`).
+- [x] V1.5 Actualizar `docs/07-operaciones.md` para eliminar flujo remoto por SSH en operacion diaria y reflejar modelo local-only en workers.
+- [x] V1.6 Revisar y corregir tablas de API/ownership en `docs/07-operaciones.md` segun endpoints y mensajes v2.
 
 Salida:
 
@@ -56,12 +54,14 @@ Salida:
 
 ### Fase 2 - Tareas de SY.admin (obligatorias)
 
-- [ ] V2.1 Implementar endpoint `POST /hives/{id}/update`.
-- [ ] V2.2 Validar payload de update (`category`, `manifest_version`, `manifest_hash`).
-- [ ] V2.3 Enviar mensaje `SYSTEM_UPDATE` a `SY.orchestrator@{hive}` por canal `system`.
-- [ ] V2.4 Ajustar timeouts HTTP/admin para updates remotos (caso `sync_pending`).
-- [ ] V2.5 Actualizar handlers de `/hives/{id}/nodes` para contrato v2 (`SPAWN_NODE`/`KILL_NODE`).
-- [ ] V2.6 Ajustar serializacion de respuestas de admin al nuevo contrato de system responses.
+- [x] V2.1 Implementar endpoint `POST /hives/{id}/update`.
+- [x] V2.2 Validar payload de update (`category`, `manifest_version`, `manifest_hash`).
+- [x] V2.3 Enviar mensaje `SYSTEM_UPDATE` a `SY.orchestrator@{hive}` por canal `system`.
+- [x] V2.4 Ajustar timeouts HTTP/admin para updates remotos (caso `sync_pending`).
+- [x] V2.5 Actualizar handlers de `/hives/{id}/nodes` para contrato v2 (`SPAWN_NODE`/`KILL_NODE`).
+- [x] V2.6 Ajustar serializacion de respuestas de admin al nuevo contrato de system responses.
+
+Nota (2026-03-04): `sy_admin` expone `POST /hives/{id}/update`, valida payload en capa HTTP con `400 INVALID_REQUEST` en errores de contrato, envía `SYSTEM_UPDATE`/`SYSTEM_UPDATE_RESPONSE`, maneja `sync_pending` con HTTP 202 y normaliza nodos con `node_name` en `/hives/{id}/nodes/{name}`.
 
 Salida:
 
@@ -169,11 +169,18 @@ Referencia: `scripts/orchestrator_spawn_kill_v2_e2e.sh` (usa `node_name`, `runti
 
 - [ ] E2E-7 update `vendor` completo via `SYSTEM_UPDATE`.
 - [ ] E2E-8 validacion de que no quedan caminos SSH en run/kill/update.
-- [ ] E2E-9 `remove_hive` con worker online usa cleanup por socket (sin depender de SSH), y con worker offline cae a fallback controlado.
-- [ ] E2E-10 `add_hive` con `harden_ssh=true` valida bloqueo de password SSH y continuidad operativa por orchestrator/socket.
+- [x] E2E-9 `remove_hive` con worker online usa cleanup por socket (sin depender de SSH), y con worker offline cae a fallback controlado.
+- [x] E2E-10 `add_hive` con `harden_ssh=true` valida bloqueo de password SSH y continuidad operativa por orchestrator/socket.
 
+Referencia: `scripts/orchestrator_system_update_api_e2e.sh` con `CATEGORY=vendor` cubre E2E-7 (`SYSTEM_UPDATE` vendor).
+Referencia: `scripts/orchestrator_no_ssh_run_kill_update_e2e.sh` cubre E2E-8 (run/kill/update exitosos con key SSH local inutilizada).
 Referencia: `scripts/orchestrator_remove_hive_socket_e2e.sh` cubre online (`remote_cleanup=socket_ok`) y offline (`ssh_fallback_*` / `socket_timeout` / `local_only`).
 Referencia: `scripts/orchestrator_add_hive_hardening_e2e.sh` cubre `add_hive(harden_ssh=true)` + rechazo de password SSH + continuidad `run_node/kill_node`.
+
+## 5.1 Pendientes reabiertos (prioridad)
+
+1. Cerrar E2E-7 y E2E-8 (Gate G4 completo): update `vendor` via `SYSTEM_UPDATE` + verificacion de ausencia de caminos SSH operativos en run/kill/update.
+2. Revalidar criterios de Done v2 (seccion 6) una vez cerrados G2/G3/G4 completos.
 
 ## 6. Definicion de Done v2
 
