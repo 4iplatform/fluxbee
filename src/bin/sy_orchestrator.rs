@@ -7670,7 +7670,49 @@ fn systemd_disable(service: &str) -> Result<(), OrchestratorError> {
 }
 
 fn disable_remote_password_auth(address: &str) -> Result<(), OrchestratorError> {
-    let set_password_auth_cmd = r#"bash -lc "if grep -Eq '^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+' /etc/ssh/sshd_config; then sed -i.bak -E 's/^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+.*/PasswordAuthentication no/' /etc/ssh/sshd_config; else printf '\nPasswordAuthentication no\n' >> /etc/ssh/sshd_config; fi""#;
+    let set_password_auth_cmd = r#"bash -lc 'set -euo pipefail
+cfg="/etc/ssh/sshd_config"
+drop="/etc/ssh/sshd_config.d/99-fluxbee-hardening.conf"
+mkdir -p /etc/ssh/sshd_config.d
+
+upsert_opt() {
+  local key="$1"
+  local val="$2"
+  local file="$3"
+  if grep -Eq "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+" "$file"; then
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+.*|${key} ${val}|" "$file"
+  else
+    printf "\n%s %s\n" "$key" "$val" >> "$file"
+  fi
+}
+
+upsert_opt "PasswordAuthentication" "no" "$cfg"
+upsert_opt "KbdInteractiveAuthentication" "no" "$cfg"
+upsert_opt "ChallengeResponseAuthentication" "no" "$cfg"
+
+cat > "$drop" <<EOF
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+EOF
+chmod 0644 "$drop"
+
+if command -v sshd >/dev/null 2>&1; then
+  sshd -t
+elif [ -x /usr/sbin/sshd ]; then
+  /usr/sbin/sshd -t
+fi
+
+if command -v sshd >/dev/null 2>&1; then
+  eff="$(sshd -T || true)"
+elif [ -x /usr/sbin/sshd ]; then
+  eff="$(/usr/sbin/sshd -T || true)"
+else
+  eff=""
+fi
+if [ -n "$eff" ]; then
+  echo "$eff" | grep -qi "^passwordauthentication no$" || { echo "sshd effective config mismatch: passwordauthentication not no" >&2; exit 91; }
+fi'"#;
     ssh_with_pass(
         address,
         &sudo_wrap(set_password_auth_cmd),
