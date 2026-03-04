@@ -7184,10 +7184,10 @@ fn add_hive_flow(
     let mut restrict_ssh_applied = false;
     let restrict_ssh_effective = restrict_ssh;
     if restrict_ssh_effective {
+        let source_patterns = resolve_add_hive_authkey_source_patterns(address);
         let restricted_result: Result<(), OrchestratorError> = (|| {
             install_remote_ssh_gate_with_access(address, &key_path)
                 .map_err(|err| format!("install gate failed: {err}"))?;
-            let source_patterns = resolve_add_hive_authkey_source_patterns(address);
             if source_patterns.is_empty() {
                 tracing::info!(
                     target = address,
@@ -7226,30 +7226,66 @@ fn add_hive_flow(
                     error = %err,
                     "restricted key flow failed; falling back to unrestricted key mode"
                 );
-                let fallback_result = if password_channel_available {
-                    apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key)
-                } else {
-                    apply_remote_unrestricted_authorized_key_with_access(
+                let restricted_err_text = err.to_string();
+                if restricted_err_text.contains("empty SSH_ORIGINAL_COMMAND") {
+                    tracing::warn!(
+                        target = address,
+                        "worker sshd does not provide SSH_ORIGINAL_COMMAND for forced-command keys; trying from-only restriction fallback"
+                    );
+                    let from_only_result = apply_remote_from_only_authorized_key_with_access(
                         address,
                         &key_path,
                         &pub_key,
+                        &source_patterns,
                     )
-                };
-                if let Err(fallback_err) = fallback_result {
-                    return serde_json::json!({
-                        "status": "error",
-                        "error_code": "SSH_KEY_FAILED",
-                        "message": format!("restricted key flow failed ({err}); unrestricted fallback failed: {fallback_err}"),
+                    .and_then(|_| {
+                        ssh_with_key(
+                            address,
+                            &key_path,
+                            "sudo -n /bin/bash -lc 'exit 0'",
+                            BOOTSTRAP_SSH_USER,
+                        )
                     });
+                    if from_only_result.is_ok() {
+                        tracing::warn!(
+                            target = address,
+                            from_patterns = ?source_patterns,
+                            "restrict_ssh degraded to from-only mode (gate disabled due sshd behavior)"
+                        );
+                        restrict_ssh_applied = true;
+                    } else {
+                        tracing::warn!(
+                            target = address,
+                            "from-only restriction fallback failed; continuing to unrestricted fallback"
+                        );
+                    }
                 }
-                if let Err(verify_err) =
-                    ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER)
-                {
-                    return serde_json::json!({
-                        "status": "error",
-                        "error_code": "SSH_KEY_FAILED",
-                        "message": format!("restricted key flow failed ({err}); unrestricted fallback verification failed: {verify_err}"),
-                    });
+                if !restrict_ssh_applied {
+                    let fallback_result = if password_channel_available {
+                        apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key)
+                    } else {
+                        apply_remote_unrestricted_authorized_key_with_access(
+                            address,
+                            &key_path,
+                            &pub_key,
+                        )
+                    };
+                    if let Err(fallback_err) = fallback_result {
+                        return serde_json::json!({
+                            "status": "error",
+                            "error_code": "SSH_KEY_FAILED",
+                            "message": format!("restricted key flow failed ({err}); unrestricted fallback failed: {fallback_err}"),
+                        });
+                    }
+                    if let Err(verify_err) =
+                        ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER)
+                    {
+                        return serde_json::json!({
+                            "status": "error",
+                            "error_code": "SSH_KEY_FAILED",
+                            "message": format!("restricted key flow failed ({err}); unrestricted fallback verification failed: {verify_err}"),
+                        });
+                    }
                 }
             }
         }
@@ -8412,6 +8448,56 @@ chmod 600 \"$auth_keys\"\n",
         gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
         key_material = shell_single_quote(key_material),
         entry = shell_single_quote(&restricted_entry),
+    );
+    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
+    ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
+    Ok(())
+}
+
+fn apply_remote_from_only_authorized_key_with_access(
+    address: &str,
+    key_path: &Path,
+    pub_key: &str,
+    source_patterns: &[String],
+) -> Result<(), OrchestratorError> {
+    let key_material = pub_key
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
+    let from_value = source_patterns.join(",");
+    let entry = if from_value.is_empty() {
+        format!(
+            "no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {pub_key}",
+            pub_key = pub_key
+        )
+    } else {
+        format!(
+            "from=\"{from_value}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {pub_key}",
+            from_value = from_value,
+            pub_key = pub_key
+        )
+    };
+    let script = format!(
+        "set -euo pipefail\n\
+user='{user}'\n\
+home_dir=\"$(getent passwd \"$user\" | cut -d: -f6)\"\n\
+if [[ -z \"$home_dir\" ]]; then home_dir=\"/home/$user\"; fi\n\
+ssh_dir=\"$home_dir/.ssh\"\n\
+auth_keys=\"$ssh_dir/authorized_keys\"\n\
+mkdir -p \"$ssh_dir\"\n\
+chown \"$user:$user\" \"$ssh_dir\"\n\
+chmod 700 \"$ssh_dir\"\n\
+touch \"$auth_keys\"\n\
+chown \"$user:$user\" \"$auth_keys\"\n\
+{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' > \"$auth_keys.tmp\"; }} || true\n\
+mv \"$auth_keys.tmp\" \"$auth_keys\"\n\
+printf '%s\\n' '{entry}' >> \"$auth_keys\"\n\
+chown \"$user:$user\" \"$auth_keys\"\n\
+chmod 600 \"$auth_keys\"\n",
+        user = BOOTSTRAP_SSH_USER,
+        gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
+        key_material = shell_single_quote(key_material),
+        entry = shell_single_quote(&entry),
     );
     let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
     ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
