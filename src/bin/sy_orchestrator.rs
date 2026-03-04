@@ -7182,15 +7182,7 @@ fn add_hive_flow(
     }
 
     let mut restrict_ssh_applied = false;
-    let restrict_ssh_effective = if restrict_ssh && !password_channel_available {
-        tracing::warn!(
-            target = address,
-            "restrict_ssh requested but password bootstrap channel unavailable; skipping restriction for safety"
-        );
-        false
-    } else {
-        restrict_ssh
-    };
+    let restrict_ssh_effective = restrict_ssh;
     if restrict_ssh_effective {
         let restricted_result: Result<(), OrchestratorError> = (|| {
             install_remote_ssh_gate_with_access(address, &key_path)
@@ -7234,13 +7226,20 @@ fn add_hive_flow(
                     error = %err,
                     "restricted key flow failed; falling back to unrestricted key mode"
                 );
-                if let Err(fallback_err) =
+                let fallback_result = if password_channel_available {
                     apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key)
-                {
+                } else {
+                    apply_remote_unrestricted_authorized_key_with_access(
+                        address,
+                        &key_path,
+                        &pub_key,
+                    )
+                };
+                if let Err(fallback_err) = fallback_result {
                     return serde_json::json!({
                         "status": "error",
                         "error_code": "SSH_KEY_FAILED",
-                        "message": format!("restricted key flow failed ({err}); unrestricted fallback via password channel failed: {fallback_err}"),
+                        "message": format!("restricted key flow failed ({err}); unrestricted fallback failed: {fallback_err}"),
                     });
                 }
                 if let Err(verify_err) =

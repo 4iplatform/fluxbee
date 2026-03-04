@@ -12,9 +12,11 @@ set -euo pipefail
 #
 # Optional:
 #   HARDEN_SSH="true|false"                # default: true
+#   RESTRICT_SSH="true|false|auto"         # default: auto (no envía campo)
 #   SSH_USER="administrator"               # default: administrator
 #   SSH_PASSWORD="magicAI"                 # default: magicAI
 #   REQUIRE_PASSWORD_BLOCKED="1|0"         # default: 1
+#   REQUIRE_RESTRICT_SSH_APPLIED="1|0"     # default: 0
 #   REQUIRE_NODE_CYCLE="1|0"               # default: 1
 #   NODE_NAME="WF.hardening.e2e"           # default: random suffix
 #   NODE_FORCE_KILL="false|true"           # default: false
@@ -23,9 +25,11 @@ BASE="${BASE:-http://127.0.0.1:8080}"
 HIVE_ID="${HIVE_ID:-worker-220}"
 HIVE_ADDR="${HIVE_ADDR:-192.168.8.220}"
 HARDEN_SSH="${HARDEN_SSH:-true}"
+RESTRICT_SSH="${RESTRICT_SSH:-auto}"
 SSH_USER="${SSH_USER:-administrator}"
 SSH_PASSWORD="${SSH_PASSWORD:-magicAI}"
 REQUIRE_PASSWORD_BLOCKED="${REQUIRE_PASSWORD_BLOCKED:-1}"
+REQUIRE_RESTRICT_SSH_APPLIED="${REQUIRE_RESTRICT_SSH_APPLIED:-0}"
 REQUIRE_NODE_CYCLE="${REQUIRE_NODE_CYCLE:-1}"
 NODE_NAME="${NODE_NAME:-WF.hardening.e2e.$RANDOM}"
 NODE_FORCE_KILL="${NODE_FORCE_KILL:-false}"
@@ -187,7 +191,11 @@ echo "Step 1/5: cleanup baseline (allow NOT_FOUND)"
 delete_hive_allow_not_found "$tmpdir/delete-baseline.json"
 
 echo "Step 2/5: add_hive harden_ssh=$HARDEN_SSH"
-add_payload="$(printf '{"hive_id":"%s","address":"%s","harden_ssh":%s}' "$HIVE_ID" "$HIVE_ADDR" "$HARDEN_SSH")"
+if [[ "$RESTRICT_SSH" == "auto" ]]; then
+  add_payload="$(printf '{"hive_id":"%s","address":"%s","harden_ssh":%s}' "$HIVE_ID" "$HIVE_ADDR" "$HARDEN_SSH")"
+else
+  add_payload="$(printf '{"hive_id":"%s","address":"%s","harden_ssh":%s,"restrict_ssh":%s}' "$HIVE_ID" "$HIVE_ADDR" "$HARDEN_SSH" "$RESTRICT_SSH")"
+fi
 status_add="$(http_call "POST" "$BASE/hives" "$tmpdir/add.json" "$add_payload")"
 print_http "$status_add" "$tmpdir/add.json"
 if [[ "$status_add" != "200" || "$(json_get "status" "$tmpdir/add.json")" != "ok" ]]; then
@@ -197,6 +205,18 @@ fi
 if [[ "$(json_get "payload.harden_ssh" "$tmpdir/add.json")" != "true" ]]; then
   echo "FAIL: payload.harden_ssh is not true" >&2
   exit 1
+fi
+if [[ "$REQUIRE_RESTRICT_SSH_APPLIED" == "1" ]]; then
+  requested="$(json_get "payload.restrict_ssh_requested" "$tmpdir/add.json")"
+  applied="$(json_get "payload.restrict_ssh" "$tmpdir/add.json")"
+  if [[ "$requested" != "true" ]]; then
+    echo "FAIL: payload.restrict_ssh_requested is not true" >&2
+    exit 1
+  fi
+  if [[ "$applied" != "true" ]]; then
+    echo "FAIL: payload.restrict_ssh is not true (requested=true)" >&2
+    exit 1
+  fi
 fi
 
 echo "Step 3/5: verify password login is blocked"

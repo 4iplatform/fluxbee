@@ -139,6 +139,7 @@ Nota (2026-03-04): `sy_orchestrator` y `install.sh` ya priorizan layout `dist/` 
 Nota (2026-03-04): `remove_hive` ahora ejecuta cleanup remoto por socket (`REMOVE_HIVE_CLEANUP`) con timeout corto y fallback SSH best-effort; la respuesta incluye `remote_cleanup_via` para diagnóstico (`socket`/`ssh_fallback`/`local_only`). `harden_ssh=true` incluye verificación estricta post-bootstrap: la key debe seguir operativa con `sudo -n` y el login por password debe quedar rechazado.
 Nota (2026-03-04): en `add_hive`, `restrict_ssh` se reporta como estado aplicado. Si el gate restringido no verifica (p.ej. `empty SSH_ORIGINAL_COMMAND`), el flujo cae automáticamente a key no restringida, mantiene `harden_ssh` y expone `restrict_ssh_requested=true` + `restrict_ssh=false`.
 Nota (2026-03-04): `remove_hive` normaliza `payload.remote_cleanup` con semántica canónica: `socket_ok`, `socket_timeout`, `ssh_fallback_ok`, `ssh_fallback_failed`, `local_only`. Se mantiene `remote_cleanup_via` como metadato auxiliar para observabilidad.
+Nota (2026-03-04): `add_hive` ahora intenta `restrict_ssh` también cuando el canal password no está disponible (escenario post-hardening), con fallback automático a key no restringida usando el propio canal por key si la verificación restringida falla.
 
 Salida:
 
