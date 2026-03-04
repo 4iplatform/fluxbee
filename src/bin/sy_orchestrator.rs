@@ -46,6 +46,7 @@ const SYNCTHING_SYNC_PORT_TCP: u16 = 22000;
 const SYNCTHING_SYNC_PORT_UDP: u16 = 22000;
 const SYNCTHING_DISCOVERY_PORT_UDP: u16 = 21027;
 const DIST_SYNC_PROBE_TIMEOUT_SECS: u64 = 45;
+const REMOVE_HIVE_SOCKET_CLEANUP_TIMEOUT_SECS: u64 = 8;
 const SYNCTHING_FOLDER_BLOB_ID: &str = "fluxbee-blob";
 const SYNCTHING_FOLDER_DIST_ID: &str = "fluxbee-dist";
 const SYNCTHING_INSTALL_DIR: &str = "/var/lib/fluxbee/vendor/bin";
@@ -1002,7 +1003,7 @@ async fn handle_admin(
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
             if let Some(hive_id) = hive {
-                remove_hive_flow(state, &hive_id)
+                remove_hive_flow(state, &hive_id).await
             } else {
                 serde_json::json!({
                     "status": "error",
@@ -1096,6 +1097,7 @@ async fn handle_system_message(
             | "KILL_NODE"
             | "RUN_ROUTER"
             | "KILL_ROUTER"
+            | "REMOVE_HIVE_CLEANUP"
     ) {
         source_name = resolve_system_source_name_with_retry(state, &msg.routing.src).await;
         let is_allowed = source_name.as_deref().is_some_and(|name| {
@@ -1153,6 +1155,15 @@ async fn handle_system_message(
                     let _ =
                         send_system_action_response(sender, msg, "KILL_ROUTER_RESPONSE", payload)
                             .await;
+                }
+                "REMOVE_HIVE_CLEANUP" => {
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "REMOVE_HIVE_CLEANUP_RESPONSE",
+                        payload,
+                    )
+                    .await;
                 }
                 _ => {}
             }
@@ -1323,6 +1334,17 @@ async fn handle_system_message(
             let result = kill_router_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "KILL_ROUTER processed");
             let _ = send_system_action_response(sender, msg, "KILL_ROUTER_RESPONSE", result).await;
+        }
+        Some("REMOVE_HIVE_CLEANUP") => {
+            let result = remove_hive_cleanup_local_flow();
+            tracing::info!(result = %result, "REMOVE_HIVE_CLEANUP processed");
+            let _ = send_system_action_response(
+                sender,
+                msg,
+                "REMOVE_HIVE_CLEANUP_RESPONSE",
+                result,
+            )
+            .await;
         }
         _ => {}
     }
@@ -3669,7 +3691,35 @@ fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
     read_hive_info(&root, hive_id)
 }
 
-fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_json::Value {
+fn remove_hive_cleanup_script() -> &'static str {
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-orchestrator sy-admin sy-storage fluxbee-syncthing; do \
+systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
+systemctl disable \"$s\" >/dev/null 2>&1 || true; \
+systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
+systemctl reset-failed \"$s\" >/dev/null 2>&1 || true; \
+done"
+}
+
+fn remove_hive_cleanup_local_flow() -> serde_json::Value {
+    let deferred_script = format!("sleep 1; {}", remove_hive_cleanup_script());
+    match Command::new("bash")
+        .arg("-lc")
+        .arg(deferred_script)
+        .spawn()
+    {
+        Ok(_) => serde_json::json!({
+            "status": "ok",
+            "cleanup": "scheduled",
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "CLEANUP_SCHEDULE_FAILED",
+            "message": err.to_string(),
+        }),
+    }
+}
+
+async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_json::Value {
     if !valid_hive_id(hive_id) {
         return serde_json::json!({
             "status": "error",
@@ -3695,40 +3745,81 @@ fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_json::Val
     }
 
     let mut remote_cleanup = "stopped";
+    let mut remote_cleanup_via = "socket";
     let mut address = String::new();
-    // Keep remove_hive responsive: cleanup is best-effort and non-blocking.
-    let cleanup_cmd = "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-orchestrator sy-admin sy-storage fluxbee-syncthing; do \
-systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
-systemctl disable \"$s\" >/dev/null 2>&1 || true; \
-systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
-systemctl reset-failed \"$s\" >/dev/null 2>&1 || true; \
-done";
-    match hive_access(hive_id) {
-        Ok((addr, key_path)) => {
-            address = addr;
-            let cleanup_cmd_q = shell_single_quote(cleanup_cmd);
-            if let Err(err) = ssh_with_key(
-                &address,
-                &key_path,
-                &sudo_wrap(&format!("bash -lc '{}'", cleanup_cmd_q)),
-                BOOTSTRAP_SSH_USER,
-            ) {
-                tracing::warn!(
-                    hive_id = hive_id,
-                    address = %address,
-                    error = %err,
-                    "remote cleanup failed; proceeding with local hive state removal"
-                );
-                remote_cleanup = "failed_skipped";
-            }
-        }
-        Err(err) => {
+    let cleanup_cmd = remove_hive_cleanup_script();
+    let forward_result = forward_system_action_to_hive_with_timeout(
+        state,
+        hive_id,
+        "REMOVE_HIVE_CLEANUP",
+        "REMOVE_HIVE_CLEANUP_RESPONSE",
+        serde_json::json!({
+            "hive_id": hive_id,
+            "target": hive_id,
+        }),
+        Duration::from_secs(REMOVE_HIVE_SOCKET_CLEANUP_TIMEOUT_SECS),
+    )
+    .await;
+
+    let socket_cleanup_ok = matches!(
+        forward_result.as_ref(),
+        Ok(payload)
+            if payload
+                .get("status")
+                .and_then(|value| value.as_str())
+                == Some("ok")
+    );
+
+    if !socket_cleanup_ok {
+        if let Err(err) = &forward_result {
             tracing::warn!(
                 hive_id = hive_id,
                 error = %err,
-                "cannot resolve hive access for remote cleanup; proceeding with local hive state removal"
+                "socket cleanup failed during remove_hive; attempting ssh fallback"
             );
-            remote_cleanup = "skipped_no_access";
+        } else if let Ok(payload) = &forward_result {
+            tracing::warn!(
+                hive_id = hive_id,
+                payload = %payload,
+                "socket cleanup returned non-ok status; attempting ssh fallback"
+            );
+        }
+        match hive_access(hive_id) {
+            Ok((addr, key_path)) => {
+                address = addr;
+                let cleanup_cmd_q = shell_single_quote(cleanup_cmd);
+                if let Err(err) = ssh_with_key(
+                    &address,
+                    &key_path,
+                    &sudo_wrap(&format!("bash -lc '{}'", cleanup_cmd_q)),
+                    BOOTSTRAP_SSH_USER,
+                ) {
+                    tracing::warn!(
+                        hive_id = hive_id,
+                        address = %address,
+                        error = %err,
+                        "remote cleanup failed; proceeding with local hive state removal"
+                    );
+                    remote_cleanup = "failed_skipped";
+                    remote_cleanup_via = "ssh_fallback";
+                }
+                if remote_cleanup == "stopped" {
+                    remote_cleanup_via = "ssh_fallback";
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    hive_id = hive_id,
+                    error = %err,
+                    "cannot resolve hive access for remote cleanup; proceeding with local hive state removal"
+                );
+                remote_cleanup = "skipped_no_access";
+                remote_cleanup_via = "local_only";
+            }
+        }
+    } else {
+        if let Ok((addr, _)) = hive_access(hive_id) {
+            address = addr;
         }
     }
 
@@ -3747,6 +3838,7 @@ done";
         "hive_id": hive_id,
         "address": address,
         "remote_cleanup": remote_cleanup,
+        "remote_cleanup_via": remote_cleanup_via,
     })
 }
 
@@ -5040,6 +5132,25 @@ async fn forward_system_action_to_hive(
     response_msg: &str,
     payload: serde_json::Value,
 ) -> Result<serde_json::Value, OrchestratorError> {
+    forward_system_action_to_hive_with_timeout(
+        state,
+        target_hive,
+        request_msg,
+        response_msg,
+        payload,
+        system_forward_timeout(),
+    )
+    .await
+}
+
+async fn forward_system_action_to_hive_with_timeout(
+    state: &OrchestratorState,
+    target_hive: &str,
+    request_msg: &str,
+    response_msg: &str,
+    payload: serde_json::Value,
+    forward_timeout: Duration,
+) -> Result<serde_json::Value, OrchestratorError> {
     if target_hive != state.hive_id {
         if let Ok(snapshot) = load_lsa_snapshot(state) {
             let now = now_epoch_ms();
@@ -5149,7 +5260,6 @@ async fn forward_system_action_to_hive(
     };
     relay_sender.send(request).await?;
 
-    let forward_timeout = system_forward_timeout();
     let wait_response = async {
         loop {
             let incoming = relay_receiver.recv().await?;
