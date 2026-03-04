@@ -137,6 +137,7 @@ Salida:
 
 Nota (2026-03-04): `sy_orchestrator` y `install.sh` ya priorizan layout `dist/` para runtime/core/vendor con fallback legacy (`/var/lib/fluxbee/{runtimes,core,vendor}`), `add_hive` genera bloque `dist` en `hive.yaml` worker, la reconciliación de `config.xml` Syncthing asegura folders separados `fluxbee-blob` + `fluxbee-dist` (local/worker, con restart condicional solo si cambia config), `add_hive` ejecuta probe explícito de sincronización dist: por defecto es no estricto (si no converge, continúa con `dist_sync_ready=false`), y en modo estricto (`require_dist_sync=true`) devuelve `DIST_SYNC_TIMEOUT`. Además aplica hardening SSH post-bootstrap en modo restringido por defecto (gate + authorized_keys con `from=` y comando forzado; opt-out explícito con `restrict_ssh=false` o env `FLUXBEE_ADD_HIVE_RESTRICT_SSH=0`).
 Nota (2026-03-04): `remove_hive` ahora ejecuta cleanup remoto por socket (`REMOVE_HIVE_CLEANUP`) con timeout corto y fallback SSH best-effort; la respuesta incluye `remote_cleanup_via` para diagnóstico (`socket`/`ssh_fallback`/`local_only`). `harden_ssh=true` incluye verificación estricta post-bootstrap: la key debe seguir operativa con `sudo -n` y el login por password debe quedar rechazado.
+Nota (2026-03-04): en `add_hive`, `restrict_ssh` se reporta como estado aplicado. Si el gate restringido no verifica (p.ej. `empty SSH_ORIGINAL_COMMAND`), el flujo cae automáticamente a key no restringida, mantiene `harden_ssh` y expone `restrict_ssh_requested=true` + `restrict_ssh=false`.
 
 Salida:
 

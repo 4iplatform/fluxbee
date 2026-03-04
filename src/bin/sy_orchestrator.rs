@@ -6855,51 +6855,66 @@ fn add_hive_flow(
         });
     }
 
+    let mut restrict_ssh_applied = false;
     if restrict_ssh {
-        if let Err(err) = install_remote_ssh_gate_with_access(address, &key_path) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!("failed to install remote ssh gate: {err}"),
-            });
-        }
-        let source_patterns = resolve_add_hive_authkey_source_patterns(address);
-        if source_patterns.is_empty() {
-            tracing::info!(
-                target = address,
-                "authorized_keys restriction applied (gate enabled, from filter disabled by policy)"
-            );
-        } else {
-            tracing::info!(
-                target = address,
-                from_patterns = ?source_patterns,
-                "authorized_keys restriction applied (gate enabled, from filter enabled by policy)"
-            );
-        }
-        if let Err(err) = apply_remote_restricted_authorized_key_with_access(
-            address,
-            &key_path,
-            &pub_key,
-            &source_patterns,
-        ) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!("failed to apply restricted authorized_keys entry: {err}"),
-            });
-        }
-
-        if let Err(err) = ssh_with_key(
-            address,
-            &key_path,
-            "sudo -n /bin/bash -lc 'exit 0'",
-            BOOTSTRAP_SSH_USER,
-        ) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!("key access verification failed after authorized_keys restriction: {err}"),
-            });
+        let restricted_result: Result<(), OrchestratorError> = (|| {
+            install_remote_ssh_gate_with_access(address, &key_path)?;
+            let source_patterns = resolve_add_hive_authkey_source_patterns(address);
+            if source_patterns.is_empty() {
+                tracing::info!(
+                    target = address,
+                    "authorized_keys restriction applied (gate enabled, from filter disabled by policy)"
+                );
+            } else {
+                tracing::info!(
+                    target = address,
+                    from_patterns = ?source_patterns,
+                    "authorized_keys restriction applied (gate enabled, from filter enabled by policy)"
+                );
+            }
+            apply_remote_restricted_authorized_key_with_access(
+                address,
+                &key_path,
+                &pub_key,
+                &source_patterns,
+            )?;
+            ssh_with_key(
+                address,
+                &key_path,
+                "sudo -n /bin/bash -lc 'exit 0'",
+                BOOTSTRAP_SSH_USER,
+            )?;
+            Ok(())
+        })();
+        match restricted_result {
+            Ok(()) => {
+                restrict_ssh_applied = true;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target = address,
+                    error = %err,
+                    "restricted key flow failed; falling back to unrestricted key mode"
+                );
+                if let Err(fallback_err) =
+                    apply_remote_unrestricted_authorized_key_with_access(address, &key_path, &pub_key)
+                {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "SSH_KEY_FAILED",
+                        "message": format!("restricted key flow failed ({err}); unrestricted fallback failed: {fallback_err}"),
+                    });
+                }
+                if let Err(verify_err) =
+                    ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER)
+                {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "SSH_KEY_FAILED",
+                        "message": format!("restricted key flow failed ({err}); unrestricted fallback verification failed: {verify_err}"),
+                    });
+                }
+            }
         }
     } else {
         tracing::warn!(
@@ -7352,7 +7367,8 @@ fn add_hive_flow(
             "hive_id": hive_id,
             "address": address,
             "harden_ssh": harden_ssh,
-            "restrict_ssh": restrict_ssh,
+            "restrict_ssh": restrict_ssh_applied,
+            "restrict_ssh_requested": restrict_ssh,
             "require_dist_sync": require_dist_sync,
             "wan_connected": false,
             "dist_sync_ready": dist_sync_ready,
@@ -7372,7 +7388,8 @@ fn add_hive_flow(
             "hive_id": hive_id,
             "address": address,
             "harden_ssh": harden_ssh,
-            "restrict_ssh": restrict_ssh,
+            "restrict_ssh": restrict_ssh_applied,
+            "restrict_ssh_requested": restrict_ssh,
             "require_dist_sync": require_dist_sync,
             "wan_connected": true,
             "orchestrator_connected": false,
@@ -7385,7 +7402,8 @@ fn add_hive_flow(
         "hive_id": hive_id,
         "address": address,
         "harden_ssh": harden_ssh,
-        "restrict_ssh": restrict_ssh,
+        "restrict_ssh": restrict_ssh_applied,
+        "restrict_ssh_requested": restrict_ssh,
         "require_dist_sync": require_dist_sync,
         "wan_connected": true,
         "orchestrator_connected": true,
@@ -7907,6 +7925,42 @@ chmod 600 ~/.ssh/authorized_keys\n",
     );
     let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
     ssh_with_pass(address, &cmd, BOOTSTRAP_SSH_USER)?;
+    Ok(())
+}
+
+fn apply_remote_unrestricted_authorized_key_with_access(
+    address: &str,
+    key_path: &Path,
+    pub_key: &str,
+) -> Result<(), OrchestratorError> {
+    let key_material = pub_key
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
+    let script = format!(
+        "set -euo pipefail\n\
+user='{user}'\n\
+home_dir=\"$(getent passwd \"$user\" | cut -d: -f6)\"\n\
+if [[ -z \"$home_dir\" ]]; then home_dir=\"/home/$user\"; fi\n\
+ssh_dir=\"$home_dir/.ssh\"\n\
+auth_keys=\"$ssh_dir/authorized_keys\"\n\
+mkdir -p \"$ssh_dir\"\n\
+chown \"$user:$user\" \"$ssh_dir\"\n\
+chmod 700 \"$ssh_dir\"\n\
+touch \"$auth_keys\"\n\
+chown \"$user:$user\" \"$auth_keys\"\n\
+{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' > \"$auth_keys.tmp\"; }} || true\n\
+mv \"$auth_keys.tmp\" \"$auth_keys\"\n\
+printf '%s\\n' '{entry}' >> \"$auth_keys\"\n\
+chown \"$user:$user\" \"$auth_keys\"\n\
+chmod 600 \"$auth_keys\"\n",
+        user = BOOTSTRAP_SSH_USER,
+        gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
+        key_material = shell_single_quote(key_material),
+        entry = shell_single_quote(pub_key),
+    );
+    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
+    ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
     Ok(())
 }
 
