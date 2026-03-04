@@ -1034,7 +1034,7 @@ async fn handle_admin(
             if let Some(hive_id) = hive_id {
                 let address = address.unwrap_or_default();
                 let harden_ssh = resolve_add_hive_harden_ssh(&msg.payload);
-                let restrict_ssh = resolve_add_hive_restrict_ssh(&msg.payload);
+                let restrict_ssh = resolve_add_hive_restrict_ssh(&msg.payload, harden_ssh);
                 add_hive_flow(state, &hive_id, &address, harden_ssh, restrict_ssh)
             } else {
                 serde_json::json!({
@@ -7317,9 +7317,15 @@ fn resolve_add_hive_harden_ssh(payload: &serde_json::Value) -> bool {
     env_flag_enabled("FLUXBEE_ADD_HIVE_HARDEN_SSH") || env_flag_enabled("JSR_ADD_HIVE_HARDEN_SSH")
 }
 
-fn resolve_add_hive_restrict_ssh(payload: &serde_json::Value) -> bool {
+fn resolve_add_hive_restrict_ssh(payload: &serde_json::Value, harden_ssh: bool) -> bool {
     if let Some(value) = payload.get("restrict_ssh").and_then(parse_bool_value) {
         return value;
+    }
+    if matches!(
+        payload.get("harden_ssh").and_then(parse_bool_value),
+        Some(false)
+    ) {
+        return false;
     }
     if let Ok(raw) = std::env::var("FLUXBEE_ADD_HIVE_RESTRICT_SSH") {
         if let Some(value) = parse_bool_str(&raw) {
@@ -7330,6 +7336,9 @@ fn resolve_add_hive_restrict_ssh(payload: &serde_json::Value) -> bool {
         if let Some(value) = parse_bool_str(&raw) {
             return value;
         }
+    }
+    if !harden_ssh {
+        return false;
     }
     true
 }
