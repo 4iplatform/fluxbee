@@ -6858,7 +6858,8 @@ fn add_hive_flow(
     let mut restrict_ssh_applied = false;
     if restrict_ssh {
         let restricted_result: Result<(), OrchestratorError> = (|| {
-            install_remote_ssh_gate_with_access(address, &key_path)?;
+            install_remote_ssh_gate_with_access(address, &key_path)
+                .map_err(|err| format!("install gate failed: {err}"))?;
             let source_patterns = resolve_add_hive_authkey_source_patterns(address);
             if source_patterns.is_empty() {
                 tracing::info!(
@@ -6877,13 +6878,15 @@ fn add_hive_flow(
                 &key_path,
                 &pub_key,
                 &source_patterns,
-            )?;
+            )
+            .map_err(|err| format!("apply restricted authorized_keys failed: {err}"))?;
             ssh_with_key(
                 address,
                 &key_path,
                 "sudo -n /bin/bash -lc 'exit 0'",
                 BOOTSTRAP_SSH_USER,
-            )?;
+            )
+            .map_err(|err| format!("restricted sudo verification failed: {err}"))?;
             Ok(())
         })();
         match restricted_result {
@@ -6897,12 +6900,12 @@ fn add_hive_flow(
                     "restricted key flow failed; falling back to unrestricted key mode"
                 );
                 if let Err(fallback_err) =
-                    apply_remote_unrestricted_authorized_key_with_access(address, &key_path, &pub_key)
+                    apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key)
                 {
                     return serde_json::json!({
                         "status": "error",
                         "error_code": "SSH_KEY_FAILED",
-                        "message": format!("restricted key flow failed ({err}); unrestricted fallback failed: {fallback_err}"),
+                        "message": format!("restricted key flow failed ({err}); unrestricted fallback via password channel failed: {fallback_err}"),
                     });
                 }
                 if let Err(verify_err) =
