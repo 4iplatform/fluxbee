@@ -173,6 +173,7 @@ Referencia: `scripts/orchestrator_spawn_kill_v2_e2e.sh` (usa `node_name`, `runti
 - [ ] E2E-10 `add_hive` con `harden_ssh=true` valida bloqueo de password SSH y continuidad operativa por orchestrator/socket.
 
 Referencia: `scripts/orchestrator_remove_hive_socket_e2e.sh` cubre online (`remote_cleanup=socket_ok`) y offline (`ssh_fallback_*` / `socket_timeout` / `local_only`).
+Referencia: `scripts/orchestrator_add_hive_hardening_e2e.sh` cubre `add_hive(harden_ssh=true)` + rechazo de password SSH + continuidad `run_node/kill_node`.
 
 ## 6. Definicion de Done v2
 
