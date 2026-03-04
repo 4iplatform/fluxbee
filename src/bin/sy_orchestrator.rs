@@ -7678,7 +7678,7 @@ chmod 600 ~/.ssh/authorized_keys\n",
 
 fn remote_orchestrator_sudoers_contents() -> String {
     format!(
-        "Defaults:{} !requiretty\n{} ALL=(root) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /bin/systemd-run, /usr/bin/systemd-run, /usr/bin/install, /bin/mkdir, /bin/rm, /bin/cp, /bin/mv, /usr/bin/sha256sum, /usr/bin/stat, /usr/bin/tee, /bin/chmod, /usr/bin/chmod, /bin/chown, /usr/bin/chown, /usr/bin/rsync, /usr/sbin/ufw, /usr/bin/firewall-cmd, /usr/sbin/service, /bin/bash, /usr/bin/bash\n",
+        "Defaults:{} !requiretty\n{} ALL=(root) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /bin/systemd-run, /usr/bin/systemd-run, /usr/bin/install, /bin/mkdir, /usr/bin/mkdir, /bin/rm, /usr/bin/rm, /bin/cp, /usr/bin/cp, /bin/mv, /usr/bin/mv, /bin/cat, /usr/bin/cat, /usr/bin/sha256sum, /usr/bin/stat, /usr/bin/tee, /bin/chmod, /usr/bin/chmod, /bin/chown, /usr/bin/chown, /usr/bin/rsync, /usr/sbin/ufw, /usr/bin/firewall-cmd, /usr/sbin/service, /bin/bash, /usr/bin/bash\n",
         BOOTSTRAP_SSH_USER, BOOTSTRAP_SSH_USER
     )
 }
@@ -7753,6 +7753,20 @@ fn ensure_remote_orchestrator_sudoers_with_access(
         BOOTSTRAP_SSH_USER,
     )
     .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (bash): {err}"))?;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap("/usr/bin/mkdir -p /tmp"),
+        BOOTSTRAP_SSH_USER,
+    )
+    .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (mkdir): {err}"))?;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap("/usr/bin/cat /etc/hosts >/dev/null"),
+        BOOTSTRAP_SSH_USER,
+    )
+    .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (cat): {err}"))?;
     Ok(())
 }
 
