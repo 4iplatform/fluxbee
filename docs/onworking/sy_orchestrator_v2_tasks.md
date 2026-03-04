@@ -172,6 +172,8 @@ Referencia: `scripts/orchestrator_spawn_kill_v2_e2e.sh` (usa `node_name`, `runti
 - [ ] E2E-9 `remove_hive` con worker online usa cleanup por socket (sin depender de SSH), y con worker offline cae a fallback controlado.
 - [ ] E2E-10 `add_hive` con `harden_ssh=true` valida bloqueo de password SSH y continuidad operativa por orchestrator/socket.
 
+Referencia: `scripts/orchestrator_remove_hive_socket_e2e.sh` cubre online (`remote_cleanup=socket_ok`) y offline (`ssh_fallback_*` / `socket_timeout` / `local_only`).
+
 ## 6. Definicion de Done v2
 
 - [ ] `SYSTEM_UPDATE` reemplaza operativamente a `RUNTIME_UPDATE`.
