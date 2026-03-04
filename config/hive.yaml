@@ -29,3 +29,9 @@ blob:
     tool: "syncthing"
     api_port: 8384
     data_dir: "/var/lib/fluxbee/syncthing"
+
+dist:
+  path: "/var/lib/fluxbee/dist"
+  sync:
+    enabled: true
+    tool: "syncthing"

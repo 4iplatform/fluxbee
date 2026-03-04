@@ -99,7 +99,7 @@ Salida:
 - [x] V5.1 Implementar handler `SYSTEM_UPDATE` en orchestrator.
 - [x] V5.2 Soportar categorias `runtime`, `core`, `vendor`.
 - [x] V5.3 Verificar manifest local (version/hash) y responder `sync_pending` si no converge.
-- [ ] V5.4 Instalar localmente desde `dist/` con hash-gate previo.
+- [x] V5.4 Instalar localmente desde `dist/` con hash-gate previo.
 - [x] V5.5 Health gate + rollback local por categoria.
 - [x] V5.6 Emitir `SYSTEM_UPDATE_RESPONSE` con detalle de `updated/unchanged/restarted/errors`.
 
@@ -126,11 +126,13 @@ Salida:
 
 ### Fase 7 - Dist por Syncthing + provisioning final
 
-- [ ] V7.1 Formalizar layout `/var/lib/fluxbee/dist` en motherbee y worker.
-- [ ] V7.2 Configurar folder `fluxbee-dist` separado de `fluxbee-blob`.
-- [ ] V7.3 Integrar `dist` en `hive.yaml` generado por add_hive.
-- [ ] V7.4 Verificar que add_hive deja worker con dist sincronizando antes de primer update.
-- [ ] V7.5 Cerrar SSH post-bootstrap segun politica final del equipo (cerrado o restringido).
+- [x] V7.1 Formalizar layout `/var/lib/fluxbee/dist` en motherbee y worker.
+- [x] V7.2 Configurar folder `fluxbee-dist` separado de `fluxbee-blob`.
+- [x] V7.3 Integrar `dist` en `hive.yaml` generado por add_hive.
+- [x] V7.4 Verificar que add_hive deja worker con dist sincronizando antes de primer update.
+- [x] V7.5 Cerrar SSH post-bootstrap segun politica final del equipo (cerrado o restringido).
+
+Nota (2026-03-03): `sy_orchestrator` y `install.sh` ya priorizan layout `dist/` para runtime/core/vendor con fallback legacy (`/var/lib/fluxbee/{runtimes,core,vendor}`), `add_hive` genera bloque `dist` en `hive.yaml` worker, la reconciliación de `config.xml` Syncthing asegura folders separados `fluxbee-blob` + `fluxbee-dist` (local/worker, con restart condicional solo si cambia config), `add_hive` ejecuta probe explícito de sincronización (`DIST_SYNC_TIMEOUT` si no converge) y aplica hardening SSH post-bootstrap en modo restringido por defecto (gate + authorized_keys con `from=` y comando forzado; opt-out explícito con `restrict_ssh=false` o env `FLUXBEE_ADD_HIVE_RESTRICT_SSH=0`).
 
 Salida:
 
