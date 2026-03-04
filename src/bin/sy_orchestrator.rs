@@ -6799,18 +6799,6 @@ fn add_hive_flow(
         });
     }
 
-    if let Err(err) = ssh_with_pass(address, "true", BOOTSTRAP_SSH_USER) {
-        return ssh_bootstrap_error_payload(&err.to_string());
-    }
-
-    if let Err(err) = fs::create_dir_all(&hive_dir) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "IO_ERROR",
-            "message": err.to_string(),
-        });
-    }
-
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     if !key_path.exists() {
         return serde_json::json!({
@@ -6838,12 +6826,49 @@ fn add_hive_flow(
         }
     };
 
-    // Seed the key via password channel with the same canonical writer used by fallbacks.
-    if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key) {
+    let mut password_channel_available = true;
+    if let Err(pass_err) = ssh_with_pass(address, "true", BOOTSTRAP_SSH_USER) {
+        password_channel_available = false;
+        match ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
+            Ok(()) => {
+                tracing::warn!(
+                    target = address,
+                    error = %pass_err,
+                    "password bootstrap channel unavailable; continuing via key channel"
+                );
+            }
+            Err(key_err) => {
+                return ssh_bootstrap_error_payload(&format!(
+                    "password probe failed: {pass_err}; key probe failed: {key_err}"
+                ));
+            }
+        }
+    }
+
+    if let Err(err) = fs::create_dir_all(&hive_dir) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "IO_ERROR",
+            "message": err.to_string(),
+        });
+    }
+
+    if password_channel_available {
+        // Seed via password channel when available (fresh bootstrap path).
+        if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_KEY_FAILED",
+                "message": format!("failed to seed bootstrap key via password channel: {err}"),
+            });
+        }
+    } else if let Err(err) =
+        apply_remote_unrestricted_authorized_key_with_access(address, &key_path, &pub_key)
+    {
         return serde_json::json!({
             "status": "error",
             "error_code": "SSH_KEY_FAILED",
-            "message": format!("failed to seed bootstrap key via password channel: {err}"),
+            "message": format!("password channel unavailable and key reseed failed: {err}"),
         });
     }
 
@@ -6856,7 +6881,16 @@ fn add_hive_flow(
     }
 
     let mut restrict_ssh_applied = false;
-    if restrict_ssh {
+    let restrict_ssh_effective = if restrict_ssh && !password_channel_available {
+        tracing::warn!(
+            target = address,
+            "restrict_ssh requested but password bootstrap channel unavailable; skipping restriction for safety"
+        );
+        false
+    } else {
+        restrict_ssh
+    };
+    if restrict_ssh_effective {
         let restricted_result: Result<(), OrchestratorError> = (|| {
             install_remote_ssh_gate_with_access(address, &key_path)
                 .map_err(|err| format!("install gate failed: {err}"))?;
@@ -6934,7 +6968,12 @@ fn add_hive_flow(
     }
 
     if harden_ssh {
-        if let Err(err) = disable_remote_password_auth(address) {
+        let harden_result = if password_channel_available {
+            disable_remote_password_auth(address)
+        } else {
+            disable_remote_password_auth_with_access(address, &key_path)
+        };
+        if let Err(err) = harden_result {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SSH_HARDEN_FAILED",
@@ -7724,6 +7763,66 @@ fi'"#;
 
     let restart_ssh_cmd = r#"bash -lc "systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart""#;
     ssh_with_pass(address, &sudo_wrap(restart_ssh_cmd), BOOTSTRAP_SSH_USER)?;
+    Ok(())
+}
+
+fn disable_remote_password_auth_with_access(
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    let set_password_auth_cmd = r#"bash -lc 'set -euo pipefail
+cfg="/etc/ssh/sshd_config"
+drop="/etc/ssh/sshd_config.d/00-fluxbee-hardening.conf"
+mkdir -p /etc/ssh/sshd_config.d
+
+upsert_opt() {
+  local key="$1"
+  local val="$2"
+  local file="$3"
+  if grep -Eq "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+" "$file"; then
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+.*|${key} ${val}|" "$file"
+  else
+    printf "\n%s %s\n" "$key" "$val" >> "$file"
+  fi
+}
+
+upsert_opt "PasswordAuthentication" "no" "$cfg"
+upsert_opt "KbdInteractiveAuthentication" "no" "$cfg"
+upsert_opt "ChallengeResponseAuthentication" "no" "$cfg"
+
+for f in /etc/ssh/sshd_config.d/*.conf; do
+  [ -f "$f" ] || continue
+  sed -i -E "s|^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+.*|PasswordAuthentication no|" "$f" || true
+  sed -i -E "s|^[[:space:]]*#?[[:space:]]*KbdInteractiveAuthentication[[:space:]]+.*|KbdInteractiveAuthentication no|" "$f" || true
+  sed -i -E "s|^[[:space:]]*#?[[:space:]]*ChallengeResponseAuthentication[[:space:]]+.*|ChallengeResponseAuthentication no|" "$f" || true
+done
+
+cat > "$drop" <<EOF
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+EOF
+chmod 0644 "$drop"
+
+if command -v sshd >/dev/null 2>&1; then
+  sshd -t >/dev/null 2>&1 || true
+elif [ -x /usr/sbin/sshd ]; then
+  /usr/sbin/sshd -t >/dev/null 2>&1 || true
+fi'"#;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(set_password_auth_cmd),
+        BOOTSTRAP_SSH_USER,
+    )?;
+
+    let restart_ssh_cmd = r#"bash -lc "systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart""#;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(restart_ssh_cmd),
+        BOOTSTRAP_SSH_USER,
+    )?;
     Ok(())
 }
 
