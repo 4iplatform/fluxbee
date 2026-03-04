@@ -62,6 +62,7 @@ pub struct NodeRuntime<N: AiNode> {
 #[derive(Debug, Default)]
 struct RuntimeMetrics {
     read_messages: AtomicU64,
+    idle_read_timeouts: AtomicU64,
     enqueued_messages: AtomicU64,
     processed_messages: AtomicU64,
     responses_sent: AtomicU64,
@@ -73,6 +74,7 @@ struct RuntimeMetrics {
 #[derive(Debug, Clone, Copy)]
 struct RuntimeMetricsSnapshot {
     read_messages: u64,
+    idle_read_timeouts: u64,
     enqueued_messages: u64,
     processed_messages: u64,
     responses_sent: u64,
@@ -85,6 +87,7 @@ impl RuntimeMetrics {
     fn snapshot(&self) -> RuntimeMetricsSnapshot {
         RuntimeMetricsSnapshot {
             read_messages: self.read_messages.load(Ordering::Relaxed),
+            idle_read_timeouts: self.idle_read_timeouts.load(Ordering::Relaxed),
             enqueued_messages: self.enqueued_messages.load(Ordering::Relaxed),
             processed_messages: self.processed_messages.load(Ordering::Relaxed),
             responses_sent: self.responses_sent.load(Ordering::Relaxed),
@@ -236,6 +239,7 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
         let final_metrics = metrics.snapshot();
         tracing::info!(
             read_messages = final_metrics.read_messages,
+            idle_read_timeouts = final_metrics.idle_read_timeouts,
             enqueued_messages = final_metrics.enqueued_messages,
             processed_messages = final_metrics.processed_messages,
             responses_sent = final_metrics.responses_sent,
@@ -256,7 +260,19 @@ async fn reader_loop(
     metrics: Arc<RuntimeMetrics>,
 ) -> Result<()> {
     loop {
-        let msg = reader.read_timeout(read_timeout).await?;
+        let msg = match reader.read_timeout(read_timeout).await {
+            Ok(msg) => msg,
+            Err(AiSdkError::Node(fluxbee_sdk::node_client::NodeError::Timeout)) => {
+                // Idle window elapsed: keep process alive and continue waiting.
+                metrics.idle_read_timeouts.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    read_timeout_ms = read_timeout.as_millis() as u64,
+                    "ai runtime read timeout (idle)"
+                );
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         metrics.read_messages.fetch_add(1, Ordering::Relaxed);
         if tx.send(msg).await.is_err() {
             return Ok(());
@@ -362,6 +378,7 @@ async fn metrics_loop(metrics: Arc<RuntimeMetrics>, interval: Duration) {
         let snapshot = metrics.snapshot();
         tracing::info!(
             read_messages = snapshot.read_messages,
+            idle_read_timeouts = snapshot.idle_read_timeouts,
             enqueued_messages = snapshot.enqueued_messages,
             processed_messages = snapshot.processed_messages,
             responses_sent = snapshot.responses_sent,
