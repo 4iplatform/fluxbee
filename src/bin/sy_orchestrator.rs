@@ -1039,6 +1039,8 @@ async fn handle_admin(
                 let harden_ssh = resolve_add_hive_harden_ssh(&msg.payload);
                 let restrict_ssh = resolve_add_hive_restrict_ssh(&msg.payload, harden_ssh);
                 let require_dist_sync = resolve_add_hive_require_dist_sync(&msg.payload);
+                let dist_sync_probe_timeout_secs =
+                    resolve_add_hive_dist_sync_probe_timeout_secs(&msg.payload);
                 add_hive_flow(
                     state,
                     &hive_id,
@@ -1046,6 +1048,7 @@ async fn handle_admin(
                     harden_ssh,
                     restrict_ssh,
                     require_dist_sync,
+                    dist_sync_probe_timeout_secs,
                 )
             } else {
                 serde_json::json!({
@@ -6681,6 +6684,7 @@ fn verify_remote_dist_sync_ready_with_access(
     address: &str,
     key_path: &Path,
     dist: &DistRuntimeConfig,
+    timeout_secs: u64,
 ) -> Result<(), OrchestratorError> {
     if !dist.sync_enabled || !dist_sync_tool_is_syncthing(dist) {
         return Ok(());
@@ -6703,7 +6707,7 @@ fn verify_remote_dist_sync_ready_with_access(
     );
 
     let started = Instant::now();
-    let timeout = Duration::from_secs(DIST_SYNC_PROBE_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(timeout_secs);
     let mut success = false;
     let mut last_err: Option<String> = None;
     while started.elapsed() < timeout {
@@ -6742,7 +6746,7 @@ fn verify_remote_dist_sync_ready_with_access(
 
     Err(format!(
         "dist sync probe timeout after {}s (target='{}', path='{}'): {}",
-        DIST_SYNC_PROBE_TIMEOUT_SECS,
+        timeout_secs,
         address,
         remote_probe_path,
         last_err.unwrap_or_else(|| "no detail".to_string())
@@ -6815,6 +6819,7 @@ fn add_hive_flow(
     harden_ssh: bool,
     restrict_ssh: bool,
     require_dist_sync: bool,
+    dist_sync_probe_timeout_secs: u64,
 ) -> serde_json::Value {
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
@@ -7372,7 +7377,12 @@ fn add_hive_flow(
                 "message": reason,
             });
         }
-        match verify_remote_dist_sync_ready_with_access(address, &key_path, &desired_dist) {
+        match verify_remote_dist_sync_ready_with_access(
+            address,
+            &key_path,
+            &desired_dist,
+            dist_sync_probe_timeout_secs,
+        ) {
             Ok(()) => {
                 dist_sync_ready = true;
             }
@@ -7502,6 +7512,7 @@ fn add_hive_flow(
             "restrict_ssh": restrict_ssh_applied,
             "restrict_ssh_requested": restrict_ssh,
             "require_dist_sync": require_dist_sync,
+            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
             "wan_connected": false,
             "dist_sync_ready": dist_sync_ready,
         });
@@ -7523,6 +7534,7 @@ fn add_hive_flow(
             "restrict_ssh": restrict_ssh_applied,
             "restrict_ssh_requested": restrict_ssh,
             "require_dist_sync": require_dist_sync,
+            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
             "wan_connected": true,
             "orchestrator_connected": false,
             "dist_sync_ready": dist_sync_ready,
@@ -7537,6 +7549,7 @@ fn add_hive_flow(
         "restrict_ssh": restrict_ssh_applied,
         "restrict_ssh_requested": restrict_ssh,
         "require_dist_sync": require_dist_sync,
+        "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
         "wan_connected": true,
         "orchestrator_connected": true,
         "dist_sync_ready": dist_sync_ready,
@@ -7652,6 +7665,23 @@ fn resolve_add_hive_require_dist_sync(payload: &serde_json::Value) -> bool {
         }
     }
     false
+}
+
+fn resolve_add_hive_dist_sync_probe_timeout_secs(payload: &serde_json::Value) -> u64 {
+    let from_payload = payload
+        .get("dist_sync_probe_timeout_secs")
+        .or_else(|| payload.get("dist_sync_timeout_secs"))
+        .and_then(|value| value.as_u64());
+    let from_env = std::env::var("FLUXBEE_ADD_HIVE_DIST_SYNC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .or_else(|| {
+            std::env::var("JSR_ADD_HIVE_DIST_SYNC_TIMEOUT_SECS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+        });
+    let raw = from_payload.or(from_env).unwrap_or(DIST_SYNC_PROBE_TIMEOUT_SECS);
+    raw.clamp(5, 600)
 }
 
 fn resolve_add_hive_authkey_source_patterns(address: &str) -> Vec<String> {
