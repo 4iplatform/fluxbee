@@ -7010,7 +7010,7 @@ fn add_hive_flow(
                 "message": format!("enable {name}: {err}"),
             });
         }
-        let service_cmd = if *name == "sy-orchestrator" {
+        let service_inner = if *name == "sy-orchestrator" {
             format!(
                 "systemctl start {name} || (systemctl reset-failed {name} || true; sleep 1; systemctl start {name})"
             )
@@ -7019,10 +7019,11 @@ fn add_hive_flow(
                 "systemctl restart {name} || (systemctl reset-failed {name} || true; sleep 1; systemctl start {name})"
             )
         };
+        let service_cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&service_inner)));
         if let Err(err) = ssh_with_key(
             address,
             &key_path,
-            &sudo_wrap(&service_cmd),
+            &service_cmd,
             BOOTSTRAP_SSH_USER,
         ) {
             return serde_json::json!({
