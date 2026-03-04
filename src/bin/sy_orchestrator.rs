@@ -47,6 +47,8 @@ const SYNCTHING_SYNC_PORT_UDP: u16 = 22000;
 const SYNCTHING_DISCOVERY_PORT_UDP: u16 = 21027;
 const DIST_SYNC_PROBE_TIMEOUT_SECS: u64 = 45;
 const REMOVE_HIVE_SOCKET_CLEANUP_TIMEOUT_SECS: u64 = 8;
+const SSH_HARDEN_VERIFY_RETRIES: usize = 6;
+const SSH_HARDEN_VERIFY_DELAY_MS: u64 = 1000;
 const SYNCTHING_FOLDER_BLOB_ID: &str = "fluxbee-blob";
 const SYNCTHING_FOLDER_DIST_ID: &str = "fluxbee-dist";
 const SYNCTHING_INSTALL_DIR: &str = "/var/lib/fluxbee/vendor/bin";
@@ -6921,6 +6923,13 @@ fn add_hive_flow(
                 "message": err.to_string(),
             });
         }
+        if let Err(err) = verify_remote_ssh_hardening_with_access(address, &key_path) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_HARDEN_FAILED",
+                "message": err.to_string(),
+            });
+        }
     }
 
     let core_manifest = match load_core_manifest() {
@@ -7650,6 +7659,79 @@ fn disable_remote_password_auth(address: &str) -> Result<(), OrchestratorError> 
     let restart_ssh_cmd = r#"bash -lc "systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart""#;
     ssh_with_pass(address, &sudo_wrap(restart_ssh_cmd), BOOTSTRAP_SSH_USER)?;
     Ok(())
+}
+
+fn verify_remote_ssh_hardening_with_access(
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    verify_remote_key_access_after_hardening(address, key_path)?;
+    verify_remote_password_auth_is_rejected(address)?;
+    Ok(())
+}
+
+fn verify_remote_key_access_after_hardening(
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    let cmd = "sudo -n /bin/bash -lc 'exit 0'";
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=SSH_HARDEN_VERIFY_RETRIES {
+        match ssh_with_key(address, key_path, cmd, BOOTSTRAP_SSH_USER) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err.to_string());
+                if attempt < SSH_HARDEN_VERIFY_RETRIES {
+                    std::thread::sleep(Duration::from_millis(SSH_HARDEN_VERIFY_DELAY_MS));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "post-harden key verification failed (sudo -n not reachable after {} attempts): {}",
+        SSH_HARDEN_VERIFY_RETRIES,
+        last_err.unwrap_or_else(|| "unknown error".to_string())
+    )
+    .into())
+}
+
+fn verify_remote_password_auth_is_rejected(address: &str) -> Result<(), OrchestratorError> {
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=SSH_HARDEN_VERIFY_RETRIES {
+        match ssh_with_pass(address, "true", BOOTSTRAP_SSH_USER) {
+            Ok(()) => {
+                return Err(
+                    "password authentication still accepted after hardening; expected rejection"
+                        .into(),
+                )
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                if is_password_auth_rejection_error(&msg) {
+                    return Ok(());
+                }
+                last_err = Some(msg);
+                if attempt < SSH_HARDEN_VERIFY_RETRIES {
+                    std::thread::sleep(Duration::from_millis(SSH_HARDEN_VERIFY_DELAY_MS));
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "password-auth rejection verification failed after {} attempts: {}",
+        SSH_HARDEN_VERIFY_RETRIES,
+        last_err.unwrap_or_else(|| "unknown error".to_string())
+    )
+    .into())
+}
+
+fn is_password_auth_rejection_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("permission denied")
+        || lower.contains("no supported authentication methods available")
+        || lower.contains("authentications that can continue")
+        || lower.contains("(publickey")
 }
 
 fn remote_ssh_gate_script_contents() -> &'static str {

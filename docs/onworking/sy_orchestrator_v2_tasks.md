@@ -131,11 +131,12 @@ Salida:
 - [x] V7.3 Integrar `dist` en `hive.yaml` generado por add_hive.
 - [x] V7.4 Verificar que add_hive deja worker con dist sincronizando antes de primer update.
 - [x] V7.5 Cerrar SSH post-bootstrap segun politica final del equipo (cerrado o restringido).
-- [ ] V7.6 Cambiar `remove_hive` a estrategia socket-first: pedir cleanup al `SY.orchestrator@worker` por mensaje system y usar SSH solo como fallback tecnico.
-- [ ] V7.7 Endurecer modo `harden_ssh=true` con verificacion estricta post-bootstrap (password login efectivamente bloqueado y key operativa para canal de mantenimiento).
+- [x] V7.6 Cambiar `remove_hive` a estrategia socket-first: pedir cleanup al `SY.orchestrator@worker` por mensaje system y usar SSH solo como fallback tecnico.
+- [x] V7.7 Endurecer modo `harden_ssh=true` con verificacion estricta post-bootstrap (password login efectivamente bloqueado y key operativa para canal de mantenimiento).
 - [ ] V7.8 Normalizar contrato de `remove_hive` para distinguir claramente `remote_cleanup=socket_ok/socket_timeout/ssh_fallback_ok/ssh_fallback_failed/local_only`.
 
 Nota (2026-03-04): `sy_orchestrator` y `install.sh` ya priorizan layout `dist/` para runtime/core/vendor con fallback legacy (`/var/lib/fluxbee/{runtimes,core,vendor}`), `add_hive` genera bloque `dist` en `hive.yaml` worker, la reconciliación de `config.xml` Syncthing asegura folders separados `fluxbee-blob` + `fluxbee-dist` (local/worker, con restart condicional solo si cambia config), `add_hive` ejecuta probe explícito de sincronización dist: por defecto es no estricto (si no converge, continúa con `dist_sync_ready=false`), y en modo estricto (`require_dist_sync=true`) devuelve `DIST_SYNC_TIMEOUT`. Además aplica hardening SSH post-bootstrap en modo restringido por defecto (gate + authorized_keys con `from=` y comando forzado; opt-out explícito con `restrict_ssh=false` o env `FLUXBEE_ADD_HIVE_RESTRICT_SSH=0`).
+Nota (2026-03-04): `remove_hive` ahora ejecuta cleanup remoto por socket (`REMOVE_HIVE_CLEANUP`) con timeout corto y fallback SSH best-effort; la respuesta incluye `remote_cleanup_via` para diagnóstico (`socket`/`ssh_fallback`/`local_only`). `harden_ssh=true` incluye verificación estricta post-bootstrap: la key debe seguir operativa con `sudo -n` y el login por password debe quedar rechazado.
 
 Salida:
 
