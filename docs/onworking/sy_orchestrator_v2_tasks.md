@@ -132,7 +132,7 @@ Salida:
 - [x] V7.4 Verificar que add_hive deja worker con dist sincronizando antes de primer update.
 - [x] V7.5 Cerrar SSH post-bootstrap segun politica final del equipo (cerrado o restringido).
 
-Nota (2026-03-03): `sy_orchestrator` y `install.sh` ya priorizan layout `dist/` para runtime/core/vendor con fallback legacy (`/var/lib/fluxbee/{runtimes,core,vendor}`), `add_hive` genera bloque `dist` en `hive.yaml` worker, la reconciliación de `config.xml` Syncthing asegura folders separados `fluxbee-blob` + `fluxbee-dist` (local/worker, con restart condicional solo si cambia config), `add_hive` ejecuta probe explícito de sincronización (`DIST_SYNC_TIMEOUT` si no converge) y aplica hardening SSH post-bootstrap en modo restringido por defecto (gate + authorized_keys con `from=` y comando forzado; opt-out explícito con `restrict_ssh=false` o env `FLUXBEE_ADD_HIVE_RESTRICT_SSH=0`).
+Nota (2026-03-04): `sy_orchestrator` y `install.sh` ya priorizan layout `dist/` para runtime/core/vendor con fallback legacy (`/var/lib/fluxbee/{runtimes,core,vendor}`), `add_hive` genera bloque `dist` en `hive.yaml` worker, la reconciliación de `config.xml` Syncthing asegura folders separados `fluxbee-blob` + `fluxbee-dist` (local/worker, con restart condicional solo si cambia config), `add_hive` ejecuta probe explícito de sincronización dist: por defecto es no estricto (si no converge, continúa con `dist_sync_ready=false`), y en modo estricto (`require_dist_sync=true`) devuelve `DIST_SYNC_TIMEOUT`. Además aplica hardening SSH post-bootstrap en modo restringido por defecto (gate + authorized_keys con `from=` y comando forzado; opt-out explícito con `restrict_ssh=false` o env `FLUXBEE_ADD_HIVE_RESTRICT_SSH=0`).
 
 Salida:
 

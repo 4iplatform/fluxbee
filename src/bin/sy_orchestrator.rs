@@ -1035,7 +1035,15 @@ async fn handle_admin(
                 let address = address.unwrap_or_default();
                 let harden_ssh = resolve_add_hive_harden_ssh(&msg.payload);
                 let restrict_ssh = resolve_add_hive_restrict_ssh(&msg.payload, harden_ssh);
-                add_hive_flow(state, &hive_id, &address, harden_ssh, restrict_ssh)
+                let require_dist_sync = resolve_add_hive_require_dist_sync(&msg.payload);
+                add_hive_flow(
+                    state,
+                    &hive_id,
+                    &address,
+                    harden_ssh,
+                    restrict_ssh,
+                    require_dist_sync,
+                )
             } else {
                 serde_json::json!({
                     "status": "error",
@@ -6604,6 +6612,7 @@ fn add_hive_flow(
     address: &str,
     harden_ssh: bool,
     restrict_ssh: bool,
+    require_dist_sync: bool,
 ) -> serde_json::Value {
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
@@ -7097,44 +7106,56 @@ fn add_hive_flow(
                 "message": reason,
             });
         }
-        if let Err(err) =
-            verify_remote_dist_sync_ready_with_access(address, &key_path, &desired_dist)
-        {
-            let reason = format!("dist sync readiness probe failed: {err}");
-            let entry = DeploymentHistoryEntry {
-                deployment_id: Uuid::new_v4().to_string(),
-                category: "vendor".to_string(),
-                trigger: "add_hive".to_string(),
-                actor: default_deployment_actor(state),
-                started_at: vendor_started_at,
-                finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
-                manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
-                manifest_hash: local_vendor_hash.clone(),
-                target_hives: vec![hive_id.to_string()],
-                result: "error".to_string(),
-                workers: vec![DeploymentWorkerOutcome {
-                    hive_id: hive_id.to_string(),
-                    status: "error".to_string(),
-                    reason: Some(reason.clone()),
-                    duration_ms: vendor_started.elapsed().as_millis() as u64,
-                    local_hash: local_vendor_hash.clone(),
-                    remote_hash_before: remote_vendor_hash_before.clone(),
-                    remote_hash_after: None,
-                }],
-            };
-            if let Err(history_err) = append_deployment_history(&entry) {
-                tracing::warn!(
-                    error = %history_err,
-                    "failed to persist add_hive dist sync readiness failure"
-                );
+        match verify_remote_dist_sync_ready_with_access(address, &key_path, &desired_dist) {
+            Ok(()) => {
+                dist_sync_ready = true;
             }
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "DIST_SYNC_TIMEOUT",
-                "message": reason,
-            });
+            Err(err) => {
+                let reason = format!("dist sync readiness probe failed: {err}");
+                let strict_status = if require_dist_sync { "error" } else { "warning" };
+                let entry = DeploymentHistoryEntry {
+                    deployment_id: Uuid::new_v4().to_string(),
+                    category: "vendor".to_string(),
+                    trigger: "add_hive".to_string(),
+                    actor: default_deployment_actor(state),
+                    started_at: vendor_started_at,
+                    finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
+                    manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
+                    manifest_hash: local_vendor_hash.clone(),
+                    target_hives: vec![hive_id.to_string()],
+                    result: strict_status.to_string(),
+                    workers: vec![DeploymentWorkerOutcome {
+                        hive_id: hive_id.to_string(),
+                        status: strict_status.to_string(),
+                        reason: Some(reason.clone()),
+                        duration_ms: vendor_started.elapsed().as_millis() as u64,
+                        local_hash: local_vendor_hash.clone(),
+                        remote_hash_before: remote_vendor_hash_before.clone(),
+                        remote_hash_after: None,
+                    }],
+                };
+                if let Err(history_err) = append_deployment_history(&entry) {
+                    tracing::warn!(
+                        error = %history_err,
+                        "failed to persist add_hive dist sync readiness failure"
+                    );
+                }
+                if require_dist_sync {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "DIST_SYNC_TIMEOUT",
+                        "message": reason,
+                    });
+                }
+                tracing::warn!(
+                    hive_id = hive_id,
+                    address = address,
+                    error = %err,
+                    "dist sync readiness probe did not converge during add_hive; continuing in non-strict mode"
+                );
+                dist_sync_ready = false;
+            }
         }
-        dist_sync_ready = true;
         let remote_vendor_hash_after = remote_syncthing_installed_hash(address, &key_path)
             .ok()
             .flatten();
@@ -7213,6 +7234,7 @@ fn add_hive_flow(
             "address": address,
             "harden_ssh": harden_ssh,
             "restrict_ssh": restrict_ssh,
+            "require_dist_sync": require_dist_sync,
             "wan_connected": false,
             "dist_sync_ready": dist_sync_ready,
         });
@@ -7232,6 +7254,7 @@ fn add_hive_flow(
             "address": address,
             "harden_ssh": harden_ssh,
             "restrict_ssh": restrict_ssh,
+            "require_dist_sync": require_dist_sync,
             "wan_connected": true,
             "orchestrator_connected": false,
             "dist_sync_ready": dist_sync_ready,
@@ -7244,6 +7267,7 @@ fn add_hive_flow(
         "address": address,
         "harden_ssh": harden_ssh,
         "restrict_ssh": restrict_ssh,
+        "require_dist_sync": require_dist_sync,
         "wan_connected": true,
         "orchestrator_connected": true,
         "dist_sync_ready": dist_sync_ready,
@@ -7342,6 +7366,23 @@ fn resolve_add_hive_restrict_ssh(payload: &serde_json::Value, harden_ssh: bool) 
         return false;
     }
     true
+}
+
+fn resolve_add_hive_require_dist_sync(payload: &serde_json::Value) -> bool {
+    if let Some(value) = payload.get("require_dist_sync").and_then(parse_bool_value) {
+        return value;
+    }
+    if let Ok(raw) = std::env::var("FLUXBEE_ADD_HIVE_REQUIRE_DIST_SYNC") {
+        if let Some(value) = parse_bool_str(&raw) {
+            return value;
+        }
+    }
+    if let Ok(raw) = std::env::var("JSR_ADD_HIVE_REQUIRE_DIST_SYNC") {
+        if let Some(value) = parse_bool_str(&raw) {
+            return value;
+        }
+    }
+    false
 }
 
 fn resolve_add_hive_authkey_source_patterns(address: &str) -> Vec<String> {
