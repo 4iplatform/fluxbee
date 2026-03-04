@@ -2654,6 +2654,212 @@ fn reconcile_syncthing_folders_xml(
     Ok((updated, changed_folders))
 }
 
+fn syncthing_config_without_folders(config_xml: &str) -> Result<String, OrchestratorError> {
+    let folder_re = Regex::new(r#"(?s)<folder\b[^>]*>.*?</folder>"#)?;
+    Ok(folder_re.replace_all(config_xml, "").into_owned())
+}
+
+fn is_valid_syncthing_device_id(value: &str) -> bool {
+    let id = value.trim();
+    !id.is_empty()
+        && id.contains('-')
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-')
+}
+
+fn extract_primary_syncthing_device_id(config_xml: &str) -> Result<String, OrchestratorError> {
+    let stripped = syncthing_config_without_folders(config_xml)?;
+    let device_re = Regex::new(r#"<device\b[^>]*\bid="([^"]+)""#)?;
+    for caps in device_re.captures_iter(&stripped) {
+        let Some(found) = caps.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        if is_valid_syncthing_device_id(found) {
+            return Ok(found.to_string());
+        }
+    }
+    Err("syncthing config has no valid top-level device id".into())
+}
+
+fn ensure_syncthing_top_level_peer_device(
+    config_xml: &str,
+    peer_device_id: &str,
+    peer_name: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let stripped = syncthing_config_without_folders(config_xml)?;
+    let peer_re = Regex::new(&format!(
+        r#"<device\b[^>]*\bid="{}""#,
+        regex::escape(peer_device_id)
+    ))?;
+    if peer_re.is_match(&stripped) {
+        return Ok((config_xml.to_string(), false));
+    }
+    let peer_block = format!(
+        "  <device id=\"{}\" name=\"{}\" compression=\"metadata\" introducer=\"false\" skipIntroductionRemovals=\"false\" introducedBy=\"\">\n    <address>dynamic</address>\n    <paused>false</paused>\n    <autoAcceptFolders>false</autoAcceptFolders>\n  </device>\n",
+        xml_escape_attr(peer_device_id),
+        xml_escape_attr(peer_name)
+    );
+    let insert_at = config_xml
+        .rfind("</configuration>")
+        .unwrap_or(config_xml.len());
+    let mut out = String::with_capacity(config_xml.len() + peer_block.len() + 2);
+    out.push_str(&config_xml[..insert_at]);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&peer_block);
+    out.push_str(&config_xml[insert_at..]);
+    Ok((out, true))
+}
+
+fn ensure_syncthing_folder_has_device_ref(
+    config_xml: &str,
+    folder_id: &str,
+    device_id: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let folder_re = Regex::new(r#"(?s)<folder\b[^>]*\bid="([^"]+)"[^>]*>.*?</folder>"#)?;
+    for caps in folder_re.captures_iter(config_xml) {
+        let Some(found_id) = caps.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        if found_id != folder_id {
+            continue;
+        }
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        let mut rewritten = full.as_str().to_string();
+        let device_re = Regex::new(&format!(
+            r#"<device\b[^>]*\bid="{}""#,
+            regex::escape(device_id)
+        ))?;
+        if device_re.is_match(&rewritten) {
+            return Ok((config_xml.to_string(), false));
+        }
+        let entry = format!(
+            "    <device id=\"{}\" introducedBy=\"\"/>\n",
+            xml_escape_attr(device_id)
+        );
+        if let Some(pos) = rewritten.find("<minDiskFree") {
+            rewritten.insert_str(pos, &entry);
+        } else if let Some(pos) = rewritten.rfind("</folder>") {
+            rewritten.insert_str(pos, &entry);
+        } else {
+            return Err("invalid syncthing folder block while inserting device ref".into());
+        }
+        let mut out =
+            String::with_capacity(config_xml.len() + rewritten.len().saturating_sub(full.len()));
+        out.push_str(&config_xml[..full.start()]);
+        out.push_str(&rewritten);
+        out.push_str(&config_xml[full.end()..]);
+        return Ok((out, true));
+    }
+    Ok((config_xml.to_string(), false))
+}
+
+fn reconcile_syncthing_peer_config_xml(
+    config_xml: &str,
+    local_device_id: &str,
+    peer_device_id: &str,
+    peer_name: &str,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) -> Result<(String, bool), OrchestratorError> {
+    let mut updated = config_xml.to_string();
+    let mut changed = false;
+
+    let (next, peer_changed) =
+        ensure_syncthing_top_level_peer_device(&updated, peer_device_id, peer_name)?;
+    updated = next;
+    changed |= peer_changed;
+
+    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        for device_id in [local_device_id, peer_device_id] {
+            let (next_cfg, folder_changed) =
+                ensure_syncthing_folder_has_device_ref(&updated, SYNCTHING_FOLDER_BLOB_ID, device_id)?;
+            updated = next_cfg;
+            changed |= folder_changed;
+        }
+    }
+    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        for device_id in [local_device_id, peer_device_id] {
+            let (next_cfg, folder_changed) =
+                ensure_syncthing_folder_has_device_ref(&updated, SYNCTHING_FOLDER_DIST_ID, device_id)?;
+            updated = next_cfg;
+            changed |= folder_changed;
+        }
+    }
+
+    Ok((updated, changed))
+}
+
+fn ensure_syncthing_peer_pairing_with_access(
+    local_hive_id: &str,
+    remote_hive_id: &str,
+    address: &str,
+    key_path: &Path,
+    sync: &BlobRuntimeConfig,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) -> Result<(), OrchestratorError> {
+    let local_cfg_path = sync.sync_data_dir.join("config.xml");
+    let local_current = fs::read_to_string(&local_cfg_path)?;
+
+    let remote_cfg_path = format!("{}/config.xml", sync.sync_data_dir.display());
+    let remote_read_cmd = format!("cat '{}'", shell_single_quote(&remote_cfg_path));
+    let remote_current = ssh_with_key_output(
+        address,
+        key_path,
+        &sudo_wrap(&remote_read_cmd),
+        BOOTSTRAP_SSH_USER,
+    )?;
+
+    let local_device_id = extract_primary_syncthing_device_id(&local_current)?;
+    let remote_device_id = extract_primary_syncthing_device_id(&remote_current)?;
+
+    let (local_updated, local_changed) = reconcile_syncthing_peer_config_xml(
+        &local_current,
+        &local_device_id,
+        &remote_device_id,
+        remote_hive_id,
+        blob,
+        dist,
+    )?;
+    let (remote_updated, remote_changed) = reconcile_syncthing_peer_config_xml(
+        &remote_current,
+        &remote_device_id,
+        &local_device_id,
+        local_hive_id,
+        blob,
+        dist,
+    )?;
+
+    if local_changed {
+        fs::write(&local_cfg_path, &local_updated)?;
+        let mut restart = Command::new("systemctl");
+        restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
+        run_cmd(restart, "systemctl restart local syncthing (pairing)")?;
+    }
+    if remote_changed {
+        write_remote_file(address, key_path, &remote_cfg_path, &remote_updated)?;
+        ssh_with_key(
+            address,
+            key_path,
+            &sudo_wrap(&format!("systemctl restart {SYNCTHING_SERVICE_NAME}")),
+            BOOTSTRAP_SSH_USER,
+        )?;
+        remote_wait_service_active(
+            address,
+            key_path,
+            SYNCTHING_SERVICE_NAME,
+            SYNCTHING_BOOTSTRAP_TIMEOUT_SECS,
+        )?;
+    }
+
+    Ok(())
+}
+
 fn reconcile_local_syncthing_folders(
     sync: &BlobRuntimeConfig,
     blob: &BlobRuntimeConfig,
@@ -7370,6 +7576,50 @@ fn add_hive_flow(
             };
             if let Err(history_err) = append_deployment_history(&entry) {
                 tracing::warn!(error = %history_err, "failed to persist add_hive vendor deployment history");
+            }
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SYNC_SETUP_FAILED",
+                "message": reason,
+            });
+        }
+        if let Err(err) = ensure_syncthing_peer_pairing_with_access(
+            &state.hive_id,
+            hive_id,
+            address,
+            &key_path,
+            &desired_sync,
+            &desired_blob,
+            &desired_dist,
+        ) {
+            let rollback_note = attempt_remote_syncthing_rollback_note(address, &key_path);
+            let reason = format!("syncthing peer pairing failed: {err}; {rollback_note}");
+            let entry = DeploymentHistoryEntry {
+                deployment_id: Uuid::new_v4().to_string(),
+                category: "vendor".to_string(),
+                trigger: "add_hive".to_string(),
+                actor: default_deployment_actor(state),
+                started_at: vendor_started_at,
+                finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
+                manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
+                manifest_hash: local_vendor_hash.clone(),
+                target_hives: vec![hive_id.to_string()],
+                result: "error".to_string(),
+                workers: vec![DeploymentWorkerOutcome {
+                    hive_id: hive_id.to_string(),
+                    status: "error".to_string(),
+                    reason: Some(reason.clone()),
+                    duration_ms: vendor_started.elapsed().as_millis() as u64,
+                    local_hash: local_vendor_hash.clone(),
+                    remote_hash_before: remote_vendor_hash_before.clone(),
+                    remote_hash_after: None,
+                }],
+            };
+            if let Err(history_err) = append_deployment_history(&entry) {
+                tracing::warn!(
+                    error = %history_err,
+                    "failed to persist add_hive vendor pairing history"
+                );
             }
             return serde_json::json!({
                 "status": "error",
