@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
@@ -44,6 +45,7 @@ const SYNCTHING_INSTALL_USER: &str = "fluxbee";
 const SYNCTHING_SYNC_PORT_TCP: u16 = 22000;
 const SYNCTHING_SYNC_PORT_UDP: u16 = 22000;
 const SYNCTHING_DISCOVERY_PORT_UDP: u16 = 21027;
+const DIST_SYNC_PROBE_TIMEOUT_SECS: u64 = 45;
 const SYNCTHING_FOLDER_BLOB_ID: &str = "fluxbee-blob";
 const SYNCTHING_FOLDER_DIST_ID: &str = "fluxbee-dist";
 const SYNCTHING_INSTALL_DIR: &str = "/var/lib/fluxbee/vendor/bin";
@@ -492,7 +494,7 @@ async fn bootstrap_local(
     .await?;
     let startup_sync = effective_syncthing_runtime_config(&state.blob, &state.dist);
     if startup_sync.sync_enabled {
-        if let Err(err) = ensure_blob_sync_runtime(&startup_sync).await {
+        if let Err(err) = ensure_blob_sync_runtime(&state.blob, &state.dist).await {
             tracing::warn!(
                 error = %err,
                 "blob sync runtime bootstrap failed; continuing startup and relying on watchdog retries"
@@ -1032,7 +1034,8 @@ async fn handle_admin(
             if let Some(hive_id) = hive_id {
                 let address = address.unwrap_or_default();
                 let harden_ssh = resolve_add_hive_harden_ssh(&msg.payload);
-                add_hive_flow(state, &hive_id, &address, harden_ssh)
+                let restrict_ssh = resolve_add_hive_restrict_ssh(&msg.payload);
+                add_hive_flow(state, &hive_id, &address, harden_ssh, restrict_ssh)
             } else {
                 serde_json::json!({
                     "status": "error",
@@ -1589,7 +1592,7 @@ async fn apply_system_update_local(
                 && (blob_sync_tool_is_syncthing(&desired_sync)
                     || dist_sync_tool_is_syncthing(&desired_dist))
             {
-                ensure_blob_sync_runtime(&desired_sync).await?;
+                ensure_blob_sync_runtime(&desired_blob, &desired_dist).await?;
                 Ok(SystemUpdateApplyResult {
                     status: "ok".to_string(),
                     updated: Vec::new(),
@@ -2417,20 +2420,211 @@ async fn wait_for_syncthing_health(blob: &BlobRuntimeConfig) -> Result<(), Orche
     }
 }
 
-async fn ensure_blob_sync_runtime(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {
-    if !blob.sync_enabled {
+fn xml_escape_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn set_xml_attr(start_tag: &str, attr: &str, value: &str) -> Result<String, OrchestratorError> {
+    let attr_re = Regex::new(&format!(r#"\b{}="[^"]*""#, regex::escape(attr)))?;
+    let replacement = format!(r#"{attr}="{value}""#);
+    if attr_re.is_match(start_tag) {
+        return Ok(attr_re
+            .replace(start_tag, replacement.as_str())
+            .into_owned());
+    }
+    let Some(insert_at) = start_tag.rfind('>') else {
+        return Err(format!("invalid xml tag (missing '>'): {start_tag}").into());
+    };
+    let mut updated = String::with_capacity(start_tag.len() + replacement.len() + 2);
+    updated.push_str(&start_tag[..insert_at]);
+    updated.push(' ');
+    updated.push_str(&replacement);
+    updated.push_str(&start_tag[insert_at..]);
+    Ok(updated)
+}
+
+fn rewrite_syncthing_folder_block(
+    block: &str,
+    folder_id: &str,
+    folder_path: &str,
+    folder_label: &str,
+) -> Result<String, OrchestratorError> {
+    let Some(tag_end) = block.find('>') else {
+        return Err("invalid syncthing folder block".into());
+    };
+    let start_tag = &block[..=tag_end];
+    let body = &block[tag_end + 1..];
+    let mut updated_tag = start_tag.to_string();
+    updated_tag = set_xml_attr(&updated_tag, "id", &xml_escape_attr(folder_id))?;
+    updated_tag = set_xml_attr(&updated_tag, "path", &xml_escape_attr(folder_path))?;
+    updated_tag = set_xml_attr(&updated_tag, "label", &xml_escape_attr(folder_label))?;
+    if !updated_tag.contains(" type=") {
+        updated_tag = set_xml_attr(&updated_tag, "type", "sendreceive")?;
+    }
+    Ok(format!("{updated_tag}{body}"))
+}
+
+fn minimal_syncthing_folder_block(
+    config_xml: &str,
+    folder_id: &str,
+    folder_path: &str,
+    folder_label: &str,
+) -> Result<String, OrchestratorError> {
+    let device_re = Regex::new(r#"<device\b[^>]*\bid="([^"]+)""#)?;
+    let Some(caps) = device_re.captures(config_xml) else {
+        return Err("syncthing config has no device id to seed folder".into());
+    };
+    let Some(device_id) = caps.get(1).map(|m| m.as_str()) else {
+        return Err("syncthing config has malformed device id".into());
+    };
+    Ok(format!(
+        "<folder id=\"{}\" label=\"{}\" path=\"{}\" type=\"sendreceive\" rescanIntervalS=\"3600\" fsWatcherEnabled=\"true\" fsWatcherDelayS=\"10\" ignorePerms=\"false\" autoNormalize=\"true\">\n    <filesystemType>basic</filesystemType>\n    <device id=\"{}\" introducedBy=\"\"/>\n    <minDiskFree unit=\"%\">1</minDiskFree>\n  </folder>",
+        xml_escape_attr(folder_id),
+        xml_escape_attr(folder_label),
+        xml_escape_attr(folder_path),
+        xml_escape_attr(device_id)
+    ))
+}
+
+fn ensure_syncthing_folder_in_config_xml(
+    config_xml: &str,
+    folder_id: &str,
+    folder_path: &str,
+    folder_label: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let folder_re = Regex::new(r#"(?s)<folder\b[^>]*\bid="([^"]+)"[^>]*>.*?</folder>"#)?;
+
+    for caps in folder_re.captures_iter(config_xml) {
+        let Some(found_id) = caps.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        if found_id != folder_id {
+            continue;
+        }
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        let rewritten =
+            rewrite_syncthing_folder_block(full.as_str(), folder_id, folder_path, folder_label)?;
+        if rewritten == full.as_str() {
+            return Ok((config_xml.to_string(), false));
+        }
+        let mut out =
+            String::with_capacity(config_xml.len() + rewritten.len().saturating_sub(full.len()));
+        out.push_str(&config_xml[..full.start()]);
+        out.push_str(&rewritten);
+        out.push_str(&config_xml[full.end()..]);
+        return Ok((out, true));
+    }
+
+    let mut template_block: Option<String> = None;
+    for caps in folder_re.captures_iter(config_xml) {
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        if template_block.is_none() {
+            template_block = Some(full.as_str().to_string());
+        }
+        if caps.get(1).map(|m| m.as_str()) == Some("default") {
+            template_block = Some(full.as_str().to_string());
+            break;
+        }
+    }
+
+    let new_block = if let Some(template) = template_block {
+        rewrite_syncthing_folder_block(&template, folder_id, folder_path, folder_label)?
+    } else {
+        minimal_syncthing_folder_block(config_xml, folder_id, folder_path, folder_label)?
+    };
+
+    let insert_at = config_xml
+        .rfind("</configuration>")
+        .unwrap_or(config_xml.len());
+    let mut out = String::with_capacity(config_xml.len() + new_block.len() + 8);
+    out.push_str(&config_xml[..insert_at]);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("  ");
+    out.push_str(&new_block);
+    out.push('\n');
+    out.push_str(&config_xml[insert_at..]);
+    Ok((out, true))
+}
+
+fn reconcile_syncthing_folders_xml(
+    config_xml: &str,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) -> Result<(String, Vec<String>), OrchestratorError> {
+    let mut updated = config_xml.to_string();
+    let mut changed_folders = Vec::new();
+
+    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        let (next, changed) = ensure_syncthing_folder_in_config_xml(
+            &updated,
+            SYNCTHING_FOLDER_BLOB_ID,
+            &blob.path.display().to_string(),
+            "Fluxbee Blob",
+        )?;
+        if changed {
+            changed_folders.push(SYNCTHING_FOLDER_BLOB_ID.to_string());
+        }
+        updated = next;
+    }
+
+    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        let (next, changed) = ensure_syncthing_folder_in_config_xml(
+            &updated,
+            SYNCTHING_FOLDER_DIST_ID,
+            &dist.path.display().to_string(),
+            "Fluxbee Dist",
+        )?;
+        if changed {
+            changed_folders.push(SYNCTHING_FOLDER_DIST_ID.to_string());
+        }
+        updated = next;
+    }
+
+    Ok((updated, changed_folders))
+}
+
+fn reconcile_local_syncthing_folders(
+    sync: &BlobRuntimeConfig,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) -> Result<Vec<String>, OrchestratorError> {
+    let config_path = sync.sync_data_dir.join("config.xml");
+    let current = fs::read_to_string(&config_path)?;
+    let (updated, changed_folders) = reconcile_syncthing_folders_xml(&current, blob, dist)?;
+    if !changed_folders.is_empty() {
+        fs::write(&config_path, updated)?;
+    }
+    Ok(changed_folders)
+}
+
+async fn ensure_blob_sync_runtime(
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) -> Result<(), OrchestratorError> {
+    let sync = effective_syncthing_runtime_config(blob, dist);
+    if !sync.sync_enabled {
         return Ok(());
     }
-    if !blob_sync_tool_is_syncthing(blob) {
+    if !(blob_sync_tool_is_syncthing(&sync) || dist_sync_tool_is_syncthing(dist)) {
         return Err(format!(
-            "unsupported blob.sync.tool '{}' (expected syncthing)",
-            blob.sync_tool
+            "unsupported sync.tool for blob/dist (blob='{}', dist='{}'; expected syncthing)",
+            blob.sync_tool, dist.sync_tool
         )
         .into());
     }
 
     ensure_syncthing_installed()?;
-    ensure_syncthing_unit(blob)?;
+    ensure_syncthing_unit(&sync)?;
     ensure_syncthing_firewall_local();
     tracing::info!(
         service = SYNCTHING_SERVICE_NAME,
@@ -2442,13 +2636,30 @@ async fn ensure_blob_sync_runtime(blob: &BlobRuntimeConfig) -> Result<(), Orches
         Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
     )
     .await?;
-    wait_for_syncthing_health(blob).await?;
+    wait_for_syncthing_health(&sync).await?;
+    let changed_folders = reconcile_local_syncthing_folders(&sync, blob, dist)?;
+    if !changed_folders.is_empty() {
+        tracing::info!(
+            service = SYNCTHING_SERVICE_NAME,
+            folders = ?changed_folders,
+            "syncthing folder config reconciled locally; restarting service"
+        );
+        let mut restart = Command::new("systemctl");
+        restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
+        run_cmd(restart, "systemctl restart")?;
+        wait_for_service_active(
+            SYNCTHING_SERVICE_NAME,
+            Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
+        )
+        .await?;
+        wait_for_syncthing_health(&sync).await?;
+    }
     tracing::info!(
         service = SYNCTHING_SERVICE_NAME,
-        api_port = blob.sync_api_port,
+        api_port = sync.sync_api_port,
         "blob sync service healthy"
     );
-    ensure_remote_blob_sync_all_hives(blob);
+    ensure_remote_blob_sync_all_hives(blob, dist);
     Ok(())
 }
 
@@ -2514,7 +2725,7 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
 
     if changed {
         tracing::info!("blob/dist sync config changed in hive.yaml; reconciling syncthing runtime");
-        ensure_blob_sync_runtime(&desired_sync).await?;
+        ensure_blob_sync_runtime(&desired_blob, &desired_dist).await?;
         return Ok(());
     }
 
@@ -2530,7 +2741,7 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         api_healthy = api_healthy,
         "syncthing unhealthy; restarting"
     );
-    ensure_blob_sync_runtime(&desired_sync).await?;
+    ensure_blob_sync_runtime(&desired_blob, &desired_dist).await?;
     Ok(())
 }
 
@@ -4291,9 +4502,13 @@ async fn vendor_sync_workers(
             });
             continue;
         }
-        if let Err(err) =
-            ensure_remote_syncthing_runtime_with_access(&address, &key_path, &desired_sync)
-        {
+        if let Err(err) = ensure_remote_syncthing_runtime_with_access(
+            &address,
+            &key_path,
+            &desired_sync,
+            &desired_blob,
+            &desired_dist,
+        ) {
             tracing::warn!(hive = %hive_id, error = %err, "vendor sync failed");
             let rollback_note = attempt_remote_syncthing_rollback_note(&address, &key_path);
             let reason = format!("vendor sync failed: {err}; {rollback_note}");
@@ -6125,7 +6340,9 @@ fn disable_remote_syncthing_firewall(
 fn ensure_remote_syncthing_runtime_with_access(
     address: &str,
     key_path: &Path,
+    sync: &BlobRuntimeConfig,
     blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
 ) -> Result<(), OrchestratorError> {
     let source = resolve_syncthing_vendor_source_path()?;
     let _ = local_syncthing_vendor_hash()?;
@@ -6169,8 +6386,9 @@ fn ensure_remote_syncthing_runtime_with_access(
     )?;
 
     let blob_path_q = shell_single_quote(&blob.path.display().to_string());
-    let sync_data_dir_q = shell_single_quote(&blob.sync_data_dir.display().to_string());
-    let mkdir_cmd = format!("mkdir -p '{blob_path_q}' '{sync_data_dir_q}'");
+    let dist_path_q = shell_single_quote(&dist.path.display().to_string());
+    let sync_data_dir_q = shell_single_quote(&sync.sync_data_dir.display().to_string());
+    let mkdir_cmd = format!("mkdir -p '{blob_path_q}' '{dist_path_q}' '{sync_data_dir_q}'");
     ssh_with_key(
         address,
         key_path,
@@ -6178,7 +6396,7 @@ fn ensure_remote_syncthing_runtime_with_access(
         BOOTSTRAP_SSH_USER,
     )?;
 
-    let remote_unit = syncthing_unit_contents(blob, "root");
+    let remote_unit = syncthing_unit_contents(sync, "root");
     write_remote_file(
         address,
         key_path,
@@ -6203,6 +6421,38 @@ fn ensure_remote_syncthing_runtime_with_access(
         &sudo_wrap(&format!("systemctl restart {SYNCTHING_SERVICE_NAME}")),
         BOOTSTRAP_SSH_USER,
     )?;
+    remote_wait_service_active(
+        address,
+        key_path,
+        SYNCTHING_SERVICE_NAME,
+        SYNCTHING_BOOTSTRAP_TIMEOUT_SECS,
+    )?;
+    let remote_config_path = format!("{}/config.xml", sync.sync_data_dir.display());
+    let read_cmd = format!("cat '{}'", shell_single_quote(&remote_config_path));
+    let remote_current =
+        ssh_with_key_output(address, key_path, &sudo_wrap(&read_cmd), BOOTSTRAP_SSH_USER)?;
+    let (remote_updated, changed_folders) =
+        reconcile_syncthing_folders_xml(&remote_current, blob, dist)?;
+    if !changed_folders.is_empty() {
+        tracing::info!(
+            address = %address,
+            folders = ?changed_folders,
+            "syncthing folder config reconciled on worker; restarting service"
+        );
+        write_remote_file(address, key_path, &remote_config_path, &remote_updated)?;
+        ssh_with_key(
+            address,
+            key_path,
+            &sudo_wrap(&format!("systemctl restart {SYNCTHING_SERVICE_NAME}")),
+            BOOTSTRAP_SSH_USER,
+        )?;
+        remote_wait_service_active(
+            address,
+            key_path,
+            SYNCTHING_SERVICE_NAME,
+            SYNCTHING_BOOTSTRAP_TIMEOUT_SECS,
+        )?;
+    }
     ensure_remote_syncthing_firewall(address, key_path)?;
     Ok(())
 }
@@ -6210,14 +6460,89 @@ fn ensure_remote_syncthing_runtime_with_access(
 fn ensure_remote_syncthing_runtime(
     hive_id: &str,
     blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
 ) -> Result<(), OrchestratorError> {
     let (address, key_path) = hive_access(hive_id)?;
-    ensure_remote_syncthing_runtime_with_access(&address, &key_path, blob)
+    let sync = effective_syncthing_runtime_config(blob, dist);
+    ensure_remote_syncthing_runtime_with_access(&address, &key_path, &sync, blob, dist)
 }
 
-fn ensure_remote_blob_sync_all_hives(blob: &BlobRuntimeConfig) {
+fn verify_remote_dist_sync_ready_with_access(
+    address: &str,
+    key_path: &Path,
+    dist: &DistRuntimeConfig,
+) -> Result<(), OrchestratorError> {
+    if !dist.sync_enabled || !dist_sync_tool_is_syncthing(dist) {
+        return Ok(());
+    }
+
+    fs::create_dir_all(&dist.path)?;
+    let probe_name = format!(
+        ".fluxbee-dist-sync-probe-{}-{}",
+        now_epoch_ms(),
+        Uuid::new_v4().simple()
+    );
+    let local_probe_path = dist.path.join(&probe_name);
+    let remote_probe_path = format!("{}/{}", dist.path.display(), probe_name);
+    let probe_content = format!("probe:{}:{}", now_epoch_ms(), Uuid::new_v4());
+    fs::write(&local_probe_path, &probe_content)?;
+
+    let read_remote_cmd = format!(
+        "bash -lc \"if [ -f '{path}' ]; then cat '{path}'; fi\"",
+        path = shell_single_quote(&remote_probe_path)
+    );
+
+    let started = Instant::now();
+    let timeout = Duration::from_secs(DIST_SYNC_PROBE_TIMEOUT_SECS);
+    let mut success = false;
+    let mut last_err: Option<String> = None;
+    while started.elapsed() < timeout {
+        match ssh_with_key_output(
+            address,
+            key_path,
+            &sudo_wrap(&read_remote_cmd),
+            BOOTSTRAP_SSH_USER,
+        ) {
+            Ok(out) => {
+                if out.trim() == probe_content {
+                    success = true;
+                    break;
+                }
+                last_err = Some("remote probe file not observed yet".to_string());
+            }
+            Err(err) => {
+                last_err = Some(err.to_string());
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    let _ = fs::remove_file(&local_probe_path);
+    let cleanup_remote_cmd = format!("rm -f '{}'", shell_single_quote(&remote_probe_path));
+    let _ = ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&cleanup_remote_cmd),
+        BOOTSTRAP_SSH_USER,
+    );
+
+    if success {
+        return Ok(());
+    }
+
+    Err(format!(
+        "dist sync probe timeout after {}s (target='{}', path='{}'): {}",
+        DIST_SYNC_PROBE_TIMEOUT_SECS,
+        address,
+        remote_probe_path,
+        last_err.unwrap_or_else(|| "no detail".to_string())
+    )
+    .into())
+}
+
+fn ensure_remote_blob_sync_all_hives(blob: &BlobRuntimeConfig, dist: &DistRuntimeConfig) {
     for hive_id in list_managed_hive_ids() {
-        if let Err(err) = ensure_remote_syncthing_runtime(&hive_id, blob) {
+        if let Err(err) = ensure_remote_syncthing_runtime(&hive_id, blob, dist) {
             tracing::warn!(
                 hive_id = hive_id,
                 error = %err,
@@ -6278,9 +6603,12 @@ fn add_hive_flow(
     hive_id: &str,
     address: &str,
     harden_ssh: bool,
+    restrict_ssh: bool,
 ) -> serde_json::Value {
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
+    let mut dist_sync_ready =
+        !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist);
     let root = hives_root();
     let hive_dir = root.join(hive_id);
     if hive_exists(&state.state_dir, hive_id) {
@@ -6406,17 +6734,64 @@ fn add_hive_flow(
         });
     }
 
-    // Insecure transitional mode: keep key unrestricted and skip gate enforcement.
-    tracing::warn!(
-        target = address,
-        "authorized_keys gate/restriction skipped (legacy insecure mode)"
-    );
-    if let Err(err) = ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SSH_KEY_FAILED",
-            "message": format!("key access verification failed after bootstrap seed: {err}"),
-        });
+    if restrict_ssh {
+        if let Err(err) = install_remote_ssh_gate_with_access(address, &key_path) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_KEY_FAILED",
+                "message": format!("failed to install remote ssh gate: {err}"),
+            });
+        }
+        let source_patterns = resolve_add_hive_authkey_source_patterns(address);
+        if source_patterns.is_empty() {
+            tracing::info!(
+                target = address,
+                "authorized_keys restriction applied (gate enabled, from filter disabled by policy)"
+            );
+        } else {
+            tracing::info!(
+                target = address,
+                from_patterns = ?source_patterns,
+                "authorized_keys restriction applied (gate enabled, from filter enabled by policy)"
+            );
+        }
+        if let Err(err) = apply_remote_restricted_authorized_key_with_access(
+            address,
+            &key_path,
+            &pub_key,
+            &source_patterns,
+        ) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_KEY_FAILED",
+                "message": format!("failed to apply restricted authorized_keys entry: {err}"),
+            });
+        }
+
+        if let Err(err) = ssh_with_key(
+            address,
+            &key_path,
+            "sudo -n /bin/bash -lc 'exit 0'",
+            BOOTSTRAP_SSH_USER,
+        ) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_KEY_FAILED",
+                "message": format!("key access verification failed after authorized_keys restriction: {err}"),
+            });
+        }
+    } else {
+        tracing::warn!(
+            target = address,
+            "authorized_keys gate/restriction skipped (legacy insecure mode)"
+        );
+        if let Err(err) = ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_KEY_FAILED",
+                "message": format!("key access verification failed after bootstrap seed: {err}"),
+            });
+        }
     }
 
     if harden_ssh {
@@ -6682,9 +7057,13 @@ fn add_hive_flow(
         let remote_vendor_hash_before = remote_syncthing_installed_hash(address, &key_path)
             .ok()
             .flatten();
-        if let Err(err) =
-            ensure_remote_syncthing_runtime_with_access(address, &key_path, &desired_sync)
-        {
+        if let Err(err) = ensure_remote_syncthing_runtime_with_access(
+            address,
+            &key_path,
+            &desired_sync,
+            &desired_blob,
+            &desired_dist,
+        ) {
             let rollback_note = attempt_remote_syncthing_rollback_note(address, &key_path);
             let reason = format!("syncthing setup failed: {err}; {rollback_note}");
             let entry = DeploymentHistoryEntry {
@@ -6717,6 +7096,44 @@ fn add_hive_flow(
                 "message": reason,
             });
         }
+        if let Err(err) =
+            verify_remote_dist_sync_ready_with_access(address, &key_path, &desired_dist)
+        {
+            let reason = format!("dist sync readiness probe failed: {err}");
+            let entry = DeploymentHistoryEntry {
+                deployment_id: Uuid::new_v4().to_string(),
+                category: "vendor".to_string(),
+                trigger: "add_hive".to_string(),
+                actor: default_deployment_actor(state),
+                started_at: vendor_started_at,
+                finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
+                manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
+                manifest_hash: local_vendor_hash.clone(),
+                target_hives: vec![hive_id.to_string()],
+                result: "error".to_string(),
+                workers: vec![DeploymentWorkerOutcome {
+                    hive_id: hive_id.to_string(),
+                    status: "error".to_string(),
+                    reason: Some(reason.clone()),
+                    duration_ms: vendor_started.elapsed().as_millis() as u64,
+                    local_hash: local_vendor_hash.clone(),
+                    remote_hash_before: remote_vendor_hash_before.clone(),
+                    remote_hash_after: None,
+                }],
+            };
+            if let Err(history_err) = append_deployment_history(&entry) {
+                tracing::warn!(
+                    error = %history_err,
+                    "failed to persist add_hive dist sync readiness failure"
+                );
+            }
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "DIST_SYNC_TIMEOUT",
+                "message": reason,
+            });
+        }
+        dist_sync_ready = true;
         let remote_vendor_hash_after = remote_syncthing_installed_hash(address, &key_path)
             .ok()
             .flatten();
@@ -6794,7 +7211,9 @@ fn add_hive_flow(
             "hive_id": hive_id,
             "address": address,
             "harden_ssh": harden_ssh,
+            "restrict_ssh": restrict_ssh,
             "wan_connected": false,
+            "dist_sync_ready": dist_sync_ready,
         });
     }
     if !orchestrator_connected {
@@ -6811,8 +7230,10 @@ fn add_hive_flow(
             "hive_id": hive_id,
             "address": address,
             "harden_ssh": harden_ssh,
+            "restrict_ssh": restrict_ssh,
             "wan_connected": true,
             "orchestrator_connected": false,
+            "dist_sync_ready": dist_sync_ready,
         });
     }
 
@@ -6821,8 +7242,10 @@ fn add_hive_flow(
         "hive_id": hive_id,
         "address": address,
         "harden_ssh": harden_ssh,
+        "restrict_ssh": restrict_ssh,
         "wan_connected": true,
         "orchestrator_connected": true,
+        "dist_sync_ready": dist_sync_ready,
     })
 }
 
@@ -6892,6 +7315,51 @@ fn resolve_add_hive_harden_ssh(payload: &serde_json::Value) -> bool {
         return value;
     }
     env_flag_enabled("FLUXBEE_ADD_HIVE_HARDEN_SSH") || env_flag_enabled("JSR_ADD_HIVE_HARDEN_SSH")
+}
+
+fn resolve_add_hive_restrict_ssh(payload: &serde_json::Value) -> bool {
+    if let Some(value) = payload.get("restrict_ssh").and_then(parse_bool_value) {
+        return value;
+    }
+    if let Ok(raw) = std::env::var("FLUXBEE_ADD_HIVE_RESTRICT_SSH") {
+        if let Some(value) = parse_bool_str(&raw) {
+            return value;
+        }
+    }
+    if let Ok(raw) = std::env::var("JSR_ADD_HIVE_RESTRICT_SSH") {
+        if let Some(value) = parse_bool_str(&raw) {
+            return value;
+        }
+    }
+    true
+}
+
+fn resolve_add_hive_authkey_source_patterns(address: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(raw) = std::env::var("ORCH_AUTHKEY_FROM_PATTERNS") {
+        out.extend(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(|item| item.to_string()),
+        );
+    }
+    if out.is_empty() {
+        match detect_source_ip_for_target(address) {
+            Ok(ip) if !ip.trim().is_empty() => out.push(ip),
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    target = address,
+                    error = %err,
+                    "could not auto-resolve source ip for authorized_keys from= restriction; leaving from filter disabled"
+                );
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn parse_bool_value(value: &serde_json::Value) -> Option<bool> {

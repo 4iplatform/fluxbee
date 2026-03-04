@@ -221,6 +221,8 @@ log_http_response "$status" "$add_body"
 assert_eq "$status" "200" "POST /hives/http"
 assert_eq "$(json_get "status" "$add_body")" "ok" "POST /hives/status"
 assert_eq "$(json_get "payload.wan_connected" "$add_body")" "true" "POST /hives/payload.wan_connected"
+assert_eq "$(json_get "payload.dist_sync_ready" "$add_body")" "true" "POST /hives/payload.dist_sync_ready"
+assert_eq "$(json_get "payload.restrict_ssh" "$add_body")" "true" "POST /hives/payload.restrict_ssh"
 echo "OK: add_hive passed with WAN freshness (wan_connected=true)"
 
 if [[ "$CHECK_OPA_NODE" == "1" ]]; then
