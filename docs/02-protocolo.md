@@ -1,7 +1,7 @@
 # JSON Router - 02 Protocolo de Mensajes
 
-**Estado:** v1.16  
-**Fecha:** 2026-02-04  
+**Estado:** v1.17  
+**Fecha:** 2026-03-04  
 **Audiencia:** Desarrolladores de librería de nodo, desarrolladores de nodos
 
 ---
@@ -726,110 +726,207 @@ Request/response para obtener EventPackage completo de otra isla:
 
 ---
 
-### 7.8 Orchestrator (Runtimes y Nodos)
+### 7.8 Orchestrator (Update y Ciclo de Vida de Nodos)
 
 | Mensaje | Origen | Destino | Propósito |
 |---------|--------|---------|-----------|
-| `RUNTIME_UPDATE` | Actor de control-plane autorizado (`SY.admin` o tooling operativo) | SY.orchestrator | Notificar nueva versión de runtimes |
-| `RUNTIME_UPDATE_RESPONSE` | SY.orchestrator | Originador de `RUNTIME_UPDATE` | Resultado determinista de validación/aplicación de manifest |
-| `SPAWN_NODE` | SY.admin (tooling E2E solo en entorno controlado) | SY.orchestrator | Solicitar ejecución de nodo |
-| `KILL_NODE` | SY.admin (tooling E2E solo en entorno controlado) | SY.orchestrator | Solicitar terminación de nodo |
+| `SYSTEM_UPDATE` | `SY.admin` (o `SY.orchestrator` relay autorizado) | `SY.orchestrator@<hive>` | Aplicar update de software por categoría (`runtime/core/vendor`) |
+| `SYSTEM_UPDATE_RESPONSE` | `SY.orchestrator@<hive>` | Originador de `SYSTEM_UPDATE` | Resultado determinista de validación/aplicación |
+| `SPAWN_NODE` | `SY.admin` (tooling E2E solo entorno controlado) | `SY.orchestrator@<hive>` | Solicitar ejecución de nodo |
+| `SPAWN_NODE_RESPONSE` | `SY.orchestrator@<hive>` | Originador de `SPAWN_NODE` | Resultado de spawn |
+| `KILL_NODE` | `SY.admin` (tooling E2E solo entorno controlado) | `SY.orchestrator@<hive>` | Solicitar terminación de nodo |
+| `KILL_NODE_RESPONSE` | `SY.orchestrator@<hive>` | Originador de `KILL_NODE` | Resultado de kill |
+
+Compatibilidad:
+- `RUNTIME_UPDATE`/`RUNTIME_UPDATE_RESPONSE` quedan **obsoletos** para operación canónica.
+- Si se reciben, se procesan en modo compatibilidad local y se responde indicando que la propagación remota debe hacerse con `SYSTEM_UPDATE`.
 
 Regla operativa 7.8:
-- Para estos mensajes usar `routing.dst` por nombre L2 (`"SY.orchestrator@<hive>"`).
-- No usar `routing.dst = null` (`Destination::Resolve`) en operación normal de control-plane.
+- Usar `routing.dst` por nombre L2 (`"SY.orchestrator@<hive>"`).
+- No usar `routing.dst = null` (`Destination::Resolve`) en control-plane normal.
 
-#### 7.8.1 RUNTIME_UPDATE
+#### 7.8.1 SYSTEM_UPDATE
 
-Notifica al orchestrator que hay nuevas versiones de runtimes:
-
-```json
-{
-  "routing": {
-    "src": "<quien-notifica>",
-    "dst": "SY.orchestrator@motherbee"
-  },
-  "meta": {
-    "type": "system",
-    "msg": "RUNTIME_UPDATE"
-  },
-  "payload": {
-    "schema_version": 1,
-    "version": 43,
-    "updated_at": "2026-02-08T10:00:00Z",
-    "target_hives": ["worker-3"],
-    "runtimes": {
-      "AI.soporte": {
-        "current": "1.3.0",
-        "available": ["1.2.0", "1.3.0"]
-      },
-      "IO.whatsapp": {
-        "current": "2.1.0",
-        "available": ["2.0.0", "2.1.0"]
-      }
-    },
-    "hash": "sha256:abc123..."
-  }
-}
-```
-
-`target_hives` es opcional:
-- ausente => rollout global a todos los workers gestionados.
-- presente => rollout canary al subset indicado.
-
-Respuesta (`RUNTIME_UPDATE_RESPONSE`):
-- `status=ok` + `applied=true` cuando el update se aplica.
-- `status=ok` + `applied=false` + `reason=up_to_date` cuando llega el mismo manifest.
-- `status=error` + `error_code=MANIFEST_INVALID` para payload/schema inválido.
-- `status=error` + `error_code=VERSION_MISMATCH` para stale o conflicto de versión.
-
-#### 7.8.2 SPAWN_NODE
-
-Solicita al orchestrator que ejecute un nodo:
+Request:
 
 ```json
 {
   "routing": {
     "src": "SY.admin@motherbee",
-    "dst": "SY.orchestrator@motherbee"
+    "dst": "SY.orchestrator@worker-1",
+    "ttl": 16,
+    "trace_id": "..."
+  },
+  "meta": {
+    "type": "system",
+    "msg": "SYSTEM_UPDATE"
+  },
+  "payload": {
+    "category": "runtime",
+    "manifest_version": 14,
+    "manifest_hash": "sha256:a1b2c3..."
+  }
+}
+```
+
+Campos de request (`payload`):
+
+| Campo | Tipo | Obligatorio | Valores | Notas |
+|-------|------|-------------|---------|-------|
+| `category` | string | No | `runtime`, `core`, `vendor` | Default: `runtime` |
+| `manifest_version` | u64 | No | >= 0 | Alias aceptado: `version` |
+| `manifest_hash` | string | Sí | `sha256:...` o hash hex | Alias aceptado: `hash` |
+
+Response (`SYSTEM_UPDATE_RESPONSE`):
+
+```json
+{
+  "meta": {
+    "type": "system",
+    "msg": "SYSTEM_UPDATE_RESPONSE"
+  },
+  "payload": {
+    "status": "ok",
+    "category": "runtime",
+    "hive": "worker-1",
+    "manifest_version": 14,
+    "local_manifest_version": 14,
+    "local_manifest_hash": "sha256:a1b2c3...",
+    "updated": [],
+    "unchanged": ["runtime-manifest"],
+    "restarted": [],
+    "errors": []
+  }
+}
+```
+
+Estados canónicos (`payload.status`):
+
+| Status | Significado |
+|--------|-------------|
+| `ok` | Update aplicado correctamente |
+| `sync_pending` | Manifest local aún no converge con el esperado |
+| `partial` | Aplicación parcial (reservado para extensiones/handlers futuros) |
+| `error` | Fallo sin rollback exitoso |
+| `rollback` | Falló el update y se restauró versión previa (ej. `core`) |
+
+Códigos de error canónicos (`payload.error_code` cuando `status=error`):
+
+| Error Code | Significado |
+|------------|-------------|
+| `MANIFEST_INVALID` | Payload inválido o manifest no interpretable |
+| `UPDATE_FAILED` | Fallo durante instalación/restart/health gate |
+| `FORBIDDEN` | Origen de mensaje system no autorizado |
+
+#### 7.8.2 SPAWN_NODE
+
+Request:
+
+```json
+{
+  "routing": {
+    "src": "SY.admin@motherbee",
+    "dst": "SY.orchestrator@worker-1",
+    "ttl": 16,
+    "trace_id": "..."
   },
   "meta": {
     "type": "system",
     "msg": "SPAWN_NODE"
   },
   "payload": {
-    "runtime": "AI.soporte",
-    "version": "1.3.0",
-    "target": "worker-3",
-    "config": {
-      "degree": "degree:soporte-l1",
-      "instance_id": "ai-soporte-001"
-    }
+    "node_name": "WF.orch.diag.test1@worker-1",
+    "runtime": "wf.orch.diag",
+    "runtime_version": "current",
+    "config": {}
   }
 }
 ```
 
+Campos de request (`payload`):
+
+| Campo | Tipo | Obligatorio | Notas |
+|-------|------|-------------|-------|
+| `node_name` | string | Sí | Alias aceptado: `name`. Si no incluye `@hive`, se normaliza al target |
+| `runtime` | string | No | Si falta, se deriva de `node_name` |
+| `runtime_version` | string | No | Default: `current`. Alias aceptado: `version` |
+| `target` | string | No | Hive destino explícito (si no, se usa el de `routing.dst`) |
+| `config` | object | No | Config del runtime/nodo |
+
+Response (`SPAWN_NODE_RESPONSE`) mínima:
+
+```json
+{
+  "payload": {
+    "status": "ok",
+    "node_name": "WF.orch.diag.test1@worker-1",
+    "runtime": "wf.orch.diag",
+    "version": "0.0.1",
+    "hive": "worker-1",
+    "unit": "fluxbee-node-WF.orch.diag.test1-worker-1"
+  }
+}
+```
+
+Estados/códigos típicos:
+- `status=ok` (incluye `state=already_running` si ya estaba activo).
+- `status=error`, `error_code=INVALID_REQUEST`.
+- `status=error`, `error_code=RUNTIME_NOT_AVAILABLE` o `RUNTIME_NOT_PRESENT`.
+- `status=error`, `error_code=SPAWN_FAILED`.
+
 #### 7.8.3 KILL_NODE
 
-Solicita al orchestrator que termine un nodo:
+Request:
 
 ```json
 {
   "routing": {
     "src": "SY.admin@motherbee",
-    "dst": "SY.orchestrator@motherbee"
+    "dst": "SY.orchestrator@worker-1",
+    "ttl": 16,
+    "trace_id": "..."
   },
   "meta": {
     "type": "system",
     "msg": "KILL_NODE"
   },
   "payload": {
-    "node_name": "AI.soporte.001@worker-3",
-    "signal": "SIGTERM",
-    "timeout_ms": 10000
+    "node_name": "WF.orch.diag.test1@worker-1",
+    "force": false
   }
 }
 ```
+
+Campos de request (`payload`):
+
+| Campo | Tipo | Obligatorio | Notas |
+|-------|------|-------------|-------|
+| `node_name` | string | Condicional | Alias aceptado: `name` |
+| `unit` | string | Condicional | Alternativa directa a `node_name` |
+| `force` | bool | No | `false` => `SIGTERM`; `true` => `SIGKILL` |
+| `signal` | string | No | Solo aplica cuando `force=false` |
+| `target` | string | No | Hive destino explícito |
+
+Regla: se requiere `node_name` o `unit`.
+
+Response (`KILL_NODE_RESPONSE`) mínima:
+
+```json
+{
+  "payload": {
+    "status": "ok",
+    "node_name": "WF.orch.diag.test1@worker-1",
+    "hive": "worker-1",
+    "signal": "SIGTERM",
+    "force": false
+  }
+}
+```
+
+Estados/códigos típicos:
+- `status=ok` (puede incluir `state=not_found` si no estaba corriendo).
+- `status=error`, `error_code=INVALID_REQUEST`.
+- `status=error`, `error_code=KILL_FAILED`.
 
 ---
 

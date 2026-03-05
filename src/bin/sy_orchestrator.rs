@@ -46,6 +46,9 @@ const SYNCTHING_SYNC_PORT_TCP: u16 = 22000;
 const SYNCTHING_SYNC_PORT_UDP: u16 = 22000;
 const SYNCTHING_DISCOVERY_PORT_UDP: u16 = 21027;
 const DIST_SYNC_PROBE_TIMEOUT_SECS: u64 = 45;
+const REMOVE_HIVE_SOCKET_CLEANUP_TIMEOUT_SECS: u64 = 8;
+const SSH_HARDEN_VERIFY_RETRIES: usize = 6;
+const SSH_HARDEN_VERIFY_DELAY_MS: u64 = 1000;
 const SYNCTHING_FOLDER_BLOB_ID: &str = "fluxbee-blob";
 const SYNCTHING_FOLDER_DIST_ID: &str = "fluxbee-dist";
 const SYNCTHING_INSTALL_DIR: &str = "/var/lib/fluxbee/vendor/bin";
@@ -1002,7 +1005,7 @@ async fn handle_admin(
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
             if let Some(hive_id) = hive {
-                remove_hive_flow(state, &hive_id)
+                remove_hive_flow(state, &hive_id).await
             } else {
                 serde_json::json!({
                     "status": "error",
@@ -1034,8 +1037,19 @@ async fn handle_admin(
             if let Some(hive_id) = hive_id {
                 let address = address.unwrap_or_default();
                 let harden_ssh = resolve_add_hive_harden_ssh(&msg.payload);
-                let restrict_ssh = resolve_add_hive_restrict_ssh(&msg.payload);
-                add_hive_flow(state, &hive_id, &address, harden_ssh, restrict_ssh)
+                let restrict_ssh = resolve_add_hive_restrict_ssh(&msg.payload, harden_ssh);
+                let require_dist_sync = resolve_add_hive_require_dist_sync(&msg.payload);
+                let dist_sync_probe_timeout_secs =
+                    resolve_add_hive_dist_sync_probe_timeout_secs(&msg.payload);
+                add_hive_flow(
+                    state,
+                    &hive_id,
+                    &address,
+                    harden_ssh,
+                    restrict_ssh,
+                    require_dist_sync,
+                    dist_sync_probe_timeout_secs,
+                )
             } else {
                 serde_json::json!({
                     "status": "error",
@@ -1088,6 +1102,7 @@ async fn handle_system_message(
             | "KILL_NODE"
             | "RUN_ROUTER"
             | "KILL_ROUTER"
+            | "REMOVE_HIVE_CLEANUP"
     ) {
         source_name = resolve_system_source_name_with_retry(state, &msg.routing.src).await;
         let is_allowed = source_name.as_deref().is_some_and(|name| {
@@ -1145,6 +1160,15 @@ async fn handle_system_message(
                     let _ =
                         send_system_action_response(sender, msg, "KILL_ROUTER_RESPONSE", payload)
                             .await;
+                }
+                "REMOVE_HIVE_CLEANUP" => {
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "REMOVE_HIVE_CLEANUP_RESPONSE",
+                        payload,
+                    )
+                    .await;
                 }
                 _ => {}
             }
@@ -1315,6 +1339,17 @@ async fn handle_system_message(
             let result = kill_router_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "KILL_ROUTER processed");
             let _ = send_system_action_response(sender, msg, "KILL_ROUTER_RESPONSE", result).await;
+        }
+        Some("REMOVE_HIVE_CLEANUP") => {
+            let result = remove_hive_cleanup_local_flow();
+            tracing::info!(result = %result, "REMOVE_HIVE_CLEANUP processed");
+            let _ = send_system_action_response(
+                sender,
+                msg,
+                "REMOVE_HIVE_CLEANUP_RESPONSE",
+                result,
+            )
+            .await;
         }
         _ => {}
     }
@@ -2128,9 +2163,15 @@ fn resolve_syncthing_vendor_source_path() -> Result<PathBuf, OrchestratorError> 
     if legacy_fallback.exists() {
         return Ok(legacy_fallback);
     }
+    // Transitional fallback: when dist/vendor source is not present yet, allow using
+    // the currently installed syncthing binary as the vendor source-of-truth.
+    let installed_fallback = PathBuf::from(SYNCTHING_INSTALL_PATH);
+    if installed_fallback.exists() {
+        return Ok(installed_fallback);
+    }
     Err(format!(
-        "syncthing vendor binary missing at '{}' and '{}' and vendor manifest is absent",
-        DIST_SYNCTHING_VENDOR_SOURCE_PATH, SYNCTHING_VENDOR_SOURCE_PATH
+        "syncthing vendor binary missing at '{}' and '{}' and '{}' and vendor manifest is absent",
+        DIST_SYNCTHING_VENDOR_SOURCE_PATH, SYNCTHING_VENDOR_SOURCE_PATH, SYNCTHING_INSTALL_PATH
     )
     .into())
 }
@@ -2346,6 +2387,26 @@ fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
     run_cmd(install, "install syncthing from vendor source")?;
     if !syncthing_binary_available() {
         return Err("syncthing install finished but installed binary is still missing".into());
+    }
+    Ok(())
+}
+
+fn ensure_local_syncthing_vendor_layout() -> Result<(), OrchestratorError> {
+    if !Path::new(SYNCTHING_INSTALL_PATH).exists() {
+        return Err("syncthing installed binary missing while ensuring vendor layout".into());
+    }
+    for target in [DIST_SYNCTHING_VENDOR_SOURCE_PATH, SYNCTHING_VENDOR_SOURCE_PATH] {
+        let target_path = Path::new(target);
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut install = Command::new("install");
+        install
+            .arg("-m")
+            .arg("0755")
+            .arg(SYNCTHING_INSTALL_PATH)
+            .arg(target);
+        run_cmd(install, &format!("install local syncthing vendor source ({target})"))?;
     }
     Ok(())
 }
@@ -2593,6 +2654,212 @@ fn reconcile_syncthing_folders_xml(
     Ok((updated, changed_folders))
 }
 
+fn syncthing_config_without_folders(config_xml: &str) -> Result<String, OrchestratorError> {
+    let folder_re = Regex::new(r#"(?s)<folder\b[^>]*>.*?</folder>"#)?;
+    Ok(folder_re.replace_all(config_xml, "").into_owned())
+}
+
+fn is_valid_syncthing_device_id(value: &str) -> bool {
+    let id = value.trim();
+    !id.is_empty()
+        && id.contains('-')
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-')
+}
+
+fn extract_primary_syncthing_device_id(config_xml: &str) -> Result<String, OrchestratorError> {
+    let stripped = syncthing_config_without_folders(config_xml)?;
+    let device_re = Regex::new(r#"<device\b[^>]*\bid="([^"]+)""#)?;
+    for caps in device_re.captures_iter(&stripped) {
+        let Some(found) = caps.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        if is_valid_syncthing_device_id(found) {
+            return Ok(found.to_string());
+        }
+    }
+    Err("syncthing config has no valid top-level device id".into())
+}
+
+fn ensure_syncthing_top_level_peer_device(
+    config_xml: &str,
+    peer_device_id: &str,
+    peer_name: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let stripped = syncthing_config_without_folders(config_xml)?;
+    let peer_re = Regex::new(&format!(
+        r#"<device\b[^>]*\bid="{}""#,
+        regex::escape(peer_device_id)
+    ))?;
+    if peer_re.is_match(&stripped) {
+        return Ok((config_xml.to_string(), false));
+    }
+    let peer_block = format!(
+        "  <device id=\"{}\" name=\"{}\" compression=\"metadata\" introducer=\"false\" skipIntroductionRemovals=\"false\" introducedBy=\"\">\n    <address>dynamic</address>\n    <paused>false</paused>\n    <autoAcceptFolders>false</autoAcceptFolders>\n  </device>\n",
+        xml_escape_attr(peer_device_id),
+        xml_escape_attr(peer_name)
+    );
+    let insert_at = config_xml
+        .rfind("</configuration>")
+        .unwrap_or(config_xml.len());
+    let mut out = String::with_capacity(config_xml.len() + peer_block.len() + 2);
+    out.push_str(&config_xml[..insert_at]);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&peer_block);
+    out.push_str(&config_xml[insert_at..]);
+    Ok((out, true))
+}
+
+fn ensure_syncthing_folder_has_device_ref(
+    config_xml: &str,
+    folder_id: &str,
+    device_id: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let folder_re = Regex::new(r#"(?s)<folder\b[^>]*\bid="([^"]+)"[^>]*>.*?</folder>"#)?;
+    for caps in folder_re.captures_iter(config_xml) {
+        let Some(found_id) = caps.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        if found_id != folder_id {
+            continue;
+        }
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        let mut rewritten = full.as_str().to_string();
+        let device_re = Regex::new(&format!(
+            r#"<device\b[^>]*\bid="{}""#,
+            regex::escape(device_id)
+        ))?;
+        if device_re.is_match(&rewritten) {
+            return Ok((config_xml.to_string(), false));
+        }
+        let entry = format!(
+            "    <device id=\"{}\" introducedBy=\"\"/>\n",
+            xml_escape_attr(device_id)
+        );
+        if let Some(pos) = rewritten.find("<minDiskFree") {
+            rewritten.insert_str(pos, &entry);
+        } else if let Some(pos) = rewritten.rfind("</folder>") {
+            rewritten.insert_str(pos, &entry);
+        } else {
+            return Err("invalid syncthing folder block while inserting device ref".into());
+        }
+        let mut out =
+            String::with_capacity(config_xml.len() + rewritten.len().saturating_sub(full.len()));
+        out.push_str(&config_xml[..full.start()]);
+        out.push_str(&rewritten);
+        out.push_str(&config_xml[full.end()..]);
+        return Ok((out, true));
+    }
+    Ok((config_xml.to_string(), false))
+}
+
+fn reconcile_syncthing_peer_config_xml(
+    config_xml: &str,
+    local_device_id: &str,
+    peer_device_id: &str,
+    peer_name: &str,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) -> Result<(String, bool), OrchestratorError> {
+    let mut updated = config_xml.to_string();
+    let mut changed = false;
+
+    let (next, peer_changed) =
+        ensure_syncthing_top_level_peer_device(&updated, peer_device_id, peer_name)?;
+    updated = next;
+    changed |= peer_changed;
+
+    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        for device_id in [local_device_id, peer_device_id] {
+            let (next_cfg, folder_changed) =
+                ensure_syncthing_folder_has_device_ref(&updated, SYNCTHING_FOLDER_BLOB_ID, device_id)?;
+            updated = next_cfg;
+            changed |= folder_changed;
+        }
+    }
+    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        for device_id in [local_device_id, peer_device_id] {
+            let (next_cfg, folder_changed) =
+                ensure_syncthing_folder_has_device_ref(&updated, SYNCTHING_FOLDER_DIST_ID, device_id)?;
+            updated = next_cfg;
+            changed |= folder_changed;
+        }
+    }
+
+    Ok((updated, changed))
+}
+
+fn ensure_syncthing_peer_pairing_with_access(
+    local_hive_id: &str,
+    remote_hive_id: &str,
+    address: &str,
+    key_path: &Path,
+    sync: &BlobRuntimeConfig,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) -> Result<(), OrchestratorError> {
+    let local_cfg_path = sync.sync_data_dir.join("config.xml");
+    let local_current = fs::read_to_string(&local_cfg_path)?;
+
+    let remote_cfg_path = format!("{}/config.xml", sync.sync_data_dir.display());
+    let remote_read_cmd = format!("cat '{}'", shell_single_quote(&remote_cfg_path));
+    let remote_current = ssh_with_key_output(
+        address,
+        key_path,
+        &sudo_wrap(&remote_read_cmd),
+        BOOTSTRAP_SSH_USER,
+    )?;
+
+    let local_device_id = extract_primary_syncthing_device_id(&local_current)?;
+    let remote_device_id = extract_primary_syncthing_device_id(&remote_current)?;
+
+    let (local_updated, local_changed) = reconcile_syncthing_peer_config_xml(
+        &local_current,
+        &local_device_id,
+        &remote_device_id,
+        remote_hive_id,
+        blob,
+        dist,
+    )?;
+    let (remote_updated, remote_changed) = reconcile_syncthing_peer_config_xml(
+        &remote_current,
+        &remote_device_id,
+        &local_device_id,
+        local_hive_id,
+        blob,
+        dist,
+    )?;
+
+    if local_changed {
+        fs::write(&local_cfg_path, &local_updated)?;
+        let mut restart = Command::new("systemctl");
+        restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
+        run_cmd(restart, "systemctl restart local syncthing (pairing)")?;
+    }
+    if remote_changed {
+        write_remote_file(address, key_path, &remote_cfg_path, &remote_updated)?;
+        ssh_with_key(
+            address,
+            key_path,
+            &sudo_wrap(&format!("systemctl restart {SYNCTHING_SERVICE_NAME}")),
+            BOOTSTRAP_SSH_USER,
+        )?;
+        remote_wait_service_active(
+            address,
+            key_path,
+            SYNCTHING_SERVICE_NAME,
+            SYNCTHING_BOOTSTRAP_TIMEOUT_SECS,
+        )?;
+    }
+
+    Ok(())
+}
+
 fn reconcile_local_syncthing_folders(
     sync: &BlobRuntimeConfig,
     blob: &BlobRuntimeConfig,
@@ -2624,6 +2891,7 @@ async fn ensure_blob_sync_runtime(
     }
 
     ensure_syncthing_installed()?;
+    ensure_local_syncthing_vendor_layout()?;
     ensure_syncthing_unit(&sync)?;
     ensure_syncthing_firewall_local();
     tracing::info!(
@@ -3661,7 +3929,35 @@ fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
     read_hive_info(&root, hive_id)
 }
 
-fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_json::Value {
+fn remove_hive_cleanup_script() -> &'static str {
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-orchestrator sy-admin sy-storage fluxbee-syncthing; do \
+systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
+systemctl disable \"$s\" >/dev/null 2>&1 || true; \
+systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
+systemctl reset-failed \"$s\" >/dev/null 2>&1 || true; \
+done"
+}
+
+fn remove_hive_cleanup_local_flow() -> serde_json::Value {
+    let deferred_script = format!("sleep 1; {}", remove_hive_cleanup_script());
+    match Command::new("bash")
+        .arg("-lc")
+        .arg(deferred_script)
+        .spawn()
+    {
+        Ok(_) => serde_json::json!({
+            "status": "ok",
+            "cleanup": "scheduled",
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "CLEANUP_SCHEDULE_FAILED",
+            "message": err.to_string(),
+        }),
+    }
+}
+
+async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_json::Value {
     if !valid_hive_id(hive_id) {
         return serde_json::json!({
             "status": "error",
@@ -3686,41 +3982,88 @@ fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_json::Val
         });
     }
 
-    let mut remote_cleanup = "stopped";
+    let mut remote_cleanup: &str;
+    let mut remote_cleanup_via: &str;
     let mut address = String::new();
-    // Keep remove_hive responsive: cleanup is best-effort and non-blocking.
-    let cleanup_cmd = "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-orchestrator sy-admin sy-storage fluxbee-syncthing; do \
-systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
-systemctl disable \"$s\" >/dev/null 2>&1 || true; \
-systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
-systemctl reset-failed \"$s\" >/dev/null 2>&1 || true; \
-done";
-    match hive_access(hive_id) {
-        Ok((addr, key_path)) => {
+    let cleanup_cmd = remove_hive_cleanup_script();
+    let forward_result = forward_system_action_to_hive_with_timeout(
+        state,
+        hive_id,
+        "REMOVE_HIVE_CLEANUP",
+        "REMOVE_HIVE_CLEANUP_RESPONSE",
+        serde_json::json!({
+            "hive_id": hive_id,
+            "target": hive_id,
+        }),
+        Duration::from_secs(REMOVE_HIVE_SOCKET_CLEANUP_TIMEOUT_SECS),
+    )
+    .await;
+
+    let socket_cleanup_ok = match forward_result.as_ref() {
+        Ok(payload) => payload
+            .get("status")
+            .and_then(|value| value.as_str())
+            == Some("ok"),
+        Err(_) => false,
+    };
+    let socket_cleanup_timed_out = socket_cleanup_timeout(&forward_result);
+
+    if socket_cleanup_ok {
+        remote_cleanup = "socket_ok";
+        remote_cleanup_via = "socket";
+        if let Ok((addr, _)) = hive_access(hive_id) {
             address = addr;
-            let cleanup_cmd_q = shell_single_quote(cleanup_cmd);
-            if let Err(err) = ssh_with_key(
-                &address,
-                &key_path,
-                &sudo_wrap(&format!("bash -lc '{}'", cleanup_cmd_q)),
-                BOOTSTRAP_SSH_USER,
-            ) {
-                tracing::warn!(
-                    hive_id = hive_id,
-                    address = %address,
-                    error = %err,
-                    "remote cleanup failed; proceeding with local hive state removal"
-                );
-                remote_cleanup = "failed_skipped";
-            }
         }
-        Err(err) => {
+    } else {
+        remote_cleanup = if socket_cleanup_timed_out {
+            "socket_timeout"
+        } else {
+            "local_only"
+        };
+        remote_cleanup_via = "local_only";
+        if let Err(err) = &forward_result {
             tracing::warn!(
                 hive_id = hive_id,
                 error = %err,
-                "cannot resolve hive access for remote cleanup; proceeding with local hive state removal"
+                "socket cleanup failed during remove_hive; attempting ssh fallback"
             );
-            remote_cleanup = "skipped_no_access";
+        } else if let Ok(payload) = &forward_result {
+            tracing::warn!(
+                hive_id = hive_id,
+                payload = %payload,
+                "socket cleanup returned non-ok status; attempting ssh fallback"
+            );
+        }
+        match hive_access(hive_id) {
+            Ok((addr, key_path)) => {
+                address = addr;
+                let cleanup_cmd_q = shell_single_quote(cleanup_cmd);
+                if let Err(err) = ssh_with_key(
+                    &address,
+                    &key_path,
+                    &sudo_wrap(&format!("bash -lc '{}'", cleanup_cmd_q)),
+                    BOOTSTRAP_SSH_USER,
+                ) {
+                    tracing::warn!(
+                        hive_id = hive_id,
+                        address = %address,
+                        error = %err,
+                        "remote cleanup failed; proceeding with local hive state removal"
+                    );
+                    remote_cleanup = "ssh_fallback_failed";
+                    remote_cleanup_via = "ssh_fallback";
+                } else {
+                    remote_cleanup = "ssh_fallback_ok";
+                    remote_cleanup_via = "ssh_fallback";
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    hive_id = hive_id,
+                    error = %err,
+                    "cannot resolve hive access for remote cleanup; proceeding with local hive state removal"
+                );
+            }
         }
     }
 
@@ -3739,7 +4082,37 @@ done";
         "hive_id": hive_id,
         "address": address,
         "remote_cleanup": remote_cleanup,
+        "remote_cleanup_via": remote_cleanup_via,
     })
+}
+
+fn socket_cleanup_timeout(
+    forward_result: &Result<serde_json::Value, OrchestratorError>,
+) -> bool {
+    match forward_result {
+        Ok(payload) => {
+            if payload
+                .get("status")
+                .and_then(|value| value.as_str())
+                .is_some_and(|status| status.eq_ignore_ascii_case("timeout"))
+            {
+                return true;
+            }
+            if payload
+                .get("error_code")
+                .and_then(|value| value.as_str())
+                .is_some_and(|code| code.eq_ignore_ascii_case("TIMEOUT"))
+            {
+                return true;
+            }
+            payload
+                .get("message")
+                .and_then(|value| value.as_str())
+                .map(|message| message.to_ascii_lowercase().contains("timeout"))
+                .unwrap_or(false)
+        }
+        Err(err) => err.to_string().to_ascii_lowercase().contains("timeout"),
+    }
 }
 
 fn read_hive_info(root: &Path, hive_id: &str) -> Result<serde_json::Value, OrchestratorError> {
@@ -5032,6 +5405,25 @@ async fn forward_system_action_to_hive(
     response_msg: &str,
     payload: serde_json::Value,
 ) -> Result<serde_json::Value, OrchestratorError> {
+    forward_system_action_to_hive_with_timeout(
+        state,
+        target_hive,
+        request_msg,
+        response_msg,
+        payload,
+        system_forward_timeout(),
+    )
+    .await
+}
+
+async fn forward_system_action_to_hive_with_timeout(
+    state: &OrchestratorState,
+    target_hive: &str,
+    request_msg: &str,
+    response_msg: &str,
+    payload: serde_json::Value,
+    forward_timeout: Duration,
+) -> Result<serde_json::Value, OrchestratorError> {
     if target_hive != state.hive_id {
         if let Ok(snapshot) = load_lsa_snapshot(state) {
             let now = now_epoch_ms();
@@ -5141,7 +5533,6 @@ async fn forward_system_action_to_hive(
     };
     relay_sender.send(request).await?;
 
-    let forward_timeout = system_forward_timeout();
     let wait_response = async {
         loop {
             let incoming = relay_receiver.recv().await?;
@@ -6384,6 +6775,13 @@ fn ensure_remote_syncthing_runtime_with_access(
         &sudo_wrap(&install_cmd),
         BOOTSTRAP_SSH_USER,
     )?;
+    if let Err(err) = ensure_remote_syncthing_vendor_layout(address, key_path) {
+        tracing::warn!(
+            target = %address,
+            error = %err,
+            "failed to mirror syncthing into remote vendor/dist source layout"
+        );
+    }
 
     let blob_path_q = shell_single_quote(&blob.path.display().to_string());
     let dist_path_q = shell_single_quote(&dist.path.display().to_string());
@@ -6457,6 +6855,27 @@ fn ensure_remote_syncthing_runtime_with_access(
     Ok(())
 }
 
+fn ensure_remote_syncthing_vendor_layout(
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    let cmd = format!(
+        "set -euo pipefail && install -d -m 0755 '{dist_dir}' '{legacy_dir}' && install -m 0755 '{installed}' '{dist_target}' && install -m 0755 '{installed}' '{legacy_target}'",
+        dist_dir = shell_single_quote("/var/lib/fluxbee/dist/vendor/syncthing"),
+        legacy_dir = shell_single_quote("/var/lib/fluxbee/vendor/syncthing"),
+        installed = shell_single_quote(SYNCTHING_INSTALL_PATH),
+        dist_target = shell_single_quote(DIST_SYNCTHING_VENDOR_SOURCE_PATH),
+        legacy_target = shell_single_quote(SYNCTHING_VENDOR_SOURCE_PATH),
+    );
+    let cmd_q = shell_single_quote(&cmd);
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("bash -lc '{}'", cmd_q)),
+        BOOTSTRAP_SSH_USER,
+    )
+}
+
 fn ensure_remote_syncthing_runtime(
     hive_id: &str,
     blob: &BlobRuntimeConfig,
@@ -6471,6 +6890,7 @@ fn verify_remote_dist_sync_ready_with_access(
     address: &str,
     key_path: &Path,
     dist: &DistRuntimeConfig,
+    timeout_secs: u64,
 ) -> Result<(), OrchestratorError> {
     if !dist.sync_enabled || !dist_sync_tool_is_syncthing(dist) {
         return Ok(());
@@ -6493,7 +6913,7 @@ fn verify_remote_dist_sync_ready_with_access(
     );
 
     let started = Instant::now();
-    let timeout = Duration::from_secs(DIST_SYNC_PROBE_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(timeout_secs);
     let mut success = false;
     let mut last_err: Option<String> = None;
     while started.elapsed() < timeout {
@@ -6532,7 +6952,7 @@ fn verify_remote_dist_sync_ready_with_access(
 
     Err(format!(
         "dist sync probe timeout after {}s (target='{}', path='{}'): {}",
-        DIST_SYNC_PROBE_TIMEOUT_SECS,
+        timeout_secs,
         address,
         remote_probe_path,
         last_err.unwrap_or_else(|| "no detail".to_string())
@@ -6604,6 +7024,8 @@ fn add_hive_flow(
     address: &str,
     harden_ssh: bool,
     restrict_ssh: bool,
+    require_dist_sync: bool,
+    dist_sync_probe_timeout_secs: u64,
 ) -> serde_json::Value {
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
@@ -6678,18 +7100,6 @@ fn add_hive_flow(
         });
     }
 
-    if let Err(err) = ssh_with_pass(address, "true", BOOTSTRAP_SSH_USER) {
-        return ssh_bootstrap_error_payload(&err.to_string());
-    }
-
-    if let Err(err) = fs::create_dir_all(&hive_dir) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "IO_ERROR",
-            "message": err.to_string(),
-        });
-    }
-
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     if !key_path.exists() {
         return serde_json::json!({
@@ -6717,12 +7127,49 @@ fn add_hive_flow(
         }
     };
 
-    // Seed the key via password channel with the same canonical writer used by fallbacks.
-    if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key) {
+    let mut password_channel_available = true;
+    if let Err(pass_err) = ssh_with_pass(address, "true", BOOTSTRAP_SSH_USER) {
+        password_channel_available = false;
+        match ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
+            Ok(()) => {
+                tracing::warn!(
+                    target = address,
+                    error = %pass_err,
+                    "password bootstrap channel unavailable; continuing via key channel"
+                );
+            }
+            Err(key_err) => {
+                return ssh_bootstrap_error_payload(&format!(
+                    "password probe failed: {pass_err}; key probe failed: {key_err}"
+                ));
+            }
+        }
+    }
+
+    if let Err(err) = fs::create_dir_all(&hive_dir) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "IO_ERROR",
+            "message": err.to_string(),
+        });
+    }
+
+    if password_channel_available {
+        // Seed via password channel when available (fresh bootstrap path).
+        if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_KEY_FAILED",
+                "message": format!("failed to seed bootstrap key via password channel: {err}"),
+            });
+        }
+    } else if let Err(err) =
+        apply_remote_unrestricted_authorized_key_with_access(address, &key_path, &pub_key)
+    {
         return serde_json::json!({
             "status": "error",
             "error_code": "SSH_KEY_FAILED",
-            "message": format!("failed to seed bootstrap key via password channel: {err}"),
+            "message": format!("password channel unavailable and key reseed failed: {err}"),
         });
     }
 
@@ -6734,51 +7181,113 @@ fn add_hive_flow(
         });
     }
 
-    if restrict_ssh {
-        if let Err(err) = install_remote_ssh_gate_with_access(address, &key_path) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!("failed to install remote ssh gate: {err}"),
-            });
-        }
+    let mut restrict_ssh_applied = false;
+    let restrict_ssh_effective = restrict_ssh;
+    if restrict_ssh_effective {
         let source_patterns = resolve_add_hive_authkey_source_patterns(address);
-        if source_patterns.is_empty() {
-            tracing::info!(
-                target = address,
-                "authorized_keys restriction applied (gate enabled, from filter disabled by policy)"
-            );
-        } else {
-            tracing::info!(
-                target = address,
-                from_patterns = ?source_patterns,
-                "authorized_keys restriction applied (gate enabled, from filter enabled by policy)"
-            );
-        }
-        if let Err(err) = apply_remote_restricted_authorized_key_with_access(
-            address,
-            &key_path,
-            &pub_key,
-            &source_patterns,
-        ) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!("failed to apply restricted authorized_keys entry: {err}"),
-            });
-        }
-
-        if let Err(err) = ssh_with_key(
-            address,
-            &key_path,
-            "sudo -n /bin/bash -lc 'exit 0'",
-            BOOTSTRAP_SSH_USER,
-        ) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!("key access verification failed after authorized_keys restriction: {err}"),
-            });
+        let restricted_result: Result<(), OrchestratorError> = (|| {
+            install_remote_ssh_gate_with_access(address, &key_path)
+                .map_err(|err| format!("install gate failed: {err}"))?;
+            if source_patterns.is_empty() {
+                tracing::info!(
+                    target = address,
+                    "authorized_keys restriction applied (gate enabled, from filter disabled by policy)"
+                );
+            } else {
+                tracing::info!(
+                    target = address,
+                    from_patterns = ?source_patterns,
+                    "authorized_keys restriction applied (gate enabled, from filter enabled by policy)"
+                );
+            }
+            apply_remote_restricted_authorized_key_with_access(
+                address,
+                &key_path,
+                &pub_key,
+                &source_patterns,
+            )
+            .map_err(|err| format!("apply restricted authorized_keys failed: {err}"))?;
+            ssh_with_key(
+                address,
+                &key_path,
+                "sudo -n /bin/bash -lc 'exit 0'",
+                BOOTSTRAP_SSH_USER,
+            )
+            .map_err(|err| format!("restricted sudo verification failed: {err}"))?;
+            Ok(())
+        })();
+        match restricted_result {
+            Ok(()) => {
+                restrict_ssh_applied = true;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target = address,
+                    error = %err,
+                    "restricted key flow failed; falling back to unrestricted key mode"
+                );
+                let restricted_err_text = err.to_string();
+                if restricted_err_text.contains("empty SSH_ORIGINAL_COMMAND") {
+                    tracing::warn!(
+                        target = address,
+                        "worker sshd does not provide SSH_ORIGINAL_COMMAND for forced-command keys; trying from-only restriction fallback"
+                    );
+                    let from_only_result = apply_remote_from_only_authorized_key_with_access(
+                        address,
+                        &key_path,
+                        &pub_key,
+                        &source_patterns,
+                    )
+                    .and_then(|_| {
+                        ssh_with_key(
+                            address,
+                            &key_path,
+                            "sudo -n /bin/bash -lc 'exit 0'",
+                            BOOTSTRAP_SSH_USER,
+                        )
+                    });
+                    if from_only_result.is_ok() {
+                        tracing::warn!(
+                            target = address,
+                            from_patterns = ?source_patterns,
+                            "restrict_ssh degraded to from-only mode (gate disabled due sshd behavior)"
+                        );
+                        restrict_ssh_applied = true;
+                    } else {
+                        tracing::warn!(
+                            target = address,
+                            "from-only restriction fallback failed; continuing to unrestricted fallback"
+                        );
+                    }
+                }
+                if !restrict_ssh_applied {
+                    let fallback_result = if password_channel_available {
+                        apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key)
+                    } else {
+                        apply_remote_unrestricted_authorized_key_with_access(
+                            address,
+                            &key_path,
+                            &pub_key,
+                        )
+                    };
+                    if let Err(fallback_err) = fallback_result {
+                        return serde_json::json!({
+                            "status": "error",
+                            "error_code": "SSH_KEY_FAILED",
+                            "message": format!("restricted key flow failed ({err}); unrestricted fallback failed: {fallback_err}"),
+                        });
+                    }
+                    if let Err(verify_err) =
+                        ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER)
+                    {
+                        return serde_json::json!({
+                            "status": "error",
+                            "error_code": "SSH_KEY_FAILED",
+                            "message": format!("restricted key flow failed ({err}); unrestricted fallback verification failed: {verify_err}"),
+                        });
+                    }
+                }
+            }
         }
     } else {
         tracing::warn!(
@@ -6795,7 +7304,19 @@ fn add_hive_flow(
     }
 
     if harden_ssh {
-        if let Err(err) = disable_remote_password_auth(address) {
+        let harden_result = if password_channel_available {
+            disable_remote_password_auth(address)
+        } else {
+            disable_remote_password_auth_with_access(address, &key_path)
+        };
+        if let Err(err) = harden_result {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SSH_HARDEN_FAILED",
+                "message": err.to_string(),
+            });
+        }
+        if let Err(err) = verify_remote_ssh_hardening_with_access(address, &key_path) {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SSH_HARDEN_FAILED",
@@ -7010,7 +7531,7 @@ fn add_hive_flow(
                 "message": format!("enable {name}: {err}"),
             });
         }
-        let service_cmd = if *name == "sy-orchestrator" {
+        let service_inner = if *name == "sy-orchestrator" {
             format!(
                 "systemctl start {name} || (systemctl reset-failed {name} || true; sleep 1; systemctl start {name})"
             )
@@ -7019,10 +7540,11 @@ fn add_hive_flow(
                 "systemctl restart {name} || (systemctl reset-failed {name} || true; sleep 1; systemctl start {name})"
             )
         };
+        let service_cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&service_inner)));
         if let Err(err) = ssh_with_key(
             address,
             &key_path,
-            &sudo_wrap(&service_cmd),
+            &service_cmd,
             BOOTSTRAP_SSH_USER,
         ) {
             return serde_json::json!({
@@ -7096,10 +7618,17 @@ fn add_hive_flow(
                 "message": reason,
             });
         }
-        if let Err(err) =
-            verify_remote_dist_sync_ready_with_access(address, &key_path, &desired_dist)
-        {
-            let reason = format!("dist sync readiness probe failed: {err}");
+        if let Err(err) = ensure_syncthing_peer_pairing_with_access(
+            &state.hive_id,
+            hive_id,
+            address,
+            &key_path,
+            &desired_sync,
+            &desired_blob,
+            &desired_dist,
+        ) {
+            let rollback_note = attempt_remote_syncthing_rollback_note(address, &key_path);
+            let reason = format!("syncthing peer pairing failed: {err}; {rollback_note}");
             let entry = DeploymentHistoryEntry {
                 deployment_id: Uuid::new_v4().to_string(),
                 category: "vendor".to_string(),
@@ -7124,16 +7653,70 @@ fn add_hive_flow(
             if let Err(history_err) = append_deployment_history(&entry) {
                 tracing::warn!(
                     error = %history_err,
-                    "failed to persist add_hive dist sync readiness failure"
+                    "failed to persist add_hive vendor pairing history"
                 );
             }
             return serde_json::json!({
                 "status": "error",
-                "error_code": "DIST_SYNC_TIMEOUT",
+                "error_code": "SYNC_SETUP_FAILED",
                 "message": reason,
             });
         }
-        dist_sync_ready = true;
+        match verify_remote_dist_sync_ready_with_access(
+            address,
+            &key_path,
+            &desired_dist,
+            dist_sync_probe_timeout_secs,
+        ) {
+            Ok(()) => {
+                dist_sync_ready = true;
+            }
+            Err(err) => {
+                let reason = format!("dist sync readiness probe failed: {err}");
+                let strict_status = if require_dist_sync { "error" } else { "warning" };
+                let entry = DeploymentHistoryEntry {
+                    deployment_id: Uuid::new_v4().to_string(),
+                    category: "vendor".to_string(),
+                    trigger: "add_hive".to_string(),
+                    actor: default_deployment_actor(state),
+                    started_at: vendor_started_at,
+                    finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
+                    manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
+                    manifest_hash: local_vendor_hash.clone(),
+                    target_hives: vec![hive_id.to_string()],
+                    result: strict_status.to_string(),
+                    workers: vec![DeploymentWorkerOutcome {
+                        hive_id: hive_id.to_string(),
+                        status: strict_status.to_string(),
+                        reason: Some(reason.clone()),
+                        duration_ms: vendor_started.elapsed().as_millis() as u64,
+                        local_hash: local_vendor_hash.clone(),
+                        remote_hash_before: remote_vendor_hash_before.clone(),
+                        remote_hash_after: None,
+                    }],
+                };
+                if let Err(history_err) = append_deployment_history(&entry) {
+                    tracing::warn!(
+                        error = %history_err,
+                        "failed to persist add_hive dist sync readiness failure"
+                    );
+                }
+                if require_dist_sync {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "DIST_SYNC_TIMEOUT",
+                        "message": reason,
+                    });
+                }
+                tracing::warn!(
+                    hive_id = hive_id,
+                    address = address,
+                    error = %err,
+                    "dist sync readiness probe did not converge during add_hive; continuing in non-strict mode"
+                );
+                dist_sync_ready = false;
+            }
+        }
         let remote_vendor_hash_after = remote_syncthing_installed_hash(address, &key_path)
             .ok()
             .flatten();
@@ -7211,7 +7794,10 @@ fn add_hive_flow(
             "hive_id": hive_id,
             "address": address,
             "harden_ssh": harden_ssh,
-            "restrict_ssh": restrict_ssh,
+            "restrict_ssh": restrict_ssh_applied,
+            "restrict_ssh_requested": restrict_ssh,
+            "require_dist_sync": require_dist_sync,
+            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
             "wan_connected": false,
             "dist_sync_ready": dist_sync_ready,
         });
@@ -7230,7 +7816,10 @@ fn add_hive_flow(
             "hive_id": hive_id,
             "address": address,
             "harden_ssh": harden_ssh,
-            "restrict_ssh": restrict_ssh,
+            "restrict_ssh": restrict_ssh_applied,
+            "restrict_ssh_requested": restrict_ssh,
+            "require_dist_sync": require_dist_sync,
+            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
             "wan_connected": true,
             "orchestrator_connected": false,
             "dist_sync_ready": dist_sync_ready,
@@ -7242,7 +7831,10 @@ fn add_hive_flow(
         "hive_id": hive_id,
         "address": address,
         "harden_ssh": harden_ssh,
-        "restrict_ssh": restrict_ssh,
+        "restrict_ssh": restrict_ssh_applied,
+        "restrict_ssh_requested": restrict_ssh,
+        "require_dist_sync": require_dist_sync,
+        "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
         "wan_connected": true,
         "orchestrator_connected": true,
         "dist_sync_ready": dist_sync_ready,
@@ -7317,9 +7909,15 @@ fn resolve_add_hive_harden_ssh(payload: &serde_json::Value) -> bool {
     env_flag_enabled("FLUXBEE_ADD_HIVE_HARDEN_SSH") || env_flag_enabled("JSR_ADD_HIVE_HARDEN_SSH")
 }
 
-fn resolve_add_hive_restrict_ssh(payload: &serde_json::Value) -> bool {
+fn resolve_add_hive_restrict_ssh(payload: &serde_json::Value, harden_ssh: bool) -> bool {
     if let Some(value) = payload.get("restrict_ssh").and_then(parse_bool_value) {
         return value;
+    }
+    if matches!(
+        payload.get("harden_ssh").and_then(parse_bool_value),
+        Some(false)
+    ) {
+        return false;
     }
     if let Ok(raw) = std::env::var("FLUXBEE_ADD_HIVE_RESTRICT_SSH") {
         if let Some(value) = parse_bool_str(&raw) {
@@ -7331,7 +7929,44 @@ fn resolve_add_hive_restrict_ssh(payload: &serde_json::Value) -> bool {
             return value;
         }
     }
+    if !harden_ssh {
+        return false;
+    }
     true
+}
+
+fn resolve_add_hive_require_dist_sync(payload: &serde_json::Value) -> bool {
+    if let Some(value) = payload.get("require_dist_sync").and_then(parse_bool_value) {
+        return value;
+    }
+    if let Ok(raw) = std::env::var("FLUXBEE_ADD_HIVE_REQUIRE_DIST_SYNC") {
+        if let Some(value) = parse_bool_str(&raw) {
+            return value;
+        }
+    }
+    if let Ok(raw) = std::env::var("JSR_ADD_HIVE_REQUIRE_DIST_SYNC") {
+        if let Some(value) = parse_bool_str(&raw) {
+            return value;
+        }
+    }
+    false
+}
+
+fn resolve_add_hive_dist_sync_probe_timeout_secs(payload: &serde_json::Value) -> u64 {
+    let from_payload = payload
+        .get("dist_sync_probe_timeout_secs")
+        .or_else(|| payload.get("dist_sync_timeout_secs"))
+        .and_then(|value| value.as_u64());
+    let from_env = std::env::var("FLUXBEE_ADD_HIVE_DIST_SYNC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .or_else(|| {
+            std::env::var("JSR_ADD_HIVE_DIST_SYNC_TIMEOUT_SECS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+        });
+    let raw = from_payload.or(from_env).unwrap_or(DIST_SYNC_PROBE_TIMEOUT_SECS);
+    raw.clamp(5, 600)
 }
 
 fn resolve_add_hive_authkey_source_patterns(address: &str) -> Vec<String> {
@@ -7479,7 +8114,52 @@ fn systemd_disable(service: &str) -> Result<(), OrchestratorError> {
 }
 
 fn disable_remote_password_auth(address: &str) -> Result<(), OrchestratorError> {
-    let set_password_auth_cmd = r#"bash -lc "if grep -Eq '^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+' /etc/ssh/sshd_config; then sed -i.bak -E 's/^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+.*/PasswordAuthentication no/' /etc/ssh/sshd_config; else printf '\nPasswordAuthentication no\n' >> /etc/ssh/sshd_config; fi""#;
+    let set_password_auth_cmd = r#"bash -lc 'set -euo pipefail
+cfg="/etc/ssh/sshd_config"
+drop="/etc/ssh/sshd_config.d/00-fluxbee-hardening.conf"
+mkdir -p /etc/ssh/sshd_config.d
+
+upsert_opt() {
+  local key="$1"
+  local val="$2"
+  local file="$3"
+  if grep -Eq "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+" "$file"; then
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+.*|${key} ${val}|" "$file"
+  else
+    printf "\n%s %s\n" "$key" "$val" >> "$file"
+  fi
+}
+
+upsert_opt "PasswordAuthentication" "no" "$cfg"
+upsert_opt "KbdInteractiveAuthentication" "no" "$cfg"
+upsert_opt "ChallengeResponseAuthentication" "no" "$cfg"
+
+# Normalize any explicit overrides in existing drop-ins.
+for f in /etc/ssh/sshd_config.d/*.conf; do
+  [ -f "$f" ] || continue
+  sed -i -E "s|^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+.*|PasswordAuthentication no|" "$f" || true
+  sed -i -E "s|^[[:space:]]*#?[[:space:]]*KbdInteractiveAuthentication[[:space:]]+.*|KbdInteractiveAuthentication no|" "$f" || true
+  sed -i -E "s|^[[:space:]]*#?[[:space:]]*ChallengeResponseAuthentication[[:space:]]+.*|ChallengeResponseAuthentication no|" "$f" || true
+done
+
+cat > "$drop" <<EOF
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+EOF
+chmod 0644 "$drop"
+
+if command -v sshd >/dev/null 2>&1; then
+  sshd -t
+elif [ -x /usr/sbin/sshd ]; then
+  /usr/sbin/sshd -t
+fi
+
+if command -v sshd >/dev/null 2>&1; then
+  sshd -T >/dev/null 2>&1 || true
+elif [ -x /usr/sbin/sshd ]; then
+  /usr/sbin/sshd -T >/dev/null 2>&1 || true
+fi'"#;
     ssh_with_pass(
         address,
         &sudo_wrap(set_password_auth_cmd),
@@ -7489,6 +8169,139 @@ fn disable_remote_password_auth(address: &str) -> Result<(), OrchestratorError> 
     let restart_ssh_cmd = r#"bash -lc "systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart""#;
     ssh_with_pass(address, &sudo_wrap(restart_ssh_cmd), BOOTSTRAP_SSH_USER)?;
     Ok(())
+}
+
+fn disable_remote_password_auth_with_access(
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    let set_password_auth_cmd = r#"bash -lc 'set -euo pipefail
+cfg="/etc/ssh/sshd_config"
+drop="/etc/ssh/sshd_config.d/00-fluxbee-hardening.conf"
+mkdir -p /etc/ssh/sshd_config.d
+
+upsert_opt() {
+  local key="$1"
+  local val="$2"
+  local file="$3"
+  if grep -Eq "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+" "$file"; then
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+.*|${key} ${val}|" "$file"
+  else
+    printf "\n%s %s\n" "$key" "$val" >> "$file"
+  fi
+}
+
+upsert_opt "PasswordAuthentication" "no" "$cfg"
+upsert_opt "KbdInteractiveAuthentication" "no" "$cfg"
+upsert_opt "ChallengeResponseAuthentication" "no" "$cfg"
+
+for f in /etc/ssh/sshd_config.d/*.conf; do
+  [ -f "$f" ] || continue
+  sed -i -E "s|^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+.*|PasswordAuthentication no|" "$f" || true
+  sed -i -E "s|^[[:space:]]*#?[[:space:]]*KbdInteractiveAuthentication[[:space:]]+.*|KbdInteractiveAuthentication no|" "$f" || true
+  sed -i -E "s|^[[:space:]]*#?[[:space:]]*ChallengeResponseAuthentication[[:space:]]+.*|ChallengeResponseAuthentication no|" "$f" || true
+done
+
+cat > "$drop" <<EOF
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+EOF
+chmod 0644 "$drop"
+
+if command -v sshd >/dev/null 2>&1; then
+  sshd -t >/dev/null 2>&1 || true
+elif [ -x /usr/sbin/sshd ]; then
+  /usr/sbin/sshd -t >/dev/null 2>&1 || true
+fi'"#;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(set_password_auth_cmd),
+        BOOTSTRAP_SSH_USER,
+    )?;
+
+    let restart_ssh_cmd = r#"bash -lc "systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart""#;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(restart_ssh_cmd),
+        BOOTSTRAP_SSH_USER,
+    )?;
+    Ok(())
+}
+
+fn verify_remote_ssh_hardening_with_access(
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    verify_remote_key_access_after_hardening(address, key_path)?;
+    verify_remote_password_auth_is_rejected(address)?;
+    Ok(())
+}
+
+fn verify_remote_key_access_after_hardening(
+    address: &str,
+    key_path: &Path,
+) -> Result<(), OrchestratorError> {
+    let cmd = "sudo -n /bin/bash -lc 'exit 0'";
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=SSH_HARDEN_VERIFY_RETRIES {
+        match ssh_with_key(address, key_path, cmd, BOOTSTRAP_SSH_USER) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err.to_string());
+                if attempt < SSH_HARDEN_VERIFY_RETRIES {
+                    std::thread::sleep(Duration::from_millis(SSH_HARDEN_VERIFY_DELAY_MS));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "post-harden key verification failed (sudo -n not reachable after {} attempts): {}",
+        SSH_HARDEN_VERIFY_RETRIES,
+        last_err.unwrap_or_else(|| "unknown error".to_string())
+    )
+    .into())
+}
+
+fn verify_remote_password_auth_is_rejected(address: &str) -> Result<(), OrchestratorError> {
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=SSH_HARDEN_VERIFY_RETRIES {
+        match ssh_with_pass(address, "true", BOOTSTRAP_SSH_USER) {
+            Ok(()) => {
+                return Err(
+                    "password authentication still accepted after hardening; expected rejection"
+                        .into(),
+                )
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                if is_password_auth_rejection_error(&msg) {
+                    return Ok(());
+                }
+                last_err = Some(msg);
+                if attempt < SSH_HARDEN_VERIFY_RETRIES {
+                    std::thread::sleep(Duration::from_millis(SSH_HARDEN_VERIFY_DELAY_MS));
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "password-auth rejection verification failed after {} attempts: {}",
+        SSH_HARDEN_VERIFY_RETRIES,
+        last_err.unwrap_or_else(|| "unknown error".to_string())
+    )
+    .into())
+}
+
+fn is_password_auth_rejection_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("permission denied")
+        || lower.contains("no supported authentication methods available")
+        || lower.contains("authentications that can continue")
+        || lower.contains("(publickey")
 }
 
 fn remote_ssh_gate_script_contents() -> &'static str {
@@ -7641,6 +8454,56 @@ chmod 600 \"$auth_keys\"\n",
     Ok(())
 }
 
+fn apply_remote_from_only_authorized_key_with_access(
+    address: &str,
+    key_path: &Path,
+    pub_key: &str,
+    source_patterns: &[String],
+) -> Result<(), OrchestratorError> {
+    let key_material = pub_key
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
+    let from_value = source_patterns.join(",");
+    let entry = if from_value.is_empty() {
+        format!(
+            "no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {pub_key}",
+            pub_key = pub_key
+        )
+    } else {
+        format!(
+            "from=\"{from_value}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {pub_key}",
+            from_value = from_value,
+            pub_key = pub_key
+        )
+    };
+    let script = format!(
+        "set -euo pipefail\n\
+user='{user}'\n\
+home_dir=\"$(getent passwd \"$user\" | cut -d: -f6)\"\n\
+if [[ -z \"$home_dir\" ]]; then home_dir=\"/home/$user\"; fi\n\
+ssh_dir=\"$home_dir/.ssh\"\n\
+auth_keys=\"$ssh_dir/authorized_keys\"\n\
+mkdir -p \"$ssh_dir\"\n\
+chown \"$user:$user\" \"$ssh_dir\"\n\
+chmod 700 \"$ssh_dir\"\n\
+touch \"$auth_keys\"\n\
+chown \"$user:$user\" \"$auth_keys\"\n\
+{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' > \"$auth_keys.tmp\"; }} || true\n\
+mv \"$auth_keys.tmp\" \"$auth_keys\"\n\
+printf '%s\\n' '{entry}' >> \"$auth_keys\"\n\
+chown \"$user:$user\" \"$auth_keys\"\n\
+chmod 600 \"$auth_keys\"\n",
+        user = BOOTSTRAP_SSH_USER,
+        gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
+        key_material = shell_single_quote(key_material),
+        entry = shell_single_quote(&entry),
+    );
+    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
+    ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
+    Ok(())
+}
+
 fn apply_remote_unrestricted_authorized_key_with_pass(
     address: &str,
     pub_key: &str,
@@ -7667,9 +8530,45 @@ chmod 600 ~/.ssh/authorized_keys\n",
     Ok(())
 }
 
+fn apply_remote_unrestricted_authorized_key_with_access(
+    address: &str,
+    key_path: &Path,
+    pub_key: &str,
+) -> Result<(), OrchestratorError> {
+    let key_material = pub_key
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
+    let script = format!(
+        "set -euo pipefail\n\
+user='{user}'\n\
+home_dir=\"$(getent passwd \"$user\" | cut -d: -f6)\"\n\
+if [[ -z \"$home_dir\" ]]; then home_dir=\"/home/$user\"; fi\n\
+ssh_dir=\"$home_dir/.ssh\"\n\
+auth_keys=\"$ssh_dir/authorized_keys\"\n\
+mkdir -p \"$ssh_dir\"\n\
+chown \"$user:$user\" \"$ssh_dir\"\n\
+chmod 700 \"$ssh_dir\"\n\
+touch \"$auth_keys\"\n\
+chown \"$user:$user\" \"$auth_keys\"\n\
+{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' > \"$auth_keys.tmp\"; }} || true\n\
+mv \"$auth_keys.tmp\" \"$auth_keys\"\n\
+printf '%s\\n' '{entry}' >> \"$auth_keys\"\n\
+chown \"$user:$user\" \"$auth_keys\"\n\
+chmod 600 \"$auth_keys\"\n",
+        user = BOOTSTRAP_SSH_USER,
+        gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
+        key_material = shell_single_quote(key_material),
+        entry = shell_single_quote(pub_key),
+    );
+    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
+    ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
+    Ok(())
+}
+
 fn remote_orchestrator_sudoers_contents() -> String {
     format!(
-        "Defaults:{} !requiretty\n{} ALL=(root) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /bin/systemd-run, /usr/bin/systemd-run, /usr/bin/install, /bin/mkdir, /bin/rm, /bin/cp, /bin/mv, /usr/bin/sha256sum, /usr/bin/stat, /usr/bin/tee, /bin/chmod, /usr/bin/chmod, /bin/chown, /usr/bin/chown, /usr/bin/rsync, /usr/sbin/ufw, /usr/bin/firewall-cmd, /usr/sbin/service, /bin/bash, /usr/bin/bash\n",
+        "Defaults:{} !requiretty\n{} ALL=(root) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /bin/systemd-run, /usr/bin/systemd-run, /usr/bin/install, /bin/mkdir, /usr/bin/mkdir, /bin/rm, /usr/bin/rm, /bin/cp, /usr/bin/cp, /bin/mv, /usr/bin/mv, /bin/cat, /usr/bin/cat, /usr/bin/sha256sum, /usr/bin/stat, /usr/bin/tee, /bin/chmod, /usr/bin/chmod, /bin/chown, /usr/bin/chown, /usr/bin/rsync, /usr/sbin/ufw, /usr/bin/firewall-cmd, /usr/sbin/service, /bin/bash, /usr/bin/bash\n",
         BOOTSTRAP_SSH_USER, BOOTSTRAP_SSH_USER
     )
 }
@@ -7744,6 +8643,20 @@ fn ensure_remote_orchestrator_sudoers_with_access(
         BOOTSTRAP_SSH_USER,
     )
     .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (bash): {err}"))?;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap("/usr/bin/mkdir -p /tmp"),
+        BOOTSTRAP_SSH_USER,
+    )
+    .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (mkdir): {err}"))?;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap("/usr/bin/cat /etc/hosts >/dev/null"),
+        BOOTSTRAP_SSH_USER,
+    )
+    .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (cat): {err}"))?;
     Ok(())
 }
 
