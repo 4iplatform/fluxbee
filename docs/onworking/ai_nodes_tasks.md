@@ -2,7 +2,7 @@
 
 Status: active  
 Owner: AI nodes initiative  
-Last update: 2026-03-03
+Last update: 2026-03-04
 
 Design note (mandatory):
 - Target model is a single generic AI node runner that can spawn N logical `AI.*` nodes by config/command.
@@ -31,6 +31,7 @@ Design note (mandatory):
 - [x] T2.3 Define recoverable vs fatal errors and retry policy.
 - [x] T2.4 Add structured logs and basic metrics.
 - [x] T2.5 Add contract tests for message in/out and text payload helpers.
+- [x] T2.6 Keep runtime alive on idle read timeout (no exit on inactivity).
 
 ## T3 - Agent behavior (incremental)
 
@@ -42,6 +43,7 @@ Design note (mandatory):
 - [x] T3.2 Add model settings object (temperature, max tokens, etc).
 - [x] T3.3 Add mock llm provider for deterministic tests.
 - [x] T3.4 Add optional streaming output pathway.
+- [x] T3.5 Make runtime the single owner of reply `routing.src` assignment.
 
 ## T4 - Tool and handoff primitives
 

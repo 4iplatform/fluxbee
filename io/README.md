@@ -14,6 +14,18 @@ This subtree hosts IO crates isolated from core routing/AI crates.
 - Runtime transport is the same node transport used by Fluxbee (`NodeConfig` + unix socket on linux).
 - Local shim crates (`router-client`, `router-protocol`, `router-stub`, `node-test`) are no longer workspace members.
 
+## Install for Linux runtime
+
+From repo root:
+
+```bash
+bash scripts/install-io.sh
+```
+
+This installs `/usr/bin/io-slack`, `/usr/bin/io-sim` and systemd units:
+- `fluxbee-io-slack.service`
+- `fluxbee-io-sim.service`
+
 ## Run (linux target expected in production)
 
 Required env vars:

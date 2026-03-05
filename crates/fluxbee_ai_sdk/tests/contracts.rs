@@ -1,6 +1,6 @@
 use fluxbee_ai_sdk::{
-    build_reply_message, build_reply_routing, extract_text, build_text_response, Destination,
-    Message, Meta, Routing,
+    build_reply_message, build_reply_message_runtime_src, build_reply_routing, extract_text,
+    build_text_response, Destination, Message, Meta, Routing,
 };
 use serde_json::json;
 
@@ -69,6 +69,22 @@ fn contract_reply_message_reuses_meta_and_sets_payload() {
     assert_eq!(reply.meta.msg_type, "user");
     assert_eq!(reply.payload, payload);
     assert_eq!(reply.routing.trace_id, "trace-abc");
+}
+
+#[test]
+fn contract_reply_message_runtime_src_leaves_src_for_runtime_assignment() {
+    let message = sample_message();
+    let payload = json!({
+        "type": "text",
+        "content": "Echo: hola mundo",
+        "attachments": []
+    });
+
+    let reply = build_reply_message_runtime_src(&message, payload.clone());
+    assert_eq!(reply.meta.msg_type, "user");
+    assert_eq!(reply.payload, payload);
+    assert_eq!(reply.routing.trace_id, "trace-abc");
+    assert_eq!(reply.routing.src, "");
 }
 
 #[test]

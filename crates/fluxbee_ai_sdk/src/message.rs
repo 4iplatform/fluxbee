@@ -23,3 +23,13 @@ pub fn build_reply_message(msg: &Message, src_uuid: &str, payload: Value) -> Mes
         payload,
     }
 }
+
+/// Builds a reply message where routing.src is intentionally left for runtime assignment.
+/// NodeRuntime overwrites routing.src with the connected node UUID before sending.
+pub fn build_reply_message_runtime_src(msg: &Message, payload: Value) -> Message {
+    Message {
+        routing: build_reply_routing(msg, ""),
+        meta: msg.meta.clone(),
+        payload,
+    }
+}

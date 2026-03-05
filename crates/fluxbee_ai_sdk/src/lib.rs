@@ -14,7 +14,8 @@ pub use llm::{
     OpenAiResponsesClient,
 };
 pub use message::{
-    build_reply_message, build_reply_routing, Destination, Message, Meta, Routing,
+    build_reply_message, build_reply_message_runtime_src, build_reply_routing, Destination,
+    Message, Meta, Routing,
 };
 pub use node_trait::AiNode;
 pub use router_client::{AiNodeConfig, RouterClient};

@@ -74,6 +74,11 @@ Runtime configuration (implemented):
 - `retry_policy.max_backoff`
 - `metrics_log_interval`
 
+Idle/lifecycle rule:
+- read timeout does not terminate node runtime
+- node stays alive and keeps waiting for new messages
+- node exits only on fatal error or explicit service stop/restart
+
 Error policy (implemented):
 - Recoverable errors:
   - socket disconnections/timeouts
@@ -94,6 +99,7 @@ Observability (implemented):
 - structured error/retry logs by stage (`handler`, `write`)
 - periodic metrics logs with counters:
   - `read_messages`
+  - `idle_read_timeouts`
   - `enqueued_messages`
   - `processed_messages`
   - `responses_sent`
@@ -211,45 +217,12 @@ If cognition changes shape, only adapter/parsing layers should change, not the c
 
 ### 7.1 YAML config for `ai_node_runner`
 
-Use `docs/onworking/ai_node_runner_config.example.yaml` as baseline.
+Canonical example (single source of truth):
+- `docs/onworking/ai_node_runner_config.example.yaml`
 
-Minimal echo profile:
-
-```yaml
-node:
-  name: "AI.chat"
-  version: "0.1.0"
-  router_socket: "/var/run/fluxbee/routers"
-  uuid_persistence_dir: "/var/lib/fluxbee/state/nodes"
-  config_dir: "/etc/fluxbee"
-
-runtime:
-  read_timeout_ms: 3600000
-  handler_timeout_ms: 60000
-  write_timeout_ms: 10000
-  queue_capacity: 128
-  worker_pool_size: 4
-  retry_max_attempts: 3
-  retry_initial_backoff_ms: 200
-  retry_max_backoff_ms: 2000
-  metrics_log_interval_ms: 30000
-
-behavior:
-  kind: echo
-```
-
-Minimal OpenAI profile:
-
-```yaml
-behavior:
-  kind: openai_chat
-  model: "gpt-4.1-mini"
-  instructions:
-    source: inline
-    value: "Respond briefly and clearly in Spanish."
-    trim: true
-  api_key_env: "OPENAI_API_KEY"
-```
+Policy:
+- keep YAML examples only in the file above
+- reference that file from other docs to avoid drift
 
 ### 7.2 Start `ai_node_runner`
 
@@ -274,3 +247,26 @@ Example:
 - `node.name: "AI.chat"`
 - `hive_id: "sandbox"`
 - registered node name: `AI.chat@sandbox`
+
+### 7.4 Install and manage AI node instances
+
+Installation script (does not modify core `install.sh`):
+
+```bash
+bash scripts/install-ia.sh
+```
+
+Installs:
+- `/usr/bin/ai-node-runner`
+- `/usr/bin/ai-nodectl`
+- systemd template unit `/etc/systemd/system/fluxbee-ai-node@.service`
+
+Manage instances with `ai-nodectl`:
+
+```bash
+ai-nodectl list
+ai-nodectl add ai-chat /tmp/ai_chat.yaml
+sudo systemctl enable --now fluxbee-ai-node@ai-chat
+ai-nodectl status ai-chat
+ai-nodectl logs ai-chat --follow
+```

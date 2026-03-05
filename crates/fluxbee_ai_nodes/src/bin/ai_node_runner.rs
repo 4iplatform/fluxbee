@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use fluxbee_ai_sdk::{
-    build_reply_message, build_text_response, extract_text, Agent, AiNode, AiNodeConfig,
+    build_reply_message_runtime_src, build_text_response, extract_text, Agent, AiNode, AiNodeConfig,
     Message, ModelSettings, NodeRuntime, OpenAiResponsesClient, RetryPolicy, RouterClient,
     RuntimeConfig,
 };
@@ -179,7 +179,7 @@ impl AiNode for GenericAiNode {
         };
 
         let payload = build_text_response(output)?;
-        Ok(Some(build_reply_message(&msg, "pending-src", payload)))
+        Ok(Some(build_reply_message_runtime_src(&msg, payload)))
     }
 }
 
