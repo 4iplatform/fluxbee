@@ -3750,6 +3750,43 @@ fn load_runtime_manifest() -> Option<RuntimeManifest> {
     None
 }
 
+fn runtime_manifest_has_current_versions(manifest: &RuntimeManifest) -> bool {
+    let runtimes = match manifest.runtimes.as_object() {
+        Some(value) => value,
+        None => return false,
+    };
+    if runtimes.is_empty() {
+        return false;
+    }
+    runtimes.values().any(|entry| {
+        entry
+            .get("current")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_some_and(|current| !current.is_empty())
+    })
+}
+
+fn local_runtime_manifest_ready_for_spawn() -> bool {
+    load_runtime_manifest()
+        .as_ref()
+        .is_some_and(runtime_manifest_has_current_versions)
+}
+
+async fn wait_for_local_runtime_manifest_ready(timeout: Duration) -> bool {
+    if local_runtime_manifest_ready_for_spawn() {
+        return true;
+    }
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        time::sleep(Duration::from_millis(1000)).await;
+        if local_runtime_manifest_ready_for_spawn() {
+            return true;
+        }
+    }
+    false
+}
+
 async fn should_verify_runtimes(state: &OrchestratorState) -> bool {
     let mut guard = state.last_runtime_verify.lock().await;
     if guard.elapsed() < Duration::from_secs(RUNTIME_VERIFY_INTERVAL_SECS) {
@@ -5118,6 +5155,11 @@ async fn add_hive_finalize_local_flow(
         .get("require_dist_sync")
         .and_then(parse_bool_value)
         .unwrap_or(false);
+    let dist_sync_probe_timeout_secs = payload
+        .get("dist_sync_probe_timeout_secs")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(DIST_SYNC_PROBE_TIMEOUT_SECS)
+        .clamp(5, 600);
     let mut updated: Vec<String> = Vec::new();
     let mut unchanged: Vec<String> = Vec::new();
     let mut restarted: Vec<String> = Vec::new();
@@ -5240,11 +5282,19 @@ async fn add_hive_finalize_local_flow(
     } else {
         false
     };
+    let runtime_manifest_ready = if !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist)
+    {
+        local_runtime_manifest_ready_for_spawn()
+    } else if service_active && api_healthy {
+        wait_for_local_runtime_manifest_ready(Duration::from_secs(dist_sync_probe_timeout_secs)).await
+    } else {
+        false
+    };
     let dist_sync_ready = if !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist)
     {
         true
     } else {
-        service_active && api_healthy
+        service_active && api_healthy && runtime_manifest_ready
     };
 
     serde_json::json!({
@@ -5254,6 +5304,8 @@ async fn add_hive_finalize_local_flow(
         "dist_sync_enabled": desired_dist.sync_enabled,
         "service_active": service_active,
         "api_healthy": api_healthy,
+        "runtime_manifest_ready": runtime_manifest_ready,
+        "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
         "dist_sync_ready": dist_sync_ready,
         "core_sync_pending": core_sync_pending,
         "require_dist_sync": require_dist_sync,
