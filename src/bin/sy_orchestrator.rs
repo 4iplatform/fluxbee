@@ -5510,7 +5510,7 @@ async fn forward_system_action_to_hive_with_timeout(
     }
 
     let socket_dir = json_router::paths::router_socket_dir();
-    let relay_name = "SY.orchestrator.relay".to_string();
+    let relay_name = format!("SY.orchestrator.relay.{}", now_epoch_ms());
     let relay_config = NodeConfig {
         name: relay_name,
         router_socket: socket_dir,
