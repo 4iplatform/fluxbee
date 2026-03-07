@@ -38,6 +38,7 @@ const STORAGE_DB_READINESS_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS: u64 = 3;
 const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const SY_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
+const ADD_HIVE_FINALIZE_SOCKET_TIMEOUT_SECS: u64 = 120;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
 const SYNCTHING_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
 const SYNCTHING_HEALTH_TIMEOUT_SECS: u64 = 2;
@@ -1050,6 +1051,7 @@ async fn handle_admin(
                     require_dist_sync,
                     dist_sync_probe_timeout_secs,
                 )
+                .await
             } else {
                 serde_json::json!({
                     "status": "error",
@@ -1102,6 +1104,7 @@ async fn handle_system_message(
             | "KILL_NODE"
             | "RUN_ROUTER"
             | "KILL_ROUTER"
+            | "ADD_HIVE_FINALIZE"
             | "REMOVE_HIVE_CLEANUP"
     ) {
         source_name = resolve_system_source_name_with_retry(state, &msg.routing.src).await;
@@ -1160,6 +1163,15 @@ async fn handle_system_message(
                     let _ =
                         send_system_action_response(sender, msg, "KILL_ROUTER_RESPONSE", payload)
                             .await;
+                }
+                "ADD_HIVE_FINALIZE" => {
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "ADD_HIVE_FINALIZE_RESPONSE",
+                        payload,
+                    )
+                    .await;
                 }
                 "REMOVE_HIVE_CLEANUP" => {
                     let _ = send_system_action_response(
@@ -1339,6 +1351,17 @@ async fn handle_system_message(
             let result = kill_router_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "KILL_ROUTER processed");
             let _ = send_system_action_response(sender, msg, "KILL_ROUTER_RESPONSE", result).await;
+        }
+        Some("ADD_HIVE_FINALIZE") => {
+            let result = add_hive_finalize_local_flow(state, &msg.payload).await;
+            tracing::info!(result = %result, "ADD_HIVE_FINALIZE processed");
+            let _ = send_system_action_response(
+                sender,
+                msg,
+                "ADD_HIVE_FINALIZE_RESPONSE",
+                result,
+            )
+            .await;
         }
         Some("REMOVE_HIVE_CLEANUP") => {
             let result = remove_hive_cleanup_local_flow();
@@ -7018,7 +7041,94 @@ fn disable_remote_blob_sync_all_hives(state: &OrchestratorState) {
     }
 }
 
-fn add_hive_flow(
+async fn add_hive_finalize_local_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let desired_blob = current_blob_runtime_config(state);
+    let desired_dist = current_dist_runtime_config(state);
+    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
+    let require_dist_sync = payload
+        .get("require_dist_sync")
+        .and_then(parse_bool_value)
+        .unwrap_or(false);
+
+    let apply_result = if desired_sync.sync_enabled {
+        ensure_blob_sync_runtime(&desired_blob, &desired_dist).await
+    } else {
+        disable_blob_sync_runtime_local()
+    };
+    if let Err(err) = apply_result {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SYNC_SETUP_FAILED",
+            "message": err.to_string(),
+            "hive_id": state.hive_id,
+            "blob_sync_enabled": desired_blob.sync_enabled,
+            "dist_sync_enabled": desired_dist.sync_enabled,
+            "require_dist_sync": require_dist_sync,
+        });
+    }
+
+    let service_active = if desired_sync.sync_enabled {
+        systemd_is_active(SYNCTHING_SERVICE_NAME)
+    } else {
+        false
+    };
+    let api_healthy = if desired_sync.sync_enabled {
+        syncthing_api_healthy(desired_sync.sync_api_port).await
+    } else {
+        false
+    };
+
+    serde_json::json!({
+        "status": "ok",
+        "hive_id": state.hive_id,
+        "blob_sync_enabled": desired_blob.sync_enabled,
+        "dist_sync_enabled": desired_dist.sync_enabled,
+        "service_active": service_active,
+        "api_healthy": api_healthy,
+        "require_dist_sync": require_dist_sync,
+        "dist_path": desired_dist.path.display().to_string(),
+    })
+}
+
+async fn add_hive_finalize_via_socket(
+    state: &OrchestratorState,
+    hive_id: &str,
+    address: &str,
+    require_dist_sync: bool,
+    dist_sync_probe_timeout_secs: u64,
+) -> Result<serde_json::Value, OrchestratorError> {
+    let timeout_secs = ADD_HIVE_FINALIZE_SOCKET_TIMEOUT_SECS.max(dist_sync_probe_timeout_secs);
+    let payload = forward_system_action_to_hive_with_timeout(
+        state,
+        hive_id,
+        "ADD_HIVE_FINALIZE",
+        "ADD_HIVE_FINALIZE_RESPONSE",
+        serde_json::json!({
+            "hive_id": hive_id,
+            "target": hive_id,
+            "address": address,
+            "require_dist_sync": require_dist_sync,
+            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+        }),
+        Duration::from_secs(timeout_secs),
+    )
+    .await?;
+
+    if payload
+        .get("status")
+        .and_then(|value| value.as_str())
+        .is_some_and(|status| status.eq_ignore_ascii_case("ok"))
+    {
+        return Ok(payload);
+    }
+
+    Err(format!("worker finalize returned non-ok payload: {}", payload).into())
+}
+
+async fn add_hive_flow(
     state: &OrchestratorState,
     hive_id: &str,
     address: &str,
@@ -7117,6 +7227,32 @@ fn add_hive_flow(
     )
     .is_ok();
     if socket_only_ready {
+        let finalize = match add_hive_finalize_via_socket(
+            state,
+            hive_id,
+            address,
+            require_dist_sync,
+            dist_sync_probe_timeout_secs,
+        )
+        .await
+        {
+            Ok(payload) => payload,
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "FINALIZE_FAILED",
+                    "message": format!("worker socket-only finalize failed: {err}"),
+                    "hive_id": hive_id,
+                    "address": address,
+                    "bootstrap_mode": "socket_only_existing_orchestrator",
+                    "harden_ssh": harden_ssh,
+                    "restrict_ssh": false,
+                    "restrict_ssh_requested": restrict_ssh,
+                    "require_dist_sync": require_dist_sync,
+                    "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                });
+            }
+        };
         let info_path = hives_root().join(hive_id).join("info.yaml");
         let info = serde_yaml::to_string(&serde_json::json!({
             "hive_id": hive_id,
@@ -7151,6 +7287,7 @@ fn add_hive_flow(
             "wan_connected": true,
             "orchestrator_connected": true,
             "dist_sync_ready": dist_sync_ready,
+            "finalize": finalize,
         });
     }
 
@@ -7872,6 +8009,35 @@ fn add_hive_flow(
         });
     }
 
+    let finalize = match add_hive_finalize_via_socket(
+        state,
+        hive_id,
+        address,
+        require_dist_sync,
+        dist_sync_probe_timeout_secs,
+    )
+    .await
+    {
+        Ok(payload) => payload,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "FINALIZE_FAILED",
+                "message": format!("worker finalize failed after bootstrap: {err}"),
+                "hive_id": hive_id,
+                "address": address,
+                "harden_ssh": harden_ssh,
+                "restrict_ssh": restrict_ssh_applied,
+                "restrict_ssh_requested": restrict_ssh,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+                "dist_sync_ready": dist_sync_ready,
+            });
+        }
+    };
+
     serde_json::json!({
         "status": "ok",
         "hive_id": hive_id,
@@ -7884,6 +8050,7 @@ fn add_hive_flow(
         "wan_connected": true,
         "orchestrator_connected": true,
         "dist_sync_ready": dist_sync_ready,
+        "finalize": finalize,
     })
 }
 

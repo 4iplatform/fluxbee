@@ -220,6 +220,8 @@ Objetivo: usar SSH solo para bootstrap minimo del worker y mover toda la post-in
 - [ ] El canal SSH queda confinado a bootstrap minimo y fallback tecnico.
 - [ ] El comportamiento queda documentado en `docs/07-operaciones.md` y spec v2 de trabajo.
 
+Nota (2026-03-07): se incorporó la acción `ADD_HIVE_FINALIZE` en canal `system` y `add_hive` ahora la invoca cuando detecta `SY.orchestrator@worker` visible (incluyendo modo `socket_only`). Esta iteración establece el esqueleto socket-first de finalize; falta mover completamente la post-instalación para cerrar R3/R4.
+
 ## 6. Definicion de Done v2
 
 - [ ] `SYSTEM_UPDATE` reemplaza operativamente a `RUNTIME_UPDATE`.
