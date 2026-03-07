@@ -89,6 +89,7 @@ const WORKER_MIN_CORE_COMPONENTS: [&str; 4] = [
     "sy-opa-rules",
     "sy-orchestrator",
 ];
+const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 2] = ["rt-gateway", "sy-orchestrator"];
 const DEFAULT_BLOB_ENABLED: bool = true;
 const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
 const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
@@ -6274,7 +6275,10 @@ fn sync_core_to_worker(
 ) -> Result<(), OrchestratorError> {
     let manifest = load_core_manifest()?;
     let component_names = if worker_bootstrap_only {
-        core_component_names_for_role(&manifest, false)?
+        WORKER_BOOTSTRAP_CORE_COMPONENTS
+            .iter()
+            .map(|name| name.to_string())
+            .collect()
     } else {
         core_component_names_for_role(&manifest, true)?
     };
@@ -6304,6 +6308,59 @@ fn sync_core_to_worker(
         local_paths.push(path.display().to_string());
     }
     validate_core_manifest_for_bins(&local_paths)?;
+
+    if worker_bootstrap_only {
+        let upload_refs: Vec<&str> = local_paths.iter().map(String::as_str).collect();
+        let remote_stage = format!("/tmp/fluxbee-core-sync-{}", sanitize_unit_suffix(hive_id));
+        let prepare_stage = format!(
+            "rm -rf '{stage}' && mkdir -p '{stage}'",
+            stage = shell_single_quote(&remote_stage)
+        );
+        ssh_with_key(address, key_path, &prepare_stage, BOOTSTRAP_SSH_USER)?;
+        scp_with_key(
+            address,
+            key_path,
+            &upload_refs,
+            &format!("{remote_stage}/"),
+            BOOTSTRAP_SSH_USER,
+        )?;
+
+        let mut commands = vec![
+            "set -euo pipefail".to_string(),
+            "mkdir -p /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/core/bin".to_string(),
+        ];
+        for name in &component_names {
+            commands.push(format!(
+                "install -m 0755 '{stage}/{name}' '/usr/bin/{name}'",
+                stage = shell_single_quote(&remote_stage),
+                name = shell_single_quote(name),
+            ));
+            commands.push(format!(
+                "install -m 0755 '{stage}/{name}' '/var/lib/fluxbee/dist/core/bin/{name}'",
+                stage = shell_single_quote(&remote_stage),
+                name = shell_single_quote(name),
+            ));
+            commands.push(format!(
+                "install -m 0755 '{stage}/{name}' '/var/lib/fluxbee/core/bin/{name}'",
+                stage = shell_single_quote(&remote_stage),
+                name = shell_single_quote(name),
+            ));
+        }
+        commands.push(format!(
+            "rm -rf '{stage}'",
+            stage = shell_single_quote(&remote_stage)
+        ));
+
+        let promote_cmd = commands.join(" && ");
+        let promote_cmd_q = shell_single_quote(&promote_cmd);
+        ssh_with_key(
+            address,
+            key_path,
+            &sudo_wrap(&format!("bash -lc '{}'", promote_cmd_q)),
+            BOOTSTRAP_SSH_USER,
+        )?;
+        return Ok(());
+    }
 
     let mut upload_paths = local_paths.clone();
     let manifest_source_path = local_core_manifest_path().ok_or_else(|| {
@@ -7054,23 +7111,42 @@ async fn add_hive_finalize_local_flow(
     let mut unchanged: Vec<String> = Vec::new();
     let mut restarted: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut core_sync_pending = false;
 
     let core_result = match apply_system_update_local(state, "core").await {
         Ok(result) => result,
         Err(err) => {
-            errors.push(err.to_string());
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "CORE_FINALIZE_FAILED",
-                "message": err.to_string(),
-                "hive_id": state.hive_id,
-                "require_dist_sync": require_dist_sync,
-                "dist_sync_enabled": desired_dist.sync_enabled,
-                "updated": updated,
-                "unchanged": unchanged,
-                "restarted": restarted,
-                "errors": errors,
-            });
+            let err_text = err.to_string();
+            if is_add_hive_core_sync_pending_error(&err_text) {
+                core_sync_pending = true;
+                unchanged.push("core-sync-pending".to_string());
+                tracing::warn!(
+                    hive_id = %state.hive_id,
+                    error = %err_text,
+                    "core finalize pending (dist/core not converged yet); continuing"
+                );
+                SystemUpdateApplyResult {
+                    status: "ok".to_string(),
+                    updated: Vec::new(),
+                    unchanged: Vec::new(),
+                    restarted: Vec::new(),
+                    errors: Vec::new(),
+                }
+            } else {
+                errors.push(err_text.clone());
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "CORE_FINALIZE_FAILED",
+                    "message": err_text,
+                    "hive_id": state.hive_id,
+                    "require_dist_sync": require_dist_sync,
+                    "dist_sync_enabled": desired_dist.sync_enabled,
+                    "updated": updated,
+                    "unchanged": unchanged,
+                    "restarted": restarted,
+                    "errors": errors,
+                });
+            }
         }
     };
     if core_result.status != "ok" {
@@ -7168,6 +7244,7 @@ async fn add_hive_finalize_local_flow(
         "service_active": service_active,
         "api_healthy": api_healthy,
         "dist_sync_ready": dist_sync_ready,
+        "core_sync_pending": core_sync_pending,
         "require_dist_sync": require_dist_sync,
         "dist_path": desired_dist.path.display().to_string(),
         "updated": updated,
@@ -7175,6 +7252,13 @@ async fn add_hive_finalize_local_flow(
         "restarted": restarted,
         "errors": errors,
     })
+}
+
+fn is_add_hive_core_sync_pending_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("core manifest missing")
+        || lower.contains("missing core source binary")
+        || lower.contains("core manifest missing required worker component")
 }
 
 async fn add_hive_finalize_via_socket(
