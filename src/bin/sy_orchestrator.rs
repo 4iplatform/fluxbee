@@ -7052,6 +7052,17 @@ async fn add_hive_finalize_local_flow(
         .get("require_dist_sync")
         .and_then(parse_bool_value)
         .unwrap_or(false);
+    let mut updated: Vec<String> = Vec::new();
+    let mut unchanged: Vec<String> = Vec::new();
+    let mut restarted: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    let pre_service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+    let pre_api_healthy = if desired_sync.sync_enabled {
+        syncthing_api_healthy(desired_sync.sync_api_port).await
+    } else {
+        false
+    };
 
     let apply_result = if desired_sync.sync_enabled {
         ensure_blob_sync_runtime(&desired_blob, &desired_dist).await
@@ -7059,6 +7070,7 @@ async fn add_hive_finalize_local_flow(
         disable_blob_sync_runtime_local()
     };
     if let Err(err) = apply_result {
+        errors.push(err.to_string());
         return serde_json::json!({
             "status": "error",
             "error_code": "SYNC_SETUP_FAILED",
@@ -7067,6 +7079,10 @@ async fn add_hive_finalize_local_flow(
             "blob_sync_enabled": desired_blob.sync_enabled,
             "dist_sync_enabled": desired_dist.sync_enabled,
             "require_dist_sync": require_dist_sync,
+            "updated": updated,
+            "unchanged": unchanged,
+            "restarted": restarted,
+            "errors": errors,
         });
     }
 
@@ -7081,6 +7097,22 @@ async fn add_hive_finalize_local_flow(
         false
     };
 
+    if desired_sync.sync_enabled {
+        if pre_service_active && pre_api_healthy && service_active && api_healthy {
+            unchanged.push("syncthing".to_string());
+        } else {
+            updated.push("syncthing".to_string());
+        }
+        if (!pre_service_active || !pre_api_healthy) && service_active {
+            restarted.push(SYNCTHING_SERVICE_NAME.to_string());
+        }
+    } else if pre_service_active {
+        updated.push("syncthing-disabled".to_string());
+        restarted.push(SYNCTHING_SERVICE_NAME.to_string());
+    } else {
+        unchanged.push("syncthing-disabled".to_string());
+    }
+
     serde_json::json!({
         "status": "ok",
         "hive_id": state.hive_id,
@@ -7090,6 +7122,10 @@ async fn add_hive_finalize_local_flow(
         "api_healthy": api_healthy,
         "require_dist_sync": require_dist_sync,
         "dist_path": desired_dist.path.display().to_string(),
+        "updated": updated,
+        "unchanged": unchanged,
+        "restarted": restarted,
+        "errors": errors,
     })
 }
 
@@ -7126,6 +7162,38 @@ async fn add_hive_finalize_via_socket(
     }
 
     Err(format!("worker finalize returned non-ok payload: {}", payload).into())
+}
+
+fn append_add_hive_finalize_history(
+    state: &OrchestratorState,
+    hive_id: &str,
+    status: &str,
+    reason: Option<String>,
+) {
+    let manifest_hash = local_syncthing_vendor_hash().ok().flatten();
+    append_single_deployment_history(
+        state,
+        "vendor",
+        "add_hive_finalize_socket",
+        hive_id,
+        status,
+        reason,
+        manifest_hash,
+    );
+}
+
+fn dist_sync_ready_from_finalize_payload(
+    finalize: &serde_json::Value,
+    dist: &DistRuntimeConfig,
+) -> bool {
+    if !dist.sync_enabled || !dist_sync_tool_is_syncthing(dist) {
+        return true;
+    }
+    finalize
+        .get("dist_sync_ready")
+        .and_then(|value| value.as_bool())
+        .or_else(|| finalize.get("api_healthy").and_then(|value| value.as_bool()))
+        .unwrap_or(false)
 }
 
 async fn add_hive_flow(
@@ -7227,6 +7295,9 @@ async fn add_hive_flow(
     )
     .is_ok();
     if socket_only_ready {
+        let mut socket_restrict_ssh_applied = false;
+        let mut socket_restrict_ssh_mode = "unrestricted".to_string();
+        let mut socket_harden_ssh_applied = false;
         let finalize = match add_hive_finalize_via_socket(
             state,
             hive_id,
@@ -7236,8 +7307,17 @@ async fn add_hive_flow(
         )
         .await
         {
-            Ok(payload) => payload,
+            Ok(payload) => {
+                append_add_hive_finalize_history(state, hive_id, "ok", None);
+                payload
+            }
             Err(err) => {
+                append_add_hive_finalize_history(
+                    state,
+                    hive_id,
+                    "error",
+                    Some(err.to_string()),
+                );
                 return serde_json::json!({
                     "status": "error",
                     "error_code": "FINALIZE_FAILED",
@@ -7253,6 +7333,96 @@ async fn add_hive_flow(
                 });
             }
         };
+        dist_sync_ready = dist_sync_ready_from_finalize_payload(&finalize, &desired_dist);
+        if require_dist_sync && !dist_sync_ready {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "DIST_SYNC_TIMEOUT",
+                "message": "worker finalize completed but dist sync is not ready",
+                "hive_id": hive_id,
+                "address": address,
+                "bootstrap_mode": "socket_only_existing_orchestrator",
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                "dist_sync_ready": dist_sync_ready,
+                "finalize": finalize,
+            });
+        }
+        if harden_ssh || restrict_ssh {
+            let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
+            if !key_path.exists() {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "SSH_KEY_FAILED",
+                    "message": format!(
+                        "motherbee ssh key missing (expected '{}'); run scripts/install.sh",
+                        key_path.display()
+                    ),
+                    "hive_id": hive_id,
+                    "address": address,
+                    "bootstrap_mode": "socket_only_existing_orchestrator",
+                    "harden_ssh": harden_ssh,
+                    "restrict_ssh_requested": restrict_ssh,
+                });
+            }
+            let pub_key = match public_key_from_private_key(&key_path) {
+                Ok(data) => data,
+                Err(err) => {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "SSH_KEY_FAILED",
+                        "message": format!(
+                            "failed to derive public key from '{}': {}",
+                            key_path.display(),
+                            err
+                        ),
+                        "hive_id": hive_id,
+                        "address": address,
+                        "bootstrap_mode": "socket_only_existing_orchestrator",
+                        "harden_ssh": harden_ssh,
+                        "restrict_ssh_requested": restrict_ssh,
+                    });
+                }
+            };
+            let password_channel_available =
+                ssh_with_pass_any(address, "true", BOOTSTRAP_SSH_USER).is_ok();
+            let ssh_controls = match apply_add_hive_ssh_controls_after_finalize(
+                address,
+                &key_path,
+                &pub_key,
+                password_channel_available,
+                restrict_ssh,
+                harden_ssh,
+            ) {
+                Ok(result) => result,
+                Err(err) => {
+                    let err_text = err.to_string();
+                    let error_code = if err_text.to_ascii_lowercase().contains("harden") {
+                        "SSH_HARDEN_FAILED"
+                    } else {
+                        "SSH_KEY_FAILED"
+                    };
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": error_code,
+                        "message": err_text,
+                        "hive_id": hive_id,
+                        "address": address,
+                        "bootstrap_mode": "socket_only_existing_orchestrator",
+                        "harden_ssh": harden_ssh,
+                        "restrict_ssh": false,
+                        "restrict_ssh_requested": restrict_ssh,
+                        "require_dist_sync": require_dist_sync,
+                        "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                        "dist_sync_ready": dist_sync_ready,
+                        "finalize": finalize,
+                    });
+                }
+            };
+            socket_restrict_ssh_applied = ssh_controls.restrict_ssh_applied;
+            socket_restrict_ssh_mode = ssh_controls.restrict_ssh_mode;
+            socket_harden_ssh_applied = harden_ssh;
+        }
         let info_path = hives_root().join(hive_id).join("info.yaml");
         let info = serde_yaml::to_string(&serde_json::json!({
             "hive_id": hive_id,
@@ -7279,8 +7449,9 @@ async fn add_hive_flow(
             "address": address,
             "bootstrap_mode": "socket_only_existing_orchestrator",
             "harden_ssh": harden_ssh,
-            "harden_ssh_applied": false,
-            "restrict_ssh": false,
+            "harden_ssh_applied": socket_harden_ssh_applied,
+            "restrict_ssh": socket_restrict_ssh_applied,
+            "restrict_ssh_mode": socket_restrict_ssh_mode,
             "restrict_ssh_requested": restrict_ssh,
             "require_dist_sync": require_dist_sync,
             "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
@@ -7319,41 +7490,29 @@ async fn add_hive_flow(
     };
 
     let mut password_channel_available = true;
-    if let Err(pass_err) = ssh_with_pass(address, "true", BOOTSTRAP_SSH_USER) {
-        match ssh_with_pass_kbd(address, "true", BOOTSTRAP_SSH_USER) {
+    if let Err(pass_err) = ssh_with_pass_any(address, "true", BOOTSTRAP_SSH_USER) {
+        password_channel_available = false;
+        match ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
             Ok(()) => {
                 tracing::warn!(
                     target = address,
                     error = %pass_err,
-                    "password probe via direct method failed; keyboard-interactive fallback succeeded"
+                    "password bootstrap channel unavailable; continuing via key channel"
                 );
             }
-            Err(pass_kbd_err) => {
-                password_channel_available = false;
-                let pass_text = format!(
-                    "{pass_err}; keyboard-interactive probe failed: {pass_kbd_err}"
-                );
-                match ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
-                    Ok(()) => {
-                        tracing::warn!(
-                            target = address,
-                            error = %pass_text,
-                            "password bootstrap channel unavailable; continuing via key channel"
-                        );
-                    }
-                    Err(key_err) => {
-                        return ssh_bootstrap_error_payload(&format!(
-                            "password probe failed: {pass_text}; key probe failed: {key_err}"
-                        ));
-                    }
-                }
+            Err(key_err) => {
+                return ssh_bootstrap_error_payload(&format!(
+                    "password probe failed: {pass_err}; key probe failed: {key_err}"
+                ));
             }
         }
     }
 
     if password_channel_available {
         // Seed via password channel when available (fresh bootstrap path).
-        if let Err(pass_seed_err) = apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key) {
+        if let Err(pass_seed_err) =
+            apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key)
+        {
             tracing::warn!(
                 target = address,
                 error = %pass_seed_err,
@@ -7389,147 +7548,17 @@ async fn add_hive_flow(
     }
 
     let mut restrict_ssh_applied = false;
-    let restrict_ssh_effective = restrict_ssh;
-    if restrict_ssh_effective {
-        let source_patterns = resolve_add_hive_authkey_source_patterns(address);
-        let restricted_result: Result<(), OrchestratorError> = (|| {
-            install_remote_ssh_gate_with_access(address, &key_path)
-                .map_err(|err| format!("install gate failed: {err}"))?;
-            if source_patterns.is_empty() {
-                tracing::info!(
-                    target = address,
-                    "authorized_keys restriction applied (gate enabled, from filter disabled by policy)"
-                );
-            } else {
-                tracing::info!(
-                    target = address,
-                    from_patterns = ?source_patterns,
-                    "authorized_keys restriction applied (gate enabled, from filter enabled by policy)"
-                );
-            }
-            apply_remote_restricted_authorized_key_with_access(
-                address,
-                &key_path,
-                &pub_key,
-                &source_patterns,
-            )
-            .map_err(|err| format!("apply restricted authorized_keys failed: {err}"))?;
-            ssh_with_key(
-                address,
-                &key_path,
-                "sudo -n /bin/bash -lc 'exit 0'",
-                BOOTSTRAP_SSH_USER,
-            )
-            .map_err(|err| format!("restricted sudo verification failed: {err}"))?;
-            Ok(())
-        })();
-        match restricted_result {
-            Ok(()) => {
-                restrict_ssh_applied = true;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    target = address,
-                    error = %err,
-                    "restricted key flow failed; falling back to unrestricted key mode"
-                );
-                let restricted_err_text = err.to_string();
-                if restricted_err_text.contains("empty SSH_ORIGINAL_COMMAND") {
-                    tracing::warn!(
-                        target = address,
-                        "worker sshd does not provide SSH_ORIGINAL_COMMAND for forced-command keys; trying from-only restriction fallback"
-                    );
-                    let from_only_result = apply_remote_from_only_authorized_key_with_access(
-                        address,
-                        &key_path,
-                        &pub_key,
-                        &source_patterns,
-                    )
-                    .and_then(|_| {
-                        ssh_with_key(
-                            address,
-                            &key_path,
-                            "sudo -n /bin/bash -lc 'exit 0'",
-                            BOOTSTRAP_SSH_USER,
-                        )
-                    });
-                    if from_only_result.is_ok() {
-                        tracing::warn!(
-                            target = address,
-                            from_patterns = ?source_patterns,
-                            "restrict_ssh degraded to from-only mode (gate disabled due sshd behavior)"
-                        );
-                        restrict_ssh_applied = true;
-                    } else {
-                        tracing::warn!(
-                            target = address,
-                            "from-only restriction fallback failed; continuing to unrestricted fallback"
-                        );
-                    }
-                }
-                if !restrict_ssh_applied {
-                    let fallback_result = if password_channel_available {
-                        apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key)
-                    } else {
-                        apply_remote_unrestricted_authorized_key_with_access(
-                            address,
-                            &key_path,
-                            &pub_key,
-                        )
-                    };
-                    if let Err(fallback_err) = fallback_result {
-                        return serde_json::json!({
-                            "status": "error",
-                            "error_code": "SSH_KEY_FAILED",
-                            "message": format!("restricted key flow failed ({err}); unrestricted fallback failed: {fallback_err}"),
-                        });
-                    }
-                    if let Err(verify_err) =
-                        ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER)
-                    {
-                        return serde_json::json!({
-                            "status": "error",
-                            "error_code": "SSH_KEY_FAILED",
-                            "message": format!("restricted key flow failed ({err}); unrestricted fallback verification failed: {verify_err}"),
-                        });
-                    }
-                }
-            }
-        }
-    } else {
-        tracing::warn!(
-            target = address,
-            "authorized_keys gate/restriction skipped (legacy insecure mode)"
-        );
-        if let Err(err) = ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!("key access verification failed after bootstrap seed: {err}"),
-            });
-        }
-    }
-
-    if harden_ssh {
-        let harden_result = if password_channel_available {
-            disable_remote_password_auth(address)
-        } else {
-            disable_remote_password_auth_with_access(address, &key_path)
-        };
-        if let Err(err) = harden_result {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_HARDEN_FAILED",
-                "message": err.to_string(),
-            });
-        }
-        if let Err(err) = verify_remote_ssh_hardening_with_access(address, &key_path) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_HARDEN_FAILED",
-                "message": err.to_string(),
-            });
-        }
+    if let Err(err) = ssh_with_key(
+        address,
+        &key_path,
+        "sudo -n /bin/bash -lc 'exit 0'",
+        BOOTSTRAP_SSH_USER,
+    ) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_KEY_FAILED",
+            "message": format!("key access verification failed after bootstrap seed: {err}"),
+        });
     }
 
     let core_manifest = match load_core_manifest() {
@@ -7725,7 +7754,8 @@ async fn add_hive_flow(
         });
     }
 
-    for (name, _) in &worker_units {
+    let bootstrap_units = ["rt-gateway", "sy-orchestrator"];
+    for name in bootstrap_units {
         if let Err(err) = ssh_with_key(
             address,
             &key_path,
@@ -7738,7 +7768,7 @@ async fn add_hive_flow(
                 "message": format!("enable {name}: {err}"),
             });
         }
-        let service_inner = if *name == "sy-orchestrator" {
+        let service_inner = if name == "sy-orchestrator" {
             format!(
                 "systemctl start {name} || (systemctl reset-failed {name} || true; sleep 1; systemctl start {name})"
             )
@@ -7757,7 +7787,7 @@ async fn add_hive_flow(
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SERVICE_FAILED",
-                "message": format!("start/restart {name}: {err}"),
+                "message": format!("start/restart bootstrap unit {name}: {err}"),
             });
         }
     }
@@ -7778,180 +7808,10 @@ async fn add_hive_flow(
         });
     }
 
-    if desired_blob.sync_enabled || desired_dist.sync_enabled {
-        let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
-        let vendor_started_at = now_epoch_ms();
-        let vendor_started = Instant::now();
-        let local_vendor_hash = local_syncthing_vendor_hash().ok().flatten();
-        let remote_vendor_hash_before = remote_syncthing_installed_hash(address, &key_path)
-            .ok()
-            .flatten();
-        if let Err(err) = ensure_remote_syncthing_runtime_with_access(
-            address,
-            &key_path,
-            &desired_sync,
-            &desired_blob,
-            &desired_dist,
-        ) {
-            let rollback_note = attempt_remote_syncthing_rollback_note(address, &key_path);
-            let reason = format!("syncthing setup failed: {err}; {rollback_note}");
-            let entry = DeploymentHistoryEntry {
-                deployment_id: Uuid::new_v4().to_string(),
-                category: "vendor".to_string(),
-                trigger: "add_hive".to_string(),
-                actor: default_deployment_actor(state),
-                started_at: vendor_started_at,
-                finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
-                manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
-                manifest_hash: local_vendor_hash.clone(),
-                target_hives: vec![hive_id.to_string()],
-                result: "error".to_string(),
-                workers: vec![DeploymentWorkerOutcome {
-                    hive_id: hive_id.to_string(),
-                    status: "error".to_string(),
-                    reason: Some(reason.clone()),
-                    duration_ms: vendor_started.elapsed().as_millis() as u64,
-                    local_hash: local_vendor_hash.clone(),
-                    remote_hash_before: remote_vendor_hash_before.clone(),
-                    remote_hash_after: None,
-                }],
-            };
-            if let Err(history_err) = append_deployment_history(&entry) {
-                tracing::warn!(error = %history_err, "failed to persist add_hive vendor deployment history");
-            }
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SYNC_SETUP_FAILED",
-                "message": reason,
-            });
-        }
-        if let Err(err) = ensure_syncthing_peer_pairing_with_access(
-            &state.hive_id,
-            hive_id,
-            address,
-            &key_path,
-            &desired_sync,
-            &desired_blob,
-            &desired_dist,
-        ) {
-            let rollback_note = attempt_remote_syncthing_rollback_note(address, &key_path);
-            let reason = format!("syncthing peer pairing failed: {err}; {rollback_note}");
-            let entry = DeploymentHistoryEntry {
-                deployment_id: Uuid::new_v4().to_string(),
-                category: "vendor".to_string(),
-                trigger: "add_hive".to_string(),
-                actor: default_deployment_actor(state),
-                started_at: vendor_started_at,
-                finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
-                manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
-                manifest_hash: local_vendor_hash.clone(),
-                target_hives: vec![hive_id.to_string()],
-                result: "error".to_string(),
-                workers: vec![DeploymentWorkerOutcome {
-                    hive_id: hive_id.to_string(),
-                    status: "error".to_string(),
-                    reason: Some(reason.clone()),
-                    duration_ms: vendor_started.elapsed().as_millis() as u64,
-                    local_hash: local_vendor_hash.clone(),
-                    remote_hash_before: remote_vendor_hash_before.clone(),
-                    remote_hash_after: None,
-                }],
-            };
-            if let Err(history_err) = append_deployment_history(&entry) {
-                tracing::warn!(
-                    error = %history_err,
-                    "failed to persist add_hive vendor pairing history"
-                );
-            }
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SYNC_SETUP_FAILED",
-                "message": reason,
-            });
-        }
-        match verify_remote_dist_sync_ready_with_access(
-            address,
-            &key_path,
-            &desired_dist,
-            dist_sync_probe_timeout_secs,
-        ) {
-            Ok(()) => {
-                dist_sync_ready = true;
-            }
-            Err(err) => {
-                let reason = format!("dist sync readiness probe failed: {err}");
-                let strict_status = if require_dist_sync { "error" } else { "warning" };
-                let entry = DeploymentHistoryEntry {
-                    deployment_id: Uuid::new_v4().to_string(),
-                    category: "vendor".to_string(),
-                    trigger: "add_hive".to_string(),
-                    actor: default_deployment_actor(state),
-                    started_at: vendor_started_at,
-                    finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
-                    manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
-                    manifest_hash: local_vendor_hash.clone(),
-                    target_hives: vec![hive_id.to_string()],
-                    result: strict_status.to_string(),
-                    workers: vec![DeploymentWorkerOutcome {
-                        hive_id: hive_id.to_string(),
-                        status: strict_status.to_string(),
-                        reason: Some(reason.clone()),
-                        duration_ms: vendor_started.elapsed().as_millis() as u64,
-                        local_hash: local_vendor_hash.clone(),
-                        remote_hash_before: remote_vendor_hash_before.clone(),
-                        remote_hash_after: None,
-                    }],
-                };
-                if let Err(history_err) = append_deployment_history(&entry) {
-                    tracing::warn!(
-                        error = %history_err,
-                        "failed to persist add_hive dist sync readiness failure"
-                    );
-                }
-                if require_dist_sync {
-                    return serde_json::json!({
-                        "status": "error",
-                        "error_code": "DIST_SYNC_TIMEOUT",
-                        "message": reason,
-                    });
-                }
-                tracing::warn!(
-                    hive_id = hive_id,
-                    address = address,
-                    error = %err,
-                    "dist sync readiness probe did not converge during add_hive; continuing in non-strict mode"
-                );
-                dist_sync_ready = false;
-            }
-        }
-        let remote_vendor_hash_after = remote_syncthing_installed_hash(address, &key_path)
-            .ok()
-            .flatten();
-        let entry = DeploymentHistoryEntry {
-            deployment_id: Uuid::new_v4().to_string(),
-            category: "vendor".to_string(),
-            trigger: "add_hive".to_string(),
-            actor: default_deployment_actor(state),
-            started_at: vendor_started_at,
-            finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
-            manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
-            manifest_hash: local_vendor_hash.clone(),
-            target_hives: vec![hive_id.to_string()],
-            result: "ok".to_string(),
-            workers: vec![DeploymentWorkerOutcome {
-                hive_id: hive_id.to_string(),
-                status: "ok".to_string(),
-                reason: None,
-                duration_ms: vendor_started.elapsed().as_millis() as u64,
-                local_hash: local_vendor_hash,
-                remote_hash_before: remote_vendor_hash_before,
-                remote_hash_after: remote_vendor_hash_after,
-            }],
-        };
-        if let Err(history_err) = append_deployment_history(&entry) {
-            tracing::warn!(error = %history_err, "failed to persist add_hive vendor deployment history");
-        }
-    }
+    tracing::info!(
+        hive_id = hive_id,
+        "add_hive bootstrap completed; vendor/dist finalize will run via worker socket"
+    );
 
     let mut wan_connected = true;
     let mut wan_wait_error = None;
@@ -8042,8 +7902,12 @@ async fn add_hive_flow(
     )
     .await
     {
-        Ok(payload) => payload,
+        Ok(payload) => {
+            append_add_hive_finalize_history(state, hive_id, "ok", None);
+            payload
+        }
         Err(err) => {
+            append_add_hive_finalize_history(state, hive_id, "error", Some(err.to_string()));
             return serde_json::json!({
                 "status": "error",
                 "error_code": "FINALIZE_FAILED",
@@ -8061,13 +7925,71 @@ async fn add_hive_flow(
             });
         }
     };
+    dist_sync_ready = dist_sync_ready_from_finalize_payload(&finalize, &desired_dist);
+    if require_dist_sync && !dist_sync_ready {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "DIST_SYNC_TIMEOUT",
+            "message": "worker finalize completed but dist sync is not ready",
+            "hive_id": hive_id,
+            "address": address,
+            "harden_ssh": harden_ssh,
+            "restrict_ssh": restrict_ssh_applied,
+            "restrict_ssh_requested": restrict_ssh,
+            "require_dist_sync": require_dist_sync,
+            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+            "wan_connected": true,
+            "orchestrator_connected": true,
+            "dist_sync_ready": dist_sync_ready,
+            "finalize": finalize,
+        });
+    }
+
+    let ssh_controls = match apply_add_hive_ssh_controls_after_finalize(
+        address,
+        &key_path,
+        &pub_key,
+        password_channel_available,
+        restrict_ssh,
+        harden_ssh,
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            let err_text = err.to_string();
+            let error_code = if err_text.to_ascii_lowercase().contains("harden") {
+                "SSH_HARDEN_FAILED"
+            } else {
+                "SSH_KEY_FAILED"
+            };
+            return serde_json::json!({
+                "status": "error",
+                "error_code": error_code,
+                "message": err_text,
+                "hive_id": hive_id,
+                "address": address,
+                "harden_ssh": harden_ssh,
+                "restrict_ssh": false,
+                "restrict_ssh_requested": restrict_ssh,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+                "dist_sync_ready": dist_sync_ready,
+                "finalize": finalize,
+            });
+        }
+    };
+    restrict_ssh_applied = ssh_controls.restrict_ssh_applied;
+    let restrict_ssh_mode = ssh_controls.restrict_ssh_mode;
 
     serde_json::json!({
         "status": "ok",
         "hive_id": hive_id,
         "address": address,
         "harden_ssh": harden_ssh,
+        "harden_ssh_applied": harden_ssh,
         "restrict_ssh": restrict_ssh_applied,
+        "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
         "require_dist_sync": require_dist_sync,
         "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
@@ -8350,6 +8272,103 @@ fn systemd_disable(service: &str) -> Result<(), OrchestratorError> {
     run_cmd(cmd, "systemctl disable")
 }
 
+struct AddHiveSshControlsResult {
+    restrict_ssh_applied: bool,
+    restrict_ssh_mode: String,
+}
+
+fn apply_add_hive_ssh_controls_after_finalize(
+    address: &str,
+    key_path: &Path,
+    pub_key: &str,
+    password_channel_available: bool,
+    restrict_ssh_requested: bool,
+    harden_ssh: bool,
+) -> Result<AddHiveSshControlsResult, OrchestratorError> {
+    let mut restrict_ssh_applied = false;
+    let mut restrict_ssh_mode = "unrestricted".to_string();
+
+    if restrict_ssh_requested {
+        let source_patterns = resolve_add_hive_authkey_source_patterns(address);
+        let restrict_result = apply_remote_from_only_authorized_key_with_access(
+            address,
+            key_path,
+            pub_key,
+            &source_patterns,
+        )
+        .and_then(|_| {
+            ssh_with_key(
+                address,
+                key_path,
+                "sudo -n /bin/bash -lc 'exit 0'",
+                BOOTSTRAP_SSH_USER,
+            )
+        });
+        match restrict_result {
+            Ok(()) => {
+                restrict_ssh_applied = true;
+                restrict_ssh_mode = "from_only".to_string();
+                tracing::info!(
+                    target = address,
+                    from_patterns = ?source_patterns,
+                    "authorized_keys restriction applied in from-only mode (post-finalize)"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target = address,
+                    error = %err,
+                    "restrict_ssh from-only mode failed; falling back to unrestricted mode"
+                );
+                let fallback_result = if password_channel_available {
+                    apply_remote_unrestricted_authorized_key_with_pass(address, pub_key)
+                } else {
+                    apply_remote_unrestricted_authorized_key_with_access(
+                        address, key_path, pub_key,
+                    )
+                };
+                if let Err(fallback_err) = fallback_result {
+                    return Err(format!(
+                        "restrict_ssh requested but from-only restriction failed ({err}); unrestricted fallback failed: {fallback_err}"
+                    )
+                    .into());
+                }
+                ssh_with_key(
+                    address,
+                    key_path,
+                    "sudo -n /bin/bash -lc 'exit 0'",
+                    BOOTSTRAP_SSH_USER,
+                )
+                .map_err(|verify_err| {
+                    format!("restrict_ssh fallback verification failed: {verify_err}")
+                })?;
+                restrict_ssh_mode = "unrestricted_fallback".to_string();
+            }
+        }
+    } else {
+        tracing::warn!(
+            target = address,
+            "authorized_keys gate/restriction skipped (legacy insecure mode)"
+        );
+    }
+
+    if harden_ssh {
+        let harden_result = if password_channel_available {
+            disable_remote_password_auth(address)
+        } else {
+            disable_remote_password_auth_with_access(address, key_path)
+        };
+        harden_result.map_err(|err| format!("ssh hardening failed: {err}"))?;
+        verify_remote_ssh_hardening_with_access(address, key_path)
+            .map_err(|err| format!("ssh hardening verification failed: {err}"))?;
+    }
+
+    Ok(AddHiveSshControlsResult {
+        restrict_ssh_applied,
+        restrict_ssh_mode,
+    })
+}
+
 fn disable_remote_password_auth(address: &str) -> Result<(), OrchestratorError> {
     let set_password_auth_cmd = r#"bash -lc 'set -euo pipefail
 cfg="/etc/ssh/sshd_config"
@@ -8397,14 +8416,14 @@ if command -v sshd >/dev/null 2>&1; then
 elif [ -x /usr/sbin/sshd ]; then
   /usr/sbin/sshd -T >/dev/null 2>&1 || true
 fi'"#;
-    ssh_with_pass(
+    ssh_with_pass_any(
         address,
         &sudo_wrap(set_password_auth_cmd),
         BOOTSTRAP_SSH_USER,
     )?;
 
     let restart_ssh_cmd = r#"bash -lc "systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart""#;
-    ssh_with_pass(address, &sudo_wrap(restart_ssh_cmd), BOOTSTRAP_SSH_USER)?;
+    ssh_with_pass_any(address, &sudo_wrap(restart_ssh_cmd), BOOTSTRAP_SSH_USER)?;
     Ok(())
 }
 
@@ -8505,7 +8524,7 @@ fn verify_remote_key_access_after_hardening(
 fn verify_remote_password_auth_is_rejected(address: &str) -> Result<(), OrchestratorError> {
     let mut last_err: Option<String> = None;
     for attempt in 1..=SSH_HARDEN_VERIFY_RETRIES {
-        match ssh_with_pass(address, "true", BOOTSTRAP_SSH_USER) {
+        match ssh_with_pass_any(address, "true", BOOTSTRAP_SSH_USER) {
             Ok(()) => {
                 return Err(
                     "password authentication still accepted after hardening; expected rejection"
@@ -8763,7 +8782,7 @@ chmod 600 ~/.ssh/authorized_keys\n",
         entry = shell_single_quote(pub_key),
     );
     let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
-    ssh_with_pass(address, &cmd, BOOTSTRAP_SSH_USER)?;
+    ssh_with_pass_any(address, &cmd, BOOTSTRAP_SSH_USER)?;
     Ok(())
 }
 
@@ -8965,6 +8984,26 @@ fn ssh_with_pass_kbd(address: &str, command: &str, user: &str) -> Result<(), Orc
     let result = run_cmd(cmd, "ssh");
     let _ = fs::remove_file(&askpass);
     result
+}
+
+fn ssh_with_pass_any(address: &str, command: &str, user: &str) -> Result<(), OrchestratorError> {
+    match ssh_with_pass(address, command, user) {
+        Ok(()) => Ok(()),
+        Err(pass_err) => match ssh_with_pass_kbd(address, command, user) {
+            Ok(()) => {
+                tracing::warn!(
+                    target = address,
+                    error = %pass_err,
+                    "password auth fallback: keyboard-interactive succeeded"
+                );
+                Ok(())
+            }
+            Err(kbd_err) => Err(format!(
+                "{pass_err}; keyboard-interactive auth failed: {kbd_err}"
+            )
+            .into()),
+        },
+    }
 }
 
 fn ssh_with_key(

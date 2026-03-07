@@ -193,17 +193,17 @@ Objetivo: usar SSH solo para bootstrap minimo del worker y mover toda la post-in
 - [x] R1.1 Si `SY.orchestrator@worker` ya responde, no ejecutar provisioning SSH (solo reconcile/validaciones).
 - [x] R1.2 Si no responde, activar bootstrap minimo por SSH.
 - [ ] R2. Reducir bootstrap SSH a minimo estricto:
-- [ ] R2.1 Seed key + sudoers.
+- [x] R2.1 Seed key + sudoers.
 - [ ] R2.2 Copia/arranque de `rt-gateway` + `sy-orchestrator` + `hive.yaml` minimo.
-- [ ] R2.3 Espera de visibilidad WAN/LSA del worker orchestrator.
+- [x] R2.3 Espera de visibilidad WAN/LSA del worker orchestrator.
 - [ ] R3. Nueva etapa `finalize` por socket en worker:
 - [ ] R3.1 Ejecutar en worker local: reconcile core restante, vendor/syncthing, dist pairing/probe, health gates.
-- [ ] R3.2 Devolver `ADD_HIVE_FINALIZE_RESPONSE` con detalle (`updated/unchanged/restarted/errors`).
-- [ ] R3.3 Persistir historial de deployment en motherbee con resultado consolidado de finalize.
-- [ ] R4. Hardening SSH al final del flujo:
-- [ ] R4.1 Aplicar hardening/restrict cuando finalize ya termino.
-- [ ] R4.2 Si `restrict_ssh` falla por compatibilidad sshd (`SSH_ORIGINAL_COMMAND`), degradar de forma explicita y observable.
-- [ ] R4.3 Mantener verificacion estricta de bloqueo password cuando `harden_ssh=true`.
+- [x] R3.2 Devolver `ADD_HIVE_FINALIZE_RESPONSE` con detalle (`updated/unchanged/restarted/errors`).
+- [x] R3.3 Persistir historial de deployment en motherbee con resultado consolidado de finalize.
+- [x] R4. Hardening SSH al final del flujo:
+- [x] R4.1 Aplicar hardening/restrict cuando finalize ya termino.
+- [x] R4.2 Si `restrict_ssh` falla por compatibilidad sshd (`SSH_ORIGINAL_COMMAND`), degradar de forma explicita y observable.
+- [x] R4.3 Mantener verificacion estricta de bloqueo password cuando `harden_ssh=true`.
 - [ ] R5. `remove_hive` mantener socket-first actual y ajustar contrato si cambia la semantica de bootstrap.
 
 ### E2E minimos para cerrar el refactor
@@ -220,7 +220,10 @@ Objetivo: usar SSH solo para bootstrap minimo del worker y mover toda la post-in
 - [ ] El canal SSH queda confinado a bootstrap minimo y fallback tecnico.
 - [ ] El comportamiento queda documentado en `docs/07-operaciones.md` y spec v2 de trabajo.
 
-Nota (2026-03-07): se incorporó la acción `ADD_HIVE_FINALIZE` en canal `system` y `add_hive` ahora la invoca cuando detecta `SY.orchestrator@worker` visible (incluyendo modo `socket_only`). Esta iteración establece el esqueleto socket-first de finalize; falta mover completamente la post-instalación para cerrar R3/R4.
+Nota (2026-03-07): se incorporó la acción `ADD_HIVE_FINALIZE` en canal `system` y `add_hive` ahora la invoca cuando detecta `SY.orchestrator@worker` visible (incluyendo modo `socket_only`). `ADD_HIVE_FINALIZE_RESPONSE` ya devuelve `updated/unchanged/restarted/errors` y motherbee persiste historial consolidado de finalize (`trigger=add_hive_finalize_socket`). Esta iteración establece el esqueleto socket-first de finalize; falta mover completamente la post-instalación para cerrar R3/R4.
+
+Nota (2026-03-07, tarde): `add_hive` ahora aplica controles SSH (`restrict_ssh`/`harden_ssh`) al final del flujo, después de `ADD_HIVE_FINALIZE`. La restricción usa modo `from_only` por defecto y, si falla, degrada explícitamente a `unrestricted_fallback` (observable en `payload.restrict_ssh_mode`), manteniendo verificación estricta de bloqueo de password cuando `harden_ssh=true`.
+Nota (2026-03-07): el arranque remoto por SSH en `add_hive` se redujo a unidades bootstrap (`rt-gateway` + `sy-orchestrator`); ya no se hace `start/restart` SSH de `sy-config-routes`/`sy-opa-rules` en esa etapa.
 
 ## 6. Definicion de Done v2
 
