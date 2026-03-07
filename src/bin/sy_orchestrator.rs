@@ -7320,31 +7320,55 @@ async fn add_hive_flow(
 
     let mut password_channel_available = true;
     if let Err(pass_err) = ssh_with_pass(address, "true", BOOTSTRAP_SSH_USER) {
-        password_channel_available = false;
-        match ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
+        match ssh_with_pass_kbd(address, "true", BOOTSTRAP_SSH_USER) {
             Ok(()) => {
                 tracing::warn!(
                     target = address,
                     error = %pass_err,
-                    "password bootstrap channel unavailable; continuing via key channel"
+                    "password probe via direct method failed; keyboard-interactive fallback succeeded"
                 );
             }
-            Err(key_err) => {
-                return ssh_bootstrap_error_payload(&format!(
-                    "password probe failed: {pass_err}; key probe failed: {key_err}"
-                ));
+            Err(pass_kbd_err) => {
+                password_channel_available = false;
+                let pass_text = format!(
+                    "{pass_err}; keyboard-interactive probe failed: {pass_kbd_err}"
+                );
+                match ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            target = address,
+                            error = %pass_text,
+                            "password bootstrap channel unavailable; continuing via key channel"
+                        );
+                    }
+                    Err(key_err) => {
+                        return ssh_bootstrap_error_payload(&format!(
+                            "password probe failed: {pass_text}; key probe failed: {key_err}"
+                        ));
+                    }
+                }
             }
         }
     }
 
     if password_channel_available {
         // Seed via password channel when available (fresh bootstrap path).
-        if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!("failed to seed bootstrap key via password channel: {err}"),
-            });
+        if let Err(pass_seed_err) = apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key) {
+            tracing::warn!(
+                target = address,
+                error = %pass_seed_err,
+                "password seed failed; attempting key-based seed fallback"
+            );
+            if let Err(key_seed_err) =
+                apply_remote_unrestricted_authorized_key_with_access(address, &key_path, &pub_key)
+            {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "SSH_KEY_FAILED",
+                    "message": format!("failed to seed bootstrap key via password channel: {pass_seed_err}; key fallback failed: {key_seed_err}"),
+                });
+            }
+            password_channel_available = false;
         }
     } else if let Err(err) =
         apply_remote_unrestricted_authorized_key_with_access(address, &key_path, &pub_key)
@@ -8897,6 +8921,34 @@ fn ssh_with_pass(address: &str, command: &str, user: &str) -> Result<(), Orchest
     cmd.arg("ssh")
         .arg("-o")
         .arg("PreferredAuthentications=password")
+        .arg("-o")
+        .arg("PubkeyAuthentication=no")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(format!("{user}@{address}"))
+        .arg(command)
+        .env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", "jsr");
+    let result = run_cmd(cmd, "ssh");
+    let _ = fs::remove_file(&askpass);
+    result
+}
+
+fn ssh_with_pass_kbd(address: &str, command: &str, user: &str) -> Result<(), OrchestratorError> {
+    let askpass = askpass_script(BOOTSTRAP_SSH_PASS)?;
+    let mut cmd = Command::new("setsid");
+    cmd.arg("ssh")
+        .arg("-o")
+        .arg("PreferredAuthentications=keyboard-interactive,password")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=yes")
+        .arg("-o")
+        .arg("PasswordAuthentication=yes")
         .arg("-o")
         .arg("PubkeyAuthentication=no")
         .arg("-o")
