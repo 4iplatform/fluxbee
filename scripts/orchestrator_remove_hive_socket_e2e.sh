@@ -3,7 +3,7 @@ set -euo pipefail
 
 # E2E for remove_hive cleanup contract (v2):
 # - Case A (online): remove_hive should cleanup via socket (remote_cleanup=socket_ok)
-# - Case B (offline): stop worker orchestrator, then remove_hive should use controlled fallback
+# - Case B (offline): stop worker orchestrator, then remove_hive should degrade to local-only cleanup
 #
 # Usage:
 #   BASE="http://127.0.0.1:8080" HIVE_ID="worker-220" HIVE_ADDR="192.168.8.220" \
@@ -12,7 +12,7 @@ set -euo pipefail
 # Optional:
 #   HARDEN_SSH="true|false"                 # default: true
 #   REQUIRE_SOCKET_ONLINE="1|0"             # default: 1
-#   REQUIRE_OFFLINE_FALLBACK="1|0"          # default: 1
+#   REQUIRE_OFFLINE_LOCAL_ONLY="1|0"        # default: 1
 #   SSH_USER="administrator"                # default: administrator
 #   SSH_KEY="/var/lib/fluxbee/ssh/motherbee.key"
 
@@ -21,7 +21,7 @@ HIVE_ID="${HIVE_ID:-worker-220}"
 HIVE_ADDR="${HIVE_ADDR:-192.168.8.220}"
 HARDEN_SSH="${HARDEN_SSH:-true}"
 REQUIRE_SOCKET_ONLINE="${REQUIRE_SOCKET_ONLINE:-1}"
-REQUIRE_OFFLINE_FALLBACK="${REQUIRE_OFFLINE_FALLBACK:-1}"
+REQUIRE_OFFLINE_LOCAL_ONLY="${REQUIRE_OFFLINE_LOCAL_ONLY:-${REQUIRE_OFFLINE_FALLBACK:-1}}"
 SSH_USER="${SSH_USER:-administrator}"
 SSH_KEY="${SSH_KEY:-/var/lib/fluxbee/ssh/motherbee.key}"
 
@@ -171,14 +171,14 @@ add_hive_expect_ok "$tmpdir/add-offline.json"
 
 echo "Step 5/6: stop remote worker orchestrator (force offline socket path)"
 if ! stop_remote_orchestrator; then
-  if [[ "$REQUIRE_OFFLINE_FALLBACK" == "1" ]]; then
+  if [[ "$REQUIRE_OFFLINE_LOCAL_ONLY" == "1" ]]; then
     echo "FAIL: could not stop remote sy-orchestrator via SSH key" >&2
     exit 1
   fi
   echo "WARN: could not stop remote sy-orchestrator; skipping strict offline assertion."
 fi
 
-echo "Step 6/6: remove hive after remote orchestrator stop (expect controlled fallback)"
+echo "Step 6/6: remove hive after remote orchestrator stop (expect local-only cleanup)"
 status_offline="$(http_call "DELETE" "$BASE/hives/$HIVE_ID" "$tmpdir/delete-offline.json")"
 print_http "$status_offline" "$tmpdir/delete-offline.json"
 cleanup_offline="$(json_get "payload.remote_cleanup" "$tmpdir/delete-offline.json")"
@@ -187,9 +187,9 @@ if [[ "$status_offline" != "200" ]]; then
   echo "FAIL: offline remove_hive http=$status_offline" >&2
   exit 1
 fi
-if [[ "$REQUIRE_OFFLINE_FALLBACK" == "1" ]]; then
+if [[ "$REQUIRE_OFFLINE_LOCAL_ONLY" == "1" ]]; then
   case "$cleanup_offline" in
-    ssh_fallback_ok|ssh_fallback_failed|socket_timeout|local_only) ;;
+    socket_timeout|local_only) ;;
     *)
       echo "FAIL: offline remote_cleanup unexpected '$cleanup_offline'" >&2
       exit 1
@@ -197,6 +197,10 @@ if [[ "$REQUIRE_OFFLINE_FALLBACK" == "1" ]]; then
   esac
   if [[ "$cleanup_offline" == "socket_ok" ]]; then
     echo "FAIL: offline case should not report socket_ok" >&2
+    exit 1
+  fi
+  if [[ "$cleanup_via_offline" != "local_only" ]]; then
+    echo "FAIL: expected payload.remote_cleanup_via=local_only, got '$cleanup_via_offline'" >&2
     exit 1
   fi
 fi

@@ -1061,7 +1061,7 @@ async fn handle_hive_paths(
             } else {
                 serde_json::from_slice(body)?
             };
-            if payload.get("node_name").is_none() && payload.get("name").is_none() {
+            if payload.get("node_name").is_none() {
                 payload["node_name"] = serde_json::Value::String(decode_percent(name));
             }
             let (status, resp) =
@@ -1088,22 +1088,6 @@ async fn handle_hive_paths(
             let payload = drift_alerts_payload_from_query(query);
             let (status, resp) =
                 handle_admin_command(ctx, client, "get_drift_alerts", payload, Some(hive)).await?;
-            Ok(Some((status, resp)))
-        }
-        ("POST", ["routers"]) => {
-            let payload = if body.is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_slice(body)?
-            };
-            let (status, resp) =
-                handle_admin_command(ctx, client, "run_router", payload, Some(hive)).await?;
-            Ok(Some((status, resp)))
-        }
-        ("DELETE", ["routers", name]) => {
-            let payload = serde_json::json!({ "name": decode_percent(name) });
-            let (status, resp) =
-                handle_admin_command(ctx, client, "kill_router", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["update"]) => {
@@ -1985,6 +1969,20 @@ async fn handle_admin_command(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
+    if let Some(detail) = admin_payload_contract_error(action, &payload) {
+        return Ok((
+            400u16,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": detail,
+            })
+            .to_string(),
+        ));
+    }
+
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
     let target_hive = extract_hive_from_target(&request.target);
@@ -2053,31 +2051,33 @@ async fn handle_hive_update_command(
         },
     };
 
-    let manifest_version = match payload
-        .get("manifest_version")
-        .or_else(|| payload.get("version"))
-    {
+    let manifest_version = match payload.get("manifest_version") {
         None => 0,
         Some(value) => match value.as_u64() {
             Some(v) => v,
-            None => {
-                return Ok(invalid_request(
-                    "manifest_version (or version) must be an unsigned integer",
-                ))
-            }
+            None => return Ok(invalid_request("manifest_version must be an unsigned integer")),
         },
     };
+    if payload.get("version").is_some() {
+        return Ok(invalid_request(
+            "legacy field 'version' is not supported; use manifest_version",
+        ));
+    }
 
     let manifest_hash = match payload
         .get("manifest_hash")
-        .or_else(|| payload.get("hash"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
         Some(value) => value,
-        None => return Ok(invalid_request("missing manifest_hash (or hash)")),
+        None => return Ok(invalid_request("missing manifest_hash")),
     };
+    if payload.get("hash").is_some() {
+        return Ok(invalid_request(
+            "legacy field 'hash' is not supported; use manifest_hash",
+        ));
+    }
 
     let target = format!("SY.orchestrator@{}", hive_id);
     let system_payload = serde_json::json!({
@@ -2169,8 +2169,8 @@ fn build_admin_request(
         match action {
             "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn"
             | "delete_vpn" => "SY.config.routes",
-            "list_nodes" | "run_node" | "kill_node" | "list_routers" | "run_router"
-            | "kill_router" | "hive_status" | "get_storage" | "set_storage" | "list_hives"
+            "list_nodes" | "run_node" | "kill_node" | "list_routers" | "hive_status"
+            | "get_storage" | "set_storage" | "list_hives"
             | "get_hive" | "list_versions" | "get_versions" | "list_deployments"
             | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "remove_hive"
             | "add_hive" => "SY.orchestrator",
@@ -2331,7 +2331,7 @@ fn admin_action_timeout(action: &str) -> Duration {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_UPDATE_TIMEOUT_SECS").unwrap_or(60))
         }
         // other orchestrator mutating actions can also take longer than default.
-        "run_node" | "kill_node" | "run_router" | "kill_router" | "remove_hive" => {
+        "run_node" | "kill_node" | "remove_hive" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30))
         }
         _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5)),
@@ -2405,8 +2405,6 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "run_node"
             | "kill_node"
             | "list_routers"
-            | "run_router"
-            | "kill_router"
             | "hive_status"
             | "get_storage"
             | "set_storage"
@@ -2441,19 +2439,29 @@ fn normalize_admin_payload(
         }
     }
 
-    if (action == "run_node" || action == "kill_node") && payload.get("node_name").is_none() {
-        if let Some(name) = payload.get("name").and_then(|value| value.as_str()) {
-            payload["node_name"] = serde_json::Value::String(name.to_string());
-        }
-    }
-
-    if (action == "run_router" || action == "kill_router") && payload.get("service").is_none() {
-        if let Some(name) = payload.get("name").and_then(|value| value.as_str()) {
-            payload["service"] = serde_json::Value::String(name.to_string());
-        }
-    }
-
     payload
+}
+
+fn admin_payload_contract_error(action: &str, payload: &serde_json::Value) -> Option<String> {
+    let legacy = match action {
+        "run_node" => {
+            if payload.get("name").is_some() {
+                Some(("name", "node_name"))
+            } else if payload.get("version").is_some() {
+                Some(("version", "runtime_version"))
+            } else {
+                None
+            }
+        }
+        "kill_node" => payload.get("name").map(|_| ("name", "node_name")),
+        _ => None,
+    };
+    legacy.map(|(field, canonical)| {
+        format!(
+            "legacy field '{}' is not supported; use '{}'",
+            field, canonical
+        )
+    })
 }
 
 async fn broadcast_full_config(
