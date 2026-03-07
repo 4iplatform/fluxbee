@@ -183,6 +183,43 @@ Referencia: `scripts/orchestrator_add_hive_hardening_e2e.sh` cubre `add_hive(har
 1. Cerrar E2E-7 y E2E-8 (Gate G4 completo): update `vendor` via `SYSTEM_UPDATE` + verificacion de ausencia de caminos SSH operativos en run/kill/update.
 2. Revalidar criterios de Done v2 (seccion 6) una vez cerrados G2/G3/G4 completos.
 
+## 5.2 Refactor add_hive socket-first (reabierto)
+
+Objetivo: usar SSH solo para bootstrap minimo del worker y mover toda la post-instalacion al `SY.orchestrator@worker` via socket `system`.
+
+### Alcance del refactor
+
+- [x] R1. `add_hive` intenta primero modo socket-only:
+- [x] R1.1 Si `SY.orchestrator@worker` ya responde, no ejecutar provisioning SSH (solo reconcile/validaciones).
+- [x] R1.2 Si no responde, activar bootstrap minimo por SSH.
+- [ ] R2. Reducir bootstrap SSH a minimo estricto:
+- [ ] R2.1 Seed key + sudoers.
+- [ ] R2.2 Copia/arranque de `rt-gateway` + `sy-orchestrator` + `hive.yaml` minimo.
+- [ ] R2.3 Espera de visibilidad WAN/LSA del worker orchestrator.
+- [ ] R3. Nueva etapa `finalize` por socket en worker:
+- [ ] R3.1 Ejecutar en worker local: reconcile core restante, vendor/syncthing, dist pairing/probe, health gates.
+- [ ] R3.2 Devolver `ADD_HIVE_FINALIZE_RESPONSE` con detalle (`updated/unchanged/restarted/errors`).
+- [ ] R3.3 Persistir historial de deployment en motherbee con resultado consolidado de finalize.
+- [ ] R4. Hardening SSH al final del flujo:
+- [ ] R4.1 Aplicar hardening/restrict cuando finalize ya termino.
+- [ ] R4.2 Si `restrict_ssh` falla por compatibilidad sshd (`SSH_ORIGINAL_COMMAND`), degradar de forma explicita y observable.
+- [ ] R4.3 Mantener verificacion estricta de bloqueo password cuando `harden_ssh=true`.
+- [ ] R5. `remove_hive` mantener socket-first actual y ajustar contrato si cambia la semantica de bootstrap.
+
+### E2E minimos para cerrar el refactor
+
+- [ ] E2E-R1. Worker preexistente con `SY.orchestrator` online: `add_hive` sin pasos SSH de provisioning.
+- [ ] E2E-R2. Worker limpio sin orchestrator: bootstrap minimo SSH + finalize socket exitoso.
+- [ ] E2E-R3. `harden_ssh=true` en flujo completo: password bloqueado y operacion remota por socket intacta.
+- [ ] E2E-R4. Falla controlada en finalize (`vendor` o `dist`): respuesta determinista sin dejar worker a medio estado.
+- [ ] E2E-R5. `remove_hive` online sigue resolviendo por socket (`remote_cleanup=socket_ok`).
+
+### Criterio de salida del refactor
+
+- [ ] `add_hive` deja de ejecutar por SSH las tareas de post-bootstrap (core/vendor/dist/hardening operativo).
+- [ ] El canal SSH queda confinado a bootstrap minimo y fallback tecnico.
+- [ ] El comportamiento queda documentado en `docs/07-operaciones.md` y spec v2 de trabajo.
+
 ## 6. Definicion de Done v2
 
 - [ ] `SYSTEM_UPDATE` reemplaza operativamente a `RUNTIME_UPDATE`.

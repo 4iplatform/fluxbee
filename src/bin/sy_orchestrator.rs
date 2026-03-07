@@ -7100,6 +7100,60 @@ fn add_hive_flow(
         });
     }
 
+    if let Err(err) = fs::create_dir_all(&hive_dir) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "IO_ERROR",
+            "message": err.to_string(),
+        });
+    }
+
+    // Socket-first fast path: if worker orchestrator is already visible in LSA,
+    // register hive without rerunning SSH bootstrap/provisioning.
+    let socket_only_ready = wait_for_remote_orchestrator_node(
+        &state.hive_id,
+        hive_id,
+        Duration::from_secs(3),
+    )
+    .is_ok();
+    if socket_only_ready {
+        let info_path = hives_root().join(hive_id).join("info.yaml");
+        let info = serde_yaml::to_string(&serde_json::json!({
+            "hive_id": hive_id,
+            "address": address,
+            "created_at": now_epoch_ms().to_string(),
+            "status": "connected",
+        }))
+        .unwrap_or_default();
+        if let Err(err) = fs::write(info_path, info) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "IO_ERROR",
+                "message": err.to_string(),
+            });
+        }
+        tracing::info!(
+            hive_id = hive_id,
+            address = address,
+            "add_hive socket-only mode: worker orchestrator already online; skipping SSH bootstrap"
+        );
+        return serde_json::json!({
+            "status": "ok",
+            "hive_id": hive_id,
+            "address": address,
+            "bootstrap_mode": "socket_only_existing_orchestrator",
+            "harden_ssh": harden_ssh,
+            "harden_ssh_applied": false,
+            "restrict_ssh": false,
+            "restrict_ssh_requested": restrict_ssh,
+            "require_dist_sync": require_dist_sync,
+            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+            "wan_connected": true,
+            "orchestrator_connected": true,
+            "dist_sync_ready": dist_sync_ready,
+        });
+    }
+
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     if !key_path.exists() {
         return serde_json::json!({
@@ -7144,14 +7198,6 @@ fn add_hive_flow(
                 ));
             }
         }
-    }
-
-    if let Err(err) = fs::create_dir_all(&hive_dir) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "IO_ERROR",
-            "message": err.to_string(),
-        });
     }
 
     if password_channel_available {
