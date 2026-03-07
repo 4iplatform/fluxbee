@@ -70,7 +70,8 @@ Fuente de verdad funcional: `docs/onworking/SY.orchestrator — Spec de Cambios 
 - [ ] D1. Revisar y eliminar helpers SSH no usados post-refactor (gate/restrict/fallback que ya no apliquen al flujo final).
 - [ ] D1. Revisar y eliminar helpers SSH no usados post-refactor (gate/restrict/fallback que ya no apliquen al flujo final).
   - Avance: removidas rutas SSH operativas para `get_versions/list_versions` y para ensure/reconcile remoto de Syncthing.
-- [ ] D2. Mantener solo primitives SSH necesarias para bootstrap minimo (`seed key/sudoers`, copia minima, start bootstrap services).
+- [x] D2. Mantener solo primitives SSH necesarias para bootstrap minimo (`seed key/sudoers`, copia minima, start bootstrap services).
+  - Avance: hardening post-bootstrap unificado a canal key+sudo (sin rama de hardening via password).
 - [x] D3. Verificar que no quede ninguna ruta de operacion diaria que invoque SSH.
 
 ## 4. Alineacion documental obligatoria
