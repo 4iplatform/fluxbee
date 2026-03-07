@@ -197,7 +197,7 @@ Objetivo: usar SSH solo para bootstrap minimo del worker y mover toda la post-in
 - [ ] R2.2 Copia/arranque de `rt-gateway` + `sy-orchestrator` + `hive.yaml` minimo.
 - [x] R2.3 Espera de visibilidad WAN/LSA del worker orchestrator.
 - [ ] R3. Nueva etapa `finalize` por socket en worker:
-- [ ] R3.1 Ejecutar en worker local: reconcile core restante, vendor/syncthing, dist pairing/probe, health gates.
+- [x] R3.1 Ejecutar en worker local: reconcile core restante, vendor/syncthing, dist pairing/probe, health gates.
 - [x] R3.2 Devolver `ADD_HIVE_FINALIZE_RESPONSE` con detalle (`updated/unchanged/restarted/errors`).
 - [x] R3.3 Persistir historial de deployment en motherbee con resultado consolidado de finalize.
 - [x] R4. Hardening SSH al final del flujo:
@@ -224,6 +224,7 @@ Nota (2026-03-07): se incorporó la acción `ADD_HIVE_FINALIZE` en canal `system
 
 Nota (2026-03-07, tarde): `add_hive` ahora aplica controles SSH (`restrict_ssh`/`harden_ssh`) al final del flujo, después de `ADD_HIVE_FINALIZE`. La restricción usa modo `from_only` por defecto y, si falla, degrada explícitamente a `unrestricted_fallback` (observable en `payload.restrict_ssh_mode`), manteniendo verificación estricta de bloqueo de password cuando `harden_ssh=true`.
 Nota (2026-03-07): el arranque remoto por SSH en `add_hive` se redujo a unidades bootstrap (`rt-gateway` + `sy-orchestrator`); ya no se hace `start/restart` SSH de `sy-config-routes`/`sy-opa-rules` en esa etapa.
+Nota (2026-03-07, noche): `ADD_HIVE_FINALIZE` ahora ejecuta reconciliación local `core` + `vendor` en worker (con health-gates/rollback existentes de `SYSTEM_UPDATE`) y publica `dist_sync_ready` en la respuesta de finalize.
 
 ## 6. Definicion de Done v2
 

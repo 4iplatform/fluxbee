@@ -7045,9 +7045,7 @@ async fn add_hive_finalize_local_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
-    let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
-    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
     let require_dist_sync = payload
         .get("require_dist_sync")
         .and_then(parse_bool_value)
@@ -7057,26 +7055,79 @@ async fn add_hive_finalize_local_flow(
     let mut restarted: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
-    let pre_service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
-    let pre_api_healthy = if desired_sync.sync_enabled {
-        syncthing_api_healthy(desired_sync.sync_api_port).await
-    } else {
-        false
+    let core_result = match apply_system_update_local(state, "core").await {
+        Ok(result) => result,
+        Err(err) => {
+            errors.push(err.to_string());
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "CORE_FINALIZE_FAILED",
+                "message": err.to_string(),
+                "hive_id": state.hive_id,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_enabled": desired_dist.sync_enabled,
+                "updated": updated,
+                "unchanged": unchanged,
+                "restarted": restarted,
+                "errors": errors,
+            });
+        }
     };
+    if core_result.status != "ok" {
+        let detail = if core_result.errors.is_empty() {
+            format!("core finalize returned status '{}'", core_result.status)
+        } else {
+            core_result.errors.join("; ")
+        };
+        errors.push(detail.clone());
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "CORE_FINALIZE_FAILED",
+            "message": detail,
+            "hive_id": state.hive_id,
+            "require_dist_sync": require_dist_sync,
+            "dist_sync_enabled": desired_dist.sync_enabled,
+            "updated": core_result.updated,
+            "unchanged": core_result.unchanged,
+            "restarted": core_result.restarted,
+            "errors": errors,
+        });
+    }
 
-    let apply_result = if desired_sync.sync_enabled {
-        ensure_blob_sync_runtime(&desired_blob, &desired_dist).await
-    } else {
-        disable_blob_sync_runtime_local()
+    updated.extend(core_result.updated);
+    unchanged.extend(core_result.unchanged);
+    restarted.extend(core_result.restarted);
+
+    let vendor_result = match apply_system_update_local(state, "vendor").await {
+        Ok(result) => result,
+        Err(err) => {
+            errors.push(err.to_string());
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SYNC_SETUP_FAILED",
+                "message": err.to_string(),
+                "hive_id": state.hive_id,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_enabled": desired_dist.sync_enabled,
+                "updated": updated,
+                "unchanged": unchanged,
+                "restarted": restarted,
+                "errors": errors,
+            });
+        }
     };
-    if let Err(err) = apply_result {
-        errors.push(err.to_string());
+    if vendor_result.status != "ok" {
+        let detail = if vendor_result.errors.is_empty() {
+            format!("vendor finalize returned status '{}'", vendor_result.status)
+        } else {
+            vendor_result.errors.join("; ")
+        };
+        errors.push(detail.clone());
         return serde_json::json!({
             "status": "error",
             "error_code": "SYNC_SETUP_FAILED",
-            "message": err.to_string(),
+            "message": detail,
             "hive_id": state.hive_id,
-            "blob_sync_enabled": desired_blob.sync_enabled,
             "dist_sync_enabled": desired_dist.sync_enabled,
             "require_dist_sync": require_dist_sync,
             "updated": updated,
@@ -7086,6 +7137,12 @@ async fn add_hive_finalize_local_flow(
         });
     }
 
+    updated.extend(vendor_result.updated);
+    unchanged.extend(vendor_result.unchanged);
+    restarted.extend(vendor_result.restarted);
+
+    let desired_blob = current_blob_runtime_config(state);
+    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
     let service_active = if desired_sync.sync_enabled {
         systemd_is_active(SYNCTHING_SERVICE_NAME)
     } else {
@@ -7096,22 +7153,12 @@ async fn add_hive_finalize_local_flow(
     } else {
         false
     };
-
-    if desired_sync.sync_enabled {
-        if pre_service_active && pre_api_healthy && service_active && api_healthy {
-            unchanged.push("syncthing".to_string());
-        } else {
-            updated.push("syncthing".to_string());
-        }
-        if (!pre_service_active || !pre_api_healthy) && service_active {
-            restarted.push(SYNCTHING_SERVICE_NAME.to_string());
-        }
-    } else if pre_service_active {
-        updated.push("syncthing-disabled".to_string());
-        restarted.push(SYNCTHING_SERVICE_NAME.to_string());
+    let dist_sync_ready = if !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist)
+    {
+        true
     } else {
-        unchanged.push("syncthing-disabled".to_string());
-    }
+        service_active && api_healthy
+    };
 
     serde_json::json!({
         "status": "ok",
@@ -7120,6 +7167,7 @@ async fn add_hive_finalize_local_flow(
         "dist_sync_enabled": desired_dist.sync_enabled,
         "service_active": service_active,
         "api_healthy": api_healthy,
+        "dist_sync_ready": dist_sync_ready,
         "require_dist_sync": require_dist_sync,
         "dist_path": desired_dist.path.display().to_string(),
         "updated": updated,
