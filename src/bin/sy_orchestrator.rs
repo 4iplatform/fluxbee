@@ -4008,7 +4008,10 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
 
     let mut remote_cleanup: &str;
     let mut remote_cleanup_via: &str;
-    let mut address = String::new();
+    let mut address = read_hive_info(&root, hive_id)
+        .ok()
+        .and_then(|info| info.get("address").and_then(|value| value.as_str()).map(str::to_string))
+        .unwrap_or_default();
     let cleanup_cmd = remove_hive_cleanup_script();
     let forward_result = forward_system_action_to_hive_with_timeout(
         state,

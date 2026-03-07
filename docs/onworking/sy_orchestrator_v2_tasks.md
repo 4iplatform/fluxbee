@@ -204,7 +204,7 @@ Objetivo: usar SSH solo para bootstrap minimo del worker y mover toda la post-in
 - [x] R4.1 Aplicar hardening/restrict cuando finalize ya termino.
 - [x] R4.2 Si `restrict_ssh` falla por compatibilidad sshd (`SSH_ORIGINAL_COMMAND`), degradar de forma explicita y observable.
 - [x] R4.3 Mantener verificacion estricta de bloqueo password cuando `harden_ssh=true`.
-- [ ] R5. `remove_hive` mantener socket-first actual y ajustar contrato si cambia la semantica de bootstrap.
+- [x] R5. `remove_hive` mantener socket-first actual y ajustar contrato si cambia la semantica de bootstrap.
 
 ### E2E minimos para cerrar el refactor
 
@@ -226,6 +226,7 @@ Nota (2026-03-07, tarde): `add_hive` ahora aplica controles SSH (`restrict_ssh`/
 Nota (2026-03-07): el arranque remoto por SSH en `add_hive` se redujo a unidades bootstrap (`rt-gateway` + `sy-orchestrator`); ya no se hace `start/restart` SSH de `sy-config-routes`/`sy-opa-rules` en esa etapa.
 Nota (2026-03-07, noche): `ADD_HIVE_FINALIZE` ahora ejecuta reconciliación local `core` + `vendor` en worker (con health-gates/rollback existentes de `SYSTEM_UPDATE`) y publica `dist_sync_ready` en la respuesta de finalize.
 Nota (2026-03-07, noche): el `sync_core_to_worker(..., worker_bootstrap_only=true)` ahora copia solo binarios bootstrap (`rt-gateway`, `sy-orchestrator`) por SSH. Si en finalize el core completo aún no convergió por `dist`, se reporta `core_sync_pending=true` y `unchanged=["core-sync-pending"]` en lugar de fallar `add_hive`.
+Nota (2026-03-07, noche): `remove_hive` mantiene `socket-first` y ahora conserva `payload.address` desde `info.yaml` incluso cuando no hay acceso SSH para fallback, para evitar respuestas ambiguas con address vacío.
 
 ## 6. Definicion de Done v2
 
