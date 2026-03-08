@@ -1,5 +1,8 @@
 # Fluxbee - CHANGELOG v1.15 → v1.16+
 
+> Estado documental (2026-03-08): este changelog se mantiene como referencia histórica de migración v1.15->v1.16.  
+> Contrato operativo vigente para orchestrator/control-plane: `docs/onworking/SY.orchestrator — Spec de Cambios v2.md` + `docs/onworking/sy_orchestrator_v2_tasks.md`.
+
 **Para:** Desarrolladores que tienen implementación basada en v1.15  
 **Objetivo:** Guía de migración con todos los cambios estructurales
 

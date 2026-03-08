@@ -3,6 +3,7 @@
 Documentos operativos activos organizados por proceso/componente:
 
 - `docs/onworking/sy_admin_tasks.md`
+- `docs/onworking/sy_orchestrator_v2_tasks.md`
 - `docs/onworking/sy_orchestrator_tasks.md`
 - `docs/onworking/sy_router_tasks.md`
 - `docs/onworking/sy_storage_tasks.md`
@@ -24,3 +25,7 @@ Documentos transversales (no de un solo proceso):
 - `docs/onworking/blob_tasks.md`
 - `docs/onworking/sdk_tasks.md`
 - `docs/onworking/blob_node_examples.md`
+
+Nota:
+- `docs/onworking/sy_orchestrator_tasks.md` y `docs/onworking/CHANGELOG-v1.15-to-v1.16.md` se mantienen como históricos.
+- Para operación vigente de orchestrator usar `docs/onworking/sy_orchestrator_v2_tasks.md` y `docs/onworking/SY.orchestrator — Spec de Cambios v2.md`.

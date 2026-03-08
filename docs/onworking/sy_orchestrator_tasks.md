@@ -1,6 +1,7 @@
 # SY.orchestrator - Estado actual vs spec (v1.16+)
 
 > Nota de direccion (2026-03-02): para la nueva arquitectura piloto, el backlog activo paso a `docs/onworking/sy_orchestrator_v2_tasks.md` y toma como fuente de verdad `docs/onworking/SY.orchestrator — Spec de Cambios v2.md`. Este archivo queda como historico de cierre v1.16.
+> Nota de alcance (2026-03-08): cualquier referencia a `RUNTIME_UPDATE`, paths fuera de `dist/` o flows legacy en este documento debe interpretarse como histórico, no como contrato operativo vigente.
 
 Checklist operativo para cerrar SY.orchestrator segun:
 - `docs/onworking/CHANGELOG-v1.15-to-v1.16.md`

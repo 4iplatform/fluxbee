@@ -917,49 +917,51 @@ Nuevo bloque `dist` en hive.yaml para declarar el repo de distribución y su sin
 
 ## 11. Checklist de implementación
 
+Estado de cierre (2026-03-08): implementado y validado por E2E en `docs/onworking/sy_orchestrator_v2_tasks.md`.
+
 ### Fase 1 — Orchestrator local en worker (prioridad máxima)
 
-- [ ] Agregar flag `role` al arranque de sy-orchestrator (leer de hive.yaml)
-- [ ] Condicionar funciones exclusivas de motherbee (add_hive, remove_hive) a `role == motherbee`
-- [ ] Eliminar SSH remoto de `execute_on_hive` (error si `hive != local`)
-- [ ] Crear systemd unit para sy-orchestrator en worker (add_hive la genera)
-- [ ] Testear arranque de orchestrator@worker: levanta servicios locales
-- [ ] Testear comunicación: admin@mother → unicast L2 → orchestrator@worker
+- [x] Agregar flag `role` al arranque de sy-orchestrator (leer de hive.yaml)
+- [x] Condicionar funciones exclusivas de motherbee (add_hive, remove_hive) a `role == motherbee`
+- [x] Eliminar SSH remoto de `execute_on_hive` (error si `hive != local`)
+- [x] Crear systemd unit para sy-orchestrator en worker (add_hive la genera)
+- [x] Testear arranque de orchestrator@worker: levanta servicios locales
+- [x] Testear comunicación: admin@mother → unicast L2 → orchestrator@worker
 
 ### Fase 2 — SYSTEM_UPDATE
 
-- [ ] Renombrar RUNTIME_UPDATE a SYSTEM_UPDATE (sin backward compat)
-- [ ] Implementar `handle_system_update` con categorías (runtime/core/vendor)
-- [ ] Verificación de hash de manifest local vs esperado
-- [ ] Response `sync_pending` cuando manifest no coincide
-- [ ] Nuevo endpoint en admin: `POST /hives/{id}/update`
-- [ ] Testear: update de runtime con Syncthing sincronizado
-- [ ] Testear: update con sync pendiente (responde sync_pending)
+- [x] Renombrar RUNTIME_UPDATE a SYSTEM_UPDATE (sin backward compat)
+- [x] Implementar `handle_system_update` con categorías (runtime/core/vendor)
+- [x] Verificación de hash de manifest local vs esperado
+- [x] Response `sync_pending` cuando manifest no coincide
+- [x] Nuevo endpoint en admin: `POST /hives/{id}/update`
+- [x] Testear: update de runtime con Syncthing sincronizado
+- [x] Testear: update con sync pendiente (responde sync_pending)
 
 ### Fase 3 — SPAWN/KILL extendido
 
-- [ ] Extender SPAWN_NODE para aceptar cualquier tipo de nodo (AI, IO, WF)
-- [ ] Resolver runtime desde nombre L2 (parseo TYPE.campo1)
-- [ ] Buscar binario en dist/runtimes/ local
-- [ ] Arranque como systemd transient unit o proceso hijo
-- [ ] Extender KILL_NODE con flag `force` (SIGTERM vs SIGKILL)
-- [ ] Nuevo/extendido endpoint en admin: `POST /hives/{id}/nodes` (cualquier tipo)
-- [ ] Testear: spawn IO.slack.jdoe@worker-1 desde admin en motherbee
+- [x] Extender SPAWN_NODE para aceptar cualquier tipo de nodo (AI, IO, WF)
+- [x] Resolver runtime desde nombre L2 (parseo TYPE.campo1)
+- [x] Buscar binario en dist/runtimes/ local
+- [x] Arranque como systemd transient unit o proceso hijo
+- [x] Extender KILL_NODE con flag `force` (SIGTERM vs SIGKILL)
+- [x] Nuevo/extendido endpoint en admin: `POST /hives/{id}/nodes` (cualquier tipo)
+- [x] Testear: spawn IO.slack.jdoe@worker-1 desde admin en motherbee
 
 ### Fase 4 — Syncthing como canal de distribución
 
-- [ ] Crear folder Syncthing `fluxbee-dist` separado de `fluxbee-blob`
-- [ ] Configurar en add_hive: agregar device + folder dist al worker
-- [ ] Bloque `dist` en hive.yaml
-- [ ] Testear: colocar binario nuevo en motherbee, verificar que aparece en worker
-- [ ] Testear: flujo completo (sync + SYSTEM_UPDATE + install + health)
+- [x] Crear folder Syncthing `fluxbee-dist` separado de `fluxbee-blob`
+- [x] Configurar en add_hive: agregar device + folder dist al worker
+- [x] Bloque `dist` en hive.yaml
+- [x] Testear: colocar binario nuevo en motherbee, verificar que aparece en worker
+- [x] Testear: flujo completo (sync + SYSTEM_UPDATE + install + health)
 
 ### Fase 5 — Cierre de SSH
 
-- [ ] Implementar restricción de SSH post-bootstrap (Opción B: key única + IP + gate)
-- [ ] Copiar `fluxbee-ssh-gate.sh` en add_hive
-- [ ] Configurar authorized_keys con restricciones
-- [ ] Documentar proceso de emergencia (cómo acceder si todo falla)
+- [x] Implementar restricción de SSH post-bootstrap (Opción B: key única + IP + gate)
+- [x] Copiar `fluxbee-ssh-gate.sh` en add_hive
+- [x] Configurar authorized_keys con restricciones
+- [x] Documentar proceso de emergencia (cómo acceder si todo falla)
 
 ---
 

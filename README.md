@@ -68,17 +68,38 @@ curl -sS "$BASE/hives/$HIVE_ID"
 curl -sS -X DELETE "$BASE/hives/$HIVE_ID"
 ```
 
+### Apply software update on a worker (`SYSTEM_UPDATE`)
+
+```bash
+MOTHER_HIVE="sandbox"   # hive local de motherbee
+
+# 1) get current manifest version/hash from motherbee
+read MANIFEST_VERSION MANIFEST_HASH < <(
+  curl -sS "$BASE/hives/$MOTHER_HIVE/versions" | python3 - <<'PY'
+import json,sys
+d=json.load(sys.stdin)
+r=d["payload"]["hive"]["runtimes"]
+print(int(r.get("manifest_version",0)), r["manifest_hash"])
+PY
+)
+
+# 2) send strict update payload to target hive
+curl -sS -X POST "$BASE/hives/$HIVE_ID/update" \
+  -H "Content-Type: application/json" \
+  -d "{\"category\":\"runtime\",\"manifest_version\":$MANIFEST_VERSION,\"manifest_hash\":\"$MANIFEST_HASH\"}"; echo
+```
+
 ### Query remote worker state (from motherbee API)
 
 ```bash
 curl -sS "$BASE/hives/$HIVE_ID/nodes"
-curl -sS "$BASE/hives/$HIVE_ID/routers"
+curl -sS "$BASE/hives/$HIVE_ID/versions"
+curl -sS "$BASE/hives/$HIVE_ID/deployments?limit=10"
 ```
 
 Expected for remote hive responses:
 - `payload.target` should match requested hive (for example `worker-220`)
 - node names should match target hive (for example `SY.config.routes@worker-220`)
-- router names should match target hive (for example `RT.gateway@worker-220`)
 
 ### Common config calls
 
@@ -150,9 +171,7 @@ Hive-scoped endpoints:
 | `GET` | `/hives/{hive}/nodes` | List nodes on hive |
 | `POST` | `/hives/{hive}/nodes` | Spawn node on hive |
 | `DELETE` | `/hives/{hive}/nodes/{name}` | Kill node on hive |
-| `GET` | `/hives/{hive}/routers` | List routers on hive |
-| `POST` | `/hives/{hive}/routers` | Start router service on hive |
-| `DELETE` | `/hives/{hive}/routers/{name}` | Stop router service on hive |
+| `POST` | `/hives/{hive}/update` | Send `SYSTEM_UPDATE` to hive orchestrator |
 | `GET` | `/hives/{hive}/versions` | Effective versions for hive |
 | `GET` | `/hives/{hive}/deployments` | Deployment history for hive |
 | `GET` | `/hives/{hive}/drift-alerts` | Drift alerts for hive |
@@ -163,6 +182,9 @@ Hive-scoped endpoints:
 | `POST` | `/hives/{hive}/opa/policy/check` | Validate policy on hive |
 | `GET` | `/hives/{hive}/opa/policy` | Read policy state on hive |
 | `GET` | `/hives/{hive}/opa/status` | OPA status on hive |
+
+Note:
+- Router operations are managed as node lifecycle (`RT.*`) via `/hives/{hive}/nodes`.
 
 ---
 
