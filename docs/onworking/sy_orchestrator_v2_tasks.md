@@ -22,6 +22,7 @@ Fuente de verdad funcional: `docs/onworking/SY.orchestrator — Spec de Cambios 
 - [x] `add_hive` socket-only no cae a bootstrap SSH si falla finalize (`FINALIZE_FAILED`).
 - [x] `add_hive`/`ADD_HIVE_FINALIZE` reconcilian pareo Syncthing mother<->worker por `device_id` (top-level device + folder device refs en `fluxbee-dist`/`fluxbee-blob`) para evitar `runtimes.status=missing` por falta de pairing.
   - Nota: resolución de `device_id` endurecida para entornos systemd sin `HOME` (se fuerza `HOME`/`XDG_CONFIG_HOME` al invocar `syncthing --device-id`).
+- [x] `scripts/install.sh` siembra runtime fixture (`wf.orch.diag@0.0.1`) en `dist/runtimes` y actualiza `dist/runtimes/manifest.json` para evitar bootstrap sin runtime publicable.
 - [x] Se elimino compatibilidad `RUNTIME_UPDATE` en `sy_orchestrator`.
 - [x] Se eliminaron aliases legacy de payload en update y nodos:
   - update: `version/hash` (solo `manifest_version/manifest_hash`)
