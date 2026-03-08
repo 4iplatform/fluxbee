@@ -39,7 +39,6 @@ const STORAGE_DB_READINESS_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS: u64 = 3;
 const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const SY_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
-const ADD_HIVE_FINALIZE_SOCKET_TIMEOUT_SECS: u64 = 120;
 const ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS: u64 = 10;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
 const SYNCTHING_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
@@ -5559,13 +5558,9 @@ async fn add_hive_finalize_via_socket(
     syncthing_peer_device_id: Option<&str>,
     syncthing_peer_name: Option<&str>,
 ) -> Result<serde_json::Value, OrchestratorError> {
-    let core_restart_budget_secs = CORE_SERVICE_HEALTH_TIMEOUT_SECS
-        .saturating_mul(CORE_SYNC_RESTART_ORDER.len() as u64)
-        .saturating_add(30);
-    let timeout_secs = ADD_HIVE_FINALIZE_SOCKET_TIMEOUT_SECS
-        .max(dist_sync_probe_timeout_secs)
-        .max(core_restart_budget_secs)
-        .clamp(30, 170);
+    // Socket-only path is an optimization. Keep it bounded so add_hive still has
+    // enough budget to fall back to SSH bootstrap within admin timeout (180s).
+    let timeout_secs = dist_sync_probe_timeout_secs.max(45).clamp(30, 75);
     let payload = forward_system_action_to_hive_with_timeout(
         state,
         hive_id,
