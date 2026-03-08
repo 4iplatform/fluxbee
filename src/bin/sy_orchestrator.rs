@@ -1154,6 +1154,14 @@ async fn handle_system_message(
     }
 
     match msg.meta.msg.as_deref() {
+        Some("RUNTIME_UPDATE") => {
+            let payload = serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": "action 'RUNTIME_UPDATE' is not supported; use 'SYSTEM_UPDATE'",
+            });
+            let _ = send_system_action_response(sender, msg, "RUNTIME_UPDATE_RESPONSE", payload).await;
+        }
         Some("SYSTEM_UPDATE") => {
             let result = handle_system_update_message(state, msg).await;
             let _ =

@@ -95,17 +95,17 @@ Fuente de verdad funcional: `docs/onworking/SY.orchestrator — Spec de Cambios 
 
 ## 5. E2E gates de cierre (sin legacy)
 
-- [ ] E2E-1 `add_hive` worker limpio: bootstrap SSH minimo + finalize socket `ok`.
-- [ ] E2E-2 `add_hive` con worker ya online: `bootstrap_mode=socket_only_existing_orchestrator`, cero pasos SSH.
-- [ ] E2E-3 `remove_hive`:
+- [x] E2E-1 `add_hive` worker limpio: bootstrap SSH minimo + finalize socket `ok`.
+- [x] E2E-2 `add_hive` con worker ya online: `bootstrap_mode=socket_only_existing_orchestrator`, cero pasos SSH.
+- [x] E2E-3 `remove_hive`:
   - online -> `remote_cleanup=socket_ok`
   - offline -> `remote_cleanup in {socket_timeout,local_only}` y `remote_cleanup_via=local_only`
-- [ ] E2E-4 `SYSTEM_UPDATE` runtime/core/vendor solo con contrato estricto (sin aliases).
-- [ ] E2E-5 `SPAWN_NODE`/`KILL_NODE` para `AI.*`, `IO.*`, `WF.*`, `RT.*` (sin endpoints de routers si se completa Fase C).
+- [x] E2E-4 `SYSTEM_UPDATE` runtime/core/vendor solo con contrato estricto (sin aliases).
+- [x] E2E-5 `SPAWN_NODE`/`KILL_NODE` para `AI.*`, `IO.*`, `WF.*`, `RT.*` (sin endpoints de routers si se completa Fase C).
 - [ ] E2E-6 prueba negativa: payload legacy (`name`, `version`, `hash`, `RUNTIME_UPDATE`) debe fallar explícitamente.
-- [ ] E2E-7 prueba negativa: key SSH inutilizable y operacion diaria (`run_node/kill_node/update/remove_hive online`) sigue funcionando por socket.
+- [x] E2E-7 prueba negativa: key SSH inutilizable y operacion diaria (`run_node/kill_node/update/remove_hive online`) sigue funcionando por socket.
 
 ## 6. Proximo corte de implementacion recomendado
 
 1. Completar Fase B (hard-delete de legacy filesystem).
-2. Ejecutar E2E-1..E2E-7 y cerrar backlog.
+2. Ejecutar E2E-6 (negativos legacy) y cerrar backlog.
