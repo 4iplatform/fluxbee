@@ -5541,6 +5541,15 @@ fn is_add_hive_core_sync_pending_error(error: &str) -> bool {
         || lower.contains("core manifest missing required worker component")
 }
 
+fn is_socket_only_unreachable_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("system forward timeout")
+        || (lower.contains("target hive")
+            && (lower.contains("not reachable in lsa") || lower.contains("stale/missing")))
+        || lower.contains("unreachable")
+        || lower.contains("ttl_exceeded")
+}
+
 async fn add_hive_finalize_via_socket(
     state: &OrchestratorState,
     hive_id: &str,
@@ -5556,7 +5565,7 @@ async fn add_hive_finalize_via_socket(
     let timeout_secs = ADD_HIVE_FINALIZE_SOCKET_TIMEOUT_SECS
         .max(dist_sync_probe_timeout_secs)
         .max(core_restart_budget_secs)
-        .clamp(30, 600);
+        .clamp(30, 170);
     let payload = forward_system_action_to_hive_with_timeout(
         state,
         hive_id,
@@ -5795,29 +5804,41 @@ async fn add_hive_flow(
             {
                 Ok(payload) => {
                     append_add_hive_finalize_history(state, hive_id, "ok", None);
-                    payload
+                    Some(payload)
                 }
                 Err(err) => {
-                    append_add_hive_finalize_history(
-                        state,
-                        hive_id,
-                        "error",
-                        Some(err.to_string()),
-                    );
-                    return serde_json::json!({
-                        "status": "error",
-                        "error_code": "FINALIZE_FAILED",
-                        "message": format!("worker socket-only finalize failed: {}", err),
-                        "hive_id": hive_id,
-                        "address": address,
-                        "bootstrap_mode": "socket_only_existing_orchestrator",
-                        "harden_ssh": harden_ssh,
-                        "restrict_ssh_requested": restrict_ssh,
-                        "require_dist_sync": require_dist_sync,
-                        "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
-                    });
+                    let err_text = err.to_string();
+                    if is_socket_only_unreachable_error(&err_text) {
+                        tracing::warn!(
+                            hive_id = hive_id,
+                            address = address,
+                            error = %err_text,
+                            "socket-only add_hive finalize unreachable/timeout; falling back to bootstrap path"
+                        );
+                        None
+                    } else {
+                        append_add_hive_finalize_history(
+                            state,
+                            hive_id,
+                            "error",
+                            Some(err_text.clone()),
+                        );
+                        return serde_json::json!({
+                            "status": "error",
+                            "error_code": "FINALIZE_FAILED",
+                            "message": format!("worker socket-only finalize failed: {}", err_text),
+                            "hive_id": hive_id,
+                            "address": address,
+                            "bootstrap_mode": "socket_only_existing_orchestrator",
+                            "harden_ssh": harden_ssh,
+                            "restrict_ssh_requested": restrict_ssh,
+                            "require_dist_sync": require_dist_sync,
+                            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                        });
+                    }
                 }
             };
+            if let Some(finalize) = finalize {
             let mut syncthing_peer_linked = false;
             if syncthing_expected {
                 let Some(worker_syncthing_device_id) =
@@ -5920,6 +5941,7 @@ async fn add_hive_flow(
                 "syncthing_peer_linked": syncthing_peer_linked,
                 "finalize": finalize,
             });
+            }
         }
     }
 
