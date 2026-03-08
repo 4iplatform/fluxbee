@@ -39,6 +39,7 @@ const STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS: u64 = 3;
 const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const SY_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
 const ADD_HIVE_FINALIZE_SOCKET_TIMEOUT_SECS: u64 = 120;
+const ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS: u64 = 10;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
 const SYNCTHING_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
 const SYNCTHING_HEALTH_TIMEOUT_SECS: u64 = 2;
@@ -5359,6 +5360,36 @@ async fn add_hive_finalize_via_socket(
     Err(format!("worker finalize returned non-ok payload: {}", payload).into())
 }
 
+async fn probe_remote_orchestrator_socket_ready(
+    state: &OrchestratorState,
+    hive_id: &str,
+    address: &str,
+) -> Result<(), OrchestratorError> {
+    let payload = forward_system_action_to_hive_with_timeout(
+        state,
+        hive_id,
+        "GET_VERSIONS",
+        "GET_VERSIONS_RESPONSE",
+        serde_json::json!({
+            "hive_id": hive_id,
+            "target": hive_id,
+            "address": address,
+        }),
+        Duration::from_secs(ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS),
+    )
+    .await?;
+
+    if payload
+        .get("status")
+        .and_then(|value| value.as_str())
+        .is_some_and(|status| status.eq_ignore_ascii_case("ok"))
+    {
+        return Ok(());
+    }
+
+    Err(format!("GET_VERSIONS probe returned non-ok payload: {payload}").into())
+}
+
 fn append_add_hive_finalize_history(
     state: &OrchestratorState,
     hive_id: &str,
@@ -5490,6 +5521,14 @@ async fn add_hive_flow(
     )
     .is_ok();
     if socket_only_ready {
+        if let Err(err) = probe_remote_orchestrator_socket_ready(state, hive_id, address).await {
+            tracing::warn!(
+                hive_id = hive_id,
+                address = address,
+                error = %err,
+                "socket-only add_hive precheck failed; falling back to bootstrap path"
+            );
+        } else {
         let finalize = match add_hive_finalize_via_socket(
             state,
             hive_id,
@@ -5585,6 +5624,7 @@ async fn add_hive_flow(
             "dist_sync_ready": dist_sync_ready,
             "finalize": finalize,
         });
+        }
     }
 
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
