@@ -30,8 +30,11 @@ Fuente de verdad funcional: `docs/onworking/SY.orchestrator — Spec de Cambios 
 
 ### 2.2 Desalineaciones abiertas (codigo)
 
-- [ ] Persisten rutas/funciones de dist/core/vendor con fallback legacy en filesystem (`/var/lib/fluxbee/{runtimes,core,vendor}`) en vez de solo `dist/`.
-- [ ] Persisten bloques de codigo muerto/legacy en capas compartidas (`lib`) y algunos textos de compatibilidad, aunque se removio el bloque SSH legacy de sync remoto en orchestrator.
+- [x] Eliminados fallbacks/mirrors legacy de filesystem para operación v2 (`dist/*` como source de core/runtime/vendor en orchestrator + install).
+- [x] Limpieza de scripts/diagnostics y textos de trabajo:
+  - renombrados scripts E2E a contrato v2 (`orchestrator_system_update_spawn_e2e.sh`, `orchestrator_system_update_stale_e2e.sh`)
+  - reemplazada terminología/variables operativas `RUNTIME_UPDATE` -> `SYSTEM_UPDATE` en scripts y docs onworking relevantes
+  - mantenido `RUNTIME_UPDATE` solo en prueba negativa explícita de rechazo legacy
 
 ## 3. Backlog de limpieza obligatoria (hard-delete)
 
@@ -102,10 +105,10 @@ Fuente de verdad funcional: `docs/onworking/SY.orchestrator — Spec de Cambios 
   - offline -> `remote_cleanup in {socket_timeout,local_only}` y `remote_cleanup_via=local_only`
 - [x] E2E-4 `SYSTEM_UPDATE` runtime/core/vendor solo con contrato estricto (sin aliases).
 - [x] E2E-5 `SPAWN_NODE`/`KILL_NODE` para `AI.*`, `IO.*`, `WF.*`, `RT.*` (sin endpoints de routers si se completa Fase C).
-- [ ] E2E-6 prueba negativa: payload legacy (`name`, `version`, `hash`, `RUNTIME_UPDATE`) debe fallar explícitamente.
+- [x] E2E-6 prueba negativa: payload legacy (`name`, `version`, `hash`, `RUNTIME_UPDATE`) debe fallar explícitamente.
 - [x] E2E-7 prueba negativa: key SSH inutilizable y operacion diaria (`run_node/kill_node/update/remove_hive online`) sigue funcionando por socket.
 
 ## 6. Proximo corte de implementacion recomendado
 
-1. Completar Fase B (hard-delete de legacy filesystem).
-2. Ejecutar E2E-6 (negativos legacy) y cerrar backlog.
+1. Ejecutar ronda final de E2E con nombres actualizados de scripts (`system_update_*`) para validar regresión cero.
+2. Congelar contrato v2 y preparar commit de cierre de limpieza legacy en orchestrator.

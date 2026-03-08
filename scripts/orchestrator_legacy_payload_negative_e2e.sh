@@ -7,7 +7,7 @@ set -euo pipefail
 # - run_node con campo legacy "version"
 # - update con campo legacy "version"
 # - update con campo legacy "hash"
-# - sistema legacy "RUNTIME_UPDATE" (debe responder INVALID_REQUEST)
+# - acción legacy "RUNTIME_UPDATE" (debe responder INVALID_REQUEST)
 #
 # Uso:
 #   BASE="http://127.0.0.1:8080" HIVE_ID="worker-220" \
@@ -15,7 +15,7 @@ set -euo pipefail
 #
 # Opcionales:
 #   BUILD_BIN=1                      # compila orch_system_diag si hace falta (default: 1)
-#   ORCH_TIMEOUT_SECS=30             # timeout para test de RUNTIME_UPDATE
+#   ORCH_TIMEOUT_SECS=30             # timeout para test de SYSTEM_UPDATE/RUNTIME_UPDATE legacy
 
 BASE="${BASE:-http://127.0.0.1:8080}"
 HIVE_ID="${HIVE_ID:-worker-220}"
@@ -138,9 +138,11 @@ fi
 
 (
   cd "$ROOT_DIR"
-  ORCH_SEND_RUNTIME_UPDATE=1 \
-  ORCH_ONLY_RUNTIME_UPDATE=1 \
-  ORCH_EXPECT_RUNTIME_UPDATE_ERROR_CODE="INVALID_REQUEST" \
+  ORCH_SEND_SYSTEM_UPDATE=0 \
+  ORCH_SEND_LEGACY_RUNTIME_UPDATE=1 \
+  ORCH_ONLY_SYSTEM_UPDATE=0 \
+  ORCH_ONLY_LEGACY_RUNTIME_UPDATE=1 \
+  ORCH_EXPECT_LEGACY_RUNTIME_UPDATE_ERROR_CODE="INVALID_REQUEST" \
   ORCH_TIMEOUT_SECS="$ORCH_TIMEOUT_SECS" \
   ./target/release/orch_system_diag
 )

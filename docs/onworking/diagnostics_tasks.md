@@ -22,17 +22,17 @@ Alcance:
   - producir timeline compacto + resumen de latencias.
 
 ### 1.2 Orchestrator system flow (control plane)
-- Script: `scripts/orchestrator_runtime_update_spawn_e2e.sh`
+- Script: `scripts/orchestrator_system_update_spawn_e2e.sh`
 - Binario principal: `src/bin/orch_system_diag.rs`
 - Propósito:
-  - validar flujo `RUNTIME_UPDATE -> SPAWN_NODE -> KILL_NODE`,
+  - validar flujo `SYSTEM_UPDATE -> SPAWN_NODE -> KILL_NODE`,
   - validar respuesta explícita en errores de routing (`UNREACHABLE`, `TTL_EXCEEDED`),
   - validar modo `Resolve` (router + OPA) vs `Unicast`.
 
 ### 1.3 Salud OPA en SHM (pre-check de resolve)
 - Binario: `src/bin/opa_shm_diag.rs`
 - Integración:
-  - usado por `scripts/orchestrator_runtime_update_spawn_e2e.sh` cuando `ORCH_ROUTE_MODE=resolve`.
+  - usado por `scripts/orchestrator_system_update_spawn_e2e.sh` cuando `ORCH_ROUTE_MODE=resolve`.
 - Propósito:
   - verificar estado OPA leído desde `/jsr-opa-<hive>` antes de correr pruebas de resolve.
 
@@ -83,14 +83,14 @@ Alcance:
 - `SHOW_FULL_LOGS`
 - `WF_DIAG_BIN_PATH`
 
-## 2.2 `orchestrator_runtime_update_spawn_e2e.sh` + `orch_system_diag.rs`
+## 2.2 `orchestrator_system_update_spawn_e2e.sh` + `orch_system_diag.rs`
 - `TARGET_HIVE`
 - `ORCH_TARGET_HIVE` (binario)
 - `ORCH_RUNTIME`
 - `ORCH_VERSION`
 - `ORCH_TIMEOUT_SECS`
 - `ORCH_SEND_KILL`
-- `ORCH_SEND_RUNTIME_UPDATE`
+- `ORCH_SEND_SYSTEM_UPDATE`
 - `ORCH_UNIT`
 - `ORCH_ROUTE_MODE=unicast|resolve`
 - `ORCH_EXPECT_SPAWN_UNREACHABLE_REASON`
@@ -261,21 +261,21 @@ bash scripts/wf_nats_diag.sh
 Orchestrator diag positivo (resolve):
 ```bash
 TARGET_HIVE="worker-220" ORCH_ROUTE_MODE="resolve" BUILD_BIN=0 \
-bash scripts/orchestrator_runtime_update_spawn_e2e.sh
+bash scripts/orchestrator_system_update_spawn_e2e.sh
 ```
 
 Orchestrator diag negativo (espera `UNREACHABLE`):
 ```bash
-TARGET_HIVE="worker-220" ORCH_ROUTE_MODE="resolve" ORCH_SEND_RUNTIME_UPDATE=0 ORCH_SEND_KILL=0 \
+TARGET_HIVE="worker-220" ORCH_ROUTE_MODE="resolve" ORCH_SEND_SYSTEM_UPDATE=0 ORCH_SEND_KILL=0 \
 ORCH_EXPECT_SPAWN_UNREACHABLE_REASON="OPA_NO_TARGET" BUILD_BIN=0 \
-bash scripts/orchestrator_runtime_update_spawn_e2e.sh
+bash scripts/orchestrator_system_update_spawn_e2e.sh
 ```
 
 Orchestrator diag (simular origen no autorizado en hardening de `SY.orchestrator`):
 ```bash
 TARGET_HIVE="worker-220" ORCH_ROUTE_MODE="unicast" ORCH_DIAG_NODE_NAME="WF.unauthorized" \
-ORCH_SEND_RUNTIME_UPDATE=0 ORCH_SEND_KILL=0 ORCH_EXPECT_SPAWN_ERROR_CODE="FORBIDDEN" BUILD_BIN=0 \
-bash scripts/orchestrator_runtime_update_spawn_e2e.sh
+ORCH_SEND_SYSTEM_UPDATE=0 ORCH_SEND_KILL=0 ORCH_EXPECT_SPAWN_ERROR_CODE="FORBIDDEN" BUILD_BIN=0 \
+bash scripts/orchestrator_system_update_spawn_e2e.sh
 ```
 
 JetStream envelope E2E (payload opaco + redelivery):

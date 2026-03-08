@@ -39,7 +39,7 @@ Checklist operativo para cerrar SY.orchestrator segun:
 ## Pendiente de cierre fino
 - [x] Validacion explicita de readiness de NATS en bootstrap (ademas de socket+SHM y SY nodes).
 - [x] Validacion explicita de readiness profunda de `sy-storage` (bootstrap ahora exige respuesta `status=ok` de `storage.metrics.get` via NATS, validando camino `SY.orchestrator -> NATS -> SY.storage -> DB`).
-- [x] Tests de integracion de `RUNTIME_UPDATE` + `SPAWN_NODE` remoto con worker real (script: `scripts/orchestrator_runtime_update_spawn_e2e.sh`, helper: `orch_system_diag`; envio ajustado a `dst` por nombre L2 y manejo explicito de `UNREACHABLE/TTL_EXCEEDED`).
+- [x] Tests de integracion de `RUNTIME_UPDATE` + `SPAWN_NODE` remoto con worker real (script: `scripts/orchestrator_system_update_spawn_e2e.sh`, helper: `orch_system_diag`; envio ajustado a `dst` por nombre L2 y manejo explicito de `UNREACHABLE/TTL_EXCEEDED`).
 - [x] Cierre operativo del E2E `RUNTIME_UPDATE + SPAWN_NODE + KILL_NODE` en worker real:
   - [x] Contrato payload alineado en `orch_system_diag` (`target`/`unit` en lugar de `hive`/`name`).
   - [x] Sync de runtimes endurecido en `sy_orchestrator` (staging remoto en `/tmp` + promocion con `sudo`), evitando fallas de permisos en `/var/lib/fluxbee/runtimes`.
@@ -116,7 +116,7 @@ Implementación ejecutada para decisiones C1/C3:
 
 ### 6) Validacion E2E de versionado/distribucion
 - [x] Script E2E: `RUNTIME_UPDATE` canary -> global -> verificacion -> rollback. (`scripts/orchestrator_runtime_rollout_e2e.sh`)
-- [x] Caso negativo E2E: update stale rechazado con `error_code` explicito (sin timeout opaco). (`scripts/orchestrator_runtime_update_stale_e2e.sh`)
+- [x] Caso negativo E2E: update stale rechazado con `error_code` explicito (sin timeout opaco). (`scripts/orchestrator_system_update_stale_e2e.sh`)
 - [x] Caso E2E de drift remoto: deteccion + auto-resync + evidencia en API/logs. (`scripts/orchestrator_drift_runtime_e2e.sh`)
 - [x] Script E2E de vendor: drift de binario + reconciliacion + health check Syncthing. (`scripts/orchestrator_drift_vendor_e2e.sh`)
 - [x] Script E2E de vendor rollback: falla inducida + rollback aplicado + evidencia en `/deployments`. (`scripts/orchestrator_vendor_rollback_e2e.sh`)

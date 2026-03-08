@@ -24,8 +24,7 @@ NODE_NAME="WF.demo.task.node1" # nombre de nodo (sin @)
 
 El orchestrator busca `start.sh` en:
 
-- primario: `/var/lib/fluxbee/dist/runtimes/<runtime>/<version>/bin/start.sh`
-- fallback legacy: `/var/lib/fluxbee/runtimes/...`
+- `/var/lib/fluxbee/dist/runtimes/<runtime>/<version>/bin/start.sh`
 
 Publicá primero en `dist`:
 
@@ -87,13 +86,6 @@ os.replace(tmp, manifest_path)
 print("manifest updated:", manifest_path)
 print("manifest_version:", doc["version"])
 PY
-```
-
-Sincronizá también el path legacy (compat):
-
-```bash
-sudo mkdir -p /var/lib/fluxbee/runtimes
-sudo cp /var/lib/fluxbee/dist/runtimes/manifest.json /var/lib/fluxbee/runtimes/manifest.json
 ```
 
 ## 4. Verificar versión/hash local en motherbee

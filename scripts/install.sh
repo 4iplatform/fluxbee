@@ -48,12 +48,8 @@ sudo install -d "$STATE_DIR/modules"
 sudo install -d "$STATE_DIR/blob"
 sudo install -d "$STATE_DIR/syncthing"
 sudo install -d "$STATE_DIR/vendor"
-sudo install -d "$STATE_DIR/vendor/syncthing"
-sudo install -d "$STATE_DIR/runtimes"
+sudo install -d "$STATE_DIR/vendor/bin"
 sudo install -d "$STATE_DIR/nats"
-sudo install -d "$STATE_DIR/core"
-sudo install -d "$STATE_DIR/core/bin"
-sudo install -d "$STATE_DIR/core/bin.prev"
 sudo install -d "$STATE_DIR/dist"
 sudo install -d "$STATE_DIR/dist/runtimes"
 sudo install -d "$STATE_DIR/dist/core"
@@ -126,17 +122,7 @@ else
 fi
 sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
 
-echo "Updating core source repo in $STATE_DIR/core/bin..."
 echo "Updating core source repo in $STATE_DIR/dist/core/bin..."
-sudo install -m 0755 "$json_router_bin" "$STATE_DIR/core/bin/rt-gateway"
-sudo install -m 0755 "$sy_admin_bin" "$STATE_DIR/core/bin/sy-admin"
-sudo install -m 0755 "$sy_config_bin" "$STATE_DIR/core/bin/sy-config-routes"
-sudo install -m 0755 "$sy_orch_bin" "$STATE_DIR/core/bin/sy-orchestrator"
-sudo install -m 0755 "$sy_storage_bin" "$STATE_DIR/core/bin/sy-storage"
-if [[ -n "${sy_identity_bin:-}" ]]; then
-  sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/core/bin/sy-identity"
-fi
-sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/core/bin/sy-opa-rules"
 sudo install -m 0755 "$json_router_bin" "$STATE_DIR/dist/core/bin/rt-gateway"
 sudo install -m 0755 "$sy_admin_bin" "$STATE_DIR/dist/core/bin/sy-admin"
 sudo install -m 0755 "$sy_config_bin" "$STATE_DIR/dist/core/bin/sy-config-routes"
@@ -193,10 +179,9 @@ cat >"$core_manifest_tmp" <<EOF
   }
 }
 EOF
-sudo install -m 0644 "$core_manifest_tmp" "$STATE_DIR/core/manifest.json"
 sudo install -m 0644 "$core_manifest_tmp" "$STATE_DIR/dist/core/manifest.json"
 rm -f "$core_manifest_tmp"
-echo "Updated core manifests at $STATE_DIR/core/manifest.json and $STATE_DIR/dist/core/manifest.json"
+echo "Updated core manifest at $STATE_DIR/dist/core/manifest.json"
 
 seeded_syncthing_vendor=0
 candidate_syncthing_vendor=""
@@ -222,7 +207,6 @@ if [[ -z "$candidate_syncthing_vendor" ]]; then
 fi
 
 if [[ -n "$candidate_syncthing_vendor" ]]; then
-  sudo install -m 0755 "$candidate_syncthing_vendor" "$STATE_DIR/vendor/syncthing/syncthing"
   sudo install -m 0755 "$candidate_syncthing_vendor" "$STATE_DIR/dist/vendor/syncthing/syncthing"
   seeded_syncthing_vendor=1
   echo "Seeded Syncthing vendor binary from $candidate_syncthing_vendor"
@@ -231,7 +215,6 @@ fi
 if [[ "$seeded_syncthing_vendor" -eq 0 ]] && command -v syncthing >/dev/null 2>&1; then
   syncthing_cmd="$(command -v syncthing)"
   if [[ -x "$syncthing_cmd" ]]; then
-    sudo install -m 0755 "$syncthing_cmd" "$STATE_DIR/vendor/syncthing/syncthing"
     sudo install -m 0755 "$syncthing_cmd" "$STATE_DIR/dist/vendor/syncthing/syncthing"
     seeded_syncthing_vendor=1
     echo "Seeded Syncthing vendor binary from $syncthing_cmd"
@@ -375,5 +358,5 @@ if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then
   sudo chown "$INSTALL_OWNER":"$INSTALL_OWNER" "$CONFIG_DIR/sy-config-routes.yaml" "$CONFIG_DIR/hive.yaml" 2>/dev/null || true
 fi
 
-echo "Installed config to $CONFIG_DIR, binaries to /usr/bin, core source repo to $STATE_DIR/dist/core/bin (legacy mirror: $STATE_DIR/core/bin), systemd units, and runtime directories."
+echo "Installed config to $CONFIG_DIR, binaries to /usr/bin, core source repo to $STATE_DIR/dist/core/bin, systemd units, and runtime directories."
 echo "Note: fluxbee-syncthing is managed dynamically by sy-orchestrator from hive.yaml (blob.sync.*)."

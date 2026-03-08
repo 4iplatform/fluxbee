@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Orchestrator drift E2E (runtime manifest drift on worker):
-# 1) Baseline runtime update (ensures manifests/sync path healthy)
+# 1) Baseline runtime SYSTEM_UPDATE (ensures manifests/sync path healthy)
 # 2) Tamper worker runtime manifest to force hash drift
-# 3) Trigger runtime_update again (auto-resync path)
+# 3) Trigger runtime SYSTEM_UPDATE again (auto-resync path)
 # 4) Validate:
 #    - worker runtime manifest hash == local hash after resync
 #    - drift alert exists in API/log evidence
@@ -42,7 +42,7 @@ INFO_FILE="/var/lib/fluxbee/hives/${HIVE_ID}/info.yaml"
 LEGACY_KEY_PATH="/var/lib/fluxbee/hives/${HIVE_ID}/ssh.key"
 MOTHERBEE_KEY_PATH="/var/lib/fluxbee/ssh/motherbee.key"
 KEY_PATH=""
-LOCAL_RUNTIME_MANIFEST="/var/lib/fluxbee/runtimes/manifest.json"
+LOCAL_RUNTIME_MANIFEST="/var/lib/fluxbee/dist/runtimes/manifest.json"
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
   SUDO=""
@@ -198,25 +198,25 @@ remote_root() {
 }
 
 remote_runtime_hash() {
-  remote_root "if [ -f /var/lib/fluxbee/runtimes/manifest.json ]; then sha256sum /var/lib/fluxbee/runtimes/manifest.json | awk '{print \$1}'; fi"
+  remote_root "if [ -f /var/lib/fluxbee/dist/runtimes/manifest.json ]; then sha256sum /var/lib/fluxbee/dist/runtimes/manifest.json | awk '{print \$1}'; fi"
 }
 
 local_runtime_hash() {
   ${SUDO} bash -lc "if [ -f '${LOCAL_RUNTIME_MANIFEST}' ]; then sha256sum '${LOCAL_RUNTIME_MANIFEST}' | awk '{print \$1}'; fi"
 }
 
-trigger_runtime_update_cycle() {
-  echo "Triggering runtime_update + spawn/kill cycle..." >&2
+trigger_system_update_cycle() {
+  echo "Triggering runtime SYSTEM_UPDATE + spawn/kill cycle..." >&2
   (
     cd "$ROOT_DIR"
     TARGET_HIVE="$HIVE_ID" \
     ORCH_RUNTIME="$ORCH_RUNTIME" \
     ORCH_VERSION="$ORCH_VERSION" \
     ORCH_TIMEOUT_SECS="$ORCH_TIMEOUT_SECS" \
-    ORCH_SEND_RUNTIME_UPDATE=1 \
+    ORCH_SEND_SYSTEM_UPDATE=1 \
     ORCH_SEND_KILL=1 \
     BUILD_BIN="$BUILD_BIN" \
-    bash scripts/orchestrator_runtime_update_spawn_e2e.sh
+    bash scripts/orchestrator_system_update_spawn_e2e.sh
   )
 }
 
@@ -337,8 +337,8 @@ log_http_response "$status" "$hive_body"
 assert_eq "$status" "200" "GET /hives/{id}/http"
 assert_eq "$(json_get "status" "$hive_body")" "ok" "GET /hives/{id}/status"
 
-echo "Step 1/4: baseline runtime update cycle"
-trigger_runtime_update_cycle
+echo "Step 1/4: baseline runtime SYSTEM_UPDATE cycle"
+trigger_system_update_cycle
 
 baseline_local_hash="$(local_runtime_hash)"
 if [[ -z "$baseline_local_hash" ]]; then
@@ -359,7 +359,7 @@ echo "Baseline hashes: local=$baseline_local_hash remote=$baseline_remote_hash"
 
 echo "Step 2/4: tamper remote runtime manifest to inject drift"
 drift_start_ms="$(epoch_ms)"
-remote_root "printf '\n# drift-e2e-$(date +%s)' >> /var/lib/fluxbee/runtimes/manifest.json"
+remote_root "printf '\n# drift-e2e-$(date +%s)' >> /var/lib/fluxbee/dist/runtimes/manifest.json"
 tampered_remote_hash="$(remote_runtime_hash || true)"
 if [[ -z "$tampered_remote_hash" || "$tampered_remote_hash" == "$baseline_local_hash" ]]; then
   echo "FAIL: tamper did not change remote runtime manifest hash" >&2
@@ -367,8 +367,8 @@ if [[ -z "$tampered_remote_hash" || "$tampered_remote_hash" == "$baseline_local_
 fi
 echo "Tampered remote hash: $tampered_remote_hash"
 
-echo "Step 3/4: trigger runtime_update again to force auto-resync"
-trigger_runtime_update_cycle
+echo "Step 3/4: trigger runtime SYSTEM_UPDATE again to force auto-resync"
+trigger_system_update_cycle
 expected_local_hash="$(local_runtime_hash)"
 if [[ -z "$expected_local_hash" ]]; then
   echo "FAIL: local runtime manifest hash is empty after resync trigger" >&2

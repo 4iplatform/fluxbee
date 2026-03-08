@@ -107,7 +107,7 @@ if [[ "$EXERCISE_ADD_REMOVE" == "1" ]]; then
 fi
 
 run_step "runtime stale reject" \
-  bash -lc "cd '$ROOT_DIR' && BASE='$BASE' HIVE_ID='$HIVE_ID' BUILD_BIN='$BUILD_BIN' bash scripts/orchestrator_runtime_update_stale_e2e.sh"
+  bash -lc "cd '$ROOT_DIR' && BASE='$BASE' HIVE_ID='$HIVE_ID' BUILD_BIN='$BUILD_BIN' bash scripts/orchestrator_system_update_stale_e2e.sh"
 
 run_step "runtime rollout canary/global/rollback" \
   bash -lc "cd '$ROOT_DIR' && BASE='$BASE' HIVE_ID='$HIVE_ID' BUILD_BIN='$BUILD_BIN' bash scripts/orchestrator_runtime_rollout_e2e.sh"
