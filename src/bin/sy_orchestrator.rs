@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 use tokio::time;
@@ -4765,14 +4766,18 @@ fn shell_single_quote(value: &str) -> String {
 }
 
 fn sha256_file(path: &Path) -> Result<String, OrchestratorError> {
-    let mut cmd = Command::new("sha256sum");
-    cmd.arg(path);
-    let out = run_cmd_output(cmd, "sha256sum core binary")?;
-    Ok(out
-        .split_whitespace()
-        .next()
-        .map(|s| s.to_string())
-        .unwrap_or_default())
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn load_core_manifest() -> Result<CoreManifest, OrchestratorError> {
