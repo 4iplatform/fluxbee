@@ -11,7 +11,7 @@
 Let me compile all the decisions and changes we've discussed:
 
 Orchestrator is LOCAL - always runs on its own machine
-add_hive/remove_hive only on motherbee (SSH bootstrap)
+add_hive/remove_hive only on motherbee (`add_hive` usa SSH bootstrap; `remove_hive` es socket-first/local-only)
 All commands via socket unicast L2 (not NATS, not SSH)
 Software sync via Syncthing to /var/lib/fluxbee/dist/
 RUNTIME_UPDATE renamed to SYSTEM_UPDATE for broader applicability
@@ -28,7 +28,8 @@ SSH access restricted to bootstrap only, then disabled
 
 Cada `SY.orchestrator` opera exclusivamente sobre su propia máquina. No ejecuta comandos remotos. No usa SSH para operaciones post-bootstrap. Toda comunicación entre orchestrators pasa por el canal de mensajería existente (socket → router → WAN).
 
-La única excepción es `add_hive` / `remove_hive`, que son funciones de provisioning exclusivas de motherbee y requieren SSH como operación de una sola vez.
+La única excepción con SSH es `add_hive` cuando el worker todavía no tiene orchestrator operativo.  
+`remove_hive` opera socket-first y, si el worker no está alcanzable por socket, hace cleanup local-only en motherbee.
 
 ---
 
@@ -60,7 +61,7 @@ role: motherbee
 **Funciones activas:**
 
 - `add_hive` — provisioning remoto por SSH (única función remota)
-- `remove_hive` — cleanup remoto por SSH o SHUTDOWN por socket
+- `remove_hive` — cleanup remoto por socket (`REMOVE_HIVE_CLEANUP`) o cleanup local-only si el worker no está alcanzable
 - Gestión del repo maestro de distribución (`/var/lib/fluxbee/dist/`)
 - Generación de manifests (core, vendor, runtimes)
 - Monitoreo de respuestas de orchestrators remotos
@@ -542,7 +543,7 @@ Ambos folders se sincronizan a los workers que correspondan. Son independientes:
 1. Operador coloca binarios nuevos en motherbee:/var/lib/fluxbee/dist/
    (puede ser build automático, copia manual, CI/CD)
 
-2. Operador actualiza manifest (version + hashes)
+2. Operador actualiza manifest (`manifest_version` + hashes)
 
 3. Syncthing detecta cambio y propaga a workers
    (automático, sin intervención)
@@ -551,7 +552,7 @@ Ambos folders se sincronizan a los workers que correspondan. Son independientes:
    GET /hives/{id}/sync-status  (futuro, por ahora verificar manualmente)
 
 5. Operador dispara update:
-   POST /hives/worker-1/update  { "category": "core", "version": 13 }
+   POST /hives/worker-1/update  { "category": "core", "manifest_version": 13, "manifest_hash": "sha256:..." }
 
 6. SY.admin → unicast → SY.orchestrator@worker-1
    Mensaje: SYSTEM_UPDATE { category: core, manifest_version: 13, manifest_hash: ... }
@@ -643,7 +644,8 @@ GET    /hives/{id}/nodes           → list_nodes (sin cambios, lee LSA/SHM)
 // Request
 {
   "category": "runtime",
-  "version": 14
+  "manifest_version": 14,
+  "manifest_hash": "sha256:a1b2c3..."
 }
 
 // Response 200
@@ -651,7 +653,7 @@ GET    /hives/{id}/nodes           → list_nodes (sin cambios, lee LSA/SHM)
   "status": "ok",
   "hive": "worker-1",
   "category": "runtime",
-  "version": 14,
+  "manifest_version": 14,
   "updated": ["AI.soporte/1.3.0"],
   "restarted": ["AI.soporte.l1"]
 }
@@ -709,14 +711,13 @@ GET    /hives/{id}/nodes           → list_nodes (sin cambios, lee LSA/SHM)
 | Operación | Antes (SSH) | Ahora |
 |-----------|-------------|-------|
 | `run_node` / `kill_node` | `ssh worker systemctl start` | Socket unicast → orchestrator@worker ejecuta local |
-| `run_router` / `kill_router` | `ssh worker systemctl start` | Socket unicast → orchestrator@worker ejecuta local |
 | rsync runtimes | `rsync -e ssh` | Syncthing (fluxbee-dist) |
 | rsync core binaries | `rsync -e ssh` | Syncthing (fluxbee-dist) |
 | rsync vendor | `rsync -e ssh` | Syncthing (fluxbee-dist) |
 | health check | `ssh worker systemctl is-active` | Orchestrator@worker reporta por socket |
 | drift check | `ssh worker sha256sum` | Orchestrator@worker verifica local y reporta |
 | `add_hive` | SSH (se mantiene) | SSH (se mantiene, única vez) |
-| `remove_hive` | SSH cleanup | Socket → SHUTDOWN + cleanup local. Fallback SSH si no responde |
+| `remove_hive` | SSH cleanup | Socket (`REMOVE_HIVE_CLEANUP`) o cleanup local-only si el worker no está alcanzable |
 
 ### 9.2 SSH post-bootstrap: cerrar o restringir
 
@@ -749,8 +750,6 @@ Some("RUNTIME_UPDATE") => self.handle_runtime_update(payload, trace_id, src).awa
 
 // Ahora:
 Some("SYSTEM_UPDATE") => self.handle_system_update(payload, trace_id, src).await,
-// Mantener backward compat temporal:
-Some("RUNTIME_UPDATE") => self.handle_system_update(payload, trace_id, src).await,
 ```
 
 **Nuevo: handle_system_update:**
@@ -843,7 +842,8 @@ async fn handle_spawn_node(&mut self, payload: &Value) -> Result {
 ```rust
 async fn handle_update(&self, hive_id: &str, payload: &Value, trace_id: &str) -> Result {
     let category = payload["category"].as_str().required()?;
-    let version = payload["version"].as_u64().required()?;
+    let manifest_version = payload["manifest_version"].as_u64().required()?;
+    let manifest_hash = payload["manifest_hash"].as_str().required()?;
 
     // Validar categoría
     if !["runtime", "core", "vendor"].contains(&category) {
@@ -852,15 +852,21 @@ async fn handle_update(&self, hive_id: &str, payload: &Value, trace_id: &str) ->
 
     // Leer manifest local de motherbee para obtener hash
     let manifest = self.read_local_manifest(category)?;
-    if manifest.version != version {
-        return Err(not_found(&format!("Version {} not found in local manifest", version)));
+    if manifest.version != manifest_version {
+        return Err(not_found(&format!(
+            "Version {} not found in local manifest",
+            manifest_version
+        )));
+    }
+    if manifest.hash() != manifest_hash {
+        return Err(bad_request("manifest_hash mismatch with local manifest"));
     }
 
     // Enviar SYSTEM_UPDATE al orchestrator del hive destino
     let msg = SystemMessage::new("SYSTEM_UPDATE", json!({
         "category": category,
-        "manifest_version": version,
-        "manifest_hash": manifest.hash()
+        "manifest_version": manifest_version,
+        "manifest_hash": manifest_hash
     }));
 
     let dst = format!("SY.orchestrator@{}", hive_id);
@@ -922,7 +928,7 @@ Nuevo bloque `dist` en hive.yaml para declarar el repo de distribución y su sin
 
 ### Fase 2 — SYSTEM_UPDATE
 
-- [ ] Renombrar RUNTIME_UPDATE a SYSTEM_UPDATE (mantener backward compat)
+- [ ] Renombrar RUNTIME_UPDATE a SYSTEM_UPDATE (sin backward compat)
 - [ ] Implementar `handle_system_update` con categorías (runtime/core/vendor)
 - [ ] Verificación de hash de manifest local vs esperado
 - [ ] Response `sync_pending` cuando manifest no coincide
@@ -975,5 +981,3 @@ Para sistemas existentes con workers ya provisionados sin orchestrator local:
 ```
 
 No es necesario re-provisionar workers desde cero.
-
-

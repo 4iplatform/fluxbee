@@ -1068,11 +1068,6 @@ async fn handle_hive_paths(
                 handle_admin_command(ctx, client, "kill_node", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
-        ("GET", ["routers"]) => {
-            let (status, resp) =
-                handle_admin_query(ctx, client, "list_routers", Some(hive)).await?;
-            Ok(Some((status, resp)))
-        }
         ("GET", ["versions"]) => {
             let (status, resp) =
                 handle_admin_query(ctx, client, "get_versions", Some(hive)).await?;
@@ -2169,7 +2164,7 @@ fn build_admin_request(
         match action {
             "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn"
             | "delete_vpn" => "SY.config.routes",
-            "list_nodes" | "run_node" | "kill_node" | "list_routers" | "hive_status"
+            "list_nodes" | "run_node" | "kill_node" | "hive_status"
             | "get_storage" | "set_storage" | "list_hives"
             | "get_hive" | "list_versions" | "get_versions" | "list_deployments"
             | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "remove_hive"
@@ -2404,7 +2399,6 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
         "list_nodes"
             | "run_node"
             | "kill_node"
-            | "list_routers"
             | "hive_status"
             | "get_storage"
             | "set_storage"

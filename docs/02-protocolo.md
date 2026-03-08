@@ -737,9 +737,9 @@ Request/response para obtener EventPackage completo de otra isla:
 | `KILL_NODE` | `SY.admin` (tooling E2E solo entorno controlado) | `SY.orchestrator@<hive>` | Solicitar terminación de nodo |
 | `KILL_NODE_RESPONSE` | `SY.orchestrator@<hive>` | Originador de `KILL_NODE` | Resultado de kill |
 
-Compatibilidad:
-- `RUNTIME_UPDATE`/`RUNTIME_UPDATE_RESPONSE` quedan **obsoletos** para operación canónica.
-- Si se reciben, se procesan en modo compatibilidad local y se responde indicando que la propagación remota debe hacerse con `SYSTEM_UPDATE`.
+Contrato estricto v2:
+- `RUNTIME_UPDATE`/`RUNTIME_UPDATE_RESPONSE` no forman parte del contrato operativo.
+- El único contrato de update remoto es `SYSTEM_UPDATE`/`SYSTEM_UPDATE_RESPONSE`.
 
 Regla operativa 7.8:
 - Usar `routing.dst` por nombre L2 (`"SY.orchestrator@<hive>"`).
@@ -774,8 +774,8 @@ Campos de request (`payload`):
 | Campo | Tipo | Obligatorio | Valores | Notas |
 |-------|------|-------------|---------|-------|
 | `category` | string | No | `runtime`, `core`, `vendor` | Default: `runtime` |
-| `manifest_version` | u64 | No | >= 0 | Alias aceptado: `version` |
-| `manifest_hash` | string | Sí | `sha256:...` o hash hex | Alias aceptado: `hash` |
+| `manifest_version` | u64 | No | >= 0 | No acepta alias legacy (`version`) |
+| `manifest_hash` | string | Sí | `sha256:...` o hash hex | No acepta alias legacy (`hash`) |
 
 Response (`SYSTEM_UPDATE_RESPONSE`):
 
@@ -847,9 +847,9 @@ Campos de request (`payload`):
 
 | Campo | Tipo | Obligatorio | Notas |
 |-------|------|-------------|-------|
-| `node_name` | string | Sí | Alias aceptado: `name`. Si no incluye `@hive`, se normaliza al target |
+| `node_name` | string | Sí | Si no incluye `@hive`, se normaliza al target |
 | `runtime` | string | No | Si falta, se deriva de `node_name` |
-| `runtime_version` | string | No | Default: `current`. Alias aceptado: `version` |
+| `runtime_version` | string | No | Default: `current` |
 | `target` | string | No | Hive destino explícito (si no, se usa el de `routing.dst`) |
 | `config` | object | No | Config del runtime/nodo |
 
@@ -901,7 +901,7 @@ Campos de request (`payload`):
 
 | Campo | Tipo | Obligatorio | Notas |
 |-------|------|-------------|-------|
-| `node_name` | string | Condicional | Alias aceptado: `name` |
+| `node_name` | string | Condicional | Requerido si no se envía `unit` |
 | `unit` | string | Condicional | Alternativa directa a `node_name` |
 | `force` | bool | No | `false` => `SIGTERM`; `true` => `SIGKILL` |
 | `signal` | string | No | Solo aplica cuando `force=false` |

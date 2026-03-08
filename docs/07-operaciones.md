@@ -544,7 +544,7 @@ Modelo:
 - Motherbee publica artefactos y manifests en `/var/lib/fluxbee/dist/`.
 - Syncthing replica `dist/` entre hives.
 - `SY.admin` dispara `POST /hives/{id}/update`.
-- `SY.orchestrator@{hive}` valida manifest local (`version/hash`) y aplica local.
+- `SY.orchestrator@{hive}` valida manifest local (`manifest_version/manifest_hash`) y aplica local.
 
 Categorías soportadas por update:
 - `runtime`
@@ -570,7 +570,7 @@ Flujo operativo canónico:
 ```
 
 Regla importante:
-- `RUNTIME_UPDATE` queda en compatibilidad, pero fuera del flujo canónico de operación.
+- El único contrato de update remoto es `SYSTEM_UPDATE`.
 - El watchdog remoto por SSH para runtime/core/vendor está deshabilitado en v2.
 
 ---
@@ -904,19 +904,19 @@ ssh -i /var/lib/fluxbee/ssh/motherbee.key administrator@192.168.1.50
 | `POST /hives` | `add_hive` | Bootstrap isla remota |
 | `GET /hives` | `list_hives` | Lista islas hijas |
 | `GET /hives/{id}` | `get_hive` | Info de isla específica |
-| `DELETE /hives/{id}` | `remove_hive` | Cleanup remoto socket-first (`REMOVE_HIVE_CLEANUP`) + fallback SSH técnico |
+| `DELETE /hives/{id}` | `remove_hive` | Cleanup remoto por socket (`REMOVE_HIVE_CLEANUP`); si el worker no está alcanzable por socket, cleanup local-only |
 | `POST /hives/{id}/update` | `update` | Envía `SYSTEM_UPDATE` al orchestrator del hive |
 
-### 5.2 Gestión de Nodos/Router por Hive (Canónico)
+### 5.2 Gestión de Nodos por Hive (Canónico)
 
 | Endpoint HTTP | Action | Descripción |
 |---------------|--------|-------------|
 | `GET /hives/{id}/nodes` | `list_nodes` | Lista nodos de hive |
 | `POST /hives/{id}/nodes` | `run_node` | Envía `SPAWN_NODE` (contrato v2: `node_name`, `runtime`, `runtime_version`) |
 | `DELETE /hives/{id}/nodes/{name}` | `kill_node` | Envía `KILL_NODE` (soporta `force=true/false`) |
-| `GET /hives/{id}/routers` | `list_routers` | Lista routers de hive |
-| `POST /hives/{id}/routers` | `run_router` | Levanta router en hive |
-| `DELETE /hives/{id}/routers/{name}` | `kill_router` | Mata router en hive |
+
+Nota:
+- Los routers se gestionan como nodos `RT.*` vía `SPAWN_NODE`/`KILL_NODE` usando los endpoints de nodos.
 
 ### 5.3 Estado de Isla
 

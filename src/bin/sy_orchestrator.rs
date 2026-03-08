@@ -54,7 +54,6 @@ const SSH_HARDEN_VERIFY_DELAY_MS: u64 = 1000;
 const SYNCTHING_FOLDER_BLOB_ID: &str = "fluxbee-blob";
 const SYNCTHING_FOLDER_DIST_ID: &str = "fluxbee-dist";
 const SYNCTHING_INSTALL_PATH: &str = "/var/lib/fluxbee/vendor/bin/syncthing";
-const VENDOR_ROOT_DIR: &str = "/var/lib/fluxbee/vendor";
 const DIST_ROOT_DIR: &str = "/var/lib/fluxbee/dist";
 const DIST_RUNTIME_ROOT_DIR: &str = "/var/lib/fluxbee/dist/runtimes";
 const DIST_RUNTIME_MANIFEST_PATH: &str = "/var/lib/fluxbee/dist/runtimes/manifest.json";
@@ -764,7 +763,7 @@ async fn watchdog_tick(state: &OrchestratorState) {
     }
 
     if should_verify_runtimes(state).await {
-        if let Err(err) = runtime_verify_and_sync(state).await {
+        if let Err(err) = runtime_verify_and_retain(state).await {
             tracing::warn!(error = %err, "runtime verify/sync failed");
         }
     }
@@ -933,7 +932,6 @@ async fn handle_admin(
             payload
         }
         "list_nodes" => list_nodes_flow(state, &msg.payload),
-        "list_routers" => list_routers_flow(state, &msg.payload),
         "list_versions" => list_versions_flow(state).await,
         "get_versions" => get_versions_flow(state, &msg.payload).await,
         "list_deployments" => list_deployments_flow(&msg.payload),
@@ -1391,7 +1389,8 @@ async fn apply_system_update_local(
             let manifest = load_core_manifest()?;
             let (updated, unchanged) =
                 compute_local_core_update_sets(&manifest, state.is_motherbee)?;
-            let backup_dir = PathBuf::from("/var/lib/fluxbee/core/bin.prev.local")
+            let backup_dir = orchestrator_runtime_dir()
+                .join("core-bin.prev.local")
                 .join(format!("update-{}", now_epoch_ms()));
             fs::create_dir_all(&backup_dir)?;
             let mut created_without_backup = HashSet::new();
@@ -1871,7 +1870,7 @@ fn ensure_dirs(
     fs::create_dir_all(runtimes_root())?;
     fs::create_dir_all(Path::new(DIST_CORE_BIN_SOURCE_DIR))?;
     fs::create_dir_all(Path::new(DIST_VENDOR_ROOT_DIR))?;
-    fs::create_dir_all(Path::new(VENDOR_ROOT_DIR))?;
+    fs::create_dir_all(syncthing_install_dir())?;
     fs::create_dir_all(orchestrator_runtime_dir())?;
     fs::create_dir_all(run_dir)?;
     Ok(())
@@ -1936,6 +1935,13 @@ fn linux_user_exists(user: &str) -> bool {
 
 fn syncthing_binary_available() -> bool {
     Path::new(SYNCTHING_INSTALL_PATH).exists()
+}
+
+fn syncthing_install_dir() -> PathBuf {
+    Path::new(SYNCTHING_INSTALL_PATH)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/fluxbee/vendor/bin"))
 }
 
 fn normalize_sha256(raw: &str) -> String {
@@ -2915,17 +2921,6 @@ fn load_lsa_snapshot(state: &OrchestratorState) -> Result<LsaSnapshot, Orchestra
         .ok_or_else(|| "lsa snapshot unavailable".into())
 }
 
-fn routers_from_snapshot(snapshot: &ShmSnapshot) -> Vec<serde_json::Value> {
-    vec![serde_json::json!({
-        "uuid": snapshot.header.router_uuid.to_string(),
-        "name": snapshot.header.router_name,
-        "is_gateway": snapshot.header.is_gateway,
-        "nodes_count": snapshot.header.node_count,
-        "heartbeat": snapshot.header.heartbeat,
-        "status": "alive",
-    })]
-}
-
 fn nodes_from_snapshot(snapshot: &ShmSnapshot, local_hive: &str) -> Vec<serde_json::Value> {
     snapshot
         .nodes
@@ -2955,36 +2950,6 @@ fn list_nodes_flow(state: &OrchestratorState, payload: &serde_json::Value) -> se
             "status": "ok",
             "target": target_hive,
             "nodes": remote_nodes_for_hive(&snapshot, &target_hive),
-        }),
-        Err(err) => serde_json::json!({
-            "status": "error",
-            "error_code": "SHM_NOT_FOUND",
-            "message": err.to_string(),
-        }),
-    }
-}
-
-fn list_routers_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
-    let target_hive = target_hive_from_payload(payload, &state.hive_id);
-    if target_hive == state.hive_id {
-        return match load_router_snapshot(state) {
-            Ok(snapshot) => serde_json::json!({
-                "status": "ok",
-                "routers": routers_from_snapshot(&snapshot),
-            }),
-            Err(err) => serde_json::json!({
-                "status": "error",
-                "error_code": "SHM_NOT_FOUND",
-                "message": err.to_string(),
-            }),
-        };
-    }
-
-    match load_lsa_snapshot(state) {
-        Ok(snapshot) => serde_json::json!({
-            "status": "ok",
-            "target": target_hive,
-            "routers": remote_routers_for_hive(state, &snapshot, &target_hive),
         }),
         Err(err) => serde_json::json!({
             "status": "error",
@@ -3542,41 +3507,6 @@ fn remote_node_to_json(
     }))
 }
 
-fn remote_routers_for_hive(
-    state: &OrchestratorState,
-    snapshot: &LsaSnapshot,
-    target_hive: &str,
-) -> Vec<serde_json::Value> {
-    let now = now_epoch_ms();
-    let gateway_base = state
-        .gateway_name
-        .split('@')
-        .next()
-        .unwrap_or(&state.gateway_name)
-        .to_string();
-    for hive in &snapshot.hives {
-        let Some(hive_id) = remote_hive_name(hive) else {
-            continue;
-        };
-        if hive_id != target_hive {
-            continue;
-        }
-        let status = remote_hive_status(hive, now);
-        let router_uuid = Uuid::from_bytes(hive.router_uuid);
-        let router_name =
-            remote_router_name(hive).unwrap_or_else(|| format!("{gateway_base}@{hive_id}"));
-        return vec![serde_json::json!({
-            "uuid": router_uuid.to_string(),
-            "name": router_name,
-            "is_gateway": true,
-            "nodes_count": hive.node_count,
-            "status": status,
-            "heartbeat": hive.last_updated,
-        })];
-    }
-    Vec::new()
-}
-
 async fn send_config_response(
     sender: &NodeSender,
     request: &Message,
@@ -4026,7 +3956,7 @@ async fn should_verify_runtimes(state: &OrchestratorState) -> bool {
     true
 }
 
-async fn runtime_verify_and_sync(state: &OrchestratorState) -> Result<(), OrchestratorError> {
+async fn runtime_verify_and_retain(state: &OrchestratorState) -> Result<(), OrchestratorError> {
     let manifest = {
         let guard = state.runtime_manifest.lock().await;
         guard.clone()
@@ -4041,9 +3971,7 @@ async fn runtime_verify_and_sync(state: &OrchestratorState) -> Result<(), Orches
             let mut guard = state.runtime_manifest.lock().await;
             *guard = Some(manifest.clone());
         }
-        tracing::info!(
-            "watchdog verify: remote runtime/core/vendor SSH sync disabled in v2 (use SYSTEM_UPDATE per hive)"
-        );
+        tracing::info!("watchdog verify: runtime retention applied (software updates use SYSTEM_UPDATE per hive)");
     }
     Ok(())
 }
@@ -6620,7 +6548,7 @@ fn resolve_add_hive_harden_ssh(payload: &serde_json::Value) -> bool {
     if let Some(value) = payload.get("harden_ssh").and_then(parse_bool_value) {
         return value;
     }
-    env_flag_enabled("FLUXBEE_ADD_HIVE_HARDEN_SSH") || env_flag_enabled("JSR_ADD_HIVE_HARDEN_SSH")
+    false
 }
 
 fn resolve_add_hive_restrict_ssh(payload: &serde_json::Value, harden_ssh: bool) -> bool {
@@ -6632,16 +6560,6 @@ fn resolve_add_hive_restrict_ssh(payload: &serde_json::Value, harden_ssh: bool) 
         Some(false)
     ) {
         return false;
-    }
-    if let Ok(raw) = std::env::var("FLUXBEE_ADD_HIVE_RESTRICT_SSH") {
-        if let Some(value) = parse_bool_str(&raw) {
-            return value;
-        }
-    }
-    if let Ok(raw) = std::env::var("JSR_ADD_HIVE_RESTRICT_SSH") {
-        if let Some(value) = parse_bool_str(&raw) {
-            return value;
-        }
     }
     if !harden_ssh {
         return false;
@@ -6719,14 +6637,6 @@ fn parse_bool_value(value: &serde_json::Value) -> Option<bool> {
     }
     let raw = value.as_str()?;
     parse_bool_str(raw)
-}
-
-fn env_flag_enabled(name: &str) -> bool {
-    let raw = match std::env::var(name) {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
-    parse_bool_str(&raw).unwrap_or(false)
 }
 
 fn parse_bool_str(raw: &str) -> Option<bool> {
@@ -7526,14 +7436,6 @@ fn remote_hive_name(entry: &RemoteHiveEntry) -> Option<String> {
     Some(String::from_utf8_lossy(&entry.hive_id[..len]).into_owned())
 }
 
-fn remote_router_name(entry: &RemoteHiveEntry) -> Option<String> {
-    if entry.router_name_len == 0 {
-        return None;
-    }
-    let len = entry.router_name_len as usize;
-    Some(String::from_utf8_lossy(&entry.router_name[..len]).into_owned())
-}
-
 fn remote_flags_status(flags: u16) -> &'static str {
     if flags & FLAG_DELETED != 0 {
         "deleted"
@@ -7676,93 +7578,12 @@ fn is_worker_role(role: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use json_router::shm::LsaHeaderSnapshot;
 
     fn write_name(buf: &mut [u8], value: &str) -> u16 {
         let bytes = value.as_bytes();
         let len = bytes.len().min(buf.len());
         buf[..len].copy_from_slice(&bytes[..len]);
         len as u16
-    }
-
-    fn test_state() -> OrchestratorState {
-        OrchestratorState {
-            hive_id: "sandbox".to_string(),
-            is_motherbee: true,
-            started_at: Instant::now(),
-            config_dir: PathBuf::from("/tmp"),
-            state_dir: PathBuf::from("/tmp"),
-            gateway_name: "RT.gateway@sandbox".to_string(),
-            storage_path: Mutex::new("/var/lib/fluxbee".to_string()),
-            wan_listen: None,
-            wan_authorized_hives: Vec::new(),
-            tracked_nodes: Mutex::new(HashSet::new()),
-            system_allowed_origins: HashSet::new(),
-            runtime_manifest: Mutex::new(None),
-            last_runtime_verify: Mutex::new(Instant::now()),
-            nats_endpoint: "nats://127.0.0.1:4222".to_string(),
-            blob: BlobRuntimeConfig {
-                enabled: true,
-                path: PathBuf::from("/var/lib/fluxbee/blob"),
-                sync_enabled: false,
-                sync_tool: "syncthing".to_string(),
-                sync_api_port: 8384,
-                sync_data_dir: PathBuf::from("/var/lib/fluxbee/syncthing"),
-            },
-            dist: DistRuntimeConfig {
-                path: PathBuf::from("/var/lib/fluxbee/dist"),
-                sync_enabled: true,
-                sync_tool: "syncthing".to_string(),
-            },
-            blob_sync_last_desired: Mutex::new(BlobRuntimeConfig {
-                enabled: true,
-                path: PathBuf::from("/var/lib/fluxbee/blob"),
-                sync_enabled: false,
-                sync_tool: "syncthing".to_string(),
-                sync_api_port: 8384,
-                sync_data_dir: PathBuf::from("/var/lib/fluxbee/syncthing"),
-            }),
-        }
-    }
-
-    #[test]
-    fn remote_routers_projection_uses_real_uuid_and_name() {
-        let router_uuid = Uuid::new_v4();
-        let mut hive = RemoteHiveEntry {
-            hive_id: [0u8; 64],
-            hive_id_len: 0,
-            router_uuid: *router_uuid.as_bytes(),
-            router_name: [0u8; 64],
-            router_name_len: 0,
-            last_lsa_seq: 10,
-            last_updated: now_epoch_ms(),
-            flags: 0,
-            node_count: 2,
-            route_count: 0,
-            vpn_count: 0,
-        };
-        hive.hive_id_len = write_name(&mut hive.hive_id, "worker-220");
-        hive.router_name_len = write_name(&mut hive.router_name, "RT.gateway@worker-220");
-
-        let snapshot = LsaSnapshot {
-            header: LsaHeaderSnapshot {
-                hive_count: 1,
-                total_node_count: 0,
-                total_route_count: 0,
-                total_vpn_count: 0,
-                heartbeat: now_epoch_ms(),
-            },
-            hives: vec![hive],
-            nodes: Vec::new(),
-            routes: Vec::new(),
-            vpns: Vec::new(),
-        };
-        let state = test_state();
-        let routers = remote_routers_for_hive(&state, &snapshot, "worker-220");
-
-        assert_eq!(routers.len(), 1);
-        assert_eq!(routers[0]["uuid"], router_uuid.to_string());
-        assert_eq!(routers[0]["name"], "RT.gateway@worker-220");
     }
 
     #[test]
