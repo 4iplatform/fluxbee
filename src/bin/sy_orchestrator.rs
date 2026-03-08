@@ -5550,7 +5550,13 @@ async fn add_hive_finalize_via_socket(
     syncthing_peer_device_id: Option<&str>,
     syncthing_peer_name: Option<&str>,
 ) -> Result<serde_json::Value, OrchestratorError> {
-    let timeout_secs = ADD_HIVE_FINALIZE_SOCKET_TIMEOUT_SECS.max(dist_sync_probe_timeout_secs);
+    let core_restart_budget_secs = CORE_SERVICE_HEALTH_TIMEOUT_SECS
+        .saturating_mul(CORE_SYNC_RESTART_ORDER.len() as u64)
+        .saturating_add(30);
+    let timeout_secs = ADD_HIVE_FINALIZE_SOCKET_TIMEOUT_SECS
+        .max(dist_sync_probe_timeout_secs)
+        .max(core_restart_budget_secs)
+        .clamp(30, 600);
     let payload = forward_system_action_to_hive_with_timeout(
         state,
         hive_id,
