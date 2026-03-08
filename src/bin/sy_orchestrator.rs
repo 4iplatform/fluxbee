@@ -1178,24 +1178,15 @@ async fn handle_system_message(
         Some("ADD_HIVE_FINALIZE") => {
             let result = add_hive_finalize_local_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "ADD_HIVE_FINALIZE processed");
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "ADD_HIVE_FINALIZE_RESPONSE",
-                result,
-            )
-            .await;
+            let _ = send_system_action_response(sender, msg, "ADD_HIVE_FINALIZE_RESPONSE", result)
+                .await;
         }
         Some("REMOVE_HIVE_CLEANUP") => {
             let result = remove_hive_cleanup_local_flow();
             tracing::info!(result = %result, "REMOVE_HIVE_CLEANUP processed");
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "REMOVE_HIVE_CLEANUP_RESPONSE",
-                result,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "REMOVE_HIVE_CLEANUP_RESPONSE", result)
+                    .await;
         }
         _ => {}
     }
@@ -1996,9 +1987,11 @@ fn resolve_syncthing_vendor_source_path() -> Result<PathBuf, OrchestratorError> 
             return Ok(path);
         }
         let primary = Path::new(DIST_VENDOR_ROOT_DIR).join(&component.path);
-        return Err(
-            format!("vendor manifest syncthing path missing at '{}'", primary.display()).into(),
-        );
+        return Err(format!(
+            "vendor manifest syncthing path missing at '{}'",
+            primary.display()
+        )
+        .into());
     }
     let fallback = PathBuf::from(DIST_SYNCTHING_VENDOR_SOURCE_PATH);
     if fallback.exists() {
@@ -2320,6 +2313,61 @@ async fn wait_for_syncthing_health(blob: &BlobRuntimeConfig) -> Result<(), Orche
     }
 }
 
+fn valid_syncthing_device_id(device_id: &str) -> bool {
+    let id = device_id.trim();
+    if id.len() < 16 {
+        return false;
+    }
+    id.chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-')
+}
+
+fn extract_first_syncthing_device_id(config_xml: &str) -> Option<String> {
+    let device_re = Regex::new(r#"<device\b[^>]*\bid="([^"]+)""#).ok()?;
+    for caps in device_re.captures_iter(config_xml) {
+        let candidate = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        if valid_syncthing_device_id(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn local_syncthing_device_id(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
+    let mut cmd = Command::new(SYNCTHING_INSTALL_PATH);
+    cmd.arg("--home")
+        .arg(&sync.sync_data_dir)
+        .arg("--device-id");
+    match run_cmd_output(cmd, "syncthing --device-id") {
+        Ok(out) => {
+            let device_id = out.trim();
+            if valid_syncthing_device_id(device_id) {
+                return Ok(device_id.to_string());
+            }
+            tracing::warn!(
+                output = %truncate_for_error(&out, 200),
+                "invalid syncthing --device-id output; falling back to config.xml parsing"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to resolve syncthing device id from binary; falling back to config.xml parsing"
+            );
+        }
+    }
+
+    let config_path = sync.sync_data_dir.join("config.xml");
+    let data = fs::read_to_string(&config_path)?;
+    extract_first_syncthing_device_id(&data).ok_or_else(|| {
+        format!(
+            "failed to resolve syncthing device id from '{}'",
+            config_path.display()
+        )
+        .into()
+    })
+}
+
 fn xml_escape_attr(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -2454,6 +2502,191 @@ fn ensure_syncthing_folder_in_config_xml(
     out.push('\n');
     out.push_str(&config_xml[insert_at..]);
     Ok((out, true))
+}
+
+fn ensure_syncthing_top_level_device_in_config_xml(
+    config_xml: &str,
+    device_id: &str,
+    device_name: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let normalized_id = device_id.trim();
+    if !valid_syncthing_device_id(normalized_id) {
+        return Err(format!("invalid syncthing device id '{}'", device_id).into());
+    }
+
+    let header_end = config_xml
+        .find("<folder")
+        .or_else(|| config_xml.find("</configuration>"))
+        .unwrap_or(config_xml.len());
+    let header = &config_xml[..header_end];
+    let device_re = Regex::new(&format!(
+        r#"<device\b[^>]*\bid="{}"[^>]*>"#,
+        regex::escape(normalized_id)
+    ))?;
+    if device_re.is_match(header) {
+        return Ok((config_xml.to_string(), false));
+    }
+
+    let name = if device_name.trim().is_empty() {
+        normalized_id
+    } else {
+        device_name.trim()
+    };
+    let new_device = format!(
+        "  <device id=\"{}\" name=\"{}\" compression=\"metadata\" introducer=\"false\" skipIntroductionRemovals=\"false\" introducedBy=\"\"></device>\n",
+        xml_escape_attr(normalized_id),
+        xml_escape_attr(name),
+    );
+    let mut out = String::with_capacity(config_xml.len() + new_device.len() + 1);
+    out.push_str(&config_xml[..header_end]);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&new_device);
+    out.push_str(&config_xml[header_end..]);
+    Ok((out, true))
+}
+
+fn ensure_syncthing_folder_has_device(
+    config_xml: &str,
+    folder_id: &str,
+    device_id: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let normalized_id = device_id.trim();
+    if !valid_syncthing_device_id(normalized_id) {
+        return Err(format!("invalid syncthing device id '{}'", device_id).into());
+    }
+
+    let folder_re = Regex::new(r#"(?s)<folder\b[^>]*\bid="([^"]+)"[^>]*>.*?</folder>"#)?;
+    let device_re = Regex::new(&format!(
+        r#"<device\b[^>]*\bid="{}"[^>]*>"#,
+        regex::escape(normalized_id)
+    ))?;
+    for caps in folder_re.captures_iter(config_xml) {
+        let Some(found_id) = caps.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        if found_id != folder_id {
+            continue;
+        }
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        if device_re.is_match(full.as_str()) {
+            return Ok((config_xml.to_string(), false));
+        }
+        let insert_at = full.end().saturating_sub("</folder>".len());
+        let mut out = String::with_capacity(config_xml.len() + 72 + normalized_id.len());
+        out.push_str(&config_xml[..insert_at]);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("    <device id=\"");
+        out.push_str(&xml_escape_attr(normalized_id));
+        out.push_str("\" introducedBy=\"\"/>\n");
+        out.push_str(&config_xml[insert_at..]);
+        return Ok((out, true));
+    }
+    Ok((config_xml.to_string(), false))
+}
+
+fn reconcile_syncthing_peer_xml(
+    config_xml: &str,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+    peer_device_id: &str,
+    peer_name: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let mut updated = config_xml.to_string();
+    let mut changed = false;
+
+    let (next, top_changed) =
+        ensure_syncthing_top_level_device_in_config_xml(&updated, peer_device_id, peer_name)?;
+    updated = next;
+    changed |= top_changed;
+
+    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        let (next, folder_changed) = ensure_syncthing_folder_in_config_xml(
+            &updated,
+            SYNCTHING_FOLDER_BLOB_ID,
+            &blob.path.display().to_string(),
+            "Fluxbee Blob",
+        )?;
+        updated = next;
+        changed |= folder_changed;
+        let (next, device_changed) =
+            ensure_syncthing_folder_has_device(&updated, SYNCTHING_FOLDER_BLOB_ID, peer_device_id)?;
+        updated = next;
+        changed |= device_changed;
+    }
+
+    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        let (next, folder_changed) = ensure_syncthing_folder_in_config_xml(
+            &updated,
+            SYNCTHING_FOLDER_DIST_ID,
+            &dist.path.display().to_string(),
+            "Fluxbee Dist",
+        )?;
+        updated = next;
+        changed |= folder_changed;
+        let (next, device_changed) =
+            ensure_syncthing_folder_has_device(&updated, SYNCTHING_FOLDER_DIST_ID, peer_device_id)?;
+        updated = next;
+        changed |= device_changed;
+    }
+
+    Ok((updated, changed))
+}
+
+fn ensure_local_syncthing_peer_link(
+    sync: &BlobRuntimeConfig,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+    peer_device_id: &str,
+    peer_name: &str,
+) -> Result<bool, OrchestratorError> {
+    let config_path = sync.sync_data_dir.join("config.xml");
+    let current = fs::read_to_string(&config_path)?;
+    let (updated, changed) =
+        reconcile_syncthing_peer_xml(&current, blob, dist, peer_device_id, peer_name)?;
+    if changed {
+        fs::write(&config_path, updated)?;
+    }
+    Ok(changed)
+}
+
+async fn ensure_syncthing_peer_link_runtime(
+    sync: &BlobRuntimeConfig,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+    peer_device_id: &str,
+    peer_name: &str,
+) -> Result<(), OrchestratorError> {
+    if !sync.sync_enabled {
+        return Ok(());
+    }
+    if !(blob_sync_tool_is_syncthing(sync) || dist_sync_tool_is_syncthing(dist)) {
+        return Ok(());
+    }
+    let changed = ensure_local_syncthing_peer_link(sync, blob, dist, peer_device_id, peer_name)?;
+    if !changed {
+        return Ok(());
+    }
+    tracing::info!(
+        service = SYNCTHING_SERVICE_NAME,
+        peer_name = peer_name,
+        "syncthing peer config reconciled locally; restarting service"
+    );
+    let mut restart = Command::new("systemctl");
+    restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
+    run_cmd(restart, "systemctl restart")?;
+    wait_for_service_active(
+        SYNCTHING_SERVICE_NAME,
+        Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
+    )
+    .await?;
+    wait_for_syncthing_health(sync).await?;
+    Ok(())
 }
 
 fn reconcile_syncthing_folders_xml(
@@ -3427,11 +3660,7 @@ done"
 
 fn remove_hive_cleanup_local_flow() -> serde_json::Value {
     let deferred_script = format!("sleep 1; {}", remove_hive_cleanup_script());
-    match Command::new("bash")
-        .arg("-lc")
-        .arg(deferred_script)
-        .spawn()
-    {
+    match Command::new("bash").arg("-lc").arg(deferred_script).spawn() {
         Ok(_) => serde_json::json!({
             "status": "ok",
             "cleanup": "scheduled",
@@ -3473,7 +3702,11 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
     let remote_cleanup_via: &str;
     let address = read_hive_info(&root, hive_id)
         .ok()
-        .and_then(|info| info.get("address").and_then(|value| value.as_str()).map(str::to_string))
+        .and_then(|info| {
+            info.get("address")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_default();
     let forward_result = forward_system_action_to_hive_with_timeout(
         state,
@@ -3489,10 +3722,7 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
     .await;
 
     let socket_cleanup_ok = match forward_result.as_ref() {
-        Ok(payload) => payload
-            .get("status")
-            .and_then(|value| value.as_str())
-            == Some("ok"),
+        Ok(payload) => payload.get("status").and_then(|value| value.as_str()) == Some("ok"),
         Err(_) => false,
     };
     let socket_cleanup_timed_out = socket_cleanup_timeout(&forward_result);
@@ -3541,9 +3771,7 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
     })
 }
 
-fn socket_cleanup_timeout(
-    forward_result: &Result<serde_json::Value, OrchestratorError>,
-) -> bool {
+fn socket_cleanup_timeout(forward_result: &Result<serde_json::Value, OrchestratorError>) -> bool {
     match forward_result {
         Ok(payload) => {
             if payload
@@ -3577,7 +3805,6 @@ fn read_hive_info(root: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
     let json = serde_json::to_value(yaml)?;
     Ok(json)
 }
-
 
 fn runtime_keep_versions(
     manifest: &RuntimeManifest,
@@ -3685,7 +3912,6 @@ fn apply_runtime_retention(
     }
     Ok(stats)
 }
-
 
 fn runtimes_root() -> PathBuf {
     PathBuf::from(DIST_RUNTIME_ROOT_DIR)
@@ -4620,7 +4846,10 @@ fn sha256_file(path: &Path) -> Result<String, OrchestratorError> {
 
 fn load_core_manifest() -> Result<CoreManifest, OrchestratorError> {
     let manifest_path = local_core_manifest_path().ok_or_else(|| {
-        format!("core manifest missing at '{}' (run scripts/install.sh)", DIST_CORE_MANIFEST_PATH)
+        format!(
+            "core manifest missing at '{}' (run scripts/install.sh)",
+            DIST_CORE_MANIFEST_PATH
+        )
     })?;
     let data = fs::read_to_string(manifest_path)?;
     let manifest: CoreManifest = serde_json::from_str(&data)?;
@@ -4818,9 +5047,8 @@ fn sync_core_to_worker(
     }
 
     let mut upload_paths = local_paths.clone();
-    let manifest_source_path = local_core_manifest_path().ok_or_else(|| {
-        format!("core manifest missing at '{}'", DIST_CORE_MANIFEST_PATH)
-    })?;
+    let manifest_source_path = local_core_manifest_path()
+        .ok_or_else(|| format!("core manifest missing at '{}'", DIST_CORE_MANIFEST_PATH))?;
     upload_paths.push(manifest_source_path.display().to_string());
     let upload_refs: Vec<&str> = upload_paths.iter().map(String::as_str).collect();
 
@@ -5152,6 +5380,8 @@ async fn add_hive_finalize_local_flow(
     payload: &serde_json::Value,
 ) -> serde_json::Value {
     let desired_dist = current_dist_runtime_config(state);
+    let desired_blob = current_blob_runtime_config(state);
+    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
     let require_dist_sync = payload
         .get("require_dist_sync")
         .and_then(parse_bool_value)
@@ -5161,6 +5391,19 @@ async fn add_hive_finalize_local_flow(
         .and_then(|value| value.as_u64())
         .unwrap_or(DIST_SYNC_PROBE_TIMEOUT_SECS)
         .clamp(5, 600);
+    let syncthing_peer_device_id = payload
+        .get("syncthing_peer_device_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let syncthing_peer_name = payload
+        .get("syncthing_peer_name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("motherbee")
+        .to_string();
     let mut updated: Vec<String> = Vec::new();
     let mut unchanged: Vec<String> = Vec::new();
     let mut restarted: Vec<String> = Vec::new();
@@ -5271,8 +5514,42 @@ async fn add_hive_finalize_local_flow(
     unchanged.extend(vendor_result.unchanged);
     restarted.extend(vendor_result.restarted);
 
-    let desired_blob = current_blob_runtime_config(state);
-    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
+    let mut syncthing_peer_linked = false;
+    if let Some(peer_device_id) = syncthing_peer_device_id.as_deref() {
+        if let Err(err) = ensure_syncthing_peer_link_runtime(
+            &desired_sync,
+            &desired_blob,
+            &desired_dist,
+            peer_device_id,
+            &syncthing_peer_name,
+        )
+        .await
+        {
+            errors.push(err.to_string());
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SYNC_SETUP_FAILED",
+                "message": err.to_string(),
+                "hive_id": state.hive_id,
+                "dist_sync_enabled": desired_dist.sync_enabled,
+                "require_dist_sync": require_dist_sync,
+                "updated": updated,
+                "unchanged": unchanged,
+                "restarted": restarted,
+                "errors": errors,
+            });
+        }
+        syncthing_peer_linked = true;
+    }
+
+    let syncthing_device_id = if desired_sync.sync_enabled
+        && (blob_sync_tool_is_syncthing(&desired_sync)
+            || dist_sync_tool_is_syncthing(&desired_dist))
+    {
+        local_syncthing_device_id(&desired_sync).ok()
+    } else {
+        None
+    };
     let service_active = if desired_sync.sync_enabled {
         systemd_is_active(SYNCTHING_SERVICE_NAME)
     } else {
@@ -5283,20 +5560,21 @@ async fn add_hive_finalize_local_flow(
     } else {
         false
     };
-    let runtime_manifest_ready = if !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist)
-    {
-        local_runtime_manifest_ready_for_spawn()
-    } else if service_active && api_healthy {
-        wait_for_local_runtime_manifest_ready(Duration::from_secs(dist_sync_probe_timeout_secs)).await
-    } else {
-        false
-    };
-    let dist_sync_ready = if !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist)
-    {
-        true
-    } else {
-        service_active && api_healthy && runtime_manifest_ready
-    };
+    let runtime_manifest_ready =
+        if !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist) {
+            local_runtime_manifest_ready_for_spawn()
+        } else if service_active && api_healthy {
+            wait_for_local_runtime_manifest_ready(Duration::from_secs(dist_sync_probe_timeout_secs))
+                .await
+        } else {
+            false
+        };
+    let dist_sync_ready =
+        if !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist) {
+            true
+        } else {
+            service_active && api_healthy && runtime_manifest_ready
+        };
 
     serde_json::json!({
         "status": "ok",
@@ -5309,6 +5587,8 @@ async fn add_hive_finalize_local_flow(
         "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
         "dist_sync_ready": dist_sync_ready,
         "core_sync_pending": core_sync_pending,
+        "syncthing_peer_linked": syncthing_peer_linked,
+        "syncthing_device_id": syncthing_device_id,
         "require_dist_sync": require_dist_sync,
         "dist_path": desired_dist.path.display().to_string(),
         "updated": updated,
@@ -5331,6 +5611,8 @@ async fn add_hive_finalize_via_socket(
     address: &str,
     require_dist_sync: bool,
     dist_sync_probe_timeout_secs: u64,
+    syncthing_peer_device_id: Option<&str>,
+    syncthing_peer_name: Option<&str>,
 ) -> Result<serde_json::Value, OrchestratorError> {
     let timeout_secs = ADD_HIVE_FINALIZE_SOCKET_TIMEOUT_SECS.max(dist_sync_probe_timeout_secs);
     let payload = forward_system_action_to_hive_with_timeout(
@@ -5344,6 +5626,8 @@ async fn add_hive_finalize_via_socket(
             "address": address,
             "require_dist_sync": require_dist_sync,
             "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+            "syncthing_peer_device_id": syncthing_peer_device_id,
+            "syncthing_peer_name": syncthing_peer_name,
         }),
         Duration::from_secs(timeout_secs),
     )
@@ -5418,8 +5702,21 @@ fn dist_sync_ready_from_finalize_payload(
     finalize
         .get("dist_sync_ready")
         .and_then(|value| value.as_bool())
-        .or_else(|| finalize.get("api_healthy").and_then(|value| value.as_bool()))
+        .or_else(|| {
+            finalize
+                .get("api_healthy")
+                .and_then(|value| value.as_bool())
+        })
         .unwrap_or(false)
+}
+
+fn syncthing_device_id_from_finalize_payload(finalize: &serde_json::Value) -> Option<String> {
+    finalize
+        .get("syncthing_device_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| valid_syncthing_device_id(value))
+        .map(str::to_string)
 }
 
 async fn add_hive_flow(
@@ -5433,6 +5730,24 @@ async fn add_hive_flow(
 ) -> serde_json::Value {
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
+    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
+    let syncthing_expected = desired_sync.sync_enabled
+        && (blob_sync_tool_is_syncthing(&desired_sync)
+            || dist_sync_tool_is_syncthing(&desired_dist));
+    let mother_syncthing_device_id = if syncthing_expected {
+        match local_syncthing_device_id(&desired_sync) {
+            Ok(device_id) => Some(device_id),
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "SYNC_SETUP_FAILED",
+                    "message": format!("local syncthing device id unavailable: {err}"),
+                });
+            }
+        }
+    } else {
+        None
+    };
     let mut dist_sync_ready =
         !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist);
     let root = hives_root();
@@ -5514,12 +5829,8 @@ async fn add_hive_flow(
 
     // Socket-first fast path: if worker orchestrator is already visible in LSA,
     // register hive without rerunning SSH bootstrap/provisioning.
-    let socket_only_ready = wait_for_remote_orchestrator_node(
-        &state.hive_id,
-        hive_id,
-        Duration::from_secs(3),
-    )
-    .is_ok();
+    let socket_only_ready =
+        wait_for_remote_orchestrator_node(&state.hive_id, hive_id, Duration::from_secs(3)).is_ok();
     if socket_only_ready {
         if let Err(err) = probe_remote_orchestrator_socket_ready(state, hive_id, address).await {
             tracing::warn!(
@@ -5529,101 +5840,144 @@ async fn add_hive_flow(
                 "socket-only add_hive precheck failed; falling back to bootstrap path"
             );
         } else {
-        let finalize = match add_hive_finalize_via_socket(
-            state,
-            hive_id,
-            address,
-            require_dist_sync,
-            dist_sync_probe_timeout_secs,
-        )
-        .await
-        {
-            Ok(payload) => {
-                append_add_hive_finalize_history(state, hive_id, "ok", None);
-                payload
-            }
-            Err(err) => {
-                append_add_hive_finalize_history(
-                    state,
+            let finalize = match add_hive_finalize_via_socket(
+                state,
+                hive_id,
+                address,
+                require_dist_sync,
+                dist_sync_probe_timeout_secs,
+                mother_syncthing_device_id.as_deref(),
+                Some(&state.hive_id),
+            )
+            .await
+            {
+                Ok(payload) => {
+                    append_add_hive_finalize_history(state, hive_id, "ok", None);
+                    payload
+                }
+                Err(err) => {
+                    append_add_hive_finalize_history(
+                        state,
+                        hive_id,
+                        "error",
+                        Some(err.to_string()),
+                    );
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "FINALIZE_FAILED",
+                        "message": format!("worker socket-only finalize failed: {}", err),
+                        "hive_id": hive_id,
+                        "address": address,
+                        "bootstrap_mode": "socket_only_existing_orchestrator",
+                        "harden_ssh": harden_ssh,
+                        "restrict_ssh_requested": restrict_ssh,
+                        "require_dist_sync": require_dist_sync,
+                        "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                    });
+                }
+            };
+            let mut syncthing_peer_linked = false;
+            if syncthing_expected {
+                let Some(worker_syncthing_device_id) =
+                    syncthing_device_id_from_finalize_payload(&finalize)
+                else {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "FINALIZE_FAILED",
+                        "message": "worker finalize missing syncthing_device_id",
+                        "hive_id": hive_id,
+                        "address": address,
+                        "bootstrap_mode": "socket_only_existing_orchestrator",
+                        "require_dist_sync": require_dist_sync,
+                        "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                        "finalize": finalize,
+                    });
+                };
+                if let Err(err) = ensure_syncthing_peer_link_runtime(
+                    &desired_sync,
+                    &desired_blob,
+                    &desired_dist,
+                    &worker_syncthing_device_id,
                     hive_id,
-                    "error",
-                    Some(err.to_string()),
-                );
+                )
+                .await
+                {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "SYNC_SETUP_FAILED",
+                        "message": format!("local syncthing peer reconcile failed: {err}"),
+                        "hive_id": hive_id,
+                        "address": address,
+                        "bootstrap_mode": "socket_only_existing_orchestrator",
+                        "require_dist_sync": require_dist_sync,
+                        "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                        "finalize": finalize,
+                    });
+                }
+                syncthing_peer_linked = true;
+            }
+            dist_sync_ready = dist_sync_ready_from_finalize_payload(&finalize, &desired_dist);
+            if require_dist_sync && !dist_sync_ready {
                 return serde_json::json!({
                     "status": "error",
-                    "error_code": "FINALIZE_FAILED",
-                    "message": format!("worker socket-only finalize failed: {}", err),
+                    "error_code": "DIST_SYNC_TIMEOUT",
+                    "message": "worker finalize completed but dist sync is not ready",
                     "hive_id": hive_id,
                     "address": address,
                     "bootstrap_mode": "socket_only_existing_orchestrator",
-                    "harden_ssh": harden_ssh,
-                    "restrict_ssh_requested": restrict_ssh,
                     "require_dist_sync": require_dist_sync,
                     "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                    "dist_sync_ready": dist_sync_ready,
+                    "finalize": finalize,
                 });
             }
-        };
-        dist_sync_ready = dist_sync_ready_from_finalize_payload(&finalize, &desired_dist);
-        if require_dist_sync && !dist_sync_ready {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "DIST_SYNC_TIMEOUT",
-                "message": "worker finalize completed but dist sync is not ready",
+            if harden_ssh || restrict_ssh {
+                tracing::warn!(
+                    hive_id = hive_id,
+                    address = address,
+                    harden_ssh = harden_ssh,
+                    restrict_ssh_requested = restrict_ssh,
+                    "socket-only add_hive: skipping SSH controls because SSH is bootstrap-only"
+                );
+            }
+            let info_path = hives_root().join(hive_id).join("info.yaml");
+            let info = serde_yaml::to_string(&serde_json::json!({
                 "hive_id": hive_id,
                 "address": address,
-                "bootstrap_mode": "socket_only_existing_orchestrator",
-                "require_dist_sync": require_dist_sync,
-                "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
-                "dist_sync_ready": dist_sync_ready,
-                "finalize": finalize,
-            });
-        }
-        if harden_ssh || restrict_ssh {
-            tracing::warn!(
-                hive_id = hive_id,
-                address = address,
-                harden_ssh = harden_ssh,
-                restrict_ssh_requested = restrict_ssh,
-                "socket-only add_hive: skipping SSH controls because SSH is bootstrap-only"
-            );
-        }
-        let info_path = hives_root().join(hive_id).join("info.yaml");
-        let info = serde_yaml::to_string(&serde_json::json!({
-            "hive_id": hive_id,
-            "address": address,
-            "created_at": now_epoch_ms().to_string(),
-            "status": "connected",
-        }))
-        .unwrap_or_default();
-        if let Err(err) = fs::write(info_path, info) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "IO_ERROR",
-                "message": err.to_string(),
-            });
-        }
-        tracing::info!(
+                "created_at": now_epoch_ms().to_string(),
+                "status": "connected",
+            }))
+            .unwrap_or_default();
+            if let Err(err) = fs::write(info_path, info) {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "IO_ERROR",
+                    "message": err.to_string(),
+                });
+            }
+            tracing::info!(
             hive_id = hive_id,
             address = address,
             "add_hive socket-only mode: worker orchestrator already online; skipping SSH bootstrap"
         );
-        return serde_json::json!({
-            "status": "ok",
-            "hive_id": hive_id,
-            "address": address,
-            "bootstrap_mode": "socket_only_existing_orchestrator",
-            "harden_ssh": harden_ssh,
-            "harden_ssh_applied": false,
-            "restrict_ssh": false,
-            "restrict_ssh_mode": "socket_only_no_ssh",
-            "restrict_ssh_requested": restrict_ssh,
-            "require_dist_sync": require_dist_sync,
-            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
-            "wan_connected": true,
-            "orchestrator_connected": true,
-            "dist_sync_ready": dist_sync_ready,
-            "finalize": finalize,
-        });
+            return serde_json::json!({
+                "status": "ok",
+                "hive_id": hive_id,
+                "address": address,
+                "bootstrap_mode": "socket_only_existing_orchestrator",
+                "harden_ssh": harden_ssh,
+                "harden_ssh_applied": false,
+                "restrict_ssh": false,
+                "restrict_ssh_mode": "socket_only_no_ssh",
+                "restrict_ssh_requested": restrict_ssh,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+                "dist_sync_ready": dist_sync_ready,
+                "syncthing_peer_linked": syncthing_peer_linked,
+                "finalize": finalize,
+            });
         }
     }
 
@@ -5926,13 +6280,11 @@ async fn add_hive_flow(
                 "systemctl restart {name} || (systemctl reset-failed {name} || true; sleep 1; systemctl start {name})"
             )
         };
-        let service_cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&service_inner)));
-        if let Err(err) = ssh_with_key(
-            address,
-            &key_path,
-            &service_cmd,
-            BOOTSTRAP_SSH_USER,
-        ) {
+        let service_cmd = sudo_wrap(&format!(
+            "bash -lc '{}'",
+            shell_single_quote(&service_inner)
+        ));
+        if let Err(err) = ssh_with_key(address, &key_path, &service_cmd, BOOTSTRAP_SSH_USER) {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SERVICE_FAILED",
@@ -6048,6 +6400,8 @@ async fn add_hive_flow(
         address,
         require_dist_sync,
         dist_sync_probe_timeout_secs,
+        mother_syncthing_device_id.as_deref(),
+        Some(&state.hive_id),
     )
     .await
     {
@@ -6074,6 +6428,55 @@ async fn add_hive_flow(
             });
         }
     };
+    let mut syncthing_peer_linked = false;
+    if syncthing_expected {
+        let Some(worker_syncthing_device_id) = syncthing_device_id_from_finalize_payload(&finalize)
+        else {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "FINALIZE_FAILED",
+                "message": "worker finalize missing syncthing_device_id",
+                "hive_id": hive_id,
+                "address": address,
+                "harden_ssh": harden_ssh,
+                "restrict_ssh": restrict_ssh_applied,
+                "restrict_ssh_requested": restrict_ssh,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+                "dist_sync_ready": dist_sync_ready,
+                "finalize": finalize,
+            });
+        };
+        if let Err(err) = ensure_syncthing_peer_link_runtime(
+            &desired_sync,
+            &desired_blob,
+            &desired_dist,
+            &worker_syncthing_device_id,
+            hive_id,
+        )
+        .await
+        {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SYNC_SETUP_FAILED",
+                "message": format!("local syncthing peer reconcile failed: {err}"),
+                "hive_id": hive_id,
+                "address": address,
+                "harden_ssh": harden_ssh,
+                "restrict_ssh": restrict_ssh_applied,
+                "restrict_ssh_requested": restrict_ssh,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+                "dist_sync_ready": dist_sync_ready,
+                "finalize": finalize,
+            });
+        }
+        syncthing_peer_linked = true;
+    }
     dist_sync_ready = dist_sync_ready_from_finalize_payload(&finalize, &desired_dist);
     if require_dist_sync && !dist_sync_ready {
         return serde_json::json!({
@@ -6144,6 +6547,7 @@ async fn add_hive_flow(
         "wan_connected": true,
         "orchestrator_connected": true,
         "dist_sync_ready": dist_sync_ready,
+        "syncthing_peer_linked": syncthing_peer_linked,
         "finalize": finalize,
     })
 }
@@ -6272,7 +6676,9 @@ fn resolve_add_hive_dist_sync_probe_timeout_secs(payload: &serde_json::Value) ->
                 .ok()
                 .and_then(|raw| raw.trim().parse::<u64>().ok())
         });
-    let raw = from_payload.or(from_env).unwrap_or(DIST_SYNC_PROBE_TIMEOUT_SECS);
+    let raw = from_payload
+        .or(from_env)
+        .unwrap_or(DIST_SYNC_PROBE_TIMEOUT_SECS);
     raw.clamp(5, 600)
 }
 
@@ -6462,8 +6868,10 @@ fn apply_add_hive_ssh_controls_after_finalize(
                 );
             }
             Err(err) => {
-                return Err(format!("restrict_ssh requested but from-only restriction failed: {err}")
-                    .into());
+                return Err(format!(
+                    "restrict_ssh requested but from-only restriction failed: {err}"
+                )
+                .into());
             }
         }
     } else {
@@ -6871,10 +7279,9 @@ fn ssh_with_pass_any(address: &str, command: &str, user: &str) -> Result<(), Orc
                 );
                 Ok(())
             }
-            Err(kbd_err) => Err(format!(
-                "{pass_err}; keyboard-interactive auth failed: {kbd_err}"
-            )
-            .into()),
+            Err(kbd_err) => {
+                Err(format!("{pass_err}; keyboard-interactive auth failed: {kbd_err}").into())
+            }
         },
     }
 }

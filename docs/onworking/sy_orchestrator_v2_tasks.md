@@ -20,6 +20,7 @@ Fuente de verdad funcional: `docs/onworking/SY.orchestrator — Spec de Cambios 
 - [x] Lectura remota de versiones (`get_versions`/`list_versions`) por socket L2 (sin SSH operativo).
 - [x] `remove_hive` sin fallback SSH: online por socket o cleanup local.
 - [x] `add_hive` socket-only no cae a bootstrap SSH si falla finalize (`FINALIZE_FAILED`).
+- [x] `add_hive`/`ADD_HIVE_FINALIZE` reconcilian pareo Syncthing mother<->worker por `device_id` (top-level device + folder device refs en `fluxbee-dist`/`fluxbee-blob`) para evitar `runtimes.status=missing` por falta de pairing.
 - [x] Se elimino compatibilidad `RUNTIME_UPDATE` en `sy_orchestrator`.
 - [x] Se eliminaron aliases legacy de payload en update y nodos:
   - update: `version/hash` (solo `manifest_version/manifest_hash`)
