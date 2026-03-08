@@ -2334,10 +2334,13 @@ fn extract_first_syncthing_device_id(config_xml: &str) -> Option<String> {
 }
 
 fn local_syncthing_device_id(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
+    let home = sync.sync_data_dir.display().to_string();
     let mut cmd = Command::new(SYNCTHING_INSTALL_PATH);
     cmd.arg("--home")
         .arg(&sync.sync_data_dir)
-        .arg("--device-id");
+        .arg("--device-id")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &home);
     match run_cmd_output(cmd, "syncthing --device-id") {
         Ok(out) => {
             let device_id = out.trim();
