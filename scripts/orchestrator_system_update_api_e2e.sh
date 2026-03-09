@@ -6,7 +6,7 @@ HIVE_ID="${HIVE_ID:-worker-220}"
 CATEGORY="${CATEGORY:-runtime}" # runtime|core|vendor
 WAIT_SYNC_HINT_SECS="${WAIT_SYNC_HINT_SECS:-120}"
 SYNC_HINT_TIMEOUT_MS="${SYNC_HINT_TIMEOUT_MS:-30000}"
-SYNC_HINT_WAIT_FOR_IDLE="${SYNC_HINT_WAIT_FOR_IDLE:-1}"
+SYNC_HINT_WAIT_FOR_IDLE="${SYNC_HINT_WAIT_FOR_IDLE:-true}"
 
 if [[ "$CATEGORY" != "runtime" && "$CATEGORY" != "core" && "$CATEGORY" != "vendor" ]]; then
   echo "FAIL: CATEGORY must be runtime|core|vendor (got '$CATEGORY')" >&2
@@ -25,9 +25,18 @@ post_sync_hint() {
   local channel="$1"
   local wait_for_idle="$2"
   local timeout_ms="$3"
+  local wait_for_idle_json
+  case "${wait_for_idle,,}" in
+    1|true|yes|on) wait_for_idle_json="true" ;;
+    0|false|no|off) wait_for_idle_json="false" ;;
+    *)
+      echo "FAIL: SYNC_HINT_WAIT_FOR_IDLE must be boolean (got '$wait_for_idle')" >&2
+      exit 1
+      ;;
+  esac
   curl -sS -X POST "$BASE/hives/$HIVE_ID/sync-hint" \
     -H "Content-Type: application/json" \
-    -d "{\"channel\":\"$channel\",\"folder_id\":\"fluxbee-$channel\",\"wait_for_idle\":$wait_for_idle,\"timeout_ms\":$timeout_ms}"
+    -d "{\"channel\":\"$channel\",\"folder_id\":\"fluxbee-$channel\",\"wait_for_idle\":$wait_for_idle_json,\"timeout_ms\":$timeout_ms}"
 }
 
 extract_versions_meta() {
