@@ -379,16 +379,46 @@ OPA_EXPECT_STATUS=ok OPA_MIN_VERSION=1 OPA_MAX_HEARTBEAT_AGE_MS=30000 \
 ./target/release/opa_shm_diag
 ```
 
-## 6) TODO para futura spec de diagnósticos
-- [ ] Definir contrato JSON unificado de salida para todos los scripts de diagnóstico.
-- [ ] Estandarizar naming de variables (`DIAG_*`) y dejar alias de compatibilidad.
-- [ ] Publicar un endpoint en `sy-admin` para exponer resumen agregado de diagnósticos.
-- [ ] Definir presupuesto de latencia objetivo por flujo (NATS, system routing, OPA resolve).
-- [ ] Agregar versionado de “perfil de diagnóstico” (resilience/perf/wan/opa).
-- [ ] Implementar resumen compacto de métricas de transporte en suite JetStream envelope (`sent/acked/redelivered/replayed/timeouts/reconnects/p50-p95-max`).
-- [x] Implementar suite Blob E2E (`blob_ref` + verificación end-to-end por contenido) con salida compacta y resumen.
-- [ ] Extender suite Blob E2E con hash end-to-end (`sha256`) en salida estándar.
-- [x] Incorporar resumen de Blob Stats en formato agregable (`count/p50/p95/max`, errores y volumen).
+## 6) Tasks unificados de diagnóstico/estadísticas (base para posible `SY.diagnostics`)
+
+Objetivo:
+- centralizar en un único backlog todo lo operativo de diagnóstico y métricas,
+- dejar explícito qué faltaría para evolucionar a un servicio dedicado (`SY.diagnostics`) sin mezclar criterios funcionales de producto.
+
+### 6.1 Contrato y estandarización de salidas
+- [ ] D1. Definir contrato JSON unificado de salida para todos los scripts/binarios de diagnóstico (`diag_schema_version`, `suite`, `profile`, `status`, `timings`, `stats`, `errors`).
+- [ ] D2. Estandarizar naming de variables en modo canónico (`DIAG_*`) y mantener aliases temporales de compatibilidad.
+- [ ] D3. Crear librería/helper común para emisión de resumen (`key=value` + JSON) y evitar formatos divergentes entre scripts.
+
+### 6.2 Ingesta y almacenamiento de resultados
+- [ ] D4. Definir modelo de persistencia de “runs” de diagnóstico (id, suite, profile, hive, timestamps, resultado, métricas).
+- [ ] D5. Definir retención/compactación de runs (TTL y política de purga).
+- [ ] D6. Definir formato de artefactos para CI/local (JSON + resumen humano).
+
+### 6.3 API y exposición operativa (vía `sy-admin` o nuevo `SY.diagnostics`)
+- [ ] D7. Publicar endpoint para resumen agregado de diagnósticos (estado global + últimos runs).
+- [ ] D8. Publicar endpoint de detalle por suite/run (`/diagnostics/runs/{id}`) con payload completo y errores.
+- [ ] D9. Definir filtros mínimos de consulta (`suite`, `profile`, `hive`, rango temporal, `status`).
+
+### 6.4 Métricas/estadísticas pendientes por suite
+- [ ] D10. Definir presupuesto de latencia objetivo por flujo (NATS, system routing, OPA resolve, sync_hint/update).
+- [ ] D11. Completar resumen de transporte JetStream envelope (`sent/acked/redelivered/replayed/timeouts/reconnects/p50/p95/max`).
+- [ ] D12. Extender Blob E2E con hash end-to-end (`sha256`) en salida estándar para validación de integridad.
+- [ ] D13. Agregar resumen estadístico de distribución de software (`dist`): tiempos `sync_hint`, `SYSTEM_UPDATE`, health-check y rollback.
+
+### 6.5 Orquestación de suites y perfiles
+- [ ] D14. Agregar versionado explícito de “perfil de diagnóstico” (`resilience/perf/wan/opa/blob`).
+- [ ] D15. Definir runner unificado de suites (plan reproducible por perfil y orden de ejecución).
+- [ ] D16. Definir gate mínimo de CI/local para diagnósticos críticos (smoke + transporte + blob multi-hive).
+
+### 6.6 Delimitación arquitectónica para eventual `SY.diagnostics`
+- [ ] D17. Definir ownership final: qué queda en `sy-admin` y qué migra a `SY.diagnostics`.
+- [ ] D18. Definir contrato de intercambio entre componentes y servicio de diagnósticos (acción system vs API local).
+- [ ] D19. Definir modelo de seguridad/acceso para diagnósticos (alcance por hive, redacción de datos sensibles, límites de exposición).
+
+### 6.7 Cerrado (ya implementado)
+- [x] D20. Implementar suite Blob E2E (`blob_ref` + verificación end-to-end por contenido) con salida compacta y resumen.
+- [x] D21. Incorporar resumen de Blob Stats en formato agregable (`count/p50/p95/max`, errores y volumen).
 
 Nota de coordinación con backlog Blob:
 - las decisiones funcionales de publicación confirmada (`SYSTEM_SYNC_HINT`, gate de emisión y pipeline dist) se gestionan en `docs/onworking/blob_tasks.md` (`BLOB-X12..X15`).

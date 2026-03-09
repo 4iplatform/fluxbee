@@ -68,12 +68,46 @@ curl -sS "$BASE/hives/$HIVE_ID"
 curl -sS -X DELETE "$BASE/hives/$HIVE_ID"
 ```
 
-### Apply software update on a worker (`SYSTEM_UPDATE`)
+### Publish and apply a runtime update on a worker (`dist` + `SYSTEM_UPDATE`)
 
 ```bash
 MOTHER_HIVE="sandbox"   # hive local de motherbee
+RUNTIME="wf.demo.task"
+VERSION="0.0.1"
 
-# 1) get current manifest version/hash from motherbee
+# 0) publish runtime files in dist (motherbee source of truth)
+RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/$RUNTIME/$VERSION"
+sudo mkdir -p "$RUNTIME_DIR/bin"
+cat <<'EOF' | sudo tee "$RUNTIME_DIR/bin/start.sh" >/dev/null
+#!/usr/bin/env bash
+set -euo pipefail
+exec /bin/sleep 3600
+EOF
+sudo chmod +x "$RUNTIME_DIR/bin/start.sh"
+
+# 1) update dist runtime manifest
+sudo env RUNTIME="$RUNTIME" VERSION="$VERSION" python3 - <<'PY'
+import json, os, datetime
+p="/var/lib/fluxbee/dist/runtimes/manifest.json"
+runtime=os.environ["RUNTIME"]; version=os.environ["VERSION"]
+try: doc=json.load(open(p,"r",encoding="utf-8"))
+except FileNotFoundError:
+    doc={"schema_version":1,"version":0,"updated_at":None,"runtimes":{}}
+doc["schema_version"]=1
+doc["version"]=int(datetime.datetime.now(datetime.timezone.utc).timestamp()*1000)
+doc["updated_at"]=datetime.datetime.now(datetime.timezone.utc).isoformat()
+doc.setdefault("runtimes",{})
+entry=doc["runtimes"].setdefault(runtime, {"available":[], "current":version})
+entry.setdefault("available",[])
+if version not in entry["available"]:
+    entry["available"].append(version)
+entry["current"]=version
+tmp=p+".tmp"
+json.dump(doc, open(tmp,"w",encoding="utf-8"), indent=2, sort_keys=True); open(tmp,"a").write("\n")
+os.replace(tmp,p)
+PY
+
+# 2) get current manifest version/hash from motherbee
 read MANIFEST_VERSION MANIFEST_HASH < <(
   curl -sS "$BASE/hives/$MOTHER_HIVE/versions" | python3 - <<'PY'
 import json,sys
@@ -83,11 +117,20 @@ print(int(r.get("manifest_version",0)), r["manifest_hash"])
 PY
 )
 
-# 2) send strict update payload to target hive
+# 3) ask target hive to converge dist channel before update
+curl -sS -X POST "$BASE/hives/$HIVE_ID/sync-hint" \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"dist","folder_id":"fluxbee-dist","wait_for_idle":true,"timeout_ms":30000}'; echo
+
+# 4) send strict update payload to target hive
 curl -sS -X POST "$BASE/hives/$HIVE_ID/update" \
   -H "Content-Type: application/json" \
   -d "{\"category\":\"runtime\",\"manifest_version\":$MANIFEST_VERSION,\"manifest_hash\":\"$MANIFEST_HASH\"}"; echo
 ```
+
+For a complete operational rollout (publish -> sync-hint -> update -> run node), see:
+- `docs/14-runtime-rollout-motherbee.md`
+- `scripts/orchestrator_system_update_api_e2e.sh`
 
 ### Trigger/confirm Syncthing convergence (`SYSTEM_SYNC_HINT`, v2.x)
 
@@ -502,6 +545,75 @@ Key documents:
 - `03-shm.md` - Shared memory structures
 - `04-routing.md` - FIB, VPNs, OPA integration
 - `10-identity-layer3.md` - Identity system and L3 routing
+
+### SDK Tools (Current)
+
+`fluxbee_sdk` is the canonical toolset for node development. Current toolbox:
+
+| Tool | Path | Purpose |
+|---|---|---|
+| Node connection | `fluxbee_sdk::{connect, NodeConfig}` | Connect node to router (split sender/receiver) |
+| Tunable connection config | `fluxbee_sdk::ClientConfig` + `connect_with_client_config` | Configure retry/backoff/keepalive/timeouts for node-router sessions |
+| Protocol types | `fluxbee_sdk::protocol` | Build/route messages (`Message`, `Routing`, `Destination`, `Meta`) |
+| Typed payloads | `fluxbee_sdk::payload::TextV1Payload` | Canonical `text/v1` payload (`content`, `content_ref`, `attachments`) |
+| NATS client wrappers | `fluxbee_sdk::nats` | Request/reply, publish/subscribe and timeout/reconnect-aware helpers |
+| Blob toolkit | `fluxbee_sdk::blob::BlobToolkit` | `put`, `put_bytes`, `promote`, `resolve`, `resolve_with_retry`, GC |
+| Blob confirmed publish | `fluxbee_sdk::blob::PublishBlobRequest` | `publish_blob_and_confirm` (`SYSTEM_SYNC_HINT` gate before emitting `blob_ref`) |
+| Blob metrics snapshot | `fluxbee_sdk::blob::BlobToolkit::metrics_snapshot` | Operational counters (`put/resolve/retry/errors/bytes`) |
+| Convenience imports | `fluxbee_sdk::prelude::*` | Common SDK symbols in one import |
+
+#### Blob: basic flow (`put`/`promote` -> attach)
+
+```rust
+use fluxbee_sdk::blob::{BlobConfig, BlobToolkit};
+use fluxbee_sdk::payload::TextV1Payload;
+
+let blob = BlobToolkit::new(BlobConfig::default())?;
+let blob_ref = blob.put_bytes(b"hello", "note.txt", "text/plain")?;
+blob.promote(&blob_ref)?;
+
+let payload = TextV1Payload::new("Adjunto archivo", vec![blob_ref]);
+let payload_json = payload.to_value()?;
+```
+
+#### Blob: confirmed publish before emit (`publish_blob_and_confirm`)
+
+```rust
+use fluxbee_sdk::blob::{BlobConfig, BlobToolkit, PublishBlobRequest};
+use fluxbee_sdk::{connect, NodeConfig};
+
+let cfg = NodeConfig {
+    name: "WF.blob.publisher".into(),
+    router_socket: "/var/run/fluxbee/routers".into(),
+    uuid_persistence_dir: "/var/lib/fluxbee/state/nodes".into(),
+    config_dir: "/etc/fluxbee".into(),
+    version: "1.0".into(),
+};
+let (sender, mut receiver) = connect(&cfg).await?;
+
+let blob = BlobToolkit::new(BlobConfig::default())?;
+let published = blob.publish_blob_and_confirm(
+    &sender,
+    &mut receiver,
+    PublishBlobRequest {
+        data: b"payload",
+        filename_original: "payload.txt",
+        mime: "text/plain",
+        targets: vec!["worker-220".into()],
+        wait_for_idle: true,
+        timeout_ms: 30_000,
+    },
+).await?;
+
+// emit only after confirm
+let payload = fluxbee_sdk::payload::TextV1Payload::new("ready", vec![published.blob_ref]);
+let payload_json = payload.to_value()?;
+```
+
+Operational Blob references:
+- `docs/blob-annex-spec.md`
+- `scripts/blob_sync_e2e.sh`
+- `scripts/blob_sync_multi_hive_e2e.sh`
 
 ### Functional Specification (Docs)
 
