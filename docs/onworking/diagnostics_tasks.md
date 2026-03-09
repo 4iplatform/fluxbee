@@ -61,6 +61,14 @@ Alcance:
   - validar invariancia del contrato (`BlobRef` + `text/v1`) entre modo sin sync y modo sync,
   - producir resumen compacto (`contract_invariant`, `consumer_retry_elapsed_ms`, roots y modo de sync).
 
+### 1.7 Blob Sync E2E multi-isla real (Syncthing)
+- Script: `scripts/blob_sync_multi_hive_e2e.sh`
+- Binario: `src/bin/blob_sync_diag.rs` (local + remoto)
+- Propósito:
+  - validar replicación real motherbee -> worker sin `copy mode`,
+  - ejecutar consumo remoto con `resolve_with_retry` sobre `blob.path` del worker,
+  - producir resumen operativo (`resolved_path_remote`, `consumer_retry_elapsed_ms`, `contract_signature`).
+
 ## 2) Variables de diagnóstico (catálogo operativo)
 
 ## 2.1 `wf_nats_diag.sh` + `wf_nats_diag.rs`
@@ -158,6 +166,25 @@ Alcance:
 - `JSR_LOG_LEVEL`
 - `SHOW_FULL_LOGS`
 
+## 2.7 `blob_sync_multi_hive_e2e.sh` + `blob_sync_diag.rs`
+- `BUILD_BIN`
+- `BLOB_DIAG_BIN_PATH`
+- `HIVE_ADDR`
+- `HIVE_USER`
+- `HIVE_KEY`
+- `BLOB_ROOT_LOCAL`
+- `BLOB_ROOT_REMOTE`
+- `BLOB_DIAG_FILENAME`
+- `BLOB_DIAG_CONTENT`
+- `BLOB_DIAG_MIME`
+- `BLOB_DIAG_PAYLOAD_TEXT`
+- `BLOB_DIAG_RETRY_MAX_WAIT_MS`
+- `BLOB_DIAG_RETRY_INITIAL_MS`
+- `BLOB_DIAG_RETRY_BACKOFF`
+- `BLOB_DIAG_SYNCTHING_SERVICE`
+- `JSR_LOG_LEVEL`
+- `SHOW_FULL_LOGS`
+
 ## 3) Qué se mide hoy (métricas efectivas)
 
 ### 3.1 Métricas de latencia NATS (WF diag)
@@ -229,6 +256,12 @@ Alcance:
   - `ELAPSED_MS` en consumidor (`resolve_with_retry`),
   - `RESOLVED_BYTES`,
   - `CONTRACT_SIGNATURE` (productor).
+- Suite `blob_sync_multi_hive_e2e.sh`:
+  - `mode=real_syncthing_multi_hive`,
+  - `active_path_local`,
+  - `resolved_path_remote`,
+  - `consumer_retry_elapsed_ms`,
+  - `contract_signature`.
 
 ### 3.7 Blob SDK (estado actual implementado)
 - Cobertura funcional actual en `fluxbee_sdk`:
@@ -309,6 +342,19 @@ BLOB_DIAG_REQUIRE_SYNCTHING_ACTIVE=1 \
 BLOB_DIAG_SYNC_MODE=external \
 BLOB_DIAG_RETRY_MAX_WAIT_MS=30000 \
 bash scripts/blob_sync_e2e.sh
+```
+
+Blob sync E2E multi-isla real (motherbee -> worker por Syncthing):
+```bash
+sudo -v
+BUILD_BIN=0 \
+HIVE_ADDR=192.168.8.220 \
+HIVE_USER=administrator \
+HIVE_KEY=/var/lib/fluxbee/ssh/motherbee.key \
+BLOB_ROOT_LOCAL=/var/lib/fluxbee/blob \
+BLOB_ROOT_REMOTE=/var/lib/fluxbee/blob \
+BLOB_DIAG_RETRY_MAX_WAIT_MS=180000 \
+bash scripts/blob_sync_multi_hive_e2e.sh
 ```
 
 Nota:

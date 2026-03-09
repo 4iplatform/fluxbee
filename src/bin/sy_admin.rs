@@ -2050,7 +2050,11 @@ async fn handle_hive_update_command(
         None => 0,
         Some(value) => match value.as_u64() {
             Some(v) => v,
-            None => return Ok(invalid_request("manifest_version must be an unsigned integer")),
+            None => {
+                return Ok(invalid_request(
+                    "manifest_version must be an unsigned integer",
+                ))
+            }
         },
     };
     if payload.get("version").is_some() {
@@ -2110,7 +2114,9 @@ async fn handle_hive_update_command(
             let http_status = match status {
                 "ok" => 200,
                 "sync_pending" => 202,
-                _ => error_code_to_http_status(error_code_opt.as_deref().unwrap_or("SERVICE_FAILED")),
+                _ => {
+                    error_code_to_http_status(error_code_opt.as_deref().unwrap_or("SERVICE_FAILED"))
+                }
             };
             let error_code = if let Some(code) = error_code_opt {
                 serde_json::json!(code)
@@ -2160,17 +2166,16 @@ fn build_admin_request(
     hive: Option<String>,
 ) -> AdminRequest {
     let requested_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
-    let base =
-        match action {
-            "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn"
-            | "delete_vpn" => "SY.config.routes",
-            "list_nodes" | "run_node" | "kill_node" | "hive_status"
-            | "get_storage" | "set_storage" | "list_hives"
-            | "get_hive" | "list_versions" | "get_versions" | "list_deployments"
-            | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "remove_hive"
-            | "add_hive" => "SY.orchestrator",
-            _ => "SY.config.routes",
-        };
+    let base = match action {
+        "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn" | "delete_vpn" => {
+            "SY.config.routes"
+        }
+        "list_nodes" | "run_node" | "kill_node" | "hive_status" | "get_storage" | "set_storage"
+        | "list_hives" | "get_hive" | "list_versions" | "get_versions" | "list_deployments"
+        | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "remove_hive"
+        | "add_hive" => "SY.orchestrator",
+        _ => "SY.config.routes",
+    };
     let route_hive = if action_routes_via_local_orchestrator(action) {
         ctx.hive_id.clone()
     } else {

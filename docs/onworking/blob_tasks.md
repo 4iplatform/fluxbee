@@ -102,9 +102,12 @@ Contexto:
 - Quedan brechas para considerar Blob "cerrado al 100%" contra `blob-annex-spec.md` y operación real multi-isla.
 
 ### BLOB-X1 - Sincronización real de `active/` entre islas
-- [ ] X1. Configurar topología Syncthing gestionada por orchestrator (devices/folders) en add/remove hive.
-- [ ] X2. Garantizar que Syncthing replique solo `blob/active` (no `staging`).
+- [x] X1. Configurar topología Syncthing gestionada por orchestrator (devices/folders) en add/remove hive.
+  - Avance (2026-03-09): `add_hive` persiste `syncthing_device_id` del worker en `info.yaml` y `remove_hive` desmonta peer Syncthing local (top-level + folders `fluxbee-blob` / `fluxbee-dist`) antes del cleanup local.
+- [x] X2. Garantizar que Syncthing replique solo `blob/active` (no `staging`).
+  - Avance (2026-03-09): reconciliación de carpeta `fluxbee-blob` en orchestrator apuntando a `<blob.path>/active` (local + peer link), y bootstrap remoto creando `active/` + `staging/`.
 - [ ] X3. E2E real multi-isla (sin modo `copy`): archivo en isla A visible en isla B por Syncthing y consumo con `resolve_with_retry`.
+  - Avance (2026-03-09): script `scripts/blob_sync_multi_hive_e2e.sh` agregado (producer local en motherbee + consumer remoto en worker con `resolve_with_retry`, sin `copy mode`).
 
 Salida:
 - replicación de blobs validada end-to-end con Syncthing real entre hives.

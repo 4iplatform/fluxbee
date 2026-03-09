@@ -6,9 +6,9 @@ use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
 use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
-use sha2::{Digest, Sha256};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::time::{timeout, Instant};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -130,8 +130,9 @@ fn resolve_system_update_payload(
         "runtime" => {
             let manifest_path = Path::new("/var/lib/fluxbee/dist/runtimes/manifest.json");
             let hash = sha256_file(manifest_path)?;
-            let version =
-                manifest_version.or_else(|| runtime_manifest_version(manifest_path)).unwrap_or(0);
+            let version = manifest_version
+                .or_else(|| runtime_manifest_version(manifest_path))
+                .unwrap_or(0);
             Ok((version, hash))
         }
         "core" => {
