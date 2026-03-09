@@ -31,6 +31,7 @@ BLOB_ROOT_REMOTE="${BLOB_ROOT_REMOTE:-/var/lib/fluxbee/blob}"
 WAIT_STATUS_SECS="${WAIT_STATUS_SECS:-240}"
 WAIT_UPDATE_SECS="${WAIT_UPDATE_SECS:-120}"
 WAIT_RUNTIME_READY_SECS="${WAIT_RUNTIME_READY_SECS:-180}"
+WAIT_SPAWN_READY_SECS="${WAIT_SPAWN_READY_SECS:-180}"
 SHOW_FULL_LOGS="${SHOW_FULL_LOGS:-0}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_PATH="${BLOB_DIAG_BIN_PATH:-$ROOT_DIR/target/release/blob_sync_diag}"
@@ -253,14 +254,34 @@ spawn_node() {
   local out_file="$4"
   local payload
   payload="{\"node_name\":\"$node_name\",\"runtime\":\"$runtime\",\"runtime_version\":\"current\"}"
-  local status
-  status="$(http_call "POST" "$BASE/hives/$hive/nodes" "$out_file" "$payload")"
-  if [[ "$status" != "200" || "$(json_get "status" "$out_file")" != "ok" ]]; then
+  local deadline=$(( $(date +%s) + WAIT_SPAWN_READY_SECS ))
+  while (( $(date +%s) <= deadline )); do
+    local status top_status error_code error_detail
+    status="$(http_call "POST" "$BASE/hives/$hive/nodes" "$out_file" "$payload")"
+    top_status="$(json_get "status" "$out_file")"
+    if [[ "$status" == "200" && "$top_status" == "ok" ]]; then
+      return 0
+    fi
+    error_code="$(json_get "error_code" "$out_file")"
+    if [[ -z "$error_code" ]]; then
+      error_code="$(json_get "payload.error_code" "$out_file")"
+    fi
+    error_detail="$(json_get "error_detail" "$out_file")"
+    if [[ -z "$error_detail" ]]; then
+      error_detail="$(json_get "payload.message" "$out_file")"
+    fi
+    if [[ "$error_code" == "RUNTIME_NOT_PRESENT" || "$error_code" == "TRANSPORT_ERROR" || "$error_detail" == *"UNREACHABLE"* ]]; then
+      echo "WARN: run_node transient '$error_code' (hive=$hive node=$node_name), retrying..." >&2
+      sleep 2
+      continue
+    fi
     echo "FAIL: run_node failed (hive=$hive node=$node_name runtime=$runtime)" >&2
     cat "$out_file" >&2 || true
     return 1
-  fi
-  return 0
+  done
+  echo "FAIL: run_node timeout waiting ready (hive=$hive node=$node_name runtime=$runtime)" >&2
+  cat "$out_file" >&2 || true
+  return 1
 }
 
 kill_node() {
