@@ -29,3 +29,4 @@ Documentos transversales (no de un solo proceso):
 Nota:
 - `docs/onworking/sy_orchestrator_tasks.md` y `docs/onworking/CHANGELOG-v1.15-to-v1.16.md` se mantienen como históricos.
 - Para operación vigente de orchestrator usar `docs/onworking/sy_orchestrator_v2_tasks.md` y `docs/onworking/SY.orchestrator — Spec de Cambios v2.md`.
+- Para Blob, la fuente única de backlog es `docs/onworking/blob_tasks.md` (mientras que `blob_node_examples.md` y `diagnostics_tasks.md` son documentos complementarios).

@@ -318,7 +318,7 @@ Hoy estos mensajes soportan routers y ciertos nodos SY. Se extienden para soport
 }
 ```
 
-**Status posibles:**
+**Status posibles (SPAWN_NODE):**
 
 | Status | Significado |
 |--------|-------------|
@@ -365,7 +365,109 @@ Hoy estos mensajes soportan routers y ciertos nodos SY. Se extienden para soport
 | `not_found` | El nodo no estaba corriendo |
 | `error` | Fallo al detener |
 
-### 5.3 Mensajes sin cambios
+### 5.3 EXTENSIÓN PROPUESTA: SYSTEM_SYNC_HINT (blob/dist)
+
+Motivación:
+- mantener Syncthing como único mecanismo de sync.
+- reducir latencia de convergencia con un trigger por evento (además del watchdog periódico).
+- evitar envío de mensajes con `blob_ref` antes de consolidar propagación.
+
+Estado:
+- **propuesto para v2.x** (no reemplaza `SYSTEM_UPDATE` ni agrega camino SSH).
+
+Request:
+
+```json
+{
+  "routing": {
+    "src": "",
+    "dst": "SY.orchestrator@worker-1",
+    "ttl": 16,
+    "trace_id": ""
+  },
+  "meta": {
+    "type": "system",
+    "msg": "SYSTEM_SYNC_HINT"
+  },
+  "payload": {
+    "channel": "blob",
+    "folder_id": "fluxbee-blob",
+    "wait_for_idle": true,
+    "timeout_ms": 30000
+  }
+}
+```
+
+Campos:
+
+| Campo | Tipo | Valores | Descripción |
+|-------|------|---------|-------------|
+| `channel` | string | `blob`, `dist` | Canal lógico a acelerar |
+| `folder_id` | string | `fluxbee-blob`, `fluxbee-dist` | Folder Syncthing objetivo |
+| `wait_for_idle` | bool | `true/false` | Si espera convergencia observada |
+| `timeout_ms` | u64 | >0 | Timeout de espera local |
+
+Response:
+
+```json
+{
+  "meta": {
+    "type": "system",
+    "msg": "SYSTEM_SYNC_HINT_RESPONSE"
+  },
+  "payload": {
+    "status": "ok",
+    "channel": "blob",
+    "folder_id": "fluxbee-blob",
+    "api_healthy": true,
+    "folder_healthy": true,
+    "state": "idle",
+    "need_total_items": 0,
+    "errors": []
+  }
+}
+```
+
+Estados:
+
+| Status | Significado |
+|--------|-------------|
+| `ok` | hint aplicado y folder saludable |
+| `sync_pending` | hint aplicado pero aún no convergió |
+| `error` | health/config inválida del folder o timeout |
+
+Notas de implementación:
+- Sin cambios de transporte: socket L2 existente.
+- Sin fallback legacy: no SSH, no camino paralelo.
+- Reutiliza chequeos de salud por folder que ya usa watchdog (`fluxbee-blob`, `fluxbee-dist`).
+
+---
+
+### 5.4 Semántica de publicación recomendada
+
+#### Blob (IO/AI/WF vía SDK)
+
+Flujo recomendado:
+1. `put/put_bytes`
+2. `promote`
+3. `SYSTEM_SYNC_HINT(channel=blob)`
+4. emitir mensaje `text/v1` con `blob_ref`
+
+Regla:
+- no propagar mensaje con `blob_ref` hasta confirmar convergencia o timeout explícito.
+
+#### Dist (rollout software)
+
+Flujo recomendado:
+1. publicar artefactos/manifest en `dist` (motherbee)
+2. `SYSTEM_SYNC_HINT(channel=dist)` sobre hives destino
+3. `SYSTEM_UPDATE(category=runtime|core|vendor)`
+
+Regla:
+- `SYSTEM_UPDATE` se ejecuta después de hint/confirmación de propagación, no antes.
+- este flujo está pensado para el pipeline de plataforma/Admin (publish central en motherbee y ejecución coordinada por hive destino).
+
+### 5.5 Mensajes sin cambios
 
 Estos mensajes se mantienen exactamente como están:
 

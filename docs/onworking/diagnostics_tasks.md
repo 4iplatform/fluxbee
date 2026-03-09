@@ -382,6 +382,10 @@ OPA_EXPECT_STATUS=ok OPA_MIN_VERSION=1 OPA_MAX_HEARTBEAT_AGE_MS=30000 \
 - [ ] Extender suite Blob E2E con hash end-to-end (`sha256`) en salida estándar.
 - [ ] Incorporar resumen de Blob Stats en formato agregable (`count/p50/p95/max`, errores y volumen).
 
+Nota de coordinación con backlog Blob:
+- las decisiones funcionales de publicación confirmada (`SYSTEM_SYNC_HINT`, gate de emisión y pipeline dist) se gestionan en `docs/onworking/blob_tasks.md` (`BLOB-X12..X15`).
+- este archivo mantiene solo tareas de diagnóstico/medición y no duplica criterios de producto.
+
 ## 7) Router Stats (propuesta para spec, sin implementación aún)
 
 Objetivo:

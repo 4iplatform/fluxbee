@@ -3,9 +3,16 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
+use crate::node_client::NodeError;
 use crate::payload::{PayloadError, TextV1Payload, TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES};
+use crate::protocol::{
+    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+};
+use crate::split::{NodeReceiver, NodeSender};
 
 pub mod constants {
     pub const BLOB_NAME_MAX_CHARS: usize = 128;
@@ -19,12 +26,16 @@ pub mod constants {
     pub const BLOB_STAGING_TTL_HOURS: u64 = 24;
     pub const BLOB_MAX_EXT_CHARS: usize = 10;
     pub const TEXT_V1_DEFAULT_OVERHEAD_BYTES: usize = 2_048;
+    pub const BLOB_SYNC_HINT_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+    pub const BLOB_SYNC_HINT_MAX_TIMEOUT_MS: u64 = 300_000;
+    pub const BLOB_SYNC_HINT_RETRY_INTERVAL_MS: u64 = 500;
 }
 
 pub use constants::{
     BLOB_HASH_LEN, BLOB_MAX_EXT_CHARS, BLOB_NAME_ALLOWED, BLOB_NAME_MAX_CHARS, BLOB_PREFIX_LEN,
     BLOB_RETRY_BACKOFF, BLOB_RETRY_INITIAL_MS, BLOB_RETRY_MAX_MS, BLOB_STAGING_TTL_HOURS,
-    TEXT_V1_DEFAULT_OVERHEAD_BYTES,
+    BLOB_SYNC_HINT_DEFAULT_TIMEOUT_MS, BLOB_SYNC_HINT_MAX_TIMEOUT_MS,
+    BLOB_SYNC_HINT_RETRY_INTERVAL_MS, TEXT_V1_DEFAULT_OVERHEAD_BYTES,
 };
 
 #[derive(Debug, Clone)]
@@ -103,6 +114,48 @@ pub struct BlobStat {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct PublishBlobRequest<'a> {
+    pub data: &'a [u8],
+    pub filename_original: &'a str,
+    pub mime: &'a str,
+    pub targets: Vec<String>,
+    pub wait_for_idle: bool,
+    pub timeout_ms: u64,
+}
+
+impl<'a> PublishBlobRequest<'a> {
+    pub fn new(
+        data: &'a [u8],
+        filename_original: &'a str,
+        mime: &'a str,
+        targets: Vec<String>,
+    ) -> Self {
+        Self {
+            data,
+            filename_original,
+            mime,
+            targets,
+            wait_for_idle: true,
+            timeout_ms: BLOB_SYNC_HINT_DEFAULT_TIMEOUT_MS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncHintTargetResult {
+    pub target: String,
+    pub status: String,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublishBlobResult {
+    pub blob_ref: BlobRef,
+    pub timeout_ms: u64,
+    pub targets: Vec<SyncHintTargetResult>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BlobError {
     #[error("BLOB_NOT_FOUND: {0}")]
@@ -115,6 +168,12 @@ pub enum BlobError {
     InvalidRef(String),
     #[error("BLOB_TOO_LARGE: size={size} max={max}")]
     TooLarge { size: u64, max: u64 },
+    #[error("BLOB_SYNC_HINT_TIMEOUT: target={target} timeout_ms={timeout_ms}")]
+    SyncHintTimeout { target: String, timeout_ms: u64 },
+    #[error("BLOB_SYNC_HINT_FAILED: target={target} detail={detail}")]
+    SyncHintFailed { target: String, detail: String },
+    #[error("BLOB_SYNC_HINT_TRANSPORT: target={target} detail={detail}")]
+    SyncHintTransport { target: String, detail: String },
     #[error("BLOB_NOT_IMPLEMENTED")]
     NotImplemented,
 }
@@ -185,6 +244,119 @@ impl BlobToolkit {
         std::fs::write(&staging_path, data)
             .map_err(|err| map_io_error(err, "write staging file"))?;
         Ok(blob_ref)
+    }
+
+    /// Publica un blob local (`put_bytes` + `promote`) y confirma convergencia por target
+    /// usando `SYSTEM_SYNC_HINT`.
+    ///
+    /// Nota: este helper consume mensajes del `NodeReceiver` mientras espera respuestas por
+    /// `trace_id`; para evitar interferencias, se recomienda usar un receptor dedicado de control.
+    pub async fn publish_blob_and_confirm(
+        &self,
+        sender: &NodeSender,
+        receiver: &mut NodeReceiver,
+        request: PublishBlobRequest<'_>,
+    ) -> Result<PublishBlobResult, BlobError> {
+        if request.targets.is_empty() {
+            return Err(BlobError::InvalidRef(
+                "publish_blob_and_confirm requires at least one target".to_string(),
+            ));
+        }
+
+        let timeout_ms = request.timeout_ms.max(1).min(BLOB_SYNC_HINT_MAX_TIMEOUT_MS);
+
+        let blob_ref = self.put_bytes(request.data, request.filename_original, request.mime)?;
+        self.promote(&blob_ref)?;
+
+        let mut target_results = Vec::with_capacity(request.targets.len());
+        for raw_target in request.targets {
+            let target = normalize_orchestrator_target(&raw_target)?;
+            let started = Instant::now();
+            let deadline = started + Duration::from_millis(timeout_ms);
+
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(BlobError::SyncHintTimeout { target, timeout_ms });
+                }
+                let remaining = deadline - now;
+                let remaining_ms = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
+                let attempt_timeout_ms = remaining_ms.max(1).min(BLOB_SYNC_HINT_MAX_TIMEOUT_MS);
+
+                let trace_id = Uuid::new_v4().to_string();
+                let payload = json!({
+                    "channel": "blob",
+                    "folder_id": "fluxbee-blob",
+                    "wait_for_idle": request.wait_for_idle,
+                    "timeout_ms": attempt_timeout_ms,
+                });
+                let message = Message {
+                    routing: Routing {
+                        src: sender.uuid().to_string(),
+                        dst: Destination::Unicast(target.clone()),
+                        ttl: 16,
+                        trace_id: trace_id.clone(),
+                    },
+                    meta: Meta {
+                        msg_type: SYSTEM_KIND.to_string(),
+                        msg: Some("SYSTEM_SYNC_HINT".to_string()),
+                        scope: None,
+                        target: None,
+                        action: None,
+                        priority: None,
+                        context: None,
+                    },
+                    payload,
+                };
+
+                sender
+                    .send(message)
+                    .await
+                    .map_err(|err| BlobError::SyncHintTransport {
+                        target: target.clone(),
+                        detail: format!("send SYSTEM_SYNC_HINT failed: {err}"),
+                    })?;
+
+                let response = wait_for_sync_hint_response(
+                    receiver,
+                    &trace_id,
+                    &target,
+                    Duration::from_millis(attempt_timeout_ms),
+                )
+                .await?;
+
+                if response.status == "ok" {
+                    target_results.push(SyncHintTargetResult {
+                        target,
+                        status: response.status,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    });
+                    break;
+                }
+
+                if response.status == "sync_pending" {
+                    if Instant::now() >= deadline {
+                        return Err(BlobError::SyncHintTimeout { target, timeout_ms });
+                    }
+                    tokio::time::sleep(Duration::from_millis(BLOB_SYNC_HINT_RETRY_INTERVAL_MS))
+                        .await;
+                    continue;
+                }
+
+                let detail = response
+                    .error_code
+                    .map(|code| format!("error_code={code}"))
+                    .or(response.message)
+                    .unwrap_or_else(|| "sync hint returned error".to_string());
+                return Err(BlobError::SyncHintFailed { target, detail });
+            }
+        }
+
+        Ok(PublishBlobResult {
+            blob_ref,
+            timeout_ms,
+            targets: target_results,
+        })
     }
 
     pub fn promote(&self, blob_ref: &BlobRef) -> Result<(), BlobError> {
@@ -462,6 +634,143 @@ fn map_io_error(err: std::io::Error, ctx: &str) -> BlobError {
     BlobError::Io(format!("{ctx}: {err}"))
 }
 
+#[derive(Debug, Clone)]
+struct SyncHintResponse {
+    status: String,
+    error_code: Option<String>,
+    message: Option<String>,
+}
+
+fn normalize_orchestrator_target(raw_target: &str) -> Result<String, BlobError> {
+    let trimmed = raw_target.trim();
+    if trimmed.is_empty() {
+        return Err(BlobError::InvalidRef(
+            "sync hint target cannot be empty".to_string(),
+        ));
+    }
+    if trimmed.contains('@') {
+        Ok(trimmed.to_string())
+    } else {
+        Ok(format!("SY.orchestrator@{trimmed}"))
+    }
+}
+
+fn parse_sync_hint_response_payload(
+    payload: &serde_json::Value,
+) -> Result<SyncHintResponse, String> {
+    let status = payload
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if status.is_empty() {
+        return Err("missing payload.status in SYSTEM_SYNC_HINT_RESPONSE".to_string());
+    }
+    Ok(SyncHintResponse {
+        status,
+        error_code: payload
+            .get("error_code")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string()),
+        message: payload
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string()),
+    })
+}
+
+async fn wait_for_sync_hint_response(
+    receiver: &mut NodeReceiver,
+    trace_id: &str,
+    target: &str,
+    timeout: Duration,
+) -> Result<SyncHintResponse, BlobError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(BlobError::SyncHintTimeout {
+                target: target.to_string(),
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+        let remaining = deadline - now;
+        let message = match receiver.recv_timeout(remaining).await {
+            Ok(msg) => msg,
+            Err(NodeError::Timeout) => {
+                return Err(BlobError::SyncHintTimeout {
+                    target: target.to_string(),
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            }
+            Err(err) => {
+                return Err(BlobError::SyncHintTransport {
+                    target: target.to_string(),
+                    detail: format!("receive SYSTEM_SYNC_HINT_RESPONSE failed: {err}"),
+                });
+            }
+        };
+
+        if message.routing.trace_id != trace_id {
+            continue;
+        }
+
+        if message.meta.msg_type == SYSTEM_KIND
+            && message.meta.msg.as_deref() == Some(MSG_UNREACHABLE)
+        {
+            let reason = message
+                .payload
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let original_dst = message
+                .payload
+                .get("original_dst")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
+            return Err(BlobError::SyncHintFailed {
+                target: target.to_string(),
+                detail: format!("router unreachable: reason={reason} original_dst={original_dst}"),
+            });
+        }
+
+        if message.meta.msg_type == SYSTEM_KIND
+            && message.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED)
+        {
+            let original_dst = message
+                .payload
+                .get("original_dst")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
+            let last_hop = message
+                .payload
+                .get("last_hop")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
+            return Err(BlobError::SyncHintFailed {
+                target: target.to_string(),
+                detail: format!(
+                    "router ttl exceeded: original_dst={original_dst} last_hop={last_hop}"
+                ),
+            });
+        }
+
+        if message.meta.msg_type != SYSTEM_KIND
+            || message.meta.msg.as_deref() != Some("SYSTEM_SYNC_HINT_RESPONSE")
+        {
+            continue;
+        }
+
+        return parse_sync_hint_response_payload(&message.payload).map_err(|detail| {
+            BlobError::SyncHintFailed {
+                target: target.to_string(),
+                detail,
+            }
+        });
+    }
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     let mut out = String::with_capacity(64);
@@ -582,6 +891,20 @@ mod tests {
         assert!(BlobToolkit::validate_blob_name("factura_0123456789abcde.png").is_err());
         assert!(BlobToolkit::validate_blob_name("factura_0123456789abcdef.PNG").is_err());
         assert!(BlobToolkit::validate_blob_name("../x_0123456789abcdef.png").is_err());
+    }
+
+    #[test]
+    fn normalize_orchestrator_target_rules() {
+        assert_eq!(
+            normalize_orchestrator_target("worker-220").expect("normalize hive id"),
+            "SY.orchestrator@worker-220"
+        );
+        assert_eq!(
+            normalize_orchestrator_target("SY.orchestrator@worker-220")
+                .expect("normalize full target"),
+            "SY.orchestrator@worker-220"
+        );
+        assert!(normalize_orchestrator_target("  ").is_err());
     }
 
     #[test]

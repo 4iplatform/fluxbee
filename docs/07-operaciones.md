@@ -1,7 +1,7 @@
 # JSON Router - 07 Operaciones
 
-**Estado:** v1.17  
-**Fecha:** 2026-03-04  
+**Estado:** v1.18  
+**Fecha:** 2026-03-09  
 **Audiencia:** Ops/SRE, desarrolladores de deployment
 
 ---
@@ -562,7 +562,7 @@ Flujo operativo canónico:
 
 ```
 1. Publicar artefactos/manifests en /var/lib/fluxbee/dist/
-2. Esperar convergencia de Syncthing en el worker
+2. Esperar convergencia de Syncthing en el worker (o usar hint/confirmación de sync cuando esté habilitado)
 3. POST /hives/{id}/update {category, manifest_version, manifest_hash}
 4. Admin envía SYSTEM_UPDATE -> SY.orchestrator@{hive}
 5. Orchestrator worker instala/reinicia localmente y responde SYSTEM_UPDATE_RESPONSE
@@ -906,6 +906,7 @@ ssh -i /var/lib/fluxbee/ssh/motherbee.key administrator@192.168.1.50
 | `GET /hives/{id}` | `get_hive` | Info de isla específica |
 | `DELETE /hives/{id}` | `remove_hive` | Cleanup remoto por socket (`REMOVE_HIVE_CLEANUP`); si el worker no está alcanzable por socket, cleanup local-only |
 | `POST /hives/{id}/update` | `update` | Envía `SYSTEM_UPDATE` al orchestrator del hive |
+| `POST /hives/{id}/sync-hint` | `sync_hint` | Envía `SYSTEM_SYNC_HINT` (`blob`/`dist`) para trigger/confirm de convergencia Syncthing |
 
 ### 5.2 Gestión de Nodos por Hive (Canónico)
 

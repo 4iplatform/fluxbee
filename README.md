@@ -89,6 +89,14 @@ curl -sS -X POST "$BASE/hives/$HIVE_ID/update" \
   -d "{\"category\":\"runtime\",\"manifest_version\":$MANIFEST_VERSION,\"manifest_hash\":\"$MANIFEST_HASH\"}"; echo
 ```
 
+### Trigger/confirm Syncthing convergence (`SYSTEM_SYNC_HINT`, v2.x)
+
+```bash
+curl -sS -X POST "$BASE/hives/$HIVE_ID/sync-hint" \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"blob","folder_id":"fluxbee-blob","wait_for_idle":true,"timeout_ms":30000}'; echo
+```
+
 ### Query remote worker state (from motherbee API)
 
 ```bash
@@ -172,6 +180,7 @@ Hive-scoped endpoints:
 | `POST` | `/hives/{hive}/nodes` | Spawn node on hive |
 | `DELETE` | `/hives/{hive}/nodes/{name}` | Kill node on hive |
 | `POST` | `/hives/{hive}/update` | Send `SYSTEM_UPDATE` to hive orchestrator |
+| `POST` | `/hives/{hive}/sync-hint` | Send `SYSTEM_SYNC_HINT` (`blob`/`dist`) to hive orchestrator |
 | `GET` | `/hives/{hive}/versions` | Effective versions for hive |
 | `GET` | `/hives/{hive}/deployments` | Deployment history for hive |
 | `GET` | `/hives/{hive}/drift-alerts` | Drift alerts for hive |

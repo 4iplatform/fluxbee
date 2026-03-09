@@ -100,7 +100,42 @@ Verificá que aparezca:
 - `payload.hive.runtimes.manifest_version`
 - `payload.hive.runtimes.manifest_hash`
 
-## 5. Propagar al hive destino (`SYSTEM_UPDATE`)
+## 5. Confirmar convergencia `dist` en destino (`SYSTEM_SYNC_HINT`)
+
+Antes de aplicar `SYSTEM_UPDATE`, confirmar convergencia del canal `dist` en el hive destino:
+
+```bash
+SYNC_HINT_TIMEOUT_MS=30000
+SYNC_HINT_WAIT_SECS=120
+deadline=$(( $(date +%s) + SYNC_HINT_WAIT_SECS ))
+while (( $(date +%s) <= deadline )); do
+  resp="$(curl -sS -X POST "$BASE/hives/$TARGET_HIVE/sync-hint" \
+    -H "Content-Type: application/json" \
+    -d "{\"channel\":\"dist\",\"folder_id\":\"fluxbee-dist\",\"wait_for_idle\":true,\"timeout_ms\":$SYNC_HINT_TIMEOUT_MS}")"
+  status="$(python3 - <<'PY' "$resp"
+import json,sys
+try:
+    d=json.loads(sys.argv[1])
+except Exception:
+    print("")
+    raise SystemExit(0)
+print(d.get("payload",{}).get("status",""))
+PY
+)"
+  if [[ "$status" == "ok" ]]; then
+    echo "$resp"
+    break
+  fi
+  if [[ "$status" == "sync_pending" ]]; then
+    sleep 2
+    continue
+  fi
+  echo "sync-hint failed: $resp" >&2
+  exit 1
+done
+```
+
+## 6. Propagar al hive destino (`SYSTEM_UPDATE`)
 
 Tomar `manifest_version` y `manifest_hash` del hive fuente (motherbee) y aplicarlo al destino:
 
@@ -124,7 +159,7 @@ curl -sS -X POST "$BASE/hives/$TARGET_HIVE/update" \
 
 Si devuelve `payload.status=sync_pending`, esperá unos segundos y repetí el `POST /update`.
 
-## 6. Ejecutar nodo en el hive destino
+## 7. Ejecutar nodo en el hive destino
 
 ```bash
 curl -sS -X POST "$BASE/hives/$TARGET_HIVE/nodes" \
@@ -138,7 +173,7 @@ Listar nodos:
 curl -sS "$BASE/hives/$TARGET_HIVE/nodes" | python3 -m json.tool
 ```
 
-## 7. Detener/eliminar nodo
+## 8. Detener/eliminar nodo
 
 ```bash
 curl -sS -X DELETE "$BASE/hives/$TARGET_HIVE/nodes/$NODE_NAME" \
@@ -158,5 +193,6 @@ curl -sS -X DELETE "$BASE/hives/$TARGET_HIVE/nodes/$NODE_NAME" \
 
 - `RUNTIME_NOT_AVAILABLE`: el `runtime` enviado no existe en manifest (revisar nombre exacto/case).
 - `RUNTIME_NOT_PRESENT`: existe en manifest pero falta `start.sh` en el hive destino (sync aún no convergió).
+- `sync_pending` en `/sync-hint`: Syncthing aún no llegó a `idle` para `fluxbee-dist`.
 - `sync_pending` en `/update`: el destino todavía no tiene el manifest/hash esperado.
 - `FORBIDDEN` en `/update`: origen no autorizado para acciones de sistema (revisar allowlist de system messages).

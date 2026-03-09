@@ -2,6 +2,10 @@
 
 Referencia de uso del contrato `text/v1` con `fluxbee_sdk`.
 
+Nota de alcance:
+- este documento es de ejemplos/contratos de uso.
+- la lista activa de tareas está en `docs/onworking/blob_tasks.md`.
+
 ## 1) IO recibe archivo externo y envía a AI
 
 ```rust
@@ -77,3 +81,40 @@ for attachment in payload.attachments {
 - No referenciar blobs en `staging/`.
 - `attachments` siempre array (vacío si no hay adjuntos).
 - Si hay `content_ref`, no incluir `content`.
+- En multi-isla, preferir publicación con confirmación (`publish_blob_and_confirm`) antes de enviar el mensaje.
+- El consumidor debe mantener `resolve_with_retry` como red de seguridad ante convergencia tardía.
+
+## 6) Propuesta v2.x (pendiente): llamada unificada en SDK con confirmación
+
+Objetivo:
+- el nodo productor (IO/AI/WF) usa una sola API de SDK para publicar blob y confirmar propagación antes de emitir el mensaje.
+
+Contrato propuesto:
+- `publish_blob_and_confirm(...)`:
+  - `put/put_bytes`
+  - `promote`
+  - `SYSTEM_SYNC_HINT` al orchestrator para canal `blob`
+  - espera confirmación de disponibilidad en hives destino (o timeout)
+  - retorna `BlobRef` listo para adjuntar
+
+Pseudocódigo:
+
+```rust
+// API propuesta (nombres tentativos)
+let publish = blob.publish_blob_and_confirm(&sender, &mut receiver, PublishBlobRequest {
+    data: &pdf_bytes,
+    filename_original: "respuesta.pdf",
+    mime: "application/pdf",
+    targets: vec!["worker-220".into()],
+    wait_for_idle: true,
+    timeout_ms: 30_000,
+}).await?;
+
+let payload = TextV1Payload::new("Adjunto el PDF", vec![publish.blob_ref]);
+send_text_v1(payload).await?;
+```
+
+Garantía buscada:
+- no enviar mensaje con `blob_ref` hasta que la propagación esté consolidada para destinos declarados.
+- fallback explícito: timeout/retry/error tipado (sin comportamiento implícito).
+- estados esperados del hint: `ok`, `sync_pending`, `error`.

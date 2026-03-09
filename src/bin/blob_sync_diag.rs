@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use fluxbee_sdk::blob::{
-    BlobConfig, BlobRef, BlobToolkit, ResolveRetryConfig, BLOB_NAME_MAX_CHARS,
+    BlobConfig, BlobRef, BlobToolkit, PublishBlobRequest, ResolveRetryConfig, BLOB_NAME_MAX_CHARS,
+    BLOB_SYNC_HINT_DEFAULT_TIMEOUT_MS,
 };
 use fluxbee_sdk::payload::TextV1Payload;
+use fluxbee_sdk::{connect, NodeConfig};
 use tracing_subscriber::EnvFilter;
 
 type DynError = Box<dyn Error + Send + Sync>;
@@ -19,7 +21,7 @@ async fn main() -> Result<(), DynError> {
 
     let mode = env_or("BLOB_SYNC_DIAG_MODE", "produce");
     match mode.as_str() {
-        "produce" => run_produce(),
+        "produce" => run_produce().await,
         "consume" => run_consume().await,
         other => {
             Err(format!("invalid BLOB_SYNC_DIAG_MODE={other}; expected produce|consume").into())
@@ -27,20 +29,64 @@ async fn main() -> Result<(), DynError> {
     }
 }
 
-fn run_produce() -> Result<(), DynError> {
+async fn run_produce() -> Result<(), DynError> {
     let blob_root = PathBuf::from(env_or("BLOB_ROOT", "/var/lib/fluxbee/blob"));
     let filename = env_or("BLOB_DIAG_FILENAME", "blob-sync-diag.txt");
     let content = env_or("BLOB_DIAG_CONTENT", "fluxbee-blob-sync-diag");
     let mime = env_or("BLOB_DIAG_MIME", "text/plain");
     let payload_text = env_or("BLOB_DIAG_PAYLOAD_TEXT", "blob sync diag");
+    let confirm_targets = env_list("BLOB_DIAG_CONFIRM_TARGETS");
+    let confirm_required = env_bool("BLOB_DIAG_CONFIRM_REQUIRED", false);
+    let confirm_wait_for_idle = env_bool("BLOB_DIAG_CONFIRM_WAIT_FOR_IDLE", true);
+    let confirm_timeout_ms = env_u64(
+        "BLOB_DIAG_CONFIRM_TIMEOUT_MS",
+        BLOB_SYNC_HINT_DEFAULT_TIMEOUT_MS,
+    );
 
     let toolkit = BlobToolkit::new(BlobConfig {
         blob_root: blob_root.clone(),
         name_max_chars: BLOB_NAME_MAX_CHARS,
     })?;
 
-    let blob_ref = toolkit.put_bytes(content.as_bytes(), &filename, &mime)?;
-    toolkit.promote(&blob_ref)?;
+    if confirm_required && confirm_targets.is_empty() {
+        return Err(
+            "BLOB_DIAG_CONFIRM_REQUIRED=1 requires BLOB_DIAG_CONFIRM_TARGETS (csv list)".into(),
+        );
+    }
+
+    let (blob_ref, sync_targets, sync_timeout_ms) = if confirm_targets.is_empty() {
+        let blob_ref = toolkit.put_bytes(content.as_bytes(), &filename, &mime)?;
+        toolkit.promote(&blob_ref)?;
+        (blob_ref, Vec::new(), 0_u64)
+    } else {
+        let node_name = env_or("BLOB_DIAG_SYSTEM_NODE_NAME", "WF.orch.diag");
+        let node_version = env_or("BLOB_DIAG_SYSTEM_NODE_VERSION", "1.0");
+        let node_config = NodeConfig {
+            name: node_name,
+            router_socket: json_router::paths::router_socket_dir(),
+            uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
+            config_dir: json_router::paths::config_dir(),
+            version: node_version,
+        };
+        let (sender, mut receiver) = connect(&node_config).await?;
+        let publish = toolkit
+            .publish_blob_and_confirm(
+                &sender,
+                &mut receiver,
+                PublishBlobRequest {
+                    data: content.as_bytes(),
+                    filename_original: &filename,
+                    mime: &mime,
+                    targets: confirm_targets.clone(),
+                    wait_for_idle: confirm_wait_for_idle,
+                    timeout_ms: confirm_timeout_ms,
+                },
+            )
+            .await?;
+        let _ = sender.close().await;
+        (publish.blob_ref, publish.targets, publish.timeout_ms)
+    };
+
     let active_path = toolkit.resolve(&blob_ref);
 
     let payload = TextV1Payload::new(payload_text, vec![blob_ref.clone()]);
@@ -54,6 +100,7 @@ fn run_produce() -> Result<(), DynError> {
         mode = "produce",
         blob_root = %blob_root.display(),
         blob_name = %blob_ref.blob_name,
+        sync_targets = sync_targets.len(),
         active_path = %active_path.display(),
         "blob sync diag producer completed"
     );
@@ -65,6 +112,13 @@ fn run_produce() -> Result<(), DynError> {
     println!("ACTIVE_PATH={}", active_path.display());
     println!("PAYLOAD_JSON={payload_json_line}");
     println!("CONTRACT_SIGNATURE={contract_signature}");
+    if !sync_targets.is_empty() {
+        println!("SYNC_HINT_TIMEOUT_MS={sync_timeout_ms}");
+        println!(
+            "SYNC_HINT_TARGETS={}",
+            serde_json::to_string(&sync_targets)?
+        );
+    }
 
     Ok(())
 }
@@ -167,4 +221,27 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(default)
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            let lowered = v.trim().to_ascii_lowercase();
+            matches!(lowered.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(default)
+}
+
+fn env_list(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|part| part.trim())
+                .filter(|part| !part.is_empty())
+                .map(|part| part.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }

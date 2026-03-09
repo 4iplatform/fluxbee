@@ -1,6 +1,6 @@
 pub use crate::blob::{
     constants as blob_constants, BlobConfig, BlobError, BlobRef, BlobStat, BlobToolkit,
-    ResolveRetryConfig,
+    PublishBlobRequest, PublishBlobResult, ResolveRetryConfig, SyncHintTargetResult,
 };
 pub use crate::comm::{
     connect, connect_with_client_config, ClientConfig, NodeConfig, NodeError, NodeReceiver,

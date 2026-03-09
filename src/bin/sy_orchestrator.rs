@@ -52,6 +52,9 @@ const SSH_HARDEN_VERIFY_RETRIES: usize = 6;
 const SSH_HARDEN_VERIFY_DELAY_MS: u64 = 1000;
 const SYNCTHING_FOLDER_BLOB_ID: &str = "fluxbee-blob";
 const SYNCTHING_FOLDER_DIST_ID: &str = "fluxbee-dist";
+const SYSTEM_SYNC_HINT_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const SYSTEM_SYNC_HINT_MAX_TIMEOUT_MS: u64 = 300_000;
+const SYSTEM_SYNC_HINT_POLL_INTERVAL_MS: u64 = 250;
 const SYNCTHING_INSTALL_PATH: &str = "/var/lib/fluxbee/vendor/bin/syncthing";
 const DIST_ROOT_DIR: &str = "/var/lib/fluxbee/dist";
 const DIST_RUNTIME_ROOT_DIR: &str = "/var/lib/fluxbee/dist/runtimes";
@@ -1079,6 +1082,7 @@ async fn handle_system_message(
     if matches!(
         action,
         "SYSTEM_UPDATE"
+            | "SYSTEM_SYNC_HINT"
             | "SPAWN_NODE"
             | "KILL_NODE"
             | "GET_VERSIONS"
@@ -1113,6 +1117,15 @@ async fn handle_system_message(
                     let _ =
                         send_system_action_response(sender, msg, "SYSTEM_UPDATE_RESPONSE", payload)
                             .await;
+                }
+                "SYSTEM_SYNC_HINT" => {
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "SYSTEM_SYNC_HINT_RESPONSE",
+                        payload,
+                    )
+                    .await;
                 }
                 "SPAWN_NODE" => {
                     let _ =
@@ -1166,6 +1179,11 @@ async fn handle_system_message(
             let result = handle_system_update_message(state, msg).await;
             let _ =
                 send_system_action_response(sender, msg, "SYSTEM_UPDATE_RESPONSE", result).await;
+        }
+        Some("SYSTEM_SYNC_HINT") => {
+            let result = handle_system_sync_hint_message(state, msg).await;
+            let _ =
+                send_system_action_response(sender, msg, "SYSTEM_SYNC_HINT_RESPONSE", result).await;
         }
         Some("SPAWN_NODE") => {
             let result = run_node_flow(state, &msg.payload).await;
@@ -1259,6 +1277,301 @@ fn parse_system_update_payload(
         .to_string();
 
     Ok((category, manifest_version, manifest_hash))
+}
+
+#[derive(Debug, Clone)]
+struct SystemSyncHintRequest {
+    channel: String,
+    folder_id: String,
+    wait_for_idle: bool,
+    timeout_ms: u64,
+}
+
+fn default_folder_id_for_sync_channel(channel: &str) -> Option<&'static str> {
+    match channel {
+        "blob" => Some(SYNCTHING_FOLDER_BLOB_ID),
+        "dist" => Some(SYNCTHING_FOLDER_DIST_ID),
+        _ => None,
+    }
+}
+
+fn parse_system_sync_hint_payload(
+    payload: &serde_json::Value,
+) -> Result<SystemSyncHintRequest, OrchestratorError> {
+    let channel = payload
+        .get("channel")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("blob")
+        .to_ascii_lowercase();
+
+    let default_folder_id = default_folder_id_for_sync_channel(&channel)
+        .ok_or("channel must be one of blob/dist")?
+        .to_string();
+
+    let folder_id = payload
+        .get("folder_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_folder_id.as_str())
+        .to_string();
+
+    if folder_id != default_folder_id {
+        return Err(format!(
+            "folder_id '{}' is invalid for channel '{}'; expected '{}'",
+            folder_id, channel, default_folder_id
+        )
+        .into());
+    }
+
+    let wait_for_idle = match payload.get("wait_for_idle") {
+        None => true,
+        Some(value) => value.as_bool().ok_or("wait_for_idle must be boolean")?,
+    };
+
+    let timeout_ms = match payload.get("timeout_ms") {
+        None => SYSTEM_SYNC_HINT_DEFAULT_TIMEOUT_MS,
+        Some(value) => value
+            .as_u64()
+            .filter(|v| *v > 0)
+            .ok_or("timeout_ms must be a positive unsigned integer")?,
+    }
+    .min(SYSTEM_SYNC_HINT_MAX_TIMEOUT_MS);
+
+    Ok(SystemSyncHintRequest {
+        channel,
+        folder_id,
+        wait_for_idle,
+        timeout_ms,
+    })
+}
+
+fn system_sync_hint_response_json(
+    state: &OrchestratorState,
+    request: &SystemSyncHintRequest,
+    status: &str,
+    api_healthy: bool,
+    folder_status: Option<&SyncthingFolderStatus>,
+    errors: Vec<String>,
+    message: Option<String>,
+) -> serde_json::Value {
+    let folder_healthy = folder_status.is_some_and(SyncthingFolderStatus::is_healthy);
+    let state_text = folder_status
+        .map(|value| value.state.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let need_total_items = folder_status
+        .map(|value| value.need_total_items)
+        .unwrap_or(0);
+    let mut payload = serde_json::json!({
+        "status": status,
+        "hive": state.hive_id.as_str(),
+        "channel": request.channel,
+        "folder_id": request.folder_id,
+        "wait_for_idle": request.wait_for_idle,
+        "timeout_ms": request.timeout_ms,
+        "api_healthy": api_healthy,
+        "folder_healthy": folder_healthy,
+        "state": state_text,
+        "need_total_items": need_total_items,
+        "errors": errors,
+    });
+    if let Some(detail) = message {
+        payload["message"] = serde_json::Value::String(detail);
+    }
+    payload
+}
+
+async fn handle_system_sync_hint_message(
+    state: &OrchestratorState,
+    msg: &Message,
+) -> serde_json::Value {
+    let request = match parse_system_sync_hint_payload(&msg.payload) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+            });
+        }
+    };
+
+    let desired_blob = current_blob_runtime_config(state);
+    let desired_dist = current_dist_runtime_config(state);
+    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
+    let channel_sync_enabled = match request.channel.as_str() {
+        "blob" => desired_blob.sync_enabled && blob_sync_tool_is_syncthing(&desired_blob),
+        "dist" => desired_dist.sync_enabled && dist_sync_tool_is_syncthing(&desired_dist),
+        _ => false,
+    };
+    if !desired_sync.sync_enabled || !channel_sync_enabled {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SYNC_DISABLED",
+            "message": format!("sync channel '{}' is not enabled in hive configuration", request.channel),
+            "channel": request.channel,
+            "folder_id": request.folder_id,
+        });
+    }
+    if !(blob_sync_tool_is_syncthing(&desired_sync) || dist_sync_tool_is_syncthing(&desired_dist)) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SYNC_UNSUPPORTED",
+            "message": format!(
+                "unsupported sync.tool for blob/dist (blob='{}', dist='{}'; expected syncthing)",
+                desired_blob.sync_tool, desired_dist.sync_tool
+            ),
+            "channel": request.channel,
+            "folder_id": request.folder_id,
+        });
+    }
+
+    let mut service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+    let mut api_healthy = if service_active {
+        syncthing_api_healthy(desired_sync.sync_api_port).await
+    } else {
+        false
+    };
+
+    if !service_active || !api_healthy {
+        if let Err(err) = ensure_blob_sync_runtime(&desired_blob, &desired_dist).await {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SYNC_UNHEALTHY",
+                "message": format!("failed to reconcile syncthing runtime: {err}"),
+                "channel": request.channel,
+                "folder_id": request.folder_id,
+            });
+        }
+        service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+        api_healthy = if service_active {
+            syncthing_api_healthy(desired_sync.sync_api_port).await
+        } else {
+            false
+        };
+    }
+
+    if !service_active || !api_healthy {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SYNC_UNHEALTHY",
+            "message": "syncthing service is not healthy",
+            "channel": request.channel,
+            "folder_id": request.folder_id,
+            "api_healthy": api_healthy,
+            "service_active": service_active,
+        });
+    }
+
+    let mut warnings = Vec::new();
+    if let Err(err) = syncthing_trigger_folder_scan(&desired_sync, &request.folder_id) {
+        tracing::warn!(
+            channel = %request.channel,
+            folder = %request.folder_id,
+            error = %err,
+            "sync hint scan trigger failed; continuing with status probe"
+        );
+        warnings.push(format!("scan trigger failed: {err}"));
+    }
+
+    let mut folder_status = match syncthing_folder_status(&desired_sync, &request.folder_id) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SYNC_STATUS_FAILED",
+                "message": err.to_string(),
+                "channel": request.channel,
+                "folder_id": request.folder_id,
+                "api_healthy": api_healthy,
+                "errors": warnings,
+            });
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
+    loop {
+        if !folder_status.is_healthy() {
+            let mut errors = warnings.clone();
+            if !folder_status.error.is_empty() {
+                errors.push(format!("folder error: {}", folder_status.error));
+            }
+            if !folder_status.invalid.is_empty() {
+                errors.push(format!("folder invalid: {}", folder_status.invalid));
+            }
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SYNC_UNHEALTHY",
+                "message": "syncthing folder is unhealthy",
+                "hive": state.hive_id.as_str(),
+                "channel": request.channel,
+                "folder_id": request.folder_id,
+                "api_healthy": api_healthy,
+                "folder_healthy": false,
+                "state": folder_status.state,
+                "need_total_items": folder_status.need_total_items,
+                "errors": errors,
+            });
+        }
+
+        if folder_status.is_converged() {
+            return system_sync_hint_response_json(
+                state,
+                &request,
+                "ok",
+                api_healthy,
+                Some(&folder_status),
+                warnings,
+                None,
+            );
+        }
+
+        if !request.wait_for_idle {
+            return system_sync_hint_response_json(
+                state,
+                &request,
+                "sync_pending",
+                api_healthy,
+                Some(&folder_status),
+                warnings,
+                Some("folder has pending items".to_string()),
+            );
+        }
+
+        if Instant::now() >= deadline {
+            return system_sync_hint_response_json(
+                state,
+                &request,
+                "sync_pending",
+                api_healthy,
+                Some(&folder_status),
+                warnings,
+                Some(format!(
+                    "sync hint timeout after {}ms waiting for idle convergence",
+                    request.timeout_ms
+                )),
+            );
+        }
+
+        time::sleep(Duration::from_millis(SYSTEM_SYNC_HINT_POLL_INTERVAL_MS)).await;
+        folder_status = match syncthing_folder_status(&desired_sync, &request.folder_id) {
+            Ok(value) => value,
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "SYNC_STATUS_FAILED",
+                    "message": err.to_string(),
+                    "hive": state.hive_id.as_str(),
+                    "channel": request.channel,
+                    "folder_id": request.folder_id,
+                    "api_healthy": api_healthy,
+                    "errors": warnings,
+                });
+            }
+        };
+    }
 }
 
 async fn restart_local_core_services_with_health_gate() -> Result<Vec<String>, OrchestratorError> {
@@ -2329,10 +2642,36 @@ fn syncthing_api_key(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorErr
     Ok(api_key)
 }
 
-fn syncthing_folder_healthy(
+#[derive(Debug, Clone)]
+struct SyncthingFolderStatus {
+    state: String,
+    need_total_items: u64,
+    error: String,
+    invalid: String,
+}
+
+impl SyncthingFolderStatus {
+    fn is_healthy(&self) -> bool {
+        self.error.trim().is_empty() && self.invalid.trim().is_empty()
+    }
+
+    fn is_converged(&self) -> bool {
+        self.is_healthy() && self.state.eq_ignore_ascii_case("idle") && self.need_total_items == 0
+    }
+}
+
+fn json_u64(payload: &serde_json::Value, camel_key: &str, snake_key: &str) -> u64 {
+    payload
+        .get(camel_key)
+        .or_else(|| payload.get(snake_key))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
+fn syncthing_folder_status(
     sync: &BlobRuntimeConfig,
     folder_id: &str,
-) -> Result<bool, OrchestratorError> {
+) -> Result<SyncthingFolderStatus, OrchestratorError> {
     let api_key = syncthing_api_key(sync)?;
     let endpoint = format!(
         "http://127.0.0.1:{}/rest/db/status?folder={}",
@@ -2344,19 +2683,62 @@ fn syncthing_folder_healthy(
         .arg(format!("X-API-Key: {}", api_key))
         .arg(&endpoint);
     let out = run_cmd_output(cmd, &format!("syncthing db status folder={folder_id}"))?;
-    let payload: serde_json::Value = serde_json::from_str(&out)
-        .map_err(|err| format!("invalid syncthing db/status payload for folder '{folder_id}': {err}"))?;
-    let error_text = payload
+    let payload: serde_json::Value = serde_json::from_str(&out).map_err(|err| {
+        format!("invalid syncthing db/status payload for folder '{folder_id}': {err}")
+    })?;
+    let state = payload
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .trim()
+        .to_string();
+    let need_total_items = json_u64(&payload, "needTotalItems", "need_total_items");
+    let error = payload
         .get("error")
         .and_then(|v| v.as_str())
         .unwrap_or("")
-        .trim();
-    let invalid_text = payload
+        .trim()
+        .to_string();
+    let invalid = payload
         .get("invalid")
         .and_then(|v| v.as_str())
         .unwrap_or("")
-        .trim();
-    Ok(error_text.is_empty() && invalid_text.is_empty())
+        .trim()
+        .to_string();
+    Ok(SyncthingFolderStatus {
+        state,
+        need_total_items,
+        error,
+        invalid,
+    })
+}
+
+fn syncthing_folder_healthy(
+    sync: &BlobRuntimeConfig,
+    folder_id: &str,
+) -> Result<bool, OrchestratorError> {
+    let status = syncthing_folder_status(sync, folder_id)?;
+    Ok(status.is_healthy())
+}
+
+fn syncthing_trigger_folder_scan(
+    sync: &BlobRuntimeConfig,
+    folder_id: &str,
+) -> Result<(), OrchestratorError> {
+    let api_key = syncthing_api_key(sync)?;
+    let endpoint = format!(
+        "http://127.0.0.1:{}/rest/db/scan?folder={}",
+        sync.sync_api_port, folder_id
+    );
+    let mut cmd = Command::new("curl");
+    cmd.arg("-fsS")
+        .arg("-X")
+        .arg("POST")
+        .arg("-H")
+        .arg(format!("X-API-Key: {}", api_key))
+        .arg(&endpoint);
+    let _ = run_cmd_output(cmd, &format!("syncthing scan folder={folder_id}"))?;
+    Ok(())
 }
 
 async fn wait_for_syncthing_health(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {

@@ -18,6 +18,10 @@ set -euo pipefail
 #   BLOB_ROOT_REMOTE=/var/lib/fluxbee/blob
 #   TEST_ID=blobmh-<custom>
 #   WAIT_STATUS_SECS=240
+#   BLOB_DIAG_CONFIRM_REQUIRED=1
+#   BLOB_DIAG_CONFIRM_TIMEOUT_MS=120000
+#   WAIT_SYNC_HINT_SECS=120
+#   SYNC_HINT_TIMEOUT_MS=30000
 #   WAIT_UPDATE_SECS=120
 #   WAIT_RUNTIME_READY_SECS=180
 #   SHOW_FULL_LOGS=0
@@ -29,6 +33,7 @@ BUILD_BIN="${BUILD_BIN:-1}"
 BLOB_ROOT_LOCAL="${BLOB_ROOT_LOCAL:-/var/lib/fluxbee/blob}"
 BLOB_ROOT_REMOTE="${BLOB_ROOT_REMOTE:-/var/lib/fluxbee/blob}"
 WAIT_STATUS_SECS="${WAIT_STATUS_SECS:-240}"
+WAIT_SYNC_HINT_SECS="${WAIT_SYNC_HINT_SECS:-120}"
 WAIT_UPDATE_SECS="${WAIT_UPDATE_SECS:-120}"
 WAIT_RUNTIME_READY_SECS="${WAIT_RUNTIME_READY_SECS:-180}"
 WAIT_SPAWN_READY_SECS="${WAIT_SPAWN_READY_SECS:-180}"
@@ -38,6 +43,9 @@ BIN_PATH="${BLOB_DIAG_BIN_PATH:-$ROOT_DIR/target/release/blob_sync_diag}"
 BLOB_DIAG_RETRY_MAX_WAIT_MS="${BLOB_DIAG_RETRY_MAX_WAIT_MS:-180000}"
 BLOB_DIAG_RETRY_INITIAL_MS="${BLOB_DIAG_RETRY_INITIAL_MS:-200}"
 BLOB_DIAG_RETRY_BACKOFF="${BLOB_DIAG_RETRY_BACKOFF:-1.8}"
+BLOB_DIAG_CONFIRM_REQUIRED="${BLOB_DIAG_CONFIRM_REQUIRED:-1}"
+BLOB_DIAG_CONFIRM_TIMEOUT_MS="${BLOB_DIAG_CONFIRM_TIMEOUT_MS:-120000}"
+SYNC_HINT_TIMEOUT_MS="${SYNC_HINT_TIMEOUT_MS:-30000}"
 BLOB_SYNC_API_PORT="${BLOB_SYNC_API_PORT:-8384}"
 BLOB_DIAG_CONTENT="${BLOB_DIAG_CONTENT:-}"
 BLOB_DIAG_FILENAME="${BLOB_DIAG_FILENAME:-}"
@@ -141,6 +149,56 @@ post_runtime_update() {
   status="$(http_call "POST" "$BASE/hives/$hive/update" "$out_file" "$payload")"
   echo "$status"
   return 0
+}
+
+post_sync_hint() {
+  local hive="$1"
+  local channel="$2"
+  local timeout_ms="$3"
+  local out_file="$4"
+  local payload
+  payload="{\"channel\":\"$channel\",\"folder_id\":\"fluxbee-$channel\",\"wait_for_idle\":true,\"timeout_ms\":$timeout_ms}"
+  local status
+  status="$(http_call "POST" "$BASE/hives/$hive/sync-hint" "$out_file" "$payload")"
+  echo "$status"
+  return 0
+}
+
+wait_sync_hint_ok() {
+  local hive="$1"
+  local channel="$2"
+  local timeout_ms="$3"
+  local out_file="$4"
+  local deadline=$(( $(date +%s) + WAIT_SYNC_HINT_SECS ))
+  while (( $(date +%s) <= deadline )); do
+    local http_status payload_status error_code error_detail
+    http_status="$(post_sync_hint "$hive" "$channel" "$timeout_ms" "$out_file")"
+    payload_status="$(json_get "payload.status" "$out_file")"
+    if [[ -z "$payload_status" ]]; then
+      payload_status="$(json_get "status" "$out_file")"
+    fi
+    if [[ "$payload_status" == "ok" ]]; then
+      return 0
+    fi
+    error_code="$(json_get "error_code" "$out_file")"
+    if [[ -z "$error_code" ]]; then
+      error_code="$(json_get "payload.error_code" "$out_file")"
+    fi
+    error_detail="$(json_get "error_detail" "$out_file")"
+    if [[ -z "$error_detail" ]]; then
+      error_detail="$(json_get "payload.message" "$out_file")"
+    fi
+    if [[ "$payload_status" == "sync_pending" || "$error_code" == "TRANSPORT_ERROR" || "$error_detail" == *"UNREACHABLE"* ]]; then
+      sleep 2
+      continue
+    fi
+    echo "FAIL: sync-hint status '$payload_status' (hive=$hive channel=$channel http=$http_status)" >&2
+    cat "$out_file" >&2 || true
+    return 1
+  done
+  echo "FAIL: sync-hint timeout waiting ok (hive=$hive channel=$channel)" >&2
+  cat "$out_file" >&2 || true
+  return 1
 }
 
 wait_update_ok() {
@@ -392,6 +450,8 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 update_local_body="$tmpdir/update_local.json"
 update_worker_body="$tmpdir/update_worker.json"
+sync_hint_local_body="$tmpdir/sync_hint_local.json"
+sync_hint_worker_body="$tmpdir/sync_hint_worker.json"
 versions_local_body="$tmpdir/versions_local.json"
 versions_worker_body="$tmpdir/versions_worker.json"
 spawn_local_body="$tmpdir/spawn_local.json"
@@ -402,13 +462,13 @@ kill_worker_body="$tmpdir/kill_worker.json"
 echo "Blob multi-hive sync E2E (no SSH): BASE=$BASE LOCAL_HIVE_ID=$LOCAL_HIVE_ID WORKER_HIVE_ID=$WORKER_HIVE_ID TEST_ID=$TEST_ID"
 
 if [[ "$BUILD_BIN" == "1" || ! -x "$BIN_PATH" ]]; then
-  echo "Step 1/10: build blob_sync_diag"
+  echo "Step 1/11: build blob_sync_diag"
   (cd "$ROOT_DIR" && cargo build --release --bin blob_sync_diag)
 else
-  echo "Step 1/10: using existing blob_sync_diag at $BIN_PATH"
+  echo "Step 1/11: using existing blob_sync_diag at $BIN_PATH"
 fi
 
-echo "Step 2/10: create runtime fixtures in dist"
+echo "Step 2/11: create runtime fixtures in dist"
 producer_dir="$DIST_RUNTIMES_ROOT/$RUNTIME_PRODUCER/$RUNTIME_VERSION/bin"
 consumer_dir="$DIST_RUNTIMES_ROOT/$RUNTIME_CONSUMER/$RUNTIME_VERSION/bin"
 as_root_local mkdir -p "$producer_dir" "$consumer_dir" "$SCENARIO_ROOT"
@@ -449,6 +509,11 @@ if BLOB_SYNC_DIAG_MODE=produce \
    BLOB_DIAG_CONTENT="$BLOB_DIAG_CONTENT" \
    BLOB_DIAG_MIME="$BLOB_DIAG_MIME" \
    BLOB_DIAG_PAYLOAD_TEXT="$BLOB_DIAG_PAYLOAD_TEXT" \
+   BLOB_DIAG_CONFIRM_TARGETS="$WORKER_HIVE_ID" \
+   BLOB_DIAG_CONFIRM_REQUIRED="${BLOB_DIAG_CONFIRM_REQUIRED:-1}" \
+   BLOB_DIAG_CONFIRM_WAIT_FOR_IDLE=true \
+   BLOB_DIAG_CONFIRM_TIMEOUT_MS="${BLOB_DIAG_CONFIRM_TIMEOUT_MS:-120000}" \
+   BLOB_DIAG_SYSTEM_NODE_NAME="${BLOB_DIAG_SYSTEM_NODE_NAME:-WF.orch.diag}" \
    JSR_LOG_LEVEL="${JSR_LOG_LEVEL:-info}" \
    "$SCRIPT_DIR/blob_sync_diag" >"$log_file" 2>&1; then
   awk -F= '/^BLOB_REF_JSON=/{print substr($0, index($0, "=")+1)}' "$log_file" | tail -n1 >"$ref_file"
@@ -574,7 +639,7 @@ EOF
 as_root_local install -m 0755 "$producer_start_tmp" "$producer_dir/start.sh"
 as_root_local install -m 0755 "$consumer_start_tmp" "$consumer_dir/start.sh"
 
-echo "Step 3/10: update runtime manifest with producer/consumer runtimes"
+echo "Step 3/11: update runtime manifest with producer/consumer runtimes"
 manifest_tmp="$tmpdir/manifest.json"
 as_root_local python3 - "$MANIFEST_PATH" "$RUNTIME_PRODUCER" "$RUNTIME_CONSUMER" "$RUNTIME_VERSION" >"$manifest_tmp" <<'PY'
 import json
@@ -645,7 +710,7 @@ if [[ -z "$manifest_version" || "$manifest_version" == "0" || -z "$manifest_hash
 fi
 echo "runtime manifest version=$manifest_version hash=$manifest_hash"
 
-echo "Step 4/10: prepare scenario files"
+echo "Step 4/11: prepare scenario files"
 as_root_local mkdir -p "$SCENARIO_ROOT"
 as_root_local rm -f \
   "$PRODUCER_STATUS_FILE" "$PRODUCER_LOG_FILE" "$PRODUCER_REF_FILE" "$PRODUCER_CONTRACT_FILE" "$PRODUCER_ACTIVE_FILE" \
@@ -662,24 +727,31 @@ scenario_tmp="$tmpdir/scenario.env"
   printf 'BLOB_DIAG_RETRY_MAX_WAIT_MS=%q\n' "$BLOB_DIAG_RETRY_MAX_WAIT_MS"
   printf 'BLOB_DIAG_RETRY_INITIAL_MS=%q\n' "$BLOB_DIAG_RETRY_INITIAL_MS"
   printf 'BLOB_DIAG_RETRY_BACKOFF=%q\n' "$BLOB_DIAG_RETRY_BACKOFF"
+  printf 'BLOB_DIAG_CONFIRM_REQUIRED=%q\n' "$BLOB_DIAG_CONFIRM_REQUIRED"
+  printf 'BLOB_DIAG_CONFIRM_TIMEOUT_MS=%q\n' "$BLOB_DIAG_CONFIRM_TIMEOUT_MS"
+  printf 'WORKER_HIVE_ID=%q\n' "$WORKER_HIVE_ID"
   printf 'BLOB_SYNC_API_PORT=%q\n' "$BLOB_SYNC_API_PORT"
   printf 'JSR_LOG_LEVEL=%q\n' "info"
 } >"$scenario_tmp"
 as_root_local install -m 0644 "$scenario_tmp" "$SCENARIO_ENV"
 
-echo "Step 5/10: wait hives reachable in versions endpoint"
+echo "Step 5/11: wait hives reachable in versions endpoint"
 wait_hive_versions_reachable "$LOCAL_HIVE_ID" "$versions_local_body" "$WAIT_RUNTIME_READY_SECS"
 wait_hive_versions_reachable "$WORKER_HIVE_ID" "$versions_worker_body" "$WAIT_RUNTIME_READY_SECS"
 
-echo "Step 6/10: SYSTEM_UPDATE runtime on local + worker"
+echo "Step 6/11: SYSTEM_SYNC_HINT dist on local + worker"
+wait_sync_hint_ok "$LOCAL_HIVE_ID" "dist" "$SYNC_HINT_TIMEOUT_MS" "$sync_hint_local_body"
+wait_sync_hint_ok "$WORKER_HIVE_ID" "dist" "$SYNC_HINT_TIMEOUT_MS" "$sync_hint_worker_body"
+
+echo "Step 7/11: SYSTEM_UPDATE runtime on local + worker"
 wait_update_ok "$LOCAL_HIVE_ID" "$manifest_version" "$manifest_hash" "$update_local_body"
 wait_update_ok "$WORKER_HIVE_ID" "$manifest_version" "$manifest_hash" "$update_worker_body"
 
-echo "Step 7/10: wait runtimes ready in versions endpoint"
+echo "Step 8/11: wait runtimes ready in versions endpoint"
 wait_runtime_ready "$LOCAL_HIVE_ID" "$RUNTIME_PRODUCER" "$versions_local_body"
 wait_runtime_ready "$WORKER_HIVE_ID" "$RUNTIME_CONSUMER" "$versions_worker_body"
 
-echo "Step 8/10: run producer (local) and consumer (worker)"
+echo "Step 9/11: run producer (local) and consumer (worker)"
 spawn_node "$LOCAL_HIVE_ID" "$PRODUCER_NODE_NAME" "$RUNTIME_PRODUCER" "$spawn_local_body"
 spawn_node "$WORKER_HIVE_ID" "$CONSUMER_NODE_NAME" "$RUNTIME_CONSUMER" "$spawn_worker_body"
 
@@ -689,11 +761,11 @@ cleanup_nodes() {
 }
 trap 'cleanup_nodes; rm -rf "$tmpdir"' EXIT
 
-echo "Step 9/10: wait producer/consumer status (via dist sync)"
+echo "Step 10/11: wait producer/consumer status (via dist sync)"
 wait_status_file_value "$PRODUCER_STATUS_FILE" "ok" "$WAIT_STATUS_SECS"
 wait_status_file_value "$CONSUMER_STATUS_FILE" "ok" "$WAIT_STATUS_SECS"
 
-echo "Step 10/10: summary + cleanup"
+echo "Step 11/11: summary + cleanup"
 consumer_elapsed="$(as_root_local cat "$CONSUMER_ELAPSED_FILE" 2>/dev/null || true)"
 consumer_path="$(as_root_local cat "$CONSUMER_PATH_FILE" 2>/dev/null || true)"
 contract_signature="$(as_root_local cat "$PRODUCER_CONTRACT_FILE" 2>/dev/null || true)"
