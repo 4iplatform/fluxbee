@@ -37,6 +37,7 @@ BIN_PATH="${BLOB_DIAG_BIN_PATH:-$ROOT_DIR/target/release/blob_sync_diag}"
 BLOB_DIAG_RETRY_MAX_WAIT_MS="${BLOB_DIAG_RETRY_MAX_WAIT_MS:-180000}"
 BLOB_DIAG_RETRY_INITIAL_MS="${BLOB_DIAG_RETRY_INITIAL_MS:-200}"
 BLOB_DIAG_RETRY_BACKOFF="${BLOB_DIAG_RETRY_BACKOFF:-1.8}"
+BLOB_SYNC_API_PORT="${BLOB_SYNC_API_PORT:-8384}"
 BLOB_DIAG_CONTENT="${BLOB_DIAG_CONTENT:-}"
 BLOB_DIAG_FILENAME="${BLOB_DIAG_FILENAME:-}"
 BLOB_DIAG_MIME="${BLOB_DIAG_MIME:-text/plain}"
@@ -496,6 +497,53 @@ if BLOB_SYNC_DIAG_MODE=consume \
   awk -F= '/^RESOLVED_PATH=/{print substr($0, index($0, "=")+1)}' "$log_file" | tail -n1 >"$path_file"
   echo "ok" >"$status_file"
 else
+  {
+    echo "---- consumer diag ----"
+    date -Is || true
+    python3 - "$blob_ref_json" "${BLOB_ROOT_REMOTE:-/var/lib/fluxbee/blob}" <<'PY'
+import json,sys,pathlib
+raw = sys.argv[1]
+root = pathlib.Path(sys.argv[2])
+try:
+    ref = json.loads(raw)
+except Exception as exc:
+    print(f"diag: failed to parse blob_ref_json: {exc}")
+    raise SystemExit(0)
+name = str(ref.get("blob_name","")).strip()
+if not name:
+    print("diag: blob_name missing in blob_ref_json")
+    raise SystemExit(0)
+parts = name.rsplit("_", 1)
+prefix = "00"
+if len(parts) == 2 and "." in parts[1]:
+    hash16 = parts[1].split(".", 1)[0]
+    if len(hash16) >= 2:
+        prefix = hash16[:2]
+path = root / "active" / prefix / name
+print(f"diag: expected_blob_path={path}")
+print(f"diag: expected_blob_exists={path.exists()}")
+PY
+    cfg="/var/lib/fluxbee/syncthing/config.xml"
+    if [[ -f "$cfg" ]]; then
+      api="$(grep -oPm1 '(?<=<apikey>)[^<]+' "$cfg" || true)"
+      if [[ -n "${api:-}" ]]; then
+        port="${BLOB_SYNC_API_PORT:-8384}"
+        echo "diag: syncthing_api_port=$port"
+        echo "diag: syncthing_db_status_fluxbee_blob"
+        curl -sS -H "X-API-Key: $api" \
+          "http://127.0.0.1:${port}/rest/db/status?folder=fluxbee-blob" || true
+        echo
+        echo "diag: syncthing_system_connections"
+        curl -sS -H "X-API-Key: $api" \
+          "http://127.0.0.1:${port}/rest/system/connections" || true
+        echo
+      else
+        echo "diag: syncthing API key not found in $cfg"
+      fi
+    else
+      echo "diag: syncthing config missing at $cfg"
+    fi
+  } >>"$log_file" 2>&1
   echo "error" >"$status_file"
 fi
 
@@ -593,6 +641,7 @@ scenario_tmp="$tmpdir/scenario.env"
   printf 'BLOB_DIAG_RETRY_MAX_WAIT_MS=%q\n' "$BLOB_DIAG_RETRY_MAX_WAIT_MS"
   printf 'BLOB_DIAG_RETRY_INITIAL_MS=%q\n' "$BLOB_DIAG_RETRY_INITIAL_MS"
   printf 'BLOB_DIAG_RETRY_BACKOFF=%q\n' "$BLOB_DIAG_RETRY_BACKOFF"
+  printf 'BLOB_SYNC_API_PORT=%q\n' "$BLOB_SYNC_API_PORT"
   printf 'JSR_LOG_LEVEL=%q\n' "info"
 } >"$scenario_tmp"
 as_root_local install -m 0644 "$scenario_tmp" "$SCENARIO_ENV"
