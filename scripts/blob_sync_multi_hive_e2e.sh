@@ -300,6 +300,21 @@ wait_status_file_value() {
           echo "---- diag log: $status_log_file (tail) ----" >&2
           as_root_local tail -n 120 "$status_log_file" >&2 || true
         fi
+        if [[ "$status_basename" == consumer.*.status ]]; then
+          local test_id producer_status producer_log
+          test_id="${status_basename#consumer.}"
+          test_id="${test_id%.status}"
+          producer_status="$SCENARIO_ROOT/producer.${test_id}.status"
+          producer_log="$SCENARIO_ROOT/producer.${test_id}.log"
+          if as_root_local test -f "$producer_status"; then
+            echo "---- diag producer status: $producer_status ----" >&2
+            as_root_local cat "$producer_status" >&2 || true
+          fi
+          if as_root_local test -f "$producer_log"; then
+            echo "---- diag producer log: $producer_log (tail) ----" >&2
+            as_root_local tail -n 120 "$producer_log" >&2 || true
+          fi
+        fi
         return 1
       fi
     fi
@@ -315,6 +330,21 @@ wait_status_file_value() {
   if as_root_local test -f "$status_log_file"; then
     echo "---- diag log: $status_log_file (tail) ----" >&2
     as_root_local tail -n 120 "$status_log_file" >&2 || true
+  fi
+  if [[ "$status_basename" == consumer.*.status ]]; then
+    local test_id producer_status producer_log
+    test_id="${status_basename#consumer.}"
+    test_id="${test_id%.status}"
+    producer_status="$SCENARIO_ROOT/producer.${test_id}.status"
+    producer_log="$SCENARIO_ROOT/producer.${test_id}.log"
+    if as_root_local test -f "$producer_status"; then
+      echo "---- diag producer status: $producer_status ----" >&2
+      as_root_local cat "$producer_status" >&2 || true
+    fi
+    if as_root_local test -f "$producer_log"; then
+      echo "---- diag producer log: $producer_log (tail) ----" >&2
+      as_root_local tail -n 120 "$producer_log" >&2 || true
+    fi
   fi
   return 1
 }
