@@ -70,6 +70,13 @@ else:
     node = hive.get("vendor", {})
     version = int(node.get("manifest_version", 0) or 0)
     h = node.get("manifest_hash")
+    if (not isinstance(h, str) or not h.strip()):
+        # vendor can be "missing" while syncthing binary is present.
+        # in that case we fallback to resolve local_manifest_hash from sync_pending.
+        if str(node.get("status", "")).strip().lower() == "missing" and bool(node.get("syncthing_present", False)):
+            print(version)
+            print("__AUTO_VENDOR_HASH_FROM_SYNC_PENDING__")
+            sys.exit(0)
 
 if not isinstance(h, str) or not h.strip():
     print("MISSING_HASH", file=sys.stderr)
@@ -103,6 +110,26 @@ print(status if isinstance(status, str) else "")
 PY
 }
 
+extract_payload_local_manifest_hash() {
+  local json_doc="$1"
+  JSON_DOC="$json_doc" python3 - <<'PY'
+import json
+import os
+raw = os.environ.get("JSON_DOC", "")
+try:
+    doc = json.loads(raw)
+except Exception:
+    print("")
+    raise SystemExit(0)
+payload = doc.get("payload")
+if not isinstance(payload, dict):
+    print("")
+    raise SystemExit(0)
+h = payload.get("local_manifest_hash")
+print(h if isinstance(h, str) else "")
+PY
+}
+
 echo "SYSTEM_UPDATE API E2E: BASE=$BASE HIVE_ID=$HIVE_ID CATEGORY=$CATEGORY"
 echo "Step 1/4: fetch current versions"
 versions="$(curl -sS "$BASE/hives/$HIVE_ID/versions")"
@@ -115,6 +142,9 @@ fi
 manifest_version="${meta[0]}"
 manifest_hash="${meta[1]}"
 echo "resolved manifest_version=$manifest_version manifest_hash=$manifest_hash"
+if [[ "$CATEGORY" == "vendor" && "$manifest_hash" == "__AUTO_VENDOR_HASH_FROM_SYNC_PENDING__" ]]; then
+  echo "INFO: vendor manifest hash absent in /versions; will resolve from sync_pending.local_manifest_hash"
+fi
 
 echo "Step 2/4: run sync-hint dist and wait ok"
 deadline=$(( $(date +%s) + WAIT_SYNC_HINT_SECS ))
@@ -151,6 +181,14 @@ echo "$resp_bad"
 if [[ "$status_bad" != "sync_pending" ]]; then
   echo "FAIL: expected payload.status=sync_pending, got '$status_bad'" >&2
   exit 1
+fi
+if [[ "$CATEGORY" == "vendor" && "$manifest_hash" == "__AUTO_VENDOR_HASH_FROM_SYNC_PENDING__" ]]; then
+  manifest_hash="$(extract_payload_local_manifest_hash "$resp_bad")"
+  if [[ -z "$manifest_hash" ]]; then
+    echo "FAIL: vendor fallback could not resolve payload.local_manifest_hash from sync_pending response" >&2
+    exit 1
+  fi
+  echo "resolved vendor manifest_hash from sync_pending.local_manifest_hash=$manifest_hash"
 fi
 
 echo "Step 4/4: send exact hash (expect ok)"
