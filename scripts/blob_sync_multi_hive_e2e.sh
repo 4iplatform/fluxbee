@@ -49,7 +49,7 @@ TEST_ID="${TEST_ID:-blobmh-$(date +%s)-$RANDOM}"
 
 DIST_RUNTIMES_ROOT="/var/lib/fluxbee/dist/runtimes"
 MANIFEST_PATH="$DIST_RUNTIMES_ROOT/manifest.json"
-SCENARIO_ROOT="$DIST_RUNTIMES_ROOT/.blob-sync-multi-hive"
+SCENARIO_ROOT="/var/lib/fluxbee/dist/.blob-sync-multi-hive"
 SCENARIO_ENV="$SCENARIO_ROOT/scenario.env"
 
 PRODUCER_NODE_NAME="WF.blob.producer.${TEST_ID}"
@@ -280,6 +280,10 @@ wait_status_file_value() {
   local file_path="$1"
   local expected="$2"
   local timeout_secs="$3"
+  local status_basename status_stem status_log_file
+  status_basename="$(basename "$file_path")"
+  status_stem="${status_basename%.status}"
+  status_log_file="$SCENARIO_ROOT/${status_stem}.log"
   local deadline=$(( $(date +%s) + timeout_secs ))
   while (( $(date +%s) <= deadline )); do
     if as_root_local test -f "$file_path"; then
@@ -292,12 +296,26 @@ wait_status_file_value() {
       fi
       if [[ -n "$val" && "$val" != "pending" ]]; then
         echo "FAIL: status file '$file_path' has value '$val' (expected '$expected')" >&2
+        if as_root_local test -f "$status_log_file"; then
+          echo "---- diag log: $status_log_file (tail) ----" >&2
+          as_root_local tail -n 120 "$status_log_file" >&2 || true
+        fi
         return 1
       fi
     fi
     sleep 2
   done
   echo "FAIL: timeout waiting status '$expected' in $file_path" >&2
+  if as_root_local test -d "$SCENARIO_ROOT"; then
+    echo "---- diag scenario dir: $SCENARIO_ROOT ----" >&2
+    as_root_local ls -la "$SCENARIO_ROOT" >&2 || true
+  else
+    echo "---- diag: scenario dir missing: $SCENARIO_ROOT ----" >&2
+  fi
+  if as_root_local test -f "$status_log_file"; then
+    echo "---- diag log: $status_log_file (tail) ----" >&2
+    as_root_local tail -n 120 "$status_log_file" >&2 || true
+  fi
   return 1
 }
 
@@ -350,7 +368,7 @@ cat >"$producer_start_tmp" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCENARIO_ROOT="/var/lib/fluxbee/dist/runtimes/.blob-sync-multi-hive"
+SCENARIO_ROOT="/var/lib/fluxbee/dist/.blob-sync-multi-hive"
 SCENARIO_ENV="$SCENARIO_ROOT/scenario.env"
 if [[ ! -f "$SCENARIO_ENV" ]]; then
   echo "missing scenario.env" >"$SCENARIO_ROOT/producer.missing_scenario.log"
@@ -397,7 +415,7 @@ cat >"$consumer_start_tmp" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCENARIO_ROOT="/var/lib/fluxbee/dist/runtimes/.blob-sync-multi-hive"
+SCENARIO_ROOT="/var/lib/fluxbee/dist/.blob-sync-multi-hive"
 SCENARIO_ENV="$SCENARIO_ROOT/scenario.env"
 
 wait_env_secs="${BLOB_DIAG_WAIT_SCENARIO_SECS:-180}"
