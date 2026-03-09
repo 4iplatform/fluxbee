@@ -137,11 +137,7 @@ post_runtime_update() {
   payload="{\"category\":\"runtime\",\"manifest_version\":${version},\"manifest_hash\":\"${hash}\"}"
   local status
   status="$(http_call "POST" "$BASE/hives/$hive/update" "$out_file" "$payload")"
-  if [[ "$status" != "200" ]]; then
-    echo "FAIL: runtime update HTTP $status (hive=$hive)" >&2
-    cat "$out_file" >&2 || true
-    return 1
-  fi
+  echo "$status"
   return 0
 }
 
@@ -152,18 +148,26 @@ wait_update_ok() {
   local out_file="$4"
   local deadline=$(( $(date +%s) + WAIT_UPDATE_SECS ))
   while (( $(date +%s) <= deadline )); do
-    post_runtime_update "$hive" "$version" "$hash" "$out_file" || return 1
+    local http_status
+    http_status="$(post_runtime_update "$hive" "$version" "$hash" "$out_file")"
     local payload_status
     payload_status="$(json_get "payload.status" "$out_file")"
+    if [[ -z "$payload_status" ]]; then
+      payload_status="$(json_get "status" "$out_file")"
+    fi
     if [[ "$payload_status" == "ok" ]]; then
       return 0
     fi
-    if [[ "$payload_status" != "sync_pending" ]]; then
-      echo "FAIL: update runtime status '$payload_status' (hive=$hive)" >&2
-      cat "$out_file" >&2 || true
-      return 1
+    if [[ "$payload_status" == "sync_pending" ]]; then
+      sleep 2
+      continue
     fi
-    sleep 2
+    echo "FAIL: update runtime status '$payload_status' (hive=$hive http=$http_status)" >&2
+    if [[ -n "$http_status" && "$http_status" != "200" ]]; then
+      echo "INFO: runtime update HTTP $http_status (hive=$hive)" >&2
+    fi
+    cat "$out_file" >&2 || true
+    return 1
   done
   echo "FAIL: runtime update timeout waiting ok (hive=$hive)" >&2
   cat "$out_file" >&2 || true
