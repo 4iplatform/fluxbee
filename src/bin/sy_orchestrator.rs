@@ -31,7 +31,6 @@ const MOTHERBEE_SSH_KEY_PATH: &str = "/var/lib/fluxbee/ssh/motherbee.key";
 const ORCH_SUDOERS_PATH: &str = "/etc/sudoers.d/fluxbee-orchestrator";
 const ORCH_SSH_GATE_PATH: &str = "/usr/local/bin/fluxbee-ssh-gate.sh";
 const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
-const RUNTIME_MANIFEST_FILE: &str = "runtime-manifest.json";
 const RUNTIME_MANIFEST_SCHEMA_VERSION: u64 = 1;
 const NATS_BOOTSTRAP_TIMEOUT_SECS: u64 = 20;
 const STORAGE_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
@@ -4100,15 +4099,8 @@ fn orchestrator_runtime_dir() -> PathBuf {
     json_router::paths::storage_root_dir().join("orchestrator")
 }
 
-fn orchestrator_runtime_manifest_path() -> PathBuf {
-    orchestrator_runtime_dir().join(RUNTIME_MANIFEST_FILE)
-}
-
 fn load_runtime_manifest() -> Option<RuntimeManifest> {
-    let primary = orchestrator_runtime_manifest_path();
-    let mut paths = vec![primary];
-    paths.extend(local_runtime_manifest_paths());
-    for path in paths {
+    for path in local_runtime_manifest_paths() {
         let data = match fs::read_to_string(&path) {
             Ok(data) => data,
             Err(_) => continue,
