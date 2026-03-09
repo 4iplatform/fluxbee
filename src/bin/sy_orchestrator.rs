@@ -2911,6 +2911,38 @@ fn reconcile_local_syncthing_folders(
     Ok(changed_folders)
 }
 
+fn ensure_syncthing_folder_marker(path: &Path) -> Result<bool, OrchestratorError> {
+    fs::create_dir_all(path)?;
+    let marker = path.join(".stfolder");
+    if marker.exists() {
+        return Ok(false);
+    }
+    fs::write(&marker, b"fluxbee syncthing marker\n")?;
+    Ok(true)
+}
+
+fn ensure_syncthing_folder_markers(
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) -> Result<Vec<String>, OrchestratorError> {
+    let mut repaired = Vec::new();
+
+    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        let blob_sync_path = blob_sync_folder_path(blob);
+        if ensure_syncthing_folder_marker(&blob_sync_path)? {
+            repaired.push(SYNCTHING_FOLDER_BLOB_ID.to_string());
+        }
+    }
+
+    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        if ensure_syncthing_folder_marker(&dist.path)? {
+            repaired.push(SYNCTHING_FOLDER_DIST_ID.to_string());
+        }
+    }
+
+    Ok(repaired)
+}
+
 async fn ensure_blob_sync_runtime(
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
@@ -2926,6 +2958,8 @@ async fn ensure_blob_sync_runtime(
         )
         .into());
     }
+
+    let repaired_markers = ensure_syncthing_folder_markers(blob, dist)?;
 
     ensure_syncthing_installed()?;
     ensure_local_syncthing_vendor_layout()?;
@@ -2943,11 +2977,12 @@ async fn ensure_blob_sync_runtime(
     .await?;
     wait_for_syncthing_health(&sync).await?;
     let changed_folders = reconcile_local_syncthing_folders(&sync, blob, dist)?;
-    if !changed_folders.is_empty() {
+    if !changed_folders.is_empty() || !repaired_markers.is_empty() {
         tracing::info!(
             service = SYNCTHING_SERVICE_NAME,
             folders = ?changed_folders,
-            "syncthing folder config reconciled locally; restarting service"
+            repaired_markers = ?repaired_markers,
+            "syncthing runtime reconciled locally; restarting service"
         );
         let mut restart = Command::new("systemctl");
         restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
