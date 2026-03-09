@@ -83,7 +83,14 @@ try:
 except Exception:
     print("")
     raise SystemExit(0)
-print(doc.get("payload", {}).get("status", ""))
+payload = doc.get("payload")
+if isinstance(payload, dict):
+    status = payload.get("status")
+    if isinstance(status, str) and status:
+        print(status)
+        raise SystemExit(0)
+status = doc.get("status")
+print(status if isinstance(status, str) else "")
 PY
 }
 
@@ -110,6 +117,10 @@ while (( $(date +%s) <= deadline )); do
     break
   fi
   if [[ "$sync_hint_status" == "sync_pending" ]]; then
+    sleep 2
+    continue
+  fi
+  if [[ "$sync_hint_resp" == *"TRANSPORT_ERROR"* || "$sync_hint_resp" == *"UNREACHABLE"* ]]; then
     sleep 2
     continue
   fi
