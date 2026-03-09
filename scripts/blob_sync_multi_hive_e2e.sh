@@ -162,6 +162,14 @@ wait_update_ok() {
       sleep 2
       continue
     fi
+    local payload_error_code payload_error_detail
+    payload_error_code="$(json_get "error_code" "$out_file")"
+    payload_error_detail="$(json_get "error_detail" "$out_file")"
+    if [[ "$payload_error_code" == "TRANSPORT_ERROR" && "$payload_error_detail" == *"UNREACHABLE"* ]]; then
+      echo "WARN: transient transport unreachable during runtime update (hive=$hive http=$http_status), retrying..." >&2
+      sleep 2
+      continue
+    fi
     echo "FAIL: update runtime status '$payload_status' (hive=$hive http=$http_status)" >&2
     if [[ -n "$http_status" && "$http_status" != "200" ]]; then
       echo "INFO: runtime update HTTP $http_status (hive=$hive)" >&2
@@ -170,6 +178,34 @@ wait_update_ok() {
     return 1
   done
   echo "FAIL: runtime update timeout waiting ok (hive=$hive)" >&2
+  cat "$out_file" >&2 || true
+  return 1
+}
+
+wait_hive_versions_reachable() {
+  local hive="$1"
+  local out_file="$2"
+  local timeout_secs="$3"
+  local deadline=$(( $(date +%s) + timeout_secs ))
+  while (( $(date +%s) <= deadline )); do
+    local status
+    status="$(http_call "GET" "$BASE/hives/$hive/versions" "$out_file")"
+    if [[ "$status" == "200" ]]; then
+      local top_status error_code error_detail
+      top_status="$(json_get "status" "$out_file")"
+      error_code="$(json_get "error_code" "$out_file")"
+      error_detail="$(json_get "error_detail" "$out_file")"
+      if [[ "$top_status" == "ok" ]]; then
+        return 0
+      fi
+      if [[ "$error_code" == "VERSIONS_FAILED" || "$error_code" == "TRANSPORT_ERROR" || "$error_detail" == *"UNREACHABLE"* ]]; then
+        sleep 2
+        continue
+      fi
+    fi
+    sleep 2
+  done
+  echo "FAIL: versions endpoint not reachable for hive '$hive' within ${timeout_secs}s" >&2
   cat "$out_file" >&2 || true
   return 1
 }
@@ -296,13 +332,13 @@ kill_worker_body="$tmpdir/kill_worker.json"
 echo "Blob multi-hive sync E2E (no SSH): BASE=$BASE LOCAL_HIVE_ID=$LOCAL_HIVE_ID WORKER_HIVE_ID=$WORKER_HIVE_ID TEST_ID=$TEST_ID"
 
 if [[ "$BUILD_BIN" == "1" || ! -x "$BIN_PATH" ]]; then
-  echo "Step 1/9: build blob_sync_diag"
+  echo "Step 1/10: build blob_sync_diag"
   (cd "$ROOT_DIR" && cargo build --release --bin blob_sync_diag)
 else
-  echo "Step 1/9: using existing blob_sync_diag at $BIN_PATH"
+  echo "Step 1/10: using existing blob_sync_diag at $BIN_PATH"
 fi
 
-echo "Step 2/9: create runtime fixtures in dist"
+echo "Step 2/10: create runtime fixtures in dist"
 producer_dir="$DIST_RUNTIMES_ROOT/$RUNTIME_PRODUCER/$RUNTIME_VERSION/bin"
 consumer_dir="$DIST_RUNTIMES_ROOT/$RUNTIME_CONSUMER/$RUNTIME_VERSION/bin"
 as_root_local mkdir -p "$producer_dir" "$consumer_dir" "$SCENARIO_ROOT"
@@ -421,7 +457,7 @@ EOF
 as_root_local install -m 0755 "$producer_start_tmp" "$producer_dir/start.sh"
 as_root_local install -m 0755 "$consumer_start_tmp" "$consumer_dir/start.sh"
 
-echo "Step 3/9: update runtime manifest with producer/consumer runtimes"
+echo "Step 3/10: update runtime manifest with producer/consumer runtimes"
 manifest_tmp="$tmpdir/manifest.json"
 as_root_local python3 - "$MANIFEST_PATH" "$RUNTIME_PRODUCER" "$RUNTIME_CONSUMER" "$RUNTIME_VERSION" >"$manifest_tmp" <<'PY'
 import json
@@ -492,7 +528,7 @@ if [[ -z "$manifest_version" || "$manifest_version" == "0" || -z "$manifest_hash
 fi
 echo "runtime manifest version=$manifest_version hash=$manifest_hash"
 
-echo "Step 4/9: prepare scenario files"
+echo "Step 4/10: prepare scenario files"
 as_root_local mkdir -p "$SCENARIO_ROOT"
 as_root_local rm -f \
   "$PRODUCER_STATUS_FILE" "$PRODUCER_LOG_FILE" "$PRODUCER_REF_FILE" "$PRODUCER_CONTRACT_FILE" "$PRODUCER_ACTIVE_FILE" \
@@ -513,15 +549,19 @@ JSR_LOG_LEVEL=info
 EOF
 as_root_local install -m 0644 "$scenario_tmp" "$SCENARIO_ENV"
 
-echo "Step 5/9: SYSTEM_UPDATE runtime on local + worker"
+echo "Step 5/10: wait hives reachable in versions endpoint"
+wait_hive_versions_reachable "$LOCAL_HIVE_ID" "$versions_local_body" "$WAIT_RUNTIME_READY_SECS"
+wait_hive_versions_reachable "$WORKER_HIVE_ID" "$versions_worker_body" "$WAIT_RUNTIME_READY_SECS"
+
+echo "Step 6/10: SYSTEM_UPDATE runtime on local + worker"
 wait_update_ok "$LOCAL_HIVE_ID" "$manifest_version" "$manifest_hash" "$update_local_body"
 wait_update_ok "$WORKER_HIVE_ID" "$manifest_version" "$manifest_hash" "$update_worker_body"
 
-echo "Step 6/9: wait runtimes ready in versions endpoint"
+echo "Step 7/10: wait runtimes ready in versions endpoint"
 wait_runtime_ready "$LOCAL_HIVE_ID" "$RUNTIME_PRODUCER" "$versions_local_body"
 wait_runtime_ready "$WORKER_HIVE_ID" "$RUNTIME_CONSUMER" "$versions_worker_body"
 
-echo "Step 7/9: run producer (local) and consumer (worker)"
+echo "Step 8/10: run producer (local) and consumer (worker)"
 spawn_node "$LOCAL_HIVE_ID" "$PRODUCER_NODE_NAME" "$RUNTIME_PRODUCER" "$spawn_local_body"
 spawn_node "$WORKER_HIVE_ID" "$CONSUMER_NODE_NAME" "$RUNTIME_CONSUMER" "$spawn_worker_body"
 
@@ -531,11 +571,11 @@ cleanup_nodes() {
 }
 trap 'cleanup_nodes; rm -rf "$tmpdir"' EXIT
 
-echo "Step 8/9: wait producer/consumer status (via dist sync)"
+echo "Step 9/10: wait producer/consumer status (via dist sync)"
 wait_status_file_value "$PRODUCER_STATUS_FILE" "ok" "$WAIT_STATUS_SECS"
 wait_status_file_value "$CONSUMER_STATUS_FILE" "ok" "$WAIT_STATUS_SECS"
 
-echo "Step 9/9: summary + cleanup"
+echo "Step 10/10: summary + cleanup"
 consumer_elapsed="$(as_root_local cat "$CONSUMER_ELAPSED_FILE" 2>/dev/null || true)"
 consumer_path="$(as_root_local cat "$CONSUMER_PATH_FILE" 2>/dev/null || true)"
 contract_signature="$(as_root_local cat "$PRODUCER_CONTRACT_FILE" 2>/dev/null || true)"
