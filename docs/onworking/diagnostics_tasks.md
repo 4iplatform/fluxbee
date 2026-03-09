@@ -66,7 +66,8 @@ Alcance:
 - Binario: `src/bin/blob_sync_diag.rs` (local + remoto)
 - Propósito:
   - validar replicación real motherbee -> worker sin `copy mode`,
-  - ejecutar consumo remoto con `resolve_with_retry` sobre `blob.path` del worker,
+  - ejecutar producer/consumer como runtimes reales via `SYSTEM_UPDATE` + `run_node` (sin SSH),
+  - ejecutar consumo en worker con `resolve_with_retry` sobre `blob.path` del worker,
   - producir resumen operativo (`resolved_path_remote`, `consumer_retry_elapsed_ms`, `contract_signature`).
 
 ## 2) Variables de diagnóstico (catálogo operativo)
@@ -169,11 +170,15 @@ Alcance:
 ## 2.7 `blob_sync_multi_hive_e2e.sh` + `blob_sync_diag.rs`
 - `BUILD_BIN`
 - `BLOB_DIAG_BIN_PATH`
-- `HIVE_ADDR`
-- `HIVE_USER`
-- `HIVE_KEY`
+- `BASE`
+- `WORKER_HIVE_ID`
+- `LOCAL_HIVE_ID`
 - `BLOB_ROOT_LOCAL`
 - `BLOB_ROOT_REMOTE`
+- `TEST_ID`
+- `WAIT_STATUS_SECS`
+- `WAIT_UPDATE_SECS`
+- `WAIT_RUNTIME_READY_SECS`
 - `BLOB_DIAG_FILENAME`
 - `BLOB_DIAG_CONTENT`
 - `BLOB_DIAG_MIME`
@@ -181,7 +186,6 @@ Alcance:
 - `BLOB_DIAG_RETRY_MAX_WAIT_MS`
 - `BLOB_DIAG_RETRY_INITIAL_MS`
 - `BLOB_DIAG_RETRY_BACKOFF`
-- `BLOB_DIAG_SYNCTHING_SERVICE`
 - `JSR_LOG_LEVEL`
 - `SHOW_FULL_LOGS`
 
@@ -257,7 +261,7 @@ Alcance:
   - `RESOLVED_BYTES`,
   - `CONTRACT_SIGNATURE` (productor).
 - Suite `blob_sync_multi_hive_e2e.sh`:
-  - `mode=real_syncthing_multi_hive`,
+  - `mode=real_syncthing_multi_hive_via_run_node`,
   - `active_path_local`,
   - `resolved_path_remote`,
   - `consumer_retry_elapsed_ms`,
@@ -348,9 +352,9 @@ Blob sync E2E multi-isla real (motherbee -> worker por Syncthing):
 ```bash
 sudo -v
 BUILD_BIN=0 \
-HIVE_ADDR=192.168.8.220 \
-HIVE_USER=administrator \
-HIVE_KEY=/var/lib/fluxbee/ssh/motherbee.key \
+BASE=http://127.0.0.1:8080 \
+WORKER_HIVE_ID=worker-220 \
+LOCAL_HIVE_ID=sandbox \
 BLOB_ROOT_LOCAL=/var/lib/fluxbee/blob \
 BLOB_ROOT_REMOTE=/var/lib/fluxbee/blob \
 BLOB_DIAG_RETRY_MAX_WAIT_MS=180000 \

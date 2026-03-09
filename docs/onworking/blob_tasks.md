@@ -107,7 +107,7 @@ Contexto:
 - [x] X2. Garantizar que Syncthing replique solo `blob/active` (no `staging`).
   - Avance (2026-03-09): reconciliación de carpeta `fluxbee-blob` en orchestrator apuntando a `<blob.path>/active` (local + peer link), y bootstrap remoto creando `active/` + `staging/`.
 - [ ] X3. E2E real multi-isla (sin modo `copy`): archivo en isla A visible en isla B por Syncthing y consumo con `resolve_with_retry`.
-  - Avance (2026-03-09): script `scripts/blob_sync_multi_hive_e2e.sh` agregado (producer local en motherbee + consumer remoto en worker con `resolve_with_retry`, sin `copy mode`).
+  - Avance (2026-03-09): `scripts/blob_sync_multi_hive_e2e.sh` migrado a flujo productivo (`SYSTEM_UPDATE` + `run_node` local/worker), sin SSH, validando consumer en worker por `resolve_with_retry`.
 
 Salida:
 - replicación de blobs validada end-to-end con Syncthing real entre hives.
