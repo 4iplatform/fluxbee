@@ -68,7 +68,8 @@ Alcance:
   - validar replicación real motherbee -> worker sin `copy mode`,
   - ejecutar producer/consumer como runtimes reales via `SYSTEM_UPDATE` + `run_node` (sin SSH),
   - ejecutar consumo en worker con `resolve_with_retry` sobre `blob.path` del worker,
-  - producir resumen operativo (`resolved_path_remote`, `consumer_retry_elapsed_ms`, `contract_signature`).
+  - producir resumen operativo (`resolved_path_remote`, `consumer_retry_elapsed_ms`, `contract_signature`),
+  - publicar resumen agregable (`blob_stats_summary_json`) con volumen/errores y percentiles de latencia.
 
 ## 2) Variables de diagnóstico (catálogo operativo)
 
@@ -259,13 +260,20 @@ Alcance:
 - Binario `blob_sync_diag.rs`:
   - `ELAPSED_MS` en consumidor (`resolve_with_retry`),
   - `RESOLVED_BYTES`,
-  - `CONTRACT_SIGNATURE` (productor).
+  - `CONTRACT_SIGNATURE` (productor),
+  - `BLOB_METRICS_JSON` (`blob_put_total`, `blob_put_bytes_total`, `blob_resolve_total`, `blob_resolve_retry_total`, `blob_errors_total`).
 - Suite `blob_sync_multi_hive_e2e.sh`:
   - `mode=real_syncthing_multi_hive_via_run_node`,
   - `active_path_local`,
   - `resolved_path_remote`,
   - `consumer_retry_elapsed_ms`,
-  - `contract_signature`.
+  - `contract_signature`,
+  - `producer_metrics_json`,
+  - `consumer_metrics_json`,
+  - `blob_stats_summary_json`:
+    - `blob_stats.consumer_retry_elapsed_ms.{count,p50,p95,max}`,
+    - `blob_stats.volume.{blob_put_bytes_total,blob_resolved_bytes_total}`,
+    - `blob_stats.errors.blob_errors_total`.
 
 ### 3.7 Blob SDK (estado actual implementado)
 - Cobertura funcional actual en `fluxbee_sdk`:
@@ -380,7 +388,7 @@ OPA_EXPECT_STATUS=ok OPA_MIN_VERSION=1 OPA_MAX_HEARTBEAT_AGE_MS=30000 \
 - [ ] Implementar resumen compacto de métricas de transporte en suite JetStream envelope (`sent/acked/redelivered/replayed/timeouts/reconnects/p50-p95-max`).
 - [x] Implementar suite Blob E2E (`blob_ref` + verificación end-to-end por contenido) con salida compacta y resumen.
 - [ ] Extender suite Blob E2E con hash end-to-end (`sha256`) en salida estándar.
-- [ ] Incorporar resumen de Blob Stats en formato agregable (`count/p50/p95/max`, errores y volumen).
+- [x] Incorporar resumen de Blob Stats en formato agregable (`count/p50/p95/max`, errores y volumen).
 
 Nota de coordinación con backlog Blob:
 - las decisiones funcionales de publicación confirmada (`SYSTEM_SYNC_HINT`, gate de emisión y pipeline dist) se gestionan en `docs/onworking/blob_tasks.md` (`BLOB-X12..X15`).

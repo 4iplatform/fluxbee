@@ -15,6 +15,10 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+use fluxbee_sdk::blob::{
+    BlobConfig as SdkBlobConfig, BlobGcOptions, BlobToolkit, BLOB_ACTIVE_RETAIN_DAYS,
+    BLOB_NAME_MAX_CHARS, BLOB_STAGING_TTL_HOURS,
+};
 use fluxbee_sdk::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
@@ -89,6 +93,13 @@ const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
 const DEFAULT_BLOB_SYNC_TOOL: &str = "syncthing";
 const DEFAULT_BLOB_SYNC_API_PORT: u16 = 8384;
 const DEFAULT_BLOB_SYNC_DATA_DIR: &str = "/var/lib/fluxbee/syncthing";
+const DEFAULT_BLOB_SYNC_SERVICE_USER: &str = SYNCTHING_INSTALL_USER;
+const DEFAULT_BLOB_SYNC_ALLOW_ROOT_FALLBACK: bool = true;
+const DEFAULT_BLOB_GC_ENABLED: bool = false;
+const DEFAULT_BLOB_GC_INTERVAL_SECS: u64 = 3600;
+const DEFAULT_BLOB_GC_APPLY: bool = false;
+const DEFAULT_BLOB_GC_STAGING_TTL_HOURS: u64 = BLOB_STAGING_TTL_HOURS;
+const DEFAULT_BLOB_GC_ACTIVE_RETAIN_DAYS: u64 = BLOB_ACTIVE_RETAIN_DAYS;
 const DEFAULT_DIST_PATH: &str = DIST_ROOT_DIR;
 const DEFAULT_DIST_SYNC_ENABLED: bool = true;
 const DEFAULT_DIST_SYNC_TOOL: &str = "syncthing";
@@ -133,6 +144,7 @@ struct BlobSection {
     enabled: Option<bool>,
     path: Option<String>,
     sync: Option<BlobSyncSection>,
+    gc: Option<BlobGcSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +153,17 @@ struct BlobSyncSection {
     tool: Option<String>,
     api_port: Option<u16>,
     data_dir: Option<String>,
+    service_user: Option<String>,
+    allow_root_fallback: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobGcSection {
+    enabled: Option<bool>,
+    interval_secs: Option<u64>,
+    apply: Option<bool>,
+    staging_ttl_hours: Option<u64>,
+    active_retain_days: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +186,13 @@ struct BlobRuntimeConfig {
     sync_tool: String,
     sync_api_port: u16,
     sync_data_dir: PathBuf,
+    sync_service_user: String,
+    sync_allow_root_fallback: bool,
+    gc_enabled: bool,
+    gc_interval_secs: u64,
+    gc_apply: bool,
+    gc_staging_ttl_hours: u64,
+    gc_active_retain_days: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +332,7 @@ struct OrchestratorState {
     system_allowed_origins: HashSet<String>,
     runtime_manifest: Mutex<Option<RuntimeManifest>>,
     last_runtime_verify: Mutex<Instant>,
+    last_blob_gc: Mutex<Instant>,
     nats_endpoint: String,
     blob: BlobRuntimeConfig,
     dist: DistRuntimeConfig,
@@ -375,6 +406,7 @@ async fn main() -> Result<(), OrchestratorError> {
         system_allowed_origins,
         runtime_manifest: Mutex::new(runtime_manifest),
         last_runtime_verify: Mutex::new(Instant::now()),
+        last_blob_gc: Mutex::new(Instant::now()),
         nats_endpoint,
         blob: blob_runtime.clone(),
         dist: dist_runtime,
@@ -387,6 +419,11 @@ async fn main() -> Result<(), OrchestratorError> {
         blob_sync_tool = %state.blob.sync_tool,
         blob_sync_api_port = state.blob.sync_api_port,
         blob_sync_data_dir = %state.blob.sync_data_dir.display(),
+        blob_gc_enabled = state.blob.gc_enabled,
+        blob_gc_interval_secs = state.blob.gc_interval_secs,
+        blob_gc_apply = state.blob.gc_apply,
+        blob_gc_staging_ttl_hours = state.blob.gc_staging_ttl_hours,
+        blob_gc_active_retain_days = state.blob.gc_active_retain_days,
         dist_path = %state.dist.path.display(),
         dist_sync_enabled = state.dist.sync_enabled,
         dist_sync_tool = %state.dist.sync_tool,
@@ -767,6 +804,19 @@ async fn watchdog_tick(state: &OrchestratorState) {
     if should_verify_runtimes(state).await {
         if let Err(err) = runtime_verify_and_retain(state).await {
             tracing::warn!(error = %err, "runtime verify/sync failed");
+        }
+    }
+
+    let desired_blob = current_blob_runtime_config(state);
+    if should_run_blob_gc(
+        state,
+        desired_blob.gc_enabled,
+        desired_blob.gc_interval_secs,
+    )
+    .await
+    {
+        if let Err(err) = run_blob_gc_housekeeping(state, &desired_blob) {
+            tracing::warn!(error = %err, "blob gc housekeeping failed");
         }
     }
 
@@ -2066,6 +2116,13 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
     let mut sync_tool = DEFAULT_BLOB_SYNC_TOOL.to_string();
     let mut sync_api_port = DEFAULT_BLOB_SYNC_API_PORT;
     let mut sync_data_dir = PathBuf::from(DEFAULT_BLOB_SYNC_DATA_DIR);
+    let mut sync_service_user = DEFAULT_BLOB_SYNC_SERVICE_USER.to_string();
+    let mut sync_allow_root_fallback = DEFAULT_BLOB_SYNC_ALLOW_ROOT_FALLBACK;
+    let mut gc_enabled = DEFAULT_BLOB_GC_ENABLED;
+    let mut gc_interval_secs = DEFAULT_BLOB_GC_INTERVAL_SECS;
+    let mut gc_apply = DEFAULT_BLOB_GC_APPLY;
+    let mut gc_staging_ttl_hours = DEFAULT_BLOB_GC_STAGING_TTL_HOURS;
+    let mut gc_active_retain_days = DEFAULT_BLOB_GC_ACTIVE_RETAIN_DAYS;
 
     if let Some(blob) = hive.blob.as_ref() {
         if let Some(value) = blob.enabled {
@@ -2096,6 +2153,32 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
                     sync_data_dir = PathBuf::from(value);
                 }
             }
+            if let Some(value) = sync.service_user.as_ref() {
+                let value = value.trim();
+                if !value.is_empty() {
+                    sync_service_user = value.to_string();
+                }
+            }
+            if let Some(value) = sync.allow_root_fallback {
+                sync_allow_root_fallback = value;
+            }
+        }
+        if let Some(gc) = blob.gc.as_ref() {
+            if let Some(value) = gc.enabled {
+                gc_enabled = value;
+            }
+            if let Some(value) = gc.interval_secs {
+                gc_interval_secs = value.max(60);
+            }
+            if let Some(value) = gc.apply {
+                gc_apply = value;
+            }
+            if let Some(value) = gc.staging_ttl_hours {
+                gc_staging_ttl_hours = value.max(1);
+            }
+            if let Some(value) = gc.active_retain_days {
+                gc_active_retain_days = value.max(1);
+            }
         }
     }
 
@@ -2106,6 +2189,13 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
         sync_tool,
         sync_api_port,
         sync_data_dir,
+        sync_service_user,
+        sync_allow_root_fallback,
+        gc_enabled,
+        gc_interval_secs,
+        gc_apply,
+        gc_staging_ttl_hours,
+        gc_active_retain_days,
     }
 }
 
@@ -2179,12 +2269,26 @@ fn ensure_dirs(
     fs::create_dir_all(opa_root.join("backup"))?;
     fs::create_dir_all(storage_root.join("nats"))?;
     if blob.enabled {
-        fs::create_dir_all(&blob.path)?;
-        fs::create_dir_all(blob.path.join("active"))?;
-        fs::create_dir_all(blob.path.join("staging"))?;
+        ensure_dir_permissions_0750(&blob.path)?;
+        ensure_dir_permissions_0750(&blob.path.join("active"))?;
+        ensure_dir_permissions_0750(&blob.path.join("staging"))?;
     }
     if blob.sync_enabled {
-        fs::create_dir_all(&blob.sync_data_dir)?;
+        ensure_dir_permissions_0750(&blob.sync_data_dir)?;
+    }
+    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        let service_user = resolve_syncthing_service_user(blob)?;
+        if service_user == "root" {
+            ensure_owned_dir(&blob.path, "root")?;
+            ensure_owned_dir(&blob.path.join("active"), "root")?;
+            ensure_owned_dir(&blob.path.join("staging"), "root")?;
+            ensure_owned_dir(&blob.sync_data_dir, "root")?;
+        } else {
+            ensure_owned_dir(&blob.path, &service_user)?;
+            ensure_owned_dir(&blob.path.join("active"), &service_user)?;
+            ensure_owned_dir(&blob.path.join("staging"), &service_user)?;
+            ensure_owned_dir(&blob.sync_data_dir, &service_user)?;
+        }
     }
     fs::create_dir_all(&dist.path)?;
     fs::create_dir_all(dist.path.join("runtimes"))?;
@@ -2258,6 +2362,59 @@ fn linux_user_exists(user: &str) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn linux_user_primary_group(user: &str) -> Option<String> {
+    let mut cmd = Command::new("id");
+    cmd.arg("-gn").arg(user);
+    let out = run_cmd_output(cmd, "id -gn").ok()?;
+    let value = out.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn resolve_syncthing_service_user(blob: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
+    let requested = blob.sync_service_user.trim();
+    let requested = if requested.is_empty() {
+        DEFAULT_BLOB_SYNC_SERVICE_USER
+    } else {
+        requested
+    };
+    if linux_user_exists(requested) {
+        return Ok(requested.to_string());
+    }
+    if blob.sync_allow_root_fallback {
+        tracing::warn!(
+            user = requested,
+            allow_root_fallback = blob.sync_allow_root_fallback,
+            "syncthing service user missing; using explicit root fallback"
+        );
+        return Ok("root".to_string());
+    }
+    Err(format!(
+        "linux user '{}' not found and blob.sync.allow_root_fallback=false",
+        requested
+    )
+    .into())
+}
+
+fn ensure_dir_permissions_0750(path: &Path) -> Result<(), OrchestratorError> {
+    fs::create_dir_all(path)?;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o750);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+fn ensure_owned_dir(path: &Path, user: &str) -> Result<(), OrchestratorError> {
+    ensure_dir_permissions_0750(path)?;
+    let group = linux_user_primary_group(user).unwrap_or_else(|| user.to_string());
+    let mut chown = Command::new("chown");
+    chown.arg(format!("{user}:{group}")).arg(path);
+    run_cmd(chown, "chown syncthing dir ownership")
 }
 
 fn syncthing_binary_available() -> bool {
@@ -2577,13 +2734,10 @@ fn ensure_local_syncthing_vendor_layout() -> Result<(), OrchestratorError> {
 }
 
 fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> String {
-    let service_group = if linux_user_exists(service_user) {
-        service_user
-    } else {
-        "root"
-    };
+    let service_group =
+        linux_user_primary_group(service_user).unwrap_or_else(|| service_user.to_string());
     format!(
-        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nEnvironment=HOME={}\nExecStart={} --no-browser --no-restart --home={} --gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nEnvironment=HOME={}\nUMask=0027\nExecStart={} --no-browser --no-restart --home={} --gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
         service_user,
         service_group,
         blob.sync_data_dir.display(),
@@ -2595,15 +2749,7 @@ fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> Stri
 }
 
 fn ensure_syncthing_unit(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {
-    let service_user = if linux_user_exists(SYNCTHING_INSTALL_USER) {
-        SYNCTHING_INSTALL_USER.to_string()
-    } else {
-        tracing::warn!(
-            user = SYNCTHING_INSTALL_USER,
-            "linux user not found; running syncthing as root"
-        );
-        "root".to_string()
-    };
+    let service_user = resolve_syncthing_service_user(blob)?;
     let unit_contents = syncthing_unit_contents(blob, &service_user);
     let unit_path =
         Path::new("/etc/systemd/system").join(format!("{SYNCTHING_SERVICE_NAME}.service"));
@@ -4668,6 +4814,67 @@ async fn should_verify_runtimes(state: &OrchestratorState) -> bool {
     }
     *guard = Instant::now();
     true
+}
+
+async fn should_run_blob_gc(
+    state: &OrchestratorState,
+    gc_enabled: bool,
+    gc_interval_secs: u64,
+) -> bool {
+    if !gc_enabled {
+        return false;
+    }
+    let mut guard = state.last_blob_gc.lock().await;
+    if guard.elapsed() < Duration::from_secs(gc_interval_secs.max(60)) {
+        return false;
+    }
+    *guard = Instant::now();
+    true
+}
+
+fn run_blob_gc_housekeeping(
+    _state: &OrchestratorState,
+    blob: &BlobRuntimeConfig,
+) -> Result<(), OrchestratorError> {
+    if !(blob.enabled && blob.gc_enabled) {
+        return Ok(());
+    }
+    let toolkit = BlobToolkit::new(SdkBlobConfig {
+        blob_root: blob.path.clone(),
+        name_max_chars: BLOB_NAME_MAX_CHARS,
+        max_blob_bytes: None,
+    })?;
+    let report = toolkit.run_gc(BlobGcOptions {
+        staging_ttl_hours: blob.gc_staging_ttl_hours,
+        active_retain_days: blob.gc_active_retain_days,
+        apply: blob.gc_apply,
+    })?;
+
+    if report.staging.candidate_files > 0 || report.active.candidate_files > 0 {
+        tracing::info!(
+            apply = report.apply,
+            staging_ttl_hours = report.staging_ttl_hours,
+            active_retain_days = report.active_retain_days,
+            staging_candidates = report.staging.candidate_files,
+            staging_deleted = report.staging.deleted_files,
+            staging_deleted_bytes = report.staging.deleted_bytes,
+            active_candidates = report.active.candidate_files,
+            active_deleted = report.active.deleted_files,
+            active_deleted_bytes = report.active.deleted_bytes,
+            "blob gc housekeeping completed"
+        );
+    }
+
+    if !report.staging.errors.is_empty() || !report.active.errors.is_empty() {
+        tracing::warn!(
+            staging_errors = report.staging.errors.len(),
+            active_errors = report.active.errors.len(),
+            first_staging_error = report.staging.errors.first().cloned().unwrap_or_default(),
+            first_active_error = report.active.errors.first().cloned().unwrap_or_default(),
+            "blob gc housekeeping finished with errors"
+        );
+    }
+    Ok(())
 }
 
 async fn runtime_verify_and_retain(state: &OrchestratorState) -> Result<(), OrchestratorError> {
@@ -6856,7 +7063,7 @@ async fn add_hive_flow(
                 .to_string()
         });
     let hive_yaml = format!(
-        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n",
+        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n",
         hive_id,
         worker_uplink,
         storage_path,
@@ -6866,6 +7073,11 @@ async fn add_hive_flow(
         desired_blob.sync_tool,
         desired_blob.sync_api_port,
         desired_blob.sync_data_dir.display(),
+        desired_blob.gc_enabled,
+        desired_blob.gc_interval_secs,
+        desired_blob.gc_apply,
+        desired_blob.gc_staging_ttl_hours,
+        desired_blob.gc_active_retain_days,
         desired_dist.path.display(),
         desired_dist.sync_enabled,
         desired_dist.sync_tool
@@ -8388,6 +8600,13 @@ mod tests {
             sync_tool: "syncthing".to_string(),
             sync_api_port: 8384,
             sync_data_dir: PathBuf::from("/var/lib/fluxbee/syncthing"),
+            sync_service_user: DEFAULT_BLOB_SYNC_SERVICE_USER.to_string(),
+            sync_allow_root_fallback: DEFAULT_BLOB_SYNC_ALLOW_ROOT_FALLBACK,
+            gc_enabled: DEFAULT_BLOB_GC_ENABLED,
+            gc_interval_secs: DEFAULT_BLOB_GC_INTERVAL_SECS,
+            gc_apply: DEFAULT_BLOB_GC_APPLY,
+            gc_staging_ttl_hours: DEFAULT_BLOB_GC_STAGING_TTL_HOURS,
+            gc_active_retain_days: DEFAULT_BLOB_GC_ACTIVE_RETAIN_DAYS,
         }
     }
 
@@ -8397,6 +8616,59 @@ mod tests {
             sync_enabled: true,
             sync_tool: "syncthing".to_string(),
         }
+    }
+
+    #[test]
+    fn resolve_syncthing_service_user_accepts_existing_user() {
+        let mut blob = sample_blob_config();
+        blob.sync_service_user = "root".to_string();
+        blob.sync_allow_root_fallback = false;
+        let effective = resolve_syncthing_service_user(&blob).expect("resolve user");
+        assert_eq!(effective, "root");
+    }
+
+    #[test]
+    fn resolve_syncthing_service_user_rejects_missing_without_fallback() {
+        let mut blob = sample_blob_config();
+        blob.sync_service_user = format!("missing-{}", Uuid::new_v4());
+        blob.sync_allow_root_fallback = false;
+        let err = resolve_syncthing_service_user(&blob).expect_err("must fail");
+        assert!(err.to_string().contains("allow_root_fallback=false"));
+    }
+
+    #[test]
+    fn blob_runtime_from_hive_defaults_include_gc() {
+        let hive: HiveFile = serde_yaml::from_str("hive_id: sandbox\n").expect("parse hive");
+        let blob = blob_runtime_from_hive(&hive);
+        assert_eq!(blob.gc_enabled, DEFAULT_BLOB_GC_ENABLED);
+        assert_eq!(blob.gc_interval_secs, DEFAULT_BLOB_GC_INTERVAL_SECS);
+        assert_eq!(blob.gc_apply, DEFAULT_BLOB_GC_APPLY);
+        assert_eq!(blob.gc_staging_ttl_hours, DEFAULT_BLOB_GC_STAGING_TTL_HOURS);
+        assert_eq!(
+            blob.gc_active_retain_days,
+            DEFAULT_BLOB_GC_ACTIVE_RETAIN_DAYS
+        );
+    }
+
+    #[test]
+    fn blob_runtime_from_hive_parses_gc_overrides() {
+        let hive_yaml = r#"
+hive_id: sandbox
+blob:
+  gc:
+    enabled: true
+    interval_secs: 1800
+    apply: true
+    staging_ttl_hours: 12
+    active_retain_days: 45
+"#;
+        let hive: HiveFile = serde_yaml::from_str(hive_yaml).expect("parse hive");
+        let blob = blob_runtime_from_hive(&hive);
+        assert!(blob.gc_enabled);
+        assert_eq!(blob.gc_interval_secs, 1800);
+        assert!(blob.gc_apply);
+        assert_eq!(blob.gc_staging_ttl_hours, 12);
+        assert_eq!(blob.gc_active_retain_days, 45);
     }
 
     #[test]

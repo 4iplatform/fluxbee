@@ -12,7 +12,10 @@ Nota de alcance:
 use fluxbee_sdk::blob::{BlobConfig, BlobToolkit};
 use fluxbee_sdk::payload::TextV1Payload;
 
-let blob = BlobToolkit::new(BlobConfig::default())?;
+let blob = BlobToolkit::new(BlobConfig {
+    max_blob_bytes: Some(100 * 1024 * 1024), // 100MB
+    ..BlobConfig::default()
+})?;
 
 // 1) guardar archivo en staging
 let blob_ref = blob.put("/tmp/incoming/factura.png".as_ref(), "Factura Marzo 2026.png")?;
@@ -31,7 +34,10 @@ let payload_json = payload.to_value()?;
 use fluxbee_sdk::blob::{BlobConfig, BlobToolkit};
 use fluxbee_sdk::payload::TextV1Payload;
 
-let blob = BlobToolkit::new(BlobConfig::default())?;
+let blob = BlobToolkit::new(BlobConfig {
+    max_blob_bytes: Some(100 * 1024 * 1024),
+    ..BlobConfig::default()
+})?;
 
 let pdf_bytes: Vec<u8> = generar_pdf();
 let pdf_ref = blob.put_bytes(&pdf_bytes, "respuesta.pdf", "application/pdf")?;
@@ -46,7 +52,10 @@ let payload_json = payload.to_value()?;
 ```rust
 use fluxbee_sdk::blob::{BlobConfig, BlobToolkit};
 
-let blob = BlobToolkit::new(BlobConfig::default())?;
+let blob = BlobToolkit::new(BlobConfig {
+    max_blob_bytes: Some(100 * 1024 * 1024),
+    ..BlobConfig::default()
+})?;
 let texto_largo = construir_resumen_largo();
 
 // Si supera límite estimado de mensaje, crea content_ref automáticamente.
@@ -60,7 +69,10 @@ let payload_json = payload.to_value()?;
 use fluxbee_sdk::blob::{BlobConfig, BlobToolkit, ResolveRetryConfig};
 use fluxbee_sdk::payload::TextV1Payload;
 
-let blob = BlobToolkit::new(BlobConfig::default())?;
+let blob = BlobToolkit::new(BlobConfig {
+    max_blob_bytes: Some(100 * 1024 * 1024),
+    ..BlobConfig::default()
+})?;
 let payload: TextV1Payload = TextV1Payload::from_value(&payload_json)?;
 
 for attachment in payload.attachments {
@@ -83,6 +95,7 @@ for attachment in payload.attachments {
 - Si hay `content_ref`, no incluir `content`.
 - En multi-isla, preferir publicación con confirmación (`publish_blob_and_confirm`) antes de enviar el mensaje.
 - El consumidor debe mantener `resolve_with_retry` como red de seguridad ante convergencia tardía.
+- Configurar `BlobConfig.max_blob_bytes` según política de canal para recibir `BLOB_TOO_LARGE` de forma explícita.
 
 ## 6) Propuesta v2.x (pendiente): llamada unificada en SDK con confirmación
 

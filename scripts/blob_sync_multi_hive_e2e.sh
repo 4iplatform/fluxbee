@@ -429,6 +429,117 @@ wait_status_file_value() {
   return 1
 }
 
+extract_last_log_kv() {
+  local log_file="$1"
+  local key="$2"
+  if ! as_root_local test -f "$log_file"; then
+    echo ""
+    return 0
+  fi
+  as_root_local awk -v k="$key" '
+    index($0, k "=") == 1 { val = substr($0, length(k) + 2) }
+    END { print val }
+  ' "$log_file"
+}
+
+build_blob_stats_summary_json() {
+  local producer_metrics_json="$1"
+  local consumer_metrics_json="$2"
+  local consumer_elapsed_ms="$3"
+  local consumer_resolved_bytes="$4"
+  local producer_status="$5"
+  local consumer_status="$6"
+  local test_id="$7"
+  local local_hive_id="$8"
+  local worker_hive_id="$9"
+  PRODUCER_METRICS_JSON="$producer_metrics_json" \
+  CONSUMER_METRICS_JSON="$consumer_metrics_json" \
+  CONSUMER_ELAPSED_MS="$consumer_elapsed_ms" \
+  CONSUMER_RESOLVED_BYTES="$consumer_resolved_bytes" \
+  PRODUCER_STATUS="$producer_status" \
+  CONSUMER_STATUS="$consumer_status" \
+  TEST_ID="$test_id" \
+  LOCAL_HIVE_ID="$local_hive_id" \
+  WORKER_HIVE_ID="$worker_hive_id" \
+  python3 - <<'PY'
+import json
+import math
+import os
+
+def parse_json(raw: str):
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        val = json.loads(raw)
+        return val if isinstance(val, dict) else {}
+    except Exception:
+        return {}
+
+def parse_int(raw: str):
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return None
+
+def percentile(values, p):
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, math.ceil((p / 100.0) * len(ordered)))
+    return ordered[rank - 1]
+
+producer = parse_json(os.getenv("PRODUCER_METRICS_JSON", ""))
+consumer = parse_json(os.getenv("CONSUMER_METRICS_JSON", ""))
+
+fields = [
+    "blob_put_total",
+    "blob_put_bytes_total",
+    "blob_resolve_total",
+    "blob_resolve_retry_total",
+    "blob_errors_total",
+]
+ops = {k: int(producer.get(k, 0) or 0) + int(consumer.get(k, 0) or 0) for k in fields}
+
+elapsed = parse_int(os.getenv("CONSUMER_ELAPSED_MS", ""))
+elapsed_samples = [elapsed] if elapsed is not None and elapsed >= 0 else []
+resolved_bytes = parse_int(os.getenv("CONSUMER_RESOLVED_BYTES", ""))
+if resolved_bytes is None or resolved_bytes < 0:
+    resolved_bytes = 0
+
+producer_status = (os.getenv("PRODUCER_STATUS", "") or "").strip()
+consumer_status = (os.getenv("CONSUMER_STATUS", "") or "").strip()
+
+summary = {
+    "status": "ok" if producer_status == "ok" and consumer_status == "ok" else "error",
+    "test_id": os.getenv("TEST_ID", ""),
+    "hives": {
+        "local": os.getenv("LOCAL_HIVE_ID", ""),
+        "worker": os.getenv("WORKER_HIVE_ID", ""),
+    },
+    "blob_stats": {
+        "ops": ops,
+        "volume": {
+            "blob_put_bytes_total": ops["blob_put_bytes_total"],
+            "blob_resolved_bytes_total": resolved_bytes,
+        },
+        "errors": {
+            "blob_errors_total": ops["blob_errors_total"],
+            "producer_status": producer_status,
+            "consumer_status": consumer_status,
+        },
+        "consumer_retry_elapsed_ms": {
+            "count": len(elapsed_samples),
+            "p50": percentile(elapsed_samples, 50),
+            "p95": percentile(elapsed_samples, 95),
+            "max": max(elapsed_samples) if elapsed_samples else None,
+        },
+    },
+}
+print(json.dumps(summary, separators=(",", ":"), sort_keys=True))
+PY
+}
+
 require_cmd cargo
 require_cmd curl
 require_cmd python3
@@ -770,6 +881,23 @@ consumer_elapsed="$(as_root_local cat "$CONSUMER_ELAPSED_FILE" 2>/dev/null || tr
 consumer_path="$(as_root_local cat "$CONSUMER_PATH_FILE" 2>/dev/null || true)"
 contract_signature="$(as_root_local cat "$PRODUCER_CONTRACT_FILE" 2>/dev/null || true)"
 active_local="$(as_root_local cat "$PRODUCER_ACTIVE_FILE" 2>/dev/null || true)"
+producer_status="$(as_root_local cat "$PRODUCER_STATUS_FILE" 2>/dev/null || true)"
+consumer_status="$(as_root_local cat "$CONSUMER_STATUS_FILE" 2>/dev/null || true)"
+producer_metrics_json="$(extract_last_log_kv "$PRODUCER_LOG_FILE" "BLOB_METRICS_JSON")"
+consumer_metrics_json="$(extract_last_log_kv "$CONSUMER_LOG_FILE" "BLOB_METRICS_JSON")"
+consumer_resolved_bytes="$(extract_last_log_kv "$CONSUMER_LOG_FILE" "RESOLVED_BYTES")"
+blob_stats_summary_json="$(
+  build_blob_stats_summary_json \
+    "$producer_metrics_json" \
+    "$consumer_metrics_json" \
+    "$consumer_elapsed" \
+    "$consumer_resolved_bytes" \
+    "$producer_status" \
+    "$consumer_status" \
+    "$TEST_ID" \
+    "$LOCAL_HIVE_ID" \
+    "$WORKER_HIVE_ID"
+)"
 
 echo "---- Blob multi-hive sync summary ----"
 echo "status=ok"
@@ -782,6 +910,9 @@ echo "active_path_local=$active_local"
 echo "resolved_path_remote=$consumer_path"
 echo "contract_signature=$contract_signature"
 echo "consumer_retry_elapsed_ms=$consumer_elapsed"
+echo "producer_metrics_json=$producer_metrics_json"
+echo "consumer_metrics_json=$consumer_metrics_json"
+echo "blob_stats_summary_json=$blob_stats_summary_json"
 
 if [[ "$SHOW_FULL_LOGS" == "1" ]]; then
   echo "---- producer log ----"

@@ -31,6 +31,7 @@ async fn main() -> Result<(), DynError> {
 
 async fn run_produce() -> Result<(), DynError> {
     let blob_root = PathBuf::from(env_or("BLOB_ROOT", "/var/lib/fluxbee/blob"));
+    let max_blob_bytes = env_u64_opt("BLOB_MAX_BYTES");
     let filename = env_or("BLOB_DIAG_FILENAME", "blob-sync-diag.txt");
     let content = env_or("BLOB_DIAG_CONTENT", "fluxbee-blob-sync-diag");
     let mime = env_or("BLOB_DIAG_MIME", "text/plain");
@@ -46,6 +47,7 @@ async fn run_produce() -> Result<(), DynError> {
     let toolkit = BlobToolkit::new(BlobConfig {
         blob_root: blob_root.clone(),
         name_max_chars: BLOB_NAME_MAX_CHARS,
+        max_blob_bytes,
     })?;
 
     if confirm_required && confirm_targets.is_empty() {
@@ -119,12 +121,17 @@ async fn run_produce() -> Result<(), DynError> {
             serde_json::to_string(&sync_targets)?
         );
     }
+    println!(
+        "BLOB_METRICS_JSON={}",
+        serde_json::to_string(&BlobToolkit::metrics_snapshot())?
+    );
 
     Ok(())
 }
 
 async fn run_consume() -> Result<(), DynError> {
     let blob_root = PathBuf::from(env_or("BLOB_ROOT", "/var/lib/fluxbee/blob"));
+    let max_blob_bytes = env_u64_opt("BLOB_MAX_BYTES");
     let blob_ref_json = env_or("BLOB_DIAG_BLOB_REF_JSON", "");
     if blob_ref_json.trim().is_empty() {
         return Err("BLOB_DIAG_BLOB_REF_JSON is required for consume mode".into());
@@ -142,6 +149,7 @@ async fn run_consume() -> Result<(), DynError> {
     let toolkit = BlobToolkit::new(BlobConfig {
         blob_root: blob_root.clone(),
         name_max_chars: BLOB_NAME_MAX_CHARS,
+        max_blob_bytes,
     })?;
 
     let blob_ref: BlobRef = serde_json::from_str(&blob_ref_json)?;
@@ -177,6 +185,10 @@ async fn run_consume() -> Result<(), DynError> {
     println!("RESOLVED_PATH={}", resolved.display());
     println!("RESOLVED_BYTES={}", bytes.len());
     println!("ELAPSED_MS={elapsed_ms}");
+    println!(
+        "BLOB_METRICS_JSON={}",
+        serde_json::to_string(&BlobToolkit::metrics_snapshot())?
+    );
 
     Ok(())
 }
@@ -214,6 +226,10 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+fn env_u64_opt(key: &str) -> Option<u64> {
+    std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok())
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {

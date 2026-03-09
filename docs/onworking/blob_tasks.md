@@ -48,10 +48,19 @@ Track A (objetivo funcional de propagación confirmada):
   - Avance (2026-03-09): `docs/14-runtime-rollout-motherbee.md` actualizado con paso operativo de `sync-hint` previo a `update`.
 
 Track B (cierre operativo y hardening):
-- [ ] B1. Resolver `BLOB-X4/X5` (owner/permisos y política explícita de usuario Syncthing).
-- [ ] B2. Resolver `BLOB-X6/X7` (GC de `staging/active`).
-- [ ] B3. Resolver `BLOB-X8/X9` (límites + errores de contrato).
-- [ ] B4. Resolver `BLOB-X10/X11` (métricas + diagnóstico agregable).
+- [x] B1. Resolver `BLOB-X4/X5` (owner/permisos y política explícita de usuario Syncthing).
+  - Avance (2026-03-09): `sy-orchestrator` agrega política explícita `blob.sync.service_user` + `blob.sync.allow_root_fallback`, con fallback a root solo cuando está habilitado por config.
+  - Avance (2026-03-09): hardening de permisos en runtime (`dirs=750`) y unit Syncthing con `UMask=0027`.
+  - Avance (2026-03-09): `fluxbee_sdk::blob` fuerza permisos de archivo `640` en staging/active y directorios `750`.
+- [x] B2. Resolver `BLOB-X6/X7` (GC de `staging/active`).
+  - Avance (2026-03-09): `fluxbee_sdk::blob` agrega GC con reporte tipado y modos `dry-run/apply` (`run_gc`, `cleanup_staging_orphans`, `gc_active_by_spool_day`).
+  - Avance (2026-03-09): `sy-orchestrator` integra housekeeping periódico por `hive.yaml` (`blob.gc.*`) en watchdog.
+- [x] B3. Resolver `BLOB-X8/X9` (límites + errores de contrato).
+  - Avance (2026-03-09): `fluxbee_sdk::blob` agrega política configurable `BlobConfig.max_blob_bytes` (default 100MB) y emite `BLOB_TOO_LARGE`.
+  - Avance (2026-03-09): se agregan tests de contrato para `BLOB_TOO_LARGE`, `BLOB_NOT_FOUND` (retry agotado) y fallas de permisos (`BLOB_IO_ERROR`).
+- [x] B4. Resolver `BLOB-X10/X11` (métricas + diagnóstico agregable).
+  - Avance (2026-03-09): `fluxbee_sdk::blob` expone snapshot de métricas mínimas (`BlobToolkit::metrics_snapshot`) con contadores de `put/resolve/retry/error` y bytes.
+  - Avance (2026-03-09): `blob_sync_diag` exporta `BLOB_METRICS_JSON` y `scripts/blob_sync_multi_hive_e2e.sh` publica `blob_stats_summary_json` agregable (`count/p50/p95/max`, errores y volumen).
 
 ## Fase B1 - Contrato canónico en SDK
 
@@ -153,29 +162,37 @@ Salida:
 - replicación de blobs validada end-to-end con Syncthing real entre hives.
 
 ### BLOB-X2 - Política de filesystem y seguridad
-- [ ] X4. Alinear owner/permisos de blob con spec (`fluxbee:fluxbee`, dirs `750`, files `640`) en mother/worker.
-- [ ] X5. Eliminar fallback silencioso a root para Syncthing o formalizar política explícita y validable.
+- [x] X4. Alinear owner/permisos de blob con spec (`fluxbee:fluxbee`, dirs `750`, files `640`) en mother/worker.
+  - Avance (2026-03-09): directorios blob/sync se crean y reconcilian en `750`; SDK blob aplica `640` a archivos en staging/active.
+- [x] X5. Eliminar fallback silencioso a root para Syncthing o formalizar política explícita y validable.
+  - Avance (2026-03-09): fallback a root quedó condicionado por `blob.sync.allow_root_fallback` y registrado explícitamente en logs.
 
 Salida:
 - postura de seguridad de Blob consistente y verificable.
 
 ### BLOB-X3 - GC y housekeeping
-- [ ] X6. Implementar cleanup de `staging/` huérfano por TTL (24h) con dry-run + modo apply.
-- [ ] X7. Definir/implementar GC de `active/` por `spool_day` (fase inicial conservadora, sin borrar referencias recientes).
+- [x] X6. Implementar cleanup de `staging/` huérfano por TTL (24h) con dry-run + modo apply.
+  - Avance (2026-03-09): expuesto en SDK (`cleanup_staging_orphans`) y orquestado por watchdog con `blob.gc.apply`.
+- [x] X7. Definir/implementar GC de `active/` por `spool_day` (fase inicial conservadora, sin borrar referencias recientes).
+  - Avance (2026-03-09): fase inicial conservadora implementada como retención por antigüedad de archivo (`gc_active_by_spool_day`), con default `30d`, dry-run por defecto y ejecución periódica configurable.
 
 Salida:
 - control de crecimiento de storage Blob en operación continua.
 
 ### BLOB-X4 - Contrato de errores y límites
-- [ ] X8. Implementar política de tamaño máxima configurable y emitir `BLOB_TOO_LARGE`.
-- [ ] X9. Agregar tests de contrato para `BLOB_TOO_LARGE`, `BLOB_NOT_FOUND` con retry agotado, y fallas de permisos.
+- [x] X8. Implementar política de tamaño máxima configurable y emitir `BLOB_TOO_LARGE`.
+  - Avance (2026-03-09): límite configurable en SDK (`BlobConfig.max_blob_bytes`) con default `100MB` y soporte `None` (sin límite).
+- [x] X9. Agregar tests de contrato para `BLOB_TOO_LARGE`, `BLOB_NOT_FOUND` con retry agotado, y fallas de permisos.
+  - Avance (2026-03-09): cobertura añadida en tests de `fluxbee_sdk::blob`.
 
 Salida:
 - errores Blob completos y comprobados contra el contrato.
 
 ### BLOB-X5 - Observabilidad de Blob
-- [ ] X10. Exponer métricas mínimas de Blob (`blob_put_total`, `blob_resolve_total`, `blob_resolve_retry_total`, `blob_errors_total`, bytes).
-- [ ] X11. Agregar diagnóstico E2E Blob multi-isla al paquete de diagnósticos operativos.
+- [x] X10. Exponer métricas mínimas de Blob (`blob_put_total`, `blob_resolve_total`, `blob_resolve_retry_total`, `blob_errors_total`, bytes).
+  - Avance (2026-03-09): `fluxbee_sdk::blob` agrega `BlobMetricsSnapshot` + contadores atómicos globales y registro en operaciones (`put`, `resolve`, `resolve_with_retry`, errores).
+- [x] X11. Agregar diagnóstico E2E Blob multi-isla al paquete de diagnósticos operativos.
+  - Avance (2026-03-09): `blob_sync_diag` emite `BLOB_METRICS_JSON`; `scripts/blob_sync_multi_hive_e2e.sh` agrega resumen `blob_stats_summary_json` apto para ingestión/aggregación operativa.
 
 Salida:
 - visibilidad operativa suficiente para soporte y capacity planning.

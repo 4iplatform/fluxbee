@@ -103,6 +103,14 @@ blob:
   path: "/var/lib/fluxbee/blob"
   sync:
     enabled: false
+    service_user: "fluxbee"
+    allow_root_fallback: true
+  gc:
+    enabled: false
+    interval_secs: 3600
+    apply: false
+    staging_ttl_hours: 24
+    active_retain_days: 30
 
 database:
   url: "postgresql://fluxbee:password@localhost:5432/fluxbee"
@@ -130,6 +138,14 @@ blob:
   path: "/var/lib/fluxbee/blob"
   sync:
     enabled: false
+    service_user: "fluxbee"
+    allow_root_fallback: true
+  gc:
+    enabled: false
+    interval_secs: 3600
+    apply: false
+    staging_ttl_hours: 24
+    active_retain_days: 30
 ```
 
 ### 2.4 Campos de hive.yaml
@@ -151,6 +167,13 @@ blob:
 | `blob.sync.tool` | No | `syncthing` | Herramienta de sincronización (actual: Syncthing) |
 | `blob.sync.api_port` | No | 8384 | API local de Syncthing |
 | `blob.sync.data_dir` | No | `/var/lib/fluxbee/syncthing` | Directorio de estado de Syncthing |
+| `blob.sync.service_user` | No | `fluxbee` | Usuario Linux del servicio `fluxbee-syncthing` |
+| `blob.sync.allow_root_fallback` | No | `true` | Si el usuario no existe, permite fallback explícito a `root` |
+| `blob.gc.enabled` | No | `false` | Habilita housekeeping de blobs en watchdog del orchestrator |
+| `blob.gc.interval_secs` | No | `3600` | Intervalo de ejecución del GC de blobs |
+| `blob.gc.apply` | No | `false` | `false`=dry-run (solo reporte), `true`=aplica borrados |
+| `blob.gc.staging_ttl_hours` | No | `24` | TTL para limpiar huérfanos en `blob/staging/` |
+| `blob.gc.active_retain_days` | No | `30` | Retención mínima de blobs en `blob/active/` |
 | `admin.listen` | No | `127.0.0.1:8080` | Bind del API HTTP de SY.admin (recomendado loopback + proxy) |
 | `database.url` | Solo Motherbee | - | Connection string PostgreSQL |
 | `database.pool_size` | No | 10 | Conexiones en el pool |
@@ -171,6 +194,20 @@ Lifecycle gestionado por orchestrator:
   - remueve unit `fluxbee-syncthing.service`,
   - ejecuta `daemon-reload`,
   - elimina reglas de firewall Syncthing en hosts gestionados.
+
+Política de usuario/permisos:
+- `blob.sync.service_user` define el usuario del unit de Syncthing (default `fluxbee`).
+- Si ese usuario no existe:
+  - con `blob.sync.allow_root_fallback=true`, se aplica fallback explícito a `root` (warning en logs).
+  - con `blob.sync.allow_root_fallback=false`, el bootstrap/reconciliación falla (política estricta).
+- El unit se instala con `UMask=0027` para reforzar `dirs=750` y `files=640` en artefactos de sync.
+
+Housekeeping Blob (GC):
+- `blob.gc.enabled=true` activa limpieza periódica en watchdog.
+- `blob.gc.apply=false` (default) ejecuta dry-run: reporta candidatos sin borrar.
+- `blob.gc.apply=true` aplica:
+  - cleanup de `staging/` por `staging_ttl_hours`,
+  - GC conservador de `active/` por retención `active_retain_days` (basado en antigüedad de archivo).
 
 Puertos operativos Syncthing:
 - `22000/tcp` (sync)

@@ -270,6 +270,7 @@ El manejo de blobs es un módulo dentro del paquete `fluxbee_sdk`. Todos los nod
 pub struct BlobConfig {
     pub blob_root: PathBuf,       // /var/lib/fluxbee/blob
     pub name_max_chars: usize,    // default: 128
+    pub max_blob_bytes: Option<u64>, // default: Some(100MB), None => sin límite
 }
 
 /// Referencia a un blob en el repositorio (serializable a JSON)
@@ -540,18 +541,28 @@ En multi-isla v2.x, se recomienda además confirmar propagación antes de emitir
 | `BLOB_TOO_LARGE` | Archivo excede límite configurado por política (ej: 100MB) |
 
 > **Nota:** se elimina `BLOB_HASH_MISMATCH` del draft anterior. No hay verificación de hash post-escritura porque el hash solo sirve para unicidad en el naming, no para integridad criptográfica.
+> El límite es configurable vía `BlobConfig.max_blob_bytes`.
 
 ---
 
-## 9. GC (Garbage Collection) — Diferido
+## 9. GC (Garbage Collection)
 
-El GC de blobs opera sobre `active/` por tiempo, basado en `spool_day`.
+GC inicial implementado en `fluxbee_sdk::blob` y ejecutable desde `SY.orchestrator` (watchdog), con dos fases:
 
-**Regla actual (de spec):** archivos con `spool_day` anterior a N días son candidatos a borrado.
+- `staging/` cleanup por TTL (`staging_ttl_hours`, default `24h`).
+- `active/` GC conservador por retención (`active_retain_days`, default `30d`).
 
-**Tema pendiente:** si un blob está referenciado por un mensaje aún en tránsito o procesamiento, no debería borrarse. Resolución diferida — por ahora el TTL del GC debe ser conservador (ej: 30 días).
+Modo operativo:
 
-**`staging/` cleanup:** archivos en `staging/` que llevan más de 24h sin ser promovidos pueden limpiarse automáticamente. Son archivos huérfanos (el nodo productor falló o abandonó la tarea antes de completar).
+- `apply=false` (default): dry-run, solo reporta candidatos.
+- `apply=true`: ejecuta borrados.
+
+Semántica conservadora:
+
+- En esta fase inicial, la retención de `active/` se basa en antigüedad de archivo (mtime) como aproximación de `spool_day`.
+- El TTL debe mantenerse conservador para minimizar riesgo de borrar blobs aún referenciados.
+
+**Tema pendiente futuro:** GC referencial (validar referencias vivas en storage/flujo antes de borrar definitivamente).
 
 ---
 
@@ -608,6 +619,9 @@ pub const BLOB_RETRY_BACKOFF: f64 = 2.0;
 
 /// TTL de cleanup de staging/ (archivos huérfanos)
 pub const BLOB_STAGING_TTL_HOURS: u64 = 24;
+
+/// Límite default de tamaño por blob (100MB)
+pub const BLOB_DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
 ```
 
 ---
