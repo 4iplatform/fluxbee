@@ -2317,6 +2317,48 @@ async fn syncthing_api_healthy(api_port: u16) -> bool {
     )
 }
 
+fn syncthing_api_key(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
+    let config_path = sync.sync_data_dir.join("config.xml");
+    let data = fs::read_to_string(&config_path)?;
+    let re = Regex::new(r#"(?s)<apikey>([^<]+)</apikey>"#)?;
+    let api_key = re
+        .captures(&data)
+        .and_then(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("syncthing API key missing in '{}'", config_path.display()))?;
+    Ok(api_key)
+}
+
+fn syncthing_folder_healthy(
+    sync: &BlobRuntimeConfig,
+    folder_id: &str,
+) -> Result<bool, OrchestratorError> {
+    let api_key = syncthing_api_key(sync)?;
+    let endpoint = format!(
+        "http://127.0.0.1:{}/rest/db/status?folder={}",
+        sync.sync_api_port, folder_id
+    );
+    let mut cmd = Command::new("curl");
+    cmd.arg("-fsS")
+        .arg("-H")
+        .arg(format!("X-API-Key: {}", api_key))
+        .arg(&endpoint);
+    let out = run_cmd_output(cmd, &format!("syncthing db status folder={folder_id}"))?;
+    let payload: serde_json::Value = serde_json::from_str(&out)
+        .map_err(|err| format!("invalid syncthing db/status payload for folder '{folder_id}': {err}"))?;
+    let error_text = payload
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let invalid_text = payload
+        .get("invalid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    Ok(error_text.is_empty() && invalid_text.is_empty())
+}
+
 async fn wait_for_syncthing_health(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {
     let start = Instant::now();
     let timeout = Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS);
@@ -3069,7 +3111,50 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
 
     let service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
     let api_healthy = syncthing_api_healthy(desired_sync.sync_api_port).await;
+    let mut folders_healthy = true;
     if service_active && api_healthy {
+        if desired_blob.sync_enabled && blob_sync_tool_is_syncthing(&desired_blob) {
+            match syncthing_folder_healthy(&desired_sync, SYNCTHING_FOLDER_BLOB_ID) {
+                Ok(true) => {}
+                Ok(false) => {
+                    folders_healthy = false;
+                    tracing::warn!(
+                        folder = SYNCTHING_FOLDER_BLOB_ID,
+                        "syncthing folder unhealthy; scheduling runtime reconcile"
+                    );
+                }
+                Err(err) => {
+                    folders_healthy = false;
+                    tracing::warn!(
+                        folder = SYNCTHING_FOLDER_BLOB_ID,
+                        error = %err,
+                        "failed to verify syncthing folder health; scheduling runtime reconcile"
+                    );
+                }
+            }
+        }
+        if desired_dist.sync_enabled && dist_sync_tool_is_syncthing(&desired_dist) {
+            match syncthing_folder_healthy(&desired_sync, SYNCTHING_FOLDER_DIST_ID) {
+                Ok(true) => {}
+                Ok(false) => {
+                    folders_healthy = false;
+                    tracing::warn!(
+                        folder = SYNCTHING_FOLDER_DIST_ID,
+                        "syncthing folder unhealthy; scheduling runtime reconcile"
+                    );
+                }
+                Err(err) => {
+                    folders_healthy = false;
+                    tracing::warn!(
+                        folder = SYNCTHING_FOLDER_DIST_ID,
+                        error = %err,
+                        "failed to verify syncthing folder health; scheduling runtime reconcile"
+                    );
+                }
+            }
+        }
+    }
+    if service_active && api_healthy && folders_healthy {
         return Ok(());
     }
 
@@ -3077,6 +3162,7 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         service = SYNCTHING_SERVICE_NAME,
         service_active = service_active,
         api_healthy = api_healthy,
+        folders_healthy = folders_healthy,
         "syncthing unhealthy; restarting"
     );
     ensure_blob_sync_runtime(&desired_blob, &desired_dist).await?;
