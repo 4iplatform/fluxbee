@@ -83,14 +83,14 @@ Salida:
 
 ## 5) Fase C - SHM identity v2 (fijo + seqlock)
 
-- [ ] C1. Agregar región `jsr-identity-<hive>` en `src/shm/mod.rs`:
+- [x] C1. Agregar región `jsr-identity-<hive>` en `src/shm/mod.rs`:
   - `IDENTITY_MAGIC`, `IDENTITY_VERSION`
   - `IdentityHeader`, `TenantEntry`, `IlkEntry`, `IchEntry`, `IchMappingEntry`, `IlkAliasEntry`
   - `IdentityRegionWriter`, `IdentityRegionReader`
-- [ ] C2. Implementar `layout_identity()` con `MAX_*` configurables.
-- [ ] C3. Implementar lectura consistente con seqlock (doble lectura de `seq`).
-- [ ] C4. Implementar escritura de mapping hash con linear probing + tombstones.
-- [ ] C5. Alinear tamaños SHM con DB para evitar truncamiento:
+- [x] C2. Implementar `layout_identity()` con `MAX_*` configurables.
+- [x] C3. Implementar lectura consistente con seqlock (doble lectura de `seq`).
+- [x] C4. Implementar escritura de mapping hash con linear probing + tombstones.
+- [x] C5. Alinear tamaños SHM con DB para evitar truncamiento:
   - `channel_type` 32
   - `address` 256
 

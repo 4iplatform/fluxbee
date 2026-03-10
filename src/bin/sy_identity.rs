@@ -13,7 +13,8 @@ use uuid::Uuid;
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
 use json_router::shm::{
-    now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RouterRegionReader, ShmSnapshot,
+    now_epoch_ms, ICH_ADDRESS_MAX_LEN, ICH_CHANNEL_TYPE_MAX_LEN, LsaRegionReader, LsaSnapshot,
+    NodeEntry, RouterRegionReader, ShmSnapshot,
 };
 
 type IdentityError = Box<dyn std::error::Error + Send + Sync>;
@@ -226,6 +227,8 @@ impl IdentityStore {
         let _ = parse_prefixed_uuid(&req.ich_id, "ich")?;
         validate_non_empty("channel_type", &req.channel_type)?;
         validate_non_empty("address", &req.address)?;
+        validate_max_len("channel_type", &req.channel_type, ICH_CHANNEL_TYPE_MAX_LEN)?;
+        validate_max_len("address", &req.address, ICH_ADDRESS_MAX_LEN)?;
 
         let key = canonical_ich_key(&req.channel_type, &req.address);
         if let Some(existing) = self.ich_lookup.get(&key) {
@@ -1001,10 +1004,23 @@ fn validate_non_empty(field: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_max_len(field: &str, value: &str, max: usize) -> Result<(), String> {
+    if value.len() > max {
+        return Err(format!("INVALID_REQUEST: {} too long (max {})", field, max));
+    }
+    Ok(())
+}
+
 fn validate_channel_input(channel: &ChannelInput) -> Result<(), String> {
     let _ = parse_prefixed_uuid(&channel.ich_id, "ich")?;
     validate_non_empty("channel.type", &channel.channel_type)?;
     validate_non_empty("channel.address", &channel.address)?;
+    validate_max_len(
+        "channel.type",
+        &channel.channel_type,
+        ICH_CHANNEL_TYPE_MAX_LEN,
+    )?;
+    validate_max_len("channel.address", &channel.address, ICH_ADDRESS_MAX_LEN)?;
     Ok(())
 }
 
