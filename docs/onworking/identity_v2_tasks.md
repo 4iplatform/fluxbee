@@ -99,7 +99,7 @@ Salida:
 
 ## 6) Fase D - Sync primary/replica por socket
 
-- [ ] D1. Implementar full sync chunked (`IDENTITY_FULL_SYNC`) en cold start.
+- [x] D1. Implementar full sync chunked (`IDENTITY_FULL_SYNC`) en cold start.
 - [ ] D2. Implementar delta sync (`IDENTITY_DELTA`) para create/update/delete.
 - [ ] D3. Implementar versionado/orden de deltas y retry/ack por worker.
 - [ ] D4. Implementar métricas de convergencia (lag, deltas pendientes, tiempo full sync).

@@ -1,10 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time;
 use tokio_postgres::NoTls;
 use tracing_subscriber::EnvFilter;
@@ -23,6 +26,11 @@ const DEFAULT_GATEWAY_NAME: &str = "RT.gateway";
 const DEFAULT_DEFAULT_TENANT_NAME: &str = "fluxbee";
 const DEFAULT_MERGE_ALIAS_TTL_SECS: u64 = 3600;
 const ALIAS_GC_INTERVAL_SECS: u64 = 30;
+const DEFAULT_IDENTITY_SYNC_PORT: u16 = 9100;
+const IDENTITY_FULL_SYNC_CHUNK_ITEMS: usize = 256;
+const IDENTITY_SYNC_VERSION: u32 = 1;
+const SYNC_OP_FULL_SYNC_REQUEST: &str = "IDENTITY_FULL_SYNC_REQUEST";
+const SYNC_OP_FULL_SYNC: &str = "full_sync";
 
 const MSG_ILK_PROVISION: &str = "ILK_PROVISION";
 const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
@@ -62,6 +70,16 @@ struct IdentitySection {
     default_tenant: Option<String>,
     #[serde(default)]
     merge_alias_ttl_secs: Option<u64>,
+    #[serde(default)]
+    sync: Option<IdentitySyncSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentitySyncSection {
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    upstream: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,7 +176,7 @@ struct TntApproveRequest {
     approved_by: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TenantRecord {
     tenant_id: String,
     name: String,
@@ -167,14 +185,14 @@ struct TenantRecord {
     settings: Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChannelRecord {
     ich_id: String,
     channel_type: String,
     address: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct IlkRecord {
     ilk_id: String,
     ilk_type: String,
@@ -187,7 +205,7 @@ struct IlkRecord {
     deleted_at_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AliasRecord {
     canonical_ilk_id: String,
     expires_at_ms: u64,
@@ -200,6 +218,36 @@ struct IdentityStore {
     // (channel_type_lower, address_lower) -> ilk_id
     ich_lookup: HashMap<(String, String), String>,
     aliases: HashMap<String, AliasRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IdentitySyncRequest {
+    operation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AliasSnapshotRecord {
+    old_ilk_id: String,
+    canonical_ilk_id: String,
+    expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IdentityFullSyncChunk {
+    version: u32,
+    operation: String,
+    chunk: u32,
+    total_chunks: u32,
+    tenants: Vec<TenantRecord>,
+    ilks: Vec<IlkRecord>,
+    aliases: Vec<AliasSnapshotRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IdentitySyncError {
+    status: String,
+    error_code: String,
+    message: String,
 }
 
 impl IdentityStore {
@@ -531,6 +579,85 @@ impl IdentityStore {
         }
         expired_old_ids.len()
     }
+
+    fn build_full_sync_chunks(&self, chunk_items: usize) -> Vec<IdentityFullSyncChunk> {
+        let chunk_items = chunk_items.max(1);
+        let mut tenants: Vec<TenantRecord> = self.tenants.values().cloned().collect();
+        let mut ilks: Vec<IlkRecord> = self.ilks.values().cloned().collect();
+        let mut aliases: Vec<AliasSnapshotRecord> = self
+            .aliases
+            .iter()
+            .map(|(old_ilk_id, alias)| AliasSnapshotRecord {
+                old_ilk_id: old_ilk_id.clone(),
+                canonical_ilk_id: alias.canonical_ilk_id.clone(),
+                expires_at_ms: alias.expires_at_ms,
+            })
+            .collect();
+        tenants.sort_by(|a, b| a.tenant_id.cmp(&b.tenant_id));
+        ilks.sort_by(|a, b| a.ilk_id.cmp(&b.ilk_id));
+        aliases.sort_by(|a, b| a.old_ilk_id.cmp(&b.old_ilk_id));
+
+        let tenant_chunks = tenants.len().div_ceil(chunk_items);
+        let ilk_chunks = ilks.len().div_ceil(chunk_items);
+        let alias_chunks = aliases.len().div_ceil(chunk_items);
+        let total_chunks = tenant_chunks.max(ilk_chunks).max(alias_chunks).max(1);
+
+        let mut out = Vec::with_capacity(total_chunks);
+        for i in 0..total_chunks {
+            out.push(IdentityFullSyncChunk {
+                version: IDENTITY_SYNC_VERSION,
+                operation: SYNC_OP_FULL_SYNC.to_string(),
+                chunk: (i + 1) as u32,
+                total_chunks: total_chunks as u32,
+                tenants: slice_chunk(&tenants, i, chunk_items),
+                ilks: slice_chunk(&ilks, i, chunk_items),
+                aliases: slice_chunk(&aliases, i, chunk_items),
+            });
+        }
+        out
+    }
+
+    fn from_full_sync_chunks(chunks: &[IdentityFullSyncChunk]) -> Result<Self, String> {
+        let mut ordered = chunks.to_vec();
+        ordered.sort_by_key(|chunk| chunk.chunk);
+
+        let mut store = IdentityStore::default();
+
+        for chunk in &ordered {
+            for tenant in &chunk.tenants {
+                store
+                    .tenants
+                    .insert(tenant.tenant_id.clone(), tenant.clone());
+            }
+            for ilk in &chunk.ilks {
+                store.ilks.insert(ilk.ilk_id.clone(), ilk.clone());
+            }
+            for alias in &chunk.aliases {
+                store.aliases.insert(
+                    alias.old_ilk_id.clone(),
+                    AliasRecord {
+                        canonical_ilk_id: alias.canonical_ilk_id.clone(),
+                        expires_at_ms: alias.expires_at_ms,
+                    },
+                );
+            }
+        }
+
+        for (ilk_id, ilk) in &store.ilks {
+            if ilk.deleted_at_ms.is_some() {
+                continue;
+            }
+            for channel in &ilk.channels {
+                let key = canonical_ich_key(&channel.channel_type, &channel.address);
+                store.ich_lookup.insert(key, ilk_id.clone());
+            }
+        }
+
+        if store.tenants.is_empty() {
+            return Err("full sync payload did not include tenants".to_string());
+        }
+        Ok(store)
+    }
 }
 
 struct IdentityRuntime {
@@ -814,6 +941,32 @@ async fn main() -> Result<(), IdentityError> {
         None
     };
     let mut runtime = IdentityRuntime::new(&hive, state_dir.clone(), is_primary, db_url);
+    let sync_port = identity_sync_port(&hive);
+    let sync_upstream = identity_sync_upstream(&hive);
+    let sync_listener = if is_primary {
+        let bind_addr = format!("0.0.0.0:{sync_port}");
+        let listener = TcpListener::bind(&bind_addr).await?;
+        tracing::info!(bind = %bind_addr, "identity sync listener ready");
+        Some(listener)
+    } else {
+        None
+    };
+    if !is_primary {
+        if let Some(upstream) = sync_upstream.as_deref() {
+            match fetch_full_sync_from_primary(upstream).await {
+                Ok(store) => {
+                    let metrics = store.metrics();
+                    runtime.store = store;
+                    tracing::info!(upstream = %upstream, metrics = %metrics, "identity full sync bootstrap applied");
+                }
+                Err(err) => {
+                    tracing::warn!(upstream = %upstream, error = %err, "identity full sync bootstrap failed; starting with local in-memory state");
+                }
+            }
+        } else {
+            tracing::warn!("identity replica mode without identity.sync.upstream; starting with local in-memory state");
+        }
+    }
     let (mut sender, mut receiver) =
         connect_with_retry(&node_config, Duration::from_secs(1)).await?;
 
@@ -825,39 +978,227 @@ async fn main() -> Result<(), IdentityError> {
 
     let mut heartbeat = time::interval(Duration::from_secs(5));
     let mut alias_gc_tick = time::interval(Duration::from_secs(ALIAS_GC_INTERVAL_SECS));
-    loop {
-        tokio::select! {
-            _ = heartbeat.tick() => {
-                tracing::debug!(metrics = %runtime.store.metrics(), "identity heartbeat");
-            }
-            _ = alias_gc_tick.tick() => {
-                if let Err(err) = runtime.run_alias_gc().await {
-                    tracing::warn!(error = %err, "identity alias gc failed");
+    if let Some(listener) = sync_listener {
+        loop {
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    tracing::debug!(metrics = %runtime.store.metrics(), "identity heartbeat");
                 }
-            }
-            received = receiver.recv() => {
-                let msg = match received {
-                    Ok(msg) => msg,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "recv error; reconnecting");
-                        let (new_sender, new_receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
-                        sender = new_sender;
-                        receiver = new_receiver;
-                        tracing::info!("reconnected to router");
+                _ = alias_gc_tick.tick() => {
+                    if let Err(err) = runtime.run_alias_gc().await {
+                        tracing::warn!(error = %err, "identity alias gc failed");
+                    }
+                }
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, remote_addr)) => {
+                            let chunks = runtime.store.build_full_sync_chunks(IDENTITY_FULL_SYNC_CHUNK_ITEMS);
+                            tokio::spawn(async move {
+                                if let Err(err) = handle_full_sync_connection(stream, chunks).await {
+                                    tracing::warn!(remote = %remote_addr, error = %err, "identity full sync request failed");
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "identity sync accept failed");
+                        }
+                    }
+                }
+                received = receiver.recv() => {
+                    let msg = match received {
+                        Ok(msg) => msg,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "recv error; reconnecting");
+                            let (new_sender, new_receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+                            sender = new_sender;
+                            receiver = new_receiver;
+                            tracing::info!("reconnected to router");
+                            continue;
+                        }
+                    };
+
+                    if msg.meta.msg_type != SYSTEM_KIND {
                         continue;
                     }
-                };
 
-                if msg.meta.msg_type != SYSTEM_KIND {
-                    continue;
+                    if let Err(err) = runtime.process_system_message(&sender, &msg).await {
+                        tracing::warn!(error = %err, action = ?msg.meta.msg, "failed to process system message");
+                    }
                 }
+            }
+        }
+    } else {
+        loop {
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    tracing::debug!(metrics = %runtime.store.metrics(), "identity heartbeat");
+                }
+                _ = alias_gc_tick.tick() => {
+                    if let Err(err) = runtime.run_alias_gc().await {
+                        tracing::warn!(error = %err, "identity alias gc failed");
+                    }
+                }
+                received = receiver.recv() => {
+                    let msg = match received {
+                        Ok(msg) => msg,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "recv error; reconnecting");
+                            let (new_sender, new_receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+                            sender = new_sender;
+                            receiver = new_receiver;
+                            tracing::info!("reconnected to router");
+                            continue;
+                        }
+                    };
 
-                if let Err(err) = runtime.process_system_message(&sender, &msg).await {
-                    tracing::warn!(error = %err, action = ?msg.meta.msg, "failed to process system message");
+                    if msg.meta.msg_type != SYSTEM_KIND {
+                        continue;
+                    }
+
+                    if let Err(err) = runtime.process_system_message(&sender, &msg).await {
+                        tracing::warn!(error = %err, action = ?msg.meta.msg, "failed to process system message");
+                    }
                 }
             }
         }
     }
+}
+
+fn identity_sync_port(hive: &HiveFile) -> u16 {
+    hive.identity
+        .as_ref()
+        .and_then(|identity| identity.sync.as_ref())
+        .and_then(|sync| sync.port)
+        .unwrap_or(DEFAULT_IDENTITY_SYNC_PORT)
+}
+
+fn identity_sync_upstream(hive: &HiveFile) -> Option<String> {
+    hive.identity
+        .as_ref()
+        .and_then(|identity| identity.sync.as_ref())
+        .and_then(|sync| sync.upstream.as_ref())
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+}
+
+async fn handle_full_sync_connection(
+    stream: TcpStream,
+    chunks: Vec<IdentityFullSyncChunk>,
+) -> Result<(), IdentityError> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let mut request_line = String::new();
+    let read = reader.read_line(&mut request_line).await?;
+    if read == 0 {
+        return Err("full sync request connection closed".into());
+    }
+    let request: IdentitySyncRequest = serde_json::from_str(request_line.trim())?;
+    if request.operation != SYNC_OP_FULL_SYNC_REQUEST {
+        let payload = IdentitySyncError {
+            status: "error".to_string(),
+            error_code: "INVALID_REQUEST".to_string(),
+            message: format!("unsupported sync operation '{}'", request.operation),
+        };
+        let encoded = serde_json::to_string(&payload)?;
+        write_half.write_all(encoded.as_bytes()).await?;
+        write_half.write_all(b"\n").await?;
+        write_half.flush().await?;
+        return Ok(());
+    }
+
+    for chunk in chunks {
+        let encoded = serde_json::to_string(&chunk)?;
+        write_half.write_all(encoded.as_bytes()).await?;
+        write_half.write_all(b"\n").await?;
+    }
+    write_half.flush().await?;
+    Ok(())
+}
+
+async fn fetch_full_sync_from_primary(upstream: &str) -> Result<IdentityStore, IdentityError> {
+    let stream = TcpStream::connect(upstream).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let request = IdentitySyncRequest {
+        operation: SYNC_OP_FULL_SYNC_REQUEST.to_string(),
+    };
+    let encoded = serde_json::to_string(&request)?;
+    write_half.write_all(encoded.as_bytes()).await?;
+    write_half.write_all(b"\n").await?;
+    write_half.flush().await?;
+
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    let mut expected_chunks: Option<usize> = None;
+    let mut received: Vec<Option<IdentityFullSyncChunk>> = Vec::new();
+
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            break;
+        }
+        let raw = line.trim();
+        if raw.is_empty() {
+            continue;
+        }
+
+        if let Ok(err_payload) = serde_json::from_str::<IdentitySyncError>(raw) {
+            if err_payload.status == "error" {
+                return Err(format!(
+                    "full sync rejected: {} ({})",
+                    err_payload.error_code, err_payload.message
+                )
+                .into());
+            }
+        }
+
+        let chunk: IdentityFullSyncChunk = serde_json::from_str(raw)?;
+        if chunk.operation != SYNC_OP_FULL_SYNC {
+            return Err(format!("unexpected sync operation '{}'", chunk.operation).into());
+        }
+
+        let total = chunk.total_chunks as usize;
+        let idx = chunk.chunk as usize;
+        if total == 0 || idx == 0 || idx > total {
+            return Err("invalid chunk numbering in full sync payload".into());
+        }
+
+        if let Some(expected) = expected_chunks {
+            if expected != total {
+                return Err("inconsistent total_chunks in full sync payload".into());
+            }
+        } else {
+            expected_chunks = Some(total);
+            received.resize(total, None);
+        }
+
+        if let Some(slot) = received.get_mut(idx - 1) {
+            *slot = Some(chunk);
+        } else {
+            return Err("chunk index out of range".into());
+        }
+
+        if received.iter().all(|entry| entry.is_some()) {
+            break;
+        }
+    }
+
+    if received.is_empty() || received.iter().any(|entry| entry.is_none()) {
+        return Err("incomplete full sync stream".into());
+    }
+
+    let chunks: Vec<IdentityFullSyncChunk> = received.into_iter().flatten().collect();
+    IdentityStore::from_full_sync_chunks(&chunks)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err).into())
+}
+
+fn slice_chunk<T: Clone>(items: &[T], chunk_index: usize, chunk_size: usize) -> Vec<T> {
+    let start = chunk_index.saturating_mul(chunk_size);
+    if start >= items.len() {
+        return Vec::new();
+    }
+    let end = (start + chunk_size).min(items.len());
+    items[start..end].to_vec()
 }
 
 fn load_hive(config_dir: &Path) -> Result<HiveFile, IdentityError> {
