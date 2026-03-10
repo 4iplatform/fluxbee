@@ -18,6 +18,8 @@ set -euo pipefail
 #   REQUIRE_PASSWORD_BLOCKED="1|0"         # default: 1
 #   REQUIRE_RESTRICT_SSH_APPLIED="1|0"     # default: 0
 #   REQUIRE_NODE_CYCLE="1|0"               # default: 1
+#   RUNTIME_RESOLVE_TIMEOUT_SECS="180"     # default: 180
+#   RUNTIME_RESOLVE_POLL_SECS="3"          # default: 3
 #   NODE_NAME="WF.hardening.e2e"           # default: random suffix
 #   NODE_FORCE_KILL="false|true"           # default: false
 
@@ -31,6 +33,8 @@ SSH_PASSWORD="${SSH_PASSWORD:-magicAI}"
 REQUIRE_PASSWORD_BLOCKED="${REQUIRE_PASSWORD_BLOCKED:-1}"
 REQUIRE_RESTRICT_SSH_APPLIED="${REQUIRE_RESTRICT_SSH_APPLIED:-0}"
 REQUIRE_NODE_CYCLE="${REQUIRE_NODE_CYCLE:-1}"
+RUNTIME_RESOLVE_TIMEOUT_SECS="${RUNTIME_RESOLVE_TIMEOUT_SECS:-180}"
+RUNTIME_RESOLVE_POLL_SECS="${RUNTIME_RESOLVE_POLL_SECS:-3}"
 NODE_NAME="${NODE_NAME:-WF.hardening.e2e.$RANDOM}"
 NODE_FORCE_KILL="${NODE_FORCE_KILL:-false}"
 
@@ -218,6 +222,9 @@ if [[ "$REQUIRE_RESTRICT_SSH_APPLIED" == "1" ]]; then
     exit 1
   fi
 fi
+if [[ "$(json_get "payload.dist_sync_ready" "$tmpdir/add.json")" != "true" ]]; then
+  echo "INFO: add_hive returned dist_sync_ready=false; waiting for runtime manifest convergence in Step 4"
+fi
 
 echo "Step 3/5: verify password login is blocked"
 askpass="$tmpdir/askpass.sh"
@@ -256,16 +263,33 @@ else
 fi
 
 echo "Step 4/5: resolve runtime from /hives/$HIVE_ID/versions"
-status_versions="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$tmpdir/versions.json")"
-print_http "$status_versions" "$tmpdir/versions.json"
-if [[ "$status_versions" != "200" ]]; then
-  echo "FAIL: versions endpoint failed" >&2
-  exit 1
-fi
-mapfile -t runtime_meta < <(select_runtime "$tmpdir/versions.json" || true)
+runtime_deadline=$((SECONDS + RUNTIME_RESOLVE_TIMEOUT_SECS))
+runtime_attempt=0
+runtime_meta=()
+while true; do
+  runtime_attempt=$((runtime_attempt + 1))
+  status_versions="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$tmpdir/versions.json")"
+  print_http "$status_versions" "$tmpdir/versions.json"
+  if [[ "$status_versions" == "200" ]]; then
+    mapfile -t runtime_meta < <(select_runtime "$tmpdir/versions.json" || true)
+    if [[ "${#runtime_meta[@]}" -ge 2 ]]; then
+      break
+    fi
+  fi
+
+  if [[ "$REQUIRE_NODE_CYCLE" != "1" ]]; then
+    break
+  fi
+  if (( SECONDS >= runtime_deadline )); then
+    break
+  fi
+  echo "INFO: runtime manifest not ready yet (attempt=$runtime_attempt); retrying in ${RUNTIME_RESOLVE_POLL_SECS}s..."
+  sleep "$RUNTIME_RESOLVE_POLL_SECS"
+done
+
 if [[ "${#runtime_meta[@]}" -lt 2 ]]; then
   if [[ "$REQUIRE_NODE_CYCLE" == "1" ]]; then
-    echo "FAIL: no runtime with current version found for node cycle" >&2
+    echo "FAIL: no runtime with current version found for node cycle after ${RUNTIME_RESOLVE_TIMEOUT_SECS}s" >&2
     exit 1
   fi
   echo "WARN: no runtime found, skipping node cycle."

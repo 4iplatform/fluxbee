@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Orchestrator drift E2E (vendor/syncthing binary on worker):
-# 1) Baseline runtime update (forces vendor sync check path)
+# 1) Baseline runtime SYSTEM_UPDATE (forces vendor sync check path)
 # 2) Tamper worker syncthing binary to force vendor hash drift
-# 3) Trigger runtime_update again (vendor auto-resync path)
+# 3) Trigger runtime SYSTEM_UPDATE again (vendor auto-resync path)
 # 4) Validate:
 #    - worker syncthing hash == local vendor hash after resync
 #    - syncthing service is active
@@ -43,8 +43,8 @@ INFO_FILE="/var/lib/fluxbee/hives/${HIVE_ID}/info.yaml"
 LEGACY_KEY_PATH="/var/lib/fluxbee/hives/${HIVE_ID}/ssh.key"
 MOTHERBEE_KEY_PATH="/var/lib/fluxbee/ssh/motherbee.key"
 KEY_PATH=""
-VENDOR_MANIFEST="/var/lib/fluxbee/vendor/manifest.json"
-LEGACY_VENDOR_BIN="/var/lib/fluxbee/vendor/syncthing/syncthing"
+VENDOR_MANIFEST="/var/lib/fluxbee/dist/vendor/manifest.json"
+DIST_VENDOR_BIN="/var/lib/fluxbee/dist/vendor/syncthing/syncthing"
 REMOTE_VENDOR_BIN="${REMOTE_VENDOR_BIN:-/var/lib/fluxbee/vendor/bin/syncthing}"
 REMOTE_SYNCTHING_SERVICE="fluxbee-syncthing"
 
@@ -201,7 +201,7 @@ remote_root() {
 }
 
 local_vendor_path() {
-  ${SUDO} python3 - "$VENDOR_MANIFEST" "$VENDOR_COMPONENT_NAME" "$LEGACY_VENDOR_BIN" <<'PY'
+  ${SUDO} python3 - "$VENDOR_MANIFEST" "$VENDOR_COMPONENT_NAME" "$DIST_VENDOR_BIN" <<'PY'
 import json
 import os
 import sys
@@ -241,18 +241,18 @@ remote_syncthing_service_active() {
   remote_root "systemctl is-active --quiet '${REMOTE_SYNCTHING_SERVICE}'"
 }
 
-trigger_runtime_update_cycle() {
-  echo "Triggering runtime_update + spawn/kill cycle..." >&2
+trigger_system_update_cycle() {
+  echo "Triggering runtime SYSTEM_UPDATE + spawn/kill cycle..." >&2
   (
     cd "$ROOT_DIR"
     TARGET_HIVE="$HIVE_ID" \
     ORCH_RUNTIME="$ORCH_RUNTIME" \
     ORCH_VERSION="$ORCH_VERSION" \
     ORCH_TIMEOUT_SECS="$ORCH_TIMEOUT_SECS" \
-    ORCH_SEND_RUNTIME_UPDATE=1 \
+    ORCH_SEND_SYSTEM_UPDATE=1 \
     ORCH_SEND_KILL=1 \
     BUILD_BIN="$BUILD_BIN" \
-    bash scripts/orchestrator_runtime_update_spawn_e2e.sh
+    bash scripts/orchestrator_system_update_spawn_e2e.sh
   )
 }
 
@@ -374,7 +374,7 @@ assert_eq "$status" "200" "GET /hives/{id}/http"
 assert_eq "$(json_get "status" "$hive_body")" "ok" "GET /hives/{id}/status"
 
 echo "Step 1/4: baseline runtime update cycle (drives vendor check)"
-trigger_runtime_update_cycle
+trigger_system_update_cycle
 
 baseline_local_hash="$(local_vendor_hash)"
 if [[ -z "$baseline_local_hash" ]]; then
@@ -407,8 +407,8 @@ if [[ -z "$tampered_remote_hash" || "$tampered_remote_hash" == "$baseline_local_
 fi
 echo "Tampered remote hash: $tampered_remote_hash"
 
-echo "Step 3/4: trigger runtime_update again to force vendor auto-resync"
-trigger_runtime_update_cycle
+echo "Step 3/4: trigger system_update again to force vendor auto-resync"
+trigger_system_update_cycle
 
 echo "Step 4/4: wait for convergence + API evidence"
 start_secs="$(date +%s)"

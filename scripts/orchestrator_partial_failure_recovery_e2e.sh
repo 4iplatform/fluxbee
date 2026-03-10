@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # Orchestrator partial-failure recovery E2E:
-# 1) Baseline runtime_update + spawn/kill cycle.
+# 1) Baseline system_update + spawn/kill cycle.
 # 2) Inject partial worker failure (stop rt-gateway + sy-config-routes).
-# 3) Trigger runtime_update cycle again.
+# 3) Trigger system_update cycle again.
 # 4) Validate auto-recovery:
 #    - remote services back to active
-#    - core deployment evidence exists for this runtime_update window
+#    - core deployment evidence exists for this system_update window
 #
 # Usage:
 #   BASE="http://127.0.0.1:8080" \
@@ -147,17 +147,17 @@ service_is_active() {
   remote_root "systemctl is-active --quiet '$svc'"
 }
 
-trigger_runtime_update_cycle() {
+trigger_system_update_cycle() {
   (
     cd "$ROOT_DIR"
     TARGET_HIVE="$HIVE_ID" \
     ORCH_RUNTIME="$ORCH_RUNTIME" \
     ORCH_VERSION="$ORCH_VERSION" \
     ORCH_TIMEOUT_SECS="$ORCH_TIMEOUT_SECS" \
-    ORCH_SEND_RUNTIME_UPDATE=1 \
+    ORCH_SEND_SYSTEM_UPDATE=1 \
     ORCH_SEND_KILL=1 \
     BUILD_BIN="$BUILD_BIN" \
-    bash scripts/orchestrator_runtime_update_spawn_e2e.sh
+    bash scripts/orchestrator_system_update_spawn_e2e.sh
   )
 }
 
@@ -246,7 +246,7 @@ if [[ "$(json_get "status" "$hive_body")" != "ok" ]]; then
 fi
 
 echo "Step 1/4: baseline runtime update cycle"
-trigger_runtime_update_cycle
+trigger_system_update_cycle
 
 echo "Step 2/4: inject partial worker failure (stop rt-gateway + sy-config-routes)"
 remote_root "systemctl stop rt-gateway || true; systemctl stop sy-config-routes || true"
@@ -260,9 +260,9 @@ if service_is_active "sy-config-routes"; then
   exit 1
 fi
 
-echo "Step 3/4: trigger runtime_update again to force orchestrator reconciliation"
+echo "Step 3/4: trigger system_update again to force orchestrator reconciliation"
 recovery_started_ms="$(epoch_ms)"
-trigger_runtime_update_cycle
+trigger_system_update_cycle
 
 echo "Step 4/4: validate services recovered + core deployment evidence"
 start_secs="$(date +%s)"

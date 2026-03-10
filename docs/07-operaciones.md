@@ -1,7 +1,7 @@
 # JSON Router - 07 Operaciones
 
-**Estado:** v1.17  
-**Fecha:** 2026-03-04  
+**Estado:** v1.18  
+**Fecha:** 2026-03-09  
 **Audiencia:** Ops/SRE, desarrolladores de deployment
 
 ---
@@ -103,6 +103,14 @@ blob:
   path: "/var/lib/fluxbee/blob"
   sync:
     enabled: false
+    service_user: "fluxbee"
+    allow_root_fallback: true
+  gc:
+    enabled: false
+    interval_secs: 3600
+    apply: false
+    staging_ttl_hours: 24
+    active_retain_days: 30
 
 database:
   url: "postgresql://fluxbee:password@localhost:5432/fluxbee"
@@ -130,6 +138,14 @@ blob:
   path: "/var/lib/fluxbee/blob"
   sync:
     enabled: false
+    service_user: "fluxbee"
+    allow_root_fallback: true
+  gc:
+    enabled: false
+    interval_secs: 3600
+    apply: false
+    staging_ttl_hours: 24
+    active_retain_days: 30
 ```
 
 ### 2.4 Campos de hive.yaml
@@ -151,6 +167,13 @@ blob:
 | `blob.sync.tool` | No | `syncthing` | Herramienta de sincronización (actual: Syncthing) |
 | `blob.sync.api_port` | No | 8384 | API local de Syncthing |
 | `blob.sync.data_dir` | No | `/var/lib/fluxbee/syncthing` | Directorio de estado de Syncthing |
+| `blob.sync.service_user` | No | `fluxbee` | Usuario Linux del servicio `fluxbee-syncthing` |
+| `blob.sync.allow_root_fallback` | No | `true` | Si el usuario no existe, permite fallback explícito a `root` |
+| `blob.gc.enabled` | No | `false` | Habilita housekeeping de blobs en watchdog del orchestrator |
+| `blob.gc.interval_secs` | No | `3600` | Intervalo de ejecución del GC de blobs |
+| `blob.gc.apply` | No | `false` | `false`=dry-run (solo reporte), `true`=aplica borrados |
+| `blob.gc.staging_ttl_hours` | No | `24` | TTL para limpiar huérfanos en `blob/staging/` |
+| `blob.gc.active_retain_days` | No | `30` | Retención mínima de blobs en `blob/active/` |
 | `admin.listen` | No | `127.0.0.1:8080` | Bind del API HTTP de SY.admin (recomendado loopback + proxy) |
 | `database.url` | Solo Motherbee | - | Connection string PostgreSQL |
 | `database.pool_size` | No | 10 | Conexiones en el pool |
@@ -171,6 +194,20 @@ Lifecycle gestionado por orchestrator:
   - remueve unit `fluxbee-syncthing.service`,
   - ejecuta `daemon-reload`,
   - elimina reglas de firewall Syncthing en hosts gestionados.
+
+Política de usuario/permisos:
+- `blob.sync.service_user` define el usuario del unit de Syncthing (default `fluxbee`).
+- Si ese usuario no existe:
+  - con `blob.sync.allow_root_fallback=true`, se aplica fallback explícito a `root` (warning en logs).
+  - con `blob.sync.allow_root_fallback=false`, el bootstrap/reconciliación falla (política estricta).
+- El unit se instala con `UMask=0027` para reforzar `dirs=750` y `files=640` en artefactos de sync.
+
+Housekeeping Blob (GC):
+- `blob.gc.enabled=true` activa limpieza periódica en watchdog.
+- `blob.gc.apply=false` (default) ejecuta dry-run: reporta candidatos sin borrar.
+- `blob.gc.apply=true` aplica:
+  - cleanup de `staging/` por `staging_ttl_hours`,
+  - GC conservador de `active/` por retención `active_retain_days` (basado en antigüedad de archivo).
 
 Puertos operativos Syncthing:
 - `22000/tcp` (sync)
@@ -544,7 +581,7 @@ Modelo:
 - Motherbee publica artefactos y manifests en `/var/lib/fluxbee/dist/`.
 - Syncthing replica `dist/` entre hives.
 - `SY.admin` dispara `POST /hives/{id}/update`.
-- `SY.orchestrator@{hive}` valida manifest local (`version/hash`) y aplica local.
+- `SY.orchestrator@{hive}` valida manifest local (`manifest_version/manifest_hash`) y aplica local.
 
 Categorías soportadas por update:
 - `runtime`
@@ -562,7 +599,7 @@ Flujo operativo canónico:
 
 ```
 1. Publicar artefactos/manifests en /var/lib/fluxbee/dist/
-2. Esperar convergencia de Syncthing en el worker
+2. Esperar convergencia de Syncthing en el worker (o usar hint/confirmación de sync cuando esté habilitado)
 3. POST /hives/{id}/update {category, manifest_version, manifest_hash}
 4. Admin envía SYSTEM_UPDATE -> SY.orchestrator@{hive}
 5. Orchestrator worker instala/reinicia localmente y responde SYSTEM_UPDATE_RESPONSE
@@ -570,7 +607,7 @@ Flujo operativo canónico:
 ```
 
 Regla importante:
-- `RUNTIME_UPDATE` queda en compatibilidad, pero fuera del flujo canónico de operación.
+- El único contrato de update remoto es `SYSTEM_UPDATE`.
 - El watchdog remoto por SSH para runtime/core/vendor está deshabilitado en v2.
 
 ---
@@ -904,19 +941,20 @@ ssh -i /var/lib/fluxbee/ssh/motherbee.key administrator@192.168.1.50
 | `POST /hives` | `add_hive` | Bootstrap isla remota |
 | `GET /hives` | `list_hives` | Lista islas hijas |
 | `GET /hives/{id}` | `get_hive` | Info de isla específica |
-| `DELETE /hives/{id}` | `remove_hive` | Cleanup remoto socket-first (`REMOVE_HIVE_CLEANUP`) + fallback SSH técnico |
+| `DELETE /hives/{id}` | `remove_hive` | Cleanup remoto por socket (`REMOVE_HIVE_CLEANUP`); si el worker no está alcanzable por socket, cleanup local-only |
 | `POST /hives/{id}/update` | `update` | Envía `SYSTEM_UPDATE` al orchestrator del hive |
+| `POST /hives/{id}/sync-hint` | `sync_hint` | Envía `SYSTEM_SYNC_HINT` (`blob`/`dist`) para trigger/confirm de convergencia Syncthing |
 
-### 5.2 Gestión de Nodos/Router por Hive (Canónico)
+### 5.2 Gestión de Nodos por Hive (Canónico)
 
 | Endpoint HTTP | Action | Descripción |
 |---------------|--------|-------------|
 | `GET /hives/{id}/nodes` | `list_nodes` | Lista nodos de hive |
 | `POST /hives/{id}/nodes` | `run_node` | Envía `SPAWN_NODE` (contrato v2: `node_name`, `runtime`, `runtime_version`) |
 | `DELETE /hives/{id}/nodes/{name}` | `kill_node` | Envía `KILL_NODE` (soporta `force=true/false`) |
-| `GET /hives/{id}/routers` | `list_routers` | Lista routers de hive |
-| `POST /hives/{id}/routers` | `run_router` | Levanta router en hive |
-| `DELETE /hives/{id}/routers/{name}` | `kill_router` | Mata router en hive |
+
+Nota:
+- Los routers se gestionan como nodos `RT.*` vía `SPAWN_NODE`/`KILL_NODE` usando los endpoints de nodos.
 
 ### 5.3 Estado de Isla
 

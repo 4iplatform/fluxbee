@@ -6,6 +6,9 @@
 **Complementa:** `07-operaciones.md` §4.9, `sy_orchestrator_tasks.md` TODO versionado
 **Resuelve:** Gap de versionado de binarios core + integración de terceros vendorizados
 
+> Estado documental (2026-03-08): este anexo describe diseño pre-cierre V2 y se mantiene como referencia histórica.  
+> Contrato operativo vigente: `docs/onworking/SY.orchestrator — Spec de Cambios v2.md` + `docs/onworking/sy_orchestrator_v2_tasks.md`.
+
 ---
 
 ## 1. Principio

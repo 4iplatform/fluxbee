@@ -2,24 +2,24 @@
 set -euo pipefail
 
 # E2E for orchestrator system messages over router:
-# 1) RUNTIME_UPDATE (updates in-memory runtime manifest)
+# 1) optional SYSTEM_UPDATE (runtime category, strict payload)
 # 2) SPAWN_NODE remote (worker hive)
 # 3) KILL_NODE remote (cleanup)
 #
 # Requires:
 # - motherbee with sy-orchestrator running
 # - reachable worker hive already registered (TARGET_HIVE)
-# - write permissions (sudo) to stage runtime script in /var/lib/fluxbee/runtimes
+# - write permissions (sudo) to stage runtime script in /var/lib/fluxbee/dist/runtimes
 #
 # Usage:
-#   TARGET_HIVE="worker-220" bash scripts/orchestrator_runtime_update_spawn_e2e.sh
+#   TARGET_HIVE="worker-220" bash scripts/orchestrator_system_update_spawn_e2e.sh
 #
 # Optional:
 #   ORCH_RUNTIME="wf.orch.diag"
 #   ORCH_VERSION="0.0.1"
 #   ORCH_TIMEOUT_SECS="45"
 #   ORCH_SEND_KILL="1"
-#   ORCH_SEND_RUNTIME_UPDATE="1"
+#   ORCH_SEND_SYSTEM_UPDATE="1"
 #   ORCH_UNIT="fluxbee-orch-e2e-<custom>"
 #   ORCH_ROUTE_MODE="unicast|resolve"
 #   ORCH_EXPECT_SPAWN_UNREACHABLE_REASON="OPA_NO_TARGET"
@@ -34,7 +34,7 @@ ORCH_RUNTIME="${ORCH_RUNTIME:-wf.orch.diag}"
 ORCH_VERSION="${ORCH_VERSION:-0.0.1}"
 ORCH_TIMEOUT_SECS="${ORCH_TIMEOUT_SECS:-45}"
 ORCH_SEND_KILL="${ORCH_SEND_KILL:-1}"
-ORCH_SEND_RUNTIME_UPDATE="${ORCH_SEND_RUNTIME_UPDATE:-1}"
+ORCH_SEND_SYSTEM_UPDATE="${ORCH_SEND_SYSTEM_UPDATE:-0}"
 BUILD_BIN="${BUILD_BIN:-1}"
 ORCH_UNIT="${ORCH_UNIT:-fluxbee-orch-e2e-$(date +%s)}"
 ORCH_ROUTE_MODE="${ORCH_ROUTE_MODE:-unicast}"
@@ -52,7 +52,7 @@ if [[ -z "${ORCH_REQUIRE_OPA_SHM_HEALTH}" ]]; then
   fi
 fi
 
-RUNTIME_DIR="/var/lib/fluxbee/runtimes/${ORCH_RUNTIME}/${ORCH_VERSION}"
+RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/${ORCH_RUNTIME}/${ORCH_VERSION}"
 START_SCRIPT="${RUNTIME_DIR}/bin/start.sh"
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
@@ -97,14 +97,14 @@ if [[ "${ORCH_REQUIRE_OPA_SHM_HEALTH}" == "1" ]]; then
   ./target/release/opa_shm_diag
 fi
 
-echo "Running orchestrator runtime-update + spawn/kill E2E..."
+echo "Running orchestrator system-update + spawn/kill E2E..."
 TARGET_HIVE="${TARGET_HIVE}" \
 ORCH_TARGET_HIVE="${TARGET_HIVE}" \
 ORCH_RUNTIME="${ORCH_RUNTIME}" \
 ORCH_VERSION="${ORCH_VERSION}" \
 ORCH_TIMEOUT_SECS="${ORCH_TIMEOUT_SECS}" \
 ORCH_SEND_KILL="${ORCH_SEND_KILL}" \
-ORCH_SEND_RUNTIME_UPDATE="${ORCH_SEND_RUNTIME_UPDATE}" \
+ORCH_SEND_SYSTEM_UPDATE="${ORCH_SEND_SYSTEM_UPDATE}" \
 ORCH_UNIT="${ORCH_UNIT}" \
 ORCH_ROUTE_MODE="${ORCH_ROUTE_MODE}" \
 ORCH_EXPECT_SPAWN_UNREACHABLE_REASON="${ORCH_EXPECT_SPAWN_UNREACHABLE_REASON}" \
@@ -112,4 +112,4 @@ ORCH_EXPECT_SPAWN_ERROR_CODE="${ORCH_EXPECT_SPAWN_ERROR_CODE}" \
 ORCH_DIAG_NODE_NAME="${ORCH_DIAG_NODE_NAME}" \
 ./target/release/orch_system_diag
 
-echo "orchestrator runtime update + spawn E2E passed."
+echo "orchestrator system update + spawn E2E passed."

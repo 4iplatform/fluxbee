@@ -7,6 +7,10 @@ STATE_DIR="/var/lib/fluxbee"
 RUN_DIR="/var/run/fluxbee"
 APPLY_DEV_OWNERSHIP="${APPLY_DEV_OWNERSHIP:-1}"
 INSTALL_OWNER="${INSTALL_OWNER:-${SUDO_USER:-$USER}}"
+SEED_RUNTIME_FIXTURE="${SEED_RUNTIME_FIXTURE:-1}"
+RUNTIME_FIXTURE_NAME="${RUNTIME_FIXTURE_NAME:-wf.orch.diag}"
+RUNTIME_FIXTURE_VERSION="${RUNTIME_FIXTURE_VERSION:-0.0.1}"
+RUNTIME_FIXTURE_SLEEP_SECS="${RUNTIME_FIXTURE_SLEEP_SECS:-3600}"
 
 if [[ "${SKIP_BUILD:-}" != "1" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
@@ -44,12 +48,8 @@ sudo install -d "$STATE_DIR/modules"
 sudo install -d "$STATE_DIR/blob"
 sudo install -d "$STATE_DIR/syncthing"
 sudo install -d "$STATE_DIR/vendor"
-sudo install -d "$STATE_DIR/vendor/syncthing"
-sudo install -d "$STATE_DIR/runtimes"
+sudo install -d "$STATE_DIR/vendor/bin"
 sudo install -d "$STATE_DIR/nats"
-sudo install -d "$STATE_DIR/core"
-sudo install -d "$STATE_DIR/core/bin"
-sudo install -d "$STATE_DIR/core/bin.prev"
 sudo install -d "$STATE_DIR/dist"
 sudo install -d "$STATE_DIR/dist/runtimes"
 sudo install -d "$STATE_DIR/dist/core"
@@ -122,17 +122,7 @@ else
 fi
 sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
 
-echo "Updating core source repo in $STATE_DIR/core/bin..."
 echo "Updating core source repo in $STATE_DIR/dist/core/bin..."
-sudo install -m 0755 "$json_router_bin" "$STATE_DIR/core/bin/rt-gateway"
-sudo install -m 0755 "$sy_admin_bin" "$STATE_DIR/core/bin/sy-admin"
-sudo install -m 0755 "$sy_config_bin" "$STATE_DIR/core/bin/sy-config-routes"
-sudo install -m 0755 "$sy_orch_bin" "$STATE_DIR/core/bin/sy-orchestrator"
-sudo install -m 0755 "$sy_storage_bin" "$STATE_DIR/core/bin/sy-storage"
-if [[ -n "${sy_identity_bin:-}" ]]; then
-  sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/core/bin/sy-identity"
-fi
-sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/core/bin/sy-opa-rules"
 sudo install -m 0755 "$json_router_bin" "$STATE_DIR/dist/core/bin/rt-gateway"
 sudo install -m 0755 "$sy_admin_bin" "$STATE_DIR/dist/core/bin/sy-admin"
 sudo install -m 0755 "$sy_config_bin" "$STATE_DIR/dist/core/bin/sy-config-routes"
@@ -189,10 +179,9 @@ cat >"$core_manifest_tmp" <<EOF
   }
 }
 EOF
-sudo install -m 0644 "$core_manifest_tmp" "$STATE_DIR/core/manifest.json"
 sudo install -m 0644 "$core_manifest_tmp" "$STATE_DIR/dist/core/manifest.json"
 rm -f "$core_manifest_tmp"
-echo "Updated core manifests at $STATE_DIR/core/manifest.json and $STATE_DIR/dist/core/manifest.json"
+echo "Updated core manifest at $STATE_DIR/dist/core/manifest.json"
 
 seeded_syncthing_vendor=0
 candidate_syncthing_vendor=""
@@ -218,7 +207,6 @@ if [[ -z "$candidate_syncthing_vendor" ]]; then
 fi
 
 if [[ -n "$candidate_syncthing_vendor" ]]; then
-  sudo install -m 0755 "$candidate_syncthing_vendor" "$STATE_DIR/vendor/syncthing/syncthing"
   sudo install -m 0755 "$candidate_syncthing_vendor" "$STATE_DIR/dist/vendor/syncthing/syncthing"
   seeded_syncthing_vendor=1
   echo "Seeded Syncthing vendor binary from $candidate_syncthing_vendor"
@@ -227,7 +215,6 @@ fi
 if [[ "$seeded_syncthing_vendor" -eq 0 ]] && command -v syncthing >/dev/null 2>&1; then
   syncthing_cmd="$(command -v syncthing)"
   if [[ -x "$syncthing_cmd" ]]; then
-    sudo install -m 0755 "$syncthing_cmd" "$STATE_DIR/vendor/syncthing/syncthing"
     sudo install -m 0755 "$syncthing_cmd" "$STATE_DIR/dist/vendor/syncthing/syncthing"
     seeded_syncthing_vendor=1
     echo "Seeded Syncthing vendor binary from $syncthing_cmd"
@@ -235,6 +222,82 @@ if [[ "$seeded_syncthing_vendor" -eq 0 ]] && command -v syncthing >/dev/null 2>&
 fi
 if [[ "$seeded_syncthing_vendor" -eq 0 ]]; then
   echo "Warning: Syncthing vendor binary not found in vendor/. Put it at vendor/syncthing/syncthing or vendor/<bundle>/syncthing, or install syncthing before running orchestrator blob sync." >&2
+fi
+
+if [[ "$SEED_RUNTIME_FIXTURE" == "1" ]]; then
+  echo "Seeding runtime fixture in $STATE_DIR/dist/runtimes: $RUNTIME_FIXTURE_NAME@$RUNTIME_FIXTURE_VERSION"
+  runtime_fixture_dir="$STATE_DIR/dist/runtimes/$RUNTIME_FIXTURE_NAME/$RUNTIME_FIXTURE_VERSION"
+  runtime_fixture_start="$runtime_fixture_dir/bin/start.sh"
+  sudo install -d "$runtime_fixture_dir/bin"
+  cat <<EOF | sudo tee "$runtime_fixture_start" >/dev/null
+#!/usr/bin/env bash
+set -euo pipefail
+exec /bin/sleep "$RUNTIME_FIXTURE_SLEEP_SECS"
+EOF
+  sudo chmod 0755 "$runtime_fixture_start"
+
+  if command -v python3 >/dev/null 2>&1; then
+    runtime_manifest_tmp="$(mktemp)"
+    cat <<EOF | python3 - "$STATE_DIR/dist/runtimes/manifest.json" "$RUNTIME_FIXTURE_NAME" "$RUNTIME_FIXTURE_VERSION" >"$runtime_manifest_tmp"
+import json
+import pathlib
+import sys
+import time
+
+manifest_path = pathlib.Path(sys.argv[1])
+runtime_name = sys.argv[2]
+runtime_version = sys.argv[3]
+
+doc = {
+    "schema_version": 1,
+    "version": 0,
+    "updated_at": None,
+    "runtimes": {},
+}
+
+if manifest_path.exists():
+    try:
+        loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            doc.update(loaded)
+    except Exception:
+        pass
+
+schema_version = doc.get("schema_version")
+if not isinstance(schema_version, int) or schema_version < 1:
+    schema_version = 1
+doc["schema_version"] = schema_version
+doc["version"] = int(time.time() * 1000)
+doc["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+runtimes = doc.get("runtimes")
+if not isinstance(runtimes, dict):
+    runtimes = {}
+doc["runtimes"] = runtimes
+
+entry = runtimes.get(runtime_name)
+if not isinstance(entry, dict):
+    entry = {}
+
+available = entry.get("available")
+if not isinstance(available, list):
+    available = []
+available = [str(v) for v in available if str(v).strip()]
+if runtime_version not in available:
+    available.append(runtime_version)
+
+entry["available"] = sorted(set(available))
+entry["current"] = runtime_version
+runtimes[runtime_name] = entry
+
+print(json.dumps(doc, indent=2, sort_keys=True))
+EOF
+    sudo install -m 0644 "$runtime_manifest_tmp" "$STATE_DIR/dist/runtimes/manifest.json"
+    rm -f "$runtime_manifest_tmp"
+    echo "Updated runtime manifest at $STATE_DIR/dist/runtimes/manifest.json (seeded $RUNTIME_FIXTURE_NAME@$RUNTIME_FIXTURE_VERSION)"
+  else
+    echo "Warning: python3 not found; skipping runtime manifest seed in $STATE_DIR/dist/runtimes/manifest.json" >&2
+  fi
 fi
 
 if [[ -f "$ROOT_DIR/config/hive.yaml" ]]; then
@@ -295,5 +358,5 @@ if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then
   sudo chown "$INSTALL_OWNER":"$INSTALL_OWNER" "$CONFIG_DIR/sy-config-routes.yaml" "$CONFIG_DIR/hive.yaml" 2>/dev/null || true
 fi
 
-echo "Installed config to $CONFIG_DIR, binaries to /usr/bin, core source repo to $STATE_DIR/dist/core/bin (legacy mirror: $STATE_DIR/core/bin), systemd units, and runtime directories."
+echo "Installed config to $CONFIG_DIR, binaries to /usr/bin, core source repo to $STATE_DIR/dist/core/bin, systemd units, and runtime directories."
 echo "Note: fluxbee-syncthing is managed dynamically by sy-orchestrator from hive.yaml (blob.sync.*)."

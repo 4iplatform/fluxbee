@@ -1,11 +1,21 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
+use crate::node_client::NodeError;
 use crate::payload::{PayloadError, TextV1Payload, TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES};
+use crate::protocol::{
+    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+};
+use crate::split::{NodeReceiver, NodeSender};
 
 pub mod constants {
     pub const BLOB_NAME_MAX_CHARS: usize = 128;
@@ -17,20 +27,28 @@ pub mod constants {
     pub const BLOB_RETRY_INITIAL_MS: u64 = 100;
     pub const BLOB_RETRY_BACKOFF: f64 = 2.0;
     pub const BLOB_STAGING_TTL_HOURS: u64 = 24;
+    pub const BLOB_ACTIVE_RETAIN_DAYS: u64 = 30;
+    pub const BLOB_DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
     pub const BLOB_MAX_EXT_CHARS: usize = 10;
     pub const TEXT_V1_DEFAULT_OVERHEAD_BYTES: usize = 2_048;
+    pub const BLOB_SYNC_HINT_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+    pub const BLOB_SYNC_HINT_MAX_TIMEOUT_MS: u64 = 300_000;
+    pub const BLOB_SYNC_HINT_RETRY_INTERVAL_MS: u64 = 500;
 }
 
 pub use constants::{
-    BLOB_HASH_LEN, BLOB_MAX_EXT_CHARS, BLOB_NAME_ALLOWED, BLOB_NAME_MAX_CHARS, BLOB_PREFIX_LEN,
-    BLOB_RETRY_BACKOFF, BLOB_RETRY_INITIAL_MS, BLOB_RETRY_MAX_MS, BLOB_STAGING_TTL_HOURS,
-    TEXT_V1_DEFAULT_OVERHEAD_BYTES,
+    BLOB_ACTIVE_RETAIN_DAYS, BLOB_DEFAULT_MAX_BYTES, BLOB_HASH_LEN, BLOB_MAX_EXT_CHARS,
+    BLOB_NAME_ALLOWED, BLOB_NAME_MAX_CHARS, BLOB_PREFIX_LEN, BLOB_RETRY_BACKOFF,
+    BLOB_RETRY_INITIAL_MS, BLOB_RETRY_MAX_MS, BLOB_STAGING_TTL_HOURS,
+    BLOB_SYNC_HINT_DEFAULT_TIMEOUT_MS, BLOB_SYNC_HINT_MAX_TIMEOUT_MS,
+    BLOB_SYNC_HINT_RETRY_INTERVAL_MS, TEXT_V1_DEFAULT_OVERHEAD_BYTES,
 };
 
 #[derive(Debug, Clone)]
 pub struct BlobConfig {
     pub blob_root: PathBuf,
     pub name_max_chars: usize,
+    pub max_blob_bytes: Option<u64>,
 }
 
 impl Default for BlobConfig {
@@ -38,6 +56,7 @@ impl Default for BlobConfig {
         Self {
             blob_root: PathBuf::from("/var/lib/fluxbee/blob"),
             name_max_chars: BLOB_NAME_MAX_CHARS,
+            max_blob_bytes: Some(BLOB_DEFAULT_MAX_BYTES),
         }
     }
 }
@@ -103,6 +122,94 @@ pub struct BlobStat {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BlobGcOptions {
+    pub staging_ttl_hours: u64,
+    pub active_retain_days: u64,
+    pub apply: bool,
+}
+
+impl Default for BlobGcOptions {
+    fn default() -> Self {
+        Self {
+            staging_ttl_hours: BLOB_STAGING_TTL_HOURS,
+            active_retain_days: BLOB_ACTIVE_RETAIN_DAYS,
+            apply: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BlobGcPassReport {
+    pub apply: bool,
+    pub scanned_files: u64,
+    pub candidate_files: u64,
+    pub deleted_files: u64,
+    pub deleted_bytes: u64,
+    pub skipped_non_blob_files: u64,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BlobGcReport {
+    pub apply: bool,
+    pub staging_ttl_hours: u64,
+    pub active_retain_days: u64,
+    pub staging: BlobGcPassReport,
+    pub active: BlobGcPassReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BlobMetricsSnapshot {
+    pub blob_put_total: u64,
+    pub blob_put_bytes_total: u64,
+    pub blob_resolve_total: u64,
+    pub blob_resolve_retry_total: u64,
+    pub blob_errors_total: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublishBlobRequest<'a> {
+    pub data: &'a [u8],
+    pub filename_original: &'a str,
+    pub mime: &'a str,
+    pub targets: Vec<String>,
+    pub wait_for_idle: bool,
+    pub timeout_ms: u64,
+}
+
+impl<'a> PublishBlobRequest<'a> {
+    pub fn new(
+        data: &'a [u8],
+        filename_original: &'a str,
+        mime: &'a str,
+        targets: Vec<String>,
+    ) -> Self {
+        Self {
+            data,
+            filename_original,
+            mime,
+            targets,
+            wait_for_idle: true,
+            timeout_ms: BLOB_SYNC_HINT_DEFAULT_TIMEOUT_MS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncHintTargetResult {
+    pub target: String,
+    pub status: String,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublishBlobResult {
+    pub blob_ref: BlobRef,
+    pub timeout_ms: u64,
+    pub targets: Vec<SyncHintTargetResult>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BlobError {
     #[error("BLOB_NOT_FOUND: {0}")]
@@ -115,6 +222,12 @@ pub enum BlobError {
     InvalidRef(String),
     #[error("BLOB_TOO_LARGE: size={size} max={max}")]
     TooLarge { size: u64, max: u64 },
+    #[error("BLOB_SYNC_HINT_TIMEOUT: target={target} timeout_ms={timeout_ms}")]
+    SyncHintTimeout { target: String, timeout_ms: u64 },
+    #[error("BLOB_SYNC_HINT_FAILED: target={target} detail={detail}")]
+    SyncHintFailed { target: String, detail: String },
+    #[error("BLOB_SYNC_HINT_TRANSPORT: target={target} detail={detail}")]
+    SyncHintTransport { target: String, detail: String },
     #[error("BLOB_NOT_IMPLEMENTED")]
     NotImplemented,
 }
@@ -124,7 +237,23 @@ pub struct BlobToolkit {
     cfg: BlobConfig,
 }
 
+static BLOB_PUT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BLOB_PUT_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BLOB_RESOLVE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BLOB_RESOLVE_RETRY_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BLOB_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 impl BlobToolkit {
+    pub fn metrics_snapshot() -> BlobMetricsSnapshot {
+        BlobMetricsSnapshot {
+            blob_put_total: BLOB_PUT_TOTAL.load(Ordering::Relaxed),
+            blob_put_bytes_total: BLOB_PUT_BYTES_TOTAL.load(Ordering::Relaxed),
+            blob_resolve_total: BLOB_RESOLVE_TOTAL.load(Ordering::Relaxed),
+            blob_resolve_retry_total: BLOB_RESOLVE_RETRY_TOTAL.load(Ordering::Relaxed),
+            blob_errors_total: BLOB_ERRORS_TOTAL.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn new(cfg: BlobConfig) -> Result<Self, BlobError> {
         if cfg.blob_root.as_os_str().is_empty() {
             return Err(BlobError::InvalidRef("blob_root is required".to_string()));
@@ -132,6 +261,11 @@ impl BlobToolkit {
         if cfg.name_max_chars == 0 {
             return Err(BlobError::InvalidRef(
                 "name_max_chars must be > 0".to_string(),
+            ));
+        }
+        if cfg.max_blob_bytes.is_some_and(|max| max == 0) {
+            return Err(BlobError::InvalidRef(
+                "max_blob_bytes must be > 0 when configured".to_string(),
             ));
         }
         Ok(Self { cfg })
@@ -146,22 +280,39 @@ impl BlobToolkit {
     }
 
     pub fn put(&self, source_path: &Path, original_filename: &str) -> Result<BlobRef, BlobError> {
-        let data =
-            std::fs::read(source_path).map_err(|err| map_io_error(err, "read source file"))?;
-        let fallback_name = source_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("blob.bin");
-        let requested_name = if original_filename.trim().is_empty() {
-            fallback_name
-        } else {
-            original_filename
-        };
-        let (blob_ref, staging_path) =
-            self.build_blob_ref_and_staging_path(&data, requested_name, None)?;
-        std::fs::write(&staging_path, data)
-            .map_err(|err| map_io_error(err, "write staging file"))?;
-        Ok(blob_ref)
+        let result = (|| -> Result<BlobRef, BlobError> {
+            if let Some(source_size) = std::fs::metadata(source_path).ok().map(|m| m.len()) {
+                self.enforce_size_limit(source_size)?;
+            }
+            let data =
+                std::fs::read(source_path).map_err(|err| map_io_error(err, "read source file"))?;
+            self.enforce_size_limit(data.len() as u64)?;
+            let fallback_name = source_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("blob.bin");
+            let requested_name = if original_filename.trim().is_empty() {
+                fallback_name
+            } else {
+                original_filename
+            };
+            let (blob_ref, staging_path) =
+                self.build_blob_ref_and_staging_path(&data, requested_name, None)?;
+            std::fs::write(&staging_path, data)
+                .map_err(|err| map_io_error(err, "write staging file"))?;
+            set_file_mode_0640(&staging_path)?;
+            Ok(blob_ref)
+        })();
+        match result {
+            Ok(blob_ref) => {
+                metrics_record_put(blob_ref.size);
+                Ok(blob_ref)
+            }
+            Err(err) => {
+                metrics_record_error();
+                Err(err)
+            }
+        }
     }
 
     pub fn put_bytes(
@@ -170,43 +321,177 @@ impl BlobToolkit {
         original_filename: &str,
         mime: &str,
     ) -> Result<BlobRef, BlobError> {
-        let fallback_name = if original_filename.trim().is_empty() {
-            "blob.bin"
-        } else {
-            original_filename
-        };
-        let mime_override = if mime.trim().is_empty() {
-            None
-        } else {
-            Some(mime)
-        };
-        let (blob_ref, staging_path) =
-            self.build_blob_ref_and_staging_path(data, fallback_name, mime_override)?;
-        std::fs::write(&staging_path, data)
-            .map_err(|err| map_io_error(err, "write staging file"))?;
-        Ok(blob_ref)
+        let result = (|| -> Result<BlobRef, BlobError> {
+            self.enforce_size_limit(data.len() as u64)?;
+            let fallback_name = if original_filename.trim().is_empty() {
+                "blob.bin"
+            } else {
+                original_filename
+            };
+            let mime_override = if mime.trim().is_empty() {
+                None
+            } else {
+                Some(mime)
+            };
+            let (blob_ref, staging_path) =
+                self.build_blob_ref_and_staging_path(data, fallback_name, mime_override)?;
+            std::fs::write(&staging_path, data)
+                .map_err(|err| map_io_error(err, "write staging file"))?;
+            set_file_mode_0640(&staging_path)?;
+            Ok(blob_ref)
+        })();
+        match result {
+            Ok(blob_ref) => {
+                metrics_record_put(blob_ref.size);
+                Ok(blob_ref)
+            }
+            Err(err) => {
+                metrics_record_error();
+                Err(err)
+            }
+        }
+    }
+
+    /// Publica un blob local (`put_bytes` + `promote`) y confirma convergencia por target
+    /// usando `SYSTEM_SYNC_HINT`.
+    ///
+    /// Nota: este helper consume mensajes del `NodeReceiver` mientras espera respuestas por
+    /// `trace_id`; para evitar interferencias, se recomienda usar un receptor dedicado de control.
+    pub async fn publish_blob_and_confirm(
+        &self,
+        sender: &NodeSender,
+        receiver: &mut NodeReceiver,
+        request: PublishBlobRequest<'_>,
+    ) -> Result<PublishBlobResult, BlobError> {
+        if request.targets.is_empty() {
+            return Err(BlobError::InvalidRef(
+                "publish_blob_and_confirm requires at least one target".to_string(),
+            ));
+        }
+
+        let timeout_ms = request.timeout_ms.max(1).min(BLOB_SYNC_HINT_MAX_TIMEOUT_MS);
+
+        let blob_ref = self.put_bytes(request.data, request.filename_original, request.mime)?;
+        self.promote(&blob_ref)?;
+
+        let mut target_results = Vec::with_capacity(request.targets.len());
+        for raw_target in request.targets {
+            let target = normalize_orchestrator_target(&raw_target)?;
+            let started = Instant::now();
+            let deadline = started + Duration::from_millis(timeout_ms);
+
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(BlobError::SyncHintTimeout { target, timeout_ms });
+                }
+                let remaining = deadline - now;
+                let remaining_ms = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
+                let attempt_timeout_ms = remaining_ms.max(1).min(BLOB_SYNC_HINT_MAX_TIMEOUT_MS);
+
+                let trace_id = Uuid::new_v4().to_string();
+                let payload = json!({
+                    "channel": "blob",
+                    "folder_id": "fluxbee-blob",
+                    "wait_for_idle": request.wait_for_idle,
+                    "timeout_ms": attempt_timeout_ms,
+                });
+                let message = Message {
+                    routing: Routing {
+                        src: sender.uuid().to_string(),
+                        dst: Destination::Unicast(target.clone()),
+                        ttl: 16,
+                        trace_id: trace_id.clone(),
+                    },
+                    meta: Meta {
+                        msg_type: SYSTEM_KIND.to_string(),
+                        msg: Some("SYSTEM_SYNC_HINT".to_string()),
+                        scope: None,
+                        target: None,
+                        action: None,
+                        priority: None,
+                        context: None,
+                    },
+                    payload,
+                };
+
+                sender
+                    .send(message)
+                    .await
+                    .map_err(|err| BlobError::SyncHintTransport {
+                        target: target.clone(),
+                        detail: format!("send SYSTEM_SYNC_HINT failed: {err}"),
+                    })?;
+
+                let response = wait_for_sync_hint_response(
+                    receiver,
+                    &trace_id,
+                    &target,
+                    Duration::from_millis(attempt_timeout_ms),
+                )
+                .await?;
+
+                if response.status == "ok" {
+                    target_results.push(SyncHintTargetResult {
+                        target,
+                        status: response.status,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    });
+                    break;
+                }
+
+                if response.status == "sync_pending" {
+                    if Instant::now() >= deadline {
+                        return Err(BlobError::SyncHintTimeout { target, timeout_ms });
+                    }
+                    tokio::time::sleep(Duration::from_millis(BLOB_SYNC_HINT_RETRY_INTERVAL_MS))
+                        .await;
+                    continue;
+                }
+
+                let detail = response
+                    .error_code
+                    .map(|code| format!("error_code={code}"))
+                    .or(response.message)
+                    .unwrap_or_else(|| "sync hint returned error".to_string());
+                return Err(BlobError::SyncHintFailed { target, detail });
+            }
+        }
+
+        Ok(PublishBlobResult {
+            blob_ref,
+            timeout_ms,
+            targets: target_results,
+        })
     }
 
     pub fn promote(&self, blob_ref: &BlobRef) -> Result<(), BlobError> {
-        Self::validate_blob_ref(blob_ref)?;
-        let from = self.staging_path(blob_ref);
-        let to = self.resolve(blob_ref);
-        if to.exists() {
-            return Ok(());
-        }
-
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| map_io_error(err, "create active directory"))?;
-        }
-
-        std::fs::rename(&from, &to).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                BlobError::NotFound(blob_ref.blob_name.clone())
-            } else {
-                map_io_error(err, "promote staging->active")
+        let result = (|| -> Result<(), BlobError> {
+            Self::validate_blob_ref(blob_ref)?;
+            let from = self.staging_path(blob_ref);
+            let to = self.resolve_path(blob_ref);
+            if to.exists() {
+                return Ok(());
             }
-        })?;
+
+            if let Some(parent) = to.parent() {
+                ensure_dir_mode_0750(parent)?;
+            }
+
+            std::fs::rename(&from, &to).map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    BlobError::NotFound(blob_ref.blob_name.clone())
+                } else {
+                    map_io_error(err, "promote staging->active")
+                }
+            })?;
+            set_file_mode_0640(&to)?;
+            Ok(())
+        })();
+        if let Err(err) = result {
+            metrics_record_error();
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -248,12 +533,8 @@ impl BlobToolkit {
     }
 
     pub fn resolve(&self, blob_ref: &BlobRef) -> PathBuf {
-        let prefix = Self::prefix(&blob_ref.blob_name);
-        self.cfg
-            .blob_root
-            .join("active")
-            .join(prefix)
-            .join(&blob_ref.blob_name)
+        metrics_record_resolve();
+        self.resolve_path(blob_ref)
     }
 
     pub async fn resolve_with_retry(
@@ -261,8 +542,12 @@ impl BlobToolkit {
         blob_ref: &BlobRef,
         cfg: ResolveRetryConfig,
     ) -> Result<PathBuf, BlobError> {
-        Self::validate_blob_ref(blob_ref)?;
-        let path = self.resolve(blob_ref);
+        if let Err(err) = Self::validate_blob_ref(blob_ref) {
+            metrics_record_error();
+            return Err(err);
+        }
+        metrics_record_resolve();
+        let path = self.resolve_path(blob_ref);
         if path.exists() {
             return Ok(path);
         }
@@ -275,18 +560,27 @@ impl BlobToolkit {
         } else {
             1.0
         };
+        let mut retry_attempts: u64 = 0;
 
         loop {
             let elapsed = started.elapsed();
             if elapsed >= max_wait {
+                if retry_attempts > 0 {
+                    BLOB_RESOLVE_RETRY_TOTAL.fetch_add(retry_attempts, Ordering::Relaxed);
+                }
+                metrics_record_error();
                 return Err(BlobError::NotFound(blob_ref.blob_name.clone()));
             }
 
             let remaining = max_wait - elapsed;
             let sleep_for = Duration::from_millis(delay_ms).min(remaining);
             tokio::time::sleep(sleep_for).await;
+            retry_attempts = retry_attempts.saturating_add(1);
 
             if path.exists() {
+                if retry_attempts > 0 {
+                    BLOB_RESOLVE_RETRY_TOTAL.fetch_add(retry_attempts, Ordering::Relaxed);
+                }
                 return Ok(path);
             }
 
@@ -299,12 +593,16 @@ impl BlobToolkit {
         if Self::validate_blob_ref(blob_ref).is_err() {
             return false;
         }
-        self.resolve(blob_ref).exists()
+        self.resolve_path(blob_ref).exists()
     }
 
     pub fn stat(&self, blob_ref: &BlobRef) -> Result<BlobStat, BlobError> {
-        Self::validate_blob_ref(blob_ref)?;
-        let path = self.resolve(blob_ref);
+        if let Err(err) = Self::validate_blob_ref(blob_ref) {
+            metrics_record_error();
+            return Err(err);
+        }
+        metrics_record_resolve();
+        let path = self.resolve_path(blob_ref);
         match std::fs::metadata(&path) {
             Ok(meta) => Ok(BlobStat {
                 size_on_disk: meta.len(),
@@ -316,8 +614,262 @@ impl BlobToolkit {
                 exists: false,
                 path,
             }),
-            Err(err) => Err(BlobError::Io(err.to_string())),
+            Err(err) => {
+                metrics_record_error();
+                Err(BlobError::Io(err.to_string()))
+            }
         }
+    }
+
+    pub fn run_gc(&self, options: BlobGcOptions) -> Result<BlobGcReport, BlobError> {
+        let result = (|| -> Result<BlobGcReport, BlobError> {
+            let now = std::time::SystemTime::now();
+            let staging = self.cleanup_staging_orphans_with_now(
+                options.staging_ttl_hours,
+                options.apply,
+                now,
+            )?;
+            let active = self.gc_active_by_spool_day_with_now(
+                options.active_retain_days,
+                options.apply,
+                now,
+            )?;
+            Ok(BlobGcReport {
+                apply: options.apply,
+                staging_ttl_hours: options.staging_ttl_hours,
+                active_retain_days: options.active_retain_days,
+                staging,
+                active,
+            })
+        })();
+        if let Err(err) = result {
+            metrics_record_error();
+            return Err(err);
+        }
+        result
+    }
+
+    pub fn cleanup_staging_orphans(
+        &self,
+        ttl_hours: u64,
+        apply: bool,
+    ) -> Result<BlobGcPassReport, BlobError> {
+        self.cleanup_staging_orphans_with_now(ttl_hours, apply, std::time::SystemTime::now())
+    }
+
+    pub fn gc_active_by_spool_day(
+        &self,
+        retain_days: u64,
+        apply: bool,
+    ) -> Result<BlobGcPassReport, BlobError> {
+        self.gc_active_by_spool_day_with_now(retain_days, apply, std::time::SystemTime::now())
+    }
+
+    fn cleanup_staging_orphans_with_now(
+        &self,
+        ttl_hours: u64,
+        apply: bool,
+        now: std::time::SystemTime,
+    ) -> Result<BlobGcPassReport, BlobError> {
+        let mut report = BlobGcPassReport {
+            apply,
+            ..BlobGcPassReport::default()
+        };
+        let staging_root = self.cfg.blob_root.join("staging");
+        let cutoff = now
+            .checked_sub(Duration::from_secs(ttl_hours.saturating_mul(3600)))
+            .unwrap_or(std::time::UNIX_EPOCH);
+        for prefix_dir in list_prefix_dirs(&staging_root)? {
+            for item in std::fs::read_dir(&prefix_dir)
+                .map_err(|err| map_io_error(err, "read staging prefix directory"))?
+            {
+                let item = match item {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        report
+                            .errors
+                            .push(format!("read staging directory entry failed: {err}"));
+                        continue;
+                    }
+                };
+                let path = item.path();
+                let file_type = match item.file_type() {
+                    Ok(value) => value,
+                    Err(err) => {
+                        report.errors.push(format!(
+                            "read file type failed for '{}': {err}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                };
+                if !file_type.is_file() {
+                    continue;
+                }
+                report.scanned_files = report.scanned_files.saturating_add(1);
+
+                let filename = match path.file_name().and_then(|s| s.to_str()) {
+                    Some(value) => value,
+                    None => {
+                        report.skipped_non_blob_files =
+                            report.skipped_non_blob_files.saturating_add(1);
+                        continue;
+                    }
+                };
+                if validate_blob_name(filename).is_err() {
+                    report.skipped_non_blob_files = report.skipped_non_blob_files.saturating_add(1);
+                    continue;
+                }
+
+                let metadata = match std::fs::metadata(&path) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        report.errors.push(format!(
+                            "read staging metadata failed for '{}': {err}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                };
+                let modified = match metadata.modified() {
+                    Ok(value) => value,
+                    Err(err) => {
+                        report.errors.push(format!(
+                            "read staging mtime failed for '{}': {err}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                };
+                if modified > cutoff {
+                    continue;
+                }
+                report.candidate_files = report.candidate_files.saturating_add(1);
+                if apply {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {
+                            report.deleted_files = report.deleted_files.saturating_add(1);
+                            report.deleted_bytes =
+                                report.deleted_bytes.saturating_add(metadata.len());
+                        }
+                        Err(err) => {
+                            report.errors.push(format!(
+                                "remove staging file failed for '{}': {err}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+            }
+            if apply {
+                remove_dir_if_empty(&prefix_dir, &mut report.errors);
+            }
+        }
+        Ok(report)
+    }
+
+    fn gc_active_by_spool_day_with_now(
+        &self,
+        retain_days: u64,
+        apply: bool,
+        now: std::time::SystemTime,
+    ) -> Result<BlobGcPassReport, BlobError> {
+        let mut report = BlobGcPassReport {
+            apply,
+            ..BlobGcPassReport::default()
+        };
+        let active_root = self.cfg.blob_root.join("active");
+        // Conservative approximation of spool_day: file mtime day.
+        let cutoff = now
+            .checked_sub(Duration::from_secs(retain_days.saturating_mul(24 * 3600)))
+            .unwrap_or(std::time::UNIX_EPOCH);
+        for prefix_dir in list_prefix_dirs(&active_root)? {
+            for item in std::fs::read_dir(&prefix_dir)
+                .map_err(|err| map_io_error(err, "read active prefix directory"))?
+            {
+                let item = match item {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        report
+                            .errors
+                            .push(format!("read active directory entry failed: {err}"));
+                        continue;
+                    }
+                };
+                let path = item.path();
+                let file_type = match item.file_type() {
+                    Ok(value) => value,
+                    Err(err) => {
+                        report.errors.push(format!(
+                            "read file type failed for '{}': {err}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                };
+                if !file_type.is_file() {
+                    continue;
+                }
+                report.scanned_files = report.scanned_files.saturating_add(1);
+
+                let filename = match path.file_name().and_then(|s| s.to_str()) {
+                    Some(value) => value,
+                    None => {
+                        report.skipped_non_blob_files =
+                            report.skipped_non_blob_files.saturating_add(1);
+                        continue;
+                    }
+                };
+                if validate_blob_name(filename).is_err() {
+                    report.skipped_non_blob_files = report.skipped_non_blob_files.saturating_add(1);
+                    continue;
+                }
+
+                let metadata = match std::fs::metadata(&path) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        report.errors.push(format!(
+                            "read active metadata failed for '{}': {err}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                };
+                let modified = match metadata.modified() {
+                    Ok(value) => value,
+                    Err(err) => {
+                        report.errors.push(format!(
+                            "read active mtime failed for '{}': {err}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                };
+                if modified > cutoff {
+                    continue;
+                }
+                report.candidate_files = report.candidate_files.saturating_add(1);
+                if apply {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {
+                            report.deleted_files = report.deleted_files.saturating_add(1);
+                            report.deleted_bytes =
+                                report.deleted_bytes.saturating_add(metadata.len());
+                        }
+                        Err(err) => {
+                            report.errors.push(format!(
+                                "remove active file failed for '{}': {err}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+            }
+            if apply {
+                remove_dir_if_empty(&prefix_dir, &mut report.errors);
+            }
+        }
+        Ok(report)
     }
 
     pub fn prefix(blob_name: &str) -> &str {
@@ -331,6 +883,15 @@ impl BlobToolkit {
         self.cfg
             .blob_root
             .join("staging")
+            .join(prefix)
+            .join(&blob_ref.blob_name)
+    }
+
+    fn resolve_path(&self, blob_ref: &BlobRef) -> PathBuf {
+        let prefix = Self::prefix(&blob_ref.blob_name);
+        self.cfg
+            .blob_root
+            .join("active")
             .join(prefix)
             .join(&blob_ref.blob_name)
     }
@@ -351,8 +912,7 @@ impl BlobToolkit {
 
         let prefix = &hash16[..BLOB_PREFIX_LEN];
         let staging_dir = self.cfg.blob_root.join("staging").join(prefix);
-        std::fs::create_dir_all(&staging_dir)
-            .map_err(|err| map_io_error(err, "create staging directory"))?;
+        ensure_dir_mode_0750(&staging_dir)?;
         let staging_path = staging_dir.join(&blob_name);
 
         let mime = mime_override
@@ -368,6 +928,15 @@ impl BlobToolkit {
             spool_day,
         };
         Ok((blob_ref, staging_path))
+    }
+
+    fn enforce_size_limit(&self, size: u64) -> Result<(), BlobError> {
+        if let Some(max) = self.cfg.max_blob_bytes {
+            if size > max {
+                return Err(BlobError::TooLarge { size, max });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -460,6 +1029,227 @@ fn is_iso_day(value: &str) -> bool {
 
 fn map_io_error(err: std::io::Error, ctx: &str) -> BlobError {
     BlobError::Io(format!("{ctx}: {err}"))
+}
+
+fn metrics_record_put(size: u64) {
+    BLOB_PUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    BLOB_PUT_BYTES_TOTAL.fetch_add(size, Ordering::Relaxed);
+}
+
+fn metrics_record_resolve() {
+    BLOB_RESOLVE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+fn metrics_record_error() {
+    BLOB_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+fn ensure_dir_mode_0750(path: &Path) -> Result<(), BlobError> {
+    std::fs::create_dir_all(path).map_err(|err| map_io_error(err, "create directory"))?;
+    #[cfg(unix)]
+    {
+        let perms = Permissions::from_mode(0o750);
+        std::fs::set_permissions(path, perms)
+            .map_err(|err| map_io_error(err, "set directory permissions"))?;
+    }
+    Ok(())
+}
+
+fn set_file_mode_0640(path: &Path) -> Result<(), BlobError> {
+    #[cfg(unix)]
+    {
+        let perms = Permissions::from_mode(0o640);
+        std::fs::set_permissions(path, perms)
+            .map_err(|err| map_io_error(err, "set file permissions"))?;
+    }
+    Ok(())
+}
+
+fn list_prefix_dirs(root: &Path) -> Result<Vec<PathBuf>, BlobError> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut dirs = Vec::new();
+    for item in std::fs::read_dir(root).map_err(|err| map_io_error(err, "read directory"))? {
+        let item = item.map_err(|err| map_io_error(err, "read directory entry"))?;
+        let path = item.path();
+        let file_type = item
+            .file_type()
+            .map_err(|err| map_io_error(err, "read directory entry type"))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(value) => value,
+            None => continue,
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        dirs.push(path);
+    }
+    Ok(dirs)
+}
+
+fn remove_dir_if_empty(path: &Path, errors: &mut Vec<String>) {
+    if !path.exists() {
+        return;
+    }
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => {
+            if entries.next().is_none() {
+                if let Err(err) = std::fs::remove_dir(path) {
+                    errors.push(format!(
+                        "remove empty directory failed for '{}': {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Err(err) => {
+            errors.push(format!(
+                "read directory for empty-check failed '{}': {err}",
+                path.display()
+            ));
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SyncHintResponse {
+    status: String,
+    error_code: Option<String>,
+    message: Option<String>,
+}
+
+fn normalize_orchestrator_target(raw_target: &str) -> Result<String, BlobError> {
+    let trimmed = raw_target.trim();
+    if trimmed.is_empty() {
+        return Err(BlobError::InvalidRef(
+            "sync hint target cannot be empty".to_string(),
+        ));
+    }
+    if trimmed.contains('@') {
+        Ok(trimmed.to_string())
+    } else {
+        Ok(format!("SY.orchestrator@{trimmed}"))
+    }
+}
+
+fn parse_sync_hint_response_payload(
+    payload: &serde_json::Value,
+) -> Result<SyncHintResponse, String> {
+    let status = payload
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if status.is_empty() {
+        return Err("missing payload.status in SYSTEM_SYNC_HINT_RESPONSE".to_string());
+    }
+    Ok(SyncHintResponse {
+        status,
+        error_code: payload
+            .get("error_code")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string()),
+        message: payload
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string()),
+    })
+}
+
+async fn wait_for_sync_hint_response(
+    receiver: &mut NodeReceiver,
+    trace_id: &str,
+    target: &str,
+    timeout: Duration,
+) -> Result<SyncHintResponse, BlobError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(BlobError::SyncHintTimeout {
+                target: target.to_string(),
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+        let remaining = deadline - now;
+        let message = match receiver.recv_timeout(remaining).await {
+            Ok(msg) => msg,
+            Err(NodeError::Timeout) => {
+                return Err(BlobError::SyncHintTimeout {
+                    target: target.to_string(),
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            }
+            Err(err) => {
+                return Err(BlobError::SyncHintTransport {
+                    target: target.to_string(),
+                    detail: format!("receive SYSTEM_SYNC_HINT_RESPONSE failed: {err}"),
+                });
+            }
+        };
+
+        if message.routing.trace_id != trace_id {
+            continue;
+        }
+
+        if message.meta.msg_type == SYSTEM_KIND
+            && message.meta.msg.as_deref() == Some(MSG_UNREACHABLE)
+        {
+            let reason = message
+                .payload
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let original_dst = message
+                .payload
+                .get("original_dst")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
+            return Err(BlobError::SyncHintFailed {
+                target: target.to_string(),
+                detail: format!("router unreachable: reason={reason} original_dst={original_dst}"),
+            });
+        }
+
+        if message.meta.msg_type == SYSTEM_KIND
+            && message.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED)
+        {
+            let original_dst = message
+                .payload
+                .get("original_dst")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
+            let last_hop = message
+                .payload
+                .get("last_hop")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
+            return Err(BlobError::SyncHintFailed {
+                target: target.to_string(),
+                detail: format!(
+                    "router ttl exceeded: original_dst={original_dst} last_hop={last_hop}"
+                ),
+            });
+        }
+
+        if message.meta.msg_type != SYSTEM_KIND
+            || message.meta.msg.as_deref() != Some("SYSTEM_SYNC_HINT_RESPONSE")
+        {
+            continue;
+        }
+
+        return parse_sync_hint_response_payload(&message.payload).map_err(|detail| {
+            BlobError::SyncHintFailed {
+                target: target.to_string(),
+                detail,
+            }
+        });
+    }
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -569,6 +1359,7 @@ mod tests {
         let toolkit = BlobToolkit::new(BlobConfig {
             blob_root: root.clone(),
             name_max_chars: BLOB_NAME_MAX_CHARS,
+            max_blob_bytes: None,
         })
         .expect("toolkit must be created");
         (toolkit, TestRoot { path: root })
@@ -582,6 +1373,20 @@ mod tests {
         assert!(BlobToolkit::validate_blob_name("factura_0123456789abcde.png").is_err());
         assert!(BlobToolkit::validate_blob_name("factura_0123456789abcdef.PNG").is_err());
         assert!(BlobToolkit::validate_blob_name("../x_0123456789abcdef.png").is_err());
+    }
+
+    #[test]
+    fn normalize_orchestrator_target_rules() {
+        assert_eq!(
+            normalize_orchestrator_target("worker-220").expect("normalize hive id"),
+            "SY.orchestrator@worker-220"
+        );
+        assert_eq!(
+            normalize_orchestrator_target("SY.orchestrator@worker-220")
+                .expect("normalize full target"),
+            "SY.orchestrator@worker-220"
+        );
+        assert!(normalize_orchestrator_target("  ").is_err());
     }
 
     #[test]
@@ -625,12 +1430,52 @@ mod tests {
         assert_eq!(stat.size_on_disk, b"file-content".len() as u64);
     }
 
+    #[tokio::test]
+    async fn metrics_snapshot_tracks_blob_operations() {
+        let before = BlobToolkit::metrics_snapshot();
+        let (toolkit, _root) = test_toolkit();
+
+        let blob_ref = toolkit
+            .put_bytes(b"xyz", "metrics.txt", "text/plain")
+            .expect("put bytes");
+        toolkit.promote(&blob_ref).expect("promote");
+        let _ = toolkit.resolve(&blob_ref);
+
+        let missing = BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "missing_metrics_0123456789abcdef.txt".to_string(),
+            size: 1,
+            mime: "text/plain".to_string(),
+            filename_original: "missing_metrics.txt".to_string(),
+            spool_day: "2026-03-09".to_string(),
+        };
+        let _ = toolkit
+            .resolve_with_retry(
+                &missing,
+                ResolveRetryConfig {
+                    max_wait_ms: 25,
+                    initial_delay_ms: 5,
+                    backoff_factor: 1.0,
+                },
+            )
+            .await
+            .expect_err("missing blob must fail");
+
+        let after = BlobToolkit::metrics_snapshot();
+        assert!(after.blob_put_total >= before.blob_put_total + 1);
+        assert!(after.blob_put_bytes_total >= before.blob_put_bytes_total + 3);
+        assert!(after.blob_resolve_total >= before.blob_resolve_total + 2);
+        assert!(after.blob_resolve_retry_total >= before.blob_resolve_retry_total + 1);
+        assert!(after.blob_errors_total >= before.blob_errors_total + 1);
+    }
+
     #[test]
     fn producer_consumer_local_e2e_with_blob_ref() {
         let (producer, root) = test_toolkit();
         let consumer = BlobToolkit::new(BlobConfig {
             blob_root: root.path.clone(),
             name_max_chars: BLOB_NAME_MAX_CHARS,
+            max_blob_bytes: None,
         })
         .expect("consumer toolkit");
 
@@ -721,6 +1566,46 @@ mod tests {
         assert!(matches!(err, BlobError::Io(_)));
     }
 
+    #[test]
+    fn contract_blob_too_large_from_put_bytes() {
+        let (toolkit, _root) = test_toolkit();
+        let limited = BlobToolkit::new(BlobConfig {
+            blob_root: toolkit.cfg.blob_root.clone(),
+            name_max_chars: BLOB_NAME_MAX_CHARS,
+            max_blob_bytes: Some(3),
+        })
+        .expect("limited toolkit");
+        let err = limited
+            .put_bytes(b"1234", "too-large.txt", "text/plain")
+            .expect_err("must fail by size policy");
+        assert!(err.to_string().starts_with("BLOB_TOO_LARGE"));
+        match err {
+            BlobError::TooLarge { size, max } => {
+                assert_eq!(size, 4);
+                assert_eq!(max, 3);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn contract_blob_too_large_from_put_file() {
+        let (toolkit, root) = test_toolkit();
+        let src = root.path.join("large.bin");
+        std::fs::create_dir_all(&root.path).expect("create root");
+        std::fs::write(&src, b"123456").expect("write source");
+        let limited = BlobToolkit::new(BlobConfig {
+            blob_root: toolkit.cfg.blob_root.clone(),
+            name_max_chars: BLOB_NAME_MAX_CHARS,
+            max_blob_bytes: Some(5),
+        })
+        .expect("limited toolkit");
+        let err = limited
+            .put(&src, "large.bin")
+            .expect_err("must fail by size");
+        assert!(matches!(err, BlobError::TooLarge { size: 6, max: 5 }));
+    }
+
     #[tokio::test]
     async fn resolve_with_retry_timeout_returns_not_found() {
         let (toolkit, _root) = test_toolkit();
@@ -744,6 +1629,7 @@ mod tests {
             .await
             .expect_err("resolve_with_retry should timeout");
         assert!(matches!(err, BlobError::NotFound(_)));
+        assert!(err.to_string().starts_with("BLOB_NOT_FOUND"));
     }
 
     #[cfg(unix)]
@@ -758,7 +1644,135 @@ mod tests {
             .put_bytes(b"x", "perm.txt", "text/plain")
             .expect_err("put_bytes should fail with permission denied");
         assert!(matches!(err, BlobError::Io(_)));
+        assert!(err.to_string().starts_with("BLOB_IO_ERROR"));
 
         std::fs::set_permissions(&root.path, Permissions::from_mode(0o755)).expect("restore perms");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_modes_staging_and_active_are_applied() {
+        let (toolkit, root) = test_toolkit();
+        let blob_ref = toolkit
+            .put_bytes(b"secure", "secure.txt", "text/plain")
+            .expect("put_bytes");
+
+        let staging_dir = root
+            .path
+            .join("staging")
+            .join(BlobToolkit::prefix(&blob_ref.blob_name));
+        let staging_file = staging_dir.join(&blob_ref.blob_name);
+        let staging_dir_mode = std::fs::metadata(&staging_dir)
+            .expect("staging dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let staging_file_mode = std::fs::metadata(&staging_file)
+            .expect("staging file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(staging_dir_mode, 0o750);
+        assert_eq!(staging_file_mode, 0o640);
+
+        toolkit.promote(&blob_ref).expect("promote");
+        let active_dir = root
+            .path
+            .join("active")
+            .join(BlobToolkit::prefix(&blob_ref.blob_name));
+        let active_file = active_dir.join(&blob_ref.blob_name);
+        let active_dir_mode = std::fs::metadata(&active_dir)
+            .expect("active dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let active_file_mode = std::fs::metadata(&active_file)
+            .expect("active file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(active_dir_mode, 0o750);
+        assert_eq!(active_file_mode, 0o640);
+    }
+
+    #[test]
+    fn staging_gc_reports_candidates_in_dry_run() {
+        let (toolkit, root) = test_toolkit();
+        let blob_ref = toolkit
+            .put_bytes(b"orphan", "orphan.txt", "text/plain")
+            .expect("put_bytes");
+        let staging_file = root
+            .path
+            .join("staging")
+            .join(BlobToolkit::prefix(&blob_ref.blob_name))
+            .join(&blob_ref.blob_name);
+        assert!(staging_file.exists());
+
+        let now = std::time::SystemTime::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("advance now");
+        let report = toolkit
+            .cleanup_staging_orphans_with_now(0, false, now)
+            .expect("staging gc dry-run");
+        assert_eq!(report.candidate_files, 1);
+        assert_eq!(report.deleted_files, 0);
+        assert!(staging_file.exists());
+    }
+
+    #[test]
+    fn staging_gc_apply_deletes_orphans() {
+        let (toolkit, root) = test_toolkit();
+        let blob_ref = toolkit
+            .put_bytes(b"orphan", "orphan2.txt", "text/plain")
+            .expect("put_bytes");
+        let prefix_dir = root
+            .path
+            .join("staging")
+            .join(BlobToolkit::prefix(&blob_ref.blob_name));
+        let staging_file = prefix_dir.join(&blob_ref.blob_name);
+        assert!(staging_file.exists());
+
+        let now = std::time::SystemTime::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("advance now");
+        let report = toolkit
+            .cleanup_staging_orphans_with_now(0, true, now)
+            .expect("staging gc apply");
+        assert_eq!(report.candidate_files, 1);
+        assert_eq!(report.deleted_files, 1);
+        assert!(!staging_file.exists());
+        assert!(!prefix_dir.exists());
+    }
+
+    #[test]
+    fn active_gc_by_spool_day_apply_deletes_old_candidates() {
+        let (toolkit, root) = test_toolkit();
+        let blob_ref = toolkit
+            .put_bytes(b"old-active", "active-gc.txt", "text/plain")
+            .expect("put_bytes");
+        toolkit.promote(&blob_ref).expect("promote");
+        let active_file = root
+            .path
+            .join("active")
+            .join(BlobToolkit::prefix(&blob_ref.blob_name))
+            .join(&blob_ref.blob_name);
+        assert!(active_file.exists());
+
+        let now = std::time::SystemTime::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("advance now");
+        let dry_run = toolkit
+            .gc_active_by_spool_day_with_now(0, false, now)
+            .expect("active gc dry-run");
+        assert_eq!(dry_run.candidate_files, 1);
+        assert_eq!(dry_run.deleted_files, 0);
+        assert!(active_file.exists());
+
+        let apply = toolkit
+            .gc_active_by_spool_day_with_now(0, true, now)
+            .expect("active gc apply");
+        assert_eq!(apply.candidate_files, 1);
+        assert_eq!(apply.deleted_files, 1);
+        assert!(!active_file.exists());
     }
 }

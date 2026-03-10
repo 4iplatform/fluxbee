@@ -1061,16 +1061,11 @@ async fn handle_hive_paths(
             } else {
                 serde_json::from_slice(body)?
             };
-            if payload.get("node_name").is_none() && payload.get("name").is_none() {
+            if payload.get("node_name").is_none() {
                 payload["node_name"] = serde_json::Value::String(decode_percent(name));
             }
             let (status, resp) =
                 handle_admin_command(ctx, client, "kill_node", payload, Some(hive)).await?;
-            Ok(Some((status, resp)))
-        }
-        ("GET", ["routers"]) => {
-            let (status, resp) =
-                handle_admin_query(ctx, client, "list_routers", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["versions"]) => {
@@ -1090,22 +1085,6 @@ async fn handle_hive_paths(
                 handle_admin_command(ctx, client, "get_drift_alerts", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
-        ("POST", ["routers"]) => {
-            let payload = if body.is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_slice(body)?
-            };
-            let (status, resp) =
-                handle_admin_command(ctx, client, "run_router", payload, Some(hive)).await?;
-            Ok(Some((status, resp)))
-        }
-        ("DELETE", ["routers", name]) => {
-            let payload = serde_json::json!({ "name": decode_percent(name) });
-            let (status, resp) =
-                handle_admin_command(ctx, client, "kill_router", payload, Some(hive)).await?;
-            Ok(Some((status, resp)))
-        }
         ("POST", ["update"]) => {
             let payload = if body.is_empty() {
                 serde_json::json!({})
@@ -1113,6 +1092,15 @@ async fn handle_hive_paths(
                 serde_json::from_slice(body)?
             };
             let (status, resp) = handle_hive_update_command(ctx, client, hive, payload).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["sync-hint"]) => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let (status, resp) = handle_hive_sync_hint_command(ctx, client, hive, payload).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["opa", "policy"]) => {
@@ -1985,6 +1973,20 @@ async fn handle_admin_command(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
+    if let Some(detail) = admin_payload_contract_error(action, &payload) {
+        return Ok((
+            400u16,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": detail,
+            })
+            .to_string(),
+        ));
+    }
+
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
     let target_hive = extract_hive_from_target(&request.target);
@@ -2053,31 +2055,37 @@ async fn handle_hive_update_command(
         },
     };
 
-    let manifest_version = match payload
-        .get("manifest_version")
-        .or_else(|| payload.get("version"))
-    {
+    let manifest_version = match payload.get("manifest_version") {
         None => 0,
         Some(value) => match value.as_u64() {
             Some(v) => v,
             None => {
                 return Ok(invalid_request(
-                    "manifest_version (or version) must be an unsigned integer",
+                    "manifest_version must be an unsigned integer",
                 ))
             }
         },
     };
+    if payload.get("version").is_some() {
+        return Ok(invalid_request(
+            "legacy field 'version' is not supported; use manifest_version",
+        ));
+    }
 
     let manifest_hash = match payload
         .get("manifest_hash")
-        .or_else(|| payload.get("hash"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
         Some(value) => value,
-        None => return Ok(invalid_request("missing manifest_hash (or hash)")),
+        None => return Ok(invalid_request("missing manifest_hash")),
     };
+    if payload.get("hash").is_some() {
+        return Ok(invalid_request(
+            "legacy field 'hash' is not supported; use manifest_hash",
+        ));
+    }
 
     let target = format!("SY.orchestrator@{}", hive_id);
     let system_payload = serde_json::json!({
@@ -2115,7 +2123,9 @@ async fn handle_hive_update_command(
             let http_status = match status {
                 "ok" => 200,
                 "sync_pending" => 202,
-                _ => error_code_to_http_status(error_code_opt.as_deref().unwrap_or("SERVICE_FAILED")),
+                _ => {
+                    error_code_to_http_status(error_code_opt.as_deref().unwrap_or("SERVICE_FAILED"))
+                }
             };
             let error_code = if let Some(code) = error_code_opt {
                 serde_json::json!(code)
@@ -2158,6 +2168,152 @@ async fn handle_hive_update_command(
     }
 }
 
+async fn handle_hive_sync_hint_command(
+    _ctx: &AdminContext,
+    client: &AdminRouterClient,
+    hive_id: String,
+    payload: serde_json::Value,
+) -> Result<(u16, String), AdminError> {
+    let invalid_request = |detail: &str| {
+        (
+            400u16,
+            serde_json::json!({
+                "status": "error",
+                "action": "sync_hint",
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": detail,
+            })
+            .to_string(),
+        )
+    };
+
+    let channel = match payload.get("channel") {
+        None => "blob".to_string(),
+        Some(value) => match value
+            .as_str()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_ascii_lowercase())
+        {
+            Some(v) if matches!(v.as_str(), "blob" | "dist") => v,
+            _ => return Ok(invalid_request("channel must be one of blob/dist")),
+        },
+    };
+
+    let folder_id = match payload.get("folder_id") {
+        None => match channel.as_str() {
+            "blob" => "fluxbee-blob".to_string(),
+            "dist" => "fluxbee-dist".to_string(),
+            _ => unreachable!(),
+        },
+        Some(value) => match value.as_str().map(str::trim).filter(|v| !v.is_empty()) {
+            Some(v) => v.to_string(),
+            None => return Ok(invalid_request("folder_id must be a non-empty string")),
+        },
+    };
+
+    let wait_for_idle = match payload.get("wait_for_idle") {
+        None => true,
+        Some(value) => match value.as_bool() {
+            Some(v) => v,
+            None => return Ok(invalid_request("wait_for_idle must be boolean")),
+        },
+    };
+
+    let timeout_ms = match payload.get("timeout_ms") {
+        None => 30_000u64,
+        Some(value) => match value.as_u64() {
+            Some(v) if v > 0 => v,
+            _ => {
+                return Ok(invalid_request(
+                    "timeout_ms must be a positive unsigned integer",
+                ))
+            }
+        },
+    };
+
+    let target = format!("SY.orchestrator@{}", hive_id);
+    let system_payload = serde_json::json!({
+        "channel": channel,
+        "folder_id": folder_id,
+        "wait_for_idle": wait_for_idle,
+        "timeout_ms": timeout_ms,
+    });
+    let response = send_system_request(
+        client,
+        &target,
+        "SYSTEM_SYNC_HINT",
+        "SYSTEM_SYNC_HINT_RESPONSE",
+        system_payload,
+        admin_action_timeout("sync_hint"),
+    )
+    .await;
+
+    match response {
+        Ok(payload) => {
+            let status = payload
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("error");
+            let top_status = match status {
+                "ok" => "ok",
+                "sync_pending" => "sync_pending",
+                _ => "error",
+            };
+            let error_code_opt = if matches!(status, "ok" | "sync_pending") {
+                None
+            } else {
+                Some(payload_error_code(&payload).unwrap_or_else(|| "SERVICE_FAILED".into()))
+            };
+            let http_status = match status {
+                "ok" => 200,
+                "sync_pending" => 202,
+                _ => {
+                    error_code_to_http_status(error_code_opt.as_deref().unwrap_or("SERVICE_FAILED"))
+                }
+            };
+            let error_code = if let Some(code) = error_code_opt {
+                serde_json::json!(code)
+            } else {
+                serde_json::Value::Null
+            };
+            let error_detail = if matches!(status, "ok" | "sync_pending") {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(payload_error_detail(&payload))
+            };
+            Ok((
+                http_status,
+                serde_json::json!({
+                    "status": top_status,
+                    "action": "sync_hint",
+                    "payload": payload,
+                    "error_code": error_code,
+                    "error_detail": error_detail,
+                })
+                .to_string(),
+            ))
+        }
+        Err(err) => {
+            let error_detail = err.to_string();
+            let error_code = infer_transport_error_code(&error_detail).to_string();
+            let status_code = error_code_to_http_status(&error_code);
+            Ok((
+                status_code,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "sync_hint",
+                    "payload": serde_json::Value::Null,
+                    "error_code": error_code,
+                    "error_detail": error_detail,
+                })
+                .to_string(),
+            ))
+        }
+    }
+}
+
 fn build_admin_request(
     ctx: &AdminContext,
     action: &str,
@@ -2165,17 +2321,16 @@ fn build_admin_request(
     hive: Option<String>,
 ) -> AdminRequest {
     let requested_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
-    let base =
-        match action {
-            "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn"
-            | "delete_vpn" => "SY.config.routes",
-            "list_nodes" | "run_node" | "kill_node" | "list_routers" | "run_router"
-            | "kill_router" | "hive_status" | "get_storage" | "set_storage" | "list_hives"
-            | "get_hive" | "list_versions" | "get_versions" | "list_deployments"
-            | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "remove_hive"
-            | "add_hive" => "SY.orchestrator",
-            _ => "SY.config.routes",
-        };
+    let base = match action {
+        "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn" | "delete_vpn" => {
+            "SY.config.routes"
+        }
+        "list_nodes" | "run_node" | "kill_node" | "hive_status" | "get_storage" | "set_storage"
+        | "list_hives" | "get_hive" | "list_versions" | "get_versions" | "list_deployments"
+        | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "remove_hive"
+        | "add_hive" => "SY.orchestrator",
+        _ => "SY.config.routes",
+    };
     let route_hive = if action_routes_via_local_orchestrator(action) {
         ctx.hive_id.clone()
     } else {
@@ -2330,8 +2485,11 @@ fn admin_action_timeout(action: &str) -> Duration {
         "update" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_UPDATE_TIMEOUT_SECS").unwrap_or(60))
         }
+        "sync_hint" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
+        }
         // other orchestrator mutating actions can also take longer than default.
-        "run_node" | "kill_node" | "run_router" | "kill_router" | "remove_hive" => {
+        "run_node" | "kill_node" | "remove_hive" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30))
         }
         _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5)),
@@ -2404,9 +2562,6 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
         "list_nodes"
             | "run_node"
             | "kill_node"
-            | "list_routers"
-            | "run_router"
-            | "kill_router"
             | "hive_status"
             | "get_storage"
             | "set_storage"
@@ -2441,19 +2596,29 @@ fn normalize_admin_payload(
         }
     }
 
-    if (action == "run_node" || action == "kill_node") && payload.get("node_name").is_none() {
-        if let Some(name) = payload.get("name").and_then(|value| value.as_str()) {
-            payload["node_name"] = serde_json::Value::String(name.to_string());
-        }
-    }
-
-    if (action == "run_router" || action == "kill_router") && payload.get("service").is_none() {
-        if let Some(name) = payload.get("name").and_then(|value| value.as_str()) {
-            payload["service"] = serde_json::Value::String(name.to_string());
-        }
-    }
-
     payload
+}
+
+fn admin_payload_contract_error(action: &str, payload: &serde_json::Value) -> Option<String> {
+    let legacy = match action {
+        "run_node" => {
+            if payload.get("name").is_some() {
+                Some(("name", "node_name"))
+            } else if payload.get("version").is_some() {
+                Some(("version", "runtime_version"))
+            } else {
+                None
+            }
+        }
+        "kill_node" => payload.get("name").map(|_| ("name", "node_name")),
+        _ => None,
+    };
+    legacy.map(|(field, canonical)| {
+        format!(
+            "legacy field '{}' is not supported; use '{}'",
+            field, canonical
+        )
+    })
 }
 
 async fn broadcast_full_config(

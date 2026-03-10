@@ -4,12 +4,12 @@ set -euo pipefail
 # Orchestrator vendor rollback E2E:
 # 1) Baseline vendor convergence (local == remote, service active)
 # 2) Corrupt local vendor source + update vendor manifest hash/size (forces bad deploy artifact)
-# 3) Trigger runtime_update cycle to force vendor sync; expect worker deployment error with rollback applied
+# 3) Trigger runtime SYSTEM_UPDATE cycle to force vendor sync; expect worker deployment error with rollback applied
 # 4) Validate rollback evidence:
 #    - deployment history contains vendor worker error with reason including "rollback applied"
 #    - remote syncthing service is active
 #    - remote syncthing hash restored to baseline hash
-# 5) Restore local vendor source/manifest and re-run runtime_update cycle for clean state
+# 5) Restore local vendor source/manifest and re-run runtime SYSTEM_UPDATE cycle for clean state
 #
 # Usage:
 #   BASE="http://127.0.0.1:8080" HIVE_ID="worker-220" BUILD_BIN=0 \
@@ -42,8 +42,8 @@ INFO_FILE="/var/lib/fluxbee/hives/${HIVE_ID}/info.yaml"
 LEGACY_KEY_PATH="/var/lib/fluxbee/hives/${HIVE_ID}/ssh.key"
 MOTHERBEE_KEY_PATH="/var/lib/fluxbee/ssh/motherbee.key"
 KEY_PATH=""
-VENDOR_MANIFEST="/var/lib/fluxbee/vendor/manifest.json"
-LEGACY_VENDOR_BIN="/var/lib/fluxbee/vendor/syncthing/syncthing"
+VENDOR_MANIFEST="/var/lib/fluxbee/dist/vendor/manifest.json"
+DIST_VENDOR_BIN="/var/lib/fluxbee/dist/vendor/syncthing/syncthing"
 REMOTE_VENDOR_BIN="${REMOTE_VENDOR_BIN:-/var/lib/fluxbee/vendor/bin/syncthing}"
 REMOTE_VENDOR_BACKUP="${REMOTE_VENDOR_BACKUP:-/var/lib/fluxbee/vendor/bin/syncthing.prev}"
 REMOTE_SYNCTHING_SERVICE="fluxbee-syncthing"
@@ -201,7 +201,7 @@ remote_root() {
 }
 
 local_vendor_path() {
-  ${SUDO} python3 - "$VENDOR_MANIFEST" "$VENDOR_COMPONENT_NAME" "$LEGACY_VENDOR_BIN" <<'PY'
+  ${SUDO} python3 - "$VENDOR_MANIFEST" "$VENDOR_COMPONENT_NAME" "$DIST_VENDOR_BIN" <<'PY'
 import json
 import os
 import sys
@@ -241,23 +241,23 @@ remote_syncthing_service_active() {
   remote_root "systemctl is-active --quiet '${REMOTE_SYNCTHING_SERVICE}'"
 }
 
-trigger_runtime_update_cycle() {
+trigger_system_update_cycle() {
   local allow_failure="${1:-0}"
-  echo "Triggering runtime_update cycle..." >&2
+  echo "Triggering runtime SYSTEM_UPDATE cycle..." >&2
   if ! (
     cd "$ROOT_DIR"
     TARGET_HIVE="$HIVE_ID" \
     ORCH_RUNTIME="$ORCH_RUNTIME" \
     ORCH_VERSION="$ORCH_VERSION" \
     ORCH_TIMEOUT_SECS="$ORCH_TIMEOUT_SECS" \
-    ORCH_SEND_RUNTIME_UPDATE=1 \
-    ORCH_ONLY_RUNTIME_UPDATE=1 \
+    ORCH_SEND_SYSTEM_UPDATE=1 \
+    ORCH_ONLY_SYSTEM_UPDATE=1 \
     ORCH_SEND_KILL=0 \
     BUILD_BIN="$BUILD_BIN" \
-    bash scripts/orchestrator_runtime_update_spawn_e2e.sh
+    bash scripts/orchestrator_system_update_spawn_e2e.sh
   ); then
     if [[ "$allow_failure" == "1" ]]; then
-      echo "WARN: runtime_update command returned non-zero (continuing because rollback scenario expects degraded path)" >&2
+      echo "WARN: runtime SYSTEM_UPDATE command returned non-zero (continuing because rollback scenario expects degraded path)" >&2
       return 0
     fi
     return 1
@@ -402,7 +402,7 @@ assert_eq "$status" "200" "GET /hives/{id}/http"
 assert_eq "$(json_get "status" "$hive_body")" "ok" "GET /hives/{id}/status"
 
 echo "Step 1/6: baseline runtime update cycle (drives vendor check)"
-trigger_runtime_update_cycle 0
+trigger_system_update_cycle 0
 
 baseline_local_hash="$(local_vendor_hash)"
 if [[ -z "$baseline_local_hash" ]]; then
@@ -480,9 +480,9 @@ PY
 fi
 echo "Corrupted local vendor hash: $bad_hash"
 
-echo "Step 3/6: trigger runtime_update again to force vendor sync with bad artifact"
+echo "Step 3/6: trigger system_update again to force vendor sync with bad artifact"
 rollback_start_ms="$(epoch_ms)"
-trigger_runtime_update_cycle 1
+trigger_system_update_cycle 1
 
 echo "Step 4/6: validate rollback evidence (deployment + service + hash restore)"
 start_secs="$(date +%s)"
@@ -542,8 +542,8 @@ if [[ -z "$restored_local_hash" ]]; then
   exit 1
 fi
 
-echo "Step 6/6: trigger runtime_update cycle to leave cluster converged"
-trigger_runtime_update_cycle 0
+echo "Step 6/6: trigger system_update cycle to leave cluster converged"
+trigger_system_update_cycle 0
 final_remote_hash="$(remote_vendor_hash || true)"
 if [[ -z "$final_remote_hash" || "$final_remote_hash" != "$restored_local_hash" ]]; then
   echo "FAIL: final vendor convergence failed (remote != restored local)" >&2

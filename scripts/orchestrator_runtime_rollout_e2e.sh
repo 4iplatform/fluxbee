@@ -147,7 +147,7 @@ wait_for_deployment() {
 
 prepare_runtime_fixture() {
   local version="$1"
-  local runtime_dir="/var/lib/fluxbee/runtimes/${ORCH_RUNTIME}/${version}"
+  local runtime_dir="/var/lib/fluxbee/dist/runtimes/${ORCH_RUNTIME}/${version}"
   local start_script="${runtime_dir}/bin/start.sh"
   ${SUDO} mkdir -p "${runtime_dir}/bin"
   cat <<'SCRIPT' | ${SUDO} tee "$start_script" >/dev/null
@@ -194,10 +194,9 @@ step1_ms="$(epoch_ms)"
   ORCH_RUNTIME="$ORCH_RUNTIME" \
   ORCH_RUNTIME_CURRENT="$CANARY_VERSION" \
   ORCH_RUNTIME_AVAILABLE="$ROLLBACK_VERSION,$CANARY_VERSION" \
-  ORCH_RUNTIME_MANIFEST_VERSION="$v1" \
-  ORCH_RUNTIME_UPDATE_TARGET_HIVES="$HIVE_ID" \
-  ORCH_SEND_RUNTIME_UPDATE=1 \
-  ORCH_ONLY_RUNTIME_UPDATE=1 \
+  ORCH_SYSTEM_UPDATE_MANIFEST_VERSION="$v1" \
+  ORCH_SEND_SYSTEM_UPDATE=1 \
+  ORCH_ONLY_SYSTEM_UPDATE=1 \
   ORCH_TIMEOUT_SECS="$ORCH_TIMEOUT_SECS" \
   ./target/release/orch_system_diag
 )
@@ -209,11 +208,11 @@ echo "Step 2/5: verify canary spawn on version=${CANARY_VERSION}"
   TARGET_HIVE="$HIVE_ID" \
   ORCH_RUNTIME="$ORCH_RUNTIME" \
   ORCH_VERSION="$CANARY_VERSION" \
-  ORCH_SEND_RUNTIME_UPDATE=0 \
+  ORCH_SEND_SYSTEM_UPDATE=0 \
   ORCH_SEND_KILL=1 \
   ORCH_TIMEOUT_SECS="$ORCH_TIMEOUT_SECS" \
   BUILD_BIN=0 \
-  bash scripts/orchestrator_runtime_update_spawn_e2e.sh
+  bash scripts/orchestrator_system_update_spawn_e2e.sh
 )
 
 echo "Step 3/5: global rollout version=${CANARY_VERSION} manifest=${v2}"
@@ -224,9 +223,9 @@ step3_ms="$(epoch_ms)"
   ORCH_RUNTIME="$ORCH_RUNTIME" \
   ORCH_RUNTIME_CURRENT="$CANARY_VERSION" \
   ORCH_RUNTIME_AVAILABLE="$ROLLBACK_VERSION,$CANARY_VERSION" \
-  ORCH_RUNTIME_MANIFEST_VERSION="$v2" \
-  ORCH_SEND_RUNTIME_UPDATE=1 \
-  ORCH_ONLY_RUNTIME_UPDATE=1 \
+  ORCH_SYSTEM_UPDATE_MANIFEST_VERSION="$v2" \
+  ORCH_SEND_SYSTEM_UPDATE=1 \
+  ORCH_ONLY_SYSTEM_UPDATE=1 \
   ORCH_TIMEOUT_SECS="$ORCH_TIMEOUT_SECS" \
   ./target/release/orch_system_diag
 )
@@ -240,9 +239,9 @@ step4_ms="$(epoch_ms)"
   ORCH_RUNTIME="$ORCH_RUNTIME" \
   ORCH_RUNTIME_CURRENT="$ROLLBACK_VERSION" \
   ORCH_RUNTIME_AVAILABLE="$ROLLBACK_VERSION,$CANARY_VERSION" \
-  ORCH_RUNTIME_MANIFEST_VERSION="$v3" \
-  ORCH_SEND_RUNTIME_UPDATE=1 \
-  ORCH_ONLY_RUNTIME_UPDATE=1 \
+  ORCH_SYSTEM_UPDATE_MANIFEST_VERSION="$v3" \
+  ORCH_SEND_SYSTEM_UPDATE=1 \
+  ORCH_ONLY_SYSTEM_UPDATE=1 \
   ORCH_TIMEOUT_SECS="$ORCH_TIMEOUT_SECS" \
   ./target/release/orch_system_diag
 )
@@ -254,11 +253,11 @@ echo "Step 5/5: verify spawn after rollback on version=${ROLLBACK_VERSION}"
   TARGET_HIVE="$HIVE_ID" \
   ORCH_RUNTIME="$ORCH_RUNTIME" \
   ORCH_VERSION="$ROLLBACK_VERSION" \
-  ORCH_SEND_RUNTIME_UPDATE=0 \
+  ORCH_SEND_SYSTEM_UPDATE=0 \
   ORCH_SEND_KILL=1 \
   ORCH_TIMEOUT_SECS="$ORCH_TIMEOUT_SECS" \
   BUILD_BIN=0 \
-  bash scripts/orchestrator_runtime_update_spawn_e2e.sh
+  bash scripts/orchestrator_system_update_spawn_e2e.sh
 )
 
 echo "orchestrator runtime rollout canary/global/rollback E2E passed."

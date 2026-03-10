@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,12 +8,17 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+use fluxbee_sdk::blob::{
+    BlobConfig as SdkBlobConfig, BlobGcOptions, BlobToolkit, BLOB_ACTIVE_RETAIN_DAYS,
+    BLOB_NAME_MAX_CHARS, BLOB_STAGING_TTL_HOURS,
+};
 use fluxbee_sdk::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
@@ -30,7 +35,6 @@ const MOTHERBEE_SSH_KEY_PATH: &str = "/var/lib/fluxbee/ssh/motherbee.key";
 const ORCH_SUDOERS_PATH: &str = "/etc/sudoers.d/fluxbee-orchestrator";
 const ORCH_SSH_GATE_PATH: &str = "/usr/local/bin/fluxbee-ssh-gate.sh";
 const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
-const RUNTIME_MANIFEST_FILE: &str = "runtime-manifest.json";
 const RUNTIME_MANIFEST_SCHEMA_VERSION: u64 = 1;
 const NATS_BOOTSTRAP_TIMEOUT_SECS: u64 = 20;
 const STORAGE_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
@@ -38,6 +42,7 @@ const STORAGE_DB_READINESS_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS: u64 = 3;
 const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const SY_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
+const ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS: u64 = 10;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
 const SYNCTHING_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
 const SYNCTHING_HEALTH_TIMEOUT_SECS: u64 = 2;
@@ -51,15 +56,10 @@ const SSH_HARDEN_VERIFY_RETRIES: usize = 6;
 const SSH_HARDEN_VERIFY_DELAY_MS: u64 = 1000;
 const SYNCTHING_FOLDER_BLOB_ID: &str = "fluxbee-blob";
 const SYNCTHING_FOLDER_DIST_ID: &str = "fluxbee-dist";
-const SYNCTHING_INSTALL_DIR: &str = "/var/lib/fluxbee/vendor/bin";
+const SYSTEM_SYNC_HINT_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const SYSTEM_SYNC_HINT_MAX_TIMEOUT_MS: u64 = 300_000;
+const SYSTEM_SYNC_HINT_POLL_INTERVAL_MS: u64 = 250;
 const SYNCTHING_INSTALL_PATH: &str = "/var/lib/fluxbee/vendor/bin/syncthing";
-const SYNCTHING_REMOTE_BACKUP_PATH: &str = "/var/lib/fluxbee/vendor/bin/syncthing.prev";
-const SYNCTHING_VENDOR_SOURCE_PATH: &str = "/var/lib/fluxbee/vendor/syncthing/syncthing";
-const VENDOR_ROOT_DIR: &str = "/var/lib/fluxbee/vendor";
-const VENDOR_MANIFEST_PATH: &str = "/var/lib/fluxbee/vendor/manifest.json";
-const CORE_BIN_SOURCE_DIR: &str = "/var/lib/fluxbee/core/bin";
-const CORE_MANIFEST_PATH: &str = "/var/lib/fluxbee/core/manifest.json";
-const LEGACY_RUNTIME_ROOT_DIR: &str = "/var/lib/fluxbee/runtimes";
 const DIST_ROOT_DIR: &str = "/var/lib/fluxbee/dist";
 const DIST_RUNTIME_ROOT_DIR: &str = "/var/lib/fluxbee/dist/runtimes";
 const DIST_RUNTIME_MANIFEST_PATH: &str = "/var/lib/fluxbee/dist/runtimes/manifest.json";
@@ -69,8 +69,6 @@ const DIST_VENDOR_ROOT_DIR: &str = "/var/lib/fluxbee/dist/vendor";
 const DIST_VENDOR_MANIFEST_PATH: &str = "/var/lib/fluxbee/dist/vendor/manifest.json";
 const DIST_SYNCTHING_VENDOR_SOURCE_PATH: &str = "/var/lib/fluxbee/dist/vendor/syncthing/syncthing";
 const CORE_SERVICE_HEALTH_TIMEOUT_SECS: u64 = 30;
-const POST_SYNC_HASH_VERIFY_ATTEMPTS: usize = 3;
-const POST_SYNC_HASH_VERIFY_DELAY_MS: u64 = 500;
 const DEPLOYMENT_HISTORY_MAX_LIMIT: usize = 500;
 const DRIFT_ALERT_MAX_LIMIT: usize = 500;
 const CORE_SYNC_RESTART_ORDER: &[&str] = &[
@@ -88,12 +86,20 @@ const WORKER_MIN_CORE_COMPONENTS: [&str; 4] = [
     "sy-opa-rules",
     "sy-orchestrator",
 ];
+const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 2] = ["rt-gateway", "sy-orchestrator"];
 const DEFAULT_BLOB_ENABLED: bool = true;
 const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
 const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
 const DEFAULT_BLOB_SYNC_TOOL: &str = "syncthing";
 const DEFAULT_BLOB_SYNC_API_PORT: u16 = 8384;
 const DEFAULT_BLOB_SYNC_DATA_DIR: &str = "/var/lib/fluxbee/syncthing";
+const DEFAULT_BLOB_SYNC_SERVICE_USER: &str = SYNCTHING_INSTALL_USER;
+const DEFAULT_BLOB_SYNC_ALLOW_ROOT_FALLBACK: bool = true;
+const DEFAULT_BLOB_GC_ENABLED: bool = false;
+const DEFAULT_BLOB_GC_INTERVAL_SECS: u64 = 3600;
+const DEFAULT_BLOB_GC_APPLY: bool = false;
+const DEFAULT_BLOB_GC_STAGING_TTL_HOURS: u64 = BLOB_STAGING_TTL_HOURS;
+const DEFAULT_BLOB_GC_ACTIVE_RETAIN_DAYS: u64 = BLOB_ACTIVE_RETAIN_DAYS;
 const DEFAULT_DIST_PATH: &str = DIST_ROOT_DIR;
 const DEFAULT_DIST_SYNC_ENABLED: bool = true;
 const DEFAULT_DIST_SYNC_TOOL: &str = "syncthing";
@@ -138,6 +144,7 @@ struct BlobSection {
     enabled: Option<bool>,
     path: Option<String>,
     sync: Option<BlobSyncSection>,
+    gc: Option<BlobGcSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +153,17 @@ struct BlobSyncSection {
     tool: Option<String>,
     api_port: Option<u16>,
     data_dir: Option<String>,
+    service_user: Option<String>,
+    allow_root_fallback: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobGcSection {
+    enabled: Option<bool>,
+    interval_secs: Option<u64>,
+    apply: Option<bool>,
+    staging_ttl_hours: Option<u64>,
+    active_retain_days: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +186,13 @@ struct BlobRuntimeConfig {
     sync_tool: String,
     sync_api_port: u16,
     sync_data_dir: PathBuf,
+    sync_service_user: String,
+    sync_allow_root_fallback: bool,
+    gc_enabled: bool,
+    gc_interval_secs: u64,
+    gc_apply: bool,
+    gc_staging_ttl_hours: u64,
+    gc_active_retain_days: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,12 +206,6 @@ struct DistRuntimeConfig {
 struct StorageSection {
     #[serde(default)]
     path: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HiveInfoFile {
-    #[serde(default)]
-    address: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -313,6 +332,7 @@ struct OrchestratorState {
     system_allowed_origins: HashSet<String>,
     runtime_manifest: Mutex<Option<RuntimeManifest>>,
     last_runtime_verify: Mutex<Instant>,
+    last_blob_gc: Mutex<Instant>,
     nats_endpoint: String,
     blob: BlobRuntimeConfig,
     dist: DistRuntimeConfig,
@@ -386,6 +406,7 @@ async fn main() -> Result<(), OrchestratorError> {
         system_allowed_origins,
         runtime_manifest: Mutex::new(runtime_manifest),
         last_runtime_verify: Mutex::new(Instant::now()),
+        last_blob_gc: Mutex::new(Instant::now()),
         nats_endpoint,
         blob: blob_runtime.clone(),
         dist: dist_runtime,
@@ -398,6 +419,11 @@ async fn main() -> Result<(), OrchestratorError> {
         blob_sync_tool = %state.blob.sync_tool,
         blob_sync_api_port = state.blob.sync_api_port,
         blob_sync_data_dir = %state.blob.sync_data_dir.display(),
+        blob_gc_enabled = state.blob.gc_enabled,
+        blob_gc_interval_secs = state.blob.gc_interval_secs,
+        blob_gc_apply = state.blob.gc_apply,
+        blob_gc_staging_ttl_hours = state.blob.gc_staging_ttl_hours,
+        blob_gc_active_retain_days = state.blob.gc_active_retain_days,
         dist_path = %state.dist.path.display(),
         dist_sync_enabled = state.dist.sync_enabled,
         dist_sync_tool = %state.dist.sync_tool,
@@ -505,7 +531,6 @@ async fn bootstrap_local(
         }
     } else {
         disable_blob_sync_runtime_local()?;
-        disable_remote_blob_sync_all_hives(state);
     }
 
     let mut services = if state.is_motherbee {
@@ -777,8 +802,21 @@ async fn watchdog_tick(state: &OrchestratorState) {
     }
 
     if should_verify_runtimes(state).await {
-        if let Err(err) = runtime_verify_and_sync(state).await {
+        if let Err(err) = runtime_verify_and_retain(state).await {
             tracing::warn!(error = %err, "runtime verify/sync failed");
+        }
+    }
+
+    let desired_blob = current_blob_runtime_config(state);
+    if should_run_blob_gc(
+        state,
+        desired_blob.gc_enabled,
+        desired_blob.gc_interval_secs,
+    )
+    .await
+    {
+        if let Err(err) = run_blob_gc_housekeeping(state, &desired_blob) {
+            tracing::warn!(error = %err, "blob gc housekeeping failed");
         }
     }
 
@@ -946,17 +984,14 @@ async fn handle_admin(
             payload
         }
         "list_nodes" => list_nodes_flow(state, &msg.payload),
-        "list_routers" => list_routers_flow(state, &msg.payload),
-        "list_versions" => list_versions_flow(state),
-        "get_versions" => get_versions_flow(state, &msg.payload),
+        "list_versions" => list_versions_flow(state).await,
+        "get_versions" => get_versions_flow(state, &msg.payload).await,
         "list_deployments" => list_deployments_flow(&msg.payload),
         "get_deployments" => get_deployments_flow(state, &msg.payload),
         "list_drift_alerts" => list_drift_alerts_flow(&msg.payload),
         "get_drift_alerts" => get_drift_alerts_flow(state, &msg.payload),
         "run_node" => run_node_flow(state, &msg.payload).await,
         "kill_node" => kill_node_flow(state, &msg.payload).await,
-        "run_router" => run_router_flow(state, &msg.payload).await,
-        "kill_router" => kill_router_flow(state, &msg.payload).await,
         "list_hives" => {
             serde_json::json!({
                 "status": "ok",
@@ -1050,6 +1085,7 @@ async fn handle_admin(
                     require_dist_sync,
                     dist_sync_probe_timeout_secs,
                 )
+                .await
             } else {
                 serde_json::json!({
                     "status": "error",
@@ -1093,18 +1129,17 @@ async fn handle_system_message(
     state: &OrchestratorState,
 ) -> Result<(), OrchestratorError> {
     let action = msg.meta.msg.as_deref().unwrap_or_default();
-    let mut source_name: Option<String> = None;
     if matches!(
         action,
-        "RUNTIME_UPDATE"
-            | "SYSTEM_UPDATE"
+        "SYSTEM_UPDATE"
+            | "SYSTEM_SYNC_HINT"
             | "SPAWN_NODE"
             | "KILL_NODE"
-            | "RUN_ROUTER"
-            | "KILL_ROUTER"
+            | "GET_VERSIONS"
+            | "ADD_HIVE_FINALIZE"
             | "REMOVE_HIVE_CLEANUP"
     ) {
-        source_name = resolve_system_source_name_with_retry(state, &msg.routing.src).await;
+        let source_name = resolve_system_source_name_with_retry(state, &msg.routing.src).await;
         let is_allowed = source_name.as_deref().is_some_and(|name| {
             state.system_allowed_origins.contains(name)
                 || name.starts_with("SY.orchestrator@")
@@ -1128,19 +1163,19 @@ async fn handle_system_message(
                 "source_name": source_name,
             });
             match action {
-                "RUNTIME_UPDATE" => {
-                    let _ = send_system_action_response(
-                        sender,
-                        msg,
-                        "RUNTIME_UPDATE_RESPONSE",
-                        payload,
-                    )
-                    .await;
-                }
                 "SYSTEM_UPDATE" => {
                     let _ =
                         send_system_action_response(sender, msg, "SYSTEM_UPDATE_RESPONSE", payload)
                             .await;
+                }
+                "SYSTEM_SYNC_HINT" => {
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "SYSTEM_SYNC_HINT_RESPONSE",
+                        payload,
+                    )
+                    .await;
                 }
                 "SPAWN_NODE" => {
                     let _ =
@@ -1151,15 +1186,19 @@ async fn handle_system_message(
                     let _ = send_system_action_response(sender, msg, "KILL_NODE_RESPONSE", payload)
                         .await;
                 }
-                "RUN_ROUTER" => {
+                "GET_VERSIONS" => {
                     let _ =
-                        send_system_action_response(sender, msg, "RUN_ROUTER_RESPONSE", payload)
+                        send_system_action_response(sender, msg, "GET_VERSIONS_RESPONSE", payload)
                             .await;
                 }
-                "KILL_ROUTER" => {
-                    let _ =
-                        send_system_action_response(sender, msg, "KILL_ROUTER_RESPONSE", payload)
-                            .await;
+                "ADD_HIVE_FINALIZE" => {
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "ADD_HIVE_FINALIZE_RESPONSE",
+                        payload,
+                    )
+                    .await;
                 }
                 "REMOVE_HIVE_CLEANUP" => {
                     let _ = send_system_action_response(
@@ -1177,148 +1216,24 @@ async fn handle_system_message(
     }
 
     match msg.meta.msg.as_deref() {
+        Some("RUNTIME_UPDATE") => {
+            let payload = serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": "action 'RUNTIME_UPDATE' is not supported; use 'SYSTEM_UPDATE'",
+            });
+            let _ =
+                send_system_action_response(sender, msg, "RUNTIME_UPDATE_RESPONSE", payload).await;
+        }
         Some("SYSTEM_UPDATE") => {
             let result = handle_system_update_message(state, msg).await;
             let _ =
                 send_system_action_response(sender, msg, "SYSTEM_UPDATE_RESPONSE", result).await;
         }
-        Some("RUNTIME_UPDATE") => {
-            let actor = source_name.unwrap_or_else(|| format!("uuid:{}", msg.routing.src));
-            let incoming = match parse_runtime_manifest(&msg.payload) {
-                Ok(manifest) => manifest,
-                Err(err) => {
-                    let payload = serde_json::json!({
-                        "status": "error",
-                        "error_code": "MANIFEST_INVALID",
-                        "message": err.to_string(),
-                        "applied": false,
-                    });
-                    let _ = send_system_action_response(
-                        sender,
-                        msg,
-                        "RUNTIME_UPDATE_RESPONSE",
-                        payload,
-                    )
-                    .await;
-                    return Ok(());
-                }
-            };
-
-            let current_manifest = current_runtime_manifest(state).await;
-            match validate_runtime_update_versioning(current_manifest.as_ref(), &incoming) {
-                Ok(RuntimeUpdateDecision::NoopSameVersion) => {
-                    let payload = serde_json::json!({
-                        "status": "ok",
-                        "applied": false,
-                        "reason": "up_to_date",
-                        "version": incoming.version,
-                    });
-                    let _ = send_system_action_response(
-                        sender,
-                        msg,
-                        "RUNTIME_UPDATE_RESPONSE",
-                        payload,
-                    )
-                    .await;
-                    return Ok(());
-                }
-                Ok(RuntimeUpdateDecision::Apply) => {}
-                Err((error_code, message)) => {
-                    let payload = serde_json::json!({
-                        "status": "error",
-                        "error_code": error_code,
-                        "message": message,
-                        "applied": false,
-                        "incoming_version": incoming.version,
-                        "current_version": current_manifest.as_ref().map(|m| m.version),
-                    });
-                    let _ = send_system_action_response(
-                        sender,
-                        msg,
-                        "RUNTIME_UPDATE_RESPONSE",
-                        payload,
-                    )
-                    .await;
-                    return Ok(());
-                }
-            }
-
-            let target_hives_filter = match parse_runtime_update_target_hives(&msg.payload) {
-                Ok(value) => value,
-                Err(err) => {
-                    let payload = serde_json::json!({
-                        "status": "error",
-                        "error_code": "MANIFEST_INVALID",
-                        "message": err.to_string(),
-                        "applied": false,
-                        "version": incoming.version,
-                    });
-                    let _ = send_system_action_response(
-                        sender,
-                        msg,
-                        "RUNTIME_UPDATE_RESPONSE",
-                        payload,
-                    )
-                    .await;
-                    return Ok(());
-                }
-            };
-
-            if let Err(err) = persist_runtime_manifest(&incoming) {
-                let payload = serde_json::json!({
-                    "status": "error",
-                    "error_code": "MANIFEST_INVALID",
-                    "message": format!("failed to persist runtime manifest: {}", err),
-                    "applied": false,
-                    "version": incoming.version,
-                });
-                let _ =
-                    send_system_action_response(sender, msg, "RUNTIME_UPDATE_RESPONSE", payload)
-                        .await;
-                return Ok(());
-            }
-
-            match apply_runtime_retention(&incoming) {
-                Ok(stats) => {
-                    tracing::info!(
-                        removed_runtime_dirs = stats.removed_runtime_dirs,
-                        removed_version_dirs = stats.removed_version_dirs,
-                        "runtime retention applied"
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "runtime retention failed after runtime update");
-                }
-            }
-
-            {
-                let mut guard = state.runtime_manifest.lock().await;
-                *guard = Some(incoming.clone());
-            }
-            tracing::info!(
-                version = incoming.version,
-                schema_version = incoming.schema_version,
-                "runtime manifest updated"
-            );
-            tracing::warn!(
-                actor = %actor,
-                "RUNTIME_UPDATE accepted in compatibility mode; remote SSH propagation is disabled in v2 (use SYSTEM_UPDATE via SY.admin /hives/{{id}}/update)"
-            );
-            let payload = serde_json::json!({
-                "status": "ok",
-                "applied": true,
-                "version": incoming.version,
-                "schema_version": incoming.schema_version,
-                "target_hives": target_hives_filter.as_ref().map(|set| {
-                    let mut v: Vec<String> = set.iter().cloned().collect();
-                    v.sort();
-                    v
-                }),
-                "compat_mode": true,
-                "propagation": "local_only_use_system_update",
-            });
+        Some("SYSTEM_SYNC_HINT") => {
+            let result = handle_system_sync_hint_message(state, msg).await;
             let _ =
-                send_system_action_response(sender, msg, "RUNTIME_UPDATE_RESPONSE", payload).await;
+                send_system_action_response(sender, msg, "SYSTEM_SYNC_HINT_RESPONSE", result).await;
         }
         Some("SPAWN_NODE") => {
             let result = run_node_flow(state, &msg.payload).await;
@@ -1330,26 +1245,22 @@ async fn handle_system_message(
             tracing::info!(result = %result, "KILL_NODE processed");
             let _ = send_system_action_response(sender, msg, "KILL_NODE_RESPONSE", result).await;
         }
-        Some("RUN_ROUTER") => {
-            let result = run_router_flow(state, &msg.payload).await;
-            tracing::info!(result = %result, "RUN_ROUTER processed");
-            let _ = send_system_action_response(sender, msg, "RUN_ROUTER_RESPONSE", result).await;
+        Some("GET_VERSIONS") => {
+            let result = get_versions_flow(state, &msg.payload).await;
+            let _ = send_system_action_response(sender, msg, "GET_VERSIONS_RESPONSE", result).await;
         }
-        Some("KILL_ROUTER") => {
-            let result = kill_router_flow(state, &msg.payload).await;
-            tracing::info!(result = %result, "KILL_ROUTER processed");
-            let _ = send_system_action_response(sender, msg, "KILL_ROUTER_RESPONSE", result).await;
+        Some("ADD_HIVE_FINALIZE") => {
+            let result = add_hive_finalize_local_flow(state, &msg.payload).await;
+            tracing::info!(result = %result, "ADD_HIVE_FINALIZE processed");
+            let _ = send_system_action_response(sender, msg, "ADD_HIVE_FINALIZE_RESPONSE", result)
+                .await;
         }
         Some("REMOVE_HIVE_CLEANUP") => {
             let result = remove_hive_cleanup_local_flow();
             tracing::info!(result = %result, "REMOVE_HIVE_CLEANUP processed");
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "REMOVE_HIVE_CLEANUP_RESPONSE",
-                result,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "REMOVE_HIVE_CLEANUP_RESPONSE", result)
+                    .await;
         }
         _ => {}
     }
@@ -1385,6 +1296,13 @@ fn local_system_manifest_state(
 fn parse_system_update_payload(
     payload: &serde_json::Value,
 ) -> Result<(String, u64, String), OrchestratorError> {
+    if payload.get("version").is_some() {
+        return Err("legacy field 'version' is not supported; use 'manifest_version'".into());
+    }
+    if payload.get("hash").is_some() {
+        return Err("legacy field 'hash' is not supported; use 'manifest_hash'".into());
+    }
+
     let category = payload
         .get("category")
         .and_then(|value| value.as_str())
@@ -1397,20 +1315,313 @@ fn parse_system_update_payload(
 
     let manifest_version = payload
         .get("manifest_version")
-        .or_else(|| payload.get("version"))
         .and_then(|value| value.as_u64())
         .unwrap_or(0);
 
     let manifest_hash = payload
         .get("manifest_hash")
-        .or_else(|| payload.get("hash"))
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or("missing manifest_hash (or hash)")?
+        .ok_or("missing manifest_hash")?
         .to_string();
 
     Ok((category, manifest_version, manifest_hash))
+}
+
+#[derive(Debug, Clone)]
+struct SystemSyncHintRequest {
+    channel: String,
+    folder_id: String,
+    wait_for_idle: bool,
+    timeout_ms: u64,
+}
+
+fn default_folder_id_for_sync_channel(channel: &str) -> Option<&'static str> {
+    match channel {
+        "blob" => Some(SYNCTHING_FOLDER_BLOB_ID),
+        "dist" => Some(SYNCTHING_FOLDER_DIST_ID),
+        _ => None,
+    }
+}
+
+fn parse_system_sync_hint_payload(
+    payload: &serde_json::Value,
+) -> Result<SystemSyncHintRequest, OrchestratorError> {
+    let channel = payload
+        .get("channel")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("blob")
+        .to_ascii_lowercase();
+
+    let default_folder_id = default_folder_id_for_sync_channel(&channel)
+        .ok_or("channel must be one of blob/dist")?
+        .to_string();
+
+    let folder_id = payload
+        .get("folder_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_folder_id.as_str())
+        .to_string();
+
+    if folder_id != default_folder_id {
+        return Err(format!(
+            "folder_id '{}' is invalid for channel '{}'; expected '{}'",
+            folder_id, channel, default_folder_id
+        )
+        .into());
+    }
+
+    let wait_for_idle = match payload.get("wait_for_idle") {
+        None => true,
+        Some(value) => value.as_bool().ok_or("wait_for_idle must be boolean")?,
+    };
+
+    let timeout_ms = match payload.get("timeout_ms") {
+        None => SYSTEM_SYNC_HINT_DEFAULT_TIMEOUT_MS,
+        Some(value) => value
+            .as_u64()
+            .filter(|v| *v > 0)
+            .ok_or("timeout_ms must be a positive unsigned integer")?,
+    }
+    .min(SYSTEM_SYNC_HINT_MAX_TIMEOUT_MS);
+
+    Ok(SystemSyncHintRequest {
+        channel,
+        folder_id,
+        wait_for_idle,
+        timeout_ms,
+    })
+}
+
+fn system_sync_hint_response_json(
+    state: &OrchestratorState,
+    request: &SystemSyncHintRequest,
+    status: &str,
+    api_healthy: bool,
+    folder_status: Option<&SyncthingFolderStatus>,
+    errors: Vec<String>,
+    message: Option<String>,
+) -> serde_json::Value {
+    let folder_healthy = folder_status.is_some_and(SyncthingFolderStatus::is_healthy);
+    let state_text = folder_status
+        .map(|value| value.state.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let need_total_items = folder_status
+        .map(|value| value.need_total_items)
+        .unwrap_or(0);
+    let mut payload = serde_json::json!({
+        "status": status,
+        "hive": state.hive_id.as_str(),
+        "channel": request.channel,
+        "folder_id": request.folder_id,
+        "wait_for_idle": request.wait_for_idle,
+        "timeout_ms": request.timeout_ms,
+        "api_healthy": api_healthy,
+        "folder_healthy": folder_healthy,
+        "state": state_text,
+        "need_total_items": need_total_items,
+        "errors": errors,
+    });
+    if let Some(detail) = message {
+        payload["message"] = serde_json::Value::String(detail);
+    }
+    payload
+}
+
+async fn handle_system_sync_hint_message(
+    state: &OrchestratorState,
+    msg: &Message,
+) -> serde_json::Value {
+    let request = match parse_system_sync_hint_payload(&msg.payload) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+            });
+        }
+    };
+
+    let desired_blob = current_blob_runtime_config(state);
+    let desired_dist = current_dist_runtime_config(state);
+    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
+    let channel_sync_enabled = match request.channel.as_str() {
+        "blob" => desired_blob.sync_enabled && blob_sync_tool_is_syncthing(&desired_blob),
+        "dist" => desired_dist.sync_enabled && dist_sync_tool_is_syncthing(&desired_dist),
+        _ => false,
+    };
+    if !desired_sync.sync_enabled || !channel_sync_enabled {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SYNC_DISABLED",
+            "message": format!("sync channel '{}' is not enabled in hive configuration", request.channel),
+            "channel": request.channel,
+            "folder_id": request.folder_id,
+        });
+    }
+    if !(blob_sync_tool_is_syncthing(&desired_sync) || dist_sync_tool_is_syncthing(&desired_dist)) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SYNC_UNSUPPORTED",
+            "message": format!(
+                "unsupported sync.tool for blob/dist (blob='{}', dist='{}'; expected syncthing)",
+                desired_blob.sync_tool, desired_dist.sync_tool
+            ),
+            "channel": request.channel,
+            "folder_id": request.folder_id,
+        });
+    }
+
+    let mut service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+    let mut api_healthy = if service_active {
+        syncthing_api_healthy(desired_sync.sync_api_port).await
+    } else {
+        false
+    };
+
+    if !service_active || !api_healthy {
+        if let Err(err) = ensure_blob_sync_runtime(&desired_blob, &desired_dist).await {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SYNC_UNHEALTHY",
+                "message": format!("failed to reconcile syncthing runtime: {err}"),
+                "channel": request.channel,
+                "folder_id": request.folder_id,
+            });
+        }
+        service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+        api_healthy = if service_active {
+            syncthing_api_healthy(desired_sync.sync_api_port).await
+        } else {
+            false
+        };
+    }
+
+    if !service_active || !api_healthy {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SYNC_UNHEALTHY",
+            "message": "syncthing service is not healthy",
+            "channel": request.channel,
+            "folder_id": request.folder_id,
+            "api_healthy": api_healthy,
+            "service_active": service_active,
+        });
+    }
+
+    let mut warnings = Vec::new();
+    if let Err(err) = syncthing_trigger_folder_scan(&desired_sync, &request.folder_id) {
+        tracing::warn!(
+            channel = %request.channel,
+            folder = %request.folder_id,
+            error = %err,
+            "sync hint scan trigger failed; continuing with status probe"
+        );
+        warnings.push(format!("scan trigger failed: {err}"));
+    }
+
+    let mut folder_status = match syncthing_folder_status(&desired_sync, &request.folder_id) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SYNC_STATUS_FAILED",
+                "message": err.to_string(),
+                "channel": request.channel,
+                "folder_id": request.folder_id,
+                "api_healthy": api_healthy,
+                "errors": warnings,
+            });
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
+    loop {
+        if !folder_status.is_healthy() {
+            let mut errors = warnings.clone();
+            if !folder_status.error.is_empty() {
+                errors.push(format!("folder error: {}", folder_status.error));
+            }
+            if !folder_status.invalid.is_empty() {
+                errors.push(format!("folder invalid: {}", folder_status.invalid));
+            }
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SYNC_UNHEALTHY",
+                "message": "syncthing folder is unhealthy",
+                "hive": state.hive_id.as_str(),
+                "channel": request.channel,
+                "folder_id": request.folder_id,
+                "api_healthy": api_healthy,
+                "folder_healthy": false,
+                "state": folder_status.state,
+                "need_total_items": folder_status.need_total_items,
+                "errors": errors,
+            });
+        }
+
+        if folder_status.is_converged() {
+            return system_sync_hint_response_json(
+                state,
+                &request,
+                "ok",
+                api_healthy,
+                Some(&folder_status),
+                warnings,
+                None,
+            );
+        }
+
+        if !request.wait_for_idle {
+            return system_sync_hint_response_json(
+                state,
+                &request,
+                "sync_pending",
+                api_healthy,
+                Some(&folder_status),
+                warnings,
+                Some("folder has pending items".to_string()),
+            );
+        }
+
+        if Instant::now() >= deadline {
+            return system_sync_hint_response_json(
+                state,
+                &request,
+                "sync_pending",
+                api_healthy,
+                Some(&folder_status),
+                warnings,
+                Some(format!(
+                    "sync hint timeout after {}ms waiting for idle convergence",
+                    request.timeout_ms
+                )),
+            );
+        }
+
+        time::sleep(Duration::from_millis(SYSTEM_SYNC_HINT_POLL_INTERVAL_MS)).await;
+        folder_status = match syncthing_folder_status(&desired_sync, &request.folder_id) {
+            Ok(value) => value,
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "SYNC_STATUS_FAILED",
+                    "message": err.to_string(),
+                    "hive": state.hive_id.as_str(),
+                    "channel": request.channel,
+                    "folder_id": request.folder_id,
+                    "api_healthy": api_healthy,
+                    "errors": warnings,
+                });
+            }
+        };
+    }
 }
 
 async fn restart_local_core_services_with_health_gate() -> Result<Vec<String>, OrchestratorError> {
@@ -1549,7 +1760,8 @@ async fn apply_system_update_local(
             let manifest = load_core_manifest()?;
             let (updated, unchanged) =
                 compute_local_core_update_sets(&manifest, state.is_motherbee)?;
-            let backup_dir = PathBuf::from("/var/lib/fluxbee/core/bin.prev.local")
+            let backup_dir = orchestrator_runtime_dir()
+                .join("core-bin.prev.local")
                 .join(format!("update-{}", now_epoch_ms()));
             fs::create_dir_all(&backup_dir)?;
             let mut created_without_backup = HashSet::new();
@@ -1904,6 +2116,13 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
     let mut sync_tool = DEFAULT_BLOB_SYNC_TOOL.to_string();
     let mut sync_api_port = DEFAULT_BLOB_SYNC_API_PORT;
     let mut sync_data_dir = PathBuf::from(DEFAULT_BLOB_SYNC_DATA_DIR);
+    let mut sync_service_user = DEFAULT_BLOB_SYNC_SERVICE_USER.to_string();
+    let mut sync_allow_root_fallback = DEFAULT_BLOB_SYNC_ALLOW_ROOT_FALLBACK;
+    let mut gc_enabled = DEFAULT_BLOB_GC_ENABLED;
+    let mut gc_interval_secs = DEFAULT_BLOB_GC_INTERVAL_SECS;
+    let mut gc_apply = DEFAULT_BLOB_GC_APPLY;
+    let mut gc_staging_ttl_hours = DEFAULT_BLOB_GC_STAGING_TTL_HOURS;
+    let mut gc_active_retain_days = DEFAULT_BLOB_GC_ACTIVE_RETAIN_DAYS;
 
     if let Some(blob) = hive.blob.as_ref() {
         if let Some(value) = blob.enabled {
@@ -1934,6 +2153,32 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
                     sync_data_dir = PathBuf::from(value);
                 }
             }
+            if let Some(value) = sync.service_user.as_ref() {
+                let value = value.trim();
+                if !value.is_empty() {
+                    sync_service_user = value.to_string();
+                }
+            }
+            if let Some(value) = sync.allow_root_fallback {
+                sync_allow_root_fallback = value;
+            }
+        }
+        if let Some(gc) = blob.gc.as_ref() {
+            if let Some(value) = gc.enabled {
+                gc_enabled = value;
+            }
+            if let Some(value) = gc.interval_secs {
+                gc_interval_secs = value.max(60);
+            }
+            if let Some(value) = gc.apply {
+                gc_apply = value;
+            }
+            if let Some(value) = gc.staging_ttl_hours {
+                gc_staging_ttl_hours = value.max(1);
+            }
+            if let Some(value) = gc.active_retain_days {
+                gc_active_retain_days = value.max(1);
+            }
         }
     }
 
@@ -1944,6 +2189,13 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
         sync_tool,
         sync_api_port,
         sync_data_dir,
+        sync_service_user,
+        sync_allow_root_fallback,
+        gc_enabled,
+        gc_interval_secs,
+        gc_apply,
+        gc_staging_ttl_hours,
+        gc_active_retain_days,
     }
 }
 
@@ -2017,24 +2269,42 @@ fn ensure_dirs(
     fs::create_dir_all(opa_root.join("backup"))?;
     fs::create_dir_all(storage_root.join("nats"))?;
     if blob.enabled {
-        fs::create_dir_all(&blob.path)?;
+        ensure_dir_permissions_0750(&blob.path)?;
+        ensure_dir_permissions_0750(&blob.path.join("active"))?;
+        ensure_dir_permissions_0750(&blob.path.join("staging"))?;
     }
     if blob.sync_enabled {
-        fs::create_dir_all(&blob.sync_data_dir)?;
+        ensure_dir_permissions_0750(&blob.sync_data_dir)?;
+    }
+    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        let service_user = resolve_syncthing_service_user(blob)?;
+        if service_user == "root" {
+            ensure_owned_dir(&blob.path, "root")?;
+            ensure_owned_dir(&blob.path.join("active"), "root")?;
+            ensure_owned_dir(&blob.path.join("staging"), "root")?;
+            ensure_owned_dir(&blob.sync_data_dir, "root")?;
+        } else {
+            ensure_owned_dir(&blob.path, &service_user)?;
+            ensure_owned_dir(&blob.path.join("active"), &service_user)?;
+            ensure_owned_dir(&blob.path.join("staging"), &service_user)?;
+            ensure_owned_dir(&blob.sync_data_dir, &service_user)?;
+        }
     }
     fs::create_dir_all(&dist.path)?;
     fs::create_dir_all(dist.path.join("runtimes"))?;
     fs::create_dir_all(dist.path.join("core").join("bin"))?;
     fs::create_dir_all(dist.path.join("vendor"))?;
     fs::create_dir_all(runtimes_root())?;
-    fs::create_dir_all(legacy_runtimes_root())?;
     fs::create_dir_all(Path::new(DIST_CORE_BIN_SOURCE_DIR))?;
     fs::create_dir_all(Path::new(DIST_VENDOR_ROOT_DIR))?;
-    fs::create_dir_all(Path::new(CORE_BIN_SOURCE_DIR))?;
-    fs::create_dir_all(Path::new(VENDOR_ROOT_DIR))?;
+    fs::create_dir_all(syncthing_install_dir())?;
     fs::create_dir_all(orchestrator_runtime_dir())?;
     fs::create_dir_all(run_dir)?;
     Ok(())
+}
+
+fn blob_sync_folder_path(blob: &BlobRuntimeConfig) -> PathBuf {
+    blob.path.join("active")
 }
 
 fn blob_sync_tool_is_syncthing(blob: &BlobRuntimeConfig) -> bool {
@@ -2094,8 +2364,68 @@ fn linux_user_exists(user: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn linux_user_primary_group(user: &str) -> Option<String> {
+    let mut cmd = Command::new("id");
+    cmd.arg("-gn").arg(user);
+    let out = run_cmd_output(cmd, "id -gn").ok()?;
+    let value = out.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn resolve_syncthing_service_user(blob: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
+    let requested = blob.sync_service_user.trim();
+    let requested = if requested.is_empty() {
+        DEFAULT_BLOB_SYNC_SERVICE_USER
+    } else {
+        requested
+    };
+    if linux_user_exists(requested) {
+        return Ok(requested.to_string());
+    }
+    if blob.sync_allow_root_fallback {
+        tracing::warn!(
+            user = requested,
+            allow_root_fallback = blob.sync_allow_root_fallback,
+            "syncthing service user missing; using explicit root fallback"
+        );
+        return Ok("root".to_string());
+    }
+    Err(format!(
+        "linux user '{}' not found and blob.sync.allow_root_fallback=false",
+        requested
+    )
+    .into())
+}
+
+fn ensure_dir_permissions_0750(path: &Path) -> Result<(), OrchestratorError> {
+    fs::create_dir_all(path)?;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o750);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+fn ensure_owned_dir(path: &Path, user: &str) -> Result<(), OrchestratorError> {
+    ensure_dir_permissions_0750(path)?;
+    let group = linux_user_primary_group(user).unwrap_or_else(|| user.to_string());
+    let mut chown = Command::new("chown");
+    chown.arg(format!("{user}:{group}")).arg(path);
+    run_cmd(chown, "chown syncthing dir ownership")
+}
+
 fn syncthing_binary_available() -> bool {
     Path::new(SYNCTHING_INSTALL_PATH).exists()
+}
+
+fn syncthing_install_dir() -> PathBuf {
+    Path::new(SYNCTHING_INSTALL_PATH)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/fluxbee/vendor/bin"))
 }
 
 fn normalize_sha256(raw: &str) -> String {
@@ -2147,11 +2477,9 @@ fn resolve_syncthing_vendor_source_path() -> Result<PathBuf, OrchestratorError> 
             return Ok(path);
         }
         let primary = Path::new(DIST_VENDOR_ROOT_DIR).join(&component.path);
-        let legacy = Path::new(VENDOR_ROOT_DIR).join(&component.path);
         return Err(format!(
-            "vendor manifest syncthing path missing at '{}' and '{}'",
-            primary.display(),
-            legacy.display()
+            "vendor manifest syncthing path missing at '{}'",
+            primary.display()
         )
         .into());
     }
@@ -2159,19 +2487,9 @@ fn resolve_syncthing_vendor_source_path() -> Result<PathBuf, OrchestratorError> 
     if fallback.exists() {
         return Ok(fallback);
     }
-    let legacy_fallback = PathBuf::from(SYNCTHING_VENDOR_SOURCE_PATH);
-    if legacy_fallback.exists() {
-        return Ok(legacy_fallback);
-    }
-    // Transitional fallback: when dist/vendor source is not present yet, allow using
-    // the currently installed syncthing binary as the vendor source-of-truth.
-    let installed_fallback = PathBuf::from(SYNCTHING_INSTALL_PATH);
-    if installed_fallback.exists() {
-        return Ok(installed_fallback);
-    }
     Err(format!(
-        "syncthing vendor binary missing at '{}' and '{}' and '{}' and vendor manifest is absent",
-        DIST_SYNCTHING_VENDOR_SOURCE_PATH, SYNCTHING_VENDOR_SOURCE_PATH, SYNCTHING_INSTALL_PATH
+        "syncthing vendor binary missing at '{}' and vendor manifest is absent",
+        DIST_SYNCTHING_VENDOR_SOURCE_PATH
     )
     .into())
 }
@@ -2395,30 +2713,31 @@ fn ensure_local_syncthing_vendor_layout() -> Result<(), OrchestratorError> {
     if !Path::new(SYNCTHING_INSTALL_PATH).exists() {
         return Err("syncthing installed binary missing while ensuring vendor layout".into());
     }
-    for target in [DIST_SYNCTHING_VENDOR_SOURCE_PATH, SYNCTHING_VENDOR_SOURCE_PATH] {
-        let target_path = Path::new(target);
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut install = Command::new("install");
-        install
-            .arg("-m")
-            .arg("0755")
-            .arg(SYNCTHING_INSTALL_PATH)
-            .arg(target);
-        run_cmd(install, &format!("install local syncthing vendor source ({target})"))?;
+    let target_path = Path::new(DIST_SYNCTHING_VENDOR_SOURCE_PATH);
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)?;
     }
+    let mut install = Command::new("install");
+    install
+        .arg("-m")
+        .arg("0755")
+        .arg(SYNCTHING_INSTALL_PATH)
+        .arg(DIST_SYNCTHING_VENDOR_SOURCE_PATH);
+    run_cmd(
+        install,
+        &format!(
+            "install local syncthing vendor source ({})",
+            DIST_SYNCTHING_VENDOR_SOURCE_PATH
+        ),
+    )?;
     Ok(())
 }
 
 fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> String {
-    let service_group = if linux_user_exists(service_user) {
-        service_user
-    } else {
-        "root"
-    };
+    let service_group =
+        linux_user_primary_group(service_user).unwrap_or_else(|| service_user.to_string());
     format!(
-        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nEnvironment=HOME={}\nExecStart={} --no-browser --no-restart --home={} --gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nEnvironment=HOME={}\nUMask=0027\nExecStart={} --no-browser --no-restart --home={} --gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
         service_user,
         service_group,
         blob.sync_data_dir.display(),
@@ -2430,15 +2749,7 @@ fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> Stri
 }
 
 fn ensure_syncthing_unit(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {
-    let service_user = if linux_user_exists(SYNCTHING_INSTALL_USER) {
-        SYNCTHING_INSTALL_USER.to_string()
-    } else {
-        tracing::warn!(
-            user = SYNCTHING_INSTALL_USER,
-            "linux user not found; running syncthing as root"
-        );
-        "root".to_string()
-    };
+    let service_user = resolve_syncthing_service_user(blob)?;
     let unit_contents = syncthing_unit_contents(blob, &service_user);
     let unit_path =
         Path::new("/etc/systemd/system").join(format!("{SYNCTHING_SERVICE_NAME}.service"));
@@ -2465,6 +2776,117 @@ async fn syncthing_api_healthy(api_port: u16) -> bool {
     )
 }
 
+fn syncthing_api_key(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
+    let config_path = sync.sync_data_dir.join("config.xml");
+    let data = fs::read_to_string(&config_path)?;
+    let re = Regex::new(r#"(?s)<apikey>([^<]+)</apikey>"#)?;
+    let api_key = re
+        .captures(&data)
+        .and_then(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("syncthing API key missing in '{}'", config_path.display()))?;
+    Ok(api_key)
+}
+
+#[derive(Debug, Clone)]
+struct SyncthingFolderStatus {
+    state: String,
+    need_total_items: u64,
+    error: String,
+    invalid: String,
+}
+
+impl SyncthingFolderStatus {
+    fn is_healthy(&self) -> bool {
+        self.error.trim().is_empty() && self.invalid.trim().is_empty()
+    }
+
+    fn is_converged(&self) -> bool {
+        self.is_healthy() && self.state.eq_ignore_ascii_case("idle") && self.need_total_items == 0
+    }
+}
+
+fn json_u64(payload: &serde_json::Value, camel_key: &str, snake_key: &str) -> u64 {
+    payload
+        .get(camel_key)
+        .or_else(|| payload.get(snake_key))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
+fn syncthing_folder_status(
+    sync: &BlobRuntimeConfig,
+    folder_id: &str,
+) -> Result<SyncthingFolderStatus, OrchestratorError> {
+    let api_key = syncthing_api_key(sync)?;
+    let endpoint = format!(
+        "http://127.0.0.1:{}/rest/db/status?folder={}",
+        sync.sync_api_port, folder_id
+    );
+    let mut cmd = Command::new("curl");
+    cmd.arg("-fsS")
+        .arg("-H")
+        .arg(format!("X-API-Key: {}", api_key))
+        .arg(&endpoint);
+    let out = run_cmd_output(cmd, &format!("syncthing db status folder={folder_id}"))?;
+    let payload: serde_json::Value = serde_json::from_str(&out).map_err(|err| {
+        format!("invalid syncthing db/status payload for folder '{folder_id}': {err}")
+    })?;
+    let state = payload
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .trim()
+        .to_string();
+    let need_total_items = json_u64(&payload, "needTotalItems", "need_total_items");
+    let error = payload
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let invalid = payload
+        .get("invalid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Ok(SyncthingFolderStatus {
+        state,
+        need_total_items,
+        error,
+        invalid,
+    })
+}
+
+fn syncthing_folder_healthy(
+    sync: &BlobRuntimeConfig,
+    folder_id: &str,
+) -> Result<bool, OrchestratorError> {
+    let status = syncthing_folder_status(sync, folder_id)?;
+    Ok(status.is_healthy())
+}
+
+fn syncthing_trigger_folder_scan(
+    sync: &BlobRuntimeConfig,
+    folder_id: &str,
+) -> Result<(), OrchestratorError> {
+    let api_key = syncthing_api_key(sync)?;
+    let endpoint = format!(
+        "http://127.0.0.1:{}/rest/db/scan?folder={}",
+        sync.sync_api_port, folder_id
+    );
+    let mut cmd = Command::new("curl");
+    cmd.arg("-fsS")
+        .arg("-X")
+        .arg("POST")
+        .arg("-H")
+        .arg(format!("X-API-Key: {}", api_key))
+        .arg(&endpoint);
+    let _ = run_cmd_output(cmd, &format!("syncthing scan folder={folder_id}"))?;
+    Ok(())
+}
+
 async fn wait_for_syncthing_health(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {
     let start = Instant::now();
     let timeout = Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS);
@@ -2479,6 +2901,64 @@ async fn wait_for_syncthing_health(blob: &BlobRuntimeConfig) -> Result<(), Orche
         }
         time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+fn valid_syncthing_device_id(device_id: &str) -> bool {
+    let id = device_id.trim();
+    if id.len() < 16 {
+        return false;
+    }
+    id.chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-')
+}
+
+fn extract_first_syncthing_device_id(config_xml: &str) -> Option<String> {
+    let device_re = Regex::new(r#"<device\b[^>]*\bid="([^"]+)""#).ok()?;
+    for caps in device_re.captures_iter(config_xml) {
+        let candidate = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        if valid_syncthing_device_id(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn local_syncthing_device_id(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
+    let home = sync.sync_data_dir.display().to_string();
+    let mut cmd = Command::new(SYNCTHING_INSTALL_PATH);
+    cmd.arg("--home")
+        .arg(&sync.sync_data_dir)
+        .arg("--device-id")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &home);
+    match run_cmd_output(cmd, "syncthing --device-id") {
+        Ok(out) => {
+            let device_id = out.trim();
+            if valid_syncthing_device_id(device_id) {
+                return Ok(device_id.to_string());
+            }
+            tracing::warn!(
+                output = %truncate_for_error(&out, 200),
+                "invalid syncthing --device-id output; falling back to config.xml parsing"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to resolve syncthing device id from binary; falling back to config.xml parsing"
+            );
+        }
+    }
+
+    let config_path = sync.sync_data_dir.join("config.xml");
+    let data = fs::read_to_string(&config_path)?;
+    extract_first_syncthing_device_id(&data).ok_or_else(|| {
+        format!(
+            "failed to resolve syncthing device id from '{}'",
+            config_path.display()
+        )
+        .into()
+    })
 }
 
 fn xml_escape_attr(value: &str) -> String {
@@ -2617,6 +3097,338 @@ fn ensure_syncthing_folder_in_config_xml(
     Ok((out, true))
 }
 
+fn ensure_syncthing_top_level_device_in_config_xml(
+    config_xml: &str,
+    device_id: &str,
+    device_name: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let normalized_id = device_id.trim();
+    if !valid_syncthing_device_id(normalized_id) {
+        return Err(format!("invalid syncthing device id '{}'", device_id).into());
+    }
+
+    let header_end = config_xml
+        .find("<folder")
+        .or_else(|| config_xml.find("</configuration>"))
+        .unwrap_or(config_xml.len());
+    let header = &config_xml[..header_end];
+    let device_re = Regex::new(&format!(
+        r#"<device\b[^>]*\bid="{}"[^>]*>"#,
+        regex::escape(normalized_id)
+    ))?;
+    if device_re.is_match(header) {
+        return Ok((config_xml.to_string(), false));
+    }
+
+    let name = if device_name.trim().is_empty() {
+        normalized_id
+    } else {
+        device_name.trim()
+    };
+    let new_device = format!(
+        "  <device id=\"{}\" name=\"{}\" compression=\"metadata\" introducer=\"false\" skipIntroductionRemovals=\"false\" introducedBy=\"\"></device>\n",
+        xml_escape_attr(normalized_id),
+        xml_escape_attr(name),
+    );
+    let mut out = String::with_capacity(config_xml.len() + new_device.len() + 1);
+    out.push_str(&config_xml[..header_end]);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&new_device);
+    out.push_str(&config_xml[header_end..]);
+    Ok((out, true))
+}
+
+fn ensure_syncthing_folder_has_device(
+    config_xml: &str,
+    folder_id: &str,
+    device_id: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let normalized_id = device_id.trim();
+    if !valid_syncthing_device_id(normalized_id) {
+        return Err(format!("invalid syncthing device id '{}'", device_id).into());
+    }
+
+    let folder_re = Regex::new(r#"(?s)<folder\b[^>]*\bid="([^"]+)"[^>]*>.*?</folder>"#)?;
+    let device_re = Regex::new(&format!(
+        r#"<device\b[^>]*\bid="{}"[^>]*>"#,
+        regex::escape(normalized_id)
+    ))?;
+    for caps in folder_re.captures_iter(config_xml) {
+        let Some(found_id) = caps.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        if found_id != folder_id {
+            continue;
+        }
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        if device_re.is_match(full.as_str()) {
+            return Ok((config_xml.to_string(), false));
+        }
+        let insert_at = full.end().saturating_sub("</folder>".len());
+        let mut out = String::with_capacity(config_xml.len() + 72 + normalized_id.len());
+        out.push_str(&config_xml[..insert_at]);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("    <device id=\"");
+        out.push_str(&xml_escape_attr(normalized_id));
+        out.push_str("\" introducedBy=\"\"/>\n");
+        out.push_str(&config_xml[insert_at..]);
+        return Ok((out, true));
+    }
+    Ok((config_xml.to_string(), false))
+}
+
+fn reconcile_syncthing_peer_xml(
+    config_xml: &str,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+    peer_device_id: &str,
+    peer_name: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let mut updated = config_xml.to_string();
+    let mut changed = false;
+
+    let (next, top_changed) =
+        ensure_syncthing_top_level_device_in_config_xml(&updated, peer_device_id, peer_name)?;
+    updated = next;
+    changed |= top_changed;
+
+    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        let blob_sync_path = blob_sync_folder_path(blob);
+        let (next, folder_changed) = ensure_syncthing_folder_in_config_xml(
+            &updated,
+            SYNCTHING_FOLDER_BLOB_ID,
+            &blob_sync_path.display().to_string(),
+            "Fluxbee Blob",
+        )?;
+        updated = next;
+        changed |= folder_changed;
+        let (next, device_changed) =
+            ensure_syncthing_folder_has_device(&updated, SYNCTHING_FOLDER_BLOB_ID, peer_device_id)?;
+        updated = next;
+        changed |= device_changed;
+    }
+
+    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        let (next, folder_changed) = ensure_syncthing_folder_in_config_xml(
+            &updated,
+            SYNCTHING_FOLDER_DIST_ID,
+            &dist.path.display().to_string(),
+            "Fluxbee Dist",
+        )?;
+        updated = next;
+        changed |= folder_changed;
+        let (next, device_changed) =
+            ensure_syncthing_folder_has_device(&updated, SYNCTHING_FOLDER_DIST_ID, peer_device_id)?;
+        updated = next;
+        changed |= device_changed;
+    }
+
+    Ok((updated, changed))
+}
+
+fn ensure_local_syncthing_peer_link(
+    sync: &BlobRuntimeConfig,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+    peer_device_id: &str,
+    peer_name: &str,
+) -> Result<bool, OrchestratorError> {
+    let config_path = sync.sync_data_dir.join("config.xml");
+    let current = fs::read_to_string(&config_path)?;
+    let (updated, changed) =
+        reconcile_syncthing_peer_xml(&current, blob, dist, peer_device_id, peer_name)?;
+    if changed {
+        fs::write(&config_path, updated)?;
+    }
+    Ok(changed)
+}
+
+async fn ensure_syncthing_peer_link_runtime(
+    sync: &BlobRuntimeConfig,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+    peer_device_id: &str,
+    peer_name: &str,
+) -> Result<(), OrchestratorError> {
+    if !sync.sync_enabled {
+        return Ok(());
+    }
+    if !(blob_sync_tool_is_syncthing(sync) || dist_sync_tool_is_syncthing(dist)) {
+        return Ok(());
+    }
+    let changed = ensure_local_syncthing_peer_link(sync, blob, dist, peer_device_id, peer_name)?;
+    if !changed {
+        return Ok(());
+    }
+    tracing::info!(
+        service = SYNCTHING_SERVICE_NAME,
+        peer_name = peer_name,
+        "syncthing peer config reconciled locally; restarting service"
+    );
+    let mut restart = Command::new("systemctl");
+    restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
+    run_cmd(restart, "systemctl restart")?;
+    wait_for_service_active(
+        SYNCTHING_SERVICE_NAME,
+        Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
+    )
+    .await?;
+    wait_for_syncthing_health(sync).await?;
+    Ok(())
+}
+
+fn remove_syncthing_folder_device(
+    config_xml: &str,
+    folder_id: &str,
+    device_id: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let normalized_id = device_id.trim();
+    if !valid_syncthing_device_id(normalized_id) {
+        return Err(format!("invalid syncthing device id '{}'", device_id).into());
+    }
+    let folder_re = Regex::new(r#"(?s)<folder\b[^>]*\bid="([^"]+)"[^>]*>.*?</folder>"#)?;
+    let device_re = Regex::new(&format!(
+        r#"(?s)\n?[ \t]*<device\b[^>]*\bid="{}"[^>]*(?:/>|>.*?</device>)[ \t]*\n?"#,
+        regex::escape(normalized_id)
+    ))?;
+    for caps in folder_re.captures_iter(config_xml) {
+        let Some(found_id) = caps.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        if found_id != folder_id {
+            continue;
+        }
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        let rewritten = device_re.replace_all(full.as_str(), "").into_owned();
+        if rewritten == full.as_str() {
+            return Ok((config_xml.to_string(), false));
+        }
+        let mut out =
+            String::with_capacity(config_xml.len() + rewritten.len().saturating_sub(full.len()));
+        out.push_str(&config_xml[..full.start()]);
+        out.push_str(&rewritten);
+        out.push_str(&config_xml[full.end()..]);
+        return Ok((out, true));
+    }
+    Ok((config_xml.to_string(), false))
+}
+
+fn remove_syncthing_top_level_device_from_config_xml(
+    config_xml: &str,
+    device_id: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let normalized_id = device_id.trim();
+    if !valid_syncthing_device_id(normalized_id) {
+        return Err(format!("invalid syncthing device id '{}'", device_id).into());
+    }
+    let header_end = config_xml
+        .find("<folder")
+        .or_else(|| config_xml.find("</configuration>"))
+        .unwrap_or(config_xml.len());
+    let header = &config_xml[..header_end];
+    let device_re = Regex::new(&format!(
+        r#"(?s)\n?[ \t]*<device\b[^>]*\bid="{}"[^>]*(?:/>|>.*?</device>)[ \t]*\n?"#,
+        regex::escape(normalized_id)
+    ))?;
+    let rewritten = device_re.replace_all(header, "").into_owned();
+    if rewritten == header {
+        return Ok((config_xml.to_string(), false));
+    }
+    let mut out = String::with_capacity(config_xml.len());
+    out.push_str(&rewritten);
+    out.push_str(&config_xml[header_end..]);
+    Ok((out, true))
+}
+
+fn reconcile_syncthing_peer_removal_xml(
+    config_xml: &str,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+    peer_device_id: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let mut updated = config_xml.to_string();
+    let mut changed = false;
+
+    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        let (next, folder_changed) =
+            remove_syncthing_folder_device(&updated, SYNCTHING_FOLDER_BLOB_ID, peer_device_id)?;
+        updated = next;
+        changed |= folder_changed;
+    }
+
+    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        let (next, folder_changed) =
+            remove_syncthing_folder_device(&updated, SYNCTHING_FOLDER_DIST_ID, peer_device_id)?;
+        updated = next;
+        changed |= folder_changed;
+    }
+
+    let (next, top_changed) =
+        remove_syncthing_top_level_device_from_config_xml(&updated, peer_device_id)?;
+    updated = next;
+    changed |= top_changed;
+
+    Ok((updated, changed))
+}
+
+fn ensure_local_syncthing_peer_unlink(
+    sync: &BlobRuntimeConfig,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+    peer_device_id: &str,
+) -> Result<bool, OrchestratorError> {
+    let config_path = sync.sync_data_dir.join("config.xml");
+    let current = fs::read_to_string(&config_path)?;
+    let (updated, changed) =
+        reconcile_syncthing_peer_removal_xml(&current, blob, dist, peer_device_id)?;
+    if changed {
+        fs::write(&config_path, updated)?;
+    }
+    Ok(changed)
+}
+
+async fn ensure_syncthing_peer_unlink_runtime(
+    sync: &BlobRuntimeConfig,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+    peer_device_id: &str,
+    peer_name: &str,
+) -> Result<bool, OrchestratorError> {
+    if !sync.sync_enabled {
+        return Ok(false);
+    }
+    if !(blob_sync_tool_is_syncthing(sync) || dist_sync_tool_is_syncthing(dist)) {
+        return Ok(false);
+    }
+    let changed = ensure_local_syncthing_peer_unlink(sync, blob, dist, peer_device_id)?;
+    if !changed {
+        return Ok(false);
+    }
+    tracing::info!(
+        service = SYNCTHING_SERVICE_NAME,
+        peer_name = peer_name,
+        "syncthing peer config reconciled locally (unlink); restarting service"
+    );
+    let mut restart = Command::new("systemctl");
+    restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
+    run_cmd(restart, "systemctl restart")?;
+    wait_for_service_active(
+        SYNCTHING_SERVICE_NAME,
+        Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
+    )
+    .await?;
+    wait_for_syncthing_health(sync).await?;
+    Ok(true)
+}
+
 fn reconcile_syncthing_folders_xml(
     config_xml: &str,
     blob: &BlobRuntimeConfig,
@@ -2626,10 +3438,11 @@ fn reconcile_syncthing_folders_xml(
     let mut changed_folders = Vec::new();
 
     if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        let blob_sync_path = blob_sync_folder_path(blob);
         let (next, changed) = ensure_syncthing_folder_in_config_xml(
             &updated,
             SYNCTHING_FOLDER_BLOB_ID,
-            &blob.path.display().to_string(),
+            &blob_sync_path.display().to_string(),
             "Fluxbee Blob",
         )?;
         if changed {
@@ -2654,212 +3467,6 @@ fn reconcile_syncthing_folders_xml(
     Ok((updated, changed_folders))
 }
 
-fn syncthing_config_without_folders(config_xml: &str) -> Result<String, OrchestratorError> {
-    let folder_re = Regex::new(r#"(?s)<folder\b[^>]*>.*?</folder>"#)?;
-    Ok(folder_re.replace_all(config_xml, "").into_owned())
-}
-
-fn is_valid_syncthing_device_id(value: &str) -> bool {
-    let id = value.trim();
-    !id.is_empty()
-        && id.contains('-')
-        && id
-            .chars()
-            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-')
-}
-
-fn extract_primary_syncthing_device_id(config_xml: &str) -> Result<String, OrchestratorError> {
-    let stripped = syncthing_config_without_folders(config_xml)?;
-    let device_re = Regex::new(r#"<device\b[^>]*\bid="([^"]+)""#)?;
-    for caps in device_re.captures_iter(&stripped) {
-        let Some(found) = caps.get(1).map(|m| m.as_str()) else {
-            continue;
-        };
-        if is_valid_syncthing_device_id(found) {
-            return Ok(found.to_string());
-        }
-    }
-    Err("syncthing config has no valid top-level device id".into())
-}
-
-fn ensure_syncthing_top_level_peer_device(
-    config_xml: &str,
-    peer_device_id: &str,
-    peer_name: &str,
-) -> Result<(String, bool), OrchestratorError> {
-    let stripped = syncthing_config_without_folders(config_xml)?;
-    let peer_re = Regex::new(&format!(
-        r#"<device\b[^>]*\bid="{}""#,
-        regex::escape(peer_device_id)
-    ))?;
-    if peer_re.is_match(&stripped) {
-        return Ok((config_xml.to_string(), false));
-    }
-    let peer_block = format!(
-        "  <device id=\"{}\" name=\"{}\" compression=\"metadata\" introducer=\"false\" skipIntroductionRemovals=\"false\" introducedBy=\"\">\n    <address>dynamic</address>\n    <paused>false</paused>\n    <autoAcceptFolders>false</autoAcceptFolders>\n  </device>\n",
-        xml_escape_attr(peer_device_id),
-        xml_escape_attr(peer_name)
-    );
-    let insert_at = config_xml
-        .rfind("</configuration>")
-        .unwrap_or(config_xml.len());
-    let mut out = String::with_capacity(config_xml.len() + peer_block.len() + 2);
-    out.push_str(&config_xml[..insert_at]);
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(&peer_block);
-    out.push_str(&config_xml[insert_at..]);
-    Ok((out, true))
-}
-
-fn ensure_syncthing_folder_has_device_ref(
-    config_xml: &str,
-    folder_id: &str,
-    device_id: &str,
-) -> Result<(String, bool), OrchestratorError> {
-    let folder_re = Regex::new(r#"(?s)<folder\b[^>]*\bid="([^"]+)"[^>]*>.*?</folder>"#)?;
-    for caps in folder_re.captures_iter(config_xml) {
-        let Some(found_id) = caps.get(1).map(|m| m.as_str()) else {
-            continue;
-        };
-        if found_id != folder_id {
-            continue;
-        }
-        let Some(full) = caps.get(0) else {
-            continue;
-        };
-        let mut rewritten = full.as_str().to_string();
-        let device_re = Regex::new(&format!(
-            r#"<device\b[^>]*\bid="{}""#,
-            regex::escape(device_id)
-        ))?;
-        if device_re.is_match(&rewritten) {
-            return Ok((config_xml.to_string(), false));
-        }
-        let entry = format!(
-            "    <device id=\"{}\" introducedBy=\"\"/>\n",
-            xml_escape_attr(device_id)
-        );
-        if let Some(pos) = rewritten.find("<minDiskFree") {
-            rewritten.insert_str(pos, &entry);
-        } else if let Some(pos) = rewritten.rfind("</folder>") {
-            rewritten.insert_str(pos, &entry);
-        } else {
-            return Err("invalid syncthing folder block while inserting device ref".into());
-        }
-        let mut out =
-            String::with_capacity(config_xml.len() + rewritten.len().saturating_sub(full.len()));
-        out.push_str(&config_xml[..full.start()]);
-        out.push_str(&rewritten);
-        out.push_str(&config_xml[full.end()..]);
-        return Ok((out, true));
-    }
-    Ok((config_xml.to_string(), false))
-}
-
-fn reconcile_syncthing_peer_config_xml(
-    config_xml: &str,
-    local_device_id: &str,
-    peer_device_id: &str,
-    peer_name: &str,
-    blob: &BlobRuntimeConfig,
-    dist: &DistRuntimeConfig,
-) -> Result<(String, bool), OrchestratorError> {
-    let mut updated = config_xml.to_string();
-    let mut changed = false;
-
-    let (next, peer_changed) =
-        ensure_syncthing_top_level_peer_device(&updated, peer_device_id, peer_name)?;
-    updated = next;
-    changed |= peer_changed;
-
-    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
-        for device_id in [local_device_id, peer_device_id] {
-            let (next_cfg, folder_changed) =
-                ensure_syncthing_folder_has_device_ref(&updated, SYNCTHING_FOLDER_BLOB_ID, device_id)?;
-            updated = next_cfg;
-            changed |= folder_changed;
-        }
-    }
-    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
-        for device_id in [local_device_id, peer_device_id] {
-            let (next_cfg, folder_changed) =
-                ensure_syncthing_folder_has_device_ref(&updated, SYNCTHING_FOLDER_DIST_ID, device_id)?;
-            updated = next_cfg;
-            changed |= folder_changed;
-        }
-    }
-
-    Ok((updated, changed))
-}
-
-fn ensure_syncthing_peer_pairing_with_access(
-    local_hive_id: &str,
-    remote_hive_id: &str,
-    address: &str,
-    key_path: &Path,
-    sync: &BlobRuntimeConfig,
-    blob: &BlobRuntimeConfig,
-    dist: &DistRuntimeConfig,
-) -> Result<(), OrchestratorError> {
-    let local_cfg_path = sync.sync_data_dir.join("config.xml");
-    let local_current = fs::read_to_string(&local_cfg_path)?;
-
-    let remote_cfg_path = format!("{}/config.xml", sync.sync_data_dir.display());
-    let remote_read_cmd = format!("cat '{}'", shell_single_quote(&remote_cfg_path));
-    let remote_current = ssh_with_key_output(
-        address,
-        key_path,
-        &sudo_wrap(&remote_read_cmd),
-        BOOTSTRAP_SSH_USER,
-    )?;
-
-    let local_device_id = extract_primary_syncthing_device_id(&local_current)?;
-    let remote_device_id = extract_primary_syncthing_device_id(&remote_current)?;
-
-    let (local_updated, local_changed) = reconcile_syncthing_peer_config_xml(
-        &local_current,
-        &local_device_id,
-        &remote_device_id,
-        remote_hive_id,
-        blob,
-        dist,
-    )?;
-    let (remote_updated, remote_changed) = reconcile_syncthing_peer_config_xml(
-        &remote_current,
-        &remote_device_id,
-        &local_device_id,
-        local_hive_id,
-        blob,
-        dist,
-    )?;
-
-    if local_changed {
-        fs::write(&local_cfg_path, &local_updated)?;
-        let mut restart = Command::new("systemctl");
-        restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
-        run_cmd(restart, "systemctl restart local syncthing (pairing)")?;
-    }
-    if remote_changed {
-        write_remote_file(address, key_path, &remote_cfg_path, &remote_updated)?;
-        ssh_with_key(
-            address,
-            key_path,
-            &sudo_wrap(&format!("systemctl restart {SYNCTHING_SERVICE_NAME}")),
-            BOOTSTRAP_SSH_USER,
-        )?;
-        remote_wait_service_active(
-            address,
-            key_path,
-            SYNCTHING_SERVICE_NAME,
-            SYNCTHING_BOOTSTRAP_TIMEOUT_SECS,
-        )?;
-    }
-
-    Ok(())
-}
-
 fn reconcile_local_syncthing_folders(
     sync: &BlobRuntimeConfig,
     blob: &BlobRuntimeConfig,
@@ -2872,6 +3479,38 @@ fn reconcile_local_syncthing_folders(
         fs::write(&config_path, updated)?;
     }
     Ok(changed_folders)
+}
+
+fn ensure_syncthing_folder_marker(path: &Path) -> Result<bool, OrchestratorError> {
+    fs::create_dir_all(path)?;
+    let marker = path.join(".stfolder");
+    if marker.exists() {
+        return Ok(false);
+    }
+    fs::write(&marker, b"fluxbee syncthing marker\n")?;
+    Ok(true)
+}
+
+fn ensure_syncthing_folder_markers(
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) -> Result<Vec<String>, OrchestratorError> {
+    let mut repaired = Vec::new();
+
+    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        let blob_sync_path = blob_sync_folder_path(blob);
+        if ensure_syncthing_folder_marker(&blob_sync_path)? {
+            repaired.push(SYNCTHING_FOLDER_BLOB_ID.to_string());
+        }
+    }
+
+    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        if ensure_syncthing_folder_marker(&dist.path)? {
+            repaired.push(SYNCTHING_FOLDER_DIST_ID.to_string());
+        }
+    }
+
+    Ok(repaired)
 }
 
 async fn ensure_blob_sync_runtime(
@@ -2890,6 +3529,8 @@ async fn ensure_blob_sync_runtime(
         .into());
     }
 
+    let repaired_markers = ensure_syncthing_folder_markers(blob, dist)?;
+
     ensure_syncthing_installed()?;
     ensure_local_syncthing_vendor_layout()?;
     ensure_syncthing_unit(&sync)?;
@@ -2906,11 +3547,12 @@ async fn ensure_blob_sync_runtime(
     .await?;
     wait_for_syncthing_health(&sync).await?;
     let changed_folders = reconcile_local_syncthing_folders(&sync, blob, dist)?;
-    if !changed_folders.is_empty() {
+    if !changed_folders.is_empty() || !repaired_markers.is_empty() {
         tracing::info!(
             service = SYNCTHING_SERVICE_NAME,
             folders = ?changed_folders,
-            "syncthing folder config reconciled locally; restarting service"
+            repaired_markers = ?repaired_markers,
+            "syncthing runtime reconciled locally; restarting service"
         );
         let mut restart = Command::new("systemctl");
         restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
@@ -2927,7 +3569,6 @@ async fn ensure_blob_sync_runtime(
         api_port = sync.sync_api_port,
         "blob sync service healthy"
     );
-    ensure_remote_blob_sync_all_hives(blob, dist);
     Ok(())
 }
 
@@ -2979,7 +3620,6 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         if changed {
             tracing::info!("blob/dist sync disabled in hive.yaml; reverting syncthing runtime");
             disable_blob_sync_runtime_local()?;
-            disable_remote_blob_sync_all_hives(state);
         }
         return Ok(());
     }
@@ -2999,7 +3639,50 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
 
     let service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
     let api_healthy = syncthing_api_healthy(desired_sync.sync_api_port).await;
+    let mut folders_healthy = true;
     if service_active && api_healthy {
+        if desired_blob.sync_enabled && blob_sync_tool_is_syncthing(&desired_blob) {
+            match syncthing_folder_healthy(&desired_sync, SYNCTHING_FOLDER_BLOB_ID) {
+                Ok(true) => {}
+                Ok(false) => {
+                    folders_healthy = false;
+                    tracing::warn!(
+                        folder = SYNCTHING_FOLDER_BLOB_ID,
+                        "syncthing folder unhealthy; scheduling runtime reconcile"
+                    );
+                }
+                Err(err) => {
+                    folders_healthy = false;
+                    tracing::warn!(
+                        folder = SYNCTHING_FOLDER_BLOB_ID,
+                        error = %err,
+                        "failed to verify syncthing folder health; scheduling runtime reconcile"
+                    );
+                }
+            }
+        }
+        if desired_dist.sync_enabled && dist_sync_tool_is_syncthing(&desired_dist) {
+            match syncthing_folder_healthy(&desired_sync, SYNCTHING_FOLDER_DIST_ID) {
+                Ok(true) => {}
+                Ok(false) => {
+                    folders_healthy = false;
+                    tracing::warn!(
+                        folder = SYNCTHING_FOLDER_DIST_ID,
+                        "syncthing folder unhealthy; scheduling runtime reconcile"
+                    );
+                }
+                Err(err) => {
+                    folders_healthy = false;
+                    tracing::warn!(
+                        folder = SYNCTHING_FOLDER_DIST_ID,
+                        error = %err,
+                        "failed to verify syncthing folder health; scheduling runtime reconcile"
+                    );
+                }
+            }
+        }
+    }
+    if service_active && api_healthy && folders_healthy {
         return Ok(());
     }
 
@@ -3007,6 +3690,7 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         service = SYNCTHING_SERVICE_NAME,
         service_active = service_active,
         api_healthy = api_healthy,
+        folders_healthy = folders_healthy,
         "syncthing unhealthy; restarting"
     );
     ensure_blob_sync_runtime(&desired_blob, &desired_dist).await?;
@@ -3048,17 +3732,6 @@ fn load_lsa_snapshot(state: &OrchestratorState) -> Result<LsaSnapshot, Orchestra
         .ok_or_else(|| "lsa snapshot unavailable".into())
 }
 
-fn routers_from_snapshot(snapshot: &ShmSnapshot) -> Vec<serde_json::Value> {
-    vec![serde_json::json!({
-        "uuid": snapshot.header.router_uuid.to_string(),
-        "name": snapshot.header.router_name,
-        "is_gateway": snapshot.header.is_gateway,
-        "nodes_count": snapshot.header.node_count,
-        "heartbeat": snapshot.header.heartbeat,
-        "status": "alive",
-    })]
-}
-
 fn nodes_from_snapshot(snapshot: &ShmSnapshot, local_hive: &str) -> Vec<serde_json::Value> {
     snapshot
         .nodes
@@ -3088,36 +3761,6 @@ fn list_nodes_flow(state: &OrchestratorState, payload: &serde_json::Value) -> se
             "status": "ok",
             "target": target_hive,
             "nodes": remote_nodes_for_hive(&snapshot, &target_hive),
-        }),
-        Err(err) => serde_json::json!({
-            "status": "error",
-            "error_code": "SHM_NOT_FOUND",
-            "message": err.to_string(),
-        }),
-    }
-}
-
-fn list_routers_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
-    let target_hive = target_hive_from_payload(payload, &state.hive_id);
-    if target_hive == state.hive_id {
-        return match load_router_snapshot(state) {
-            Ok(snapshot) => serde_json::json!({
-                "status": "ok",
-                "routers": routers_from_snapshot(&snapshot),
-            }),
-            Err(err) => serde_json::json!({
-                "status": "error",
-                "error_code": "SHM_NOT_FOUND",
-                "message": err.to_string(),
-            }),
-        };
-    }
-
-    match load_lsa_snapshot(state) {
-        Ok(snapshot) => serde_json::json!({
-            "status": "ok",
-            "target": target_hive,
-            "routers": remote_routers_for_hive(state, &snapshot, &target_hive),
         }),
         Err(err) => serde_json::json!({
             "status": "error",
@@ -3178,11 +3821,10 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
             })
         }
         Ok(None) => {
-            let legacy_present = Path::new(DIST_SYNCTHING_VENDOR_SOURCE_PATH).exists()
-                || Path::new(SYNCTHING_VENDOR_SOURCE_PATH).exists();
+            let syncthing_present = Path::new(DIST_SYNCTHING_VENDOR_SOURCE_PATH).exists();
             serde_json::json!({
-                "status": if legacy_present { "legacy_no_manifest" } else { "missing" },
-                "syncthing_present": legacy_present,
+                "status": "missing",
+                "syncthing_present": syncthing_present,
             })
         }
         Err(err) => serde_json::json!({
@@ -3199,124 +3841,30 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
     })
 }
 
-fn remote_read_file(
-    address: &str,
-    key_path: &Path,
-    path: &str,
-) -> Result<Option<String>, OrchestratorError> {
-    let path_q = shell_single_quote(path);
-    let cmd = format!("bash -lc \"if [ -f '{path_q}' ]; then cat '{path_q}'; fi\"");
-    let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
-    if out.trim().is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(out))
-}
-
-fn remote_versions_snapshot(
-    hive_id: &str,
-    address: &str,
-    key_path: &Path,
-) -> Result<serde_json::Value, OrchestratorError> {
-    let core_raw = match remote_read_file(address, key_path, DIST_CORE_MANIFEST_PATH)? {
-        Some(raw) => Some(raw),
-        None => remote_read_file(address, key_path, CORE_MANIFEST_PATH)?,
-    };
-    let core = match core_raw {
-        Some(raw) => match serde_json::from_str::<CoreManifest>(&raw) {
-            Ok(manifest) => {
-                let manifest_hash = remote_core_manifest_hash(address, key_path).ok().flatten();
-                serde_json::json!({
-                    "status": "ok",
-                    "schema_version": manifest.schema_version,
-                    "manifest_hash": manifest_hash,
-                    "components": manifest.components,
-                })
-            }
-            Err(err) => serde_json::json!({
-                "status": "error",
-                "message": format!("invalid core manifest: {}", err),
-            }),
-        },
-        None => serde_json::json!({
-            "status": "missing",
-        }),
-    };
-
-    let runtime_raw = match remote_read_file(address, key_path, DIST_RUNTIME_MANIFEST_PATH)? {
-        Some(raw) => Some(raw),
-        None => remote_read_file(address, key_path, "/var/lib/fluxbee/runtimes/manifest.json")?,
-    };
-    let runtimes = match runtime_raw {
-        Some(raw) => match serde_json::from_str::<RuntimeManifest>(&raw) {
-            Ok(manifest) => {
-                let manifest_hash = remote_runtime_manifest_hash(address, key_path)
-                    .ok()
-                    .flatten();
-                serde_json::json!({
-                    "status": "ok",
-                    "manifest_version": manifest.version,
-                    "manifest_hash": manifest_hash,
-                    "runtimes": manifest.runtimes,
-                })
-            }
-            Err(err) => serde_json::json!({
-                "status": "error",
-                "message": format!("invalid runtime manifest: {}", err),
-            }),
-        },
-        None => serde_json::json!({
-            "status": "missing",
-        }),
-    };
-
-    let vendor = match remote_syncthing_installed_hash(address, key_path) {
-        Ok(hash) => {
-            if let Some(hash) = hash {
-                serde_json::json!({
-                    "status": "ok",
-                    "syncthing_installed_path": SYNCTHING_INSTALL_PATH,
-                    "manifest_hash": hash,
-                })
-            } else {
-                serde_json::json!({
-                    "status": "missing",
-                    "syncthing_installed_path": SYNCTHING_INSTALL_PATH,
-                })
-            }
-        }
-        Err(err) => serde_json::json!({
-            "status": "error",
-            "message": err.to_string(),
-        }),
-    };
-
-    Ok(serde_json::json!({
-        "hive_id": hive_id,
-        "core": core,
-        "runtimes": runtimes,
-        "vendor": vendor,
-    }))
-}
-
-fn versions_snapshot_for_hive(
+async fn get_versions_flow(
     state: &OrchestratorState,
-    hive_id: &str,
-) -> Result<serde_json::Value, OrchestratorError> {
-    if hive_id == state.hive_id {
-        return Ok(local_versions_snapshot(state));
-    }
-    let (address, key_path) = hive_access(hive_id)?;
-    remote_versions_snapshot(hive_id, &address, &key_path)
-}
-
-fn get_versions_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+    payload: &serde_json::Value,
+) -> serde_json::Value {
     let target_hive = target_hive_from_payload(payload, &state.hive_id);
-    match versions_snapshot_for_hive(state, &target_hive) {
-        Ok(snapshot) => serde_json::json!({
+    if target_hive == state.hive_id {
+        return serde_json::json!({
             "status": "ok",
-            "hive": snapshot,
+            "hive": local_versions_snapshot(state),
+        });
+    }
+
+    let forwarded = forward_system_action_to_hive(
+        state,
+        &target_hive,
+        "GET_VERSIONS",
+        "GET_VERSIONS_RESPONSE",
+        serde_json::json!({
+            "target": target_hive,
         }),
+    )
+    .await;
+    match forwarded {
+        Ok(payload) => payload,
         Err(err) => serde_json::json!({
             "status": "error",
             "error_code": "VERSIONS_FAILED",
@@ -3326,27 +3874,45 @@ fn get_versions_flow(state: &OrchestratorState, payload: &serde_json::Value) -> 
     }
 }
 
-fn list_versions_flow(state: &OrchestratorState) -> serde_json::Value {
+async fn list_versions_flow(state: &OrchestratorState) -> serde_json::Value {
     let mut hives = Vec::new();
-    match versions_snapshot_for_hive(state, &state.hive_id) {
-        Ok(snapshot) => hives.push(snapshot),
-        Err(err) => hives.push(serde_json::json!({
-            "hive_id": state.hive_id,
-            "status": "error",
-            "message": err.to_string(),
-        })),
-    }
+    hives.push(local_versions_snapshot(state));
     for hive_id in list_managed_hive_ids() {
         if hive_id == state.hive_id {
             continue;
         }
-        match versions_snapshot_for_hive(state, &hive_id) {
-            Ok(snapshot) => hives.push(snapshot),
-            Err(err) => hives.push(serde_json::json!({
+        let response = get_versions_flow(
+            state,
+            &serde_json::json!({
+                "target": hive_id,
+            }),
+        )
+        .await;
+        if response
+            .get("status")
+            .and_then(|v| v.as_str())
+            .is_some_and(|status| status.eq_ignore_ascii_case("ok"))
+        {
+            if let Some(snapshot) = response.get("hive") {
+                hives.push(snapshot.clone());
+            } else {
+                hives.push(serde_json::json!({
+                    "hive_id": hive_id,
+                    "status": "error",
+                    "message": "remote GET_VERSIONS returned ok without hive payload",
+                }));
+            }
+        } else {
+            let message = response
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("versions request failed");
+            hives.push(serde_json::json!({
                 "hive_id": hive_id,
                 "status": "error",
-                "message": err.to_string(),
-            })),
+                "message": message,
+                "error_code": response.get("error_code").cloned().unwrap_or(serde_json::Value::Null),
+            }));
         }
     }
     serde_json::json!({
@@ -3430,30 +3996,6 @@ fn append_deployment_history(entry: &DeploymentHistoryEntry) -> Result<(), Orche
     let line = serde_json::to_string(entry)?;
     writeln!(file, "{line}")?;
     Ok(())
-}
-
-fn deployment_result(workers: &[DeploymentWorkerOutcome]) -> String {
-    if workers.is_empty() {
-        return "noop".to_string();
-    }
-    let mut ok = 0usize;
-    let mut err = 0usize;
-    for worker in workers {
-        match worker.status.as_str() {
-            "ok" => ok += 1,
-            "error" => err += 1,
-            _ => {}
-        }
-    }
-    if ok == 0 && err == 0 {
-        "noop".to_string()
-    } else if ok > 0 && err > 0 {
-        "partial_error".to_string()
-    } else if err > 0 {
-        "error".to_string()
-    } else {
-        "ok".to_string()
-    }
 }
 
 fn default_deployment_actor(state: &OrchestratorState) -> String {
@@ -3562,20 +4104,6 @@ fn drift_alert_limit_from_payload(payload: &serde_json::Value) -> usize {
         .clamp(1, DRIFT_ALERT_MAX_LIMIT)
 }
 
-fn append_drift_alert(entry: &DriftAlertEntry) -> Result<(), OrchestratorError> {
-    let path = drift_alerts_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let line = serde_json::to_string(entry)?;
-    writeln!(file, "{line}")?;
-    Ok(())
-}
-
 fn read_drift_alerts(
     limit: usize,
     hive_filter: Option<&str>,
@@ -3640,35 +4168,6 @@ fn drift_filter_str<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
-}
-
-fn push_drift_alert(
-    category: &str,
-    trigger: &str,
-    hive_id: &str,
-    severity: &str,
-    kind: &str,
-    message: String,
-    local_hash: Option<String>,
-    remote_hash_before: Option<String>,
-    remote_hash_after: Option<String>,
-) {
-    let entry = DriftAlertEntry {
-        alert_id: Uuid::new_v4().to_string(),
-        detected_at: now_epoch_ms(),
-        category: category.to_string(),
-        trigger: trigger.to_string(),
-        hive_id: hive_id.to_string(),
-        severity: severity.to_string(),
-        kind: kind.to_string(),
-        message,
-        local_hash,
-        remote_hash_before,
-        remote_hash_after,
-    };
-    if let Err(err) = append_drift_alert(&entry) {
-        tracing::warn!(error = %err, "failed to persist drift alert");
-    }
 }
 
 fn list_drift_alerts_flow(payload: &serde_json::Value) -> serde_json::Value {
@@ -3819,41 +4318,6 @@ fn remote_node_to_json(
     }))
 }
 
-fn remote_routers_for_hive(
-    state: &OrchestratorState,
-    snapshot: &LsaSnapshot,
-    target_hive: &str,
-) -> Vec<serde_json::Value> {
-    let now = now_epoch_ms();
-    let gateway_base = state
-        .gateway_name
-        .split('@')
-        .next()
-        .unwrap_or(&state.gateway_name)
-        .to_string();
-    for hive in &snapshot.hives {
-        let Some(hive_id) = remote_hive_name(hive) else {
-            continue;
-        };
-        if hive_id != target_hive {
-            continue;
-        }
-        let status = remote_hive_status(hive, now);
-        let router_uuid = Uuid::from_bytes(hive.router_uuid);
-        let router_name =
-            remote_router_name(hive).unwrap_or_else(|| format!("{gateway_base}@{hive_id}"));
-        return vec![serde_json::json!({
-            "uuid": router_uuid.to_string(),
-            "name": router_name,
-            "is_gateway": true,
-            "nodes_count": hive.node_count,
-            "status": status,
-            "heartbeat": hive.last_updated,
-        })];
-    }
-    Vec::new()
-}
-
 async fn send_config_response(
     sender: &NodeSender,
     request: &Message,
@@ -3940,11 +4404,7 @@ done"
 
 fn remove_hive_cleanup_local_flow() -> serde_json::Value {
     let deferred_script = format!("sleep 1; {}", remove_hive_cleanup_script());
-    match Command::new("bash")
-        .arg("-lc")
-        .arg(deferred_script)
-        .spawn()
-    {
+    match Command::new("bash").arg("-lc").arg(deferred_script).spawn() {
         Ok(_) => serde_json::json!({
             "status": "ok",
             "cleanup": "scheduled",
@@ -3982,10 +4442,24 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
         });
     }
 
-    let mut remote_cleanup: &str;
-    let mut remote_cleanup_via: &str;
-    let mut address = String::new();
-    let cleanup_cmd = remove_hive_cleanup_script();
+    let remote_cleanup: &str;
+    let remote_cleanup_via: &str;
+    let hive_info = read_hive_info(&root, hive_id).ok();
+    let address = hive_info
+        .as_ref()
+        .and_then(|info| {
+            info.get("address")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let syncthing_peer_device_id = hive_info
+        .as_ref()
+        .and_then(|info| info.get("syncthing_device_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| valid_syncthing_device_id(value))
+        .map(str::to_string);
     let forward_result = forward_system_action_to_hive_with_timeout(
         state,
         hive_id,
@@ -4000,10 +4474,7 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
     .await;
 
     let socket_cleanup_ok = match forward_result.as_ref() {
-        Ok(payload) => payload
-            .get("status")
-            .and_then(|value| value.as_str())
-            == Some("ok"),
+        Ok(payload) => payload.get("status").and_then(|value| value.as_str()) == Some("ok"),
         Err(_) => false,
     };
     let socket_cleanup_timed_out = socket_cleanup_timeout(&forward_result);
@@ -4011,9 +4482,6 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
     if socket_cleanup_ok {
         remote_cleanup = "socket_ok";
         remote_cleanup_via = "socket";
-        if let Ok((addr, _)) = hive_access(hive_id) {
-            address = addr;
-        }
     } else {
         remote_cleanup = if socket_cleanup_timed_out {
             "socket_timeout"
@@ -4025,43 +4493,47 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
             tracing::warn!(
                 hive_id = hive_id,
                 error = %err,
-                "socket cleanup failed during remove_hive; attempting ssh fallback"
+                "socket cleanup failed during remove_hive; using local-only cleanup"
             );
         } else if let Ok(payload) = &forward_result {
             tracing::warn!(
                 hive_id = hive_id,
                 payload = %payload,
-                "socket cleanup returned non-ok status; attempting ssh fallback"
+                "socket cleanup returned non-ok status; using local-only cleanup"
             );
         }
-        match hive_access(hive_id) {
-            Ok((addr, key_path)) => {
-                address = addr;
-                let cleanup_cmd_q = shell_single_quote(cleanup_cmd);
-                if let Err(err) = ssh_with_key(
-                    &address,
-                    &key_path,
-                    &sudo_wrap(&format!("bash -lc '{}'", cleanup_cmd_q)),
-                    BOOTSTRAP_SSH_USER,
-                ) {
-                    tracing::warn!(
-                        hive_id = hive_id,
-                        address = %address,
-                        error = %err,
-                        "remote cleanup failed; proceeding with local hive state removal"
-                    );
-                    remote_cleanup = "ssh_fallback_failed";
-                    remote_cleanup_via = "ssh_fallback";
+    }
+
+    let mut syncthing_peer_cleanup = "skipped_no_peer_device_id".to_string();
+    let mut syncthing_peer_unlinked = false;
+    if let Some(peer_device_id) = syncthing_peer_device_id.as_deref() {
+        let desired_blob = current_blob_runtime_config(state);
+        let desired_dist = current_dist_runtime_config(state);
+        let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
+        match ensure_syncthing_peer_unlink_runtime(
+            &desired_sync,
+            &desired_blob,
+            &desired_dist,
+            peer_device_id,
+            hive_id,
+        )
+        .await
+        {
+            Ok(changed) => {
+                syncthing_peer_unlinked = changed;
+                syncthing_peer_cleanup = if changed {
+                    "local_unlinked".to_string()
                 } else {
-                    remote_cleanup = "ssh_fallback_ok";
-                    remote_cleanup_via = "ssh_fallback";
-                }
+                    "local_no_changes".to_string()
+                };
             }
             Err(err) => {
+                syncthing_peer_cleanup = "local_unlink_failed".to_string();
                 tracing::warn!(
                     hive_id = hive_id,
+                    peer_device_id = peer_device_id,
                     error = %err,
-                    "cannot resolve hive access for remote cleanup; proceeding with local hive state removal"
+                    "failed to unlink syncthing peer during remove_hive; continuing with local cleanup"
                 );
             }
         }
@@ -4083,12 +4555,12 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
         "address": address,
         "remote_cleanup": remote_cleanup,
         "remote_cleanup_via": remote_cleanup_via,
+        "syncthing_peer_cleanup": syncthing_peer_cleanup,
+        "syncthing_peer_unlinked": syncthing_peer_unlinked,
     })
 }
 
-fn socket_cleanup_timeout(
-    forward_result: &Result<serde_json::Value, OrchestratorError>,
-) -> bool {
+fn socket_cleanup_timeout(forward_result: &Result<serde_json::Value, OrchestratorError>) -> bool {
     match forward_result {
         Ok(payload) => {
             if payload
@@ -4123,69 +4595,15 @@ fn read_hive_info(root: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
     Ok(json)
 }
 
-fn parse_runtime_manifest(
-    payload: &serde_json::Value,
-) -> Result<RuntimeManifest, OrchestratorError> {
-    if !payload.is_object() {
-        return Err("runtime manifest payload must be an object".into());
-    }
-    let manifest: RuntimeManifest = serde_json::from_value(payload.clone())?;
-    if manifest.schema_version != RUNTIME_MANIFEST_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported runtime manifest schema_version={} (expected={})",
-            manifest.schema_version, RUNTIME_MANIFEST_SCHEMA_VERSION
-        )
-        .into());
-    }
-    if manifest.version == 0 {
-        return Err("runtime manifest missing version".into());
-    }
-    Ok(manifest)
-}
-
-fn parse_runtime_update_target_hives(
-    payload: &serde_json::Value,
-) -> Result<Option<HashSet<String>>, OrchestratorError> {
-    let Some(raw) = payload.get("target_hives") else {
-        return Ok(None);
-    };
-    let arr = raw
-        .as_array()
-        .ok_or_else(|| "runtime update target_hives must be an array".to_string())?;
-    if arr.is_empty() {
-        return Err("runtime update target_hives cannot be empty".into());
-    }
-    let managed: HashSet<String> = list_worker_access()
-        .into_iter()
-        .map(|(hive_id, _, _)| hive_id)
-        .collect();
-    let mut targets = HashSet::new();
-    for item in arr {
-        let hive_id = item
-            .as_str()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| "runtime update target_hives contains invalid value".to_string())?;
-        if !valid_hive_id(hive_id) {
-            return Err(format!(
-                "runtime update target_hives contains invalid hive_id '{}'",
-                hive_id
-            )
-            .into());
-        }
-        if !managed.contains(hive_id) {
-            return Err(format!(
-                "runtime update target_hives contains unmanaged hive '{}'",
-                hive_id
-            )
-            .into());
-        }
-        targets.insert(hive_id.to_string());
-    }
-    if targets.is_empty() {
-        return Err("runtime update target_hives resolved empty set".into());
-    }
-    Ok(Some(targets))
+fn write_hive_info(
+    root: &Path,
+    hive_id: &str,
+    info: &serde_json::Value,
+) -> Result<(), OrchestratorError> {
+    let path = root.join(hive_id).join("info.yaml");
+    let yaml = serde_yaml::to_string(info)?;
+    fs::write(path, yaml)?;
+    Ok(())
 }
 
 fn runtime_keep_versions(
@@ -4295,116 +4713,26 @@ fn apply_runtime_retention(
     Ok(stats)
 }
 
-enum RuntimeUpdateDecision {
-    Apply,
-    NoopSameVersion,
-}
-
-fn validate_runtime_update_versioning(
-    current: Option<&RuntimeManifest>,
-    incoming: &RuntimeManifest,
-) -> Result<RuntimeUpdateDecision, (&'static str, String)> {
-    if incoming.schema_version != RUNTIME_MANIFEST_SCHEMA_VERSION {
-        return Err((
-            "MANIFEST_INVALID",
-            format!(
-                "unsupported runtime manifest schema_version={} (expected={})",
-                incoming.schema_version, RUNTIME_MANIFEST_SCHEMA_VERSION
-            ),
-        ));
-    }
-    if incoming.version == 0 {
-        return Err((
-            "MANIFEST_INVALID",
-            "runtime manifest missing version".to_string(),
-        ));
-    }
-
-    let Some(current) = current else {
-        return Ok(RuntimeUpdateDecision::Apply);
-    };
-
-    if incoming.version < current.version {
-        return Err((
-            "VERSION_MISMATCH",
-            format!(
-                "stale runtime manifest version={} (current={})",
-                incoming.version, current.version
-            ),
-        ));
-    }
-    if incoming.version > current.version {
-        return Ok(RuntimeUpdateDecision::Apply);
-    }
-    if incoming == current {
-        return Ok(RuntimeUpdateDecision::NoopSameVersion);
-    }
-    Err((
-        "VERSION_MISMATCH",
-        format!(
-            "runtime manifest conflict at version={} (payload differs from current)",
-            incoming.version
-        ),
-    ))
-}
-
 fn runtimes_root() -> PathBuf {
     PathBuf::from(DIST_RUNTIME_ROOT_DIR)
 }
 
-fn legacy_runtimes_root() -> PathBuf {
-    PathBuf::from(LEGACY_RUNTIME_ROOT_DIR)
-}
-
-fn local_runtime_source_root() -> PathBuf {
-    let dist = runtimes_root();
-    if dist.join("manifest.json").exists() {
-        return dist;
-    }
-    let legacy = legacy_runtimes_root();
-    if legacy.exists() {
-        return legacy;
-    }
-    dist
-}
-
 fn local_runtime_manifest_paths() -> Vec<PathBuf> {
-    vec![
-        PathBuf::from(DIST_RUNTIME_MANIFEST_PATH),
-        PathBuf::from(format!("{LEGACY_RUNTIME_ROOT_DIR}/manifest.json")),
-    ]
+    vec![PathBuf::from(DIST_RUNTIME_MANIFEST_PATH)]
 }
 
 fn local_core_manifest_path() -> Option<PathBuf> {
     let primary = PathBuf::from(DIST_CORE_MANIFEST_PATH);
-    if primary.exists() {
-        return Some(primary);
-    }
-    let legacy = PathBuf::from(CORE_MANIFEST_PATH);
-    if legacy.exists() {
-        return Some(legacy);
-    }
-    None
+    primary.exists().then_some(primary)
 }
 
 fn local_core_bin_source_path(name: &str) -> PathBuf {
-    let primary = Path::new(DIST_CORE_BIN_SOURCE_DIR).join(name);
-    if primary.exists() {
-        return primary;
-    }
-    Path::new(CORE_BIN_SOURCE_DIR).join(name)
+    Path::new(DIST_CORE_BIN_SOURCE_DIR).join(name)
 }
 
 fn local_vendor_manifest_path() -> Option<PathBuf> {
     let primary = PathBuf::from(DIST_VENDOR_MANIFEST_PATH);
-    if primary.exists() {
-        return Some(primary);
-    }
-    let legacy = PathBuf::from(VENDOR_MANIFEST_PATH);
-    if legacy.exists() {
-        return Some(legacy);
-    }
-    None
+    primary.exists().then_some(primary)
 }
 
 fn local_vendor_component_path(relative_path: &str) -> Option<PathBuf> {
@@ -4413,29 +4741,15 @@ fn local_vendor_component_path(relative_path: &str) -> Option<PathBuf> {
         return None;
     }
     let primary = Path::new(DIST_VENDOR_ROOT_DIR).join(rel);
-    if primary.exists() {
-        return Some(primary);
-    }
-    let legacy = Path::new(VENDOR_ROOT_DIR).join(rel);
-    if legacy.exists() {
-        return Some(legacy);
-    }
-    None
+    primary.exists().then_some(primary)
 }
 
 fn orchestrator_runtime_dir() -> PathBuf {
     json_router::paths::storage_root_dir().join("orchestrator")
 }
 
-fn orchestrator_runtime_manifest_path() -> PathBuf {
-    orchestrator_runtime_dir().join(RUNTIME_MANIFEST_FILE)
-}
-
 fn load_runtime_manifest() -> Option<RuntimeManifest> {
-    let primary = orchestrator_runtime_manifest_path();
-    let mut paths = vec![primary];
-    paths.extend(local_runtime_manifest_paths());
-    for path in paths {
+    for path in local_runtime_manifest_paths() {
         let data = match fs::read_to_string(&path) {
             Ok(data) => data,
             Err(_) => continue,
@@ -4456,23 +4770,41 @@ fn load_runtime_manifest() -> Option<RuntimeManifest> {
     None
 }
 
-async fn current_runtime_manifest(state: &OrchestratorState) -> Option<RuntimeManifest> {
-    let cached = {
-        let guard = state.runtime_manifest.lock().await;
-        guard.clone()
+fn runtime_manifest_has_current_versions(manifest: &RuntimeManifest) -> bool {
+    let runtimes = match manifest.runtimes.as_object() {
+        Some(value) => value,
+        None => return false,
     };
-    cached.or_else(load_runtime_manifest)
+    if runtimes.is_empty() {
+        return false;
+    }
+    runtimes.values().any(|entry| {
+        entry
+            .get("current")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_some_and(|current| !current.is_empty())
+    })
 }
 
-fn persist_runtime_manifest(manifest: &RuntimeManifest) -> Result<(), OrchestratorError> {
-    fs::create_dir_all(orchestrator_runtime_dir())?;
-    fs::create_dir_all(runtimes_root())?;
-    fs::create_dir_all(legacy_runtimes_root())?;
-    let data = serde_json::to_string_pretty(manifest)?;
-    fs::write(orchestrator_runtime_manifest_path(), &data)?;
-    fs::write(runtimes_root().join("manifest.json"), &data)?;
-    fs::write(legacy_runtimes_root().join("manifest.json"), data)?;
-    Ok(())
+fn local_runtime_manifest_ready_for_spawn() -> bool {
+    load_runtime_manifest()
+        .as_ref()
+        .is_some_and(runtime_manifest_has_current_versions)
+}
+
+async fn wait_for_local_runtime_manifest_ready(timeout: Duration) -> bool {
+    if local_runtime_manifest_ready_for_spawn() {
+        return true;
+    }
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        time::sleep(Duration::from_millis(1000)).await;
+        if local_runtime_manifest_ready_for_spawn() {
+            return true;
+        }
+    }
+    false
 }
 
 async fn should_verify_runtimes(state: &OrchestratorState) -> bool {
@@ -4484,7 +4816,68 @@ async fn should_verify_runtimes(state: &OrchestratorState) -> bool {
     true
 }
 
-async fn runtime_verify_and_sync(state: &OrchestratorState) -> Result<(), OrchestratorError> {
+async fn should_run_blob_gc(
+    state: &OrchestratorState,
+    gc_enabled: bool,
+    gc_interval_secs: u64,
+) -> bool {
+    if !gc_enabled {
+        return false;
+    }
+    let mut guard = state.last_blob_gc.lock().await;
+    if guard.elapsed() < Duration::from_secs(gc_interval_secs.max(60)) {
+        return false;
+    }
+    *guard = Instant::now();
+    true
+}
+
+fn run_blob_gc_housekeeping(
+    _state: &OrchestratorState,
+    blob: &BlobRuntimeConfig,
+) -> Result<(), OrchestratorError> {
+    if !(blob.enabled && blob.gc_enabled) {
+        return Ok(());
+    }
+    let toolkit = BlobToolkit::new(SdkBlobConfig {
+        blob_root: blob.path.clone(),
+        name_max_chars: BLOB_NAME_MAX_CHARS,
+        max_blob_bytes: None,
+    })?;
+    let report = toolkit.run_gc(BlobGcOptions {
+        staging_ttl_hours: blob.gc_staging_ttl_hours,
+        active_retain_days: blob.gc_active_retain_days,
+        apply: blob.gc_apply,
+    })?;
+
+    if report.staging.candidate_files > 0 || report.active.candidate_files > 0 {
+        tracing::info!(
+            apply = report.apply,
+            staging_ttl_hours = report.staging_ttl_hours,
+            active_retain_days = report.active_retain_days,
+            staging_candidates = report.staging.candidate_files,
+            staging_deleted = report.staging.deleted_files,
+            staging_deleted_bytes = report.staging.deleted_bytes,
+            active_candidates = report.active.candidate_files,
+            active_deleted = report.active.deleted_files,
+            active_deleted_bytes = report.active.deleted_bytes,
+            "blob gc housekeeping completed"
+        );
+    }
+
+    if !report.staging.errors.is_empty() || !report.active.errors.is_empty() {
+        tracing::warn!(
+            staging_errors = report.staging.errors.len(),
+            active_errors = report.active.errors.len(),
+            first_staging_error = report.staging.errors.first().cloned().unwrap_or_default(),
+            first_active_error = report.active.errors.first().cloned().unwrap_or_default(),
+            "blob gc housekeeping finished with errors"
+        );
+    }
+    Ok(())
+}
+
+async fn runtime_verify_and_retain(state: &OrchestratorState) -> Result<(), OrchestratorError> {
     let manifest = {
         let guard = state.runtime_manifest.lock().await;
         guard.clone()
@@ -4499,550 +4892,9 @@ async fn runtime_verify_and_sync(state: &OrchestratorState) -> Result<(), Orches
             let mut guard = state.runtime_manifest.lock().await;
             *guard = Some(manifest.clone());
         }
-        tracing::info!(
-            "watchdog verify: remote runtime/core/vendor SSH sync disabled in v2 (use SYSTEM_UPDATE per hive)"
-        );
+        tracing::info!("watchdog verify: runtime retention applied (software updates use SYSTEM_UPDATE per hive)");
     }
     Ok(())
-}
-
-async fn runtime_sync_workers(
-    _state: &OrchestratorState,
-    manifest: &RuntimeManifest,
-    target_hives_filter: Option<&HashSet<String>>,
-    trigger: &str,
-    actor: &str,
-    force_record: bool,
-) -> Result<(), OrchestratorError> {
-    if manifest.version == 0 {
-        return Ok(());
-    }
-    let started_at = now_epoch_ms();
-    let started = Instant::now();
-    let deployment_id = Uuid::new_v4().to_string();
-    let local_hash = local_runtime_manifest_hash()?;
-    let workers = list_worker_access();
-    let mut outcomes: Vec<DeploymentWorkerOutcome> = Vec::new();
-    let mut target_hives = Vec::new();
-    for (hive_id, address, key_path) in workers {
-        if let Some(filter) = target_hives_filter {
-            if !filter.contains(&hive_id) {
-                continue;
-            }
-        }
-        target_hives.push(hive_id.clone());
-        let worker_started = Instant::now();
-        if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(&address, &key_path) {
-            outcomes.push(DeploymentWorkerOutcome {
-                hive_id,
-                status: "error".to_string(),
-                reason: Some(format!("sudo bootstrap failed: {err}")),
-                duration_ms: worker_started.elapsed().as_millis() as u64,
-                local_hash: local_hash.clone(),
-                remote_hash_before: None,
-                remote_hash_after: None,
-            });
-            continue;
-        }
-        let remote_hash = remote_runtime_manifest_hash(&address, &key_path)
-            .ok()
-            .flatten();
-        let pre_drift_detected = local_hash.is_some()
-            && remote_hash
-                .as_deref()
-                .is_some_and(|remote| Some(remote) != local_hash.as_deref());
-        if local_hash.is_some() && remote_hash == local_hash {
-            outcomes.push(DeploymentWorkerOutcome {
-                hive_id,
-                status: "skipped".to_string(),
-                reason: Some("up_to_date".to_string()),
-                duration_ms: worker_started.elapsed().as_millis() as u64,
-                local_hash: local_hash.clone(),
-                remote_hash_before: remote_hash.clone(),
-                remote_hash_after: remote_hash,
-            });
-            continue;
-        }
-        if let Err(err) = sync_runtime_to_worker(&hive_id, &address, &key_path) {
-            tracing::warn!(hive = %hive_id, error = %err, "runtime sync failed");
-            if pre_drift_detected {
-                push_drift_alert(
-                    "runtime",
-                    trigger,
-                    &hive_id,
-                    "error",
-                    "sync_error",
-                    format!("runtime drift detected and auto-resync failed: {}", err),
-                    local_hash.clone(),
-                    remote_hash.clone(),
-                    None,
-                );
-            }
-            outcomes.push(DeploymentWorkerOutcome {
-                hive_id,
-                status: "error".to_string(),
-                reason: Some(err.to_string()),
-                duration_ms: worker_started.elapsed().as_millis() as u64,
-                local_hash: local_hash.clone(),
-                remote_hash_before: remote_hash,
-                remote_hash_after: None,
-            });
-            continue;
-        }
-        let remote_after = verify_remote_hash_with_retry(local_hash.as_deref(), || {
-            remote_runtime_manifest_hash(&address, &key_path)
-        })
-        .ok()
-        .flatten();
-        if local_hash.is_some() && remote_after != local_hash {
-            push_drift_alert(
-                "runtime",
-                trigger,
-                &hive_id,
-                "error",
-                "post_sync_mismatch",
-                "runtime drift persists after auto-resync".to_string(),
-                local_hash.clone(),
-                remote_hash.clone(),
-                remote_after.clone(),
-            );
-            outcomes.push(DeploymentWorkerOutcome {
-                hive_id,
-                status: "error".to_string(),
-                reason: Some("post_sync_hash_mismatch_after_retry".to_string()),
-                duration_ms: worker_started.elapsed().as_millis() as u64,
-                local_hash: local_hash.clone(),
-                remote_hash_before: remote_hash,
-                remote_hash_after: remote_after,
-            });
-            continue;
-        }
-        if pre_drift_detected {
-            push_drift_alert(
-                "runtime",
-                trigger,
-                &hive_id,
-                "warning",
-                "pre_sync_mismatch_resolved",
-                format!(
-                    "runtime drift detected (remote != local) and resolved by auto-resync by {}",
-                    actor
-                ),
-                local_hash.clone(),
-                remote_hash.clone(),
-                remote_after.clone(),
-            );
-        }
-        outcomes.push(DeploymentWorkerOutcome {
-            hive_id,
-            status: "ok".to_string(),
-            reason: None,
-            duration_ms: worker_started.elapsed().as_millis() as u64,
-            local_hash: local_hash.clone(),
-            remote_hash_before: remote_hash,
-            remote_hash_after: remote_after,
-        });
-    }
-
-    let has_non_skipped = outcomes.iter().any(|item| item.status != "skipped");
-    if force_record || has_non_skipped {
-        let entry = DeploymentHistoryEntry {
-            deployment_id,
-            category: "runtime".to_string(),
-            trigger: trigger.to_string(),
-            actor: actor.to_string(),
-            started_at,
-            finished_at: started_at + started.elapsed().as_millis() as u64,
-            manifest_version: Some(manifest.version),
-            manifest_hash: local_hash.clone(),
-            target_hives,
-            result: deployment_result(&outcomes),
-            workers: outcomes,
-        };
-        if let Err(err) = append_deployment_history(&entry) {
-            tracing::warn!(error = %err, "failed to persist runtime deployment history");
-        }
-    }
-    Ok(())
-}
-
-async fn core_sync_workers(
-    _state: &OrchestratorState,
-    trigger: &str,
-    actor: &str,
-    force_record: bool,
-) -> Result<(), OrchestratorError> {
-    let started_at = now_epoch_ms();
-    let started = Instant::now();
-    let deployment_id = Uuid::new_v4().to_string();
-    let local_hash = local_core_manifest_hash()?;
-    let workers = list_worker_access();
-    let mut outcomes: Vec<DeploymentWorkerOutcome> = Vec::new();
-    let mut target_hives = Vec::new();
-    for (hive_id, address, key_path) in workers {
-        target_hives.push(hive_id.clone());
-        let worker_started = Instant::now();
-        if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(&address, &key_path) {
-            outcomes.push(DeploymentWorkerOutcome {
-                hive_id,
-                status: "error".to_string(),
-                reason: Some(format!("sudo bootstrap failed: {err}")),
-                duration_ms: worker_started.elapsed().as_millis() as u64,
-                local_hash: local_hash.clone(),
-                remote_hash_before: None,
-                remote_hash_after: None,
-            });
-            continue;
-        }
-        let remote_hash = remote_core_manifest_hash(&address, &key_path)
-            .ok()
-            .flatten();
-        let pre_drift_detected = local_hash.is_some()
-            && remote_hash
-                .as_deref()
-                .is_some_and(|remote| Some(remote) != local_hash.as_deref());
-        if local_hash.is_some() && remote_hash == local_hash {
-            outcomes.push(DeploymentWorkerOutcome {
-                hive_id,
-                status: "skipped".to_string(),
-                reason: Some("up_to_date".to_string()),
-                duration_ms: worker_started.elapsed().as_millis() as u64,
-                local_hash: local_hash.clone(),
-                remote_hash_before: remote_hash.clone(),
-                remote_hash_after: remote_hash,
-            });
-            continue;
-        }
-        if let Err(err) = sync_core_to_worker(&hive_id, &address, &key_path, true, false) {
-            tracing::warn!(hive = %hive_id, error = %err, "core sync failed");
-            if pre_drift_detected {
-                push_drift_alert(
-                    "core",
-                    trigger,
-                    &hive_id,
-                    "error",
-                    "sync_error",
-                    format!("core drift detected and auto-resync failed: {}", err),
-                    local_hash.clone(),
-                    remote_hash.clone(),
-                    None,
-                );
-            }
-            outcomes.push(DeploymentWorkerOutcome {
-                hive_id,
-                status: "error".to_string(),
-                reason: Some(err.to_string()),
-                duration_ms: worker_started.elapsed().as_millis() as u64,
-                local_hash: local_hash.clone(),
-                remote_hash_before: remote_hash,
-                remote_hash_after: None,
-            });
-            continue;
-        }
-        let remote_after = verify_remote_hash_with_retry(local_hash.as_deref(), || {
-            remote_core_manifest_hash(&address, &key_path)
-        })
-        .ok()
-        .flatten();
-        if local_hash.is_some() && remote_after != local_hash {
-            push_drift_alert(
-                "core",
-                trigger,
-                &hive_id,
-                "error",
-                "post_sync_mismatch",
-                "core drift persists after auto-resync".to_string(),
-                local_hash.clone(),
-                remote_hash.clone(),
-                remote_after.clone(),
-            );
-            outcomes.push(DeploymentWorkerOutcome {
-                hive_id,
-                status: "error".to_string(),
-                reason: Some("post_sync_hash_mismatch_after_retry".to_string()),
-                duration_ms: worker_started.elapsed().as_millis() as u64,
-                local_hash: local_hash.clone(),
-                remote_hash_before: remote_hash,
-                remote_hash_after: remote_after,
-            });
-            continue;
-        }
-        if pre_drift_detected {
-            push_drift_alert(
-                "core",
-                trigger,
-                &hive_id,
-                "warning",
-                "pre_sync_mismatch_resolved",
-                format!(
-                    "core drift detected (remote != local) and resolved by auto-resync by {}",
-                    actor
-                ),
-                local_hash.clone(),
-                remote_hash.clone(),
-                remote_after.clone(),
-            );
-        }
-        outcomes.push(DeploymentWorkerOutcome {
-            hive_id,
-            status: "ok".to_string(),
-            reason: None,
-            duration_ms: worker_started.elapsed().as_millis() as u64,
-            local_hash: local_hash.clone(),
-            remote_hash_before: remote_hash,
-            remote_hash_after: remote_after,
-        });
-    }
-
-    let has_non_skipped = outcomes.iter().any(|item| item.status != "skipped");
-    if force_record || has_non_skipped {
-        let entry = DeploymentHistoryEntry {
-            deployment_id,
-            category: "core".to_string(),
-            trigger: trigger.to_string(),
-            actor: actor.to_string(),
-            started_at,
-            finished_at: started_at + started.elapsed().as_millis() as u64,
-            manifest_version: None,
-            manifest_hash: local_hash.clone(),
-            target_hives,
-            result: deployment_result(&outcomes),
-            workers: outcomes,
-        };
-        if let Err(err) = append_deployment_history(&entry) {
-            tracing::warn!(error = %err, "failed to persist core deployment history");
-        }
-    }
-    Ok(())
-}
-
-async fn vendor_sync_workers(
-    state: &OrchestratorState,
-    trigger: &str,
-    actor: &str,
-    force_record: bool,
-) -> Result<(), OrchestratorError> {
-    let desired_blob = current_blob_runtime_config(state);
-    let desired_dist = current_dist_runtime_config(state);
-    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
-    if !desired_sync.sync_enabled
-        || !(blob_sync_tool_is_syncthing(&desired_sync)
-            || dist_sync_tool_is_syncthing(&desired_dist))
-    {
-        return Ok(());
-    }
-
-    let started_at = now_epoch_ms();
-    let started = Instant::now();
-    let deployment_id = Uuid::new_v4().to_string();
-    let local_hash = local_syncthing_vendor_hash()?;
-    let manifest_version = load_vendor_manifest()?.map(|manifest| manifest.version);
-
-    let workers = list_worker_access();
-    let mut outcomes: Vec<DeploymentWorkerOutcome> = Vec::new();
-    let mut target_hives = Vec::new();
-    for (hive_id, address, key_path) in workers {
-        target_hives.push(hive_id.clone());
-        let worker_started = Instant::now();
-        if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(&address, &key_path) {
-            outcomes.push(DeploymentWorkerOutcome {
-                hive_id,
-                status: "error".to_string(),
-                reason: Some(format!("sudo bootstrap failed: {err}")),
-                duration_ms: worker_started.elapsed().as_millis() as u64,
-                local_hash: local_hash.clone(),
-                remote_hash_before: None,
-                remote_hash_after: None,
-            });
-            continue;
-        }
-        let remote_hash = remote_syncthing_installed_hash(&address, &key_path)
-            .ok()
-            .flatten();
-        let pre_drift_detected = local_hash.is_some()
-            && remote_hash
-                .as_deref()
-                .is_some_and(|remote| Some(remote) != local_hash.as_deref());
-        if local_hash.is_some() && remote_hash == local_hash {
-            outcomes.push(DeploymentWorkerOutcome {
-                hive_id,
-                status: "skipped".to_string(),
-                reason: Some("up_to_date".to_string()),
-                duration_ms: worker_started.elapsed().as_millis() as u64,
-                local_hash: local_hash.clone(),
-                remote_hash_before: remote_hash.clone(),
-                remote_hash_after: remote_hash,
-            });
-            continue;
-        }
-        if let Err(err) = ensure_remote_syncthing_runtime_with_access(
-            &address,
-            &key_path,
-            &desired_sync,
-            &desired_blob,
-            &desired_dist,
-        ) {
-            tracing::warn!(hive = %hive_id, error = %err, "vendor sync failed");
-            let rollback_note = attempt_remote_syncthing_rollback_note(&address, &key_path);
-            let reason = format!("vendor sync failed: {err}; {rollback_note}");
-            if pre_drift_detected {
-                push_drift_alert(
-                    "vendor",
-                    trigger,
-                    &hive_id,
-                    "error",
-                    "sync_error",
-                    format!(
-                        "vendor drift detected and auto-resync failed: {}; {}",
-                        err, rollback_note
-                    ),
-                    local_hash.clone(),
-                    remote_hash.clone(),
-                    None,
-                );
-            }
-            outcomes.push(DeploymentWorkerOutcome {
-                hive_id,
-                status: "error".to_string(),
-                reason: Some(reason),
-                duration_ms: worker_started.elapsed().as_millis() as u64,
-                local_hash: local_hash.clone(),
-                remote_hash_before: remote_hash,
-                remote_hash_after: None,
-            });
-            continue;
-        }
-        if let Err(err) = remote_wait_service_active(
-            &address,
-            &key_path,
-            SYNCTHING_SERVICE_NAME,
-            SYNCTHING_BOOTSTRAP_TIMEOUT_SECS,
-        ) {
-            let rollback_note = attempt_remote_syncthing_rollback_note(&address, &key_path);
-            let reason = format!("service not active after vendor sync: {err}; {rollback_note}");
-            push_drift_alert(
-                "vendor",
-                trigger,
-                &hive_id,
-                "error",
-                "health_check_failed",
-                reason.clone(),
-                local_hash.clone(),
-                remote_hash.clone(),
-                None,
-            );
-            outcomes.push(DeploymentWorkerOutcome {
-                hive_id,
-                status: "error".to_string(),
-                reason: Some(reason),
-                duration_ms: worker_started.elapsed().as_millis() as u64,
-                local_hash: local_hash.clone(),
-                remote_hash_before: remote_hash,
-                remote_hash_after: None,
-            });
-            continue;
-        }
-
-        let remote_after = verify_remote_hash_with_retry(local_hash.as_deref(), || {
-            remote_syncthing_installed_hash(&address, &key_path)
-        })
-        .ok()
-        .flatten();
-        if local_hash.is_some() && remote_after != local_hash {
-            let rollback_note = attempt_remote_syncthing_rollback_note(&address, &key_path);
-            let reason = format!("post_sync_hash_mismatch_after_retry; {rollback_note}");
-            push_drift_alert(
-                "vendor",
-                trigger,
-                &hive_id,
-                "error",
-                "post_sync_mismatch",
-                format!("vendor drift persists after auto-resync; {}", rollback_note),
-                local_hash.clone(),
-                remote_hash.clone(),
-                remote_after.clone(),
-            );
-            outcomes.push(DeploymentWorkerOutcome {
-                hive_id,
-                status: "error".to_string(),
-                reason: Some(reason),
-                duration_ms: worker_started.elapsed().as_millis() as u64,
-                local_hash: local_hash.clone(),
-                remote_hash_before: remote_hash,
-                remote_hash_after: remote_after,
-            });
-            continue;
-        }
-        if pre_drift_detected {
-            push_drift_alert(
-                "vendor",
-                trigger,
-                &hive_id,
-                "warning",
-                "pre_sync_mismatch_resolved",
-                format!(
-                    "vendor drift detected (remote != local) and resolved by auto-resync by {}",
-                    actor
-                ),
-                local_hash.clone(),
-                remote_hash.clone(),
-                remote_after.clone(),
-            );
-        }
-        outcomes.push(DeploymentWorkerOutcome {
-            hive_id,
-            status: "ok".to_string(),
-            reason: None,
-            duration_ms: worker_started.elapsed().as_millis() as u64,
-            local_hash: local_hash.clone(),
-            remote_hash_before: remote_hash,
-            remote_hash_after: remote_after,
-        });
-    }
-
-    let has_non_skipped = outcomes.iter().any(|item| item.status != "skipped");
-    if force_record || has_non_skipped {
-        let entry = DeploymentHistoryEntry {
-            deployment_id,
-            category: "vendor".to_string(),
-            trigger: trigger.to_string(),
-            actor: actor.to_string(),
-            started_at,
-            finished_at: started_at + started.elapsed().as_millis() as u64,
-            manifest_version,
-            manifest_hash: local_hash.clone(),
-            target_hives,
-            result: deployment_result(&outcomes),
-            workers: outcomes,
-        };
-        if let Err(err) = append_deployment_history(&entry) {
-            tracing::warn!(error = %err, "failed to persist vendor deployment history");
-        }
-    }
-    Ok(())
-}
-
-fn list_worker_access() -> Vec<(String, String, PathBuf)> {
-    let mut out = Vec::new();
-    let entries = match fs::read_dir(hives_root()) {
-        Ok(entries) => entries,
-        Err(_) => return out,
-    };
-
-    for entry in entries.flatten() {
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-        if !is_dir {
-            continue;
-        }
-        let hive_id = entry.file_name().to_string_lossy().to_string();
-        let (address, key_path) = match hive_access(&hive_id) {
-            Ok(access) => access,
-            Err(_) => continue,
-        };
-        out.push((hive_id, address, key_path));
-    }
-
-    out
 }
 
 fn local_runtime_manifest_hash() -> Result<Option<String>, OrchestratorError> {
@@ -5064,45 +4916,6 @@ fn local_runtime_manifest_hash() -> Result<Option<String>, OrchestratorError> {
         }
     }
     Ok(None)
-}
-
-fn verify_remote_hash_with_retry<F>(
-    expected_hash: Option<&str>,
-    mut fetch_remote_hash: F,
-) -> Result<Option<String>, OrchestratorError>
-where
-    F: FnMut() -> Result<Option<String>, OrchestratorError>,
-{
-    let mut last_seen: Option<String> = None;
-    for attempt in 0..POST_SYNC_HASH_VERIFY_ATTEMPTS {
-        let remote_hash = fetch_remote_hash()?;
-        if expected_hash.is_none() || remote_hash.as_deref() == expected_hash {
-            return Ok(remote_hash);
-        }
-        last_seen = remote_hash;
-        if attempt + 1 < POST_SYNC_HASH_VERIFY_ATTEMPTS {
-            std::thread::sleep(Duration::from_millis(POST_SYNC_HASH_VERIFY_DELAY_MS));
-        }
-    }
-    Ok(last_seen)
-}
-
-fn remote_runtime_manifest_hash(
-    address: &str,
-    key_path: &Path,
-) -> Result<Option<String>, OrchestratorError> {
-    let cmd = r#"bash -lc "if [ -f /var/lib/fluxbee/dist/runtimes/manifest.json ]; then sha256sum /var/lib/fluxbee/dist/runtimes/manifest.json | awk '{print $1}'; elif [ -f /var/lib/fluxbee/runtimes/manifest.json ]; then sha256sum /var/lib/fluxbee/runtimes/manifest.json | awk '{print $1}'; fi""#;
-    let out = ssh_with_key_output(address, key_path, &sudo_wrap(cmd), BOOTSTRAP_SSH_USER)?;
-    let hash = out
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if hash.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(hash))
 }
 
 fn local_core_manifest_hash() -> Result<Option<String>, OrchestratorError> {
@@ -5128,7 +4941,7 @@ fn remote_core_manifest_hash(
     address: &str,
     key_path: &Path,
 ) -> Result<Option<String>, OrchestratorError> {
-    let cmd = "bash -lc \"if [ -f '/var/lib/fluxbee/dist/core/manifest.json' ]; then sha256sum '/var/lib/fluxbee/dist/core/manifest.json' | awk '{print $1}'; elif [ -f '/var/lib/fluxbee/core/manifest.json' ]; then sha256sum '/var/lib/fluxbee/core/manifest.json' | awk '{print $1}'; fi\"".to_string();
+    let cmd = "bash -lc \"if [ -f '/var/lib/fluxbee/dist/core/manifest.json' ]; then sha256sum '/var/lib/fluxbee/dist/core/manifest.json' | awk '{print $1}'; fi\"".to_string();
     let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
     let hash = out
         .split_whitespace()
@@ -5140,76 +4953,6 @@ fn remote_core_manifest_hash(
         return Ok(None);
     }
     Ok(Some(hash))
-}
-
-fn remote_syncthing_installed_hash(
-    address: &str,
-    key_path: &Path,
-) -> Result<Option<String>, OrchestratorError> {
-    let cmd = format!(
-        "bash -lc \"if [ -f '{}' ]; then sha256sum '{}' | awk '{{print $1}}'; fi\"",
-        SYNCTHING_INSTALL_PATH, SYNCTHING_INSTALL_PATH
-    );
-    let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
-    let hash = out
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if hash.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(hash))
-}
-
-fn sync_runtime_to_worker(
-    hive_id: &str,
-    address: &str,
-    key_path: &Path,
-) -> Result<(), OrchestratorError> {
-    let local_root = local_runtime_source_root();
-    if !local_root.exists() {
-        return Ok(());
-    }
-
-    let remote_stage = format!("/tmp/fluxbee-runtimes-sync-{hive_id}");
-    let prepare_stage = format!(
-        "rm -rf '{stage}' && mkdir -p '{stage}'",
-        stage = remote_stage
-    );
-    ssh_with_key(address, key_path, &prepare_stage, BOOTSTRAP_SSH_USER)?;
-
-    let mut cmd = Command::new("rsync");
-    cmd.arg("-rz")
-        .arg("--delete")
-        .arg("--omit-dir-times")
-        .arg("--no-perms")
-        .arg("--no-owner")
-        .arg("--no-group")
-        .arg("-e")
-        .arg(format!(
-            "ssh -i {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10",
-            key_path.display()
-        ))
-        .arg(format!("{}/", local_root.display()))
-        .arg(format!(
-            "{}@{}:{}/",
-            BOOTSTRAP_SSH_USER, address, remote_stage
-        ));
-    run_cmd(cmd, &format!("rsync runtime stage ({hive_id})"))?;
-
-    let promote_cmd = format!(
-        "mkdir -p /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/runtimes && rsync -r --delete --omit-dir-times --no-perms --no-owner --no-group '{stage}/' /var/lib/fluxbee/dist/runtimes/ && rsync -r --delete --omit-dir-times --no-perms --no-owner --no-group /var/lib/fluxbee/dist/runtimes/ /var/lib/fluxbee/runtimes/ && rm -rf '{stage}'",
-        stage = remote_stage
-    );
-    let promote_cmd_escaped = promote_cmd.replace('"', "\\\"");
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap(&format!("bash -lc \"{}\"", promote_cmd_escaped)),
-        BOOTSTRAP_SSH_USER,
-    )
 }
 
 fn target_hive_from_payload(payload: &serde_json::Value, local_hive: &str) -> String {
@@ -5368,25 +5111,8 @@ fn runtime_start_script(runtime: &str, version: &str) -> String {
     format!("/var/lib/fluxbee/dist/runtimes/{runtime}/{version}/bin/start.sh")
 }
 
-fn runtime_start_script_legacy(runtime: &str, version: &str) -> String {
-    format!("/var/lib/fluxbee/runtimes/{runtime}/{version}/bin/start.sh")
-}
-
-fn hive_has_runtime_script(
-    state: &OrchestratorState,
-    target_hive: &str,
-    script_path: &str,
-) -> Result<bool, OrchestratorError> {
-    if target_hive == state.hive_id {
-        return Ok(Path::new(script_path).exists());
-    }
-    let (address, key_path) = hive_access(target_hive)?;
-    let cmd = format!(
-        "bash -lc \"if [ -x '{}' ]; then echo 1; else echo 0; fi\"",
-        script_path
-    );
-    let out = ssh_with_key_output(&address, &key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
-    Ok(out.trim() == "1")
+fn local_runtime_script_exists(script_path: &str) -> bool {
+    Path::new(script_path).is_file()
 }
 
 fn system_forward_timeout() -> Duration {
@@ -5487,7 +5213,7 @@ async fn forward_system_action_to_hive_with_timeout(
     }
 
     let socket_dir = json_router::paths::router_socket_dir();
-    let relay_name = "SY.orchestrator.relay".to_string();
+    let relay_name = format!("SY.orchestrator.relay.{}", now_epoch_ms());
     let relay_config = NodeConfig {
         name: relay_name,
         router_socket: socket_dir,
@@ -5566,10 +5292,24 @@ async fn run_node_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
+    if payload.get("name").is_some() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "legacy field 'name' is not supported; use 'node_name'",
+        });
+    }
+    if payload.get("version").is_some() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "legacy field 'version' is not supported; use 'runtime_version'",
+        });
+    }
+
     let mut target_hive = target_hive_from_payload(payload, &state.hive_id);
     let raw_node_name = payload
         .get("node_name")
-        .or_else(|| payload.get("name"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .unwrap_or("");
@@ -5614,7 +5354,6 @@ async fn run_node_flow(
 
     let requested_version = payload
         .get("runtime_version")
-        .or_else(|| payload.get("version"))
         .and_then(|v| v.as_str())
         .unwrap_or("current")
         .trim();
@@ -5698,44 +5437,16 @@ async fn run_node_flow(
         }
     };
 
-    let start_script_primary = runtime_start_script(&runtime_key, &version);
-    let start_script_legacy = runtime_start_script_legacy(&runtime_key, &version);
-    let start_script = match hive_has_runtime_script(state, &target_hive, &start_script_primary) {
-        Ok(true) => start_script_primary,
-        Ok(false) => match hive_has_runtime_script(state, &target_hive, &start_script_legacy) {
-            Ok(true) => start_script_legacy,
-            Ok(false) => {
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": "RUNTIME_NOT_PRESENT",
-                    "message": format!(
-                        "runtime script missing in dist and legacy paths: {}, {}",
-                        start_script_primary, start_script_legacy
-                    ),
-                    "target": target_hive,
-                    "node_name": node_name,
-                });
-            }
-            Err(err) => {
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": "RUNTIME_CHECK_FAILED",
-                    "message": err.to_string(),
-                    "target": target_hive,
-                    "node_name": node_name,
-                });
-            }
-        },
-        Err(err) => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "RUNTIME_CHECK_FAILED",
-                "message": err.to_string(),
-                "target": target_hive,
-                "node_name": node_name,
-            });
-        }
-    };
+    let start_script = runtime_start_script(&runtime_key, &version);
+    if !local_runtime_script_exists(&start_script) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "RUNTIME_NOT_PRESENT",
+            "message": format!("runtime script missing in dist path: {}", start_script),
+            "target": target_hive,
+            "node_name": node_name,
+        });
+    }
 
     match systemd_unit_is_active(&unit) {
         Ok(true) => {
@@ -5795,9 +5506,16 @@ async fn kill_node_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
+    if payload.get("name").is_some() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "legacy field 'name' is not supported; use 'node_name'",
+        });
+    }
+
     let node_name = payload
         .get("node_name")
-        .or_else(|| payload.get("name"))
         .and_then(|v| v.as_str())
         .map(|v| v.trim().to_string())
         .unwrap_or_default();
@@ -5946,130 +5664,6 @@ async fn kill_node_flow(
     }
 }
 
-async fn run_router_flow(
-    state: &OrchestratorState,
-    payload: &serde_json::Value,
-) -> serde_json::Value {
-    let target_hive = target_hive_from_payload(payload, &state.hive_id);
-    let service = payload
-        .get("service")
-        .and_then(|v| v.as_str())
-        .unwrap_or("rt-gateway")
-        .trim();
-
-    if !valid_token(service) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "INVALID_REQUEST",
-            "message": "invalid service",
-        });
-    }
-
-    if target_hive != state.hive_id {
-        let mut forwarded_payload = payload.clone();
-        if let Some(obj) = forwarded_payload.as_object_mut() {
-            obj.insert("target".to_string(), serde_json::json!(target_hive));
-            obj.insert("service".to_string(), serde_json::json!(service));
-        }
-        return match forward_system_action_to_hive(
-            state,
-            &target_hive,
-            "RUN_ROUTER",
-            "RUN_ROUTER_RESPONSE",
-            forwarded_payload,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(err) => serde_json::json!({
-                "status": "error",
-                "error_code": "SERVICE_FAILED",
-                "message": err.to_string(),
-                "target": target_hive,
-                "service": service,
-            }),
-        };
-    }
-
-    let cmd = format!("systemctl start {service}");
-    match execute_on_hive(state, &target_hive, &cmd, "run_router") {
-        Ok(()) => serde_json::json!({
-            "status": "ok",
-            "target": target_hive,
-            "service": service,
-        }),
-        Err(err) => serde_json::json!({
-            "status": "error",
-            "error_code": "SERVICE_FAILED",
-            "message": err.to_string(),
-            "target": target_hive,
-            "service": service,
-        }),
-    }
-}
-
-async fn kill_router_flow(
-    state: &OrchestratorState,
-    payload: &serde_json::Value,
-) -> serde_json::Value {
-    let target_hive = target_hive_from_payload(payload, &state.hive_id);
-    let service = payload
-        .get("service")
-        .and_then(|v| v.as_str())
-        .unwrap_or("rt-gateway")
-        .trim();
-
-    if !valid_token(service) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "INVALID_REQUEST",
-            "message": "invalid service",
-        });
-    }
-
-    if target_hive != state.hive_id {
-        let mut forwarded_payload = payload.clone();
-        if let Some(obj) = forwarded_payload.as_object_mut() {
-            obj.insert("target".to_string(), serde_json::json!(target_hive));
-            obj.insert("service".to_string(), serde_json::json!(service));
-        }
-        return match forward_system_action_to_hive(
-            state,
-            &target_hive,
-            "KILL_ROUTER",
-            "KILL_ROUTER_RESPONSE",
-            forwarded_payload,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(err) => serde_json::json!({
-                "status": "error",
-                "error_code": "SERVICE_FAILED",
-                "message": err.to_string(),
-                "target": target_hive,
-                "service": service,
-            }),
-        };
-    }
-
-    let cmd = format!("systemctl stop {service}");
-    match execute_on_hive(state, &target_hive, &cmd, "kill_router") {
-        Ok(()) => serde_json::json!({
-            "status": "ok",
-            "target": target_hive,
-            "service": service,
-        }),
-        Err(err) => serde_json::json!({
-            "status": "error",
-            "error_code": "SERVICE_FAILED",
-            "message": err.to_string(),
-            "target": target_hive,
-            "service": service,
-        }),
-    }
-}
-
 fn execute_on_hive(
     state: &OrchestratorState,
     target_hive: &str,
@@ -6087,55 +5681,30 @@ fn execute_on_hive(
     run_cmd(cmd, label)
 }
 
-fn hive_access(hive_id: &str) -> Result<(String, PathBuf), OrchestratorError> {
-    let root = hives_root();
-    let hive_dir = root.join(hive_id);
-    let legacy_key_path = hive_dir.join("ssh.key");
-    let key_path = if legacy_key_path.exists() {
-        legacy_key_path
-    } else {
-        let motherbee_key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
-        if motherbee_key_path.exists() {
-            motherbee_key_path
-        } else {
-            return Err(format!(
-                "missing ssh key for hive '{hive_id}': checked '{}' and '{}'",
-                legacy_key_path.display(),
-                MOTHERBEE_SSH_KEY_PATH
-            )
-            .into());
-        }
-    };
-
-    let info_path = hive_dir.join("info.yaml");
-    let data = fs::read_to_string(&info_path)?;
-    let info: HiveInfoFile = serde_yaml::from_str(&data)?;
-    let address = info
-        .address
-        .ok_or_else(|| format!("missing address for hive '{hive_id}'"))?;
-    Ok((address, key_path))
-}
-
 fn shell_single_quote(value: &str) -> String {
     value.replace('\'', "'\"'\"'")
 }
 
 fn sha256_file(path: &Path) -> Result<String, OrchestratorError> {
-    let mut cmd = Command::new("sha256sum");
-    cmd.arg(path);
-    let out = run_cmd_output(cmd, "sha256sum core binary")?;
-    Ok(out
-        .split_whitespace()
-        .next()
-        .map(|s| s.to_string())
-        .unwrap_or_default())
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn load_core_manifest() -> Result<CoreManifest, OrchestratorError> {
     let manifest_path = local_core_manifest_path().ok_or_else(|| {
         format!(
-            "core manifest missing at '{}' and '{}' (run scripts/install.sh)",
-            DIST_CORE_MANIFEST_PATH, CORE_MANIFEST_PATH
+            "core manifest missing at '{}' (run scripts/install.sh)",
+            DIST_CORE_MANIFEST_PATH
         )
     })?;
     let data = fs::read_to_string(manifest_path)?;
@@ -6251,7 +5820,10 @@ fn sync_core_to_worker(
 ) -> Result<(), OrchestratorError> {
     let manifest = load_core_manifest()?;
     let component_names = if worker_bootstrap_only {
-        core_component_names_for_role(&manifest, false)?
+        WORKER_BOOTSTRAP_CORE_COMPONENTS
+            .iter()
+            .map(|name| name.to_string())
+            .collect()
     } else {
         core_component_names_for_role(&manifest, true)?
     };
@@ -6282,13 +5854,57 @@ fn sync_core_to_worker(
     }
     validate_core_manifest_for_bins(&local_paths)?;
 
+    if worker_bootstrap_only {
+        let upload_refs: Vec<&str> = local_paths.iter().map(String::as_str).collect();
+        let remote_stage = format!("/tmp/fluxbee-core-sync-{}", sanitize_unit_suffix(hive_id));
+        let prepare_stage = format!(
+            "rm -rf '{stage}' && mkdir -p '{stage}'",
+            stage = shell_single_quote(&remote_stage)
+        );
+        ssh_with_key(address, key_path, &prepare_stage, BOOTSTRAP_SSH_USER)?;
+        scp_with_key(
+            address,
+            key_path,
+            &upload_refs,
+            &format!("{remote_stage}/"),
+            BOOTSTRAP_SSH_USER,
+        )?;
+
+        let mut commands = vec![
+            "set -euo pipefail".to_string(),
+            "mkdir -p /var/lib/fluxbee/dist/core/bin".to_string(),
+        ];
+        for name in &component_names {
+            commands.push(format!(
+                "install -m 0755 '{stage}/{name}' '/usr/bin/{name}'",
+                stage = shell_single_quote(&remote_stage),
+                name = shell_single_quote(name),
+            ));
+            commands.push(format!(
+                "install -m 0755 '{stage}/{name}' '/var/lib/fluxbee/dist/core/bin/{name}'",
+                stage = shell_single_quote(&remote_stage),
+                name = shell_single_quote(name),
+            ));
+        }
+        commands.push(format!(
+            "rm -rf '{stage}'",
+            stage = shell_single_quote(&remote_stage)
+        ));
+
+        let promote_cmd = commands.join(" && ");
+        let promote_cmd_q = shell_single_quote(&promote_cmd);
+        ssh_with_key(
+            address,
+            key_path,
+            &sudo_wrap(&format!("bash -lc '{}'", promote_cmd_q)),
+            BOOTSTRAP_SSH_USER,
+        )?;
+        return Ok(());
+    }
+
     let mut upload_paths = local_paths.clone();
-    let manifest_source_path = local_core_manifest_path().ok_or_else(|| {
-        format!(
-            "core manifest missing at '{}' and '{}'",
-            DIST_CORE_MANIFEST_PATH, CORE_MANIFEST_PATH
-        )
-    })?;
+    let manifest_source_path = local_core_manifest_path()
+        .ok_or_else(|| format!("core manifest missing at '{}'", DIST_CORE_MANIFEST_PATH))?;
     upload_paths.push(manifest_source_path.display().to_string());
     let upload_refs: Vec<&str> = upload_paths.iter().map(String::as_str).collect();
 
@@ -6357,15 +5973,6 @@ fn sync_core_to_worker(
     );
     commands.push(
         "mv /var/lib/fluxbee/dist/core/manifest.next.json /var/lib/fluxbee/dist/core/manifest.json"
-            .to_string(),
-    );
-    commands.push("mkdir -p /var/lib/fluxbee/core /var/lib/fluxbee/core/bin".to_string());
-    commands.push(
-        "rsync -r --delete --omit-dir-times --no-perms --no-owner --no-group /var/lib/fluxbee/dist/core/bin/ /var/lib/fluxbee/core/bin/"
-            .to_string(),
-    );
-    commands.push(
-        "install -m 0644 /var/lib/fluxbee/dist/core/manifest.json /var/lib/fluxbee/core/manifest.json"
             .to_string(),
     );
     for name in &component_names {
@@ -6546,9 +6153,6 @@ rm -rf /var/lib/fluxbee/dist/core/bin.bad && \
 if [ -d /var/lib/fluxbee/dist/core/bin ]; then mv /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/core/bin.bad; fi && \
 mv /var/lib/fluxbee/dist/core/bin.prev /var/lib/fluxbee/dist/core/bin && \
 if [ -f /var/lib/fluxbee/dist/core/manifest.prev.json ]; then mv /var/lib/fluxbee/dist/core/manifest.prev.json /var/lib/fluxbee/dist/core/manifest.json; fi && \
-mkdir -p /var/lib/fluxbee/core /var/lib/fluxbee/core/bin && \
-rsync -r --delete --omit-dir-times --no-perms --no-owner --no-group /var/lib/fluxbee/dist/core/bin/ /var/lib/fluxbee/core/bin/ && \
-if [ -f /var/lib/fluxbee/dist/core/manifest.json ]; then install -m 0644 /var/lib/fluxbee/dist/core/manifest.json /var/lib/fluxbee/core/manifest.json; fi && \
 for b in /var/lib/fluxbee/dist/core/bin/*; do [ -f \"$b\" ] || continue; install -m 0755 \"$b\" \"/usr/bin/$(basename \"$b\")\"; done";
     let rollback_cmd_q = shell_single_quote(rollback_cmd);
     ssh_with_key(
@@ -6607,59 +6211,6 @@ fn remote_service_journal_tail(
     }
 }
 
-fn remote_syncthing_backup_exists(
-    address: &str,
-    key_path: &Path,
-) -> Result<bool, OrchestratorError> {
-    let cmd = format!(
-        "bash -lc \"if [ -f '{}' ]; then echo 1; else echo 0; fi\"",
-        SYNCTHING_REMOTE_BACKUP_PATH
-    );
-    let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
-    Ok(out.trim() == "1")
-}
-
-fn rollback_remote_syncthing_to_prev(
-    address: &str,
-    key_path: &Path,
-) -> Result<(), OrchestratorError> {
-    let rollback_cmd = format!(
-        "set -euo pipefail && \
-if [ ! -f '{backup}' ]; then echo 'missing {backup}' >&2; exit 1; fi && \
-install -m 0755 '{backup}' '{install_path}' && \
-systemctl restart {service}",
-        backup = SYNCTHING_REMOTE_BACKUP_PATH,
-        install_path = SYNCTHING_INSTALL_PATH,
-        service = SYNCTHING_SERVICE_NAME
-    );
-    let rollback_cmd_q = shell_single_quote(&rollback_cmd);
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap(&format!("bash -lc '{}'", rollback_cmd_q)),
-        BOOTSTRAP_SSH_USER,
-    )
-}
-
-fn attempt_remote_syncthing_rollback_note(address: &str, key_path: &Path) -> String {
-    match remote_syncthing_backup_exists(address, key_path) {
-        Ok(false) => "rollback skipped (no previous vendor backup)".to_string(),
-        Ok(true) => match rollback_remote_syncthing_to_prev(address, key_path) {
-            Ok(()) => match remote_wait_service_active(
-                address,
-                key_path,
-                SYNCTHING_SERVICE_NAME,
-                SYNCTHING_BOOTSTRAP_TIMEOUT_SECS,
-            ) {
-                Ok(()) => "rollback applied".to_string(),
-                Err(err) => format!("rollback applied but service health check failed: {err}"),
-            },
-            Err(err) => format!("rollback failed: {err}"),
-        },
-        Err(err) => format!("rollback precheck failed: {err}"),
-    }
-}
-
 fn list_managed_hive_ids() -> Vec<String> {
     let mut out = Vec::new();
     let root = hives_root();
@@ -6680,345 +6231,362 @@ fn list_managed_hive_ids() -> Vec<String> {
     out
 }
 
-fn ensure_remote_syncthing_firewall(
-    address: &str,
-    key_path: &Path,
-) -> Result<(), OrchestratorError> {
-    let firewall_cmd = format!(
-        "bash -lc \"if command -v ufw >/dev/null 2>&1; then ufw allow {}/tcp || true; ufw allow {}/udp || true; ufw allow {}/udp || true; fi; if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --add-port={}/tcp || true; firewall-cmd --add-port={}/udp || true; firewall-cmd --add-port={}/udp || true; firewall-cmd --permanent --add-port={}/tcp || true; firewall-cmd --permanent --add-port={}/udp || true; firewall-cmd --permanent --add-port={}/udp || true; fi\"",
-        SYNCTHING_SYNC_PORT_TCP,
-        SYNCTHING_SYNC_PORT_UDP,
-        SYNCTHING_DISCOVERY_PORT_UDP,
-        SYNCTHING_SYNC_PORT_TCP,
-        SYNCTHING_SYNC_PORT_UDP,
-        SYNCTHING_DISCOVERY_PORT_UDP,
-        SYNCTHING_SYNC_PORT_TCP,
-        SYNCTHING_SYNC_PORT_UDP,
-        SYNCTHING_DISCOVERY_PORT_UDP,
-    );
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap(&firewall_cmd),
-        BOOTSTRAP_SSH_USER,
-    )
-}
+async fn add_hive_finalize_local_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let desired_dist = current_dist_runtime_config(state);
+    let desired_blob = current_blob_runtime_config(state);
+    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
+    let require_dist_sync = payload
+        .get("require_dist_sync")
+        .and_then(parse_bool_value)
+        .unwrap_or(false);
+    let dist_sync_probe_timeout_secs = payload
+        .get("dist_sync_probe_timeout_secs")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(DIST_SYNC_PROBE_TIMEOUT_SECS)
+        .clamp(5, 600);
+    let syncthing_peer_device_id = payload
+        .get("syncthing_peer_device_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let syncthing_peer_name = payload
+        .get("syncthing_peer_name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("motherbee")
+        .to_string();
+    let mut updated: Vec<String> = Vec::new();
+    let mut unchanged: Vec<String> = Vec::new();
+    let mut restarted: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut core_sync_pending = false;
 
-fn disable_remote_syncthing_firewall(
-    address: &str,
-    key_path: &Path,
-) -> Result<(), OrchestratorError> {
-    let firewall_cmd = format!(
-        "bash -lc \"if command -v ufw >/dev/null 2>&1; then ufw --force delete allow {}/tcp || true; ufw --force delete allow {}/udp || true; ufw --force delete allow {}/udp || true; fi; if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --remove-port={}/tcp || true; firewall-cmd --remove-port={}/udp || true; firewall-cmd --remove-port={}/udp || true; firewall-cmd --permanent --remove-port={}/tcp || true; firewall-cmd --permanent --remove-port={}/udp || true; firewall-cmd --permanent --remove-port={}/udp || true; fi\"",
-        SYNCTHING_SYNC_PORT_TCP,
-        SYNCTHING_SYNC_PORT_UDP,
-        SYNCTHING_DISCOVERY_PORT_UDP,
-        SYNCTHING_SYNC_PORT_TCP,
-        SYNCTHING_SYNC_PORT_UDP,
-        SYNCTHING_DISCOVERY_PORT_UDP,
-        SYNCTHING_SYNC_PORT_TCP,
-        SYNCTHING_SYNC_PORT_UDP,
-        SYNCTHING_DISCOVERY_PORT_UDP,
-    );
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap(&firewall_cmd),
-        BOOTSTRAP_SSH_USER,
-    )
-}
-
-fn ensure_remote_syncthing_runtime_with_access(
-    address: &str,
-    key_path: &Path,
-    sync: &BlobRuntimeConfig,
-    blob: &BlobRuntimeConfig,
-    dist: &DistRuntimeConfig,
-) -> Result<(), OrchestratorError> {
-    let source = resolve_syncthing_vendor_source_path()?;
-    let _ = local_syncthing_vendor_hash()?;
-
-    let remote_tmp_path = format!(
-        "/tmp/fluxbee-syncthing-{}.bin",
-        sanitize_unit_suffix(address)
-    );
-    let source_str = source.to_string_lossy().to_string();
-    let source_refs = [source_str.as_str()];
-    scp_with_key(
-        address,
-        key_path,
-        &source_refs,
-        &remote_tmp_path,
-        BOOTSTRAP_SSH_USER,
-    )?;
-    let backup_cmd = format!(
-        "set -euo pipefail && mkdir -p '{vendor_root}' '{install_dir}' && if [ -f '{installed}' ]; then install -m 0755 '{installed}' '{backup}'; fi",
-        vendor_root = shell_single_quote(VENDOR_ROOT_DIR),
-        install_dir = shell_single_quote(SYNCTHING_INSTALL_DIR),
-        installed = shell_single_quote(SYNCTHING_INSTALL_PATH),
-        backup = shell_single_quote(SYNCTHING_REMOTE_BACKUP_PATH),
-    );
-    let backup_cmd_q = shell_single_quote(&backup_cmd);
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap(&format!("bash -lc '{}'", backup_cmd_q)),
-        BOOTSTRAP_SSH_USER,
-    )?;
-    let install_cmd = format!(
-        "install -m 0755 '{}' '{}' && rm -f '{}'",
-        remote_tmp_path, SYNCTHING_INSTALL_PATH, remote_tmp_path
-    );
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap(&install_cmd),
-        BOOTSTRAP_SSH_USER,
-    )?;
-    if let Err(err) = ensure_remote_syncthing_vendor_layout(address, key_path) {
-        tracing::warn!(
-            target = %address,
-            error = %err,
-            "failed to mirror syncthing into remote vendor/dist source layout"
-        );
-    }
-
-    let blob_path_q = shell_single_quote(&blob.path.display().to_string());
-    let dist_path_q = shell_single_quote(&dist.path.display().to_string());
-    let sync_data_dir_q = shell_single_quote(&sync.sync_data_dir.display().to_string());
-    let mkdir_cmd = format!("mkdir -p '{blob_path_q}' '{dist_path_q}' '{sync_data_dir_q}'");
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap(&mkdir_cmd),
-        BOOTSTRAP_SSH_USER,
-    )?;
-
-    let remote_unit = syncthing_unit_contents(sync, "root");
-    write_remote_file(
-        address,
-        key_path,
-        &format!("/etc/systemd/system/{SYNCTHING_SERVICE_NAME}.service"),
-        &remote_unit,
-    )?;
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap("systemctl daemon-reload"),
-        BOOTSTRAP_SSH_USER,
-    )?;
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap(&format!("systemctl enable {SYNCTHING_SERVICE_NAME}")),
-        BOOTSTRAP_SSH_USER,
-    )?;
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap(&format!("systemctl restart {SYNCTHING_SERVICE_NAME}")),
-        BOOTSTRAP_SSH_USER,
-    )?;
-    remote_wait_service_active(
-        address,
-        key_path,
-        SYNCTHING_SERVICE_NAME,
-        SYNCTHING_BOOTSTRAP_TIMEOUT_SECS,
-    )?;
-    let remote_config_path = format!("{}/config.xml", sync.sync_data_dir.display());
-    let read_cmd = format!("cat '{}'", shell_single_quote(&remote_config_path));
-    let remote_current =
-        ssh_with_key_output(address, key_path, &sudo_wrap(&read_cmd), BOOTSTRAP_SSH_USER)?;
-    let (remote_updated, changed_folders) =
-        reconcile_syncthing_folders_xml(&remote_current, blob, dist)?;
-    if !changed_folders.is_empty() {
-        tracing::info!(
-            address = %address,
-            folders = ?changed_folders,
-            "syncthing folder config reconciled on worker; restarting service"
-        );
-        write_remote_file(address, key_path, &remote_config_path, &remote_updated)?;
-        ssh_with_key(
-            address,
-            key_path,
-            &sudo_wrap(&format!("systemctl restart {SYNCTHING_SERVICE_NAME}")),
-            BOOTSTRAP_SSH_USER,
-        )?;
-        remote_wait_service_active(
-            address,
-            key_path,
-            SYNCTHING_SERVICE_NAME,
-            SYNCTHING_BOOTSTRAP_TIMEOUT_SECS,
-        )?;
-    }
-    ensure_remote_syncthing_firewall(address, key_path)?;
-    Ok(())
-}
-
-fn ensure_remote_syncthing_vendor_layout(
-    address: &str,
-    key_path: &Path,
-) -> Result<(), OrchestratorError> {
-    let cmd = format!(
-        "set -euo pipefail && install -d -m 0755 '{dist_dir}' '{legacy_dir}' && install -m 0755 '{installed}' '{dist_target}' && install -m 0755 '{installed}' '{legacy_target}'",
-        dist_dir = shell_single_quote("/var/lib/fluxbee/dist/vendor/syncthing"),
-        legacy_dir = shell_single_quote("/var/lib/fluxbee/vendor/syncthing"),
-        installed = shell_single_quote(SYNCTHING_INSTALL_PATH),
-        dist_target = shell_single_quote(DIST_SYNCTHING_VENDOR_SOURCE_PATH),
-        legacy_target = shell_single_quote(SYNCTHING_VENDOR_SOURCE_PATH),
-    );
-    let cmd_q = shell_single_quote(&cmd);
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap(&format!("bash -lc '{}'", cmd_q)),
-        BOOTSTRAP_SSH_USER,
-    )
-}
-
-fn ensure_remote_syncthing_runtime(
-    hive_id: &str,
-    blob: &BlobRuntimeConfig,
-    dist: &DistRuntimeConfig,
-) -> Result<(), OrchestratorError> {
-    let (address, key_path) = hive_access(hive_id)?;
-    let sync = effective_syncthing_runtime_config(blob, dist);
-    ensure_remote_syncthing_runtime_with_access(&address, &key_path, &sync, blob, dist)
-}
-
-fn verify_remote_dist_sync_ready_with_access(
-    address: &str,
-    key_path: &Path,
-    dist: &DistRuntimeConfig,
-    timeout_secs: u64,
-) -> Result<(), OrchestratorError> {
-    if !dist.sync_enabled || !dist_sync_tool_is_syncthing(dist) {
-        return Ok(());
-    }
-
-    fs::create_dir_all(&dist.path)?;
-    let probe_name = format!(
-        ".fluxbee-dist-sync-probe-{}-{}",
-        now_epoch_ms(),
-        Uuid::new_v4().simple()
-    );
-    let local_probe_path = dist.path.join(&probe_name);
-    let remote_probe_path = format!("{}/{}", dist.path.display(), probe_name);
-    let probe_content = format!("probe:{}:{}", now_epoch_ms(), Uuid::new_v4());
-    fs::write(&local_probe_path, &probe_content)?;
-
-    let read_remote_cmd = format!(
-        "bash -lc \"if [ -f '{path}' ]; then cat '{path}'; fi\"",
-        path = shell_single_quote(&remote_probe_path)
-    );
-
-    let started = Instant::now();
-    let timeout = Duration::from_secs(timeout_secs);
-    let mut success = false;
-    let mut last_err: Option<String> = None;
-    while started.elapsed() < timeout {
-        match ssh_with_key_output(
-            address,
-            key_path,
-            &sudo_wrap(&read_remote_cmd),
-            BOOTSTRAP_SSH_USER,
-        ) {
-            Ok(out) => {
-                if out.trim() == probe_content {
-                    success = true;
-                    break;
-                }
-                last_err = Some("remote probe file not observed yet".to_string());
-            }
-            Err(err) => {
-                last_err = Some(err.to_string());
-            }
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-
-    let _ = fs::remove_file(&local_probe_path);
-    let cleanup_remote_cmd = format!("rm -f '{}'", shell_single_quote(&remote_probe_path));
-    let _ = ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap(&cleanup_remote_cmd),
-        BOOTSTRAP_SSH_USER,
-    );
-
-    if success {
-        return Ok(());
-    }
-
-    Err(format!(
-        "dist sync probe timeout after {}s (target='{}', path='{}'): {}",
-        timeout_secs,
-        address,
-        remote_probe_path,
-        last_err.unwrap_or_else(|| "no detail".to_string())
-    )
-    .into())
-}
-
-fn ensure_remote_blob_sync_all_hives(blob: &BlobRuntimeConfig, dist: &DistRuntimeConfig) {
-    for hive_id in list_managed_hive_ids() {
-        if let Err(err) = ensure_remote_syncthing_runtime(&hive_id, blob, dist) {
-            tracing::warn!(
-                hive_id = hive_id,
-                error = %err,
-                "failed to ensure syncthing on managed hive"
-            );
-        }
-    }
-}
-
-fn disable_remote_syncthing_runtime(hive_id: &str) {
-    let (address, key_path) = match hive_access(hive_id) {
-        Ok(access) => access,
+    let core_result = match apply_system_update_local(state, "core").await {
+        Ok(result) => result,
         Err(err) => {
-            tracing::warn!(
-                hive_id = hive_id,
-                error = %err,
-                "failed to resolve hive access for syncthing teardown"
-            );
-            return;
+            let err_text = err.to_string();
+            if is_add_hive_core_sync_pending_error(&err_text) {
+                core_sync_pending = true;
+                unchanged.push("core-sync-pending".to_string());
+                tracing::warn!(
+                    hive_id = %state.hive_id,
+                    error = %err_text,
+                    "core finalize pending (dist/core not converged yet); continuing"
+                );
+                SystemUpdateApplyResult {
+                    status: "ok".to_string(),
+                    updated: Vec::new(),
+                    unchanged: Vec::new(),
+                    restarted: Vec::new(),
+                    errors: Vec::new(),
+                }
+            } else {
+                errors.push(err_text.clone());
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "CORE_FINALIZE_FAILED",
+                    "message": err_text,
+                    "hive_id": state.hive_id,
+                    "require_dist_sync": require_dist_sync,
+                    "dist_sync_enabled": desired_dist.sync_enabled,
+                    "updated": updated,
+                    "unchanged": unchanged,
+                    "restarted": restarted,
+                    "errors": errors,
+                });
+            }
         }
     };
+    if core_result.status != "ok" {
+        let detail = if core_result.errors.is_empty() {
+            format!("core finalize returned status '{}'", core_result.status)
+        } else {
+            core_result.errors.join("; ")
+        };
+        errors.push(detail.clone());
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "CORE_FINALIZE_FAILED",
+            "message": detail,
+            "hive_id": state.hive_id,
+            "require_dist_sync": require_dist_sync,
+            "dist_sync_enabled": desired_dist.sync_enabled,
+            "updated": core_result.updated,
+            "unchanged": core_result.unchanged,
+            "restarted": core_result.restarted,
+            "errors": errors,
+        });
+    }
 
-    let stop_disable_cmd = format!(
-        "bash -lc \"systemctl stop {0} || true; systemctl disable {0} || true; rm -f /etc/systemd/system/{0}.service; systemctl daemon-reload || true\"",
-        SYNCTHING_SERVICE_NAME
+    updated.extend(core_result.updated);
+    unchanged.extend(core_result.unchanged);
+    restarted.extend(core_result.restarted);
+
+    let vendor_result = match apply_system_update_local(state, "vendor").await {
+        Ok(result) => result,
+        Err(err) => {
+            errors.push(err.to_string());
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SYNC_SETUP_FAILED",
+                "message": err.to_string(),
+                "hive_id": state.hive_id,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_enabled": desired_dist.sync_enabled,
+                "updated": updated,
+                "unchanged": unchanged,
+                "restarted": restarted,
+                "errors": errors,
+            });
+        }
+    };
+    if vendor_result.status != "ok" {
+        let detail = if vendor_result.errors.is_empty() {
+            format!("vendor finalize returned status '{}'", vendor_result.status)
+        } else {
+            vendor_result.errors.join("; ")
+        };
+        errors.push(detail.clone());
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SYNC_SETUP_FAILED",
+            "message": detail,
+            "hive_id": state.hive_id,
+            "dist_sync_enabled": desired_dist.sync_enabled,
+            "require_dist_sync": require_dist_sync,
+            "updated": updated,
+            "unchanged": unchanged,
+            "restarted": restarted,
+            "errors": errors,
+        });
+    }
+
+    updated.extend(vendor_result.updated);
+    unchanged.extend(vendor_result.unchanged);
+    restarted.extend(vendor_result.restarted);
+
+    let mut syncthing_peer_linked = false;
+    if let Some(peer_device_id) = syncthing_peer_device_id.as_deref() {
+        if let Err(err) = ensure_syncthing_peer_link_runtime(
+            &desired_sync,
+            &desired_blob,
+            &desired_dist,
+            peer_device_id,
+            &syncthing_peer_name,
+        )
+        .await
+        {
+            errors.push(err.to_string());
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SYNC_SETUP_FAILED",
+                "message": err.to_string(),
+                "hive_id": state.hive_id,
+                "dist_sync_enabled": desired_dist.sync_enabled,
+                "require_dist_sync": require_dist_sync,
+                "updated": updated,
+                "unchanged": unchanged,
+                "restarted": restarted,
+                "errors": errors,
+            });
+        }
+        syncthing_peer_linked = true;
+    }
+
+    let syncthing_device_id = if desired_sync.sync_enabled
+        && (blob_sync_tool_is_syncthing(&desired_sync)
+            || dist_sync_tool_is_syncthing(&desired_dist))
+    {
+        local_syncthing_device_id(&desired_sync).ok()
+    } else {
+        None
+    };
+    let service_active = if desired_sync.sync_enabled {
+        systemd_is_active(SYNCTHING_SERVICE_NAME)
+    } else {
+        false
+    };
+    let api_healthy = if desired_sync.sync_enabled {
+        syncthing_api_healthy(desired_sync.sync_api_port).await
+    } else {
+        false
+    };
+    let runtime_manifest_ready =
+        if !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist) {
+            local_runtime_manifest_ready_for_spawn()
+        } else if service_active && api_healthy {
+            wait_for_local_runtime_manifest_ready(Duration::from_secs(dist_sync_probe_timeout_secs))
+                .await
+        } else {
+            false
+        };
+    let dist_sync_ready =
+        if !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist) {
+            true
+        } else {
+            service_active && api_healthy && runtime_manifest_ready
+        };
+
+    serde_json::json!({
+        "status": "ok",
+        "hive_id": state.hive_id,
+        "blob_sync_enabled": desired_blob.sync_enabled,
+        "dist_sync_enabled": desired_dist.sync_enabled,
+        "service_active": service_active,
+        "api_healthy": api_healthy,
+        "runtime_manifest_ready": runtime_manifest_ready,
+        "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+        "dist_sync_ready": dist_sync_ready,
+        "core_sync_pending": core_sync_pending,
+        "syncthing_peer_linked": syncthing_peer_linked,
+        "syncthing_device_id": syncthing_device_id,
+        "require_dist_sync": require_dist_sync,
+        "dist_path": desired_dist.path.display().to_string(),
+        "updated": updated,
+        "unchanged": unchanged,
+        "restarted": restarted,
+        "errors": errors,
+    })
+}
+
+fn is_add_hive_core_sync_pending_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("core manifest missing")
+        || lower.contains("missing core source binary")
+        || lower.contains("core manifest missing required worker component")
+}
+
+fn is_socket_only_unreachable_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("system forward timeout")
+        || (lower.contains("target hive")
+            && (lower.contains("not reachable in lsa") || lower.contains("stale/missing")))
+        || lower.contains("unreachable")
+        || lower.contains("ttl_exceeded")
+}
+
+async fn add_hive_finalize_via_socket(
+    state: &OrchestratorState,
+    hive_id: &str,
+    address: &str,
+    require_dist_sync: bool,
+    dist_sync_probe_timeout_secs: u64,
+    syncthing_peer_device_id: Option<&str>,
+    syncthing_peer_name: Option<&str>,
+) -> Result<serde_json::Value, OrchestratorError> {
+    // Socket-only path is an optimization. Keep it bounded so add_hive still has
+    // enough budget to fall back to SSH bootstrap within admin timeout (180s).
+    let timeout_secs = dist_sync_probe_timeout_secs.max(45).clamp(30, 75);
+    let payload = forward_system_action_to_hive_with_timeout(
+        state,
+        hive_id,
+        "ADD_HIVE_FINALIZE",
+        "ADD_HIVE_FINALIZE_RESPONSE",
+        serde_json::json!({
+            "hive_id": hive_id,
+            "target": hive_id,
+            "address": address,
+            "require_dist_sync": require_dist_sync,
+            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+            "syncthing_peer_device_id": syncthing_peer_device_id,
+            "syncthing_peer_name": syncthing_peer_name,
+        }),
+        Duration::from_secs(timeout_secs),
+    )
+    .await?;
+
+    if payload
+        .get("status")
+        .and_then(|value| value.as_str())
+        .is_some_and(|status| status.eq_ignore_ascii_case("ok"))
+    {
+        return Ok(payload);
+    }
+
+    Err(format!("worker finalize returned non-ok payload: {}", payload).into())
+}
+
+async fn probe_remote_orchestrator_socket_ready(
+    state: &OrchestratorState,
+    hive_id: &str,
+    address: &str,
+) -> Result<(), OrchestratorError> {
+    let payload = forward_system_action_to_hive_with_timeout(
+        state,
+        hive_id,
+        "GET_VERSIONS",
+        "GET_VERSIONS_RESPONSE",
+        serde_json::json!({
+            "hive_id": hive_id,
+            "target": hive_id,
+            "address": address,
+        }),
+        Duration::from_secs(ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS),
+    )
+    .await?;
+
+    if payload
+        .get("status")
+        .and_then(|value| value.as_str())
+        .is_some_and(|status| status.eq_ignore_ascii_case("ok"))
+    {
+        return Ok(());
+    }
+
+    Err(format!("GET_VERSIONS probe returned non-ok payload: {payload}").into())
+}
+
+fn append_add_hive_finalize_history(
+    state: &OrchestratorState,
+    hive_id: &str,
+    status: &str,
+    reason: Option<String>,
+) {
+    let manifest_hash = local_syncthing_vendor_hash().ok().flatten();
+    append_single_deployment_history(
+        state,
+        "vendor",
+        "add_hive_finalize_socket",
+        hive_id,
+        status,
+        reason,
+        manifest_hash,
     );
-    if let Err(err) = ssh_with_key(
-        &address,
-        &key_path,
-        &sudo_wrap(&stop_disable_cmd),
-        BOOTSTRAP_SSH_USER,
-    ) {
-        tracing::warn!(
-            hive_id = hive_id,
-            error = %err,
-            "failed to stop/disable remote syncthing"
-        );
-    }
-
-    if let Err(err) = disable_remote_syncthing_firewall(&address, &key_path) {
-        tracing::warn!(
-            hive_id = hive_id,
-            error = %err,
-            "failed to remove remote syncthing firewall rules"
-        );
-    }
 }
 
-fn disable_remote_blob_sync_all_hives(state: &OrchestratorState) {
-    let _ = state;
-    for hive_id in list_managed_hive_ids() {
-        disable_remote_syncthing_runtime(&hive_id);
+fn dist_sync_ready_from_finalize_payload(
+    finalize: &serde_json::Value,
+    dist: &DistRuntimeConfig,
+) -> bool {
+    if !dist.sync_enabled || !dist_sync_tool_is_syncthing(dist) {
+        return true;
     }
+    finalize
+        .get("dist_sync_ready")
+        .and_then(|value| value.as_bool())
+        .or_else(|| {
+            finalize
+                .get("api_healthy")
+                .and_then(|value| value.as_bool())
+        })
+        .unwrap_or(false)
 }
 
-fn add_hive_flow(
+fn syncthing_device_id_from_finalize_payload(finalize: &serde_json::Value) -> Option<String> {
+    finalize
+        .get("syncthing_device_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| valid_syncthing_device_id(value))
+        .map(str::to_string)
+}
+
+async fn add_hive_flow(
     state: &OrchestratorState,
     hive_id: &str,
     address: &str,
@@ -7029,6 +6597,24 @@ fn add_hive_flow(
 ) -> serde_json::Value {
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
+    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
+    let syncthing_expected = desired_sync.sync_enabled
+        && (blob_sync_tool_is_syncthing(&desired_sync)
+            || dist_sync_tool_is_syncthing(&desired_dist));
+    let mother_syncthing_device_id = if syncthing_expected {
+        match local_syncthing_device_id(&desired_sync) {
+            Ok(device_id) => Some(device_id),
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "SYNC_SETUP_FAILED",
+                    "message": format!("local syncthing device id unavailable: {err}"),
+                });
+            }
+        }
+    } else {
+        None
+    };
     let mut dist_sync_ready =
         !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist);
     let root = hives_root();
@@ -7100,6 +6686,185 @@ fn add_hive_flow(
         });
     }
 
+    if let Err(err) = fs::create_dir_all(&hive_dir) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "IO_ERROR",
+            "message": err.to_string(),
+        });
+    }
+
+    // Socket-first fast path: if worker orchestrator is already visible in LSA,
+    // register hive without rerunning SSH bootstrap/provisioning.
+    let socket_only_ready =
+        wait_for_remote_orchestrator_node(&state.hive_id, hive_id, Duration::from_secs(3)).is_ok();
+    if socket_only_ready {
+        if let Err(err) = probe_remote_orchestrator_socket_ready(state, hive_id, address).await {
+            tracing::warn!(
+                hive_id = hive_id,
+                address = address,
+                error = %err,
+                "socket-only add_hive precheck failed; falling back to bootstrap path"
+            );
+        } else {
+            let finalize = match add_hive_finalize_via_socket(
+                state,
+                hive_id,
+                address,
+                require_dist_sync,
+                dist_sync_probe_timeout_secs,
+                mother_syncthing_device_id.as_deref(),
+                Some(&state.hive_id),
+            )
+            .await
+            {
+                Ok(payload) => {
+                    append_add_hive_finalize_history(state, hive_id, "ok", None);
+                    Some(payload)
+                }
+                Err(err) => {
+                    let err_text = err.to_string();
+                    if is_socket_only_unreachable_error(&err_text) {
+                        tracing::warn!(
+                            hive_id = hive_id,
+                            address = address,
+                            error = %err_text,
+                            "socket-only add_hive finalize unreachable/timeout; falling back to bootstrap path"
+                        );
+                        None
+                    } else {
+                        append_add_hive_finalize_history(
+                            state,
+                            hive_id,
+                            "error",
+                            Some(err_text.clone()),
+                        );
+                        return serde_json::json!({
+                            "status": "error",
+                            "error_code": "FINALIZE_FAILED",
+                            "message": format!("worker socket-only finalize failed: {}", err_text),
+                            "hive_id": hive_id,
+                            "address": address,
+                            "bootstrap_mode": "socket_only_existing_orchestrator",
+                            "harden_ssh": harden_ssh,
+                            "restrict_ssh_requested": restrict_ssh,
+                            "require_dist_sync": require_dist_sync,
+                            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                        });
+                    }
+                }
+            };
+            if let Some(finalize) = finalize {
+                let mut syncthing_peer_linked = false;
+                let mut worker_syncthing_device_id: Option<String> = None;
+                if syncthing_expected {
+                    let Some(peer_device_id) = syncthing_device_id_from_finalize_payload(&finalize)
+                    else {
+                        return serde_json::json!({
+                            "status": "error",
+                            "error_code": "FINALIZE_FAILED",
+                            "message": "worker finalize missing syncthing_device_id",
+                            "hive_id": hive_id,
+                            "address": address,
+                            "bootstrap_mode": "socket_only_existing_orchestrator",
+                            "require_dist_sync": require_dist_sync,
+                            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                            "finalize": finalize,
+                        });
+                    };
+                    if let Err(err) = ensure_syncthing_peer_link_runtime(
+                        &desired_sync,
+                        &desired_blob,
+                        &desired_dist,
+                        &peer_device_id,
+                        hive_id,
+                    )
+                    .await
+                    {
+                        return serde_json::json!({
+                            "status": "error",
+                            "error_code": "SYNC_SETUP_FAILED",
+                            "message": format!("local syncthing peer reconcile failed: {err}"),
+                            "hive_id": hive_id,
+                            "address": address,
+                            "bootstrap_mode": "socket_only_existing_orchestrator",
+                            "require_dist_sync": require_dist_sync,
+                            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                            "finalize": finalize,
+                        });
+                    }
+                    worker_syncthing_device_id = Some(peer_device_id);
+                    syncthing_peer_linked = true;
+                }
+                dist_sync_ready = dist_sync_ready_from_finalize_payload(&finalize, &desired_dist);
+                if require_dist_sync && !dist_sync_ready {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "DIST_SYNC_TIMEOUT",
+                        "message": "worker finalize completed but dist sync is not ready",
+                        "hive_id": hive_id,
+                        "address": address,
+                        "bootstrap_mode": "socket_only_existing_orchestrator",
+                        "require_dist_sync": require_dist_sync,
+                        "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                        "dist_sync_ready": dist_sync_ready,
+                        "finalize": finalize,
+                    });
+                }
+                if harden_ssh || restrict_ssh {
+                    tracing::warn!(
+                        hive_id = hive_id,
+                        address = address,
+                        harden_ssh = harden_ssh,
+                        restrict_ssh_requested = restrict_ssh,
+                        "socket-only add_hive: skipping SSH controls because SSH is bootstrap-only"
+                    );
+                }
+                let mut info_payload = serde_json::json!({
+                    "hive_id": hive_id,
+                    "address": address,
+                    "created_at": now_epoch_ms().to_string(),
+                    "status": "connected",
+                });
+                if let Some(device_id) = worker_syncthing_device_id.clone() {
+                    info_payload["syncthing_device_id"] = serde_json::json!(device_id);
+                }
+                info_payload["syncthing_peer_linked"] = serde_json::json!(syncthing_peer_linked);
+                if let Err(err) = write_hive_info(&root, hive_id, &info_payload) {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "IO_ERROR",
+                        "message": err.to_string(),
+                    });
+                }
+                tracing::info!(
+                    hive_id = hive_id,
+                    address = address,
+                    "add_hive socket-only mode: worker orchestrator already online; skipping SSH bootstrap"
+                );
+                return serde_json::json!({
+                    "status": "ok",
+                    "hive_id": hive_id,
+                    "address": address,
+                    "bootstrap_mode": "socket_only_existing_orchestrator",
+                    "harden_ssh": harden_ssh,
+                    "harden_ssh_applied": false,
+                    "restrict_ssh": false,
+                    "restrict_ssh_mode": "socket_only_no_ssh",
+                    "restrict_ssh_requested": restrict_ssh,
+                    "require_dist_sync": require_dist_sync,
+                    "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                    "wan_connected": true,
+                    "orchestrator_connected": true,
+                    "dist_sync_ready": dist_sync_ready,
+                    "syncthing_peer_linked": syncthing_peer_linked,
+                    "syncthing_device_id": worker_syncthing_device_id,
+                    "finalize": finalize,
+                });
+            }
+        }
+    }
+
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     if !key_path.exists() {
         return serde_json::json!({
@@ -7128,7 +6893,7 @@ fn add_hive_flow(
     };
 
     let mut password_channel_available = true;
-    if let Err(pass_err) = ssh_with_pass(address, "true", BOOTSTRAP_SSH_USER) {
+    if let Err(pass_err) = ssh_with_pass_any(address, "true", BOOTSTRAP_SSH_USER) {
         password_channel_available = false;
         match ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
             Ok(()) => {
@@ -7146,16 +6911,7 @@ fn add_hive_flow(
         }
     }
 
-    if let Err(err) = fs::create_dir_all(&hive_dir) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "IO_ERROR",
-            "message": err.to_string(),
-        });
-    }
-
     if password_channel_available {
-        // Seed via password channel when available (fresh bootstrap path).
         if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key) {
             return serde_json::json!({
                 "status": "error",
@@ -7163,14 +6919,11 @@ fn add_hive_flow(
                 "message": format!("failed to seed bootstrap key via password channel: {err}"),
             });
         }
-    } else if let Err(err) =
-        apply_remote_unrestricted_authorized_key_with_access(address, &key_path, &pub_key)
-    {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SSH_KEY_FAILED",
-            "message": format!("password channel unavailable and key reseed failed: {err}"),
-        });
+    } else {
+        tracing::info!(
+            target = address,
+            "password bootstrap channel unavailable; key channel already active, skipping key reseed"
+        );
     }
 
     if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(address, &key_path) {
@@ -7182,147 +6935,17 @@ fn add_hive_flow(
     }
 
     let mut restrict_ssh_applied = false;
-    let restrict_ssh_effective = restrict_ssh;
-    if restrict_ssh_effective {
-        let source_patterns = resolve_add_hive_authkey_source_patterns(address);
-        let restricted_result: Result<(), OrchestratorError> = (|| {
-            install_remote_ssh_gate_with_access(address, &key_path)
-                .map_err(|err| format!("install gate failed: {err}"))?;
-            if source_patterns.is_empty() {
-                tracing::info!(
-                    target = address,
-                    "authorized_keys restriction applied (gate enabled, from filter disabled by policy)"
-                );
-            } else {
-                tracing::info!(
-                    target = address,
-                    from_patterns = ?source_patterns,
-                    "authorized_keys restriction applied (gate enabled, from filter enabled by policy)"
-                );
-            }
-            apply_remote_restricted_authorized_key_with_access(
-                address,
-                &key_path,
-                &pub_key,
-                &source_patterns,
-            )
-            .map_err(|err| format!("apply restricted authorized_keys failed: {err}"))?;
-            ssh_with_key(
-                address,
-                &key_path,
-                "sudo -n /bin/bash -lc 'exit 0'",
-                BOOTSTRAP_SSH_USER,
-            )
-            .map_err(|err| format!("restricted sudo verification failed: {err}"))?;
-            Ok(())
-        })();
-        match restricted_result {
-            Ok(()) => {
-                restrict_ssh_applied = true;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    target = address,
-                    error = %err,
-                    "restricted key flow failed; falling back to unrestricted key mode"
-                );
-                let restricted_err_text = err.to_string();
-                if restricted_err_text.contains("empty SSH_ORIGINAL_COMMAND") {
-                    tracing::warn!(
-                        target = address,
-                        "worker sshd does not provide SSH_ORIGINAL_COMMAND for forced-command keys; trying from-only restriction fallback"
-                    );
-                    let from_only_result = apply_remote_from_only_authorized_key_with_access(
-                        address,
-                        &key_path,
-                        &pub_key,
-                        &source_patterns,
-                    )
-                    .and_then(|_| {
-                        ssh_with_key(
-                            address,
-                            &key_path,
-                            "sudo -n /bin/bash -lc 'exit 0'",
-                            BOOTSTRAP_SSH_USER,
-                        )
-                    });
-                    if from_only_result.is_ok() {
-                        tracing::warn!(
-                            target = address,
-                            from_patterns = ?source_patterns,
-                            "restrict_ssh degraded to from-only mode (gate disabled due sshd behavior)"
-                        );
-                        restrict_ssh_applied = true;
-                    } else {
-                        tracing::warn!(
-                            target = address,
-                            "from-only restriction fallback failed; continuing to unrestricted fallback"
-                        );
-                    }
-                }
-                if !restrict_ssh_applied {
-                    let fallback_result = if password_channel_available {
-                        apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key)
-                    } else {
-                        apply_remote_unrestricted_authorized_key_with_access(
-                            address,
-                            &key_path,
-                            &pub_key,
-                        )
-                    };
-                    if let Err(fallback_err) = fallback_result {
-                        return serde_json::json!({
-                            "status": "error",
-                            "error_code": "SSH_KEY_FAILED",
-                            "message": format!("restricted key flow failed ({err}); unrestricted fallback failed: {fallback_err}"),
-                        });
-                    }
-                    if let Err(verify_err) =
-                        ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER)
-                    {
-                        return serde_json::json!({
-                            "status": "error",
-                            "error_code": "SSH_KEY_FAILED",
-                            "message": format!("restricted key flow failed ({err}); unrestricted fallback verification failed: {verify_err}"),
-                        });
-                    }
-                }
-            }
-        }
-    } else {
-        tracing::warn!(
-            target = address,
-            "authorized_keys gate/restriction skipped (legacy insecure mode)"
-        );
-        if let Err(err) = ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!("key access verification failed after bootstrap seed: {err}"),
-            });
-        }
-    }
-
-    if harden_ssh {
-        let harden_result = if password_channel_available {
-            disable_remote_password_auth(address)
-        } else {
-            disable_remote_password_auth_with_access(address, &key_path)
-        };
-        if let Err(err) = harden_result {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_HARDEN_FAILED",
-                "message": err.to_string(),
-            });
-        }
-        if let Err(err) = verify_remote_ssh_hardening_with_access(address, &key_path) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_HARDEN_FAILED",
-                "message": err.to_string(),
-            });
-        }
+    if let Err(err) = ssh_with_key(
+        address,
+        &key_path,
+        "sudo -n /bin/bash -lc 'exit 0'",
+        BOOTSTRAP_SSH_USER,
+    ) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_KEY_FAILED",
+            "message": format!("key access verification failed after bootstrap seed: {err}"),
+        });
     }
 
     let core_manifest = match load_core_manifest() {
@@ -7398,12 +7021,16 @@ fn add_hive_flow(
         tracing::warn!(error = %history_err, "failed to persist add_hive core deployment history");
     }
 
+    let blob_active_dir = state.blob.path.join("active");
+    let blob_staging_dir = state.blob.path.join("staging");
     if let Err(err) = ssh_with_key(
         address,
         &key_path,
         &sudo_wrap(&format!(
-            "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/runtimes /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}'",
+            "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}' '{}' '{}'",
             state.blob.path.display(),
+            blob_active_dir.display(),
+            blob_staging_dir.display(),
             state.blob.sync_data_dir.display()
         )),
         BOOTSTRAP_SSH_USER,
@@ -7436,7 +7063,7 @@ fn add_hive_flow(
                 .to_string()
         });
     let hive_yaml = format!(
-        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n",
+        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n",
         hive_id,
         worker_uplink,
         storage_path,
@@ -7446,6 +7073,11 @@ fn add_hive_flow(
         desired_blob.sync_tool,
         desired_blob.sync_api_port,
         desired_blob.sync_data_dir.display(),
+        desired_blob.gc_enabled,
+        desired_blob.gc_interval_secs,
+        desired_blob.gc_apply,
+        desired_blob.gc_staging_ttl_hours,
+        desired_blob.gc_active_retain_days,
         desired_dist.path.display(),
         desired_dist.sync_enabled,
         desired_dist.sync_tool
@@ -7518,7 +7150,8 @@ fn add_hive_flow(
         });
     }
 
-    for (name, _) in &worker_units {
+    let bootstrap_units = ["rt-gateway", "sy-orchestrator"];
+    for name in bootstrap_units {
         if let Err(err) = ssh_with_key(
             address,
             &key_path,
@@ -7531,7 +7164,7 @@ fn add_hive_flow(
                 "message": format!("enable {name}: {err}"),
             });
         }
-        let service_inner = if *name == "sy-orchestrator" {
+        let service_inner = if name == "sy-orchestrator" {
             format!(
                 "systemctl start {name} || (systemctl reset-failed {name} || true; sleep 1; systemctl start {name})"
             )
@@ -7540,17 +7173,15 @@ fn add_hive_flow(
                 "systemctl restart {name} || (systemctl reset-failed {name} || true; sleep 1; systemctl start {name})"
             )
         };
-        let service_cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&service_inner)));
-        if let Err(err) = ssh_with_key(
-            address,
-            &key_path,
-            &service_cmd,
-            BOOTSTRAP_SSH_USER,
-        ) {
+        let service_cmd = sudo_wrap(&format!(
+            "bash -lc '{}'",
+            shell_single_quote(&service_inner)
+        ));
+        if let Err(err) = ssh_with_key(address, &key_path, &service_cmd, BOOTSTRAP_SSH_USER) {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SERVICE_FAILED",
-                "message": format!("start/restart {name}: {err}"),
+                "message": format!("start/restart bootstrap unit {name}: {err}"),
             });
         }
     }
@@ -7571,180 +7202,10 @@ fn add_hive_flow(
         });
     }
 
-    if desired_blob.sync_enabled || desired_dist.sync_enabled {
-        let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
-        let vendor_started_at = now_epoch_ms();
-        let vendor_started = Instant::now();
-        let local_vendor_hash = local_syncthing_vendor_hash().ok().flatten();
-        let remote_vendor_hash_before = remote_syncthing_installed_hash(address, &key_path)
-            .ok()
-            .flatten();
-        if let Err(err) = ensure_remote_syncthing_runtime_with_access(
-            address,
-            &key_path,
-            &desired_sync,
-            &desired_blob,
-            &desired_dist,
-        ) {
-            let rollback_note = attempt_remote_syncthing_rollback_note(address, &key_path);
-            let reason = format!("syncthing setup failed: {err}; {rollback_note}");
-            let entry = DeploymentHistoryEntry {
-                deployment_id: Uuid::new_v4().to_string(),
-                category: "vendor".to_string(),
-                trigger: "add_hive".to_string(),
-                actor: default_deployment_actor(state),
-                started_at: vendor_started_at,
-                finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
-                manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
-                manifest_hash: local_vendor_hash.clone(),
-                target_hives: vec![hive_id.to_string()],
-                result: "error".to_string(),
-                workers: vec![DeploymentWorkerOutcome {
-                    hive_id: hive_id.to_string(),
-                    status: "error".to_string(),
-                    reason: Some(reason.clone()),
-                    duration_ms: vendor_started.elapsed().as_millis() as u64,
-                    local_hash: local_vendor_hash.clone(),
-                    remote_hash_before: remote_vendor_hash_before.clone(),
-                    remote_hash_after: None,
-                }],
-            };
-            if let Err(history_err) = append_deployment_history(&entry) {
-                tracing::warn!(error = %history_err, "failed to persist add_hive vendor deployment history");
-            }
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SYNC_SETUP_FAILED",
-                "message": reason,
-            });
-        }
-        if let Err(err) = ensure_syncthing_peer_pairing_with_access(
-            &state.hive_id,
-            hive_id,
-            address,
-            &key_path,
-            &desired_sync,
-            &desired_blob,
-            &desired_dist,
-        ) {
-            let rollback_note = attempt_remote_syncthing_rollback_note(address, &key_path);
-            let reason = format!("syncthing peer pairing failed: {err}; {rollback_note}");
-            let entry = DeploymentHistoryEntry {
-                deployment_id: Uuid::new_v4().to_string(),
-                category: "vendor".to_string(),
-                trigger: "add_hive".to_string(),
-                actor: default_deployment_actor(state),
-                started_at: vendor_started_at,
-                finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
-                manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
-                manifest_hash: local_vendor_hash.clone(),
-                target_hives: vec![hive_id.to_string()],
-                result: "error".to_string(),
-                workers: vec![DeploymentWorkerOutcome {
-                    hive_id: hive_id.to_string(),
-                    status: "error".to_string(),
-                    reason: Some(reason.clone()),
-                    duration_ms: vendor_started.elapsed().as_millis() as u64,
-                    local_hash: local_vendor_hash.clone(),
-                    remote_hash_before: remote_vendor_hash_before.clone(),
-                    remote_hash_after: None,
-                }],
-            };
-            if let Err(history_err) = append_deployment_history(&entry) {
-                tracing::warn!(
-                    error = %history_err,
-                    "failed to persist add_hive vendor pairing history"
-                );
-            }
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SYNC_SETUP_FAILED",
-                "message": reason,
-            });
-        }
-        match verify_remote_dist_sync_ready_with_access(
-            address,
-            &key_path,
-            &desired_dist,
-            dist_sync_probe_timeout_secs,
-        ) {
-            Ok(()) => {
-                dist_sync_ready = true;
-            }
-            Err(err) => {
-                let reason = format!("dist sync readiness probe failed: {err}");
-                let strict_status = if require_dist_sync { "error" } else { "warning" };
-                let entry = DeploymentHistoryEntry {
-                    deployment_id: Uuid::new_v4().to_string(),
-                    category: "vendor".to_string(),
-                    trigger: "add_hive".to_string(),
-                    actor: default_deployment_actor(state),
-                    started_at: vendor_started_at,
-                    finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
-                    manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
-                    manifest_hash: local_vendor_hash.clone(),
-                    target_hives: vec![hive_id.to_string()],
-                    result: strict_status.to_string(),
-                    workers: vec![DeploymentWorkerOutcome {
-                        hive_id: hive_id.to_string(),
-                        status: strict_status.to_string(),
-                        reason: Some(reason.clone()),
-                        duration_ms: vendor_started.elapsed().as_millis() as u64,
-                        local_hash: local_vendor_hash.clone(),
-                        remote_hash_before: remote_vendor_hash_before.clone(),
-                        remote_hash_after: None,
-                    }],
-                };
-                if let Err(history_err) = append_deployment_history(&entry) {
-                    tracing::warn!(
-                        error = %history_err,
-                        "failed to persist add_hive dist sync readiness failure"
-                    );
-                }
-                if require_dist_sync {
-                    return serde_json::json!({
-                        "status": "error",
-                        "error_code": "DIST_SYNC_TIMEOUT",
-                        "message": reason,
-                    });
-                }
-                tracing::warn!(
-                    hive_id = hive_id,
-                    address = address,
-                    error = %err,
-                    "dist sync readiness probe did not converge during add_hive; continuing in non-strict mode"
-                );
-                dist_sync_ready = false;
-            }
-        }
-        let remote_vendor_hash_after = remote_syncthing_installed_hash(address, &key_path)
-            .ok()
-            .flatten();
-        let entry = DeploymentHistoryEntry {
-            deployment_id: Uuid::new_v4().to_string(),
-            category: "vendor".to_string(),
-            trigger: "add_hive".to_string(),
-            actor: default_deployment_actor(state),
-            started_at: vendor_started_at,
-            finished_at: vendor_started_at + vendor_started.elapsed().as_millis() as u64,
-            manifest_version: load_vendor_manifest().ok().flatten().map(|m| m.version),
-            manifest_hash: local_vendor_hash.clone(),
-            target_hives: vec![hive_id.to_string()],
-            result: "ok".to_string(),
-            workers: vec![DeploymentWorkerOutcome {
-                hive_id: hive_id.to_string(),
-                status: "ok".to_string(),
-                reason: None,
-                duration_ms: vendor_started.elapsed().as_millis() as u64,
-                local_hash: local_vendor_hash,
-                remote_hash_before: remote_vendor_hash_before,
-                remote_hash_after: remote_vendor_hash_after,
-            }],
-        };
-        if let Err(history_err) = append_deployment_history(&entry) {
-            tracing::warn!(error = %history_err, "failed to persist add_hive vendor deployment history");
-        }
-    }
+    tracing::info!(
+        hive_id = hive_id,
+        "add_hive bootstrap completed; vendor/dist finalize will run via worker socket"
+    );
 
     let mut wan_connected = true;
     let mut wan_wait_error = None;
@@ -7769,15 +7230,13 @@ fn add_hive_flow(
         }
     }
 
-    let info_path = hives_root().join(hive_id).join("info.yaml");
-    let info = serde_yaml::to_string(&serde_json::json!({
+    let info_payload = serde_json::json!({
         "hive_id": hive_id,
         "address": address,
         "created_at": now_epoch_ms().to_string(),
         "status": if wan_connected && orchestrator_connected { "connected" } else { "pending" },
-    }))
-    .unwrap_or_default();
-    if let Err(err) = fs::write(info_path, info) {
+    });
+    if let Err(err) = write_hive_info(&root, hive_id, &info_payload) {
         return serde_json::json!({
             "status": "error",
             "error_code": "IO_ERROR",
@@ -7826,18 +7285,181 @@ fn add_hive_flow(
         });
     }
 
+    let finalize = match add_hive_finalize_via_socket(
+        state,
+        hive_id,
+        address,
+        require_dist_sync,
+        dist_sync_probe_timeout_secs,
+        mother_syncthing_device_id.as_deref(),
+        Some(&state.hive_id),
+    )
+    .await
+    {
+        Ok(payload) => {
+            append_add_hive_finalize_history(state, hive_id, "ok", None);
+            payload
+        }
+        Err(err) => {
+            append_add_hive_finalize_history(state, hive_id, "error", Some(err.to_string()));
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "FINALIZE_FAILED",
+                "message": format!("worker finalize failed after bootstrap: {err}"),
+                "hive_id": hive_id,
+                "address": address,
+                "harden_ssh": harden_ssh,
+                "restrict_ssh": restrict_ssh_applied,
+                "restrict_ssh_requested": restrict_ssh,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+                "dist_sync_ready": dist_sync_ready,
+            });
+        }
+    };
+    let mut syncthing_peer_linked = false;
+    let mut worker_syncthing_device_id: Option<String> = None;
+    if syncthing_expected {
+        let Some(peer_device_id) = syncthing_device_id_from_finalize_payload(&finalize) else {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "FINALIZE_FAILED",
+                "message": "worker finalize missing syncthing_device_id",
+                "hive_id": hive_id,
+                "address": address,
+                "harden_ssh": harden_ssh,
+                "restrict_ssh": restrict_ssh_applied,
+                "restrict_ssh_requested": restrict_ssh,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+                "dist_sync_ready": dist_sync_ready,
+                "finalize": finalize,
+            });
+        };
+        if let Err(err) = ensure_syncthing_peer_link_runtime(
+            &desired_sync,
+            &desired_blob,
+            &desired_dist,
+            &peer_device_id,
+            hive_id,
+        )
+        .await
+        {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SYNC_SETUP_FAILED",
+                "message": format!("local syncthing peer reconcile failed: {err}"),
+                "hive_id": hive_id,
+                "address": address,
+                "harden_ssh": harden_ssh,
+                "restrict_ssh": restrict_ssh_applied,
+                "restrict_ssh_requested": restrict_ssh,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+                "dist_sync_ready": dist_sync_ready,
+                "finalize": finalize,
+            });
+        }
+        worker_syncthing_device_id = Some(peer_device_id);
+        syncthing_peer_linked = true;
+    }
+    dist_sync_ready = dist_sync_ready_from_finalize_payload(&finalize, &desired_dist);
+    if require_dist_sync && !dist_sync_ready {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "DIST_SYNC_TIMEOUT",
+            "message": "worker finalize completed but dist sync is not ready",
+            "hive_id": hive_id,
+            "address": address,
+            "harden_ssh": harden_ssh,
+            "restrict_ssh": restrict_ssh_applied,
+            "restrict_ssh_requested": restrict_ssh,
+            "require_dist_sync": require_dist_sync,
+            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+            "wan_connected": true,
+            "orchestrator_connected": true,
+            "dist_sync_ready": dist_sync_ready,
+            "finalize": finalize,
+        });
+    }
+
+    let ssh_controls = match apply_add_hive_ssh_controls_after_finalize(
+        address,
+        &key_path,
+        &pub_key,
+        restrict_ssh,
+        harden_ssh,
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            let err_text = err.to_string();
+            let error_code = if err_text.to_ascii_lowercase().contains("harden") {
+                "SSH_HARDEN_FAILED"
+            } else {
+                "SSH_KEY_FAILED"
+            };
+            return serde_json::json!({
+                "status": "error",
+                "error_code": error_code,
+                "message": err_text,
+                "hive_id": hive_id,
+                "address": address,
+                "harden_ssh": harden_ssh,
+                "restrict_ssh": false,
+                "restrict_ssh_requested": restrict_ssh,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+                "dist_sync_ready": dist_sync_ready,
+                "finalize": finalize,
+            });
+        }
+    };
+    restrict_ssh_applied = ssh_controls.restrict_ssh_applied;
+    let restrict_ssh_mode = ssh_controls.restrict_ssh_mode;
+
+    let mut final_info_payload = serde_json::json!({
+        "hive_id": hive_id,
+        "address": address,
+        "created_at": now_epoch_ms().to_string(),
+        "status": "connected",
+        "syncthing_peer_linked": syncthing_peer_linked,
+    });
+    if let Some(device_id) = worker_syncthing_device_id.clone() {
+        final_info_payload["syncthing_device_id"] = serde_json::json!(device_id);
+    }
+    if let Err(err) = write_hive_info(&root, hive_id, &final_info_payload) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "IO_ERROR",
+            "message": err.to_string(),
+        });
+    }
+
     serde_json::json!({
         "status": "ok",
         "hive_id": hive_id,
         "address": address,
         "harden_ssh": harden_ssh,
+        "harden_ssh_applied": harden_ssh,
         "restrict_ssh": restrict_ssh_applied,
+        "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
         "require_dist_sync": require_dist_sync,
         "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
         "wan_connected": true,
         "orchestrator_connected": true,
         "dist_sync_ready": dist_sync_ready,
+        "syncthing_peer_linked": syncthing_peer_linked,
+        "syncthing_device_id": worker_syncthing_device_id,
+        "finalize": finalize,
     })
 }
 
@@ -7906,7 +7528,7 @@ fn resolve_add_hive_harden_ssh(payload: &serde_json::Value) -> bool {
     if let Some(value) = payload.get("harden_ssh").and_then(parse_bool_value) {
         return value;
     }
-    env_flag_enabled("FLUXBEE_ADD_HIVE_HARDEN_SSH") || env_flag_enabled("JSR_ADD_HIVE_HARDEN_SSH")
+    false
 }
 
 fn resolve_add_hive_restrict_ssh(payload: &serde_json::Value, harden_ssh: bool) -> bool {
@@ -7918,16 +7540,6 @@ fn resolve_add_hive_restrict_ssh(payload: &serde_json::Value, harden_ssh: bool) 
         Some(false)
     ) {
         return false;
-    }
-    if let Ok(raw) = std::env::var("FLUXBEE_ADD_HIVE_RESTRICT_SSH") {
-        if let Some(value) = parse_bool_str(&raw) {
-            return value;
-        }
-    }
-    if let Ok(raw) = std::env::var("JSR_ADD_HIVE_RESTRICT_SSH") {
-        if let Some(value) = parse_bool_str(&raw) {
-            return value;
-        }
     }
     if !harden_ssh {
         return false;
@@ -7965,7 +7577,9 @@ fn resolve_add_hive_dist_sync_probe_timeout_secs(payload: &serde_json::Value) ->
                 .ok()
                 .and_then(|raw| raw.trim().parse::<u64>().ok())
         });
-    let raw = from_payload.or(from_env).unwrap_or(DIST_SYNC_PROBE_TIMEOUT_SECS);
+    let raw = from_payload
+        .or(from_env)
+        .unwrap_or(DIST_SYNC_PROBE_TIMEOUT_SECS);
     raw.clamp(5, 600)
 }
 
@@ -8003,14 +7617,6 @@ fn parse_bool_value(value: &serde_json::Value) -> Option<bool> {
     }
     let raw = value.as_str()?;
     parse_bool_str(raw)
-}
-
-fn env_flag_enabled(name: &str) -> bool {
-    let raw = match std::env::var(name) {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
-    parse_bool_str(&raw).unwrap_or(false)
 }
 
 fn parse_bool_str(raw: &str) -> Option<bool> {
@@ -8113,62 +7719,72 @@ fn systemd_disable(service: &str) -> Result<(), OrchestratorError> {
     run_cmd(cmd, "systemctl disable")
 }
 
-fn disable_remote_password_auth(address: &str) -> Result<(), OrchestratorError> {
-    let set_password_auth_cmd = r#"bash -lc 'set -euo pipefail
-cfg="/etc/ssh/sshd_config"
-drop="/etc/ssh/sshd_config.d/00-fluxbee-hardening.conf"
-mkdir -p /etc/ssh/sshd_config.d
-
-upsert_opt() {
-  local key="$1"
-  local val="$2"
-  local file="$3"
-  if grep -Eq "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+" "$file"; then
-    sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+.*|${key} ${val}|" "$file"
-  else
-    printf "\n%s %s\n" "$key" "$val" >> "$file"
-  fi
+struct AddHiveSshControlsResult {
+    restrict_ssh_applied: bool,
+    restrict_ssh_mode: String,
 }
 
-upsert_opt "PasswordAuthentication" "no" "$cfg"
-upsert_opt "KbdInteractiveAuthentication" "no" "$cfg"
-upsert_opt "ChallengeResponseAuthentication" "no" "$cfg"
+fn apply_add_hive_ssh_controls_after_finalize(
+    address: &str,
+    key_path: &Path,
+    pub_key: &str,
+    restrict_ssh_requested: bool,
+    harden_ssh: bool,
+) -> Result<AddHiveSshControlsResult, OrchestratorError> {
+    let mut restrict_ssh_applied = false;
+    let mut restrict_ssh_mode = "unrestricted".to_string();
 
-# Normalize any explicit overrides in existing drop-ins.
-for f in /etc/ssh/sshd_config.d/*.conf; do
-  [ -f "$f" ] || continue
-  sed -i -E "s|^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+.*|PasswordAuthentication no|" "$f" || true
-  sed -i -E "s|^[[:space:]]*#?[[:space:]]*KbdInteractiveAuthentication[[:space:]]+.*|KbdInteractiveAuthentication no|" "$f" || true
-  sed -i -E "s|^[[:space:]]*#?[[:space:]]*ChallengeResponseAuthentication[[:space:]]+.*|ChallengeResponseAuthentication no|" "$f" || true
-done
+    if restrict_ssh_requested {
+        let source_patterns = resolve_add_hive_authkey_source_patterns(address);
+        let restrict_result = apply_remote_from_only_authorized_key_with_access(
+            address,
+            key_path,
+            pub_key,
+            &source_patterns,
+        )
+        .and_then(|_| {
+            ssh_with_key(
+                address,
+                key_path,
+                "sudo -n /bin/bash -lc 'exit 0'",
+                BOOTSTRAP_SSH_USER,
+            )
+        });
+        match restrict_result {
+            Ok(()) => {
+                restrict_ssh_applied = true;
+                restrict_ssh_mode = "from_only".to_string();
+                tracing::info!(
+                    target = address,
+                    from_patterns = ?source_patterns,
+                    "authorized_keys restriction applied in from-only mode (post-finalize)"
+                );
+            }
+            Err(err) => {
+                return Err(format!(
+                    "restrict_ssh requested but from-only restriction failed: {err}"
+                )
+                .into());
+            }
+        }
+    } else {
+        tracing::info!(
+            target = address,
+            "authorized_keys restriction not requested; leaving bootstrap key unrestricted"
+        );
+    }
 
-cat > "$drop" <<EOF
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-ChallengeResponseAuthentication no
-EOF
-chmod 0644 "$drop"
+    if harden_ssh {
+        disable_remote_password_auth_with_access(address, key_path)
+            .map_err(|err| format!("ssh hardening failed: {err}"))?;
+        verify_remote_ssh_hardening_with_access(address, key_path)
+            .map_err(|err| format!("ssh hardening verification failed: {err}"))?;
+    }
 
-if command -v sshd >/dev/null 2>&1; then
-  sshd -t
-elif [ -x /usr/sbin/sshd ]; then
-  /usr/sbin/sshd -t
-fi
-
-if command -v sshd >/dev/null 2>&1; then
-  sshd -T >/dev/null 2>&1 || true
-elif [ -x /usr/sbin/sshd ]; then
-  /usr/sbin/sshd -T >/dev/null 2>&1 || true
-fi'"#;
-    ssh_with_pass(
-        address,
-        &sudo_wrap(set_password_auth_cmd),
-        BOOTSTRAP_SSH_USER,
-    )?;
-
-    let restart_ssh_cmd = r#"bash -lc "systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart""#;
-    ssh_with_pass(address, &sudo_wrap(restart_ssh_cmd), BOOTSTRAP_SSH_USER)?;
-    Ok(())
+    Ok(AddHiveSshControlsResult {
+        restrict_ssh_applied,
+        restrict_ssh_mode,
+    })
 }
 
 fn disable_remote_password_auth_with_access(
@@ -8268,7 +7884,7 @@ fn verify_remote_key_access_after_hardening(
 fn verify_remote_password_auth_is_rejected(address: &str) -> Result<(), OrchestratorError> {
     let mut last_err: Option<String> = None;
     for attempt in 1..=SSH_HARDEN_VERIFY_RETRIES {
-        match ssh_with_pass(address, "true", BOOTSTRAP_SSH_USER) {
+        match ssh_with_pass_any(address, "true", BOOTSTRAP_SSH_USER) {
             Ok(()) => {
                 return Err(
                     "password authentication still accepted after hardening; expected rejection"
@@ -8302,156 +7918,6 @@ fn is_password_auth_rejection_error(message: &str) -> bool {
         || lower.contains("no supported authentication methods available")
         || lower.contains("authentications that can continue")
         || lower.contains("(publickey")
-}
-
-fn remote_ssh_gate_script_contents() -> &'static str {
-    r#"#!/bin/bash
-set -euo pipefail
-
-cmd="${SSH_ORIGINAL_COMMAND:-}"
-if [[ -z "${cmd}" ]]; then
-  echo "DENIED by fluxbee-ssh-gate: empty SSH_ORIGINAL_COMMAND" >&2
-  logger -t fluxbee-ssh-gate "DENIED empty command from ${SSH_CONNECTION:-unknown}"
-  exit 1
-fi
-
-allow_and_exec() {
-  /bin/bash -lc "${cmd}"
-  rc=$?
-  if [[ $rc -ne 0 ]]; then
-    echo "GATE_EXEC_FAILED rc=${rc} cmd=${cmd}" >&2
-    logger -t fluxbee-ssh-gate "EXEC FAILED rc=${rc} from ${SSH_CONNECTION:-unknown}: ${cmd}"
-  fi
-  exit $rc
-}
-
-deny_cmd() {
-  echo "DENIED by fluxbee-ssh-gate: ${cmd}" >&2
-  logger -t fluxbee-ssh-gate "DENIED command from ${SSH_CONNECTION:-unknown}: ${cmd}"
-  exit 1
-}
-
-case "${cmd}" in
-  scp\ -t\ *|scp\ -f\ *|rsync\ --server*)
-    allow_and_exec
-    ;;
-esac
-
-if [[ "${cmd}" == sudo\ -n\ * ]]; then
-  subcmd="${cmd#sudo -n }"
-  case "${subcmd}" in
-    /bin/systemctl\ *|/usr/bin/systemctl\ *|systemctl\ *|\
-    /bin/systemd-run\ *|/usr/bin/systemd-run\ *|systemd-run\ *|\
-    /usr/bin/install\ *|install\ *|\
-    /bin/mkdir\ *|mkdir\ *|\
-    /bin/rm\ *|rm\ *|\
-    /bin/cp\ *|cp\ *|\
-    /bin/mv\ *|mv\ *|\
-    /usr/bin/sha256sum\ *|sha256sum\ *|\
-    /usr/bin/stat\ *|stat\ *|\
-    /usr/bin/tee\ *|tee\ *|\
-    /bin/chmod\ *|/usr/bin/chmod\ *|chmod\ *|\
-    /bin/chown\ *|/usr/bin/chown\ *|chown\ *|\
-    /usr/bin/rsync\ *|rsync\ *|\
-    /usr/sbin/ufw\ *|ufw\ *|\
-    /usr/bin/firewall-cmd\ *|firewall-cmd\ *|\
-    /usr/sbin/service\ *|service\ *|\
-    /bin/bash\ -lc\ *|/usr/bin/bash\ -lc\ *|bash\ -lc\ *)
-      allow_and_exec
-      ;;
-    *)
-      deny_cmd
-      ;;
-  esac
-fi
-
-# Transitional bootstrap path while password flow exists.
-if [[ "${cmd}" == echo\ *\|\ sudo\ -S\ -p\ * ]]; then
-  allow_and_exec
-fi
-
-case "${cmd}" in
-  rm\ -rf\ /tmp/fluxbee-*|mkdir\ -p\ /tmp/fluxbee-*)
-    allow_and_exec
-    ;;
-esac
-
-deny_cmd
-"#
-}
-
-fn install_remote_ssh_gate_with_access(
-    address: &str,
-    key_path: &Path,
-) -> Result<(), OrchestratorError> {
-    write_remote_file(
-        address,
-        key_path,
-        ORCH_SSH_GATE_PATH,
-        remote_ssh_gate_script_contents(),
-    )?;
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap(&format!(
-            "chmod 0755 {}",
-            shell_single_quote(ORCH_SSH_GATE_PATH)
-        )),
-        BOOTSTRAP_SSH_USER,
-    )?;
-    Ok(())
-}
-
-fn apply_remote_restricted_authorized_key_with_access(
-    address: &str,
-    key_path: &Path,
-    pub_key: &str,
-    source_patterns: &[String],
-) -> Result<(), OrchestratorError> {
-    let key_material = pub_key
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
-    let restricted_entry = if source_patterns.is_empty() {
-        format!(
-            "command=\"{gate}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {pub_key}",
-            gate = ORCH_SSH_GATE_PATH,
-            pub_key = pub_key
-        )
-    } else {
-        let from_value = source_patterns.join(",");
-        format!(
-            "from=\"{from_value}\",command=\"{gate}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {pub_key}",
-            from_value = from_value,
-            gate = ORCH_SSH_GATE_PATH,
-            pub_key = pub_key
-        )
-    };
-    let script = format!(
-        "set -euo pipefail\n\
-user='{user}'\n\
-home_dir=\"$(getent passwd \"$user\" | cut -d: -f6)\"\n\
-if [[ -z \"$home_dir\" ]]; then home_dir=\"/home/$user\"; fi\n\
-ssh_dir=\"$home_dir/.ssh\"\n\
-auth_keys=\"$ssh_dir/authorized_keys\"\n\
-mkdir -p \"$ssh_dir\"\n\
-chown \"$user:$user\" \"$ssh_dir\"\n\
-chmod 700 \"$ssh_dir\"\n\
-touch \"$auth_keys\"\n\
-chown \"$user:$user\" \"$auth_keys\"\n\
-{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' > \"$auth_keys.tmp\"; }} || true\n\
-mv \"$auth_keys.tmp\" \"$auth_keys\"\n\
-printf '%s\\n' '{entry}' >> \"$auth_keys\"\n\
-chown \"$user:$user\" \"$auth_keys\"\n\
-chmod 600 \"$auth_keys\"\n",
-        user = BOOTSTRAP_SSH_USER,
-        gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
-        key_material = shell_single_quote(key_material),
-        entry = shell_single_quote(&restricted_entry),
-    );
-    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
-    ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
-    Ok(())
 }
 
 fn apply_remote_from_only_authorized_key_with_access(
@@ -8526,43 +7992,7 @@ chmod 600 ~/.ssh/authorized_keys\n",
         entry = shell_single_quote(pub_key),
     );
     let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
-    ssh_with_pass(address, &cmd, BOOTSTRAP_SSH_USER)?;
-    Ok(())
-}
-
-fn apply_remote_unrestricted_authorized_key_with_access(
-    address: &str,
-    key_path: &Path,
-    pub_key: &str,
-) -> Result<(), OrchestratorError> {
-    let key_material = pub_key
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
-    let script = format!(
-        "set -euo pipefail\n\
-user='{user}'\n\
-home_dir=\"$(getent passwd \"$user\" | cut -d: -f6)\"\n\
-if [[ -z \"$home_dir\" ]]; then home_dir=\"/home/$user\"; fi\n\
-ssh_dir=\"$home_dir/.ssh\"\n\
-auth_keys=\"$ssh_dir/authorized_keys\"\n\
-mkdir -p \"$ssh_dir\"\n\
-chown \"$user:$user\" \"$ssh_dir\"\n\
-chmod 700 \"$ssh_dir\"\n\
-touch \"$auth_keys\"\n\
-chown \"$user:$user\" \"$auth_keys\"\n\
-{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' > \"$auth_keys.tmp\"; }} || true\n\
-mv \"$auth_keys.tmp\" \"$auth_keys\"\n\
-printf '%s\\n' '{entry}' >> \"$auth_keys\"\n\
-chown \"$user:$user\" \"$auth_keys\"\n\
-chmod 600 \"$auth_keys\"\n",
-        user = BOOTSTRAP_SSH_USER,
-        gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
-        key_material = shell_single_quote(key_material),
-        entry = shell_single_quote(pub_key),
-    );
-    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
-    ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
+    ssh_with_pass_any(address, &cmd, BOOTSTRAP_SSH_USER)?;
     Ok(())
 }
 
@@ -8700,6 +8130,53 @@ fn ssh_with_pass(address: &str, command: &str, user: &str) -> Result<(), Orchest
     let result = run_cmd(cmd, "ssh");
     let _ = fs::remove_file(&askpass);
     result
+}
+
+fn ssh_with_pass_kbd(address: &str, command: &str, user: &str) -> Result<(), OrchestratorError> {
+    let askpass = askpass_script(BOOTSTRAP_SSH_PASS)?;
+    let mut cmd = Command::new("setsid");
+    cmd.arg("ssh")
+        .arg("-o")
+        .arg("PreferredAuthentications=keyboard-interactive,password")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=yes")
+        .arg("-o")
+        .arg("PasswordAuthentication=yes")
+        .arg("-o")
+        .arg("PubkeyAuthentication=no")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(format!("{user}@{address}"))
+        .arg(command)
+        .env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", "jsr");
+    let result = run_cmd(cmd, "ssh");
+    let _ = fs::remove_file(&askpass);
+    result
+}
+
+fn ssh_with_pass_any(address: &str, command: &str, user: &str) -> Result<(), OrchestratorError> {
+    match ssh_with_pass(address, command, user) {
+        Ok(()) => Ok(()),
+        Err(pass_err) => match ssh_with_pass_kbd(address, command, user) {
+            Ok(()) => {
+                tracing::warn!(
+                    target = address,
+                    error = %pass_err,
+                    "password auth fallback: keyboard-interactive succeeded"
+                );
+                Ok(())
+            }
+            Err(kbd_err) => {
+                Err(format!("{pass_err}; keyboard-interactive auth failed: {kbd_err}").into())
+            }
+        },
+    }
 }
 
 fn ssh_with_key(
@@ -8939,14 +8416,6 @@ fn remote_hive_name(entry: &RemoteHiveEntry) -> Option<String> {
     Some(String::from_utf8_lossy(&entry.hive_id[..len]).into_owned())
 }
 
-fn remote_router_name(entry: &RemoteHiveEntry) -> Option<String> {
-    if entry.router_name_len == 0 {
-        return None;
-    }
-    let len = entry.router_name_len as usize;
-    Some(String::from_utf8_lossy(&entry.router_name[..len]).into_owned())
-}
-
 fn remote_flags_status(flags: u16) -> &'static str {
     if flags & FLAG_DELETED != 0 {
         "deleted"
@@ -9089,7 +8558,9 @@ fn is_worker_role(role: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use json_router::shm::LsaHeaderSnapshot;
+
+    const LOCAL_DEVICE_ID: &str = "V7TZE22-7TDF4XG-KXILPOJ-NXFPHYF-HPXR2AH-YCZKW5G-XAOGXS3-AKHUFAC";
+    const PEER_DEVICE_ID: &str = "I7MM32M-LYH7OVN-TCPA6G4-MIFHRC6-T7RKRVN-Q35OZRX-MGZMVA3-X7Y24QF";
 
     fn write_name(buf: &mut [u8], value: &str) -> u16 {
         let bytes = value.as_bytes();
@@ -9098,84 +8569,106 @@ mod tests {
         len as u16
     }
 
-    fn test_state() -> OrchestratorState {
-        OrchestratorState {
-            hive_id: "sandbox".to_string(),
-            is_motherbee: true,
-            started_at: Instant::now(),
-            config_dir: PathBuf::from("/tmp"),
-            state_dir: PathBuf::from("/tmp"),
-            gateway_name: "RT.gateway@sandbox".to_string(),
-            storage_path: Mutex::new("/var/lib/fluxbee".to_string()),
-            wan_listen: None,
-            wan_authorized_hives: Vec::new(),
-            tracked_nodes: Mutex::new(HashSet::new()),
-            system_allowed_origins: HashSet::new(),
-            runtime_manifest: Mutex::new(None),
-            last_runtime_verify: Mutex::new(Instant::now()),
-            nats_endpoint: "nats://127.0.0.1:4222".to_string(),
-            blob: BlobRuntimeConfig {
-                enabled: true,
-                path: PathBuf::from("/var/lib/fluxbee/blob"),
-                sync_enabled: false,
-                sync_tool: "syncthing".to_string(),
-                sync_api_port: 8384,
-                sync_data_dir: PathBuf::from("/var/lib/fluxbee/syncthing"),
-            },
-            dist: DistRuntimeConfig {
-                path: PathBuf::from("/var/lib/fluxbee/dist"),
-                sync_enabled: true,
-                sync_tool: "syncthing".to_string(),
-            },
-            blob_sync_last_desired: Mutex::new(BlobRuntimeConfig {
-                enabled: true,
-                path: PathBuf::from("/var/lib/fluxbee/blob"),
-                sync_enabled: false,
-                sync_tool: "syncthing".to_string(),
-                sync_api_port: 8384,
-                sync_data_dir: PathBuf::from("/var/lib/fluxbee/syncthing"),
-            }),
+    fn sample_syncthing_config_with_peer() -> String {
+        format!(
+            "<configuration version=\"37\">
+  <device id=\"{local}\" name=\"sandbox\"></device>
+  <device id=\"{peer}\" name=\"worker-220\"></device>
+  <folder id=\"{blob_id}\" label=\"Fluxbee Blob\" path=\"/var/lib/fluxbee/blob/active\" type=\"sendreceive\">
+    <device id=\"{local}\" introducedBy=\"\"/>
+    <device id=\"{peer}\" introducedBy=\"\"/>
+    <minDiskFree unit=\"%\">1</minDiskFree>
+  </folder>
+  <folder id=\"{dist_id}\" label=\"Fluxbee Dist\" path=\"/var/lib/fluxbee/dist\" type=\"sendreceive\">
+    <device id=\"{local}\" introducedBy=\"\"/>
+    <device id=\"{peer}\" introducedBy=\"\"/>
+    <minDiskFree unit=\"%\">1</minDiskFree>
+  </folder>
+</configuration>",
+            local = LOCAL_DEVICE_ID,
+            peer = PEER_DEVICE_ID,
+            blob_id = SYNCTHING_FOLDER_BLOB_ID,
+            dist_id = SYNCTHING_FOLDER_DIST_ID
+        )
+    }
+
+    fn sample_blob_config() -> BlobRuntimeConfig {
+        BlobRuntimeConfig {
+            enabled: true,
+            path: PathBuf::from("/var/lib/fluxbee/blob"),
+            sync_enabled: true,
+            sync_tool: "syncthing".to_string(),
+            sync_api_port: 8384,
+            sync_data_dir: PathBuf::from("/var/lib/fluxbee/syncthing"),
+            sync_service_user: DEFAULT_BLOB_SYNC_SERVICE_USER.to_string(),
+            sync_allow_root_fallback: DEFAULT_BLOB_SYNC_ALLOW_ROOT_FALLBACK,
+            gc_enabled: DEFAULT_BLOB_GC_ENABLED,
+            gc_interval_secs: DEFAULT_BLOB_GC_INTERVAL_SECS,
+            gc_apply: DEFAULT_BLOB_GC_APPLY,
+            gc_staging_ttl_hours: DEFAULT_BLOB_GC_STAGING_TTL_HOURS,
+            gc_active_retain_days: DEFAULT_BLOB_GC_ACTIVE_RETAIN_DAYS,
+        }
+    }
+
+    fn sample_dist_config() -> DistRuntimeConfig {
+        DistRuntimeConfig {
+            path: PathBuf::from("/var/lib/fluxbee/dist"),
+            sync_enabled: true,
+            sync_tool: "syncthing".to_string(),
         }
     }
 
     #[test]
-    fn remote_routers_projection_uses_real_uuid_and_name() {
-        let router_uuid = Uuid::new_v4();
-        let mut hive = RemoteHiveEntry {
-            hive_id: [0u8; 64],
-            hive_id_len: 0,
-            router_uuid: *router_uuid.as_bytes(),
-            router_name: [0u8; 64],
-            router_name_len: 0,
-            last_lsa_seq: 10,
-            last_updated: now_epoch_ms(),
-            flags: 0,
-            node_count: 2,
-            route_count: 0,
-            vpn_count: 0,
-        };
-        hive.hive_id_len = write_name(&mut hive.hive_id, "worker-220");
-        hive.router_name_len = write_name(&mut hive.router_name, "RT.gateway@worker-220");
+    fn resolve_syncthing_service_user_accepts_existing_user() {
+        let mut blob = sample_blob_config();
+        blob.sync_service_user = "root".to_string();
+        blob.sync_allow_root_fallback = false;
+        let effective = resolve_syncthing_service_user(&blob).expect("resolve user");
+        assert_eq!(effective, "root");
+    }
 
-        let snapshot = LsaSnapshot {
-            header: LsaHeaderSnapshot {
-                hive_count: 1,
-                total_node_count: 0,
-                total_route_count: 0,
-                total_vpn_count: 0,
-                heartbeat: now_epoch_ms(),
-            },
-            hives: vec![hive],
-            nodes: Vec::new(),
-            routes: Vec::new(),
-            vpns: Vec::new(),
-        };
-        let state = test_state();
-        let routers = remote_routers_for_hive(&state, &snapshot, "worker-220");
+    #[test]
+    fn resolve_syncthing_service_user_rejects_missing_without_fallback() {
+        let mut blob = sample_blob_config();
+        blob.sync_service_user = format!("missing-{}", Uuid::new_v4());
+        blob.sync_allow_root_fallback = false;
+        let err = resolve_syncthing_service_user(&blob).expect_err("must fail");
+        assert!(err.to_string().contains("allow_root_fallback=false"));
+    }
 
-        assert_eq!(routers.len(), 1);
-        assert_eq!(routers[0]["uuid"], router_uuid.to_string());
-        assert_eq!(routers[0]["name"], "RT.gateway@worker-220");
+    #[test]
+    fn blob_runtime_from_hive_defaults_include_gc() {
+        let hive: HiveFile = serde_yaml::from_str("hive_id: sandbox\n").expect("parse hive");
+        let blob = blob_runtime_from_hive(&hive);
+        assert_eq!(blob.gc_enabled, DEFAULT_BLOB_GC_ENABLED);
+        assert_eq!(blob.gc_interval_secs, DEFAULT_BLOB_GC_INTERVAL_SECS);
+        assert_eq!(blob.gc_apply, DEFAULT_BLOB_GC_APPLY);
+        assert_eq!(blob.gc_staging_ttl_hours, DEFAULT_BLOB_GC_STAGING_TTL_HOURS);
+        assert_eq!(
+            blob.gc_active_retain_days,
+            DEFAULT_BLOB_GC_ACTIVE_RETAIN_DAYS
+        );
+    }
+
+    #[test]
+    fn blob_runtime_from_hive_parses_gc_overrides() {
+        let hive_yaml = r#"
+hive_id: sandbox
+blob:
+  gc:
+    enabled: true
+    interval_secs: 1800
+    apply: true
+    staging_ttl_hours: 12
+    active_retain_days: 45
+"#;
+        let hive: HiveFile = serde_yaml::from_str(hive_yaml).expect("parse hive");
+        let blob = blob_runtime_from_hive(&hive);
+        assert!(blob.gc_enabled);
+        assert_eq!(blob.gc_interval_secs, 1800);
+        assert!(blob.gc_apply);
+        assert_eq!(blob.gc_staging_ttl_hours, 12);
+        assert_eq!(blob.gc_active_retain_days, 45);
     }
 
     #[test]
@@ -9200,5 +8693,36 @@ mod tests {
         let deleted =
             remote_node_to_json(&node, 1000, FLAG_DELETED, "worker-220").expect("deleted node");
         assert_eq!(deleted["status"], "deleted");
+    }
+
+    #[test]
+    fn reconcile_syncthing_peer_removal_removes_peer_from_top_level_and_folders() {
+        let config = sample_syncthing_config_with_peer();
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+
+        let (updated, changed) =
+            reconcile_syncthing_peer_removal_xml(&config, &blob, &dist, PEER_DEVICE_ID)
+                .expect("peer removal must succeed");
+
+        assert!(changed);
+        assert!(!updated.contains(PEER_DEVICE_ID));
+        assert!(updated.contains(LOCAL_DEVICE_ID));
+        assert!(updated.contains(SYNCTHING_FOLDER_BLOB_ID));
+        assert!(updated.contains(SYNCTHING_FOLDER_DIST_ID));
+    }
+
+    #[test]
+    fn reconcile_syncthing_peer_removal_noop_when_peer_missing() {
+        let config = sample_syncthing_config_with_peer().replace(PEER_DEVICE_ID, "");
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+
+        let (updated, changed) =
+            reconcile_syncthing_peer_removal_xml(&config, &blob, &dist, PEER_DEVICE_ID)
+                .expect("peer removal must succeed");
+
+        assert!(!changed);
+        assert_eq!(updated, config);
     }
 }

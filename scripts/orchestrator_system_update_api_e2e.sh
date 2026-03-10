@@ -4,6 +4,9 @@ set -euo pipefail
 BASE="${BASE:-http://127.0.0.1:8080}"
 HIVE_ID="${HIVE_ID:-worker-220}"
 CATEGORY="${CATEGORY:-runtime}" # runtime|core|vendor
+WAIT_SYNC_HINT_SECS="${WAIT_SYNC_HINT_SECS:-120}"
+SYNC_HINT_TIMEOUT_MS="${SYNC_HINT_TIMEOUT_MS:-30000}"
+SYNC_HINT_WAIT_FOR_IDLE="${SYNC_HINT_WAIT_FOR_IDLE:-true}"
 
 if [[ "$CATEGORY" != "runtime" && "$CATEGORY" != "core" && "$CATEGORY" != "vendor" ]]; then
   echo "FAIL: CATEGORY must be runtime|core|vendor (got '$CATEGORY')" >&2
@@ -16,6 +19,24 @@ post_update() {
   curl -sS -X POST "$BASE/hives/$HIVE_ID/update" \
     -H "Content-Type: application/json" \
     -d "{\"category\":\"$CATEGORY\",\"manifest_version\":$version,\"manifest_hash\":\"$hash\"}"
+}
+
+post_sync_hint() {
+  local channel="$1"
+  local wait_for_idle="$2"
+  local timeout_ms="$3"
+  local wait_for_idle_json
+  case "${wait_for_idle,,}" in
+    1|true|yes|on) wait_for_idle_json="true" ;;
+    0|false|no|off) wait_for_idle_json="false" ;;
+    *)
+      echo "FAIL: SYNC_HINT_WAIT_FOR_IDLE must be boolean (got '$wait_for_idle')" >&2
+      exit 1
+      ;;
+  esac
+  curl -sS -X POST "$BASE/hives/$HIVE_ID/sync-hint" \
+    -H "Content-Type: application/json" \
+    -d "{\"channel\":\"$channel\",\"folder_id\":\"fluxbee-$channel\",\"wait_for_idle\":$wait_for_idle_json,\"timeout_ms\":$timeout_ms}"
 }
 
 extract_versions_meta() {
@@ -49,6 +70,13 @@ else:
     node = hive.get("vendor", {})
     version = int(node.get("manifest_version", 0) or 0)
     h = node.get("manifest_hash")
+    if (not isinstance(h, str) or not h.strip()):
+        # vendor can be "missing" while syncthing binary is present.
+        # in that case we fallback to resolve local_manifest_hash from sync_pending.
+        if str(node.get("status", "")).strip().lower() == "missing" and bool(node.get("syncthing_present", False)):
+            print(version)
+            print("__AUTO_VENDOR_HASH_FROM_SYNC_PENDING__")
+            sys.exit(0)
 
 if not isinstance(h, str) or not h.strip():
     print("MISSING_HASH", file=sys.stderr)
@@ -71,12 +99,39 @@ try:
 except Exception:
     print("")
     raise SystemExit(0)
-print(doc.get("payload", {}).get("status", ""))
+payload = doc.get("payload")
+if isinstance(payload, dict):
+    status = payload.get("status")
+    if isinstance(status, str) and status:
+        print(status)
+        raise SystemExit(0)
+status = doc.get("status")
+print(status if isinstance(status, str) else "")
+PY
+}
+
+extract_payload_local_manifest_hash() {
+  local json_doc="$1"
+  JSON_DOC="$json_doc" python3 - <<'PY'
+import json
+import os
+raw = os.environ.get("JSON_DOC", "")
+try:
+    doc = json.loads(raw)
+except Exception:
+    print("")
+    raise SystemExit(0)
+payload = doc.get("payload")
+if not isinstance(payload, dict):
+    print("")
+    raise SystemExit(0)
+h = payload.get("local_manifest_hash")
+print(h if isinstance(h, str) else "")
 PY
 }
 
 echo "SYSTEM_UPDATE API E2E: BASE=$BASE HIVE_ID=$HIVE_ID CATEGORY=$CATEGORY"
-echo "Step 1/3: fetch current versions"
+echo "Step 1/4: fetch current versions"
 versions="$(curl -sS "$BASE/hives/$HIVE_ID/versions")"
 mapfile -t meta < <(extract_versions_meta "$CATEGORY" "$versions")
 if [[ "${#meta[@]}" -lt 2 ]]; then
@@ -87,8 +142,38 @@ fi
 manifest_version="${meta[0]}"
 manifest_hash="${meta[1]}"
 echo "resolved manifest_version=$manifest_version manifest_hash=$manifest_hash"
+if [[ "$CATEGORY" == "vendor" && "$manifest_hash" == "__AUTO_VENDOR_HASH_FROM_SYNC_PENDING__" ]]; then
+  echo "INFO: vendor manifest hash absent in /versions; will resolve from sync_pending.local_manifest_hash"
+fi
 
-echo "Step 2/3: send wrong hash (expect sync_pending)"
+echo "Step 2/4: run sync-hint dist and wait ok"
+deadline=$(( $(date +%s) + WAIT_SYNC_HINT_SECS ))
+while (( $(date +%s) <= deadline )); do
+  sync_hint_resp="$(post_sync_hint "dist" "$SYNC_HINT_WAIT_FOR_IDLE" "$SYNC_HINT_TIMEOUT_MS")"
+  sync_hint_status="$(extract_payload_status "$sync_hint_resp")"
+  if [[ "$sync_hint_status" == "ok" ]]; then
+    echo "$sync_hint_resp"
+    break
+  fi
+  if [[ "$sync_hint_status" == "sync_pending" ]]; then
+    sleep 2
+    continue
+  fi
+  if [[ "$sync_hint_resp" == *"TRANSPORT_ERROR"* || "$sync_hint_resp" == *"UNREACHABLE"* ]]; then
+    sleep 2
+    continue
+  fi
+  echo "FAIL: expected sync-hint payload.status in {ok,sync_pending}, got '$sync_hint_status'" >&2
+  echo "$sync_hint_resp" >&2
+  exit 1
+done
+if [[ "${sync_hint_status:-}" != "ok" ]]; then
+  echo "FAIL: sync-hint did not converge to ok within ${WAIT_SYNC_HINT_SECS}s" >&2
+  echo "$sync_hint_resp" >&2
+  exit 1
+fi
+
+echo "Step 3/4: send wrong hash (expect sync_pending)"
 bad_hash="0000000000000000000000000000000000000000000000000000000000000000"
 resp_bad="$(post_update "$manifest_version" "$bad_hash")"
 status_bad="$(extract_payload_status "$resp_bad")"
@@ -97,8 +182,16 @@ if [[ "$status_bad" != "sync_pending" ]]; then
   echo "FAIL: expected payload.status=sync_pending, got '$status_bad'" >&2
   exit 1
 fi
+if [[ "$CATEGORY" == "vendor" && "$manifest_hash" == "__AUTO_VENDOR_HASH_FROM_SYNC_PENDING__" ]]; then
+  manifest_hash="$(extract_payload_local_manifest_hash "$resp_bad")"
+  if [[ -z "$manifest_hash" ]]; then
+    echo "FAIL: vendor fallback could not resolve payload.local_manifest_hash from sync_pending response" >&2
+    exit 1
+  fi
+  echo "resolved vendor manifest_hash from sync_pending.local_manifest_hash=$manifest_hash"
+fi
 
-echo "Step 3/3: send exact hash (expect ok)"
+echo "Step 4/4: send exact hash (expect ok)"
 resp_ok="$(post_update "$manifest_version" "$manifest_hash")"
 status_ok="$(extract_payload_status "$resp_ok")"
 echo "$resp_ok"

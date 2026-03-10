@@ -1,7 +1,7 @@
 # JSON Router - 02 Protocolo de Mensajes
 
-**Estado:** v1.17  
-**Fecha:** 2026-03-04  
+**Estado:** v1.18  
+**Fecha:** 2026-03-09  
 **Audiencia:** Desarrolladores de librería de nodo, desarrolladores de nodos
 
 ---
@@ -736,10 +736,13 @@ Request/response para obtener EventPackage completo de otra isla:
 | `SPAWN_NODE_RESPONSE` | `SY.orchestrator@<hive>` | Originador de `SPAWN_NODE` | Resultado de spawn |
 | `KILL_NODE` | `SY.admin` (tooling E2E solo entorno controlado) | `SY.orchestrator@<hive>` | Solicitar terminación de nodo |
 | `KILL_NODE_RESPONSE` | `SY.orchestrator@<hive>` | Originador de `KILL_NODE` | Resultado de kill |
+| `SYSTEM_SYNC_HINT` *(propuesto v2.x)* | `SY.admin` / SDK productor (según política) | `SY.orchestrator@<hive>` | Acelerar/confirmar convergencia de canal Syncthing (`blob`/`dist`) |
+| `SYSTEM_SYNC_HINT_RESPONSE` *(propuesto v2.x)* | `SY.orchestrator@<hive>` | Originador de `SYSTEM_SYNC_HINT` | Estado de convergencia del folder (`ok`/`sync_pending`/`error`) |
 
-Compatibilidad:
-- `RUNTIME_UPDATE`/`RUNTIME_UPDATE_RESPONSE` quedan **obsoletos** para operación canónica.
-- Si se reciben, se procesan en modo compatibilidad local y se responde indicando que la propagación remota debe hacerse con `SYSTEM_UPDATE`.
+Contrato estricto v2:
+- `RUNTIME_UPDATE`/`RUNTIME_UPDATE_RESPONSE` no forman parte del contrato operativo.
+- El único contrato de update remoto es `SYSTEM_UPDATE`/`SYSTEM_UPDATE_RESPONSE`.
+- `SYSTEM_SYNC_HINT` está documentado como extensión propuesta v2.x; su adopción es explícita por feature/política.
 
 Regla operativa 7.8:
 - Usar `routing.dst` por nombre L2 (`"SY.orchestrator@<hive>"`).
@@ -774,8 +777,8 @@ Campos de request (`payload`):
 | Campo | Tipo | Obligatorio | Valores | Notas |
 |-------|------|-------------|---------|-------|
 | `category` | string | No | `runtime`, `core`, `vendor` | Default: `runtime` |
-| `manifest_version` | u64 | No | >= 0 | Alias aceptado: `version` |
-| `manifest_hash` | string | Sí | `sha256:...` o hash hex | Alias aceptado: `hash` |
+| `manifest_version` | u64 | No | >= 0 | No acepta alias legacy (`version`) |
+| `manifest_hash` | string | Sí | `sha256:...` o hash hex | No acepta alias legacy (`hash`) |
 
 Response (`SYSTEM_UPDATE_RESPONSE`):
 
@@ -847,9 +850,9 @@ Campos de request (`payload`):
 
 | Campo | Tipo | Obligatorio | Notas |
 |-------|------|-------------|-------|
-| `node_name` | string | Sí | Alias aceptado: `name`. Si no incluye `@hive`, se normaliza al target |
+| `node_name` | string | Sí | Si no incluye `@hive`, se normaliza al target |
 | `runtime` | string | No | Si falta, se deriva de `node_name` |
-| `runtime_version` | string | No | Default: `current`. Alias aceptado: `version` |
+| `runtime_version` | string | No | Default: `current` |
 | `target` | string | No | Hive destino explícito (si no, se usa el de `routing.dst`) |
 | `config` | object | No | Config del runtime/nodo |
 
@@ -901,7 +904,7 @@ Campos de request (`payload`):
 
 | Campo | Tipo | Obligatorio | Notas |
 |-------|------|-------------|-------|
-| `node_name` | string | Condicional | Alias aceptado: `name` |
+| `node_name` | string | Condicional | Requerido si no se envía `unit` |
 | `unit` | string | Condicional | Alternativa directa a `node_name` |
 | `force` | bool | No | `false` => `SIGTERM`; `true` => `SIGKILL` |
 | `signal` | string | No | Solo aplica cuando `force=false` |
@@ -927,6 +930,40 @@ Estados/códigos típicos:
 - `status=ok` (puede incluir `state=not_found` si no estaba corriendo).
 - `status=error`, `error_code=INVALID_REQUEST`.
 - `status=error`, `error_code=KILL_FAILED`.
+
+#### 7.8.4 SYSTEM_SYNC_HINT *(propuesto v2.x)*
+
+Objetivo:
+- gatillar sincronización por evento sobre Syncthing y opcionalmente esperar convergencia observada.
+- usar el mismo canal de control L2 (sin SSH, sin transporte paralelo).
+
+Request mínimo:
+
+```json
+{
+  "routing": {
+    "src": "SY.admin@motherbee",
+    "dst": "SY.orchestrator@worker-1",
+    "ttl": 16,
+    "trace_id": "..."
+  },
+  "meta": {
+    "type": "system",
+    "msg": "SYSTEM_SYNC_HINT"
+  },
+  "payload": {
+    "channel": "blob",
+    "folder_id": "fluxbee-blob",
+    "wait_for_idle": true,
+    "timeout_ms": 30000
+  }
+}
+```
+
+Status de respuesta (`SYSTEM_SYNC_HINT_RESPONSE.payload.status`):
+- `ok`: folder sano y convergencia observada
+- `sync_pending`: hint aplicado, aún sin convergencia final
+- `error`: timeout o estado inválido del folder/API
 
 ---
 
