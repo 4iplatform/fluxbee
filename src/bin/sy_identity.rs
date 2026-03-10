@@ -12,12 +12,16 @@ use uuid::Uuid;
 
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
-use json_router::shm::{LsaRegionReader, LsaSnapshot, NodeEntry, RouterRegionReader, ShmSnapshot};
+use json_router::shm::{
+    now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RouterRegionReader, ShmSnapshot,
+};
 
 type IdentityError = Box<dyn std::error::Error + Send + Sync>;
 
 const DEFAULT_GATEWAY_NAME: &str = "RT.gateway";
 const DEFAULT_DEFAULT_TENANT_NAME: &str = "fluxbee";
+const DEFAULT_MERGE_ALIAS_TTL_SECS: u64 = 3600;
+const ALIAS_GC_INTERVAL_SECS: u64 = 30;
 
 const MSG_ILK_PROVISION: &str = "ILK_PROVISION";
 const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
@@ -55,6 +59,8 @@ struct WanSection {
 struct IdentitySection {
     #[serde(default)]
     default_tenant: Option<String>,
+    #[serde(default)]
+    merge_alias_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +183,13 @@ struct IlkRecord {
     roles: Vec<String>,
     capabilities: Vec<String>,
     channels: Vec<ChannelRecord>,
+    deleted_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct AliasRecord {
+    canonical_ilk_id: String,
+    expires_at_ms: u64,
 }
 
 #[derive(Debug, Default)]
@@ -185,7 +198,7 @@ struct IdentityStore {
     ilks: HashMap<String, IlkRecord>,
     // (channel_type_lower, address_lower) -> ilk_id
     ich_lookup: HashMap<(String, String), String>,
-    aliases: HashMap<String, String>,
+    aliases: HashMap<String, AliasRecord>,
 }
 
 impl IdentityStore {
@@ -241,6 +254,7 @@ impl IdentityStore {
                 channel_type: req.channel_type,
                 address: req.address,
             }],
+            deleted_at_ms: None,
         };
         self.ich_lookup.insert(key, ilk_id.clone());
         self.ilks.insert(ilk_id.clone(), ilk);
@@ -268,6 +282,9 @@ impl IdentityStore {
 
         match self.ilks.get_mut(&req.ilk_id) {
             Some(existing) => {
+                if existing.deleted_at_ms.is_some() {
+                    return Err("ILK_NOT_FOUND".to_string());
+                }
                 let tenant_change = existing.tenant_id != req.tenant_id;
                 if tenant_change && !existing.registration_status.eq("temporary") {
                     return Err("INVALID_TENANT_TRANSITION".to_string());
@@ -291,6 +308,7 @@ impl IdentityStore {
                         roles,
                         capabilities,
                         channels: Vec::new(),
+                        deleted_at_ms: None,
                     },
                 );
             }
@@ -302,7 +320,11 @@ impl IdentityStore {
         }))
     }
 
-    fn add_channel(&mut self, req: IlkAddChannelRequest) -> Result<Value, String> {
+    fn add_channel(
+        &mut self,
+        req: IlkAddChannelRequest,
+        merge_alias_ttl_secs: u64,
+    ) -> Result<Value, String> {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
         validate_channel_input(&req.channel)?;
 
@@ -311,6 +333,9 @@ impl IdentityStore {
             .ilks
             .get_mut(&canonical_ilk_id)
             .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        if target.deleted_at_ms.is_some() {
+            return Err("ILK_NOT_FOUND".to_string());
+        }
 
         let key = canonical_ich_key(&req.channel.channel_type, &req.channel.address);
         self.ich_lookup.insert(key, canonical_ilk_id.clone());
@@ -329,8 +354,49 @@ impl IdentityStore {
 
         if let Some(old_ilk) = req.merge_from_ilk_id {
             let _ = parse_prefixed_uuid(&old_ilk, "ilk")?;
-            self.aliases
-                .insert(old_ilk.clone(), canonical_ilk_id.clone());
+            if old_ilk == canonical_ilk_id {
+                return Err("INVALID_MERGE_SOURCE".to_string());
+            }
+            let source = self
+                .ilks
+                .get(&old_ilk)
+                .ok_or_else(|| "INVALID_MERGE_SOURCE".to_string())?;
+            if source.deleted_at_ms.is_some() || source.registration_status != "temporary" {
+                return Err("INVALID_MERGE_SOURCE".to_string());
+            }
+
+            let source_channels = source.channels.clone();
+            let source_keys: Vec<(String, String)> = source_channels
+                .iter()
+                .map(|ch| canonical_ich_key(&ch.channel_type, &ch.address))
+                .collect();
+
+            let canonical = self
+                .ilks
+                .get_mut(&canonical_ilk_id)
+                .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+            for ch in source_channels {
+                if !canonical
+                    .channels
+                    .iter()
+                    .any(|existing| existing.ich_id == ch.ich_id)
+                {
+                    canonical.channels.push(ch);
+                }
+            }
+            for key in source_keys {
+                self.ich_lookup.insert(key, canonical_ilk_id.clone());
+            }
+
+            let ttl_ms = merge_alias_ttl_secs.saturating_mul(1000);
+            let expires_at_ms = now_epoch_ms().saturating_add(ttl_ms);
+            self.aliases.insert(
+                old_ilk.clone(),
+                AliasRecord {
+                    canonical_ilk_id: canonical_ilk_id.clone(),
+                    expires_at_ms,
+                },
+            );
         }
 
         Ok(json!({
@@ -351,6 +417,9 @@ impl IdentityStore {
             .ilks
             .get_mut(&req.ilk_id)
             .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        if entry.deleted_at_ms.is_some() {
+            return Err("ILK_NOT_FOUND".to_string());
+        }
 
         for ch in &req.add_channels {
             validate_channel_input(ch)?;
@@ -422,12 +491,42 @@ impl IdentityStore {
     }
 
     fn metrics(&self) -> Value {
+        let deleted_ilks = self
+            .ilks
+            .values()
+            .filter(|entry| entry.deleted_at_ms.is_some())
+            .count();
         json!({
             "tenant_count": self.tenants.len(),
             "ilk_count": self.ilks.len(),
             "ich_count": self.ich_lookup.len(),
             "alias_count": self.aliases.len(),
+            "deleted_ilk_count": deleted_ilks,
         })
+    }
+
+    fn gc_expired_aliases(&mut self, now_ms: u64) -> usize {
+        let mut expired_old_ids = Vec::new();
+        self.aliases.retain(|old_ilk_id, entry| {
+            let keep = entry.expires_at_ms > now_ms;
+            if !keep {
+                expired_old_ids.push(old_ilk_id.clone());
+            }
+            keep
+        });
+
+        for old_ilk_id in &expired_old_ids {
+            if let Some(ilk) = self.ilks.get_mut(old_ilk_id) {
+                if ilk.registration_status == "temporary" && ilk.deleted_at_ms.is_none() {
+                    ilk.deleted_at_ms = Some(now_ms);
+                }
+            }
+        }
+        if !expired_old_ids.is_empty() {
+            self.ich_lookup
+                .retain(|_, ilk_id| !expired_old_ids.iter().any(|old| old == ilk_id));
+        }
+        expired_old_ids.len()
     }
 }
 
@@ -435,6 +534,9 @@ struct IdentityRuntime {
     hive_id: String,
     state_dir: PathBuf,
     gateway_name: String,
+    is_primary: bool,
+    db_url: Option<String>,
+    merge_alias_ttl_secs: u64,
     store: IdentityStore,
     // action -> allowed prefixes by node name
     // e.g. "ILK_PROVISION" -> ["IO."]
@@ -444,7 +546,7 @@ struct IdentityRuntime {
 }
 
 impl IdentityRuntime {
-    fn new(hive: &HiveFile, state_dir: PathBuf) -> Self {
+    fn new(hive: &HiveFile, state_dir: PathBuf, is_primary: bool, db_url: Option<String>) -> Self {
         let mut allowed_prefixes: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
         allowed_prefixes.insert(MSG_ILK_PROVISION, vec!["IO."]);
         allowed_prefixes.insert(MSG_ILK_REGISTER, vec!["AI.frontdesk@", "SY.orchestrator@"]);
@@ -465,6 +567,11 @@ impl IdentityRuntime {
             .and_then(|cfg| cfg.default_tenant.as_deref())
             .filter(|name| !name.trim().is_empty())
             .unwrap_or(DEFAULT_DEFAULT_TENANT_NAME);
+        let merge_alias_ttl_secs = hive
+            .identity
+            .as_ref()
+            .and_then(|cfg| cfg.merge_alias_ttl_secs)
+            .unwrap_or(DEFAULT_MERGE_ALIAS_TTL_SECS);
 
         let gateway_name = hive
             .wan
@@ -477,6 +584,9 @@ impl IdentityRuntime {
             hive_id: hive.hive_id.clone(),
             state_dir,
             gateway_name,
+            is_primary,
+            db_url,
+            merge_alias_ttl_secs,
             store: IdentityStore::with_default_tenant(default_tenant),
             allowed_prefixes,
             allowed_exacts,
@@ -527,7 +637,7 @@ impl IdentityRuntime {
             }
             MSG_ILK_ADD_CHANNEL => {
                 match serde_json::from_value::<IlkAddChannelRequest>(msg.payload.clone()) {
-                    Ok(req) => match self.store.add_channel(req) {
+                    Ok(req) => match self.store.add_channel(req, self.merge_alias_ttl_secs) {
                         Ok(ok) => ok,
                         Err(code) => error_payload(&code, "failed to add channel"),
                     },
@@ -572,6 +682,27 @@ impl IdentityRuntime {
         };
 
         send_system_response(sender, msg, response_name(action), payload).await
+    }
+
+    async fn run_alias_gc(&mut self) -> Result<(), IdentityError> {
+        let now_ms = now_epoch_ms();
+        let removed_local = self.store.gc_expired_aliases(now_ms);
+        if removed_local > 0 {
+            tracing::info!(removed = removed_local, "identity alias gc applied locally");
+        }
+
+        if self.is_primary {
+            if let Some(db_url) = self.db_url.as_deref() {
+                let removed_db = gc_aliases_in_db(db_url).await?;
+                if removed_db > 0 {
+                    tracing::info!(
+                        removed = removed_db,
+                        "identity alias gc applied in database"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn is_authorized(&self, action: &str, source_name: Option<&str>) -> bool {
@@ -657,7 +788,8 @@ async fn main() -> Result<(), IdentityError> {
     let socket_dir = json_router::paths::router_socket_dir();
 
     let hive = load_hive(&config_dir)?;
-    if is_mother_role(hive.role.as_deref()) {
+    let is_primary = is_mother_role(hive.role.as_deref());
+    if is_primary {
         ensure_primary_schema(&hive).await?;
     } else {
         tracing::info!(
@@ -673,7 +805,12 @@ async fn main() -> Result<(), IdentityError> {
         version: "2.0".to_string(),
     };
 
-    let mut runtime = IdentityRuntime::new(&hive, state_dir.clone());
+    let db_url = if is_primary {
+        Some(database_url(&hive)?)
+    } else {
+        None
+    };
+    let mut runtime = IdentityRuntime::new(&hive, state_dir.clone(), is_primary, db_url);
     let (mut sender, mut receiver) =
         connect_with_retry(&node_config, Duration::from_secs(1)).await?;
 
@@ -684,10 +821,16 @@ async fn main() -> Result<(), IdentityError> {
     );
 
     let mut heartbeat = time::interval(Duration::from_secs(5));
+    let mut alias_gc_tick = time::interval(Duration::from_secs(ALIAS_GC_INTERVAL_SECS));
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 tracing::debug!(metrics = %runtime.store.metrics(), "identity heartbeat");
+            }
+            _ = alias_gc_tick.tick() => {
+                if let Err(err) = runtime.run_alias_gc().await {
+                    tracing::warn!(error = %err, "identity alias gc failed");
+                }
             }
             received = receiver.recv() => {
                 let msg = match received {
@@ -998,6 +1141,45 @@ CREATE TABLE IF NOT EXISTS identity_vocabulary (
 
     tracing::info!("identity primary schema ensured");
     Ok(())
+}
+
+async fn gc_aliases_in_db(database_url: &str) -> Result<u64, IdentityError> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "identity alias gc postgres connection closed");
+        }
+    });
+
+    let rows = client
+        .query(
+            r#"
+WITH expired AS (
+    DELETE FROM identity_ilk_aliases
+    WHERE expires_at <= NOW()
+    RETURNING old_ilk_id
+),
+soft_deleted AS (
+    UPDATE identity_ilks i
+    SET deleted_at = NOW(), updated_at = NOW()
+    FROM expired e
+    WHERE i.ilk_id = e.old_ilk_id
+      AND i.registration_status = 'temporary'
+      AND i.deleted_at IS NULL
+    RETURNING i.ilk_id
+)
+SELECT COUNT(*)::BIGINT AS removed_count FROM expired
+"#,
+            &[],
+        )
+        .await?;
+
+    let removed = rows
+        .first()
+        .map(|row| row.get::<_, i64>(0))
+        .unwrap_or(0)
+        .max(0) as u64;
+    Ok(removed)
 }
 
 fn database_url(hive: &HiveFile) -> Result<String, IdentityError> {

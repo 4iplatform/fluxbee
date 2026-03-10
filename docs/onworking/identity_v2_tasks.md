@@ -76,7 +76,7 @@ Salida:
 - [x] B3. Implementar reglas de transición:
   - provisión en `default_tenant`
   - reasignación de tenant solo en `registration_status=temporary`
-- [ ] B4. Implementar GC de alias expirados + soft-delete de ILK temporal mergeado.
+- [x] B4. Implementar GC de alias expirados + soft-delete de ILK temporal mergeado.
 
 Salida:
 - persistencia consistente con unicidad y política de merge.
