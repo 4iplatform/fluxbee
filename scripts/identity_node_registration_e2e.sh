@@ -145,15 +145,20 @@ spawn_node() {
 check_register_contract() {
   local file="$1"
   local label="$2"
-  local reg_status reg_reason reg_ilk
+  local reg_status reg_reason reg_ilk reg_code
 
   reg_status="$(json_get_file "payload.identity.register.status" "$file")"
   reg_reason="$(json_get_file "payload.identity.register.reason" "$file")"
   reg_ilk="$(json_get_file "payload.identity.register.ilk_id" "$file")"
+  reg_code="$(json_get_file "payload.identity.register.error_code" "$file")"
 
   if [[ "$REQUIRE_IDENTITY_REGISTER_OK" == "1" && "$reg_status" != "ok" ]]; then
     echo "FAIL[$label]: payload.identity.register.status='$reg_status' reason='$reg_reason'" >&2
-    echo "Hint: provide TENANT_ID=tnt:<uuid> or set ORCH_DEFAULT_TENANT_ID in sy-orchestrator environment." >&2
+    if [[ "$reg_code" == "INVALID_TENANT" ]]; then
+      echo "Hint: TENANT_ID does not exist in identity primary. Use a fresh tenant_id from TNT_CREATE (for example TENANT_ID from scripts/identity_merge_alias_e2e.sh output)." >&2
+    else
+      echo "Hint: provide TENANT_ID=tnt:<uuid> or set ORCH_DEFAULT_TENANT_ID in sy-orchestrator environment." >&2
+    fi
     cat "$file" >&2 || true
     exit 1
   fi

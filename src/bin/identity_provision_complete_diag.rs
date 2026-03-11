@@ -48,6 +48,24 @@ fn env_opt(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .and_then(|v| match v.as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+fn hive_from_node_name(name: &str) -> Option<&str> {
+    name.rsplit_once('@')
+        .map(|(_, hive)| hive.trim())
+        .filter(|hive| !hive.is_empty())
+}
+
 fn load_hive_id(config_dir: &PathBuf) -> Result<String, DiagError> {
     let data = std::fs::read_to_string(config_dir.join("hive.yaml"))?;
     let hive: HiveFile = serde_yaml::from_str(&data)?;
@@ -380,7 +398,19 @@ async fn main() -> Result<(), DiagError> {
         "IDENTITY_PROVISION_COMPLETE_TARGET",
         &format!("SY.identity@{}", hive_id),
     );
+    let allow_remote_target = env_bool("IDENTITY_PROVISION_COMPLETE_ALLOW_REMOTE_TARGET", false);
     let fallback_target = env_opt("IDENTITY_PROVISION_COMPLETE_FALLBACK_TARGET");
+    if !allow_remote_target {
+        if let Some(target_hive) = hive_from_node_name(&target) {
+            if target_hive != hive_id {
+                return Err(format!(
+                    "IDENTITY_PROVISION_COMPLETE_TARGET={} points to remote hive '{}', but this E2E validates local routing probe to AI.frontdesk@{}. Use local target or set IDENTITY_PROVISION_COMPLETE_ALLOW_REMOTE_TARGET=true",
+                    target, target_hive, hive_id
+                )
+                .into());
+            }
+        }
+    }
 
     let channel_type = env_or(
         "IDENTITY_PROVISION_COMPLETE_CHANNEL_TYPE",

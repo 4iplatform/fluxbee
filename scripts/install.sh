@@ -12,15 +12,26 @@ SEED_RUNTIME_FIXTURE="${SEED_RUNTIME_FIXTURE:-1}"
 RUNTIME_FIXTURE_NAME="${RUNTIME_FIXTURE_NAME:-wf.orch.diag}"
 RUNTIME_FIXTURE_VERSION="${RUNTIME_FIXTURE_VERSION:-0.0.1}"
 RUNTIME_FIXTURE_SLEEP_SECS="${RUNTIME_FIXTURE_SLEEP_SECS:-3600}"
+BIN_DIR="${BIN_DIR:-$ROOT_DIR/target/release}"
 
 if [[ "${SKIP_BUILD:-}" != "1" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
-    echo "Error: cargo not found. Set SKIP_BUILD=1 if binaries are already built." >&2
-    exit 1
+    # Common case: running with plain sudo loses user PATH (cargo unavailable as root).
+    # If release binaries already exist, continue without rebuilding.
+    if [[ -x "$BIN_DIR/json-router" && -x "$BIN_DIR/sy_orchestrator" && -x "$BIN_DIR/sy_identity" ]]; then
+      echo "Warning: cargo not found; using prebuilt binaries from $BIN_DIR (SKIP_BUILD=1)."
+      SKIP_BUILD=1
+    else
+      echo "Error: cargo not found and required prebuilt binaries are missing in $BIN_DIR." >&2
+      echo "Hint: run without sudo (the script already uses sudo internally), or install cargo in root PATH, or set SKIP_BUILD=1 with existing binaries." >&2
+      exit 1
+    fi
   fi
 
-  echo "Building Rust binaries..."
-  cargo build --release --bins
+  if [[ "${SKIP_BUILD:-}" != "1" ]]; then
+    echo "Building Rust binaries..."
+    cargo build --release --bins
+  fi
 fi
 
 if [[ -d "$ROOT_DIR/sy-opa-rules" ]]; then
@@ -72,7 +83,6 @@ if [[ -f "$MOTHERBEE_KEY_PUB" ]]; then
   sudo chmod 644 "$MOTHERBEE_KEY_PUB"
 fi
 
-BIN_DIR="${BIN_DIR:-$ROOT_DIR/target/release}"
 if [[ "${SKIP_BUILD:-}" == "1" ]]; then
   echo "SKIP_BUILD=1: installing only binaries from $BIN_DIR" >&2
 fi
