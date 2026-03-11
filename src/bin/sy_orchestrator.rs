@@ -6778,33 +6778,25 @@ fn remote_service_journal_tail(
     };
     let service_q = shell_single_quote(&service_unit);
     let cmd = format!(
-        "journalctl -u '{service}' --no-pager -n {lines} -o short-precise 2>/dev/null || true",
+        "bash -lc \"\
+echo '--- journalctl ---'; \
+journalctl -u '{service}' --no-pager -n {lines} -o short-precise 2>/dev/null || true; \
+echo '--- systemctl status ---'; \
+systemctl --no-pager -l status '{service}' 2>/dev/null | tail -n {lines} || true; \
+echo '--- syslog tail ---'; \
+tail -n {lines} /var/log/syslog 2>/dev/null | grep -E '{service_raw}|sy_orchestrator' || true\"",
         service = service_q,
+        service_raw = service.replace('\'', "'\"'\"'"),
         lines = lines
     );
     match ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER) {
         Ok(out) => {
             let trimmed = out.trim();
             if trimmed.is_empty() {
-                let fallback_cmd = format!(
-                    "systemctl --no-pager -l status '{service}' 2>/dev/null | tail -n {lines} || true",
-                    service = service_q,
-                    lines = lines
-                );
-                let fallback = ssh_with_key_output(
-                    address,
-                    key_path,
-                    &sudo_wrap(&fallback_cmd),
-                    BOOTSTRAP_SSH_USER,
-                )
-                .unwrap_or_default();
-                let fallback = fallback.trim();
-                if fallback.is_empty() {
-                    return None;
-                }
-                return Some(truncate_for_error(fallback, 1600));
+                None
+            } else {
+                Some(truncate_for_error(trimmed, 6000))
             }
-            Some(truncate_for_error(trimmed, 1600))
         }
         Err(_) => None,
     }
@@ -7790,7 +7782,7 @@ async fn add_hive_flow(
         "sy-orchestrator",
         CORE_SERVICE_HEALTH_TIMEOUT_SECS,
     ) {
-        let journal_tail = remote_service_journal_tail(address, &key_path, "sy-orchestrator", 40);
+        let journal_tail = remote_service_journal_tail(address, &key_path, "sy-orchestrator", 120);
         return serde_json::json!({
             "status": "error",
             "error_code": "SERVICE_FAILED",
@@ -7863,7 +7855,7 @@ async fn add_hive_flow(
     if !orchestrator_connected {
         let detail = orchestrator_wait_error
             .unwrap_or_else(|| "worker orchestrator not observed in LSA".to_string());
-        let journal_tail = remote_service_journal_tail(address, &key_path, "sy-orchestrator", 40);
+        let journal_tail = remote_service_journal_tail(address, &key_path, "sy-orchestrator", 120);
         return serde_json::json!({
             "status": "error",
             "error_code": "WORKER_ORCHESTRATOR_TIMEOUT",
