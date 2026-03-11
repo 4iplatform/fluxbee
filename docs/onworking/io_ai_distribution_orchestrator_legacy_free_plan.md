@@ -1,61 +1,61 @@
-﻿# Legacy-Free para IO/IA (condiciones y plan de implementación)
+﻿# IO/IA Runtime Distribution on Orchestrator v2 (Current Plan)
 
-Estado: propuesta operativa  
-Fecha: 2026-03-05
+Estado: vigente sobre plataforma v2  
+Fecha: 2026-03-10
 
-## 1. Objetivo
+## 1. Alcance
 
-Definir qué tiene que cumplirse para declarar el flujo de nodos `IO.*` y `AI.*` como **legacy-free** en distribución/orquestación, y cómo implementarlo sin ambigüedad.
+Este documento cubre únicamente lo pendiente para nodos `IO.*` y `AI.*` en el modelo ya canónico de plataforma:
+- distribución vía `dist/`;
+- rollout por `SYSTEM_UPDATE`;
+- ejecución por `SPAWN_NODE`.
 
-"Legacy-free" aquí significa:
-- sin dependencia operativa de `RUNTIME_UPDATE`;
-- sin dependencia operativa de rutas legacy (`/var/lib/fluxbee/runtimes`, `/var/lib/fluxbee/core`, `/var/lib/fluxbee/vendor`);
-- control-plane canónico por `SYSTEM_UPDATE` + `POST /hives/{id}/update`.
+No redefine orchestrator v2 ni control-plane general.
 
-## 2. Criterios de salida (Definition of Done)
+## 2. Supuesto de base (ya cerrado)
 
-Se considera legacy-free cuando se cumplan todos:
+Se asume resuelto a nivel plataforma:
+- contrato remoto de update: `SYSTEM_UPDATE` / `SYSTEM_UPDATE_RESPONSE`;
+- API admin canónica: `POST /hives/{id}/update`;
+- source of truth de software: `/var/lib/fluxbee/dist/...`.
 
-1. Protocolo canónico único
-- `SYSTEM_UPDATE` / `SYSTEM_UPDATE_RESPONSE` es el único contrato activo de update.
-- `RUNTIME_UPDATE` queda removido del runtime de orchestrator (no solo "obsoleto en docs").
+Referencias:
+- `docs/02-protocolo.md`
+- `docs/07-operaciones.md`
+- `docs/14-runtime-rollout-motherbee.md`
+- `docs/onworking/sy_orchestrator_v2_tasks.md`
 
-2. Path canónico único
-- Fuente de verdad de software: `/var/lib/fluxbee/dist/...`.
-- Sin fallback de lectura/escritura a `/var/lib/fluxbee/runtimes`, `/core`, `/vendor`.
+## 3. Qué falta para IO/IA
 
-3. Admin API canónica
-- `POST /hives/{id}/update` usado para rollout remoto.
-- Código y tests sin rutas de update alternas legacy.
+## 3.1 Publicación canónica de runtimes IO/IA
 
-4. Tooling sin legacy
-- Scripts E2E/diagnóstico no usan `ORCH_SEND_RUNTIME_UPDATE` ni esperan `RUNTIME_UPDATE_RESPONSE`.
-- Install/publish scripts de IO/IA publican en `dist/runtimes` + `manifest` canónico.
+Hoy `scripts/install-io.sh` y `scripts/install-ia.sh` instalan localmente (`/usr/bin` + systemd), pero no publican runtimes versionados en `dist/runtimes`.
 
-5. Ejecución de nodos IO/IA por runtime canónico
-- `SPAWN_NODE` resuelve runtime/version contra `dist/runtimes/manifest.json`.
-- Start script requerido en `dist/runtimes/<runtime>/<version>/bin/start.sh`.
+Falta:
+- publicar binarios IO/IA en:
+  - `/var/lib/fluxbee/dist/runtimes/<runtime>/<version>/bin/...`
+- garantizar `bin/start.sh` por runtime-version;
+- actualizar `dist/runtimes/manifest.json` de forma atómica.
 
-6. Evidencia E2E
-- Update runtime/core/vendor por `SYSTEM_UPDATE` validado en al menos 1 worker.
-- Spawn/kill IO/IA funcionando sin paths legacy.
-- Rollback verificado sin fallback legacy.
+## 3.2 Convención de runtime names para IO/IA
 
-## 3. Alcance específico IO/IA
+Definir naming estable para manifest/runtime key (ejemplos):
+- `AI.chat`
+- `IO.slack`
+- `IO.sim`
 
-Incluye:
-- empaquetado/publicación de runtime de `io-slack`, `io-sim`, `ai-node-runner`;
-- actualización de manifest de runtimes;
-- rollout por hive con `SYSTEM_UPDATE`;
-- ejecución remota vía orchestrator local del worker.
+Regla:
+- el `runtime` usado en `SPAWN_NODE` debe mapear 1:1 con la key en `manifest.runtimes`.
 
-No incluye:
-- cambios funcionales de negocio de IO/IA (mensajería, prompts, etc.);
-- rediseño de payloads/protocolo de aplicación.
+## 3.3 Estrategia de configuración de runtime
 
-## 4. Contrato canónico de runtime para IO/IA
+Cerrar una sola estrategia (recomendado: externa, operator-managed):
+- runtime trae binario + `start.sh`;
+- configuración por instancia queda fuera del runtime (env/config gestionada por orchestrator/admin).
 
-## 4.1 Layout esperado en dist
+## 4. Contrato de runtime IO/IA en dist
+
+## 4.1 Layout mínimo
 
 ```text
 /var/lib/fluxbee/dist/runtimes/
@@ -65,8 +65,6 @@ No incluye:
       bin/
         ai-node-runner
         start.sh
-      config/
-        ai_chat.yaml (opcional, según estrategia)
   IO.slack/
     0.1.0/
       bin/
@@ -79,26 +77,17 @@ No incluye:
         start.sh
 ```
 
-## 4.2 `manifest.json` mínimo
+## 4.2 Manifest mínimo
 
 ```json
 {
   "schema_version": 1,
-  "version": 1741180000000,
-  "updated_at": "2026-03-05T15:00:00Z",
+  "version": 1741640000000,
+  "updated_at": "2026-03-10T12:00:00Z",
   "runtimes": {
-    "AI.chat": {
-      "current": "0.1.0",
-      "available": ["0.1.0"]
-    },
-    "IO.slack": {
-      "current": "0.1.0",
-      "available": ["0.1.0"]
-    },
-    "IO.sim": {
-      "current": "0.1.0",
-      "available": ["0.1.0"]
-    }
+    "AI.chat": { "current": "0.1.0", "available": ["0.1.0"] },
+    "IO.slack": { "current": "0.1.0", "available": ["0.1.0"] },
+    "IO.sim": { "current": "0.1.0", "available": ["0.1.0"] }
   },
   "hash": "sha256:..."
 }
@@ -106,115 +95,63 @@ No incluye:
 
 ## 4.3 Start script
 
-Cada runtime-version debe tener `bin/start.sh` ejecutable, con contrato estable:
-- lee variables de entorno estándar de Fluxbee;
-- ejecuta el binario correcto con su config;
-- `exit != 0` en error de precondiciones.
+Cada runtime-version debe incluir `bin/start.sh` ejecutable.
 
-## 5. Estado actual vs target (resumen)
+Debe:
+- validar precondiciones mínimas;
+- ejecutar el binario correspondiente del runtime;
+- retornar `exit != 0` en error de arranque.
 
-Estado actual (observado):
-- existe `SYSTEM_UPDATE`, pero también compat de `RUNTIME_UPDATE`;
-- existe prioridad de `dist`, pero con fallback legacy;
-- scripts IO/IA (`install-io.sh`, `install-ia.sh`) instalan localmente en `/usr/bin` y units, no publican runtime canónico en `dist/runtimes`.
+## 5. Pipeline operativo IO/IA (canónico)
 
-Target legacy-free:
-- quitar compat/fallback;
-- introducir publicación canónica IO/IA a `dist/runtimes`;
-- usar `SYSTEM_UPDATE` para rollout por hive.
+1. Publicar runtime en motherbee (`dist/runtimes`).
+2. Actualizar `dist/runtimes/manifest.json`.
+3. Esperar/verificar convergencia `dist` al hive destino.
+4. Ejecutar `POST /hives/{id}/update` (`category=runtime`, `manifest_version`, `manifest_hash`).
+5. Ejecutar `POST /hives/{id}/nodes` (`SPAWN_NODE`) para levantar instancia.
+6. Verificar estado con `GET /versions` y `GET /deployments`.
 
-## 6. Plan de implementación
+## 6. Implementación recomendada en este repo
 
-## Fase A - Publicación canónica de runtimes IO/IA
+## Fase A - Script de publish runtime
 
-1. Crear script de publicación (nuevo)
-- `scripts/publish-runtime.sh` (genérico) o `publish-ia.sh` + `publish-io.sh`.
+Implementado en este repo:
+- `scripts/publish-runtime.sh`
+- `scripts/publish-ia-runtime.sh`
+- `scripts/publish-io-runtime.sh`
 
-2. Responsabilidades del script
-- construir/copiar binarios a staging;
-- escribir `bin/start.sh`;
-- mover a `/var/lib/fluxbee/dist/runtimes/<runtime>/<version>/`;
-- actualizar merge de `/var/lib/fluxbee/dist/runtimes/manifest.json`;
-- recalcular `hash` y `version` monotónica;
-- validar estructura final.
+Responsabilidades:
+- entradas: `runtime`, `version`, `binary_path`, `--set-current`;
+- staging + validación;
+- copia a `dist/runtimes/<runtime>/<version>/bin/`;
+- generación/validación de `start.sh`;
+- merge atómico de `dist/runtimes/manifest.json`.
 
-3. Política de activación
-- opción `--set-current` para promover versión al `current`;
-- sin `--set-current`, solo agrega a `available`.
+## Fase B - Wrappers por dominio
 
-## Fase B - Rollout por orchestrator
+Opcionalmente agregar:
+- `scripts/publish-ia-runtime.sh`
+- `scripts/publish-io-runtime.sh`
 
-1. Trigger desde admin
-- `POST /hives/{id}/update` con:
-  - `category=runtime`
-  - `manifest_version`
-  - `manifest_hash`
+para encapsular convenciones de nombre/runtime y binarios por crate.
 
-2. Orchestrator worker
-- valida manifest local dist;
-- aplica update local;
-- responde `SYSTEM_UPDATE_RESPONSE` con detalle.
+## Fase C - Validación E2E
 
-3. Verificación
-- `GET /versions?hive=<id>`
-- `GET /deployments?hive=<id>`
+Automatizar E2E de IO/IA sobre pipeline canónico:
+- publish -> sync -> `SYSTEM_UPDATE` -> `SPAWN_NODE` -> `KILL_NODE`.
 
-## Fase C - Migración de ejecución de nodos
+## 7. Checklist
 
-1. Mantener instalación local actual solo como modo dev/local
-- `install-io.sh` / `install-ia.sh` quedan para entorno de desarrollo o nodo único.
+- [ ] Script de publish canónico para runtimes IO/IA.
+  - Estado: implementado (`scripts/publish-runtime.sh`, `scripts/publish-ia-runtime.sh`, `scripts/publish-io-runtime.sh`).
+- [ ] Publicación real de `AI.chat`, `IO.slack`, `IO.sim` en `dist/runtimes`.
+- [ ] `start.sh` presente y válido por runtime-version.
+- [ ] Manifest runtime actualizado de forma atómica.
+- [ ] Rollout por `POST /hives/{id}/update` validado.
+- [ ] Spawn/Kill de IO/IA validado por API en worker.
 
-2. Producción
-- ejecución por `SPAWN_NODE` + runtime en dist.
+## 8. Respuesta directa de dependencia
 
-3. Config de nodos
-- definir estrategia única:
-  - configs embebidas por versión de runtime, o
-  - configs externas gestionadas por orchestrator (recomendado).
-
-## Fase D - Corte de legacy
-
-1. Código
-- remover handlers/paths de `RUNTIME_UPDATE`;
-- remover fallback a `/var/lib/fluxbee/runtimes|core|vendor`.
-
-2. Scripts/tests
-- eliminar variables y pruebas `ORCH_SEND_RUNTIME_UPDATE`;
-- convertir E2E a `SYSTEM_UPDATE`.
-
-3. Documentación
-- actualizar docs v1.16 remanentes;
-- declarar deprecación efectiva (fecha de corte).
-
-## 7. Checklist operativo (ejecutable)
-
-- [ ] Script de publish runtime implementado para IO/IA.
-- [ ] Publicación de `AI.chat`, `IO.slack`, `IO.sim` en `dist/runtimes`.
-- [ ] Manifest runtime canónico actualizado sin errores.
-- [ ] Rollout de runtime por `POST /hives/{id}/update` validado.
-- [ ] Spawn remoto de IO/IA usando start script en dist validado.
-- [ ] Remoción de compat `RUNTIME_UPDATE` completada.
-- [ ] Remoción de fallback legacy paths completada.
-- [ ] E2E final (runtime/core/vendor + spawn/kill IO/IA) en verde.
-
-## 8. Riesgos y mitigaciones
-
-1. Riesgo: romper workers no migrados
-- Mitigación: ventana de transición con feature flag de compat y fecha de corte.
-
-2. Riesgo: publish inconsistente de manifest
-- Mitigación: operación atómica (escribir `.next`, validar, renombrar).
-
-3. Riesgo: runtime publicado sin start script válido
-- Mitigación: validación estricta pre-publish.
-
-4. Riesgo: divergencia docs/código
-- Mitigación: PRs acoplados (código + doc + E2E obligatorio).
-
-## 9. Recomendación práctica para este repo
-
-Secuencia mínima recomendada:
-1. Implementar script de publish IO/IA a `dist/runtimes`.
-2. Usarlo en un entorno de prueba con `SYSTEM_UPDATE` runtime.
-3. Migrar scripts E2E que hoy usan `RUNTIME_UPDATE`.
-4. Remover compat/fallback legacy recién cuando los E2E estén estables.
+Para deploy de IO/IA, con el estado actual de plataforma:
+- no dependemos de cerrar más cambios estructurales en orchestrator v2 para el flujo canónico;
+- sí dependemos de completar cambios internos de IO/IA (publicación de runtime, manifest y start scripts).
