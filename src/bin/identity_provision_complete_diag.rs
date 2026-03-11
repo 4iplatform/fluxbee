@@ -286,6 +286,30 @@ fn read_identity_ilk_state(
     Ok(None)
 }
 
+async fn wait_identity_ilk_status(
+    hive_id: &str,
+    ilk_id: &str,
+    expected_status: &str,
+    timeout_ms: u64,
+) -> Result<(), DiagError> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if let Some((_tenant_id, status)) = read_identity_ilk_state(hive_id, ilk_id)? {
+            if status == expected_status {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "identity SHM did not converge for ilk={} status={} within {}ms",
+                ilk_id, expected_status, timeout_ms
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
 async fn wait_identity_ilk_state(
     hive_id: &str,
     ilk_id: &str,
@@ -501,6 +525,7 @@ async fn main() -> Result<(), DiagError> {
         .ok_or_else(|| "ILK_PROVISION missing ilk_id".to_string())?
         .to_string();
     let _ = parse_prefixed_uuid_bytes(&ilk_id, "ilk")?;
+    wait_identity_ilk_status(&hive_id, &ilk_id, "temporary", timeout_ms).await?;
 
     let probe_trace_id = send_resolve_probe(&io_sender, &ilk_id, &test_id).await?;
     let probe_msg =
