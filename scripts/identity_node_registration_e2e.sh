@@ -32,6 +32,21 @@ require_cmd() {
 require_cmd curl
 require_cmd python3
 
+validate_tenant_id() {
+  local tenant_id="$1"
+  if [[ -z "$tenant_id" ]]; then
+    return 0
+  fi
+  if [[ "$tenant_id" == *"<"* || "$tenant_id" == *">"* ]]; then
+    echo "FAIL: TENANT_ID looks like a placeholder ('$tenant_id'). Use a real value: tnt:<uuid-v4>." >&2
+    exit 1
+  fi
+  if [[ ! "$tenant_id" =~ ^tnt:[0-9a-fA-F-]{36}$ ]]; then
+    echo "FAIL: invalid TENANT_ID='$tenant_id' (expected format: tnt:<uuid-v4>)." >&2
+    exit 1
+  fi
+}
+
 json_get_file() {
   local path="$1"
   local file="$2"
@@ -150,6 +165,7 @@ check_register_contract() {
 }
 
 echo "IDENTITY node registration E2E: BASE=$BASE HIVE_ID=$HIVE_ID NODE_NAME=$NODE_NAME RUNTIME=$RUNTIME REQUIRE_IDENTITY_REGISTER_OK=$REQUIRE_IDENTITY_REGISTER_OK"
+validate_tenant_id "$TENANT_ID"
 
 echo "Step 1/6: validate runtime exists in /hives/$HIVE_ID/versions"
 versions_http="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$versions_body")"
