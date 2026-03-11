@@ -18,9 +18,9 @@ Spec fuente: `docs/10-identity-v2.md`
 - [x] Validación de IDs prefijados (`ilk:`, `ich:`, `tnt:`) en frontera protocolo.
 - [x] Allowlist autoritativo por acción (resolviendo `routing.src` UUID -> node name vía SHM/LSA).
 - [x] Bootstrap de schema PostgreSQL en `SY.identity` primary (motherbee), con tablas `identity_*`.
-- [ ] Persistencia real en PostgreSQL (fase B pendiente).
-- [ ] SHM `jsr-identity-*` propia (fase C pendiente).
-- [ ] Sync primary/replica por socket identity (fase D pendiente).
+- [x] Persistencia real en PostgreSQL (tenants + ILK/ICH/aliases en primary; validar convergencia/restart en G5).
+- [x] SHM `jsr-identity-*` propia (fase C implementada).
+- [x] Sync primary/replica por socket identity (fase D implementada; métricas de convergencia en D4 pendientes).
 
 ## 1) Reglas de trabajo
 
@@ -80,9 +80,14 @@ Salida:
   - provisión en `default_tenant`
   - reasignación de tenant solo en `registration_status=temporary`
 - [x] B4. Implementar GC de alias expirados + soft-delete de ILK temporal mergeado.
+- [x] B5. Persistir mutaciones de ILK/ICH/alias en PostgreSQL (primary):
+  - `ILK_PROVISION/REGISTER/UPDATE` -> `identity_ilks`
+  - alta/merge de canales -> `identity_ichs`
+  - merge alias -> `identity_ilk_aliases`
+- [x] B6. Cargar `identity_ilks`, `identity_ichs` e `identity_ilk_aliases` desde PostgreSQL al bootstrap del primary.
 
 Salida:
-- persistencia consistente con unicidad y política de merge.
+- persistencia de identity en DB conectada al flujo runtime (sujeta a validación E2E de réplica/restart en G5).
 
 ## 5) Fase C - SHM identity v2 (fijo + seqlock)
 
@@ -134,9 +139,9 @@ Salida:
 - [ ] E2. Frontdesk:
   - completar registro vía `ILK_REGISTER` sobre ILK temporal
   - canal extra por `ILK_ADD_CHANNEL`
-- [x] E3. Orchestrator:
+- [ ] E3. Orchestrator:
   - [x] registro de nodos por `ILK_REGISTER` en `run_node` (pre-spawn):
-    - usa relay system message hacia `SY.identity@<primary_hive>` (`state.hive_id`, motherbee)
+    - usa relay system message hacia `SY.identity@<primary_hive>` (resuelto por `identity_primary_hive_id`)
     - en `SPAWN_NODE` remoto, propaga `identity_primary_hive_id` al worker para evitar resolver contra `SY.identity@<worker_hive>`
     - persiste `node_name -> ilk_id` en estado local orchestrator para reusar ILK en reinicios
     - modo estricto opcional por env `ORCH_IDENTITY_REGISTER_REQUIRED=true`
@@ -145,6 +150,9 @@ Salida:
     - target fijo `SY.identity@<primary_hive>` (misma regla que `ILK_REGISTER`)
     - soporta `add_roles`, `remove_roles`, `add_capabilities`, `remove_capabilities`, `add_channels`, `identity_change_reason`
     - falla el spawn con `IDENTITY_UPDATE_FAILED` si se pidió delta y identity devuelve error
+  - [ ] hardening pendiente para alinear spec:
+    - eliminar `node_name -> ilk_id` local como fuente de verdad primaria,
+    - resolver/reusar ILK desde `SY.identity` por `node_name` antes de crear UUID nuevo.
 - [x] E4. Merge temporal:
   - [x] crear alias `old->canonical` (`SY.identity` -> `ILK_ADD_CHANNEL` con `merge_from_ilk_id`)
   - [x] mantener alias por TTL (`merge_alias_ttl_secs`)
@@ -195,6 +203,7 @@ Salida:
   - Avance: script dedicado `scripts/identity_node_registration_e2e.sh`
     - valida `payload.identity.register.status=ok`
     - valida persistencia de `ilk_id` entre restart del mismo `node_name`
+  - Nota: hoy pasa en verde, pero depende del map local del orchestrator (E3 hardening pendiente).
 - [ ] G5. E2E replica:
   - full sync en worker nuevo + deltas runtime.
 - [ ] G6. Pruebas negativas:

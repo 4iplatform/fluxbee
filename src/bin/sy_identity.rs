@@ -240,7 +240,7 @@ struct AliasRecord {
     expires_at_ms: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct IdentityStore {
     tenants: HashMap<String, TenantRecord>,
     ilks: HashMap<String, IlkRecord>,
@@ -856,87 +856,262 @@ impl IdentityRuntime {
         let payload = match action {
             MSG_ILK_PROVISION => {
                 match serde_json::from_value::<IlkProvisionRequest>(msg.payload.clone()) {
-                    Ok(req) => match self.store.provision_temporary_ilk(req) {
-                        Ok(ok) => {
-                            if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
-                                if let Some(ilk) = self.store.ilks.get(ilk_id) {
-                                    deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
-                                        ilk: ilk.clone(),
-                                    }));
+                    Ok(req) => {
+                        let snapshot = if self.is_primary && self.db_url.is_some() {
+                            Some(self.store.clone())
+                        } else {
+                            None
+                        };
+                        match self.store.provision_temporary_ilk(req) {
+                            Ok(ok) => {
+                                if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
+                                    if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
+                                        if self.is_primary {
+                                            if let Some(database_url) = self.db_url.as_deref() {
+                                                if let Err(err) =
+                                                    persist_ilk_state_in_db(database_url, &ilk, None)
+                                                        .await
+                                                {
+                                                    if let Some(snapshot) = snapshot {
+                                                        self.store = snapshot;
+                                                    }
+                                                    error_payload(
+                                                        "DB_WRITE_FAILED",
+                                                        &format!(
+                                                            "failed to persist provisioned ilk: {}",
+                                                            err
+                                                        ),
+                                                    )
+                                                } else {
+                                                    deltas.push(delta_envelope(
+                                                        IdentityDelta::IlkUpsert { ilk },
+                                                    ));
+                                                    ok
+                                                }
+                                            } else {
+                                                deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                                    ilk,
+                                                }));
+                                                ok
+                                            }
+                                        } else {
+                                            deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                                ilk,
+                                            }));
+                                            ok
+                                        }
+                                    } else {
+                                        ok
+                                    }
+                                } else {
+                                    ok
                                 }
                             }
-                            ok
+                            Err(code) => error_payload(&code, "failed to provision ilk"),
                         }
-                        Err(code) => error_payload(&code, "failed to provision ilk"),
-                    },
+                    }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
             }
             MSG_ILK_REGISTER => {
                 match serde_json::from_value::<IlkRegisterRequest>(msg.payload.clone()) {
-                    Ok(req) => match self.store.register_ilk(req) {
-                        Ok(ok) => {
-                            if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
-                                if let Some(ilk) = self.store.ilks.get(ilk_id) {
-                                    deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
-                                        ilk: ilk.clone(),
-                                    }));
+                    Ok(req) => {
+                        let snapshot = if self.is_primary && self.db_url.is_some() {
+                            Some(self.store.clone())
+                        } else {
+                            None
+                        };
+                        match self.store.register_ilk(req) {
+                            Ok(ok) => {
+                                if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
+                                    if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
+                                        if self.is_primary {
+                                            if let Some(database_url) = self.db_url.as_deref() {
+                                                if let Err(err) =
+                                                    persist_ilk_state_in_db(database_url, &ilk, None)
+                                                        .await
+                                                {
+                                                    if let Some(snapshot) = snapshot {
+                                                        self.store = snapshot;
+                                                    }
+                                                    error_payload(
+                                                        "DB_WRITE_FAILED",
+                                                        &format!(
+                                                            "failed to persist registered ilk: {}",
+                                                            err
+                                                        ),
+                                                    )
+                                                } else {
+                                                    deltas.push(delta_envelope(
+                                                        IdentityDelta::IlkUpsert { ilk },
+                                                    ));
+                                                    ok
+                                                }
+                                            } else {
+                                                deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                                    ilk,
+                                                }));
+                                                ok
+                                            }
+                                        } else {
+                                            deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                                ilk,
+                                            }));
+                                            ok
+                                        }
+                                    } else {
+                                        ok
+                                    }
+                                } else {
+                                    ok
                                 }
                             }
-                            ok
+                            Err(code) => error_payload(&code, "failed to register ilk"),
                         }
-                        Err(code) => error_payload(&code, "failed to register ilk"),
-                    },
+                    }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
             }
             MSG_ILK_ADD_CHANNEL => {
                 match serde_json::from_value::<IlkAddChannelRequest>(msg.payload.clone()) {
-                    Ok(req) => match self
-                        .store
-                        .add_channel(req.clone(), self.merge_alias_ttl_secs)
-                    {
-                        Ok(ok) => {
-                            if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
-                                if let Some(ilk) = self.store.ilks.get(ilk_id) {
-                                    deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
-                                        ilk: ilk.clone(),
-                                    }));
+                    Ok(req) => {
+                        let snapshot = if self.is_primary && self.db_url.is_some() {
+                            Some(self.store.clone())
+                        } else {
+                            None
+                        };
+                        match self
+                            .store
+                            .add_channel(req.clone(), self.merge_alias_ttl_secs)
+                        {
+                            Ok(ok) => {
+                                let alias_delta = req.merge_from_ilk_id.as_ref().and_then(|old_ilk_id| {
+                                    self.store.aliases.get(old_ilk_id).map(|alias| AliasSnapshotRecord {
+                                        old_ilk_id: old_ilk_id.clone(),
+                                        canonical_ilk_id: alias.canonical_ilk_id.clone(),
+                                        expires_at_ms: alias.expires_at_ms,
+                                    })
+                                });
+                                if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
+                                    if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
+                                        if self.is_primary {
+                                            if let Some(database_url) = self.db_url.as_deref() {
+                                                if let Err(err) = persist_ilk_state_in_db(
+                                                    database_url,
+                                                    &ilk,
+                                                    alias_delta.as_ref(),
+                                                )
+                                                .await
+                                                {
+                                                    if let Some(snapshot) = snapshot {
+                                                        self.store = snapshot;
+                                                    }
+                                                    error_payload(
+                                                        "DB_WRITE_FAILED",
+                                                        &format!(
+                                                            "failed to persist channel/merge update: {}",
+                                                            err
+                                                        ),
+                                                    )
+                                                } else {
+                                                    deltas.push(delta_envelope(
+                                                        IdentityDelta::IlkUpsert { ilk },
+                                                    ));
+                                                    if let Some(alias) = alias_delta {
+                                                        deltas.push(delta_envelope(
+                                                            IdentityDelta::AliasUpsert { alias },
+                                                        ));
+                                                    }
+                                                    ok
+                                                }
+                                            } else {
+                                                deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                                    ilk,
+                                                }));
+                                                if let Some(alias) = alias_delta {
+                                                    deltas.push(delta_envelope(
+                                                        IdentityDelta::AliasUpsert { alias },
+                                                    ));
+                                                }
+                                                ok
+                                            }
+                                        } else {
+                                            deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                                ilk,
+                                            }));
+                                            if let Some(alias) = alias_delta {
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::AliasUpsert { alias },
+                                                ));
+                                            }
+                                            ok
+                                        }
+                                    } else {
+                                        ok
+                                    }
+                                } else {
+                                    ok
                                 }
                             }
-                            if let Some(old_ilk_id) = req.merge_from_ilk_id {
-                                if let Some(alias) = self.store.aliases.get(&old_ilk_id) {
-                                    deltas.push(delta_envelope(IdentityDelta::AliasUpsert {
-                                        alias: AliasSnapshotRecord {
-                                            old_ilk_id,
-                                            canonical_ilk_id: alias.canonical_ilk_id.clone(),
-                                            expires_at_ms: alias.expires_at_ms,
-                                        },
-                                    }));
-                                }
-                            }
-                            ok
+                            Err(code) => error_payload(&code, "failed to add channel"),
                         }
-                        Err(code) => error_payload(&code, "failed to add channel"),
-                    },
+                    }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
             }
             MSG_ILK_UPDATE => match serde_json::from_value::<IlkUpdateRequest>(msg.payload.clone())
             {
-                Ok(req) => match self.store.update_ilk(req) {
-                    Ok(ok) => {
-                        if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
-                            if let Some(ilk) = self.store.ilks.get(ilk_id) {
-                                deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
-                                    ilk: ilk.clone(),
-                                }));
+                Ok(req) => {
+                    let snapshot = if self.is_primary && self.db_url.is_some() {
+                        Some(self.store.clone())
+                    } else {
+                        None
+                    };
+                    match self.store.update_ilk(req) {
+                        Ok(ok) => {
+                            if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
+                                if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
+                                    if self.is_primary {
+                                        if let Some(database_url) = self.db_url.as_deref() {
+                                            if let Err(err) =
+                                                persist_ilk_state_in_db(database_url, &ilk, None)
+                                                    .await
+                                            {
+                                                if let Some(snapshot) = snapshot {
+                                                    self.store = snapshot;
+                                                }
+                                                error_payload(
+                                                    "DB_WRITE_FAILED",
+                                                    &format!("failed to persist ilk update: {}", err),
+                                                )
+                                            } else {
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::IlkUpsert { ilk },
+                                                ));
+                                                ok
+                                            }
+                                        } else {
+                                            deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                                ilk,
+                                            }));
+                                            ok
+                                        }
+                                    } else {
+                                        deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                            ilk,
+                                        }));
+                                        ok
+                                    }
+                                } else {
+                                    ok
+                                }
+                            } else {
+                                ok
                             }
                         }
-                        ok
+                        Err(code) => error_payload(&code, "failed to update ilk"),
                     }
-                    Err(code) => error_payload(&code, "failed to update ilk"),
-                },
+                }
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
             },
             MSG_TNT_CREATE => match serde_json::from_value::<TntCreateRequest>(msg.payload.clone())
@@ -981,13 +1156,22 @@ impl IdentityRuntime {
             },
             MSG_TNT_APPROVE => {
                 match serde_json::from_value::<TntApproveRequest>(msg.payload.clone()) {
-                    Ok(req) => match self.store.approve_tenant(req) {
+                    Ok(req) => {
+                        let snapshot = if self.is_primary && self.db_url.is_some() {
+                            Some(self.store.clone())
+                        } else {
+                            None
+                        };
+                        match self.store.approve_tenant(req) {
                         Ok(ok) => {
                             if let Some(tenant_id) = ok.get("tenant_id").and_then(Value::as_str) {
                                 if let Some(tenant) = self.store.tenants.get(tenant_id).cloned() {
                                     if self.is_primary {
                                         if let Some(database_url) = self.db_url.as_deref() {
                                             if let Err(err) = upsert_tenant_in_db(database_url, &tenant).await {
+                                                if let Some(snapshot) = snapshot {
+                                                    self.store = snapshot;
+                                                }
                                                 error_payload("DB_WRITE_FAILED", &format!("failed to persist tenant approval: {}", err))
                                             } else {
                                                 deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
@@ -1015,7 +1199,8 @@ impl IdentityRuntime {
                             }
                         }
                         Err(code) => error_payload(&code, "failed to approve tenant"),
-                    },
+                    }
+                    }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
             }
@@ -1204,8 +1389,8 @@ async fn main() -> Result<(), IdentityError> {
     let mut runtime = IdentityRuntime::new(&hive, state_dir.clone(), is_primary, db_url);
     if is_primary {
         if let Some(database_url) = runtime.db_url.clone() {
-            match load_tenants_from_db(&database_url).await {
-                Ok(tenants) if tenants.is_empty() => {
+            match load_identity_store_from_db(&database_url).await {
+                Ok(store) if store.tenants.is_empty() => {
                     if let Some(default_tenant_id) = runtime.store.default_tenant_id() {
                         if let Some(default_tenant) = runtime.store.tenants.get(&default_tenant_id).cloned() {
                             if let Err(err) = upsert_tenant_in_db(&database_url, &default_tenant).await {
@@ -1216,16 +1401,13 @@ async fn main() -> Result<(), IdentityError> {
                         }
                     }
                 }
-                Ok(tenants) => {
-                    let mut loaded = HashMap::new();
-                    for tenant in tenants {
-                        loaded.insert(tenant.tenant_id.clone(), tenant);
-                    }
-                    runtime.store.tenants = loaded;
-                    tracing::info!(tenant_count = runtime.store.tenants.len(), "loaded identity tenants from primary db");
+                Ok(store) => {
+                    let metrics = store.metrics();
+                    runtime.store = store;
+                    tracing::info!(metrics = %metrics, "loaded identity store from primary db");
                 }
                 Err(err) => {
-                    tracing::warn!(error = %err, "failed to load tenants from primary db; continuing with in-memory bootstrap");
+                    tracing::warn!(error = %err, "failed to load identity store from primary db; continuing with in-memory bootstrap");
                 }
             }
         }
@@ -2416,7 +2598,219 @@ SELECT COUNT(*)::BIGINT AS removed_count FROM expired
     Ok(removed)
 }
 
-async fn load_tenants_from_db(database_url: &str) -> Result<Vec<TenantRecord>, IdentityError> {
+fn definition_tags(definition: &Value, key: &str) -> Vec<String> {
+    let from_current = definition
+        .get("current")
+        .and_then(Value::as_object)
+        .and_then(|current| current.get(key))
+        .and_then(Value::as_array);
+    let from_root = definition.get(key).and_then(Value::as_array);
+    from_current
+        .or(from_root)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn optional_identification_string(
+    identification: &Value,
+    key: &str,
+    max_len: usize,
+) -> Result<Option<String>, IdentityError> {
+    let value = identification
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    if let Some(ref value) = value {
+        if value.len() > max_len {
+            return Err(format!("identification.{} too long (max {})", key, max_len).into());
+        }
+    }
+    Ok(value)
+}
+
+fn association_json_from_ilk(ilk: &IlkRecord) -> Value {
+    let channels: Vec<Value> = ilk
+        .channels
+        .iter()
+        .map(|channel| {
+            json!({
+                "ich_id": channel.ich_id,
+                "type": channel.channel_type,
+                "address": channel.address,
+            })
+        })
+        .collect();
+    json!({
+        "tenant_id": ilk.tenant_id,
+        "channels": channels,
+    })
+}
+
+fn definition_json_from_ilk(ilk: &IlkRecord) -> Value {
+    json!({
+        "current": {
+            "roles": ilk.roles,
+            "capabilities": ilk.capabilities,
+        }
+    })
+}
+
+async fn persist_ilk_state_in_db(
+    database_url: &str,
+    ilk: &IlkRecord,
+    alias: Option<&AliasSnapshotRecord>,
+) -> Result<(), IdentityError> {
+    let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?.to_string();
+    let tenant_uuid = parse_prefixed_uuid(&ilk.tenant_id, "tnt")?.to_string();
+    let email = optional_identification_string(&ilk.identification, "email", 256)?;
+    let node_name = optional_identification_string(&ilk.identification, "node_name", 128)?;
+    let association = association_json_from_ilk(ilk);
+    let definition = definition_json_from_ilk(ilk);
+    let deleted_at_ms = ilk.deleted_at_ms.and_then(|value| i64::try_from(value).ok());
+    let registered_by: Option<String> = None;
+
+    let (mut client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "identity ilk persist postgres connection closed");
+        }
+    });
+
+    let tx = client.transaction().await?;
+    tx.execute(
+        r#"
+INSERT INTO identity_ilks (
+    ilk_id,
+    ilk_type,
+    registration_status,
+    tenant_id,
+    email,
+    node_name,
+    identification,
+    association,
+    definition,
+    registered_by,
+    deleted_at,
+    updated_at
+)
+VALUES (
+    $1::text::uuid,
+    $2,
+    $3,
+    $4::text::uuid,
+    $5,
+    $6,
+    $7::jsonb,
+    $8::jsonb,
+    $9::jsonb,
+    $10::text::uuid,
+    CASE WHEN $11::BIGINT IS NULL THEN NULL ELSE to_timestamp(($11::DOUBLE PRECISION) / 1000.0) END,
+    NOW()
+)
+ON CONFLICT (ilk_id) DO UPDATE
+SET
+    ilk_type = EXCLUDED.ilk_type,
+    registration_status = EXCLUDED.registration_status,
+    tenant_id = EXCLUDED.tenant_id,
+    email = EXCLUDED.email,
+    node_name = EXCLUDED.node_name,
+    identification = EXCLUDED.identification,
+    association = EXCLUDED.association,
+    definition = EXCLUDED.definition,
+    registered_by = EXCLUDED.registered_by,
+    deleted_at = EXCLUDED.deleted_at,
+    updated_at = NOW()
+"#,
+        &[
+            &ilk_uuid,
+            &ilk.ilk_type,
+            &ilk.registration_status,
+            &tenant_uuid,
+            &email,
+            &node_name,
+            &ilk.identification,
+            &association,
+            &definition,
+            &registered_by,
+            &deleted_at_ms,
+        ],
+    )
+    .await?;
+
+    if ilk.deleted_at_ms.is_some() {
+        tx.execute(
+            "DELETE FROM identity_ichs WHERE ilk_id = $1::text::uuid",
+            &[&ilk_uuid],
+        )
+        .await?;
+    } else {
+        for (index, channel) in ilk.channels.iter().enumerate() {
+            let ich_uuid = parse_prefixed_uuid(&channel.ich_id, "ich")?.to_string();
+            let is_primary = index == 0;
+            tx.execute(
+                r#"
+INSERT INTO identity_ichs (ich_id, ilk_id, tenant_id, channel_type, address, is_primary, added_at)
+VALUES ($1::text::uuid, $2::text::uuid, $3::text::uuid, $4, $5, $6, NOW())
+ON CONFLICT (ich_id) DO UPDATE
+SET
+    ilk_id = EXCLUDED.ilk_id,
+    tenant_id = EXCLUDED.tenant_id,
+    channel_type = EXCLUDED.channel_type,
+    address = EXCLUDED.address,
+    is_primary = EXCLUDED.is_primary
+"#,
+                &[
+                    &ich_uuid,
+                    &ilk_uuid,
+                    &tenant_uuid,
+                    &channel.channel_type,
+                    &channel.address,
+                    &is_primary,
+                ],
+            )
+            .await?;
+        }
+    }
+
+    if let Some(alias_record) = alias {
+        let old_uuid = parse_prefixed_uuid(&alias_record.old_ilk_id, "ilk")?.to_string();
+        let canonical_uuid =
+            parse_prefixed_uuid(&alias_record.canonical_ilk_id, "ilk")?.to_string();
+        let expires_at_ms = i64::try_from(alias_record.expires_at_ms)
+            .map_err(|_| "alias expires_at_ms overflow")?;
+        tx.execute(
+            r#"
+INSERT INTO identity_ilk_aliases (old_ilk_id, canonical_ilk_id, expires_at)
+VALUES (
+    $1::text::uuid,
+    $2::text::uuid,
+    to_timestamp(($3::DOUBLE PRECISION) / 1000.0)
+)
+ON CONFLICT (old_ilk_id) DO UPDATE
+SET
+    canonical_ilk_id = EXCLUDED.canonical_ilk_id,
+    expires_at = EXCLUDED.expires_at
+"#,
+            &[&old_uuid, &canonical_uuid, &expires_at_ms],
+        )
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn load_identity_store_from_db(database_url: &str) -> Result<IdentityStore, IdentityError> {
     let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
     tokio::spawn(async move {
         if let Err(err) = connection.await {
@@ -2440,7 +2834,7 @@ ORDER BY created_at ASC
         )
         .await?;
 
-    let mut out = Vec::with_capacity(rows.len());
+    let mut store = IdentityStore::default();
     for row in rows {
         let tenant_uuid: String = row.get("tenant_id");
         let tenant_id = format!("tnt:{}", tenant_uuid);
@@ -2448,15 +2842,119 @@ ORDER BY created_at ASC
         let domain: Option<String> = row.get("domain");
         let status: String = row.get("status");
         let settings: Value = row.get("settings");
-        out.push(TenantRecord {
-            tenant_id,
-            name,
-            domain,
-            status,
-            settings,
-        });
+        store.tenants.insert(
+            tenant_id.clone(),
+            TenantRecord {
+                tenant_id,
+                name,
+                domain,
+                status,
+                settings,
+            },
+        );
     }
-    Ok(out)
+
+    let ilk_rows = client
+        .query(
+            r#"
+SELECT
+    ilk_id::text AS ilk_id,
+    ilk_type,
+    registration_status,
+    tenant_id::text AS tenant_id,
+    identification,
+    definition,
+    CASE
+        WHEN deleted_at IS NULL THEN NULL
+        ELSE (EXTRACT(EPOCH FROM deleted_at) * 1000)::BIGINT
+    END AS deleted_at_ms
+FROM identity_ilks
+ORDER BY created_at ASC
+"#,
+            &[],
+        )
+        .await?;
+    for row in ilk_rows {
+        let ilk_uuid: String = row.get("ilk_id");
+        let tenant_uuid: String = row.get("tenant_id");
+        let definition: Value = row.get("definition");
+        let roles = definition_tags(&definition, "roles");
+        let capabilities = definition_tags(&definition, "capabilities");
+        let deleted_at_ms: Option<i64> = row.get("deleted_at_ms");
+        store.ilks.insert(
+            format!("ilk:{}", ilk_uuid),
+            IlkRecord {
+                ilk_id: format!("ilk:{}", ilk_uuid),
+                ilk_type: row.get("ilk_type"),
+                registration_status: row.get("registration_status"),
+                tenant_id: format!("tnt:{}", tenant_uuid),
+                identification: row.get("identification"),
+                roles,
+                capabilities,
+                channels: Vec::new(),
+                deleted_at_ms: deleted_at_ms.and_then(|value| u64::try_from(value).ok()),
+            },
+        );
+    }
+
+    let ich_rows = client
+        .query(
+            r#"
+SELECT
+    ich_id::text AS ich_id,
+    ilk_id::text AS ilk_id,
+    channel_type,
+    address
+FROM identity_ichs
+ORDER BY added_at ASC
+"#,
+            &[],
+        )
+        .await?;
+    for row in ich_rows {
+        let ilk_id = format!("ilk:{}", row.get::<_, String>("ilk_id"));
+        let channel = ChannelRecord {
+            ich_id: format!("ich:{}", row.get::<_, String>("ich_id")),
+            channel_type: row.get("channel_type"),
+            address: row.get("address"),
+        };
+        if let Some(ilk) = store.ilks.get_mut(&ilk_id) {
+            if !ilk.channels.iter().any(|existing| existing.ich_id == channel.ich_id) {
+                ilk.channels.push(channel.clone());
+            }
+            if ilk.deleted_at_ms.is_none() {
+                let key = canonical_ich_key(&channel.channel_type, &channel.address);
+                store.ich_lookup.insert(key, ilk_id.clone());
+            }
+        }
+    }
+
+    let alias_rows = client
+        .query(
+            r#"
+SELECT
+    old_ilk_id::text AS old_ilk_id,
+    canonical_ilk_id::text AS canonical_ilk_id,
+    (EXTRACT(EPOCH FROM expires_at) * 1000)::BIGINT AS expires_at_ms
+FROM identity_ilk_aliases
+"#,
+            &[],
+        )
+        .await?;
+    for row in alias_rows {
+        let expires_at_ms: i64 = row.get("expires_at_ms");
+        if let Ok(expires_at_ms) = u64::try_from(expires_at_ms) {
+            store.aliases.insert(
+                format!("ilk:{}", row.get::<_, String>("old_ilk_id")),
+                AliasRecord {
+                    canonical_ilk_id: format!("ilk:{}", row.get::<_, String>("canonical_ilk_id")),
+                    expires_at_ms,
+                },
+            );
+        }
+    }
+
+    Ok(store)
 }
 
 async fn upsert_tenant_in_db(database_url: &str, tenant: &TenantRecord) -> Result<(), IdentityError> {
