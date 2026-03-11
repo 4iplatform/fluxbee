@@ -6,7 +6,6 @@ use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
 use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
-use json_router::shm::IdentityRegionReader;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::time::{sleep, timeout, Instant};
@@ -63,19 +62,6 @@ fn parse_prefixed_uuid_bytes(value: &str, prefix: &str) -> Result<[u8; 16], Diag
         .ok_or_else(|| format!("expected {prefix}:<uuid>, got '{value}'"))?;
     let uuid = Uuid::parse_str(raw)?;
     Ok(*uuid.as_bytes())
-}
-
-fn format_prefixed_uuid(prefix: &str, bytes: &[u8; 16]) -> String {
-    format!("{prefix}:{}", Uuid::from_bytes(*bytes))
-}
-
-fn registration_status_name(code: u8) -> &'static str {
-    match code {
-        0 => "temporary",
-        1 => "partial",
-        2 => "complete",
-        _ => "unknown",
-    }
 }
 
 fn src_ilk_from_message(msg: &Message) -> Option<String> {
@@ -263,78 +249,6 @@ fn require_payload_ok(payload: &Value, action: &str) -> Result<(), DiagError> {
     .into())
 }
 
-fn read_identity_ilk_state(
-    hive_id: &str,
-    ilk_id: &str,
-) -> Result<Option<(String, String)>, DiagError> {
-    let ilk_bytes = parse_prefixed_uuid_bytes(ilk_id, "ilk")?;
-    let shm_name = format!("/jsr-identity-{hive_id}");
-    let reader = IdentityRegionReader::open_read_only_auto(&shm_name)?;
-    let snapshot = reader
-        .read_snapshot()
-        .ok_or_else(|| format!("failed to read identity snapshot from {}", shm_name))?;
-    for ilk in &snapshot.ilks {
-        if ilk.flags == 0 {
-            continue;
-        }
-        if ilk.ilk_id == ilk_bytes {
-            let tenant_id = format_prefixed_uuid("tnt", &ilk.tenant_id);
-            let registration_status = registration_status_name(ilk.registration_status).to_string();
-            return Ok(Some((tenant_id, registration_status)));
-        }
-    }
-    Ok(None)
-}
-
-async fn wait_identity_ilk_status(
-    hive_id: &str,
-    ilk_id: &str,
-    expected_status: &str,
-    timeout_ms: u64,
-) -> Result<(), DiagError> {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        if let Some((_tenant_id, status)) = read_identity_ilk_state(hive_id, ilk_id)? {
-            if status == expected_status {
-                return Ok(());
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "identity SHM did not converge for ilk={} status={} within {}ms",
-                ilk_id, expected_status, timeout_ms
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
-}
-
-async fn wait_identity_ilk_state(
-    hive_id: &str,
-    ilk_id: &str,
-    expected_tenant_id: &str,
-    expected_status: &str,
-    timeout_ms: u64,
-) -> Result<(), DiagError> {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        if let Some((tenant_id, status)) = read_identity_ilk_state(hive_id, ilk_id)? {
-            if tenant_id == expected_tenant_id && status == expected_status {
-                return Ok(());
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "identity SHM did not converge for ilk={} tenant={} status={} within {}ms",
-                ilk_id, expected_tenant_id, expected_status, timeout_ms
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
-}
-
 async fn send_resolve_probe(
     sender: &NodeSender,
     src_ilk: &str,
@@ -409,6 +323,39 @@ async fn wait_frontdesk_probe(
             continue;
         }
         return Ok(msg);
+    }
+}
+
+async fn probe_until_frontdesk(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    src_ilk: &str,
+    probe_id: &str,
+    timeout_ms: u64,
+) -> Result<Message, DiagError> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timeout waiting frontdesk routing probe src_ilk={} within {}ms",
+                src_ilk, timeout_ms
+            )
+            .into());
+        }
+        let trace_id = send_resolve_probe(sender, src_ilk, probe_id).await?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let slice_ms = remaining.as_millis().min(900) as u64;
+        match wait_frontdesk_probe(receiver, &trace_id, slice_ms).await {
+            Ok(msg) => return Ok(msg),
+            Err(err) => {
+                let err_text = err.to_string();
+                if err_text.contains("timeout waiting frontdesk probe") {
+                    sleep(Duration::from_millis(150)).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
     }
 }
 
@@ -525,11 +472,15 @@ async fn main() -> Result<(), DiagError> {
         .ok_or_else(|| "ILK_PROVISION missing ilk_id".to_string())?
         .to_string();
     let _ = parse_prefixed_uuid_bytes(&ilk_id, "ilk")?;
-    wait_identity_ilk_status(&hive_id, &ilk_id, "temporary", timeout_ms).await?;
 
-    let probe_trace_id = send_resolve_probe(&io_sender, &ilk_id, &test_id).await?;
-    let probe_msg =
-        wait_frontdesk_probe(&mut frontdesk_receiver, &probe_trace_id, timeout_ms).await?;
+    let probe_msg = probe_until_frontdesk(
+        &io_sender,
+        &mut frontdesk_receiver,
+        &ilk_id,
+        &test_id,
+        timeout_ms,
+    )
+    .await?;
     let routed_src_ilk = src_ilk_from_message(&probe_msg).unwrap_or_default();
     if routed_src_ilk != ilk_id {
         return Err(format!(
@@ -562,7 +513,44 @@ async fn main() -> Result<(), DiagError> {
     effective_target = used_target;
     require_payload_ok(&register, "ILK_REGISTER")?;
 
-    wait_identity_ilk_state(&hive_id, &ilk_id, &tenant_id, "complete", timeout_ms).await?;
+    let (provision_after_complete, used_target) = system_call_with_fallback(
+        &io_sender,
+        &mut io_receiver,
+        &effective_target,
+        fallback_target.as_deref(),
+        "ILK_PROVISION",
+        json!({
+            "ich_id": format!("ich:{}", Uuid::new_v4()),
+            "channel_type": channel_type,
+            "address": address,
+        }),
+        timeout_ms,
+    )
+    .await?;
+    effective_target = used_target;
+    require_payload_ok(&provision_after_complete, "ILK_PROVISION(after_complete)")?;
+    let status_after_complete = provision_after_complete
+        .get("registration_status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if status_after_complete != "complete" {
+        return Err(format!(
+            "ILK_PROVISION after complete expected registration_status=complete, got {}",
+            status_after_complete
+        )
+        .into());
+    }
+    let ilk_after_complete = provision_after_complete
+        .get("ilk_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if ilk_after_complete != ilk_id {
+        return Err(format!(
+            "ILK_PROVISION after complete returned different ILK expected={} got={}",
+            ilk_id, ilk_after_complete
+        )
+        .into());
+    }
 
     let (tenant_create_2, used_target) = system_call_with_fallback(
         &frontdesk_sender,
