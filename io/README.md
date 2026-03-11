@@ -26,6 +26,36 @@ This installs `/usr/bin/io-slack`, `/usr/bin/io-sim` and systemd units:
 - `fluxbee-io-slack.service`
 - `fluxbee-io-sim.service`
 
+## Publish runtime (orchestrator v2 canonical flow)
+
+For rollout via `SYSTEM_UPDATE` + `SPAWN_NODE`, publish IO runtimes into
+`/var/lib/fluxbee/dist/runtimes`.
+
+Publish `IO.slack`:
+
+```bash
+bash scripts/publish-io-runtime.sh --kind slack --version 0.1.0 --set-current --sudo
+```
+
+Publish `IO.sim`:
+
+```bash
+bash scripts/publish-io-runtime.sh --kind sim --version 0.1.0 --set-current --sudo
+```
+
+Generic publish helper:
+
+```bash
+bash scripts/publish-runtime.sh --runtime IO.slack --version 0.1.0 --binary io/target/release/io-slack --set-current --sudo
+```
+
+Expected output includes:
+- `manifest_version=<...>`
+- `manifest_hash=<...>`
+
+Use those values with:
+- `POST /hives/{id}/update` (`category=runtime`)
+
 ## Run (linux target expected in production)
 
 Required env vars:
