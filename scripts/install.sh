@@ -7,6 +7,7 @@ STATE_DIR="/var/lib/fluxbee"
 RUN_DIR="/var/run/fluxbee"
 APPLY_DEV_OWNERSHIP="${APPLY_DEV_OWNERSHIP:-1}"
 INSTALL_OWNER="${INSTALL_OWNER:-${SUDO_USER:-$USER}}"
+RESTART_ORCHESTRATOR_AFTER_INSTALL="${RESTART_ORCHESTRATOR_AFTER_INSTALL:-1}"
 SEED_RUNTIME_FIXTURE="${SEED_RUNTIME_FIXTURE:-1}"
 RUNTIME_FIXTURE_NAME="${RUNTIME_FIXTURE_NAME:-wf.orch.diag}"
 RUNTIME_FIXTURE_VERSION="${RUNTIME_FIXTURE_VERSION:-0.0.1}"
@@ -169,6 +170,48 @@ EOF
 sudo install -m 0644 "$core_manifest_tmp" "$STATE_DIR/dist/core/manifest.json"
 rm -f "$core_manifest_tmp"
 echo "Updated core manifest at $STATE_DIR/dist/core/manifest.json"
+
+verify_core_component() {
+  local component="$1"
+  local expected_sha="$2"
+  local expected_size="$3"
+  local dist_path="$STATE_DIR/dist/core/bin/$component"
+  local usr_path="/usr/bin/$component"
+
+  if [[ ! -f "$dist_path" ]]; then
+    echo "Error: missing core dist binary: $dist_path" >&2
+    exit 1
+  fi
+  if [[ ! -f "$usr_path" ]]; then
+    echo "Error: missing installed core binary: $usr_path" >&2
+    exit 1
+  fi
+
+  local dist_sha dist_size usr_sha usr_size
+  dist_sha="$(sha256sum "$dist_path" | awk '{print $1}')"
+  dist_size="$(stat -c %s "$dist_path")"
+  usr_sha="$(sha256sum "$usr_path" | awk '{print $1}')"
+  usr_size="$(stat -c %s "$usr_path")"
+
+  if [[ "$dist_sha" != "$expected_sha" || "$dist_size" != "$expected_size" ]]; then
+    echo "Error: dist/core/bin mismatch for $component (expected sha=$expected_sha size=$expected_size, got sha=$dist_sha size=$dist_size)" >&2
+    exit 1
+  fi
+  if [[ "$usr_sha" != "$expected_sha" || "$usr_size" != "$expected_size" ]]; then
+    echo "Error: /usr/bin mismatch for $component (expected sha=$expected_sha size=$expected_size, got sha=$usr_sha size=$usr_size)" >&2
+    exit 1
+  fi
+}
+
+echo "Verifying installed core binaries (dist/core/bin + /usr/bin)..."
+verify_core_component "rt-gateway" "$rt_gateway_sha" "$rt_gateway_size"
+verify_core_component "sy-admin" "$sy_admin_sha" "$sy_admin_size"
+verify_core_component "sy-config-routes" "$sy_config_sha" "$sy_config_size"
+verify_core_component "sy-opa-rules" "$sy_opa_sha" "$sy_opa_size"
+verify_core_component "sy-identity" "$sy_identity_sha" "$sy_identity_size"
+verify_core_component "sy-orchestrator" "$sy_orch_sha" "$sy_orch_size"
+verify_core_component "sy-storage" "$sy_storage_sha" "$sy_storage_size"
+echo "Core binaries verification passed."
 
 seeded_syncthing_vendor=0
 candidate_syncthing_vendor=""
@@ -334,6 +377,19 @@ install_unit "sy-orchestrator" "/usr/bin/sy-orchestrator"
 install_unit "sy-storage" "/usr/bin/sy-storage"
 install_unit "sy-identity" "/usr/bin/sy-identity"
 sudo systemctl daemon-reload
+
+if [[ "$RESTART_ORCHESTRATOR_AFTER_INSTALL" == "1" ]]; then
+  if sudo systemctl list-unit-files sy-orchestrator.service >/dev/null 2>&1; then
+    if sudo systemctl is-active --quiet sy-orchestrator; then
+      echo "Restarting sy-orchestrator to apply new binary..."
+      sudo systemctl restart sy-orchestrator
+    else
+      echo "sy-orchestrator is not active; skipping restart."
+    fi
+  fi
+else
+  echo "RESTART_ORCHESTRATOR_AFTER_INSTALL=0: skipping sy-orchestrator restart."
+fi
 
 if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then
   echo "Applying ownership for test/dev user: $INSTALL_OWNER"
