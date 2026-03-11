@@ -428,6 +428,30 @@ Códigos recomendados (no exhaustivo):
 
 ---
 
+### Campos L3 de contexto (ctx, ctx_seq, ctx_window)
+
+✅ **NORMATIVO (canónico en protocolo)**:
+- `ich` (Interlocutor Channel Hash) y `ctx` (Context Hash) identifican la conversación a nivel L3.
+- `ctx_seq` es el número secuencial monotónico por contexto (L3).
+- `ctx_window` es la “historia reciente” agregada por router (L3).
+
+⚠️ **ADAPTACIÓN TEMPORAL AL ESTADO ACTUAL DEL CORE (implementación)**:
+> La especificación es “palabra santa”. Sin embargo, el core actual todavía no inyecta consistentemente todos los campos L3 (especialmente `ctx_window`).  
+> Por lo tanto, **hasta que el core se alinee**, el runner AI debe implementar tolerancia controlada sin romper el contrato.
+
+✅ **NORMATIVO (tolerancia implementable hoy)**:
+- Si falta `ctx_window`:
+  - **MUST** loggear advertencia `missing_ctx_window`,
+  - **MUST** continuar procesando usando `payload.content`/`content_ref` y attachments disponibles.
+- Si falta `ctx_seq`:
+  - **MUST** loggear advertencia `missing_ctx_seq`,
+  - **MUST** asumir `ctx_seq = 0` (o equivalente) para no abortar el procesamiento.
+- Si falta `ich` o `ctx` en un mensaje `user`:
+  - **SHOULD** tratarse como error de mensaje mal formado (`invalid_payload`) **salvo** que exista un modo legacy explícito de ingestión (🧩 a especificar si se necesita).
+
+🧩 **A ESPECIFICAR (cuando el core se alinee)**:
+- Momento exacto en el que `ctx_window` pasa de “tolerado” a “obligatorio” en el happy path.
+
 ## 1. Alcance del Data Plane
 
 ✅ **NORMATIVO**: esta sección aplica a mensajes con:
@@ -440,6 +464,17 @@ En estado `UNCONFIGURED`, los mensajes `user` se rechazan según Control Plane (
 ---
 
 ## 2. Contrato estándar `text/v1` (Fluxbee)
+### `meta.type` vs `meta.msg_type` (naming legacy)
+
+✅ **NORMATIVO (AI Nodes)**:
+- Control Plane: se identifica por `meta.type in {"system","admin"}` y `meta.msg` (comando).
+- Data Plane: se identifica por `meta.type == "user"` y el contrato de payload (`text/v1`).
+
+⚠️ **ADAPTACIÓN TEMPORAL AL CORE (implementación)**:
+- En el core existen menciones/uso de `meta.msg_type` (naming legacy) además de `meta.type`.
+- El runner AI **SHOULD** tolerar la presencia/ausencia de `meta.msg_type` y no depender de él para el dispatch principal.
+
+
 
 ✅ **NORMATIVO**: los AI Nodes implementan el contrato **`text/v1`** definido por Fluxbee (ver `blob-annex-spec.md`, sección “Contrato de Payload: text/v1”).
 
@@ -1225,6 +1260,13 @@ Cada instancia opera aislada y no debe interferir con otras.
 ---
 
 ## 4. Persistencia y rehidratación en restart
+✅ **NORMATIVO (HOY)**:
+- El runner del nodo **debe** asegurar que existe un identificador estable (UUID/ILK) para la instancia y persistirlo localmente (p.ej. archivo `<node>.uuid` bajo `/var/lib/fluxbee/nodes/` o el path que defina la operación).
+
+🧩 **A ESPECIFICAR (Fluxbee / node-spawn)**:
+- Quién crea inicialmente el archivo `.uuid` (posible futuro: orchestrator crea; nodo mantiene).  
+  Mientras no esté normado, se asume que el **nodo** lo crea si no existe.
+
 
 ✅ **NORMATIVO**: al reiniciar una instancia:
 
