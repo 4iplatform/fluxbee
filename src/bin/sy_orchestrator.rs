@@ -6622,9 +6622,14 @@ fn remote_wait_service_active(
         "systemctl show '{service}' --property=SubState --value 2>/dev/null || true",
         service = service_q
     );
+    let state_summary_cmd = format!(
+        "systemctl show '{service}' --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus --value 2>/dev/null | tr '\\n' ' ' || true",
+        service = service_q
+    );
 
     let mut stable = 0_u8;
     let mut last_err: Option<String> = None;
+    let mut last_state_summary: Option<String> = None;
     for _ in 0..timeout_secs {
         match ssh_with_key(
             address,
@@ -6652,12 +6657,28 @@ fn remote_wait_service_active(
             Err(err) => {
                 stable = 0;
                 last_err = Some(err.to_string());
+                let summary = ssh_with_key_output(
+                    address,
+                    key_path,
+                    &sudo_wrap(&state_summary_cmd),
+                    BOOTSTRAP_SSH_USER,
+                )
+                .unwrap_or_default();
+                let summary = summary.trim();
+                if !summary.is_empty() {
+                    last_state_summary = Some(summary.to_string());
+                }
             }
         }
         std::thread::sleep(Duration::from_secs(1));
     }
 
     let detail = last_err.unwrap_or_else(|| "timed out waiting for active/running".to_string());
+    let detail = if let Some(summary) = last_state_summary {
+        format!("{detail}; state={summary}")
+    } else {
+        detail
+    };
     Err(format!(
         "service '{}' did not become active in {}s: {}",
         service, timeout_secs, detail
@@ -6744,7 +6765,7 @@ fn remote_service_journal_tail(
     };
     let service_q = shell_single_quote(&service_unit);
     let cmd = format!(
-        "systemctl --no-pager -l status '{service}' 2>/dev/null | tail -n {lines} || true",
+        "journalctl -u '{service}' --no-pager -n {lines} -o short-precise 2>/dev/null || true",
         service = service_q,
         lines = lines
     );
@@ -6752,10 +6773,25 @@ fn remote_service_journal_tail(
         Ok(out) => {
             let trimmed = out.trim();
             if trimmed.is_empty() {
-                None
-            } else {
-                Some(truncate_for_error(trimmed, 800))
+                let fallback_cmd = format!(
+                    "systemctl --no-pager -l status '{service}' 2>/dev/null | tail -n {lines} || true",
+                    service = service_q,
+                    lines = lines
+                );
+                let fallback = ssh_with_key_output(
+                    address,
+                    key_path,
+                    &sudo_wrap(&fallback_cmd),
+                    BOOTSTRAP_SSH_USER,
+                )
+                .unwrap_or_default();
+                let fallback = fallback.trim();
+                if fallback.is_empty() {
+                    return None;
+                }
+                return Some(truncate_for_error(fallback, 1600));
             }
+            Some(truncate_for_error(trimmed, 1600))
         }
         Err(_) => None,
     }
