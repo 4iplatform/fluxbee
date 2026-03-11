@@ -5272,6 +5272,50 @@ fn resolve_tenant_id_for_node(payload: &serde_json::Value) -> Option<String> {
         })
 }
 
+fn resolve_identity_primary_hive_id(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> Result<String, OrchestratorError> {
+    if let Some(raw) = payload
+        .get("identity_primary_hive_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        if !valid_hive_id(raw) {
+            return Err("invalid identity_primary_hive_id".into());
+        }
+        return Ok(raw.to_string());
+    }
+
+    if let Ok(raw) = std::env::var("ORCH_IDENTITY_PRIMARY_HIVE_ID") {
+        let value = raw.trim();
+        if !value.is_empty() {
+            if !valid_hive_id(value) {
+                return Err("invalid ORCH_IDENTITY_PRIMARY_HIVE_ID".into());
+            }
+            return Ok(value.to_string());
+        }
+    }
+
+    if state.is_motherbee {
+        return Ok(state.hive_id.clone());
+    }
+
+    if state.wan_authorized_hives.len() == 1 {
+        let value = state.wan_authorized_hives[0].trim();
+        if !value.is_empty() && valid_hive_id(value) {
+            return Ok(value.to_string());
+        }
+    }
+
+    tracing::warn!(
+        hive_id = %state.hive_id,
+        "identity primary hive id unresolved on worker; falling back to local hive id"
+    );
+    Ok(state.hive_id.clone())
+}
+
 fn resolve_identity_change_reason(payload: &serde_json::Value) -> Option<String> {
     payload
         .get("identity_change_reason")
@@ -5524,6 +5568,7 @@ async fn forward_system_action_to_hive_with_timeout(
 async fn ensure_node_identity_registered(
     state: &OrchestratorState,
     payload: &serde_json::Value,
+    identity_primary_hive_id: &str,
     node_name: &str,
     runtime: &str,
     runtime_version: &str,
@@ -5569,7 +5614,7 @@ async fn ensure_node_identity_registered(
         "roles": roles,
         "capabilities": capabilities,
     });
-    let identity_target = format!("SY.identity@{}", state.hive_id);
+    let identity_target = format!("SY.identity@{}", identity_primary_hive_id);
     let response = relay_system_action(
         state,
         &identity_target,
@@ -5638,6 +5683,7 @@ async fn ensure_node_identity_registered(
 async fn apply_node_identity_update(
     state: &OrchestratorState,
     payload: &serde_json::Value,
+    identity_primary_hive_id: &str,
     ilk_id: &str,
 ) -> Result<Option<serde_json::Value>, OrchestratorError> {
     parse_prefixed_uuid(ilk_id, "ilk")?;
@@ -5670,7 +5716,7 @@ async fn apply_node_identity_update(
         "remove_capabilities": remove_capabilities,
         "change_reason": change_reason,
     });
-    let identity_target = format!("SY.identity@{}", state.hive_id);
+    let identity_target = format!("SY.identity@{}", identity_primary_hive_id);
     let response = relay_system_action(
         state,
         &identity_target,
@@ -5747,6 +5793,16 @@ async fn run_node_flow(
             });
         }
     };
+    let identity_primary_hive_id = match resolve_identity_primary_hive_id(state, payload) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+            });
+        }
+    };
 
     let runtime = payload
         .get("runtime")
@@ -5802,6 +5858,10 @@ async fn run_node_flow(
                 serde_json::json!(requested_version),
             );
             obj.insert("unit".to_string(), serde_json::json!(unit));
+            obj.insert(
+                "identity_primary_hive_id".to_string(),
+                serde_json::json!(identity_primary_hive_id),
+            );
         }
         return match forward_system_action_to_hive(
             state,
@@ -5870,6 +5930,7 @@ async fn run_node_flow(
     let identity_register = match ensure_node_identity_registered(
         state,
         payload,
+        &identity_primary_hive_id,
         &node_name,
         &runtime_key,
         &version,
@@ -5895,7 +5956,9 @@ async fn run_node_flow(
         .map(str::to_string);
     let identity_update = match identity_ilk_id.as_deref() {
         Some(ilk_id) => {
-            match apply_node_identity_update(state, payload, ilk_id).await {
+            match apply_node_identity_update(state, payload, &identity_primary_hive_id, ilk_id)
+                .await
+            {
                 Ok(value) => value,
                 Err(err) => {
                     return serde_json::json!({
@@ -5928,7 +5991,8 @@ async fn run_node_flow(
     };
     let identity = serde_json::json!({
         "requested_hive": target_hive,
-        "identity_target": format!("SY.identity@{}", state.hive_id),
+        "identity_primary_hive_id": identity_primary_hive_id,
+        "identity_target": format!("SY.identity@{}", identity_primary_hive_id),
         "register": identity_register,
         "update": identity_update,
     });

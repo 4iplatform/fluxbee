@@ -137,6 +137,7 @@ Salida:
 - [x] E3. Orchestrator:
   - [x] registro de nodos por `ILK_REGISTER` en `run_node` (pre-spawn):
     - usa relay system message hacia `SY.identity@<primary_hive>` (`state.hive_id`, motherbee)
+    - en `SPAWN_NODE` remoto, propaga `identity_primary_hive_id` al worker para evitar resolver contra `SY.identity@<worker_hive>`
     - persiste `node_name -> ilk_id` en estado local orchestrator para reusar ILK en reinicios
     - modo estricto opcional por env `ORCH_IDENTITY_REGISTER_REQUIRED=true`
     - tenant resuelto desde `payload.tenant_id`, `payload.config.tenant_id` o `ORCH_DEFAULT_TENANT_ID`
