@@ -53,6 +53,13 @@ fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_opt(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 fn load_hive_id(config_dir: &PathBuf) -> Result<String, DiagError> {
     let data = std::fs::read_to_string(config_dir.join("hive.yaml"))?;
     let hive: HiveFile = serde_yaml::from_str(&data)?;
@@ -98,20 +105,16 @@ async fn wait_system_response(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(format!(
-                "timeout waiting {} for trace_id={}",
-                expected_msg, trace_id
-            )
-            .into());
+            return Err(
+                format!("timeout waiting {} for trace_id={}", expected_msg, trace_id).into(),
+            );
         }
         let message = match timeout(remaining, receiver.recv()).await {
             Ok(message) => message?,
             Err(_) => {
-                return Err(format!(
-                    "timeout waiting {} for trace_id={}",
-                    expected_msg, trace_id
-                )
-                .into());
+                return Err(
+                    format!("timeout waiting {} for trace_id={}", expected_msg, trace_id).into(),
+                );
             }
         };
         if message.meta.msg_type != SYSTEM_KIND || message.routing.trace_id != trace_id {
@@ -170,6 +173,51 @@ async fn system_call(
     wait_system_response(receiver, &trace_id, &response_action, timeout_ms).await
 }
 
+async fn system_call_with_fallback(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    target: &str,
+    fallback_target: Option<&str>,
+    action: &str,
+    payload: Value,
+    timeout_ms: u64,
+) -> Result<(Value, String), DiagError> {
+    let first = system_call(
+        sender,
+        receiver,
+        target,
+        action,
+        payload.clone(),
+        timeout_ms,
+    )
+    .await;
+    match first {
+        Ok(response) => Ok((response, target.to_string())),
+        Err(err) => {
+            let err_text = err.to_string();
+            let Some(fallback) = fallback_target else {
+                return Err(err);
+            };
+            if fallback == target {
+                return Err(err);
+            }
+            if !err_text.contains("reason=NODE_NOT_FOUND") {
+                return Err(err);
+            }
+            tracing::warn!(
+                target = %target,
+                fallback = %fallback,
+                action = action,
+                error = %err_text,
+                "primary identity target unreachable, retrying with fallback"
+            );
+            let second =
+                system_call(sender, receiver, fallback, action, payload, timeout_ms).await?;
+            Ok((second, fallback.to_string()))
+        }
+    }
+}
+
 fn payload_status_ok(payload: &Value) -> Result<(), DiagError> {
     let status = payload
         .get("status")
@@ -186,7 +234,11 @@ fn payload_status_ok(payload: &Value) -> Result<(), DiagError> {
         .get("message")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    Err(format!("non-ok payload status={} code={} message={}", status, code, message).into())
+    Err(format!(
+        "non-ok payload status={} code={} message={}",
+        status, code, message
+    )
+    .into())
 }
 
 fn metric_alias_count(payload: &Value) -> Option<u64> {
@@ -210,6 +262,7 @@ async fn main() -> Result<(), DiagError> {
         &format!("idmerge-{}", now_epoch_ms()),
     );
     let target = env_or("IDENTITY_MERGE_TARGET", &format!("SY.identity@{}", hive_id));
+    let fallback_target = env_opt("IDENTITY_MERGE_FALLBACK_TARGET");
     let timeout_ms = env_u64("IDENTITY_MERGE_TIMEOUT_MS", 10_000);
     let wait_gc_secs = env_u64("IDENTITY_MERGE_WAIT_GC_SECS", 0);
     let require_alias_cleanup = env_bool("IDENTITY_MERGE_REQUIRE_ALIAS_CLEANUP", false);
@@ -240,10 +293,11 @@ async fn main() -> Result<(), DiagError> {
     };
     let (io_sender, mut io_receiver) = connect(&io_node_config).await?;
 
-    let metrics_before = system_call(
+    let (metrics_before, mut effective_target) = system_call_with_fallback(
         &io_sender,
         &mut io_receiver,
         &target,
+        fallback_target.as_deref(),
         "IDENTITY_METRICS",
         json!({}),
         timeout_ms,
@@ -253,10 +307,11 @@ async fn main() -> Result<(), DiagError> {
     let alias_before = metric_alias_count(&metrics_before).unwrap_or(0);
 
     let old_ich_id = format!("ich:{}", Uuid::new_v4());
-    let provision_old = system_call(
+    let (provision_old, used_target) = system_call_with_fallback(
         &io_sender,
         &mut io_receiver,
-        &target,
+        &effective_target,
+        fallback_target.as_deref(),
         "ILK_PROVISION",
         json!({
             "ich_id": old_ich_id,
@@ -266,6 +321,7 @@ async fn main() -> Result<(), DiagError> {
         timeout_ms,
     )
     .await?;
+    effective_target = used_target;
     payload_status_ok(&provision_old)?;
     let old_ilk_id = provision_old
         .get("ilk_id")
@@ -282,10 +338,11 @@ async fn main() -> Result<(), DiagError> {
     };
     let (frontdesk_sender, mut frontdesk_receiver) = connect(&frontdesk_config).await?;
 
-    let tenant_create = system_call(
+    let (tenant_create, used_target) = system_call_with_fallback(
         &frontdesk_sender,
         &mut frontdesk_receiver,
-        &target,
+        &effective_target,
+        fallback_target.as_deref(),
         "TNT_CREATE",
         json!({
             "name": format!("merge-diag-{}", test_id),
@@ -295,6 +352,7 @@ async fn main() -> Result<(), DiagError> {
         timeout_ms,
     )
     .await?;
+    effective_target = used_target;
     payload_status_ok(&tenant_create)?;
     let tenant_id = tenant_create
         .get("tenant_id")
@@ -306,10 +364,11 @@ async fn main() -> Result<(), DiagError> {
         "IDENTITY_MERGE_CANONICAL_ILK_ID",
         &format!("ilk:{}", Uuid::new_v4()),
     );
-    let register = system_call(
+    let (register, used_target) = system_call_with_fallback(
         &frontdesk_sender,
         &mut frontdesk_receiver,
-        &target,
+        &effective_target,
+        fallback_target.as_deref(),
         "ILK_REGISTER",
         json!({
             "ilk_id": canonical_ilk_id,
@@ -325,12 +384,14 @@ async fn main() -> Result<(), DiagError> {
         timeout_ms,
     )
     .await?;
+    effective_target = used_target;
     payload_status_ok(&register)?;
 
-    let add_channel = system_call(
+    let (add_channel, used_target) = system_call_with_fallback(
         &frontdesk_sender,
         &mut frontdesk_receiver,
-        &target,
+        &effective_target,
+        fallback_target.as_deref(),
         "ILK_ADD_CHANNEL",
         json!({
             "ilk_id": canonical_ilk_id,
@@ -345,25 +406,29 @@ async fn main() -> Result<(), DiagError> {
         timeout_ms,
     )
     .await?;
+    effective_target = used_target;
     payload_status_ok(&add_channel)?;
 
-    let metrics_after_merge = system_call(
+    let (metrics_after_merge, used_target) = system_call_with_fallback(
         &io_sender,
         &mut io_receiver,
-        &target,
+        &effective_target,
+        fallback_target.as_deref(),
         "IDENTITY_METRICS",
         json!({}),
         timeout_ms,
     )
     .await?;
+    effective_target = used_target;
     payload_status_ok(&metrics_after_merge)?;
     let alias_after_merge = metric_alias_count(&metrics_after_merge).unwrap_or(0);
 
     let old_ich_id_second = format!("ich:{}", Uuid::new_v4());
-    let provision_old_again = system_call(
+    let (provision_old_again, used_target) = system_call_with_fallback(
         &io_sender,
         &mut io_receiver,
-        &target,
+        &effective_target,
+        fallback_target.as_deref(),
         "ILK_PROVISION",
         json!({
             "ich_id": old_ich_id_second,
@@ -373,6 +438,7 @@ async fn main() -> Result<(), DiagError> {
         timeout_ms,
     )
     .await?;
+    effective_target = used_target;
     payload_status_ok(&provision_old_again)?;
     let resolved_old_channel_ilk = provision_old_again
         .get("ilk_id")
@@ -391,15 +457,17 @@ async fn main() -> Result<(), DiagError> {
     let mut alias_after_wait = alias_after_merge;
     if wait_gc_secs > 0 {
         sleep(Duration::from_secs(wait_gc_secs)).await;
-        let metrics_after_wait = system_call(
+        let (metrics_after_wait, used_target) = system_call_with_fallback(
             &io_sender,
             &mut io_receiver,
-            &target,
+            &effective_target,
+            fallback_target.as_deref(),
             "IDENTITY_METRICS",
             json!({}),
             timeout_ms,
         )
         .await?;
+        effective_target = used_target;
         payload_status_ok(&metrics_after_wait)?;
         alias_after_wait = metric_alias_count(&metrics_after_wait).unwrap_or(alias_after_merge);
     }
@@ -418,6 +486,7 @@ async fn main() -> Result<(), DiagError> {
     println!("STATUS=ok");
     println!("TEST_ID={}", test_id);
     println!("TARGET={}", target);
+    println!("EFFECTIVE_TARGET={}", effective_target);
     println!("OLD_ILK_ID={}", old_ilk_id);
     println!("CANONICAL_ILK_ID={}", canonical_ilk_id);
     println!("RESOLVED_OLD_CHANNEL_ILK_ID={}", resolved_old_channel_ilk);
