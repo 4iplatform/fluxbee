@@ -175,12 +175,12 @@ Salida:
 
 ## 9) Fase G - E2E y criterios de aceptación
 
-- [ ] G1. E2E provisión:
+- [x] G1. E2E provisión:
   - ICH desconocido -> `ILK_PROVISION` -> ILK temporal real -> ruta a frontdesk.
   - Avance: diag+script integrados:
     - `src/bin/identity_provision_complete_diag.rs` (incluye verificación de route a `AI.frontdesk`)
     - `scripts/identity_provision_complete_e2e.sh`
-- [ ] G2. E2E complete:
+- [x] G2. E2E complete:
   - `ILK_REGISTER` completa ILK temporal y reasigna tenant.
   - Avance: validación integrada en `identity_provision_complete_diag`:
     - convergencia `registration_status=complete` + `tenant_id` esperado en SHM identity,
