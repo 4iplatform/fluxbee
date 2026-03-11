@@ -136,11 +136,12 @@ Salida:
   - canal extra por `ILK_ADD_CHANNEL`
 - [x] E3. Orchestrator:
   - [x] registro de nodos por `ILK_REGISTER` en `run_node` (pre-spawn):
-    - usa relay system message hacia `SY.identity@<hive>`
+    - usa relay system message hacia `SY.identity@<primary_hive>` (`state.hive_id`, motherbee)
     - persiste `node_name -> ilk_id` en estado local orchestrator para reusar ILK en reinicios
     - modo estricto opcional por env `ORCH_IDENTITY_REGISTER_REQUIRED=true`
     - tenant resuelto desde `payload.tenant_id`, `payload.config.tenant_id` o `ORCH_DEFAULT_TENANT_ID`
   - [x] updates de metadata por `ILK_UPDATE` en `run_node` (delta explícito):
+    - target fijo `SY.identity@<primary_hive>` (misma regla que `ILK_REGISTER`)
     - soporta `add_roles`, `remove_roles`, `add_capabilities`, `remove_capabilities`, `add_channels`, `identity_change_reason`
     - falla el spawn con `IDENTITY_UPDATE_FAILED` si se pidió delta y identity devuelve error
 - [x] E4. Merge temporal:
