@@ -57,21 +57,20 @@ async fn main() -> Result<(), DynError> {
                 version: node_version,
             };
             let (sender, mut receiver) = connect(&node_config).await?;
-            let provisioned = provision_ilk(
+            let provisioned = provision_ilk_with_fallback(
                 &sender,
                 &mut receiver,
-                IlkProvisionRequest {
-                    target: &target,
-                    ich_id: &ich_id,
-                    channel_type: &channel_type,
-                    address: &address,
-                    timeout: Duration::from_millis(provision_timeout_ms),
-                },
+                &target,
+                &ich_id,
+                &channel_type,
+                &address,
+                Duration::from_millis(provision_timeout_ms),
+                env_opt("IO_TEST_IDENTITY_FALLBACK_TARGET"),
             )
             .await?;
             let _ = sender.close().await;
             provision_trace_id = Some(provisioned.trace_id.clone());
-            identity_target = Some(target);
+            identity_target = Some(provisioned.target);
             wait_for_lookup_hit(&config_dir, &channel_type, &address, post_provision_wait_ms)
                 .await?
                 .unwrap_or(provisioned.ilk_id)
@@ -98,21 +97,20 @@ async fn main() -> Result<(), DynError> {
                 version: node_version,
             };
             let (sender, mut receiver) = connect(&node_config).await?;
-            let provisioned = provision_ilk(
+            let provisioned = provision_ilk_with_fallback(
                 &sender,
                 &mut receiver,
-                IlkProvisionRequest {
-                    target: &target,
-                    ich_id: &ich_id,
-                    channel_type: &channel_type,
-                    address: &address,
-                    timeout: Duration::from_millis(provision_timeout_ms),
-                },
+                &target,
+                &ich_id,
+                &channel_type,
+                &address,
+                Duration::from_millis(provision_timeout_ms),
+                env_opt("IO_TEST_IDENTITY_FALLBACK_TARGET"),
             )
             .await?;
             let _ = sender.close().await;
             provision_trace_id = Some(provisioned.trace_id.clone());
-            identity_target = Some(target);
+            identity_target = Some(provisioned.target);
             wait_for_lookup_hit(&config_dir, &channel_type, &address, post_provision_wait_ms)
                 .await?
                 .unwrap_or(provisioned.ilk_id)
@@ -192,10 +190,96 @@ fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_opt(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 fn is_lookup_unavailable(err: &IdentityShmError) -> bool {
     match err {
         IdentityShmError::Nix(errno) => *errno == nix::errno::Errno::ENOENT,
         IdentityShmError::Io(io_err) => io_err.kind() == std::io::ErrorKind::NotFound,
         _ => false,
+    }
+}
+
+struct ProvisionOutcome {
+    ilk_id: String,
+    trace_id: String,
+    target: String,
+}
+
+async fn provision_ilk_with_fallback(
+    sender: &fluxbee_sdk::NodeSender,
+    receiver: &mut fluxbee_sdk::NodeReceiver,
+    target: &str,
+    ich_id: &str,
+    channel_type: &str,
+    address: &str,
+    timeout: Duration,
+    fallback_target: Option<String>,
+) -> Result<ProvisionOutcome, DynError> {
+    let first = provision_ilk(
+        sender,
+        receiver,
+        IlkProvisionRequest {
+            target,
+            ich_id,
+            channel_type,
+            address,
+            timeout,
+        },
+    )
+    .await;
+    match first {
+        Ok(ok) => Ok(ProvisionOutcome {
+            ilk_id: ok.ilk_id,
+            trace_id: ok.trace_id,
+            target: target.to_string(),
+        }),
+        Err(fluxbee_sdk::identity::IdentityError::Unreachable {
+            reason,
+            original_dst,
+        }) if reason == "NODE_NOT_FOUND" => {
+            let Some(fallback) = fallback_target else {
+                return Err(fluxbee_sdk::identity::IdentityError::Unreachable {
+                    reason,
+                    original_dst,
+                }
+                .into());
+            };
+            if fallback == target {
+                return Err(fluxbee_sdk::identity::IdentityError::Unreachable {
+                    reason,
+                    original_dst,
+                }
+                .into());
+            }
+            tracing::warn!(
+                target = %target,
+                fallback = %fallback,
+                "primary identity target unreachable (NODE_NOT_FOUND), retrying with fallback target"
+            );
+            let second = provision_ilk(
+                sender,
+                receiver,
+                IlkProvisionRequest {
+                    target: &fallback,
+                    ich_id,
+                    channel_type,
+                    address,
+                    timeout,
+                },
+            )
+            .await?;
+            Ok(ProvisionOutcome {
+                ilk_id: second.ilk_id,
+                trace_id: second.trace_id,
+                target: fallback,
+            })
+        }
+        Err(other) => Err(other.into()),
     }
 }
