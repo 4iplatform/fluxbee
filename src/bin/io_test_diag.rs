@@ -152,9 +152,15 @@ async fn wait_for_lookup_hit(
     }
     let deadline = Instant::now() + Duration::from_millis(max_wait_ms);
     loop {
-        let resolved = resolve_ilk_from_hive_config(config_dir, channel_type, address)?;
-        if resolved.is_some() {
-            return Ok(resolved);
+        match resolve_ilk_from_hive_config(config_dir, channel_type, address) {
+            Ok(Some(ilk)) => return Ok(Some(ilk)),
+            Ok(None) => {}
+            Err(err) if is_lookup_unavailable(&err) => {
+                // Some workers may not expose identity SHM locally yet.
+                // In that case caller should rely on the provisioned ILK id.
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
         }
         if Instant::now() >= deadline {
             return Ok(None);
