@@ -2473,7 +2473,7 @@ async fn upsert_tenant_in_db(database_url: &str, tenant: &TenantRecord) -> Resul
         .execute(
             r#"
 INSERT INTO identity_tenants (tenant_id, name, domain, status, settings, updated_at)
-VALUES ($1::uuid, $2, $3, $4, $5::jsonb, NOW())
+VALUES ($1::text::uuid, $2, $3, $4, $5::jsonb, NOW())
 ON CONFLICT (tenant_id) DO UPDATE
 SET
     name = EXCLUDED.name,
