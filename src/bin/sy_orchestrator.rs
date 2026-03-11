@@ -6626,33 +6626,36 @@ fn remote_wait_service_active(
         "systemctl show '{service}' --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus --value 2>/dev/null | tr '\\n' ' ' || true",
         service = service_q
     );
+    let check_running = || -> Result<bool, OrchestratorError> {
+        ssh_with_key(
+            address,
+            key_path,
+            &sudo_wrap(&is_active_cmd),
+            BOOTSTRAP_SSH_USER,
+        )?;
+        let substate = ssh_with_key_output(
+            address,
+            key_path,
+            &sudo_wrap(&substate_cmd),
+            BOOTSTRAP_SSH_USER,
+        )
+        .unwrap_or_default();
+        Ok(substate.trim() == "running")
+    };
 
     let mut stable = 0_u8;
     let mut last_err: Option<String> = None;
     let mut last_state_summary: Option<String> = None;
     for _ in 0..timeout_secs {
-        match ssh_with_key(
-            address,
-            key_path,
-            &sudo_wrap(&is_active_cmd),
-            BOOTSTRAP_SSH_USER,
-        ) {
-            Ok(()) => {
-                let substate = ssh_with_key_output(
-                    address,
-                    key_path,
-                    &sudo_wrap(&substate_cmd),
-                    BOOTSTRAP_SSH_USER,
-                )
-                .unwrap_or_default();
-                if substate.trim() == "running" {
-                    stable = stable.saturating_add(1);
-                    if stable >= 3 {
-                        return Ok(());
-                    }
-                } else {
-                    stable = 0;
+        match check_running() {
+            Ok(true) => {
+                stable = stable.saturating_add(1);
+                if stable >= 3 {
+                    return Ok(());
                 }
+            }
+            Ok(false) => {
+                stable = 0;
             }
             Err(err) => {
                 stable = 0;
@@ -6671,6 +6674,16 @@ fn remote_wait_service_active(
             }
         }
         std::thread::sleep(Duration::from_secs(1));
+    }
+
+    // Avoid timeout-edge false negatives: if it became running right at the end, accept it.
+    if check_running().unwrap_or(false) {
+        tracing::warn!(
+            service = service,
+            timeout_secs = timeout_secs,
+            "service reached running state at timeout edge; accepting health gate"
+        );
+        return Ok(());
     }
 
     let detail = last_err.unwrap_or_else(|| "timed out waiting for active/running".to_string());
