@@ -91,8 +91,13 @@ const WORKER_MIN_CORE_COMPONENTS: [&str; 5] = [
     "sy-identity",
     "sy-orchestrator",
 ];
-const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 3] =
-    ["rt-gateway", "sy-identity", "sy-orchestrator"];
+const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 5] = [
+    "rt-gateway",
+    "sy-config-routes",
+    "sy-opa-rules",
+    "sy-identity",
+    "sy-orchestrator",
+];
 const DEFAULT_BLOB_ENABLED: bool = true;
 const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
 const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
