@@ -840,6 +840,17 @@ impl IdentityRuntime {
             send_system_response(sender, msg, response_name(action), payload).await?;
             return Ok(Vec::new());
         }
+        if !self.is_primary && action_requires_primary(action) {
+            let payload = json!({
+                "status": "error",
+                "error_code": "NOT_PRIMARY",
+                "message": "identity replica is read-only for this action; route request to primary",
+                "action": action,
+                "replica_hive_id": self.hive_id,
+            });
+            send_system_response(sender, msg, response_name(action), payload).await?;
+            return Ok(Vec::new());
+        }
 
         let mut deltas: Vec<IdentityDeltaEnvelope> = Vec::new();
         let payload = match action {
@@ -2006,6 +2017,18 @@ fn response_name(action: &str) -> &'static str {
         "IDENTITY_METRICS" => "IDENTITY_METRICS_RESPONSE",
         _ => "SYSTEM_ERROR",
     }
+}
+
+fn action_requires_primary(action: &str) -> bool {
+    matches!(
+        action,
+        MSG_ILK_PROVISION
+            | MSG_ILK_REGISTER
+            | MSG_ILK_ADD_CHANNEL
+            | MSG_ILK_UPDATE
+            | MSG_TNT_CREATE
+            | MSG_TNT_APPROVE
+    )
 }
 
 async fn send_system_response(

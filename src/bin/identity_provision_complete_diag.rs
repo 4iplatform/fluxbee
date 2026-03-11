@@ -220,7 +220,24 @@ async fn system_call_with_fallback(
     )
     .await
     {
-        Ok(response) => Ok((response, target.to_string())),
+        Ok(response) => {
+            let (status, code) = payload_status(&response);
+            let Some(fallback) = fallback_target else {
+                return Ok((response, target.to_string()));
+            };
+            if fallback != target && status == "error" && code == Some("NOT_PRIMARY") {
+                tracing::warn!(
+                    target = %target,
+                    fallback = %fallback,
+                    action = action,
+                    "identity target is replica (NOT_PRIMARY), retrying with fallback"
+                );
+                let second =
+                    system_call(sender, receiver, fallback, action, payload, timeout_ms).await?;
+                return Ok((second, fallback.to_string()));
+            }
+            Ok((response, target.to_string()))
+        }
         Err(err) => {
             let err_text = err.to_string();
             let Some(fallback) = fallback_target else {
