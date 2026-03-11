@@ -6410,7 +6410,11 @@ fn sync_core_to_worker(
     validate_core_manifest_for_bins(&local_paths)?;
 
     if worker_bootstrap_only {
-        let upload_refs: Vec<&str> = local_paths.iter().map(String::as_str).collect();
+        let manifest_source_path = local_core_manifest_path()
+            .ok_or_else(|| format!("core manifest missing at '{}'", DIST_CORE_MANIFEST_PATH))?;
+        let mut upload_paths = local_paths.clone();
+        upload_paths.push(manifest_source_path.display().to_string());
+        let upload_refs: Vec<&str> = upload_paths.iter().map(String::as_str).collect();
         let remote_stage = format!("/tmp/fluxbee-core-sync-{}", sanitize_unit_suffix(hive_id));
         let prepare_stage = format!(
             "rm -rf '{stage}' && mkdir -p '{stage}'",
@@ -6427,9 +6431,18 @@ fn sync_core_to_worker(
 
         let mut commands = vec![
             "set -euo pipefail".to_string(),
+            "mkdir -p /var/lib/fluxbee/dist/core".to_string(),
             "mkdir -p /var/lib/fluxbee/dist/core/bin".to_string(),
         ];
+        commands.push(format!(
+            "install -m 0644 '{stage}/manifest.json' '/var/lib/fluxbee/dist/core/manifest.json'",
+            stage = shell_single_quote(&remote_stage),
+        ));
         for name in &component_names {
+            commands.push(format!(
+                "rm -f '/usr/bin/{name}' '/var/lib/fluxbee/dist/core/bin/{name}'",
+                name = shell_single_quote(name),
+            ));
             commands.push(format!(
                 "install -m 0755 '{stage}/{name}' '/usr/bin/{name}'",
                 stage = shell_single_quote(&remote_stage),
@@ -6454,6 +6467,19 @@ fn sync_core_to_worker(
             &sudo_wrap(&format!("bash -lc '{}'", promote_cmd_q)),
             BOOTSTRAP_SSH_USER,
         )?;
+        verify_remote_core_components(address, key_path, &manifest, &component_names)?;
+        if let Some(local_hash) = local_core_manifest_hash()? {
+            let remote_hash = remote_core_manifest_hash(address, key_path)?;
+            if remote_hash.as_deref() != Some(local_hash.as_str()) {
+                return Err(format!(
+                    "core manifest hash mismatch after bootstrap sync hive='{}' local={} remote={}",
+                    hive_id,
+                    local_hash,
+                    remote_hash.unwrap_or_else(|| "<none>".to_string())
+                )
+                .into());
+            }
+        }
         return Ok(());
     }
 
@@ -6549,6 +6575,7 @@ fn sync_core_to_worker(
         &sudo_wrap(&format!("bash -lc '{}'", promote_cmd_q)),
         BOOTSTRAP_SSH_USER,
     )?;
+    verify_remote_core_components(address, key_path, &manifest, &component_names)?;
 
     if let Some(local_hash) = local_core_manifest_hash()? {
         let remote_hash = remote_core_manifest_hash(address, key_path)?;
@@ -6585,6 +6612,62 @@ fn sync_core_to_worker(
     }
 
     Ok(())
+}
+
+fn verify_remote_core_components(
+    address: &str,
+    key_path: &Path,
+    manifest: &CoreManifest,
+    component_names: &[String],
+) -> Result<(), OrchestratorError> {
+    if component_names.is_empty() {
+        return Ok(());
+    }
+    let mut commands = vec!["set -euo pipefail".to_string()];
+    for name in component_names {
+        let expected = manifest
+            .components
+            .get(name)
+            .ok_or_else(|| format!("core manifest missing component '{}'", name))?;
+        commands.push(format!(
+            "test -f '/var/lib/fluxbee/dist/core/bin/{name}'",
+            name = shell_single_quote(name),
+        ));
+        commands.push(format!(
+            "test \"$(sha256sum '/var/lib/fluxbee/dist/core/bin/{name}' | awk '{{print $1}}')\" = '{sha}'",
+            name = shell_single_quote(name),
+            sha = shell_single_quote(expected.sha256.trim()),
+        ));
+        commands.push(format!(
+            "test -f '/usr/bin/{name}'",
+            name = shell_single_quote(name),
+        ));
+        commands.push(format!(
+            "test \"$(sha256sum '/usr/bin/{name}' | awk '{{print $1}}')\" = '{sha}'",
+            name = shell_single_quote(name),
+            sha = shell_single_quote(expected.sha256.trim()),
+        ));
+        if let Some(size) = expected.size {
+            commands.push(format!(
+                "test \"$(stat -c %s '/var/lib/fluxbee/dist/core/bin/{name}')\" = '{size}'",
+                name = shell_single_quote(name),
+                size = size,
+            ));
+            commands.push(format!(
+                "test \"$(stat -c %s '/usr/bin/{name}')\" = '{size}'",
+                name = shell_single_quote(name),
+                size = size,
+            ));
+        }
+    }
+    let verify_cmd = commands.join(" && ");
+    let verify_cmd_q = shell_single_quote(&verify_cmd);
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("bash -lc '{}'", verify_cmd_q)),
+        BOOTSTRAP_SSH_USER,
+    )
 }
 
 fn remote_service_exists(
@@ -6681,16 +6764,27 @@ fn remote_wait_service_active(
         std::thread::sleep(Duration::from_secs(1));
     }
 
-    // Avoid timeout-edge false negatives: if it became running right at the end, accept it.
-    if check_running().unwrap_or(false) {
-        tracing::warn!(
-            service = service,
-            timeout_secs = timeout_secs,
-            "service reached running state at timeout edge; accepting health gate"
-        );
-        return Ok(());
+    // Avoid timeout-edge false negatives, but still require stability.
+    let mut edge_stable = 0_u8;
+    for _ in 0..3 {
+        match check_running() {
+            Ok(true) => {
+                edge_stable = edge_stable.saturating_add(1);
+                if edge_stable >= 3 {
+                    tracing::warn!(
+                        service = service,
+                        timeout_secs = timeout_secs,
+                        "service reached running state at timeout edge; accepting health gate"
+                    );
+                    return Ok(());
+                }
+            }
+            Ok(false) | Err(_) => {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
-
     let detail = last_err.unwrap_or_else(|| "timed out waiting for active/running".to_string());
     let detail = if let Some(summary) = last_state_summary {
         format!("{detail}; state={summary}")
