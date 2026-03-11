@@ -943,14 +943,37 @@ impl IdentityRuntime {
             {
                 Ok(req) => match self.store.create_tenant(req) {
                     Ok(ok) => {
-                        if let Some(tenant_id) = ok.get("tenant_id").and_then(Value::as_str) {
-                            if let Some(tenant) = self.store.tenants.get(tenant_id) {
-                                deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
-                                    tenant: tenant.clone(),
-                                }));
+                        if let Some(tenant_id) = ok.get("tenant_id").and_then(Value::as_str).map(str::to_string) {
+                            if let Some(tenant) = self.store.tenants.get(&tenant_id).cloned() {
+                                if self.is_primary {
+                                    if let Some(database_url) = self.db_url.as_deref() {
+                                        if let Err(err) = upsert_tenant_in_db(database_url, &tenant).await {
+                                            self.store.tenants.remove(&tenant_id);
+                                            error_payload("DB_WRITE_FAILED", &format!("failed to persist tenant: {}", err))
+                                        } else {
+                                            deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
+                                                tenant,
+                                            }));
+                                            ok
+                                        }
+                                    } else {
+                                        deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
+                                            tenant,
+                                        }));
+                                        ok
+                                    }
+                                } else {
+                                    deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
+                                        tenant,
+                                    }));
+                                    ok
+                                }
+                            } else {
+                                ok
                             }
+                        } else {
+                            ok
                         }
-                        ok
                     }
                     Err(code) => error_payload(&code, "failed to create tenant"),
                 },
@@ -961,13 +984,35 @@ impl IdentityRuntime {
                     Ok(req) => match self.store.approve_tenant(req) {
                         Ok(ok) => {
                             if let Some(tenant_id) = ok.get("tenant_id").and_then(Value::as_str) {
-                                if let Some(tenant) = self.store.tenants.get(tenant_id) {
-                                    deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
-                                        tenant: tenant.clone(),
-                                    }));
+                                if let Some(tenant) = self.store.tenants.get(tenant_id).cloned() {
+                                    if self.is_primary {
+                                        if let Some(database_url) = self.db_url.as_deref() {
+                                            if let Err(err) = upsert_tenant_in_db(database_url, &tenant).await {
+                                                error_payload("DB_WRITE_FAILED", &format!("failed to persist tenant approval: {}", err))
+                                            } else {
+                                                deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
+                                                    tenant,
+                                                }));
+                                                ok
+                                            }
+                                        } else {
+                                            deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
+                                                tenant,
+                                            }));
+                                            ok
+                                        }
+                                    } else {
+                                        deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
+                                            tenant,
+                                        }));
+                                        ok
+                                    }
+                                } else {
+                                    ok
                                 }
+                            } else {
+                                ok
                             }
-                            ok
                         }
                         Err(code) => error_payload(&code, "failed to approve tenant"),
                     },
@@ -1157,6 +1202,34 @@ async fn main() -> Result<(), IdentityError> {
         None
     };
     let mut runtime = IdentityRuntime::new(&hive, state_dir.clone(), is_primary, db_url);
+    if is_primary {
+        if let Some(database_url) = runtime.db_url.clone() {
+            match load_tenants_from_db(&database_url).await {
+                Ok(tenants) if tenants.is_empty() => {
+                    if let Some(default_tenant_id) = runtime.store.default_tenant_id() {
+                        if let Some(default_tenant) = runtime.store.tenants.get(&default_tenant_id).cloned() {
+                            if let Err(err) = upsert_tenant_in_db(&database_url, &default_tenant).await {
+                                tracing::warn!(error = %err, "failed to persist default tenant in primary db bootstrap");
+                            } else {
+                                tracing::info!(tenant_id = %default_tenant.tenant_id, "persisted default tenant in primary db bootstrap");
+                            }
+                        }
+                    }
+                }
+                Ok(tenants) => {
+                    let mut loaded = HashMap::new();
+                    for tenant in tenants {
+                        loaded.insert(tenant.tenant_id.clone(), tenant);
+                    }
+                    runtime.store.tenants = loaded;
+                    tracing::info!(tenant_count = runtime.store.tenants.len(), "loaded identity tenants from primary db");
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to load tenants from primary db; continuing with in-memory bootstrap");
+                }
+            }
+        }
+    }
     let identity_shm_name = identity_shm_name(&hive.hive_id);
     let identity_limits = identity_region_limits(&hive);
     let mut identity_shm = match IdentityRegionWriter::open_or_create(
@@ -2341,6 +2414,84 @@ SELECT COUNT(*)::BIGINT AS removed_count FROM expired
         .unwrap_or(0)
         .max(0) as u64;
     Ok(removed)
+}
+
+async fn load_tenants_from_db(database_url: &str) -> Result<Vec<TenantRecord>, IdentityError> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "identity tenant load postgres connection closed");
+        }
+    });
+
+    let rows = client
+        .query(
+            r#"
+SELECT
+    tenant_id::text AS tenant_id,
+    name,
+    domain,
+    status,
+    settings
+FROM identity_tenants
+ORDER BY created_at ASC
+"#,
+            &[],
+        )
+        .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let tenant_uuid: String = row.get("tenant_id");
+        let tenant_id = format!("tnt:{}", tenant_uuid);
+        let name: String = row.get("name");
+        let domain: Option<String> = row.get("domain");
+        let status: String = row.get("status");
+        let settings: Value = row.get("settings");
+        out.push(TenantRecord {
+            tenant_id,
+            name,
+            domain,
+            status,
+            settings,
+        });
+    }
+    Ok(out)
+}
+
+async fn upsert_tenant_in_db(database_url: &str, tenant: &TenantRecord) -> Result<(), IdentityError> {
+    let tenant_uuid = parse_prefixed_uuid(&tenant.tenant_id, "tnt")?;
+    let tenant_uuid = tenant_uuid.to_string();
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "identity tenant upsert postgres connection closed");
+        }
+    });
+
+    client
+        .execute(
+            r#"
+INSERT INTO identity_tenants (tenant_id, name, domain, status, settings, updated_at)
+VALUES ($1::uuid, $2, $3, $4, $5::jsonb, NOW())
+ON CONFLICT (tenant_id) DO UPDATE
+SET
+    name = EXCLUDED.name,
+    domain = EXCLUDED.domain,
+    status = EXCLUDED.status,
+    settings = EXCLUDED.settings,
+    updated_at = NOW()
+"#,
+            &[
+                &tenant_uuid,
+                &tenant.name,
+                &tenant.domain,
+                &tenant.status,
+                &tenant.settings,
+            ],
+        )
+        .await?;
+    Ok(())
 }
 
 fn database_url(hive: &HiveFile) -> Result<String, IdentityError> {

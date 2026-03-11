@@ -155,7 +155,7 @@ check_register_contract() {
   if [[ "$REQUIRE_IDENTITY_REGISTER_OK" == "1" && "$reg_status" != "ok" ]]; then
     echo "FAIL[$label]: payload.identity.register.status='$reg_status' reason='$reg_reason'" >&2
     if [[ "$reg_code" == "INVALID_TENANT" ]]; then
-      echo "Hint: TENANT_ID does not exist in identity primary. Use a fresh tenant_id from TNT_CREATE (for example TENANT_ID from scripts/identity_merge_alias_e2e.sh output)." >&2
+      echo "Hint: TENANT_ID does not exist in identity primary. Use a fresh tenant_id from scripts/identity_provision_complete_e2e.sh output (TENANT_ID=...)." >&2
     else
       echo "Hint: provide TENANT_ID=tnt:<uuid> or set ORCH_DEFAULT_TENANT_ID in sy-orchestrator environment." >&2
     fi
