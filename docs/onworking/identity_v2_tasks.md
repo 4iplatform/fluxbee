@@ -154,10 +154,21 @@ Salida:
 
 ## 8) Fase F - OPA y canonicalización de ILK
 
-- [ ] F1. Exponer `data.identity` y `data.identity_aliases` desde reader SHM.
-- [ ] F2. Canonicalizar `src_ilk` en reglas antes de derivar tenant/capabilities.
-- [ ] F3. Regla de ruteo a frontdesk para `registration_status=temporary`.
-- [ ] F4. Validar que mensajes con ILK temporal mergeado sigan resolviendo por alias durante TTL.
+- [x] F1. Exponer `data.identity` y `data.identity_aliases` desde reader SHM.
+  - `SY.identity` ahora sincroniza snapshot completo (tenants/ilks/ichs/aliases) a `jsr-identity-*`.
+  - `router` inyecta `identity` + `identity_aliases` en el bundle OPA al recargar policy.
+- [x] F2. Canonicalizar `src_ilk` antes de resolver target.
+  - Implementado en `router` como pre-resolve integrado:
+    - lee alias desde SHM identity,
+    - canonicaliza `meta.context.src_ilk` (si existe),
+    - luego evalúa OPA con el ILK canonical.
+- [x] F3. Ruteo de temporales a frontdesk.
+  - Implementado en `router` como override pre-OPA:
+    - si `registration_status=temporary`, fuerza target `AI.frontdesk@<hive>`.
+- [x] F4. Validar que mensajes con ILK temporal mergeado sigan resolviendo por alias durante TTL.
+  - Validado en tests de `router` (pre-resolve identity):
+    - `apply_identity_pre_resolve_keeps_alias_canonical_during_ttl`
+    - `apply_identity_pre_resolve_ignores_alias_after_ttl`
 
 Salida:
 - decisiones L3 consistentes sin perder mensajes en ventana de merge.
@@ -166,8 +177,14 @@ Salida:
 
 - [ ] G1. E2E provisión:
   - ICH desconocido -> `ILK_PROVISION` -> ILK temporal real -> ruta a frontdesk.
+  - Avance: diag+script integrados:
+    - `src/bin/identity_provision_complete_diag.rs` (incluye verificación de route a `AI.frontdesk`)
+    - `scripts/identity_provision_complete_e2e.sh`
 - [ ] G2. E2E complete:
   - `ILK_REGISTER` completa ILK temporal y reasigna tenant.
+  - Avance: validación integrada en `identity_provision_complete_diag`:
+    - convergencia `registration_status=complete` + `tenant_id` esperado en SHM identity,
+    - bloqueo de segunda reasignación (`INVALID_TENANT_TRANSITION`) para ILK ya completo.
 - [ ] G3. E2E add_channel + merge:
   - nuevo ICH -> temporal -> `ILK_ADD_CHANNEL` -> alias activo -> convergencia a canonical.
   - Avance: script dedicado `scripts/identity_merge_alias_e2e.sh` (convergencia old->canonical y opcional wait/cleanup por TTL).

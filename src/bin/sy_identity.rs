@@ -18,8 +18,10 @@ use uuid::Uuid;
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
 use json_router::shm::{
-    now_epoch_ms, IdentityRegionLimits, IdentityRegionWriter, LsaRegionReader, LsaSnapshot,
-    NodeEntry, RouterRegionReader, ShmSnapshot, ICH_ADDRESS_MAX_LEN, ICH_CHANNEL_TYPE_MAX_LEN,
+    copy_bytes_with_len, now_epoch_ms, IchEntry, IdentityRegionLimits, IdentityRegionWriter,
+    IlkAliasEntry, IlkEntry, LsaRegionReader, LsaSnapshot, NodeEntry, RouterRegionReader,
+    ShmSnapshot, TenantEntry, VocabularyEntry, FLAG_ACTIVE, ICH_ADDRESS_MAX_LEN,
+    ICH_CHANNEL_TYPE_MAX_LEN,
 };
 
 type IdentityError = Box<dyn std::error::Error + Send + Sync>;
@@ -41,6 +43,15 @@ const IDENTITY_DELTA_MAX_RETRIES: u32 = 3;
 const DEFAULT_IDENTITY_SHM_MAX_ILKS: u32 = 8_192;
 const DEFAULT_IDENTITY_SHM_MAX_TENANTS: u32 = 1_024;
 const DEFAULT_IDENTITY_SHM_MAX_VOCABULARY: u32 = 4_096;
+const SHM_ILK_TYPE_HUMAN: u8 = 0;
+const SHM_ILK_TYPE_AGENT: u8 = 1;
+const SHM_ILK_TYPE_SYSTEM: u8 = 2;
+const SHM_REG_STATUS_TEMPORARY: u8 = 0;
+const SHM_REG_STATUS_PARTIAL: u8 = 1;
+const SHM_REG_STATUS_COMPLETE: u8 = 2;
+const SHM_TENANT_STATUS_PENDING: u8 = 0;
+const SHM_TENANT_STATUS_ACTIVE: u8 = 1;
+const SHM_TENANT_STATUS_SUSPENDED: u8 = 2;
 
 const MSG_ILK_PROVISION: &str = "ILK_PROVISION";
 const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
@@ -322,10 +333,15 @@ impl IdentityStore {
 
         let key = canonical_ich_key(&req.channel_type, &req.address);
         if let Some(existing) = self.ich_lookup.get(&key) {
+            let status = self
+                .ilks
+                .get(existing)
+                .map(|ilk| ilk.registration_status.as_str())
+                .unwrap_or("temporary");
             return Ok(json!({
                 "status": "ok",
                 "ilk_id": existing,
-                "registration_status": "temporary",
+                "registration_status": status,
             }));
         }
 
@@ -1333,21 +1349,123 @@ fn identity_region_limits(hive: &HiveFile) -> IdentityRegionLimits {
     }
 }
 
+fn parse_ilk_type_for_shm(value: &str) -> u8 {
+    match value.trim() {
+        "human" => SHM_ILK_TYPE_HUMAN,
+        "agent" => SHM_ILK_TYPE_AGENT,
+        "system" => SHM_ILK_TYPE_SYSTEM,
+        _ => SHM_ILK_TYPE_SYSTEM,
+    }
+}
+
+fn parse_registration_status_for_shm(value: &str) -> u8 {
+    match value.trim() {
+        "temporary" => SHM_REG_STATUS_TEMPORARY,
+        "partial" => SHM_REG_STATUS_PARTIAL,
+        "complete" => SHM_REG_STATUS_COMPLETE,
+        _ => SHM_REG_STATUS_TEMPORARY,
+    }
+}
+
+fn parse_tenant_status_for_shm(value: &str) -> u8 {
+    match value.trim() {
+        "pending" => SHM_TENANT_STATUS_PENDING,
+        "active" => SHM_TENANT_STATUS_ACTIVE,
+        "suspended" => SHM_TENANT_STATUS_SUSPENDED,
+        _ => SHM_TENANT_STATUS_PENDING,
+    }
+}
+
+fn identification_str<'a>(identification: &'a Value, key: &str) -> Option<&'a str> {
+    identification
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 fn sync_identity_shm_mappings(
     writer: &mut IdentityRegionWriter,
     store: &IdentityStore,
 ) -> Result<(), IdentityError> {
-    writer.clear()?;
-    let mut mapped_channels = 0u64;
-    for (ilk_id, ilk) in &store.ilks {
+    let now_ms = now_epoch_ms();
+    let mut tenant_entries: Vec<TenantEntry> = Vec::new();
+    let mut ilk_entries: Vec<IlkEntry> = Vec::new();
+    let mut ich_entries: Vec<IchEntry> = Vec::new();
+    let mut alias_entries: Vec<IlkAliasEntry> = Vec::new();
+    let vocabulary_entries: Vec<VocabularyEntry> = Vec::new();
+
+    let mut tenant_ids: Vec<String> = store.tenants.keys().cloned().collect();
+    tenant_ids.sort_unstable();
+    for tenant_id in tenant_ids {
+        let Some(tenant) = store.tenants.get(&tenant_id) else {
+            continue;
+        };
+        let Ok(tenant_uuid) = parse_prefixed_uuid(&tenant.tenant_id, "tnt") else {
+            tracing::warn!(
+                tenant_id = %tenant.tenant_id,
+                "skipping invalid tenant_id during identity shm sync"
+            );
+            continue;
+        };
+        let mut entry = TenantEntry {
+            tenant_id: *tenant_uuid.as_bytes(),
+            name: [0u8; 128],
+            domain: [0u8; 128],
+            status: parse_tenant_status_for_shm(&tenant.status),
+            flags: FLAG_ACTIVE,
+            _pad0: [0u8; 5],
+            max_ilks: tenant
+                .settings
+                .get("max_ilks")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32,
+            created_at: now_ms,
+            updated_at: now_ms,
+            _reserved: [0u8; 8],
+        };
+        copy_bytes_with_len(&mut entry.name, tenant.name.trim());
+        if let Some(domain) = tenant
+            .domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            copy_bytes_with_len(&mut entry.domain, domain);
+        }
+        tenant_entries.push(entry);
+    }
+
+    let mut channel_to_ich: HashMap<(String, String), [u8; 16]> = HashMap::new();
+    let mut ilk_ids: Vec<String> = store.ilks.keys().cloned().collect();
+    ilk_ids.sort_unstable();
+    for ilk_id in ilk_ids {
+        let Some(ilk) = store.ilks.get(&ilk_id) else {
+            continue;
+        };
         if ilk.deleted_at_ms.is_some() {
             continue;
         }
-        let Ok(ilk_uuid) = parse_prefixed_uuid(ilk_id, "ilk") else {
-            tracing::warn!(ilk_id = %ilk_id, "skipping invalid ilk_id during identity shm sync");
+        let Ok(ilk_uuid) = parse_prefixed_uuid(&ilk.ilk_id, "ilk") else {
+            tracing::warn!(
+                ilk_id = %ilk.ilk_id,
+                "skipping invalid ilk_id during identity shm sync"
+            );
             continue;
         };
-        for channel in &ilk.channels {
+        let Ok(tenant_uuid) = parse_prefixed_uuid(&ilk.tenant_id, "tnt") else {
+            tracing::warn!(
+                ilk_id = %ilk.ilk_id,
+                tenant_id = %ilk.tenant_id,
+                "skipping ILK with invalid tenant_id during identity shm sync"
+            );
+            continue;
+        };
+
+        let ich_offset = ich_entries.len() as u32;
+        let mut ich_count: u16 = 0;
+        for (idx, channel) in ilk.channels.iter().enumerate() {
             let channel_type = channel.channel_type.trim().to_ascii_lowercase();
             let address = channel.address.trim().to_ascii_lowercase();
             if channel_type.is_empty() || address.is_empty() {
@@ -1355,31 +1473,150 @@ fn sync_identity_shm_mappings(
             }
             let Ok(ich_uuid) = parse_prefixed_uuid(&channel.ich_id, "ich") else {
                 tracing::warn!(
-                    ilk_id = %ilk_id,
+                    ilk_id = %ilk.ilk_id,
                     ich_id = %channel.ich_id,
                     "skipping invalid ich_id during identity shm sync"
                 );
                 continue;
             };
-            if let Err(err) = writer.upsert_ich_mapping(
-                &channel_type,
-                &address,
-                *ich_uuid.as_bytes(),
-                *ilk_uuid.as_bytes(),
-            ) {
-                tracing::warn!(
-                    ilk_id = %ilk_id,
-                    channel_type = %channel_type,
-                    address = %address,
-                    error = %err,
-                    "failed to upsert identity shm ich mapping"
-                );
-                continue;
-            }
-            mapped_channels = mapped_channels.saturating_add(1);
+            let mut ich_entry = IchEntry {
+                ich_id: *ich_uuid.as_bytes(),
+                ilk_id: *ilk_uuid.as_bytes(),
+                channel_type: [0u8; ICH_CHANNEL_TYPE_MAX_LEN],
+                address: [0u8; ICH_ADDRESS_MAX_LEN],
+                flags: FLAG_ACTIVE,
+                is_primary: if idx == 0 { 1 } else { 0 },
+                _pad0: [0u8; 5],
+                added_at: now_ms,
+                _reserved: [0u8; 16],
+            };
+            copy_bytes_with_len(&mut ich_entry.channel_type, &channel_type);
+            copy_bytes_with_len(&mut ich_entry.address, &address);
+            ich_entries.push(ich_entry);
+            ich_count = ich_count.saturating_add(1);
+            channel_to_ich.insert((channel_type, address), *ich_uuid.as_bytes());
         }
+
+        let mut ilk_entry = IlkEntry {
+            ilk_id: *ilk_uuid.as_bytes(),
+            ilk_type: parse_ilk_type_for_shm(&ilk.ilk_type),
+            registration_status: parse_registration_status_for_shm(&ilk.registration_status),
+            flags: FLAG_ACTIVE,
+            tenant_id: *tenant_uuid.as_bytes(),
+            display_name: [0u8; 128],
+            handler_node: [0u8; 128],
+            ich_offset,
+            ich_count,
+            _pad0: [0u8; 2],
+            roles_offset: 0,
+            roles_len: 0,
+            _pad1: [0u8; 2],
+            capabilities_offset: 0,
+            capabilities_len: 0,
+            _pad2: [0u8; 2],
+            created_at: now_ms,
+            updated_at: now_ms,
+            _reserved: [0u8; 8],
+        };
+        let display_name = identification_str(&ilk.identification, "display_name")
+            .or_else(|| identification_str(&ilk.identification, "node_name"))
+            .unwrap_or(ilk.ilk_id.as_str());
+        copy_bytes_with_len(&mut ilk_entry.display_name, display_name);
+        if let Some(handler_node) = identification_str(&ilk.identification, "node_name") {
+            copy_bytes_with_len(&mut ilk_entry.handler_node, handler_node);
+        }
+        ilk_entries.push(ilk_entry);
     }
-    tracing::debug!(mapped_channels, "identity shm mapping sync applied");
+
+    let mut alias_keys: Vec<String> = store.aliases.keys().cloned().collect();
+    alias_keys.sort_unstable();
+    for old_ilk_id in alias_keys {
+        let Some(alias) = store.aliases.get(&old_ilk_id) else {
+            continue;
+        };
+        if alias.expires_at_ms <= now_ms {
+            continue;
+        }
+        let Ok(old_uuid) = parse_prefixed_uuid(&old_ilk_id, "ilk") else {
+            tracing::warn!(
+                old_ilk_id = %old_ilk_id,
+                "skipping invalid alias old_ilk_id during identity shm sync"
+            );
+            continue;
+        };
+        let Ok(canonical_uuid) = parse_prefixed_uuid(&alias.canonical_ilk_id, "ilk") else {
+            tracing::warn!(
+                old_ilk_id = %old_ilk_id,
+                canonical_ilk_id = %alias.canonical_ilk_id,
+                "skipping invalid alias canonical_ilk_id during identity shm sync"
+            );
+            continue;
+        };
+        alias_entries.push(IlkAliasEntry {
+            old_ilk_id: *old_uuid.as_bytes(),
+            canonical_ilk_id: *canonical_uuid.as_bytes(),
+            expires_at: alias.expires_at_ms,
+            flags: FLAG_ACTIVE,
+            _reserved: [0u8; 22],
+        });
+    }
+
+    writer.write_snapshot_entries(
+        &tenant_entries,
+        &ilk_entries,
+        &ich_entries,
+        &alias_entries,
+        &vocabulary_entries,
+    )?;
+
+    let mut mapped_channels = 0u64;
+    let mut lookup_keys: Vec<(String, String)> = store.ich_lookup.keys().cloned().collect();
+    lookup_keys.sort_unstable();
+    for (channel_type, address) in lookup_keys {
+        let Some(ilk_id) = store
+            .ich_lookup
+            .get(&(channel_type.clone(), address.clone()))
+        else {
+            continue;
+        };
+        let Ok(ilk_uuid) = parse_prefixed_uuid(ilk_id, "ilk") else {
+            tracing::warn!(ilk_id = %ilk_id, "skipping invalid ilk_id during identity shm sync");
+            continue;
+        };
+        let Some(ich_id) = channel_to_ich
+            .get(&(channel_type.clone(), address.clone()))
+            .copied()
+        else {
+            tracing::warn!(
+                ilk_id = %ilk_id,
+                channel_type = %channel_type,
+                address = %address,
+                "missing ich_id for lookup key during identity shm sync"
+            );
+            continue;
+        };
+        if let Err(err) =
+            writer.upsert_ich_mapping(&channel_type, &address, ich_id, *ilk_uuid.as_bytes())
+        {
+            tracing::warn!(
+                ilk_id = %ilk_id,
+                channel_type = %channel_type,
+                address = %address,
+                error = %err,
+                "failed to upsert identity shm ich mapping"
+            );
+            continue;
+        }
+        mapped_channels = mapped_channels.saturating_add(1);
+    }
+    tracing::debug!(
+        mapped_channels,
+        tenant_count = tenant_entries.len(),
+        ilk_count = ilk_entries.len(),
+        ich_count = ich_entries.len(),
+        alias_count = alias_entries.len(),
+        "identity shm snapshot sync applied"
+    );
     Ok(())
 }
 
