@@ -261,10 +261,10 @@ as_root_local mkdir -p "$runtime_bin_dir" "$SCENARIO_ROOT"
 as_root_local install -m 0755 "$BIN_PATH" "$runtime_bin_dir/io_test_diag"
 
 start_tmp="$tmpdir/start.sh"
-cat >"$start_tmp" <<EOF
+cat >"$start_tmp" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-SCENARIO_ENV_FILE="$SCENARIO_ENV"
+SCENARIO_ENV_FILE="__IO_TEST_SCENARIO_ENV__"
 if [[ ! -f "$SCENARIO_ENV_FILE" ]]; then
   exit 10
 fi
@@ -295,6 +295,8 @@ else
 fi
 exec /bin/sleep "${IO_TEST_HOLD_SECS:-3600}"
 EOF
+scenario_env_escaped="$(printf '%s' "$SCENARIO_ENV" | sed 's/[\/&]/\\&/g')"
+sed -i'' -e "s/__IO_TEST_SCENARIO_ENV__/${scenario_env_escaped}/g" "$start_tmp"
 as_root_local install -m 0755 "$start_tmp" "$runtime_bin_dir/start.sh"
 
 echo "Step 3/8: update runtime manifest"
