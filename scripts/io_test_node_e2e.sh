@@ -18,6 +18,7 @@ set -euo pipefail
 #   IO_TEST_CHANNEL_TYPE=whatsapp
 #   IO_TEST_ADDRESS=+54911...
 #   IO_TEST_ALLOW_PROVISION=1
+#   IO_TEST_IDENTITY_TARGET=SY.identity@sandbox
 #   WAIT_SYNC_HINT_SECS=120
 #   WAIT_UPDATE_SECS=120
 #   WAIT_STATUS_SECS=90
@@ -229,6 +230,7 @@ fi
 if [[ -z "$HIVE_ID" ]]; then
   HIVE_ID="sandbox"
 fi
+IO_TEST_IDENTITY_TARGET="${IO_TEST_IDENTITY_TARGET:-SY.identity@${HIVE_ID}}"
 
 tmpdir="$(mktemp -d)"
 cleanup() {
@@ -285,7 +287,7 @@ if JSR_LOG_LEVEL="${JSR_LOG_LEVEL:-info}" \
    IO_TEST_CHANNEL_TYPE="$IO_TEST_CHANNEL_TYPE" \
    IO_TEST_ADDRESS="$IO_TEST_ADDRESS" \
    IO_TEST_ALLOW_PROVISION="$IO_TEST_ALLOW_PROVISION" \
-   IO_TEST_IDENTITY_TARGET="SY.identity@${IO_TEST_TARGET_HIVE}" \
+   IO_TEST_IDENTITY_TARGET="$IO_TEST_IDENTITY_TARGET" \
    IO_TEST_NODE_NAME="${IO_TEST_NODE_NAME:-IO.test.diag}" \
    IO_TEST_NODE_VERSION="${IO_TEST_NODE_VERSION:-0.0.1}" \
    "$(dirname "${BASH_SOURCE[0]}")/io_test_diag" >"$IO_TEST_LOG_FILE" 2>&1; then
@@ -370,6 +372,7 @@ scenario_tmp="$tmpdir/scenario.env"
   printf 'IO_TEST_ADDRESS=%q\n' "$IO_TEST_ADDRESS"
   printf 'IO_TEST_ALLOW_PROVISION=%q\n' "$IO_TEST_ALLOW_PROVISION"
   printf 'IO_TEST_TARGET_HIVE=%q\n' "$HIVE_ID"
+  printf 'IO_TEST_IDENTITY_TARGET=%q\n' "$IO_TEST_IDENTITY_TARGET"
   printf 'IO_TEST_NODE_NAME=%q\n' "$NODE_NAME"
   printf 'IO_TEST_NODE_VERSION=%q\n' "0.0.1"
   printf 'JSR_LOG_LEVEL=%q\n' "info"

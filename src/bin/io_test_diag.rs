@@ -2,7 +2,8 @@ use std::error::Error;
 use std::path::PathBuf;
 
 use fluxbee_sdk::identity::{
-    load_hive_id, provision_ilk, resolve_ilk_from_hive_config, IlkProvisionRequest,
+    load_hive_id, provision_ilk, resolve_ilk_from_hive_config, IdentityShmError,
+    IlkProvisionRequest,
 };
 use fluxbee_sdk::{connect, NodeConfig};
 use tokio::time::{sleep, Duration, Instant};
@@ -30,16 +31,17 @@ async fn main() -> Result<(), DynError> {
     let mut mode = "lookup_hit".to_string();
     let mut provision_trace_id: Option<String> = None;
     let mut identity_target: Option<String> = None;
-    let ilk_id = match resolve_ilk_from_hive_config(&config_dir, &channel_type, &address)? {
-        Some(existing) => existing,
-        None if !allow_provision => {
+    let lookup = resolve_ilk_from_hive_config(&config_dir, &channel_type, &address);
+    let ilk_id = match lookup {
+        Ok(Some(existing)) => existing,
+        Ok(None) if !allow_provision => {
             return Err(format!(
                 "no ILK mapping found for channel_type='{}' address='{}' and IO_TEST_ALLOW_PROVISION=0",
                 channel_type, address
             )
             .into());
         }
-        None => {
+        Ok(None) => {
             mode = "provisioned".to_string();
             let hive_id = load_hive_id(&config_dir)?;
             let target = env_or(
@@ -74,6 +76,48 @@ async fn main() -> Result<(), DynError> {
                 .await?
                 .unwrap_or(provisioned.ilk_id)
         }
+        Err(err) if allow_provision && is_lookup_unavailable(&err) => {
+            mode = "provisioned_lookup_unavailable".to_string();
+            tracing::warn!(
+                error = %err,
+                channel_type = %channel_type,
+                address = %address,
+                "identity SHM lookup unavailable; continuing with ILK_PROVISION"
+            );
+            let hive_id = load_hive_id(&config_dir)?;
+            let target = env_or(
+                "IO_TEST_IDENTITY_TARGET",
+                &format!("SY.identity@{}", hive_id),
+            );
+            let ich_id = format!("ich:{}", Uuid::new_v4());
+            let node_config = NodeConfig {
+                name: node_name,
+                router_socket: json_router::paths::router_socket_dir(),
+                uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
+                config_dir: json_router::paths::config_dir(),
+                version: node_version,
+            };
+            let (sender, mut receiver) = connect(&node_config).await?;
+            let provisioned = provision_ilk(
+                &sender,
+                &mut receiver,
+                IlkProvisionRequest {
+                    target: &target,
+                    ich_id: &ich_id,
+                    channel_type: &channel_type,
+                    address: &address,
+                    timeout: Duration::from_millis(provision_timeout_ms),
+                },
+            )
+            .await?;
+            let _ = sender.close().await;
+            provision_trace_id = Some(provisioned.trace_id.clone());
+            identity_target = Some(target);
+            wait_for_lookup_hit(&config_dir, &channel_type, &address, post_provision_wait_ms)
+                .await?
+                .unwrap_or(provisioned.ilk_id)
+        }
+        Err(err) => return Err(err.into()),
     };
 
     tracing::info!(
@@ -146,4 +190,12 @@ fn env_bool(key: &str, default: bool) -> bool {
             )
         })
         .unwrap_or(default)
+}
+
+fn is_lookup_unavailable(err: &IdentityShmError) -> bool {
+    match err {
+        IdentityShmError::Nix(errno) => *errno == nix::errno::Errno::ENOENT,
+        IdentityShmError::Io(io_err) => io_err.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
 }
