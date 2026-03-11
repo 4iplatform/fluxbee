@@ -1038,8 +1038,10 @@ impl IdentityRuntime {
             return false;
         };
 
+        let variants = authorized_name_variants(name);
+
         if let Some(exacts) = self.allowed_exacts.get(action) {
-            if exacts.contains(name) {
+            if variants.iter().any(|candidate| exacts.contains(candidate)) {
                 return true;
             }
         }
@@ -1047,7 +1049,9 @@ impl IdentityRuntime {
         let Some(prefixes) = self.allowed_prefixes.get(action) else {
             return false;
         };
-        prefixes.iter().any(|prefix| name.starts_with(prefix))
+        variants
+            .iter()
+            .any(|candidate| prefixes.iter().any(|prefix| candidate.starts_with(prefix)))
     }
 
     async fn resolve_source_name_with_retry(&self, source_uuid: &str) -> Option<String> {
@@ -1090,6 +1094,16 @@ impl IdentityRuntime {
             .read_snapshot()
             .ok_or_else(|| "lsa shm snapshot unavailable".into())
     }
+}
+
+fn authorized_name_variants(name: &str) -> Vec<String> {
+    let mut out = vec![name.to_string()];
+    if let Some((local, hive)) = name.split_once('@') {
+        if local.starts_with("SY.orchestrator.relay.") {
+            out.push(format!("SY.orchestrator@{hive}"));
+        }
+    }
+    out
 }
 
 #[tokio::main]
