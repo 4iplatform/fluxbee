@@ -29,6 +29,9 @@ Spec fuente: `docs/10-identity-v2.md`
 - SHM fijo + seqlock (mismo patrón que router/config/lsa/opa).
 - Sync identity solo por socket SY.identity<->SY.identity (no CONFIG_CHANGED, no broadcast).
 - ILK temporal siempre real (`ilk:<uuid-v4>`), nunca pseudo-id.
+- Herramientas para nodos externos (IO/AI/WF fuera del core) viven en `fluxbee_sdk`.
+  - `json-router` implementa runtime/plataforma (writer SHM, servicios SY/RT).
+  - `fluxbee_sdk` expone helpers de consumo (lookup/provision/contratos de integración).
 
 ## 2) Decisiones cerradas (tomadas en spec)
 
@@ -100,9 +103,10 @@ Salida:
 ## 6) Fase D - Sync primary/replica por socket
 
 - [x] D1. Implementar full sync chunked (`IDENTITY_FULL_SYNC`) en cold start.
-- [ ] D2. Implementar delta sync (`IDENTITY_DELTA`) para create/update/delete.
-- [ ] D3. Implementar versionado/orden de deltas y retry/ack por worker.
+- [x] D2. Implementar delta sync (`IDENTITY_DELTA`) para create/update/delete.
+- [x] D3. Implementar versionado/orden de deltas y retry/ack por worker.
 - [ ] D4. Implementar métricas de convergencia (lag, deltas pendientes, tiempo full sync).
+  - tracking detallado en `docs/onworking/diagnostics_tasks.md` sección `6.6 Identity sync (SY.identity)`.
 
 Salida:
 - replicación identity estable entre motherbee (PRIMARY) y workers (REPLICA).
@@ -110,9 +114,20 @@ Salida:
 ## 7) Fase E - Integración con IO/frontdesk/orchestrator
 
 - [ ] E1. IO:
-  - lookup ICH en SHM
-  - si miss: `ILK_PROVISION`
-  - usar `ilk_id` temporal en `meta.src_ilk`
+  - [x] helper lookup ICH->ILK en SHM (SDK `crates/fluxbee_sdk/src/identity.rs`):
+    - `resolve_ilk_from_shm_name`
+    - `resolve_ilk_from_hive_id`
+    - `resolve_ilk_from_hive_config`
+  - [x] helper `ILK_PROVISION` reusable en SDK (`crates/fluxbee_sdk/src/identity.rs`):
+    - `provision_ilk`
+    - `IlkProvisionRequest` / `IlkProvisionResult`
+  - [x] nodo/runtime de referencia para validar infraestructura sin tocar IO productivo:
+    - binario `src/bin/io_test_diag.rs` (usa helpers SDK de lookup/provision)
+    - script `scripts/io_test_node_e2e.sh` (runtime fixture + sync-hint + update + run/kill)
+  - [ ] integrar en runtimes IO reales (fuera de este repo) para:
+    - lookup en SHM
+    - miss -> `ILK_PROVISION`
+    - usar `ilk_id` en `meta.src_ilk`
 - [ ] E2. Frontdesk:
   - completar registro vía `ILK_REGISTER` sobre ILK temporal
   - canal extra por `ILK_ADD_CHANNEL`

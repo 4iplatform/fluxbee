@@ -1229,7 +1229,8 @@ impl IdentityRegionWriter {
                 .ok_or(ShmError::InvalidHeader)?;
         let hash = compute_ich_hash(channel_type, address);
         seqlock_begin_write(&header.seq);
-        let result = upsert_ich_mapping_entry(mappings, hash, channel_type, address, ich_id, ilk_id);
+        let result =
+            upsert_ich_mapping_entry(mappings, hash, channel_type, address, ich_id, ilk_id);
         if let Ok(inserted) = result {
             if inserted {
                 header.ich_mapping_count = header.ich_mapping_count.saturating_add(1);
@@ -1267,7 +1268,13 @@ impl IdentityRegionWriter {
         address: &str,
     ) -> Option<([u8; 16], [u8; 16])> {
         let header = self.header_ref()?;
-        resolve_ich_mapping_from_region(header, self.mmap.as_ref(), &self.layout, channel_type, address)
+        resolve_ich_mapping_from_region(
+            header,
+            self.mmap.as_ref(),
+            &self.layout,
+            channel_type,
+            address,
+        )
     }
 
     fn header_ref(&self) -> Option<&IdentityHeader> {
@@ -1291,6 +1298,50 @@ impl IdentityRegionReader {
         })
     }
 
+    /// Opens the identity region by discovering limits from the SHM header.
+    /// Useful for IO readers that should not need static compile-time limits.
+    pub fn open_read_only_auto(name: &str) -> Result<Self, ShmError> {
+        validate_name(name)?;
+        let cstr = CString::new(name).map_err(|_| ShmError::NameTooLong)?;
+        let fd = shm_open(
+            cstr.as_c_str(),
+            OFlag::O_RDONLY,
+            nix::sys::stat::Mode::empty(),
+        )?;
+        let stat = fstat(fd.as_raw_fd())?;
+        if stat.st_size <= 0 {
+            return Err(ShmError::InvalidHeader);
+        }
+        let mmap = unsafe {
+            MmapOptions::new()
+                .len(stat.st_size as usize)
+                .map(fd.as_raw_fd())?
+        };
+        if !is_region_valid(mmap.as_ref()) {
+            return Err(ShmError::InvalidHeader);
+        }
+        let header =
+            header_ref::<IdentityHeader>(mmap.as_ref(), 0).ok_or(ShmError::InvalidHeader)?;
+        if header.version != IDENTITY_VERSION {
+            return Err(ShmError::InvalidHeader);
+        }
+        let limits = IdentityRegionLimits {
+            max_ilks: header.max_ilks,
+            max_tenants: header.max_tenants,
+            max_vocabulary: header.max_vocabulary,
+            max_ilk_aliases: header.max_ilk_aliases,
+        };
+        let layout = layout_identity(limits);
+        if layout.total_len > stat.st_size as usize {
+            return Err(ShmError::InvalidHeader);
+        }
+        Ok(Self {
+            name: name.to_string(),
+            mmap,
+            layout,
+        })
+    }
+
     pub fn read_snapshot(&self) -> Option<IdentitySnapshot> {
         let header = self.header_ref()?;
         read_identity_snapshot(header, self.mmap.as_ref(), &self.layout)
@@ -1302,7 +1353,13 @@ impl IdentityRegionReader {
         address: &str,
     ) -> Option<([u8; 16], [u8; 16])> {
         let header = self.header_ref()?;
-        resolve_ich_mapping_from_region(header, self.mmap.as_ref(), &self.layout, channel_type, address)
+        resolve_ich_mapping_from_region(
+            header,
+            self.mmap.as_ref(),
+            &self.layout,
+            channel_type,
+            address,
+        )
     }
 
     fn header_ref(&self) -> Option<&IdentityHeader> {
@@ -1915,11 +1972,8 @@ fn read_identity_snapshot(
         let tenants = read_slice::<TenantEntry>(mmap, layout.tenant_offset, max_tenants)?;
         let ilks = read_slice::<IlkEntry>(mmap, layout.ilk_offset, max_ilks)?;
         let ichs = read_slice::<IchEntry>(mmap, layout.ich_offset, max_ichs)?;
-        let ich_mappings = read_slice::<IchMappingEntry>(
-            mmap,
-            layout.ich_mapping_offset,
-            max_ich_mappings,
-        )?;
+        let ich_mappings =
+            read_slice::<IchMappingEntry>(mmap, layout.ich_mapping_offset, max_ich_mappings)?;
         let ilk_aliases =
             read_slice::<IlkAliasEntry>(mmap, layout.ilk_alias_offset, max_ilk_aliases)?;
         let vocabulary =
@@ -2709,19 +2763,15 @@ mod tests {
             Some((ich_b, ilk_b))
         );
 
-        assert!(
-            writer
-                .remove_ich_mapping(channel, address)
-                .expect("remove mapping")
-        );
+        assert!(writer
+            .remove_ich_mapping(channel, address)
+            .expect("remove mapping"));
         let snap = writer.read_snapshot().expect("snapshot");
         assert_eq!(snap.header.ich_mapping_count, 0);
         assert_eq!(writer.resolve_ich_mapping(channel, address), None);
-        assert!(
-            !writer
-                .remove_ich_mapping(channel, address)
-                .expect("remove missing mapping")
-        );
+        assert!(!writer
+            .remove_ich_mapping(channel, address)
+            .expect("remove missing mapping"));
 
         cleanup_shm(&name);
     }
@@ -2752,7 +2802,10 @@ mod tests {
                 }
             }
         }
-        assert!(colliders.len() > table_len, "need enough colliders for test");
+        assert!(
+            colliders.len() > table_len,
+            "need enough colliders for test"
+        );
 
         let mut writer =
             IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, limits)
@@ -2764,33 +2817,58 @@ mod tests {
                 .expect("fill table");
         }
         assert_eq!(
-            writer.read_snapshot().expect("snapshot").header.ich_mapping_count as usize,
+            writer
+                .read_snapshot()
+                .expect("snapshot")
+                .header
+                .ich_mapping_count as usize,
             table_len
         );
 
-        let overflow = writer.upsert_ich_mapping(
-            channel,
-            &colliders[table_len],
-            [250u8; 16],
-            [251u8; 16],
-        );
+        let overflow =
+            writer.upsert_ich_mapping(channel, &colliders[table_len], [250u8; 16], [251u8; 16]);
         assert!(matches!(overflow, Err(ShmError::SlotFull)));
 
-        assert!(
-            writer
-                .remove_ich_mapping(channel, first)
-                .expect("remove A")
-        );
+        assert!(writer.remove_ich_mapping(channel, first).expect("remove A"));
         writer
             .upsert_ich_mapping(channel, &colliders[table_len], [12u8; 16], [13u8; 16])
             .expect("insert B");
         assert_eq!(
-            writer.read_snapshot().expect("snapshot").header.ich_mapping_count as usize,
+            writer
+                .read_snapshot()
+                .expect("snapshot")
+                .header
+                .ich_mapping_count as usize,
             table_len
         );
         assert_eq!(
             writer.resolve_ich_mapping(channel, &colliders[table_len]),
             Some(([12u8; 16], [13u8; 16]))
+        );
+
+        cleanup_shm(&name);
+    }
+
+    #[test]
+    fn identity_reader_auto_discovers_limits_from_header() {
+        let name = format!("/jat{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let limits = IdentityRegionLimits {
+            max_ilks: 2,
+            max_tenants: 2,
+            max_vocabulary: 8,
+            max_ilk_aliases: 2,
+        };
+        let mut writer =
+            IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, limits)
+                .expect("open identity region");
+        writer
+            .upsert_ich_mapping("whatsapp", "+549111111", [1u8; 16], [2u8; 16])
+            .expect("upsert mapping");
+
+        let reader = IdentityRegionReader::open_read_only_auto(&name).expect("open auto reader");
+        assert_eq!(
+            reader.resolve_ich_mapping("whatsapp", "+549111111"),
+            Some(([1u8; 16], [2u8; 16]))
         );
 
         cleanup_shm(&name);

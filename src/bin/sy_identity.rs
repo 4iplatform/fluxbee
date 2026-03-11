@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -8,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::time;
 use tokio_postgres::NoTls;
 use tracing_subscriber::EnvFilter;
@@ -16,8 +18,8 @@ use uuid::Uuid;
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
 use json_router::shm::{
-    now_epoch_ms, ICH_ADDRESS_MAX_LEN, ICH_CHANNEL_TYPE_MAX_LEN, LsaRegionReader, LsaSnapshot,
-    NodeEntry, RouterRegionReader, ShmSnapshot,
+    now_epoch_ms, IdentityRegionLimits, IdentityRegionWriter, LsaRegionReader, LsaSnapshot,
+    NodeEntry, RouterRegionReader, ShmSnapshot, ICH_ADDRESS_MAX_LEN, ICH_CHANNEL_TYPE_MAX_LEN,
 };
 
 type IdentityError = Box<dyn std::error::Error + Send + Sync>;
@@ -31,6 +33,14 @@ const IDENTITY_FULL_SYNC_CHUNK_ITEMS: usize = 256;
 const IDENTITY_SYNC_VERSION: u32 = 1;
 const SYNC_OP_FULL_SYNC_REQUEST: &str = "IDENTITY_FULL_SYNC_REQUEST";
 const SYNC_OP_FULL_SYNC: &str = "full_sync";
+const SYNC_OP_DELTA_SUBSCRIBE: &str = "IDENTITY_DELTA_SUBSCRIBE";
+const SYNC_OP_DELTA: &str = "IDENTITY_DELTA";
+const SYNC_OP_DELTA_ACK: &str = "IDENTITY_DELTA_ACK";
+const IDENTITY_DELTA_ACK_TIMEOUT_MS: u64 = 2_000;
+const IDENTITY_DELTA_MAX_RETRIES: u32 = 3;
+const DEFAULT_IDENTITY_SHM_MAX_ILKS: u32 = 8_192;
+const DEFAULT_IDENTITY_SHM_MAX_TENANTS: u32 = 1_024;
+const DEFAULT_IDENTITY_SHM_MAX_VOCABULARY: u32 = 4_096;
 
 const MSG_ILK_PROVISION: &str = "ILK_PROVISION";
 const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
@@ -70,6 +80,14 @@ struct IdentitySection {
     default_tenant: Option<String>,
     #[serde(default)]
     merge_alias_ttl_secs: Option<u64>,
+    #[serde(default)]
+    max_ilks: Option<u32>,
+    #[serde(default)]
+    max_tenants: Option<u32>,
+    #[serde(default)]
+    max_vocabulary: Option<u32>,
+    #[serde(default)]
+    max_ilk_aliases: Option<u32>,
     #[serde(default)]
     sync: Option<IdentitySyncSection>,
 }
@@ -128,7 +146,7 @@ struct ChannelInput {
     address: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct IlkAddChannelRequest {
     ilk_id: String,
@@ -225,6 +243,12 @@ struct IdentitySyncRequest {
     operation: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct IdentityDeltaAck {
+    operation: String,
+    seq: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AliasSnapshotRecord {
     old_ilk_id: String,
@@ -248,6 +272,24 @@ struct IdentitySyncError {
     status: String,
     error_code: String,
     message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum IdentityDelta {
+    TenantUpsert { tenant: TenantRecord },
+    IlkUpsert { ilk: IlkRecord },
+    IlkDelete { ilk_id: String },
+    AliasUpsert { alias: AliasSnapshotRecord },
+    AliasDelete { old_ilk_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IdentityDeltaEnvelope {
+    version: u32,
+    operation: String,
+    seq: u64,
+    delta: IdentityDelta,
 }
 
 impl IdentityStore {
@@ -658,6 +700,43 @@ impl IdentityStore {
         }
         Ok(store)
     }
+
+    fn apply_delta(&mut self, delta: IdentityDelta) {
+        match delta {
+            IdentityDelta::TenantUpsert { tenant } => {
+                self.tenants.insert(tenant.tenant_id.clone(), tenant);
+            }
+            IdentityDelta::IlkUpsert { ilk } => {
+                let ilk_id = ilk.ilk_id.clone();
+                self.ich_lookup
+                    .retain(|_, mapped_ilk| mapped_ilk != &ilk_id);
+                if ilk.deleted_at_ms.is_none() {
+                    for channel in &ilk.channels {
+                        let key = canonical_ich_key(&channel.channel_type, &channel.address);
+                        self.ich_lookup.insert(key, ilk_id.clone());
+                    }
+                }
+                self.ilks.insert(ilk_id, ilk);
+            }
+            IdentityDelta::IlkDelete { ilk_id } => {
+                self.ich_lookup
+                    .retain(|_, mapped_ilk| mapped_ilk != &ilk_id);
+                self.ilks.remove(&ilk_id);
+            }
+            IdentityDelta::AliasUpsert { alias } => {
+                self.aliases.insert(
+                    alias.old_ilk_id.clone(),
+                    AliasRecord {
+                        canonical_ilk_id: alias.canonical_ilk_id,
+                        expires_at_ms: alias.expires_at_ms,
+                    },
+                );
+            }
+            IdentityDelta::AliasDelete { old_ilk_id } => {
+                self.aliases.remove(&old_ilk_id);
+            }
+        }
+    }
 }
 
 struct IdentityRuntime {
@@ -727,9 +806,9 @@ impl IdentityRuntime {
         &mut self,
         sender: &NodeSender,
         msg: &Message,
-    ) -> Result<(), IdentityError> {
+    ) -> Result<Vec<IdentityDeltaEnvelope>, IdentityError> {
         let Some(action) = msg.meta.msg.as_deref() else {
-            return Ok(());
+            return Ok(Vec::new());
         };
 
         let source_name = self.resolve_source_name_with_retry(&msg.routing.src).await;
@@ -743,14 +822,24 @@ impl IdentityRuntime {
                 "source_name": source_name,
             });
             send_system_response(sender, msg, response_name(action), payload).await?;
-            return Ok(());
+            return Ok(Vec::new());
         }
 
+        let mut deltas: Vec<IdentityDeltaEnvelope> = Vec::new();
         let payload = match action {
             MSG_ILK_PROVISION => {
                 match serde_json::from_value::<IlkProvisionRequest>(msg.payload.clone()) {
                     Ok(req) => match self.store.provision_temporary_ilk(req) {
-                        Ok(ok) => ok,
+                        Ok(ok) => {
+                            if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
+                                if let Some(ilk) = self.store.ilks.get(ilk_id) {
+                                    deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                        ilk: ilk.clone(),
+                                    }));
+                                }
+                            }
+                            ok
+                        }
                         Err(code) => error_payload(&code, "failed to provision ilk"),
                     },
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -759,7 +848,16 @@ impl IdentityRuntime {
             MSG_ILK_REGISTER => {
                 match serde_json::from_value::<IlkRegisterRequest>(msg.payload.clone()) {
                     Ok(req) => match self.store.register_ilk(req) {
-                        Ok(ok) => ok,
+                        Ok(ok) => {
+                            if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
+                                if let Some(ilk) = self.store.ilks.get(ilk_id) {
+                                    deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                        ilk: ilk.clone(),
+                                    }));
+                                }
+                            }
+                            ok
+                        }
                         Err(code) => error_payload(&code, "failed to register ilk"),
                     },
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -767,8 +865,31 @@ impl IdentityRuntime {
             }
             MSG_ILK_ADD_CHANNEL => {
                 match serde_json::from_value::<IlkAddChannelRequest>(msg.payload.clone()) {
-                    Ok(req) => match self.store.add_channel(req, self.merge_alias_ttl_secs) {
-                        Ok(ok) => ok,
+                    Ok(req) => match self
+                        .store
+                        .add_channel(req.clone(), self.merge_alias_ttl_secs)
+                    {
+                        Ok(ok) => {
+                            if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
+                                if let Some(ilk) = self.store.ilks.get(ilk_id) {
+                                    deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                        ilk: ilk.clone(),
+                                    }));
+                                }
+                            }
+                            if let Some(old_ilk_id) = req.merge_from_ilk_id {
+                                if let Some(alias) = self.store.aliases.get(&old_ilk_id) {
+                                    deltas.push(delta_envelope(IdentityDelta::AliasUpsert {
+                                        alias: AliasSnapshotRecord {
+                                            old_ilk_id,
+                                            canonical_ilk_id: alias.canonical_ilk_id.clone(),
+                                            expires_at_ms: alias.expires_at_ms,
+                                        },
+                                    }));
+                                }
+                            }
+                            ok
+                        }
                         Err(code) => error_payload(&code, "failed to add channel"),
                     },
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -777,7 +898,16 @@ impl IdentityRuntime {
             MSG_ILK_UPDATE => match serde_json::from_value::<IlkUpdateRequest>(msg.payload.clone())
             {
                 Ok(req) => match self.store.update_ilk(req) {
-                    Ok(ok) => ok,
+                    Ok(ok) => {
+                        if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
+                            if let Some(ilk) = self.store.ilks.get(ilk_id) {
+                                deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                    ilk: ilk.clone(),
+                                }));
+                            }
+                        }
+                        ok
+                    }
                     Err(code) => error_payload(&code, "failed to update ilk"),
                 },
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -785,7 +915,16 @@ impl IdentityRuntime {
             MSG_TNT_CREATE => match serde_json::from_value::<TntCreateRequest>(msg.payload.clone())
             {
                 Ok(req) => match self.store.create_tenant(req) {
-                    Ok(ok) => ok,
+                    Ok(ok) => {
+                        if let Some(tenant_id) = ok.get("tenant_id").and_then(Value::as_str) {
+                            if let Some(tenant) = self.store.tenants.get(tenant_id) {
+                                deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
+                                    tenant: tenant.clone(),
+                                }));
+                            }
+                        }
+                        ok
+                    }
                     Err(code) => error_payload(&code, "failed to create tenant"),
                 },
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -793,7 +932,16 @@ impl IdentityRuntime {
             MSG_TNT_APPROVE => {
                 match serde_json::from_value::<TntApproveRequest>(msg.payload.clone()) {
                     Ok(req) => match self.store.approve_tenant(req) {
-                        Ok(ok) => ok,
+                        Ok(ok) => {
+                            if let Some(tenant_id) = ok.get("tenant_id").and_then(Value::as_str) {
+                                if let Some(tenant) = self.store.tenants.get(tenant_id) {
+                                    deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
+                                        tenant: tenant.clone(),
+                                    }));
+                                }
+                            }
+                            ok
+                        }
                         Err(code) => error_payload(&code, "failed to approve tenant"),
                     },
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -811,11 +959,24 @@ impl IdentityRuntime {
             ),
         };
 
-        send_system_response(sender, msg, response_name(action), payload).await
+        send_system_response(sender, msg, response_name(action), payload).await?;
+        Ok(deltas)
     }
 
-    async fn run_alias_gc(&mut self) -> Result<(), IdentityError> {
+    async fn run_alias_gc(&mut self) -> Result<Vec<IdentityDeltaEnvelope>, IdentityError> {
         let now_ms = now_epoch_ms();
+        let expired_aliases: Vec<String> = self
+            .store
+            .aliases
+            .iter()
+            .filter_map(|(old_ilk_id, alias)| {
+                if alias.expires_at_ms <= now_ms {
+                    Some(old_ilk_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
         let removed_local = self.store.gc_expired_aliases(now_ms);
         if removed_local > 0 {
             tracing::info!(removed = removed_local, "identity alias gc applied locally");
@@ -832,7 +993,21 @@ impl IdentityRuntime {
                 }
             }
         }
-        Ok(())
+
+        let mut deltas = Vec::new();
+        for old_ilk_id in expired_aliases {
+            deltas.push(delta_envelope(IdentityDelta::AliasDelete {
+                old_ilk_id: old_ilk_id.clone(),
+            }));
+            if let Some(ilk) = self.store.ilks.get(&old_ilk_id) {
+                if ilk.deleted_at_ms.is_some() {
+                    deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                        ilk: ilk.clone(),
+                    }));
+                }
+            }
+        }
+        Ok(deltas)
     }
 
     fn is_authorized(&self, action: &str, source_name: Option<&str>) -> bool {
@@ -941,6 +1116,25 @@ async fn main() -> Result<(), IdentityError> {
         None
     };
     let mut runtime = IdentityRuntime::new(&hive, state_dir.clone(), is_primary, db_url);
+    let identity_shm_name = identity_shm_name(&hive.hive_id);
+    let identity_limits = identity_region_limits(&hive);
+    let mut identity_shm = match IdentityRegionWriter::open_or_create(
+        &identity_shm_name,
+        Uuid::new_v4(),
+        &hive.hive_id,
+        is_primary,
+        identity_limits,
+    ) {
+        Ok(writer) => Some(writer),
+        Err(err) => {
+            tracing::warn!(
+                shm = %identity_shm_name,
+                error = %err,
+                "identity shm unavailable; IO lookup via SHM will be degraded"
+            );
+            None
+        }
+    };
     let sync_port = identity_sync_port(&hive);
     let sync_upstream = identity_sync_upstream(&hive);
     let sync_listener = if is_primary {
@@ -967,6 +1161,19 @@ async fn main() -> Result<(), IdentityError> {
             tracing::warn!("identity replica mode without identity.sync.upstream; starting with local in-memory state");
         }
     }
+    if let Some(writer) = identity_shm.as_mut() {
+        if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
+            tracing::warn!(error = %err, "initial identity shm sync failed");
+        }
+    }
+    let (delta_event_tx, mut delta_event_rx) = mpsc::unbounded_channel::<IdentityDeltaEnvelope>();
+    if !is_primary {
+        if let Some(upstream) = sync_upstream.clone() {
+            tokio::spawn(async move {
+                run_delta_subscription_loop(upstream, delta_event_tx).await;
+            });
+        }
+    }
     let (mut sender, mut receiver) =
         connect_with_retry(&node_config, Duration::from_secs(1)).await?;
 
@@ -978,84 +1185,99 @@ async fn main() -> Result<(), IdentityError> {
 
     let mut heartbeat = time::interval(Duration::from_secs(5));
     let mut alias_gc_tick = time::interval(Duration::from_secs(ALIAS_GC_INTERVAL_SECS));
-    if let Some(listener) = sync_listener {
-        loop {
-            tokio::select! {
-                _ = heartbeat.tick() => {
-                    tracing::debug!(metrics = %runtime.store.metrics(), "identity heartbeat");
+    let sync_listener = sync_listener;
+    let mut delta_subscribers: Vec<mpsc::UnboundedSender<IdentityDeltaEnvelope>> = Vec::new();
+    let mut next_delta_seq: u64 = 1;
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                tracing::debug!(metrics = %runtime.store.metrics(), "identity heartbeat");
+                if let Some(writer) = identity_shm.as_mut() {
+                    writer.update_heartbeat();
                 }
-                _ = alias_gc_tick.tick() => {
-                    if let Err(err) = runtime.run_alias_gc().await {
-                        tracing::warn!(error = %err, "identity alias gc failed");
-                    }
-                }
-                accepted = listener.accept() => {
-                    match accepted {
-                        Ok((stream, remote_addr)) => {
-                            let chunks = runtime.store.build_full_sync_chunks(IDENTITY_FULL_SYNC_CHUNK_ITEMS);
-                            tokio::spawn(async move {
-                                if let Err(err) = handle_full_sync_connection(stream, chunks).await {
-                                    tracing::warn!(remote = %remote_addr, error = %err, "identity full sync request failed");
+            }
+            _ = alias_gc_tick.tick() => {
+                match runtime.run_alias_gc().await {
+                    Ok(mut deltas) => {
+                        if !deltas.is_empty() {
+                            if let Some(writer) = identity_shm.as_mut() {
+                                if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
+                                    tracing::warn!(error = %err, "identity shm sync failed after alias gc");
                                 }
-                            });
+                            }
                         }
-                        Err(err) => {
-                            tracing::warn!(error = %err, "identity sync accept failed");
+                        if is_primary && !deltas.is_empty() {
+                            assign_delta_seqs(&mut deltas, &mut next_delta_seq);
+                            broadcast_deltas(&mut delta_subscribers, &deltas);
                         }
                     }
-                }
-                received = receiver.recv() => {
-                    let msg = match received {
-                        Ok(msg) => msg,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "recv error; reconnecting");
-                            let (new_sender, new_receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
-                            sender = new_sender;
-                            receiver = new_receiver;
-                            tracing::info!("reconnected to router");
-                            continue;
-                        }
-                    };
-
-                    if msg.meta.msg_type != SYSTEM_KIND {
-                        continue;
-                    }
-
-                    if let Err(err) = runtime.process_system_message(&sender, &msg).await {
-                        tracing::warn!(error = %err, action = ?msg.meta.msg, "failed to process system message");
+                    Err(err) => {
+                        tracing::warn!(error = %err, "identity alias gc failed");
                     }
                 }
             }
-        }
-    } else {
-        loop {
-            tokio::select! {
-                _ = heartbeat.tick() => {
-                    tracing::debug!(metrics = %runtime.store.metrics(), "identity heartbeat");
-                }
-                _ = alias_gc_tick.tick() => {
-                    if let Err(err) = runtime.run_alias_gc().await {
-                        tracing::warn!(error = %err, "identity alias gc failed");
+            maybe_delta = delta_event_rx.recv() => {
+                if let Some(envelope) = maybe_delta {
+                    runtime.store.apply_delta(envelope.delta);
+                    if let Some(writer) = identity_shm.as_mut() {
+                        if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
+                            tracing::warn!(error = %err, "identity shm sync failed after delta apply");
+                        }
                     }
                 }
-                received = receiver.recv() => {
-                    let msg = match received {
-                        Ok(msg) => msg,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "recv error; reconnecting");
-                            let (new_sender, new_receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
-                            sender = new_sender;
-                            receiver = new_receiver;
-                            tracing::info!("reconnected to router");
-                            continue;
+            }
+            accepted = async {
+                match sync_listener.as_ref() {
+                    Some(listener) => listener.accept().await.ok(),
+                    None => future::pending().await,
+                }
+            } => {
+                if let Some((stream, remote_addr)) = accepted {
+                    let chunks = runtime.store.build_full_sync_chunks(IDENTITY_FULL_SYNC_CHUNK_ITEMS);
+                    match handle_sync_connection(stream, chunks).await {
+                        Ok(Some(subscriber)) => {
+                            tracing::info!(remote = %remote_addr, "identity delta subscriber connected");
+                            delta_subscribers.push(subscriber);
                         }
-                    };
-
-                    if msg.meta.msg_type != SYSTEM_KIND {
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(remote = %remote_addr, error = %err, "identity sync request failed");
+                        }
+                    }
+                }
+            }
+            received = receiver.recv() => {
+                let msg = match received {
+                    Ok(msg) => msg,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "recv error; reconnecting");
+                        let (new_sender, new_receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+                        sender = new_sender;
+                        receiver = new_receiver;
+                        tracing::info!("reconnected to router");
                         continue;
                     }
+                };
 
-                    if let Err(err) = runtime.process_system_message(&sender, &msg).await {
+                if msg.meta.msg_type != SYSTEM_KIND {
+                    continue;
+                }
+
+                match runtime.process_system_message(&sender, &msg).await {
+                    Ok(mut deltas) => {
+                        if !deltas.is_empty() {
+                            if let Some(writer) = identity_shm.as_mut() {
+                                if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
+                                    tracing::warn!(error = %err, "identity shm sync failed after system action");
+                                }
+                            }
+                        }
+                        if is_primary && !deltas.is_empty() {
+                            assign_delta_seqs(&mut deltas, &mut next_delta_seq);
+                            broadcast_deltas(&mut delta_subscribers, &deltas);
+                        }
+                    }
+                    Err(err) => {
                         tracing::warn!(error = %err, action = ?msg.meta.msg, "failed to process system message");
                     }
                 }
@@ -1081,10 +1303,90 @@ fn identity_sync_upstream(hive: &HiveFile) -> Option<String> {
         .filter(|raw| !raw.is_empty())
 }
 
-async fn handle_full_sync_connection(
+fn identity_shm_name(hive_id: &str) -> String {
+    format!("/jsr-identity-{}", hive_id.trim())
+}
+
+fn identity_region_limits(hive: &HiveFile) -> IdentityRegionLimits {
+    let section = hive.identity.as_ref();
+    let max_ilks = section
+        .and_then(|identity| identity.max_ilks)
+        .unwrap_or(DEFAULT_IDENTITY_SHM_MAX_ILKS)
+        .max(1);
+    let max_tenants = section
+        .and_then(|identity| identity.max_tenants)
+        .unwrap_or(DEFAULT_IDENTITY_SHM_MAX_TENANTS)
+        .max(1);
+    let max_vocabulary = section
+        .and_then(|identity| identity.max_vocabulary)
+        .unwrap_or(DEFAULT_IDENTITY_SHM_MAX_VOCABULARY)
+        .max(1);
+    let max_ilk_aliases = section
+        .and_then(|identity| identity.max_ilk_aliases)
+        .unwrap_or(max_ilks)
+        .max(1);
+    IdentityRegionLimits {
+        max_ilks,
+        max_tenants,
+        max_vocabulary,
+        max_ilk_aliases,
+    }
+}
+
+fn sync_identity_shm_mappings(
+    writer: &mut IdentityRegionWriter,
+    store: &IdentityStore,
+) -> Result<(), IdentityError> {
+    writer.clear()?;
+    let mut mapped_channels = 0u64;
+    for (ilk_id, ilk) in &store.ilks {
+        if ilk.deleted_at_ms.is_some() {
+            continue;
+        }
+        let Ok(ilk_uuid) = parse_prefixed_uuid(ilk_id, "ilk") else {
+            tracing::warn!(ilk_id = %ilk_id, "skipping invalid ilk_id during identity shm sync");
+            continue;
+        };
+        for channel in &ilk.channels {
+            let channel_type = channel.channel_type.trim().to_ascii_lowercase();
+            let address = channel.address.trim().to_ascii_lowercase();
+            if channel_type.is_empty() || address.is_empty() {
+                continue;
+            }
+            let Ok(ich_uuid) = parse_prefixed_uuid(&channel.ich_id, "ich") else {
+                tracing::warn!(
+                    ilk_id = %ilk_id,
+                    ich_id = %channel.ich_id,
+                    "skipping invalid ich_id during identity shm sync"
+                );
+                continue;
+            };
+            if let Err(err) = writer.upsert_ich_mapping(
+                &channel_type,
+                &address,
+                *ich_uuid.as_bytes(),
+                *ilk_uuid.as_bytes(),
+            ) {
+                tracing::warn!(
+                    ilk_id = %ilk_id,
+                    channel_type = %channel_type,
+                    address = %address,
+                    error = %err,
+                    "failed to upsert identity shm ich mapping"
+                );
+                continue;
+            }
+            mapped_channels = mapped_channels.saturating_add(1);
+        }
+    }
+    tracing::debug!(mapped_channels, "identity shm mapping sync applied");
+    Ok(())
+}
+
+async fn handle_sync_connection(
     stream: TcpStream,
     chunks: Vec<IdentityFullSyncChunk>,
-) -> Result<(), IdentityError> {
+) -> Result<Option<mpsc::UnboundedSender<IdentityDeltaEnvelope>>, IdentityError> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut request_line = String::new();
@@ -1093,26 +1395,88 @@ async fn handle_full_sync_connection(
         return Err("full sync request connection closed".into());
     }
     let request: IdentitySyncRequest = serde_json::from_str(request_line.trim())?;
-    if request.operation != SYNC_OP_FULL_SYNC_REQUEST {
-        let payload = IdentitySyncError {
-            status: "error".to_string(),
-            error_code: "INVALID_REQUEST".to_string(),
-            message: format!("unsupported sync operation '{}'", request.operation),
-        };
-        let encoded = serde_json::to_string(&payload)?;
-        write_half.write_all(encoded.as_bytes()).await?;
-        write_half.write_all(b"\n").await?;
-        write_half.flush().await?;
-        return Ok(());
+    match request.operation.as_str() {
+        SYNC_OP_FULL_SYNC_REQUEST => {
+            for chunk in chunks {
+                let encoded = serde_json::to_string(&chunk)?;
+                write_half.write_all(encoded.as_bytes()).await?;
+                write_half.write_all(b"\n").await?;
+            }
+            write_half.flush().await?;
+            Ok(None)
+        }
+        SYNC_OP_DELTA_SUBSCRIBE => {
+            let (tx, mut rx) = mpsc::unbounded_channel::<IdentityDeltaEnvelope>();
+            let ack = json!({
+                "status": "ok",
+                "operation": "IDENTITY_DELTA_SUBSCRIBED"
+            });
+            write_half
+                .write_all(serde_json::to_string(&ack)?.as_bytes())
+                .await?;
+            write_half.write_all(b"\n").await?;
+            write_half.flush().await?;
+            tokio::spawn(async move {
+                while let Some(envelope) = rx.recv().await {
+                    let encoded = match serde_json::to_string(&envelope) {
+                        Ok(encoded) => encoded,
+                        Err(err) => {
+                            tracing::warn!(error = %err, seq = envelope.seq, "failed to encode identity delta frame");
+                            continue;
+                        }
+                    };
+                    let mut acked = false;
+                    for attempt in 1..=IDENTITY_DELTA_MAX_RETRIES {
+                        if write_half.write_all(encoded.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        if write_half.write_all(b"\n").await.is_err() {
+                            return;
+                        }
+                        if write_half.flush().await.is_err() {
+                            return;
+                        }
+                        match wait_for_delta_ack(&mut reader, envelope.seq).await {
+                            Ok(()) => {
+                                acked = true;
+                                break;
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    seq = envelope.seq,
+                                    attempt,
+                                    max_retries = IDENTITY_DELTA_MAX_RETRIES,
+                                    error = %err,
+                                    "identity delta ack not received; retrying"
+                                );
+                            }
+                        }
+                    }
+                    if !acked {
+                        tracing::warn!(
+                            seq = envelope.seq,
+                            max_retries = IDENTITY_DELTA_MAX_RETRIES,
+                            "identity delta ack retries exhausted; closing subscriber stream"
+                        );
+                        return;
+                    }
+                }
+            });
+            Ok(Some(tx))
+        }
+        _ => {
+            let payload = IdentitySyncError {
+                status: "error".to_string(),
+                error_code: "INVALID_REQUEST".to_string(),
+                message: format!("unsupported sync operation '{}'", request.operation),
+            };
+            let encoded = serde_json::to_string(&payload)?;
+            write_half.write_all(encoded.as_bytes()).await?;
+            write_half.write_all(b"\n").await?;
+            write_half.flush().await?;
+            Ok(None)
+        }
     }
-
-    for chunk in chunks {
-        let encoded = serde_json::to_string(&chunk)?;
-        write_half.write_all(encoded.as_bytes()).await?;
-        write_half.write_all(b"\n").await?;
-    }
-    write_half.flush().await?;
-    Ok(())
 }
 
 async fn fetch_full_sync_from_primary(upstream: &str) -> Result<IdentityStore, IdentityError> {
@@ -1199,6 +1563,172 @@ fn slice_chunk<T: Clone>(items: &[T], chunk_index: usize, chunk_size: usize) -> 
     }
     let end = (start + chunk_size).min(items.len());
     items[start..end].to_vec()
+}
+
+fn delta_envelope(delta: IdentityDelta) -> IdentityDeltaEnvelope {
+    IdentityDeltaEnvelope {
+        version: IDENTITY_SYNC_VERSION,
+        operation: SYNC_OP_DELTA.to_string(),
+        seq: 0,
+        delta,
+    }
+}
+
+fn assign_delta_seqs(deltas: &mut [IdentityDeltaEnvelope], next_seq: &mut u64) {
+    for delta in deltas.iter_mut() {
+        delta.seq = *next_seq;
+        *next_seq = next_seq.saturating_add(1);
+    }
+}
+
+fn broadcast_deltas(
+    subscribers: &mut Vec<mpsc::UnboundedSender<IdentityDeltaEnvelope>>,
+    deltas: &[IdentityDeltaEnvelope],
+) {
+    if deltas.is_empty() {
+        return;
+    }
+    subscribers.retain(|tx| {
+        for delta in deltas {
+            if tx.send(delta.clone()).is_err() {
+                return false;
+            }
+        }
+        true
+    });
+}
+
+async fn run_delta_subscription_loop(
+    upstream: String,
+    sink: mpsc::UnboundedSender<IdentityDeltaEnvelope>,
+) {
+    loop {
+        match stream_deltas_from_primary(&upstream, &sink).await {
+            Ok(()) => {
+                tracing::warn!(upstream = %upstream, "identity delta stream closed; reconnecting")
+            }
+            Err(err) => {
+                tracing::warn!(upstream = %upstream, error = %err, "identity delta stream failed; reconnecting")
+            }
+        }
+        time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn stream_deltas_from_primary(
+    upstream: &str,
+    sink: &mpsc::UnboundedSender<IdentityDeltaEnvelope>,
+) -> Result<(), IdentityError> {
+    let stream = TcpStream::connect(upstream).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let request = IdentitySyncRequest {
+        operation: SYNC_OP_DELTA_SUBSCRIBE.to_string(),
+    };
+    let encoded = serde_json::to_string(&request)?;
+    write_half.write_all(encoded.as_bytes()).await?;
+    write_half.write_all(b"\n").await?;
+    write_half.flush().await?;
+
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    let mut last_seq: Option<u64> = None;
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        let raw = line.trim();
+        if raw.is_empty() {
+            continue;
+        }
+
+        if let Ok(err_payload) = serde_json::from_str::<IdentitySyncError>(raw) {
+            if err_payload.status == "error" {
+                return Err(format!(
+                    "delta subscribe rejected: {} ({})",
+                    err_payload.error_code, err_payload.message
+                )
+                .into());
+            }
+        }
+
+        if let Ok(envelope) = serde_json::from_str::<IdentityDeltaEnvelope>(raw) {
+            if envelope.operation == SYNC_OP_DELTA {
+                if envelope.seq == 0 {
+                    return Err("delta stream payload with seq=0 is invalid".into());
+                }
+                if let Some(last) = last_seq {
+                    if envelope.seq == last {
+                        send_delta_ack(&mut write_half, envelope.seq).await?;
+                        continue;
+                    }
+                    if envelope.seq != last.saturating_add(1) {
+                        return Err(format!(
+                            "delta stream sequence gap/out-of-order: prev={} current={}",
+                            last, envelope.seq
+                        )
+                        .into());
+                    }
+                }
+                if sink.send(envelope.clone()).is_err() {
+                    return Err("delta sink dropped".into());
+                }
+                last_seq = Some(envelope.seq);
+                send_delta_ack(&mut write_half, envelope.seq).await?;
+            }
+        }
+    }
+}
+
+async fn wait_for_delta_ack(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    expected_seq: u64,
+) -> Result<(), IdentityError> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = time::timeout(
+            Duration::from_millis(IDENTITY_DELTA_ACK_TIMEOUT_MS),
+            reader.read_line(&mut line),
+        )
+        .await
+        .map_err(|_| "delta ack timeout".to_string())??;
+        if read == 0 {
+            return Err("delta subscriber closed while waiting ack".into());
+        }
+        let raw = line.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let ack: IdentityDeltaAck = serde_json::from_str(raw)?;
+        if ack.operation != SYNC_OP_DELTA_ACK {
+            return Err(format!("unexpected delta ack operation '{}'", ack.operation).into());
+        }
+        if ack.seq != expected_seq {
+            return Err(format!(
+                "unexpected delta ack seq {} (expected {})",
+                ack.seq, expected_seq
+            )
+            .into());
+        }
+        return Ok(());
+    }
+}
+
+async fn send_delta_ack(
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    seq: u64,
+) -> Result<(), IdentityError> {
+    let ack = IdentityDeltaAck {
+        operation: SYNC_OP_DELTA_ACK.to_string(),
+        seq,
+    };
+    let encoded = serde_json::to_string(&ack)?;
+    write_half.write_all(encoded.as_bytes()).await?;
+    write_half.write_all(b"\n").await?;
+    write_half.flush().await?;
+    Ok(())
 }
 
 fn load_hive(config_dir: &Path) -> Result<HiveFile, IdentityError> {
