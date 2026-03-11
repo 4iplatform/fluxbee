@@ -185,11 +185,14 @@ Salida:
   - Avance: validación integrada en `identity_provision_complete_diag`:
     - convergencia `registration_status=complete` + `tenant_id` esperado en SHM identity,
     - bloqueo de segunda reasignación (`INVALID_TENANT_TRANSITION`) para ILK ya completo.
-- [ ] G3. E2E add_channel + merge:
+- [x] G3. E2E add_channel + merge:
   - nuevo ICH -> temporal -> `ILK_ADD_CHANNEL` -> alias activo -> convergencia a canonical.
   - Avance: script dedicado `scripts/identity_merge_alias_e2e.sh` (convergencia old->canonical y opcional wait/cleanup por TTL).
 - [ ] G4. E2E node registration:
   - spawn de `AI.*`/`WF.*` con ILK persistente por `node_name`.
+  - Avance: script dedicado `scripts/identity_node_registration_e2e.sh`
+    - valida `payload.identity.register.status=ok`
+    - valida persistencia de `ilk_id` entre restart del mismo `node_name`
 - [ ] G5. E2E replica:
   - full sync en worker nuevo + deltas runtime.
 - [ ] G6. Pruebas negativas:
