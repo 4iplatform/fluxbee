@@ -134,13 +134,20 @@ Salida:
 - [ ] E2. Frontdesk:
   - completar registro vía `ILK_REGISTER` sobre ILK temporal
   - canal extra por `ILK_ADD_CHANNEL`
-- [ ] E3. Orchestrator:
-  - registro de nodos por `ILK_REGISTER`
-  - updates de metadata por `ILK_UPDATE`
-- [ ] E4. Merge temporal:
-  - crear alias `old->canonical`
-  - mantener alias por TTL
-  - cleanup al vencer
+- [x] E3. Orchestrator:
+  - [x] registro de nodos por `ILK_REGISTER` en `run_node` (pre-spawn):
+    - usa relay system message hacia `SY.identity@<hive>`
+    - persiste `node_name -> ilk_id` en estado local orchestrator para reusar ILK en reinicios
+    - modo estricto opcional por env `ORCH_IDENTITY_REGISTER_REQUIRED=true`
+    - tenant resuelto desde `payload.tenant_id`, `payload.config.tenant_id` o `ORCH_DEFAULT_TENANT_ID`
+  - [x] updates de metadata por `ILK_UPDATE` en `run_node` (delta explícito):
+    - soporta `add_roles`, `remove_roles`, `add_capabilities`, `remove_capabilities`, `add_channels`, `identity_change_reason`
+    - falla el spawn con `IDENTITY_UPDATE_FAILED` si se pidió delta y identity devuelve error
+- [x] E4. Merge temporal:
+  - [x] crear alias `old->canonical` (`SY.identity` -> `ILK_ADD_CHANNEL` con `merge_from_ilk_id`)
+  - [x] mantener alias por TTL (`merge_alias_ttl_secs`)
+  - [x] cleanup al vencer (GC periódico + `AliasDelete` delta + soft-delete de ILK temporal)
+  - [x] diag/E2E disponible: `src/bin/identity_merge_diag.rs` + `scripts/identity_merge_alias_e2e.sh`
 
 Salida:
 - flujo operativo end-to-end de alta humana y alta de nodos.
@@ -163,6 +170,7 @@ Salida:
   - `ILK_REGISTER` completa ILK temporal y reasigna tenant.
 - [ ] G3. E2E add_channel + merge:
   - nuevo ICH -> temporal -> `ILK_ADD_CHANNEL` -> alias activo -> convergencia a canonical.
+  - Avance: script dedicado `scripts/identity_merge_alias_e2e.sh` (convergencia old->canonical y opcional wait/cleanup por TTL).
 - [ ] G4. E2E node registration:
   - spawn de `AI.*`/`WF.*` con ILK persistente por `node_name`.
 - [ ] G5. E2E replica:

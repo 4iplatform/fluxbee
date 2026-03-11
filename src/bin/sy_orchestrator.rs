@@ -41,6 +41,10 @@ const STORAGE_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS: u64 = 3;
 const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
+const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
+const MSG_ILK_REGISTER_RESPONSE: &str = "ILK_REGISTER_RESPONSE";
+const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
+const MSG_ILK_UPDATE_RESPONSE: &str = "ILK_UPDATE_RESPONSE";
 const SY_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
 const ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS: u64 = 10;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
@@ -105,6 +109,7 @@ const DEFAULT_BLOB_GC_ACTIVE_RETAIN_DAYS: u64 = BLOB_ACTIVE_RETAIN_DAYS;
 const DEFAULT_DIST_PATH: &str = DIST_ROOT_DIR;
 const DEFAULT_DIST_SYNC_ENABLED: bool = true;
 const DEFAULT_DIST_SYNC_TOOL: &str = "syncthing";
+const IDENTITY_NODE_ILK_MAP_FILE: &str = "identity-node-ilk-map.json";
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -318,6 +323,12 @@ struct DriftAlertEntry {
 struct RuntimeRetentionStats {
     removed_runtime_dirs: u64,
     removed_version_dirs: u64,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct IdentityNodeIlkMap {
+    #[serde(default)]
+    nodes: HashMap<String, String>,
 }
 
 struct OrchestratorState {
@@ -5132,6 +5143,284 @@ fn system_forward_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+fn parse_prefixed_uuid(raw: &str, prefix: &str) -> Result<Uuid, OrchestratorError> {
+    let value = raw.trim();
+    let expected = format!("{prefix}:");
+    let Some(uuid_raw) = value.strip_prefix(&expected) else {
+        return Err(format!(
+            "invalid {prefix} id '{}': expected '{}<uuid>'",
+            value, expected
+        )
+        .into());
+    };
+    let uuid = Uuid::parse_str(uuid_raw)?;
+    Ok(uuid)
+}
+
+fn identity_register_required() -> bool {
+    std::env::var("ORCH_IDENTITY_REGISTER_REQUIRED")
+        .ok()
+        .and_then(|raw| parse_bool_str(&raw))
+        .unwrap_or(false)
+}
+
+fn node_ilk_map_path(state: &OrchestratorState) -> PathBuf {
+    state
+        .state_dir
+        .join("orchestrator")
+        .join(IDENTITY_NODE_ILK_MAP_FILE)
+}
+
+fn load_identity_node_ilk_map(path: &Path) -> IdentityNodeIlkMap {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return IdentityNodeIlkMap::default();
+    };
+    serde_json::from_str::<IdentityNodeIlkMap>(&raw).unwrap_or_default()
+}
+
+fn save_identity_node_ilk_map(
+    path: &Path,
+    map: &IdentityNodeIlkMap,
+) -> Result<(), OrchestratorError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let body = serde_json::to_vec_pretty(map)?;
+    fs::write(&tmp, body)?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn resolve_node_ilk_id(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+    node_name: &str,
+) -> Result<String, OrchestratorError> {
+    if let Some(raw) = payload.get("ilk_id").and_then(|v| v.as_str()) {
+        let normalized = raw.trim().to_string();
+        parse_prefixed_uuid(&normalized, "ilk")?;
+        return Ok(normalized);
+    }
+    let map_path = node_ilk_map_path(state);
+    let map = load_identity_node_ilk_map(&map_path);
+    if let Some(existing) = map.nodes.get(node_name) {
+        parse_prefixed_uuid(existing, "ilk")?;
+        return Ok(existing.clone());
+    }
+    Ok(format!("ilk:{}", Uuid::new_v4()))
+}
+
+fn persist_node_ilk_mapping(
+    state: &OrchestratorState,
+    node_name: &str,
+    ilk_id: &str,
+) -> Result<(), OrchestratorError> {
+    parse_prefixed_uuid(ilk_id, "ilk")?;
+    let map_path = node_ilk_map_path(state);
+    let mut map = load_identity_node_ilk_map(&map_path);
+    map.nodes.insert(node_name.to_string(), ilk_id.to_string());
+    save_identity_node_ilk_map(&map_path, &map)
+}
+
+fn derive_ilk_type_for_node(node_name: &str) -> &'static str {
+    if node_name.starts_with("AI.") {
+        "agent"
+    } else {
+        "system"
+    }
+}
+
+fn string_list_from_payload(payload: &serde_json::Value, key: &str) -> Vec<String> {
+    payload
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn resolve_tenant_id_for_node(payload: &serde_json::Value) -> Option<String> {
+    let from_payload = payload
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+    if from_payload.is_some() {
+        return from_payload;
+    }
+    payload
+        .get("config")
+        .and_then(|cfg| cfg.get("tenant_id"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .or_else(|| {
+            std::env::var("ORCH_DEFAULT_TENANT_ID")
+                .ok()
+                .map(|raw| raw.trim().to_string())
+                .filter(|raw| !raw.is_empty())
+        })
+}
+
+fn resolve_identity_change_reason(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("identity_change_reason")
+        .or_else(|| payload.get("change_reason"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+}
+
+fn identity_update_requested(payload: &serde_json::Value) -> bool {
+    !string_list_from_payload(payload, "add_roles").is_empty()
+        || !string_list_from_payload(payload, "remove_roles").is_empty()
+        || !string_list_from_payload(payload, "add_capabilities").is_empty()
+        || !string_list_from_payload(payload, "remove_capabilities").is_empty()
+        || payload
+            .get("add_channels")
+            .and_then(|v| v.as_array())
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        || resolve_identity_change_reason(payload).is_some()
+}
+
+fn identity_add_channels_from_payload(
+    payload: &serde_json::Value,
+) -> Result<Vec<serde_json::Value>, OrchestratorError> {
+    let Some(raw) = payload.get("add_channels") else {
+        return Ok(Vec::new());
+    };
+    let channels = raw
+        .as_array()
+        .ok_or_else(|| "invalid add_channels: expected array".to_string())?;
+    let mut out = Vec::new();
+    for channel in channels {
+        let obj = channel
+            .as_object()
+            .ok_or_else(|| "invalid add_channels entry: expected object".to_string())?;
+        let ich_id = obj
+            .get("ich_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| "invalid add_channels entry: missing ich_id".to_string())?;
+        parse_prefixed_uuid(ich_id, "ich")?;
+        let channel_type = obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| "invalid add_channels entry: missing type".to_string())?;
+        let address = obj
+            .get("address")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| "invalid add_channels entry: missing address".to_string())?;
+        out.push(serde_json::json!({
+            "ich_id": ich_id,
+            "type": channel_type,
+            "address": address,
+        }));
+    }
+    Ok(out)
+}
+
+async fn relay_system_action(
+    state: &OrchestratorState,
+    destination: &str,
+    request_msg: &str,
+    response_msg: &str,
+    payload: serde_json::Value,
+    forward_timeout: Duration,
+) -> Result<serde_json::Value, OrchestratorError> {
+    let socket_dir = json_router::paths::router_socket_dir();
+    let relay_name = format!("SY.orchestrator.relay.{}", now_epoch_ms());
+    let relay_config = NodeConfig {
+        name: relay_name,
+        router_socket: socket_dir,
+        uuid_persistence_dir: state.state_dir.join("nodes"),
+        config_dir: state.config_dir.clone(),
+        version: "1.0".to_string(),
+    };
+    let connect_timeout = Duration::from_secs(5);
+    let (relay_sender, mut relay_receiver) = match time::timeout(
+        connect_timeout,
+        connect_with_retry(&relay_config, Duration::from_millis(100)),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(format!(
+                "system forward timeout while connecting relay node to local router ({}s)",
+                connect_timeout.as_secs()
+            )
+            .into());
+        }
+    };
+
+    let trace_id = Uuid::new_v4().to_string();
+    let request = Message {
+        routing: Routing {
+            src: relay_sender.uuid().to_string(),
+            dst: Destination::Unicast(destination.to_string()),
+            ttl: 16,
+            trace_id: trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(request_msg.to_string()),
+            scope: None,
+            target: None,
+            action: None,
+            priority: None,
+            context: None,
+        },
+        payload,
+    };
+    relay_sender.send(request).await?;
+
+    let wait_response = async {
+        loop {
+            let incoming = relay_receiver.recv().await?;
+            if incoming.meta.msg_type != SYSTEM_KIND {
+                continue;
+            }
+            if incoming.routing.trace_id != trace_id {
+                continue;
+            }
+            if incoming.meta.msg.as_deref() != Some(response_msg) {
+                continue;
+            }
+            return Ok::<serde_json::Value, OrchestratorError>(incoming.payload);
+        }
+    };
+
+    match time::timeout(forward_timeout, wait_response).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "system forward timeout msg={} response={} target={} timeout_secs={}",
+            request_msg,
+            response_msg,
+            destination,
+            forward_timeout.as_secs()
+        )
+        .into()),
+    }
+}
+
 async fn forward_system_action_to_hive(
     state: &OrchestratorState,
     target_hive: &str,
@@ -5220,80 +5509,205 @@ async fn forward_system_action_to_hive_with_timeout(
         }
     }
 
-    let socket_dir = json_router::paths::router_socket_dir();
-    let relay_name = format!("SY.orchestrator.relay.{}", now_epoch_ms());
-    let relay_config = NodeConfig {
-        name: relay_name,
-        router_socket: socket_dir,
-        uuid_persistence_dir: state.state_dir.join("nodes"),
-        config_dir: state.config_dir.clone(),
-        version: "1.0".to_string(),
-    };
-    let connect_timeout = Duration::from_secs(5);
-    let (relay_sender, mut relay_receiver) = match time::timeout(
-        connect_timeout,
-        connect_with_retry(&relay_config, Duration::from_millis(100)),
+    let destination = format!("SY.orchestrator@{target_hive}");
+    relay_system_action(
+        state,
+        &destination,
+        request_msg,
+        response_msg,
+        payload,
+        forward_timeout,
     )
     .await
-    {
-        Ok(result) => result?,
-        Err(_) => {
+}
+
+async fn ensure_node_identity_registered(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+    target_hive: &str,
+    node_name: &str,
+    runtime: &str,
+    runtime_version: &str,
+) -> Result<Option<serde_json::Value>, OrchestratorError> {
+    let required = identity_register_required();
+
+    if !identity_available() {
+        if required {
+            return Err("identity registration required but sy-identity is not installed".into());
+        }
+        return Ok(Some(serde_json::json!({
+            "status": "skipped",
+            "reason": "identity_unavailable",
+        })));
+    }
+
+    let Some(tenant_id) = resolve_tenant_id_for_node(payload) else {
+        if required {
+            return Err("identity registration required but tenant_id is missing (use payload.tenant_id, payload.config.tenant_id, or ORCH_DEFAULT_TENANT_ID)".into());
+        }
+        return Ok(Some(serde_json::json!({
+            "status": "skipped",
+            "reason": "missing_tenant_id",
+        })));
+    };
+    parse_prefixed_uuid(&tenant_id, "tnt")?;
+
+    let requested_ilk_id = resolve_node_ilk_id(state, payload, node_name)?;
+    let ilk_type = derive_ilk_type_for_node(node_name);
+    let roles = string_list_from_payload(payload, "roles");
+    let capabilities = string_list_from_payload(payload, "capabilities");
+
+    let request_payload = serde_json::json!({
+        "ilk_id": requested_ilk_id,
+        "ilk_type": ilk_type,
+        "tenant_id": tenant_id,
+        "identification": {
+            "display_name": node_name,
+            "node_name": node_name,
+            "runtime": runtime,
+            "runtime_version": runtime_version,
+        },
+        "roles": roles,
+        "capabilities": capabilities,
+    });
+    let identity_target = format!("SY.identity@{target_hive}");
+    let response = relay_system_action(
+        state,
+        &identity_target,
+        MSG_ILK_REGISTER,
+        MSG_ILK_REGISTER_RESPONSE,
+        request_payload,
+        system_forward_timeout(),
+    )
+    .await?;
+
+    let status = response
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("error");
+    if status != "ok" {
+        let error_code = response
+            .get("error_code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("IDENTITY_REGISTER_FAILED");
+        let message = response
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("identity register returned non-ok status");
+        if required {
             return Err(format!(
-                "system forward timeout while connecting relay node to local router ({}s)",
-                connect_timeout.as_secs()
+                "identity register failed code={} message={}",
+                error_code, message
             )
             .into());
         }
-    };
-
-    let trace_id = Uuid::new_v4().to_string();
-    let request = Message {
-        routing: Routing {
-            src: relay_sender.uuid().to_string(),
-            dst: Destination::Unicast(format!("SY.orchestrator@{target_hive}")),
-            ttl: 16,
-            trace_id: trace_id.clone(),
-        },
-        meta: Meta {
-            msg_type: SYSTEM_KIND.to_string(),
-            msg: Some(request_msg.to_string()),
-            scope: None,
-            target: None,
-            action: None,
-            priority: None,
-            context: None,
-        },
-        payload,
-    };
-    relay_sender.send(request).await?;
-
-    let wait_response = async {
-        loop {
-            let incoming = relay_receiver.recv().await?;
-            if incoming.meta.msg_type != SYSTEM_KIND {
-                continue;
-            }
-            if incoming.routing.trace_id != trace_id {
-                continue;
-            }
-            if incoming.meta.msg.as_deref() != Some(response_msg) {
-                continue;
-            }
-            return Ok::<serde_json::Value, OrchestratorError>(incoming.payload);
-        }
-    };
-
-    match time::timeout(forward_timeout, wait_response).await {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "system forward timeout msg={} response={} target={} timeout_secs={}",
-            request_msg,
-            response_msg,
-            target_hive,
-            forward_timeout.as_secs()
-        )
-        .into()),
+        tracing::warn!(
+            target = %identity_target,
+            code = error_code,
+            message = message,
+            "identity register returned non-ok status; continuing because ORCH_IDENTITY_REGISTER_REQUIRED=false"
+        );
+        return Ok(Some(serde_json::json!({
+            "status": "error",
+            "error_code": error_code,
+            "message": message,
+            "target": identity_target,
+        })));
     }
+
+    let resolved_ilk_id = response
+        .get("ilk_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| requested_ilk_id.clone());
+    if let Err(err) = persist_node_ilk_mapping(state, node_name, &resolved_ilk_id) {
+        tracing::warn!(
+            node_name = node_name,
+            ilk_id = resolved_ilk_id,
+            error = %err,
+            "failed to persist node->ilk mapping"
+        );
+    }
+
+    Ok(Some(serde_json::json!({
+        "status": "ok",
+        "ilk_id": resolved_ilk_id,
+        "ilk_type": ilk_type,
+        "target": identity_target,
+    })))
+}
+
+async fn apply_node_identity_update(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+    target_hive: &str,
+    ilk_id: &str,
+) -> Result<Option<serde_json::Value>, OrchestratorError> {
+    parse_prefixed_uuid(ilk_id, "ilk")?;
+    let add_roles = string_list_from_payload(payload, "add_roles");
+    let remove_roles = string_list_from_payload(payload, "remove_roles");
+    let add_capabilities = string_list_from_payload(payload, "add_capabilities");
+    let remove_capabilities = string_list_from_payload(payload, "remove_capabilities");
+    let add_channels = identity_add_channels_from_payload(payload)?;
+    let change_reason = resolve_identity_change_reason(payload);
+
+    let has_changes = !add_roles.is_empty()
+        || !remove_roles.is_empty()
+        || !add_capabilities.is_empty()
+        || !remove_capabilities.is_empty()
+        || !add_channels.is_empty()
+        || change_reason.is_some();
+    if !has_changes {
+        return Ok(Some(serde_json::json!({
+            "status": "skipped",
+            "reason": "no_changes",
+        })));
+    }
+
+    let request_payload = serde_json::json!({
+        "ilk_id": ilk_id,
+        "add_channels": add_channels,
+        "add_roles": add_roles,
+        "remove_roles": remove_roles,
+        "add_capabilities": add_capabilities,
+        "remove_capabilities": remove_capabilities,
+        "change_reason": change_reason,
+    });
+    let identity_target = format!("SY.identity@{target_hive}");
+    let response = relay_system_action(
+        state,
+        &identity_target,
+        MSG_ILK_UPDATE,
+        MSG_ILK_UPDATE_RESPONSE,
+        request_payload,
+        system_forward_timeout(),
+    )
+    .await?;
+    let status = response
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("error");
+    if status != "ok" {
+        let error_code = response
+            .get("error_code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("IDENTITY_UPDATE_FAILED");
+        let message = response
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("identity update returned non-ok status");
+        return Err(format!(
+            "identity update failed code={} message={}",
+            error_code, message
+        )
+        .into());
+    }
+
+    Ok(Some(serde_json::json!({
+        "status": "ok",
+        "ilk_id": ilk_id,
+        "target": identity_target,
+    })))
 }
 
 async fn run_node_flow(
@@ -5456,6 +5870,71 @@ async fn run_node_flow(
         });
     }
 
+    let identity_register = match ensure_node_identity_registered(
+        state,
+        payload,
+        &target_hive,
+        &node_name,
+        &runtime_key,
+        &version,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "IDENTITY_REGISTER_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+                "unit": unit,
+            });
+        }
+    };
+    let identity_ilk_id = identity_register
+        .as_ref()
+        .and_then(|value| value.get("ilk_id"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let identity_update = match identity_ilk_id.as_deref() {
+        Some(ilk_id) => {
+            match apply_node_identity_update(state, payload, &target_hive, ilk_id).await {
+                Ok(value) => value,
+                Err(err) => {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "IDENTITY_UPDATE_FAILED",
+                        "message": err.to_string(),
+                        "target": target_hive,
+                        "node_name": node_name,
+                        "unit": unit,
+                    });
+                }
+            }
+        }
+        None => {
+            if identity_update_requested(payload) {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "IDENTITY_UPDATE_FAILED",
+                    "message": "identity update requested but no ilk_id is available",
+                    "target": target_hive,
+                    "node_name": node_name,
+                    "unit": unit,
+                });
+            }
+            Some(serde_json::json!({
+                "status": "skipped",
+                "reason": "missing_ilk_id",
+            }))
+        }
+    };
+    let identity = serde_json::json!({
+        "register": identity_register,
+        "update": identity_update,
+    });
+
     match systemd_unit_is_active(&unit) {
         Ok(true) => {
             return serde_json::json!({
@@ -5468,6 +5947,7 @@ async fn run_node_flow(
                 "hive": target_hive,
                 "target": target_hive,
                 "unit": unit,
+                "identity": identity,
             });
         }
         Ok(false) => {}
@@ -5479,6 +5959,7 @@ async fn run_node_flow(
                 "target": target_hive,
                 "node_name": node_name,
                 "unit": unit,
+                "identity": identity,
             });
         }
     }
@@ -5498,6 +5979,7 @@ async fn run_node_flow(
             "hive": target_hive,
             "target": target_hive,
             "unit": unit,
+            "identity": identity,
         }),
         Err(err) => serde_json::json!({
             "status": "error",
@@ -5506,6 +5988,7 @@ async fn run_node_flow(
             "target": target_hive,
             "node_name": node_name,
             "unit": unit,
+            "identity": identity,
         }),
     }
 }
