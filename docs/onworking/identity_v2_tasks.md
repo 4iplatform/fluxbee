@@ -124,6 +124,9 @@ Salida:
   - [x] nodo/runtime de referencia para validar infraestructura sin tocar IO productivo:
     - binario `src/bin/io_test_diag.rs` (usa helpers SDK de lookup/provision)
     - script `scripts/io_test_node_e2e.sh` (runtime fixture + sync-hint + update + run/kill)
+  - [x] precondición de spec aplicada en plataforma:
+    - `sy-identity` pasa a core requerido en instalación/manifiesto (`scripts/install.sh`)
+    - bootstrap worker mínimo incluye `sy-identity` junto a `rt-gateway` y `sy-orchestrator`
   - [ ] integrar en runtimes IO reales (fuera de este repo) para:
     - lookup en SHM
     - miss -> `ILK_PROVISION`

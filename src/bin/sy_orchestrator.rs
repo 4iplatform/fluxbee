@@ -80,13 +80,15 @@ const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "sy-storage",
     "sy-orchestrator",
 ];
-const WORKER_MIN_CORE_COMPONENTS: [&str; 4] = [
+const WORKER_MIN_CORE_COMPONENTS: [&str; 5] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
+    "sy-identity",
     "sy-orchestrator",
 ];
-const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 2] = ["rt-gateway", "sy-orchestrator"];
+const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 3] =
+    ["rt-gateway", "sy-identity", "sy-orchestrator"];
 const DEFAULT_BLOB_ENABLED: bool = true;
 const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
 const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
@@ -339,14 +341,20 @@ struct OrchestratorState {
     blob_sync_last_desired: Mutex<BlobRuntimeConfig>,
 }
 
-const MOTHERBEE_CRITICAL_SERVICES: [&str; 5] = [
+const MOTHERBEE_CRITICAL_SERVICES: [&str; 6] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
+    "sy-identity",
     "sy-admin",
     "sy-storage",
 ];
-const WORKER_CRITICAL_SERVICES: [&str; 3] = ["rt-gateway", "sy-config-routes", "sy-opa-rules"];
+const WORKER_CRITICAL_SERVICES: [&str; 4] = [
+    "rt-gateway",
+    "sy-config-routes",
+    "sy-opa-rules",
+    "sy-identity",
+];
 
 #[tokio::main]
 async fn main() -> Result<(), OrchestratorError> {
@@ -5794,9 +5802,6 @@ fn core_component_names_for_role(
             return Err(format!("core manifest missing required worker component '{name}'").into());
         }
         out.push(name.to_string());
-    }
-    if manifest.components.contains_key("sy-identity") {
-        out.push("sy-identity".to_string());
     }
     Ok(out)
 }

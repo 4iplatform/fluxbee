@@ -93,7 +93,7 @@ sy_admin_bin="$(pick_bin sy_admin)" || { echo "Missing binary: $BIN_DIR/sy_admin
 sy_config_bin="$(pick_bin sy_config_routes)" || { echo "Missing binary: $BIN_DIR/sy_config_routes" >&2; missing=1; }
 sy_orch_bin="$(pick_bin sy_orchestrator)" || { echo "Missing binary: $BIN_DIR/sy_orchestrator" >&2; missing=1; }
 sy_storage_bin="$(pick_bin sy_storage)" || { echo "Missing binary: $BIN_DIR/sy_storage" >&2; missing=1; }
-sy_identity_bin="$(pick_bin sy_identity || true)"
+sy_identity_bin="$(pick_bin sy_identity)" || { echo "Missing binary: $BIN_DIR/sy_identity" >&2; missing=1; }
 sy_opa_rules_bin=""
 if [[ -f "$ROOT_DIR/sy-opa-rules/sy-opa-rules" ]]; then
   sy_opa_rules_bin="$ROOT_DIR/sy-opa-rules/sy-opa-rules"
@@ -115,11 +115,7 @@ sudo install -m 0755 "$sy_admin_bin" /usr/bin/sy-admin
 sudo install -m 0755 "$sy_config_bin" /usr/bin/sy-config-routes
 sudo install -m 0755 "$sy_orch_bin" /usr/bin/sy-orchestrator
 sudo install -m 0755 "$sy_storage_bin" /usr/bin/sy-storage
-if [[ -n "${sy_identity_bin:-}" ]]; then
-  sudo install -m 0755 "$sy_identity_bin" /usr/bin/sy-identity
-else
-  echo "Warning: sy-identity binary not found; skipping install." >&2
-fi
+sudo install -m 0755 "$sy_identity_bin" /usr/bin/sy-identity
 sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
 
 echo "Updating core source repo in $STATE_DIR/dist/core/bin..."
@@ -128,9 +124,7 @@ sudo install -m 0755 "$sy_admin_bin" "$STATE_DIR/dist/core/bin/sy-admin"
 sudo install -m 0755 "$sy_config_bin" "$STATE_DIR/dist/core/bin/sy-config-routes"
 sudo install -m 0755 "$sy_orch_bin" "$STATE_DIR/dist/core/bin/sy-orchestrator"
 sudo install -m 0755 "$sy_storage_bin" "$STATE_DIR/dist/core/bin/sy-storage"
-if [[ -n "${sy_identity_bin:-}" ]]; then
-  sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/dist/core/bin/sy-identity"
-fi
+sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/dist/core/bin/sy-identity"
 sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/dist/core/bin/sy-opa-rules"
 
 rt_gateway_sha="$(sha256sum "$STATE_DIR/dist/core/bin/rt-gateway" | awk '{print $1}')"
@@ -154,16 +148,8 @@ fi
 if [[ -z "${core_build_id:-}" ]]; then
   core_build_id="$(date -u +%Y%m%d%H%M%S)"
 fi
-identity_manifest_entry=""
-if [[ -f "$STATE_DIR/dist/core/bin/sy-identity" ]]; then
-  sy_identity_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-identity" | awk '{print $1}')"
-  sy_identity_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-identity")"
-  identity_manifest_entry="$(cat <<EOF
-,
-    "sy-identity": {"service": "sy-identity", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_identity_sha", "size": $sy_identity_size}
-EOF
-)"
-fi
+sy_identity_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-identity" | awk '{print $1}')"
+sy_identity_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-identity")"
 
 core_manifest_tmp="$(mktemp)"
 cat >"$core_manifest_tmp" <<EOF
@@ -174,8 +160,9 @@ cat >"$core_manifest_tmp" <<EOF
     "sy-admin": {"service": "sy-admin", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_admin_sha", "size": $sy_admin_size},
     "sy-config-routes": {"service": "sy-config-routes", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_config_sha", "size": $sy_config_size},
     "sy-opa-rules": {"service": "sy-opa-rules", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_opa_sha", "size": $sy_opa_size},
+    "sy-identity": {"service": "sy-identity", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_identity_sha", "size": $sy_identity_size},
     "sy-orchestrator": {"service": "sy-orchestrator", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_orch_sha", "size": $sy_orch_size},
-    "sy-storage": {"service": "sy-storage", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_storage_sha", "size": $sy_storage_size}${identity_manifest_entry}
+    "sy-storage": {"service": "sy-storage", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_storage_sha", "size": $sy_storage_size}
   }
 }
 EOF
@@ -345,11 +332,7 @@ install_unit "sy-opa-rules" "/usr/bin/sy-opa-rules"
 install_unit "sy-admin" "/usr/bin/sy-admin"
 install_unit "sy-orchestrator" "/usr/bin/sy-orchestrator"
 install_unit "sy-storage" "/usr/bin/sy-storage"
-if [[ -n "${sy_identity_bin:-}" ]]; then
-  install_unit "sy-identity" "/usr/bin/sy-identity"
-else
-  echo "Warning: sy-identity unit not installed (binary missing)." >&2
-fi
+install_unit "sy-identity" "/usr/bin/sy-identity"
 sudo systemctl daemon-reload
 
 if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then
