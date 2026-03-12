@@ -212,7 +212,11 @@ Salida:
   - Nota: la idempotencia ya no depende del map local de orchestrator; la canonicalización por `node_name` vive en `SY.identity`.
 - [ ] G5. E2E replica:
   - full sync en worker nuevo + deltas runtime.
-- [ ] G6. Pruebas negativas:
+  - [x] diag+runner implementados:
+    - `src/bin/identity_replica_sync_diag.rs`
+    - `scripts/identity_replica_sync_e2e.sh`
+  - [ ] ejecutar corrida de cierre en entorno multi-hive real (worker recién agregado o reiniciado)
+- [x] G6. Pruebas negativas:
   - [x] diag+runner base implementados:
     - `src/bin/identity_negative_diag.rs`
     - `scripts/identity_negative_e2e.sh`
@@ -222,7 +226,7 @@ Salida:
   - [x] duplicado de email (`DUPLICATE_EMAIL`)
   - [x] duplicado de ICH por unique (`DUPLICATE_ICH`)
   - [x] colisión de `node_name` cubierta por canonicalización/idempotencia (G4), no se espera error de duplicado en flujo normal
-  - [ ] ejecutar corrida final de cierre con casos de duplicado
+  - [x] corrida final de cierre con casos de duplicado
 
 Salida:
 - gate de aceptación identity v2 completo.
