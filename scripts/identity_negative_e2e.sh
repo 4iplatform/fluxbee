@@ -46,7 +46,7 @@ while :; do
     break
   fi
 
-  if grep -Eq "Connection refused|No such file or directory|timed out waiting ANNOUNCE|router socket" "$tmp_run"; then
+  if grep -Eq "Connection refused|No such file or directory|timed out waiting ANNOUNCE" "$tmp_run"; then
     if (( SECONDS >= deadline )); then
       cat "$tmp_run" | tee "$TMP_OUT"
       rm -f "$tmp_run"
