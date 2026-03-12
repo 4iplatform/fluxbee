@@ -33,6 +33,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-frontdesk-gov"
+version = "0.1.0"
+dependencies = [
+ "fluxbee-sdk",
+ "gov-common",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -569,6 +581,13 @@ dependencies = [
  "fallible-iterator 0.3.0",
  "indexmap",
  "stable_deref_trait",
+]
+
+[[package]]
+name = "gov-common"
+version = "0.1.0"
+dependencies = [
+ "fluxbee-sdk",
 ]
 
 [[package]]

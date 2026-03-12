@@ -1,8 +1,8 @@
 # JSON Router - Nodos SY (System)
 
-**Estado:** v1.15
-**Fecha:** 2026-01-31
-**Documento relacionado:** Fluxbee Especificación Técnica v1.15
+**Estado:** v1.16
+**Fecha:** 2026-03-12
+**Documento relacionado:** Fluxbee Especificación Técnica v2 (identity v2)
 
 ---
 
@@ -41,7 +41,7 @@ Los nodos SY (System) son componentes de infraestructura que proveen servicios e
 | `SY.orchestrator` | Rust | Uno por isla | Especificado | Orquestación de routers y nodos |
 | `SY.config.routes` | Rust | Uno por isla | Especificado | Configuración de rutas estáticas y VPNs |
 | `SY.opa.rules` | **Go** | Uno por isla | Especificado | Compilación y gestión de policies OPA |
-| `SY.identity` | Rust | Uno por isla | Especificado | Registro de ILKs, degrees, modules |
+| `SY.identity` | Rust | Uno por isla | Especificado | Registro de tenants/ILKs/ICHs + sync primary/replica por socket |
 | `SY.time` | Rust | Uno por isla | Por especificar | Sincronización de tiempo |
 | `SY.log` | Rust | Uno por isla | Por especificar | Colector de logs |
 
@@ -60,7 +60,6 @@ Todo nodo SY que reciba configuración via broadcast CONFIG_CHANGED **DEBE** res
 | `routes` | SY.config.routes | Rutas estáticas |
 | `vpn` | SY.config.routes | Tabla VPN |
 | `opa` | SY.opa.rules | Policies OPA |
-| `identity` | SY.identity | ILKs, modules, degrees |
 | `storage` | SY.orchestrator | Path de storage compartido |
 
 **Flujo estándar:**
@@ -125,6 +124,19 @@ SY.admin
 3. Timeout: SY.admin espera ~5 segundos para respuestas
 4. Si una isla no responde, se asume proceso caído (alerta operacional)
 5. Si `status=error`, el nodo **NO** debe aplicar la configuración
+
+---
+
+### 1.5 Excepción explícita: SY.identity fuera de CONFIG_CHANGED
+
+`SY.identity` **no** participa del patrón `CONFIG_CHANGED/CONFIG_RESPONSE`.
+
+- Mutaciones de identity usan mensajes system unicast (`ILK_*`, `TNT_*`) hacia `SY.identity`.
+- En runtime multi-hive, las escrituras van al `SY.identity` primary (motherbee).
+- Replicación a workers usa socket directo `SY.identity <-> SY.identity` (full sync + deltas), no broadcast router.
+- Por lo tanto no existe `subsystem="identity"` en `CONFIG_CHANGED`.
+
+Esta delimitación evita mezclar configuración declarativa con operaciones de registro transaccional de identidad.
 
 ---
 

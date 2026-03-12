@@ -434,7 +434,7 @@ Configuration comes from outside (admins, APIs). The system executes but doesn't
 
 ## Current Status
 
-This is a working specification with partial implementation. The core router, shared memory regions, and node communication are functional. The identity system and university model are specified but not yet implemented.
+This is a working system with ongoing spec/doc alignment. Core routing, SHM regions, node communication, and identity v2 core flows are implemented and running in multi-hive E2E.
 
 ### Implemented
 - Core router with FIB and shared memory
@@ -442,13 +442,18 @@ This is a working specification with partial implementation. The core router, sh
 - Inter-hive gateway communication
 - OPA policy compilation and distribution
 - Configuration broadcast and replication
+- `SY.identity` v2 core:
+  - primary/replica sync (full + delta),
+  - DB persistence (`identity_*` tables),
+  - SHM identity region + alias canonicalization,
+  - orchestrator node registration integration (`ILK_REGISTER`/`ILK_UPDATE`)
 
-### Specified, Not Yet Implemented
-- SY.identity service
-- Module/Degree/Graduation system
-- IO nodes (WhatsApp, Email, etc.)
-- AI agent framework
-- Workflow engine
+### Still In Progress
+- Module/Degree/Graduation lifecycle service
+- Product runtimes outside this repo using identity helpers end-to-end:
+  - IO runtimes (channel lookup + `ILK_PROVISION`)
+  - `AI.frontdesk` runtime (complete register + merge channel flows)
+- Broader AI/workflow runtime catalog
 
 ---
 
@@ -464,6 +469,9 @@ This README explains the system and concepts. For how to run, build, and develop
 
 If you want to build a node in another repo, use `fluxbee_sdk`
 (`json-router/crates/fluxbee_sdk`) as the canonical SDK.
+
+For domain nodes that live in this repo (for example `.gov`), see:
+- `nodes/gov/README.md`
 
 **What to copy**
 ```
@@ -544,7 +552,7 @@ Key documents:
 - `02-protocolo.md` - Message protocol and node library
 - `03-shm.md` - Shared memory structures
 - `04-routing.md` - FIB, VPNs, OPA integration
-- `10-identity-layer3.md` - Identity system and L3 routing
+- `10-identity-v2.md` - Identity system v2 and L3 routing
 
 ### SDK Tools (Current)
 
@@ -560,6 +568,9 @@ Key documents:
 | Blob toolkit | `fluxbee_sdk::blob::BlobToolkit` | `put`, `put_bytes`, `promote`, `resolve`, `resolve_with_retry`, GC |
 | Blob confirmed publish | `fluxbee_sdk::blob::PublishBlobRequest` | `publish_blob_and_confirm` (`SYSTEM_SYNC_HINT` gate before emitting `blob_ref`) |
 | Blob metrics snapshot | `fluxbee_sdk::blob::BlobToolkit::metrics_snapshot` | Operational counters (`put/resolve/retry/errors/bytes`) |
+| Identity SHM lookup | `fluxbee_sdk::identity::{resolve_ilk_from_shm_name, resolve_ilk_from_hive_id, resolve_ilk_from_hive_config}` | Resolve `(channel_type,address) -> ilk` locally from identity SHM |
+| Identity provision | `fluxbee_sdk::identity::{IlkProvisionRequest, provision_ilk}` | Request `ILK_PROVISION` with automatic `NOT_PRIMARY` fallback target support |
+| Identity system calls | `fluxbee_sdk::identity::{IdentitySystemRequest, identity_system_call, identity_system_call_ok}` | Generic helpers for `ILK_REGISTER`, `ILK_ADD_CHANNEL`, `ILK_UPDATE`, tenant actions |
 | Convenience imports | `fluxbee_sdk::prelude::*` | Common SDK symbols in one import |
 
 #### Blob: basic flow (`put`/`promote` -> attach)
@@ -627,7 +638,7 @@ The functional specification lives in `docs/`. There is no cross-navigation betw
 - `07-operaciones.md` - Ops, deployment, and admin workflows
 - `08-apendices.md` - Appendix and reference notes
 - `09-router-status.md` - Router implementation status checklist
-- `10-identity-layer3.md` - Identity system and L3 routing
+- `10-identity-v2.md` - Identity system and L3 routing (current spec)
 - `SY_nodes_spec.md` - System nodes specification
 
 ---

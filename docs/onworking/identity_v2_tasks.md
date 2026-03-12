@@ -112,6 +112,7 @@ Salida:
 - [x] D3. Implementar versionado/orden de deltas y retry/ack por worker.
 - [ ] D4. Implementar métricas de convergencia (lag, deltas pendientes, tiempo full sync).
   - tracking detallado en `docs/onworking/diagnostics_tasks.md` sección `6.6 Identity sync (SY.identity)`.
+  - ownership: backlog de diagnósticos/observabilidad (no cierre funcional de identity en este documento).
 
 Salida:
 - replicación identity estable entre motherbee (PRIMARY) y workers (REPLICA).
@@ -137,12 +138,41 @@ Salida:
     - lookup en SHM
     - miss -> `ILK_PROVISION`
     - usar `ilk_id` en `meta.src_ilk`
+  - Nota: en este repo no queda trabajo técnico adicional para E1; el pendiente es de adopción en runtimes IO externos.
 - [ ] E2. Frontdesk:
   - [x] helpers SDK para acciones frontdesk (`identity_system_call` / `identity_system_call_ok`) con fallback a primary.
   - [x] diags de referencia (`identity_provision_complete_diag`, `identity_merge_diag`) migrados a helpers SDK.
+  - [x] workspace/scaffold para handoff externo disponible en repo:
+    - `nodes/gov/common`
+    - `nodes/gov/ai-frontdesk-gov`
+    - alcance actual: solo `AI.frontdesk.gov` (sin segundo nodo `.gov` en esta fase)
   - [ ] integrar en runtime `AI.frontdesk` real (fuera de este repo):
     - completar registro vía `ILK_REGISTER` sobre ILK temporal
     - canal extra por `ILK_ADD_CHANNEL`
+    - scaffold base disponible en este repo: `nodes/gov/ai-frontdesk-gov` (+ `nodes/gov/common`)
+  - [ ] checklist de handoff `AI.frontdesk.gov` (owner externo, pendiente cuando entre al repo):
+    - [ ] configuración de destino frontdesk en `hive.yaml`:
+      - `government.identity_frontdesk: "AI.frontdesk.gov@motherbee"` (o nombre final acordado)
+    - [ ] flujo de registro temporal -> completo:
+      - consumir `meta.src_ilk` temporal
+      - recolectar mínimos (`email`, `display_name`, `tenant_id`)
+      - enviar `ILK_REGISTER` con `identity_system_call_ok`
+      - verificar `ilk_id` devuelto == ILK temporal original
+    - [ ] flujo de canal adicional + merge:
+      - detectar match de persona existente (ej: por email)
+      - enviar `ILK_ADD_CHANNEL` con `merge_from_ilk_id`
+      - verificar convergencia alias old->canonical (durante TTL)
+    - [ ] manejo de errores de negocio:
+      - contemplar explícitamente `INVALID_TENANT`, `TENANT_PENDING`, `DUPLICATE_EMAIL`,
+        `INVALID_REQUEST`, `UNAUTHORIZED_REGISTRAR`
+      - no reintentar errores de validación (solo transitorios de red/routing)
+    - [ ] gates E2E de cierre (cuando el nodo exista):
+      - `BUILD_BIN=0 IDENTITY_PROVISION_COMPLETE_TARGET=\"SY.identity@sandbox\" IDENTITY_PROVISION_COMPLETE_FRONTDESK_NODE_NAME=\"AI.frontdesk.gov@sandbox\" bash scripts/identity_provision_complete_e2e.sh`
+      - `BUILD_BIN=0 IDENTITY_MERGE_TARGET=\"SY.identity@worker-220\" IDENTITY_MERGE_FALLBACK_TARGET=\"SY.identity@sandbox\" IDENTITY_MERGE_FRONTDESK_NODE_NAME=\"AI.frontdesk.gov@sandbox\" bash scripts/identity_merge_alias_e2e.sh`
+      - wrapper integrado: `BUILD_BIN=0 FRONTDESK_NODE_NAME=\"AI.frontdesk.gov@sandbox\" bash scripts/gov_frontdesk_identity_e2e.sh`
+    - [ ] criterio de done:
+      - ambos E2E en `status=ok`
+      - sin overrides/manual workarounds de targets al cerrar
 - [x] E3. Orchestrator:
   - [x] registro de nodos por `ILK_REGISTER` en `run_node` (pre-spawn):
     - usa relay system message hacia `SY.identity@<primary_hive>` (resuelto por `identity_primary_hive_id`)
@@ -210,12 +240,14 @@ Salida:
     - valida persistencia de `ilk_id` entre restart del mismo `node_name`
   - Validado también tras restart de `sy-identity` primary (persistencia de tenant/flujo de registro estable).
   - Nota: la idempotencia ya no depende del map local de orchestrator; la canonicalización por `node_name` vive en `SY.identity`.
-- [ ] G5. E2E replica:
+- [x] G5. E2E replica:
   - full sync en worker nuevo + deltas runtime.
+  - [x] hardening de bootstrap worker:
+    - `add_hive` escribe `identity.sync.upstream` en `hive.yaml` remoto.
   - [x] diag+runner implementados:
     - `src/bin/identity_replica_sync_diag.rs`
     - `scripts/identity_replica_sync_e2e.sh`
-  - [ ] ejecutar corrida de cierre en entorno multi-hive real (worker recién agregado o reiniciado)
+  - [x] corrida de cierre en entorno multi-hive real (worker recién agregado o reiniciado)
 - [x] G6. Pruebas negativas:
   - [x] diag+runner base implementados:
     - `src/bin/identity_negative_diag.rs`
@@ -233,8 +265,8 @@ Salida:
 
 ## 10) Alineación documental al cerrar implementación
 
-- [ ] DOC1. `docs/02-protocolo.md` (mensajes identity v2).
-- [ ] DOC2. `docs/03-shm.md` (región identity v2 real).
-- [ ] DOC3. `docs/SY_nodes_spec.md` (identity fuera de CONFIG_CHANGED).
-- [ ] DOC4. `docs/07-operaciones.md` (excepción DB ownership + operación identity).
-- [ ] DOC5. `README.md` (estado de implementación de identity).
+- [x] DOC1. `docs/02-protocolo.md` (mensajes identity v2 + delimitación vs CONFIG_CHANGED).
+- [x] DOC2. `docs/03-shm.md` (región identity v2 real: layout dinámico, aliases, hash mapping ICH->ILK).
+- [x] DOC3. `docs/SY_nodes_spec.md` (identity fuera de CONFIG_CHANGED + sync por socket primary/replica).
+- [x] DOC4. `docs/07-operaciones.md` (excepción DB ownership de identity + bloque `identity.*` en `hive.yaml`).
+- [x] DOC5. `README.md` (estado de implementación de identity + toolbox SDK identity).

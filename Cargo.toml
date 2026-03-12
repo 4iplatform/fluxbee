@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-members = ["crates/fluxbee_sdk"]
+members = [
+    "crates/fluxbee_sdk",
+    "nodes/gov/common",
+    "nodes/gov/ai-frontdesk-gov",
+]
 
 [dependencies]
 tokio = { version = "1.37", features = ["full"] }
