@@ -14,3 +14,5 @@ tracing = "0.1"
 sha2 = "0.10"
 mime_guess = "2.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+memmap2 = "0.9"
+nix = { version = "0.28", features = ["fs", "mman"] }

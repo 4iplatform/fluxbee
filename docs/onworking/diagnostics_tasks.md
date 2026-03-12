@@ -411,12 +411,44 @@ Objetivo:
 - [ ] D15. Definir runner unificado de suites (plan reproducible por perfil y orden de ejecución).
 - [ ] D16. Definir gate mínimo de CI/local para diagnósticos críticos (smoke + transporte + blob multi-hive).
 
-### 6.6 Delimitación arquitectónica para eventual `SY.diagnostics`
+### 6.6 Identity sync (SY.identity) - métricas y diagnósticos de convergencia
+Objetivo:
+- cubrir `identity_v2_tasks.md` fase D4 con telemetría operativa real de replicación primary/replica.
+
+- [ ] D16.1. Definir y exponer métricas de full sync:
+  - `identity_full_sync_total{result}` (`ok|error`),
+  - `identity_full_sync_duration_ms` (histograma),
+  - `identity_full_sync_chunks_total`.
+- [ ] D16.2. Definir y exponer métricas de stream delta:
+  - `identity_delta_sent_total`,
+  - `identity_delta_acked_total`,
+  - `identity_delta_retry_total`,
+  - `identity_delta_drop_total` (sin ack tras reintentos),
+  - `identity_delta_apply_total{result}` en replica.
+- [ ] D16.3. Definir métricas de lag/convergencia por replica:
+  - `identity_delta_last_sent_seq`,
+  - `identity_delta_last_acked_seq{replica}`,
+  - `identity_delta_last_applied_seq{replica}`,
+  - `identity_delta_lag_seq{replica}`,
+  - `identity_convergence_time_ms{replica}` (delta aplicado vs delta emitido).
+- [ ] D16.4. Definir métricas de salud del canal sync:
+  - `identity_sync_subscribers_connected`,
+  - `identity_sync_reconnect_total{role=primary|replica}`,
+  - `identity_sync_ack_timeout_total`.
+- [ ] D16.5. Definir diagnóstico operativo mínimo para identity:
+  - script/binario que reporte snapshot de convergencia (`seq`, lag, pendientes, último full sync),
+  - salida compacta + JSON (alineado con contrato `diag_schema_version`).
+- [ ] D16.6. Definir E2E de convergencia identity:
+  - generar ráfaga de cambios (`ILK_PROVISION/REGISTER/ADD_CHANNEL`),
+  - verificar convergencia `seq` en worker dentro de umbral configurable,
+  - fallar si hay gaps/out-of-order persistentes o lag por encima de umbral.
+
+### 6.7 Delimitación arquitectónica para eventual `SY.diagnostics`
 - [ ] D17. Definir ownership final: qué queda en `sy-admin` y qué migra a `SY.diagnostics`.
 - [ ] D18. Definir contrato de intercambio entre componentes y servicio de diagnósticos (acción system vs API local).
 - [ ] D19. Definir modelo de seguridad/acceso para diagnósticos (alcance por hive, redacción de datos sensibles, límites de exposición).
 
-### 6.7 Cerrado (ya implementado)
+### 6.8 Cerrado (ya implementado)
 - [x] D20. Implementar suite Blob E2E (`blob_ref` + verificación end-to-end por contenido) con salida compacta y resumen.
 - [x] D21. Incorporar resumen de Blob Stats en formato agregable (`count/p50/p95/max`, errores y volumen).
 

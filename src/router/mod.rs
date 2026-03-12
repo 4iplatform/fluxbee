@@ -18,11 +18,12 @@ use crate::nats::{
 };
 use crate::opa::OpaResolver;
 use crate::shm::{
-    copy_bytes_with_len, now_epoch_ms, ConfigRegionReader, ConfigSnapshot, LsaRegionReader,
-    LsaRegionWriter, LsaSnapshot, OpaRegionReader, OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry,
-    RemoteRouteEntry, RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, VpnAssignment,
-    ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
-    MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
+    copy_bytes_with_len, now_epoch_ms, ConfigRegionReader, ConfigSnapshot, IdentityRegionReader,
+    LsaRegionReader, LsaRegionWriter, LsaSnapshot, OpaRegionReader, OpaSnapshot, RemoteHiveEntry,
+    RemoteNodeEntry, RemoteRouteEntry, RemoteVpnEntry, RouterRegionReader, RouterRegionWriter,
+    VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE,
+    HEARTBEAT_STALE_MS, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR,
+    OPA_STATUS_LOADING,
 };
 use fluxbee_sdk::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
@@ -81,7 +82,6 @@ const LSA_REJECT_HIVE_MISMATCH: &str = "hive_mismatch";
 const LSA_REJECT_STALE_SEQ: &str = "stale_seq";
 const LSA_REJECT_PARSE_ERROR: &str = "parse_error";
 const LSA_REJECT_UNAUTHORIZED: &str = "unauthorized";
-
 impl Router {
     pub fn new(cfg: RouterConfig) -> Self {
         let shm = RouterRegionWriter::open_or_create(
@@ -209,6 +209,7 @@ impl Router {
         let router_name = self.cfg.router_l2_name.clone();
         let shm_name = self.cfg.shm_name.clone();
         let hive_id = self.cfg.hive_id.clone();
+        let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
         let is_gateway = self.cfg.is_gateway;
         let peer_socket_dir = self.cfg.node_socket_dir.clone();
         tokio::spawn(async move {
@@ -217,6 +218,7 @@ impl Router {
                 &router_name,
                 &shm_name,
                 &hive_id,
+                &identity_frontdesk_node_name,
                 peer_socket_dir,
                 peers_pd,
                 peer_nodes_pd,
@@ -272,6 +274,7 @@ impl Router {
         let opa = Arc::clone(&self.opa);
         let opa_reader = Arc::clone(&self.opa_reader);
         let hive_id = self.cfg.hive_id.clone();
+        let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
         let wan_peers = Arc::clone(&self.wan_peers);
         let lsa_snapshot = Arc::clone(&self.lsa_snapshot);
         let is_gateway = self.cfg.is_gateway;
@@ -298,6 +301,7 @@ impl Router {
                 let opa = Arc::clone(&opa);
                 let opa_reader = Arc::clone(&opa_reader);
                 let hive_id = hive_id.clone();
+                let identity_frontdesk_node_name = identity_frontdesk_node_name.clone();
                 let wan_peers = Arc::clone(&wan_peers);
                 let lsa_reader = Arc::clone(&lsa_reader);
                 let lsa_snapshot = Arc::clone(&lsa_snapshot);
@@ -320,6 +324,7 @@ impl Router {
                         opa,
                         opa_reader,
                         hive_id,
+                        identity_frontdesk_node_name,
                         wan_peers,
                         lsa_snapshot,
                         is_gateway,
@@ -337,6 +342,7 @@ impl Router {
                 router_uuid: self.cfg.router_uuid,
                 router_name: self.cfg.router_l2_name.clone(),
                 hive_id: self.cfg.hive_id.clone(),
+                identity_frontdesk_node_name: self.cfg.identity_frontdesk_node_name.clone(),
                 hello_interval_ms: self.cfg.hello_interval_ms,
                 dead_interval_ms: self.cfg.dead_interval_ms,
                 authorized_hives: self.cfg.wan_authorized_hives.clone(),
@@ -405,6 +411,7 @@ impl Router {
             let nats_publisher = self.nats_publisher.clone();
             let nats_publish_errors = Arc::clone(&self.nats_publish_errors);
             let is_gateway = self.cfg.is_gateway;
+            let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
             tokio::spawn(async move {
                 if let Err(err) = handle_node(
                     stream,
@@ -430,6 +437,7 @@ impl Router {
                     router_uuid,
                     &router_name,
                     &hive_id,
+                    &identity_frontdesk_node_name,
                     is_gateway,
                 )
                 .await
@@ -465,6 +473,7 @@ async fn handle_node(
     router_uuid: Uuid,
     router_name: &str,
     hive_id: &str,
+    identity_frontdesk_node_name: &str,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
     let (mut reader, mut writer) = stream.into_split();
@@ -751,6 +760,8 @@ async fn handle_node(
                         &wan_peers,
                         &opa,
                         &broadcast_cache,
+                        &hive_id,
+                        identity_frontdesk_node_name,
                         router_uuid,
                         is_gateway,
                         &lsa_snapshot,
@@ -803,6 +814,8 @@ async fn handle_message(
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     opa: &Arc<Mutex<OpaResolver>>,
     broadcast_cache: &Arc<Mutex<BroadcastCache>>,
+    hive_id: &str,
+    identity_frontdesk_node_name: &str,
     router_uuid: Uuid,
     is_gateway: bool,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
@@ -1038,17 +1051,17 @@ async fn handle_message(
             }
         }
         Destination::Resolve => {
-            let resolved_target = match {
-                let mut opa = opa.lock().await;
-                opa.resolve_target(msg)
-            } {
-                Ok(value) => value,
-                Err(err) => {
-                    tracing::warn!("opa resolve failed: {err}");
-                    send_unreachable_to(msg, &src_handle.sender, router_uuid, "OPA_ERROR")?;
-                    return Ok(());
-                }
-            };
+            let resolved_target =
+                match resolve_target_with_identity(opa, hive_id, identity_frontdesk_node_name, msg)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!("opa resolve failed: {err}");
+                        send_unreachable_to(msg, &src_handle.sender, router_uuid, "OPA_ERROR")?;
+                        return Ok(());
+                    }
+                };
             let Some(target) = resolved_target.as_deref() else {
                 send_unreachable_to(msg, &src_handle.sender, router_uuid, "OPA_NO_TARGET")?;
                 return Ok(());
@@ -2286,10 +2299,14 @@ async fn handle_wan_message(
             }
         }
         Destination::Resolve => {
-            let resolved_target = match {
-                let mut opa = ctx.opa.lock().await;
-                opa.resolve_target(msg)
-            } {
+            let resolved_target = match resolve_target_with_identity(
+                &ctx.opa,
+                &ctx.hive_id,
+                &ctx.identity_frontdesk_node_name,
+                msg,
+            )
+            .await
+            {
                 Ok(value) => value,
                 Err(err) => {
                     tracing::warn!("opa resolve failed: {err}");
@@ -2383,6 +2400,7 @@ async fn peer_discovery_loop(
     self_router_name: &str,
     self_shm_name: &str,
     hive_id: &str,
+    identity_frontdesk_node_name: &str,
     socket_dir: PathBuf,
     peers: Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
@@ -2458,6 +2476,7 @@ async fn peer_discovery_loop(
                     let lsa_snapshot = Arc::clone(&lsa_snapshot);
                     let is_gateway = is_gateway;
                     let socket_dir = socket_dir.clone();
+                    let identity_frontdesk_node_name = identity_frontdesk_node_name.to_string();
                     tokio::spawn(async move {
                         let _ = connect_to_peer(
                             peer_uuid,
@@ -2479,6 +2498,7 @@ async fn peer_discovery_loop(
                             opa,
                             opa_reader,
                             &hive_id,
+                            &identity_frontdesk_node_name,
                             lsa_snapshot,
                             fib,
                             is_gateway,
@@ -2578,6 +2598,7 @@ async fn connect_to_peer(
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     hive_id: &str,
+    identity_frontdesk_node_name: &str,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
     is_gateway: bool,
@@ -2635,6 +2656,7 @@ async fn connect_to_peer(
                         &opa,
                         &opa_reader,
                         hive_id,
+                        identity_frontdesk_node_name,
                         &fib,
                         self_uuid,
                         is_gateway,
@@ -2671,6 +2693,7 @@ async fn handle_peer_incoming(
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     hive_id: String,
+    identity_frontdesk_node_name: String,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     is_gateway: bool,
@@ -2726,6 +2749,7 @@ async fn handle_peer_incoming(
                         &opa,
                         &opa_reader,
                         &hive_id,
+                        &identity_frontdesk_node_name,
                         &fib,
                         router_uuid,
                         is_gateway,
@@ -2762,6 +2786,7 @@ async fn handle_peer_message(
     opa: &Arc<Mutex<OpaResolver>>,
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
     hive_id: &str,
+    identity_frontdesk_node_name: &str,
     fib: &Arc<Mutex<Vec<FibEntry>>>,
     router_uuid: Uuid,
     is_gateway: bool,
@@ -3005,19 +3030,19 @@ async fn handle_peer_message(
             }
         }
         Destination::Resolve => {
-            let resolved_target = match {
-                let mut opa = opa.lock().await;
-                opa.resolve_target(msg)
-            } {
-                Ok(value) => value,
-                Err(err) => {
-                    tracing::warn!("opa resolve failed: {err}");
-                    if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(msg, &peer.sender, router_uuid, "OPA_ERROR")?;
+            let resolved_target =
+                match resolve_target_with_identity(opa, hive_id, identity_frontdesk_node_name, msg)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!("opa resolve failed: {err}");
+                        if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
+                            send_unreachable_to(msg, &peer.sender, router_uuid, "OPA_ERROR")?;
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-            };
+                };
             let Some(target) = resolved_target.as_deref() else {
                 if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                     send_unreachable_to(msg, &peer.sender, router_uuid, "OPA_NO_TARGET")?;
@@ -3231,6 +3256,7 @@ struct WanContext {
     router_uuid: Uuid,
     router_name: String,
     hive_id: String,
+    identity_frontdesk_node_name: String,
     hello_interval_ms: u64,
     dead_interval_ms: u64,
     authorized_hives: Vec<String>,
@@ -3469,7 +3495,7 @@ async fn apply_opa_reload(
         tracing::error!("opa reload rejected: hash missing");
         return;
     }
-    apply_opa_snapshot(opa, shm, &snapshot).await;
+    apply_opa_snapshot(opa, shm, hive_id, &snapshot).await;
 }
 
 fn parse_sha256_hash(value: &str) -> Option<[u8; 32]> {
@@ -3527,7 +3553,7 @@ async fn maybe_refresh_opa_from_shm(
         );
         return;
     };
-    apply_opa_snapshot(opa, shm, &snapshot).await;
+    apply_opa_snapshot(opa, shm, hive_id, &snapshot).await;
 }
 
 async fn read_opa_header(
@@ -3563,6 +3589,7 @@ async fn read_opa_snapshot(
 async fn apply_opa_snapshot(
     opa: &Arc<Mutex<OpaResolver>>,
     shm: &Arc<Mutex<RouterRegionWriter>>,
+    hive_id: &str,
     snapshot: &OpaSnapshot,
 ) {
     if snapshot.wasm.is_empty() {
@@ -3582,7 +3609,7 @@ async fn apply_opa_snapshot(
         Some(snapshot.header.entrypoint.clone())
     };
     let data_bundle_path = opa_data_bundle_path();
-    let data_bundle = match load_opa_data_bundle(&data_bundle_path) {
+    let data_bundle = match load_opa_data_bundle(&data_bundle_path, hive_id) {
         Ok(Some(bundle)) => {
             tracing::info!(
                 path = %data_bundle_path.display(),
@@ -3637,18 +3664,213 @@ fn opa_data_bundle_path() -> PathBuf {
         .join("data.json")
 }
 
-fn load_opa_data_bundle(path: &Path) -> Result<Option<String>, io::Error> {
+fn load_opa_data_bundle(path: &Path, hive_id: &str) -> Result<Option<String>, io::Error> {
     match fs::read_to_string(path) {
         Ok(content) => {
             if content.trim().is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(content))
+                let mut root: serde_json::Value =
+                    serde_json::from_str(&content).map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid OPA data bundle JSON: {err}"),
+                        )
+                    })?;
+                if let Some(snapshot) = read_identity_snapshot(hive_id) {
+                    inject_identity_data(&mut root, &snapshot);
+                }
+                Ok(Some(root.to_string()))
             }
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+fn read_identity_snapshot(hive_id: &str) -> Option<crate::shm::IdentitySnapshot> {
+    let shm_name = format!("/jsr-identity-{}", hive_id);
+    let reader = IdentityRegionReader::open_read_only_auto(&shm_name).ok()?;
+    reader.read_snapshot()
+}
+
+async fn resolve_target_with_identity(
+    opa: &Arc<Mutex<OpaResolver>>,
+    hive_id: &str,
+    identity_frontdesk_node_name: &str,
+    msg: &Message,
+) -> Result<Option<String>, crate::opa::OpaError> {
+    let mut msg_for_opa = msg.clone();
+    if let Some(snapshot) = read_identity_snapshot(hive_id) {
+        let now_ms = now_epoch_ms();
+        if let Some(forced_target) = apply_identity_pre_resolve(
+            &mut msg_for_opa,
+            identity_frontdesk_node_name,
+            &snapshot,
+            now_ms,
+        ) {
+            return Ok(Some(forced_target));
+        }
+    }
+    let mut guard = opa.lock().await;
+    guard.resolve_target(&msg_for_opa)
+}
+
+fn apply_identity_pre_resolve(
+    msg: &mut Message,
+    identity_frontdesk_node_name: &str,
+    snapshot: &crate::shm::IdentitySnapshot,
+    now_ms: u64,
+) -> Option<String> {
+    let src_ilk = get_src_ilk_from_meta(&msg.meta)?;
+    let (canonical_src_ilk, registration_status) =
+        canonicalize_src_ilk_and_status(snapshot, &src_ilk, now_ms);
+    if let Some(canonical) = canonical_src_ilk {
+        if canonical != src_ilk {
+            set_src_ilk_in_meta(&mut msg.meta, &canonical);
+        }
+        if registration_status.as_deref() == Some("temporary") {
+            return Some(identity_frontdesk_node_name.to_string());
+        }
+    }
+    None
+}
+
+fn canonicalize_src_ilk_and_status(
+    snapshot: &crate::shm::IdentitySnapshot,
+    src_ilk: &str,
+    now_ms: u64,
+) -> (Option<String>, Option<String>) {
+    let Some(src_ilk_bytes) = parse_prefixed_uuid_bytes(src_ilk, "ilk") else {
+        return (None, None);
+    };
+    let mut canonical = src_ilk_bytes;
+    for alias in &snapshot.ilk_aliases {
+        if alias.flags & FLAG_ACTIVE == 0 {
+            continue;
+        }
+        if alias.expires_at <= now_ms {
+            continue;
+        }
+        if alias.old_ilk_id == src_ilk_bytes {
+            canonical = alias.canonical_ilk_id;
+            break;
+        }
+    }
+    let canonical_str = format_prefixed_uuid("ilk", &canonical);
+    let status = snapshot
+        .ilks
+        .iter()
+        .find(|ilk| ilk.flags & FLAG_ACTIVE != 0 && ilk.ilk_id == canonical)
+        .map(|ilk| match ilk.registration_status {
+            0 => "temporary".to_string(),
+            1 => "partial".to_string(),
+            2 => "complete".to_string(),
+            _ => "unknown".to_string(),
+        });
+    (Some(canonical_str), status)
+}
+
+fn parse_prefixed_uuid_bytes(value: &str, prefix: &str) -> Option<[u8; 16]> {
+    let expected = format!("{prefix}:");
+    let raw = value.trim().strip_prefix(&expected)?;
+    let uuid = Uuid::parse_str(raw).ok()?;
+    Some(*uuid.as_bytes())
+}
+
+fn get_src_ilk_from_meta(meta: &Meta) -> Option<String> {
+    meta.context
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|ctx| ctx.get("src_ilk"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+fn set_src_ilk_in_meta(meta: &mut Meta, src_ilk: &str) {
+    let value = serde_json::Value::String(src_ilk.to_string());
+    match meta.context.as_mut() {
+        Some(serde_json::Value::Object(ctx)) => {
+            ctx.insert("src_ilk".to_string(), value);
+        }
+        Some(_) => {
+            meta.context = Some(serde_json::json!({ "src_ilk": src_ilk }));
+        }
+        None => {
+            meta.context = Some(serde_json::json!({ "src_ilk": src_ilk }));
+        }
+    }
+}
+
+fn inject_identity_data(root: &mut serde_json::Value, snapshot: &crate::shm::IdentitySnapshot) {
+    let Some(obj) = root.as_object_mut() else {
+        return;
+    };
+
+    let now_ms = now_epoch_ms();
+    let mut identity_obj = serde_json::Map::new();
+    for ilk in &snapshot.ilks {
+        if ilk.flags & FLAG_ACTIVE == 0 {
+            continue;
+        }
+        let ilk_id = format_prefixed_uuid("ilk", &ilk.ilk_id);
+        let tenant_id = format_prefixed_uuid("tnt", &ilk.tenant_id);
+        let registration_status = match ilk.registration_status {
+            0 => "temporary",
+            1 => "partial",
+            2 => "complete",
+            _ => "temporary",
+        };
+        let ilk_type = match ilk.ilk_type {
+            0 => "human",
+            1 => "agent",
+            2 => "system",
+            _ => "system",
+        };
+        let handler_node = fixed_str(&ilk.handler_node);
+        let payload = serde_json::json!({
+            "tenant_id": tenant_id,
+            "ilk_type": ilk_type,
+            "registration_status": registration_status,
+            "handler_node": handler_node,
+            "roles": [],
+            "capabilities": []
+        });
+        identity_obj.insert(ilk_id, payload);
+    }
+
+    let mut alias_obj = serde_json::Map::new();
+    for alias in &snapshot.ilk_aliases {
+        if alias.flags & FLAG_ACTIVE == 0 {
+            continue;
+        }
+        if alias.expires_at <= now_ms {
+            continue;
+        }
+        let old_ilk = format_prefixed_uuid("ilk", &alias.old_ilk_id);
+        let canonical_ilk = format_prefixed_uuid("ilk", &alias.canonical_ilk_id);
+        alias_obj.insert(old_ilk, serde_json::Value::String(canonical_ilk));
+    }
+
+    obj.insert(
+        "identity".to_string(),
+        serde_json::Value::Object(identity_obj),
+    );
+    obj.insert(
+        "identity_aliases".to_string(),
+        serde_json::Value::Object(alias_obj),
+    );
+}
+
+fn fixed_str(buf: &[u8]) -> String {
+    let len = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len]).trim().to_string()
+}
+
+fn format_prefixed_uuid(prefix: &str, bytes: &[u8; 16]) -> String {
+    format!("{}:{}", prefix, Uuid::from_bytes(*bytes))
 }
 
 async fn refresh_lsa(
@@ -4370,6 +4592,8 @@ fn should_publish_turn(msg: &Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shm::{IdentityHeaderSnapshot, IdentitySnapshot, IlkAliasEntry, IlkEntry};
+    use fluxbee_sdk::protocol::Routing;
     use std::collections::HashMap;
 
     fn lsa_payload(hive: &str, seq: u64, router_id: &str, router_name: &str) -> LsaPayload {
@@ -4503,5 +4727,362 @@ mod tests {
         let entry = guard.get(expected_hive).expect("missing hive state");
         assert_eq!(entry.router_uuid, *peer_router_uuid.as_bytes());
         assert_eq!(entry.router_name, peer_router_name);
+    }
+
+    #[test]
+    fn inject_identity_data_exposes_identity_and_aliases() {
+        let now = now_epoch_ms();
+        let ilk_id = Uuid::new_v4();
+        let tenant_id = Uuid::new_v4();
+        let canonical_ilk_id = Uuid::new_v4();
+        let old_ilk_id = Uuid::new_v4();
+
+        let mut ilk = IlkEntry {
+            ilk_id: *ilk_id.as_bytes(),
+            ilk_type: 1,
+            registration_status: 2,
+            flags: FLAG_ACTIVE,
+            tenant_id: *tenant_id.as_bytes(),
+            display_name: [0u8; 128],
+            handler_node: [0u8; 128],
+            ich_offset: 0,
+            ich_count: 0,
+            _pad0: [0u8; 2],
+            roles_offset: 0,
+            roles_len: 0,
+            _pad1: [0u8; 2],
+            capabilities_offset: 0,
+            capabilities_len: 0,
+            _pad2: [0u8; 2],
+            created_at: now,
+            updated_at: now,
+            _reserved: [0u8; 8],
+        };
+        copy_bytes_with_len(&mut ilk.handler_node, "AI.frontdesk@sandbox");
+
+        let alias = IlkAliasEntry {
+            old_ilk_id: *old_ilk_id.as_bytes(),
+            canonical_ilk_id: *canonical_ilk_id.as_bytes(),
+            expires_at: now + 60_000,
+            flags: FLAG_ACTIVE,
+            _reserved: [0u8; 22],
+        };
+
+        let snapshot = IdentitySnapshot {
+            header: IdentityHeaderSnapshot {
+                tenant_count: 0,
+                ilk_count: 1,
+                ich_count: 0,
+                ich_mapping_count: 0,
+                vocabulary_count: 0,
+                ilk_alias_count: 1,
+                max_ilks: 0,
+                max_tenants: 0,
+                max_ichs: 0,
+                max_ich_mappings: 0,
+                max_vocabulary: 0,
+                max_ilk_aliases: 0,
+                heartbeat: now,
+                updated_at: now,
+            },
+            tenants: Vec::new(),
+            ilks: vec![ilk],
+            ichs: Vec::new(),
+            ich_mappings: Vec::new(),
+            ilk_aliases: vec![alias],
+            vocabulary: Vec::new(),
+        };
+
+        let mut root = serde_json::json!({ "foo": "bar" });
+        inject_identity_data(&mut root, &snapshot);
+
+        let identity = root
+            .get("identity")
+            .and_then(serde_json::Value::as_object)
+            .expect("missing identity map");
+        let key = format!("ilk:{ilk_id}");
+        let record = identity
+            .get(&key)
+            .and_then(serde_json::Value::as_object)
+            .expect("missing ilk record");
+        let expected_tenant = format!("tnt:{tenant_id}");
+        assert_eq!(
+            record.get("tenant_id").and_then(serde_json::Value::as_str),
+            Some(expected_tenant.as_str())
+        );
+        assert_eq!(
+            record
+                .get("registration_status")
+                .and_then(serde_json::Value::as_str),
+            Some("complete")
+        );
+        assert_eq!(
+            record
+                .get("handler_node")
+                .and_then(serde_json::Value::as_str),
+            Some("AI.frontdesk@sandbox")
+        );
+
+        let aliases = root
+            .get("identity_aliases")
+            .and_then(serde_json::Value::as_object)
+            .expect("missing aliases map");
+        let old_key = format!("ilk:{old_ilk_id}");
+        let expected_canonical = format!("ilk:{canonical_ilk_id}");
+        assert_eq!(
+            aliases.get(&old_key).and_then(serde_json::Value::as_str),
+            Some(expected_canonical.as_str())
+        );
+    }
+
+    #[test]
+    fn canonicalize_src_ilk_and_status_resolves_alias_and_status() {
+        let now = now_epoch_ms();
+        let canonical_ilk_id = Uuid::new_v4();
+        let old_ilk_id = Uuid::new_v4();
+
+        let ilk = IlkEntry {
+            ilk_id: *canonical_ilk_id.as_bytes(),
+            ilk_type: 0,
+            registration_status: 0,
+            flags: FLAG_ACTIVE,
+            tenant_id: [0u8; 16],
+            display_name: [0u8; 128],
+            handler_node: [0u8; 128],
+            ich_offset: 0,
+            ich_count: 0,
+            _pad0: [0u8; 2],
+            roles_offset: 0,
+            roles_len: 0,
+            _pad1: [0u8; 2],
+            capabilities_offset: 0,
+            capabilities_len: 0,
+            _pad2: [0u8; 2],
+            created_at: now,
+            updated_at: now,
+            _reserved: [0u8; 8],
+        };
+        let alias = IlkAliasEntry {
+            old_ilk_id: *old_ilk_id.as_bytes(),
+            canonical_ilk_id: *canonical_ilk_id.as_bytes(),
+            expires_at: now + 60_000,
+            flags: FLAG_ACTIVE,
+            _reserved: [0u8; 22],
+        };
+        let snapshot = IdentitySnapshot {
+            header: IdentityHeaderSnapshot {
+                tenant_count: 0,
+                ilk_count: 1,
+                ich_count: 0,
+                ich_mapping_count: 0,
+                vocabulary_count: 0,
+                ilk_alias_count: 1,
+                max_ilks: 0,
+                max_tenants: 0,
+                max_ichs: 0,
+                max_ich_mappings: 0,
+                max_vocabulary: 0,
+                max_ilk_aliases: 0,
+                heartbeat: now,
+                updated_at: now,
+            },
+            tenants: Vec::new(),
+            ilks: vec![ilk],
+            ichs: Vec::new(),
+            ich_mappings: Vec::new(),
+            ilk_aliases: vec![alias],
+            vocabulary: Vec::new(),
+        };
+
+        let old_src = format!("ilk:{old_ilk_id}");
+        let (canonical, status) = canonicalize_src_ilk_and_status(&snapshot, &old_src, now);
+        let expected_canonical = format!("ilk:{canonical_ilk_id}");
+        assert_eq!(canonical.as_deref(), Some(expected_canonical.as_str()));
+        assert_eq!(status.as_deref(), Some("temporary"));
+    }
+
+    #[test]
+    fn src_ilk_meta_helpers_roundtrip() {
+        let mut meta = Meta {
+            msg_type: "user".to_string(),
+            msg: None,
+            scope: None,
+            target: None,
+            action: None,
+            priority: None,
+            context: None,
+        };
+        assert!(get_src_ilk_from_meta(&meta).is_none());
+        set_src_ilk_in_meta(&mut meta, "ilk:11111111-1111-1111-1111-111111111111");
+        assert_eq!(
+            get_src_ilk_from_meta(&meta).as_deref(),
+            Some("ilk:11111111-1111-1111-1111-111111111111")
+        );
+    }
+
+    fn message_with_src_ilk(src_ilk: &str) -> Message {
+        Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                dst: Destination::Resolve,
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                msg: None,
+                scope: None,
+                target: Some("dummy.target".to_string()),
+                action: None,
+                priority: None,
+                context: Some(serde_json::json!({
+                    "src_ilk": src_ilk,
+                })),
+            },
+            payload: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn apply_identity_pre_resolve_keeps_alias_canonical_during_ttl() {
+        let now = now_epoch_ms();
+        let canonical_ilk_id = Uuid::new_v4();
+        let old_ilk_id = Uuid::new_v4();
+
+        let canonical_ilk = IlkEntry {
+            ilk_id: *canonical_ilk_id.as_bytes(),
+            ilk_type: 0,
+            registration_status: 2,
+            flags: FLAG_ACTIVE,
+            tenant_id: [0u8; 16],
+            display_name: [0u8; 128],
+            handler_node: [0u8; 128],
+            ich_offset: 0,
+            ich_count: 0,
+            _pad0: [0u8; 2],
+            roles_offset: 0,
+            roles_len: 0,
+            _pad1: [0u8; 2],
+            capabilities_offset: 0,
+            capabilities_len: 0,
+            _pad2: [0u8; 2],
+            created_at: now,
+            updated_at: now,
+            _reserved: [0u8; 8],
+        };
+        let alias = IlkAliasEntry {
+            old_ilk_id: *old_ilk_id.as_bytes(),
+            canonical_ilk_id: *canonical_ilk_id.as_bytes(),
+            expires_at: now + 60_000,
+            flags: FLAG_ACTIVE,
+            _reserved: [0u8; 22],
+        };
+        let snapshot = IdentitySnapshot {
+            header: IdentityHeaderSnapshot {
+                tenant_count: 0,
+                ilk_count: 1,
+                ich_count: 0,
+                ich_mapping_count: 0,
+                vocabulary_count: 0,
+                ilk_alias_count: 1,
+                max_ilks: 0,
+                max_tenants: 0,
+                max_ichs: 0,
+                max_ich_mappings: 0,
+                max_vocabulary: 0,
+                max_ilk_aliases: 0,
+                heartbeat: now,
+                updated_at: now,
+            },
+            tenants: Vec::new(),
+            ilks: vec![canonical_ilk],
+            ichs: Vec::new(),
+            ich_mappings: Vec::new(),
+            ilk_aliases: vec![alias],
+            vocabulary: Vec::new(),
+        };
+
+        let old_src = format!("ilk:{old_ilk_id}");
+        let expected_canonical = format!("ilk:{canonical_ilk_id}");
+        let mut msg = message_with_src_ilk(&old_src);
+        let forced_target =
+            apply_identity_pre_resolve(&mut msg, "AI.frontdesk@sandbox", &snapshot, now);
+
+        assert!(forced_target.is_none());
+        assert_eq!(
+            get_src_ilk_from_meta(&msg.meta).as_deref(),
+            Some(expected_canonical.as_str())
+        );
+    }
+
+    #[test]
+    fn apply_identity_pre_resolve_ignores_alias_after_ttl() {
+        let now = now_epoch_ms();
+        let canonical_ilk_id = Uuid::new_v4();
+        let old_ilk_id = Uuid::new_v4();
+
+        let canonical_ilk = IlkEntry {
+            ilk_id: *canonical_ilk_id.as_bytes(),
+            ilk_type: 0,
+            registration_status: 2,
+            flags: FLAG_ACTIVE,
+            tenant_id: [0u8; 16],
+            display_name: [0u8; 128],
+            handler_node: [0u8; 128],
+            ich_offset: 0,
+            ich_count: 0,
+            _pad0: [0u8; 2],
+            roles_offset: 0,
+            roles_len: 0,
+            _pad1: [0u8; 2],
+            capabilities_offset: 0,
+            capabilities_len: 0,
+            _pad2: [0u8; 2],
+            created_at: now,
+            updated_at: now,
+            _reserved: [0u8; 8],
+        };
+        let alias = IlkAliasEntry {
+            old_ilk_id: *old_ilk_id.as_bytes(),
+            canonical_ilk_id: *canonical_ilk_id.as_bytes(),
+            expires_at: now.saturating_sub(1),
+            flags: FLAG_ACTIVE,
+            _reserved: [0u8; 22],
+        };
+        let snapshot = IdentitySnapshot {
+            header: IdentityHeaderSnapshot {
+                tenant_count: 0,
+                ilk_count: 1,
+                ich_count: 0,
+                ich_mapping_count: 0,
+                vocabulary_count: 0,
+                ilk_alias_count: 1,
+                max_ilks: 0,
+                max_tenants: 0,
+                max_ichs: 0,
+                max_ich_mappings: 0,
+                max_vocabulary: 0,
+                max_ilk_aliases: 0,
+                heartbeat: now,
+                updated_at: now,
+            },
+            tenants: Vec::new(),
+            ilks: vec![canonical_ilk],
+            ichs: Vec::new(),
+            ich_mappings: Vec::new(),
+            ilk_aliases: vec![alias],
+            vocabulary: Vec::new(),
+        };
+
+        let old_src = format!("ilk:{old_ilk_id}");
+        let mut msg = message_with_src_ilk(&old_src);
+        let forced_target =
+            apply_identity_pre_resolve(&mut msg, "AI.frontdesk@sandbox", &snapshot, now);
+
+        assert!(forced_target.is_none());
+        assert_eq!(
+            get_src_ilk_from_meta(&msg.meta).as_deref(),
+            Some(old_src.as_str())
+        );
     }
 }

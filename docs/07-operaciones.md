@@ -154,6 +154,7 @@ blob:
 |-------|-------------|---------|-------------|
 | `hive_id` | **Sí** | - | Identificador único de la isla |
 | `role` | No | `worker` | `motherbee` o `worker` |
+| `government.identity_frontdesk` | No | `AI.frontdesk@<hive_id>` | Nodo L2 de frontdesk para ruteo de ILK temporales (puede apuntar a motherbee) |
 | `wan.gateway_name` | No | `RT.gateway` | Nombre del router gateway |
 | `wan.listen` | No | (sin escucha) | IP:puerto para recibir conexiones WAN |
 | `wan.uplinks[]` | No | [] | Lista de gateways a conectar (workers) |

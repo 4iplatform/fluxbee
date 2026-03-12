@@ -7,19 +7,31 @@ STATE_DIR="/var/lib/fluxbee"
 RUN_DIR="/var/run/fluxbee"
 APPLY_DEV_OWNERSHIP="${APPLY_DEV_OWNERSHIP:-1}"
 INSTALL_OWNER="${INSTALL_OWNER:-${SUDO_USER:-$USER}}"
+RESTART_ORCHESTRATOR_AFTER_INSTALL="${RESTART_ORCHESTRATOR_AFTER_INSTALL:-1}"
 SEED_RUNTIME_FIXTURE="${SEED_RUNTIME_FIXTURE:-1}"
 RUNTIME_FIXTURE_NAME="${RUNTIME_FIXTURE_NAME:-wf.orch.diag}"
 RUNTIME_FIXTURE_VERSION="${RUNTIME_FIXTURE_VERSION:-0.0.1}"
 RUNTIME_FIXTURE_SLEEP_SECS="${RUNTIME_FIXTURE_SLEEP_SECS:-3600}"
+BIN_DIR="${BIN_DIR:-$ROOT_DIR/target/release}"
 
 if [[ "${SKIP_BUILD:-}" != "1" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
-    echo "Error: cargo not found. Set SKIP_BUILD=1 if binaries are already built." >&2
-    exit 1
+    # Common case: running with plain sudo loses user PATH (cargo unavailable as root).
+    # If release binaries already exist, continue without rebuilding.
+    if [[ -x "$BIN_DIR/json-router" && -x "$BIN_DIR/sy_orchestrator" && -x "$BIN_DIR/sy_identity" ]]; then
+      echo "Warning: cargo not found; using prebuilt binaries from $BIN_DIR (SKIP_BUILD=1)."
+      SKIP_BUILD=1
+    else
+      echo "Error: cargo not found and required prebuilt binaries are missing in $BIN_DIR." >&2
+      echo "Hint: run without sudo (the script already uses sudo internally), or install cargo in root PATH, or set SKIP_BUILD=1 with existing binaries." >&2
+      exit 1
+    fi
   fi
 
-  echo "Building Rust binaries..."
-  cargo build --release --bins
+  if [[ "${SKIP_BUILD:-}" != "1" ]]; then
+    echo "Building Rust binaries..."
+    cargo build --release --bins
+  fi
 fi
 
 if [[ -d "$ROOT_DIR/sy-opa-rules" ]]; then
@@ -71,7 +83,6 @@ if [[ -f "$MOTHERBEE_KEY_PUB" ]]; then
   sudo chmod 644 "$MOTHERBEE_KEY_PUB"
 fi
 
-BIN_DIR="${BIN_DIR:-$ROOT_DIR/target/release}"
 if [[ "${SKIP_BUILD:-}" == "1" ]]; then
   echo "SKIP_BUILD=1: installing only binaries from $BIN_DIR" >&2
 fi
@@ -93,7 +104,7 @@ sy_admin_bin="$(pick_bin sy_admin)" || { echo "Missing binary: $BIN_DIR/sy_admin
 sy_config_bin="$(pick_bin sy_config_routes)" || { echo "Missing binary: $BIN_DIR/sy_config_routes" >&2; missing=1; }
 sy_orch_bin="$(pick_bin sy_orchestrator)" || { echo "Missing binary: $BIN_DIR/sy_orchestrator" >&2; missing=1; }
 sy_storage_bin="$(pick_bin sy_storage)" || { echo "Missing binary: $BIN_DIR/sy_storage" >&2; missing=1; }
-sy_identity_bin="$(pick_bin sy_identity || true)"
+sy_identity_bin="$(pick_bin sy_identity)" || { echo "Missing binary: $BIN_DIR/sy_identity" >&2; missing=1; }
 sy_opa_rules_bin=""
 if [[ -f "$ROOT_DIR/sy-opa-rules/sy-opa-rules" ]]; then
   sy_opa_rules_bin="$ROOT_DIR/sy-opa-rules/sy-opa-rules"
@@ -115,11 +126,7 @@ sudo install -m 0755 "$sy_admin_bin" /usr/bin/sy-admin
 sudo install -m 0755 "$sy_config_bin" /usr/bin/sy-config-routes
 sudo install -m 0755 "$sy_orch_bin" /usr/bin/sy-orchestrator
 sudo install -m 0755 "$sy_storage_bin" /usr/bin/sy-storage
-if [[ -n "${sy_identity_bin:-}" ]]; then
-  sudo install -m 0755 "$sy_identity_bin" /usr/bin/sy-identity
-else
-  echo "Warning: sy-identity binary not found; skipping install." >&2
-fi
+sudo install -m 0755 "$sy_identity_bin" /usr/bin/sy-identity
 sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
 
 echo "Updating core source repo in $STATE_DIR/dist/core/bin..."
@@ -128,9 +135,7 @@ sudo install -m 0755 "$sy_admin_bin" "$STATE_DIR/dist/core/bin/sy-admin"
 sudo install -m 0755 "$sy_config_bin" "$STATE_DIR/dist/core/bin/sy-config-routes"
 sudo install -m 0755 "$sy_orch_bin" "$STATE_DIR/dist/core/bin/sy-orchestrator"
 sudo install -m 0755 "$sy_storage_bin" "$STATE_DIR/dist/core/bin/sy-storage"
-if [[ -n "${sy_identity_bin:-}" ]]; then
-  sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/dist/core/bin/sy-identity"
-fi
+sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/dist/core/bin/sy-identity"
 sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/dist/core/bin/sy-opa-rules"
 
 rt_gateway_sha="$(sha256sum "$STATE_DIR/dist/core/bin/rt-gateway" | awk '{print $1}')"
@@ -154,16 +159,8 @@ fi
 if [[ -z "${core_build_id:-}" ]]; then
   core_build_id="$(date -u +%Y%m%d%H%M%S)"
 fi
-identity_manifest_entry=""
-if [[ -f "$STATE_DIR/dist/core/bin/sy-identity" ]]; then
-  sy_identity_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-identity" | awk '{print $1}')"
-  sy_identity_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-identity")"
-  identity_manifest_entry="$(cat <<EOF
-,
-    "sy-identity": {"service": "sy-identity", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_identity_sha", "size": $sy_identity_size}
-EOF
-)"
-fi
+sy_identity_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-identity" | awk '{print $1}')"
+sy_identity_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-identity")"
 
 core_manifest_tmp="$(mktemp)"
 cat >"$core_manifest_tmp" <<EOF
@@ -174,14 +171,57 @@ cat >"$core_manifest_tmp" <<EOF
     "sy-admin": {"service": "sy-admin", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_admin_sha", "size": $sy_admin_size},
     "sy-config-routes": {"service": "sy-config-routes", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_config_sha", "size": $sy_config_size},
     "sy-opa-rules": {"service": "sy-opa-rules", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_opa_sha", "size": $sy_opa_size},
+    "sy-identity": {"service": "sy-identity", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_identity_sha", "size": $sy_identity_size},
     "sy-orchestrator": {"service": "sy-orchestrator", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_orch_sha", "size": $sy_orch_size},
-    "sy-storage": {"service": "sy-storage", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_storage_sha", "size": $sy_storage_size}${identity_manifest_entry}
+    "sy-storage": {"service": "sy-storage", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_storage_sha", "size": $sy_storage_size}
   }
 }
 EOF
 sudo install -m 0644 "$core_manifest_tmp" "$STATE_DIR/dist/core/manifest.json"
 rm -f "$core_manifest_tmp"
 echo "Updated core manifest at $STATE_DIR/dist/core/manifest.json"
+
+verify_core_component() {
+  local component="$1"
+  local expected_sha="$2"
+  local expected_size="$3"
+  local dist_path="$STATE_DIR/dist/core/bin/$component"
+  local usr_path="/usr/bin/$component"
+
+  if [[ ! -f "$dist_path" ]]; then
+    echo "Error: missing core dist binary: $dist_path" >&2
+    exit 1
+  fi
+  if [[ ! -f "$usr_path" ]]; then
+    echo "Error: missing installed core binary: $usr_path" >&2
+    exit 1
+  fi
+
+  local dist_sha dist_size usr_sha usr_size
+  dist_sha="$(sha256sum "$dist_path" | awk '{print $1}')"
+  dist_size="$(stat -c %s "$dist_path")"
+  usr_sha="$(sha256sum "$usr_path" | awk '{print $1}')"
+  usr_size="$(stat -c %s "$usr_path")"
+
+  if [[ "$dist_sha" != "$expected_sha" || "$dist_size" != "$expected_size" ]]; then
+    echo "Error: dist/core/bin mismatch for $component (expected sha=$expected_sha size=$expected_size, got sha=$dist_sha size=$dist_size)" >&2
+    exit 1
+  fi
+  if [[ "$usr_sha" != "$expected_sha" || "$usr_size" != "$expected_size" ]]; then
+    echo "Error: /usr/bin mismatch for $component (expected sha=$expected_sha size=$expected_size, got sha=$usr_sha size=$usr_size)" >&2
+    exit 1
+  fi
+}
+
+echo "Verifying installed core binaries (dist/core/bin + /usr/bin)..."
+verify_core_component "rt-gateway" "$rt_gateway_sha" "$rt_gateway_size"
+verify_core_component "sy-admin" "$sy_admin_sha" "$sy_admin_size"
+verify_core_component "sy-config-routes" "$sy_config_sha" "$sy_config_size"
+verify_core_component "sy-opa-rules" "$sy_opa_sha" "$sy_opa_size"
+verify_core_component "sy-identity" "$sy_identity_sha" "$sy_identity_size"
+verify_core_component "sy-orchestrator" "$sy_orch_sha" "$sy_orch_size"
+verify_core_component "sy-storage" "$sy_storage_sha" "$sy_storage_size"
+echo "Core binaries verification passed."
 
 seeded_syncthing_vendor=0
 candidate_syncthing_vendor=""
@@ -345,12 +385,21 @@ install_unit "sy-opa-rules" "/usr/bin/sy-opa-rules"
 install_unit "sy-admin" "/usr/bin/sy-admin"
 install_unit "sy-orchestrator" "/usr/bin/sy-orchestrator"
 install_unit "sy-storage" "/usr/bin/sy-storage"
-if [[ -n "${sy_identity_bin:-}" ]]; then
-  install_unit "sy-identity" "/usr/bin/sy-identity"
-else
-  echo "Warning: sy-identity unit not installed (binary missing)." >&2
-fi
+install_unit "sy-identity" "/usr/bin/sy-identity"
 sudo systemctl daemon-reload
+
+if [[ "$RESTART_ORCHESTRATOR_AFTER_INSTALL" == "1" ]]; then
+  if sudo systemctl list-unit-files sy-orchestrator.service >/dev/null 2>&1; then
+    if sudo systemctl is-active --quiet sy-orchestrator; then
+      echo "Restarting sy-orchestrator to apply new binary..."
+      sudo systemctl restart sy-orchestrator
+    else
+      echo "sy-orchestrator is not active; skipping restart."
+    fi
+  fi
+else
+  echo "RESTART_ORCHESTRATOR_AFTER_INSTALL=0: skipping sy-orchestrator restart."
+fi
 
 if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then
   echo "Applying ownership for test/dev user: $INSTALL_OWNER"

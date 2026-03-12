@@ -505,7 +505,9 @@ name = "fluxbee-sdk"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "memmap2",
  "mime_guess",
+ "nix",
  "serde",
  "serde_json",
  "serde_yaml",

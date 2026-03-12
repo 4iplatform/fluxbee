@@ -1206,6 +1206,9 @@ Note: Tables are prefixed `identity_` to avoid collision with SY.storage's domai
 
 ```yaml
 # Motherbee
+government:
+  identity_frontdesk: "AI.frontdesk@motherbee"
+
 identity:
   max_ilks: 1000000
   max_tenants: 10000
@@ -1215,6 +1218,9 @@ identity:
     port: 9100              # Socket port for delta/full-sync to workers
 
 # Worker
+government:
+  identity_frontdesk: "AI.frontdesk@motherbee"  # Resolved cross-hive by router
+
 identity:
   sync:
     upstream: "motherbee:9100"   # Connect to motherbee identity

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -8,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::time;
 use tokio_postgres::NoTls;
 use tracing_subscriber::EnvFilter;
@@ -16,8 +18,10 @@ use uuid::Uuid;
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
 use json_router::shm::{
-    now_epoch_ms, ICH_ADDRESS_MAX_LEN, ICH_CHANNEL_TYPE_MAX_LEN, LsaRegionReader, LsaSnapshot,
-    NodeEntry, RouterRegionReader, ShmSnapshot,
+    copy_bytes_with_len, now_epoch_ms, IchEntry, IdentityRegionLimits, IdentityRegionWriter,
+    IlkAliasEntry, IlkEntry, LsaRegionReader, LsaSnapshot, NodeEntry, RouterRegionReader,
+    ShmSnapshot, TenantEntry, VocabularyEntry, FLAG_ACTIVE, ICH_ADDRESS_MAX_LEN,
+    ICH_CHANNEL_TYPE_MAX_LEN,
 };
 
 type IdentityError = Box<dyn std::error::Error + Send + Sync>;
@@ -31,6 +35,23 @@ const IDENTITY_FULL_SYNC_CHUNK_ITEMS: usize = 256;
 const IDENTITY_SYNC_VERSION: u32 = 1;
 const SYNC_OP_FULL_SYNC_REQUEST: &str = "IDENTITY_FULL_SYNC_REQUEST";
 const SYNC_OP_FULL_SYNC: &str = "full_sync";
+const SYNC_OP_DELTA_SUBSCRIBE: &str = "IDENTITY_DELTA_SUBSCRIBE";
+const SYNC_OP_DELTA: &str = "IDENTITY_DELTA";
+const SYNC_OP_DELTA_ACK: &str = "IDENTITY_DELTA_ACK";
+const IDENTITY_DELTA_ACK_TIMEOUT_MS: u64 = 2_000;
+const IDENTITY_DELTA_MAX_RETRIES: u32 = 3;
+const DEFAULT_IDENTITY_SHM_MAX_ILKS: u32 = 8_192;
+const DEFAULT_IDENTITY_SHM_MAX_TENANTS: u32 = 1_024;
+const DEFAULT_IDENTITY_SHM_MAX_VOCABULARY: u32 = 4_096;
+const SHM_ILK_TYPE_HUMAN: u8 = 0;
+const SHM_ILK_TYPE_AGENT: u8 = 1;
+const SHM_ILK_TYPE_SYSTEM: u8 = 2;
+const SHM_REG_STATUS_TEMPORARY: u8 = 0;
+const SHM_REG_STATUS_PARTIAL: u8 = 1;
+const SHM_REG_STATUS_COMPLETE: u8 = 2;
+const SHM_TENANT_STATUS_PENDING: u8 = 0;
+const SHM_TENANT_STATUS_ACTIVE: u8 = 1;
+const SHM_TENANT_STATUS_SUSPENDED: u8 = 2;
 
 const MSG_ILK_PROVISION: &str = "ILK_PROVISION";
 const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
@@ -70,6 +91,14 @@ struct IdentitySection {
     default_tenant: Option<String>,
     #[serde(default)]
     merge_alias_ttl_secs: Option<u64>,
+    #[serde(default)]
+    max_ilks: Option<u32>,
+    #[serde(default)]
+    max_tenants: Option<u32>,
+    #[serde(default)]
+    max_vocabulary: Option<u32>,
+    #[serde(default)]
+    max_ilk_aliases: Option<u32>,
     #[serde(default)]
     sync: Option<IdentitySyncSection>,
 }
@@ -128,7 +157,7 @@ struct ChannelInput {
     address: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct IlkAddChannelRequest {
     ilk_id: String,
@@ -211,7 +240,7 @@ struct AliasRecord {
     expires_at_ms: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct IdentityStore {
     tenants: HashMap<String, TenantRecord>,
     ilks: HashMap<String, IlkRecord>,
@@ -223,6 +252,12 @@ struct IdentityStore {
 #[derive(Debug, Serialize, Deserialize)]
 struct IdentitySyncRequest {
     operation: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IdentityDeltaAck {
+    operation: String,
+    seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,7 +285,48 @@ struct IdentitySyncError {
     message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum IdentityDelta {
+    TenantUpsert { tenant: TenantRecord },
+    IlkUpsert { ilk: IlkRecord },
+    IlkDelete { ilk_id: String },
+    AliasUpsert { alias: AliasSnapshotRecord },
+    AliasDelete { old_ilk_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IdentityDeltaEnvelope {
+    version: u32,
+    operation: String,
+    seq: u64,
+    delta: IdentityDelta,
+}
+
 impl IdentityStore {
+    fn find_active_ilk_by_identification_key(&self, key: &str, expected: &str) -> Option<String> {
+        let expected = expected.trim();
+        if expected.is_empty() {
+            return None;
+        }
+        self.ilks.iter().find_map(|(ilk_id, ilk)| {
+            if ilk.deleted_at_ms.is_some() {
+                return None;
+            }
+            let value = ilk
+                .identification
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if value == Some(expected) {
+                Some(ilk_id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     fn with_default_tenant(name: &str) -> Self {
         let mut out = Self::default();
         let tenant_id = format!("tnt:{}", Uuid::new_v4());
@@ -280,10 +356,15 @@ impl IdentityStore {
 
         let key = canonical_ich_key(&req.channel_type, &req.address);
         if let Some(existing) = self.ich_lookup.get(&key) {
+            let status = self
+                .ilks
+                .get(existing)
+                .map(|ilk| ilk.registration_status.as_str())
+                .unwrap_or("temporary");
             return Ok(json!({
                 "status": "ok",
                 "ilk_id": existing,
-                "registration_status": "temporary",
+                "registration_status": status,
             }));
         }
 
@@ -331,7 +412,20 @@ impl IdentityStore {
         let roles = dedup_lowercase_tags(req.roles)?;
         let capabilities = dedup_lowercase_tags(req.capabilities)?;
 
-        match self.ilks.get_mut(&req.ilk_id) {
+        let requested_ilk_id = req.ilk_id.clone();
+        let node_name = req
+            .identification
+            .get("node_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        let canonical_ilk_id = node_name
+            .as_deref()
+            .and_then(|name| self.find_active_ilk_by_identification_key("node_name", name))
+            .unwrap_or_else(|| requested_ilk_id.clone());
+
+        match self.ilks.get_mut(&canonical_ilk_id) {
             Some(existing) => {
                 if existing.deleted_at_ms.is_some() {
                     return Err("ILK_NOT_FOUND".to_string());
@@ -349,9 +443,9 @@ impl IdentityStore {
             }
             None => {
                 self.ilks.insert(
-                    req.ilk_id.clone(),
+                    canonical_ilk_id.clone(),
                     IlkRecord {
-                        ilk_id: req.ilk_id.clone(),
+                        ilk_id: canonical_ilk_id.clone(),
                         ilk_type: req.ilk_type,
                         registration_status: "complete".to_string(),
                         tenant_id: req.tenant_id,
@@ -367,7 +461,7 @@ impl IdentityStore {
 
         Ok(json!({
             "status": "ok",
-            "ilk_id": req.ilk_id,
+            "ilk_id": canonical_ilk_id,
         }))
     }
 
@@ -658,6 +752,43 @@ impl IdentityStore {
         }
         Ok(store)
     }
+
+    fn apply_delta(&mut self, delta: IdentityDelta) {
+        match delta {
+            IdentityDelta::TenantUpsert { tenant } => {
+                self.tenants.insert(tenant.tenant_id.clone(), tenant);
+            }
+            IdentityDelta::IlkUpsert { ilk } => {
+                let ilk_id = ilk.ilk_id.clone();
+                self.ich_lookup
+                    .retain(|_, mapped_ilk| mapped_ilk != &ilk_id);
+                if ilk.deleted_at_ms.is_none() {
+                    for channel in &ilk.channels {
+                        let key = canonical_ich_key(&channel.channel_type, &channel.address);
+                        self.ich_lookup.insert(key, ilk_id.clone());
+                    }
+                }
+                self.ilks.insert(ilk_id, ilk);
+            }
+            IdentityDelta::IlkDelete { ilk_id } => {
+                self.ich_lookup
+                    .retain(|_, mapped_ilk| mapped_ilk != &ilk_id);
+                self.ilks.remove(&ilk_id);
+            }
+            IdentityDelta::AliasUpsert { alias } => {
+                self.aliases.insert(
+                    alias.old_ilk_id.clone(),
+                    AliasRecord {
+                        canonical_ilk_id: alias.canonical_ilk_id,
+                        expires_at_ms: alias.expires_at_ms,
+                    },
+                );
+            }
+            IdentityDelta::AliasDelete { old_ilk_id } => {
+                self.aliases.remove(&old_ilk_id);
+            }
+        }
+    }
 }
 
 struct IdentityRuntime {
@@ -727,9 +858,9 @@ impl IdentityRuntime {
         &mut self,
         sender: &NodeSender,
         msg: &Message,
-    ) -> Result<(), IdentityError> {
+    ) -> Result<Vec<IdentityDeltaEnvelope>, IdentityError> {
         let Some(action) = msg.meta.msg.as_deref() else {
-            return Ok(());
+            return Ok(Vec::new());
         };
 
         let source_name = self.resolve_source_name_with_retry(&msg.routing.src).await;
@@ -743,59 +874,399 @@ impl IdentityRuntime {
                 "source_name": source_name,
             });
             send_system_response(sender, msg, response_name(action), payload).await?;
-            return Ok(());
+            return Ok(Vec::new());
+        }
+        if !self.is_primary && action_requires_primary(action) {
+            let payload = json!({
+                "status": "error",
+                "error_code": "NOT_PRIMARY",
+                "message": "identity replica is read-only for this action; route request to primary",
+                "action": action,
+                "replica_hive_id": self.hive_id,
+            });
+            send_system_response(sender, msg, response_name(action), payload).await?;
+            return Ok(Vec::new());
         }
 
+        let mut deltas: Vec<IdentityDeltaEnvelope> = Vec::new();
         let payload = match action {
             MSG_ILK_PROVISION => {
                 match serde_json::from_value::<IlkProvisionRequest>(msg.payload.clone()) {
-                    Ok(req) => match self.store.provision_temporary_ilk(req) {
-                        Ok(ok) => ok,
-                        Err(code) => error_payload(&code, "failed to provision ilk"),
-                    },
+                    Ok(req) => {
+                        let snapshot = if self.is_primary && self.db_url.is_some() {
+                            Some(self.store.clone())
+                        } else {
+                            None
+                        };
+                        match self.store.provision_temporary_ilk(req) {
+                            Ok(ok) => {
+                                if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
+                                    if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
+                                        if self.is_primary {
+                                            if let Some(database_url) = self.db_url.as_deref() {
+                                                if let Err(err) = persist_ilk_state_in_db(
+                                                    database_url,
+                                                    &ilk,
+                                                    None,
+                                                )
+                                                .await
+                                                {
+                                                    if let Some(snapshot) = snapshot {
+                                                        self.store = snapshot;
+                                                    }
+                                                    error_payload(
+                                                        "DB_WRITE_FAILED",
+                                                        &format!(
+                                                            "failed to persist provisioned ilk: {}",
+                                                            err
+                                                        ),
+                                                    )
+                                                } else {
+                                                    deltas.push(delta_envelope(
+                                                        IdentityDelta::IlkUpsert { ilk },
+                                                    ));
+                                                    ok
+                                                }
+                                            } else {
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::IlkUpsert { ilk },
+                                                ));
+                                                ok
+                                            }
+                                        } else {
+                                            deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                                ilk,
+                                            }));
+                                            ok
+                                        }
+                                    } else {
+                                        ok
+                                    }
+                                } else {
+                                    ok
+                                }
+                            }
+                            Err(code) => error_payload(&code, "failed to provision ilk"),
+                        }
+                    }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
             }
             MSG_ILK_REGISTER => {
                 match serde_json::from_value::<IlkRegisterRequest>(msg.payload.clone()) {
-                    Ok(req) => match self.store.register_ilk(req) {
-                        Ok(ok) => ok,
-                        Err(code) => error_payload(&code, "failed to register ilk"),
-                    },
+                    Ok(req) => {
+                        let snapshot = if self.is_primary && self.db_url.is_some() {
+                            Some(self.store.clone())
+                        } else {
+                            None
+                        };
+                        match self.store.register_ilk(req) {
+                            Ok(ok) => {
+                                if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
+                                    if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
+                                        if self.is_primary {
+                                            if let Some(database_url) = self.db_url.as_deref() {
+                                                if let Err(err) = persist_ilk_state_in_db(
+                                                    database_url,
+                                                    &ilk,
+                                                    None,
+                                                )
+                                                .await
+                                                {
+                                                    if let Some(snapshot) = snapshot {
+                                                        self.store = snapshot;
+                                                    }
+                                                    error_payload(
+                                                        "DB_WRITE_FAILED",
+                                                        &format!(
+                                                            "failed to persist registered ilk: {}",
+                                                            err
+                                                        ),
+                                                    )
+                                                } else {
+                                                    deltas.push(delta_envelope(
+                                                        IdentityDelta::IlkUpsert { ilk },
+                                                    ));
+                                                    ok
+                                                }
+                                            } else {
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::IlkUpsert { ilk },
+                                                ));
+                                                ok
+                                            }
+                                        } else {
+                                            deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                                ilk,
+                                            }));
+                                            ok
+                                        }
+                                    } else {
+                                        ok
+                                    }
+                                } else {
+                                    ok
+                                }
+                            }
+                            Err(code) => error_payload(&code, "failed to register ilk"),
+                        }
+                    }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
             }
             MSG_ILK_ADD_CHANNEL => {
                 match serde_json::from_value::<IlkAddChannelRequest>(msg.payload.clone()) {
-                    Ok(req) => match self.store.add_channel(req, self.merge_alias_ttl_secs) {
-                        Ok(ok) => ok,
-                        Err(code) => error_payload(&code, "failed to add channel"),
-                    },
+                    Ok(req) => {
+                        let snapshot = if self.is_primary && self.db_url.is_some() {
+                            Some(self.store.clone())
+                        } else {
+                            None
+                        };
+                        match self
+                            .store
+                            .add_channel(req.clone(), self.merge_alias_ttl_secs)
+                        {
+                            Ok(ok) => {
+                                let alias_delta =
+                                    req.merge_from_ilk_id.as_ref().and_then(|old_ilk_id| {
+                                        self.store.aliases.get(old_ilk_id).map(|alias| {
+                                            AliasSnapshotRecord {
+                                                old_ilk_id: old_ilk_id.clone(),
+                                                canonical_ilk_id: alias.canonical_ilk_id.clone(),
+                                                expires_at_ms: alias.expires_at_ms,
+                                            }
+                                        })
+                                    });
+                                if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
+                                    if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
+                                        if self.is_primary {
+                                            if let Some(database_url) = self.db_url.as_deref() {
+                                                if let Err(err) = persist_ilk_state_in_db(
+                                                    database_url,
+                                                    &ilk,
+                                                    alias_delta.as_ref(),
+                                                )
+                                                .await
+                                                {
+                                                    if let Some(snapshot) = snapshot {
+                                                        self.store = snapshot;
+                                                    }
+                                                    error_payload(
+                                                        "DB_WRITE_FAILED",
+                                                        &format!(
+                                                            "failed to persist channel/merge update: {}",
+                                                            err
+                                                        ),
+                                                    )
+                                                } else {
+                                                    deltas.push(delta_envelope(
+                                                        IdentityDelta::IlkUpsert { ilk },
+                                                    ));
+                                                    if let Some(alias) = alias_delta {
+                                                        deltas.push(delta_envelope(
+                                                            IdentityDelta::AliasUpsert { alias },
+                                                        ));
+                                                    }
+                                                    ok
+                                                }
+                                            } else {
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::IlkUpsert { ilk },
+                                                ));
+                                                if let Some(alias) = alias_delta {
+                                                    deltas.push(delta_envelope(
+                                                        IdentityDelta::AliasUpsert { alias },
+                                                    ));
+                                                }
+                                                ok
+                                            }
+                                        } else {
+                                            deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                                ilk,
+                                            }));
+                                            if let Some(alias) = alias_delta {
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::AliasUpsert { alias },
+                                                ));
+                                            }
+                                            ok
+                                        }
+                                    } else {
+                                        ok
+                                    }
+                                } else {
+                                    ok
+                                }
+                            }
+                            Err(code) => error_payload(&code, "failed to add channel"),
+                        }
+                    }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
             }
             MSG_ILK_UPDATE => match serde_json::from_value::<IlkUpdateRequest>(msg.payload.clone())
             {
-                Ok(req) => match self.store.update_ilk(req) {
-                    Ok(ok) => ok,
-                    Err(code) => error_payload(&code, "failed to update ilk"),
-                },
+                Ok(req) => {
+                    let snapshot = if self.is_primary && self.db_url.is_some() {
+                        Some(self.store.clone())
+                    } else {
+                        None
+                    };
+                    match self.store.update_ilk(req) {
+                        Ok(ok) => {
+                            if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
+                                if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
+                                    if self.is_primary {
+                                        if let Some(database_url) = self.db_url.as_deref() {
+                                            if let Err(err) =
+                                                persist_ilk_state_in_db(database_url, &ilk, None)
+                                                    .await
+                                            {
+                                                if let Some(snapshot) = snapshot {
+                                                    self.store = snapshot;
+                                                }
+                                                error_payload(
+                                                    "DB_WRITE_FAILED",
+                                                    &format!(
+                                                        "failed to persist ilk update: {}",
+                                                        err
+                                                    ),
+                                                )
+                                            } else {
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::IlkUpsert { ilk },
+                                                ));
+                                                ok
+                                            }
+                                        } else {
+                                            deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                                ilk,
+                                            }));
+                                            ok
+                                        }
+                                    } else {
+                                        deltas
+                                            .push(delta_envelope(IdentityDelta::IlkUpsert { ilk }));
+                                        ok
+                                    }
+                                } else {
+                                    ok
+                                }
+                            } else {
+                                ok
+                            }
+                        }
+                        Err(code) => error_payload(&code, "failed to update ilk"),
+                    }
+                }
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
             },
             MSG_TNT_CREATE => match serde_json::from_value::<TntCreateRequest>(msg.payload.clone())
             {
                 Ok(req) => match self.store.create_tenant(req) {
-                    Ok(ok) => ok,
+                    Ok(ok) => {
+                        if let Some(tenant_id) = ok
+                            .get("tenant_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                        {
+                            if let Some(tenant) = self.store.tenants.get(&tenant_id).cloned() {
+                                if self.is_primary {
+                                    if let Some(database_url) = self.db_url.as_deref() {
+                                        if let Err(err) =
+                                            upsert_tenant_in_db(database_url, &tenant).await
+                                        {
+                                            self.store.tenants.remove(&tenant_id);
+                                            error_payload(
+                                                "DB_WRITE_FAILED",
+                                                &format!("failed to persist tenant: {}", err),
+                                            )
+                                        } else {
+                                            deltas.push(delta_envelope(
+                                                IdentityDelta::TenantUpsert { tenant },
+                                            ));
+                                            ok
+                                        }
+                                    } else {
+                                        deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
+                                            tenant,
+                                        }));
+                                        ok
+                                    }
+                                } else {
+                                    deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
+                                        tenant,
+                                    }));
+                                    ok
+                                }
+                            } else {
+                                ok
+                            }
+                        } else {
+                            ok
+                        }
+                    }
                     Err(code) => error_payload(&code, "failed to create tenant"),
                 },
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
             },
             MSG_TNT_APPROVE => {
                 match serde_json::from_value::<TntApproveRequest>(msg.payload.clone()) {
-                    Ok(req) => match self.store.approve_tenant(req) {
-                        Ok(ok) => ok,
-                        Err(code) => error_payload(&code, "failed to approve tenant"),
-                    },
+                    Ok(req) => {
+                        let snapshot = if self.is_primary && self.db_url.is_some() {
+                            Some(self.store.clone())
+                        } else {
+                            None
+                        };
+                        match self.store.approve_tenant(req) {
+                            Ok(ok) => {
+                                if let Some(tenant_id) = ok.get("tenant_id").and_then(Value::as_str)
+                                {
+                                    if let Some(tenant) = self.store.tenants.get(tenant_id).cloned()
+                                    {
+                                        if self.is_primary {
+                                            if let Some(database_url) = self.db_url.as_deref() {
+                                                if let Err(err) =
+                                                    upsert_tenant_in_db(database_url, &tenant).await
+                                                {
+                                                    if let Some(snapshot) = snapshot {
+                                                        self.store = snapshot;
+                                                    }
+                                                    error_payload(
+                                                        "DB_WRITE_FAILED",
+                                                        &format!(
+                                                            "failed to persist tenant approval: {}",
+                                                            err
+                                                        ),
+                                                    )
+                                                } else {
+                                                    deltas.push(delta_envelope(
+                                                        IdentityDelta::TenantUpsert { tenant },
+                                                    ));
+                                                    ok
+                                                }
+                                            } else {
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::TenantUpsert { tenant },
+                                                ));
+                                                ok
+                                            }
+                                        } else {
+                                            deltas.push(delta_envelope(
+                                                IdentityDelta::TenantUpsert { tenant },
+                                            ));
+                                            ok
+                                        }
+                                    } else {
+                                        ok
+                                    }
+                                } else {
+                                    ok
+                                }
+                            }
+                            Err(code) => error_payload(&code, "failed to approve tenant"),
+                        }
+                    }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
             }
@@ -811,11 +1282,24 @@ impl IdentityRuntime {
             ),
         };
 
-        send_system_response(sender, msg, response_name(action), payload).await
+        send_system_response(sender, msg, response_name(action), payload).await?;
+        Ok(deltas)
     }
 
-    async fn run_alias_gc(&mut self) -> Result<(), IdentityError> {
+    async fn run_alias_gc(&mut self) -> Result<Vec<IdentityDeltaEnvelope>, IdentityError> {
         let now_ms = now_epoch_ms();
+        let expired_aliases: Vec<String> = self
+            .store
+            .aliases
+            .iter()
+            .filter_map(|(old_ilk_id, alias)| {
+                if alias.expires_at_ms <= now_ms {
+                    Some(old_ilk_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
         let removed_local = self.store.gc_expired_aliases(now_ms);
         if removed_local > 0 {
             tracing::info!(removed = removed_local, "identity alias gc applied locally");
@@ -832,7 +1316,21 @@ impl IdentityRuntime {
                 }
             }
         }
-        Ok(())
+
+        let mut deltas = Vec::new();
+        for old_ilk_id in expired_aliases {
+            deltas.push(delta_envelope(IdentityDelta::AliasDelete {
+                old_ilk_id: old_ilk_id.clone(),
+            }));
+            if let Some(ilk) = self.store.ilks.get(&old_ilk_id) {
+                if ilk.deleted_at_ms.is_some() {
+                    deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                        ilk: ilk.clone(),
+                    }));
+                }
+            }
+        }
+        Ok(deltas)
     }
 
     fn is_authorized(&self, action: &str, source_name: Option<&str>) -> bool {
@@ -847,8 +1345,10 @@ impl IdentityRuntime {
             return false;
         };
 
+        let variants = authorized_name_variants(name);
+
         if let Some(exacts) = self.allowed_exacts.get(action) {
-            if exacts.contains(name) {
+            if variants.iter().any(|candidate| exacts.contains(candidate)) {
                 return true;
             }
         }
@@ -856,7 +1356,9 @@ impl IdentityRuntime {
         let Some(prefixes) = self.allowed_prefixes.get(action) else {
             return false;
         };
-        prefixes.iter().any(|prefix| name.starts_with(prefix))
+        variants
+            .iter()
+            .any(|candidate| prefixes.iter().any(|prefix| candidate.starts_with(prefix)))
     }
 
     async fn resolve_source_name_with_retry(&self, source_uuid: &str) -> Option<String> {
@@ -901,6 +1403,16 @@ impl IdentityRuntime {
     }
 }
 
+fn authorized_name_variants(name: &str) -> Vec<String> {
+    let mut out = vec![name.to_string()];
+    if let Some((local, hive)) = name.split_once('@') {
+        if local.starts_with("SY.orchestrator.relay.") {
+            out.push(format!("SY.orchestrator@{hive}"));
+        }
+    }
+    out
+}
+
 #[tokio::main]
 async fn main() -> Result<(), IdentityError> {
     if cfg!(not(target_os = "linux")) {
@@ -941,6 +1453,54 @@ async fn main() -> Result<(), IdentityError> {
         None
     };
     let mut runtime = IdentityRuntime::new(&hive, state_dir.clone(), is_primary, db_url);
+    if is_primary {
+        if let Some(database_url) = runtime.db_url.clone() {
+            match load_identity_store_from_db(&database_url).await {
+                Ok(store) if store.tenants.is_empty() => {
+                    if let Some(default_tenant_id) = runtime.store.default_tenant_id() {
+                        if let Some(default_tenant) =
+                            runtime.store.tenants.get(&default_tenant_id).cloned()
+                        {
+                            if let Err(err) =
+                                upsert_tenant_in_db(&database_url, &default_tenant).await
+                            {
+                                tracing::warn!(error = %err, "failed to persist default tenant in primary db bootstrap");
+                            } else {
+                                tracing::info!(tenant_id = %default_tenant.tenant_id, "persisted default tenant in primary db bootstrap");
+                            }
+                        }
+                    }
+                }
+                Ok(store) => {
+                    let metrics = store.metrics();
+                    runtime.store = store;
+                    tracing::info!(metrics = %metrics, "loaded identity store from primary db");
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to load identity store from primary db; continuing with in-memory bootstrap");
+                }
+            }
+        }
+    }
+    let identity_shm_name = identity_shm_name(&hive.hive_id);
+    let identity_limits = identity_region_limits(&hive);
+    let mut identity_shm = match IdentityRegionWriter::open_or_create(
+        &identity_shm_name,
+        Uuid::new_v4(),
+        &hive.hive_id,
+        is_primary,
+        identity_limits,
+    ) {
+        Ok(writer) => Some(writer),
+        Err(err) => {
+            tracing::warn!(
+                shm = %identity_shm_name,
+                error = %err,
+                "identity shm unavailable; IO lookup via SHM will be degraded"
+            );
+            None
+        }
+    };
     let sync_port = identity_sync_port(&hive);
     let sync_upstream = identity_sync_upstream(&hive);
     let sync_listener = if is_primary {
@@ -967,6 +1527,19 @@ async fn main() -> Result<(), IdentityError> {
             tracing::warn!("identity replica mode without identity.sync.upstream; starting with local in-memory state");
         }
     }
+    if let Some(writer) = identity_shm.as_mut() {
+        if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
+            tracing::warn!(error = %err, "initial identity shm sync failed");
+        }
+    }
+    let (delta_event_tx, mut delta_event_rx) = mpsc::unbounded_channel::<IdentityDeltaEnvelope>();
+    if !is_primary {
+        if let Some(upstream) = sync_upstream.clone() {
+            tokio::spawn(async move {
+                run_delta_subscription_loop(upstream, delta_event_tx).await;
+            });
+        }
+    }
     let (mut sender, mut receiver) =
         connect_with_retry(&node_config, Duration::from_secs(1)).await?;
 
@@ -978,84 +1551,99 @@ async fn main() -> Result<(), IdentityError> {
 
     let mut heartbeat = time::interval(Duration::from_secs(5));
     let mut alias_gc_tick = time::interval(Duration::from_secs(ALIAS_GC_INTERVAL_SECS));
-    if let Some(listener) = sync_listener {
-        loop {
-            tokio::select! {
-                _ = heartbeat.tick() => {
-                    tracing::debug!(metrics = %runtime.store.metrics(), "identity heartbeat");
+    let sync_listener = sync_listener;
+    let mut delta_subscribers: Vec<mpsc::UnboundedSender<IdentityDeltaEnvelope>> = Vec::new();
+    let mut next_delta_seq: u64 = 1;
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                tracing::debug!(metrics = %runtime.store.metrics(), "identity heartbeat");
+                if let Some(writer) = identity_shm.as_mut() {
+                    writer.update_heartbeat();
                 }
-                _ = alias_gc_tick.tick() => {
-                    if let Err(err) = runtime.run_alias_gc().await {
-                        tracing::warn!(error = %err, "identity alias gc failed");
-                    }
-                }
-                accepted = listener.accept() => {
-                    match accepted {
-                        Ok((stream, remote_addr)) => {
-                            let chunks = runtime.store.build_full_sync_chunks(IDENTITY_FULL_SYNC_CHUNK_ITEMS);
-                            tokio::spawn(async move {
-                                if let Err(err) = handle_full_sync_connection(stream, chunks).await {
-                                    tracing::warn!(remote = %remote_addr, error = %err, "identity full sync request failed");
+            }
+            _ = alias_gc_tick.tick() => {
+                match runtime.run_alias_gc().await {
+                    Ok(mut deltas) => {
+                        if !deltas.is_empty() {
+                            if let Some(writer) = identity_shm.as_mut() {
+                                if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
+                                    tracing::warn!(error = %err, "identity shm sync failed after alias gc");
                                 }
-                            });
+                            }
                         }
-                        Err(err) => {
-                            tracing::warn!(error = %err, "identity sync accept failed");
+                        if is_primary && !deltas.is_empty() {
+                            assign_delta_seqs(&mut deltas, &mut next_delta_seq);
+                            broadcast_deltas(&mut delta_subscribers, &deltas);
                         }
                     }
-                }
-                received = receiver.recv() => {
-                    let msg = match received {
-                        Ok(msg) => msg,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "recv error; reconnecting");
-                            let (new_sender, new_receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
-                            sender = new_sender;
-                            receiver = new_receiver;
-                            tracing::info!("reconnected to router");
-                            continue;
-                        }
-                    };
-
-                    if msg.meta.msg_type != SYSTEM_KIND {
-                        continue;
-                    }
-
-                    if let Err(err) = runtime.process_system_message(&sender, &msg).await {
-                        tracing::warn!(error = %err, action = ?msg.meta.msg, "failed to process system message");
+                    Err(err) => {
+                        tracing::warn!(error = %err, "identity alias gc failed");
                     }
                 }
             }
-        }
-    } else {
-        loop {
-            tokio::select! {
-                _ = heartbeat.tick() => {
-                    tracing::debug!(metrics = %runtime.store.metrics(), "identity heartbeat");
-                }
-                _ = alias_gc_tick.tick() => {
-                    if let Err(err) = runtime.run_alias_gc().await {
-                        tracing::warn!(error = %err, "identity alias gc failed");
+            maybe_delta = delta_event_rx.recv() => {
+                if let Some(envelope) = maybe_delta {
+                    runtime.store.apply_delta(envelope.delta);
+                    if let Some(writer) = identity_shm.as_mut() {
+                        if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
+                            tracing::warn!(error = %err, "identity shm sync failed after delta apply");
+                        }
                     }
                 }
-                received = receiver.recv() => {
-                    let msg = match received {
-                        Ok(msg) => msg,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "recv error; reconnecting");
-                            let (new_sender, new_receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
-                            sender = new_sender;
-                            receiver = new_receiver;
-                            tracing::info!("reconnected to router");
-                            continue;
+            }
+            accepted = async {
+                match sync_listener.as_ref() {
+                    Some(listener) => listener.accept().await.ok(),
+                    None => future::pending().await,
+                }
+            } => {
+                if let Some((stream, remote_addr)) = accepted {
+                    let chunks = runtime.store.build_full_sync_chunks(IDENTITY_FULL_SYNC_CHUNK_ITEMS);
+                    match handle_sync_connection(stream, chunks).await {
+                        Ok(Some(subscriber)) => {
+                            tracing::info!(remote = %remote_addr, "identity delta subscriber connected");
+                            delta_subscribers.push(subscriber);
                         }
-                    };
-
-                    if msg.meta.msg_type != SYSTEM_KIND {
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(remote = %remote_addr, error = %err, "identity sync request failed");
+                        }
+                    }
+                }
+            }
+            received = receiver.recv() => {
+                let msg = match received {
+                    Ok(msg) => msg,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "recv error; reconnecting");
+                        let (new_sender, new_receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+                        sender = new_sender;
+                        receiver = new_receiver;
+                        tracing::info!("reconnected to router");
                         continue;
                     }
+                };
 
-                    if let Err(err) = runtime.process_system_message(&sender, &msg).await {
+                if msg.meta.msg_type != SYSTEM_KIND {
+                    continue;
+                }
+
+                match runtime.process_system_message(&sender, &msg).await {
+                    Ok(mut deltas) => {
+                        if !deltas.is_empty() {
+                            if let Some(writer) = identity_shm.as_mut() {
+                                if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
+                                    tracing::warn!(error = %err, "identity shm sync failed after system action");
+                                }
+                            }
+                        }
+                        if is_primary && !deltas.is_empty() {
+                            assign_delta_seqs(&mut deltas, &mut next_delta_seq);
+                            broadcast_deltas(&mut delta_subscribers, &deltas);
+                        }
+                    }
+                    Err(err) => {
                         tracing::warn!(error = %err, action = ?msg.meta.msg, "failed to process system message");
                     }
                 }
@@ -1081,10 +1669,311 @@ fn identity_sync_upstream(hive: &HiveFile) -> Option<String> {
         .filter(|raw| !raw.is_empty())
 }
 
-async fn handle_full_sync_connection(
+fn identity_shm_name(hive_id: &str) -> String {
+    format!("/jsr-identity-{}", hive_id.trim())
+}
+
+fn identity_region_limits(hive: &HiveFile) -> IdentityRegionLimits {
+    let section = hive.identity.as_ref();
+    let max_ilks = section
+        .and_then(|identity| identity.max_ilks)
+        .unwrap_or(DEFAULT_IDENTITY_SHM_MAX_ILKS)
+        .max(1);
+    let max_tenants = section
+        .and_then(|identity| identity.max_tenants)
+        .unwrap_or(DEFAULT_IDENTITY_SHM_MAX_TENANTS)
+        .max(1);
+    let max_vocabulary = section
+        .and_then(|identity| identity.max_vocabulary)
+        .unwrap_or(DEFAULT_IDENTITY_SHM_MAX_VOCABULARY)
+        .max(1);
+    let max_ilk_aliases = section
+        .and_then(|identity| identity.max_ilk_aliases)
+        .unwrap_or(max_ilks)
+        .max(1);
+    IdentityRegionLimits {
+        max_ilks,
+        max_tenants,
+        max_vocabulary,
+        max_ilk_aliases,
+    }
+}
+
+fn parse_ilk_type_for_shm(value: &str) -> u8 {
+    match value.trim() {
+        "human" => SHM_ILK_TYPE_HUMAN,
+        "agent" => SHM_ILK_TYPE_AGENT,
+        "system" => SHM_ILK_TYPE_SYSTEM,
+        _ => SHM_ILK_TYPE_SYSTEM,
+    }
+}
+
+fn parse_registration_status_for_shm(value: &str) -> u8 {
+    match value.trim() {
+        "temporary" => SHM_REG_STATUS_TEMPORARY,
+        "partial" => SHM_REG_STATUS_PARTIAL,
+        "complete" => SHM_REG_STATUS_COMPLETE,
+        _ => SHM_REG_STATUS_TEMPORARY,
+    }
+}
+
+fn parse_tenant_status_for_shm(value: &str) -> u8 {
+    match value.trim() {
+        "pending" => SHM_TENANT_STATUS_PENDING,
+        "active" => SHM_TENANT_STATUS_ACTIVE,
+        "suspended" => SHM_TENANT_STATUS_SUSPENDED,
+        _ => SHM_TENANT_STATUS_PENDING,
+    }
+}
+
+fn identification_str<'a>(identification: &'a Value, key: &str) -> Option<&'a str> {
+    identification
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn sync_identity_shm_mappings(
+    writer: &mut IdentityRegionWriter,
+    store: &IdentityStore,
+) -> Result<(), IdentityError> {
+    let now_ms = now_epoch_ms();
+    let mut tenant_entries: Vec<TenantEntry> = Vec::new();
+    let mut ilk_entries: Vec<IlkEntry> = Vec::new();
+    let mut ich_entries: Vec<IchEntry> = Vec::new();
+    let mut alias_entries: Vec<IlkAliasEntry> = Vec::new();
+    let vocabulary_entries: Vec<VocabularyEntry> = Vec::new();
+
+    let mut tenant_ids: Vec<String> = store.tenants.keys().cloned().collect();
+    tenant_ids.sort_unstable();
+    for tenant_id in tenant_ids {
+        let Some(tenant) = store.tenants.get(&tenant_id) else {
+            continue;
+        };
+        let Ok(tenant_uuid) = parse_prefixed_uuid(&tenant.tenant_id, "tnt") else {
+            tracing::warn!(
+                tenant_id = %tenant.tenant_id,
+                "skipping invalid tenant_id during identity shm sync"
+            );
+            continue;
+        };
+        let mut entry = TenantEntry {
+            tenant_id: *tenant_uuid.as_bytes(),
+            name: [0u8; 128],
+            domain: [0u8; 128],
+            status: parse_tenant_status_for_shm(&tenant.status),
+            flags: FLAG_ACTIVE,
+            _pad0: [0u8; 5],
+            max_ilks: tenant
+                .settings
+                .get("max_ilks")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32,
+            created_at: now_ms,
+            updated_at: now_ms,
+            _reserved: [0u8; 8],
+        };
+        copy_bytes_with_len(&mut entry.name, tenant.name.trim());
+        if let Some(domain) = tenant
+            .domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            copy_bytes_with_len(&mut entry.domain, domain);
+        }
+        tenant_entries.push(entry);
+    }
+
+    let mut channel_to_ich: HashMap<(String, String), [u8; 16]> = HashMap::new();
+    let mut ilk_ids: Vec<String> = store.ilks.keys().cloned().collect();
+    ilk_ids.sort_unstable();
+    for ilk_id in ilk_ids {
+        let Some(ilk) = store.ilks.get(&ilk_id) else {
+            continue;
+        };
+        if ilk.deleted_at_ms.is_some() {
+            continue;
+        }
+        let Ok(ilk_uuid) = parse_prefixed_uuid(&ilk.ilk_id, "ilk") else {
+            tracing::warn!(
+                ilk_id = %ilk.ilk_id,
+                "skipping invalid ilk_id during identity shm sync"
+            );
+            continue;
+        };
+        let Ok(tenant_uuid) = parse_prefixed_uuid(&ilk.tenant_id, "tnt") else {
+            tracing::warn!(
+                ilk_id = %ilk.ilk_id,
+                tenant_id = %ilk.tenant_id,
+                "skipping ILK with invalid tenant_id during identity shm sync"
+            );
+            continue;
+        };
+
+        let ich_offset = ich_entries.len() as u32;
+        let mut ich_count: u16 = 0;
+        for (idx, channel) in ilk.channels.iter().enumerate() {
+            let channel_type = channel.channel_type.trim().to_ascii_lowercase();
+            let address = channel.address.trim().to_ascii_lowercase();
+            if channel_type.is_empty() || address.is_empty() {
+                continue;
+            }
+            let Ok(ich_uuid) = parse_prefixed_uuid(&channel.ich_id, "ich") else {
+                tracing::warn!(
+                    ilk_id = %ilk.ilk_id,
+                    ich_id = %channel.ich_id,
+                    "skipping invalid ich_id during identity shm sync"
+                );
+                continue;
+            };
+            let mut ich_entry = IchEntry {
+                ich_id: *ich_uuid.as_bytes(),
+                ilk_id: *ilk_uuid.as_bytes(),
+                channel_type: [0u8; ICH_CHANNEL_TYPE_MAX_LEN],
+                address: [0u8; ICH_ADDRESS_MAX_LEN],
+                flags: FLAG_ACTIVE,
+                is_primary: if idx == 0 { 1 } else { 0 },
+                _pad0: [0u8; 5],
+                added_at: now_ms,
+                _reserved: [0u8; 16],
+            };
+            copy_bytes_with_len(&mut ich_entry.channel_type, &channel_type);
+            copy_bytes_with_len(&mut ich_entry.address, &address);
+            ich_entries.push(ich_entry);
+            ich_count = ich_count.saturating_add(1);
+            channel_to_ich.insert((channel_type, address), *ich_uuid.as_bytes());
+        }
+
+        let mut ilk_entry = IlkEntry {
+            ilk_id: *ilk_uuid.as_bytes(),
+            ilk_type: parse_ilk_type_for_shm(&ilk.ilk_type),
+            registration_status: parse_registration_status_for_shm(&ilk.registration_status),
+            flags: FLAG_ACTIVE,
+            tenant_id: *tenant_uuid.as_bytes(),
+            display_name: [0u8; 128],
+            handler_node: [0u8; 128],
+            ich_offset,
+            ich_count,
+            _pad0: [0u8; 2],
+            roles_offset: 0,
+            roles_len: 0,
+            _pad1: [0u8; 2],
+            capabilities_offset: 0,
+            capabilities_len: 0,
+            _pad2: [0u8; 2],
+            created_at: now_ms,
+            updated_at: now_ms,
+            _reserved: [0u8; 8],
+        };
+        let display_name = identification_str(&ilk.identification, "display_name")
+            .or_else(|| identification_str(&ilk.identification, "node_name"))
+            .unwrap_or(ilk.ilk_id.as_str());
+        copy_bytes_with_len(&mut ilk_entry.display_name, display_name);
+        if let Some(handler_node) = identification_str(&ilk.identification, "node_name") {
+            copy_bytes_with_len(&mut ilk_entry.handler_node, handler_node);
+        }
+        ilk_entries.push(ilk_entry);
+    }
+
+    let mut alias_keys: Vec<String> = store.aliases.keys().cloned().collect();
+    alias_keys.sort_unstable();
+    for old_ilk_id in alias_keys {
+        let Some(alias) = store.aliases.get(&old_ilk_id) else {
+            continue;
+        };
+        if alias.expires_at_ms <= now_ms {
+            continue;
+        }
+        let Ok(old_uuid) = parse_prefixed_uuid(&old_ilk_id, "ilk") else {
+            tracing::warn!(
+                old_ilk_id = %old_ilk_id,
+                "skipping invalid alias old_ilk_id during identity shm sync"
+            );
+            continue;
+        };
+        let Ok(canonical_uuid) = parse_prefixed_uuid(&alias.canonical_ilk_id, "ilk") else {
+            tracing::warn!(
+                old_ilk_id = %old_ilk_id,
+                canonical_ilk_id = %alias.canonical_ilk_id,
+                "skipping invalid alias canonical_ilk_id during identity shm sync"
+            );
+            continue;
+        };
+        alias_entries.push(IlkAliasEntry {
+            old_ilk_id: *old_uuid.as_bytes(),
+            canonical_ilk_id: *canonical_uuid.as_bytes(),
+            expires_at: alias.expires_at_ms,
+            flags: FLAG_ACTIVE,
+            _reserved: [0u8; 22],
+        });
+    }
+
+    writer.write_snapshot_entries(
+        &tenant_entries,
+        &ilk_entries,
+        &ich_entries,
+        &alias_entries,
+        &vocabulary_entries,
+    )?;
+
+    let mut mapped_channels = 0u64;
+    let mut lookup_keys: Vec<(String, String)> = store.ich_lookup.keys().cloned().collect();
+    lookup_keys.sort_unstable();
+    for (channel_type, address) in lookup_keys {
+        let Some(ilk_id) = store
+            .ich_lookup
+            .get(&(channel_type.clone(), address.clone()))
+        else {
+            continue;
+        };
+        let Ok(ilk_uuid) = parse_prefixed_uuid(ilk_id, "ilk") else {
+            tracing::warn!(ilk_id = %ilk_id, "skipping invalid ilk_id during identity shm sync");
+            continue;
+        };
+        let Some(ich_id) = channel_to_ich
+            .get(&(channel_type.clone(), address.clone()))
+            .copied()
+        else {
+            tracing::warn!(
+                ilk_id = %ilk_id,
+                channel_type = %channel_type,
+                address = %address,
+                "missing ich_id for lookup key during identity shm sync"
+            );
+            continue;
+        };
+        if let Err(err) =
+            writer.upsert_ich_mapping(&channel_type, &address, ich_id, *ilk_uuid.as_bytes())
+        {
+            tracing::warn!(
+                ilk_id = %ilk_id,
+                channel_type = %channel_type,
+                address = %address,
+                error = %err,
+                "failed to upsert identity shm ich mapping"
+            );
+            continue;
+        }
+        mapped_channels = mapped_channels.saturating_add(1);
+    }
+    tracing::debug!(
+        mapped_channels,
+        tenant_count = tenant_entries.len(),
+        ilk_count = ilk_entries.len(),
+        ich_count = ich_entries.len(),
+        alias_count = alias_entries.len(),
+        "identity shm snapshot sync applied"
+    );
+    Ok(())
+}
+
+async fn handle_sync_connection(
     stream: TcpStream,
     chunks: Vec<IdentityFullSyncChunk>,
-) -> Result<(), IdentityError> {
+) -> Result<Option<mpsc::UnboundedSender<IdentityDeltaEnvelope>>, IdentityError> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut request_line = String::new();
@@ -1093,26 +1982,88 @@ async fn handle_full_sync_connection(
         return Err("full sync request connection closed".into());
     }
     let request: IdentitySyncRequest = serde_json::from_str(request_line.trim())?;
-    if request.operation != SYNC_OP_FULL_SYNC_REQUEST {
-        let payload = IdentitySyncError {
-            status: "error".to_string(),
-            error_code: "INVALID_REQUEST".to_string(),
-            message: format!("unsupported sync operation '{}'", request.operation),
-        };
-        let encoded = serde_json::to_string(&payload)?;
-        write_half.write_all(encoded.as_bytes()).await?;
-        write_half.write_all(b"\n").await?;
-        write_half.flush().await?;
-        return Ok(());
+    match request.operation.as_str() {
+        SYNC_OP_FULL_SYNC_REQUEST => {
+            for chunk in chunks {
+                let encoded = serde_json::to_string(&chunk)?;
+                write_half.write_all(encoded.as_bytes()).await?;
+                write_half.write_all(b"\n").await?;
+            }
+            write_half.flush().await?;
+            Ok(None)
+        }
+        SYNC_OP_DELTA_SUBSCRIBE => {
+            let (tx, mut rx) = mpsc::unbounded_channel::<IdentityDeltaEnvelope>();
+            let ack = json!({
+                "status": "ok",
+                "operation": "IDENTITY_DELTA_SUBSCRIBED"
+            });
+            write_half
+                .write_all(serde_json::to_string(&ack)?.as_bytes())
+                .await?;
+            write_half.write_all(b"\n").await?;
+            write_half.flush().await?;
+            tokio::spawn(async move {
+                while let Some(envelope) = rx.recv().await {
+                    let encoded = match serde_json::to_string(&envelope) {
+                        Ok(encoded) => encoded,
+                        Err(err) => {
+                            tracing::warn!(error = %err, seq = envelope.seq, "failed to encode identity delta frame");
+                            continue;
+                        }
+                    };
+                    let mut acked = false;
+                    for attempt in 1..=IDENTITY_DELTA_MAX_RETRIES {
+                        if write_half.write_all(encoded.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        if write_half.write_all(b"\n").await.is_err() {
+                            return;
+                        }
+                        if write_half.flush().await.is_err() {
+                            return;
+                        }
+                        match wait_for_delta_ack(&mut reader, envelope.seq).await {
+                            Ok(()) => {
+                                acked = true;
+                                break;
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    seq = envelope.seq,
+                                    attempt,
+                                    max_retries = IDENTITY_DELTA_MAX_RETRIES,
+                                    error = %err,
+                                    "identity delta ack not received; retrying"
+                                );
+                            }
+                        }
+                    }
+                    if !acked {
+                        tracing::warn!(
+                            seq = envelope.seq,
+                            max_retries = IDENTITY_DELTA_MAX_RETRIES,
+                            "identity delta ack retries exhausted; closing subscriber stream"
+                        );
+                        return;
+                    }
+                }
+            });
+            Ok(Some(tx))
+        }
+        _ => {
+            let payload = IdentitySyncError {
+                status: "error".to_string(),
+                error_code: "INVALID_REQUEST".to_string(),
+                message: format!("unsupported sync operation '{}'", request.operation),
+            };
+            let encoded = serde_json::to_string(&payload)?;
+            write_half.write_all(encoded.as_bytes()).await?;
+            write_half.write_all(b"\n").await?;
+            write_half.flush().await?;
+            Ok(None)
+        }
     }
-
-    for chunk in chunks {
-        let encoded = serde_json::to_string(&chunk)?;
-        write_half.write_all(encoded.as_bytes()).await?;
-        write_half.write_all(b"\n").await?;
-    }
-    write_half.flush().await?;
-    Ok(())
 }
 
 async fn fetch_full_sync_from_primary(upstream: &str) -> Result<IdentityStore, IdentityError> {
@@ -1201,6 +2152,172 @@ fn slice_chunk<T: Clone>(items: &[T], chunk_index: usize, chunk_size: usize) -> 
     items[start..end].to_vec()
 }
 
+fn delta_envelope(delta: IdentityDelta) -> IdentityDeltaEnvelope {
+    IdentityDeltaEnvelope {
+        version: IDENTITY_SYNC_VERSION,
+        operation: SYNC_OP_DELTA.to_string(),
+        seq: 0,
+        delta,
+    }
+}
+
+fn assign_delta_seqs(deltas: &mut [IdentityDeltaEnvelope], next_seq: &mut u64) {
+    for delta in deltas.iter_mut() {
+        delta.seq = *next_seq;
+        *next_seq = next_seq.saturating_add(1);
+    }
+}
+
+fn broadcast_deltas(
+    subscribers: &mut Vec<mpsc::UnboundedSender<IdentityDeltaEnvelope>>,
+    deltas: &[IdentityDeltaEnvelope],
+) {
+    if deltas.is_empty() {
+        return;
+    }
+    subscribers.retain(|tx| {
+        for delta in deltas {
+            if tx.send(delta.clone()).is_err() {
+                return false;
+            }
+        }
+        true
+    });
+}
+
+async fn run_delta_subscription_loop(
+    upstream: String,
+    sink: mpsc::UnboundedSender<IdentityDeltaEnvelope>,
+) {
+    loop {
+        match stream_deltas_from_primary(&upstream, &sink).await {
+            Ok(()) => {
+                tracing::warn!(upstream = %upstream, "identity delta stream closed; reconnecting")
+            }
+            Err(err) => {
+                tracing::warn!(upstream = %upstream, error = %err, "identity delta stream failed; reconnecting")
+            }
+        }
+        time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn stream_deltas_from_primary(
+    upstream: &str,
+    sink: &mpsc::UnboundedSender<IdentityDeltaEnvelope>,
+) -> Result<(), IdentityError> {
+    let stream = TcpStream::connect(upstream).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let request = IdentitySyncRequest {
+        operation: SYNC_OP_DELTA_SUBSCRIBE.to_string(),
+    };
+    let encoded = serde_json::to_string(&request)?;
+    write_half.write_all(encoded.as_bytes()).await?;
+    write_half.write_all(b"\n").await?;
+    write_half.flush().await?;
+
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    let mut last_seq: Option<u64> = None;
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        let raw = line.trim();
+        if raw.is_empty() {
+            continue;
+        }
+
+        if let Ok(err_payload) = serde_json::from_str::<IdentitySyncError>(raw) {
+            if err_payload.status == "error" {
+                return Err(format!(
+                    "delta subscribe rejected: {} ({})",
+                    err_payload.error_code, err_payload.message
+                )
+                .into());
+            }
+        }
+
+        if let Ok(envelope) = serde_json::from_str::<IdentityDeltaEnvelope>(raw) {
+            if envelope.operation == SYNC_OP_DELTA {
+                if envelope.seq == 0 {
+                    return Err("delta stream payload with seq=0 is invalid".into());
+                }
+                if let Some(last) = last_seq {
+                    if envelope.seq == last {
+                        send_delta_ack(&mut write_half, envelope.seq).await?;
+                        continue;
+                    }
+                    if envelope.seq != last.saturating_add(1) {
+                        return Err(format!(
+                            "delta stream sequence gap/out-of-order: prev={} current={}",
+                            last, envelope.seq
+                        )
+                        .into());
+                    }
+                }
+                if sink.send(envelope.clone()).is_err() {
+                    return Err("delta sink dropped".into());
+                }
+                last_seq = Some(envelope.seq);
+                send_delta_ack(&mut write_half, envelope.seq).await?;
+            }
+        }
+    }
+}
+
+async fn wait_for_delta_ack(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    expected_seq: u64,
+) -> Result<(), IdentityError> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = time::timeout(
+            Duration::from_millis(IDENTITY_DELTA_ACK_TIMEOUT_MS),
+            reader.read_line(&mut line),
+        )
+        .await
+        .map_err(|_| "delta ack timeout".to_string())??;
+        if read == 0 {
+            return Err("delta subscriber closed while waiting ack".into());
+        }
+        let raw = line.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let ack: IdentityDeltaAck = serde_json::from_str(raw)?;
+        if ack.operation != SYNC_OP_DELTA_ACK {
+            return Err(format!("unexpected delta ack operation '{}'", ack.operation).into());
+        }
+        if ack.seq != expected_seq {
+            return Err(format!(
+                "unexpected delta ack seq {} (expected {})",
+                ack.seq, expected_seq
+            )
+            .into());
+        }
+        return Ok(());
+    }
+}
+
+async fn send_delta_ack(
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    seq: u64,
+) -> Result<(), IdentityError> {
+    let ack = IdentityDeltaAck {
+        operation: SYNC_OP_DELTA_ACK.to_string(),
+        seq,
+    };
+    let encoded = serde_json::to_string(&ack)?;
+    write_half.write_all(encoded.as_bytes()).await?;
+    write_half.write_all(b"\n").await?;
+    write_half.flush().await?;
+    Ok(())
+}
+
 fn load_hive(config_dir: &Path) -> Result<HiveFile, IdentityError> {
     let raw = fs::read_to_string(config_dir.join("hive.yaml"))?;
     Ok(serde_yaml::from_str(&raw)?)
@@ -1225,6 +2342,18 @@ fn response_name(action: &str) -> &'static str {
         "IDENTITY_METRICS" => "IDENTITY_METRICS_RESPONSE",
         _ => "SYSTEM_ERROR",
     }
+}
+
+fn action_requires_primary(action: &str) -> bool {
+    matches!(
+        action,
+        MSG_ILK_PROVISION
+            | MSG_ILK_REGISTER
+            | MSG_ILK_ADD_CHANNEL
+            | MSG_ILK_UPDATE
+            | MSG_TNT_CREATE
+            | MSG_TNT_APPROVE
+    )
 }
 
 async fn send_system_response(
@@ -1537,6 +2666,409 @@ SELECT COUNT(*)::BIGINT AS removed_count FROM expired
         .unwrap_or(0)
         .max(0) as u64;
     Ok(removed)
+}
+
+fn definition_tags(definition: &Value, key: &str) -> Vec<String> {
+    let from_current = definition
+        .get("current")
+        .and_then(Value::as_object)
+        .and_then(|current| current.get(key))
+        .and_then(Value::as_array);
+    let from_root = definition.get(key).and_then(Value::as_array);
+    from_current
+        .or(from_root)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn optional_identification_string(
+    identification: &Value,
+    key: &str,
+    max_len: usize,
+) -> Result<Option<String>, IdentityError> {
+    let value = identification
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    if let Some(ref value) = value {
+        if value.len() > max_len {
+            return Err(format!("identification.{} too long (max {})", key, max_len).into());
+        }
+    }
+    Ok(value)
+}
+
+fn association_json_from_ilk(ilk: &IlkRecord) -> Value {
+    let channels: Vec<Value> = ilk
+        .channels
+        .iter()
+        .map(|channel| {
+            json!({
+                "ich_id": channel.ich_id,
+                "type": channel.channel_type,
+                "address": channel.address,
+            })
+        })
+        .collect();
+    json!({
+        "tenant_id": ilk.tenant_id,
+        "channels": channels,
+    })
+}
+
+fn definition_json_from_ilk(ilk: &IlkRecord) -> Value {
+    json!({
+        "current": {
+            "roles": ilk.roles,
+            "capabilities": ilk.capabilities,
+        }
+    })
+}
+
+async fn persist_ilk_state_in_db(
+    database_url: &str,
+    ilk: &IlkRecord,
+    alias: Option<&AliasSnapshotRecord>,
+) -> Result<(), IdentityError> {
+    let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?.to_string();
+    let tenant_uuid = parse_prefixed_uuid(&ilk.tenant_id, "tnt")?.to_string();
+    let email = optional_identification_string(&ilk.identification, "email", 256)?;
+    let node_name = optional_identification_string(&ilk.identification, "node_name", 128)?;
+    let association = association_json_from_ilk(ilk);
+    let definition = definition_json_from_ilk(ilk);
+    let deleted_at_ms = ilk
+        .deleted_at_ms
+        .and_then(|value| i64::try_from(value).ok());
+    let registered_by: Option<String> = None;
+
+    let (mut client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "identity ilk persist postgres connection closed");
+        }
+    });
+
+    let tx = client.transaction().await?;
+    tx.execute(
+        r#"
+INSERT INTO identity_ilks (
+    ilk_id,
+    ilk_type,
+    registration_status,
+    tenant_id,
+    email,
+    node_name,
+    identification,
+    association,
+    definition,
+    registered_by,
+    deleted_at,
+    updated_at
+)
+VALUES (
+    $1::text::uuid,
+    $2,
+    $3,
+    $4::text::uuid,
+    $5,
+    $6,
+    $7::jsonb,
+    $8::jsonb,
+    $9::jsonb,
+    $10::text::uuid,
+    CASE WHEN $11::BIGINT IS NULL THEN NULL ELSE to_timestamp(($11::DOUBLE PRECISION) / 1000.0) END,
+    NOW()
+)
+ON CONFLICT (ilk_id) DO UPDATE
+SET
+    ilk_type = EXCLUDED.ilk_type,
+    registration_status = EXCLUDED.registration_status,
+    tenant_id = EXCLUDED.tenant_id,
+    email = EXCLUDED.email,
+    node_name = EXCLUDED.node_name,
+    identification = EXCLUDED.identification,
+    association = EXCLUDED.association,
+    definition = EXCLUDED.definition,
+    registered_by = EXCLUDED.registered_by,
+    deleted_at = EXCLUDED.deleted_at,
+    updated_at = NOW()
+"#,
+        &[
+            &ilk_uuid,
+            &ilk.ilk_type,
+            &ilk.registration_status,
+            &tenant_uuid,
+            &email,
+            &node_name,
+            &ilk.identification,
+            &association,
+            &definition,
+            &registered_by,
+            &deleted_at_ms,
+        ],
+    )
+    .await?;
+
+    if ilk.deleted_at_ms.is_some() {
+        tx.execute(
+            "DELETE FROM identity_ichs WHERE ilk_id = $1::text::uuid",
+            &[&ilk_uuid],
+        )
+        .await?;
+    } else {
+        for (index, channel) in ilk.channels.iter().enumerate() {
+            let ich_uuid = parse_prefixed_uuid(&channel.ich_id, "ich")?.to_string();
+            let is_primary = index == 0;
+            tx.execute(
+                r#"
+INSERT INTO identity_ichs (ich_id, ilk_id, tenant_id, channel_type, address, is_primary, added_at)
+VALUES ($1::text::uuid, $2::text::uuid, $3::text::uuid, $4, $5, $6, NOW())
+ON CONFLICT (ich_id) DO UPDATE
+SET
+    ilk_id = EXCLUDED.ilk_id,
+    tenant_id = EXCLUDED.tenant_id,
+    channel_type = EXCLUDED.channel_type,
+    address = EXCLUDED.address,
+    is_primary = EXCLUDED.is_primary
+"#,
+                &[
+                    &ich_uuid,
+                    &ilk_uuid,
+                    &tenant_uuid,
+                    &channel.channel_type,
+                    &channel.address,
+                    &is_primary,
+                ],
+            )
+            .await?;
+        }
+    }
+
+    if let Some(alias_record) = alias {
+        let old_uuid = parse_prefixed_uuid(&alias_record.old_ilk_id, "ilk")?.to_string();
+        let canonical_uuid =
+            parse_prefixed_uuid(&alias_record.canonical_ilk_id, "ilk")?.to_string();
+        let expires_at_ms = i64::try_from(alias_record.expires_at_ms)
+            .map_err(|_| "alias expires_at_ms overflow")?;
+        tx.execute(
+            r#"
+INSERT INTO identity_ilk_aliases (old_ilk_id, canonical_ilk_id, expires_at)
+VALUES (
+    $1::text::uuid,
+    $2::text::uuid,
+    to_timestamp(($3::BIGINT)::DOUBLE PRECISION / 1000.0)
+)
+ON CONFLICT (old_ilk_id) DO UPDATE
+SET
+    canonical_ilk_id = EXCLUDED.canonical_ilk_id,
+    expires_at = EXCLUDED.expires_at
+"#,
+            &[&old_uuid, &canonical_uuid, &expires_at_ms],
+        )
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn load_identity_store_from_db(database_url: &str) -> Result<IdentityStore, IdentityError> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "identity tenant load postgres connection closed");
+        }
+    });
+
+    let rows = client
+        .query(
+            r#"
+SELECT
+    tenant_id::text AS tenant_id,
+    name,
+    domain,
+    status,
+    settings
+FROM identity_tenants
+ORDER BY created_at ASC
+"#,
+            &[],
+        )
+        .await?;
+
+    let mut store = IdentityStore::default();
+    for row in rows {
+        let tenant_uuid: String = row.get("tenant_id");
+        let tenant_id = format!("tnt:{}", tenant_uuid);
+        let name: String = row.get("name");
+        let domain: Option<String> = row.get("domain");
+        let status: String = row.get("status");
+        let settings: Value = row.get("settings");
+        store.tenants.insert(
+            tenant_id.clone(),
+            TenantRecord {
+                tenant_id,
+                name,
+                domain,
+                status,
+                settings,
+            },
+        );
+    }
+
+    let ilk_rows = client
+        .query(
+            r#"
+SELECT
+    ilk_id::text AS ilk_id,
+    ilk_type,
+    registration_status,
+    tenant_id::text AS tenant_id,
+    identification,
+    definition,
+    CASE
+        WHEN deleted_at IS NULL THEN NULL
+        ELSE (EXTRACT(EPOCH FROM deleted_at) * 1000)::BIGINT
+    END AS deleted_at_ms
+FROM identity_ilks
+ORDER BY created_at ASC
+"#,
+            &[],
+        )
+        .await?;
+    for row in ilk_rows {
+        let ilk_uuid: String = row.get("ilk_id");
+        let tenant_uuid: String = row.get("tenant_id");
+        let definition: Value = row.get("definition");
+        let roles = definition_tags(&definition, "roles");
+        let capabilities = definition_tags(&definition, "capabilities");
+        let deleted_at_ms: Option<i64> = row.get("deleted_at_ms");
+        store.ilks.insert(
+            format!("ilk:{}", ilk_uuid),
+            IlkRecord {
+                ilk_id: format!("ilk:{}", ilk_uuid),
+                ilk_type: row.get("ilk_type"),
+                registration_status: row.get("registration_status"),
+                tenant_id: format!("tnt:{}", tenant_uuid),
+                identification: row.get("identification"),
+                roles,
+                capabilities,
+                channels: Vec::new(),
+                deleted_at_ms: deleted_at_ms.and_then(|value| u64::try_from(value).ok()),
+            },
+        );
+    }
+
+    let ich_rows = client
+        .query(
+            r#"
+SELECT
+    ich_id::text AS ich_id,
+    ilk_id::text AS ilk_id,
+    channel_type,
+    address
+FROM identity_ichs
+ORDER BY added_at ASC
+"#,
+            &[],
+        )
+        .await?;
+    for row in ich_rows {
+        let ilk_id = format!("ilk:{}", row.get::<_, String>("ilk_id"));
+        let channel = ChannelRecord {
+            ich_id: format!("ich:{}", row.get::<_, String>("ich_id")),
+            channel_type: row.get("channel_type"),
+            address: row.get("address"),
+        };
+        if let Some(ilk) = store.ilks.get_mut(&ilk_id) {
+            if !ilk
+                .channels
+                .iter()
+                .any(|existing| existing.ich_id == channel.ich_id)
+            {
+                ilk.channels.push(channel.clone());
+            }
+            if ilk.deleted_at_ms.is_none() {
+                let key = canonical_ich_key(&channel.channel_type, &channel.address);
+                store.ich_lookup.insert(key, ilk_id.clone());
+            }
+        }
+    }
+
+    let alias_rows = client
+        .query(
+            r#"
+SELECT
+    old_ilk_id::text AS old_ilk_id,
+    canonical_ilk_id::text AS canonical_ilk_id,
+    (EXTRACT(EPOCH FROM expires_at) * 1000)::BIGINT AS expires_at_ms
+FROM identity_ilk_aliases
+"#,
+            &[],
+        )
+        .await?;
+    for row in alias_rows {
+        let expires_at_ms: i64 = row.get("expires_at_ms");
+        if let Ok(expires_at_ms) = u64::try_from(expires_at_ms) {
+            store.aliases.insert(
+                format!("ilk:{}", row.get::<_, String>("old_ilk_id")),
+                AliasRecord {
+                    canonical_ilk_id: format!("ilk:{}", row.get::<_, String>("canonical_ilk_id")),
+                    expires_at_ms,
+                },
+            );
+        }
+    }
+
+    Ok(store)
+}
+
+async fn upsert_tenant_in_db(
+    database_url: &str,
+    tenant: &TenantRecord,
+) -> Result<(), IdentityError> {
+    let tenant_uuid = parse_prefixed_uuid(&tenant.tenant_id, "tnt")?;
+    let tenant_uuid = tenant_uuid.to_string();
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "identity tenant upsert postgres connection closed");
+        }
+    });
+
+    client
+        .execute(
+            r#"
+INSERT INTO identity_tenants (tenant_id, name, domain, status, settings, updated_at)
+VALUES ($1::text::uuid, $2, $3, $4, $5::jsonb, NOW())
+ON CONFLICT (tenant_id) DO UPDATE
+SET
+    name = EXCLUDED.name,
+    domain = EXCLUDED.domain,
+    status = EXCLUDED.status,
+    settings = EXCLUDED.settings,
+    updated_at = NOW()
+"#,
+            &[
+                &tenant_uuid,
+                &tenant.name,
+                &tenant.domain,
+                &tenant.status,
+                &tenant.settings,
+            ],
+        )
+        .await?;
+    Ok(())
 }
 
 fn database_url(hive: &HiveFile) -> Result<String, IdentityError> {
