@@ -2866,7 +2866,7 @@ INSERT INTO identity_ilk_aliases (old_ilk_id, canonical_ilk_id, expires_at)
 VALUES (
     $1::text::uuid,
     $2::text::uuid,
-    to_timestamp(($3::DOUBLE PRECISION) / 1000.0)
+    to_timestamp(($3::BIGINT)::DOUBLE PRECISION / 1000.0)
 )
 ON CONFLICT (old_ilk_id) DO UPDATE
 SET

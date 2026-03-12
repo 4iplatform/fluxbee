@@ -4,7 +4,8 @@ set -euo pipefail
 BASE="${BASE:-http://127.0.0.1:8080}"
 HIVE_ID="${HIVE_ID:-sandbox}"
 RUNTIME="${RUNTIME:-wf.orch.diag}"
-NODE_NAME="${NODE_NAME:-WF.identity.node.reg}"
+TEST_ID="${TEST_ID:-idnreg-$(date +%s)-${RANDOM}}"
+NODE_NAME="${NODE_NAME:-WF.identity.node.reg.${TEST_ID}}"
 RUNTIME_VERSION="${RUNTIME_VERSION:-current}"
 TENANT_ID="${TENANT_ID:-}"
 REQUIRE_IDENTITY_REGISTER_OK="${REQUIRE_IDENTITY_REGISTER_OK:-1}"
@@ -156,6 +157,8 @@ check_register_contract() {
     echo "FAIL[$label]: payload.identity.register.status='$reg_status' reason='$reg_reason'" >&2
     if [[ "$reg_code" == "INVALID_TENANT" ]]; then
       echo "Hint: TENANT_ID does not exist in identity primary. Use a fresh tenant_id from scripts/identity_provision_complete_e2e.sh output (TENANT_ID=...)." >&2
+    elif [[ "$reg_code" == "INVALID_TENANT_TRANSITION" ]]; then
+      echo "Hint: NODE_NAME already exists under another tenant in identity primary. Use a fresh NODE_NAME or keep the original tenant for this node_name." >&2
     else
       echo "Hint: provide TENANT_ID=tnt:<uuid> or set ORCH_DEFAULT_TENANT_ID in sy-orchestrator environment." >&2
     fi
@@ -169,7 +172,7 @@ check_register_contract() {
   fi
 }
 
-echo "IDENTITY node registration E2E: BASE=$BASE HIVE_ID=$HIVE_ID NODE_NAME=$NODE_NAME RUNTIME=$RUNTIME REQUIRE_IDENTITY_REGISTER_OK=$REQUIRE_IDENTITY_REGISTER_OK"
+echo "IDENTITY node registration E2E: BASE=$BASE HIVE_ID=$HIVE_ID NODE_NAME=$NODE_NAME RUNTIME=$RUNTIME TEST_ID=$TEST_ID REQUIRE_IDENTITY_REGISTER_OK=$REQUIRE_IDENTITY_REGISTER_OK"
 validate_tenant_id "$TENANT_ID"
 
 echo "Step 1/6: validate runtime exists in /hives/$HIVE_ID/versions"
