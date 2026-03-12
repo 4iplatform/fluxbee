@@ -5,71 +5,56 @@
 
 ---
 
-## 1) Ejemplo de YAML por nodo (1 YAML ↔ 1 instancia)
+## 1) Ejemplo de archivo JSON efectivo por nodo (single source of truth)
 
-> Nota: YAML **por nodo**. La instancia systemd `fluxbee-ai-node@AI.soporte.l1.service` carga `/etc/fluxbee/ai-nodes/AI.soporte.l1.yaml`.
+> ✅ **Fuente viva**: `${STATE_DIR}/ai-nodes/<node_name>.json`  
+> default: `/var/lib/fluxbee/state/ai-nodes/AI.soporte.l1.json`
 
-```yaml
-# /etc/fluxbee/ai-nodes/AI.soporte.l1.yaml
-# schema_version es opcional en YAML (si falta, se asume 1)
+> ⚠️ Plantilla opcional (no fuente viva): `/etc/fluxbee/ai-nodes/<node>.yaml` (si existe, es solo referencia)
 
-schema_version: 1
-
-node:
-  # Nombre L2 del nodo (sin @hive; el SDK agrega @hive automáticamente al registrarlo)
-  name: "AI.soporte.l1"
-
-  # Socket del router (path fijo por isla, normalmente bajo /var/run/fluxbee/routers/)
-  router_socket: "/var/run/fluxbee/routers"
-
-  # Directorio donde el runner persiste el UUID del nodo (si aplica al runtime)
-  uuid_persistence_dir: "/var/lib/fluxbee/nodes"
-
-  # Directorio base de config (donde vive hive.yaml)
-  config_dir: "/etc/fluxbee"
-
-# runtime es OPCIONAL.
-# Si se omite, el runner usa defaults razonables comunes a todos los nodos AI.
-# Descomentar solo si necesitás tunear este nodo en particular.
-# runtime:
-#   read_timeout_ms: 30000
-#   handler_timeout_ms: 60000
-#   write_timeout_ms: 10000
-#   queue_capacity: 128
-#   worker_pool_size: 4
-#   retry_max_attempts: 3
-#   retry_initial_backoff_ms: 200
-#   retry_max_backoff_ms: 2000
-#   metrics_log_interval_ms: 30000
-
-behavior:
-  kind: "openai_chat"
-  model: "gpt-4.1-mini"
-
-  instructions:
-    source: "inline"
-    value: "Sos un agente de soporte conciso. Respondé en español y pedí datos mínimos."
-    trim: true
-
-  # --- Secrets (HOY vs FUTURO) ---
-  #
-  # HOY (camino real recomendado en este estado del sistema):
-  # - Mantener la API key en el YAML (sí, queda en disco).
-  # - Esto evita depender de un gestor de secretos/orchestrator que la inyecte por env.
-  #
-  # FUTURO (recomendado a mediano plazo):
-  # - Reemplazar por un ref (env/file/vault/kms) y un gestor de secretos.
-  #
-  # IMPORTANTE: no usar ambas variantes al mismo tiempo.
-  #
-  # (A) HOY: secreto inline en YAML (MVP)
-  openai:
-    api_key: "sk-REDACTED-IN-YAML-MVP"
-
-  # (B) FUTURO: referencia a secreto (NO usar junto con (A))
-  # secrets:
-  #   api_key_ref: "env:OPENAI_API_KEY"
 ```json
+{
+  "schema_version": 1,
+  "config_version": 1,
+
+  "node": {
+    "name": "AI.soporte.l1"
+  },
+
+  "behavior": {
+    "kind": "openai_chat",
+    "provider": "openai",
+
+    "capabilities": { "multimodal": false },
+
+    "params": {
+      "model": "gpt-4.1-mini",
+      "system_prompt": "Sos un agente de soporte conciso. Respondé en español.",
+      "timeout_ms": 15000,
+      "max_output_tokens": 256,
+      "temperature": 0.2
+    }
+  },
+
+  "runtime": {
+    "handler_timeout_ms": 60000,
+    "worker_pool_size": 4,
+    "queue_capacity": 128
+  },
+
+  "secrets": {
+    "openai": {
+      "api_key": "***INLINE_MVP_OR_REF***"
+    }
+  }
+}
+```
+
+### Comentarios
+- Este archivo representa la **config efectiva** aplicada.
+- Si el nodo recibe `CONFIG_SET` válido con `apply_mode="replace"`, persiste un JSON equivalente (sin secretos en claro si así se decide).
+- Si el archivo no existe, el nodo arranca `UNCONFIGURED` y espera `CONFIG_SET`.
+json
 {
   "routing": {
     "src": "uuid-sy-orchestrator",

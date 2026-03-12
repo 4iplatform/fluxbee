@@ -2,6 +2,7 @@
 set -euo pipefail
 
 CONFIG_DIR="${CONFIG_DIR:-/etc/fluxbee/ai-nodes}"
+DYNAMIC_CONFIG_DIR="${DYNAMIC_CONFIG_DIR:-/var/lib/fluxbee/state/ai-nodes}"
 UNIT_PREFIX="${UNIT_PREFIX:-fluxbee-ai-node@}"
 
 usage() {
@@ -9,6 +10,7 @@ usage() {
 Usage:
   ai-nodectl.sh list
   ai-nodectl.sh add <name> <yaml_path>
+  ai-nodectl.sh init-state <name> <config_json_path> [--schema-version N] [--config-version N] [--force]
   ai-nodectl.sh remove <name> [--purge-config]
   ai-nodectl.sh start <name>
   ai-nodectl.sh stop <name>
@@ -21,6 +23,7 @@ Usage:
 Notes:
   - Systemd instance name: fluxbee-ai-node@<name>.service
   - Config path: /etc/fluxbee/ai-nodes/<name>.yaml
+  - Dynamic state path: /var/lib/fluxbee/state/ai-nodes/<name>.json
 EOF
 }
 
@@ -69,6 +72,107 @@ case "$cmd" in
     echo "Installed config: $dst_yaml"
     echo "Next:"
     echo "  sudo systemctl enable --now $(unit_name "$name")"
+    ;;
+  init-state)
+    require_args 3 "$#"
+    name="$2"
+    src_json="$3"
+    schema_version="1"
+    config_version="1"
+    force_write="0"
+    shift 3
+    while (( "$#" )); do
+      case "$1" in
+        --schema-version)
+          schema_version="${2:-}"
+          shift 2
+          ;;
+        --config-version)
+          config_version="${2:-}"
+          shift 2
+          ;;
+        --force)
+          force_write="1"
+          shift 1
+          ;;
+        *)
+          echo "Error: unknown option for init-state: $1" >&2
+          exit 1
+          ;;
+      esac
+    done
+
+    if [[ ! "$schema_version" =~ ^[0-9]+$ ]]; then
+      echo "Error: --schema-version must be an integer" >&2
+      exit 1
+    fi
+    if [[ ! "$config_version" =~ ^[0-9]+$ ]]; then
+      echo "Error: --config-version must be an integer" >&2
+      exit 1
+    fi
+    if [[ ! -f "$src_json" ]]; then
+      echo "Error: json not found: $src_json" >&2
+      exit 1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+      echo "Error: python3 is required for init-state." >&2
+      exit 1
+    fi
+
+    dst_json="${DYNAMIC_CONFIG_DIR}/${name}.json"
+    if [[ -f "$dst_json" && "$force_write" != "1" ]]; then
+      echo "Error: destination exists: $dst_json (use --force to overwrite)" >&2
+      exit 1
+    fi
+
+    $SUDO install -d "$DYNAMIC_CONFIG_DIR"
+
+    tmp_json="$(mktemp)"
+    trap 'rm -f "$tmp_json"' EXIT
+    python3 - "$name" "$schema_version" "$config_version" "$src_json" "$tmp_json" <<'PY'
+import datetime
+import json
+import sys
+
+node_name = sys.argv[1]
+schema_version = int(sys.argv[2])
+config_version = int(sys.argv[3])
+src_json = sys.argv[4]
+dst_tmp = sys.argv[5]
+
+with open(src_json, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+if not isinstance(cfg, dict):
+    raise SystemExit("config_json_path must contain a JSON object")
+
+state = {
+    "schema_version": schema_version,
+    "config_version": config_version,
+    "node_name": node_name,
+    "config": cfg,
+    "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+}
+with open(dst_tmp, "w", encoding="utf-8") as f:
+    json.dump(state, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+
+    if [[ "$force_write" == "1" ]]; then
+      $SUDO install -m 0644 "$tmp_json" "$dst_json"
+    else
+      if $SUDO test -e "$dst_json"; then
+        echo "Error: destination exists: $dst_json (use --force to overwrite)" >&2
+        exit 1
+      fi
+      $SUDO install -m 0644 "$tmp_json" "$dst_json"
+    fi
+    rm -f "$tmp_json"
+    trap - EXIT
+
+    echo "Created effective state file: $dst_json"
+    echo "Next:"
+    echo "  sudo systemctl restart $(unit_name "$name")"
     ;;
   remove)
     require_args 2 "$#"

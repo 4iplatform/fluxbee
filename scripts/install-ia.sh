@@ -78,5 +78,7 @@ fi
 echo "Installed: /usr/bin/ai-node-runner, /usr/bin/ai-nodectl"
 echo "Template unit: /etc/systemd/system/fluxbee-ai-node@.service"
 echo "Config location: $CONFIG_DIR/ai-nodes/<name>.yaml"
+echo "Dynamic state location: $STATE_DIR/state/ai-nodes/<name>.json"
+echo "Precreate state example: ai-nodectl init-state <name> /tmp/<name>_effective_config.json"
 echo "Start example: sudo systemctl enable --now fluxbee-ai-node@ai-chat"
 echo "Management example: ai-nodectl list"

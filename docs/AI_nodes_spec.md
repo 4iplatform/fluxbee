@@ -88,12 +88,22 @@
 
 ✅ **NORMATIVO**: en `FAILED_CONFIG` el nodo **MUST** seguir atendiendo: `PING`, `STATUS`, `CONFIG_GET`, `CONFIG_SET`.
 
-### Fuentes de configuración y precedencia
+### Configuración efectiva: archivo único (JSON) y creación TBD
 
-✅ **NORMATIVO**:
-- Fuente 1: YAML operator-managed (si existe y es válido).
-- Fuente 2: config dinámica persistida (recibida por Control Plane).
-- Precedencia: YAML > persistida > none (`UNCONFIGURED`).
+✅ **NORMATIVO (nuevo lineamiento operativo)**:
+- La configuración efectiva del nodo AI vive en **un único archivo JSON** bajo `${STATE_DIR}` (default: `/var/lib/fluxbee/state/ai-nodes/<node_name>.json`).
+- El nodo **MUST** leer y escribir este archivo (persistencia atómica) como “effective config” y fuente de verdad de runtime.
+
+🧩 **A ESPECIFICAR (fricción actual / responsabilidad de creación)**:
+- Quién crea el archivo por primera vez:
+  - **Opción A**: `SY.orchestrator` lo crea como parte del flujo de spawn/provision.
+  - **Opción B**: el nodo lo crea al recibir el primer `CONFIG_SET` válido.
+- Mientras no esté normado, el comportamiento del nodo debe ser:
+  - si el archivo no existe → estado `UNCONFIGURED` (atiende solo Control Plane).
+
+⚠️ **DEPRECATED (no operator-managed)**:
+- Los YAML por nodo en `/etc/fluxbee/ai-nodes/*.yaml` dejan de ser “operator-managed config”.
+- Si existen, se consideran **plantillas / referencia** (no fuente viva) y **no deben** ser reescritas por el nodo en runtime.
 
 ### 2.1.1 Mensajes `user` cuando no está configurado
 
@@ -431,26 +441,16 @@ Códigos recomendados (no exhaustivo):
 ### Campos L3 de contexto (ctx, ctx_seq, ctx_window)
 
 ✅ **NORMATIVO (canónico en protocolo)**:
-- `ich` (Interlocutor Channel Hash) y `ctx` (Context Hash) identifican la conversación a nivel L3.
-- `ctx_seq` es el número secuencial monotónico por contexto (L3).
-- `ctx_window` es la “historia reciente” agregada por router (L3).
+- `ctx` y `ctx_seq` se tratan como campos de contexto L3 del mensaje.
+- `ctx_window` se define como historia reciente agregada por router.
 
-⚠️ **ADAPTACIÓN TEMPORAL AL ESTADO ACTUAL DEL CORE (implementación)**:
-> La especificación es “palabra santa”. Sin embargo, el core actual todavía no inyecta consistentemente todos los campos L3 (especialmente `ctx_window`).  
-> Por lo tanto, **hasta que el core se alinee**, el runner AI debe implementar tolerancia controlada sin romper el contrato.
+⚠️ **TOLERANCIA OPERATIVA (HOY)**:
+- En el código core revisado, `ctx_window` no aparece implementado/inyectado por el router (solo está documentado).  
+  Por lo tanto, AI Nodes **MUST** tolerar `ctx_window` faltante:
+  - loggear advertencia (`missing_ctx_window`),
+  - continuar procesando usando `payload.content`/`content_ref` y attachments disponibles.
+- Cuando el router lo implemente, `ctx_window` pasará a ser **obligatorio** para el “happy path” (sin cambiar el contrato de AI Nodes).
 
-✅ **NORMATIVO (tolerancia implementable hoy)**:
-- Si falta `ctx_window`:
-  - **MUST** loggear advertencia `missing_ctx_window`,
-  - **MUST** continuar procesando usando `payload.content`/`content_ref` y attachments disponibles.
-- Si falta `ctx_seq`:
-  - **MUST** loggear advertencia `missing_ctx_seq`,
-  - **MUST** asumir `ctx_seq = 0` (o equivalente) para no abortar el procesamiento.
-- Si falta `ich` o `ctx` en un mensaje `user`:
-  - **SHOULD** tratarse como error de mensaje mal formado (`invalid_payload`) **salvo** que exista un modo legacy explícito de ingestión (🧩 a especificar si se necesita).
-
-🧩 **A ESPECIFICAR (cuando el core se alinee)**:
-- Momento exacto en el que `ctx_window` pasa de “tolerado” a “obligatorio” en el happy path.
 
 ## 1. Alcance del Data Plane
 
@@ -464,17 +464,6 @@ En estado `UNCONFIGURED`, los mensajes `user` se rechazan según Control Plane (
 ---
 
 ## 2. Contrato estándar `text/v1` (Fluxbee)
-### `meta.type` vs `meta.msg_type` (naming legacy)
-
-✅ **NORMATIVO (AI Nodes)**:
-- Control Plane: se identifica por `meta.type in {"system","admin"}` y `meta.msg` (comando).
-- Data Plane: se identifica por `meta.type == "user"` y el contrato de payload (`text/v1`).
-
-⚠️ **ADAPTACIÓN TEMPORAL AL CORE (implementación)**:
-- En el core existen menciones/uso de `meta.msg_type` (naming legacy) además de `meta.type`.
-- El runner AI **SHOULD** tolerar la presencia/ausencia de `meta.msg_type` y no depender de él para el dispatch principal.
-
-
 
 ✅ **NORMATIVO**: los AI Nodes implementan el contrato **`text/v1`** definido por Fluxbee (ver `blob-annex-spec.md`, sección “Contrato de Payload: text/v1”).
 
@@ -1058,6 +1047,39 @@ secrets:
 
 ## 4. Esquema de configuración (schema_version = 1) — primera versión
 
+### Campos obligatorios vs opcionales (defaults) y materialización en JSON
+
+✅ **NORMATIVO**:
+- La configuración efectiva vive en `${STATE_DIR}/ai-nodes/<node_name>.json`.
+- El nodo **MUST** aplicar defaults razonables a campos opcionales faltantes.
+- El nodo **MUST** **materializar** (persistir) esos defaults en el JSON efectivo, de modo que el archivo represente la configuración real en uso.
+
+#### Requeridos (mínimo)
+
+✅ **NORMATIVO** (si falta alguno, `invalid_config`):
+- `schema_version`
+- `config_version`
+- `node.name`
+- `behavior.kind`
+
+✅ **NORMATIVO** (requeridos condicionales por behavior):
+- Si `behavior.kind = openai_chat`:
+  - `behavior.params.model`
+  - credencial (HOY): `secrets.openai.api_key` (inline YAML/CONFIG_SET) o futura `api_key_ref` (🧩)
+
+#### Opcionales (con defaults)
+
+✅ **NORMATIVO**:
+- `runtime.*` es **opcional**. Si falta:
+  - el nodo aplica defaults (timeouts, pool, queue, etc.),
+  - y los escribe en el JSON efectivo.
+- `behavior.params.*` (temperature/top_p/max_output_tokens/timeouts) es **opcional** salvo los requeridos condicionales.
+- `capabilities.*` es opcional (por ejemplo `multimodal=false` por default).
+
+> Nota: materializar defaults evita “config implícita” y facilita operación y debugging.
+
+
+
 ✅ **NORMATIVO (v1)**: se define un **mínimo** de campos (required/optional) para operar sin leer código.
 Campos extra **no** deben romper (ver §7).
 
@@ -1219,12 +1241,16 @@ Motivo: el nodo (runner) es dueño de su archivo; los typos deberían ser improb
 - `fluxbee-ai-node@<node>.service`
 
 ✅ **NORMATIVO**: relación 1:1:
-- **1 nodo AI** ↔ **1 archivo YAML** ↔ **1 instancia systemd**
+- **1 nodo AI** ↔ **1 archivo JSON efectivo en `${STATE_DIR}`** ↔ **1 instancia systemd**
 
-✅ **NORMATIVO**: el path del YAML por instancia es:
+⚠️ El YAML por nodo puede existir como **plantilla** (no fuente viva).
 
-- `${CONFIG_DIR}/ai-nodes/<node>.yaml`  
-  default: `/etc/fluxbee/ai-nodes/<node>.yaml`
+✅ **NORMATIVO**: el path del JSON efectivo por instancia es:
+
+- `${STATE_DIR}/ai-nodes/<node>.json`  
+  default: `/var/lib/fluxbee/state/ai-nodes/<node>.json`
+
+⚠️ Plantilla opcional (no fuente viva): `/etc/fluxbee/ai-nodes/<node>.yaml`
 
 ✅ **NORMATIVO**: no se soporta modo “multi-config” (un proceso leyendo múltiples YAML).  
 Cada instancia opera aislada y no debe interferir con otras.
@@ -1448,5 +1474,17 @@ ai-nodectl add ai-chat /tmp/ai_chat.yaml
 sudo systemctl enable --now fluxbee-ai-node@ai-chat
 ai-nodectl status ai-chat
 ai-nodectl logs ai-chat --follow
+```
+
+Spawn/provision flows (manual, without orchestrator integration):
+
+```bash
+# Flow A: JSON-first (precreate effective state file)
+ai-nodectl init-state ai-chat /tmp/ai_chat_effective_config.json --schema-version 1 --config-version 1
+sudo systemctl restart fluxbee-ai-node@ai-chat
+
+# Flow B: start UNCONFIGURED and provision with first CONFIG_SET
+sudo systemctl start fluxbee-ai-node@ai-chat
+# then send CONFIG_SET via control plane
 ```
 

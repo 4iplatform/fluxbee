@@ -1,4 +1,6 @@
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,7 +11,7 @@ use fluxbee_ai_sdk::{
     build_reply_message_runtime_src, build_text_response, extract_text, AiNode, AiNodeConfig, Message,
     ModelSettings, NodeRuntime, OpenAiResponsesClient, RetryPolicy, RouterClient, RuntimeConfig,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
@@ -77,13 +79,13 @@ struct OpenAiChatSection {
     base_url: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct OpenAiCredentialsSection {
     #[serde(default)]
     api_key: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct RunnerModelSettings {
     #[serde(default)]
     temperature: Option<f32>,
@@ -107,7 +109,7 @@ enum InstructionsSourceConfig {
     Strategy(InstructionsStrategy),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct InstructionsStrategy {
     source: InstructionsSourceKind,
     #[serde(default)]
@@ -116,13 +118,124 @@ struct InstructionsStrategy {
     trim: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum InstructionsSourceKind {
     Inline,
     File,
     Env,
     None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EffectiveStateFile {
+    schema_version: u32,
+    config_version: u64,
+    node_name: String,
+    config: EffectiveConfigDocument,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct EffectiveConfigDocument {
+    #[serde(default)]
+    node: Option<EffectiveNodeSection>,
+    #[serde(default)]
+    behavior: EffectiveBehaviorSection,
+    #[serde(default)]
+    runtime: Option<EffectiveRuntimeSection>,
+    #[serde(default)]
+    secrets: Option<EffectiveSecretsSection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct EffectiveNodeSection {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    router_socket: Option<String>,
+    #[serde(default)]
+    uuid_persistence_dir: Option<String>,
+    #[serde(default)]
+    config_dir: Option<String>,
+    #[serde(default)]
+    dynamic_config_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct EffectiveBehaviorSection {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    params: Option<EffectiveBehaviorParams>,
+    #[serde(default)]
+    instructions: Option<Value>,
+    #[serde(default)]
+    model_settings: Option<RunnerModelSettings>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    openai: Option<OpenAiCredentialsSection>,
+    #[serde(default)]
+    base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct EffectiveBehaviorParams {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct EffectiveRuntimeSection {
+    #[serde(default)]
+    read_timeout_ms: Option<u64>,
+    #[serde(default)]
+    handler_timeout_ms: Option<u64>,
+    #[serde(default)]
+    write_timeout_ms: Option<u64>,
+    #[serde(default)]
+    queue_capacity: Option<usize>,
+    #[serde(default)]
+    worker_pool_size: Option<usize>,
+    #[serde(default)]
+    retry_max_attempts: Option<usize>,
+    #[serde(default)]
+    retry_initial_backoff_ms: Option<u64>,
+    #[serde(default)]
+    retry_max_backoff_ms: Option<u64>,
+    #[serde(default)]
+    metrics_log_interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct EffectiveSecretsSection {
+    #[serde(default)]
+    openai: Option<EffectiveOpenAiSecrets>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct EffectiveOpenAiSecrets {
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
 }
 
 impl Default for RuntimeSection {
@@ -173,6 +286,7 @@ fn default_trim_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone)]
 enum NodeBehavior {
     Echo,
     OpenAiChat(OpenAiChatRuntime),
@@ -190,7 +304,7 @@ struct OpenAiChatRuntime {
 
 struct GenericAiNode {
     node_name: String,
-    behavior: NodeBehavior,
+    behavior: Arc<RwLock<Option<NodeBehavior>>>,
     dynamic_config_dir: PathBuf,
     control_plane: Arc<RwLock<ControlPlaneState>>,
 }
@@ -247,8 +361,14 @@ impl AiNode for GenericAiNode {
             }
         }
 
+        let behavior = self.behavior.read().await.clone();
+        let Some(behavior) = behavior else {
+            let payload = node_runtime_not_ready_payload();
+            return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
+        };
+
         let input = extract_text(&msg.payload).unwrap_or_default();
-        let output = match &self.behavior {
+        let output = match &behavior {
             NodeBehavior::Echo => format!("Echo: {input}"),
             NodeBehavior::OpenAiChat(openai) => self.run_openai_chat(openai, input).await?,
         };
@@ -305,16 +425,30 @@ impl GenericAiNode {
         let Some(command) = msg.meta.msg.as_deref() else {
             return Ok(None);
         };
-        let response_payload = if command.eq_ignore_ascii_case("CONFIG_SET") {
-            self.apply_config_set(&msg).await
+        let (response_msg, response_payload) = if command.eq_ignore_ascii_case("CONFIG_SET") {
+            ("CONFIG_RESPONSE", self.apply_config_set(&msg).await)
         } else if command.eq_ignore_ascii_case("CONFIG_GET") {
-            self.build_config_get_response().await
+            ("CONFIG_RESPONSE", self.build_config_get_response().await)
+        } else if command.eq_ignore_ascii_case("PING") {
+            ("PONG", self.build_ping_response().await)
+        } else if command.eq_ignore_ascii_case("STATUS") {
+            ("STATUS_RESPONSE", self.build_status_response().await)
         } else {
-            return Ok(None);
+            let state = self.control_plane.read().await.current_state;
+            (
+                "CONFIG_RESPONSE",
+                self.error_response(
+                    "unknown_system_msg",
+                    format!("Unsupported control-plane command: {command}"),
+                    1,
+                    0,
+                    state.as_str(),
+                ),
+            )
         };
         Ok(Some(build_control_plane_response(
             &msg,
-            "CONFIG_RESPONSE",
+            response_msg,
             response_payload,
         )))
     }
@@ -383,6 +517,25 @@ impl GenericAiNode {
                 );
             }
         };
+        let apply_mode = match msg.payload.get("apply_mode").and_then(Value::as_str) {
+            Some(value) => value,
+            None => {
+                return self.invalid_config_response(
+                    Some(schema_version),
+                    Some(config_version),
+                    "Missing required field: payload.apply_mode".to_string(),
+                );
+            }
+        };
+        if apply_mode != "replace" {
+            return self.error_response(
+                "unsupported_apply_mode",
+                format!("Unsupported payload.apply_mode='{apply_mode}' (only 'replace' is supported in current phase)"),
+                schema_version,
+                config_version,
+                self.control_plane.read().await.current_state.as_str(),
+            );
+        }
 
         let config = match msg.payload.get("config") {
             Some(Value::Object(_)) => msg.payload.get("config").cloned().unwrap_or(Value::Null),
@@ -398,6 +551,37 @@ impl GenericAiNode {
                     Some(schema_version),
                     Some(config_version),
                     "Missing required field: payload.config".to_string(),
+                );
+            }
+        };
+        let mut config_doc = match parse_effective_config_doc(&config) {
+            Ok(v) => v,
+            Err(err) => {
+                return self.invalid_config_response(
+                    Some(schema_version),
+                    Some(config_version),
+                    format!("Invalid payload.config schema: {err}"),
+                );
+            }
+        };
+        config_doc = materialize_effective_defaults(&self.node_name, config_doc);
+        let next_behavior = match build_behavior_from_effective_config(&config_doc) {
+            Ok(v) => v,
+            Err(err) => {
+                return self.invalid_config_response(
+                    Some(schema_version),
+                    Some(config_version),
+                    format!("Invalid payload.config behavior: {err}"),
+                );
+            }
+        };
+        let materialized_config = match serde_json::to_value(&config_doc) {
+            Ok(v) => v,
+            Err(err) => {
+                return self.invalid_config_response(
+                    Some(schema_version),
+                    Some(config_version),
+                    format!("Failed to serialize effective config: {err}"),
                 );
             }
         };
@@ -433,7 +617,7 @@ impl GenericAiNode {
 
         state.current_state = NodeLifecycleState::Configured;
         state.config_source = "persisted";
-        state.effective_config = Some(config);
+        state.effective_config = Some(materialized_config);
         state.schema_version = schema_version;
         state.config_version = config_version;
         if let Err(err) = persist_dynamic_config(
@@ -441,7 +625,7 @@ impl GenericAiNode {
             &self.node_name,
             state.schema_version,
             state.config_version,
-            state.effective_config.as_ref().unwrap_or(&Value::Null),
+            &config_doc,
         ) {
             state.current_state = prev_state;
             state.config_source = prev_source;
@@ -456,6 +640,7 @@ impl GenericAiNode {
                 prev_state.as_str(),
             );
         }
+        *self.behavior.write().await = Some(next_behavior);
 
         self.ok_response(
             subsystem,
@@ -493,10 +678,10 @@ impl GenericAiNode {
             "subsystem": subsystem,
             "node_name": self.node_name.as_str(),
             "ok": true,
-            "status": "ok",
             "state": state,
             "schema_version": schema_version,
             "config_version": config_version,
+            "error": Value::Null,
             "effective_config": effective_config.map(redact_secrets),
         })
     }
@@ -513,7 +698,6 @@ impl GenericAiNode {
             "subsystem": "ai_node",
             "node_name": self.node_name.as_str(),
             "ok": false,
-            "status": "error",
             "state": state,
             "schema_version": schema_version,
             "config_version": config_version,
@@ -521,8 +705,7 @@ impl GenericAiNode {
                 "code": code,
                 "message": message
             },
-            "error_code": code,
-            "error_message": message
+            "effective_config": Value::Null
         })
     }
 
@@ -541,21 +724,60 @@ impl GenericAiNode {
         } else {
             (false, "none")
         };
+        let error = if ok {
+            Value::Null
+        } else {
+            json!({"code":"node_not_configured","message":"No effective config available"})
+        };
         json!({
             "subsystem": "ai_node",
             "node_name": self.node_name.as_str(),
             "ok": ok,
-            "status": if ok { "ok" } else { "error" },
             "state": state.current_state.as_str(),
             "config_source": config_source,
             "schema_version": state.schema_version,
             "config_version": state.config_version,
-            "config": state.effective_config.as_ref().map(redact_secrets),
             "effective_config": state.effective_config.as_ref().map(redact_secrets),
-            "error": if ok { Value::Null } else { json!({"code":"node_not_configured","message":"No effective config available"}) },
-            "error_code": if ok { Value::Null } else { Value::String("node_not_configured".to_string()) },
-            "error_message": if ok { Value::Null } else { Value::String("No effective config available".to_string()) },
+            "error": error,
         })
+    }
+
+    async fn build_ping_response(&self) -> Value {
+        let state = self.control_plane.read().await;
+        json!({
+            "ok": true,
+            "node_name": self.node_name.as_str(),
+            "state": state.current_state.as_str(),
+        })
+    }
+
+    async fn build_status_response(&self) -> Value {
+        let state = self.control_plane.read().await;
+        let behavior_kind = self
+            .behavior
+            .read()
+            .await
+            .as_ref()
+            .map(NodeBehavior::kind)
+            .unwrap_or("none");
+        json!({
+            "state": state.current_state.as_str(),
+            "node_name": self.node_name.as_str(),
+            "behavior_kind": behavior_kind,
+            "config_source": state.config_source,
+            "schema_version": state.schema_version,
+            "config_version": state.config_version,
+            "last_error": Value::Null
+        })
+    }
+}
+
+impl NodeBehavior {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Echo => "echo",
+            Self::OpenAiChat(_) => "openai_chat",
+        }
     }
 }
 
@@ -565,7 +787,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let config_paths = parse_config_paths()?;
+    let args = parse_runner_args()?;
+    let config_paths = args.config_paths;
     let mut loaded = Vec::with_capacity(config_paths.len());
     for path in &config_paths {
         let raw = fs::read_to_string(path)?;
@@ -574,6 +797,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     ensure_unique_node_names(&loaded)?;
+
+    if loaded.is_empty() {
+        let bootstrap_node = bootstrap_node_from_args(&args.bootstrap)?;
+        tracing::info!(
+            node_name = %bootstrap_node.name,
+            "starting ai_node_runner without YAML config (UNCONFIGURED mode)"
+        );
+        run_unconfigured_bootstrap(bootstrap_node).await?;
+        return Ok(());
+    }
 
     let mut runners = JoinSet::new();
     for (config_path, cfg) in loaded {
@@ -594,7 +827,9 @@ async fn run_one_config(
     config_path: PathBuf,
     cfg: RunnerConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let startup_effective_config = build_startup_effective_config(&cfg);
+    let startup_effective_doc = build_startup_effective_config_doc(&cfg);
+    let startup_effective_doc = materialize_effective_defaults(&cfg.node.name, startup_effective_doc);
+    let startup_effective_config = serde_json::to_value(&startup_effective_doc)?;
     let persisted_dynamic = load_persisted_dynamic_config(
         &PathBuf::from(&cfg.node.dynamic_config_dir),
         &cfg.node.name,
@@ -634,7 +869,7 @@ async fn run_one_config(
         client,
         GenericAiNode {
             node_name,
-            behavior,
+            behavior: Arc::new(RwLock::new(Some(behavior))),
             dynamic_config_dir: PathBuf::from(cfg.node.dynamic_config_dir),
             control_plane: Arc::new(RwLock::new(ControlPlaneState {
                 current_state: NodeLifecycleState::Configured,
@@ -656,31 +891,206 @@ async fn run_one_config(
     Ok(())
 }
 
-fn parse_config_paths() -> Result<Vec<PathBuf>, Box<dyn std::error::Error + Send + Sync>> {
+async fn run_unconfigured_bootstrap(
+    node: NodeSection,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let node_name = node.name.clone();
+    let dynamic_dir = PathBuf::from(node.dynamic_config_dir.clone());
+    let persisted_dynamic = load_persisted_dynamic_config(&dynamic_dir, &node_name);
+    let (behavior, state) = match persisted_dynamic.as_ref() {
+        Some(stored) => {
+            let materialized = materialize_effective_defaults(&node_name, stored.config.clone());
+            match build_behavior_from_effective_config(&materialized) {
+            Ok(behavior) => {
+                tracing::info!(
+                    node_name = %node_name,
+                    config_version = stored.config_version,
+                    "loaded effective JSON config at bootstrap"
+                );
+                (
+                    Some(behavior),
+                    ControlPlaneState {
+                        current_state: NodeLifecycleState::Configured,
+                        config_source: "persisted",
+                        effective_config: Some(
+                            serde_json::to_value(materialized).unwrap_or(Value::Null),
+                        ),
+                        schema_version: stored.schema_version,
+                        config_version: stored.config_version,
+                    },
+                )
+            }
+            Err(err) => {
+                tracing::warn!(
+                    node_name = %node_name,
+                    error = %err,
+                    "persisted JSON config is invalid; booting FAILED_CONFIG"
+                );
+                (
+                    None,
+                    ControlPlaneState {
+                        current_state: NodeLifecycleState::FailedConfig,
+                        config_source: "persisted",
+                        effective_config: Some(
+                            serde_json::to_value(materialized).unwrap_or(Value::Null),
+                        ),
+                        schema_version: stored.schema_version,
+                        config_version: stored.config_version,
+                    },
+                )
+            }
+        }},
+        None => (
+            None,
+            ControlPlaneState {
+                current_state: NodeLifecycleState::Unconfigured,
+                config_source: "none",
+                effective_config: None,
+                schema_version: 0,
+                config_version: 0,
+            },
+        ),
+    };
+
+    let ai_node_config = AiNodeConfig {
+        name: node.name,
+        version: node.version,
+        router_socket: PathBuf::from(node.router_socket),
+        uuid_persistence_dir: PathBuf::from(node.uuid_persistence_dir),
+        config_dir: PathBuf::from(node.config_dir),
+    };
+    let client = RouterClient::connect(ai_node_config).await?;
+    let runtime = NodeRuntime::new(
+        client,
+        GenericAiNode {
+            node_name,
+            behavior: Arc::new(RwLock::new(behavior)),
+            dynamic_config_dir: dynamic_dir,
+            control_plane: Arc::new(RwLock::new(state)),
+        },
+    );
+    runtime.run_with_config(RuntimeConfig::default()).await?;
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct BootstrapArgs {
+    node_name: Option<String>,
+    version: Option<String>,
+    router_socket: Option<String>,
+    uuid_persistence_dir: Option<String>,
+    config_dir: Option<String>,
+    dynamic_config_dir: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct RunnerArgs {
+    config_paths: Vec<PathBuf>,
+    bootstrap: BootstrapArgs,
+}
+
+fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + Sync>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let mut configs = Vec::new();
+    let mut parsed = RunnerArgs::default();
     let mut i = 0usize;
     while i < args.len() {
-        if args[i] == "--config" {
-            let Some(path) = args.get(i + 1) else {
-                return Err("missing path after --config".to_string().into());
-            };
-            configs.push(PathBuf::from(path));
-            i += 2;
-            continue;
+        match args[i].as_str() {
+            "--config" => {
+                let Some(path) = args.get(i + 1) else {
+                    return Err("missing path after --config".to_string().into());
+                };
+                parsed.config_paths.push(PathBuf::from(path));
+                i += 2;
+            }
+            "--node-name" => {
+                let Some(value) = args.get(i + 1) else {
+                    return Err("missing value after --node-name".to_string().into());
+                };
+                parsed.bootstrap.node_name = Some(value.clone());
+                i += 2;
+            }
+            "--version" => {
+                let Some(value) = args.get(i + 1) else {
+                    return Err("missing value after --version".to_string().into());
+                };
+                parsed.bootstrap.version = Some(value.clone());
+                i += 2;
+            }
+            "--router-socket" => {
+                let Some(value) = args.get(i + 1) else {
+                    return Err("missing value after --router-socket".to_string().into());
+                };
+                parsed.bootstrap.router_socket = Some(value.clone());
+                i += 2;
+            }
+            "--uuid-persistence-dir" => {
+                let Some(value) = args.get(i + 1) else {
+                    return Err("missing value after --uuid-persistence-dir".to_string().into());
+                };
+                parsed.bootstrap.uuid_persistence_dir = Some(value.clone());
+                i += 2;
+            }
+            "--config-dir" => {
+                let Some(value) = args.get(i + 1) else {
+                    return Err("missing value after --config-dir".to_string().into());
+                };
+                parsed.bootstrap.config_dir = Some(value.clone());
+                i += 2;
+            }
+            "--dynamic-config-dir" => {
+                let Some(value) = args.get(i + 1) else {
+                    return Err("missing value after --dynamic-config-dir".to_string().into());
+                };
+                parsed.bootstrap.dynamic_config_dir = Some(value.clone());
+                i += 2;
+            }
+            other => {
+                return Err(format!("unknown argument: {other}").into());
+            }
         }
-        return Err(format!("unknown argument: {}", args[i]).into());
     }
 
-    if configs.is_empty() {
-        return Err(
-            "usage: ai_node_runner --config <path-1.yaml> [--config <path-2.yaml> ...]"
-                .to_string()
-                .into(),
-        );
-    }
+    Ok(parsed)
+}
 
-    Ok(configs)
+fn bootstrap_node_from_args(
+    args: &BootstrapArgs,
+) -> Result<NodeSection, Box<dyn std::error::Error + Send + Sync>> {
+    let name = args
+        .node_name
+        .clone()
+        .or_else(|| std::env::var("AI_NODE_NAME").ok())
+        .ok_or_else(|| {
+            "when no --config is provided, pass --node-name (or AI_NODE_NAME env var)".to_string()
+        })?;
+    Ok(NodeSection {
+        name,
+        version: args
+            .version
+            .clone()
+            .or_else(|| std::env::var("AI_NODE_VERSION").ok())
+            .unwrap_or_else(default_version),
+        router_socket: args
+            .router_socket
+            .clone()
+            .or_else(|| std::env::var("AI_ROUTER_SOCKET").ok())
+            .unwrap_or_else(default_router_socket),
+        uuid_persistence_dir: args
+            .uuid_persistence_dir
+            .clone()
+            .or_else(|| std::env::var("AI_UUID_PERSISTENCE_DIR").ok())
+            .unwrap_or_else(default_state_dir),
+        config_dir: args
+            .config_dir
+            .clone()
+            .or_else(|| std::env::var("AI_CONFIG_DIR").ok())
+            .unwrap_or_else(default_config_dir),
+        dynamic_config_dir: args
+            .dynamic_config_dir
+            .clone()
+            .or_else(|| std::env::var("AI_DYNAMIC_CONFIG_DIR").ok())
+            .unwrap_or_else(default_dynamic_config_dir),
+    })
 }
 
 fn ensure_unique_node_names(
@@ -734,6 +1144,57 @@ fn build_behavior(
     Ok(behavior)
 }
 
+fn build_behavior_from_effective_config(
+    config: &EffectiveConfigDocument,
+) -> Result<NodeBehavior, Box<dyn std::error::Error + Send + Sync>> {
+    let behavior = &config.behavior;
+    let kind = behavior.kind.as_str();
+    if kind.is_empty() {
+        return Err("missing behavior.kind in effective config".to_string().into());
+    }
+
+    match kind {
+        "echo" => Ok(NodeBehavior::Echo),
+        "openai_chat" => {
+            let model = behavior
+                .model
+                .clone()
+                .or_else(|| behavior.params.as_ref().and_then(|p| p.model.clone()))
+                .ok_or_else(|| "missing behavior.model for openai_chat".to_string())?
+                .to_string();
+
+            let instructions = extract_instructions_from_effective_config(behavior);
+            let model_settings = extract_model_settings_from_effective_config(behavior);
+            let api_key_env = behavior
+                .api_key_env
+                .clone()
+                .or_else(|| {
+                    config
+                        .secrets
+                        .as_ref()
+                        .and_then(|v| v.openai.as_ref())
+                        .and_then(|v| v.api_key_env.clone())
+                })
+                .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
+            let yaml_inline_api_key = extract_openai_api_key_from_effective_config(config)
+                .filter(|v| v != "***REDACTED***");
+            let base_url = behavior
+                .base_url
+                .clone();
+
+            Ok(NodeBehavior::OpenAiChat(OpenAiChatRuntime {
+                model,
+                instructions,
+                model_settings,
+                api_key_env,
+                yaml_inline_api_key,
+                base_url,
+            }))
+        }
+        other => Err(format!("unsupported behavior.kind '{other}'").into()),
+    }
+}
+
 fn resolve_instructions(
     cfg: &Option<InstructionsSourceConfig>,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
@@ -782,56 +1243,48 @@ fn maybe_trim(value: String, trim: bool) -> String {
     }
 }
 
-fn build_startup_effective_config(cfg: &RunnerConfig) -> Value {
-    let behavior_value = match &cfg.behavior {
-        BehaviorSection::Echo => json!({ "kind": "echo" }),
-        BehaviorSection::OpenaiChat(openai) => json!({
-            "kind": "openai_chat",
-            "model": openai.model,
-            "base_url": openai.base_url,
-            "instructions": format_instructions_snapshot(&openai.instructions),
-            "model_settings": openai.model_settings.as_ref().map(|v| {
-                json!({
-                    "temperature": v.temperature,
-                    "top_p": v.top_p,
-                    "max_output_tokens": v.max_output_tokens
-                })
-            }),
-            "api_key_env": openai.api_key_env
-        }),
+fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocument {
+    let behavior = match &cfg.behavior {
+        BehaviorSection::Echo => EffectiveBehaviorSection {
+            kind: "echo".to_string(),
+            ..EffectiveBehaviorSection::default()
+        },
+        BehaviorSection::OpenaiChat(openai) => EffectiveBehaviorSection {
+            kind: "openai_chat".to_string(),
+            model: Some(openai.model.clone()),
+            instructions: Some(format_instructions_snapshot(&openai.instructions)),
+            model_settings: openai.model_settings.clone(),
+            api_key_env: Some(openai.api_key_env.clone()),
+            api_key: openai.api_key.clone(),
+            openai: openai.openai.clone(),
+            base_url: openai.base_url.clone(),
+            ..EffectiveBehaviorSection::default()
+        },
     };
 
-    json!({
-        "node": {
-            "name": cfg.node.name,
-            "version": cfg.node.version,
-            "router_socket": cfg.node.router_socket,
-            "uuid_persistence_dir": cfg.node.uuid_persistence_dir,
-            "config_dir": cfg.node.config_dir
-            ,"dynamic_config_dir": cfg.node.dynamic_config_dir
-        },
-        "runtime": {
-            "read_timeout_ms": cfg.runtime.read_timeout_ms,
-            "handler_timeout_ms": cfg.runtime.handler_timeout_ms,
-            "write_timeout_ms": cfg.runtime.write_timeout_ms,
-            "queue_capacity": cfg.runtime.queue_capacity,
-            "worker_pool_size": cfg.runtime.worker_pool_size,
-            "retry_max_attempts": cfg.runtime.retry_max_attempts,
-            "retry_initial_backoff_ms": cfg.runtime.retry_initial_backoff_ms,
-            "retry_max_backoff_ms": cfg.runtime.retry_max_backoff_ms,
-            "metrics_log_interval_ms": cfg.runtime.metrics_log_interval_ms
-        },
-        "behavior": behavior_value
-    })
-}
-
-#[derive(Debug, Deserialize, serde::Serialize)]
-struct PersistedDynamicConfig {
-    schema_version: u32,
-    config_version: u64,
-    node_name: String,
-    config: Value,
-    updated_at: String,
+    EffectiveConfigDocument {
+        node: Some(EffectiveNodeSection {
+            name: Some(cfg.node.name.clone()),
+            version: Some(cfg.node.version.clone()),
+            router_socket: Some(cfg.node.router_socket.clone()),
+            uuid_persistence_dir: Some(cfg.node.uuid_persistence_dir.clone()),
+            config_dir: Some(cfg.node.config_dir.clone()),
+            dynamic_config_dir: Some(cfg.node.dynamic_config_dir.clone()),
+        }),
+        behavior,
+        runtime: Some(EffectiveRuntimeSection {
+            read_timeout_ms: Some(cfg.runtime.read_timeout_ms),
+            handler_timeout_ms: Some(cfg.runtime.handler_timeout_ms),
+            write_timeout_ms: Some(cfg.runtime.write_timeout_ms),
+            queue_capacity: Some(cfg.runtime.queue_capacity),
+            worker_pool_size: Some(cfg.runtime.worker_pool_size),
+            retry_max_attempts: Some(cfg.runtime.retry_max_attempts),
+            retry_initial_backoff_ms: Some(cfg.runtime.retry_initial_backoff_ms),
+            retry_max_backoff_ms: Some(cfg.runtime.retry_max_backoff_ms),
+            metrics_log_interval_ms: Some(cfg.runtime.metrics_log_interval_ms),
+        }),
+        secrets: None,
+    }
 }
 
 fn dynamic_config_path(base_dir: &std::path::Path, node_name: &str) -> PathBuf {
@@ -842,10 +1295,10 @@ fn dynamic_config_path(base_dir: &std::path::Path, node_name: &str) -> PathBuf {
 fn load_persisted_dynamic_config(
     base_dir: &std::path::Path,
     node_name: &str,
-) -> Option<PersistedDynamicConfig> {
+) -> Option<EffectiveStateFile> {
     let path = dynamic_config_path(base_dir, node_name);
     let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<PersistedDynamicConfig>(&raw).ok()
+    serde_json::from_str::<EffectiveStateFile>(&raw).ok()
 }
 
 fn persist_dynamic_config(
@@ -853,19 +1306,59 @@ fn persist_dynamic_config(
     node_name: &str,
     schema_version: u32,
     config_version: u64,
-    config: &Value,
+    config: &EffectiveConfigDocument,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     fs::create_dir_all(base_dir)?;
     let path = dynamic_config_path(base_dir, node_name);
-    let payload = PersistedDynamicConfig {
+    let payload = EffectiveStateFile {
         schema_version,
         config_version,
         node_name: node_name.to_string(),
-        config: redact_secrets(config),
+        config: config.clone(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
     let json = serde_json::to_string_pretty(&payload)?;
-    fs::write(path, json)?;
+    write_json_atomic(&path, &json)?;
+    Ok(())
+}
+
+fn write_json_atomic(
+    path: &std::path::Path,
+    content: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "target path has no parent directory".to_string())?;
+    fs::create_dir_all(parent)?;
+
+    let tmp_name = format!(
+        ".{}.tmp.{}.{}",
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("state"),
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let tmp_path = parent.join(tmp_name);
+
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp_path)?;
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    fs::rename(&tmp_path, path)?;
+
+    if let Ok(dir_file) = OpenOptions::new().read(true).open(parent) {
+        let _ = dir_file.sync_all();
+    }
+
     Ok(())
 }
 
@@ -902,7 +1395,123 @@ fn extract_openai_api_key_from_config(config: &Value) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
         })
+        .or_else(|| {
+            config
+                .get("secrets")
+                .and_then(|v| v.get("openai"))
+                .and_then(|v| v.get("api_key"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
 }
+
+fn extract_openai_api_key_from_effective_config(config: &EffectiveConfigDocument) -> Option<String> {
+    config
+        .behavior
+        .openai
+        .as_ref()
+        .and_then(|v| v.api_key.clone())
+        .or_else(|| config.behavior.api_key.clone())
+        .or_else(|| {
+            config
+                .secrets
+                .as_ref()
+                .and_then(|v| v.openai.as_ref())
+                .and_then(|v| v.api_key.clone())
+        })
+}
+
+fn parse_effective_config_doc(
+    config: &Value,
+) -> Result<EffectiveConfigDocument, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(serde_json::from_value::<EffectiveConfigDocument>(config.clone())?)
+}
+
+fn materialize_effective_defaults(
+    node_name: &str,
+    mut config: EffectiveConfigDocument,
+) -> EffectiveConfigDocument {
+    if config.node.is_none() {
+        config.node = Some(EffectiveNodeSection::default());
+    }
+    if let Some(node) = config.node.as_mut() {
+        if node.name.is_none() {
+            node.name = Some(node_name.to_string());
+        }
+    }
+    if config.runtime.is_none() {
+        config.runtime = Some(EffectiveRuntimeSection::default());
+    }
+    if let Some(runtime) = config.runtime.as_mut() {
+        materialize_runtime_defaults(runtime);
+    }
+    if config.behavior.kind.eq_ignore_ascii_case("openai_chat") {
+        if config.behavior.provider.is_none() {
+            config.behavior.provider = Some("openai".to_string());
+        }
+        if config.behavior.api_key_env.is_none() {
+            let inherited = config
+                .secrets
+                .as_ref()
+                .and_then(|v| v.openai.as_ref())
+                .and_then(|v| v.api_key_env.clone());
+            config.behavior.api_key_env = Some(
+                inherited.unwrap_or_else(|| default_openai_api_key_env()),
+            );
+        }
+        if config.secrets.is_none() {
+            config.secrets = Some(EffectiveSecretsSection::default());
+        }
+        if let Some(secrets) = config.secrets.as_mut() {
+            if secrets.openai.is_none() {
+                secrets.openai = Some(EffectiveOpenAiSecrets::default());
+            }
+            if let Some(openai_secrets) = secrets.openai.as_mut() {
+                if openai_secrets.api_key.is_none() {
+                    openai_secrets.api_key = config
+                        .behavior
+                        .openai
+                        .as_ref()
+                        .and_then(|v| v.api_key.clone())
+                        .or_else(|| config.behavior.api_key.clone());
+                }
+            }
+        }
+    }
+    config
+}
+
+fn materialize_runtime_defaults(runtime: &mut EffectiveRuntimeSection) {
+    let defaults = RuntimeSection::default();
+    if runtime.read_timeout_ms.is_none() {
+        runtime.read_timeout_ms = Some(defaults.read_timeout_ms);
+    }
+    if runtime.handler_timeout_ms.is_none() {
+        runtime.handler_timeout_ms = Some(defaults.handler_timeout_ms);
+    }
+    if runtime.write_timeout_ms.is_none() {
+        runtime.write_timeout_ms = Some(defaults.write_timeout_ms);
+    }
+    if runtime.queue_capacity.is_none() {
+        runtime.queue_capacity = Some(defaults.queue_capacity);
+    }
+    if runtime.worker_pool_size.is_none() {
+        runtime.worker_pool_size = Some(defaults.worker_pool_size);
+    }
+    if runtime.retry_max_attempts.is_none() {
+        runtime.retry_max_attempts = Some(defaults.retry_max_attempts);
+    }
+    if runtime.retry_initial_backoff_ms.is_none() {
+        runtime.retry_initial_backoff_ms = Some(defaults.retry_initial_backoff_ms);
+    }
+    if runtime.retry_max_backoff_ms.is_none() {
+        runtime.retry_max_backoff_ms = Some(defaults.retry_max_backoff_ms);
+    }
+    if runtime.metrics_log_interval_ms.is_none() {
+        runtime.metrics_log_interval_ms = Some(defaults.metrics_log_interval_ms);
+    }
+}
+
 
 fn is_control_plane(msg: &Message) -> bool {
     msg.meta.msg_type.eq_ignore_ascii_case("system")
@@ -942,5 +1551,45 @@ fn node_not_configured_payload(state: NodeLifecycleState) -> Value {
         "details": {
             "state": state.as_str()
         }
+    })
+}
+
+fn extract_instructions_from_effective_config(behavior: &EffectiveBehaviorSection) -> Option<String> {
+    behavior
+        .instructions
+        .as_ref()
+        .and_then(|v| {
+            if let Some(inline) = v.as_str() {
+                return Some(inline.to_string());
+            }
+            v.get("value")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| behavior.params.as_ref().and_then(|p| p.system_prompt.clone()))
+}
+
+fn extract_model_settings_from_effective_config(behavior: &EffectiveBehaviorSection) -> ModelSettings {
+    let direct = behavior.model_settings.as_ref();
+    let params = behavior.params.as_ref();
+    ModelSettings {
+        temperature: direct
+            .and_then(|v| v.temperature)
+            .or_else(|| params.and_then(|v| v.temperature)),
+        top_p: direct
+            .and_then(|v| v.top_p)
+            .or_else(|| params.and_then(|v| v.top_p)),
+        max_output_tokens: direct
+            .and_then(|v| v.max_output_tokens)
+            .or_else(|| params.and_then(|v| v.max_output_tokens)),
+    }
+}
+
+fn node_runtime_not_ready_payload() -> Value {
+    json!({
+        "type": "error",
+        "code": "node_runtime_not_ready",
+        "message": "AI node runtime is not ready to process user messages yet.",
+        "retryable": true
     })
 }

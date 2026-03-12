@@ -48,7 +48,62 @@ ai-nodectl restart ai-chat
 ai-nodectl remove ai-sales --purge-config
 ```
 
-### 2.1 Environment variables per AI instance (systemd)
+### 2.0 Spawn flow A: precreated effective JSON (JSON-first)
+
+Use this when you want a node to boot already `CONFIGURED`, without waiting for control-plane provisioning.
+
+1. Prepare a JSON file with the effective config body (same shape as `payload.config` in `CONFIG_SET`).
+2. Precreate the state file with `init-state`:
+
+```bash
+ai-nodectl init-state ai-chat /tmp/ai_chat_effective_config.json \
+  --schema-version 1 \
+  --config-version 1
+```
+
+3. Start or restart the instance:
+
+```bash
+sudo systemctl restart fluxbee-ai-node@ai-chat
+sudo systemctl status fluxbee-ai-node@ai-chat
+```
+
+Notes for flow A:
+- Input file must be a JSON object representing `payload.config` (effective config body).
+- Output is wrapped as:
+  - `schema_version`
+  - `config_version`
+  - `node_name`
+  - `config`
+  - `updated_at`
+- If destination exists, command fails unless `--force` is passed.
+- Default target path: `/var/lib/fluxbee/state/ai-nodes/<name>.json`.
+
+Example overwrite:
+
+```bash
+ai-nodectl init-state ai-chat /tmp/ai_chat_effective_config.json --force
+```
+
+### 2.1 Spawn flow B: boot `UNCONFIGURED` then first `CONFIG_SET`
+
+Use this when you want to provision from control-plane messages.
+
+1. Start node instance without precreated state file:
+
+```bash
+sudo systemctl start fluxbee-ai-node@ai-chat
+```
+
+2. Node boots in `UNCONFIGURED` and accepts control-plane commands.
+3. Send first valid `CONFIG_SET` (`apply_mode=replace`, `config_version>=1`).
+4. Node persists state file under `/var/lib/fluxbee/state/ai-nodes/ai-chat.json` and transitions to `CONFIGURED`.
+
+Notes for flow B:
+- User messages are rejected with `node_not_configured` until first valid `CONFIG_SET`.
+- `CONFIG_SET` remains the source of runtime updates after bootstrap.
+
+### 2.2 Environment variables per AI instance (systemd)
 
 When running with `systemd`, shell `export` variables are **not** inherited by the service.
 
@@ -87,7 +142,7 @@ OpenAI key precedence in current MVP runner:
 2. YAML inline key (`behavior.openai.api_key` or `behavior.api_key` when configured)
 3. env var pointed by `behavior.api_key_env` (default `OPENAI_API_KEY`)
 
-### 2.2 Persistence model (UUID vs dynamic config)
+### 2.3 Persistence model (UUID vs dynamic config)
 
 There are two different persistence concerns:
 
@@ -101,8 +156,9 @@ There are two different persistence concerns:
   - purpose: persist `CONFIG_SET` state (`schema_version`, `config_version`, redacted config snapshot, `updated_at`).
 
 Operational note:
-- YAML remains current startup source in this stage.
-- Dynamic config persistence is used for control-plane continuity and version tracking, and is prepared for later full `UNCONFIGURED -> CONFIG_SET` bootstrap flow.
+- Effective JSON state is the runtime source of truth when present.
+- YAML remains as optional/operator-managed compatibility input.
+- If no effective JSON exists, node boots `UNCONFIGURED` and can be provisioned by first valid `CONFIG_SET`.
 
 ## 3) IO runtime install
 
