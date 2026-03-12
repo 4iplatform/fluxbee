@@ -207,6 +207,7 @@ fn is_lookup_unavailable(err: &IdentityShmError) -> bool {
     match err {
         IdentityShmError::Nix(errno) => *errno == nix::errno::Errno::ENOENT,
         IdentityShmError::Io(io_err) => io_err.kind() == std::io::ErrorKind::NotFound,
+        IdentityShmError::SeqLockTimeout => true,
         _ => false,
     }
 }
