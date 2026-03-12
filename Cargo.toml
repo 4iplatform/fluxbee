@@ -6,6 +6,8 @@ edition = "2021"
 [workspace]
 members = [
     "crates/fluxbee_sdk",
+    "nodes/gov/common",
+    "nodes/gov/ai-frontdesk-gov",
     "crates/fluxbee_ai_sdk",
     "crates/fluxbee_ai_nodes",
 ]

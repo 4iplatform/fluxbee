@@ -207,6 +207,7 @@ fn is_lookup_unavailable(err: &IdentityShmError) -> bool {
     match err {
         IdentityShmError::Nix(errno) => *errno == nix::errno::Errno::ENOENT,
         IdentityShmError::Io(io_err) => io_err.kind() == std::io::ErrorKind::NotFound,
+        IdentityShmError::SeqLockTimeout => true,
         _ => false,
     }
 }
@@ -245,6 +246,47 @@ async fn provision_ilk_with_fallback(
             trace_id: ok.trace_id,
             target: target.to_string(),
         }),
+        Err(fluxbee_sdk::identity::IdentityError::ProvisionRejected {
+            error_code,
+            message,
+        }) if error_code == "NOT_PRIMARY" => {
+            let Some(fallback) = fallback_target else {
+                return Err(fluxbee_sdk::identity::IdentityError::ProvisionRejected {
+                    error_code,
+                    message,
+                }
+                .into());
+            };
+            if fallback == target {
+                return Err(fluxbee_sdk::identity::IdentityError::ProvisionRejected {
+                    error_code,
+                    message,
+                }
+                .into());
+            }
+            tracing::warn!(
+                target = %target,
+                fallback = %fallback,
+                "identity target is replica (NOT_PRIMARY), retrying with fallback target"
+            );
+            let second = provision_ilk(
+                sender,
+                receiver,
+                IlkProvisionRequest {
+                    target: &fallback,
+                    ich_id,
+                    channel_type,
+                    address,
+                    timeout,
+                },
+            )
+            .await?;
+            Ok(ProvisionOutcome {
+                ilk_id: second.ilk_id,
+                trace_id: second.trace_id,
+                target: fallback,
+            })
+        }
         Err(fluxbee_sdk::identity::IdentityError::Unreachable {
             reason,
             original_dst,

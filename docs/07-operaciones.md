@@ -1,7 +1,7 @@
 # JSON Router - 07 Operaciones
 
-**Estado:** v1.18  
-**Fecha:** 2026-03-09  
+**Estado:** v1.19  
+**Fecha:** 2026-03-12  
 **Audiencia:** Ops/SRE, desarrolladores de deployment
 
 ---
@@ -65,7 +65,7 @@ Todos los binarios conocen estos paths por código:
 ├── jsr-config-<hive>
 ├── jsr-lsa-<hive>
 ├── jsr-opa-<hive>               # WASM de policy OPA
-└── jsr-identity-<hive>          # Identity table (ILKs, degrees, modules)
+└── jsr-identity-<hive>          # Identity table (tenants, ILKs, ICHs, aliases, vocabulary)
 ```
 
 ---
@@ -90,6 +90,9 @@ Con esto el sistema levanta una isla funcional sin conexión WAN (usa SQLite emb
 hive_id: produccion
 role: motherbee
 
+government:
+  identity_frontdesk: "AI.frontdesk@motherbee"
+
 wan:
   gateway_name: RT.gateway         # Opcional, default: RT.gateway
   listen: "0.0.0.0:9000"           # Escuchar conexiones de workers
@@ -112,6 +115,15 @@ blob:
     staging_ttl_hours: 24
     active_retain_days: 30
 
+identity:
+  max_ilks: 1000000
+  max_tenants: 10000
+  max_vocabulary: 4096
+  max_ilk_aliases: 1000000
+  merge_alias_ttl_secs: 3600
+  sync:
+    port: 9100
+
 database:
   url: "postgresql://fluxbee:password@localhost:5432/fluxbee"
   pool_size: 10
@@ -123,6 +135,9 @@ database:
 # /etc/fluxbee/hive.yaml (generado por add_hive o manual)
 hive_id: staging
 role: worker
+
+government:
+  identity_frontdesk: "AI.frontdesk@motherbee"
 
 wan:
   gateway_name: RT.gateway
@@ -146,6 +161,15 @@ blob:
     apply: false
     staging_ttl_hours: 24
     active_retain_days: 30
+
+identity:
+  max_ilks: 1000000
+  max_tenants: 10000
+  max_vocabulary: 4096
+  max_ilk_aliases: 1000000
+  merge_alias_ttl_secs: 3600
+  sync:
+    upstream: "motherbee:9100"    # escrito por add_hive para réplica identity
 ```
 
 ### 2.4 Campos de hive.yaml
@@ -155,6 +179,13 @@ blob:
 | `hive_id` | **Sí** | - | Identificador único de la isla |
 | `role` | No | `worker` | `motherbee` o `worker` |
 | `government.identity_frontdesk` | No | `AI.frontdesk@<hive_id>` | Nodo L2 de frontdesk para ruteo de ILK temporales (puede apuntar a motherbee) |
+| `identity.max_ilks` | No | `1000000` | Límite superior de ILKs para región SHM identity |
+| `identity.max_tenants` | No | `10000` | Límite de tenants para región SHM identity |
+| `identity.max_vocabulary` | No | `4096` | Límite de vocabulary en SHM identity |
+| `identity.max_ilk_aliases` | No | `1000000` | Límite de aliases `old->canonical` en SHM identity |
+| `identity.merge_alias_ttl_secs` | No | `3600` | TTL de alias temporal durante merge de ILKs |
+| `identity.sync.port` | No (motherbee) | `9100` | Puerto del socket de sync identity (primary) |
+| `identity.sync.upstream` | No (worker) | - | Target `host:port` del primary para full/delta sync en réplicas |
 | `wan.gateway_name` | No | `RT.gateway` | Nombre del router gateway |
 | `wan.listen` | No | (sin escucha) | IP:puerto para recibir conexiones WAN |
 | `wan.uplinks[]` | No | [] | Lista de gateways a conectar (workers) |
@@ -297,7 +328,8 @@ Evidencia mínima de recuperación:
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │ Componentes exclusivos de Motherbee:                    │   │
 │  │  • PostgreSQL (source of truth)                         │   │
-│  │  • SY.storage (único que escribe DB)                    │   │
+│  │  • SY.storage (dominio cognitivo en DB)                 │   │
+│  │  • SY.identity PRIMARY (dominio identity_* en DB)       │   │
 │  │  • SY.orchestrator (supervisa todo)                     │   │
 │  │  • SY.admin (API admin, comandos)                       │   │
 │  └─────────────────────────────────────────────────────────┘   │
@@ -338,7 +370,7 @@ Evidencia mínima de recuperación:
 |------------|:---------:|:------:|-------|
 | **Infraestructura** |
 | PostgreSQL | ✓ | - | Source of truth |
-| SY.storage | ✓ | - | Único que escribe DB |
+| SY.storage | ✓ | - | Writer DB del dominio cognitivo (`turns`, `events`, `memory_items`) |
 | SY.orchestrator | ✓ | ✓ | Ejecuta local en cada hive. `add_hive/remove_hive` solo en motherbee |
 | SY.admin | ✓ | - | API admin HTTP |
 | **Router** |
@@ -347,7 +379,7 @@ Evidencia mínima de recuperación:
 | WAN bridge | ✓ | ✓ | Si config.wan presente |
 | Syncthing (opcional) | ✓ | ✓ | Solo si `blob.sync.enabled=true`; orchestrator instala/arranca/monitorea local+remoto |
 | **Sistema** |
-| SY.identity | ✓ | ✓ (cache) | Worker sincroniza de Motherbee |
+| SY.identity | ✓ | ✓ (cache) | PRIMARY escribe `identity_*` en DB; worker sincroniza por socket desde Motherbee |
 | SY.config.routes | ✓ | ✓ (cache) | Worker sincroniza de Motherbee |
 | SY.opa.rules | ✓ | ✓ (cache) | Worker sincroniza de Motherbee |
 | **Cognición** |
@@ -378,6 +410,23 @@ Worker nuevo arranca:
 ```
 
 Esto hace que los workers sean ideales para containers (Docker, K8s).
+
+### 3.4 Ownership de DB: excepción formal de identity
+
+Regla general:
+- `SY.storage` es writer de persistencia cognitiva.
+
+Excepción explícita (identity v2):
+- `SY.identity` PRIMARY escribe directamente su dominio en PostgreSQL:
+  - `identity_tenants`
+  - `identity_ilks`
+  - `identity_ichs`
+  - `identity_vocabulary`
+  - `identity_ilk_aliases`
+
+Rationale operativo:
+- El registro de identidad requiere confirmación síncrona de persistencia para `run_node`/alta de interlocutores.
+- Workers nunca escriben DB de identity; aplican réplica por socket y mantienen SHM local.
 
 ---
 
@@ -910,6 +959,7 @@ Después de `add_hive` exitoso:
 /usr/bin/
 ├── sy-orchestrator
 ├── rt-gateway
+├── sy-identity
 ├── sy-config-routes
 └── sy-opa-rules
 # NOTA: NO tiene sy-admin (solo mother tiene)
@@ -917,9 +967,10 @@ Después de `add_hive` exitoso:
 Procesos corriendo:
 ├── sy-orchestrator
 ├── rt-gateway (conectado a mother:9000)
+├── sy-identity (réplica, sync por socket desde primary)
 ├── sy-config-routes
 └── sy-opa-rules
-# SIN sy-admin - solo escucha CONFIG_CHANGED de mother
+# SIN sy-admin - opera por control-plane L2 desde mother
 ```
 
 ### 4.9 Acceso SSH Post-Bootstrap

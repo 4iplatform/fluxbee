@@ -1,7 +1,7 @@
 # JSON Router - 03 Shared Memory
 
-**Estado:** v1.16  
-**Fecha:** 2026-02-05  
+**Estado:** v1.17  
+**Fecha:** 2026-03-12  
 **Audiencia:** Desarrolladores de router core
 
 ---
@@ -16,7 +16,7 @@ El sistema usa seis tipos de regiones de memoria compartida:
 ├── jsr-config-<hive>      # Una por isla
 ├── jsr-lsa-<hive>         # Una por isla
 ├── jsr-opa-<hive>         # Una por isla (WASM de policies)
-├── jsr-identity-<hive>    # Una por isla (ILKs, ICHs, degrees, modules)
+├── jsr-identity-<hive>    # Una por isla (tenants, ILKs, ICHs, aliases, vocabulary)
 └── jsr-memory-<hive>      # Una por isla (índice de activación cognitiva)
 ```
 
@@ -26,7 +26,7 @@ El sistema usa seis tipos de regiones de memoria compartida:
 | `jsr-config-<hive>` | SY.config.routes | Rutas estáticas, tabla VPN |
 | `jsr-lsa-<hive>` | Gateway | Topología de islas remotas |
 | `jsr-opa-<hive>` | SY.opa.rules | WASM compilado de policy OPA |
-| `jsr-identity-<hive>` | SY.identity | ILKs, ICHs, modules, degrees, external mappings |
+| `jsr-identity-<hive>` | SY.identity | tenants, ILKs, ICHs, aliases temporales, vocabulary, mapping hash ICH->ILK |
 | `jsr-memory-<hive>` | SY.cognition | Índice de activación: tags → event_ids |
 
 **Principio clave:** Cada región tiene **un único writer** y múltiples readers. Esto permite usar `seqlock` (writer único + lecturas lock-free).
@@ -778,148 +778,152 @@ Ejemplo: /jsr-identity-produccion
 
 | Dato | Descripción |
 |------|-------------|
-| Header | Identificación, seqlock, versión |
-| ILKs | Tabla de interlocutores (tenant, agent, human, system) |
-| ICHs | Tabla de canales (WhatsApp, Slack, email, etc.) |
-| Modules | Tabla de módulos de conocimiento |
-| Degrees | Tabla de títulos (combinaciones de módulos) |
-| ICH Mappings | Mapeo (channel_type, external_id) → ICH |
+| Header | Identificación, seqlock, límites configurados, conteos |
+| Tenants | Tabla de tenants (`tenant_id`, estado, dominio, límites) |
+| ILKs | Tabla de interlocutores (`ilk_id`, tipo, registration_status, tenant, metadata fija) |
+| ICHs | Tabla de canales (`ich_id`, `ilk_id`, `channel_type`, `address`) |
+| ICH Mappings | Tabla hash para lookup O(1) promedio `(channel_type,address) -> (ich_id,ilk_id)` |
+| ILK Aliases | Mapeo temporal `old_ilk_id -> canonical_ilk_id` con `expires_at` |
+| Vocabulary | Tags controlados (rol/capability) y estado |
+| Variable | Espacio alineado reservado para extensiones de metadata |
 
-**Propósito:** OPA y nodos IO/AI leen esta región para resolver ILKs, ICHs, obtener tenant, verificar degrees.
+**Propósito:** OPA y nodos IO/AI leen esta región para resolver tenant/capabilities por ILK y resolver ICH->ILK sin round-trip a DB.
 
 ### 10.3 Layout
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│ IdentityHeader (128 bytes)                                      │
-├────────────────────────────────────────────────────────────────┤
-│ IlkEntry[MAX_ILKS] (8192 entries × 256 bytes)                  │
-│ Total: ~2 MB                                                    │
-├────────────────────────────────────────────────────────────────┤
-│ IchEntry[MAX_ICHS] (4096 entries × 256 bytes)                  │
-│ Total: ~1 MB                                                    │
-├────────────────────────────────────────────────────────────────┤
-│ IchMappingEntry[MAX_ICH_MAPPINGS] (8192 entries × 256 bytes)   │
-│ Total: ~2 MB                                                    │
-├────────────────────────────────────────────────────────────────┤
-│ ModuleEntry[MAX_MODULES] (1024 entries × 512 bytes)            │
-│ Total: ~512 KB                                                  │
-├────────────────────────────────────────────────────────────────┤
-│ DegreeEntry[MAX_DEGREES] (512 entries × 1024 bytes)            │
-│ Total: ~512 KB                                                  │
-└────────────────────────────────────────────────────────────────┘
-Total aproximado: ~6 MB por isla
+┌──────────────────────────────────────────────────────────────────┐
+│ IdentityHeader                                                   │
+├──────────────────────────────────────────────────────────────────┤
+│ TenantEntry[max_tenants]                                         │
+├──────────────────────────────────────────────────────────────────┤
+│ IlkEntry[max_ilks]                                               │
+├──────────────────────────────────────────────────────────────────┤
+│ IchEntry[max_ichs]            (max_ichs = max_ilks * 4)         │
+├──────────────────────────────────────────────────────────────────┤
+│ IchMappingEntry[max_ich_mappings] (max_ich_mappings = max_ichs*2)│
+├──────────────────────────────────────────────────────────────────┤
+│ IlkAliasEntry[max_ilk_aliases]                                   │
+├──────────────────────────────────────────────────────────────────┤
+│ VocabularyEntry[max_vocabulary]                                  │
+├──────────────────────────────────────────────────────────────────┤
+│ Variable area (reservada, alineada a 64 bytes)                  │
+└──────────────────────────────────────────────────────────────────┘
 ```
+
+No hay límites fijos hardcodeados en la spec de runtime. El tamaño se calcula al iniciar `SY.identity` con `IdentityRegionLimits` (configurable por `hive.yaml`).
 
 ### 10.4 Estructuras
 
 ```rust
 pub const IDENTITY_MAGIC: u32 = 0x4A534944;  // "JSID"
-pub const IDENTITY_VERSION: u32 = 1;
-pub const MAX_ILKS: u32 = 8192;
-pub const MAX_ICHS: u32 = 4096;
-pub const MAX_ICH_MAPPINGS: u32 = 8192;
-pub const MAX_MODULES: u32 = 1024;
-pub const MAX_DEGREES: u32 = 512;
+pub const IDENTITY_VERSION: u32 = 2;
+
+pub const DEFAULT_IDENTITY_MAX_ILKS: u32 = 1_000_000;
+pub const DEFAULT_IDENTITY_MAX_TENANTS: u32 = 10_000;
+pub const DEFAULT_IDENTITY_MAX_VOCABULARY: u32 = 4_096;
+pub const DEFAULT_IDENTITY_MAX_ILK_ALIASES: u32 = 1_000_000;
+
+pub const ICH_CHANNEL_TYPE_MAX_LEN: usize = 32;
+pub const ICH_ADDRESS_MAX_LEN: usize = 256;
 
 #[repr(C)]
 pub struct IdentityHeader {
-    // Identificación (8 bytes)
     pub magic: u32,
     pub version: u32,
-    
-    // Seqlock (8 bytes)
-    pub seq: u64,
-    
-    // Counts (20 bytes)
+
+    pub seq: AtomicU64,
+
+    pub tenant_count: u32,
     pub ilk_count: u32,
     pub ich_count: u32,
     pub ich_mapping_count: u32,
-    pub module_count: u32,
-    pub degree_count: u32,
-    
-    // Timestamps (16 bytes)
+    pub vocabulary_count: u32,
+    pub ilk_alias_count: u32,
+
+    pub max_ilks: u32,
+    pub max_tenants: u32,
+    pub max_ichs: u32,
+    pub max_ich_mappings: u32,
+    pub max_vocabulary: u32,
+    pub max_ilk_aliases: u32,
+
     pub updated_at: u64,
     pub heartbeat: u64,
-    
-    // Owner (24 bytes)
+
     pub owner_uuid: [u8; 16],
     pub owner_pid: u32,
-    pub is_primary: u8,  // 1 si es PRIMARY, 0 si es REPLICA
-    pub _pad: [u8; 3],
-    
-    // Reserved
-    pub _reserved: [u8; 56],
+    pub is_primary: u8,
+    pub _pad0: [u8; 3],
+
+    pub hive_id: [u8; 64],
+    pub hive_id_len: u16,
 }
-// Total: 128 bytes
+
+#[repr(C)]
+pub struct TenantEntry {
+    pub tenant_id: [u8; 16],   // UUID raw bytes
+    pub name: [u8; 128],
+    pub domain: [u8; 128],
+    pub status: u8,            // 0 pending, 1 active, 2 suspended
+    pub max_ilks: u32,
+}
 
 #[repr(C)]
 pub struct IlkEntry {
-    pub ilk: [u8; 48],              // "ilk:<uuid>" (null-terminated)
-    pub ilk_type: u8,               // 0=tenant, 1=agent, 2=human, 3=system
-    pub human_subtype: u8,          // 0=internal, 1=external (solo si type=human)
-    pub flags: u16,                 // FLAG_ACTIVE, FLAG_DELETED
-    pub tenant_ilk: [u8; 48],       // ILK del tenant al que pertenece
-    pub handler_node: [u8; 64],     // Nodo L2 que maneja este ILK (para agents)
-    pub degree_hash: [u8; 32],      // Hash del degree asignado (para agents)
-    pub capabilities: [u8; 64],     // Lista de capabilities (comma-separated)
-    // Total: 256 bytes
+    pub ilk_id: [u8; 16],       // UUID raw bytes
+    pub ilk_type: u8,           // 0 human, 1 agent, 2 system
+    pub registration_status: u8,// 0 temporary, 1 partial, 2 complete
+    pub tenant_id: [u8; 16],    // UUID raw bytes
+    pub display_name: [u8; 128],
+    pub handler_node: [u8; 128],
+    pub ich_offset: u32,
+    pub ich_count: u16,
+    pub roles_offset: u32,      // offsets/lens a área variable (reservado)
+    pub roles_len: u16,
+    pub capabilities_offset: u32,
+    pub capabilities_len: u16,
 }
 
 #[repr(C)]
 pub struct IchEntry {
-    pub ich: [u8; 48],              // "ich:<uuid>" (null-terminated)
-    pub channel_type: [u8; 16],     // "whatsapp", "slack", "email", etc.
-    pub external_id: [u8; 128],     // "+5491155551234", "U12345", "user@mail.com"
-    pub ilk: [u8; 48],              // ILK dueño de este canal
-    pub flags: u16,                 // FLAG_ACTIVE, FLAG_DELETED
-    pub _pad: [u8; 14],
-    // Total: 256 bytes
+    pub ich_id: [u8; 16],       // UUID raw bytes
+    pub ilk_id: [u8; 16],       // UUID raw bytes
+    pub channel_type: [u8; ICH_CHANNEL_TYPE_MAX_LEN],
+    pub address: [u8; ICH_ADDRESS_MAX_LEN],
+    pub is_primary: u8,
 }
 
 #[repr(C)]
 pub struct IchMappingEntry {
-    pub channel_type: [u8; 16],     // "whatsapp", "slack", etc.
-    pub external_id: [u8; 128],     // "+5491155551234", etc.
-    pub ich: [u8; 48],              // ICH resuelto
+    pub hash: u64,                  // hash(channel_type,address)
+    pub channel_type: [u8; ICH_CHANNEL_TYPE_MAX_LEN],
+    pub address: [u8; ICH_ADDRESS_MAX_LEN],
+    pub ich_id: [u8; 16],
+    pub ilk_id: [u8; 16],
+    pub flags: u16,                 // OCCUPIED / TOMBSTONE / empty
+}
+
+#[repr(C)]
+pub struct IlkAliasEntry {
+    pub old_ilk_id: [u8; 16],
+    pub canonical_ilk_id: [u8; 16],
+    pub expires_at: u64,
     pub flags: u16,
-    pub _pad: [u8; 62],
-    // Total: 256 bytes
 }
 ```
 
 ### 10.5 Writer: SY.identity
 
-SY.identity es el único writer. En modo PRIMARY escribe cambios; en modo REPLICA recibe replicación de mother.
+`SY.identity` es el único writer. En modo PRIMARY escribe cambios y emite deltas; en modo REPLICA aplica full sync/deltas y escribe su SHM local.
 
 ```rust
 impl IdentityWriter {
-    fn write_ilk(&mut self, ilk: &Ilk) -> Result<()> {
-        self.header.seq.fetch_add(1, Ordering::SeqCst);
-        
-        let slot = self.find_or_create_slot(&ilk.ilk)?;
-        slot.ilk_type = ilk.ilk_type as u8;
-        slot.human_subtype = ilk.human_subtype.unwrap_or(0) as u8;
-        copy_string(&mut slot.tenant_ilk, &ilk.tenant_ilk);
-        copy_string(&mut slot.handler_node, &ilk.handler_node.unwrap_or_default());
-        
-        self.header.seq.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-    
-    fn write_ich(&mut self, ich: &Ich) -> Result<()> {
-        self.header.seq.fetch_add(1, Ordering::SeqCst);
-        
-        let slot = self.find_or_create_ich_slot(&ich.ich)?;
-        copy_string(&mut slot.channel_type, &ich.channel_type);
-        copy_string(&mut slot.external_id, &ich.external_id);
-        copy_string(&mut slot.ilk, &ich.ilk);
-        slot.flags = FLAG_ACTIVE;
-        
-        // Also create mapping for fast lookup
-        self.create_ich_mapping(&ich.channel_type, &ich.external_id, &ich.ich)?;
-        
-        self.header.seq.fetch_add(1, Ordering::SeqCst);
+    fn write_snapshot_entries(...) -> Result<()> {
+        seqlock_begin_write(&header.seq);
+        // rewrite tenants/ilks/ichs/aliases/vocabulary
+        // rebuild counters
+        seqlock_end_write(&header.seq);
         Ok(())
     }
 }
@@ -930,40 +934,50 @@ impl IdentityWriter {
 OPA carga esta región como `data.identity` para usar en reglas:
 
 ```rego
-# Derivar tenant de src_ilk
-tenant := data.identity[input.meta.src_ilk].tenant_ilk
+# Canonicalización por alias
+canonical := object.get(data.identity_aliases, input.meta.src_ilk, input.meta.src_ilk)
+
+# Derivar tenant
+tenant := data.identity[canonical].tenant_id
 
 # Verificar capabilities de un agent
-data.identity[ilk].capabilities
+data.identity[canonical].capabilities
 ```
 
 ### 10.7 Reader: Nodos IO
 
-Los nodos IO resuelven (channel_type, external_id) → ICH → ILK:
+Los nodos IO resuelven `(channel_type, address)` directo contra `IchMappingEntry` (tabla hash con linear probing + tombstones), evitando scan O(N):
 
 ```rust
-fn resolve_ich(&self, channel_type: &str, external_id: &str) -> Option<String> {
+fn resolve_ilk_for_channel(&self, channel_type: &str, address: &str) -> Option<[u8; 16]> {
     let shm = self.identity_region.as_ref()?;
-    
-    for mapping in shm.ich_mappings.iter() {
-        if mapping.channel_type == channel_type && mapping.external_id == external_id {
-            return Some(mapping.ich.to_string());
-        }
-    }
-    None
-}
 
-fn get_ilk_for_ich(&self, ich: &str) -> Option<String> {
-    let shm = self.identity_region.as_ref()?;
-    
-    for entry in shm.ichs.iter() {
-        if entry.ich == ich {
-            return Some(entry.ilk.to_string());
+    let hash = compute_ich_hash(channel_type, address);
+    let table_size = shm.header.max_ich_mappings as usize;
+    let mut idx = (hash as usize) % table_size;
+
+    for _ in 0..table_size {
+        let entry = &shm.ich_mappings[idx];
+        if entry.flags == 0 {
+            return None; // slot nunca usado
         }
+        if entry.flags & ICH_MAP_FLAG_TOMBSTONE != 0 {
+            idx = (idx + 1) % table_size;
+            continue;
+        }
+        if entry.flags & ICH_MAP_FLAG_OCCUPIED != 0
+            && entry.hash == hash
+            && equal_fixed_str(&entry.channel_type, channel_type)
+            && equal_fixed_str(&entry.address, address) {
+            return Some(entry.ilk_id);
+        }
+        idx = (idx + 1) % table_size;
     }
     None
 }
 ```
+
+La lectura usa seqlock lock-free con timeout corto (`SEQLOCK_READ_TIMEOUT_MS`) para evitar bloqueos bajo escritura.
 
 ### 10.8 Descubrimiento
 
@@ -980,7 +994,7 @@ let identity_shm = format!("/jsr-identity-{}", hive_id);
 ```rust
 // Región de routers
 pub const SHM_MAGIC: u32 = 0x4A535352;
-pub const SHM_VERSION: u32 = 1;
+pub const SHM_VERSION: u32 = 2;
 pub const MAX_NODES: u32 = 1024;
 
 // Región de config
@@ -1007,21 +1021,28 @@ pub const OPA_STATUS_LOADING: u8 = 2;
 
 // Región Identity
 pub const IDENTITY_MAGIC: u32 = 0x4A534944;  // "JSID"
-pub const IDENTITY_VERSION: u32 = 1;
-pub const MAX_ILKS: u32 = 8192;
-pub const MAX_MODULES: u32 = 1024;
-pub const MAX_DEGREES: u32 = 512;
-pub const MAX_EXTERNAL_MAPPINGS: u32 = 16384;
+pub const IDENTITY_VERSION: u32 = 2;
+pub const DEFAULT_IDENTITY_MAX_ILKS: u32 = 1_000_000;
+pub const DEFAULT_IDENTITY_MAX_TENANTS: u32 = 10_000;
+pub const DEFAULT_IDENTITY_MAX_VOCABULARY: u32 = 4_096;
+pub const DEFAULT_IDENTITY_MAX_ILK_ALIASES: u32 = 1_000_000;
+pub const ICH_CHANNEL_TYPE_MAX_LEN: usize = 32;
+pub const ICH_ADDRESS_MAX_LEN: usize = 256;
 
 // ILK types
-pub const ILK_TYPE_TENANT: u8 = 0;
+pub const ILK_TYPE_HUMAN: u8 = 0;
 pub const ILK_TYPE_AGENT: u8 = 1;
-pub const ILK_TYPE_HUMAN: u8 = 2;
-pub const ILK_TYPE_SYSTEM: u8 = 3;
+pub const ILK_TYPE_SYSTEM: u8 = 2;
 
-// Human subtypes
-pub const HUMAN_SUBTYPE_INTERNAL: u8 = 0;
-pub const HUMAN_SUBTYPE_EXTERNAL: u8 = 1;
+// Registration status
+pub const REG_STATUS_TEMPORARY: u8 = 0;
+pub const REG_STATUS_PARTIAL: u8 = 1;
+pub const REG_STATUS_COMPLETE: u8 = 2;
+
+// Tenant status
+pub const TNT_STATUS_PENDING: u8 = 0;
+pub const TNT_STATUS_ACTIVE: u8 = 1;
+pub const TNT_STATUS_SUSPENDED: u8 = 2;
 
 // Match kinds
 pub const MATCH_EXACT: u8 = 0;
@@ -1031,6 +1052,8 @@ pub const MATCH_GLOB: u8 = 2;
 // Flags
 pub const FLAG_ACTIVE: u16 = 0x0001;
 pub const FLAG_DELETED: u16 = 0x0002;
+pub const ICH_MAP_FLAG_OCCUPIED: u16 = 0x0001;
+pub const ICH_MAP_FLAG_TOMBSTONE: u16 = 0x0002;
 
 // Timers
 pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
@@ -1039,7 +1062,7 @@ pub const HEARTBEAT_STALE_MS: u64 = 30_000;
 
 ---
 
-## 11. Referencias
+## 12. Referencias
 
 | Tema | Documento |
 |------|-----------|
@@ -1048,3 +1071,4 @@ pub const HEARTBEAT_STALE_MS: u64 = 30_000;
 | LSA entre gateways | `05-conectividad.md` |
 | SY.config.routes | `06-regiones.md` |
 | SY.opa.rules | `SY_nodes_spec.md` |
+| Identity v2 (fuente) | `10-identity-v2.md` |

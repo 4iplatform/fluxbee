@@ -114,6 +114,7 @@ const DEFAULT_BLOB_GC_ACTIVE_RETAIN_DAYS: u64 = BLOB_ACTIVE_RETAIN_DAYS;
 const DEFAULT_DIST_PATH: &str = DIST_ROOT_DIR;
 const DEFAULT_DIST_SYNC_ENABLED: bool = true;
 const DEFAULT_DIST_SYNC_TOOL: &str = "syncthing";
+const DEFAULT_IDENTITY_SYNC_PORT: u16 = 9100;
 const IDENTITY_NODE_ILK_MAP_FILE: &str = "identity-node-ilk-map.json";
 
 #[derive(Debug, Deserialize)]
@@ -125,7 +126,18 @@ struct HiveFile {
     storage: Option<StorageSection>,
     blob: Option<BlobSection>,
     dist: Option<DistSection>,
+    identity: Option<IdentitySection>,
     government: Option<GovernmentSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentitySection {
+    sync: Option<IdentitySyncSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentitySyncSection {
+    port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7752,15 +7764,33 @@ async fn add_hive_flow(
                 .to_string_lossy()
                 .to_string()
         });
-    let identity_frontdesk_node_name = load_hive(&state.config_dir)
-        .map(|hive| identity_frontdesk_node_name_from_hive(&hive))
-        .unwrap_or_else(|_| format!("AI.frontdesk@{}", state.hive_id));
+    let local_hive = load_hive(&state.config_dir).ok();
+    let identity_frontdesk_node_name = local_hive
+        .as_ref()
+        .map(identity_frontdesk_node_name_from_hive)
+        .unwrap_or_else(|| format!("AI.frontdesk@{}", state.hive_id));
+    let identity_sync_port = local_hive
+        .as_ref()
+        .map(identity_sync_port_from_hive)
+        .unwrap_or(DEFAULT_IDENTITY_SYNC_PORT);
+    let (worker_uplink_host, _) = match parse_host_port(&worker_uplink) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "CONFIG_FAILED",
+                "message": format!("resolve identity sync upstream failed: {err}"),
+            });
+        }
+    };
+    let identity_sync_upstream = format_host_port(&worker_uplink_host, identity_sync_port);
     let hive_yaml = format!(
-        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n",
+        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n",
         hive_id,
         worker_uplink,
         storage_path,
         identity_frontdesk_node_name,
+        identity_sync_upstream,
         desired_blob.enabled,
         desired_blob.path.display(),
         desired_blob.sync_enabled,
@@ -9216,6 +9246,23 @@ fn identity_frontdesk_node_name_from_hive(hive: &HiveFile) -> String {
         Some(value) if value.contains('@') => value.to_string(),
         Some(value) => format!("{value}@{}", hive.hive_id),
         None => format!("AI.frontdesk@{}", hive.hive_id),
+    }
+}
+
+fn identity_sync_port_from_hive(hive: &HiveFile) -> u16 {
+    hive.identity
+        .as_ref()
+        .and_then(|identity| identity.sync.as_ref())
+        .and_then(|sync| sync.port)
+        .unwrap_or(DEFAULT_IDENTITY_SYNC_PORT)
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    let host = host.trim();
+    if host.contains(':') && !host.starts_with('[') && !host.ends_with(']') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
     }
 }
 

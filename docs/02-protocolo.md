@@ -1,7 +1,7 @@
 # JSON Router - 02 Protocolo de Mensajes
 
-**Estado:** v1.18  
-**Fecha:** 2026-03-09  
+**Estado:** v1.19  
+**Fecha:** 2026-03-12  
 **Audiencia:** Desarrolladores de librería de nodo, desarrolladores de nodos
 
 ---
@@ -596,6 +596,14 @@ El subsystem `opa` tiene un campo adicional `action` que define la operación:
 }
 ```
 
+#### 7.4.6 Delimitación: identity NO usa CONFIG_CHANGED
+
+`SY.identity` no participa del patrón `CONFIG_CHANGED/CONFIG_RESPONSE`.
+
+- Registro/actualización de identidad usa acciones system unicast (`ILK_*`, `TNT_*`) hacia `SY.identity`.
+- Replicación identity usa socket directo `SY.identity` (full sync + deltas), fuera del path router.
+- En consecuencia, no existe `subsystem="identity"` bajo `CONFIG_CHANGED`.
+
 ### 7.5 OPA_RELOAD (local)
 
 | Mensaje | Origen | Destino | Propósito |
@@ -626,13 +634,59 @@ Los routers pueden:
 1. Escuchar OPA_RELOAD y recargar el WASM de SHM
 2. O detectar cambio en SHM por `policy_version` diferente
 
-### 7.6 Tiempo
+### 7.6 Identity Registry (SY.identity)
+
+| Mensaje | Origen autorizado | Destino | Propósito |
+|---------|-------------------|---------|-----------|
+| `ILK_PROVISION` | `IO.*@*` | `SY.identity@<hive>` | Crear ILK temporal para ICH desconocido |
+| `ILK_PROVISION_RESPONSE` | `SY.identity` | Originador | Resultado de provisión |
+| `ILK_REGISTER` | `AI.frontdesk@*`, `SY.orchestrator@*` | `SY.identity@<primary_hive>` | Completar ILK temporal o registrar nodo |
+| `ILK_REGISTER_RESPONSE` | `SY.identity` | Originador | Resultado de registro |
+| `ILK_ADD_CHANNEL` | `AI.frontdesk@*` | `SY.identity@<primary_hive>` | Asociar canal y opcionalmente mergear ILK temporal |
+| `ILK_ADD_CHANNEL_RESPONSE` | `SY.identity` | Originador | Resultado de asociación/merge |
+| `ILK_UPDATE` | `SY.orchestrator@*` | `SY.identity@<primary_hive>` | Actualizar metadata del ILK (roles/capabilities/channels) |
+| `ILK_UPDATE_RESPONSE` | `SY.identity` | Originador | Resultado de update |
+| `TNT_CREATE` | `AI.frontdesk@*` | `SY.identity@<primary_hive>` | Crear tenant (típicamente `pending`) |
+| `TNT_CREATE_RESPONSE` | `SY.identity` | Originador | Resultado de create tenant |
+| `TNT_APPROVE` | `SY.admin@*` | `SY.identity@<primary_hive>` | Aprobar tenant pending |
+| `TNT_APPROVE_RESPONSE` | `SY.identity` | Originador | Resultado de approve tenant |
+| `IDENTITY_METRICS` | tooling/system nodes | `SY.identity@<hive>` | Snapshot operativo de conteos/estado identity |
+| `IDENTITY_METRICS_RESPONSE` | `SY.identity` | Originador | Resultado de métricas |
+
+Reglas operativas identity:
+1. Validación estricta de payload (`serde(deny_unknown_fields)` en writer).
+2. La allowlist de registradores en `SY.identity` es autoritativa (OPA es defensa en profundidad).
+3. Si la acción muta estado y llega a replica, `SY.identity` responde `status=error`, `error_code=NOT_PRIMARY`.
+4. El formato de error estándar incluye `status=error`, `error_code`, `message`.
+
+Ejemplo mínimo de provisión:
+```json
+{
+  "routing": {
+    "src": "<uuid-io-node>",
+    "dst": "SY.identity@worker-220",
+    "ttl": 16,
+    "trace_id": "<uuid>"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "ILK_PROVISION"
+  },
+  "payload": {
+    "ich_id": "ich:a1b2c3d4-5678-90ab-cdef-1234567890ab",
+    "channel_type": "whatsapp",
+    "address": "+5491155551234"
+  }
+}
+```
+
+### 7.7 Tiempo
 
 | Mensaje | Origen | Destino | Propósito |
 |---------|--------|---------|-----------|
 | `TIME_SYNC` | SY.time / Router | Broadcast | Sincronización UTC (scope=`"global"`) |
 
-### 7.7 Cognición y Memoria
+### 7.8 Cognición y Memoria
 
 | Mensaje | Origen | Destino | Propósito |
 |---------|--------|---------|-----------|
@@ -640,7 +694,7 @@ Los routers pueden:
 | `MEMORY_FETCH` | SY.cognition | Gateway destino | Request: obtener EventPackage de otra isla |
 | `MEMORY_RESPONSE` | Gateway | SY.cognition | Response: EventPackage solicitado |
 
-#### 7.7.1 LSA_MEMORY
+#### 7.8.1 LSA_MEMORY
 
 Propaga punteros de eventos con alta activación para que otras islas sepan que existen:
 
@@ -672,7 +726,7 @@ Propaga punteros de eventos con alta activación para que otras islas sepan que 
 }
 ```
 
-#### 7.7.2 MEMORY_FETCH / MEMORY_RESPONSE
+#### 7.8.2 MEMORY_FETCH / MEMORY_RESPONSE
 
 Request/response para obtener EventPackage completo de otra isla:
 
@@ -726,7 +780,7 @@ Request/response para obtener EventPackage completo de otra isla:
 
 ---
 
-### 7.8 Orchestrator (Update y Ciclo de Vida de Nodos)
+### 7.9 Orchestrator (Update y Ciclo de Vida de Nodos)
 
 | Mensaje | Origen | Destino | Propósito |
 |---------|--------|---------|-----------|
@@ -744,11 +798,11 @@ Contrato estricto v2:
 - El único contrato de update remoto es `SYSTEM_UPDATE`/`SYSTEM_UPDATE_RESPONSE`.
 - `SYSTEM_SYNC_HINT` está documentado como extensión propuesta v2.x; su adopción es explícita por feature/política.
 
-Regla operativa 7.8:
+Regla operativa 7.9:
 - Usar `routing.dst` por nombre L2 (`"SY.orchestrator@<hive>"`).
 - No usar `routing.dst = null` (`Destination::Resolve`) en control-plane normal.
 
-#### 7.8.1 SYSTEM_UPDATE
+#### 7.9.1 SYSTEM_UPDATE
 
 Request:
 
@@ -821,7 +875,7 @@ Códigos de error canónicos (`payload.error_code` cuando `status=error`):
 | `UPDATE_FAILED` | Fallo durante instalación/restart/health gate |
 | `FORBIDDEN` | Origen de mensaje system no autorizado |
 
-#### 7.8.2 SPAWN_NODE
+#### 7.9.2 SPAWN_NODE
 
 Request:
 
@@ -877,7 +931,7 @@ Estados/códigos típicos:
 - `status=error`, `error_code=RUNTIME_NOT_AVAILABLE` o `RUNTIME_NOT_PRESENT`.
 - `status=error`, `error_code=SPAWN_FAILED`.
 
-#### 7.8.3 KILL_NODE
+#### 7.9.3 KILL_NODE
 
 Request:
 
@@ -931,7 +985,7 @@ Estados/códigos típicos:
 - `status=error`, `error_code=INVALID_REQUEST`.
 - `status=error`, `error_code=KILL_FAILED`.
 
-#### 7.8.4 SYSTEM_SYNC_HINT *(propuesto v2.x)*
+#### 7.9.4 SYSTEM_SYNC_HINT *(propuesto v2.x)*
 
 Objetivo:
 - gatillar sincronización por evento sobre Syncthing y opcionalmente esperar convergencia observada.
