@@ -255,3 +255,25 @@ SegÃºn la especificaciÃ³n del Router v1.16:
 
 `meta.context` **NO** debe usarse para almacenar historia, turns ni contexto conversacional.
 
+
+
+## Retries y deduplicación
+
+✅ **NORMATIVO (HOY, Socket Mode)**:
+- La deduplicación se hace por un `message_id` estable (preferentemente `event_id`; fallback `ts`) dentro de la ventana del sessionizer.
+- No se depende de headers `X-Slack-Retry-*` (propios de HTTP Events API), dado que el modo activo es Socket Mode.
+
+🧩 **A ESPECIFICAR**:
+- Si a futuro se habilita ingestión por HTTP Events API, se deberá incorporar manejo explícito de `X-Slack-Retry-*` y una política de dedupe consistente.
+
+
+
+## Configuración en caliente (sin reinicio)
+
+✅ **NORMATIVO**:
+- El nodo Slack **debe** poder actualizar credenciales/config sin depender de un restart del orchestrator, usando Control Plane (`CONFIG_SET`).
+- Precedencia sugerida:
+  1) Override en memoria recibido por `CONFIG_SET` (si existe)
+  2) Config local (YAML/env)
+- En reinicio, el override en memoria se pierde; si no hay config local, el nodo puede quedar `FAILED_CONFIG (missing_secret)` hasta recibir `CONFIG_SET` nuevamente.
+

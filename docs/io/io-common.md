@@ -4,6 +4,39 @@
 > IO performs best-effort lookup only; on miss/unavailable it forwards with `meta.src_ilk = null`.
 > Any older wording suggesting synchronous wait/buffering for identity should be treated as superseded.
 
+
+
+## Control Plane unificado (IO Nodes ↔ AI Nodes)
+
+✅ **NORMATIVO**:
+- IO Nodes adoptan el mismo patrón de Control Plane que AI Nodes:
+  - `PING/STATUS` para observabilidad mínima,
+  - `CONFIG_GET/CONFIG_SET/CONFIG_RESPONSE` para gestión de configuración en caliente.
+- Los mensajes de Control Plane se distinguen por `meta.type in {"system","admin"}` + `meta.msg`.
+
+🧩 **A ESPECIFICAR**:
+- Catálogo global de comandos system/admin (cuando Fluxbee lo formalice en protocolo/base).
+
+
+
+## Adaptación temporal al core/SDK (campos L3 e identidad)
+
+> ✅ **Canónico (protocolo Fluxbee):** existen campos L3 dedicados para identidad y contexto conversacional (por ejemplo `src_ilk/dst_ilk`, `ich/ctx`, `ctx_seq`, `ctx_window`).  
+> ⚠️ **Estado actual (core/SDK):** el SDK de mensaje aún no expone todos esos campos como propiedades top-level; se dispone de `meta.context` (JSON) como “carrier”.
+
+✅ **NORMATIVO (HOY, implementación compatible):**
+- IO Nodes **MUST** usar `meta.context` como carrier temporal para hints de identidad/contexto cuando el core/SDK no provea campos dedicados.
+- La metadata específica del canal (Slack/WhatsApp/Email) debe vivir bajo `meta.context.io.*`.
+- Mientras dure la transición, es aceptable transportar `src_ilk/dst_ilk` como `meta.context.src_ilk` / `meta.context.dst_ilk` (carrier legacy).
+
+⚠️ **ADVERTENCIA:**
+- Este carrier es temporal. Cuando el core/SDK exponga campos dedicados, IO Nodes deben migrar a los campos canónicos y dejar de “polucionar” `meta.context` raíz.
+
+🧩 **A ESPECIFICAR (cuando el core se alinee):**
+- Momento exacto de corte (release) donde `ctx_seq/ctx_window` pasan a ser obligatorios en el happy path.
+
+
+
 ## 0. Objetivo
 
 `io-common` es una librerÃ­a (o conjunto de librerÃ­as por lenguaje) que encapsula la
@@ -59,7 +92,9 @@ Funciones mÃ­nimas:
 - **No bloquear ACK**: el IO puede ACKear al proveedor y mantener el evento en un buffer acotado hasta resolver `src_ilk`.
 - **CorrelaciÃ³n**: usar `routing.trace_id` (o un correlation_id en `meta.context`) para correlacionar request/response.
 
-**Helper normativo (io-common): `resolve_or_create()`**
+**Helper normativo (io-common): `resolve_or_create()
+
+> ⚠️ **DEPRECATED**: IO Nodes no deben bloquear ni esperar a `SY.identity`. El modo vigente es lookup-only best-effort por SHM. Si hay miss, forward con `src_ilk=null` y permitir onboarding por router/OPA.`**
 - Entrada: `{ channel, external_id, tenant_hint?, attributes? }`
 - Salida: `{ src_ilk, tenant_ilk?, created: bool }` o error clasificado.
 - SemÃ¡ntica:

@@ -95,3 +95,82 @@ SegÃºn la especificaciÃ³n del Router v1.16:
 
 `meta.context` **NO** debe usarse para almacenar historia, turns ni contexto conversacional.
 
+
+## Adaptación temporal (spec canónica vs core actual)
+
+✅ **Canónico (protocolo Fluxbee)**:
+- Mensajes `user` deben incluir identidad/contexto L3 (p.ej. `ich/ctx`, `ctx_seq`, y eventualmente `ctx_window`).
+
+⚠️ **Estado actual (core/SDK)**:
+- `ctx_window` no está garantizado en runtime hoy; `ctx_seq` puede no venir en algunos flujos.
+
+✅ **NORMATIVO (HOY)**:
+- IO Nodes **MUST** tolerar `ctx_window` faltante (no fallar), loggear advertencia y continuar.
+- IO Nodes **SHOULD** tolerar `ctx_seq` faltante (asumir `0` o equivalente para no abortar).
+
+🧩 **A ESPECIFICAR**:
+- Cuándo y cómo se vuelve obligatorio `ctx_window` (cuando el router/core lo implemente consistentemente).
+
+
+## Lifecycle & configuración (modelo unificado con AI Nodes)
+
+> ✅ **Intención**: no reinventar la rueda. IO Nodes adoptan el **mismo patrón operacional** que AI Nodes:
+> `SY.admin` recibe comandos → `SY.orchestrator` decide spawn/identity → el nodo arranca con config base y se ajusta por Control Plane (`CONFIG_SET/GET`, `STATUS/PING`).
+
+### 1) Spawn (alto nivel)
+
+✅ **NORMATIVO**:
+- El nodo IO se crea/spawnea por `SY.orchestrator` (invocado por `SY.admin`).
+- El nodo nace con `node_name` y con una **configuración base** mínima (depende del adapter: Slack/WhatsApp/Email).
+- Si la config base es incompleta o inválida, el nodo **debe arrancar igual** y quedar en estado de fallo de configuración (ver estados).
+
+🧩 **A ESPECIFICAR (cuando node-spawn quede totalmente normado para IO)**:
+- Detalle del mensaje `SPAWN_NODE` y payload exacto para IO Nodes (alinear con normas globales de Fluxbee).
+
+### 2) Estados
+
+✅ **NORMATIVO**: estados por instancia:
+- `UNCONFIGURED`: sin configuración efectiva aplicable.
+- `CONFIGURED`: configuración efectiva válida para operar.
+- `FAILED_CONFIG`: no puede operar data-plane, pero atiende Control Plane para recuperarse.
+
+✅ **NORMATIVO**:
+- En `FAILED_CONFIG`, el nodo **MUST** atender: `PING`, `STATUS`, `CONFIG_GET`, `CONFIG_SET`.
+
+### 3) Configuración en caliente (Control Plane)
+
+✅ **NORMATIVO**:
+- IO Nodes usan el mismo patrón de mensajes que AI Nodes:
+  - `CONFIG_SET` (replace/merge_patch) para aplicar cambios,
+  - `CONFIG_RESPONSE` como confirmación,
+  - `CONFIG_GET` para consultar estado/config_version,
+  - `STATUS`/`PING` para observabilidad mínima.
+
+✅ **NORMATIVO (replace MVP)**:
+- Para MVP, se prioriza `apply_mode="replace"` y se permite luego `merge_patch` (RFC 7396) como mejora.
+
+### 4) Reglas de configuración: común vs adapter-specific
+
+✅ **NORMATIVO**:
+- La capa común define:
+  - versionado (`schema_version`, `config_version`),
+  - persistencia de config efectiva,
+  - validación estructural,
+  - states y errores.
+- Cada adapter define su **config mínima requerida**:
+  - Slack Socket Mode: `SLACK_APP_TOKEN` y `SLACK_BOT_TOKEN` (y otros campos que el adapter declare).
+  - WhatsApp/Email: TBD según adapter.
+
+### 5) Secrets: HOY vs futuro
+
+✅ **NORMATIVO (HOY / MVP)**:
+- Se permite que credenciales (tokens, signing secrets, etc.) vivan en **config local** (YAML/env) y/o viajen **inline** en `CONFIG_SET` para permitir cambios sin reinicio.
+- El nodo **MUST NOT** persistir secretos en claro en `${STATE_DIR}`.
+
+⚠️ **ADVERTENCIA**:
+- Si el secreto llega inline por `CONFIG_SET`, el nodo puede retenerlo solo en memoria (y se pierde en restart), salvo que exista una fuente local (YAML/env).
+
+🧩 **A ESPECIFICAR (futuro)**:
+- `*_key_ref` (env/file/vault/kms) + gestor de secretos (orchestrator/admin o servicio dedicado) para rotación/persistencia segura.
+
+

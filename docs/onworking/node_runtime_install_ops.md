@@ -82,6 +82,28 @@ Important:
 - `api_key_env` in YAML must match variable name in `.env`.
 - If YAML uses default `api_key_env: OPENAI_API_KEY`, `.env` must define `OPENAI_API_KEY=...`.
 
+OpenAI key precedence in current MVP runner:
+1. `CONFIG_SET.payload.config.behavior.openai.api_key` (hot override in memory, not persisted as plaintext)
+2. YAML inline key (`behavior.openai.api_key` or `behavior.api_key` when configured)
+3. env var pointed by `behavior.api_key_env` (default `OPENAI_API_KEY`)
+
+### 2.2 Persistence model (UUID vs dynamic config)
+
+There are two different persistence concerns:
+
+- Node identity persistence (already existed):
+  - path from YAML: `node.uuid_persistence_dir` (default `/var/lib/fluxbee/state/nodes`)
+  - purpose: keep stable node UUID/identity across restarts.
+
+- AI dynamic config persistence (new control-plane path):
+  - path from YAML: `node.dynamic_config_dir` (default `/var/lib/fluxbee/state/ai-nodes`)
+  - file: `<dynamic_config_dir>/<node_name>.json`
+  - purpose: persist `CONFIG_SET` state (`schema_version`, `config_version`, redacted config snapshot, `updated_at`).
+
+Operational note:
+- YAML remains current startup source in this stage.
+- Dynamic config persistence is used for control-plane continuity and version tracking, and is prepared for later full `UNCONFIGURED -> CONFIG_SET` bootstrap flow.
+
 ## 3) IO runtime install
 
 Use:
