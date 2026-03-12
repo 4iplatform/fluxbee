@@ -635,6 +635,56 @@ async fn handle_http(
 ) -> Result<(), AdminError> {
     let (method, path, headers, body) = read_http_request(stream).await?;
     let (path, query) = split_path_query(&path);
+    if method == "GET" {
+        if path == "/inventory" {
+            let mut payload = serde_json::json!({ "scope": "global" });
+            if let Some(kind) = query
+                .get("type")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                payload["filter_type"] = serde_json::Value::String(kind.to_ascii_uppercase());
+            }
+            if let Some(hive_id) = query
+                .get("hive")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                payload["scope"] = serde_json::Value::String("hive".to_string());
+                payload["filter_hive"] = serde_json::Value::String(hive_id.to_string());
+            }
+            let (status, resp) = handle_inventory_http(ctx, client, payload).await?;
+            respond_json(stream, status, &resp).await?;
+            return Ok(());
+        }
+        if path == "/inventory/summary" {
+            let payload = serde_json::json!({ "scope": "summary" });
+            let (status, resp) = handle_inventory_http(ctx, client, payload).await?;
+            respond_json(stream, status, &resp).await?;
+            return Ok(());
+        }
+        if let Some(hive_id) = path
+            .strip_prefix("/inventory/")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .filter(|value| *value != "summary")
+        {
+            let mut payload = serde_json::json!({
+                "scope": "hive",
+                "filter_hive": decode_percent(hive_id),
+            });
+            if let Some(kind) = query
+                .get("type")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                payload["filter_type"] = serde_json::Value::String(kind.to_ascii_uppercase());
+            }
+            let (status, resp) = handle_inventory_http(ctx, client, payload).await?;
+            respond_json(stream, status, &resp).await?;
+            return Ok(());
+        }
+    }
     if let Some((status, resp)) =
         handle_hive_paths(method.as_str(), path, &query, &body, ctx, client).await?
     {
@@ -943,6 +993,25 @@ async fn handle_http(
         }
     }
     Ok(())
+}
+
+async fn handle_inventory_http(
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+    payload: serde_json::Value,
+) -> Result<(u16, String), AdminError> {
+    let target = format!("SY.orchestrator@{}", ctx.hive_id);
+    let timeout_secs = env_timeout_secs("JSR_ADMIN_INVENTORY_TIMEOUT_SECS").unwrap_or(10);
+    let response = send_system_request(
+        client,
+        &target,
+        "INVENTORY_REQUEST",
+        "INVENTORY_RESPONSE",
+        payload,
+        Duration::from_secs(timeout_secs),
+    )
+    .await;
+    Ok(build_admin_http_response("inventory", response))
 }
 
 async fn handle_hive_paths(

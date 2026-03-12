@@ -1,5 +1,5 @@
 use fluxbee_sdk::{connect, NodeReceiver, NodeSender};
-use gov_common::{build_node_config, env_or, env_opt};
+use gov_common::{build_node_config, env_opt, env_or};
 use serde_json::Value;
 use tokio::time::{timeout, Duration};
 use tracing_subscriber::EnvFilter;

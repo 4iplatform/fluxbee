@@ -11,6 +11,7 @@ Documentos operativos activos organizados por proceso/componente:
 - `docs/onworking/blob_tasks.md`
 - `docs/onworking/sdk_tasks.md`
 - `docs/onworking/blob_node_examples.md`
+- `docs/onworking/orchestrator_frictions.md`
 
 Convención aplicada:
 - nodos/procesos: archivo por proceso con patrón `<proceso>_tasks.md` (ej. `sy_admin_tasks.md`, `ai_<name>_tasks.md`).
@@ -25,6 +26,7 @@ Documentos transversales (no de un solo proceso):
 - `docs/onworking/blob_tasks.md`
 - `docs/onworking/sdk_tasks.md`
 - `docs/onworking/blob_node_examples.md`
+- `docs/onworking/orchestrator_frictions.md`
 
 Nota:
 - `docs/onworking/sy_orchestrator_tasks.md` y `docs/onworking/CHANGELOG-v1.15-to-v1.16.md` se mantienen como históricos.
