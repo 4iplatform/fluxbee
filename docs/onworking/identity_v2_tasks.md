@@ -219,7 +219,10 @@ Salida:
   - [x] actor no autorizado (`UNAUTHORIZED_REGISTRAR`)
   - [x] IDs mal formados (`INVALID_REQUEST`)
   - [x] tenant inexistente (`INVALID_TENANT`)
-  - [ ] duplicados (`DUPLICATE_EMAIL`, `DUPLICATE_NODE_NAME`, ICH unique)
+  - [x] duplicado de email (`DUPLICATE_EMAIL`)
+  - [x] duplicado de ICH por unique (`DUPLICATE_ICH`)
+  - [x] colisión de `node_name` cubierta por canonicalización/idempotencia (G4), no se espera error de duplicado en flujo normal
+  - [ ] ejecutar corrida final de cierre con casos de duplicado
 
 Salida:
 - gate de aceptación identity v2 completo.

@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time;
-use tokio_postgres::NoTls;
+use tokio_postgres::{error::SqlState, NoTls};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -914,12 +914,9 @@ impl IdentityRuntime {
                                                     if let Some(snapshot) = snapshot {
                                                         self.store = snapshot;
                                                     }
-                                                    error_payload(
-                                                        "DB_WRITE_FAILED",
-                                                        &format!(
-                                                            "failed to persist provisioned ilk: {}",
-                                                            err
-                                                        ),
+                                                    db_write_error_payload(
+                                                        "failed to persist provisioned ilk",
+                                                        err.as_ref(),
                                                     )
                                                 } else {
                                                     deltas.push(delta_envelope(
@@ -976,12 +973,9 @@ impl IdentityRuntime {
                                                     if let Some(snapshot) = snapshot {
                                                         self.store = snapshot;
                                                     }
-                                                    error_payload(
-                                                        "DB_WRITE_FAILED",
-                                                        &format!(
-                                                            "failed to persist registered ilk: {}",
-                                                            err
-                                                        ),
+                                                    db_write_error_payload(
+                                                        "failed to persist registered ilk",
+                                                        err.as_ref(),
                                                     )
                                                 } else {
                                                     deltas.push(delta_envelope(
@@ -1051,12 +1045,9 @@ impl IdentityRuntime {
                                                     if let Some(snapshot) = snapshot {
                                                         self.store = snapshot;
                                                     }
-                                                    error_payload(
-                                                        "DB_WRITE_FAILED",
-                                                        &format!(
-                                                            "failed to persist channel/merge update: {}",
-                                                            err
-                                                        ),
+                                                    db_write_error_payload(
+                                                        "failed to persist channel/merge update",
+                                                        err.as_ref(),
                                                     )
                                                 } else {
                                                     deltas.push(delta_envelope(
@@ -1125,12 +1116,9 @@ impl IdentityRuntime {
                                                 if let Some(snapshot) = snapshot {
                                                     self.store = snapshot;
                                                 }
-                                                error_payload(
-                                                    "DB_WRITE_FAILED",
-                                                    &format!(
-                                                        "failed to persist ilk update: {}",
-                                                        err
-                                                    ),
+                                                db_write_error_payload(
+                                                    "failed to persist ilk update",
+                                                    err.as_ref(),
                                                 )
                                             } else {
                                                 deltas.push(delta_envelope(
@@ -1177,9 +1165,9 @@ impl IdentityRuntime {
                                             upsert_tenant_in_db(database_url, &tenant).await
                                         {
                                             self.store.tenants.remove(&tenant_id);
-                                            error_payload(
-                                                "DB_WRITE_FAILED",
-                                                &format!("failed to persist tenant: {}", err),
+                                            db_write_error_payload(
+                                                "failed to persist tenant",
+                                                err.as_ref(),
                                             )
                                         } else {
                                             deltas.push(delta_envelope(
@@ -1232,12 +1220,9 @@ impl IdentityRuntime {
                                                     if let Some(snapshot) = snapshot {
                                                         self.store = snapshot;
                                                     }
-                                                    error_payload(
-                                                        "DB_WRITE_FAILED",
-                                                        &format!(
-                                                            "failed to persist tenant approval: {}",
-                                                            err
-                                                        ),
+                                                    db_write_error_payload(
+                                                        "failed to persist tenant approval",
+                                                        err.as_ref(),
                                                     )
                                                 } else {
                                                     deltas.push(delta_envelope(
@@ -2441,6 +2426,57 @@ fn error_payload(error_code: &str, message: &str) -> Value {
         "error_code": error_code,
         "message": message,
     })
+}
+
+fn db_write_error_payload(context: &str, err: &(dyn std::error::Error + 'static)) -> Value {
+    let code = map_db_write_error_code(err);
+    error_payload(code, &format!("{}: {}", context, err))
+}
+
+fn map_db_write_error_code(err: &(dyn std::error::Error + 'static)) -> &'static str {
+    if let Some(pg_err) = err.downcast_ref::<tokio_postgres::Error>() {
+        if let Some(db_err) = pg_err.as_db_error() {
+            if db_err.code() == &SqlState::UNIQUE_VIOLATION {
+                if let Some(constraint) = db_err.constraint() {
+                    return map_unique_constraint_code(constraint);
+                }
+                return "DUPLICATE_CONSTRAINT";
+            }
+        }
+    }
+    let message = err.to_string().to_ascii_lowercase();
+    if message.contains("duplicate key value violates unique constraint")
+        || message.contains("violates unique constraint")
+    {
+        if message.contains("idx_identity_ilks_email")
+            || message.contains("identity_ilks_email")
+            || message.contains("email")
+        {
+            return "DUPLICATE_EMAIL";
+        }
+        if message.contains("idx_identity_ilks_node_name")
+            || message.contains("identity_ilks_node_name")
+            || message.contains("node_name")
+        {
+            return "DUPLICATE_NODE_NAME";
+        }
+        if message.contains("identity_ichs_channel_type_address_tenant_id_key")
+            || message.contains("identity_ichs")
+        {
+            return "DUPLICATE_ICH";
+        }
+        return "DUPLICATE_CONSTRAINT";
+    }
+    "DB_WRITE_FAILED"
+}
+
+fn map_unique_constraint_code(constraint: &str) -> &'static str {
+    match constraint {
+        "idx_identity_ilks_email" => "DUPLICATE_EMAIL",
+        "idx_identity_ilks_node_name" => "DUPLICATE_NODE_NAME",
+        "identity_ichs_channel_type_address_tenant_id_key" => "DUPLICATE_ICH",
+        _ => "DUPLICATE_CONSTRAINT",
+    }
 }
 
 fn canonical_ich_key(channel_type: &str, address: &str) -> (String, String) {

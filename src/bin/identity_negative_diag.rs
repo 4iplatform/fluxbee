@@ -2,7 +2,8 @@ use std::error::Error;
 use std::path::PathBuf;
 
 use fluxbee_sdk::identity::{
-    identity_system_call, load_hive_id, IdentitySystemRequest, MSG_ILK_PROVISION, MSG_ILK_REGISTER,
+    identity_system_call, load_hive_id, IdentitySystemRequest, MSG_ILK_ADD_CHANNEL,
+    MSG_ILK_PROVISION, MSG_ILK_REGISTER, MSG_TNT_CREATE,
 };
 use fluxbee_sdk::{connect, NodeConfig};
 use serde_json::{json, Value};
@@ -110,7 +111,144 @@ async fn main() -> Result<(), DynError> {
     )
     .await?;
 
-    // Case 4 (optional): explicit NOT_PRIMARY against replica target.
+    // Case 4: duplicate email inside same tenant => DUPLICATE_EMAIL.
+    let tnt_create_payload = json!({
+        "name": format!("identity-negative-{}", test_id),
+        "status": "active",
+    });
+    let tnt_create = run_case_expect_ok(
+        &frontdesk_name,
+        &target,
+        fallback_target.as_deref(),
+        MSG_TNT_CREATE,
+        tnt_create_payload,
+        timeout,
+    )
+    .await?;
+    let tenant_id = tnt_create
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .ok_or("missing tenant_id in TNT_CREATE response")?
+        .to_string();
+
+    let duplicate_email = format!("duplicate-email-{}@diag.local", test_id);
+    let first_human_register = json!({
+        "ilk_id": format!("ilk:{}", Uuid::new_v4()),
+        "ilk_type": "human",
+        "tenant_id": tenant_id.clone(),
+        "identification": {
+            "display_name": "dup-email-first",
+            "email": duplicate_email,
+        },
+        "roles": [],
+        "capabilities": [],
+    });
+    let first_human = run_case_expect_ok(
+        &frontdesk_name,
+        &target,
+        fallback_target.as_deref(),
+        MSG_ILK_REGISTER,
+        first_human_register,
+        timeout,
+    )
+    .await?;
+    let first_human_ilk = first_human
+        .get("ilk_id")
+        .and_then(Value::as_str)
+        .ok_or("missing ilk_id in first human register response")?
+        .to_string();
+
+    let second_human_register = json!({
+        "ilk_id": format!("ilk:{}", Uuid::new_v4()),
+        "ilk_type": "human",
+        "tenant_id": tenant_id.clone(),
+        "identification": {
+            "display_name": "dup-email-second",
+            "email": duplicate_email,
+        },
+        "roles": [],
+        "capabilities": [],
+    });
+    let duplicate_email_code = run_case_expect_error(
+        &frontdesk_name,
+        &target,
+        fallback_target.as_deref(),
+        MSG_ILK_REGISTER,
+        second_human_register,
+        timeout,
+        "DUPLICATE_EMAIL",
+    )
+    .await?;
+
+    // Case 5: duplicate ICH (channel_type + address + tenant_id) => DUPLICATE_ICH.
+    let second_unique_human_register = json!({
+        "ilk_id": format!("ilk:{}", Uuid::new_v4()),
+        "ilk_type": "human",
+        "tenant_id": tenant_id.clone(),
+        "identification": {
+            "display_name": "dup-ich-second-human",
+            "email": format!("dup-ich-second-{}@diag.local", test_id),
+        },
+        "roles": [],
+        "capabilities": [],
+    });
+    let second_human = run_case_expect_ok(
+        &frontdesk_name,
+        &target,
+        fallback_target.as_deref(),
+        MSG_ILK_REGISTER,
+        second_unique_human_register,
+        timeout,
+    )
+    .await?;
+    let second_human_ilk = second_human
+        .get("ilk_id")
+        .and_then(Value::as_str)
+        .ok_or("missing ilk_id in second human register response")?
+        .to_string();
+
+    let dup_ich_type = "identity.negative.ich";
+    let dup_ich_address = format!("identity.negative.ich.{}", test_id);
+    let first_add_channel = json!({
+        "ilk_id": first_human_ilk,
+        "channel": {
+            "ich_id": format!("ich:{}", Uuid::new_v4()),
+            "type": dup_ich_type,
+            "address": dup_ich_address.clone(),
+        },
+        "change_reason": "identity negative duplicate ich baseline",
+    });
+    let _ = run_case_expect_ok(
+        &frontdesk_name,
+        &target,
+        fallback_target.as_deref(),
+        MSG_ILK_ADD_CHANNEL,
+        first_add_channel,
+        timeout,
+    )
+    .await?;
+
+    let second_add_channel = json!({
+        "ilk_id": second_human_ilk,
+        "channel": {
+            "ich_id": format!("ich:{}", Uuid::new_v4()),
+            "type": dup_ich_type,
+            "address": dup_ich_address.clone(),
+        },
+        "change_reason": "identity negative duplicate ich conflict",
+    });
+    let duplicate_ich_code = run_case_expect_error(
+        &frontdesk_name,
+        &target,
+        fallback_target.as_deref(),
+        MSG_ILK_ADD_CHANNEL,
+        second_add_channel,
+        timeout,
+        "DUPLICATE_ICH",
+    )
+    .await?;
+
+    // Case 6 (optional): explicit NOT_PRIMARY against replica target.
     let not_primary_code = if let Some(replica_target) = env_opt("IDENTITY_NEGATIVE_REPLICA_TARGET")
     {
         let io_name = env_or(
@@ -146,8 +284,54 @@ async fn main() -> Result<(), DynError> {
     println!("UNAUTHORIZED_CODE={}", unauthorized_code);
     println!("INVALID_REQUEST_CODE={}", invalid_request_code);
     println!("INVALID_TENANT_CODE={}", invalid_tenant_code);
+    println!("DUPLICATE_EMAIL_CODE={}", duplicate_email_code);
+    println!("DUPLICATE_ICH_CODE={}", duplicate_ich_code);
     println!("NOT_PRIMARY_CODE={}", not_primary_code);
     Ok(())
+}
+
+async fn run_case_expect_ok(
+    node_name: &str,
+    target: &str,
+    fallback_target: Option<&str>,
+    action: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<Value, DynError> {
+    let cfg = NodeConfig {
+        name: node_name.to_string(),
+        router_socket: json_router::paths::router_socket_dir(),
+        uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
+        config_dir: json_router::paths::config_dir(),
+        version: "0.0.1".to_string(),
+    };
+    let (sender, mut receiver) = connect(&cfg).await?;
+    let out = identity_system_call(
+        &sender,
+        &mut receiver,
+        IdentitySystemRequest {
+            target,
+            fallback_target,
+            action,
+            payload,
+            timeout,
+        },
+    )
+    .await?;
+    let _ = sender.close().await;
+    let status = out
+        .payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if status != "ok" {
+        return Err(format!(
+            "unexpected non-ok response for {} from {} (effective={}): payload={}",
+            action, target, out.effective_target, out.payload
+        )
+        .into());
+    }
+    Ok(out.payload)
 }
 
 async fn run_case_expect_error(
