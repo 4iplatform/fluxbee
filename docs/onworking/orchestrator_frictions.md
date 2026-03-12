@@ -257,7 +257,7 @@ Criterio de aceptación C:
 
 ### Fase D — E2E y regresión FR-01/FR-03
 
-- [ ] INV-D1. E2E: spawn/kill se refleja en inventario.
+- [x] INV-D1. E2E: spawn/kill se refleja en inventario. (`scripts/inventory_spawn_kill_e2e.sh`)
 - [ ] INV-D2. E2E: add_hive/remove_hive se refleja en inventario.
 - [ ] INV-D3. E2E: hive stale aparece como stale.
 - [ ] INV-D4. E2E: worker con `identity.sync.upstream` enruta writes a primary sin fallback local.

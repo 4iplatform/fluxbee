@@ -397,7 +397,7 @@ Implementation status (2026-03-12):
 
 ### Phase D — Validation
 
-- [ ] D1. E2E: inventory reflects node spawn/kill in real time.
+- [x] D1. E2E: inventory reflects node spawn/kill in real time. (`scripts/inventory_spawn_kill_e2e.sh`)
 - [ ] D2. E2E: inventory reflects add_hive/remove_hive.
 - [ ] D3. E2E: stale hive appears as stale in inventory.
 - [ ] D4. E2E: worker identity sync connection establishes correctly (primary resolved by convention).
