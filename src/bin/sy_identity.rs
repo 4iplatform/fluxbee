@@ -304,6 +304,29 @@ struct IdentityDeltaEnvelope {
 }
 
 impl IdentityStore {
+    fn find_active_ilk_by_identification_key(&self, key: &str, expected: &str) -> Option<String> {
+        let expected = expected.trim();
+        if expected.is_empty() {
+            return None;
+        }
+        self.ilks.iter().find_map(|(ilk_id, ilk)| {
+            if ilk.deleted_at_ms.is_some() {
+                return None;
+            }
+            let value = ilk
+                .identification
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if value == Some(expected) {
+                Some(ilk_id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     fn with_default_tenant(name: &str) -> Self {
         let mut out = Self::default();
         let tenant_id = format!("tnt:{}", Uuid::new_v4());
@@ -389,7 +412,20 @@ impl IdentityStore {
         let roles = dedup_lowercase_tags(req.roles)?;
         let capabilities = dedup_lowercase_tags(req.capabilities)?;
 
-        match self.ilks.get_mut(&req.ilk_id) {
+        let requested_ilk_id = req.ilk_id.clone();
+        let node_name = req
+            .identification
+            .get("node_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        let canonical_ilk_id = node_name
+            .as_deref()
+            .and_then(|name| self.find_active_ilk_by_identification_key("node_name", name))
+            .unwrap_or_else(|| requested_ilk_id.clone());
+
+        match self.ilks.get_mut(&canonical_ilk_id) {
             Some(existing) => {
                 if existing.deleted_at_ms.is_some() {
                     return Err("ILK_NOT_FOUND".to_string());
@@ -407,9 +443,9 @@ impl IdentityStore {
             }
             None => {
                 self.ilks.insert(
-                    req.ilk_id.clone(),
+                    canonical_ilk_id.clone(),
                     IlkRecord {
-                        ilk_id: req.ilk_id.clone(),
+                        ilk_id: canonical_ilk_id.clone(),
                         ilk_type: req.ilk_type,
                         registration_status: "complete".to_string(),
                         tenant_id: req.tenant_id,
@@ -425,7 +461,7 @@ impl IdentityStore {
 
         Ok(json!({
             "status": "ok",
-            "ilk_id": req.ilk_id,
+            "ilk_id": canonical_ilk_id,
         }))
     }
 
@@ -868,9 +904,12 @@ impl IdentityRuntime {
                                     if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
                                         if self.is_primary {
                                             if let Some(database_url) = self.db_url.as_deref() {
-                                                if let Err(err) =
-                                                    persist_ilk_state_in_db(database_url, &ilk, None)
-                                                        .await
+                                                if let Err(err) = persist_ilk_state_in_db(
+                                                    database_url,
+                                                    &ilk,
+                                                    None,
+                                                )
+                                                .await
                                                 {
                                                     if let Some(snapshot) = snapshot {
                                                         self.store = snapshot;
@@ -889,9 +928,9 @@ impl IdentityRuntime {
                                                     ok
                                                 }
                                             } else {
-                                                deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
-                                                    ilk,
-                                                }));
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::IlkUpsert { ilk },
+                                                ));
                                                 ok
                                             }
                                         } else {
@@ -927,9 +966,12 @@ impl IdentityRuntime {
                                     if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
                                         if self.is_primary {
                                             if let Some(database_url) = self.db_url.as_deref() {
-                                                if let Err(err) =
-                                                    persist_ilk_state_in_db(database_url, &ilk, None)
-                                                        .await
+                                                if let Err(err) = persist_ilk_state_in_db(
+                                                    database_url,
+                                                    &ilk,
+                                                    None,
+                                                )
+                                                .await
                                                 {
                                                     if let Some(snapshot) = snapshot {
                                                         self.store = snapshot;
@@ -948,9 +990,9 @@ impl IdentityRuntime {
                                                     ok
                                                 }
                                             } else {
-                                                deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
-                                                    ilk,
-                                                }));
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::IlkUpsert { ilk },
+                                                ));
                                                 ok
                                             }
                                         } else {
@@ -985,13 +1027,16 @@ impl IdentityRuntime {
                             .add_channel(req.clone(), self.merge_alias_ttl_secs)
                         {
                             Ok(ok) => {
-                                let alias_delta = req.merge_from_ilk_id.as_ref().and_then(|old_ilk_id| {
-                                    self.store.aliases.get(old_ilk_id).map(|alias| AliasSnapshotRecord {
-                                        old_ilk_id: old_ilk_id.clone(),
-                                        canonical_ilk_id: alias.canonical_ilk_id.clone(),
-                                        expires_at_ms: alias.expires_at_ms,
-                                    })
-                                });
+                                let alias_delta =
+                                    req.merge_from_ilk_id.as_ref().and_then(|old_ilk_id| {
+                                        self.store.aliases.get(old_ilk_id).map(|alias| {
+                                            AliasSnapshotRecord {
+                                                old_ilk_id: old_ilk_id.clone(),
+                                                canonical_ilk_id: alias.canonical_ilk_id.clone(),
+                                                expires_at_ms: alias.expires_at_ms,
+                                            }
+                                        })
+                                    });
                                 if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
                                     if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
                                         if self.is_primary {
@@ -1025,9 +1070,9 @@ impl IdentityRuntime {
                                                     ok
                                                 }
                                             } else {
-                                                deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
-                                                    ilk,
-                                                }));
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::IlkUpsert { ilk },
+                                                ));
                                                 if let Some(alias) = alias_delta {
                                                     deltas.push(delta_envelope(
                                                         IdentityDelta::AliasUpsert { alias },
@@ -1082,7 +1127,10 @@ impl IdentityRuntime {
                                                 }
                                                 error_payload(
                                                     "DB_WRITE_FAILED",
-                                                    &format!("failed to persist ilk update: {}", err),
+                                                    &format!(
+                                                        "failed to persist ilk update: {}",
+                                                        err
+                                                    ),
                                                 )
                                             } else {
                                                 deltas.push(delta_envelope(
@@ -1097,9 +1145,8 @@ impl IdentityRuntime {
                                             ok
                                         }
                                     } else {
-                                        deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
-                                            ilk,
-                                        }));
+                                        deltas
+                                            .push(delta_envelope(IdentityDelta::IlkUpsert { ilk }));
                                         ok
                                     }
                                 } else {
@@ -1118,17 +1165,26 @@ impl IdentityRuntime {
             {
                 Ok(req) => match self.store.create_tenant(req) {
                     Ok(ok) => {
-                        if let Some(tenant_id) = ok.get("tenant_id").and_then(Value::as_str).map(str::to_string) {
+                        if let Some(tenant_id) = ok
+                            .get("tenant_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                        {
                             if let Some(tenant) = self.store.tenants.get(&tenant_id).cloned() {
                                 if self.is_primary {
                                     if let Some(database_url) = self.db_url.as_deref() {
-                                        if let Err(err) = upsert_tenant_in_db(database_url, &tenant).await {
+                                        if let Err(err) =
+                                            upsert_tenant_in_db(database_url, &tenant).await
+                                        {
                                             self.store.tenants.remove(&tenant_id);
-                                            error_payload("DB_WRITE_FAILED", &format!("failed to persist tenant: {}", err))
+                                            error_payload(
+                                                "DB_WRITE_FAILED",
+                                                &format!("failed to persist tenant: {}", err),
+                                            )
                                         } else {
-                                            deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
-                                                tenant,
-                                            }));
+                                            deltas.push(delta_envelope(
+                                                IdentityDelta::TenantUpsert { tenant },
+                                            ));
                                             ok
                                         }
                                     } else {
@@ -1163,43 +1219,53 @@ impl IdentityRuntime {
                             None
                         };
                         match self.store.approve_tenant(req) {
-                        Ok(ok) => {
-                            if let Some(tenant_id) = ok.get("tenant_id").and_then(Value::as_str) {
-                                if let Some(tenant) = self.store.tenants.get(tenant_id).cloned() {
-                                    if self.is_primary {
-                                        if let Some(database_url) = self.db_url.as_deref() {
-                                            if let Err(err) = upsert_tenant_in_db(database_url, &tenant).await {
-                                                if let Some(snapshot) = snapshot {
-                                                    self.store = snapshot;
+                            Ok(ok) => {
+                                if let Some(tenant_id) = ok.get("tenant_id").and_then(Value::as_str)
+                                {
+                                    if let Some(tenant) = self.store.tenants.get(tenant_id).cloned()
+                                    {
+                                        if self.is_primary {
+                                            if let Some(database_url) = self.db_url.as_deref() {
+                                                if let Err(err) =
+                                                    upsert_tenant_in_db(database_url, &tenant).await
+                                                {
+                                                    if let Some(snapshot) = snapshot {
+                                                        self.store = snapshot;
+                                                    }
+                                                    error_payload(
+                                                        "DB_WRITE_FAILED",
+                                                        &format!(
+                                                            "failed to persist tenant approval: {}",
+                                                            err
+                                                        ),
+                                                    )
+                                                } else {
+                                                    deltas.push(delta_envelope(
+                                                        IdentityDelta::TenantUpsert { tenant },
+                                                    ));
+                                                    ok
                                                 }
-                                                error_payload("DB_WRITE_FAILED", &format!("failed to persist tenant approval: {}", err))
                                             } else {
-                                                deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
-                                                    tenant,
-                                                }));
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::TenantUpsert { tenant },
+                                                ));
                                                 ok
                                             }
                                         } else {
-                                            deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
-                                                tenant,
-                                            }));
+                                            deltas.push(delta_envelope(
+                                                IdentityDelta::TenantUpsert { tenant },
+                                            ));
                                             ok
                                         }
                                     } else {
-                                        deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
-                                            tenant,
-                                        }));
                                         ok
                                     }
                                 } else {
                                     ok
                                 }
-                            } else {
-                                ok
                             }
+                            Err(code) => error_payload(&code, "failed to approve tenant"),
                         }
-                        Err(code) => error_payload(&code, "failed to approve tenant"),
-                    }
                     }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
@@ -1392,8 +1458,12 @@ async fn main() -> Result<(), IdentityError> {
             match load_identity_store_from_db(&database_url).await {
                 Ok(store) if store.tenants.is_empty() => {
                     if let Some(default_tenant_id) = runtime.store.default_tenant_id() {
-                        if let Some(default_tenant) = runtime.store.tenants.get(&default_tenant_id).cloned() {
-                            if let Err(err) = upsert_tenant_in_db(&database_url, &default_tenant).await {
+                        if let Some(default_tenant) =
+                            runtime.store.tenants.get(&default_tenant_id).cloned()
+                        {
+                            if let Err(err) =
+                                upsert_tenant_in_db(&database_url, &default_tenant).await
+                            {
                                 tracing::warn!(error = %err, "failed to persist default tenant in primary db bootstrap");
                             } else {
                                 tracing::info!(tenant_id = %default_tenant.tenant_id, "persisted default tenant in primary db bootstrap");
@@ -2676,7 +2746,9 @@ async fn persist_ilk_state_in_db(
     let node_name = optional_identification_string(&ilk.identification, "node_name", 128)?;
     let association = association_json_from_ilk(ilk);
     let definition = definition_json_from_ilk(ilk);
-    let deleted_at_ms = ilk.deleted_at_ms.and_then(|value| i64::try_from(value).ok());
+    let deleted_at_ms = ilk
+        .deleted_at_ms
+        .and_then(|value| i64::try_from(value).ok());
     let registered_by: Option<String> = None;
 
     let (mut client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
@@ -2919,7 +2991,11 @@ ORDER BY added_at ASC
             address: row.get("address"),
         };
         if let Some(ilk) = store.ilks.get_mut(&ilk_id) {
-            if !ilk.channels.iter().any(|existing| existing.ich_id == channel.ich_id) {
+            if !ilk
+                .channels
+                .iter()
+                .any(|existing| existing.ich_id == channel.ich_id)
+            {
                 ilk.channels.push(channel.clone());
             }
             if ilk.deleted_at_ms.is_none() {
@@ -2957,7 +3033,10 @@ FROM identity_ilk_aliases
     Ok(store)
 }
 
-async fn upsert_tenant_in_db(database_url: &str, tenant: &TenantRecord) -> Result<(), IdentityError> {
+async fn upsert_tenant_in_db(
+    database_url: &str,
+    tenant: &TenantRecord,
+) -> Result<(), IdentityError> {
     let tenant_uuid = parse_prefixed_uuid(&tenant.tenant_id, "tnt")?;
     let tenant_uuid = tenant_uuid.to_string();
     let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;

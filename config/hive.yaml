@@ -1,6 +1,9 @@
 hive_id: "sandbox"
 role: motherbee
 
+government:
+  identity_frontdesk: "AI.frontdesk@sandbox"
+
 # WAN (gateway). Optional: remove block if no inter-hive connectivity.
 wan:
   listen: "0.0.0.0:9000"

@@ -11,7 +11,7 @@ use nix::fcntl::OFlag;
 use nix::sys::mman::shm_open;
 use nix::sys::stat::fstat;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::time::{Duration, Instant as TokioInstant};
 use uuid::Uuid;
 
@@ -22,6 +22,12 @@ use crate::{NodeError, NodeReceiver, NodeSender};
 
 pub const MSG_ILK_PROVISION: &str = "ILK_PROVISION";
 pub const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
+pub const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
+pub const MSG_ILK_ADD_CHANNEL: &str = "ILK_ADD_CHANNEL";
+pub const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
+pub const MSG_TNT_CREATE: &str = "TNT_CREATE";
+pub const MSG_TNT_APPROVE: &str = "TNT_APPROVE";
+pub const MSG_IDENTITY_METRICS: &str = "IDENTITY_METRICS";
 const IDENTITY_MAGIC: u32 = 0x4A534944; // "JSID"
 const IDENTITY_VERSION: u32 = 2;
 const REGION_ALIGNMENT: usize = 64;
@@ -47,6 +53,22 @@ pub struct IlkProvisionResult {
     pub trace_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct IdentitySystemRequest<'a> {
+    pub target: &'a str,
+    pub fallback_target: Option<&'a str>,
+    pub action: &'a str,
+    pub payload: Value,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct IdentitySystemResult {
+    pub payload: Value,
+    pub effective_target: String,
+    pub trace_id: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
     #[error("node error: {0}")]
@@ -69,8 +91,23 @@ pub enum IdentityError {
     },
     #[error("ILK_PROVISION rejected: error_code={error_code}, message={message}")]
     ProvisionRejected { error_code: String, message: String },
+    #[error(
+        "identity action rejected: action={action}, error_code={error_code}, message={message}"
+    )]
+    SystemRejected {
+        action: String,
+        error_code: String,
+        message: String,
+    },
     #[error("timeout waiting ILK_PROVISION_RESPONSE trace_id={trace_id} target={target} timeout_ms={timeout_ms}")]
     Timeout {
+        trace_id: String,
+        target: String,
+        timeout_ms: u64,
+    },
+    #[error("timeout waiting identity response: action={action} trace_id={trace_id} target={target} timeout_ms={timeout_ms}")]
+    ActionTimeout {
+        action: String,
         trace_id: String,
         target: String,
         timeout_ms: u64,
@@ -276,6 +313,135 @@ struct VocabularyEntry {
     _reserved: [u8; 8],
 }
 
+/// Sends any identity action to `SY.identity@<hive>` and waits for
+/// `<ACTION>_RESPONSE` with matching `trace_id`.
+///
+/// If `fallback_target` is set, it retries on:
+/// - transport `UNREACHABLE` with reason `NODE_NOT_FOUND`
+/// - payload `status=error` and `error_code=NOT_PRIMARY`
+pub async fn identity_system_call(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    request: IdentitySystemRequest<'_>,
+) -> Result<IdentitySystemResult, IdentityError> {
+    let target = request.target.trim();
+    let action = request.action.trim();
+    if target.is_empty() {
+        return Err(IdentityError::InvalidRequest(
+            "target must be non-empty".to_string(),
+        ));
+    }
+    if action.is_empty() {
+        return Err(IdentityError::InvalidRequest(
+            "action must be non-empty".to_string(),
+        ));
+    }
+    let timeout = default_timeout(request.timeout);
+    let first = send_action_once(
+        sender,
+        receiver,
+        target,
+        action,
+        request.payload.clone(),
+        timeout,
+    )
+    .await;
+    match first {
+        Ok((payload, trace_id)) => {
+            let Some(fallback_target) = request.fallback_target.map(str::trim) else {
+                return Ok(IdentitySystemResult {
+                    payload,
+                    effective_target: target.to_string(),
+                    trace_id,
+                });
+            };
+            if fallback_target.is_empty() || fallback_target == target {
+                return Ok(IdentitySystemResult {
+                    payload,
+                    effective_target: target.to_string(),
+                    trace_id,
+                });
+            }
+            let (status, error_code) = payload_status_and_code(&payload);
+            if status == Some("error") && error_code == Some("NOT_PRIMARY") {
+                let (fallback_payload, fallback_trace_id) = send_action_once(
+                    sender,
+                    receiver,
+                    fallback_target,
+                    action,
+                    request.payload,
+                    timeout,
+                )
+                .await?;
+                return Ok(IdentitySystemResult {
+                    payload: fallback_payload,
+                    effective_target: fallback_target.to_string(),
+                    trace_id: fallback_trace_id,
+                });
+            }
+            Ok(IdentitySystemResult {
+                payload,
+                effective_target: target.to_string(),
+                trace_id,
+            })
+        }
+        Err(IdentityError::Unreachable {
+            reason,
+            original_dst,
+        }) => {
+            let Some(fallback_target) = request.fallback_target.map(str::trim) else {
+                return Err(IdentityError::Unreachable {
+                    reason,
+                    original_dst,
+                });
+            };
+            if fallback_target.is_empty() || fallback_target == target || reason != "NODE_NOT_FOUND"
+            {
+                return Err(IdentityError::Unreachable {
+                    reason,
+                    original_dst,
+                });
+            }
+            let (fallback_payload, fallback_trace_id) = send_action_once(
+                sender,
+                receiver,
+                fallback_target,
+                action,
+                request.payload,
+                timeout,
+            )
+            .await?;
+            Ok(IdentitySystemResult {
+                payload: fallback_payload,
+                effective_target: fallback_target.to_string(),
+                trace_id: fallback_trace_id,
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Like [`identity_system_call`], but enforces payload `status="ok"`.
+pub async fn identity_system_call_ok(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    request: IdentitySystemRequest<'_>,
+) -> Result<IdentitySystemResult, IdentityError> {
+    let action = request.action.to_string();
+    let out = identity_system_call(sender, receiver, request).await?;
+    let (status, error_code) = payload_status_and_code(&out.payload);
+    if status == Some("ok") {
+        return Ok(out);
+    }
+    Err(IdentityError::SystemRejected {
+        action,
+        error_code: error_code.unwrap_or("UNKNOWN").to_string(),
+        message: payload_message(&out.payload)
+            .unwrap_or("identity returned non-ok status")
+            .to_string(),
+    })
+}
+
 /// Sends `ILK_PROVISION` to `SY.identity@<hive>` and waits for
 /// `ILK_PROVISION_RESPONSE` with matching `trace_id`.
 pub async fn provision_ilk(
@@ -287,22 +453,65 @@ pub async fn provision_ilk(
     let ich_id = request.ich_id.trim();
     let channel_type = request.channel_type.trim();
     let address = request.address.trim();
-    if target.is_empty() {
-        return Err(IdentityError::InvalidRequest(
-            "target must be non-empty".to_string(),
-        ));
-    }
     if ich_id.is_empty() || channel_type.is_empty() || address.is_empty() {
         return Err(IdentityError::InvalidRequest(
             "ich_id, channel_type and address must be non-empty".to_string(),
         ));
     }
+    let call = identity_system_call(
+        sender,
+        receiver,
+        IdentitySystemRequest {
+            target,
+            fallback_target: None,
+            action: MSG_ILK_PROVISION,
+            payload: json!({
+                "ich_id": ich_id,
+                "channel_type": channel_type,
+                "address": address,
+            }),
+            timeout: request.timeout,
+        },
+    )
+    .await?;
+    let payload: IlkProvisionResponsePayload = serde_json::from_value(call.payload)?;
+    parse_provision_payload(payload, call.trace_id)
+}
 
-    let timeout = if request.timeout.is_zero() {
+fn default_timeout(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
         Duration::from_secs(5)
     } else {
-        request.timeout
-    };
+        timeout
+    }
+}
+
+fn response_action_for(action: &str) -> String {
+    format!("{action}_RESPONSE")
+}
+
+fn payload_status_and_code(payload: &Value) -> (Option<&str>, Option<&str>) {
+    (
+        payload.get("status").and_then(Value::as_str),
+        payload.get("error_code").and_then(Value::as_str),
+    )
+}
+
+fn payload_message(payload: &Value) -> Option<&str> {
+    payload
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|msg| !msg.trim().is_empty())
+}
+
+async fn send_action_once(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    target: &str,
+    action: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<(Value, String), IdentityError> {
     let trace_id = Uuid::new_v4().to_string();
     let msg = Message {
         routing: Routing {
@@ -313,28 +522,44 @@ pub async fn provision_ilk(
         },
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
-            msg: Some(MSG_ILK_PROVISION.to_string()),
+            msg: Some(action.to_string()),
             scope: None,
             target: None,
             action: None,
             priority: None,
             context: None,
         },
-        payload: json!({
-            "ich_id": ich_id,
-            "channel_type": channel_type,
-            "address": address,
-        }),
+        payload,
     };
-
     sender.send(msg).await?;
+    let response_action = response_action_for(action);
+    let incoming = wait_system_response(
+        receiver,
+        target,
+        &trace_id,
+        &response_action,
+        action,
+        timeout,
+    )
+    .await?;
+    Ok((incoming.payload, trace_id))
+}
 
+async fn wait_system_response(
+    receiver: &mut NodeReceiver,
+    target: &str,
+    trace_id: &str,
+    expected_msg: &str,
+    action: &str,
+    timeout: Duration,
+) -> Result<Message, IdentityError> {
     let deadline = TokioInstant::now() + timeout;
     loop {
         let now = TokioInstant::now();
         if now >= deadline {
-            return Err(IdentityError::Timeout {
-                trace_id,
+            return Err(IdentityError::ActionTimeout {
+                action: action.to_string(),
+                trace_id: trace_id.to_string(),
                 target: target.to_string(),
                 timeout_ms: timeout.as_millis() as u64,
             });
@@ -343,8 +568,9 @@ pub async fn provision_ilk(
         let incoming = match receiver.recv_timeout(remaining).await {
             Ok(message) => message,
             Err(NodeError::Timeout) => {
-                return Err(IdentityError::Timeout {
-                    trace_id,
+                return Err(IdentityError::ActionTimeout {
+                    action: action.to_string(),
+                    trace_id: trace_id.to_string(),
                     target: target.to_string(),
                     timeout_ms: timeout.as_millis() as u64,
                 })
@@ -358,11 +584,6 @@ pub async fn provision_ilk(
             continue;
         }
         match incoming.meta.msg.as_deref() {
-            Some(MSG_ILK_PROVISION_RESPONSE) => {
-                let payload: IlkProvisionResponsePayload =
-                    serde_json::from_value(incoming.payload)?;
-                return parse_provision_payload(payload, trace_id);
-            }
             Some(MSG_UNREACHABLE) => {
                 let payload = serde_json::from_value::<UnreachablePayload>(incoming.payload)
                     .unwrap_or_default();
@@ -379,6 +600,7 @@ pub async fn provision_ilk(
                     last_hop: payload.last_hop,
                 });
             }
+            Some(msg_name) if msg_name == expected_msg => return Ok(incoming),
             _ => continue,
         }
     }

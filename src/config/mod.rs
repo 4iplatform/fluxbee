@@ -20,6 +20,7 @@ const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
 const DEFAULT_BLOB_SYNC_TOOL: &str = "syncthing";
 const DEFAULT_BLOB_SYNC_API_PORT: u16 = 8384;
 const DEFAULT_BLOB_SYNC_DATA_DIR: &str = "/var/lib/fluxbee/syncthing";
+const DEFAULT_IDENTITY_FRONTDESK_NODE_BASE: &str = "AI.frontdesk";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -64,6 +65,7 @@ pub struct RouterConfig {
     pub blob_sync_tool: String,
     pub blob_sync_api_port: u16,
     pub blob_sync_data_dir: PathBuf,
+    pub identity_frontdesk_node_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +75,12 @@ struct HiveFile {
     wan: Option<WanSection>,
     nats: Option<NatsSection>,
     blob: Option<BlobSection>,
+    government: Option<GovernmentSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GovernmentSection {
+    identity_frontdesk: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +174,8 @@ impl RouterConfig {
         let data = std::fs::read_to_string(&hive_path)?;
         let hive: HiveFile = serde_yaml::from_str(&data)?;
         let hive_id = hive.hive_id;
+        let mut identity_frontdesk_node_name =
+            format!("{DEFAULT_IDENTITY_FRONTDESK_NODE_BASE}@{hive_id}");
         if let Some(role) = hive.role {
             let role = role.trim().to_ascii_lowercase();
             if !role.is_empty() {
@@ -241,6 +251,18 @@ impl RouterConfig {
                 }
             }
         }
+        if let Some(government) = hive.government {
+            if let Some(frontdesk) = government.identity_frontdesk {
+                let frontdesk = frontdesk.trim();
+                if !frontdesk.is_empty() {
+                    identity_frontdesk_node_name = if frontdesk.contains('@') {
+                        frontdesk.to_string()
+                    } else {
+                        format!("{frontdesk}@{hive_id}")
+                    };
+                }
+            }
+        }
         if nats_url.is_empty() {
             nats_url = format!("nats://127.0.0.1:{nats_port}");
         }
@@ -293,6 +315,7 @@ impl RouterConfig {
             blob_sync_tool,
             blob_sync_api_port,
             blob_sync_data_dir,
+            identity_frontdesk_node_name,
         })
     }
 }

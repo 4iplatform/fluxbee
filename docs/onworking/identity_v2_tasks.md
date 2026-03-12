@@ -137,22 +137,25 @@ Salida:
     - miss -> `ILK_PROVISION`
     - usar `ilk_id` en `meta.src_ilk`
 - [ ] E2. Frontdesk:
-  - completar registro vía `ILK_REGISTER` sobre ILK temporal
-  - canal extra por `ILK_ADD_CHANNEL`
-- [ ] E3. Orchestrator:
+  - [x] helpers SDK para acciones frontdesk (`identity_system_call` / `identity_system_call_ok`) con fallback a primary.
+  - [x] diags de referencia (`identity_provision_complete_diag`, `identity_merge_diag`) migrados a helpers SDK.
+  - [ ] integrar en runtime `AI.frontdesk` real (fuera de este repo):
+    - completar registro vía `ILK_REGISTER` sobre ILK temporal
+    - canal extra por `ILK_ADD_CHANNEL`
+- [x] E3. Orchestrator:
   - [x] registro de nodos por `ILK_REGISTER` en `run_node` (pre-spawn):
     - usa relay system message hacia `SY.identity@<primary_hive>` (resuelto por `identity_primary_hive_id`)
     - en `SPAWN_NODE` remoto, propaga `identity_primary_hive_id` al worker para evitar resolver contra `SY.identity@<worker_hive>`
-    - persiste `node_name -> ilk_id` en estado local orchestrator para reusar ILK en reinicios
+    - persiste `node_name -> ilk_id` en estado local orchestrator como cache/diagnóstico (no fuente de verdad)
     - modo estricto opcional por env `ORCH_IDENTITY_REGISTER_REQUIRED=true`
     - tenant resuelto desde `payload.tenant_id`, `payload.config.tenant_id` o `ORCH_DEFAULT_TENANT_ID`
   - [x] updates de metadata por `ILK_UPDATE` en `run_node` (delta explícito):
     - target fijo `SY.identity@<primary_hive>` (misma regla que `ILK_REGISTER`)
     - soporta `add_roles`, `remove_roles`, `add_capabilities`, `remove_capabilities`, `add_channels`, `identity_change_reason`
     - falla el spawn con `IDENTITY_UPDATE_FAILED` si se pidió delta y identity devuelve error
-  - [ ] hardening pendiente para alinear spec:
-    - eliminar `node_name -> ilk_id` local como fuente de verdad primaria,
-    - resolver/reusar ILK desde `SY.identity` por `node_name` antes de crear UUID nuevo.
+  - [x] hardening aplicado para alinear spec:
+    - `sy_orchestrator` ya no usa `node_name -> ilk_id` local como fuente de verdad al resolver `ilk_id` inicial,
+    - `SY.identity` canonicaliza `ILK_REGISTER` por `identification.node_name` y devuelve el ILK existente cuando corresponde.
 - [x] E4. Merge temporal:
   - [x] crear alias `old->canonical` (`SY.identity` -> `ILK_ADD_CHANNEL` con `merge_from_ilk_id`)
   - [x] mantener alias por TTL (`merge_alias_ttl_secs`)
@@ -174,7 +177,8 @@ Salida:
     - luego evalúa OPA con el ILK canonical.
 - [x] F3. Ruteo de temporales a frontdesk.
   - Implementado en `router` como override pre-OPA:
-    - si `registration_status=temporary`, fuerza target `AI.frontdesk@<hive>`.
+    - si `registration_status=temporary`, fuerza target configurado en `hive.yaml`:
+      `government.identity_frontdesk` (fallback: `AI.frontdesk@<hive_local>`).
 - [x] F4. Validar que mensajes con ILK temporal mergeado sigan resolviendo por alias durante TTL.
   - Validado en tests de `router` (pre-resolve identity):
     - `apply_identity_pre_resolve_keeps_alias_canonical_during_ttl`
@@ -198,12 +202,13 @@ Salida:
 - [x] G3. E2E add_channel + merge:
   - nuevo ICH -> temporal -> `ILK_ADD_CHANNEL` -> alias activo -> convergencia a canonical.
   - Avance: script dedicado `scripts/identity_merge_alias_e2e.sh` (convergencia old->canonical y opcional wait/cleanup por TTL).
-- [ ] G4. E2E node registration:
+- [x] G4. E2E node registration:
   - spawn de `AI.*`/`WF.*` con ILK persistente por `node_name`.
   - Avance: script dedicado `scripts/identity_node_registration_e2e.sh`
     - valida `payload.identity.register.status=ok`
     - valida persistencia de `ilk_id` entre restart del mismo `node_name`
-  - Nota: hoy pasa en verde, pero depende del map local del orchestrator (E3 hardening pendiente).
+  - Validado también tras restart de `sy-identity` primary (persistencia de tenant/flujo de registro estable).
+  - Nota: la idempotencia ya no depende del map local de orchestrator; la canonicalización por `node_name` vive en `SY.identity`.
 - [ ] G5. E2E replica:
   - full sync en worker nuevo + deltas runtime.
 - [ ] G6. Pruebas negativas:

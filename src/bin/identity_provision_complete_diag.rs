@@ -2,9 +2,8 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fluxbee_sdk::protocol::{
-    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
-};
+use fluxbee_sdk::identity::{identity_system_call, IdentitySystemRequest};
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, MSG_UNREACHABLE, SYSTEM_KIND};
 use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -94,113 +93,6 @@ fn src_ilk_from_message(msg: &Message) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-async fn send_system_message(
-    sender: &NodeSender,
-    target: &str,
-    msg_name: &str,
-    payload: Value,
-) -> Result<String, DiagError> {
-    let trace_id = Uuid::new_v4().to_string();
-    let message = Message {
-        routing: Routing {
-            src: sender.uuid().to_string(),
-            dst: Destination::Unicast(target.to_string()),
-            ttl: 16,
-            trace_id: trace_id.clone(),
-        },
-        meta: Meta {
-            msg_type: SYSTEM_KIND.to_string(),
-            msg: Some(msg_name.to_string()),
-            scope: None,
-            target: None,
-            action: None,
-            priority: None,
-            context: None,
-        },
-        payload,
-    };
-    sender.send(message).await?;
-    Ok(trace_id)
-}
-
-async fn wait_system_response(
-    receiver: &mut NodeReceiver,
-    trace_id: &str,
-    expected_msg: &str,
-    timeout_ms: u64,
-) -> Result<Value, DiagError> {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(
-                format!("timeout waiting {} for trace_id={}", expected_msg, trace_id).into(),
-            );
-        }
-        let message = match timeout(remaining, receiver.recv()).await {
-            Ok(message) => message?,
-            Err(_) => {
-                return Err(
-                    format!("timeout waiting {} for trace_id={}", expected_msg, trace_id).into(),
-                );
-            }
-        };
-        if message.meta.msg_type != SYSTEM_KIND || message.routing.trace_id != trace_id {
-            continue;
-        }
-        if message.meta.msg.as_deref() == Some(MSG_UNREACHABLE) {
-            let reason = message
-                .payload
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let original_dst = message
-                .payload
-                .get("original_dst")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            return Err(format!(
-                "unreachable while waiting {} trace_id={} reason={} original_dst={}",
-                expected_msg, trace_id, reason, original_dst
-            )
-            .into());
-        }
-        if message.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED) {
-            let original_dst = message
-                .payload
-                .get("original_dst")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let last_hop = message
-                .payload
-                .get("last_hop")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            return Err(format!(
-                "ttl_exceeded while waiting {} trace_id={} original_dst={} last_hop={}",
-                expected_msg, trace_id, original_dst, last_hop
-            )
-            .into());
-        }
-        if message.meta.msg.as_deref() == Some(expected_msg) {
-            return Ok(message.payload);
-        }
-    }
-}
-
-async fn system_call(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    target: &str,
-    action: &str,
-    payload: Value,
-    timeout_ms: u64,
-) -> Result<Value, DiagError> {
-    let trace_id = send_system_message(sender, target, action, payload).await?;
-    let response_action = format!("{action}_RESPONSE");
-    wait_system_response(receiver, &trace_id, &response_action, timeout_ms).await
-}
-
 async fn system_call_with_fallback(
     sender: &NodeSender,
     receiver: &mut NodeReceiver,
@@ -210,54 +102,19 @@ async fn system_call_with_fallback(
     payload: Value,
     timeout_ms: u64,
 ) -> Result<(Value, String), DiagError> {
-    match system_call(
+    let out = identity_system_call(
         sender,
         receiver,
-        target,
-        action,
-        payload.clone(),
-        timeout_ms,
+        IdentitySystemRequest {
+            target,
+            fallback_target,
+            action,
+            payload,
+            timeout: Duration::from_millis(timeout_ms),
+        },
     )
-    .await
-    {
-        Ok(response) => {
-            let (status, code) = payload_status(&response);
-            let Some(fallback) = fallback_target else {
-                return Ok((response, target.to_string()));
-            };
-            if fallback != target && status == "error" && code == Some("NOT_PRIMARY") {
-                tracing::warn!(
-                    target = %target,
-                    fallback = %fallback,
-                    action = action,
-                    "identity target is replica (NOT_PRIMARY), retrying with fallback"
-                );
-                let second =
-                    system_call(sender, receiver, fallback, action, payload, timeout_ms).await?;
-                return Ok((second, fallback.to_string()));
-            }
-            Ok((response, target.to_string()))
-        }
-        Err(err) => {
-            let err_text = err.to_string();
-            let Some(fallback) = fallback_target else {
-                return Err(err);
-            };
-            if fallback == target || !err_text.contains("reason=NODE_NOT_FOUND") {
-                return Err(err);
-            }
-            tracing::warn!(
-                target = %target,
-                fallback = %fallback,
-                action = action,
-                error = %err_text,
-                "primary identity target unreachable, retrying with fallback"
-            );
-            let second =
-                system_call(sender, receiver, fallback, action, payload, timeout_ms).await?;
-            Ok((second, fallback.to_string()))
-        }
-    }
+    .await?;
+    Ok((out.payload, out.effective_target))
 }
 
 fn payload_status(payload: &Value) -> (&str, Option<&str>) {

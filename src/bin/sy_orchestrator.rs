@@ -125,6 +125,7 @@ struct HiveFile {
     storage: Option<StorageSection>,
     blob: Option<BlobSection>,
     dist: Option<DistSection>,
+    government: Option<GovernmentSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,6 +150,11 @@ struct NatsSection {
     mode: Option<String>,
     port: Option<u16>,
     url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GovernmentSection {
+    identity_frontdesk: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5198,20 +5204,14 @@ fn save_identity_node_ilk_map(
 }
 
 fn resolve_node_ilk_id(
-    state: &OrchestratorState,
+    _state: &OrchestratorState,
     payload: &serde_json::Value,
-    node_name: &str,
+    _node_name: &str,
 ) -> Result<String, OrchestratorError> {
     if let Some(raw) = payload.get("ilk_id").and_then(|v| v.as_str()) {
         let normalized = raw.trim().to_string();
         parse_prefixed_uuid(&normalized, "ilk")?;
         return Ok(normalized);
-    }
-    let map_path = node_ilk_map_path(state);
-    let map = load_identity_node_ilk_map(&map_path);
-    if let Some(existing) = map.nodes.get(node_name) {
-        parse_prefixed_uuid(existing, "ilk")?;
-        return Ok(existing.clone());
     }
     Ok(format!("ilk:{}", Uuid::new_v4()))
 }
@@ -7752,11 +7752,15 @@ async fn add_hive_flow(
                 .to_string_lossy()
                 .to_string()
         });
+    let identity_frontdesk_node_name = load_hive(&state.config_dir)
+        .map(|hive| identity_frontdesk_node_name_from_hive(&hive))
+        .unwrap_or_else(|_| format!("AI.frontdesk@{}", state.hive_id));
     let hive_yaml = format!(
-        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n",
+        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n",
         hive_id,
         worker_uplink,
         storage_path,
+        identity_frontdesk_node_name,
         desired_blob.enabled,
         desired_blob.path.display(),
         desired_blob.sync_enabled,
@@ -9199,6 +9203,20 @@ fn storage_path_from_hive(hive: &HiveFile) -> String {
         }
     }
     default_root
+}
+
+fn identity_frontdesk_node_name_from_hive(hive: &HiveFile) -> String {
+    let configured = hive
+        .government
+        .as_ref()
+        .and_then(|government| government.identity_frontdesk.as_ref())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    match configured {
+        Some(value) if value.contains('@') => value.to_string(),
+        Some(value) => format!("{value}@{}", hive.hive_id),
+        None => format!("AI.frontdesk@{}", hive.hive_id),
+    }
 }
 
 fn persist_storage_path_in_hive(config_dir: &Path, path: &str) -> Result<(), OrchestratorError> {

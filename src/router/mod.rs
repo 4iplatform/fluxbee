@@ -82,8 +82,6 @@ const LSA_REJECT_HIVE_MISMATCH: &str = "hive_mismatch";
 const LSA_REJECT_STALE_SEQ: &str = "stale_seq";
 const LSA_REJECT_PARSE_ERROR: &str = "parse_error";
 const LSA_REJECT_UNAUTHORIZED: &str = "unauthorized";
-const IDENTITY_FRONTDESK_NODE_BASE: &str = "AI.frontdesk";
-
 impl Router {
     pub fn new(cfg: RouterConfig) -> Self {
         let shm = RouterRegionWriter::open_or_create(
@@ -211,6 +209,7 @@ impl Router {
         let router_name = self.cfg.router_l2_name.clone();
         let shm_name = self.cfg.shm_name.clone();
         let hive_id = self.cfg.hive_id.clone();
+        let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
         let is_gateway = self.cfg.is_gateway;
         let peer_socket_dir = self.cfg.node_socket_dir.clone();
         tokio::spawn(async move {
@@ -219,6 +218,7 @@ impl Router {
                 &router_name,
                 &shm_name,
                 &hive_id,
+                &identity_frontdesk_node_name,
                 peer_socket_dir,
                 peers_pd,
                 peer_nodes_pd,
@@ -274,6 +274,7 @@ impl Router {
         let opa = Arc::clone(&self.opa);
         let opa_reader = Arc::clone(&self.opa_reader);
         let hive_id = self.cfg.hive_id.clone();
+        let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
         let wan_peers = Arc::clone(&self.wan_peers);
         let lsa_snapshot = Arc::clone(&self.lsa_snapshot);
         let is_gateway = self.cfg.is_gateway;
@@ -300,6 +301,7 @@ impl Router {
                 let opa = Arc::clone(&opa);
                 let opa_reader = Arc::clone(&opa_reader);
                 let hive_id = hive_id.clone();
+                let identity_frontdesk_node_name = identity_frontdesk_node_name.clone();
                 let wan_peers = Arc::clone(&wan_peers);
                 let lsa_reader = Arc::clone(&lsa_reader);
                 let lsa_snapshot = Arc::clone(&lsa_snapshot);
@@ -322,6 +324,7 @@ impl Router {
                         opa,
                         opa_reader,
                         hive_id,
+                        identity_frontdesk_node_name,
                         wan_peers,
                         lsa_snapshot,
                         is_gateway,
@@ -339,6 +342,7 @@ impl Router {
                 router_uuid: self.cfg.router_uuid,
                 router_name: self.cfg.router_l2_name.clone(),
                 hive_id: self.cfg.hive_id.clone(),
+                identity_frontdesk_node_name: self.cfg.identity_frontdesk_node_name.clone(),
                 hello_interval_ms: self.cfg.hello_interval_ms,
                 dead_interval_ms: self.cfg.dead_interval_ms,
                 authorized_hives: self.cfg.wan_authorized_hives.clone(),
@@ -407,6 +411,7 @@ impl Router {
             let nats_publisher = self.nats_publisher.clone();
             let nats_publish_errors = Arc::clone(&self.nats_publish_errors);
             let is_gateway = self.cfg.is_gateway;
+            let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
             tokio::spawn(async move {
                 if let Err(err) = handle_node(
                     stream,
@@ -432,6 +437,7 @@ impl Router {
                     router_uuid,
                     &router_name,
                     &hive_id,
+                    &identity_frontdesk_node_name,
                     is_gateway,
                 )
                 .await
@@ -467,6 +473,7 @@ async fn handle_node(
     router_uuid: Uuid,
     router_name: &str,
     hive_id: &str,
+    identity_frontdesk_node_name: &str,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
     let (mut reader, mut writer) = stream.into_split();
@@ -754,6 +761,7 @@ async fn handle_node(
                         &opa,
                         &broadcast_cache,
                         &hive_id,
+                        identity_frontdesk_node_name,
                         router_uuid,
                         is_gateway,
                         &lsa_snapshot,
@@ -807,6 +815,7 @@ async fn handle_message(
     opa: &Arc<Mutex<OpaResolver>>,
     broadcast_cache: &Arc<Mutex<BroadcastCache>>,
     hive_id: &str,
+    identity_frontdesk_node_name: &str,
     router_uuid: Uuid,
     is_gateway: bool,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
@@ -1042,14 +1051,17 @@ async fn handle_message(
             }
         }
         Destination::Resolve => {
-            let resolved_target = match resolve_target_with_identity(opa, hive_id, msg).await {
-                Ok(value) => value,
-                Err(err) => {
-                    tracing::warn!("opa resolve failed: {err}");
-                    send_unreachable_to(msg, &src_handle.sender, router_uuid, "OPA_ERROR")?;
-                    return Ok(());
-                }
-            };
+            let resolved_target =
+                match resolve_target_with_identity(opa, hive_id, identity_frontdesk_node_name, msg)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!("opa resolve failed: {err}");
+                        send_unreachable_to(msg, &src_handle.sender, router_uuid, "OPA_ERROR")?;
+                        return Ok(());
+                    }
+                };
             let Some(target) = resolved_target.as_deref() else {
                 send_unreachable_to(msg, &src_handle.sender, router_uuid, "OPA_NO_TARGET")?;
                 return Ok(());
@@ -2287,15 +2299,21 @@ async fn handle_wan_message(
             }
         }
         Destination::Resolve => {
-            let resolved_target =
-                match resolve_target_with_identity(&ctx.opa, &ctx.hive_id, msg).await {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!("opa resolve failed: {err}");
-                        send_unreachable_to(msg, sender, ctx.router_uuid, "OPA_ERROR")?;
-                        return Ok(());
-                    }
-                };
+            let resolved_target = match resolve_target_with_identity(
+                &ctx.opa,
+                &ctx.hive_id,
+                &ctx.identity_frontdesk_node_name,
+                msg,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!("opa resolve failed: {err}");
+                    send_unreachable_to(msg, sender, ctx.router_uuid, "OPA_ERROR")?;
+                    return Ok(());
+                }
+            };
             let Some(target) = resolved_target.as_deref() else {
                 send_unreachable_to(msg, sender, ctx.router_uuid, "OPA_NO_TARGET")?;
                 return Ok(());
@@ -2382,6 +2400,7 @@ async fn peer_discovery_loop(
     self_router_name: &str,
     self_shm_name: &str,
     hive_id: &str,
+    identity_frontdesk_node_name: &str,
     socket_dir: PathBuf,
     peers: Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
@@ -2457,6 +2476,7 @@ async fn peer_discovery_loop(
                     let lsa_snapshot = Arc::clone(&lsa_snapshot);
                     let is_gateway = is_gateway;
                     let socket_dir = socket_dir.clone();
+                    let identity_frontdesk_node_name = identity_frontdesk_node_name.to_string();
                     tokio::spawn(async move {
                         let _ = connect_to_peer(
                             peer_uuid,
@@ -2478,6 +2498,7 @@ async fn peer_discovery_loop(
                             opa,
                             opa_reader,
                             &hive_id,
+                            &identity_frontdesk_node_name,
                             lsa_snapshot,
                             fib,
                             is_gateway,
@@ -2577,6 +2598,7 @@ async fn connect_to_peer(
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     hive_id: &str,
+    identity_frontdesk_node_name: &str,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
     is_gateway: bool,
@@ -2634,6 +2656,7 @@ async fn connect_to_peer(
                         &opa,
                         &opa_reader,
                         hive_id,
+                        identity_frontdesk_node_name,
                         &fib,
                         self_uuid,
                         is_gateway,
@@ -2670,6 +2693,7 @@ async fn handle_peer_incoming(
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     hive_id: String,
+    identity_frontdesk_node_name: String,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     is_gateway: bool,
@@ -2725,6 +2749,7 @@ async fn handle_peer_incoming(
                         &opa,
                         &opa_reader,
                         &hive_id,
+                        &identity_frontdesk_node_name,
                         &fib,
                         router_uuid,
                         is_gateway,
@@ -2761,6 +2786,7 @@ async fn handle_peer_message(
     opa: &Arc<Mutex<OpaResolver>>,
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
     hive_id: &str,
+    identity_frontdesk_node_name: &str,
     fib: &Arc<Mutex<Vec<FibEntry>>>,
     router_uuid: Uuid,
     is_gateway: bool,
@@ -3004,16 +3030,19 @@ async fn handle_peer_message(
             }
         }
         Destination::Resolve => {
-            let resolved_target = match resolve_target_with_identity(opa, hive_id, msg).await {
-                Ok(value) => value,
-                Err(err) => {
-                    tracing::warn!("opa resolve failed: {err}");
-                    if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(msg, &peer.sender, router_uuid, "OPA_ERROR")?;
+            let resolved_target =
+                match resolve_target_with_identity(opa, hive_id, identity_frontdesk_node_name, msg)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!("opa resolve failed: {err}");
+                        if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
+                            send_unreachable_to(msg, &peer.sender, router_uuid, "OPA_ERROR")?;
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-            };
+                };
             let Some(target) = resolved_target.as_deref() else {
                 if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                     send_unreachable_to(msg, &peer.sender, router_uuid, "OPA_NO_TARGET")?;
@@ -3227,6 +3256,7 @@ struct WanContext {
     router_uuid: Uuid,
     router_name: String,
     hive_id: String,
+    identity_frontdesk_node_name: String,
     hello_interval_ms: u64,
     dead_interval_ms: u64,
     authorized_hives: Vec<String>,
@@ -3667,14 +3697,18 @@ fn read_identity_snapshot(hive_id: &str) -> Option<crate::shm::IdentitySnapshot>
 async fn resolve_target_with_identity(
     opa: &Arc<Mutex<OpaResolver>>,
     hive_id: &str,
+    identity_frontdesk_node_name: &str,
     msg: &Message,
 ) -> Result<Option<String>, crate::opa::OpaError> {
     let mut msg_for_opa = msg.clone();
     if let Some(snapshot) = read_identity_snapshot(hive_id) {
         let now_ms = now_epoch_ms();
-        if let Some(forced_target) =
-            apply_identity_pre_resolve(&mut msg_for_opa, hive_id, &snapshot, now_ms)
-        {
+        if let Some(forced_target) = apply_identity_pre_resolve(
+            &mut msg_for_opa,
+            identity_frontdesk_node_name,
+            &snapshot,
+            now_ms,
+        ) {
             return Ok(Some(forced_target));
         }
     }
@@ -3684,7 +3718,7 @@ async fn resolve_target_with_identity(
 
 fn apply_identity_pre_resolve(
     msg: &mut Message,
-    hive_id: &str,
+    identity_frontdesk_node_name: &str,
     snapshot: &crate::shm::IdentitySnapshot,
     now_ms: u64,
 ) -> Option<String> {
@@ -3696,7 +3730,7 @@ fn apply_identity_pre_resolve(
             set_src_ilk_in_meta(&mut msg.meta, &canonical);
         }
         if registration_status.as_deref() == Some("temporary") {
-            return Some(format!("{IDENTITY_FRONTDESK_NODE_BASE}@{hive_id}"));
+            return Some(identity_frontdesk_node_name.to_string());
         }
     }
     None
@@ -4971,7 +5005,8 @@ mod tests {
         let old_src = format!("ilk:{old_ilk_id}");
         let expected_canonical = format!("ilk:{canonical_ilk_id}");
         let mut msg = message_with_src_ilk(&old_src);
-        let forced_target = apply_identity_pre_resolve(&mut msg, "sandbox", &snapshot, now);
+        let forced_target =
+            apply_identity_pre_resolve(&mut msg, "AI.frontdesk@sandbox", &snapshot, now);
 
         assert!(forced_target.is_none());
         assert_eq!(
@@ -5041,7 +5076,8 @@ mod tests {
 
         let old_src = format!("ilk:{old_ilk_id}");
         let mut msg = message_with_src_ilk(&old_src);
-        let forced_target = apply_identity_pre_resolve(&mut msg, "sandbox", &snapshot, now);
+        let forced_target =
+            apply_identity_pre_resolve(&mut msg, "AI.frontdesk@sandbox", &snapshot, now);
 
         assert!(forced_target.is_none());
         assert_eq!(
