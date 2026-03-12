@@ -213,9 +213,13 @@ Salida:
 - [ ] G5. E2E replica:
   - full sync en worker nuevo + deltas runtime.
 - [ ] G6. Pruebas negativas:
-  - actor no autorizado (`UNAUTHORIZED_REGISTRAR`)
-  - IDs mal formados
-  - duplicados (`DUPLICATE_EMAIL`, `DUPLICATE_NODE_NAME`, ICH unique)
+  - [x] diag+runner base implementados:
+    - `src/bin/identity_negative_diag.rs`
+    - `scripts/identity_negative_e2e.sh`
+  - [x] actor no autorizado (`UNAUTHORIZED_REGISTRAR`)
+  - [x] IDs mal formados (`INVALID_REQUEST`)
+  - [x] tenant inexistente (`INVALID_TENANT`)
+  - [ ] duplicados (`DUPLICATE_EMAIL`, `DUPLICATE_NODE_NAME`, ICH unique)
 
 Salida:
 - gate de aceptación identity v2 completo.
