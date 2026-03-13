@@ -20,7 +20,9 @@ use fluxbee_sdk::blob::{
     BLOB_NAME_MAX_CHARS, BLOB_STAGING_TTL_HOURS,
 };
 use fluxbee_sdk::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::protocol::{
+    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+};
 use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RemoteHiveEntry, RemoteNodeEntry,
@@ -5683,6 +5685,40 @@ async fn relay_system_action(
             }
             if incoming.routing.trace_id != trace_id {
                 continue;
+            }
+            if incoming.meta.msg.as_deref() == Some(MSG_UNREACHABLE) {
+                let reason = incoming
+                    .payload
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let original_dst = incoming
+                    .payload
+                    .get("original_dst")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("-");
+                return Err(format!(
+                    "unreachable while waiting {} trace_id={} reason={} original_dst={}",
+                    response_msg, trace_id, reason, original_dst
+                )
+                .into());
+            }
+            if incoming.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED) {
+                let original_dst = incoming
+                    .payload
+                    .get("original_dst")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("-");
+                let last_hop = incoming
+                    .payload
+                    .get("last_hop")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("-");
+                return Err(format!(
+                    "ttl exceeded while waiting {} trace_id={} original_dst={} last_hop={}",
+                    response_msg, trace_id, original_dst, last_hop
+                )
+                .into());
             }
             if incoming.meta.msg.as_deref() != Some(response_msg) {
                 continue;
