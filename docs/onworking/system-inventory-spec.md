@@ -398,8 +398,8 @@ Implementation status (2026-03-12):
 ### Phase D — Validation
 
 - [x] D1. E2E: inventory reflects node spawn/kill in real time. (`scripts/inventory_spawn_kill_e2e.sh`)
-- [ ] D2. E2E: inventory reflects add_hive/remove_hive. (`scripts/inventory_add_remove_hive_e2e.sh`)
-- [ ] D3. E2E: stale hive appears as stale in inventory.
+- [x] D2. E2E: inventory reflects add_hive/remove_hive. (`scripts/inventory_add_remove_hive_e2e.sh`)
+- [ ] D3. E2E: stale hive appears as stale in inventory. (`scripts/inventory_stale_hive_e2e.sh`)
 - [ ] D4. E2E: worker identity writes are routed to `SY.identity@motherbee` (no fallback to local replica).
 - [ ] D5. E2E negative: if `SY.identity@motherbee` is unreachable, worker fails identity write routing explicitly (no local fallback).
 

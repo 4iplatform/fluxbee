@@ -260,8 +260,8 @@ Criterio de aceptación C:
 ### Fase D — E2E y regresión FR-01/FR-03
 
 - [x] INV-D1. E2E: spawn/kill se refleja en inventario. (`scripts/inventory_spawn_kill_e2e.sh`)
-- [ ] INV-D2. E2E: add_hive/remove_hive se refleja en inventario. (`scripts/inventory_add_remove_hive_e2e.sh`)
-- [ ] INV-D3. E2E: hive stale aparece como stale.
+- [x] INV-D2. E2E: add_hive/remove_hive se refleja en inventario. (`scripts/inventory_add_remove_hive_e2e.sh`)
+- [ ] INV-D3. E2E: hive stale aparece como stale. (`scripts/inventory_stale_hive_e2e.sh`)
 - [ ] INV-D4. E2E: worker enruta writes a `SY.identity@motherbee` sin fallback local.
 - [ ] INV-D5. E2E negativo: worker falla registro identity cuando `SY.identity@motherbee` es inalcanzable.
 - [ ] INV-D6. E2E regresión: `node_name@hive` cruzado vs endpoint hive mantiene identidad/routing correctos.
