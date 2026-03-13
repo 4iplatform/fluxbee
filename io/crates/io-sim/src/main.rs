@@ -219,6 +219,11 @@ async fn process_one_inbound(
             params: serde_json::json!({}),
         },
     };
+    tracing::debug!(
+        sim_thread_id = ?config.sim_thread_id,
+        sim_conversation_id = %config.sim_conversation_id,
+        "io-sim building inbound io context"
+    );
 
     let payload = serde_json::json!({
       "type": "text",
@@ -253,8 +258,16 @@ async fn process_one_inbound(
                 fluxbee_sdk::protocol::Destination::Broadcast => "broadcast".to_string(),
                 fluxbee_sdk::protocol::Destination::Resolve => "resolve".to_string(),
             };
+            let thread_id = msg
+                .meta
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("thread_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             sender.send(msg).await?;
-            tracing::info!(%trace_id, dst, "io-sim sent inbound message to router");
+            tracing::info!(%trace_id, dst, thread_id = %thread_id, "io-sim sent inbound message to router");
         }
         InboundOutcome::DroppedDuplicate => {
             tracing::warn!(message_id = %message_id, "io-sim dropped duplicate inbound");
@@ -277,12 +290,36 @@ async fn run_outbound_log_loop(mut receiver: NodeReceiver) -> Result<()> {
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let error_code = msg
+            .payload
+            .get("code")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                msg.payload
+                    .get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("");
+        let error_message = msg
+            .payload
+            .get("message")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                msg.payload
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("");
 
         tracing::info!(
             trace_id = %msg.routing.trace_id,
             src = %msg.routing.src,
             payload_type = %payload_type,
             content = %content,
+            error_code = %error_code,
+            error_message = %error_message,
             "io-sim received outbound from router"
         );
     }
