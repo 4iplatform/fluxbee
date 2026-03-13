@@ -74,12 +74,13 @@ Criterio de cierre FR-02:
 
 ### FR-03 — Normalización de `node_name@hive` vs `target_hive`
 
-Estado: PARTIAL-CLOSED (quedan pruebas de regresión)
+Estado: CLOSED
 
 Qué pasa hoy:
 - Existe normalización única.
 - Si `node_name` trae `@hive`, ese hive manda.
 - En spawn remoto se propaga `identity_primary_hive_id` al worker.
+- En kill remoto aplica la misma precedencia: `node_name@hive` manda sobre el hive del endpoint.
 
 Evidencia:
 - `src/bin/sy_orchestrator.rs:5037`
@@ -87,9 +88,7 @@ Evidencia:
 - `src/bin/sy_orchestrator.rs:5803`
 - `src/bin/sy_orchestrator.rs:5879`
 - `src/bin/sy_orchestrator.rs:5627`
-
-Riesgo residual:
-- Falta gate E2E explícito para caso cruzado (`POST /hives/worker1/nodes` con `node_name@worker2`) como test estable de regresión.
+- `scripts/inventory_node_name_cross_hive_e2e.sh` (spawn+inventory+kill cruzado)
 
 ---
 
@@ -124,7 +123,7 @@ Impacto:
 
 ### FR-05 — Config per-node unicast (API de control) + lectura de estado
 
-Estado: PARTIAL-CLOSED
+Estado: CLOSED
 
 Qué pasa hoy:
 - Existe endpoint admin canónico per-node config:
@@ -153,7 +152,7 @@ Lista de tareas FR-05:
 
 ### FR-06 — Ownership de archivos de nodo (revisión v1.1: two-file model)
 
-Estado: PARTIAL-CLOSED (implementación base completa, falta cierre E2E dedicado)
+Estado: CLOSED
 
 Qué pasa hoy:
 - Implementación migrada a two-file ownership con writer único por archivo.
@@ -249,8 +248,7 @@ Estado: PARCIAL
 ## 4) Orden sugerido de ejecución
 
 1. FR-07 (status schema común).
-2. FR-03 (regresión E2E de cierre).
-3. FR-04 (ON HOLD hasta cerrar spec cognitive de L3/CTX).
+2. FR-04 (ON HOLD hasta cerrar spec cognitive de L3/CTX).
 
 ---
 
@@ -265,13 +263,14 @@ Estado: PARCIAL
 | 2026-03-13 | FR-02 core strict | `run_node` falla siempre ante register identity no exitoso; removido soft-fail/flag estricto en spawn | core | parcial |
 | 2026-03-13 | FR-02 E2E negativos | `identity_register_strict_e2e.sh` valida `missing_tenant_id` e `identity_unavailable` con fallo explícito `IDENTITY_REGISTER_FAILED` | core | parcial |
 | 2026-03-13 | FR-02 cierre documental | `10-identity-v2.md` declara gate obligatorio fail-closed para spawn sin registro identity exitoso | core | cerrado |
-| 2026-03-13 | FR-05 avance | API per-node config implementada (`GET/PUT /hives/{hive}/nodes/{node}/config`) + relay remoto | core | parcial |
+| 2026-03-13 | FR-05 avance | API per-node config implementada (`GET/PUT /hives/{hive}/nodes/{node}/config`) + relay remoto | core | cerrado |
 | 2026-03-13 | FR-06 cierre (v1.0) | Config efectiva single-file bajo `${STATE_DIR}/node-configs` con creación en spawn y update atómico | core | superseded |
 | 2026-03-13 | FR-05/06 validación E2E v1.0 | `scripts/node_config_per_node_e2e.sh` pasó en `worker-220` (spawn+get+put+get, `config_version` 1→2) | core | cerrado |
 | 2026-03-13 | FR-06 reabierta (v1.1) | Se acuerda migrar a two-file ownership (`config.json`/`state.json`) para eliminar write-races y separar responsabilidades | core | abierto |
-| 2026-03-13 | FR-06 implementación v1.1 | Core migra a `/var/lib/fluxbee/nodes/<TYPE>/<node@hive>/{config.json,state.json}` con permisos estrictos y spawn fail-closed | core | parcial |
-| 2026-03-13 | FR-05 state endpoint | `GET /hives/{hive}/nodes/{node}/state` implementado en `SY.admin`/`SY.orchestrator` con relay remoto | core | parcial |
-| 2026-03-13 | FR-05/06 E2E v1.1 | `node_config_per_node_e2e.sh` extendido con checks de `state` (existing/missing) y respawn fail-closed `NODE_ALREADY_EXISTS` | core | parcial |
+| 2026-03-13 | FR-06 implementación v1.1 | Core migra a `/var/lib/fluxbee/nodes/<TYPE>/<node@hive>/{config.json,state.json}` con permisos estrictos y spawn fail-closed | core | cerrado |
+| 2026-03-13 | FR-05 state endpoint | `GET /hives/{hive}/nodes/{node}/state` implementado en `SY.admin`/`SY.orchestrator` con relay remoto | core | cerrado |
+| 2026-03-13 | FR-05/06 E2E v1.1 | `node_config_per_node_e2e.sh` extendido con checks de `state` (existing/missing) y respawn fail-closed `NODE_ALREADY_EXISTS` | core | cerrado |
+| 2026-03-13 | FR-03 cierre E2E | `inventory_node_name_cross_hive_e2e.sh` valida precedencia de `node_name@hive` en spawn+kill contra endpoint cruzado | core | cerrado |
 
 ---
 
@@ -347,7 +346,7 @@ Criterio de aceptación C:
   - No duplica validación de delete/add (cubierta en INV-D2).
 - [x] INV-D4. E2E: worker enruta writes a `SY.identity@motherbee` sin fallback local. (`scripts/inventory_identity_primary_routing_e2e.sh`)
 - [x] INV-D5. E2E negativo: worker falla registro identity cuando `SY.identity@motherbee` es inalcanzable. (`scripts/inventory_identity_primary_routing_e2e.sh`)
-- [ ] INV-D6. E2E regresión: `node_name@hive` cruzado vs endpoint hive mantiene identidad/routing correctos.
+- [x] INV-D6. E2E regresión: `node_name@hive` cruzado vs endpoint hive mantiene identidad/routing correctos. (`scripts/inventory_node_name_cross_hive_e2e.sh`)
 
 Criterio de aceptación D:
 - FR-01 y FR-03 cerrados con evidencia automatizada.
