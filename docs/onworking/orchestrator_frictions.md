@@ -33,18 +33,18 @@ Evidencia:
 
 Resultado:
 - Se cierra fricción de resolución de primary.
-- Riesgo residual asociado a identity write queda en FR-02 (modo estricto de registro).
+- Sin riesgo residual abierto en el eje primary/registro (FR-01 y FR-02 cerrados).
 
 ---
 
 ### FR-02 — Spawn puede continuar aunque falle identity register
 
-Estado: PARTIAL-CLOSED (cambio core aplicado, faltan E2E dedicados y cierre documental)
+Estado: CLOSED (core + E2E + docs)
 
 Qué pasa hoy:
 - `run_node` exige registro identity exitoso para continuar.
 - Fallos de identity register ya no tienen camino soft-fail.
-- Faltan tests dedicados FR-02 (negativos) para cerrar formalmente.
+- FR-02 queda cerrado: spawn sin registro identity exitoso está prohibido.
 
 Evidencia:
 - `src/bin/sy_orchestrator.rs:5843`
@@ -61,9 +61,9 @@ Lista de tareas FR-02 (ejecución):
 - [x] FR2-T3. Tratar `missing_tenant_id` e `identity_unavailable` como error explícito de spawn (no `skipped`).
 - [x] FR2-T4. Mantener `ORCH_IDENTITY_REGISTER_REQUIRED` solo como override temporal de test, o removerla completamente (decisión hard no-legacy sugerida: remover).
 - [x] FR2-T5. Actualizar mensajes de error/contrato HTTP para que `run_node` devuelva `IDENTITY_REGISTER_FAILED` consistente en todos los fallos de registro.
-- [ ] FR2-T6. Agregar E2E negativo dedicado FR-02: spawn sin `tenant_id` debe fallar siempre. (`scripts/identity_register_strict_e2e.sh`, pendiente validación en entorno integrado)
-- [ ] FR2-T7. Agregar E2E negativo dedicado FR-02: con identity no disponible, spawn debe fallar siempre. (`scripts/identity_register_strict_e2e.sh`, pendiente validación en entorno integrado)
-- [ ] FR2-T8. Actualizar docs (`10-identity-v2.md` y este doc) declarando que spawn sin identity register exitoso está prohibido.
+- [x] FR2-T6. Agregar E2E negativo dedicado FR-02: spawn sin `tenant_id` debe fallar siempre. (`scripts/identity_register_strict_e2e.sh`)
+- [x] FR2-T7. Agregar E2E negativo dedicado FR-02: con identity no disponible, spawn debe fallar siempre. (`scripts/identity_register_strict_e2e.sh`)
+- [x] FR2-T8. Actualizar docs (`10-identity-v2.md` y este doc) declarando que spawn sin identity register exitoso está prohibido.
 
 Criterio de cierre FR-02:
 - `run_node` no puede devolver `status=ok` si `payload.identity.register.status != ok`.
@@ -124,33 +124,48 @@ Impacto:
 
 ### FR-05 — Config per-node unicast (`CONFIG_SET/GET`) canónico
 
-Estado: OPEN (prioridad media)
+Estado: CLOSED (API + flujo unicast implementado)
 
 Qué pasa hoy:
-- El protocolo core formaliza `CONFIG_CHANGED` broadcast.
-- No hay contrato canónico implementado para `CONFIG_SET/CONFIG_GET`.
-- Tampoco hay endpoint admin canónico per-node config (`/nodes/{node}/config`) en la API actual.
+- Existe endpoint admin canónico per-node:
+  - `GET /hives/{hive}/nodes/{node}/config`
+  - `PUT /hives/{hive}/nodes/{node}/config`
+- El update per-node usa unicast a L2 del nodo con `CONFIG_CHANGED` (`subsystem=node_config`) como equivalente explícito al contrato `CONFIG_SET`.
+- El flujo soporta hive remoto vía relay motherbee -> `SY.orchestrator@target`.
 
 Evidencia:
-- `docs/02-protocolo.md:454`
-- `docs/02-protocolo.md:458`
-- `src/bin/sy_admin.rs:999`
+- `src/bin/sy_admin.rs`
+- `src/bin/sy_orchestrator.rs`
+- `scripts/node_config_per_node_e2e.sh`
+
+Lista de tareas FR-05:
+- [x] FR5-T1. Endpoint admin per-node config (`GET/PUT /hives/{hive}/nodes/{node}/config`).
+- [x] FR5-T2. Acción canónica en orchestrator (`get_node_config` / `set_node_config`).
+- [x] FR5-T3. Soporte remoto por relay (`NODE_CONFIG_GET/SET` via system messages).
+- [x] FR5-T4. Señal unicast de hot-reload (`CONFIG_CHANGED subsystem=node_config`) al nodo target.
+- [x] FR5-T5. E2E dedicado (`scripts/node_config_per_node_e2e.sh`).
 
 ---
 
 ### FR-06 — Config efectiva single-file por nodo (ownership de creación)
 
-Estado: OPEN (prioridad media)
+Estado: CLOSED (orchestrator owner en spawn + update API)
 
 Qué pasa hoy:
-- Hay spec de trabajo que dice “persistir config por nodo”.
-- En `run_node` actual, `payload.config` solo participa para resolver `tenant_id`.
-- No hay materialización canónica del JSON efectivo por nodo durante spawn.
+- `run_node` materializa config efectiva por nodo bajo `${STATE_DIR}/node-configs/<TYPE>/<node_name@hive>.json`.
+- Orchestrator crea el archivo inicial durante spawn (si no existe), preserva el existente en respawn y actualiza vía `PUT .../config`.
+- El bloque `_system` se mantiene canónico (`node_name`, `hive_id`, `config_version`, timestamps, runtime metadata).
 
 Evidencia:
-- `docs/onworking/node-spawn-config-spec.md:103`
-- `docs/onworking/node-spawn-config-spec.md:146`
-- `src/bin/sy_orchestrator.rs:5278`
+- `src/bin/sy_orchestrator.rs`
+- `scripts/node_config_per_node_e2e.sh`
+
+Lista de tareas FR-06:
+- [x] FR6-T1. Definir path único de config efectiva por nodo bajo `${STATE_DIR}`.
+- [x] FR6-T2. Crear config inicial en spawn con metadata `_system`.
+- [x] FR6-T3. Versionado de config (`_system.config_version`) y update atómico.
+- [x] FR6-T4. Exponer lectura/escritura por API admin per-node.
+- [x] FR6-T5. Cubrir flujo spawn+update+read en E2E.
 
 ---
 
@@ -175,10 +190,10 @@ Estado: CERRADA
 
 ### D-02 (strict register)
 
-Estado: CERRADA (implementado en core)
+Estado: CERRADA (core + E2E + docs)
 - `run_node` ahora exige register identity exitoso.
 - Se removió dependencia de flag `ORCH_IDENTITY_REGISTER_REQUIRED` en el flow de spawn.
-- Quedan pendientes E2E/documentación de cierre (FR2-T6/7/8).
+- Validado por E2E negativos (`identity_register_strict_e2e.sh`) y alineado en `10-identity-v2.md`.
 
 ### D-03 (L3 migration)
 
@@ -189,25 +204,25 @@ Definir plan en dos fases:
 
 ### D-04 (config per-node)
 
-Cerrar decisión de arquitectura:
-- opción A dual-mode explícito (`CONFIG_CHANGED` global + `CONFIG_SET/GET` unicast), o
-- opción B broadcast con targeting fuerte.
+Estado: CERRADA
+- Se adopta modo dual explícito en operación:
+  - config global/subsystem: `CONFIG_CHANGED` broadcast (actual).
+  - config per-node: API per-node + unicast `CONFIG_CHANGED` (`subsystem=node_config`) al nodo target.
+- No se agrega `CONFIG_SET/GET` nuevo en protocolo por ahora; se documenta equivalente explícito.
 
 ### D-05 (effective config file ownership)
 
-Definir actor creador del JSON efectivo por nodo:
-- orchestrator en spawn, o
-- nodo en primer config válido.
+Estado: CERRADA
+- Ownership adoptado: orchestrator crea/gestiona el archivo efectivo inicial en spawn.
+- Update posterior se hace por API per-node (`PUT .../config`) y persiste en el mismo archivo.
 
 ---
 
 ## 4) Orden sugerido de ejecución
 
-1. FR-02 (cerrar modo estricto de identity register).
-2. FR-05 + FR-06 (modelo canónico de config per-node y archivo efectivo).
-3. FR-07 (status schema común).
-4. FR-03 (regresión E2E de cierre).
-5. FR-04 (ON HOLD hasta cerrar spec cognitive de L3/CTX).
+1. FR-07 (status schema común).
+2. FR-03 (regresión E2E de cierre).
+3. FR-04 (ON HOLD hasta cerrar spec cognitive de L3/CTX).
 
 ---
 
@@ -220,6 +235,10 @@ Definir actor creador del JSON efectivo por nodo:
 | 2026-03-12 | Regla dura control-plane | `role=motherbee` exige `hive_id=motherbee`; sin nombres alternativos/legacy para primary L2 | core | cerrado |
 | 2026-03-13 | FR-01 validación | D4/D5 E2E pasan; enrutamiento identity write a `SY.identity@motherbee` sin fallback local | core | cerrado |
 | 2026-03-13 | FR-02 core strict | `run_node` falla siempre ante register identity no exitoso; removido soft-fail/flag estricto en spawn | core | parcial |
+| 2026-03-13 | FR-02 E2E negativos | `identity_register_strict_e2e.sh` valida `missing_tenant_id` e `identity_unavailable` con fallo explícito `IDENTITY_REGISTER_FAILED` | core | parcial |
+| 2026-03-13 | FR-02 cierre documental | `10-identity-v2.md` declara gate obligatorio fail-closed para spawn sin registro identity exitoso | core | cerrado |
+| 2026-03-13 | FR-05 cierre | API per-node config implementada (`GET/PUT /hives/{hive}/nodes/{node}/config`) + relay remoto | core | cerrado |
+| 2026-03-13 | FR-06 cierre | Config efectiva single-file bajo `${STATE_DIR}/node-configs` con creación en spawn y update atómico | core | cerrado |
 
 ---
 

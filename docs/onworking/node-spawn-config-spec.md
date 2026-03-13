@@ -17,11 +17,11 @@ When orchestrator spawns a business node (AI, WF, IO), the node needs configurat
 
 1. **Config arrives via admin API.** The architect (human or AI) sends a POST to SY.admin with the full node configuration. This is the single entry point.
 
-2. **Orchestrator creates the config file.** Before executing `start.sh`, orchestrator writes a JSON config file to a standard path. The node reads it at startup.
+2. **Orchestrator creates the config file.** Before executing `start.sh`, orchestrator writes a JSON config file to a standard path under `${STATE_DIR}`. The node reads it at startup.
 
 3. **Single file per node instance.** One file serves as both initial config (written by orchestrator) and retention (updated by the node). Orchestrator creates it once; after that, the node owns it.
 
-4. **If the file already exists, spawn fails.** Orchestrator returns error to admin. This prevents accidental overwrites of a running node's config.
+4. **If the file already exists, spawn keeps it.** Orchestrator treats spawn as idempotent and reuses the existing effective config file.
 
 5. **Post-spawn updates via CONFIG_CHANGED.** Changes to node config (new prompt, new model, etc.) are delivered as CONFIG_CHANGED messages. The node receives them, updates its own file.
 
@@ -36,7 +36,7 @@ When orchestrator spawns a business node (AI, WF, IO), the node needs configurat
 ## 3. Filesystem Layout
 
 ```
-/var/lib/fluxbee/nodes/
+/var/lib/fluxbee/state/node-configs/
 ├── AI/
 │   ├── AI.soporte.l1@produccion.json
 │   ├── AI.frontdesk@produccion.json
@@ -55,14 +55,14 @@ When orchestrator spawns a business node (AI, WF, IO), the node needs configurat
 - File name: full L2 node name including `@hive` suffix, with `.json` extension.
 - L2 name is guaranteed unique by orchestrator — no file collision possible.
 - Orchestrator creates the type directory if it doesn't exist.
-- Base path: `/var/lib/fluxbee/nodes/` (not configurable, consistent with other fluxbee state paths).
+- Base path: `${STATE_DIR}/node-configs/` (actual default: `/var/lib/fluxbee/state/node-configs/`).
 
 **Path resolution by the node:**
 
 ```rust
 fn config_path(node_name: &str) -> PathBuf {
     let node_type = node_name.split('.').next().unwrap(); // "AI", "WF", "IO"
-    PathBuf::from("/var/lib/fluxbee/nodes")
+    PathBuf::from("/var/lib/fluxbee/state/node-configs")
         .join(node_type)
         .join(format!("{}.json", node_name))
 }
@@ -145,7 +145,7 @@ SY.admin sends CONFIG_CHANGED to the target node. The node receives it, merges u
 
 5. SY.orchestrator writes config file:
    - Creates type directory if missing.
-   - Writes to `/var/lib/fluxbee/nodes/{TYPE}/{node_name}@{hive}.json`.
+   - Writes to `${STATE_DIR}/node-configs/{TYPE}/{node_name}@{hive}.json`.
    - Atomic write (tmp + rename).
 
 6. SY.orchestrator executes `start.sh` for the runtime.
@@ -244,7 +244,7 @@ The `_system` block is always present and written by orchestrator. Nodes should 
 
 ```
 Node starts
-  → reads /var/lib/fluxbee/nodes/{TYPE}/{node_name}.json
+  → reads ${STATE_DIR}/node-configs/{TYPE}/{node_name}.json
   → parses _system block (gets ILK, hive, runtime info)
   → parses runtime-specific config (api_key, prompt, etc.)
   → connects to router with node_name from _system

@@ -1152,6 +1152,51 @@ async fn handle_hive_paths(
                 handle_admin_command(ctx, client, "kill_node", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("GET", ["nodes", name, "config"]) => {
+            let payload = serde_json::json!({
+                "node_name": decode_percent(name),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "get_node_config", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("PUT", ["nodes", name, "config"]) => {
+            let config_payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if !config_payload.is_object() {
+                return Ok(Some((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "set_node_config",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": "request body must be a JSON object",
+                    })
+                    .to_string(),
+                )));
+            }
+            let replace = query
+                .get("replace")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let notify = query
+                .get("notify")
+                .map(|value| !(value == "0" || value.eq_ignore_ascii_case("false")))
+                .unwrap_or(true);
+            let payload = serde_json::json!({
+                "node_name": decode_percent(name),
+                "config": config_payload,
+                "replace": replace,
+                "notify": notify,
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "set_node_config", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["versions"]) => {
             let (status, resp) =
                 handle_admin_query(ctx, client, "get_versions", Some(hive)).await?;
@@ -2411,8 +2456,8 @@ fn build_admin_request(
         }
         "list_nodes" | "run_node" | "kill_node" | "hive_status" | "get_storage" | "set_storage"
         | "list_hives" | "get_hive" | "list_versions" | "get_versions" | "list_deployments"
-        | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "remove_hive"
-        | "add_hive" => "SY.orchestrator",
+        | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "get_node_config"
+        | "set_node_config" | "remove_hive" | "add_hive" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
     let route_hive = if action_routes_via_local_orchestrator(action) {
@@ -2573,7 +2618,7 @@ fn admin_action_timeout(action: &str) -> Duration {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
         }
         // other orchestrator mutating actions can also take longer than default.
-        "run_node" | "kill_node" | "remove_hive" => {
+        "run_node" | "kill_node" | "remove_hive" | "set_node_config" | "get_node_config" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30))
         }
         _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5)),
@@ -2657,6 +2702,8 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "get_deployments"
             | "list_drift_alerts"
             | "get_drift_alerts"
+            | "get_node_config"
+            | "set_node_config"
             | "remove_hive"
             | "add_hive"
     )
