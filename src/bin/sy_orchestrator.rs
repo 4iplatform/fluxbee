@@ -32,6 +32,7 @@ type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 const BOOTSTRAP_SSH_USER: &str = "administrator";
 const BOOTSTRAP_SSH_PASS: &str = "magicAI";
 const MOTHERBEE_SSH_KEY_PATH: &str = "/var/lib/fluxbee/ssh/motherbee.key";
+const PRIMARY_HIVE_ID: &str = "motherbee";
 const ORCH_SUDOERS_PATH: &str = "/etc/sudoers.d/fluxbee-orchestrator";
 const ORCH_SSH_GATE_PATH: &str = "/usr/local/bin/fluxbee-ssh-gate.sh";
 const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
@@ -409,12 +410,27 @@ async fn main() -> Result<(), OrchestratorError> {
 
     let hive = load_hive(&config_dir)?;
     let is_motherbee = is_mother_role(hive.role.as_deref());
-    if !is_motherbee && !is_worker_role(hive.role.as_deref()) {
+    let is_worker = is_worker_role(hive.role.as_deref());
+    if !is_motherbee && !is_worker {
         tracing::warn!(
             role = ?hive.role,
             "SY.orchestrator supports only role=motherbee|worker; exiting"
         );
         return Ok(());
+    }
+    if is_motherbee && hive.hive_id != PRIMARY_HIVE_ID {
+        return Err(format!(
+            "invalid hive.yaml: role=motherbee requires hive_id='{}' (got '{}')",
+            PRIMARY_HIVE_ID, hive.hive_id
+        )
+        .into());
+    }
+    if is_worker && hive.hive_id == PRIMARY_HIVE_ID {
+        return Err(format!(
+            "invalid hive.yaml: hive_id='{}' is reserved for role=motherbee",
+            PRIMARY_HIVE_ID
+        )
+        .into());
     }
     let gateway_name = hive
         .wan
@@ -5521,46 +5537,22 @@ fn resolve_tenant_id_for_node(payload: &serde_json::Value) -> Option<String> {
 
 fn resolve_identity_primary_hive_id(
     state: &OrchestratorState,
-    payload: &serde_json::Value,
 ) -> Result<String, OrchestratorError> {
-    if let Some(raw) = payload
-        .get("identity_primary_hive_id")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        if !valid_hive_id(raw) {
-            return Err("invalid identity_primary_hive_id".into());
-        }
-        return Ok(raw.to_string());
+    if state.is_motherbee && state.hive_id != PRIMARY_HIVE_ID {
+        return Err(format!(
+            "invalid local role/hive_id: role=motherbee requires hive_id='{}' (got '{}')",
+            PRIMARY_HIVE_ID, state.hive_id
+        )
+        .into());
     }
-
-    if let Ok(raw) = std::env::var("ORCH_IDENTITY_PRIMARY_HIVE_ID") {
-        let value = raw.trim();
-        if !value.is_empty() {
-            if !valid_hive_id(value) {
-                return Err("invalid ORCH_IDENTITY_PRIMARY_HIVE_ID".into());
-            }
-            return Ok(value.to_string());
-        }
+    if !state.is_motherbee && state.hive_id == PRIMARY_HIVE_ID {
+        return Err(format!(
+            "invalid local role/hive_id: hive_id='{}' is reserved for role=motherbee",
+            PRIMARY_HIVE_ID
+        )
+        .into());
     }
-
-    if state.is_motherbee {
-        return Ok(state.hive_id.clone());
-    }
-
-    if state.wan_authorized_hives.len() == 1 {
-        let value = state.wan_authorized_hives[0].trim();
-        if !value.is_empty() && valid_hive_id(value) {
-            return Ok(value.to_string());
-        }
-    }
-
-    tracing::warn!(
-        hive_id = %state.hive_id,
-        "identity primary hive id unresolved on worker; falling back to local hive id"
-    );
-    Ok(state.hive_id.clone())
+    Ok(PRIMARY_HIVE_ID.to_string())
 }
 
 fn resolve_identity_change_reason(payload: &serde_json::Value) -> Option<String> {
@@ -6040,7 +6032,7 @@ async fn run_node_flow(
             });
         }
     };
-    let identity_primary_hive_id = match resolve_identity_primary_hive_id(state, payload) {
+    let identity_primary_hive_id = match resolve_identity_primary_hive_id(state) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -6105,10 +6097,6 @@ async fn run_node_flow(
                 serde_json::json!(requested_version),
             );
             obj.insert("unit".to_string(), serde_json::json!(unit));
-            obj.insert(
-                "identity_primary_hive_id".to_string(),
-                serde_json::json!(identity_primary_hive_id),
-            );
         }
         return match forward_system_action_to_hive(
             state,
@@ -9533,7 +9521,7 @@ fn persist_storage_path_in_hive(config_dir: &Path, path: &str) -> Result<(), Orc
 }
 
 fn is_mother_role(role: Option<&str>) -> bool {
-    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee" || r == "mother")
+    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee")
 }
 
 fn is_worker_role(role: Option<&str>) -> bool {

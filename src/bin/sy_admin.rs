@@ -26,6 +26,7 @@ use json_router::shm::{
 };
 
 type AdminError = Box<dyn std::error::Error + Send + Sync>;
+const PRIMARY_HIVE_ID: &str = "motherbee";
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -195,9 +196,23 @@ async fn main() -> Result<(), AdminError> {
         .as_ref()
         .and_then(|wan| wan.authorized_hives.clone())
         .unwrap_or_default();
+    if hive.hive_id == PRIMARY_HIVE_ID && !is_mother_role(hive.role.as_deref()) {
+        return Err(format!(
+            "invalid hive.yaml: hive_id='{}' is reserved for role=motherbee",
+            PRIMARY_HIVE_ID
+        )
+        .into());
+    }
     if !is_mother_role(hive.role.as_deref()) {
         tracing::warn!("SY.admin solo corre en motherbee; role != motherbee");
         return Ok(());
+    }
+    if hive.hive_id != PRIMARY_HIVE_ID {
+        return Err(format!(
+            "invalid hive.yaml: role=motherbee requires hive_id='{}' (got '{}')",
+            PRIMARY_HIVE_ID, hive.hive_id
+        )
+        .into());
     }
     // Default to loopback for safer deployments; expose externally only via explicit config/env.
     let admin_listen = std::env::var("JSR_ADMIN_LISTEN")
@@ -1506,7 +1521,7 @@ fn load_node_uuid(dir: &Path, base_name: &str) -> Result<String, AdminError> {
 }
 
 fn is_mother_role(role: Option<&str>) -> bool {
-    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee" || r == "mother")
+    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee")
 }
 
 fn http_status_line(status: u16) -> &'static str {

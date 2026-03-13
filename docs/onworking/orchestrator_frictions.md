@@ -190,7 +190,8 @@ Definir actor creador del JSON efectivo por nodo:
 | Fecha | Tema | Decisión | Owner | Estado |
 |------|------|----------|-------|--------|
 | 2026-03-12 | Documento inicial | Creado draft de fricciones | core | abierto |
-| 2026-03-12 | Inventario simplificado | Se adopta dirección de `system-inventory-spec.md` con primary resuelto por convención/upstream (sin campo nuevo en SHM identity) | core | cerrado |
+| 2026-03-12 | Inventario simplificado | Se adopta dirección de `system-inventory-spec.md` con primary fijo en `SY.identity@motherbee` y sin campo nuevo en SHM identity | core | cerrado |
+| 2026-03-12 | Regla dura control-plane | `role=motherbee` exige `hive_id=motherbee`; sin nombres alternativos/legacy para primary L2 | core | cerrado |
 
 ---
 
@@ -205,10 +206,11 @@ Definir actor creador del JSON efectivo por nodo:
 
 ### 6.2 Decisión adoptada para primary
 
-Se adopta el enfoque simple:
+Se adopta el enfoque simple (y duro):
 - no agregar `primary_hive_id` al `IdentityHeader`;
-- resolver primary en workers por `identity.sync.upstream` y conexión activa de sync;
-- no permitir fallback local para writes identity en worker.
+- primary identity write target fijo: `SY.identity@motherbee`;
+- no permitir fallback local para writes identity en worker;
+- `role=motherbee` requiere `hive_id=motherbee` en instalación/bootstrap.
 
 Razón:
 - evita migración de layout/version de identity SHM;
@@ -218,7 +220,7 @@ Razón:
 
 La propuesta simplificada resuelve FR-01 si se cumplen dos condiciones:
 - worker deja de adivinar primary por heurística local/WAN para writes de identity;
-- si falta `identity.sync.upstream` (o no hay resolución válida), falla en forma explícita (sin fallback local).
+- si `SY.identity@motherbee` no es enrutable/alcanzable, falla en forma explícita (sin fallback local).
 
 ---
 
@@ -258,10 +260,10 @@ Criterio de aceptación C:
 ### Fase D — E2E y regresión FR-01/FR-03
 
 - [x] INV-D1. E2E: spawn/kill se refleja en inventario. (`scripts/inventory_spawn_kill_e2e.sh`)
-- [ ] INV-D2. E2E: add_hive/remove_hive se refleja en inventario.
+- [ ] INV-D2. E2E: add_hive/remove_hive se refleja en inventario. (`scripts/inventory_add_remove_hive_e2e.sh`)
 - [ ] INV-D3. E2E: hive stale aparece como stale.
-- [ ] INV-D4. E2E: worker con `identity.sync.upstream` enruta writes a primary sin fallback local.
-- [ ] INV-D5. E2E negativo: worker sin `identity.sync.upstream` falla registro identity explícitamente.
+- [ ] INV-D4. E2E: worker enruta writes a `SY.identity@motherbee` sin fallback local.
+- [ ] INV-D5. E2E negativo: worker falla registro identity cuando `SY.identity@motherbee` es inalcanzable.
 - [ ] INV-D6. E2E regresión: `node_name@hive` cruzado vs endpoint hive mantiene identidad/routing correctos.
 
 Criterio de aceptación D:

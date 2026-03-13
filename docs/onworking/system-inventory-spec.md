@@ -33,7 +33,7 @@ The goal is to make the full system inventory available locally in SHM on every 
 
 5. **Admin queries orchestrator, not the router.** Admin sends inventory requests to SY.orchestrator, which reads SHM and returns the consolidated view. The router is never queried directly — it's a data plane component, not a control plane responder.
 
-6. **Primary hive resolved by convention, not SHM.** Motherbee is the primary, always. Workers know this from `identity.sync.upstream` in hive.yaml and their active socket connection. No field in SHM needed — the processes that need to know the primary already know it from their own state.
+6. **Primary identity target is fixed and canonical.** The control-plane hive id is mandatory and fixed to `motherbee`. Therefore all identity writes target `SY.identity@motherbee` (not configurable, no SHM field). Workers must route writes to `@motherbee` and fail explicitly if unreachable.
 
 ---
 
@@ -208,10 +208,10 @@ SY.admin sends request to SY.orchestrator, which reads SHM and returns:
     "updated_at": "2026-03-12T10:00:00Z",
     "hives": [
       {
-        "hive_id": "sandbox",
+        "hive_id": "motherbee",
         "is_local": true,
         "status": "alive",
-        "router_name": "RT.gateway@sandbox",
+        "router_name": "RT.gateway@motherbee",
         "last_seen": "2026-03-12T10:00:00Z",
         "node_count": 12
       },
@@ -398,10 +398,10 @@ Implementation status (2026-03-12):
 ### Phase D — Validation
 
 - [x] D1. E2E: inventory reflects node spawn/kill in real time. (`scripts/inventory_spawn_kill_e2e.sh`)
-- [ ] D2. E2E: inventory reflects add_hive/remove_hive.
+- [ ] D2. E2E: inventory reflects add_hive/remove_hive. (`scripts/inventory_add_remove_hive_e2e.sh`)
 - [ ] D3. E2E: stale hive appears as stale in inventory.
-- [ ] D4. E2E: worker identity sync connection establishes correctly (primary resolved by convention).
-- [ ] D5. E2E negative: worker without `identity.sync.upstream` fails identity write routing explicitly (no local fallback).
+- [ ] D4. E2E: worker identity writes are routed to `SY.identity@motherbee` (no fallback to local replica).
+- [ ] D5. E2E negative: if `SY.identity@motherbee` is unreachable, worker fails identity write routing explicitly (no local fallback).
 
 ---
 
@@ -411,7 +411,15 @@ Implementation status (2026-03-12):
 - Identity metadata (ILK details, capabilities) is not in the inventory — that's in `jsr-identity-<hive>`.
 - Runtime/version information per node is not in LSA today. Could be added later if needed.
 - Historical inventory (who was running when) is not persisted. This is a live snapshot only.
-- Primary hive identification: resolved by convention (motherbee = primary), not stored in inventory. Workers know the primary from their `identity.sync.upstream` config and active socket connection.
+- Primary hive identification is fixed by rule: control-plane hive id MUST be `motherbee`; identity writes target `SY.identity@motherbee`. Not stored in inventory SHM.
+
+---
+
+## 9.1 Breaking Rule (No Legacy)
+
+- `role: motherbee` implies `hive_id: motherbee` (required).
+- Install/bootstrap must create the control-plane hive as `motherbee`.
+- Configurations using control-plane `hive_id` values other than `motherbee` are invalid and must be migrated.
 
 ---
 
