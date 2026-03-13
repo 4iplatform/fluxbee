@@ -178,7 +178,7 @@ Salida:
     - usa relay system message hacia `SY.identity@<primary_hive>` (resuelto por `identity_primary_hive_id`)
     - en `SPAWN_NODE` remoto, propaga `identity_primary_hive_id` al worker para evitar resolver contra `SY.identity@<worker_hive>`
     - persiste `node_name -> ilk_id` en estado local orchestrator como cache/diagnóstico (no fuente de verdad)
-    - modo estricto opcional por env `ORCH_IDENTITY_REGISTER_REQUIRED=true`
+    - modo estricto obligatorio en core: si `ILK_REGISTER` no devuelve `status=ok`, `run_node` falla con `IDENTITY_REGISTER_FAILED` (sin soft-fail)
     - tenant resuelto desde `payload.tenant_id`, `payload.config.tenant_id` o `ORCH_DEFAULT_TENANT_ID`
   - [x] updates de metadata por `ILK_UPDATE` en `run_node` (delta explícito):
     - target fijo `SY.identity@<primary_hive>` (misma regla que `ILK_REGISTER`)

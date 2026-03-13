@@ -1,7 +1,7 @@
 # Orchestrator Frictions (working draft)
 
 Status: working
-Date: 2026-03-12
+Date: 2026-03-13
 Scope: SY.admin, SY.orchestrator, router, SDK protocol, identity integration
 Reference input: `fluxbee-core-change-request.md` (draft v1), `docs/onworking/system-inventory-spec.md` (v1.0)
 
@@ -18,38 +18,57 @@ Es temporal y orientado a decisión.
 
 ### FR-01 — Identity primary resolution en workers
 
-Estado: OPEN (alta prioridad)
+Estado: CLOSED (implementado y validado E2E)
 
 Qué pasa hoy:
-- `sy_orchestrator` puede resolver `identity_primary_hive_id` por heurística WAN y, si no resuelve, hace fallback al hive local.
+- El primary de identity write está fijado por convención dura en `motherbee`.
+- `sy_orchestrator` valida coherencia `role/hive_id` y enruta writes a `SY.identity@motherbee`.
+- No hay fallback local para writes identity en workers.
 
 Evidencia:
-- `src/bin/sy_orchestrator.rs:5292`
-- `src/bin/sy_orchestrator.rs:5322`
-- `src/bin/sy_orchestrator.rs:5333`
+- `src/bin/sy_orchestrator.rs:37`
+- `src/bin/sy_orchestrator.rs:5540`
+- `src/bin/sy_orchestrator.rs:5892`
+- `scripts/inventory_identity_primary_routing_e2e.sh` (D4/D5)
 
-Impacto:
-- Puede intentar `ILK_REGISTER` / `ILK_UPDATE` contra réplica (`SY.identity@workerX`) y recibir `NOT_PRIMARY`.
-- Si no está en modo estricto, el spawn puede continuar sin registro identity exitoso.
+Resultado:
+- Se cierra fricción de resolución de primary.
+- Riesgo residual asociado a identity write queda en FR-02 (modo estricto de registro).
 
 ---
 
 ### FR-02 — Spawn puede continuar aunque falle identity register
 
-Estado: OPEN (alta prioridad)
+Estado: PARTIAL-CLOSED (cambio core aplicado, faltan E2E dedicados y cierre documental)
 
 Qué pasa hoy:
-- El modo estricto de registro identity depende de `ORCH_IDENTITY_REGISTER_REQUIRED`.
-- Default actual: `false`.
-- Si identity devuelve error y no está estricto, el flow continúa.
+- `run_node` exige registro identity exitoso para continuar.
+- Fallos de identity register ya no tienen camino soft-fail.
+- Faltan tests dedicados FR-02 (negativos) para cerrar formalmente.
 
 Evidencia:
-- `src/bin/sy_orchestrator.rs:5183`
-- `src/bin/sy_orchestrator.rs:5657`
-- `src/bin/sy_orchestrator.rs:5671`
+- `src/bin/sy_orchestrator.rs:5843`
+- `src/bin/sy_orchestrator.rs:5851`
+- `src/bin/sy_orchestrator.rs:5894`
+- `src/bin/sy_orchestrator.rs:6187`
 
 Nota de spec:
 - `docs/10-identity-v2.md:302` indica que el orchestrator no debería spawnear sin confirmación síncrona de ILK en DB.
+
+Lista de tareas FR-02 (ejecución):
+- [x] FR2-T1. Cambiar default de `identity_register_required()` a `true` en core.
+- [x] FR2-T2. Eliminar camino soft-fail en `ensure_node_identity_registered` (si status != ok -> error duro siempre).
+- [x] FR2-T3. Tratar `missing_tenant_id` e `identity_unavailable` como error explícito de spawn (no `skipped`).
+- [x] FR2-T4. Mantener `ORCH_IDENTITY_REGISTER_REQUIRED` solo como override temporal de test, o removerla completamente (decisión hard no-legacy sugerida: remover).
+- [x] FR2-T5. Actualizar mensajes de error/contrato HTTP para que `run_node` devuelva `IDENTITY_REGISTER_FAILED` consistente en todos los fallos de registro.
+- [x] FR2-T6. Agregar E2E negativo dedicado FR-02: spawn sin `tenant_id` debe fallar siempre. (`scripts/identity_register_strict_e2e.sh`)
+- [x] FR2-T7. Agregar E2E negativo dedicado FR-02: con identity no disponible, spawn debe fallar siempre. (`scripts/identity_register_strict_e2e.sh`)
+- [ ] FR2-T8. Actualizar docs (`10-identity-v2.md` y este doc) declarando que spawn sin identity register exitoso está prohibido.
+
+Criterio de cierre FR-02:
+- `run_node` no puede devolver `status=ok` si `payload.identity.register.status != ok`.
+- No existen respuestas `register.status=skipped` en flujos de spawn productivos.
+- E2E FR-02 positivos/negativos en verde.
 
 ---
 
@@ -76,7 +95,11 @@ Riesgo residual:
 
 ### FR-04 — Campos L3 tipados (`src_ilk/dst_ilk/ich/ctx/ctx_seq/ctx_window`)
 
-Estado: OPEN (alta prioridad)
+Estado: ON HOLD (dependencia externa de spec cognitive)
+
+Regla de trabajo actual:
+- Este frente no se toca por ahora.
+- No implementar cambios de `ctx` / `ctx_window` hasta cerrar la spec cognitive onworking.
 
 Qué pasa hoy:
 - El protocolo/documentación define L3 tipado.
@@ -145,14 +168,17 @@ Qué pasa hoy:
 
 ### D-01 (identity primary)
 
-Definir regla obligatoria en worker:
-- sin `identity_primary_hive_id` explícito -> error duro (sin fallback local),
-- fuente: `hive.yaml` + env como fallback,
-- heurística WAN solo observabilidad (warning), no routing de writes.
+Estado: CERRADA
+- Regla activa: primary de writes identity fijo en `SY.identity@motherbee`.
+- `role=motherbee` exige `hive_id=motherbee`; sin nombres alternativos/legacy.
+- Validado por E2E D4/D5.
 
 ### D-02 (strict register)
 
-Definir si `ORCH_IDENTITY_REGISTER_REQUIRED` pasa a default estricto en core.
+Estado: CERRADA (implementado en core)
+- `run_node` ahora exige register identity exitoso.
+- Se removió dependencia de flag `ORCH_IDENTITY_REGISTER_REQUIRED` en el flow de spawn.
+- Quedan pendientes E2E/documentación de cierre (FR2-T6/7/8).
 
 ### D-03 (L3 migration)
 
@@ -177,11 +203,11 @@ Definir actor creador del JSON efectivo por nodo:
 
 ## 4) Orden sugerido de ejecución
 
-1. FR-01 + FR-02 (evitar inconsistencia de identidad en spawn).
-2. FR-04 (alinear contrato L3 real).
-3. FR-05 + FR-06 (modelo canónico de config per-node y archivo efectivo).
-4. FR-07 (status schema común).
-5. FR-03 (regresión E2E de cierre).
+1. FR-02 (cerrar modo estricto de identity register).
+2. FR-05 + FR-06 (modelo canónico de config per-node y archivo efectivo).
+3. FR-07 (status schema común).
+4. FR-03 (regresión E2E de cierre).
+5. FR-04 (ON HOLD hasta cerrar spec cognitive de L3/CTX).
 
 ---
 
@@ -192,6 +218,8 @@ Definir actor creador del JSON efectivo por nodo:
 | 2026-03-12 | Documento inicial | Creado draft de fricciones | core | abierto |
 | 2026-03-12 | Inventario simplificado | Se adopta dirección de `system-inventory-spec.md` con primary fijo en `SY.identity@motherbee` y sin campo nuevo en SHM identity | core | cerrado |
 | 2026-03-12 | Regla dura control-plane | `role=motherbee` exige `hive_id=motherbee`; sin nombres alternativos/legacy para primary L2 | core | cerrado |
+| 2026-03-13 | FR-01 validación | D4/D5 E2E pasan; enrutamiento identity write a `SY.identity@motherbee` sin fallback local | core | cerrado |
+| 2026-03-13 | FR-02 core strict | `run_node` falla siempre ante register identity no exitoso; removido soft-fail/flag estricto en spawn | core | parcial |
 
 ---
 
@@ -218,9 +246,9 @@ Razón:
 
 ### 6.3 Efecto sobre FR-01
 
-La propuesta simplificada resuelve FR-01 si se cumplen dos condiciones:
-- worker deja de adivinar primary por heurística local/WAN para writes de identity;
-- si `SY.identity@motherbee` no es enrutable/alcanzable, falla en forma explícita (sin fallback local).
+FR-01 queda cerrado en implementación actual:
+- worker no adivina primary por heurística local/WAN para writes de identity;
+- si `SY.identity@motherbee` no es enrutable/alcanzable, falla en forma explícita (sin fallback local), validado por D5.
 
 ---
 
@@ -266,7 +294,7 @@ Criterio de aceptación C:
   - Estado: bloqueado por contrato operativo actual. Sin endpoint `/hives/{id}/routers*` en `SY.admin`, falta trigger canónico para inducir `stale` sin workaround manual.
   - No duplica validación de delete/add (cubierta en INV-D2).
 - [x] INV-D4. E2E: worker enruta writes a `SY.identity@motherbee` sin fallback local. (`scripts/inventory_identity_primary_routing_e2e.sh`)
-- [ ] INV-D5. E2E negativo: worker falla registro identity cuando `SY.identity@motherbee` es inalcanzable. (`scripts/inventory_identity_primary_routing_e2e.sh`)
+- [x] INV-D5. E2E negativo: worker falla registro identity cuando `SY.identity@motherbee` es inalcanzable. (`scripts/inventory_identity_primary_routing_e2e.sh`)
 - [ ] INV-D6. E2E regresión: `node_name@hive` cruzado vs endpoint hive mantiene identidad/routing correctos.
 
 Criterio de aceptación D:

@@ -404,7 +404,7 @@ Implementation status (2026-03-12):
   - Estado: bloqueado por contrato operativo actual. `SY.admin` no expone `/hives/{id}/routers*` y aún falta trigger canónico no-legacy para forzar transición `alive -> stale` en pruebas.
   - Nota: `D3` no valida delete/add; eso ya queda cubierto por `D2`.
 - [x] D4. E2E: worker identity writes are routed to `SY.identity@motherbee` (no fallback to local replica). (`scripts/inventory_identity_primary_routing_e2e.sh`)
-- [ ] D5. E2E negative: if `SY.identity@motherbee` is unreachable, worker fails identity write routing explicitly (no local fallback). (`scripts/inventory_identity_primary_routing_e2e.sh`)
+- [x] D5. E2E negative: if `SY.identity@motherbee` is unreachable, worker fails identity write routing explicitly (no local fallback). (`scripts/inventory_identity_primary_routing_e2e.sh`)
 
 ---
 

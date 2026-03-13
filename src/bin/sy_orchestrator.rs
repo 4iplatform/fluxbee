@@ -5428,13 +5428,6 @@ fn parse_prefixed_uuid(raw: &str, prefix: &str) -> Result<Uuid, OrchestratorErro
     Ok(uuid)
 }
 
-fn identity_register_required() -> bool {
-    std::env::var("ORCH_IDENTITY_REGISTER_REQUIRED")
-        .ok()
-        .and_then(|raw| parse_bool_str(&raw))
-        .unwrap_or(false)
-}
-
 fn node_ilk_map_path(state: &OrchestratorState) -> PathBuf {
     state
         .state_dir
@@ -5848,26 +5841,12 @@ async fn ensure_node_identity_registered(
     runtime: &str,
     runtime_version: &str,
 ) -> Result<Option<serde_json::Value>, OrchestratorError> {
-    let required = identity_register_required();
-
     if !identity_available() {
-        if required {
-            return Err("identity registration required but sy-identity is not installed".into());
-        }
-        return Ok(Some(serde_json::json!({
-            "status": "skipped",
-            "reason": "identity_unavailable",
-        })));
+        return Err("identity registration required but sy-identity is not installed".into());
     }
 
     let Some(tenant_id) = resolve_tenant_id_for_node(payload) else {
-        if required {
-            return Err("identity registration required but tenant_id is missing (use payload.tenant_id, payload.config.tenant_id, or ORCH_DEFAULT_TENANT_ID)".into());
-        }
-        return Ok(Some(serde_json::json!({
-            "status": "skipped",
-            "reason": "missing_tenant_id",
-        })));
+        return Err("identity registration required but tenant_id is missing (use payload.tenant_id, payload.config.tenant_id, or ORCH_DEFAULT_TENANT_ID)".into());
     };
     parse_prefixed_uuid(&tenant_id, "tnt")?;
 
@@ -5912,25 +5891,11 @@ async fn ensure_node_identity_registered(
             .get("message")
             .and_then(|v| v.as_str())
             .unwrap_or("identity register returned non-ok status");
-        if required {
-            return Err(format!(
-                "identity register failed code={} message={}",
-                error_code, message
-            )
-            .into());
-        }
-        tracing::warn!(
-            target = %identity_target,
-            code = error_code,
-            message = message,
-            "identity register returned non-ok status; continuing because ORCH_IDENTITY_REGISTER_REQUIRED=false"
-        );
-        return Ok(Some(serde_json::json!({
-            "status": "error",
-            "error_code": error_code,
-            "message": message,
-            "target": identity_target,
-        })));
+        return Err(format!(
+            "identity register failed code={} message={}",
+            error_code, message
+        )
+        .into());
     }
 
     let resolved_ilk_id = response
