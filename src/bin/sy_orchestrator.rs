@@ -1866,9 +1866,19 @@ async fn apply_system_update_local(
         "runtime" => {
             let manifest = load_runtime_manifest().ok_or("runtime manifest missing locally")?;
             apply_runtime_retention(&manifest)?;
+            let artifact_errors = verify_runtime_current_artifacts(&manifest)?;
             {
                 let mut guard = state.runtime_manifest.lock().await;
                 *guard = Some(manifest);
+            }
+            if !artifact_errors.is_empty() {
+                return Ok(SystemUpdateApplyResult {
+                    status: "sync_pending".to_string(),
+                    updated: Vec::new(),
+                    unchanged: vec!["runtime-manifest".to_string()],
+                    restarted: Vec::new(),
+                    errors: artifact_errors,
+                });
             }
             Ok(SystemUpdateApplyResult {
                 status: "ok".to_string(),
@@ -2016,6 +2026,38 @@ async fn handle_system_update_message(
     let local_hash = local.hash.unwrap_or_default();
     let expected_hash_norm = normalize_sha256(&expected_hash);
     let local_hash_norm = normalize_sha256(&local_hash);
+    if expected_version != 0 {
+        if let Some(local_known_version) = local.version {
+            if local_known_version > expected_version {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "VERSION_MISMATCH",
+                    "message": format!(
+                        "local manifest version is ahead of requested version (local={} requested={})",
+                        local_known_version, expected_version
+                    ),
+                    "category": category,
+                    "hive": state.hive_id.as_str(),
+                    "manifest_version": expected_version,
+                    "local_manifest_version": local.version,
+                    "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
+                    "errors": [],
+                });
+            }
+            if local_known_version < expected_version {
+                return serde_json::json!({
+                    "status": "sync_pending",
+                    "category": category,
+                    "hive": state.hive_id.as_str(),
+                    "manifest_version": expected_version,
+                    "local_manifest_version": local.version,
+                    "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
+                    "errors": [],
+                    "message": "Local manifest version is behind expected. Sync channel may still be propagating.",
+                });
+            }
+        }
+    }
     let version_match = if expected_version == 0 || local.version.is_none() {
         true
     } else {
@@ -5009,6 +5051,64 @@ fn runtime_keep_versions(
         }
     }
     Ok(keep_map)
+}
+
+fn runtime_current_versions(
+    manifest: &RuntimeManifest,
+) -> Result<Vec<(String, String)>, OrchestratorError> {
+    let runtimes = manifest
+        .runtimes
+        .as_object()
+        .ok_or_else(|| "runtime manifest invalid: runtimes must be object".to_string())?;
+    let mut out = Vec::new();
+    for (runtime, entry) in runtimes {
+        if !valid_token(runtime) {
+            return Err(format!("runtime manifest invalid runtime name '{}'", runtime).into());
+        }
+        let current = entry
+            .get("current")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if current.is_empty() {
+            continue;
+        }
+        if !valid_token(current) {
+            return Err(format!("runtime manifest invalid current version '{}'", current).into());
+        }
+        out.push((runtime.clone(), current.to_string()));
+    }
+    Ok(out)
+}
+
+fn verify_runtime_current_artifacts(
+    manifest: &RuntimeManifest,
+) -> Result<Vec<String>, OrchestratorError> {
+    let mut errors = Vec::new();
+    for (runtime, version) in runtime_current_versions(manifest)? {
+        let start_script = Path::new(DIST_RUNTIME_ROOT_DIR)
+            .join(&runtime)
+            .join(&version)
+            .join("bin/start.sh");
+        if !start_script.is_file() {
+            errors.push(format!(
+                "runtime artifact missing start.sh runtime='{}' version='{}' path='{}'",
+                runtime,
+                version,
+                start_script.display()
+            ));
+            continue;
+        }
+        if !local_runtime_script_is_executable(&start_script) {
+            errors.push(format!(
+                "runtime artifact start.sh is not executable runtime='{}' version='{}' path='{}'",
+                runtime,
+                version,
+                start_script.display()
+            ));
+        }
+    }
+    Ok(errors)
 }
 
 fn apply_runtime_retention(
