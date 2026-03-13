@@ -32,6 +32,10 @@ REQUIRE_INVENTORY_PRESENT="${REQUIRE_INVENTORY_PRESENT:-0}"
 WAIT_SYNC_HINT_SECS="${WAIT_SYNC_HINT_SECS:-120}"
 WAIT_UPDATE_SECS="${WAIT_UPDATE_SECS:-120}"
 SYNC_HINT_TIMEOUT_MS="${SYNC_HINT_TIMEOUT_MS:-30000}"
+AUTO_SEED_RUNTIME_IF_MISSING="${AUTO_SEED_RUNTIME_IF_MISSING:-1}"
+RUNTIME_SEED_BUILD_BIN="${RUNTIME_SEED_BUILD_BIN:-1}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUNTIME_SEED_SCRIPT="$ROOT_DIR/scripts/inventory_spawn_kill_e2e.sh"
 
 tmpdir="$(mktemp -d)"
 versions_body="$tmpdir/versions.json"
@@ -272,6 +276,30 @@ materialize_runtime_on_target() {
   return 0
 }
 
+seed_runtime_fixture_if_needed() {
+  if [[ "$AUTO_SEED_RUNTIME_IF_MISSING" != "1" ]]; then
+    return 1
+  fi
+  if [[ "$RUNTIME" != "wf.inventory.hold.diag" ]]; then
+    return 1
+  fi
+  if [[ ! -x "$RUNTIME_SEED_SCRIPT" ]]; then
+    echo "FAIL: runtime seed script missing or not executable: $RUNTIME_SEED_SCRIPT" >&2
+    return 1
+  fi
+  echo "INFO: runtime source still missing after update; seeding '$RUNTIME' automatically via inventory_spawn_kill_e2e.sh." >&2
+  BASE="$BASE" \
+  HIVE_ID="$TARGET_HIVE_ID" \
+  BUILD_BIN="$RUNTIME_SEED_BUILD_BIN" \
+  RUNTIME="$RUNTIME" \
+  RUNTIME_VERSION="$RUNTIME_VERSION" \
+  TEST_ID="fr3seed-${TEST_ID}" \
+  NODE_NAME="WF.inventory.seed.${TEST_ID}" \
+  INVENTORY_APPEAR_TIMEOUT_SECS=45 \
+  INVENTORY_DISAPPEAR_TIMEOUT_SECS=45 \
+  "$RUNTIME_SEED_SCRIPT"
+}
+
 wait_inventory_state() {
   local hive_id="$1"
   local node_l2="$2"
@@ -397,10 +425,29 @@ if [[ "$spawn_http" != "200" || "$spawn_status" != "ok" ]]; then
   if [[ -z "$spawn_code" ]]; then
     spawn_code="$(json_get_file "payload.error_code" "$spawn_body")"
   fi
+  if [[ "$spawn_code" == "RUNTIME_NOT_PRESENT" ]]; then
+    if seed_runtime_fixture_if_needed; then
+      spawn_http="$(http_call "POST" "$BASE/hives/$REQUEST_HIVE_ID/nodes" "$spawn_body" "$spawn_payload")"
+      spawn_status="$(json_get_file "status" "$spawn_body")"
+      if [[ "$spawn_http" == "200" && "$spawn_status" == "ok" ]]; then
+        echo "INFO: spawn succeeded after runtime seed fallback." >&2
+      fi
+      spawn_code="$(json_get_file "error_code" "$spawn_body")"
+      if [[ -z "$spawn_code" ]]; then
+        spawn_code="$(json_get_file "payload.error_code" "$spawn_body")"
+      fi
+    fi
+  fi
+fi
+if [[ "$spawn_http" != "200" || "$spawn_status" != "ok" ]]; then
+  spawn_code="$(json_get_file "error_code" "$spawn_body")"
+  if [[ -z "$spawn_code" ]]; then
+    spawn_code="$(json_get_file "payload.error_code" "$spawn_body")"
+  fi
   echo "FAIL: spawn failed http=$spawn_http status=$spawn_status code=$spawn_code" >&2
   cat "$spawn_body" >&2 || true
   if [[ "$spawn_code" == "RUNTIME_NOT_PRESENT" ]]; then
-    echo "Hint: runtime is still missing on target hive '$TARGET_HIVE_ID' after auto-update attempt." >&2
+    echo "Hint: runtime is still missing on target hive '$TARGET_HIVE_ID' after auto-remediation attempts." >&2
   fi
   exit 1
 fi
