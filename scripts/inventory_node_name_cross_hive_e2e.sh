@@ -6,6 +6,7 @@ set -euo pipefail
 # - POST /hives/{request_hive}/nodes con node_name "...@{target_hive}"
 # - spawn/identity deben resolverse en {target_hive}
 # - kill via request_hive también debe operar sobre {target_hive}
+# - chequeo estricto de presencia en inventory requiere runtime de larga vida
 #
 # Usage:
 #   BASE="http://127.0.0.1:8080" \
@@ -226,6 +227,13 @@ assert_eq() {
   fi
 }
 
+is_long_lived_runtime() {
+  case "$1" in
+    wf.inventory.hold.diag) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 echo "INVENTORY FR-03 D6 E2E: BASE=$BASE REQUEST_HIVE_ID=$REQUEST_HIVE_ID TARGET_HIVE_ID=$TARGET_HIVE_ID RUNTIME=$RUNTIME"
 
 require_cmd curl
@@ -234,6 +242,11 @@ validate_tenant_id "$TENANT_ID"
 
 if [[ "$REQUEST_HIVE_ID" == "$TARGET_HIVE_ID" ]]; then
   echo "FAIL: REQUEST_HIVE_ID and TARGET_HIVE_ID must be different for FR-03 cross-hive regression." >&2
+  exit 1
+fi
+if [[ "$REQUIRE_INVENTORY_PRESENT" == "1" ]] && ! is_long_lived_runtime "$RUNTIME"; then
+  echo "FAIL: REQUIRE_INVENTORY_PRESENT=1 requires a long-lived runtime (recommended: RUNTIME=wf.inventory.hold.diag)." >&2
+  echo "Got RUNTIME='$RUNTIME'." >&2
   exit 1
 fi
 

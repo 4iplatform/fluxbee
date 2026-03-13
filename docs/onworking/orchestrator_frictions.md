@@ -348,6 +348,7 @@ Criterio de aceptación C:
 - [x] INV-D5. E2E negativo: worker falla registro identity cuando `SY.identity@motherbee` es inalcanzable. (`scripts/inventory_identity_primary_routing_e2e.sh`)
 - [x] INV-D6. E2E regresión: `node_name@hive` cruzado vs endpoint hive mantiene identidad/routing correctos. (`scripts/inventory_node_name_cross_hive_e2e.sh`)
   - El criterio duro valida routing en spawn/kill por `node_name@hive`; la observación en inventory puede ser efímera con runtimes de vida corta.
+  - Modo estricto (`REQUIRE_INVENTORY_PRESENT=1`) requiere runtime long-lived (ej.: `wf.inventory.hold.diag`).
 
 Criterio de aceptación D:
 - FR-01 y FR-03 cerrados con evidencia automatizada.
