@@ -288,16 +288,30 @@ seed_runtime_fixture_if_needed() {
     return 1
   fi
   echo "INFO: runtime source still missing after update; seeding '$RUNTIME' automatically via inventory_spawn_kill_e2e.sh." >&2
-  BASE="$BASE" \
-  HIVE_ID="$TARGET_HIVE_ID" \
-  BUILD_BIN="$RUNTIME_SEED_BUILD_BIN" \
-  RUNTIME="$RUNTIME" \
-  RUNTIME_VERSION="$RUNTIME_VERSION" \
-  TEST_ID="fr3seed-${TEST_ID}" \
-  NODE_NAME="WF.inventory.seed.${TEST_ID}" \
-  INVENTORY_APPEAR_TIMEOUT_SECS=45 \
-  INVENTORY_DISAPPEAR_TIMEOUT_SECS=45 \
-  "$RUNTIME_SEED_SCRIPT"
+  if [[ "$RUNTIME_VERSION" == "current" ]]; then
+    BASE="$BASE" \
+    HIVE_ID="$TARGET_HIVE_ID" \
+    BUILD_BIN="$RUNTIME_SEED_BUILD_BIN" \
+    RUNTIME="$RUNTIME" \
+    TENANT_ID="$TENANT_ID" \
+    TEST_ID="fr3seed-${TEST_ID}" \
+    NODE_NAME="WF.inventory.seed.${TEST_ID}" \
+    INVENTORY_APPEAR_TIMEOUT_SECS=45 \
+    INVENTORY_DISAPPEAR_TIMEOUT_SECS=45 \
+    "$RUNTIME_SEED_SCRIPT"
+  else
+    BASE="$BASE" \
+    HIVE_ID="$TARGET_HIVE_ID" \
+    BUILD_BIN="$RUNTIME_SEED_BUILD_BIN" \
+    RUNTIME="$RUNTIME" \
+    RUNTIME_VERSION="$RUNTIME_VERSION" \
+    TENANT_ID="$TENANT_ID" \
+    TEST_ID="fr3seed-${TEST_ID}" \
+    NODE_NAME="WF.inventory.seed.${TEST_ID}" \
+    INVENTORY_APPEAR_TIMEOUT_SECS=45 \
+    INVENTORY_DISAPPEAR_TIMEOUT_SECS=45 \
+    "$RUNTIME_SEED_SCRIPT"
+  fi
 }
 
 wait_inventory_state() {

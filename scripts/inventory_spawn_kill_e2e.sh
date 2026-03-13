@@ -7,6 +7,7 @@ BUILD_BIN="${BUILD_BIN:-1}"
 RUNTIME="${RUNTIME:-wf.inventory.hold.diag}"
 RUNTIME_VERSION="${RUNTIME_VERSION:-diag-$(date +%Y%m%d%H%M%S)}"
 RUNTIME_NODE_VERSION="${RUNTIME_NODE_VERSION:-0.0.1}"
+TENANT_ID="${TENANT_ID:-}"
 TEST_ID="${TEST_ID:-invd1-$(date +%s)-${RANDOM}}"
 NODE_NAME="${NODE_NAME:-WF.inventory.spawnkill.${TEST_ID}}"
 POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-1}"
@@ -404,7 +405,12 @@ echo "Step 7/10: cleanup baseline node (ignore errors)"
 http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
 
 echo "Step 8/10: spawn node and wait until appears in inventory"
-spawn_http="$(http_call "POST" "$BASE/hives/$HIVE_ID/nodes" "$spawn_body" "$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"current"}' "$NODE_NAME" "$RUNTIME")")"
+if [[ -n "$TENANT_ID" ]]; then
+  spawn_payload="$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"current","tenant_id":"%s"}' "$NODE_NAME" "$RUNTIME" "$TENANT_ID")"
+else
+  spawn_payload="$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"current"}' "$NODE_NAME" "$RUNTIME")"
+fi
+spawn_http="$(http_call "POST" "$BASE/hives/$HIVE_ID/nodes" "$spawn_body" "$spawn_payload")"
 spawn_status="$(json_get_file "status" "$spawn_body")"
 if [[ "$spawn_http" != "200" || "$spawn_status" != "ok" ]]; then
   echo "FAIL: spawn failed http=$spawn_http status=$spawn_status" >&2
@@ -429,4 +435,7 @@ echo "status=ok"
 echo "hive_id=$HIVE_ID"
 echo "node_name=$NODE_NAME@$HIVE_ID"
 echo "runtime=$RUNTIME@$RUNTIME_VERSION"
+if [[ -n "$TENANT_ID" ]]; then
+  echo "tenant_id=$TENANT_ID"
+fi
 echo "inventory spawn/kill E2E passed."

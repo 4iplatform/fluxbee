@@ -199,6 +199,36 @@ Qué pasa hoy:
 
 ---
 
+### FR-08 — Consistencia `versions` vs artefacto runtime real (`start.sh`)
+
+Estado: OPEN (prioridad alta)
+
+Qué pasa hoy:
+- En algunos casos `/hives/{hive}/versions` reporta runtime/version disponible por manifest, pero el artefacto local no está materializado (`bin/start.sh` ausente).
+- `run_node` falla con `RUNTIME_NOT_PRESENT` aunque `versions` lo muestre disponible.
+- Esto introduce falsos positivos de “runtime listo” y hace frágiles los E2E de spawn.
+
+Evidencia:
+- `src/bin/sy_orchestrator.rs:6840`
+- `src/bin/sy_orchestrator.rs:6841`
+- `scripts/inventory_node_name_cross_hive_e2e.sh` (caso `RUNTIME_NOT_PRESENT` en spawn)
+
+Lista de tareas FR-08:
+- [ ] FR8-T1. Definir contrato único: cuándo un runtime aparece en `versions` como “available/current” (solo manifest vs manifest+artefacto local).
+- [ ] FR8-T2. Alinear `get_versions` para no reportar “available” si falta `bin/start.sh` local de la versión.
+- [ ] FR8-T3. Agregar campo explícito por runtime/version en `versions` para readiness local (ej. `runtime_present=true|false`) si se mantiene visibilidad de manifest sin artefacto.
+- [ ] FR8-T4. En `run_node`, si falta artefacto y hay metadata para update pendiente, devolver error accionable consistente (sin ambigüedad entre drift y sync pendiente).
+- [ ] FR8-T5. E2E dedicado manifest-vs-artifact:
+  - caso A: runtime en manifest sin `start.sh` -> `versions` y/o `run_node` coherentes con contrato;
+  - caso B: tras `sync-hint + update`, runtime materializado y spawn exitoso.
+- [ ] FR8-T6. Actualizar docs operativas (`07-operaciones.md` + runbooks E2E) con el flujo canónico de materialización runtime.
+
+Criterio de cierre FR-08:
+- No existe escenario donde `versions` afirme disponibilidad runtime y `run_node` falle por ausencia de `start.sh` sin señal previa explícita en API.
+- E2E FR-08 en verde con y sin sync pendiente.
+
+---
+
 ## 3) Decisiones pendientes (para discutir)
 
 ### D-01 (identity primary)
@@ -247,8 +277,9 @@ Estado: PARCIAL
 
 ## 4) Orden sugerido de ejecución
 
-1. FR-07 (status schema común).
-2. FR-04 (ON HOLD hasta cerrar spec cognitive de L3/CTX).
+1. FR-08 (consistencia versions vs artefacto runtime).
+2. FR-07 (status schema común).
+3. FR-04 (ON HOLD hasta cerrar spec cognitive de L3/CTX).
 
 ---
 
@@ -271,6 +302,7 @@ Estado: PARCIAL
 | 2026-03-13 | FR-05 state endpoint | `GET /hives/{hive}/nodes/{node}/state` implementado en `SY.admin`/`SY.orchestrator` con relay remoto | core | cerrado |
 | 2026-03-13 | FR-05/06 E2E v1.1 | `node_config_per_node_e2e.sh` extendido con checks de `state` (existing/missing) y respawn fail-closed `NODE_ALREADY_EXISTS` | core | cerrado |
 | 2026-03-13 | FR-03 cierre E2E | `inventory_node_name_cross_hive_e2e.sh` valida precedencia de `node_name@hive` en spawn+kill contra endpoint cruzado | core | cerrado |
+| 2026-03-13 | FR-08 abierta | Detectada desalineación entre `versions` (manifest) y presencia real de artefactos runtime (`start.sh`) en spawn | core | abierto |
 
 ---
 
