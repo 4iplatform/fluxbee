@@ -9,7 +9,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use fluxbee_ai_sdk::{
     build_reply_message_runtime_src, build_text_response, extract_text, AiNode, AiNodeConfig, Message,
-    ModelSettings, NodeRuntime, OpenAiResponsesClient, RetryPolicy, RouterClient, RuntimeConfig,
+    FunctionCallingConfig, FunctionCallingRunner, FunctionToolProvider, FunctionToolRegistry,
+    LanceDbThreadStateStore, ModelSettings, NodeRuntime, OpenAiResponsesClient, RetryPolicy,
+    RouterClient, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -306,7 +308,13 @@ struct GenericAiNode {
     node_name: String,
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
     dynamic_config_dir: PathBuf,
+    thread_state_store: Option<Arc<dyn ThreadStateStore>>,
     control_plane: Arc<RwLock<ControlPlaneState>>,
+}
+
+#[derive(Debug, Clone)]
+struct BehaviorContext {
+    thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,7 +367,14 @@ impl AiNode for GenericAiNode {
                 let payload = node_not_configured_payload(state);
                 return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
             }
+            if extract_thread_id(&msg).is_none() {
+                let payload = invalid_payload_missing_thread_id();
+                return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
+            }
         }
+        let behavior_ctx = BehaviorContext {
+            thread_id: extract_thread_id(&msg),
+        };
 
         let behavior = self.behavior.read().await.clone();
         let Some(behavior) = behavior else {
@@ -370,7 +385,7 @@ impl AiNode for GenericAiNode {
         let input = extract_text(&msg.payload).unwrap_or_default();
         let output = match &behavior {
             NodeBehavior::Echo => format!("Echo: {input}"),
-            NodeBehavior::OpenAiChat(openai) => self.run_openai_chat(openai, input).await?,
+            NodeBehavior::OpenAiChat(openai) => self.run_openai_chat(openai, input, &behavior_ctx).await?,
         };
 
         let payload = build_text_response(output)?;
@@ -383,6 +398,7 @@ impl GenericAiNode {
         &self,
         openai: &OpenAiChatRuntime,
         input: String,
+        ctx: &BehaviorContext,
     ) -> fluxbee_ai_sdk::Result<String> {
         let api_key = self.resolve_openai_api_key(openai).await.ok_or_else(|| {
             fluxbee_ai_sdk::errors::AiSdkError::Protocol(
@@ -393,6 +409,26 @@ impl GenericAiNode {
         if let Some(base_url) = &openai.base_url {
             client = client.with_base_url(base_url.clone());
         }
+        let mut tool_registry = FunctionToolRegistry::new();
+        if let (Some(store), Some(_thread_id)) = (&self.thread_state_store, &ctx.thread_id) {
+            let provider = ThreadStateToolsProvider::with_get_put_delete(store.clone());
+            provider.register_tools(&mut tool_registry)?;
+        }
+        if !tool_registry.definitions().is_empty() {
+            let model = client
+                .clone()
+                .function_model(
+                    openai.model.clone(),
+                    openai.instructions.clone(),
+                    openai.model_settings.clone(),
+                );
+            let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+            let result = runner.run(&model, &tool_registry, input.clone()).await?;
+            if let Some(text) = result.final_assistant_text {
+                return Ok(text);
+            }
+        }
+
         let req = fluxbee_ai_sdk::llm::LlmRequest {
             model: openai.model.clone(),
             system: openai.instructions.clone(),
@@ -864,6 +900,7 @@ async fn run_one_config(
     );
 
     let node_name = ai_node_config.name.clone();
+    let thread_state_store = init_thread_state_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
     let client = RouterClient::connect(ai_node_config).await?;
     let runtime = NodeRuntime::new(
         client,
@@ -871,6 +908,7 @@ async fn run_one_config(
             node_name,
             behavior: Arc::new(RwLock::new(Some(behavior))),
             dynamic_config_dir: PathBuf::from(cfg.node.dynamic_config_dir),
+            thread_state_store,
             control_plane: Arc::new(RwLock::new(ControlPlaneState {
                 current_state: NodeLifecycleState::Configured,
                 config_source: "yaml",
@@ -896,6 +934,7 @@ async fn run_unconfigured_bootstrap(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node_name = node.name.clone();
     let dynamic_dir = PathBuf::from(node.dynamic_config_dir.clone());
+    let thread_state_store = init_thread_state_store(&node_name, &dynamic_dir).await;
     let persisted_dynamic = load_persisted_dynamic_config(&dynamic_dir, &node_name);
     let (behavior, state) = match persisted_dynamic.as_ref() {
         Some(stored) => {
@@ -966,6 +1005,7 @@ async fn run_unconfigured_bootstrap(
             node_name,
             behavior: Arc::new(RwLock::new(behavior)),
             dynamic_config_dir: dynamic_dir,
+            thread_state_store,
             control_plane: Arc::new(RwLock::new(state)),
         },
     );
@@ -1592,4 +1632,58 @@ fn node_runtime_not_ready_payload() -> Value {
         "message": "AI node runtime is not ready to process user messages yet.",
         "retryable": true
     })
+}
+
+fn infer_state_dir_from_dynamic(dynamic_config_dir: &std::path::Path) -> PathBuf {
+    dynamic_config_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/var/lib/fluxbee/state"))
+}
+
+async fn init_thread_state_store(
+    node_name: &str,
+    dynamic_config_dir: &std::path::Path,
+) -> Option<Arc<dyn ThreadStateStore>> {
+    let state_dir = infer_state_dir_from_dynamic(dynamic_config_dir);
+    let store_root = LanceDbThreadStateStore::path_for_node(&state_dir, node_name);
+    let store = LanceDbThreadStateStore::new(store_root);
+    match store.ensure_ready().await {
+        Ok(()) => {
+            tracing::info!(
+                node_name = %node_name,
+                path = %store.root_dir().display(),
+                "thread state store ready"
+            );
+            Some(Arc::new(store))
+        }
+        Err(err) => {
+            tracing::warn!(
+                node_name = %node_name,
+                error = %err,
+                "thread state store unavailable; continuing in degraded mode"
+            );
+            None
+        }
+    }
+}
+
+fn invalid_payload_missing_thread_id() -> Value {
+    json!({
+        "type": "error",
+        "code": "invalid_payload",
+        "message": "Missing required thread_id for user message.",
+        "retryable": false
+    })
+}
+
+fn extract_thread_id(msg: &Message) -> Option<String> {
+    msg.meta
+        .context
+        .as_ref()
+        .and_then(|ctx| ctx.get("thread_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
 }

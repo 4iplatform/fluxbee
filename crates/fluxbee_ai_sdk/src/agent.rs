@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
 use crate::errors::Result;
+use crate::function_calling::{
+    FunctionTool, FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
+};
 use crate::llm::{LlmClient, LlmRequest, LlmResponse, LlmStreamEvent, ModelSettings};
 
 pub struct Agent {
@@ -9,6 +12,7 @@ pub struct Agent {
     instructions: Option<String>,
     model_settings: ModelSettings,
     llm: Arc<dyn LlmClient>,
+    tools: FunctionToolRegistry,
 }
 
 impl Agent {
@@ -34,6 +38,7 @@ impl Agent {
             instructions,
             model_settings,
             llm,
+            tools: FunctionToolRegistry::new(),
         }
     }
 
@@ -47,6 +52,22 @@ impl Agent {
 
     pub async fn run_text_stream(&self, input: impl Into<String>) -> Result<Vec<LlmStreamEvent>> {
         self.llm.generate_stream(self.build_request(input.into())).await
+    }
+
+    pub fn register_tool(&mut self, tool: Arc<dyn FunctionTool>) -> Result<()> {
+        self.tools.register(tool)
+    }
+
+    pub fn register_tools_from(&mut self, provider: &dyn FunctionToolProvider) -> Result<()> {
+        provider.register_tools(&mut self.tools)
+    }
+
+    pub fn tool_definitions(&self) -> Vec<FunctionToolDefinition> {
+        self.tools.definitions()
+    }
+
+    pub fn tool_registry(&self) -> &FunctionToolRegistry {
+        &self.tools
     }
 
     fn build_request(&self, input: String) -> LlmRequest {

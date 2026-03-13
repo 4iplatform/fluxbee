@@ -427,6 +427,22 @@ Códigos recomendados (no exhaustivo):
 > contrato de entrada/salida para mensajes `meta.type="user"`, parsing del contrato `text/v1`, resolución de blobs/attachments según la **spec de Blob Annex**, construcción de input para el behavior, formato de respuesta y reglas de error.  
 > *Cognitive* queda fuera de alcance (solo se lo menciona como “a especificar”).
 
+### Estado de cierre (contrato vs implementación)
+
+✅ **CONTRATO CERRADO (especificación)**:
+- `text/v1` con `content`, `attachments[]` y `content_ref`.
+- Resolución/creación de blobs delegando en `fluxbee_sdk::blob`.
+- Reglas de error para blobs/adjuntos (`BLOB_*`, `unsupported_attachment_mime`, etc.).
+
+🧩 **CONCEPTO AÚN ABIERTO (especificación)**:
+- Límites finales por MIME/tamaño están como valores tentativos.
+- Tabla final de compatibilidad MIME × behavior × provider.
+
+🐞 **IMPLEMENTACIÓN PENDIENTE (runner actual)**:
+- El runner hoy procesa principalmente `payload.content`.
+- Falta implementar procesamiento completo de `attachments` y `content_ref` de entrada.
+- Falta implementar salida con adjuntos/blob refs (cuando el behavior genere artefactos).
+
 ---
 
 ## Convenciones de estado del documento
@@ -450,6 +466,16 @@ Códigos recomendados (no exhaustivo):
   - loggear advertencia (`missing_ctx_window`),
   - continuar procesando usando `payload.content`/`content_ref` y attachments disponibles.
 - Cuando el router lo implemente, `ctx_window` pasará a ser **obligatorio** para el “happy path” (sin cambiar el contrato de AI Nodes).
+
+
+
+### `src_ilk` siempre presente (incluye ILK temporal)
+
+✅ **NORMATIVO (alineación core)**:
+- Los mensajes `user` deben incluir `src_ilk` como ILK **siempre presente**.
+- `src_ilk` puede estar en estado **temporary** (identidad incompleta). En ese caso, nodos como `AI.frontdesk.gov` actúan para completar/actualizar la identidad a través del pipeline de sistema (no “inventan” identity).
+
+> Nota: los detalles del provisioning/upgrade viven en core (SY.admin/SY.orchestrator/SY.identity); el nodo AI solo consume `src_ilk`.
 
 
 ## 1. Alcance del Data Plane
@@ -1489,8 +1515,13 @@ ai-nodectl logs ai-chat --follow
 🧩 **A ESPECIFICAR (core)**: la definición final de `thread_id` se cerrará más adelante.
 
 ✅ **NORMATIVO (MVP)**:
-- Todo mensaje `user` debe incluir `thread_id` (campo top-level, al mismo nivel que `src_ilk`).
+- Todo mensaje `user` debe incluir `thread_id`.
+- **Ubicación tentantiva** (MVP): campo top-level, al mismo nivel que `src_ilk`.
+- La ubicación final será definida por core; el runner debe poder migrar el extractor cuando se formalice.
 - El responsable de asignarlo es el **IO node** (por canal/conversación), por lo que **siempre** debe venir.
+
+⚠️ **Bridge temporal de implementación**:
+- Mientras el wire model del SDK no tipifique `thread_id` top-level, el runner puede extraerlo desde `meta.context.thread_id`.
 
 ### 9.2 Modelo de datos: 1 JSON por `thread_id`
 
@@ -1508,8 +1539,8 @@ ai-nodectl logs ai-chat --follow
 ### 9.3 API (Tool calling) mínima
 
 ✅ **NORMATIVO (MVP)**: el runtime/SDK debe exponer tools equivalentes a:
-- `thread_state_get(thread_id) -> { state_json?, updated_at? }`
-- `thread_state_put(thread_id, state_json, ttl_seconds?) -> ok`
+- `thread_state_get(thread_id) -> { data?, updated_at? }`
+- `thread_state_put(thread_id, data, ttl_seconds?) -> ok`
 - `thread_state_delete(thread_id) -> ok`
 
 > Nota: no se requiere query vectorial ni múltiple-key en MVP.

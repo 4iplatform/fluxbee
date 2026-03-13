@@ -3,6 +3,14 @@
 > ✅ **Objetivo**: ejemplos claros y completos para implementación/QA del lifecycle de configuración de nodos `AI.*`.  
 > Este anexo asume el contrato `text/v1` y el Control Plane definidos en la spec consolidada.
 
+> ⚠️ **Alcance de este anexo**: los ejemplos describen el **contrato objetivo**.  
+> Estado actual del runner (MVP técnico): `attachments/content_ref` todavía no están implementados de punta a punta; `thread_id` se toma temporalmente como top-level.
+
+## Convenciones de identidad y thread
+
+- `src_ilk` se asume **siempre presente** (puede ser ILK temporal).
+- `thread_id` se asume presente (asignado por IO). La ubicación exacta es tentantiva; en MVP lo tratamos como top-level.
+
 ---
 
 ## 1) Ejemplo de archivo JSON efectivo por nodo (single source of truth)
@@ -340,6 +348,51 @@ Debe responder:
     "message": "Attachment exceeds BlobConfig.max_blob_bytes",
     "retryable": false,
     "details": { "limit_bytes": 104857600, "actual_bytes": 209715200 }
+  }
+}
+```
+
+
+---
+
+## 8) Ejemplo: Thread State Store (LanceDB) — 1 JSON por `thread_id`
+
+> MVP: un documento JSON por `thread_id` (estructura libre por prompting).
+
+### Put
+```json
+{
+  "tool": "thread_state_put",
+  "args": {
+    "thread_id": "slack:T123:C456:thread:1710000000.000",
+    "data": {
+      "status": "waiting_information",
+      "description": "Asked for: name, phone, mail",
+      "name": null,
+      "phone": "+541112345678",
+      "mail": null
+    },
+    "ttl_seconds": 86400
+  }
+}
+```
+
+### Get
+```json
+{
+  "tool": "thread_state_get",
+  "args": {
+    "thread_id": "slack:T123:C456:thread:1710000000.000"
+  }
+}
+```
+
+### Delete
+```json
+{
+  "tool": "thread_state_delete",
+  "args": {
+    "thread_id": "slack:T123:C456:thread:1710000000.000"
   }
 }
 ```

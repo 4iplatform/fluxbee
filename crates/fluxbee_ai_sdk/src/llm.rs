@@ -4,10 +4,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::errors::{AiSdkError, Result};
+use crate::function_calling::{
+    FunctionCallingModel, FunctionLoopItem, FunctionModelTurnRequest, FunctionModelTurnResponse,
+    FunctionToolCall,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmRequest {
@@ -140,6 +144,20 @@ impl OpenAiResponsesClient {
         self.base_url = base_url.into();
         self
     }
+
+    pub fn function_model(
+        self,
+        model: impl Into<String>,
+        system: Option<String>,
+        model_settings: ModelSettings,
+    ) -> OpenAiFunctionCallingModel {
+        OpenAiFunctionCallingModel {
+            client: self,
+            model: model.into(),
+            system,
+            model_settings,
+        }
+    }
 }
 
 #[async_trait]
@@ -215,5 +233,156 @@ impl LlmClient for OpenAiResponsesClient {
             .ok_or_else(|| AiSdkError::Protocol("responses payload missing text output".into()))?;
 
         Ok(LlmResponse { content: text })
+    }
+}
+
+#[derive(Clone)]
+pub struct OpenAiFunctionCallingModel {
+    client: OpenAiResponsesClient,
+    model: String,
+    system: Option<String>,
+    model_settings: ModelSettings,
+}
+
+#[async_trait]
+impl FunctionCallingModel for OpenAiFunctionCallingModel {
+    async fn run_turn(&self, request: FunctionModelTurnRequest) -> Result<FunctionModelTurnResponse> {
+        let mut input = Vec::new();
+        if let Some(system) = &self.system {
+            input.push(json!({
+                "role": "system",
+                "content": [{"type":"input_text","text": system}],
+            }));
+        }
+
+        for item in request.items {
+            match item {
+                FunctionLoopItem::UserText { content } => {
+                    input.push(json!({
+                        "role": "user",
+                        "content": [{"type":"input_text","text": content}],
+                    }));
+                }
+                FunctionLoopItem::ToolResult { result } => {
+                    let output_text = match result.output {
+                        Value::String(s) => s,
+                        other => serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string()),
+                    };
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": result.call_id,
+                        "output": output_text,
+                    }));
+                }
+                FunctionLoopItem::AssistantText { .. } => {
+                    // We keep model input minimal for MVP: user turns + tool outputs.
+                }
+            }
+        }
+
+        let tools = request
+            .tools
+            .into_iter()
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters_json_schema,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let body = json!({
+            "model": self.model,
+            "input": input,
+            "tools": tools,
+            "parallel_tool_calls": true,
+            "max_output_tokens": self.model_settings.max_output_tokens,
+            "temperature": self.model_settings.temperature,
+            "top_p": self.model_settings.top_p,
+        });
+
+        let auth = format!("Bearer {}", self.client.api_key);
+        let response = self
+            .client
+            .http
+            .post(&self.client.base_url)
+            .header(AUTHORIZATION, auth)
+            .header(CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let value: Value = response.json().await?;
+        if !status.is_success() {
+            return Err(AiSdkError::Protocol(format!(
+                "openai function calling error status={} body={}",
+                status, value
+            )));
+        }
+
+        let mut assistant_text = value
+            .get("output_text")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let mut tool_calls = Vec::<FunctionToolCall>::new();
+
+        if let Some(items) = value.get("output").and_then(Value::as_array) {
+            for item in items {
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                if item_type == "function_call" {
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("id").and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let arguments = parse_tool_arguments(
+                        item.get("arguments").cloned().unwrap_or(Value::Object(Default::default())),
+                    );
+                    if !call_id.is_empty() && !name.is_empty() {
+                        tool_calls.push(FunctionToolCall {
+                            call_id,
+                            name,
+                            arguments,
+                        });
+                    }
+                    continue;
+                }
+
+                if assistant_text.is_none() && item_type == "message" {
+                    assistant_text = item
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .and_then(|arr| {
+                            arr.iter().find_map(|content_item| {
+                                content_item
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .map(ToString::to_string)
+                            })
+                        });
+                }
+            }
+        }
+
+        Ok(FunctionModelTurnResponse {
+            assistant_text,
+            tool_calls,
+        })
+    }
+}
+
+fn parse_tool_arguments(raw: Value) -> Value {
+    match raw {
+        Value::String(s) => serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s)),
+        other => other,
     }
 }

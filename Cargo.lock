@@ -503,6 +503,7 @@ name = "fluxbee-ai-sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "fluxbee-sdk",
  "reqwest",
  "serde",
