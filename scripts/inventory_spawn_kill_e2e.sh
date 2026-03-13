@@ -4,6 +4,7 @@ set -euo pipefail
 BASE="${BASE:-http://127.0.0.1:8080}"
 HIVE_ID="${HIVE_ID:-worker-220}"
 BUILD_BIN="${BUILD_BIN:-1}"
+PREPARE_ONLY="${PREPARE_ONLY:-0}"
 RUNTIME="${RUNTIME:-wf.inventory.hold.diag}"
 RUNTIME_VERSION="${RUNTIME_VERSION:-diag-$(date +%Y%m%d%H%M%S)}"
 RUNTIME_NODE_VERSION="${RUNTIME_NODE_VERSION:-0.0.1}"
@@ -399,6 +400,17 @@ if ! runtime_exists_in_manifest "$RUNTIME" "$versions_body"; then
   echo "FAIL: runtime '$RUNTIME' missing in /hives/$HIVE_ID/versions" >&2
   cat "$versions_body" >&2 || true
   exit 1
+fi
+
+if [[ "$PREPARE_ONLY" == "1" ]]; then
+  echo "status=ok"
+  echo "hive_id=$HIVE_ID"
+  echo "runtime=$RUNTIME@$RUNTIME_VERSION"
+  if [[ -n "$TENANT_ID" ]]; then
+    echo "tenant_id=$TENANT_ID"
+  fi
+  echo "inventory runtime fixture prepare-only passed."
+  exit 0
 fi
 
 echo "Step 7/10: cleanup baseline node (ignore errors)"

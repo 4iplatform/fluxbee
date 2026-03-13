@@ -294,6 +294,7 @@ seed_runtime_fixture_if_needed() {
     BASE="$BASE" \
     HIVE_ID="$TARGET_HIVE_ID" \
     BUILD_BIN="$RUNTIME_SEED_BUILD_BIN" \
+    PREPARE_ONLY=1 \
     RUNTIME="$RUNTIME" \
     TENANT_ID="$TENANT_ID" \
     TEST_ID="fr3seed-${TEST_ID}" \
@@ -305,6 +306,7 @@ seed_runtime_fixture_if_needed() {
     BASE="$BASE" \
     HIVE_ID="$TARGET_HIVE_ID" \
     BUILD_BIN="$RUNTIME_SEED_BUILD_BIN" \
+    PREPARE_ONLY=1 \
     RUNTIME="$RUNTIME" \
     RUNTIME_VERSION="$RUNTIME_VERSION" \
     TENANT_ID="$TENANT_ID" \
@@ -331,6 +333,7 @@ prepare_strict_runtime_fixture() {
   BASE="$BASE" \
   HIVE_ID="$TARGET_HIVE_ID" \
   BUILD_BIN="$RUNTIME_SEED_BUILD_BIN" \
+  PREPARE_ONLY=1 \
   RUNTIME="$RUNTIME" \
   RUNTIME_VERSION="$STRICT_RUNTIME_VERSION" \
   TENANT_ID="$TENANT_ID" \

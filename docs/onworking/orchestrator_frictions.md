@@ -385,6 +385,7 @@ Criterio de aceptación C:
   - El seed automático usa el mismo `NODE_NAME` del test FR-03 para evitar fixture bakeada con un nombre distinto y falsos negativos de presencia en inventory.
   - En modo estricto, el E2E prepara previamente un runtime fixture long-lived para el mismo `NODE_NAME` del caso, evitando arrastre de versiones `current` bakeadas con otro nombre.
   - En modo estricto, el `spawn` usa explícitamente `runtime_version=$STRICT_RUNTIME_VERSION` (no `current`) para evitar carreras de manifest durante el mismo test.
+  - El seed/prepare de runtime se ejecuta en modo `PREPARE_ONLY=1` (sin spawn/kill), para no dejar `config.json` residual que provoque `NODE_ALREADY_EXISTS` en el spawn real del caso.
 
 Criterio de aceptación D:
 - FR-01 y FR-03 cerrados con evidencia automatizada.
