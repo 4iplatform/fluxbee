@@ -109,12 +109,67 @@ raise SystemExit(1)
 PY
 }
 
+inventory_hive_state_file() {
+  local file="$1"
+  local hive_id="$2"
+  python3 - "$file" "$hive_id" <<'PY'
+import json
+import sys
+
+file_path = sys.argv[1]
+hive_id = sys.argv[2]
+try:
+    with open(file_path, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+except Exception:
+    print("unknown")
+    raise SystemExit(0)
+
+payload = doc.get("payload", {})
+if isinstance(payload, dict) and "hives" not in payload and isinstance(payload.get("payload"), dict):
+    payload = payload["payload"]
+
+hives = payload.get("hives", [])
+nodes = payload.get("nodes", [])
+if not isinstance(hives, list) or not isinstance(nodes, list):
+    print("unknown")
+    raise SystemExit(0)
+
+hive_entry = None
+for hive in hives:
+    if isinstance(hive, dict) and hive.get("hive_id") == hive_id:
+        hive_entry = hive
+        break
+
+has_nodes = any(isinstance(n, dict) and n.get("hive") == hive_id for n in nodes)
+
+if hive_entry is None:
+    print("removed")
+    raise SystemExit(0)
+
+raw_count = hive_entry.get("node_count", 0)
+try:
+    node_count = int(raw_count)
+except Exception:
+    node_count = 0
+
+if node_count <= 0 and not has_nodes:
+    print("removed")
+else:
+    print("present")
+PY
+}
+
 wait_inventory_hive_state() {
   local hive_id="$1"
-  local expected="$2" # present|absent
+  local expected="$2" # present|removed|absent
   local timeout_secs="$3"
   local started_at
   started_at="$(date +%s)"
+
+  if [[ "$expected" == "absent" ]]; then
+    expected="removed"
+  fi
 
   while true; do
     local now elapsed http
@@ -140,14 +195,9 @@ wait_inventory_hive_state() {
       continue
     fi
 
-    if inventory_has_hive "$inventory_body" "$hive_id"; then
-      if [[ "$expected" == "present" ]]; then
-        return 0
-      fi
-    else
-      if [[ "$expected" == "absent" ]]; then
-        return 0
-      fi
+    current_state="$(inventory_hive_state_file "$inventory_body" "$hive_id")"
+    if [[ "$current_state" == "$expected" ]]; then
+      return 0
     fi
     sleep "$POLL_INTERVAL_SECS"
   done
@@ -188,11 +238,7 @@ inventory_state_now() {
     echo "unknown"
     return 0
   fi
-  if inventory_has_hive "$inventory_body" "$hive_id"; then
-    echo "present"
-  else
-    echo "absent"
-  fi
+  inventory_hive_state_file "$inventory_body" "$hive_id"
 }
 
 extract_address_from_json() {
@@ -308,9 +354,9 @@ fi
 echo "initial_present=$initial_present"
 
 if [[ "$initial_present" == "1" ]]; then
-  echo "Step 3/7: remove hive and wait absent"
+  echo "Step 3/7: remove hive and wait removed view"
   remove_hive_expect_ok_or_not_found "$HIVE_ID"
-  wait_inventory_hive_state "$HIVE_ID" "absent" "$INVENTORY_WAIT_SECS"
+  wait_inventory_hive_state "$HIVE_ID" "removed" "$INVENTORY_WAIT_SECS"
 
   echo "Step 4/7: add hive and wait present"
   add_hive_expect_ok "$HIVE_ID" "$HIVE_ADDR"
@@ -320,9 +366,9 @@ else
   add_hive_expect_ok "$HIVE_ID" "$HIVE_ADDR"
   wait_inventory_hive_state "$HIVE_ID" "present" "$INVENTORY_WAIT_SECS"
 
-  echo "Step 4/7: remove hive and wait absent"
+  echo "Step 4/7: remove hive and wait removed view"
   remove_hive_expect_ok_or_not_found "$HIVE_ID"
-  wait_inventory_hive_state "$HIVE_ID" "absent" "$INVENTORY_WAIT_SECS"
+  wait_inventory_hive_state "$HIVE_ID" "removed" "$INVENTORY_WAIT_SECS"
 
   echo "Step 5/7: add hive again and wait present (restore baseline)"
   add_hive_expect_ok "$HIVE_ID" "$HIVE_ADDR"
