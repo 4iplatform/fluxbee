@@ -36,6 +36,11 @@ pub fn build_user_message(
         "dst_ilk".to_string(),
         dst_ilk.map(Value::String).unwrap_or(Value::Null),
     );
+    if !context_obj.contains_key("thread_id") {
+        if let Some(thread_id) = extract_thread_id_from_context_obj(&context_obj) {
+            context_obj.insert("thread_id".to_string(), Value::String(thread_id));
+        }
+    }
 
     Message {
         routing: Routing {
@@ -57,6 +62,17 @@ pub fn build_user_message(
         },
         payload,
     }
+}
+
+fn extract_thread_id_from_context_obj(context_obj: &Map<String, Value>) -> Option<String> {
+    context_obj
+        .get("io")
+        .and_then(|io| io.get("conversation"))
+        .and_then(|conversation| conversation.get("thread_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 pub fn build_inbound_user_message_to_router(

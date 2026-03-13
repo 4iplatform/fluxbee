@@ -164,4 +164,30 @@ mod tests {
             .and_then(|ctx| ctx.get("src_ilk"));
         assert_eq!(src, Some(&serde_json::Value::Null));
     }
+
+    #[tokio::test]
+    async fn forwards_thread_id_at_context_top_level_for_ai_nodes() {
+        let mut p = InboundProcessor::new("node", InboundConfig::default());
+        let id = MockIdentityResolver::new();
+        let io = slack_inbound_io_context("T", "U", "C", Some("171234.567"), "Ev1");
+        let input = ResolveOrCreateInput {
+            channel: "slack".to_string(),
+            external_id: "T:U".to_string(),
+            tenant_hint: None,
+            attributes: serde_json::json!({}),
+        };
+        let payload = serde_json::json!({ "type": "text", "content": "hi" });
+
+        let o = p.process_inbound(&id, input, io, payload).await;
+        let InboundOutcome::SendNow(msg) = o else {
+            panic!("unexpected outcome: {o:?}");
+        };
+        let thread_id = msg
+            .meta
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("thread_id"))
+            .and_then(|v| v.as_str());
+        assert_eq!(thread_id, Some("171234.567"));
+    }
 }
