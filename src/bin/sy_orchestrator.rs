@@ -4133,11 +4133,20 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
     let runtimes = match load_runtime_manifest() {
         Some(manifest) => {
             let manifest_hash = local_runtime_manifest_hash().ok().flatten();
+            let mut runtimes = manifest.runtimes.clone();
+            if let Some(runtime_map) = runtimes.as_object_mut() {
+                for (runtime, entry) in runtime_map.iter_mut() {
+                    let readiness = runtime_readiness_for_entry(runtime, entry);
+                    if let Some(entry_obj) = entry.as_object_mut() {
+                        entry_obj.insert("readiness".to_string(), readiness);
+                    }
+                }
+            }
             serde_json::json!({
                 "status": "ok",
                 "manifest_version": manifest.version,
                 "manifest_hash": manifest_hash,
-                "runtimes": manifest.runtimes,
+                "runtimes": runtimes,
             })
         }
         None => serde_json::json!({
@@ -5662,6 +5671,65 @@ fn runtime_start_script(runtime: &str, version: &str) -> String {
 
 fn local_runtime_script_exists(script_path: &str) -> bool {
     Path::new(script_path).is_file()
+}
+
+fn local_runtime_script_is_executable(script_path: &Path) -> bool {
+    fs::metadata(script_path)
+        .map(|meta| (meta.permissions().mode() & 0o111) != 0)
+        .unwrap_or(false)
+}
+
+fn runtime_versions_from_manifest_entry(entry: &serde_json::Value) -> Vec<String> {
+    let mut versions = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(current) = entry
+        .get("current")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| valid_token(value))
+    {
+        let current_value = current.to_string();
+        seen.insert(current_value.clone());
+        versions.push(current_value);
+    }
+    if let Some(available) = entry.get("available").and_then(|value| value.as_array()) {
+        for value in available {
+            let Some(version) = value
+                .as_str()
+                .map(str::trim)
+                .filter(|candidate| valid_token(candidate))
+            else {
+                continue;
+            };
+            if seen.insert(version.to_string()) {
+                versions.push(version.to_string());
+            }
+        }
+    }
+    versions
+}
+
+fn runtime_readiness_for_entry(runtime: &str, entry: &serde_json::Value) -> serde_json::Value {
+    if !valid_token(runtime) {
+        return serde_json::json!({});
+    }
+    let mut readiness = serde_json::Map::new();
+    for version in runtime_versions_from_manifest_entry(entry) {
+        let start_script = Path::new(DIST_RUNTIME_ROOT_DIR)
+            .join(runtime)
+            .join(&version)
+            .join("bin/start.sh");
+        let runtime_present = start_script.is_file();
+        let start_sh_executable = runtime_present && local_runtime_script_is_executable(&start_script);
+        readiness.insert(
+            version,
+            serde_json::json!({
+                "runtime_present": runtime_present,
+                "start_sh_executable": start_sh_executable,
+            }),
+        );
+    }
+    serde_json::Value::Object(readiness)
 }
 
 fn system_forward_timeout() -> Duration {

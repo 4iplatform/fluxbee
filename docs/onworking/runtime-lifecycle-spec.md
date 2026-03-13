@@ -79,7 +79,9 @@ A runtime version is considered published when BOTH conditions are met:
 1. The version appears in `manifest.json` under `runtimes.<name>.available`.
 2. The file `dist/runtimes/<name>/<version>/bin/start.sh` exists and is executable.
 
-**Publish validation (recommended):**
+**Publish validation (recommended, requires FR8-T3/T4 implemented):**
+
+The following validation uses the `readiness` block in the versions API, which is part of the target state defined in this spec. Until FR8-T3/T4 are implemented, verify artifact presence manually on disk.
 
 ```bash
 # After placing artifacts and updating manifest:
@@ -94,6 +96,21 @@ assert readiness.get('runtime_present', False), f'{v} artifact not present local
 assert readiness.get('start_sh_executable', False), f'{v} start.sh not executable'
 print('PUBLISH OK')
 "
+```
+
+**Interim validation (before FR8-T3/T4):**
+
+```bash
+# Check manifest entry
+curl -sS "$BASE/hives/$MOTHER_HIVE/versions" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+rt = d['payload']['hive']['runtimes']['runtimes']['$RUNTIME']
+assert '$VERSION' in rt['available'], 'not in manifest'
+print('MANIFEST OK')
+"
+# Check artifact on disk
+test -x "/var/lib/fluxbee/dist/runtimes/$RUNTIME/$VERSION/bin/start.sh" && echo "ARTIFACT OK" || echo "ARTIFACT MISSING"
 ```
 
 ---
@@ -164,8 +181,8 @@ curl -sS -X POST "$BASE/hives/$TARGET_HIVE/update" \
 |--------|---------|---------------|
 | `ok` | Manifest and all current artifacts verified locally | Proceed to spawn |
 | `sync_pending` | Manifest or artifacts not yet present, or version not yet replicated | Wait, retry sync-hint, retry update |
-| `VERSION_MISMATCH` | Requested version is stale (local already ahead) | Use current version from motherbee |
-| `error` | Manifest invalid, hash corrupted, or other failure | Investigate, do not proceed |
+| `error` (`VERSION_MISMATCH`) | Requested version is stale (local already ahead) | Use current version from motherbee |
+| `error` (other) | Manifest invalid, hash corrupted, or other failure | Investigate, do not proceed |
 
 **Key rule:** `ok` from UPDATE means "this worker can execute any runtime marked as current in the manifest." This is the gate that authorizes spawn.
 
@@ -176,7 +193,7 @@ The version check uses exact match, not >=. This is intentional:
 - `manifest_version=0` → skip version check (bootstrap/recovery).
 - `local == requested` → proceed to hash and artifact verification.
 - `local < requested` → manifest hasn't arrived yet → `sync_pending`.
-- `local > requested` → caller is behind → `VERSION_MISMATCH`.
+- `local > requested` → caller is behind → `status: error, error_code: VERSION_MISMATCH`.
 
 ---
 
@@ -440,7 +457,7 @@ Architect                   Worker
 |------|---------------------------|--------------------------|
 | `GET /versions` readiness | Not implemented. Returns manifest only | Returns manifest + `readiness` per runtime/version with `runtime_present` and `start_sh_executable` |
 | `SYSTEM_UPDATE` artifact check | Not implemented. Only validates manifest version/hash | Also verifies `start.sh` exists and is executable for each current runtime |
-| Version semantics in UPDATE | Exact match or `manifest_version=0`; `sync_pending` if no match | Same exact match semantics, documented explicitly with all cases |
+| Version semantics in UPDATE | Exact match or `manifest_version=0`; cualquier mismatch responde `sync_pending` | Mantiene exact match para `==` y `manifest_version=0`; distingue `local > requested` como `status:error` + `error_code=VERSION_MISMATCH` |
 | Executable check in spawn | Checks `is_file` only, not executable bit | Checks both `exists` and `is_executable` |
 | Spawn preflight error detail | Returns `RUNTIME_NOT_PRESENT` (basic) | Returns `RUNTIME_NOT_PRESENT` with runtime, version, expected_path, and hint |
 
