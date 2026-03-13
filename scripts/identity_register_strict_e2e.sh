@@ -196,15 +196,20 @@ assert_failed_with_identity_register() {
   local http_code="$2"
   local label="$3"
   local expected_message_fragment="${4:-}"
-  local status code message detail
+  local status code message detail reg_status reg_reason
 
   status="$(json_get_file "status" "$file")"
   code="$(effective_error_code "$file")"
   message="$(json_get_file "payload.message" "$file")"
   detail="$(json_get_file "error_detail" "$file")"
+  reg_status="$(json_get_file "payload.identity.register.status" "$file")"
+  reg_reason="$(json_get_file "payload.identity.register.reason" "$file")"
 
   if [[ "$status" == "ok" ]]; then
     echo "FAIL[$label]: unexpected success http=$http_code" >&2
+    if [[ "$reg_status" == "skipped" && "$reg_reason" == "missing_tenant_id" ]]; then
+      echo "Hint[$label]: worker sy-orchestrator still runs old logic (soft-fail register). Deploy/restart latest sy-orchestrator on worker and retry." >&2
+    fi
     cat "$file" >&2 || true
     exit 1
   fi
