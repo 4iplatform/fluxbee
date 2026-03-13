@@ -349,6 +349,7 @@ Criterio de aceptación C:
 - [x] INV-D6. E2E regresión: `node_name@hive` cruzado vs endpoint hive mantiene identidad/routing correctos. (`scripts/inventory_node_name_cross_hive_e2e.sh`)
   - El criterio duro valida routing en spawn/kill por `node_name@hive`; la observación en inventory puede ser efímera con runtimes de vida corta.
   - Modo estricto (`REQUIRE_INVENTORY_PRESENT=1`) requiere runtime long-lived (ej.: `wf.inventory.hold.diag`).
+  - Si `spawn` responde `RUNTIME_NOT_PRESENT`, el E2E intenta auto-remediar con `sync-hint + update(runtime)` y reintenta una vez.
 
 Criterio de aceptación D:
 - FR-01 y FR-03 cerrados con evidencia automatizada.

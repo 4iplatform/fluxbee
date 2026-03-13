@@ -29,6 +29,9 @@ POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-1}"
 APPEAR_TIMEOUT_SECS="${APPEAR_TIMEOUT_SECS:-45}"
 DISAPPEAR_TIMEOUT_SECS="${DISAPPEAR_TIMEOUT_SECS:-45}"
 REQUIRE_INVENTORY_PRESENT="${REQUIRE_INVENTORY_PRESENT:-0}"
+WAIT_SYNC_HINT_SECS="${WAIT_SYNC_HINT_SECS:-120}"
+WAIT_UPDATE_SECS="${WAIT_UPDATE_SECS:-120}"
+SYNC_HINT_TIMEOUT_MS="${SYNC_HINT_TIMEOUT_MS:-30000}"
 
 tmpdir="$(mktemp -d)"
 versions_body="$tmpdir/versions.json"
@@ -36,6 +39,8 @@ spawn_body="$tmpdir/spawn.json"
 kill_body="$tmpdir/kill.json"
 inventory_target_body="$tmpdir/inventory_target.json"
 inventory_request_body="$tmpdir/inventory_request.json"
+sync_hint_body="$tmpdir/sync_hint.json"
+update_body="$tmpdir/update.json"
 
 cleanup() {
   local _ec=$?
@@ -176,6 +181,97 @@ http_call() {
   fi
 }
 
+post_sync_hint() {
+  local out_file="$1"
+  local payload
+  payload="{\"channel\":\"dist\",\"folder_id\":\"fluxbee-dist\",\"wait_for_idle\":true,\"timeout_ms\":$SYNC_HINT_TIMEOUT_MS}"
+  http_call "POST" "$BASE/hives/$TARGET_HIVE_ID/sync-hint" "$out_file" "$payload"
+}
+
+wait_sync_hint_ok() {
+  local out_file="$1"
+  local deadline=$(( $(date +%s) + WAIT_SYNC_HINT_SECS ))
+  while (( $(date +%s) <= deadline )); do
+    local status
+    post_sync_hint "$out_file" >/dev/null
+    status="$(json_get_file "payload.status" "$out_file")"
+    if [[ "$status" == "ok" ]]; then
+      return 0
+    fi
+    if [[ "$status" == "sync_pending" ]]; then
+      sleep 2
+      continue
+    fi
+    echo "FAIL: sync-hint status='$status'" >&2
+    cat "$out_file" >&2 || true
+    return 1
+  done
+  echo "FAIL: sync-hint timeout waiting ok" >&2
+  cat "$out_file" >&2 || true
+  return 1
+}
+
+post_runtime_update() {
+  local manifest_version="$1"
+  local manifest_hash="$2"
+  local out_file="$3"
+  local payload
+  payload="{\"category\":\"runtime\",\"manifest_version\":${manifest_version},\"manifest_hash\":\"${manifest_hash}\"}"
+  http_call "POST" "$BASE/hives/$TARGET_HIVE_ID/update" "$out_file" "$payload"
+}
+
+wait_update_ok() {
+  local manifest_version="$1"
+  local manifest_hash="$2"
+  local out_file="$3"
+  local deadline=$(( $(date +%s) + WAIT_UPDATE_SECS ))
+  while (( $(date +%s) <= deadline )); do
+    local status error_code error_detail
+    post_runtime_update "$manifest_version" "$manifest_hash" "$out_file" >/dev/null
+    status="$(json_get_file "payload.status" "$out_file")"
+    if [[ "$status" == "ok" ]]; then
+      return 0
+    fi
+    if [[ "$status" == "sync_pending" ]]; then
+      sleep 2
+      continue
+    fi
+    error_code="$(json_get_file "error_code" "$out_file")"
+    error_detail="$(json_get_file "error_detail" "$out_file")"
+    if [[ "$error_code" == "TRANSPORT_ERROR" && "$error_detail" == *"UNREACHABLE"* ]]; then
+      sleep 2
+      continue
+    fi
+    echo "FAIL: update runtime status='$status'" >&2
+    cat "$out_file" >&2 || true
+    return 1
+  done
+  echo "FAIL: update runtime timeout waiting ok" >&2
+  cat "$out_file" >&2 || true
+  return 1
+}
+
+is_numeric() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+materialize_runtime_on_target() {
+  local manifest_version="$1"
+  local manifest_hash="$2"
+  if [[ -z "$manifest_version" || -z "$manifest_hash" ]]; then
+    echo "FAIL: cannot materialize runtime (missing manifest_version/hash)" >&2
+    return 1
+  fi
+  if ! is_numeric "$manifest_version"; then
+    echo "FAIL: cannot materialize runtime (manifest_version is non-numeric: '$manifest_version')" >&2
+    return 1
+  fi
+  echo "INFO: runtime missing on target, trying sync-hint + update (hive=$TARGET_HIVE_ID runtime=$RUNTIME)" >&2
+  wait_sync_hint_ok "$sync_hint_body" || return 1
+  wait_update_ok "$manifest_version" "$manifest_hash" "$update_body" || return 1
+  return 0
+}
+
 wait_inventory_state() {
   local hive_id="$1"
   local node_l2="$2"
@@ -277,8 +373,35 @@ spawn_payload="$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"%s"
 spawn_http="$(http_call "POST" "$BASE/hives/$REQUEST_HIVE_ID/nodes" "$spawn_body" "$spawn_payload")"
 spawn_status="$(json_get_file "status" "$spawn_body")"
 if [[ "$spawn_http" != "200" || "$spawn_status" != "ok" ]]; then
-  echo "FAIL: spawn failed http=$spawn_http status=$spawn_status" >&2
+  spawn_code="$(json_get_file "error_code" "$spawn_body")"
+  if [[ -z "$spawn_code" ]]; then
+    spawn_code="$(json_get_file "payload.error_code" "$spawn_body")"
+  fi
+  if [[ "$spawn_code" == "RUNTIME_NOT_PRESENT" ]]; then
+    manifest_version="$(json_get_file "payload.hive.runtimes.manifest_version" "$versions_body")"
+    manifest_hash="$(json_get_file "payload.hive.runtimes.manifest_hash" "$versions_body")"
+    if ! materialize_runtime_on_target "$manifest_version" "$manifest_hash"; then
+      echo "FAIL: runtime materialization attempt failed; spawn cannot proceed." >&2
+      cat "$spawn_body" >&2 || true
+      exit 1
+    fi
+    spawn_http="$(http_call "POST" "$BASE/hives/$REQUEST_HIVE_ID/nodes" "$spawn_body" "$spawn_payload")"
+    spawn_status="$(json_get_file "status" "$spawn_body")"
+    if [[ "$spawn_http" == "200" && "$spawn_status" == "ok" ]]; then
+      echo "INFO: spawn succeeded after runtime materialization retry." >&2
+    fi
+  fi
+fi
+if [[ "$spawn_http" != "200" || "$spawn_status" != "ok" ]]; then
+  spawn_code="$(json_get_file "error_code" "$spawn_body")"
+  if [[ -z "$spawn_code" ]]; then
+    spawn_code="$(json_get_file "payload.error_code" "$spawn_body")"
+  fi
+  echo "FAIL: spawn failed http=$spawn_http status=$spawn_status code=$spawn_code" >&2
   cat "$spawn_body" >&2 || true
+  if [[ "$spawn_code" == "RUNTIME_NOT_PRESENT" ]]; then
+    echo "Hint: runtime is still missing on target hive '$TARGET_HIVE_ID' after auto-update attempt." >&2
+  fi
   exit 1
 fi
 
