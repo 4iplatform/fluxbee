@@ -475,19 +475,19 @@ Architect                   Worker
 
 ### Phase 2 — Versions API
 
-- [ ] FR8-T3. Add `readiness` block per runtime/version in `GET /hives/{hive}/versions` response.
-- [ ] FR8-T4. Orchestrator checks filesystem for each version when building versions response.
+- [x] FR8-T3. Add `readiness` block per runtime/version in `GET /hives/{hive}/versions` response.
+- [x] FR8-T4. Orchestrator checks filesystem for each version when building versions response.
 - [ ] FR8-T5. Maintain manifest visibility regardless of readiness (manifest data always shown, readiness is additional).
 
 ### Phase 3 — UPDATE Hardening
 
-- [ ] FR8-T6. Add artifact verification in SYSTEM_UPDATE handler: for each current runtime/version, check `start.sh` exists and is executable.
-- [ ] FR8-T7. If artifacts missing during UPDATE, respond `sync_pending` (not `ok`).
+- [x] FR8-T6. Add artifact verification in SYSTEM_UPDATE handler: for each current runtime/version, check `start.sh` exists and is executable.
+- [x] FR8-T7. If artifacts missing during UPDATE, respond `sync_pending` (not `ok`).
 
 ### Phase 4 — Spawn Hardening
 
-- [ ] FR8-T8. Add explicit preflight check in `run_node`: verify `start.sh` exists AND is executable, before config.json creation.
-- [ ] FR8-T9. Return structured `RUNTIME_NOT_PRESENT` error with runtime, version, expected_path, and hint.
+- [x] FR8-T8. Add explicit preflight check in `run_node`: verify `start.sh` exists AND is executable, before config.json creation.
+- [x] FR8-T9. Return structured `RUNTIME_NOT_PRESENT` error with runtime, version, expected_path, and hint.
 - [ ] FR8-T10. Spawn does NOT auto-trigger SYSTEM_UPDATE. Fails explicitly.
 
 ### Phase 5 — E2E Validation
@@ -495,7 +495,7 @@ Architect                   Worker
 - [ ] FR8-T11. E2E case A: runtime in manifest without `start.sh` → versions shows `runtime_present: false`, spawn returns `RUNTIME_NOT_PRESENT`.
 - [ ] FR8-T12. E2E case B: after sync-hint + update → versions shows `runtime_present: true`, spawn succeeds.
 - [ ] FR8-T13. E2E case C: spawn without prior update → `RUNTIME_NOT_PRESENT` with actionable hint.
-- [ ] FR8-T14. E2E case D: UPDATE with missing artifact → responds `sync_pending`, not `ok`.
+- [x] FR8-T14. E2E case D: UPDATE with missing artifact → responds `sync_pending`, not `ok`.
 
 ### Phase 6 — Documentation
 

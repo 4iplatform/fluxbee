@@ -7002,11 +7002,29 @@ async fn run_node_flow(
     };
 
     let start_script = runtime_start_script(&runtime_key, &version);
+    let start_script_path = PathBuf::from(&start_script);
     if !local_runtime_script_exists(&start_script) {
         return serde_json::json!({
             "status": "error",
             "error_code": "RUNTIME_NOT_PRESENT",
             "message": format!("runtime script missing in dist path: {}", start_script),
+            "runtime": runtime_key,
+            "version": version,
+            "expected_path": start_script,
+            "hint": "Run SYSTEM_UPDATE to materialize this runtime on the worker",
+            "target": target_hive,
+            "node_name": node_name,
+        });
+    }
+    if !local_runtime_script_is_executable(&start_script_path) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "RUNTIME_NOT_PRESENT",
+            "message": format!("runtime script exists but is not executable: {}", start_script),
+            "runtime": runtime_key,
+            "version": version,
+            "expected_path": start_script,
+            "hint": "Fix permissions (chmod +x) and run SYSTEM_UPDATE",
             "target": target_hive,
             "node_name": node_name,
         });
