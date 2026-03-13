@@ -488,14 +488,15 @@ Architect                   Worker
 
 - [x] FR8-T8. Add explicit preflight check in `run_node`: verify `start.sh` exists AND is executable, before config.json creation.
 - [x] FR8-T9. Return structured `RUNTIME_NOT_PRESENT` error with runtime, version, expected_path, and hint.
-- [ ] FR8-T10. Spawn does NOT auto-trigger SYSTEM_UPDATE. Fails explicitly.
+- [x] FR8-T10. Spawn does NOT auto-trigger SYSTEM_UPDATE. Fails explicitly.
 
 ### Phase 5 — E2E Validation
 
 - [ ] FR8-T11. E2E case A: runtime in manifest without `start.sh` → versions shows `runtime_present: false`, spawn returns `RUNTIME_NOT_PRESENT`.
 - [ ] FR8-T12. E2E case B: after sync-hint + update → versions shows `runtime_present: true`, spawn succeeds.
-- [ ] FR8-T13. E2E case C: spawn without prior update → `RUNTIME_NOT_PRESENT` with actionable hint.
+- [x] FR8-T13. E2E case C: spawn without prior update → `RUNTIME_NOT_PRESENT` with actionable hint.
 - [x] FR8-T14. E2E case D: UPDATE with missing artifact → responds `sync_pending`, not `ok`.
+- Test script for FR8-T11/T12: `scripts/runtime_lifecycle_fr8_e2e.sh`.
 
 ### Phase 6 — Documentation
 
