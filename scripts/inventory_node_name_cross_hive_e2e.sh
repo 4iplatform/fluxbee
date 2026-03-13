@@ -295,7 +295,7 @@ seed_runtime_fixture_if_needed() {
     RUNTIME="$RUNTIME" \
     TENANT_ID="$TENANT_ID" \
     TEST_ID="fr3seed-${TEST_ID}" \
-    NODE_NAME="WF.inventory.seed.${TEST_ID}" \
+    NODE_NAME="$NODE_NAME_BASE" \
     INVENTORY_APPEAR_TIMEOUT_SECS=45 \
     INVENTORY_DISAPPEAR_TIMEOUT_SECS=45 \
     "$RUNTIME_SEED_SCRIPT"
@@ -307,7 +307,7 @@ seed_runtime_fixture_if_needed() {
     RUNTIME_VERSION="$RUNTIME_VERSION" \
     TENANT_ID="$TENANT_ID" \
     TEST_ID="fr3seed-${TEST_ID}" \
-    NODE_NAME="WF.inventory.seed.${TEST_ID}" \
+    NODE_NAME="$NODE_NAME_BASE" \
     INVENTORY_APPEAR_TIMEOUT_SECS=45 \
     INVENTORY_DISAPPEAR_TIMEOUT_SECS=45 \
     "$RUNTIME_SEED_SCRIPT"

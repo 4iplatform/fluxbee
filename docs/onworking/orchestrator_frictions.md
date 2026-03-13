@@ -382,6 +382,7 @@ Criterio de aceptación C:
   - El criterio duro valida routing en spawn/kill por `node_name@hive`; la observación en inventory puede ser efímera con runtimes de vida corta.
   - Modo estricto (`REQUIRE_INVENTORY_PRESENT=1`) requiere runtime long-lived (ej.: `wf.inventory.hold.diag`).
   - Si `spawn` responde `RUNTIME_NOT_PRESENT`, el E2E intenta auto-remediar con `sync-hint + update(runtime)` y reintenta; para `wf.inventory.hold.diag` agrega seed automático de runtime source si sigue faltando.
+  - El seed automático usa el mismo `NODE_NAME` del test FR-03 para evitar fixture bakeada con un nombre distinto y falsos negativos de presencia en inventory.
 
 Criterio de aceptación D:
 - FR-01 y FR-03 cerrados con evidencia automatizada.
