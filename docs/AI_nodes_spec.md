@@ -1476,15 +1476,55 @@ ai-nodectl status ai-chat
 ai-nodectl logs ai-chat --follow
 ```
 
-Spawn/provision flows (manual, without orchestrator integration):
 
-```bash
-# Flow A: JSON-first (precreate effective state file)
-ai-nodectl init-state ai-chat /tmp/ai_chat_effective_config.json --schema-version 1 --config-version 1
-sudo systemctl restart fluxbee-ai-node@ai-chat
+---
 
-# Flow B: start UNCONFIGURED and provision with first CONFIG_SET
-sudo systemctl start fluxbee-ai-node@ai-chat
-# then send CONFIG_SET via control plane
-```
+## 9. Thread State Store (LanceDB) — estado relevante por thread (MVP)
 
+> ✅ **Objetivo**: permitir que cada nodo `AI.*` guarde **datos duros** relevantes para continuar tareas entre mensajes, sin guardar la conversación completa.
+> ⚠️ Este store es **privado por nodo**: un nodo no lee/escribe el store de otro.
+
+### 9.1 Identificador: `thread_id` (tentativo)
+
+🧩 **A ESPECIFICAR (core)**: la definición final de `thread_id` se cerrará más adelante.
+
+✅ **NORMATIVO (MVP)**:
+- Todo mensaje `user` debe incluir `thread_id` (campo top-level, al mismo nivel que `src_ilk`).
+- El responsable de asignarlo es el **IO node** (por canal/conversación), por lo que **siempre** debe venir.
+
+### 9.2 Modelo de datos: 1 JSON por `thread_id`
+
+✅ **NORMATIVO (MVP)**:
+- El nodo mantiene **un único documento JSON** por `thread_id`.
+- La estructura del JSON es **libre** y se define por prompting/policy según el nodo (frontdesk, soporte, etc.).
+- Campos opcionales de sistema:
+  - `updated_at` (timestamp de último write)
+  - `ttl_seconds` (si el backend lo soporta)
+
+✅ **NORMATIVO**:
+- El nodo **decide** qué guardar y cuándo actualizar/borrar (por prompting/policy).
+- El nodo **MUST** poder borrar inmediatamente el estado de un thread cuando deje de ser útil.
+
+### 9.3 API (Tool calling) mínima
+
+✅ **NORMATIVO (MVP)**: el runtime/SDK debe exponer tools equivalentes a:
+- `thread_state_get(thread_id) -> { state_json?, updated_at? }`
+- `thread_state_put(thread_id, state_json, ttl_seconds?) -> ok`
+- `thread_state_delete(thread_id) -> ok`
+
+> Nota: no se requiere query vectorial ni múltiple-key en MVP.
+
+### 9.4 Persistencia y path
+
+✅ **NORMATIVO (MVP)**:
+- La base/dataset de LanceDB del nodo vive bajo `${STATE_DIR}/ai-nodes/<node_name>/lancedb/` (o path equivalente que respete patrones Fluxbee).
+- El nodo es responsable del mantenimiento: cleanup de threads completados, TTL, compactación si aplica.
+
+🧩 **A ESPECIFICAR**:
+- Reglas de backup/restore y migración de schema interno de LanceDB.
+
+### 9.5 Concurrencia e idempotencia
+
+✅ **NORMATIVO (MVP)**:
+- Se asume un único proceso writer (la instancia del nodo) para su store.
+- El nodo debe serializar accesos concurrentes a un mismo `thread_id` para evitar corrupción (mutex/actor queue).
