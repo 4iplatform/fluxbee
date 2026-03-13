@@ -3,7 +3,10 @@ set -euo pipefail
 
 # FR-05/06 E2E:
 # - spawn con config inicial
+# - respawn con mismo node_name debe fallar (NODE_ALREADY_EXISTS)
 # - GET config por nodo
+# - GET state por nodo
+# - GET state de nodo inexistente (state=null)
 # - PUT config patch por nodo (merge)
 # - GET final para verificar persistencia y versionado
 #
@@ -21,6 +24,20 @@ RUNTIME_VERSION="${RUNTIME_VERSION:-current}"
 TENANT_ID="${TENANT_ID:-}"
 TEST_ID="${TEST_ID:-cfgpn-$(date +%s)-$RANDOM}"
 NODE_NAME="${NODE_NAME:-WF.config.pernode.${TEST_ID}}"
+NODE_REQUEST_NAME="$NODE_NAME"
+if [[ "$NODE_REQUEST_NAME" == *@* ]]; then
+  NODE_FQN="$NODE_REQUEST_NAME"
+else
+  NODE_FQN="$NODE_REQUEST_NAME@$HIVE_ID"
+fi
+NODE_LOCAL="${NODE_FQN%@*}"
+NODE_KIND="${NODE_FQN%%.*}"
+EXPECTED_CONFIG_PATH="/var/lib/fluxbee/nodes/$NODE_KIND/$NODE_FQN/config.json"
+EXPECTED_STATE_PATH="/var/lib/fluxbee/nodes/$NODE_KIND/$NODE_FQN/state.json"
+MISSING_REQUEST_NAME="${NODE_LOCAL}.missing.${TEST_ID}"
+MISSING_FQN="$MISSING_REQUEST_NAME@$HIVE_ID"
+MISSING_KIND="${MISSING_FQN%%.*}"
+EXPECTED_MISSING_STATE_PATH="/var/lib/fluxbee/nodes/$MISSING_KIND/$MISSING_FQN/state.json"
 
 if [[ -z "$TENANT_ID" ]]; then
   echo "FAIL: TENANT_ID is required (format tnt:<uuid>)" >&2
@@ -70,6 +87,15 @@ assert_eq() {
   local label="$3"
   if [[ "$actual" != "$expected" ]]; then
     echo "FAIL[$label]: expected '$expected', got '$actual'" >&2
+    exit 1
+  fi
+}
+
+assert_nonempty() {
+  local value="$1"
+  local label="$2"
+  if [[ -z "$value" ]]; then
+    echo "FAIL[$label]: value is empty" >&2
     exit 1
   fi
 }
@@ -135,7 +161,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 echo "NODE CONFIG FR-05/06 E2E: BASE=$BASE HIVE_ID=$HIVE_ID NODE_NAME=$NODE_NAME RUNTIME=$RUNTIME"
 
-echo "Step 1/7: validate runtime exists in /hives/$HIVE_ID/versions"
+echo "Step 1/10: validate runtime exists in /hives/$HIVE_ID/versions"
 versions_body="$tmpdir/versions.json"
 status="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$versions_body")"
 assert_eq "$status" "200" "versions-http"
@@ -146,13 +172,14 @@ if [[ "$(runtime_exists "$versions_body" "$RUNTIME")" != "1" ]]; then
   exit 1
 fi
 
-echo "Step 2/7: cleanup baseline node (ignore errors)"
+echo "Step 2/10: cleanup baseline node (ignore errors)"
 cleanup_body="$tmpdir/cleanup.json"
-http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" "$cleanup_body" >/dev/null || true
+http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_REQUEST_NAME" "$cleanup_body" >/dev/null || true
+http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$MISSING_REQUEST_NAME" "$cleanup_body" >/dev/null || true
 
-echo "Step 3/7: spawn node with initial config"
+echo "Step 3/10: spawn node with initial config"
 spawn_payload="$(cat <<JSON
-{"node_name":"$NODE_NAME","runtime":"$RUNTIME","runtime_version":"$RUNTIME_VERSION","config":{"tenant_id":"$TENANT_ID","model":"diag-v1","temperature":0.7}}
+{"node_name":"$NODE_REQUEST_NAME","runtime":"$RUNTIME","runtime_version":"$RUNTIME_VERSION","config":{"tenant_id":"$TENANT_ID","model":"diag-v1","temperature":0.7}}
 JSON
 )"
 spawn_body="$tmpdir/spawn.json"
@@ -169,9 +196,26 @@ if [[ -z "$config_path" ]]; then
   exit 1
 fi
 
-echo "Step 4/7: read node config via API"
+echo "Step 4/10: verify fixed config path"
+assert_eq "$config_path" "$EXPECTED_CONFIG_PATH" "config-path-fixed"
+
+echo "Step 5/10: respawn with same node_name must fail"
+respawn_body="$tmpdir/respawn.json"
+status="$(http_call "POST" "$BASE/hives/$HIVE_ID/nodes" "$respawn_body" "$spawn_payload")"
+if [[ "$status" == "200" && "$(json_get "status" "$respawn_body")" == "ok" ]]; then
+  echo "FAIL: respawn unexpectedly succeeded" >&2
+  cat "$respawn_body" >&2
+  exit 1
+fi
+respawn_error_code="$(json_get "error_code" "$respawn_body")"
+if [[ -z "$respawn_error_code" ]]; then
+  respawn_error_code="$(json_get "payload.error_code" "$respawn_body")"
+fi
+assert_eq "$respawn_error_code" "NODE_ALREADY_EXISTS" "respawn-error-code"
+
+echo "Step 6/10: read node config via API"
 get1_body="$tmpdir/get1.json"
-status="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" "$get1_body")"
+status="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes/$NODE_REQUEST_NAME/config" "$get1_body")"
 if [[ "$status" != "200" || "$(json_get "status" "$get1_body")" != "ok" ]]; then
   echo "FAIL: get config (initial) failed http=$status" >&2
   cat "$get1_body" >&2
@@ -181,19 +225,40 @@ assert_eq "$(json_get "payload.config.model" "$get1_body")" "diag-v1" "get1-mode
 assert_eq "$(json_get "payload.config.tenant_id" "$get1_body")" "$TENANT_ID" "get1-tenant"
 v1="$(json_get "payload.config_version" "$get1_body")"
 
-echo "Step 5/7: patch node config via API"
+echo "Step 7/10: read node state via API"
+get_state_body="$tmpdir/get_state.json"
+status="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes/$NODE_REQUEST_NAME/state" "$get_state_body")"
+if [[ "$status" != "200" || "$(json_get "status" "$get_state_body")" != "ok" ]]; then
+  echo "FAIL: get state failed http=$status" >&2
+  cat "$get_state_body" >&2
+  exit 1
+fi
+assert_eq "$(json_get "payload.path" "$get_state_body")" "$EXPECTED_STATE_PATH" "state-path-fixed"
+assert_nonempty "$(json_get "payload.node_name" "$get_state_body")" "state-node-name"
+
+echo "Step 8/10: read state of missing node (must be null)"
+get_missing_state_body="$tmpdir/get_missing_state.json"
+status="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes/$MISSING_REQUEST_NAME/state" "$get_missing_state_body")"
+if [[ "$status" != "200" || "$(json_get "status" "$get_missing_state_body")" != "ok" ]]; then
+  echo "FAIL: get missing state failed http=$status" >&2
+  cat "$get_missing_state_body" >&2
+  exit 1
+fi
+assert_eq "$(json_get "payload.path" "$get_missing_state_body")" "$EXPECTED_MISSING_STATE_PATH" "missing-state-path-fixed"
+assert_eq "$(json_get "payload.state" "$get_missing_state_body")" "" "missing-state-null"
+
+echo "Step 9/10: patch node config via API and verify merge + version bump"
 patch_payload='{"temperature":0.2,"system_prompt":"hello from FR-05/06"}'
 set_body="$tmpdir/set.json"
-status="$(http_call "PUT" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" "$set_body" "$patch_payload")"
+status="$(http_call "PUT" "$BASE/hives/$HIVE_ID/nodes/$NODE_REQUEST_NAME/config" "$set_body" "$patch_payload")"
 if [[ "$status" != "200" || "$(json_get "status" "$set_body")" != "ok" ]]; then
   echo "FAIL: put config failed http=$status" >&2
   cat "$set_body" >&2
   exit 1
 fi
 
-echo "Step 6/7: read node config again and verify merge + version bump"
 get2_body="$tmpdir/get2.json"
-status="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" "$get2_body")"
+status="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes/$NODE_REQUEST_NAME/config" "$get2_body")"
 if [[ "$status" != "200" || "$(json_get "status" "$get2_body")" != "ok" ]]; then
   echo "FAIL: get config (after patch) failed http=$status" >&2
   cat "$get2_body" >&2
@@ -218,9 +283,9 @@ if (( v2 <= v1 )); then
   exit 1
 fi
 
-echo "Step 7/7: final kill + summary"
+echo "Step 10/10: final kill + summary"
 kill_body="$tmpdir/kill.json"
-status="$(http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" "$kill_body")"
+status="$(http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_REQUEST_NAME" "$kill_body")"
 if [[ "$status" != "200" || "$(json_get "status" "$kill_body")" != "ok" ]]; then
   echo "WARN: final kill returned http=$status" >&2
   cat "$kill_body" >&2
@@ -228,10 +293,11 @@ fi
 
 echo "status=ok"
 echo "hive_id=$HIVE_ID"
-echo "node_name=$NODE_NAME@$HIVE_ID"
+echo "node_name=$NODE_FQN"
 echo "runtime=$RUNTIME@$RUNTIME_VERSION"
 echo "tenant_id=$TENANT_ID"
 echo "config_path=$config_path"
+echo "state_path=$EXPECTED_STATE_PATH"
 echo "config_version_before=$v1"
 echo "config_version_after=$v2"
 echo "node config FR-05/06 E2E passed."

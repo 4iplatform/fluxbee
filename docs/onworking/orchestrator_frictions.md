@@ -122,16 +122,18 @@ Impacto:
 
 ---
 
-### FR-05 — Config per-node unicast (`CONFIG_SET/GET`) canónico
+### FR-05 — Config per-node unicast (API de control) + lectura de estado
 
-Estado: CLOSED (API + flujo unicast implementado)
+Estado: PARTIAL-CLOSED
 
 Qué pasa hoy:
-- Existe endpoint admin canónico per-node:
+- Existe endpoint admin canónico per-node config:
   - `GET /hives/{hive}/nodes/{node}/config`
   - `PUT /hives/{hive}/nodes/{node}/config`
-- El update per-node usa unicast a L2 del nodo con `CONFIG_CHANGED` (`subsystem=node_config`) como equivalente explícito al contrato `CONFIG_SET`.
+- El update per-node usa unicast a L2 del nodo con `CONFIG_CHANGED` (`subsystem=node_config`) como señal de hot-reload.
 - El flujo soporta hive remoto vía relay motherbee -> `SY.orchestrator@target`.
+- Ya existe endpoint canónico de diagnóstico runtime por nodo:
+  - `GET /hives/{hive}/nodes/{node}/state` (read-only; `payload.state = null` si no hay archivo).
 
 Evidencia:
 - `src/bin/sy_admin.rs`
@@ -143,29 +145,48 @@ Lista de tareas FR-05:
 - [x] FR5-T2. Acción canónica en orchestrator (`get_node_config` / `set_node_config`).
 - [x] FR5-T3. Soporte remoto por relay (`NODE_CONFIG_GET/SET` via system messages).
 - [x] FR5-T4. Señal unicast de hot-reload (`CONFIG_CHANGED subsystem=node_config`) al nodo target.
-- [x] FR5-T5. E2E dedicado (`scripts/node_config_per_node_e2e.sh`).
+- [x] FR5-T5. E2E dedicado config (`scripts/node_config_per_node_e2e.sh`).
+- [x] FR5-T6. Endpoint `GET /hives/{hive}/nodes/{node}/state` (read-only, `payload: null` si no existe).
+- [x] FR5-T7. E2E de state endpoint (existente/no existente + hive remoto). (`scripts/node_config_per_node_e2e.sh`)
 
 ---
 
-### FR-06 — Config efectiva single-file por nodo (ownership de creación)
+### FR-06 — Ownership de archivos de nodo (revisión v1.1: two-file model)
 
-Estado: CLOSED (orchestrator owner en spawn + update API)
+Estado: PARTIAL-CLOSED (implementación base completa, falta cierre E2E dedicado)
 
 Qué pasa hoy:
-- `run_node` materializa config efectiva por nodo bajo `${STATE_DIR}/node-configs/<TYPE>/<node_name@hive>.json`.
-- Orchestrator crea el archivo inicial durante spawn (si no existe), preserva el existente en respawn y actualiza vía `PUT .../config`.
-- El bloque `_system` se mantiene canónico (`node_name`, `hive_id`, `config_version`, timestamps, runtime metadata).
+- Implementación migrada a two-file ownership con writer único por archivo.
+- Path base canónico fijo: `/var/lib/fluxbee/nodes`.
+- Spawn fail-closed si existe `config.json` del nodo (`NODE_ALREADY_EXISTS`).
 
-Evidencia:
-- `src/bin/sy_orchestrator.rs`
-- `scripts/node_config_per_node_e2e.sh`
+Objetivo v1.1 propuesto:
+- Dos archivos por instancia, un único writer por archivo:
+  - `config.json` (writer: orchestrator)
+  - `state.json` (writer: nodo)
+- Invariante: orchestrator nunca escribe `state.json`; nodo nunca escribe `config.json`.
+- Spawn fail-closed si `config.json` ya existe (`NODE_ALREADY_EXISTS`), para evitar overwrite accidental.
 
-Lista de tareas FR-06:
-- [x] FR6-T1. Definir path único de config efectiva por nodo bajo `${STATE_DIR}`.
-- [x] FR6-T2. Crear config inicial en spawn con metadata `_system`.
-- [x] FR6-T3. Versionado de config (`_system.config_version`) y update atómico.
-- [x] FR6-T4. Exponer lectura/escritura por API admin per-node.
-- [x] FR6-T5. Cubrir flujo spawn+update+read en E2E.
+Evidencia de contexto:
+- `docs/onworking/node-spawn-config-spec.md` (v1.1 draft)
+- `src/bin/sy_orchestrator.rs` (layout two-file + permisos + fail-closed)
+- `src/bin/sy_admin.rs` (`GET /hives/{hive}/nodes/{node}/state`)
+
+Lista de tareas FR-06 (migración v1.1):
+- [x] FR6R-T1. Cambiar layout on-disk a carpeta por nodo (`.../<TYPE>/<node@hive>/config.json` + `state.json`).
+- [x] FR6R-T2. Definir base path final canónica fija en core: `/var/lib/fluxbee/nodes`.
+- [x] FR6R-T3. Spawn: crear `config.json` atómico con bloque `_system`; fallar si ya existe.
+- [x] FR6R-T4. `PUT .../config`: merge/write atómico de `config.json` + señal `CONFIG_CHANGED`.
+- [x] FR6R-T5. `GET .../config`: leer `config.json` exclusivamente.
+- [x] FR6R-T6. `GET .../state`: leer `state.json` read-only, devolver `payload=null` si no existe.
+- [x] FR6R-T7. Permisos de archivo/directorio (`0700` dirs, `0600` files) en create/update.
+- [x] FR6R-T8. E2E de migración/ownership (writer único por archivo + respawn fail when config exists). (`scripts/node_config_per_node_e2e.sh`)
+
+Criterio de cierre FR-06:
+- No existe ningún camino donde orchestrator escriba `state.json`.
+- No existe ningún camino donde nodo necesite escribir `config.json`.
+- Respawn con `config.json` preexistente falla de forma explícita y estable.
+- E2E FR6R en verde.
 
 ---
 
@@ -212,9 +233,16 @@ Estado: CERRADA
 
 ### D-05 (effective config file ownership)
 
-Estado: CERRADA
-- Ownership adoptado: orchestrator crea/gestiona el archivo efectivo inicial en spawn.
-- Update posterior se hace por API per-node (`PUT .../config`) y persiste en el mismo archivo.
+Estado: REABIERTA
+- La decisión de single-file queda reemplazada por revisión v1.1 de two-file ownership.
+- Se mantiene el principio de writer único, ahora con separación explícita config/state.
+
+### D-06 (modelo de archivos por nodo)
+
+Estado: PARCIAL
+- Se adopta dirección técnica: `config.json` (orchestrator) + `state.json` (node).
+- Path canónico fijo en core: `/var/lib/fluxbee/nodes`.
+- Pendiente de cierre: validación E2E final de ownership/respawn fail-closed.
 
 ---
 
@@ -237,8 +265,13 @@ Estado: CERRADA
 | 2026-03-13 | FR-02 core strict | `run_node` falla siempre ante register identity no exitoso; removido soft-fail/flag estricto en spawn | core | parcial |
 | 2026-03-13 | FR-02 E2E negativos | `identity_register_strict_e2e.sh` valida `missing_tenant_id` e `identity_unavailable` con fallo explícito `IDENTITY_REGISTER_FAILED` | core | parcial |
 | 2026-03-13 | FR-02 cierre documental | `10-identity-v2.md` declara gate obligatorio fail-closed para spawn sin registro identity exitoso | core | cerrado |
-| 2026-03-13 | FR-05 cierre | API per-node config implementada (`GET/PUT /hives/{hive}/nodes/{node}/config`) + relay remoto | core | cerrado |
-| 2026-03-13 | FR-06 cierre | Config efectiva single-file bajo `${STATE_DIR}/node-configs` con creación en spawn y update atómico | core | cerrado |
+| 2026-03-13 | FR-05 avance | API per-node config implementada (`GET/PUT /hives/{hive}/nodes/{node}/config`) + relay remoto | core | parcial |
+| 2026-03-13 | FR-06 cierre (v1.0) | Config efectiva single-file bajo `${STATE_DIR}/node-configs` con creación en spawn y update atómico | core | superseded |
+| 2026-03-13 | FR-05/06 validación E2E v1.0 | `scripts/node_config_per_node_e2e.sh` pasó en `worker-220` (spawn+get+put+get, `config_version` 1→2) | core | cerrado |
+| 2026-03-13 | FR-06 reabierta (v1.1) | Se acuerda migrar a two-file ownership (`config.json`/`state.json`) para eliminar write-races y separar responsabilidades | core | abierto |
+| 2026-03-13 | FR-06 implementación v1.1 | Core migra a `/var/lib/fluxbee/nodes/<TYPE>/<node@hive>/{config.json,state.json}` con permisos estrictos y spawn fail-closed | core | parcial |
+| 2026-03-13 | FR-05 state endpoint | `GET /hives/{hive}/nodes/{node}/state` implementado en `SY.admin`/`SY.orchestrator` con relay remoto | core | parcial |
+| 2026-03-13 | FR-05/06 E2E v1.1 | `node_config_per_node_e2e.sh` extendido con checks de `state` (existing/missing) y respawn fail-closed `NODE_ALREADY_EXISTS` | core | parcial |
 
 ---
 

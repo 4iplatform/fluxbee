@@ -1197,6 +1197,14 @@ async fn handle_hive_paths(
                 handle_admin_command(ctx, client, "set_node_config", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("GET", ["nodes", name, "state"]) => {
+            let payload = serde_json::json!({
+                "node_name": decode_percent(name),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "get_node_state", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["versions"]) => {
             let (status, resp) =
                 handle_admin_query(ctx, client, "get_versions", Some(hive)).await?;
@@ -2457,7 +2465,7 @@ fn build_admin_request(
         "list_nodes" | "run_node" | "kill_node" | "hive_status" | "get_storage" | "set_storage"
         | "list_hives" | "get_hive" | "list_versions" | "get_versions" | "list_deployments"
         | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "get_node_config"
-        | "set_node_config" | "remove_hive" | "add_hive" => "SY.orchestrator",
+        | "set_node_config" | "get_node_state" | "remove_hive" | "add_hive" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
     let route_hive = if action_routes_via_local_orchestrator(action) {
@@ -2618,7 +2626,8 @@ fn admin_action_timeout(action: &str) -> Duration {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
         }
         // other orchestrator mutating actions can also take longer than default.
-        "run_node" | "kill_node" | "remove_hive" | "set_node_config" | "get_node_config" => {
+        "run_node" | "kill_node" | "remove_hive" | "set_node_config" | "get_node_config"
+        | "get_node_state" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30))
         }
         _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5)),
@@ -2704,6 +2713,7 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "get_drift_alerts"
             | "get_node_config"
             | "set_node_config"
+            | "get_node_state"
             | "remove_hive"
             | "add_hive"
     )
