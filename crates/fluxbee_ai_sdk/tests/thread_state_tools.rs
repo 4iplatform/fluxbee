@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fluxbee_ai_sdk::{
-    FunctionTool, LanceDbThreadStateStore, ThreadStateDeleteTool, ThreadStateGetTool,
-    ThreadStatePutTool, ThreadStateStore,
+    FunctionTool, FunctionToolProvider, LanceDbThreadStateStore, ThreadStateDeleteTool, ThreadStateGetTool,
+    ThreadStatePutTool, ThreadStateStore, ThreadStateToolsProvider,
 };
 use serde_json::json;
 
@@ -179,6 +179,45 @@ async fn thread_state_delete_is_idempotent_for_missing_record() {
         out.get("thread_id").and_then(|v| v.as_str()),
         Some("thr-del-missing")
     );
+
+    let _ = tokio::fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn scoped_provider_overrides_model_supplied_thread_id() {
+    let root = unique_temp_store_root();
+    let store = LanceDbThreadStateStore::new(root.clone());
+    store.ensure_ready().await.expect("store ready");
+    let store_arc: Arc<dyn ThreadStateStore> = Arc::new(store.clone());
+
+    let provider =
+        ThreadStateToolsProvider::with_get_put_delete_scoped(store_arc, "sim-thread-1");
+    let mut registry = fluxbee_ai_sdk::FunctionToolRegistry::new();
+    provider
+        .register_tools(&mut registry)
+        .expect("register scoped tools");
+
+    let put_tool = registry
+        .get("thread_state_put")
+        .expect("thread_state_put tool exists");
+    put_tool
+        .call(json!({
+            "thread_id": "identity_thread",
+            "data": {"email":"noe@gmail.com"}
+        }))
+        .await
+        .expect("put call should succeed");
+
+    let scoped = store
+        .get("sim-thread-1")
+        .await
+        .expect("get scoped record");
+    assert!(scoped.is_some());
+    let leaked = store
+        .get("identity_thread")
+        .await
+        .expect("get leaked record");
+    assert!(leaked.is_none());
 
     let _ = tokio::fs::remove_dir_all(root).await;
 }

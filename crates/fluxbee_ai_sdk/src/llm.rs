@@ -247,35 +247,54 @@ pub struct OpenAiFunctionCallingModel {
 #[async_trait]
 impl FunctionCallingModel for OpenAiFunctionCallingModel {
     async fn run_turn(&self, request: FunctionModelTurnRequest) -> Result<FunctionModelTurnResponse> {
-        let mut input = Vec::new();
-        if let Some(system) = &self.system {
-            input.push(json!({
-                "role": "system",
-                "content": [{"type":"input_text","text": system}],
-            }));
-        }
+        let (pending_tool_results, request_items) = split_pending_tool_results(request.items);
+        let previous_response_id = pending_tool_results
+            .first()
+            .and_then(|result| result.response_id.clone());
 
-        for item in request.items {
-            match item {
-                FunctionLoopItem::UserText { content } => {
-                    input.push(json!({
-                        "role": "user",
-                        "content": [{"type":"input_text","text": content}],
-                    }));
-                }
-                FunctionLoopItem::ToolResult { result } => {
-                    let output_text = match result.output {
-                        Value::String(s) => s,
-                        other => serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string()),
-                    };
-                    input.push(json!({
-                        "type": "function_call_output",
-                        "call_id": result.call_id,
-                        "output": output_text,
-                    }));
-                }
-                FunctionLoopItem::AssistantText { .. } => {
-                    // We keep model input minimal for MVP: user turns + tool outputs.
+        let mut input = Vec::new();
+        if previous_response_id.is_some() {
+            for result in pending_tool_results {
+                let output_text = match result.output {
+                    Value::String(s) => s,
+                    other => serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string()),
+                };
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": result.call_id,
+                    "output": output_text,
+                }));
+            }
+        } else {
+            if let Some(system) = &self.system {
+                input.push(json!({
+                    "role": "system",
+                    "content": [{"type":"input_text","text": system}],
+                }));
+            }
+
+            for item in request_items {
+                match item {
+                    FunctionLoopItem::UserText { content } => {
+                        input.push(json!({
+                            "role": "user",
+                            "content": [{"type":"input_text","text": content}],
+                        }));
+                    }
+                    FunctionLoopItem::ToolResult { result } => {
+                        let output_text = match result.output {
+                            Value::String(s) => s,
+                            other => serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string()),
+                        };
+                        input.push(json!({
+                            "type": "function_call_output",
+                            "call_id": result.call_id,
+                            "output": output_text,
+                        }));
+                    }
+                    FunctionLoopItem::AssistantText { .. } => {
+                        // We keep model input minimal for MVP: user turns + tool outputs.
+                    }
                 }
             }
         }
@@ -293,7 +312,7 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
             })
             .collect::<Vec<_>>();
 
-        let body = json!({
+        let mut body = json!({
             "model": self.model,
             "input": input,
             "tools": tools,
@@ -302,6 +321,9 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
             "temperature": self.model_settings.temperature,
             "top_p": self.model_settings.top_p,
         });
+        if let Some(previous_response_id) = previous_response_id {
+            body["previous_response_id"] = Value::String(previous_response_id);
+        }
 
         let auth = format!("Bearer {}", self.client.api_key);
         let response = self
@@ -323,6 +345,7 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
             )));
         }
 
+        let response_id = value.get("id").and_then(Value::as_str).map(ToString::to_string);
         let mut assistant_text = value
             .get("output_text")
             .and_then(Value::as_str)
@@ -350,6 +373,7 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                     if !call_id.is_empty() && !name.is_empty() {
                         tool_calls.push(FunctionToolCall {
                             call_id,
+                            response_id: response_id.clone(),
                             name,
                             arguments,
                         });
@@ -378,6 +402,31 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
             tool_calls,
         })
     }
+}
+
+fn split_pending_tool_results(
+    items: Vec<FunctionLoopItem>,
+) -> (Vec<crate::function_calling::FunctionToolResult>, Vec<FunctionLoopItem>) {
+    let mut prefix = items;
+    let mut tail = Vec::new();
+
+    loop {
+        let Some(last) = prefix.last() else {
+            break;
+        };
+        match last {
+            FunctionLoopItem::ToolResult { .. } => {
+                let popped = prefix.pop().expect("last item exists");
+                if let FunctionLoopItem::ToolResult { result } = popped {
+                    tail.push(result);
+                }
+            }
+            _ => break,
+        }
+    }
+
+    tail.reverse();
+    (tail, prefix)
 }
 
 fn parse_tool_arguments(raw: Value) -> Value {

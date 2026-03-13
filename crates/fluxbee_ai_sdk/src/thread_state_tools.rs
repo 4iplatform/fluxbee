@@ -13,33 +13,66 @@ use crate::{AiSdkError, Result};
 #[derive(Clone)]
 pub struct ThreadStateGetTool {
     store: Arc<dyn ThreadStateStore>,
+    scoped_thread_id: Option<String>,
 }
 
 impl ThreadStateGetTool {
     pub fn new(store: Arc<dyn ThreadStateStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            scoped_thread_id: None,
+        }
+    }
+
+    pub fn new_scoped(store: Arc<dyn ThreadStateStore>, thread_id: impl Into<String>) -> Self {
+        Self {
+            store,
+            scoped_thread_id: Some(thread_id.into()),
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct ThreadStatePutTool {
     store: Arc<dyn ThreadStateStore>,
+    scoped_thread_id: Option<String>,
 }
 
 impl ThreadStatePutTool {
     pub fn new(store: Arc<dyn ThreadStateStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            scoped_thread_id: None,
+        }
+    }
+
+    pub fn new_scoped(store: Arc<dyn ThreadStateStore>, thread_id: impl Into<String>) -> Self {
+        Self {
+            store,
+            scoped_thread_id: Some(thread_id.into()),
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct ThreadStateDeleteTool {
     store: Arc<dyn ThreadStateStore>,
+    scoped_thread_id: Option<String>,
 }
 
 impl ThreadStateDeleteTool {
     pub fn new(store: Arc<dyn ThreadStateStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            scoped_thread_id: None,
+        }
+    }
+
+    pub fn new_scoped(store: Arc<dyn ThreadStateStore>, thread_id: impl Into<String>) -> Self {
+        Self {
+            store,
+            scoped_thread_id: Some(thread_id.into()),
+        }
     }
 }
 
@@ -72,6 +105,18 @@ impl ThreadStateToolsProvider {
             get_tool: Some(ThreadStateGetTool::new(store.clone())),
             put_tool: Some(ThreadStatePutTool::new(store.clone())),
             delete_tool: Some(ThreadStateDeleteTool::new(store)),
+        }
+    }
+
+    pub fn with_get_put_delete_scoped(
+        store: Arc<dyn ThreadStateStore>,
+        thread_id: impl Into<String>,
+    ) -> Self {
+        let scoped = thread_id.into();
+        Self {
+            get_tool: Some(ThreadStateGetTool::new_scoped(store.clone(), scoped.clone())),
+            put_tool: Some(ThreadStatePutTool::new_scoped(store.clone(), scoped.clone())),
+            delete_tool: Some(ThreadStateDeleteTool::new_scoped(store, scoped)),
         }
     }
 }
@@ -133,7 +178,11 @@ impl FunctionTool for ThreadStateGetTool {
                 "thread_state_get: invalid arguments (expected {{thread_id:string}}): {err}"
             ))
         })?;
-        let thread_id = args.thread_id.trim();
+        let thread_id_owned = self
+            .scoped_thread_id
+            .clone()
+            .unwrap_or(args.thread_id);
+        let thread_id = thread_id_owned.trim();
         if thread_id.is_empty() {
             return Err(AiSdkError::Protocol(
                 "thread_state_get: thread_id must not be empty".to_string(),
@@ -202,7 +251,11 @@ impl FunctionTool for ThreadStatePutTool {
                 "thread_state_put: invalid arguments (expected {{thread_id:string,data:any,ttl_seconds?:u64}}): {err}"
             ))
         })?;
-        let thread_id = args.thread_id.trim();
+        let thread_id_owned = self
+            .scoped_thread_id
+            .clone()
+            .unwrap_or(args.thread_id);
+        let thread_id = thread_id_owned.trim();
         if thread_id.is_empty() {
             return Err(AiSdkError::Protocol(
                 "thread_state_put: thread_id must not be empty".to_string(),
@@ -261,7 +314,11 @@ impl FunctionTool for ThreadStateDeleteTool {
                 "thread_state_delete: invalid arguments (expected {{thread_id:string}}): {err}"
             ))
         })?;
-        let thread_id = args.thread_id.trim();
+        let thread_id_owned = self
+            .scoped_thread_id
+            .clone()
+            .unwrap_or(args.thread_id);
+        let thread_id = thread_id_owned.trim();
         if thread_id.is_empty() {
             return Err(AiSdkError::Protocol(
                 "thread_state_delete: thread_id must not be empty".to_string(),

@@ -410,8 +410,9 @@ impl GenericAiNode {
             client = client.with_base_url(base_url.clone());
         }
         let mut tool_registry = FunctionToolRegistry::new();
-        if let (Some(store), Some(_thread_id)) = (&self.thread_state_store, &ctx.thread_id) {
-            let provider = ThreadStateToolsProvider::with_get_put_delete(store.clone());
+        if let (Some(store), Some(thread_id)) = (&self.thread_state_store, &ctx.thread_id) {
+            let provider =
+                ThreadStateToolsProvider::with_get_put_delete_scoped(store.clone(), thread_id.clone());
             provider.register_tools(&mut tool_registry)?;
         }
         if !tool_registry.definitions().is_empty() {

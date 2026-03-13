@@ -17,6 +17,8 @@ pub struct FunctionToolDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionToolCall {
     pub call_id: String,
+    #[serde(default)]
+    pub response_id: Option<String>,
     pub name: String,
     pub arguments: Value,
 }
@@ -24,6 +26,8 @@ pub struct FunctionToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionToolResult {
     pub call_id: String,
+    #[serde(default)]
+    pub response_id: Option<String>,
     pub name: String,
     pub output: Value,
     pub is_error: bool,
@@ -182,12 +186,14 @@ pub async fn dispatch_tool_calls(
             Some(tool) => match tool.call(call.arguments.clone()).await {
                 Ok(output) => FunctionToolResult {
                     call_id: call.call_id,
+                    response_id: call.response_id,
                     name: call.name,
                     output,
                     is_error: false,
                 },
                 Err(err) => FunctionToolResult {
                     call_id: call.call_id,
+                    response_id: call.response_id,
                     name: call.name,
                     output: Value::String(err.to_string()),
                     is_error: true,
@@ -195,6 +201,7 @@ pub async fn dispatch_tool_calls(
             },
             None => FunctionToolResult {
                 call_id: call.call_id,
+                response_id: call.response_id,
                 name: call.name,
                 output: Value::String("unknown_tool".to_string()),
                 is_error: true,
