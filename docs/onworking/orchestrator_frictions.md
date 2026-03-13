@@ -81,6 +81,7 @@ Qué pasa hoy:
 - Si `node_name` trae `@hive`, ese hive manda.
 - En spawn remoto se propaga `identity_primary_hive_id` al worker.
 - En kill remoto aplica la misma precedencia: `node_name@hive` manda sobre el hive del endpoint.
+- Validado en modo estricto de inventario (`REQUIRE_INVENTORY_PRESENT=1`) con runtime long-lived `wf.inventory.hold.diag` y versión fixture dedicada por test.
 
 Evidencia:
 - `src/bin/sy_orchestrator.rs:5037`
@@ -302,6 +303,7 @@ Estado: PARCIAL
 | 2026-03-13 | FR-05 state endpoint | `GET /hives/{hive}/nodes/{node}/state` implementado en `SY.admin`/`SY.orchestrator` con relay remoto | core | cerrado |
 | 2026-03-13 | FR-05/06 E2E v1.1 | `node_config_per_node_e2e.sh` extendido con checks de `state` (existing/missing) y respawn fail-closed `NODE_ALREADY_EXISTS` | core | cerrado |
 | 2026-03-13 | FR-03 cierre E2E | `inventory_node_name_cross_hive_e2e.sh` valida precedencia de `node_name@hive` en spawn+kill contra endpoint cruzado | core | cerrado |
+| 2026-03-13 | FR-03 validación estricta | FR-03 pasa en modo estricto (`REQUIRE_INVENTORY_PRESENT=1`) con fixture `prepare-only` y `runtime_version` dedicada por caso | core | cerrado |
 | 2026-03-13 | FR-08 abierta | Detectada desalineación entre `versions` (manifest) y presencia real de artefactos runtime (`start.sh`) en spawn | core | abierto |
 
 ---
