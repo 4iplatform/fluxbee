@@ -26,6 +26,7 @@ use json_router::shm::{
 };
 
 type AdminError = Box<dyn std::error::Error + Send + Sync>;
+const PRIMARY_HIVE_ID: &str = "motherbee";
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -195,9 +196,23 @@ async fn main() -> Result<(), AdminError> {
         .as_ref()
         .and_then(|wan| wan.authorized_hives.clone())
         .unwrap_or_default();
+    if hive.hive_id == PRIMARY_HIVE_ID && !is_mother_role(hive.role.as_deref()) {
+        return Err(format!(
+            "invalid hive.yaml: hive_id='{}' is reserved for role=motherbee",
+            PRIMARY_HIVE_ID
+        )
+        .into());
+    }
     if !is_mother_role(hive.role.as_deref()) {
         tracing::warn!("SY.admin solo corre en motherbee; role != motherbee");
         return Ok(());
+    }
+    if hive.hive_id != PRIMARY_HIVE_ID {
+        return Err(format!(
+            "invalid hive.yaml: role=motherbee requires hive_id='{}' (got '{}')",
+            PRIMARY_HIVE_ID, hive.hive_id
+        )
+        .into());
     }
     // Default to loopback for safer deployments; expose externally only via explicit config/env.
     let admin_listen = std::env::var("JSR_ADMIN_LISTEN")
@@ -635,6 +650,56 @@ async fn handle_http(
 ) -> Result<(), AdminError> {
     let (method, path, headers, body) = read_http_request(stream).await?;
     let (path, query) = split_path_query(&path);
+    if method == "GET" {
+        if path == "/inventory" {
+            let mut payload = serde_json::json!({ "scope": "global" });
+            if let Some(kind) = query
+                .get("type")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                payload["filter_type"] = serde_json::Value::String(kind.to_ascii_uppercase());
+            }
+            if let Some(hive_id) = query
+                .get("hive")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                payload["scope"] = serde_json::Value::String("hive".to_string());
+                payload["filter_hive"] = serde_json::Value::String(hive_id.to_string());
+            }
+            let (status, resp) = handle_inventory_http(ctx, client, payload).await?;
+            respond_json(stream, status, &resp).await?;
+            return Ok(());
+        }
+        if path == "/inventory/summary" {
+            let payload = serde_json::json!({ "scope": "summary" });
+            let (status, resp) = handle_inventory_http(ctx, client, payload).await?;
+            respond_json(stream, status, &resp).await?;
+            return Ok(());
+        }
+        if let Some(hive_id) = path
+            .strip_prefix("/inventory/")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .filter(|value| *value != "summary")
+        {
+            let mut payload = serde_json::json!({
+                "scope": "hive",
+                "filter_hive": decode_percent(hive_id),
+            });
+            if let Some(kind) = query
+                .get("type")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                payload["filter_type"] = serde_json::Value::String(kind.to_ascii_uppercase());
+            }
+            let (status, resp) = handle_inventory_http(ctx, client, payload).await?;
+            respond_json(stream, status, &resp).await?;
+            return Ok(());
+        }
+    }
     if let Some((status, resp)) =
         handle_hive_paths(method.as_str(), path, &query, &body, ctx, client).await?
     {
@@ -943,6 +1008,25 @@ async fn handle_http(
         }
     }
     Ok(())
+}
+
+async fn handle_inventory_http(
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+    payload: serde_json::Value,
+) -> Result<(u16, String), AdminError> {
+    let target = format!("SY.orchestrator@{}", ctx.hive_id);
+    let timeout_secs = env_timeout_secs("JSR_ADMIN_INVENTORY_TIMEOUT_SECS").unwrap_or(10);
+    let response = send_system_request(
+        client,
+        &target,
+        "INVENTORY_REQUEST",
+        "INVENTORY_RESPONSE",
+        payload,
+        Duration::from_secs(timeout_secs),
+    )
+    .await;
+    Ok(build_admin_http_response("inventory", response))
 }
 
 async fn handle_hive_paths(
@@ -1437,7 +1521,7 @@ fn load_node_uuid(dir: &Path, base_name: &str) -> Result<String, AdminError> {
 }
 
 fn is_mother_role(role: Option<&str>) -> bool {
-    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee" || r == "mother")
+    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee")
 }
 
 fn http_status_line(status: u16) -> &'static str {

@@ -25,6 +25,7 @@ use json_router::shm::{
 };
 
 type IdentityError = Box<dyn std::error::Error + Send + Sync>;
+const PRIMARY_HIVE_ID: &str = "motherbee";
 
 const DEFAULT_GATEWAY_NAME: &str = "RT.gateway";
 const DEFAULT_DEFAULT_TENANT_NAME: &str = "fluxbee";
@@ -1416,6 +1417,23 @@ async fn main() -> Result<(), IdentityError> {
 
     let hive = load_hive(&config_dir)?;
     let is_primary = is_mother_role(hive.role.as_deref());
+    if !is_primary && !is_worker_role(hive.role.as_deref()) {
+        return Err("sy.identity supports only role=motherbee|worker".into());
+    }
+    if is_primary && hive.hive_id != PRIMARY_HIVE_ID {
+        return Err(format!(
+            "invalid hive.yaml: role=motherbee requires hive_id='{}' (got '{}')",
+            PRIMARY_HIVE_ID, hive.hive_id
+        )
+        .into());
+    }
+    if !is_primary && hive.hive_id == PRIMARY_HIVE_ID {
+        return Err(format!(
+            "invalid hive.yaml: hive_id='{}' is reserved for role=motherbee",
+            PRIMARY_HIVE_ID
+        )
+        .into());
+    }
     if is_primary {
         ensure_primary_schema(&hive).await?;
     } else {
@@ -3131,5 +3149,9 @@ fn database_url(hive: &HiveFile) -> Result<String, IdentityError> {
 }
 
 fn is_mother_role(role: Option<&str>) -> bool {
-    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee" || r == "mother")
+    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee")
+}
+
+fn is_worker_role(role: Option<&str>) -> bool {
+    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "worker")
 }

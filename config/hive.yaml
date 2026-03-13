@@ -1,8 +1,8 @@
-hive_id: "sandbox"
+hive_id: "motherbee"
 role: motherbee
 
 government:
-  identity_frontdesk: "AI.frontdesk@sandbox"
+  identity_frontdesk: "AI.frontdesk@motherbee"
 
 # WAN (gateway). Optional: remove block if no inter-hive connectivity.
 wan:

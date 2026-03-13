@@ -22,7 +22,7 @@ use crate::shm::{
     LsaRegionReader, LsaRegionWriter, LsaSnapshot, OpaRegionReader, OpaSnapshot, RemoteHiveEntry,
     RemoteNodeEntry, RemoteRouteEntry, RemoteVpnEntry, RouterRegionReader, RouterRegionWriter,
     VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE,
-    HEARTBEAT_STALE_MS, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR,
+    HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR,
     OPA_STATUS_LOADING,
 };
 use fluxbee_sdk::protocol::{
@@ -1614,22 +1614,52 @@ async fn apply_lsa_payload(
     LsaApplyResult::Applied
 }
 
-async fn write_lsa_state(
-    lsa_state: &Arc<Mutex<std::collections::HashMap<String, RemoteHiveState>>>,
-    lsa_writer: &Arc<Mutex<Option<LsaRegionWriter>>>,
-    lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
-) {
-    let mut writer_guard = lsa_writer.lock().await;
-    let Some(writer) = writer_guard.as_mut() else {
-        return;
+async fn write_lsa_state(ctx: &WanContext) {
+    let self_seq = {
+        let guard = ctx.lsa_seq.lock().await;
+        *guard
     };
-    let state_guard = lsa_state.lock().await;
+    let self_payload = build_local_lsa_payload(
+        ctx.router_uuid,
+        &ctx.router_name,
+        &ctx.hive_id,
+        self_seq,
+        &ctx.nodes,
+        &ctx.peer_nodes,
+        &ctx.static_routes,
+        &ctx.vpn_rules,
+    )
+    .await;
+    let self_last_updated = self_payload
+        .timestamp
+        .parse::<u64>()
+        .unwrap_or_else(|_| now_epoch_ms());
+    let self_state = RemoteHiveState {
+        session_epoch: 0,
+        last_seq: self_payload.seq,
+        last_updated: self_last_updated,
+        flags: FLAG_ACTIVE | HIVE_FLAG_SELF,
+        router_uuid: *ctx.router_uuid.as_bytes(),
+        router_name: ctx.router_name.clone(),
+        nodes: self_payload.nodes,
+        routes: self_payload.routes,
+        vpns: self_payload.vpns,
+    };
+
+    let state_guard = ctx.lsa_state.lock().await;
     let mut hives: Vec<(String, RemoteHiveState)> = state_guard
         .iter()
+        .filter(|(name, _)| name.as_str() != ctx.hive_id)
         .map(|(name, state)| (name.clone(), state.clone()))
         .collect();
     hives.sort_by(|a, b| a.0.cmp(&b.0));
     drop(state_guard);
+    hives.insert(0, (ctx.hive_id.clone(), self_state));
+
+    let mut writer_guard = ctx.lsa_writer.lock().await;
+    let Some(writer) = writer_guard.as_mut() else {
+        return;
+    };
 
     let mut hive_entries: Vec<RemoteHiveEntry> = Vec::new();
     let mut node_entries: Vec<RemoteNodeEntry> = Vec::new();
@@ -1726,7 +1756,7 @@ async fn write_lsa_state(
         return;
     }
     if let Some(snapshot) = writer.read_snapshot() {
-        let mut guard = lsa_snapshot.lock().await;
+        let mut guard = ctx.lsa_snapshot.lock().await;
         *guard = Some(snapshot);
     }
 }
@@ -1758,8 +1788,10 @@ async fn lsa_refresh_loop(
 
 async fn lsa_broadcast_loop(ctx: Arc<WanContext>) {
     let mut ticker = time::interval(Duration::from_millis(ctx.hello_interval_ms));
+    write_lsa_state(&ctx).await;
     loop {
         ticker.tick().await;
+        write_lsa_state(&ctx).await;
         let _ = broadcast_lsa(&ctx, None).await;
     }
 }
@@ -1787,7 +1819,7 @@ async fn lsa_stale_loop(ctx: Arc<WanContext>) {
             }
         }
         if changed {
-            write_lsa_state(&ctx.lsa_state, &ctx.lsa_writer, &ctx.lsa_snapshot).await;
+            write_lsa_state(&ctx).await;
         }
     }
 }
@@ -2059,7 +2091,7 @@ async fn handle_wan_message(
             .await
             {
                 LsaApplyResult::Applied => {
-                    write_lsa_state(&ctx.lsa_state, &ctx.lsa_writer, &ctx.lsa_snapshot).await;
+                    write_lsa_state(ctx).await;
                 }
                 LsaApplyResult::Rejected {
                     reason,
@@ -3154,6 +3186,9 @@ fn find_remote_node(snapshot: &Option<LsaSnapshot>, uuid: Uuid) -> Option<Remote
         if hive.hive_id_len == 0 {
             continue;
         }
+        if hive.flags & HIVE_FLAG_SELF != 0 {
+            continue;
+        }
         if hive.flags & FLAG_STALE != 0 {
             continue;
         }
@@ -4065,6 +4100,9 @@ async fn rebuild_fib(
         let mut hive_map: Vec<(String, u16, u16, u64)> = Vec::new();
         for (idx, hive) in snapshot.hives.iter().enumerate() {
             if hive.hive_id_len == 0 {
+                continue;
+            }
+            if hive.flags & HIVE_FLAG_SELF != 0 {
                 continue;
             }
             let name = bytes_to_string(&hive.hive_id, hive.hive_id_len as usize);

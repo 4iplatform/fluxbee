@@ -22,6 +22,7 @@ use json_router::nats::{
 };
 
 type StorageError = Box<dyn std::error::Error + Send + Sync>;
+const PRIMARY_HIVE_ID: &str = "motherbee";
 
 const NATS_ERROR_LOG_EVERY: u64 = 20;
 const INBOX_REPLAY_BATCH_SIZE: i64 = 200;
@@ -120,12 +121,26 @@ async fn main() -> Result<(), StorageError> {
 
     let config_dir = json_router::paths::config_dir();
     let hive = load_hive(&config_dir).await?;
+    if hive.hive_id == PRIMARY_HIVE_ID && !is_mother_role(hive.role.as_deref()) {
+        return Err(format!(
+            "invalid hive.yaml: hive_id='{}' is reserved for role=motherbee",
+            PRIMARY_HIVE_ID
+        )
+        .into());
+    }
     if !is_mother_role(hive.role.as_deref()) {
         tracing::warn!(
             hive = %hive.hive_id,
             "SY.storage solo corre en motherbee; role != motherbee"
         );
         return Ok(());
+    }
+    if hive.hive_id != PRIMARY_HIVE_ID {
+        return Err(format!(
+            "invalid hive.yaml: role=motherbee requires hive_id='{}' (got '{}')",
+            PRIMARY_HIVE_ID, hive.hive_id
+        )
+        .into());
     }
 
     let endpoint = resolve_local_nats_endpoint(&config_dir)?;
@@ -1463,5 +1478,5 @@ fn stable_i64(value: &str) -> i64 {
 }
 
 fn is_mother_role(role: Option<&str>) -> bool {
-    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee" || r == "mother")
+    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee")
 }

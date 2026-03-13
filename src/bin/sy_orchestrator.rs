@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -24,7 +24,7 @@ use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RemoteHiveEntry, RemoteNodeEntry,
-    RouterRegionReader, ShmSnapshot, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
+    RouterRegionReader, ShmSnapshot, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS, HIVE_FLAG_SELF,
 };
 
 type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
@@ -32,6 +32,7 @@ type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 const BOOTSTRAP_SSH_USER: &str = "administrator";
 const BOOTSTRAP_SSH_PASS: &str = "magicAI";
 const MOTHERBEE_SSH_KEY_PATH: &str = "/var/lib/fluxbee/ssh/motherbee.key";
+const PRIMARY_HIVE_ID: &str = "motherbee";
 const ORCH_SUDOERS_PATH: &str = "/etc/sudoers.d/fluxbee-orchestrator";
 const ORCH_SSH_GATE_PATH: &str = "/usr/local/bin/fluxbee-ssh-gate.sh";
 const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
@@ -409,12 +410,27 @@ async fn main() -> Result<(), OrchestratorError> {
 
     let hive = load_hive(&config_dir)?;
     let is_motherbee = is_mother_role(hive.role.as_deref());
-    if !is_motherbee && !is_worker_role(hive.role.as_deref()) {
+    let is_worker = is_worker_role(hive.role.as_deref());
+    if !is_motherbee && !is_worker {
         tracing::warn!(
             role = ?hive.role,
             "SY.orchestrator supports only role=motherbee|worker; exiting"
         );
         return Ok(());
+    }
+    if is_motherbee && hive.hive_id != PRIMARY_HIVE_ID {
+        return Err(format!(
+            "invalid hive.yaml: role=motherbee requires hive_id='{}' (got '{}')",
+            PRIMARY_HIVE_ID, hive.hive_id
+        )
+        .into());
+    }
+    if is_worker && hive.hive_id == PRIMARY_HIVE_ID {
+        return Err(format!(
+            "invalid hive.yaml: hive_id='{}' is reserved for role=motherbee",
+            PRIMARY_HIVE_ID
+        )
+        .into());
     }
     let gateway_name = hive
         .wan
@@ -1178,6 +1194,7 @@ async fn handle_system_message(
             | "SPAWN_NODE"
             | "KILL_NODE"
             | "GET_VERSIONS"
+            | "INVENTORY_REQUEST"
             | "ADD_HIVE_FINALIZE"
             | "REMOVE_HIVE_CLEANUP"
     ) {
@@ -1232,6 +1249,10 @@ async fn handle_system_message(
                     let _ =
                         send_system_action_response(sender, msg, "GET_VERSIONS_RESPONSE", payload)
                             .await;
+                }
+                "INVENTORY_REQUEST" => {
+                    let _ = send_system_action_response(sender, msg, "INVENTORY_RESPONSE", payload)
+                        .await;
                 }
                 "ADD_HIVE_FINALIZE" => {
                     let _ = send_system_action_response(
@@ -1290,6 +1311,10 @@ async fn handle_system_message(
         Some("GET_VERSIONS") => {
             let result = get_versions_flow(state, &msg.payload).await;
             let _ = send_system_action_response(sender, msg, "GET_VERSIONS_RESPONSE", result).await;
+        }
+        Some("INVENTORY_REQUEST") => {
+            let result = inventory_flow(state, &msg.payload);
+            let _ = send_system_action_response(sender, msg, "INVENTORY_RESPONSE", result).await;
         }
         Some("ADD_HIVE_FINALIZE") => {
             let result = add_hive_finalize_local_flow(state, &msg.payload).await;
@@ -3812,6 +3837,227 @@ fn list_nodes_flow(state: &OrchestratorState, payload: &serde_json::Value) -> se
     }
 }
 
+fn remote_router_name(entry: &RemoteHiveEntry) -> String {
+    if entry.router_name_len == 0 {
+        return String::new();
+    }
+    let len = entry.router_name_len as usize;
+    String::from_utf8_lossy(&entry.router_name[..len]).into_owned()
+}
+
+fn inventory_scope_from_payload(payload: &serde_json::Value) -> String {
+    payload
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("global")
+        .to_ascii_lowercase()
+}
+
+fn inventory_filter_type(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("filter_type")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("type").and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_ascii_uppercase())
+}
+
+fn inventory_filter_hive(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("filter_hive")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("hive_id").and_then(|v| v.as_str()))
+        .or_else(|| payload.get("target").and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+}
+
+fn inventory_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+    let snapshot = match load_lsa_snapshot(state) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "SHM_NOT_FOUND",
+                "message": err.to_string(),
+            });
+        }
+    };
+
+    let now = now_epoch_ms();
+    let scope = inventory_scope_from_payload(payload);
+    let filter_type = inventory_filter_type(payload);
+    let filter_hive = if scope == "hive" {
+        inventory_filter_hive(payload)
+            .or_else(|| Some(target_hive_from_payload(payload, &state.hive_id)))
+    } else {
+        inventory_filter_hive(payload)
+    };
+
+    let mut hive_meta_by_index: HashMap<u16, (String, bool, String, String, u64)> = HashMap::new();
+    let mut hive_node_counts: HashMap<u16, u32> = HashMap::new();
+
+    for (idx, hive) in snapshot.hives.iter().enumerate() {
+        let Some(hive_id) = remote_hive_name(hive) else {
+            continue;
+        };
+        if let Some(expected_hive) = filter_hive.as_deref() {
+            if hive_id != expected_hive {
+                continue;
+            }
+        }
+        let status = remote_hive_status(hive, now).to_string();
+        let is_local = (hive.flags & HIVE_FLAG_SELF) != 0 || hive_id == state.hive_id;
+        let router_name = remote_router_name(hive);
+        hive_meta_by_index.insert(
+            idx as u16,
+            (hive_id, is_local, status, router_name, hive.last_updated),
+        );
+    }
+
+    let mut nodes: Vec<serde_json::Value> = Vec::new();
+    let mut nodes_by_type: BTreeMap<String, u32> = BTreeMap::new();
+    let mut nodes_by_status: BTreeMap<String, u32> = BTreeMap::new();
+
+    for node in &snapshot.nodes {
+        if node.name_len == 0 {
+            continue;
+        }
+        if node.flags & FLAG_DELETED != 0 {
+            continue;
+        }
+
+        let Some((hive_id, _is_local, hive_status, _router_name, last_seen)) =
+            hive_meta_by_index.get(&node.hive_index)
+        else {
+            continue;
+        };
+
+        let len = node.name_len as usize;
+        let name = String::from_utf8_lossy(&node.name[..len]).into_owned();
+        let kind = node_kind_from_name(&name);
+        if let Some(expected_kind) = filter_type.as_deref() {
+            if kind != expected_kind {
+                continue;
+            }
+        }
+        let status = if hive_status == "alive" {
+            remote_flags_status(node.flags).to_string()
+        } else {
+            hive_status.clone()
+        };
+
+        *hive_node_counts.entry(node.hive_index).or_insert(0) += 1;
+        *nodes_by_type.entry(kind.clone()).or_insert(0) += 1;
+        *nodes_by_status.entry(status.clone()).or_insert(0) += 1;
+
+        let (node_name_l2, node_hive) = node_l2_and_hive(&name, hive_id);
+        let uuid = match Uuid::from_slice(&node.uuid) {
+            Ok(uuid) => uuid,
+            Err(_) => continue,
+        };
+        nodes.push(serde_json::json!({
+            "uuid": uuid.to_string(),
+            "name": name,
+            "node_name": node_name_l2,
+            "hive": node_hive,
+            "kind": kind,
+            "vpn_id": node.vpn_id,
+            "connected_at": *last_seen,
+            "status": status,
+        }));
+    }
+
+    let mut hives: Vec<serde_json::Value> = Vec::new();
+    let mut hives_alive: u32 = 0;
+    let mut hives_stale: u32 = 0;
+    let mut hives_deleted: u32 = 0;
+
+    let mut hive_indexes: Vec<u16> = hive_meta_by_index.keys().copied().collect();
+    hive_indexes.sort_unstable();
+    for idx in hive_indexes {
+        let Some((hive_id, is_local, status, router_name, last_seen)) =
+            hive_meta_by_index.get(&idx)
+        else {
+            continue;
+        };
+        match status.as_str() {
+            "alive" => hives_alive += 1,
+            "stale" => hives_stale += 1,
+            "deleted" => hives_deleted += 1,
+            _ => {}
+        }
+        hives.push(serde_json::json!({
+            "hive_id": hive_id,
+            "is_local": is_local,
+            "status": status,
+            "router_name": router_name,
+            "last_seen": *last_seen,
+            "node_count": hive_node_counts.get(&idx).copied().unwrap_or(0),
+        }));
+    }
+
+    let total_hives = hives.len() as u32;
+    let total_nodes = nodes.len() as u32;
+
+    match scope.as_str() {
+        "summary" => serde_json::json!({
+            "status": "ok",
+            "scope": "summary",
+            "updated_at": now,
+            "total_hives": total_hives,
+            "hives_alive": hives_alive,
+            "hives_stale": hives_stale,
+            "hives_deleted": hives_deleted,
+            "total_nodes": total_nodes,
+            "nodes_by_type": nodes_by_type,
+            "nodes_by_status": nodes_by_status,
+        }),
+        "hive" => {
+            let Some(filter_hive) = filter_hive else {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "INVALID_REQUEST",
+                    "message": "missing hive filter for scope='hive'",
+                });
+            };
+            let Some(hive) = hives.first() else {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "NOT_FOUND",
+                    "message": format!("hive '{}' not found in inventory", filter_hive),
+                    "target": filter_hive,
+                });
+            };
+            serde_json::json!({
+                "status": "ok",
+                "scope": "hive",
+                "hive_id": hive.get("hive_id").cloned().unwrap_or(serde_json::Value::Null),
+                "is_local": hive.get("is_local").cloned().unwrap_or(serde_json::Value::Null),
+                "hive_status": hive.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                "router_name": hive.get("router_name").cloned().unwrap_or(serde_json::Value::Null),
+                "last_seen": hive.get("last_seen").cloned().unwrap_or(serde_json::Value::Null),
+                "node_count": total_nodes,
+                "nodes": nodes,
+                "updated_at": now,
+            })
+        }
+        _ => serde_json::json!({
+            "status": "ok",
+            "scope": "global",
+            "updated_at": now,
+            "total_hives": total_hives,
+            "total_nodes": total_nodes,
+            "hives": hives,
+            "nodes": nodes,
+        }),
+    }
+}
+
 fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
     let core = match load_core_manifest() {
         Ok(manifest) => {
@@ -5291,46 +5537,22 @@ fn resolve_tenant_id_for_node(payload: &serde_json::Value) -> Option<String> {
 
 fn resolve_identity_primary_hive_id(
     state: &OrchestratorState,
-    payload: &serde_json::Value,
 ) -> Result<String, OrchestratorError> {
-    if let Some(raw) = payload
-        .get("identity_primary_hive_id")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        if !valid_hive_id(raw) {
-            return Err("invalid identity_primary_hive_id".into());
-        }
-        return Ok(raw.to_string());
+    if state.is_motherbee && state.hive_id != PRIMARY_HIVE_ID {
+        return Err(format!(
+            "invalid local role/hive_id: role=motherbee requires hive_id='{}' (got '{}')",
+            PRIMARY_HIVE_ID, state.hive_id
+        )
+        .into());
     }
-
-    if let Ok(raw) = std::env::var("ORCH_IDENTITY_PRIMARY_HIVE_ID") {
-        let value = raw.trim();
-        if !value.is_empty() {
-            if !valid_hive_id(value) {
-                return Err("invalid ORCH_IDENTITY_PRIMARY_HIVE_ID".into());
-            }
-            return Ok(value.to_string());
-        }
+    if !state.is_motherbee && state.hive_id == PRIMARY_HIVE_ID {
+        return Err(format!(
+            "invalid local role/hive_id: hive_id='{}' is reserved for role=motherbee",
+            PRIMARY_HIVE_ID
+        )
+        .into());
     }
-
-    if state.is_motherbee {
-        return Ok(state.hive_id.clone());
-    }
-
-    if state.wan_authorized_hives.len() == 1 {
-        let value = state.wan_authorized_hives[0].trim();
-        if !value.is_empty() && valid_hive_id(value) {
-            return Ok(value.to_string());
-        }
-    }
-
-    tracing::warn!(
-        hive_id = %state.hive_id,
-        "identity primary hive id unresolved on worker; falling back to local hive id"
-    );
-    Ok(state.hive_id.clone())
+    Ok(PRIMARY_HIVE_ID.to_string())
 }
 
 fn resolve_identity_change_reason(payload: &serde_json::Value) -> Option<String> {
@@ -5810,7 +6032,7 @@ async fn run_node_flow(
             });
         }
     };
-    let identity_primary_hive_id = match resolve_identity_primary_hive_id(state, payload) {
+    let identity_primary_hive_id = match resolve_identity_primary_hive_id(state) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -5875,10 +6097,6 @@ async fn run_node_flow(
                 serde_json::json!(requested_version),
             );
             obj.insert("unit".to_string(), serde_json::json!(unit));
-            obj.insert(
-                "identity_primary_hive_id".to_string(),
-                serde_json::json!(identity_primary_hive_id),
-            );
         }
         return match forward_system_action_to_hive(
             state,
@@ -9303,7 +9521,7 @@ fn persist_storage_path_in_hive(config_dir: &Path, path: &str) -> Result<(), Orc
 }
 
 fn is_mother_role(role: Option<&str>) -> bool {
-    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee" || r == "mother")
+    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee")
 }
 
 fn is_worker_role(role: Option<&str>) -> bool {
