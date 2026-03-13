@@ -1,6 +1,6 @@
 # Runtime Lifecycle — Publish, Distribute, Update, Spawn
 
-**Status:** v1.0
+**Status:** v1.1
 **Date:** 2026-03-12
 **Audience:** Developers implementing orchestrator, admin API, and runtime management
 **Parent specs:** `14-runtime-rollout-motherbee.md`, `software-distribution-spec.md`, `node-spawn-config-spec.md`
@@ -89,8 +89,9 @@ d = json.load(sys.stdin)
 rt = d['payload']['hive']['runtimes']['runtimes']['$RUNTIME']
 v = '$VERSION'
 assert v in rt['available'], f'{v} not in available'
-present = d['payload']['hive']['runtimes'].get('readiness', {}).get(f'$RUNTIME/{v}', {}).get('runtime_present', False)
-assert present, f'{v} artifact not present locally'
+readiness = rt.get('readiness', {}).get(v, {})
+assert readiness.get('runtime_present', False), f'{v} artifact not present locally'
+assert readiness.get('start_sh_executable', False), f'{v} start.sh not executable'
 print('PUBLISH OK')
 "
 ```
@@ -145,26 +146,37 @@ curl -sS -X POST "$BASE/hives/$TARGET_HIVE/update" \
 
 ```
 1. Local manifest exists at /var/lib/fluxbee/dist/runtimes/manifest.json
-2. Local manifest version >= requested manifest_version
-3. Local manifest hash == requested manifest_hash
+2. Local manifest hash == requested manifest_hash
+3. Local manifest version == requested manifest_version
+   - If manifest_version=0: skip version check (initial bootstrap)
+   - If local version < requested: respond sync_pending (manifest not yet replicated)
+   - If local version > requested: respond VERSION_MISMATCH (stale update rejected)
 4. For each runtime/version in manifest marked as "current":
    - /var/lib/fluxbee/dist/runtimes/<runtime>/<version>/bin/start.sh exists
    - start.sh is executable
 ```
+
+**Note on current implementation (as of 2026-03-12):** Step 4 (artifact verification during UPDATE) is NOT yet implemented. Today UPDATE only validates manifest version and hash. Artifact presence is checked later during spawn (preflight). This spec defines the target state where UPDATE also verifies artifacts, so that `ok` from UPDATE is a reliable gate for spawn readiness.
 
 ### 5.4 Responses
 
 | Status | Meaning | Caller action |
 |--------|---------|---------------|
 | `ok` | Manifest and all current artifacts verified locally | Proceed to spawn |
-| `sync_pending` | Manifest or artifacts not yet present or hash mismatch | Wait, retry sync-hint, retry update |
+| `sync_pending` | Manifest or artifacts not yet present, or version not yet replicated | Wait, retry sync-hint, retry update |
+| `VERSION_MISMATCH` | Requested version is stale (local already ahead) | Use current version from motherbee |
 | `error` | Manifest invalid, hash corrupted, or other failure | Investigate, do not proceed |
 
 **Key rule:** `ok` from UPDATE means "this worker can execute any runtime marked as current in the manifest." This is the gate that authorizes spawn.
 
-### 5.5 Monotonic Version Enforcement
+### 5.5 Version Matching Semantics
 
-If the requested `manifest_version` is less than or equal to the worker's already-applied version, orchestrator rejects with `VERSION_MISMATCH`. This prevents stale rollbacks.
+The version check uses exact match, not >=. This is intentional:
+
+- `manifest_version=0` → skip version check (bootstrap/recovery).
+- `local == requested` → proceed to hash and artifact verification.
+- `local < requested` → manifest hasn't arrived yet → `sync_pending`.
+- `local > requested` → caller is behind → `VERSION_MISMATCH`.
 
 ---
 
@@ -422,12 +434,27 @@ Architect                   Worker
 
 ---
 
-## 9. Implementation Tasks (FR-08 Alignment)
+## 9. Current State vs Target State
+
+| Area | Current state (2026-03-12) | Target state (this spec) |
+|------|---------------------------|--------------------------|
+| `GET /versions` readiness | Not implemented. Returns manifest only | Returns manifest + `readiness` per runtime/version with `runtime_present` and `start_sh_executable` |
+| `SYSTEM_UPDATE` artifact check | Not implemented. Only validates manifest version/hash | Also verifies `start.sh` exists and is executable for each current runtime |
+| Version semantics in UPDATE | Exact match or `manifest_version=0`; `sync_pending` if no match | Same exact match semantics, documented explicitly with all cases |
+| Executable check in spawn | Checks `is_file` only, not executable bit | Checks both `exists` and `is_executable` |
+| Spawn preflight error detail | Returns `RUNTIME_NOT_PRESENT` (basic) | Returns `RUNTIME_NOT_PRESENT` with runtime, version, expected_path, and hint |
+
+---
+
+## 10. Implementation Tasks (FR-08 Alignment)
 
 ### Phase 1 — Contract Definition
 
 - [ ] FR8-T1. Adopt this document as the canonical runtime lifecycle spec.
-- [ ] FR8-T2. Define: `runtime_present` = `bin/start.sh` exists AND is executable at the expected local path.
+- [ ] FR8-T2. Define flag semantics:
+  - `runtime_present` = `bin/start.sh` exists at the expected local path.
+  - `start_sh_executable` = `bin/start.sh` has execute permission.
+  - Both must be `true` for a runtime to be spawn-ready.
 
 ### Phase 2 — Versions API
 
@@ -435,26 +462,32 @@ Architect                   Worker
 - [ ] FR8-T4. Orchestrator checks filesystem for each version when building versions response.
 - [ ] FR8-T5. Maintain manifest visibility regardless of readiness (manifest data always shown, readiness is additional).
 
-### Phase 3 — Spawn Hardening
+### Phase 3 — UPDATE Hardening
 
-- [ ] FR8-T6. Add explicit preflight check in `run_node` before config.json creation.
-- [ ] FR8-T7. Return structured `RUNTIME_NOT_PRESENT` error with runtime, version, expected_path, and hint.
-- [ ] FR8-T8. Spawn does NOT auto-trigger SYSTEM_UPDATE. Fails explicitly.
+- [ ] FR8-T6. Add artifact verification in SYSTEM_UPDATE handler: for each current runtime/version, check `start.sh` exists and is executable.
+- [ ] FR8-T7. If artifacts missing during UPDATE, respond `sync_pending` (not `ok`).
 
-### Phase 4 — E2E Validation
+### Phase 4 — Spawn Hardening
 
-- [ ] FR8-T9. E2E case A: runtime in manifest without `start.sh` → versions shows `runtime_present: false`, spawn returns `RUNTIME_NOT_PRESENT`.
-- [ ] FR8-T10. E2E case B: after sync-hint + update → versions shows `runtime_present: true`, spawn succeeds.
-- [ ] FR8-T11. E2E case C: spawn without prior update → `RUNTIME_NOT_PRESENT` with accionable hint.
+- [ ] FR8-T8. Add explicit preflight check in `run_node`: verify `start.sh` exists AND is executable, before config.json creation.
+- [ ] FR8-T9. Return structured `RUNTIME_NOT_PRESENT` error with runtime, version, expected_path, and hint.
+- [ ] FR8-T10. Spawn does NOT auto-trigger SYSTEM_UPDATE. Fails explicitly.
 
-### Phase 5 — Documentation
+### Phase 5 — E2E Validation
 
-- [ ] FR8-T12. Update `07-operaciones.md` with canonical publish → distribute → update → spawn flow.
-- [ ] FR8-T13. Update `14-runtime-rollout-motherbee.md` to reference readiness check in versions.
+- [ ] FR8-T11. E2E case A: runtime in manifest without `start.sh` → versions shows `runtime_present: false`, spawn returns `RUNTIME_NOT_PRESENT`.
+- [ ] FR8-T12. E2E case B: after sync-hint + update → versions shows `runtime_present: true`, spawn succeeds.
+- [ ] FR8-T13. E2E case C: spawn without prior update → `RUNTIME_NOT_PRESENT` with actionable hint.
+- [ ] FR8-T14. E2E case D: UPDATE with missing artifact → responds `sync_pending`, not `ok`.
+
+### Phase 6 — Documentation
+
+- [ ] FR8-T15. Update `07-operaciones.md` with canonical publish → distribute → update → spawn flow.
+- [ ] FR8-T16. Update `14-runtime-rollout-motherbee.md` to reference readiness check in versions.
 
 ---
 
-## 10. Relationship to Other Specs
+## 11. Relationship to Other Specs
 
 | Spec | Relationship |
 |------|-------------|
