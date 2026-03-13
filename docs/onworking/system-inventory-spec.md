@@ -398,10 +398,13 @@ Implementation status (2026-03-12):
 ### Phase D — Validation
 
 - [x] D1. E2E: inventory reflects node spawn/kill in real time. (`scripts/inventory_spawn_kill_e2e.sh`)
-- [x] D2. E2E: inventory reflects add_hive/remove_hive. (`scripts/inventory_add_remove_hive_e2e.sh`)
+- [x] D2. E2E: inventory reflects add_hive/remove_hive via API (`/inventory`). (`scripts/inventory_add_remove_hive_e2e.sh`)
+  - Cubre explícitamente `DELETE /hives/{id}` -> hive removida (o vista removida) en inventario, y `POST /hives` -> hive presente.
 - [ ] D3. E2E: stale hive appears as stale in inventory. (`scripts/inventory_stale_hive_e2e.sh`)
-- [ ] D4. E2E: worker identity writes are routed to `SY.identity@motherbee` (no fallback to local replica).
-- [ ] D5. E2E negative: if `SY.identity@motherbee` is unreachable, worker fails identity write routing explicitly (no local fallback).
+  - Estado: bloqueado por contrato operativo actual. `SY.admin` no expone `/hives/{id}/routers*` y aún falta trigger canónico no-legacy para forzar transición `alive -> stale` en pruebas.
+  - Nota: `D3` no valida delete/add; eso ya queda cubierto por `D2`.
+- [x] D4. E2E: worker identity writes are routed to `SY.identity@motherbee` (no fallback to local replica). (`scripts/inventory_identity_primary_routing_e2e.sh`)
+- [ ] D5. E2E negative: if `SY.identity@motherbee` is unreachable, worker fails identity write routing explicitly (no local fallback). (`scripts/inventory_identity_primary_routing_e2e.sh`)
 
 ---
 

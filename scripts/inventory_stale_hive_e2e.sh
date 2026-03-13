@@ -21,7 +21,7 @@ router_killed="0"
 cleanup() {
   local _ec=$?
   if [[ "$AUTO_RECOVER_ON_EXIT" == "1" && "$router_killed" == "1" ]]; then
-    http_call "POST" "$BASE/hives/$HIVE_ID/routers" "$run_body" "{\"service\":\"$ROUTER_SERVICE\"}" >/dev/null 2>&1 || true
+    run_router_best_effort_api || true
   fi
   rm -rf "$tmpdir"
   return "$_ec"
@@ -157,6 +157,11 @@ run_router_expect_ok() {
   local http
   http="$(http_call "POST" "$BASE/hives/$HIVE_ID/routers" "$run_body" "{\"service\":\"$ROUTER_SERVICE\"}")"
   if [[ "$http" != "200" || "$(json_get_file "status" "$run_body")" != "ok" ]]; then
+    if [[ "$http" == "404" ]]; then
+      echo "FAIL: router run endpoint not available in current API (404)" >&2
+      cat "$run_body" >&2 || true
+      exit 1
+    fi
     echo "FAIL: run router failed http=$http" >&2
     cat "$run_body" >&2 || true
     exit 1
@@ -167,10 +172,24 @@ kill_router_expect_ok() {
   local http
   http="$(http_call "DELETE" "$BASE/hives/$HIVE_ID/routers/$ROUTER_SERVICE" "$kill_body")"
   if [[ "$http" != "200" || "$(json_get_file "status" "$kill_body")" != "ok" ]]; then
+    if [[ "$http" == "404" ]]; then
+      echo "FAIL: router kill endpoint not available in current API (404)" >&2
+      cat "$kill_body" >&2 || true
+      exit 1
+    fi
     echo "FAIL: kill router failed http=$http" >&2
     cat "$kill_body" >&2 || true
     exit 1
   fi
+}
+
+run_router_best_effort_api() {
+  local http
+  http="$(http_call "POST" "$BASE/hives/$HIVE_ID/routers" "$run_body" "{\"service\":\"$ROUTER_SERVICE\"}")" || true
+  if [[ "${http:-}" != "200" || "$(json_get_file "status" "$run_body")" != "ok" ]]; then
+    return 1
+  fi
+  return 0
 }
 
 require_cmd curl

@@ -240,6 +240,7 @@ let _decoded: NatsResponseEnvelope<serde_json::Value> = serde_json::from_slice(&
 Smoke recomendado:
 
 ```bash
+# Historico: este script incluye /hives/{id}/routers* (API removida en v2).
 BASE="http://127.0.0.1:8080" HIVE_ID="worker-220" bash scripts/admin_nodes_routers_storage_e2e.sh
 ```
 

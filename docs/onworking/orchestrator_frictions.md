@@ -261,9 +261,12 @@ Criterio de aceptación C:
 
 - [x] INV-D1. E2E: spawn/kill se refleja en inventario. (`scripts/inventory_spawn_kill_e2e.sh`)
 - [x] INV-D2. E2E: add_hive/remove_hive se refleja en inventario. (`scripts/inventory_add_remove_hive_e2e.sh`)
+  - Incluye visibilidad por API de `DELETE /hives/{id}` (removida/vista removida) y `POST /hives` (presente).
 - [ ] INV-D3. E2E: hive stale aparece como stale. (`scripts/inventory_stale_hive_e2e.sh`)
-- [ ] INV-D4. E2E: worker enruta writes a `SY.identity@motherbee` sin fallback local.
-- [ ] INV-D5. E2E negativo: worker falla registro identity cuando `SY.identity@motherbee` es inalcanzable.
+  - Estado: bloqueado por contrato operativo actual. Sin endpoint `/hives/{id}/routers*` en `SY.admin`, falta trigger canónico para inducir `stale` sin workaround manual.
+  - No duplica validación de delete/add (cubierta en INV-D2).
+- [x] INV-D4. E2E: worker enruta writes a `SY.identity@motherbee` sin fallback local. (`scripts/inventory_identity_primary_routing_e2e.sh`)
+- [ ] INV-D5. E2E negativo: worker falla registro identity cuando `SY.identity@motherbee` es inalcanzable. (`scripts/inventory_identity_primary_routing_e2e.sh`)
 - [ ] INV-D6. E2E regresión: `node_name@hive` cruzado vs endpoint hive mantiene identidad/routing correctos.
 
 Criterio de aceptación D:
