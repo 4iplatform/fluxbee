@@ -36,6 +36,8 @@ AUTO_SEED_RUNTIME_IF_MISSING="${AUTO_SEED_RUNTIME_IF_MISSING:-1}"
 RUNTIME_SEED_BUILD_BIN="${RUNTIME_SEED_BUILD_BIN:-1}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_SEED_SCRIPT="$ROOT_DIR/scripts/inventory_spawn_kill_e2e.sh"
+STRICT_RUNTIME_VERSION="${STRICT_RUNTIME_VERSION:-diag-fr3-${TEST_ID}}"
+EFFECTIVE_RUNTIME_VERSION="$RUNTIME_VERSION"
 
 tmpdir="$(mktemp -d)"
 versions_body="$tmpdir/versions.json"
@@ -314,6 +316,31 @@ seed_runtime_fixture_if_needed() {
   fi
 }
 
+prepare_strict_runtime_fixture() {
+  if [[ "$REQUIRE_INVENTORY_PRESENT" != "1" ]]; then
+    return 0
+  fi
+  if [[ "$RUNTIME" != "wf.inventory.hold.diag" ]]; then
+    return 0
+  fi
+  if [[ ! -x "$RUNTIME_SEED_SCRIPT" ]]; then
+    echo "FAIL: runtime seed script missing or not executable: $RUNTIME_SEED_SCRIPT" >&2
+    return 1
+  fi
+  echo "INFO: strict inventory mode: preparing long-lived runtime fixture bound to node '$NODE_NAME_BASE'." >&2
+  BASE="$BASE" \
+  HIVE_ID="$TARGET_HIVE_ID" \
+  BUILD_BIN="$RUNTIME_SEED_BUILD_BIN" \
+  RUNTIME="$RUNTIME" \
+  RUNTIME_VERSION="$STRICT_RUNTIME_VERSION" \
+  TENANT_ID="$TENANT_ID" \
+  TEST_ID="fr3strict-${TEST_ID}" \
+  NODE_NAME="$NODE_NAME_BASE" \
+  INVENTORY_APPEAR_TIMEOUT_SECS=45 \
+  INVENTORY_DISAPPEAR_TIMEOUT_SECS=45 \
+  "$RUNTIME_SEED_SCRIPT"
+}
+
 wait_inventory_state() {
   local hive_id="$1"
   local node_l2="$2"
@@ -405,13 +432,21 @@ echo "Step 2/8: cleanup baseline node (ignore errors)"
 http_call "DELETE" "$BASE/hives/$REQUEST_HIVE_ID/nodes/$NODE_FQN" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
 http_call "DELETE" "$BASE/hives/$TARGET_HIVE_ID/nodes/$NODE_FQN" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
 
+if ! prepare_strict_runtime_fixture; then
+  echo "FAIL: strict runtime fixture preparation failed" >&2
+  exit 1
+fi
+if [[ "$REQUIRE_INVENTORY_PRESENT" == "1" && "$RUNTIME" == "wf.inventory.hold.diag" ]]; then
+  EFFECTIVE_RUNTIME_VERSION="$STRICT_RUNTIME_VERSION"
+fi
+
 echo "Step 3/8: baseline inventory absent on both request/target hives"
 wait_inventory_state "$TARGET_HIVE_ID" "$NODE_FQN" "absent" 10 "$inventory_target_body"
 wait_inventory_state "$REQUEST_HIVE_ID" "$NODE_FQN" "absent" 10 "$inventory_request_body"
 
 echo "Step 4/8: cross-hive spawn via request hive endpoint"
 spawn_payload="$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"%s","tenant_id":"%s"}' \
-  "$NODE_FQN" "$RUNTIME" "$RUNTIME_VERSION" "$TENANT_ID")"
+  "$NODE_FQN" "$RUNTIME" "$EFFECTIVE_RUNTIME_VERSION" "$TENANT_ID")"
 spawn_http="$(http_call "POST" "$BASE/hives/$REQUEST_HIVE_ID/nodes" "$spawn_body" "$spawn_payload")"
 spawn_status="$(json_get_file "status" "$spawn_body")"
 if [[ "$spawn_http" != "200" || "$spawn_status" != "ok" ]]; then
@@ -504,7 +539,7 @@ echo "status=ok"
 echo "request_hive_id=$REQUEST_HIVE_ID"
 echo "target_hive_id=$TARGET_HIVE_ID"
 echo "node_name=$NODE_FQN"
-echo "runtime=$RUNTIME@$RUNTIME_VERSION"
+echo "runtime=$RUNTIME@$EFFECTIVE_RUNTIME_VERSION"
 echo "tenant_id=$TENANT_ID"
 echo "observed_in_target_inventory=$observed_present"
 echo "inventory FR-03 D6 cross-hive node_name precedence E2E passed."

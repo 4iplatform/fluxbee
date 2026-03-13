@@ -383,6 +383,8 @@ Criterio de aceptación C:
   - Modo estricto (`REQUIRE_INVENTORY_PRESENT=1`) requiere runtime long-lived (ej.: `wf.inventory.hold.diag`).
   - Si `spawn` responde `RUNTIME_NOT_PRESENT`, el E2E intenta auto-remediar con `sync-hint + update(runtime)` y reintenta; para `wf.inventory.hold.diag` agrega seed automático de runtime source si sigue faltando.
   - El seed automático usa el mismo `NODE_NAME` del test FR-03 para evitar fixture bakeada con un nombre distinto y falsos negativos de presencia en inventory.
+  - En modo estricto, el E2E prepara previamente un runtime fixture long-lived para el mismo `NODE_NAME` del caso, evitando arrastre de versiones `current` bakeadas con otro nombre.
+  - En modo estricto, el `spawn` usa explícitamente `runtime_version=$STRICT_RUNTIME_VERSION` (no `current`) para evitar carreras de manifest durante el mismo test.
 
 Criterio de aceptación D:
 - FR-01 y FR-03 cerrados con evidencia automatizada.
