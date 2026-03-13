@@ -256,10 +256,12 @@ assert_readiness_value() {
   local file="$5"
   local present exec
   present="$(jq -r --arg runtime "$runtime" --arg version "$version" \
-    '.payload.hive.runtimes.runtimes[$runtime].readiness[$version].runtime_present // empty' \
+    '(.payload.hive.runtimes.runtimes[$runtime].readiness[$version].runtime_present)
+     | if . == null then "" else tostring end' \
     "$file")"
   exec="$(jq -r --arg runtime "$runtime" --arg version "$version" \
-    '.payload.hive.runtimes.runtimes[$runtime].readiness[$version].start_sh_executable // empty' \
+    '(.payload.hive.runtimes.runtimes[$runtime].readiness[$version].start_sh_executable)
+     | if . == null then "" else tostring end' \
     "$file")"
   if [[ "$present" != "$expected_present" || "$exec" != "$expected_exec" ]]; then
     echo "FAIL: readiness mismatch runtime=$runtime version=$version expected=($expected_present,$expected_exec) got=($present,$exec)" >&2
