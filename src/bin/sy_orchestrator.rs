@@ -3876,7 +3876,8 @@ fn inventory_flow(state: &OrchestratorState, payload: &serde_json::Value) -> ser
     let scope = inventory_scope_from_payload(payload);
     let filter_type = inventory_filter_type(payload);
     let filter_hive = if scope == "hive" {
-        Some(target_hive_from_payload(payload, &state.hive_id))
+        inventory_filter_hive(payload)
+            .or_else(|| Some(target_hive_from_payload(payload, &state.hive_id)))
     } else {
         inventory_filter_hive(payload)
     };
