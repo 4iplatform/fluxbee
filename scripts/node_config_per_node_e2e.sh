@@ -104,16 +104,25 @@ except Exception:
     print("0")
     raise SystemExit(0)
 
+# v2 format:
+# payload.hive.runtimes.runtimes is an object keyed by runtime name
 payload = data.get("payload") if isinstance(data, dict) else None
-versions = payload.get("versions") if isinstance(payload, dict) else None
-if not isinstance(versions, list):
-    print("0")
-    raise SystemExit(0)
-
-for item in versions:
-    if isinstance(item, dict) and item.get("runtime") == runtime:
+hive = payload.get("hive") if isinstance(payload, dict) else None
+runtimes_block = hive.get("runtimes") if isinstance(hive, dict) else None
+runtimes_map = runtimes_block.get("runtimes") if isinstance(runtimes_block, dict) else None
+if isinstance(runtimes_map, dict):
+    if runtime in runtimes_map:
         print("1")
         raise SystemExit(0)
+
+# legacy/older format fallback:
+# payload.versions is a list of {runtime, ...}
+versions = payload.get("versions") if isinstance(payload, dict) else None
+if isinstance(versions, list):
+    for item in versions:
+        if isinstance(item, dict) and item.get("runtime") == runtime:
+            print("1")
+            raise SystemExit(0)
 print("0")
 PY
 }
