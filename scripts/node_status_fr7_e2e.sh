@@ -9,8 +9,10 @@ TEST_ID="${TEST_ID:-fr7-$(date +%s)-${RANDOM}}"
 RUNTIME_VERSION="${RUNTIME_VERSION:-diag-fr7-${TEST_ID}}"
 RUNTIME_REPORTED="${RUNTIME_REPORTED:-wf.node.status.report.diag}"
 RUNTIME_FALLBACK="${RUNTIME_FALLBACK:-wf.node.status.fallback.diag}"
+RUNTIME_ERROR="${RUNTIME_ERROR:-wf.node.status.error.diag}"
 NODE_REPORTED="${NODE_REPORTED:-WF.status.report.${TEST_ID}}"
 NODE_FALLBACK="${NODE_FALLBACK:-WF.status.fallback.${TEST_ID}}"
+NODE_ERROR="${NODE_ERROR:-WF.status.error.${TEST_ID}}"
 STATUS_TIMEOUT_SECS="${STATUS_TIMEOUT_SECS:-30}"
 SYNC_HINT_TIMEOUT_MS="${SYNC_HINT_TIMEOUT_MS:-30000}"
 WAIT_SYNC_HINT_SECS="${WAIT_SYNC_HINT_SECS:-120}"
@@ -25,9 +27,12 @@ tmpdir="$(mktemp -d)"
 versions_body="$tmpdir/versions.json"
 spawn_report_body="$tmpdir/spawn_report.json"
 spawn_fallback_body="$tmpdir/spawn_fallback.json"
+spawn_error_body="$tmpdir/spawn_error.json"
 kill_body="$tmpdir/kill.json"
 status_report_body="$tmpdir/status_report.json"
 status_fallback_body="$tmpdir/status_fallback.json"
+status_stopped_body="$tmpdir/status_stopped.json"
+status_error_body="$tmpdir/status_error.json"
 sync_hint_body="$tmpdir/sync_hint.json"
 update_body="$tmpdir/update.json"
 
@@ -35,6 +40,7 @@ cleanup() {
   local _ec=$?
   http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_REPORTED" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
   http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_FALLBACK" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
+  http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_ERROR" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
   rm -rf "$tmpdir"
   return "$_ec"
 }
@@ -207,6 +213,7 @@ write_runtime_start_sh() {
   local start_path="$1"
   local node_name="$2"
   local handler_enabled="$3"
+  local health_state="$4"
   cat >"$start_path" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -214,19 +221,22 @@ export INVENTORY_HOLD_NODE_NAME="$node_name"
 export INVENTORY_HOLD_NODE_VERSION="0.0.1"
 export INVENTORY_HOLD_SECS="0"
 export NODE_STATUS_DEFAULT_HANDLER_ENABLED="$handler_enabled"
+export NODE_STATUS_DEFAULT_HEALTH_STATE="$health_state"
 exec "\$(dirname "\${BASH_SOURCE[0]}")/inventory_hold_diag"
 EOF
 }
 
 wait_node_status() {
   local node_name="$1"
-  local expected_source="$2"
-  local expected_health="$3"
-  local out_file="$4"
+  local expected_lifecycle="$2"
+  local expected_config_valid="$3"
+  local expected_source="$4"
+  local expected_health="$5"
+  local out_file="$6"
   local deadline=$(( $(date +%s) + STATUS_TIMEOUT_SECS ))
 
   while (( $(date +%s) <= deadline )); do
-    local http api_status payload_status lifecycle source health
+    local http api_status payload_status lifecycle source health config_valid
     http="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes/$node_name/status" "$out_file")"
     if [[ "$http" != "200" ]]; then
       sleep 1
@@ -237,16 +247,17 @@ wait_node_status() {
     lifecycle="$(json_get_file "payload.node_status.lifecycle_state" "$out_file")"
     source="$(json_get_file "payload.node_status.health_source" "$out_file")"
     health="$(json_get_file "payload.node_status.health_state" "$out_file")"
+    config_valid="$(json_get_file "payload.node_status.config.valid" "$out_file")"
     if [[ "$api_status" != "ok" || "$payload_status" != "ok" ]]; then
       sleep 1
       continue
     fi
-    if [[ "$lifecycle" == "RUNNING" && "$source" == "$expected_source" && "$health" == "$expected_health" ]]; then
+    if [[ "$lifecycle" == "$expected_lifecycle" && "$source" == "$expected_source" && "$health" == "$expected_health" && "$config_valid" == "$expected_config_valid" ]]; then
       return 0
     fi
     sleep 1
   done
-  echo "FAIL: node status mismatch node='$node_name' expected_source='$expected_source' expected_health='$expected_health'" >&2
+  echo "FAIL: node status mismatch node='$node_name' expected_lifecycle='$expected_lifecycle' expected_source='$expected_source' expected_health='$expected_health' expected_config_valid='$expected_config_valid'" >&2
   cat "$out_file" >&2 || true
   return 1
 }
@@ -256,9 +267,9 @@ require_cmd python3
 require_cmd sha256sum
 require_cmd sudo
 
-echo "FR7 T9/T10 E2E: BASE=$BASE HIVE_ID=$HIVE_ID REPORT_RUNTIME=$RUNTIME_REPORTED FALLBACK_RUNTIME=$RUNTIME_FALLBACK"
+echo "FR7 T7/T8/T9/T10 E2E: BASE=$BASE HIVE_ID=$HIVE_ID REPORT_RUNTIME=$RUNTIME_REPORTED FALLBACK_RUNTIME=$RUNTIME_FALLBACK ERROR_RUNTIME=$RUNTIME_ERROR"
 
-echo "Step 1/9: build inventory_hold_diag (status-aware)"
+echo "Step 1/13: build inventory_hold_diag (status-aware)"
 if [[ "$BUILD_BIN" == "1" || ! -x "$BIN_PATH" ]]; then
   require_cmd cargo
   (cd "$ROOT_DIR" && cargo build --release --bin inventory_hold_diag)
@@ -268,22 +279,27 @@ if [[ ! -x "$BIN_PATH" ]]; then
   exit 1
 fi
 
-echo "Step 2/9: create runtime fixtures for NODE_REPORTED and fallback-inferred"
+echo "Step 2/13: create runtime fixtures for NODE_REPORTED, fallback-inferred, and NODE_REPORTED=ERROR"
 report_bin_dir="$DIST_RUNTIMES_ROOT/$RUNTIME_REPORTED/$RUNTIME_VERSION/bin"
 fallback_bin_dir="$DIST_RUNTIMES_ROOT/$RUNTIME_FALLBACK/$RUNTIME_VERSION/bin"
-as_root_local mkdir -p "$report_bin_dir" "$fallback_bin_dir"
+error_bin_dir="$DIST_RUNTIMES_ROOT/$RUNTIME_ERROR/$RUNTIME_VERSION/bin"
+as_root_local mkdir -p "$report_bin_dir" "$fallback_bin_dir" "$error_bin_dir"
 as_root_local install -m 0755 "$BIN_PATH" "$report_bin_dir/inventory_hold_diag"
 as_root_local install -m 0755 "$BIN_PATH" "$fallback_bin_dir/inventory_hold_diag"
+as_root_local install -m 0755 "$BIN_PATH" "$error_bin_dir/inventory_hold_diag"
 report_start="$tmpdir/report_start.sh"
 fallback_start="$tmpdir/fallback_start.sh"
-write_runtime_start_sh "$report_start" "$NODE_REPORTED" "1"
-write_runtime_start_sh "$fallback_start" "$NODE_FALLBACK" "0"
+error_start="$tmpdir/error_start.sh"
+write_runtime_start_sh "$report_start" "$NODE_REPORTED" "1" "HEALTHY"
+write_runtime_start_sh "$fallback_start" "$NODE_FALLBACK" "0" "HEALTHY"
+write_runtime_start_sh "$error_start" "$NODE_ERROR" "1" "ERROR"
 as_root_local install -m 0755 "$report_start" "$report_bin_dir/start.sh"
 as_root_local install -m 0755 "$fallback_start" "$fallback_bin_dir/start.sh"
+as_root_local install -m 0755 "$error_start" "$error_bin_dir/start.sh"
 
-echo "Step 3/9: update runtime manifest"
+echo "Step 3/13: update runtime manifest"
 manifest_tmp="$tmpdir/manifest.json"
-as_root_local python3 - "$MANIFEST_PATH" "$RUNTIME_REPORTED" "$RUNTIME_FALLBACK" "$RUNTIME_VERSION" >"$manifest_tmp" <<'PY'
+as_root_local python3 - "$MANIFEST_PATH" "$RUNTIME_REPORTED" "$RUNTIME_FALLBACK" "$RUNTIME_ERROR" "$RUNTIME_VERSION" >"$manifest_tmp" <<'PY'
 import json
 import pathlib
 import sys
@@ -292,7 +308,8 @@ import time
 manifest_path = pathlib.Path(sys.argv[1])
 runtime_report = sys.argv[2]
 runtime_fallback = sys.argv[3]
-runtime_version = sys.argv[4]
+runtime_error = sys.argv[4]
+runtime_version = sys.argv[5]
 
 doc = {"schema_version": 1, "version": 0, "updated_at": None, "runtimes": {}}
 if manifest_path.exists():
@@ -312,7 +329,7 @@ if not isinstance(runtimes, dict):
     runtimes = {}
 doc["runtimes"] = runtimes
 
-for runtime_name in (runtime_report, runtime_fallback):
+for runtime_name in (runtime_report, runtime_fallback, runtime_error):
     entry = runtimes.get(runtime_name)
     if not isinstance(entry, dict):
         entry = {}
@@ -342,11 +359,11 @@ if [[ -z "$manifest_version" || "$manifest_version" == "0" || -z "$manifest_hash
   exit 1
 fi
 
-echo "Step 4/9: SYSTEM_SYNC_HINT dist + SYSTEM_UPDATE runtime"
+echo "Step 4/13: SYSTEM_SYNC_HINT dist + SYSTEM_UPDATE runtime"
 wait_sync_hint_ok "$sync_hint_body"
 wait_update_ok "$manifest_version" "$manifest_hash" "$update_body"
 
-echo "Step 5/9: validate runtime presence in versions"
+echo "Step 5/13: validate runtime presence in versions"
 versions_http="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$versions_body")"
 if [[ "$versions_http" != "200" ]]; then
   echo "FAIL: versions endpoint HTTP $versions_http" >&2
@@ -363,8 +380,13 @@ if ! runtime_exists_in_manifest "$RUNTIME_FALLBACK" "$versions_body"; then
   cat "$versions_body" >&2 || true
   exit 1
 fi
+if ! runtime_exists_in_manifest "$RUNTIME_ERROR" "$versions_body"; then
+  echo "FAIL: runtime '$RUNTIME_ERROR' missing in /hives/$HIVE_ID/versions" >&2
+  cat "$versions_body" >&2 || true
+  exit 1
+fi
 
-echo "Step 6/9: spawn reported-status node"
+echo "Step 6/13: spawn reported-status node"
 http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_REPORTED" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
 if [[ -n "$TENANT_ID" ]]; then
   spawn_report_payload="$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"current","tenant_id":"%s"}' "$NODE_REPORTED" "$RUNTIME_REPORTED" "$TENANT_ID")"
@@ -378,10 +400,10 @@ if [[ "$spawn_report_http" != "200" || "$(json_get_file "status" "$spawn_report_
   exit 1
 fi
 
-echo "Step 7/9: validate NODE_REPORTED precedence"
-wait_node_status "$NODE_REPORTED" "NODE_REPORTED" "HEALTHY" "$status_report_body"
+echo "Step 7/13: validate NODE_REPORTED precedence"
+wait_node_status "$NODE_REPORTED" "RUNNING" "true" "NODE_REPORTED" "HEALTHY" "$status_report_body"
 
-echo "Step 8/9: spawn fallback-status node and validate inferred fallback"
+echo "Step 8/13: spawn fallback-status node and validate inferred fallback"
 http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_FALLBACK" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
 if [[ -n "$TENANT_ID" ]]; then
   spawn_fallback_payload="$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"current","tenant_id":"%s"}' "$NODE_FALLBACK" "$RUNTIME_FALLBACK" "$TENANT_ID")"
@@ -394,18 +416,52 @@ if [[ "$spawn_fallback_http" != "200" || "$(json_get_file "status" "$spawn_fallb
   cat "$spawn_fallback_body" >&2 || true
   exit 1
 fi
-wait_node_status "$NODE_FALLBACK" "ORCHESTRATOR_INFERRED" "HEALTHY" "$status_fallback_body"
+wait_node_status "$NODE_FALLBACK" "RUNNING" "true" "ORCHESTRATOR_INFERRED" "HEALTHY" "$status_fallback_body"
 
-echo "Step 9/9: cleanup + summary"
+echo "Step 9/13: stop fallback node and validate STOPPED/UNKNOWN"
+http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_FALLBACK" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
+wait_node_status "$NODE_FALLBACK" "STOPPED" "true" "UNKNOWN" "UNKNOWN" "$status_stopped_body"
+
+echo "Step 10/13: spawn error-reporting node"
+http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_ERROR" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
+if [[ -n "$TENANT_ID" ]]; then
+  spawn_error_payload="$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"current","tenant_id":"%s"}' "$NODE_ERROR" "$RUNTIME_ERROR" "$TENANT_ID")"
+else
+  spawn_error_payload="$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"current"}' "$NODE_ERROR" "$RUNTIME_ERROR")"
+fi
+spawn_error_http="$(http_call "POST" "$BASE/hives/$HIVE_ID/nodes" "$spawn_error_body" "$spawn_error_payload")"
+if [[ "$spawn_error_http" != "200" || "$(json_get_file "status" "$spawn_error_body")" != "ok" ]]; then
+  echo "FAIL: error node spawn failed http=$spawn_error_http" >&2
+  cat "$spawn_error_body" >&2 || true
+  exit 1
+fi
+
+echo "Step 11/13: corrupt config.json to force config.valid=false"
+error_config_path="$(json_get_file "payload.config.path" "$spawn_error_body")"
+if [[ -z "$error_config_path" ]]; then
+  echo "FAIL: missing config path for error node" >&2
+  cat "$spawn_error_body" >&2 || true
+  exit 1
+fi
+printf '{invalid_json: true' >"$tmpdir/invalid_config.json"
+as_root_local install -m 0600 "$tmpdir/invalid_config.json" "$error_config_path"
+
+echo "Step 12/13: validate RUNNING + NODE_REPORTED=ERROR + config.valid=false"
+wait_node_status "$NODE_ERROR" "RUNNING" "false" "NODE_REPORTED" "ERROR" "$status_error_body"
+
+echo "Step 13/13: cleanup + summary"
 http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_REPORTED" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
 http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_FALLBACK" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
+http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_ERROR" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
 echo "status=ok"
 echo "hive_id=$HIVE_ID"
 echo "runtime_reported=$RUNTIME_REPORTED@$RUNTIME_VERSION"
 echo "runtime_fallback=$RUNTIME_FALLBACK@$RUNTIME_VERSION"
+echo "runtime_error=$RUNTIME_ERROR@$RUNTIME_VERSION"
 echo "node_reported=$NODE_REPORTED@$HIVE_ID"
 echo "node_fallback=$NODE_FALLBACK@$HIVE_ID"
+echo "node_error=$NODE_ERROR@$HIVE_ID"
 if [[ -n "$TENANT_ID" ]]; then
   echo "tenant_id=$TENANT_ID"
 fi
-echo "node status FR7 T9/T10 E2E passed."
+echo "node status FR7 T7/T8/T9/T10 E2E passed."
