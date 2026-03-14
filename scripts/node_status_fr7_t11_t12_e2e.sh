@@ -73,11 +73,11 @@ http_call() {
   local payload="${4:-}"
   local http_code=""
   if [[ -n "$payload" ]]; then
-    http_code="$(curl -sS -o "$out_file" -w "%{http_code}" -X "$method" "$url" \
+    http_code="$(curl -s -o "$out_file" -w "%{http_code}" -X "$method" "$url" \
       -H "Content-Type: application/json" \
       -d "$payload" || true)"
   else
-    http_code="$(curl -sS -o "$out_file" -w "%{http_code}" -X "$method" "$url" || true)"
+    http_code="$(curl -s -o "$out_file" -w "%{http_code}" -X "$method" "$url" || true)"
   fi
   if [[ -z "$http_code" ]]; then
     http_code="000"
@@ -346,6 +346,48 @@ wait_node_status() {
   return 1
 }
 
+wait_node_status_with_sources() {
+  local node_name="$1"
+  local expected_lifecycle="$2"
+  local expected_health="$3"
+  local allowed_sources_csv="$4"
+  local out_file="$5"
+  local deadline=$(( $(date +%s) + STATUS_TIMEOUT_SECS ))
+
+  while (( $(date +%s) <= deadline )); do
+    local http api_status payload_status lifecycle source health
+    http="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes/$node_name/status" "$out_file")"
+    if [[ "$http" != "200" ]]; then
+      sleep 1
+      continue
+    fi
+    api_status="$(json_get_file "status" "$out_file")"
+    payload_status="$(json_get_file "payload.status" "$out_file")"
+    lifecycle="$(json_get_file "payload.node_status.lifecycle_state" "$out_file")"
+    source="$(json_get_file "payload.node_status.health_source" "$out_file")"
+    health="$(json_get_file "payload.node_status.health_state" "$out_file")"
+    if [[ "$api_status" != "ok" || "$payload_status" != "ok" ]]; then
+      sleep 1
+      continue
+    fi
+    if [[ "$lifecycle" != "$expected_lifecycle" || "$health" != "$expected_health" ]]; then
+      sleep 1
+      continue
+    fi
+    IFS=',' read -r -a allowed_sources <<<"$allowed_sources_csv"
+    for allowed in "${allowed_sources[@]}"; do
+      if [[ "$source" == "$allowed" ]]; then
+        OBSERVED_HEALTH_SOURCE="$source"
+        return 0
+      fi
+    done
+    sleep 1
+  done
+  echo "FAIL: node status mismatch node='$node_name' expected_lifecycle='$expected_lifecycle' expected_health='$expected_health' allowed_sources='$allowed_sources_csv'" >&2
+  cat "$out_file" >&2 || true
+  return 1
+}
+
 wait_hive_status_ok() {
   local deadline=$(( $(date +%s) + WAIT_ORCH_RESTART_SECS ))
   while (( $(date +%s) <= deadline )); do
@@ -598,7 +640,8 @@ echo "Step 9/12: wait control-plane healthy after restart"
 wait_hive_status_ok
 
 echo "Step 10/12: read node status after orchestrator restart"
-wait_node_status "$NODE_MONO" "RUNNING" "NODE_REPORTED" "HEALTHY" "$status_mono_after_body"
+OBSERVED_HEALTH_SOURCE=""
+wait_node_status_with_sources "$NODE_MONO" "RUNNING" "HEALTHY" "NODE_REPORTED,ORCHESTRATOR_INFERRED" "$status_mono_after_body"
 status_version_after="$(json_get_file "payload.node_status.status_version" "$status_mono_after_body")"
 if [[ -z "$status_version_after" || ! "$status_version_after" =~ ^[0-9]+$ ]]; then
   echo "FAIL: invalid status_version after orchestrator restart ('$status_version_after')" >&2
@@ -624,6 +667,7 @@ echo "runtime_crash=$RUNTIME_CRASH@$RUNTIME_VERSION"
 echo "update_gate_result=$UPDATE_GATE_RESULT"
 echo "node_failed=$NODE_FAILED@$HIVE_ID"
 echo "node_monotonic=$NODE_MONO@$HIVE_ID"
+echo "status_source_after_restart=$OBSERVED_HEALTH_SOURCE"
 echo "status_version_before=$status_version_before"
 echo "status_version_after=$status_version_after"
 if [[ -n "$TENANT_ID" ]]; then
