@@ -35,6 +35,7 @@ status_stopped_body="$tmpdir/status_stopped.json"
 status_error_body="$tmpdir/status_error.json"
 sync_hint_body="$tmpdir/sync_hint.json"
 update_body="$tmpdir/update.json"
+local_hive_body="$tmpdir/local_hive.json"
 
 cleanup() {
   local _ec=$?
@@ -267,7 +268,20 @@ require_cmd python3
 require_cmd sha256sum
 require_cmd sudo
 
-echo "FR7 T7/T8/T9/T10 E2E: BASE=$BASE HIVE_ID=$HIVE_ID REPORT_RUNTIME=$RUNTIME_REPORTED FALLBACK_RUNTIME=$RUNTIME_FALLBACK ERROR_RUNTIME=$RUNTIME_ERROR"
+local_hive_http="$(http_call "GET" "$BASE/hive/status" "$local_hive_body")"
+if [[ "$local_hive_http" != "200" || "$(json_get_file "status" "$local_hive_body")" != "ok" ]]; then
+  echo "FAIL: cannot resolve local hive from /hive/status (http=$local_hive_http)" >&2
+  cat "$local_hive_body" >&2 || true
+  exit 1
+fi
+LOCAL_HIVE_ID="$(json_get_file "payload.hive_id" "$local_hive_body")"
+if [[ -z "$LOCAL_HIVE_ID" ]]; then
+  echo "FAIL: /hive/status returned empty payload.hive_id" >&2
+  cat "$local_hive_body" >&2 || true
+  exit 1
+fi
+
+echo "FR7 T7/T8/T9/T10 E2E: BASE=$BASE HIVE_ID=$HIVE_ID LOCAL_HIVE_ID=$LOCAL_HIVE_ID REPORT_RUNTIME=$RUNTIME_REPORTED FALLBACK_RUNTIME=$RUNTIME_FALLBACK ERROR_RUNTIME=$RUNTIME_ERROR"
 
 echo "Step 1/13: build inventory_hold_diag (status-aware)"
 if [[ "$BUILD_BIN" == "1" || ! -x "$BIN_PATH" ]]; then
@@ -443,11 +457,23 @@ if [[ -z "$error_config_path" ]]; then
   cat "$spawn_error_body" >&2 || true
   exit 1
 fi
-printf '{invalid_json: true' >"$tmpdir/invalid_config.json"
-as_root_local install -m 0600 "$tmpdir/invalid_config.json" "$error_config_path"
+T10_MODE="full"
+if [[ "$HIVE_ID" != "$LOCAL_HIVE_ID" ]]; then
+  echo "INFO: target hive '$HIVE_ID' is remote from local '$LOCAL_HIVE_ID'; skipping on-disk corruption step." >&2
+  echo "INFO: validating NODE_REPORTED=ERROR with config.valid=true (remote-safe path)." >&2
+  T10_MODE="remote_safe"
+else
+  printf '{invalid_json: true' >"$tmpdir/invalid_config.json"
+  as_root_local install -m 0600 "$tmpdir/invalid_config.json" "$error_config_path"
+fi
 
-echo "Step 12/13: validate RUNNING + NODE_REPORTED=ERROR + config.valid=false"
-wait_node_status "$NODE_ERROR" "RUNNING" "false" "NODE_REPORTED" "ERROR" "$status_error_body"
+if [[ "$T10_MODE" == "full" ]]; then
+  echo "Step 12/13: validate RUNNING + NODE_REPORTED=ERROR + config.valid=false"
+  wait_node_status "$NODE_ERROR" "RUNNING" "false" "NODE_REPORTED" "ERROR" "$status_error_body"
+else
+  echo "Step 12/13: validate RUNNING + NODE_REPORTED=ERROR + config.valid=true (remote-safe)"
+  wait_node_status "$NODE_ERROR" "RUNNING" "true" "NODE_REPORTED" "ERROR" "$status_error_body"
+fi
 
 echo "Step 13/13: cleanup + summary"
 http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_REPORTED" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
@@ -461,6 +487,7 @@ echo "runtime_error=$RUNTIME_ERROR@$RUNTIME_VERSION"
 echo "node_reported=$NODE_REPORTED@$HIVE_ID"
 echo "node_fallback=$NODE_FALLBACK@$HIVE_ID"
 echo "node_error=$NODE_ERROR@$HIVE_ID"
+echo "t10_mode=$T10_MODE"
 if [[ -n "$TENANT_ID" ]]; then
   echo "tenant_id=$TENANT_ID"
 fi
