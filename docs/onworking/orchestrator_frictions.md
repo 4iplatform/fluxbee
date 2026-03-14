@@ -219,8 +219,8 @@ Lista de tareas FR-07:
 - [x] FR7-T6. Implementar acción canónica en orchestrator para status por nodo (`get_node_status`) con soporte local y remoto.
 - [x] FR7-T7. Exponer endpoint admin estable para status por nodo/hive (sin romper endpoints existentes).
 - [x] FR7-T8. Incluir estado de config/state ownership (presencia de `config.json` / `state.json`) en status estandarizado.
-- [ ] FR7-T9. Definir precedencia de health en la respuesta final (`NODE_REPORTED` primero, fallback inferido en timeout).
-- [ ] FR7-T10. E2E de status (node reportado, timeout con inferencia, nodo detenido).
+- [x] FR7-T9. Definir precedencia de health en la respuesta final (`NODE_REPORTED` primero, fallback inferido en timeout).
+- [ ] FR7-T10. E2E de status (node reportado, timeout con inferencia, nodo detenido). (`scripts/node_status_fr7_e2e.sh`)
 - [ ] FR7-T11. Actualizar docs (`02-protocolo.md`, `07-operaciones.md`) y runbooks de troubleshooting.
 
 Borrador inicial para discusión:
@@ -230,6 +230,8 @@ Implementado en esta etapa (2026-03-14):
 - `GET /hives/{hive}/nodes/{node_name}/status` en `SY.admin`.
 - `get_node_status` en `SY.orchestrator` con relay cross-hive (`NODE_STATUS_GET` / `NODE_STATUS_GET_RESPONSE`).
 - Payload base con `lifecycle_state`, `health_state`, `health_source`, `status_version` y bloques `config/state/process/runtime/identity`.
+- Precedencia de health implementada: `NODE_REPORTED` (si responde en <=2s) y fallback inferido en timeout/unreachable.
+- SDK helper default: `fluxbee_sdk::try_handle_default_node_status` (opt-out con `NODE_STATUS_DEFAULT_HANDLER_ENABLED=0`).
 
 Criterio de cierre FR-07:
 - Existe un payload canónico de status consumible por UI/operación sin parsing ad-hoc por runtime.

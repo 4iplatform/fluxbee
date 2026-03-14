@@ -452,14 +452,14 @@ When a node cannot operate correctly:
 ## 12. Implementation Tasks (FR-07)
 
 - [ ] FR7-T1. Implement `node_status` schema in orchestrator (this document).
-- [ ] FR7-T2. Implement `GET /hives/{hive}/nodes/{node_name}/status` in SY.admin.
-- [ ] FR7-T3. Implement `get_node_status` forward from orchestrator to node with 2s timeout.
-- [ ] FR7-T4. Implement health inference (section 3.4) for non-responsive or handler-less nodes.
-- [ ] FR7-T5. Implement `status_version` persistence in `/var/lib/fluxbee/nodes/{TYPE}/{node_name}/status_version`.
-- [ ] FR7-T6. Add `get_node_status` default handler to `fluxbee_sdk`.
-- [ ] FR7-T7. E2E: node RUNNING + HEALTHY → full status response with node-reported health.
+- [x] FR7-T2. Implement `GET /hives/{hive}/nodes/{node_name}/status` in SY.admin.
+- [x] FR7-T3. Implement `get_node_status` forward from orchestrator to node with 2s timeout.
+- [x] FR7-T4. Implement health inference (section 3.4) for non-responsive or handler-less nodes.
+- [x] FR7-T5. Implement `status_version` persistence in `/var/lib/fluxbee/nodes/{TYPE}/{node_name}/status_version`.
+- [x] FR7-T6. Add `get_node_status` default handler to `fluxbee_sdk`.
+- [ ] FR7-T7. E2E: node RUNNING + HEALTHY → full status response with node-reported health. (`scripts/node_status_fr7_e2e.sh`)
 - [ ] FR7-T8. E2E: node STOPPED → lifecycle=STOPPED, health=UNKNOWN.
-- [ ] FR7-T9. E2E: node RUNNING but unresponsive → lifecycle=RUNNING, health inferred (HEALTHY if config valid, no errors).
+- [ ] FR7-T9. E2E: node RUNNING but unresponsive → lifecycle=RUNNING, health inferred (HEALTHY if config valid, no errors). (`scripts/node_status_fr7_e2e.sh`)
 - [ ] FR7-T10. E2E: node with invalid config → config.valid=false, node reports health=ERROR.
 - [ ] FR7-T11. E2E: FAILED node (crash) → lifecycle=FAILED, health=UNKNOWN.
 - [ ] FR7-T12. E2E: status_version survives orchestrator restart (monotonic across restarts).

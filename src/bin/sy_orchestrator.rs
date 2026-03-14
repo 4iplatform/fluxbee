@@ -78,6 +78,7 @@ const DIST_VENDOR_MANIFEST_PATH: &str = "/var/lib/fluxbee/dist/vendor/manifest.j
 const DIST_SYNCTHING_VENDOR_SOURCE_PATH: &str = "/var/lib/fluxbee/dist/vendor/syncthing/syncthing";
 const CORE_SERVICE_HEALTH_TIMEOUT_SECS: u64 = 30;
 const NODE_STATUS_SCHEMA_VERSION: &str = "1";
+const NODE_STATUS_FORWARD_TIMEOUT_SECS: u64 = 2;
 const DEPLOYMENT_HISTORY_MAX_LIMIT: usize = 500;
 const DRIFT_ALERT_MAX_LIMIT: usize = 500;
 const CORE_SYNC_RESTART_ORDER: &[&str] = &[
@@ -6651,6 +6652,10 @@ fn node_status_version_path(node_name: &str) -> Result<PathBuf, OrchestratorErro
     Ok(node_instance_dir(node_name)?.join("status_version"))
 }
 
+fn node_status_fingerprint_path(node_name: &str) -> Result<PathBuf, OrchestratorError> {
+    Ok(node_instance_dir(node_name)?.join("status_fingerprint.sha256"))
+}
+
 fn read_node_status_version(path: &Path) -> u64 {
     fs::read_to_string(path)
         .ok()
@@ -6658,17 +6663,57 @@ fn read_node_status_version(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn bump_node_status_version(node_name: &str) -> Result<u64, OrchestratorError> {
-    let path = node_status_version_path(node_name)?;
+fn write_private_file_atomic(path: &Path, contents: &[u8]) -> Result<(), OrchestratorError> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
     }
-    let next = read_node_status_version(&path).saturating_add(1).max(1);
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    fs::write(&tmp, next.to_string())?;
+    fs::write(&tmp, contents)?;
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
     fs::rename(&tmp, &path)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn status_fingerprint_hash(value: &serde_json::Value) -> Result<String, OrchestratorError> {
+    let bytes = serde_json::to_vec(value)?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn advance_node_status_version(
+    node_name: &str,
+    fingerprint: &serde_json::Value,
+) -> Result<u64, OrchestratorError> {
+    let version_path = node_status_version_path(node_name)?;
+    let fingerprint_path = node_status_fingerprint_path(node_name)?;
+    if let Some(parent) = version_path.parent() {
+        ensure_private_dir(parent)?;
+    }
+
+    let current = read_node_status_version(&version_path);
+    let new_fingerprint = status_fingerprint_hash(fingerprint)?;
+    let old_fingerprint = fs::read_to_string(&fingerprint_path)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty());
+
+    let next = if current == 0 {
+        1
+    } else if old_fingerprint.as_deref() == Some(new_fingerprint.as_str()) {
+        current
+    } else {
+        current.saturating_add(1)
+    };
+
+    if current != next || !version_path.exists() {
+        write_private_file_atomic(&version_path, next.to_string().as_bytes())?;
+    }
+    if old_fingerprint.as_deref() != Some(new_fingerprint.as_str()) || !fingerprint_path.exists() {
+        write_private_file_atomic(&fingerprint_path, new_fingerprint.as_bytes())?;
+    }
+
     Ok(next)
 }
 
@@ -6710,6 +6755,33 @@ fn systemd_unit_is_failed(unit: &str) -> Result<bool, OrchestratorError> {
         .arg(unit)
         .status()?;
     Ok(status.success())
+}
+
+fn normalize_reported_health_state(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "HEALTHY" => Some("HEALTHY"),
+        "DEGRADED" => Some("DEGRADED"),
+        "ERROR" => Some("ERROR"),
+        "UNKNOWN" => Some("UNKNOWN"),
+        _ => None,
+    }
+}
+
+fn extract_node_status_payload_value<'a>(
+    response: &'a serde_json::Value,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    response
+        .get(key)
+        .or_else(|| response.get("payload").and_then(|payload| payload.get(key)))
+}
+
+fn extract_reported_health_state(response: &serde_json::Value) -> Option<&'static str> {
+    let raw = extract_node_status_payload_value(response, "health_state")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    normalize_reported_health_state(raw)
 }
 
 async fn get_node_status_flow(
@@ -6875,12 +6947,12 @@ async fn get_node_status_flow(
         }
     }
 
-    let last_error = state_payload
+    let mut last_error = state_payload
         .as_ref()
         .and_then(|value| value.get("last_error"))
         .filter(|value| !value.is_null())
         .cloned();
-    let extensions = state_payload
+    let mut extensions = state_payload
         .as_ref()
         .and_then(|value| value.get("extensions"))
         .filter(|value| !value.is_null())
@@ -6900,7 +6972,7 @@ async fn get_node_status_flow(
         "UNKNOWN"
     };
 
-    let (health_state, health_source) = if lifecycle_state == "RUNNING" {
+    let (fallback_health_state, fallback_health_source) = if lifecycle_state == "RUNNING" {
         if !config_exists || !config_valid {
             ("ERROR", "ORCHESTRATOR_INFERRED")
         } else if last_error.is_some() {
@@ -6911,8 +6983,66 @@ async fn get_node_status_flow(
     } else {
         ("UNKNOWN", "UNKNOWN")
     };
+    let mut health_state = fallback_health_state.to_string();
+    let mut health_source = fallback_health_source.to_string();
 
-    let status_version = match bump_node_status_version(&node_name) {
+    if lifecycle_state == "RUNNING" {
+        let node_status_request = serde_json::json!({
+            "node_name": node_name,
+        });
+        match relay_system_action(
+            state,
+            &node_name,
+            "NODE_STATUS_GET",
+            "NODE_STATUS_GET_RESPONSE",
+            node_status_request,
+            Duration::from_secs(NODE_STATUS_FORWARD_TIMEOUT_SECS),
+        )
+        .await
+        {
+            Ok(response) => {
+                if let Some(reported) = extract_reported_health_state(&response) {
+                    health_state = reported.to_string();
+                    health_source = "NODE_REPORTED".to_string();
+                }
+                if let Some(value) = extract_node_status_payload_value(&response, "last_error")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                {
+                    last_error = Some(value);
+                }
+                if let Some(value) = extract_node_status_payload_value(&response, "extensions")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                {
+                    extensions = Some(value);
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    node_name = node_name,
+                    error = %err,
+                    "node status request timed out/unreachable; using inferred fallback"
+                );
+            }
+        }
+    }
+
+    let status_fingerprint = serde_json::json!({
+        "lifecycle_state": lifecycle_state,
+        "health_state": health_state,
+        "health_source": health_source,
+        "runtime_name": runtime_name.clone(),
+        "runtime_version": runtime_version.clone(),
+        "config_exists": config_exists,
+        "config_valid": config_valid,
+        "config_version": config_version,
+        "state_exists": state_exists,
+        "identity_ilk_id": identity_ilk_id.clone(),
+        "identity_tenant_id": identity_tenant_id.clone(),
+        "last_error": last_error.clone(),
+    });
+    let status_version = match advance_node_status_version(&node_name, &status_fingerprint) {
         Ok(value) => value,
         Err(err) => {
             tracing::warn!(

@@ -17,3 +17,4 @@ pub use crate::identity::{
     MSG_TNT_CREATE,
 };
 pub use crate::payload::{PayloadError, TextV1Payload, TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES};
+pub use crate::status::try_handle_default_node_status;

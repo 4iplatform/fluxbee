@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::time::Duration;
 
-use fluxbee_sdk::{connect, NodeConfig};
+use fluxbee_sdk::{connect, try_handle_default_node_status, NodeConfig};
 use tracing_subscriber::EnvFilter;
 
 type DynError = Box<dyn Error + Send + Sync>;
@@ -25,8 +25,24 @@ async fn main() -> Result<(), DynError> {
         version: node_version,
     };
 
-    let (_sender, _receiver) = connect(&node_cfg).await?;
+    let (sender, mut receiver) = connect(&node_cfg).await?;
     tracing::info!("inventory hold diag connected");
+
+    let status_sender = sender.clone();
+    tokio::spawn(async move {
+        loop {
+            let message = match receiver.recv().await {
+                Ok(msg) => msg,
+                Err(err) => {
+                    tracing::warn!(error = %err, "inventory hold diag receiver ended");
+                    break;
+                }
+            };
+            if let Err(err) = try_handle_default_node_status(&status_sender, &message).await {
+                tracing::warn!(error = %err, "failed to handle default node status");
+            }
+        }
+    });
 
     if hold_secs == 0 {
         std::future::pending::<()>().await;

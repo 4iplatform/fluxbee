@@ -8,6 +8,7 @@ pub mod payload;
 pub mod prelude;
 pub mod protocol;
 pub mod socket;
+pub mod status;
 pub mod split;
 
 pub use client_config::ClientConfig;
@@ -20,4 +21,5 @@ pub use identity::{
     MSG_TNT_CREATE,
 };
 pub use node_client::{connect, connect_with_client_config, NodeConfig, NodeError};
+pub use status::try_handle_default_node_status;
 pub use split::{NodeReceiver, NodeSender};
