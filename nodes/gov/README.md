@@ -43,3 +43,23 @@ El nodo `AI.frontdesk.gov` debe usar helpers del SDK:
 - fallback a primary (`SY.identity@<motherbee>`) cuando reciba `NOT_PRIMARY`
 
 Checklist operativo: `docs/onworking/identity_v2_tasks.md` sección `E2`.
+
+## Contrato de Status (FR7)
+
+Para cualquier nodo `.gov`, el contrato operativo recomendado es:
+- responder `get_node_status` vía SDK (handler default o custom),
+- exponer `health_state` consistente (`HEALTHY|DEGRADED|ERROR|UNKNOWN`),
+- mantener `extensions` solo para métricas runtime-specific.
+
+Validación desde API admin:
+
+```bash
+BASE="http://127.0.0.1:8080"
+HIVE_ID="motherbee"
+NODE_NAME="AI.frontdesk.gov@$HIVE_ID"
+curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/status" | jq .
+```
+
+Referencia:
+- `docs/02-protocolo.md` (mensajes `NODE_STATUS_GET/_RESPONSE`)
+- `docs/07-operaciones.md` (runbook de status por nodo)

@@ -1,7 +1,7 @@
 # JSON Router - 02 Protocolo de Mensajes
 
-**Estado:** v1.19  
-**Fecha:** 2026-03-12  
+**Estado:** v1.20  
+**Fecha:** 2026-03-14  
 **Audiencia:** Desarrolladores de librería de nodo, desarrolladores de nodos
 
 ---
@@ -790,6 +790,8 @@ Request/response para obtener EventPackage completo de otra isla:
 | `SPAWN_NODE_RESPONSE` | `SY.orchestrator@<hive>` | Originador de `SPAWN_NODE` | Resultado de spawn |
 | `KILL_NODE` | `SY.admin` (tooling E2E solo entorno controlado) | `SY.orchestrator@<hive>` | Solicitar terminación de nodo |
 | `KILL_NODE_RESPONSE` | `SY.orchestrator@<hive>` | Originador de `KILL_NODE` | Resultado de kill |
+| `NODE_STATUS_GET` | `SY.admin` (vía endpoint de status) | `SY.orchestrator@<hive>` | Solicitar snapshot canónico de estado de un nodo |
+| `NODE_STATUS_GET_RESPONSE` | `SY.orchestrator@<hive>` | Originador de `NODE_STATUS_GET` | Retornar estado consolidado (`lifecycle`, `health`, `config`, `process`, `status_version`) |
 | `SYSTEM_SYNC_HINT` *(propuesto v2.x)* | `SY.admin` / SDK productor (según política) | `SY.orchestrator@<hive>` | Acelerar/confirmar convergencia de canal Syncthing (`blob`/`dist`) |
 | `SYSTEM_SYNC_HINT_RESPONSE` *(propuesto v2.x)* | `SY.orchestrator@<hive>` | Originador de `SYSTEM_SYNC_HINT` | Estado de convergencia del folder (`ok`/`sync_pending`/`error`) |
 
@@ -985,7 +987,67 @@ Estados/códigos típicos:
 - `status=error`, `error_code=INVALID_REQUEST`.
 - `status=error`, `error_code=KILL_FAILED`.
 
-#### 7.9.4 SYSTEM_SYNC_HINT *(propuesto v2.x)*
+#### 7.9.4 NODE_STATUS_GET
+
+Objetivo:
+- obtener un snapshot canónico de estado por nodo, consistente en local/remoto.
+- evitar parsing ad-hoc por runtime para troubleshooting operativo.
+
+Request:
+
+```json
+{
+  "routing": {
+    "src": "SY.admin@motherbee",
+    "dst": "SY.orchestrator@worker-1",
+    "ttl": 16,
+    "trace_id": "..."
+  },
+  "meta": {
+    "type": "system",
+    "msg": "NODE_STATUS_GET"
+  },
+  "payload": {
+    "node_name": "WF.demo.worker@worker-1"
+  }
+}
+```
+
+Response (`NODE_STATUS_GET_RESPONSE`) mínima:
+
+```json
+{
+  "payload": {
+    "status": "ok",
+    "target": "worker-1",
+    "hive": "worker-1",
+    "node_name": "WF.demo.worker@worker-1",
+    "node_status": {
+      "schema_version": "1",
+      "node_name": "WF.demo.worker@worker-1",
+      "hive_id": "worker-1",
+      "observed_at": "2026-03-14T14:28:37Z",
+      "lifecycle_state": "RUNNING",
+      "health_state": "HEALTHY",
+      "health_source": "NODE_REPORTED",
+      "status_version": 3
+    }
+  }
+}
+```
+
+Semántica canónica:
+- `lifecycle_state`: `STARTING|RUNNING|STOPPING|STOPPED|FAILED|UNKNOWN`
+- `health_state`: `HEALTHY|DEGRADED|ERROR|UNKNOWN`
+- `health_source`: `NODE_REPORTED|ORCHESTRATOR_INFERRED|UNKNOWN`
+- `status_version`: contador monotónico por nodo, persistido en disco por orchestrator.
+
+Regla de precedencia:
+- si el nodo responde status en tiempo (timeout 2s), prevalece `health_source=NODE_REPORTED`;
+- si no responde y `lifecycle_state=RUNNING`, orchestrator aplica fallback (`ORCHESTRATOR_INFERRED`);
+- si no hay señal suficiente o el nodo no está runnable, `health_source=UNKNOWN`.
+
+#### 7.9.5 SYSTEM_SYNC_HINT *(propuesto v2.x)*
 
 Objetivo:
 - gatillar sincronización por evento sobre Syncthing y opcionalmente esperar convergencia observada.

@@ -1,7 +1,7 @@
 # Node Status Contract
 
-**Status:** v1.0
-**Date:** 2026-03-13
+**Status:** v1.1
+**Date:** 2026-03-14
 **Audience:** Developers implementing orchestrator, admin API, and node runtimes (AI/WF/IO/SY)
 **Parent specs:** `node-spawn-config-spec.md`, `system-inventory-spec.md`
 **Resolves:** FR-07 (status/health)
@@ -444,8 +444,8 @@ When a node cannot operate correctly:
 ### Phase 3 — Consolidation
 
 - Mark ad-hoc status responses as deprecated.
-- Update `02-protocolo.md` with `get_node_status` message definition.
-- Update `07-operaciones.md` with status endpoints.
+- [x] Update `02-protocolo.md` with `get_node_status` message definition.
+- [x] Update `07-operaciones.md` with status endpoints and runbook de status por nodo.
 
 ---
 
@@ -461,8 +461,8 @@ When a node cannot operate correctly:
 - [x] FR7-T8. E2E: node STOPPED → lifecycle=STOPPED, health=UNKNOWN. (`scripts/node_status_fr7_e2e.sh`)
 - [x] FR7-T9. E2E: node RUNNING but unresponsive → lifecycle=RUNNING, health inferred (HEALTHY if config valid, no errors). (`scripts/node_status_fr7_e2e.sh`)
 - [x] FR7-T10. E2E: node with invalid config → config.valid=false, node reports health=ERROR. (`scripts/node_status_fr7_e2e.sh`, validated with `t10_mode=full` on `motherbee`)
-- [ ] FR7-T11. E2E: FAILED node (crash) → lifecycle=FAILED, health=UNKNOWN. (`scripts/node_status_fr7_t11_t12_e2e.sh`)
-- [ ] FR7-T12. E2E: status_version survives orchestrator restart (monotonic across restarts). (`scripts/node_status_fr7_t11_t12_e2e.sh`)
+- [x] FR7-T11. E2E: FAILED node (crash) → lifecycle=FAILED, health=UNKNOWN. (`scripts/node_status_fr7_t11_t12_e2e.sh`)
+- [x] FR7-T12. E2E: status_version survives orchestrator restart (monotonic across restarts). (`scripts/node_status_fr7_t11_t12_e2e.sh`, validated with `status_version_before=2` and `status_version_after=3`)
 
 ---
 
@@ -474,5 +474,5 @@ When a node cannot operate correctly:
 | `system-inventory-spec.md` | Inventory provides node list; status provides per-node health detail |
 | `runtime-lifecycle-spec.md` | Runtime readiness is a prerequisite; status reports post-spawn state |
 | `10-identity-v2.md` | Identity block in status comes from ILK registration |
-| `02-protocolo.md` | Needs update with get_node_status message definition |
-| `07-operaciones.md` | Needs update with status API endpoints |
+| `02-protocolo.md` | Define `NODE_STATUS_GET/NODE_STATUS_GET_RESPONSE` and canonical status fields |
+| `07-operaciones.md` | Expose status/config/state endpoints and operational runbook |

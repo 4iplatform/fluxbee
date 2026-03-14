@@ -1,7 +1,7 @@
 # JSON Router - 07 Operaciones
 
-**Estado:** v1.19  
-**Fecha:** 2026-03-12  
+**Estado:** v1.20  
+**Fecha:** 2026-03-14  
 **Audiencia:** Ops/SRE, desarrolladores de deployment
 
 ---
@@ -1009,9 +1009,39 @@ ssh -i /var/lib/fluxbee/ssh/motherbee.key administrator@192.168.1.50
 | `GET /hives/{id}/nodes` | `list_nodes` | Lista nodos de hive |
 | `POST /hives/{id}/nodes` | `run_node` | Envía `SPAWN_NODE` (contrato v2: `node_name`, `runtime`, `runtime_version`) |
 | `DELETE /hives/{id}/nodes/{name}` | `kill_node` | Envía `KILL_NODE` (soporta `force=true/false`) |
+| `GET /hives/{id}/nodes/{name}/status` | `get_node_status` | Snapshot canónico de estado de nodo (`lifecycle`, `health`, `source`, `status_version`) |
+| `GET /hives/{id}/nodes/{name}/config` | `get_node_config` | Lee `config.json` efectivo del nodo |
+| `PUT /hives/{id}/nodes/{name}/config` | `set_node_config` | Merge/patch de config per-node + señal de hot-reload |
+| `GET /hives/{id}/nodes/{name}/state` | `get_node_state` | Lectura diagnóstica de `state.json` (o `null` si no existe) |
 
 Nota:
 - Los routers se gestionan como nodos `RT.*` vía `SPAWN_NODE`/`KILL_NODE` usando los endpoints de nodos.
+
+### 5.2.1 Runbook de Status por Nodo
+
+Consultar status de un nodo:
+
+```bash
+BASE="http://127.0.0.1:8080"
+HIVE_ID="worker-220"
+NODE_NAME="WF.demo.worker@worker-220"
+
+curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/status" | jq .
+```
+
+Campos operativos relevantes (`payload.node_status`):
+- `lifecycle_state`: `STARTING|RUNNING|STOPPING|STOPPED|FAILED|UNKNOWN`
+- `health_state`: `HEALTHY|DEGRADED|ERROR|UNKNOWN`
+- `health_source`: `NODE_REPORTED|ORCHESTRATOR_INFERRED|UNKNOWN`
+- `status_version`: contador monotónico por nodo (persiste restart de orchestrator)
+
+Diagnóstico rápido:
+1. `lifecycle_state=FAILED` + `health_source=UNKNOWN`:
+   revisar unit systemd del nodo y logs del servicio.
+2. `lifecycle_state=RUNNING` + `health_source=ORCHESTRATOR_INFERRED`:
+   el nodo está vivo pero no respondió handler de status en timeout (2s).
+3. `config.valid=false`:
+   revisar `config.json` del nodo y re-aplicar `PUT /config` si corresponde.
 
 ### 5.3 Estado de Isla
 

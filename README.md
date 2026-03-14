@@ -71,7 +71,7 @@ curl -sS -X DELETE "$BASE/hives/$HIVE_ID"
 ### Publish and apply a runtime update on a worker (`dist` + `SYSTEM_UPDATE`)
 
 ```bash
-MOTHER_HIVE="sandbox"   # hive local de motherbee
+MOTHER_HIVE="motherbee"   # hive local de motherbee (nombre fijo)
 RUNTIME="wf.demo.task"
 VERSION="0.0.1"
 
@@ -148,6 +148,27 @@ curl -sS "$BASE/hives/$HIVE_ID/versions"
 curl -sS "$BASE/hives/$HIVE_ID/deployments?limit=10"
 ```
 
+### Node status/config quick checks
+
+```bash
+NODE_NAME="WF.demo.worker@$HIVE_ID"
+
+# canonical node status snapshot
+curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/status" | jq .
+
+# effective node config
+curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" | jq .
+
+# node runtime state (null if not created yet)
+curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/state" | jq .
+```
+
+Useful status fields:
+- `payload.node_status.lifecycle_state`
+- `payload.node_status.health_state`
+- `payload.node_status.health_source`
+- `payload.node_status.status_version`
+
 Expected for remote hive responses:
 - `payload.target` should match requested hive (for example `worker-220`)
 - node names should match target hive (for example `SY.config.routes@worker-220`)
@@ -222,6 +243,10 @@ Hive-scoped endpoints:
 | `GET` | `/hives/{hive}/nodes` | List nodes on hive |
 | `POST` | `/hives/{hive}/nodes` | Spawn node on hive |
 | `DELETE` | `/hives/{hive}/nodes/{name}` | Kill node on hive |
+| `GET` | `/hives/{hive}/nodes/{name}/status` | Canonical node status (lifecycle/health/config/process) |
+| `GET` | `/hives/{hive}/nodes/{name}/config` | Read node effective config |
+| `PUT` | `/hives/{hive}/nodes/{name}/config` | Update node effective config |
+| `GET` | `/hives/{hive}/nodes/{name}/state` | Read node runtime state payload |
 | `POST` | `/hives/{hive}/update` | Send `SYSTEM_UPDATE` to hive orchestrator |
 | `POST` | `/hives/{hive}/sync-hint` | Send `SYSTEM_SYNC_HINT` (`blob`/`dist`) to hive orchestrator |
 | `GET` | `/hives/{hive}/versions` | Effective versions for hive |
