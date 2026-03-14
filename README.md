@@ -596,7 +596,13 @@ Key documents:
 | Identity SHM lookup | `fluxbee_sdk::identity::{resolve_ilk_from_shm_name, resolve_ilk_from_hive_id, resolve_ilk_from_hive_config}` | Resolve `(channel_type,address) -> ilk` locally from identity SHM |
 | Identity provision | `fluxbee_sdk::identity::{IlkProvisionRequest, provision_ilk}` | Request `ILK_PROVISION` with automatic `NOT_PRIMARY` fallback target support |
 | Identity system calls | `fluxbee_sdk::identity::{IdentitySystemRequest, identity_system_call, identity_system_call_ok}` | Generic helpers for `ILK_REGISTER`, `ILK_ADD_CHANNEL`, `ILK_UPDATE`, tenant actions |
+| Node status default handler | `fluxbee_sdk::try_handle_default_node_status` | Respond `NODE_STATUS_GET` with canonical `health_state`; avoids `ORCHESTRATOR_INFERRED` fallback when node is healthy |
 | Convenience imports | `fluxbee_sdk::prelude::*` | Common SDK symbols in one import |
+
+Recommended for every new node/scaffold:
+- call `try_handle_default_node_status(&sender, &msg).await` inside the receive loop.
+- keep it enabled unless the runtime provides a custom status handler with the same contract.
+- this makes `GET /hives/{hive}/nodes/{name}/status` report `health_source=NODE_REPORTED` in normal operation.
 
 #### Blob: basic flow (`put`/`promote` -> attach)
 
