@@ -34,9 +34,16 @@ sync_hint_body="$tmpdir/sync_hint.json"
 update_body="$tmpdir/update.json"
 local_hive_body="$tmpdir/local_hive.json"
 hive_status_body="$tmpdir/hive_status.json"
+failed_unit_file=""
 
 cleanup() {
   local _ec=$?
+  if [[ -n "$failed_unit_file" && -f "$failed_unit_file" ]]; then
+    as_root_local systemctl stop "$(basename "${failed_unit_file%.service}")" >/dev/null 2>&1 || true
+    as_root_local systemctl reset-failed "$(basename "${failed_unit_file%.service}")" >/dev/null 2>&1 || true
+    as_root_local rm -f "$failed_unit_file" >/dev/null 2>&1 || true
+    as_root_local systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
   http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_FAILED" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
   http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_MONO" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
   rm -rf "$tmpdir"
@@ -536,8 +543,34 @@ if [[ -z "$failed_unit" ]]; then
 fi
 as_root_local systemctl stop "$failed_unit" >/dev/null 2>&1 || true
 as_root_local systemctl reset-failed "$failed_unit" >/dev/null 2>&1 || true
-if ! as_root_local systemd-run --replace --unit "$failed_unit" --property Restart=no --property RestartSec=0 /bin/false >/dev/null 2>&1; then
-  echo "FAIL: unable to inject failed unit run for '$failed_unit'" >&2
+failed_unit_file="/etc/systemd/system/${failed_unit}.service"
+cat >"$tmpdir/failed_unit.service" <<EOF
+[Unit]
+Description=FR7 T11 failed fixture for $failed_unit
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/false
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+if ! as_root_local install -m 0644 "$tmpdir/failed_unit.service" "$failed_unit_file"; then
+  echo "FAIL: unable to install failed fixture unit '$failed_unit_file'" >&2
+  exit 1
+fi
+if ! as_root_local systemctl daemon-reload >/dev/null 2>&1; then
+  echo "FAIL: daemon-reload failed after installing '$failed_unit_file'" >&2
+  exit 1
+fi
+if ! as_root_local systemctl start "$failed_unit" >/dev/null 2>&1; then
+  # expected non-zero for /bin/false on some systems; continue to status check
+  true
+fi
+if ! as_root_local systemctl is-failed --quiet "$failed_unit"; then
+  echo "FAIL: fixture unit '$failed_unit' did not enter failed state" >&2
   exit 1
 fi
 wait_node_status "$NODE_FAILED" "FAILED" "UNKNOWN" "UNKNOWN" "$status_failed_body"
