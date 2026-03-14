@@ -7,17 +7,19 @@ Este instructivo cubre el flujo operativo actual para:
 3. ejecutar un nodo con `sy-admin`/`sy-orchestrator`.
 
 Aplica al modelo v2 actual: el nodo se corre por API de admin (`/hives/{id}/nodes`) y el versionado se aplica por `SYSTEM_UPDATE` (`/hives/{id}/update`).
+Referencia canónica de lifecycle: `docs/onworking/runtime-lifecycle-spec.md`.
 
 ## 1. Variables base
 
 ```bash
 BASE="http://127.0.0.1:8080"
-MOTHER_HIVE="sandbox"          # hive local de motherbee
+MOTHER_HIVE="motherbee"        # hive local de motherbee (fijo por convención)
 TARGET_HIVE="worker-220"       # hive donde vas a correr el nodo
 
 RUNTIME="wf.demo.task"         # usar nombre exacto (case-sensitive)
 VERSION="0.0.1"
 NODE_NAME="WF.demo.task.node1" # nombre de nodo (sin @)
+TENANT_ID="tnt:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" # requerido si identity strict aplica al runtime
 ```
 
 ## 2. Publicar ejecutable/runtime en motherbee
@@ -88,15 +90,25 @@ print("manifest_version:", doc["version"])
 PY
 ```
 
-## 4. Verificar versión/hash local en motherbee
+## 4. Verificar manifest + readiness local en motherbee
 
 ```bash
-curl -sS "$BASE/hives/$MOTHER_HIVE/versions" | python3 -m json.tool
+resp="$(curl -sS "$BASE/hives/$MOTHER_HIVE/versions")"
+echo "$resp" | python3 -m json.tool
+
+echo "$resp" | jq -e --arg rt "$RUNTIME" --arg ver "$VERSION" '
+  .payload.hive.runtimes.runtimes[$rt].readiness[$ver].runtime_present == true and
+  .payload.hive.runtimes.runtimes[$rt].readiness[$ver].start_sh_executable == true
+' >/dev/null || {
+  echo "runtime no listo en motherbee (readiness false): $RUNTIME@$VERSION" >&2
+  exit 1
+}
 ```
 
 Verificá que aparezca:
 
 - `payload.hive.runtimes.runtimes.<RUNTIME>`
+- `payload.hive.runtimes.runtimes.<RUNTIME>.readiness.<VERSION>`
 - `payload.hive.runtimes.manifest_version`
 - `payload.hive.runtimes.manifest_hash`
 
@@ -158,13 +170,55 @@ curl -sS -X POST "$BASE/hives/$TARGET_HIVE/update" \
 ```
 
 Si devuelve `payload.status=sync_pending`, esperá unos segundos y repetí el `POST /update`.
+Si devuelve `payload.status=error` con `error_code=VERSION_MISMATCH`, no reintentes con la misma versión pedida: tomá el `manifest_version` vigente desde motherbee y reenviá el update.
+
+Loop recomendado:
+
+```bash
+UPDATE_WAIT_SECS=180
+deadline=$(( $(date +%s) + UPDATE_WAIT_SECS ))
+while (( $(date +%s) <= deadline )); do
+  upd="$(curl -sS -X POST "$BASE/hives/$TARGET_HIVE/update" \
+    -H "Content-Type: application/json" \
+    -d "{\"category\":\"runtime\",\"manifest_version\":$MANIFEST_VERSION,\"manifest_hash\":\"$MANIFEST_HASH\"}")"
+  status="$(echo "$upd" | jq -r '.payload.status // .status // ""')"
+  code="$(echo "$upd" | jq -r '.error_code // .payload.error_code // ""')"
+  if [[ "$status" == "ok" ]]; then
+    echo "$upd"
+    break
+  fi
+  if [[ "$status" == "sync_pending" ]]; then
+    sleep 2
+    continue
+  fi
+  echo "$upd" >&2
+  if [[ "$code" == "VERSION_MISMATCH" ]]; then
+    echo "update rechazado por VERSION_MISMATCH (local > requested)" >&2
+  fi
+  exit 1
+done
+```
+
+## 6.1 Verificar readiness en destino antes de spawn
+
+```bash
+resp_target="$(curl -sS "$BASE/hives/$TARGET_HIVE/versions")"
+echo "$resp_target" | jq -e --arg rt "$RUNTIME" '
+  .payload.hive.runtimes.runtimes[$rt].current as $cv |
+  .payload.hive.runtimes.runtimes[$rt].readiness[$cv].runtime_present == true and
+  .payload.hive.runtimes.runtimes[$rt].readiness[$cv].start_sh_executable == true
+' >/dev/null || {
+  echo "runtime no listo en target hive para current: $RUNTIME" >&2
+  exit 1
+}
+```
 
 ## 7. Ejecutar nodo en el hive destino
 
 ```bash
 curl -sS -X POST "$BASE/hives/$TARGET_HIVE/nodes" \
   -H "Content-Type: application/json" \
-  -d "{\"node_name\":\"$NODE_NAME\",\"runtime\":\"$RUNTIME\",\"runtime_version\":\"current\"}"; echo
+  -d "{\"node_name\":\"$NODE_NAME\",\"runtime\":\"$RUNTIME\",\"runtime_version\":\"current\",\"tenant_id\":\"$TENANT_ID\"}"; echo
 ```
 
 Listar nodos:
@@ -192,7 +246,9 @@ curl -sS -X DELETE "$BASE/hives/$TARGET_HIVE/nodes/$NODE_NAME" \
 ## Troubleshooting rápido
 
 - `RUNTIME_NOT_AVAILABLE`: el `runtime` enviado no existe en manifest (revisar nombre exacto/case).
-- `RUNTIME_NOT_PRESENT`: existe en manifest pero falta `start.sh` en el hive destino (sync aún no convergió).
+- `RUNTIME_NOT_PRESENT`: existe en manifest pero falta `start.sh` en el hive destino (sync aún no convergió) o `start.sh` no es ejecutable.
 - `sync_pending` en `/sync-hint`: Syncthing aún no llegó a `idle` para `fluxbee-dist`.
-- `sync_pending` en `/update`: el destino todavía no tiene el manifest/hash esperado.
+- `sync_pending` en `/update`: el destino todavía no tiene el manifest/hash esperado o faltan artefactos runtime locales.
+- `VERSION_MISMATCH` en `/update`: el destino tiene manifest local más nuevo que el solicitado (`local_manifest_version > manifest_version`).
+- `IDENTITY_REGISTER_FAILED`: faltó `tenant_id` en `POST /nodes` (runtime con identity strict).
 - `FORBIDDEN` en `/update`: origen no autorizado para acciones de sistema (revisar allowlist de system messages).

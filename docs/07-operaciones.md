@@ -631,7 +631,7 @@ Modelo:
 - Motherbee publica artefactos y manifests en `/var/lib/fluxbee/dist/`.
 - Syncthing replica `dist/` entre hives.
 - `SY.admin` dispara `POST /hives/{id}/update`.
-- `SY.orchestrator@{hive}` valida manifest local (`manifest_version/manifest_hash`) y aplica local.
+- `SY.orchestrator@{hive}` valida manifest local (`manifest_version/manifest_hash`) y readiness de artefactos runtime (`start.sh` presente + ejecutable para versiones `current`) antes de responder `ok`.
 
 Categorías soportadas por update:
 - `runtime`
@@ -649,11 +649,16 @@ Flujo operativo canónico:
 
 ```
 1. Publicar artefactos/manifests en /var/lib/fluxbee/dist/
-2. Esperar convergencia de Syncthing en el worker (o usar hint/confirmación de sync cuando esté habilitado)
-3. POST /hives/{id}/update {category, manifest_version, manifest_hash}
-4. Admin envía SYSTEM_UPDATE -> SY.orchestrator@{hive}
-5. Orchestrator worker instala/reinicia localmente y responde SYSTEM_UPDATE_RESPONSE
-6. Admin devuelve respuesta HTTP (200 ok / 202 sync_pending / error)
+2. Verificar en motherbee: /hives/motherbee/versions refleja manifest + readiness del runtime objetivo
+3. Esperar convergencia de Syncthing en el worker (POST /hives/{id}/sync-hint canal dist)
+4. POST /hives/{id}/update {category, manifest_version, manifest_hash}
+5. Admin envía SYSTEM_UPDATE -> SY.orchestrator@{hive}
+6. Orchestrator worker responde:
+   - ok: manifest exacto y artefactos listos localmente
+   - sync_pending: aún no convergió manifest/artefactos
+   - error VERSION_MISMATCH: local_manifest_version > manifest_version pedido
+7. Solo con update=ok ejecutar POST /hives/{id}/nodes (spawn)
+8. Spawn valida start.sh del runtime/version solicitado; si falta/no ejecutable retorna RUNTIME_NOT_PRESENT (sin auto-update)
 ```
 
 Regla importante:

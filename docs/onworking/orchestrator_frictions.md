@@ -120,6 +120,18 @@ Impacto:
 - Desalineación contrato vs runtime real.
 - Dependencia implícita en carriers legacy (`meta.context`).
 
+Lista de tareas FR-04 (ON HOLD, solo preparación):
+- [ ] FR4-T1. Congelar alcance y contrato final de L3 en spec cognitive (fuente única de verdad para `ctx/ctx_window`).
+- [ ] FR4-T2. Definir matriz de compatibilidad backward (`meta.context` legacy vs campos tipados en `Meta`).
+- [ ] FR4-T3. Diseñar migración por fases (SDK -> router -> storage) con feature flags y criterio de rollback.
+- [ ] FR4-T4. Definir límites y semántica operativa de `ctx_window` (tamaño, truncado, casos de omisión).
+- [ ] FR4-T5. Definir plan de pruebas (unit + integración + E2E) para evitar regresiones de tracing/conversación.
+
+Criterio de salida de ON HOLD FR-04:
+- Spec cognitive cerrada y aprobada.
+- Plan de migración firmado (fases, compat, métricas de adopción).
+- Recién ahí se habilita implementación en core/SDK/router.
+
 ---
 
 ### FR-05 — Config per-node unicast (API de control) + lectura de estado
@@ -192,41 +204,58 @@ Criterio de cierre FR-06:
 
 ### FR-07 — Schema canónico de status/health para nodos
 
-Estado: OPEN (prioridad media-baja)
+Estado: IN PROGRESS (prioridad media-baja)
 
 Qué pasa hoy:
-- No existe contrato de mensaje canónico de status de nodo en protocolo core para estados como `UNCONFIGURED`, `FAILED_CONFIG`, `DEGRADED`.
+- No existe contrato de mensaje canónico de status de nodo en protocolo core para `lifecycle_state + health_state + health_source`.
 - Hay respuestas ad-hoc por acción/servicio.
+
+Lista de tareas FR-07:
+- [ ] FR7-T1. Definir contrato canónico de `STATUS_RESPONSE` en protocolo (campos mínimos obligatorios + extensiones).
+- [ ] FR7-T2. Definir enum `lifecycle_state`: `STARTING|RUNNING|STOPPING|STOPPED|FAILED|UNKNOWN`.
+- [ ] FR7-T3. Definir enum `health_state`: `HEALTHY|DEGRADED|ERROR|UNKNOWN`.
+- [ ] FR7-T4. Definir enum `health_source`: `NODE_REPORTED|ORCHESTRATOR_INFERRED|UNKNOWN`.
+- [ ] FR7-T5. Definir contrato de timestamps/versión (`observed_at`, `config_version`, `status_version`) para diagnósticos consistentes.
+- [x] FR7-T6. Implementar acción canónica en orchestrator para status por nodo (`get_node_status`) con soporte local y remoto.
+- [x] FR7-T7. Exponer endpoint admin estable para status por nodo/hive (sin romper endpoints existentes).
+- [x] FR7-T8. Incluir estado de config/state ownership (presencia de `config.json` / `state.json`) en status estandarizado.
+- [ ] FR7-T9. Definir precedencia de health en la respuesta final (`NODE_REPORTED` primero, fallback inferido en timeout).
+- [ ] FR7-T10. E2E de status (node reportado, timeout con inferencia, nodo detenido).
+- [ ] FR7-T11. Actualizar docs (`02-protocolo.md`, `07-operaciones.md`) y runbooks de troubleshooting.
+
+Borrador inicial para discusión:
+- `docs/onworking/node-status-contract-draft.md`
+
+Implementado en esta etapa (2026-03-14):
+- `GET /hives/{hive}/nodes/{node_name}/status` en `SY.admin`.
+- `get_node_status` en `SY.orchestrator` con relay cross-hive (`NODE_STATUS_GET` / `NODE_STATUS_GET_RESPONSE`).
+- Payload base con `lifecycle_state`, `health_state`, `health_source`, `status_version` y bloques `config/state/process/runtime/identity`.
+
+Criterio de cierre FR-07:
+- Existe un payload canónico de status consumible por UI/operación sin parsing ad-hoc por runtime.
+- El mismo contrato aplica en local/remote (relay) con compat backward razonable.
+- E2E FR-07 en verde para los estados principales.
 
 ---
 
 ### FR-08 — Consistencia `versions` vs artefacto runtime real (`start.sh`)
 
-Estado: OPEN (prioridad alta)
+Estado: CLOSED (core + E2E + docs)
 
 Qué pasa hoy:
-- En algunos casos `/hives/{hive}/versions` reporta runtime/version disponible por manifest, pero el artefacto local no está materializado (`bin/start.sh` ausente).
-- `run_node` falla con `RUNTIME_NOT_PRESENT` aunque `versions` lo muestre disponible.
-- Esto introduce falsos positivos de “runtime listo” y hace frágiles los E2E de spawn.
+- `GET /hives/{hive}/versions` incluye readiness por runtime/version (`runtime_present`, `start_sh_executable`).
+- `POST /hives/{hive}/update` valida artefactos de runtimes `current` y responde `sync_pending` si no están listos.
+- `run_node` preflight valida `start.sh` (existencia + executable) y falla explícitamente con `RUNTIME_NOT_PRESENT` sin auto-update.
+- Semántica de versión en update endurecida: `local > requested` => `VERSION_MISMATCH`.
 
 Evidencia:
-- `src/bin/sy_orchestrator.rs:6840`
-- `src/bin/sy_orchestrator.rs:6841`
-- `scripts/inventory_node_name_cross_hive_e2e.sh` (caso `RUNTIME_NOT_PRESENT` en spawn)
-
-Lista de tareas FR-08:
-- [ ] FR8-T1. Definir contrato único: cuándo un runtime aparece en `versions` como “available/current” (solo manifest vs manifest+artefacto local).
-- [ ] FR8-T2. Alinear `get_versions` para no reportar “available” si falta `bin/start.sh` local de la versión.
-- [ ] FR8-T3. Agregar campo explícito por runtime/version en `versions` para readiness local (ej. `runtime_present=true|false`) si se mantiene visibilidad de manifest sin artefacto.
-- [ ] FR8-T4. En `run_node`, si falta artefacto y hay metadata para update pendiente, devolver error accionable consistente (sin ambigüedad entre drift y sync pendiente).
-- [ ] FR8-T5. E2E dedicado manifest-vs-artifact:
-  - caso A: runtime en manifest sin `start.sh` -> `versions` y/o `run_node` coherentes con contrato;
-  - caso B: tras `sync-hint + update`, runtime materializado y spawn exitoso.
-- [ ] FR8-T6. Actualizar docs operativas (`07-operaciones.md` + runbooks E2E) con el flujo canónico de materialización runtime.
+- `src/bin/sy_orchestrator.rs` (readiness + update hardening + spawn preflight)
+- `scripts/runtime_lifecycle_fr8_e2e.sh` (T11/T12)
+- checks manuales T13/T14 (spawn fail explícito + update `sync_pending` con artefacto faltante)
+- `docs/onworking/runtime-lifecycle-spec.md` (FR8-T1..T16 en `[x]`)
 
 Criterio de cierre FR-08:
-- No existe escenario donde `versions` afirme disponibilidad runtime y `run_node` falle por ausencia de `start.sh` sin señal previa explícita en API.
-- E2E FR-08 en verde con y sin sync pendiente.
+- Cumplido (2026-03-13). Ver checklist consolidado en `docs/onworking/runtime-lifecycle-spec.md`.
 
 ---
 
@@ -263,24 +292,24 @@ Estado: CERRADA
 
 ### D-05 (effective config file ownership)
 
-Estado: REABIERTA
+Estado: CERRADA
 - La decisión de single-file queda reemplazada por revisión v1.1 de two-file ownership.
 - Se mantiene el principio de writer único, ahora con separación explícita config/state.
 
 ### D-06 (modelo de archivos por nodo)
 
-Estado: PARCIAL
+Estado: CERRADA
 - Se adopta dirección técnica: `config.json` (orchestrator) + `state.json` (node).
 - Path canónico fijo en core: `/var/lib/fluxbee/nodes`.
-- Pendiente de cierre: validación E2E final de ownership/respawn fail-closed.
+- Validado E2E: ownership + respawn fail-closed (`NODE_ALREADY_EXISTS`).
 
 ---
 
 ## 4) Orden sugerido de ejecución
 
-1. FR-08 (consistencia versions vs artefacto runtime).
-2. FR-07 (status schema común).
-3. FR-04 (ON HOLD hasta cerrar spec cognitive de L3/CTX).
+1. FR-07 (status schema común).
+2. FR-04 (ON HOLD hasta cerrar spec cognitive de L3/CTX; avanzar solo tareas preparatorias de contrato).
+3. INV-D3 (stale inventory) cuando exista trigger canónico desde API admin.
 
 ---
 
@@ -304,7 +333,7 @@ Estado: PARCIAL
 | 2026-03-13 | FR-05/06 E2E v1.1 | `node_config_per_node_e2e.sh` extendido con checks de `state` (existing/missing) y respawn fail-closed `NODE_ALREADY_EXISTS` | core | cerrado |
 | 2026-03-13 | FR-03 cierre E2E | `inventory_node_name_cross_hive_e2e.sh` valida precedencia de `node_name@hive` en spawn+kill contra endpoint cruzado | core | cerrado |
 | 2026-03-13 | FR-03 validación estricta | FR-03 pasa en modo estricto (`REQUIRE_INVENTORY_PRESENT=1`) con fixture `prepare-only` y `runtime_version` dedicada por caso | core | cerrado |
-| 2026-03-13 | FR-08 abierta | Detectada desalineación entre `versions` (manifest) y presencia real de artefactos runtime (`start.sh`) en spawn | core | abierto |
+| 2026-03-13 | FR-08 cierre integral | Readiness en `versions`, hardening de `update/spawn`, E2E T11..T14 y docs operativas alineadas | core | cerrado |
 
 ---
 

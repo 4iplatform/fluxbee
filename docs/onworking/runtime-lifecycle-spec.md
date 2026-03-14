@@ -79,9 +79,9 @@ A runtime version is considered published when BOTH conditions are met:
 1. The version appears in `manifest.json` under `runtimes.<name>.available`.
 2. The file `dist/runtimes/<name>/<version>/bin/start.sh` exists and is executable.
 
-**Publish validation (recommended, requires FR8-T3/T4 implemented):**
+**Publish validation (recommended):**
 
-The following validation uses the `readiness` block in the versions API, which is part of the target state defined in this spec. Until FR8-T3/T4 are implemented, verify artifact presence manually on disk.
+The following validation uses the `readiness` block in the versions API.
 
 ```bash
 # After placing artifacts and updating manifest:
@@ -173,7 +173,7 @@ curl -sS -X POST "$BASE/hives/$TARGET_HIVE/update" \
    - start.sh is executable
 ```
 
-**Note on current implementation (as of 2026-03-12):** Step 4 (artifact verification during UPDATE) is NOT yet implemented. Today UPDATE only validates manifest version and hash. Artifact presence is checked later during spawn (preflight). This spec defines the target state where UPDATE also verifies artifacts, so that `ok` from UPDATE is a reliable gate for spawn readiness.
+**Implementation status (2026-03-13):** Step 4 (artifact verification during UPDATE) is implemented. UPDATE verifies `start.sh` existence + execute bit for runtimes referenced as `current`, and returns `sync_pending` when artifacts are not ready.
 
 ### 5.4 Responses
 
@@ -453,13 +453,13 @@ Architect                   Worker
 
 ## 9. Current State vs Target State
 
-| Area | Current state (2026-03-12) | Target state (this spec) |
+| Area | Current state (2026-03-13) | Target state (this spec) |
 |------|---------------------------|--------------------------|
-| `GET /versions` readiness | Not implemented. Returns manifest only | Returns manifest + `readiness` per runtime/version with `runtime_present` and `start_sh_executable` |
-| `SYSTEM_UPDATE` artifact check | Not implemented. Only validates manifest version/hash | Also verifies `start.sh` exists and is executable for each current runtime |
-| Version semantics in UPDATE | Exact match or `manifest_version=0`; cualquier mismatch responde `sync_pending` | Mantiene exact match para `==` y `manifest_version=0`; distingue `local > requested` como `status:error` + `error_code=VERSION_MISMATCH` |
-| Executable check in spawn | Checks `is_file` only, not executable bit | Checks both `exists` and `is_executable` |
-| Spawn preflight error detail | Returns `RUNTIME_NOT_PRESENT` (basic) | Returns `RUNTIME_NOT_PRESENT` with runtime, version, expected_path, and hint |
+| `GET /versions` readiness | Implemented. Returns manifest + `readiness` per runtime/version with `runtime_present` and `start_sh_executable` | Same |
+| `SYSTEM_UPDATE` artifact check | Implemented. Verifies `start.sh` exists and is executable for each current runtime | Same |
+| Version semantics in UPDATE | Implemented: `manifest_version=0` bypass; `local < requested` => `sync_pending`; `local > requested` => `status:error` + `error_code=VERSION_MISMATCH` | Same |
+| Executable check in spawn | Implemented. Checks both `exists` and `is_executable` | Same |
+| Spawn preflight error detail | Implemented structured `RUNTIME_NOT_PRESENT` with runtime, version, expected_path, and hint | Same |
 
 ---
 
@@ -467,8 +467,8 @@ Architect                   Worker
 
 ### Phase 1 — Contract Definition
 
-- [ ] FR8-T1. Adopt this document as the canonical runtime lifecycle spec.
-- [ ] FR8-T2. Define flag semantics:
+- [x] FR8-T1. Adopt this document as the canonical runtime lifecycle spec.
+- [x] FR8-T2. Define flag semantics:
   - `runtime_present` = `bin/start.sh` exists at the expected local path.
   - `start_sh_executable` = `bin/start.sh` has execute permission.
   - Both must be `true` for a runtime to be spawn-ready.
@@ -477,7 +477,7 @@ Architect                   Worker
 
 - [x] FR8-T3. Add `readiness` block per runtime/version in `GET /hives/{hive}/versions` response.
 - [x] FR8-T4. Orchestrator checks filesystem for each version when building versions response.
-- [ ] FR8-T5. Maintain manifest visibility regardless of readiness (manifest data always shown, readiness is additional).
+- [x] FR8-T5. Maintain manifest visibility regardless of readiness (manifest data always shown, readiness is additional).
 
 ### Phase 3 — UPDATE Hardening
 
@@ -492,16 +492,18 @@ Architect                   Worker
 
 ### Phase 5 — E2E Validation
 
-- [ ] FR8-T11. E2E case A: runtime in manifest without `start.sh` → versions shows `runtime_present: false`, spawn returns `RUNTIME_NOT_PRESENT`.
-- [ ] FR8-T12. E2E case B: after sync-hint + update → versions shows `runtime_present: true`, spawn succeeds.
+- [x] FR8-T11. E2E case A: runtime in manifest without `start.sh` → versions shows `runtime_present: false`, spawn returns `RUNTIME_NOT_PRESENT`.
+- [x] FR8-T12. E2E case B: after sync-hint + update → versions shows `runtime_present: true`, spawn succeeds.
 - [x] FR8-T13. E2E case C: spawn without prior update → `RUNTIME_NOT_PRESENT` with actionable hint.
 - [x] FR8-T14. E2E case D: UPDATE with missing artifact → responds `sync_pending`, not `ok`.
 - Test script for FR8-T11/T12: `scripts/runtime_lifecycle_fr8_e2e.sh`.
 
 ### Phase 6 — Documentation
 
-- [ ] FR8-T15. Update `07-operaciones.md` with canonical publish → distribute → update → spawn flow.
-- [ ] FR8-T16. Update `14-runtime-rollout-motherbee.md` to reference readiness check in versions.
+- [x] FR8-T15. Update `07-operaciones.md` with canonical publish → distribute → update → spawn flow.
+- [x] FR8-T16. Update `14-runtime-rollout-motherbee.md` to reference readiness check in versions.
+
+**FR-08 closure status (2026-03-13):** all tasks FR8-T1..FR8-T16 completed and validated with E2E coverage (`scripts/runtime_lifecycle_fr8_e2e.sh` + manual checks for T13/T14).
 
 ---
 
