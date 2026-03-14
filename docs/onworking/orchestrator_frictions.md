@@ -268,6 +268,40 @@ Criterio de cierre FR-08:
 
 ---
 
+### FR-10 — Unificar llamadas de identity en orchestrator con helpers del SDK (opción 1)
+
+Estado: OPEN (backlog)
+
+Qué pasa hoy:
+- `SY.orchestrator` usa implementación propia de transporte para `ILK_REGISTER/ILK_UPDATE` (`relay_system_action` + parse/manual errors).
+- El SDK ya expone helpers canónicos de identity (`identity_system_call`, `identity_system_call_ok`), pero orchestrator no los usa.
+
+Decisión acordada (alcance mínimo):
+- Adoptar opción 1: migrar solo el flujo identity de `run_node` a helpers SDK, sin rediseñar loop principal ni refactor global de mensajería.
+- Mantener compatibilidad del contrato externo actual (`IDENTITY_REGISTER_FAILED`, payloads de `run_node`, timeouts observables).
+
+No objetivo en esta etapa:
+- No reemplazar `forward_system_action_to_hive` ni `relay_system_action` para el resto de acciones.
+- No cambiar el modelo de concurrencia del receiver principal de orchestrator.
+
+Lista de tareas FR-10 (backlog):
+- [ ] FR10-T1. Extraer un wrapper local en orchestrator para crear `NodeSender/NodeReceiver` de relay y ejecutar una llamada identity SDK dentro de ese contexto.
+- [ ] FR10-T2. Migrar `ensure_node_identity_registered` para usar `fluxbee_sdk::identity::identity_system_call_ok` con `MSG_ILK_REGISTER`.
+- [ ] FR10-T3. Migrar `apply_node_identity_update` para usar `fluxbee_sdk::identity::identity_system_call_ok` con `MSG_ILK_UPDATE`.
+- [ ] FR10-T4. Mapear `IdentityError -> OrchestratorError` preservando códigos/mensajes ya consumidos por admin/E2E.
+- [ ] FR10-T5. Mantener `identity_target` explícito (`SY.identity@motherbee`) en payload de respuesta para no romper diagnósticos actuales.
+- [ ] FR10-T6. Si aparece lógica identity reusable que hoy está duplicada en orchestrator, subirla al SDK (sin mover reglas de negocio de orchestrator).
+- [ ] FR10-T7. Unit tests en orchestrator para mapeo de error y paths `ok/error` de registro/actualización identity.
+- [ ] FR10-T8. Re-ejecutar regresión E2E mínima: `identity_register_strict_e2e.sh` + `inventory_identity_primary_routing_e2e.sh`.
+- [ ] FR10-T9. Actualizar docs de implementación (`10-identity-v2.md` + este doc) indicando que orchestrator usa helper SDK para identity calls.
+
+Criterio de cierre FR-10:
+- No hay envío manual de `ILK_REGISTER/ILK_UPDATE` en orchestrator fuera del wrapper de transición.
+- E2E FR-02 + D4/D5 siguen en verde sin cambios de contrato externo.
+- Lógica reusable de llamada identity queda centralizada en SDK.
+
+---
+
 ## 3) Decisiones pendientes (para discutir)
 
 ### D-01 (identity primary)
@@ -318,7 +352,8 @@ Estado: CERRADA
 
 1. FR-07 (status schema común).
 2. FR-04 (ON HOLD hasta cerrar spec cognitive de L3/CTX; avanzar solo tareas preparatorias de contrato).
-3. INV-D3 (stale inventory) cuando exista trigger canónico desde API admin.
+3. FR-10 (migración acotada de identity calls a SDK, opción 1).
+4. INV-D3 (stale inventory) cuando exista trigger canónico desde API admin.
 
 ---
 
@@ -343,6 +378,7 @@ Estado: CERRADA
 | 2026-03-13 | FR-03 cierre E2E | `inventory_node_name_cross_hive_e2e.sh` valida precedencia de `node_name@hive` en spawn+kill contra endpoint cruzado | core | cerrado |
 | 2026-03-13 | FR-03 validación estricta | FR-03 pasa en modo estricto (`REQUIRE_INVENTORY_PRESENT=1`) con fixture `prepare-only` y `runtime_version` dedicada por caso | core | cerrado |
 | 2026-03-13 | FR-08 cierre integral | Readiness en `versions`, hardening de `update/spawn`, E2E T11..T14 y docs operativas alineadas | core | cerrado |
+| 2026-03-14 | FR-10 decisión técnica | Se adopta migración opción 1: orchestrator pasa llamadas identity (`ILK_REGISTER/ILK_UPDATE`) a helper SDK, sin refactor global de mensajería | core | abierto |
 
 ---
 
