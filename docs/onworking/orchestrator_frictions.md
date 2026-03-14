@@ -211,7 +211,7 @@ Qué pasa hoy:
 - Hay respuestas ad-hoc por acción/servicio.
 
 Lista de tareas FR-07:
-- [ ] FR7-T1. Definir contrato canónico de `STATUS_RESPONSE` en protocolo (campos mínimos obligatorios + extensiones).
+- [x] FR7-T1. Definir contrato canónico de `STATUS_RESPONSE` en protocolo (campos mínimos obligatorios + extensiones).
 - [ ] FR7-T2. Definir enum `lifecycle_state`: `STARTING|RUNNING|STOPPING|STOPPED|FAILED|UNKNOWN`.
 - [ ] FR7-T3. Definir enum `health_state`: `HEALTHY|DEGRADED|ERROR|UNKNOWN`.
 - [ ] FR7-T4. Definir enum `health_source`: `NODE_REPORTED|ORCHESTRATOR_INFERRED|UNKNOWN`.
@@ -232,6 +232,7 @@ Implementado en esta etapa (2026-03-14):
 - Payload base con `lifecycle_state`, `health_state`, `health_source`, `status_version` y bloques `config/state/process/runtime/identity`.
 - Precedencia de health implementada: `NODE_REPORTED` (si responde en <=2s) y fallback inferido en timeout/unreachable.
 - SDK helper default: `fluxbee_sdk::try_handle_default_node_status` (opt-out con `NODE_STATUS_DEFAULT_HANDLER_ENABLED=0`).
+- Alineación de shape con spec: `observed_at` ISO-8601 UTC, `process.{pid,exit_code,restart_count,started_at}` y `config.updated_at` ISO-8601.
 
 Criterio de cierre FR-07:
 - Existe un payload canónico de status consumible por UI/operación sin parsing ad-hoc por runtime.

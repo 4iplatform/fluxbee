@@ -27,3 +27,4 @@ regex = "1.10"
 tar = "0.4"
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

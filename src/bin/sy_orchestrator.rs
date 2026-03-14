@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use chrono::{SecondsFormat, TimeZone, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -6757,6 +6758,52 @@ fn systemd_unit_is_failed(unit: &str) -> Result<bool, OrchestratorError> {
     Ok(status.success())
 }
 
+fn epoch_ms_to_iso_utc(epoch_ms: u64) -> Option<String> {
+    let secs = (epoch_ms / 1000) as i64;
+    let nanos = ((epoch_ms % 1000) * 1_000_000) as u32;
+    let ts = Utc.timestamp_opt(secs, nanos).single()?;
+    Some(ts.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+fn parse_systemd_u64(value: Option<&String>) -> Option<u64> {
+    value
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| raw.parse::<u64>().ok())
+}
+
+fn parse_systemd_i32(value: Option<&String>) -> Option<i32> {
+    value
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| raw.parse::<i32>().ok())
+}
+
+fn systemd_unit_show(unit: &str, properties: &[&str]) -> HashMap<String, String> {
+    if properties.is_empty() {
+        return HashMap::new();
+    }
+    let property_arg = format!("--property={}", properties.join(","));
+    let output = Command::new("systemctl")
+        .arg("show")
+        .arg(unit)
+        .arg(property_arg)
+        .output();
+    let Ok(output) = output else {
+        return HashMap::new();
+    };
+    if !output.status.success() {
+        return HashMap::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect()
+}
+
 fn normalize_reported_health_state(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_uppercase().as_str() {
         "HEALTHY" => Some("HEALTHY"),
@@ -6888,11 +6935,11 @@ async fn get_node_status_flow(
     let mut config_valid = false;
     let mut config_version: Option<u64> = None;
     let mut config_updated_at_ms: Option<u64> = None;
+    let mut runtime_requested_version: Option<String> = None;
     let mut runtime_name: Option<String> = None;
     let mut runtime_version: Option<String> = None;
     let mut identity_ilk_id: Option<String> = None;
     let mut identity_tenant_id: Option<String> = None;
-    let mut config_read_error: Option<String> = None;
     if config_exists {
         match load_node_effective_config(&config_path) {
             Ok(config_payload) => {
@@ -6900,6 +6947,11 @@ async fn get_node_status_flow(
                 config_version = Some(config_version_from_value(&config_payload));
                 if let Some(system) = config_payload.get("_system").and_then(|v| v.as_object()) {
                     config_updated_at_ms = system.get("updated_at_ms").and_then(|v| v.as_u64());
+                    runtime_requested_version = system
+                        .get("requested_runtime_version")
+                        .or_else(|| system.get("requested_version"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
                     runtime_name = system
                         .get("runtime")
                         .and_then(|v| v.as_str())
@@ -6925,13 +6977,16 @@ async fn get_node_status_flow(
                 }
             }
             Err(err) => {
-                config_read_error = Some(err.to_string());
+                tracing::debug!(
+                    node_name = node_name,
+                    error = %err,
+                    "unable to parse node config while building status"
+                );
             }
         }
     }
 
     let mut state_payload: Option<serde_json::Value> = None;
-    let mut state_read_error: Option<String> = None;
     if state_exists {
         match fs::read_to_string(&state_path)
             .map_err(|err| err.to_string())
@@ -6942,7 +6997,11 @@ async fn get_node_status_flow(
                 state_payload = Some(value);
             }
             Err(err) => {
-                state_read_error = Some(err);
+                tracing::debug!(
+                    node_name = node_name,
+                    error = %err,
+                    "unable to parse node state while building status"
+                );
             }
         }
     }
@@ -7028,16 +7087,48 @@ async fn get_node_status_flow(
         }
     }
 
+    let systemd_props = systemd_unit_show(
+        &unit,
+        &[
+            "MainPID",
+            "ExecMainStatus",
+            "NRestarts",
+            "ActiveEnterTimestampUSec",
+        ],
+    );
+    let process_pid = parse_systemd_u64(systemd_props.get("MainPID")).filter(|value| *value > 0);
+    let process_exit_code = parse_systemd_i32(systemd_props.get("ExecMainStatus"));
+    let process_restart_count = parse_systemd_u64(systemd_props.get("NRestarts"));
+    let process_started_at = parse_systemd_u64(systemd_props.get("ActiveEnterTimestampUSec"))
+        .and_then(|usec| {
+            if usec == 0 {
+                None
+            } else {
+                epoch_ms_to_iso_utc(usec / 1000)
+            }
+        });
+    let observed_at_ms = now_epoch_ms();
+    let observed_at = epoch_ms_to_iso_utc(observed_at_ms)
+        .unwrap_or_else(|| observed_at_ms.to_string());
+    let config_updated_at = config_updated_at_ms
+        .and_then(epoch_ms_to_iso_utc)
+        .or_else(|| config_updated_at_ms.map(|value| value.to_string()));
+
     let status_fingerprint = serde_json::json!({
         "lifecycle_state": lifecycle_state,
         "health_state": health_state,
         "health_source": health_source,
+        "runtime_requested_version": runtime_requested_version.clone(),
         "runtime_name": runtime_name.clone(),
         "runtime_version": runtime_version.clone(),
         "config_exists": config_exists,
         "config_valid": config_valid,
         "config_version": config_version,
         "state_exists": state_exists,
+        "process_pid": process_pid,
+        "process_exit_code": process_exit_code,
+        "process_restart_count": process_restart_count,
+        "process_started_at": process_started_at.clone(),
         "identity_ilk_id": identity_ilk_id.clone(),
         "identity_tenant_id": identity_tenant_id.clone(),
         "last_error": last_error.clone(),
@@ -7053,34 +7144,33 @@ async fn get_node_status_flow(
             1
         }
     };
-    let observed_at_ms = now_epoch_ms();
     let mut node_status = serde_json::json!({
         "schema_version": NODE_STATUS_SCHEMA_VERSION,
         "node_name": node_name,
         "hive_id": target_hive,
-        "observed_at": observed_at_ms.to_string(),
-        "observed_at_ms": observed_at_ms,
+        "observed_at": observed_at,
         "lifecycle_state": lifecycle_state,
         "health_state": health_state,
         "health_source": health_source,
         "status_version": status_version,
         "runtime": {
             "name": runtime_name,
-            "requested_version": serde_json::Value::Null,
+            "requested_version": runtime_requested_version,
             "resolved_version": runtime_version,
         },
         "process": {
             "unit": unit,
-            "systemd_active": unit_active,
-            "systemd_failed": unit_failed,
-            "inventory_visible": inventory_visible,
+            "pid": process_pid,
+            "exit_code": process_exit_code,
+            "restart_count": process_restart_count,
+            "started_at": process_started_at,
         },
         "config": {
             "path": config_path.display().to_string(),
             "exists": config_exists,
             "valid": config_valid,
             "config_version": config_version,
-            "updated_at_ms": config_updated_at_ms,
+            "updated_at": config_updated_at,
         },
         "state": {
             "path": state_path.display().to_string(),
@@ -7091,12 +7181,6 @@ async fn get_node_status_flow(
             "tenant_id": identity_tenant_id,
         },
     });
-    if let Some(err) = config_read_error {
-        node_status["config"]["read_error"] = serde_json::json!(err);
-    }
-    if let Some(err) = state_read_error {
-        node_status["state"]["read_error"] = serde_json::json!(err);
-    }
     if let Some(value) = last_error {
         node_status["last_error"] = value;
     }

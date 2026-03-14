@@ -451,7 +451,7 @@ When a node cannot operate correctly:
 
 ## 12. Implementation Tasks (FR-07)
 
-- [ ] FR7-T1. Implement `node_status` schema in orchestrator (this document).
+- [x] FR7-T1. Implement `node_status` schema in orchestrator (this document).
 - [x] FR7-T2. Implement `GET /hives/{hive}/nodes/{node_name}/status` in SY.admin.
 - [x] FR7-T3. Implement `get_node_status` forward from orchestrator to node with 2s timeout.
 - [x] FR7-T4. Implement health inference (section 3.4) for non-responsive or handler-less nodes.
