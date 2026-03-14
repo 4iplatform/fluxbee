@@ -206,6 +206,84 @@ wait_update_ok() {
   return 1
 }
 
+runtime_current_ready_in_versions() {
+  local runtime="$1"
+  local file="$2"
+  python3 - "$runtime" "$file" <<'PY'
+import json
+import sys
+
+runtime = sys.argv[1]
+file_path = sys.argv[2]
+try:
+    with open(file_path, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+except Exception:
+    raise SystemExit(2)
+
+entry = (
+    doc.get("payload", {})
+       .get("hive", {})
+       .get("runtimes", {})
+       .get("runtimes", {})
+       .get(runtime)
+)
+if not isinstance(entry, dict):
+    raise SystemExit(1)
+current = entry.get("current")
+readiness = entry.get("readiness", {})
+if not isinstance(current, str) or not isinstance(readiness, dict):
+    raise SystemExit(1)
+status = readiness.get(current)
+if not isinstance(status, dict):
+    raise SystemExit(1)
+runtime_present = bool(status.get("runtime_present"))
+start_sh_executable = bool(status.get("start_sh_executable"))
+raise SystemExit(0 if (runtime_present and start_sh_executable) else 1)
+PY
+}
+
+wait_update_or_runtime_ready() {
+  local manifest_version="$1"
+  local manifest_hash="$2"
+  local runtime="$3"
+  local update_out_file="$4"
+  local versions_out_file="$5"
+  local deadline=$(( $(date +%s) + WAIT_UPDATE_SECS ))
+
+  while (( $(date +%s) <= deadline )); do
+    local payload_status error_code error_detail versions_http
+    post_runtime_update "$manifest_version" "$manifest_hash" "$update_out_file" >/dev/null
+    payload_status="$(json_get_file "payload.status" "$update_out_file")"
+    if [[ "$payload_status" == "ok" ]]; then
+      UPDATE_GATE_RESULT="ok"
+      return 0
+    fi
+    if [[ "$payload_status" == "sync_pending" ]]; then
+      versions_http="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$versions_out_file")"
+      if [[ "$versions_http" == "200" ]] && runtime_current_ready_in_versions "$runtime" "$versions_out_file"; then
+        UPDATE_GATE_RESULT="runtime_ready_only"
+        echo "WARN: update stayed sync_pending due unrelated runtime artifacts; continuing because '$runtime' current is ready in /versions." >&2
+        return 0
+      fi
+      sleep 2
+      continue
+    fi
+    error_code="$(json_get_file "error_code" "$update_out_file")"
+    error_detail="$(json_get_file "error_detail" "$update_out_file")"
+    if [[ "$error_code" == "TRANSPORT_ERROR" && "$error_detail" == *"UNREACHABLE"* ]]; then
+      sleep 2
+      continue
+    fi
+    echo "FAIL: update runtime status='$payload_status'" >&2
+    cat "$update_out_file" >&2 || true
+    return 1
+  done
+  echo "FAIL: update runtime timeout waiting ok/runtime-ready gate" >&2
+  cat "$update_out_file" >&2 || true
+  return 1
+}
+
 write_runtime_start_sh() {
   local start_path="$1"
   local node_name="$2"
@@ -396,7 +474,8 @@ fi
 
 echo "Step 4/12: SYSTEM_SYNC_HINT dist + SYSTEM_UPDATE runtime"
 wait_sync_hint_ok "$sync_hint_body"
-wait_update_ok "$manifest_version" "$manifest_hash" "$update_body"
+UPDATE_GATE_RESULT="unknown"
+wait_update_or_runtime_ready "$manifest_version" "$manifest_hash" "$RUNTIME_STABLE" "$update_body" "$versions_body"
 
 echo "Step 5/12: validate runtime presence in versions"
 versions_http="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$versions_body")"
@@ -407,6 +486,11 @@ if [[ "$versions_http" != "200" ]]; then
 fi
 if ! runtime_exists_in_manifest "$RUNTIME_STABLE" "$versions_body"; then
   echo "FAIL: runtime '$RUNTIME_STABLE' missing in /hives/$HIVE_ID/versions" >&2
+  cat "$versions_body" >&2 || true
+  exit 1
+fi
+if ! runtime_current_ready_in_versions "$RUNTIME_STABLE" "$versions_body"; then
+  echo "FAIL: runtime '$RUNTIME_STABLE' current version is not ready (runtime_present/start_sh_executable)" >&2
   cat "$versions_body" >&2 || true
   exit 1
 fi
@@ -467,6 +551,7 @@ echo "Step 12/12: summary"
 echo "status=ok"
 echo "hive_id=$HIVE_ID"
 echo "runtime_stable=$RUNTIME_STABLE@$RUNTIME_VERSION"
+echo "update_gate_result=$UPDATE_GATE_RESULT"
 echo "node_failed=$NODE_FAILED@$HIVE_ID"
 echo "node_monotonic=$NODE_MONO@$HIVE_ID"
 echo "status_version_before=$status_version_before"
