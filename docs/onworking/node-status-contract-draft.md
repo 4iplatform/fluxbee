@@ -457,12 +457,12 @@ When a node cannot operate correctly:
 - [x] FR7-T4. Implement health inference (section 3.4) for non-responsive or handler-less nodes.
 - [x] FR7-T5. Implement `status_version` persistence in `/var/lib/fluxbee/nodes/{TYPE}/{node_name}/status_version`.
 - [x] FR7-T6. Add `get_node_status` default handler to `fluxbee_sdk`.
-- [ ] FR7-T7. E2E: node RUNNING + HEALTHY → full status response with node-reported health. (`scripts/node_status_fr7_e2e.sh`)
-- [ ] FR7-T8. E2E: node STOPPED → lifecycle=STOPPED, health=UNKNOWN. (`scripts/node_status_fr7_e2e.sh`)
-- [ ] FR7-T9. E2E: node RUNNING but unresponsive → lifecycle=RUNNING, health inferred (HEALTHY if config valid, no errors). (`scripts/node_status_fr7_e2e.sh`)
-- [ ] FR7-T10. E2E: node with invalid config → config.valid=false, node reports health=ERROR. (`scripts/node_status_fr7_e2e.sh`)
-- [ ] FR7-T11. E2E: FAILED node (crash) → lifecycle=FAILED, health=UNKNOWN.
-- [ ] FR7-T12. E2E: status_version survives orchestrator restart (monotonic across restarts).
+- [x] FR7-T7. E2E: node RUNNING + HEALTHY → full status response with node-reported health. (`scripts/node_status_fr7_e2e.sh`)
+- [x] FR7-T8. E2E: node STOPPED → lifecycle=STOPPED, health=UNKNOWN. (`scripts/node_status_fr7_e2e.sh`)
+- [x] FR7-T9. E2E: node RUNNING but unresponsive → lifecycle=RUNNING, health inferred (HEALTHY if config valid, no errors). (`scripts/node_status_fr7_e2e.sh`)
+- [x] FR7-T10. E2E: node with invalid config → config.valid=false, node reports health=ERROR. (`scripts/node_status_fr7_e2e.sh`, validated with `t10_mode=full` on `motherbee`)
+- [ ] FR7-T11. E2E: FAILED node (crash) → lifecycle=FAILED, health=UNKNOWN. (`scripts/node_status_fr7_t11_t12_e2e.sh`)
+- [ ] FR7-T12. E2E: status_version survives orchestrator restart (monotonic across restarts). (`scripts/node_status_fr7_t11_t12_e2e.sh`)
 
 ---
 

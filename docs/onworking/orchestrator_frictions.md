@@ -207,8 +207,8 @@ Criterio de cierre FR-06:
 Estado: IN PROGRESS (prioridad media-baja)
 
 Qué pasa hoy:
-- No existe contrato de mensaje canónico de status de nodo en protocolo core para `lifecycle_state + health_state + health_source`.
-- Hay respuestas ad-hoc por acción/servicio.
+- Ya existe un contrato operativo en borrador (`docs/onworking/node-status-contract-draft.md`) y un payload canónico implementado en orchestrator/admin.
+- Falta consolidar la parte documental final en specs canónicas (`02-protocolo.md`, `07-operaciones.md`) y cerrar E2E restantes (T11/T12).
 
 Lista de tareas FR-07:
 - [x] FR7-T1. Definir contrato canónico de `STATUS_RESPONSE` en protocolo (campos mínimos obligatorios + extensiones).
@@ -220,7 +220,7 @@ Lista de tareas FR-07:
 - [x] FR7-T7. Exponer endpoint admin estable para status por nodo/hive (sin romper endpoints existentes).
 - [x] FR7-T8. Incluir estado de config/state ownership (presencia de `config.json` / `state.json`) en status estandarizado.
 - [x] FR7-T9. Definir precedencia de health en la respuesta final (`NODE_REPORTED` primero, fallback inferido en timeout).
-- [ ] FR7-T10. E2E de status (node reportado, timeout con inferencia, nodo detenido). (`scripts/node_status_fr7_e2e.sh`)
+- [x] FR7-T10. E2E de status (node reportado, timeout con inferencia, nodo detenido + caso config inválida en local). (`scripts/node_status_fr7_e2e.sh`)
 - [ ] FR7-T11. Actualizar docs (`02-protocolo.md`, `07-operaciones.md`) y runbooks de troubleshooting.
 
 Borrador inicial para discusión:
@@ -233,6 +233,8 @@ Implementado en esta etapa (2026-03-14):
 - Precedencia de health implementada: `NODE_REPORTED` (si responde en <=2s) y fallback inferido en timeout/unreachable.
 - SDK helper default: `fluxbee_sdk::try_handle_default_node_status` (opt-out con `NODE_STATUS_DEFAULT_HANDLER_ENABLED=0`).
 - Alineación de shape con spec: `observed_at` ISO-8601 UTC, `process.{pid,exit_code,restart_count,started_at}` y `config.updated_at` ISO-8601.
+- E2E FR7 T7/T8/T9/T10 en verde; validación T10 full confirmada en `motherbee` (`t10_mode=full`).
+- Script dedicado agregado para pendientes T11/T12: `scripts/node_status_fr7_t11_t12_e2e.sh` (pendiente corrida y cierre).
 
 Criterio de cierre FR-07:
 - Existe un payload canónico de status consumible por UI/operación sin parsing ad-hoc por runtime.
