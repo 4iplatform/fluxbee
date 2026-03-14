@@ -8,6 +8,7 @@ TENANT_ID="${TENANT_ID:-}"
 TEST_ID="${TEST_ID:-fr7t1112-$(date +%s)-${RANDOM}}"
 RUNTIME_VERSION="${RUNTIME_VERSION:-diag-fr7-t1112-${TEST_ID}}"
 RUNTIME_STABLE="${RUNTIME_STABLE:-wf.node.status.stable.diag}"
+RUNTIME_CRASH="${RUNTIME_CRASH:-wf.node.status.crash.diag}"
 NODE_FAILED="${NODE_FAILED:-WF.status.failed.${TEST_ID}}"
 NODE_MONO="${NODE_MONO:-WF.status.monotonic.${TEST_ID}}"
 STATUS_TIMEOUT_SECS="${STATUS_TIMEOUT_SECS:-45}"
@@ -404,7 +405,7 @@ if [[ "$HIVE_ID" != "$LOCAL_HIVE_ID" ]]; then
   exit 1
 fi
 
-echo "FR7 T11/T12 E2E: BASE=$BASE HIVE_ID=$HIVE_ID LOCAL_HIVE_ID=$LOCAL_HIVE_ID RUNTIME_STABLE=$RUNTIME_STABLE VERSION=$RUNTIME_VERSION"
+echo "FR7 T11/T12 E2E: BASE=$BASE HIVE_ID=$HIVE_ID LOCAL_HIVE_ID=$LOCAL_HIVE_ID RUNTIME_STABLE=$RUNTIME_STABLE RUNTIME_CRASH=$RUNTIME_CRASH VERSION=$RUNTIME_VERSION"
 
 echo "Step 1/12: build inventory_hold_diag (status-aware)"
 if [[ "$BUILD_BIN" == "1" || ! -x "$BIN_PATH" ]]; then
@@ -416,17 +417,24 @@ if [[ ! -x "$BIN_PATH" ]]; then
   exit 1
 fi
 
-echo "Step 2/12: create runtime fixture for stable status node"
+echo "Step 2/12: create runtime fixtures (stable + crash)"
 stable_bin_dir="$DIST_RUNTIMES_ROOT/$RUNTIME_STABLE/$RUNTIME_VERSION/bin"
-as_root_local mkdir -p "$stable_bin_dir"
+crash_bin_dir="$DIST_RUNTIMES_ROOT/$RUNTIME_CRASH/$RUNTIME_VERSION/bin"
+as_root_local mkdir -p "$stable_bin_dir" "$crash_bin_dir"
 as_root_local install -m 0755 "$BIN_PATH" "$stable_bin_dir/inventory_hold_diag"
 stable_start="$tmpdir/stable_start.sh"
 write_runtime_start_sh "$stable_start" "$NODE_MONO"
 as_root_local install -m 0755 "$stable_start" "$stable_bin_dir/start.sh"
+cat >"$tmpdir/crash_start.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exit 42
+EOF
+as_root_local install -m 0755 "$tmpdir/crash_start.sh" "$crash_bin_dir/start.sh"
 
 echo "Step 3/12: update runtime manifest"
 manifest_tmp="$tmpdir/manifest.json"
-as_root_local python3 - "$MANIFEST_PATH" "$RUNTIME_STABLE" "$RUNTIME_VERSION" >"$manifest_tmp" <<'PY'
+as_root_local python3 - "$MANIFEST_PATH" "$RUNTIME_STABLE" "$RUNTIME_CRASH" "$RUNTIME_VERSION" >"$manifest_tmp" <<'PY'
 import json
 import pathlib
 import sys
@@ -434,7 +442,8 @@ import time
 
 manifest_path = pathlib.Path(sys.argv[1])
 runtime_name = sys.argv[2]
-runtime_version = sys.argv[3]
+crash_runtime_name = sys.argv[3]
+runtime_version = sys.argv[4]
 
 doc = {"schema_version": 1, "version": 0, "updated_at": None, "runtimes": {}}
 if manifest_path.exists():
@@ -454,18 +463,19 @@ if not isinstance(runtimes, dict):
     runtimes = {}
 doc["runtimes"] = runtimes
 
-entry = runtimes.get(runtime_name)
-if not isinstance(entry, dict):
-    entry = {}
-available = entry.get("available")
-if not isinstance(available, list):
-    available = []
-available = [str(v).strip() for v in available if str(v).strip()]
-if runtime_version not in available:
-    available.append(runtime_version)
-entry["available"] = sorted(set(available))
-entry["current"] = runtime_version
-runtimes[runtime_name] = entry
+for name in (runtime_name, crash_runtime_name):
+    entry = runtimes.get(name)
+    if not isinstance(entry, dict):
+        entry = {}
+    available = entry.get("available")
+    if not isinstance(available, list):
+        available = []
+    available = [str(v).strip() for v in available if str(v).strip()]
+    if runtime_version not in available:
+        available.append(runtime_version)
+    entry["available"] = sorted(set(available))
+    entry["current"] = runtime_version
+    runtimes[name] = entry
 
 print(json.dumps(doc, indent=2, sort_keys=True))
 PY
@@ -505,10 +515,30 @@ if ! runtime_current_ready_in_versions "$RUNTIME_STABLE" "$versions_body"; then
   cat "$versions_body" >&2 || true
   exit 1
 fi
+if ! runtime_exists_in_manifest "$RUNTIME_CRASH" "$versions_body"; then
+  echo "FAIL: runtime '$RUNTIME_CRASH' missing in /hives/$HIVE_ID/versions" >&2
+  cat "$versions_body" >&2 || true
+  exit 1
+fi
+if ! runtime_current_ready_in_versions "$RUNTIME_CRASH" "$versions_body"; then
+  echo "FAIL: runtime '$RUNTIME_CRASH' current version is not ready (runtime_present/start_sh_executable)" >&2
+  cat "$versions_body" >&2 || true
+  exit 1
+fi
 
-echo "Step 6/12: spawn node and force crash to validate FAILED/UNKNOWN (T11)"
+echo "Step 6/12: spawn crash node and validate FAILED/UNKNOWN (T11)"
 http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_FAILED" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
-spawn_node "$NODE_FAILED" "$spawn_failed_body"
+if [[ -n "$TENANT_ID" ]]; then
+  failed_payload="$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"current","tenant_id":"%s"}' "$NODE_FAILED" "$RUNTIME_CRASH" "$TENANT_ID")"
+else
+  failed_payload="$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"current"}' "$NODE_FAILED" "$RUNTIME_CRASH")"
+fi
+failed_http="$(http_call "POST" "$BASE/hives/$HIVE_ID/nodes" "$spawn_failed_body" "$failed_payload")"
+if [[ "$failed_http" != "200" || "$(json_get_file "status" "$spawn_failed_body")" != "ok" ]]; then
+  echo "FAIL: spawn failed node='$NODE_FAILED' http=$failed_http" >&2
+  cat "$spawn_failed_body" >&2 || true
+  exit 1
+fi
 failed_unit="$(json_get_file "payload.unit" "$spawn_failed_body")"
 if [[ -z "$failed_unit" ]]; then
   echo "FAIL: missing payload.unit for failed-node scenario" >&2
@@ -531,7 +561,7 @@ if ! as_root_local systemctl daemon-reload >/dev/null 2>&1; then
   echo "FAIL: unable to daemon-reload after override for unit '$failed_unit'" >&2
   exit 1
 fi
-as_root_local systemctl kill -s SIGKILL "$failed_unit" >/dev/null 2>&1 || true
+as_root_local systemctl restart "$failed_unit" >/dev/null 2>&1 || true
 wait_node_status "$NODE_FAILED" "FAILED" "UNKNOWN" "UNKNOWN" "$status_failed_body"
 
 echo "Step 7/12: spawn healthy node for status_version monotonic check (T12)"
@@ -574,6 +604,7 @@ echo "Step 12/12: summary"
 echo "status=ok"
 echo "hive_id=$HIVE_ID"
 echo "runtime_stable=$RUNTIME_STABLE@$RUNTIME_VERSION"
+echo "runtime_crash=$RUNTIME_CRASH@$RUNTIME_VERSION"
 echo "update_gate_result=$UPDATE_GATE_RESULT"
 echo "node_failed=$NODE_FAILED@$HIVE_ID"
 echo "node_monotonic=$NODE_MONO@$HIVE_ID"
