@@ -1,121 +1,60 @@
-# SY.admin Internal Command Gateway
+# SY.admin Internal Command Gateway (Unified Spec)
 
-**Status:** v1.0
-**Date:** 2026-03-14
-**Audience:** Developers implementing SY.admin, internal callers (AI/WF/IO nodes), SDK
-**Parent specs:** `02-protocolo.md`, `07-operaciones.md`
+**Status:** v1.2-draft  
+**Date:** 2026-03-14  
+**Audience:** Developers implementing `SY.admin`, internal callers (`AI/WF/IO`), SDK  
+**Parent specs:** `docs/02-protocolo.md`, `docs/07-operaciones.md`
 
 ---
 
 ## 1. Purpose
 
-Enable internal nodes to invoke any SY.admin function via socket/WAN messages, with the same behavior as HTTP. SY.admin remains the single gateway for all control operations — internal callers do not bypass it to reach SY.orchestrator or other SY nodes directly.
+Definir un único modelo para que `SY.admin` reciba comandos por:
+
+1. HTTP (externo)
+2. socket/WAN (`ADMIN_COMMAND`, interno)
+
+con ejecución equivalente y transparente: mismo resultado funcional, diferente envelope de transporte.
 
 ---
 
-## 2. Design Decisions
+## 2. Scope and ownership
 
-1. **SY.admin is the only control gateway.** Both HTTP (external) and socket (internal) enter through the same dispatcher. No fork in logic, no separate code paths.
+### 2.1 In scope
 
-2. **Every HTTP function is automatically available via socket.** There is no manual catalog of "allowed internal actions." When a new endpoint is added to admin's HTTP handler, it is immediately callable via ADMIN_COMMAND using the same action name and payload shape. The implementation reuses the same internal dispatch function for both entry points.
+- Gateway de comandos de control en `SY.admin`
+- Paridad HTTP/socket
+- Routing por `target` + precedencia `node_name@hive`
+- Inventory por canal interno
+- Cobertura de comandos actuales y futuros con registry + CI guard
 
-3. **No ACL for internal commands (v1).** If a message arrives via socket with `msg: ADMIN_COMMAND`, it is accepted and processed. Security hardening with origin/action matrix is deferred.
+### 2.2 Out of scope
 
-4. **Monocommand execution.** Admin processes one command at a time, regardless of entry channel. If a command is in progress (HTTP or socket), the next one waits in queue. This simplifies concurrency and avoids race conditions in orchestrator dispatch.
+- `identity` en `SY.admin`
 
-5. **request_id is correlation only.** No persistence, no idempotency enforcement, no deduplication. The caller sends a `request_id`, admin echoes it back in the response for the caller to match. Logging and persistence are deferred.
+Ownership de identity:
+- `SY.orchestrator`: ILK de nodos (spawn)
+- `AI.frontdesk`: ILK de humanos
 
-6. **No bypass in production.** Direct messaging to SY.orchestrator remains restricted to controlled tooling and E2E tests. The recommended path for any productive operation is always through SY.admin.
-
----
-
-## 3. Architecture
-
-### 3.1 External Flow (Unchanged)
-
-```
-HTTP client
-  → SY.admin HTTP handler
-  → parse action + params
-  → dispatch(action, params)        ← shared dispatcher
-  → executor (SY.orchestrator, SY.identity, etc.)
-  → HTTP response
-```
-
-### 3.2 Internal Flow (New)
-
-```
-Internal node (AI/WF/IO)
-  → ADMIN_COMMAND message to SY.admin@motherbee
-  → SY.admin message handler
-  → parse action + params from payload
-  → dispatch(action, params)        ← same shared dispatcher
-  → executor (SY.orchestrator, SY.identity, etc.)
-  → ADMIN_COMMAND_RESPONSE message back to caller
-```
-
-### 3.3 Shared Dispatcher
-
-The key implementation requirement: both HTTP and socket entry points call the same `dispatch(action, params)` function. This function contains all validation, normalization, routing to executors, timeout handling, and response formatting.
-
-```rust
-// Pseudocode — both entry points converge here
-async fn dispatch(action: &str, hive_id: Option<&str>, params: Value) -> AdminResult {
-    // validate action exists
-    // normalize params (same rules as HTTP)
-    // acquire command lock (monocommand)
-    // route to executor
-    // wait for response with timeout
-    // release lock
-    // return result
-}
-
-// HTTP entry point
-async fn handle_http(req: HttpRequest) -> HttpResponse {
-    let action = extract_action(&req);
-    let params = extract_params(&req);
-    let hive_id = extract_hive_id(&req);
-    let result = dispatch(&action, hive_id.as_deref(), params).await;
-    to_http_response(result)
-}
-
-// Socket entry point
-async fn handle_admin_command(msg: Message) -> Message {
-    let action = msg.payload["action"].as_str();
-    let params = msg.payload["params"].clone();
-    let hive_id = msg.payload["hive_id"].as_str();
-    let result = dispatch(action, hive_id, params).await;
-    to_admin_command_response(result, &msg)
-}
-```
-
-### 3.4 Invariant
-
-For the same `action` and equivalent `params`, the functional result is identical regardless of entry channel (HTTP or socket). Only transport metadata differs (HTTP status codes vs message envelope).
+`SY.admin` no define endpoints/acciones identity en este diseño.
 
 ---
 
-## 4. Monocommand Execution
+## 3. Hard design rules
 
-Admin processes one command at a time. This applies globally across both channels.
-
-```rust
-// Single command lock
-let _guard = self.command_lock.lock().await;
-// Only one command executes at a time
-let result = dispatch(action, hive_id, params).await;
-// Lock released when _guard drops
-```
-
-If a second command arrives (HTTP or socket) while one is in progress, it waits for the lock. The caller experiences this as latency, not as an error.
-
-**Timeout:** Each action has a maximum execution time (same as HTTP timeouts). If the executor does not respond within the timeout, admin returns `error` with `error_code: TIMEOUT` and releases the lock.
+1. `SY.admin` es el único gateway de control (HTTP + socket).
+2. No bypass productivo a `SY.orchestrator`.
+3. Canónico de destino interno: `payload.target`.
+4. `hive_id` no se usa como selector de destino en comandos internos nuevos.
+5. Excepción de `hive_id`: solo acciones de dominio de hive (`add_hive/get_hive/remove_hive`).
+6. Precedencia dura: `node_name@hive` manda sobre `target`.
+7. Monocommand bloqueante global (HTTP + socket comparten lock).
 
 ---
 
-## 5. Message Contract
+## 4. Message contract
 
-### 5.1 ADMIN_COMMAND (Request)
+### 4.1 Request (`ADMIN_COMMAND`)
 
 ```json
 {
@@ -127,46 +66,32 @@ If a second command arrives (HTTP or socket) while one is in progress, it waits 
   },
   "meta": {
     "type": "admin",
-    "msg": "ADMIN_COMMAND"
+    "msg": "ADMIN_COMMAND",
+    "target": "SY.admin@motherbee"
   },
   "payload": {
     "action": "run_node",
-    "hive_id": "worker-220",
+    "target": "worker-220",
     "params": {
-      "node_name": "AI.soporte.l1",
-      "runtime": "ai.soporte",
-      "runtime_version": "current",
-      "config": {
-        "api_provider": "openai",
-        "api_key": "sk-...",
-        "model": "gpt-4",
-        "system_prompt": "..."
-      }
+      "node_name": "WF.batch.sync",
+      "runtime": "wf.batch.sync.diag",
+      "runtime_version": "current"
     },
     "request_id": "req-20260314-001"
   }
 }
 ```
 
-**Payload fields:**
+Campos:
+- `action` (required)
+- `target` (optional, requerido para acciones hive-scoped salvo excepciones de dominio)
+- `params` (optional object)
+- `request_id` (optional)
 
-| Field | Required | Type | Description |
-|-------|----------|------|-------------|
-| `action` | Yes | string | Action name, same as the HTTP handler dispatch key |
-| `hive_id` | No | string | Target hive when the action is hive-scoped. Omit for global actions |
-| `params` | No | object | Action parameters, same shape as HTTP request body |
-| `request_id` | No | string | Correlation ID, echoed back in response |
-
-### 5.2 ADMIN_COMMAND_RESPONSE (Response)
+### 4.2 Response (`ADMIN_COMMAND_RESPONSE`)
 
 ```json
 {
-  "routing": {
-    "src": "SY.admin@motherbee",
-    "dst": "WF.architect@motherbee",
-    "ttl": 16,
-    "trace_id": "5a7f2f4f-bf34-4b15-bde6-7f7fe7345f3d"
-  },
   "meta": {
     "type": "admin",
     "msg": "ADMIN_COMMAND_RESPONSE"
@@ -175,9 +100,9 @@ If a second command arrives (HTTP or socket) while one is in progress, it waits 
     "status": "ok",
     "action": "run_node",
     "payload": {
-      "node_name": "AI.soporte.l1@worker-220",
-      "runtime": "ai.soporte",
-      "version": "1.2.0"
+      "node_name": "WF.batch.sync@worker-220",
+      "runtime": "wf.batch.sync.diag",
+      "version": "0.0.1"
     },
     "error_code": null,
     "error_detail": null,
@@ -186,262 +111,203 @@ If a second command arrives (HTTP or socket) while one is in progress, it waits 
 }
 ```
 
-**Response payload fields:**
-
-| Field | Always present | Description |
-|-------|---------------|-------------|
-| `status` | Yes | `ok`, `sync_pending`, or `error` |
-| `action` | Yes | Echo of the requested action |
-| `payload` | Yes (nullable) | Domain-specific result, same as HTTP response body |
-| `error_code` | Yes (nullable) | Error code when status=error, same codes as HTTP |
-| `error_detail` | Yes (nullable) | Human-readable error detail |
-| `request_id` | If sent | Echo of the caller's request_id |
-
-### 5.3 Correlation
-
-- Primary: `routing.trace_id` (always present, system-generated if not provided).
-- Caller-side: `payload.request_id` (optional, echoed back for caller matching).
+Correlación:
+- primaria: `routing.trace_id`
+- opcional: `payload.request_id`
 
 ---
 
-## 6. Action Mapping
+## 5. Unified execution model
 
-Every HTTP endpoint maps to an `action` string. The mapping is defined by the HTTP handler dispatch table in SY.admin — there is no separate catalog for internal commands.
-
-**Current actions (as of v1.16+, non-exhaustive):**
-
-| HTTP Endpoint | Action | Hive-scoped |
-|---------------|--------|-------------|
-| `GET /hive/status` | `hive_status` | No |
-| `GET /hives` | `list_hives` | No |
-| `POST /hives` | `add_hive` | No |
-| `GET /hives/{id}` | `get_hive` | Yes |
-| `DELETE /hives/{id}` | `remove_hive` | Yes |
-| `POST /hives/{id}/update` | `update` | Yes |
-| `POST /hives/{id}/sync-hint` | `sync_hint` | Yes |
-| `GET /hives/{id}/versions` | `get_versions` | Yes |
-| `GET /hives/{id}/nodes` | `list_nodes` | Yes |
-| `POST /hives/{id}/nodes` | `run_node` | Yes |
-| `DELETE /hives/{id}/nodes/{name}` | `kill_node` | Yes |
-| `GET /hives/{id}/nodes/{name}/status` | `get_node_status` | Yes |
-| `GET /hives/{id}/nodes/{name}/config` | `get_node_config` | Yes |
-| `PUT /hives/{id}/nodes/{name}/config` | `set_node_config` | Yes |
-| `GET /hives/{id}/nodes/{name}/state` | `get_node_state` | Yes |
-| `GET /hives/{id}/routers` | `list_routers` | Yes |
-| `POST /hives/{id}/routers` | `run_router` | Yes |
-| `DELETE /hives/{id}/routers/{name}` | `kill_router` | Yes |
-| `GET /inventory` | `get_inventory` | No |
-| `GET /inventory/{id}` | `get_inventory_hive` | Yes |
-| `GET /inventory/summary` | `get_inventory_summary` | No |
-| `GET/POST/DELETE /routes` | `list_routes`, `add_route`, `delete_route` | No |
-| `GET/POST/DELETE /vpns` | `list_vpns`, `add_vpn`, `delete_vpn` | No |
-| `GET/PUT /config/storage` | `get_config_storage`, `set_config_storage` | No |
-| `POST /identity/tenants` | `create_tenant` | No |
-| `GET /identity/tenants` | `list_tenants` | No |
-| `GET /identity/tenants/{id}` | `get_tenant` | No |
-| `PUT /identity/tenants/{id}` | `update_tenant` | No |
-| `POST /identity/tenants/{id}/approve` | `approve_tenant` | No |
-| `GET /identity/ilks` | `list_ilks` | No |
-| `GET /identity/ilks/{id}` | `get_ilk` | No |
-| `DELETE /identity/ilks/{id}` | `delete_ilk` | No |
-| `GET /identity/vocabulary` | `list_vocabulary` | No |
-| `POST /identity/vocabulary` | `add_vocabulary` | No |
-| `DELETE /identity/vocabulary/{tag}` | `deprecate_vocabulary` | No |
-| `GET /identity/metrics` | `get_identity_metrics` | No |
-| `POST /opa/policy` | `opa_policy` | No |
-| `POST /opa/policy/compile` | `opa_compile` | No |
-| `POST /opa/policy/apply` | `opa_apply` | No |
-| `POST /opa/policy/rollback` | `opa_rollback` | No |
-| `GET /opa/status` | `opa_status` | No |
-
-**Rule for new endpoints:** When a new HTTP endpoint is added to SY.admin, the developer must ensure the handler goes through the shared `dispatch()` function. This automatically makes it available via ADMIN_COMMAND with no additional work.
-
----
-
-## 7. Implementation Requirements
-
-### 7.1 In SY.admin
-
-1. Add message handler for `ADMIN_COMMAND` that extracts `action`, `hive_id`, `params` and calls `dispatch()`.
-2. Format the dispatch result as `ADMIN_COMMAND_RESPONSE` and send back to caller.
-3. Apply the same param normalization as HTTP (field name mapping, defaults, etc.).
-4. Apply the same error code mapping as HTTP.
-5. Apply monocommand lock before dispatch, release after.
-6. Apply same per-action timeouts as HTTP.
-
-### 7.2 In SDK (fluxbee_sdk)
-
-Provide a helper for internal callers:
+### 5.1 Internal canonical command
 
 ```rust
-pub async fn admin_command(
-    action: &str,
-    hive_id: Option<&str>,
-    params: Value,
-    timeout: Duration,
-) -> Result<AdminCommandResponse> {
-    let request_id = generate_request_id();
-    let msg = build_admin_command(action, hive_id, params, request_id);
-    let response = send_and_wait(msg, timeout).await?;
-    parse_admin_command_response(response)
+struct AdminCommand {
+    action: String,
+    target: Option<String>,
+    params: serde_json::Value,
+    trace_id: String,
+    request_id: Option<String>,
+    origin: CommandOrigin, // Http | Socket
+}
+
+struct AdminCommandResult {
+    status: String, // ok | sync_pending | error
+    action: String,
+    payload: serde_json::Value,
+    error_code: Option<String>,
+    error_detail: Option<serde_json::Value>,
 }
 ```
 
-Usage:
+### 5.2 Single execution entrypoint
+
+Ambas entradas deben converger en:
+
+`execute_admin_command(ctx, client, cmd) -> AdminCommandResult`
+
+Pipeline:
+1. validar action en registry
+2. normalizar payload (`target`, no-legacy)
+3. aplicar precedencia `node_name@hive > target`
+4. adquirir lock monocomando
+5. ejecutar handler existente
+6. convertir a `AdminCommandResult`
+
+### 5.3 Adapters
+
+- HTTP adapter: `method/path/query/body` -> `AdminCommand` -> `execute_admin_command` -> HTTP response
+- Socket adapter: `ADMIN_COMMAND` -> `AdminCommand` -> `execute_admin_command` -> `ADMIN_COMMAND_RESPONSE`
+
+Regla: adapters sin lógica de negocio.
+
+---
+
+## 6. Action registry (current and future)
+
+Se define `action_registry` como fuente única de verdad:
 
 ```rust
-let result = admin_command(
-    "run_node",
-    Some("worker-220"),
-    json!({
-        "node_name": "AI.soporte.l1",
-        "runtime": "ai.soporte",
-        "runtime_version": "current",
-        "config": { ... }
-    }),
-    Duration::from_secs(30),
-).await?;
-
-match result.status {
-    "ok" => println!("Node spawned: {}", result.payload),
-    "error" => eprintln!("Failed: {} - {}", result.error_code, result.error_detail),
-    _ => {}
+struct ActionSpec {
+    requires_target: bool,
+    timeout_kind: TimeoutKind,
+    handler_kind: HandlerKind,
 }
 ```
+
+`handler_kind` referencia wrappers a código existente:
+- `handle_admin_query`
+- `handle_admin_command`
+- `handle_hive_update_command`
+- `handle_hive_sync_hint_command`
+- `handle_inventory_http`
+- `handle_opa_http`
+- `handle_opa_query`
+- modules handler (si se expone por socket)
 
 ---
 
-## 8. Examples
+## 7. Action mapping (baseline v1)
 
-### 8.1 Spawn a Node (Internal)
+### 7.1 Core/hive/node actions
 
-```json
-{
-  "payload": {
-    "action": "run_node",
-    "hive_id": "worker-220",
-    "params": {
-      "node_name": "AI.soporte.l1",
-      "runtime": "ai.soporte",
-      "runtime_version": "current",
-      "config": { "api_key": "sk-...", "model": "gpt-4" }
-    }
-  }
-}
-```
+| Endpoint | Action | Base handler |
+|---|---|---|
+| `GET /hive/status` | `hive_status` | `handle_admin_query` |
+| `GET /hives` | `list_hives` | `handle_admin_query` |
+| `POST /hives` | `add_hive` | `handle_admin_command` |
+| `GET /hives/{id}` | `get_hive` | `handle_admin_command` |
+| `DELETE /hives/{id}` | `remove_hive` | `handle_admin_command` |
+| `POST /hives/{id}/update` | `update` | `handle_hive_update_command` |
+| `POST /hives/{id}/sync-hint` | `sync_hint` | `handle_hive_sync_hint_command` |
+| `GET /hives/{id}/versions` | `get_versions` | `handle_admin_query` |
+| `GET /hives/{id}/nodes` | `list_nodes` | `handle_admin_query` |
+| `POST /hives/{id}/nodes` | `run_node` | `handle_admin_command` |
+| `DELETE /hives/{id}/nodes/{name}` | `kill_node` | `handle_admin_command` |
+| `GET /hives/{id}/nodes/{name}/status` | `get_node_status` | `handle_admin_command` |
+| `GET /hives/{id}/nodes/{name}/config` | `get_node_config` | `handle_admin_command` |
+| `PUT /hives/{id}/nodes/{name}/config` | `set_node_config` | `handle_admin_command` |
+| `GET /hives/{id}/nodes/{name}/state` | `get_node_state` | `handle_admin_command` |
 
-### 8.2 Kill a Node (Internal)
+### 7.2 Inventory
 
-```json
-{
-  "payload": {
-    "action": "kill_node",
-    "hive_id": "worker-220",
-    "params": {
-      "node_name": "AI.soporte.l1",
-      "force": false
-    }
-  }
-}
-```
+Acción interna: `inventory` (mapea a `handle_inventory_http`)
 
-### 8.3 Get Inventory (Internal)
+Params:
+- `scope`: `global|hive|summary`
+- `filter_hive` (optional)
+- `filter_type` (optional)
 
-```json
-{
-  "payload": {
-    "action": "get_inventory",
-    "params": {}
-  }
-}
-```
+### 7.3 Routes/VPN/Storage/OPA/Modules
 
-### 8.4 Create Tenant (Internal)
-
-```json
-{
-  "payload": {
-    "action": "create_tenant",
-    "params": {
-      "name": "Acme Corp",
-      "domain": "acme.com",
-      "status": "pending"
-    }
-  }
-}
-```
-
-### 8.5 Update Node Config (Internal)
-
-```json
-{
-  "payload": {
-    "action": "set_node_config",
-    "hive_id": "worker-220",
-    "params": {
-      "node_name": "AI.soporte.l1",
-      "system_prompt": "Updated prompt...",
-      "temperature": 0.5
-    }
-  }
-}
-```
-
-### 8.6 Error Response
-
-```json
-{
-  "payload": {
-    "status": "error",
-    "action": "run_node",
-    "payload": null,
-    "error_code": "RUNTIME_NOT_PRESENT",
-    "error_detail": {
-      "runtime": "ai.soporte",
-      "version": "1.2.0",
-      "expected_path": "/var/lib/fluxbee/dist/runtimes/ai.soporte/1.2.0/bin/start.sh",
-      "hint": "Run SYSTEM_UPDATE to materialize this runtime on the worker"
-    },
-    "request_id": "req-20260314-001"
-  }
-}
-```
+- Routes/VPN CRUD: acciones canónicas existentes
+- `PUT /config/routes|vpns|storage`: requieren wrapper que preserve versioning+broadcast
+- OPA: acciones explícitas mapeadas a handlers OPA actuales
+- Modules: decisión explícita (exponer por socket o dejar solo HTTP)
 
 ---
 
-## 9. Implementation Tasks
+## 8. Routing and precedence details
 
-- [ ] FR9-T1. Add `ADMIN_COMMAND` / `ADMIN_COMMAND_RESPONSE` message handler in SY.admin.
-- [ ] FR9-T2. Wire handler to shared `dispatch()` function (same as HTTP).
-- [ ] FR9-T3. Implement monocommand lock (single command in progress across HTTP + socket).
-- [ ] FR9-T4. Implement SDK helper `admin_command()` in `fluxbee_sdk`.
-- [ ] FR9-T5. E2E: `run_node` via ADMIN_COMMAND produces same result as HTTP POST.
-- [ ] FR9-T6. E2E: `kill_node` via ADMIN_COMMAND produces same result as HTTP DELETE.
-- [ ] FR9-T7. E2E: `get_inventory` via ADMIN_COMMAND returns valid inventory.
-- [ ] FR9-T8. E2E: monocommand — concurrent commands wait, don't error.
-- [ ] FR9-T9. Update `02-protocolo.md` with ADMIN_COMMAND message definition.
-- [ ] FR9-T10. Update `07-operaciones.md` with internal command gateway documentation.
+Para `run_node/kill_node/get_node_*`:
 
----
+1. si `params.node_name` trae `@hive`, ese hive manda
+2. si `target` difiere, se ignora (warning)
+3. si no hay `@hive`, `target` es obligatorio
+4. si falta destino, `INVALID_REQUEST`
 
-## 10. Not In Scope (v1)
-
-- ACL by origin or action (deferred, implement as guard in dispatch when needed).
-- Audit logging to database (deferred, log to structured stdout for now).
-- Idempotency enforcement via request_id (deferred).
-- Replacing HTTP (HTTP remains the external entry point).
-- Batch commands (one action per ADMIN_COMMAND message).
+Ejemplo:
+- `target=motherbee` + `node_name="WF.x@worker-220"` -> destino real `worker-220`
 
 ---
 
-## 11. Relationship to Other Specs
+## 9. Concurrency and timeout
+
+- lock monocomando global compartido
+- una ejecución activa a la vez
+- misma política de timeout por acción que HTTP
+- comportamiento bajo contención: espera (no error inmediato)
+
+---
+
+## 10. Implementation tasks (FR9)
+
+- [ ] FR9-T1. Agregar handler `ADMIN_COMMAND` / `ADMIN_COMMAND_RESPONSE` en `SY.admin`.
+- [ ] FR9-T2. Implementar `dispatch_internal_admin_command()` como adapter a handlers existentes.
+- [ ] FR9-T3. Corregir mapping v1 según este spec (sin routers legacy).
+- [ ] FR9-T4. Incluir acción `inventory` en canal interno.
+- [ ] FR9-T5. Mantener lock monocomando global HTTP+socket.
+- [ ] FR9-T6. Mantener validación no-legacy (`name`/`version` inválidos).
+- [ ] FR9-T7. Aplicar precedencia `node_name@hive` en normalización única.
+- [ ] FR9-T8. SDK helper `admin_command()` para callers internos.
+- [ ] FR9-T9. E2E socket: `run_node/kill_node/get_node_status/update/sync_hint/inventory`.
+- [ ] FR9-T10. E2E paridad funcional HTTP vs socket (subset crítico).
+- [ ] FR9-T11. Actualizar `docs/02-protocolo.md` con `ADMIN_COMMAND`.
+- [ ] FR9-T12. Actualizar `docs/07-operaciones.md` con gateway interno.
+- [ ] FR9-T13. Resolver hive destino en socket solo por `payload.target` (excepto acciones de dominio hive).
+- [ ] FR9-T14. Rechazar `hive_id` como selector de destino en `ADMIN_COMMAND` hive-scoped.
+- [ ] FR9-T15. Mantener `hive_id` solo para `add_hive/get_hive/remove_hive`.
+- [ ] FR9-T16. Endurecer nuevas rutas de control para no depender de fallback `hive_id`.
+- [ ] FR9-T17. E2E negativo: `run_node` con `hive_id` sin `target` falla.
+- [ ] FR9-T18. E2E precedencia: `node_name@hive` gana sobre `target`.
+- [ ] FR9-T19. Definir y versionar `action_registry` único.
+- [ ] FR9-T20. Mapping completo de `ADMIN_COMMAND` para todas las acciones actuales de `SY.admin`.
+- [ ] FR9-T21. Test de paridad de catálogo (HTTP action <-> registry/socket).
+- [ ] FR9-T22. Guard CI: endpoint/acción HTTP nueva sin mapping socket => fail.
+- [ ] FR9-T23. Exponer `list_admin_actions` para introspección de capacidades.
+- [ ] FR9-T24. E2E matrix all-actions (incluye inventory).
+
+---
+
+## 11. Not in scope (v1)
+
+- ACL por origen/acción (defer)
+- Idempotencia fuerte por `request_id` (defer)
+- Modelo concurrente fino (se mantiene monocomando)
+- Reemplazar HTTP
+
+---
+
+## 12. Acceptance criteria
+
+Cerrado cuando:
+
+1. existe `execute_admin_command` único;
+2. HTTP y socket pasan por ese ejecutor;
+3. precedencia `node_name@hive > target` centralizada;
+4. inventory operativo por socket;
+5. registry + CI guard + E2E matrix garantizan cobertura de comandos actuales y futuros.
+
+---
+
+## 13. Relationship to other specs
 
 | Spec | Relationship |
 |------|-------------|
-| `02-protocolo.md` | Add ADMIN_COMMAND / ADMIN_COMMAND_RESPONSE message definitions |
-| `07-operaciones.md` | Document internal command gateway and SDK usage |
-| `node-spawn-config-spec.md` | `run_node` action creates config.json via the same dispatch path |
-| `node-status-contract.md` | `get_node_status` action available via internal command |
-| `system-inventory-spec.md` | `get_inventory` action available via internal command |
-| `runtime-lifecycle-spec.md` | `update`, `sync_hint`, `get_versions` available via internal command |
-| `10-identity-v2.md` | Identity management actions available via internal command |
+| `docs/02-protocolo.md` | Definición de `ADMIN_COMMAND`/`ADMIN_COMMAND_RESPONSE` |
+| `docs/07-operaciones.md` | Operación del gateway interno |
+| `docs/onworking/orchestrator_frictions.md` | Seguimiento FR-09 |
+| `docs/onworking/node-spawn-config-spec.md` | Reuso de path de ejecución para `run_node`/`set_node_config` |
+| `docs/onworking/runtime-lifecycle-spec.md` | `update`/`sync_hint`/`get_versions` por gateway |
+| `docs/onworking/system-inventory-spec.md` | Acción interna `inventory` |
+
