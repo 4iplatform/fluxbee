@@ -71,13 +71,18 @@ http_call() {
   local url="$2"
   local out_file="$3"
   local payload="${4:-}"
+  local http_code=""
   if [[ -n "$payload" ]]; then
-    curl -sS -o "$out_file" -w "%{http_code}" -X "$method" "$url" \
+    http_code="$(curl -sS -o "$out_file" -w "%{http_code}" -X "$method" "$url" \
       -H "Content-Type: application/json" \
-      -d "$payload"
+      -d "$payload" || true)"
   else
-    curl -sS -o "$out_file" -w "%{http_code}" -X "$method" "$url"
+    http_code="$(curl -sS -o "$out_file" -w "%{http_code}" -X "$method" "$url" || true)"
   fi
+  if [[ -z "$http_code" ]]; then
+    http_code="000"
+  fi
+  printf "%s" "$http_code"
 }
 
 json_get_file() {
