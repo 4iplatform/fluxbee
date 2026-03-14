@@ -33,9 +33,20 @@ sync_hint_body="$tmpdir/sync_hint.json"
 update_body="$tmpdir/update.json"
 local_hive_body="$tmpdir/local_hive.json"
 hive_status_body="$tmpdir/hive_status.json"
+failed_unit_override_dir=""
+failed_unit_override_file=""
 
 cleanup() {
   local _ec=$?
+  if [[ -n "$failed_unit_override_file" && -f "$failed_unit_override_file" ]]; then
+    as_root_local rm -f "$failed_unit_override_file" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$failed_unit_override_dir" && -d "$failed_unit_override_dir" ]]; then
+    as_root_local rmdir "$failed_unit_override_dir" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$failed_unit_override_file" ]]; then
+    as_root_local systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
   http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_FAILED" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
   http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_MONO" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
   rm -rf "$tmpdir"
@@ -504,8 +515,20 @@ if [[ -z "$failed_unit" ]]; then
   cat "$spawn_failed_body" >&2 || true
   exit 1
 fi
-if ! as_root_local systemctl set-property "$failed_unit" Restart=no RestartSec=0 >/dev/null 2>&1; then
-  echo "FAIL: unable to set Restart=no on unit '$failed_unit' (required for deterministic FAILED state)" >&2
+failed_unit_override_dir="/etc/systemd/system/${failed_unit}.service.d"
+failed_unit_override_file="${failed_unit_override_dir}/99-fr7-t11-no-restart.conf"
+as_root_local mkdir -p "$failed_unit_override_dir"
+cat >"$tmpdir/failed_unit_override.conf" <<'EOF'
+[Service]
+Restart=no
+RestartSec=0
+EOF
+if ! as_root_local install -m 0644 "$tmpdir/failed_unit_override.conf" "$failed_unit_override_file"; then
+  echo "FAIL: unable to install systemd override for unit '$failed_unit'" >&2
+  exit 1
+fi
+if ! as_root_local systemctl daemon-reload >/dev/null 2>&1; then
+  echo "FAIL: unable to daemon-reload after override for unit '$failed_unit'" >&2
   exit 1
 fi
 as_root_local systemctl kill -s SIGKILL "$failed_unit" >/dev/null 2>&1 || true
