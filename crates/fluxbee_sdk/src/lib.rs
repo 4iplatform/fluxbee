@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod blob;
 pub mod client_config;
 pub mod comm;
@@ -8,9 +9,13 @@ pub mod payload;
 pub mod prelude;
 pub mod protocol;
 pub mod socket;
-pub mod status;
 pub mod split;
+pub mod status;
 
+pub use admin::{
+    admin_command, admin_command_ok, AdminCommandError, AdminCommandRequest, AdminCommandResult,
+    ADMIN_KIND, MSG_ADMIN_COMMAND, MSG_ADMIN_COMMAND_RESPONSE,
+};
 pub use client_config::ClientConfig;
 pub use identity::{
     identity_shm_name_for_hive, identity_system_call, identity_system_call_ok, load_hive_id,
@@ -21,5 +26,5 @@ pub use identity::{
     MSG_TNT_CREATE,
 };
 pub use node_client::{connect, connect_with_client_config, NodeConfig, NodeError};
-pub use status::try_handle_default_node_status;
 pub use split::{NodeReceiver, NodeSender};
+pub use status::try_handle_default_node_status;

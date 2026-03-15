@@ -252,15 +252,15 @@ Ejemplo:
 
 ## 10. Implementation tasks (FR9)
 
-- [ ] FR9-T1. Agregar handler `ADMIN_COMMAND` / `ADMIN_COMMAND_RESPONSE` en `SY.admin`.
-- [ ] FR9-T2. Implementar `dispatch_internal_admin_command()` como adapter a handlers existentes.
-- [ ] FR9-T3. Corregir mapping v1 según este spec (sin routers legacy).
-- [ ] FR9-T4. Incluir acción `inventory` en canal interno.
-- [ ] FR9-T5. Mantener lock monocomando global HTTP+socket.
-- [ ] FR9-T6. Mantener validación no-legacy (`name`/`version` inválidos).
-- [ ] FR9-T7. Aplicar precedencia `node_name@hive` en normalización única.
-- [ ] FR9-T8. SDK helper `admin_command()` para callers internos.
-- [ ] FR9-T9. E2E socket: `run_node/kill_node/get_node_status/update/sync_hint/inventory`.
+- [x] FR9-T1. Agregar handler `ADMIN_COMMAND` / `ADMIN_COMMAND_RESPONSE` en `SY.admin`.
+- [x] FR9-T2. Implementar `dispatch_internal_admin_command()` como adapter a handlers existentes.
+- [x] FR9-T3. Corregir mapping v1 según este spec (sin routers legacy).
+- [x] FR9-T4. Incluir acción `inventory` en canal interno. (`scripts/admin_internal_inventory_socket_e2e.sh`)
+- [x] FR9-T5. Mantener lock monocomando global HTTP+socket.
+- [x] FR9-T6. Mantener validación no-legacy (`name`/`version` inválidos). (`scripts/admin_internal_no_legacy_e2e.sh`)
+- [x] FR9-T7. Aplicar precedencia `node_name@hive` en normalización única.
+- [x] FR9-T8. SDK helper `admin_command()` para callers internos (`crates/fluxbee_sdk/src/admin.rs`, usado por `src/bin/admin_internal_command_diag.rs`).
+- [ ] FR9-T9. E2E socket: `run_node/kill_node/get_node_status/update/sync_hint/inventory`. (`scripts/admin_internal_socket_actions_e2e.sh`)
 - [ ] FR9-T10. E2E paridad funcional HTTP vs socket (subset crítico).
 - [ ] FR9-T11. Actualizar `docs/02-protocolo.md` con `ADMIN_COMMAND`.
 - [ ] FR9-T12. Actualizar `docs/07-operaciones.md` con gateway interno.
@@ -310,4 +310,3 @@ Cerrado cuando:
 | `docs/onworking/node-spawn-config-spec.md` | Reuso de path de ejecución para `run_node`/`set_node_config` |
 | `docs/onworking/runtime-lifecycle-spec.md` | `update`/`sync_hint`/`get_versions` por gateway |
 | `docs/onworking/system-inventory-spec.md` | Acción interna `inventory` |
-

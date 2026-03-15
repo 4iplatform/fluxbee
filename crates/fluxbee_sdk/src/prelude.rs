@@ -1,3 +1,7 @@
+pub use crate::admin::{
+    admin_command, admin_command_ok, AdminCommandError, AdminCommandRequest, AdminCommandResult,
+    ADMIN_KIND, MSG_ADMIN_COMMAND, MSG_ADMIN_COMMAND_RESPONSE,
+};
 pub use crate::blob::{
     constants as blob_constants, BlobConfig, BlobError, BlobGcOptions, BlobGcPassReport,
     BlobGcReport, BlobMetricsSnapshot, BlobRef, BlobStat, BlobToolkit, PublishBlobRequest,
