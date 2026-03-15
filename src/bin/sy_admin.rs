@@ -739,6 +739,10 @@ async fn dispatch_internal_admin_command(
     target: Option<&str>,
     params: serde_json::Value,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
+    if let Some(detail) = internal_admin_payload_contract_error(action, &params) {
+        return Ok(internal_invalid_request(action, &detail));
+    }
+
     let route = match resolve_internal_action_route(action) {
         Ok(route) => route,
         Err(detail) => return Ok(internal_invalid_request(action, detail)),
@@ -833,6 +837,21 @@ fn normalize_internal_target_hive(target: Option<&str>) -> Option<String> {
         }
     }
     Some(raw.to_string())
+}
+
+fn internal_admin_payload_contract_error(action: &str, params: &serde_json::Value) -> Option<String> {
+    if !params.is_object() {
+        return None;
+    }
+    if params.get("hive_id").is_some()
+        && !matches!(action, "add_hive" | "get_hive" | "remove_hive")
+    {
+        return Some(
+            "legacy field 'hive_id' is not supported for this action; use payload.target"
+                .to_string(),
+        );
+    }
+    None
 }
 
 fn resolve_internal_action_hive(

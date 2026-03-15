@@ -264,11 +264,11 @@ Ejemplo:
 - [x] FR9-T10. E2E paridad funcional HTTP vs socket (subset crítico). (`scripts/admin_http_socket_parity_e2e.sh`)
 - [x] FR9-T11. Actualizar `docs/02-protocolo.md` con `ADMIN_COMMAND`.
 - [x] FR9-T12. Actualizar `docs/07-operaciones.md` con gateway interno.
-- [ ] FR9-T13. Resolver hive destino en socket solo por `payload.target` (excepto acciones de dominio hive). (`scripts/admin_internal_target_required_e2e.sh`)
-- [ ] FR9-T14. Rechazar `hive_id` como selector de destino en `ADMIN_COMMAND` hive-scoped.
-- [ ] FR9-T15. Mantener `hive_id` solo para `add_hive/get_hive/remove_hive`.
-- [ ] FR9-T16. Endurecer nuevas rutas de control para no depender de fallback `hive_id`.
-- [ ] FR9-T17. E2E negativo: `run_node` con `hive_id` sin `target` falla. (`scripts/admin_internal_target_required_e2e.sh`)
+- [x] FR9-T13. Resolver hive destino en socket solo por `payload.target` (excepto acciones de dominio hive). (`scripts/admin_internal_target_required_e2e.sh`)
+- [x] FR9-T14. Rechazar `hive_id` como selector de destino en `ADMIN_COMMAND` hive-scoped. (`scripts/admin_internal_hive_id_selector_e2e.sh`)
+- [x] FR9-T15. Mantener `hive_id` solo para `add_hive/get_hive/remove_hive`. (`scripts/admin_internal_hive_id_selector_e2e.sh`)
+- [x] FR9-T16. Endurecer nuevas rutas de control para no depender de fallback `hive_id`.
+- [x] FR9-T17. E2E negativo: `run_node` con `hive_id` sin `target` falla. (`scripts/admin_internal_target_required_e2e.sh`)
 - [ ] FR9-T18. E2E precedencia: `node_name@hive` gana sobre `target`.
 - [ ] FR9-T19. Definir y versionar `action_registry` único.
 - [ ] FR9-T20. Mapping completo de `ADMIN_COMMAND` para todas las acciones actuales de `SY.admin`.
