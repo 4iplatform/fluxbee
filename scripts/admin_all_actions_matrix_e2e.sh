@@ -400,7 +400,7 @@ if [[ "$expected_count" != "$actual_count" ]]; then
   cat "$SUMMARY_FILE" >&2
   exit 1
 fi
-if ! grep -q '^inventory\t' "$SUMMARY_FILE"; then
+if ! awk -F'\t' '$1=="inventory"{found=1} END{exit found?0:1}' "$SUMMARY_FILE"; then
   echo "FAIL: inventory action was not executed in matrix" >&2
   cat "$SUMMARY_FILE" >&2
   exit 1
