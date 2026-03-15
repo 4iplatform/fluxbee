@@ -1,0 +1,24 @@
+name: admin-catalog-guard
+
+on:
+  pull_request:
+    paths:
+      - "src/bin/sy_admin.rs"
+      - "scripts/admin_action_catalog_parity_check.sh"
+      - ".github/workflows/admin-catalog-guard.yml"
+  push:
+    branches: ["**"]
+    paths:
+      - "src/bin/sy_admin.rs"
+      - "scripts/admin_action_catalog_parity_check.sh"
+      - ".github/workflows/admin-catalog-guard.yml"
+
+jobs:
+  catalog-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify admin HTTP/socket action catalog parity
+        run: bash scripts/admin_action_catalog_parity_check.sh

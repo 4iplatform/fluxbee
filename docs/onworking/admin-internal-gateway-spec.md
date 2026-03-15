@@ -175,6 +175,11 @@ struct ActionSpec {
 }
 ```
 
+Implementación actual:
+- `src/bin/sy_admin.rs`
+- `INTERNAL_ACTION_REGISTRY` (catálogo único)
+- `INTERNAL_ACTION_REGISTRY_VERSION = "1"` (versionado explícito del catálogo)
+
 `handler_kind` referencia wrappers a código existente:
 - `handle_admin_query`
 - `handle_admin_command`
@@ -193,6 +198,8 @@ struct ActionSpec {
 
 | Endpoint | Action | Base handler |
 |---|---|---|
+| `GET /admin/actions` | `list_admin_actions` | `handle_admin_query` (local catalog) |
+| `GET /versions` | `list_versions` | `handle_admin_query` |
 | `GET /hive/status` | `hive_status` | `handle_admin_query` |
 | `GET /hives` | `list_hives` | `handle_admin_query` |
 | `POST /hives` | `add_hive` | `handle_admin_command` |
@@ -209,7 +216,22 @@ struct ActionSpec {
 | `PUT /hives/{id}/nodes/{name}/config` | `set_node_config` | `handle_admin_command` |
 | `GET /hives/{id}/nodes/{name}/state` | `get_node_state` | `handle_admin_command` |
 
-### 7.2 Inventory
+### 7.2 Routes, VPN, storage, rollout/drift
+
+| Endpoint | Action | Base handler |
+|---|---|---|
+| `GET /routes` | `list_routes` | `handle_admin_query` |
+| `POST /routes` | `add_route` | `handle_admin_command` |
+| `DELETE /routes` | `delete_route` | `handle_admin_command` |
+| `GET /vpns` | `list_vpns` | `handle_admin_query` |
+| `POST /vpns` | `add_vpn` | `handle_admin_command` |
+| `DELETE /vpns` | `delete_vpn` | `handle_admin_command` |
+| `GET /config/storage` | `get_storage` | `handle_admin_query` |
+| `PUT /config/storage` | `set_storage` | `handle_admin_command` |
+| `GET /deployments` | `list_deployments` / `get_deployments` | `handle_admin_command` |
+| `GET /drift-alerts` | `list_drift_alerts` / `get_drift_alerts` | `handle_admin_command` |
+
+### 7.3 Inventory
 
 Acción interna: `inventory` (mapea a `handle_inventory_http`)
 
@@ -218,12 +240,23 @@ Params:
 - `filter_hive` (optional)
 - `filter_type` (optional)
 
-### 7.3 Routes/VPN/Storage/OPA/Modules
+### 7.4 OPA
 
-- Routes/VPN CRUD: acciones canónicas existentes
-- `PUT /config/routes|vpns|storage`: requieren wrapper que preserve versioning+broadcast
-- OPA: acciones explícitas mapeadas a handlers OPA actuales
-- Modules: decisión explícita (exponer por socket o dejar solo HTTP)
+| Endpoint | Action | Base handler |
+|---|---|---|
+| `POST /opa/policy` | `opa_compile_apply` | `handle_opa_http` |
+| `POST /opa/policy/compile` | `opa_compile` | `handle_opa_http` |
+| `POST /opa/policy/apply` | `opa_apply` | `handle_opa_http` |
+| `POST /opa/policy/rollback` | `opa_rollback` | `handle_opa_http` |
+| `POST /opa/policy/check` | `opa_check` | `handle_opa_http` |
+| `GET /opa/policy` | `opa_get_policy` | `handle_opa_query` |
+| `GET /opa/status` | `opa_get_status` | `handle_opa_query` |
+
+### 7.5 Explicit exclusions (v1)
+
+- `PUT /config/routes` y `PUT /config/vpns`: flujo broadcast/config local, fuera de `ADMIN_COMMAND` v1.
+- `GET /config/storage/metrics`: endpoint especializado NATS/metrics, fuera de `ADMIN_COMMAND` v1.
+- `/modules/*`: superficie de módulos queda HTTP-only en esta fase.
 
 ---
 
@@ -269,12 +302,12 @@ Ejemplo:
 - [x] FR9-T15. Mantener `hive_id` solo para `add_hive/get_hive/remove_hive`. (`scripts/admin_internal_hive_id_selector_e2e.sh`)
 - [x] FR9-T16. Endurecer nuevas rutas de control para no depender de fallback `hive_id`.
 - [x] FR9-T17. E2E negativo: `run_node` con `hive_id` sin `target` falla. (`scripts/admin_internal_target_required_e2e.sh`)
-- [ ] FR9-T18. E2E precedencia: `node_name@hive` gana sobre `target`. (`scripts/admin_internal_node_name_precedence_e2e.sh`)
-- [ ] FR9-T19. Definir y versionar `action_registry` único.
-- [ ] FR9-T20. Mapping completo de `ADMIN_COMMAND` para todas las acciones actuales de `SY.admin`.
-- [ ] FR9-T21. Test de paridad de catálogo (HTTP action <-> registry/socket).
-- [ ] FR9-T22. Guard CI: endpoint/acción HTTP nueva sin mapping socket => fail.
-- [ ] FR9-T23. Exponer `list_admin_actions` para introspección de capacidades.
+- [x] FR9-T18. E2E precedencia: `node_name@hive` gana sobre `target`. (`scripts/admin_internal_node_name_precedence_e2e.sh`)
+- [x] FR9-T19. Definir y versionar `action_registry` único. (`src/bin/sy_admin.rs`: `INTERNAL_ACTION_REGISTRY`, `INTERNAL_ACTION_REGISTRY_VERSION`)
+- [x] FR9-T20. Mapping completo de `ADMIN_COMMAND` para todas las acciones actuales de `SY.admin` (excepto exclusiones explícitas v1 en sección 7.5).
+- [x] FR9-T21. Test de paridad de catálogo (HTTP action <-> registry/socket). (`scripts/admin_action_catalog_parity_check.sh`)
+- [x] FR9-T22. Guard CI: endpoint/acción HTTP nueva sin mapping socket => fail. (`.github/workflows/admin-catalog-guard.yml` + `scripts/admin_action_catalog_parity_check.sh`)
+- [x] FR9-T23. Exponer `list_admin_actions` para introspección de capacidades. (`GET /admin/actions` + `ADMIN_COMMAND action=list_admin_actions`; `scripts/admin_list_actions_e2e.sh`)
 - [ ] FR9-T24. E2E matrix all-actions (incluye inventory).
 
 ---
