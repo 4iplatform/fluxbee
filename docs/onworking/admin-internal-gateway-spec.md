@@ -260,8 +260,8 @@ Ejemplo:
 - [x] FR9-T6. Mantener validación no-legacy (`name`/`version` inválidos). (`scripts/admin_internal_no_legacy_e2e.sh`)
 - [x] FR9-T7. Aplicar precedencia `node_name@hive` en normalización única.
 - [x] FR9-T8. SDK helper `admin_command()` para callers internos (`crates/fluxbee_sdk/src/admin.rs`, usado por `src/bin/admin_internal_command_diag.rs`).
-- [ ] FR9-T9. E2E socket: `run_node/kill_node/get_node_status/update/sync_hint/inventory`. (`scripts/admin_internal_socket_actions_e2e.sh`)
-- [ ] FR9-T10. E2E paridad funcional HTTP vs socket (subset crítico).
+- [x] FR9-T9. E2E socket: `run_node/kill_node/get_node_status/update/sync_hint/inventory`. (`scripts/admin_internal_socket_actions_e2e.sh`)
+- [ ] FR9-T10. E2E paridad funcional HTTP vs socket (subset crítico). (`scripts/admin_http_socket_parity_e2e.sh`)
 - [ ] FR9-T11. Actualizar `docs/02-protocolo.md` con `ADMIN_COMMAND`.
 - [ ] FR9-T12. Actualizar `docs/07-operaciones.md` con gateway interno.
 - [ ] FR9-T13. Resolver hive destino en socket solo por `payload.target` (excepto acciones de dominio hive).
