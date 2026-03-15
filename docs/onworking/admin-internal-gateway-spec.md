@@ -308,7 +308,7 @@ Ejemplo:
 - [x] FR9-T21. Test de paridad de catálogo (HTTP action <-> registry/socket). (`scripts/admin_action_catalog_parity_check.sh`)
 - [x] FR9-T22. Guard CI: endpoint/acción HTTP nueva sin mapping socket => fail. (`.github/workflows/admin-catalog-guard.yml` + `scripts/admin_action_catalog_parity_check.sh`)
 - [x] FR9-T23. Exponer `list_admin_actions` para introspección de capacidades. (`GET /admin/actions` + `ADMIN_COMMAND action=list_admin_actions`; `scripts/admin_list_actions_e2e.sh`)
-- [ ] FR9-T24. E2E matrix all-actions (incluye inventory).
+- [ ] FR9-T24. E2E matrix all-actions (incluye inventory). (`scripts/admin_all_actions_matrix_e2e.sh`)
 
 ---
 
