@@ -269,7 +269,7 @@ Ejemplo:
 - [x] FR9-T15. Mantener `hive_id` solo para `add_hive/get_hive/remove_hive`. (`scripts/admin_internal_hive_id_selector_e2e.sh`)
 - [x] FR9-T16. Endurecer nuevas rutas de control para no depender de fallback `hive_id`.
 - [x] FR9-T17. E2E negativo: `run_node` con `hive_id` sin `target` falla. (`scripts/admin_internal_target_required_e2e.sh`)
-- [ ] FR9-T18. E2E precedencia: `node_name@hive` gana sobre `target`.
+- [ ] FR9-T18. E2E precedencia: `node_name@hive` gana sobre `target`. (`scripts/admin_internal_node_name_precedence_e2e.sh`)
 - [ ] FR9-T19. Definir y versionar `action_registry` único.
 - [ ] FR9-T20. Mapping completo de `ADMIN_COMMAND` para todas las acciones actuales de `SY.admin`.
 - [ ] FR9-T21. Test de paridad de catálogo (HTTP action <-> registry/socket).
