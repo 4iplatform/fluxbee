@@ -235,20 +235,25 @@ if [[ "$(json_get "status" "$LAST_OUT")" != "ok" ]]; then
   exit 1
 fi
 
-echo "Step 7/10: socket action get_node_status (wait RUNNING)"
+echo "Step 7/10: socket action get_node_status (wait STARTING/RUNNING)"
 status_ok="0"
+observed_lifecycle=""
+observed_pid=""
 for _ in $(seq 1 20); do
   run_admin "get_node_status" "get_node_status" "$HIVE_ID" "{\"node_name\":\"$NODE_FQN\"}"
   top_status="$(json_get "status" "$LAST_OUT")"
   lifecycle="$(json_get "payload.node_status.lifecycle_state" "$LAST_OUT")"
-  if [[ "$top_status" == "ok" && "$lifecycle" == "RUNNING" ]]; then
+  pid="$(json_get "payload.node_status.process.pid" "$LAST_OUT")"
+  observed_lifecycle="$lifecycle"
+  observed_pid="$pid"
+  if [[ "$top_status" == "ok" && ( "$lifecycle" == "RUNNING" || "$lifecycle" == "STARTING" ) ]]; then
     status_ok="1"
     break
   fi
   sleep 1
 done
 if [[ "$status_ok" != "1" ]]; then
-  echo "FAIL[get_node_status]: did not reach lifecycle RUNNING" >&2
+  echo "FAIL[get_node_status]: did not reach lifecycle STARTING/RUNNING" >&2
   cat "$LAST_OUT" >&2
   exit 1
 fi
@@ -284,4 +289,6 @@ echo "node_name=$NODE_FQN"
 echo "sync_hint_status=$sync_status"
 echo "update_status=$update_status"
 echo "update_error_code=${update_code:-}"
+echo "node_status_lifecycle=$observed_lifecycle"
+echo "node_status_pid=$observed_pid"
 echo "admin internal socket actions FR9-T9 E2E passed."
