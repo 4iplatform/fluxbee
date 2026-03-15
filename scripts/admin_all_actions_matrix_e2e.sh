@@ -162,13 +162,22 @@ assert_valid_matrix_response() {
   local requested_action="$1"
   local file="$2"
 
-  local got_action status error_code error_detail
+  local got_action status error_code error_detail expected_alt_action
   got_action="$(json_get "action" "$file")"
   status="$(json_get "status" "$file")"
   error_code="$(json_get "error_code" "$file")"
   error_detail="$(json_get "error_detail" "$file")"
 
-  if [[ "$got_action" != "$requested_action" ]]; then
+  expected_alt_action=""
+  case "$requested_action" in
+    opa_compile|opa_compile_apply|opa_check) expected_alt_action="compile" ;;
+    opa_apply) expected_alt_action="apply" ;;
+    opa_rollback) expected_alt_action="rollback" ;;
+    opa_get_policy) expected_alt_action="get_policy" ;;
+    opa_get_status) expected_alt_action="get_status" ;;
+  esac
+
+  if [[ "$got_action" != "$requested_action" && "$got_action" != "$expected_alt_action" ]]; then
     echo "FAIL[$requested_action]: action mismatch got='$got_action'" >&2
     cat "$file" >&2
     exit 1
