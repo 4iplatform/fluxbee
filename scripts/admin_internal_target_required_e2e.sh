@@ -7,7 +7,8 @@ set -euo pipefail
 # Covered:
 # - list_nodes without target -> INVALID_REQUEST
 # - get_versions without target -> INVALID_REQUEST
-# - run_node without target (with hive_id in params) -> INVALID_REQUEST
+# - run_node without target -> INVALID_REQUEST (missing target)
+# - run_node with legacy hive_id and no target -> INVALID_REQUEST (legacy hive_id rejected)
 #
 # Usage:
 #   ADMIN_TARGET="SY.admin@motherbee" \
@@ -102,7 +103,13 @@ run_case \
 run_case \
   "run_node_hive_id_without_target" \
   "run_node" \
-  "{\"node_name\":\"WF.admin.target.required.$RANDOM\",\"runtime\":\"wf.orch.diag\",\"runtime_version\":\"current\",\"tenant_id\":\"$TENANT_ID\",\"hive_id\":\"worker-220\"}" \
+  "{\"node_name\":\"WF.admin.target.required.nohive.$RANDOM\",\"runtime\":\"wf.orch.diag\",\"runtime_version\":\"current\",\"tenant_id\":\"$TENANT_ID\"}" \
   "missing target"
+
+run_case \
+  "run_node_legacy_hive_id_without_target" \
+  "run_node" \
+  "{\"node_name\":\"WF.admin.target.required.$RANDOM\",\"runtime\":\"wf.orch.diag\",\"runtime_version\":\"current\",\"tenant_id\":\"$TENANT_ID\",\"hive_id\":\"worker-220\"}" \
+  "legacy field 'hive_id' is not supported"
 
 echo "admin internal target-required E2E passed."
