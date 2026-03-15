@@ -27,6 +27,8 @@ TENANT_ID="${TENANT_ID:-}"
 ADMIN_TIMEOUT_SECS="${ADMIN_TIMEOUT_SECS:-20}"
 TEST_ID="${TEST_ID:-fr9t9-$(date +%s)-$RANDOM}"
 NODE_NAME="${NODE_NAME:-WF.admin.socket.${TEST_ID}}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DIAG_BIN="${ADMIN_DIAG_BIN:-$ROOT_DIR/target/debug/admin_internal_command_diag}"
 
 if [[ -z "$TENANT_ID" ]]; then
   echo "FAIL: TENANT_ID is required (format tnt:<uuid>)" >&2
@@ -126,28 +128,39 @@ run_admin() {
     ADMIN_TIMEOUT_SECS="$ADMIN_TIMEOUT_SECS" \
     ADMIN_PAYLOAD_TARGET="$payload_target" \
     ADMIN_PARAMS_JSON="$params_json" \
-    cargo run --quiet --bin admin_internal_command_diag >"$out_file"
+    "$DIAG_BIN" >"$out_file"
   else
     ADMIN_ACTION="$action" \
     ADMIN_TARGET="$ADMIN_TARGET" \
     ADMIN_TIMEOUT_SECS="$ADMIN_TIMEOUT_SECS" \
     ADMIN_PARAMS_JSON="$params_json" \
-    cargo run --quiet --bin admin_internal_command_diag >"$out_file"
+    "$DIAG_BIN" >"$out_file"
   fi
 
   LAST_OUT="$out_file"
 }
 
-require_cmd cargo
 require_cmd curl
 require_cmd python3
+if [[ ! -x "$DIAG_BIN" ]]; then
+  require_cmd cargo
+fi
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
 echo "ADMIN internal socket actions E2E: ADMIN_TARGET=$ADMIN_TARGET HIVE_ID=$HIVE_ID RUNTIME=$RUNTIME NODE_NAME=$NODE_NAME"
 
-echo "Step 1/9: validate runtime exists and read manifest metadata via HTTP"
+echo "Step 1/10: build admin_internal_command_diag once"
+if [[ ! -x "$DIAG_BIN" ]]; then
+  (cd "$ROOT_DIR" && cargo build --quiet --bin admin_internal_command_diag)
+fi
+if [[ ! -x "$DIAG_BIN" ]]; then
+  echo "FAIL: admin_internal_command_diag binary missing at '$DIAG_BIN'" >&2
+  exit 1
+fi
+
+echo "Step 2/10: validate runtime exists and read manifest metadata via HTTP"
 versions_body="$tmpdir/versions.json"
 versions_http="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$versions_body")"
 if [[ "$versions_http" != "200" || "$(json_get "status" "$versions_body")" != "ok" ]]; then
@@ -168,10 +181,10 @@ if [[ -z "$manifest_version" || -z "$manifest_hash" ]]; then
   exit 1
 fi
 
-echo "Step 2/9: cleanup baseline node (ignore errors)"
+echo "Step 3/10: cleanup baseline node (ignore errors)"
 run_admin "cleanup_pre" "kill_node" "$HIVE_ID" "{\"node_name\":\"$NODE_NAME\"}"
 
-echo "Step 3/9: socket action sync_hint"
+echo "Step 4/10: socket action sync_hint"
 run_admin "sync_hint" "sync_hint" "$HIVE_ID" '{"channel":"dist","folder_id":"fluxbee-dist","wait_for_idle":true,"timeout_ms":30000}'
 sync_status="$(json_get "status" "$LAST_OUT")"
 sync_action="$(json_get "action" "$LAST_OUT")"
@@ -186,7 +199,7 @@ if [[ "$sync_status" != "ok" && "$sync_status" != "sync_pending" ]]; then
   exit 1
 fi
 
-echo "Step 4/9: socket action update(runtime)"
+echo "Step 5/10: socket action update(runtime)"
 update_params="$(cat <<JSON
 {"category":"runtime","manifest_version":$manifest_version,"manifest_hash":"$manifest_hash"}
 JSON
@@ -210,7 +223,7 @@ if [[ "$update_status" != "ok" && "$update_status" != "sync_pending" ]]; then
   fi
 fi
 
-echo "Step 5/9: socket action run_node"
+echo "Step 6/10: socket action run_node"
 run_params="$(cat <<JSON
 {"node_name":"$NODE_NAME","runtime":"$RUNTIME","runtime_version":"$RUNTIME_VERSION","tenant_id":"$TENANT_ID"}
 JSON
@@ -222,7 +235,7 @@ if [[ "$(json_get "status" "$LAST_OUT")" != "ok" ]]; then
   exit 1
 fi
 
-echo "Step 6/9: socket action get_node_status (wait RUNNING)"
+echo "Step 7/10: socket action get_node_status (wait RUNNING)"
 status_ok="0"
 for _ in $(seq 1 20); do
   run_admin "get_node_status" "get_node_status" "$HIVE_ID" "{\"node_name\":\"$NODE_FQN\"}"
@@ -240,7 +253,7 @@ if [[ "$status_ok" != "1" ]]; then
   exit 1
 fi
 
-echo "Step 7/9: socket action inventory (hive scope)"
+echo "Step 8/10: socket action inventory (hive scope)"
 run_admin "inventory" "inventory" "" "{\"scope\":\"hive\",\"filter_hive\":\"$HIVE_ID\"}"
 if [[ "$(json_get "status" "$LAST_OUT")" != "ok" ]]; then
   echo "FAIL[inventory]: expected top status='ok'" >&2
@@ -253,7 +266,7 @@ if [[ "$(json_get "payload.status" "$LAST_OUT")" != "ok" ]]; then
   exit 1
 fi
 
-echo "Step 8/9: socket action kill_node"
+echo "Step 9/10: socket action kill_node"
 run_admin "kill_node" "kill_node" "$HIVE_ID" "{\"node_name\":\"$NODE_FQN\"}"
 if [[ "$(json_get "status" "$LAST_OUT")" != "ok" ]]; then
   echo "FAIL[kill_node]: expected status='ok'" >&2
@@ -261,7 +274,7 @@ if [[ "$(json_get "status" "$LAST_OUT")" != "ok" ]]; then
   exit 1
 fi
 
-echo "Step 9/9: summary"
+echo "Step 10/10: summary"
 echo "status=ok"
 echo "admin_target=$ADMIN_TARGET"
 echo "hive_id=$HIVE_ID"
