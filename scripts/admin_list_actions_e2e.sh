@@ -72,10 +72,17 @@ except Exception:
     print("0")
     raise SystemExit(0)
 
-actions = (
-    doc.get("payload", {})
-       .get("actions", [])
-)
+# Supports both:
+# - full envelope: { payload: { actions: [...] } }
+# - payload-only doc: { actions: [...] }
+actions = []
+if isinstance(doc, dict):
+    if isinstance(doc.get("actions"), list):
+        actions = doc.get("actions", [])
+    else:
+        payload = doc.get("payload", {})
+        if isinstance(payload, dict) and isinstance(payload.get("actions"), list):
+            actions = payload.get("actions", [])
 if isinstance(actions, list) and any(isinstance(x, dict) and x.get("action") == action for x in actions):
     print("1")
 else:
