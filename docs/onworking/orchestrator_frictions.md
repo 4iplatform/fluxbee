@@ -268,6 +268,33 @@ Criterio de cierre FR-08:
 
 ---
 
+### FR-09 — SY.admin internal gateway (HTTP + socket unificado)
+
+Estado: OPEN (fase avanzada)
+
+Qué pasa hoy:
+- `SY.admin` ya acepta `ADMIN_COMMAND` / `ADMIN_COMMAND_RESPONSE` por socket.
+- Existe adapter interno a handlers actuales con lock monocomando global compartido HTTP+socket.
+- Se validó paridad funcional en subset crítico (inventory, sync_hint, update, run_node, get_node_status, kill_node).
+- SDK ya expone helper canónico `admin_command()` para callers internos.
+
+Evidencia:
+- `src/bin/sy_admin.rs` (handler interno + dispatch + normalización `node_name@hive`)
+- `crates/fluxbee_sdk/src/admin.rs` (helper SDK)
+- `scripts/admin_internal_socket_actions_e2e.sh` (FR9-T9)
+- `scripts/admin_http_socket_parity_e2e.sh` (FR9-T10)
+- `docs/onworking/admin-internal-gateway-spec.md` (checklist FR9)
+
+Estado de tareas FR-09:
+- Cerradas: FR9-T1..T12
+- Pendientes: FR9-T13..T24 (hardening de selector destino sin `hive_id` legacy, action registry único, guard CI y matrix all-actions)
+
+Siguiente foco recomendado:
+- cerrar FR9-T13..T18 (routing/selector definitivo por `target` y `node_name@hive`, con E2E negativos/precedencia),
+- luego FR9-T19..T24 (registry + cobertura total + guard CI).
+
+---
+
 ### FR-10 — Unificar llamadas de identity en orchestrator con helpers del SDK (opción 1)
 
 Estado: OPEN (backlog)

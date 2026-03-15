@@ -739,7 +739,6 @@ async fn dispatch_internal_admin_command(
     target: Option<&str>,
     params: serde_json::Value,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
-    let hive = normalize_internal_target_hive(target);
     let route = match resolve_internal_action_route(action) {
         Ok(route) => route,
         Err(detail) => return Ok(internal_invalid_request(action, detail)),
@@ -747,36 +746,54 @@ async fn dispatch_internal_admin_command(
 
     let (status, body) = match route {
         InternalActionRoute::Query(canonical) => {
-            handle_admin_query(ctx, client, canonical, hive.clone()).await?
+            let hive = resolve_internal_action_hive(canonical, target, &params);
+            if internal_action_requires_target(canonical) && hive.is_none() {
+                return Ok(internal_invalid_request(
+                    action,
+                    "missing target (payload.target required for this action)",
+                ));
+            }
+            handle_admin_query(ctx, client, canonical, hive).await?
         }
         InternalActionRoute::Command(canonical) => {
-            handle_admin_command(ctx, client, canonical, params, hive.clone()).await?
+            let hive = resolve_internal_action_hive(canonical, target, &params);
+            if internal_action_requires_target(canonical) && hive.is_none() {
+                return Ok(internal_invalid_request(
+                    action,
+                    "missing target (payload.target required for this action)",
+                ));
+            }
+            handle_admin_command(ctx, client, canonical, params, hive).await?
         }
         InternalActionRoute::Update => {
+            let hive = resolve_internal_action_hive("update", target, &params);
             let Some(hive_id) = hive else {
                 return Ok(internal_invalid_request(
                     action,
-                    "missing target (expected hive id or @hive)",
+                    "missing target (payload.target required for this action)",
                 ));
             };
             handle_hive_update_command(ctx, client, hive_id, params).await?
         }
         InternalActionRoute::SyncHint => {
+            let hive = resolve_internal_action_hive("sync_hint", target, &params);
             let Some(hive_id) = hive else {
                 return Ok(internal_invalid_request(
                     action,
-                    "missing target (expected hive id or @hive)",
+                    "missing target (payload.target required for this action)",
                 ));
             };
             handle_hive_sync_hint_command(ctx, client, hive_id, params).await?
         }
         InternalActionRoute::Inventory => handle_inventory_http(ctx, client, params).await?,
         InternalActionRoute::OpaHttp(opa_action) => {
-            let req = parse_internal_opa_request(params, hive.clone())
+            let hive = resolve_internal_action_hive(action, target, &params);
+            let req = parse_internal_opa_request(params, hive)
                 .map_err(|detail| -> AdminError { detail.into() })?;
             handle_opa_http(ctx, client, req, opa_action).await?
         }
         InternalActionRoute::OpaQuery(query_action) => {
+            let hive = resolve_internal_action_hive(action, target, &params);
             handle_opa_query(ctx, client, query_action, hive.clone()).await?
         }
     };
@@ -816,6 +833,44 @@ fn normalize_internal_target_hive(target: Option<&str>) -> Option<String> {
         }
     }
     Some(raw.to_string())
+}
+
+fn resolve_internal_action_hive(
+    action: &str,
+    target: Option<&str>,
+    params: &serde_json::Value,
+) -> Option<String> {
+    if let Some(node_hive) = node_name_hive_from_payload(action, params).map(str::to_string) {
+        return Some(node_hive);
+    }
+    normalize_internal_target_hive(target)
+}
+
+fn internal_action_requires_target(action: &str) -> bool {
+    matches!(
+        action,
+        "list_routes"
+            | "add_route"
+            | "delete_route"
+            | "list_vpns"
+            | "add_vpn"
+            | "delete_vpn"
+            | "list_nodes"
+            | "list_versions"
+            | "get_versions"
+            | "list_deployments"
+            | "get_deployments"
+            | "list_drift_alerts"
+            | "get_drift_alerts"
+            | "run_node"
+            | "kill_node"
+            | "get_node_config"
+            | "set_node_config"
+            | "get_node_state"
+            | "get_node_status"
+            | "update"
+            | "sync_hint"
+    )
 }
 
 fn resolve_internal_action_route(action: &str) -> Result<InternalActionRoute, &'static str> {

@@ -1,7 +1,7 @@
 # JSON Router - 07 Operaciones
 
-**Estado:** v1.20  
-**Fecha:** 2026-03-14  
+**Estado:** v1.21  
+**Fecha:** 2026-03-15  
 **Audiencia:** Ops/SRE, desarrolladores de deployment
 
 ---
@@ -1060,6 +1060,38 @@ Diagnóstico rápido:
 | `GET /modules/{name}` | `list_versions` | Lista versiones de un módulo |
 | `GET /modules/{name}/{version}` | `get_module` | Descarga módulo |
 | `POST /modules/{name}/{version}` | `upload_module` | Sube módulo (solo mother) |
+
+### 5.5 Gateway Interno de Comandos (Socket/WAN)
+
+`SY.admin` centraliza control-plane por dos entradas equivalentes:
+1. HTTP (`/hives/*`, `/inventory`, `/config/*`, etc.)
+2. Socket/WAN (`ADMIN_COMMAND` / `ADMIN_COMMAND_RESPONSE`)
+
+Contrato operativo:
+- destino del mensaje: `routing.dst = "SY.admin@<hive>"`
+- `meta.type = "admin"`, `meta.msg = "ADMIN_COMMAND"`
+- `payload.action` + `payload.params` (+ `payload.target` opcional por acción)
+- respuesta en envelope admin estándar (`status/action/payload/error_code/error_detail/request_id`)
+
+Reglas relevantes:
+- lock monocomando global compartido entre HTTP y socket.
+- acciones node-scoped respetan precedencia `node_name@hive > target`.
+- payload legacy (`name`, `version`, `hash`) se rechaza con `INVALID_REQUEST`.
+- `SY.admin` no expone operaciones de identity en este gateway (identity queda en `SY.orchestrator` y `AI.frontdesk`).
+
+Runbook rápido (socket):
+
+```bash
+# ejemplo: inventory por socket interno
+ADMIN_ACTION="inventory" \
+ADMIN_TARGET="SY.admin@motherbee" \
+ADMIN_PARAMS_JSON='{"scope":"hive","filter_hive":"worker-220"}' \
+target/debug/admin_internal_command_diag | jq .
+```
+
+E2E de referencia:
+- `scripts/admin_internal_socket_actions_e2e.sh` (acciones socket)
+- `scripts/admin_http_socket_parity_e2e.sh` (paridad HTTP vs socket)
 
 ---
 

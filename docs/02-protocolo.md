@@ -1,7 +1,7 @@
 # JSON Router - 02 Protocolo de Mensajes
 
-**Estado:** v1.20  
-**Fecha:** 2026-03-14  
+**Estado:** v1.21  
+**Fecha:** 2026-03-15  
 **Audiencia:** Desarrolladores de librería de nodo, desarrolladores de nodos
 
 ---
@@ -1080,6 +1080,80 @@ Status de respuesta (`SYSTEM_SYNC_HINT_RESPONSE.payload.status`):
 - `ok`: folder sano y convergencia observada
 - `sync_pending`: hint aplicado, aún sin convergencia final
 - `error`: timeout o estado inválido del folder/API
+
+---
+
+### 7.10 SY.admin Internal Gateway (`ADMIN_COMMAND`)
+
+Canal canónico para ejecutar acciones de control en `SY.admin` vía socket/WAN, en paridad con HTTP.
+
+| Mensaje | Origen | Destino | Propósito |
+|---------|--------|---------|-----------|
+| `ADMIN_COMMAND` | caller interno (`AI/WF/IO` o tooling) | `SY.admin@<hive>` | Ejecutar acción administrativa (`run_node`, `kill_node`, `get_node_status`, `update`, `sync_hint`, `inventory`, etc.) |
+| `ADMIN_COMMAND_RESPONSE` | `SY.admin@<hive>` | Originador de `ADMIN_COMMAND` | Envelope de resultado unificado (`status/action/payload/error_code/error_detail`) |
+
+Request mínimo:
+
+```json
+{
+  "routing": {
+    "src": "WF.some.caller@motherbee",
+    "dst": "SY.admin@motherbee",
+    "ttl": 16,
+    "trace_id": "..."
+  },
+  "meta": {
+    "type": "admin",
+    "msg": "ADMIN_COMMAND",
+    "target": "SY.admin@motherbee"
+  },
+  "payload": {
+    "action": "run_node",
+    "target": "worker-220",
+    "params": {
+      "node_name": "WF.demo.internal",
+      "runtime": "wf.orch.diag",
+      "runtime_version": "current",
+      "tenant_id": "tnt:..."
+    },
+    "request_id": "..."
+  }
+}
+```
+
+Response mínima:
+
+```json
+{
+  "meta": {
+    "type": "admin",
+    "msg": "ADMIN_COMMAND_RESPONSE"
+  },
+  "payload": {
+    "status": "ok",
+    "action": "run_node",
+    "payload": { "...": "..." },
+    "error_code": null,
+    "error_detail": null,
+    "request_id": "...",
+    "trace_id": "..."
+  }
+}
+```
+
+Reglas de contrato:
+- `payload.action` es obligatorio.
+- `payload.params` debe ser objeto JSON o `null`.
+- Para acciones node-scoped (`run_node`, `kill_node`, `get_node_*`), si `params.node_name` trae `@hive`, ese hive tiene precedencia sobre `payload.target`.
+- Campos legacy de params se rechazan con `INVALID_REQUEST`:
+  - `name` (usar `node_name`)
+  - `version` (usar `runtime_version` o `manifest_version` según acción)
+  - `hash` (usar `manifest_hash`)
+- `SY.admin` mantiene lock monocomando global compartido entre HTTP y socket.
+
+Cobertura E2E (FR-09):
+- `scripts/admin_internal_socket_actions_e2e.sh` (socket actions)
+- `scripts/admin_http_socket_parity_e2e.sh` (paridad HTTP vs socket, subset crítico)
 
 ---
 
