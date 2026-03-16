@@ -55,9 +55,25 @@ This is the effective port map for current deployments.
 Firewall behavior in `SY.orchestrator`:
 
 - Automatic firewall management is currently implemented for Syncthing ports (`22000/tcp`, `22000/udp`, `21027/udp`) when blob/dist sync is enabled.
+- Automatic firewall management is also applied for core listener ports:
+  - WAN listener from `wan.listen` (for example `9000/tcp`) when configured.
+  - Identity sync listener on motherbee (`identity.sync.port`, default `9100/tcp`).
 - This runs locally on each hive where `SY.orchestrator` starts and reconciles Syncthing runtime.
-- WAN (`9000/tcp`) and identity sync (`9100/tcp`) are not auto-opened by orchestrator firewall helpers today; they must be allowed by infrastructure policy (at least on motherbee, and on workers if configured to listen).
+- Workers typically do not need `identity.sync.port` inbound because replicas use `identity.sync.upstream` (outbound to primary), but WAN listener firewall rules are applied if `wan.listen` is set on that worker.
 - If neither `ufw` nor `firewalld` exists on host, orchestrator logs a warning and port policy remains external.
+
+## PostgreSQL Ownership
+
+`SY.storage` and `SY.identity` use fixed database names defined in code (not in `hive.yaml`):
+
+- `SY.storage` -> `fluxbee_storage`
+- `SY.identity` (primary only) -> `fluxbee_identity`
+
+Bootstrap behavior:
+
+- Both services read connection host/user/password from `database.url` (or env overrides).
+- On motherbee startup, each service ensures its own database exists (`CREATE DATABASE` if missing) and then ensures its own schema/tables.
+- Worker identity replicas remain read-only for DB writes and continue syncing from primary through identity sync.
 
 ### Base URL
 

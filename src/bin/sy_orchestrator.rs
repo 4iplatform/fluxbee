@@ -377,6 +377,7 @@ struct OrchestratorState {
     last_runtime_verify: Mutex<Instant>,
     last_blob_gc: Mutex<Instant>,
     nats_endpoint: String,
+    identity_sync_port: u16,
     blob: BlobRuntimeConfig,
     dist: DistRuntimeConfig,
     blob_sync_last_desired: Mutex<BlobRuntimeConfig>,
@@ -450,6 +451,7 @@ async fn main() -> Result<(), OrchestratorError> {
         .and_then(|wan| wan.authorized_hives.clone())
         .unwrap_or_default();
     let nats_endpoint = nats_endpoint_from_hive(&hive);
+    let identity_sync_port = identity_sync_port_from_hive(&hive);
     let blob_runtime = blob_runtime_from_hive(&hive);
     let dist_runtime = dist_runtime_from_hive(&hive);
     let storage_path = storage_path_from_hive(&hive);
@@ -472,6 +474,7 @@ async fn main() -> Result<(), OrchestratorError> {
         last_runtime_verify: Mutex::new(Instant::now()),
         last_blob_gc: Mutex::new(Instant::now()),
         nats_endpoint,
+        identity_sync_port,
         blob: blob_runtime.clone(),
         dist: dist_runtime,
         blob_sync_last_desired: Mutex::new(blob_runtime),
@@ -491,6 +494,7 @@ async fn main() -> Result<(), OrchestratorError> {
         dist_path = %state.dist.path.display(),
         dist_sync_enabled = state.dist.sync_enabled,
         dist_sync_tool = %state.dist.sync_tool,
+        identity_sync_port = state.identity_sync_port,
         "blob/dist runtime config loaded"
     );
     ensure_dirs(&config_dir, &state_dir, &run_dir, &state.blob, &state.dist)?;
@@ -585,6 +589,7 @@ async fn bootstrap_local(
         Duration::from_secs(NATS_BOOTSTRAP_TIMEOUT_SECS),
     )
     .await?;
+    ensure_core_firewall_local(state);
     let startup_sync = effective_syncthing_runtime_config(&state.blob, &state.dist);
     if startup_sync.sync_enabled {
         if let Err(err) = ensure_blob_sync_runtime(&state.blob, &state.dist).await {
@@ -2723,19 +2728,19 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn ensure_syncthing_firewall_local() {
+fn open_firewall_rules_local(rules: &[String], context: &str) {
+    if rules.is_empty() {
+        return;
+    }
+
     let mut applied = false;
     if command_exists("ufw") {
         applied = true;
-        for rule in [
-            format!("{SYNCTHING_SYNC_PORT_TCP}/tcp"),
-            format!("{SYNCTHING_SYNC_PORT_UDP}/udp"),
-            format!("{SYNCTHING_DISCOVERY_PORT_UDP}/udp"),
-        ] {
+        for rule in rules {
             let mut cmd = Command::new("ufw");
-            cmd.arg("allow").arg(&rule);
-            if let Err(err) = run_cmd(cmd, "ufw allow syncthing") {
-                tracing::warn!(rule = %rule, error = %err, "ufw allow failed");
+            cmd.arg("allow").arg(rule);
+            if let Err(err) = run_cmd(cmd, "ufw allow") {
+                tracing::warn!(context = context, rule = %rule, error = %err, "ufw allow failed");
             }
         }
     }
@@ -2745,24 +2750,30 @@ fn ensure_syncthing_firewall_local() {
         state_cmd.arg("--state");
         if run_cmd(state_cmd, "firewall-cmd --state").is_ok() {
             applied = true;
-            for rule in [
-                format!("{SYNCTHING_SYNC_PORT_TCP}/tcp"),
-                format!("{SYNCTHING_SYNC_PORT_UDP}/udp"),
-                format!("{SYNCTHING_DISCOVERY_PORT_UDP}/udp"),
-            ] {
+            for rule in rules {
                 let mut cmd_now = Command::new("firewall-cmd");
-                cmd_now.arg("--add-port").arg(&rule);
+                cmd_now.arg("--add-port").arg(rule);
                 if let Err(err) = run_cmd(cmd_now, "firewall-cmd --add-port") {
-                    tracing::warn!(rule = %rule, error = %err, "firewalld runtime port rule failed");
+                    tracing::warn!(
+                        context = context,
+                        rule = %rule,
+                        error = %err,
+                        "firewalld runtime port rule failed"
+                    );
                 }
 
                 let mut cmd_persistent = Command::new("firewall-cmd");
                 cmd_persistent
                     .arg("--permanent")
                     .arg("--add-port")
-                    .arg(&rule);
+                    .arg(rule);
                 if let Err(err) = run_cmd(cmd_persistent, "firewall-cmd --permanent --add-port") {
-                    tracing::warn!(rule = %rule, error = %err, "firewalld permanent port rule failed");
+                    tracing::warn!(
+                        context = context,
+                        rule = %rule,
+                        error = %err,
+                        "firewalld permanent port rule failed"
+                    );
                 }
             }
         }
@@ -2770,24 +2781,31 @@ fn ensure_syncthing_firewall_local() {
 
     if !applied {
         tracing::warn!(
-            "no ufw/firewalld detected; syncthing ports must be opened by host firewall policy"
+            context = context,
+            rules = ?rules,
+            "no ufw/firewalld detected; ports must be opened by host firewall policy"
         );
     }
 }
 
-fn disable_syncthing_firewall_local() {
+fn close_firewall_rules_local(rules: &[String], context: &str) {
+    if rules.is_empty() {
+        return;
+    }
+
     let mut applied = false;
     if command_exists("ufw") {
         applied = true;
-        for rule in [
-            format!("{SYNCTHING_SYNC_PORT_TCP}/tcp"),
-            format!("{SYNCTHING_SYNC_PORT_UDP}/udp"),
-            format!("{SYNCTHING_DISCOVERY_PORT_UDP}/udp"),
-        ] {
+        for rule in rules {
             let mut cmd = Command::new("ufw");
-            cmd.arg("--force").arg("delete").arg("allow").arg(&rule);
-            if let Err(err) = run_cmd(cmd, "ufw delete allow syncthing") {
-                tracing::warn!(rule = %rule, error = %err, "ufw delete allow failed");
+            cmd.arg("--force").arg("delete").arg("allow").arg(rule);
+            if let Err(err) = run_cmd(cmd, "ufw delete allow") {
+                tracing::warn!(
+                    context = context,
+                    rule = %rule,
+                    error = %err,
+                    "ufw delete allow failed"
+                );
             }
         }
     }
@@ -2797,15 +2815,12 @@ fn disable_syncthing_firewall_local() {
         state_cmd.arg("--state");
         if run_cmd(state_cmd, "firewall-cmd --state").is_ok() {
             applied = true;
-            for rule in [
-                format!("{SYNCTHING_SYNC_PORT_TCP}/tcp"),
-                format!("{SYNCTHING_SYNC_PORT_UDP}/udp"),
-                format!("{SYNCTHING_DISCOVERY_PORT_UDP}/udp"),
-            ] {
+            for rule in rules {
                 let mut cmd_now = Command::new("firewall-cmd");
-                cmd_now.arg("--remove-port").arg(&rule);
+                cmd_now.arg("--remove-port").arg(rule);
                 if let Err(err) = run_cmd(cmd_now, "firewall-cmd --remove-port") {
                     tracing::warn!(
+                        context = context,
                         rule = %rule,
                         error = %err,
                         "firewalld runtime port remove failed"
@@ -2816,10 +2831,11 @@ fn disable_syncthing_firewall_local() {
                 cmd_persistent
                     .arg("--permanent")
                     .arg("--remove-port")
-                    .arg(&rule);
+                    .arg(rule);
                 if let Err(err) = run_cmd(cmd_persistent, "firewall-cmd --permanent --remove-port")
                 {
                     tracing::warn!(
+                        context = context,
                         rule = %rule,
                         error = %err,
                         "firewalld permanent port remove failed"
@@ -2831,9 +2847,55 @@ fn disable_syncthing_firewall_local() {
 
     if !applied {
         tracing::warn!(
-            "no ufw/firewalld detected; syncthing ports must be removed by host firewall policy"
+            context = context,
+            rules = ?rules,
+            "no ufw/firewalld detected; ports must be removed by host firewall policy"
         );
     }
+}
+
+fn syncthing_firewall_rules() -> Vec<String> {
+    vec![
+        format!("{SYNCTHING_SYNC_PORT_TCP}/tcp"),
+        format!("{SYNCTHING_SYNC_PORT_UDP}/udp"),
+        format!("{SYNCTHING_DISCOVERY_PORT_UDP}/udp"),
+    ]
+}
+
+fn ensure_syncthing_firewall_local() {
+    open_firewall_rules_local(&syncthing_firewall_rules(), "syncthing");
+}
+
+fn disable_syncthing_firewall_local() {
+    close_firewall_rules_local(&syncthing_firewall_rules(), "syncthing");
+}
+
+fn ensure_core_firewall_local(state: &OrchestratorState) {
+    let mut rules: Vec<String> = Vec::new();
+    if let Some(listen) = state.wan_listen.as_deref() {
+        let listen = listen.trim();
+        if !listen.is_empty() {
+            match parse_host_port(listen) {
+                Ok((_, port)) => rules.push(format!("{port}/tcp")),
+                Err(err) => tracing::warn!(
+                    wan_listen = listen,
+                    error = %err,
+                    "failed to parse wan.listen for firewall setup; skipping WAN port rule"
+                ),
+            }
+        }
+    }
+
+    if state.is_motherbee {
+        rules.push(format!("{}/tcp", state.identity_sync_port));
+    }
+
+    if rules.is_empty() {
+        return;
+    }
+    rules.sort();
+    rules.dedup();
+    open_firewall_rules_local(&rules, "core");
 }
 
 fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
