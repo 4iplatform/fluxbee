@@ -199,6 +199,7 @@ Global endpoints:
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness/health probe |
+| `GET` | `/admin/actions` | Introspect internal admin action catalog (`list_admin_actions`) |
 | `GET` | `/hive/status` | Local hive/orchestrator status |
 | `GET` | `/hives` | List managed hives |
 | `POST` | `/hives` | Add hive (`hive_id`, `address`) |
@@ -597,12 +598,44 @@ Key documents:
 | Identity provision | `fluxbee_sdk::identity::{IlkProvisionRequest, provision_ilk}` | Request `ILK_PROVISION` with automatic `NOT_PRIMARY` fallback target support |
 | Identity system calls | `fluxbee_sdk::identity::{IdentitySystemRequest, identity_system_call, identity_system_call_ok}` | Generic helpers for `ILK_REGISTER`, `ILK_ADD_CHANNEL`, `ILK_UPDATE`, tenant actions |
 | Node status default handler | `fluxbee_sdk::try_handle_default_node_status` | Respond `NODE_STATUS_GET` with canonical `health_state`; avoids `ORCHESTRATOR_INFERRED` fallback when node is healthy |
+| Admin internal gateway | `fluxbee_sdk::{admin_command, admin_command_ok, AdminCommandRequest}` | Execute `ADMIN_COMMAND` over socket/WAN against `SY.admin@<hive>` (same control surface as HTTP) |
 | Convenience imports | `fluxbee_sdk::prelude::*` | Common SDK symbols in one import |
 
 Recommended for every new node/scaffold:
 - call `try_handle_default_node_status(&sender, &msg).await` inside the receive loop.
 - keep it enabled unless the runtime provides a custom status handler with the same contract.
 - this makes `GET /hives/{hive}/nodes/{name}/status` report `health_source=NODE_REPORTED` in normal operation.
+
+#### Admin internal gateway from SDK (`ADMIN_COMMAND`)
+
+Use this when a node/workflow needs to call `SY.admin` without HTTP (socket/WAN path):
+
+```rust
+use std::time::Duration;
+use fluxbee_sdk::{admin_command, AdminCommandRequest};
+use serde_json::json;
+
+let out = admin_command(
+    &sender,
+    &mut receiver,
+    AdminCommandRequest {
+        admin_target: "SY.admin@motherbee",
+        action: "list_admin_actions",
+        target: None,                 // use Some("worker-220") for hive-scoped actions
+        params: json!({}),
+        request_id: None,
+        timeout: Duration::from_secs(10),
+    },
+).await?;
+
+assert_eq!(out.status, "ok");
+```
+
+Operational checks for this gateway:
+- `scripts/admin_internal_socket_actions_e2e.sh`
+- `scripts/admin_http_socket_parity_e2e.sh`
+- `scripts/admin_list_actions_e2e.sh`
+- `scripts/admin_all_actions_matrix_e2e.sh`
 
 #### Blob: basic flow (`put`/`promote` -> attach)
 
