@@ -409,13 +409,21 @@ fn split_pending_tool_results(
 ) -> (Vec<crate::function_calling::FunctionToolResult>, Vec<FunctionLoopItem>) {
     let mut prefix = items;
     let mut tail = Vec::new();
+    let mut expected_response_id: Option<Option<String>> = None;
 
     loop {
         let Some(last) = prefix.last() else {
             break;
         };
         match last {
-            FunctionLoopItem::ToolResult { .. } => {
+            FunctionLoopItem::ToolResult { result } => {
+                if let Some(expected) = &expected_response_id {
+                    if expected != &result.response_id {
+                        break;
+                    }
+                } else {
+                    expected_response_id = Some(result.response_id.clone());
+                }
                 let popped = prefix.pop().expect("last item exists");
                 if let FunctionLoopItem::ToolResult { result } = popped {
                     tail.push(result);
