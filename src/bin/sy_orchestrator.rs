@@ -6385,6 +6385,20 @@ fn identity_error_code_and_message(err: &IdentityError) -> (String, String) {
     }
 }
 
+fn map_identity_action_result(
+    action_label: &str,
+    result: Result<serde_json::Value, IdentityError>,
+) -> Result<serde_json::Value, OrchestratorError> {
+    result.map_err(|err| {
+        let (error_code, message) = identity_error_code_and_message(&err);
+        format!(
+            "identity {} failed code={} message={}",
+            action_label, error_code, message
+        )
+        .into()
+    })
+}
+
 async fn ensure_node_identity_registered(
     state: &OrchestratorState,
     payload: &serde_json::Value,
@@ -6428,14 +6442,8 @@ async fn ensure_node_identity_registered(
         request_payload,
         system_forward_timeout(),
     )
-    .await
-    .map_err(|err| {
-        let (error_code, message) = identity_error_code_and_message(&err);
-        format!(
-            "identity register failed code={} message={}",
-            error_code, message
-        )
-    })?;
+    .await;
+    let response = map_identity_action_result("register", response)?;
 
     let resolved_ilk_id = response
         .get("ilk_id")
@@ -6496,21 +6504,15 @@ async fn apply_node_identity_update(
         "change_reason": change_reason,
     });
     let identity_target = format!("SY.identity@{}", identity_primary_hive_id);
-    relay_identity_system_call_ok(
+    let update_result = relay_identity_system_call_ok(
         state,
         &identity_target,
         MSG_ILK_UPDATE,
         request_payload,
         system_forward_timeout(),
     )
-    .await
-    .map_err(|err| {
-        let (error_code, message) = identity_error_code_and_message(&err);
-        format!(
-            "identity update failed code={} message={}",
-            error_code, message
-        )
-    })?;
+    .await;
+    let _ = map_identity_action_result("update", update_result)?;
 
     Ok(Some(serde_json::json!({
         "status": "ok",
@@ -11266,5 +11268,67 @@ blob:
 
         assert!(!changed);
         assert_eq!(updated, config);
+    }
+
+    #[test]
+    fn identity_error_code_and_message_maps_system_rejected() {
+        let err = IdentityError::SystemRejected {
+            action: MSG_ILK_REGISTER.to_string(),
+            error_code: "INVALID_TENANT".to_string(),
+            message: "tenant missing".to_string(),
+        };
+        let (code, message) = identity_error_code_and_message(&err);
+        assert_eq!(code, "INVALID_TENANT");
+        assert_eq!(message, "tenant missing");
+    }
+
+    #[test]
+    fn identity_error_code_and_message_maps_action_timeout() {
+        let err = IdentityError::ActionTimeout {
+            action: MSG_ILK_UPDATE.to_string(),
+            trace_id: "trace-123".to_string(),
+            target: "SY.identity@motherbee".to_string(),
+            timeout_ms: 2500,
+        };
+        let (code, message) = identity_error_code_and_message(&err);
+        assert_eq!(code, "TIMEOUT");
+        assert!(message.contains("action=ILK_UPDATE"));
+        assert!(message.contains("trace_id=trace-123"));
+    }
+
+    #[test]
+    fn map_identity_action_result_returns_payload_for_ok() {
+        let payload = serde_json::json!({"status": "ok", "ilk_id": "ilk:demo"});
+        let out = map_identity_action_result("register", Ok(payload.clone())).expect("ok");
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn map_identity_action_result_formats_register_error() {
+        let err = IdentityError::SystemRejected {
+            action: MSG_ILK_REGISTER.to_string(),
+            error_code: "INVALID_TENANT".to_string(),
+            message: "tenant missing".to_string(),
+        };
+        let out = map_identity_action_result("register", Err(err)).expect_err("must fail");
+        let message = out.to_string();
+        assert!(message.contains("identity register failed"));
+        assert!(message.contains("code=INVALID_TENANT"));
+        assert!(message.contains("message=tenant missing"));
+    }
+
+    #[test]
+    fn map_identity_action_result_formats_update_error() {
+        let err = IdentityError::ActionTimeout {
+            action: MSG_ILK_UPDATE.to_string(),
+            trace_id: "trace-999".to_string(),
+            target: "SY.identity@motherbee".to_string(),
+            timeout_ms: 5000,
+        };
+        let out = map_identity_action_result("update", Err(err)).expect_err("must fail");
+        let message = out.to_string();
+        assert!(message.contains("identity update failed"));
+        assert!(message.contains("code=TIMEOUT"));
+        assert!(message.contains("action=ILK_UPDATE"));
     }
 }

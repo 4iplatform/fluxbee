@@ -331,9 +331,9 @@ Lista de tareas FR-10 (backlog):
 - [x] FR10-T4. Mapear `IdentityError -> OrchestratorError` preservando códigos/mensajes ya consumidos por admin/E2E.
 - [x] FR10-T5. Mantener `identity_target` explícito (`SY.identity@motherbee`) en payload de respuesta para no romper diagnósticos actuales.
 - [ ] FR10-T6. Si aparece lógica reusable, subir al SDK solo helpers agnósticos de transporte/protocolo identity (no reglas de negocio de orchestrator).
-- [ ] FR10-T7. Unit tests en orchestrator para mapeo de error y paths `ok/error` de registro/actualización identity.
-- [ ] FR10-T8. Re-ejecutar regresión E2E mínima: `identity_register_strict_e2e.sh` + `inventory_identity_primary_routing_e2e.sh`.
-- [ ] FR10-T9. Actualizar docs de implementación (`10-identity-v2.md` + este doc) indicando que orchestrator usa helper SDK para identity calls.
+- [x] FR10-T7. Unit tests en orchestrator para mapeo de error y paths `ok/error` de registro/actualización identity.
+- [x] FR10-T8. Re-ejecutar regresión E2E mínima: `identity_register_strict_e2e.sh` + `inventory_identity_primary_routing_e2e.sh`.
+- [x] FR10-T9. Actualizar docs de implementación (`10-identity-v2.md` + este doc) indicando que orchestrator usa helper SDK para identity calls.
 
 Criterio de cierre FR-10:
 - No hay envío manual de `ILK_REGISTER/ILK_UPDATE` en orchestrator fuera del wrapper de transición.
