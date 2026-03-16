@@ -36,6 +36,29 @@ Every message flows through a unified routing layer that knows who's talking, wh
 
 Operational API for motherbee control is exposed by `SY.admin` (default `127.0.0.1:8080`).
 
+## Network Ports (Motherbee <-> Workers)
+
+This is the effective port map for current deployments.
+
+| Port | Proto | Scope | Purpose | Default owner/listener |
+|---|---|---|---|---|
+| `9000` | TCP | inter-hive | WAN gateway channel (`RT.gateway`) | `motherbee` (`wan.listen`) |
+| `9100` | TCP | inter-hive | Identity full-sync + delta stream | `SY.identity` primary (`motherbee`) |
+| `22000` | TCP | inter-hive | Syncthing data sync (`blob`/`dist`) | peer-to-peer (`motherbee` + workers) |
+| `22000` | UDP | inter-hive | Syncthing QUIC/data sync | peer-to-peer (`motherbee` + workers) |
+| `21027` | UDP | LAN discovery | Syncthing local discovery | peer-to-peer LAN |
+| `8080` | TCP | local | `SY.admin` HTTP API | local host (`127.0.0.1` by default) |
+| `8384` | TCP | local | Syncthing API/GUI | local host (`127.0.0.1` by default) |
+| `4222` | TCP | local | Embedded NATS | local host (`127.0.0.1` by default) |
+| `22` | TCP | ops/bootstrap | SSH bootstrap/maintenance channel | worker host SSH daemon |
+
+Firewall behavior in `SY.orchestrator`:
+
+- Automatic firewall management is currently implemented for Syncthing ports (`22000/tcp`, `22000/udp`, `21027/udp`) when blob/dist sync is enabled.
+- This runs locally on each hive where `SY.orchestrator` starts and reconciles Syncthing runtime.
+- WAN (`9000/tcp`) and identity sync (`9100/tcp`) are not auto-opened by orchestrator firewall helpers today; they must be allowed by infrastructure policy (at least on motherbee, and on workers if configured to listen).
+- If neither `ufw` nor `firewalld` exists on host, orchestrator logs a warning and port policy remains external.
+
 ### Base URL
 
 ```bash
