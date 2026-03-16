@@ -1,7 +1,7 @@
 # JSON Router - 02 Protocolo de Mensajes
 
-**Estado:** v1.19  
-**Fecha:** 2026-03-12  
+**Estado:** v1.21  
+**Fecha:** 2026-03-15  
 **Audiencia:** Desarrolladores de librería de nodo, desarrolladores de nodos
 
 ---
@@ -790,6 +790,8 @@ Request/response para obtener EventPackage completo de otra isla:
 | `SPAWN_NODE_RESPONSE` | `SY.orchestrator@<hive>` | Originador de `SPAWN_NODE` | Resultado de spawn |
 | `KILL_NODE` | `SY.admin` (tooling E2E solo entorno controlado) | `SY.orchestrator@<hive>` | Solicitar terminación de nodo |
 | `KILL_NODE_RESPONSE` | `SY.orchestrator@<hive>` | Originador de `KILL_NODE` | Resultado de kill |
+| `NODE_STATUS_GET` | `SY.admin` (vía endpoint de status) | `SY.orchestrator@<hive>` | Solicitar snapshot canónico de estado de un nodo |
+| `NODE_STATUS_GET_RESPONSE` | `SY.orchestrator@<hive>` | Originador de `NODE_STATUS_GET` | Retornar estado consolidado (`lifecycle`, `health`, `config`, `process`, `status_version`) |
 | `SYSTEM_SYNC_HINT` *(propuesto v2.x)* | `SY.admin` / SDK productor (según política) | `SY.orchestrator@<hive>` | Acelerar/confirmar convergencia de canal Syncthing (`blob`/`dist`) |
 | `SYSTEM_SYNC_HINT_RESPONSE` *(propuesto v2.x)* | `SY.orchestrator@<hive>` | Originador de `SYSTEM_SYNC_HINT` | Estado de convergencia del folder (`ok`/`sync_pending`/`error`) |
 
@@ -985,7 +987,67 @@ Estados/códigos típicos:
 - `status=error`, `error_code=INVALID_REQUEST`.
 - `status=error`, `error_code=KILL_FAILED`.
 
-#### 7.9.4 SYSTEM_SYNC_HINT *(propuesto v2.x)*
+#### 7.9.4 NODE_STATUS_GET
+
+Objetivo:
+- obtener un snapshot canónico de estado por nodo, consistente en local/remoto.
+- evitar parsing ad-hoc por runtime para troubleshooting operativo.
+
+Request:
+
+```json
+{
+  "routing": {
+    "src": "SY.admin@motherbee",
+    "dst": "SY.orchestrator@worker-1",
+    "ttl": 16,
+    "trace_id": "..."
+  },
+  "meta": {
+    "type": "system",
+    "msg": "NODE_STATUS_GET"
+  },
+  "payload": {
+    "node_name": "WF.demo.worker@worker-1"
+  }
+}
+```
+
+Response (`NODE_STATUS_GET_RESPONSE`) mínima:
+
+```json
+{
+  "payload": {
+    "status": "ok",
+    "target": "worker-1",
+    "hive": "worker-1",
+    "node_name": "WF.demo.worker@worker-1",
+    "node_status": {
+      "schema_version": "1",
+      "node_name": "WF.demo.worker@worker-1",
+      "hive_id": "worker-1",
+      "observed_at": "2026-03-14T14:28:37Z",
+      "lifecycle_state": "RUNNING",
+      "health_state": "HEALTHY",
+      "health_source": "NODE_REPORTED",
+      "status_version": 3
+    }
+  }
+}
+```
+
+Semántica canónica:
+- `lifecycle_state`: `STARTING|RUNNING|STOPPING|STOPPED|FAILED|UNKNOWN`
+- `health_state`: `HEALTHY|DEGRADED|ERROR|UNKNOWN`
+- `health_source`: `NODE_REPORTED|ORCHESTRATOR_INFERRED|UNKNOWN`
+- `status_version`: contador monotónico por nodo, persistido en disco por orchestrator.
+
+Regla de precedencia:
+- si el nodo responde status en tiempo (timeout 2s), prevalece `health_source=NODE_REPORTED`;
+- si no responde y `lifecycle_state=RUNNING`, orchestrator aplica fallback (`ORCHESTRATOR_INFERRED`);
+- si no hay señal suficiente o el nodo no está runnable, `health_source=UNKNOWN`.
+
+#### 7.9.5 SYSTEM_SYNC_HINT *(propuesto v2.x)*
 
 Objetivo:
 - gatillar sincronización por evento sobre Syncthing y opcionalmente esperar convergencia observada.
@@ -1018,6 +1080,80 @@ Status de respuesta (`SYSTEM_SYNC_HINT_RESPONSE.payload.status`):
 - `ok`: folder sano y convergencia observada
 - `sync_pending`: hint aplicado, aún sin convergencia final
 - `error`: timeout o estado inválido del folder/API
+
+---
+
+### 7.10 SY.admin Internal Gateway (`ADMIN_COMMAND`)
+
+Canal canónico para ejecutar acciones de control en `SY.admin` vía socket/WAN, en paridad con HTTP.
+
+| Mensaje | Origen | Destino | Propósito |
+|---------|--------|---------|-----------|
+| `ADMIN_COMMAND` | caller interno (`AI/WF/IO` o tooling) | `SY.admin@<hive>` | Ejecutar acción administrativa (`run_node`, `kill_node`, `get_node_status`, `update`, `sync_hint`, `inventory`, etc.) |
+| `ADMIN_COMMAND_RESPONSE` | `SY.admin@<hive>` | Originador de `ADMIN_COMMAND` | Envelope de resultado unificado (`status/action/payload/error_code/error_detail`) |
+
+Request mínimo:
+
+```json
+{
+  "routing": {
+    "src": "WF.some.caller@motherbee",
+    "dst": "SY.admin@motherbee",
+    "ttl": 16,
+    "trace_id": "..."
+  },
+  "meta": {
+    "type": "admin",
+    "msg": "ADMIN_COMMAND",
+    "target": "SY.admin@motherbee"
+  },
+  "payload": {
+    "action": "run_node",
+    "target": "worker-220",
+    "params": {
+      "node_name": "WF.demo.internal",
+      "runtime": "wf.orch.diag",
+      "runtime_version": "current",
+      "tenant_id": "tnt:..."
+    },
+    "request_id": "..."
+  }
+}
+```
+
+Response mínima:
+
+```json
+{
+  "meta": {
+    "type": "admin",
+    "msg": "ADMIN_COMMAND_RESPONSE"
+  },
+  "payload": {
+    "status": "ok",
+    "action": "run_node",
+    "payload": { "...": "..." },
+    "error_code": null,
+    "error_detail": null,
+    "request_id": "...",
+    "trace_id": "..."
+  }
+}
+```
+
+Reglas de contrato:
+- `payload.action` es obligatorio.
+- `payload.params` debe ser objeto JSON o `null`.
+- Para acciones node-scoped (`run_node`, `kill_node`, `get_node_*`), si `params.node_name` trae `@hive`, ese hive tiene precedencia sobre `payload.target`.
+- Campos legacy de params se rechazan con `INVALID_REQUEST`:
+  - `name` (usar `node_name`)
+  - `version` (usar `runtime_version` o `manifest_version` según acción)
+  - `hash` (usar `manifest_hash`)
+- `SY.admin` mantiene lock monocomando global compartido entre HTTP y socket.
+
+Cobertura E2E (FR-09):
+- `scripts/admin_internal_socket_actions_e2e.sh` (socket actions)
+- `scripts/admin_http_socket_parity_e2e.sh` (paridad HTTP vs socket, subset crítico)
 
 ---
 

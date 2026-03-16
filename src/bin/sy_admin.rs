@@ -27,6 +27,8 @@ use json_router::shm::{
 
 type AdminError = Box<dyn std::error::Error + Send + Sync>;
 const PRIMARY_HIVE_ID: &str = "motherbee";
+const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
+const MSG_ADMIN_COMMAND_RESPONSE: &str = "ADMIN_COMMAND_RESPONSE";
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -56,6 +58,7 @@ struct AdminContext {
     authorized_hives: Vec<String>,
     nats_endpoint: String,
     nats_client: Arc<NatsClient>,
+    command_lock: Arc<Mutex<()>>,
 }
 
 struct AdminRouterClient {
@@ -63,17 +66,20 @@ struct AdminRouterClient {
     pending_admin: Mutex<HashMap<String, oneshot::Sender<Message>>>,
     system_tx: broadcast::Sender<Message>,
     query_tx: broadcast::Sender<Message>,
+    internal_admin_tx: broadcast::Sender<Message>,
 }
 
 impl AdminRouterClient {
     fn new(sender: NodeSender) -> Self {
         let (system_tx, _) = broadcast::channel(256);
         let (query_tx, _) = broadcast::channel(256);
+        let (internal_admin_tx, _) = broadcast::channel(256);
         Self {
             sender,
             pending_admin: Mutex::new(HashMap::new()),
             system_tx,
             query_tx,
+            internal_admin_tx,
         }
     }
 
@@ -122,6 +128,10 @@ impl AdminRouterClient {
                 return;
             }
         }
+        if msg.meta.msg_type == "admin" && msg.meta.msg.as_deref() == Some(MSG_ADMIN_COMMAND) {
+            let _ = self.internal_admin_tx.send(msg);
+            return;
+        }
         if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some("CONFIG_RESPONSE") {
             let _ = self.system_tx.send(msg);
             return;
@@ -147,6 +157,10 @@ impl AdminRouterClient {
 
     fn subscribe_query(&self) -> broadcast::Receiver<Message> {
         self.query_tx.subscribe()
+    }
+
+    fn subscribe_internal_admin(&self) -> broadcast::Receiver<Message> {
+        self.internal_admin_tx.subscribe()
     }
 }
 
@@ -238,6 +252,7 @@ async fn main() -> Result<(), AdminError> {
     let (broadcast_tx, broadcast_rx) = mpsc::unbounded_channel::<BroadcastRequest>();
     let http_tx = broadcast_tx.clone();
     let nats_client = Arc::new(NatsClient::from_client_config(&client_config)?);
+    let command_lock = Arc::new(Mutex::new(()));
     let http_ctx = AdminContext {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
@@ -246,7 +261,9 @@ async fn main() -> Result<(), AdminError> {
         authorized_hives,
         nats_endpoint: nats_client.endpoint().to_string(),
         nats_client,
+        command_lock,
     };
+    let internal_ctx = http_ctx.clone();
     let http_client = router_client.clone();
     tokio::spawn(async move {
         if let Err(err) = run_http_server(&admin_listen, &http_tx, http_ctx, http_client).await {
@@ -257,6 +274,12 @@ async fn main() -> Result<(), AdminError> {
     let loop_client = router_client.clone();
     tokio::spawn(async move {
         run_broadcast_loop(broadcast_rx, loop_client).await;
+    });
+
+    let internal_client = router_client.clone();
+    let internal_rx = router_client.subscribe_internal_admin();
+    tokio::spawn(async move {
+        run_internal_admin_loop(internal_ctx, internal_client, internal_rx).await;
     });
 
     future::pending::<()>().await;
@@ -517,6 +540,438 @@ struct AdminRequest {
     unicast: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct InternalAdminCommandPayload {
+    action: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    params: serde_json::Value,
+    #[serde(default)]
+    request_id: Option<String>,
+}
+
+async fn run_internal_admin_loop(
+    ctx: AdminContext,
+    client: Arc<AdminRouterClient>,
+    mut rx: broadcast::Receiver<Message>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(msg) => {
+                if let Err(err) = handle_internal_admin_command(&ctx, &client, &msg).await {
+                    tracing::warn!(error = %err, "internal admin command handling failed");
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(skipped = skipped, "internal admin loop lagged; dropping stale commands");
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+async fn handle_internal_admin_command(
+    ctx: &AdminContext,
+    client: &Arc<AdminRouterClient>,
+    msg: &Message,
+) -> Result<(), AdminError> {
+    if msg.meta.msg_type != "admin" || msg.meta.msg.as_deref() != Some(MSG_ADMIN_COMMAND) {
+        return Ok(());
+    }
+
+    let payload = serde_json::from_value::<InternalAdminCommandPayload>(msg.payload.clone());
+    let parsed = match payload {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let detail = serde_json::json!({ "message": err.to_string() });
+            return send_admin_command_response(
+                client,
+                msg,
+                "",
+                "error",
+                serde_json::Value::Null,
+                Some("INVALID_REQUEST".to_string()),
+                Some(detail),
+                None,
+            )
+            .await;
+        }
+    };
+
+    let action = match parsed
+        .action
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(action) => action.to_string(),
+        None => {
+            let detail = serde_json::json!({ "message": "missing payload.action" });
+            return send_admin_command_response(
+                client,
+                msg,
+                "",
+                "error",
+                serde_json::Value::Null,
+                Some("INVALID_REQUEST".to_string()),
+                Some(detail),
+                parsed.request_id,
+            )
+            .await;
+        }
+    };
+
+    let internal = {
+        let _command_guard = ctx.command_lock.lock().await;
+        dispatch_internal_admin_command(
+            ctx,
+            client,
+            &action,
+            parsed.target.as_deref(),
+            parsed.params,
+        )
+        .await?
+    };
+    let status = internal
+        .envelope
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or(if internal.http_status < 400 { "ok" } else { "error" });
+    let action_out = internal
+        .envelope
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&action)
+        .to_string();
+    let payload = internal
+        .envelope
+        .get("payload")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let error_code = internal
+        .envelope
+        .get("error_code")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let error_detail = internal
+        .envelope
+        .get("error_detail")
+        .cloned()
+        .and_then(|v| if v.is_null() { None } else { Some(v) });
+
+    send_admin_command_response(
+        client,
+        msg,
+        &action_out,
+        status,
+        payload,
+        error_code,
+        error_detail,
+        parsed.request_id,
+    )
+    .await
+}
+
+async fn send_admin_command_response(
+    client: &AdminRouterClient,
+    request_msg: &Message,
+    action: &str,
+    status: &str,
+    payload: serde_json::Value,
+    error_code: Option<String>,
+    error_detail: Option<serde_json::Value>,
+    request_id: Option<String>,
+) -> Result<(), AdminError> {
+    let mut body = serde_json::json!({
+        "status": status,
+        "action": action,
+        "payload": payload,
+        "error_code": error_code,
+        "error_detail": error_detail,
+    });
+    if let Some(req_id) = request_id {
+        body["request_id"] = serde_json::Value::String(req_id);
+    }
+
+    let response = Message {
+        routing: Routing {
+            src: client.sender.uuid().to_string(),
+            dst: Destination::Unicast(request_msg.routing.src.clone()),
+            ttl: 16,
+            trace_id: request_msg.routing.trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: "admin".to_string(),
+            msg: Some(MSG_ADMIN_COMMAND_RESPONSE.to_string()),
+            scope: None,
+            target: None,
+            action: Some(action.to_string()),
+            priority: None,
+            context: None,
+        },
+        payload: body,
+    };
+    client.sender.send(response).await?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct InternalAdminDispatchResult {
+    http_status: u16,
+    envelope: serde_json::Value,
+}
+
+#[derive(Clone, Copy)]
+enum InternalActionRoute {
+    Query(&'static str),
+    Command(&'static str),
+    Update,
+    SyncHint,
+    Inventory,
+    OpaHttp(OpaAction),
+    OpaQuery(&'static str),
+}
+
+#[derive(Clone, Copy)]
+struct InternalActionSpec {
+    action: &'static str,
+    route: InternalActionRoute,
+    requires_target: bool,
+    allow_legacy_hive_id: bool,
+}
+
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "1";
+
+const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
+    InternalActionSpec { action: "hive_status", route: InternalActionRoute::Query("hive_status"), requires_target: false, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "list_hives", route: InternalActionRoute::Query("list_hives"), requires_target: false, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "list_admin_actions", route: InternalActionRoute::Query("list_admin_actions"), requires_target: false, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "list_versions", route: InternalActionRoute::Query("list_versions"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "get_versions", route: InternalActionRoute::Query("get_versions"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "list_routes", route: InternalActionRoute::Query("list_routes"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "list_vpns", route: InternalActionRoute::Query("list_vpns"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "list_nodes", route: InternalActionRoute::Query("list_nodes"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "get_storage", route: InternalActionRoute::Query("get_storage"), requires_target: false, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "add_hive", route: InternalActionRoute::Command("add_hive"), requires_target: false, allow_legacy_hive_id: true },
+    InternalActionSpec { action: "get_hive", route: InternalActionRoute::Command("get_hive"), requires_target: false, allow_legacy_hive_id: true },
+    InternalActionSpec { action: "remove_hive", route: InternalActionRoute::Command("remove_hive"), requires_target: false, allow_legacy_hive_id: true },
+    InternalActionSpec { action: "add_route", route: InternalActionRoute::Command("add_route"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "delete_route", route: InternalActionRoute::Command("delete_route"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "add_vpn", route: InternalActionRoute::Command("add_vpn"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "delete_vpn", route: InternalActionRoute::Command("delete_vpn"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "run_node", route: InternalActionRoute::Command("run_node"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "kill_node", route: InternalActionRoute::Command("kill_node"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "get_node_config", route: InternalActionRoute::Command("get_node_config"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "set_node_config", route: InternalActionRoute::Command("set_node_config"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "get_node_state", route: InternalActionRoute::Command("get_node_state"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "get_node_status", route: InternalActionRoute::Command("get_node_status"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "list_deployments", route: InternalActionRoute::Command("list_deployments"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "get_deployments", route: InternalActionRoute::Command("get_deployments"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "list_drift_alerts", route: InternalActionRoute::Command("list_drift_alerts"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "get_drift_alerts", route: InternalActionRoute::Command("get_drift_alerts"), requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "set_storage", route: InternalActionRoute::Command("set_storage"), requires_target: false, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "update", route: InternalActionRoute::Update, requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "sync_hint", route: InternalActionRoute::SyncHint, requires_target: true, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "inventory", route: InternalActionRoute::Inventory, requires_target: false, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "opa_compile_apply", route: InternalActionRoute::OpaHttp(OpaAction::CompileApply), requires_target: false, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "opa_compile", route: InternalActionRoute::OpaHttp(OpaAction::Compile), requires_target: false, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "opa_apply", route: InternalActionRoute::OpaHttp(OpaAction::Apply), requires_target: false, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "opa_rollback", route: InternalActionRoute::OpaHttp(OpaAction::Rollback), requires_target: false, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "opa_check", route: InternalActionRoute::OpaHttp(OpaAction::Check), requires_target: false, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "opa_get_policy", route: InternalActionRoute::OpaQuery("get_policy"), requires_target: false, allow_legacy_hive_id: false },
+    InternalActionSpec { action: "opa_get_status", route: InternalActionRoute::OpaQuery("get_status"), requires_target: false, allow_legacy_hive_id: false },
+];
+
+async fn dispatch_internal_admin_command(
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+    action: &str,
+    target: Option<&str>,
+    params: serde_json::Value,
+) -> Result<InternalAdminDispatchResult, AdminError> {
+    let spec = match resolve_internal_action_spec(action) {
+        Ok(route) => route,
+        Err(detail) => return Ok(internal_invalid_request(action, detail)),
+    };
+
+    if let Some(detail) = internal_admin_payload_contract_error(spec, &params) {
+        return Ok(internal_invalid_request(action, &detail));
+    }
+
+    let (status, body) = match spec.route {
+        InternalActionRoute::Query(canonical) => {
+            let hive = resolve_internal_action_hive(canonical, target, &params);
+            if spec.requires_target && hive.is_none() {
+                return Ok(internal_invalid_request(
+                    action,
+                    "missing target (payload.target required for this action)",
+                ));
+            }
+            handle_admin_query(ctx, client, canonical, hive).await?
+        }
+        InternalActionRoute::Command(canonical) => {
+            let hive = resolve_internal_action_hive(canonical, target, &params);
+            if spec.requires_target && hive.is_none() {
+                return Ok(internal_invalid_request(
+                    action,
+                    "missing target (payload.target required for this action)",
+                ));
+            }
+            handle_admin_command(ctx, client, canonical, params, hive).await?
+        }
+        InternalActionRoute::Update => {
+            let hive = resolve_internal_action_hive("update", target, &params);
+            let Some(hive_id) = hive else {
+                return Ok(internal_invalid_request(
+                    action,
+                    "missing target (payload.target required for this action)",
+                ));
+            };
+            handle_hive_update_command(ctx, client, hive_id, params).await?
+        }
+        InternalActionRoute::SyncHint => {
+            let hive = resolve_internal_action_hive("sync_hint", target, &params);
+            let Some(hive_id) = hive else {
+                return Ok(internal_invalid_request(
+                    action,
+                    "missing target (payload.target required for this action)",
+                ));
+            };
+            handle_hive_sync_hint_command(ctx, client, hive_id, params).await?
+        }
+        InternalActionRoute::Inventory => handle_inventory_http(ctx, client, params).await?,
+        InternalActionRoute::OpaHttp(opa_action) => {
+            let hive = resolve_internal_action_hive(action, target, &params);
+            let req = parse_internal_opa_request(params, hive)
+                .map_err(|detail| -> AdminError { detail.into() })?;
+            handle_opa_http(ctx, client, req, opa_action).await?
+        }
+        InternalActionRoute::OpaQuery(query_action) => {
+            let hive = resolve_internal_action_hive(action, target, &params);
+            handle_opa_query(ctx, client, query_action, hive.clone()).await?
+        }
+    };
+
+    Ok(InternalAdminDispatchResult {
+        http_status: status,
+        envelope: parse_internal_response_envelope(action, status, &body),
+    })
+}
+
+fn parse_internal_response_envelope(
+    action: &str,
+    http_status: u16,
+    body: &str,
+) -> serde_json::Value {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) if value.is_object() => value,
+        Ok(_) | Err(_) => serde_json::json!({
+            "status": "error",
+            "action": action,
+            "payload": serde_json::Value::Null,
+            "error_code": "TRANSPORT_ERROR",
+            "error_detail": format!("invalid response envelope (http_status={http_status})"),
+        }),
+    }
+}
+
+fn normalize_internal_target_hive(target: Option<&str>) -> Option<String> {
+    let raw = target?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some((_, hive)) = raw.rsplit_once('@') {
+        let hive = hive.trim();
+        if !hive.is_empty() {
+            return Some(hive.to_string());
+        }
+    }
+    Some(raw.to_string())
+}
+
+fn internal_admin_payload_contract_error(
+    action: &InternalActionSpec,
+    params: &serde_json::Value,
+) -> Option<String> {
+    if !params.is_object() {
+        return None;
+    }
+    if params.get("hive_id").is_some() && !action.allow_legacy_hive_id {
+        return Some(
+            "legacy field 'hive_id' is not supported for this action; use payload.target"
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn resolve_internal_action_hive(
+    action: &str,
+    target: Option<&str>,
+    params: &serde_json::Value,
+) -> Option<String> {
+    if let Some(node_hive) = node_name_hive_from_payload(action, params).map(str::to_string) {
+        return Some(node_hive);
+    }
+    normalize_internal_target_hive(target)
+}
+
+fn resolve_internal_action_spec(action: &str) -> Result<&'static InternalActionSpec, &'static str> {
+    debug_assert!(!INTERNAL_ACTION_REGISTRY_VERSION.is_empty());
+    if matches!(
+        action,
+        "list_routers" | "get_routers" | "add_router" | "delete_router"
+    ) {
+        return Err(
+            "legacy router action is not supported; use inventory/list_nodes/list_routes/list_vpns",
+        );
+    }
+    INTERNAL_ACTION_REGISTRY
+        .iter()
+        .find(|spec| spec.action == action)
+        .ok_or("unknown action")
+}
+
+fn parse_internal_opa_request(
+    params: serde_json::Value,
+    default_hive: Option<String>,
+) -> Result<OpaRequest, String> {
+    if !params.is_null() && !params.is_object() {
+        return Err("invalid params: expected JSON object for OPA action".to_string());
+    }
+    let mut req = if params.is_null() {
+        OpaRequest {
+            rego: None,
+            entrypoint: None,
+            version: None,
+            action: None,
+            hive: None,
+        }
+    } else {
+        serde_json::from_value::<OpaRequest>(params)
+            .map_err(|err| format!("invalid OPA params: {err}"))?
+    };
+    if req.hive.is_none() {
+        req.hive = default_hive;
+    }
+    Ok(req)
+}
+
+fn internal_invalid_request(action: &str, detail: &str) -> InternalAdminDispatchResult {
+    InternalAdminDispatchResult {
+        http_status: 400,
+        envelope: serde_json::json!({
+            "status": "error",
+            "action": action,
+            "payload": serde_json::Value::Null,
+            "error_code": "INVALID_REQUEST",
+            "error_detail": detail,
+        }),
+    }
+}
+
+#[derive(Clone, Copy)]
 enum OpaAction {
     Compile,
     CompileApply,
@@ -650,6 +1105,15 @@ async fn handle_http(
 ) -> Result<(), AdminError> {
     let (method, path, headers, body) = read_http_request(stream).await?;
     let (path, query) = split_path_query(&path);
+    if method == "GET" && path == "/health" {
+        respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
+        return Ok(());
+    }
+
+    // FR9-T5: single global command lock shared by HTTP and internal socket commands.
+    // Contention is blocking (wait), never immediate reject.
+    let _command_guard = ctx.command_lock.lock().await;
+
     if method == "GET" {
         if path == "/inventory" {
             let mut payload = serde_json::json!({ "scope": "global" });
@@ -719,8 +1183,10 @@ async fn handle_http(
         return Ok(());
     }
     match (method.as_str(), path) {
-        ("GET", "/health") => {
-            respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
+        ("GET", "/admin/actions") => {
+            let (status, resp) =
+                handle_admin_query(ctx, client, "list_admin_actions", None).await?;
+            respond_json(stream, status, &resp).await?;
         }
         ("GET", "/hive/status") => {
             let (status, resp) = handle_admin_query(ctx, client, "hive_status", None).await?;
@@ -1150,6 +1616,67 @@ async fn handle_hive_paths(
             }
             let (status, resp) =
                 handle_admin_command(ctx, client, "kill_node", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["nodes", name, "config"]) => {
+            let payload = serde_json::json!({
+                "node_name": decode_percent(name),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "get_node_config", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("PUT", ["nodes", name, "config"]) => {
+            let config_payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if !config_payload.is_object() {
+                return Ok(Some((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "set_node_config",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": "request body must be a JSON object",
+                    })
+                    .to_string(),
+                )));
+            }
+            let replace = query
+                .get("replace")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let notify = query
+                .get("notify")
+                .map(|value| !(value == "0" || value.eq_ignore_ascii_case("false")))
+                .unwrap_or(true);
+            let payload = serde_json::json!({
+                "node_name": decode_percent(name),
+                "config": config_payload,
+                "replace": replace,
+                "notify": notify,
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "set_node_config", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["nodes", name, "state"]) => {
+            let payload = serde_json::json!({
+                "node_name": decode_percent(name),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "get_node_state", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["nodes", name, "status"]) => {
+            let payload = serde_json::json!({
+                "node_name": decode_percent(name),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "get_node_status", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["versions"]) => {
@@ -2044,10 +2571,51 @@ async fn handle_admin_query(
     action: &str,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
+    if action == "list_admin_actions" {
+        return Ok(build_admin_actions_catalog_response());
+    }
     let payload = normalize_admin_payload(action, serde_json::json!({}), hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
     let response = send_admin_request(client, request, admin_action_timeout(action)).await;
     Ok(build_admin_http_response(action, response))
+}
+
+fn build_admin_actions_catalog_response() -> (u16, String) {
+    let actions: Vec<serde_json::Value> = INTERNAL_ACTION_REGISTRY
+        .iter()
+        .map(|spec| {
+            let (handler, canonical_action) = match spec.route {
+                InternalActionRoute::Query(canonical) => ("query", Some(canonical)),
+                InternalActionRoute::Command(canonical) => ("command", Some(canonical)),
+                InternalActionRoute::Update => ("update", None),
+                InternalActionRoute::SyncHint => ("sync_hint", None),
+                InternalActionRoute::Inventory => ("inventory", None),
+                InternalActionRoute::OpaHttp(_) => ("opa_http", None),
+                InternalActionRoute::OpaQuery(canonical) => ("opa_query", Some(canonical)),
+            };
+            serde_json::json!({
+                "action": spec.action,
+                "handler": handler,
+                "canonical_action": canonical_action,
+                "requires_target": spec.requires_target,
+                "allow_legacy_hive_id": spec.allow_legacy_hive_id,
+            })
+        })
+        .collect();
+    (
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "action": "list_admin_actions",
+            "payload": {
+                "registry_version": INTERNAL_ACTION_REGISTRY_VERSION,
+                "actions": actions,
+            },
+            "error_code": serde_json::Value::Null,
+            "error_detail": serde_json::Value::Null,
+        })
+        .to_string(),
+    )
 }
 
 async fn handle_admin_command(
@@ -2411,7 +2979,8 @@ fn build_admin_request(
         }
         "list_nodes" | "run_node" | "kill_node" | "hive_status" | "get_storage" | "set_storage"
         | "list_hives" | "get_hive" | "list_versions" | "get_versions" | "list_deployments"
-        | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "remove_hive"
+        | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "get_node_config"
+        | "set_node_config" | "get_node_state" | "get_node_status" | "remove_hive"
         | "add_hive" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
@@ -2573,7 +3142,8 @@ fn admin_action_timeout(action: &str) -> Duration {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
         }
         // other orchestrator mutating actions can also take longer than default.
-        "run_node" | "kill_node" | "remove_hive" => {
+        "run_node" | "kill_node" | "remove_hive" | "set_node_config" | "get_node_config"
+        | "get_node_state" | "get_node_status" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30))
         }
         _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5)),
@@ -2657,6 +3227,10 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "get_deployments"
             | "list_drift_alerts"
             | "get_drift_alerts"
+            | "get_node_config"
+            | "set_node_config"
+            | "get_node_state"
+            | "get_node_status"
             | "remove_hive"
             | "add_hive"
     )
@@ -2671,6 +3245,26 @@ fn normalize_admin_payload(
         return payload;
     }
 
+    if let Some(node_hive) = node_name_hive_from_payload(action, &payload) {
+        if let Some(requested_target) = payload
+            .get("target")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if requested_target != node_hive {
+                tracing::warn!(
+                    action = action,
+                    node_hive = %node_hive,
+                    requested_target = %requested_target,
+                    "node_name@hive overrides payload.target"
+                );
+            }
+        }
+        payload["target"] = serde_json::Value::String(node_hive.to_string());
+        return payload;
+    }
+
     if let Some(hive_id) = hive
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
@@ -2681,6 +3275,35 @@ fn normalize_admin_payload(
     }
 
     payload
+}
+
+fn node_name_hive_from_payload<'a>(action: &str, payload: &'a serde_json::Value) -> Option<&'a str> {
+    if !is_node_scoped_action(action) {
+        return None;
+    }
+    let node_name = payload
+        .get("node_name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let (_, hive) = node_name.rsplit_once('@')?;
+    let hive = hive.trim();
+    if hive.is_empty() {
+        return None;
+    }
+    Some(hive)
+}
+
+fn is_node_scoped_action(action: &str) -> bool {
+    matches!(
+        action,
+        "run_node"
+            | "kill_node"
+            | "get_node_config"
+            | "set_node_config"
+            | "get_node_state"
+            | "get_node_status"
+    )
 }
 
 fn admin_payload_contract_error(action: &str, payload: &serde_json::Value) -> Option<String> {

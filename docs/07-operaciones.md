@@ -1,7 +1,7 @@
 # JSON Router - 07 Operaciones
 
-**Estado:** v1.19  
-**Fecha:** 2026-03-12  
+**Estado:** v1.21  
+**Fecha:** 2026-03-15  
 **Audiencia:** Ops/SRE, desarrolladores de deployment
 
 ---
@@ -631,7 +631,7 @@ Modelo:
 - Motherbee publica artefactos y manifests en `/var/lib/fluxbee/dist/`.
 - Syncthing replica `dist/` entre hives.
 - `SY.admin` dispara `POST /hives/{id}/update`.
-- `SY.orchestrator@{hive}` valida manifest local (`manifest_version/manifest_hash`) y aplica local.
+- `SY.orchestrator@{hive}` valida manifest local (`manifest_version/manifest_hash`) y readiness de artefactos runtime (`start.sh` presente + ejecutable para versiones `current`) antes de responder `ok`.
 
 Categorías soportadas por update:
 - `runtime`
@@ -649,11 +649,16 @@ Flujo operativo canónico:
 
 ```
 1. Publicar artefactos/manifests en /var/lib/fluxbee/dist/
-2. Esperar convergencia de Syncthing en el worker (o usar hint/confirmación de sync cuando esté habilitado)
-3. POST /hives/{id}/update {category, manifest_version, manifest_hash}
-4. Admin envía SYSTEM_UPDATE -> SY.orchestrator@{hive}
-5. Orchestrator worker instala/reinicia localmente y responde SYSTEM_UPDATE_RESPONSE
-6. Admin devuelve respuesta HTTP (200 ok / 202 sync_pending / error)
+2. Verificar en motherbee: /hives/motherbee/versions refleja manifest + readiness del runtime objetivo
+3. Esperar convergencia de Syncthing en el worker (POST /hives/{id}/sync-hint canal dist)
+4. POST /hives/{id}/update {category, manifest_version, manifest_hash}
+5. Admin envía SYSTEM_UPDATE -> SY.orchestrator@{hive}
+6. Orchestrator worker responde:
+   - ok: manifest exacto y artefactos listos localmente
+   - sync_pending: aún no convergió manifest/artefactos
+   - error VERSION_MISMATCH: local_manifest_version > manifest_version pedido
+7. Solo con update=ok ejecutar POST /hives/{id}/nodes (spawn)
+8. Spawn valida start.sh del runtime/version solicitado; si falta/no ejecutable retorna RUNTIME_NOT_PRESENT (sin auto-update)
 ```
 
 Regla importante:
@@ -1004,9 +1009,39 @@ ssh -i /var/lib/fluxbee/ssh/motherbee.key administrator@192.168.1.50
 | `GET /hives/{id}/nodes` | `list_nodes` | Lista nodos de hive |
 | `POST /hives/{id}/nodes` | `run_node` | Envía `SPAWN_NODE` (contrato v2: `node_name`, `runtime`, `runtime_version`) |
 | `DELETE /hives/{id}/nodes/{name}` | `kill_node` | Envía `KILL_NODE` (soporta `force=true/false`) |
+| `GET /hives/{id}/nodes/{name}/status` | `get_node_status` | Snapshot canónico de estado de nodo (`lifecycle`, `health`, `source`, `status_version`) |
+| `GET /hives/{id}/nodes/{name}/config` | `get_node_config` | Lee `config.json` efectivo del nodo |
+| `PUT /hives/{id}/nodes/{name}/config` | `set_node_config` | Merge/patch de config per-node + señal de hot-reload |
+| `GET /hives/{id}/nodes/{name}/state` | `get_node_state` | Lectura diagnóstica de `state.json` (o `null` si no existe) |
 
 Nota:
 - Los routers se gestionan como nodos `RT.*` vía `SPAWN_NODE`/`KILL_NODE` usando los endpoints de nodos.
+
+### 5.2.1 Runbook de Status por Nodo
+
+Consultar status de un nodo:
+
+```bash
+BASE="http://127.0.0.1:8080"
+HIVE_ID="worker-220"
+NODE_NAME="WF.demo.worker@worker-220"
+
+curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/status" | jq .
+```
+
+Campos operativos relevantes (`payload.node_status`):
+- `lifecycle_state`: `STARTING|RUNNING|STOPPING|STOPPED|FAILED|UNKNOWN`
+- `health_state`: `HEALTHY|DEGRADED|ERROR|UNKNOWN`
+- `health_source`: `NODE_REPORTED|ORCHESTRATOR_INFERRED|UNKNOWN`
+- `status_version`: contador monotónico por nodo (persiste restart de orchestrator)
+
+Diagnóstico rápido:
+1. `lifecycle_state=FAILED` + `health_source=UNKNOWN`:
+   revisar unit systemd del nodo y logs del servicio.
+2. `lifecycle_state=RUNNING` + `health_source=ORCHESTRATOR_INFERRED`:
+   el nodo está vivo pero no respondió handler de status en timeout (2s).
+3. `config.valid=false`:
+   revisar `config.json` del nodo y re-aplicar `PUT /config` si corresponde.
 
 ### 5.3 Estado de Isla
 
@@ -1025,6 +1060,38 @@ Nota:
 | `GET /modules/{name}` | `list_versions` | Lista versiones de un módulo |
 | `GET /modules/{name}/{version}` | `get_module` | Descarga módulo |
 | `POST /modules/{name}/{version}` | `upload_module` | Sube módulo (solo mother) |
+
+### 5.5 Gateway Interno de Comandos (Socket/WAN)
+
+`SY.admin` centraliza control-plane por dos entradas equivalentes:
+1. HTTP (`/hives/*`, `/inventory`, `/config/*`, etc.)
+2. Socket/WAN (`ADMIN_COMMAND` / `ADMIN_COMMAND_RESPONSE`)
+
+Contrato operativo:
+- destino del mensaje: `routing.dst = "SY.admin@<hive>"`
+- `meta.type = "admin"`, `meta.msg = "ADMIN_COMMAND"`
+- `payload.action` + `payload.params` (+ `payload.target` opcional por acción)
+- respuesta en envelope admin estándar (`status/action/payload/error_code/error_detail/request_id`)
+
+Reglas relevantes:
+- lock monocomando global compartido entre HTTP y socket.
+- acciones node-scoped respetan precedencia `node_name@hive > target`.
+- payload legacy (`name`, `version`, `hash`) se rechaza con `INVALID_REQUEST`.
+- `SY.admin` no expone operaciones de identity en este gateway (identity queda en `SY.orchestrator` y `AI.frontdesk`).
+
+Runbook rápido (socket):
+
+```bash
+# ejemplo: inventory por socket interno
+ADMIN_ACTION="inventory" \
+ADMIN_TARGET="SY.admin@motherbee" \
+ADMIN_PARAMS_JSON='{"scope":"hive","filter_hive":"worker-220"}' \
+target/debug/admin_internal_command_diag | jq .
+```
+
+E2E de referencia:
+- `scripts/admin_internal_socket_actions_e2e.sh` (acciones socket)
+- `scripts/admin_http_socket_parity_e2e.sh` (paridad HTTP vs socket)
 
 ---
 

@@ -6,6 +6,7 @@ Estado:
 - conecta al router con `fluxbee_sdk`,
 - recibe mensajes y registra trazas básicas,
 - deja explicitado el flujo TODO para integración identity (`ILK_REGISTER`, `ILK_ADD_CHANNEL`).
+- pendiente: handler explícito de `get_node_status` (hoy puede quedar en fallback inferido por orchestrator).
 
 ## Variables útiles
 
@@ -35,3 +36,17 @@ Para cerrar el flujo productivo:
 
 Checklist de aceptación:
 - `docs/onworking/identity_v2_tasks.md` sección `E2`.
+
+## Status Operativo (recomendado)
+
+Este runtime debería responder `NODE_STATUS_GET` para evitar `health_source=ORCHESTRATOR_INFERRED`
+en `GET /hives/{hive}/nodes/{node}/status`.
+
+Consulta rápida:
+
+```bash
+BASE="http://127.0.0.1:8080"
+HIVE_ID="motherbee"
+NODE_NAME="AI.frontdesk.gov@$HIVE_ID"
+curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/status" | jq .
+```

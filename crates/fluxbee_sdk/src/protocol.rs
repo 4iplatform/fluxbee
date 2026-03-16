@@ -210,6 +210,8 @@ pub const MSG_TIME_SYNC: &str = "TIME_SYNC";
 pub const MSG_WITHDRAW: &str = "WITHDRAW";
 pub const MSG_CONFIG_CHANGED: &str = "CONFIG_CHANGED";
 pub const MSG_OPA_RELOAD: &str = "OPA_RELOAD";
+pub const MSG_NODE_STATUS_GET: &str = "NODE_STATUS_GET";
+pub const MSG_NODE_STATUS_GET_RESPONSE: &str = "NODE_STATUS_GET_RESPONSE";
 
 pub const SCOPE_VPN: &str = "vpn";
 pub const SCOPE_GLOBAL: &str = "global";

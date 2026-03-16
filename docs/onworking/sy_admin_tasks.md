@@ -1,6 +1,8 @@
 # SY.admin - Estado actual vs spec (v1.16+)
 
 > Nota de direccion (2026-03-02): las tareas activas para la arquitectura nueva (orchestrator v2, `SYSTEM_UPDATE`, control-plane socket L2) estan integradas en `docs/onworking/sy_orchestrator_v2_tasks.md`. Este archivo se mantiene como referencia historica de v1.16.
+>
+> Actualizacion de contrato (2026-03-13): `SY.admin` ya no expone `/hives/{id}/routers*`. La operacion canónica es por `/hives/{id}/nodes` (`SPAWN_NODE`/`KILL_NODE`). Cualquier mención de `/routers*` en este documento debe leerse como histórico.
 
 Checklist operativo consolidado para `SY.admin`.
 
@@ -20,17 +22,15 @@ Lista de tareas cerradas para alinear `SY.admin` con la especificacion actual y 
 - [x] OPA target broadcast/unicast alineado y timeout de OPA en 30s.
 
 ## Pendiente critico (impacta pruebas)
-- [x] Corregir routing multi-hive de acciones de nodos/routers:
-  - `/hives/{hive}/nodes|routers` ahora enruta a orchestrator local (`SY.orchestrator@motherbee`).
+- [x] Corregir routing multi-hive de acciones de nodos:
+  - `/hives/{hive}/nodes` ahora enruta a orchestrator local (`SY.orchestrator@motherbee`).
   - Se propaga `target` en payload para que orchestrator ejecute sobre hive remota.
-- [x] Corregir listado multi-hive de nodos/routers:
-  - `GET /hives/{hive}/nodes` y `GET /hives/{hive}/routers` ahora devuelven vista del hive target (no snapshot local de motherbee).
+- [x] Corregir listado multi-hive de nodos:
+  - `GET /hives/{hive}/nodes` devuelve vista del hive target (no snapshot local de motherbee).
 - [x] Corregir contrato de payload para `kill_node`:
   - HTTP mantiene `{"name": ...}` por compatibilidad.
   - `SY.admin` normaliza a `node_name` antes de enviar a orchestrator.
-- [x] Corregir contrato de payload para `kill_router`:
-  - HTTP mantiene `{"name": ...}` por compatibilidad.
-  - `SY.admin` normaliza a `service` antes de enviar a orchestrator.
+- [x] Eliminar contrato mutante de `kill_router` al retirar endpoints `/routers*`.
 
 ## Pendiente alto (consistencia API)
 - [x] Definir y aplicar version monotona para `CONFIG_CHANGED` en routes/vpns/storage.
@@ -43,7 +43,7 @@ Lista de tareas cerradas para alinear `SY.admin` con la especificacion actual y 
   - respuestas de admin/OPA incluyen envelope consistente con `status`, `action`, `payload`, `error_code`, `error_detail`.
 - [x] Eliminar coexistencia de rutas legacy para nodos/routers y dejar estrategia canónica:
   - removidos handlers legacy `/nodes` y `/routers` en `SY.admin`.
-  - canónico único: `/hives/{id}/nodes` y `/hives/{id}/routers`.
+  - canónico único: `/hives/{id}/nodes`.
 
 ## Pendiente medio
 - [x] Revalidar contrato `add_hive` desde API con matriz de errores esperados de spec.
@@ -52,9 +52,8 @@ Lista de tareas cerradas para alinear `SY.admin` con la especificacion actual y 
   - checklist actualizado con cobertura manual de `WAN_TIMEOUT`.
 - [x] Agregar pruebas de integracion end-to-end para:
   - [x] `/hives/{id}/nodes` (run/kill)
-  - [x] `/hives/{id}/routers` (run/kill)
   - [x] `/config/storage` (broadcast + confirmacion)
-  - Script E2E agregado: `scripts/admin_nodes_routers_storage_e2e.sh`.
+  - Nota: `scripts/admin_nodes_routers_storage_e2e.sh` quedó histórico porque valida `/routers*` (contrato removido en v2).
 
 ## Seguimiento
 - [x] Registrar mapeo final de endpoints por ownership:
@@ -70,7 +69,6 @@ Lista de tareas cerradas para alinear `SY.admin` con la especificacion actual y 
     - `GET/POST /hives`
     - `GET/DELETE /hives/{id}`
     - `GET/POST/DELETE /hives/{hive}/nodes`
-    - `GET/POST/DELETE /hives/{hive}/routers`
   - `SY.opa.rules`
     - `POST /opa/policy`
     - `POST /opa/policy/compile`
@@ -185,26 +183,11 @@ Caso manual adicional:
 - `WAN_TIMEOUT` -> HTTP `504`
   - Requiere host remoto que bootstrappee pero no logre conexión WAN dentro de 60s.
 
-## 3) Router remoto por hive
+## 3) Router remoto por hive (histórico/deprecado)
 
-```bash
-HIVE_ID="worker-test"
-
-curl -sS "$BASE/hives/$HIVE_ID/routers"
-
-curl -sS -X POST "$BASE/hives/$HIVE_ID/routers" \
-  -H 'Content-Type: application/json' \
-  -d '{"service":"rt-gateway"}'
-
-curl -sS -X DELETE "$BASE/hives/$HIVE_ID/routers/rt-gateway"
-```
-
-Esperado:
-- `list_routers` responde `status=ok`
-- en hive remoto, el `name` debe quedar con sufijo `@{hive}` (ej: `RT.gateway@worker-220`), no `@sandbox`.
-- en hive remoto, `uuid` debe venir del router remoto (no `00000000-0000-0000-0000-000000000000`).
-  Si aparece nil UUID, revisar mismatch de versiones/instalacion entre mother y worker.
-- start/stop router responde `status=ok`
+Contrato actual:
+- `/hives/{id}/routers*` no existe en `SY.admin` (debe devolver `404`).
+- El control canónico para entidades `RT.*` es vía `/hives/{id}/nodes` (`SPAWN_NODE`/`KILL_NODE`), sujeto a disponibilidad de runtime/contrato operativo del router.
 
 ## 4) Node remoto por hive
 
@@ -285,34 +268,28 @@ curl -sS "$BASE/routers"
 ## 10) E2E script (batch)
 
 Script automatizado para cubrir en una sola corrida:
-- `GET/POST/DELETE /hives/{id}/routers`
 - `GET/POST/DELETE /hives/{id}/nodes`
 - `GET/PUT /config/storage` (incluye restore)
 
-```bash
-BASE="http://127.0.0.1:8080" \
-HIVE_ID="worker-220" \
-bash scripts/admin_nodes_routers_storage_e2e.sh
-```
+Estado actual:
+- `scripts/admin_nodes_routers_storage_e2e.sh` es histórico (incluye `/routers*`).
+- Para inventario y control multi-hive usar scripts de `system-inventory-spec` (`inventory_*_e2e.sh`).
 
-Opcionales:
-- `RUN_ROUTER_CYCLE=0` para desactivar kill/start de router.
-- `RUN_NODE_CYCLE=0` para desactivar run/kill de runtime.
-- `NODE_RUNTIME=wf.echo NODE_VERSION=current` para runtime específico.
-- `SKIP_NODE_IF_RUNTIME_MISSING=1` para entorno sin runtime-manifest/assets.
+Opcionales históricos:
+- `RUN_ROUTER_CYCLE=0`
+- `RUN_NODE_CYCLE=0`
+- `NODE_RUNTIME=wf.echo NODE_VERSION=current`
+- `SKIP_NODE_IF_RUNTIME_MISSING=1`
 
-## 11) WAN stale/recovery E2E (router remoto)
+## 11) WAN stale/recovery E2E (router remoto, histórico/deprecado)
 
 Script automatizado para validar transicion:
 - `alive -> stale` (al detener router remoto)
 - `stale -> alive` (al levantar router remoto)
 - UUID remoto no-nil despues de recovery
 
-```bash
-BASE="http://127.0.0.1:8080" \
-HIVE_ID="worker-220" \
-bash scripts/admin_wan_stale_recovery_e2e.sh
-```
+El script `scripts/admin_wan_stale_recovery_e2e.sh` quedó histórico por dependencia de `/hives/{id}/routers*`.
+Para stale/recovery de inventario ver `scripts/inventory_stale_hive_e2e.sh` (D3), pendiente de trigger canónico de stale sin `/routers*`.
 
 Opcionales:
 - `STALE_TIMEOUT_SECS=90` (default `90`)

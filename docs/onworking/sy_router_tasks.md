@@ -4,6 +4,9 @@ Documento consolidado de trabajo para router:
 - LSA/WAN/topología remota.
 - Resolver OPA y contrato de routing.
 
+> Nota de contrato (2026-03-13): las referencias a `/hives/{id}/routers*` en este documento son históricas.
+> En el código actual de `SY.admin` esos endpoints fueron removidos; la operación canónica expuesta es por `/hives/{id}/nodes`.
+
 ## Bloque A - LSA/WAN (migrado)
 ### Router LSA/SLA Full Review (Motherbee/Worker)
 

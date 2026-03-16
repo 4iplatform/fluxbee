@@ -409,6 +409,12 @@ When an ILK or TNT is created, updated, or deleted, motherbee SY.identity propag
 6. Node starts with its ILK assigned.
 ```
 
+**Fail-closed registration gate (mandatory):**
+
+- `SY.orchestrator` MUST receive `ILK_REGISTER_RESPONSE` with `payload.status="ok"` before spawning a node.
+- If registration cannot be completed (for example: missing `tenant_id`, identity unavailable, transport failure, or non-ok register response), `run_node` MUST fail and return `IDENTITY_REGISTER_FAILED`.
+- There is no soft-fail mode for node spawn without successful identity registration.
+
 **Node ILK persistence:** The ILK for a node persists even when the node is stopped. Same node_name = same ILK across restarts. If the node's definition changes (new capabilities, new runtime version), orchestrator sends an ILK_UPDATE to identity, and the change is recorded in the definition history.
 
 ### 6.4 Tenant Creation
@@ -898,6 +904,10 @@ Upgrades a temporary ILK to complete, or creates a new ILK for a node. Sent by A
   }
 }
 ```
+
+For node spawn flows (`SY.orchestrator -> ILK_REGISTER`), this response is a hard gate:
+- only `payload.status="ok"` allows spawn to continue;
+- any other outcome must abort spawn with `IDENTITY_REGISTER_FAILED`.
 
 **Error codes:** `INVALID_TENANT`, `TENANT_PENDING`, `DUPLICATE_EMAIL`, `DUPLICATE_NODE_NAME`, `VOCABULARY_INVALID`, `IDENTITY_LIMIT_REACHED`, `UNAUTHORIZED_REGISTRAR`.
 

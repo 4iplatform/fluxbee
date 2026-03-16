@@ -71,7 +71,7 @@ curl -sS -X DELETE "$BASE/hives/$HIVE_ID"
 ### Publish and apply a runtime update on a worker (`dist` + `SYSTEM_UPDATE`)
 
 ```bash
-MOTHER_HIVE="sandbox"   # hive local de motherbee
+MOTHER_HIVE="motherbee"   # hive local de motherbee (nombre fijo)
 RUNTIME="wf.demo.task"
 VERSION="0.0.1"
 
@@ -148,6 +148,27 @@ curl -sS "$BASE/hives/$HIVE_ID/versions"
 curl -sS "$BASE/hives/$HIVE_ID/deployments?limit=10"
 ```
 
+### Node status/config quick checks
+
+```bash
+NODE_NAME="WF.demo.worker@$HIVE_ID"
+
+# canonical node status snapshot
+curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/status" | jq .
+
+# effective node config
+curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" | jq .
+
+# node runtime state (null if not created yet)
+curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/state" | jq .
+```
+
+Useful status fields:
+- `payload.node_status.lifecycle_state`
+- `payload.node_status.health_state`
+- `payload.node_status.health_source`
+- `payload.node_status.status_version`
+
 Expected for remote hive responses:
 - `payload.target` should match requested hive (for example `worker-220`)
 - node names should match target hive (for example `SY.config.routes@worker-220`)
@@ -178,6 +199,7 @@ Global endpoints:
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness/health probe |
+| `GET` | `/admin/actions` | Introspect internal admin action catalog (`list_admin_actions`) |
 | `GET` | `/hive/status` | Local hive/orchestrator status |
 | `GET` | `/hives` | List managed hives |
 | `POST` | `/hives` | Add hive (`hive_id`, `address`) |
@@ -222,6 +244,10 @@ Hive-scoped endpoints:
 | `GET` | `/hives/{hive}/nodes` | List nodes on hive |
 | `POST` | `/hives/{hive}/nodes` | Spawn node on hive |
 | `DELETE` | `/hives/{hive}/nodes/{name}` | Kill node on hive |
+| `GET` | `/hives/{hive}/nodes/{name}/status` | Canonical node status (lifecycle/health/config/process) |
+| `GET` | `/hives/{hive}/nodes/{name}/config` | Read node effective config |
+| `PUT` | `/hives/{hive}/nodes/{name}/config` | Update node effective config |
+| `GET` | `/hives/{hive}/nodes/{name}/state` | Read node runtime state payload |
 | `POST` | `/hives/{hive}/update` | Send `SYSTEM_UPDATE` to hive orchestrator |
 | `POST` | `/hives/{hive}/sync-hint` | Send `SYSTEM_SYNC_HINT` (`blob`/`dist`) to hive orchestrator |
 | `GET` | `/hives/{hive}/versions` | Effective versions for hive |
@@ -571,7 +597,45 @@ Key documents:
 | Identity SHM lookup | `fluxbee_sdk::identity::{resolve_ilk_from_shm_name, resolve_ilk_from_hive_id, resolve_ilk_from_hive_config}` | Resolve `(channel_type,address) -> ilk` locally from identity SHM |
 | Identity provision | `fluxbee_sdk::identity::{IlkProvisionRequest, provision_ilk}` | Request `ILK_PROVISION` with automatic `NOT_PRIMARY` fallback target support |
 | Identity system calls | `fluxbee_sdk::identity::{IdentitySystemRequest, identity_system_call, identity_system_call_ok}` | Generic helpers for `ILK_REGISTER`, `ILK_ADD_CHANNEL`, `ILK_UPDATE`, tenant actions |
+| Node status default handler | `fluxbee_sdk::try_handle_default_node_status` | Respond `NODE_STATUS_GET` with canonical `health_state`; avoids `ORCHESTRATOR_INFERRED` fallback when node is healthy |
+| Admin internal gateway | `fluxbee_sdk::{admin_command, admin_command_ok, AdminCommandRequest}` | Execute `ADMIN_COMMAND` over socket/WAN against `SY.admin@<hive>` (same control surface as HTTP) |
 | Convenience imports | `fluxbee_sdk::prelude::*` | Common SDK symbols in one import |
+
+Recommended for every new node/scaffold:
+- call `try_handle_default_node_status(&sender, &msg).await` inside the receive loop.
+- keep it enabled unless the runtime provides a custom status handler with the same contract.
+- this makes `GET /hives/{hive}/nodes/{name}/status` report `health_source=NODE_REPORTED` in normal operation.
+
+#### Admin internal gateway from SDK (`ADMIN_COMMAND`)
+
+Use this when a node/workflow needs to call `SY.admin` without HTTP (socket/WAN path):
+
+```rust
+use std::time::Duration;
+use fluxbee_sdk::{admin_command, AdminCommandRequest};
+use serde_json::json;
+
+let out = admin_command(
+    &sender,
+    &mut receiver,
+    AdminCommandRequest {
+        admin_target: "SY.admin@motherbee",
+        action: "list_admin_actions",
+        target: None,                 // use Some("worker-220") for hive-scoped actions
+        params: json!({}),
+        request_id: None,
+        timeout: Duration::from_secs(10),
+    },
+).await?;
+
+assert_eq!(out.status, "ok");
+```
+
+Operational checks for this gateway:
+- `scripts/admin_internal_socket_actions_e2e.sh`
+- `scripts/admin_http_socket_parity_e2e.sh`
+- `scripts/admin_list_actions_e2e.sh`
+- `scripts/admin_all_actions_matrix_e2e.sh`
 
 #### Blob: basic flow (`put`/`promote` -> attach)
 

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use chrono::{SecondsFormat, TimeZone, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,7 +21,10 @@ use fluxbee_sdk::blob::{
     BLOB_NAME_MAX_CHARS, BLOB_STAGING_TTL_HOURS,
 };
 use fluxbee_sdk::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::protocol::{
+    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED,
+    MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SCOPE_GLOBAL, SYSTEM_KIND,
+};
 use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RemoteHiveEntry, RemoteNodeEntry,
@@ -74,6 +78,8 @@ const DIST_VENDOR_ROOT_DIR: &str = "/var/lib/fluxbee/dist/vendor";
 const DIST_VENDOR_MANIFEST_PATH: &str = "/var/lib/fluxbee/dist/vendor/manifest.json";
 const DIST_SYNCTHING_VENDOR_SOURCE_PATH: &str = "/var/lib/fluxbee/dist/vendor/syncthing/syncthing";
 const CORE_SERVICE_HEALTH_TIMEOUT_SECS: u64 = 30;
+const NODE_STATUS_SCHEMA_VERSION: &str = "1";
+const NODE_STATUS_FORWARD_TIMEOUT_SECS: u64 = 2;
 const DEPLOYMENT_HISTORY_MAX_LIMIT: usize = 500;
 const DRIFT_ALERT_MAX_LIMIT: usize = 500;
 const CORE_SYNC_RESTART_ORDER: &[&str] = &[
@@ -117,6 +123,7 @@ const DEFAULT_DIST_SYNC_ENABLED: bool = true;
 const DEFAULT_DIST_SYNC_TOOL: &str = "syncthing";
 const DEFAULT_IDENTITY_SYNC_PORT: u16 = 9100;
 const IDENTITY_NODE_ILK_MAP_FILE: &str = "identity-node-ilk-map.json";
+const NODE_FILES_ROOT: &str = "/var/lib/fluxbee/nodes";
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -1048,6 +1055,10 @@ async fn handle_admin(
         "get_deployments" => get_deployments_flow(state, &msg.payload),
         "list_drift_alerts" => list_drift_alerts_flow(&msg.payload),
         "get_drift_alerts" => get_drift_alerts_flow(state, &msg.payload),
+        "get_node_config" => get_node_config_flow(state, &msg.payload).await,
+        "get_node_state" => get_node_state_flow(state, &msg.payload).await,
+        "get_node_status" => get_node_status_flow(state, &msg.payload).await,
+        "set_node_config" => set_node_config_flow(sender, state, &msg.payload).await,
         "run_node" => run_node_flow(state, &msg.payload).await,
         "kill_node" => kill_node_flow(state, &msg.payload).await,
         "list_hives" => {
@@ -1193,6 +1204,10 @@ async fn handle_system_message(
             | "SYSTEM_SYNC_HINT"
             | "SPAWN_NODE"
             | "KILL_NODE"
+            | "NODE_CONFIG_SET"
+            | "NODE_CONFIG_GET"
+            | "NODE_STATE_GET"
+            | "NODE_STATUS_GET"
             | "GET_VERSIONS"
             | "INVENTORY_REQUEST"
             | "ADD_HIVE_FINALIZE"
@@ -1244,6 +1259,42 @@ async fn handle_system_message(
                 "KILL_NODE" => {
                     let _ = send_system_action_response(sender, msg, "KILL_NODE_RESPONSE", payload)
                         .await;
+                }
+                "NODE_CONFIG_SET" => {
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "NODE_CONFIG_SET_RESPONSE",
+                        payload,
+                    )
+                    .await;
+                }
+                "NODE_CONFIG_GET" => {
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "NODE_CONFIG_GET_RESPONSE",
+                        payload,
+                    )
+                    .await;
+                }
+                "NODE_STATE_GET" => {
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "NODE_STATE_GET_RESPONSE",
+                        payload,
+                    )
+                    .await;
+                }
+                "NODE_STATUS_GET" => {
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "NODE_STATUS_GET_RESPONSE",
+                        payload,
+                    )
+                    .await;
                 }
                 "GET_VERSIONS" => {
                     let _ =
@@ -1307,6 +1358,30 @@ async fn handle_system_message(
             let result = kill_node_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "KILL_NODE processed");
             let _ = send_system_action_response(sender, msg, "KILL_NODE_RESPONSE", result).await;
+        }
+        Some("NODE_CONFIG_SET") => {
+            let result = set_node_config_flow(sender, state, &msg.payload).await;
+            tracing::info!(result = %result, "NODE_CONFIG_SET processed");
+            let _ =
+                send_system_action_response(sender, msg, "NODE_CONFIG_SET_RESPONSE", result).await;
+        }
+        Some("NODE_CONFIG_GET") => {
+            let result = get_node_config_flow(state, &msg.payload).await;
+            tracing::info!(result = %result, "NODE_CONFIG_GET processed");
+            let _ =
+                send_system_action_response(sender, msg, "NODE_CONFIG_GET_RESPONSE", result).await;
+        }
+        Some("NODE_STATE_GET") => {
+            let result = get_node_state_flow(state, &msg.payload).await;
+            tracing::info!(result = %result, "NODE_STATE_GET processed");
+            let _ =
+                send_system_action_response(sender, msg, "NODE_STATE_GET_RESPONSE", result).await;
+        }
+        Some("NODE_STATUS_GET") => {
+            let result = get_node_status_flow(state, &msg.payload).await;
+            tracing::info!(result = %result, "NODE_STATUS_GET processed");
+            let _ =
+                send_system_action_response(sender, msg, "NODE_STATUS_GET_RESPONSE", result).await;
         }
         Some("GET_VERSIONS") => {
             let result = get_versions_flow(state, &msg.payload).await;
@@ -1811,9 +1886,19 @@ async fn apply_system_update_local(
         "runtime" => {
             let manifest = load_runtime_manifest().ok_or("runtime manifest missing locally")?;
             apply_runtime_retention(&manifest)?;
+            let artifact_errors = verify_runtime_current_artifacts(&manifest)?;
             {
                 let mut guard = state.runtime_manifest.lock().await;
                 *guard = Some(manifest);
+            }
+            if !artifact_errors.is_empty() {
+                return Ok(SystemUpdateApplyResult {
+                    status: "sync_pending".to_string(),
+                    updated: Vec::new(),
+                    unchanged: vec!["runtime-manifest".to_string()],
+                    restarted: Vec::new(),
+                    errors: artifact_errors,
+                });
             }
             Ok(SystemUpdateApplyResult {
                 status: "ok".to_string(),
@@ -1961,6 +2046,38 @@ async fn handle_system_update_message(
     let local_hash = local.hash.unwrap_or_default();
     let expected_hash_norm = normalize_sha256(&expected_hash);
     let local_hash_norm = normalize_sha256(&local_hash);
+    if expected_version != 0 {
+        if let Some(local_known_version) = local.version {
+            if local_known_version > expected_version {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "VERSION_MISMATCH",
+                    "message": format!(
+                        "local manifest version is ahead of requested version (local={} requested={})",
+                        local_known_version, expected_version
+                    ),
+                    "category": category,
+                    "hive": state.hive_id.as_str(),
+                    "manifest_version": expected_version,
+                    "local_manifest_version": local.version,
+                    "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
+                    "errors": [],
+                });
+            }
+            if local_known_version < expected_version {
+                return serde_json::json!({
+                    "status": "sync_pending",
+                    "category": category,
+                    "hive": state.hive_id.as_str(),
+                    "manifest_version": expected_version,
+                    "local_manifest_version": local.version,
+                    "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
+                    "errors": [],
+                    "message": "Local manifest version is behind expected. Sync channel may still be propagating.",
+                });
+            }
+        }
+    }
     let version_match = if expected_version == 0 || local.version.is_none() {
         true
     } else {
@@ -4078,11 +4195,20 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
     let runtimes = match load_runtime_manifest() {
         Some(manifest) => {
             let manifest_hash = local_runtime_manifest_hash().ok().flatten();
+            let mut runtimes = manifest.runtimes.clone();
+            if let Some(runtime_map) = runtimes.as_object_mut() {
+                for (runtime, entry) in runtime_map.iter_mut() {
+                    let readiness = runtime_readiness_for_entry(runtime, entry);
+                    if let Some(entry_obj) = entry.as_object_mut() {
+                        entry_obj.insert("readiness".to_string(), readiness);
+                    }
+                }
+            }
             serde_json::json!({
                 "status": "ok",
                 "manifest_version": manifest.version,
                 "manifest_hash": manifest_hash,
-                "runtimes": manifest.runtimes,
+                "runtimes": runtimes,
             })
         }
         None => serde_json::json!({
@@ -4947,6 +5073,64 @@ fn runtime_keep_versions(
     Ok(keep_map)
 }
 
+fn runtime_current_versions(
+    manifest: &RuntimeManifest,
+) -> Result<Vec<(String, String)>, OrchestratorError> {
+    let runtimes = manifest
+        .runtimes
+        .as_object()
+        .ok_or_else(|| "runtime manifest invalid: runtimes must be object".to_string())?;
+    let mut out = Vec::new();
+    for (runtime, entry) in runtimes {
+        if !valid_token(runtime) {
+            return Err(format!("runtime manifest invalid runtime name '{}'", runtime).into());
+        }
+        let current = entry
+            .get("current")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if current.is_empty() {
+            continue;
+        }
+        if !valid_token(current) {
+            return Err(format!("runtime manifest invalid current version '{}'", current).into());
+        }
+        out.push((runtime.clone(), current.to_string()));
+    }
+    Ok(out)
+}
+
+fn verify_runtime_current_artifacts(
+    manifest: &RuntimeManifest,
+) -> Result<Vec<String>, OrchestratorError> {
+    let mut errors = Vec::new();
+    for (runtime, version) in runtime_current_versions(manifest)? {
+        let start_script = Path::new(DIST_RUNTIME_ROOT_DIR)
+            .join(&runtime)
+            .join(&version)
+            .join("bin/start.sh");
+        if !start_script.is_file() {
+            errors.push(format!(
+                "runtime artifact missing start.sh runtime='{}' version='{}' path='{}'",
+                runtime,
+                version,
+                start_script.display()
+            ));
+            continue;
+        }
+        if !local_runtime_script_is_executable(&start_script) {
+            errors.push(format!(
+                "runtime artifact start.sh is not executable runtime='{}' version='{}' path='{}'",
+                runtime,
+                version,
+                start_script.display()
+            ));
+        }
+    }
+    Ok(errors)
+}
+
 fn apply_runtime_retention(
     manifest: &RuntimeManifest,
 ) -> Result<RuntimeRetentionStats, OrchestratorError> {
@@ -5329,6 +5513,212 @@ fn node_runtime_from_name(node_name: &str) -> Option<String> {
     }
 }
 
+fn ensure_private_dir(path: &Path) -> Result<(), OrchestratorError> {
+    fs::create_dir_all(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn node_files_root() -> PathBuf {
+    PathBuf::from(NODE_FILES_ROOT)
+}
+
+fn node_instance_dir(node_name: &str) -> Result<PathBuf, OrchestratorError> {
+    let (local, hive) = node_name
+        .rsplit_once('@')
+        .ok_or_else(|| format!("invalid node_name '{}': expected <name>@<hive>", node_name))?;
+    let local = local.trim();
+    let hive = hive.trim();
+    if !valid_node_local_name(local) {
+        return Err(format!("invalid node_name local part '{}'", local).into());
+    }
+    if !valid_hive_id(hive) {
+        return Err(format!("invalid node_name hive part '{}'", hive).into());
+    }
+    let node_kind = local
+        .split('.')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("invalid node_name '{}': missing kind prefix", node_name))?;
+    Ok(node_files_root().join(node_kind).join(node_name))
+}
+
+fn node_effective_config_path(
+    _state: &OrchestratorState,
+    node_name: &str,
+) -> Result<PathBuf, OrchestratorError> {
+    Ok(node_instance_dir(node_name)?.join("config.json"))
+}
+
+fn node_state_path(
+    _state: &OrchestratorState,
+    node_name: &str,
+) -> Result<PathBuf, OrchestratorError> {
+    Ok(node_instance_dir(node_name)?.join("state.json"))
+}
+
+fn write_json_atomic(path: &Path, value: &serde_json::Value) -> Result<(), OrchestratorError> {
+    if let Some(parent) = path.parent() {
+        ensure_private_dir(parent)?;
+    }
+    let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(tmp, path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn load_node_effective_config(path: &Path) -> Result<serde_json::Value, OrchestratorError> {
+    let raw = fs::read_to_string(path)?;
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    if !value.is_object() {
+        return Err(format!("invalid node config '{}': expected object", path.display()).into());
+    }
+    Ok(value)
+}
+
+fn parse_config_patch(
+    payload: &serde_json::Value,
+    field: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, OrchestratorError> {
+    let config_value = payload
+        .get(field)
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let config = config_value
+        .as_object()
+        .ok_or_else(|| format!("invalid {field}: expected object"))?
+        .clone();
+    if config.contains_key("_system") {
+        return Err(format!("invalid {field}: reserved key '_system' is not allowed").into());
+    }
+    Ok(config)
+}
+
+fn config_version_from_value(value: &serde_json::Value) -> u64 {
+    value
+        .get("_system")
+        .and_then(|v| v.get("config_version"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+}
+
+fn build_node_system_block(
+    node_name: &str,
+    hive_id: &str,
+    runtime: Option<&str>,
+    runtime_version: Option<&str>,
+    ilk_id: Option<&str>,
+    tenant_id: Option<&str>,
+    config_version: u64,
+) -> serde_json::Value {
+    let mut out = serde_json::json!({
+        "managed_by": "SY.orchestrator",
+        "node_name": node_name,
+        "hive_id": hive_id,
+        "config_version": config_version,
+        "created_at_ms": now_epoch_ms(),
+        "updated_at_ms": now_epoch_ms(),
+    });
+    if let Some(runtime) = runtime.filter(|v| !v.trim().is_empty()) {
+        out["runtime"] = serde_json::Value::String(runtime.to_string());
+    }
+    if let Some(runtime_version) = runtime_version.filter(|v| !v.trim().is_empty()) {
+        out["runtime_version"] = serde_json::Value::String(runtime_version.to_string());
+    }
+    if let Some(ilk_id) = ilk_id.filter(|v| !v.trim().is_empty()) {
+        out["ilk_id"] = serde_json::Value::String(ilk_id.to_string());
+    }
+    if let Some(tenant_id) = tenant_id.filter(|v| !v.trim().is_empty()) {
+        out["tenant_id"] = serde_json::Value::String(tenant_id.to_string());
+    }
+    out
+}
+
+fn ensure_node_effective_config_on_spawn(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+    node_name: &str,
+    target_hive: &str,
+    runtime: &str,
+    runtime_version: &str,
+    ilk_id: Option<&str>,
+) -> Result<serde_json::Value, OrchestratorError> {
+    let path = node_effective_config_path(state, node_name)?;
+    if path.exists() {
+        return Err(format!("node config already exists: {}", path.display()).into());
+    }
+
+    let mut config = serde_json::Map::<String, serde_json::Value>::new();
+    for (key, value) in parse_config_patch(payload, "config")? {
+        config.insert(key, value);
+    }
+    if let Some(tenant_id) = resolve_tenant_id_for_node(payload) {
+        config
+            .entry("tenant_id".to_string())
+            .or_insert(serde_json::Value::String(tenant_id));
+    }
+    config.insert(
+        "_system".to_string(),
+        build_node_system_block(
+            node_name,
+            target_hive,
+            Some(runtime),
+            Some(runtime_version),
+            ilk_id,
+            config.get("tenant_id").and_then(|v| v.as_str()),
+            1,
+        ),
+    );
+    write_json_atomic(&path, &serde_json::Value::Object(config))?;
+
+    Ok(serde_json::json!({
+        "status": "ok",
+        "path": path.display().to_string(),
+        "created": true,
+        "config_version": 1,
+    }))
+}
+
+async fn send_node_config_changed_signal(
+    sender: &NodeSender,
+    node_name: &str,
+    config_version: u64,
+    patch: serde_json::Value,
+) -> Result<(), OrchestratorError> {
+    let msg = Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            dst: Destination::Unicast(node_name.to_string()),
+            ttl: 16,
+            trace_id: Uuid::new_v4().to_string(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_CONFIG_CHANGED.to_string()),
+            scope: Some(SCOPE_GLOBAL.to_string()),
+            target: Some(node_name.to_string()),
+            action: None,
+            priority: None,
+            context: None,
+        },
+        payload: serde_json::to_value(ConfigChangedPayload {
+            subsystem: "node_config".to_string(),
+            action: Some("set".to_string()),
+            auto_apply: Some(true),
+            version: config_version,
+            config: serde_json::json!({
+                "node_name": node_name,
+                "patch": patch,
+            }),
+        })?,
+    };
+    sender.send(msg).await?;
+    Ok(())
+}
+
 fn unit_from_node_name(node_name: &str) -> String {
     format!("fluxbee-node-{}", sanitize_unit_suffix(node_name))
 }
@@ -5403,6 +5793,65 @@ fn local_runtime_script_exists(script_path: &str) -> bool {
     Path::new(script_path).is_file()
 }
 
+fn local_runtime_script_is_executable(script_path: &Path) -> bool {
+    fs::metadata(script_path)
+        .map(|meta| (meta.permissions().mode() & 0o111) != 0)
+        .unwrap_or(false)
+}
+
+fn runtime_versions_from_manifest_entry(entry: &serde_json::Value) -> Vec<String> {
+    let mut versions = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(current) = entry
+        .get("current")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| valid_token(value))
+    {
+        let current_value = current.to_string();
+        seen.insert(current_value.clone());
+        versions.push(current_value);
+    }
+    if let Some(available) = entry.get("available").and_then(|value| value.as_array()) {
+        for value in available {
+            let Some(version) = value
+                .as_str()
+                .map(str::trim)
+                .filter(|candidate| valid_token(candidate))
+            else {
+                continue;
+            };
+            if seen.insert(version.to_string()) {
+                versions.push(version.to_string());
+            }
+        }
+    }
+    versions
+}
+
+fn runtime_readiness_for_entry(runtime: &str, entry: &serde_json::Value) -> serde_json::Value {
+    if !valid_token(runtime) {
+        return serde_json::json!({});
+    }
+    let mut readiness = serde_json::Map::new();
+    for version in runtime_versions_from_manifest_entry(entry) {
+        let start_script = Path::new(DIST_RUNTIME_ROOT_DIR)
+            .join(runtime)
+            .join(&version)
+            .join("bin/start.sh");
+        let runtime_present = start_script.is_file();
+        let start_sh_executable = runtime_present && local_runtime_script_is_executable(&start_script);
+        readiness.insert(
+            version,
+            serde_json::json!({
+                "runtime_present": runtime_present,
+                "start_sh_executable": start_sh_executable,
+            }),
+        );
+    }
+    serde_json::Value::Object(readiness)
+}
+
 fn system_forward_timeout() -> Duration {
     let secs = std::env::var("JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS")
         .ok()
@@ -5424,13 +5873,6 @@ fn parse_prefixed_uuid(raw: &str, prefix: &str) -> Result<Uuid, OrchestratorErro
     };
     let uuid = Uuid::parse_str(uuid_raw)?;
     Ok(uuid)
-}
-
-fn identity_register_required() -> bool {
-    std::env::var("ORCH_IDENTITY_REGISTER_REQUIRED")
-        .ok()
-        .and_then(|raw| parse_bool_str(&raw))
-        .unwrap_or(false)
 }
 
 fn node_ilk_map_path(state: &OrchestratorState) -> PathBuf {
@@ -5684,6 +6126,40 @@ async fn relay_system_action(
             if incoming.routing.trace_id != trace_id {
                 continue;
             }
+            if incoming.meta.msg.as_deref() == Some(MSG_UNREACHABLE) {
+                let reason = incoming
+                    .payload
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let original_dst = incoming
+                    .payload
+                    .get("original_dst")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("-");
+                return Err(format!(
+                    "unreachable while waiting {} trace_id={} reason={} original_dst={}",
+                    response_msg, trace_id, reason, original_dst
+                )
+                .into());
+            }
+            if incoming.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED) {
+                let original_dst = incoming
+                    .payload
+                    .get("original_dst")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("-");
+                let last_hop = incoming
+                    .payload
+                    .get("last_hop")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("-");
+                return Err(format!(
+                    "ttl exceeded while waiting {} trace_id={} original_dst={} last_hop={}",
+                    response_msg, trace_id, original_dst, last_hop
+                )
+                .into());
+            }
             if incoming.meta.msg.as_deref() != Some(response_msg) {
                 continue;
             }
@@ -5812,26 +6288,12 @@ async fn ensure_node_identity_registered(
     runtime: &str,
     runtime_version: &str,
 ) -> Result<Option<serde_json::Value>, OrchestratorError> {
-    let required = identity_register_required();
-
     if !identity_available() {
-        if required {
-            return Err("identity registration required but sy-identity is not installed".into());
-        }
-        return Ok(Some(serde_json::json!({
-            "status": "skipped",
-            "reason": "identity_unavailable",
-        })));
+        return Err("identity registration required but sy-identity is not installed".into());
     }
 
     let Some(tenant_id) = resolve_tenant_id_for_node(payload) else {
-        if required {
-            return Err("identity registration required but tenant_id is missing (use payload.tenant_id, payload.config.tenant_id, or ORCH_DEFAULT_TENANT_ID)".into());
-        }
-        return Ok(Some(serde_json::json!({
-            "status": "skipped",
-            "reason": "missing_tenant_id",
-        })));
+        return Err("identity registration required but tenant_id is missing (use payload.tenant_id, payload.config.tenant_id, or ORCH_DEFAULT_TENANT_ID)".into());
     };
     parse_prefixed_uuid(&tenant_id, "tnt")?;
 
@@ -5876,25 +6338,11 @@ async fn ensure_node_identity_registered(
             .get("message")
             .and_then(|v| v.as_str())
             .unwrap_or("identity register returned non-ok status");
-        if required {
-            return Err(format!(
-                "identity register failed code={} message={}",
-                error_code, message
-            )
-            .into());
-        }
-        tracing::warn!(
-            target = %identity_target,
-            code = error_code,
-            message = message,
-            "identity register returned non-ok status; continuing because ORCH_IDENTITY_REGISTER_REQUIRED=false"
-        );
-        return Ok(Some(serde_json::json!({
-            "status": "error",
-            "error_code": error_code,
-            "message": message,
-            "target": identity_target,
-        })));
+        return Err(format!(
+            "identity register failed code={} message={}",
+            error_code, message
+        )
+        .into());
     }
 
     let resolved_ilk_id = response
@@ -5990,6 +6438,976 @@ async fn apply_node_identity_update(
         "ilk_id": ilk_id,
         "target": identity_target,
     })))
+}
+
+async fn get_node_config_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let mut target_hive = target_hive_from_payload(payload, &state.hive_id);
+    let raw_node_name = payload
+        .get("node_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if raw_node_name.is_empty() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "missing node_name",
+        });
+    }
+    if let Some((_, hive)) = raw_node_name.rsplit_once('@') {
+        if !hive.trim().is_empty() {
+            target_hive = hive.trim().to_string();
+        }
+    }
+    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+            });
+        }
+    };
+
+    if target_hive != state.hive_id {
+        let mut forwarded_payload = payload.clone();
+        if let Some(obj) = forwarded_payload.as_object_mut() {
+            obj.insert("target".to_string(), serde_json::json!(target_hive));
+            obj.insert("node_name".to_string(), serde_json::json!(node_name));
+        }
+        return match forward_system_action_to_hive(
+            state,
+            &target_hive,
+            "NODE_CONFIG_GET",
+            "NODE_CONFIG_GET_RESPONSE",
+            forwarded_payload,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_CONFIG_GET_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+            }),
+        };
+    }
+
+    let path = match node_effective_config_path(state, &node_name) {
+        Ok(path) => path,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+            });
+        }
+    };
+    if !path.exists() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "NODE_CONFIG_NOT_FOUND",
+            "message": "effective config file not found",
+            "target": target_hive,
+            "node_name": node_name,
+            "path": path.display().to_string(),
+        });
+    }
+
+    match load_node_effective_config(&path) {
+        Ok(config) => serde_json::json!({
+            "status": "ok",
+            "target": target_hive,
+            "hive": target_hive,
+            "node_name": node_name,
+            "path": path.display().to_string(),
+            "config_version": config_version_from_value(&config),
+            "config": config,
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "NODE_CONFIG_READ_FAILED",
+            "message": err.to_string(),
+            "target": target_hive,
+            "node_name": node_name,
+            "path": path.display().to_string(),
+        }),
+    }
+}
+
+async fn get_node_state_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let mut target_hive = target_hive_from_payload(payload, &state.hive_id);
+    let raw_node_name = payload
+        .get("node_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if raw_node_name.is_empty() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "missing node_name",
+        });
+    }
+    if let Some((_, hive)) = raw_node_name.rsplit_once('@') {
+        if !hive.trim().is_empty() {
+            target_hive = hive.trim().to_string();
+        }
+    }
+    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+            });
+        }
+    };
+
+    if target_hive != state.hive_id {
+        let mut forwarded_payload = payload.clone();
+        if let Some(obj) = forwarded_payload.as_object_mut() {
+            obj.insert("target".to_string(), serde_json::json!(target_hive));
+            obj.insert("node_name".to_string(), serde_json::json!(node_name));
+        }
+        return match forward_system_action_to_hive(
+            state,
+            &target_hive,
+            "NODE_STATE_GET",
+            "NODE_STATE_GET_RESPONSE",
+            forwarded_payload,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_STATE_GET_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+            }),
+        };
+    }
+
+    let path = match node_state_path(state, &node_name) {
+        Ok(path) => path,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+            });
+        }
+    };
+    if !path.exists() {
+        return serde_json::json!({
+            "status": "ok",
+            "target": target_hive,
+            "hive": target_hive,
+            "node_name": node_name,
+            "path": path.display().to_string(),
+            "state": serde_json::Value::Null,
+        });
+    }
+
+    match fs::read_to_string(&path)
+        .map_err(|err| err.to_string())
+        .and_then(|raw| {
+            serde_json::from_str::<serde_json::Value>(&raw).map_err(|err| err.to_string())
+        }) {
+        Ok(state_payload) => serde_json::json!({
+            "status": "ok",
+            "target": target_hive,
+            "hive": target_hive,
+            "node_name": node_name,
+            "path": path.display().to_string(),
+            "state": state_payload,
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "NODE_STATE_READ_FAILED",
+            "message": err,
+            "target": target_hive,
+            "node_name": node_name,
+            "path": path.display().to_string(),
+        }),
+    }
+}
+
+fn node_status_version_path(node_name: &str) -> Result<PathBuf, OrchestratorError> {
+    Ok(node_instance_dir(node_name)?.join("status_version"))
+}
+
+fn node_status_fingerprint_path(node_name: &str) -> Result<PathBuf, OrchestratorError> {
+    Ok(node_instance_dir(node_name)?.join("status_fingerprint.sha256"))
+}
+
+fn read_node_status_version(path: &Path) -> u64 {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn write_private_file_atomic(path: &Path, contents: &[u8]) -> Result<(), OrchestratorError> {
+    if let Some(parent) = path.parent() {
+        ensure_private_dir(parent)?;
+    }
+    let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    fs::write(&tmp, contents)?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&tmp, &path)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn status_fingerprint_hash(value: &serde_json::Value) -> Result<String, OrchestratorError> {
+    let bytes = serde_json::to_vec(value)?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn advance_node_status_version(
+    node_name: &str,
+    fingerprint: &serde_json::Value,
+) -> Result<u64, OrchestratorError> {
+    let version_path = node_status_version_path(node_name)?;
+    let fingerprint_path = node_status_fingerprint_path(node_name)?;
+    if let Some(parent) = version_path.parent() {
+        ensure_private_dir(parent)?;
+    }
+
+    let current = read_node_status_version(&version_path);
+    let new_fingerprint = status_fingerprint_hash(fingerprint)?;
+    let old_fingerprint = fs::read_to_string(&fingerprint_path)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty());
+
+    let next = if current == 0 {
+        1
+    } else if old_fingerprint.as_deref() == Some(new_fingerprint.as_str()) {
+        current
+    } else {
+        current.saturating_add(1)
+    };
+
+    if current != next || !version_path.exists() {
+        write_private_file_atomic(&version_path, next.to_string().as_bytes())?;
+    }
+    if old_fingerprint.as_deref() != Some(new_fingerprint.as_str()) || !fingerprint_path.exists() {
+        write_private_file_atomic(&fingerprint_path, new_fingerprint.as_bytes())?;
+    }
+
+    Ok(next)
+}
+
+fn local_inventory_has_node(state: &OrchestratorState, expected_node_name: &str) -> bool {
+    let Ok(snapshot) = load_lsa_snapshot(state) else {
+        return false;
+    };
+    let now = now_epoch_ms();
+    snapshot.nodes.iter().any(|entry| {
+        if entry.name_len == 0 {
+            return false;
+        }
+        let hive_idx = entry.hive_index as usize;
+        let Some(hive_entry) = snapshot.hives.get(hive_idx) else {
+            return false;
+        };
+        let Some(hive_name) = remote_hive_name(hive_entry) else {
+            return false;
+        };
+        if hive_name != state.hive_id {
+            return false;
+        }
+        if remote_hive_is_stale(hive_entry, now) {
+            return false;
+        }
+        if entry.flags & (FLAG_DELETED | FLAG_STALE) != 0 {
+            return false;
+        }
+        let name = String::from_utf8_lossy(&entry.name[..entry.name_len as usize]).into_owned();
+        let (node_name_l2, hive) = node_l2_and_hive(&name, &state.hive_id);
+        hive == state.hive_id && node_name_l2 == expected_node_name
+    })
+}
+
+fn systemd_unit_is_failed(unit: &str) -> Result<bool, OrchestratorError> {
+    let status = Command::new("systemctl")
+        .arg("is-failed")
+        .arg("--quiet")
+        .arg(unit)
+        .status()?;
+    Ok(status.success())
+}
+
+fn epoch_ms_to_iso_utc(epoch_ms: u64) -> Option<String> {
+    let secs = (epoch_ms / 1000) as i64;
+    let nanos = ((epoch_ms % 1000) * 1_000_000) as u32;
+    let ts = Utc.timestamp_opt(secs, nanos).single()?;
+    Some(ts.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+fn parse_systemd_u64(value: Option<&String>) -> Option<u64> {
+    value
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| raw.parse::<u64>().ok())
+}
+
+fn parse_systemd_i32(value: Option<&String>) -> Option<i32> {
+    value
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| raw.parse::<i32>().ok())
+}
+
+fn systemd_unit_show(unit: &str, properties: &[&str]) -> HashMap<String, String> {
+    if properties.is_empty() {
+        return HashMap::new();
+    }
+    let property_arg = format!("--property={}", properties.join(","));
+    let output = Command::new("systemctl")
+        .arg("show")
+        .arg(unit)
+        .arg(property_arg)
+        .output();
+    let Ok(output) = output else {
+        return HashMap::new();
+    };
+    if !output.status.success() {
+        return HashMap::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect()
+}
+
+fn normalize_reported_health_state(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "HEALTHY" => Some("HEALTHY"),
+        "DEGRADED" => Some("DEGRADED"),
+        "ERROR" => Some("ERROR"),
+        "UNKNOWN" => Some("UNKNOWN"),
+        _ => None,
+    }
+}
+
+fn extract_node_status_payload_value<'a>(
+    response: &'a serde_json::Value,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    response
+        .get(key)
+        .or_else(|| response.get("payload").and_then(|payload| payload.get(key)))
+}
+
+fn extract_reported_health_state(response: &serde_json::Value) -> Option<&'static str> {
+    let raw = extract_node_status_payload_value(response, "health_state")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    normalize_reported_health_state(raw)
+}
+
+async fn get_node_status_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let mut target_hive = target_hive_from_payload(payload, &state.hive_id);
+    let raw_node_name = payload
+        .get("node_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if raw_node_name.is_empty() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "missing node_name",
+        });
+    }
+    if let Some((_, hive)) = raw_node_name.rsplit_once('@') {
+        if !hive.trim().is_empty() {
+            target_hive = hive.trim().to_string();
+        }
+    }
+    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+            });
+        }
+    };
+
+    if target_hive != state.hive_id {
+        let mut forwarded_payload = payload.clone();
+        if let Some(obj) = forwarded_payload.as_object_mut() {
+            obj.insert("target".to_string(), serde_json::json!(target_hive));
+            obj.insert("node_name".to_string(), serde_json::json!(node_name));
+        }
+        return match forward_system_action_to_hive(
+            state,
+            &target_hive,
+            "NODE_STATUS_GET",
+            "NODE_STATUS_GET_RESPONSE",
+            forwarded_payload,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_STATUS_GET_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+            }),
+        };
+    }
+
+    let config_path = match node_effective_config_path(state, &node_name) {
+        Ok(path) => path,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+            });
+        }
+    };
+    let state_path = match node_state_path(state, &node_name) {
+        Ok(path) => path,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+            });
+        }
+    };
+
+    let config_exists = config_path.exists();
+    let state_exists = state_path.exists();
+    let unit = unit_from_node_name(&node_name);
+    let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
+    let unit_failed = systemd_unit_is_failed(&unit).unwrap_or(false);
+    let inventory_visible = local_inventory_has_node(state, &node_name);
+
+    if !config_exists && !state_exists && !unit_active && !unit_failed && !inventory_visible {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "NODE_NOT_FOUND",
+            "message": format!("node '{}' not found", node_name),
+            "target": target_hive,
+            "node_name": node_name,
+        });
+    }
+
+    let mut config_valid = false;
+    let mut config_version: Option<u64> = None;
+    let mut config_updated_at_ms: Option<u64> = None;
+    let mut runtime_requested_version: Option<String> = None;
+    let mut runtime_name: Option<String> = None;
+    let mut runtime_version: Option<String> = None;
+    let mut identity_ilk_id: Option<String> = None;
+    let mut identity_tenant_id: Option<String> = None;
+    if config_exists {
+        match load_node_effective_config(&config_path) {
+            Ok(config_payload) => {
+                config_valid = true;
+                config_version = Some(config_version_from_value(&config_payload));
+                if let Some(system) = config_payload.get("_system").and_then(|v| v.as_object()) {
+                    config_updated_at_ms = system.get("updated_at_ms").and_then(|v| v.as_u64());
+                    runtime_requested_version = system
+                        .get("requested_runtime_version")
+                        .or_else(|| system.get("requested_version"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    runtime_name = system
+                        .get("runtime")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    runtime_version = system
+                        .get("runtime_version")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    identity_ilk_id = system
+                        .get("ilk_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    identity_tenant_id = system
+                        .get("tenant_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                }
+                if identity_tenant_id.is_none() {
+                    identity_tenant_id = config_payload
+                        .get("tenant_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    node_name = node_name,
+                    error = %err,
+                    "unable to parse node config while building status"
+                );
+            }
+        }
+    }
+
+    let mut state_payload: Option<serde_json::Value> = None;
+    if state_exists {
+        match fs::read_to_string(&state_path)
+            .map_err(|err| err.to_string())
+            .and_then(|raw| {
+                serde_json::from_str::<serde_json::Value>(&raw).map_err(|err| err.to_string())
+            }) {
+            Ok(value) => {
+                state_payload = Some(value);
+            }
+            Err(err) => {
+                tracing::debug!(
+                    node_name = node_name,
+                    error = %err,
+                    "unable to parse node state while building status"
+                );
+            }
+        }
+    }
+
+    let mut last_error = state_payload
+        .as_ref()
+        .and_then(|value| value.get("last_error"))
+        .filter(|value| !value.is_null())
+        .cloned();
+    let mut extensions = state_payload
+        .as_ref()
+        .and_then(|value| value.get("extensions"))
+        .filter(|value| !value.is_null())
+        .cloned();
+
+    let lifecycle_state = if unit_active {
+        if inventory_visible {
+            "RUNNING"
+        } else {
+            "STARTING"
+        }
+    } else if unit_failed {
+        "FAILED"
+    } else if config_exists || state_exists {
+        "STOPPED"
+    } else {
+        "UNKNOWN"
+    };
+
+    let (fallback_health_state, fallback_health_source) = if lifecycle_state == "RUNNING" {
+        if !config_exists || !config_valid {
+            ("ERROR", "ORCHESTRATOR_INFERRED")
+        } else if last_error.is_some() {
+            ("DEGRADED", "ORCHESTRATOR_INFERRED")
+        } else {
+            ("HEALTHY", "ORCHESTRATOR_INFERRED")
+        }
+    } else {
+        ("UNKNOWN", "UNKNOWN")
+    };
+    let mut health_state = fallback_health_state.to_string();
+    let mut health_source = fallback_health_source.to_string();
+
+    if lifecycle_state == "RUNNING" {
+        let node_status_request = serde_json::json!({
+            "node_name": node_name,
+        });
+        match relay_system_action(
+            state,
+            &node_name,
+            "NODE_STATUS_GET",
+            "NODE_STATUS_GET_RESPONSE",
+            node_status_request,
+            Duration::from_secs(NODE_STATUS_FORWARD_TIMEOUT_SECS),
+        )
+        .await
+        {
+            Ok(response) => {
+                if let Some(reported) = extract_reported_health_state(&response) {
+                    health_state = reported.to_string();
+                    health_source = "NODE_REPORTED".to_string();
+                }
+                if let Some(value) = extract_node_status_payload_value(&response, "last_error")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                {
+                    last_error = Some(value);
+                }
+                if let Some(value) = extract_node_status_payload_value(&response, "extensions")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                {
+                    extensions = Some(value);
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    node_name = node_name,
+                    error = %err,
+                    "node status request timed out/unreachable; using inferred fallback"
+                );
+            }
+        }
+    }
+
+    let systemd_props = systemd_unit_show(
+        &unit,
+        &[
+            "MainPID",
+            "ExecMainStatus",
+            "NRestarts",
+            "ActiveEnterTimestampUSec",
+        ],
+    );
+    let process_pid = parse_systemd_u64(systemd_props.get("MainPID")).filter(|value| *value > 0);
+    let process_exit_code = parse_systemd_i32(systemd_props.get("ExecMainStatus"));
+    let process_restart_count = parse_systemd_u64(systemd_props.get("NRestarts"));
+    let process_started_at = parse_systemd_u64(systemd_props.get("ActiveEnterTimestampUSec"))
+        .and_then(|usec| {
+            if usec == 0 {
+                None
+            } else {
+                epoch_ms_to_iso_utc(usec / 1000)
+            }
+        });
+    let observed_at_ms = now_epoch_ms();
+    let observed_at = epoch_ms_to_iso_utc(observed_at_ms)
+        .unwrap_or_else(|| observed_at_ms.to_string());
+    let config_updated_at = config_updated_at_ms
+        .and_then(epoch_ms_to_iso_utc)
+        .or_else(|| config_updated_at_ms.map(|value| value.to_string()));
+
+    let status_fingerprint = serde_json::json!({
+        "lifecycle_state": lifecycle_state,
+        "health_state": health_state,
+        "health_source": health_source,
+        "runtime_requested_version": runtime_requested_version.clone(),
+        "runtime_name": runtime_name.clone(),
+        "runtime_version": runtime_version.clone(),
+        "config_exists": config_exists,
+        "config_valid": config_valid,
+        "config_version": config_version,
+        "state_exists": state_exists,
+        "process_pid": process_pid,
+        "process_exit_code": process_exit_code,
+        "process_restart_count": process_restart_count,
+        "process_started_at": process_started_at.clone(),
+        "identity_ilk_id": identity_ilk_id.clone(),
+        "identity_tenant_id": identity_tenant_id.clone(),
+        "last_error": last_error.clone(),
+    });
+    let status_version = match advance_node_status_version(&node_name, &status_fingerprint) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                node_name = node_name,
+                error = %err,
+                "failed to persist node status version"
+            );
+            1
+        }
+    };
+    let mut node_status = serde_json::json!({
+        "schema_version": NODE_STATUS_SCHEMA_VERSION,
+        "node_name": node_name,
+        "hive_id": target_hive,
+        "observed_at": observed_at,
+        "lifecycle_state": lifecycle_state,
+        "health_state": health_state,
+        "health_source": health_source,
+        "status_version": status_version,
+        "runtime": {
+            "name": runtime_name,
+            "requested_version": runtime_requested_version,
+            "resolved_version": runtime_version,
+        },
+        "process": {
+            "unit": unit,
+            "pid": process_pid,
+            "exit_code": process_exit_code,
+            "restart_count": process_restart_count,
+            "started_at": process_started_at,
+        },
+        "config": {
+            "path": config_path.display().to_string(),
+            "exists": config_exists,
+            "valid": config_valid,
+            "config_version": config_version,
+            "updated_at": config_updated_at,
+        },
+        "state": {
+            "path": state_path.display().to_string(),
+            "exists": state_exists,
+        },
+        "identity": {
+            "ilk_id": identity_ilk_id,
+            "tenant_id": identity_tenant_id,
+        },
+    });
+    if let Some(value) = last_error {
+        node_status["last_error"] = value;
+    }
+    if let Some(value) = extensions {
+        node_status["extensions"] = value;
+    }
+
+    serde_json::json!({
+        "status": "ok",
+        "target": target_hive,
+        "hive": target_hive,
+        "node_name": node_name,
+        "node_status": node_status,
+    })
+}
+
+async fn set_node_config_flow(
+    sender: &NodeSender,
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let mut target_hive = target_hive_from_payload(payload, &state.hive_id);
+    let raw_node_name = payload
+        .get("node_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if raw_node_name.is_empty() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "missing node_name",
+        });
+    }
+    if let Some((_, hive)) = raw_node_name.rsplit_once('@') {
+        if !hive.trim().is_empty() {
+            target_hive = hive.trim().to_string();
+        }
+    }
+    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+            });
+        }
+    };
+
+    if target_hive != state.hive_id {
+        let mut forwarded_payload = payload.clone();
+        if let Some(obj) = forwarded_payload.as_object_mut() {
+            obj.insert("target".to_string(), serde_json::json!(target_hive));
+            obj.insert("node_name".to_string(), serde_json::json!(node_name));
+        }
+        return match forward_system_action_to_hive(
+            state,
+            &target_hive,
+            "NODE_CONFIG_SET",
+            "NODE_CONFIG_SET_RESPONSE",
+            forwarded_payload,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_CONFIG_SET_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+            }),
+        };
+    }
+
+    let patch = match parse_config_patch(payload, "config") {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+            });
+        }
+    };
+    let replace = payload
+        .get("replace")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let notify = payload
+        .get("notify")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let path = match node_effective_config_path(state, &node_name) {
+        Ok(path) => path,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+            });
+        }
+    };
+
+    let mut config = if path.exists() {
+        match load_node_effective_config(&path) {
+            Ok(value) => value,
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "NODE_CONFIG_READ_FAILED",
+                    "message": err.to_string(),
+                    "target": target_hive,
+                    "node_name": node_name,
+                    "path": path.display().to_string(),
+                });
+            }
+        }
+    } else {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "NODE_CONFIG_NOT_FOUND",
+            "message": "config.json not found for node",
+            "target": target_hive,
+            "node_name": node_name,
+            "path": path.display().to_string(),
+        });
+    };
+    let next_version = config_version_from_value(&config).saturating_add(1);
+    let Some(config_obj) = config.as_object_mut() else {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "NODE_CONFIG_INVALID",
+            "message": "effective config root must be object",
+            "target": target_hive,
+            "node_name": node_name,
+            "path": path.display().to_string(),
+        });
+    };
+
+    if replace {
+        let existing_system = config_obj
+            .get("_system")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        config_obj.clear();
+        config_obj.extend(patch);
+        config_obj.insert("_system".to_string(), existing_system);
+    } else {
+        for (key, value) in patch {
+            config_obj.insert(key, value);
+        }
+    }
+
+    let mut system = config_obj
+        .remove("_system")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    system.insert(
+        "managed_by".to_string(),
+        serde_json::json!("SY.orchestrator"),
+    );
+    system.insert("node_name".to_string(), serde_json::json!(node_name));
+    system.insert("hive_id".to_string(), serde_json::json!(target_hive));
+    system.insert(
+        "config_version".to_string(),
+        serde_json::json!(next_version),
+    );
+    system.insert(
+        "updated_at_ms".to_string(),
+        serde_json::json!(now_epoch_ms()),
+    );
+    if !system.contains_key("created_at_ms") {
+        system.insert(
+            "created_at_ms".to_string(),
+            serde_json::json!(now_epoch_ms()),
+        );
+    }
+    config_obj.insert("_system".to_string(), serde_json::Value::Object(system));
+
+    if let Err(err) = write_json_atomic(&path, &config) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "CONFIG_WRITE_FAILED",
+            "message": err.to_string(),
+            "target": target_hive,
+            "node_name": node_name,
+            "path": path.display().to_string(),
+        });
+    }
+
+    let notify_status = if notify {
+        let patch_payload = payload
+            .get("config")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        match send_node_config_changed_signal(sender, &node_name, next_version, patch_payload).await
+        {
+            Ok(()) => "sent".to_string(),
+            Err(err) => {
+                tracing::warn!(
+                    node_name = node_name,
+                    error = %err,
+                    "failed to dispatch node CONFIG_CHANGED signal"
+                );
+                format!("dispatch_failed: {}", err)
+            }
+        }
+    } else {
+        "skipped".to_string()
+    };
+
+    serde_json::json!({
+        "status": "ok",
+        "target": target_hive,
+        "hive": target_hive,
+        "node_name": node_name,
+        "path": path.display().to_string(),
+        "config_version": next_version,
+        "notify_status": notify_status,
+    })
 }
 
 async fn run_node_flow(
@@ -6152,11 +7570,29 @@ async fn run_node_flow(
     };
 
     let start_script = runtime_start_script(&runtime_key, &version);
+    let start_script_path = PathBuf::from(&start_script);
     if !local_runtime_script_exists(&start_script) {
         return serde_json::json!({
             "status": "error",
             "error_code": "RUNTIME_NOT_PRESENT",
             "message": format!("runtime script missing in dist path: {}", start_script),
+            "runtime": runtime_key,
+            "version": version,
+            "expected_path": start_script,
+            "hint": "Run SYSTEM_UPDATE to materialize this runtime on the worker",
+            "target": target_hive,
+            "node_name": node_name,
+        });
+    }
+    if !local_runtime_script_is_executable(&start_script_path) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "RUNTIME_NOT_PRESENT",
+            "message": format!("runtime script exists but is not executable: {}", start_script),
+            "runtime": runtime_key,
+            "version": version,
+            "expected_path": start_script,
+            "hint": "Fix permissions (chmod +x) and run SYSTEM_UPDATE",
             "target": target_hive,
             "node_name": node_name,
         });
@@ -6231,6 +7667,56 @@ async fn run_node_flow(
         "register": identity_register,
         "update": identity_update,
     });
+    let config_path = match node_effective_config_path(state, &node_name) {
+        Ok(path) => path,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+                "unit": unit,
+                "identity": identity,
+            });
+        }
+    };
+    if config_path.exists() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "NODE_ALREADY_EXISTS",
+            "message": format!("node config already exists: {}", config_path.display()),
+            "target": target_hive,
+            "node_name": node_name,
+            "unit": unit,
+            "identity": identity,
+            "config": {
+                "path": config_path.display().to_string(),
+            }
+        });
+    }
+    let node_config = match ensure_node_effective_config_on_spawn(
+        state,
+        payload,
+        &node_name,
+        &target_hive,
+        &runtime_key,
+        &version,
+        identity_ilk_id.as_deref(),
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "CONFIG_WRITE_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+                "unit": unit,
+                "identity": identity,
+            });
+        }
+    };
 
     match systemd_unit_is_active(&unit) {
         Ok(true) => {
@@ -6245,6 +7731,7 @@ async fn run_node_flow(
                 "target": target_hive,
                 "unit": unit,
                 "identity": identity,
+                "config": node_config,
             });
         }
         Ok(false) => {}
@@ -6257,6 +7744,7 @@ async fn run_node_flow(
                 "node_name": node_name,
                 "unit": unit,
                 "identity": identity,
+                "config": node_config,
             });
         }
     }
@@ -6277,6 +7765,7 @@ async fn run_node_flow(
             "target": target_hive,
             "unit": unit,
             "identity": identity,
+            "config": node_config,
         }),
         Err(err) => serde_json::json!({
             "status": "error",
@@ -6286,6 +7775,7 @@ async fn run_node_flow(
             "node_name": node_name,
             "unit": unit,
             "identity": identity,
+            "config": node_config,
         }),
     }
 }
