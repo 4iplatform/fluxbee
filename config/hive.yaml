@@ -17,7 +17,7 @@ admin:
 
 # Storage DB (local PostgreSQL for SY.storage).
 database:
-  url: "postgresql://fluxbee:magicAI@127.0.0.1:5432/fluxbee"
+  url: "postgresql://fluxbee_sa:magicAI@127.0.0.1:5432/fluxbee"
 
 # Shared storage root for modules/artifacts (used by SY.admin/SY.orchestrator).
 storage:
