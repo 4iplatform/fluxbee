@@ -315,17 +315,22 @@ Decisión acordada (alcance mínimo):
 - Adoptar opción 1: migrar solo el flujo identity de `run_node` a helpers SDK, sin rediseñar loop principal ni refactor global de mensajería.
 - Mantener compatibilidad del contrato externo actual (`IDENTITY_REGISTER_FAILED`, payloads de `run_node`, timeouts observables).
 
+Límite explícito SDK vs negocio:
+- SDK (`fluxbee_sdk::identity`) solo centraliza transporte y manejo genérico de llamadas identity (`trace_id`, timeout, unreachable/ttl, status/error_code).
+- `SY.orchestrator` mantiene reglas de negocio: cuándo llamar, target fijo `SY.identity@motherbee`, armado de payload (`tenant_id`, `ilk_type`, `identification`), persistencia local `node->ilk` y contrato externo de admin/E2E.
+- No mover al SDK decisiones de flujo de spawn ni validaciones de negocio específicas de orchestrator.
+
 No objetivo en esta etapa:
 - No reemplazar `forward_system_action_to_hive` ni `relay_system_action` para el resto de acciones.
 - No cambiar el modelo de concurrencia del receiver principal de orchestrator.
 
 Lista de tareas FR-10 (backlog):
-- [ ] FR10-T1. Extraer un wrapper local en orchestrator para crear `NodeSender/NodeReceiver` de relay y ejecutar una llamada identity SDK dentro de ese contexto.
-- [ ] FR10-T2. Migrar `ensure_node_identity_registered` para usar `fluxbee_sdk::identity::identity_system_call_ok` con `MSG_ILK_REGISTER`.
-- [ ] FR10-T3. Migrar `apply_node_identity_update` para usar `fluxbee_sdk::identity::identity_system_call_ok` con `MSG_ILK_UPDATE`.
-- [ ] FR10-T4. Mapear `IdentityError -> OrchestratorError` preservando códigos/mensajes ya consumidos por admin/E2E.
-- [ ] FR10-T5. Mantener `identity_target` explícito (`SY.identity@motherbee`) en payload de respuesta para no romper diagnósticos actuales.
-- [ ] FR10-T6. Si aparece lógica identity reusable que hoy está duplicada en orchestrator, subirla al SDK (sin mover reglas de negocio de orchestrator).
+- [x] FR10-T1. Extraer un wrapper local en orchestrator para crear `NodeSender/NodeReceiver` de relay y ejecutar una llamada identity SDK dentro de ese contexto.
+- [x] FR10-T2. Migrar `ensure_node_identity_registered` para usar `fluxbee_sdk::identity::identity_system_call_ok` con `MSG_ILK_REGISTER`.
+- [x] FR10-T3. Migrar `apply_node_identity_update` para usar `fluxbee_sdk::identity::identity_system_call_ok` con `MSG_ILK_UPDATE`.
+- [x] FR10-T4. Mapear `IdentityError -> OrchestratorError` preservando códigos/mensajes ya consumidos por admin/E2E.
+- [x] FR10-T5. Mantener `identity_target` explícito (`SY.identity@motherbee`) en payload de respuesta para no romper diagnósticos actuales.
+- [ ] FR10-T6. Si aparece lógica reusable, subir al SDK solo helpers agnósticos de transporte/protocolo identity (no reglas de negocio de orchestrator).
 - [ ] FR10-T7. Unit tests en orchestrator para mapeo de error y paths `ok/error` de registro/actualización identity.
 - [ ] FR10-T8. Re-ejecutar regresión E2E mínima: `identity_register_strict_e2e.sh` + `inventory_identity_primary_routing_e2e.sh`.
 - [ ] FR10-T9. Actualizar docs de implementación (`10-identity-v2.md` + este doc) indicando que orchestrator usa helper SDK para identity calls.

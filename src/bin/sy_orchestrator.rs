@@ -20,6 +20,7 @@ use fluxbee_sdk::blob::{
     BlobConfig as SdkBlobConfig, BlobGcOptions, BlobToolkit, BLOB_ACTIVE_RETAIN_DAYS,
     BLOB_NAME_MAX_CHARS, BLOB_STAGING_TTL_HOURS,
 };
+use fluxbee_sdk::identity::{identity_system_call_ok, IdentityError, IdentitySystemRequest};
 use fluxbee_sdk::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED,
@@ -47,9 +48,7 @@ const STORAGE_DB_READINESS_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS: u64 = 3;
 const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
-const MSG_ILK_REGISTER_RESPONSE: &str = "ILK_REGISTER_RESPONSE";
 const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
-const MSG_ILK_UPDATE_RESPONSE: &str = "ILK_UPDATE_RESPONSE";
 const SY_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
 const ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS: u64 = 10;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
@@ -5840,7 +5839,8 @@ fn runtime_readiness_for_entry(runtime: &str, entry: &serde_json::Value) -> serd
             .join(&version)
             .join("bin/start.sh");
         let runtime_present = start_script.is_file();
-        let start_sh_executable = runtime_present && local_runtime_script_is_executable(&start_script);
+        let start_sh_executable =
+            runtime_present && local_runtime_script_is_executable(&start_script);
         readiness.insert(
             version,
             serde_json::json!({
@@ -6280,6 +6280,111 @@ async fn forward_system_action_to_hive_with_timeout(
     .await
 }
 
+async fn relay_identity_system_call_ok(
+    state: &OrchestratorState,
+    target: &str,
+    action: &str,
+    payload: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, IdentityError> {
+    let socket_dir = json_router::paths::router_socket_dir();
+    let relay_name = format!("SY.orchestrator.relay.{}", now_epoch_ms());
+    let relay_config = NodeConfig {
+        name: relay_name,
+        router_socket: socket_dir,
+        uuid_persistence_dir: state.state_dir.join("nodes"),
+        config_dir: state.config_dir.clone(),
+        version: "1.0".to_string(),
+    };
+    let connect_timeout = Duration::from_secs(5);
+    let (relay_sender, mut relay_receiver) = match time::timeout(
+        connect_timeout,
+        connect_with_retry(&relay_config, Duration::from_millis(100)),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(IdentityError::Node)?,
+        Err(_) => {
+            return Err(IdentityError::InvalidResponse(format!(
+                "system forward timeout while connecting relay node to local router ({}s)",
+                connect_timeout.as_secs()
+            )));
+        }
+    };
+
+    let result = identity_system_call_ok(
+        &relay_sender,
+        &mut relay_receiver,
+        IdentitySystemRequest {
+            target,
+            fallback_target: None,
+            action,
+            payload,
+            timeout,
+        },
+    )
+    .await;
+    let _ = relay_sender.close().await;
+    result.map(|out| out.payload)
+}
+
+fn identity_error_code_and_message(err: &IdentityError) -> (String, String) {
+    match err {
+        IdentityError::SystemRejected {
+            error_code,
+            message,
+            ..
+        } => (error_code.clone(), message.clone()),
+        IdentityError::ProvisionRejected {
+            error_code,
+            message,
+        } => (error_code.clone(), message.clone()),
+        IdentityError::Unreachable {
+            reason,
+            original_dst,
+        } => (
+            "UNREACHABLE".to_string(),
+            format!("reason={} original_dst={}", reason, original_dst),
+        ),
+        IdentityError::TtlExceeded {
+            original_dst,
+            last_hop,
+        } => (
+            "TTL_EXCEEDED".to_string(),
+            format!("original_dst={} last_hop={}", original_dst, last_hop),
+        ),
+        IdentityError::Timeout {
+            trace_id,
+            target,
+            timeout_ms,
+        } => (
+            "TIMEOUT".to_string(),
+            format!(
+                "trace_id={} target={} timeout_ms={}",
+                trace_id, target, timeout_ms
+            ),
+        ),
+        IdentityError::ActionTimeout {
+            action,
+            trace_id,
+            target,
+            timeout_ms,
+        } => (
+            "TIMEOUT".to_string(),
+            format!(
+                "action={} trace_id={} target={} timeout_ms={}",
+                action, trace_id, target, timeout_ms
+            ),
+        ),
+        IdentityError::InvalidRequest(message) => ("INVALID_REQUEST".to_string(), message.clone()),
+        IdentityError::InvalidResponse(message) => {
+            ("INVALID_RESPONSE".to_string(), message.clone())
+        }
+        IdentityError::Node(err) => ("NODE_ERROR".to_string(), err.to_string()),
+        IdentityError::Json(err) => ("JSON_ERROR".to_string(), err.to_string()),
+    }
+}
+
 async fn ensure_node_identity_registered(
     state: &OrchestratorState,
     payload: &serde_json::Value,
@@ -6316,34 +6421,21 @@ async fn ensure_node_identity_registered(
         "capabilities": capabilities,
     });
     let identity_target = format!("SY.identity@{}", identity_primary_hive_id);
-    let response = relay_system_action(
+    let response = relay_identity_system_call_ok(
         state,
         &identity_target,
         MSG_ILK_REGISTER,
-        MSG_ILK_REGISTER_RESPONSE,
         request_payload,
         system_forward_timeout(),
     )
-    .await?;
-    let status = response
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("error");
-    if status != "ok" {
-        let error_code = response
-            .get("error_code")
-            .and_then(|v| v.as_str())
-            .unwrap_or("IDENTITY_REGISTER_FAILED");
-        let message = response
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("identity register returned non-ok status");
-        return Err(format!(
+    .await
+    .map_err(|err| {
+        let (error_code, message) = identity_error_code_and_message(&err);
+        format!(
             "identity register failed code={} message={}",
             error_code, message
         )
-        .into());
-    }
+    })?;
 
     let resolved_ilk_id = response
         .get("ilk_id")
@@ -6404,34 +6496,21 @@ async fn apply_node_identity_update(
         "change_reason": change_reason,
     });
     let identity_target = format!("SY.identity@{}", identity_primary_hive_id);
-    let response = relay_system_action(
+    relay_identity_system_call_ok(
         state,
         &identity_target,
         MSG_ILK_UPDATE,
-        MSG_ILK_UPDATE_RESPONSE,
         request_payload,
         system_forward_timeout(),
     )
-    .await?;
-    let status = response
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("error");
-    if status != "ok" {
-        let error_code = response
-            .get("error_code")
-            .and_then(|v| v.as_str())
-            .unwrap_or("IDENTITY_UPDATE_FAILED");
-        let message = response
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("identity update returned non-ok status");
-        return Err(format!(
+    .await
+    .map_err(|err| {
+        let (error_code, message) = identity_error_code_and_message(&err);
+        format!(
             "identity update failed code={} message={}",
             error_code, message
         )
-        .into());
-    }
+    })?;
 
     Ok(Some(serde_json::json!({
         "status": "ok",
@@ -7108,8 +7187,8 @@ async fn get_node_status_flow(
             }
         });
     let observed_at_ms = now_epoch_ms();
-    let observed_at = epoch_ms_to_iso_utc(observed_at_ms)
-        .unwrap_or_else(|| observed_at_ms.to_string());
+    let observed_at =
+        epoch_ms_to_iso_utc(observed_at_ms).unwrap_or_else(|| observed_at_ms.to_string());
     let config_updated_at = config_updated_at_ms
         .and_then(epoch_ms_to_iso_utc)
         .or_else(|| config_updated_at_ms.map(|value| value.to_string()));
