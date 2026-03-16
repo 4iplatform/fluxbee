@@ -1,38 +1,54 @@
 hive_id: "motherbee"
 role: motherbee
 
-government:
-  identity_frontdesk: "AI.frontdesk@motherbee"
-
-# WAN (gateway). Optional: remove block if no inter-hive connectivity.
+# WAN / inter-hive gateway.
 wan:
   listen: "0.0.0.0:9000"
   gateway_name: "RT.gateway"
   uplinks:
     - address: "192.168.8.220:9000"
 
-# Admin API (optional).
+# Local NATS broker for control/data plane.
+nats:
+  mode: embedded
+  port: 4222
+
+# Local admin HTTP API.
 admin:
   listen: "127.0.0.1:8080"
 
-# Storage DB (local PostgreSQL for SY.storage).
-database:
-  url: "postgresql://fluxbee_sa:magicAI@127.0.0.1:5432/fluxbee"
-
-# Shared storage root for modules/artifacts (used by SY.admin/SY.orchestrator).
+# Shared filesystem root used by admin/orchestrator.
 storage:
   path: "/var/lib/fluxbee"
 
-# Blob runtime config (single source of truth).
+# Base PostgreSQL connection.
+# Runtime DB names are fixed by code:
+# - SY.identity -> fluxbee_identity
+# - SY.storage  -> fluxbee_storage
+database:
+  url: "postgresql://fluxbee_sa:magicAI@127.0.0.1:5432/fluxbee"
+
+# Identity runtime settings.
+identity:
+  default_tenant: "fluxbee"
+  sync:
+    port: 9100
+
+# Government/frontdesk wiring.
+government:
+  identity_frontdesk: "AI.frontdesk@motherbee"
+
+# Blob runtime config.
 blob:
   enabled: true
   path: "/var/lib/fluxbee/blob"
   sync:
-    enabled: true   # true if Syncthing should be managed by orchestrator
+    enabled: true
     tool: "syncthing"
     api_port: 8384
     data_dir: "/var/lib/fluxbee/syncthing"
 
+# Runtime artifact distribution config.
 dist:
   path: "/var/lib/fluxbee/dist"
   sync:
