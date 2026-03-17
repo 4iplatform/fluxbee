@@ -43,6 +43,7 @@ publish_cfg_log="$tmpdir/publish_cfg.log"
 versions_body="$tmpdir/versions.json"
 spawn_body="$tmpdir/spawn.json"
 status_body="$tmpdir/status.json"
+config_body="$tmpdir/config.json"
 kill_body="$tmpdir/kill.json"
 
 cleanup() {
@@ -281,6 +282,32 @@ wait_node_active_with_runtime() {
   return 1
 }
 
+assert_node_system_runtime_base() {
+  local http api_status payload_status cfg_runtime_base cfg_package_path expected_package_path
+  http="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" "$config_body")"
+  api_status="$(json_get_file "status" "$config_body")"
+  payload_status="$(json_get_file "payload.status" "$config_body")"
+  if [[ "$http" != "200" || "$api_status" != "ok" || "$payload_status" != "ok" ]]; then
+    echo "FAIL: get config failed http=$http status=$api_status payload_status=$payload_status" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  fi
+  cfg_runtime_base="$(json_get_file "payload.config._system.runtime_base" "$config_body")"
+  cfg_package_path="$(json_get_file "payload.config._system.package_path" "$config_body")"
+  expected_package_path="/var/lib/fluxbee/dist/runtimes/$CONFIG_RUNTIME_NAME/$CONFIG_RUNTIME_VERSION"
+  if [[ "$cfg_runtime_base" != "$BASE_RUNTIME_NAME" ]]; then
+    echo "FAIL: unexpected payload.config._system.runtime_base expected='$BASE_RUNTIME_NAME' got='$cfg_runtime_base'" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  fi
+  if [[ "$cfg_package_path" != "$expected_package_path" ]]; then
+    echo "FAIL: unexpected payload.config._system.package_path expected='$expected_package_path' got='$cfg_package_path'" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  fi
+  echo "$cfg_package_path"
+}
+
 create_base_package_fixture() {
   mkdir -p "$base_pkg_dir/bin" "$base_pkg_dir/config"
   cat >"$base_pkg_dir/package.json" <<EOF
@@ -397,7 +424,7 @@ fi
 
 echo "PUB-T23 config_only E2E: BASE=$BASE HIVE_ID=$HIVE_ID MOTHER_HIVE_ID=$MOTHER_HIVE_ID BASE_RUNTIME=$BASE_RUNTIME_NAME@$BASE_RUNTIME_VERSION CONFIG_RUNTIME=$CONFIG_RUNTIME_NAME@$CONFIG_RUNTIME_VERSION NODE=$NODE_NAME"
 
-echo "Step 1/12: build binaries (fluxbee-publish + inventory_hold_diag)"
+echo "Step 1/13: build binaries (fluxbee-publish + inventory_hold_diag)"
 (cd "$ROOT_DIR" && cargo build --release --bin fluxbee-publish --bin inventory_hold_diag >/dev/null)
 if [[ ! -x "$PUBLISH_BIN" ]]; then
   echo "FAIL: publish binary missing at '$PUBLISH_BIN'" >&2
@@ -408,15 +435,15 @@ if [[ ! -x "$DIAG_BIN" ]]; then
   exit 1
 fi
 
-echo "Step 2/12: backup manifest + create package fixtures (base + config_only)"
+echo "Step 2/13: backup manifest + create package fixtures (base + config_only)"
 as_root_local install -m 0644 "$MANIFEST_PATH" "$manifest_backup"
 create_base_package_fixture
 create_config_package_fixture
 
-echo "Step 3/12: publish base full_runtime with deploy"
+echo "Step 3/13: publish base full_runtime with deploy"
 run_publish "$base_pkg_dir" "$BASE_RUNTIME_VERSION" "$publish_base_log"
 
-echo "Step 4/12: validate base deploy summary"
+echo "Step 4/13: validate base deploy summary"
 base_deploy="$(extract_and_validate_deploy_summary "$publish_base_log" "base")"
 base_sync_hint_status="${base_deploy%%|*}"
 base_rest="${base_deploy#*|}"
@@ -425,13 +452,13 @@ base_rest="${base_rest#*|}"
 base_update_error_code="${base_rest%%|*}"
 base_manifest_version="${base_rest#*|}"
 
-echo "Step 5/12: wait base runtime readiness on target"
+echo "Step 5/13: wait base runtime readiness on target"
 wait_runtime_readiness_full "$BASE_RUNTIME_NAME" "$BASE_RUNTIME_VERSION"
 
-echo "Step 6/12: publish config_only runtime with deploy"
+echo "Step 6/13: publish config_only runtime with deploy"
 run_publish "$cfg_pkg_dir" "$CONFIG_RUNTIME_VERSION" "$publish_cfg_log"
 
-echo "Step 7/12: validate config_only deploy summary"
+echo "Step 7/13: validate config_only deploy summary"
 cfg_deploy="$(extract_and_validate_deploy_summary "$publish_cfg_log" "config")"
 cfg_sync_hint_status="${cfg_deploy%%|*}"
 cfg_rest="${cfg_deploy#*|}"
@@ -440,10 +467,10 @@ cfg_rest="${cfg_rest#*|}"
 cfg_update_error_code="${cfg_rest%%|*}"
 cfg_manifest_version="${cfg_rest#*|}"
 
-echo "Step 8/12: wait config_only readiness (including base_runtime_ready)"
+echo "Step 8/13: wait config_only readiness (including base_runtime_ready)"
 wait_runtime_readiness_config "$CONFIG_RUNTIME_NAME" "$CONFIG_RUNTIME_VERSION" "$cfg_manifest_version"
 
-echo "Step 9/12: spawn node with config_only runtime"
+echo "Step 9/13: spawn node with config_only runtime"
 spawn_http="$(spawn_node)"
 spawn_status="$(json_get_file "status" "$spawn_body")"
 if [[ "$spawn_http" != "200" || "$spawn_status" != "ok" ]]; then
@@ -452,13 +479,16 @@ if [[ "$spawn_http" != "200" || "$spawn_status" != "ok" ]]; then
   exit 1
 fi
 
-echo "Step 10/12: wait node lifecycle RUNNING (or STARTING active) and runtime resolution"
+echo "Step 10/13: wait node lifecycle RUNNING (or STARTING active) and runtime resolution"
 lifecycle_observed="$(wait_node_active_with_runtime "$CONFIG_RUNTIME_NAME" "$CONFIG_RUNTIME_VERSION")"
 
-echo "Step 11/12: cleanup node"
+echo "Step 11/13: verify _system.runtime_base and _system.package_path"
+package_path_observed="$(assert_node_system_runtime_base)"
+
+echo "Step 12/13: cleanup node"
 http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" "$kill_body" '{"force":true}' >/dev/null || true
 
-echo "Step 12/12: summary"
+echo "Step 13/13: summary"
 echo "status=ok"
 echo "hive_id=$HIVE_ID"
 echo "base_runtime=$BASE_RUNTIME_NAME@$BASE_RUNTIME_VERSION"
@@ -473,4 +503,5 @@ echo "config_update_status=$cfg_update_status"
 echo "config_update_error_code=$cfg_update_error_code"
 echo "config_manifest_version=$cfg_manifest_version"
 echo "lifecycle_observed=$lifecycle_observed"
+echo "package_path_observed=$package_path_observed"
 echo "runtime packaging PUB-T23 config_only E2E passed."

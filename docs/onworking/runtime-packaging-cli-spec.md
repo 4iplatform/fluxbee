@@ -887,31 +887,36 @@ fluxbee-publish ./package --deploy worker-220
   - call `sync-hint` + `update`.
   - report `ok`/`sync_pending`/`error`.
 
-### Phase 5 — E2E and Regression Matrix
+### Phase 5 — Core E2E Matrix
 
 - [x] PUB-T22. E2E `full_runtime`: publish -> deploy -> spawn -> running.
   - Script: `scripts/runtime_packaging_pub_t22_e2e.sh`
-- [x] PUB-T23. E2E `config_only`: publish -> deploy -> spawn using base runtime.
+- [ ] PUB-T23. E2E `config_only`: publish base fixture -> publish config_only -> deploy -> spawn using base runtime.
   - Script: `scripts/runtime_packaging_pub_t23_e2e.sh`
-  - Note: readiness check waits target hive `manifest_version` convergence before asserting `base_runtime_ready` (prevents false negatives while deploy is still `sync_pending`).
-- [x] PUB-T24. E2E `workflow`: publish -> deploy -> spawn using `wf.engine`.
-  - Script: `scripts/runtime_packaging_pub_t24_e2e.sh`
-- [ ] PUB-T25. E2E negative: missing `runtime_base` / unknown base / base without `start.sh`.
+  - Must also assert `GET /nodes/{node}/config` includes `_system.runtime_base` and `_system.package_path`.
+- [ ] PUB-T24. E2E `workflow`: rewrite from scratch as self-contained flow.
+  - New goal: publish engine fixture -> publish workflow package -> deploy -> spawn using workflow base runtime.
+  - Script target: `scripts/runtime_packaging_pub_t24_e2e.sh`
+  - Must not depend on pre-existing `wf.engine` on the target hive.
+- [ ] PUB-T25. E2E negative matrix:
+  - missing `runtime_base`
+  - unknown `runtime_base`
+  - base runtime without executable `start.sh`
+  - Prefer one script covering all three cases.
 - [ ] PUB-T26. E2E template layering:
   - template defaults applied
   - request overrides take precedence
-  - `_system` fields forced by orchestrator.
-- [ ] PUB-T27. Regression: rerun FR-08 suite (`scripts/runtime_lifecycle_fr8_e2e.sh`).
-- [ ] PUB-T28. Regression: rerun admin parity matrix for spawn/update actions (HTTP + socket).
+  - `_system` fields forced by orchestrator
+  - Prefer validating this on `config_only`, where the merge contract matters most.
 
 ### Phase 6 — Rollout and Documentation
 
-- [ ] PUB-T29. Document rollout order:
+- [ ] PUB-T27. Document rollout order:
   - orchestrator compatibility first
   - then CLI manifest v2 writes
   - then config-only/workflow packages
-- [ ] PUB-T30. Update operator docs (`README.md` + runtime lifecycle runbook) replacing manual manifest editing with `fluxbee-publish`.
-- [ ] PUB-T31. Add troubleshooting section:
+- [ ] PUB-T28. Update operator docs (`README.md` + runtime lifecycle runbook) replacing manual manifest editing with `fluxbee-publish`.
+- [ ] PUB-T29. Add troubleshooting section:
   - common errors and remediation (`BASE_RUNTIME_NOT_PRESENT`, `MISSING_RUNTIME_BASE`, `sync_pending`).
 
 ---
