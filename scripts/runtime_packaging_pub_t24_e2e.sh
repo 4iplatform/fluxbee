@@ -2,15 +2,14 @@
 set -euo pipefail
 
 # PUB-T24 E2E (workflow):
-# 1) publish workflow package (runtime_base=wf.engine by default)
-# 2) deploy to target hive
-# 3) spawn node and verify runtime + _system wiring
+# 1) publish workflow engine base fixture (full_runtime)
+# 2) publish workflow package using that base runtime
+# 3) deploy + spawn workflow on target hive
 #
 # Usage:
 #   BASE="http://127.0.0.1:8080" \
 #   HIVE_ID="worker-220" \
 #   MOTHER_HIVE_ID="motherbee" \
-#   RUNTIME_BASE="wf.engine" \
 #   TENANT_ID="tnt:<uuid>" \
 #   bash scripts/runtime_packaging_pub_t24_e2e.sh
 
@@ -21,22 +20,26 @@ MOTHER_HIVE_ID="${MOTHER_HIVE_ID:-motherbee}"
 TENANT_ID="${TENANT_ID:-}"
 WAIT_READY_SECS="${WAIT_READY_SECS:-120}"
 WAIT_STATUS_SECS="${WAIT_STATUS_SECS:-90}"
-WAIT_BASE_READY_SECS="${WAIT_BASE_READY_SECS:-30}"
 DEPLOY_STRICT="${DEPLOY_STRICT:-1}"
 TEST_ID="${TEST_ID:-pubt24-$(date +%s)-$RANDOM}"
+BASE_RUNTIME_NAME="${BASE_RUNTIME_NAME:-wf.engine.diag.$(date +%s)}"
+BASE_RUNTIME_VERSION="${BASE_RUNTIME_VERSION:-1.0.0-$TEST_ID}"
 WORKFLOW_RUNTIME_NAME="${WORKFLOW_RUNTIME_NAME:-wf.publish.workflow.diag.$(date +%s)}"
-WORKFLOW_RUNTIME_VERSION="${WORKFLOW_RUNTIME_VERSION:-1.0.0-$TEST_ID}"
-RUNTIME_BASE="${RUNTIME_BASE:-wf.engine}"
+WORKFLOW_RUNTIME_VERSION="${WORKFLOW_RUNTIME_VERSION:-2.0.0-$TEST_ID}"
 NODE_NAME="${NODE_NAME:-WF.publish.workflow.$TEST_ID}"
 
 MANIFEST_PATH="/var/lib/fluxbee/dist/runtimes/manifest.json"
+DIST_BASE_RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/$BASE_RUNTIME_NAME"
 DIST_WORKFLOW_RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/$WORKFLOW_RUNTIME_NAME"
 PUBLISH_BIN="$ROOT_DIR/target/release/fluxbee-publish"
+DIAG_BIN="$ROOT_DIR/target/release/inventory_hold_diag"
 
 tmpdir="$(mktemp -d)"
+base_pkg_dir="$tmpdir/base_pkg"
 workflow_pkg_dir="$tmpdir/workflow_pkg"
 manifest_backup="$tmpdir/manifest.backup.json"
-publish_log="$tmpdir/publish_workflow.log"
+publish_base_log="$tmpdir/publish_base.log"
+publish_workflow_log="$tmpdir/publish_workflow.log"
 versions_body="$tmpdir/versions.json"
 spawn_body="$tmpdir/spawn.json"
 status_body="$tmpdir/status.json"
@@ -49,6 +52,7 @@ cleanup() {
   if [[ -f "$manifest_backup" ]]; then
     as_root_local install -m 0644 "$manifest_backup" "$MANIFEST_PATH" >/dev/null 2>&1 || true
   fi
+  as_root_local rm -rf "$DIST_BASE_RUNTIME_DIR" >/dev/null 2>&1 || true
   as_root_local rm -rf "$DIST_WORKFLOW_RUNTIME_DIR" >/dev/null 2>&1 || true
   as_root_local rm -rf "$tmpdir" >/dev/null 2>&1 || true
   return "$_ec"
@@ -137,72 +141,37 @@ validate_tenant_id() {
   fi
 }
 
-assert_runtime_base_ready() {
-  local deadline=$(( $(date +%s) + WAIT_BASE_READY_SECS ))
-  local missing_runtime_count=0
-  local missing_current_count=0
-  local last_progress_ts=0
+wait_runtime_readiness_full() {
+  local runtime_name="$1"
+  local runtime_version="$2"
+  local deadline=$(( $(date +%s) + WAIT_READY_SECS ))
   while (( $(date +%s) <= deadline )); do
-    local http runtime_exists base_current present exec now available_head
+    local http present exec
     http="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$versions_body")"
     if [[ "$http" != "200" ]]; then
       sleep 2
       continue
     fi
-    runtime_exists="$(jq -r --arg rt "$RUNTIME_BASE" \
-      '(.payload.hive.runtimes.runtimes | has($rt)) // false | tostring' \
-      "$versions_body")"
-    if [[ "$runtime_exists" != "true" ]]; then
-      missing_runtime_count=$((missing_runtime_count + 1))
-      if (( missing_runtime_count >= 3 )); then
-        available_head="$(jq -r '.payload.hive.runtimes.runtimes | keys | .[0:8] | join(",")' "$versions_body")"
-        echo "FAIL: runtime_base '$RUNTIME_BASE' is not present on hive '$HIVE_ID' versions catalog." >&2
-        echo "HINT: publish/deploy '$RUNTIME_BASE' first, or run with RUNTIME_BASE=<existing runtime>." >&2
-        if [[ -n "$available_head" ]]; then
-          echo "available_runtimes(sample)=$available_head" >&2
-        fi
-        return 1
-      fi
-      sleep 2
-      continue
-    fi
-    base_current="$(jq -r --arg rt "$RUNTIME_BASE" \
-      '(.payload.hive.runtimes.runtimes[$rt].current // "") | tostring' \
-      "$versions_body")"
-    if [[ -z "$base_current" ]]; then
-      missing_current_count=$((missing_current_count + 1))
-      if (( missing_current_count >= 3 )); then
-        echo "FAIL: runtime_base '$RUNTIME_BASE' exists on hive '$HIVE_ID' but has empty 'current' version." >&2
-        echo "HINT: fix manifest current for '$RUNTIME_BASE' and retry." >&2
-        return 1
-      fi
-      sleep 2
-      continue
-    fi
-    present="$(jq -r --arg rt "$RUNTIME_BASE" --arg ver "$base_current" \
+    present="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
       '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver].runtime_present // false) | tostring' \
       "$versions_body")"
-    exec="$(jq -r --arg rt "$RUNTIME_BASE" --arg ver "$base_current" \
+    exec="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
       '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver].start_sh_executable // false) | tostring' \
       "$versions_body")"
     if [[ "$present" == "true" && "$exec" == "true" ]]; then
       return 0
     fi
-    now="$(date +%s)"
-    if (( last_progress_ts == 0 || now - last_progress_ts >= 10 )); then
-      echo "waiting runtime_base readiness runtime='$RUNTIME_BASE' current='$base_current' runtime_present=$present start_sh_executable=$exec" >&2
-      last_progress_ts="$now"
-    fi
     sleep 2
   done
-  echo "FAIL: runtime_base '$RUNTIME_BASE' is not ready on hive '$HIVE_ID'" >&2
-  echo "HINT: publish/deploy the base runtime first or override RUNTIME_BASE for this environment." >&2
+  echo "FAIL: base runtime readiness not ready runtime='$runtime_name' version='$runtime_version'" >&2
   cat "$versions_body" >&2 || true
   return 1
 }
 
-wait_workflow_readiness() {
-  local expected_manifest_version="${1:-0}"
+wait_runtime_readiness_workflow() {
+  local runtime_name="$1"
+  local runtime_version="$2"
+  local expected_manifest_version="${3:-0}"
   local deadline=$(( $(date +%s) + WAIT_READY_SECS ))
   while (( $(date +%s) <= deadline )); do
     local http manifest_version runtime_exists readiness_exists present exec base_ready has_base_ready
@@ -220,36 +189,36 @@ wait_workflow_readiness() {
         fi
       fi
     fi
-    runtime_exists="$(jq -r --arg rt "$WORKFLOW_RUNTIME_NAME" \
+    runtime_exists="$(jq -r --arg rt "$runtime_name" \
       '(.payload.hive.runtimes.runtimes | has($rt)) // false | tostring' \
       "$versions_body")"
     if [[ "$runtime_exists" != "true" ]]; then
       sleep 2
       continue
     fi
-    readiness_exists="$(jq -r --arg rt "$WORKFLOW_RUNTIME_NAME" --arg ver "$WORKFLOW_RUNTIME_VERSION" \
+    readiness_exists="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
       '(.payload.hive.runtimes.runtimes[$rt].readiness | has($ver)) // false | tostring' \
       "$versions_body")"
     if [[ "$readiness_exists" != "true" ]]; then
       sleep 2
       continue
     fi
-    has_base_ready="$(jq -r --arg rt "$WORKFLOW_RUNTIME_NAME" --arg ver "$WORKFLOW_RUNTIME_VERSION" \
+    has_base_ready="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
       '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver] | has("base_runtime_ready")) // false | tostring' \
       "$versions_body")"
     if [[ "$has_base_ready" != "true" ]]; then
-      echo "FAIL: target hive '$HIVE_ID' runtime '$WORKFLOW_RUNTIME_NAME' readiness for version '$WORKFLOW_RUNTIME_VERSION' is present but missing base_runtime_ready." >&2
+      echo "FAIL: target hive '$HIVE_ID' runtime '$runtime_name' readiness for version '$runtime_version' is present but missing base_runtime_ready." >&2
       echo "HINT: verify worker sy-orchestrator build has package-aware readiness (PUB-T10+)." >&2
       cat "$versions_body" >&2 || true
       return 1
     fi
-    present="$(jq -r --arg rt "$WORKFLOW_RUNTIME_NAME" --arg ver "$WORKFLOW_RUNTIME_VERSION" \
+    present="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
       '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver].runtime_present // false) | tostring' \
       "$versions_body")"
-    exec="$(jq -r --arg rt "$WORKFLOW_RUNTIME_NAME" --arg ver "$WORKFLOW_RUNTIME_VERSION" \
+    exec="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
       '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver].start_sh_executable // false) | tostring' \
       "$versions_body")"
-    base_ready="$(jq -r --arg rt "$WORKFLOW_RUNTIME_NAME" --arg ver "$WORKFLOW_RUNTIME_VERSION" \
+    base_ready="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
       '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver].base_runtime_ready // false) | tostring' \
       "$versions_body")"
     if [[ "$present" == "true" && "$exec" == "true" && "$base_ready" == "true" ]]; then
@@ -257,7 +226,11 @@ wait_workflow_readiness() {
     fi
     sleep 2
   done
-  echo "FAIL: workflow readiness timeout runtime='$WORKFLOW_RUNTIME_NAME' version='$WORKFLOW_RUNTIME_VERSION' expected_manifest_version>=$expected_manifest_version" >&2
+  if [[ "$expected_manifest_version" =~ ^[0-9]+$ && "$expected_manifest_version" -gt 0 ]]; then
+    echo "FAIL: workflow readiness timeout runtime='$runtime_name' version='$runtime_version' expected_manifest_version>=$expected_manifest_version" >&2
+  else
+    echo "FAIL: workflow readiness timeout runtime='$runtime_name' version='$runtime_version'" >&2
+  fi
   cat "$versions_body" >&2 || true
   return 1
 }
@@ -270,6 +243,8 @@ spawn_node() {
 }
 
 wait_node_active_with_runtime() {
+  local expected_runtime="$1"
+  local expected_version="$2"
   local deadline=$(( $(date +%s) + WAIT_STATUS_SECS ))
   while (( $(date +%s) <= deadline )); do
     local http api_status payload_status lifecycle pid runtime_name runtime_version
@@ -288,7 +263,7 @@ wait_node_active_with_runtime() {
       sleep 2
       continue
     fi
-    if [[ "$runtime_name" != "$WORKFLOW_RUNTIME_NAME" || "$runtime_version" != "$WORKFLOW_RUNTIME_VERSION" ]]; then
+    if [[ "$runtime_name" != "$expected_runtime" || "$runtime_version" != "$expected_version" ]]; then
       sleep 2
       continue
     fi
@@ -308,7 +283,7 @@ wait_node_active_with_runtime() {
 }
 
 assert_node_system_runtime_base() {
-  local http api_status payload_status cfg_runtime_base cfg_package_path
+  local http api_status payload_status cfg_runtime_base cfg_package_path expected_package_path
   http="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" "$config_body")"
   api_status="$(json_get_file "status" "$config_body")"
   payload_status="$(json_get_file "payload.status" "$config_body")"
@@ -319,17 +294,51 @@ assert_node_system_runtime_base() {
   fi
   cfg_runtime_base="$(json_get_file "payload.config._system.runtime_base" "$config_body")"
   cfg_package_path="$(json_get_file "payload.config._system.package_path" "$config_body")"
-  if [[ "$cfg_runtime_base" != "$RUNTIME_BASE" ]]; then
-    echo "FAIL: unexpected payload.config._system.runtime_base expected='$RUNTIME_BASE' got='$cfg_runtime_base'" >&2
+  expected_package_path="/var/lib/fluxbee/dist/runtimes/$WORKFLOW_RUNTIME_NAME/$WORKFLOW_RUNTIME_VERSION"
+  if [[ "$cfg_runtime_base" != "$BASE_RUNTIME_NAME" ]]; then
+    echo "FAIL: unexpected payload.config._system.runtime_base expected='$BASE_RUNTIME_NAME' got='$cfg_runtime_base'" >&2
     cat "$config_body" >&2 || true
     return 1
   fi
-  if [[ -z "$cfg_package_path" ]]; then
-    echo "FAIL: payload.config._system.package_path is empty" >&2
+  if [[ "$cfg_package_path" != "$expected_package_path" ]]; then
+    echo "FAIL: unexpected payload.config._system.package_path expected='$expected_package_path' got='$cfg_package_path'" >&2
     cat "$config_body" >&2 || true
     return 1
   fi
   echo "$cfg_package_path"
+}
+
+create_base_package_fixture() {
+  mkdir -p "$base_pkg_dir/bin" "$base_pkg_dir/config"
+  cat >"$base_pkg_dir/package.json" <<EOF
+{
+  "name": "$BASE_RUNTIME_NAME",
+  "version": "0.0.1",
+  "type": "full_runtime",
+  "description": "PUB-T24 workflow engine fixture",
+  "config_template": "config/default-config.json",
+  "entry_point": "bin/start.sh"
+}
+EOF
+  cat >"$base_pkg_dir/bin/start.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+export INVENTORY_HOLD_NODE_NAME="${INVENTORY_HOLD_NODE_NAME:-${NODE_NAME:-WF.publish.workflow}}"
+export INVENTORY_HOLD_NODE_VERSION="${INVENTORY_HOLD_NODE_VERSION:-0.0.1}"
+export INVENTORY_HOLD_SECS="${INVENTORY_HOLD_SECS:-0}"
+export NODE_STATUS_DEFAULT_HANDLER_ENABLED="1"
+export NODE_STATUS_DEFAULT_HEALTH_STATE="HEALTHY"
+exec "$(dirname "${BASH_SOURCE[0]}")/inventory_hold_diag"
+EOF
+  chmod 0755 "$base_pkg_dir/bin/start.sh"
+  cat >"$base_pkg_dir/config/default-config.json" <<'EOF'
+{
+  "diag": {
+    "kind": "workflow_engine_base"
+  }
+}
+EOF
+  as_root_local install -m 0755 "$DIAG_BIN" "$base_pkg_dir/bin/inventory_hold_diag"
 }
 
 create_workflow_package_fixture() {
@@ -340,7 +349,7 @@ create_workflow_package_fixture() {
   "version": "0.0.1",
   "type": "workflow",
   "description": "PUB-T24 workflow fixture",
-  "runtime_base": "$RUNTIME_BASE",
+  "runtime_base": "$BASE_RUNTIME_NAME",
   "config_template": "config/default-config.json"
 }
 EOF
@@ -352,12 +361,17 @@ EOF
   }
 }
 EOF
-  cat >"$workflow_pkg_dir/flow/main.yaml" <<'EOF'
-id: demo-workflow
-version: 1
-steps:
-  - id: start
-    type: noop
+  cat >"$workflow_pkg_dir/flow/definition.json" <<'EOF'
+{
+  "id": "demo-workflow",
+  "version": 1,
+  "steps": [
+    {
+      "id": "start",
+      "type": "noop"
+    }
+  ]
+}
 EOF
   cat >"$workflow_pkg_dir/assets/readme.txt" <<'EOF'
 workflow fixture payload
@@ -377,8 +391,9 @@ run_publish() {
 
 extract_and_validate_deploy_summary() {
   local out_log="$1"
+  local label="$2"
   if ! grep -q "sync_hint_status=" "$out_log"; then
-    echo "FAIL: publish output missing deploy summary" >&2
+    echo "FAIL[$label]: publish output missing deploy summary" >&2
     cat "$out_log" >&2 || true
     exit 1
   fi
@@ -389,18 +404,18 @@ extract_and_validate_deploy_summary() {
   update_error_code="$(echo "$deploy_line" | sed -n 's/.*update_error_code=\(.*\)$/\1/p')"
   manifest_version="$(sed -n 's/.*Manifest: .* (version=\([0-9][0-9]*\)).*/\1/p' "$out_log" | tail -n1)"
   if [[ -z "$manifest_version" ]]; then
-    echo "FAIL: unable to parse manifest version from publish output" >&2
+    echo "FAIL[$label]: unable to parse manifest version from publish output" >&2
     cat "$out_log" >&2 || true
     exit 1
   fi
   if [[ "$DEPLOY_STRICT" == "1" ]]; then
     if [[ "$sync_hint_status" == "error" ]]; then
-      echo "FAIL: strict deploy requires sync_hint_status != error" >&2
+      echo "FAIL[$label]: strict deploy requires sync_hint_status != error" >&2
       cat "$out_log" >&2 || true
       exit 1
     fi
     if [[ "$update_status" == "error" ]]; then
-      echo "FAIL: strict deploy requires update_status != error (code='$update_error_code')" >&2
+      echo "FAIL[$label]: strict deploy requires update_status != error (code='$update_error_code')" >&2
       cat "$out_log" >&2 || true
       exit 1
     fi
@@ -419,38 +434,55 @@ if [[ ! -f "$MANIFEST_PATH" ]]; then
   exit 1
 fi
 
-echo "PUB-T24 workflow E2E: BASE=$BASE HIVE_ID=$HIVE_ID MOTHER_HIVE_ID=$MOTHER_HIVE_ID RUNTIME_BASE=$RUNTIME_BASE WORKFLOW_RUNTIME=$WORKFLOW_RUNTIME_NAME@$WORKFLOW_RUNTIME_VERSION NODE=$NODE_NAME"
+echo "PUB-T24 workflow E2E: BASE=$BASE HIVE_ID=$HIVE_ID MOTHER_HIVE_ID=$MOTHER_HIVE_ID BASE_RUNTIME=$BASE_RUNTIME_NAME@$BASE_RUNTIME_VERSION WORKFLOW_RUNTIME=$WORKFLOW_RUNTIME_NAME@$WORKFLOW_RUNTIME_VERSION NODE=$NODE_NAME"
 
-echo "Step 1/11: build binary (fluxbee-publish)"
-(cd "$ROOT_DIR" && cargo build --release --bin fluxbee-publish >/dev/null)
+echo "Step 1/13: build binaries (fluxbee-publish + inventory_hold_diag)"
+(cd "$ROOT_DIR" && cargo build --release --bin fluxbee-publish --bin inventory_hold_diag >/dev/null)
 if [[ ! -x "$PUBLISH_BIN" ]]; then
   echo "FAIL: publish binary missing at '$PUBLISH_BIN'" >&2
   exit 1
 fi
+if [[ ! -x "$DIAG_BIN" ]]; then
+  echo "FAIL: inventory_hold_diag binary missing at '$DIAG_BIN'" >&2
+  exit 1
+fi
 
-echo "Step 2/11: validate runtime_base readiness on target hive"
-assert_runtime_base_ready
-
-echo "Step 3/11: backup manifest + create workflow package fixture"
+echo "Step 2/13: backup manifest + create package fixtures (engine base + workflow)"
 as_root_local install -m 0644 "$MANIFEST_PATH" "$manifest_backup"
+create_base_package_fixture
 create_workflow_package_fixture
 
-echo "Step 4/11: publish workflow package with deploy"
-run_publish "$workflow_pkg_dir" "$WORKFLOW_RUNTIME_VERSION" "$publish_log"
+echo "Step 3/13: publish workflow engine base with deploy"
+run_publish "$base_pkg_dir" "$BASE_RUNTIME_VERSION" "$publish_base_log"
 
-echo "Step 5/11: validate deploy summary"
-deploy_summary="$(extract_and_validate_deploy_summary "$publish_log")"
-sync_hint_status="${deploy_summary%%|*}"
-rest="${deploy_summary#*|}"
-update_status="${rest%%|*}"
-rest="${rest#*|}"
-update_error_code="${rest%%|*}"
-manifest_version="${rest#*|}"
+echo "Step 4/13: validate base deploy summary"
+base_deploy="$(extract_and_validate_deploy_summary "$publish_base_log" "base")"
+base_sync_hint_status="${base_deploy%%|*}"
+base_rest="${base_deploy#*|}"
+base_update_status="${base_rest%%|*}"
+base_rest="${base_rest#*|}"
+base_update_error_code="${base_rest%%|*}"
+base_manifest_version="${base_rest#*|}"
 
-echo "Step 6/11: wait workflow readiness (including base_runtime_ready)"
-wait_workflow_readiness "$manifest_version"
+echo "Step 5/13: wait base runtime readiness on target"
+wait_runtime_readiness_full "$BASE_RUNTIME_NAME" "$BASE_RUNTIME_VERSION"
 
-echo "Step 7/11: spawn node with workflow runtime"
+echo "Step 6/13: publish workflow runtime with deploy"
+run_publish "$workflow_pkg_dir" "$WORKFLOW_RUNTIME_VERSION" "$publish_workflow_log"
+
+echo "Step 7/13: validate workflow deploy summary"
+workflow_deploy="$(extract_and_validate_deploy_summary "$publish_workflow_log" "workflow")"
+workflow_sync_hint_status="${workflow_deploy%%|*}"
+workflow_rest="${workflow_deploy#*|}"
+workflow_update_status="${workflow_rest%%|*}"
+workflow_rest="${workflow_rest#*|}"
+workflow_update_error_code="${workflow_rest%%|*}"
+workflow_manifest_version="${workflow_rest#*|}"
+
+echo "Step 8/13: wait workflow readiness (including base_runtime_ready)"
+wait_runtime_readiness_workflow "$WORKFLOW_RUNTIME_NAME" "$WORKFLOW_RUNTIME_VERSION" "$workflow_manifest_version"
+
+echo "Step 9/13: spawn node with workflow runtime"
 spawn_http="$(spawn_node)"
 spawn_status="$(json_get_file "status" "$spawn_body")"
 if [[ "$spawn_http" != "200" || "$spawn_status" != "ok" ]]; then
@@ -459,25 +491,29 @@ if [[ "$spawn_http" != "200" || "$spawn_status" != "ok" ]]; then
   exit 1
 fi
 
-echo "Step 8/11: wait node lifecycle RUNNING (or STARTING active)"
-lifecycle_observed="$(wait_node_active_with_runtime)"
+echo "Step 10/13: wait node lifecycle RUNNING (or STARTING active) and runtime resolution"
+lifecycle_observed="$(wait_node_active_with_runtime "$WORKFLOW_RUNTIME_NAME" "$WORKFLOW_RUNTIME_VERSION")"
 
-echo "Step 9/11: verify _system.runtime_base and _system.package_path"
+echo "Step 11/13: verify _system.runtime_base and _system.package_path"
 package_path_observed="$(assert_node_system_runtime_base)"
 
-echo "Step 10/11: cleanup node"
+echo "Step 12/13: cleanup node"
 http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" "$kill_body" '{"force":true}' >/dev/null || true
 
-echo "Step 11/11: summary"
+echo "Step 13/13: summary"
 echo "status=ok"
 echo "hive_id=$HIVE_ID"
-echo "runtime_base=$RUNTIME_BASE"
+echo "base_runtime=$BASE_RUNTIME_NAME@$BASE_RUNTIME_VERSION"
 echo "workflow_runtime=$WORKFLOW_RUNTIME_NAME@$WORKFLOW_RUNTIME_VERSION"
 echo "node_name=$NODE_NAME@$HIVE_ID"
-echo "sync_hint_status=$sync_hint_status"
-echo "update_status=$update_status"
-echo "update_error_code=$update_error_code"
-echo "manifest_version=$manifest_version"
+echo "base_sync_hint_status=$base_sync_hint_status"
+echo "base_update_status=$base_update_status"
+echo "base_update_error_code=$base_update_error_code"
+echo "base_manifest_version=$base_manifest_version"
+echo "workflow_sync_hint_status=$workflow_sync_hint_status"
+echo "workflow_update_status=$workflow_update_status"
+echo "workflow_update_error_code=$workflow_update_error_code"
+echo "workflow_manifest_version=$workflow_manifest_version"
 echo "lifecycle_observed=$lifecycle_observed"
 echo "package_path_observed=$package_path_observed"
 echo "runtime packaging PUB-T24 workflow E2E passed."
