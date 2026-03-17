@@ -893,7 +893,9 @@ fluxbee-publish ./package --deploy worker-220
   - Script: `scripts/runtime_packaging_pub_t22_e2e.sh`
 - [x] PUB-T23. E2E `config_only`: publish -> deploy -> spawn using base runtime.
   - Script: `scripts/runtime_packaging_pub_t23_e2e.sh`
-- [ ] PUB-T24. E2E `workflow`: publish -> deploy -> spawn using `wf.engine`.
+  - Note: readiness check waits target hive `manifest_version` convergence before asserting `base_runtime_ready` (prevents false negatives while deploy is still `sync_pending`).
+- [x] PUB-T24. E2E `workflow`: publish -> deploy -> spawn using `wf.engine`.
+  - Script: `scripts/runtime_packaging_pub_t24_e2e.sh`
 - [ ] PUB-T25. E2E negative: missing `runtime_base` / unknown base / base without `start.sh`.
 - [ ] PUB-T26. E2E template layering:
   - template defaults applied
