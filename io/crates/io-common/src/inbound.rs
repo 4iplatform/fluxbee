@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::identity::{IdentityResolver, ResolveOrCreateInput};
+use crate::identity::{IdentityProvisioner, IdentityResolver, ResolveOrCreateInput};
 use crate::io_context::{wrap_in_meta_context, IoContext};
 use crate::reliability::{dedup_key_from_io_context, DedupCache};
 use crate::router_message::{build_user_message, new_trace_id};
@@ -16,6 +16,7 @@ pub struct InboundConfig {
     pub dedup_ttl: Duration,
     pub dedup_max_entries: usize,
     pub dst_node: Option<String>,
+    pub provision_on_miss: bool,
 }
 
 impl Default for InboundConfig {
@@ -25,6 +26,7 @@ impl Default for InboundConfig {
             dedup_ttl: Duration::from_millis(10 * 60 * 1000),
             dedup_max_entries: 50_000,
             dst_node: None,
+            provision_on_miss: true,
         }
     }
 }
@@ -40,6 +42,7 @@ pub struct InboundProcessor {
     node_uuid: String,
     ttl: u32,
     dst_node: Option<String>,
+    provision_on_miss: bool,
     dedup: DedupCache,
     stats: InboundStats,
 }
@@ -60,6 +63,7 @@ impl InboundProcessor {
             node_uuid: node_uuid.into(),
             ttl,
             dst_node,
+            provision_on_miss: config.provision_on_miss,
             dedup,
             stats: InboundStats::default(),
         }
@@ -72,6 +76,7 @@ impl InboundProcessor {
     pub async fn process_inbound(
         &mut self,
         identity: &dyn IdentityResolver,
+        provisioner: Option<&dyn IdentityProvisioner>,
         identity_input: ResolveOrCreateInput,
         io_context: IoContext,
         payload: Value,
@@ -84,10 +89,47 @@ impl InboundProcessor {
         self.stats.dedup_misses += 1;
 
         let trace_id = new_trace_id();
-        let src_ilk = match identity.lookup(&identity_input.channel, &identity_input.external_id) {
+        let mut src_ilk = match identity.lookup(&identity_input.channel, &identity_input.external_id) {
             Ok(v) => v,
             Err(_) => None,
         };
+
+        if src_ilk.is_none() && self.provision_on_miss {
+            if let Some(provisioner) = provisioner {
+                match provisioner.provision(&identity_input).await {
+                    Ok(Some(provisioned_ilk)) => {
+                        tracing::info!(
+                            channel = %identity_input.channel,
+                            external_id = %identity_input.external_id,
+                            src_ilk = %provisioned_ilk,
+                            "identity provisioned on miss"
+                        );
+                        src_ilk = Some(provisioned_ilk);
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            channel = %identity_input.channel,
+                            external_id = %identity_input.external_id,
+                            "identity miss with no provisional src_ilk; forwarding with null src_ilk"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            channel = %identity_input.channel,
+                            external_id = %identity_input.external_id,
+                            "identity provision failed; forwarding with null src_ilk"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    channel = %identity_input.channel,
+                    external_id = %identity_input.external_id,
+                    "identity miss without provisioner; forwarding with null src_ilk"
+                );
+            }
+        }
 
         InboundOutcome::SendNow(build_user_message(
             &self.node_uuid,
@@ -133,10 +175,12 @@ mod tests {
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
-        let o1 = p.process_inbound(&id, input.clone(), io.clone(), payload.clone()).await;
+        let o1 = p
+            .process_inbound(&id, None, input.clone(), io.clone(), payload.clone())
+            .await;
         assert!(matches!(o1, InboundOutcome::SendNow(_)));
 
-        let o2 = p.process_inbound(&id, input, io, payload).await;
+        let o2 = p.process_inbound(&id, None, input, io, payload).await;
         assert!(matches!(o2, InboundOutcome::DroppedDuplicate));
     }
 
@@ -153,7 +197,7 @@ mod tests {
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
-        let o = p.process_inbound(&id, input, io, payload).await;
+        let o = p.process_inbound(&id, None, input, io, payload).await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
@@ -178,7 +222,7 @@ mod tests {
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
-        let o = p.process_inbound(&id, input, io, payload).await;
+        let o = p.process_inbound(&id, None, input, io, payload).await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
@@ -189,5 +233,43 @@ mod tests {
             .and_then(|ctx| ctx.get("thread_id"))
             .and_then(|v| v.as_str());
         assert_eq!(thread_id, Some("171234.567"));
+    }
+
+    struct AlwaysProvision;
+
+    #[async_trait::async_trait]
+    impl IdentityProvisioner for AlwaysProvision {
+        async fn provision(&self, _input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
+            Ok(Some("ilk:provisional:test".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn miss_can_provision_src_ilk() {
+        let mut p = InboundProcessor::new("node", InboundConfig::default());
+        let id = AlwaysMiss;
+        let provisioner = AlwaysProvision;
+        let io = slack_inbound_io_context("T", "U", "C", None, "Ev1");
+        let input = ResolveOrCreateInput {
+            channel: "slack".to_string(),
+            external_id: "T:U".to_string(),
+            tenant_hint: None,
+            attributes: serde_json::json!({}),
+        };
+        let payload = serde_json::json!({ "type": "text", "content": "hi" });
+
+        let o = p
+            .process_inbound(&id, Some(&provisioner), input, io, payload)
+            .await;
+        let InboundOutcome::SendNow(msg) = o else {
+            panic!("unexpected outcome: {o:?}");
+        };
+        let src = msg
+            .meta
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("src_ilk"))
+            .and_then(|v| v.as_str());
+        assert_eq!(src, Some("ilk:provisional:test"));
     }
 }

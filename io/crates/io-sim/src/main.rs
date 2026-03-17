@@ -1,13 +1,14 @@
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
-use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::{connect, NodeConfig, NodeSender};
 use io_common::identity::{
-    DisabledIdentityResolver, IdentityResolver, MockIdentityResolver, ResolveOrCreateInput,
+    DisabledIdentityProvisioner, DisabledIdentityResolver, IdentityProvisioner, IdentityResolver, MockIdentityResolver, ResolveOrCreateInput,
     ShmIdentityResolver,
 };
 use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
 use io_common::io_context::{ConversationRef, IoContext, MessageRef, PartyRef, ReplyTarget};
+use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,10 +57,25 @@ async fn main() -> Result<()> {
             };
             Arc::new(FixedIdentityResolver::new(src_ilk))
         }
+        "provision" => Arc::new(ShmIdentityResolver::new(&config.island_id)),
         "mock" => Arc::new(MockIdentityResolver::new()),
         "shm" => Arc::new(ShmIdentityResolver::new(&config.island_id)),
         "disabled" => Arc::new(DisabledIdentityResolver::new()),
-        other => anyhow::bail!("unsupported IDENTITY_MODE={other} (use shm|mock|disabled|fixed)"),
+        other => anyhow::bail!("unsupported IDENTITY_MODE={other} (use shm|mock|disabled|fixed|provision)"),
+    };
+    let inbox = Arc::new(Mutex::new(RouterInbox::new(receiver)));
+    let provisioner: Arc<dyn IdentityProvisioner> = if config.identity_mode == "provision" {
+        Arc::new(FluxbeeIdentityProvisioner::new(
+            sender.clone(),
+            inbox.clone(),
+            IdentityProvisionConfig {
+                target: config.identity_target.clone(),
+                fallback_target: config.identity_fallback_target.clone(),
+                timeout: Duration::from_millis(config.identity_timeout_ms),
+            },
+        ))
+    } else {
+        Arc::new(DisabledIdentityProvisioner::new())
     };
     let inbound = Arc::new(Mutex::new(InboundProcessor::new(
         sender.uuid().to_string(),
@@ -68,15 +84,16 @@ async fn main() -> Result<()> {
             dedup_ttl: Duration::from_millis(config.dedup_ttl_ms),
             dedup_max_entries: config.dedup_max_entries,
             dst_node: config.dst_node.clone(),
+            provision_on_miss: true,
         },
     )));
 
-    let outbound_task = tokio::spawn(run_outbound_log_loop(receiver));
+    let outbound_task = tokio::spawn(run_outbound_log_loop(inbox.clone()));
 
     if let Some(text) = args.once {
-        process_one_inbound(&config, &sender, identity.as_ref(), inbound.clone(), text).await?;
+        process_one_inbound(&config, &sender, identity.as_ref(), provisioner.as_ref(), inbound.clone(), text).await?;
     } else {
-        run_stdin_inbound_loop(&config, &sender, identity.as_ref(), inbound.clone()).await?;
+        run_stdin_inbound_loop(&config, &sender, identity.as_ref(), provisioner.as_ref(), inbound.clone()).await?;
     }
 
     outbound_task.abort();
@@ -102,6 +119,9 @@ struct Config {
     sim_thread_id: Option<String>,
     sim_src_ilk: Option<String>,
     sim_tenant_hint: Option<String>,
+    identity_target: String,
+    identity_fallback_target: Option<String>,
+    identity_timeout_ms: u64,
 }
 
 impl Config {
@@ -138,6 +158,11 @@ impl Config {
             sim_thread_id: env("SIM_THREAD_ID"),
             sim_src_ilk: env("SIM_SRC_ILK"),
             sim_tenant_hint: env("SIM_TENANT_HINT"),
+            identity_target: env("IDENTITY_TARGET").unwrap_or_else(|| "SY.identity".to_string()),
+            identity_fallback_target: env("IDENTITY_FALLBACK_TARGET"),
+            identity_timeout_ms: env("IDENTITY_TIMEOUT_MS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000),
         })
     }
 }
@@ -199,6 +224,7 @@ async fn run_stdin_inbound_loop(
     config: &Config,
     sender: &NodeSender,
     identity: &dyn IdentityResolver,
+    provisioner: &dyn IdentityProvisioner,
     inbound: Arc<Mutex<InboundProcessor>>,
 ) -> Result<()> {
     tracing::info!("io-sim reading lines from stdin");
@@ -210,7 +236,7 @@ async fn run_stdin_inbound_loop(
         if text.is_empty() {
             continue;
         }
-        process_one_inbound(config, sender, identity, inbound.clone(), text).await?;
+        process_one_inbound(config, sender, identity, provisioner, inbound.clone(), text).await?;
     }
     Ok(())
 }
@@ -219,6 +245,7 @@ async fn process_one_inbound(
     config: &Config,
     sender: &NodeSender,
     identity: &dyn IdentityResolver,
+    provisioner: &dyn IdentityProvisioner,
     inbound: Arc<Mutex<InboundProcessor>>,
     text: String,
 ) -> Result<()> {
@@ -265,6 +292,7 @@ async fn process_one_inbound(
         .await
         .process_inbound(
             identity,
+            Some(provisioner),
             ResolveOrCreateInput {
                 channel: config.sim_channel.clone(),
                 external_id: config.sim_sender_id.clone(),
@@ -306,9 +334,15 @@ async fn process_one_inbound(
     Ok(())
 }
 
-async fn run_outbound_log_loop(mut receiver: NodeReceiver) -> Result<()> {
+async fn run_outbound_log_loop(inbox: Arc<Mutex<RouterInbox>>) -> Result<()> {
     loop {
-        let msg = receiver.recv().await?;
+        let msg = {
+            let mut guard = inbox.lock().await;
+            match guard.recv_next_timeout(Duration::from_millis(500)).await? {
+                Some(msg) => msg,
+                None => continue,
+            }
+        };
         let payload_type = msg
             .payload
             .get("type")

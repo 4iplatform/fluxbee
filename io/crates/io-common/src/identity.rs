@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;
@@ -36,6 +37,27 @@ pub enum IdentityError {
 pub trait IdentityResolver: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn lookup(&self, channel: &str, external_id: &str) -> Result<Option<String>, IdentityError>;
+}
+
+#[async_trait]
+pub trait IdentityProvisioner: Send + Sync {
+    async fn provision(&self, input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError>;
+}
+
+#[derive(Default)]
+pub struct DisabledIdentityProvisioner;
+
+impl DisabledIdentityProvisioner {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl IdentityProvisioner for DisabledIdentityProvisioner {
+    async fn provision(&self, _input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
+        Ok(None)
+    }
 }
 
 #[derive(Default)]

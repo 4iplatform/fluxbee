@@ -1,7 +1,7 @@
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,11 +14,16 @@ use fluxbee_ai_sdk::{
     LanceDbThreadStateStore, ModelSettings, NodeRuntime, OpenAiResponsesClient, RetryPolicy,
     RouterClient, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
 };
-use fluxbee_sdk::{connect, identity_system_call_ok, IdentitySystemRequest, MSG_ILK_REGISTER, NodeConfig};
+use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
+use fluxbee_sdk::node_client::NodeError;
+use fluxbee_sdk::protocol::{Destination, Meta, Routing, SYSTEM_KIND, MSG_TTL_EXCEEDED, MSG_UNREACHABLE};
+use fluxbee_sdk::MSG_ILK_REGISTER;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
+use uuid::Uuid;
 use tracing_subscriber::EnvFilter;
 
 const MSG_NODE_STATUS_GET: &str = "NODE_STATUS_GET";
@@ -28,7 +33,6 @@ const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE
 const GOV_IDENTITY_TARGET_ENV: &str = "GOV_IDENTITY_TARGET";
 const GOV_IDENTITY_FALLBACK_TARGET_ENV: &str = "GOV_IDENTITY_FALLBACK_TARGET";
 const GOV_IDENTITY_TIMEOUT_MS_ENV: &str = "GOV_IDENTITY_TIMEOUT_MS";
-const GOV_IDENTITY_CALLER_NODE_ENV: &str = "GOV_IDENTITY_CALLER_NODE";
 
 #[derive(Debug, Deserialize)]
 struct RunnerConfig {
@@ -322,7 +326,7 @@ struct GenericAiNode {
     dynamic_config_dir: PathBuf,
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
     gov_identity: GovIdentityConfig,
-    gov_identity_bridge: Arc<GovIdentityBridge>,
+    gov_identity_bridge: Option<Arc<GovIdentityBridge>>,
     control_plane: Arc<RwLock<ControlPlaneState>>,
 }
 
@@ -331,7 +335,6 @@ struct GovIdentityConfig {
     target: String,
     fallback_target: Option<String>,
     timeout: Duration,
-    caller_node: Option<String>,
 }
 
 impl Default for GovIdentityConfig {
@@ -340,36 +343,57 @@ impl Default for GovIdentityConfig {
             target: "SY.identity".to_string(),
             fallback_target: Some("SY.identity@motherbee".to_string()),
             timeout: Duration::from_secs(10),
-            caller_node: None,
         }
     }
 }
 
+struct SharedRouterConnection {
+    inner: Mutex<SharedRouterState>,
+}
+
+struct SharedRouterState {
+    reader: RouterReader,
+    writer: RouterWriter,
+    backlog: VecDeque<Message>,
+}
+
+impl SharedRouterConnection {
+    fn new(reader: RouterReader, writer: RouterWriter) -> Self {
+        Self {
+            inner: Mutex::new(SharedRouterState {
+                reader,
+                writer,
+                backlog: VecDeque::new(),
+            }),
+        }
+    }
+
+    async fn uuid(&self) -> String {
+        let guard = self.inner.lock().await;
+        guard.writer.uuid().to_string()
+    }
+
+    async fn read_runtime_message(&self, timeout: Duration) -> fluxbee_ai_sdk::Result<Message> {
+        let mut guard = self.inner.lock().await;
+        if let Some(msg) = guard.backlog.pop_front() {
+            return Ok(msg);
+        }
+        guard.reader.read_timeout(timeout).await
+    }
+
+    async fn write(&self, msg: Message) -> fluxbee_ai_sdk::Result<()> {
+        let guard = self.inner.lock().await;
+        guard.writer.write(msg).await
+    }
+}
+
 struct GovIdentityBridge {
-    caller_name: String,
-    caller_version: String,
-    router_socket: PathBuf,
-    uuid_persistence_dir: PathBuf,
-    config_dir: PathBuf,
-    client: Mutex<Option<(fluxbee_sdk::NodeSender, fluxbee_sdk::NodeReceiver)>>,
+    connection: Arc<SharedRouterConnection>,
 }
 
 impl GovIdentityBridge {
-    fn new(
-        caller_name: String,
-        caller_version: String,
-        router_socket: PathBuf,
-        uuid_persistence_dir: PathBuf,
-        config_dir: PathBuf,
-    ) -> Self {
-        Self {
-            caller_name,
-            caller_version,
-            router_socket,
-            uuid_persistence_dir,
-            config_dir,
-            client: Mutex::new(None),
-        }
+    fn new(connection: Arc<SharedRouterConnection>) -> Self {
+        Self { connection }
     }
 
     async fn call_ok(
@@ -378,35 +402,168 @@ impl GovIdentityBridge {
         action: &str,
         payload: Value,
     ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, String> {
-        let mut guard = self.client.lock().await;
-        if guard.is_none() {
-            let node_config = NodeConfig {
-                name: self.caller_name.clone(),
-                version: self.caller_version.clone(),
-                router_socket: self.router_socket.clone(),
-                uuid_persistence_dir: self.uuid_persistence_dir.clone(),
-                config_dir: self.config_dir.clone(),
-            };
-            let (sender, receiver) = connect(&node_config)
-                .await
-                .map_err(|err| format!("bridge connect failed: {err}"))?;
-            *guard = Some((sender, receiver));
-        }
+        let first = self
+            .send_action_once(&identity.target, action, payload.clone(), identity.timeout)
+            .await;
 
-        let (sender, receiver) = guard.as_mut().expect("identity bridge client");
-        identity_system_call_ok(
-            sender,
-            receiver,
-            IdentitySystemRequest {
-                target: &identity.target,
-                fallback_target: identity.fallback_target.as_deref(),
-                action,
-                payload,
-                timeout: identity.timeout,
+        match first {
+            Ok(out) => {
+                let status = out.payload.get("status").and_then(Value::as_str);
+                let error_code = out.payload.get("error_code").and_then(Value::as_str);
+                if status == Some("error") && error_code == Some("NOT_PRIMARY") {
+                    if let Some(fallback) = identity.fallback_target.as_deref() {
+                        if !fallback.trim().is_empty() && fallback != identity.target {
+                            return self
+                                .send_action_once(fallback, action, payload, identity.timeout)
+                                .await;
+                        }
+                    }
+                }
+                if status == Some("ok") {
+                    Ok(out)
+                } else {
+                    Err(format!(
+                        "identity action rejected: action={action}, error_code={}, message={}",
+                        error_code.unwrap_or("UNKNOWN"),
+                        out.payload
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("identity returned non-ok status")
+                    ))
+                }
+            }
+            Err(err) => {
+                let use_fallback = err.contains("original_dst=") && err.contains("NODE_NOT_FOUND");
+                if use_fallback {
+                    if let Some(fallback) = identity.fallback_target.as_deref() {
+                        if !fallback.trim().is_empty() && fallback != identity.target {
+                            return self
+                                .send_action_once(fallback, action, payload, identity.timeout)
+                                .await;
+                        }
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn send_action_once(
+        &self,
+        target: &str,
+        action: &str,
+        payload: Value,
+        timeout: Duration,
+    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, String> {
+        let trace_id = Uuid::new_v4().to_string();
+        let src = self.connection.uuid().await;
+        let req = Message {
+            routing: Routing {
+                src,
+                dst: Destination::Unicast(target.to_string()),
+                ttl: 16,
+                trace_id: trace_id.clone(),
             },
-        )
-        .await
-        .map_err(|err| err.to_string())
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(action.to_string()),
+                scope: None,
+                target: None,
+                action: None,
+                priority: None,
+                context: None,
+            },
+            payload,
+        };
+        self.connection
+            .write(req)
+            .await
+            .map_err(|err| format!("identity send failed: {err}"))?;
+        let expected_msg = format!("{action}_RESPONSE");
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "timeout waiting identity response: action={action} trace_id={trace_id} target={target} timeout_ms={}",
+                    timeout.as_millis()
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let mut guard = self.connection.inner.lock().await;
+            if let Some(idx) = guard.backlog.iter().position(|msg| msg.routing.trace_id == trace_id)
+            {
+                let msg = guard.backlog.remove(idx).expect("backlog index");
+                drop(guard);
+                return Self::parse_identity_reply(msg, &expected_msg, target, trace_id);
+            }
+            match guard.reader.read_timeout(remaining).await {
+                Ok(msg) => {
+                    if msg.routing.trace_id == trace_id {
+                        drop(guard);
+                        return Self::parse_identity_reply(msg, &expected_msg, target, trace_id);
+                    }
+                    guard.backlog.push_back(msg);
+                }
+                Err(fluxbee_ai_sdk::errors::AiSdkError::Node(NodeError::Timeout)) => {
+                    return Err(format!(
+                        "timeout waiting identity response: action={action} trace_id={trace_id} target={target} timeout_ms={}",
+                        timeout.as_millis()
+                    ));
+                }
+                Err(err) => return Err(format!("identity receive failed: {err}")),
+            }
+        }
+    }
+
+    fn parse_identity_reply(
+        msg: Message,
+        expected_msg: &str,
+        target: &str,
+        trace_id: String,
+    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, String> {
+        if msg.meta.msg.as_deref() == Some(expected_msg) {
+            return Ok(fluxbee_sdk::IdentitySystemResult {
+                payload: msg.payload,
+                effective_target: target.to_string(),
+                trace_id,
+            });
+        }
+        if msg.meta.msg.as_deref() == Some(MSG_UNREACHABLE) {
+            let original_dst = msg
+                .payload
+                .get("original_dst")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let reason = msg
+                .payload
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return Err(format!(
+                "identity transport unreachable: reason={reason}, original_dst={original_dst}"
+            ));
+        }
+        if msg.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED) {
+            let original_dst = msg
+                .payload
+                .get("original_dst")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let last_hop = msg
+                .payload
+                .get("last_hop")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            return Err(format!(
+                "identity transport ttl exceeded: original_dst={original_dst}, last_hop={last_hop}"
+            ));
+        }
+        Err(format!(
+            "invalid identity response: expected {expected_msg} trace_id={trace_id}, got msg={:?}",
+            msg.meta.msg
+        ))
     }
 }
 
@@ -432,7 +589,7 @@ struct IlkRegisterArgs {
 struct IlkRegisterTool {
     scoped_src_ilk: Option<String>,
     identity: GovIdentityConfig,
-    bridge: Arc<GovIdentityBridge>,
+    bridge: Option<Arc<GovIdentityBridge>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1043,7 +1200,6 @@ fn gov_identity_config_from_env() -> GovIdentityConfig {
         GOV_IDENTITY_TIMEOUT_MS_ENV,
         cfg.timeout.as_millis() as u64,
     ));
-    cfg.caller_node = env_nonempty(GOV_IDENTITY_CALLER_NODE_ENV);
     cfg
 }
 
@@ -1127,10 +1283,11 @@ impl FunctionTool for IlkRegisterTool {
             },
             "thread_id": args.thread_id
         });
-        let result = self
-            .bridge
-            .call_ok(&self.identity, MSG_ILK_REGISTER, payload)
-            .await;
+        let result = if let Some(bridge) = &self.bridge {
+            bridge.call_ok(&self.identity, MSG_ILK_REGISTER, payload).await
+        } else {
+            Err("identity bridge not initialized".to_string())
+        };
 
         match result {
             Ok(out) => Ok(json!({
@@ -1224,6 +1381,121 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
+async fn run_single_connection_runtime(
+    connection: Arc<SharedRouterConnection>,
+    node: GenericAiNode,
+    config: RuntimeConfig,
+) -> fluxbee_ai_sdk::Result<()> {
+    tracing::info!(
+        worker_pool_size = config.worker_pool_size,
+        queue_capacity = config.queue_capacity,
+        read_timeout_ms = config.read_timeout.as_millis() as u64,
+        handler_timeout_ms = config.handler_timeout.as_millis() as u64,
+        write_timeout_ms = config.write_timeout.as_millis() as u64,
+        retry_max_attempts = config.retry_policy.max_attempts,
+        retry_initial_backoff_ms = config.retry_policy.initial_backoff.as_millis() as u64,
+        retry_max_backoff_ms = config.retry_policy.max_backoff.as_millis() as u64,
+        metrics_log_interval_s = config.metrics_log_interval.as_secs(),
+        "ai runtime started (single-connection gov mode)"
+    );
+
+    let mut read_messages = 0u64;
+    let mut idle_read_timeouts = 0u64;
+    let mut processed_messages = 0u64;
+    let mut responses_sent = 0u64;
+    let mut retry_attempts = 0u64;
+    let mut next_metrics_log = Instant::now() + config.metrics_log_interval;
+
+    loop {
+        let msg = match connection.read_runtime_message(config.read_timeout).await {
+            Ok(msg) => msg,
+            Err(fluxbee_ai_sdk::errors::AiSdkError::Node(NodeError::Timeout)) => {
+                idle_read_timeouts = idle_read_timeouts.saturating_add(1);
+                tracing::debug!(
+                    read_timeout_ms = config.read_timeout.as_millis() as u64,
+                    "ai runtime read timeout (idle)"
+                );
+                if Instant::now() >= next_metrics_log {
+                    tracing::info!(
+                        read_messages,
+                        idle_read_timeouts,
+                        enqueued_messages = read_messages,
+                        processed_messages,
+                        responses_sent,
+                        recoverable_exhausted = 0,
+                        fatal_errors = 0,
+                        retry_attempts,
+                        "ai runtime metrics"
+                    );
+                    next_metrics_log = Instant::now() + config.metrics_log_interval;
+                }
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        read_messages = read_messages.saturating_add(1);
+
+        let mut attempt = 0usize;
+        let max_attempts = config.retry_policy.max_attempts.max(1);
+        let mut backoff = config.retry_policy.initial_backoff;
+        let maybe_response = loop {
+            attempt += 1;
+            match tokio::time::timeout(config.handler_timeout, node.on_message(msg.clone())).await {
+                Ok(Ok(response)) => break response,
+                Ok(Err(err)) if err.is_recoverable() && attempt < max_attempts => {
+                    retry_attempts = retry_attempts.saturating_add(1);
+                    tracing::debug!(
+                        stage = "handler",
+                        attempt,
+                        next_backoff_ms = backoff.as_millis() as u64,
+                        error = %err,
+                        "recoverable error, retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff.saturating_mul(2), config.retry_policy.max_backoff);
+                }
+                Ok(Err(err)) if err.is_recoverable() => {
+                    return Err(fluxbee_ai_sdk::errors::AiSdkError::RecoverableExhausted(format!(
+                        "handler failed after {max_attempts} attempts: {err}"
+                    )));
+                }
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    return Err(fluxbee_ai_sdk::errors::AiSdkError::Timeout(
+                        "node handler timeout".to_string(),
+                    ))
+                }
+            }
+        };
+
+        if let Some(mut response) = maybe_response {
+            response.routing.src = connection.uuid().await;
+            tokio::time::timeout(config.write_timeout, connection.write(response))
+                .await
+                .map_err(|_| {
+                    fluxbee_ai_sdk::errors::AiSdkError::Timeout("router write timeout".to_string())
+                })??;
+            responses_sent = responses_sent.saturating_add(1);
+        }
+        processed_messages = processed_messages.saturating_add(1);
+
+        if Instant::now() >= next_metrics_log {
+            tracing::info!(
+                read_messages,
+                idle_read_timeouts,
+                enqueued_messages = read_messages,
+                processed_messages,
+                responses_sent,
+                recoverable_exhausted = 0,
+                fatal_errors = 0,
+                retry_attempts,
+                "ai runtime metrics"
+            );
+            next_metrics_log = Instant::now() + config.metrics_log_interval;
+        }
+    }
+}
+
 async fn run_one_config(
     config_path: PathBuf,
     cfg: RunnerConfig,
@@ -1267,51 +1539,43 @@ async fn run_one_config(
     );
 
     let node_name = ai_node_config.name.clone();
-    let node_version = ai_node_config.version.clone();
-    let router_socket = ai_node_config.router_socket.clone();
-    let uuid_persistence_dir = ai_node_config.uuid_persistence_dir.clone();
-    let config_dir = ai_node_config.config_dir.clone();
     let gov_identity = gov_identity_config_from_env();
-    let bridge_caller_name = gov_identity
-        .caller_node
-        .clone()
-        .unwrap_or_else(|| format!("{}.govtool", node_name));
-    let gov_identity_bridge = Arc::new(GovIdentityBridge::new(
-        bridge_caller_name,
-        node_version.clone(),
-        router_socket.clone(),
-        uuid_persistence_dir.clone(),
-        config_dir.clone(),
-    ));
     let thread_state_store = init_thread_state_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
-    let client = RouterClient::connect(ai_node_config).await?;
-    let runtime = NodeRuntime::new(
-        client,
-        GenericAiNode {
-            mode,
-            node_name,
-            behavior: Arc::new(RwLock::new(Some(behavior))),
-            dynamic_config_dir: PathBuf::from(cfg.node.dynamic_config_dir),
-            thread_state_store,
-            gov_identity,
-            gov_identity_bridge,
-            control_plane: Arc::new(RwLock::new(ControlPlaneState {
-                current_state: NodeLifecycleState::Configured,
-                config_source: "yaml",
-                effective_config: Some(startup_effective_config),
-                schema_version: persisted_dynamic
-                    .as_ref()
-                    .map(|v| v.schema_version)
-                    .unwrap_or(1),
-                config_version: persisted_dynamic
-                    .as_ref()
-                    .map(|v| v.config_version)
-                    .unwrap_or(1),
-                ..ControlPlaneState::default()
-            })),
-        },
-    );
-    runtime.run_with_config(runtime_config).await?;
+    let node = GenericAiNode {
+        mode,
+        node_name,
+        behavior: Arc::new(RwLock::new(Some(behavior))),
+        dynamic_config_dir: PathBuf::from(cfg.node.dynamic_config_dir),
+        thread_state_store,
+        gov_identity,
+        gov_identity_bridge: None,
+        control_plane: Arc::new(RwLock::new(ControlPlaneState {
+            current_state: NodeLifecycleState::Configured,
+            config_source: "yaml",
+            effective_config: Some(startup_effective_config),
+            schema_version: persisted_dynamic
+                .as_ref()
+                .map(|v| v.schema_version)
+                .unwrap_or(1),
+            config_version: persisted_dynamic
+                .as_ref()
+                .map(|v| v.config_version)
+                .unwrap_or(1),
+            ..ControlPlaneState::default()
+        })),
+    };
+    if mode == RunnerMode::Gov {
+        let client = RouterClient::connect(ai_node_config).await?;
+        let (reader, writer) = client.split();
+        let shared_conn = Arc::new(SharedRouterConnection::new(reader, writer));
+        let mut node = node;
+        node.gov_identity_bridge = Some(Arc::new(GovIdentityBridge::new(shared_conn.clone())));
+        run_single_connection_runtime(shared_conn, node, runtime_config).await?;
+    } else {
+        let client = RouterClient::connect(ai_node_config).await?;
+        let runtime = NodeRuntime::new(client, node);
+        runtime.run_with_config(runtime_config).await?;
+    }
     Ok(())
 }
 
@@ -1390,37 +1654,29 @@ async fn run_unconfigured_bootstrap(
         mode = %mode.as_str(),
         "starting ai_node_runner bootstrap instance"
     );
-    let node_version = ai_node_config.version.clone();
-    let router_socket = ai_node_config.router_socket.clone();
-    let uuid_persistence_dir = ai_node_config.uuid_persistence_dir.clone();
-    let config_dir = ai_node_config.config_dir.clone();
     let gov_identity = gov_identity_config_from_env();
-    let bridge_caller_name = gov_identity
-        .caller_node
-        .clone()
-        .unwrap_or_else(|| format!("{}.govtool", node_name));
-    let gov_identity_bridge = Arc::new(GovIdentityBridge::new(
-        bridge_caller_name,
-        node_version.clone(),
-        router_socket.clone(),
-        uuid_persistence_dir.clone(),
-        config_dir.clone(),
-    ));
-    let client = RouterClient::connect(ai_node_config).await?;
-    let runtime = NodeRuntime::new(
-        client,
-        GenericAiNode {
-            mode,
-            node_name,
-            behavior: Arc::new(RwLock::new(behavior)),
-            dynamic_config_dir: dynamic_dir,
-            thread_state_store,
-            gov_identity,
-            gov_identity_bridge,
-            control_plane: Arc::new(RwLock::new(state)),
-        },
-    );
-    runtime.run_with_config(RuntimeConfig::default()).await?;
+    let ai_node = GenericAiNode {
+        mode,
+        node_name,
+        behavior: Arc::new(RwLock::new(behavior)),
+        dynamic_config_dir: dynamic_dir,
+        thread_state_store,
+        gov_identity,
+        gov_identity_bridge: None,
+        control_plane: Arc::new(RwLock::new(state)),
+    };
+    if mode == RunnerMode::Gov {
+        let client = RouterClient::connect(ai_node_config).await?;
+        let (reader, writer) = client.split();
+        let shared_conn = Arc::new(SharedRouterConnection::new(reader, writer));
+        let mut ai_node = ai_node;
+        ai_node.gov_identity_bridge = Some(Arc::new(GovIdentityBridge::new(shared_conn.clone())));
+        run_single_connection_runtime(shared_conn, ai_node, RuntimeConfig::default()).await?;
+    } else {
+        let client = RouterClient::connect(ai_node_config).await?;
+        let runtime = NodeRuntime::new(client, ai_node);
+        runtime.run_with_config(RuntimeConfig::default()).await?;
+    }
     Ok(())
 }
 
@@ -2227,13 +2483,6 @@ mod tests {
 
     fn test_node() -> GenericAiNode {
         let gov_identity = GovIdentityConfig::default();
-        let gov_identity_bridge = Arc::new(GovIdentityBridge::new(
-            "AI.frontdesk.gov.govtool".to_string(),
-            "0.1.0".to_string(),
-            PathBuf::from("/var/run/fluxbee/routers"),
-            PathBuf::from("/var/lib/fluxbee/state/nodes"),
-            PathBuf::from("/etc/fluxbee"),
-        ));
         GenericAiNode {
             mode: RunnerMode::Default,
             node_name: "AI.frontdesk.gov".to_string(),
@@ -2241,7 +2490,7 @@ mod tests {
             dynamic_config_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
             gov_identity,
-            gov_identity_bridge,
+            gov_identity_bridge: None,
             control_plane: Arc::new(RwLock::new(ControlPlaneState {
                 current_state: NodeLifecycleState::Unconfigured,
                 config_source: "none",

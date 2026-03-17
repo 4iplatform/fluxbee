@@ -12,6 +12,7 @@ license = "UNLICENSED"
 
 [workspace.dependencies]
 anyhow = "1"
+async-trait = "0.1"
 fluxbee-sdk = { path = "../crates/fluxbee_sdk" }
 futures-util = "0.3"
 regex = "1"
