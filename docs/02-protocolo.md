@@ -1553,7 +1553,7 @@ impl MyNode {
 | Handshake HELLO/ANNOUNCE | Librería |
 | Reconexión automática con backoff | Librería |
 | Envío de WITHDRAW en close() | Librería |
-| Generar y persistir UUID | Librería |
+| Resolver UUID L1 (persistente o efímero) | Librería |
 | Agregar @isla al nombre | Librería |
 | Request/response (correlación) | **Nodo** |
 | Qué hacer post-reconexión | **Nodo** |
@@ -1565,7 +1565,9 @@ impl MyNode {
 1. Leer /etc/fluxbee/hive.yaml → obtener hive_id
    - Si no existe → ERROR, no arrancar
    
-2. Cargar o generar UUID desde archivo de persistencia
+2. Resolver UUID L1 según `uuid_mode`
+   - `Persistent`: cargar o generar UUID desde archivo de persistencia
+   - `Ephemeral`: generar UUID nuevo en memoria (sin archivo)
 
 3. Construir nombre L2 completo:
    - Config del nodo: name = "AI.soporte.l1"
@@ -1584,7 +1586,21 @@ impl MyNode {
 9. Retornar (NodeSender, NodeReceiver)
 ```
 
-### 10.11 Persistencia de UUID
+### 10.11 Modo de UUID
+
+La librería de nodos soporta dos modos:
+
+- `Persistent`: comportamiento normal para nodos estables. Guarda el UUID L1 en disco y lo reutiliza entre reinicios.
+- `Ephemeral`: para relays o procesos temporales. Genera UUID L1 nuevo por proceso y no escribe archivo de persistencia.
+
+Ambos modos siguen enviando:
+
+- `uuid` L1 en `HELLO`
+- `name` L2 en `HELLO`
+
+Es decir, el modo sólo cambia cómo se obtiene el UUID L1; no elimina el nombre L2 ni cambia el contrato de routing.
+
+### 10.12 Persistencia de UUID
 
 ```
 /var/lib/fluxbee/state/nodes/<nombre-sin-isla>.uuid
@@ -1592,10 +1608,12 @@ impl MyNode {
 
 Ejemplo: `/var/lib/fluxbee/state/nodes/AI.soporte.l1.uuid`
 
-### 10.12 Ejemplo de Uso
+Este archivo existe solo cuando `uuid_mode = Persistent`.
+
+### 10.13 Ejemplo de Uso
 
 ```rust
-use json_router::node_client::{connect, NodeConfig};
+use json_router::node_client::{connect, NodeConfig, NodeUuidMode};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1603,11 +1621,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "AI.soporte.l1".to_string(),  // SIN @isla
         router_socket: "/var/run/fluxbee/routers".into(),
         uuid_persistence_dir: "/var/lib/fluxbee/state/nodes/".into(),
+        uuid_mode: NodeUuidMode::Persistent,
         config_dir: "/etc/fluxbee".into(),
         version: "1.0".to_string(),
     };
 
-    let (sender, mut receiver) = connect(config).await?;
+    let (sender, mut receiver) = connect(&config).await?;
     
     println!("Conectado como: {}", receiver.full_name());  
     // → "AI.soporte.l1@produccion"

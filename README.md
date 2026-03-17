@@ -569,7 +569,7 @@ fluxbee-sdk = { path = "./fluxbee_sdk" }
 
 **Minimal node example**
 ```rust
-use fluxbee_sdk::{connect, NodeConfig};
+use fluxbee_sdk::{connect, NodeConfig, NodeUuidMode};
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
 use uuid::Uuid;
 
@@ -579,6 +579,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "WF.test".to_string(),
         router_socket: "/var/run/fluxbee/routers".into(),
         uuid_persistence_dir: "/var/lib/fluxbee/state/nodes".into(),
+        uuid_mode: NodeUuidMode::Persistent,
         config_dir: "/etc/fluxbee".into(),
         version: "1.0".to_string(),
     };
@@ -640,6 +641,14 @@ Key documents:
 | Admin internal gateway | `fluxbee_sdk::{admin_command, admin_command_ok, AdminCommandRequest}` | Execute `ADMIN_COMMAND` over socket/WAN against `SY.admin@<hive>` (same control surface as HTTP) |
 | Convenience imports | `fluxbee_sdk::prelude::*` | Common SDK symbols in one import |
 
+`NodeConfig` now supports two UUID modes:
+- `NodeUuidMode::Persistent`: default for normal nodes. Reuses/stores L1 UUID in `uuid_persistence_dir`.
+- `NodeUuidMode::Ephemeral`: for short-lived relays/diagnostic sessions. Generates a new L1 UUID per process without writing `*.uuid` files.
+
+Both modes still require:
+- L1 UUID for connection identity (`HELLO.uuid`, `routing.src`)
+- L2 node name for canonical process identity (`HELLO.name`, router registration, routing by name)
+
 Recommended for every new node/scaffold:
 - call `try_handle_default_node_status(&sender, &msg).await` inside the receive loop.
 - keep it enabled unless the runtime provides a custom status handler with the same contract.
@@ -694,12 +703,13 @@ let payload_json = payload.to_value()?;
 
 ```rust
 use fluxbee_sdk::blob::{BlobConfig, BlobToolkit, PublishBlobRequest};
-use fluxbee_sdk::{connect, NodeConfig};
+use fluxbee_sdk::{connect, NodeConfig, NodeUuidMode};
 
 let cfg = NodeConfig {
     name: "WF.blob.publisher".into(),
     router_socket: "/var/run/fluxbee/routers".into(),
     uuid_persistence_dir: "/var/lib/fluxbee/state/nodes".into(),
+    uuid_mode: NodeUuidMode::Persistent,
     config_dir: "/etc/fluxbee".into(),
     version: "1.0".into(),
 };
