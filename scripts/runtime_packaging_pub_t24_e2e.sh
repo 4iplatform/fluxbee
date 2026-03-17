@@ -10,6 +10,7 @@ set -euo pipefail
 #   BASE="http://127.0.0.1:8080" \
 #   HIVE_ID="worker-220" \
 #   MOTHER_HIVE_ID="motherbee" \
+#   RUNTIME_BASE="wf.engine" \
 #   TENANT_ID="tnt:<uuid>" \
 #   bash scripts/runtime_packaging_pub_t24_e2e.sh
 
@@ -20,6 +21,7 @@ MOTHER_HIVE_ID="${MOTHER_HIVE_ID:-motherbee}"
 TENANT_ID="${TENANT_ID:-}"
 WAIT_READY_SECS="${WAIT_READY_SECS:-120}"
 WAIT_STATUS_SECS="${WAIT_STATUS_SECS:-90}"
+WAIT_BASE_READY_SECS="${WAIT_BASE_READY_SECS:-30}"
 DEPLOY_STRICT="${DEPLOY_STRICT:-1}"
 TEST_ID="${TEST_ID:-pubt24-$(date +%s)-$RANDOM}"
 WORKFLOW_RUNTIME_NAME="${WORKFLOW_RUNTIME_NAME:-wf.publish.workflow.diag.$(date +%s)}"
@@ -136,9 +138,12 @@ validate_tenant_id() {
 }
 
 assert_runtime_base_ready() {
-  local deadline=$(( $(date +%s) + WAIT_READY_SECS ))
+  local deadline=$(( $(date +%s) + WAIT_BASE_READY_SECS ))
+  local missing_runtime_count=0
+  local missing_current_count=0
+  local last_progress_ts=0
   while (( $(date +%s) <= deadline )); do
-    local http runtime_exists base_current present exec
+    local http runtime_exists base_current present exec now available_head
     http="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$versions_body")"
     if [[ "$http" != "200" ]]; then
       sleep 2
@@ -148,6 +153,16 @@ assert_runtime_base_ready() {
       '(.payload.hive.runtimes.runtimes | has($rt)) // false | tostring' \
       "$versions_body")"
     if [[ "$runtime_exists" != "true" ]]; then
+      missing_runtime_count=$((missing_runtime_count + 1))
+      if (( missing_runtime_count >= 3 )); then
+        available_head="$(jq -r '.payload.hive.runtimes.runtimes | keys | .[0:8] | join(",")' "$versions_body")"
+        echo "FAIL: runtime_base '$RUNTIME_BASE' is not present on hive '$HIVE_ID' versions catalog." >&2
+        echo "HINT: publish/deploy '$RUNTIME_BASE' first, or run with RUNTIME_BASE=<existing runtime>." >&2
+        if [[ -n "$available_head" ]]; then
+          echo "available_runtimes(sample)=$available_head" >&2
+        fi
+        return 1
+      fi
       sleep 2
       continue
     fi
@@ -155,6 +170,12 @@ assert_runtime_base_ready() {
       '(.payload.hive.runtimes.runtimes[$rt].current // "") | tostring' \
       "$versions_body")"
     if [[ -z "$base_current" ]]; then
+      missing_current_count=$((missing_current_count + 1))
+      if (( missing_current_count >= 3 )); then
+        echo "FAIL: runtime_base '$RUNTIME_BASE' exists on hive '$HIVE_ID' but has empty 'current' version." >&2
+        echo "HINT: fix manifest current for '$RUNTIME_BASE' and retry." >&2
+        return 1
+      fi
       sleep 2
       continue
     fi
@@ -166,6 +187,11 @@ assert_runtime_base_ready() {
       "$versions_body")"
     if [[ "$present" == "true" && "$exec" == "true" ]]; then
       return 0
+    fi
+    now="$(date +%s)"
+    if (( last_progress_ts == 0 || now - last_progress_ts >= 10 )); then
+      echo "waiting runtime_base readiness runtime='$RUNTIME_BASE' current='$base_current' runtime_present=$present start_sh_executable=$exec" >&2
+      last_progress_ts="$now"
     fi
     sleep 2
   done
