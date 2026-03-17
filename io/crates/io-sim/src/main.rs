@@ -364,6 +364,7 @@ async fn process_one_inbound(
 }
 
 fn log_outbound_message(msg: &fluxbee_sdk::protocol::Message) {
+    let msg_kind = msg.meta.msg.as_deref().unwrap_or("");
     let payload_type = msg
         .payload
         .get("type")
@@ -396,14 +397,27 @@ fn log_outbound_message(msg: &fluxbee_sdk::protocol::Message) {
                 .and_then(|v| v.as_str())
         })
         .unwrap_or("");
+    let unreachable_reason = msg
+        .payload
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let original_dst = msg
+        .payload
+        .get("original_dst")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     tracing::info!(
         trace_id = %msg.routing.trace_id,
         src = %msg.routing.src,
+        msg_kind = %msg_kind,
         payload_type = %payload_type,
         content = %content,
         error_code = %error_code,
         error_message = %error_message,
+        unreachable_reason = %unreachable_reason,
+        original_dst = %original_dst,
         "io-sim received outbound from router"
     );
 }
