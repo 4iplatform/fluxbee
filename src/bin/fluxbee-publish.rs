@@ -12,6 +12,7 @@ use json_router::runtime_manifest::{
 };
 use regex::Regex;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 type CliError = Box<dyn Error + Send + Sync>;
@@ -768,18 +769,57 @@ fn parse_runtime_manifest_meta_from_versions(
         .and_then(|v| v.get("runtimes"))
         .ok_or_else(|| "versions response missing payload.hive.runtimes".to_string())?;
     let version = runtimes
-        .get("version")
+        .get("manifest_version")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| "versions response missing runtimes.version".to_string())?;
+        .or_else(|| runtimes.get("version").and_then(|v| v.as_u64()))
+        .ok_or_else(|| "versions response missing runtimes.manifest_version|version".to_string())?;
     let hash = runtimes
-        .get("hash")
+        .get("manifest_hash")
         .and_then(|v| v.as_str())
         .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| "versions response missing runtimes.hash".to_string())?;
+        .or_else(|| {
+            runtimes
+                .get("hash")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.trim().is_empty())
+        })
+        .ok_or_else(|| "versions response missing runtimes.manifest_hash|hash".to_string())?;
     Ok(RuntimeManifestMeta {
         version,
         hash: hash.to_string(),
     })
+}
+
+fn local_runtime_manifest_meta_from_file(path: &Path) -> Result<RuntimeManifestMeta, String> {
+    let raw = fs::read(path).map_err(|err| {
+        format!(
+            "local manifest fallback failed: read '{}' failed: {}",
+            path.display(),
+            err
+        )
+    })?;
+    let json: serde_json::Value = serde_json::from_slice(&raw).map_err(|err| {
+        format!(
+            "local manifest fallback failed: parse '{}' failed: {}",
+            path.display(),
+            err
+        )
+    })?;
+    let version = json
+        .get("version")
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<u64>().ok())
+        .or_else(|| json.get("version").and_then(|v| v.as_u64()))
+        .ok_or_else(|| {
+            format!(
+                "local manifest fallback failed: missing version in '{}'",
+                path.display()
+            )
+        })?;
+    let mut hasher = Sha256::new();
+    hasher.update(&raw);
+    let hash = format!("{:x}", hasher.finalize());
+    Ok(RuntimeManifestMeta { version, hash })
 }
 
 fn response_status_and_error_code(json: &serde_json::Value) -> (String, Option<String>) {
@@ -817,7 +857,19 @@ fn fetch_runtime_manifest_meta(
             response.status_code, url, response.json
         ));
     }
-    parse_runtime_manifest_meta_from_versions(&response.json)
+    match parse_runtime_manifest_meta_from_versions(&response.json) {
+        Ok(meta) => Ok(meta),
+        Err(parse_err) => {
+            let fallback =
+                local_runtime_manifest_meta_from_file(Path::new(DIST_RUNTIME_MANIFEST_PATH));
+            fallback.map_err(|fallback_err| {
+                format!(
+                    "versions parse failed: {}; fallback also failed: {}",
+                    parse_err, fallback_err
+                )
+            })
+        }
+    }
 }
 
 fn deploy_to_hive(
@@ -1506,8 +1558,8 @@ mod tests {
             "payload": {
                 "hive": {
                     "runtimes": {
-                        "version": 1711111111111u64,
-                        "hash": "abc123",
+                        "manifest_version": 1711111111111u64,
+                        "manifest_hash": "abc123",
                         "runtimes": {}
                     }
                 }
@@ -1525,13 +1577,31 @@ mod tests {
             "payload": {
                 "hive": {
                     "runtimes": {
-                        "version": 1711111111111u64
+                        "manifest_version": 1711111111111u64
                     }
                 }
             }
         });
         let err = parse_runtime_manifest_meta_from_versions(&json).expect_err("expected error");
-        assert!(err.contains("runtimes.hash"), "err={err}");
+        assert!(err.contains("manifest_hash|hash"), "err={err}");
+    }
+
+    #[test]
+    fn parse_runtime_manifest_meta_from_versions_accepts_legacy_version_hash_keys() {
+        let json = serde_json::json!({
+            "status": "ok",
+            "payload": {
+                "hive": {
+                    "runtimes": {
+                        "version": 1711111111111u64,
+                        "hash": "legacyhash"
+                    }
+                }
+            }
+        });
+        let meta = parse_runtime_manifest_meta_from_versions(&json).expect("meta");
+        assert_eq!(meta.version, 1711111111111u64);
+        assert_eq!(meta.hash, "legacyhash");
     }
 
     #[test]
