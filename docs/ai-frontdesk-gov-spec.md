@@ -64,14 +64,17 @@
 
 ---
 
-## 3) Estado por thread (LanceDB)
+## 3) Estado por hilo (LanceDB)
 
 ✅ **NORMATIVO (MVP)**:
-- El nodo mantiene **1 JSON** por `thread_id` (estructura libre por prompting/policy).
+- El nodo mantiene **1 JSON** por `src_ilk` (estructura libre por prompting/policy).
 - Tools mínimas (SDK/runtime):
   - `thread_state_get(thread_id)`
   - `thread_state_put(thread_id, data, ttl_seconds?)`
   - `thread_state_delete(thread_id)`
+
+Nota de compatibilidad:
+- El runtime puede aceptar `thread_id` legacy para migracion, pero la clave efectiva de estado debe ser `src_ilk`.
 
 ### 3.1 Estructura recomendada (no normativa)
 
@@ -139,11 +142,11 @@ Ejemplo típico:
 
 ---
 
-## 6) Acción “upgrade/complete identity” (TBD)
+## 6) Accion de completacion de identidad (MVP vigente)
 
-🧩 **A ESPECIFICAR (core)**:
-- Nombre exacto de la acción/tool para solicitar completar identidad de un `src_ilk` temporal.
-  - Candidatos: `ILK_UPDATE`, `ILK_PROMOTE`, `ILK_COMPLETE`, o acción vía `SY.admin`.
+✅ **NORMATIVO (MVP)**:
+- El nodo usa la tool `ilk_register` (solo disponible en `mode=gov`).
+- `ilk_register` invoca `ILK_REGISTER` via Identity (`identity_system_call_ok`).
 
 ✅ **NORMATIVO (payload mínimo esperado)**:
 - `src_ilk` (el ILK a completar)
@@ -157,6 +160,12 @@ Ejemplo típico:
 ✅ **NORMATIVO (resultado)**:
 - Éxito: el core devuelve identidad “complete” asociada al mismo `src_ilk` (no cambia el ILK).
 - Fallo: error con razón (email ya en uso, tenant inválido, etc.).
+
+Variables de entorno por instancia recomendadas:
+- `AI_NODE_MODE=gov`
+- `GOV_IDENTITY_TARGET` (default `SY.identity`)
+- `GOV_IDENTITY_FALLBACK_TARGET` (opcional)
+- `GOV_IDENTITY_TIMEOUT_MS` (default 10000)
 
 ---
 

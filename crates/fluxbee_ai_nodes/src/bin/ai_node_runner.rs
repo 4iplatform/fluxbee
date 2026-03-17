@@ -9,10 +9,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use fluxbee_ai_sdk::{
     build_reply_message_runtime_src, build_text_response, extract_text, AiNode, AiNodeConfig, Message,
-    FunctionCallingConfig, FunctionCallingRunner, FunctionToolProvider, FunctionToolRegistry,
+    FunctionCallingConfig, FunctionCallingRunner, FunctionTool, FunctionToolDefinition,
+    FunctionToolProvider, FunctionToolRegistry,
     LanceDbThreadStateStore, ModelSettings, NodeRuntime, OpenAiResponsesClient, RetryPolicy,
     RouterClient, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
 };
+use fluxbee_sdk::{connect, identity_system_call_ok, IdentityError, IdentitySystemRequest, MSG_ILK_REGISTER, NodeConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
@@ -23,6 +25,9 @@ const MSG_NODE_STATUS_GET: &str = "NODE_STATUS_GET";
 const MSG_NODE_STATUS_GET_RESPONSE: &str = "NODE_STATUS_GET_RESPONSE";
 const NODE_STATUS_DEFAULT_HANDLER_ENABLED: &str = "NODE_STATUS_DEFAULT_HANDLER_ENABLED";
 const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE";
+const GOV_IDENTITY_TARGET_ENV: &str = "GOV_IDENTITY_TARGET";
+const GOV_IDENTITY_FALLBACK_TARGET_ENV: &str = "GOV_IDENTITY_FALLBACK_TARGET";
+const GOV_IDENTITY_TIMEOUT_MS_ENV: &str = "GOV_IDENTITY_TIMEOUT_MS";
 
 #[derive(Debug, Deserialize)]
 struct RunnerConfig {
@@ -310,16 +315,69 @@ struct OpenAiChatRuntime {
 }
 
 struct GenericAiNode {
+    mode: RunnerMode,
     node_name: String,
+    node_version: String,
+    router_socket: PathBuf,
+    uuid_persistence_dir: PathBuf,
+    config_dir: PathBuf,
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
     dynamic_config_dir: PathBuf,
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
+    gov_identity: GovIdentityConfig,
     control_plane: Arc<RwLock<ControlPlaneState>>,
+}
+
+#[derive(Debug, Clone)]
+struct GovIdentityConfig {
+    target: String,
+    fallback_target: Option<String>,
+    timeout: Duration,
+}
+
+impl Default for GovIdentityConfig {
+    fn default() -> Self {
+        Self {
+            target: "SY.identity".to_string(),
+            fallback_target: Some("SY.identity@motherbee".to_string()),
+            timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IlkRegisterIdentityCandidate {
+    name: String,
+    email: String,
+    #[serde(default)]
+    phone: Option<String>,
+    #[serde(default)]
+    tenant_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IlkRegisterArgs {
+    src_ilk: String,
+    identity_candidate: IlkRegisterIdentityCandidate,
+    #[serde(default)]
+    thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct IlkRegisterTool {
+    scoped_src_ilk: Option<String>,
+    owner_node_name: String,
+    owner_node_version: String,
+    router_socket: PathBuf,
+    uuid_persistence_dir: PathBuf,
+    config_dir: PathBuf,
+    identity: GovIdentityConfig,
 }
 
 #[derive(Debug, Clone)]
 struct BehaviorContext {
     thread_id: Option<String>,
+    src_ilk: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,7 +437,15 @@ impl AiNode for GenericAiNode {
         }
         let behavior_ctx = BehaviorContext {
             thread_id: extract_thread_id(&msg),
+            src_ilk: extract_src_ilk(&msg),
         };
+        if msg.meta.msg_type.eq_ignore_ascii_case("user") && behavior_ctx.src_ilk.is_none() {
+            tracing::warn!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                "missing src_ilk in incoming user message"
+            );
+        }
 
         let behavior = self.behavior.read().await.clone();
         let Some(behavior) = behavior else {
@@ -414,12 +480,7 @@ impl GenericAiNode {
         if let Some(base_url) = &openai.base_url {
             client = client.with_base_url(base_url.clone());
         }
-        let mut tool_registry = FunctionToolRegistry::new();
-        if let (Some(store), Some(thread_id)) = (&self.thread_state_store, &ctx.thread_id) {
-            let provider =
-                ThreadStateToolsProvider::with_get_put_delete_scoped(store.clone(), thread_id.clone());
-            provider.register_tools(&mut tool_registry)?;
-        }
+        let tool_registry = self.build_tool_registry(ctx)?;
         if !tool_registry.definitions().is_empty() {
             let model = client
                 .clone()
@@ -444,6 +505,52 @@ impl GenericAiNode {
         };
         let response = fluxbee_ai_sdk::llm::LlmClient::generate(&client, req).await?;
         Ok(response.content)
+    }
+
+    fn build_tool_registry(
+        &self,
+        ctx: &BehaviorContext,
+    ) -> fluxbee_ai_sdk::Result<FunctionToolRegistry> {
+        let mut registry = FunctionToolRegistry::new();
+        self.register_common_tools(&mut registry, ctx)?;
+        if self.mode == RunnerMode::Gov {
+            self.register_gov_tools(&mut registry, ctx)?;
+        }
+        Ok(registry)
+    }
+
+    fn register_common_tools(
+        &self,
+        registry: &mut FunctionToolRegistry,
+        ctx: &BehaviorContext,
+    ) -> fluxbee_ai_sdk::Result<()> {
+        if let (Some(store), Some(src_ilk)) = (&self.thread_state_store, &ctx.src_ilk) {
+            let provider = ThreadStateToolsProvider::with_get_put_delete_scoped_with_legacy(
+                store.clone(),
+                src_ilk.clone(),
+                ctx.thread_id.clone(),
+            );
+            provider.register_tools(registry)?;
+        }
+        Ok(())
+    }
+
+    fn register_gov_tools(
+        &self,
+        registry: &mut FunctionToolRegistry,
+        ctx: &BehaviorContext,
+    ) -> fluxbee_ai_sdk::Result<()> {
+        let tool = IlkRegisterTool {
+            scoped_src_ilk: ctx.src_ilk.clone(),
+            owner_node_name: self.node_name.clone(),
+            owner_node_version: self.node_version.clone(),
+            router_socket: self.router_socket.clone(),
+            uuid_persistence_dir: self.uuid_persistence_dir.clone(),
+            config_dir: self.config_dir.clone(),
+            identity: self.gov_identity.clone(),
+        };
+        registry.register(Arc::new(tool))?;
+        Ok(())
     }
 
     async fn resolve_openai_api_key(&self, openai: &OpenAiChatRuntime) -> Option<String> {
@@ -855,6 +962,194 @@ fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn gov_identity_config_from_env() -> GovIdentityConfig {
+    let mut cfg = GovIdentityConfig::default();
+    if let Some(target) = env_nonempty(GOV_IDENTITY_TARGET_ENV) {
+        cfg.target = target;
+    }
+    cfg.fallback_target = env_nonempty(GOV_IDENTITY_FALLBACK_TARGET_ENV);
+    cfg.timeout = Duration::from_millis(env_u64(
+        GOV_IDENTITY_TIMEOUT_MS_ENV,
+        cfg.timeout.as_millis() as u64,
+    ));
+    cfg
+}
+
+#[async_trait]
+impl FunctionTool for IlkRegisterTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "ilk_register".to_string(),
+            description: "Register identity completion for a temporary ILK (gov mode only)."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "src_ilk": { "type": "string", "minLength": 1 },
+                    "identity_candidate": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "minLength": 1 },
+                            "email": { "type": "string", "minLength": 3 },
+                            "phone": { "type": "string" },
+                            "tenant_hint": { "type": "string" }
+                        },
+                        "required": ["name", "email"],
+                        "additionalProperties": true
+                    },
+                    "thread_id": { "type": "string" }
+                },
+                "required": ["src_ilk", "identity_candidate"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: IlkRegisterArgs = serde_json::from_value(arguments).map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "ilk_register: invalid arguments: {err}"
+            ))
+        })?;
+
+        let src_ilk_owned = self
+            .scoped_src_ilk
+            .clone()
+            .unwrap_or(args.src_ilk);
+        let src_ilk = src_ilk_owned.trim();
+        if src_ilk.is_empty() {
+            return Ok(json!({
+                "status": "error",
+                "error_code": "missing_src_ilk",
+                "message": "src_ilk is required",
+                "retryable": false
+            }));
+        }
+
+        if args.identity_candidate.name.trim().is_empty()
+            || args.identity_candidate.email.trim().is_empty()
+        {
+            return Ok(json!({
+                "status": "error",
+                "error_code": "invalid_identity_candidate",
+                "message": "identity_candidate.name and identity_candidate.email are required",
+                "retryable": false
+            }));
+        }
+
+        tracing::info!(
+            op = "ilk_register",
+            src_ilk = %src_ilk,
+            target = %self.identity.target,
+            has_fallback = self.identity.fallback_target.is_some(),
+            "dispatching identity registration request"
+        );
+
+        let tool_node_name = format!(
+            "{}.govtool.{}",
+            self.owner_node_name,
+            chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        );
+        let node_config = NodeConfig {
+            name: tool_node_name,
+            version: self.owner_node_version.clone(),
+            router_socket: self.router_socket.clone(),
+            uuid_persistence_dir: self.uuid_persistence_dir.clone(),
+            config_dir: self.config_dir.clone(),
+        };
+
+        let (sender, mut receiver) = match connect(&node_config).await {
+            Ok(parts) => parts,
+            Err(err) => {
+                return Ok(json!({
+                    "status": "error",
+                    "error_code": "identity_unavailable",
+                    "message": format!("failed to connect identity tool client: {err}"),
+                    "retryable": true
+                }));
+            }
+        };
+
+        let fallback_target = self.identity.fallback_target.as_deref();
+        let payload = json!({
+            "src_ilk": src_ilk,
+            "identity_candidate": {
+                "name": args.identity_candidate.name,
+                "email": args.identity_candidate.email,
+                "phone": args.identity_candidate.phone,
+                "tenant_hint": args.identity_candidate.tenant_hint
+            },
+            "thread_id": args.thread_id
+        });
+        let result = identity_system_call_ok(
+            &sender,
+            &mut receiver,
+            IdentitySystemRequest {
+                target: &self.identity.target,
+                fallback_target,
+                action: MSG_ILK_REGISTER,
+                payload,
+                timeout: self.identity.timeout,
+            },
+        )
+        .await;
+
+        match result {
+            Ok(out) => Ok(json!({
+                "status": "ok",
+                "registered": true,
+                "effective_target": out.effective_target,
+                "trace_id": out.trace_id,
+                "identity_payload": out.payload
+            })),
+            Err(err) => Ok(identity_error_to_tool_payload(err)),
+        }
+    }
+}
+
+fn identity_error_to_tool_payload(err: IdentityError) -> Value {
+    let msg = err.to_string();
+    let upper = msg.to_ascii_uppercase();
+    let (error_code, retryable) = if upper.contains("NOT_PRIMARY") {
+        ("NOT_PRIMARY", true)
+    } else if upper.contains("UNREACHABLE") || upper.contains("NODE_NOT_FOUND") {
+        ("UNAVAILABLE", true)
+    } else if upper.contains("TTL EXCEEDED") || upper.contains("TTL_EXCEEDED") {
+        ("TTL_EXCEEDED", true)
+    } else if upper.contains("TIMEOUT") {
+        ("TIMEOUT", true)
+    } else if upper.contains("INVALID_") {
+        ("INVALID_REQUEST", false)
+    } else if upper.contains("UNAUTHORIZED_REGISTRAR") {
+        ("UNAUTHORIZED_REGISTRAR", false)
+    } else {
+        ("IDENTITY_ERROR", true)
+    };
+
+    json!({
+        "status": "error",
+        "error_code": error_code,
+        "message": msg,
+        "retryable": retryable
+    })
+}
+
 impl NodeBehavior {
     fn kind(&self) -> &'static str {
         match self {
@@ -885,15 +1180,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bootstrap_node = bootstrap_node_from_args(&args.bootstrap)?;
         tracing::info!(
             node_name = %bootstrap_node.name,
+            mode = %args.mode.as_str(),
             "starting ai_node_runner without YAML config (UNCONFIGURED mode)"
         );
-        run_unconfigured_bootstrap(bootstrap_node).await?;
+        run_unconfigured_bootstrap(bootstrap_node, args.mode).await?;
         return Ok(());
     }
 
     let mut runners = JoinSet::new();
+    let mode = args.mode;
     for (config_path, cfg) in loaded {
-        runners.spawn(async move { run_one_config(config_path, cfg).await });
+        runners.spawn(async move { run_one_config(config_path, cfg, mode).await });
     }
 
     while let Some(result) = runners.join_next().await {
@@ -909,6 +1206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 async fn run_one_config(
     config_path: PathBuf,
     cfg: RunnerConfig,
+    mode: RunnerMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let startup_effective_doc = build_startup_effective_config_doc(&cfg);
     let startup_effective_doc = materialize_effective_defaults(&cfg.node.name, startup_effective_doc);
@@ -943,19 +1241,30 @@ async fn run_one_config(
     tracing::info!(
         config = %config_path.display(),
         node_name = %ai_node_config.name,
+        mode = %mode.as_str(),
         "starting ai_node_runner node instance"
     );
 
     let node_name = ai_node_config.name.clone();
+    let node_version = ai_node_config.version.clone();
+    let router_socket = ai_node_config.router_socket.clone();
+    let uuid_persistence_dir = ai_node_config.uuid_persistence_dir.clone();
+    let config_dir = ai_node_config.config_dir.clone();
     let thread_state_store = init_thread_state_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
     let client = RouterClient::connect(ai_node_config).await?;
     let runtime = NodeRuntime::new(
         client,
         GenericAiNode {
+            mode,
             node_name,
+            node_version,
+            router_socket,
+            uuid_persistence_dir,
+            config_dir,
             behavior: Arc::new(RwLock::new(Some(behavior))),
             dynamic_config_dir: PathBuf::from(cfg.node.dynamic_config_dir),
             thread_state_store,
+            gov_identity: gov_identity_config_from_env(),
             control_plane: Arc::new(RwLock::new(ControlPlaneState {
                 current_state: NodeLifecycleState::Configured,
                 config_source: "yaml",
@@ -978,6 +1287,7 @@ async fn run_one_config(
 
 async fn run_unconfigured_bootstrap(
     node: NodeSection,
+    mode: RunnerMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node_name = node.name.clone();
     let dynamic_dir = PathBuf::from(node.dynamic_config_dir.clone());
@@ -1045,14 +1355,29 @@ async fn run_unconfigured_bootstrap(
         uuid_persistence_dir: PathBuf::from(node.uuid_persistence_dir),
         config_dir: PathBuf::from(node.config_dir),
     };
+    tracing::info!(
+        node_name = %node_name,
+        mode = %mode.as_str(),
+        "starting ai_node_runner bootstrap instance"
+    );
+    let node_version = ai_node_config.version.clone();
+    let router_socket = ai_node_config.router_socket.clone();
+    let uuid_persistence_dir = ai_node_config.uuid_persistence_dir.clone();
+    let config_dir = ai_node_config.config_dir.clone();
     let client = RouterClient::connect(ai_node_config).await?;
     let runtime = NodeRuntime::new(
         client,
         GenericAiNode {
+            mode,
             node_name,
+            node_version,
+            router_socket,
+            uuid_persistence_dir,
+            config_dir,
             behavior: Arc::new(RwLock::new(behavior)),
             dynamic_config_dir: dynamic_dir,
             thread_state_store,
+            gov_identity: gov_identity_config_from_env(),
             control_plane: Arc::new(RwLock::new(state)),
         },
     );
@@ -1074,11 +1399,42 @@ struct BootstrapArgs {
 struct RunnerArgs {
     config_paths: Vec<PathBuf>,
     bootstrap: BootstrapArgs,
+    mode: RunnerMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RunnerMode {
+    #[default]
+    Default,
+    Gov,
+}
+
+impl RunnerMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Gov => "gov",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "default" => Some(Self::Default),
+            "gov" => Some(Self::Gov),
+            _ => None,
+        }
+    }
 }
 
 fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + Sync>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let mut parsed = RunnerArgs::default();
+    let mut parsed = RunnerArgs {
+        mode: std::env::var("AI_NODE_MODE")
+            .ok()
+            .and_then(|v| RunnerMode::parse(&v))
+            .unwrap_or_default(),
+        ..RunnerArgs::default()
+    };
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -1129,6 +1485,19 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
                     return Err("missing value after --dynamic-config-dir".to_string().into());
                 };
                 parsed.bootstrap.dynamic_config_dir = Some(value.clone());
+                i += 2;
+            }
+            "--mode" => {
+                let Some(value) = args.get(i + 1) else {
+                    return Err("missing value after --mode".to_string().into());
+                };
+                let Some(mode) = RunnerMode::parse(value) else {
+                    return Err(format!(
+                        "invalid value for --mode: {value} (expected default|gov)"
+                    )
+                    .into());
+                };
+                parsed.mode = mode;
                 i += 2;
             }
             other => {
@@ -1735,6 +2104,24 @@ fn extract_thread_id(msg: &Message) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn extract_src_ilk(msg: &Message) -> Option<String> {
+    msg.meta
+        .context
+        .as_ref()
+        .and_then(|ctx| ctx.get("src_ilk"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+}
+
+#[allow(dead_code)]
+fn require_src_ilk(ctx: &BehaviorContext) -> fluxbee_ai_sdk::Result<&str> {
+    ctx.src_ilk.as_deref().ok_or_else(|| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol("missing_src_ilk".to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1801,10 +2188,16 @@ mod tests {
 
     fn test_node() -> GenericAiNode {
         GenericAiNode {
+            mode: RunnerMode::Default,
             node_name: "AI.frontdesk.gov".to_string(),
+            node_version: "0.1.0".to_string(),
+            router_socket: PathBuf::from("/var/run/fluxbee/routers"),
+            uuid_persistence_dir: PathBuf::from("/var/lib/fluxbee/state/nodes"),
+            config_dir: PathBuf::from("/etc/fluxbee"),
             behavior: Arc::new(RwLock::new(None)),
             dynamic_config_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
+            gov_identity: GovIdentityConfig::default(),
             control_plane: Arc::new(RwLock::new(ControlPlaneState {
                 current_state: NodeLifecycleState::Unconfigured,
                 config_source: "none",
@@ -1864,5 +2257,116 @@ mod tests {
 
         std::env::remove_var(NODE_STATUS_DEFAULT_HEALTH_STATE);
         std::env::remove_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED);
+    }
+
+    fn sample_user_request_with_context(context: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: "IO.sim.local@motherbee".to_string(),
+                dst: Destination::Unicast("AI.frontdesk.gov@motherbee".to_string()),
+                ttl: 16,
+                trace_id: "trace-user-123".to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                msg: None,
+                scope: None,
+                target: None,
+                action: None,
+                priority: None,
+                context: Some(context),
+            },
+            payload: json!({"type":"text","content":"hola"}),
+        }
+    }
+
+    #[test]
+    fn default_mode_registry_does_not_expose_gov_tools() {
+        let node = test_node();
+        let registry = node
+            .build_tool_registry(&BehaviorContext {
+                thread_id: None,
+                src_ilk: None,
+            })
+            .expect("registry");
+        let names = registry
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect::<Vec<_>>();
+        assert!(!names.iter().any(|name| name == "ilk_register"));
+    }
+
+    #[test]
+    fn gov_mode_registry_exposes_ilk_register() {
+        let mut node = test_node();
+        node.mode = RunnerMode::Gov;
+        let registry = node
+            .build_tool_registry(&BehaviorContext {
+                thread_id: Some("legacy-thread-1".to_string()),
+                src_ilk: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
+            })
+            .expect("registry");
+        let names = registry
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "ilk_register"));
+    }
+
+    #[tokio::test]
+    async fn default_mode_rejects_ilk_register_with_unknown_tool() {
+        let node = test_node();
+        let registry = node
+            .build_tool_registry(&BehaviorContext {
+                thread_id: Some("legacy-thread-1".to_string()),
+                src_ilk: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
+            })
+            .expect("registry");
+
+        let results = fluxbee_ai_sdk::dispatch_tool_calls(
+            &registry,
+            vec![fluxbee_ai_sdk::FunctionToolCall {
+                call_id: "call_1".to_string(),
+                response_id: None,
+                name: "ilk_register".to_string(),
+                arguments: json!({
+                    "src_ilk": "ilk:11111111-1111-4111-8111-111111111111",
+                    "identity_candidate": {
+                        "name": "Noelia Eguren",
+                        "email": "neguren@4iplatform.com"
+                    }
+                }),
+            }],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert!(result.is_error);
+        assert_eq!(result.name, "ilk_register");
+        assert_eq!(result.output, Value::String("unknown_tool".to_string()));
+    }
+
+    #[test]
+    fn extract_src_ilk_reads_from_meta_context() {
+        let msg = sample_user_request_with_context(json!({
+            "src_ilk": "ilk:11111111-1111-4111-8111-111111111111"
+        }));
+        assert_eq!(
+            extract_src_ilk(&msg).as_deref(),
+            Some("ilk:11111111-1111-4111-8111-111111111111")
+        );
+    }
+
+    #[test]
+    fn require_src_ilk_returns_missing_src_ilk_error() {
+        let ctx = BehaviorContext {
+            thread_id: None,
+            src_ilk: None,
+        };
+        let err = require_src_ilk(&ctx).expect_err("missing src_ilk should fail");
+        assert!(err.to_string().contains("missing_src_ilk"));
     }
 }

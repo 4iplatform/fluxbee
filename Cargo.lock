@@ -490,6 +490,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "fluxbee-ai-sdk",
+ "fluxbee-sdk",
  "serde",
  "serde_json",
  "serde_yaml",

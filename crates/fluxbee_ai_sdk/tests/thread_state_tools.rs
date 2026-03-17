@@ -221,3 +221,127 @@ async fn scoped_provider_overrides_model_supplied_thread_id() {
 
     let _ = tokio::fs::remove_dir_all(root).await;
 }
+
+#[tokio::test]
+async fn scoped_provider_migrates_legacy_key_on_get() {
+    let root = unique_temp_store_root();
+    let store = LanceDbThreadStateStore::new(root.clone());
+    store.ensure_ready().await.expect("store ready");
+    store
+        .put("legacy-thread-1", json!({"email":"noe@gmail.com"}), Some(180))
+        .await
+        .expect("seed legacy record");
+    let store_arc: Arc<dyn ThreadStateStore> = Arc::new(store.clone());
+
+    let provider = ThreadStateToolsProvider::with_get_put_delete_scoped_with_legacy(
+        store_arc,
+        "ilk:11111111-1111-4111-8111-111111111111",
+        Some("legacy-thread-1".to_string()),
+    );
+    let mut registry = fluxbee_ai_sdk::FunctionToolRegistry::new();
+    provider
+        .register_tools(&mut registry)
+        .expect("register scoped tools");
+
+    let get_tool = registry
+        .get("thread_state_get")
+        .expect("thread_state_get tool exists");
+    let out = get_tool
+        .call(json!({
+            "thread_id": "ignored-by-scoped-provider"
+        }))
+        .await
+        .expect("get call should succeed");
+
+    assert_eq!(out.get("found").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        out.get("thread_id").and_then(|v| v.as_str()),
+        Some("ilk:11111111-1111-4111-8111-111111111111")
+    );
+    assert_eq!(
+        out.get("data")
+            .and_then(|v| v.get("email"))
+            .and_then(|v| v.as_str()),
+        Some("noe@gmail.com")
+    );
+
+    let primary = store
+        .get("ilk:11111111-1111-4111-8111-111111111111")
+        .await
+        .expect("get primary record");
+    assert!(primary.is_some());
+    let legacy = store
+        .get("legacy-thread-1")
+        .await
+        .expect("get legacy record");
+    assert!(legacy.is_none());
+
+    let _ = tokio::fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn scoped_provider_put_and_delete_cleanup_legacy_key() {
+    let root = unique_temp_store_root();
+    let store = LanceDbThreadStateStore::new(root.clone());
+    store.ensure_ready().await.expect("store ready");
+    store
+        .put("legacy-thread-2", json!({"stale":true}), None)
+        .await
+        .expect("seed legacy record");
+    let store_arc: Arc<dyn ThreadStateStore> = Arc::new(store.clone());
+
+    let provider = ThreadStateToolsProvider::with_get_put_delete_scoped_with_legacy(
+        store_arc,
+        "ilk:22222222-2222-4222-8222-222222222222",
+        Some("legacy-thread-2".to_string()),
+    );
+    let mut registry = fluxbee_ai_sdk::FunctionToolRegistry::new();
+    provider
+        .register_tools(&mut registry)
+        .expect("register scoped tools");
+
+    let put_tool = registry
+        .get("thread_state_put")
+        .expect("thread_state_put tool exists");
+    put_tool
+        .call(json!({
+            "thread_id": "ignored-by-scoped-provider",
+            "data": {"tenant_hint":"4iplatform"}
+        }))
+        .await
+        .expect("put call should succeed");
+
+    let primary = store
+        .get("ilk:22222222-2222-4222-8222-222222222222")
+        .await
+        .expect("get primary record after put");
+    assert!(primary.is_some());
+    let legacy_after_put = store
+        .get("legacy-thread-2")
+        .await
+        .expect("get legacy record after put");
+    assert!(legacy_after_put.is_none());
+
+    let delete_tool = registry
+        .get("thread_state_delete")
+        .expect("thread_state_delete tool exists");
+    delete_tool
+        .call(json!({
+            "thread_id": "ignored-by-scoped-provider"
+        }))
+        .await
+        .expect("delete call should succeed");
+
+    let primary_after_delete = store
+        .get("ilk:22222222-2222-4222-8222-222222222222")
+        .await
+        .expect("get primary record after delete");
+    assert!(primary_after_delete.is_none());
+    let legacy_after_delete = store
+        .get("legacy-thread-2")
+        .await
+        .expect("get legacy record after delete");
+    assert!(legacy_after_delete.is_none());
+
+    let _ = tokio::fs::remove_dir_all(root).await;
+}

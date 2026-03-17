@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
         node_name = %config.node_name,
         router_socket = %config.router_socket.display(),
         identity_mode = %config.identity_mode,
+        sim_src_ilk = ?config.sim_src_ilk,
         dst_node = %config.dst_node.clone().unwrap_or_else(|| "resolve".to_string()),
         "io-sim starting"
     );
@@ -49,10 +50,16 @@ async fn main() -> Result<()> {
     );
 
     let identity: Arc<dyn IdentityResolver> = match config.identity_mode.as_str() {
+        "fixed" => {
+            let Some(src_ilk) = config.sim_src_ilk.clone() else {
+                anyhow::bail!("IDENTITY_MODE=fixed requires SIM_SRC_ILK");
+            };
+            Arc::new(FixedIdentityResolver::new(src_ilk))
+        }
         "mock" => Arc::new(MockIdentityResolver::new()),
         "shm" => Arc::new(ShmIdentityResolver::new(&config.island_id)),
         "disabled" => Arc::new(DisabledIdentityResolver::new()),
-        other => anyhow::bail!("unsupported IDENTITY_MODE={other} (use shm|mock|disabled)"),
+        other => anyhow::bail!("unsupported IDENTITY_MODE={other} (use shm|mock|disabled|fixed)"),
     };
     let inbound = Arc::new(Mutex::new(InboundProcessor::new(
         sender.uuid().to_string(),
@@ -93,6 +100,7 @@ struct Config {
     sim_sender_id: String,
     sim_conversation_id: String,
     sim_thread_id: Option<String>,
+    sim_src_ilk: Option<String>,
     sim_tenant_hint: Option<String>,
 }
 
@@ -128,8 +136,29 @@ impl Config {
             sim_conversation_id: env("SIM_CONVERSATION_ID")
                 .unwrap_or_else(|| "sim-console".to_string()),
             sim_thread_id: env("SIM_THREAD_ID"),
+            sim_src_ilk: env("SIM_SRC_ILK"),
             sim_tenant_hint: env("SIM_TENANT_HINT"),
         })
+    }
+}
+
+struct FixedIdentityResolver {
+    src_ilk: String,
+}
+
+impl FixedIdentityResolver {
+    fn new(src_ilk: String) -> Self {
+        Self { src_ilk }
+    }
+}
+
+impl IdentityResolver for FixedIdentityResolver {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn lookup(&self, _channel: &str, _external_id: &str) -> Result<Option<String>, io_common::identity::IdentityError> {
+        Ok(Some(self.src_ilk.clone()))
     }
 }
 

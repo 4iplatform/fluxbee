@@ -14,6 +14,7 @@ use crate::{AiSdkError, Result};
 pub struct ThreadStateGetTool {
     store: Arc<dyn ThreadStateStore>,
     scoped_thread_id: Option<String>,
+    legacy_scoped_thread_id: Option<String>,
 }
 
 impl ThreadStateGetTool {
@@ -21,6 +22,7 @@ impl ThreadStateGetTool {
         Self {
             store,
             scoped_thread_id: None,
+            legacy_scoped_thread_id: None,
         }
     }
 
@@ -28,6 +30,19 @@ impl ThreadStateGetTool {
         Self {
             store,
             scoped_thread_id: Some(thread_id.into()),
+            legacy_scoped_thread_id: None,
+        }
+    }
+
+    pub fn new_scoped_with_legacy(
+        store: Arc<dyn ThreadStateStore>,
+        thread_id: impl Into<String>,
+        legacy_thread_id: Option<String>,
+    ) -> Self {
+        Self {
+            store,
+            scoped_thread_id: Some(thread_id.into()),
+            legacy_scoped_thread_id: legacy_thread_id,
         }
     }
 }
@@ -36,6 +51,7 @@ impl ThreadStateGetTool {
 pub struct ThreadStatePutTool {
     store: Arc<dyn ThreadStateStore>,
     scoped_thread_id: Option<String>,
+    legacy_scoped_thread_id: Option<String>,
 }
 
 impl ThreadStatePutTool {
@@ -43,6 +59,7 @@ impl ThreadStatePutTool {
         Self {
             store,
             scoped_thread_id: None,
+            legacy_scoped_thread_id: None,
         }
     }
 
@@ -50,6 +67,19 @@ impl ThreadStatePutTool {
         Self {
             store,
             scoped_thread_id: Some(thread_id.into()),
+            legacy_scoped_thread_id: None,
+        }
+    }
+
+    pub fn new_scoped_with_legacy(
+        store: Arc<dyn ThreadStateStore>,
+        thread_id: impl Into<String>,
+        legacy_thread_id: Option<String>,
+    ) -> Self {
+        Self {
+            store,
+            scoped_thread_id: Some(thread_id.into()),
+            legacy_scoped_thread_id: legacy_thread_id,
         }
     }
 }
@@ -58,6 +88,7 @@ impl ThreadStatePutTool {
 pub struct ThreadStateDeleteTool {
     store: Arc<dyn ThreadStateStore>,
     scoped_thread_id: Option<String>,
+    legacy_scoped_thread_id: Option<String>,
 }
 
 impl ThreadStateDeleteTool {
@@ -65,6 +96,7 @@ impl ThreadStateDeleteTool {
         Self {
             store,
             scoped_thread_id: None,
+            legacy_scoped_thread_id: None,
         }
     }
 
@@ -72,6 +104,19 @@ impl ThreadStateDeleteTool {
         Self {
             store,
             scoped_thread_id: Some(thread_id.into()),
+            legacy_scoped_thread_id: None,
+        }
+    }
+
+    pub fn new_scoped_with_legacy(
+        store: Arc<dyn ThreadStateStore>,
+        thread_id: impl Into<String>,
+        legacy_thread_id: Option<String>,
+    ) -> Self {
+        Self {
+            store,
+            scoped_thread_id: Some(thread_id.into()),
+            legacy_scoped_thread_id: legacy_thread_id,
         }
     }
 }
@@ -112,11 +157,31 @@ impl ThreadStateToolsProvider {
         store: Arc<dyn ThreadStateStore>,
         thread_id: impl Into<String>,
     ) -> Self {
+        Self::with_get_put_delete_scoped_with_legacy(store, thread_id, None)
+    }
+
+    pub fn with_get_put_delete_scoped_with_legacy(
+        store: Arc<dyn ThreadStateStore>,
+        thread_id: impl Into<String>,
+        legacy_thread_id: Option<String>,
+    ) -> Self {
         let scoped = thread_id.into();
         Self {
-            get_tool: Some(ThreadStateGetTool::new_scoped(store.clone(), scoped.clone())),
-            put_tool: Some(ThreadStatePutTool::new_scoped(store.clone(), scoped.clone())),
-            delete_tool: Some(ThreadStateDeleteTool::new_scoped(store, scoped)),
+            get_tool: Some(ThreadStateGetTool::new_scoped_with_legacy(
+                store.clone(),
+                scoped.clone(),
+                legacy_thread_id.clone(),
+            )),
+            put_tool: Some(ThreadStatePutTool::new_scoped_with_legacy(
+                store.clone(),
+                scoped.clone(),
+                legacy_thread_id.clone(),
+            )),
+            delete_tool: Some(ThreadStateDeleteTool::new_scoped_with_legacy(
+                store,
+                scoped,
+                legacy_thread_id,
+            )),
         }
     }
 }
@@ -200,6 +265,61 @@ impl FunctionTool for ThreadStateGetTool {
             );
             err
         })?;
+        let migrated_from = self
+            .legacy_scoped_thread_id
+            .as_deref()
+            .filter(|legacy| !legacy.is_empty() && *legacy != thread_id);
+        let found = match (found, migrated_from) {
+            (None, Some(legacy)) => {
+                let legacy_found = self.store.get(legacy).await.map_err(|err| {
+                    warn!(
+                        op = "thread_state_get",
+                        thread_id = %thread_id,
+                        legacy_thread_id = %legacy,
+                        status = "error",
+                        latency_ms = started.elapsed().as_millis() as u64,
+                        error = %err,
+                        "thread state legacy lookup failed"
+                    );
+                    err
+                })?;
+                if let Some(record) = legacy_found {
+                    self.store
+                        .put(thread_id, record.data.clone(), record.ttl_seconds)
+                        .await
+                        .map_err(|err| {
+                            warn!(
+                                op = "thread_state_get",
+                                thread_id = %thread_id,
+                                legacy_thread_id = %legacy,
+                                status = "error",
+                                latency_ms = started.elapsed().as_millis() as u64,
+                                error = %err,
+                                "thread state migration put failed"
+                            );
+                            err
+                        })?;
+                    self.store.delete(legacy).await.map_err(|err| {
+                        warn!(
+                            op = "thread_state_get",
+                            thread_id = %thread_id,
+                            legacy_thread_id = %legacy,
+                            status = "error",
+                            latency_ms = started.elapsed().as_millis() as u64,
+                            error = %err,
+                            "thread state migration delete failed"
+                        );
+                        err
+                    })?;
+                    let mut migrated = record;
+                    migrated.thread_id = thread_id.to_string();
+                    Some(migrated)
+                } else {
+                    None
+                }
+            }
+            (found, _) => found,
+        };
         let payload = match found {
             Some(record) => json!({
                 "found": true,
@@ -276,6 +396,24 @@ impl FunctionTool for ThreadStatePutTool {
                 );
                 err
             })?;
+        if let Some(legacy_thread_id) = self
+            .legacy_scoped_thread_id
+            .as_deref()
+            .filter(|legacy| !legacy.is_empty() && *legacy != thread_id)
+        {
+            self.store.delete(legacy_thread_id).await.map_err(|err| {
+                warn!(
+                    op = "thread_state_put",
+                    thread_id = %thread_id,
+                    legacy_thread_id = %legacy_thread_id,
+                    status = "error",
+                    latency_ms = started.elapsed().as_millis() as u64,
+                    error = %err,
+                    "thread state cleanup of legacy key failed"
+                );
+                err
+            })?;
+        }
         info!(
             op = "thread_state_put",
             thread_id = %thread_id,
@@ -336,6 +474,24 @@ impl FunctionTool for ThreadStateDeleteTool {
             );
             err
         })?;
+        if let Some(legacy_thread_id) = self
+            .legacy_scoped_thread_id
+            .as_deref()
+            .filter(|legacy| !legacy.is_empty() && *legacy != thread_id)
+        {
+            self.store.delete(legacy_thread_id).await.map_err(|err| {
+                warn!(
+                    op = "thread_state_delete",
+                    thread_id = %thread_id,
+                    legacy_thread_id = %legacy_thread_id,
+                    status = "error",
+                    latency_ms = started.elapsed().as_millis() as u64,
+                    error = %err,
+                    "thread state cleanup of legacy key failed"
+                );
+                err
+            })?;
+        }
         info!(
             op = "thread_state_delete",
             thread_id = %thread_id,

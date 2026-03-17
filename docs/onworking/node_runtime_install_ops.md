@@ -21,6 +21,14 @@ Config location:
 - Canonical YAML example:
   - `docs/onworking/ai_node_runner_config.example.yaml`
 
+Mode per instance (`default|gov`):
+- Unit now starts with:
+  - `ExecStart=/usr/bin/ai-node-runner --mode ${AI_NODE_MODE} --config /etc/fluxbee/ai-nodes/%i.yaml`
+- Default mode is:
+  - `AI_NODE_MODE=default`
+- Override per instance via:
+  - `/etc/fluxbee/ai-nodes/<name>.env`
+
 ## 2) AI instance lifecycle
 
 One install, many instances.
@@ -119,6 +127,29 @@ RUST_LOG=info,fluxbee_ai_nodes=debug,fluxbee_ai_sdk=debug
 EOF
 ```
 
+Example for `AI.frontdesk.gov` (gov mode + identity targets):
+
+```bash
+sudo tee /etc/fluxbee/ai-nodes/ai-frontdesk-gov.env >/dev/null <<'EOF'
+AI_NODE_MODE=gov
+OPENAI_API_KEY=sk-REPLACE_ME
+GOV_IDENTITY_TARGET=SY.identity
+GOV_IDENTITY_FALLBACK_TARGET=SY.identity@motherbee
+GOV_IDENTITY_TIMEOUT_MS=10000
+RUST_LOG=info,fluxbee_ai_nodes=debug,fluxbee_ai_sdk=debug
+EOF
+```
+
+Example for a regular AI node (default mode):
+
+```bash
+sudo tee /etc/fluxbee/ai-nodes/ai-chat.env >/dev/null <<'EOF'
+AI_NODE_MODE=default
+OPENAI_API_KEY=sk-REPLACE_ME
+RUST_LOG=info
+EOF
+```
+
 What this command does:
 - `tee /etc/fluxbee/ai-nodes/ai-chat.env`: writes stdin to that file.
 - `sudo`: allows writing under `/etc/fluxbee/...`.
@@ -136,6 +167,7 @@ sudo systemctl status fluxbee-ai-node@ai-chat
 Important:
 - `api_key_env` in YAML must match variable name in `.env`.
 - If YAML uses default `api_key_env: OPENAI_API_KEY`, `.env` must define `OPENAI_API_KEY=...`.
+- `AI_NODE_MODE=gov` is required for gov-only tools (for example `ilk_register`).
 
 OpenAI key precedence in current MVP runner:
 1. `CONFIG_SET.payload.config.behavior.openai.api_key` (hot override in memory, not persisted as plaintext)

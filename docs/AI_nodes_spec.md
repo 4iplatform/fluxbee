@@ -1492,6 +1492,11 @@ Installs:
 - `/usr/bin/ai-nodectl`
 - systemd template unit `/etc/systemd/system/fluxbee-ai-node@.service`
 
+Per-instance mode:
+- `AI_NODE_MODE=default|gov` (set in `/etc/fluxbee/ai-nodes/<name>.env`)
+- `default`: common tools only
+- `gov`: common tools + gov tools (for example `ilk_register`)
+
 Manage instances with `ai-nodectl`:
 
 ```bash
@@ -1510,23 +1515,24 @@ ai-nodectl logs ai-chat --follow
 > ✅ **Objetivo**: permitir que cada nodo `AI.*` guarde **datos duros** relevantes para continuar tareas entre mensajes, sin guardar la conversación completa.
 > ⚠️ Este store es **privado por nodo**: un nodo no lee/escribe el store de otro.
 
-### 9.1 Identificador: `thread_id` (tentativo)
+### 9.1 Keying principal: `src_ilk` (MVP vigente)
 
-🧩 **A ESPECIFICAR (core)**: la definición final de `thread_id` se cerrará más adelante.
+✅ **NORMATIVO (MVP vigente)**:
+- El key principal de thread state es `src_ilk`.
+- El runner extrae `src_ilk` desde `meta.context.src_ilk` (carrier actual).
+- Si falta `src_ilk`, las tools de thread state deben fallar con error explicito (`missing_src_ilk`).
 
-✅ **NORMATIVO (MVP)**:
-- Todo mensaje `user` debe incluir `thread_id`.
-- **Ubicación tentantiva** (MVP): campo top-level, al mismo nivel que `src_ilk`.
-- La ubicación final será definida por core; el runner debe poder migrar el extractor cuando se formalice.
-- El responsable de asignarlo es el **IO node** (por canal/conversación), por lo que **siempre** debe venir.
-
-⚠️ **Bridge temporal de implementación**:
-- Mientras el wire model del SDK no tipifique `thread_id` top-level, el runner puede extraerlo desde `meta.context.thread_id`.
-
-### 9.2 Modelo de datos: 1 JSON por `thread_id`
+### 9.2 Compatibilidad legacy con `thread_id`
 
 ✅ **NORMATIVO (MVP)**:
-- El nodo mantiene **un único documento JSON** por `thread_id`.
+- `thread_id` se mantiene solo como compatibilidad legacy/migracion.
+- El runner puede extraer `thread_id` desde `meta.context.thread_id`.
+- Si existe estado legacy por `thread_id`, el runtime puede migrarlo al key principal (`src_ilk`) y limpiar la key legacy.
+
+### 9.3 Modelo de datos: 1 JSON por key de estado (`src_ilk`)
+
+✅ **NORMATIVO (MVP)**:
+- El nodo mantiene **un unico documento JSON** por `src_ilk`.
 - La estructura del JSON es **libre** y se define por prompting/policy según el nodo (frontdesk, soporte, etc.).
 - Campos opcionales de sistema:
   - `updated_at` (timestamp de último write)
@@ -1536,16 +1542,20 @@ ai-nodectl logs ai-chat --follow
 - El nodo **decide** qué guardar y cuándo actualizar/borrar (por prompting/policy).
 - El nodo **MUST** poder borrar inmediatamente el estado de un thread cuando deje de ser útil.
 
-### 9.3 API (Tool calling) mínima
+### 9.4 API (Tool calling) minima
 
 ✅ **NORMATIVO (MVP)**: el runtime/SDK debe exponer tools equivalentes a:
 - `thread_state_get(thread_id) -> { data?, updated_at? }`
 - `thread_state_put(thread_id, data, ttl_seconds?) -> ok`
 - `thread_state_delete(thread_id) -> ok`
 
+Nota:
+- En modo scoped del runtime, el argumento `thread_id` enviado por el modelo puede ignorarse.
+- La ejecucion se scopea al key del contexto actual (`src_ilk`), con fallback legacy opcional.
+
 > Nota: no se requiere query vectorial ni múltiple-key en MVP.
 
-### 9.4 Persistencia y path
+### 9.5 Persistencia y path
 
 ✅ **NORMATIVO (MVP)**:
 - La base/dataset de LanceDB del nodo vive bajo `${STATE_DIR}/ai-nodes/<node_name>/lancedb/` (o path equivalente que respete patrones Fluxbee).
@@ -1554,8 +1564,8 @@ ai-nodectl logs ai-chat --follow
 🧩 **A ESPECIFICAR**:
 - Reglas de backup/restore y migración de schema interno de LanceDB.
 
-### 9.5 Concurrencia e idempotencia
+### 9.6 Concurrencia e idempotencia
 
 ✅ **NORMATIVO (MVP)**:
 - Se asume un único proceso writer (la instancia del nodo) para su store.
-- El nodo debe serializar accesos concurrentes a un mismo `thread_id` para evitar corrupción (mutex/actor queue).
+- El nodo debe serializar accesos concurrentes a un mismo key de estado para evitar corrupcion (mutex/actor queue).

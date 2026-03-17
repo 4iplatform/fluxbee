@@ -60,7 +60,8 @@ After=network.target rt-gateway.service
 [Service]
 Type=simple
 EnvironmentFile=-/etc/fluxbee/ai-nodes/%i.env
-ExecStart=/usr/bin/ai-node-runner --config /etc/fluxbee/ai-nodes/%i.yaml
+Environment=AI_NODE_MODE=default
+ExecStart=/usr/bin/ai-node-runner --mode ${AI_NODE_MODE} --config /etc/fluxbee/ai-nodes/%i.yaml
 Restart=always
 RestartSec=5
 
@@ -79,6 +80,7 @@ echo "Installed: /usr/bin/ai-node-runner, /usr/bin/ai-nodectl"
 echo "Template unit: /etc/systemd/system/fluxbee-ai-node@.service"
 echo "Config location: $CONFIG_DIR/ai-nodes/<name>.yaml"
 echo "Dynamic state location: $STATE_DIR/state/ai-nodes/<name>.json"
+echo "Mode per instance env: /etc/fluxbee/ai-nodes/<name>.env (AI_NODE_MODE=default|gov)"
 echo "Precreate state example: ai-nodectl init-state <name> /tmp/<name>_effective_config.json"
 echo "Start example: sudo systemctl enable --now fluxbee-ai-node@ai-chat"
 echo "Management example: ai-nodectl list"

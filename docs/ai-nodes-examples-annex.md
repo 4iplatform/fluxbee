@@ -9,7 +9,13 @@
 ## Convenciones de identidad y thread
 
 - `src_ilk` se asume **siempre presente** (puede ser ILK temporal).
-- `thread_id` se asume presente (asignado por IO). La ubicación exacta es tentantiva; en MVP lo tratamos como top-level.
+- `thread_id` se mantiene como compatibilidad legacy (carrier actual en `meta.context.thread_id`).
+- El key efectivo de thread state en MVP vigente es `src_ilk`.
+
+## Modo del runner (default/gov)
+
+- `AI_NODE_MODE=default`: tools comunes.
+- `AI_NODE_MODE=gov`: tools comunes + `ilk_register`.
 
 ---
 
@@ -355,16 +361,16 @@ Debe responder:
 
 ---
 
-## 8) Ejemplo: Thread State Store (LanceDB) — 1 JSON por `thread_id`
+## 8) Ejemplo: Thread State Store (LanceDB) - 1 JSON por `src_ilk`
 
-> MVP: un documento JSON por `thread_id` (estructura libre por prompting).
+> MVP vigente: un documento JSON por `src_ilk` (estructura libre por prompting), con compatibilidad legacy por `thread_id`.
 
 ### Put
 ```json
 {
   "tool": "thread_state_put",
   "args": {
-    "thread_id": "slack:T123:C456:thread:1710000000.000",
+    "thread_id": "legacy-thread-id-ignored-in-scoped-mode",
     "data": {
       "status": "waiting_information",
       "description": "Asked for: name, phone, mail",
@@ -382,7 +388,7 @@ Debe responder:
 {
   "tool": "thread_state_get",
   "args": {
-    "thread_id": "slack:T123:C456:thread:1710000000.000"
+    "thread_id": "legacy-thread-id-ignored-in-scoped-mode"
   }
 }
 ```
@@ -392,7 +398,35 @@ Debe responder:
 {
   "tool": "thread_state_delete",
   "args": {
-    "thread_id": "slack:T123:C456:thread:1710000000.000"
+    "thread_id": "legacy-thread-id-ignored-in-scoped-mode"
   }
 }
+
+## 9) Ejemplo: tool gov `ilk_register` (solo `AI_NODE_MODE=gov`)
+
+```json
+{
+  "tool": "ilk_register",
+  "args": {
+    "src_ilk": "ilk:550e8400-e29b-41d4-a716-446655440000",
+    "thread_id": "slack:T123:C456:thread:1710000000.000",
+    "identity_candidate": {
+      "name": "Noelia Eguren",
+      "email": "neguren@4iplatform.com",
+      "tenant_hint": "4iplatform"
+    }
+  }
+}
+```
+
+Respuesta esperada (ok):
+
+```json
+{
+  "status": "ok",
+  "registered": true,
+  "effective_target": "SY.identity@motherbee",
+  "trace_id": "uuid-trace"
+}
+```
 ```
