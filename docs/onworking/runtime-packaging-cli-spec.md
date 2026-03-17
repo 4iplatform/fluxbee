@@ -909,6 +909,7 @@ fluxbee-publish ./package --deploy worker-220
   - request overrides take precedence
   - `_system` fields forced by orchestrator
   - Prefer validating this on `config_only`, where the merge contract matters most.
+  - Script target: `scripts/runtime_packaging_pub_t26_e2e.sh`
 
 ### Phase 6 — Rollout and Documentation
 
