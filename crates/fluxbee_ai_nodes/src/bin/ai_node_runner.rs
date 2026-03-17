@@ -14,10 +14,10 @@ use fluxbee_ai_sdk::{
     LanceDbThreadStateStore, ModelSettings, NodeRuntime, OpenAiResponsesClient, RetryPolicy,
     RouterClient, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
 };
-use fluxbee_sdk::{connect, identity_system_call_ok, IdentityError, IdentitySystemRequest, MSG_ILK_REGISTER, NodeConfig};
+use fluxbee_sdk::{connect, identity_system_call_ok, IdentitySystemRequest, MSG_ILK_REGISTER, NodeConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
@@ -28,6 +28,7 @@ const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE
 const GOV_IDENTITY_TARGET_ENV: &str = "GOV_IDENTITY_TARGET";
 const GOV_IDENTITY_FALLBACK_TARGET_ENV: &str = "GOV_IDENTITY_FALLBACK_TARGET";
 const GOV_IDENTITY_TIMEOUT_MS_ENV: &str = "GOV_IDENTITY_TIMEOUT_MS";
+const GOV_IDENTITY_CALLER_NODE_ENV: &str = "GOV_IDENTITY_CALLER_NODE";
 
 #[derive(Debug, Deserialize)]
 struct RunnerConfig {
@@ -317,14 +318,11 @@ struct OpenAiChatRuntime {
 struct GenericAiNode {
     mode: RunnerMode,
     node_name: String,
-    node_version: String,
-    router_socket: PathBuf,
-    uuid_persistence_dir: PathBuf,
-    config_dir: PathBuf,
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
     dynamic_config_dir: PathBuf,
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
     gov_identity: GovIdentityConfig,
+    gov_identity_bridge: Arc<GovIdentityBridge>,
     control_plane: Arc<RwLock<ControlPlaneState>>,
 }
 
@@ -333,6 +331,7 @@ struct GovIdentityConfig {
     target: String,
     fallback_target: Option<String>,
     timeout: Duration,
+    caller_node: Option<String>,
 }
 
 impl Default for GovIdentityConfig {
@@ -341,7 +340,73 @@ impl Default for GovIdentityConfig {
             target: "SY.identity".to_string(),
             fallback_target: Some("SY.identity@motherbee".to_string()),
             timeout: Duration::from_secs(10),
+            caller_node: None,
         }
+    }
+}
+
+struct GovIdentityBridge {
+    caller_name: String,
+    caller_version: String,
+    router_socket: PathBuf,
+    uuid_persistence_dir: PathBuf,
+    config_dir: PathBuf,
+    client: Mutex<Option<(fluxbee_sdk::NodeSender, fluxbee_sdk::NodeReceiver)>>,
+}
+
+impl GovIdentityBridge {
+    fn new(
+        caller_name: String,
+        caller_version: String,
+        router_socket: PathBuf,
+        uuid_persistence_dir: PathBuf,
+        config_dir: PathBuf,
+    ) -> Self {
+        Self {
+            caller_name,
+            caller_version,
+            router_socket,
+            uuid_persistence_dir,
+            config_dir,
+            client: Mutex::new(None),
+        }
+    }
+
+    async fn call_ok(
+        &self,
+        identity: &GovIdentityConfig,
+        action: &str,
+        payload: Value,
+    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, String> {
+        let mut guard = self.client.lock().await;
+        if guard.is_none() {
+            let node_config = NodeConfig {
+                name: self.caller_name.clone(),
+                version: self.caller_version.clone(),
+                router_socket: self.router_socket.clone(),
+                uuid_persistence_dir: self.uuid_persistence_dir.clone(),
+                config_dir: self.config_dir.clone(),
+            };
+            let (sender, receiver) = connect(&node_config)
+                .await
+                .map_err(|err| format!("bridge connect failed: {err}"))?;
+            *guard = Some((sender, receiver));
+        }
+
+        let (sender, receiver) = guard.as_mut().expect("identity bridge client");
+        identity_system_call_ok(
+            sender,
+            receiver,
+            IdentitySystemRequest {
+                target: &identity.target,
+                fallback_target: identity.fallback_target.as_deref(),
+                action,
+                payload,
+                timeout: identity.timeout,
+            },
+        )
+        .await
+        .map_err(|err| err.to_string())
     }
 }
 
@@ -363,15 +428,11 @@ struct IlkRegisterArgs {
     thread_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct IlkRegisterTool {
     scoped_src_ilk: Option<String>,
-    owner_node_name: String,
-    owner_node_version: String,
-    router_socket: PathBuf,
-    uuid_persistence_dir: PathBuf,
-    config_dir: PathBuf,
     identity: GovIdentityConfig,
+    bridge: Arc<GovIdentityBridge>,
 }
 
 #[derive(Debug, Clone)]
@@ -542,12 +603,8 @@ impl GenericAiNode {
     ) -> fluxbee_ai_sdk::Result<()> {
         let tool = IlkRegisterTool {
             scoped_src_ilk: ctx.src_ilk.clone(),
-            owner_node_name: self.node_name.clone(),
-            owner_node_version: self.node_version.clone(),
-            router_socket: self.router_socket.clone(),
-            uuid_persistence_dir: self.uuid_persistence_dir.clone(),
-            config_dir: self.config_dir.clone(),
             identity: self.gov_identity.clone(),
+            bridge: self.gov_identity_bridge.clone(),
         };
         registry.register(Arc::new(tool))?;
         Ok(())
@@ -986,6 +1043,7 @@ fn gov_identity_config_from_env() -> GovIdentityConfig {
         GOV_IDENTITY_TIMEOUT_MS_ENV,
         cfg.timeout.as_millis() as u64,
     ));
+    cfg.caller_node = env_nonempty(GOV_IDENTITY_CALLER_NODE_ENV);
     cfg
 }
 
@@ -1059,34 +1117,6 @@ impl FunctionTool for IlkRegisterTool {
             "dispatching identity registration request"
         );
 
-        let tool_node_name = format!(
-            "{}.govtool.{}",
-            self.owner_node_name,
-            chrono::Utc::now()
-                .timestamp_nanos_opt()
-                .unwrap_or_default()
-        );
-        let node_config = NodeConfig {
-            name: tool_node_name,
-            version: self.owner_node_version.clone(),
-            router_socket: self.router_socket.clone(),
-            uuid_persistence_dir: self.uuid_persistence_dir.clone(),
-            config_dir: self.config_dir.clone(),
-        };
-
-        let (sender, mut receiver) = match connect(&node_config).await {
-            Ok(parts) => parts,
-            Err(err) => {
-                return Ok(json!({
-                    "status": "error",
-                    "error_code": "identity_unavailable",
-                    "message": format!("failed to connect identity tool client: {err}"),
-                    "retryable": true
-                }));
-            }
-        };
-
-        let fallback_target = self.identity.fallback_target.as_deref();
         let payload = json!({
             "src_ilk": src_ilk,
             "identity_candidate": {
@@ -1097,18 +1127,10 @@ impl FunctionTool for IlkRegisterTool {
             },
             "thread_id": args.thread_id
         });
-        let result = identity_system_call_ok(
-            &sender,
-            &mut receiver,
-            IdentitySystemRequest {
-                target: &self.identity.target,
-                fallback_target,
-                action: MSG_ILK_REGISTER,
-                payload,
-                timeout: self.identity.timeout,
-            },
-        )
-        .await;
+        let result = self
+            .bridge
+            .call_ok(&self.identity, MSG_ILK_REGISTER, payload)
+            .await;
 
         match result {
             Ok(out) => Ok(json!({
@@ -1123,8 +1145,7 @@ impl FunctionTool for IlkRegisterTool {
     }
 }
 
-fn identity_error_to_tool_payload(err: IdentityError) -> Value {
-    let msg = err.to_string();
+fn identity_error_to_tool_payload(msg: String) -> Value {
     let upper = msg.to_ascii_uppercase();
     let (error_code, retryable) = if upper.contains("NOT_PRIMARY") {
         ("NOT_PRIMARY", true)
@@ -1250,6 +1271,18 @@ async fn run_one_config(
     let router_socket = ai_node_config.router_socket.clone();
     let uuid_persistence_dir = ai_node_config.uuid_persistence_dir.clone();
     let config_dir = ai_node_config.config_dir.clone();
+    let gov_identity = gov_identity_config_from_env();
+    let bridge_caller_name = gov_identity
+        .caller_node
+        .clone()
+        .unwrap_or_else(|| format!("{}.govtool", node_name));
+    let gov_identity_bridge = Arc::new(GovIdentityBridge::new(
+        bridge_caller_name,
+        node_version.clone(),
+        router_socket.clone(),
+        uuid_persistence_dir.clone(),
+        config_dir.clone(),
+    ));
     let thread_state_store = init_thread_state_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
     let client = RouterClient::connect(ai_node_config).await?;
     let runtime = NodeRuntime::new(
@@ -1257,14 +1290,11 @@ async fn run_one_config(
         GenericAiNode {
             mode,
             node_name,
-            node_version,
-            router_socket,
-            uuid_persistence_dir,
-            config_dir,
             behavior: Arc::new(RwLock::new(Some(behavior))),
             dynamic_config_dir: PathBuf::from(cfg.node.dynamic_config_dir),
             thread_state_store,
-            gov_identity: gov_identity_config_from_env(),
+            gov_identity,
+            gov_identity_bridge,
             control_plane: Arc::new(RwLock::new(ControlPlaneState {
                 current_state: NodeLifecycleState::Configured,
                 config_source: "yaml",
@@ -1364,20 +1394,29 @@ async fn run_unconfigured_bootstrap(
     let router_socket = ai_node_config.router_socket.clone();
     let uuid_persistence_dir = ai_node_config.uuid_persistence_dir.clone();
     let config_dir = ai_node_config.config_dir.clone();
+    let gov_identity = gov_identity_config_from_env();
+    let bridge_caller_name = gov_identity
+        .caller_node
+        .clone()
+        .unwrap_or_else(|| format!("{}.govtool", node_name));
+    let gov_identity_bridge = Arc::new(GovIdentityBridge::new(
+        bridge_caller_name,
+        node_version.clone(),
+        router_socket.clone(),
+        uuid_persistence_dir.clone(),
+        config_dir.clone(),
+    ));
     let client = RouterClient::connect(ai_node_config).await?;
     let runtime = NodeRuntime::new(
         client,
         GenericAiNode {
             mode,
             node_name,
-            node_version,
-            router_socket,
-            uuid_persistence_dir,
-            config_dir,
             behavior: Arc::new(RwLock::new(behavior)),
             dynamic_config_dir: dynamic_dir,
             thread_state_store,
-            gov_identity: gov_identity_config_from_env(),
+            gov_identity,
+            gov_identity_bridge,
             control_plane: Arc::new(RwLock::new(state)),
         },
     );
@@ -2187,17 +2226,22 @@ mod tests {
     }
 
     fn test_node() -> GenericAiNode {
+        let gov_identity = GovIdentityConfig::default();
+        let gov_identity_bridge = Arc::new(GovIdentityBridge::new(
+            "AI.frontdesk.gov.govtool".to_string(),
+            "0.1.0".to_string(),
+            PathBuf::from("/var/run/fluxbee/routers"),
+            PathBuf::from("/var/lib/fluxbee/state/nodes"),
+            PathBuf::from("/etc/fluxbee"),
+        ));
         GenericAiNode {
             mode: RunnerMode::Default,
             node_name: "AI.frontdesk.gov".to_string(),
-            node_version: "0.1.0".to_string(),
-            router_socket: PathBuf::from("/var/run/fluxbee/routers"),
-            uuid_persistence_dir: PathBuf::from("/var/lib/fluxbee/state/nodes"),
-            config_dir: PathBuf::from("/etc/fluxbee"),
             behavior: Arc::new(RwLock::new(None)),
             dynamic_config_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
-            gov_identity: GovIdentityConfig::default(),
+            gov_identity,
+            gov_identity_bridge,
             control_plane: Arc::new(RwLock::new(ControlPlaneState {
                 current_state: NodeLifecycleState::Unconfigured,
                 config_source: "none",
