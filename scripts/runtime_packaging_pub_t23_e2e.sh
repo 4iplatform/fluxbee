@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# PUB-T23 E2E (config_only):
+# 1) publish base full_runtime
+# 2) publish config_only using runtime_base
+# 3) deploy + spawn config_only on target hive
+#
+# Usage:
+#   BASE="http://127.0.0.1:8080" \
+#   HIVE_ID="worker-220" \
+#   MOTHER_HIVE_ID="motherbee" \
+#   TENANT_ID="tnt:<uuid>" \
+#   bash scripts/runtime_packaging_pub_t23_e2e.sh
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+BASE="${BASE:-http://127.0.0.1:8080}"
+HIVE_ID="${HIVE_ID:-motherbee}"
+MOTHER_HIVE_ID="${MOTHER_HIVE_ID:-motherbee}"
+TENANT_ID="${TENANT_ID:-}"
+WAIT_READY_SECS="${WAIT_READY_SECS:-120}"
+WAIT_STATUS_SECS="${WAIT_STATUS_SECS:-90}"
+DEPLOY_STRICT="${DEPLOY_STRICT:-1}"
+TEST_ID="${TEST_ID:-pubt23-$(date +%s)-$RANDOM}"
+BASE_RUNTIME_NAME="${BASE_RUNTIME_NAME:-wf.publish.base.diag.$(date +%s)}"
+BASE_RUNTIME_VERSION="${BASE_RUNTIME_VERSION:-1.0.0-$TEST_ID}"
+CONFIG_RUNTIME_NAME="${CONFIG_RUNTIME_NAME:-wf.publish.config.diag.$(date +%s)}"
+CONFIG_RUNTIME_VERSION="${CONFIG_RUNTIME_VERSION:-2.0.0-$TEST_ID}"
+NODE_NAME="${NODE_NAME:-WF.publish.config.$TEST_ID}"
+
+MANIFEST_PATH="/var/lib/fluxbee/dist/runtimes/manifest.json"
+DIST_BASE_RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/$BASE_RUNTIME_NAME"
+DIST_CONFIG_RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/$CONFIG_RUNTIME_NAME"
+PUBLISH_BIN="$ROOT_DIR/target/release/fluxbee-publish"
+DIAG_BIN="$ROOT_DIR/target/release/inventory_hold_diag"
+
+tmpdir="$(mktemp -d)"
+base_pkg_dir="$tmpdir/base_pkg"
+cfg_pkg_dir="$tmpdir/cfg_pkg"
+manifest_backup="$tmpdir/manifest.backup.json"
+publish_base_log="$tmpdir/publish_base.log"
+publish_cfg_log="$tmpdir/publish_cfg.log"
+versions_body="$tmpdir/versions.json"
+spawn_body="$tmpdir/spawn.json"
+status_body="$tmpdir/status.json"
+kill_body="$tmpdir/kill.json"
+
+cleanup() {
+  local _ec=$?
+  http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
+  if [[ -f "$manifest_backup" ]]; then
+    as_root_local install -m 0644 "$manifest_backup" "$MANIFEST_PATH" >/dev/null 2>&1 || true
+  fi
+  as_root_local rm -rf "$DIST_BASE_RUNTIME_DIR" >/dev/null 2>&1 || true
+  as_root_local rm -rf "$DIST_CONFIG_RUNTIME_DIR" >/dev/null 2>&1 || true
+  as_root_local rm -rf "$tmpdir" >/dev/null 2>&1 || true
+  return "$_ec"
+}
+trap cleanup EXIT
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "FAIL: missing required command '$1'" >&2
+    exit 1
+  }
+}
+
+as_root_local() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@"
+  else
+    if ! command -v sudo >/dev/null 2>&1; then
+      echo "FAIL: sudo is required when not running as root" >&2
+      exit 1
+    fi
+    sudo -n "$@"
+  fi
+}
+
+http_call() {
+  local method="$1"
+  local url="$2"
+  local out_file="$3"
+  local payload="${4:-}"
+  if [[ -n "$payload" ]]; then
+    curl -sS -o "$out_file" -w "%{http_code}" -X "$method" "$url" \
+      -H "Content-Type: application/json" \
+      -d "$payload"
+  else
+    curl -sS -o "$out_file" -w "%{http_code}" -X "$method" "$url"
+  fi
+}
+
+json_get_file() {
+  local path="$1"
+  local file="$2"
+  python3 - "$path" "$file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+file_path = sys.argv[2]
+try:
+    with open(file_path, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+value = doc
+for part in path.split("."):
+    if not part:
+        continue
+    if isinstance(value, dict):
+        value = value.get(part)
+    else:
+        value = None
+        break
+
+if value is None:
+    print("")
+elif isinstance(value, bool):
+    print("true" if value else "false")
+elif isinstance(value, (dict, list)):
+    print(json.dumps(value))
+else:
+    print(str(value))
+PY
+}
+
+validate_tenant_id() {
+  local tenant_id="$1"
+  if [[ -z "$tenant_id" ]]; then
+    echo "FAIL: TENANT_ID is required (format: tnt:<uuid-v4>)" >&2
+    exit 1
+  fi
+  if [[ ! "$tenant_id" =~ ^tnt:[0-9a-fA-F-]{36}$ ]]; then
+    echo "FAIL: invalid TENANT_ID='$tenant_id' (expected tnt:<uuid-v4>)" >&2
+    exit 1
+  fi
+}
+
+wait_runtime_readiness_full() {
+  local runtime_name="$1"
+  local runtime_version="$2"
+  local deadline=$(( $(date +%s) + WAIT_READY_SECS ))
+  while (( $(date +%s) <= deadline )); do
+    local http present exec
+    http="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$versions_body")"
+    if [[ "$http" != "200" ]]; then
+      sleep 2
+      continue
+    fi
+    present="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
+      '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver].runtime_present // false) | tostring' \
+      "$versions_body")"
+    exec="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
+      '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver].start_sh_executable // false) | tostring' \
+      "$versions_body")"
+    if [[ "$present" == "true" && "$exec" == "true" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "FAIL: full_runtime readiness not ready runtime='$runtime_name' version='$runtime_version'" >&2
+  cat "$versions_body" >&2 || true
+  return 1
+}
+
+wait_runtime_readiness_config() {
+  local runtime_name="$1"
+  local runtime_version="$2"
+  local deadline=$(( $(date +%s) + WAIT_READY_SECS ))
+  while (( $(date +%s) <= deadline )); do
+    local http present exec base_ready
+    http="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$versions_body")"
+    if [[ "$http" != "200" ]]; then
+      sleep 2
+      continue
+    fi
+    present="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
+      '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver].runtime_present // false) | tostring' \
+      "$versions_body")"
+    exec="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
+      '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver].start_sh_executable // false) | tostring' \
+      "$versions_body")"
+    base_ready="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
+      '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver].base_runtime_ready // false) | tostring' \
+      "$versions_body")"
+    if [[ "$present" == "true" && "$exec" == "true" && "$base_ready" == "true" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "FAIL: config_only readiness not ready runtime='$runtime_name' version='$runtime_version'" >&2
+  cat "$versions_body" >&2 || true
+  return 1
+}
+
+spawn_node() {
+  local payload
+  payload="$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"current","tenant_id":"%s"}' \
+    "$NODE_NAME" "$CONFIG_RUNTIME_NAME" "$TENANT_ID")"
+  http_call "POST" "$BASE/hives/$HIVE_ID/nodes" "$spawn_body" "$payload"
+}
+
+wait_node_active_with_runtime() {
+  local expected_runtime="$1"
+  local expected_version="$2"
+  local deadline=$(( $(date +%s) + WAIT_STATUS_SECS ))
+  while (( $(date +%s) <= deadline )); do
+    local http api_status payload_status lifecycle pid runtime_name runtime_version
+    http="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/status" "$status_body")"
+    if [[ "$http" != "200" ]]; then
+      sleep 2
+      continue
+    fi
+    api_status="$(json_get_file "status" "$status_body")"
+    payload_status="$(json_get_file "payload.status" "$status_body")"
+    lifecycle="$(json_get_file "payload.node_status.lifecycle_state" "$status_body")"
+    pid="$(json_get_file "payload.node_status.process.pid" "$status_body")"
+    runtime_name="$(json_get_file "payload.node_status.runtime.name" "$status_body")"
+    runtime_version="$(json_get_file "payload.node_status.runtime.resolved_version" "$status_body")"
+    if [[ "$api_status" != "ok" || "$payload_status" != "ok" ]]; then
+      sleep 2
+      continue
+    fi
+    if [[ "$runtime_name" != "$expected_runtime" || "$runtime_version" != "$expected_version" ]]; then
+      sleep 2
+      continue
+    fi
+    if [[ "$lifecycle" == "RUNNING" ]]; then
+      echo "$lifecycle"
+      return 0
+    fi
+    if [[ "$lifecycle" == "STARTING" && -n "$pid" && "$pid" != "null" ]]; then
+      echo "$lifecycle"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "FAIL: node did not reach active lifecycle with expected runtime node='$NODE_NAME'" >&2
+  cat "$status_body" >&2 || true
+  return 1
+}
+
+create_base_package_fixture() {
+  mkdir -p "$base_pkg_dir/bin" "$base_pkg_dir/config"
+  cat >"$base_pkg_dir/package.json" <<EOF
+{
+  "name": "$BASE_RUNTIME_NAME",
+  "version": "0.0.1",
+  "type": "full_runtime",
+  "description": "PUB-T23 base runtime fixture",
+  "config_template": "config/default-config.json",
+  "entry_point": "bin/start.sh"
+}
+EOF
+  cat >"$base_pkg_dir/bin/start.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+export INVENTORY_HOLD_NODE_NAME="${INVENTORY_HOLD_NODE_NAME:-${NODE_NAME:-WF.publish.config}}"
+export INVENTORY_HOLD_NODE_VERSION="${INVENTORY_HOLD_NODE_VERSION:-0.0.1}"
+export INVENTORY_HOLD_SECS="${INVENTORY_HOLD_SECS:-0}"
+export NODE_STATUS_DEFAULT_HANDLER_ENABLED="1"
+export NODE_STATUS_DEFAULT_HEALTH_STATE="HEALTHY"
+exec "$(dirname "${BASH_SOURCE[0]}")/inventory_hold_diag"
+EOF
+  chmod 0755 "$base_pkg_dir/bin/start.sh"
+  cat >"$base_pkg_dir/config/default-config.json" <<'EOF'
+{
+  "diag": {
+    "kind": "base"
+  }
+}
+EOF
+  as_root_local install -m 0755 "$DIAG_BIN" "$base_pkg_dir/bin/inventory_hold_diag"
+}
+
+create_config_package_fixture() {
+  mkdir -p "$cfg_pkg_dir/config" "$cfg_pkg_dir/assets"
+  cat >"$cfg_pkg_dir/package.json" <<EOF
+{
+  "name": "$CONFIG_RUNTIME_NAME",
+  "version": "0.0.1",
+  "type": "config_only",
+  "description": "PUB-T23 config-only fixture",
+  "runtime_base": "$BASE_RUNTIME_NAME",
+  "config_template": "config/default-config.json"
+}
+EOF
+  cat >"$cfg_pkg_dir/config/default-config.json" <<'EOF'
+{
+  "diag": {
+    "kind": "config_only"
+  }
+}
+EOF
+  cat >"$cfg_pkg_dir/assets/prompts.txt" <<'EOF'
+hello from config-only fixture
+EOF
+}
+
+run_publish() {
+  local pkg_path="$1"
+  local version="$2"
+  local out_log="$3"
+  as_root_local env \
+    FLUXBEE_PUBLISH_BASE="$BASE" \
+    FLUXBEE_PUBLISH_MOTHER_HIVE_ID="$MOTHER_HIVE_ID" \
+    "$PUBLISH_BIN" "$pkg_path" --version "$version" --deploy "$HIVE_ID" \
+    | tee "$out_log"
+}
+
+extract_and_validate_deploy_summary() {
+  local out_log="$1"
+  local label="$2"
+  if ! grep -q "sync_hint_status=" "$out_log"; then
+    echo "FAIL[$label]: publish output missing deploy summary" >&2
+    cat "$out_log" >&2 || true
+    exit 1
+  fi
+  local deploy_line sync_hint_status update_status update_error_code
+  deploy_line="$(grep -E 'sync_hint_status=' "$out_log" | tail -n1)"
+  sync_hint_status="$(echo "$deploy_line" | sed -n 's/.*sync_hint_status=\([^ ]*\).*/\1/p')"
+  update_status="$(echo "$deploy_line" | sed -n 's/.*update_status=\([^ ]*\).*/\1/p')"
+  update_error_code="$(echo "$deploy_line" | sed -n 's/.*update_error_code=\(.*\)$/\1/p')"
+  if [[ "$DEPLOY_STRICT" == "1" ]]; then
+    if [[ "$sync_hint_status" == "error" ]]; then
+      echo "FAIL[$label]: strict deploy requires sync_hint_status != error" >&2
+      cat "$out_log" >&2 || true
+      exit 1
+    fi
+    if [[ "$update_status" == "error" ]]; then
+      echo "FAIL[$label]: strict deploy requires update_status != error (code='$update_error_code')" >&2
+      cat "$out_log" >&2 || true
+      exit 1
+    fi
+  fi
+  echo "$sync_hint_status|$update_status|$update_error_code"
+}
+
+require_cmd curl
+require_cmd jq
+require_cmd python3
+require_cmd cargo
+validate_tenant_id "$TENANT_ID"
+
+if [[ ! -f "$MANIFEST_PATH" ]]; then
+  echo "FAIL: runtime manifest missing at '$MANIFEST_PATH'" >&2
+  exit 1
+fi
+
+echo "PUB-T23 config_only E2E: BASE=$BASE HIVE_ID=$HIVE_ID MOTHER_HIVE_ID=$MOTHER_HIVE_ID BASE_RUNTIME=$BASE_RUNTIME_NAME@$BASE_RUNTIME_VERSION CONFIG_RUNTIME=$CONFIG_RUNTIME_NAME@$CONFIG_RUNTIME_VERSION NODE=$NODE_NAME"
+
+echo "Step 1/12: build binaries (fluxbee-publish + inventory_hold_diag)"
+(cd "$ROOT_DIR" && cargo build --release --bin fluxbee-publish --bin inventory_hold_diag >/dev/null)
+if [[ ! -x "$PUBLISH_BIN" ]]; then
+  echo "FAIL: publish binary missing at '$PUBLISH_BIN'" >&2
+  exit 1
+fi
+if [[ ! -x "$DIAG_BIN" ]]; then
+  echo "FAIL: inventory_hold_diag binary missing at '$DIAG_BIN'" >&2
+  exit 1
+fi
+
+echo "Step 2/12: backup manifest + create package fixtures (base + config_only)"
+as_root_local install -m 0644 "$MANIFEST_PATH" "$manifest_backup"
+create_base_package_fixture
+create_config_package_fixture
+
+echo "Step 3/12: publish base full_runtime with deploy"
+run_publish "$base_pkg_dir" "$BASE_RUNTIME_VERSION" "$publish_base_log"
+
+echo "Step 4/12: validate base deploy summary"
+base_deploy="$(extract_and_validate_deploy_summary "$publish_base_log" "base")"
+base_sync_hint_status="${base_deploy%%|*}"
+base_rest="${base_deploy#*|}"
+base_update_status="${base_rest%%|*}"
+base_update_error_code="${base_rest#*|}"
+
+echo "Step 5/12: wait base runtime readiness on target"
+wait_runtime_readiness_full "$BASE_RUNTIME_NAME" "$BASE_RUNTIME_VERSION"
+
+echo "Step 6/12: publish config_only runtime with deploy"
+run_publish "$cfg_pkg_dir" "$CONFIG_RUNTIME_VERSION" "$publish_cfg_log"
+
+echo "Step 7/12: validate config_only deploy summary"
+cfg_deploy="$(extract_and_validate_deploy_summary "$publish_cfg_log" "config")"
+cfg_sync_hint_status="${cfg_deploy%%|*}"
+cfg_rest="${cfg_deploy#*|}"
+cfg_update_status="${cfg_rest%%|*}"
+cfg_update_error_code="${cfg_rest#*|}"
+
+echo "Step 8/12: wait config_only readiness (including base_runtime_ready)"
+wait_runtime_readiness_config "$CONFIG_RUNTIME_NAME" "$CONFIG_RUNTIME_VERSION"
+
+echo "Step 9/12: spawn node with config_only runtime"
+spawn_http="$(spawn_node)"
+spawn_status="$(json_get_file "status" "$spawn_body")"
+if [[ "$spawn_http" != "200" || "$spawn_status" != "ok" ]]; then
+  echo "FAIL: spawn failed http=$spawn_http status=$spawn_status" >&2
+  cat "$spawn_body" >&2 || true
+  exit 1
+fi
+
+echo "Step 10/12: wait node lifecycle RUNNING (or STARTING active) and runtime resolution"
+lifecycle_observed="$(wait_node_active_with_runtime "$CONFIG_RUNTIME_NAME" "$CONFIG_RUNTIME_VERSION")"
+
+echo "Step 11/12: cleanup node"
+http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" "$kill_body" '{"force":true}' >/dev/null || true
+
+echo "Step 12/12: summary"
+echo "status=ok"
+echo "hive_id=$HIVE_ID"
+echo "base_runtime=$BASE_RUNTIME_NAME@$BASE_RUNTIME_VERSION"
+echo "config_runtime=$CONFIG_RUNTIME_NAME@$CONFIG_RUNTIME_VERSION"
+echo "node_name=$NODE_NAME@$HIVE_ID"
+echo "base_sync_hint_status=$base_sync_hint_status"
+echo "base_update_status=$base_update_status"
+echo "base_update_error_code=$base_update_error_code"
+echo "config_sync_hint_status=$cfg_sync_hint_status"
+echo "config_update_status=$cfg_update_status"
+echo "config_update_error_code=$cfg_update_error_code"
+echo "lifecycle_observed=$lifecycle_observed"
+echo "runtime packaging PUB-T23 config_only E2E passed."

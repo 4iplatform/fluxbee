@@ -18,6 +18,7 @@ MOTHER_HIVE_ID="${MOTHER_HIVE_ID:-motherbee}"
 TENANT_ID="${TENANT_ID:-}"
 WAIT_READY_SECS="${WAIT_READY_SECS:-120}"
 WAIT_STATUS_SECS="${WAIT_STATUS_SECS:-90}"
+DEPLOY_STRICT="${DEPLOY_STRICT:-1}"
 TEST_ID="${TEST_ID:-pubt22-$(date +%s)-$RANDOM}"
 RUNTIME_NAME="${RUNTIME_NAME:-wf.publish.full.diag.$(date +%s)}"
 RUNTIME_VERSION="${RUNTIME_VERSION:-1.0.0-$TEST_ID}"
@@ -277,6 +278,18 @@ deploy_line="$(grep -E 'sync_hint_status=' "$publish_log" | tail -n1)"
 sync_hint_status="$(echo "$deploy_line" | sed -n 's/.*sync_hint_status=\([^ ]*\).*/\1/p')"
 update_status="$(echo "$deploy_line" | sed -n 's/.*update_status=\([^ ]*\).*/\1/p')"
 update_error_code="$(echo "$deploy_line" | sed -n 's/.*update_error_code=\(.*\)$/\1/p')"
+if [[ "$DEPLOY_STRICT" == "1" ]]; then
+  if [[ "$sync_hint_status" == "error" ]]; then
+    echo "FAIL: strict deploy requires sync_hint_status != error (got '$sync_hint_status')" >&2
+    cat "$publish_log" >&2 || true
+    exit 1
+  fi
+  if [[ "$update_status" == "error" ]]; then
+    echo "FAIL: strict deploy requires update_status != error (got '$update_status' code='$update_error_code')" >&2
+    cat "$publish_log" >&2 || true
+    exit 1
+  fi
+fi
 
 echo "Step 5/9: wait readiness=true on target hive versions"
 wait_runtime_ready
