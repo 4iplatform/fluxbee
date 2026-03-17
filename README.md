@@ -107,67 +107,200 @@ curl -sS "$BASE/hives/$HIVE_ID"
 curl -sS -X DELETE "$BASE/hives/$HIVE_ID"
 ```
 
-### Publish and apply a runtime update on a worker (`dist` + `SYSTEM_UPDATE`)
+### Publish a custom node runtime on Fluxbee (recommended)
 
-```bash
-MOTHER_HIVE="motherbee"   # hive local de motherbee (nombre fijo)
-RUNTIME="wf.demo.task"
-VERSION="0.0.1"
+The normal operator flow is:
 
-# 0) publish runtime files in dist (motherbee source of truth)
-RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/$RUNTIME/$VERSION"
-sudo mkdir -p "$RUNTIME_DIR/bin"
-cat <<'EOF' | sudo tee "$RUNTIME_DIR/bin/start.sh" >/dev/null
-#!/usr/bin/env bash
-set -euo pipefail
-exec /bin/sleep 3600
-EOF
-sudo chmod +x "$RUNTIME_DIR/bin/start.sh"
+1. Build your node binary.
+2. Package it as a Fluxbee runtime.
+3. Publish it with `fluxbee-publish` on motherbee.
+4. Let `--deploy` propagate `dist` and trigger `SYSTEM_UPDATE` on the target hive.
+5. Spawn the node through `SY.admin`.
 
-# 1) update dist runtime manifest
-sudo env RUNTIME="$RUNTIME" VERSION="$VERSION" python3 - <<'PY'
-import json, os, datetime
-p="/var/lib/fluxbee/dist/runtimes/manifest.json"
-runtime=os.environ["RUNTIME"]; version=os.environ["VERSION"]
-try: doc=json.load(open(p,"r",encoding="utf-8"))
-except FileNotFoundError:
-    doc={"schema_version":1,"version":0,"updated_at":None,"runtimes":{}}
-doc["schema_version"]=1
-doc["version"]=int(datetime.datetime.now(datetime.timezone.utc).timestamp()*1000)
-doc["updated_at"]=datetime.datetime.now(datetime.timezone.utc).isoformat()
-doc.setdefault("runtimes",{})
-entry=doc["runtimes"].setdefault(runtime, {"available":[], "current":version})
-entry.setdefault("available",[])
-if version not in entry["available"]:
-    entry["available"].append(version)
-entry["current"]=version
-tmp=p+".tmp"
-json.dump(doc, open(tmp,"w",encoding="utf-8"), indent=2, sort_keys=True); open(tmp,"a").write("\n")
-os.replace(tmp,p)
-PY
+This is the path validated by the runtime packaging E2E suite (`PUB-T22` through `PUB-T26`).
 
-# 2) get current manifest version/hash from motherbee
-read MANIFEST_VERSION MANIFEST_HASH < <(
-  curl -sS "$BASE/hives/$MOTHER_HIVE/versions" | python3 - <<'PY'
-import json,sys
-d=json.load(sys.stdin)
-r=d["payload"]["hive"]["runtimes"]
-print(int(r.get("manifest_version",0)), r["manifest_hash"])
-PY
-)
+#### Package types
 
-# 3) ask target hive to converge dist channel before update
-curl -sS -X POST "$BASE/hives/$HIVE_ID/sync-hint" \
-  -H "Content-Type: application/json" \
-  -d '{"channel":"dist","folder_id":"fluxbee-dist","wait_for_idle":true,"timeout_ms":30000}'; echo
+- `full_runtime`: your package ships its own `bin/start.sh` and binaries. This is the normal choice for a custom node.
+- `config_only`: your package ships config/assets and uses the `bin/start.sh` of an existing base runtime.
+- `workflow`: your package ships flow definitions/assets and uses the `bin/start.sh` of an existing workflow engine runtime.
 
-# 4) send strict update payload to target hive
-curl -sS -X POST "$BASE/hives/$HIVE_ID/update" \
-  -H "Content-Type: application/json" \
-  -d "{\"category\":\"runtime\",\"manifest_version\":$MANIFEST_VERSION,\"manifest_hash\":\"$MANIFEST_HASH\"}"; echo
+If you are publishing a brand new custom node, start with `full_runtime`.
+
+#### Minimal `full_runtime` package
+
+```text
+my-node/
+├── package.json
+├── bin/
+│   ├── start.sh
+│   └── ai-my-node
+└── config/
+    └── default-config.json
 ```
 
-For a complete operational rollout (publish -> sync-hint -> update -> run node), see:
+`package.json`:
+
+```json
+{
+  "name": "ai.my.node",
+  "version": "1.0.0",
+  "type": "full_runtime",
+  "description": "Custom Fluxbee node",
+  "config_template": "config/default-config.json",
+  "entry_point": "bin/start.sh"
+}
+```
+
+`bin/start.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$(dirname "${BASH_SOURCE[0]}")/ai-my-node"
+```
+
+#### End-to-end example (`full_runtime`)
+
+```bash
+MOTHER_HIVE="motherbee"
+TARGET_HIVE="worker-220"
+RUNTIME_NAME="ai.my.node"
+RUNTIME_VERSION="1.0.0"
+PKG_DIR="$PWD/package"
+
+# 1) build your node binary
+cargo build --release --bin ai-my-node
+
+# 2) assemble package
+mkdir -p "$PKG_DIR/bin" "$PKG_DIR/config"
+cp target/release/ai-my-node "$PKG_DIR/bin/ai-my-node"
+chmod 0755 "$PKG_DIR/bin/ai-my-node"
+cat >"$PKG_DIR/bin/start.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$(dirname "${BASH_SOURCE[0]}")/ai-my-node"
+EOF
+chmod 0755 "$PKG_DIR/bin/start.sh"
+cat >"$PKG_DIR/package.json" <<EOF
+{
+  "name": "$RUNTIME_NAME",
+  "version": "$RUNTIME_VERSION",
+  "type": "full_runtime",
+  "description": "Custom Fluxbee node",
+  "config_template": "config/default-config.json",
+  "entry_point": "bin/start.sh"
+}
+EOF
+cat >"$PKG_DIR/config/default-config.json" <<'EOF'
+{
+  "model": "gpt-5",
+  "temperature": 0.2
+}
+EOF
+
+# 3) publish on motherbee and deploy to target hive
+FLUXBEE_PUBLISH_BASE="$BASE" \
+FLUXBEE_PUBLISH_MOTHER_HIVE_ID="$MOTHER_HIVE" \
+target/release/fluxbee-publish "$PKG_DIR" \
+  --version "$RUNTIME_VERSION" \
+  --deploy "$TARGET_HIVE"
+```
+
+`fluxbee-publish` does the following:
+
+- validates the package layout
+- installs it under `/var/lib/fluxbee/dist/runtimes/<name>/<version>`
+- updates `/var/lib/fluxbee/dist/runtimes/manifest.json`
+- when `--deploy` is present, sends `sync-hint + update` to the target hive
+
+Important:
+
+- `update_status=sync_pending` is not a failure by itself
+- the correct post-publish check is runtime readiness in `/hives/<hive>/versions`
+
+#### Check readiness on the target hive
+
+```bash
+curl -sS "$BASE/hives/$TARGET_HIVE/versions" | jq .
+```
+
+Expected for `full_runtime`:
+
+- `runtime_present = true`
+- `start_sh_executable = true`
+
+Expected for `config_only` / `workflow`:
+
+- `runtime_present = true`
+- `start_sh_executable = true`
+- `base_runtime_ready = true`
+
+#### Spawn the node
+
+```bash
+TENANT_ID="tnt:12345678-1234-1234-1234-123456789abc"
+NODE_NAME="AI.my.node.1"
+
+curl -sS -X POST "$BASE/hives/$TARGET_HIVE/nodes" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"node_name\":\"$NODE_NAME\",
+    \"runtime\":\"$RUNTIME_NAME\",
+    \"runtime_version\":\"current\",
+    \"tenant_id\":\"$TENANT_ID\",
+    \"config\":{
+      \"model\":\"gpt-5\",
+      \"temperature\":0.7
+    }
+  }"
+```
+
+At spawn time, the orchestrator builds the final config as:
+
+1. package template defaults
+2. request `config` overrides
+3. forced `_system` block
+
+For `config_only` and `workflow`, `_system` also includes:
+
+- `runtime_base`
+- `package_path`
+
+This lets the node load assets directly from the published package in `dist`.
+
+#### Verify status and effective config
+
+```bash
+curl -sS "$BASE/hives/$TARGET_HIVE/nodes/$NODE_NAME/status" | jq .
+curl -sS "$BASE/hives/$TARGET_HIVE/nodes/$NODE_NAME/config" | jq .
+```
+
+Useful checks:
+
+- `payload.node_status.lifecycle_state`
+- `payload.node_status.runtime.name`
+- `payload.node_status.runtime.resolved_version`
+- `payload.config._system.runtime`
+- `payload.config._system.runtime_version`
+- `payload.config._system.runtime_base` for `config_only` / `workflow`
+- `payload.config._system.package_path` for `config_only` / `workflow`
+
+#### When to use `config_only` or `workflow`
+
+- Use `config_only` when you already have a reusable base runtime and only want to ship config, prompts, or assets.
+- Use `workflow` when the package is a flow definition that runs on top of a workflow engine runtime.
+
+In both cases the package must declare `runtime_base` in `package.json`, and the base runtime must already be published and ready on the target hive.
+
+For the full packaging contract and examples of all three package types, see:
+- [`docs/onworking/runtime-packaging-cli-spec.md`](docs/onworking/runtime-packaging-cli-spec.md)
+
+#### Low-level fallback: manual `dist` / manifest editing
+
+Manual editing of `/var/lib/fluxbee/dist/runtimes` and `manifest.json` is still possible for debugging, but it is no longer the recommended operator path. Prefer `fluxbee-publish` unless you are diagnosing a broken rollout or reproducing a low-level runtime lifecycle issue.
+
+For a low-level operational rollout (manual `dist` + `sync-hint` + `update` + run node), see:
 - `docs/14-runtime-rollout-motherbee.md`
 - `scripts/orchestrator_system_update_api_e2e.sh`
 

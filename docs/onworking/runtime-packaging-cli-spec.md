@@ -891,25 +891,22 @@ fluxbee-publish ./package --deploy worker-220
 
 - [x] PUB-T22. E2E `full_runtime`: publish -> deploy -> spawn -> running.
   - Script: `scripts/runtime_packaging_pub_t22_e2e.sh`
-- [ ] PUB-T23. E2E `config_only`: publish base fixture -> publish config_only -> deploy -> spawn using base runtime.
+- [x] PUB-T23. E2E `config_only`: publish base fixture -> publish config_only -> deploy -> spawn using base runtime.
   - Script: `scripts/runtime_packaging_pub_t23_e2e.sh`
-  - Must also assert `GET /nodes/{node}/config` includes `_system.runtime_base` and `_system.package_path`.
-- [ ] PUB-T24. E2E `workflow`: rewrite from scratch as self-contained flow.
-  - New goal: publish engine fixture -> publish workflow package -> deploy -> spawn using workflow base runtime.
-  - Script target: `scripts/runtime_packaging_pub_t24_e2e.sh`
-  - Must not depend on pre-existing `wf.engine` on the target hive.
-- [ ] PUB-T25. E2E negative matrix:
+- [x] PUB-T24. E2E `workflow`: publish engine fixture -> publish workflow package -> deploy -> spawn using workflow base runtime.
+  - Script: `scripts/runtime_packaging_pub_t24_e2e.sh`
+  - Self-contained; does not depend on pre-existing `wf.engine` on the target hive.
+- [x] PUB-T25. E2E negative matrix:
   - missing `runtime_base`
   - unknown `runtime_base`
   - base runtime without executable `start.sh`
-  - Prefer one script covering all three cases.
-  - Script target: `scripts/runtime_packaging_pub_t25_e2e.sh`
-- [ ] PUB-T26. E2E template layering:
+  - Script: `scripts/runtime_packaging_pub_t25_e2e.sh`
+- [x] PUB-T26. E2E template layering:
   - template defaults applied
   - request overrides take precedence
   - `_system` fields forced by orchestrator
-  - Prefer validating this on `config_only`, where the merge contract matters most.
-  - Script target: `scripts/runtime_packaging_pub_t26_e2e.sh`
+  - Validated on `config_only`.
+  - Script: `scripts/runtime_packaging_pub_t26_e2e.sh`
 
 ### Phase 6 — Rollout and Documentation
 
