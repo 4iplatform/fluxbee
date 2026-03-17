@@ -163,7 +163,12 @@ El contenido del mensaje. Ni el router ni OPA lo leen. Solo el nodo destino lo p
 }
 ```
 
-La estructura interna es libre y la definen los nodos.
+La estructura interna la definen los nodos. Para flujo conversacional, el contrato vigente es
+`text/v1` (`type: "text"`) con:
+- `content` inline + `attachments[]` (cuando entra en tamaño de frame), o
+- `content_ref` + `attachments[]` (cuando el texto se offloadea a blob).
+
+Regla del contrato `text/v1`: `content` y `content_ref` son mutuamente excluyentes.
 
 ---
 
@@ -376,7 +381,9 @@ pub struct CtxTurn {
 
 - `length`: uint32 en big-endian, indica el tamaño del JSON en bytes
 - `length` NO incluye los 4 bytes del header
-- Máximo tamaño de mensaje: 64KB para inline, blob_ref para mayores
+- Máximo tamaño de frame JSON: 64KB.
+  Para contenidos grandes, mantener `payload.type="text"` y offloadear el texto a `content_ref`
+  (blob), dejando anexos en `attachments[]`.
 
 ### 6.2 Pseudocódigo Rust
 
@@ -1622,7 +1629,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 ```
-```
 
 ---
 
@@ -1636,7 +1642,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   "meta": { ... },
   "payload": {
     "type": "text",
-    "content": "Mensaje normal"
+    "content": "Mensaje normal",
+    "attachments": []
   }
 }
 ```
@@ -1648,14 +1655,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   "routing": { ... },
   "meta": { ... },
   "payload": {
-    "type": "blob_ref",
-    "blob_id": "sha256:a1b2c3d4...",
-    "size": 5242880,
-    "mime": "image/png",
-    "spool_day": "2025-01-15"
+    "type": "text",
+    "content_ref": {
+      "type": "blob_ref",
+      "blob_name": "contenido_largo_a1b2c3d4e5f6a7b8.txt",
+      "size": 150000,
+      "mime": "text/plain",
+      "filename_original": "content.txt",
+      "spool_day": "2026-03-16"
+    },
+    "attachments": []
   }
 }
 ```
+
+Nota: para anexos, se agregan `BlobRef` en `attachments[]` bajo el mismo contrato `text/v1`.
 
 ---
 

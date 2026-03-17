@@ -564,7 +564,10 @@ async fn run_internal_admin_loop(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(skipped = skipped, "internal admin loop lagged; dropping stale commands");
+                tracing::warn!(
+                    skipped = skipped,
+                    "internal admin loop lagged; dropping stale commands"
+                );
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
@@ -637,7 +640,11 @@ async fn handle_internal_admin_command(
         .envelope
         .get("status")
         .and_then(|v| v.as_str())
-        .unwrap_or(if internal.http_status < 400 { "ok" } else { "error" });
+        .unwrap_or(if internal.http_status < 400 {
+            "ok"
+        } else {
+            "error"
+        });
     let action_out = internal
         .envelope
         .get("action")
@@ -744,43 +751,228 @@ struct InternalActionSpec {
 const INTERNAL_ACTION_REGISTRY_VERSION: &str = "1";
 
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
-    InternalActionSpec { action: "hive_status", route: InternalActionRoute::Query("hive_status"), requires_target: false, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "list_hives", route: InternalActionRoute::Query("list_hives"), requires_target: false, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "list_admin_actions", route: InternalActionRoute::Query("list_admin_actions"), requires_target: false, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "list_versions", route: InternalActionRoute::Query("list_versions"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "get_versions", route: InternalActionRoute::Query("get_versions"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "list_routes", route: InternalActionRoute::Query("list_routes"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "list_vpns", route: InternalActionRoute::Query("list_vpns"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "list_nodes", route: InternalActionRoute::Query("list_nodes"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "get_storage", route: InternalActionRoute::Query("get_storage"), requires_target: false, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "add_hive", route: InternalActionRoute::Command("add_hive"), requires_target: false, allow_legacy_hive_id: true },
-    InternalActionSpec { action: "get_hive", route: InternalActionRoute::Command("get_hive"), requires_target: false, allow_legacy_hive_id: true },
-    InternalActionSpec { action: "remove_hive", route: InternalActionRoute::Command("remove_hive"), requires_target: false, allow_legacy_hive_id: true },
-    InternalActionSpec { action: "add_route", route: InternalActionRoute::Command("add_route"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "delete_route", route: InternalActionRoute::Command("delete_route"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "add_vpn", route: InternalActionRoute::Command("add_vpn"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "delete_vpn", route: InternalActionRoute::Command("delete_vpn"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "run_node", route: InternalActionRoute::Command("run_node"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "kill_node", route: InternalActionRoute::Command("kill_node"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "get_node_config", route: InternalActionRoute::Command("get_node_config"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "set_node_config", route: InternalActionRoute::Command("set_node_config"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "get_node_state", route: InternalActionRoute::Command("get_node_state"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "get_node_status", route: InternalActionRoute::Command("get_node_status"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "list_deployments", route: InternalActionRoute::Command("list_deployments"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "get_deployments", route: InternalActionRoute::Command("get_deployments"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "list_drift_alerts", route: InternalActionRoute::Command("list_drift_alerts"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "get_drift_alerts", route: InternalActionRoute::Command("get_drift_alerts"), requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "set_storage", route: InternalActionRoute::Command("set_storage"), requires_target: false, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "update", route: InternalActionRoute::Update, requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "sync_hint", route: InternalActionRoute::SyncHint, requires_target: true, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "inventory", route: InternalActionRoute::Inventory, requires_target: false, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "opa_compile_apply", route: InternalActionRoute::OpaHttp(OpaAction::CompileApply), requires_target: false, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "opa_compile", route: InternalActionRoute::OpaHttp(OpaAction::Compile), requires_target: false, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "opa_apply", route: InternalActionRoute::OpaHttp(OpaAction::Apply), requires_target: false, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "opa_rollback", route: InternalActionRoute::OpaHttp(OpaAction::Rollback), requires_target: false, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "opa_check", route: InternalActionRoute::OpaHttp(OpaAction::Check), requires_target: false, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "opa_get_policy", route: InternalActionRoute::OpaQuery("get_policy"), requires_target: false, allow_legacy_hive_id: false },
-    InternalActionSpec { action: "opa_get_status", route: InternalActionRoute::OpaQuery("get_status"), requires_target: false, allow_legacy_hive_id: false },
+    InternalActionSpec {
+        action: "hive_status",
+        route: InternalActionRoute::Query("hive_status"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "list_hives",
+        route: InternalActionRoute::Query("list_hives"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "list_admin_actions",
+        route: InternalActionRoute::Query("list_admin_actions"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "list_versions",
+        route: InternalActionRoute::Query("list_versions"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "get_versions",
+        route: InternalActionRoute::Query("get_versions"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "list_routes",
+        route: InternalActionRoute::Query("list_routes"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "list_vpns",
+        route: InternalActionRoute::Query("list_vpns"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "list_nodes",
+        route: InternalActionRoute::Query("list_nodes"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "get_storage",
+        route: InternalActionRoute::Query("get_storage"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "add_hive",
+        route: InternalActionRoute::Command("add_hive"),
+        requires_target: false,
+        allow_legacy_hive_id: true,
+    },
+    InternalActionSpec {
+        action: "get_hive",
+        route: InternalActionRoute::Command("get_hive"),
+        requires_target: false,
+        allow_legacy_hive_id: true,
+    },
+    InternalActionSpec {
+        action: "remove_hive",
+        route: InternalActionRoute::Command("remove_hive"),
+        requires_target: false,
+        allow_legacy_hive_id: true,
+    },
+    InternalActionSpec {
+        action: "add_route",
+        route: InternalActionRoute::Command("add_route"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "delete_route",
+        route: InternalActionRoute::Command("delete_route"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "add_vpn",
+        route: InternalActionRoute::Command("add_vpn"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "delete_vpn",
+        route: InternalActionRoute::Command("delete_vpn"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "run_node",
+        route: InternalActionRoute::Command("run_node"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "kill_node",
+        route: InternalActionRoute::Command("kill_node"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "get_node_config",
+        route: InternalActionRoute::Command("get_node_config"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "set_node_config",
+        route: InternalActionRoute::Command("set_node_config"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "get_node_state",
+        route: InternalActionRoute::Command("get_node_state"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "get_node_status",
+        route: InternalActionRoute::Command("get_node_status"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "list_deployments",
+        route: InternalActionRoute::Command("list_deployments"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "get_deployments",
+        route: InternalActionRoute::Command("get_deployments"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "list_drift_alerts",
+        route: InternalActionRoute::Command("list_drift_alerts"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "get_drift_alerts",
+        route: InternalActionRoute::Command("get_drift_alerts"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "set_storage",
+        route: InternalActionRoute::Command("set_storage"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "update",
+        route: InternalActionRoute::Update,
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "sync_hint",
+        route: InternalActionRoute::SyncHint,
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "inventory",
+        route: InternalActionRoute::Inventory,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "opa_compile_apply",
+        route: InternalActionRoute::OpaHttp(OpaAction::CompileApply),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "opa_compile",
+        route: InternalActionRoute::OpaHttp(OpaAction::Compile),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "opa_apply",
+        route: InternalActionRoute::OpaHttp(OpaAction::Apply),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "opa_rollback",
+        route: InternalActionRoute::OpaHttp(OpaAction::Rollback),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "opa_check",
+        route: InternalActionRoute::OpaHttp(OpaAction::Check),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "opa_get_policy",
+        route: InternalActionRoute::OpaQuery("get_policy"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "opa_get_status",
+        route: InternalActionRoute::OpaQuery("get_status"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
 ];
 
 async fn dispatch_internal_admin_command(
@@ -2973,17 +3165,17 @@ fn build_admin_request(
     hive: Option<String>,
 ) -> AdminRequest {
     let requested_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
-    let base = match action {
-        "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn" | "delete_vpn" => {
-            "SY.config.routes"
-        }
-        "list_nodes" | "run_node" | "kill_node" | "hive_status" | "get_storage" | "set_storage"
-        | "list_hives" | "get_hive" | "list_versions" | "get_versions" | "list_deployments"
-        | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "get_node_config"
-        | "set_node_config" | "get_node_state" | "get_node_status" | "remove_hive"
-        | "add_hive" => "SY.orchestrator",
-        _ => "SY.config.routes",
-    };
+    let base =
+        match action {
+            "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn"
+            | "delete_vpn" => "SY.config.routes",
+            "list_nodes" | "run_node" | "kill_node" | "hive_status" | "get_storage"
+            | "set_storage" | "list_hives" | "get_hive" | "list_versions" | "get_versions"
+            | "list_deployments" | "get_deployments" | "list_drift_alerts" | "get_drift_alerts"
+            | "get_node_config" | "set_node_config" | "get_node_state" | "get_node_status"
+            | "remove_hive" | "add_hive" => "SY.orchestrator",
+            _ => "SY.config.routes",
+        };
     let route_hive = if action_routes_via_local_orchestrator(action) {
         ctx.hive_id.clone()
     } else {
@@ -3277,7 +3469,10 @@ fn normalize_admin_payload(
     payload
 }
 
-fn node_name_hive_from_payload<'a>(action: &str, payload: &'a serde_json::Value) -> Option<&'a str> {
+fn node_name_hive_from_payload<'a>(
+    action: &str,
+    payload: &'a serde_json::Value,
+) -> Option<&'a str> {
     if !is_node_scoped_action(action) {
         return None;
     }

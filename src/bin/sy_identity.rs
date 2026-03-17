@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time;
-use tokio_postgres::{error::SqlState, NoTls};
+use tokio_postgres::{error::SqlState, Config as PgConfig, NoTls};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -32,6 +32,7 @@ const DEFAULT_DEFAULT_TENANT_NAME: &str = "fluxbee";
 const DEFAULT_MERGE_ALIAS_TTL_SECS: u64 = 3600;
 const ALIAS_GC_INTERVAL_SECS: u64 = 30;
 const DEFAULT_IDENTITY_SYNC_PORT: u16 = 9100;
+const IDENTITY_DB_NAME: &str = "fluxbee_identity";
 const IDENTITY_FULL_SYNC_CHUNK_ITEMS: usize = 256;
 const IDENTITY_SYNC_VERSION: u32 = 1;
 const SYNC_OP_FULL_SYNC_REQUEST: &str = "IDENTITY_FULL_SYNC_REQUEST";
@@ -797,7 +798,7 @@ struct IdentityRuntime {
     state_dir: PathBuf,
     gateway_name: String,
     is_primary: bool,
-    db_url: Option<String>,
+    db_config: Option<PgConfig>,
     merge_alias_ttl_secs: u64,
     store: IdentityStore,
     // action -> allowed prefixes by node name
@@ -808,7 +809,12 @@ struct IdentityRuntime {
 }
 
 impl IdentityRuntime {
-    fn new(hive: &HiveFile, state_dir: PathBuf, is_primary: bool, db_url: Option<String>) -> Self {
+    fn new(
+        hive: &HiveFile,
+        state_dir: PathBuf,
+        is_primary: bool,
+        db_config: Option<PgConfig>,
+    ) -> Self {
         let mut allowed_prefixes: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
         allowed_prefixes.insert(MSG_ILK_PROVISION, vec!["IO."]);
         allowed_prefixes.insert(MSG_ILK_REGISTER, vec!["AI.frontdesk@", "SY.orchestrator@"]);
@@ -847,7 +853,7 @@ impl IdentityRuntime {
             state_dir,
             gateway_name,
             is_primary,
-            db_url,
+            db_config,
             merge_alias_ttl_secs,
             store: IdentityStore::with_default_tenant(default_tenant),
             allowed_prefixes,
@@ -894,7 +900,7 @@ impl IdentityRuntime {
             MSG_ILK_PROVISION => {
                 match serde_json::from_value::<IlkProvisionRequest>(msg.payload.clone()) {
                     Ok(req) => {
-                        let snapshot = if self.is_primary && self.db_url.is_some() {
+                        let snapshot = if self.is_primary && self.db_config.is_some() {
                             Some(self.store.clone())
                         } else {
                             None
@@ -904,9 +910,9 @@ impl IdentityRuntime {
                                 if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
                                     if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
                                         if self.is_primary {
-                                            if let Some(database_url) = self.db_url.as_deref() {
+                                            if let Some(database_config) = self.db_config.as_ref() {
                                                 if let Err(err) = persist_ilk_state_in_db(
-                                                    database_url,
+                                                    database_config,
                                                     &ilk,
                                                     None,
                                                 )
@@ -953,7 +959,7 @@ impl IdentityRuntime {
             MSG_ILK_REGISTER => {
                 match serde_json::from_value::<IlkRegisterRequest>(msg.payload.clone()) {
                     Ok(req) => {
-                        let snapshot = if self.is_primary && self.db_url.is_some() {
+                        let snapshot = if self.is_primary && self.db_config.is_some() {
                             Some(self.store.clone())
                         } else {
                             None
@@ -963,9 +969,9 @@ impl IdentityRuntime {
                                 if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
                                     if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
                                         if self.is_primary {
-                                            if let Some(database_url) = self.db_url.as_deref() {
+                                            if let Some(database_config) = self.db_config.as_ref() {
                                                 if let Err(err) = persist_ilk_state_in_db(
-                                                    database_url,
+                                                    database_config,
                                                     &ilk,
                                                     None,
                                                 )
@@ -1012,7 +1018,7 @@ impl IdentityRuntime {
             MSG_ILK_ADD_CHANNEL => {
                 match serde_json::from_value::<IlkAddChannelRequest>(msg.payload.clone()) {
                     Ok(req) => {
-                        let snapshot = if self.is_primary && self.db_url.is_some() {
+                        let snapshot = if self.is_primary && self.db_config.is_some() {
                             Some(self.store.clone())
                         } else {
                             None
@@ -1035,9 +1041,9 @@ impl IdentityRuntime {
                                 if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
                                     if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
                                         if self.is_primary {
-                                            if let Some(database_url) = self.db_url.as_deref() {
+                                            if let Some(database_config) = self.db_config.as_ref() {
                                                 if let Err(err) = persist_ilk_state_in_db(
-                                                    database_url,
+                                                    database_config,
                                                     &ilk,
                                                     alias_delta.as_ref(),
                                                 )
@@ -1099,7 +1105,7 @@ impl IdentityRuntime {
             MSG_ILK_UPDATE => match serde_json::from_value::<IlkUpdateRequest>(msg.payload.clone())
             {
                 Ok(req) => {
-                    let snapshot = if self.is_primary && self.db_url.is_some() {
+                    let snapshot = if self.is_primary && self.db_config.is_some() {
                         Some(self.store.clone())
                     } else {
                         None
@@ -1109,9 +1115,9 @@ impl IdentityRuntime {
                             if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
                                 if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
                                     if self.is_primary {
-                                        if let Some(database_url) = self.db_url.as_deref() {
+                                        if let Some(database_config) = self.db_config.as_ref() {
                                             if let Err(err) =
-                                                persist_ilk_state_in_db(database_url, &ilk, None)
+                                                persist_ilk_state_in_db(database_config, &ilk, None)
                                                     .await
                                             {
                                                 if let Some(snapshot) = snapshot {
@@ -1161,9 +1167,9 @@ impl IdentityRuntime {
                         {
                             if let Some(tenant) = self.store.tenants.get(&tenant_id).cloned() {
                                 if self.is_primary {
-                                    if let Some(database_url) = self.db_url.as_deref() {
+                                    if let Some(database_config) = self.db_config.as_ref() {
                                         if let Err(err) =
-                                            upsert_tenant_in_db(database_url, &tenant).await
+                                            upsert_tenant_in_db(database_config, &tenant).await
                                         {
                                             self.store.tenants.remove(&tenant_id);
                                             db_write_error_payload(
@@ -1202,7 +1208,7 @@ impl IdentityRuntime {
             MSG_TNT_APPROVE => {
                 match serde_json::from_value::<TntApproveRequest>(msg.payload.clone()) {
                     Ok(req) => {
-                        let snapshot = if self.is_primary && self.db_url.is_some() {
+                        let snapshot = if self.is_primary && self.db_config.is_some() {
                             Some(self.store.clone())
                         } else {
                             None
@@ -1214,9 +1220,10 @@ impl IdentityRuntime {
                                     if let Some(tenant) = self.store.tenants.get(tenant_id).cloned()
                                     {
                                         if self.is_primary {
-                                            if let Some(database_url) = self.db_url.as_deref() {
+                                            if let Some(database_config) = self.db_config.as_ref() {
                                                 if let Err(err) =
-                                                    upsert_tenant_in_db(database_url, &tenant).await
+                                                    upsert_tenant_in_db(database_config, &tenant)
+                                                        .await
                                                 {
                                                     if let Some(snapshot) = snapshot {
                                                         self.store = snapshot;
@@ -1292,8 +1299,8 @@ impl IdentityRuntime {
         }
 
         if self.is_primary {
-            if let Some(db_url) = self.db_url.as_deref() {
-                let removed_db = gc_aliases_in_db(db_url).await?;
+            if let Some(database_config) = self.db_config.as_ref() {
+                let removed_db = gc_aliases_in_db(database_config).await?;
                 if removed_db > 0 {
                     tracing::info!(
                         removed = removed_db,
@@ -1434,14 +1441,19 @@ async fn main() -> Result<(), IdentityError> {
         )
         .into());
     }
-    if is_primary {
-        ensure_primary_schema(&hive).await?;
+    let db_config = if is_primary {
+        let base = database_config(&hive)?;
+        ensure_database_exists(&base, IDENTITY_DB_NAME).await?;
+        let cfg = with_dbname(&base, IDENTITY_DB_NAME);
+        ensure_primary_schema(&cfg).await?;
+        Some(cfg)
     } else {
         tracing::info!(
             role = %hive.role.clone().unwrap_or_else(|| "unknown".to_string()),
             "sy.identity running without local DB (replica/non-primary mode)"
         );
-    }
+        None
+    };
     let node_config = NodeConfig {
         name: "SY.identity".to_string(),
         router_socket: socket_dir,
@@ -1450,22 +1462,17 @@ async fn main() -> Result<(), IdentityError> {
         version: "2.0".to_string(),
     };
 
-    let db_url = if is_primary {
-        Some(database_url(&hive)?)
-    } else {
-        None
-    };
-    let mut runtime = IdentityRuntime::new(&hive, state_dir.clone(), is_primary, db_url);
+    let mut runtime = IdentityRuntime::new(&hive, state_dir.clone(), is_primary, db_config);
     if is_primary {
-        if let Some(database_url) = runtime.db_url.clone() {
-            match load_identity_store_from_db(&database_url).await {
+        if let Some(database_config) = runtime.db_config.clone() {
+            match load_identity_store_from_db(&database_config).await {
                 Ok(store) if store.tenants.is_empty() => {
                     if let Some(default_tenant_id) = runtime.store.default_tenant_id() {
                         if let Some(default_tenant) =
                             runtime.store.tenants.get(&default_tenant_id).cloned()
                         {
                             if let Err(err) =
-                                upsert_tenant_in_db(&database_url, &default_tenant).await
+                                upsert_tenant_in_db(&database_config, &default_tenant).await
                             {
                                 tracing::warn!(error = %err, "failed to persist default tenant in primary db bootstrap");
                             } else {
@@ -2582,9 +2589,8 @@ fn apply_tag_delta(current: &mut Vec<String>, add: &[String], remove: &[String])
     *current = out;
 }
 
-async fn ensure_primary_schema(hive: &HiveFile) -> Result<(), IdentityError> {
-    let url = database_url(hive)?;
-    let (client, connection) = tokio_postgres::connect(&url, NoTls).await?;
+async fn ensure_primary_schema(database_config: &PgConfig) -> Result<(), IdentityError> {
+    let (client, connection) = database_config.connect(NoTls).await?;
     tokio::spawn(async move {
         if let Err(err) = connection.await {
             tracing::error!(error = %err, "identity postgres connection closed");
@@ -2683,8 +2689,8 @@ CREATE TABLE IF NOT EXISTS identity_vocabulary (
     Ok(())
 }
 
-async fn gc_aliases_in_db(database_url: &str) -> Result<u64, IdentityError> {
-    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+async fn gc_aliases_in_db(database_config: &PgConfig) -> Result<u64, IdentityError> {
+    let (client, connection) = database_config.connect(NoTls).await?;
     tokio::spawn(async move {
         if let Err(err) = connection.await {
             tracing::warn!(error = %err, "identity alias gc postgres connection closed");
@@ -2790,7 +2796,7 @@ fn definition_json_from_ilk(ilk: &IlkRecord) -> Value {
 }
 
 async fn persist_ilk_state_in_db(
-    database_url: &str,
+    database_config: &PgConfig,
     ilk: &IlkRecord,
     alias: Option<&AliasSnapshotRecord>,
 ) -> Result<(), IdentityError> {
@@ -2805,7 +2811,7 @@ async fn persist_ilk_state_in_db(
         .and_then(|value| i64::try_from(value).ok());
     let registered_by: Option<String> = None;
 
-    let (mut client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let (mut client, connection) = database_config.connect(NoTls).await?;
     tokio::spawn(async move {
         if let Err(err) = connection.await {
             tracing::warn!(error = %err, "identity ilk persist postgres connection closed");
@@ -2936,8 +2942,10 @@ SET
     Ok(())
 }
 
-async fn load_identity_store_from_db(database_url: &str) -> Result<IdentityStore, IdentityError> {
-    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+async fn load_identity_store_from_db(
+    database_config: &PgConfig,
+) -> Result<IdentityStore, IdentityError> {
+    let (client, connection) = database_config.connect(NoTls).await?;
     tokio::spawn(async move {
         if let Err(err) = connection.await {
             tracing::warn!(error = %err, "identity tenant load postgres connection closed");
@@ -3088,12 +3096,12 @@ FROM identity_ilk_aliases
 }
 
 async fn upsert_tenant_in_db(
-    database_url: &str,
+    database_config: &PgConfig,
     tenant: &TenantRecord,
 ) -> Result<(), IdentityError> {
     let tenant_uuid = parse_prefixed_uuid(&tenant.tenant_id, "tnt")?;
     let tenant_uuid = tenant_uuid.to_string();
-    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let (client, connection) = database_config.connect(NoTls).await?;
     tokio::spawn(async move {
         if let Err(err) = connection.await {
             tracing::warn!(error = %err, "identity tenant upsert postgres connection closed");
@@ -3125,7 +3133,7 @@ SET
     Ok(())
 }
 
-fn database_url(hive: &HiveFile) -> Result<String, IdentityError> {
+fn base_database_url(hive: &HiveFile) -> Result<String, IdentityError> {
     if let Ok(url) = std::env::var("FLUXBEE_DATABASE_URL") {
         if !url.trim().is_empty() {
             return Ok(url);
@@ -3146,6 +3154,48 @@ fn database_url(hive: &HiveFile) -> Result<String, IdentityError> {
         return Err("database.url empty".into());
     }
     Ok(url.clone())
+}
+
+fn database_config(hive: &HiveFile) -> Result<PgConfig, IdentityError> {
+    let url = base_database_url(hive)?;
+    Ok(url.parse::<PgConfig>()?)
+}
+
+fn with_dbname(base: &PgConfig, dbname: &str) -> PgConfig {
+    let mut cfg = base.clone();
+    cfg.dbname(dbname);
+    cfg
+}
+
+fn admin_db_config(base: &PgConfig) -> PgConfig {
+    with_dbname(base, "postgres")
+}
+
+async fn ensure_database_exists(base: &PgConfig, dbname: &str) -> Result<(), IdentityError> {
+    let admin_cfg = admin_db_config(base);
+    let (client, connection) = admin_cfg.connect(NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "identity postgres admin connection closed");
+        }
+    });
+    let exists = client
+        .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&dbname])
+        .await?
+        .is_some();
+    if !exists {
+        let create_sql = format!("CREATE DATABASE \"{dbname}\"");
+        if let Err(err) = client.execute(&create_sql, &[]).await {
+            if err.code() == Some(&SqlState::DUPLICATE_DATABASE) {
+                tracing::info!(db = dbname, "identity database already exists (race)");
+            } else {
+                return Err(err.into());
+            }
+        } else {
+            tracing::info!(db = dbname, "created identity database");
+        }
+    }
+    Ok(())
 }
 
 fn is_mother_role(role: Option<&str>) -> bool {

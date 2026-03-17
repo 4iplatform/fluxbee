@@ -409,6 +409,8 @@ When an ILK or TNT is created, updated, or deleted, motherbee SY.identity propag
 6. Node starts with its ILK assigned.
 ```
 
+**Implementation note (2026-03-16):** `SY.orchestrator` executes `ILK_REGISTER` and `ILK_UPDATE` through `fluxbee_sdk::identity::identity_system_call_ok` (relay wrapper local). The SDK centralizes transport/protocol behavior (timeouts, unreachable/ttl, response parsing). Orchestrator keeps spawn business rules (target `SY.identity@motherbee`, payload assembly, node->ilk persistence, and external admin contract).
+
 **Fail-closed registration gate (mandatory):**
 
 - `SY.orchestrator` MUST receive `ILK_REGISTER_RESPONSE` with `payload.status="ok"` before spawning a node.
@@ -908,6 +910,7 @@ Upgrades a temporary ILK to complete, or creates a new ILK for a node. Sent by A
 For node spawn flows (`SY.orchestrator -> ILK_REGISTER`), this response is a hard gate:
 - only `payload.status="ok"` allows spawn to continue;
 - any other outcome must abort spawn with `IDENTITY_REGISTER_FAILED`.
+- In implementation, orchestrator sends this action through the SDK helper (`identity_system_call_ok`) and maps `IdentityError` to orchestrator/admin-facing errors without changing external error contracts.
 
 **Error codes:** `INVALID_TENANT`, `TENANT_PENDING`, `DUPLICATE_EMAIL`, `DUPLICATE_NODE_NAME`, `VOCABULARY_INVALID`, `IDENTITY_LIMIT_REACHED`, `UNAUTHORIZED_REGISTRAR`.
 

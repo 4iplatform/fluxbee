@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -20,15 +20,24 @@ use fluxbee_sdk::blob::{
     BlobConfig as SdkBlobConfig, BlobGcOptions, BlobToolkit, BLOB_ACTIVE_RETAIN_DAYS,
     BLOB_NAME_MAX_CHARS, BLOB_STAGING_TTL_HOURS,
 };
+use fluxbee_sdk::identity::{identity_system_call_ok, IdentityError, IdentitySystemRequest};
 use fluxbee_sdk::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED,
     MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
-use json_router::shm::{
-    now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RemoteHiveEntry, RemoteNodeEntry,
-    RouterRegionReader, ShmSnapshot, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS, HIVE_FLAG_SELF,
+use json_router::{
+    runtime_manifest::{
+        load_runtime_manifest_from_paths as load_runtime_manifest_paths_shared,
+        parse_runtime_manifest_file as parse_runtime_manifest_file_shared, RuntimeManifest,
+        RuntimeManifestEntry,
+    },
+    shm::{
+        now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RemoteHiveEntry, RemoteNodeEntry,
+        RouterRegionReader, ShmSnapshot, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
+        HIVE_FLAG_SELF,
+    },
 };
 
 type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
@@ -40,16 +49,13 @@ const PRIMARY_HIVE_ID: &str = "motherbee";
 const ORCH_SUDOERS_PATH: &str = "/etc/sudoers.d/fluxbee-orchestrator";
 const ORCH_SSH_GATE_PATH: &str = "/usr/local/bin/fluxbee-ssh-gate.sh";
 const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
-const RUNTIME_MANIFEST_SCHEMA_VERSION: u64 = 1;
 const NATS_BOOTSTRAP_TIMEOUT_SECS: u64 = 20;
 const STORAGE_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS: u64 = 3;
 const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
-const MSG_ILK_REGISTER_RESPONSE: &str = "ILK_REGISTER_RESPONSE";
 const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
-const MSG_ILK_UPDATE_RESPONSE: &str = "ILK_UPDATE_RESPONSE";
 const SY_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
 const ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS: u64 = 10;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
@@ -246,24 +252,6 @@ struct StorageSection {
     path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-struct RuntimeManifest {
-    #[serde(default = "default_runtime_manifest_schema_version")]
-    schema_version: u64,
-    #[serde(default)]
-    version: u64,
-    #[serde(default)]
-    updated_at: Option<String>,
-    #[serde(default)]
-    runtimes: serde_json::Value,
-    #[serde(default)]
-    hash: Option<String>,
-}
-
-fn default_runtime_manifest_schema_version() -> u64 {
-    RUNTIME_MANIFEST_SCHEMA_VERSION
-}
-
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct CoreManifest {
     schema_version: u64,
@@ -298,6 +286,12 @@ struct VendorManifestComponent {
     #[serde(default)]
     size: Option<u64>,
     path: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RuntimePackageMetadata {
+    #[serde(default)]
+    config_template: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -378,6 +372,7 @@ struct OrchestratorState {
     last_runtime_verify: Mutex<Instant>,
     last_blob_gc: Mutex<Instant>,
     nats_endpoint: String,
+    identity_sync_port: u16,
     blob: BlobRuntimeConfig,
     dist: DistRuntimeConfig,
     blob_sync_last_desired: Mutex<BlobRuntimeConfig>,
@@ -451,6 +446,7 @@ async fn main() -> Result<(), OrchestratorError> {
         .and_then(|wan| wan.authorized_hives.clone())
         .unwrap_or_default();
     let nats_endpoint = nats_endpoint_from_hive(&hive);
+    let identity_sync_port = identity_sync_port_from_hive(&hive);
     let blob_runtime = blob_runtime_from_hive(&hive);
     let dist_runtime = dist_runtime_from_hive(&hive);
     let storage_path = storage_path_from_hive(&hive);
@@ -473,6 +469,7 @@ async fn main() -> Result<(), OrchestratorError> {
         last_runtime_verify: Mutex::new(Instant::now()),
         last_blob_gc: Mutex::new(Instant::now()),
         nats_endpoint,
+        identity_sync_port,
         blob: blob_runtime.clone(),
         dist: dist_runtime,
         blob_sync_last_desired: Mutex::new(blob_runtime),
@@ -492,6 +489,7 @@ async fn main() -> Result<(), OrchestratorError> {
         dist_path = %state.dist.path.display(),
         dist_sync_enabled = state.dist.sync_enabled,
         dist_sync_tool = %state.dist.sync_tool,
+        identity_sync_port = state.identity_sync_port,
         "blob/dist runtime config loaded"
     );
     ensure_dirs(&config_dir, &state_dir, &run_dir, &state.blob, &state.dist)?;
@@ -586,6 +584,7 @@ async fn bootstrap_local(
         Duration::from_secs(NATS_BOOTSTRAP_TIMEOUT_SECS),
     )
     .await?;
+    ensure_core_firewall_local(state);
     let startup_sync = effective_syncthing_runtime_config(&state.blob, &state.dist);
     if startup_sync.sync_enabled {
         if let Err(err) = ensure_blob_sync_runtime(&state.blob, &state.dist).await {
@@ -1420,7 +1419,7 @@ fn local_system_manifest_state(
 ) -> Result<LocalSystemManifestState, OrchestratorError> {
     match category {
         "runtime" => Ok(LocalSystemManifestState {
-            version: load_runtime_manifest().map(|manifest| manifest.version),
+            version: load_runtime_manifest_result()?.map(|manifest| manifest.version),
             hash: local_runtime_manifest_hash()?,
         }),
         "core" => Ok(LocalSystemManifestState {
@@ -1884,7 +1883,8 @@ async fn apply_system_update_local(
 ) -> Result<SystemUpdateApplyResult, OrchestratorError> {
     match category {
         "runtime" => {
-            let manifest = load_runtime_manifest().ok_or("runtime manifest missing locally")?;
+            let manifest =
+                load_runtime_manifest_result()?.ok_or("runtime manifest missing locally")?;
             apply_runtime_retention(&manifest)?;
             let artifact_errors = verify_runtime_current_artifacts(&manifest)?;
             {
@@ -2724,19 +2724,19 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn ensure_syncthing_firewall_local() {
+fn open_firewall_rules_local(rules: &[String], context: &str) {
+    if rules.is_empty() {
+        return;
+    }
+
     let mut applied = false;
     if command_exists("ufw") {
         applied = true;
-        for rule in [
-            format!("{SYNCTHING_SYNC_PORT_TCP}/tcp"),
-            format!("{SYNCTHING_SYNC_PORT_UDP}/udp"),
-            format!("{SYNCTHING_DISCOVERY_PORT_UDP}/udp"),
-        ] {
+        for rule in rules {
             let mut cmd = Command::new("ufw");
-            cmd.arg("allow").arg(&rule);
-            if let Err(err) = run_cmd(cmd, "ufw allow syncthing") {
-                tracing::warn!(rule = %rule, error = %err, "ufw allow failed");
+            cmd.arg("allow").arg(rule);
+            if let Err(err) = run_cmd(cmd, "ufw allow") {
+                tracing::warn!(context = context, rule = %rule, error = %err, "ufw allow failed");
             }
         }
     }
@@ -2746,24 +2746,30 @@ fn ensure_syncthing_firewall_local() {
         state_cmd.arg("--state");
         if run_cmd(state_cmd, "firewall-cmd --state").is_ok() {
             applied = true;
-            for rule in [
-                format!("{SYNCTHING_SYNC_PORT_TCP}/tcp"),
-                format!("{SYNCTHING_SYNC_PORT_UDP}/udp"),
-                format!("{SYNCTHING_DISCOVERY_PORT_UDP}/udp"),
-            ] {
+            for rule in rules {
                 let mut cmd_now = Command::new("firewall-cmd");
-                cmd_now.arg("--add-port").arg(&rule);
+                cmd_now.arg("--add-port").arg(rule);
                 if let Err(err) = run_cmd(cmd_now, "firewall-cmd --add-port") {
-                    tracing::warn!(rule = %rule, error = %err, "firewalld runtime port rule failed");
+                    tracing::warn!(
+                        context = context,
+                        rule = %rule,
+                        error = %err,
+                        "firewalld runtime port rule failed"
+                    );
                 }
 
                 let mut cmd_persistent = Command::new("firewall-cmd");
                 cmd_persistent
                     .arg("--permanent")
                     .arg("--add-port")
-                    .arg(&rule);
+                    .arg(rule);
                 if let Err(err) = run_cmd(cmd_persistent, "firewall-cmd --permanent --add-port") {
-                    tracing::warn!(rule = %rule, error = %err, "firewalld permanent port rule failed");
+                    tracing::warn!(
+                        context = context,
+                        rule = %rule,
+                        error = %err,
+                        "firewalld permanent port rule failed"
+                    );
                 }
             }
         }
@@ -2771,24 +2777,31 @@ fn ensure_syncthing_firewall_local() {
 
     if !applied {
         tracing::warn!(
-            "no ufw/firewalld detected; syncthing ports must be opened by host firewall policy"
+            context = context,
+            rules = ?rules,
+            "no ufw/firewalld detected; ports must be opened by host firewall policy"
         );
     }
 }
 
-fn disable_syncthing_firewall_local() {
+fn close_firewall_rules_local(rules: &[String], context: &str) {
+    if rules.is_empty() {
+        return;
+    }
+
     let mut applied = false;
     if command_exists("ufw") {
         applied = true;
-        for rule in [
-            format!("{SYNCTHING_SYNC_PORT_TCP}/tcp"),
-            format!("{SYNCTHING_SYNC_PORT_UDP}/udp"),
-            format!("{SYNCTHING_DISCOVERY_PORT_UDP}/udp"),
-        ] {
+        for rule in rules {
             let mut cmd = Command::new("ufw");
-            cmd.arg("--force").arg("delete").arg("allow").arg(&rule);
-            if let Err(err) = run_cmd(cmd, "ufw delete allow syncthing") {
-                tracing::warn!(rule = %rule, error = %err, "ufw delete allow failed");
+            cmd.arg("--force").arg("delete").arg("allow").arg(rule);
+            if let Err(err) = run_cmd(cmd, "ufw delete allow") {
+                tracing::warn!(
+                    context = context,
+                    rule = %rule,
+                    error = %err,
+                    "ufw delete allow failed"
+                );
             }
         }
     }
@@ -2798,15 +2811,12 @@ fn disable_syncthing_firewall_local() {
         state_cmd.arg("--state");
         if run_cmd(state_cmd, "firewall-cmd --state").is_ok() {
             applied = true;
-            for rule in [
-                format!("{SYNCTHING_SYNC_PORT_TCP}/tcp"),
-                format!("{SYNCTHING_SYNC_PORT_UDP}/udp"),
-                format!("{SYNCTHING_DISCOVERY_PORT_UDP}/udp"),
-            ] {
+            for rule in rules {
                 let mut cmd_now = Command::new("firewall-cmd");
-                cmd_now.arg("--remove-port").arg(&rule);
+                cmd_now.arg("--remove-port").arg(rule);
                 if let Err(err) = run_cmd(cmd_now, "firewall-cmd --remove-port") {
                     tracing::warn!(
+                        context = context,
                         rule = %rule,
                         error = %err,
                         "firewalld runtime port remove failed"
@@ -2817,10 +2827,11 @@ fn disable_syncthing_firewall_local() {
                 cmd_persistent
                     .arg("--permanent")
                     .arg("--remove-port")
-                    .arg(&rule);
+                    .arg(rule);
                 if let Err(err) = run_cmd(cmd_persistent, "firewall-cmd --permanent --remove-port")
                 {
                     tracing::warn!(
+                        context = context,
                         rule = %rule,
                         error = %err,
                         "firewalld permanent port remove failed"
@@ -2832,9 +2843,55 @@ fn disable_syncthing_firewall_local() {
 
     if !applied {
         tracing::warn!(
-            "no ufw/firewalld detected; syncthing ports must be removed by host firewall policy"
+            context = context,
+            rules = ?rules,
+            "no ufw/firewalld detected; ports must be removed by host firewall policy"
         );
     }
+}
+
+fn syncthing_firewall_rules() -> Vec<String> {
+    vec![
+        format!("{SYNCTHING_SYNC_PORT_TCP}/tcp"),
+        format!("{SYNCTHING_SYNC_PORT_UDP}/udp"),
+        format!("{SYNCTHING_DISCOVERY_PORT_UDP}/udp"),
+    ]
+}
+
+fn ensure_syncthing_firewall_local() {
+    open_firewall_rules_local(&syncthing_firewall_rules(), "syncthing");
+}
+
+fn disable_syncthing_firewall_local() {
+    close_firewall_rules_local(&syncthing_firewall_rules(), "syncthing");
+}
+
+fn ensure_core_firewall_local(state: &OrchestratorState) {
+    let mut rules: Vec<String> = Vec::new();
+    if let Some(listen) = state.wan_listen.as_deref() {
+        let listen = listen.trim();
+        if !listen.is_empty() {
+            match parse_host_port(listen) {
+                Ok((_, port)) => rules.push(format!("{port}/tcp")),
+                Err(err) => tracing::warn!(
+                    wan_listen = listen,
+                    error = %err,
+                    "failed to parse wan.listen for firewall setup; skipping WAN port rule"
+                ),
+            }
+        }
+    }
+
+    if state.is_motherbee {
+        rules.push(format!("{}/tcp", state.identity_sync_port));
+    }
+
+    if rules.is_empty() {
+        return;
+    }
+    rules.sort();
+    rules.dedup();
+    open_firewall_rules_local(&rules, "core");
 }
 
 fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
@@ -4192,13 +4249,28 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
         }),
     };
 
-    let runtimes = match load_runtime_manifest() {
-        Some(manifest) => {
+    let runtimes = match load_runtime_manifest_result() {
+        Ok(Some(manifest)) => {
             let manifest_hash = local_runtime_manifest_hash().ok().flatten();
             let mut runtimes = manifest.runtimes.clone();
+            let runtime_entries_snapshot = manifest.runtimes.as_object().cloned();
             if let Some(runtime_map) = runtimes.as_object_mut() {
                 for (runtime, entry) in runtime_map.iter_mut() {
-                    let readiness = runtime_readiness_for_entry(runtime, entry);
+                    let readiness = match runtime_manifest_entry_from_value(runtime, entry) {
+                        Ok(entry_model) => runtime_readiness_for_entry(
+                            runtime,
+                            &entry_model,
+                            runtime_entries_snapshot.as_ref(),
+                        ),
+                        Err(err) => {
+                            tracing::warn!(
+                                runtime = %runtime,
+                                error = %err,
+                                "runtime readiness skipped due invalid manifest entry"
+                            );
+                            serde_json::json!({})
+                        }
+                    };
                     if let Some(entry_obj) = entry.as_object_mut() {
                         entry_obj.insert("readiness".to_string(), readiness);
                     }
@@ -4211,8 +4283,12 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
                 "runtimes": runtimes,
             })
         }
-        None => serde_json::json!({
+        Ok(None) => serde_json::json!({
             "status": "missing",
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "message": err.to_string(),
         }),
     };
 
@@ -5020,20 +5096,49 @@ fn write_hive_info(
     Ok(())
 }
 
-fn runtime_keep_versions(
+fn runtime_manifest_entry_from_value(
+    runtime: &str,
+    value: &serde_json::Value,
+) -> Result<RuntimeManifestEntry, OrchestratorError> {
+    if !value.is_object() {
+        return Err(format!(
+            "runtime manifest invalid entry for '{}': expected object",
+            runtime
+        )
+        .into());
+    }
+    serde_json::from_value::<RuntimeManifestEntry>(value.clone())
+        .map_err(|err| format!("runtime manifest invalid entry for '{}': {}", runtime, err).into())
+}
+
+fn runtime_manifest_entry_map(
     manifest: &RuntimeManifest,
-) -> Result<HashMap<String, HashSet<String>>, OrchestratorError> {
+) -> Result<BTreeMap<String, RuntimeManifestEntry>, OrchestratorError> {
     let runtimes = manifest
         .runtimes
         .as_object()
         .ok_or_else(|| "runtime manifest invalid: runtimes must be object".to_string())?;
-    let mut keep_map: HashMap<String, HashSet<String>> = HashMap::new();
-    for (runtime, entry) in runtimes {
+    let mut out: BTreeMap<String, RuntimeManifestEntry> = BTreeMap::new();
+    for (runtime, value) in runtimes {
         if !valid_token(runtime) {
             return Err(format!("runtime manifest invalid runtime name '{}'", runtime).into());
         }
+        out.insert(
+            runtime.clone(),
+            runtime_manifest_entry_from_value(runtime, value)?,
+        );
+    }
+    Ok(out)
+}
+
+fn runtime_keep_versions(
+    manifest: &RuntimeManifest,
+) -> Result<HashMap<String, HashSet<String>>, OrchestratorError> {
+    let runtimes = runtime_manifest_entry_map(manifest)?;
+    let mut keep_map: HashMap<String, HashSet<String>> = HashMap::new();
+    for (runtime, entry) in runtimes {
         let mut keep: HashSet<String> = HashSet::new();
-        if let Some(current) = entry.get("current").and_then(|v| v.as_str()) {
+        if let Some(current) = entry.current.as_deref() {
             let current = current.trim();
             if !current.is_empty() {
                 if !valid_token(current) {
@@ -5044,88 +5149,162 @@ fn runtime_keep_versions(
                 keep.insert(current.to_string());
             }
         }
-        if let Some(available) = entry.get("available").and_then(|v| v.as_array()) {
-            for value in available {
-                let version = value
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .ok_or_else(|| {
-                        format!(
-                            "runtime manifest invalid available version for runtime '{}'",
-                            runtime
-                        )
-                    })?;
-                if !valid_token(version) {
-                    return Err(format!(
-                        "runtime manifest invalid available version '{}'",
-                        version
-                    )
-                    .into());
-                }
-                keep.insert(version.to_string());
+        for value in &entry.available {
+            let version = value.trim();
+            if version.is_empty() {
+                return Err(format!(
+                    "runtime manifest invalid available version for runtime '{}'",
+                    runtime
+                )
+                .into());
             }
+            if !valid_token(version) {
+                return Err(
+                    format!("runtime manifest invalid available version '{}'", version).into(),
+                );
+            }
+            keep.insert(version.to_string());
         }
         if !keep.is_empty() {
-            keep_map.insert(runtime.clone(), keep);
+            keep_map.insert(runtime, keep);
         }
     }
     Ok(keep_map)
 }
 
-fn runtime_current_versions(
-    manifest: &RuntimeManifest,
-) -> Result<Vec<(String, String)>, OrchestratorError> {
-    let runtimes = manifest
-        .runtimes
-        .as_object()
-        .ok_or_else(|| "runtime manifest invalid: runtimes must be object".to_string())?;
-    let mut out = Vec::new();
-    for (runtime, entry) in runtimes {
-        if !valid_token(runtime) {
-            return Err(format!("runtime manifest invalid runtime name '{}'", runtime).into());
-        }
-        let current = entry
-            .get("current")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .unwrap_or("");
-        if current.is_empty() {
-            continue;
-        }
-        if !valid_token(current) {
-            return Err(format!("runtime manifest invalid current version '{}'", current).into());
-        }
-        out.push((runtime.clone(), current.to_string()));
-    }
-    Ok(out)
-}
-
 fn verify_runtime_current_artifacts(
     manifest: &RuntimeManifest,
 ) -> Result<Vec<String>, OrchestratorError> {
+    verify_runtime_current_artifacts_with_root(manifest, Path::new(DIST_RUNTIME_ROOT_DIR))
+}
+
+fn verify_runtime_current_artifacts_with_root(
+    manifest: &RuntimeManifest,
+    runtimes_root: &Path,
+) -> Result<Vec<String>, OrchestratorError> {
+    let runtimes = runtime_manifest_entry_map(manifest)?;
     let mut errors = Vec::new();
-    for (runtime, version) in runtime_current_versions(manifest)? {
-        let start_script = Path::new(DIST_RUNTIME_ROOT_DIR)
-            .join(&runtime)
-            .join(&version)
-            .join("bin/start.sh");
-        if !start_script.is_file() {
+    for (runtime, entry) in &runtimes {
+        let version = entry.current.as_deref().map(str::trim).unwrap_or("");
+        if version.is_empty() {
+            continue;
+        }
+        if !valid_token(version) {
+            return Err(format!("runtime manifest invalid current version '{}'", version).into());
+        }
+
+        let package_dir = runtimes_root.join(runtime).join(version);
+        if !package_dir.is_dir() {
             errors.push(format!(
-                "runtime artifact missing start.sh runtime='{}' version='{}' path='{}'",
+                "runtime package missing directory runtime='{}' version='{}' path='{}'",
                 runtime,
                 version,
-                start_script.display()
+                package_dir.display()
             ));
             continue;
         }
-        if !local_runtime_script_is_executable(&start_script) {
-            errors.push(format!(
-                "runtime artifact start.sh is not executable runtime='{}' version='{}' path='{}'",
-                runtime,
-                version,
-                start_script.display()
-            ));
+
+        match runtime_package_type(entry) {
+            "full_runtime" => {
+                let start_script = package_dir.join("bin/start.sh");
+                if !start_script.is_file() {
+                    errors.push(format!(
+                        "runtime artifact missing start.sh runtime='{}' version='{}' path='{}'",
+                        runtime,
+                        version,
+                        start_script.display()
+                    ));
+                    continue;
+                }
+                if !local_runtime_script_is_executable(&start_script) {
+                    errors.push(format!(
+                        "runtime artifact start.sh is not executable runtime='{}' version='{}' path='{}'",
+                        runtime,
+                        version,
+                        start_script.display()
+                    ));
+                }
+            }
+            "config_only" | "workflow" => {
+                let base_runtime = entry
+                    .runtime_base
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let Some(base_runtime) = base_runtime else {
+                    errors.push(format!(
+                        "runtime package missing runtime_base runtime='{}' version='{}' type='{}'",
+                        runtime,
+                        version,
+                        runtime_package_type(entry)
+                    ));
+                    continue;
+                };
+                if !valid_token(base_runtime) {
+                    errors.push(format!(
+                        "runtime package invalid runtime_base runtime='{}' version='{}' type='{}' runtime_base='{}'",
+                        runtime,
+                        version,
+                        runtime_package_type(entry),
+                        base_runtime
+                    ));
+                    continue;
+                }
+                let Some(base_entry) = runtimes.get(base_runtime) else {
+                    errors.push(format!(
+                        "runtime package runtime_base not available runtime='{}' version='{}' type='{}' runtime_base='{}'",
+                        runtime,
+                        version,
+                        runtime_package_type(entry),
+                        base_runtime
+                    ));
+                    continue;
+                };
+                let base_version = base_entry.current.as_deref().map(str::trim).unwrap_or("");
+                if base_version.is_empty() || !valid_token(base_version) {
+                    errors.push(format!(
+                        "runtime package runtime_base has invalid current version runtime='{}' version='{}' type='{}' runtime_base='{}' base_version='{}'",
+                        runtime,
+                        version,
+                        runtime_package_type(entry),
+                        base_runtime,
+                        base_version
+                    ));
+                    continue;
+                }
+
+                let base_start = runtimes_root
+                    .join(base_runtime)
+                    .join(base_version)
+                    .join("bin/start.sh");
+                if !base_start.is_file() {
+                    errors.push(format!(
+                        "runtime artifact missing base start.sh runtime='{}' version='{}' runtime_base='{}' base_version='{}' path='{}'",
+                        runtime,
+                        version,
+                        base_runtime,
+                        base_version,
+                        base_start.display()
+                    ));
+                    continue;
+                }
+                if !local_runtime_script_is_executable(&base_start) {
+                    errors.push(format!(
+                        "runtime artifact base start.sh is not executable runtime='{}' version='{}' runtime_base='{}' base_version='{}' path='{}'",
+                        runtime,
+                        version,
+                        base_runtime,
+                        base_version,
+                        base_start.display()
+                    ));
+                }
+            }
+            other => {
+                errors.push(format!(
+                    "runtime package unknown type runtime='{}' version='{}' type='{}'",
+                    runtime, version, other
+                ));
+            }
         }
     }
     Ok(errors)
@@ -5220,26 +5399,25 @@ fn orchestrator_runtime_dir() -> PathBuf {
     json_router::paths::storage_root_dir().join("orchestrator")
 }
 
+fn parse_runtime_manifest_file(
+    path: &Path,
+    data: &str,
+) -> Result<RuntimeManifest, OrchestratorError> {
+    parse_runtime_manifest_file_shared(path, data).map_err(Into::into)
+}
+
+fn load_runtime_manifest_result() -> Result<Option<RuntimeManifest>, OrchestratorError> {
+    load_runtime_manifest_paths_shared(&local_runtime_manifest_paths()).map_err(Into::into)
+}
+
 fn load_runtime_manifest() -> Option<RuntimeManifest> {
-    for path in local_runtime_manifest_paths() {
-        let data = match fs::read_to_string(&path) {
-            Ok(data) => data,
-            Err(_) => continue,
-        };
-        if let Ok(manifest) = serde_json::from_str::<RuntimeManifest>(&data) {
-            if manifest.schema_version != RUNTIME_MANIFEST_SCHEMA_VERSION || manifest.version == 0 {
-                tracing::warn!(
-                    path = %path.display(),
-                    schema_version = manifest.schema_version,
-                    version = manifest.version,
-                    "ignoring invalid local runtime manifest"
-                );
-                continue;
-            }
-            return Some(manifest);
+    match load_runtime_manifest_result() {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            tracing::warn!(error = %err, "ignoring invalid local runtime manifest");
+            None
         }
     }
-    None
 }
 
 fn runtime_manifest_has_current_versions(manifest: &RuntimeManifest) -> bool {
@@ -5551,6 +5729,115 @@ fn node_effective_config_path(
     Ok(node_instance_dir(node_name)?.join("config.json"))
 }
 
+fn runtime_package_dir_with_root(runtimes_root: &Path, runtime: &str, version: &str) -> PathBuf {
+    runtimes_root.join(runtime).join(version)
+}
+
+fn runtime_package_dir(runtime: &str, version: &str) -> PathBuf {
+    runtime_package_dir_with_root(Path::new(DIST_RUNTIME_ROOT_DIR), runtime, version)
+}
+
+fn runtime_package_metadata(
+    package_dir: &Path,
+) -> Result<Option<RuntimePackageMetadata>, OrchestratorError> {
+    let package_json_path = package_dir.join("package.json");
+    if !package_json_path.is_file() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&package_json_path)?;
+    let metadata = serde_json::from_str::<RuntimePackageMetadata>(&raw).map_err(|err| {
+        format!(
+            "invalid runtime package.json '{}' for config template resolution: {}",
+            package_json_path.display(),
+            err
+        )
+    })?;
+    Ok(Some(metadata))
+}
+
+fn normalize_runtime_template_relative_path(raw: &str) -> Result<String, OrchestratorError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("runtime config_template cannot be empty".into());
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err(format!(
+            "runtime config_template must be relative, got '{}'",
+            trimmed
+        )
+        .into());
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(format!(
+            "runtime config_template must not contain parent traversal, got '{}'",
+            trimmed
+        )
+        .into());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn runtime_template_relative_path(package_dir: &Path) -> Result<String, OrchestratorError> {
+    let metadata = runtime_package_metadata(package_dir)?;
+    let template_rel = metadata
+        .and_then(|value| value.config_template)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "config/default-config.json".to_string());
+    normalize_runtime_template_relative_path(&template_rel)
+}
+
+fn load_runtime_config_template_with_root(
+    runtime: &str,
+    runtime_version: &str,
+    runtimes_root: &Path,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, OrchestratorError> {
+    let package_dir = runtime_package_dir_with_root(runtimes_root, runtime, runtime_version);
+    if !package_dir.is_dir() {
+        return Ok(None);
+    }
+    let template_rel = runtime_template_relative_path(&package_dir)?;
+    let template_path = package_dir.join(template_rel);
+    if !template_path.is_file() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&template_path)?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+        format!(
+            "invalid runtime config template '{}' for runtime='{}' version='{}': {}",
+            template_path.display(),
+            runtime,
+            runtime_version,
+            err
+        )
+    })?;
+    let object = parsed.as_object().ok_or_else(|| {
+        format!(
+            "invalid runtime config template '{}' for runtime='{}' version='{}': expected object",
+            template_path.display(),
+            runtime,
+            runtime_version
+        )
+    })?;
+    Ok(Some(object.clone()))
+}
+
+fn load_runtime_config_template(
+    runtime: &str,
+    runtime_version: &str,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, OrchestratorError> {
+    load_runtime_config_template_with_root(
+        runtime,
+        runtime_version,
+        Path::new(DIST_RUNTIME_ROOT_DIR),
+    )
+}
+
 fn node_state_path(
     _state: &OrchestratorState,
     node_name: &str,
@@ -5610,6 +5897,8 @@ fn build_node_system_block(
     hive_id: &str,
     runtime: Option<&str>,
     runtime_version: Option<&str>,
+    runtime_base: Option<&str>,
+    package_path: Option<&str>,
     ilk_id: Option<&str>,
     tenant_id: Option<&str>,
     config_version: u64,
@@ -5628,6 +5917,12 @@ fn build_node_system_block(
     if let Some(runtime_version) = runtime_version.filter(|v| !v.trim().is_empty()) {
         out["runtime_version"] = serde_json::Value::String(runtime_version.to_string());
     }
+    if let Some(runtime_base) = runtime_base.filter(|v| !v.trim().is_empty()) {
+        out["runtime_base"] = serde_json::Value::String(runtime_base.to_string());
+    }
+    if let Some(package_path) = package_path.filter(|v| !v.trim().is_empty()) {
+        out["package_path"] = serde_json::Value::String(package_path.to_string());
+    }
     if let Some(ilk_id) = ilk_id.filter(|v| !v.trim().is_empty()) {
         out["ilk_id"] = serde_json::Value::String(ilk_id.to_string());
     }
@@ -5644,6 +5939,8 @@ fn ensure_node_effective_config_on_spawn(
     target_hive: &str,
     runtime: &str,
     runtime_version: &str,
+    runtime_base: Option<&str>,
+    package_path: Option<&str>,
     ilk_id: Option<&str>,
 ) -> Result<serde_json::Value, OrchestratorError> {
     let path = node_effective_config_path(state, node_name)?;
@@ -5651,27 +5948,22 @@ fn ensure_node_effective_config_on_spawn(
         return Err(format!("node config already exists: {}", path.display()).into());
     }
 
-    let mut config = serde_json::Map::<String, serde_json::Value>::new();
-    for (key, value) in parse_config_patch(payload, "config")? {
-        config.insert(key, value);
-    }
-    if let Some(tenant_id) = resolve_tenant_id_for_node(payload) {
-        config
-            .entry("tenant_id".to_string())
-            .or_insert(serde_json::Value::String(tenant_id));
-    }
-    config.insert(
-        "_system".to_string(),
-        build_node_system_block(
-            node_name,
-            target_hive,
-            Some(runtime),
-            Some(runtime_version),
-            ilk_id,
-            config.get("tenant_id").and_then(|v| v.as_str()),
-            1,
-        ),
+    let template = load_runtime_config_template(runtime, runtime_version)?;
+    let request_patch = parse_config_patch(payload, "config")?;
+    let resolved_tenant_id = resolve_tenant_id_for_node(payload);
+    let mut config = assemble_spawn_config_map(template, request_patch, resolved_tenant_id, None);
+    let system_block = build_node_system_block(
+        node_name,
+        target_hive,
+        Some(runtime),
+        Some(runtime_version),
+        runtime_base,
+        package_path,
+        ilk_id,
+        config.get("tenant_id").and_then(|v| v.as_str()),
+        1,
     );
+    config.insert("_system".to_string(), system_block);
     write_json_atomic(&path, &serde_json::Value::Object(config))?;
 
     Ok(serde_json::json!({
@@ -5680,6 +5972,27 @@ fn ensure_node_effective_config_on_spawn(
         "created": true,
         "config_version": 1,
     }))
+}
+
+fn assemble_spawn_config_map(
+    template: Option<serde_json::Map<String, serde_json::Value>>,
+    request_patch: serde_json::Map<String, serde_json::Value>,
+    resolved_tenant_id: Option<String>,
+    forced_system: Option<serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut config = template.unwrap_or_default();
+    for (key, value) in request_patch {
+        config.insert(key, value);
+    }
+    if let Some(tenant_id) = resolved_tenant_id {
+        config
+            .entry("tenant_id".to_string())
+            .or_insert(serde_json::Value::String(tenant_id));
+    }
+    if let Some(system) = forced_system {
+        config.insert("_system".to_string(), system);
+    }
+    config
 }
 
 async fn send_node_config_changed_signal(
@@ -5737,24 +6050,18 @@ fn resolve_runtime_version(
     runtime: &str,
     requested_version: &str,
 ) -> Result<String, OrchestratorError> {
-    let runtimes = manifest
-        .runtimes
-        .as_object()
-        .ok_or_else(|| "runtime manifest invalid: runtimes must be object".to_string())?;
+    let runtimes = runtime_manifest_entry_map(manifest)?;
     let entry = runtimes
         .get(runtime)
         .ok_or_else(|| format!("runtime '{runtime}' not found in manifest"))?;
 
-    let current = entry
-        .get("current")
-        .and_then(|v| v.as_str())
-        .map(|v| v.trim())
-        .unwrap_or("");
+    let current = entry.current.as_deref().map(str::trim).unwrap_or("");
     let available: Vec<&str> = entry
-        .get("available")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
+        .available
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect();
 
     if requested_version.is_empty() || requested_version == "current" {
         if !current.is_empty() {
@@ -5775,14 +6082,175 @@ fn resolve_runtime_key(
     manifest: &RuntimeManifest,
     runtime: &str,
 ) -> Result<String, OrchestratorError> {
-    let runtimes = manifest
-        .runtimes
-        .as_object()
-        .ok_or_else(|| "runtime manifest invalid: runtimes must be object".to_string())?;
+    let runtimes = runtime_manifest_entry_map(manifest)?;
     if runtimes.contains_key(runtime) {
         return Ok(runtime.to_string());
     }
     Err(format!("runtime '{runtime}' not found in manifest").into())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeSpawnEntrypoint {
+    script_runtime: String,
+    script_version: String,
+    script_path: String,
+    runtime_base: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeSpawnEntrypointError {
+    RuntimeNotAvailable(String),
+    MissingRuntimeBase {
+        runtime: String,
+        package_type: String,
+    },
+    BaseRuntimeNotAvailable {
+        runtime: String,
+        package_type: String,
+        runtime_base: String,
+        reason: String,
+    },
+    UnknownPackageType {
+        runtime: String,
+        package_type: String,
+    },
+}
+
+impl RuntimeSpawnEntrypointError {
+    fn error_code(&self) -> &'static str {
+        match self {
+            Self::RuntimeNotAvailable(_) => "RUNTIME_NOT_AVAILABLE",
+            Self::MissingRuntimeBase { .. } => "MISSING_RUNTIME_BASE",
+            Self::BaseRuntimeNotAvailable { .. } => "BASE_RUNTIME_NOT_AVAILABLE",
+            Self::UnknownPackageType { .. } => "UNKNOWN_PACKAGE_TYPE",
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::RuntimeNotAvailable(message) => message.clone(),
+            Self::MissingRuntimeBase {
+                runtime,
+                package_type,
+            } => format!(
+                "runtime '{}' package type '{}' requires non-empty runtime_base",
+                runtime, package_type
+            ),
+            Self::BaseRuntimeNotAvailable {
+                runtime,
+                package_type,
+                runtime_base,
+                reason,
+            } => format!(
+                "runtime '{}' package type '{}' runtime_base '{}' is not available: {}",
+                runtime, package_type, runtime_base, reason
+            ),
+            Self::UnknownPackageType {
+                runtime,
+                package_type,
+            } => format!(
+                "runtime '{}' has unknown package type '{}'",
+                runtime, package_type
+            ),
+        }
+    }
+}
+
+fn runtime_package_type(entry: &RuntimeManifestEntry) -> &str {
+    entry
+        .package_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("full_runtime")
+}
+
+fn resolve_runtime_spawn_entrypoint(
+    manifest: &RuntimeManifest,
+    runtime: &str,
+    resolved_runtime_version: &str,
+) -> Result<RuntimeSpawnEntrypoint, RuntimeSpawnEntrypointError> {
+    let runtimes = runtime_manifest_entry_map(manifest)
+        .map_err(|err| RuntimeSpawnEntrypointError::RuntimeNotAvailable(err.to_string()))?;
+    let entry = runtimes.get(runtime).ok_or_else(|| {
+        RuntimeSpawnEntrypointError::RuntimeNotAvailable(format!(
+            "runtime '{}' not found in manifest",
+            runtime
+        ))
+    })?;
+    let package_type = runtime_package_type(entry);
+
+    let (script_runtime, script_version, runtime_base) = match package_type {
+        "full_runtime" => (
+            runtime.to_string(),
+            resolved_runtime_version.to_string(),
+            None,
+        ),
+        "config_only" | "workflow" => {
+            let base = entry
+                .runtime_base
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| RuntimeSpawnEntrypointError::MissingRuntimeBase {
+                    runtime: runtime.to_string(),
+                    package_type: package_type.to_string(),
+                })?;
+            if !valid_token(base) {
+                return Err(RuntimeSpawnEntrypointError::BaseRuntimeNotAvailable {
+                    runtime: runtime.to_string(),
+                    package_type: package_type.to_string(),
+                    runtime_base: base.to_string(),
+                    reason: format!("invalid runtime_base token '{}'", base),
+                });
+            }
+            let base_entry = runtimes.get(base).ok_or_else(|| {
+                RuntimeSpawnEntrypointError::BaseRuntimeNotAvailable {
+                    runtime: runtime.to_string(),
+                    package_type: package_type.to_string(),
+                    runtime_base: base.to_string(),
+                    reason: "runtime not found in manifest".to_string(),
+                }
+            })?;
+            let base_current = base_entry
+                .current
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| RuntimeSpawnEntrypointError::BaseRuntimeNotAvailable {
+                    runtime: runtime.to_string(),
+                    package_type: package_type.to_string(),
+                    runtime_base: base.to_string(),
+                    reason: "missing current version".to_string(),
+                })?;
+            if !valid_token(base_current) {
+                return Err(RuntimeSpawnEntrypointError::BaseRuntimeNotAvailable {
+                    runtime: runtime.to_string(),
+                    package_type: package_type.to_string(),
+                    runtime_base: base.to_string(),
+                    reason: format!("invalid current version '{}'", base_current),
+                });
+            }
+            (
+                base.to_string(),
+                base_current.to_string(),
+                Some(base.to_string()),
+            )
+        }
+        _ => {
+            return Err(RuntimeSpawnEntrypointError::UnknownPackageType {
+                runtime: runtime.to_string(),
+                package_type: package_type.to_string(),
+            });
+        }
+    };
+    let script_path = runtime_start_script(&script_runtime, &script_version);
+    Ok(RuntimeSpawnEntrypoint {
+        script_runtime,
+        script_version,
+        script_path,
+        runtime_base,
+    })
 }
 
 fn runtime_start_script(runtime: &str, version: &str) -> String {
@@ -5799,12 +6267,92 @@ fn local_runtime_script_is_executable(script_path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn runtime_versions_from_manifest_entry(entry: &serde_json::Value) -> Vec<String> {
+fn runtime_start_script_preflight(
+    runtime: &str,
+    version: &str,
+    start_script: &str,
+    target_hive: &str,
+    node_name: &str,
+) -> Result<(), serde_json::Value> {
+    let start_script_path = PathBuf::from(start_script);
+    if !local_runtime_script_exists(start_script) {
+        return Err(serde_json::json!({
+            "status": "error",
+            "error_code": "RUNTIME_NOT_PRESENT",
+            "message": format!("runtime script missing in dist path: {}", start_script),
+            "runtime": runtime,
+            "version": version,
+            "expected_path": start_script,
+            "hint": "Run SYSTEM_UPDATE to materialize this runtime on the worker",
+            "target": target_hive,
+            "node_name": node_name,
+        }));
+    }
+    if !local_runtime_script_is_executable(&start_script_path) {
+        return Err(serde_json::json!({
+            "status": "error",
+            "error_code": "RUNTIME_NOT_PRESENT",
+            "message": format!("runtime script exists but is not executable: {}", start_script),
+            "runtime": runtime,
+            "version": version,
+            "expected_path": start_script,
+            "hint": "Fix permissions (chmod +x) and run SYSTEM_UPDATE",
+            "target": target_hive,
+            "node_name": node_name,
+        }));
+    }
+    Ok(())
+}
+
+fn runtime_base_start_script_preflight(
+    requested_runtime: &str,
+    requested_version: &str,
+    runtime_base: &str,
+    base_version: &str,
+    start_script: &str,
+    target_hive: &str,
+    node_name: &str,
+) -> Result<(), serde_json::Value> {
+    let start_script_path = PathBuf::from(start_script);
+    if !local_runtime_script_exists(start_script) {
+        return Err(serde_json::json!({
+            "status": "error",
+            "error_code": "BASE_RUNTIME_NOT_PRESENT",
+            "message": format!("base runtime script missing in dist path: {}", start_script),
+            "runtime": requested_runtime,
+            "version": requested_version,
+            "runtime_base": runtime_base,
+            "base_version": base_version,
+            "expected_path": start_script,
+            "hint": "Run SYSTEM_UPDATE to materialize runtime_base on the worker",
+            "target": target_hive,
+            "node_name": node_name,
+        }));
+    }
+    if !local_runtime_script_is_executable(&start_script_path) {
+        return Err(serde_json::json!({
+            "status": "error",
+            "error_code": "BASE_RUNTIME_NOT_PRESENT",
+            "message": format!("base runtime script exists but is not executable: {}", start_script),
+            "runtime": requested_runtime,
+            "version": requested_version,
+            "runtime_base": runtime_base,
+            "base_version": base_version,
+            "expected_path": start_script,
+            "hint": "Fix permissions (chmod +x) for runtime_base start.sh and run SYSTEM_UPDATE",
+            "target": target_hive,
+            "node_name": node_name,
+        }));
+    }
+    Ok(())
+}
+
+fn runtime_versions_from_manifest_entry(entry: &RuntimeManifestEntry) -> Vec<String> {
     let mut versions = Vec::new();
     let mut seen = HashSet::new();
     if let Some(current) = entry
-        .get("current")
-        .and_then(|value| value.as_str())
+        .current
+        .as_deref()
         .map(str::trim)
         .filter(|value| valid_token(value))
     {
@@ -5812,40 +6360,98 @@ fn runtime_versions_from_manifest_entry(entry: &serde_json::Value) -> Vec<String
         seen.insert(current_value.clone());
         versions.push(current_value);
     }
-    if let Some(available) = entry.get("available").and_then(|value| value.as_array()) {
-        for value in available {
-            let Some(version) = value
-                .as_str()
-                .map(str::trim)
-                .filter(|candidate| valid_token(candidate))
-            else {
-                continue;
-            };
-            if seen.insert(version.to_string()) {
-                versions.push(version.to_string());
-            }
+    for value in &entry.available {
+        let version = value.trim();
+        if !valid_token(version) {
+            continue;
+        }
+        if seen.insert(version.to_string()) {
+            versions.push(version.to_string());
         }
     }
     versions
 }
 
-fn runtime_readiness_for_entry(runtime: &str, entry: &serde_json::Value) -> serde_json::Value {
+fn runtime_readiness_for_entry(
+    runtime: &str,
+    entry: &RuntimeManifestEntry,
+    runtime_entries: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Value {
+    runtime_readiness_for_entry_with_root(
+        runtime,
+        entry,
+        runtime_entries,
+        Path::new(DIST_RUNTIME_ROOT_DIR),
+    )
+}
+
+fn runtime_readiness_for_entry_with_root(
+    runtime: &str,
+    entry: &RuntimeManifestEntry,
+    runtime_entries: Option<&serde_json::Map<String, serde_json::Value>>,
+    runtimes_root: &Path,
+) -> serde_json::Value {
     if !valid_token(runtime) {
         return serde_json::json!({});
     }
+    let package_type = runtime_package_type(entry);
+    let base_runtime = entry
+        .runtime_base
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let base_start_script = if matches!(package_type, "config_only" | "workflow") {
+        if let Some(base_runtime_name) = base_runtime {
+            let base_entry = runtime_entries
+                .and_then(|entries| entries.get(base_runtime_name))
+                .and_then(|value| runtime_manifest_entry_from_value(base_runtime_name, value).ok());
+            let base_version = base_entry
+                .as_ref()
+                .and_then(|value| value.current.as_deref())
+                .map(str::trim)
+                .filter(|value| valid_token(value));
+            base_version.map(|value| {
+                runtimes_root
+                    .join(base_runtime_name)
+                    .join(value)
+                    .join("bin/start.sh")
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let base_runtime_ready = base_start_script
+        .as_ref()
+        .map(|start| start.is_file() && local_runtime_script_is_executable(start))
+        .unwrap_or(false);
+
     let mut readiness = serde_json::Map::new();
     for version in runtime_versions_from_manifest_entry(entry) {
-        let start_script = Path::new(DIST_RUNTIME_ROOT_DIR)
-            .join(runtime)
-            .join(&version)
-            .join("bin/start.sh");
-        let runtime_present = start_script.is_file();
-        let start_sh_executable = runtime_present && local_runtime_script_is_executable(&start_script);
+        let package_dir = runtimes_root.join(runtime).join(&version);
+        let start_script = package_dir.join("bin/start.sh");
+        let (runtime_present, start_sh_executable, base_runtime_ready_field) = match package_type {
+            "full_runtime" => {
+                let runtime_present = start_script.is_file();
+                let start_sh_executable =
+                    runtime_present && local_runtime_script_is_executable(&start_script);
+                (runtime_present, start_sh_executable, true)
+            }
+            "config_only" | "workflow" => {
+                let runtime_present = package_dir.is_dir();
+                (runtime_present, base_runtime_ready, base_runtime_ready)
+            }
+            _ => (false, false, false),
+        };
         readiness.insert(
             version,
             serde_json::json!({
                 "runtime_present": runtime_present,
                 "start_sh_executable": start_sh_executable,
+                "base_runtime_ready": base_runtime_ready_field,
             }),
         );
     }
@@ -6280,6 +6886,125 @@ async fn forward_system_action_to_hive_with_timeout(
     .await
 }
 
+async fn relay_identity_system_call_ok(
+    state: &OrchestratorState,
+    target: &str,
+    action: &str,
+    payload: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, IdentityError> {
+    let socket_dir = json_router::paths::router_socket_dir();
+    let relay_name = format!("SY.orchestrator.relay.{}", now_epoch_ms());
+    let relay_config = NodeConfig {
+        name: relay_name,
+        router_socket: socket_dir,
+        uuid_persistence_dir: state.state_dir.join("nodes"),
+        config_dir: state.config_dir.clone(),
+        version: "1.0".to_string(),
+    };
+    let connect_timeout = Duration::from_secs(5);
+    let (relay_sender, mut relay_receiver) = match time::timeout(
+        connect_timeout,
+        connect_with_retry(&relay_config, Duration::from_millis(100)),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(IdentityError::Node)?,
+        Err(_) => {
+            return Err(IdentityError::InvalidResponse(format!(
+                "system forward timeout while connecting relay node to local router ({}s)",
+                connect_timeout.as_secs()
+            )));
+        }
+    };
+
+    let result = identity_system_call_ok(
+        &relay_sender,
+        &mut relay_receiver,
+        IdentitySystemRequest {
+            target,
+            fallback_target: None,
+            action,
+            payload,
+            timeout,
+        },
+    )
+    .await;
+    let _ = relay_sender.close().await;
+    result.map(|out| out.payload)
+}
+
+fn identity_error_code_and_message(err: &IdentityError) -> (String, String) {
+    match err {
+        IdentityError::SystemRejected {
+            error_code,
+            message,
+            ..
+        } => (error_code.clone(), message.clone()),
+        IdentityError::ProvisionRejected {
+            error_code,
+            message,
+        } => (error_code.clone(), message.clone()),
+        IdentityError::Unreachable {
+            reason,
+            original_dst,
+        } => (
+            "UNREACHABLE".to_string(),
+            format!("reason={} original_dst={}", reason, original_dst),
+        ),
+        IdentityError::TtlExceeded {
+            original_dst,
+            last_hop,
+        } => (
+            "TTL_EXCEEDED".to_string(),
+            format!("original_dst={} last_hop={}", original_dst, last_hop),
+        ),
+        IdentityError::Timeout {
+            trace_id,
+            target,
+            timeout_ms,
+        } => (
+            "TIMEOUT".to_string(),
+            format!(
+                "trace_id={} target={} timeout_ms={}",
+                trace_id, target, timeout_ms
+            ),
+        ),
+        IdentityError::ActionTimeout {
+            action,
+            trace_id,
+            target,
+            timeout_ms,
+        } => (
+            "TIMEOUT".to_string(),
+            format!(
+                "action={} trace_id={} target={} timeout_ms={}",
+                action, trace_id, target, timeout_ms
+            ),
+        ),
+        IdentityError::InvalidRequest(message) => ("INVALID_REQUEST".to_string(), message.clone()),
+        IdentityError::InvalidResponse(message) => {
+            ("INVALID_RESPONSE".to_string(), message.clone())
+        }
+        IdentityError::Node(err) => ("NODE_ERROR".to_string(), err.to_string()),
+        IdentityError::Json(err) => ("JSON_ERROR".to_string(), err.to_string()),
+    }
+}
+
+fn map_identity_action_result(
+    action_label: &str,
+    result: Result<serde_json::Value, IdentityError>,
+) -> Result<serde_json::Value, OrchestratorError> {
+    result.map_err(|err| {
+        let (error_code, message) = identity_error_code_and_message(&err);
+        format!(
+            "identity {} failed code={} message={}",
+            action_label, error_code, message
+        )
+        .into()
+    })
+}
+
 async fn ensure_node_identity_registered(
     state: &OrchestratorState,
     payload: &serde_json::Value,
@@ -6316,34 +7041,15 @@ async fn ensure_node_identity_registered(
         "capabilities": capabilities,
     });
     let identity_target = format!("SY.identity@{}", identity_primary_hive_id);
-    let response = relay_system_action(
+    let response = relay_identity_system_call_ok(
         state,
         &identity_target,
         MSG_ILK_REGISTER,
-        MSG_ILK_REGISTER_RESPONSE,
         request_payload,
         system_forward_timeout(),
     )
-    .await?;
-    let status = response
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("error");
-    if status != "ok" {
-        let error_code = response
-            .get("error_code")
-            .and_then(|v| v.as_str())
-            .unwrap_or("IDENTITY_REGISTER_FAILED");
-        let message = response
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("identity register returned non-ok status");
-        return Err(format!(
-            "identity register failed code={} message={}",
-            error_code, message
-        )
-        .into());
-    }
+    .await;
+    let response = map_identity_action_result("register", response)?;
 
     let resolved_ilk_id = response
         .get("ilk_id")
@@ -6404,34 +7110,15 @@ async fn apply_node_identity_update(
         "change_reason": change_reason,
     });
     let identity_target = format!("SY.identity@{}", identity_primary_hive_id);
-    let response = relay_system_action(
+    let update_result = relay_identity_system_call_ok(
         state,
         &identity_target,
         MSG_ILK_UPDATE,
-        MSG_ILK_UPDATE_RESPONSE,
         request_payload,
         system_forward_timeout(),
     )
-    .await?;
-    let status = response
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("error");
-    if status != "ok" {
-        let error_code = response
-            .get("error_code")
-            .and_then(|v| v.as_str())
-            .unwrap_or("IDENTITY_UPDATE_FAILED");
-        let message = response
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("identity update returned non-ok status");
-        return Err(format!(
-            "identity update failed code={} message={}",
-            error_code, message
-        )
-        .into());
-    }
+    .await;
+    let _ = map_identity_action_result("update", update_result)?;
 
     Ok(Some(serde_json::json!({
         "status": "ok",
@@ -7108,8 +7795,8 @@ async fn get_node_status_flow(
             }
         });
     let observed_at_ms = now_epoch_ms();
-    let observed_at = epoch_ms_to_iso_utc(observed_at_ms)
-        .unwrap_or_else(|| observed_at_ms.to_string());
+    let observed_at =
+        epoch_ms_to_iso_utc(observed_at_ms).unwrap_or_else(|| observed_at_ms.to_string());
     let config_updated_at = config_updated_at_ms
         .and_then(epoch_ms_to_iso_utc)
         .or_else(|| config_updated_at_ms.map(|value| value.to_string()));
@@ -7537,13 +8224,20 @@ async fn run_node_flow(
         };
     }
 
-    let manifest = match load_runtime_manifest() {
-        Some(manifest) => manifest,
-        None => {
+    let manifest = match load_runtime_manifest_result() {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "RUNTIME_MANIFEST_MISSING",
                 "message": "runtime manifest not found",
+            });
+        }
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "MANIFEST_INVALID",
+                "message": err.to_string(),
             });
         }
     };
@@ -7569,33 +8263,36 @@ async fn run_node_flow(
         }
     };
 
-    let start_script = runtime_start_script(&runtime_key, &version);
-    let start_script_path = PathBuf::from(&start_script);
-    if !local_runtime_script_exists(&start_script) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "RUNTIME_NOT_PRESENT",
-            "message": format!("runtime script missing in dist path: {}", start_script),
-            "runtime": runtime_key,
-            "version": version,
-            "expected_path": start_script,
-            "hint": "Run SYSTEM_UPDATE to materialize this runtime on the worker",
-            "target": target_hive,
-            "node_name": node_name,
-        });
-    }
-    if !local_runtime_script_is_executable(&start_script_path) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "RUNTIME_NOT_PRESENT",
-            "message": format!("runtime script exists but is not executable: {}", start_script),
-            "runtime": runtime_key,
-            "version": version,
-            "expected_path": start_script,
-            "hint": "Fix permissions (chmod +x) and run SYSTEM_UPDATE",
-            "target": target_hive,
-            "node_name": node_name,
-        });
+    let entrypoint = match resolve_runtime_spawn_entrypoint(&manifest, &runtime_key, &version) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": err.error_code(),
+                "message": err.message(),
+            });
+        }
+    };
+    if let Some(runtime_base) = entrypoint.runtime_base.as_deref() {
+        if let Err(payload) = runtime_base_start_script_preflight(
+            &runtime_key,
+            &version,
+            runtime_base,
+            &entrypoint.script_version,
+            &entrypoint.script_path,
+            &target_hive,
+            &node_name,
+        ) {
+            return payload;
+        }
+    } else if let Err(payload) = runtime_start_script_preflight(
+        &entrypoint.script_runtime,
+        &entrypoint.script_version,
+        &entrypoint.script_path,
+        &target_hive,
+        &node_name,
+    ) {
+        return payload;
     }
 
     let identity_register = match ensure_node_identity_registered(
@@ -7695,6 +8392,11 @@ async fn run_node_flow(
             }
         });
     }
+    let package_path = entrypoint.runtime_base.as_ref().map(|_| {
+        runtime_package_dir(&runtime_key, &version)
+            .display()
+            .to_string()
+    });
     let node_config = match ensure_node_effective_config_on_spawn(
         state,
         payload,
@@ -7702,6 +8404,8 @@ async fn run_node_flow(
         &target_hive,
         &runtime_key,
         &version,
+        entrypoint.runtime_base.as_deref(),
+        package_path.as_deref(),
         identity_ilk_id.as_deref(),
     ) {
         Ok(value) => value,
@@ -7751,7 +8455,7 @@ async fn run_node_flow(
 
     let cmd = format!(
         "systemd-run --unit {} --collect --property Restart=always --property RestartSec=5 {}",
-        unit, start_script
+        unit, entrypoint.script_path
     );
 
     match execute_on_hive(state, &target_hive, &cmd, "run_node") {
@@ -11187,5 +11891,890 @@ blob:
 
         assert!(!changed);
         assert_eq!(updated, config);
+    }
+
+    #[test]
+    fn identity_error_code_and_message_maps_system_rejected() {
+        let err = IdentityError::SystemRejected {
+            action: MSG_ILK_REGISTER.to_string(),
+            error_code: "INVALID_TENANT".to_string(),
+            message: "tenant missing".to_string(),
+        };
+        let (code, message) = identity_error_code_and_message(&err);
+        assert_eq!(code, "INVALID_TENANT");
+        assert_eq!(message, "tenant missing");
+    }
+
+    #[test]
+    fn identity_error_code_and_message_maps_action_timeout() {
+        let err = IdentityError::ActionTimeout {
+            action: MSG_ILK_UPDATE.to_string(),
+            trace_id: "trace-123".to_string(),
+            target: "SY.identity@motherbee".to_string(),
+            timeout_ms: 2500,
+        };
+        let (code, message) = identity_error_code_and_message(&err);
+        assert_eq!(code, "TIMEOUT");
+        assert!(message.contains("action=ILK_UPDATE"));
+        assert!(message.contains("trace_id=trace-123"));
+    }
+
+    #[test]
+    fn map_identity_action_result_returns_payload_for_ok() {
+        let payload = serde_json::json!({"status": "ok", "ilk_id": "ilk:demo"});
+        let out = map_identity_action_result("register", Ok(payload.clone())).expect("ok");
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn map_identity_action_result_formats_register_error() {
+        let err = IdentityError::SystemRejected {
+            action: MSG_ILK_REGISTER.to_string(),
+            error_code: "INVALID_TENANT".to_string(),
+            message: "tenant missing".to_string(),
+        };
+        let out = map_identity_action_result("register", Err(err)).expect_err("must fail");
+        let message = out.to_string();
+        assert!(message.contains("identity register failed"));
+        assert!(message.contains("code=INVALID_TENANT"));
+        assert!(message.contains("message=tenant missing"));
+    }
+
+    #[test]
+    fn map_identity_action_result_formats_update_error() {
+        let err = IdentityError::ActionTimeout {
+            action: MSG_ILK_UPDATE.to_string(),
+            trace_id: "trace-999".to_string(),
+            target: "SY.identity@motherbee".to_string(),
+            timeout_ms: 5000,
+        };
+        let out = map_identity_action_result("update", Err(err)).expect_err("must fail");
+        let message = out.to_string();
+        assert!(message.contains("identity update failed"));
+        assert!(message.contains("code=TIMEOUT"));
+        assert!(message.contains("action=ILK_UPDATE"));
+    }
+
+    #[test]
+    fn parse_runtime_manifest_accepts_schema_v1() {
+        let path = PathBuf::from("/tmp/runtime-manifest-v1.json");
+        let manifest = parse_runtime_manifest_file(
+            &path,
+            r#"{
+                "schema_version": 1,
+                "version": 1710000000000,
+                "updated_at": "2026-03-16T00:00:00Z",
+                "runtimes": {}
+            }"#,
+        )
+        .expect("schema v1 should be accepted");
+        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.version, 1710000000000);
+    }
+
+    #[test]
+    fn parse_runtime_manifest_accepts_schema_v2() {
+        let path = PathBuf::from("/tmp/runtime-manifest-v2.json");
+        let manifest = parse_runtime_manifest_file(
+            &path,
+            r#"{
+                "schema_version": 2,
+                "version": 1710000000001,
+                "updated_at": "2026-03-16T00:00:01Z",
+                "runtimes": {}
+            }"#,
+        )
+        .expect("schema v2 should be accepted");
+        assert_eq!(manifest.schema_version, 2);
+        assert_eq!(manifest.version, 1710000000001);
+    }
+
+    #[test]
+    fn parse_runtime_manifest_rejects_unknown_schema_explicitly() {
+        let path = PathBuf::from("/tmp/runtime-manifest-v3.json");
+        let err = parse_runtime_manifest_file(
+            &path,
+            r#"{
+                "schema_version": 3,
+                "version": 1710000000002,
+                "updated_at": "2026-03-16T00:00:02Z",
+                "runtimes": {}
+            }"#,
+        )
+        .expect_err("unsupported schema must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported schema_version=3"));
+        assert!(msg.contains("supported=1..=2"));
+    }
+
+    #[test]
+    fn runtime_start_script_preflight_missing_returns_runtime_not_present() {
+        let runtime = format!("wf.preflight.{}", Uuid::new_v4().simple());
+        let version = format!("diag-{}", Uuid::new_v4().simple());
+        let start_script = format!(
+            "/tmp/fluxbee-preflight-{}/bin/start.sh",
+            Uuid::new_v4().simple()
+        );
+        let _ = std::fs::remove_file(&start_script);
+
+        let out = runtime_start_script_preflight(
+            &runtime,
+            &version,
+            &start_script,
+            "worker-220",
+            "WF.preflight.test@worker-220",
+        )
+        .expect_err("missing script must fail");
+
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["error_code"], "RUNTIME_NOT_PRESENT");
+        assert_eq!(out["runtime"], runtime);
+        assert_eq!(out["version"], version);
+        assert_eq!(out["expected_path"], start_script);
+    }
+
+    #[test]
+    fn runtime_readiness_entry_keeps_fr8_fields() {
+        let runtime = format!("wf.readiness.{}", Uuid::new_v4().simple());
+        let version = format!("diag-{}", Uuid::new_v4().simple());
+        let entry = RuntimeManifestEntry {
+            available: vec![version.clone()],
+            current: Some(version),
+            package_type: None,
+            runtime_base: None,
+            extra: BTreeMap::new(),
+        };
+        let readiness = runtime_readiness_for_entry(&runtime, &entry, None);
+        let item = readiness
+            .as_object()
+            .and_then(|map| map.values().next())
+            .expect("readiness item");
+
+        assert!(item.get("runtime_present").is_some());
+        assert!(item.get("start_sh_executable").is_some());
+        assert!(item.get("base_runtime_ready").is_some());
+    }
+
+    #[test]
+    fn runtime_readiness_full_runtime_sets_base_runtime_ready_true() {
+        let root = std::env::temp_dir().join(format!("fluxbee-readiness-{}", Uuid::new_v4()));
+        let runtime = "ai.runtime.full";
+        let version = "1.0.0";
+        let start_script = root.join(runtime).join(version).join("bin/start.sh");
+        fs::create_dir_all(
+            start_script
+                .parent()
+                .expect("start script parent directory must exist"),
+        )
+        .expect("create bin dir");
+        fs::write(&start_script, "#!/usr/bin/env bash\necho ok\n").expect("write start.sh");
+        let mut perms = fs::metadata(&start_script)
+            .expect("stat start.sh")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&start_script, perms).expect("chmod start.sh");
+
+        let entry = RuntimeManifestEntry {
+            available: vec![version.to_string()],
+            current: Some(version.to_string()),
+            package_type: Some("full_runtime".to_string()),
+            runtime_base: None,
+            extra: BTreeMap::new(),
+        };
+        let readiness = runtime_readiness_for_entry_with_root(runtime, &entry, None, &root);
+        let item = readiness
+            .as_object()
+            .and_then(|map| map.get(version))
+            .expect("readiness item");
+        assert_eq!(item["runtime_present"], serde_json::json!(true));
+        assert_eq!(item["start_sh_executable"], serde_json::json!(true));
+        assert_eq!(item["base_runtime_ready"], serde_json::json!(true));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_readiness_config_only_sets_base_runtime_ready_from_base_runtime() {
+        let root = std::env::temp_dir().join(format!("fluxbee-readiness-{}", Uuid::new_v4()));
+        let runtime = "ai.runtime.config";
+        let version = "1.0.0";
+        let base_runtime = "ai.generic";
+        let base_version = "3.0.0";
+        let package_dir = root.join(runtime).join(version);
+        let base_start = root
+            .join(base_runtime)
+            .join(base_version)
+            .join("bin/start.sh");
+
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        fs::create_dir_all(
+            base_start
+                .parent()
+                .expect("base start script parent directory must exist"),
+        )
+        .expect("create base bin dir");
+        fs::write(&base_start, "#!/usr/bin/env bash\necho ok\n").expect("write base start");
+        let mut perms = fs::metadata(&base_start)
+            .expect("stat base start")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&base_start, perms).expect("chmod base start");
+
+        let entry = RuntimeManifestEntry {
+            available: vec![version.to_string()],
+            current: Some(version.to_string()),
+            package_type: Some("config_only".to_string()),
+            runtime_base: Some(base_runtime.to_string()),
+            extra: BTreeMap::new(),
+        };
+        let runtime_entries = serde_json::json!({
+            runtime: {
+                "available": [version],
+                "current": version,
+                "type": "config_only",
+                "runtime_base": base_runtime
+            },
+            base_runtime: {
+                "available": [base_version],
+                "current": base_version,
+                "type": "full_runtime"
+            }
+        });
+        let readiness = runtime_readiness_for_entry_with_root(
+            runtime,
+            &entry,
+            runtime_entries.as_object(),
+            &root,
+        );
+        let item = readiness
+            .as_object()
+            .and_then(|map| map.get(version))
+            .expect("readiness item");
+        assert_eq!(item["runtime_present"], serde_json::json!(true));
+        assert_eq!(item["start_sh_executable"], serde_json::json!(true));
+        assert_eq!(item["base_runtime_ready"], serde_json::json!(true));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_manifest_entry_from_value_preserves_extra_fields() {
+        let raw = serde_json::json!({
+            "available": ["1.0.0"],
+            "current": "1.0.0",
+            "type": "config_only",
+            "runtime_base": "ai.generic",
+            "custom_policy": {
+                "foo": "bar"
+            }
+        });
+
+        let entry =
+            runtime_manifest_entry_from_value("ai.test.config", &raw).expect("typed entry parse");
+
+        assert_eq!(entry.package_type.as_deref(), Some("config_only"));
+        assert_eq!(entry.runtime_base.as_deref(), Some("ai.generic"));
+        assert_eq!(
+            entry.extra.get("custom_policy"),
+            Some(&serde_json::json!({"foo":"bar"}))
+        );
+    }
+
+    #[test]
+    fn legacy_manifest_entry_without_type_uses_full_runtime_path_contract() {
+        let runtime = "ai.legacy.sample";
+        let current = "1.2.3";
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000001111,
+            updated_at: Some("2026-03-16T00:10:00Z".to_string()),
+            runtimes: serde_json::json!({
+                runtime: {
+                    "available": [current],
+                    "current": current
+                }
+            }),
+            hash: None,
+        };
+
+        let runtime_key = resolve_runtime_key(&manifest, runtime).expect("runtime key");
+        let resolved_version =
+            resolve_runtime_version(&manifest, &runtime_key, "current").expect("version");
+        let start_script = runtime_start_script(&runtime_key, &resolved_version);
+
+        assert_eq!(
+            start_script,
+            format!(
+                "/var/lib/fluxbee/dist/runtimes/{}/{}/bin/start.sh",
+                runtime, current
+            )
+        );
+    }
+
+    #[test]
+    fn full_runtime_type_keeps_same_start_script_contract() {
+        let runtime = "wf.legacy.full";
+        let current = "0.0.7";
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000002222,
+            updated_at: Some("2026-03-16T00:20:00Z".to_string()),
+            runtimes: serde_json::json!({
+                runtime: {
+                    "available": [current],
+                    "current": current,
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let runtime_key = resolve_runtime_key(&manifest, runtime).expect("runtime key");
+        let resolved_version =
+            resolve_runtime_version(&manifest, &runtime_key, "current").expect("version");
+        let start_script = runtime_start_script(&runtime_key, &resolved_version);
+
+        assert_eq!(
+            start_script,
+            format!(
+                "/var/lib/fluxbee/dist/runtimes/{}/{}/bin/start.sh",
+                runtime, current
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_spawn_entrypoint_full_runtime_uses_own_start_script() {
+        let runtime = "ai.agent.full";
+        let version = "1.3.0";
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000003333,
+            updated_at: Some("2026-03-16T00:30:00Z".to_string()),
+            runtimes: serde_json::json!({
+                runtime: {
+                    "available": [version],
+                    "current": version,
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let entrypoint =
+            resolve_runtime_spawn_entrypoint(&manifest, runtime, version).expect("entrypoint");
+        assert_eq!(entrypoint.script_runtime, runtime);
+        assert_eq!(entrypoint.script_version, version);
+        assert_eq!(
+            entrypoint.script_path,
+            format!(
+                "/var/lib/fluxbee/dist/runtimes/{}/{}/bin/start.sh",
+                runtime, version
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_spawn_entrypoint_config_only_uses_base_runtime_start_script() {
+        let runtime = "ai.agent.billing";
+        let runtime_version = "2.1.0";
+        let base_runtime = "ai.generic";
+        let base_version = "5.0.0";
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000004444,
+            updated_at: Some("2026-03-16T00:40:00Z".to_string()),
+            runtimes: serde_json::json!({
+                runtime: {
+                    "available": [runtime_version],
+                    "current": runtime_version,
+                    "type": "config_only",
+                    "runtime_base": base_runtime
+                },
+                base_runtime: {
+                    "available": [base_version],
+                    "current": base_version,
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let entrypoint = resolve_runtime_spawn_entrypoint(&manifest, runtime, runtime_version)
+            .expect("entrypoint");
+        assert_eq!(entrypoint.script_runtime, base_runtime);
+        assert_eq!(entrypoint.script_version, base_version);
+        assert_eq!(
+            entrypoint.script_path,
+            format!(
+                "/var/lib/fluxbee/dist/runtimes/{}/{}/bin/start.sh",
+                base_runtime, base_version
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_spawn_entrypoint_workflow_uses_base_runtime_start_script() {
+        let runtime = "wf.onboarding.standard";
+        let runtime_version = "1.0.0";
+        let base_runtime = "wf.engine";
+        let base_version = "9.9.1";
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000005555,
+            updated_at: Some("2026-03-16T00:50:00Z".to_string()),
+            runtimes: serde_json::json!({
+                runtime: {
+                    "available": [runtime_version],
+                    "current": runtime_version,
+                    "type": "workflow",
+                    "runtime_base": base_runtime
+                },
+                base_runtime: {
+                    "available": [base_version],
+                    "current": base_version,
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let entrypoint = resolve_runtime_spawn_entrypoint(&manifest, runtime, runtime_version)
+            .expect("entrypoint");
+        assert_eq!(entrypoint.script_runtime, base_runtime);
+        assert_eq!(entrypoint.script_version, base_version);
+        assert_eq!(
+            entrypoint.script_path,
+            format!(
+                "/var/lib/fluxbee/dist/runtimes/{}/{}/bin/start.sh",
+                base_runtime, base_version
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_spawn_entrypoint_missing_runtime_base_returns_specific_error() {
+        let runtime = "ai.agent.config";
+        let runtime_version = "1.0.0";
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000006666,
+            updated_at: Some("2026-03-16T01:00:00Z".to_string()),
+            runtimes: serde_json::json!({
+                runtime: {
+                    "available": [runtime_version],
+                    "current": runtime_version,
+                    "type": "config_only"
+                }
+            }),
+            hash: None,
+        };
+
+        let err = resolve_runtime_spawn_entrypoint(&manifest, runtime, runtime_version)
+            .expect_err("missing runtime_base must fail");
+        assert_eq!(err.error_code(), "MISSING_RUNTIME_BASE");
+    }
+
+    #[test]
+    fn resolve_runtime_spawn_entrypoint_unknown_base_returns_specific_error() {
+        let runtime = "ai.agent.config";
+        let runtime_version = "1.0.0";
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000007777,
+            updated_at: Some("2026-03-16T01:10:00Z".to_string()),
+            runtimes: serde_json::json!({
+                runtime: {
+                    "available": [runtime_version],
+                    "current": runtime_version,
+                    "type": "config_only",
+                    "runtime_base": "ai.missing"
+                }
+            }),
+            hash: None,
+        };
+
+        let err = resolve_runtime_spawn_entrypoint(&manifest, runtime, runtime_version)
+            .expect_err("unknown runtime_base must fail");
+        assert_eq!(err.error_code(), "BASE_RUNTIME_NOT_AVAILABLE");
+    }
+
+    #[test]
+    fn resolve_runtime_spawn_entrypoint_unknown_package_type_returns_specific_error() {
+        let runtime = "ai.agent.weird";
+        let runtime_version = "1.0.0";
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000008888,
+            updated_at: Some("2026-03-16T01:20:00Z".to_string()),
+            runtimes: serde_json::json!({
+                runtime: {
+                    "available": [runtime_version],
+                    "current": runtime_version,
+                    "type": "strange_mode"
+                }
+            }),
+            hash: None,
+        };
+
+        let err = resolve_runtime_spawn_entrypoint(&manifest, runtime, runtime_version)
+            .expect_err("unknown package type must fail");
+        assert_eq!(err.error_code(), "UNKNOWN_PACKAGE_TYPE");
+    }
+
+    #[test]
+    fn runtime_base_start_script_preflight_missing_returns_base_runtime_not_present() {
+        let runtime = format!("wf.preflight.base.{}", Uuid::new_v4().simple());
+        let version = format!("diag-{}", Uuid::new_v4().simple());
+        let base_runtime = "wf.engine";
+        let base_version = "9.0.0";
+        let start_script = format!(
+            "/tmp/fluxbee-preflight-base-{}/bin/start.sh",
+            Uuid::new_v4().simple()
+        );
+        let _ = std::fs::remove_file(&start_script);
+
+        let out = runtime_base_start_script_preflight(
+            &runtime,
+            &version,
+            base_runtime,
+            base_version,
+            &start_script,
+            "worker-220",
+            "WF.preflight.base.test@worker-220",
+        )
+        .expect_err("missing base runtime script must fail");
+
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["error_code"], "BASE_RUNTIME_NOT_PRESENT");
+        assert_eq!(out["runtime"], runtime);
+        assert_eq!(out["runtime_base"], base_runtime);
+        assert_eq!(out["base_version"], base_version);
+        assert_eq!(out["expected_path"], start_script);
+    }
+
+    #[test]
+    fn verify_runtime_current_artifacts_with_root_config_only_requires_runtime_base_start_script() {
+        let root = std::env::temp_dir().join(format!("fluxbee-verify-{}", Uuid::new_v4()));
+        let runtime = "ai.agent.config";
+        let runtime_version = "2.0.0";
+        let base_runtime = "ai.generic";
+        let base_version = "5.1.0";
+
+        fs::create_dir_all(root.join(runtime).join(runtime_version)).expect("runtime package dir");
+
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000011111,
+            updated_at: Some("2026-03-16T01:40:00Z".to_string()),
+            runtimes: serde_json::json!({
+                runtime: {
+                    "available": [runtime_version],
+                    "current": runtime_version,
+                    "type": "config_only",
+                    "runtime_base": base_runtime
+                },
+                base_runtime: {
+                    "available": [base_version],
+                    "current": base_version,
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let errors = verify_runtime_current_artifacts_with_root(&manifest, &root).expect("verify");
+        assert!(
+            errors
+                .iter()
+                .any(|item| item.contains("missing base start.sh")
+                    && item.contains("runtime_base='ai.generic'")),
+            "expected missing base start.sh error in {:?}",
+            errors
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verify_runtime_current_artifacts_with_root_workflow_ok_when_base_runtime_ready() {
+        let root = std::env::temp_dir().join(format!("fluxbee-verify-{}", Uuid::new_v4()));
+        let runtime = "wf.onboarding.standard";
+        let runtime_version = "1.0.0";
+        let base_runtime = "wf.engine";
+        let base_version = "9.2.0";
+        let base_start = root
+            .join(base_runtime)
+            .join(base_version)
+            .join("bin/start.sh");
+
+        fs::create_dir_all(root.join(runtime).join(runtime_version)).expect("runtime package dir");
+        fs::create_dir_all(
+            base_start
+                .parent()
+                .expect("base start script parent directory must exist"),
+        )
+        .expect("base bin dir");
+        fs::write(&base_start, "#!/usr/bin/env bash\necho ok\n").expect("write base start.sh");
+        let mut perms = fs::metadata(&base_start)
+            .expect("stat base start.sh")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&base_start, perms).expect("chmod base start.sh");
+
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000012222,
+            updated_at: Some("2026-03-16T01:50:00Z".to_string()),
+            runtimes: serde_json::json!({
+                runtime: {
+                    "available": [runtime_version],
+                    "current": runtime_version,
+                    "type": "workflow",
+                    "runtime_base": base_runtime
+                },
+                base_runtime: {
+                    "available": [base_version],
+                    "current": base_version,
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let errors = verify_runtime_current_artifacts_with_root(&manifest, &root).expect("verify");
+        assert!(errors.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_runtime_config_template_with_root_uses_default_template_path() {
+        let root = std::env::temp_dir().join(format!("fluxbee-template-{}", Uuid::new_v4()));
+        let runtime = "ai.template.default";
+        let version = "1.0.0";
+        let template_path = root
+            .join(runtime)
+            .join(version)
+            .join("config/default-config.json");
+        fs::create_dir_all(
+            template_path
+                .parent()
+                .expect("template parent directory must exist"),
+        )
+        .expect("create template dir");
+        fs::write(
+            &template_path,
+            r#"{"model":"gpt-5","temperature":0.2,"tenant_id":"tnt:from-template"}"#,
+        )
+        .expect("write template");
+
+        let template = load_runtime_config_template_with_root(runtime, version, &root)
+            .expect("load template")
+            .expect("template should exist");
+        assert_eq!(template.get("model"), Some(&serde_json::json!("gpt-5")));
+        assert_eq!(template.get("temperature"), Some(&serde_json::json!(0.2)));
+        assert_eq!(
+            template.get("tenant_id"),
+            Some(&serde_json::json!("tnt:from-template"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_runtime_config_template_with_root_uses_package_json_config_template_field() {
+        let root = std::env::temp_dir().join(format!("fluxbee-template-{}", Uuid::new_v4()));
+        let runtime = "ai.template.custom";
+        let version = "2.0.0";
+        let package_dir = root.join(runtime).join(version);
+        fs::create_dir_all(package_dir.join("templates")).expect("create package dir");
+        fs::write(
+            package_dir.join("package.json"),
+            r#"{"config_template":"templates/runtime.json"}"#,
+        )
+        .expect("write package.json");
+        fs::write(
+            package_dir.join("templates/runtime.json"),
+            r#"{"model":"gpt-5-mini","region":"ar"}"#,
+        )
+        .expect("write template");
+
+        let template = load_runtime_config_template_with_root(runtime, version, &root)
+            .expect("load template")
+            .expect("template should exist");
+        assert_eq!(
+            template.get("model"),
+            Some(&serde_json::json!("gpt-5-mini"))
+        );
+        assert_eq!(template.get("region"), Some(&serde_json::json!("ar")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_runtime_config_template_with_root_rejects_parent_traversal() {
+        let root = std::env::temp_dir().join(format!("fluxbee-template-{}", Uuid::new_v4()));
+        let runtime = "ai.template.invalid";
+        let version = "3.0.0";
+        let package_dir = root.join(runtime).join(version);
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        fs::write(
+            package_dir.join("package.json"),
+            r#"{"config_template":"../secret.json"}"#,
+        )
+        .expect("write package.json");
+
+        let err = load_runtime_config_template_with_root(runtime, version, &root)
+            .expect_err("parent traversal must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("must not contain parent traversal"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn assemble_spawn_config_map_applies_template_then_request_then_forced_system() {
+        let template = serde_json::json!({
+            "model": "gpt-5",
+            "temperature": 0.2,
+            "tenant_id": "tnt:template",
+            "_system": {"managed_by": "template"}
+        })
+        .as_object()
+        .expect("template object")
+        .clone();
+        let request_patch = serde_json::json!({
+            "temperature": 0.9,
+            "max_tokens": 4096,
+            "tenant_id": "tnt:request"
+        })
+        .as_object()
+        .expect("request object")
+        .clone();
+        let forced_system = serde_json::json!({
+            "managed_by": "SY.orchestrator",
+            "config_version": 1
+        });
+
+        let out = assemble_spawn_config_map(
+            Some(template),
+            request_patch,
+            Some("tnt:resolved".to_string()),
+            Some(forced_system.clone()),
+        );
+
+        assert_eq!(out.get("model"), Some(&serde_json::json!("gpt-5")));
+        assert_eq!(out.get("temperature"), Some(&serde_json::json!(0.9)));
+        assert_eq!(out.get("max_tokens"), Some(&serde_json::json!(4096)));
+        assert_eq!(
+            out.get("tenant_id"),
+            Some(&serde_json::json!("tnt:request"))
+        );
+        assert_eq!(out.get("_system"), Some(&forced_system));
+    }
+
+    #[test]
+    fn assemble_spawn_config_map_uses_resolved_tenant_only_when_missing() {
+        let request_patch = serde_json::json!({
+            "model": "gpt-5-mini"
+        })
+        .as_object()
+        .expect("request object")
+        .clone();
+
+        let out =
+            assemble_spawn_config_map(None, request_patch, Some("tnt:resolved".to_string()), None);
+
+        assert_eq!(out.get("model"), Some(&serde_json::json!("gpt-5-mini")));
+        assert_eq!(
+            out.get("tenant_id"),
+            Some(&serde_json::json!("tnt:resolved"))
+        );
+        assert!(out.get("_system").is_none());
+    }
+
+    #[test]
+    fn build_node_system_block_includes_runtime_base_and_package_path_when_provided() {
+        let system = build_node_system_block(
+            "AI.billing@worker-220",
+            "worker-220",
+            Some("ai.billing"),
+            Some("2.1.0"),
+            Some("ai.generic"),
+            Some("/var/lib/fluxbee/dist/runtimes/ai.billing/2.1.0"),
+            Some("ilk:11111111-1111-1111-1111-111111111111"),
+            Some("tnt:22222222-2222-2222-2222-222222222222"),
+            1,
+        );
+        assert_eq!(system["runtime_base"], serde_json::json!("ai.generic"));
+        assert_eq!(
+            system["package_path"],
+            serde_json::json!("/var/lib/fluxbee/dist/runtimes/ai.billing/2.1.0")
+        );
+    }
+
+    #[test]
+    fn build_node_system_block_preserves_existing_identity_and_system_fields() {
+        let system = build_node_system_block(
+            "WF.demo.l1@worker-220",
+            "worker-220",
+            Some("wf.orch.diag"),
+            Some("current"),
+            None,
+            None,
+            Some("ilk:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            Some("tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+            7,
+        );
+        let obj = system.as_object().expect("system block must be object");
+
+        assert_eq!(
+            obj.get("managed_by"),
+            Some(&serde_json::json!("SY.orchestrator"))
+        );
+        assert_eq!(
+            obj.get("node_name"),
+            Some(&serde_json::json!("WF.demo.l1@worker-220"))
+        );
+        assert_eq!(obj.get("hive_id"), Some(&serde_json::json!("worker-220")));
+        assert_eq!(obj.get("runtime"), Some(&serde_json::json!("wf.orch.diag")));
+        assert_eq!(
+            obj.get("runtime_version"),
+            Some(&serde_json::json!("current"))
+        );
+        assert_eq!(
+            obj.get("ilk_id"),
+            Some(&serde_json::json!(
+                "ilk:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+            ))
+        );
+        assert_eq!(
+            obj.get("tenant_id"),
+            Some(&serde_json::json!(
+                "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            ))
+        );
+        assert_eq!(obj.get("config_version"), Some(&serde_json::json!(7)));
+        assert!(obj.get("created_at_ms").and_then(|v| v.as_u64()).is_some());
+        assert!(obj.get("updated_at_ms").and_then(|v| v.as_u64()).is_some());
+    }
+
+    #[test]
+    fn build_node_system_block_omits_runtime_base_and_package_path_when_absent() {
+        let system = build_node_system_block(
+            "AI.core@worker-220",
+            "worker-220",
+            Some("ai.core"),
+            Some("1.0.0"),
+            None,
+            None,
+            None,
+            None,
+            1,
+        );
+        let system_obj = system.as_object().expect("system must be object");
+        assert!(!system_obj.contains_key("runtime_base"));
+        assert!(!system_obj.contains_key("package_path"));
     }
 }

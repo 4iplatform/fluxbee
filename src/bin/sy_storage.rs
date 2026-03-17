@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time;
-use tokio_postgres::{Client, GenericClient, NoTls};
+use tokio_postgres::{error::SqlState, Client, Config as PgConfig, GenericClient, NoTls};
 use tracing_subscriber::EnvFilter;
 
 use fluxbee_sdk::nats::{
@@ -37,6 +37,7 @@ const DURABLE_QUEUE_ITEMS: &str = "durable.sy-storage.items";
 const DURABLE_QUEUE_REACTIVATION: &str = "durable.sy-storage.reactivation";
 const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const STORAGE_METRICS_QUERY_SID: u32 = 19;
+const STORAGE_DB_NAME: &str = "fluxbee_storage";
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -150,8 +151,10 @@ async fn main() -> Result<(), StorageError> {
         .and_then(|n| n.mode.as_deref())
         .map(|mode| mode.trim().eq_ignore_ascii_case("embedded"))
         .unwrap_or(true);
-    let database_url = database_url(&hive)?;
-    let storage = Arc::new(Storage::connect(&database_url).await?);
+    let base_database_config = database_config(&hive)?;
+    ensure_database_exists(&base_database_config, STORAGE_DB_NAME).await?;
+    let storage_database_config = with_dbname(&base_database_config, STORAGE_DB_NAME);
+    let storage = Arc::new(Storage::connect(&storage_database_config).await?);
     storage.ensure_schema().await?;
     let replayed = storage
         .replay_pending_messages(INBOX_REPLAY_BATCH_SIZE, INBOX_REPLAY_MAX_ROUNDS)
@@ -221,8 +224,8 @@ async fn main() -> Result<(), StorageError> {
 }
 
 impl Storage {
-    async fn connect(database_url: &str) -> Result<Self, StorageError> {
-        let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    async fn connect(database_config: &PgConfig) -> Result<Self, StorageError> {
+        let (client, connection) = database_config.connect(NoTls).await?;
         tokio::spawn(async move {
             if let Err(err) = connection.await {
                 tracing::error!(error = %err, "postgres connection closed");
@@ -1209,7 +1212,7 @@ async fn load_hive(config_dir: &Path) -> Result<HiveFile, StorageError> {
     Ok(serde_yaml::from_str(&data)?)
 }
 
-fn database_url(hive: &HiveFile) -> Result<String, StorageError> {
+fn base_database_url(hive: &HiveFile) -> Result<String, StorageError> {
     if let Ok(url) = std::env::var("FLUXBEE_DATABASE_URL") {
         if !url.trim().is_empty() {
             return Ok(url);
@@ -1230,6 +1233,48 @@ fn database_url(hive: &HiveFile) -> Result<String, StorageError> {
         return Err("database.url empty".into());
     }
     Ok(url.clone())
+}
+
+fn database_config(hive: &HiveFile) -> Result<PgConfig, StorageError> {
+    let url = base_database_url(hive)?;
+    Ok(url.parse::<PgConfig>()?)
+}
+
+fn with_dbname(base: &PgConfig, dbname: &str) -> PgConfig {
+    let mut cfg = base.clone();
+    cfg.dbname(dbname);
+    cfg
+}
+
+fn admin_db_config(base: &PgConfig) -> PgConfig {
+    with_dbname(base, "postgres")
+}
+
+async fn ensure_database_exists(base: &PgConfig, dbname: &str) -> Result<(), StorageError> {
+    let admin_cfg = admin_db_config(base);
+    let (client, connection) = admin_cfg.connect(NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "postgres admin connection closed");
+        }
+    });
+    let exists = client
+        .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&dbname])
+        .await?
+        .is_some();
+    if !exists {
+        let create_sql = format!("CREATE DATABASE \"{dbname}\"");
+        if let Err(err) = client.execute(&create_sql, &[]).await {
+            if err.code() == Some(&SqlState::DUPLICATE_DATABASE) {
+                tracing::info!(db = dbname, "storage database already exists (race)");
+            } else {
+                return Err(err.into());
+            }
+        } else {
+            tracing::info!(db = dbname, "created storage database");
+        }
+    }
+    Ok(())
 }
 
 fn parse_turn(value: Value) -> Result<TurnRecord, StorageError> {
