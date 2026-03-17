@@ -563,7 +563,7 @@ When PUB tasks are completed, compatibility rules become:
 - Missing `runtime_base` is valid only for `full_runtime`.
 - Missing `package.json` in dist directory remains valid for legacy runtimes.
 - Manifest loader accepts schema versions `1` and `2` during migration.
-- Writer emits `schema_version: 2` once all target hives run compatibility code.
+- Writer emits `schema_version: 2` once all target hives run compatibility code and compatibility gate `FLUXBEE_RUNTIME_MANIFEST_WRITE_V2=1` is enabled.
 
 ### 8.3 Migration Order (required)
 
@@ -819,76 +819,78 @@ fluxbee-publish ./package --deploy worker-220
 
 ### Phase 0 — Baseline and Safety Gates (blocking)
 
-- [ ] PUB-T1. Add orchestrator tests that pin current FR-08 behavior before changes:
+- [x] PUB-T1. Add orchestrator tests that pin current FR-08 behavior before changes:
   - `schema_version=1` manifest load.
   - spawn preflight (`RUNTIME_NOT_PRESENT` when missing `start.sh`).
   - runtime readiness fields (`runtime_present`, `start_sh_executable`).
-- [ ] PUB-T2. Add migration-safe manifest loader contract:
+- [x] PUB-T2. Add migration-safe manifest loader contract:
   - accept runtime manifest `schema_version` in `[1,2]`.
   - reject unknown schema versions with explicit error.
-- [ ] PUB-T3. Keep FR-08 stable for legacy runtimes:
+- [x] PUB-T3. Keep FR-08 stable for legacy runtimes:
   - missing `type` => `full_runtime`.
   - `full_runtime` path stays `/bin/start.sh`.
 
 ### Phase 1 — Runtime Manifest v2 Model
 
-- [ ] PUB-T4. Introduce typed manifest runtime entry model:
+- [x] PUB-T4. Introduce typed manifest runtime entry model:
   - `available`, `current`, optional `type`, optional `runtime_base`.
   - preserve unknown fields when possible (forward compatibility).
-- [ ] PUB-T5. Implement manifest read/write helpers used by orchestrator and publish CLI.
-- [ ] PUB-T6. Implement schema migration policy:
+- [x] PUB-T5. Implement manifest read/write helpers used by orchestrator and publish CLI.
+- [x] PUB-T6. Implement schema migration policy:
   - read v1/v2.
   - write v2 only after compatibility gate flag is enabled.
 
 ### Phase 2 — Orchestrator Spawn/Update/Readiness
 
-- [ ] PUB-T7. Implement package-type runtime entrypoint resolution in spawn:
+- [x] PUB-T7. Implement package-type runtime entrypoint resolution in spawn:
   - `full_runtime`: own `bin/start.sh`.
   - `config_only`/`workflow`: base runtime `bin/start.sh`.
-- [ ] PUB-T8. Add spawn validation errors:
+- [x] PUB-T8. Add spawn validation errors:
   - `MISSING_RUNTIME_BASE`
   - `BASE_RUNTIME_NOT_AVAILABLE`
   - `BASE_RUNTIME_NOT_PRESENT`
   - `UNKNOWN_PACKAGE_TYPE`
-- [ ] PUB-T9. Extend `SYSTEM_UPDATE(category=runtime)` verification to be package-type aware:
+- [x] PUB-T9. Extend `SYSTEM_UPDATE(category=runtime)` verification to be package-type aware:
   - for `full_runtime`: validate own `start.sh`.
   - for `config_only`/`workflow`: validate package directory + base runtime `start.sh`.
-- [ ] PUB-T10. Extend readiness payload with `base_runtime_ready` while keeping existing fields.
-- [ ] PUB-T11. Keep existing readiness semantics compatible for legacy clients:
+- [x] PUB-T10. Extend readiness payload with `base_runtime_ready` while keeping existing fields.
+- [x] PUB-T11. Keep readiness contract stable for existing consumers (without legacy execution paths):
   - `runtime_present` and `start_sh_executable` remain present for all versions.
+  - No alternate/legacy runtime resolution logic is retained; only response-field continuity is preserved.
 
 ### Phase 3 — Config Assembly
 
-- [ ] PUB-T12. Implement config template loading from package (`config/default-config.json` or `config_template` field).
-- [ ] PUB-T13. Merge order at spawn:
+- [x] PUB-T12. Implement config template loading from package (`config/default-config.json` or `config_template` field).
+- [x] PUB-T13. Merge order at spawn:
   - template defaults
   - request `config` overrides
   - orchestrator `_system` overwrite
-- [ ] PUB-T14. Inject additional `_system` metadata for non-full runtimes:
+- [x] PUB-T14. Inject additional `_system` metadata for non-full runtimes:
   - `runtime_base`
   - `package_path`
-- [ ] PUB-T15. Preserve existing identity/system fields currently injected by orchestrator.
+- [x] PUB-T15. Preserve existing identity/system fields currently injected by orchestrator.
 
 ### Phase 4 — `fluxbee-publish` CLI
 
-- [ ] PUB-T16. Create CLI binary `fluxbee-publish` in Rust (new `src/bin/fluxbee_publish.rs` or dedicated crate).
-- [ ] PUB-T17. Implement package validation:
+- [x] PUB-T16. Create CLI binary `fluxbee-publish` in Rust (new `src/bin/fluxbee_publish.rs` or dedicated crate).
+- [x] PUB-T17. Implement package validation:
   - validate `package.json` fields and type-specific structure.
   - enforce runtime naming/format policy.
-- [ ] PUB-T18. Implement install step:
+- [x] PUB-T18. Implement install step:
   - copy package to `/var/lib/fluxbee/dist/runtimes/<name>/<version>/`.
   - normalize permissions.
   - atomic manifest update.
-- [ ] PUB-T19. Implement `--dry-run`.
-- [ ] PUB-T20. Implement `--version <override>`.
-- [ ] PUB-T21. Implement `--deploy <hive>`:
+- [x] PUB-T19. Implement `--dry-run`.
+- [x] PUB-T20. Implement `--version <override>`.
+- [x] PUB-T21. Implement `--deploy <hive>`:
   - fetch manifest version/hash from local versions endpoint.
   - call `sync-hint` + `update`.
   - report `ok`/`sync_pending`/`error`.
 
 ### Phase 5 — E2E and Regression Matrix
 
-- [ ] PUB-T22. E2E `full_runtime`: publish -> deploy -> spawn -> running.
+- [x] PUB-T22. E2E `full_runtime`: publish -> deploy -> spawn -> running.
+  - Script: `scripts/runtime_packaging_pub_t22_e2e.sh`
 - [ ] PUB-T23. E2E `config_only`: publish -> deploy -> spawn using base runtime.
 - [ ] PUB-T24. E2E `workflow`: publish -> deploy -> spawn using `wf.engine`.
 - [ ] PUB-T25. E2E negative: missing `runtime_base` / unknown base / base without `start.sh`.
