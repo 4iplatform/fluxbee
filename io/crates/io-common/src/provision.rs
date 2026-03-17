@@ -201,18 +201,9 @@ fn parse_provision_response(msg: WireMessage) -> Result<String, IdentityError> {
 }
 
 fn stable_ich_id(channel: &str, external_id: &str) -> String {
-    let raw = format!("{channel}:{external_id}");
-    let mut out = String::with_capacity(raw.len() + 4);
-    out.push_str("ich:");
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.len() > 120 {
-        out.truncate(120);
-    }
-    out
+    // Canonical identity ids in Fluxbee use prefixed UUIDs (`ich:<uuid>`).
+    // We derive a deterministic UUIDv5 from `(channel, external_id)`.
+    let key = format!("{channel}:{external_id}");
+    let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes());
+    format!("ich:{uuid}")
 }
