@@ -34,6 +34,7 @@ MISSING_BASE_RUNTIME_NAME="${MISSING_BASE_RUNTIME_NAME:-wf.publish.neg.missingba
 MISSING_BASE_RUNTIME_VERSION="${MISSING_BASE_RUNTIME_VERSION:-1.0.0-$TEST_ID}"
 UNKNOWN_BASE_RUNTIME_NAME="${UNKNOWN_BASE_RUNTIME_NAME:-wf.publish.neg.unknownbase.$(date +%s)}"
 UNKNOWN_BASE_RUNTIME_VERSION="${UNKNOWN_BASE_RUNTIME_VERSION:-2.0.0-$TEST_ID}"
+UNKNOWN_BASE_RUNTIME_REF="${UNKNOWN_BASE_RUNTIME_REF:-wf.publish.base.unknown.$(date +%s).$RANDOM}"
 MISSING_START_RUNTIME_NAME="${MISSING_START_RUNTIME_NAME:-wf.publish.neg.basemissingstart.$(date +%s)}"
 MISSING_START_RUNTIME_VERSION="${MISSING_START_RUNTIME_VERSION:-3.0.0-$TEST_ID}"
 MISSING_START_BASE_RUNTIME_NAME="${MISSING_START_BASE_RUNTIME_NAME:-wf.publish.base.missingstart.$(date +%s)}"
@@ -395,7 +396,7 @@ create_unknown_base_package_fixture() {
   "version": "0.0.1",
   "type": "config_only",
   "description": "PUB-T25 unknown runtime_base fixture",
-  "runtime_base": "wf.publish.base.unknown.$TEST_ID",
+  "runtime_base": "$UNKNOWN_BASE_RUNTIME_REF",
   "config_template": "config/default-config.json"
 }
 EOF
@@ -601,6 +602,7 @@ echo "status=ok"
 echo "hive_id=$HIVE_ID"
 echo "missing_runtime_base_package=$MISSING_BASE_RUNTIME_NAME@$MISSING_BASE_RUNTIME_VERSION"
 echo "unknown_runtime_base_package=$UNKNOWN_BASE_RUNTIME_NAME@$UNKNOWN_BASE_RUNTIME_VERSION"
+echo "unknown_runtime_base_ref=$UNKNOWN_BASE_RUNTIME_REF"
 echo "unknown_runtime_base_spawn_error=BASE_RUNTIME_NOT_AVAILABLE"
 echo "unknown_sync_hint_status=$unknown_sync_hint_status"
 echo "unknown_update_status=$unknown_update_status"
