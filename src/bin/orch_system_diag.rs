@@ -311,6 +311,7 @@ async fn main() -> Result<(), DiagError> {
         name: diag_node_name.clone(),
         router_socket: socket_dir,
         uuid_persistence_dir: state_dir.join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
         config_dir,
         version: "1.0".to_string(),
     };

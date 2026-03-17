@@ -1458,6 +1458,7 @@ async fn main() -> Result<(), IdentityError> {
         name: "SY.identity".to_string(),
         router_socket: socket_dir,
         uuid_persistence_dir: state_dir.join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
         config_dir: config_dir.clone(),
         version: "2.0".to_string(),
     };

@@ -9,7 +9,7 @@ pub use crate::blob::{
 };
 pub use crate::comm::{
     connect, connect_with_client_config, ClientConfig, NodeConfig, NodeError, NodeReceiver,
-    NodeSender,
+    NodeSender, NodeUuidMode,
 };
 pub use crate::comm::{nats, protocol};
 pub use crate::identity::{

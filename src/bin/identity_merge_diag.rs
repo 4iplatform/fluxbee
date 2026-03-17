@@ -158,6 +158,7 @@ async fn main() -> Result<(), DiagError> {
         name: io_node_name,
         router_socket: json_router::paths::router_socket_dir(),
         uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
         config_dir: json_router::paths::config_dir(),
         version: "0.0.1".to_string(),
     };
@@ -203,6 +204,7 @@ async fn main() -> Result<(), DiagError> {
         name: frontdesk_node_name,
         router_socket: json_router::paths::router_socket_dir(),
         uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
         config_dir: json_router::paths::config_dir(),
         version: "0.0.1".to_string(),
     };

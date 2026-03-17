@@ -26,7 +26,7 @@ use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED,
     MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SCOPE_GLOBAL, SYSTEM_KIND,
 };
-use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender, NodeUuidMode};
 use json_router::{
     runtime_manifest::{
         load_runtime_manifest_from_paths as load_runtime_manifest_paths_shared,
@@ -501,6 +501,7 @@ async fn main() -> Result<(), OrchestratorError> {
         name: "SY.orchestrator".to_string(),
         router_socket: socket_dir.clone(),
         uuid_persistence_dir: state_dir.join("nodes"),
+        uuid_mode: NodeUuidMode::Persistent,
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
     };
@@ -6682,6 +6683,7 @@ async fn relay_system_action(
         name: relay_name,
         router_socket: socket_dir,
         uuid_persistence_dir: state.state_dir.join("nodes"),
+        uuid_mode: NodeUuidMode::Ephemeral,
         config_dir: state.config_dir.clone(),
         version: "1.0".to_string(),
     };
@@ -6701,6 +6703,13 @@ async fn relay_system_action(
             .into());
         }
     };
+    tracing::info!(
+        relay_name = %relay_config.name,
+        relay_uuid = %relay_sender.uuid(),
+        destination = %destination,
+        request_msg = %request_msg,
+        "relay system action connected"
+    );
 
     let trace_id = Uuid::new_v4().to_string();
     let request = Message {
@@ -6899,6 +6908,7 @@ async fn relay_identity_system_call_ok(
         name: relay_name,
         router_socket: socket_dir,
         uuid_persistence_dir: state.state_dir.join("nodes"),
+        uuid_mode: NodeUuidMode::Ephemeral,
         config_dir: state.config_dir.clone(),
         version: "1.0".to_string(),
     };
@@ -6917,6 +6927,13 @@ async fn relay_identity_system_call_ok(
             )));
         }
     };
+    tracing::info!(
+        relay_name = %relay_config.name,
+        relay_uuid = %relay_sender.uuid(),
+        target = %target,
+        action = %action,
+        "relay identity system call connected"
+    );
 
     let result = identity_system_call_ok(
         &relay_sender,

@@ -302,6 +302,7 @@ async fn run_case_expect_ok(
         name: node_name.to_string(),
         router_socket: json_router::paths::router_socket_dir(),
         uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
         config_dir: json_router::paths::config_dir(),
         version: "0.0.1".to_string(),
     };
@@ -347,6 +348,7 @@ async fn run_case_expect_error(
         name: node_name.to_string(),
         router_socket: json_router::paths::router_socket_dir(),
         uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
         config_dir: json_router::paths::config_dir(),
         version: "0.0.1".to_string(),
     };

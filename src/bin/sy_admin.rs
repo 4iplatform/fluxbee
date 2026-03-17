@@ -238,6 +238,7 @@ async fn main() -> Result<(), AdminError> {
         name: "SY.admin".to_string(),
         router_socket: socket_dir.clone(),
         uuid_persistence_dir: state_dir.join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
     };

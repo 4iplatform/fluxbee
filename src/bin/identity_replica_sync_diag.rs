@@ -248,6 +248,7 @@ async fn connect_node(name: &str) -> Result<NodeSession, DynError> {
         name: name.to_string(),
         router_socket: json_router::paths::router_socket_dir(),
         uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
         config_dir: json_router::paths::config_dir(),
         version: "0.0.1".to_string(),
     };
