@@ -903,6 +903,7 @@ fluxbee-publish ./package --deploy worker-220
   - unknown `runtime_base`
   - base runtime without executable `start.sh`
   - Prefer one script covering all three cases.
+  - Script target: `scripts/runtime_packaging_pub_t25_e2e.sh`
 - [ ] PUB-T26. E2E template layering:
   - template defaults applied
   - request overrides take precedence
