@@ -142,6 +142,52 @@ OpenAI key precedence in current MVP runner:
 2. YAML inline key (`behavior.openai.api_key` or `behavior.api_key` when configured)
 3. env var pointed by `behavior.api_key_env` (default `OPENAI_API_KEY`)
 
+### 2.2.1 NODE_STATUS_GET default handler (MVP)
+
+AI nodes now answer orchestrator health probes (`NODE_STATUS_GET`) directly from the runtime.
+
+Supported env vars (per instance):
+- `NODE_STATUS_DEFAULT_HANDLER_ENABLED` (default: `true`)
+- `NODE_STATUS_DEFAULT_HEALTH_STATE` (default: `HEALTHY`, accepted: `HEALTHY|DEGRADED|ERROR|UNKNOWN`)
+
+Example for instance `ai-chat`:
+
+```bash
+sudo tee /etc/fluxbee/ai-nodes/ai-chat.env >/dev/null <<'EOF'
+OPENAI_API_KEY=sk-REPLACE_ME
+RUST_LOG=info,fluxbee_ai_nodes=debug,fluxbee_ai_sdk=debug
+NODE_STATUS_DEFAULT_HANDLER_ENABLED=true
+NODE_STATUS_DEFAULT_HEALTH_STATE=HEALTHY
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl restart fluxbee-ai-node@ai-chat
+```
+
+Validation (from admin API):
+
+```bash
+BASE="http://127.0.0.1:8080"
+HIVE_ID="motherbee"
+NODE="AI.chat@$HIVE_ID"
+
+curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE/status" | jq '.payload.node_status.health_source'
+```
+
+Expected:
+- `NODE_REPORTED`
+
+Quick override test:
+
+```bash
+sudo sed -i 's/^NODE_STATUS_DEFAULT_HEALTH_STATE=.*/NODE_STATUS_DEFAULT_HEALTH_STATE=DEGRADED/' /etc/fluxbee/ai-nodes/ai-chat.env
+sudo systemctl restart fluxbee-ai-node@ai-chat
+curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE/status" | jq '.payload.node_status.health_state'
+```
+
+Expected:
+- `DEGRADED`
+
 ### 2.3 Persistence model (UUID vs dynamic config)
 
 There are two different persistence concerns:
