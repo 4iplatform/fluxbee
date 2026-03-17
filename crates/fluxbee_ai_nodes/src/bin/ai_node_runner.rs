@@ -19,6 +19,11 @@ use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
+const MSG_NODE_STATUS_GET: &str = "NODE_STATUS_GET";
+const MSG_NODE_STATUS_GET_RESPONSE: &str = "NODE_STATUS_GET_RESPONSE";
+const NODE_STATUS_DEFAULT_HANDLER_ENABLED: &str = "NODE_STATUS_DEFAULT_HANDLER_ENABLED";
+const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE";
+
 #[derive(Debug, Deserialize)]
 struct RunnerConfig {
     node: NodeSection,
@@ -462,7 +467,15 @@ impl GenericAiNode {
         let Some(command) = msg.meta.msg.as_deref() else {
             return Ok(None);
         };
-        let (response_msg, response_payload) = if command.eq_ignore_ascii_case("CONFIG_SET") {
+        let (response_msg, response_payload) = if command.eq_ignore_ascii_case(MSG_NODE_STATUS_GET) {
+            if !env_bool(NODE_STATUS_DEFAULT_HANDLER_ENABLED, true) {
+                return Ok(None);
+            }
+            (
+                MSG_NODE_STATUS_GET_RESPONSE,
+                self.build_node_status_get_response().await,
+            )
+        } else if command.eq_ignore_ascii_case("CONFIG_SET") {
             ("CONFIG_RESPONSE", self.apply_config_set(&msg).await)
         } else if command.eq_ignore_ascii_case("CONFIG_GET") {
             ("CONFIG_RESPONSE", self.build_config_get_response().await)
@@ -807,6 +820,39 @@ impl GenericAiNode {
             "last_error": Value::Null
         })
     }
+
+    async fn build_node_status_get_response(&self) -> Value {
+        let health_state = std::env::var(NODE_STATUS_DEFAULT_HEALTH_STATE)
+            .ok()
+            .as_deref()
+            .map(normalize_health_state)
+            .unwrap_or("HEALTHY");
+        json!({
+            "status": "ok",
+            "health_state": health_state
+        })
+    }
+}
+
+fn normalize_health_state(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "HEALTHY" => "HEALTHY",
+        "DEGRADED" => "DEGRADED",
+        "ERROR" => "ERROR",
+        "UNKNOWN" => "UNKNOWN",
+        _ => "HEALTHY",
+    }
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        })
+        .unwrap_or(default)
 }
 
 impl NodeBehavior {
@@ -1687,4 +1733,136 @@ fn extract_thread_id(msg: &Message) -> Option<String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToString::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluxbee_ai_sdk::{Destination, Meta, Routing};
+    use std::sync::{Mutex, OnceLock};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn sample_request() -> Message {
+        Message {
+            routing: Routing {
+                src: "SY.orchestrator@motherbee".to_string(),
+                dst: Destination::Unicast("AI.frontdesk.gov@motherbee".to_string()),
+                ttl: 16,
+                trace_id: "trace-123".to_string(),
+            },
+            meta: Meta {
+                msg_type: "system".to_string(),
+                msg: Some(MSG_NODE_STATUS_GET.to_string()),
+                scope: None,
+                target: None,
+                action: None,
+                priority: None,
+                context: None,
+            },
+            payload: json!({}),
+        }
+    }
+
+    #[test]
+    fn control_plane_response_keeps_trace_id_and_replies_to_request_src() {
+        let req = sample_request();
+        let res = build_control_plane_response(
+            &req,
+            MSG_NODE_STATUS_GET_RESPONSE,
+            json!({"status":"ok","health_state":"HEALTHY"}),
+        );
+
+        assert_eq!(res.routing.trace_id, req.routing.trace_id);
+        assert!(matches!(
+            res.routing.dst,
+            Destination::Unicast(ref dst) if dst == &req.routing.src
+        ));
+    }
+
+    #[test]
+    fn control_plane_response_sets_expected_msg_name() {
+        let req = sample_request();
+        let res = build_control_plane_response(
+            &req,
+            MSG_NODE_STATUS_GET_RESPONSE,
+            json!({"status":"ok","health_state":"HEALTHY"}),
+        );
+        assert_eq!(
+            res.meta.msg.as_deref(),
+            Some(MSG_NODE_STATUS_GET_RESPONSE)
+        );
+    }
+
+    fn test_node() -> GenericAiNode {
+        GenericAiNode {
+            node_name: "AI.frontdesk.gov".to_string(),
+            behavior: Arc::new(RwLock::new(None)),
+            dynamic_config_dir: PathBuf::from("/tmp"),
+            thread_state_store: None,
+            control_plane: Arc::new(RwLock::new(ControlPlaneState {
+                current_state: NodeLifecycleState::Unconfigured,
+                config_source: "none",
+                effective_config: None,
+                schema_version: 0,
+                config_version: 0,
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn node_status_get_respects_handler_enabled_env_false() {
+        let _guard = env_lock().lock().expect("env lock");
+        std::env::set_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED, "false");
+        std::env::remove_var(NODE_STATUS_DEFAULT_HEALTH_STATE);
+        let node = test_node();
+        let req = sample_request();
+        let response = node.handle_control_plane(req).await.expect("control-plane should not fail");
+        assert!(response.is_none());
+        std::env::remove_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED);
+    }
+
+    #[tokio::test]
+    async fn node_status_get_uses_env_health_state_and_falls_back_to_healthy() {
+        let _guard = env_lock().lock().expect("env lock");
+        std::env::set_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED, "true");
+        let node = test_node();
+        let req = sample_request();
+
+        std::env::set_var(NODE_STATUS_DEFAULT_HEALTH_STATE, "DEGRADED");
+        let degraded = node
+            .handle_control_plane(req.clone())
+            .await
+            .expect("control-plane should not fail")
+            .expect("status response should exist");
+        assert_eq!(
+            degraded
+                .payload
+                .get("health_state")
+                .and_then(Value::as_str),
+            Some("DEGRADED")
+        );
+
+        std::env::set_var(NODE_STATUS_DEFAULT_HEALTH_STATE, "not-a-valid-state");
+        let fallback = node
+            .handle_control_plane(req)
+            .await
+            .expect("control-plane should not fail")
+            .expect("status response should exist");
+        assert_eq!(
+            fallback
+                .payload
+                .get("health_state")
+                .and_then(Value::as_str),
+            Some("HEALTHY")
+        );
+
+        std::env::remove_var(NODE_STATUS_DEFAULT_HEALTH_STATE);
+        std::env::remove_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED);
+    }
 }
