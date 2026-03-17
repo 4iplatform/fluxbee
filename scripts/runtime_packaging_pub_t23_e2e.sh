@@ -172,7 +172,7 @@ wait_runtime_readiness_config() {
   local runtime_version="$2"
   local deadline=$(( $(date +%s) + WAIT_READY_SECS ))
   while (( $(date +%s) <= deadline )); do
-    local http present exec base_ready
+    local http present exec base_ready has_base_ready
     http="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$versions_body")"
     if [[ "$http" != "200" ]]; then
       sleep 2
@@ -184,6 +184,15 @@ wait_runtime_readiness_config() {
     exec="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
       '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver].start_sh_executable // false) | tostring' \
       "$versions_body")"
+    has_base_ready="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
+      '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver] | has("base_runtime_ready")) // false | tostring' \
+      "$versions_body")"
+    if [[ "$has_base_ready" != "true" ]]; then
+      echo "FAIL: target hive '$HIVE_ID' does not expose readiness.base_runtime_ready for config_only runtime '$runtime_name'." >&2
+      echo "HINT: deploy latest sy-orchestrator with runtime package-type readiness support (PUB-T10+)." >&2
+      cat "$versions_body" >&2 || true
+      return 1
+    fi
     base_ready="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
       '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver].base_runtime_ready // false) | tostring' \
       "$versions_body")"
