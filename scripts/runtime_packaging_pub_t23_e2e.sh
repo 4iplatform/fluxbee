@@ -170,11 +170,35 @@ wait_runtime_readiness_full() {
 wait_runtime_readiness_config() {
   local runtime_name="$1"
   local runtime_version="$2"
+  local expected_manifest_version="${3:-0}"
   local deadline=$(( $(date +%s) + WAIT_READY_SECS ))
   while (( $(date +%s) <= deadline )); do
-    local http present exec base_ready has_base_ready
+    local http manifest_version runtime_exists readiness_exists present exec base_ready has_base_ready
     http="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$versions_body")"
     if [[ "$http" != "200" ]]; then
+      sleep 2
+      continue
+    fi
+    manifest_version="$(jq -r '.payload.hive.runtimes.manifest_version // 0 | tostring' "$versions_body")"
+    if [[ "$expected_manifest_version" =~ ^[0-9]+$ && "$expected_manifest_version" -gt 0 ]]; then
+      if [[ "$manifest_version" =~ ^[0-9]+$ ]]; then
+        if (( manifest_version < expected_manifest_version )); then
+          sleep 2
+          continue
+        fi
+      fi
+    fi
+    runtime_exists="$(jq -r --arg rt "$runtime_name" \
+      '(.payload.hive.runtimes.runtimes | has($rt)) // false | tostring' \
+      "$versions_body")"
+    if [[ "$runtime_exists" != "true" ]]; then
+      sleep 2
+      continue
+    fi
+    readiness_exists="$(jq -r --arg rt "$runtime_name" --arg ver "$runtime_version" \
+      '(.payload.hive.runtimes.runtimes[$rt].readiness | has($ver)) // false | tostring' \
+      "$versions_body")"
+    if [[ "$readiness_exists" != "true" ]]; then
       sleep 2
       continue
     fi
@@ -188,8 +212,8 @@ wait_runtime_readiness_config() {
       '(.payload.hive.runtimes.runtimes[$rt].readiness[$ver] | has("base_runtime_ready")) // false | tostring' \
       "$versions_body")"
     if [[ "$has_base_ready" != "true" ]]; then
-      echo "FAIL: target hive '$HIVE_ID' does not expose readiness.base_runtime_ready for config_only runtime '$runtime_name'." >&2
-      echo "HINT: deploy latest sy-orchestrator with runtime package-type readiness support (PUB-T10+)." >&2
+      echo "FAIL: target hive '$HIVE_ID' runtime '$runtime_name' readiness for version '$runtime_version' is present but missing base_runtime_ready." >&2
+      echo "HINT: verify worker sy-orchestrator build has package-aware readiness (PUB-T10+)." >&2
       cat "$versions_body" >&2 || true
       return 1
     fi
@@ -201,7 +225,11 @@ wait_runtime_readiness_config() {
     fi
     sleep 2
   done
-  echo "FAIL: config_only readiness not ready runtime='$runtime_name' version='$runtime_version'" >&2
+  if [[ "$expected_manifest_version" =~ ^[0-9]+$ && "$expected_manifest_version" -gt 0 ]]; then
+    echo "FAIL: config_only readiness timeout runtime='$runtime_name' version='$runtime_version' expected_manifest_version>=$expected_manifest_version" >&2
+  else
+    echo "FAIL: config_only readiness timeout runtime='$runtime_name' version='$runtime_version'" >&2
+  fi
   cat "$versions_body" >&2 || true
   return 1
 }
@@ -346,7 +374,14 @@ extract_and_validate_deploy_summary() {
       exit 1
     fi
   fi
-  echo "$sync_hint_status|$update_status|$update_error_code"
+  local manifest_version
+  manifest_version="$(sed -n 's/.*Manifest: .* (version=\([0-9][0-9]*\)).*/\1/p' "$out_log" | tail -n1)"
+  if [[ -z "$manifest_version" ]]; then
+    echo "FAIL[$label]: unable to parse manifest version from publish output" >&2
+    cat "$out_log" >&2 || true
+    exit 1
+  fi
+  echo "$sync_hint_status|$update_status|$update_error_code|$manifest_version"
 }
 
 require_cmd curl
@@ -386,7 +421,9 @@ base_deploy="$(extract_and_validate_deploy_summary "$publish_base_log" "base")"
 base_sync_hint_status="${base_deploy%%|*}"
 base_rest="${base_deploy#*|}"
 base_update_status="${base_rest%%|*}"
-base_update_error_code="${base_rest#*|}"
+base_rest="${base_rest#*|}"
+base_update_error_code="${base_rest%%|*}"
+base_manifest_version="${base_rest#*|}"
 
 echo "Step 5/12: wait base runtime readiness on target"
 wait_runtime_readiness_full "$BASE_RUNTIME_NAME" "$BASE_RUNTIME_VERSION"
@@ -399,10 +436,12 @@ cfg_deploy="$(extract_and_validate_deploy_summary "$publish_cfg_log" "config")"
 cfg_sync_hint_status="${cfg_deploy%%|*}"
 cfg_rest="${cfg_deploy#*|}"
 cfg_update_status="${cfg_rest%%|*}"
-cfg_update_error_code="${cfg_rest#*|}"
+cfg_rest="${cfg_rest#*|}"
+cfg_update_error_code="${cfg_rest%%|*}"
+cfg_manifest_version="${cfg_rest#*|}"
 
 echo "Step 8/12: wait config_only readiness (including base_runtime_ready)"
-wait_runtime_readiness_config "$CONFIG_RUNTIME_NAME" "$CONFIG_RUNTIME_VERSION"
+wait_runtime_readiness_config "$CONFIG_RUNTIME_NAME" "$CONFIG_RUNTIME_VERSION" "$cfg_manifest_version"
 
 echo "Step 9/12: spawn node with config_only runtime"
 spawn_http="$(spawn_node)"
@@ -428,8 +467,10 @@ echo "node_name=$NODE_NAME@$HIVE_ID"
 echo "base_sync_hint_status=$base_sync_hint_status"
 echo "base_update_status=$base_update_status"
 echo "base_update_error_code=$base_update_error_code"
+echo "base_manifest_version=$base_manifest_version"
 echo "config_sync_hint_status=$cfg_sync_hint_status"
 echo "config_update_status=$cfg_update_status"
 echo "config_update_error_code=$cfg_update_error_code"
+echo "config_manifest_version=$cfg_manifest_version"
 echo "lifecycle_observed=$lifecycle_observed"
 echo "runtime packaging PUB-T23 config_only E2E passed."
