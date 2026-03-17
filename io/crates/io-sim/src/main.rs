@@ -88,15 +88,28 @@ async fn main() -> Result<()> {
         },
     )));
 
-    let outbound_task = tokio::spawn(run_outbound_log_loop(inbox.clone()));
-
     if let Some(text) = args.once {
-        process_one_inbound(&config, &sender, identity.as_ref(), provisioner.as_ref(), inbound.clone(), text).await?;
+        process_one_inbound(
+            &config,
+            &sender,
+            &inbox,
+            identity.as_ref(),
+            provisioner.as_ref(),
+            inbound.clone(),
+            text,
+        )
+        .await?;
     } else {
-        run_stdin_inbound_loop(&config, &sender, identity.as_ref(), provisioner.as_ref(), inbound.clone()).await?;
+        run_stdin_inbound_loop(
+            &config,
+            &sender,
+            &inbox,
+            identity.as_ref(),
+            provisioner.as_ref(),
+            inbound.clone(),
+        )
+        .await?;
     }
-
-    outbound_task.abort();
     Ok(())
 }
 
@@ -223,6 +236,7 @@ fn env(key: &str) -> Option<String> {
 async fn run_stdin_inbound_loop(
     config: &Config,
     sender: &NodeSender,
+    inbox: &Arc<Mutex<RouterInbox>>,
     identity: &dyn IdentityResolver,
     provisioner: &dyn IdentityProvisioner,
     inbound: Arc<Mutex<InboundProcessor>>,
@@ -236,7 +250,7 @@ async fn run_stdin_inbound_loop(
         if text.is_empty() {
             continue;
         }
-        process_one_inbound(config, sender, identity, provisioner, inbound.clone(), text).await?;
+        process_one_inbound(config, sender, inbox, identity, provisioner, inbound.clone(), text).await?;
     }
     Ok(())
 }
@@ -244,6 +258,7 @@ async fn run_stdin_inbound_loop(
 async fn process_one_inbound(
     config: &Config,
     sender: &NodeSender,
+    inbox: &Arc<Mutex<RouterInbox>>,
     identity: &dyn IdentityResolver,
     provisioner: &dyn IdentityProvisioner,
     inbound: Arc<Mutex<InboundProcessor>>,
@@ -325,6 +340,20 @@ async fn process_one_inbound(
                 .to_string();
             sender.send(msg).await?;
             tracing::info!(%trace_id, dst, thread_id = %thread_id, "io-sim sent inbound message to router");
+            match inbox
+                .lock()
+                .await
+                .recv_for_trace_id(&trace_id, Duration::from_secs(30))
+                .await
+            {
+                Ok(outbound) => log_outbound_message(&outbound),
+                Err(io_common::identity::IdentityError::Timeout) => {
+                    tracing::warn!(%trace_id, "io-sim timed out waiting outbound from router");
+                }
+                Err(err) => {
+                    tracing::warn!(%trace_id, ?err, "io-sim failed waiting outbound from router");
+                }
+            }
         }
         InboundOutcome::DroppedDuplicate => {
             tracing::warn!(message_id = %message_id, "io-sim dropped duplicate inbound");
@@ -334,56 +363,47 @@ async fn process_one_inbound(
     Ok(())
 }
 
-async fn run_outbound_log_loop(inbox: Arc<Mutex<RouterInbox>>) -> Result<()> {
-    loop {
-        let msg = {
-            let mut guard = inbox.lock().await;
-            match guard.recv_next_timeout(Duration::from_millis(500)).await? {
-                Some(msg) => msg,
-                None => continue,
-            }
-        };
-        let payload_type = msg
-            .payload
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let content = msg
-            .payload
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let error_code = msg
-            .payload
-            .get("code")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                msg.payload
-                    .get("error")
-                    .and_then(|e| e.get("code"))
-                    .and_then(|v| v.as_str())
-            })
-            .unwrap_or("");
-        let error_message = msg
-            .payload
-            .get("message")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                msg.payload
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|v| v.as_str())
-            })
-            .unwrap_or("");
+fn log_outbound_message(msg: &fluxbee_sdk::protocol::Message) {
+    let payload_type = msg
+        .payload
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let content = msg
+        .payload
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let error_code = msg
+        .payload
+        .get("code")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            msg.payload
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("");
+    let error_message = msg
+        .payload
+        .get("message")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            msg.payload
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("");
 
-        tracing::info!(
-            trace_id = %msg.routing.trace_id,
-            src = %msg.routing.src,
-            payload_type = %payload_type,
-            content = %content,
-            error_code = %error_code,
-            error_message = %error_message,
-            "io-sim received outbound from router"
-        );
-    }
+    tracing::info!(
+        trace_id = %msg.routing.trace_id,
+        src = %msg.routing.src,
+        payload_type = %payload_type,
+        content = %content,
+        error_code = %error_code,
+        error_message = %error_message,
+        "io-sim received outbound from router"
+    );
 }

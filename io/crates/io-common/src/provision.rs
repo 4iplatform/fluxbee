@@ -42,7 +42,7 @@ impl RouterInbox {
         }
     }
 
-    async fn recv_for_trace_id(
+    pub async fn recv_for_trace_id(
         &mut self,
         trace_id: &str,
         timeout: Duration,
