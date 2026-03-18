@@ -2,11 +2,22 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_DIR="${CONFIG_DIR:-/etc/fluxbee}"
-STATE_DIR="${STATE_DIR:-/var/lib/fluxbee}"
-RUN_DIR="${RUN_DIR:-/var/run/fluxbee}"
+
+CONFIG_ROOT="${CONFIG_DIR:-/etc/fluxbee}"
+AI_CONFIG_DIR="${AI_CONFIG_DIR:-$CONFIG_ROOT/ai-nodes}"
+STATE_ROOT="${STATE_DIR:-/var/lib/fluxbee}"
+UUID_STATE_DIR="${UUID_PERSISTENCE_DIR:-$STATE_ROOT/state/nodes}"
+AI_DYNAMIC_STATE_DIR="${AI_DYNAMIC_CONFIG_DIR:-$STATE_ROOT/state/ai-nodes}"
+RUN_ROOT="${RUN_DIR:-/var/run/fluxbee}"
+RUN_ROUTERS_DIR="${RUN_ROUTERS_DIR:-$RUN_ROOT/routers}"
+
 APPLY_DEV_OWNERSHIP="${APPLY_DEV_OWNERSHIP:-1}"
 INSTALL_OWNER="${INSTALL_OWNER:-${SUDO_USER:-$USER}}"
+
+SYSTEMD_UNIT_PATH="/etc/systemd/system/fluxbee-ai-node@.service"
+INSTALL_BIN_DIR="/usr/bin"
+RUNNER_BIN_NAME="ai-node-runner"
+NODECTL_BIN_NAME="ai-nodectl"
 
 SUDO=""
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -16,46 +27,53 @@ fi
 
 if [[ "${SKIP_BUILD:-}" != "1" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
-    echo "Error: cargo not found. Set SKIP_BUILD=1 if binaries are already built." >&2
+    echo "Error: cargo not found. Set SKIP_BUILD=1 to install existing binaries." >&2
     exit 1
   fi
-
-  echo "Building AI binary (ai_node_runner)..."
-  (cd "$ROOT_DIR" && cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner)
+  echo "Building AI runner (fluxbee-ai-nodes/ai_node_runner)..."
+  (
+    cd "$ROOT_DIR"
+    cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
+  )
 fi
 
 BIN_DIR="${BIN_DIR:-$ROOT_DIR/target/release}"
 if [[ "${SKIP_BUILD:-}" == "1" ]]; then
-  echo "SKIP_BUILD=1: installing only binaries from $BIN_DIR" >&2
+  echo "SKIP_BUILD=1: installing binaries from BIN_DIR=$BIN_DIR"
 fi
 
-AI_BIN="$BIN_DIR/ai_node_runner"
+RUNNER_BIN_SRC="$BIN_DIR/ai_node_runner"
 NODECTL_SRC="$ROOT_DIR/scripts/ai-nodectl.sh"
-if [[ ! -f "$AI_BIN" ]]; then
-  echo "Missing binary: $AI_BIN" >&2
-  echo "Build it first (e.g. cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner) or set BIN_DIR." >&2
+
+if [[ ! -f "$RUNNER_BIN_SRC" ]]; then
+  echo "Error: missing runner binary: $RUNNER_BIN_SRC" >&2
+  echo "Hint: build with 'cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner' or set BIN_DIR." >&2
   exit 1
 fi
 if [[ ! -f "$NODECTL_SRC" ]]; then
-  echo "Missing script: $NODECTL_SRC" >&2
+  echo "Error: missing helper script: $NODECTL_SRC" >&2
   exit 1
 fi
 
-$SUDO install -d "$CONFIG_DIR"
-$SUDO install -d "$CONFIG_DIR/ai-nodes"
-$SUDO install -d "$STATE_DIR"
-$SUDO install -d "$STATE_DIR/state/nodes"
-$SUDO install -d "$RUN_DIR"
-$SUDO install -d "$RUN_DIR/routers"
+echo "Creating runtime directories..."
+$SUDO install -d "$CONFIG_ROOT"
+$SUDO install -d "$AI_CONFIG_DIR"
+$SUDO install -d "$STATE_ROOT"
+$SUDO install -d "$UUID_STATE_DIR"
+$SUDO install -d "$AI_DYNAMIC_STATE_DIR"
+$SUDO install -d "$RUN_ROOT"
+$SUDO install -d "$RUN_ROUTERS_DIR"
 
-$SUDO install -m 0755 "$AI_BIN" /usr/bin/ai-node-runner
-$SUDO install -m 0755 "$NODECTL_SRC" /usr/bin/ai-nodectl
+echo "Installing binaries into $INSTALL_BIN_DIR..."
+$SUDO install -m 0755 "$RUNNER_BIN_SRC" "$INSTALL_BIN_DIR/$RUNNER_BIN_NAME"
+$SUDO install -m 0755 "$NODECTL_SRC" "$INSTALL_BIN_DIR/$NODECTL_BIN_NAME"
 
-echo "Installing systemd template unit: fluxbee-ai-node@.service"
-cat <<'EOF' | $SUDO tee /etc/systemd/system/fluxbee-ai-node@.service >/dev/null
+echo "Installing systemd template unit: $(basename "$SYSTEMD_UNIT_PATH")"
+cat <<'EOF' | $SUDO tee "$SYSTEMD_UNIT_PATH" >/dev/null
 [Unit]
 Description=Fluxbee AI Node (%i)
-After=network.target rt-gateway.service
+After=network-online.target rt-gateway.service
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -64,6 +82,7 @@ Environment=AI_NODE_MODE=default
 ExecStart=/usr/bin/ai-node-runner --mode ${AI_NODE_MODE} --config /etc/fluxbee/ai-nodes/%i.yaml
 Restart=always
 RestartSec=5
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -72,15 +91,30 @@ EOF
 $SUDO systemctl daemon-reload
 
 if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then
-  echo "Applying ownership for test/dev user: $INSTALL_OWNER"
-  $SUDO chown -R "$INSTALL_OWNER":"$INSTALL_OWNER" "$CONFIG_DIR/ai-nodes" "$STATE_DIR/state/nodes" "$RUN_DIR/routers"
+  echo "Applying dev ownership to $INSTALL_OWNER ..."
+  $SUDO chown -R "$INSTALL_OWNER":"$INSTALL_OWNER" \
+    "$AI_CONFIG_DIR" \
+    "$UUID_STATE_DIR" \
+    "$AI_DYNAMIC_STATE_DIR" \
+    "$RUN_ROUTERS_DIR"
 fi
 
-echo "Installed: /usr/bin/ai-node-runner, /usr/bin/ai-nodectl"
-echo "Template unit: /etc/systemd/system/fluxbee-ai-node@.service"
-echo "Config location: $CONFIG_DIR/ai-nodes/<name>.yaml"
-echo "Dynamic state location: $STATE_DIR/state/ai-nodes/<name>.json"
-echo "Mode per instance env: /etc/fluxbee/ai-nodes/<name>.env (AI_NODE_MODE=default|gov)"
-echo "Precreate state example: ai-nodectl init-state <name> /tmp/<name>_effective_config.json"
-echo "Start example: sudo systemctl enable --now fluxbee-ai-node@ai-chat"
-echo "Management example: ai-nodectl list"
+cat <<EOF
+AI runtime install complete.
+
+Installed:
+  - $INSTALL_BIN_DIR/$RUNNER_BIN_NAME
+  - $INSTALL_BIN_DIR/$NODECTL_BIN_NAME
+  - $SYSTEMD_UNIT_PATH
+
+Expected paths:
+  - Per-node YAML config: $AI_CONFIG_DIR/<name>.yaml
+  - Per-node env (optional): $AI_CONFIG_DIR/<name>.env
+  - Dynamic node state: $AI_DYNAMIC_STATE_DIR/<name>.json
+  - UUID state (node client): $UUID_STATE_DIR
+
+Examples:
+  ai-nodectl add ai-chat /tmp/ai_chat.yaml
+  sudo systemctl enable --now fluxbee-ai-node@ai-chat
+  ai-nodectl status ai-chat
+EOF
