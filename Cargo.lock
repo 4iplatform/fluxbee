@@ -45,6 +45,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-test-gov"
+version = "0.1.0"
+dependencies = [
+ "fluxbee-sdk",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -669,6 +680,19 @@ dependencies = [
  "hashbrown 0.16.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "io-test"
+version = "0.1.0"
+dependencies = [
+ "fluxbee-sdk",
+ "nix",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
