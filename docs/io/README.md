@@ -26,3 +26,31 @@ When these docs conflict with the current Fluxbee v1.16/v1.17 direction in this 
 3. Transport:
 - Production node-to-router integration in this repo uses `fluxbee_sdk` + Unix sockets.
 - Any TCP/shim client in imported code is transitional and isolated under `io/legacy`.
+
+## Known Issue / Troubleshooting
+
+### Identity lookup fails after restart with `EACCES`
+
+Symptom in IO logs:
+- `identity lookup error; treating as miss ... EACCES: Permission denied`
+- then provision path works, but lookup keeps missing after node restart.
+
+What this means:
+- The node can provision via `SY.identity`, but cannot read identity SHM (`jsr-identity-<island>`).
+- This is an environment permissions issue (SHM read access), not an IO protocol issue.
+
+Quick checks:
+- `ls -l /dev/shm/jsr-identity-<island>`
+- `id` (user/group running the IO process)
+- For systemd services: `systemctl show <service> -p User -p Group`
+
+Expected in correct production setup:
+- IO runtime user/service must have read access to identity SHM.
+- If permissions are correct, lookup should survive process restarts (no forced reprovision loop).
+
+Temporary debug-only workaround:
+- Run IO as privileged user to validate diagnosis.
+
+Operational fix:
+- Align SHM ownership/group/ACL with the IO runtime user.
+- If this cannot be guaranteed by deployment defaults, escalate to core/ops to standardize SHM permissions for `sy-identity`.

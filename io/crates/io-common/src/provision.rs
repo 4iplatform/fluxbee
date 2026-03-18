@@ -116,6 +116,8 @@ impl FluxbeeIdentityProvisioner {
         target: &str,
         input: &ResolveOrCreateInput,
     ) -> Result<String, IdentityError> {
+        let normalized_channel = normalize_identity_field(&input.channel, true);
+        let normalized_address = normalize_identity_field(&input.external_id, true);
         let trace_id = Uuid::new_v4().to_string();
         let req = WireMessage {
             routing: Routing {
@@ -134,9 +136,9 @@ impl FluxbeeIdentityProvisioner {
                 context: None,
             },
             payload: serde_json::json!({
-                "ich_id": stable_ich_id(&input.channel, &input.external_id),
-                "channel_type": input.channel,
-                "address": input.external_id,
+                "ich_id": stable_ich_id(&normalized_channel, &normalized_address),
+                "channel_type": normalized_channel,
+                "address": normalized_address,
             }),
         };
         self.sender
@@ -206,4 +208,32 @@ fn stable_ich_id(channel: &str, external_id: &str) -> String {
     let key = format!("{channel}:{external_id}");
     let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes());
     format!("ich:{uuid}")
+}
+
+fn normalize_identity_field(value: &str, lowercase: bool) -> String {
+    let trimmed = value.trim();
+    if lowercase {
+        trimmed.to_ascii_lowercase()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stable_ich_id;
+
+    #[test]
+    fn stable_ich_id_is_deterministic() {
+        let a = stable_ich_id("sim-new", "user.provision.abc1");
+        let b = stable_ich_id("sim-new", "user.provision.abc1");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn stable_ich_id_changes_when_input_changes() {
+        let a = stable_ich_id("sim-new", "user.provision.abc1");
+        let b = stable_ich_id("sim-new", "user.provision.abc2");
+        assert_ne!(a, b);
+    }
 }

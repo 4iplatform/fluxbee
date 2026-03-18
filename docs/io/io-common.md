@@ -4,6 +4,10 @@
 > IO performs best-effort lookup only; on miss/unavailable it forwards with `meta.src_ilk = null`.
 > Any older wording suggesting synchronous wait/buffering for identity should be treated as superseded.
 
+> Operational note:
+> If lookup logs show `EACCES` (permission denied) when reading identity SHM, this is an environment permissions issue.
+> See `docs/io/README.md` ("Known Issue / Troubleshooting") for diagnosis and operational fix.
+
 
 
 ## Control Plane unificado (IO Nodes ↔ AI Nodes)

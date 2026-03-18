@@ -35,6 +35,12 @@ impl Default for InboundConfig {
 pub struct InboundStats {
     pub dedup_hits: u64,
     pub dedup_misses: u64,
+    pub identity_lookup_hits: u64,
+    pub identity_lookup_misses: u64,
+    pub identity_lookup_errors: u64,
+    pub identity_provision_success: u64,
+    pub identity_provision_errors: u64,
+    pub identity_fallback_null: u64,
 }
 
 #[derive(Debug)]
@@ -91,6 +97,7 @@ impl InboundProcessor {
         let trace_id = new_trace_id();
         let mut src_ilk = match identity.lookup(&identity_input.channel, &identity_input.external_id) {
             Ok(Some(src_ilk)) => {
+                self.stats.identity_lookup_hits += 1;
                 tracing::debug!(
                     channel = %identity_input.channel,
                     external_id = %identity_input.external_id,
@@ -100,6 +107,7 @@ impl InboundProcessor {
                 Some(src_ilk)
             }
             Ok(None) => {
+                self.stats.identity_lookup_misses += 1;
                 tracing::debug!(
                     channel = %identity_input.channel,
                     external_id = %identity_input.external_id,
@@ -108,6 +116,7 @@ impl InboundProcessor {
                 None
             }
             Err(error) => {
+                self.stats.identity_lookup_errors += 1;
                 tracing::warn!(
                     ?error,
                     channel = %identity_input.channel,
@@ -122,6 +131,7 @@ impl InboundProcessor {
             if let Some(provisioner) = provisioner {
                 match provisioner.provision(&identity_input).await {
                     Ok(Some(provisioned_ilk)) => {
+                        self.stats.identity_provision_success += 1;
                         tracing::info!(
                             channel = %identity_input.channel,
                             external_id = %identity_input.external_id,
@@ -136,6 +146,7 @@ impl InboundProcessor {
                         src_ilk = Some(provisioned_ilk);
                     }
                     Ok(None) => {
+                        self.stats.identity_fallback_null += 1;
                         tracing::warn!(
                             channel = %identity_input.channel,
                             external_id = %identity_input.external_id,
@@ -143,6 +154,8 @@ impl InboundProcessor {
                         );
                     }
                     Err(error) => {
+                        self.stats.identity_provision_errors += 1;
+                        self.stats.identity_fallback_null += 1;
                         tracing::warn!(
                             ?error,
                             channel = %identity_input.channel,
@@ -152,6 +165,7 @@ impl InboundProcessor {
                     }
                 }
             } else {
+                self.stats.identity_fallback_null += 1;
                 tracing::warn!(
                     channel = %identity_input.channel,
                     external_id = %identity_input.external_id,
@@ -179,6 +193,8 @@ mod tests {
     use crate::identity::IdentityError;
     use crate::identity::MockIdentityResolver;
     use crate::io_context::slack_inbound_io_context;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     struct AlwaysMiss;
     impl IdentityResolver for AlwaysMiss {
@@ -236,6 +252,9 @@ mod tests {
             .as_ref()
             .and_then(|ctx| ctx.get("src_ilk"));
         assert_eq!(src, Some(&serde_json::Value::Null));
+        let stats = p.stats();
+        assert_eq!(stats.identity_lookup_misses, 1);
+        assert_eq!(stats.identity_fallback_null, 1);
     }
 
     #[tokio::test]
@@ -273,6 +292,39 @@ mod tests {
         }
     }
 
+    struct AlwaysProvisionError;
+
+    #[async_trait::async_trait]
+    impl IdentityProvisioner for AlwaysProvisionError {
+        async fn provision(&self, _input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
+            Err(IdentityError::Unavailable)
+        }
+    }
+
+    struct HitResolver;
+
+    impl IdentityResolver for HitResolver {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn lookup(&self, _channel: &str, _external_id: &str) -> Result<Option<String>, IdentityError> {
+            Ok(Some("ilk:hit:test".to_string()))
+        }
+    }
+
+    struct CountingProvisioner {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl IdentityProvisioner for CountingProvisioner {
+        async fn provision(&self, _input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some("ilk:should-not-be-used".to_string()))
+        }
+    }
+
     #[tokio::test]
     async fn miss_can_provision_src_ilk() {
         let mut p = InboundProcessor::new("node", InboundConfig::default());
@@ -300,5 +352,78 @@ mod tests {
             .and_then(|ctx| ctx.get("src_ilk"))
             .and_then(|v| v.as_str());
         assert_eq!(src, Some("ilk:provisional:test"));
+        let stats = p.stats();
+        assert_eq!(stats.identity_lookup_misses, 1);
+        assert_eq!(stats.identity_provision_success, 1);
+        assert_eq!(stats.identity_fallback_null, 0);
+    }
+
+    #[tokio::test]
+    async fn miss_with_provision_error_forwards_with_null_src_ilk() {
+        let mut p = InboundProcessor::new("node", InboundConfig::default());
+        let id = AlwaysMiss;
+        let provisioner = AlwaysProvisionError;
+        let io = slack_inbound_io_context("T", "U", "C", None, "Ev1");
+        let input = ResolveOrCreateInput {
+            channel: "slack".to_string(),
+            external_id: "T:U".to_string(),
+            tenant_hint: None,
+            attributes: serde_json::json!({}),
+        };
+        let payload = serde_json::json!({ "type": "text", "content": "hi" });
+
+        let o = p
+            .process_inbound(&id, Some(&provisioner), input, io, payload)
+            .await;
+        let InboundOutcome::SendNow(msg) = o else {
+            panic!("unexpected outcome: {o:?}");
+        };
+        let src = msg
+            .meta
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("src_ilk"));
+        assert_eq!(src, Some(&serde_json::Value::Null));
+        let stats = p.stats();
+        assert_eq!(stats.identity_lookup_misses, 1);
+        assert_eq!(stats.identity_provision_errors, 1);
+        assert_eq!(stats.identity_fallback_null, 1);
+    }
+
+    #[tokio::test]
+    async fn lookup_hit_skips_provision_call() {
+        let mut p = InboundProcessor::new("node", InboundConfig::default());
+        let id = HitResolver;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provisioner = CountingProvisioner {
+            calls: Arc::clone(&calls),
+        };
+        let io = slack_inbound_io_context("T", "U", "C", None, "Ev1");
+        let input = ResolveOrCreateInput {
+            channel: "slack".to_string(),
+            external_id: "T:U".to_string(),
+            tenant_hint: None,
+            attributes: serde_json::json!({}),
+        };
+        let payload = serde_json::json!({ "type": "text", "content": "hi" });
+
+        let o = p
+            .process_inbound(&id, Some(&provisioner), input, io, payload)
+            .await;
+        let InboundOutcome::SendNow(msg) = o else {
+            panic!("unexpected outcome: {o:?}");
+        };
+        let src = msg
+            .meta
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("src_ilk"))
+            .and_then(|v| v.as_str());
+        assert_eq!(src, Some("ilk:hit:test"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let stats = p.stats();
+        assert_eq!(stats.identity_lookup_hits, 1);
+        assert_eq!(stats.identity_provision_success, 0);
+        assert_eq!(stats.identity_fallback_null, 0);
     }
 }
