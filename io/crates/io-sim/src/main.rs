@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
-use fluxbee_sdk::{connect, NodeConfig, NodeSender};
+use fluxbee_sdk::{connect, NodeConfig, NodeSender, NodeUuidMode};
 use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
 };
@@ -36,6 +36,7 @@ async fn main() -> Result<()> {
         name: config.node_name.clone(),
         router_socket: config.router_socket.clone(),
         uuid_persistence_dir: config.uuid_persistence_dir.clone(),
+        uuid_mode: NodeUuidMode::Persistent,
         config_dir: config.config_dir.clone(),
         version: config.node_version.clone(),
     })
