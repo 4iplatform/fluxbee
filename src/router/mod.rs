@@ -3712,7 +3712,7 @@ fn load_opa_data_bundle(path: &Path, hive_id: &str) -> Result<Option<String>, io
                             format!("invalid OPA data bundle JSON: {err}"),
                         )
                     })?;
-                if let Some(snapshot) = read_identity_snapshot(hive_id) {
+                if let Ok(snapshot) = read_identity_snapshot(hive_id) {
                     inject_identity_data(&mut root, &snapshot);
                 }
                 Ok(Some(root.to_string()))
@@ -3723,10 +3723,14 @@ fn load_opa_data_bundle(path: &Path, hive_id: &str) -> Result<Option<String>, io
     }
 }
 
-fn read_identity_snapshot(hive_id: &str) -> Option<crate::shm::IdentitySnapshot> {
+fn read_identity_snapshot(
+    hive_id: &str,
+) -> Result<crate::shm::IdentitySnapshot, crate::shm::ShmError> {
     let shm_name = format!("/jsr-identity-{}", hive_id);
-    let reader = IdentityRegionReader::open_read_only_auto(&shm_name).ok()?;
-    reader.read_snapshot()
+    let reader = IdentityRegionReader::open_read_only_auto(&shm_name)?;
+    reader
+        .read_snapshot()
+        .ok_or(crate::shm::ShmError::InvalidHeader)
 }
 
 async fn resolve_target_with_identity(
@@ -3737,7 +3741,8 @@ async fn resolve_target_with_identity(
 ) -> Result<Option<String>, crate::opa::OpaError> {
     let mut msg_for_opa = msg.clone();
     let src_ilk = get_src_ilk_from_meta(&msg.meta);
-    if let Some(snapshot) = read_identity_snapshot(hive_id) {
+    match read_identity_snapshot(hive_id) {
+        Ok(snapshot) => {
         let now_ms = now_epoch_ms();
         let registration_status = src_ilk.as_deref().and_then(|src_ilk| {
             let (_, status) = canonicalize_src_ilk_and_status(&snapshot, src_ilk, now_ms);
@@ -3764,12 +3769,16 @@ async fn resolve_target_with_identity(
                 "identity pre-resolve did not force target"
             );
         }
-    } else if src_ilk.is_some() {
-        tracing::warn!(
-            src_ilk = ?src_ilk,
-            shm = %format!("/jsr-identity-{hive_id}"),
-            "identity pre-resolve skipped: identity snapshot unavailable"
-        );
+        }
+        Err(err) if src_ilk.is_some() => {
+            tracing::warn!(
+                src_ilk = ?src_ilk,
+                shm = %format!("/jsr-identity-{hive_id}"),
+                error = %err,
+                "identity pre-resolve skipped: identity snapshot unavailable"
+            );
+        }
+        Err(_) => {}
     }
     let mut guard = opa.lock().await;
     guard.resolve_target(&msg_for_opa)
