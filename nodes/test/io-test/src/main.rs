@@ -223,7 +223,14 @@ fn env_u64(key: &str, default: u64) -> u64 {
 
 fn is_lookup_unavailable(err: &IdentityShmError) -> bool {
     match err {
-        IdentityShmError::Nix(errno) => *errno == nix::errno::Errno::ENOENT,
+        IdentityShmError::Nix(errno) => {
+            matches!(
+                *errno,
+                nix::errno::Errno::ENOENT
+                    | nix::errno::Errno::EACCES
+                    | nix::errno::Errno::EPERM
+            )
+        }
         IdentityShmError::Io(io_err) => io_err.kind() == std::io::ErrorKind::NotFound,
         IdentityShmError::SeqLockTimeout => true,
         _ => false,
