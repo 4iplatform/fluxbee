@@ -2302,12 +2302,29 @@ fn read_identity_snapshot(
     layout: &IdentityRegionLayout,
 ) -> Result<IdentitySnapshot, ShmError> {
     let start = Instant::now();
+    let mut odd_seq_spins = 0u64;
+    let mut seq_retry_count = 0u64;
+    let mut last_seq = 0u64;
     loop {
         if start.elapsed() > Duration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            tracing::warn!(
+                elapsed_us = start.elapsed().as_micros() as u64,
+                odd_seq_spins,
+                seq_retry_count,
+                last_seq,
+                tenant_count = header.tenant_count,
+                ilk_count = header.ilk_count,
+                ich_count = header.ich_count,
+                ich_mapping_count = header.ich_mapping_count,
+                ilk_alias_count = header.ilk_alias_count,
+                "identity shm read timed out under seqlock"
+            );
             return Err(ShmError::SeqLockTimeout);
         }
         let s1 = header.seq.load(Ordering::Acquire);
+        last_seq = s1;
         if s1 & 1 != 0 {
+            odd_seq_spins = odd_seq_spins.saturating_add(1);
             std::hint::spin_loop();
             continue;
         }
@@ -2406,6 +2423,8 @@ fn read_identity_snapshot(
                 vocabulary: vocabulary_snapshot,
             });
         }
+        seq_retry_count = seq_retry_count.saturating_add(1);
+        last_seq = s2;
     }
 }
 

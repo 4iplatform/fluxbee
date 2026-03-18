@@ -39,6 +39,12 @@ Estado:
 - [x] Identity SHM / Router: distinguir timeout de lectura (`SeqLockTimeout`) de `InvalidHeader`.
   - El router ahora puede diagnosticar mejor cuándo el snapshot no está corrupto sino simplemente no disponible dentro de la ventana de lectura.
 
+- [x] Instrumentación temporal fuerte para diagnóstico de `ILK_PROVISION -> SHM -> router pre-resolve`.
+  - `sy_identity` ahora loguea recepción de `ILK_PROVISION`, duración del store update, duración del apply al SHM y momento de respuesta usando `trace_id`.
+  - el writer del SHM loguea timeout de lectura con contadores de reintento/seqlock.
+  - el router loguea apertura/lectura del snapshot identity y tiempos del `identity-aware resolve`.
+  - Objetivo: reconstruir orden exacto entre procesos y distinguir contención real de desincronismo entre actor/respuesta/lectura.
+
 - [x] Identity: eliminar carrera entre `ILK_PROVISION_RESPONSE` y visibilidad del ILK en el SHM consumido por el router.
   - Hallazgo en prueba real: `IO.test` provisionaba un ILK temporal y enviaba el probe inmediatamente, pero el router todavía no lo veía en SHM y caía a OPA.
   - Ajuste aplicado: `sy_identity` ahora sincroniza el SHM antes de responder acciones del sistema que mutan el store.

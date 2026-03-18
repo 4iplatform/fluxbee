@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::{mpsc, Mutex};
@@ -3727,8 +3728,36 @@ fn read_identity_snapshot(
     hive_id: &str,
 ) -> Result<crate::shm::IdentitySnapshot, crate::shm::ShmError> {
     let shm_name = format!("/jsr-identity-{}", hive_id);
+    let open_started = Instant::now();
     let reader = IdentityRegionReader::open_read_only_auto(&shm_name)?;
-    reader.try_read_snapshot()
+    let open_elapsed_us = open_started.elapsed().as_micros() as u64;
+    let read_started = Instant::now();
+    match reader.try_read_snapshot() {
+        Ok(snapshot) => {
+            tracing::info!(
+                shm = %shm_name,
+                open_elapsed_us,
+                read_elapsed_us = read_started.elapsed().as_micros() as u64,
+                tenant_count = snapshot.header.tenant_count,
+                ilk_count = snapshot.header.ilk_count,
+                ich_count = snapshot.header.ich_count,
+                ich_mapping_count = snapshot.header.ich_mapping_count,
+                updated_at = snapshot.header.updated_at,
+                "router identity snapshot read succeeded"
+            );
+            Ok(snapshot)
+        }
+        Err(err) => {
+            tracing::warn!(
+                shm = %shm_name,
+                open_elapsed_us,
+                read_elapsed_us = read_started.elapsed().as_micros() as u64,
+                error = %err,
+                "router identity snapshot read failed"
+            );
+            Err(err)
+        }
+    }
 }
 
 async fn resolve_target_with_identity(
@@ -3737,8 +3766,15 @@ async fn resolve_target_with_identity(
     identity_frontdesk_node_name: &str,
     msg: &Message,
 ) -> Result<Option<String>, crate::opa::OpaError> {
+    let resolve_started = Instant::now();
     let mut msg_for_opa = msg.clone();
     let src_ilk = get_src_ilk_from_meta(&msg.meta);
+    tracing::info!(
+        trace_id = %msg.routing.trace_id,
+        src_ilk = ?src_ilk,
+        identity_frontdesk_node_name = %identity_frontdesk_node_name,
+        "router starting identity-aware resolve"
+    );
     match read_identity_snapshot(hive_id) {
         Ok(snapshot) => {
         let now_ms = now_epoch_ms();
@@ -3753,26 +3789,32 @@ async fn resolve_target_with_identity(
             now_ms,
         ) {
             tracing::info!(
+                trace_id = %msg.routing.trace_id,
                 src_ilk = ?src_ilk,
                 registration_status = ?registration_status,
                 forced_target = %forced_target,
+                elapsed_us = resolve_started.elapsed().as_micros() as u64,
                 "identity pre-resolve forced frontdesk target"
             );
             return Ok(Some(forced_target));
         }
         if src_ilk.is_some() {
             tracing::info!(
+                trace_id = %msg.routing.trace_id,
                 src_ilk = ?src_ilk,
                 registration_status = ?registration_status,
+                elapsed_us = resolve_started.elapsed().as_micros() as u64,
                 "identity pre-resolve did not force target"
             );
         }
         }
         Err(err) if src_ilk.is_some() => {
             tracing::warn!(
+                trace_id = %msg.routing.trace_id,
                 src_ilk = ?src_ilk,
                 shm = %format!("/jsr-identity-{hive_id}"),
                 error = %err,
+                elapsed_us = resolve_started.elapsed().as_micros() as u64,
                 "identity pre-resolve skipped: identity snapshot unavailable"
             );
         }

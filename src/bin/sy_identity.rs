@@ -870,8 +870,20 @@ impl IdentityRuntime {
         let Some(action) = msg.meta.msg.as_deref() else {
             return Ok(Vec::new());
         };
+        let action_started = Instant::now();
+        let trace_id = msg.routing.trace_id.clone();
 
         let source_name = self.resolve_source_name_with_retry(&msg.routing.src).await;
+        if action == MSG_ILK_PROVISION {
+            tracing::info!(
+                action,
+                trace_id = %trace_id,
+                source_uuid = %msg.routing.src,
+                source_name = source_name.as_deref().unwrap_or("<unknown>"),
+                payload = %msg.payload,
+                "identity received ILK_PROVISION request"
+            );
+        }
         if !self.is_authorized(action, source_name.as_deref()) {
             let payload = json!({
                 "status": "error",
@@ -906,8 +918,16 @@ impl IdentityRuntime {
                         } else {
                             None
                         };
+                        let provision_started = Instant::now();
                         match self.store.provision_temporary_ilk(req) {
                             Ok(ok) => {
+                                tracing::info!(
+                                    action,
+                                    trace_id = %trace_id,
+                                    elapsed_us = provision_started.elapsed().as_micros() as u64,
+                                    response = %ok,
+                                    "identity store provision completed"
+                                );
                                 if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
                                     if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
                                         if self.is_primary {
@@ -1278,10 +1298,24 @@ impl IdentityRuntime {
 
         if !deltas.is_empty() {
             if let Some(writer) = identity_shm {
+                let shm_apply_started = Instant::now();
                 apply_identity_shm_deltas(writer, &self.store, action, &deltas)?;
+                tracing::info!(
+                    action,
+                    trace_id = %trace_id,
+                    delta_count = deltas.len(),
+                    elapsed_us = shm_apply_started.elapsed().as_micros() as u64,
+                    "identity shm delta apply completed"
+                );
             }
         }
 
+        tracing::info!(
+            action,
+            trace_id = %trace_id,
+            elapsed_us = action_started.elapsed().as_micros() as u64,
+            "identity sending system response"
+        );
         send_system_response(sender, msg, response_name(action), payload).await?;
         Ok(deltas)
     }
@@ -2147,8 +2181,15 @@ fn apply_identity_shm_provision_fast(
     }
 
     let entries_only: Vec<IchEntry> = ich_entries.iter().map(|(entry, _, _)| *entry).collect();
+    let apply_started = Instant::now();
     let ilk_entry = ilk_entry_from_record(ilk)?;
     writer.provision_temporary_ilk(ilk_entry, &entries_only)?;
+    tracing::info!(
+        ilk_id = %ilk.ilk_id,
+        channel_count = entries_only.len(),
+        elapsed_us = apply_started.elapsed().as_micros() as u64,
+        "identity shm provision fast path applied"
+    );
     Ok(true)
 }
 
