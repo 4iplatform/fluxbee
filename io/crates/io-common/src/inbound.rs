@@ -90,8 +90,32 @@ impl InboundProcessor {
 
         let trace_id = new_trace_id();
         let mut src_ilk = match identity.lookup(&identity_input.channel, &identity_input.external_id) {
-            Ok(v) => v,
-            Err(_) => None,
+            Ok(Some(src_ilk)) => {
+                tracing::debug!(
+                    channel = %identity_input.channel,
+                    external_id = %identity_input.external_id,
+                    src_ilk = %src_ilk,
+                    "identity lookup hit"
+                );
+                Some(src_ilk)
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    channel = %identity_input.channel,
+                    external_id = %identity_input.external_id,
+                    "identity lookup miss"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    channel = %identity_input.channel,
+                    external_id = %identity_input.external_id,
+                    "identity lookup error; treating as miss"
+                );
+                None
+            }
         };
 
         if src_ilk.is_none() && self.provision_on_miss {
