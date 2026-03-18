@@ -75,7 +75,3 @@ Comportamiento esperado:
 ## Nota importante sobre `src_ilk`
 
 El contrato canónico ahora es `meta.src_ilk`.
-
-El router mantiene compatibilidad de lectura con el formato legacy
-`meta.context.src_ilk`, pero los ejemplos y el SDK deben usar `meta.src_ilk`
-como forma principal.

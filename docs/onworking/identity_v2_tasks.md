@@ -204,7 +204,7 @@ Salida:
 - [x] F2. Canonicalizar `src_ilk` antes de resolver target.
   - Implementado en `router` como pre-resolve integrado:
     - lee alias desde SHM identity,
-    - canonicaliza `meta.context.src_ilk` (si existe),
+    - canonicaliza `meta.src_ilk`,
     - luego evalúa OPA con el ILK canonical.
 - [x] F3. Ruteo de temporales a frontdesk.
   - Implementado en `router` como override pre-OPA:

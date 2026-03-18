@@ -107,8 +107,7 @@ Estado:
 
 - [x] Router/SDK: contrato de `src_ilk` alineado.
   - El contrato canónico queda en `meta.src_ilk` y el `Meta` tipado del SDK ya lo expone.
-  - El router ahora lee `meta.src_ilk` como fuente principal y mantiene compatibilidad temporal con `meta.context.src_ilk`.
-  - Al canonicalizar, el router escribe ambos para no romper nodos legacy durante la transición.
+  - El router ahora consume `meta.src_ilk` como única fuente para el pre-resolve/canonicalización.
   - Los ejemplos `IO.test` y `AI.test.gov` ya usan `meta.src_ilk` como forma principal.
 
 ## Notas de arquitectura

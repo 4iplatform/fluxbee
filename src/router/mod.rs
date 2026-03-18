@@ -3905,32 +3905,10 @@ fn get_src_ilk_from_meta(meta: &Meta) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string())
-        .or_else(|| {
-            meta.context
-        .as_ref()
-        .and_then(serde_json::Value::as_object)
-        .and_then(|ctx| ctx.get("src_ilk"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
-        })
 }
 
 fn set_src_ilk_in_meta(meta: &mut Meta, src_ilk: &str) {
     meta.src_ilk = Some(src_ilk.to_string());
-    let value = serde_json::Value::String(src_ilk.to_string());
-    match meta.context.as_mut() {
-        Some(serde_json::Value::Object(ctx)) => {
-            ctx.insert("src_ilk".to_string(), value);
-        }
-        Some(_) => {
-            meta.context = Some(serde_json::json!({ "src_ilk": src_ilk }));
-        }
-        None => {
-            meta.context = Some(serde_json::json!({ "src_ilk": src_ilk }));
-        }
-    }
 }
 
 fn inject_identity_data(root: &mut serde_json::Value, snapshot: &crate::shm::IdentitySnapshot) {
@@ -5052,14 +5030,6 @@ mod tests {
             Some("ilk:11111111-1111-1111-1111-111111111111")
         );
         assert_eq!(
-            meta.context
-                .as_ref()
-                .and_then(serde_json::Value::as_object)
-                .and_then(|ctx| ctx.get("src_ilk"))
-                .and_then(serde_json::Value::as_str),
-            Some("ilk:11111111-1111-1111-1111-111111111111")
-        );
-        assert_eq!(
             get_src_ilk_from_meta(&meta).as_deref(),
             Some("ilk:11111111-1111-1111-1111-111111111111")
         );
@@ -5081,43 +5051,10 @@ mod tests {
                 target: Some("dummy.target".to_string()),
                 action: None,
                 priority: None,
-                context: Some(serde_json::json!({
-                    "src_ilk": src_ilk,
-                })),
+                context: None,
             },
             payload: serde_json::json!({}),
         }
-    }
-
-    fn message_with_context_only_src_ilk(src_ilk: &str) -> Message {
-        Message {
-            routing: Routing {
-                src: Uuid::new_v4().to_string(),
-                dst: Destination::Resolve,
-                ttl: 16,
-                trace_id: Uuid::new_v4().to_string(),
-            },
-            meta: Meta {
-                msg_type: "user".to_string(),
-                msg: None,
-                src_ilk: None,
-                scope: None,
-                target: Some("dummy.target".to_string()),
-                action: None,
-                priority: None,
-                context: Some(serde_json::json!({
-                    "src_ilk": src_ilk,
-                })),
-            },
-            payload: serde_json::json!({}),
-        }
-    }
-
-    #[test]
-    fn src_ilk_meta_helpers_accept_legacy_context_shape() {
-        let old_src = "ilk:22222222-2222-2222-2222-222222222222";
-        let msg = message_with_context_only_src_ilk(old_src);
-        assert_eq!(get_src_ilk_from_meta(&msg.meta).as_deref(), Some(old_src));
     }
 
     #[test]

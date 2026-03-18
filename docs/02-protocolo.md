@@ -104,8 +104,6 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 
 Nota de contrato:
 - el campo canónico de L3 para identity routing es `meta.src_ilk`
-- el router mantiene compatibilidad temporal con el formato legacy `meta.context.src_ilk`
-- durante transición, el router puede espejar el valor canonicalizado en ambos lugares
 
 **Regla:** si `type="system"` y `scope="global"`, el router ignora el filtro de VPN para broadcast/multicast.
 

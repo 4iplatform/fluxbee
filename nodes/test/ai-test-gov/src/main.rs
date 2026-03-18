@@ -91,16 +91,7 @@ async fn run_loop(sender: &NodeSender, receiver: &mut NodeReceiver) -> Result<()
 }
 
 fn src_ilk_from_meta(meta: &Meta) -> Option<String> {
-    meta.src_ilk.clone().or_else(|| {
-        meta.context
-            .as_ref()
-            .and_then(Value::as_object)
-            .and_then(|ctx| ctx.get("src_ilk"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(|v| v.to_string())
-    })
+    meta.src_ilk.clone()
 }
 
 fn build_node_config(default_name: &str, default_version: &str, prefix: &str) -> NodeConfig {
