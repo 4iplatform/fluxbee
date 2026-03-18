@@ -6,11 +6,6 @@ Estado:
 
 ## Abiertos
 
-- [ ] SDK: degradar `IdentityShmError::Nix(EACCES|EPERM)` a "lookup unavailable" en helpers de alto nivel, no sólo en ejemplos.
-  - Contexto: `IO.test` falló al leer el SHM de identity desde un proceso sin permisos de lectura.
-  - Hoy el workaround quedó absorbido en `nodes/test/io-test/src/main.rs`.
-  - Objetivo: que el fallback a `ILK_PROVISION` sea natural para integradores del SDK.
-
 - [ ] Router/SDK: alinear contrato de `src_ilk`.
   - Hallazgo: el router hoy hace pre-resolve leyendo `meta.context.src_ilk`.
   - Riesgo: integradores pueden asumir otro shape del mensaje si leen docs viejas o ejemplos incompletos.
@@ -110,6 +105,10 @@ Estado:
 
 - [x] `io-test`: tratar `EACCES|EPERM` del SHM de identity como lookup no disponible y hacer fallback a provision.
   - Esto desbloquea la prueba real del flujo aunque todavía falte endurecer el helper del SDK.
+
+- [x] SDK: degradar `IdentityShmError::Nix(EACCES|EPERM)` a "lookup unavailable" en helpers de alto nivel.
+  - `resolve_ilk_from_shm_name`, `resolve_ilk_from_hive_id` y `resolve_ilk_from_hive_config` ahora devuelven `Ok(None)` cuando el lookup falla por permiso denegado.
+  - Resultado: el fallback a `ILK_PROVISION` ya no depende de workarounds específicos en cada integrador.
 
 ## Notas de arquitectura
 

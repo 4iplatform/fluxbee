@@ -642,8 +642,16 @@ pub fn resolve_ilk_from_shm_name(
     if normalized_channel.is_empty() || normalized_address.is_empty() {
         return Err(IdentityShmError::InvalidChannelInput);
     }
-    let reader = open_identity_shm_reader(identity_shm_name)?;
-    let ilk = reader.resolve_ich_mapping(&normalized_channel, &normalized_address)?;
+    let reader = match open_identity_shm_reader(identity_shm_name) {
+        Ok(reader) => reader,
+        Err(err) if is_permission_lookup_unavailable(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let ilk = match reader.resolve_ich_mapping(&normalized_channel, &normalized_address) {
+        Ok(ilk) => ilk,
+        Err(err) if is_permission_lookup_unavailable(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
     Ok(ilk.map(|ilk_id| format!("ilk:{}", Uuid::from_bytes(ilk_id))))
 }
 
@@ -759,6 +767,16 @@ fn open_identity_shm_reader(name: &str) -> Result<IdentityShmReader, IdentityShm
         return Err(IdentityShmError::InvalidShmHeader);
     }
     Ok(IdentityShmReader { mmap, layout })
+}
+
+fn is_permission_lookup_unavailable(err: &IdentityShmError) -> bool {
+    match err {
+        IdentityShmError::Nix(errno) => {
+            matches!(*errno, nix::errno::Errno::EACCES | nix::errno::Errno::EPERM)
+        }
+        IdentityShmError::Io(io_err) => io_err.kind() == std::io::ErrorKind::PermissionDenied,
+        _ => false,
+    }
 }
 
 fn resolve_ich_mapping_from_region(
@@ -967,6 +985,18 @@ fn is_prefixed_uuid(value: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_denied_lookup_is_treated_as_not_found() {
+        let out = match Err::<Option<String>, _>(IdentityShmError::Nix(nix::errno::Errno::EACCES))
+        {
+            Err(err) if is_permission_lookup_unavailable(&err) => Ok(None),
+            Err(err) => Err(err),
+            Ok(value) => Ok(value),
+        }
+        .expect("permission denied should degrade to lookup unavailable");
+        assert_eq!(out, None);
+    }
 
     #[test]
     fn parse_provision_payload_ok() {
