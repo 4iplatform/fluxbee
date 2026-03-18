@@ -3728,9 +3728,7 @@ fn read_identity_snapshot(
 ) -> Result<crate::shm::IdentitySnapshot, crate::shm::ShmError> {
     let shm_name = format!("/jsr-identity-{}", hive_id);
     let reader = IdentityRegionReader::open_read_only_auto(&shm_name)?;
-    reader
-        .read_snapshot()
-        .ok_or(crate::shm::ShmError::InvalidHeader)
+    reader.try_read_snapshot()
 }
 
 async fn resolve_target_with_identity(

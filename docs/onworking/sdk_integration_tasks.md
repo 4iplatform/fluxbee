@@ -16,13 +16,6 @@ Estado:
   - Riesgo: integradores pueden asumir otro shape del mensaje si leen docs viejas o ejemplos incompletos.
   - Objetivo: definir y documentar un contrato único, y si hace falta aceptar ambos formatos temporalmente.
 
-- [ ] Router: revisar por qué ciertos `src_ilk` temporales no activan el desvío automático a frontdesk aun con `identity_frontdesk` configurado y frontdesk online.
-  - Instrumentación agregada para distinguir:
-    - snapshot de identity no disponible
-    - ILK no encontrado en snapshot
-    - status no temporal
-    - target forzado correctamente
-
 - [ ] Identity SHM: revisar modelo de permisos para lectura por nodos no privilegiados.
   - Hallazgo: el SHM se crea con `0600`.
   - Pregunta abierta: eso es policy deseada o sólo un default demasiado estricto para integraciones SDK?
@@ -33,6 +26,17 @@ Estado:
   - Queda como mejora de producto/herramientas.
 
 ## Hechos
+
+- [x] Identity SHM: reemplazar el sync global en hot path por escritura incremental orientada a deltas.
+  - Problema observado: `ILK_PROVISION` disparaba un rewrite completo del snapshot de identity SHM y el router fallaba leyendo `/jsr-identity-<hive>` durante la ventana de seqlock.
+  - Cambio aplicado:
+    - `IdentityRegionWriter` ahora soporta upserts/remociones incrementales para tenants, ILKs, ICH entries, mappings y aliases.
+    - `sy_identity` aplica `IdentityDelta` directamente al SHM en vez de ejecutar `sync_identity_shm_mappings(...)` por cada acción.
+    - el rebuild completo queda como fallback de reparación si la aplicación incremental falla.
+  - Resultado esperado: `ILK_PROVISION` y otras acciones puntuales dejan de reescribir regiones completas del SHM.
+
+- [x] Identity SHM / Router: distinguir timeout de lectura (`SeqLockTimeout`) de `InvalidHeader`.
+  - El router ahora puede diagnosticar mejor cuándo el snapshot no está corrupto sino simplemente no disponible dentro de la ventana de lectura.
 
 - [x] Identity: eliminar carrera entre `ILK_PROVISION_RESPONSE` y visibilidad del ILK en el SHM consumido por el router.
   - Hallazgo en prueba real: `IO.test` provisionaba un ILK temporal y enviaba el probe inmediatamente, pero el router todavía no lo veía en SHM y caía a OPA.
@@ -77,6 +81,13 @@ Estado:
   - `src_ilk` presente en el shape que hoy consume el router
   - `registration_status = temporary` en identity
 - La convención `.gov` hoy es convención operativa, no enforcement del sistema.
+- Para identity SHM:
+  - `full snapshot sync` queda reservado para bootstrap, rebuild y fallback.
+  - el hot path de acciones del sistema debe operar con deltas incrementales.
+  - si vuelve a aparecer contención de lectura, revisar primero:
+    - duración de ventana de seqlock
+    - costo de reindex de ICH
+    - frecuencia de fallback a rebuild completo
 
 ## Criterio para nuevas entradas
 

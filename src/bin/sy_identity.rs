@@ -1278,7 +1278,7 @@ impl IdentityRuntime {
 
         if !deltas.is_empty() {
             if let Some(writer) = identity_shm {
-                sync_identity_shm_mappings(writer, &self.store)?;
+                apply_identity_shm_deltas(writer, &self.store, &deltas)?;
             }
         }
 
@@ -1981,6 +1981,170 @@ fn sync_identity_shm_mappings(
         alias_count = alias_entries.len(),
         "identity shm snapshot sync applied"
     );
+    Ok(())
+}
+
+fn tenant_entry_from_record(tenant: &TenantRecord) -> Result<TenantEntry, IdentityError> {
+    let tenant_uuid = parse_prefixed_uuid(&tenant.tenant_id, "tnt")?;
+    let now_ms = now_epoch_ms();
+    let mut entry = TenantEntry {
+        tenant_id: *tenant_uuid.as_bytes(),
+        name: [0u8; 128],
+        domain: [0u8; 128],
+        status: parse_tenant_status_for_shm(&tenant.status),
+        flags: FLAG_ACTIVE,
+        _pad0: [0u8; 5],
+        max_ilks: tenant
+            .settings
+            .get("max_ilks")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32,
+        created_at: now_ms,
+        updated_at: now_ms,
+        _reserved: [0u8; 8],
+    };
+    copy_bytes_with_len(&mut entry.name, tenant.name.trim());
+    if let Some(domain) = tenant
+        .domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        copy_bytes_with_len(&mut entry.domain, domain);
+    }
+    Ok(entry)
+}
+
+fn ilk_entry_from_record(ilk: &IlkRecord) -> Result<IlkEntry, IdentityError> {
+    let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
+    let tenant_uuid = parse_prefixed_uuid(&ilk.tenant_id, "tnt")?;
+    let now_ms = now_epoch_ms();
+    let mut entry = IlkEntry {
+        ilk_id: *ilk_uuid.as_bytes(),
+        ilk_type: parse_ilk_type_for_shm(&ilk.ilk_type),
+        registration_status: parse_registration_status_for_shm(&ilk.registration_status),
+        flags: FLAG_ACTIVE,
+        tenant_id: *tenant_uuid.as_bytes(),
+        display_name: [0u8; 128],
+        handler_node: [0u8; 128],
+        ich_offset: 0,
+        ich_count: 0,
+        _pad0: [0u8; 2],
+        roles_offset: 0,
+        roles_len: 0,
+        _pad1: [0u8; 2],
+        capabilities_offset: 0,
+        capabilities_len: 0,
+        _pad2: [0u8; 2],
+        created_at: now_ms,
+        updated_at: now_ms,
+        _reserved: [0u8; 8],
+    };
+    let display_name = identification_str(&ilk.identification, "display_name")
+        .or_else(|| identification_str(&ilk.identification, "node_name"))
+        .unwrap_or(ilk.ilk_id.as_str());
+    copy_bytes_with_len(&mut entry.display_name, display_name);
+    if let Some(handler_node) = identification_str(&ilk.identification, "node_name") {
+        copy_bytes_with_len(&mut entry.handler_node, handler_node);
+    }
+    Ok(entry)
+}
+
+fn ich_entries_from_ilk_record(ilk: &IlkRecord) -> Result<Vec<(IchEntry, String, String)>, IdentityError> {
+    let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
+    let now_ms = now_epoch_ms();
+    let mut entries = Vec::with_capacity(ilk.channels.len());
+    for (idx, channel) in ilk.channels.iter().enumerate() {
+        let ich_uuid = parse_prefixed_uuid(&channel.ich_id, "ich")?;
+        let channel_type = channel.channel_type.trim().to_ascii_lowercase();
+        let address = channel.address.trim().to_ascii_lowercase();
+        if channel_type.is_empty() || address.is_empty() {
+            continue;
+        }
+        let mut entry = IchEntry {
+            ich_id: *ich_uuid.as_bytes(),
+            ilk_id: *ilk_uuid.as_bytes(),
+            channel_type: [0u8; ICH_CHANNEL_TYPE_MAX_LEN],
+            address: [0u8; ICH_ADDRESS_MAX_LEN],
+            flags: FLAG_ACTIVE,
+            is_primary: if idx == 0 { 1 } else { 0 },
+            _pad0: [0u8; 5],
+            added_at: now_ms,
+            _reserved: [0u8; 16],
+        };
+        copy_bytes_with_len(&mut entry.channel_type, &channel_type);
+        copy_bytes_with_len(&mut entry.address, &address);
+        entries.push((entry, channel_type, address));
+    }
+    Ok(entries)
+}
+
+fn alias_entry_from_record(alias: &AliasSnapshotRecord) -> Result<IlkAliasEntry, IdentityError> {
+    let old_uuid = parse_prefixed_uuid(&alias.old_ilk_id, "ilk")?;
+    let canonical_uuid = parse_prefixed_uuid(&alias.canonical_ilk_id, "ilk")?;
+    Ok(IlkAliasEntry {
+        old_ilk_id: *old_uuid.as_bytes(),
+        canonical_ilk_id: *canonical_uuid.as_bytes(),
+        expires_at: alias.expires_at_ms,
+        flags: FLAG_ACTIVE,
+        _reserved: [0u8; 22],
+    })
+}
+
+fn apply_identity_shm_delta(
+    writer: &mut IdentityRegionWriter,
+    delta: &IdentityDelta,
+) -> Result<(), IdentityError> {
+    match delta {
+        IdentityDelta::TenantUpsert { tenant } => {
+            writer.upsert_tenant_entry(tenant_entry_from_record(tenant)?)?;
+        }
+        IdentityDelta::IlkUpsert { ilk } => {
+            let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
+            writer.upsert_ilk_entry(ilk_entry_from_record(ilk)?)?;
+            writer.clear_ich_mappings_for_ilk(*ilk_uuid.as_bytes())?;
+            let ich_entries = ich_entries_from_ilk_record(ilk)?;
+            let entries_only: Vec<IchEntry> = ich_entries.iter().map(|(entry, _, _)| *entry).collect();
+            writer.replace_ich_entries_for_ilk(*ilk_uuid.as_bytes(), &entries_only)?;
+            for (entry, channel_type, address) in ich_entries {
+                writer.upsert_ich_mapping(
+                    &channel_type,
+                    &address,
+                    entry.ich_id,
+                    *ilk_uuid.as_bytes(),
+                )?;
+            }
+        }
+        IdentityDelta::IlkDelete { ilk_id } => {
+            let ilk_uuid = parse_prefixed_uuid(ilk_id, "ilk")?;
+            writer.clear_ich_mappings_for_ilk(*ilk_uuid.as_bytes())?;
+            writer.replace_ich_entries_for_ilk(*ilk_uuid.as_bytes(), &[])?;
+            writer.remove_ilk_entry(*ilk_uuid.as_bytes())?;
+        }
+        IdentityDelta::AliasUpsert { alias } => {
+            writer.upsert_ilk_alias_entry(alias_entry_from_record(alias)?)?;
+        }
+        IdentityDelta::AliasDelete { old_ilk_id } => {
+            let old_uuid = parse_prefixed_uuid(old_ilk_id, "ilk")?;
+            writer.remove_ilk_alias_entry(*old_uuid.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_identity_shm_deltas(
+    writer: &mut IdentityRegionWriter,
+    store: &IdentityStore,
+    deltas: &[IdentityDeltaEnvelope],
+) -> Result<(), IdentityError> {
+    for delta in deltas {
+        if let Err(err) = apply_identity_shm_delta(writer, &delta.delta) {
+            tracing::warn!(error = %err, "identity shm incremental apply failed; rebuilding full snapshot");
+            sync_identity_shm_mappings(writer, store)?;
+            return Ok(());
+        }
+    }
     Ok(())
 }
 

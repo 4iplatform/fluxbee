@@ -78,6 +78,8 @@ pub enum ShmError {
     Nix(#[from] nix::Error),
     #[error("invalid header")]
     InvalidHeader,
+    #[error("seqlock read timeout")]
+    SeqLockTimeout,
     #[error("name too long")]
     NameTooLong,
     #[error("value too long: {len} > {max}")]
@@ -1159,8 +1161,13 @@ impl IdentityRegionWriter {
     }
 
     pub fn read_snapshot(&self) -> Option<IdentitySnapshot> {
-        let header = self.header_ref()?;
+        self.try_read_snapshot().ok()
+    }
+
+    pub fn try_read_snapshot(&self) -> Result<IdentitySnapshot, ShmError> {
+        let header = self.header_ref().ok_or(ShmError::InvalidHeader)?;
         read_identity_snapshot(header, self.mmap.as_ref(), &self.layout)
+            .ok_or(ShmError::SeqLockTimeout)
     }
 
     pub fn update_heartbeat(&mut self) {
@@ -1340,6 +1347,184 @@ impl IdentityRegionWriter {
         result.map(|_| ())
     }
 
+    pub fn upsert_tenant_entry(&mut self, entry: TenantEntry) -> Result<(), ShmError> {
+        let (header, tenants, _ilks, _ichs, _mappings, _aliases, _vocabulary) =
+            identity_header_and_entries_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
+        let used = header.tenant_count as usize;
+        let max = self.layout.limits.max_tenants as usize;
+        if used > max {
+            return Err(ShmError::InvalidHeader);
+        }
+        seqlock_begin_write(&header.seq);
+        if let Some(idx) = find_tenant_entry_index(&tenants[..used], entry.tenant_id) {
+            let created_at = tenants[idx].created_at;
+            tenants[idx] = entry;
+            tenants[idx].created_at = created_at;
+        } else if used < max {
+            tenants[used] = entry;
+            header.tenant_count = header.tenant_count.saturating_add(1);
+        } else {
+            seqlock_end_write(&header.seq);
+            return Err(ShmError::SlotFull);
+        }
+        header.updated_at = now_epoch_ms();
+        header.heartbeat = header.updated_at;
+        seqlock_end_write(&header.seq);
+        Ok(())
+    }
+
+    pub fn upsert_ilk_entry(&mut self, entry: IlkEntry) -> Result<(), ShmError> {
+        let (header, _tenants, ilks, _ichs, _mappings, _aliases, _vocabulary) =
+            identity_header_and_entries_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
+        let used = header.ilk_count as usize;
+        let max = self.layout.limits.max_ilks as usize;
+        if used > max {
+            return Err(ShmError::InvalidHeader);
+        }
+        seqlock_begin_write(&header.seq);
+        if let Some(idx) = find_ilk_entry_index(&ilks[..used], entry.ilk_id) {
+            let created_at = ilks[idx].created_at;
+            ilks[idx] = entry;
+            ilks[idx].created_at = created_at;
+        } else if used < max {
+            ilks[used] = entry;
+            header.ilk_count = header.ilk_count.saturating_add(1);
+        } else {
+            seqlock_end_write(&header.seq);
+            return Err(ShmError::SlotFull);
+        }
+        header.updated_at = now_epoch_ms();
+        header.heartbeat = header.updated_at;
+        seqlock_end_write(&header.seq);
+        Ok(())
+    }
+
+    pub fn remove_ilk_entry(&mut self, ilk_id: [u8; 16]) -> Result<bool, ShmError> {
+        let (header, _tenants, ilks, _ichs, _mappings, _aliases, _vocabulary) =
+            identity_header_and_entries_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
+        let used = header.ilk_count as usize;
+        if used > self.layout.limits.max_ilks as usize {
+            return Err(ShmError::InvalidHeader);
+        }
+        seqlock_begin_write(&header.seq);
+        let removed = remove_compact_ilk_entry(header, ilks, ilk_id);
+        if removed {
+            header.updated_at = now_epoch_ms();
+            header.heartbeat = header.updated_at;
+        }
+        seqlock_end_write(&header.seq);
+        Ok(removed)
+    }
+
+    pub fn replace_ich_entries_for_ilk(
+        &mut self,
+        ilk_id: [u8; 16],
+        entries: &[IchEntry],
+    ) -> Result<(), ShmError> {
+        let (header, _tenants, ilks, ichs, _mappings, _aliases, _vocabulary) =
+            identity_header_and_entries_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
+        let max_ichs = self.layout.limits.max_ichs() as usize;
+        let mut used = header.ich_count as usize;
+        if used > max_ichs {
+            return Err(ShmError::InvalidHeader);
+        }
+        seqlock_begin_write(&header.seq);
+        let mut idx = 0usize;
+        while idx < used {
+            if ichs[idx].flags & FLAG_ACTIVE != 0 && ichs[idx].ilk_id == ilk_id {
+                used -= 1;
+                if idx != used {
+                    ichs[idx] = ichs[used];
+                }
+                ichs[used] = empty_ich_entry();
+                continue;
+            }
+            idx += 1;
+        }
+        if used + entries.len() > max_ichs {
+            seqlock_end_write(&header.seq);
+            return Err(ShmError::SlotFull);
+        }
+        for (offset, entry) in entries.iter().enumerate() {
+            ichs[used + offset] = *entry;
+        }
+        used += entries.len();
+        header.ich_count = used as u32;
+        reindex_ilk_channel_layout(&mut ilks[..header.ilk_count as usize], &ichs[..used]);
+        header.updated_at = now_epoch_ms();
+        header.heartbeat = header.updated_at;
+        seqlock_end_write(&header.seq);
+        Ok(())
+    }
+
+    pub fn clear_ich_mappings_for_ilk(&mut self, ilk_id: [u8; 16]) -> Result<u32, ShmError> {
+        let (header, _tenants, _ilks, _ichs, mappings, _aliases, _vocabulary) =
+            identity_header_and_entries_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
+        seqlock_begin_write(&header.seq);
+        let mut removed = 0u32;
+        for entry in mappings.iter_mut() {
+            if entry.flags & ICH_MAP_FLAG_OCCUPIED != 0 && entry.ilk_id == ilk_id {
+                *entry = empty_ich_mapping_entry();
+                removed = removed.saturating_add(1);
+            }
+        }
+        if removed > 0 {
+            header.ich_mapping_count = header.ich_mapping_count.saturating_sub(removed);
+            header.updated_at = now_epoch_ms();
+            header.heartbeat = header.updated_at;
+        }
+        seqlock_end_write(&header.seq);
+        Ok(removed)
+    }
+
+    pub fn upsert_ilk_alias_entry(&mut self, entry: IlkAliasEntry) -> Result<(), ShmError> {
+        let (header, _tenants, _ilks, _ichs, _mappings, aliases, _vocabulary) =
+            identity_header_and_entries_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
+        let used = header.ilk_alias_count as usize;
+        let max = self.layout.limits.max_ilk_aliases as usize;
+        if used > max {
+            return Err(ShmError::InvalidHeader);
+        }
+        seqlock_begin_write(&header.seq);
+        if let Some(idx) = find_alias_entry_index(&aliases[..used], entry.old_ilk_id) {
+            aliases[idx] = entry;
+        } else if used < max {
+            aliases[used] = entry;
+            header.ilk_alias_count = header.ilk_alias_count.saturating_add(1);
+        } else {
+            seqlock_end_write(&header.seq);
+            return Err(ShmError::SlotFull);
+        }
+        header.updated_at = now_epoch_ms();
+        header.heartbeat = header.updated_at;
+        seqlock_end_write(&header.seq);
+        Ok(())
+    }
+
+    pub fn remove_ilk_alias_entry(&mut self, old_ilk_id: [u8; 16]) -> Result<bool, ShmError> {
+        let (header, _tenants, _ilks, _ichs, _mappings, aliases, _vocabulary) =
+            identity_header_and_entries_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
+        let used = header.ilk_alias_count as usize;
+        if used > self.layout.limits.max_ilk_aliases as usize {
+            return Err(ShmError::InvalidHeader);
+        }
+        seqlock_begin_write(&header.seq);
+        let removed = remove_compact_alias_entry(header, aliases, old_ilk_id);
+        if removed {
+            header.updated_at = now_epoch_ms();
+            header.heartbeat = header.updated_at;
+        }
+        seqlock_end_write(&header.seq);
+        Ok(removed)
+    }
+
     pub fn remove_ich_mapping(
         &mut self,
         channel_type: &str,
@@ -1443,6 +1628,12 @@ impl IdentityRegionReader {
     pub fn read_snapshot(&self) -> Option<IdentitySnapshot> {
         let header = self.header_ref()?;
         read_identity_snapshot(header, self.mmap.as_ref(), &self.layout)
+    }
+
+    pub fn try_read_snapshot(&self) -> Result<IdentitySnapshot, ShmError> {
+        let header = self.header_ref().ok_or(ShmError::InvalidHeader)?;
+        read_identity_snapshot(header, self.mmap.as_ref(), &self.layout)
+            .ok_or(ShmError::SeqLockTimeout)
     }
 
     pub fn resolve_ich_mapping(
@@ -2436,6 +2627,82 @@ fn header_and_slice_mut<T, U>(
     }
 }
 
+fn find_tenant_entry_index(entries: &[TenantEntry], tenant_id: [u8; 16]) -> Option<usize> {
+    entries
+        .iter()
+        .position(|entry| entry.flags & FLAG_ACTIVE != 0 && entry.tenant_id == tenant_id)
+}
+
+fn find_ilk_entry_index(entries: &[IlkEntry], ilk_id: [u8; 16]) -> Option<usize> {
+    entries
+        .iter()
+        .position(|entry| entry.flags & FLAG_ACTIVE != 0 && entry.ilk_id == ilk_id)
+}
+
+fn find_alias_entry_index(entries: &[IlkAliasEntry], old_ilk_id: [u8; 16]) -> Option<usize> {
+    entries
+        .iter()
+        .position(|entry| entry.flags & FLAG_ACTIVE != 0 && entry.old_ilk_id == old_ilk_id)
+}
+
+fn remove_compact_ilk_entry(
+    header: &mut IdentityHeader,
+    entries: &mut [IlkEntry],
+    ilk_id: [u8; 16],
+) -> bool {
+    let used = header.ilk_count as usize;
+    let Some(idx) = find_ilk_entry_index(&entries[..used], ilk_id) else {
+        return false;
+    };
+    let last = used - 1;
+    if idx != last {
+        entries[idx] = entries[last];
+    }
+    entries[last] = empty_ilk_entry();
+    header.ilk_count = header.ilk_count.saturating_sub(1);
+    true
+}
+
+fn remove_compact_alias_entry(
+    header: &mut IdentityHeader,
+    entries: &mut [IlkAliasEntry],
+    old_ilk_id: [u8; 16],
+) -> bool {
+    let used = header.ilk_alias_count as usize;
+    let Some(idx) = find_alias_entry_index(&entries[..used], old_ilk_id) else {
+        return false;
+    };
+    let last = used - 1;
+    if idx != last {
+        entries[idx] = entries[last];
+    }
+    entries[last] = empty_ilk_alias_entry();
+    header.ilk_alias_count = header.ilk_alias_count.saturating_sub(1);
+    true
+}
+
+fn reindex_ilk_channel_layout(ilks: &mut [IlkEntry], ichs: &[IchEntry]) {
+    let mut per_ilk: std::collections::HashMap<[u8; 16], (u32, u16)> =
+        std::collections::HashMap::new();
+    for (idx, entry) in ichs.iter().enumerate() {
+        if entry.flags & FLAG_ACTIVE == 0 {
+            continue;
+        }
+        per_ilk
+            .entry(entry.ilk_id)
+            .and_modify(|(_, count)| *count = count.saturating_add(1))
+            .or_insert((idx as u32, 1));
+    }
+    for ilk in ilks.iter_mut() {
+        if ilk.flags & FLAG_ACTIVE == 0 {
+            continue;
+        }
+        let (offset, count) = per_ilk.get(&ilk.ilk_id).copied().unwrap_or((0, 0));
+        ilk.ich_offset = offset;
+        ilk.ich_count = count;
+    }
+}
+
 fn align_up(value: usize, align: usize) -> usize {
     let mask = align - 1;
     (value + mask) & !mask
@@ -2943,6 +3210,117 @@ mod tests {
             writer.resolve_ich_mapping(channel, &colliders[table_len]),
             Some(([12u8; 16], [13u8; 16]))
         );
+
+        cleanup_shm(&name);
+    }
+
+    #[test]
+    fn identity_incremental_ilk_channel_and_alias_updates() {
+        let id = Uuid::new_v4().simple().to_string();
+        let name = format!("/jsid-i-{}", &id[..8]);
+        cleanup_shm(&name);
+        let limits = IdentityRegionLimits {
+            max_ilks: 4,
+            max_tenants: 2,
+            max_vocabulary: 1,
+            max_ilk_aliases: 4,
+        };
+        let mut writer =
+            IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, limits)
+                .expect("open identity region");
+
+        let tenant_id = [9u8; 16];
+        let ilk_id = [7u8; 16];
+        let alias_old = [6u8; 16];
+        let ich_id = [5u8; 16];
+
+        let tenant = TenantEntry {
+            tenant_id,
+            name: [0u8; 128],
+            domain: [0u8; 128],
+            status: 1,
+            flags: FLAG_ACTIVE,
+            _pad0: [0u8; 5],
+            max_ilks: 0,
+            created_at: 1,
+            updated_at: 1,
+            _reserved: [0u8; 8],
+        };
+        writer.upsert_tenant_entry(tenant).expect("tenant upsert");
+
+        let ilk = IlkEntry {
+            ilk_id,
+            ilk_type: 0,
+            registration_status: 0,
+            flags: FLAG_ACTIVE,
+            tenant_id,
+            display_name: [0u8; 128],
+            handler_node: [0u8; 128],
+            ich_offset: 0,
+            ich_count: 0,
+            _pad0: [0u8; 2],
+            roles_offset: 0,
+            roles_len: 0,
+            _pad1: [0u8; 2],
+            capabilities_offset: 0,
+            capabilities_len: 0,
+            _pad2: [0u8; 2],
+            created_at: 1,
+            updated_at: 1,
+            _reserved: [0u8; 8],
+        };
+        writer.upsert_ilk_entry(ilk).expect("ilk upsert");
+
+        let mut ich = empty_ich_entry();
+        ich.ich_id = ich_id;
+        ich.ilk_id = ilk_id;
+        ich.flags = FLAG_ACTIVE;
+        ich.is_primary = 1;
+        copy_bytes_with_len(&mut ich.channel_type, "io.test.demo");
+        copy_bytes_with_len(&mut ich.address, "addr-1");
+        writer
+            .replace_ich_entries_for_ilk(ilk_id, &[ich])
+            .expect("replace ich entries");
+        writer
+            .upsert_ich_mapping("io.test.demo", "addr-1", ich_id, ilk_id)
+            .expect("upsert mapping");
+
+        let alias = IlkAliasEntry {
+            old_ilk_id: alias_old,
+            canonical_ilk_id: ilk_id,
+            expires_at: 123,
+            flags: FLAG_ACTIVE,
+            _reserved: [0u8; 22],
+        };
+        writer
+            .upsert_ilk_alias_entry(alias)
+            .expect("alias upsert");
+
+        let snap = writer.try_read_snapshot().expect("snapshot");
+        assert_eq!(snap.header.tenant_count, 1);
+        assert_eq!(snap.header.ilk_count, 1);
+        assert_eq!(snap.header.ich_count, 1);
+        assert_eq!(snap.header.ilk_alias_count, 1);
+        assert_eq!(snap.header.ich_mapping_count, 1);
+        assert_eq!(writer.resolve_ich_mapping("io.test.demo", "addr-1"), Some((ich_id, ilk_id)));
+
+        writer
+            .clear_ich_mappings_for_ilk(ilk_id)
+            .expect("clear mappings");
+        writer
+            .replace_ich_entries_for_ilk(ilk_id, &[])
+            .expect("clear ichs");
+        writer.remove_ilk_entry(ilk_id).expect("remove ilk");
+        writer
+            .remove_ilk_alias_entry(alias_old)
+            .expect("remove alias");
+
+        let snap = writer.try_read_snapshot().expect("snapshot after delete");
+        assert_eq!(snap.header.ilk_count, 0);
+        assert_eq!(snap.header.ich_count, 0);
+        assert_eq!(snap.header.ilk_alias_count, 0);
+        assert_eq!(snap.header.ich_mapping_count, 0);
+        assert_eq!(writer.resolve_ich_mapping("io.test.demo", "addr-1"), None);
 
         cleanup_shm(&name);
     }
