@@ -71,7 +71,6 @@ Optional env vars:
 - `UUID_PERSISTENCE_DIR` (default `/var/lib/fluxbee/state/nodes`)
 - `CONFIG_DIR` (default `/etc/fluxbee`)
 - `ISLAND_ID` (used by identity shm path, default `local`)
-- `IDENTITY_MODE` (`shm|mock|disabled|fixed`, default `mock`)
 - `DEV_MODE` (`true|false`, default `false`)
 - `DEDUP_TTL_MS` (default `600000`)
 - `DEDUP_MAX_ENTRIES` (default `50000`)
@@ -79,6 +78,8 @@ Optional env vars:
 - `SLACK_SESSION_WINDOW_MS` (default `0` to disable)
 - `SLACK_SESSION_MAX_SESSIONS` (default `10000`)
 - `SLACK_SESSION_MAX_FRAGMENTS` (default `8`)
+
+Identity behavior is provision-on-miss by default in current IO nodes (no mode flag required).
 
 Example:
 
@@ -98,11 +99,9 @@ Recommended (interactive, keeps process alive and logs replies):
 
 ```bash
 SIM_DST_NODE="AI.chat@sandbox" \
-SIM_SRC_ILK="ilk:11111111-1111-4111-8111-111111111111" \
 ROUTER_SOCKET="/var/run/fluxbee/routers" \
 CONFIG_DIR="/etc/fluxbee" \
 UUID_PERSISTENCE_DIR="/var/lib/fluxbee/state/nodes" \
-IDENTITY_MODE="fixed" \
 RUST_LOG=info,io_sim=debug,fluxbee_sdk=info \
 cargo run --release -p io-sim
 ```
@@ -111,11 +110,9 @@ One-shot send:
 
 ```bash
 SIM_DST_NODE="AI.chat@sandbox" \
-SIM_SRC_ILK="ilk:11111111-1111-4111-8111-111111111111" \
 ROUTER_SOCKET="/var/run/fluxbee/routers" \
 CONFIG_DIR="/etc/fluxbee" \
 UUID_PERSISTENCE_DIR="/var/lib/fluxbee/state/nodes" \
-IDENTITY_MODE="fixed" \
 RUST_LOG=info,io_sim=debug,fluxbee_sdk=info \
 cargo run -p io-sim -- --once "hola router"
 ```
@@ -127,7 +124,6 @@ Optional env vars for `io-sim`:
 - `SIM_SENDER_ID` (default `user.local`)
 - `SIM_CONVERSATION_ID` (default `sim-console`)
 - `SIM_THREAD_ID` (optional)
-- `SIM_SRC_ILK` (required when `IDENTITY_MODE=fixed`)
 - `SIM_TENANT_HINT` (optional)
 
 Note:

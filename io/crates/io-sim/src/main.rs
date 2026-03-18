@@ -3,8 +3,7 @@
 use anyhow::Result;
 use fluxbee_sdk::{connect, NodeConfig, NodeSender};
 use io_common::identity::{
-    DisabledIdentityProvisioner, DisabledIdentityResolver, IdentityProvisioner, IdentityResolver, MockIdentityResolver, ResolveOrCreateInput,
-    ShmIdentityResolver,
+    IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
 };
 use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
 use io_common::io_context::{ConversationRef, IoContext, MessageRef, PartyRef, ReplyTarget};
@@ -29,8 +28,6 @@ async fn main() -> Result<()> {
     tracing::info!(
         node_name = %config.node_name,
         router_socket = %config.router_socket.display(),
-        identity_mode = %config.identity_mode,
-        sim_src_ilk = ?config.sim_src_ilk,
         dst_node = %config.dst_node.clone().unwrap_or_else(|| "resolve".to_string()),
         "io-sim starting"
     );
@@ -50,33 +47,17 @@ async fn main() -> Result<()> {
         "io-sim connected to router"
     );
 
-    let identity: Arc<dyn IdentityResolver> = match config.identity_mode.as_str() {
-        "fixed" => {
-            let Some(src_ilk) = config.sim_src_ilk.clone() else {
-                anyhow::bail!("IDENTITY_MODE=fixed requires SIM_SRC_ILK");
-            };
-            Arc::new(FixedIdentityResolver::new(src_ilk))
-        }
-        "provision" => Arc::new(ShmIdentityResolver::new(&config.island_id)),
-        "mock" => Arc::new(MockIdentityResolver::new()),
-        "shm" => Arc::new(ShmIdentityResolver::new(&config.island_id)),
-        "disabled" => Arc::new(DisabledIdentityResolver::new()),
-        other => anyhow::bail!("unsupported IDENTITY_MODE={other} (use shm|mock|disabled|fixed|provision)"),
-    };
+    let identity: Arc<dyn IdentityResolver> = Arc::new(ShmIdentityResolver::new(&config.island_id));
     let inbox = Arc::new(Mutex::new(RouterInbox::new(receiver)));
-    let provisioner: Arc<dyn IdentityProvisioner> = if config.identity_mode == "provision" {
-        Arc::new(FluxbeeIdentityProvisioner::new(
-            sender.clone(),
-            inbox.clone(),
-            IdentityProvisionConfig {
-                target: config.identity_target.clone(),
-                fallback_target: config.identity_fallback_target.clone(),
-                timeout: Duration::from_millis(config.identity_timeout_ms),
-            },
-        ))
-    } else {
-        Arc::new(DisabledIdentityProvisioner::new())
-    };
+    let provisioner: Arc<dyn IdentityProvisioner> = Arc::new(FluxbeeIdentityProvisioner::new(
+        sender.clone(),
+        inbox.clone(),
+        IdentityProvisionConfig {
+            target: config.identity_target.clone(),
+            fallback_target: config.identity_fallback_target.clone(),
+            timeout: Duration::from_millis(config.identity_timeout_ms),
+        },
+    ));
     let inbound = Arc::new(Mutex::new(InboundProcessor::new(
         sender.uuid().to_string(),
         InboundConfig {
@@ -115,7 +96,6 @@ async fn main() -> Result<()> {
 
 #[derive(Debug, Clone)]
 struct Config {
-    identity_mode: String,
     node_name: String,
     island_id: String,
     node_version: String,
@@ -130,7 +110,6 @@ struct Config {
     sim_sender_id: String,
     sim_conversation_id: String,
     sim_thread_id: Option<String>,
-    sim_src_ilk: Option<String>,
     sim_tenant_hint: Option<String>,
     identity_target: String,
     identity_fallback_target: Option<String>,
@@ -140,7 +119,6 @@ struct Config {
 impl Config {
     fn from_env() -> Result<Self> {
         Ok(Self {
-            identity_mode: env("IDENTITY_MODE").unwrap_or_else(|| "mock".to_string()),
             node_name: env("NODE_NAME").unwrap_or_else(|| "IO.sim.local".to_string()),
             island_id: env("ISLAND_ID").unwrap_or_else(|| "local".to_string()),
             node_version: env("NODE_VERSION").unwrap_or_else(|| "0.1".to_string()),
@@ -169,7 +147,6 @@ impl Config {
             sim_conversation_id: env("SIM_CONVERSATION_ID")
                 .unwrap_or_else(|| "sim-console".to_string()),
             sim_thread_id: env("SIM_THREAD_ID"),
-            sim_src_ilk: env("SIM_SRC_ILK"),
             sim_tenant_hint: env("SIM_TENANT_HINT"),
             identity_target: env("IDENTITY_TARGET").unwrap_or_else(|| "SY.identity".to_string()),
             identity_fallback_target: env("IDENTITY_FALLBACK_TARGET"),
@@ -177,26 +154,6 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
         })
-    }
-}
-
-struct FixedIdentityResolver {
-    src_ilk: String,
-}
-
-impl FixedIdentityResolver {
-    fn new(src_ilk: String) -> Self {
-        Self { src_ilk }
-    }
-}
-
-impl IdentityResolver for FixedIdentityResolver {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn lookup(&self, _channel: &str, _external_id: &str) -> Result<Option<String>, io_common::identity::IdentityError> {
-        Ok(Some(self.src_ilk.clone()))
     }
 }
 
