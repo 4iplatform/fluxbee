@@ -3736,16 +3736,40 @@ async fn resolve_target_with_identity(
     msg: &Message,
 ) -> Result<Option<String>, crate::opa::OpaError> {
     let mut msg_for_opa = msg.clone();
+    let src_ilk = get_src_ilk_from_meta(&msg.meta);
     if let Some(snapshot) = read_identity_snapshot(hive_id) {
         let now_ms = now_epoch_ms();
+        let registration_status = src_ilk.as_deref().and_then(|src_ilk| {
+            let (_, status) = canonicalize_src_ilk_and_status(&snapshot, src_ilk, now_ms);
+            status
+        });
         if let Some(forced_target) = apply_identity_pre_resolve(
             &mut msg_for_opa,
             identity_frontdesk_node_name,
             &snapshot,
             now_ms,
         ) {
+            tracing::info!(
+                src_ilk = ?src_ilk,
+                registration_status = ?registration_status,
+                forced_target = %forced_target,
+                "identity pre-resolve forced frontdesk target"
+            );
             return Ok(Some(forced_target));
         }
+        if src_ilk.is_some() {
+            tracing::info!(
+                src_ilk = ?src_ilk,
+                registration_status = ?registration_status,
+                "identity pre-resolve did not force target"
+            );
+        }
+    } else if src_ilk.is_some() {
+        tracing::warn!(
+            src_ilk = ?src_ilk,
+            shm = %format!("/jsr-identity-{hive_id}"),
+            "identity pre-resolve skipped: identity snapshot unavailable"
+        );
     }
     let mut guard = opa.lock().await;
     guard.resolve_target(&msg_for_opa)

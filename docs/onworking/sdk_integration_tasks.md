@@ -16,6 +16,13 @@ Estado:
   - Riesgo: integradores pueden asumir otro shape del mensaje si leen docs viejas o ejemplos incompletos.
   - Objetivo: definir y documentar un contrato único, y si hace falta aceptar ambos formatos temporalmente.
 
+- [ ] Router: revisar por qué ciertos `src_ilk` temporales no activan el desvío automático a frontdesk aun con `identity_frontdesk` configurado y frontdesk online.
+  - Instrumentación agregada para distinguir:
+    - snapshot de identity no disponible
+    - ILK no encontrado en snapshot
+    - status no temporal
+    - target forzado correctamente
+
 - [ ] Identity SHM: revisar modelo de permisos para lectura por nodos no privilegiados.
   - Hallazgo: el SHM se crea con `0600`.
   - Pregunta abierta: eso es policy deseada o sólo un default demasiado estricto para integraciones SDK?
