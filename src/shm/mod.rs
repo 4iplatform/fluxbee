@@ -1517,28 +1517,40 @@ impl IdentityRegionWriter {
         ilks[used_ilks] = ilk;
         header.ilk_count = header.ilk_count.saturating_add(1);
 
-        for entry in ich_entries {
-            let channel_type = fixed_str(&entry.channel_type);
-            let address = fixed_str(&entry.address);
-            if channel_type.is_empty() || address.is_empty() {
-                continue;
+        let mapping_result = (|| -> Result<(), ShmError> {
+            for entry in ich_entries {
+                let channel_type = fixed_str(&entry.channel_type);
+                let address = fixed_str(&entry.address);
+                if channel_type.is_empty() || address.is_empty() {
+                    continue;
+                }
+                let inserted = upsert_ich_mapping_entry(
+                    mappings,
+                    compute_ich_hash(&channel_type, &address),
+                    &channel_type,
+                    &address,
+                    entry.ich_id,
+                    entry.ilk_id,
+                )?;
+                if inserted {
+                    header.ich_mapping_count = header.ich_mapping_count.saturating_add(1);
+                }
             }
-            let inserted = upsert_ich_mapping_entry(
-                mappings,
-                compute_ich_hash(&channel_type, &address),
-                &channel_type,
-                &address,
-                entry.ich_id,
-                entry.ilk_id,
-            )?;
-            if inserted {
-                header.ich_mapping_count = header.ich_mapping_count.saturating_add(1);
-            }
-        }
+            Ok(())
+        })();
 
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
         seqlock_end_write(&header.seq);
+        if let Err(err) = mapping_result {
+            tracing::warn!(
+                ilk_id = %Uuid::from_bytes(ilk.ilk_id),
+                ich_count = ich_entries.len(),
+                error = %err,
+                "identity shm provision mapping update failed"
+            );
+            return Err(err);
+        }
         Ok(())
     }
 

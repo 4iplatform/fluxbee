@@ -45,6 +45,11 @@ Estado:
   - el router loguea apertura/lectura del snapshot identity y tiempos del `identity-aware resolve`.
   - Objetivo: reconstruir orden exacto entre procesos y distinguir contención real de desincronismo entre actor/respuesta/lectura.
 
+- [x] Identity SHM: corregida salida temprana que dejaba el seqlock abierto en `ILK_PROVISION`.
+  - Hallazgo con logs reales: `odd_seq_spins > 0`, `seq_retry_count = 0` y `last_seq` impar mostraban que el writer entraba en la región crítica y no salía.
+  - Causa: `provision_temporary_ilk(...)` hacía `?` sobre `upsert_ich_mapping_entry(...)` dentro de la sección protegida, y un error dejaba `seq` impar hasta reinicio.
+  - Corrección: cerrar siempre la sección crítica antes de propagar error y dejar `warn` explícito si falla la carga de mappings.
+
 - [x] Identity: eliminar carrera entre `ILK_PROVISION_RESPONSE` y visibilidad del ILK en el SHM consumido por el router.
   - Hallazgo en prueba real: `IO.test` provisionaba un ILK temporal y enviaba el probe inmediatamente, pero el router todavía no lo veía en SHM y caía a OPA.
   - Ajuste aplicado: `sy_identity` ahora sincroniza el SHM antes de responder acciones del sistema que mutan el store.
