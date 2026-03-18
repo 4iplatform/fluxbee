@@ -104,6 +104,11 @@ impl InboundProcessor {
                             src_ilk = %provisioned_ilk,
                             "identity provisioned on miss"
                         );
+                        identity.remember(
+                            &identity_input.channel,
+                            &identity_input.external_id,
+                            &provisioned_ilk,
+                        );
                         src_ilk = Some(provisioned_ilk);
                     }
                     Ok(None) => {
