@@ -1167,7 +1167,6 @@ impl IdentityRegionWriter {
     pub fn try_read_snapshot(&self) -> Result<IdentitySnapshot, ShmError> {
         let header = self.header_ref().ok_or(ShmError::InvalidHeader)?;
         read_identity_snapshot(header, self.mmap.as_ref(), &self.layout)
-            .ok_or(ShmError::SeqLockTimeout)
     }
 
     pub fn update_heartbeat(&mut self) {
@@ -1649,14 +1648,12 @@ impl IdentityRegionReader {
     }
 
     pub fn read_snapshot(&self) -> Option<IdentitySnapshot> {
-        let header = self.header_ref()?;
-        read_identity_snapshot(header, self.mmap.as_ref(), &self.layout)
+        self.try_read_snapshot().ok()
     }
 
     pub fn try_read_snapshot(&self) -> Result<IdentitySnapshot, ShmError> {
         let header = self.header_ref().ok_or(ShmError::InvalidHeader)?;
         read_identity_snapshot(header, self.mmap.as_ref(), &self.layout)
-            .ok_or(ShmError::SeqLockTimeout)
     }
 
     pub fn resolve_ich_mapping(
@@ -2244,11 +2241,11 @@ fn read_identity_snapshot(
     header: &IdentityHeader,
     mmap: &[u8],
     layout: &IdentityRegionLayout,
-) -> Option<IdentitySnapshot> {
+) -> Result<IdentitySnapshot, ShmError> {
     let start = Instant::now();
     loop {
         if start.elapsed() > Duration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
-            return None;
+            return Err(ShmError::SeqLockTimeout);
         }
         let s1 = header.seq.load(Ordering::Acquire);
         if s1 & 1 != 0 {
@@ -2278,18 +2275,24 @@ fn read_identity_snapshot(
             || vocabulary_count > max_vocabulary
             || ilk_alias_count > max_ilk_aliases
         {
-            return None;
+            return Err(ShmError::InvalidHeader);
         }
 
-        let tenants = read_slice::<TenantEntry>(mmap, layout.tenant_offset, max_tenants)?;
-        let ilks = read_slice::<IlkEntry>(mmap, layout.ilk_offset, max_ilks)?;
-        let ichs = read_slice::<IchEntry>(mmap, layout.ich_offset, max_ichs)?;
+        let tenants = read_slice::<TenantEntry>(mmap, layout.tenant_offset, max_tenants)
+            .ok_or(ShmError::InvalidHeader)?;
+        let ilks =
+            read_slice::<IlkEntry>(mmap, layout.ilk_offset, max_ilks).ok_or(ShmError::InvalidHeader)?;
+        let ichs =
+            read_slice::<IchEntry>(mmap, layout.ich_offset, max_ichs).ok_or(ShmError::InvalidHeader)?;
         let ich_mappings =
-            read_slice::<IchMappingEntry>(mmap, layout.ich_mapping_offset, max_ich_mappings)?;
+            read_slice::<IchMappingEntry>(mmap, layout.ich_mapping_offset, max_ich_mappings)
+                .ok_or(ShmError::InvalidHeader)?;
         let ilk_aliases =
-            read_slice::<IlkAliasEntry>(mmap, layout.ilk_alias_offset, max_ilk_aliases)?;
+            read_slice::<IlkAliasEntry>(mmap, layout.ilk_alias_offset, max_ilk_aliases)
+                .ok_or(ShmError::InvalidHeader)?;
         let vocabulary =
-            read_slice::<VocabularyEntry>(mmap, layout.vocabulary_offset, max_vocabulary)?;
+            read_slice::<VocabularyEntry>(mmap, layout.vocabulary_offset, max_vocabulary)
+                .ok_or(ShmError::InvalidHeader)?;
 
         let mut tenant_snapshot = Vec::with_capacity(tenant_count);
         for entry in tenants.iter().take(tenant_count) {
@@ -2319,7 +2322,7 @@ fn read_identity_snapshot(
         atomic::fence(Ordering::Acquire);
         let s2 = header.seq.load(Ordering::Acquire);
         if s1 == s2 {
-            return Some(IdentitySnapshot {
+            return Ok(IdentitySnapshot {
                 header: IdentityHeaderSnapshot {
                     tenant_count: header.tenant_count,
                     ilk_count: header.ilk_count,
