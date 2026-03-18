@@ -22,8 +22,16 @@ pub struct NodeConfig {
     pub name: String,
     pub router_socket: PathBuf,
     pub uuid_persistence_dir: PathBuf,
+    pub uuid_mode: NodeUuidMode,
     pub config_dir: PathBuf,
     pub version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NodeUuidMode {
+    #[default]
+    Persistent,
+    Ephemeral,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -84,7 +92,7 @@ struct ConnectedParts {
 async fn connect_parts(config: &NodeConfig) -> Result<ConnectedParts, NodeError> {
     let hive_id = load_hive_id(&config.config_dir)?;
     let (full_name, base_name) = normalize_name(&config.name, &hive_id);
-    let uuid = load_or_create_uuid(&config.uuid_persistence_dir, &base_name)?;
+    let uuid = resolve_uuid(config.uuid_mode, &config.uuid_persistence_dir, &base_name)?;
 
     let state = Arc::new(ConnectionState::new_connected());
     let (app_tx, internal_rx) = mpsc::channel::<Vec<u8>>(256);
@@ -350,6 +358,13 @@ fn load_or_create_uuid(dir: &Path, base_name: &str) -> Result<Uuid, NodeError> {
     Ok(uuid)
 }
 
+fn resolve_uuid(mode: NodeUuidMode, dir: &Path, base_name: &str) -> Result<Uuid, NodeError> {
+    match mode {
+        NodeUuidMode::Persistent => load_or_create_uuid(dir, base_name),
+        NodeUuidMode::Ephemeral => Ok(Uuid::new_v4()),
+    }
+}
+
 fn router_socket_candidates(path: &Path, node_name: &str) -> Result<Vec<PathBuf>, NodeError> {
     if path.is_dir() {
         let mut sockets: Vec<PathBuf> = fs::read_dir(path)?
@@ -396,4 +411,44 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("{prefix}-{nanos}"));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn resolve_uuid_persistent_reuses_uuid_file() {
+        let dir = test_temp_dir("node-client-persistent");
+        let first = resolve_uuid(NodeUuidMode::Persistent, &dir, "SY.test")
+            .expect("persistent uuid");
+        let second = resolve_uuid(NodeUuidMode::Persistent, &dir, "SY.test")
+            .expect("persistent uuid reload");
+        assert_eq!(first, second);
+        assert!(dir.join("SY.test.uuid").is_file());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_uuid_ephemeral_does_not_persist_uuid_file() {
+        let dir = test_temp_dir("node-client-ephemeral");
+        let first = resolve_uuid(NodeUuidMode::Ephemeral, &dir, "SY.test")
+            .expect("ephemeral uuid");
+        let second = resolve_uuid(NodeUuidMode::Ephemeral, &dir, "SY.test")
+            .expect("ephemeral uuid");
+        assert_ne!(first, second);
+        assert!(!dir.join("SY.test.uuid").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
 }

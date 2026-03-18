@@ -97,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "SY.config.routes".to_string(),
         router_socket: router_socket.clone(),
         uuid_persistence_dir: state_dir.join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
     };

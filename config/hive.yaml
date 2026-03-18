@@ -36,7 +36,7 @@ identity:
 
 # Government/frontdesk wiring.
 government:
-  identity_frontdesk: "AI.frontdesk@motherbee"
+  identity_frontdesk: "AI.frontdesk.gov@motherbee"
 
 # Blob runtime config.
 blob:

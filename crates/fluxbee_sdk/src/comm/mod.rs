@@ -7,5 +7,5 @@ pub use crate::split;
 
 pub use crate::{
     connect, connect_with_client_config, ClientConfig, NodeConfig, NodeError, NodeReceiver,
-    NodeSender,
+    NodeSender, NodeUuidMode,
 };

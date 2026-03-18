@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# PUB-T23 E2E (config_only):
-# 1) publish base full_runtime
-# 2) publish config_only using runtime_base
-# 3) deploy + spawn config_only on target hive
+# PUB-T26 E2E (template layering on config_only):
+# 1) publish base full_runtime fixture
+# 2) publish config_only package with a config template that includes defaults
+#    and a fake _system block
+# 3) deploy + spawn config_only with request config overrides
+# 4) verify template defaults remain, request config wins, and orchestrator
+#    forces the final _system block
 #
 # Usage:
 #   BASE="http://127.0.0.1:8080" \
 #   HIVE_ID="worker-220" \
 #   MOTHER_HIVE_ID="motherbee" \
 #   TENANT_ID="tnt:<uuid>" \
-#   bash scripts/runtime_packaging_pub_t23_e2e.sh
+#   bash scripts/runtime_packaging_pub_t26_e2e.sh
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BASE="${BASE:-http://127.0.0.1:8080}"
@@ -21,18 +24,27 @@ TENANT_ID="${TENANT_ID:-}"
 WAIT_READY_SECS="${WAIT_READY_SECS:-120}"
 WAIT_STATUS_SECS="${WAIT_STATUS_SECS:-90}"
 DEPLOY_STRICT="${DEPLOY_STRICT:-1}"
-TEST_ID="${TEST_ID:-pubt23-$(date +%s)-$RANDOM}"
-BASE_RUNTIME_NAME="${BASE_RUNTIME_NAME:-wf.publish.base.diag.$(date +%s)}"
+TEST_ID="${TEST_ID:-pubt26-$(date +%s)-$RANDOM}"
+BASE_RUNTIME_NAME="${BASE_RUNTIME_NAME:-wf.publish.layer.base.diag.$(date +%s)}"
 BASE_RUNTIME_VERSION="${BASE_RUNTIME_VERSION:-1.0.0-$TEST_ID}"
-CONFIG_RUNTIME_NAME="${CONFIG_RUNTIME_NAME:-wf.publish.config.diag.$(date +%s)}"
+CONFIG_RUNTIME_NAME="${CONFIG_RUNTIME_NAME:-wf.publish.layer.config.diag.$(date +%s)}"
 CONFIG_RUNTIME_VERSION="${CONFIG_RUNTIME_VERSION:-2.0.0-$TEST_ID}"
-NODE_NAME="${NODE_NAME:-WF.publish.config.$TEST_ID}"
+NODE_NAME="${NODE_NAME:-WF.publish.layering.$TEST_ID}"
 
 MANIFEST_PATH="/var/lib/fluxbee/dist/runtimes/manifest.json"
 DIST_BASE_RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/$BASE_RUNTIME_NAME"
 DIST_CONFIG_RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/$CONFIG_RUNTIME_NAME"
 PUBLISH_BIN="$ROOT_DIR/target/release/fluxbee-publish"
 DIAG_BIN="$ROOT_DIR/target/release/inventory_hold_diag"
+
+TEMPLATE_MODEL="template-model-v1"
+REQUEST_MODEL="request-model-v2"
+TEMPLATE_TEMPERATURE="0.2"
+REQUEST_TEMPERATURE="0.9"
+TEMPLATE_PROMPT_ASSET="assets/prompts/system.txt"
+TEMPLATE_ONLY_MARKER="from-template"
+REQUEST_ONLY_MARKER="from-request"
+FAKE_TEMPLATE_SYSTEM_PACKAGE_PATH="/tmp/template-package"
 
 tmpdir="$(mktemp -d)"
 base_pkg_dir="$tmpdir/base_pkg"
@@ -214,7 +226,6 @@ wait_runtime_readiness_config() {
       "$versions_body")"
     if [[ "$has_base_ready" != "true" ]]; then
       echo "FAIL: target hive '$HIVE_ID' runtime '$runtime_name' readiness for version '$runtime_version' is present but missing base_runtime_ready." >&2
-      echo "HINT: verify worker sy-orchestrator build has package-aware readiness (PUB-T10+)." >&2
       cat "$versions_body" >&2 || true
       return 1
     fi
@@ -226,19 +237,17 @@ wait_runtime_readiness_config() {
     fi
     sleep 2
   done
-  if [[ "$expected_manifest_version" =~ ^[0-9]+$ && "$expected_manifest_version" -gt 0 ]]; then
-    echo "FAIL: config_only readiness timeout runtime='$runtime_name' version='$runtime_version' expected_manifest_version>=$expected_manifest_version" >&2
-  else
-    echo "FAIL: config_only readiness timeout runtime='$runtime_name' version='$runtime_version'" >&2
-  fi
+  echo "FAIL: config_only readiness timeout runtime='$runtime_name' version='$runtime_version'" >&2
   cat "$versions_body" >&2 || true
   return 1
 }
 
 spawn_node() {
   local payload
-  payload="$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"current","tenant_id":"%s"}' \
-    "$NODE_NAME" "$CONFIG_RUNTIME_NAME" "$TENANT_ID")"
+  payload="$(cat <<EOF
+{"node_name":"$NODE_NAME","runtime":"$CONFIG_RUNTIME_NAME","runtime_version":"current","tenant_id":"$TENANT_ID","config":{"tenant_id":"$TENANT_ID","model":"$REQUEST_MODEL","temperature":$REQUEST_TEMPERATURE,"request_only":"$REQUEST_ONLY_MARKER"}}
+EOF
+)"
   http_call "POST" "$BASE/hives/$HIVE_ID/nodes" "$spawn_body" "$payload"
 }
 
@@ -282,8 +291,8 @@ wait_node_active_with_runtime() {
   return 1
 }
 
-assert_node_system_runtime_base() {
-  local http api_status payload_status cfg_runtime_base cfg_package_path expected_package_path
+assert_layered_config() {
+  local http api_status payload_status expected_package_path observed_model observed_temp observed_prompt observed_template_only observed_request_only observed_tenant observed_system_managed_by observed_runtime_base observed_package_path observed_system_runtime observed_system_version observed_system_tenant
   http="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" "$config_body")"
   api_status="$(json_get_file "status" "$config_body")"
   payload_status="$(json_get_file "payload.status" "$config_body")"
@@ -292,20 +301,88 @@ assert_node_system_runtime_base() {
     cat "$config_body" >&2 || true
     return 1
   fi
-  cfg_runtime_base="$(json_get_file "payload.config._system.runtime_base" "$config_body")"
-  cfg_package_path="$(json_get_file "payload.config._system.package_path" "$config_body")"
+
+  observed_model="$(json_get_file "payload.config.model" "$config_body")"
+  observed_temp="$(json_get_file "payload.config.temperature" "$config_body")"
+  observed_prompt="$(json_get_file "payload.config.prompt_asset" "$config_body")"
+  observed_template_only="$(json_get_file "payload.config.template_only" "$config_body")"
+  observed_request_only="$(json_get_file "payload.config.request_only" "$config_body")"
+  observed_tenant="$(json_get_file "payload.config.tenant_id" "$config_body")"
+  observed_system_managed_by="$(json_get_file "payload.config._system.managed_by" "$config_body")"
+  observed_runtime_base="$(json_get_file "payload.config._system.runtime_base" "$config_body")"
+  observed_package_path="$(json_get_file "payload.config._system.package_path" "$config_body")"
+  observed_system_runtime="$(json_get_file "payload.config._system.runtime" "$config_body")"
+  observed_system_version="$(json_get_file "payload.config._system.runtime_version" "$config_body")"
+  observed_system_tenant="$(json_get_file "payload.config._system.tenant_id" "$config_body")"
   expected_package_path="/var/lib/fluxbee/dist/runtimes/$CONFIG_RUNTIME_NAME/$CONFIG_RUNTIME_VERSION"
-  if [[ "$cfg_runtime_base" != "$BASE_RUNTIME_NAME" ]]; then
-    echo "FAIL: unexpected payload.config._system.runtime_base expected='$BASE_RUNTIME_NAME' got='$cfg_runtime_base'" >&2
+
+  [[ "$observed_model" == "$REQUEST_MODEL" ]] || {
+    echo "FAIL: request override for model not applied expected='$REQUEST_MODEL' got='$observed_model'" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  }
+  [[ "$observed_temp" == "$REQUEST_TEMPERATURE" ]] || {
+    echo "FAIL: request override for temperature not applied expected='$REQUEST_TEMPERATURE' got='$observed_temp'" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  }
+  [[ "$observed_prompt" == "$TEMPLATE_PROMPT_ASSET" ]] || {
+    echo "FAIL: template default prompt_asset missing expected='$TEMPLATE_PROMPT_ASSET' got='$observed_prompt'" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  }
+  [[ "$observed_template_only" == "$TEMPLATE_ONLY_MARKER" ]] || {
+    echo "FAIL: template default field missing expected='$TEMPLATE_ONLY_MARKER' got='$observed_template_only'" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  }
+  [[ "$observed_request_only" == "$REQUEST_ONLY_MARKER" ]] || {
+    echo "FAIL: request-only field missing expected='$REQUEST_ONLY_MARKER' got='$observed_request_only'" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  }
+  [[ "$observed_tenant" == "$TENANT_ID" ]] || {
+    echo "FAIL: final tenant_id mismatch expected='$TENANT_ID' got='$observed_tenant'" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  }
+  [[ "$observed_system_managed_by" == "SY.orchestrator" ]] || {
+    echo "FAIL: _system.managed_by was not forced by orchestrator got='$observed_system_managed_by'" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  }
+  [[ "$observed_runtime_base" == "$BASE_RUNTIME_NAME" ]] || {
+    echo "FAIL: _system.runtime_base mismatch expected='$BASE_RUNTIME_NAME' got='$observed_runtime_base'" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  }
+  [[ "$observed_package_path" == "$expected_package_path" ]] || {
+    echo "FAIL: _system.package_path mismatch expected='$expected_package_path' got='$observed_package_path'" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  }
+  [[ "$observed_system_runtime" == "$CONFIG_RUNTIME_NAME" ]] || {
+    echo "FAIL: _system.runtime mismatch expected='$CONFIG_RUNTIME_NAME' got='$observed_system_runtime'" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  }
+  [[ "$observed_system_version" == "$CONFIG_RUNTIME_VERSION" ]] || {
+    echo "FAIL: _system.runtime_version mismatch expected='$CONFIG_RUNTIME_VERSION' got='$observed_system_version'" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  }
+  [[ "$observed_system_tenant" == "$TENANT_ID" ]] || {
+    echo "FAIL: _system.tenant_id mismatch expected='$TENANT_ID' got='$observed_system_tenant'" >&2
+    cat "$config_body" >&2 || true
+    return 1
+  }
+  if grep -q "$FAKE_TEMPLATE_SYSTEM_PACKAGE_PATH" "$config_body"; then
+    echo "FAIL: template _system leaked into final config" >&2
     cat "$config_body" >&2 || true
     return 1
   fi
-  if [[ "$cfg_package_path" != "$expected_package_path" ]]; then
-    echo "FAIL: unexpected payload.config._system.package_path expected='$expected_package_path' got='$cfg_package_path'" >&2
-    cat "$config_body" >&2 || true
-    return 1
-  fi
-  echo "$cfg_package_path"
+
+  echo "$observed_package_path"
 }
 
 create_base_package_fixture() {
@@ -315,7 +392,7 @@ create_base_package_fixture() {
   "name": "$BASE_RUNTIME_NAME",
   "version": "0.0.1",
   "type": "full_runtime",
-  "description": "PUB-T23 base runtime fixture",
+  "description": "PUB-T26 base runtime fixture",
   "config_template": "config/default-config.json",
   "entry_point": "bin/start.sh"
 }
@@ -323,7 +400,7 @@ EOF
   cat >"$base_pkg_dir/bin/start.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-export INVENTORY_HOLD_NODE_NAME="${INVENTORY_HOLD_NODE_NAME:-${NODE_NAME:-WF.publish.config}}"
+export INVENTORY_HOLD_NODE_NAME="${INVENTORY_HOLD_NODE_NAME:-${NODE_NAME:-WF.publish.layering}}"
 export INVENTORY_HOLD_NODE_VERSION="${INVENTORY_HOLD_NODE_VERSION:-0.0.1}"
 export INVENTORY_HOLD_SECS="${INVENTORY_HOLD_SECS:-0}"
 export NODE_STATUS_DEFAULT_HANDLER_ENABLED="1"
@@ -342,26 +419,33 @@ EOF
 }
 
 create_config_package_fixture() {
-  mkdir -p "$cfg_pkg_dir/config" "$cfg_pkg_dir/assets"
+  mkdir -p "$cfg_pkg_dir/config" "$cfg_pkg_dir/assets/prompts"
   cat >"$cfg_pkg_dir/package.json" <<EOF
 {
   "name": "$CONFIG_RUNTIME_NAME",
   "version": "0.0.1",
   "type": "config_only",
-  "description": "PUB-T23 config-only fixture",
+  "description": "PUB-T26 layering fixture",
   "runtime_base": "$BASE_RUNTIME_NAME",
   "config_template": "config/default-config.json"
 }
 EOF
-  cat >"$cfg_pkg_dir/config/default-config.json" <<'EOF'
+  cat >"$cfg_pkg_dir/config/default-config.json" <<EOF
 {
-  "diag": {
-    "kind": "config_only"
+  "tenant_id": "tnt:template-default",
+  "model": "$TEMPLATE_MODEL",
+  "temperature": $TEMPLATE_TEMPERATURE,
+  "prompt_asset": "$TEMPLATE_PROMPT_ASSET",
+  "template_only": "$TEMPLATE_ONLY_MARKER",
+  "_system": {
+    "managed_by": "template",
+    "runtime_base": "template.runtime.base",
+    "package_path": "$FAKE_TEMPLATE_SYSTEM_PACKAGE_PATH"
   }
 }
 EOF
-  cat >"$cfg_pkg_dir/assets/prompts.txt" <<'EOF'
-hello from config-only fixture
+  cat >"$cfg_pkg_dir/assets/prompts/system.txt" <<'EOF'
+template prompt asset
 EOF
 }
 
@@ -422,7 +506,7 @@ if [[ ! -f "$MANIFEST_PATH" ]]; then
   exit 1
 fi
 
-echo "PUB-T23 config_only E2E: BASE=$BASE HIVE_ID=$HIVE_ID MOTHER_HIVE_ID=$MOTHER_HIVE_ID BASE_RUNTIME=$BASE_RUNTIME_NAME@$BASE_RUNTIME_VERSION CONFIG_RUNTIME=$CONFIG_RUNTIME_NAME@$CONFIG_RUNTIME_VERSION NODE=$NODE_NAME"
+echo "PUB-T26 template layering E2E: BASE=$BASE HIVE_ID=$HIVE_ID MOTHER_HIVE_ID=$MOTHER_HIVE_ID BASE_RUNTIME=$BASE_RUNTIME_NAME@$BASE_RUNTIME_VERSION CONFIG_RUNTIME=$CONFIG_RUNTIME_NAME@$CONFIG_RUNTIME_VERSION NODE=$NODE_NAME"
 
 echo "Step 1/13: build binaries (fluxbee-publish + inventory_hold_diag)"
 (cd "$ROOT_DIR" && cargo build --release --bin fluxbee-publish --bin inventory_hold_diag >/dev/null)
@@ -435,7 +519,7 @@ if [[ ! -x "$DIAG_BIN" ]]; then
   exit 1
 fi
 
-echo "Step 2/13: backup manifest + create package fixtures (base + config_only)"
+echo "Step 2/13: backup manifest + create package fixtures (base + layering config_only)"
 as_root_local install -m 0644 "$MANIFEST_PATH" "$manifest_backup"
 create_base_package_fixture
 create_config_package_fixture
@@ -455,10 +539,10 @@ base_manifest_version="${base_rest#*|}"
 echo "Step 5/13: wait base runtime readiness on target"
 wait_runtime_readiness_full "$BASE_RUNTIME_NAME" "$BASE_RUNTIME_VERSION"
 
-echo "Step 6/13: publish config_only runtime with deploy"
+echo "Step 6/13: publish layering config_only runtime with deploy"
 run_publish "$cfg_pkg_dir" "$CONFIG_RUNTIME_VERSION" "$publish_cfg_log"
 
-echo "Step 7/13: validate config_only deploy summary"
+echo "Step 7/13: validate layering config_only deploy summary"
 cfg_deploy="$(extract_and_validate_deploy_summary "$publish_cfg_log" "config")"
 cfg_sync_hint_status="${cfg_deploy%%|*}"
 cfg_rest="${cfg_deploy#*|}"
@@ -467,10 +551,10 @@ cfg_rest="${cfg_rest#*|}"
 cfg_update_error_code="${cfg_rest%%|*}"
 cfg_manifest_version="${cfg_rest#*|}"
 
-echo "Step 8/13: wait config_only readiness (including base_runtime_ready)"
+echo "Step 8/13: wait layering config_only readiness (including base_runtime_ready)"
 wait_runtime_readiness_config "$CONFIG_RUNTIME_NAME" "$CONFIG_RUNTIME_VERSION" "$cfg_manifest_version"
 
-echo "Step 9/13: spawn node with config_only runtime"
+echo "Step 9/13: spawn node with template defaults + request overrides"
 spawn_http="$(spawn_node)"
 spawn_status="$(json_get_file "status" "$spawn_body")"
 if [[ "$spawn_http" != "200" || "$spawn_status" != "ok" ]]; then
@@ -482,8 +566,8 @@ fi
 echo "Step 10/13: wait node lifecycle RUNNING (or STARTING active) and runtime resolution"
 lifecycle_observed="$(wait_node_active_with_runtime "$CONFIG_RUNTIME_NAME" "$CONFIG_RUNTIME_VERSION")"
 
-echo "Step 11/13: verify _system.runtime_base and _system.package_path"
-package_path_observed="$(assert_node_system_runtime_base)"
+echo "Step 11/13: verify template defaults, request overrides, and forced _system"
+package_path_observed="$(assert_layered_config)"
 
 echo "Step 12/13: cleanup node"
 http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" "$kill_body" '{"force":true}' >/dev/null || true
@@ -504,4 +588,4 @@ echo "config_update_error_code=$cfg_update_error_code"
 echo "config_manifest_version=$cfg_manifest_version"
 echo "lifecycle_observed=$lifecycle_observed"
 echo "package_path_observed=$package_path_observed"
-echo "runtime packaging PUB-T23 config_only E2E passed."
+echo "runtime packaging PUB-T26 template layering E2E passed."
