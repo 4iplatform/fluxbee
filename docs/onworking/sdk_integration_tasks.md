@@ -32,6 +32,7 @@ Estado:
   - Cambio aplicado:
     - `IdentityRegionWriter` ahora soporta upserts/remociones incrementales para tenants, ILKs, ICH entries, mappings y aliases.
     - `sy_identity` aplica `IdentityDelta` directamente al SHM en vez de ejecutar `sync_identity_shm_mappings(...)` por cada acción.
+    - `ILK_PROVISION` quedó con fast path atómico de una sola ventana de seqlock para escribir ILK temporal + ICH + mappings, evitando varias escrituras encadenadas sobre el mismo snapshot.
     - el rebuild completo queda como fallback de reparación si la aplicación incremental falla.
   - Resultado esperado: `ILK_PROVISION` y otras acciones puntuales dejan de reescribir regiones completas del SHM.
 
@@ -84,6 +85,7 @@ Estado:
 - Para identity SHM:
   - `full snapshot sync` queda reservado para bootstrap, rebuild y fallback.
   - el hot path de acciones del sistema debe operar con deltas incrementales.
+  - `ILK_PROVISION` no debe abrir varias ventanas de seqlock seguidas; si vuelve a aparecer contención, revisar primero que siga entrando al fast path atómico antes de mirar OPA o routing.
   - si vuelve a aparecer contención de lectura, revisar primero:
     - duración de ventana de seqlock
     - costo de reindex de ICH

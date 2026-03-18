@@ -1483,6 +1483,65 @@ impl IdentityRegionWriter {
         Ok(used as u32)
     }
 
+    pub fn provision_temporary_ilk(
+        &mut self,
+        mut ilk: IlkEntry,
+        ich_entries: &[IchEntry],
+    ) -> Result<(), ShmError> {
+        let (header, _tenants, ilks, ichs, mappings, _aliases, _vocabulary) =
+            identity_header_and_entries_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
+        let used_ilks = header.ilk_count as usize;
+        let used_ichs = header.ich_count as usize;
+        let max_ilks = self.layout.limits.max_ilks as usize;
+        let max_ichs = self.layout.limits.max_ichs() as usize;
+        if used_ilks > max_ilks || used_ichs > max_ichs {
+            return Err(ShmError::InvalidHeader);
+        }
+        if used_ilks >= max_ilks || used_ichs + ich_entries.len() > max_ichs {
+            return Err(ShmError::SlotFull);
+        }
+        if find_ilk_entry_index(&ilks[..used_ilks], ilk.ilk_id).is_some() {
+            return Err(ShmError::InvalidHeader);
+        }
+
+        seqlock_begin_write(&header.seq);
+        let ich_offset = used_ichs as u32;
+        for (offset, entry) in ich_entries.iter().enumerate() {
+            ichs[used_ichs + offset] = *entry;
+        }
+        header.ich_count = header.ich_count.saturating_add(ich_entries.len() as u32);
+
+        ilk.ich_offset = ich_offset;
+        ilk.ich_count = ich_entries.len().min(u16::MAX as usize) as u16;
+        ilks[used_ilks] = ilk;
+        header.ilk_count = header.ilk_count.saturating_add(1);
+
+        for entry in ich_entries {
+            let channel_type = fixed_str(&entry.channel_type);
+            let address = fixed_str(&entry.address);
+            if channel_type.is_empty() || address.is_empty() {
+                continue;
+            }
+            let inserted = upsert_ich_mapping_entry(
+                mappings,
+                compute_ich_hash(&channel_type, &address),
+                &channel_type,
+                &address,
+                entry.ich_id,
+                entry.ilk_id,
+            )?;
+            if inserted {
+                header.ich_mapping_count = header.ich_mapping_count.saturating_add(1);
+            }
+        }
+
+        header.updated_at = now_epoch_ms();
+        header.heartbeat = header.updated_at;
+        seqlock_end_write(&header.seq);
+        Ok(())
+    }
+
     pub fn clear_ich_mappings_for_ilk(&mut self, ilk_id: [u8; 16]) -> Result<u32, ShmError> {
         let (header, _tenants, _ilks, _ichs, mappings, _aliases, _vocabulary) =
             identity_header_and_entries_mut(&mut self.mmap, &self.layout)
@@ -2907,6 +2966,11 @@ fn write_ich_mapping_entry(
 fn fixed_str_matches(buf: &[u8], value: &str) -> bool {
     let used = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
     &buf[..used] == value.as_bytes()
+}
+
+fn fixed_str(buf: &[u8]) -> String {
+    let used = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..used]).trim().to_string()
 }
 
 fn empty_node_entry() -> NodeEntry {

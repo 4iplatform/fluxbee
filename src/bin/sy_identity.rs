@@ -2147,17 +2147,8 @@ fn apply_identity_shm_provision_fast(
     }
 
     let entries_only: Vec<IchEntry> = ich_entries.iter().map(|(entry, _, _)| *entry).collect();
-    let ich_offset = writer.append_ich_entries(&entries_only)?;
-
-    let mut ilk_entry = ilk_entry_from_record(ilk)?;
-    ilk_entry.ich_offset = ich_offset;
-    ilk_entry.ich_count = entries_only.len().min(u16::MAX as usize) as u16;
-    writer.upsert_ilk_entry(ilk_entry)?;
-
-    let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
-    for (entry, channel_type, address) in ich_entries {
-        writer.upsert_ich_mapping(&channel_type, &address, entry.ich_id, *ilk_uuid.as_bytes())?;
-    }
+    let ilk_entry = ilk_entry_from_record(ilk)?;
+    writer.provision_temporary_ilk(ilk_entry, &entries_only)?;
     Ok(true)
 }
 
@@ -2180,7 +2171,11 @@ fn apply_identity_shm_deltas(
 
     for delta in deltas {
         if let Err(err) = apply_identity_shm_delta(writer, &delta.delta) {
-            tracing::warn!(error = %err, "identity shm incremental apply failed; rebuilding full snapshot");
+            tracing::warn!(
+                action,
+                error = %err,
+                "identity shm incremental apply failed; rebuilding full snapshot"
+            );
             sync_identity_shm_mappings(writer, store)?;
             return Ok(());
         }
