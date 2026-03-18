@@ -117,7 +117,7 @@ if [[ "$SKIP_BUILD" != "1" ]]; then
   (cd "$ROOT_DIR" && cargo build --release --manifest-path io/Cargo.toml -p "$build_pkg")
 fi
 
-cmd=("$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --binary "$BINARY")
+cmd=(bash "$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --binary "$BINARY")
 if [[ -n "$DIST_ROOT" ]]; then
   cmd+=(--dist-root "$DIST_ROOT")
 fi
