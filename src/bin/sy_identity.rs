@@ -1278,7 +1278,7 @@ impl IdentityRuntime {
 
         if !deltas.is_empty() {
             if let Some(writer) = identity_shm {
-                apply_identity_shm_deltas(writer, &self.store, &deltas)?;
+                apply_identity_shm_deltas(writer, &self.store, action, &deltas)?;
             }
         }
 
@@ -2133,11 +2133,51 @@ fn apply_identity_shm_delta(
     Ok(())
 }
 
+fn apply_identity_shm_provision_fast(
+    writer: &mut IdentityRegionWriter,
+    ilk: &IlkRecord,
+) -> Result<bool, IdentityError> {
+    if ilk.registration_status != "temporary" || ilk.channels.is_empty() {
+        return Ok(false);
+    }
+
+    let ich_entries = ich_entries_from_ilk_record(ilk)?;
+    if ich_entries.is_empty() {
+        return Ok(false);
+    }
+
+    let entries_only: Vec<IchEntry> = ich_entries.iter().map(|(entry, _, _)| *entry).collect();
+    let ich_offset = writer.append_ich_entries(&entries_only)?;
+
+    let mut ilk_entry = ilk_entry_from_record(ilk)?;
+    ilk_entry.ich_offset = ich_offset;
+    ilk_entry.ich_count = entries_only.len().min(u16::MAX as usize) as u16;
+    writer.upsert_ilk_entry(ilk_entry)?;
+
+    let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
+    for (entry, channel_type, address) in ich_entries {
+        writer.upsert_ich_mapping(&channel_type, &address, entry.ich_id, *ilk_uuid.as_bytes())?;
+    }
+    Ok(true)
+}
+
 fn apply_identity_shm_deltas(
     writer: &mut IdentityRegionWriter,
     store: &IdentityStore,
+    action: &str,
     deltas: &[IdentityDeltaEnvelope],
 ) -> Result<(), IdentityError> {
+    if action == MSG_ILK_PROVISION
+        && deltas.len() == 1
+        && matches!(&deltas[0].delta, IdentityDelta::IlkUpsert { .. })
+    {
+        if let IdentityDelta::IlkUpsert { ilk } = &deltas[0].delta {
+            if apply_identity_shm_provision_fast(writer, ilk)? {
+                return Ok(());
+            }
+        }
+    }
+
     for delta in deltas {
         if let Err(err) = apply_identity_shm_delta(writer, &delta.delta) {
             tracing::warn!(error = %err, "identity shm incremental apply failed; rebuilding full snapshot");

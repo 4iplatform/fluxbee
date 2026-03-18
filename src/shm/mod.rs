@@ -1461,6 +1461,29 @@ impl IdentityRegionWriter {
         Ok(())
     }
 
+    pub fn append_ich_entries(&mut self, entries: &[IchEntry]) -> Result<u32, ShmError> {
+        let (header, _tenants, _ilks, ichs, _mappings, _aliases, _vocabulary) =
+            identity_header_and_entries_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
+        let used = header.ich_count as usize;
+        let max_ichs = self.layout.limits.max_ichs() as usize;
+        if used > max_ichs {
+            return Err(ShmError::InvalidHeader);
+        }
+        if used + entries.len() > max_ichs {
+            return Err(ShmError::SlotFull);
+        }
+        seqlock_begin_write(&header.seq);
+        for (offset, entry) in entries.iter().enumerate() {
+            ichs[used + offset] = *entry;
+        }
+        header.ich_count = header.ich_count.saturating_add(entries.len() as u32);
+        header.updated_at = now_epoch_ms();
+        header.heartbeat = header.updated_at;
+        seqlock_end_write(&header.seq);
+        Ok(used as u32)
+    }
+
     pub fn clear_ich_mappings_for_ilk(&mut self, ilk_id: [u8; 16]) -> Result<u32, ShmError> {
         let (header, _tenants, _ilks, _ichs, mappings, _aliases, _vocabulary) =
             identity_header_and_entries_mut(&mut self.mmap, &self.layout)
