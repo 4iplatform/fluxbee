@@ -865,6 +865,7 @@ impl IdentityRuntime {
         &mut self,
         sender: &NodeSender,
         msg: &Message,
+        identity_shm: Option<&mut IdentityRegionWriter>,
     ) -> Result<Vec<IdentityDeltaEnvelope>, IdentityError> {
         let Some(action) = msg.meta.msg.as_deref() else {
             return Ok(Vec::new());
@@ -1275,6 +1276,12 @@ impl IdentityRuntime {
             ),
         };
 
+        if !deltas.is_empty() {
+            if let Some(writer) = identity_shm {
+                sync_identity_shm_mappings(writer, &self.store)?;
+            }
+        }
+
         send_system_response(sender, msg, response_name(action), payload).await?;
         Ok(deltas)
     }
@@ -1640,15 +1647,11 @@ async fn main() -> Result<(), IdentityError> {
                     continue;
                 }
 
-                match runtime.process_system_message(&sender, &msg).await {
+                match runtime
+                    .process_system_message(&sender, &msg, identity_shm.as_mut())
+                    .await
+                {
                     Ok(mut deltas) => {
-                        if !deltas.is_empty() {
-                            if let Some(writer) = identity_shm.as_mut() {
-                                if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
-                                    tracing::warn!(error = %err, "identity shm sync failed after system action");
-                                }
-                            }
-                        }
                         if is_primary && !deltas.is_empty() {
                             assign_delta_seqs(&mut deltas, &mut next_delta_seq);
                             broadcast_deltas(&mut delta_subscribers, &deltas);
