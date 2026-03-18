@@ -60,6 +60,7 @@ pub async fn try_handle_default_node_status(
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(MSG_NODE_STATUS_GET_RESPONSE.to_string()),
+            src_ilk: None,
             scope: None,
             target: None,
             action: None,

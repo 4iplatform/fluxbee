@@ -2633,6 +2633,7 @@ async fn send_system_response(
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(msg_name.to_string()),
+            src_ilk: None,
             scope: None,
             target: None,
             action: None,

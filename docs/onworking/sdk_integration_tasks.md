@@ -6,11 +6,6 @@ Estado:
 
 ## Abiertos
 
-- [ ] Router/SDK: alinear contrato de `src_ilk`.
-  - Hallazgo: el router hoy hace pre-resolve leyendo `meta.context.src_ilk`.
-  - Riesgo: integradores pueden asumir otro shape del mensaje si leen docs viejas o ejemplos incompletos.
-  - Objetivo: definir y documentar un contrato único, y si hace falta aceptar ambos formatos temporalmente.
-
 - [ ] Identity SHM: revisar modelo de permisos para lectura por nodos no privilegiados.
   - Hallazgo: el SHM se crea con `0600`.
   - Pregunta abierta: eso es policy deseada o sólo un default demasiado estricto para integraciones SDK?
@@ -109,6 +104,12 @@ Estado:
 - [x] SDK: degradar `IdentityShmError::Nix(EACCES|EPERM)` a "lookup unavailable" en helpers de alto nivel.
   - `resolve_ilk_from_shm_name`, `resolve_ilk_from_hive_id` y `resolve_ilk_from_hive_config` ahora devuelven `Ok(None)` cuando el lookup falla por permiso denegado.
   - Resultado: el fallback a `ILK_PROVISION` ya no depende de workarounds específicos en cada integrador.
+
+- [x] Router/SDK: contrato de `src_ilk` alineado.
+  - El contrato canónico queda en `meta.src_ilk` y el `Meta` tipado del SDK ya lo expone.
+  - El router ahora lee `meta.src_ilk` como fuente principal y mantiene compatibilidad temporal con `meta.context.src_ilk`.
+  - Al canonicalizar, el router escribe ambos para no romper nodos legacy durante la transición.
+  - Los ejemplos `IO.test` y `AI.test.gov` ya usan `meta.src_ilk` como forma principal.
 
 ## Notas de arquitectura
 

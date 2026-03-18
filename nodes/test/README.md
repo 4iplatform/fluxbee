@@ -17,7 +17,7 @@ Mostrar, con nodos reales y legibles:
 
 - cómo construir `NodeConfig` y conectar con `fluxbee_sdk::connect`
 - cómo emitir un mensaje `Resolve`
-- cómo adjuntar `src_ilk` en `meta.context.src_ilk`
+- cómo adjuntar `src_ilk` en `meta.src_ilk`
 - cómo responder `NODE_STATUS_GET` con el handler default del SDK
 - cómo observar el auto-routing hacia el frontdesk configurado en `hive.yaml`
 
@@ -66,7 +66,7 @@ cargo run -p io-test
 Comportamiento esperado:
 
 1. `IO.test` provisiona un ILK temporal si no recibe uno por env.
-2. `IO.test` envía un mensaje `Resolve` con `meta.context.src_ilk`.
+2. `IO.test` envía un mensaje `Resolve` con `meta.src_ilk`.
 3. El router detecta `registration_status=temporary` y fuerza destino a
    `AI.test.gov@motherbee` sin entrar a OPA.
 4. `AI.test.gov` registra el mensaje recibido y devuelve un reply simple a
@@ -74,5 +74,8 @@ Comportamiento esperado:
 
 ## Nota importante sobre `src_ilk`
 
-Estos ejemplos escriben `src_ilk` en `meta.context.src_ilk`, porque el router
-actual usa ese campo para el pre-resolve de identity-temporary.
+El contrato canónico ahora es `meta.src_ilk`.
+
+El router mantiene compatibilidad de lectura con el formato legacy
+`meta.context.src_ilk`, pero los ejemplos y el SDK deben usar `meta.src_ilk`
+como forma principal.

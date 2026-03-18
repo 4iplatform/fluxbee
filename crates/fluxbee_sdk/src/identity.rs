@@ -523,6 +523,7 @@ async fn send_action_once(
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(action.to_string()),
+            src_ilk: None,
             scope: None,
             target: None,
             action: None,

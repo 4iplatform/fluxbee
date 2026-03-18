@@ -125,13 +125,12 @@ async fn send_probe(
         meta: Meta {
             msg_type: "user".to_string(),
             msg: None,
+            src_ilk: Some(src_ilk.to_string()),
             scope: None,
             target: Some("io.test.route.probe".to_string()),
             action: None,
             priority: None,
-            // Current router pre-resolve reads src_ilk from meta.context.
             context: Some(json!({
-                "src_ilk": src_ilk,
                 "probe_id": probe_id,
             })),
         },

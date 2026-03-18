@@ -33,7 +33,7 @@ async fn run_loop(sender: &NodeSender, receiver: &mut NodeReceiver) -> Result<()
             continue;
         }
 
-        let src_ilk = src_ilk_from_context(msg.meta.context.as_ref()).unwrap_or_default();
+        let src_ilk = src_ilk_from_meta(&msg.meta).unwrap_or_default();
         let text = msg
             .payload
             .get("text")
@@ -65,12 +65,16 @@ async fn run_loop(sender: &NodeSender, receiver: &mut NodeReceiver) -> Result<()
                 meta: Meta {
                     msg_type: "user".to_string(),
                     msg: None,
+                    src_ilk: if src_ilk.is_empty() {
+                        None
+                    } else {
+                        Some(src_ilk.clone())
+                    },
                     scope: None,
                     target: Some("ai.test.gov.reply".to_string()),
                     action: None,
                     priority: None,
                     context: Some(json!({
-                        "src_ilk": src_ilk,
                         "handled_by": sender.full_name(),
                     })),
                 },
@@ -86,14 +90,17 @@ async fn run_loop(sender: &NodeSender, receiver: &mut NodeReceiver) -> Result<()
     }
 }
 
-fn src_ilk_from_context(context: Option<&Value>) -> Option<String> {
-    context
-        .and_then(Value::as_object)
-        .and_then(|ctx| ctx.get("src_ilk"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_string())
+fn src_ilk_from_meta(meta: &Meta) -> Option<String> {
+    meta.src_ilk.clone().or_else(|| {
+        meta.context
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|ctx| ctx.get("src_ilk"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+    })
 }
 
 fn build_node_config(default_name: &str, default_version: &str, prefix: &str) -> NodeConfig {
