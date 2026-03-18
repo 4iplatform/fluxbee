@@ -75,3 +75,33 @@ Comportamiento esperado:
 ## Nota importante sobre `src_ilk`
 
 El contrato canónico ahora es `meta.src_ilk`.
+
+## Probar publish/install completo con CLI
+
+También hay un E2E operator-style que usa `fluxbee-publish` de punta a punta
+con estos dos nodos:
+
+```bash
+BASE="http://127.0.0.1:8080" \
+HIVE_ID="motherbee" \
+MOTHER_HIVE_ID="motherbee" \
+bash scripts/identity_test_nodes_publish_e2e.sh
+```
+
+Ese script:
+
+1. compila `fluxbee-publish`, `ai-test-gov` e `io-test`
+2. arma packages `full_runtime` temporales
+3. publica ambos con `--deploy`
+4. espera readiness en `/versions`
+5. spawnea `AI.test.gov` como frontdesk gestionado
+6. spawnea `IO.test` como probe one-shot
+7. valida que el reply vuelva con `HANDLED_BY=AI.test.gov@<hive>`
+
+Sirve para verificar el ciclo completo de software:
+
+- package layout
+- install en `dist`
+- update/sync
+- spawn administrado
+- ejecución real del binario publicado

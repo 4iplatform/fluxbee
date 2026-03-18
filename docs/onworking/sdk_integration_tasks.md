@@ -110,6 +110,11 @@ Estado:
   - El router ahora consume `meta.src_ilk` como única fuente para el pre-resolve/canonicalización.
   - Los ejemplos `IO.test` y `AI.test.gov` ya usan `meta.src_ilk` como forma principal.
 
+- [x] Nodos de referencia de identity con ciclo completo de software por CLI.
+  - Script: `scripts/identity_test_nodes_publish_e2e.sh`.
+  - Valida build -> package -> `fluxbee-publish` -> `--deploy` -> readiness -> spawn -> reply real entre `IO.test` y `AI.test.gov`.
+  - Objetivo: reproducir problemas de install/rollout en entorno de prueba usando runtimes controlados, sin tocar nodos productivos.
+
 ## Notas de arquitectura
 
 - El `fluxbee-publish` actual entra por HTTP a `SY.admin`; no usa el socket/router como cliente.
