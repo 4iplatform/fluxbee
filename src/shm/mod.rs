@@ -651,6 +651,18 @@ pub struct IdentityRegionReader {
     layout: IdentityRegionLayout,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct IdentityHeaderDebugState {
+    pub seq: u64,
+    pub tenant_count: u32,
+    pub ilk_count: u32,
+    pub ich_count: u32,
+    pub ich_mapping_count: u32,
+    pub ilk_alias_count: u32,
+    pub updated_at: u64,
+    pub heartbeat: u64,
+}
+
 impl RouterRegionWriter {
     pub fn open_or_create(
         name: &str,
@@ -1169,6 +1181,11 @@ impl IdentityRegionWriter {
         read_identity_snapshot(header, self.mmap.as_ref(), &self.layout)
     }
 
+    pub fn debug_state(&self) -> Option<IdentityHeaderDebugState> {
+        let header = self.header_ref()?;
+        Some(identity_debug_state_from_header(header))
+    }
+
     pub fn update_heartbeat(&mut self) {
         if let Some(header) = self.header_mut() {
             seqlock_begin_write(&header.seq);
@@ -1505,7 +1522,11 @@ impl IdentityRegionWriter {
             return Err(ShmError::InvalidHeader);
         }
 
+        let ilk_uuid = Uuid::from_bytes(ilk.ilk_id);
+        let seq_before = header.seq.load(Ordering::Acquire);
+        let write_started = Instant::now();
         seqlock_begin_write(&header.seq);
+        let seq_after_begin = header.seq.load(Ordering::Acquire);
         let ich_offset = used_ichs as u32;
         for (offset, entry) in ich_entries.iter().enumerate() {
             ichs[used_ichs + offset] = *entry;
@@ -1542,10 +1563,26 @@ impl IdentityRegionWriter {
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
         seqlock_end_write(&header.seq);
+        let seq_after_end = header.seq.load(Ordering::Acquire);
+        tracing::info!(
+            ilk_id = %ilk_uuid,
+            seq_before,
+            seq_after_begin,
+            seq_after_end,
+            used_ilks,
+            used_ichs,
+            new_ilk_count = header.ilk_count,
+            new_ich_count = header.ich_count,
+            new_mapping_count = header.ich_mapping_count,
+            elapsed_us = write_started.elapsed().as_micros() as u64,
+            "identity shm provision_temporary_ilk completed"
+        );
         if let Err(err) = mapping_result {
             tracing::warn!(
-                ilk_id = %Uuid::from_bytes(ilk.ilk_id),
+                ilk_id = %ilk_uuid,
                 ich_count = ich_entries.len(),
+                seq_after_end,
+                elapsed_us = write_started.elapsed().as_micros() as u64,
                 error = %err,
                 "identity shm provision mapping update failed"
             );
@@ -1725,6 +1762,11 @@ impl IdentityRegionReader {
     pub fn try_read_snapshot(&self) -> Result<IdentitySnapshot, ShmError> {
         let header = self.header_ref().ok_or(ShmError::InvalidHeader)?;
         read_identity_snapshot(header, self.mmap.as_ref(), &self.layout)
+    }
+
+    pub fn debug_state(&self) -> Option<IdentityHeaderDebugState> {
+        let header = self.header_ref()?;
+        Some(identity_debug_state_from_header(header))
     }
 
     pub fn resolve_ich_mapping(
@@ -3002,6 +3044,19 @@ fn fixed_str_matches(buf: &[u8], value: &str) -> bool {
 fn fixed_str(buf: &[u8]) -> String {
     let used = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..used]).trim().to_string()
+}
+
+fn identity_debug_state_from_header(header: &IdentityHeader) -> IdentityHeaderDebugState {
+    IdentityHeaderDebugState {
+        seq: header.seq.load(Ordering::Acquire),
+        tenant_count: header.tenant_count,
+        ilk_count: header.ilk_count,
+        ich_count: header.ich_count,
+        ich_mapping_count: header.ich_mapping_count,
+        ilk_alias_count: header.ilk_alias_count,
+        updated_at: header.updated_at,
+        heartbeat: header.heartbeat,
+    }
 }
 
 fn empty_node_entry() -> NodeEntry {

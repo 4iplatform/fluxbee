@@ -1300,11 +1300,18 @@ impl IdentityRuntime {
             if let Some(writer) = identity_shm {
                 let shm_apply_started = Instant::now();
                 apply_identity_shm_deltas(writer, &self.store, action, &deltas)?;
+                let shm_state = writer.debug_state();
                 tracing::info!(
                     action,
                     trace_id = %trace_id,
                     delta_count = deltas.len(),
                     elapsed_us = shm_apply_started.elapsed().as_micros() as u64,
+                    shm_seq = shm_state.map(|s| s.seq),
+                    shm_tenant_count = shm_state.map(|s| s.tenant_count),
+                    shm_ilk_count = shm_state.map(|s| s.ilk_count),
+                    shm_ich_count = shm_state.map(|s| s.ich_count),
+                    shm_mapping_count = shm_state.map(|s| s.ich_mapping_count),
+                    shm_updated_at = shm_state.map(|s| s.updated_at),
                     "identity shm delta apply completed"
                 );
             }

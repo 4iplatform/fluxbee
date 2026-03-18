@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fluxbee_sdk::identity::{
     load_hive_id, provision_ilk, resolve_ilk_from_hive_config, IdentityShmError,
@@ -114,6 +114,7 @@ async fn send_probe(
     text: &str,
 ) -> Result<String, DynError> {
     let trace_id = Uuid::new_v4().to_string();
+    let send_started = Instant::now();
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
@@ -141,6 +142,13 @@ async fn send_probe(
         }),
     };
     sender.send(msg).await?;
+    tracing::info!(
+        trace_id = %trace_id,
+        src_ilk = %src_ilk,
+        probe_id = %probe_id,
+        elapsed_us = send_started.elapsed().as_micros() as u64,
+        "IO.test sent routing probe"
+    );
     Ok(trace_id)
 }
 
@@ -150,17 +158,39 @@ async fn wait_for_reply(
     expected_trace_id: &str,
     timeout_ms: u64,
 ) -> Result<Message, DynError> {
-    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let wait_started = Instant::now();
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            tracing::warn!(
+                trace_id = %expected_trace_id,
+                elapsed_us = wait_started.elapsed().as_micros() as u64,
+                "IO.test timed out waiting for reply"
+            );
             return Err(format!("timeout waiting reply trace_id={expected_trace_id}").into());
         }
         let incoming = match timeout(remaining, receiver.recv()).await {
             Ok(Ok(msg)) => msg,
             Ok(Err(err)) => return Err(err.into()),
-            Err(_) => return Err(format!("timeout waiting reply trace_id={expected_trace_id}").into()),
+            Err(_) => {
+                tracing::warn!(
+                    trace_id = %expected_trace_id,
+                    elapsed_us = wait_started.elapsed().as_micros() as u64,
+                    "IO.test timed out waiting for reply"
+                );
+                return Err(format!("timeout waiting reply trace_id={expected_trace_id}").into());
+            }
         };
+
+        tracing::info!(
+            expected_trace_id = %expected_trace_id,
+            incoming_trace_id = %incoming.routing.trace_id,
+            incoming_type = %incoming.meta.msg_type,
+            incoming_msg = incoming.meta.msg.as_deref().unwrap_or(""),
+            elapsed_us = wait_started.elapsed().as_micros() as u64,
+            "IO.test received message while waiting for reply"
+        );
 
         if try_handle_default_node_status(sender, &incoming).await? {
             continue;
@@ -171,6 +201,11 @@ async fn wait_for_reply(
         if incoming.meta.msg_type != "user" {
             continue;
         }
+        tracing::info!(
+            trace_id = %expected_trace_id,
+            elapsed_us = wait_started.elapsed().as_micros() as u64,
+            "IO.test received matching user reply"
+        );
         return Ok(incoming);
     }
 }

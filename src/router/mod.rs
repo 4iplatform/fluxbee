@@ -3730,6 +3730,7 @@ fn read_identity_snapshot(
     let shm_name = format!("/jsr-identity-{}", hive_id);
     let open_started = Instant::now();
     let reader = IdentityRegionReader::open_read_only_auto(&shm_name)?;
+    let header_state = reader.debug_state();
     let open_elapsed_us = open_started.elapsed().as_micros() as u64;
     let read_started = Instant::now();
     match reader.try_read_snapshot() {
@@ -3738,6 +3739,12 @@ fn read_identity_snapshot(
                 shm = %shm_name,
                 open_elapsed_us,
                 read_elapsed_us = read_started.elapsed().as_micros() as u64,
+                header_seq = header_state.map(|s| s.seq),
+                header_tenant_count = header_state.map(|s| s.tenant_count),
+                header_ilk_count = header_state.map(|s| s.ilk_count),
+                header_ich_count = header_state.map(|s| s.ich_count),
+                header_mapping_count = header_state.map(|s| s.ich_mapping_count),
+                header_updated_at = header_state.map(|s| s.updated_at),
                 tenant_count = snapshot.header.tenant_count,
                 ilk_count = snapshot.header.ilk_count,
                 ich_count = snapshot.header.ich_count,
@@ -3752,6 +3759,12 @@ fn read_identity_snapshot(
                 shm = %shm_name,
                 open_elapsed_us,
                 read_elapsed_us = read_started.elapsed().as_micros() as u64,
+                header_seq = header_state.map(|s| s.seq),
+                header_tenant_count = header_state.map(|s| s.tenant_count),
+                header_ilk_count = header_state.map(|s| s.ilk_count),
+                header_ich_count = header_state.map(|s| s.ich_count),
+                header_mapping_count = header_state.map(|s| s.ich_mapping_count),
+                header_updated_at = header_state.map(|s| s.updated_at),
                 error = %err,
                 "router identity snapshot read failed"
             );
