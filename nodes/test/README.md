@@ -85,6 +85,7 @@ con estos dos nodos:
 BASE="http://127.0.0.1:8080" \
 HIVE_ID="motherbee" \
 MOTHER_HIVE_ID="motherbee" \
+TENANT_ID="tnt:<uuid-v4>" \
 bash scripts/identity_test_nodes_publish_e2e.sh
 ```
 
@@ -97,6 +98,12 @@ Ese script:
 5. spawnea `AI.test.gov` como frontdesk gestionado
 6. spawnea `IO.test` como probe one-shot
 7. valida que el reply vuelva con `HANDLED_BY=AI.test.gov@<hive>`
+
+Nota:
+
+- este E2E requiere `TENANT_ID`, porque el frontdesk configurado en `hive.yaml`
+  se spawnea como nodo gestionado y el orchestrator hoy exige `tenant_id` para
+  ese camino de registro identity-aware
 
 Sirve para verificar el ciclo completo de software:
 

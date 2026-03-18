@@ -23,6 +23,7 @@ set -euo pipefail
 #   IO_RUNTIME_NAME="io.test.diag.<id>"
 #   AI_RUNTIME_VERSION="1.0.0-<id>"
 #   IO_RUNTIME_VERSION="1.0.0-<id>"
+#   TENANT_ID="tnt:<uuid-v4>"
 #   IO_TEST_CHANNEL_TYPE="io.test.demo"
 #   IO_TEST_ADDRESS="io.test.demo.<id>"
 #   IO_TEST_WAIT_REPLY_MS=8000
@@ -136,6 +137,22 @@ elif isinstance(value, (dict, list)):
 else:
     print(str(value))
 PY
+}
+
+validate_tenant_id() {
+  local tenant_id="${1:-}"
+  if [[ -z "$tenant_id" ]]; then
+    echo "FAIL: TENANT_ID is required for this E2E because the configured frontdesk node is identity-managed and spawn requires tenant_id (format: tnt:<uuid-v4>)" >&2
+    exit 1
+  fi
+  if [[ "$tenant_id" == *"<"* || "$tenant_id" == *">"* ]]; then
+    echo "FAIL: TENANT_ID looks like placeholder ('$tenant_id'). Use real tnt:<uuid-v4>." >&2
+    exit 1
+  fi
+  if [[ ! "$tenant_id" =~ ^tnt:[0-9a-fA-F-]{36}$ ]]; then
+    echo "FAIL: invalid TENANT_ID='$tenant_id' (expected tnt:<uuid-v4>)" >&2
+    exit 1
+  fi
 }
 
 read_hive_id_from_config() {
@@ -430,6 +447,7 @@ require_cmd curl
 require_cmd jq
 require_cmd python3
 require_cmd sudo
+validate_tenant_id "${TENANT_ID:-}"
 
 if [[ -z "$LOCAL_HIVE_ID" ]]; then
   LOCAL_HIVE_ID="$(read_hive_id_from_config)"
