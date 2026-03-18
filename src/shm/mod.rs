@@ -719,9 +719,8 @@ impl RouterRegionWriter {
 
     pub fn update_heartbeat(&mut self) {
         if let Some(header) = self.header_mut() {
-            seqlock_begin_write(&header.seq);
+            let _write_guard = SeqlockWriteGuard::new(&header.seq);
             header.heartbeat = now_epoch_ms();
-            seqlock_end_write(&header.seq);
         }
     }
 
@@ -732,12 +731,11 @@ impl RouterRegionWriter {
         if header.opa_policy_version == policy_version && header.opa_load_status == load_status {
             return;
         }
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         header.opa_policy_version = policy_version;
         header.opa_load_status = load_status;
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
-        seqlock_end_write(&header.seq);
     }
 
     pub fn register_node(
@@ -771,7 +769,7 @@ impl RouterRegionWriter {
             return Err(ShmError::SlotFull);
         };
 
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         *entry = empty_node_entry();
         entry.uuid = *node_uuid.as_bytes();
         entry.name_len = copy_bytes_with_len(&mut entry.name, name) as u16;
@@ -781,7 +779,6 @@ impl RouterRegionWriter {
         header.node_count = count_active_nodes(nodes);
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
-        seqlock_end_write(&header.seq);
         Ok(())
     }
 
@@ -790,7 +787,7 @@ impl RouterRegionWriter {
             router_header_and_nodes_mut(&mut self.mmap, &self.layout)
                 .ok_or(ShmError::InvalidHeader)?;
         let mut found = false;
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         for entry in nodes.iter_mut() {
             if entry.flags & FLAG_ACTIVE == 0 {
                 continue;
@@ -807,7 +804,6 @@ impl RouterRegionWriter {
             header.updated_at = now_epoch_ms();
             header.heartbeat = header.updated_at;
         }
-        seqlock_end_write(&header.seq);
         Ok(())
     }
 
@@ -816,7 +812,7 @@ impl RouterRegionWriter {
             router_header_and_nodes_mut(&mut self.mmap, &self.layout)
                 .ok_or(ShmError::InvalidHeader)?;
         let mut updated = false;
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         for entry in nodes.iter_mut() {
             if entry.flags & FLAG_ACTIVE == 0 {
                 continue;
@@ -831,7 +827,6 @@ impl RouterRegionWriter {
             header.updated_at = now_epoch_ms();
             header.heartbeat = header.updated_at;
         }
-        seqlock_end_write(&header.seq);
         Ok(())
     }
 
@@ -893,9 +888,8 @@ impl ConfigRegionWriter {
 
     pub fn update_heartbeat(&mut self) {
         if let Some(header) = self.header_mut() {
-            seqlock_begin_write(&header.seq);
+            let _write_guard = SeqlockWriteGuard::new(&header.seq);
             header.heartbeat = now_epoch_ms();
-            seqlock_end_write(&header.seq);
         }
     }
 
@@ -913,7 +907,7 @@ impl ConfigRegionWriter {
         let (header, entries): (&mut ConfigHeader, &mut [StaticRouteEntry]) =
             config_header_and_routes_mut(&mut self.mmap, &self.layout)
                 .ok_or(ShmError::InvalidHeader)?;
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         for entry in entries.iter_mut() {
             *entry = empty_static_route();
         }
@@ -926,7 +920,6 @@ impl ConfigRegionWriter {
         }
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
-        seqlock_end_write(&header.seq);
         Ok(())
     }
 
@@ -944,7 +937,7 @@ impl ConfigRegionWriter {
         let (header, entries): (&mut ConfigHeader, &mut [VpnAssignment]) =
             config_header_and_vpns_mut(&mut self.mmap, &self.layout)
                 .ok_or(ShmError::InvalidHeader)?;
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         for entry in entries.iter_mut() {
             *entry = empty_vpn_assignment();
         }
@@ -957,7 +950,6 @@ impl ConfigRegionWriter {
         }
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
-        seqlock_end_write(&header.seq);
         Ok(())
     }
 
@@ -1024,9 +1016,8 @@ impl LsaRegionWriter {
 
     pub fn update_heartbeat(&mut self) {
         if let Some(header) = self.header_mut() {
-            seqlock_begin_write(&header.seq);
+            let _write_guard = SeqlockWriteGuard::new(&header.seq);
             header.heartbeat = now_epoch_ms();
-            seqlock_end_write(&header.seq);
         }
     }
 
@@ -1070,7 +1061,7 @@ impl LsaRegionWriter {
         ) = lsa_header_and_entries_mut(&mut self.mmap, &self.layout)
             .ok_or(ShmError::InvalidHeader)?;
 
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         for entry in hive_entries.iter_mut() {
             *entry = empty_remote_hive();
         }
@@ -1103,7 +1094,6 @@ impl LsaRegionWriter {
         header.total_vpn_count = vpns.len() as u32;
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
-        seqlock_end_write(&header.seq);
         Ok(())
     }
 
@@ -1220,9 +1210,8 @@ impl IdentityRegionWriter {
 
     pub fn update_heartbeat(&mut self) {
         if let Some(header) = self.header_mut() {
-            seqlock_begin_write(&header.seq);
+            let _write_guard = SeqlockWriteGuard::new(&header.seq);
             header.heartbeat = now_epoch_ms();
-            seqlock_end_write(&header.seq);
         }
     }
 
@@ -1230,7 +1219,7 @@ impl IdentityRegionWriter {
         let (header, tenants, ilks, ichs, mappings, aliases, vocabulary) =
             identity_header_and_entries_mut(&mut self.mmap, &self.layout)
                 .ok_or(ShmError::InvalidHeader)?;
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         for entry in tenants.iter_mut() {
             *entry = empty_tenant_entry();
         }
@@ -1257,7 +1246,6 @@ impl IdentityRegionWriter {
         header.ilk_alias_count = 0;
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
-        seqlock_end_write(&header.seq);
         Ok(())
     }
 
@@ -1310,7 +1298,7 @@ impl IdentityRegionWriter {
             identity_header_and_entries_mut(&mut self.mmap, &self.layout)
                 .ok_or(ShmError::InvalidHeader)?;
 
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         for entry in tenants.iter_mut() {
             *entry = empty_tenant_entry();
         }
@@ -1354,7 +1342,6 @@ impl IdentityRegionWriter {
         header.vocabulary_count = vocabulary_src.len() as u32;
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
-        seqlock_end_write(&header.seq);
         Ok(())
     }
 
@@ -1381,7 +1368,7 @@ impl IdentityRegionWriter {
             identity_header_and_entries_mut(&mut self.mmap, &self.layout)
                 .ok_or(ShmError::InvalidHeader)?;
         let hash = compute_ich_hash(channel_type, address);
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         let result =
             upsert_ich_mapping_entry(mappings, hash, channel_type, address, ich_id, ilk_id);
         if let Ok(inserted) = result {
@@ -1391,7 +1378,6 @@ impl IdentityRegionWriter {
             header.updated_at = now_epoch_ms();
             header.heartbeat = header.updated_at;
         }
-        seqlock_end_write(&header.seq);
         result.map(|_| ())
     }
 
@@ -1404,7 +1390,7 @@ impl IdentityRegionWriter {
         if used > max {
             return Err(ShmError::InvalidHeader);
         }
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         if let Some(idx) = find_tenant_entry_index(&tenants[..used], entry.tenant_id) {
             let created_at = tenants[idx].created_at;
             tenants[idx] = entry;
@@ -1413,12 +1399,10 @@ impl IdentityRegionWriter {
             tenants[used] = entry;
             header.tenant_count = header.tenant_count.saturating_add(1);
         } else {
-            seqlock_end_write(&header.seq);
             return Err(ShmError::SlotFull);
         }
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
-        seqlock_end_write(&header.seq);
         Ok(())
     }
 
@@ -1431,7 +1415,7 @@ impl IdentityRegionWriter {
         if used > max {
             return Err(ShmError::InvalidHeader);
         }
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         if let Some(idx) = find_ilk_entry_index(&ilks[..used], entry.ilk_id) {
             let created_at = ilks[idx].created_at;
             ilks[idx] = entry;
@@ -1440,12 +1424,10 @@ impl IdentityRegionWriter {
             ilks[used] = entry;
             header.ilk_count = header.ilk_count.saturating_add(1);
         } else {
-            seqlock_end_write(&header.seq);
             return Err(ShmError::SlotFull);
         }
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
-        seqlock_end_write(&header.seq);
         Ok(())
     }
 
@@ -1457,13 +1439,12 @@ impl IdentityRegionWriter {
         if used > self.layout.limits.max_ilks as usize {
             return Err(ShmError::InvalidHeader);
         }
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         let removed = remove_compact_ilk_entry(header, ilks, ilk_id);
         if removed {
             header.updated_at = now_epoch_ms();
             header.heartbeat = header.updated_at;
         }
-        seqlock_end_write(&header.seq);
         Ok(removed)
     }
 
@@ -1480,7 +1461,7 @@ impl IdentityRegionWriter {
         if used > max_ichs {
             return Err(ShmError::InvalidHeader);
         }
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         let mut idx = 0usize;
         while idx < used {
             if ichs[idx].flags & FLAG_ACTIVE != 0 && ichs[idx].ilk_id == ilk_id {
@@ -1494,7 +1475,6 @@ impl IdentityRegionWriter {
             idx += 1;
         }
         if used + entries.len() > max_ichs {
-            seqlock_end_write(&header.seq);
             return Err(ShmError::SlotFull);
         }
         for (offset, entry) in entries.iter().enumerate() {
@@ -1505,7 +1485,6 @@ impl IdentityRegionWriter {
         reindex_ilk_channel_layout(&mut ilks[..header.ilk_count as usize], &ichs[..used]);
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
-        seqlock_end_write(&header.seq);
         Ok(())
     }
 
@@ -1521,14 +1500,13 @@ impl IdentityRegionWriter {
         if used + entries.len() > max_ichs {
             return Err(ShmError::SlotFull);
         }
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         for (offset, entry) in entries.iter().enumerate() {
             ichs[used + offset] = *entry;
         }
         header.ich_count = header.ich_count.saturating_add(entries.len() as u32);
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
-        seqlock_end_write(&header.seq);
         Ok(used as u32)
     }
 
@@ -1557,44 +1535,46 @@ impl IdentityRegionWriter {
         let ilk_uuid = Uuid::from_bytes(ilk.ilk_id);
         let seq_before = header.seq.load(Ordering::Acquire);
         let write_started = Instant::now();
-        seqlock_begin_write(&header.seq);
-        let seq_after_begin = header.seq.load(Ordering::Acquire);
-        let ich_offset = used_ichs as u32;
-        for (offset, entry) in ich_entries.iter().enumerate() {
-            ichs[used_ichs + offset] = *entry;
-        }
-        header.ich_count = header.ich_count.saturating_add(ich_entries.len() as u32);
-
-        ilk.ich_offset = ich_offset;
-        ilk.ich_count = ich_entries.len().min(u16::MAX as usize) as u16;
-        ilks[used_ilks] = ilk;
-        header.ilk_count = header.ilk_count.saturating_add(1);
-
-        let mapping_result = (|| -> Result<(), ShmError> {
-            for entry in ich_entries {
-                let channel_type = fixed_str(&entry.channel_type);
-                let address = fixed_str(&entry.address);
-                if channel_type.is_empty() || address.is_empty() {
-                    continue;
-                }
-                let inserted = upsert_ich_mapping_entry(
-                    mappings,
-                    compute_ich_hash(&channel_type, &address),
-                    &channel_type,
-                    &address,
-                    entry.ich_id,
-                    entry.ilk_id,
-                )?;
-                if inserted {
-                    header.ich_mapping_count = header.ich_mapping_count.saturating_add(1);
-                }
+        let (seq_after_begin, mapping_result) = {
+            let _write_guard = SeqlockWriteGuard::new(&header.seq);
+            let seq_after_begin = header.seq.load(Ordering::Acquire);
+            let ich_offset = used_ichs as u32;
+            for (offset, entry) in ich_entries.iter().enumerate() {
+                ichs[used_ichs + offset] = *entry;
             }
-            Ok(())
-        })();
+            header.ich_count = header.ich_count.saturating_add(ich_entries.len() as u32);
 
-        header.updated_at = now_epoch_ms();
-        header.heartbeat = header.updated_at;
-        seqlock_end_write(&header.seq);
+            ilk.ich_offset = ich_offset;
+            ilk.ich_count = ich_entries.len().min(u16::MAX as usize) as u16;
+            ilks[used_ilks] = ilk;
+            header.ilk_count = header.ilk_count.saturating_add(1);
+
+            let mapping_result = (|| -> Result<(), ShmError> {
+                for entry in ich_entries {
+                    let channel_type = fixed_str(&entry.channel_type);
+                    let address = fixed_str(&entry.address);
+                    if channel_type.is_empty() || address.is_empty() {
+                        continue;
+                    }
+                    let inserted = upsert_ich_mapping_entry(
+                        mappings,
+                        compute_ich_hash(&channel_type, &address),
+                        &channel_type,
+                        &address,
+                        entry.ich_id,
+                        entry.ilk_id,
+                    )?;
+                    if inserted {
+                        header.ich_mapping_count = header.ich_mapping_count.saturating_add(1);
+                    }
+                }
+                Ok(())
+            })();
+
+            header.updated_at = now_epoch_ms();
+            header.heartbeat = header.updated_at;
+            (seq_after_begin, mapping_result)
+        };
         let seq_after_end = header.seq.load(Ordering::Acquire);
         tracing::info!(
             ilk_id = %ilk_uuid,
@@ -1627,7 +1607,7 @@ impl IdentityRegionWriter {
         let (header, _tenants, _ilks, _ichs, mappings, _aliases, _vocabulary) =
             identity_header_and_entries_mut(&mut self.mmap, &self.layout)
                 .ok_or(ShmError::InvalidHeader)?;
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         let mut removed = 0u32;
         for entry in mappings.iter_mut() {
             if entry.flags & ICH_MAP_FLAG_OCCUPIED != 0 && entry.ilk_id == ilk_id {
@@ -1640,7 +1620,6 @@ impl IdentityRegionWriter {
             header.updated_at = now_epoch_ms();
             header.heartbeat = header.updated_at;
         }
-        seqlock_end_write(&header.seq);
         Ok(removed)
     }
 
@@ -1653,19 +1632,17 @@ impl IdentityRegionWriter {
         if used > max {
             return Err(ShmError::InvalidHeader);
         }
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         if let Some(idx) = find_alias_entry_index(&aliases[..used], entry.old_ilk_id) {
             aliases[idx] = entry;
         } else if used < max {
             aliases[used] = entry;
             header.ilk_alias_count = header.ilk_alias_count.saturating_add(1);
         } else {
-            seqlock_end_write(&header.seq);
             return Err(ShmError::SlotFull);
         }
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
-        seqlock_end_write(&header.seq);
         Ok(())
     }
 
@@ -1677,13 +1654,12 @@ impl IdentityRegionWriter {
         if used > self.layout.limits.max_ilk_aliases as usize {
             return Err(ShmError::InvalidHeader);
         }
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         let removed = remove_compact_alias_entry(header, aliases, old_ilk_id);
         if removed {
             header.updated_at = now_epoch_ms();
             header.heartbeat = header.updated_at;
         }
-        seqlock_end_write(&header.seq);
         Ok(removed)
     }
 
@@ -1696,14 +1672,13 @@ impl IdentityRegionWriter {
             identity_header_and_entries_mut(&mut self.mmap, &self.layout)
                 .ok_or(ShmError::InvalidHeader)?;
         let hash = compute_ich_hash(channel_type, address);
-        seqlock_begin_write(&header.seq);
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
         let removed = remove_ich_mapping_entry(mappings, hash, channel_type, address);
         if removed {
             header.ich_mapping_count = header.ich_mapping_count.saturating_sub(1);
             header.updated_at = now_epoch_ms();
             header.heartbeat = header.updated_at;
         }
-        seqlock_end_write(&header.seq);
         Ok(removed)
     }
 
@@ -1864,6 +1839,26 @@ fn normalize_seq_header<T: SeqHeader>(
         );
     }
     Ok(())
+}
+
+#[must_use]
+struct SeqlockWriteGuard {
+    seq: *const AtomicU64,
+}
+
+impl SeqlockWriteGuard {
+    fn new(seq: &AtomicU64) -> Self {
+        seqlock_begin_write(seq);
+        Self { seq }
+    }
+}
+
+impl Drop for SeqlockWriteGuard {
+    fn drop(&mut self) {
+        unsafe {
+            seqlock_end_write(&*self.seq);
+        }
+    }
 }
 
 pub fn copy_bytes_with_len(dst: &mut [u8], src: &str) -> usize {
@@ -3657,6 +3652,133 @@ mod tests {
         assert_eq!(snap.header.ilk_alias_count, 1);
         assert_eq!(snap.header.ich_mapping_count, 0);
         assert_eq!(writer.resolve_ich_mapping("whatsapp", "+549111111"), None);
+
+        cleanup_shm(&name);
+    }
+
+    #[test]
+    fn router_writer_recovers_stale_odd_seq_on_reopen() {
+        let name = format!("/jsr-r-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        cleanup_shm(&name);
+
+        let mut writer = RouterRegionWriter::open_or_create(
+            &name,
+            Uuid::new_v4(),
+            "sandbox",
+            "RT.test@sandbox",
+            true,
+        )
+        .expect("open router region");
+        writer
+            .header_mut()
+            .expect("router header")
+            .seq
+            .store(11, Ordering::Release);
+        drop(writer);
+
+        let reopened = RouterRegionWriter::open_or_create(
+            &name,
+            Uuid::new_v4(),
+            "sandbox",
+            "RT.test@sandbox",
+            true,
+        )
+        .expect("reopen router region");
+        assert_eq!(
+            reopened.header_ref().expect("router header").seq.load(Ordering::Acquire),
+            12
+        );
+        assert!(reopened.read_snapshot().is_some());
+
+        cleanup_shm(&name);
+    }
+
+    #[test]
+    fn config_writer_recovers_stale_odd_seq_on_reopen() {
+        let name = format!("/jsc-r-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        cleanup_shm(&name);
+
+        let mut writer =
+            ConfigRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox")
+                .expect("open config region");
+        writer
+            .header_mut()
+            .expect("config header")
+            .seq
+            .store(13, Ordering::Release);
+        drop(writer);
+
+        let reopened =
+            ConfigRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox")
+                .expect("reopen config region");
+        assert_eq!(
+            reopened.header_ref().expect("config header").seq.load(Ordering::Acquire),
+            14
+        );
+        assert!(reopened.read_snapshot().is_some());
+
+        cleanup_shm(&name);
+    }
+
+    #[test]
+    fn lsa_writer_recovers_stale_odd_seq_on_reopen() {
+        let name = format!("/jsl-r-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        cleanup_shm(&name);
+
+        let mut writer =
+            LsaRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox")
+                .expect("open lsa region");
+        writer
+            .header_mut()
+            .expect("lsa header")
+            .seq
+            .store(21, Ordering::Release);
+        drop(writer);
+
+        let reopened =
+            LsaRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox")
+                .expect("reopen lsa region");
+        assert_eq!(
+            reopened.header_ref().expect("lsa header").seq.load(Ordering::Acquire),
+            22
+        );
+        assert!(reopened.read_snapshot().is_some());
+
+        cleanup_shm(&name);
+    }
+
+    #[test]
+    fn identity_writer_recovers_stale_odd_seq_on_reopen() {
+        let name = format!("/jsid-r-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        cleanup_shm(&name);
+        let limits = IdentityRegionLimits {
+            max_ilks: 2,
+            max_tenants: 2,
+            max_vocabulary: 2,
+            max_ilk_aliases: 2,
+        };
+
+        let mut writer =
+            IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, limits)
+                .expect("open identity region");
+        writer
+            .header_mut()
+            .expect("identity header")
+            .seq
+            .store(31, Ordering::Release);
+        drop(writer);
+
+        let reopened =
+            IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, limits)
+                .expect("reopen identity region");
+        assert_eq!(
+            reopened
+                .debug_state()
+                .expect("identity debug state")
+                .seq,
+            32
+        );
+        assert!(reopened.read_snapshot().is_some());
 
         cleanup_shm(&name);
     }

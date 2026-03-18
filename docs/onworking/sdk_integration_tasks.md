@@ -21,6 +21,11 @@ Estado:
   - Pregunta abierta: eso es policy deseada o sólo un default demasiado estricto para integraciones SDK?
   - Esta tarea es de diseño; no está tratada todavía como bug obligatorio.
 
+- [ ] SDK/SHM: alinear el reader de identity del SDK con la implementación central de `json_router::shm`.
+  - Hallazgo: el SDK mantiene una implementación separada en `crates/fluxbee_sdk/src/identity.rs`.
+  - Riesgo: diagnósticos, timeouts o semántica de lectura pueden divergir del sistema real.
+  - Objetivo: compartir código o al menos mantener paridad 1:1 en semántica y errores.
+
 - [ ] Publish por API: evaluar endpoint HTTP de upload/staging para que `fluxbee-publish` pueda ser reemplazable por llamada API completa.
   - No bloquea operación actual.
   - Queda como mejora de producto/herramientas.
@@ -49,6 +54,25 @@ Estado:
   - Hallazgo con logs reales: `odd_seq_spins > 0`, `seq_retry_count = 0` y `last_seq` impar mostraban que el writer entraba en la región crítica y no salía.
   - Causa: `provision_temporary_ilk(...)` hacía `?` sobre `upsert_ich_mapping_entry(...)` dentro de la sección protegida, y un error dejaba `seq` impar hasta reinicio.
   - Corrección: cerrar siempre la sección crítica antes de propagar error y dejar `warn` explícito si falla la carga de mappings.
+
+- [x] Identity SHM: migración del writer a guard/RAII para seqlock.
+  - Se agregó `SeqlockWriteGuard` en la capa compartida de SHM.
+  - `RouterRegionWriter`, `ConfigRegionWriter`, `LsaRegionWriter` e `IdentityRegionWriter` ya no dependen de `seqlock_begin_write/seqlock_end_write` manual en sus operaciones de escritura.
+  - Resultado: el hot path de identity queda protegido estructuralmente contra salidas tempranas que dejen el lock abierto.
+
+- [x] SHM core: recovery automático de `seq` impar heredado al abrir writers.
+  - Hallazgo: aun después de corregir el hot path, una SHM persistida podía seguir arrancando con `seq` impar de una corrida previa.
+  - Corrección aplicada: `RouterRegionWriter`, `ConfigRegionWriter`, `LsaRegionWriter` e `IdentityRegionWriter` normalizan `seq` impar al abrir y lo dejan logueado.
+  - Alcance: la corrección vive en la capa compartida `src/shm/mod.rs`, así que cubre a los binarios del sistema que usan esos writers.
+
+- [x] SHM core: cobertura explícita de recovery para `seq` impar heredado.
+  - Se agregaron tests de reapertura/recovery para `router`, `config`, `lsa` e `identity`.
+  - Objetivo cubierto: validar que una SHM persistida con `seq` impar se normaliza al reabrirse antes de volver a operar.
+
+- [x] Revisión de arquitectura SHM: writers centralizados, reader del SDK todavía separado.
+  - Los writers/headers de SHM del sistema viven en `src/shm/mod.rs`.
+  - `rt-gateway`, `sy_identity` y `sy_config_routes` consumen esa capa central.
+  - El SDK sólo duplica lectura de identity SHM en `crates/fluxbee_sdk/src/identity.rs`; ese es el punto pendiente de alineación.
 
 - [x] Identity: eliminar carrera entre `ILK_PROVISION_RESPONSE` y visibilidad del ILK en el SHM consumido por el router.
   - Hallazgo en prueba real: `IO.test` provisionaba un ILK temporal y enviaba el probe inmediatamente, pero el router todavía no lo veía en SHM y caía a OPA.
@@ -97,6 +121,7 @@ Estado:
   - `full snapshot sync` queda reservado para bootstrap, rebuild y fallback.
   - el hot path de acciones del sistema debe operar con deltas incrementales.
   - `ILK_PROVISION` no debe abrir varias ventanas de seqlock seguidas; si vuelve a aparecer contención, revisar primero que siga entrando al fast path atómico antes de mirar OPA o routing.
+  - las escrituras seguras deberían tender a una abstracción con guard/RAII, no a `begin/end` manual repetido.
   - si vuelve a aparecer contención de lectura, revisar primero:
     - duración de ventana de seqlock
     - costo de reindex de ICH
