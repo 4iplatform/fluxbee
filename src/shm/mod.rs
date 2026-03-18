@@ -2457,10 +2457,10 @@ fn read_identity_snapshot(
 
         let tenants = read_slice::<TenantEntry>(mmap, layout.tenant_offset, max_tenants)
             .ok_or(ShmError::InvalidHeader)?;
-        let ilks =
-            read_slice::<IlkEntry>(mmap, layout.ilk_offset, max_ilks).ok_or(ShmError::InvalidHeader)?;
-        let ichs =
-            read_slice::<IchEntry>(mmap, layout.ich_offset, max_ichs).ok_or(ShmError::InvalidHeader)?;
+        let ilks = read_slice::<IlkEntry>(mmap, layout.ilk_offset, max_ilks)
+            .ok_or(ShmError::InvalidHeader)?;
+        let ichs = read_slice::<IchEntry>(mmap, layout.ich_offset, max_ichs)
+            .ok_or(ShmError::InvalidHeader)?;
         let ich_mappings =
             read_slice::<IchMappingEntry>(mmap, layout.ich_mapping_offset, max_ich_mappings)
                 .ok_or(ShmError::InvalidHeader)?;
@@ -3515,9 +3515,7 @@ mod tests {
             flags: FLAG_ACTIVE,
             _reserved: [0u8; 22],
         };
-        writer
-            .upsert_ilk_alias_entry(alias)
-            .expect("alias upsert");
+        writer.upsert_ilk_alias_entry(alias).expect("alias upsert");
 
         let snap = writer.try_read_snapshot().expect("snapshot");
         assert_eq!(snap.header.tenant_count, 1);
@@ -3525,7 +3523,10 @@ mod tests {
         assert_eq!(snap.header.ich_count, 1);
         assert_eq!(snap.header.ilk_alias_count, 1);
         assert_eq!(snap.header.ich_mapping_count, 1);
-        assert_eq!(writer.resolve_ich_mapping("io.test.demo", "addr-1"), Some((ich_id, ilk_id)));
+        assert_eq!(
+            writer.resolve_ich_mapping("io.test.demo", "addr-1"),
+            Some((ich_id, ilk_id))
+        );
 
         writer
             .clear_ich_mappings_for_ilk(ilk_id)
@@ -3685,7 +3686,11 @@ mod tests {
         )
         .expect("reopen router region");
         assert_eq!(
-            reopened.header_ref().expect("router header").seq.load(Ordering::Acquire),
+            reopened
+                .header_ref()
+                .expect("router header")
+                .seq
+                .load(Ordering::Acquire),
             12
         );
         assert!(reopened.read_snapshot().is_some());
@@ -3698,9 +3703,8 @@ mod tests {
         let name = format!("/jsc-r-{}", &Uuid::new_v4().simple().to_string()[..8]);
         cleanup_shm(&name);
 
-        let mut writer =
-            ConfigRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox")
-                .expect("open config region");
+        let mut writer = ConfigRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox")
+            .expect("open config region");
         writer
             .header_mut()
             .expect("config header")
@@ -3708,11 +3712,14 @@ mod tests {
             .store(13, Ordering::Release);
         drop(writer);
 
-        let reopened =
-            ConfigRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox")
-                .expect("reopen config region");
+        let reopened = ConfigRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox")
+            .expect("reopen config region");
         assert_eq!(
-            reopened.header_ref().expect("config header").seq.load(Ordering::Acquire),
+            reopened
+                .header_ref()
+                .expect("config header")
+                .seq
+                .load(Ordering::Acquire),
             14
         );
         assert!(reopened.read_snapshot().is_some());
@@ -3725,9 +3732,8 @@ mod tests {
         let name = format!("/jsl-r-{}", &Uuid::new_v4().simple().to_string()[..8]);
         cleanup_shm(&name);
 
-        let mut writer =
-            LsaRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox")
-                .expect("open lsa region");
+        let mut writer = LsaRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox")
+            .expect("open lsa region");
         writer
             .header_mut()
             .expect("lsa header")
@@ -3735,11 +3741,14 @@ mod tests {
             .store(21, Ordering::Release);
         drop(writer);
 
-        let reopened =
-            LsaRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox")
-                .expect("reopen lsa region");
+        let reopened = LsaRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox")
+            .expect("reopen lsa region");
         assert_eq!(
-            reopened.header_ref().expect("lsa header").seq.load(Ordering::Acquire),
+            reopened
+                .header_ref()
+                .expect("lsa header")
+                .seq
+                .load(Ordering::Acquire),
             22
         );
         assert!(reopened.read_snapshot().is_some());
@@ -3772,10 +3781,7 @@ mod tests {
             IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, limits)
                 .expect("reopen identity region");
         assert_eq!(
-            reopened
-                .debug_state()
-                .expect("identity debug state")
-                .seq,
+            reopened.debug_state().expect("identity debug state").seq,
             32
         );
         assert!(reopened.read_snapshot().is_some());

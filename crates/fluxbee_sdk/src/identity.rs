@@ -680,30 +680,13 @@ impl IdentityShmReader {
     ) -> Result<Option<[u8; 16]>, IdentityShmError> {
         let header = header_ref::<IdentityHeader>(self.mmap.as_ref(), self.layout.header_offset)
             .ok_or(IdentityShmError::InvalidShmHeader)?;
-        let start = StdInstant::now();
-        loop {
-            if start.elapsed() > StdDuration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
-                return Err(IdentityShmError::SeqLockTimeout);
-            }
-            let s1 = header.seq.load(Ordering::Acquire);
-            if s1 & 1 != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            atomic::fence(Ordering::Acquire);
-            let mappings = read_slice::<IchMappingEntry>(
-                self.mmap.as_ref(),
-                self.layout.ich_mapping_offset,
-                self.layout.limits.max_ich_mappings() as usize,
-            )
-            .ok_or(IdentityShmError::InvalidShmHeader)?;
-            let resolved = resolve_ich_mapping_from_entries(mappings, channel_type, address);
-            atomic::fence(Ordering::Acquire);
-            let s2 = header.seq.load(Ordering::Acquire);
-            if s1 == s2 {
-                return Ok(resolved);
-            }
-        }
+        resolve_ich_mapping_from_region(
+            header,
+            self.mmap.as_ref(),
+            &self.layout,
+            channel_type,
+            address,
+        )
     }
 }
 
@@ -757,9 +740,12 @@ fn open_identity_shm_reader(name: &str) -> Result<IdentityShmReader, IdentityShm
             .len(stat.st_size as usize)
             .map(fd.as_raw_fd())?
     };
+    if !is_region_valid(mmap.as_ref()) {
+        return Err(IdentityShmError::InvalidShmHeader);
+    }
     let header =
         header_ref::<IdentityHeader>(mmap.as_ref(), 0).ok_or(IdentityShmError::InvalidShmHeader)?;
-    if header.magic != IDENTITY_MAGIC || header.version != IDENTITY_VERSION {
+    if header.version != IDENTITY_VERSION {
         return Err(IdentityShmError::InvalidShmHeader);
     }
     let limits = IdentityRegionLimits {
@@ -773,6 +759,73 @@ fn open_identity_shm_reader(name: &str) -> Result<IdentityShmReader, IdentityShm
         return Err(IdentityShmError::InvalidShmHeader);
     }
     Ok(IdentityShmReader { mmap, layout })
+}
+
+fn resolve_ich_mapping_from_region(
+    header: &IdentityHeader,
+    mmap: &[u8],
+    layout: &IdentityRegionLayout,
+    channel_type: &str,
+    address: &str,
+) -> Result<Option<[u8; 16]>, IdentityShmError> {
+    let start = StdInstant::now();
+    let mut odd_seq_spins = 0u64;
+    let mut seq_retry_count = 0u64;
+    let mut last_seq = 0u64;
+    loop {
+        if start.elapsed() > StdDuration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            tracing::warn!(
+                elapsed_us = start.elapsed().as_micros() as u64,
+                odd_seq_spins,
+                seq_retry_count,
+                last_seq,
+                tenant_count = header.tenant_count,
+                ilk_count = header.ilk_count,
+                ich_count = header.ich_count,
+                ich_mapping_count = header.ich_mapping_count,
+                ilk_alias_count = header.ilk_alias_count,
+                "sdk identity shm read timed out under seqlock"
+            );
+            return Err(IdentityShmError::SeqLockTimeout);
+        }
+        let s1 = header.seq.load(Ordering::Acquire);
+        last_seq = s1;
+        if s1 & 1 != 0 {
+            odd_seq_spins = odd_seq_spins.saturating_add(1);
+            std::hint::spin_loop();
+            continue;
+        }
+        atomic::fence(Ordering::Acquire);
+        let mappings = read_slice::<IchMappingEntry>(
+            mmap,
+            layout.ich_mapping_offset,
+            layout.limits.max_ich_mappings() as usize,
+        )
+        .ok_or(IdentityShmError::InvalidShmHeader)?;
+        let resolved = resolve_ich_mapping_from_entries(mappings, channel_type, address);
+        atomic::fence(Ordering::Acquire);
+        let s2 = header.seq.load(Ordering::Acquire);
+        if s1 == s2 {
+            return Ok(resolved);
+        }
+        seq_retry_count = seq_retry_count.saturating_add(1);
+        last_seq = s2;
+    }
+}
+
+fn is_region_valid(mmap: &[u8]) -> bool {
+    let Some(magic_bytes) = mmap.get(0..4) else {
+        return false;
+    };
+    let Ok(magic_bytes) = <[u8; 4]>::try_from(magic_bytes) else {
+        return false;
+    };
+    let magic = u32::from_ne_bytes(magic_bytes);
+    match magic {
+        IDENTITY_MAGIC => header_ref::<IdentityHeader>(mmap, 0)
+            .is_some_and(|header| header.version == IDENTITY_VERSION),
+        _ => false,
+    }
 }
 
 fn resolve_ich_mapping_from_entries(

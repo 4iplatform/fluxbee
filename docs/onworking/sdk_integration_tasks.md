@@ -21,11 +21,6 @@ Estado:
   - Pregunta abierta: eso es policy deseada o sólo un default demasiado estricto para integraciones SDK?
   - Esta tarea es de diseño; no está tratada todavía como bug obligatorio.
 
-- [ ] SDK/SHM: alinear el reader de identity del SDK con la implementación central de `json_router::shm`.
-  - Hallazgo: el SDK mantiene una implementación separada en `crates/fluxbee_sdk/src/identity.rs`.
-  - Riesgo: diagnósticos, timeouts o semántica de lectura pueden divergir del sistema real.
-  - Objetivo: compartir código o al menos mantener paridad 1:1 en semántica y errores.
-
 - [ ] Publish por API: evaluar endpoint HTTP de upload/staging para que `fluxbee-publish` pueda ser reemplazable por llamada API completa.
   - No bloquea operación actual.
   - Queda como mejora de producto/herramientas.
@@ -73,6 +68,15 @@ Estado:
   - Los writers/headers de SHM del sistema viven en `src/shm/mod.rs`.
   - `rt-gateway`, `sy_identity` y `sy_config_routes` consumen esa capa central.
   - El SDK sólo duplica lectura de identity SHM en `crates/fluxbee_sdk/src/identity.rs`; ese es el punto pendiente de alineación.
+
+- [x] SDK/SHM: reader de identity alineado con la semántica central.
+  - Se mantuvo la implementación separada en `crates/fluxbee_sdk/src/identity.rs`, pero quedó alineada con `json_router::shm` en:
+    - validación de región antes de abrir el header
+    - auto-discovery de límites desde el header válido
+    - loop de lectura bajo seqlock
+    - timeout explícito `SeqLockTimeout`
+    - logging de diagnóstico con contadores equivalentes cuando vence la lectura
+  - Resultado: SDK y sistema ya no divergen en el comportamiento observable del reader de identity SHM, aunque el código todavía no esté extraído a una librería compartida.
 
 - [x] Identity: eliminar carrera entre `ILK_PROVISION_RESPONSE` y visibilidad del ILK en el SHM consumido por el router.
   - Hallazgo en prueba real: `IO.test` provisionaba un ILK temporal y enviaba el probe inmediatamente, pero el router todavía no lo veía en SHM y caía a OPA.
