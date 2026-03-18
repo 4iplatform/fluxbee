@@ -651,6 +651,34 @@ pub struct IdentityRegionReader {
     layout: IdentityRegionLayout,
 }
 
+trait SeqHeader {
+    fn seq(&mut self) -> &mut AtomicU64;
+}
+
+impl SeqHeader for ShmHeader {
+    fn seq(&mut self) -> &mut AtomicU64 {
+        &mut self.seq
+    }
+}
+
+impl SeqHeader for ConfigHeader {
+    fn seq(&mut self) -> &mut AtomicU64 {
+        &mut self.seq
+    }
+}
+
+impl SeqHeader for LsaHeader {
+    fn seq(&mut self) -> &mut AtomicU64 {
+        &mut self.seq
+    }
+}
+
+impl SeqHeader for IdentityHeader {
+    fn seq(&mut self) -> &mut AtomicU64 {
+        &mut self.seq
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct IdentityHeaderDebugState {
     pub seq: u64,
@@ -673,9 +701,10 @@ impl RouterRegionWriter {
     ) -> Result<Self, ShmError> {
         validate_name(name)?;
         let layout = layout_router();
-        let mmap = open_or_create_region(name, layout.total_len, |mmap| {
+        let mut mmap = open_or_create_region(name, layout.total_len, |mmap| {
             initialize_router_header(mmap, router_uuid, hive_id, router_name, is_gateway);
         })?;
+        normalize_seq_header::<ShmHeader>(&mut mmap, layout.header_offset, "router shm")?;
         Ok(Self {
             name: name.to_string(),
             mmap,
@@ -846,9 +875,10 @@ impl ConfigRegionWriter {
     pub fn open_or_create(name: &str, owner_uuid: Uuid, hive_id: &str) -> Result<Self, ShmError> {
         validate_name(name)?;
         let layout = layout_config();
-        let mmap = open_or_create_region(name, layout.total_len, |mmap| {
+        let mut mmap = open_or_create_region(name, layout.total_len, |mmap| {
             initialize_config_header(mmap, owner_uuid, hive_id);
         })?;
+        normalize_seq_header::<ConfigHeader>(&mut mmap, layout.header_offset, "config shm")?;
         Ok(Self {
             name: name.to_string(),
             mmap,
@@ -976,9 +1006,10 @@ impl LsaRegionWriter {
     pub fn open_or_create(name: &str, gateway_uuid: Uuid, hive_id: &str) -> Result<Self, ShmError> {
         validate_name(name)?;
         let layout = layout_lsa();
-        let mmap = open_or_create_region(name, layout.total_len, |mmap| {
+        let mut mmap = open_or_create_region(name, layout.total_len, |mmap| {
             initialize_lsa_header(mmap, gateway_uuid, hive_id);
         })?;
+        normalize_seq_header::<LsaHeader>(&mut mmap, layout.header_offset, "lsa shm")?;
         Ok(Self {
             name: name.to_string(),
             mmap,
@@ -1162,9 +1193,10 @@ impl IdentityRegionWriter {
     ) -> Result<Self, ShmError> {
         validate_name(name)?;
         let layout = layout_identity(limits);
-        let mmap = open_or_create_region(name, layout.total_len, |mmap| {
+        let mut mmap = open_or_create_region(name, layout.total_len, |mmap| {
             initialize_identity_header(mmap, owner_uuid, hive_id, is_primary, limits);
         })?;
+        normalize_seq_header::<IdentityHeader>(&mut mmap, layout.header_offset, "identity shm")?;
         Ok(Self {
             name: name.to_string(),
             mmap,
@@ -1812,6 +1844,26 @@ pub fn seqlock_begin_write(seq: &AtomicU64) {
 pub fn seqlock_end_write(seq: &AtomicU64) {
     atomic::fence(Ordering::Release);
     seq.fetch_add(1, Ordering::Relaxed);
+}
+
+fn normalize_seq_header<T: SeqHeader>(
+    mmap: &mut MmapMut,
+    offset: usize,
+    region_name: &str,
+) -> Result<(), ShmError> {
+    let header = header_mut::<T>(mmap, offset).ok_or(ShmError::InvalidHeader)?;
+    let seq = header.seq().load(Ordering::Acquire);
+    if seq & 1 != 0 {
+        let recovered_seq = seq.saturating_add(1);
+        header.seq().store(recovered_seq, Ordering::Release);
+        tracing::warn!(
+            region = region_name,
+            stale_seq = seq,
+            recovered_seq,
+            "recovered stale odd seqlock state on open"
+        );
+    }
+    Ok(())
 }
 
 pub fn copy_bytes_with_len(dst: &mut [u8], src: &str) -> usize {
