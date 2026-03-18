@@ -338,6 +338,9 @@ async fn process_one_inbound(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            if let Ok(wire) = serde_json::to_string(&msg) {
+                tracing::debug!(%trace_id, wire = %wire, "io-sim outbound wire message");
+            }
             sender.send(msg).await?;
             tracing::info!(%trace_id, dst, thread_id = %thread_id, "io-sim sent inbound message to router");
             match inbox
@@ -407,6 +410,9 @@ fn log_outbound_message(msg: &fluxbee_sdk::protocol::Message) {
         .get("original_dst")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    if let Ok(wire) = serde_json::to_string(msg) {
+        tracing::debug!(trace_id = %msg.routing.trace_id, wire = %wire, "io-sim inbound wire message");
+    }
 
     tracing::info!(
         trace_id = %msg.routing.trace_id,
