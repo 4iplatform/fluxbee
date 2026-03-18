@@ -1,15 +1,17 @@
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
-use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender, NodeUuidMode};
+use fluxbee_sdk::{connect, NodeConfig, NodeSender, NodeUuidMode};
 use futures_util::{SinkExt, StreamExt};
 use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
 use io_common::identity::{
-    DisabledIdentityResolver, IdentityResolver, MockIdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
+    IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
 };
 use io_common::io_context::{extract_slack_post_target, slack_inbound_io_context};
+use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox};
 use regex::Regex;
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,7 +39,6 @@ async fn main() -> Result<()> {
     tracing::info!(
         node_name = %config.node_name,
         router_socket = %config.router_socket.display(),
-        identity_mode = %config.identity_mode,
         dst_node = %config.dst_node.clone().unwrap_or_else(|| "resolve".to_string()),
         dev_mode = %config.dev_mode,
         "io-slack starting"
@@ -59,14 +60,18 @@ async fn main() -> Result<()> {
         "connected to router"
     );
 
-    let receiver = Arc::new(Mutex::new(receiver));
+    let inbox = Arc::new(Mutex::new(RouterInbox::new(receiver)));
     let slack = Arc::new(SlackClients::new(&config)?);
-    let identity: Arc<dyn IdentityResolver> = match config.identity_mode.as_str() {
-        "mock" => Arc::new(MockIdentityResolver::new()),
-        "shm" => Arc::new(ShmIdentityResolver::new(&config.island_id)),
-        "disabled" => Arc::new(DisabledIdentityResolver::new()),
-        other => anyhow::bail!("unsupported IDENTITY_MODE={other} (use shm|mock|disabled)"),
-    };
+    let identity: Arc<dyn IdentityResolver> = Arc::new(ShmIdentityResolver::new(&config.island_id));
+    let provisioner: Arc<dyn IdentityProvisioner> = Arc::new(FluxbeeIdentityProvisioner::new(
+        sender.clone(),
+        inbox.clone(),
+        IdentityProvisionConfig {
+            target: config.identity_target.clone(),
+            fallback_target: config.identity_fallback_target.clone(),
+            timeout: Duration::from_millis(config.identity_timeout_ms),
+        },
+    ));
     let inbound = Arc::new(Mutex::new(InboundProcessor::new(
         sender.uuid().to_string(),
         InboundConfig {
@@ -88,7 +93,7 @@ async fn main() -> Result<()> {
     };
 
     let outbound_task = tokio::spawn(run_outbound_loop(
-        receiver.clone(),
+        inbox.clone(),
         slack.clone(),
     ));
 
@@ -97,6 +102,7 @@ async fn main() -> Result<()> {
         sender,
         slack,
         identity,
+        provisioner,
         inbound,
         sessionizer,
     ));
@@ -109,7 +115,6 @@ async fn main() -> Result<()> {
 struct Config {
     slack_app_token: String,
     slack_bot_token: String,
-    identity_mode: String,
     node_name: String,
     island_id: String,
     node_version: String,
@@ -121,6 +126,9 @@ struct Config {
     dedup_ttl_ms: u64,
     dedup_max_entries: usize,
     dst_node: Option<String>,
+    identity_target: String,
+    identity_fallback_target: Option<String>,
+    identity_timeout_ms: u64,
     slack_session_window_ms: u64,
     slack_session_max_sessions: usize,
     slack_session_max_fragments: usize,
@@ -128,24 +136,95 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Self> {
-        let slack_app_token = env_req("SLACK_APP_TOKEN")?;
-        let slack_bot_token = env_req("SLACK_BOT_TOKEN")?;
+        let env_node_name = env("NODE_NAME").unwrap_or_else(|| "IO.slack.T123".to_string());
+        let env_island_id = env("ISLAND_ID").unwrap_or_else(|| "local".to_string());
+        let env_config_dir = PathBuf::from(
+            env("CONFIG_DIR").unwrap_or_else(|| "/etc/fluxbee".to_string()),
+        );
+        let spawn_cfg = load_spawn_config(
+            env("NODE_CONFIG_PATH").map(PathBuf::from),
+            &env_node_name,
+            &env_island_id,
+        );
+
+        if let Some(cfg) = &spawn_cfg {
+            tracing::info!(path = %cfg.path.display(), "io-slack loaded spawn config");
+        }
+
+        let slack_app_token = env("SLACK_APP_TOKEN")
+            .or_else(|| resolve_secret(
+                spawn_cfg.as_ref().map(|c| &c.doc),
+                &[
+                    "slack.app_token",
+                    "slack_app_token",
+                ],
+                &[
+                    "slack.app_token_ref",
+                    "slack_app_token_ref",
+                ],
+            ))
+            .ok_or_else(|| anyhow::anyhow!("missing Slack app token (set SLACK_APP_TOKEN or config slack.app_token / slack.app_token_ref=env:VAR)"))?;
+        let slack_bot_token = env("SLACK_BOT_TOKEN")
+            .or_else(|| resolve_secret(
+                spawn_cfg.as_ref().map(|c| &c.doc),
+                &[
+                    "slack.bot_token",
+                    "slack_bot_token",
+                ],
+                &[
+                    "slack.bot_token_ref",
+                    "slack_bot_token_ref",
+                ],
+            ))
+            .ok_or_else(|| anyhow::anyhow!("missing Slack bot token (set SLACK_BOT_TOKEN or config slack.bot_token / slack.bot_token_ref=env:VAR)"))?;
 
         Ok(Self {
             slack_app_token,
             slack_bot_token,
-            identity_mode: env("IDENTITY_MODE").unwrap_or_else(|| "mock".to_string()),
-            node_name: env("NODE_NAME").unwrap_or_else(|| "IO.slack.T123".to_string()),
-            island_id: env("ISLAND_ID").unwrap_or_else(|| "local".to_string()),
-            node_version: env("NODE_VERSION").unwrap_or_else(|| "0.1".to_string()),
+            node_name: env("NODE_NAME")
+                .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
+                    "node.name",
+                    "_system.node_name",
+                ]))
+                .unwrap_or_else(|| env_node_name.clone()),
+            island_id: env("ISLAND_ID")
+                .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
+                    "_system.hive_id",
+                    "node.island_id",
+                    "island_id",
+                ]))
+                .unwrap_or_else(|| env_island_id.clone()),
+            node_version: env("NODE_VERSION")
+                .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
+                    "_system.runtime_version",
+                    "runtime.version",
+                    "node.version",
+                ]))
+                .unwrap_or_else(|| "0.1".to_string()),
             router_socket: PathBuf::from(
-                env("ROUTER_SOCKET").unwrap_or_else(|| "/var/run/fluxbee/routers".to_string()),
+                env("ROUTER_SOCKET")
+                    .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
+                        "node.router_socket",
+                        "router_socket",
+                    ]))
+                    .unwrap_or_else(|| "/var/run/fluxbee/routers".to_string()),
             ),
             uuid_persistence_dir: PathBuf::from(
                 env("UUID_PERSISTENCE_DIR")
+                    .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
+                        "node.uuid_persistence_dir",
+                        "uuid_persistence_dir",
+                    ]))
                     .unwrap_or_else(|| "/var/lib/fluxbee/state/nodes".to_string()),
             ),
-            config_dir: PathBuf::from(env("CONFIG_DIR").unwrap_or_else(|| "/etc/fluxbee".to_string())),
+            config_dir: PathBuf::from(
+                env("CONFIG_DIR")
+                    .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
+                        "node.config_dir",
+                        "config_dir",
+                    ]))
+                    .unwrap_or_else(|| env_config_dir.display().to_string()),
+            ),
             dev_mode: env_bool("DEV_MODE").unwrap_or(false),
             ttl: env("TTL")
                 .and_then(|v| v.parse().ok())
@@ -156,7 +235,29 @@ impl Config {
             dedup_max_entries: env("DEDUP_MAX_ENTRIES")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50_000),
-            dst_node: env("IO_SLACK_DST_NODE"),
+            dst_node: env("IO_SLACK_DST_NODE")
+                .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
+                    "io.dst_node",
+                    "dst_node",
+                ])),
+            identity_target: env("IDENTITY_TARGET")
+                .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
+                    "identity.target",
+                    "identity_target",
+                ]))
+                .unwrap_or_else(|| "SY.identity".to_string()),
+            identity_fallback_target: env("IDENTITY_FALLBACK_TARGET")
+                .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
+                    "identity.fallback_target",
+                    "identity_fallback_target",
+                ])),
+            identity_timeout_ms: env("IDENTITY_TIMEOUT_MS")
+                .and_then(|v| v.parse().ok())
+                .or_else(|| json_get_u64_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
+                    "identity.timeout_ms",
+                    "identity_timeout_ms",
+                ]))
+                .unwrap_or(10_000),
             slack_session_window_ms: env("SLACK_SESSION_WINDOW_MS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
@@ -183,8 +284,105 @@ fn env_bool(key: &str) -> Option<bool> {
     }
 }
 
-fn env_req(key: &str) -> Result<String> {
-    env(key).ok_or_else(|| anyhow::anyhow!("missing env var {key}"))
+struct SpawnConfig {
+    path: PathBuf,
+    doc: Value,
+}
+
+fn load_spawn_config(
+    explicit_path: Option<PathBuf>,
+    node_name: &str,
+    island_id: &str,
+) -> Option<SpawnConfig> {
+    let mut candidates = Vec::new();
+    if let Some(path) = explicit_path {
+        candidates.push(path);
+    }
+
+    // Canonical node-spawn path:
+    // /var/lib/fluxbee/nodes/IO/<node_name>/config.json
+    // If node_name is not fully qualified, also try "<name>@<island_id>".
+    candidates.push(PathBuf::from(format!(
+        "/var/lib/fluxbee/nodes/IO/{node_name}/config.json"
+    )));
+    if !node_name.contains('@') && !island_id.is_empty() {
+        candidates.push(PathBuf::from(format!(
+            "/var/lib/fluxbee/nodes/IO/{}@{}/config.json",
+            node_name, island_id
+        )));
+    }
+
+    for path in candidates {
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+                Ok(doc) => return Some(SpawnConfig { path, doc }),
+                Err(err) => tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to parse spawn config JSON; ignoring file"
+                ),
+            },
+            Err(err) => tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to read spawn config file; ignoring file"
+            ),
+        }
+    }
+    None
+}
+
+fn json_get_string_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<String> {
+    let doc = doc?;
+    for path in dotted_paths {
+        if let Some(v) = json_get_path(doc, path) {
+            if let Some(s) = v.as_str() {
+                if !s.trim().is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn json_get_u64_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<u64> {
+    let doc = doc?;
+    for path in dotted_paths {
+        if let Some(v) = json_get_path(doc, path) {
+            if let Some(n) = v.as_u64() {
+                return Some(n);
+            }
+            if let Some(s) = v.as_str() {
+                if let Ok(n) = s.parse::<u64>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_secret(doc: Option<&Value>, value_paths: &[&str], ref_paths: &[&str]) -> Option<String> {
+    if let Some(value) = json_get_string_opt(doc, value_paths) {
+        return Some(value);
+    }
+    let reference = json_get_string_opt(doc, ref_paths)?;
+    if let Some(var) = reference.strip_prefix("env:") {
+        return env(var);
+    }
+    None
+}
+
+fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
+    let mut cur = root;
+    for part in dotted_path.split('.') {
+        cur = cur.get(part)?;
+    }
+    Some(cur)
 }
 
 #[derive(Clone)]
@@ -287,6 +485,7 @@ async fn run_inbound_socket_mode(
     sender: NodeSender,
     slack: Arc<SlackClients>,
     identity: Arc<dyn IdentityResolver>,
+    provisioner: Arc<dyn IdentityProvisioner>,
     inbound: Arc<Mutex<InboundProcessor>>,
     sessionizer: Option<Arc<SlackSessionizer>>,
 ) -> Result<()> {
@@ -412,6 +611,7 @@ async fn run_inbound_socket_mode(
                     .handle_event(
                         sender.clone(),
                         identity.clone(),
+                        provisioner.clone(),
                         inbound.clone(),
                         &team_id,
                         &user,
@@ -444,7 +644,7 @@ async fn run_inbound_socket_mode(
                 .await
                 .process_inbound(
                     identity.as_ref(),
-                    None,
+                    Some(provisioner.as_ref()),
                     ResolveOrCreateInput {
                         channel: "slack".to_string(),
                         external_id: user.to_string(),
@@ -518,6 +718,7 @@ impl SlackSessionizer {
         self: &Arc<Self>,
         sender: NodeSender,
         identity: Arc<dyn IdentityResolver>,
+        provisioner: Arc<dyn IdentityProvisioner>,
         inbound: Arc<Mutex<InboundProcessor>>,
         team_id: &str,
         user: &str,
@@ -539,6 +740,7 @@ impl SlackSessionizer {
                 self.send_one(
                     sender,
                     identity,
+                    provisioner,
                     inbound,
                     team_id,
                     user,
@@ -594,6 +796,7 @@ impl SlackSessionizer {
                 version,
                 sender,
                 identity,
+                provisioner,
                 inbound,
             ));
         }
@@ -605,6 +808,7 @@ impl SlackSessionizer {
         mut version: u64,
         sender: NodeSender,
         identity: Arc<dyn IdentityResolver>,
+        provisioner: Arc<dyn IdentityProvisioner>,
         inbound: Arc<Mutex<InboundProcessor>>,
     ) {
         loop {
@@ -646,7 +850,13 @@ impl SlackSessionizer {
             let outcome = inbound
                 .lock()
                 .await
-                .process_inbound(identity.as_ref(), None, state.identity_input, state.io_ctx, payload)
+                .process_inbound(
+                    identity.as_ref(),
+                    Some(provisioner.as_ref()),
+                    state.identity_input,
+                    state.io_ctx,
+                    payload,
+                )
                 .await;
 
             match outcome {
@@ -676,6 +886,7 @@ impl SlackSessionizer {
         &self,
         sender: NodeSender,
         identity: Arc<dyn IdentityResolver>,
+        provisioner: Arc<dyn IdentityProvisioner>,
         inbound: Arc<Mutex<InboundProcessor>>,
         team_id: &str,
         user: &str,
@@ -697,7 +908,7 @@ impl SlackSessionizer {
             .await
             .process_inbound(
                 identity.as_ref(),
-                None,
+                Some(provisioner.as_ref()),
                 ResolveOrCreateInput {
                     channel: "slack".to_string(),
                     external_id: user.to_string(),
@@ -726,11 +937,13 @@ impl SlackSessionizer {
     }
 }
 
-async fn run_outbound_loop(receiver: Arc<Mutex<NodeReceiver>>, slack: Arc<SlackClients>) -> Result<()> {
+async fn run_outbound_loop(inbox: Arc<Mutex<RouterInbox>>, slack: Arc<SlackClients>) -> Result<()> {
     loop {
-        let msg = {
-            let mut guard = receiver.lock().await;
-            guard.recv().await?
+        let Some(msg) = ({
+            let mut guard = inbox.lock().await;
+            guard.recv_next_timeout(Duration::from_secs(1)).await?
+        }) else {
+            continue;
         };
 
         tracing::debug!(
