@@ -785,6 +785,18 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "list_runtimes",
+        route: InternalActionRoute::Query("list_runtimes"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "get_runtime",
+        route: InternalActionRoute::Query("get_runtime"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "list_routes",
         route: InternalActionRoute::Query("list_routes"),
         requires_target: true,
@@ -1879,6 +1891,20 @@ async fn handle_hive_paths(
                 handle_admin_query(ctx, client, "get_versions", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("GET", ["runtimes"]) => {
+            let (status, resp) =
+                handle_admin_query(ctx, client, "list_runtimes", Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["runtimes", runtime]) => {
+            let payload = serde_json::json!({
+                "runtime": decode_percent(runtime),
+            });
+            let (status, resp) =
+                handle_admin_query_with_payload(ctx, client, "get_runtime", payload, Some(hive))
+                    .await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["deployments"]) => {
             let payload = deployments_payload_from_query(query);
             let (status, resp) =
@@ -2775,6 +2801,19 @@ async fn handle_admin_query(
     Ok(build_admin_http_response(action, response))
 }
 
+async fn handle_admin_query_with_payload(
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+    action: &str,
+    payload: serde_json::Value,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    let payload = normalize_admin_payload(action, payload, hive.as_deref());
+    let request = build_admin_request(ctx, action, payload, hive);
+    let response = send_admin_request(client, request, admin_action_timeout(action)).await;
+    Ok(build_admin_http_response(action, response))
+}
+
 fn build_admin_actions_catalog_response() -> (u16, String) {
     let actions: Vec<serde_json::Value> = INTERNAL_ACTION_REGISTRY
         .iter()
@@ -3174,6 +3213,7 @@ fn build_admin_request(
             | "delete_vpn" => "SY.config.routes",
             "list_nodes" | "run_node" | "kill_node" | "hive_status" | "get_storage"
             | "set_storage" | "list_hives" | "get_hive" | "list_versions" | "get_versions"
+            | "list_runtimes" | "get_runtime"
             | "list_deployments" | "get_deployments" | "list_drift_alerts" | "get_drift_alerts"
             | "get_node_config" | "set_node_config" | "get_node_state" | "get_node_status"
             | "remove_hive" | "add_hive" => "SY.orchestrator",
@@ -3420,6 +3460,8 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "get_hive"
             | "list_versions"
             | "get_versions"
+            | "list_runtimes"
+            | "get_runtime"
             | "list_deployments"
             | "get_deployments"
             | "list_drift_alerts"

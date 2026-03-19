@@ -1052,6 +1052,8 @@ async fn handle_admin(
         "list_nodes" => list_nodes_flow(state, &msg.payload),
         "list_versions" => list_versions_flow(state).await,
         "get_versions" => get_versions_flow(state, &msg.payload).await,
+        "list_runtimes" => list_runtimes_flow(state, &msg.payload).await,
+        "get_runtime" => get_runtime_flow(state, &msg.payload).await,
         "list_deployments" => list_deployments_flow(&msg.payload),
         "get_deployments" => get_deployments_flow(state, &msg.payload),
         "list_drift_alerts" => list_drift_alerts_flow(&msg.payload),
@@ -1388,6 +1390,14 @@ async fn handle_system_message(
         Some("GET_VERSIONS") => {
             let result = get_versions_flow(state, &msg.payload).await;
             let _ = send_system_action_response(sender, msg, "GET_VERSIONS_RESPONSE", result).await;
+        }
+        Some("GET_RUNTIMES") => {
+            let result = list_runtimes_flow(state, &msg.payload).await;
+            let _ = send_system_action_response(sender, msg, "GET_RUNTIMES_RESPONSE", result).await;
+        }
+        Some("GET_RUNTIME") => {
+            let result = get_runtime_flow(state, &msg.payload).await;
+            let _ = send_system_action_response(sender, msg, "GET_RUNTIME_RESPONSE", result).await;
         }
         Some("INVENTORY_REQUEST") => {
             let result = inventory_flow(state, &msg.payload);
@@ -4335,6 +4345,106 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
     })
 }
 
+fn runtime_api_entry(
+    runtime: &str,
+    entry: &RuntimeManifestEntry,
+    runtime_entries: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "runtime": runtime,
+        "current": entry.current,
+        "available": entry.available,
+        "type": runtime_package_type(entry),
+        "runtime_base": entry.runtime_base,
+        "readiness": runtime_readiness_for_entry(runtime, entry, runtime_entries),
+    })
+}
+
+fn local_runtimes_snapshot(state: &OrchestratorState) -> serde_json::Value {
+    match load_runtime_manifest_result() {
+        Ok(Some(manifest)) => {
+            let manifest_hash = local_runtime_manifest_hash().ok().flatten();
+            let runtime_entries_snapshot = manifest.runtimes.as_object().cloned();
+            let runtime_map = match runtime_manifest_entry_map(&manifest) {
+                Ok(map) => map,
+                Err(err) => {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "MANIFEST_INVALID",
+                        "message": err.to_string(),
+                    });
+                }
+            };
+            let runtimes = runtime_map
+                .iter()
+                .map(|(runtime, entry)| {
+                    runtime_api_entry(runtime, entry, runtime_entries_snapshot.as_ref())
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "status": "ok",
+                "hive_id": state.hive_id,
+                "manifest_version": manifest.version,
+                "manifest_hash": manifest_hash,
+                "runtimes": runtimes,
+            })
+        }
+        Ok(None) => serde_json::json!({
+            "status": "error",
+            "error_code": "RUNTIME_MANIFEST_MISSING",
+            "message": "runtime manifest not found",
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "MANIFEST_INVALID",
+            "message": err.to_string(),
+        }),
+    }
+}
+
+fn local_runtime_snapshot(state: &OrchestratorState, runtime: &str) -> serde_json::Value {
+    match load_runtime_manifest_result() {
+        Ok(Some(manifest)) => {
+            let manifest_hash = local_runtime_manifest_hash().ok().flatten();
+            let runtime_entries_snapshot = manifest.runtimes.as_object().cloned();
+            let runtime_map = match runtime_manifest_entry_map(&manifest) {
+                Ok(map) => map,
+                Err(err) => {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "MANIFEST_INVALID",
+                        "message": err.to_string(),
+                    });
+                }
+            };
+            let Some(entry) = runtime_map.get(runtime) else {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "RUNTIME_NOT_FOUND",
+                    "message": format!("runtime '{}' not found", runtime),
+                });
+            };
+            serde_json::json!({
+                "status": "ok",
+                "hive_id": state.hive_id,
+                "manifest_version": manifest.version,
+                "manifest_hash": manifest_hash,
+                "runtime": runtime_api_entry(runtime, entry, runtime_entries_snapshot.as_ref()),
+            })
+        }
+        Ok(None) => serde_json::json!({
+            "status": "error",
+            "error_code": "RUNTIME_MANIFEST_MISSING",
+            "message": "runtime manifest not found",
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "MANIFEST_INVALID",
+            "message": err.to_string(),
+        }),
+    }
+}
+
 async fn get_versions_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
@@ -4413,6 +4523,88 @@ async fn list_versions_flow(state: &OrchestratorState) -> serde_json::Value {
         "status": "ok",
         "hives": hives,
     })
+}
+
+async fn list_runtimes_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let target_hive = target_hive_from_payload(payload, &state.hive_id);
+    if target_hive == state.hive_id {
+        return local_runtimes_snapshot(state);
+    }
+
+    match forward_system_action_to_hive(
+        state,
+        &target_hive,
+        "GET_RUNTIMES",
+        "GET_RUNTIMES_RESPONSE",
+        serde_json::json!({
+            "target": target_hive,
+        }),
+    )
+    .await
+    {
+        Ok(payload) => payload,
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "RUNTIMES_FAILED",
+            "message": err.to_string(),
+            "target": target_hive,
+        }),
+    }
+}
+
+async fn get_runtime_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let target_hive = target_hive_from_payload(payload, &state.hive_id);
+    let runtime = payload
+        .get("runtime")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if runtime.is_empty() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "missing runtime",
+        });
+    }
+    if !valid_token(runtime) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "invalid runtime",
+        });
+    }
+
+    if target_hive == state.hive_id {
+        return local_runtime_snapshot(state, runtime);
+    }
+
+    match forward_system_action_to_hive(
+        state,
+        &target_hive,
+        "GET_RUNTIME",
+        "GET_RUNTIME_RESPONSE",
+        serde_json::json!({
+            "target": target_hive,
+            "runtime": runtime,
+        }),
+    )
+    .await
+    {
+        Ok(payload) => payload,
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "RUNTIME_GET_FAILED",
+            "message": err.to_string(),
+            "target": target_hive,
+            "runtime": runtime,
+        }),
+    }
 }
 
 fn deployment_history_path() -> PathBuf {
