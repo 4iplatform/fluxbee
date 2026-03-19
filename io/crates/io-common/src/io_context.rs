@@ -92,8 +92,12 @@ pub fn slack_inbound_io_context(
     thread_ts: Option<&str>,
     message_id: &str,
 ) -> IoContext {
-    let thread_id = thread_ts.map(|s| s.to_string());
-    let params = match &thread_id {
+    // AI nodes require a logical thread_id for user messages.
+    // For Slack root-channel messages (no thread_ts), use channel_id as fallback thread_id.
+    let thread_id = thread_ts
+        .map(|s| s.to_string())
+        .or_else(|| Some(channel_id.to_string()));
+    let params = match thread_ts {
         Some(t) => serde_json::json!({ "thread_ts": t, "workspace_id": team_id }),
         None => serde_json::json!({ "workspace_id": team_id }),
     };
@@ -155,6 +159,19 @@ mod tests {
                 thread_ts: None,
                 workspace_id: Some("T123".to_string()),
             }
+        );
+    }
+
+    #[test]
+    fn slack_thread_id_falls_back_to_channel_id_when_thread_ts_missing() {
+        let io = slack_inbound_io_context("T123", "U456", "C789", None, "EvABC");
+        assert_eq!(io.conversation.thread_id.as_deref(), Some("C789"));
+        assert_eq!(
+            io.reply_target
+                .params
+                .get("thread_ts")
+                .and_then(|v| v.as_str()),
+            None
         );
     }
 }

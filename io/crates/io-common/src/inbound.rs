@@ -292,6 +292,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwards_channel_id_as_thread_id_when_slack_thread_is_missing() {
+        let mut p = InboundProcessor::new("node", InboundConfig::default());
+        let id = MockIdentityResolver::new();
+        let io = slack_inbound_io_context("T", "U", "C123", None, "Ev1");
+        let input = ResolveOrCreateInput {
+            channel: "slack".to_string(),
+            external_id: "T:U".to_string(),
+            tenant_hint: None,
+            attributes: serde_json::json!({}),
+        };
+        let payload = serde_json::json!({ "type": "text", "content": "hi" });
+
+        let o = p.process_inbound(&id, None, input, io, payload).await;
+        let InboundOutcome::SendNow(msg) = o else {
+            panic!("unexpected outcome: {o:?}");
+        };
+        let thread_id = msg
+            .meta
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("thread_id"))
+            .and_then(|v| v.as_str());
+        assert_eq!(thread_id, Some("C123"));
+    }
+
+    #[tokio::test]
     async fn preserves_io_reply_target_in_meta_context() {
         let mut p = InboundProcessor::new("node", InboundConfig::default());
         let id = MockIdentityResolver::new();
