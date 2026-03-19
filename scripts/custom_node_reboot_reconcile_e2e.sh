@@ -152,6 +152,22 @@ read_hive_id_from_config() {
   awk -F': *' '/^hive_id:/ {print $2; exit}' "$LOCAL_HIVE_YAML" | tr -d '"'
 }
 
+read_frontdesk_from_config() {
+  if [[ ! -f "$LOCAL_HIVE_YAML" ]]; then
+    return 0
+  fi
+  awk '
+    /^government:/ {in_gov=1; next}
+    in_gov && /^[^[:space:]]/ {in_gov=0}
+    in_gov && /^[[:space:]]+identity_frontdesk:/ {
+      sub(/^[^:]+:[[:space:]]*/, "", $0)
+      gsub(/"/, "", $0)
+      print $0
+      exit
+    }
+  ' "$LOCAL_HIVE_YAML"
+}
+
 node_local_name() {
   local raw="$1"
   echo "${raw%@*}"
@@ -590,7 +606,11 @@ if [[ "$HIVE_ID" != "$LOCAL_HIVE_ID" || "$MOTHER_HIVE_ID" != "$LOCAL_HIVE_ID" ]]
   exit 1
 fi
 
-FRONTDESK_NODE_NAME="${FRONTDESK_NODE_NAME:-AI.test.gov@$HIVE_ID}"
+CONFIGURED_FRONTDESK_NODE_NAME="${CONFIGURED_FRONTDESK_NODE_NAME:-}"
+if [[ -z "$CONFIGURED_FRONTDESK_NODE_NAME" ]]; then
+  CONFIGURED_FRONTDESK_NODE_NAME="$(read_frontdesk_from_config)"
+fi
+FRONTDESK_NODE_NAME="${FRONTDESK_NODE_NAME:-${CONFIGURED_FRONTDESK_NODE_NAME:-AI.test.gov@$HIVE_ID}}"
 FRONTDESK_NODE_NAME="$(normalize_node_name "$FRONTDESK_NODE_NAME" "$HIVE_ID")"
 FRONTDESK_NODE_LOCAL="$(node_local_name "$FRONTDESK_NODE_NAME")"
 FRONTDESK_NODE_HIVE="$(node_hive_name "$FRONTDESK_NODE_NAME")"
