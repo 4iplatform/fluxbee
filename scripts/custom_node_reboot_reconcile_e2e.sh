@@ -347,7 +347,7 @@ run_io_probe_until_success() {
   local attempt=0
   while (( $(date +%s) <= deadline )); do
     attempt=$((attempt + 1))
-    rm -f "$IO_STATUS_FILE" "$IO_LOG_FILE"
+    as_root_local rm -f "$IO_STATUS_FILE" "$IO_LOG_FILE"
     kill_node "$IO_NODE_NAME"
     remove_node_instance "$IO_NODE_NAME"
 
@@ -364,6 +364,8 @@ run_io_probe_until_success() {
     if wait_io_result && assert_io_log "$FRONTDESK_NODE_NAME"; then
       return 0
     fi
+
+    echo "WARN: IO.test probe attempt $attempt failed after orchestrator restart; retrying" >&2
 
     sleep 2
   done
