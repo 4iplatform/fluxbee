@@ -129,6 +129,7 @@ impl FluxbeeIdentityProvisioner {
             meta: Meta {
                 msg_type: SYSTEM_KIND.to_string(),
                 msg: Some(MSG_ILK_PROVISION.to_string()),
+                src_ilk: None,
                 scope: None,
                 target: None,
                 action: None,
