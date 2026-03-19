@@ -1009,6 +1009,7 @@ ssh -i /var/lib/fluxbee/ssh/motherbee.key administrator@192.168.1.50
 | `GET /hives/{id}/nodes` | `list_nodes` | Lista nodos de hive |
 | `POST /hives/{id}/nodes` | `run_node` | Envía `SPAWN_NODE` (contrato v2: `node_name`, `runtime`, `runtime_version`) |
 | `DELETE /hives/{id}/nodes/{name}` | `kill_node` | Envía `KILL_NODE` (soporta `force=true/false`) |
+| `DELETE /hives/{id}/nodes/{name}/instance` | `remove_node_instance` | Borra la instancia persistida del nodo; falla si sigue corriendo/visible |
 | `GET /hives/{id}/nodes/{name}/status` | `get_node_status` | Snapshot canónico de estado de nodo (`lifecycle`, `health`, `source`, `status_version`) |
 | `GET /hives/{id}/nodes/{name}/config` | `get_node_config` | Lee `config.json` efectivo del nodo |
 | `PUT /hives/{id}/nodes/{name}/config` | `set_node_config` | Merge/patch de config per-node + señal de hot-reload |

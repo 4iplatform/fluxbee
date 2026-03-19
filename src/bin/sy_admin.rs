@@ -881,6 +881,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "remove_node_instance",
+        route: InternalActionRoute::Command("remove_node_instance"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "get_node_config",
         route: InternalActionRoute::Command("get_node_config"),
         requires_target: true,
@@ -1831,6 +1837,25 @@ async fn handle_hive_paths(
                 handle_admin_command(ctx, client, "kill_node", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("DELETE", ["nodes", name, "instance"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if payload.get("node_name").is_none() {
+                payload["node_name"] = serde_json::Value::String(decode_percent(name));
+            }
+            let (status, resp) = handle_admin_command(
+                ctx,
+                client,
+                "remove_node_instance",
+                payload,
+                Some(hive),
+            )
+            .await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["nodes", name, "config"]) => {
             let payload = serde_json::json!({
                 "node_name": decode_percent(name),
@@ -2327,6 +2352,7 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
     match code.as_str() {
         "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID" => 400,
         "NOT_FOUND"
+        | "NODE_NOT_FOUND"
         | "RUNTIME_NOT_AVAILABLE"
         | "RUNTIME_NOT_FOUND"
         | "RUNTIME_VERSION_NOT_FOUND" => 404,
@@ -2334,6 +2360,7 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "MODULE_EXISTS"
         | "VERSION_MISMATCH"
         | "WAN_NOT_AUTHORIZED"
+        | "NODE_INSTANCE_RUNNING"
         | "RUNTIME_IN_USE"
         | "RUNTIME_HAS_DEPENDENTS"
         | "RUNTIME_CURRENT_CONFLICT"
@@ -3420,6 +3447,7 @@ fn admin_action_timeout(action: &str) -> Duration {
         // other orchestrator mutating actions can also take longer than default.
         "run_node"
         | "kill_node"
+        | "remove_node_instance"
         | "remove_hive"
         | "set_node_config"
         | "get_node_config"
@@ -3499,6 +3527,7 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
         "list_nodes"
             | "run_node"
             | "kill_node"
+            | "remove_node_instance"
             | "hive_status"
             | "get_storage"
             | "set_storage"
@@ -3588,6 +3617,7 @@ fn is_node_scoped_action(action: &str) -> bool {
         action,
         "run_node"
             | "kill_node"
+            | "remove_node_instance"
             | "get_node_config"
             | "set_node_config"
             | "get_node_state"
@@ -3607,6 +3637,7 @@ fn admin_payload_contract_error(action: &str, payload: &serde_json::Value) -> Op
             }
         }
         "kill_node" => payload.get("name").map(|_| ("name", "node_name")),
+        "remove_node_instance" => payload.get("name").map(|_| ("name", "node_name")),
         _ => None,
     };
     legacy.map(|(field, canonical)| {

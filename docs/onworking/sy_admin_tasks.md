@@ -243,10 +243,12 @@ Revisión 2026-03-19:
   - Lista lo que existe en `/var/lib/fluxbee/nodes/.../config.json`, aun si el proceso no está conectado.
   - Remoto: forward al orchestrator del hive target.
 
-- [ ] Separar lifecycle de instancia: `stop/kill` vs `remove`.
-  - `kill_node` hoy es stop del proceso/unit.
-  - falta operación canónica para borrar la instancia persistida (`config.json`, estado asociado, metadata) y liberar el `node_name`
-  - definir si `DELETE /hives/{hive}/nodes/{name}` debe pasar a significar `remove instance`, o si hace falta endpoint nuevo para no romper contrato existente
+- [x] Separar lifecycle de instancia: `stop/kill` vs `remove`.
+  - `kill_node` sigue siendo stop del proceso/unit.
+  - operación canónica nueva para borrar la instancia persistida: `DELETE /hives/{hive}/nodes/{name}/instance`
+  - borra `config.json`, `state.json`, `status_version`, `status_fingerprint` y el directorio de instancia
+  - libera el `node_name`
+  - rechaza si la instancia sigue `RUNNING`/visible (`NODE_INSTANCE_RUNNING`)
 
 - [ ] Cerrar el contrato de persistencia post-reboot para workloads `CUSTOM`.
   - estado actual: config persistida + unit transitorio

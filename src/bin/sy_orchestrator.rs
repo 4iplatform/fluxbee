@@ -1058,6 +1058,7 @@ async fn handle_admin(
         "list_runtimes" => list_runtimes_flow(state, &msg.payload).await,
         "get_runtime" => get_runtime_flow(state, &msg.payload).await,
         "remove_runtime_version" => remove_runtime_version_flow(state, &msg.payload).await,
+        "remove_node_instance" => remove_node_instance_flow(state, &msg.payload).await,
         "list_deployments" => list_deployments_flow(&msg.payload),
         "get_deployments" => get_deployments_flow(state, &msg.payload),
         "list_drift_alerts" => list_drift_alerts_flow(&msg.payload),
@@ -1212,6 +1213,7 @@ async fn handle_system_message(
             | "SYSTEM_SYNC_HINT"
             | "SPAWN_NODE"
             | "KILL_NODE"
+            | "REMOVE_NODE_INSTANCE"
             | "NODE_CONFIG_SET"
             | "NODE_CONFIG_GET"
             | "NODE_STATE_GET"
@@ -1267,6 +1269,15 @@ async fn handle_system_message(
                 "KILL_NODE" => {
                     let _ = send_system_action_response(sender, msg, "KILL_NODE_RESPONSE", payload)
                         .await;
+                }
+                "REMOVE_NODE_INSTANCE" => {
+                    let _ = send_system_action_response(
+                        sender,
+                        msg,
+                        "REMOVE_NODE_INSTANCE_RESPONSE",
+                        payload,
+                    )
+                    .await;
                 }
                 "NODE_CONFIG_SET" => {
                     let _ = send_system_action_response(
@@ -1366,6 +1377,17 @@ async fn handle_system_message(
             let result = kill_node_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "KILL_NODE processed");
             let _ = send_system_action_response(sender, msg, "KILL_NODE_RESPONSE", result).await;
+        }
+        Some("REMOVE_NODE_INSTANCE") => {
+            let result = remove_node_instance_flow(state, &msg.payload).await;
+            tracing::info!(result = %result, "REMOVE_NODE_INSTANCE processed");
+            let _ = send_system_action_response(
+                sender,
+                msg,
+                "REMOVE_NODE_INSTANCE_RESPONSE",
+                result,
+            )
+            .await;
         }
         Some("NODE_CONFIG_SET") => {
             let result = set_node_config_flow(sender, state, &msg.payload).await;
@@ -9735,6 +9757,180 @@ async fn kill_node_flow(
     }
 }
 
+fn remove_node_instance_dir_with_root(
+    node_name: &str,
+    root: &Path,
+) -> Result<(PathBuf, bool), OrchestratorError> {
+    let local = node_name
+        .split_once('@')
+        .map(|(local, _)| local)
+        .unwrap_or(node_name);
+    let node_kind = local
+        .split('.')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("invalid node_name '{}': missing kind prefix", node_name))?;
+    let kind_dir = root.join(node_kind);
+    let node_dir = kind_dir.join(node_name);
+    if !node_dir.exists() {
+        return Err("NODE_NOT_FOUND".into());
+    }
+    fs::remove_dir_all(&node_dir)?;
+    let mut removed_kind_dir = false;
+    if kind_dir.is_dir() && kind_dir.read_dir()?.next().is_none() {
+        fs::remove_dir(&kind_dir)?;
+        removed_kind_dir = true;
+    }
+    Ok((node_dir, removed_kind_dir))
+}
+
+async fn remove_node_instance_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    if payload.get("name").is_some() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "legacy field 'name' is not supported; use 'node_name'",
+        });
+    }
+
+    let node_name = payload
+        .get("node_name")
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default();
+    if node_name.is_empty() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "missing node_name",
+        });
+    }
+
+    let mut target_hive = target_hive_from_payload(payload, &state.hive_id);
+    if target_hive == state.hive_id {
+        if let Some((_, hive)) = node_name.split_once('@') {
+            if !hive.trim().is_empty() {
+                target_hive = hive.trim().to_string();
+            }
+        }
+    }
+
+    let node_name = match normalize_node_name_for_target(&node_name, &target_hive) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+            });
+        }
+    };
+
+    if target_hive != state.hive_id {
+        return match forward_system_action_to_hive(
+            state,
+            &target_hive,
+            "REMOVE_NODE_INSTANCE",
+            "REMOVE_NODE_INSTANCE_RESPONSE",
+            serde_json::json!({
+                "target": target_hive,
+                "node_name": node_name,
+            }),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_INSTANCE_REMOVE_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+            }),
+        };
+    }
+
+    let instance_dir = match node_instance_dir(&node_name) {
+        Ok(path) => path,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+            });
+        }
+    };
+    if !instance_dir.exists() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "NODE_NOT_FOUND",
+            "message": format!("node '{}' not found", node_name),
+            "target": target_hive,
+            "node_name": node_name,
+        });
+    }
+
+    let unit = unit_from_node_name(&node_name);
+    let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
+    let inventory_visible = local_inventory_has_node(state, &node_name);
+    if unit_active || inventory_visible {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "NODE_INSTANCE_RUNNING",
+            "message": "node instance is still running/visible; stop it before removing",
+            "target": target_hive,
+            "node_name": node_name,
+            "unit": unit,
+            "visible_in_router": inventory_visible,
+        });
+    }
+
+    let cleanup_cmd = format!("systemctl stop {unit} || true; systemctl reset-failed {unit} || true");
+    if let Err(err) = execute_on_hive(state, &target_hive, &cleanup_cmd, "remove_node_instance") {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "NODE_INSTANCE_REMOVE_FAILED",
+            "message": err.to_string(),
+            "target": target_hive,
+            "node_name": node_name,
+            "unit": unit,
+        });
+    }
+
+    match remove_node_instance_dir_with_root(&node_name, &node_files_root()) {
+        Ok((removed_path, removed_kind_dir)) => serde_json::json!({
+            "status": "ok",
+            "target": target_hive,
+            "hive": target_hive,
+            "node_name": node_name,
+            "unit": unit,
+            "removed_path": removed_path.display().to_string(),
+            "removed_kind_dir": removed_kind_dir,
+        }),
+        Err(err) => {
+            let error_code = if err.to_string() == "NODE_NOT_FOUND" {
+                "NODE_NOT_FOUND"
+            } else {
+                "NODE_INSTANCE_REMOVE_FAILED"
+            };
+            serde_json::json!({
+                "status": "error",
+                "error_code": error_code,
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+                "unit": unit,
+            })
+        }
+    }
+}
+
 fn execute_on_hive(
     state: &OrchestratorState,
     target_hive: &str,
@@ -13247,6 +13443,52 @@ blob:
         assert_eq!(inventory[0]["lifecycle_state"], "STOPPED");
         assert_eq!(inventory[0]["runtime"]["name"], "ai.persisted.test");
         assert_eq!(inventory[0]["runtime"]["version"], "1.0.0-diag");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_node_instance_dir_with_root_removes_instance_and_empty_kind_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "fluxbee-remove-node-instance-{}",
+            Uuid::new_v4().simple()
+        ));
+        let node_dir = root.join("AI").join("AI.remove.test@motherbee");
+        std::fs::create_dir_all(&node_dir).expect("create node dir");
+        std::fs::write(node_dir.join("config.json"), "{}").expect("write config");
+
+        let (removed_path, removed_kind_dir) =
+            remove_node_instance_dir_with_root("AI.remove.test@motherbee", &root)
+                .expect("remove instance");
+        assert_eq!(removed_path, node_dir);
+        assert!(removed_kind_dir);
+        assert!(!removed_path.exists());
+        assert!(!root.join("AI").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_node_instance_dir_with_root_preserves_non_empty_kind_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "fluxbee-remove-node-instance-{}",
+            Uuid::new_v4().simple()
+        ));
+        let first_node_dir = root.join("AI").join("AI.remove.first@motherbee");
+        let second_node_dir = root.join("AI").join("AI.remove.second@motherbee");
+        std::fs::create_dir_all(&first_node_dir).expect("create first node dir");
+        std::fs::create_dir_all(&second_node_dir).expect("create second node dir");
+        std::fs::write(first_node_dir.join("config.json"), "{}").expect("write config 1");
+        std::fs::write(second_node_dir.join("config.json"), "{}").expect("write config 2");
+
+        let (removed_path, removed_kind_dir) =
+            remove_node_instance_dir_with_root("AI.remove.first@motherbee", &root)
+                .expect("remove instance");
+        assert_eq!(removed_path, first_node_dir);
+        assert!(!removed_kind_dir);
+        assert!(!removed_path.exists());
+        assert!(root.join("AI").exists());
+        assert!(second_node_dir.exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
