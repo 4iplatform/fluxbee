@@ -169,13 +169,13 @@ Checklist de implementación propuesto:
 - [x] definir cómo se resuelve `RUNTIME_HAS_DEPENDENTS`
   - fuente: manifest/runtime catalog
   - criterio: runtimes publicados con `runtime_base=<runtime>`
-- [ ] agregar E2E de paridad HTTP/socket para remove runtime version
+- [x] agregar E2E de paridad HTTP/socket para remove runtime version
 - [x] agregar E2E negativos básicos:
   - borrar runtime en uso
   - borrar base runtime con dependientes
   - borrar versión inexistente
   - borrar `current`
-- [ ] agregar E2E negativo de concurrencia:
+- [x] agregar E2E negativo de concurrencia:
   - borrar mientras hay operación concurrente activa
 
 Estado actual de implementación:
@@ -190,8 +190,8 @@ Estado actual de implementación:
   - muta manifest + `dist` con lock de lifecycle y rollback local básico si falla la escritura del manifest
 - Script E2E/negativos agregado:
   - `scripts/admin_runtime_delete_e2e.sh`
-  - cubre `ok`, `RUNTIME_CURRENT_CONFLICT`, `RUNTIME_VERSION_NOT_FOUND`, `RUNTIME_IN_USE`, `RUNTIME_HAS_DEPENDENTS`
-  - pendiente aparte: caso determinista de `BUSY`
+  - cubre `ok`, `RUNTIME_CURRENT_CONFLICT`, `RUNTIME_VERSION_NOT_FOUND`, `RUNTIME_IN_USE`, `RUNTIME_HAS_DEPENDENTS`, `BUSY`
+  - incluye paridad HTTP/socket para `remove_runtime_version`
 
 ## Matriz operativa - CORE/CUSTOM x singleton/instanciado
 

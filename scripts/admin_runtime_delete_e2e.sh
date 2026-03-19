@@ -3,9 +3,10 @@ set -euo pipefail
 
 # Runtime delete REST E2E:
 # 1) publish a full_runtime twice and verify:
+#    - concurrent second DELETE -> BUSY
 #    - DELETE current -> RUNTIME_CURRENT_CONFLICT
 #    - DELETE missing version -> RUNTIME_VERSION_NOT_FOUND
-#    - DELETE old non-current version -> ok
+#    - held DELETE old non-current version -> ok
 # 2) publish an AI runtime twice, spawn version1, and verify:
 #    - DELETE old running version -> RUNTIME_IN_USE
 # 3) publish a base runtime twice + config_only dependent and verify:
@@ -25,6 +26,7 @@ MOTHER_HIVE_ID="${MOTHER_HIVE_ID:-motherbee}"
 TENANT_ID="${TENANT_ID:-}"
 WAIT_READY_SECS="${WAIT_READY_SECS:-120}"
 WAIT_STATUS_SECS="${WAIT_STATUS_SECS:-90}"
+BUSY_HOLD_MS="${BUSY_HOLD_MS:-3000}"
 TEST_TS="$(date +%s)"
 TEST_ID="${TEST_ID:-admindel-${TEST_TS}-$RANDOM}"
 
@@ -47,6 +49,7 @@ DEPENDENT_VERSION="${DEPENDENT_VERSION:-1.0.0-${TEST_ID}}"
 
 PUBLISH_BIN="$ROOT_DIR/target/release/fluxbee-publish"
 AI_BIN="$ROOT_DIR/target/release/ai-test-gov"
+DIAG_BIN="${ADMIN_DIAG_BIN:-$ROOT_DIR/target/debug/admin_internal_command_diag}"
 MANIFEST_PATH="/var/lib/fluxbee/dist/runtimes/manifest.json"
 
 DIST_DELETE_OK_DIR="/var/lib/fluxbee/dist/runtimes/$DELETE_OK_RUNTIME_NAME"
@@ -66,7 +69,11 @@ status_body="$tmpdir/status.json"
 spawn_body="$tmpdir/spawn.json"
 kill_body="$tmpdir/kill.json"
 delete_body="$tmpdir/delete.json"
+busy_primary_body="$tmpdir/delete_busy_primary.json"
+busy_primary_http="$tmpdir/delete_busy_primary.http"
+busy_secondary_body="$tmpdir/delete_busy_secondary.json"
 publish_log="$tmpdir/publish.log"
+socket_current_body="$tmpdir/socket_current.json"
 
 cleanup() {
   local _ec=$?
@@ -260,6 +267,61 @@ assert_runtime_missing_version() {
   fi
 }
 
+run_busy_delete_case() {
+  : >"$busy_primary_http"
+  curl -sS -o "$busy_primary_body" -w "%{http_code}" -X DELETE \
+    "$BASE/hives/$HIVE_ID/runtimes/$DELETE_OK_RUNTIME_NAME/versions/$DELETE_OK_V1?test_hold_ms=$BUSY_HOLD_MS" \
+    >"$busy_primary_http" &
+  local busy_pid=$!
+  sleep 1
+
+  local secondary_http
+  secondary_http="$(http_call "DELETE" \
+    "$BASE/hives/$HIVE_ID/runtimes/$DELETE_OK_RUNTIME_NAME/versions/$DELETE_OK_V1" \
+    "$busy_secondary_body")"
+  if [[ "$secondary_http" != "409" ]]; then
+    echo "FAIL: busy secondary delete http mismatch expected='409' got='$secondary_http'" >&2
+    cat "$busy_secondary_body" >&2 || true
+    wait "$busy_pid" || true
+    exit 1
+  fi
+  local secondary_code
+  secondary_code="$(json_get_file "error_code" "$busy_secondary_body")"
+  if [[ "$secondary_code" != "BUSY" ]]; then
+    echo "FAIL: busy secondary delete error_code mismatch expected='BUSY' got='$secondary_code'" >&2
+    cat "$busy_secondary_body" >&2 || true
+    wait "$busy_pid" || true
+    exit 1
+  fi
+
+  wait "$busy_pid"
+  local primary_http
+  primary_http="$(cat "$busy_primary_http")"
+  if [[ "$primary_http" != "200" ]]; then
+    echo "FAIL: busy primary delete http mismatch expected='200' got='$primary_http'" >&2
+    cat "$busy_primary_body" >&2 || true
+    exit 1
+  fi
+  local primary_status
+  primary_status="$(json_get_file "status" "$busy_primary_body")"
+  if [[ "$primary_status" != "ok" ]]; then
+    echo "FAIL: busy primary delete status mismatch expected='ok' got='$primary_status'" >&2
+    cat "$busy_primary_body" >&2 || true
+    exit 1
+  fi
+}
+
+run_admin_socket() {
+  local action="$1"
+  local params_json="$2"
+  ADMIN_ACTION="$action" \
+  ADMIN_TARGET="SY.admin@motherbee" \
+  ADMIN_TIMEOUT_SECS="30" \
+  ADMIN_PAYLOAD_TARGET="$HIVE_ID" \
+  ADMIN_PARAMS_JSON="$params_json" \
+  "$DIAG_BIN" >"$socket_current_body"
+}
+
 create_delete_ok_package() {
   mkdir -p "$delete_ok_pkg/bin" "$delete_ok_pkg/config"
   cat >"$delete_ok_pkg/package.json" <<EOF
@@ -392,63 +454,72 @@ fi
 
 validate_tenant_id "$TENANT_ID"
 
-echo "Step 1/12: build fluxbee-publish + ai-test-gov"
+echo "Step 1/14: build fluxbee-publish + ai-test-gov + admin diag"
 (cd "$ROOT_DIR" && cargo build --release --bin fluxbee-publish -p json-router)
 (cd "$ROOT_DIR" && cargo build --release -p ai-test-gov)
+(cd "$ROOT_DIR" && cargo build --quiet --bin admin_internal_command_diag)
 [[ -x "$PUBLISH_BIN" ]] || { echo "FAIL: missing publish binary '$PUBLISH_BIN'" >&2; exit 1; }
 [[ -x "$AI_BIN" ]] || { echo "FAIL: missing ai-test-gov binary '$AI_BIN'" >&2; exit 1; }
+[[ -x "$DIAG_BIN" ]] || { echo "FAIL: missing admin diag binary '$DIAG_BIN'" >&2; exit 1; }
 
-echo "Step 2/12: backup manifest + create package fixtures"
+echo "Step 2/14: backup manifest + create package fixtures"
 as_root_local install -m 0644 "$MANIFEST_PATH" "$manifest_backup"
 create_delete_ok_package
 create_in_use_package
 create_base_package
 create_dependent_package
 
-echo "Step 3/12: publish success fixture runtime twice"
+echo "Step 3/14: publish success fixture runtime twice"
 run_publish "$delete_ok_pkg" "$DELETE_OK_V1"
 run_publish "$delete_ok_pkg" "$DELETE_OK_V2"
 wait_runtime_ready "$DELETE_OK_RUNTIME_NAME" "$DELETE_OK_V1"
 wait_runtime_ready "$DELETE_OK_RUNTIME_NAME" "$DELETE_OK_V2"
 
-echo "Step 4/12: current + missing version negatives"
+echo "Step 4/14: BUSY concurrency negative + held delete success"
+run_busy_delete_case
+assert_runtime_missing_version "$DELETE_OK_RUNTIME_NAME" "$DELETE_OK_V1"
+
+echo "Step 5/14: current + missing version negatives"
 assert_delete_error "$DELETE_OK_RUNTIME_NAME" "$DELETE_OK_V2" "409" "RUNTIME_CURRENT_CONFLICT"
 assert_delete_error "$DELETE_OK_RUNTIME_NAME" "$DELETE_OK_MISSING_VERSION" "404" "RUNTIME_VERSION_NOT_FOUND"
 
-echo "Step 5/12: delete non-current version succeeds"
-delete_http="$(http_call "DELETE" "$BASE/hives/$HIVE_ID/runtimes/$DELETE_OK_RUNTIME_NAME/versions/$DELETE_OK_V1" "$delete_body")"
-if [[ "$delete_http" != "200" ]]; then
-  echo "FAIL: delete success case http='$delete_http'" >&2
-  cat "$delete_body" >&2 || true
+echo "Step 6/14: HTTP/socket parity on current-conflict"
+run_admin_socket \
+  "remove_runtime_version" \
+  "{\"runtime\":\"$DELETE_OK_RUNTIME_NAME\",\"runtime_version\":\"$DELETE_OK_V2\"}"
+socket_status="$(json_get_file "status" "$socket_current_body")"
+socket_error_code="$(json_get_file "error_code" "$socket_current_body")"
+if [[ "$socket_status" != "error" || "$socket_error_code" != "RUNTIME_CURRENT_CONFLICT" ]]; then
+  echo "FAIL: socket parity mismatch for current delete" >&2
+  cat "$socket_current_body" >&2 || true
   exit 1
 fi
-assert_runtime_missing_version "$DELETE_OK_RUNTIME_NAME" "$DELETE_OK_V1"
 
-echo "Step 6/12: publish in-use fixture runtime twice"
+echo "Step 7/14: publish in-use fixture runtime twice"
 run_publish "$in_use_pkg" "$IN_USE_V1"
 run_publish "$in_use_pkg" "$IN_USE_V2"
 wait_runtime_ready "$IN_USE_RUNTIME_NAME" "$IN_USE_V1"
 wait_runtime_ready "$IN_USE_RUNTIME_NAME" "$IN_USE_V2"
 
-echo "Step 7/12: spawn version-pinned running node"
+echo "Step 8/14: spawn version-pinned running node"
 spawn_in_use_node
 wait_node_running "$IN_USE_NODE_NAME"
 
-echo "Step 8/12: running version delete must fail"
+echo "Step 9/14: running version delete must fail"
 assert_delete_error "$IN_USE_RUNTIME_NAME" "$IN_USE_V1" "409" "RUNTIME_IN_USE"
 http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$IN_USE_NODE_NAME" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
 
-echo "Step 9/12: publish base runtime twice + dependent runtime"
+echo "Step 10/14: publish base runtime twice + dependent runtime"
 run_publish "$base_pkg" "$BASE_V1"
 run_publish "$base_pkg" "$BASE_V2"
 wait_runtime_ready "$BASE_RUNTIME_NAME" "$BASE_V1"
 wait_runtime_ready "$BASE_RUNTIME_NAME" "$BASE_V2"
 run_publish "$dependent_pkg" "$DEPENDENT_VERSION"
 
-echo "Step 10/12: base runtime delete must fail while dependent exists"
+echo "Step 11/14: base runtime delete must fail while dependent exists"
 assert_delete_error "$BASE_RUNTIME_NAME" "$BASE_V1" "409" "RUNTIME_HAS_DEPENDENTS"
 
-echo "Step 11/12: summarize visible runtime state"
+echo "Step 12/14: summarize visible runtime state"
 http_call "GET" "$BASE/hives/$HIVE_ID/runtimes/$DELETE_OK_RUNTIME_NAME" "$runtime_body" >/dev/null
 delete_ok_manifest_version="$(json_get_file "payload.manifest_version" "$runtime_body")"
 http_call "GET" "$BASE/hives/$HIVE_ID/runtimes/$IN_USE_RUNTIME_NAME" "$runtime_body" >/dev/null
@@ -456,11 +527,17 @@ in_use_running_count="$(json_get_file "payload.usage_global_visible.running_coun
 http_call "GET" "$BASE/hives/$HIVE_ID/runtimes/$BASE_RUNTIME_NAME" "$runtime_body" >/dev/null
 base_current="$(json_get_file "payload.runtime.current" "$runtime_body")"
 
-echo "Step 12/12: summary"
+echo "Step 13/14: BUSY/parity summary"
+busy_secondary_code="$(json_get_file "error_code" "$busy_secondary_body")"
+
+echo "Step 14/14: summary"
 echo "status=ok"
 echo "delete_ok_runtime=$DELETE_OK_RUNTIME_NAME@$DELETE_OK_V2"
 echo "delete_ok_removed_version=$DELETE_OK_V1"
 echo "delete_ok_manifest_version=$delete_ok_manifest_version"
+echo "busy_hold_ms=$BUSY_HOLD_MS"
+echo "busy_secondary_error_code=$busy_secondary_code"
+echo "socket_current_error_code=$socket_error_code"
 echo "in_use_runtime=$IN_USE_RUNTIME_NAME@$IN_USE_V2"
 echo "in_use_blocked_version=$IN_USE_V1"
 echo "in_use_running_count_after_kill=$in_use_running_count"

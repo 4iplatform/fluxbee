@@ -4885,6 +4885,10 @@ async fn remove_runtime_version_flow(
             "message": "missing or invalid runtime_version",
         });
     }
+    let test_hold_ms = payload
+        .get("test_hold_ms")
+        .and_then(|value| value.as_u64())
+        .filter(|value| *value > 0);
 
     let _lifecycle_guard = match state.runtime_lifecycle_lock.try_lock() {
         Ok(guard) => guard,
@@ -4896,6 +4900,15 @@ async fn remove_runtime_version_flow(
             });
         }
     };
+    if let Some(hold_ms) = test_hold_ms {
+        tracing::info!(
+            runtime = runtime,
+            runtime_version = runtime_version,
+            test_hold_ms = hold_ms,
+            "runtime delete diagnostic hold active"
+        );
+        time::sleep(Duration::from_millis(hold_ms)).await;
+    }
 
     let manifest = match load_runtime_manifest_result() {
         Ok(Some(manifest)) => manifest,

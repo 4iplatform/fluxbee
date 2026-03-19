@@ -1912,10 +1912,17 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("DELETE", ["runtimes", runtime, "versions", version]) => {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "runtime": decode_percent(runtime),
                 "runtime_version": decode_percent(version),
             });
+            if let Some(test_hold_ms) = query
+                .get("test_hold_ms")
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+            {
+                payload["test_hold_ms"] = serde_json::json!(test_hold_ms);
+            }
             let (status, resp) = handle_admin_command(
                 ctx,
                 client,
