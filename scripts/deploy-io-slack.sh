@@ -184,9 +184,11 @@ fetch_existing_config_json() {
     echo "Error: --reuse-existing-config requires --node-name" >&2
     exit 1
   fi
-  log "step=get_existing_config node_name=$NODE_NAME"
+  # Important: this function may run inside command substitution.
+  # Keep diagnostics out of stdout so captured JSON stays clean.
+  log "step=get_existing_config node_name=$NODE_NAME" >&2
   local raw
-  raw="$(curl -sS -X GET "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" | tee -a "$LOG_FILE")"
+  raw="$(curl -sS -X GET "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" | tee -a "$LOG_FILE" >&2)"
   RAW_JSON="$raw" python3 - <<'PY'
 import json
 import os
