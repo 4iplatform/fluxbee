@@ -27,6 +27,7 @@ WAIT_READY_SECS="${WAIT_READY_SECS:-120}"
 WAIT_STATUS_SECS="${WAIT_STATUS_SECS:-90}"
 WAIT_STOP_SECS="${WAIT_STOP_SECS:-30}"
 WAIT_IO_RESULT_SECS="${WAIT_IO_RESULT_SECS:-30}"
+WAIT_PROBE_READY_SECS="${WAIT_PROBE_READY_SECS:-30}"
 IO_TEST_WAIT_REPLY_MS="${IO_TEST_WAIT_REPLY_MS:-8000}"
 TEST_TS="$(date +%s)"
 TEST_ID="${TEST_ID:-rebootreconcile-${TEST_TS}-$RANDOM}"
@@ -341,6 +342,39 @@ wait_io_result() {
   return 1
 }
 
+run_io_probe_until_success() {
+  local deadline=$(( $(date +%s) + WAIT_PROBE_READY_SECS ))
+  local attempt=0
+  while (( $(date +%s) <= deadline )); do
+    attempt=$((attempt + 1))
+    rm -f "$IO_STATUS_FILE" "$IO_LOG_FILE"
+    kill_node "$IO_NODE_NAME"
+    remove_node_instance "$IO_NODE_NAME"
+
+    local io_spawn_payload io_spawn_http io_spawn_status
+    io_spawn_payload="$(spawn_node_payload "$IO_NODE_NAME" "$IO_RUNTIME_NAME" "current")"
+    io_spawn_http="$(http_call "POST" "$BASE/hives/$HIVE_ID/nodes" "$io_spawn_body" "$io_spawn_payload")"
+    io_spawn_status="$(json_get_file "payload.status" "$io_spawn_body")"
+    if [[ "$io_spawn_http" != "200" || "$io_spawn_status" != "ok" ]]; then
+      echo "FAIL: IO.test spawn http=$io_spawn_http attempt=$attempt" >&2
+      cat "$io_spawn_body" >&2 || true
+      return 1
+    fi
+
+    if wait_io_result && assert_io_log "$FRONTDESK_NODE_NAME"; then
+      return 0
+    fi
+
+    sleep 2
+  done
+
+  echo "FAIL: IO.test probe never observed routed reply after orchestrator restart" >&2
+  if as_root_local test -f "$IO_LOG_FILE"; then
+    as_root_local tail -n 200 "$IO_LOG_FILE" >&2 || true
+  fi
+  return 1
+}
+
 assert_io_log() {
   local expected_handled_by="$1"
   if ! as_root_local test -f "$IO_LOG_FILE"; then
@@ -454,12 +488,13 @@ if env \
   IO_TEST_WAIT_REPLY_MS="${IO_TEST_WAIT_REPLY_MS}" \
   "\$(dirname "\${BASH_SOURCE[0]}")/io-test" >"\$LOG_FILE" 2>&1; then
   echo "ok" >"\$STATUS_FILE"
+  exec /bin/sleep "\${IO_TEST_HOLD_SECS:-3600}"
 else
   rc="\$?"
   echo "error" >"\$STATUS_FILE"
   echo "EXIT_CODE=\$rc" >>"\$LOG_FILE"
+  exit "\$rc"
 fi
-exec /bin/sleep "\${IO_TEST_HOLD_SECS:-3600}"
 EOF
   chmod 0755 "$io_pkg_dir/bin/start.sh"
   as_root_local install -m 0755 "$IO_BIN" "$io_pkg_dir/bin/io-test"
@@ -577,16 +612,7 @@ frontdesk_lifecycle_after="$(wait_node_active "$FRONTDESK_NODE_NAME")"
 wait_node_visible_in_router "$FRONTDESK_NODE_NAME"
 
 echo "Step 10/11: spawn IO.test probe against relaunched frontdesk"
-io_spawn_payload="$(spawn_node_payload "$IO_NODE_NAME" "$IO_RUNTIME_NAME" "current")"
-io_spawn_http="$(http_call "POST" "$BASE/hives/$HIVE_ID/nodes" "$io_spawn_body" "$io_spawn_payload")"
-io_spawn_status="$(json_get_file "payload.status" "$io_spawn_body")"
-if [[ "$io_spawn_http" != "200" || "$io_spawn_status" != "ok" ]]; then
-  echo "FAIL: IO.test spawn http=$io_spawn_http" >&2
-  cat "$io_spawn_body" >&2 || true
-  exit 1
-fi
-wait_io_result
-assert_io_log "$FRONTDESK_NODE_NAME"
+run_io_probe_until_success
 
 echo "Step 11/11: summary"
 config_http="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes/$FRONTDESK_NODE_NAME/config" "$config_body")"
