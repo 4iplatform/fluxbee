@@ -21,6 +21,7 @@ Options:
   --forced-dynamic-config-dir <path>
                                Pass-through to publish-ia-runtime.sh (forces bootstrap dynamic config dir)
   --node-name <name@hive>      If provided, script also spawns/restarts node
+  --tenant-id <tnt:...>        Tenant ID for identity registration (payload + config fallback)
   --runtime-version <ver>      Runtime version for spawn payload (default: current)
   --config-json <file>         JSON file with spawn config object
   --spawn                      Force spawn step (requires --node-name and --config-json or --reuse-existing-config)
@@ -60,6 +61,7 @@ FORCED_NODE_NAME=""
 FORCED_DYNAMIC_CONFIG_DIR=""
 RUNTIME_VERSION="current"
 NODE_NAME=""
+TENANT_ID=""
 CONFIG_JSON=""
 DO_SPAWN=0
 FORCE_SKIP_SPAWN=0
@@ -86,6 +88,7 @@ while [[ $# -gt 0 ]]; do
     --forced-dynamic-config-dir) FORCED_DYNAMIC_CONFIG_DIR="${2:-}"; shift 2 ;;
     --runtime-version) RUNTIME_VERSION="${2:-}"; shift 2 ;;
     --node-name) NODE_NAME="${2:-}"; shift 2 ;;
+    --tenant-id) TENANT_ID="${2:-}"; shift 2 ;;
     --config-json) CONFIG_JSON="${2:-}"; shift 2 ;;
     --spawn) DO_SPAWN=1; shift ;;
     --skip-spawn) FORCE_SKIP_SPAWN=1; shift ;;
@@ -321,15 +324,22 @@ if [[ -z "$NODE_NAME" ]]; then
 fi
 
 spawn_cfg_json="$(build_spawn_config_json)"
-spawn_payload="$(NODE_NAME="$NODE_NAME" RUNTIME="$RUNTIME" RUNTIME_VERSION="$RUNTIME_VERSION" SPAWN_CFG_JSON="$spawn_cfg_json" python3 - <<'PY'
+spawn_payload="$(NODE_NAME="$NODE_NAME" RUNTIME="$RUNTIME" RUNTIME_VERSION="$RUNTIME_VERSION" TENANT_ID="$TENANT_ID" SPAWN_CFG_JSON="$spawn_cfg_json" python3 - <<'PY'
 import json
 import os
-print(json.dumps({
+cfg = json.loads(os.environ["SPAWN_CFG_JSON"])
+tenant_id = os.environ.get("TENANT_ID", "").strip()
+if tenant_id:
+    cfg.setdefault("tenant_id", tenant_id)
+payload = {
   "node_name": os.environ["NODE_NAME"],
   "runtime": os.environ["RUNTIME"],
   "runtime_version": os.environ["RUNTIME_VERSION"],
-  "config": json.loads(os.environ["SPAWN_CFG_JSON"]),
-}, separators=(",", ":")))
+  "config": cfg,
+}
+if tenant_id:
+    payload["tenant_id"] = tenant_id
+print(json.dumps(payload, separators=(",", ":")))
 PY
 )"
 
