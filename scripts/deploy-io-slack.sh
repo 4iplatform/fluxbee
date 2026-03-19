@@ -186,9 +186,11 @@ fetch_existing_config_json() {
   log "step=get_existing_config node_name=$NODE_NAME"
   local raw
   raw="$(curl -sS -X GET "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" | tee -a "$LOG_FILE")"
-  python3 - <<'PY' <<<"$raw"
-import json, sys
-raw = sys.stdin.read().strip()
+  RAW_JSON="$raw" python3 - <<'PY'
+import json
+import os
+import sys
+raw = (os.environ.get("RAW_JSON") or "").strip()
 if not raw:
     print("Error: empty response from get config", file=sys.stderr)
     sys.exit(1)
@@ -282,9 +284,11 @@ while [[ "$attempt" -le "$UPDATE_RETRIES" ]]; do
     -H "Content-Type: application/json" \
     -d "$update_payload" | tee -a "$LOG_FILE")"
 
-  UPDATE_STATUS="$(echo "$update_resp" | python3 - <<'PY'
-import json, sys
-raw = sys.stdin.read().strip()
+  UPDATE_STATUS="$(RAW_JSON="$update_resp" python3 - <<'PY'
+import json
+import os
+import sys
+raw = (os.environ.get("RAW_JSON") or "").strip()
 try:
     d = json.loads(raw)
 except Exception:
@@ -352,9 +356,11 @@ spawn_resp="$(curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes" \
   -H "Content-Type: application/json" \
   -d "$spawn_payload" | tee -a "$LOG_FILE")"
 
-spawn_status="$(echo "$spawn_resp" | python3 - <<'PY'
-import json, sys
-raw = sys.stdin.read().strip()
+spawn_status="$(RAW_JSON="$spawn_resp" python3 - <<'PY'
+import json
+import os
+import sys
+raw = (os.environ.get("RAW_JSON") or "").strip()
 try:
     d = json.loads(raw)
 except Exception:
