@@ -954,11 +954,15 @@ async fn run_outbound_loop(inbox: Arc<Mutex<RouterInbox>>, slack: Arc<SlackClien
             continue;
         };
 
-        let text = msg
-            .payload
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let text = render_outbound_text(&msg.payload);
+        if text.is_empty() {
+            tracing::debug!(
+                trace_id = %msg.routing.trace_id,
+                payload = %msg.payload,
+                "skipping slack post for empty outbound payload"
+            );
+            continue;
+        }
 
         let blocks = msg.payload.get("blocks").cloned();
 
@@ -966,12 +970,12 @@ async fn run_outbound_loop(inbox: Arc<Mutex<RouterInbox>>, slack: Arc<SlackClien
             slack_channel = target.channel_id,
             slack_thread_ts = target.thread_ts.as_deref().unwrap_or(""),
             text_len = text.len(),
-            text_preview = %truncate(text, 120),
+            text_preview = %truncate(&text, 120),
             "sending slack message"
         );
 
         if let Err(e) = slack
-            .post_message(&target.channel_id, text, target.thread_ts.as_deref(), blocks)
+            .post_message(&target.channel_id, &text, target.thread_ts.as_deref(), blocks)
             .await
         {
             tracing::warn!(error=?e, "failed to send slack message");
@@ -979,6 +983,37 @@ async fn run_outbound_loop(inbox: Arc<Mutex<RouterInbox>>, slack: Arc<SlackClien
             tracing::debug!("slack message sent");
         }
     }
+}
+
+fn render_outbound_text(payload: &Value) -> String {
+    if let Some(content) = payload.get("content").and_then(|v| v.as_str()) {
+        if !content.trim().is_empty() {
+            return content.to_string();
+        }
+    }
+
+    let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if payload_type.eq_ignore_ascii_case("error") {
+        let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let code = payload.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        if !message.trim().is_empty() && !code.trim().is_empty() {
+            return format!("Error ({code}): {message}");
+        }
+        if !message.trim().is_empty() {
+            return format!("Error: {message}");
+        }
+        if !code.trim().is_empty() {
+            return format!("Error: {code}");
+        }
+    }
+
+    if let Some(message) = payload.get("message").and_then(|v| v.as_str()) {
+        if !message.trim().is_empty() {
+            return message.to_string();
+        }
+    }
+
+    String::new()
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
