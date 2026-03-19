@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender, NodeUuidMode};
 
 use crate::errors::Result;
 use crate::message::Message;
@@ -21,6 +21,7 @@ impl From<AiNodeConfig> for NodeConfig {
             name: value.name,
             router_socket: value.router_socket,
             uuid_persistence_dir: value.uuid_persistence_dir,
+            uuid_mode: NodeUuidMode::Persistent,
             config_dir: value.config_dir,
             version: value.version,
         }
