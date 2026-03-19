@@ -245,6 +245,26 @@ assert_delete_error() {
   fi
 }
 
+assert_delete_ok() {
+  local runtime_name="$1"
+  local runtime_version="$2"
+  local http
+  http="$(http_call "DELETE" "$BASE/hives/$HIVE_ID/runtimes/$runtime_name/versions/$runtime_version" "$delete_body")"
+  if [[ "$http" != "200" ]]; then
+    echo "FAIL: delete http mismatch runtime='$runtime_name' version='$runtime_version' expected='200' got='$http'" >&2
+    cat "$delete_body" >&2 || true
+    exit 1
+  fi
+  local status removed_version
+  status="$(json_get_file "status" "$delete_body")"
+  removed_version="$(json_get_file "payload.removed_version" "$delete_body")"
+  if [[ "$status" != "ok" || "$removed_version" != "$runtime_version" ]]; then
+    echo "FAIL: delete success payload mismatch runtime='$runtime_name' version='$runtime_version'" >&2
+    cat "$delete_body" >&2 || true
+    exit 1
+  fi
+}
+
 assert_runtime_missing_version() {
   local runtime_name="$1"
   local runtime_version="$2"
