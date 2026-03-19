@@ -67,7 +67,9 @@ SLACK_BOT_TOKEN=xoxb-REPLACE_ME
 # ROUTER_SOCKET=/var/run/fluxbee/routers
 # UUID_PERSISTENCE_DIR=/var/lib/fluxbee/state/nodes
 # CONFIG_DIR=/etc/fluxbee
-# IDENTITY_MODE=mock
+# ISLAND_ID=motherbee
+# IDENTITY_TARGET=SY.identity@motherbee
+# IDENTITY_TIMEOUT_MS=10000
 # IO_SLACK_DST_NODE=AI.chat@sandbox
 # DEV_MODE=true
 # RUST_LOG=info,io_slack=debug,fluxbee_sdk=info
@@ -82,7 +84,9 @@ if [[ ! -f "$CONFIG_DIR/io-sim.env" ]]; then
 # ROUTER_SOCKET=/var/run/fluxbee/routers
 # UUID_PERSISTENCE_DIR=/var/lib/fluxbee/state/nodes
 # CONFIG_DIR=/etc/fluxbee
-# IDENTITY_MODE=mock
+# ISLAND_ID=motherbee
+# IDENTITY_TARGET=SY.identity@motherbee
+# IDENTITY_TIMEOUT_MS=10000
 # SIM_DST_NODE=AI.chat@sandbox
 # RUST_LOG=info,io_sim=debug,fluxbee_sdk=info
 EOF

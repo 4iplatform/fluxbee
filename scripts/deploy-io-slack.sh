@@ -25,7 +25,7 @@ Options:
   --identity-target <name>     Convenience: add identity_target to spawn config
   --identity-timeout-ms <ms>   Convenience: add identity_timeout_ms to spawn config
   --spawn                      Force spawn step (requires --node-name and config source)
-  --update-existing            Shortcut for existing node code update: reuse current config + kill-first + spawn
+  --update-existing            Existing node code update: reuse current config + restart unit (spawn only if unit missing)
   --skip-spawn                 Skip spawn step (default unless --node-name is set)
   --kill-first                 If spawning, call DELETE node before POST node
   --reuse-existing-config      When spawning, fetch config from GET /hives/{id}/nodes/{name}/config
@@ -127,8 +127,8 @@ if [[ "$UPDATE_EXISTING" == "1" ]]; then
     echo "Error: --update-existing requires --node-name" >&2
     exit 1
   fi
-  DO_SPAWN=1
-  KILL_FIRST=1
+  DO_SPAWN=0
+  KILL_FIRST=0
   REUSE_EXISTING_CONFIG=1
 fi
 
@@ -138,6 +138,34 @@ touch "$LOG_FILE"
 log() {
   local msg="$1"
   echo "[$(date -Iseconds)] $msg" | tee -a "$LOG_FILE"
+}
+
+sanitize_config_json() {
+  python3 - <<'PY'
+import json
+import sys
+
+raw = sys.stdin.read()
+if not raw.strip():
+    print("{}")
+    raise SystemExit(0)
+
+cfg = json.loads(raw)
+if not isinstance(cfg, dict):
+    print("Error: config JSON root must be object", file=sys.stderr)
+    raise SystemExit(1)
+
+# Reserved by orchestrator.
+cfg.pop("_system", None)
+
+# IO policy: no fallback identity target in active config.
+cfg.pop("identity_fallback_target", None)
+ident = cfg.get("identity")
+if isinstance(ident, dict):
+    ident.pop("fallback_target", None)
+
+print(json.dumps(cfg, separators=(",", ":")))
+PY
 }
 
 build_spawn_config_json() {
@@ -151,7 +179,7 @@ build_spawn_config_json() {
       echo "Error: --config-json not found: $CONFIG_JSON" >&2
       exit 1
     fi
-    cat "$CONFIG_JSON"
+    sanitize_config_json < "$CONFIG_JSON"
     return
   fi
 
@@ -160,7 +188,7 @@ build_spawn_config_json() {
     exit 1
   fi
 
-  python3 - <<PY
+  python3 - <<PY | sanitize_config_json
 import json
 
 cfg = {
@@ -189,7 +217,7 @@ fetch_existing_config_json() {
   log "step=get_existing_config node_name=$NODE_NAME" >&2
   local raw
   raw="$(curl -sS -X GET "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" | tee -a "$LOG_FILE" >&2)"
-  RAW_JSON="$raw" python3 - <<'PY'
+  RAW_JSON="$raw" python3 - <<'PY' | sanitize_config_json
 import json
 import os
 import sys
@@ -227,6 +255,36 @@ if cfg is None:
 
 print(json.dumps(cfg, separators=(",", ":")))
 PY
+}
+
+derive_unit_name() {
+  local node="$1"
+  local base="${node%@*}"
+  local hive="${node##*@}"
+  if [[ "$base" == "$node" ]]; then
+    hive="$HIVE_ID"
+  fi
+  echo "fluxbee-node-${base}-${hive}.service"
+}
+
+restart_existing_unit_if_present() {
+  local node="$1"
+  local unit
+  unit="$(derive_unit_name "$node")"
+  local systemctl_cmd=("systemctl")
+  if [[ "$USE_SUDO" == "1" ]]; then
+    systemctl_cmd=("sudo" "systemctl")
+  fi
+
+  if "${systemctl_cmd[@]}" cat "$unit" >/dev/null 2>&1; then
+    log "step=restart_existing unit=$unit"
+    "${systemctl_cmd[@]}" restart "$unit"
+    log "restart_ok unit=$unit"
+    return 0
+  fi
+
+  log "restart_skipped unit_not_found=$unit"
+  return 1
 }
 
 require_cmd bash
@@ -330,8 +388,18 @@ if [[ "$UPDATE_STATUS" != "ok" ]]; then
 fi
 
 if [[ "$DO_SPAWN" != "1" ]]; then
-  log "deploy completed (publish+update). spawn skipped."
-  exit 0
+  if [[ "$UPDATE_EXISTING" == "1" && -n "$NODE_NAME" ]]; then
+    if restart_existing_unit_if_present "$NODE_NAME"; then
+      log "deploy completed (publish+update+restart) node_name=$NODE_NAME"
+      exit 0
+    fi
+    DO_SPAWN=1
+    REUSE_EXISTING_CONFIG=1
+    log "update_existing: unit missing, falling back to spawn node_name=$NODE_NAME"
+  else
+    log "deploy completed (publish+update). spawn skipped."
+    exit 0
+  fi
 fi
 
 if [[ -z "$NODE_NAME" ]]; then
@@ -391,7 +459,28 @@ print(d.get("status",""))
 PY
 )"
 
+spawn_error_code="$(RAW_JSON="$spawn_resp" python3 - <<'PY'
+import json
+import os
+import sys
+raw = (os.environ.get("RAW_JSON") or "").strip()
+try:
+    d = json.loads(raw)
+except Exception:
+    print("")
+    sys.exit(0)
+print(d.get("error_code") or (d.get("payload") or {}).get("error_code") or "")
+PY
+)"
+
 if [[ "$spawn_status" != "ok" ]]; then
+  if [[ "$spawn_error_code" == "NODE_ALREADY_EXISTS" && "$UPDATE_EXISTING" == "1" ]]; then
+    log "spawn_node_already_exists; trying restart_existing for update flow"
+    if restart_existing_unit_if_present "$NODE_NAME"; then
+      log "deploy completed (publish+update+restart) node_name=$NODE_NAME"
+      exit 0
+    fi
+  fi
   log "spawn_failed status=${spawn_status:-unknown}"
   exit 1
 fi
