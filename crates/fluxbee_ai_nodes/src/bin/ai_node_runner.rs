@@ -686,7 +686,22 @@ impl AiNode for GenericAiNode {
         let input = extract_text(&msg.payload).unwrap_or_default();
         let output = match &behavior {
             NodeBehavior::Echo => format!("Echo: {input}"),
-            NodeBehavior::OpenAiChat(openai) => self.run_openai_chat(openai, input, &behavior_ctx).await?,
+            NodeBehavior::OpenAiChat(openai) => {
+                match self.run_openai_chat(openai, input, &behavior_ctx).await {
+                    Ok(output) => output,
+                    Err(err) if err.to_string().contains("missing OpenAI api key") => {
+                        tracing::warn!(
+                            node_name = %self.node_name,
+                            trace_id = %msg.routing.trace_id,
+                            error = %err,
+                            "openai runtime missing api key; replying with runtime-not-ready payload"
+                        );
+                        let payload = missing_openai_api_key_payload();
+                        return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
         };
 
         let payload = build_text_response(output)?;
@@ -2357,6 +2372,15 @@ fn node_runtime_not_ready_payload() -> Value {
     })
 }
 
+fn missing_openai_api_key_payload() -> Value {
+    json!({
+        "type": "error",
+        "code": "missing_openai_api_key",
+        "message": "Missing OpenAI API key in CONFIG_SET override, YAML inline, or env.",
+        "retryable": true
+    })
+}
+
 fn infer_state_dir_from_dynamic(dynamic_config_dir: &std::path::Path) -> PathBuf {
     dynamic_config_dir
         .parent()
@@ -2597,6 +2621,54 @@ mod tests {
 
         std::env::remove_var(NODE_STATUS_DEFAULT_HEALTH_STATE);
         std::env::remove_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED);
+    }
+
+    #[tokio::test]
+    async fn openai_chat_missing_api_key_returns_error_payload_instead_of_fatal() {
+        let _guard = env_lock().lock().expect("env lock");
+        std::env::remove_var("OPENAI_API_KEY_MISSING_FOR_TEST");
+        let mut node = test_node();
+        {
+            let mut state = node.control_plane.write().await;
+            state.current_state = NodeLifecycleState::Configured;
+        }
+        {
+            let mut behavior = node.behavior.write().await;
+            *behavior = Some(NodeBehavior::OpenAiChat(OpenAiChatRuntime {
+                model: "gpt-4.1-mini".to_string(),
+                instructions: Some("Test instructions".to_string()),
+                model_settings: ModelSettings::default(),
+                api_key_env: "OPENAI_API_KEY_MISSING_FOR_TEST".to_string(),
+                yaml_inline_api_key: None,
+                base_url: None,
+            }));
+        }
+
+        let msg = sample_user_request_with_context(
+            json!({ "thread_id": "sim-thread-1" }),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        let response = node
+            .on_message(msg)
+            .await
+            .expect("on_message should not fail fatally")
+            .expect("response should be present");
+
+        assert_eq!(
+            response
+                .payload
+                .get("code")
+                .and_then(Value::as_str),
+            Some("missing_openai_api_key")
+        );
+        assert_eq!(
+            response
+                .payload
+                .get("retryable")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        std::env::remove_var("OPENAI_API_KEY_MISSING_FOR_TEST");
     }
 
     fn sample_user_request_with_context(context: Value, top_level_src_ilk: Option<&str>) -> Message {
