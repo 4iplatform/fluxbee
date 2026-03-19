@@ -71,6 +71,7 @@ kill_body="$tmpdir/kill.json"
 delete_body="$tmpdir/delete.json"
 busy_primary_body="$tmpdir/delete_busy_primary.json"
 busy_primary_http="$tmpdir/delete_busy_primary.http"
+busy_primary_socket_body="$tmpdir/delete_busy_primary_socket.json"
 busy_secondary_body="$tmpdir/delete_busy_secondary.json"
 publish_log="$tmpdir/publish.log"
 socket_current_body="$tmpdir/socket_current.json"
@@ -269,9 +270,15 @@ assert_runtime_missing_version() {
 
 run_busy_delete_case() {
   : >"$busy_primary_http"
-  curl -sS -o "$busy_primary_body" -w "%{http_code}" -X DELETE \
-    "$BASE/hives/$HIVE_ID/runtimes/$DELETE_OK_RUNTIME_NAME/versions/$DELETE_OK_V1?test_hold_ms=$BUSY_HOLD_MS" \
-    >"$busy_primary_http" &
+  (
+    ADMIN_ACTION="remove_runtime_version" \
+    ADMIN_TARGET="SY.admin@motherbee" \
+    ADMIN_TIMEOUT_SECS="30" \
+    ADMIN_PAYLOAD_TARGET="$HIVE_ID" \
+    ADMIN_PARAMS_JSON="{\"runtime\":\"$DELETE_OK_RUNTIME_NAME\",\"runtime_version\":\"$DELETE_OK_V1\",\"test_hold_ms\":$BUSY_HOLD_MS}" \
+    "$DIAG_BIN" >"$busy_primary_socket_body"
+    printf '200' >"$busy_primary_http"
+  ) &
   local busy_pid=$!
   sleep 1
 
@@ -299,14 +306,14 @@ run_busy_delete_case() {
   primary_http="$(cat "$busy_primary_http")"
   if [[ "$primary_http" != "200" ]]; then
     echo "FAIL: busy primary delete http mismatch expected='200' got='$primary_http'" >&2
-    cat "$busy_primary_body" >&2 || true
+    cat "$busy_primary_socket_body" >&2 || true
     exit 1
   fi
   local primary_status
-  primary_status="$(json_get_file "status" "$busy_primary_body")"
+  primary_status="$(json_get_file "status" "$busy_primary_socket_body")"
   if [[ "$primary_status" != "ok" ]]; then
     echo "FAIL: busy primary delete status mismatch expected='ok' got='$primary_status'" >&2
-    cat "$busy_primary_body" >&2 || true
+    cat "$busy_primary_socket_body" >&2 || true
     exit 1
   fi
 }
