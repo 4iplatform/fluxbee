@@ -1,4 +1,4 @@
-﻿# Nodos IO â€“ Specification v1.16 (Fluxbee)
+﻿# Nodos IO - Specification v1.16 (Fluxbee)
 > Adaptation note for `json-router`:
 > This spec is imported and kept as functional baseline.
 > If a section conflicts with router v1.16+ docs in this repo, follow `docs/io/README.md` precedence.
@@ -18,18 +18,20 @@ They are intentionally:
 
 IO nodes:
 - Resolve identity via SHM
-- Never wait on `SY.identity`
-- Never emit or consume identity replies synchronously
+- On miss/error, can call `ILK_PROVISION` via `SY.identity` (shared `io-common` flow)
+- Never block provider ACK waiting for identity
 
-Unknown identities are handled **by the Router layer**, not IO.
+If provision fails/timeout, IO forwards with `meta.context.src_ilk = null` and Router/OPA handles onboarding.
 
 ---
 
 ## 3. Identity Strategies
 
-### Strategy: Routerâ€‘Driven Onboarding
+### Strategy: Router-Driven Onboarding
 
-- IO forwards messages with `src_ilk = null`
+- IO runs `lookup -> provision_on_miss -> forward`
+- Normal path is non-null `meta.context.src_ilk` when lookup/provision succeeds
+- Degraded fallback forwards with `meta.context.src_ilk = null`
 - Router + OPA redirect to onboarding workflow
 - Message is re-injected once identity exists
 
@@ -75,7 +77,7 @@ Rules:
 
 ---
 
-## 7. Nonâ€‘Responsibilities
+## 7. Non-Responsibilities
 
 IO nodes explicitly do NOT:
 - Store conversation history
@@ -86,9 +88,9 @@ IO nodes explicitly do NOT:
 ---
 
 
-### AclaraciÃ³n â€“ meta.ctx vs meta.context
+### Aclaración - meta.ctx vs meta.context
 
-SegÃºn la especificaciÃ³n del Router v1.16:
+Según la especificación del Router v1.16:
 
 - `meta.ctx` representa el **Contexto Conversacional (CTX)**
 - `meta.context` se reserva exclusivamente para **datos adicionales evaluados por OPA**
@@ -172,5 +174,8 @@ SegÃºn la especificaciÃ³n del Router v1.16:
 
 🧩 **A ESPECIFICAR (futuro)**:
 - `*_key_ref` (env/file/vault/kms) + gestor de secretos (orchestrator/admin o servicio dedicado) para rotación/persistencia segura.
+
+
+
 
 

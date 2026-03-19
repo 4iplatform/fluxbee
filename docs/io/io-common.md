@@ -1,7 +1,8 @@
-﻿# io-common â€“ EspecificaciÃ³n tÃ©cnica
+﻿# io-common - Especificación técnica
 > Adaptation note for `json-router`:
 > In this repo, identity flow follows Router-driven onboarding (v1.16+):
-> IO performs best-effort lookup only; on miss/unavailable it forwards with `meta.src_ilk = null`.
+> IO performs `lookup -> provision_on_miss -> forward`.
+> On provision failure/timeout, it forwards with `meta.context.src_ilk = null` (degraded fallback).
 > Any older wording suggesting synchronous wait/buffering for identity should be treated as superseded.
 
 > Operational note:
@@ -43,85 +44,78 @@
 
 ## 0. Objetivo
 
-`io-common` es una librerÃ­a (o conjunto de librerÃ­as por lenguaje) que encapsula la
-lÃ³gica **crÃ­tica y repetible** de los Nodos IO.
+`io-common` es una librería (o conjunto de librerías por lenguaje) que encapsula la
+lógica **crítica y repetible** de los Nodos IO.
 
 Su objetivo es:
-- evitar duplicaciÃ³n de lÃ³gica entre IOs,
-- reducir errores en deduplicaciÃ³n, retries e idempotencia,
-- estandarizar operaciÃ³n, observabilidad y lifecycle,
+- evitar duplicación de lógica entre IOs,
+- reducir errores en deduplicación, retries e idempotencia,
+- estandarizar operación, observabilidad y lifecycle,
 - permitir evolucionar de un MVP single-instance a una arquitectura escalable.
 
 `io-common` **no** es consciente del canal (Slack, WhatsApp, email, etc.).
-Los detalles especÃ­ficos quedan en cada Nodo IO.
+Los detalles específicos quedan en cada Nodo IO.
 
 ---
 
-## 1. Principios de diseÃ±o
+## 1. Principios de diseño
 
-- **AgnÃ³stico de canal**: no conoce APIs externas.
-- **Sin persistencia local**: `io-common` **NO** asume DB/Redis dentro de los IO. Todo estado tÃ©cnico es **en memoria**.
-- **Best-effort por proceso**: deduplicaciÃ³n, sessionizaciÃ³n y reintentos funcionan mientras el proceso estÃ¡ vivo; tras restart pueden perderse.
+- **Agnóstico de canal**: no conoce APIs externas.
+- **Sin persistencia local**: `io-common` **NO** asume DB/Redis dentro de los IO. Todo estado técnico es **en memoria**.
+- **Best-effort por proceso**: deduplicación, sessionización y reintentos funcionan mientras el proceso está vivo; tras restart pueden perderse.
 - **Compatible con el protocolo**: no asume campos fuera de `routing/meta/payload`.
-- **Acotado y observable**: todo buffer/cachÃ© debe tener TTL, lÃ­mites y mÃ©tricas para evitar crecimiento sin control.
-- **Evolutivo**: el diseÃ±o deja ganchos para incorporar persistencia (DB/Redis) fuera del IO si el sistema lo habilita en el futuro.
+- **Acotado y observable**: todo buffer/caché debe tener TTL, límites y métricas para evitar crecimiento sin control.
+- **Evolutivo**: el diseño deja ganchos para incorporar persistencia (DB/Redis) fuera del IO si el sistema lo habilita en el futuro.
 
 ---
 
 ## 2. Responsabilidades de io-common
 
 ### 2.1 Inbound reliability
-- DeduplicaciÃ³n inbound **en memoria** con TTL y lÃ­mites (cap por entries/bytes).
-- Helpers para patrÃ³n â€œACK rÃ¡pidoâ€:
+- Deduplicación inbound **en memoria** con TTL y límites (cap por entries/bytes).
+- Helpers para patrón "ACK rápido":
   - el ACK al proveedor **no** espera respuesta del router,
-  - el procesamiento downstream ocurre asincrÃ³nicamente.
-- Cola/buffer **acotado** de mensajes â€œpendientesâ€ (p.ej. esperando identidad) con timeouts.
+  - el procesamiento downstream ocurre asincrónicamente.
+- Cola/buffer **acotado** de mensajes "pendientes" (p.ej. esperando identidad) con timeouts.
 
 ### 2.2 Outbound reliability
 - Outbox **en memoria** (best-effort) con:
   - cola acotada,
   - reintentos con backoff,
-  - timeouts y estados mÃ­nimos (`PENDING/SENDING/SENT/FAILED/DEAD`) solo para operaciÃ³n interna.
+  - timeouts y estados mínimos (`PENDING/SENDING/SENT/FAILED/DEAD`) solo para operación interna.
 - Idempotencia outbound **por proceso** mediante claves internas en memoria (si se requiere).
 - Worker/dispatcher en memoria para procesar el outbox.
-- **Nota**: al no haber persistencia, tras restart puede perderse el outbox y, por ende, mensajes outbound que no hayan sido enviados todavÃ­a.
+- **Nota**: al no haber persistencia, tras restart puede perderse el outbox y, por ende, mensajes outbound que no hayan sido enviados todavía.
 
 ### 2.2.1 Identity Resolution Client (SY.identity)
 
-`io-common` **DEBE** proveer un cliente para integrar con `SY.identity` como nodo (no librerÃ­a).
+`io-common` **DEBE** proveer identidad como pipeline compartido para todos los IO:
 
-Funciones mÃ­nimas:
-- **Lookup local** (rÃ¡pido): lectura de SHM de identidad si estÃ¡ disponible en la isla.
-- **Miss handling**: emitir un mensaje **unicast** a `SY.identity@mother` (o al target definido por configuraciÃ³n) para crear/linkear la identidad cuando no exista.
-- **No bloquear ACK**: el IO puede ACKear al proveedor y mantener el evento en un buffer acotado hasta resolver `src_ilk`.
-- **CorrelaciÃ³n**: usar `routing.trace_id` (o un correlation_id en `meta.context`) para correlacionar request/response.
+1. `lookup(channel, external_id)` sobre SHM de identidad (`jsr-identity-<island>`).
+2. Si lookup da miss/error y `provision_on_miss=true`, llamar `ILK_PROVISION` contra `SY.identity`.
+3. Si provision devuelve ILK, forward con `meta.context.src_ilk=<ilk>`.
+4. Si provision falla o timeout, forward con `meta.context.src_ilk=null` (degraded fallback).
 
-**Helper normativo (io-common): `resolve_or_create()
+Configuración operativa:
+- `ISLAND_ID`
+- `IDENTITY_TARGET` (default `SY.identity`)
+- `IDENTITY_FALLBACK_TARGET` (opcional)
+- `IDENTITY_TIMEOUT_MS`
 
-> ⚠️ **DEPRECATED**: IO Nodes no deben bloquear ni esperar a `SY.identity`. El modo vigente es lookup-only best-effort por SHM. Si hay miss, forward con `src_ilk=null` y permitir onboarding por router/OPA.`**
-- Entrada: `{ channel, external_id, tenant_hint?, attributes? }`
-- Salida: `{ src_ilk, tenant_ilk?, created: bool }` o error clasificado.
-- SemÃ¡ntica:
-  1) intenta `lookup(channel, external_id)` (SHM/local),
-  2) si MISS â†’ envÃ­a comando a `SY.identity` para crear/linkear,
-  3) reintenta `lookup` hasta timeout,
-  4) devuelve `src_ilk`.
-- Reglas:
-  - **NO** bloquea el ACK al proveedor.
-  - Usa un buffer en memoria acotado para eventos pendientes de identidad.
-  - Diferencia explÃ­citamente `MISS` vs `ERROR` para decidir si crear o reintentar.
+Propiedades requeridas:
+- no bloquea ACK al proveedor externo
+- no mantiene sesiones sin límite esperando identidad
+- logs/counters para hit/miss/error/provision/fallback
 
-> **Definido (io-common):** `io-common` expone un helper `resolve_or_create()` que implementa el flujo *lookup â†’ (si miss) create/link â†’ re-lookup* sin bloquear el ACK al proveedor. El wire-contract exacto con `SY.identity` (mensajes y respuestas) sigue pendiente (ver secciÃ³n 7.0).
-
-### 2.3 SessionizaciÃ³n (opcional)
+### 2.3 Sessionización (opcional)
 - Agrupamiento de fragmentos en turnos.
 - Ventanas configurables.
-- ImplementaciÃ³n local (MVP) o durable (post-MVP).
+- Implementación local (MVP) o durable (post-MVP).
 
 ### 2.4 Retry y errores
-- ClasificaciÃ³n de errores (retryable / non-retryable / rate_limited).
+- Clasificación de errores (retryable / non-retryable / rate_limited).
 - Circuit breaker opcional.
-- PolÃ­ticas configurables por IO.
+- Políticas configurables por IO.
 
 ### 2.5 Lifecycle
 - Estados: STARTING / READY / DRAINING / STOPPED.
@@ -130,57 +124,46 @@ Funciones mÃ­nimas:
 
 ### 2.6 Observabilidad
 - Logs estructurados comunes.
-- MÃ©tricas estÃ¡ndar.
-- PropagaciÃ³n de `trace_id`.
+- Métricas estándar.
+- Propagación de `trace_id`.
 
 ---
 
 ## 3. Capa 3: Identidad (IdentityResolver)
 
-Para garantizar la coherencia del sistema y cumplir con la arquitectura de capas (ver Doc 10), el `io-common` integra un mecanismo obligatorio de resoluciÃ³n de identidades. El objetivo es que los nodos internos (AI, WF) nunca operen con IDs propietarios de canales (ej: Slack IDs), sino Ãºnicamente con **ILKs** (`ilk:<uuid>`).
+Para garantizar coherencia entre adaptadores IO, `io-common` expone un contrato
+de identidad centrado en inbound:
+- resolver `src_ilk` por `(channel, external_id)` cuando sea posible,
+- provisionar en miss si está habilitado,
+- degradar a `src_ilk=null` cuando no se logra resolver.
 
 ### 3.1 Interfaz del Resolver (Contrato)
-El `io-common` define este contrato que el Nodo IO debe implementar al inicializarse. Esta interfaz actÃºa como un puente hacia la librerÃ­a de sistema `SY.identity`.
+El contrato operativo en runtime está compuesto por:
 
-| MÃ©todo | Entrada | Salida | DescripciÃ³n |
-| :--- | :--- | :--- | :--- |
-| `resolve_to_ilk` | `provider`, `external_id` | `Result<ILK>` | **Inbound:** Mapea ID de canal a ILK universal. |
-| `resolve_to_external` | `ilk`, `provider` | `Result<String>` | **Outbound:** Mapea ILK a ID de canal para entrega. |
+- `IdentityResolver::lookup(channel, external_id) -> Option<src_ilk>`
+- `IdentityProvisioner::provision(input) -> Option<src_ilk>`
+- `InboundProcessor` como orquestador del flujo (lookup/provision/fallback)
 
-### 3.2 Flujo Inbound (Canal â†’ Router)
+### 3.2 Flujo Inbound (Canal -> Router)
 Cada vez que el Nodo IO recibe un mensaje o evento desde el exterior:
-1. **ExtracciÃ³n:** El Nodo IO extrae el ID del proveedor (ej: `U12345`).
-2. **ResoluciÃ³n:** Se invoca `resolve_to_ilk("slack", "U12345")`.
-3. **ValidaciÃ³n:** Si la resoluciÃ³n falla, el mensaje **no debe entrar al Router**. Se queda en la capa de persistencia del IO para reintento o descarte.
-4. **Enriquecimiento:** Si tiene Ã©xito, el `io-common` construye el mensaje inyectando el resultado en `meta.src_ilk`.
+1. **Extracción:** El Nodo IO extrae el ID del proveedor (ej: `U12345`).
+2. **Lookup:** `lookup(channel, external_id)`.
+3. **Provision on miss (opcional por config):** si hay miss/error, intentar `ILK_PROVISION`.
+4. **Forward al Router:** con `meta.context.src_ilk=<ilk>` si hubo éxito, o `null` en fallback.
 
-### 3.3 Flujo Outbound (Router â†’ Canal)
-Cuando el Router entrega un mensaje para ser enviado al exterior:
-1. **Captura:** El worker de **Outbox** toma el mensaje que contiene un `meta.dst_ilk`.
-2. **TraducciÃ³n:** Se invoca `resolve_to_external(dst_ilk, "slack")`.
-3. **PreparaciÃ³n:** El estado del mensaje en el outbox pasa a `READY_TO_SEND` solo si se obtiene un ID externo vÃ¡lido.
-4. **Despacho:** El Nodo IO usa ese ID para llamar a la API del canal (ej: `chat.postMessage`).
-
-### 3.4 Manejo de Errores y Estados en Outbox
-Para el MVP, se aÃ±ade el estado `RESOLVING_ID` en el ciclo de vida del Outbox para manejar fallos en la comunicaciÃ³n con el servicio de identidad sin bloquear el flujo de red del IO.
-
-| Estado | DescripciÃ³n |
-| :--- | :--- |
-| `PENDING` | Mensaje recibido del router, guardado en DB local. |
-| `RESOLVING_ID` | Consultando al `IdentityResolver` el mapeo de ILK a External ID. |
-| `READY_TO_SEND` | Identidad resuelta con Ã©xito, listo para el envÃ­o al canal. |
-| `SENT` | ConfirmaciÃ³n de entrega (ACK) recibida por el proveedor externo. |
-| `FAILED` | Error irrecuperable en resoluciÃ³n o envÃ­o. |
+### 3.3 Outbound
+La resolución de destino outbound es por `meta.context.io.reply_target` (contrato IO Context).
+No depende de un resolver de identidad adicional en `io-common`.
 
 ---
 
 ## Fuera de alcance de io-common
 
-- ValidaciÃ³n de firmas de proveedores.
-- AutenticaciÃ³n OAuth.
-- ExtracciÃ³n de IDs especÃ­ficos de canal.
+- Validación de firmas de proveedores.
+- Autenticación OAuth.
+- Extracción de IDs específicos de canal.
 - Decisiones de routing u OPA.
-- GestiÃ³n de secretos.
+- Gestión de secretos.
 
 ---
 
@@ -189,17 +172,17 @@ Para el MVP, se aÃ±ade el estado `RESOLVING_ID` en el ciclo de vida del Outbox
 ### 4.1 Interfaces principales
 
 **InboundAdapter (por canal)**
-- parse_event(raw) â†’ InboundEvent
-- dedup_key(event) â†’ DedupKey
-- session_key(event) â†’ SessionKey?
-- to_internal_message(event|turn) â†’ Message
+- parse_event(raw) -> InboundEvent
+- dedup_key(event) -> DedupKey
+- session_key(event) -> SessionKey?
+- to_internal_message(event|turn) -> Message
 
 **OutboundAdapter (por canal)**
-- build_outbound(message) â†’ OutboxItem
-- send(outbox_item) â†’ SendResult
+- build_outbound(message) -> OutboxItem
+- send(outbox_item) -> SendResult
 
 **ErrorClassifier**
-- classify(error) â†’ retryable | non_retryable | rate_limited | auth_error
+- classify(error) -> retryable | non_retryable | rate_limited | auth_error
 
 **Storage**
 - dedup_store
@@ -213,21 +196,21 @@ Para el MVP, se aÃ±ade el estado `RESOLVING_ID` en el ciclo de vida del Outbox
 ## 4.X Contrato de metadata IO (meta.context.io (TENTATIVO))
 
 `io-common` **DEBE** proveer utilidades para construir y validar el bloque estandarizado
-`meta.context.io (TENTATIVO)` (ver tambiÃ©n la spec de Nodos IO). El objetivo es que todos los IO produzcan/consuman
-una metadata homogÃ©nea, minimizando excepciones por canal.
+`meta.context.io (TENTATIVO)` (ver también la spec de Nodos IO). El objetivo es que todos los IO produzcan/consuman
+una metadata homogénea, minimizando excepciones por canal.
 
 Elementos clave:
-- `entrypoint`: identidad/cuenta del negocio (p.ej. nÃºmero A vs B).
-- `reply_target`: parÃ¡metros mÃ­nimos para responder (contrato clave).
+- `entrypoint`: identidad/cuenta del negocio (p.ej. número A vs B).
+- `reply_target`: parámetros mínimos para responder (contrato clave).
 - `message.id`: ID externo para dedup best-effort.
 - `conversation`: identificador externo (y thread si aplica).
 
 `io-common` **PUEDE** proveer helpers tipo:
 - `build_io_context_inbound(...)`
 - `extract_reply_target(outbound_message)`
-- `propagate_io_context(inbound â†’ outbound)`
+- `propagate_io_context(inbound -> outbound)`
 
-> Nota: el contenido exacto por canal se modela vÃ­a `reply_target.kind` y `reply_target.params`.
+> Nota: el contenido exacto por canal se modela vía `reply_target.kind` y `reply_target.params`.
 
 
 ## 5. Estado y almacenamiento (dentro del IO)
@@ -241,42 +224,42 @@ Por lo tanto, `io-common` implementa almacenamiento **en memoria** para:
 
 ### 5.1 Reglas obligatorias de acotamiento
 
-`io-common` **DEBE** exponer configuraciÃ³n para limitar memoria y evitar crecimiento sin control:
+`io-common` **DEBE** exponer configuración para limitar memoria y evitar crecimiento sin control:
 
 - `dedup.ttl_ms`, `dedup.max_entries`, `dedup.max_bytes`
 - `session.window_ms`, `session.max_sessions`, `session.max_fragments`, `session.max_bytes`
 - `outbox.max_pending`, `outbox.max_inflight`, `outbox.max_age_ms`
-- polÃ­ticas de expulsiÃ³n (eviction) y flush forzado
+- políticas de expulsión (eviction) y flush forzado
 
-`io-common` **DEBE** exponer mÃ©tricas por:
+`io-common` **DEBE** exponer métricas por:
 - evictions,
-- drops (por lÃ­mites),
+- drops (por límites),
 - size actual de caches/colas,
 - timeouts.
 
 ---
 
-## 6. Opciones futuras: persistencia y aceleraciÃ³n fuera del IO
+## 6. Opciones futuras: persistencia y aceleración fuera del IO
 
-Si en el futuro el sistema permite persistencia para IO, hay dos caminos tÃ­picos:
+Si en el futuro el sistema permite persistencia para IO, hay dos caminos típicos:
 
-- **Postgres** (fuente de verdad) para dedup/outbox/mapeos (idempotencia) con auditorÃ­a.
+- **Postgres** (fuente de verdad) para dedup/outbox/mapeos (idempotencia) con auditoría.
 - **Redis** como acelerador (cache TTL, buffers temporales, rate limiting).
 
-Estas opciones **NO** estÃ¡n habilitadas dentro del IO bajo las directivas actuales, pero el diseÃ±o
-de `io-common` debe mantener puntos de extensiÃ³n para incorporarlas (por ejemplo, una interfaz `StorageBackend`).
+Estas opciones **NO** están habilitadas dentro del IO bajo las directivas actuales, pero el diseño
+de `io-common` debe mantener puntos de extensión para incorporarlas (por ejemplo, una interfaz `StorageBackend`).
  (post-MVP)
 
 ### 6.1 Usos recomendados
 - Cache de dedup (SETNX + TTL).
-- Buffer temporal de sessionizaciÃ³n.
+- Buffer temporal de sessionización.
 - Rate limiting distribuido.
 
 ### 6.2 No recomendado como fuente de verdad
 - Outbox durable.
-- AuditorÃ­a final.
+- Auditoría final.
 
-### 6.3 Modelo hÃ­brido
+### 6.3 Modelo híbrido
 - Redis fast-path + Postgres truth.
 - Fallback a Postgres ante misses.
 
@@ -285,12 +268,12 @@ de `io-common` debe mantener puntos de extensiÃ³n para incorporarlas (por ejem
 ## 7. Decisiones abiertas
 
 ### 7.1 DB por IO vs schema por IO
-- DB por IO: mÃ¡s aislamiento, mÃ¡s ops.
+- DB por IO: más aislamiento, más ops.
 - Schema por IO: menos ops, menos aislamiento.
 
-### 7.2 SessionizaciÃ³n obligatoria u opcional
+### 7.2 Sessionización obligatoria u opcional
 - Obligatoria en chat: menos ruido downstream.
-- Opcional: MVP mÃ¡s simple.
+- Opcional: MVP más simple.
 
 ### 7.3 Estrategia de claiming del outbox
 - SELECT FOR UPDATE SKIP LOCKED.
@@ -306,19 +289,19 @@ de `io-common` debe mantener puntos de extensiÃ³n para incorporarlas (por ejem
 ## 8. Si no se usa io-common
 
 Cada Nodo IO debe implementar:
-- deduplicaciÃ³n durable,
+- deduplicación durable,
 - outbox y retries,
 - backoff,
 - lifecycle y draining,
-- mÃ©tricas y logging,
-- sessionizaciÃ³n (si aplica).
+- métricas y logging,
+- sessionización (si aplica).
 
 Riesgos:
 - inconsistencia entre canales,
-- bugs de duplicaciÃ³n,
-- alta deuda tÃ©cnica.
+- bugs de duplicación,
+- alta deuda técnica.
 
-MitigaciÃ³n mÃ­nima:
+Mitigación mínima:
 - checklist de conformidad + tests de contrato.
 
 ---
@@ -326,14 +309,14 @@ MitigaciÃ³n mÃ­nima:
 ## 9. Entregables de io-common
 
 - Migraciones SQL versionadas.
-- API pÃºblica estable.
-- MÃ©tricas estÃ¡ndar.
-- DocumentaciÃ³n de integraciÃ³n.
+- API pública estable.
+- Métricas estándar.
+- Documentación de integración.
 
 
 ---
 
-## Anexo A â€“ Esquema sugerido si se habilita Postgres (post-MVP)
+## Anexo A - Esquema sugerido si se habilita Postgres (post-MVP)
 
 > Este anexo es **informativo** y **no aplica** mientras los IO no puedan usar DB/Redis.
 
@@ -344,7 +327,7 @@ MitigaciÃ³n mÃ­nima:
 - `expires_at TIMESTAMPTZ NOT NULL`
 - `meta JSONB NULL`
 
-OperaciÃ³n: `INSERT ... ON CONFLICT DO NOTHING` (conflict â‡’ DUPLICATE).
+Operación: `INSERT ... ON CONFLICT DO NOTHING` (conflict => DUPLICATE).
 
 ### A.2 Tabla `io_outbox` (outbound)
 
@@ -362,9 +345,9 @@ OperaciÃ³n: `INSERT ... ON CONFLICT DO NOTHING` (conflict â‡’ DUPLICATE).
 - `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`
 - `updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`
 
-Ãndices: `(state, next_attempt_at)`, `(lock_until)`.
+Índices: `(state, next_attempt_at)`, `(lock_until)`.
 
-### A.3 Tabla `io_session_buffer` (sessionizaciÃ³n)
+### A.3 Tabla `io_session_buffer` (sessionización)
 
 - `session_key TEXT PRIMARY KEY`
 - `buffer JSONB NOT NULL`
@@ -372,66 +355,44 @@ OperaciÃ³n: `INSERT ... ON CONFLICT DO NOTHING` (conflict â‡’ DUPLICATE).
 - `updated_at TIMESTAMPTZ NOT NULL`
 
 
-> **Outbox (aclaraciÃ³n):** El outbox de los nodos IO **no es durable**. Su estado vive Ãºnicamente en memoria y puede perderse ante reinicios. Sin embargo, **se mantiene el mecanismo ya establecido de TTL, retries y ventana de vida mÃ¡xima**, tras la cual los mensajes pendientes se descartan.
+> **Outbox (aclaración):** El outbox de los nodos IO **no es durable**. Su estado vive únicamente en memoria y puede perderse ante reinicios. Sin embargo, **se mantiene el mecanismo ya establecido de TTL, retries y ventana de vida máxima**, tras la cual los mensajes pendientes se descartan.
 
 ---
 
-## Aclaraciones v1.16 â€“ AlineaciÃ³n con Fluxbee
+## Aclaraciones v1.16+ - Alineacion con Fluxbee
 
 ### Identidad L3
 
-El Nodo IO **NO debe esperar ni consumir mensajes sÃ­ncronos de `SY.identity`**.
+El Nodo IO no debe bloquear ACK inbound esperando identidad.
 
-La resoluciÃ³n de identidad se realiza **exclusivamente mediante lectura de Shared Memory**
-(`jsr-identity-<island>`, vÃ­a `jsr-identity` / `jsr-identity-client`).
+Pipeline normativo:
+1. lookup en SHM (`jsr-identity-<island>`)
+2. si hay miss/error: `ILK_PROVISION` contra `SY.identity` (provision_on_miss)
+3. si provision falla/timeout: forward degradado con `meta.context.src_ilk = null`
 
-Cuando no se puede resolver `src_ilk`, el Nodo IO **DEBE** enviar el mensaje al Router con
-`meta.src_ilk = null` y permitir que el Router (vÃ­a OPA) desvÃ­e el flujo a onboarding.
-
-Esta definiciÃ³n reemplaza cualquier mecanismo previo de espera, buffer o relay
-de identidad en el Nodo IO.
+Mientras el SDK no exponga campos L3 tipados, el carrier vigente es `meta.context.src_ilk`.
 
 ---
 
 ### Contexto (`ctx_window`)
 
-`ctx_window` es inyectado **Ãºnicamente por el Router** y contiene los Ãºltimos 20 turns
-del contexto conversacional.
-
-El Nodo IO:
-- DEBE aceptar mensajes que incluyan `ctx_window`
-- NO DEBE reenviar `ctx_window` al canal externo
-- NO DEBE persistir ni exponer este campo al usuario final
-
-Cualquier referencia previa a manejo de historial conversacional en el Nodo IO
-debe considerarse obsoleta.
+`ctx_window` lo inyecta Router. IO puede recibirlo, pero no debe reenviarlo al canal externo.
 
 ---
 
 ### Protocolo (`meta.ctx` vs `meta.context`)
 
-SegÃºn la especificaciÃ³n del Router v1.16:
-
-- `meta.ctx` representa el **Contexto Conversacional (CTX)**
-- `meta.context` se reserva exclusivamente para **datos adicionales evaluados por OPA**
-
-`meta.context` **NO** debe utilizarse para almacenar historia, turns ni contexto
-conversacional.
+- `meta.ctx`: contexto conversacional
+- `meta.context`: metadata adicional (OPA + carrier temporal)
+- IO metadata de canal bajo `meta.context.io.*`
 
 ---
 
 ### Persistencia en el Nodo IO
 
-Cuando esta especificaciÃ³n menciona persistencia "en memoria", se refiere a la
-**implementaciÃ³n MVP**.
+El MVP usa memoria para estado tecnico local (dedup/sessions/outbox).
+IO no es source of truth; la persistencia canonica permanece en core (Router/Storage/Identity).
 
-Normativamente, el Nodo IO **DEBE definir una interfaz de persistencia**, cuya
-implementaciÃ³n puede variar:
 
-- MVP: InMemory
-- EvoluciÃ³n: SQLite
-- Escala: PostgreSQL
 
-El Nodo IO **NO es source of truth**. La persistencia canÃ³nica corresponde al Router
-y a los nodos de Storage.
 

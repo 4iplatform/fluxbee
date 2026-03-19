@@ -114,6 +114,25 @@ bash scripts/publish-io-runtime.sh --kind slack --version "$NEW_VERSION" --set-c
    - opcion A: `KILL_NODE` + `SPAWN_NODE` (recomendado, explicito)
    - opcion B: si tu capa admin expone restart directo, usar restart del nodo
 
+Atajo automatizado (recomendado):
+
+```bash
+bash scripts/deploy-io-slack.sh \
+  --base "$BASE" \
+  --hive-id "$HIVE_ID" \
+  --version "$NEW_VERSION" \
+  --node-name "$NODE_NAME" \
+  --update-existing \
+  --sync-hint \
+  --sudo
+```
+
+`--update-existing` hace:
+- publish runtime nuevo
+- update runtime con retries en `sync_pending`
+- GET config actual del nodo
+- kill-first + spawn reutilizando esa config
+
 Ejemplo A (kill + spawn):
 
 ```bash
@@ -159,3 +178,33 @@ Opcional:
 `scripts/install-io.sh` sigue siendo util para desarrollo local rapido (systemd + env file),
 pero no reemplaza el pipeline canónico `publish -> update -> spawn`.
 
+---
+
+## 8) Script automatizado (publish + update + spawn opcional)
+
+Se agregó:
+- `scripts/deploy-io-slack.sh`
+
+Ejemplo (deploy + spawn):
+
+```bash
+bash scripts/deploy-io-slack.sh \
+  --base "$BASE" \
+  --hive-id "$HIVE_ID" \
+  --version "0.1.0" \
+  --node-name "IO.slack.T123@$HIVE_ID" \
+  --app-token "xapp-REPLACE_ME" \
+  --bot-token "xoxb-REPLACE_ME" \
+  --identity-target "SY.identity" \
+  --identity-fallback "SY.identity@$HIVE_ID" \
+  --identity-timeout-ms 10000 \
+  --sync-hint \
+  --kill-first \
+  --sudo
+```
+
+El script:
+- parsea `manifest_version`/`manifest_hash` desde publish,
+- reintenta `update` si recibe `sync_pending`,
+- loguea cada paso en archivo (`/tmp/deploy-io-slack-<ts>.log` por defecto).
+- soporta `--update-existing` para actualizar codigo de nodo existente reutilizando su config.

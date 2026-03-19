@@ -56,12 +56,24 @@ Expected output includes:
 Use those values with:
 - `POST /hives/{id}/update` (`category=runtime`)
 
+Deploy runbook:
+- `docs/io/io-slack-deploy-runbook.md`
+
 ## Run (linux target expected in production)
 
 Required env vars:
 
 - `SLACK_APP_TOKEN`
 - `SLACK_BOT_TOKEN`
+
+Spawn/orchestrator mode note:
+- `io-slack` can also read tokens/config from spawn `config.json` under
+  `/var/lib/fluxbee/nodes/IO/<node_name>/config.json`
+  (or `NODE_CONFIG_PATH` override).
+- Supported token fields in config:
+  - `slack.app_token` / `slack.bot_token`
+  - `slack.app_token_ref` / `slack.bot_token_ref` with `env:VAR` indirection
+- Precedence: explicit env vars override spawn config values.
 
 Optional env vars:
 
@@ -74,7 +86,7 @@ Optional env vars:
 - `DEV_MODE` (`true|false`, default `false`)
 - `DEDUP_TTL_MS` (default `600000`)
 - `DEDUP_MAX_ENTRIES` (default `50000`)
-- `IO_SLACK_DST_NODE` (optional fixed unicast destination, e.g. `AI.chat@sandbox`; if omitted uses `resolve`)
+- `IO_SLACK_DST_NODE` (optional fixed unicast destination, e.g. `AI.chat@sandbox`; if omitted uses `resolve`; keep fixed dst for test/recovery only, not production baseline)
 - `SLACK_SESSION_WINDOW_MS` (default `0` to disable)
 - `SLACK_SESSION_MAX_SESSIONS` (default `10000`)
 - `SLACK_SESSION_MAX_FRAGMENTS` (default `8`)

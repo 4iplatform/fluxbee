@@ -16,6 +16,7 @@ Required:
 Options:
   --binary <path>          Binary path (default: target/release/ai_node_runner)
   --dist-root <path>       Dist root (default: /var/lib/fluxbee/dist)
+  --mode <default|gov>     Default AI_NODE_MODE for published start.sh (default: default)
   --set-current            Set current version in manifest
   --sudo                   Use sudo for writes
   --skip-build             Skip cargo build
@@ -30,6 +31,7 @@ DIST_ROOT=""
 SET_CURRENT=0
 USE_SUDO=0
 SKIP_BUILD=0
+MODE="default"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -47,6 +49,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dist-root)
       DIST_ROOT="${2:-}"
+      shift 2
+      ;;
+    --mode)
+      MODE="${2:-}"
       shift 2
       ;;
     --set-current)
@@ -79,6 +85,15 @@ if [[ -z "$RUNTIME" || -z "$VERSION" ]]; then
   exit 1
 fi
 
+case "$MODE" in
+  default|gov)
+    ;;
+  *)
+    echo "Error: --mode must be default or gov (got '$MODE')" >&2
+    exit 1
+    ;;
+esac
+
 if [[ "$SKIP_BUILD" != "1" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
     echo "Error: cargo not found (use --skip-build if binary already exists)" >&2
@@ -87,7 +102,7 @@ if [[ "$SKIP_BUILD" != "1" ]]; then
   (cd "$ROOT_DIR" && cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner)
 fi
 
-cmd=("$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --binary "$BINARY")
+cmd=(bash "$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --binary "$BINARY")
 if [[ -n "$DIST_ROOT" ]]; then
   cmd+=(--dist-root "$DIST_ROOT")
 fi
@@ -99,3 +114,46 @@ if [[ "$USE_SUDO" == "1" ]]; then
 fi
 
 "${cmd[@]}"
+
+DIST_ROOT_EFFECTIVE="${DIST_ROOT:-/var/lib/fluxbee/dist}"
+RUNTIME_DIR="$DIST_ROOT_EFFECTIVE/runtimes/$RUNTIME/$VERSION"
+BIN_DIR="$RUNTIME_DIR/bin"
+START_SH="$BIN_DIR/start.sh"
+BINARY_NAME="$(basename "$BINARY")"
+
+tmp_start="$(mktemp)"
+cat >"$tmp_start" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n "\${NODE_NAME:-}" && -z "\${AI_NODE_NAME:-}" ]]; then
+  export AI_NODE_NAME="\${NODE_NAME}"
+fi
+if [[ -n "\${ROUTER_SOCKET:-}" && -z "\${AI_ROUTER_SOCKET:-}" ]]; then
+  export AI_ROUTER_SOCKET="\${ROUTER_SOCKET}"
+fi
+if [[ -n "\${UUID_PERSISTENCE_DIR:-}" && -z "\${AI_UUID_PERSISTENCE_DIR:-}" ]]; then
+  export AI_UUID_PERSISTENCE_DIR="\${UUID_PERSISTENCE_DIR}"
+fi
+if [[ -n "\${CONFIG_DIR:-}" && -z "\${AI_CONFIG_DIR:-}" ]]; then
+  export AI_CONFIG_DIR="\${CONFIG_DIR}"
+fi
+if [[ -n "\${AI_DYNAMIC_CONFIG_DIR:-}" ]]; then
+  :
+elif [[ -n "\${STATE_DIR:-}" ]]; then
+  export AI_DYNAMIC_CONFIG_DIR="\${STATE_DIR}/ai-nodes"
+fi
+if [[ -z "\${AI_NODE_MODE:-}" ]]; then
+  export AI_NODE_MODE="$MODE"
+fi
+SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+exec "\$SCRIPT_DIR/$BINARY_NAME" "\$@"
+EOF
+
+if [[ "$USE_SUDO" == "1" ]]; then
+  sudo install -m 0755 "$tmp_start" "$START_SH"
+else
+  install -m 0755 "$tmp_start" "$START_SH"
+fi
+rm -f "$tmp_start"
+
+echo "Configured AI start.sh mode default: $MODE"

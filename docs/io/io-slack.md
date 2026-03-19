@@ -1,4 +1,4 @@
-﻿# Nodo IO â€“ Slack (EspecificaciÃ³n MVP)
+﻿# Nodo IO - Slack (Especificación MVP)
 > Adaptation note for `json-router`:
 > This spec is imported and kept as functional baseline.
 > If a section conflicts with router v1.16+ docs in this repo, follow `docs/io/README.md` precedence.
@@ -8,11 +8,11 @@
 El **Nodo IO Slack** es el adaptador entre Slack y el sistema interno (router + nodos).
 Para el MVP, su objetivo es:
 
-- **Inbound:** recibir mensajes Ãºnicamente a travÃ©s de **menciones al bot** (`app_mention`).
+- **Inbound:** recibir mensajes únicamente a través de **menciones al bot** (`app_mention`).
 - **Outbound:** enviar mensajes a Slack usando la **Slack Web API** (`chat.postMessage`).
 
-Este documento **extiende** la especificaciÃ³n base de Nodos IO y define Ãºnicamente
-las decisiones y necesidades **especÃ­ficas de Slack**.
+Este documento **extiende** la especificación base de Nodos IO y define únicamente
+las decisiones y necesidades **específicas de Slack**.
 
 ---
 
@@ -21,31 +21,31 @@ las decisiones y necesidades **especÃ­ficas de Slack**.
 - Existe **una sola instancia activa** del Nodo IO Slack por app/workspace.
 - Se acepta downtime si el nodo cae.
 - Los Nodos IO **NO** manejan base de datos ni Redis; por lo tanto:
-  - deduplicaciÃ³n y sessionizaciÃ³n son **en memoria** (*best-effort*),
+  - deduplicación y sessionización son **en memoria** (*best-effort*),
   - retries/outbox outbound son **en memoria** (*best-effort*),
-  - tras reinicio se pierde el estado tÃ©cnico.
+  - tras reinicio se pierde el estado técnico.
 
-> Nota: para evitar inconsistencias con necesidades futuras de durabilidad, la lÃ³gica interna del IO deberÃ­a usar una **interfaz de persistencia** (MVP: InMemory) tal como se define en `io-common.md`.
+> Nota: para evitar inconsistencias con necesidades futuras de durabilidad, la lógica interna del IO debería usar una **interfaz de persistencia** (MVP: InMemory) tal como se define en `io-common.md`.
 
 ---
 
-## 3. Inbound: recepciÃ³n de mensajes desde Slack
+## 3. Inbound: recepción de mensajes desde Slack
 
-### 3.1 Mecanismo de recepciÃ³n
+### 3.1 Mecanismo de recepción
 
 El Nodo IO Slack **DEBE** soportar uno de los siguientes modos:
 
-#### OpciÃ³n A â€“ Socket Mode (recomendado para MVP)
-- ConexiÃ³n WebSocket usando **App-Level Token** (`xapp-...`).
+#### Opción A - Socket Mode (recomendado para MVP)
+- Conexión WebSocket usando **App-Level Token** (`xapp-...`).
 - Scope requerido: `connections:write`.
-- No requiere endpoint HTTP pÃºblico.
+- No requiere endpoint HTTP público.
 
-#### OpciÃ³n B â€“ Events API (HTTP)
-- Endpoint HTTPS pÃºblico.
+#### Opción B - Events API (HTTP)
+- Endpoint HTTPS público.
 - Soporte de `url_verification` (responder el `challenge` en plaintext).
-- ValidaciÃ³n de firma usando el **Signing Secret** de Slack.
+- Validación de firma usando el **Signing Secret** de Slack.
 
-La elecciÃ³n del modo **NO afecta** el contrato interno del IO.
+La elección del modo **NO afecta** el contrato interno del IO.
 
 ---
 
@@ -56,7 +56,7 @@ El Nodo IO Slack **SOLO** procesa eventos:
 
 Campos relevantes del evento Slack:
 - `user`: ID del usuario que menciona al bot.
-- `channel`: ID del canal donde ocurriÃ³ la menciÃ³n.
+- `channel`: ID del canal donde ocurrió la mención.
 - `text`: contenido del mensaje.
 - `ts`: timestamp del mensaje.
 - `thread_ts`: timestamp del hilo (si aplica).
@@ -66,22 +66,22 @@ Otros eventos **DEBEN** ser ignorados.
 
 ---
 
-## 4. DeduplicaciÃ³n inbound (Slack)
+## 4. Deduplicación inbound (Slack)
 
 Slack puede reenviar eventos si:
 - no recibe ACK,
 - el ACK es lento,
 - o hay errores transitorios.
 
-### Clave de deduplicaciÃ³n recomendada (en orden de preferencia)
-1. `event_id` (si estÃ¡ presente)
+### Clave de deduplicación recomendada (en orden de preferencia)
+1. `event_id` (si está presente)
 2. `(team_id, channel, ts)` como surrogate estable
 
-### ImplementaciÃ³n (sin DB/Redis)
-- CachÃ© en memoria con TTL.
-- LÃ­mite por tamaÃ±o: `max_entries`/`max_bytes`.
+### Implementación (sin DB/Redis)
+- Caché en memoria con TTL.
+- Límite por tamaño: `max_entries`/`max_bytes`.
 - Eviction (TTL-LRU o drop-oldest).
-- MÃ©tricas: dedup_hits, dedup_misses, evictions.
+- Métricas: dedup_hits, dedup_misses, evictions.
 
 ### Regla operativa
 - El ACK a Slack **DEBE** enviarse lo antes posible, sin esperar respuesta del router ni de identidad.
@@ -90,20 +90,20 @@ Slack puede reenviar eventos si:
 
 ---
 
-## 5. SessionizaciÃ³n (Slack)
+## 5. Sessionización (Slack)
 
 ### Objetivo
-Agrupar mÃºltiples mensajes consecutivos del mismo usuario en el mismo canal/hilo
-en un Ãºnico turno lÃ³gico.
+Agrupar múltiples mensajes consecutivos del mismo usuario en el mismo canal/hilo
+en un único turno lógico.
 
 ### Reglas MVP
-- **PUEDE** aplicarse sessionizaciÃ³n para Slack.
+- **PUEDE** aplicarse sessionización para Slack.
 - Clave sugerida:
 ```
 (channel, user, thread_ts || channel)
 ```
-- Ventana de tiempo configurable (ej: 2â€“5 segundos).
-- Si el nodo se reinicia durante la ventana, el MVP **PUEDE** aceptar pÃ©rdida
+- Ventana de tiempo configurable (ej: 2-5 segundos).
+- Si el nodo se reinicia durante la ventana, el MVP **PUEDE** aceptar pérdida
 de agrupamiento (mensajes procesados separados).
 
 ---
@@ -111,39 +111,49 @@ de agrupamiento (mensajes procesados separados).
 ## 6. Identidad (L3) y despacho al router
 
 ### 6.1 Requisito
-El Nodo IO Slack **DEBE** intentar resolver `meta.src_ilk` por SHM (`jsr-identity`).
+El Nodo IO Slack **DEBE** usar el flujo compartido de `io-common` para identidad:
 
-- Si hay hit: incluir `meta.src_ilk`.
-- Si hay miss: **enviar igualmente** el mensaje al Router con `meta.src_ilk = null`.
+1. `lookup` por SHM (`jsr-identity-*`)
+2. si hay miss/error: `provision_on_miss` via `SY.identity` (`ILK_PROVISION`)
+3. si provision falla o timeout: forward con `meta.context.src_ilk = null`
 
-Esto implementa la estrategia recomendada de L3: **DesvÃ­o a Onboarding (Reprocesamiento)**.
+- Si hay hit: incluir `meta.context.src_ilk`.
+- Si hay miss y provision exitoso: incluir `meta.context.src_ilk` provisionado.
+- Si hay miss y provision no exitoso: **enviar igualmente** con `meta.context.src_ilk = null`.
 
-### 6.2 IntegraciÃ³n con identidad (no bloqueante)
-El Nodo IO Slack **PUEDE** emitir un aviso *fire-and-forget* para registrar/linkear al usuario en `SY.identity`, pero:
+Esto implementa la estrategia recomendada de L3: **Desvío a Onboarding (Reprocesamiento)**.
 
-- **NO** debe bloquear el ACK,
-- **NO** debe retener el mensaje en memoria â€œpendiente de identidadâ€,
-- **NO** debe esperar un â€œreadyâ€ de `SY.identity`.
+### 6.2 Integración con identidad (ACK no bloqueante)
+El Nodo IO Slack usa `io-common::FluxbeeIdentityProvisioner` para el paso de provision.
+Regla operativa:
 
-El control de flujo (espera/reinyecciÃ³n) es responsabilidad de `WF.onboarding` y del Router.
+- **SIEMPRE** debe ACKear a Slack primero.
+- Después del ACK puede ejecutar lookup/provision en el flujo inbound.
+- No hay espera de una “sesión de identidad”; si no hay `src_ilk`, forward con `null`.
+
+El control de flujo (espera/reinyección) es responsabilidad de `WF.onboarding` y del Router.
 
 ---
 
-## 7. NormalizaciÃ³n hacia el router
+## 7. Normalización hacia el router
 
-AdemÃ¡s de `meta.src_ilk` (o `null`), el IO Slack **DEBE** adjuntar el bloque estandarizado `meta.context.io` (contrato IO Context), incluyendo `entrypoint` (workspace), `conversation` (channel/thread) y `reply_target` (channel + thread_ts).
+Además de `meta.context.src_ilk` (o `null`), el IO Slack **DEBE** adjuntar el bloque estandarizado `meta.context.io` (contrato IO Context), incluyendo `entrypoint` (workspace), `conversation` (channel/thread) y `reply_target` (channel + thread_ts).
 
-Por cada evento vÃ¡lido (`app_mention`), el Nodo IO Slack **DEBE** construir un
+Por cada evento válido (`app_mention`), el Nodo IO Slack **DEBE** construir un
 `Message` del protocolo interno con:
 
 ### routing
 - `routing.dst = null`
-- `routing.ttl`: valor estÃ¡ndar del sistema
+- `routing.ttl`: valor estándar del sistema
 - `routing.trace_id`: nuevo o propagado
+
+Interpretación operativa:
+- `routing.dst = null` implica `resolve` en el router (baseline de producción).
+- Un destino unicast fijo solo debe usarse como override de pruebas/controladas.
 
 ### meta
 - `meta.type = "user"`
-- `meta.src_ilk`: ILK representando al usuario de Slack (humano externo) **o null**
+- `meta.context.src_ilk`: ILK representando al usuario de Slack (humano externo) **o null**
 - `meta.context.io`:
 ```json
 {
@@ -162,31 +172,31 @@ Por cada evento vÃ¡lido (`app_mention`), el Nodo IO Slack **DEBE** construir u
 }
 ```
 
-> Nota: si el Router inyecta `meta.ctx_window`, el IO Slack **DEBE** aceptarlo pero **NUNCA** debe serializarlo/reenviarlo a Slack (es informaciÃ³n interna).
+> Nota: si el Router inyecta `meta.ctx_window`, el IO Slack **DEBE** aceptarlo pero **NUNCA** debe serializarlo/reenviarlo a Slack (es información interna).
 
 ### payload
 ```json
 {
   "type": "text",
-  "content": "<texto del mensaje sin la menciÃ³n al bot>",
+  "content": "<texto del mensaje sin la mención al bot>",
   "raw": { "slack_event": "..." }
 }
 ```
 
 ---
 
-## 8. Outbound: envÃ­o de mensajes a Slack
+## 8. Outbound: envío de mensajes a Slack
 
 ### 8.1 API utilizada
 - Slack Web API: `chat.postMessage`
 - Token requerido: **Bot Token** (`xoxb-...`)
-- Scope mÃ­nimo: `chat:write`
+- Scope mínimo: `chat:write`
 
-### 8.2 ResoluciÃ³n de destino
+### 8.2 Resolución de destino
 
 El Nodo IO Slack **DEBE**:
 - Enviar el mensaje al `channel` indicado.
-- Si `thread_ts` estÃ¡ presente, responder en el mismo hilo.
+- Si `thread_ts` está presente, responder en el mismo hilo.
 - Caso contrario, publicar en el canal.
 
 ---
@@ -196,20 +206,20 @@ El Nodo IO Slack **DEBE**:
 ### Modelo MVP (sin DB/Redis)
 - Outbox/cola en memoria con estados:
   - `PENDING`, `SENDING`, `SENT`, `FAILED`, `DEAD`
-- Reintentos con backoff y lÃ­mite configurable.
-- LÃ­mites obligatorios: `max_pending`, `max_inflight`, `max_age_ms`.
+- Reintentos con backoff y límite configurable.
+- Límites obligatorios: `max_pending`, `max_inflight`, `max_age_ms`.
 
 ### Idempotencia (Slack)
 Para el MVP:
 - La idempotencia outbound se garantiza por tracking en memoria del outbox.
-- No se debe reenviar un mensaje marcado como `SENT` mientras el proceso estÃ© vivo.
+- No se debe reenviar un mensaje marcado como `SENT` mientras el proceso esté vivo.
 - En caso de duda (timeout sin respuesta), se reintenta respetando backoff.
 
-> Nota: tras restart, se pierde el outbox y puede haber pÃ©rdida de outbound no enviado aÃºn.
+> Nota: tras restart, se pierde el outbox y puede haber pérdida de outbound no enviado aún.
 
 ---
 
-## 10. Manejo de errores especÃ­ficos de Slack
+## 10. Manejo de errores específicos de Slack
 
 Errores comunes a manejar:
 - `rate_limited`
@@ -218,37 +228,53 @@ Errores comunes a manejar:
 - `invalid_auth` / `token_revoked`
 
 Reglas:
-- Errores de rate limit â†’ retry con backoff.
-- Errores de permisos/configuraciÃ³n â†’ `DEAD` + auditorÃ­a.
+- Errores de rate limit -> retry con backoff.
+- Errores de permisos/configuración -> `DEAD` + auditoría.
 
 ---
 
-## 11. ConfiguraciÃ³n mÃ­nima requerida
+## 11. Configuración mínima requerida
 
 - `SLACK_APP_TOKEN` (xapp)
 - `SLACK_BOT_TOKEN` (xoxb)
 - `SLACK_SIGNING_SECRET` (si se usa Events API)
 
+Modo spawn/orchestrator (compliance path):
+- El nodo puede leer configuración desde `config.json` de spawn:
+  - ruta canónica: `/var/lib/fluxbee/nodes/IO/<node_name>/config.json`
+  - override: `NODE_CONFIG_PATH`
+- Tokens soportados en config:
+  - `slack.app_token`, `slack.bot_token`
+  - `slack.app_token_ref`, `slack.bot_token_ref` (`env:VAR`)
+- Precedencia:
+  - env explícito (`SLACK_APP_TOKEN`/`SLACK_BOT_TOKEN`) sobre config de spawn.
+
+## 12. Gaps conocidos (estado actual)
+
+- `CONFIG_CHANGED` hot-reload:
+  - pendiente implementar manejo explícito en runtime para recargar/aplicar cambios de `config.json` sin respawn.
+  - hoy, la actualización confiable de config en `IO.slack` se realiza por `KILL_NODE + SPAWN_NODE` (o restart controlado equivalente).
 
 
-### AclaraciÃ³n â€“ Identidad L3 (v1.16)
 
-El Nodo IO **NO debe esperar ni consumir mensajes sÃ­ncronos de `SY.identity`**.
+### Aclaración - Identidad L3 (v1.16+)
 
-La resoluciÃ³n de identidad se realiza **exclusivamente mediante lectura de SHM**
-(`jsr-identity-*`, vÃ­a `jsr-identity` / `jsr-identity-client`).
+El Nodo IO Slack no implementa un protocolo de sesión con Identity.
+Usa lookup por SHM + provision on miss en el pipeline compartido de `io-common`.
 
-Cuando no se puede resolver `src_ilk`, el IO **DEBE enviar el mensaje al Router con**
-`meta.src_ilk = null` y permitir que el Router (OPA) desvÃ­e el flujo a onboarding.
+La resolución primaria es por SHM (`jsr-identity-*`).
+Cuando hay miss/error, el provisioner puede enviar `ILK_PROVISION` a `SY.identity`.
 
-Esta definiciÃ³n reemplaza cualquier mecanismo previo de espera, buffer o relay
-de identidad en el Nodo IO.
+Si no se obtiene `src_ilk` (fallo/timeout), el IO **DEBE** enviar al Router con
+`meta.context.src_ilk = null` para degradación controlada/onboarding.
+
+Esta definición reemplaza cualquier modo legacy o lógica de identidad ad-hoc en el nodo Slack.
 
 
 
-### AclaraciÃ³n â€“ meta.ctx vs meta.context
+### Aclaración - meta.ctx vs meta.context
 
-SegÃºn la especificaciÃ³n del Router v1.16:
+Según la especificación del Router v1.16:
 
 - `meta.ctx` representa el **Contexto Conversacional (CTX)**
 - `meta.context` se reserva exclusivamente para **datos adicionales evaluados por OPA**
@@ -276,4 +302,7 @@ SegÃºn la especificaciÃ³n del Router v1.16:
   1) Override en memoria recibido por `CONFIG_SET` (si existe)
   2) Config local (YAML/env)
 - En reinicio, el override en memoria se pierde; si no hay config local, el nodo puede quedar `FAILED_CONFIG (missing_secret)` hasta recibir `CONFIG_SET` nuevamente.
+
+
+
 
