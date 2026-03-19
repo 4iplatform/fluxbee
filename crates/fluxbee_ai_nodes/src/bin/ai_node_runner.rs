@@ -467,6 +467,7 @@ impl GovIdentityBridge {
             meta: Meta {
                 msg_type: SYSTEM_KIND.to_string(),
                 msg: Some(action.to_string()),
+                src_ilk: None,
                 scope: None,
                 target: None,
                 action: None,
@@ -657,12 +658,23 @@ impl AiNode for GenericAiNode {
             thread_id: extract_thread_id(&msg),
             src_ilk: extract_src_ilk(&msg),
         };
-        if msg.meta.msg_type.eq_ignore_ascii_case("user") && behavior_ctx.src_ilk.is_none() {
-            tracing::warn!(
-                node_name = %self.node_name,
-                trace_id = %msg.routing.trace_id,
-                "missing src_ilk in incoming user message"
-            );
+        if msg.meta.msg_type.eq_ignore_ascii_case("user") {
+            let src_ilk_source = src_ilk_source(&msg);
+            if behavior_ctx.src_ilk.is_none() {
+                tracing::warn!(
+                    node_name = %self.node_name,
+                    trace_id = %msg.routing.trace_id,
+                    src_ilk_source = src_ilk_source,
+                    "missing src_ilk in incoming user message"
+                );
+            } else {
+                tracing::debug!(
+                    node_name = %self.node_name,
+                    trace_id = %msg.routing.trace_id,
+                    src_ilk_source = src_ilk_source,
+                    "resolved src_ilk in incoming user message"
+                );
+            }
         }
 
         let behavior = self.behavior.read().await.clone();
@@ -2400,6 +2412,16 @@ fn extract_thread_id(msg: &Message) -> Option<String> {
 }
 
 fn extract_src_ilk(msg: &Message) -> Option<String> {
+    if let Some(src_ilk) = msg
+        .meta
+        .src_ilk
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+    {
+        return Some(src_ilk);
+    }
     msg.meta
         .context
         .as_ref()
@@ -2408,6 +2430,30 @@ fn extract_src_ilk(msg: &Message) -> Option<String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToString::to_string)
+}
+
+fn src_ilk_source(msg: &Message) -> &'static str {
+    if msg
+        .meta
+        .src_ilk
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty())
+    {
+        return "meta";
+    }
+    if msg
+        .meta
+        .context
+        .as_ref()
+        .and_then(|ctx| ctx.get("src_ilk"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty())
+    {
+        return "context_legacy";
+    }
+    "missing"
 }
 
 #[allow(dead_code)]
@@ -2441,6 +2487,7 @@ mod tests {
             meta: Meta {
                 msg_type: "system".to_string(),
                 msg: Some(MSG_NODE_STATUS_GET.to_string()),
+                src_ilk: None,
                 scope: None,
                 target: None,
                 action: None,
@@ -2552,7 +2599,7 @@ mod tests {
         std::env::remove_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED);
     }
 
-    fn sample_user_request_with_context(context: Value) -> Message {
+    fn sample_user_request_with_context(context: Value, top_level_src_ilk: Option<&str>) -> Message {
         Message {
             routing: Routing {
                 src: "IO.sim.local@motherbee".to_string(),
@@ -2563,6 +2610,7 @@ mod tests {
             meta: Meta {
                 msg_type: "user".to_string(),
                 msg: None,
+                src_ilk: top_level_src_ilk.map(ToString::to_string),
                 scope: None,
                 target: None,
                 action: None,
@@ -2643,14 +2691,36 @@ mod tests {
     }
 
     #[test]
-    fn extract_src_ilk_reads_from_meta_context() {
-        let msg = sample_user_request_with_context(json!({
-            "src_ilk": "ilk:11111111-1111-4111-8111-111111111111"
-        }));
+    fn extract_src_ilk_reads_from_meta_top_level_first() {
+        let msg = sample_user_request_with_context(
+            json!({ "src_ilk": "ilk:legacy-context-value" }),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
         assert_eq!(
             extract_src_ilk(&msg).as_deref(),
             Some("ilk:11111111-1111-4111-8111-111111111111")
         );
+        assert_eq!(src_ilk_source(&msg), "meta");
+    }
+
+    #[test]
+    fn extract_src_ilk_falls_back_to_meta_context_legacy() {
+        let msg = sample_user_request_with_context(
+            json!({ "src_ilk": "ilk:11111111-1111-4111-8111-111111111111" }),
+            None,
+        );
+        assert_eq!(
+            extract_src_ilk(&msg).as_deref(),
+            Some("ilk:11111111-1111-4111-8111-111111111111")
+        );
+        assert_eq!(src_ilk_source(&msg), "context_legacy");
+    }
+
+    #[test]
+    fn extract_src_ilk_reports_missing_when_absent() {
+        let msg = sample_user_request_with_context(json!({}), None);
+        assert_eq!(extract_src_ilk(&msg), None);
+        assert_eq!(src_ilk_source(&msg), "missing");
     }
 
     #[test]
