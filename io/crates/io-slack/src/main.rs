@@ -20,6 +20,10 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use url::Url;
 
+// TEMPORARY WORKAROUND (remove once core spawn contract injects NODE_CONFIG_PATH/NODE_NAME/ISLAND_ID)
+const TEMP_FORCED_SPAWN_CONFIG_PATH: &str =
+    "/var/lib/fluxbee/nodes/IO/IO.slack.T123@motherbee/config.json";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
@@ -139,8 +143,17 @@ impl Config {
         let env_config_dir = PathBuf::from(
             env("CONFIG_DIR").unwrap_or_else(|| "/etc/fluxbee".to_string()),
         );
+        let forced_spawn_config_path = env("NODE_CONFIG_PATH")
+            .or_else(|| env("IO_SLACK_FORCE_CONFIG_PATH"))
+            .unwrap_or_else(|| TEMP_FORCED_SPAWN_CONFIG_PATH.to_string());
+        if env("NODE_CONFIG_PATH").is_none() {
+            tracing::warn!(
+                path = %forced_spawn_config_path,
+                "using temporary forced spawn config path; remove once orchestrator provides spawn env contract"
+            );
+        }
         let spawn_cfg = load_spawn_config(
-            env("NODE_CONFIG_PATH").map(PathBuf::from),
+            Some(PathBuf::from(forced_spawn_config_path)),
             &env_node_name,
             &env_island_id,
         );
