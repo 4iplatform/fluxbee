@@ -175,8 +175,9 @@ Checklist de implementación propuesto:
   - borrar base runtime con dependientes
   - borrar versión inexistente
   - borrar `current`
-- [x] agregar E2E negativo de concurrencia:
-  - borrar mientras hay operación concurrente activa
+- [x] cubrir `BUSY` de lifecycle lock
+  - test interno determinista en `SY.orchestrator`
+  - nota: no es observable hoy por HTTP porque `SY.admin` serializa commands y `SY.orchestrator` procesa admin actions secuencialmente
 
 Estado actual de implementación:
 - `GET /hives/{hive}/runtimes/{runtime}` ya expone:
@@ -190,8 +191,11 @@ Estado actual de implementación:
   - muta manifest + `dist` con lock de lifecycle y rollback local básico si falla la escritura del manifest
 - Script E2E/negativos agregado:
   - `scripts/admin_runtime_delete_e2e.sh`
-  - cubre `ok`, `RUNTIME_CURRENT_CONFLICT`, `RUNTIME_VERSION_NOT_FOUND`, `RUNTIME_IN_USE`, `RUNTIME_HAS_DEPENDENTS`, `BUSY`
+  - cubre `ok`, `RUNTIME_CURRENT_CONFLICT`, `RUNTIME_VERSION_NOT_FOUND`, `RUNTIME_IN_USE`, `RUNTIME_HAS_DEPENDENTS`
   - incluye paridad HTTP/socket para `remove_runtime_version`
+- Cobertura interna adicional:
+  - `remove_runtime_version_flow_returns_busy_when_lifecycle_lock_is_held`
+  - justificación: `BUSY` no emerge por HTTP en la arquitectura actual porque el path `SY.admin -> SY.orchestrator` ya serializa las operaciones antes del lifecycle lock
 
 ## Matriz operativa - CORE/CUSTOM x singleton/instanciado
 

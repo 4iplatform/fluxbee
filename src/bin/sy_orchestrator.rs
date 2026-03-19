@@ -13032,6 +13032,45 @@ blob:
         assert_eq!(dependents[1]["runtime"], serde_json::json!("wf.child.flow"));
     }
 
+    fn sample_orchestrator_state_for_tests() -> OrchestratorState {
+        OrchestratorState {
+            hive_id: PRIMARY_HIVE_ID.to_string(),
+            is_motherbee: true,
+            started_at: Instant::now(),
+            config_dir: PathBuf::from("/tmp/fluxbee-test-config"),
+            state_dir: PathBuf::from("/tmp/fluxbee-test-state"),
+            gateway_name: "RT.gateway".to_string(),
+            storage_path: Mutex::new("/var/lib/fluxbee/blob".to_string()),
+            wan_listen: None,
+            wan_authorized_hives: Vec::new(),
+            tracked_nodes: Mutex::new(HashSet::new()),
+            system_allowed_origins: HashSet::new(),
+            runtime_manifest: Mutex::new(None),
+            runtime_lifecycle_lock: Mutex::new(()),
+            last_runtime_verify: Mutex::new(Instant::now()),
+            last_blob_gc: Mutex::new(Instant::now()),
+            nats_endpoint: "nats://127.0.0.1:4222".to_string(),
+            identity_sync_port: 0,
+            blob: sample_blob_config(),
+            dist: sample_dist_config(),
+            blob_sync_last_desired: Mutex::new(sample_blob_config()),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_runtime_version_flow_returns_busy_when_lifecycle_lock_is_held() {
+        let state = sample_orchestrator_state_for_tests();
+        let _guard = state.runtime_lifecycle_lock.lock().await;
+        let payload = serde_json::json!({
+            "runtime": "wf.busy.test",
+            "runtime_version": "1.0.0-test"
+        });
+
+        let out = remove_runtime_version_flow(&state, &payload).await;
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["error_code"], "BUSY");
+    }
+
     #[test]
     fn runtime_start_script_preflight_missing_returns_runtime_not_present() {
         let runtime = format!("wf.preflight.{}", Uuid::new_v4().simple());
