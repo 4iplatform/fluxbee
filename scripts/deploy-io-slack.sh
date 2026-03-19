@@ -23,7 +23,6 @@ Options:
   --app-token <xapp-...>       Convenience: build spawn config with inline Slack app token
   --bot-token <xoxb-...>       Convenience: build spawn config with inline Slack bot token
   --identity-target <name>     Convenience: add identity_target to spawn config
-  --identity-fallback <name>   Convenience: add identity_fallback_target to spawn config
   --identity-timeout-ms <ms>   Convenience: add identity_timeout_ms to spawn config
   --spawn                      Force spawn step (requires --node-name and config source)
   --update-existing            Shortcut for existing node code update: reuse current config + kill-first + spawn
@@ -64,7 +63,6 @@ CONFIG_JSON=""
 APP_TOKEN=""
 BOT_TOKEN=""
 IDENTITY_TARGET=""
-IDENTITY_FALLBACK=""
 IDENTITY_TIMEOUT_MS=""
 DO_SPAWN=0
 FORCE_SKIP_SPAWN=0
@@ -93,7 +91,6 @@ while [[ $# -gt 0 ]]; do
     --app-token) APP_TOKEN="${2:-}"; shift 2 ;;
     --bot-token) BOT_TOKEN="${2:-}"; shift 2 ;;
     --identity-target) IDENTITY_TARGET="${2:-}"; shift 2 ;;
-    --identity-fallback) IDENTITY_FALLBACK="${2:-}"; shift 2 ;;
     --identity-timeout-ms) IDENTITY_TIMEOUT_MS="${2:-}"; shift 2 ;;
     --spawn) DO_SPAWN=1; shift ;;
     --update-existing) UPDATE_EXISTING=1; shift ;;
@@ -175,8 +172,6 @@ cfg = {
 
 if "${IDENTITY_TARGET}":
     cfg["identity_target"] = "${IDENTITY_TARGET}"
-if "${IDENTITY_FALLBACK}":
-    cfg["identity_fallback_target"] = "${IDENTITY_FALLBACK}"
 if "${IDENTITY_TIMEOUT_MS}":
     cfg["identity_timeout_ms"] = int("${IDENTITY_TIMEOUT_MS}")
 

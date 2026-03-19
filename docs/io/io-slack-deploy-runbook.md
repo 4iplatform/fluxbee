@@ -29,6 +29,25 @@ VERSION="0.1.0"
 NODE_NAME="IO.slack.T123@$HIVE_ID"
 ```
 
+## Known Blocker (Visible)
+
+En algunos entornos, `run_node` crea un unit transient sin `Environment=` (no inyecta `NODE_NAME`, `ISLAND_ID`, `NODE_CONFIG_PATH`).
+Si eso pasa, `io-slack` arranca con defaults (`NODE_NAME=IO.slack.T123`, `ISLAND_ID=local`) y no encuentra el `config.json` real (`.../IO.slack.T123@motherbee/...`).
+
+Síntoma típico:
+- `Error: missing Slack app token (set SLACK_APP_TOKEN or config slack.app_token / slack.app_token_ref=env:VAR)`
+
+Esto NO significa necesariamente que falten keys en el archivo; puede significar que el runtime está leyendo otro path.
+
+Validación:
+```bash
+systemctl cat fluxbee-node-IO.slack.T123-motherbee
+sudo jq . /var/lib/fluxbee/nodes/IO/IO.slack.T123@motherbee/config.json
+```
+
+Esperado en fix de plataforma:
+- el unit spawned debe incluir `NODE_NAME`, `ISLAND_ID` o `NODE_CONFIG_PATH` correctos.
+
 ---
 
 ## 3) Deploy inicial (compliant)
@@ -76,19 +95,21 @@ curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes" \
     \"node_name\":\"$NODE_NAME\",
     \"runtime\":\"$RUNTIME\",
     \"runtime_version\":\"current\",
+    \"tenant_id\":\"<TENANT_ID>\",
     \"config\":{
+      \"tenant_id\":\"<TENANT_ID>\",
       \"slack\":{
         \"app_token\":\"xapp-REPLACE_ME\",
         \"bot_token\":\"xoxb-REPLACE_ME\"
       },
-      \"identity_target\":\"SY.identity\",
-      \"identity_fallback_target\":\"SY.identity@$HIVE_ID\",
+      \"identity_target\":\"SY.identity@$HIVE_ID\",
       \"identity_timeout_ms\":10000
     }
   }"
 ```
 
 Notas:
+- En hives con registro de identidad obligatorio en spawn, `tenant_id` es requerido (top-level o `config.tenant_id`).
 - `IO.slack` soporta tokens por config de spawn:
   - `slack.app_token`, `slack.bot_token`
   - `slack.app_token_ref`, `slack.bot_token_ref` con `env:VAR`
@@ -193,10 +214,10 @@ bash scripts/deploy-io-slack.sh \
   --hive-id "$HIVE_ID" \
   --version "0.1.0" \
   --node-name "IO.slack.T123@$HIVE_ID" \
+  --tenant-id "<TENANT_ID>" \
   --app-token "xapp-REPLACE_ME" \
   --bot-token "xoxb-REPLACE_ME" \
-  --identity-target "SY.identity" \
-  --identity-fallback "SY.identity@$HIVE_ID" \
+  --identity-target "SY.identity@$HIVE_ID" \
   --identity-timeout-ms 10000 \
   --sync-hint \
   --kill-first \

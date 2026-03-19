@@ -98,8 +98,7 @@ Los detalles específicos quedan en cada Nodo IO.
 
 Configuración operativa:
 - `ISLAND_ID`
-- `IDENTITY_TARGET` (default `SY.identity`)
-- `IDENTITY_FALLBACK_TARGET` (opcional)
+- `IDENTITY_TARGET` (default `SY.identity@<ISLAND_ID>`)
 - `IDENTITY_TIMEOUT_MS`
 
 Propiedades requeridas:

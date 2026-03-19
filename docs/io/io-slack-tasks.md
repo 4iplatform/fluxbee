@@ -39,6 +39,10 @@ Out of scope:
 - [x] P0.1 Freeze rule: identity resolution/provision lives in `io-common`; `io-slack` only maps Slack events/context.
 - [x] P0.2 Remove legacy identity mode wording/toggles from Slack runtime docs/config.
 - [x] P0.3 Document degraded fallback explicitly: provision failure/timeout => forward with `src_ilk=null`.
+- [ ] P0.4 Runtime resilience on missing config/secrets:
+  - missing `slack.app_token`/`slack.bot_token` must NOT terminate process (`exit 1`)
+  - runtime should stay alive in degraded/not-ready state and expose operational error
+  - keep node controllable via orchestrator/admin while config is repaired
 
 Acceptance:
 - Slack adapter has no alternate identity behavior outside `io-common` flow.
@@ -98,13 +102,16 @@ Acceptance:
 - [x] P4.1 Keep config minimal and explicit:
   - Slack tokens (`SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, optional signing secret for HTTP mode)
   - router/node config
-  - shared identity envs (`ISLAND_ID`, `IDENTITY_TARGET`, `IDENTITY_FALLBACK_TARGET`, `IDENTITY_TIMEOUT_MS`)
+  - shared identity envs (`ISLAND_ID`, `IDENTITY_TARGET`, `IDENTITY_TIMEOUT_MS`)
 - [x] P4.2 Remove any remaining identity-mode env usage from Slack docs/examples.
 - [ ] P4.3 Define healthcheck expectations:
   - router connectivity
   - Slack connectivity
   - runtime lifecycle state
 - [x] P4.4 Keep optional test-only fixed destination documented as non-production override.
+- [ ] P4.5 Add explicit runbook check for spawn env contract:
+  - node must receive `NODE_NAME` + `ISLAND_ID` or `NODE_CONFIG_PATH`
+  - if missing, document as platform/core issue (not missing credentials by default)
 
 Acceptance:
 - Operator-facing config/runbook reflects baseline behavior with no legacy ambiguity.

@@ -255,6 +255,16 @@ Modo spawn/orchestrator (compliance path):
   - pendiente implementar manejo explícito en runtime para recargar/aplicar cambios de `config.json` sin respawn.
   - hoy, la actualización confiable de config en `IO.slack` se realiza por `KILL_NODE + SPAWN_NODE` (o restart controlado equivalente).
 
+- Fallback de configuración y resiliencia de proceso:
+  - hoy, si faltan credenciales (`slack.app_token`/`slack.bot_token`) el proceso termina con `exit 1`.
+  - comportamiento esperado (pendiente): no crash; reportar estado/config error y seguir atendiendo control-plane.
+  - en entornos con unit transient sin `NODE_NAME`/`ISLAND_ID`/`NODE_CONFIG_PATH`, el nodo puede no encontrar `config.json` aunque exista (síntoma: `missing Slack app token`).
+
+- Bloqueante operativo (prioridad alta):
+  - hoy el runtime trata falta de config/secrets como fatal de arranque (`exit 1`), lo que provoca restart loop en systemd.
+  - responsabilidad de `IO.slack`: este caso debe pasar a modo degradado/no-ready, sin terminar proceso.
+  - estado esperado (pendiente): levantar el runtime, publicar estado de error de config y permanecer controlable por orchestrator/admin.
+
 
 
 ### Aclaración - Identidad L3 (v1.16+)
