@@ -314,6 +314,55 @@ wait_node_stopped_and_not_visible() {
   return 1
 }
 
+wait_node_absent() {
+  local node_name="$1"
+  local deadline=$(( $(date +%s) + WAIT_STOP_SECS ))
+  while (( $(date +%s) <= deadline )); do
+    local http count
+    http="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes" "$nodes_body")"
+    if [[ "$http" != "200" ]]; then
+      sleep 2
+      continue
+    fi
+    count="$(jq -r --arg node "$node_name" '[.payload.nodes[] | select(.node_name == $node)] | length' "$nodes_body")"
+    if [[ "$count" == "0" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "FAIL: node instance still present after remove node='$node_name'" >&2
+  cat "$nodes_body" >&2 || true
+  return 1
+}
+
+ensure_node_removed() {
+  local node_name="$1"
+  local deadline=$(( $(date +%s) + WAIT_STOP_SECS ))
+  while (( $(date +%s) <= deadline )); do
+    kill_node "$node_name"
+    local http remove_status error_code
+    http="$(http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$node_name/instance" "$remove_body" || true)"
+    remove_status="$(json_get_file "status" "$remove_body")"
+    error_code="$(json_get_file "error_code" "$remove_body")"
+    if [[ "$http" == "200" && "$remove_status" == "ok" ]]; then
+      wait_node_absent "$node_name"
+      return 0
+    fi
+    if [[ "$http" == "404" ]] || [[ "$error_code" == "NODE_NOT_FOUND" ]]; then
+      return 0
+    fi
+    if [[ "$error_code" != "NODE_INSTANCE_RUNNING" ]]; then
+      echo "FAIL: unexpected remove_node_instance response for '$node_name' http=$http" >&2
+      cat "$remove_body" >&2 || true
+      return 1
+    fi
+    sleep 1
+  done
+  echo "FAIL: node instance could not be removed node='$node_name'" >&2
+  cat "$remove_body" >&2 || true
+  return 1
+}
+
 wait_io_result() {
   local deadline=$(( $(date +%s) + WAIT_IO_RESULT_SECS ))
   while (( $(date +%s) <= deadline )); do
@@ -348,8 +397,7 @@ run_io_probe_until_success() {
   while (( $(date +%s) <= deadline )); do
     attempt=$((attempt + 1))
     as_root_local rm -f "$IO_STATUS_FILE" "$IO_LOG_FILE"
-    kill_node "$IO_NODE_NAME"
-    remove_node_instance "$IO_NODE_NAME"
+    ensure_node_removed "$IO_NODE_NAME"
 
     local io_spawn_payload io_spawn_http io_spawn_status
     io_spawn_payload="$(spawn_node_payload "$IO_NODE_NAME" "$IO_RUNTIME_NAME" "current")"
@@ -585,10 +633,8 @@ wait_runtime_ready "$AI_RUNTIME_NAME" "$AI_RUNTIME_VERSION"
 wait_runtime_ready "$IO_RUNTIME_NAME" "$IO_RUNTIME_VERSION"
 
 echo "Step 5/11: cleanup any previous managed nodes and spawn frontdesk"
-kill_node "$IO_NODE_NAME"
-kill_node "$FRONTDESK_NODE_NAME"
-remove_node_instance "$IO_NODE_NAME"
-remove_node_instance "$FRONTDESK_NODE_NAME"
+ensure_node_removed "$IO_NODE_NAME"
+ensure_node_removed "$FRONTDESK_NODE_NAME"
 ai_spawn_payload="$(spawn_node_payload "$FRONTDESK_NODE_NAME" "$AI_RUNTIME_NAME" "current")"
 ai_spawn_http="$(http_call "POST" "$BASE/hives/$HIVE_ID/nodes" "$ai_spawn_body" "$ai_spawn_payload")"
 ai_spawn_status="$(json_get_file "payload.status" "$ai_spawn_body")"
