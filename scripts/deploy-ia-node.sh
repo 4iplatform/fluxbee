@@ -29,6 +29,7 @@ Options:
   --reuse-existing-config      Fetch config from GET /hives/{id}/nodes/{name}/config and reuse it for spawn
   --update-existing            Shortcut: reuse existing config + kill-first + spawn (requires --node-name)
   --sync-hint                  Run sync-hint before each update attempt
+  --allow-sync-pending         Continue to spawn even if update stays sync_pending
   --update-retries <n>         Retries when update returns sync_pending (default: 8)
   --retry-delay-s <seconds>    Delay between retries (default: 2)
   --sudo                       Pass --sudo to publish script
@@ -66,6 +67,7 @@ KILL_FIRST=0
 REUSE_EXISTING_CONFIG=0
 UPDATE_EXISTING=0
 USE_SYNC_HINT=0
+ALLOW_SYNC_PENDING=0
 UPDATE_RETRIES=8
 RETRY_DELAY_S=2
 USE_SUDO=0
@@ -91,6 +93,7 @@ while [[ $# -gt 0 ]]; do
     --reuse-existing-config) REUSE_EXISTING_CONFIG=1; shift ;;
     --update-existing) UPDATE_EXISTING=1; shift ;;
     --sync-hint) USE_SYNC_HINT=1; shift ;;
+    --allow-sync-pending) ALLOW_SYNC_PENDING=1; shift ;;
     --update-retries) UPDATE_RETRIES="${2:-}"; shift 2 ;;
     --retry-delay-s) RETRY_DELAY_S="${2:-}"; shift 2 ;;
     --sudo) USE_SUDO=1; shift ;;
@@ -299,8 +302,12 @@ PY
 done
 
 if [[ "$UPDATE_STATUS" != "ok" ]]; then
-  log "update_not_ready status=$UPDATE_STATUS after $UPDATE_RETRIES attempts"
-  exit 1
+  if [[ "$UPDATE_STATUS" == "sync_pending" && "$ALLOW_SYNC_PENDING" == "1" ]]; then
+    log "update_not_ready status=$UPDATE_STATUS after $UPDATE_RETRIES attempts; continuing because --allow-sync-pending is set"
+  else
+    log "update_not_ready status=$UPDATE_STATUS after $UPDATE_RETRIES attempts"
+    exit 1
+  fi
 fi
 
 if [[ "$DO_SPAWN" != "1" ]]; then
