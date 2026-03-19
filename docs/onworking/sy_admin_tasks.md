@@ -256,6 +256,12 @@ Contrato operativo resumido:
 - `DELETE /nodes/{name}/instance` borra la instancia persistida
 - reboot/reconcile parte de la instancia persistida, no del proceso ni del catálogo solo
 
+Nota adicional:
+- el prefijo funcional del nodo (`AI.*`, `IO.*`, `WF.*`, `SY.*`, `RT.*`) no equivale por sí mismo a la clasificación de lifecycle (`core` vs runtime gestionado)
+- para v1, el corte operativo es:
+  - `SY.*` y `RT.gateway` fuera de spawn gestionado
+  - `AI.*`, `IO.*`, `WF.*` y `RT.<otro>` permitidos como runtimes gestionados publicados
+
 ### Tareas nuevas derivadas de esta matriz
 
 Revisión 2026-03-19:

@@ -136,6 +136,33 @@ Notas prácticas:
 - las env vars legacy (`AI_TEST_NODE_NAME`, `IO_TEST_NODE_NAME`, `GOV_NODE_NAME`) quedan sólo como compatibilidad o uso manual
 - `_system.node_name` dentro de `config.json` sigue siendo la fuente de verdad persistida
 
+## Nota sobre prefijos de nodo y lifecycle
+
+Los prefijos funcionales del nombre (`AI.*`, `IO.*`, `WF.*`, `SY.*`, `RT.*`) no
+son lo mismo que la clasificación de lifecycle (`core` vs runtime gestionado).
+
+Ejemplos:
+
+- `AI.*`, `IO.*` y `WF.*` suelen correr como runtimes gestionados publicados
+  en `dist`
+- un nodo `AI.*` puede cumplir un rol muy importante en la arquitectura y aun así
+  seguir estando en el modelo de runtime gestionado
+- `SY.*` identifica control-plane/core del sistema
+- `RT.gateway` identifica infraestructura base del hive
+
+Entonces, para v1, la regla operativa no es “AI/IO/WF sí, resto no”.
+
+La regla real es:
+
+- `SY.*` no entra por spawn gestionado
+- `RT.gateway` no entra por spawn gestionado
+- `AI.*`, `IO.*`, `WF.*` y `RT.<otro>` pueden entrar por el modelo de runtime gestionado publicado
+
+Eso evita mezclar:
+
+- familia funcional del nodo
+- origen/lifecycle del componente
+
 ## Probar publish/install completo con CLI
 
 También hay un E2E operator-style que usa `fluxbee-publish` de punta a punta
