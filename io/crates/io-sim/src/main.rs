@@ -55,7 +55,6 @@ async fn main() -> Result<()> {
         inbox.clone(),
         IdentityProvisionConfig {
             target: config.identity_target.clone(),
-            fallback_target: config.identity_fallback_target.clone(),
             timeout: Duration::from_millis(config.identity_timeout_ms),
         },
     ));
@@ -113,15 +112,15 @@ struct Config {
     sim_thread_id: Option<String>,
     sim_tenant_hint: Option<String>,
     identity_target: String,
-    identity_fallback_target: Option<String>,
     identity_timeout_ms: u64,
 }
 
 impl Config {
     fn from_env() -> Result<Self> {
+        let island_id = env("ISLAND_ID").unwrap_or_else(|| "local".to_string());
         Ok(Self {
             node_name: env("NODE_NAME").unwrap_or_else(|| "IO.sim.local".to_string()),
-            island_id: env("ISLAND_ID").unwrap_or_else(|| "local".to_string()),
+            island_id: island_id.clone(),
             node_version: env("NODE_VERSION").unwrap_or_else(|| "0.1".to_string()),
             router_socket: PathBuf::from(
                 env("ROUTER_SOCKET").unwrap_or_else(|| "/var/run/fluxbee/routers".to_string()),
@@ -149,8 +148,8 @@ impl Config {
                 .unwrap_or_else(|| "sim-console".to_string()),
             sim_thread_id: env("SIM_THREAD_ID"),
             sim_tenant_hint: env("SIM_TENANT_HINT"),
-            identity_target: env("IDENTITY_TARGET").unwrap_or_else(|| "SY.identity".to_string()),
-            identity_fallback_target: env("IDENTITY_FALLBACK_TARGET"),
+            identity_target: env("IDENTITY_TARGET")
+                .unwrap_or_else(|| format!("SY.identity@{island_id}")),
             identity_timeout_ms: env("IDENTITY_TIMEOUT_MS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),

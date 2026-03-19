@@ -68,7 +68,6 @@ async fn main() -> Result<()> {
         inbox.clone(),
         IdentityProvisionConfig {
             target: config.identity_target.clone(),
-            fallback_target: config.identity_fallback_target.clone(),
             timeout: Duration::from_millis(config.identity_timeout_ms),
         },
     ));
@@ -127,7 +126,6 @@ struct Config {
     dedup_max_entries: usize,
     dst_node: Option<String>,
     identity_target: String,
-    identity_fallback_target: Option<String>,
     identity_timeout_ms: u64,
     slack_session_window_ms: u64,
     slack_session_max_sessions: usize,
@@ -150,6 +148,21 @@ impl Config {
         if let Some(cfg) = &spawn_cfg {
             tracing::info!(path = %cfg.path.display(), "io-slack loaded spawn config");
         }
+
+        let resolved_node_name = env("NODE_NAME")
+            .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
+                "node.name",
+                "_system.node_name",
+            ]))
+            .unwrap_or_else(|| env_node_name.clone());
+
+        let resolved_island_id = env("ISLAND_ID")
+            .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
+                "_system.hive_id",
+                "node.island_id",
+                "island_id",
+            ]))
+            .unwrap_or_else(|| env_island_id.clone());
 
         let slack_app_token = env("SLACK_APP_TOKEN")
             .or_else(|| resolve_secret(
@@ -181,19 +194,8 @@ impl Config {
         Ok(Self {
             slack_app_token,
             slack_bot_token,
-            node_name: env("NODE_NAME")
-                .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
-                    "node.name",
-                    "_system.node_name",
-                ]))
-                .unwrap_or_else(|| env_node_name.clone()),
-            island_id: env("ISLAND_ID")
-                .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
-                    "_system.hive_id",
-                    "node.island_id",
-                    "island_id",
-                ]))
-                .unwrap_or_else(|| env_island_id.clone()),
+            node_name: resolved_node_name,
+            island_id: resolved_island_id.clone(),
             node_version: env("NODE_VERSION")
                 .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
                     "_system.runtime_version",
@@ -245,12 +247,7 @@ impl Config {
                     "identity.target",
                     "identity_target",
                 ]))
-                .unwrap_or_else(|| "SY.identity".to_string()),
-            identity_fallback_target: env("IDENTITY_FALLBACK_TARGET")
-                .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
-                    "identity.fallback_target",
-                    "identity_fallback_target",
-                ])),
+                .unwrap_or_else(|| format!("SY.identity@{resolved_island_id}")),
             identity_timeout_ms: env("IDENTITY_TIMEOUT_MS")
                 .and_then(|v| v.parse().ok())
                 .or_else(|| json_get_u64_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[

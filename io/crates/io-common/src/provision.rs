@@ -78,15 +78,13 @@ impl RouterInbox {
 #[derive(Debug, Clone)]
 pub struct IdentityProvisionConfig {
     pub target: String,
-    pub fallback_target: Option<String>,
     pub timeout: Duration,
 }
 
 impl Default for IdentityProvisionConfig {
     fn default() -> Self {
         Self {
-            target: "SY.identity".to_string(),
-            fallback_target: Some("SY.identity@motherbee".to_string()),
+            target: "SY.identity@motherbee".to_string(),
             timeout: Duration::from_secs(10),
         }
     }
@@ -160,14 +158,7 @@ impl IdentityProvisioner for FluxbeeIdentityProvisioner {
     async fn provision(&self, input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
         match self.call_provision_target(&self.config.target, input).await {
             Ok(src_ilk) => Ok(Some(src_ilk)),
-            Err(IdentityError::Unavailable) | Err(IdentityError::Other(_)) => {
-                if let Some(fallback) = &self.config.fallback_target {
-                    if fallback != &self.config.target && !fallback.trim().is_empty() {
-                        return self.call_provision_target(fallback, input).await.map(Some);
-                    }
-                }
-                Ok(None)
-            }
+            Err(IdentityError::Unavailable) | Err(IdentityError::Other(_)) => Ok(None),
             Err(IdentityError::Timeout) | Err(IdentityError::Miss) => Ok(None),
         }
     }
