@@ -102,6 +102,9 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 | `context` | object | No | Datos adicionales para reglas OPA |
 | `action` | string | No | Para mensajes admin: acción a ejecutar |
 
+Nota de contrato:
+- el campo canónico de L3 para identity routing es `meta.src_ilk`
+
 **Regla:** si `type="system"` y `scope="global"`, el router ignora el filtro de VPN para broadcast/multicast.
 
 ### 3.1 Uso de `target` según contexto

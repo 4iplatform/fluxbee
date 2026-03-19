@@ -406,6 +406,7 @@ impl BlobToolkit {
                     meta: Meta {
                         msg_type: SYSTEM_KIND.to_string(),
                         msg: Some("SYSTEM_SYNC_HINT".to_string()),
+                        src_ilk: None,
                         scope: None,
                         target: None,
                         action: None,

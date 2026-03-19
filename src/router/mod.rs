@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::{mpsc, Mutex};
@@ -3712,7 +3713,7 @@ fn load_opa_data_bundle(path: &Path, hive_id: &str) -> Result<Option<String>, io
                             format!("invalid OPA data bundle JSON: {err}"),
                         )
                     })?;
-                if let Some(snapshot) = read_identity_snapshot(hive_id) {
+                if let Ok(snapshot) = read_identity_snapshot(hive_id) {
                     inject_identity_data(&mut root, &snapshot);
                 }
                 Ok(Some(root.to_string()))
@@ -3723,10 +3724,53 @@ fn load_opa_data_bundle(path: &Path, hive_id: &str) -> Result<Option<String>, io
     }
 }
 
-fn read_identity_snapshot(hive_id: &str) -> Option<crate::shm::IdentitySnapshot> {
+fn read_identity_snapshot(
+    hive_id: &str,
+) -> Result<crate::shm::IdentitySnapshot, crate::shm::ShmError> {
     let shm_name = format!("/jsr-identity-{}", hive_id);
-    let reader = IdentityRegionReader::open_read_only_auto(&shm_name).ok()?;
-    reader.read_snapshot()
+    let open_started = Instant::now();
+    let reader = IdentityRegionReader::open_read_only_auto(&shm_name)?;
+    let header_state = reader.debug_state();
+    let open_elapsed_us = open_started.elapsed().as_micros() as u64;
+    let read_started = Instant::now();
+    match reader.try_read_snapshot() {
+        Ok(snapshot) => {
+            tracing::info!(
+                shm = %shm_name,
+                open_elapsed_us,
+                read_elapsed_us = read_started.elapsed().as_micros() as u64,
+                header_seq = header_state.map(|s| s.seq),
+                header_tenant_count = header_state.map(|s| s.tenant_count),
+                header_ilk_count = header_state.map(|s| s.ilk_count),
+                header_ich_count = header_state.map(|s| s.ich_count),
+                header_mapping_count = header_state.map(|s| s.ich_mapping_count),
+                header_updated_at = header_state.map(|s| s.updated_at),
+                tenant_count = snapshot.header.tenant_count,
+                ilk_count = snapshot.header.ilk_count,
+                ich_count = snapshot.header.ich_count,
+                ich_mapping_count = snapshot.header.ich_mapping_count,
+                updated_at = snapshot.header.updated_at,
+                "router identity snapshot read succeeded"
+            );
+            Ok(snapshot)
+        }
+        Err(err) => {
+            tracing::warn!(
+                shm = %shm_name,
+                open_elapsed_us,
+                read_elapsed_us = read_started.elapsed().as_micros() as u64,
+                header_seq = header_state.map(|s| s.seq),
+                header_tenant_count = header_state.map(|s| s.tenant_count),
+                header_ilk_count = header_state.map(|s| s.ilk_count),
+                header_ich_count = header_state.map(|s| s.ich_count),
+                header_mapping_count = header_state.map(|s| s.ich_mapping_count),
+                header_updated_at = header_state.map(|s| s.updated_at),
+                error = %err,
+                "router identity snapshot read failed"
+            );
+            Err(err)
+        }
+    }
 }
 
 async fn resolve_target_with_identity(
@@ -3735,17 +3779,59 @@ async fn resolve_target_with_identity(
     identity_frontdesk_node_name: &str,
     msg: &Message,
 ) -> Result<Option<String>, crate::opa::OpaError> {
+    let resolve_started = Instant::now();
     let mut msg_for_opa = msg.clone();
-    if let Some(snapshot) = read_identity_snapshot(hive_id) {
+    let src_ilk = get_src_ilk_from_meta(&msg.meta);
+    tracing::info!(
+        trace_id = %msg.routing.trace_id,
+        src_ilk = ?src_ilk,
+        identity_frontdesk_node_name = %identity_frontdesk_node_name,
+        "router starting identity-aware resolve"
+    );
+    match read_identity_snapshot(hive_id) {
+        Ok(snapshot) => {
         let now_ms = now_epoch_ms();
+        let registration_status = src_ilk.as_deref().and_then(|src_ilk| {
+            let (_, status) = canonicalize_src_ilk_and_status(&snapshot, src_ilk, now_ms);
+            status
+        });
         if let Some(forced_target) = apply_identity_pre_resolve(
             &mut msg_for_opa,
             identity_frontdesk_node_name,
             &snapshot,
             now_ms,
         ) {
+            tracing::info!(
+                trace_id = %msg.routing.trace_id,
+                src_ilk = ?src_ilk,
+                registration_status = ?registration_status,
+                forced_target = %forced_target,
+                elapsed_us = resolve_started.elapsed().as_micros() as u64,
+                "identity pre-resolve forced frontdesk target"
+            );
             return Ok(Some(forced_target));
         }
+        if src_ilk.is_some() {
+            tracing::info!(
+                trace_id = %msg.routing.trace_id,
+                src_ilk = ?src_ilk,
+                registration_status = ?registration_status,
+                elapsed_us = resolve_started.elapsed().as_micros() as u64,
+                "identity pre-resolve did not force target"
+            );
+        }
+        }
+        Err(err) if src_ilk.is_some() => {
+            tracing::warn!(
+                trace_id = %msg.routing.trace_id,
+                src_ilk = ?src_ilk,
+                shm = %format!("/jsr-identity-{hive_id}"),
+                error = %err,
+                elapsed_us = resolve_started.elapsed().as_micros() as u64,
+                "identity pre-resolve skipped: identity snapshot unavailable"
+            );
+        }
+        Err(_) => {}
     }
     let mut guard = opa.lock().await;
     guard.resolve_target(&msg_for_opa)
@@ -3814,29 +3900,15 @@ fn parse_prefixed_uuid_bytes(value: &str, prefix: &str) -> Option<[u8; 16]> {
 }
 
 fn get_src_ilk_from_meta(meta: &Meta) -> Option<String> {
-    meta.context
-        .as_ref()
-        .and_then(serde_json::Value::as_object)
-        .and_then(|ctx| ctx.get("src_ilk"))
-        .and_then(serde_json::Value::as_str)
+    meta.src_ilk
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string())
 }
 
 fn set_src_ilk_in_meta(meta: &mut Meta, src_ilk: &str) {
-    let value = serde_json::Value::String(src_ilk.to_string());
-    match meta.context.as_mut() {
-        Some(serde_json::Value::Object(ctx)) => {
-            ctx.insert("src_ilk".to_string(), value);
-        }
-        Some(_) => {
-            meta.context = Some(serde_json::json!({ "src_ilk": src_ilk }));
-        }
-        None => {
-            meta.context = Some(serde_json::json!({ "src_ilk": src_ilk }));
-        }
-    }
+    meta.src_ilk = Some(src_ilk.to_string());
 }
 
 fn inject_identity_data(root: &mut serde_json::Value, snapshot: &crate::shm::IdentitySnapshot) {
@@ -4944,6 +5016,7 @@ mod tests {
         let mut meta = Meta {
             msg_type: "user".to_string(),
             msg: None,
+            src_ilk: None,
             scope: None,
             target: None,
             action: None,
@@ -4952,6 +5025,10 @@ mod tests {
         };
         assert!(get_src_ilk_from_meta(&meta).is_none());
         set_src_ilk_in_meta(&mut meta, "ilk:11111111-1111-1111-1111-111111111111");
+        assert_eq!(
+            meta.src_ilk.as_deref(),
+            Some("ilk:11111111-1111-1111-1111-111111111111")
+        );
         assert_eq!(
             get_src_ilk_from_meta(&meta).as_deref(),
             Some("ilk:11111111-1111-1111-1111-111111111111")
@@ -4969,13 +5046,12 @@ mod tests {
             meta: Meta {
                 msg_type: "user".to_string(),
                 msg: None,
+                src_ilk: Some(src_ilk.to_string()),
                 scope: None,
                 target: Some("dummy.target".to_string()),
                 action: None,
                 priority: None,
-                context: Some(serde_json::json!({
-                    "src_ilk": src_ilk,
-                })),
+                context: None,
             },
             payload: serde_json::json!({}),
         }

@@ -486,6 +486,7 @@ async fn broadcast_config_changed(
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(MSG_CONFIG_CHANGED.to_string()),
+            src_ilk: None,
             scope: Some(SCOPE_GLOBAL.to_string()),
             target: None,
             action: None,
@@ -712,6 +713,7 @@ async fn send_admin_command_response(
         meta: Meta {
             msg_type: "admin".to_string(),
             msg: Some(MSG_ADMIN_COMMAND_RESPONSE.to_string()),
+            src_ilk: None,
             scope: None,
             target: None,
             action: Some(action.to_string()),
@@ -3220,6 +3222,7 @@ async fn send_admin_request(
         meta: Meta {
             msg_type: "admin".to_string(),
             msg: None,
+            src_ilk: None,
             scope: None,
             target: Some(request.target.clone()),
             action: Some(request.action.clone()),
@@ -3272,6 +3275,7 @@ async fn send_system_request(
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(request_msg.to_string()),
+            src_ilk: None,
             scope: None,
             target: Some(target.to_string()),
             action: None,
@@ -3622,6 +3626,7 @@ async fn send_opa_query(
             msg_type: "query".to_string(),
             action: Some(action.to_string()),
             msg: None,
+            src_ilk: None,
             scope: None,
             target: target_pattern,
             priority: None,

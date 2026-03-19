@@ -177,6 +177,7 @@ async fn send_system_message(
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(msg_name.to_string()),
+            src_ilk: None,
             scope: None,
             target: meta_target,
             action: None,

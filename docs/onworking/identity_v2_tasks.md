@@ -131,6 +131,9 @@ Salida:
     - binario `src/bin/io_test_diag.rs` (usa helpers SDK de lookup/provision)
     - script `scripts/io_test_node_e2e.sh` (runtime fixture + sync-hint + update + run/kill)
     - wrapper ejemplo para integradores `scripts/io_identity_example_e2e.sh` (naming `io.identity.example`)
+  - [x] ciclo operator-style con CLI para nodos de referencia de identity:
+    - script `scripts/identity_test_nodes_publish_e2e.sh`
+    - usa `fluxbee-publish` para `AI.test.gov` + `IO.test` y valida publish/deploy/spawn/routing end-to-end
   - [x] precondición de spec aplicada en plataforma:
     - `sy-identity` pasa a core requerido en instalación/manifiesto (`scripts/install.sh`)
     - bootstrap worker mínimo incluye `sy-identity` junto a `rt-gateway` y `sy-orchestrator`
@@ -204,7 +207,7 @@ Salida:
 - [x] F2. Canonicalizar `src_ilk` antes de resolver target.
   - Implementado en `router` como pre-resolve integrado:
     - lee alias desde SHM identity,
-    - canonicaliza `meta.context.src_ilk` (si existe),
+    - canonicaliza `meta.src_ilk`,
     - luego evalúa OPA con el ILK canonical.
 - [x] F3. Ruteo de temporales a frontdesk.
   - Implementado en `router` como override pre-OPA:

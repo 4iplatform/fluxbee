@@ -865,12 +865,25 @@ impl IdentityRuntime {
         &mut self,
         sender: &NodeSender,
         msg: &Message,
+        identity_shm: Option<&mut IdentityRegionWriter>,
     ) -> Result<Vec<IdentityDeltaEnvelope>, IdentityError> {
         let Some(action) = msg.meta.msg.as_deref() else {
             return Ok(Vec::new());
         };
+        let action_started = Instant::now();
+        let trace_id = msg.routing.trace_id.clone();
 
         let source_name = self.resolve_source_name_with_retry(&msg.routing.src).await;
+        if action == MSG_ILK_PROVISION {
+            tracing::info!(
+                action,
+                trace_id = %trace_id,
+                source_uuid = %msg.routing.src,
+                source_name = source_name.as_deref().unwrap_or("<unknown>"),
+                payload = %msg.payload,
+                "identity received ILK_PROVISION request"
+            );
+        }
         if !self.is_authorized(action, source_name.as_deref()) {
             let payload = json!({
                 "status": "error",
@@ -905,8 +918,16 @@ impl IdentityRuntime {
                         } else {
                             None
                         };
+                        let provision_started = Instant::now();
                         match self.store.provision_temporary_ilk(req) {
                             Ok(ok) => {
+                                tracing::info!(
+                                    action,
+                                    trace_id = %trace_id,
+                                    elapsed_us = provision_started.elapsed().as_micros() as u64,
+                                    response = %ok,
+                                    "identity store provision completed"
+                                );
                                 if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
                                     if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
                                         if self.is_primary {
@@ -1275,6 +1296,33 @@ impl IdentityRuntime {
             ),
         };
 
+        if !deltas.is_empty() {
+            if let Some(writer) = identity_shm {
+                let shm_apply_started = Instant::now();
+                apply_identity_shm_deltas(writer, &self.store, action, &deltas)?;
+                let shm_state = writer.debug_state();
+                tracing::info!(
+                    action,
+                    trace_id = %trace_id,
+                    delta_count = deltas.len(),
+                    elapsed_us = shm_apply_started.elapsed().as_micros() as u64,
+                    shm_seq = shm_state.map(|s| s.seq),
+                    shm_tenant_count = shm_state.map(|s| s.tenant_count),
+                    shm_ilk_count = shm_state.map(|s| s.ilk_count),
+                    shm_ich_count = shm_state.map(|s| s.ich_count),
+                    shm_mapping_count = shm_state.map(|s| s.ich_mapping_count),
+                    shm_updated_at = shm_state.map(|s| s.updated_at),
+                    "identity shm delta apply completed"
+                );
+            }
+        }
+
+        tracing::info!(
+            action,
+            trace_id = %trace_id,
+            elapsed_us = action_started.elapsed().as_micros() as u64,
+            "identity sending system response"
+        );
         send_system_response(sender, msg, response_name(action), payload).await?;
         Ok(deltas)
     }
@@ -1640,15 +1688,11 @@ async fn main() -> Result<(), IdentityError> {
                     continue;
                 }
 
-                match runtime.process_system_message(&sender, &msg).await {
+                match runtime
+                    .process_system_message(&sender, &msg, identity_shm.as_mut())
+                    .await
+                {
                     Ok(mut deltas) => {
-                        if !deltas.is_empty() {
-                            if let Some(writer) = identity_shm.as_mut() {
-                                if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
-                                    tracing::warn!(error = %err, "identity shm sync failed after system action");
-                                }
-                            }
-                        }
                         if is_primary && !deltas.is_empty() {
                             assign_delta_seqs(&mut deltas, &mut next_delta_seq);
                             broadcast_deltas(&mut delta_subscribers, &deltas);
@@ -1978,6 +2022,212 @@ fn sync_identity_shm_mappings(
         alias_count = alias_entries.len(),
         "identity shm snapshot sync applied"
     );
+    Ok(())
+}
+
+fn tenant_entry_from_record(tenant: &TenantRecord) -> Result<TenantEntry, IdentityError> {
+    let tenant_uuid = parse_prefixed_uuid(&tenant.tenant_id, "tnt")?;
+    let now_ms = now_epoch_ms();
+    let mut entry = TenantEntry {
+        tenant_id: *tenant_uuid.as_bytes(),
+        name: [0u8; 128],
+        domain: [0u8; 128],
+        status: parse_tenant_status_for_shm(&tenant.status),
+        flags: FLAG_ACTIVE,
+        _pad0: [0u8; 5],
+        max_ilks: tenant
+            .settings
+            .get("max_ilks")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32,
+        created_at: now_ms,
+        updated_at: now_ms,
+        _reserved: [0u8; 8],
+    };
+    copy_bytes_with_len(&mut entry.name, tenant.name.trim());
+    if let Some(domain) = tenant
+        .domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        copy_bytes_with_len(&mut entry.domain, domain);
+    }
+    Ok(entry)
+}
+
+fn ilk_entry_from_record(ilk: &IlkRecord) -> Result<IlkEntry, IdentityError> {
+    let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
+    let tenant_uuid = parse_prefixed_uuid(&ilk.tenant_id, "tnt")?;
+    let now_ms = now_epoch_ms();
+    let mut entry = IlkEntry {
+        ilk_id: *ilk_uuid.as_bytes(),
+        ilk_type: parse_ilk_type_for_shm(&ilk.ilk_type),
+        registration_status: parse_registration_status_for_shm(&ilk.registration_status),
+        flags: FLAG_ACTIVE,
+        tenant_id: *tenant_uuid.as_bytes(),
+        display_name: [0u8; 128],
+        handler_node: [0u8; 128],
+        ich_offset: 0,
+        ich_count: 0,
+        _pad0: [0u8; 2],
+        roles_offset: 0,
+        roles_len: 0,
+        _pad1: [0u8; 2],
+        capabilities_offset: 0,
+        capabilities_len: 0,
+        _pad2: [0u8; 2],
+        created_at: now_ms,
+        updated_at: now_ms,
+        _reserved: [0u8; 8],
+    };
+    let display_name = identification_str(&ilk.identification, "display_name")
+        .or_else(|| identification_str(&ilk.identification, "node_name"))
+        .unwrap_or(ilk.ilk_id.as_str());
+    copy_bytes_with_len(&mut entry.display_name, display_name);
+    if let Some(handler_node) = identification_str(&ilk.identification, "node_name") {
+        copy_bytes_with_len(&mut entry.handler_node, handler_node);
+    }
+    Ok(entry)
+}
+
+fn ich_entries_from_ilk_record(ilk: &IlkRecord) -> Result<Vec<(IchEntry, String, String)>, IdentityError> {
+    let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
+    let now_ms = now_epoch_ms();
+    let mut entries = Vec::with_capacity(ilk.channels.len());
+    for (idx, channel) in ilk.channels.iter().enumerate() {
+        let ich_uuid = parse_prefixed_uuid(&channel.ich_id, "ich")?;
+        let channel_type = channel.channel_type.trim().to_ascii_lowercase();
+        let address = channel.address.trim().to_ascii_lowercase();
+        if channel_type.is_empty() || address.is_empty() {
+            continue;
+        }
+        let mut entry = IchEntry {
+            ich_id: *ich_uuid.as_bytes(),
+            ilk_id: *ilk_uuid.as_bytes(),
+            channel_type: [0u8; ICH_CHANNEL_TYPE_MAX_LEN],
+            address: [0u8; ICH_ADDRESS_MAX_LEN],
+            flags: FLAG_ACTIVE,
+            is_primary: if idx == 0 { 1 } else { 0 },
+            _pad0: [0u8; 5],
+            added_at: now_ms,
+            _reserved: [0u8; 16],
+        };
+        copy_bytes_with_len(&mut entry.channel_type, &channel_type);
+        copy_bytes_with_len(&mut entry.address, &address);
+        entries.push((entry, channel_type, address));
+    }
+    Ok(entries)
+}
+
+fn alias_entry_from_record(alias: &AliasSnapshotRecord) -> Result<IlkAliasEntry, IdentityError> {
+    let old_uuid = parse_prefixed_uuid(&alias.old_ilk_id, "ilk")?;
+    let canonical_uuid = parse_prefixed_uuid(&alias.canonical_ilk_id, "ilk")?;
+    Ok(IlkAliasEntry {
+        old_ilk_id: *old_uuid.as_bytes(),
+        canonical_ilk_id: *canonical_uuid.as_bytes(),
+        expires_at: alias.expires_at_ms,
+        flags: FLAG_ACTIVE,
+        _reserved: [0u8; 22],
+    })
+}
+
+fn apply_identity_shm_delta(
+    writer: &mut IdentityRegionWriter,
+    delta: &IdentityDelta,
+) -> Result<(), IdentityError> {
+    match delta {
+        IdentityDelta::TenantUpsert { tenant } => {
+            writer.upsert_tenant_entry(tenant_entry_from_record(tenant)?)?;
+        }
+        IdentityDelta::IlkUpsert { ilk } => {
+            let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
+            writer.upsert_ilk_entry(ilk_entry_from_record(ilk)?)?;
+            writer.clear_ich_mappings_for_ilk(*ilk_uuid.as_bytes())?;
+            let ich_entries = ich_entries_from_ilk_record(ilk)?;
+            let entries_only: Vec<IchEntry> = ich_entries.iter().map(|(entry, _, _)| *entry).collect();
+            writer.replace_ich_entries_for_ilk(*ilk_uuid.as_bytes(), &entries_only)?;
+            for (entry, channel_type, address) in ich_entries {
+                writer.upsert_ich_mapping(
+                    &channel_type,
+                    &address,
+                    entry.ich_id,
+                    *ilk_uuid.as_bytes(),
+                )?;
+            }
+        }
+        IdentityDelta::IlkDelete { ilk_id } => {
+            let ilk_uuid = parse_prefixed_uuid(ilk_id, "ilk")?;
+            writer.clear_ich_mappings_for_ilk(*ilk_uuid.as_bytes())?;
+            writer.replace_ich_entries_for_ilk(*ilk_uuid.as_bytes(), &[])?;
+            writer.remove_ilk_entry(*ilk_uuid.as_bytes())?;
+        }
+        IdentityDelta::AliasUpsert { alias } => {
+            writer.upsert_ilk_alias_entry(alias_entry_from_record(alias)?)?;
+        }
+        IdentityDelta::AliasDelete { old_ilk_id } => {
+            let old_uuid = parse_prefixed_uuid(old_ilk_id, "ilk")?;
+            writer.remove_ilk_alias_entry(*old_uuid.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_identity_shm_provision_fast(
+    writer: &mut IdentityRegionWriter,
+    ilk: &IlkRecord,
+) -> Result<bool, IdentityError> {
+    if ilk.registration_status != "temporary" || ilk.channels.is_empty() {
+        return Ok(false);
+    }
+
+    let ich_entries = ich_entries_from_ilk_record(ilk)?;
+    if ich_entries.is_empty() {
+        return Ok(false);
+    }
+
+    let entries_only: Vec<IchEntry> = ich_entries.iter().map(|(entry, _, _)| *entry).collect();
+    let apply_started = Instant::now();
+    let ilk_entry = ilk_entry_from_record(ilk)?;
+    writer.provision_temporary_ilk(ilk_entry, &entries_only)?;
+    tracing::info!(
+        ilk_id = %ilk.ilk_id,
+        channel_count = entries_only.len(),
+        elapsed_us = apply_started.elapsed().as_micros() as u64,
+        "identity shm provision fast path applied"
+    );
+    Ok(true)
+}
+
+fn apply_identity_shm_deltas(
+    writer: &mut IdentityRegionWriter,
+    store: &IdentityStore,
+    action: &str,
+    deltas: &[IdentityDeltaEnvelope],
+) -> Result<(), IdentityError> {
+    if action == MSG_ILK_PROVISION
+        && deltas.len() == 1
+        && matches!(&deltas[0].delta, IdentityDelta::IlkUpsert { .. })
+    {
+        if let IdentityDelta::IlkUpsert { ilk } = &deltas[0].delta {
+            if apply_identity_shm_provision_fast(writer, ilk)? {
+                return Ok(());
+            }
+        }
+    }
+
+    for delta in deltas {
+        if let Err(err) = apply_identity_shm_delta(writer, &delta.delta) {
+            tracing::warn!(
+                action,
+                error = %err,
+                "identity shm incremental apply failed; rebuilding full snapshot"
+            );
+            sync_identity_shm_mappings(writer, store)?;
+            return Ok(());
+        }
+    }
     Ok(())
 }
 
@@ -2383,6 +2633,7 @@ async fn send_system_response(
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(msg_name.to_string()),
+            src_ilk: None,
             scope: None,
             target: None,
             action: None,

@@ -321,6 +321,7 @@ async fn send_config_response(
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some("CONFIG_RESPONSE".to_string()),
+            src_ilk: None,
             scope: None,
             target: None,
             action: None,
@@ -458,6 +459,7 @@ async fn handle_admin_action(
         meta: Meta {
             msg_type: "admin".to_string(),
             msg: None,
+            src_ilk: None,
             scope: None,
             target: None,
             action: Some(action.to_string()),

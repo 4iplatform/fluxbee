@@ -46,6 +46,8 @@ pub struct Meta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub msg: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_ilk: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
@@ -241,6 +243,7 @@ pub fn build_system_message(
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(msg.to_string()),
+            src_ilk: None,
             scope: None,
             target: None,
             action: None,

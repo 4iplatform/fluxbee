@@ -140,6 +140,7 @@ pub async fn admin_command(
         meta: Meta {
             msg_type: ADMIN_KIND.to_string(),
             msg: Some(MSG_ADMIN_COMMAND.to_string()),
+            src_ilk: None,
             scope: None,
             target: Some(admin_target.to_string()),
             action: Some(action.to_string()),

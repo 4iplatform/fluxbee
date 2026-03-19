@@ -83,11 +83,8 @@ fn parse_prefixed_uuid_bytes(value: &str, prefix: &str) -> Result<[u8; 16], Diag
 
 fn src_ilk_from_message(msg: &Message) -> Option<String> {
     msg.meta
-        .context
-        .as_ref()
-        .and_then(Value::as_object)
-        .and_then(|ctx| ctx.get("src_ilk"))
-        .and_then(Value::as_str)
+        .src_ilk
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
@@ -157,12 +154,12 @@ async fn send_resolve_probe(
         meta: Meta {
             msg_type: "user".to_string(),
             msg: None,
+            src_ilk: Some(src_ilk.to_string()),
             scope: None,
             target: Some("identity.provision.complete.diag".to_string()),
             action: None,
             priority: None,
             context: Some(json!({
-                "src_ilk": src_ilk,
                 "probe_id": probe_id,
             })),
         },

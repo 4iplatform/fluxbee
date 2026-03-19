@@ -104,7 +104,7 @@ Regla de trabajo actual:
 Qué pasa hoy:
 - El protocolo/documentación define L3 tipado.
 - `Meta` en SDK no expone esos campos (solo `context` libre).
-- Router hoy canonicaliza `src_ilk` leyendo `meta.context["src_ilk"]`.
+- Router hoy canonicaliza `src_ilk` leyendo `meta.src_ilk`.
 - No está materializada la inyección real de `ctx_window` en router.
 
 Evidencia:

@@ -10,6 +10,7 @@ Documentos operativos activos organizados por proceso/componente:
 - `docs/onworking/nats_tasks.md`
 - `docs/onworking/blob_tasks.md`
 - `docs/onworking/sdk_tasks.md`
+- `docs/onworking/sdk_integration_tasks.md`
 - `docs/onworking/blob_node_examples.md`
 - `docs/onworking/orchestrator_frictions.md`
 
@@ -25,6 +26,7 @@ Documentos transversales (no de un solo proceso):
 - `docs/onworking/diagnostics_tasks.md`
 - `docs/onworking/blob_tasks.md`
 - `docs/onworking/sdk_tasks.md`
+- `docs/onworking/sdk_integration_tasks.md`
 - `docs/onworking/blob_node_examples.md`
 - `docs/onworking/orchestrator_frictions.md`
 

@@ -1,3 +1,4 @@
+use fluxbee_sdk::protocol::Meta;
 use fluxbee_sdk::{connect, NodeReceiver, NodeSender};
 use gov_common::{build_node_config, env_opt, env_or};
 use serde_json::Value;
@@ -39,7 +40,7 @@ async fn run_loop(
             Err(_) => continue,
         };
 
-        let src_ilk = src_ilk_from_meta_context(msg.meta.context.as_ref()).unwrap_or_default();
+        let src_ilk = src_ilk_from_meta(&msg.meta).unwrap_or_default();
         let kind = msg.meta.msg_type.as_str();
 
         tracing::info!(
@@ -71,11 +72,9 @@ async fn run_loop(
     }
 }
 
-fn src_ilk_from_meta_context(context: Option<&Value>) -> Option<String> {
-    context
-        .and_then(Value::as_object)
-        .and_then(|ctx| ctx.get("src_ilk"))
-        .and_then(Value::as_str)
+fn src_ilk_from_meta(meta: &Meta) -> Option<String> {
+    meta.src_ilk
+        .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(|v| v.to_string())
