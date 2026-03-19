@@ -17,6 +17,9 @@ Required:
 
 Options:
   --mode <default|gov>         Default AI_NODE_MODE embedded in runtime start.sh (default: default)
+  --forced-node-name <name>    Pass-through to publish-ia-runtime.sh (forces bootstrap node name in start.sh)
+  --forced-dynamic-config-dir <path>
+                               Pass-through to publish-ia-runtime.sh (forces bootstrap dynamic config dir)
   --node-name <name@hive>      If provided, script also spawns/restarts node
   --runtime-version <ver>      Runtime version for spawn payload (default: current)
   --config-json <file>         JSON file with spawn config object
@@ -52,6 +55,8 @@ HIVE_ID=""
 RUNTIME=""
 VERSION=""
 MODE="default"
+FORCED_NODE_NAME=""
+FORCED_DYNAMIC_CONFIG_DIR=""
 RUNTIME_VERSION="current"
 NODE_NAME=""
 CONFIG_JSON=""
@@ -75,6 +80,8 @@ while [[ $# -gt 0 ]]; do
     --runtime) RUNTIME="${2:-}"; shift 2 ;;
     --version) VERSION="${2:-}"; shift 2 ;;
     --mode) MODE="${2:-}"; shift 2 ;;
+    --forced-node-name) FORCED_NODE_NAME="${2:-}"; shift 2 ;;
+    --forced-dynamic-config-dir) FORCED_DYNAMIC_CONFIG_DIR="${2:-}"; shift 2 ;;
     --runtime-version) RUNTIME_VERSION="${2:-}"; shift 2 ;;
     --node-name) NODE_NAME="${2:-}"; shift 2 ;;
     --config-json) CONFIG_JSON="${2:-}"; shift 2 ;;
@@ -207,6 +214,12 @@ log "starting deploy; log_file=$LOG_FILE"
 log "step=publish runtime=$RUNTIME version=$VERSION mode=$MODE"
 
 publish_cmd=(bash "$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --mode "$MODE" --set-current)
+if [[ -n "$FORCED_NODE_NAME" ]]; then
+  publish_cmd+=(--forced-node-name "$FORCED_NODE_NAME")
+fi
+if [[ -n "$FORCED_DYNAMIC_CONFIG_DIR" ]]; then
+  publish_cmd+=(--forced-dynamic-config-dir "$FORCED_DYNAMIC_CONFIG_DIR")
+fi
 if [[ "$USE_SUDO" == "1" ]]; then
   publish_cmd+=(--sudo)
 fi

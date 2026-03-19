@@ -17,6 +17,9 @@ Options:
   --binary <path>          Binary path (default: target/release/ai_node_runner)
   --dist-root <path>       Dist root (default: /var/lib/fluxbee/dist)
   --mode <default|gov>     Default AI_NODE_MODE for published start.sh (default: default)
+  --forced-node-name <n>   Force --node-name in start.sh when AI_NODE_NAME is missing
+  --forced-dynamic-config-dir <p>
+                            Force --dynamic-config-dir in start.sh when AI_DYNAMIC_CONFIG_DIR is missing
   --set-current            Set current version in manifest
   --sudo                   Use sudo for writes
   --skip-build             Skip cargo build
@@ -32,6 +35,8 @@ SET_CURRENT=0
 USE_SUDO=0
 SKIP_BUILD=0
 MODE="default"
+FORCED_NODE_NAME=""
+FORCED_DYNAMIC_CONFIG_DIR=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,6 +58,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --mode)
       MODE="${2:-}"
+      shift 2
+      ;;
+    --forced-node-name)
+      FORCED_NODE_NAME="${2:-}"
+      shift 2
+      ;;
+    --forced-dynamic-config-dir)
+      FORCED_DYNAMIC_CONFIG_DIR="${2:-}"
       shift 2
       ;;
     --set-current)
@@ -146,7 +159,16 @@ if [[ -z "\${AI_NODE_MODE:-}" ]]; then
   export AI_NODE_MODE="$MODE"
 fi
 SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
-exec "\$SCRIPT_DIR/$BINARY_NAME" "\$@"
+forced_node_name="${FORCED_NODE_NAME}"
+forced_dynamic_dir="${FORCED_DYNAMIC_CONFIG_DIR}"
+runner_args=()
+if [[ -n "\${forced_node_name}" && -z "\${AI_NODE_NAME:-}" ]]; then
+  runner_args+=(--node-name "\${forced_node_name}")
+fi
+if [[ -n "\${forced_dynamic_dir}" && -z "\${AI_DYNAMIC_CONFIG_DIR:-}" ]]; then
+  runner_args+=(--dynamic-config-dir "\${forced_dynamic_dir}")
+fi
+exec "\$SCRIPT_DIR/$BINARY_NAME" "\${runner_args[@]}" "\$@"
 EOF
 
 if [[ "$USE_SUDO" == "1" ]]; then
@@ -157,3 +179,9 @@ fi
 rm -f "$tmp_start"
 
 echo "Configured AI start.sh mode default: $MODE"
+if [[ -n "$FORCED_NODE_NAME" ]]; then
+  echo "Configured AI start.sh forced node name: $FORCED_NODE_NAME"
+fi
+if [[ -n "$FORCED_DYNAMIC_CONFIG_DIR" ]]; then
+  echo "Configured AI start.sh forced dynamic config dir: $FORCED_DYNAMIC_CONFIG_DIR"
+fi
