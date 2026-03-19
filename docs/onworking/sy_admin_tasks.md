@@ -255,7 +255,7 @@ Revisión 2026-03-19:
   - implementado:
     - scan de instancias persistidas
     - salto explícito de `SY.*` / `RT.*`
-    - relaunch de instancias `CUSTOM` caídas si tienen `runtime` + `runtime_version` válidos y no están activas/visibles
+    - relaunch de instancias `CUSTOM` caídas si tienen `runtime` + `runtime_version` válidos, no están activas/visibles y `_system.relaunch_on_boot=true`
   - contrato de bootstrap de nombre para runtimes gestionados:
     - `SY.orchestrator` debe pasar el nombre canónico de la instancia al proceso al momento del spawn/relaunch
     - forma elegida para v1: variable de entorno `FLUXBEE_NODE_NAME=<node_name@hive>`
@@ -264,11 +264,13 @@ Revisión 2026-03-19:
       - `/var/lib/fluxbee/nodes/<KIND>/<node_name@hive>/config.json`
     - `_system.node_name` dentro de `config.json` sigue siendo la fuente de verdad persistida
     - `FLUXBEE_NODE_NAME` es el dato de bootstrap para que el proceso llegue a esa persistencia al arrancar
+    - el reconcile de reboot/autostart es opt-in por `_system.relaunch_on_boot=true`
   - rationale del contrato:
     - evita duplicar dos referencias (`NODE_NAME` + `NODE_CONFIG`) que podrían divergir
     - evita depender de parsing de argumentos en todos los `start.sh`
     - calza bien con `systemd-run --setenv=...`
     - mantiene el cambio concentrado en `SY.orchestrator`, no en cada runtime individual
+    - evita relanzar basura histórica persistida de pruebas viejas que no fue creada bajo el contrato nuevo
   - pendiente:
     - validación E2E real post-reboot
     - script preparado: `scripts/custom_node_reboot_reconcile_e2e.sh`

@@ -387,6 +387,7 @@ struct PersistedManagedNode {
     runtime: String,
     runtime_version: String,
     config_path: PathBuf,
+    relaunch_on_boot: bool,
 }
 
 const MOTHERBEE_CRITICAL_SERVICES: [&str; 6] = [
@@ -860,6 +861,7 @@ async fn reconcile_persisted_custom_nodes(
                     kind = node.kind,
                     runtime = runtime_key,
                     runtime_version = version,
+                    relaunch_on_boot = node.relaunch_on_boot,
                     config_path = %node.config_path.display(),
                     unit = unit,
                     "persisted custom node relaunched during bootstrap reconcile"
@@ -4381,6 +4383,13 @@ fn persisted_custom_nodes_with_root(root: &Path) -> Result<Vec<PersistedManagedN
             else {
                 continue;
             };
+            let relaunch_on_boot = system
+                .get("relaunch_on_boot")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if !relaunch_on_boot {
+                continue;
+            }
 
             nodes.push(PersistedManagedNode {
                 node_name,
@@ -4388,6 +4397,7 @@ fn persisted_custom_nodes_with_root(root: &Path) -> Result<Vec<PersistedManagedN
                 runtime: runtime.to_string(),
                 runtime_version: runtime_version.to_string(),
                 config_path,
+                relaunch_on_boot,
             });
         }
     }
@@ -7237,6 +7247,7 @@ fn build_node_system_block(
         "managed_by": "SY.orchestrator",
         "node_name": node_name,
         "hive_id": hive_id,
+        "relaunch_on_boot": true,
         "config_version": config_version,
         "created_at_ms": now_epoch_ms(),
         "updated_at_ms": now_epoch_ms(),
@@ -13750,7 +13761,8 @@ blob:
             serde_json::json!({
                 "_system": {
                     "runtime": "ai.keep.test",
-                    "runtime_version": "1.0.0-diag"
+                    "runtime_version": "1.0.0-diag",
+                    "relaunch_on_boot": true
                 }
             })
             .to_string(),
@@ -13764,7 +13776,8 @@ blob:
             serde_json::json!({
                 "_system": {
                     "runtime": "sy.admin",
-                    "runtime_version": "1.0.0"
+                    "runtime_version": "1.0.0",
+                    "relaunch_on_boot": true
                 }
             })
             .to_string(),
@@ -13777,7 +13790,8 @@ blob:
             broken_dir.join("config.json"),
             serde_json::json!({
                 "_system": {
-                    "runtime": "wf.invalid"
+                    "runtime": "wf.invalid",
+                    "relaunch_on_boot": true
                 }
             })
             .to_string(),
@@ -13789,6 +13803,34 @@ blob:
         assert_eq!(nodes[0].node_name, "AI.keep.test@motherbee");
         assert_eq!(nodes[0].runtime, "ai.keep.test");
         assert_eq!(nodes[0].runtime_version, "1.0.0-diag");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn persisted_custom_nodes_with_root_requires_relaunch_on_boot_flag() {
+        let root = std::env::temp_dir().join(format!(
+            "fluxbee-persisted-custom-nodes-{}",
+            Uuid::new_v4().simple()
+        ));
+
+        let disabled_dir = root.join("AI").join("AI.skip.test@motherbee");
+        std::fs::create_dir_all(&disabled_dir).expect("create disabled dir");
+        std::fs::write(
+            disabled_dir.join("config.json"),
+            serde_json::json!({
+                "_system": {
+                    "runtime": "ai.skip.test",
+                    "runtime_version": "1.0.0-diag",
+                    "relaunch_on_boot": false
+                }
+            })
+            .to_string(),
+        )
+        .expect("write disabled config");
+
+        let nodes = persisted_custom_nodes_with_root(&root).expect("load persisted nodes");
+        assert!(nodes.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -14537,6 +14579,7 @@ blob:
             Some(&serde_json::json!("WF.demo.l1@worker-220"))
         );
         assert_eq!(obj.get("hive_id"), Some(&serde_json::json!("worker-220")));
+        assert_eq!(obj.get("relaunch_on_boot"), Some(&serde_json::json!(true)));
         assert_eq!(obj.get("runtime"), Some(&serde_json::json!("wf.orch.diag")));
         assert_eq!(
             obj.get("runtime_version"),

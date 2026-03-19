@@ -247,6 +247,46 @@ wait_node_active() {
   return 1
 }
 
+wait_admin_ready() {
+  local deadline=$(( $(date +%s) + WAIT_STATUS_SECS ))
+  while (( $(date +%s) <= deadline )); do
+    local http
+    http="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes" "$nodes_body" || true)"
+    if [[ "$http" == "200" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "FAIL: admin API did not recover after orchestrator restart" >&2
+  return 1
+}
+
+wait_node_visible_in_router() {
+  local node_name="$1"
+  local deadline=$(( $(date +%s) + WAIT_STATUS_SECS ))
+  while (( $(date +%s) <= deadline )); do
+    local http lifecycle visible
+    http="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes" "$nodes_body")"
+    if [[ "$http" != "200" ]]; then
+      sleep 2
+      continue
+    fi
+    lifecycle="$(jq -r --arg node "$node_name" \
+      '.payload.nodes[] | select(.node_name == $node) | .lifecycle_state // empty' \
+      "$nodes_body" | head -n1)"
+    visible="$(jq -r --arg node "$node_name" \
+      '.payload.nodes[] | select(.node_name == $node) | (.visible_in_router // false | tostring)' \
+      "$nodes_body" | head -n1)"
+    if [[ "$visible" == "true" && ( "$lifecycle" == "RUNNING" || "$lifecycle" == "STARTING" ) ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "FAIL: node did not become visible in router node='$node_name'" >&2
+  cat "$nodes_body" >&2 || true
+  return 1
+}
+
 wait_node_stopped_and_not_visible() {
   local node_name="$1"
   local deadline=$(( $(date +%s) + WAIT_STOP_SECS ))
@@ -532,7 +572,9 @@ echo "Step 8/11: restart sy-orchestrator to trigger bootstrap reconcile"
 as_root_local systemctl restart sy-orchestrator
 
 echo "Step 9/11: wait frontdesk relaunched by reconcile"
+wait_admin_ready
 frontdesk_lifecycle_after="$(wait_node_active "$FRONTDESK_NODE_NAME")"
+wait_node_visible_in_router "$FRONTDESK_NODE_NAME"
 
 echo "Step 10/11: spawn IO.test probe against relaunched frontdesk"
 io_spawn_payload="$(spawn_node_payload "$IO_NODE_NAME" "$IO_RUNTIME_NAME" "current")"
