@@ -220,7 +220,7 @@ Ejes:
 
 ### Hallazgos concretos de código
 
-- `GET /hives/{hive}/nodes` hoy lista nodos visibles en router/LSA, o sea conectados/vivos, no el conjunto completo de instancias gestionadas persistidas.
+- `GET /hives/{hive}/nodes` ya devuelve inventario de instancias gestionadas persistidas leyendo `/var/lib/fluxbee/nodes/**/config.json` y calculando lifecycle local; para hive remoto hace forward al orchestrator remoto.
 - `POST /hives/{hive}/nodes` persiste `config.json` en `/var/lib/fluxbee/nodes/<KIND>/<node@hive>/config.json` y hace spawn fail-closed si ya existe.
 - `DELETE /hives/{hive}/nodes/{name}` hoy termina en `kill_node`, que hace `systemctl stop/reset-failed`, pero no borra `config.json` ni elimina la instancia persistida.
 - El spawn de nodos gestionados usa `systemd-run --collect`, o sea unit transitorio.
@@ -228,16 +228,20 @@ Ejes:
 
 ### Tareas nuevas derivadas de esta matriz
 
+Revisión 2026-03-19:
+- Esta lista sigue vigente.
+- No quedó vieja, pero ya no mezcla el frente de lifecycle de runtimes por REST, que quedó resuelto arriba.
+- Lo que queda acá es el siguiente frente real: inventario persistente de instancias, remove real de instancia y persistencia/reconcile post-reboot para workloads custom.
+
 - [ ] Definir contrato de producto para `CORE + instanciado`.
   - Opción A: dejarlo explícitamente fuera de scope y rechazar `SY.*` / `RT.*` en el modelo de spawn gestionado.
   - Opción B: soportarlo como clase real con reglas específicas.
 
-- [ ] Implementar inventario de instancias gestionadas persistidas.
-  - No puede depender sólo de SHM/router.
-  - Debe listar lo que existe en `/var/lib/fluxbee/nodes/.../config.json`, aun si el proceso no está conectado.
-  - Decidir si:
-    - `/hives/{hive}/nodes` cambia a semántica de instancias gestionadas
-    - o se crea recurso nuevo (`/managed-nodes`, `/node-instances`, etc.)
+- [x] Implementar inventario de instancias gestionadas persistidas.
+  - Ya no depende sólo de SHM/router.
+  - `GET /hives/{hive}/nodes` pasó a semántica de instancias gestionadas persistidas.
+  - Lista lo que existe en `/var/lib/fluxbee/nodes/.../config.json`, aun si el proceso no está conectado.
+  - Remoto: forward al orchestrator del hive target.
 
 - [ ] Separar lifecycle de instancia: `stop/kill` vs `remove`.
   - `kill_node` hoy es stop del proceso/unit.

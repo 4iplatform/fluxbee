@@ -1052,7 +1052,7 @@ async fn handle_admin(
             .await;
             payload
         }
-        "list_nodes" => list_nodes_flow(state, &msg.payload),
+        "list_nodes" => list_nodes_flow(state, &msg.payload).await,
         "list_versions" => list_versions_flow(state).await,
         "get_versions" => get_versions_flow(state, &msg.payload).await,
         "list_runtimes" => list_runtimes_flow(state, &msg.payload).await,
@@ -1398,6 +1398,10 @@ async fn handle_system_message(
         Some("GET_RUNTIMES") => {
             let result = list_runtimes_flow(state, &msg.payload).await;
             let _ = send_system_action_response(sender, msg, "GET_RUNTIMES_RESPONSE", result).await;
+        }
+        Some("LIST_NODES") => {
+            let result = list_nodes_flow(state, &msg.payload).await;
+            let _ = send_system_action_response(sender, msg, "LIST_NODES_RESPONSE", result).await;
         }
         Some("GET_RUNTIME") => {
             let result = get_runtime_flow(state, &msg.payload).await;
@@ -3997,40 +4001,182 @@ fn load_lsa_snapshot(state: &OrchestratorState) -> Result<LsaSnapshot, Orchestra
         .ok_or_else(|| "lsa snapshot unavailable".into())
 }
 
-fn nodes_from_snapshot(snapshot: &ShmSnapshot, local_hive: &str) -> Vec<serde_json::Value> {
-    snapshot
-        .nodes
-        .iter()
-        .filter_map(|node| node_entry_to_json(node, local_hive))
-        .collect()
+fn managed_node_inventory_with_root(
+    state: &OrchestratorState,
+    root: &Path,
+) -> Result<Vec<serde_json::Value>, OrchestratorError> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut nodes = Vec::new();
+    for kind_entry in fs::read_dir(root)? {
+        let kind_entry = kind_entry?;
+        if !kind_entry.file_type()?.is_dir() {
+            continue;
+        }
+        for node_entry in fs::read_dir(kind_entry.path())? {
+            let node_entry = node_entry?;
+            if !node_entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            let node_name = node_entry.file_name().to_string_lossy().to_string();
+            let hive = node_name
+                .rsplit_once('@')
+                .map(|(_, hive)| hive.to_string())
+                .unwrap_or_else(|| state.hive_id.clone());
+            let kind = node_kind_from_name(&node_name);
+            let config_path = node_entry.path().join("config.json");
+            let state_path = node_entry.path().join("state.json");
+            let config_exists = config_path.is_file();
+            let state_exists = state_path.is_file();
+            let unit = unit_from_node_name(&node_name);
+            let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
+            let unit_failed = systemd_unit_is_failed(&unit).unwrap_or(false);
+            let inventory_visible = local_inventory_has_node(state, &node_name);
+
+            let mut config_valid = false;
+            let mut config_version: Option<u64> = None;
+            let mut runtime_name: Option<String> = None;
+            let mut runtime_version: Option<String> = None;
+            let mut identity_ilk_id: Option<String> = None;
+            let mut identity_tenant_id: Option<String> = None;
+            if config_exists {
+                if let Ok(config_payload) = load_node_effective_config(&config_path) {
+                    config_valid = true;
+                    config_version = Some(config_version_from_value(&config_payload));
+                    if let Some(system) = config_payload.get("_system").and_then(|v| v.as_object()) {
+                        runtime_name = system
+                            .get("runtime")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        runtime_version = system
+                            .get("runtime_version")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        identity_ilk_id = system
+                            .get("ilk_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        identity_tenant_id = system
+                            .get("tenant_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                    }
+                    if identity_tenant_id.is_none() {
+                        identity_tenant_id = config_payload
+                            .get("tenant_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                    }
+                }
+            }
+
+            let lifecycle_state = if unit_active {
+                if inventory_visible {
+                    "RUNNING"
+                } else {
+                    "STARTING"
+                }
+            } else if unit_failed {
+                "FAILED"
+            } else if config_exists || state_exists {
+                "STOPPED"
+            } else {
+                "UNKNOWN"
+            };
+            let health_state = if lifecycle_state == "RUNNING" {
+                if !config_exists || !config_valid {
+                    "ERROR"
+                } else {
+                    "HEALTHY"
+                }
+            } else {
+                "UNKNOWN"
+            };
+
+            nodes.push(serde_json::json!({
+                "name": node_name,
+                "node_name": node_name,
+                "hive": hive,
+                "kind": kind,
+                "managed": true,
+                "inventory_source": "managed_instance",
+                "status": lifecycle_state.to_ascii_lowercase(),
+                "lifecycle_state": lifecycle_state,
+                "health_state": health_state,
+                "visible_in_router": inventory_visible,
+                "runtime": {
+                    "name": runtime_name,
+                    "version": runtime_version,
+                },
+                "config": {
+                    "path": config_path.display().to_string(),
+                    "exists": config_exists,
+                    "valid": config_valid,
+                    "config_version": config_version,
+                },
+                "state": {
+                    "path": state_path.display().to_string(),
+                    "exists": state_exists,
+                },
+                "identity": {
+                    "ilk_id": identity_ilk_id,
+                    "tenant_id": identity_tenant_id,
+                }
+            }));
+        }
+    }
+
+    nodes.sort_by(|a, b| {
+        let a_name = a.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
+        let b_name = b.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
+        a_name.cmp(b_name)
+    });
+    Ok(nodes)
 }
 
-fn list_nodes_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+fn managed_node_inventory(state: &OrchestratorState) -> Result<Vec<serde_json::Value>, OrchestratorError> {
+    managed_node_inventory_with_root(state, &node_files_root())
+}
+
+async fn list_nodes_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
     let target_hive = target_hive_from_payload(payload, &state.hive_id);
     if target_hive == state.hive_id {
-        return match load_router_snapshot(state) {
-            Ok(snapshot) => serde_json::json!({
+        return match managed_node_inventory(state) {
+            Ok(nodes) => serde_json::json!({
                 "status": "ok",
-                "nodes": nodes_from_snapshot(&snapshot, &state.hive_id),
+                "target": state.hive_id,
+                "hive": state.hive_id,
+                "inventory_source": "managed_instances",
+                "nodes": nodes,
             }),
             Err(err) => serde_json::json!({
                 "status": "error",
-                "error_code": "SHM_NOT_FOUND",
+                "error_code": "NODE_INVENTORY_READ_FAILED",
                 "message": err.to_string(),
             }),
         };
     }
 
-    match load_lsa_snapshot(state) {
-        Ok(snapshot) => serde_json::json!({
-            "status": "ok",
+    match forward_system_action_to_hive(
+        state,
+        &target_hive,
+        "LIST_NODES",
+        "LIST_NODES_RESPONSE",
+        serde_json::json!({
             "target": target_hive,
-            "nodes": remote_nodes_for_hive(&snapshot, &target_hive),
         }),
+    )
+    .await
+    {
+        Ok(response) => response,
         Err(err) => serde_json::json!({
             "status": "error",
-            "error_code": "SHM_NOT_FOUND",
+            "error_code": "NODE_LIST_FAILED",
             "message": err.to_string(),
+            "target": target_hive,
         }),
     }
 }
@@ -13069,6 +13215,40 @@ blob:
         let out = remove_runtime_version_flow(&state, &payload).await;
         assert_eq!(out["status"], "error");
         assert_eq!(out["error_code"], "BUSY");
+    }
+
+    #[test]
+    fn managed_node_inventory_lists_persisted_instances_without_router_visibility() {
+        let state = sample_orchestrator_state_for_tests();
+        let root = std::env::temp_dir().join(format!(
+            "fluxbee-managed-node-inventory-{}",
+            Uuid::new_v4().simple()
+        ));
+        let node_dir = root.join("AI").join("AI.persisted.test@motherbee");
+        std::fs::create_dir_all(&node_dir).expect("create node dir");
+        std::fs::write(
+            node_dir.join("config.json"),
+            serde_json::json!({
+                "_system": {
+                    "runtime": "ai.persisted.test",
+                    "runtime_version": "1.0.0-diag",
+                    "tenant_id": "tnt:test"
+                }
+            })
+            .to_string(),
+        )
+        .expect("write config");
+
+        let inventory =
+            managed_node_inventory_with_root(&state, &root).expect("managed inventory must load");
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0]["node_name"], "AI.persisted.test@motherbee");
+        assert_eq!(inventory[0]["inventory_source"], "managed_instance");
+        assert_eq!(inventory[0]["lifecycle_state"], "STOPPED");
+        assert_eq!(inventory[0]["runtime"]["name"], "ai.persisted.test");
+        assert_eq!(inventory[0]["runtime"]["version"], "1.0.0-diag");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
