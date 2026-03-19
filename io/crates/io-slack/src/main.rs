@@ -659,12 +659,7 @@ async fn run_inbound_socket_mode(
             match outcome {
                 InboundOutcome::SendNow(msg) => {
                     let trace_id = msg.routing.trace_id.clone();
-                    let has_src_ilk = msg
-                        .meta
-                        .context
-                        .as_ref()
-                        .and_then(|ctx| ctx.get("src_ilk"))
-                        .is_some_and(|v| !v.is_null());
+                    let has_src_ilk = msg.meta.src_ilk.as_deref().is_some_and(|v| !v.is_empty());
                     if let Err(e) = sender.send(msg).await {
                         tracing::warn!(error=?e, %trace_id, "failed to send to router");
                     } else {
@@ -862,12 +857,7 @@ impl SlackSessionizer {
             match outcome {
                 InboundOutcome::SendNow(msg) => {
                     let trace_id = msg.routing.trace_id.clone();
-                    let has_src_ilk = msg
-                        .meta
-                        .context
-                        .as_ref()
-                        .and_then(|ctx| ctx.get("src_ilk"))
-                        .is_some_and(|v| !v.is_null());
+                    let has_src_ilk = msg.meta.src_ilk.as_deref().is_some_and(|v| !v.is_empty());
                     if let Err(e) = sender.send(msg).await {
                         tracing::warn!(error=?e, %trace_id, "failed to send to router (session flush)");
                     } else {
@@ -922,12 +912,7 @@ impl SlackSessionizer {
 
         if let InboundOutcome::SendNow(msg) = outcome {
             let trace_id = msg.routing.trace_id.clone();
-            let has_src_ilk = msg
-                .meta
-                .context
-                .as_ref()
-                .and_then(|ctx| ctx.get("src_ilk"))
-                .is_some_and(|v| !v.is_null());
+            let has_src_ilk = msg.meta.src_ilk.as_deref().is_some_and(|v| !v.is_empty());
             if let Err(e) = sender.send(msg).await {
                 tracing::warn!(error=?e, %trace_id, "failed to send to router");
             } else {

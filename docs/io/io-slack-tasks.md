@@ -66,7 +66,7 @@ Acceptance:
 
 - [x] P2.1 Route all inbound Slack events through shared `InboundProcessor`.
 - [x] P2.2 Ensure envelope parity with `io-sim`:
-  - set `meta.context.src_ilk` (not top-level variants)
+  - set `meta.src_ilk` (canonical identity carrier)
   - preserve `meta.context.io` fields for Slack
 - [x] P2.3 Keep ACK non-blocking (do not block Slack ack on router/provision latency).
 - [x] P2.4 Keep dedup active for inbound keys (`event_id` preferred; fallback tuple).

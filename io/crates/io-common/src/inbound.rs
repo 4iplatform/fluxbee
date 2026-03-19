@@ -207,6 +207,18 @@ mod tests {
         }
     }
 
+    fn assert_no_legacy_context_src_ilk(msg: &fluxbee_sdk::protocol::Message) {
+        let legacy = msg
+            .meta
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("src_ilk"));
+        assert!(
+            legacy.is_none(),
+            "legacy meta.context.src_ilk should not be present"
+        );
+    }
+
     #[tokio::test]
     async fn dedup_drops_second_message() {
         let mut p = InboundProcessor::new("node", InboundConfig::default());
@@ -246,12 +258,8 @@ mod tests {
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
-        let src = msg
-            .meta
-            .context
-            .as_ref()
-            .and_then(|ctx| ctx.get("src_ilk"));
-        assert_eq!(src, Some(&serde_json::Value::Null));
+        assert_eq!(msg.meta.src_ilk, None);
+        assert_no_legacy_context_src_ilk(&msg);
         let stats = p.stats();
         assert_eq!(stats.identity_lookup_misses, 1);
         assert_eq!(stats.identity_fallback_null, 1);
@@ -281,6 +289,58 @@ mod tests {
             .and_then(|ctx| ctx.get("thread_id"))
             .and_then(|v| v.as_str());
         assert_eq!(thread_id, Some("171234.567"));
+    }
+
+    #[tokio::test]
+    async fn preserves_io_reply_target_in_meta_context() {
+        let mut p = InboundProcessor::new("node", InboundConfig::default());
+        let id = MockIdentityResolver::new();
+        let io = slack_inbound_io_context("T123", "U456", "C789", Some("171234.567"), "Ev1");
+        let input = ResolveOrCreateInput {
+            channel: "slack".to_string(),
+            external_id: "T123:U456".to_string(),
+            tenant_hint: None,
+            attributes: serde_json::json!({}),
+        };
+        let payload = serde_json::json!({ "type": "text", "content": "hi" });
+
+        let o = p.process_inbound(&id, None, input, io, payload).await;
+        let InboundOutcome::SendNow(msg) = o else {
+            panic!("unexpected outcome: {o:?}");
+        };
+
+        assert_eq!(msg.meta.src_ilk.as_deref(), Some("ilk:test"));
+        assert_no_legacy_context_src_ilk(&msg);
+
+        let rt = msg
+            .meta
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("io"))
+            .and_then(|io| io.get("reply_target"))
+            .cloned()
+            .expect("missing meta.context.io.reply_target");
+
+        assert_eq!(
+            rt.get("kind").and_then(|v| v.as_str()),
+            Some("slack_post")
+        );
+        assert_eq!(
+            rt.get("address").and_then(|v| v.as_str()),
+            Some("C789")
+        );
+        assert_eq!(
+            rt.get("params")
+                .and_then(|v| v.get("thread_ts"))
+                .and_then(|v| v.as_str()),
+            Some("171234.567")
+        );
+        assert_eq!(
+            rt.get("params")
+                .and_then(|v| v.get("workspace_id"))
+                .and_then(|v| v.as_str()),
+            Some("T123")
+        );
     }
 
     struct AlwaysProvision;
@@ -345,13 +405,8 @@ mod tests {
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
-        let src = msg
-            .meta
-            .context
-            .as_ref()
-            .and_then(|ctx| ctx.get("src_ilk"))
-            .and_then(|v| v.as_str());
-        assert_eq!(src, Some("ilk:provisional:test"));
+        assert_eq!(msg.meta.src_ilk.as_deref(), Some("ilk:provisional:test"));
+        assert_no_legacy_context_src_ilk(&msg);
         let stats = p.stats();
         assert_eq!(stats.identity_lookup_misses, 1);
         assert_eq!(stats.identity_provision_success, 1);
@@ -378,12 +433,8 @@ mod tests {
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
-        let src = msg
-            .meta
-            .context
-            .as_ref()
-            .and_then(|ctx| ctx.get("src_ilk"));
-        assert_eq!(src, Some(&serde_json::Value::Null));
+        assert_eq!(msg.meta.src_ilk, None);
+        assert_no_legacy_context_src_ilk(&msg);
         let stats = p.stats();
         assert_eq!(stats.identity_lookup_misses, 1);
         assert_eq!(stats.identity_provision_errors, 1);
@@ -413,13 +464,8 @@ mod tests {
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
-        let src = msg
-            .meta
-            .context
-            .as_ref()
-            .and_then(|ctx| ctx.get("src_ilk"))
-            .and_then(|v| v.as_str());
-        assert_eq!(src, Some("ilk:hit:test"));
+        assert_eq!(msg.meta.src_ilk.as_deref(), Some("ilk:hit:test"));
+        assert_no_legacy_context_src_ilk(&msg);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let stats = p.stats();
         assert_eq!(stats.identity_lookup_hits, 1);

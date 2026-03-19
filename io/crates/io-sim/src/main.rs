@@ -288,6 +288,14 @@ async fn process_one_inbound(
                 fluxbee_sdk::protocol::Destination::Broadcast => "broadcast".to_string(),
                 fluxbee_sdk::protocol::Destination::Resolve => "resolve".to_string(),
             };
+            let src_ilk = msg.meta.src_ilk.clone().unwrap_or_default();
+            let has_src_ilk = !src_ilk.is_empty();
+            let legacy_context_src_ilk = msg
+                .meta
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("src_ilk"))
+                .is_some();
             let thread_id = msg
                 .meta
                 .context
@@ -296,11 +304,24 @@ async fn process_one_inbound(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            if legacy_context_src_ilk {
+                tracing::warn!(
+                    %trace_id,
+                    "io-sim outbound still includes legacy meta.context.src_ilk"
+                );
+            }
             if let Ok(wire) = serde_json::to_string(&msg) {
                 tracing::debug!(%trace_id, wire = %wire, "io-sim outbound wire message");
             }
             sender.send(msg).await?;
-            tracing::info!(%trace_id, dst, thread_id = %thread_id, "io-sim sent inbound message to router");
+            tracing::info!(
+                %trace_id,
+                dst,
+                thread_id = %thread_id,
+                has_src_ilk,
+                src_ilk = %src_ilk,
+                "io-sim sent inbound message to router"
+            );
             match inbox
                 .lock()
                 .await

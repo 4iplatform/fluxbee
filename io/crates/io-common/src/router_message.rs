@@ -29,10 +29,6 @@ pub fn build_user_message(
         }
     };
     context_obj.insert(
-        "src_ilk".to_string(),
-        src_ilk.map(Value::String).unwrap_or(Value::Null),
-    );
-    context_obj.insert(
         "dst_ilk".to_string(),
         dst_ilk.map(Value::String).unwrap_or(Value::Null),
     );
@@ -54,6 +50,7 @@ pub fn build_user_message(
         meta: Meta {
             msg_type: "user".to_string(),
             msg: None,
+            src_ilk,
             scope: None,
             target: None,
             action: None,

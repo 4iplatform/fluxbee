@@ -23,11 +23,10 @@ They can be removed safely once you want a cleanup-only commit.
 
 ## Protocol note
 
-`fluxbee_sdk::protocol::Meta` currently exposes `context` (object) but not dedicated `src_ilk/dst_ilk` fields.
+`fluxbee_sdk::protocol::Meta` currently exposes top-level `src_ilk` and `context` (object).
 
-For now, io-common stores identity hints in `meta.context`:
+Current IO contract:
 
-- `meta.context.src_ilk`
-- `meta.context.dst_ilk`
-
-When Fluxbee protocol metadata includes native `src_ilk/dst_ilk` fields, io-common should move these values to native fields.
+- source identity uses canonical `meta.src_ilk`
+- channel metadata lives in `meta.context.io.*`
+- non-typed L3 fields (for example `dst_ilk`) may still be carried in `meta.context` until SDK/core alignment is complete

@@ -115,11 +115,11 @@ El Nodo IO Slack **DEBE** usar el flujo compartido de `io-common` para identidad
 
 1. `lookup` por SHM (`jsr-identity-*`)
 2. si hay miss/error: `provision_on_miss` via `SY.identity` (`ILK_PROVISION`)
-3. si provision falla o timeout: forward con `meta.context.src_ilk = null`
+3. si provision falla o timeout: forward con `meta.src_ilk = null`
 
-- Si hay hit: incluir `meta.context.src_ilk`.
-- Si hay miss y provision exitoso: incluir `meta.context.src_ilk` provisionado.
-- Si hay miss y provision no exitoso: **enviar igualmente** con `meta.context.src_ilk = null`.
+- Si hay hit: incluir `meta.src_ilk`.
+- Si hay miss y provision exitoso: incluir `meta.src_ilk` provisionado.
+- Si hay miss y provision no exitoso: **enviar igualmente** con `meta.src_ilk = null`.
 
 Esto implementa la estrategia recomendada de L3: **Desvío a Onboarding (Reprocesamiento)**.
 
@@ -137,7 +137,7 @@ El control de flujo (espera/reinyección) es responsabilidad de `WF.onboarding` 
 
 ## 7. Normalización hacia el router
 
-Además de `meta.context.src_ilk` (o `null`), el IO Slack **DEBE** adjuntar el bloque estandarizado `meta.context.io` (contrato IO Context), incluyendo `entrypoint` (workspace), `conversation` (channel/thread) y `reply_target` (channel + thread_ts).
+Además de `meta.src_ilk` (o `null`), el IO Slack **DEBE** adjuntar el bloque estandarizado `meta.context.io` (contrato IO Context), incluyendo `entrypoint` (workspace), `conversation` (channel/thread) y `reply_target` (channel + thread_ts).
 
 Por cada evento válido (`app_mention`), el Nodo IO Slack **DEBE** construir un
 `Message` del protocolo interno con:
@@ -153,7 +153,7 @@ Interpretación operativa:
 
 ### meta
 - `meta.type = "user"`
-- `meta.context.src_ilk`: ILK representando al usuario de Slack (humano externo) **o null**
+- `meta.src_ilk`: ILK representando al usuario de Slack (humano externo) **o null**
 - `meta.context.io`:
 ```json
 {
@@ -266,7 +266,7 @@ La resolución primaria es por SHM (`jsr-identity-*`).
 Cuando hay miss/error, el provisioner puede enviar `ILK_PROVISION` a `SY.identity`.
 
 Si no se obtiene `src_ilk` (fallo/timeout), el IO **DEBE** enviar al Router con
-`meta.context.src_ilk = null` para degradación controlada/onboarding.
+`meta.src_ilk = null` para degradación controlada/onboarding.
 
 Esta definición reemplaza cualquier modo legacy o lógica de identidad ad-hoc en el nodo Slack.
 

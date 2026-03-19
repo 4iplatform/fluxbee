@@ -21,7 +21,7 @@ IO nodes:
 - On miss/error, can call `ILK_PROVISION` via `SY.identity` (shared `io-common` flow)
 - Never block provider ACK waiting for identity
 
-If provision fails/timeout, IO forwards with `meta.context.src_ilk = null` and Router/OPA handles onboarding.
+If provision fails/timeout, IO forwards with `meta.src_ilk = null` and Router/OPA handles onboarding.
 
 ---
 
@@ -30,8 +30,8 @@ If provision fails/timeout, IO forwards with `meta.context.src_ilk = null` and R
 ### Strategy: Router-Driven Onboarding
 
 - IO runs `lookup -> provision_on_miss -> forward`
-- Normal path is non-null `meta.context.src_ilk` when lookup/provision succeeds
-- Degraded fallback forwards with `meta.context.src_ilk = null`
+- Normal path is non-null `meta.src_ilk` when lookup/provision succeeds
+- Degraded fallback forwards with `meta.src_ilk = null`
 - Router + OPA redirect to onboarding workflow
 - Message is re-injected once identity exists
 

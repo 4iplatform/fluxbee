@@ -2,7 +2,7 @@
 > Adaptation note for `json-router`:
 > In this repo, identity flow follows Router-driven onboarding (v1.16+):
 > IO performs `lookup -> provision_on_miss -> forward`.
-> On provision failure/timeout, it forwards with `meta.context.src_ilk = null` (degraded fallback).
+> On provision failure/timeout, it forwards with `meta.src_ilk = null` (degraded fallback).
 > Any older wording suggesting synchronous wait/buffering for identity should be treated as superseded.
 
 > Operational note:
@@ -27,15 +27,15 @@
 ## Adaptación temporal al core/SDK (campos L3 e identidad)
 
 > ✅ **Canónico (protocolo Fluxbee):** existen campos L3 dedicados para identidad y contexto conversacional (por ejemplo `src_ilk/dst_ilk`, `ich/ctx`, `ctx_seq`, `ctx_window`).  
-> ⚠️ **Estado actual (core/SDK):** el SDK de mensaje aún no expone todos esos campos como propiedades top-level; se dispone de `meta.context` (JSON) como “carrier”.
+> ⚠️ **Estado actual (core/SDK):** el SDK no expone todos los campos L3 dedicados, pero `src_ilk` sí se transporta canónicamente en `meta.src_ilk`. `meta.context` queda para metadata adicional.
 
 ✅ **NORMATIVO (HOY, implementación compatible):**
-- IO Nodes **MUST** usar `meta.context` como carrier temporal para hints de identidad/contexto cuando el core/SDK no provea campos dedicados.
+- IO Nodes **MUST** usar `meta.src_ilk` como carrier canónico de identidad de origen.
 - La metadata específica del canal (Slack/WhatsApp/Email) debe vivir bajo `meta.context.io.*`.
-- Mientras dure la transición, es aceptable transportar `src_ilk/dst_ilk` como `meta.context.src_ilk` / `meta.context.dst_ilk` (carrier legacy).
+- Mientras dure la transición, campos L3 no tipados (por ejemplo `dst_ilk`) pueden transportarse en `meta.context`.
 
 ⚠️ **ADVERTENCIA:**
-- Este carrier es temporal. Cuando el core/SDK exponga campos dedicados, IO Nodes deben migrar a los campos canónicos y dejar de “polucionar” `meta.context` raíz.
+- El uso de `meta.context` como carrier es temporal para campos no tipados. `meta.src_ilk` ya es canónico y no debe duplicarse en `meta.context`.
 
 🧩 **A ESPECIFICAR (cuando el core se alinee):**
 - Momento exacto de corte (release) donde `ctx_seq/ctx_window` pasan a ser obligatorios en el happy path.
@@ -93,8 +93,8 @@ Los detalles específicos quedan en cada Nodo IO.
 
 1. `lookup(channel, external_id)` sobre SHM de identidad (`jsr-identity-<island>`).
 2. Si lookup da miss/error y `provision_on_miss=true`, llamar `ILK_PROVISION` contra `SY.identity`.
-3. Si provision devuelve ILK, forward con `meta.context.src_ilk=<ilk>`.
-4. Si provision falla o timeout, forward con `meta.context.src_ilk=null` (degraded fallback).
+3. Si provision devuelve ILK, forward con `meta.src_ilk=<ilk>`.
+4. Si provision falla o timeout, forward con `meta.src_ilk=null` (degraded fallback).
 
 Configuración operativa:
 - `ISLAND_ID`
@@ -149,7 +149,7 @@ Cada vez que el Nodo IO recibe un mensaje o evento desde el exterior:
 1. **Extracción:** El Nodo IO extrae el ID del proveedor (ej: `U12345`).
 2. **Lookup:** `lookup(channel, external_id)`.
 3. **Provision on miss (opcional por config):** si hay miss/error, intentar `ILK_PROVISION`.
-4. **Forward al Router:** con `meta.context.src_ilk=<ilk>` si hubo éxito, o `null` en fallback.
+4. **Forward al Router:** con `meta.src_ilk=<ilk>` si hubo éxito, o `null` en fallback.
 
 ### 3.3 Outbound
 La resolución de destino outbound es por `meta.context.io.reply_target` (contrato IO Context).
@@ -368,9 +368,9 @@ El Nodo IO no debe bloquear ACK inbound esperando identidad.
 Pipeline normativo:
 1. lookup en SHM (`jsr-identity-<island>`)
 2. si hay miss/error: `ILK_PROVISION` contra `SY.identity` (provision_on_miss)
-3. si provision falla/timeout: forward degradado con `meta.context.src_ilk = null`
+3. si provision falla/timeout: forward degradado con `meta.src_ilk = null`
 
-Mientras el SDK no exponga campos L3 tipados, el carrier vigente es `meta.context.src_ilk`.
+`src_ilk` debe ir en `meta.src_ilk`; `meta.context` queda para metadata adicional (incluyendo `meta.context.io.*`).
 
 ---
 
@@ -383,7 +383,7 @@ Mientras el SDK no exponga campos L3 tipados, el carrier vigente es `meta.contex
 ### Protocolo (`meta.ctx` vs `meta.context`)
 
 - `meta.ctx`: contexto conversacional
-- `meta.context`: metadata adicional (OPA + carrier temporal)
+- `meta.context`: metadata adicional (OPA + carrier temporal para campos no tipados)
 - IO metadata de canal bajo `meta.context.io.*`
 
 ---

@@ -16,13 +16,13 @@ When these docs conflict with the current Fluxbee v1.16/v1.17 direction in this 
 1. Identity:
 - IO uses shared `io-common` pipeline: `lookup -> provision_on_miss -> forward`.
 - IO must not block waiting for identity before acking inbound provider traffic.
-- On provision failure/timeout, IO forwards with `meta.context.src_ilk = null` (degraded fallback), and Router/OPA handles onboarding.
+- On provision failure/timeout, IO forwards with `meta.src_ilk = null` (degraded fallback), and Router/OPA handles onboarding.
 
 2. Context fields:
 - `meta.ctx` is conversational context key.
 - `meta.context` is reserved for OPA/extra metadata.
 - IO metadata belongs under `meta.context.io` only.
-- While SDK L3 typed fields are not exposed, identity carrier uses `meta.context.src_ilk` / `meta.context.dst_ilk`.
+- Identity is carried in `meta.src_ilk`. Channel metadata remains under `meta.context.io.*`.
 
 3. Transport:
 - Production node-to-router integration in this repo uses `fluxbee_sdk` + Unix sockets.
