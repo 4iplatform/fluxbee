@@ -208,3 +208,16 @@ El script:
 - reintenta `update` si recibe `sync_pending`,
 - loguea cada paso en archivo (`/tmp/deploy-io-slack-<ts>.log` por defecto).
 - soporta `--update-existing` para actualizar codigo de nodo existente reutilizando su config.
+- opcionalmente permite continuar aun con `sync_pending` via `--allow-sync-pending` (solo para entornos de prueba con manifest global inconsistente).
+
+### Nota sobre `sync_pending` permanente
+
+Si `update` queda en `sync_pending` por faltantes de otros runtimes del manifest (por ejemplo `wf.node.status.*.diag`), el deploy de `IO.slack` puede bloquearse aunque `IO.slack` se haya publicado correctamente.
+
+En entornos de prueba podes usar:
+
+```bash
+bash scripts/deploy-io-slack.sh ... --allow-sync-pending
+```
+
+Esto permite continuar a `spawn`, pero no corrige el problema de fondo del manifest global.

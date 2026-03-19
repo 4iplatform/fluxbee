@@ -32,6 +32,7 @@ Options:
   --sync-hint                  Run sync-hint before each update attempt
   --update-retries <n>         Retries when update returns sync_pending (default: 8)
   --retry-delay-s <seconds>    Delay between retries (default: 2)
+  --allow-sync-pending         Continue deploy even if update stays in sync_pending after retries
   --sudo                       Pass --sudo to publish script
   --skip-build                 Pass --skip-build to publish script
   --dist-root <path>           Pass --dist-root to publish script
@@ -71,6 +72,7 @@ UPDATE_EXISTING=0
 USE_SYNC_HINT=0
 UPDATE_RETRIES=8
 RETRY_DELAY_S=2
+ALLOW_SYNC_PENDING=0
 USE_SUDO=0
 SKIP_BUILD=0
 DIST_ROOT=""
@@ -98,6 +100,7 @@ while [[ $# -gt 0 ]]; do
     --sync-hint) USE_SYNC_HINT=1; shift ;;
     --update-retries) UPDATE_RETRIES="${2:-}"; shift 2 ;;
     --retry-delay-s) RETRY_DELAY_S="${2:-}"; shift 2 ;;
+    --allow-sync-pending) ALLOW_SYNC_PENDING=1; shift ;;
     --sudo) USE_SUDO=1; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --dist-root) DIST_ROOT="${2:-}"; shift 2 ;;
@@ -318,8 +321,12 @@ PY
 done
 
 if [[ "$UPDATE_STATUS" != "ok" ]]; then
+  if [[ "$UPDATE_STATUS" == "sync_pending" && "$ALLOW_SYNC_PENDING" == "1" ]]; then
+    log "update_not_ready status=$UPDATE_STATUS after $UPDATE_RETRIES attempts; continuing because --allow-sync-pending is set"
+  else
   log "update_not_ready status=$UPDATE_STATUS after $UPDATE_RETRIES attempts"
   exit 1
+  fi
 fi
 
 if [[ "$DO_SPAWN" != "1" ]]; then
