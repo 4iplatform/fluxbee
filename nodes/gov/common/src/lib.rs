@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use fluxbee_sdk::NodeConfig;
+use fluxbee_sdk::{managed_node_name, NodeConfig, NodeUuidMode};
 
 pub fn env_or(key: &str, default: &str) -> String {
     std::env::var(key)
@@ -18,7 +18,7 @@ pub fn env_opt(key: &str) -> Option<String> {
 }
 
 pub fn build_node_config(default_name: &str, default_version: &str) -> NodeConfig {
-    let name = env_or("GOV_NODE_NAME", default_name);
+    let name = managed_node_name(default_name, &["GOV_NODE_NAME"]);
     let version = env_or("GOV_NODE_VERSION", default_version);
     let router_socket = PathBuf::from(env_or("GOV_ROUTER_SOCKET_DIR", "/var/run/fluxbee/routers"));
     let uuid_persistence_dir = PathBuf::from(env_or(
@@ -31,6 +31,7 @@ pub fn build_node_config(default_name: &str, default_version: &str) -> NodeConfi
         name,
         router_socket,
         uuid_persistence_dir,
+        uuid_mode: NodeUuidMode::Persistent,
         config_dir,
         version,
     }

@@ -380,6 +380,15 @@ struct OrchestratorState {
     blob_sync_last_desired: Mutex<BlobRuntimeConfig>,
 }
 
+#[derive(Debug, Clone)]
+struct PersistedManagedNode {
+    node_name: String,
+    kind: String,
+    runtime: String,
+    runtime_version: String,
+    config_path: PathBuf,
+}
+
 const MOTHERBEE_CRITICAL_SERVICES: [&str; 6] = [
     "rt-gateway",
     "sy-config-routes",
@@ -636,6 +645,12 @@ async fn bootstrap_local(
         )
         .await?;
     }
+    if let Err(err) = reconcile_persisted_custom_nodes(state).await {
+        tracing::warn!(
+            error = %err,
+            "persisted custom node reconcile failed during bootstrap"
+        );
+    }
     Ok(())
 }
 
@@ -718,6 +733,159 @@ async fn wait_for_storage_db_ready(
         }
         time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+async fn reconcile_persisted_custom_nodes(
+    state: &OrchestratorState,
+) -> Result<(), OrchestratorError> {
+    let manifest = match load_runtime_manifest_result()? {
+        Some(manifest) => manifest,
+        None => {
+            tracing::warn!("runtime manifest missing; skipping persisted custom node reconcile");
+            return Ok(());
+        }
+    };
+
+    let nodes = persisted_custom_nodes(state)?;
+    if nodes.is_empty() {
+        tracing::info!("no persisted custom node instances found for reconcile");
+        return Ok(());
+    }
+
+    let mut started = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for node in nodes {
+        let unit = unit_from_node_name(&node.node_name);
+        let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
+        let visible_in_router = local_inventory_has_node(state, &node.node_name);
+        if unit_active || visible_in_router {
+            skipped = skipped.saturating_add(1);
+            tracing::info!(
+                node_name = node.node_name,
+                runtime = node.runtime,
+                runtime_version = node.runtime_version,
+                unit = unit,
+                unit_active = unit_active,
+                visible_in_router = visible_in_router,
+                "skipping persisted custom node reconcile; instance already active/visible"
+            );
+            continue;
+        }
+
+        let runtime_key = match resolve_runtime_key(&manifest, &node.runtime) {
+            Ok(value) => value,
+            Err(err) => {
+                failed = failed.saturating_add(1);
+                tracing::warn!(
+                    node_name = node.node_name,
+                    runtime = node.runtime,
+                    runtime_version = node.runtime_version,
+                    error = %err,
+                    "unable to resolve runtime for persisted custom node reconcile"
+                );
+                continue;
+            }
+        };
+        let version = match resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version) {
+            Ok(value) => value,
+            Err(err) => {
+                failed = failed.saturating_add(1);
+                tracing::warn!(
+                    node_name = node.node_name,
+                    runtime = runtime_key,
+                    runtime_version = node.runtime_version,
+                    error = %err,
+                    "unable to resolve runtime version for persisted custom node reconcile"
+                );
+                continue;
+            }
+        };
+        let entrypoint = match resolve_runtime_spawn_entrypoint(&manifest, &runtime_key, &version) {
+            Ok(value) => value,
+            Err(err) => {
+                failed = failed.saturating_add(1);
+                tracing::warn!(
+                    node_name = node.node_name,
+                    runtime = runtime_key,
+                    runtime_version = version,
+                    error_code = err.error_code(),
+                    error = err.message(),
+                    "unable to resolve entrypoint for persisted custom node reconcile"
+                );
+                continue;
+            }
+        };
+
+        let preflight_error = if let Some(runtime_base) = entrypoint.runtime_base.as_deref() {
+            runtime_base_start_script_preflight(
+                &runtime_key,
+                &version,
+                runtime_base,
+                &entrypoint.script_version,
+                &entrypoint.script_path,
+                &state.hive_id,
+                &node.node_name,
+            )
+            .err()
+        } else {
+            runtime_start_script_preflight(
+                &entrypoint.script_runtime,
+                &entrypoint.script_version,
+                &entrypoint.script_path,
+                &state.hive_id,
+                &node.node_name,
+            )
+            .err()
+        };
+        if let Some(payload) = preflight_error {
+            failed = failed.saturating_add(1);
+            tracing::warn!(
+                node_name = node.node_name,
+                runtime = runtime_key,
+                runtime_version = version,
+                payload = %payload,
+                "preflight failed for persisted custom node reconcile"
+            );
+            continue;
+        }
+
+        let cmd = build_managed_node_run_command(&unit, &node.node_name, &entrypoint.script_path);
+        match execute_on_hive(state, &state.hive_id, &cmd, "reconcile_persisted_custom_nodes") {
+            Ok(()) => {
+                started = started.saturating_add(1);
+                tracing::info!(
+                    node_name = node.node_name,
+                    kind = node.kind,
+                    runtime = runtime_key,
+                    runtime_version = version,
+                    config_path = %node.config_path.display(),
+                    unit = unit,
+                    "persisted custom node relaunched during bootstrap reconcile"
+                );
+            }
+            Err(err) => {
+                failed = failed.saturating_add(1);
+                tracing::warn!(
+                    node_name = node.node_name,
+                    runtime = runtime_key,
+                    runtime_version = version,
+                    unit = unit,
+                    error = %err,
+                    "failed to relaunch persisted custom node during bootstrap reconcile"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        started = started,
+        skipped = skipped,
+        failed = failed,
+        "persisted custom node reconcile completed"
+    );
+    Ok(())
 }
 
 async fn wait_for_router_ready(
@@ -4161,6 +4329,75 @@ fn managed_node_inventory_with_root(
 
 fn managed_node_inventory(state: &OrchestratorState) -> Result<Vec<serde_json::Value>, OrchestratorError> {
     managed_node_inventory_with_root(state, &node_files_root())
+}
+
+fn persisted_custom_nodes_with_root(root: &Path) -> Result<Vec<PersistedManagedNode>, OrchestratorError> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut nodes = Vec::new();
+    for kind_entry in fs::read_dir(root)? {
+        let kind_entry = kind_entry?;
+        if !kind_entry.file_type()?.is_dir() {
+            continue;
+        }
+        for node_entry in fs::read_dir(kind_entry.path())? {
+            let node_entry = node_entry?;
+            if !node_entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            let node_name = node_entry.file_name().to_string_lossy().to_string();
+            let kind = node_kind_from_name(&node_name);
+            if matches!(kind.as_str(), "SY" | "RT" | "UNKNOWN") {
+                continue;
+            }
+
+            let config_path = node_entry.path().join("config.json");
+            if !config_path.is_file() {
+                continue;
+            }
+            let config = match load_node_effective_config(&config_path) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let Some(system) = config.get("_system").and_then(|value| value.as_object()) else {
+                continue;
+            };
+            let Some(runtime) = system
+                .get("runtime")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let Some(runtime_version) = system
+                .get("runtime_version")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+
+            nodes.push(PersistedManagedNode {
+                node_name,
+                kind,
+                runtime: runtime.to_string(),
+                runtime_version: runtime_version.to_string(),
+                config_path,
+            });
+        }
+    }
+
+    nodes.sort_by(|a, b| a.node_name.cmp(&b.node_name));
+    Ok(nodes)
+}
+
+fn persisted_custom_nodes(_state: &OrchestratorState) -> Result<Vec<PersistedManagedNode>, OrchestratorError> {
+    persisted_custom_nodes_with_root(&node_files_root())
 }
 
 async fn list_nodes_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
@@ -9564,10 +9801,7 @@ async fn run_node_flow(
         }
     }
 
-    let cmd = format!(
-        "systemd-run --unit {} --collect --property Restart=always --property RestartSec=5 {}",
-        unit, entrypoint.script_path
-    );
+    let cmd = build_managed_node_run_command(&unit, &node_name, &entrypoint.script_path);
 
     match execute_on_hive(state, &target_hive, &cmd, "run_node") {
         Ok(()) => serde_json::json!({
@@ -9946,6 +10180,15 @@ fn execute_on_hive(
     let mut cmd = Command::new("bash");
     cmd.arg("-lc").arg(command);
     run_cmd(cmd, label)
+}
+
+fn build_managed_node_run_command(unit: &str, node_name: &str, script_path: &str) -> String {
+    format!(
+        "systemd-run --unit {unit} --setenv=FLUXBEE_NODE_NAME='{node_name}' --collect --property Restart=always --property RestartSec=5 '{script_path}'",
+        unit = shell_single_quote(unit),
+        node_name = shell_single_quote(node_name),
+        script_path = shell_single_quote(script_path),
+    )
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -13491,6 +13734,76 @@ blob:
         assert!(second_node_dir.exists());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn persisted_custom_nodes_with_root_skips_core_and_invalid_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "fluxbee-persisted-custom-nodes-{}",
+            Uuid::new_v4().simple()
+        ));
+
+        let ai_dir = root.join("AI").join("AI.keep.test@motherbee");
+        std::fs::create_dir_all(&ai_dir).expect("create ai dir");
+        std::fs::write(
+            ai_dir.join("config.json"),
+            serde_json::json!({
+                "_system": {
+                    "runtime": "ai.keep.test",
+                    "runtime_version": "1.0.0-diag"
+                }
+            })
+            .to_string(),
+        )
+        .expect("write ai config");
+
+        let sy_dir = root.join("SY").join("SY.admin@motherbee");
+        std::fs::create_dir_all(&sy_dir).expect("create sy dir");
+        std::fs::write(
+            sy_dir.join("config.json"),
+            serde_json::json!({
+                "_system": {
+                    "runtime": "sy.admin",
+                    "runtime_version": "1.0.0"
+                }
+            })
+            .to_string(),
+        )
+        .expect("write sy config");
+
+        let broken_dir = root.join("WF").join("WF.invalid@motherbee");
+        std::fs::create_dir_all(&broken_dir).expect("create wf dir");
+        std::fs::write(
+            broken_dir.join("config.json"),
+            serde_json::json!({
+                "_system": {
+                    "runtime": "wf.invalid"
+                }
+            })
+            .to_string(),
+        )
+        .expect("write broken config");
+
+        let nodes = persisted_custom_nodes_with_root(&root).expect("load persisted nodes");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_name, "AI.keep.test@motherbee");
+        assert_eq!(nodes[0].runtime, "ai.keep.test");
+        assert_eq!(nodes[0].runtime_version, "1.0.0-diag");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_managed_node_run_command_injects_fluxbee_node_name() {
+        let cmd = build_managed_node_run_command(
+            "fluxbee-node-AI.demo-motherbee",
+            "AI.demo@motherbee",
+            "/var/lib/fluxbee/dist/runtimes/ai.demo/1.0.0/bin/start.sh",
+        );
+
+        assert!(cmd.contains("--setenv=FLUXBEE_NODE_NAME='AI.demo@motherbee'"));
+        assert!(cmd.contains("systemd-run --unit fluxbee-node-AI.demo-motherbee"));
+        assert!(cmd.contains("'/var/lib/fluxbee/dist/runtimes/ai.demo/1.0.0/bin/start.sh'"));
     }
 
     #[test]

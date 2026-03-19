@@ -250,12 +250,34 @@ Revisión 2026-03-19:
   - libera el `node_name`
   - rechaza si la instancia sigue `RUNNING`/visible (`NODE_INSTANCE_RUNNING`)
 
-- [ ] Cerrar el contrato de persistencia post-reboot para workloads `CUSTOM`.
-  - estado actual: config persistida + unit transitorio
-  - falta decidir e implementar uno de estos modelos:
-    - generar unit persistente por instancia y habilitarlo
-    - o hacer reconcile/autostart desde orchestrator al arranque leyendo `config.json`
-  - este punto aplica a `CUSTOM + singleton` y `CUSTOM + instanciado`
+- [~] Cerrar el contrato de persistencia post-reboot para workloads `CUSTOM`.
+  - modelo elegido: reconcile/autostart desde `SY.orchestrator` al arranque leyendo `/var/lib/fluxbee/nodes/**/config.json`
+  - implementado:
+    - scan de instancias persistidas
+    - salto explícito de `SY.*` / `RT.*`
+    - relaunch de instancias `CUSTOM` caídas si tienen `runtime` + `runtime_version` válidos y no están activas/visibles
+  - contrato de bootstrap de nombre para runtimes gestionados:
+    - `SY.orchestrator` debe pasar el nombre canónico de la instancia al proceso al momento del spawn/relaunch
+    - forma elegida para v1: variable de entorno `FLUXBEE_NODE_NAME=<node_name@hive>`
+    - no se requiere `FLUXBEE_NODE_CONFIG` como contrato obligatorio en v1
+    - el runtime debe poder derivar su `config.json` desde `FLUXBEE_NODE_NAME` usando el layout canónico:
+      - `/var/lib/fluxbee/nodes/<KIND>/<node_name@hive>/config.json`
+    - `_system.node_name` dentro de `config.json` sigue siendo la fuente de verdad persistida
+    - `FLUXBEE_NODE_NAME` es el dato de bootstrap para que el proceso llegue a esa persistencia al arrancar
+  - rationale del contrato:
+    - evita duplicar dos referencias (`NODE_NAME` + `NODE_CONFIG`) que podrían divergir
+    - evita depender de parsing de argumentos en todos los `start.sh`
+    - calza bien con `systemd-run --setenv=...`
+    - mantiene el cambio concentrado en `SY.orchestrator`, no en cada runtime individual
+  - pendiente:
+    - validación E2E real post-reboot
+    - script preparado: `scripts/custom_node_reboot_reconcile_e2e.sh`
+  - ya implementado además:
+    - `SY.orchestrator` inyecta `FLUXBEE_NODE_NAME` en spawn y relaunch
+    - helper compartido en SDK:
+      - `fluxbee_sdk::managed_node_name(...)`
+      - `fluxbee_sdk::managed_node_config_path(...)`
+    - endurecer reglas finas de elegibilidad si aparece algún caso borde
 
 - [ ] Agregar E2E específico de reboot semantics para workloads custom.
   - publicar runtime
@@ -263,6 +285,9 @@ Revisión 2026-03-19:
   - reiniciar host o reiniciar servicios base equivalentes
   - verificar:
     - inventario persistente
+  - script propuesto:
+    - `scripts/custom_node_reboot_reconcile_e2e.sh`
+    - secuencia actual: publish -> spawn -> kill -> wait invisible -> restart `sy-orchestrator` -> verify relaunch -> probe real con `IO.test`
     - relaunch automático si corresponde
     - respuesta correcta de `GET /nodes`, `/config`, `/status`
 

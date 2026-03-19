@@ -112,3 +112,22 @@ Sirve para verificar el ciclo completo de software:
 - update/sync
 - spawn administrado
 - ejecución real del binario publicado
+
+También quedó preparado un E2E para reboot/reconcile de nodos custom gestionados:
+
+```bash
+BASE="http://127.0.0.1:8080" \
+HIVE_ID="motherbee" \
+MOTHER_HIVE_ID="motherbee" \
+TENANT_ID="tnt:<uuid-v4>" \
+bash scripts/custom_node_reboot_reconcile_e2e.sh
+```
+
+Ese script valida:
+
+1. publish de runtimes temporales
+2. spawn del frontdesk gestionado
+3. `kill_node`
+4. restart de `sy-orchestrator`
+5. relaunch automático desde `config.json`
+6. probe real posterior con `IO.test`
