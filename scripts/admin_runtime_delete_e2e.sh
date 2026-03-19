@@ -393,7 +393,8 @@ fi
 validate_tenant_id "$TENANT_ID"
 
 echo "Step 1/12: build fluxbee-publish + ai-test-gov"
-(cd "$ROOT_DIR" && cargo build --release --bin fluxbee-publish --bin ai-test-gov)
+(cd "$ROOT_DIR" && cargo build --release --bin fluxbee-publish -p json-router)
+(cd "$ROOT_DIR" && cargo build --release -p ai-test-gov)
 [[ -x "$PUBLISH_BIN" ]] || { echo "FAIL: missing publish binary '$PUBLISH_BIN'" >&2; exit 1; }
 [[ -x "$AI_BIN" ]] || { echo "FAIL: missing ai-test-gov binary '$AI_BIN'" >&2; exit 1; }
 
