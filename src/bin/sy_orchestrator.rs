@@ -4402,7 +4402,7 @@ fn local_runtimes_snapshot(state: &OrchestratorState) -> serde_json::Value {
     }
 }
 
-fn local_runtime_snapshot(state: &OrchestratorState, runtime: &str) -> serde_json::Value {
+async fn local_runtime_snapshot(state: &OrchestratorState, runtime: &str) -> serde_json::Value {
     match load_runtime_manifest_result() {
         Ok(Some(manifest)) => {
             let manifest_hash = local_runtime_manifest_hash().ok().flatten();
@@ -4424,12 +4424,22 @@ fn local_runtime_snapshot(state: &OrchestratorState, runtime: &str) -> serde_jso
                     "message": format!("runtime '{}' not found", runtime),
                 });
             };
+            let usage = local_runtime_usage_summary(state, runtime, None).unwrap_or_else(|err| {
+                serde_json::json!({
+                    "scope": "hive_local_visible",
+                    "status": "error",
+                    "message": err.to_string(),
+                })
+            });
+            let usage_global = global_visible_runtime_usage_summary(state, runtime, None).await;
             serde_json::json!({
                 "status": "ok",
                 "hive_id": state.hive_id,
                 "manifest_version": manifest.version,
                 "manifest_hash": manifest_hash,
                 "runtime": runtime_api_entry(runtime, entry, runtime_entries_snapshot.as_ref()),
+                "usage": usage,
+                "usage_global_visible": usage_global,
             })
         }
         Ok(None) => serde_json::json!({
@@ -4443,6 +4453,212 @@ fn local_runtime_snapshot(state: &OrchestratorState, runtime: &str) -> serde_jso
             "message": err.to_string(),
         }),
     }
+}
+
+fn local_runtime_usage_summary(
+    state: &OrchestratorState,
+    runtime: &str,
+    version_filter: Option<&str>,
+) -> Result<serde_json::Value, OrchestratorError> {
+    let root = node_files_root();
+    if !root.exists() {
+        return Ok(serde_json::json!({
+            "scope": "hive_local_visible",
+            "in_use": false,
+            "running_count": 0,
+            "running_nodes": [],
+        }));
+    }
+
+    let mut running_nodes = Vec::new();
+    for kind_entry in fs::read_dir(&root)? {
+        let kind_entry = kind_entry?;
+        if !kind_entry.file_type()?.is_dir() {
+            continue;
+        }
+        for node_entry in fs::read_dir(kind_entry.path())? {
+            let node_entry = node_entry?;
+            if !node_entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            let node_name = node_entry.file_name().to_string_lossy().to_string();
+            let config_path = node_entry.path().join("config.json");
+            if !config_path.is_file() {
+                continue;
+            }
+
+            let config = match load_node_effective_config(&config_path) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let Some(system) = config.get("_system").and_then(|value| value.as_object()) else {
+                continue;
+            };
+            let Some(config_runtime) = system
+                .get("runtime")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if config_runtime != runtime {
+                continue;
+            }
+
+            let config_runtime_version = system
+                .get("runtime_version")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if let Some(expected_version) = version_filter {
+                if config_runtime_version != Some(expected_version) {
+                    continue;
+                }
+            }
+
+            let unit = unit_from_node_name(&node_name);
+            let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
+            let lifecycle = if unit_active {
+                if local_inventory_has_node(state, &node_name) {
+                    "RUNNING"
+                } else {
+                    "STARTING"
+                }
+            } else if systemd_unit_is_failed(&unit).unwrap_or(false) {
+                "FAILED"
+            } else {
+                "STOPPED"
+            };
+            if lifecycle != "RUNNING" {
+                continue;
+            }
+
+            let hive = node_name
+                .rsplit_once('@')
+                .map(|(_, hive)| hive.to_string())
+                .unwrap_or_else(|| state.hive_id.clone());
+            running_nodes.push(serde_json::json!({
+                "node_name": node_name,
+                "hive": hive,
+                "runtime": config_runtime,
+                "runtime_version": config_runtime_version,
+                "lifecycle": lifecycle,
+            }));
+        }
+    }
+
+    running_nodes.sort_by(|a, b| {
+        let a_name = a.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
+        let b_name = b.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
+        a_name.cmp(b_name)
+    });
+
+    Ok(serde_json::json!({
+        "scope": "hive_local_visible",
+        "in_use": !running_nodes.is_empty(),
+        "running_count": running_nodes.len(),
+        "running_nodes": running_nodes,
+    }))
+}
+
+async fn global_visible_runtime_usage_summary(
+    state: &OrchestratorState,
+    runtime: &str,
+    version_filter: Option<&str>,
+) -> serde_json::Value {
+    let local_usage = match local_runtime_usage_summary(state, runtime, version_filter) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "scope": "group_visible_control_plane",
+                "status": "error",
+                "message": err.to_string(),
+            });
+        }
+    };
+
+    if !state.is_motherbee {
+        return local_usage;
+    }
+
+    let mut running_nodes = local_usage
+        .get("running_nodes")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut skipped_hives = Vec::new();
+
+    for hive_id in list_managed_hive_ids() {
+        if hive_id == state.hive_id {
+            continue;
+        }
+        let mut payload = serde_json::json!({
+            "target": hive_id,
+            "runtime": runtime,
+        });
+        if let Some(version) = version_filter {
+            payload["runtime_version"] = serde_json::json!(version);
+        }
+
+        match forward_system_action_to_hive(
+            state,
+            &hive_id,
+            "GET_RUNTIME",
+            "GET_RUNTIME_RESPONSE",
+            payload,
+        )
+        .await
+        {
+            Ok(response) => {
+                if response
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|status| status.eq_ignore_ascii_case("ok"))
+                {
+                    if let Some(nodes) = response
+                        .get("usage")
+                        .and_then(|value| value.get("running_nodes"))
+                        .and_then(|value| value.as_array())
+                    {
+                        running_nodes.extend(nodes.iter().cloned());
+                    }
+                } else {
+                    skipped_hives.push(serde_json::json!({
+                        "hive_id": hive_id,
+                        "reason": response
+                            .get("error_code")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!("RUNTIME_QUERY_FAILED")),
+                    }));
+                }
+            }
+            Err(err) => {
+                skipped_hives.push(serde_json::json!({
+                    "hive_id": hive_id,
+                    "reason": "UNREACHABLE",
+                    "message": err.to_string(),
+                }));
+            }
+        }
+    }
+
+    running_nodes.sort_by(|a, b| {
+        let a_hive = a.get("hive").and_then(|value| value.as_str()).unwrap_or("");
+        let b_hive = b.get("hive").and_then(|value| value.as_str()).unwrap_or("");
+        let a_name = a.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
+        let b_name = b.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
+        (a_hive, a_name).cmp(&(b_hive, b_name))
+    });
+
+    serde_json::json!({
+        "scope": "group_visible_control_plane",
+        "in_use": !running_nodes.is_empty(),
+        "running_count": running_nodes.len(),
+        "running_nodes": running_nodes,
+        "skipped_hives": skipped_hives,
+    })
 }
 
 async fn get_versions_flow(
@@ -4581,7 +4797,7 @@ async fn get_runtime_flow(
     }
 
     if target_hive == state.hive_id {
-        return local_runtime_snapshot(state, runtime);
+        return local_runtime_snapshot(state, runtime).await;
     }
 
     match forward_system_action_to_hive(
