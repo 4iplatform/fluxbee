@@ -115,11 +115,21 @@ Estado:
   - Valida build -> package -> `fluxbee-publish` -> `--deploy` -> readiness -> spawn -> reply real entre `IO.test` y `AI.test.gov`.
   - Objetivo: reproducir problemas de install/rollout en entorno de prueba usando runtimes controlados, sin tocar nodos productivos.
 
+- [x] SDK/orchestrator: contrato explícito de bootstrap de nombre para nodos gestionados.
+  - `SY.orchestrator` ahora inyecta `FLUXBEE_NODE_NAME=<node_name@hive>` en spawn y relaunch.
+  - El SDK expone helpers:
+    - `fluxbee_sdk::managed_node_name(...)`
+    - `fluxbee_sdk::managed_node_config_path(...)`
+  - Resultado: los runtimes gestionados pueden resolver su identidad canónica y derivar `config.json` sin depender de parsing de argumentos ni de una segunda referencia tipo `NODE_CONFIG`.
+
 ## Notas de arquitectura
 
 - El `fluxbee-publish` actual entra por HTTP a `SY.admin`; no usa el socket/router como cliente.
 - Un runtime publicado queda en `dist` y en `/versions`, pero no se vuelve nodo gestionado hasta el `spawn`.
 - Los nodos custom spawneados pasan a ser workloads gestionados por la infra, no componentes core tipo `SY.*` o `RT.*`.
+- El bootstrap de identidad local para esos workloads gestionados usa `FLUXBEE_NODE_NAME` como contrato mínimo en v1.
+  - `_system.node_name` en `config.json` sigue siendo la fuente de verdad persistida.
+  - `fluxbee_sdk::managed_node_name(...)` debe considerarse la forma recomendada de resolver el nombre efectivo en runtimes de ejemplo/integración.
 - El routing automático de ILKs temporales hacia frontdesk existe, pero depende de:
   - `government.identity_frontdesk` configurado en el `hive.yaml` instalado
   - `src_ilk` presente en el shape que hoy consume el router

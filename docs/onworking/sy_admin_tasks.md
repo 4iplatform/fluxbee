@@ -215,16 +215,46 @@ Ejes:
 |------|---------------|----------------------|-------------------|
 | `CORE + singleton` | **Mayormente resuelto** | bootstrap escribe units persistentes en `/etc/systemd/system`, hace `daemon-reload`, habilita y arranca bootstrap units; `SYSTEM_UPDATE` cubre rollout core | terminar de dejar explícita la semántica completa de lifecycle REST para core cuando corresponda |
 | `CORE + instanciado` | **No es modelo explícito hoy** | `run_node` acepta nombres arbitrarios, pero el modelo canónico de `config.json/state.json` declara `SY.*` y `RT.*` fuera de scope | falta decisión de producto: prohibirlo formalmente o soportarlo como clase explícita |
-| `CUSTOM + singleton` | **Parcialmente resuelto** | package `full_runtime/config_only/workflow`, publish/install, `--deploy`, readiness, spawn, config persistida, identity wiring, ejecución real validada | falta relaunch/autostart post-reboot; falta inventario de instancias gestionadas desacoplado del router; falta remove real de instancia |
-| `CUSTOM + instanciado` | **Parcialmente resuelto** | runtime único con múltiples `node_name`, `config.json` por instancia, `_system` inyectado, `kill_node/get_node_*` por nombre, E2E real validado con nodos de prueba | mismos huecos que singleton custom: reboot reconcile, inventario persistente de instancias, remove real de instancia |
+| `CUSTOM + singleton` | **Mayormente resuelto** | package `full_runtime/config_only/workflow`, publish/install, `--deploy`, readiness, spawn, config persistida, inventario de instancias, `remove` real de instancia, reboot/reconcile validado E2E | cleanup documental y decisión separada sobre `CORE + instanciado` |
+| `CUSTOM + instanciado` | **Mayormente resuelto** | runtime único con múltiples `node_name`, `config.json` por instancia, `_system` inyectado, `kill_node/get_node_*` por nombre, inventario persistente, remove real, reboot/reconcile validado E2E | cleanup documental y reglas finas si aparece algún caso borde |
 
 ### Hallazgos concretos de código
 
 - `GET /hives/{hive}/nodes` ya devuelve inventario de instancias gestionadas persistidas leyendo `/var/lib/fluxbee/nodes/**/config.json` y calculando lifecycle local; para hive remoto hace forward al orchestrator remoto.
 - `POST /hives/{hive}/nodes` persiste `config.json` en `/var/lib/fluxbee/nodes/<KIND>/<node@hive>/config.json` y hace spawn fail-closed si ya existe.
-- `DELETE /hives/{hive}/nodes/{name}` hoy termina en `kill_node`, que hace `systemctl stop/reset-failed`, pero no borra `config.json` ni elimina la instancia persistida.
+- `DELETE /hives/{hive}/nodes/{name}` termina en `kill_node`, que afecta el proceso/unit pero no borra la instancia persistida.
+- `DELETE /hives/{hive}/nodes/{name}/instance` borra la instancia persistida local y libera el `node_name`.
 - El spawn de nodos gestionados usa `systemd-run --collect`, o sea unit transitorio.
-- No quedó identificado todavía un reconcile/autostart explícito al arranque que recorra `/var/lib/fluxbee/nodes/**/config.json` y relance workloads custom después de reboot.
+- El reboot/autostart de workloads `CUSTOM` quedó implementado como reconcile al arranque del orchestrator, opt-in por `_system.relaunch_on_boot=true`.
+
+### Tres conceptos que deben quedar separados
+
+- `runtime publicado/instalado`
+  - artifact publicado en `dist`, versionado en `manifest.json`, visible en `/versions` y `/hives/{hive}/runtimes`
+  - ejemplo: `ai.test.gov.reboot.1773959170@1.0.0-rebootreconcile-1773959170-5980`
+  - ownership: `motherbee`
+  - converge por Syncthing
+  - no implica por sí mismo un proceso corriendo
+
+- `instancia gestionada persistida`
+  - entidad local del hive representada por `config.json` bajo `/var/lib/fluxbee/nodes/<KIND>/<node_name@hive>/`
+  - ejemplo: `/var/lib/fluxbee/nodes/AI/AI.frontdesk.gov@motherbee/config.json`
+  - visible en `GET /hives/{hive}/nodes`
+  - puede existir aunque el proceso esté parado
+  - ownership: orchestrator local del hive
+
+- `proceso conectado/vivo`
+  - ejecución actual del nodo, observable por systemd + router/LSA
+  - se expresa como `RUNNING/STARTING/STOPPED/FAILED` y `visible_in_router`
+  - puede caer y volver sin que desaparezca la instancia persistida
+  - no es equivalente a “runtime publicado” ni a “instancia existente”
+
+Contrato operativo resumido:
+- publicar/instalar runtime crea catálogo en `dist`
+- `run_node` crea o reutiliza instancia persistida y lanza proceso
+- `kill_node` afecta el proceso, no la instancia persistida
+- `DELETE /nodes/{name}/instance` borra la instancia persistida
+- reboot/reconcile parte de la instancia persistida, no del proceso ni del catálogo solo
 
 ### Tareas nuevas derivadas de esta matriz
 
@@ -250,7 +280,7 @@ Revisión 2026-03-19:
   - libera el `node_name`
   - rechaza si la instancia sigue `RUNNING`/visible (`NODE_INSTANCE_RUNNING`)
 
-- [~] Cerrar el contrato de persistencia post-reboot para workloads `CUSTOM`.
+- [x] Cerrar el contrato de persistencia post-reboot para workloads `CUSTOM`.
   - modelo elegido: reconcile/autostart desde `SY.orchestrator` al arranque leyendo `/var/lib/fluxbee/nodes/**/config.json`
   - implementado:
     - scan de instancias persistidas
@@ -271,9 +301,11 @@ Revisión 2026-03-19:
     - calza bien con `systemd-run --setenv=...`
     - mantiene el cambio concentrado en `SY.orchestrator`, no en cada runtime individual
     - evita relanzar basura histórica persistida de pruebas viejas que no fue creada bajo el contrato nuevo
-  - pendiente:
-    - validación E2E real post-reboot
-    - script preparado: `scripts/custom_node_reboot_reconcile_e2e.sh`
+  - validado:
+    - E2E real post-reboot con `scripts/custom_node_reboot_reconcile_e2e.sh`
+    - secuencia validada en entorno real:
+      - publish -> spawn -> kill -> wait invisible -> restart `sy-orchestrator` -> relaunch -> probe real con `IO.test`
+    - el script toma por default `government.identity_frontdesk` desde `hive.yaml` para que el destino del `Resolve` coincida con el frontdesk efectivo del router
   - ya implementado además:
     - `SY.orchestrator` inyecta `FLUXBEE_NODE_NAME` en spawn y relaunch
     - helper compartido en SDK:
@@ -281,22 +313,19 @@ Revisión 2026-03-19:
       - `fluxbee_sdk::managed_node_config_path(...)`
     - endurecer reglas finas de elegibilidad si aparece algún caso borde
 
-- [ ] Agregar E2E específico de reboot semantics para workloads custom.
-  - publicar runtime
-  - spawnear instancia(s)
-  - reiniciar host o reiniciar servicios base equivalentes
-  - verificar:
-    - inventario persistente
-  - script propuesto:
-    - `scripts/custom_node_reboot_reconcile_e2e.sh`
-    - secuencia actual: publish -> spawn -> kill -> wait invisible -> restart `sy-orchestrator` -> verify relaunch -> probe real con `IO.test`
+- [x] Agregar E2E específico de reboot semantics para workloads custom.
+  - cubierto por `scripts/custom_node_reboot_reconcile_e2e.sh`
+  - validado:
     - relaunch automático si corresponde
     - respuesta correcta de `GET /nodes`, `/config`, `/status`
+    - probe real posterior con `IO.test`
+    - `handled_by=<government.identity_frontdesk>`
 
-- [ ] Alinear documentación para separar tres conceptos que hoy se mezclan:
+- [x] Alinear documentación para separar tres conceptos que hoy se mezclan:
   - runtime instalado/publicado
   - instancia gestionada persistida
   - proceso conectado/vivo en router
+  - definiciones y contrato operativo resumido asentados en este documento
 
 ## Seguimiento
 - [x] Registrar mapeo final de endpoints por ownership:

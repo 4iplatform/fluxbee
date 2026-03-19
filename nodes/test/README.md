@@ -76,6 +76,66 @@ Comportamiento esperado:
 
 El contrato canónico ahora es `meta.src_ilk`.
 
+## Contrato de nombre para nodos gestionados
+
+Para nodos gestionados spawneados por `SY.orchestrator`, el contrato de bootstrap
+de nombre para v1 es:
+
+- `SY.orchestrator` inyecta `FLUXBEE_NODE_NAME=<node_name@hive>` al proceso
+- el runtime usa ese nombre como identidad canónica al arrancar
+- el `config.json` de la instancia se deriva desde ese nombre con el layout:
+  - `/var/lib/fluxbee/nodes/<KIND>/<node_name@hive>/config.json`
+
+Esto aplica tanto al spawn normal como al relaunch de reboot/reconcile.
+
+Ejemplo:
+
+```bash
+FLUXBEE_NODE_NAME="AI.frontdesk.gov@motherbee"
+```
+
+Para ese caso, el path de instancia esperado es:
+
+```text
+/var/lib/fluxbee/nodes/AI/AI.frontdesk.gov@motherbee/config.json
+```
+
+### Por qué este contrato
+
+- evita duplicar `NODE_NAME` y `NODE_CONFIG` como dos referencias que podrían divergir
+- evita depender de argumentos en todos los `start.sh`
+- concentra el cambio en `SY.orchestrator` usando `systemd-run --setenv=...`
+- sirve igual para singleton e instanciado
+
+### Helper del SDK
+
+El SDK ya trae helpers para este contrato:
+
+- `fluxbee_sdk::managed_node_name(...)`
+  - toma `FLUXBEE_NODE_NAME` como fuente principal
+  - puede caer a env vars legacy del runtime si hace falta compatibilidad
+- `fluxbee_sdk::managed_node_config_path(...)`
+  - deriva el `config.json` canónico a partir del `node_name`
+
+Patrón recomendado en un runtime:
+
+```rust
+let cfg = NodeConfig {
+    name: fluxbee_sdk::managed_node_name("AI.test.gov", &["AI_TEST_NODE_NAME"]),
+    router_socket: "/var/run/fluxbee/routers".into(),
+    uuid_persistence_dir: "/var/lib/fluxbee/state/nodes".into(),
+    uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
+    config_dir: "/etc/fluxbee".into(),
+    version: "0.1.0".to_string(),
+};
+```
+
+Notas prácticas:
+
+- si el proceso arranca bajo orchestrator, `FLUXBEE_NODE_NAME` debería ganar siempre
+- las env vars legacy (`AI_TEST_NODE_NAME`, `IO_TEST_NODE_NAME`, `GOV_NODE_NAME`) quedan sólo como compatibilidad o uso manual
+- `_system.node_name` dentro de `config.json` sigue siendo la fuente de verdad persistida
+
 ## Probar publish/install completo con CLI
 
 También hay un E2E operator-style que usa `fluxbee-publish` de punta a punta
@@ -113,7 +173,7 @@ Sirve para verificar el ciclo completo de software:
 - spawn administrado
 - ejecución real del binario publicado
 
-También quedó preparado un E2E para reboot/reconcile de nodos custom gestionados:
+También quedó validado un E2E para reboot/reconcile de nodos custom gestionados:
 
 ```bash
 BASE="http://127.0.0.1:8080" \
@@ -126,7 +186,7 @@ bash scripts/custom_node_reboot_reconcile_e2e.sh
 Ese script valida:
 
 1. publish de runtimes temporales
-2. spawn del frontdesk gestionado
+2. spawn del frontdesk gestionado usando por default el `government.identity_frontdesk` configurado en `hive.yaml`
 3. `kill_node`
 4. restart de `sy-orchestrator`
 5. relaunch automático desde `config.json`
