@@ -125,6 +125,14 @@
   - entra en estado `FAILED_CONFIG`,
   - y solo atiende Control Plane hasta corregir la configuración.
 
+✅ **NORMATIVO (resiliencia runtime)**:
+- Errores de configuración o dependencias externas esperables en runtime (por ejemplo `missing_secret`, credenciales ausentes, provider temporalmente no disponible) **MUST NOT** terminar el proceso del nodo.
+- Ante estos casos, el nodo **MUST**:
+  - responder al mensaje `user` con error estructurado (por ejemplo `ErrorV1Payload`/`text-v1` equivalente),
+  - marcar `retryable` según corresponda,
+  - continuar operativo para `PING/STATUS/CONFIG_GET/CONFIG_SET` y para mensajes posteriores.
+- Los errores fatales deben reservarse para condiciones realmente irrecuperables del proceso (corrupción interna, imposibilidad de inicializar runtime base, etc.).
+
 ### 2.1.3 `CONFIG_RESPONSE`: confirmación
 
 ✅ **NORMATIVO**:

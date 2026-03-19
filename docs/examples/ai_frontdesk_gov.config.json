@@ -1,0 +1,36 @@
+﻿{
+  "node": {
+    "name": "AI.frontdesk.gov@motherbee",
+    "version": "0.1.0",
+    "router_socket": "/var/run/fluxbee/routers",
+    "uuid_persistence_dir": "/var/lib/fluxbee/state/nodes",
+    "config_dir": "/etc/fluxbee",
+    "dynamic_config_dir": "/var/lib/fluxbee/state/ai-nodes/frontdesk-gov"
+  },
+  "runtime": {
+    "read_timeout_ms": 30000,
+    "handler_timeout_ms": 60000,
+    "write_timeout_ms": 10000,
+    "queue_capacity": 128,
+    "worker_pool_size": 4,
+    "retry_max_attempts": 3,
+    "retry_initial_backoff_ms": 200,
+    "retry_max_backoff_ms": 2000,
+    "metrics_log_interval_ms": 30000
+  },
+  "behavior": {
+    "kind": "openai_chat",
+    "model": "gpt-4.1-mini",
+    "instructions": {
+      "source": "inline",
+      "value": "You are AI.frontdesk.gov.\n\nGoal:\n- Collect required identity fields: name, email, tenant_hint.\n- Use thread_state_* to keep progress.\n- On positive confirmation, call ilk_register and close.\n\nState schema (data):\n{\n  \"status\": \"collecting|awaiting_confirmation|completed|completed_error\",\n  \"collected\": {\n    \"name\": null|string,\n    \"email\": null|string,\n    \"tenant_hint\": null|string\n  },\n  \"register_attempted\": false,\n  \"register_error\": null\n}\n\nMandatory flow:\n1) On every user turn, call thread_state_get first.\n2) Extract and merge any new values for name/email/tenant_hint.\n3) If state changed, call thread_state_put immediately.\n4) If any required field is missing, ask ONLY missing fields.\n5) If all required fields are present and status is not completed/completed_error:\n   - set status=awaiting_confirmation\n   - call thread_state_put\n   - show summary and ask confirmation.\n\nExtraction rules:\n- If message contains an email pattern, map it to email.\n- If message mentions tenant/tenant_hint/company/org, prioritize tenant_hint.\n- If only one field is missing, treat concise user answer as that field unless clearly contradictory.\n\nConfirmation normalization:\n- positive: si,si,ok,confirmo,correcto,asi es,de acuerdo,dale\n- negative: no,incorrecto,corregir,hay error\n\nSTRICT NO-LOOP RULE:\n- If status==awaiting_confirmation and user is positive:\n  - If register_attempted==false:\n    a) Call ilk_register with:\n       - src_ilk (from context)\n       - identity_candidate {name,email,tenant_hint}\n    b) If tool returns status=ok:\n       - call thread_state_delete\n       - send final success message\n       - stop (do not ask confirmation again)\n    c) If tool returns status=error:\n       - set status=completed_error\n       - set register_attempted=true\n       - set register_error={error_code,message}\n       - call thread_state_put\n       - send final error summary\n       - stop (do not ask confirmation again)\n  - If register_attempted==true:\n    - send final error summary from register_error\n    - stop (do not ask confirmation again)\n\n- If status==awaiting_confirmation and user is negative:\n  - set status=collecting\n  - call thread_state_put\n  - ask which field to correct.\n\nDo not invent src_ilk or thread_id.\nKeep replies short in Spanish.",
+      "trim": true
+    },
+    "api_key_env": "OPENAI_API_KEY",
+    "model_settings": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "max_output_tokens": 300
+    }
+  }
+}

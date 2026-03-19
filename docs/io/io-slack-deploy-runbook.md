@@ -48,6 +48,14 @@ sudo jq . /var/lib/fluxbee/nodes/IO/IO.slack.T123@motherbee/config.json
 Esperado en fix de plataforma:
 - el unit spawned debe incluir `NODE_NAME`, `ISLAND_ID` o `NODE_CONFIG_PATH` correctos.
 
+Workaround temporal (repo IO):
+- `io-slack` usa path forzado de config para destrabar pruebas cuando el unit no trae env:
+  - `/var/lib/fluxbee/nodes/IO/IO.slack.T123@motherbee/config.json`
+- override:
+  - `IO_SLACK_FORCE_CONFIG_PATH`
+  - `NODE_CONFIG_PATH` (tiene prioridad)
+- Este workaround se debe remover cuando core cierre el contrato final de spawn/env.
+
 ---
 
 ## 3) Deploy inicial (compliant)

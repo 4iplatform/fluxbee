@@ -8,9 +8,12 @@
 
 ## Convenciones de identidad y thread
 
-- `src_ilk` se asume **siempre presente** (puede ser ILK temporal).
+- `src_ilk` se asume **siempre presente** (puede ser ILK temporal) y viaja en `meta.src_ilk`.
 - `thread_id` se mantiene como compatibilidad legacy (carrier actual en `meta.context.thread_id`).
 - El key efectivo de thread state en MVP vigente es `src_ilk`.
+
+Nota de transición:
+- `meta.context.src_ilk` es solo fallback legacy temporal para compatibilidad.
 
 ## Modo del runner (default/gov)
 

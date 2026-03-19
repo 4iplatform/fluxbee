@@ -265,6 +265,12 @@ Modo spawn/orchestrator (compliance path):
   - responsabilidad de `IO.slack`: este caso debe pasar a modo degradado/no-ready, sin terminar proceso.
   - estado esperado (pendiente): levantar el runtime, publicar estado de error de config y permanecer controlable por orchestrator/admin.
 
+- Workaround temporal de path forzado (solo para destrabar pruebas):
+  - mientras `run_node` no inyecte `NODE_CONFIG_PATH`/`NODE_NAME`/`ISLAND_ID` en el unit transient, `io-slack` fuerza lectura desde:
+    - `/var/lib/fluxbee/nodes/IO/IO.slack.T123@motherbee/config.json`
+  - override soportado: `IO_SLACK_FORCE_CONFIG_PATH` o `NODE_CONFIG_PATH`.
+  - **pendiente eliminar** cuando core cierre el contrato final de spawn para runtime env.
+
 
 
 ### Aclaración - Identidad L3 (v1.16+)

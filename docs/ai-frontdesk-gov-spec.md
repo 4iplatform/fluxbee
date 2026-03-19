@@ -46,9 +46,12 @@
 
 ✅ **NORMATIVO**:
 - El mensaje entrante debe incluir:
-  - `src_ilk` (siempre presente; puede ser ILK temporal),
+  - `src_ilk` en `meta.src_ilk` (siempre presente; puede ser ILK temporal),
   - `thread_id` (asignado por IO; ubicación tentantiva en top-level),
   - payload `text/v1` con `content` y/o `attachments`.
+
+Nota de transición:
+- `meta.context.src_ilk` puede aceptarse solo como compatibilidad legacy temporal.
 
 ✅ **NORMATIVO**:
 - `AI.frontdesk.gov` asume que la derivación a frontdesk se hace por policy/core cuando el `src_ilk` está en estado `temporary` o equivalente.
