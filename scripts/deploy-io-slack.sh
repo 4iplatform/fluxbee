@@ -18,6 +18,7 @@ Options:
   --node-name <name@hive>      If provided, script will also spawn/restart node
   --runtime <name>             Runtime key (default: IO.slack)
   --runtime-version <ver>      Runtime version for spawn payload (default: current)
+  --tenant-id <id>             Tenant ID for spawn identity registration (required in some hives)
   --config-json <file>         JSON file with spawn config object
   --app-token <xapp-...>       Convenience: build spawn config with inline Slack app token
   --bot-token <xoxb-...>       Convenience: build spawn config with inline Slack bot token
@@ -57,6 +58,7 @@ HIVE_ID=""
 VERSION=""
 RUNTIME="IO.slack"
 RUNTIME_VERSION="current"
+TENANT_ID=""
 NODE_NAME=""
 CONFIG_JSON=""
 APP_TOKEN=""
@@ -85,6 +87,7 @@ while [[ $# -gt 0 ]]; do
     --version) VERSION="${2:-}"; shift 2 ;;
     --runtime) RUNTIME="${2:-}"; shift 2 ;;
     --runtime-version) RUNTIME_VERSION="${2:-}"; shift 2 ;;
+    --tenant-id) TENANT_ID="${2:-}"; shift 2 ;;
     --node-name) NODE_NAME="${2:-}"; shift 2 ;;
     --config-json) CONFIG_JSON="${2:-}"; shift 2 ;;
     --app-token) APP_TOKEN="${2:-}"; shift 2 ;;
@@ -339,17 +342,31 @@ if [[ -z "$NODE_NAME" ]]; then
   exit 1
 fi
 
+if [[ -z "$TENANT_ID" && -z "${ORCH_DEFAULT_TENANT_ID:-}" ]]; then
+  log "warning: spawn may fail with IDENTITY_REGISTER_FAILED because tenant_id is missing; set --tenant-id or ORCH_DEFAULT_TENANT_ID"
+fi
+
 spawn_cfg_json="$(build_spawn_config_json)"
 
-spawn_payload="$(NODE_NAME="$NODE_NAME" RUNTIME="$RUNTIME" RUNTIME_VERSION="$RUNTIME_VERSION" SPAWN_CFG_JSON="$spawn_cfg_json" python3 - <<'PY'
+spawn_payload="$(NODE_NAME="$NODE_NAME" RUNTIME="$RUNTIME" RUNTIME_VERSION="$RUNTIME_VERSION" TENANT_ID="$TENANT_ID" SPAWN_CFG_JSON="$spawn_cfg_json" python3 - <<'PY'
 import json
 import os
-print(json.dumps({
+cfg = json.loads(os.environ["SPAWN_CFG_JSON"])
+tenant_id = os.environ.get("TENANT_ID", "").strip()
+if tenant_id:
+    # Keep both paths to satisfy orchestrator variants.
+    cfg.setdefault("tenant_id", tenant_id)
+
+payload = {
   "node_name": os.environ["NODE_NAME"],
   "runtime": os.environ["RUNTIME"],
   "runtime_version": os.environ["RUNTIME_VERSION"],
-  "config": json.loads(os.environ["SPAWN_CFG_JSON"]),
-}, separators=(",", ":")))
+  "config": cfg,
+}
+if tenant_id:
+    payload["tenant_id"] = tenant_id
+
+print(json.dumps(payload, separators=(",", ":")))
 PY
 )"
 
