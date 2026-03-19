@@ -3277,7 +3277,7 @@ fn build_admin_request(
         match action {
             "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn"
             | "delete_vpn" => "SY.config.routes",
-            "list_nodes" | "run_node" | "kill_node" | "hive_status" | "get_storage"
+            "list_nodes" | "run_node" | "kill_node" | "remove_node_instance" | "hive_status" | "get_storage"
             | "set_storage" | "list_hives" | "get_hive" | "list_versions" | "get_versions"
             | "list_runtimes" | "get_runtime" | "remove_runtime_version"
             | "list_deployments" | "get_deployments" | "list_drift_alerts" | "get_drift_alerts"
