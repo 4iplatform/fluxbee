@@ -797,6 +797,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "remove_runtime_version",
+        route: InternalActionRoute::Command("remove_runtime_version"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "list_routes",
         route: InternalActionRoute::Query("list_routes"),
         requires_target: true,
@@ -1905,6 +1911,21 @@ async fn handle_hive_paths(
                     .await?;
             Ok(Some((status, resp)))
         }
+        ("DELETE", ["runtimes", runtime, "versions", version]) => {
+            let payload = serde_json::json!({
+                "runtime": decode_percent(runtime),
+                "runtime_version": decode_percent(version),
+            });
+            let (status, resp) = handle_admin_command(
+                ctx,
+                client,
+                "remove_runtime_version",
+                payload,
+                Some(hive),
+            )
+            .await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["deployments"]) => {
             let payload = deployments_payload_from_query(query);
             let (status, resp) =
@@ -2298,8 +2319,18 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
     }
     match code.as_str() {
         "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID" => 400,
-        "NOT_FOUND" | "RUNTIME_NOT_AVAILABLE" => 404,
-        "HIVE_EXISTS" | "MODULE_EXISTS" | "VERSION_MISMATCH" | "WAN_NOT_AUTHORIZED" => 409,
+        "NOT_FOUND"
+        | "RUNTIME_NOT_AVAILABLE"
+        | "RUNTIME_NOT_FOUND"
+        | "RUNTIME_VERSION_NOT_FOUND" => 404,
+        "HIVE_EXISTS"
+        | "MODULE_EXISTS"
+        | "VERSION_MISMATCH"
+        | "WAN_NOT_AUTHORIZED"
+        | "RUNTIME_IN_USE"
+        | "RUNTIME_HAS_DEPENDENTS"
+        | "RUNTIME_CURRENT_CONFLICT"
+        | "BUSY" => 409,
         "COMPILE_ERROR" => 422,
         "NOT_IMPLEMENTED" => 501,
         "SERVICE_FAILED"
@@ -2312,6 +2343,7 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "RUNTIME_ERROR"
         | "RUNTIME_COMMAND_FAILED"
         | "RUNTIME_UNAVAILABLE"
+        | "RUNTIME_REMOVE_FAILED"
         | "TRANSPORT_ERROR" => 502,
         "SHM_NOT_FOUND" | "RUNTIME_MANIFEST_MISSING" | "MISSING_WAN_LISTEN" => 503,
         _ => 500,
@@ -3213,7 +3245,7 @@ fn build_admin_request(
             | "delete_vpn" => "SY.config.routes",
             "list_nodes" | "run_node" | "kill_node" | "hive_status" | "get_storage"
             | "set_storage" | "list_hives" | "get_hive" | "list_versions" | "get_versions"
-            | "list_runtimes" | "get_runtime"
+            | "list_runtimes" | "get_runtime" | "remove_runtime_version"
             | "list_deployments" | "get_deployments" | "list_drift_alerts" | "get_drift_alerts"
             | "get_node_config" | "set_node_config" | "get_node_state" | "get_node_status"
             | "remove_hive" | "add_hive" => "SY.orchestrator",
@@ -3380,7 +3412,7 @@ fn admin_action_timeout(action: &str) -> Duration {
         }
         // other orchestrator mutating actions can also take longer than default.
         "run_node" | "kill_node" | "remove_hive" | "set_node_config" | "get_node_config"
-        | "get_node_state" | "get_node_status" => {
+        | "get_node_state" | "get_node_status" | "remove_runtime_version" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30))
         }
         _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5)),
@@ -3462,6 +3494,7 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "get_versions"
             | "list_runtimes"
             | "get_runtime"
+            | "remove_runtime_version"
             | "list_deployments"
             | "get_deployments"
             | "list_drift_alerts"

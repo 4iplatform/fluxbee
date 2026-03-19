@@ -101,7 +101,7 @@ Endpoints candidatos vNext:
   - lista runtimes publicados visibles para ese hive, incluyendo `current`, `available`, `type`, `runtime_base` y readiness resumido
 - [x] `GET /hives/{hive}/runtimes/{runtime}`
   - detalle por runtime, incluyendo versiones publicadas y readiness por versión
-- [ ] `DELETE /hives/{hive}/runtimes/{runtime}/versions/{version}`
+- [x] `DELETE /hives/{hive}/runtimes/{runtime}/versions/{version}`
   - remueve una versión puntual del manifest/dist
   - sólo permitido para versiones no-`current`
   - la remoción converge luego al resto del grupo
@@ -126,7 +126,7 @@ Decisiones de contrato resueltas:
   - el resultado debe reportar convergencia posterior, no atomicidad distribuida
 - [x] definición conceptual de vista:
   - `GET /hives/{hive}/runtimes` puede ser recurso nuevo, pero su fuente de verdad es el manifest/readiness que hoy ya alimenta `/versions`
-- [ ] definir shape final de respuesta:
+- [x] definir shape final de respuesta:
   - runtime/version removido
   - manifest_version nuevo
   - manifest_hash nuevo
@@ -147,13 +147,13 @@ Checklist de implementación propuesto:
 - [x] agregar acciones internas en `SY.admin` registry:
   - [x] `list_runtimes`
   - [x] `get_runtime`
-  - [ ] `remove_runtime_version`
+  - [x] `remove_runtime_version`
 - [x] implementar handlers REST en `SY.admin` para lectura:
   - [x] `GET /hives/{hive}/runtimes`
   - [x] `GET /hives/{hive}/runtimes/{runtime}`
-- [ ] implementar handler REST de delete en `SY.admin`
-- [ ] delegar ejecución a `SY.orchestrator` (owner de manifest/dist lifecycle)
-- [ ] endurecer mapeo HTTP de errores:
+- [x] implementar handler REST de delete en `SY.admin`
+- [x] delegar ejecución a `SY.orchestrator` (owner de manifest/dist lifecycle)
+- [x] endurecer mapeo HTTP de errores:
   - `RUNTIME_NOT_FOUND`
   - `RUNTIME_VERSION_NOT_FOUND`
   - `RUNTIME_IN_USE`
@@ -161,12 +161,12 @@ Checklist de implementación propuesto:
   - `RUNTIME_CURRENT_CONFLICT`
   - `BUSY`
   - `RUNTIME_REMOVE_FAILED`
-- [ ] implementar lock secuencial de lifecycle manifest/dist en motherbee
-- [ ] definir cómo se resuelve `RUNTIME_IN_USE`
+- [x] implementar lock secuencial de lifecycle manifest/dist en motherbee
+- [x] definir cómo se resuelve `RUNTIME_IN_USE`
   - fuente: inventario global
   - criterio: nodos `RUNNING`
   - incluir version exacta, no sólo nombre de runtime
-- [ ] definir cómo se resuelve `RUNTIME_HAS_DEPENDENTS`
+- [x] definir cómo se resuelve `RUNTIME_HAS_DEPENDENTS`
   - fuente: manifest/runtime catalog
   - criterio: runtimes publicados con `runtime_base=<runtime>`
 - [ ] agregar E2E de paridad HTTP/socket para remove runtime version
@@ -176,6 +176,17 @@ Checklist de implementación propuesto:
   - borrar versión inexistente
   - borrar `current`
   - borrar mientras hay operación concurrente activa
+
+Estado actual de implementación:
+- `GET /hives/{hive}/runtimes/{runtime}` ya expone:
+  - `usage` local visible
+  - `usage_global_visible` agregado por control-plane
+- `DELETE /hives/{hive}/runtimes/{runtime}/versions/{version}` ya:
+  - corre sólo en `motherbee`
+  - rechaza `current`
+  - rechaza si hay `RUNNING` visible para esa versión
+  - rechaza si el runtime tiene dependientes `config_only`/`workflow`
+  - muta manifest + `dist` con lock de lifecycle y rollback local básico si falla la escritura del manifest
 
 ## Matriz operativa - CORE/CUSTOM x singleton/instanciado
 
