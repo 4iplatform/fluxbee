@@ -214,7 +214,7 @@ Ejes:
 | Caso | Estado actual | Qué ya está resuelto | Qué sigue abierto |
 |------|---------------|----------------------|-------------------|
 | `CORE + singleton` | **Mayormente resuelto** | bootstrap escribe units persistentes en `/etc/systemd/system`, hace `daemon-reload`, habilita y arranca bootstrap units; `SYSTEM_UPDATE` cubre rollout core | terminar de dejar explícita la semántica completa de lifecycle REST para core cuando corresponda |
-| `CORE + instanciado` | **No es modelo explícito hoy** | `run_node` acepta nombres arbitrarios, pero el modelo canónico de `config.json/state.json` declara `SY.*` y `RT.*` fuera de scope | falta decisión de producto: prohibirlo formalmente o soportarlo como clase explícita |
+| `CORE + instanciado` | **Resuelto para v1 con excepción explícita** | `run_node` rechaza `SY.*` y `RT.gateway`; `RT.<otro>` se permite como runtime gestionado publicado | revisar sólo si en el futuro se quiere modelar más core por este camino |
 | `CUSTOM + singleton` | **Mayormente resuelto** | package `full_runtime/config_only/workflow`, publish/install, `--deploy`, readiness, spawn, config persistida, inventario de instancias, `remove` real de instancia, reboot/reconcile validado E2E | cleanup documental y decisión separada sobre `CORE + instanciado` |
 | `CUSTOM + instanciado` | **Mayormente resuelto** | runtime único con múltiples `node_name`, `config.json` por instancia, `_system` inyectado, `kill_node/get_node_*` por nombre, inventario persistente, remove real, reboot/reconcile validado E2E | cleanup documental y reglas finas si aparece algún caso borde |
 
@@ -263,9 +263,15 @@ Revisión 2026-03-19:
 - No quedó vieja, pero ya no mezcla el frente de lifecycle de runtimes por REST, que quedó resuelto arriba.
 - Lo que queda acá es el siguiente frente real: inventario persistente de instancias, remove real de instancia y persistencia/reconcile post-reboot para workloads custom.
 
-- [ ] Definir contrato de producto para `CORE + instanciado`.
-  - Opción A: dejarlo explícitamente fuera de scope y rechazar `SY.*` / `RT.*` en el modelo de spawn gestionado.
-  - Opción B: soportarlo como clase real con reglas específicas.
+- [x] Definir contrato de producto para `CORE + instanciado`.
+  - decisión v1:
+    - `SY.*` queda fuera de scope de spawn gestionado
+    - `RT.gateway` queda fuera de scope de spawn gestionado
+    - `RT.<otro>` queda permitido y se trata como runtime gestionado publicado, igual que `AI/IO/WF`
+  - rationale:
+    - protege control-plane y gateway base del hive
+    - deja abierta la posibilidad de modelar componentes de comunicación especializados como parte de la carga del sistema
+    - evita inventar una clase separada de lifecycle para `RT.<otro>` en v1
 
 - [x] Implementar inventario de instancias gestionadas persistidas.
   - Ya no depende sólo de SHM/router.
@@ -284,7 +290,7 @@ Revisión 2026-03-19:
   - modelo elegido: reconcile/autostart desde `SY.orchestrator` al arranque leyendo `/var/lib/fluxbee/nodes/**/config.json`
   - implementado:
     - scan de instancias persistidas
-    - salto explícito de `SY.*` / `RT.*`
+    - salto explícito de `SY.*` y `RT.gateway`
     - relaunch de instancias `CUSTOM` caídas si tienen `runtime` + `runtime_version` válidos, no están activas/visibles y `_system.relaunch_on_boot=true`
   - contrato de bootstrap de nombre para runtimes gestionados:
     - `SY.orchestrator` debe pasar el nombre canónico de la instancia al proceso al momento del spawn/relaunch
@@ -459,7 +465,8 @@ Caso manual adicional:
 
 Contrato actual:
 - `/hives/{id}/routers*` no existe en `SY.admin` (debe devolver `404`).
-- El control canónico para entidades `RT.*` es vía `/hives/{id}/nodes` (`SPAWN_NODE`/`KILL_NODE`), sujeto a disponibilidad de runtime/contrato operativo del router.
+- El control canónico para entidades `RT.<otro>` es vía `/hives/{id}/nodes` (`SPAWN_NODE`/`KILL_NODE`), sujeto a disponibilidad de runtime publicado.
+- `RT.gateway` queda fuera de scope de spawn gestionado en v1.
 
 ## 4) Node remoto por hive
 

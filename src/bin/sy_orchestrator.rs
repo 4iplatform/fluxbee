@@ -4352,7 +4352,8 @@ fn persisted_custom_nodes_with_root(root: &Path) -> Result<Vec<PersistedManagedN
 
             let node_name = node_entry.file_name().to_string_lossy().to_string();
             let kind = node_kind_from_name(&node_name);
-            if matches!(kind.as_str(), "SY" | "RT" | "UNKNOWN") {
+            if matches!(kind.as_str(), "UNKNOWN") || !managed_reconcile_candidate_allowed(&node_name)
+            {
                 continue;
             }
 
@@ -6046,6 +6047,22 @@ fn node_kind_from_name(name: &str) -> String {
         "AI" | "IO" | "WF" | "SY" | "RT" => prefix,
         _ => "UNKNOWN".to_string(),
     }
+}
+
+fn managed_spawn_disallowed_reason(node_name: &str) -> Option<&'static str> {
+    let local = node_name.split('@').next().unwrap_or(node_name).trim();
+    let kind = node_kind_from_name(node_name);
+    match kind.as_str() {
+        "SY" => Some("managed spawn does not support SY.* nodes"),
+        "RT" if local.eq_ignore_ascii_case("RT.gateway") => {
+            Some("managed spawn does not support RT.gateway; it is core hive infrastructure")
+        }
+        _ => None,
+    }
+}
+
+fn managed_reconcile_candidate_allowed(node_name: &str) -> bool {
+    managed_spawn_disallowed_reason(node_name).is_none()
 }
 
 fn node_l2_and_hive(name: &str, default_hive: &str) -> (String, String) {
@@ -9496,6 +9513,15 @@ async fn run_node_flow(
             });
         }
     };
+    if let Some(message) = managed_spawn_disallowed_reason(&node_name) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": message,
+            "target": target_hive,
+            "node_name": node_name,
+        });
+    }
     let identity_primary_hive_id = match resolve_identity_primary_hive_id(state) {
         Ok(value) => value,
         Err(err) => {
@@ -13784,6 +13810,36 @@ blob:
         )
         .expect("write sy config");
 
+        let rt_gateway_dir = root.join("RT").join("RT.gateway@motherbee");
+        std::fs::create_dir_all(&rt_gateway_dir).expect("create rt gateway dir");
+        std::fs::write(
+            rt_gateway_dir.join("config.json"),
+            serde_json::json!({
+                "_system": {
+                    "runtime": "rt.gateway",
+                    "runtime_version": "1.0.0",
+                    "relaunch_on_boot": true
+                }
+            })
+            .to_string(),
+        )
+        .expect("write rt gateway config");
+
+        let rt_edge_dir = root.join("RT").join("RT.edge.buffer@motherbee");
+        std::fs::create_dir_all(&rt_edge_dir).expect("create rt edge dir");
+        std::fs::write(
+            rt_edge_dir.join("config.json"),
+            serde_json::json!({
+                "_system": {
+                    "runtime": "rt.edge.buffer",
+                    "runtime_version": "1.2.3",
+                    "relaunch_on_boot": true
+                }
+            })
+            .to_string(),
+        )
+        .expect("write rt edge config");
+
         let broken_dir = root.join("WF").join("WF.invalid@motherbee");
         std::fs::create_dir_all(&broken_dir).expect("create wf dir");
         std::fs::write(
@@ -13799,12 +13855,29 @@ blob:
         .expect("write broken config");
 
         let nodes = persisted_custom_nodes_with_root(&root).expect("load persisted nodes");
-        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].node_name, "AI.keep.test@motherbee");
         assert_eq!(nodes[0].runtime, "ai.keep.test");
         assert_eq!(nodes[0].runtime_version, "1.0.0-diag");
+        assert_eq!(nodes[1].node_name, "RT.edge.buffer@motherbee");
+        assert_eq!(nodes[1].runtime, "rt.edge.buffer");
+        assert_eq!(nodes[1].runtime_version, "1.2.3");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn managed_spawn_disallowed_reason_blocks_sy_and_rt_gateway_only() {
+        assert_eq!(
+            managed_spawn_disallowed_reason("SY.admin@motherbee"),
+            Some("managed spawn does not support SY.* nodes")
+        );
+        assert_eq!(
+            managed_spawn_disallowed_reason("RT.gateway@motherbee"),
+            Some("managed spawn does not support RT.gateway; it is core hive infrastructure")
+        );
+        assert_eq!(managed_spawn_disallowed_reason("RT.edge.buffer@motherbee"), None);
+        assert_eq!(managed_spawn_disallowed_reason("AI.frontdesk.gov@motherbee"), None);
     }
 
     #[test]
