@@ -30,9 +30,17 @@ cargo run -p ai-frontdesk-gov
 
 Para cerrar el flujo productivo:
 1. consumir `meta.src_ilk` temporal,
-2. colectar identidad mínima (`email`, `display_name`, `tenant_id`),
-3. invocar `ILK_REGISTER` vía SDK (`identity_system_call_ok`),
-4. en canal adicional, invocar `ILK_ADD_CHANNEL` con merge si aplica.
+2. colectar identidad mínima (`email`, `display_name`, `tenant_hint`/empresa),
+3. resolver tenant canónico vía `TNT_CREATE` en `SY.identity`,
+4. usar el `tenant_id=tnt:<uuid>` devuelto por `TNT_CREATE` para `ILK_REGISTER`,
+5. en canal adicional, invocar `ILK_ADD_CHANNEL` con merge si aplica.
+
+Semántica actual recomendada:
+- `TNT_CREATE` debe usarse como `create-or-resolve`.
+- Si ya existe un tenant con el mismo `domain` o `name` normalizado, `SY.identity`
+  devuelve el `tenant_id` existente en vez de crear otro.
+- `ILK_REGISTER` no debe recibir nombres humanos de tenant (`"4iPlatform"`), sino
+  siempre `tenant_id` canónico tipo `tnt:<uuid>`.
 
 Checklist de aceptación:
 - `docs/onworking/identity_v2_tasks.md` sección `E2`.

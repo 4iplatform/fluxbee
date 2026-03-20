@@ -322,6 +322,37 @@ struct IdentityDeltaEnvelope {
 }
 
 impl IdentityStore {
+    fn find_tenant_by_hint(&self, name: &str, domain: Option<&str>) -> Option<(TenantRecord, &'static str)> {
+        let normalized_domain = normalize_tenant_domain(domain);
+        if let Some(expected_domain) = normalized_domain.as_deref() {
+            let mut tenant_ids: Vec<&String> = self.tenants.keys().collect();
+            tenant_ids.sort_unstable();
+            for tenant_id in tenant_ids {
+                let Some(tenant) = self.tenants.get(tenant_id) else {
+                    continue;
+                };
+                if normalize_tenant_domain(tenant.domain.as_deref()).as_deref() == Some(expected_domain)
+                {
+                    return Some((tenant.clone(), "domain"));
+                }
+            }
+        }
+
+        let normalized_name = normalize_tenant_name(name);
+        let mut tenant_ids: Vec<&String> = self.tenants.keys().collect();
+        tenant_ids.sort_unstable();
+        for tenant_id in tenant_ids {
+            let Some(tenant) = self.tenants.get(tenant_id) else {
+                continue;
+            };
+            if normalize_tenant_name(&tenant.name) == normalized_name {
+                return Some((tenant.clone(), "name"));
+            }
+        }
+
+        None
+    }
+
     fn get_ilk_payload(&self, requested_ilk_id: &str) -> Result<Value, String> {
         let requested_ilk_id = requested_ilk_id.trim();
         if requested_ilk_id.is_empty() {
@@ -659,6 +690,13 @@ impl IdentityStore {
 
     fn create_tenant(&mut self, req: TntCreateRequest) -> Result<Value, String> {
         validate_non_empty("name", &req.name)?;
+        let normalized_name = req.name.trim().to_string();
+        let normalized_domain = req
+            .domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
         let status = req
             .status
             .unwrap_or_else(|| "pending".to_string())
@@ -668,13 +706,24 @@ impl IdentityStore {
             return Err("INVALID_REQUEST".to_string());
         }
 
+        if let Some((tenant, matched_by)) =
+            self.find_tenant_by_hint(&normalized_name, normalized_domain.as_deref())
+        {
+            return Ok(json!({
+                "status": "ok",
+                "tenant_id": tenant.tenant_id,
+                "created": false,
+                "matched_by": matched_by,
+            }));
+        }
+
         let tenant_id = format!("tnt:{}", Uuid::new_v4());
         self.tenants.insert(
             tenant_id.clone(),
             TenantRecord {
                 tenant_id: tenant_id.clone(),
-                name: req.name,
-                domain: req.domain,
+                name: normalized_name,
+                domain: normalized_domain,
                 status,
                 settings: req.settings.unwrap_or_else(|| json!({})),
             },
@@ -683,6 +732,8 @@ impl IdentityStore {
         Ok(json!({
             "status": "ok",
             "tenant_id": tenant_id,
+            "created": true,
+            "matched_by": serde_json::Value::Null,
         }))
     }
 
@@ -2284,6 +2335,18 @@ fn apply_identity_shm_provision_fast(
         return Ok(false);
     }
 
+    let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
+    if writer
+        .read_snapshot()
+        .is_some_and(|snapshot| snapshot.ilks.iter().any(|entry| entry.ilk_id == *ilk_uuid.as_bytes()))
+    {
+        tracing::debug!(
+            ilk_id = %ilk.ilk_id,
+            "identity shm fast provision skipped; ilk already present"
+        );
+        return Ok(false);
+    }
+
     let ich_entries = ich_entries_from_ilk_record(ilk)?;
     if ich_entries.is_empty() {
         return Ok(false);
@@ -2864,6 +2927,16 @@ fn canonical_ich_key(channel_type: &str, address: &str) -> (String, String) {
         channel_type.trim().to_ascii_lowercase(),
         address.trim().to_ascii_lowercase(),
     )
+}
+
+fn normalize_tenant_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn normalize_tenant_domain(value: Option<&str>) -> Option<String> {
+    value.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
 }
 
 fn parse_prefixed_uuid(value: &str, prefix: &str) -> Result<Uuid, String> {
@@ -3664,5 +3737,50 @@ mod tests {
                 .and_then(Value::as_str),
             Some("tnt:11111111-1111-1111-1111-111111111111")
         );
+    }
+
+    #[test]
+    fn create_tenant_returns_existing_tenant_for_same_name_or_domain() {
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                name: "4iPlatform".to_string(),
+                domain: Some("4iplatform.com".to_string()),
+                status: "active".to_string(),
+                settings: json!({}),
+            },
+        );
+
+        let by_name = store
+            .create_tenant(TntCreateRequest {
+                name: "4iplatform".to_string(),
+                domain: None,
+                status: Some("active".to_string()),
+                settings: None,
+            })
+            .expect("resolve by name");
+        assert_eq!(
+            by_name.get("tenant_id").and_then(Value::as_str),
+            Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        );
+        assert_eq!(by_name.get("created").and_then(Value::as_bool), Some(false));
+        assert_eq!(by_name.get("matched_by").and_then(Value::as_str), Some("name"));
+
+        let by_domain = store
+            .create_tenant(TntCreateRequest {
+                name: "another-name".to_string(),
+                domain: Some("4iplatform.com".to_string()),
+                status: Some("active".to_string()),
+                settings: None,
+            })
+            .expect("resolve by domain");
+        assert_eq!(
+            by_domain.get("tenant_id").and_then(Value::as_str),
+            Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        );
+        assert_eq!(by_domain.get("created").and_then(Value::as_bool), Some(false));
+        assert_eq!(by_domain.get("matched_by").and_then(Value::as_str), Some("domain"));
     }
 }
