@@ -6522,6 +6522,78 @@ fn runtime_keep_versions(
     Ok(keep_map)
 }
 
+fn persisted_runtime_keep_versions_with_root(
+    nodes_root: &Path,
+) -> Result<HashMap<String, HashSet<String>>, OrchestratorError> {
+    if !nodes_root.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let mut keep_map: HashMap<String, HashSet<String>> = HashMap::new();
+    for kind_entry in fs::read_dir(nodes_root)? {
+        let kind_entry = kind_entry?;
+        if !kind_entry.file_type()?.is_dir() {
+            continue;
+        }
+        for node_entry in fs::read_dir(kind_entry.path())? {
+            let node_entry = node_entry?;
+            if !node_entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            let config_path = node_entry.path().join("config.json");
+            if !config_path.is_file() {
+                continue;
+            }
+            let config = match load_node_effective_config(&config_path) {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %config_path.display(),
+                        error = %err,
+                        "runtime retention skipping unreadable persisted node config"
+                    );
+                    continue;
+                }
+            };
+            let Some(system) = config.get("_system").and_then(|value| value.as_object()) else {
+                continue;
+            };
+            let Some(runtime) = system
+                .get("runtime")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let Some(runtime_version) = system
+                .get("runtime_version")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if !valid_token(runtime) || !valid_token(runtime_version) {
+                tracing::warn!(
+                    path = %config_path.display(),
+                    runtime = runtime,
+                    runtime_version = runtime_version,
+                    "runtime retention skipping persisted node with invalid runtime tokens"
+                );
+                continue;
+            }
+            keep_map
+                .entry(runtime.to_string())
+                .or_default()
+                .insert(runtime_version.to_string());
+        }
+    }
+
+    Ok(keep_map)
+}
+
 fn verify_runtime_current_artifacts(
     manifest: &RuntimeManifest,
 ) -> Result<Vec<String>, OrchestratorError> {
@@ -6660,11 +6732,16 @@ fn verify_runtime_current_artifacts_with_root(
     Ok(errors)
 }
 
-fn apply_runtime_retention(
+fn apply_runtime_retention_with_roots(
     manifest: &RuntimeManifest,
+    runtimes_root: &Path,
+    nodes_root: &Path,
 ) -> Result<RuntimeRetentionStats, OrchestratorError> {
-    let keep_map = runtime_keep_versions(manifest)?;
-    let root = runtimes_root();
+    let mut keep_map = runtime_keep_versions(manifest)?;
+    for (runtime, versions) in persisted_runtime_keep_versions_with_root(nodes_root)? {
+        keep_map.entry(runtime).or_default().extend(versions);
+    }
+    let root = runtimes_root.to_path_buf();
     if !root.exists() {
         return Ok(RuntimeRetentionStats::default());
     }
@@ -6712,6 +6789,12 @@ fn apply_runtime_retention(
         }
     }
     Ok(stats)
+}
+
+fn apply_runtime_retention(
+    manifest: &RuntimeManifest,
+) -> Result<RuntimeRetentionStats, OrchestratorError> {
+    apply_runtime_retention_with_roots(manifest, &runtimes_root(), &node_files_root())
 }
 
 fn runtimes_root() -> PathBuf {
@@ -13648,6 +13731,59 @@ blob:
         let err = remove_runtime_version_from_manifest(&manifest, "ai.test.gov", "1.0.0")
             .expect_err("current delete must fail");
         assert_eq!(err.to_string(), "RUNTIME_CURRENT_CONFLICT");
+    }
+
+    #[test]
+    fn apply_runtime_retention_preserves_runtime_referenced_by_persisted_instance() {
+        let root = std::env::temp_dir().join(format!(
+            "fluxbee-retention-test-{}",
+            Uuid::new_v4()
+        ));
+        let runtimes_root = root.join("dist").join("runtimes");
+        let nodes_root = root.join("nodes");
+
+        let kept_runtime_dir = runtimes_root.join("AI.chat.test").join("1.0.0");
+        fs::create_dir_all(&kept_runtime_dir).expect("create kept runtime dir");
+        fs::write(kept_runtime_dir.join("marker"), "keep").expect("write kept marker");
+
+        let pruned_runtime_dir = runtimes_root.join("AI.prune.test").join("1.0.0");
+        fs::create_dir_all(&pruned_runtime_dir).expect("create pruned runtime dir");
+        fs::write(pruned_runtime_dir.join("marker"), "prune").expect("write pruned marker");
+
+        let node_dir = nodes_root.join("AI").join("AI.chat@motherbee");
+        fs::create_dir_all(&node_dir).expect("create node dir");
+        fs::write(
+            node_dir.join("config.json"),
+            serde_json::json!({
+                "_system": {
+                    "runtime": "AI.chat.test",
+                    "runtime_version": "1.0.0",
+                    "relaunch_on_boot": true
+                }
+            })
+            .to_string(),
+        )
+        .expect("write config");
+
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-03-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+
+        let stats = apply_runtime_retention_with_roots(&manifest, &runtimes_root, &nodes_root)
+            .expect("retention should succeed");
+
+        assert!(kept_runtime_dir.exists(), "persisted runtime should be kept");
+        assert!(
+            !pruned_runtime_dir.exists(),
+            "unreferenced runtime should be pruned"
+        );
+        assert_eq!(stats.removed_runtime_dirs, 1);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -266,6 +266,14 @@ Evidencia:
 Criterio de cierre FR-08:
 - Cumplido (2026-03-13). Ver checklist consolidado en `docs/onworking/runtime-lifecycle-spec.md`.
 
+Addendum 2026-03-20:
+- Se corrigió una deriva entre runtime retention y managed instances persistidas.
+- Antes, `runtime_verify_and_retain()` preservaba sólo runtimes/versiones presentes en `manifest.json`; si una instancia persistida referenciaba un runtime/version fuera del manifest actual, el watchdog podía borrar `/var/lib/fluxbee/dist/runtimes/<runtime>/<version>` al reiniciar `SY.orchestrator`.
+- Ahora el keep-set de retention se amplía con `runtime` + `runtime_version` leídos desde `/var/lib/fluxbee/nodes/**/config.json`.
+- Resultado: artifacts referenciados por instancias persistidas ya no se podan aunque no estén en `current`/`available` del manifest.
+- Evidencia:
+  - `src/bin/sy_orchestrator.rs` (`persisted_runtime_keep_versions_with_root`, `apply_runtime_retention_with_roots`)
+
 ---
 
 ### FR-09 — SY.admin internal gateway (HTTP + socket unificado)
