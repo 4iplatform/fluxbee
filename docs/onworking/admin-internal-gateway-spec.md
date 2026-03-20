@@ -30,13 +30,17 @@ con ejecución equivalente y transparente: mismo resultado funcional, diferente 
 
 ### 2.2 Out of scope
 
-- `identity` en `SY.admin`
+- mutaciones productivas de `identity` en `SY.admin`
 
 Ownership de identity:
 - `SY.orchestrator`: ILK de nodos (spawn)
 - `AI.frontdesk`: ILK de humanos
 
-`SY.admin` no define endpoints/acciones identity en este diseño.
+Excepción mínima aceptada:
+- `SY.admin` sí puede exponer lecturas de observabilidad/inspección sobre `identity`
+  que no cambian estado.
+- v1 agrega `get_ilk` por HTTP/admin para inspeccionar el snapshot lógico de un ILK
+  (`tenant_id`, `registration_status`, canales, identificación y alias canónico si aplica).
 
 ---
 
@@ -216,6 +220,8 @@ Implementación actual:
 | `GET /hives/{id}/nodes/{name}/config` | `get_node_config` | `handle_admin_command` |
 | `PUT /hives/{id}/nodes/{name}/config` | `set_node_config` | `handle_admin_command` |
 | `GET /hives/{id}/nodes/{name}/state` | `get_node_state` | `handle_admin_command` |
+| `GET /hives/{id}/identity/ilks` | `list_ilks` | `handle_admin_query` -> `SY.identity` (`ILK_LIST`) |
+| `GET /hives/{id}/identity/ilks/{ilk_id}` | `get_ilk` | `handle_admin_command` -> `SY.identity` (`ILK_GET`) |
 
 ### 7.2 Routes, VPN, storage, rollout/drift
 

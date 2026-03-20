@@ -57,6 +57,10 @@ const SHM_TENANT_STATUS_SUSPENDED: u8 = 2;
 
 const MSG_ILK_PROVISION: &str = "ILK_PROVISION";
 const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
+const MSG_ILK_LIST: &str = "ILK_LIST";
+const MSG_ILK_LIST_RESPONSE: &str = "ILK_LIST_RESPONSE";
+const MSG_ILK_GET: &str = "ILK_GET";
+const MSG_ILK_GET_RESPONSE: &str = "ILK_GET_RESPONSE";
 const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
 const MSG_ILK_REGISTER_RESPONSE: &str = "ILK_REGISTER_RESPONSE";
 const MSG_ILK_ADD_CHANNEL: &str = "ILK_ADD_CHANNEL";
@@ -76,9 +80,17 @@ struct HiveFile {
     #[serde(default)]
     wan: Option<WanSection>,
     #[serde(default)]
+    government: Option<GovernmentSection>,
+    #[serde(default)]
     identity: Option<IdentitySection>,
     #[serde(default)]
     database: Option<DatabaseSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GovernmentSection {
+    #[serde(default)]
+    identity_frontdesk: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +147,12 @@ struct IlkProvisionRequest {
     ich_id: String,
     channel_type: String,
     address: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IlkGetRequest {
+    ilk_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,6 +324,125 @@ struct IdentityDeltaEnvelope {
 }
 
 impl IdentityStore {
+    fn find_tenant_by_hint(&self, name: &str, domain: Option<&str>) -> Option<(TenantRecord, &'static str)> {
+        let normalized_domain = normalize_tenant_domain(domain);
+        if let Some(expected_domain) = normalized_domain.as_deref() {
+            let mut tenant_ids: Vec<&String> = self.tenants.keys().collect();
+            tenant_ids.sort_unstable();
+            for tenant_id in tenant_ids {
+                let Some(tenant) = self.tenants.get(tenant_id) else {
+                    continue;
+                };
+                if normalize_tenant_domain(tenant.domain.as_deref()).as_deref() == Some(expected_domain)
+                {
+                    return Some((tenant.clone(), "domain"));
+                }
+            }
+        }
+
+        let normalized_name = normalize_tenant_name(name);
+        let mut tenant_ids: Vec<&String> = self.tenants.keys().collect();
+        tenant_ids.sort_unstable();
+        for tenant_id in tenant_ids {
+            let Some(tenant) = self.tenants.get(tenant_id) else {
+                continue;
+            };
+            if normalize_tenant_name(&tenant.name) == normalized_name {
+                return Some((tenant.clone(), "name"));
+            }
+        }
+
+        None
+    }
+
+    fn get_ilk_payload(&self, requested_ilk_id: &str) -> Result<Value, String> {
+        let requested_ilk_id = requested_ilk_id.trim();
+        if requested_ilk_id.is_empty() {
+            return Err("INVALID_REQUEST".to_string());
+        }
+        let _ = parse_prefixed_uuid(requested_ilk_id, "ilk")?;
+
+        let alias = self.aliases.get(requested_ilk_id).cloned();
+        let canonical_ilk_id = alias
+            .as_ref()
+            .map(|entry| entry.canonical_ilk_id.clone())
+            .unwrap_or_else(|| requested_ilk_id.to_string());
+
+        let Some(ilk) = self.ilks.get(&canonical_ilk_id).cloned() else {
+            return Err("NOT_FOUND".to_string());
+        };
+
+        let tenant = self.tenants.get(&ilk.tenant_id).cloned();
+        let merged_aliases: Vec<Value> = self
+            .aliases
+            .iter()
+            .filter_map(|(old_ilk_id, entry)| {
+                (entry.canonical_ilk_id == canonical_ilk_id).then(|| {
+                    json!({
+                        "old_ilk_id": old_ilk_id,
+                        "canonical_ilk_id": entry.canonical_ilk_id,
+                        "expires_at_ms": entry.expires_at_ms,
+                    })
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "status": "ok",
+            "ilk_id": canonical_ilk_id,
+            "queried_ilk_id": requested_ilk_id,
+            "canonical_ilk_id": canonical_ilk_id,
+            "alias_resolved": requested_ilk_id != ilk.ilk_id,
+            "queried_alias": alias.as_ref().map(|entry| json!({
+                "old_ilk_id": requested_ilk_id,
+                "canonical_ilk_id": entry.canonical_ilk_id,
+                "expires_at_ms": entry.expires_at_ms,
+            })),
+            "merged_aliases": merged_aliases,
+            "ilk": ilk,
+            "tenant": tenant,
+        }))
+    }
+
+    fn list_ilks_payload(&self) -> Value {
+        let mut ilk_ids: Vec<&String> = self.ilks.keys().collect();
+        ilk_ids.sort_unstable();
+
+        let ilks: Vec<Value> = ilk_ids
+            .into_iter()
+            .filter_map(|ilk_id| {
+                let ilk = self.ilks.get(ilk_id)?;
+                let tenant = self.tenants.get(&ilk.tenant_id);
+                let display_name = identification_str(&ilk.identification, "display_name")
+                    .map(str::to_string);
+                let node_name =
+                    identification_str(&ilk.identification, "node_name").map(str::to_string);
+                Some(json!({
+                    "ilk_id": ilk.ilk_id,
+                    "ilk_type": ilk.ilk_type,
+                    "registration_status": ilk.registration_status,
+                    "tenant_id": ilk.tenant_id,
+                    "tenant_name": tenant.map(|entry| entry.name.clone()),
+                    "display_name": display_name,
+                    "node_name": node_name,
+                    "channel_count": ilk.channels.len(),
+                    "channels": ilk.channels.iter().map(|channel| json!({
+                        "ich_id": channel.ich_id,
+                        "channel_type": channel.channel_type,
+                        "address": channel.address,
+                    })).collect::<Vec<_>>(),
+                    "deleted_at_ms": ilk.deleted_at_ms,
+                }))
+            })
+            .collect();
+
+        json!({
+            "status": "ok",
+            "count": ilks.len(),
+            "ilks": ilks,
+        })
+    }
+
     fn find_active_ilk_by_identification_key(&self, key: &str, expected: &str) -> Option<String> {
         let expected = expected.trim();
         if expected.is_empty() {
@@ -594,6 +731,13 @@ impl IdentityStore {
 
     fn create_tenant(&mut self, req: TntCreateRequest) -> Result<Value, String> {
         validate_non_empty("name", &req.name)?;
+        let normalized_name = req.name.trim().to_string();
+        let normalized_domain = req
+            .domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
         let status = req
             .status
             .unwrap_or_else(|| "pending".to_string())
@@ -603,13 +747,24 @@ impl IdentityStore {
             return Err("INVALID_REQUEST".to_string());
         }
 
+        if let Some((tenant, matched_by)) =
+            self.find_tenant_by_hint(&normalized_name, normalized_domain.as_deref())
+        {
+            return Ok(json!({
+                "status": "ok",
+                "tenant_id": tenant.tenant_id,
+                "created": false,
+                "matched_by": matched_by,
+            }));
+        }
+
         let tenant_id = format!("tnt:{}", Uuid::new_v4());
         self.tenants.insert(
             tenant_id.clone(),
             TenantRecord {
                 tenant_id: tenant_id.clone(),
-                name: req.name,
-                domain: req.domain,
+                name: normalized_name,
+                domain: normalized_domain,
                 status,
                 settings: req.settings.unwrap_or_else(|| json!({})),
             },
@@ -618,6 +773,8 @@ impl IdentityStore {
         Ok(json!({
             "status": "ok",
             "tenant_id": tenant_id,
+            "created": true,
+            "matched_by": serde_json::Value::Null,
         }))
     }
 
@@ -817,6 +974,8 @@ impl IdentityRuntime {
     ) -> Self {
         let mut allowed_prefixes: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
         allowed_prefixes.insert(MSG_ILK_PROVISION, vec!["IO."]);
+        allowed_prefixes.insert(MSG_ILK_LIST, vec!["SY.admin@"]);
+        allowed_prefixes.insert(MSG_ILK_GET, vec!["SY.admin@"]);
         allowed_prefixes.insert(MSG_ILK_REGISTER, vec!["AI.frontdesk@", "SY.orchestrator@"]);
         allowed_prefixes.insert(MSG_ILK_ADD_CHANNEL, vec!["AI.frontdesk@"]);
         allowed_prefixes.insert(MSG_ILK_UPDATE, vec!["SY.orchestrator@"]);
@@ -828,6 +987,20 @@ impl IdentityRuntime {
         bootstrap.insert(format!("SY.identity@{}", hive.hive_id));
         allowed_exacts.insert(MSG_ILK_REGISTER, bootstrap.clone());
         allowed_exacts.insert(MSG_ILK_UPDATE, bootstrap);
+        if let Some(frontdesk_node) = configured_identity_frontdesk_node_name(hive) {
+            allowed_exacts
+                .entry(MSG_ILK_REGISTER)
+                .or_default()
+                .insert(frontdesk_node.clone());
+            allowed_exacts
+                .entry(MSG_ILK_ADD_CHANNEL)
+                .or_default()
+                .insert(frontdesk_node.clone());
+            allowed_exacts
+                .entry(MSG_TNT_CREATE)
+                .or_default()
+                .insert(frontdesk_node);
+        }
 
         let default_tenant = hive
             .identity
@@ -910,6 +1083,14 @@ impl IdentityRuntime {
 
         let mut deltas: Vec<IdentityDeltaEnvelope> = Vec::new();
         let payload = match action {
+            MSG_ILK_LIST => self.store.list_ilks_payload(),
+            MSG_ILK_GET => match serde_json::from_value::<IlkGetRequest>(msg.payload.clone()) {
+                Ok(req) => match self.store.get_ilk_payload(&req.ilk_id) {
+                    Ok(ok) => ok,
+                    Err(code) => error_payload(&code, "failed to get ilk"),
+                },
+                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+            },
             MSG_ILK_PROVISION => {
                 match serde_json::from_value::<IlkProvisionRequest>(msg.payload.clone()) {
                     Ok(req) => {
@@ -1442,6 +1623,21 @@ impl IdentityRuntime {
             .read_snapshot()
             .ok_or_else(|| "lsa shm snapshot unavailable".into())
     }
+}
+
+fn configured_identity_frontdesk_node_name(hive: &HiveFile) -> Option<String> {
+    hive.government
+        .as_ref()
+        .and_then(|government| government.identity_frontdesk.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.contains('@') {
+                value.to_string()
+            } else {
+                format!("{value}@{}", hive.hive_id)
+            }
+        })
 }
 
 fn authorized_name_variants(name: &str) -> Vec<String> {
@@ -2182,6 +2378,18 @@ fn apply_identity_shm_provision_fast(
         return Ok(false);
     }
 
+    let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
+    if writer
+        .read_snapshot()
+        .is_some_and(|snapshot| snapshot.ilks.iter().any(|entry| entry.ilk_id == *ilk_uuid.as_bytes()))
+    {
+        tracing::debug!(
+            ilk_id = %ilk.ilk_id,
+            "identity shm fast provision skipped; ilk already present"
+        );
+        return Ok(false);
+    }
+
     let ich_entries = ich_entries_from_ilk_record(ilk)?;
     if ich_entries.is_empty() {
         return Ok(false);
@@ -2595,6 +2803,8 @@ fn ensure_l2_name(name: &str, hive_id: &str) -> String {
 fn response_name(action: &str) -> &'static str {
     match action {
         MSG_ILK_PROVISION => MSG_ILK_PROVISION_RESPONSE,
+        MSG_ILK_LIST => MSG_ILK_LIST_RESPONSE,
+        MSG_ILK_GET => MSG_ILK_GET_RESPONSE,
         MSG_ILK_REGISTER => MSG_ILK_REGISTER_RESPONSE,
         MSG_ILK_ADD_CHANNEL => MSG_ILK_ADD_CHANNEL_RESPONSE,
         MSG_ILK_UPDATE => MSG_ILK_UPDATE_RESPONSE,
@@ -2761,6 +2971,16 @@ fn canonical_ich_key(channel_type: &str, address: &str) -> (String, String) {
         channel_type.trim().to_ascii_lowercase(),
         address.trim().to_ascii_lowercase(),
     )
+}
+
+fn normalize_tenant_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn normalize_tenant_domain(value: Option<&str>) -> Option<String> {
+    value.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
 }
 
 fn parse_prefixed_uuid(value: &str, prefix: &str) -> Result<Uuid, String> {
@@ -3456,4 +3676,198 @@ fn is_mother_role(role: Option<&str>) -> bool {
 
 fn is_worker_role(role: Option<&str>) -> bool {
     matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "worker")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_hive(identity_frontdesk: Option<&str>) -> HiveFile {
+        HiveFile {
+            hive_id: "motherbee".to_string(),
+            role: Some("motherbee".to_string()),
+            wan: None,
+            government: Some(GovernmentSection {
+                identity_frontdesk: identity_frontdesk.map(str::to_string),
+            }),
+            identity: None,
+            database: None,
+        }
+    }
+
+    #[test]
+    fn configured_identity_frontdesk_node_name_normalizes_local_name() {
+        let hive = test_hive(Some("AI.frontdesk.gov"));
+        assert_eq!(
+            configured_identity_frontdesk_node_name(&hive).as_deref(),
+            Some("AI.frontdesk.gov@motherbee")
+        );
+    }
+
+    #[test]
+    fn identity_runtime_authorizes_configured_frontdesk_exact_name() {
+        let hive = test_hive(Some("AI.frontdesk.gov@motherbee"));
+        let runtime = IdentityRuntime::new(&hive, PathBuf::from("/tmp"), true, None);
+
+        assert!(runtime.is_authorized(
+            MSG_ILK_REGISTER,
+            Some("AI.frontdesk.gov@motherbee")
+        ));
+        assert!(runtime.is_authorized(
+            MSG_ILK_ADD_CHANNEL,
+            Some("AI.frontdesk.gov@motherbee")
+        ));
+        assert!(runtime.is_authorized(
+            MSG_TNT_CREATE,
+            Some("AI.frontdesk.gov@motherbee")
+        ));
+    }
+
+    #[test]
+    fn identity_store_get_ilk_payload_resolves_alias_and_embeds_tenant() {
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            "tnt:11111111-1111-1111-1111-111111111111".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:11111111-1111-1111-1111-111111111111".to_string(),
+                name: "tenant-a".to_string(),
+                domain: Some("tenant-a.local".to_string()),
+                status: "active".to_string(),
+                settings: json!({}),
+            },
+        );
+        store.ilks.insert(
+            "ilk:22222222-2222-2222-2222-222222222222".to_string(),
+            IlkRecord {
+                ilk_id: "ilk:22222222-2222-2222-2222-222222222222".to_string(),
+                ilk_type: "human".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: "tnt:11111111-1111-1111-1111-111111111111".to_string(),
+                identification: json!({"display_name":"Jane","node_name":"AI.frontdesk.gov@motherbee"}),
+                roles: vec!["user".to_string()],
+                capabilities: vec!["chat".to_string()],
+                channels: vec![ChannelRecord {
+                    ich_id: "ich:33333333-3333-3333-3333-333333333333".to_string(),
+                    channel_type: "slack".to_string(),
+                    address: "U123".to_string(),
+                }],
+                deleted_at_ms: None,
+            },
+        );
+        store.aliases.insert(
+            "ilk:44444444-4444-4444-4444-444444444444".to_string(),
+            AliasRecord {
+                canonical_ilk_id: "ilk:22222222-2222-2222-2222-222222222222".to_string(),
+                expires_at_ms: 4_102_444_800_000,
+            },
+        );
+
+        let payload = store
+            .get_ilk_payload("ilk:44444444-4444-4444-4444-444444444444")
+            .expect("payload");
+
+        assert_eq!(
+            payload.get("canonical_ilk_id").and_then(Value::as_str),
+            Some("ilk:22222222-2222-2222-2222-222222222222")
+        );
+        assert_eq!(
+            payload.get("alias_resolved").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            payload
+                .get("tenant")
+                .and_then(|value| value.get("tenant_id"))
+                .and_then(Value::as_str),
+            Some("tnt:11111111-1111-1111-1111-111111111111")
+        );
+    }
+
+    #[test]
+    fn create_tenant_returns_existing_tenant_for_same_name_or_domain() {
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                name: "4iPlatform".to_string(),
+                domain: Some("4iplatform.com".to_string()),
+                status: "active".to_string(),
+                settings: json!({}),
+            },
+        );
+
+        let by_name = store
+            .create_tenant(TntCreateRequest {
+                name: "4iplatform".to_string(),
+                domain: None,
+                status: Some("active".to_string()),
+                settings: None,
+            })
+            .expect("resolve by name");
+        assert_eq!(
+            by_name.get("tenant_id").and_then(Value::as_str),
+            Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        );
+        assert_eq!(by_name.get("created").and_then(Value::as_bool), Some(false));
+        assert_eq!(by_name.get("matched_by").and_then(Value::as_str), Some("name"));
+
+        let by_domain = store
+            .create_tenant(TntCreateRequest {
+                name: "another-name".to_string(),
+                domain: Some("4iplatform.com".to_string()),
+                status: Some("active".to_string()),
+                settings: None,
+            })
+            .expect("resolve by domain");
+        assert_eq!(
+            by_domain.get("tenant_id").and_then(Value::as_str),
+            Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        );
+        assert_eq!(by_domain.get("created").and_then(Value::as_bool), Some(false));
+        assert_eq!(by_domain.get("matched_by").and_then(Value::as_str), Some("domain"));
+    }
+
+    #[test]
+    fn list_ilks_payload_returns_compact_identity_rows() {
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                name: "fluxbee".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+            },
+        );
+        store.ilks.insert(
+            "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            IlkRecord {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                ilk_type: "human".to_string(),
+                registration_status: "temporary".to_string(),
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                identification: json!({"display_name":"Jane","node_name":"AI.frontdesk.gov@motherbee"}),
+                roles: vec![],
+                capabilities: vec![],
+                channels: vec![ChannelRecord {
+                    ich_id: "ich:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
+                    channel_type: "slack".to_string(),
+                    address: "U123".to_string(),
+                }],
+                deleted_at_ms: None,
+            },
+        );
+
+        let payload = store.list_ilks_payload();
+        assert_eq!(payload.get("count").and_then(Value::as_u64), Some(1));
+        let rows = payload
+            .get("ilks")
+            .and_then(Value::as_array)
+            .expect("ilks array");
+        assert_eq!(rows[0].get("tenant_name").and_then(Value::as_str), Some("fluxbee"));
+        assert_eq!(rows[0].get("channel_count").and_then(Value::as_u64), Some(1));
+        assert_eq!(rows[0].get("registration_status").and_then(Value::as_str), Some("temporary"));
+    }
 }

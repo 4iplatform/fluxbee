@@ -911,6 +911,18 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "list_ilks",
+        route: InternalActionRoute::Query("list_ilks"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "get_ilk",
+        route: InternalActionRoute::Command("get_ilk"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "list_deployments",
         route: InternalActionRoute::Command("list_deployments"),
         requires_target: true,
@@ -1917,6 +1929,19 @@ async fn handle_hive_paths(
                 handle_admin_command(ctx, client, "get_node_status", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("GET", ["identity", "ilks"]) => {
+            let (status, resp) =
+                handle_admin_query(ctx, client, "list_ilks", Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["identity", "ilks", ilk_id]) => {
+            let payload = serde_json::json!({
+                "ilk_id": decode_percent(ilk_id),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "get_ilk", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["versions"]) => {
             let (status, resp) =
                 handle_admin_query(ctx, client, "get_versions", Some(hive)).await?;
@@ -2861,6 +2886,9 @@ async fn handle_admin_query(
     if action == "list_admin_actions" {
         return Ok(build_admin_actions_catalog_response());
     }
+    if action == "list_ilks" {
+        return handle_identity_query(ctx, client, action, hive).await;
+    }
     let payload = normalize_admin_payload(action, serde_json::json!({}), hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
     let response = send_admin_request(client, request, admin_action_timeout(action)).await;
@@ -2925,6 +2953,10 @@ async fn handle_admin_command(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
+    if matches!(action, "get_ilk") {
+        return handle_identity_command(ctx, client, action, payload, hive).await;
+    }
+
     if let Some(detail) = admin_payload_contract_error(action, &payload) {
         return Ok((
             400u16,
@@ -2965,6 +2997,55 @@ async fn handle_admin_command(
             }
         }
     }
+    Ok(build_admin_http_response(action, response))
+}
+
+async fn handle_identity_query(
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+    action: &str,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    let target = format!("SY.identity@{}", target_hive);
+    let (request_msg, response_msg) = match action {
+        "list_ilks" => ("ILK_LIST", "ILK_LIST_RESPONSE"),
+        _ => return Err(format!("unsupported identity admin query: {action}").into()),
+    };
+    let response = send_system_request(
+        client,
+        &target,
+        request_msg,
+        response_msg,
+        serde_json::json!({}),
+        admin_action_timeout(action),
+    )
+    .await;
+    Ok(build_admin_http_response(action, response))
+}
+
+async fn handle_identity_command(
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+    action: &str,
+    payload: serde_json::Value,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    let target = format!("SY.identity@{}", target_hive);
+    let (request_msg, response_msg) = match action {
+        "get_ilk" => ("ILK_GET", "ILK_GET_RESPONSE"),
+        _ => return Err(format!("unsupported identity admin action: {action}").into()),
+    };
+    let response = send_system_request(
+        client,
+        &target,
+        request_msg,
+        response_msg,
+        payload,
+        admin_action_timeout(action),
+    )
+    .await;
     Ok(build_admin_http_response(action, response))
 }
 
