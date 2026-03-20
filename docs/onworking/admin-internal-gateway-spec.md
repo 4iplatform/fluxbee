@@ -211,6 +211,7 @@ Implementación actual:
 | `GET /hives/{id}/nodes` | `list_nodes` | `handle_admin_query` |
 | `POST /hives/{id}/nodes` | `run_node` | `handle_admin_command` |
 | `DELETE /hives/{id}/nodes/{name}` | `kill_node` | `handle_admin_command` |
+| `DELETE /hives/{id}/nodes/{name}/instance` | `remove_node_instance` | `handle_admin_command` |
 | `GET /hives/{id}/nodes/{name}/status` | `get_node_status` | `handle_admin_command` |
 | `GET /hives/{id}/nodes/{name}/config` | `get_node_config` | `handle_admin_command` |
 | `PUT /hives/{id}/nodes/{name}/config` | `set_node_config` | `handle_admin_command` |

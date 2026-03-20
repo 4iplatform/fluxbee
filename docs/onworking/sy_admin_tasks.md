@@ -55,6 +55,290 @@ Lista de tareas cerradas para alinear `SY.admin` con la especificacion actual y 
   - [x] `/config/storage` (broadcast + confirmacion)
   - Nota: `scripts/admin_nodes_routers_storage_e2e.sh` quedó histórico porque valida `/routers*` (contrato removido en v2).
 
+## Pendiente nuevo - lifecycle de runtimes por REST
+
+Motivación:
+- Hoy `SY.admin` permite instalar software indirectamente vía `fluxbee-publish`, y permite operar instancias vía `/hives/{id}/nodes`.
+- Falta el complemento REST para remover artifacts de runtime publicados en `dist`/manifest sin tocar el CLI ni editar archivos manualmente.
+- La operación canónica debería vivir en `SY.admin` y pasar por el mismo modelo HTTP + gateway interno que el resto de las acciones administrativas.
+
+Alcance propuesto:
+- administrar artifacts publicados (manifest + `dist`)
+- no reemplaza `kill_node`
+- no reemplaza `GET /versions` (esa sigue siendo la vista efectiva/readiness)
+
+Contrato operativo cerrado:
+- ownership: sólo `motherbee` modifica `manifest.json` y `dist/runtimes`
+- replicación: los workers convergen por Syncthing; un worker desconectado no bloquea delete
+- serialización: publish/remove/update de runtimes deben ejecutarse bajo lock secuencial; si hay otra operación activa, responder `BUSY`
+- criterio de uso:
+  - un runtime/version está `in use` si existe algún nodo `RUNNING` en el inventario global usando ese runtime/version
+  - no se usa la mera existencia de `config.json` como bloqueo para delete de artifacts
+  - la evaluación sale del inventario visible del control-plane
+  - un hive `offline/stale` no bloquea delete; si está desconectado, no cuenta como `RUNNING`
+- criterio de dependencia:
+  - un runtime base no puede borrarse si existen runtimes publicados `config_only` o `workflow` cuyo `runtime_base` lo referencia
+  - este check sale del manifest/`GET /versions`, no del inventario de nodos
+- política de current:
+  - no se permite borrar la versión `current`
+  - no hay fallback automático ni promote implícito
+- atomicidad:
+  - el delete es atómico en `motherbee`
+  - luego la remoción converge al resto de hives por replicación
+  - no se intenta atomicidad distribuida estricta entre hives
+
+Explicación corta del modelo:
+- `kill_node` y `DELETE /hives/{hive}/nodes/{name}` siguen siendo lifecycle de proceso/instancia, no de artifact publicado
+- el delete de runtimes opera sobre el catálogo publicado en `motherbee`
+- para decidir si puede borrar:
+  - se mira el inventario global para `in use`
+  - se mira el manifest/`/versions` para dependencias `runtime_base`
+- si pasa ambos checks, se borra en `motherbee` y el resto converge solo
+- si un worker estaba desconectado al momento del delete, la reconciliación cuando vuelva queda explícitamente fuera de alcance de esta v1; el owner ya removió el artifact y la convergencia posterior se observará aparte
+
+Endpoints candidatos vNext:
+- [x] `GET /hives/{hive}/runtimes`
+  - lista runtimes publicados visibles para ese hive, incluyendo `current`, `available`, `type`, `runtime_base` y readiness resumido
+- [x] `GET /hives/{hive}/runtimes/{runtime}`
+  - detalle por runtime, incluyendo versiones publicadas y readiness por versión
+- [x] `DELETE /hives/{hive}/runtimes/{runtime}/versions/{version}`
+  - remueve una versión puntual del manifest/dist
+  - sólo permitido para versiones no-`current`
+  - la remoción converge luego al resto del grupo
+
+Fuera de alcance en v1:
+- [ ] `DELETE /hives/{hive}/runtimes/{runtime}`
+  - removido del alcance inicial
+  - choca con la regla `no current delete`
+  - si se necesita más adelante, requerirá contrato explícito de deprecación/desasignación de `current`
+
+Decisiones de contrato resueltas:
+- [x] ownership real:
+  - sólo `motherbee` modifica manifest/dist
+  - `hive` en el endpoint se interpreta como contexto operativo/consulta, no como owner alternativo de artifacts
+- [x] política de seguridad:
+  - rechazar delete si existe algún nodo `RUNNING` usando ese runtime/version
+  - rechazar delete de runtime base si hay `config_only`/`workflow` dependientes publicados
+  - rechazar delete de `current`
+- [x] semántica de reconcile:
+  - delete muta primero `motherbee`
+  - workers offline no bloquean
+  - el resultado debe reportar convergencia posterior, no atomicidad distribuida
+- [x] definición conceptual de vista:
+  - `GET /hives/{hive}/runtimes` puede ser recurso nuevo, pero su fuente de verdad es el manifest/readiness que hoy ya alimenta `/versions`
+- [x] definir shape final de respuesta:
+  - runtime/version removido
+  - manifest_version nuevo
+  - manifest_hash nuevo
+  - `replication_status` / `convergence_status`
+  - hives pendientes si aplica
+
+Orden sugerido de implementación:
+1. resolver chequeo `RUNTIME_IN_USE`
+   - leer inventario global visible del control-plane
+2. resolver chequeo `RUNTIME_HAS_DEPENDENTS`
+   - leer manifest/runtime catalog
+3. `DELETE /hives/{hive}/runtimes/{runtime}/versions/{version}`
+   - sólo no-`current`
+   - lock secuencial
+4. E2E y negativos
+
+Checklist de implementación propuesto:
+- [x] agregar acciones internas en `SY.admin` registry:
+  - [x] `list_runtimes`
+  - [x] `get_runtime`
+  - [x] `remove_runtime_version`
+- [x] implementar handlers REST en `SY.admin` para lectura:
+  - [x] `GET /hives/{hive}/runtimes`
+  - [x] `GET /hives/{hive}/runtimes/{runtime}`
+- [x] implementar handler REST de delete en `SY.admin`
+- [x] delegar ejecución a `SY.orchestrator` (owner de manifest/dist lifecycle)
+- [x] endurecer mapeo HTTP de errores:
+  - `RUNTIME_NOT_FOUND`
+  - `RUNTIME_VERSION_NOT_FOUND`
+  - `RUNTIME_IN_USE`
+  - `RUNTIME_HAS_DEPENDENTS`
+  - `RUNTIME_CURRENT_CONFLICT`
+  - `BUSY`
+  - `RUNTIME_REMOVE_FAILED`
+- [x] implementar lock secuencial de lifecycle manifest/dist en motherbee
+- [x] definir cómo se resuelve `RUNTIME_IN_USE`
+  - fuente: inventario global
+  - criterio: nodos `RUNNING`
+  - incluir version exacta, no sólo nombre de runtime
+- [x] definir cómo se resuelve `RUNTIME_HAS_DEPENDENTS`
+  - fuente: manifest/runtime catalog
+  - criterio: runtimes publicados con `runtime_base=<runtime>`
+- [x] agregar E2E de paridad HTTP/socket para remove runtime version
+- [x] agregar E2E negativos básicos:
+  - borrar runtime en uso
+  - borrar base runtime con dependientes
+  - borrar versión inexistente
+  - borrar `current`
+- [x] cubrir `BUSY` de lifecycle lock
+  - test interno determinista en `SY.orchestrator`
+  - nota: no es observable hoy por HTTP porque `SY.admin` serializa commands y `SY.orchestrator` procesa admin actions secuencialmente
+
+Estado actual de implementación:
+- `GET /hives/{hive}/runtimes/{runtime}` ya expone:
+  - `usage` local visible
+  - `usage_global_visible` agregado por control-plane
+- `DELETE /hives/{hive}/runtimes/{runtime}/versions/{version}` ya:
+  - corre sólo en `motherbee`
+  - rechaza `current`
+  - rechaza si hay `RUNNING` visible para esa versión
+  - rechaza si el runtime tiene dependientes `config_only`/`workflow`
+  - muta manifest + `dist` con lock de lifecycle y rollback local básico si falla la escritura del manifest
+- Script E2E/negativos agregado:
+  - `scripts/admin_runtime_delete_e2e.sh`
+  - cubre `ok`, `RUNTIME_CURRENT_CONFLICT`, `RUNTIME_VERSION_NOT_FOUND`, `RUNTIME_IN_USE`, `RUNTIME_HAS_DEPENDENTS`
+  - incluye paridad HTTP/socket para `remove_runtime_version`
+- Cobertura interna adicional:
+  - `remove_runtime_version_flow_returns_busy_when_lifecycle_lock_is_held`
+  - justificación: `BUSY` no emerge por HTTP en la arquitectura actual porque el path `SY.admin -> SY.orchestrator` ya serializa las operaciones antes del lifecycle lock
+
+## Matriz operativa - CORE/CUSTOM x singleton/instanciado
+
+Cruce pedido para ordenar el modelo real del sistema.
+
+Ejes:
+- Tipo de ejecutable:
+  - `CORE`: ejecutables del sistema/OS (`RT.*`, `SY.*`, bootstrap del hive, servicios base)
+  - `CUSTOM`: runtimes externos publicados en `dist` e integrados para correr bajo control de Fluxbee
+- Modo de ejecución:
+  - `singleton`: una única instancia por rol/nombre esperado
+  - `instanciado`: mismo ejecutable/runtime corriendo varias veces con distintos `node_name`
+
+### Estado actual por caso
+
+| Caso | Estado actual | Qué ya está resuelto | Qué sigue abierto |
+|------|---------------|----------------------|-------------------|
+| `CORE + singleton` | **Mayormente resuelto** | bootstrap escribe units persistentes en `/etc/systemd/system`, hace `daemon-reload`, habilita y arranca bootstrap units; `SYSTEM_UPDATE` cubre rollout core | terminar de dejar explícita la semántica completa de lifecycle REST para core cuando corresponda |
+| `CORE + instanciado` | **Resuelto para v1 con excepción explícita** | `run_node` rechaza `SY.*` y `RT.gateway`; `RT.<otro>` se permite como runtime gestionado publicado | revisar sólo si en el futuro se quiere modelar más core por este camino |
+| `CUSTOM + singleton` | **Mayormente resuelto** | package `full_runtime/config_only/workflow`, publish/install, `--deploy`, readiness, spawn, config persistida, inventario de instancias, `remove` real de instancia, reboot/reconcile validado E2E | cleanup documental y decisión separada sobre `CORE + instanciado` |
+| `CUSTOM + instanciado` | **Mayormente resuelto** | runtime único con múltiples `node_name`, `config.json` por instancia, `_system` inyectado, `kill_node/get_node_*` por nombre, inventario persistente, remove real, reboot/reconcile validado E2E | cleanup documental y reglas finas si aparece algún caso borde |
+
+### Hallazgos concretos de código
+
+- `GET /hives/{hive}/nodes` ya devuelve inventario de instancias gestionadas persistidas leyendo `/var/lib/fluxbee/nodes/**/config.json` y calculando lifecycle local; para hive remoto hace forward al orchestrator remoto.
+- `POST /hives/{hive}/nodes` persiste `config.json` en `/var/lib/fluxbee/nodes/<KIND>/<node@hive>/config.json` y hace spawn fail-closed si ya existe.
+- `DELETE /hives/{hive}/nodes/{name}` termina en `kill_node`, que afecta el proceso/unit pero no borra la instancia persistida.
+- `DELETE /hives/{hive}/nodes/{name}/instance` borra la instancia persistida local y libera el `node_name`.
+- El spawn de nodos gestionados usa `systemd-run --collect`, o sea unit transitorio.
+- El reboot/autostart de workloads `CUSTOM` quedó implementado como reconcile al arranque del orchestrator, opt-in por `_system.relaunch_on_boot=true`.
+
+### Tres conceptos que deben quedar separados
+
+- `runtime publicado/instalado`
+  - artifact publicado en `dist`, versionado en `manifest.json`, visible en `/versions` y `/hives/{hive}/runtimes`
+  - ejemplo: `ai.test.gov.reboot.1773959170@1.0.0-rebootreconcile-1773959170-5980`
+  - ownership: `motherbee`
+  - converge por Syncthing
+  - no implica por sí mismo un proceso corriendo
+
+- `instancia gestionada persistida`
+  - entidad local del hive representada por `config.json` bajo `/var/lib/fluxbee/nodes/<KIND>/<node_name@hive>/`
+  - ejemplo: `/var/lib/fluxbee/nodes/AI/AI.frontdesk.gov@motherbee/config.json`
+  - visible en `GET /hives/{hive}/nodes`
+  - puede existir aunque el proceso esté parado
+  - ownership: orchestrator local del hive
+
+- `proceso conectado/vivo`
+  - ejecución actual del nodo, observable por systemd + router/LSA
+  - se expresa como `RUNNING/STARTING/STOPPED/FAILED` y `visible_in_router`
+  - puede caer y volver sin que desaparezca la instancia persistida
+  - no es equivalente a “runtime publicado” ni a “instancia existente”
+
+Contrato operativo resumido:
+- publicar/instalar runtime crea catálogo en `dist`
+- `run_node` crea o reutiliza instancia persistida y lanza proceso
+- `kill_node` afecta el proceso, no la instancia persistida
+- `DELETE /nodes/{name}/instance` borra la instancia persistida
+- reboot/reconcile parte de la instancia persistida, no del proceso ni del catálogo solo
+
+Nota adicional:
+- el prefijo funcional del nodo (`AI.*`, `IO.*`, `WF.*`, `SY.*`, `RT.*`) no equivale por sí mismo a la clasificación de lifecycle (`core` vs runtime gestionado)
+- para v1, el corte operativo es:
+  - `SY.*` y `RT.gateway` fuera de spawn gestionado
+  - `AI.*`, `IO.*`, `WF.*` y `RT.<otro>` permitidos como runtimes gestionados publicados
+
+### Tareas nuevas derivadas de esta matriz
+
+Revisión 2026-03-19:
+- Esta lista sigue vigente.
+- No quedó vieja, pero ya no mezcla el frente de lifecycle de runtimes por REST, que quedó resuelto arriba.
+- Lo que queda acá es el siguiente frente real: inventario persistente de instancias, remove real de instancia y persistencia/reconcile post-reboot para workloads custom.
+
+- [x] Definir contrato de producto para `CORE + instanciado`.
+  - decisión v1:
+    - `SY.*` queda fuera de scope de spawn gestionado
+    - `RT.gateway` queda fuera de scope de spawn gestionado
+    - `RT.<otro>` queda permitido y se trata como runtime gestionado publicado, igual que `AI/IO/WF`
+  - rationale:
+    - protege control-plane y gateway base del hive
+    - deja abierta la posibilidad de modelar componentes de comunicación especializados como parte de la carga del sistema
+    - evita inventar una clase separada de lifecycle para `RT.<otro>` en v1
+
+- [x] Implementar inventario de instancias gestionadas persistidas.
+  - Ya no depende sólo de SHM/router.
+  - `GET /hives/{hive}/nodes` pasó a semántica de instancias gestionadas persistidas.
+  - Lista lo que existe en `/var/lib/fluxbee/nodes/.../config.json`, aun si el proceso no está conectado.
+  - Remoto: forward al orchestrator del hive target.
+
+- [x] Separar lifecycle de instancia: `stop/kill` vs `remove`.
+  - `kill_node` sigue siendo stop del proceso/unit.
+  - operación canónica nueva para borrar la instancia persistida: `DELETE /hives/{hive}/nodes/{name}/instance`
+  - borra `config.json`, `state.json`, `status_version`, `status_fingerprint` y el directorio de instancia
+  - libera el `node_name`
+  - rechaza si la instancia sigue `RUNNING`/visible (`NODE_INSTANCE_RUNNING`)
+
+- [x] Cerrar el contrato de persistencia post-reboot para workloads `CUSTOM`.
+  - modelo elegido: reconcile/autostart desde `SY.orchestrator` al arranque leyendo `/var/lib/fluxbee/nodes/**/config.json`
+  - implementado:
+    - scan de instancias persistidas
+    - salto explícito de `SY.*` y `RT.gateway`
+    - relaunch de instancias `CUSTOM` caídas si tienen `runtime` + `runtime_version` válidos, no están activas/visibles y `_system.relaunch_on_boot=true`
+  - contrato de bootstrap de nombre para runtimes gestionados:
+    - `SY.orchestrator` debe pasar el nombre canónico de la instancia al proceso al momento del spawn/relaunch
+    - forma elegida para v1: variable de entorno `FLUXBEE_NODE_NAME=<node_name@hive>`
+    - no se requiere `FLUXBEE_NODE_CONFIG` como contrato obligatorio en v1
+    - el runtime debe poder derivar su `config.json` desde `FLUXBEE_NODE_NAME` usando el layout canónico:
+      - `/var/lib/fluxbee/nodes/<KIND>/<node_name@hive>/config.json`
+    - `_system.node_name` dentro de `config.json` sigue siendo la fuente de verdad persistida
+    - `FLUXBEE_NODE_NAME` es el dato de bootstrap para que el proceso llegue a esa persistencia al arrancar
+    - el reconcile de reboot/autostart es opt-in por `_system.relaunch_on_boot=true`
+  - rationale del contrato:
+    - evita duplicar dos referencias (`NODE_NAME` + `NODE_CONFIG`) que podrían divergir
+    - evita depender de parsing de argumentos en todos los `start.sh`
+    - calza bien con `systemd-run --setenv=...`
+    - mantiene el cambio concentrado en `SY.orchestrator`, no en cada runtime individual
+    - evita relanzar basura histórica persistida de pruebas viejas que no fue creada bajo el contrato nuevo
+  - validado:
+    - E2E real post-reboot con `scripts/custom_node_reboot_reconcile_e2e.sh`
+    - secuencia validada en entorno real:
+      - publish -> spawn -> kill -> wait invisible -> restart `sy-orchestrator` -> relaunch -> probe real con `IO.test`
+    - el script toma por default `government.identity_frontdesk` desde `hive.yaml` para que el destino del `Resolve` coincida con el frontdesk efectivo del router
+  - ya implementado además:
+    - `SY.orchestrator` inyecta `FLUXBEE_NODE_NAME` en spawn y relaunch
+    - helper compartido en SDK:
+      - `fluxbee_sdk::managed_node_name(...)`
+      - `fluxbee_sdk::managed_node_config_path(...)`
+    - endurecer reglas finas de elegibilidad si aparece algún caso borde
+
+- [x] Agregar E2E específico de reboot semantics para workloads custom.
+  - cubierto por `scripts/custom_node_reboot_reconcile_e2e.sh`
+  - validado:
+    - relaunch automático si corresponde
+    - respuesta correcta de `GET /nodes`, `/config`, `/status`
+    - probe real posterior con `IO.test`
+    - `handled_by=<government.identity_frontdesk>`
+
+- [x] Alinear documentación para separar tres conceptos que hoy se mezclan:
+  - runtime instalado/publicado
+  - instancia gestionada persistida
+  - proceso conectado/vivo en router
+  - definiciones y contrato operativo resumido asentados en este documento
+
 ## Seguimiento
 - [x] Registrar mapeo final de endpoints por ownership:
   - `SY.config.routes`
@@ -187,7 +471,8 @@ Caso manual adicional:
 
 Contrato actual:
 - `/hives/{id}/routers*` no existe en `SY.admin` (debe devolver `404`).
-- El control canónico para entidades `RT.*` es vía `/hives/{id}/nodes` (`SPAWN_NODE`/`KILL_NODE`), sujeto a disponibilidad de runtime/contrato operativo del router.
+- El control canónico para entidades `RT.<otro>` es vía `/hives/{id}/nodes` (`SPAWN_NODE`/`KILL_NODE`), sujeto a disponibilidad de runtime publicado.
+- `RT.gateway` queda fuera de scope de spawn gestionado en v1.
 
 ## 4) Node remoto por hive
 

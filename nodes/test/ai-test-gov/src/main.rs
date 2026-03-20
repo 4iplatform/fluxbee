@@ -95,8 +95,9 @@ fn src_ilk_from_meta(meta: &Meta) -> Option<String> {
 }
 
 fn build_node_config(default_name: &str, default_version: &str, prefix: &str) -> NodeConfig {
+    let node_name_env = format!("{prefix}_NODE_NAME");
     NodeConfig {
-        name: env_or(&format!("{prefix}_NODE_NAME"), default_name),
+        name: fluxbee_sdk::managed_node_name(default_name, &[node_name_env.as_str()]),
         router_socket: PathBuf::from(env_or(
             &format!("{prefix}_ROUTER_SOCKET_DIR"),
             "/var/run/fluxbee/routers",

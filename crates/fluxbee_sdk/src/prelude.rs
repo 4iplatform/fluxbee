@@ -20,5 +20,10 @@ pub use crate::identity::{
     MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_REGISTER, MSG_ILK_UPDATE, MSG_TNT_APPROVE,
     MSG_TNT_CREATE,
 };
+pub use crate::managed_node::{
+    managed_node_config_path, managed_node_config_path_with_root, managed_node_instance_dir,
+    managed_node_instance_dir_with_root, managed_node_name, ManagedNodeError,
+    DEFAULT_MANAGED_NODE_ROOT, FLUXBEE_NODE_NAME_ENV,
+};
 pub use crate::payload::{PayloadError, TextV1Payload, TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES};
 pub use crate::status::try_handle_default_node_status;

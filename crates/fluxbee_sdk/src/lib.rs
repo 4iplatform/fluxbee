@@ -3,6 +3,7 @@ pub mod blob;
 pub mod client_config;
 pub mod comm;
 pub mod identity;
+pub mod managed_node;
 pub mod nats;
 #[cfg(unix)]
 pub mod node_client;
@@ -28,6 +29,11 @@ pub use identity::{
     IdentitySystemResult, IlkProvisionRequest, IlkProvisionResult, MSG_IDENTITY_METRICS,
     MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_REGISTER, MSG_ILK_UPDATE, MSG_TNT_APPROVE,
     MSG_TNT_CREATE,
+};
+pub use managed_node::{
+    managed_node_config_path, managed_node_config_path_with_root, managed_node_instance_dir,
+    managed_node_instance_dir_with_root, managed_node_name, ManagedNodeError,
+    DEFAULT_MANAGED_NODE_ROOT, FLUXBEE_NODE_NAME_ENV,
 };
 pub use node_client::{connect, connect_with_client_config, NodeConfig, NodeError, NodeUuidMode};
 pub use split::{NodeReceiver, NodeSender};
