@@ -2147,6 +2147,7 @@ fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocu
     };
 
     EffectiveConfigDocument {
+        tenant_id: None,
         node: Some(EffectiveNodeSection {
             name: Some(cfg.node.name.clone()),
             version: Some(cfg.node.version.clone()),
