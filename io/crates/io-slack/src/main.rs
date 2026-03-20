@@ -479,7 +479,7 @@ struct SocketEnvelope {
 }
 
 async fn run_inbound_socket_mode(
-    _config: Config,
+    config: Config,
     sender: NodeSender,
     slack: Arc<SlackClients>,
     identity: Arc<dyn IdentityResolver>,
@@ -607,6 +607,7 @@ async fn run_inbound_socket_mode(
             if let Some(sessionizer) = &sessionizer {
                 sessionizer
                     .handle_event(
+                        &config.node_name,
                         sender.clone(),
                         identity.clone(),
                         provisioner.clone(),
@@ -645,7 +646,7 @@ async fn run_inbound_socket_mode(
                     Some(provisioner.as_ref()),
                     ResolveOrCreateInput {
                         channel: "slack".to_string(),
-                        external_id: user.to_string(),
+                        external_id: slack_external_id(&config.node_name, &user),
                         tenant_hint: Some(team_id.to_string()),
                         attributes: serde_json::json!({ "team_id": team_id }),
                     },
@@ -709,6 +710,7 @@ impl SlackSessionizer {
 
     async fn handle_event(
         self: &Arc<Self>,
+        node_name: &str,
         sender: NodeSender,
         identity: Arc<dyn IdentityResolver>,
         provisioner: Arc<dyn IdentityProvisioner>,
@@ -731,6 +733,7 @@ impl SlackSessionizer {
                 drop(sessions);
                 tracing::warn!(%key, "session buffer full; sending message immediately");
                 self.send_one(
+                    node_name,
                     sender,
                     identity,
                     provisioner,
@@ -754,7 +757,7 @@ impl SlackSessionizer {
                 io_ctx: slack_inbound_io_context(team_id, user, channel, thread_ts, message_id),
                 identity_input: ResolveOrCreateInput {
                     channel: "slack".to_string(),
-                    external_id: user.to_string(),
+                    external_id: slack_external_id(node_name, user),
                     tenant_hint: Some(team_id.to_string()),
                     attributes: serde_json::json!({ "team_id": team_id }),
                 },
@@ -872,6 +875,7 @@ impl SlackSessionizer {
 
     async fn send_one(
         &self,
+        node_name: &str,
         sender: NodeSender,
         identity: Arc<dyn IdentityResolver>,
         provisioner: Arc<dyn IdentityProvisioner>,
@@ -899,7 +903,7 @@ impl SlackSessionizer {
                 Some(provisioner.as_ref()),
                 ResolveOrCreateInput {
                     channel: "slack".to_string(),
-                    external_id: user.to_string(),
+                    external_id: slack_external_id(node_name, user),
                     tenant_hint: Some(team_id.to_string()),
                     attributes: serde_json::json!({ "team_id": team_id }),
                 },
@@ -918,6 +922,10 @@ impl SlackSessionizer {
             }
         }
     }
+}
+
+fn slack_external_id(node_name: &str, user_id: &str) -> String {
+    format!("{node_name}:{user_id}")
 }
 
 async fn run_outbound_loop(inbox: Arc<Mutex<RouterInbox>>, slack: Arc<SlackClients>) -> Result<()> {
