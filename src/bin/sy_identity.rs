@@ -76,9 +76,17 @@ struct HiveFile {
     #[serde(default)]
     wan: Option<WanSection>,
     #[serde(default)]
+    government: Option<GovernmentSection>,
+    #[serde(default)]
     identity: Option<IdentitySection>,
     #[serde(default)]
     database: Option<DatabaseSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GovernmentSection {
+    #[serde(default)]
+    identity_frontdesk: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -828,6 +836,20 @@ impl IdentityRuntime {
         bootstrap.insert(format!("SY.identity@{}", hive.hive_id));
         allowed_exacts.insert(MSG_ILK_REGISTER, bootstrap.clone());
         allowed_exacts.insert(MSG_ILK_UPDATE, bootstrap);
+        if let Some(frontdesk_node) = configured_identity_frontdesk_node_name(hive) {
+            allowed_exacts
+                .entry(MSG_ILK_REGISTER)
+                .or_default()
+                .insert(frontdesk_node.clone());
+            allowed_exacts
+                .entry(MSG_ILK_ADD_CHANNEL)
+                .or_default()
+                .insert(frontdesk_node.clone());
+            allowed_exacts
+                .entry(MSG_TNT_CREATE)
+                .or_default()
+                .insert(frontdesk_node);
+        }
 
         let default_tenant = hive
             .identity
@@ -1442,6 +1464,21 @@ impl IdentityRuntime {
             .read_snapshot()
             .ok_or_else(|| "lsa shm snapshot unavailable".into())
     }
+}
+
+fn configured_identity_frontdesk_node_name(hive: &HiveFile) -> Option<String> {
+    hive.government
+        .as_ref()
+        .and_then(|government| government.identity_frontdesk.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.contains('@') {
+                value.to_string()
+            } else {
+                format!("{value}@{}", hive.hive_id)
+            }
+        })
 }
 
 fn authorized_name_variants(name: &str) -> Vec<String> {
@@ -3456,4 +3493,50 @@ fn is_mother_role(role: Option<&str>) -> bool {
 
 fn is_worker_role(role: Option<&str>) -> bool {
     matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "worker")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_hive(identity_frontdesk: Option<&str>) -> HiveFile {
+        HiveFile {
+            hive_id: "motherbee".to_string(),
+            role: Some("motherbee".to_string()),
+            wan: None,
+            government: Some(GovernmentSection {
+                identity_frontdesk: identity_frontdesk.map(str::to_string),
+            }),
+            identity: None,
+            database: None,
+        }
+    }
+
+    #[test]
+    fn configured_identity_frontdesk_node_name_normalizes_local_name() {
+        let hive = test_hive(Some("AI.frontdesk.gov"));
+        assert_eq!(
+            configured_identity_frontdesk_node_name(&hive).as_deref(),
+            Some("AI.frontdesk.gov@motherbee")
+        );
+    }
+
+    #[test]
+    fn identity_runtime_authorizes_configured_frontdesk_exact_name() {
+        let hive = test_hive(Some("AI.frontdesk.gov@motherbee"));
+        let runtime = IdentityRuntime::new(&hive, PathBuf::from("/tmp"), true, None);
+
+        assert!(runtime.is_authorized(
+            MSG_ILK_REGISTER,
+            Some("AI.frontdesk.gov@motherbee")
+        ));
+        assert!(runtime.is_authorized(
+            MSG_ILK_ADD_CHANNEL,
+            Some("AI.frontdesk.gov@motherbee")
+        ));
+        assert!(runtime.is_authorized(
+            MSG_TNT_CREATE,
+            Some("AI.frontdesk.gov@motherbee")
+        ));
+    }
 }
