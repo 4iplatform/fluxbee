@@ -91,7 +91,7 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 | `msg` | string | Sí si type=system | Tipo de mensaje de sistema (ej: `"HELLO"`, `"LSA"`) |
 | `scope` | string | No | Alcance VPN para broadcast/multicast: `"vpn"` (default) o `"global"` (solo system) |
 | `target` | string | Opcional | Hint/namespace opcional para OPA o filtro de broadcast (nombre L2, patrón o clave de policy) |
-| `src_ilk` | string | Sí (L3) | ILK del interlocutor que envía. OPA deriva tenant via `data.identity` |
+| `src_ilk` | string | Sí (L3) | ILK del interlocutor que envía. OPA deriva tenant via `data.identity`, actualizado desde SHM de identity en cada `Resolve` |
 | `dst_ilk` | string | No | ILK del interlocutor destino (si se conoce) |
 | `ich` | string | Sí (L3) | ICH (Interlocutor Channel) por el cual se comunica |
 | `ctx` | string | Sí (L3) | Context ID. Calculado: `hash(src_ilk + ich)` |
@@ -104,6 +104,7 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 
 Nota de contrato:
 - el campo canónico de L3 para identity routing es `meta.src_ilk`
+- en `Destination::Resolve`, el router evalúa OPA con identidad fresca desde SHM (`data.identity`, `data.identity_aliases`); no depende de `OPA_RELOAD` para refrescar estados dinámicos como `temporary/complete`
 
 **Regla:** si `type="system"` y `scope="global"`, el router ignora el filtro de VPN para broadcast/multicast.
 

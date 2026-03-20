@@ -3788,42 +3788,40 @@ async fn resolve_target_with_identity(
         identity_frontdesk_node_name = %identity_frontdesk_node_name,
         "router starting identity-aware resolve"
     );
-    if src_ilk.is_none() {
-        let mut guard = opa.lock().await;
-        return guard.resolve_target(&msg_for_opa);
-    }
+    let mut dynamic_opa_data: Option<serde_json::Value> = None;
     match read_identity_snapshot(hive_id) {
         Ok(snapshot) => {
-        let now_ms = now_epoch_ms();
-        let registration_status = src_ilk.as_deref().and_then(|src_ilk| {
-            let (_, status) = canonicalize_src_ilk_and_status(&snapshot, src_ilk, now_ms);
-            status
-        });
-        if let Some(forced_target) = apply_identity_pre_resolve(
-            &mut msg_for_opa,
-            identity_frontdesk_node_name,
-            &snapshot,
-            now_ms,
-        ) {
-            tracing::info!(
-                trace_id = %msg.routing.trace_id,
-                src_ilk = ?src_ilk,
-                registration_status = ?registration_status,
-                forced_target = %forced_target,
-                elapsed_us = resolve_started.elapsed().as_micros() as u64,
-                "identity pre-resolve forced frontdesk target"
-            );
-            return Ok(Some(forced_target));
-        }
-        if src_ilk.is_some() {
-            tracing::info!(
-                trace_id = %msg.routing.trace_id,
-                src_ilk = ?src_ilk,
-                registration_status = ?registration_status,
-                elapsed_us = resolve_started.elapsed().as_micros() as u64,
-                "identity pre-resolve did not force target"
-            );
-        }
+            dynamic_opa_data = Some(build_dynamic_identity_opa_data(&snapshot));
+            let now_ms = now_epoch_ms();
+            let registration_status = src_ilk.as_deref().and_then(|src_ilk| {
+                let (_, status) = canonicalize_src_ilk_and_status(&snapshot, src_ilk, now_ms);
+                status
+            });
+            if let Some(forced_target) = apply_identity_pre_resolve(
+                &mut msg_for_opa,
+                identity_frontdesk_node_name,
+                &snapshot,
+                now_ms,
+            ) {
+                tracing::info!(
+                    trace_id = %msg.routing.trace_id,
+                    src_ilk = ?src_ilk,
+                    registration_status = ?registration_status,
+                    forced_target = %forced_target,
+                    elapsed_us = resolve_started.elapsed().as_micros() as u64,
+                    "identity pre-resolve forced frontdesk target"
+                );
+                return Ok(Some(forced_target));
+            }
+            if src_ilk.is_some() {
+                tracing::info!(
+                    trace_id = %msg.routing.trace_id,
+                    src_ilk = ?src_ilk,
+                    registration_status = ?registration_status,
+                    elapsed_us = resolve_started.elapsed().as_micros() as u64,
+                    "identity pre-resolve did not force target"
+                );
+            }
         }
         Err(err) if src_ilk.is_some() => {
             tracing::warn!(
@@ -3838,7 +3836,7 @@ async fn resolve_target_with_identity(
         Err(_) => {}
     }
     let mut guard = opa.lock().await;
-    guard.resolve_target(&msg_for_opa)
+    guard.resolve_target_with_data(&msg_for_opa, dynamic_opa_data.as_ref())
 }
 
 fn apply_identity_pre_resolve(
@@ -3973,6 +3971,14 @@ fn inject_identity_data(root: &mut serde_json::Value, snapshot: &crate::shm::Ide
         "identity_aliases".to_string(),
         serde_json::Value::Object(alias_obj),
     );
+}
+
+fn build_dynamic_identity_opa_data(
+    snapshot: &crate::shm::IdentitySnapshot,
+) -> serde_json::Value {
+    let mut root = serde_json::json!({});
+    inject_identity_data(&mut root, snapshot);
+    root
 }
 
 fn fixed_str(buf: &[u8]) -> String {
