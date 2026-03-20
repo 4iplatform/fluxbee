@@ -17,9 +17,9 @@ Required:
 
 Options:
   --mode <default|gov>         Default AI_NODE_MODE embedded in runtime start.sh (default: default)
-  --forced-node-name <name>    Pass-through to publish-ia-runtime.sh (forces bootstrap node name in start.sh)
+  --forced-node-name <name>    Pass-through to publish-ia-runtime.sh (deprecated emergency override)
   --forced-dynamic-config-dir <path>
-                               Pass-through to publish-ia-runtime.sh (forces bootstrap dynamic config dir)
+                               Pass-through to publish-ia-runtime.sh (deprecated emergency override)
   --node-name <name@hive>      If provided, script also spawns/restarts node
   --tenant-id <tnt:...>        Tenant ID for identity registration (payload + config fallback)
   --runtime-version <ver>      Runtime version for spawn payload (default: current)

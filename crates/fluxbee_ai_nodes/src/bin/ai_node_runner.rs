@@ -15,6 +15,7 @@ use fluxbee_ai_sdk::{
     RouterClient, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
 };
 use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
+use fluxbee_sdk::{managed_node_config_path, managed_node_name};
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{Destination, Meta, Routing, SYSTEM_KIND, MSG_TTL_EXCEEDED, MSG_UNREACHABLE};
 use fluxbee_sdk::MSG_ILK_REGISTER;
@@ -1612,6 +1613,11 @@ async fn run_unconfigured_bootstrap(
     let dynamic_dir = PathBuf::from(node.dynamic_config_dir.clone());
     let thread_state_store = init_thread_state_store(&node_name, &dynamic_dir).await;
     let persisted_dynamic = load_persisted_dynamic_config(&dynamic_dir, &node_name);
+    let spawn_effective = if persisted_dynamic.is_none() {
+        load_effective_config_from_spawn(&node_name)
+    } else {
+        None
+    };
     let (behavior, state) = match persisted_dynamic.as_ref() {
         Some(stored) => {
             let materialized = materialize_effective_defaults(&node_name, stored.config.clone());
@@ -1655,16 +1661,75 @@ async fn run_unconfigured_bootstrap(
                 )
             }
         }},
-        None => (
-            None,
-            ControlPlaneState {
-                current_state: NodeLifecycleState::Unconfigured,
-                config_source: "none",
-                effective_config: None,
-                schema_version: 0,
-                config_version: 0,
-            },
-        ),
+        None => {
+            if let Some(spawn_cfg) = spawn_effective {
+                match build_behavior_from_effective_config(&spawn_cfg.config) {
+                    Ok(behavior) => {
+                        tracing::info!(
+                            node_name = %node_name,
+                            path = %spawn_cfg.path.display(),
+                            "loaded spawn config at bootstrap"
+                        );
+                        if let Err(err) = persist_dynamic_config(
+                            &dynamic_dir,
+                            &node_name,
+                            spawn_cfg.schema_version,
+                            spawn_cfg.config_version,
+                            &spawn_cfg.config,
+                        ) {
+                            tracing::warn!(
+                                node_name = %node_name,
+                                error = %err,
+                                "failed to persist bootstrap config from spawn file"
+                            );
+                        }
+                        (
+                            Some(behavior),
+                            ControlPlaneState {
+                                current_state: NodeLifecycleState::Configured,
+                                config_source: "spawn",
+                                effective_config: Some(
+                                    serde_json::to_value(spawn_cfg.config).unwrap_or(Value::Null),
+                                ),
+                                schema_version: spawn_cfg.schema_version,
+                                config_version: spawn_cfg.config_version,
+                            },
+                        )
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            node_name = %node_name,
+                            path = %spawn_cfg.path.display(),
+                            error = %err,
+                            "spawn config exists but is invalid for AI effective config"
+                        );
+                        (
+                            None,
+                            ControlPlaneState {
+                                current_state: NodeLifecycleState::FailedConfig,
+                                config_source: "spawn",
+                                effective_config: Some(
+                                    serde_json::to_value(spawn_cfg.config).unwrap_or(Value::Null),
+                                ),
+                                schema_version: spawn_cfg.schema_version,
+                                config_version: spawn_cfg.config_version,
+                            },
+                        )
+                    }
+                }
+            } else {
+                (
+                    None,
+                    ControlPlaneState {
+                        current_state: NodeLifecycleState::Unconfigured,
+                        config_source: "none",
+                        effective_config: None,
+                        schema_version: 0,
+                        config_version: 0,
+                    },
+                )
+            }
+        }
     };
 
     let ai_node_config = AiNodeConfig {
@@ -1832,13 +1897,16 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
 fn bootstrap_node_from_args(
     args: &BootstrapArgs,
 ) -> Result<NodeSection, Box<dyn std::error::Error + Send + Sync>> {
-    let name = args
-        .node_name
-        .clone()
-        .or_else(|| std::env::var("AI_NODE_NAME").ok())
-        .ok_or_else(|| {
-            "when no --config is provided, pass --node-name (or AI_NODE_NAME env var)".to_string()
-        })?;
+    let name = args.node_name.clone().or_else(|| {
+        let resolved = managed_node_name("", &["AI_NODE_NAME", "NODE_NAME"]);
+        if resolved.trim().is_empty() {
+            None
+        } else {
+            Some(resolved)
+        }
+    }).ok_or_else(|| {
+        "when no --config is provided, pass --node-name (or FLUXBEE_NODE_NAME/AI_NODE_NAME env var)".to_string()
+    })?;
     Ok(NodeSection {
         name,
         version: args
@@ -2201,6 +2269,43 @@ fn parse_effective_config_doc(
     config: &Value,
 ) -> Result<EffectiveConfigDocument, Box<dyn std::error::Error + Send + Sync>> {
     Ok(serde_json::from_value::<EffectiveConfigDocument>(config.clone())?)
+}
+
+#[derive(Debug)]
+struct SpawnEffectiveConfig {
+    path: PathBuf,
+    schema_version: u32,
+    config_version: u64,
+    config: EffectiveConfigDocument,
+}
+
+fn load_effective_config_from_spawn(node_name: &str) -> Option<SpawnEffectiveConfig> {
+    let path = managed_node_config_path(node_name).ok()?;
+    let raw = fs::read_to_string(&path).ok()?;
+    let root: Value = serde_json::from_str(&raw).ok()?;
+    let schema_version = root
+        .get("_system")
+        .and_then(|v| v.get("config_version"))
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(1);
+    let config_version = root
+        .get("_system")
+        .and_then(|v| v.get("updated_at_ms"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let mut candidate = root.get("config").cloned().unwrap_or(root);
+    if let Some(obj) = candidate.as_object_mut() {
+        obj.remove("_system");
+    }
+    let parsed = parse_effective_config_doc(&candidate).ok()?;
+    let config = materialize_effective_defaults(node_name, parsed);
+    Some(SpawnEffectiveConfig {
+        path,
+        schema_version,
+        config_version,
+        config,
+    })
 }
 
 fn materialize_effective_defaults(

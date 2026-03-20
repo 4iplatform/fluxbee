@@ -17,9 +17,9 @@ Options:
   --binary <path>          Binary path (default: target/release/ai_node_runner)
   --dist-root <path>       Dist root (default: /var/lib/fluxbee/dist)
   --mode <default|gov>     Default AI_NODE_MODE for published start.sh (default: default)
-  --forced-node-name <n>   Force --node-name in start.sh when AI_NODE_NAME is missing
+  --forced-node-name <n>   Deprecated emergency override for --node-name in start.sh
   --forced-dynamic-config-dir <p>
-                            Force --dynamic-config-dir in start.sh when AI_DYNAMIC_CONFIG_DIR is missing
+                            Deprecated emergency override for --dynamic-config-dir in start.sh
   --set-current            Set current version in manifest
   --sudo                   Use sudo for writes
   --skip-build             Skip cargo build
@@ -138,8 +138,14 @@ tmp_start="$(mktemp)"
 cat >"$tmp_start" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ -n "\${FLUXBEE_NODE_NAME:-}" && -z "\${AI_NODE_NAME:-}" ]]; then
+  export AI_NODE_NAME="\${FLUXBEE_NODE_NAME}"
+fi
 if [[ -n "\${NODE_NAME:-}" && -z "\${AI_NODE_NAME:-}" ]]; then
   export AI_NODE_NAME="\${NODE_NAME}"
+fi
+if [[ -n "\${AI_NODE_NAME:-}" && -z "\${FLUXBEE_NODE_NAME:-}" ]]; then
+  export FLUXBEE_NODE_NAME="\${AI_NODE_NAME}"
 fi
 if [[ -n "\${ROUTER_SOCKET:-}" && -z "\${AI_ROUTER_SOCKET:-}" ]]; then
   export AI_ROUTER_SOCKET="\${ROUTER_SOCKET}"

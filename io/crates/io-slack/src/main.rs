@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
-use fluxbee_sdk::{connect, NodeConfig, NodeSender, NodeUuidMode};
+use fluxbee_sdk::{
+    connect, managed_node_config_path, managed_node_name, NodeConfig, NodeSender, NodeUuidMode,
+};
 use futures_util::{SinkExt, StreamExt};
 use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
 use io_common::identity::{
@@ -19,10 +21,6 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use url::Url;
-
-// TEMPORARY WORKAROUND (remove once core spawn contract injects NODE_CONFIG_PATH/NODE_NAME/ISLAND_ID)
-const TEMP_FORCED_SPAWN_CONFIG_PATH: &str =
-    "/var/lib/fluxbee/nodes/IO/IO.slack.T123@motherbee/config.json";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -138,22 +136,14 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Self> {
-        let env_node_name = env("NODE_NAME").unwrap_or_else(|| "IO.slack.T123".to_string());
+        let env_node_name = managed_node_name("IO.slack.T123", &["NODE_NAME"]);
         let env_island_id = env("ISLAND_ID").unwrap_or_else(|| "local".to_string());
         let env_config_dir = PathBuf::from(
             env("CONFIG_DIR").unwrap_or_else(|| "/etc/fluxbee".to_string()),
         );
-        let forced_spawn_config_path = env("NODE_CONFIG_PATH")
-            .or_else(|| env("IO_SLACK_FORCE_CONFIG_PATH"))
-            .unwrap_or_else(|| TEMP_FORCED_SPAWN_CONFIG_PATH.to_string());
-        if env("NODE_CONFIG_PATH").is_none() {
-            tracing::warn!(
-                path = %forced_spawn_config_path,
-                "using temporary forced spawn config path; remove once orchestrator provides spawn env contract"
-            );
-        }
+        let explicit_spawn_config_path = env("NODE_CONFIG_PATH").or_else(|| env("IO_SLACK_FORCE_CONFIG_PATH"));
         let spawn_cfg = load_spawn_config(
-            Some(PathBuf::from(forced_spawn_config_path)),
+            explicit_spawn_config_path.map(PathBuf::from),
             &env_node_name,
             &env_island_id,
         );
@@ -309,17 +299,15 @@ fn load_spawn_config(
         candidates.push(path);
     }
 
-    // Canonical node-spawn path:
-    // /var/lib/fluxbee/nodes/IO/<node_name>/config.json
-    // If node_name is not fully qualified, also try "<name>@<island_id>".
-    candidates.push(PathBuf::from(format!(
-        "/var/lib/fluxbee/nodes/IO/{node_name}/config.json"
-    )));
+    // Canonical managed-node paths from SDK helper.
+    if let Ok(path) = managed_node_config_path(node_name) {
+        candidates.push(path);
+    }
     if !node_name.contains('@') && !island_id.is_empty() {
-        candidates.push(PathBuf::from(format!(
-            "/var/lib/fluxbee/nodes/IO/{}@{}/config.json",
-            node_name, island_id
-        )));
+        let fq_node_name = format!("{node_name}@{island_id}");
+        if let Ok(path) = managed_node_config_path(&fq_node_name) {
+            candidates.push(path);
+        }
     }
 
     for path in candidates {
