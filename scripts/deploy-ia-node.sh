@@ -206,7 +206,25 @@ build_spawn_config_json() {
     echo "Error: --config-json not found: $CONFIG_JSON" >&2
     exit 1
   fi
-  cat "$CONFIG_JSON"
+  CONFIG_JSON_PATH="$CONFIG_JSON" python3 - <<'PY'
+import json
+import os
+import sys
+
+path = os.environ["CONFIG_JSON_PATH"]
+try:
+    with open(path, "r", encoding="utf-8-sig") as f:
+        cfg = json.load(f)
+except Exception as e:
+    print(f"Error: invalid JSON in --config-json ({path}): {e}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(cfg, dict):
+    print(f"Error: --config-json root must be object ({path})", file=sys.stderr)
+    sys.exit(1)
+
+print(json.dumps(cfg, separators=(",", ":")))
+PY
 }
 
 require_cmd bash
@@ -327,7 +345,10 @@ spawn_cfg_json="$(build_spawn_config_json)"
 spawn_payload="$(NODE_NAME="$NODE_NAME" RUNTIME="$RUNTIME" RUNTIME_VERSION="$RUNTIME_VERSION" TENANT_ID="$TENANT_ID" SPAWN_CFG_JSON="$spawn_cfg_json" python3 - <<'PY'
 import json
 import os
-cfg = json.loads(os.environ["SPAWN_CFG_JSON"])
+raw_cfg = os.environ["SPAWN_CFG_JSON"]
+if raw_cfg.startswith("\ufeff"):
+    raw_cfg = raw_cfg.lstrip("\ufeff")
+cfg = json.loads(raw_cfg)
 tenant_id = os.environ.get("TENANT_ID", "").strip()
 if tenant_id:
     cfg.setdefault("tenant_id", tenant_id)
