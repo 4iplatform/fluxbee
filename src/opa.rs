@@ -94,10 +94,6 @@ impl OpaResolver {
     }
 
     pub fn resolve_target(&mut self, msg: &Message) -> Result<Option<String>, OpaError> {
-        let target = msg.meta.target.as_deref();
-        if target.is_none() {
-            return Ok(None);
-        }
         if !self.policy_loaded && !self.logged_missing {
             self.logged_missing = true;
             tracing::warn!("opa policy not loaded; resolver disabled");

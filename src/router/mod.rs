@@ -3788,6 +3788,10 @@ async fn resolve_target_with_identity(
         identity_frontdesk_node_name = %identity_frontdesk_node_name,
         "router starting identity-aware resolve"
     );
+    if src_ilk.is_none() {
+        let mut guard = opa.lock().await;
+        return guard.resolve_target(&msg_for_opa);
+    }
     match read_identity_snapshot(hive_id) {
         Ok(snapshot) => {
         let now_ms = now_epoch_ms();
