@@ -18,7 +18,7 @@ use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
 use fluxbee_sdk::{managed_node_config_path, managed_node_name};
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{Destination, Meta, Routing, SYSTEM_KIND, MSG_TTL_EXCEEDED, MSG_UNREACHABLE};
-use fluxbee_sdk::MSG_ILK_REGISTER;
+use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, RwLock};
@@ -1317,8 +1317,84 @@ impl FunctionTool for IlkRegisterTool {
         let tenant_hint = args.identity_candidate.tenant_hint.as_deref().map(str::trim);
         let cfg_tenant = self.default_tenant_id.as_deref().map(str::trim);
         let env_tenant = env_nonempty(GOV_IDENTITY_TENANT_ID_ENV);
-        let tenant_source = tenant_resolution_source(explicit_tenant, tenant_hint, cfg_tenant);
-        let resolved_tenant_id = resolve_tenant_id_for_register(explicit_tenant, tenant_hint, cfg_tenant);
+        let mut tenant_source = tenant_resolution_source(explicit_tenant, tenant_hint, cfg_tenant);
+        let mut resolved_tenant_id =
+            resolve_tenant_id_for_register(explicit_tenant, tenant_hint, cfg_tenant);
+
+        if resolved_tenant_id.is_none() {
+            if let Some(tenant_name) = tenant_hint.filter(|value| !value.is_empty()) {
+                tracing::info!(
+                    op = "tenant_resolve",
+                    src_ilk = %src_ilk,
+                    target = %self.identity.target,
+                    tenant_hint = %tenant_name,
+                    "tenant_id missing; attempting TNT_CREATE from tenant_hint"
+                );
+                let create_payload = json!({
+                    "name": tenant_name,
+                    "status": "active"
+                });
+                tracing::info!(
+                    op = "tenant_resolve",
+                    target = %self.identity.target,
+                    msg = %MSG_TNT_CREATE,
+                    payload = %create_payload,
+                    "sending TNT_CREATE to identity"
+                );
+                let create_result = if let Some(bridge) = &self.bridge {
+                    bridge
+                        .call_ok(&self.identity, MSG_TNT_CREATE, create_payload)
+                        .await
+                } else {
+                    Err("identity bridge not initialized".to_string())
+                };
+
+                match create_result {
+                    Ok(out) => {
+                        let created_tenant_id = out
+                            .payload
+                            .get("tenant_id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| looks_like_tenant_id(value))
+                            .map(ToString::to_string);
+                        tracing::info!(
+                            op = "tenant_resolve",
+                            trace_id = %out.trace_id,
+                            effective_target = %out.effective_target,
+                            response_payload = %out.payload,
+                            "received TNT_CREATE response from identity"
+                        );
+                        if created_tenant_id.is_none() {
+                            tracing::warn!(
+                                op = "tenant_resolve",
+                                target = %self.identity.target,
+                                response_payload = %out.payload,
+                                "TNT_CREATE response missing valid tenant_id"
+                            );
+                            return Ok(json!({
+                                "status": "error",
+                                "error_code": "invalid_tnt_create_response",
+                                "message": "TNT_CREATE response did not include a valid tenant_id",
+                                "retryable": false
+                            }));
+                        }
+                        resolved_tenant_id = created_tenant_id;
+                        tenant_source = "tnt_create";
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            op = "tenant_resolve",
+                            target = %self.identity.target,
+                            error = %err,
+                            "TNT_CREATE failed"
+                        );
+                        return Ok(identity_error_to_tool_payload(err));
+                    }
+                }
+            }
+        }
+
         let Some(tenant_id) = resolved_tenant_id else {
             tracing::warn!(
                 op = "ilk_register",
@@ -1342,7 +1418,7 @@ impl FunctionTool for IlkRegisterTool {
             op = "ilk_register",
             src_ilk = %src_ilk,
             tenant_id = %tenant_id,
-            tenant_source = tenant_source,
+            tenant_source = %tenant_source,
             target = %self.identity.target,
             has_fallback = self.identity.fallback_target.is_some(),
             "dispatching identity registration request"
@@ -1518,7 +1594,7 @@ async fn run_single_connection_runtime(
                     "ai runtime read timeout (idle)"
                 );
                 if Instant::now() >= next_metrics_log {
-                    tracing::info!(
+                    tracing::debug!(
                         read_messages,
                         idle_read_timeouts,
                         enqueued_messages = read_messages,
@@ -1582,7 +1658,7 @@ async fn run_single_connection_runtime(
         processed_messages = processed_messages.saturating_add(1);
 
         if Instant::now() >= next_metrics_log {
-            tracing::info!(
+            tracing::debug!(
                 read_messages,
                 idle_read_timeouts,
                 enqueued_messages = read_messages,
