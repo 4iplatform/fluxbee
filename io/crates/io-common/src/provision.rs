@@ -144,11 +144,24 @@ impl FluxbeeIdentityProvisioner {
             .send(req)
             .await
             .map_err(|_| IdentityError::Unavailable)?;
+        tracing::debug!(
+            trace_id = %trace_id,
+            target = %target,
+            channel = %normalized_channel,
+            address = %normalized_address,
+            "identity provision request sent"
+        );
 
         let msg = {
             let mut inbox = self.inbox.lock().await;
             inbox.recv_for_trace_id(&trace_id, self.config.timeout).await?
         };
+        tracing::debug!(
+            trace_id = %trace_id,
+            target = %target,
+            response_msg = %msg.meta.msg.as_deref().unwrap_or(""),
+            "identity provision response matched"
+        );
         parse_provision_response(msg)
     }
 }
@@ -158,8 +171,25 @@ impl IdentityProvisioner for FluxbeeIdentityProvisioner {
     async fn provision(&self, input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
         match self.call_provision_target(&self.config.target, input).await {
             Ok(src_ilk) => Ok(Some(src_ilk)),
-            Err(IdentityError::Unavailable) | Err(IdentityError::Other(_)) => Ok(None),
-            Err(IdentityError::Timeout) | Err(IdentityError::Miss) => Ok(None),
+            Err(IdentityError::Unavailable) | Err(IdentityError::Other(_)) => {
+                tracing::warn!(
+                    target = %self.config.target,
+                    channel = %input.channel,
+                    external_id = %input.external_id,
+                    "identity provision unavailable; falling back to null src_ilk"
+                );
+                Ok(None)
+            }
+            Err(IdentityError::Timeout) | Err(IdentityError::Miss) => {
+                tracing::warn!(
+                    target = %self.config.target,
+                    channel = %input.channel,
+                    external_id = %input.external_id,
+                    timeout_ms = self.config.timeout.as_millis() as u64,
+                    "identity provision timeout/miss; falling back to null src_ilk"
+                );
+                Ok(None)
+            }
         }
     }
 }

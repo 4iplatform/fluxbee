@@ -929,16 +929,34 @@ async fn run_outbound_loop(inbox: Arc<Mutex<RouterInbox>>, slack: Arc<SlackClien
             continue;
         };
 
+        let payload_type = msg.payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let meta_msg = msg.meta.msg.as_deref().unwrap_or("");
         tracing::debug!(
             trace_id = %msg.routing.trace_id,
-            payload_type = %msg.payload.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+            msg_type = %msg.meta.msg_type,
+            msg = %meta_msg,
+            payload_type = %payload_type,
             "outbound received from router"
         );
 
         let Some(meta_context) = msg.meta.context.as_ref() else {
+            tracing::debug!(
+                trace_id = %msg.routing.trace_id,
+                msg_type = %msg.meta.msg_type,
+                msg = %meta_msg,
+                payload_type = %payload_type,
+                "skipping outbound: missing meta.context"
+            );
             continue;
         };
         let Some(target) = extract_slack_post_target(meta_context) else {
+            tracing::debug!(
+                trace_id = %msg.routing.trace_id,
+                msg_type = %msg.meta.msg_type,
+                msg = %meta_msg,
+                payload_type = %payload_type,
+                "skipping outbound: missing/unsupported io.reply_target for Slack"
+            );
             continue;
         };
 

@@ -164,6 +164,9 @@ fi
 if [[ -z "\${AI_NODE_MODE:-}" ]]; then
   export AI_NODE_MODE="$MODE"
 fi
+if [[ -z "\${RUST_LOG:-}" ]]; then
+  export RUST_LOG="info,fluxbee_ai_nodes=debug,fluxbee_ai_sdk=info"
+fi
 SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 forced_node_name="${FORCED_NODE_NAME}"
 forced_dynamic_dir="${FORCED_DYNAMIC_CONFIG_DIR}"
