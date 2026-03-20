@@ -33,6 +33,7 @@ const NODE_STATUS_DEFAULT_HANDLER_ENABLED: &str = "NODE_STATUS_DEFAULT_HANDLER_E
 const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE";
 const GOV_IDENTITY_TARGET_ENV: &str = "GOV_IDENTITY_TARGET";
 const GOV_IDENTITY_TIMEOUT_MS_ENV: &str = "GOV_IDENTITY_TIMEOUT_MS";
+const GOV_IDENTITY_TENANT_ID_ENV: &str = "GOV_IDENTITY_TENANT_ID";
 
 #[derive(Debug, Deserialize)]
 struct RunnerConfig {
@@ -155,6 +156,8 @@ struct EffectiveStateFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct EffectiveConfigDocument {
+    #[serde(default)]
+    tenant_id: Option<String>,
     #[serde(default)]
     node: Option<EffectiveNodeSection>,
     #[serde(default)]
@@ -583,12 +586,15 @@ struct IlkRegisterArgs {
     src_ilk: String,
     identity_candidate: IlkRegisterIdentityCandidate,
     #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
     thread_id: Option<String>,
 }
 
 #[derive(Clone)]
 struct IlkRegisterTool {
     scoped_src_ilk: Option<String>,
+    default_tenant_id: Option<String>,
     identity: GovIdentityConfig,
     bridge: Option<Arc<GovIdentityBridge>>,
 }
@@ -787,6 +793,7 @@ impl GenericAiNode {
     ) -> fluxbee_ai_sdk::Result<()> {
         let tool = IlkRegisterTool {
             scoped_src_ilk: ctx.src_ilk.clone(),
+            default_tenant_id: self.resolve_effective_tenant_id(),
             identity: self.gov_identity.clone(),
             bridge: self.gov_identity_bridge.clone(),
         };
@@ -809,6 +816,20 @@ impl GenericAiNode {
             return openai.yaml_inline_api_key.clone();
         }
         std::env::var(&openai.api_key_env).ok()
+    }
+
+    fn resolve_effective_tenant_id(&self) -> Option<String> {
+        let Ok(state) = self.control_plane.try_read() else {
+            return None;
+        };
+        state
+            .effective_config
+            .as_ref()
+            .and_then(|v| v.get("tenant_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| looks_like_tenant_id(v))
+            .map(ToString::to_string)
     }
 
     async fn handle_control_plane(&self, msg: Message) -> fluxbee_ai_sdk::Result<Option<Message>> {
@@ -1251,6 +1272,7 @@ impl FunctionTool for IlkRegisterTool {
                         "required": ["name", "email"],
                         "additionalProperties": true
                     },
+                    "tenant_id": { "type": "string" },
                     "thread_id": { "type": "string" }
                 },
                 "required": ["src_ilk", "identity_candidate"],
@@ -1291,23 +1313,41 @@ impl FunctionTool for IlkRegisterTool {
             }));
         }
 
+        let resolved_tenant_id = resolve_tenant_id_for_register(
+            args.tenant_id.as_deref(),
+            args.identity_candidate.tenant_hint.as_deref(),
+            self.default_tenant_id.as_deref(),
+        );
+        let Some(tenant_id) = resolved_tenant_id else {
+            return Ok(json!({
+                "status": "error",
+                "error_code": "missing_tenant_id",
+                "message": "tenant_id is required for ILK_REGISTER (set tenant_id as tnt:<uuid>, use identity_candidate.tenant_hint=tnt:<uuid>, or set GOV_IDENTITY_TENANT_ID)",
+                "retryable": false
+            }));
+        };
+
         tracing::info!(
             op = "ilk_register",
             src_ilk = %src_ilk,
+            tenant_id = %tenant_id,
             target = %self.identity.target,
             has_fallback = self.identity.fallback_target.is_some(),
             "dispatching identity registration request"
         );
 
         let payload = json!({
-            "src_ilk": src_ilk,
-            "identity_candidate": {
-                "name": args.identity_candidate.name,
+            "ilk_id": src_ilk,
+            "ilk_type": "human",
+            "tenant_id": tenant_id,
+            "identification": {
+                "display_name": args.identity_candidate.name,
                 "email": args.identity_candidate.email,
                 "phone": args.identity_candidate.phone,
-                "tenant_hint": args.identity_candidate.tenant_hint
+                "tenant_hint": args.identity_candidate.tenant_hint,
             },
-            "thread_id": args.thread_id
+            "roles": [],
+            "capabilities": []
         });
         let result = if let Some(bridge) = &self.bridge {
             bridge.call_ok(&self.identity, MSG_ILK_REGISTER, payload).await
@@ -2308,6 +2348,48 @@ fn load_effective_config_from_spawn(node_name: &str) -> Option<SpawnEffectiveCon
     })
 }
 
+fn looks_like_tenant_id(raw: &str) -> bool {
+    let Some(rest) = raw.strip_prefix("tnt:") else {
+        return false;
+    };
+    Uuid::parse_str(rest.trim()).is_ok()
+}
+
+fn resolve_tenant_id_for_register(
+    explicit_tenant_id: Option<&str>,
+    tenant_hint: Option<&str>,
+    default_tenant_id: Option<&str>,
+) -> Option<String> {
+    let explicit = explicit_tenant_id
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .filter(|v| looks_like_tenant_id(v))
+        .map(ToString::to_string);
+    if explicit.is_some() {
+        return explicit;
+    }
+
+    let hint = tenant_hint
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .filter(|v| looks_like_tenant_id(v))
+        .map(ToString::to_string);
+    if hint.is_some() {
+        return hint;
+    }
+
+    let cfg_default = default_tenant_id
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .filter(|v| looks_like_tenant_id(v))
+        .map(ToString::to_string);
+    if cfg_default.is_some() {
+        return cfg_default;
+    }
+
+    env_nonempty(GOV_IDENTITY_TENANT_ID_ENV).filter(|v| looks_like_tenant_id(v))
+}
+
 fn materialize_effective_defaults(
     node_name: &str,
     mut config: EffectiveConfigDocument,
@@ -2906,5 +2988,20 @@ mod tests {
         };
         let err = require_src_ilk(&ctx).expect_err("missing src_ilk should fail");
         assert!(err.to_string().contains("missing_src_ilk"));
+    }
+
+    #[test]
+    fn resolve_tenant_id_prefers_explicit_over_hint() {
+        let explicit = "tnt:11111111-1111-4111-8111-111111111111";
+        let hint = "tnt:22222222-2222-4222-8222-222222222222";
+        let out = resolve_tenant_id_for_register(Some(explicit), Some(hint), None);
+        assert_eq!(out.as_deref(), Some(explicit));
+    }
+
+    #[test]
+    fn resolve_tenant_id_uses_hint_when_explicit_missing() {
+        let hint = "tnt:22222222-2222-4222-8222-222222222222";
+        let out = resolve_tenant_id_for_register(None, Some(hint), None);
+        assert_eq!(out.as_deref(), Some(hint));
     }
 }
