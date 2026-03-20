@@ -7032,6 +7032,33 @@ fn normalize_node_name_for_target(
     Ok(format!("{raw}@{target_hive}"))
 }
 
+fn validate_existing_node_name_literal(raw_node_name: &str) -> Result<String, OrchestratorError> {
+    let raw = raw_node_name.trim();
+    if raw.is_empty() {
+        return Err("missing node_name".into());
+    }
+
+    if let Some((local, hive)) = raw.rsplit_once('@') {
+        let local = local.trim();
+        let hive = hive.trim();
+        if local.is_empty() || hive.is_empty() {
+            return Err("invalid node_name".into());
+        }
+        if !valid_node_local_name(local) {
+            return Err("invalid node_name".into());
+        }
+        if !valid_hive_id(hive) {
+            return Err("invalid node_name hive".into());
+        }
+        return Ok(format!("{local}@{hive}"));
+    }
+
+    if !valid_node_local_name(raw) {
+        return Err("invalid node_name".into());
+    }
+    Ok(raw.to_string())
+}
+
 fn node_runtime_from_name(node_name: &str) -> Option<String> {
     let local = node_name.split('@').next().unwrap_or(node_name);
     let mut parts = local.split('.');
@@ -7059,16 +7086,19 @@ fn node_files_root() -> PathBuf {
 }
 
 fn node_instance_dir(node_name: &str) -> Result<PathBuf, OrchestratorError> {
-    let (local, hive) = node_name
+    let local = node_name
         .rsplit_once('@')
-        .ok_or_else(|| format!("invalid node_name '{}': expected <name>@<hive>", node_name))?;
-    let local = local.trim();
-    let hive = hive.trim();
+        .map(|(local, _)| local)
+        .unwrap_or(node_name)
+        .trim();
     if !valid_node_local_name(local) {
         return Err(format!("invalid node_name local part '{}'", local).into());
     }
-    if !valid_hive_id(hive) {
-        return Err(format!("invalid node_name hive part '{}'", hive).into());
+    if let Some((_, hive)) = node_name.rsplit_once('@') {
+        let hive = hive.trim();
+        if !valid_hive_id(hive) {
+            return Err(format!("invalid node_name hive part '{}'", hive).into());
+        }
     }
     let node_kind = local
         .split('.')
@@ -8525,7 +8555,7 @@ async fn get_node_config_flow(
             target_hive = hive.trim().to_string();
         }
     }
-    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
+    let node_name = match validate_existing_node_name_literal(raw_node_name) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -8628,7 +8658,7 @@ async fn get_node_state_flow(
             target_hive = hive.trim().to_string();
         }
     }
-    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
+    let node_name = match validate_existing_node_name_literal(raw_node_name) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -8916,7 +8946,7 @@ async fn get_node_status_flow(
             target_hive = hive.trim().to_string();
         }
     }
-    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
+    let node_name = match validate_existing_node_name_literal(raw_node_name) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -9283,7 +9313,7 @@ async fn set_node_config_flow(
             target_hive = hive.trim().to_string();
         }
     }
-    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
+    let node_name = match validate_existing_node_name_literal(raw_node_name) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -9893,10 +9923,10 @@ async fn kill_node_flow(
         }
     }
 
-    let normalized_node_name = if node_name.is_empty() {
+    let validated_node_name = if node_name.is_empty() {
         None
     } else {
-        match normalize_node_name_for_target(&node_name, &target_hive) {
+        match validate_existing_node_name_literal(&node_name) {
             Ok(value) => Some(value),
             Err(err) => {
                 return serde_json::json!({
@@ -9914,7 +9944,7 @@ async fn kill_node_flow(
         .map(|v| sanitize_unit_suffix(v.trim()))
         .filter(|v| !v.is_empty())
         .or_else(|| {
-            normalized_node_name
+            validated_node_name
                 .as_ref()
                 .map(|name| unit_from_node_name(name))
         });
@@ -9956,7 +9986,7 @@ async fn kill_node_flow(
             obj.insert("unit".to_string(), serde_json::json!(unit));
             obj.insert("signal".to_string(), serde_json::json!(signal));
             obj.insert("force".to_string(), serde_json::json!(force));
-            if let Some(name) = normalized_node_name.as_ref() {
+            if let Some(name) = validated_node_name.as_ref() {
                 obj.insert("node_name".to_string(), serde_json::json!(name));
             }
         }
@@ -9975,7 +10005,7 @@ async fn kill_node_flow(
                 "error_code": "KILL_FAILED",
                 "message": err.to_string(),
                 "target": target_hive,
-                "node_name": normalized_node_name,
+                "node_name": validated_node_name,
                 "unit": unit,
             }),
         };
@@ -9988,7 +10018,7 @@ async fn kill_node_flow(
                 "state": "not_found",
                 "hive": target_hive,
                 "target": target_hive,
-                "node_name": normalized_node_name,
+                "node_name": validated_node_name,
                 "unit": unit,
                 "signal": signal,
                 "force": force,
@@ -10001,7 +10031,7 @@ async fn kill_node_flow(
                 "error_code": "SERVICE_FAILED",
                 "message": format!("unable to check unit activity: {err}"),
                 "target": target_hive,
-                "node_name": normalized_node_name,
+                "node_name": validated_node_name,
                 "unit": unit,
             });
         }
@@ -10012,7 +10042,7 @@ async fn kill_node_flow(
             "status": "ok",
             "hive": target_hive,
             "target": target_hive,
-            "node_name": normalized_node_name,
+            "node_name": validated_node_name,
             "unit": unit,
             "signal": signal,
             "force": force,
@@ -10022,7 +10052,7 @@ async fn kill_node_flow(
             "error_code": "KILL_FAILED",
             "message": err.to_string(),
             "target": target_hive,
-            "node_name": normalized_node_name,
+            "node_name": validated_node_name,
             "unit": unit,
         }),
     }
@@ -10090,7 +10120,7 @@ async fn remove_node_instance_flow(
         }
     }
 
-    let node_name = match normalize_node_name_for_target(&node_name, &target_hive) {
+    let node_name = match validate_existing_node_name_literal(&node_name) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({

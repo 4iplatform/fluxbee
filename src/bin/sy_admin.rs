@@ -3063,7 +3063,7 @@ async fn handle_send_node_message(
 ) -> Result<(u16, String), AdminError> {
     let req: DebugNodeMessageRequest = serde_json::from_value(payload)?;
     let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
-    let node_name = canonicalize_node_name_for_hive(&req.node_name, &target_hive);
+    let node_name = req.node_name.trim().to_string();
     if node_name.trim().is_empty() {
         return Ok((
             400,
@@ -3842,17 +3842,6 @@ fn is_node_scoped_action(action: &str) -> bool {
             | "get_node_status"
             | "send_node_message"
     )
-}
-
-fn canonicalize_node_name_for_hive(node_name: &str, hive_id: &str) -> String {
-    let node_name = node_name.trim();
-    if node_name.is_empty() {
-        return String::new();
-    }
-    if node_name.contains('@') {
-        return node_name.to_string();
-    }
-    format!("{node_name}@{hive_id}")
 }
 
 fn admin_payload_contract_error(action: &str, payload: &serde_json::Value) -> Option<String> {
