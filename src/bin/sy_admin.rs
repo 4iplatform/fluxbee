@@ -188,6 +188,39 @@ struct VpnConfig {
     priority: Option<u16>,
 }
 
+fn default_debug_msg_type() -> String {
+    "user".to_string()
+}
+
+fn default_debug_payload() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+#[derive(Debug, Deserialize)]
+struct DebugNodeMessageRequest {
+    node_name: String,
+    #[serde(default = "default_debug_msg_type")]
+    msg_type: String,
+    #[serde(default)]
+    msg: Option<String>,
+    #[serde(default)]
+    src_ilk: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default, rename = "meta_target")]
+    meta_target: Option<String>,
+    #[serde(default, rename = "meta_action")]
+    meta_action: Option<String>,
+    #[serde(default)]
+    priority: Option<String>,
+    #[serde(default)]
+    context: Option<serde_json::Value>,
+    #[serde(default = "default_debug_payload")]
+    payload: serde_json::Value,
+    #[serde(default)]
+    ttl: Option<u8>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), AdminError> {
     if cfg!(not(target_os = "linux")) {
@@ -907,6 +940,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "get_node_status",
         route: InternalActionRoute::Command("get_node_status"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "send_node_message",
+        route: InternalActionRoute::Command("send_node_message"),
         requires_target: true,
         allow_legacy_hive_id: false,
     },
@@ -1927,6 +1966,19 @@ async fn handle_hive_paths(
             });
             let (status, resp) =
                 handle_admin_command(ctx, client, "get_node_status", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["nodes", name, "messages"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if payload.get("node_name").is_none() {
+                payload["node_name"] = serde_json::Value::String(decode_percent(name));
+            }
+            let (status, resp) =
+                handle_admin_command(ctx, client, "send_node_message", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["identity", "ilks"]) => {
@@ -2953,6 +3005,9 @@ async fn handle_admin_command(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
+    if matches!(action, "send_node_message") {
+        return handle_send_node_message(ctx, client, payload, hive).await;
+    }
     if matches!(action, "get_ilk") {
         return handle_identity_command(ctx, client, action, payload, hive).await;
     }
@@ -2998,6 +3053,88 @@ async fn handle_admin_command(
         }
     }
     Ok(build_admin_http_response(action, response))
+}
+
+async fn handle_send_node_message(
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+    payload: serde_json::Value,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    let req: DebugNodeMessageRequest = serde_json::from_value(payload)?;
+    let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    let node_name = canonicalize_node_name_for_hive(&req.node_name, &target_hive);
+    if node_name.trim().is_empty() {
+        return Ok((
+            400,
+            serde_json::json!({
+                "status": "error",
+                "action": "send_node_message",
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": "node_name is required",
+            })
+            .to_string(),
+        ));
+    }
+    if req.msg_type.trim().is_empty() {
+        return Ok((
+            400,
+            serde_json::json!({
+                "status": "error",
+                "action": "send_node_message",
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": "msg_type is required",
+            })
+            .to_string(),
+        ));
+    }
+    let ttl = req.ttl.unwrap_or(16).max(1);
+    let trace_id = Uuid::new_v4().to_string();
+    let src_ilk = req.src_ilk.clone();
+    let msg_name = req.msg.clone();
+    let msg_type = req.msg_type.trim().to_string();
+    let message = Message {
+        routing: Routing {
+            src: client.sender.uuid().to_string(),
+            dst: Destination::Unicast(node_name.clone()),
+            ttl,
+            trace_id: trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: msg_type.clone(),
+            msg: msg_name.as_ref().map(|value| value.trim().to_string()),
+            src_ilk: src_ilk.clone(),
+            scope: req.scope,
+            target: req.meta_target,
+            action: req.meta_action,
+            priority: req.priority,
+            context: req.context,
+        },
+        payload: req.payload,
+    };
+    client.sender.send(message).await?;
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "action": "send_node_message",
+            "payload": {
+                "status": "sent",
+                "target": target_hive,
+                "node_name": node_name,
+                "trace_id": trace_id,
+                "msg_type": msg_type,
+                "msg": msg_name,
+                "src_ilk": src_ilk,
+                "ttl": ttl,
+            },
+            "error_code": serde_json::Value::Null,
+            "error_detail": serde_json::Value::Null,
+        })
+        .to_string(),
+    ))
 }
 
 async fn handle_identity_query(
@@ -3703,7 +3840,19 @@ fn is_node_scoped_action(action: &str) -> bool {
             | "set_node_config"
             | "get_node_state"
             | "get_node_status"
+            | "send_node_message"
     )
+}
+
+fn canonicalize_node_name_for_hive(node_name: &str, hive_id: &str) -> String {
+    let node_name = node_name.trim();
+    if node_name.is_empty() {
+        return String::new();
+    }
+    if node_name.contains('@') {
+        return node_name.to_string();
+    }
+    format!("{node_name}@{hive_id}")
 }
 
 fn admin_payload_contract_error(action: &str, payload: &serde_json::Value) -> Option<String> {

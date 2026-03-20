@@ -362,6 +362,65 @@ For a larger E2E checklist and error matrix, see:
 - `docs/onworking/sy_admin_e2e_curl_checklist.md`
 - `scripts/admin_add_hive_matrix.sh`
 
+### Identity inspection calls
+
+Useful when debugging registration and routing state from `SY.admin` without
+talking to `SY.identity` directly:
+
+```bash
+HIVE_ID="motherbee"
+ILK_ID="ilk:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# compact list of current ILKs on the hive
+curl -sS "$BASE/hives/$HIVE_ID/identity/ilks" | jq .
+
+# full detail for one ILK
+curl -sS "$BASE/hives/$HIVE_ID/identity/ilks/$ILK_ID" | jq .
+```
+
+`GET /hives/{hive}/identity/ilks` returns a compact row per ILK with:
+
+- `ilk_id`
+- `ilk_type`
+- `registration_status`
+- `tenant_id`
+- `tenant_name`
+- `display_name`
+- `node_name`
+- `channel_count`
+- `channels` (`ich_id`, `channel_type`, `address`)
+- `deleted_at_ms`
+
+### Debug message to one node
+
+For ad-hoc debugging, `SY.admin` can emit a direct message to a specific node by
+name and return the generated `trace_id`.
+
+```bash
+HIVE_ID="motherbee"
+NODE_NAME="AI.frontdesk.gov@motherbee"
+
+curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/messages" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "msg_type": "user",
+    "msg": "LLM",
+    "payload": {
+      "text": "hola desde admin"
+    }
+  }' | jq .
+```
+
+Optional fields:
+
+- `src_ilk`
+- `scope`
+- `meta_target`
+- `meta_action`
+- `priority`
+- `context`
+- `ttl`
+
 ### Endpoint Reference (SY.admin)
 
 Current HTTP surface exposed by `SY.admin`:
@@ -420,6 +479,9 @@ Hive-scoped endpoints:
 | `GET` | `/hives/{hive}/nodes/{name}/config` | Read node effective config |
 | `PUT` | `/hives/{hive}/nodes/{name}/config` | Update node effective config |
 | `GET` | `/hives/{hive}/nodes/{name}/state` | Read node runtime state payload |
+| `POST` | `/hives/{hive}/nodes/{name}/messages` | Send a direct debug message to one node |
+| `GET` | `/hives/{hive}/identity/ilks` | List ILKs on hive (compact identity view) |
+| `GET` | `/hives/{hive}/identity/ilks/{ilk_id}` | Read one ILK with resolved tenant/alias detail |
 | `POST` | `/hives/{hive}/update` | Send `SYSTEM_UPDATE` to hive orchestrator |
 | `POST` | `/hives/{hive}/sync-hint` | Send `SYSTEM_SYNC_HINT` (`blob`/`dist`) to hive orchestrator |
 | `GET` | `/hives/{hive}/versions` | Effective versions for hive |
