@@ -141,19 +141,35 @@ log() {
 }
 
 sanitize_config_json() {
-  python3 - <<'PY'
+  local source_path="${1:-}"
+  SANITIZE_CONFIG_SOURCE="$source_path" python3 - <<'PY'
 import json
+import os
 import sys
 
-raw = sys.stdin.read()
+source = (os.environ.get("SANITIZE_CONFIG_SOURCE") or "").strip()
+if source:
+    with open(source, "r", encoding="utf-8-sig") as f:
+        raw = f.read()
+else:
+    raw = sys.stdin.read()
+
 if not raw.strip():
+    print(f"Warning: empty config payload for sanitize (source={source or 'stdin'}); using {{}}", file=sys.stderr)
     print("{}")
     raise SystemExit(0)
 
-cfg = json.loads(raw)
+try:
+    cfg = json.loads(raw)
+except Exception as e:
+    print(f"Warning: invalid config JSON for sanitize (source={source or 'stdin'}): {e}; using {{}}", file=sys.stderr)
+    print("{}")
+    raise SystemExit(0)
+
 if not isinstance(cfg, dict):
-    print("Error: config JSON root must be object", file=sys.stderr)
-    raise SystemExit(1)
+    print(f"Warning: config JSON root must be object (source={source or 'stdin'}); using {{}}", file=sys.stderr)
+    print("{}")
+    raise SystemExit(0)
 
 # Reserved by orchestrator.
 cfg.pop("_system", None)
@@ -163,6 +179,13 @@ cfg.pop("identity_fallback_target", None)
 ident = cfg.get("identity")
 if isinstance(ident, dict):
     ident.pop("fallback_target", None)
+
+slack = cfg.get("slack")
+if not isinstance(slack, dict) or not slack.get("app_token") or not slack.get("bot_token"):
+    print(
+        "Warning: sanitized config has no slack.app_token/bot_token; spawn may succeed but runtime will fail missing token",
+        file=sys.stderr,
+    )
 
 print(json.dumps(cfg, separators=(",", ":")))
 PY
@@ -179,7 +202,7 @@ build_spawn_config_json() {
       echo "Error: --config-json not found: $CONFIG_JSON" >&2
       exit 1
     fi
-    sanitize_config_json < "$CONFIG_JSON"
+    sanitize_config_json "$CONFIG_JSON"
     return
   fi
 
