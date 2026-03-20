@@ -31,7 +31,6 @@ const MSG_NODE_STATUS_GET_RESPONSE: &str = "NODE_STATUS_GET_RESPONSE";
 const NODE_STATUS_DEFAULT_HANDLER_ENABLED: &str = "NODE_STATUS_DEFAULT_HANDLER_ENABLED";
 const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE";
 const GOV_IDENTITY_TARGET_ENV: &str = "GOV_IDENTITY_TARGET";
-const GOV_IDENTITY_FALLBACK_TARGET_ENV: &str = "GOV_IDENTITY_FALLBACK_TARGET";
 const GOV_IDENTITY_TIMEOUT_MS_ENV: &str = "GOV_IDENTITY_TIMEOUT_MS";
 
 #[derive(Debug, Deserialize)]
@@ -340,8 +339,8 @@ struct GovIdentityConfig {
 impl Default for GovIdentityConfig {
     fn default() -> Self {
         Self {
-            target: "SY.identity".to_string(),
-            fallback_target: Some("SY.identity@motherbee".to_string()),
+            target: "SY.identity@motherbee".to_string(),
+            fallback_target: None,
             timeout: Duration::from_secs(10),
         }
     }
@@ -1222,7 +1221,6 @@ fn gov_identity_config_from_env() -> GovIdentityConfig {
     if let Some(target) = env_nonempty(GOV_IDENTITY_TARGET_ENV) {
         cfg.target = target;
     }
-    cfg.fallback_target = env_nonempty(GOV_IDENTITY_FALLBACK_TARGET_ENV);
     cfg.timeout = Duration::from_millis(env_u64(
         GOV_IDENTITY_TIMEOUT_MS_ENV,
         cfg.timeout.as_millis() as u64,
