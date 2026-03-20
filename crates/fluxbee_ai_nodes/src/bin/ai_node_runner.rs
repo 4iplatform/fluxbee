@@ -1313,12 +1313,23 @@ impl FunctionTool for IlkRegisterTool {
             }));
         }
 
-        let resolved_tenant_id = resolve_tenant_id_for_register(
-            args.tenant_id.as_deref(),
-            args.identity_candidate.tenant_hint.as_deref(),
-            self.default_tenant_id.as_deref(),
-        );
+        let explicit_tenant = args.tenant_id.as_deref().map(str::trim);
+        let tenant_hint = args.identity_candidate.tenant_hint.as_deref().map(str::trim);
+        let cfg_tenant = self.default_tenant_id.as_deref().map(str::trim);
+        let env_tenant = env_nonempty(GOV_IDENTITY_TENANT_ID_ENV);
+        let tenant_source = tenant_resolution_source(explicit_tenant, tenant_hint, cfg_tenant);
+        let resolved_tenant_id = resolve_tenant_id_for_register(explicit_tenant, tenant_hint, cfg_tenant);
         let Some(tenant_id) = resolved_tenant_id else {
+            tracing::warn!(
+                op = "ilk_register",
+                src_ilk = %src_ilk,
+                target = %self.identity.target,
+                explicit_tenant_id = ?explicit_tenant,
+                tenant_hint = ?tenant_hint,
+                effective_config_tenant_id = ?cfg_tenant,
+                env_tenant_id = ?env_tenant,
+                "missing tenant_id for ILK_REGISTER"
+            );
             return Ok(json!({
                 "status": "error",
                 "error_code": "missing_tenant_id",
@@ -1331,6 +1342,7 @@ impl FunctionTool for IlkRegisterTool {
             op = "ilk_register",
             src_ilk = %src_ilk,
             tenant_id = %tenant_id,
+            tenant_source = tenant_source,
             target = %self.identity.target,
             has_fallback = self.identity.fallback_target.is_some(),
             "dispatching identity registration request"
@@ -1349,6 +1361,13 @@ impl FunctionTool for IlkRegisterTool {
             "roles": [],
             "capabilities": []
         });
+        tracing::info!(
+            op = "ilk_register",
+            target = %self.identity.target,
+            msg = %MSG_ILK_REGISTER,
+            payload = %payload,
+            "sending ILK_REGISTER to identity"
+        );
         let result = if let Some(bridge) = &self.bridge {
             bridge.call_ok(&self.identity, MSG_ILK_REGISTER, payload).await
         } else {
@@ -1356,14 +1375,31 @@ impl FunctionTool for IlkRegisterTool {
         };
 
         match result {
-            Ok(out) => Ok(json!({
-                "status": "ok",
-                "registered": true,
-                "effective_target": out.effective_target,
-                "trace_id": out.trace_id,
-                "identity_payload": out.payload
-            })),
-            Err(err) => Ok(identity_error_to_tool_payload(err)),
+            Ok(out) => {
+                tracing::info!(
+                    op = "ilk_register",
+                    trace_id = %out.trace_id,
+                    effective_target = %out.effective_target,
+                    response_payload = %out.payload,
+                    "received ILK_REGISTER response from identity"
+                );
+                Ok(json!({
+                    "status": "ok",
+                    "registered": true,
+                    "effective_target": out.effective_target,
+                    "trace_id": out.trace_id,
+                    "identity_payload": out.payload
+                }))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    op = "ilk_register",
+                    target = %self.identity.target,
+                    error = %err,
+                    "ILK_REGISTER failed"
+                );
+                Ok(identity_error_to_tool_payload(err))
+            }
         }
     }
 }
@@ -2389,6 +2425,45 @@ fn resolve_tenant_id_for_register(
     }
 
     env_nonempty(GOV_IDENTITY_TENANT_ID_ENV).filter(|v| looks_like_tenant_id(v))
+}
+
+fn tenant_resolution_source(
+    explicit_tenant_id: Option<&str>,
+    tenant_hint: Option<&str>,
+    default_tenant_id: Option<&str>,
+) -> &'static str {
+    let explicit_ok = explicit_tenant_id
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .is_some_and(looks_like_tenant_id);
+    if explicit_ok {
+        return "args.tenant_id";
+    }
+
+    let hint_ok = tenant_hint
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .is_some_and(looks_like_tenant_id);
+    if hint_ok {
+        return "identity_candidate.tenant_hint";
+    }
+
+    let cfg_ok = default_tenant_id
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .is_some_and(looks_like_tenant_id);
+    if cfg_ok {
+        return "effective_config.tenant_id";
+    }
+
+    let env_ok = env_nonempty(GOV_IDENTITY_TENANT_ID_ENV)
+        .as_deref()
+        .is_some_and(looks_like_tenant_id);
+    if env_ok {
+        return GOV_IDENTITY_TENANT_ID_ENV;
+    }
+
+    "missing"
 }
 
 fn materialize_effective_defaults(
