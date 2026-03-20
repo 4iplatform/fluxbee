@@ -222,10 +222,13 @@ Ejes:
 
 - [x] Agregar lectura admin de identity para inspección de ILKs.
   - Endpoint v1:
+    - `GET /hives/{hive}/identity/ilks`
     - `GET /hives/{hive}/identity/ilks/{ilk_id}`
   - Alcance:
     - solo lectura
-    - expone `ilk`, `tenant`, `canonical_ilk_id`, `alias_resolved`
+    - listado compacto expone `ilk_id`, `registration_status`, `tenant_id`,
+      `tenant_name`, `node_name/display_name`, `channels`
+    - detalle expone `ilk`, `tenant`, `canonical_ilk_id`, `alias_resolved`
     - pensado para debugging operativo cuando routing/registro refleja un `tenant_id`
       inesperado
 

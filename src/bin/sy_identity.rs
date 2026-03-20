@@ -57,6 +57,8 @@ const SHM_TENANT_STATUS_SUSPENDED: u8 = 2;
 
 const MSG_ILK_PROVISION: &str = "ILK_PROVISION";
 const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
+const MSG_ILK_LIST: &str = "ILK_LIST";
+const MSG_ILK_LIST_RESPONSE: &str = "ILK_LIST_RESPONSE";
 const MSG_ILK_GET: &str = "ILK_GET";
 const MSG_ILK_GET_RESPONSE: &str = "ILK_GET_RESPONSE";
 const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
@@ -400,6 +402,45 @@ impl IdentityStore {
             "ilk": ilk,
             "tenant": tenant,
         }))
+    }
+
+    fn list_ilks_payload(&self) -> Value {
+        let mut ilk_ids: Vec<&String> = self.ilks.keys().collect();
+        ilk_ids.sort_unstable();
+
+        let ilks: Vec<Value> = ilk_ids
+            .into_iter()
+            .filter_map(|ilk_id| {
+                let ilk = self.ilks.get(ilk_id)?;
+                let tenant = self.tenants.get(&ilk.tenant_id);
+                let display_name = identification_str(&ilk.identification, "display_name")
+                    .map(str::to_string);
+                let node_name =
+                    identification_str(&ilk.identification, "node_name").map(str::to_string);
+                Some(json!({
+                    "ilk_id": ilk.ilk_id,
+                    "ilk_type": ilk.ilk_type,
+                    "registration_status": ilk.registration_status,
+                    "tenant_id": ilk.tenant_id,
+                    "tenant_name": tenant.map(|entry| entry.name.clone()),
+                    "display_name": display_name,
+                    "node_name": node_name,
+                    "channel_count": ilk.channels.len(),
+                    "channels": ilk.channels.iter().map(|channel| json!({
+                        "ich_id": channel.ich_id,
+                        "channel_type": channel.channel_type,
+                        "address": channel.address,
+                    })).collect::<Vec<_>>(),
+                    "deleted_at_ms": ilk.deleted_at_ms,
+                }))
+            })
+            .collect();
+
+        json!({
+            "status": "ok",
+            "count": ilks.len(),
+            "ilks": ilks,
+        })
     }
 
     fn find_active_ilk_by_identification_key(&self, key: &str, expected: &str) -> Option<String> {
@@ -933,6 +974,7 @@ impl IdentityRuntime {
     ) -> Self {
         let mut allowed_prefixes: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
         allowed_prefixes.insert(MSG_ILK_PROVISION, vec!["IO."]);
+        allowed_prefixes.insert(MSG_ILK_LIST, vec!["SY.admin@"]);
         allowed_prefixes.insert(MSG_ILK_GET, vec!["SY.admin@"]);
         allowed_prefixes.insert(MSG_ILK_REGISTER, vec!["AI.frontdesk@", "SY.orchestrator@"]);
         allowed_prefixes.insert(MSG_ILK_ADD_CHANNEL, vec!["AI.frontdesk@"]);
@@ -1041,6 +1083,7 @@ impl IdentityRuntime {
 
         let mut deltas: Vec<IdentityDeltaEnvelope> = Vec::new();
         let payload = match action {
+            MSG_ILK_LIST => self.store.list_ilks_payload(),
             MSG_ILK_GET => match serde_json::from_value::<IlkGetRequest>(msg.payload.clone()) {
                 Ok(req) => match self.store.get_ilk_payload(&req.ilk_id) {
                     Ok(ok) => ok,
@@ -2760,6 +2803,7 @@ fn ensure_l2_name(name: &str, hive_id: &str) -> String {
 fn response_name(action: &str) -> &'static str {
     match action {
         MSG_ILK_PROVISION => MSG_ILK_PROVISION_RESPONSE,
+        MSG_ILK_LIST => MSG_ILK_LIST_RESPONSE,
         MSG_ILK_GET => MSG_ILK_GET_RESPONSE,
         MSG_ILK_REGISTER => MSG_ILK_REGISTER_RESPONSE,
         MSG_ILK_ADD_CHANNEL => MSG_ILK_ADD_CHANNEL_RESPONSE,
@@ -3782,5 +3826,48 @@ mod tests {
         );
         assert_eq!(by_domain.get("created").and_then(Value::as_bool), Some(false));
         assert_eq!(by_domain.get("matched_by").and_then(Value::as_str), Some("domain"));
+    }
+
+    #[test]
+    fn list_ilks_payload_returns_compact_identity_rows() {
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                name: "fluxbee".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+            },
+        );
+        store.ilks.insert(
+            "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            IlkRecord {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                ilk_type: "human".to_string(),
+                registration_status: "temporary".to_string(),
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                identification: json!({"display_name":"Jane","node_name":"AI.frontdesk.gov@motherbee"}),
+                roles: vec![],
+                capabilities: vec![],
+                channels: vec![ChannelRecord {
+                    ich_id: "ich:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
+                    channel_type: "slack".to_string(),
+                    address: "U123".to_string(),
+                }],
+                deleted_at_ms: None,
+            },
+        );
+
+        let payload = store.list_ilks_payload();
+        assert_eq!(payload.get("count").and_then(Value::as_u64), Some(1));
+        let rows = payload
+            .get("ilks")
+            .and_then(Value::as_array)
+            .expect("ilks array");
+        assert_eq!(rows[0].get("tenant_name").and_then(Value::as_str), Some("fluxbee"));
+        assert_eq!(rows[0].get("channel_count").and_then(Value::as_u64), Some(1));
+        assert_eq!(rows[0].get("registration_status").and_then(Value::as_str), Some("temporary"));
     }
 }
