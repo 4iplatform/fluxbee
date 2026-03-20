@@ -57,6 +57,8 @@ const SHM_TENANT_STATUS_SUSPENDED: u8 = 2;
 
 const MSG_ILK_PROVISION: &str = "ILK_PROVISION";
 const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
+const MSG_ILK_GET: &str = "ILK_GET";
+const MSG_ILK_GET_RESPONSE: &str = "ILK_GET_RESPONSE";
 const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
 const MSG_ILK_REGISTER_RESPONSE: &str = "ILK_REGISTER_RESPONSE";
 const MSG_ILK_ADD_CHANNEL: &str = "ILK_ADD_CHANNEL";
@@ -143,6 +145,12 @@ struct IlkProvisionRequest {
     ich_id: String,
     channel_type: String,
     address: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IlkGetRequest {
+    ilk_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,6 +322,55 @@ struct IdentityDeltaEnvelope {
 }
 
 impl IdentityStore {
+    fn get_ilk_payload(&self, requested_ilk_id: &str) -> Result<Value, String> {
+        let requested_ilk_id = requested_ilk_id.trim();
+        if requested_ilk_id.is_empty() {
+            return Err("INVALID_REQUEST".to_string());
+        }
+        let _ = parse_prefixed_uuid(requested_ilk_id, "ilk")?;
+
+        let alias = self.aliases.get(requested_ilk_id).cloned();
+        let canonical_ilk_id = alias
+            .as_ref()
+            .map(|entry| entry.canonical_ilk_id.clone())
+            .unwrap_or_else(|| requested_ilk_id.to_string());
+
+        let Some(ilk) = self.ilks.get(&canonical_ilk_id).cloned() else {
+            return Err("NOT_FOUND".to_string());
+        };
+
+        let tenant = self.tenants.get(&ilk.tenant_id).cloned();
+        let merged_aliases: Vec<Value> = self
+            .aliases
+            .iter()
+            .filter_map(|(old_ilk_id, entry)| {
+                (entry.canonical_ilk_id == canonical_ilk_id).then(|| {
+                    json!({
+                        "old_ilk_id": old_ilk_id,
+                        "canonical_ilk_id": entry.canonical_ilk_id,
+                        "expires_at_ms": entry.expires_at_ms,
+                    })
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "status": "ok",
+            "ilk_id": canonical_ilk_id,
+            "queried_ilk_id": requested_ilk_id,
+            "canonical_ilk_id": canonical_ilk_id,
+            "alias_resolved": requested_ilk_id != ilk.ilk_id,
+            "queried_alias": alias.as_ref().map(|entry| json!({
+                "old_ilk_id": requested_ilk_id,
+                "canonical_ilk_id": entry.canonical_ilk_id,
+                "expires_at_ms": entry.expires_at_ms,
+            })),
+            "merged_aliases": merged_aliases,
+            "ilk": ilk,
+            "tenant": tenant,
+        }))
+    }
+
     fn find_active_ilk_by_identification_key(&self, key: &str, expected: &str) -> Option<String> {
         let expected = expected.trim();
         if expected.is_empty() {
@@ -825,6 +882,7 @@ impl IdentityRuntime {
     ) -> Self {
         let mut allowed_prefixes: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
         allowed_prefixes.insert(MSG_ILK_PROVISION, vec!["IO."]);
+        allowed_prefixes.insert(MSG_ILK_GET, vec!["SY.admin@"]);
         allowed_prefixes.insert(MSG_ILK_REGISTER, vec!["AI.frontdesk@", "SY.orchestrator@"]);
         allowed_prefixes.insert(MSG_ILK_ADD_CHANNEL, vec!["AI.frontdesk@"]);
         allowed_prefixes.insert(MSG_ILK_UPDATE, vec!["SY.orchestrator@"]);
@@ -932,6 +990,13 @@ impl IdentityRuntime {
 
         let mut deltas: Vec<IdentityDeltaEnvelope> = Vec::new();
         let payload = match action {
+            MSG_ILK_GET => match serde_json::from_value::<IlkGetRequest>(msg.payload.clone()) {
+                Ok(req) => match self.store.get_ilk_payload(&req.ilk_id) {
+                    Ok(ok) => ok,
+                    Err(code) => error_payload(&code, "failed to get ilk"),
+                },
+                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+            },
             MSG_ILK_PROVISION => {
                 match serde_json::from_value::<IlkProvisionRequest>(msg.payload.clone()) {
                     Ok(req) => {
@@ -2632,6 +2697,7 @@ fn ensure_l2_name(name: &str, hive_id: &str) -> String {
 fn response_name(action: &str) -> &'static str {
     match action {
         MSG_ILK_PROVISION => MSG_ILK_PROVISION_RESPONSE,
+        MSG_ILK_GET => MSG_ILK_GET_RESPONSE,
         MSG_ILK_REGISTER => MSG_ILK_REGISTER_RESPONSE,
         MSG_ILK_ADD_CHANNEL => MSG_ILK_ADD_CHANNEL_RESPONSE,
         MSG_ILK_UPDATE => MSG_ILK_UPDATE_RESPONSE,
@@ -3538,5 +3604,65 @@ mod tests {
             MSG_TNT_CREATE,
             Some("AI.frontdesk.gov@motherbee")
         ));
+    }
+
+    #[test]
+    fn identity_store_get_ilk_payload_resolves_alias_and_embeds_tenant() {
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            "tnt:11111111-1111-1111-1111-111111111111".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:11111111-1111-1111-1111-111111111111".to_string(),
+                name: "tenant-a".to_string(),
+                domain: Some("tenant-a.local".to_string()),
+                status: "active".to_string(),
+                settings: json!({}),
+            },
+        );
+        store.ilks.insert(
+            "ilk:22222222-2222-2222-2222-222222222222".to_string(),
+            IlkRecord {
+                ilk_id: "ilk:22222222-2222-2222-2222-222222222222".to_string(),
+                ilk_type: "human".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: "tnt:11111111-1111-1111-1111-111111111111".to_string(),
+                identification: json!({"display_name":"Jane","node_name":"AI.frontdesk.gov@motherbee"}),
+                roles: vec!["user".to_string()],
+                capabilities: vec!["chat".to_string()],
+                channels: vec![ChannelRecord {
+                    ich_id: "ich:33333333-3333-3333-3333-333333333333".to_string(),
+                    channel_type: "slack".to_string(),
+                    address: "U123".to_string(),
+                }],
+                deleted_at_ms: None,
+            },
+        );
+        store.aliases.insert(
+            "ilk:44444444-4444-4444-4444-444444444444".to_string(),
+            AliasRecord {
+                canonical_ilk_id: "ilk:22222222-2222-2222-2222-222222222222".to_string(),
+                expires_at_ms: 4_102_444_800_000,
+            },
+        );
+
+        let payload = store
+            .get_ilk_payload("ilk:44444444-4444-4444-4444-444444444444")
+            .expect("payload");
+
+        assert_eq!(
+            payload.get("canonical_ilk_id").and_then(Value::as_str),
+            Some("ilk:22222222-2222-2222-2222-222222222222")
+        );
+        assert_eq!(
+            payload.get("alias_resolved").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            payload
+                .get("tenant")
+                .and_then(|value| value.get("tenant_id"))
+                .and_then(Value::as_str),
+            Some("tnt:11111111-1111-1111-1111-111111111111")
+        );
     }
 }

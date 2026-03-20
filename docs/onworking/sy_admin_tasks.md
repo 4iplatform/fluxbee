@@ -218,6 +218,17 @@ Ejes:
 | `CUSTOM + singleton` | **Mayormente resuelto** | package `full_runtime/config_only/workflow`, publish/install, `--deploy`, readiness, spawn, config persistida, inventario de instancias, `remove` real de instancia, reboot/reconcile validado E2E | cleanup documental y decisión separada sobre `CORE + instanciado` |
 | `CUSTOM + instanciado` | **Mayormente resuelto** | runtime único con múltiples `node_name`, `config.json` por instancia, `_system` inyectado, `kill_node/get_node_*` por nombre, inventario persistente, remove real, reboot/reconcile validado E2E | cleanup documental y reglas finas si aparece algún caso borde |
 
+### Observabilidad identity por admin
+
+- [x] Agregar lectura admin de identity para inspección de ILKs.
+  - Endpoint v1:
+    - `GET /hives/{hive}/identity/ilks/{ilk_id}`
+  - Alcance:
+    - solo lectura
+    - expone `ilk`, `tenant`, `canonical_ilk_id`, `alias_resolved`
+    - pensado para debugging operativo cuando routing/registro refleja un `tenant_id`
+      inesperado
+
 ### Hallazgos concretos de código
 
 - `GET /hives/{hive}/nodes` ya devuelve inventario de instancias gestionadas persistidas leyendo `/var/lib/fluxbee/nodes/**/config.json` y calculando lifecycle local; para hive remoto hace forward al orchestrator remoto.
