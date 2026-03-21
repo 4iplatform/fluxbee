@@ -687,11 +687,17 @@ fn architect_index_html(state: &ArchitectState) -> String {
       background: var(--bg);
       color: var(--text);
       -webkit-font-smoothing: antialiased;
+      height: 100vh;
+      overflow: hidden;
     }}
     .page {{
       width: min(1320px, calc(100vw - 32px));
       margin: 0 auto;
       padding: 22px 0 28px;
+      height: 100vh;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      overflow: hidden;
     }}
     .masthead {{
       display: flex;
@@ -754,12 +760,20 @@ fn architect_index_html(state: &ArchitectState) -> String {
       justify-content: flex-end;
       gap: 16px;
       align-items: center;
+      flex-wrap: wrap;
     }}
     .status-strip {{
       display: flex;
       gap: 8px;
       flex-wrap: wrap;
       justify-content: flex-end;
+    }}
+    .status-note {{
+      color: var(--muted);
+      font-size: 0.78rem;
+      line-height: 1.35;
+      text-align: right;
+      max-width: 280px;
     }}
     .chip {{
       border: 1px solid var(--line);
@@ -795,6 +809,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       grid-template-columns: 280px minmax(0, 1fr);
       gap: 18px;
       align-items: start;
+      min-height: 0;
+      overflow: hidden;
     }}
     .sidebar,
     .shell {{
@@ -807,6 +823,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       padding: 20px 18px;
       position: sticky;
       top: 22px;
+      min-height: 0;
+      overflow: auto;
     }}
     .sidebar-head {{
       display: flex;
@@ -830,6 +848,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
       color: var(--muted);
       background: var(--panel-alt);
     }}
+    .new-chat {{
+      width: 100%;
+      margin-bottom: 14px;
+      background: var(--logo-dark);
+      color: #ffffff;
+      justify-content: center;
+    }}
     .history-list {{
       display: grid;
       gap: 10px;
@@ -843,6 +868,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
     .history-card.active {{
       background: linear-gradient(180deg, #f5f8ff 0%, #eef3ff 100%);
       border-color: #d7e4ff;
+    }}
+    .history-card.placeholder {{
+      border-style: dashed;
+      background: #fbfcfe;
     }}
     .history-name {{
       font-size: 0.95rem;
@@ -876,7 +905,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     .shell {{
       overflow: hidden;
-      min-height: calc(100vh - 110px);
+      min-height: 0;
+      height: 100%;
       display: grid;
       grid-template-rows: auto minmax(0, 1fr) auto;
     }}
@@ -1031,6 +1061,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       .sidebar {{
         position: static;
+        max-height: 260px;
       }}
       .shell {{
         min-height: auto;
@@ -1040,6 +1071,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       .page {{
         width: min(100vw - 20px, 1320px);
         padding-top: 14px;
+        padding-bottom: 14px;
       }}
       .masthead,
       .shell-title-row,
@@ -1049,6 +1081,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       .topbar {{
         justify-content: flex-start;
+      }}
+      .status-note {{
+        text-align: left;
+        max-width: none;
       }}
       .brand-mark {{
         width: 48px;
@@ -1098,10 +1134,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
       <div class="topbar">
         <div class="status-strip">
           <div class="chip"><span class="chip-label">Router</span><span id="router" class="chip-value">{router}</span></div>
-          <div class="chip"><span class="chip-label">AI</span><span id="ai" class="chip-value">{ai}</span></div>
           <div class="chip"><span class="chip-label">Hive</span><span class="chip-value">{hive}</span></div>
-          <div class="chip"><span class="chip-label">Bind</span><span class="chip-value">{listen}</span></div>
         </div>
+        <div class="status-note">System component states from inventory/SHM should land here next: `SY.orchestrator`, `SY.admin`, storage, identity, and related health signals.</div>
       </div>
     </div>
     <div class="workspace">
@@ -1110,18 +1145,26 @@ fn architect_index_html(state: &ArchitectState) -> String {
           <div class="sidebar-title">Chat History</div>
           <div class="mini-pill">local</div>
         </div>
+        <button id="new-chat" class="new-chat">New chat</button>
         <div class="history-list">
           <div class="history-card active">
             <div id="session-title" class="history-name">Current session</div>
             <div id="session-meta" class="history-meta">archi ready · waiting for first message</div>
           </div>
+          <div class="history-card placeholder">
+            <div class="history-name">Support flow draft</div>
+            <div class="history-meta">session list UI placeholder</div>
+          </div>
+          <div class="history-card placeholder">
+            <div class="history-name">Cluster rollout notes</div>
+            <div class="history-meta">persistence still pending</div>
+          </div>
         </div>
         <div class="history-note">
-          LanceDB-backed history is not wired yet. This rail is reserved for the session index the spec describes, so the layout already leaves that space in place.
+          Real session persistence is still pending, but this rail is now structured as a chat navigator instead of an info card.
         </div>
         <div class="meta-grid">
           <div><strong>Node</strong>: {node}</div>
-          <div><strong>Listen</strong>: {listen}</div>
           <div><strong>Modes</strong>: chat, FCMD, ACMD</div>
         </div>
       </aside>
@@ -1161,10 +1204,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const messages = document.getElementById("messages");
     const input = document.getElementById("input");
     const send = document.getElementById("send");
+    const newChat = document.getElementById("new-chat");
     const sessionTitle = document.getElementById("session-title");
     const sessionMeta = document.getElementById("session-meta");
     let userMessageCount = 0;
-
     function formatBoolChip(elementId, activeText, inactiveText, value) {{
       const element = document.getElementById(elementId);
       if (!element) return;
@@ -1200,12 +1243,24 @@ fn architect_index_html(state: &ArchitectState) -> String {
       messages.appendChild(div);
       messages.scrollTop = messages.scrollHeight;
     }}
+    function seedWelcomeMessages() {{
+      addMessage("system", "Fluxbee architect interface ready. Prompt control is local through FCMD, and admin passthrough is available through ACMD.");
+      addMessage("architect", "I am archi. AI conversation is still pending, but the control-plane shell and prompt operations are live.");
+      addMessage("system", "Example: FCMD: {{\"op\":\"prompt.get\",\"prompt_id\":\"architect\"}} or ACMD: curl -X GET /hives/{hive}/nodes");
+    }}
+    function resetChatSession() {{
+      messages.innerHTML = "";
+      input.value = "";
+      userMessageCount = 0;
+      sessionTitle.textContent = "Current session";
+      sessionMeta.textContent = "archi ready · waiting for first message";
+      seedWelcomeMessages();
+    }}
     async function refreshStatus() {{
       try {{
         const res = await fetch(statusUrl);
         const data = await res.json();
         formatBoolChip("router", "connected", "offline", !!data.router_connected);
-        formatBoolChip("ai", "configured", "missing", !!data.ai_configured);
       }} catch (_err) {{}}
     }}
     async function submit() {{
@@ -1231,24 +1286,21 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
     }}
     send.addEventListener("click", submit);
+    newChat.addEventListener("click", resetChatSession);
     input.addEventListener("keydown", (event) => {{
       if (event.key === "Enter" && !event.shiftKey) {{
         event.preventDefault();
         submit();
       }}
     }});
-    addMessage("system", "Fluxbee architect interface ready. Prompt control is local through FCMD, and admin passthrough is available through ACMD.");
-    addMessage("architect", "I am archi. AI conversation is still pending, but the control-plane shell and prompt operations are live.");
-    addMessage("system", "Example: FCMD: {{\"op\":\"prompt.get\",\"prompt_id\":\"architect\"}} or ACMD: curl -X GET /hives/{hive}/nodes");
+    resetChatSession();
     refreshStatus();
     setInterval(refreshStatus, 5000);
   </script>
-</body>
+        </body>
 </html>"##,
         node = state.node_name,
         hive = state.hive_id,
-        listen = state.listen,
         router = state.router_connected.load(Ordering::Relaxed),
-        ai = state.ai_configured.load(Ordering::Relaxed),
     )
 }
