@@ -17,6 +17,10 @@ nats:
 admin:
   listen: "127.0.0.1:8080"
 
+# Local architect HTTP UI/API (typically exposed through reverse proxy).
+architect:
+  listen: "127.0.0.1:3000"
+
 # Shared filesystem root used by admin/orchestrator.
 storage:
   path: "/var/lib/fluxbee"

@@ -95,6 +95,7 @@ const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "sy-opa-rules",
     "sy-identity",
     "sy-admin",
+    "sy-architect",
     "sy-storage",
     "sy-orchestrator",
 ];
@@ -390,12 +391,13 @@ struct PersistedManagedNode {
     relaunch_on_boot: bool,
 }
 
-const MOTHERBEE_CRITICAL_SERVICES: [&str; 6] = [
+const MOTHERBEE_CRITICAL_SERVICES: [&str; 7] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
     "sy-admin",
+    "sy-architect",
     "sy-storage",
 ];
 const WORKER_CRITICAL_SERVICES: [&str; 4] = [
@@ -612,7 +614,13 @@ async fn bootstrap_local(
     }
 
     let mut services = if state.is_motherbee {
-        vec!["sy-config-routes", "sy-opa-rules", "sy-admin", "sy-storage"]
+        vec![
+            "sy-config-routes",
+            "sy-opa-rules",
+            "sy-admin",
+            "sy-architect",
+            "sy-storage",
+        ]
     } else {
         vec!["sy-config-routes", "sy-opa-rules"]
     };
@@ -1075,7 +1083,13 @@ async fn shutdown_sequence(state: &OrchestratorState) {
 
     time::sleep(Duration::from_secs(10)).await;
 
-    for service in ["sy-storage", "sy-admin", "sy-config-routes", "sy-opa-rules"] {
+    for service in [
+        "sy-storage",
+        "sy-architect",
+        "sy-admin",
+        "sy-config-routes",
+        "sy-opa-rules",
+    ] {
         if let Err(err) = systemd_stop(service) {
             tracing::warn!(service = service, error = %err, "failed to stop service");
         }
@@ -6234,7 +6248,7 @@ fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
 }
 
 fn remove_hive_cleanup_script() -> &'static str {
-    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-orchestrator sy-admin sy-storage fluxbee-syncthing; do \
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-orchestrator sy-admin sy-architect sy-storage fluxbee-syncthing; do \
 systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
 systemctl disable \"$s\" >/dev/null 2>&1 || true; \
 systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
