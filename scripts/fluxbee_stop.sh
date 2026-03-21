@@ -15,6 +15,7 @@ fi
 services=(
   "sy-identity"
   "sy-admin"
+  "sy-architect"
   "sy-storage"
   "sy-config-routes"
   "sy-opa-rules"
@@ -74,6 +75,7 @@ echo "Cleaning residual processes..."
 residual_procs=(
   "sy-orchestrator"
   "sy-admin"
+  "sy-architect"
   "sy-storage"
   "sy-config-routes"
   "sy-opa-rules"
@@ -82,6 +84,7 @@ residual_procs=(
   "json-router"
   "sy_orchestrator"
   "sy_admin"
+  "sy_architect"
   "sy_storage"
   "sy_config_routes"
   "sy_opa_rules"
