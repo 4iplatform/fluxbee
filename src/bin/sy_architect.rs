@@ -241,7 +241,7 @@ struct ParsedScmd {
     body: Option<Value>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AdminTranslation {
     admin_target: String,
     action: String,
