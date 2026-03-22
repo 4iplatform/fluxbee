@@ -635,12 +635,12 @@ These are not optional details; they affect the shape of the implementation:
 
 This is the recommended first execution slice for the current repo state. It deliberately avoids AI-first work.
 
-- [ ] ARCH-S1.1. Implement system status bar backed by `ADMIN_COMMAND` over socket (`SY.admin` target, no HTTP dependency).
-- [ ] ARCH-S1.2. Improve `ACMD` rendering and validation so command results/errors are usable as an operational shell.
-- [ ] ARCH-S1.3. Add destructive action confirmation flow for `kill_node`, `remove_hive`, and future deletes.
-- [ ] ARCH-S1.4. Implement real chat sessions (`create/list/load`) so the left rail stops being placeholder UI.
-- [ ] ARCH-S1.5. Persist sessions and messages in LanceDB, with a schema tuned for single-process local usage.
-- [ ] ARCH-S1.6. Restore session content on reload and keep chat navigation stable across refreshes.
+- [x] ARCH-S1.1. Implement system status bar backed by `ADMIN_COMMAND` over socket (`SY.admin` target, no HTTP dependency).
+- [x] ARCH-S1.2. Improve `ACMD` rendering and validation so command results/errors are usable as an operational shell.
+- [x] ARCH-S1.3. Add destructive action confirmation flow for `kill_node`, `remove_hive`, and future deletes.
+- [x] ARCH-S1.4. Implement real chat sessions (`create/list/load`) so the left rail stops being placeholder UI.
+- [x] ARCH-S1.5. Persist sessions and messages in LanceDB, with a schema tuned for single-process local usage.
+- [x] ARCH-S1.6. Restore session content on reload and keep chat navigation stable across refreshes.
 - [ ] ARCH-S1.7. Freeze the config contract (`hive.yaml` bootstrap/fallback vs `config.json` self-managed state) before adding settings UI.
 
 ### Phase A — Contracts And Bootstrap Invariants

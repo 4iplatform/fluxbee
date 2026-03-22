@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
@@ -13,6 +15,9 @@ use axum::{Json, Router};
 use fluxbee_sdk::{
     admin_command, connect, AdminCommandRequest, NodeConfig, NodeError, NodeReceiver,
 };
+use futures::TryStreamExt;
+use lancedb::connection::Connection;
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -25,6 +30,8 @@ type ArchitectError = Box<dyn std::error::Error + Send + Sync>;
 
 const DEFAULT_ARCHITECT_LISTEN: &str = "127.0.0.1:3000";
 const ROUTER_RECONNECT_DELAY_SECS: u64 = 2;
+const CHAT_SESSIONS_TABLE: &str = "sessions";
+const CHAT_MESSAGES_TABLE: &str = "messages";
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -57,6 +64,7 @@ struct ArchitectState {
     socket_dir: PathBuf,
     router_connected: AtomicBool,
     ai_configured: AtomicBool,
+    chat_lock: Mutex<()>,
     prompt_lock: Mutex<()>,
 }
 
@@ -87,6 +95,7 @@ struct ArchitectComponentStatus {
 
 #[derive(Debug, Deserialize)]
 struct ChatRequest {
+    session_id: Option<String>,
     message: String,
 }
 
@@ -95,6 +104,69 @@ struct ChatResponse {
     status: String,
     mode: String,
     output: Value,
+    session_id: Option<String>,
+    session_title: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSessionRequest {
+    title: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct SessionSummary {
+    session_id: String,
+    title: String,
+    agent: String,
+    created_at_ms: u64,
+    last_activity_at_ms: u64,
+    message_count: u64,
+    last_message_preview: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionListResponse {
+    sessions: Vec<SessionSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionDetailResponse {
+    session: SessionSummary,
+    messages: Vec<PersistedChatMessage>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct PersistedChatMessage {
+    message_id: String,
+    session_id: String,
+    role: String,
+    content: String,
+    timestamp_ms: u64,
+    mode: String,
+    metadata: Value,
+}
+
+#[derive(Debug, Clone)]
+struct ChatSessionRecord {
+    session_id: String,
+    title: String,
+    agent: String,
+    created_at_ms: u64,
+    last_activity_at_ms: u64,
+    message_count: u64,
+    last_message_preview: String,
+}
+
+#[derive(Debug, Clone)]
+struct ChatMessageRecord {
+    message_id: String,
+    session_id: String,
+    role: String,
+    content: String,
+    timestamp_ms: u64,
+    mode: String,
+    metadata_json: String,
+    seq: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -184,8 +256,11 @@ async fn main() -> Result<(), ArchitectError> {
         socket_dir,
         router_connected: AtomicBool::new(false),
         ai_configured: AtomicBool::new(hive_ai_configured(&hive)),
+        chat_lock: Mutex::new(()),
         prompt_lock: Mutex::new(()),
     });
+
+    ensure_chat_storage(&state).await?;
 
     let node_config = NodeConfig {
         name: "SY.architect".to_string(),
@@ -206,6 +281,8 @@ async fn main() -> Result<(), ArchitectError> {
         .route("/healthz", any(dynamic_handler))
         .route("/api/status", any(dynamic_handler))
         .route("/api/chat", any(dynamic_handler))
+        .route("/api/sessions", any(dynamic_handler))
+        .route("/api/sessions/*path", any(dynamic_handler))
         .route("/*path", any(dynamic_handler))
         .with_state(Arc::clone(&state));
 
@@ -284,6 +361,72 @@ async fn dynamic_handler(
             let status = build_architect_status(&state).await;
             Json(status).into_response()
         }
+        (Method::GET, _) if is_sessions_collection_path(path) => {
+            match list_chat_sessions(&state).await {
+                Ok(sessions) => Json(SessionListResponse { sessions }).into_response(),
+                Err(err) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("failed to list sessions: {err}") })),
+                )
+                    .into_response(),
+            }
+        }
+        (Method::POST, _) if is_sessions_collection_path(path) => {
+            let body = match axum::body::to_bytes(request.into_body(), 64 * 1024).await {
+                Ok(body) => body,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("invalid body: {err}") })),
+                    )
+                        .into_response()
+                }
+            };
+            let req = if body.is_empty() {
+                CreateSessionRequest { title: None }
+            } else {
+                match serde_json::from_slice::<CreateSessionRequest>(&body) {
+                    Ok(req) => req,
+                    Err(err) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": format!("invalid json: {err}") })),
+                        )
+                            .into_response()
+                    }
+                }
+            };
+            match create_chat_session(&state, req.title).await {
+                Ok(detail) => Json(detail).into_response(),
+                Err(err) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("failed to create session: {err}") })),
+                )
+                    .into_response(),
+            }
+        }
+        (Method::GET, _) if is_session_detail_path(path) => {
+            let Some(session_id) = session_id_from_path(path) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "missing session id" })),
+                )
+                    .into_response();
+            };
+            match load_chat_session(&state, session_id).await {
+                Ok(Some(detail)) => Json(detail).into_response(),
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "session_not_found" })),
+                )
+                    .into_response(),
+                Err(err) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("failed to load session: {err}") })),
+                )
+                    .into_response(),
+            }
+        }
         (Method::POST, _) if is_chat_path(path) => {
             let body = match axum::body::to_bytes(request.into_body(), 1024 * 1024).await {
                 Ok(body) => body,
@@ -305,26 +448,50 @@ async fn dynamic_handler(
                         .into_response()
                 }
             };
-            let out = handle_chat_message(&state, req.message).await;
+            let out = handle_chat_message(&state, req.session_id, req.message).await;
             Json(out).into_response()
         }
-        (Method::GET, _) if !is_api_path(path) => Html(architect_index_html(&state)).into_response(),
+        (Method::GET, _) if !is_api_path(path) => {
+            Html(architect_index_html(&state)).into_response()
+        }
         _ => (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" }))).into_response(),
     }
 }
 
-async fn handle_chat_message(state: &ArchitectState, message: String) -> ChatResponse {
-    if let Some(raw) = message.strip_prefix("FCMD:") {
+async fn handle_chat_message(
+    state: &ArchitectState,
+    session_id: Option<String>,
+    message: String,
+) -> ChatResponse {
+    let (resolved_session_id, mut session) =
+        match resolve_chat_session(state, session_id, None).await {
+            Ok(values) => values,
+            Err(err) => {
+                return ChatResponse {
+                    status: "error".to_string(),
+                    mode: "chat".to_string(),
+                    output: json!({ "error": format!("session unavailable: {err}") }),
+                    session_id: None,
+                    session_title: None,
+                }
+            }
+        };
+
+    let response = if let Some(raw) = message.strip_prefix("FCMD:") {
         match handle_fcmd(state, raw.trim()).await {
             Ok(output) => ChatResponse {
                 status: "ok".to_string(),
                 mode: "fcmd".to_string(),
                 output,
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
             },
             Err(err) => ChatResponse {
                 status: "error".to_string(),
                 mode: "fcmd".to_string(),
                 output: json!({ "error": err.to_string() }),
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
             },
         }
     } else if let Some(raw) = message.strip_prefix("ACMD:") {
@@ -333,11 +500,15 @@ async fn handle_chat_message(state: &ArchitectState, message: String) -> ChatRes
                 status: "ok".to_string(),
                 mode: "acmd".to_string(),
                 output,
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
             },
             Err(err) => ChatResponse {
                 status: "error".to_string(),
                 mode: "acmd".to_string(),
                 output: json!({ "error": err.to_string() }),
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
             },
         }
     } else {
@@ -348,7 +519,22 @@ async fn handle_chat_message(state: &ArchitectState, message: String) -> ChatRes
                 "message": "AI chat path not implemented yet. Use FCMD: for prompt control or ACMD: for admin passthrough.",
                 "ai_configured": state.ai_configured.load(Ordering::Relaxed),
             }),
+            session_id: Some(resolved_session_id.clone()),
+            session_title: Some(session.title.clone()),
         }
+    };
+
+    let new_title = update_title_from_message(&session.title, &message);
+    if new_title != session.title {
+        session.title = new_title;
+    }
+    if let Err(err) = persist_chat_exchange(state, &mut session, message, &response).await {
+        tracing::warn!(error = %err, session_id = %resolved_session_id, "failed to persist chat exchange");
+    }
+
+    ChatResponse {
+        session_title: Some(session.title),
+        ..response
     }
 }
 
@@ -491,8 +677,15 @@ fn parse_acmd(raw: &str) -> Result<ParsedAcmd, ArchitectError> {
     Ok(ParsedAcmd { method, path, body })
 }
 
-fn translate_acmd(local_hive_id: &str, parsed: ParsedAcmd) -> Result<AdminTranslation, ArchitectError> {
-    let segments: Vec<&str> = parsed.path.split('/').filter(|segment| !segment.is_empty()).collect();
+fn translate_acmd(
+    local_hive_id: &str,
+    parsed: ParsedAcmd,
+) -> Result<AdminTranslation, ArchitectError> {
+    let segments: Vec<&str> = parsed
+        .path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
     if segments.len() < 2 || segments[0] != "hives" {
         return Err("ACMD path must start with /hives/{hive}/...".into());
     }
@@ -641,8 +834,9 @@ async fn fetch_inventory_status_data(
         config_dir: state.config_dir.clone(),
         version: "0.1.0".to_string(),
     };
-    let (sender, mut receiver) =
-        connect(&node_config).await.map_err(|err| -> ArchitectError { Box::new(err) })?;
+    let (sender, mut receiver) = connect(&node_config)
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
     let admin_target = format!("SY.admin@{}", state.hive_id);
 
     let summary = admin_command(
@@ -680,7 +874,10 @@ async fn fetch_inventory_status_data(
     Ok((summary.payload, hive.payload))
 }
 
-fn ensure_admin_ok(label: &str, result: &fluxbee_sdk::AdminCommandResult) -> Result<(), ArchitectError> {
+fn ensure_admin_ok(
+    label: &str,
+    result: &fluxbee_sdk::AdminCommandResult,
+) -> Result<(), ArchitectError> {
     if result.status == "ok" {
         return Ok(());
     }
@@ -748,7 +945,9 @@ fn parse_component_statuses(payload: &Value) -> Vec<ArchitectComponentStatus> {
             let best = nodes
                 .iter()
                 .filter(|node| node_matches_component(node, &component.key))
-                .max_by_key(|node| component_status_rank(node.get("status").and_then(Value::as_str)));
+                .max_by_key(|node| {
+                    component_status_rank(node.get("status").and_then(Value::as_str))
+                });
             match best {
                 Some(node) => ArchitectComponentStatus {
                     status: node
@@ -783,6 +982,590 @@ fn component_status_rank(status: Option<&str>) -> u8 {
         "stale" | "degraded" => 1,
         _ => 0,
     }
+}
+
+async fn ensure_chat_storage(state: &ArchitectState) -> Result<(), ArchitectError> {
+    let db = open_architect_db(state).await?;
+    let _ = ensure_sessions_table(&db).await?;
+    let _ = ensure_messages_table(&db).await?;
+    Ok(())
+}
+
+async fn open_architect_db(state: &ArchitectState) -> Result<Connection, ArchitectError> {
+    let path = architect_db_path(state);
+    fs::create_dir_all(&path)?;
+    lancedb::connect(path.to_string_lossy().as_ref())
+        .execute()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })
+}
+
+fn architect_db_path(state: &ArchitectState) -> PathBuf {
+    json_router::paths::storage_root_dir()
+        .join("nodes")
+        .join("SY")
+        .join(format!("SY.architect@{}", state.hive_id))
+        .join("architect.lance")
+}
+
+async fn ensure_sessions_table(db: &Connection) -> Result<lancedb::Table, ArchitectError> {
+    match db.open_table(CHAT_SESSIONS_TABLE).execute().await {
+        Ok(table) => Ok(table),
+        Err(_) => db
+            .create_empty_table(CHAT_SESSIONS_TABLE, chat_sessions_schema())
+            .execute()
+            .await
+            .map_err(|err| -> ArchitectError { Box::new(err) }),
+    }
+}
+
+async fn ensure_messages_table(db: &Connection) -> Result<lancedb::Table, ArchitectError> {
+    match db.open_table(CHAT_MESSAGES_TABLE).execute().await {
+        Ok(table) => Ok(table),
+        Err(_) => db
+            .create_empty_table(CHAT_MESSAGES_TABLE, chat_messages_schema())
+            .execute()
+            .await
+            .map_err(|err| -> ArchitectError { Box::new(err) }),
+    }
+}
+
+fn chat_sessions_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("session_id", DataType::Utf8, false),
+        Field::new("title", DataType::Utf8, false),
+        Field::new("agent", DataType::Utf8, false),
+        Field::new("created_at_ms", DataType::UInt64, false),
+        Field::new("last_activity_at_ms", DataType::UInt64, false),
+        Field::new("message_count", DataType::UInt64, false),
+        Field::new("last_message_preview", DataType::Utf8, false),
+    ]))
+}
+
+fn chat_messages_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("message_id", DataType::Utf8, false),
+        Field::new("session_id", DataType::Utf8, false),
+        Field::new("role", DataType::Utf8, false),
+        Field::new("content", DataType::Utf8, false),
+        Field::new("timestamp_ms", DataType::UInt64, false),
+        Field::new("mode", DataType::Utf8, false),
+        Field::new("metadata_json", DataType::Utf8, false),
+        Field::new("seq", DataType::UInt64, false),
+    ]))
+}
+
+async fn list_chat_sessions(state: &ArchitectState) -> Result<Vec<SessionSummary>, ArchitectError> {
+    let _guard = state.chat_lock.lock().await;
+    let db = open_architect_db(state).await?;
+    let table = ensure_sessions_table(&db).await?;
+    let batches = table
+        .query()
+        .select(Select::columns(&[
+            "session_id",
+            "title",
+            "agent",
+            "created_at_ms",
+            "last_activity_at_ms",
+            "message_count",
+            "last_message_preview",
+        ]))
+        .execute()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    let mut sessions = parse_session_batches(&batches)?;
+    sessions.sort_by(|a, b| {
+        b.last_activity_at_ms
+            .cmp(&a.last_activity_at_ms)
+            .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+    });
+    Ok(sessions)
+}
+
+async fn create_chat_session(
+    state: &ArchitectState,
+    title: Option<String>,
+) -> Result<SessionDetailResponse, ArchitectError> {
+    let _guard = state.chat_lock.lock().await;
+    let db = open_architect_db(state).await?;
+    let sessions = ensure_sessions_table(&db).await?;
+    let _messages = ensure_messages_table(&db).await?;
+    let now = now_epoch_ms();
+    let record = ChatSessionRecord {
+        session_id: Uuid::new_v4().to_string(),
+        title: sanitize_session_title(title.as_deref()),
+        agent: "architect".to_string(),
+        created_at_ms: now,
+        last_activity_at_ms: now,
+        message_count: 0,
+        last_message_preview: String::new(),
+    };
+    upsert_session_record(&sessions, &record).await?;
+    Ok(SessionDetailResponse {
+        session: session_record_to_summary(&record),
+        messages: Vec::new(),
+    })
+}
+
+async fn load_chat_session(
+    state: &ArchitectState,
+    session_id: &str,
+) -> Result<Option<SessionDetailResponse>, ArchitectError> {
+    let _guard = state.chat_lock.lock().await;
+    let db = open_architect_db(state).await?;
+    let sessions = ensure_sessions_table(&db).await?;
+    let messages = ensure_messages_table(&db).await?;
+    let Some(session) = load_session_record(&sessions, session_id).await? else {
+        return Ok(None);
+    };
+    let persisted = load_session_messages(&messages, session_id).await?;
+    Ok(Some(SessionDetailResponse {
+        session: session_record_to_summary(&session),
+        messages: persisted,
+    }))
+}
+
+async fn resolve_chat_session(
+    state: &ArchitectState,
+    session_id: Option<String>,
+    title: Option<String>,
+) -> Result<(String, ChatSessionRecord), ArchitectError> {
+    let _guard = state.chat_lock.lock().await;
+    let db = open_architect_db(state).await?;
+    let sessions = ensure_sessions_table(&db).await?;
+    let _messages = ensure_messages_table(&db).await?;
+
+    if let Some(session_id) = session_id {
+        if let Some(session) = load_session_record(&sessions, &session_id).await? {
+            return Ok((session_id, session));
+        }
+        return Err(format!("session not found: {session_id}").into());
+    }
+
+    let now = now_epoch_ms();
+    let record = ChatSessionRecord {
+        session_id: Uuid::new_v4().to_string(),
+        title: sanitize_session_title(title.as_deref()),
+        agent: "architect".to_string(),
+        created_at_ms: now,
+        last_activity_at_ms: now,
+        message_count: 0,
+        last_message_preview: String::new(),
+    };
+    upsert_session_record(&sessions, &record).await?;
+    Ok((record.session_id.clone(), record))
+}
+
+async fn persist_chat_exchange(
+    state: &ArchitectState,
+    session: &mut ChatSessionRecord,
+    user_message: String,
+    response: &ChatResponse,
+) -> Result<(), ArchitectError> {
+    let _guard = state.chat_lock.lock().await;
+    let db = open_architect_db(state).await?;
+    let sessions = ensure_sessions_table(&db).await?;
+    let messages = ensure_messages_table(&db).await?;
+
+    let now = now_epoch_ms();
+    let user_row = ChatMessageRecord {
+        message_id: Uuid::new_v4().to_string(),
+        session_id: session.session_id.clone(),
+        role: "user".to_string(),
+        content: user_message.clone(),
+        timestamp_ms: now,
+        mode: "text".to_string(),
+        metadata_json: json!({ "kind": "text" }).to_string(),
+        seq: session.message_count + 1,
+    };
+    append_message_record(&messages, &user_row).await?;
+
+    let response_role = if response.status == "ok" {
+        "architect"
+    } else {
+        "system"
+    };
+    let response_row = ChatMessageRecord {
+        message_id: Uuid::new_v4().to_string(),
+        session_id: session.session_id.clone(),
+        role: response_role.to_string(),
+        content: response
+            .output
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        timestamp_ms: now_epoch_ms(),
+        mode: response.mode.clone(),
+        metadata_json: json!({
+            "kind": "response",
+            "response": response,
+        })
+        .to_string(),
+        seq: session.message_count + 2,
+    };
+    append_message_record(&messages, &response_row).await?;
+
+    session.message_count += 2;
+    session.last_activity_at_ms = response_row.timestamp_ms;
+    session.last_message_preview = preview_text(
+        if response_row.content.is_empty() {
+            &response.mode
+        } else {
+            &response_row.content
+        },
+        88,
+    );
+    upsert_session_record(&sessions, session).await?;
+    Ok(())
+}
+
+async fn load_session_record(
+    table: &lancedb::Table,
+    session_id: &str,
+) -> Result<Option<ChatSessionRecord>, ArchitectError> {
+    let filter = format!("session_id = '{}'", session_id.replace('\'', "''"));
+    let batches = table
+        .query()
+        .only_if(filter)
+        .select(Select::columns(&[
+            "session_id",
+            "title",
+            "agent",
+            "created_at_ms",
+            "last_activity_at_ms",
+            "message_count",
+            "last_message_preview",
+        ]))
+        .execute()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    let mut rows = parse_session_records(&batches)?;
+    Ok(rows.pop())
+}
+
+async fn load_session_messages(
+    table: &lancedb::Table,
+    session_id: &str,
+) -> Result<Vec<PersistedChatMessage>, ArchitectError> {
+    let filter = format!("session_id = '{}'", session_id.replace('\'', "''"));
+    let batches = table
+        .query()
+        .only_if(filter)
+        .select(Select::columns(&[
+            "message_id",
+            "session_id",
+            "role",
+            "content",
+            "timestamp_ms",
+            "mode",
+            "metadata_json",
+            "seq",
+        ]))
+        .execute()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    let mut rows = parse_message_records(&batches)?;
+    rows.sort_by_key(|row| (row.seq, row.timestamp_ms));
+    Ok(rows.into_iter().map(message_record_to_persisted).collect())
+}
+
+async fn upsert_session_record(
+    table: &lancedb::Table,
+    record: &ChatSessionRecord,
+) -> Result<(), ArchitectError> {
+    let batch = session_batch_from_rows(std::slice::from_ref(record))?;
+    let mut merge = table.merge_insert(&["session_id"]);
+    merge
+        .when_matched_update_all(None)
+        .when_not_matched_insert_all();
+    merge
+        .execute(single_batch_reader(batch))
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    Ok(())
+}
+
+async fn append_message_record(
+    table: &lancedb::Table,
+    record: &ChatMessageRecord,
+) -> Result<(), ArchitectError> {
+    let batch = message_batch_from_rows(std::slice::from_ref(record))?;
+    table
+        .add(batch)
+        .execute()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    Ok(())
+}
+
+fn single_batch_reader(batch: RecordBatch) -> Box<dyn arrow_array::RecordBatchReader + Send> {
+    let schema = batch.schema();
+    Box::new(RecordBatchIterator::new(
+        vec![Ok(batch)].into_iter(),
+        schema,
+    ))
+}
+
+fn session_batch_from_rows(rows: &[ChatSessionRecord]) -> Result<RecordBatch, ArchitectError> {
+    let schema = chat_sessions_schema();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.session_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.title.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.agent.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|row| row.created_at_ms).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter()
+                    .map(|row| row.last_activity_at_ms)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|row| row.message_count).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.last_message_preview.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    Ok(batch)
+}
+
+fn message_batch_from_rows(rows: &[ChatMessageRecord]) -> Result<RecordBatch, ArchitectError> {
+    let schema = chat_messages_schema();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.message_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.session_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.role.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.content.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|row| row.timestamp_ms).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.mode.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.metadata_json.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    Ok(batch)
+}
+
+fn parse_session_batches(batches: &[RecordBatch]) -> Result<Vec<SessionSummary>, ArchitectError> {
+    Ok(parse_session_records(batches)?
+        .into_iter()
+        .map(|record| session_record_to_summary(&record))
+        .collect())
+}
+
+fn parse_session_records(
+    batches: &[RecordBatch],
+) -> Result<Vec<ChatSessionRecord>, ArchitectError> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let session_ids = string_column(batch, "session_id")?;
+        let titles = string_column(batch, "title")?;
+        let agents = string_column(batch, "agent")?;
+        let created = u64_column(batch, "created_at_ms")?;
+        let updated = u64_column(batch, "last_activity_at_ms")?;
+        let counts = u64_column(batch, "message_count")?;
+        let previews = string_column(batch, "last_message_preview")?;
+        for idx in 0..batch.num_rows() {
+            out.push(ChatSessionRecord {
+                session_id: session_ids.value(idx).to_string(),
+                title: session_title_or_default(titles.value(idx)),
+                agent: agents.value(idx).to_string(),
+                created_at_ms: created.value(idx),
+                last_activity_at_ms: updated.value(idx),
+                message_count: counts.value(idx),
+                last_message_preview: previews.value(idx).to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn parse_message_records(
+    batches: &[RecordBatch],
+) -> Result<Vec<ChatMessageRecord>, ArchitectError> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let message_ids = string_column(batch, "message_id")?;
+        let session_ids = string_column(batch, "session_id")?;
+        let roles = string_column(batch, "role")?;
+        let contents = string_column(batch, "content")?;
+        let timestamps = u64_column(batch, "timestamp_ms")?;
+        let modes = string_column(batch, "mode")?;
+        let metadata = string_column(batch, "metadata_json")?;
+        let seqs = u64_column(batch, "seq")?;
+        for idx in 0..batch.num_rows() {
+            out.push(ChatMessageRecord {
+                message_id: message_ids.value(idx).to_string(),
+                session_id: session_ids.value(idx).to_string(),
+                role: roles.value(idx).to_string(),
+                content: contents.value(idx).to_string(),
+                timestamp_ms: timestamps.value(idx),
+                mode: modes.value(idx).to_string(),
+                metadata_json: metadata.value(idx).to_string(),
+                seq: seqs.value(idx),
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn string_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a StringArray, ArchitectError> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| format!("missing column: {name}").into())
+        .and_then(|column| {
+            column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| format!("invalid string column: {name}").into())
+        })
+}
+
+fn u64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array, ArchitectError> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| format!("missing column: {name}").into())
+        .and_then(|column| {
+            column
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| format!("invalid u64 column: {name}").into())
+        })
+}
+
+fn session_record_to_summary(record: &ChatSessionRecord) -> SessionSummary {
+    SessionSummary {
+        session_id: record.session_id.clone(),
+        title: session_title_or_default(&record.title),
+        agent: record.agent.clone(),
+        created_at_ms: record.created_at_ms,
+        last_activity_at_ms: record.last_activity_at_ms,
+        message_count: record.message_count,
+        last_message_preview: if record.last_message_preview.trim().is_empty() {
+            None
+        } else {
+            Some(record.last_message_preview.clone())
+        },
+    }
+}
+
+fn message_record_to_persisted(record: ChatMessageRecord) -> PersistedChatMessage {
+    PersistedChatMessage {
+        message_id: record.message_id,
+        session_id: record.session_id,
+        role: record.role,
+        content: record.content,
+        timestamp_ms: record.timestamp_ms,
+        mode: record.mode,
+        metadata: serde_json::from_str(&record.metadata_json)
+            .unwrap_or_else(|_| json!({ "kind": "text" })),
+    }
+}
+
+fn sanitize_session_title(title: Option<&str>) -> String {
+    title
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| preview_text(value, 56))
+        .unwrap_or_else(|| "Untitled chat".to_string())
+}
+
+fn session_title_or_default(title: &str) -> String {
+    if title.trim().is_empty() {
+        "Untitled chat".to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+fn update_title_from_message(current_title: &str, message: &str) -> String {
+    if current_title != "Untitled chat" {
+        return current_title.to_string();
+    }
+    let normalized = compact_title_candidate(message);
+    if normalized.is_empty() {
+        current_title.to_string()
+    } else {
+        preview_text(&normalized, 56)
+    }
+}
+
+fn compact_title_candidate(message: &str) -> String {
+    let trimmed = message.trim();
+    let no_prefix = trimmed
+        .strip_prefix("FCMD:")
+        .or_else(|| trimmed.strip_prefix("ACMD:"))
+        .unwrap_or(trimmed);
+    no_prefix.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn preview_text(input: &str, max_chars: usize) -> String {
+    let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    compact
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn prompt_store_path(state: &ArchitectState) -> PathBuf {
@@ -832,8 +1615,11 @@ fn is_api_path(path: &str) -> bool {
     path.contains("/api/")
         || path == "/api/status"
         || path == "/api/chat"
+        || path == "/api/sessions"
+        || path.starts_with("/api/sessions/")
         || path.ends_with("/api/status")
         || path.ends_with("/api/chat")
+        || path.ends_with("/api/sessions")
         || path == "/healthz"
 }
 
@@ -843,6 +1629,21 @@ fn is_status_path(path: &str) -> bool {
 
 fn is_chat_path(path: &str) -> bool {
     path == "/api/chat" || path.ends_with("/api/chat")
+}
+
+fn is_sessions_collection_path(path: &str) -> bool {
+    path == "/api/sessions" || path.ends_with("/api/sessions")
+}
+
+fn is_session_detail_path(path: &str) -> bool {
+    path.starts_with("/api/sessions/") && session_id_from_path(path).is_some()
+}
+
+fn session_id_from_path(path: &str) -> Option<&str> {
+    path.split("/api/sessions/")
+        .nth(1)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn architect_index_html(state: &ArchitectState) -> String {
@@ -1067,6 +1868,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       border-radius: 18px;
       border: 1px solid var(--line);
       background: var(--panel-alt);
+      cursor: pointer;
     }}
     .history-card.active {{
       background: linear-gradient(180deg, #f5f8ff 0%, #eef3ff 100%);
@@ -1087,6 +1889,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
       color: var(--muted);
       font-size: 0.82rem;
       line-height: 1.45;
+    }}
+    .history-preview {{
+      margin-top: 8px;
+      color: var(--text);
+      font-size: 0.82rem;
+      line-height: 1.4;
     }}
     .history-note {{
       margin-top: 16px;
@@ -1408,32 +2216,19 @@ fn architect_index_html(state: &ArchitectState) -> String {
           <div class="chip"><span class="chip-label">Updated</span><span id="updated-at" class="chip-value">--</span></div>
         </div>
         <div id="service-strip" class="service-strip"></div>
-        <div id="status-note" class="status-note">Reading system inventory via `ADMIN_COMMAND` over socket.</div>
+        <div id="status-note" class="status-note"></div>
       </div>
     </div>
     <div class="workspace">
       <aside class="sidebar">
         <div class="sidebar-head">
           <div class="sidebar-title">Chat History</div>
-          <div class="mini-pill">local</div>
+          <div class="mini-pill">LanceDB</div>
         </div>
         <button id="new-chat" class="new-chat">New chat</button>
-        <div class="history-list">
-          <div class="history-card active">
-            <div id="session-title" class="history-name">Current session</div>
-            <div id="session-meta" class="history-meta">archi ready · waiting for first message</div>
-          </div>
-          <div class="history-card placeholder">
-            <div class="history-name">Support flow draft</div>
-            <div class="history-meta">session list UI placeholder</div>
-          </div>
-          <div class="history-card placeholder">
-            <div class="history-name">Cluster rollout notes</div>
-            <div class="history-meta">persistence still pending</div>
-          </div>
-        </div>
+        <div id="history-list" class="history-list"></div>
         <div class="history-note">
-          Real session persistence is still pending, but this rail is now structured as a chat navigator instead of an info card.
+          Chat sessions stay local to this node and reload from LanceDB.
         </div>
         <div class="meta-grid">
           <div><strong>Node</strong>: {node}</div>
@@ -1461,7 +2256,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         <div class="composer">
           <textarea id="input" placeholder="Message, FCMD: {{...}}, or ACMD: curl -X GET /hives/{hive}/nodes"></textarea>
           <div class="composer-row">
-            <div class="hint">Enter to send. Shift+Enter for newline. Chat history on the left is layout-ready even though persistent sessions are still pending.</div>
+            <div id="composer-hint" class="hint">Enter to send. Shift+Enter for newline. Sessions on the left are local and reload-safe.</div>
             <button id="send">Send</button>
           </div>
         </div>
@@ -1473,15 +2268,18 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const base = rawPath === "" ? "" : rawPath;
     const statusUrl = (base || "") + "/api/status";
     const chatUrl = (base || "") + "/api/chat";
+    const sessionsUrl = (base || "") + "/api/sessions";
+    const currentSessionStorageKey = "sy.architect.currentSession.{hive}";
     const messages = document.getElementById("messages");
     const input = document.getElementById("input");
     const send = document.getElementById("send");
     const newChat = document.getElementById("new-chat");
+    const historyList = document.getElementById("history-list");
     const serviceStrip = document.getElementById("service-strip");
     const statusNote = document.getElementById("status-note");
-    const sessionTitle = document.getElementById("session-title");
-    const sessionMeta = document.getElementById("session-meta");
-    let userMessageCount = 0;
+    const composerHint = document.getElementById("composer-hint");
+    let currentSessionId = null;
+    let sessionsCache = [];
     function appendMessage(kind, labelText, bodyContent) {{
       const div = document.createElement("div");
       const label = document.createElement("div");
@@ -1546,18 +2344,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
         chip.appendChild(value);
         serviceStrip.appendChild(chip);
       }});
-    }}
-
-    function updateSession(text) {{
-      const compact = text.replace(/\s+/g, " ").trim();
-      if (!compact) return;
-      userMessageCount += 1;
-      if (userMessageCount === 1) {{
-        sessionTitle.textContent = compact.slice(0, 42) || "Current session";
-      }}
-      sessionMeta.textContent = userMessageCount === 1
-        ? "first message captured locally"
-        : userMessageCount + " local messages in this session";
     }}
 
     function addMessage(kind, text) {{
@@ -1626,6 +2412,16 @@ fn architect_index_html(state: &ArchitectState) -> String {
 
       appendMessage(kind, kind === "architect" ? "archi" : "System", shell);
     }}
+    function renderStoredMessage(message) {{
+      const metadata = message && message.metadata ? message.metadata : {{}};
+      if (metadata.kind === "response" && metadata.response) {{
+        const role = message.role === "architect" ? "architect" : message.role === "system" ? "system" : "architect";
+        renderCommandResult(role, metadata.response.mode, metadata.response);
+        return;
+      }}
+      const role = message.role === "architect" ? "architect" : message.role === "system" ? "system" : "user";
+      addMessage(role, message.content || "");
+    }}
     function isDestructiveMessage(message) {{
       const trimmed = String(message || "").trim();
       if (!trimmed.startsWith("ACMD:")) return false;
@@ -1637,13 +2433,111 @@ fn architect_index_html(state: &ArchitectState) -> String {
       addMessage("architect", "I am archi. AI conversation is still pending, but the control-plane shell and prompt operations are live.");
       addMessage("system", "Example: FCMD: {{\"op\":\"prompt.get\",\"prompt_id\":\"architect\"}} or ACMD: curl -X GET /hives/{hive}/nodes");
     }}
-    function resetChatSession() {{
+    function resetChatViewport() {{
       messages.innerHTML = "";
       input.value = "";
-      userMessageCount = 0;
-      sessionTitle.textContent = "Current session";
-      sessionMeta.textContent = "archi ready · waiting for first message";
-      seedWelcomeMessages();
+    }}
+    function formatSessionMeta(session) {{
+      if (!session) return "waiting for first message";
+      if (!session.message_count) return "waiting for first message";
+      const count = Number(session.message_count || 0);
+      return count + " messages · updated " + formatTimestamp(session.last_activity_at_ms);
+    }}
+    function renderHistory() {{
+      historyList.innerHTML = "";
+      if (!sessionsCache.length) {{
+        const empty = document.createElement("div");
+        empty.className = "history-card placeholder";
+        empty.innerHTML = '<div class="history-name">No chats yet</div><div class="history-meta">Create the first session to start working with archi.</div>';
+        historyList.appendChild(empty);
+        return;
+      }}
+      sessionsCache.forEach((session) => {{
+        const card = document.createElement("div");
+        const name = document.createElement("div");
+        const meta = document.createElement("div");
+        card.className = "history-card" + (session.session_id === currentSessionId ? " active" : "");
+        name.className = "history-name";
+        meta.className = "history-meta";
+        name.textContent = session.title || "Untitled chat";
+        meta.textContent = formatSessionMeta(session);
+        card.appendChild(name);
+        card.appendChild(meta);
+        if (session.last_message_preview) {{
+          const preview = document.createElement("div");
+          preview.className = "history-preview";
+          preview.textContent = session.last_message_preview;
+          card.appendChild(preview);
+        }}
+        card.addEventListener("click", () => {{
+          if (session.session_id !== currentSessionId) {{
+            loadSession(session.session_id);
+          }}
+        }});
+        historyList.appendChild(card);
+      }});
+    }}
+    async function refreshSessionList(preferredSessionId) {{
+      const res = await fetch(sessionsUrl);
+      const data = await res.json();
+      sessionsCache = Array.isArray(data.sessions) ? data.sessions : [];
+      if (!currentSessionId && sessionsCache.length) {{
+        currentSessionId = preferredSessionId || localStorage.getItem(currentSessionStorageKey) || sessionsCache[0].session_id;
+      }}
+      if (preferredSessionId) {{
+        currentSessionId = preferredSessionId;
+      }}
+      renderHistory();
+    }}
+    async function createSession() {{
+      const res = await fetch(sessionsUrl, {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{}})
+      }});
+      const detail = await res.json();
+      await refreshSessionList(detail.session && detail.session.session_id ? detail.session.session_id : null);
+      await loadSession(detail.session.session_id, detail);
+    }}
+    function updateComposerHint(session) {{
+      if (!session) {{
+        composerHint.textContent = "Enter to send. Shift+Enter for newline. Sessions on the left are local and reload-safe.";
+        return;
+      }}
+      composerHint.textContent = session.message_count
+        ? "Enter to send. Shift+Enter for newline. This chat has " + session.message_count + " persisted messages."
+        : "Enter to send. Shift+Enter for newline. This chat is empty and ready.";
+    }}
+    function renderSession(detail) {{
+      resetChatViewport();
+      const session = detail && detail.session ? detail.session : null;
+      const sessionId = session && session.session_id ? session.session_id : null;
+      currentSessionId = sessionId;
+      if (sessionId) {{
+        localStorage.setItem(currentSessionStorageKey, sessionId);
+      }}
+      renderHistory();
+      updateComposerHint(session);
+      if (!detail || !Array.isArray(detail.messages) || detail.messages.length === 0) {{
+        seedWelcomeMessages();
+        return;
+      }}
+      detail.messages.forEach((message) => renderStoredMessage(message));
+    }}
+    async function loadSession(sessionId, existingDetail) {{
+      currentSessionId = sessionId;
+      renderHistory();
+      localStorage.setItem(currentSessionStorageKey, sessionId);
+      if (existingDetail) {{
+        renderSession(existingDetail);
+        return;
+      }}
+      const res = await fetch(sessionsUrl + "/" + encodeURIComponent(sessionId));
+      if (!res.ok) {{
+        throw new Error("session load failed");
+      }}
+      const detail = await res.json();
+      renderSession(detail);
     }}
     async function refreshStatus() {{
       try {{
@@ -1659,30 +2553,39 @@ fn architect_index_html(state: &ArchitectState) -> String {
         renderComponents(data.components);
         if (data.error) {{
           statusNote.textContent = "Status degraded: " + data.error;
+          statusNote.style.display = "block";
         }} else {{
-          statusNote.textContent = "System inventory via ADMIN_COMMAND socket. Hive " + data.hive_id + ".";
+          statusNote.textContent = "";
+          statusNote.style.display = "none";
         }}
       }} catch (_err) {{}}
     }}
     async function submit() {{
       const message = input.value.trim();
       if (!message) return;
+      if (!currentSessionId) {{
+        await createSession();
+      }}
       if (isDestructiveMessage(message)) {{
         const confirmed = window.confirm("This command looks destructive. Do you want to send it?");
         if (!confirmed) return;
       }}
       addMessage("user", message);
-      updateSession(message);
       input.value = "";
       send.disabled = true;
       try {{
         const res = await fetch(chatUrl, {{
           method: "POST",
           headers: {{ "Content-Type": "application/json" }},
-          body: JSON.stringify({{ message }})
+          body: JSON.stringify({{ session_id: currentSessionId, message }})
         }});
         const data = await res.json();
+        if (data.session_id) {{
+          currentSessionId = data.session_id;
+          localStorage.setItem(currentSessionStorageKey, currentSessionId);
+        }}
         renderCommandResult(data.status === "ok" ? "architect" : "system", data.mode, data);
+        await refreshSessionList(currentSessionId);
       }} catch (err) {{
         addMessage("system", "Request failed: " + err);
       }} finally {{
@@ -1691,16 +2594,32 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
     }}
     send.addEventListener("click", submit);
-    newChat.addEventListener("click", resetChatSession);
+    newChat.addEventListener("click", () => {{
+      createSession().catch((err) => {{
+        addMessage("system", "Session creation failed: " + err);
+      }});
+    }});
     input.addEventListener("keydown", (event) => {{
       if (event.key === "Enter" && !event.shiftKey) {{
         event.preventDefault();
         submit();
       }}
     }});
-    resetChatSession();
-    refreshStatus();
-    setInterval(refreshStatus, 5000);
+    async function bootstrap() {{
+      resetChatViewport();
+      await refreshSessionList(localStorage.getItem(currentSessionStorageKey));
+      if (!sessionsCache.length) {{
+        await createSession();
+      }} else {{
+        const preferred = currentSessionId || localStorage.getItem(currentSessionStorageKey) || sessionsCache[0].session_id;
+        await loadSession(preferred);
+      }}
+      await refreshStatus();
+      setInterval(refreshStatus, 5000);
+    }}
+    bootstrap().catch((err) => {{
+      addMessage("system", "Bootstrap failed: " + err);
+    }});
   </script>
         </body>
 </html>"##,
