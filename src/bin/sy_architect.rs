@@ -47,6 +47,7 @@ Rules:
 - Be direct and operational.
 - Prefer short concrete answers over long explanations.
 - If the user asks about system state, deployments, nodes, hives, identity, or operations, prefer SCMD/system operations when available.
+- If you are unsure which Fluxbee action or path exists, inspect `/admin/actions` or `/admin/actions/{action}` before answering.
 - Use the available read-only system tool when you need live Fluxbee state instead of guessing.
 - Do not perform mutations through tools; destructive or write actions stay manual through explicit SCMD from the operator.
 - Do not claim actions were executed unless they actually were.
@@ -277,7 +278,8 @@ impl FunctionTool for ArchitectSystemGetTool {
         FunctionToolDefinition {
             name: "fluxbee_system_get".to_string(),
             description: format!(
-                "Read live Fluxbee system state through SY.admin over socket for hive {}. Read-only. Supports GET paths and safe POST checks such as OPA policy validation. Example paths: /hives/{}/inventory/summary, /hives/{}/nodes, /hives/{}/nodes/SY.admin@{}/status, /hives/{}/identity/ilks, /admin/actions, /config/storage",
+                "Read live Fluxbee system state through SY.admin over socket for hive {}. Read-only. Supports GET paths and safe POST checks such as OPA policy validation. Use /admin/actions or /admin/actions/{action} when you need dynamic help. Example paths: /hives/{}/inventory/summary, /hives/{}/nodes, /hives/{}/nodes/SY.admin@{}/status, /hives/{}/identity/ilks, /admin/actions, /admin/actions/get_node_status, /config/storage",
+                self.context.hive_id,
                 self.context.hive_id,
                 self.context.hive_id,
                 self.context.hive_id,
@@ -912,6 +914,12 @@ fn translate_scmd(
             action: "list_admin_actions".to_string(),
             target_hive: local_hive_id.to_string(),
             params: json!({}),
+        }),
+        ("GET", ["admin", "actions", action_name]) => Ok(AdminTranslation {
+            admin_target,
+            action: "get_admin_action_help".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({ "action_name": action_name }),
         }),
         ("GET", ["hive", "status"]) => Ok(AdminTranslation {
             admin_target,

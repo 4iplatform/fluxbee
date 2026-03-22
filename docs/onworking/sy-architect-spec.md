@@ -723,6 +723,7 @@ This is now the highest-value execution track. `SY.architect` should converge to
 - [x] ARCH-T32. Expandir cobertura read-only de `SY.admin` en `SCMD` y tools del agente:
   - `list_hives`, `get_hive`
   - `list_admin_actions`
+  - `get_admin_action_help`
   - `list_versions`, `get_versions`
   - `list_runtimes`, `get_runtime`
   - `list_routes`, `list_vpns`
@@ -747,6 +748,10 @@ This is now the highest-value execution track. `SY.architect` should converge to
   - mostrar qué tool usó `archi`
   - mostrar inputs relevantes y resultado resumido
   - mantener salida completa disponible en metadata
+
+Note:
+- `SY.admin` should be the canonical dynamic help surface for action discovery.
+- `archi` should prefer `/admin/actions` and `/admin/actions/{action}` over hardcoded prompt knowledge when it is unsure about available operations.
 
 ### Phase D — Prompt Assets And Build-Time Policy
 
