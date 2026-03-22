@@ -1959,7 +1959,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
     .shell-title-row {{
       display: flex;
       align-items: flex-start;
-      justify-content: space-between;
       gap: 16px;
     }}
     .shell-kicker {{
@@ -1975,33 +1974,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font-size: 1.8rem;
       line-height: 1;
       letter-spacing: -0.04em;
-    }}
-    .shell-subtitle {{
-      margin-top: 8px;
-      color: var(--muted);
-      font-size: 0.98rem;
-      max-width: 740px;
-    }}
-    .helper-chip {{
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      padding: 10px 12px;
-      min-width: 190px;
-      background: var(--panel-alt);
-    }}
-    .helper-chip strong {{
-      display: block;
-      font-size: 0.76rem;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--muted);
-      margin-bottom: 4px;
-    }}
-    .helper-chip span {{
-      display: block;
-      font-size: 0.9rem;
-      font-weight: 600;
-      color: var(--text);
     }}
     .messages {{
       min-height: 0;
@@ -2266,14 +2238,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
             <div>
               <div class="shell-kicker">System Architect Terminal</div>
               <h1 class="shell-title">archi</h1>
-              <div class="shell-subtitle">
-                Fluxbee control surface for system design, prompt operations, and admin passthrough.
-                The top status bar can grow without changing the composition, matching the spec direction.
-              </div>
-            </div>
-            <div class="helper-chip">
-              <strong>Quick Start</strong>
-              <span>Use `FCMD:` for local prompt control or `ACMD:` for admin reads and actions.</span>
             </div>
           </div>
         </div>
@@ -2488,7 +2452,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       renderHistory();
     }}
-    async function createSession() {{
+    async function createSession(showWelcome = false) {{
       const res = await fetch(sessionsUrl, {{
         method: "POST",
         headers: {{ "Content-Type": "application/json" }},
@@ -2496,7 +2460,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }});
       const detail = await res.json();
       await refreshSessionList(detail.session && detail.session.session_id ? detail.session.session_id : null);
-      await loadSession(detail.session.session_id, detail);
+      await loadSession(detail.session.session_id, detail, showWelcome);
     }}
     function updateComposerHint(session) {{
       if (!session) {{
@@ -2507,7 +2471,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         ? "Enter to send. Shift+Enter for newline. This chat has " + session.message_count + " persisted messages."
         : "Enter to send. Shift+Enter for newline. This chat is empty and ready.";
     }}
-    function renderSession(detail) {{
+    function renderSession(detail, showWelcome = false) {{
       resetChatViewport();
       const session = detail && detail.session ? detail.session : null;
       const sessionId = session && session.session_id ? session.session_id : null;
@@ -2518,17 +2482,19 @@ fn architect_index_html(state: &ArchitectState) -> String {
       renderHistory();
       updateComposerHint(session);
       if (!detail || !Array.isArray(detail.messages) || detail.messages.length === 0) {{
-        seedWelcomeMessages();
+        if (showWelcome) {{
+          seedWelcomeMessages();
+        }}
         return;
       }}
       detail.messages.forEach((message) => renderStoredMessage(message));
     }}
-    async function loadSession(sessionId, existingDetail) {{
+    async function loadSession(sessionId, existingDetail, showWelcome = false) {{
       currentSessionId = sessionId;
       renderHistory();
       localStorage.setItem(currentSessionStorageKey, sessionId);
       if (existingDetail) {{
-        renderSession(existingDetail);
+        renderSession(existingDetail, showWelcome);
         return;
       }}
       const res = await fetch(sessionsUrl + "/" + encodeURIComponent(sessionId));
@@ -2536,7 +2502,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         throw new Error("session load failed");
       }}
       const detail = await res.json();
-      renderSession(detail);
+      renderSession(detail, showWelcome);
     }}
     async function refreshStatus() {{
       try {{
@@ -2586,7 +2552,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     send.addEventListener("click", submit);
     newChat.addEventListener("click", () => {{
-      createSession().catch((err) => {{
+      createSession(false).catch((err) => {{
         addMessage("system", "Session creation failed: " + err);
       }});
     }});
@@ -2600,10 +2566,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
       resetChatViewport();
       await refreshSessionList(localStorage.getItem(currentSessionStorageKey));
       if (!sessionsCache.length) {{
-        await createSession();
+        await createSession(true);
       }} else {{
         const preferred = currentSessionId || localStorage.getItem(currentSessionStorageKey) || sessionsCache[0].session_id;
-        await loadSession(preferred);
+        await loadSession(preferred, null, false);
       }}
       await refreshStatus();
       setInterval(refreshStatus, 5000);
