@@ -58,3 +58,10 @@ dist:
   sync:
     enabled: true
     tool: "syncthing"
+
+ai_providers:
+  openai:
+    api_key: "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"
+    default_model: "gpt-4.1-mini"
+    max_tokens: 1200
+    temperature: 0.2
