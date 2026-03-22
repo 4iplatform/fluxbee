@@ -1791,19 +1791,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
       flex-wrap: wrap;
       justify-content: flex-end;
     }}
-    .service-strip {{
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-    }}
-    .status-note {{
-      color: var(--muted);
-      font-size: 0.78rem;
-      line-height: 1.35;
-      text-align: right;
-      max-width: 420px;
-    }}
     .chip {{
       border: 1px solid var(--line);
       background: var(--panel);
@@ -1832,9 +1819,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     .chip-value.warn {{
       color: var(--warning);
-    }}
-    .service-chip {{
-      background: var(--panel-alt);
     }}
     .workspace {{
       display: grid;
@@ -2204,12 +2188,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       .topbar {{
         align-items: stretch;
       }}
-      .status-note {{
-        text-align: left;
-        max-width: none;
-      }}
-      .status-strip,
-      .service-strip {{
+      .status-strip {{
         justify-content: flex-start;
       }}
       .brand-mark {{
@@ -2263,8 +2242,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
           <div class="chip"><span class="chip-label">Nodes</span><span id="nodes-summary" class="chip-value">--</span></div>
           <div class="chip"><span class="chip-label">Updated</span><span id="updated-at" class="chip-value">--</span></div>
         </div>
-        <div id="service-strip" class="service-strip"></div>
-        <div id="status-note" class="status-note"></div>
       </div>
     </div>
     <div class="workspace">
@@ -2323,8 +2300,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const send = document.getElementById("send");
     const newChat = document.getElementById("new-chat");
     const historyList = document.getElementById("history-list");
-    const serviceStrip = document.getElementById("service-strip");
-    const statusNote = document.getElementById("status-note");
     const composerHint = document.getElementById("composer-hint");
     let currentSessionId = null;
     let sessionsCache = [];
@@ -2368,30 +2343,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const date = new Date(Number(value));
       if (Number.isNaN(date.getTime())) return "--";
       return date.toLocaleTimeString([], {{ hour: "2-digit", minute: "2-digit", second: "2-digit" }});
-    }}
-
-    function renderComponents(components) {{
-      serviceStrip.innerHTML = "";
-      (components || []).forEach((component) => {{
-        const chip = document.createElement("div");
-        const label = document.createElement("span");
-        const value = document.createElement("span");
-        chip.className = "chip service-chip";
-        label.className = "chip-label";
-        label.textContent = component.label || component.key || "component";
-        value.className = "chip-value";
-        value.textContent = String(component.status || "unknown");
-        const cls = statusClass(component.status);
-        if (cls) {{
-          value.classList.add(cls);
-        }}
-        if (component.node_name) {{
-          chip.title = component.node_name;
-        }}
-        chip.appendChild(label);
-        chip.appendChild(value);
-        serviceStrip.appendChild(chip);
-      }});
     }}
 
     function addMessage(kind, text) {{
@@ -2598,14 +2549,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
         formatChip("hives-summary", totalHives ? (String(alive) + "/" + String(totalHives) + " alive") : "--", stale > 0 ? "warn" : "ok");
         formatChip("nodes-summary", totalNodes ? String(totalNodes) : "--", totalNodes > 0 ? "ok" : "");
         formatChip("updated-at", formatTimestamp(data.inventory_updated_at), data.admin_available ? "ok" : "warn");
-        renderComponents(data.components);
-        if (data.error) {{
-          statusNote.textContent = "Status degraded: " + data.error;
-          statusNote.style.display = "block";
-        }} else {{
-          statusNote.textContent = "";
-          statusNote.style.display = "none";
-        }}
       }} catch (_err) {{}}
     }}
     async function submit() {{
