@@ -720,7 +720,7 @@ This is the most important product phase for now. The architect should become us
 
 This is now the highest-value execution track. `SY.architect` should converge toward broad operational coverage of what `SY.admin` already exposes today.
 
-- [ ] ARCH-T32. Expandir cobertura read-only de `SY.admin` en `SCMD` y tools del agente:
+- [x] ARCH-T32. Expandir cobertura read-only de `SY.admin` en `SCMD` y tools del agente:
   - `list_hives`, `get_hive`
   - `list_admin_actions`
   - `list_versions`, `get_versions`

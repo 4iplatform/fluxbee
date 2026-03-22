@@ -277,8 +277,7 @@ impl FunctionTool for ArchitectSystemGetTool {
         FunctionToolDefinition {
             name: "fluxbee_system_get".to_string(),
             description: format!(
-                "Read live Fluxbee system state through SY.admin over socket for hive {}. Read-only. Use for inventory, nodes, node status, and identity ilks. Example paths: /hives/{}/inventory/summary, /hives/{}/nodes, /hives/{}/nodes/SY.admin@{}/status, /hives/{}/identity/ilks",
-                self.context.hive_id,
+                "Read live Fluxbee system state through SY.admin over socket for hive {}. Read-only. Supports GET paths and safe POST checks such as OPA policy validation. Example paths: /hives/{}/inventory/summary, /hives/{}/nodes, /hives/{}/nodes/SY.admin@{}/status, /hives/{}/identity/ilks, /admin/actions, /config/storage",
                 self.context.hive_id,
                 self.context.hive_id,
                 self.context.hive_id,
@@ -289,9 +288,18 @@ impl FunctionTool for ArchitectSystemGetTool {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST"],
+                        "description": "HTTP-like read method. Defaults to GET. POST is only for safe read/check operations."
+                    },
                     "path": {
                         "type": "string",
-                        "description": "Read-only Fluxbee path starting with /hives/{hive}/..., for example /hives/motherbee/nodes"
+                        "description": "Read-only Fluxbee path, for example /hives/motherbee/nodes or /admin/actions"
+                    },
+                    "body": {
+                        "type": "object",
+                        "description": "Optional JSON object for safe POST checks such as /hives/{hive}/opa/policy/check"
                     }
                 },
                 "required": ["path"]
@@ -300,6 +308,13 @@ impl FunctionTool for ArchitectSystemGetTool {
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let method = arguments
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("GET")
+            .to_ascii_uppercase();
         let path = arguments
             .get("path")
             .and_then(Value::as_str)
@@ -310,10 +325,22 @@ impl FunctionTool for ArchitectSystemGetTool {
                     "fluxbee_system_get requires a non-empty 'path'".to_string(),
                 )
             })?;
+        let body = arguments.get("body").cloned();
+        if method != "GET" && method != "POST" {
+            return Err(fluxbee_ai_sdk::AiSdkError::Protocol(
+                "fluxbee_system_get only supports GET or POST".to_string(),
+            ));
+        }
+        if method == "GET" && body.is_some() {
+            return Err(fluxbee_ai_sdk::AiSdkError::Protocol(
+                "fluxbee_system_get does not accept a body for GET requests".to_string(),
+            ));
+        }
 
-        let parsed = parse_scmd(&format!("curl -X GET {path}")).map_err(|err| {
-            fluxbee_ai_sdk::AiSdkError::Protocol(format!("invalid system get path: {err}"))
-        })?;
+        let parsed =
+            parse_scmd(&scmd_raw_from_parts(&method, path, body.as_ref())).map_err(|err| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(format!("invalid system get path: {err}"))
+            })?;
         let translation = translate_scmd(&self.context.hive_id, parsed).map_err(|err| {
             fluxbee_ai_sdk::AiSdkError::Protocol(format!("unsupported system get path: {err}"))
         })?;
@@ -832,6 +859,18 @@ async fn handle_scmd(state: &ArchitectState, raw: &str) -> Result<Value, Archite
     execute_admin_translation(state, translated).await
 }
 
+fn scmd_raw_from_parts(method: &str, path: &str, body: Option<&Value>) -> String {
+    match body {
+        Some(value) => format!(
+            "curl -X {} {} -d '{}'",
+            method,
+            path,
+            serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+        ),
+        None => format!("curl -X {} {}", method, path),
+    }
+}
+
 fn parse_scmd(raw: &str) -> Result<ParsedScmd, ArchitectError> {
     let mut text = raw.trim();
     if !text.starts_with("curl ") {
@@ -864,56 +903,178 @@ fn translate_scmd(
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect();
-    if segments.len() < 2 || segments[0] != "hives" {
-        return Err("SCMD path must start with /hives/{hive}/...".into());
-    }
-    let hive_id = segments[1].to_string();
     let admin_target = format!("SY.admin@{local_hive_id}");
 
     match (parsed.method.as_str(), segments.as_slice()) {
-        ("GET", ["hives", _, "nodes"]) => Ok(AdminTranslation {
+        ("GET", ["admin", "actions"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "list_admin_actions".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["hive", "status"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "hive_status".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["hives"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "list_hives".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["versions"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "list_versions".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["deployments"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "list_deployments".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["drift-alerts"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "list_drift_alerts".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["config", "storage"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "get_storage".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["hives", hive_id]) => Ok(AdminTranslation {
+            admin_target,
+            action: "get_hive".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({ "hive_id": hive_id }),
+        }),
+        ("GET", ["hives", hive_id, "nodes"]) => Ok(AdminTranslation {
             admin_target,
             action: "list_nodes".to_string(),
-            target_hive: hive_id,
+            target_hive: (*hive_id).to_string(),
             params: json!({}),
         }),
-        ("GET", ["hives", _, "inventory", "summary"]) => Ok(AdminTranslation {
+        ("GET", ["hives", hive_id, "inventory", "summary"]) => Ok(AdminTranslation {
             admin_target,
             action: "inventory".to_string(),
-            target_hive: hive_id,
+            target_hive: (*hive_id).to_string(),
             params: json!({ "scope": "summary" }),
         }),
-        ("GET", ["hives", _, "inventory", "hive"]) => Ok(AdminTranslation {
+        ("GET", ["hives", hive_id, "inventory", "hive"]) => Ok(AdminTranslation {
             admin_target,
             action: "inventory".to_string(),
-            target_hive: hive_id.clone(),
+            target_hive: (*hive_id).to_string(),
             params: json!({ "scope": "hive", "filter_hive": hive_id }),
         }),
-        ("GET", ["hives", _, "nodes", node_name, "status"]) => Ok(AdminTranslation {
+        ("GET", ["hives", hive_id, "nodes", node_name, "status"]) => Ok(AdminTranslation {
             admin_target,
             action: "get_node_status".to_string(),
-            target_hive: hive_id,
+            target_hive: (*hive_id).to_string(),
             params: json!({ "node_name": node_name }),
         }),
-        ("GET", ["hives", _, "identity", "ilks"]) => Ok(AdminTranslation {
+        ("GET", ["hives", hive_id, "nodes", node_name, "config"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "get_node_config".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({ "node_name": node_name }),
+        }),
+        ("GET", ["hives", hive_id, "nodes", node_name, "state"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "get_node_state".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({ "node_name": node_name }),
+        }),
+        ("GET", ["hives", hive_id, "identity", "ilks"]) => Ok(AdminTranslation {
             admin_target,
             action: "list_ilks".to_string(),
-            target_hive: hive_id,
+            target_hive: (*hive_id).to_string(),
             params: json!({}),
         }),
-        ("GET", ["hives", _, "identity", "ilks", ilk_id]) => Ok(AdminTranslation {
+        ("GET", ["hives", hive_id, "identity", "ilks", ilk_id]) => Ok(AdminTranslation {
             admin_target,
             action: "get_ilk".to_string(),
-            target_hive: hive_id,
+            target_hive: (*hive_id).to_string(),
             params: json!({ "ilk_id": ilk_id }),
         }),
-        ("DELETE", ["hives", _, "nodes", node_name, "instance"]) => Ok(AdminTranslation {
+        ("GET", ["hives", hive_id, "versions"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "get_versions".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["hives", hive_id, "runtimes"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "list_runtimes".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["hives", hive_id, "runtimes", runtime]) => Ok(AdminTranslation {
+            admin_target,
+            action: "get_runtime".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({ "runtime": runtime }),
+        }),
+        ("GET", ["hives", hive_id, "routes"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "list_routes".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["hives", hive_id, "vpns"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "list_vpns".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["hives", hive_id, "deployments"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "get_deployments".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["hives", hive_id, "drift-alerts"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "get_drift_alerts".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["hives", hive_id, "opa", "policy"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "opa_get_policy".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["hives", hive_id, "opa", "status"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "opa_get_status".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({}),
+        }),
+        ("POST", ["hives", hive_id, "opa", "policy", "check"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for opa check must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "opa_check".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("DELETE", ["hives", hive_id, "nodes", node_name, "instance"]) => Ok(AdminTranslation {
             admin_target,
             action: "remove_node_instance".to_string(),
-            target_hive: hive_id,
+            target_hive: (*hive_id).to_string(),
             params: json!({ "node_name": node_name }),
         }),
-        ("DELETE", ["hives", _, "nodes", node_name]) => {
+        ("DELETE", ["hives", hive_id, "nodes", node_name]) => {
             let force = parsed
                 .body
                 .as_ref()
@@ -923,11 +1084,11 @@ fn translate_scmd(
             Ok(AdminTranslation {
                 admin_target,
                 action: "kill_node".to_string(),
-                target_hive: hive_id,
+                target_hive: (*hive_id).to_string(),
                 params: json!({ "node_name": node_name, "force": force }),
             })
         }
-        ("POST", ["hives", _, "nodes", node_name, "messages"]) => {
+        ("POST", ["hives", hive_id, "nodes", node_name, "messages"]) => {
             let mut params = parsed.body.unwrap_or_else(|| json!({}));
             if !params.is_object() {
                 return Err("SCMD body for send message must be a JSON object".into());
@@ -936,7 +1097,7 @@ fn translate_scmd(
             Ok(AdminTranslation {
                 admin_target,
                 action: "send_node_message".to_string(),
-                target_hive: hive_id,
+                target_hive: (*hive_id).to_string(),
                 params,
             })
         }
