@@ -731,7 +731,7 @@ This is now the highest-value execution track. `SY.architect` should converge to
   - `list_deployments`, `get_deployments`
   - `list_drift_alerts`, `get_drift_alerts`
   - `opa_get_policy`, `opa_get_status`, `opa_check`
-- [ ] ARCH-T33. Exponer acciones mutating de `SY.admin` a través de `SY.architect` con política explícita de confirmación:
+- [x] ARCH-T33. Exponer acciones mutating de `SY.admin` a través de `SY.architect` con política explícita de confirmación:
   - `run_node`, `kill_node`, `remove_node_instance`
   - `add_hive`, `remove_hive`
   - `add_route`, `delete_route`
@@ -740,10 +740,14 @@ This is now the highest-value execution track. `SY.architect` should converge to
   - `send_node_message`
   - `update`, `sync_hint`
   - `opa_compile`, `opa_apply`, `opa_compile_apply`, `opa_rollback`
-- [ ] ARCH-T34. Diseñar contrato de confirmación para tools de escritura:
+- [x] ARCH-T34. Diseñar contrato de confirmación para tools de escritura:
   - lectura libre
   - escritura/mutación solo con confirmación explícita del operador
   - no depender solo del prompt para seguridad
+- Confirmation flow v1:
+  - el agente puede preparar una mutación con `fluxbee_system_write`
+  - la acción queda pendiente por sesión
+  - el operador debe responder `CONFIRM` para ejecutar o `CANCEL` para descartar
 - [ ] ARCH-T35. Mejorar render/persistencia de tool calls:
   - mostrar qué tool usó `archi`
   - mostrar inputs relevantes y resultado resumido

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,7 +49,7 @@ Rules:
 - If the user asks about system state, deployments, nodes, hives, identity, or operations, prefer SCMD/system operations when available.
 - If you are unsure which Fluxbee action or path exists, inspect `/admin/actions` or `/admin/actions/{action}` before answering.
 - Use the available read-only system tool when you need live Fluxbee state instead of guessing.
-- Do not perform mutations through tools; destructive or write actions stay manual through explicit SCMD from the operator.
+- For mutations, use the write tool only to stage the action. Then instruct the operator to reply CONFIRM or CANCEL. Do not claim the mutation ran before confirmation.
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.
 - Keep answers useful for administrators and developers."#;
@@ -108,6 +108,8 @@ struct ArchitectAdminToolContext {
     config_dir: PathBuf,
     state_dir: PathBuf,
     socket_dir: PathBuf,
+    session_id: Option<String>,
+    pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
 }
 
 struct ArchitectState {
@@ -121,6 +123,7 @@ struct ArchitectState {
     ai_configured: AtomicBool,
     ai_runtime: Option<ArchitectAiRuntime>,
     chat_lock: Mutex<()>,
+    pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -246,6 +249,13 @@ struct AdminTranslation {
     params: Value,
 }
 
+#[derive(Debug, Clone)]
+struct PendingAdminAction {
+    translation: AdminTranslation,
+    preview_command: String,
+    created_at_ms: u64,
+}
+
 struct ArchitectAdminReadToolsProvider {
     context: ArchitectAdminToolContext,
 }
@@ -258,7 +268,10 @@ impl ArchitectAdminReadToolsProvider {
 
 impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
     fn register_tools(&self, registry: &mut FunctionToolRegistry) -> fluxbee_ai_sdk::Result<()> {
-        registry.register(Arc::new(ArchitectSystemGetTool::new(self.context.clone())))
+        registry.register(Arc::new(ArchitectSystemGetTool::new(self.context.clone())))?;
+        registry.register(Arc::new(ArchitectSystemWriteTool::new(
+            self.context.clone(),
+        )))
     }
 }
 
@@ -267,6 +280,16 @@ struct ArchitectSystemGetTool {
 }
 
 impl ArchitectSystemGetTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+struct ArchitectSystemWriteTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl ArchitectSystemWriteTool {
     fn new(context: ArchitectAdminToolContext) -> Self {
         Self { context }
     }
@@ -356,6 +379,112 @@ impl FunctionTool for ArchitectSystemGetTool {
     }
 }
 
+#[async_trait]
+impl FunctionTool for ArchitectSystemWriteTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "fluxbee_system_write".to_string(),
+            description: format!(
+                "Prepare a mutating Fluxbee admin action for hive {}. This tool does not execute immediately. It stages the action and requires explicit user confirmation in chat with CONFIRM or CANCEL. Use it for run_node, route/vpn changes, config writes, OPA apply flows, and other mutations.",
+                self.context.hive_id,
+            ),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "enum": ["POST", "PUT", "DELETE"],
+                        "description": "Mutation method."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Mutating Fluxbee path, for example /hives/motherbee/nodes or /hives/motherbee/opa/policy/apply"
+                    },
+                    "body": {
+                        "type": "object",
+                        "description": "Optional JSON object payload."
+                    }
+                },
+                "required": ["method", "path"]
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let session_id = self
+            .context
+            .session_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_system_write requires a live chat session".to_string(),
+                )
+            })?;
+        let method = arguments
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_system_write requires 'method'".to_string(),
+                )
+            })?
+            .to_ascii_uppercase();
+        if !matches!(method.as_str(), "POST" | "PUT" | "DELETE") {
+            return Err(fluxbee_ai_sdk::AiSdkError::Protocol(
+                "fluxbee_system_write only supports POST, PUT, or DELETE".to_string(),
+            ));
+        }
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_system_write requires a non-empty 'path'".to_string(),
+                )
+            })?;
+        let body = arguments.get("body").cloned();
+        let raw = scmd_raw_from_parts(&method, path, body.as_ref());
+        let parsed = parse_scmd(&raw).map_err(|err| {
+            fluxbee_ai_sdk::AiSdkError::Protocol(format!("invalid system write path: {err}"))
+        })?;
+        let translation = translate_scmd(&self.context.hive_id, parsed).map_err(|err| {
+            fluxbee_ai_sdk::AiSdkError::Protocol(format!("unsupported system write path: {err}"))
+        })?;
+        if !admin_action_allows_ai_write(&translation.action) {
+            return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                "action '{}' is not enabled for AI write confirmation",
+                translation.action
+            )));
+        }
+
+        let preview_command = format!("SCMD: {raw}");
+        let pending = PendingAdminAction {
+            translation: translation.clone(),
+            preview_command: preview_command.clone(),
+            created_at_ms: now_epoch_ms(),
+        };
+        self.context
+            .pending_actions
+            .lock()
+            .await
+            .insert(session_id.to_string(), pending);
+
+        Ok(json!({
+            "pending_confirmation": true,
+            "requires_confirmation": true,
+            "action": translation.action,
+            "preview_command": preview_command,
+            "message": "Mutation prepared. Reply CONFIRM to execute it or CANCEL to discard it."
+        }))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), ArchitectError> {
     if cfg!(not(target_os = "linux")) {
@@ -397,6 +526,7 @@ async fn main() -> Result<(), ArchitectError> {
         ai_configured: AtomicBool::new(ai_runtime.is_some()),
         ai_runtime,
         chat_lock: Mutex::new(()),
+        pending_actions: Arc::new(Mutex::new(HashMap::new())),
     });
 
     ensure_chat_storage(&state).await?;
@@ -522,13 +652,46 @@ fn merged_openai_section(
     }
 }
 
-fn admin_tool_context(state: &ArchitectState) -> ArchitectAdminToolContext {
+fn admin_tool_context(
+    state: &ArchitectState,
+    session_id: Option<&str>,
+) -> ArchitectAdminToolContext {
     ArchitectAdminToolContext {
         hive_id: state.hive_id.clone(),
         config_dir: state.config_dir.clone(),
         state_dir: state.state_dir.clone(),
         socket_dir: state.socket_dir.clone(),
+        session_id: session_id.map(str::to_string),
+        pending_actions: Arc::clone(&state.pending_actions),
     }
+}
+
+fn confirmation_requested(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_uppercase().as_str(),
+        "CONFIRM" | "OK CONFIRM"
+    )
+}
+
+fn cancellation_requested(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_uppercase().as_str(),
+        "CANCEL" | "ABORT"
+    )
+}
+
+async fn take_pending_action(
+    state: &ArchitectState,
+    session_id: &str,
+) -> Option<PendingAdminAction> {
+    state.pending_actions.lock().await.remove(session_id)
+}
+
+async fn clear_pending_action(
+    state: &ArchitectState,
+    session_id: &str,
+) -> Option<PendingAdminAction> {
+    state.pending_actions.lock().await.remove(session_id)
 }
 
 async fn router_connect_loop(config: NodeConfig, state: Arc<ArchitectState>) {
@@ -724,7 +887,63 @@ async fn handle_chat_message(
             }
         };
 
-    let response = if let Some(raw) = message.strip_prefix("SCMD:") {
+    let trimmed_message = message.trim();
+    let response = if confirmation_requested(trimmed_message) {
+        match take_pending_action(state, &resolved_session_id).await {
+            Some(pending) => match execute_admin_translation(state, pending.translation).await {
+                Ok(mut output) => {
+                    output["confirmed_command"] = Value::String(pending.preview_command);
+                    output["pending_created_at_ms"] = json!(pending.created_at_ms);
+                    output["confirmed_at_ms"] = json!(now_epoch_ms());
+                    ChatResponse {
+                        status: "ok".to_string(),
+                        mode: "scmd".to_string(),
+                        output,
+                        session_id: Some(resolved_session_id.clone()),
+                        session_title: Some(session.title.clone()),
+                    }
+                }
+                Err(err) => ChatResponse {
+                    status: "error".to_string(),
+                    mode: "scmd".to_string(),
+                    output: json!({ "error": err.to_string() }),
+                    session_id: Some(resolved_session_id.clone()),
+                    session_title: Some(session.title.clone()),
+                },
+            },
+            None => ChatResponse {
+                status: "error".to_string(),
+                mode: "chat".to_string(),
+                output: json!({
+                    "message": "There is no pending action to confirm in this chat."
+                }),
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
+            },
+        }
+    } else if cancellation_requested(trimmed_message) {
+        match clear_pending_action(state, &resolved_session_id).await {
+            Some(pending) => ChatResponse {
+                status: "ok".to_string(),
+                mode: "chat".to_string(),
+                output: json!({
+                    "message": format!("Pending action discarded: {}", pending.preview_command),
+                    "pending_created_at_ms": pending.created_at_ms,
+                }),
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
+            },
+            None => ChatResponse {
+                status: "error".to_string(),
+                mode: "chat".to_string(),
+                output: json!({
+                    "message": "There is no pending action to cancel in this chat."
+                }),
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
+            },
+        }
+    } else if let Some(raw) = message.strip_prefix("SCMD:") {
         match handle_scmd(state, raw.trim()).await {
             Ok(output) => ChatResponse {
                 status: "ok".to_string(),
@@ -762,7 +981,7 @@ async fn handle_chat_message(
             session_title: Some(session.title.clone()),
         }
     } else {
-        match handle_ai_chat(state, message.trim()).await {
+        match handle_ai_chat(state, &resolved_session_id, message.trim()).await {
             Ok(output) => ChatResponse {
                 status: "ok".to_string(),
                 mode: "chat".to_string(),
@@ -798,13 +1017,17 @@ async fn handle_chat_message(
     }
 }
 
-async fn handle_ai_chat(state: &ArchitectState, input: &str) -> Result<Value, ArchitectError> {
+async fn handle_ai_chat(
+    state: &ArchitectState,
+    session_id: &str,
+    input: &str,
+) -> Result<Value, ArchitectError> {
     let runtime = state.ai_runtime.clone().ok_or_else(|| -> ArchitectError {
         "AI provider not configured. Chat remains available for SCMD system operations."
             .to_string()
             .into()
     })?;
-    let tool_context = admin_tool_context(state);
+    let tool_context = admin_tool_context(state, Some(session_id));
     let tool_provider = ArchitectAdminReadToolsProvider::new(tool_context);
     let mut tools = FunctionToolRegistry::new();
     tool_provider
@@ -873,6 +1096,30 @@ fn scmd_raw_from_parts(method: &str, path: &str, body: Option<&Value>) -> String
     }
 }
 
+fn admin_action_allows_ai_write(action: &str) -> bool {
+    matches!(
+        action,
+        "add_hive"
+            | "remove_hive"
+            | "add_route"
+            | "delete_route"
+            | "add_vpn"
+            | "delete_vpn"
+            | "run_node"
+            | "kill_node"
+            | "remove_node_instance"
+            | "set_node_config"
+            | "send_node_message"
+            | "set_storage"
+            | "update"
+            | "sync_hint"
+            | "opa_compile_apply"
+            | "opa_compile"
+            | "opa_apply"
+            | "opa_rollback"
+    )
+}
+
 fn parse_scmd(raw: &str) -> Result<ParsedScmd, ArchitectError> {
     let mut text = raw.trim();
     if !text.starts_with("curl ") {
@@ -932,6 +1179,18 @@ fn translate_scmd(
             target_hive: local_hive_id.to_string(),
             params: json!({}),
         }),
+        ("POST", ["hives"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for add_hive must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "add_hive".to_string(),
+                target_hive: local_hive_id.to_string(),
+                params,
+            })
+        }
         ("GET", ["versions"]) => Ok(AdminTranslation {
             admin_target,
             action: "list_versions".to_string(),
@@ -962,12 +1221,30 @@ fn translate_scmd(
             target_hive: local_hive_id.to_string(),
             params: json!({ "hive_id": hive_id }),
         }),
+        ("DELETE", ["hives", hive_id]) => Ok(AdminTranslation {
+            admin_target,
+            action: "remove_hive".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({ "hive_id": hive_id }),
+        }),
         ("GET", ["hives", hive_id, "nodes"]) => Ok(AdminTranslation {
             admin_target,
             action: "list_nodes".to_string(),
             target_hive: (*hive_id).to_string(),
             params: json!({}),
         }),
+        ("POST", ["hives", hive_id, "nodes"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for run_node must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "run_node".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
         ("GET", ["hives", hive_id, "inventory", "summary"]) => Ok(AdminTranslation {
             admin_target,
             action: "inventory".to_string(),
@@ -1034,12 +1311,60 @@ fn translate_scmd(
             target_hive: (*hive_id).to_string(),
             params: json!({}),
         }),
+        ("POST", ["hives", hive_id, "routes"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for add_route must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "add_route".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("DELETE", ["hives", hive_id, "routes"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for delete_route must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "delete_route".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
         ("GET", ["hives", hive_id, "vpns"]) => Ok(AdminTranslation {
             admin_target,
             action: "list_vpns".to_string(),
             target_hive: (*hive_id).to_string(),
             params: json!({}),
         }),
+        ("POST", ["hives", hive_id, "vpns"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for add_vpn must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "add_vpn".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("DELETE", ["hives", hive_id, "vpns"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for delete_vpn must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "delete_vpn".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
         ("GET", ["hives", hive_id, "deployments"]) => Ok(AdminTranslation {
             admin_target,
             action: "get_deployments".to_string(),
@@ -1072,6 +1397,78 @@ fn translate_scmd(
             Ok(AdminTranslation {
                 admin_target,
                 action: "opa_check".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "opa", "policy"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for opa compile_apply must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "opa_compile_apply".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "opa", "policy", "compile"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for opa compile must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "opa_compile".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "opa", "policy", "apply"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for opa apply must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "opa_apply".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "opa", "policy", "rollback"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for opa rollback must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "opa_rollback".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "update"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for update must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "update".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "sync-hint"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for sync_hint must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "sync_hint".to_string(),
                 target_hive: (*hive_id).to_string(),
                 params,
             })
@@ -1109,6 +1506,35 @@ fn translate_scmd(
                 params,
             })
         }
+        ("PUT", ["hives", hive_id, "nodes", node_name, "config"]) => {
+            let config = parsed.body.unwrap_or_else(|| json!({}));
+            if !config.is_object() {
+                return Err("SCMD body for set_node_config must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "set_node_config".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params: json!({
+                    "node_name": node_name,
+                    "config": config,
+                    "replace": false,
+                    "notify": true,
+                }),
+            })
+        }
+        ("PUT", ["config", "storage"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for set_storage must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "set_storage".to_string(),
+                target_hive: local_hive_id.to_string(),
+                params,
+            })
+        }
         _ => Err(format!("unsupported SCMD path: {} {}", parsed.method, parsed.path).into()),
     }
 }
@@ -1117,7 +1543,8 @@ async fn execute_admin_translation(
     state: &ArchitectState,
     translation: AdminTranslation,
 ) -> Result<Value, ArchitectError> {
-    execute_admin_translation_with_context(&admin_tool_context(state), translation, "scmd").await
+    execute_admin_translation_with_context(&admin_tool_context(state, None), translation, "scmd")
+        .await
 }
 
 async fn execute_admin_translation_with_context(
@@ -1495,6 +1922,7 @@ async fn delete_chat_session(
     state: &ArchitectState,
     session_id: &str,
 ) -> Result<SessionDeleteResponse, ArchitectError> {
+    state.pending_actions.lock().await.remove(session_id);
     let _guard = state.chat_lock.lock().await;
     let db = open_architect_db(state).await?;
     let sessions = ensure_sessions_table(&db).await?;
@@ -1531,6 +1959,7 @@ async fn delete_chat_session(
 async fn clear_chat_sessions(
     state: &ArchitectState,
 ) -> Result<SessionDeleteResponse, ArchitectError> {
+    state.pending_actions.lock().await.clear();
     let _guard = state.chat_lock.lock().await;
     let db = open_architect_db(state).await?;
     let sessions = ensure_sessions_table(&db).await?;
@@ -1987,6 +2416,9 @@ fn session_title_or_default(title: &str) -> String {
 
 fn update_title_from_message(current_title: &str, message: &str) -> String {
     if current_title != "Untitled chat" {
+        return current_title.to_string();
+    }
+    if confirmation_requested(message) || cancellation_requested(message) {
         return current_title.to_string();
     }
     let normalized = compact_title_candidate(message);
