@@ -17,6 +17,7 @@ fn sample_message() -> Message {
             msg: Some("HELLO".to_string()),
             scope: Some("vpn".to_string()),
             target: Some("AI.echo@dev".to_string()),
+            src_ilk: None,
             action: None,
             priority: None,
             context: Some(json!({"thread_id":"thr-1"})),
@@ -99,4 +100,3 @@ fn contract_extract_text_rejects_non_text_payload() {
     let payload = json!({"type":"json","value":{"ok":true}});
     assert!(extract_text(&payload).is_none());
 }
-

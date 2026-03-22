@@ -6,6 +6,7 @@ edition = "2021"
 [workspace]
 members = [
     "crates/fluxbee_sdk",
+    "crates/fluxbee_ai_sdk",
     "nodes/gov/common",
     "nodes/gov/ai-frontdesk-gov",
     "nodes/test/io-test",
@@ -25,6 +26,7 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fluxbee-sdk = { path = "crates/fluxbee_sdk" }
+fluxbee-ai-sdk = { path = "crates/fluxbee_ai_sdk" }
 wasmtime = "19.0.0"
 regex = "1.10"
 tar = "0.4"

@@ -731,7 +731,9 @@ This README explains the system and concepts. For how to run, build, and develop
 ### Node Development Template (Rust)
 
 If you want to build a node in another repo, use `fluxbee_sdk`
-(`json-router/crates/fluxbee_sdk`) as the canonical SDK.
+(`json-router/crates/fluxbee_sdk`) as the canonical base SDK.
+
+For AI-specific runtimes, `json-router/crates/fluxbee_ai_sdk` is available as a separate higher-level SDK on top of `fluxbee_sdk`. It is intended for `SY.architect` and future `AI.*` nodes, not as a replacement for the transport/protocol SDK.
 
 For domain nodes that live in this repo (for example `.gov`), see:
 - `nodes/gov/README.md`
@@ -820,7 +822,7 @@ Key documents:
 
 ### SDK Tools (Current)
 
-`fluxbee_sdk` is the canonical toolset for node development. Current toolbox:
+`fluxbee_sdk` is the canonical base toolset for node development. `fluxbee_ai_sdk` is a separate AI-oriented crate layered on top of it for architect/AI runtimes. Current base toolbox:
 
 | Tool | Path | Purpose |
 |---|---|---|
