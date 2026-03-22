@@ -33,11 +33,15 @@ const DEFAULT_ARCHITECT_LISTEN: &str = "127.0.0.1:3000";
 const ROUTER_RECONNECT_DELAY_SECS: u64 = 2;
 const CHAT_SESSIONS_TABLE: &str = "sessions";
 const CHAT_MESSAGES_TABLE: &str = "messages";
-const FAVICON_SVG: &str = include_str!("../../docs/tmp/favicon.svg");
-const FAVICON_ICO: &[u8] = include_bytes!("../../docs/tmp/favicon.ico");
-const FAVICON_16_PNG: &[u8] = include_bytes!("../../docs/tmp/favicon-16.png");
-const FAVICON_32_PNG: &[u8] = include_bytes!("../../docs/tmp/favicon-32.png");
-const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../../docs/tmp/apple-touch-icon.png");
+const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="16" fill="#ffffff"/>
+  <path d="M18 33c0-8 6.5-14.5 14.5-14.5S47 25 47 33s-6.5 14.5-14.5 14.5S18 41 18 33Z" fill="#0070F3" opacity="0.14"/>
+  <path d="M21 31.5c1.4-6.4 6.2-10.5 11.7-10.5 5.7 0 10.5 4.3 11.6 10.5-1.1 6.8-5.8 11.5-11.6 11.5-5.9 0-10.7-4.8-11.7-11.5Z" fill="#1f2a37"/>
+  <circle cx="32.5" cy="33" r="7.5" fill="#ffffff"/>
+  <circle cx="32.5" cy="33" r="4.2" fill="#0070F3"/>
+  <path d="M24 22l4.8 5.4" stroke="#1f2a37" stroke-width="3.2" stroke-linecap="round"/>
+  <path d="M41 22l-4.8 5.4" stroke="#1f2a37" stroke-width="3.2" stroke-linecap="round"/>
+</svg>"##;
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -1648,14 +1652,7 @@ fn is_chat_path(path: &str) -> bool {
 }
 
 fn is_favicon_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/favicon.ico"
-            | "/favicon.svg"
-            | "/favicon-16.png"
-            | "/favicon-32.png"
-            | "/apple-touch-icon.png"
-    )
+    matches!(path, "/favicon.svg")
 }
 
 fn serve_favicon(path: &str) -> Response {
@@ -1663,17 +1660,6 @@ fn serve_favicon(path: &str) -> Response {
         "/favicon.svg" => (
             [(CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
             FAVICON_SVG,
-        )
-            .into_response(),
-        "/favicon.ico" => ([(CONTENT_TYPE, "image/x-icon")], FAVICON_ICO).into_response(),
-        "/favicon-16.png" | "/favicon-32.png" | "/apple-touch-icon.png" => (
-            [(CONTENT_TYPE, "image/png")],
-            match path {
-                "/favicon-16.png" => FAVICON_16_PNG,
-                "/favicon-32.png" => FAVICON_32_PNG,
-                "/apple-touch-icon.png" => APPLE_TOUCH_ICON_PNG,
-                _ => unreachable!(),
-            },
         )
             .into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
@@ -1703,11 +1689,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SY.architect</title>
-  <link rel="icon" href="/favicon.ico" sizes="any">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="icon" href="/favicon-16.png" sizes="16x16" type="image/png">
-  <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
-  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <style>
     :root {{
       --bg: #ffffff;
