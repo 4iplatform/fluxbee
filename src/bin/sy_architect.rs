@@ -1211,6 +1211,69 @@ fn architect_index_html(state: &ArchitectState) -> String {
       line-height: 1.5;
       font-size: 0.96rem;
     }}
+    .result-shell {{
+      display: grid;
+      gap: 10px;
+    }}
+    .result-head {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    .result-title {{
+      font-size: 0.94rem;
+      font-weight: 700;
+      color: var(--text);
+    }}
+    .result-status {{
+      border-radius: 999px;
+      padding: 5px 9px;
+      font-size: 0.72rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      background: var(--panel-soft);
+      color: var(--muted);
+    }}
+    .result-status.ok {{
+      background: var(--success-soft);
+      color: var(--success);
+    }}
+    .result-status.warn {{
+      background: var(--warning-soft);
+      color: var(--warning);
+    }}
+    .result-meta {{
+      color: var(--muted);
+      font-size: 0.78rem;
+      line-height: 1.45;
+    }}
+    .result-section {{
+      display: grid;
+      gap: 6px;
+    }}
+    .result-section-title {{
+      font-size: 0.72rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }}
+    .result-pre {{
+      margin: 0;
+      padding: 12px 13px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: #fbfcfe;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 0.82rem;
+      line-height: 1.45;
+      font-family: "SFMono-Regular", "Menlo", "Consolas", monospace;
+    }}
     .composer {{
       border-top: 1px solid var(--line);
       padding: 18px 20px 20px;
@@ -1419,6 +1482,24 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const sessionTitle = document.getElementById("session-title");
     const sessionMeta = document.getElementById("session-meta");
     let userMessageCount = 0;
+    function appendMessage(kind, labelText, bodyContent) {{
+      const div = document.createElement("div");
+      const label = document.createElement("div");
+      const body = document.createElement("div");
+      div.className = "msg " + kind;
+      label.className = "msg-label";
+      label.textContent = labelText;
+      body.className = "msg-body";
+      if (typeof bodyContent === "string") {{
+        body.textContent = bodyContent;
+      }} else if (bodyContent) {{
+        body.appendChild(bodyContent);
+      }}
+      div.appendChild(label);
+      div.appendChild(body);
+      messages.appendChild(div);
+      messages.scrollTop = messages.scrollHeight;
+    }}
     function formatChip(elementId, text, className) {{
       const element = document.getElementById(elementId);
       if (!element) return;
@@ -1480,19 +1561,76 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
 
     function addMessage(kind, text) {{
-      const div = document.createElement("div");
-      const label = document.createElement("div");
-      const body = document.createElement("div");
       const labels = {{ user: "Operator", architect: "archi", system: "System" }};
-      div.className = "msg " + kind;
-      label.className = "msg-label";
-      label.textContent = labels[kind] || "Message";
-      body.className = "msg-body";
-      body.textContent = text;
-      div.appendChild(label);
-      div.appendChild(body);
-      messages.appendChild(div);
-      messages.scrollTop = messages.scrollHeight;
+      appendMessage(kind, labels[kind] || "Message", text);
+    }}
+    function createPre(value) {{
+      const pre = document.createElement("pre");
+      pre.className = "result-pre";
+      pre.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+      return pre;
+    }}
+    function createResultSection(title, value) {{
+      const section = document.createElement("div");
+      const heading = document.createElement("div");
+      section.className = "result-section";
+      heading.className = "result-section-title";
+      heading.textContent = title;
+      section.appendChild(heading);
+      section.appendChild(createPre(value));
+      return section;
+    }}
+    function renderCommandResult(kind, mode, data) {{
+      const shell = document.createElement("div");
+      const head = document.createElement("div");
+      const title = document.createElement("div");
+      const badge = document.createElement("div");
+      const meta = document.createElement("div");
+      shell.className = "result-shell";
+      head.className = "result-head";
+      title.className = "result-title";
+      badge.className = "result-status";
+      meta.className = "result-meta";
+
+      const modeLabel = mode === "acmd" ? "admin command" : mode === "fcmd" ? "prompt control" : "response";
+      const resultStatus = String(data.status || "unknown");
+      title.textContent = modeLabel;
+      badge.textContent = resultStatus;
+      const badgeClass = statusClass(resultStatus);
+      if (badgeClass) {{
+        badge.classList.add(badgeClass);
+      }}
+      head.appendChild(title);
+      head.appendChild(badge);
+      shell.appendChild(head);
+
+      if (mode === "acmd") {{
+        const action = data.output && data.output.action ? data.output.action : "unknown";
+        const traceId = data.output && data.output.trace_id ? data.output.trace_id : null;
+        meta.textContent = "action: " + action + (traceId ? " | trace: " + traceId : "");
+        shell.appendChild(meta);
+        if (data.output && data.output.payload !== undefined) {{
+          shell.appendChild(createResultSection("payload", data.output.payload));
+        }}
+        if (data.output && data.output.error_detail) {{
+          shell.appendChild(createResultSection("error", data.output.error_detail));
+        }}
+      }} else if (mode === "fcmd") {{
+        const promptId = data.output && data.output.prompt_id ? data.output.prompt_id : null;
+        meta.textContent = promptId ? "prompt: " + promptId : "local prompt operation";
+        shell.appendChild(meta);
+        shell.appendChild(createResultSection("result", data.output));
+      }} else {{
+        shell.appendChild(createResultSection("result", data.output));
+      }}
+
+      appendMessage(kind, kind === "architect" ? "archi" : "System", shell);
+    }}
+    function isDestructiveMessage(message) {{
+      const trimmed = String(message || "").trim();
+      if (!trimmed.startsWith("ACMD:")) return false;
+      const command = trimmed.slice(5).trim().toUpperCase();
+      return command.startsWith("CURL -X DELETE ");
     }}
     function seedWelcomeMessages() {{
       addMessage("system", "Fluxbee architect interface ready. Prompt control is local through FCMD, and admin passthrough is available through ACMD.");
@@ -1529,6 +1667,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
     async function submit() {{
       const message = input.value.trim();
       if (!message) return;
+      if (isDestructiveMessage(message)) {{
+        const confirmed = window.confirm("This command looks destructive. Do you want to send it?");
+        if (!confirmed) return;
+      }}
       addMessage("user", message);
       updateSession(message);
       input.value = "";
@@ -1540,7 +1682,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
           body: JSON.stringify({{ message }})
         }});
         const data = await res.json();
-        addMessage(data.status === "ok" ? "architect" : "system", JSON.stringify(data.output, null, 2));
+        renderCommandResult(data.status === "ok" ? "architect" : "system", data.mode, data);
       }} catch (err) {{
         addMessage("system", "Request failed: " + err);
       }} finally {{
