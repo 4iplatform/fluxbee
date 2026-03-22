@@ -284,8 +284,6 @@ impl FunctionTool for ArchitectSystemGetTool {
                 self.context.hive_id,
                 self.context.hive_id,
                 self.context.hive_id,
-                self.context.hive_id,
-                self.context.hive_id,
             ),
             parameters_json_schema: json!({
                 "type": "object",
