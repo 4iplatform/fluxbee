@@ -28,6 +28,14 @@ if [[ "${SKIP_BUILD:-}" != "1" ]]; then
     fi
   fi
 
+  if [[ "${SKIP_BUILD:-}" != "1" ]] && ! command -v protoc >/dev/null 2>&1; then
+    echo "Error: protoc not found in PATH." >&2
+    echo "Fluxbee now builds LanceDB-backed components and requires the Protocol Buffers compiler on the build host." >&2
+    echo "Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y protobuf-compiler" >&2
+    echo "RHEL/CentOS: sudo dnf install -y protobuf-compiler" >&2
+    exit 1
+  fi
+
   if [[ "${SKIP_BUILD:-}" != "1" ]]; then
     echo "Building Rust binaries..."
     cargo build --release --bins

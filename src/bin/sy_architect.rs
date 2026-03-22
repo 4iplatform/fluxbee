@@ -1812,7 +1812,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       display: grid;
       grid-template-columns: 280px minmax(0, 1fr);
       gap: 18px;
-      align-items: start;
+      align-items: stretch;
       min-height: 0;
       overflow: hidden;
     }}
@@ -1828,6 +1828,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       position: sticky;
       top: 22px;
       min-height: 0;
+      max-height: 100%;
       overflow: auto;
     }}
     .sidebar-head {{
@@ -1918,6 +1919,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       overflow: hidden;
       min-height: 0;
       height: 100%;
+      max-height: 100%;
+      align-self: stretch;
       display: grid;
       grid-template-rows: auto minmax(0, 1fr) auto;
     }}
@@ -1974,10 +1977,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
       color: var(--text);
     }}
     .messages {{
-      min-height: 58vh;
-      max-height: 72vh;
+      min-height: 0;
+      height: 100%;
       overflow: auto;
-      padding: 22px 20px 10px;
+      padding: 22px 20px 18px;
       background:
         radial-gradient(circle at top right, rgba(69, 117, 220, 0.08), transparent 24%),
         linear-gradient(to bottom, #ffffff, #f8f9fb);
@@ -2076,6 +2079,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       border: 1px solid var(--line);
       background: #fbfcfe;
       overflow: auto;
+      max-height: min(40vh, 420px);
       white-space: pre-wrap;
       word-break: break-word;
       font-size: 0.82rem;
@@ -2139,6 +2143,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       .shell {{
         min-height: auto;
+        max-height: none;
       }}
     }}
     @media (max-width: 760px) {{

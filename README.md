@@ -169,6 +169,9 @@ RUNTIME_NAME="ai.my.node"
 RUNTIME_VERSION="1.0.0"
 PKG_DIR="$PWD/package"
 
+# prerequisite for current workspace builds: `protoc` in PATH
+# Debian/Ubuntu: sudo apt-get install -y protobuf-compiler
+
 # 1) build your node binary
 cargo build --release --bin ai-my-node
 
