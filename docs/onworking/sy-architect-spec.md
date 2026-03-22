@@ -83,6 +83,7 @@ Current state in repo:
 - `SY.architect` already has a first direct OpenAI path through `fluxbee_ai_sdk`.
 - normal chat messages can go through a local `archi` agent when an OpenAI key is configured.
 - `SCMD:` remains a separate local/system path and does not invoke the AI provider.
+- the local agent can already use read-only socket-backed tools against `SY.admin` for live system state.
 - streaming, multi-agent routing, and prompt assets by role are still pending.
 
 ---
@@ -758,6 +759,7 @@ This is intentionally later. The node should already be operational without it.
   - switch explícito por usuario
   - heurística simple por intención
 - [x] ARCH-T12.1. Separar pipeline de mensajes normales vs mensajes de control; `SCMD:` no debe invocar al proveedor AI.
+- [x] ARCH-T12.2. Exponer tools read-only del sistema al agente local usando `ADMIN_COMMAND` sobre socket.
 - [ ] ARCH-T6. Implementar endpoint WebSocket de chat bidireccional.
 - [ ] ARCH-T10. Implementar streaming token-by-token hacia WebSocket.
 

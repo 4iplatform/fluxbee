@@ -7,13 +7,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
 use axum::extract::{Request, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
-use fluxbee_ai_sdk::{Agent, ModelSettings, OpenAiResponsesClient};
+use fluxbee_ai_sdk::{
+    FunctionCallingConfig, FunctionCallingRunner, FunctionTool, FunctionToolDefinition,
+    FunctionToolProvider, FunctionToolRegistry, ModelSettings, OpenAiResponsesClient,
+};
 use fluxbee_sdk::{
     admin_command, connect, AdminCommandRequest, NodeConfig, NodeError, NodeReceiver,
 };
@@ -43,6 +47,8 @@ Rules:
 - Be direct and operational.
 - Prefer short concrete answers over long explanations.
 - If the user asks about system state, deployments, nodes, hives, identity, or operations, prefer SCMD/system operations when available.
+- Use the available read-only system tool when you need live Fluxbee state instead of guessing.
+- Do not perform mutations through tools; destructive or write actions stay manual through explicit SCMD from the operator.
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.
 - Keep answers useful for administrators and developers."#;
@@ -93,6 +99,14 @@ struct ArchitectAiRuntime {
     instructions: String,
     model_settings: ModelSettings,
     client: OpenAiResponsesClient,
+}
+
+#[derive(Clone)]
+struct ArchitectAdminToolContext {
+    hive_id: String,
+    config_dir: PathBuf,
+    state_dir: PathBuf,
+    socket_dir: PathBuf,
 }
 
 struct ArchitectState {
@@ -229,6 +243,88 @@ struct AdminTranslation {
     action: String,
     target_hive: String,
     params: Value,
+}
+
+struct ArchitectAdminReadToolsProvider {
+    context: ArchitectAdminToolContext,
+}
+
+impl ArchitectAdminReadToolsProvider {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
+    fn register_tools(&self, registry: &mut FunctionToolRegistry) -> fluxbee_ai_sdk::Result<()> {
+        registry.register(Arc::new(ArchitectSystemGetTool::new(self.context.clone())))
+    }
+}
+
+struct ArchitectSystemGetTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl ArchitectSystemGetTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for ArchitectSystemGetTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "fluxbee_system_get".to_string(),
+            description: format!(
+                "Read live Fluxbee system state through SY.admin over socket for hive {}. Read-only. Use for inventory, nodes, node status, and identity ilks. Example paths: /hives/{}/inventory/summary, /hives/{}/nodes, /hives/{}/nodes/SY.admin@{}/status, /hives/{}/identity/ilks",
+                self.context.hive_id,
+                self.context.hive_id,
+                self.context.hive_id,
+                self.context.hive_id,
+                self.context.hive_id,
+                self.context.hive_id,
+            ),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Read-only Fluxbee path starting with /hives/{hive}/..., for example /hives/motherbee/nodes"
+                    }
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_system_get requires a non-empty 'path'".to_string(),
+                )
+            })?;
+
+        let parsed = parse_scmd(&format!("curl -X GET {path}")).map_err(|err| {
+            fluxbee_ai_sdk::AiSdkError::Protocol(format!("invalid system get path: {err}"))
+        })?;
+        let translation = translate_scmd(&self.context.hive_id, parsed).map_err(|err| {
+            fluxbee_ai_sdk::AiSdkError::Protocol(format!("unsupported system get path: {err}"))
+        })?;
+        let output =
+            execute_admin_translation_with_context(&self.context, translation, "tool.read")
+                .await
+                .map_err(|err| {
+                    fluxbee_ai_sdk::AiSdkError::Protocol(format!("system get failed: {err}"))
+                })?;
+        Ok(output)
+    }
 }
 
 #[tokio::main]
@@ -394,6 +490,15 @@ fn merged_openai_section(
         (Some(cfg), None) => Some(cfg),
         (None, Some(hive_cfg)) => Some(hive_cfg),
         (None, None) => None,
+    }
+}
+
+fn admin_tool_context(state: &ArchitectState) -> ArchitectAdminToolContext {
+    ArchitectAdminToolContext {
+        hive_id: state.hive_id.clone(),
+        config_dir: state.config_dir.clone(),
+        state_dir: state.state_dir.clone(),
+        socket_dir: state.socket_dir.clone(),
     }
 }
 
@@ -670,23 +775,54 @@ async fn handle_ai_chat(state: &ArchitectState, input: &str) -> Result<Value, Ar
             .to_string()
             .into()
     })?;
+    let tool_context = admin_tool_context(state);
+    let tool_provider = ArchitectAdminReadToolsProvider::new(tool_context);
+    let mut tools = FunctionToolRegistry::new();
+    tool_provider
+        .register_tools(&mut tools)
+        .map_err(|err| -> ArchitectError {
+            format!("AI tool registration failed: {err}").into()
+        })?;
 
-    let agent = Agent::with_model_settings(
-        "archi",
+    let model = runtime.client.clone().function_model(
         runtime.model.clone(),
         Some(runtime.instructions.clone()),
         runtime.model_settings.clone(),
-        Arc::new(runtime.client),
     );
-    let response = agent
-        .run_text(input.to_string())
+    let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+    let result = runner
+        .run(&model, &tools, input.to_string())
         .await
         .map_err(|err| -> ArchitectError { format!("AI request failed: {err}").into() })?;
 
+    let tool_results = result
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            fluxbee_ai_sdk::FunctionLoopItem::ToolResult { result } => Some(json!({
+                "name": result.name.clone(),
+                "output": result.output.clone(),
+                "is_error": result.is_error,
+            })),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let message = result
+        .final_assistant_text
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| {
+            if tool_results.is_empty() {
+                "The AI run completed without a textual response.".to_string()
+            } else {
+                "I executed live system lookups, but the model returned no final text.".to_string()
+            }
+        });
+
     Ok(json!({
-        "message": response.content,
+        "message": message,
         "provider": "openai",
         "model": runtime.model,
+        "tool_results": tool_results,
     }))
 }
 
@@ -740,6 +876,18 @@ fn translate_scmd(
             action: "list_nodes".to_string(),
             target_hive: hive_id,
             params: json!({}),
+        }),
+        ("GET", ["hives", _, "inventory", "summary"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "inventory".to_string(),
+            target_hive: hive_id,
+            params: json!({ "scope": "summary" }),
+        }),
+        ("GET", ["hives", _, "inventory", "hive"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "inventory".to_string(),
+            target_hive: hive_id.clone(),
+            params: json!({ "scope": "hive", "filter_hive": hive_id }),
         }),
         ("GET", ["hives", _, "nodes", node_name, "status"]) => Ok(AdminTranslation {
             admin_target,
@@ -800,12 +948,20 @@ async fn execute_admin_translation(
     state: &ArchitectState,
     translation: AdminTranslation,
 ) -> Result<Value, ArchitectError> {
+    execute_admin_translation_with_context(&admin_tool_context(state), translation, "scmd").await
+}
+
+async fn execute_admin_translation_with_context(
+    context: &ArchitectAdminToolContext,
+    translation: AdminTranslation,
+    purpose: &str,
+) -> Result<Value, ArchitectError> {
     let node_config = NodeConfig {
-        name: format!("SY.architect.scmd.{}", Uuid::new_v4().simple()),
-        router_socket: state.socket_dir.clone(),
-        uuid_persistence_dir: state.state_dir.join("nodes"),
+        name: format!("SY.architect.{purpose}.{}", Uuid::new_v4().simple()),
+        router_socket: context.socket_dir.clone(),
+        uuid_persistence_dir: context.state_dir.join("nodes"),
         uuid_mode: fluxbee_sdk::NodeUuidMode::Ephemeral,
-        config_dir: state.config_dir.clone(),
+        config_dir: context.config_dir.clone(),
         version: "0.1.0".to_string(),
     };
     let (sender, mut receiver) = connect(&node_config).await?;
