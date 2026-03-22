@@ -2758,6 +2758,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "async-trait",
  "axum",
  "chrono",
  "fluxbee-ai-sdk",
