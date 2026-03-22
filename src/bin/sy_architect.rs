@@ -1548,11 +1548,38 @@ fn update_title_from_message(current_title: &str, message: &str) -> String {
 
 fn compact_title_candidate(message: &str) -> String {
     let trimmed = message.trim();
-    let no_prefix = trimmed
-        .strip_prefix("FCMD:")
-        .or_else(|| trimmed.strip_prefix("ACMD:"))
-        .unwrap_or(trimmed);
-    no_prefix.split_whitespace().collect::<Vec<_>>().join(" ")
+    if let Some(raw) = trimmed.strip_prefix("FCMD:") {
+        return compact_fcmd_title(raw.trim());
+    }
+    if let Some(raw) = trimmed.strip_prefix("ACMD:") {
+        return compact_acmd_title(raw.trim());
+    }
+    trimmed.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn compact_fcmd_title(raw: &str) -> String {
+    match serde_json::from_str::<PromptCommand>(raw) {
+        Ok(command) => {
+            let mut parts = vec!["FCMD".to_string(), command.op];
+            if let Some(prompt_id) = command
+                .prompt_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                parts.push(prompt_id.to_string());
+            }
+            parts.join(" ")
+        }
+        Err(_) => format!("FCMD {}", preview_text(raw, 40)),
+    }
+}
+
+fn compact_acmd_title(raw: &str) -> String {
+    match parse_acmd(raw) {
+        Ok(parsed) => format!("{} {}", parsed.method, preview_text(&parsed.path, 40)),
+        Err(_) => format!("ACMD {}", preview_text(raw, 40)),
+    }
 }
 
 fn preview_text(input: &str, max_chars: usize) -> String {
@@ -1560,12 +1587,13 @@ fn preview_text(input: &str, max_chars: usize) -> String {
     if compact.chars().count() <= max_chars {
         return compact;
     }
-    compact
+    let truncated = compact
         .chars()
-        .take(max_chars)
+        .take(max_chars.saturating_sub(1))
         .collect::<String>()
         .trim()
-        .to_string()
+        .to_string();
+    format!("{truncated}…")
 }
 
 fn prompt_store_path(state: &ArchitectState) -> PathBuf {
@@ -1870,6 +1898,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       border: 1px solid var(--line);
       background: var(--panel-alt);
       cursor: pointer;
+      overflow: hidden;
     }}
     .history-card.active {{
       background: linear-gradient(180deg, #f5f8ff 0%, #eef3ff 100%);
@@ -1883,6 +1912,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font-size: 0.95rem;
       font-weight: 700;
       margin-bottom: 5px;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }}
     .history-meta,
     .history-note,
@@ -1891,11 +1924,21 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font-size: 0.82rem;
       line-height: 1.45;
     }}
+    .history-meta {{
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
     .history-preview {{
       margin-top: 8px;
       color: var(--text);
       font-size: 0.82rem;
       line-height: 1.4;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }}
     .history-note {{
       margin-top: 16px;
