@@ -13,6 +13,7 @@ use axum::http::{Method, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
+use fluxbee_ai_sdk::{Agent, ModelSettings, OpenAiResponsesClient};
 use fluxbee_sdk::{
     admin_command, connect, AdminCommandRequest, NodeConfig, NodeError, NodeReceiver,
 };
@@ -30,9 +31,21 @@ use uuid::Uuid;
 type ArchitectError = Box<dyn std::error::Error + Send + Sync>;
 
 const DEFAULT_ARCHITECT_LISTEN: &str = "127.0.0.1:3000";
+const DEFAULT_ARCHITECT_MODEL: &str = "gpt-4.1-mini";
 const ROUTER_RECONNECT_DELAY_SECS: u64 = 2;
 const CHAT_SESSIONS_TABLE: &str = "sessions";
 const CHAT_MESSAGES_TABLE: &str = "messages";
+const ARCHI_SYSTEM_PROMPT: &str = r#"You are archi, the Fluxbee system architect.
+
+Operate as a concise technical assistant for the Fluxbee control plane.
+
+Rules:
+- Be direct and operational.
+- Prefer short concrete answers over long explanations.
+- If the user asks about system state, deployments, nodes, hives, identity, or operations, prefer SCMD/system operations when available.
+- Do not claim actions were executed unless they actually were.
+- If information is missing, say what is missing.
+- Keep answers useful for administrators and developers."#;
 const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <rect width="64" height="64" rx="16" fill="#ffffff"/>
   <path d="M18 33c0-8 6.5-14.5 14.5-14.5S47 25 47 33s-6.5 14.5-14.5 14.5S18 41 18 33Z" fill="#0070F3" opacity="0.14"/>
@@ -55,19 +68,31 @@ struct ArchitectSection {
     listen: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct AiProvidersSection {
     openai: Option<OpenAiSection>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct OpenAiSection {
     api_key: Option<String>,
+    default_model: Option<String>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ArchitectNodeConfigFile {
     ai_providers: Option<AiProvidersSection>,
+}
+
+#[derive(Clone)]
+struct ArchitectAiRuntime {
+    model: String,
+    instructions: String,
+    model_settings: ModelSettings,
+    client: OpenAiResponsesClient,
 }
 
 struct ArchitectState {
@@ -79,6 +104,7 @@ struct ArchitectState {
     socket_dir: PathBuf,
     router_connected: AtomicBool,
     ai_configured: AtomicBool,
+    ai_runtime: Option<ArchitectAiRuntime>,
     chat_lock: Mutex<()>,
 }
 
@@ -223,6 +249,7 @@ async fn main() -> Result<(), ArchitectError> {
 
     let hive = load_hive(&config_dir)?;
     let node_config = load_architect_node_config(&hive.hive_id)?;
+    let ai_runtime = build_architect_ai_runtime(node_config.as_ref(), &hive);
     let listen = std::env::var("JSR_ARCHITECT_LISTEN")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -242,7 +269,8 @@ async fn main() -> Result<(), ArchitectError> {
         state_dir,
         socket_dir,
         router_connected: AtomicBool::new(false),
-        ai_configured: AtomicBool::new(architect_ai_configured(node_config.as_ref(), &hive)),
+        ai_configured: AtomicBool::new(ai_runtime.is_some()),
+        ai_runtime,
         chat_lock: Mutex::new(()),
     });
 
@@ -289,24 +317,6 @@ fn load_hive(config_dir: &Path) -> Result<HiveFile, ArchitectError> {
     Ok(serde_yaml::from_str(&data)?)
 }
 
-fn hive_ai_configured(hive: &HiveFile) -> bool {
-    hive.ai_providers
-        .as_ref()
-        .and_then(|providers| providers.openai.as_ref())
-        .and_then(|openai| openai.api_key.as_ref())
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-}
-
-fn architect_ai_configured(config: Option<&ArchitectNodeConfigFile>, hive: &HiveFile) -> bool {
-    config
-        .and_then(|cfg| cfg.ai_providers.as_ref())
-        .and_then(|providers| providers.openai.as_ref())
-        .and_then(|openai| openai.api_key.as_ref())
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| hive_ai_configured(hive))
-}
-
 fn load_architect_node_config(
     hive_id: &str,
 ) -> Result<Option<ArchitectNodeConfigFile>, ArchitectError> {
@@ -328,6 +338,63 @@ fn architect_node_dir(hive_id: &str) -> PathBuf {
 
 fn architect_config_path(hive_id: &str) -> PathBuf {
     architect_node_dir(hive_id).join("config.json")
+}
+
+fn build_architect_ai_runtime(
+    config: Option<&ArchitectNodeConfigFile>,
+    hive: &HiveFile,
+) -> Option<ArchitectAiRuntime> {
+    let openai = merged_openai_section(config, hive)?;
+    let api_key = openai
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let model = openai
+        .default_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_ARCHITECT_MODEL)
+        .to_string();
+
+    Some(ArchitectAiRuntime {
+        model,
+        instructions: ARCHI_SYSTEM_PROMPT.to_string(),
+        model_settings: ModelSettings {
+            temperature: openai.temperature,
+            top_p: openai.top_p,
+            max_output_tokens: openai.max_tokens,
+        },
+        client: OpenAiResponsesClient::new(api_key),
+    })
+}
+
+fn merged_openai_section(
+    config: Option<&ArchitectNodeConfigFile>,
+    hive: &HiveFile,
+) -> Option<OpenAiSection> {
+    let config_openai = config
+        .and_then(|cfg| cfg.ai_providers.as_ref())
+        .and_then(|providers| providers.openai.clone());
+    let hive_openai = hive
+        .ai_providers
+        .as_ref()
+        .and_then(|providers| providers.openai.clone());
+
+    match (config_openai, hive_openai) {
+        (Some(cfg), Some(hive_cfg)) => Some(OpenAiSection {
+            api_key: cfg.api_key.or(hive_cfg.api_key),
+            default_model: cfg.default_model.or(hive_cfg.default_model),
+            max_tokens: cfg.max_tokens.or(hive_cfg.max_tokens),
+            temperature: cfg.temperature.or(hive_cfg.temperature),
+            top_p: cfg.top_p.or(hive_cfg.top_p),
+        }),
+        (Some(cfg), None) => Some(cfg),
+        (None, Some(hive_cfg)) => Some(hive_cfg),
+        (None, None) => None,
+    }
 }
 
 async fn router_connect_loop(config: NodeConfig, state: Arc<ArchitectState>) {
@@ -561,15 +628,25 @@ async fn handle_chat_message(
             session_title: Some(session.title.clone()),
         }
     } else {
-        ChatResponse {
-            status: "ok".to_string(),
-            mode: "chat".to_string(),
-            output: json!({
-                "message": "AI chat path not implemented yet. Use SCMD: for system operations via socket/admin.",
-                "ai_configured": state.ai_configured.load(Ordering::Relaxed),
-            }),
-            session_id: Some(resolved_session_id.clone()),
-            session_title: Some(session.title.clone()),
+        match handle_ai_chat(state, message.trim()).await {
+            Ok(output) => ChatResponse {
+                status: "ok".to_string(),
+                mode: "chat".to_string(),
+                output,
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
+            },
+            Err(err) => ChatResponse {
+                status: "error".to_string(),
+                mode: "chat".to_string(),
+                output: json!({
+                    "error": err.to_string(),
+                    "message": err.to_string(),
+                    "ai_configured": state.ai_configured.load(Ordering::Relaxed),
+                }),
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
+            },
         }
     };
 
@@ -585,6 +662,32 @@ async fn handle_chat_message(
         session_title: Some(session.title),
         ..response
     }
+}
+
+async fn handle_ai_chat(state: &ArchitectState, input: &str) -> Result<Value, ArchitectError> {
+    let runtime = state.ai_runtime.clone().ok_or_else(|| -> ArchitectError {
+        "AI provider not configured. Chat remains available for SCMD system operations."
+            .to_string()
+            .into()
+    })?;
+
+    let agent = Agent::with_model_settings(
+        "archi",
+        runtime.model.clone(),
+        Some(runtime.instructions.clone()),
+        runtime.model_settings.clone(),
+        Arc::new(runtime.client),
+    );
+    let response = agent
+        .run_text(input.to_string())
+        .await
+        .map_err(|err| -> ArchitectError { format!("AI request failed: {err}").into() })?;
+
+    Ok(json!({
+        "message": response.content,
+        "provider": "openai",
+        "model": runtime.model,
+    }))
 }
 
 async fn handle_scmd(state: &ArchitectState, raw: &str) -> Result<Value, ArchitectError> {
@@ -2428,11 +2531,19 @@ fn architect_index_html(state: &ArchitectState) -> String {
 
       appendMessage(kind, kind === "architect" ? "archi" : "System", shell);
     }}
+    function renderResponsePayload(kind, data) {{
+      const output = data && data.output ? data.output : null;
+      if (data && data.mode === "chat" && output && typeof output.message === "string" && output.message.trim()) {{
+        addMessage(kind, output.message);
+        return;
+      }}
+      renderCommandResult(kind, data.mode, data);
+    }}
     function renderStoredMessage(message) {{
       const metadata = message && message.metadata ? message.metadata : {{}};
       if (metadata.kind === "response" && metadata.response) {{
         const role = message.role === "architect" ? "architect" : message.role === "system" ? "system" : "architect";
-        renderCommandResult(role, metadata.response.mode, metadata.response);
+        renderResponsePayload(role, metadata.response);
         return;
       }}
       const role = message.role === "architect" ? "architect" : message.role === "system" ? "system" : "user";
@@ -2446,7 +2557,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     function seedWelcomeMessages() {{
       addMessage("system", "Fluxbee architect interface ready. System operations are available through SCMD.");
-      addMessage("architect", "I am archi. AI conversation is still pending, but the control-plane shell is live.");
+      addMessage("architect", "I am archi. Chat is live, and SCMD remains available for direct system operations.");
       addMessage("system", "Example: SCMD: curl -X GET /hives/{hive}/nodes");
     }}
     function resetChatViewport() {{
@@ -2659,7 +2770,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
           currentSessionId = data.session_id;
           localStorage.setItem(currentSessionStorageKey, currentSessionId);
         }}
-        renderCommandResult(data.status === "ok" ? "architect" : "system", data.mode, data);
+        renderResponsePayload(data.status === "ok" ? "architect" : "system", data);
         await refreshSessionList(currentSessionId);
       }} catch (err) {{
         addMessage("system", "Request failed: " + err);

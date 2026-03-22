@@ -79,6 +79,12 @@ Before implementation, the following constraints from the current core must be t
 
 SY.architect connects directly to AI providers (OpenAI initially) via HTTP. It does NOT use internal AI nodes for its own reasoning. It manages up to 3 concurrent AI agent connections with different system prompts. If more than 3 are needed, they should be spawned as separate AI nodes.
 
+Current state in repo:
+- `SY.architect` already has a first direct OpenAI path through `fluxbee_ai_sdk`.
+- normal chat messages can go through a local `archi` agent when an OpenAI key is configured.
+- `SCMD:` remains a separate local/system path and does not invoke the AI provider.
+- streaming, multi-agent routing, and prompt assets by role are still pending.
+
 ---
 
 ## 3. UI Layout
@@ -746,12 +752,12 @@ Only after config ownership is explicit.
 
 This is intentionally later. The node should already be operational without it.
 
-- [ ] ARCH-T9. Implementar cliente OpenAI con configuración externa y modo “unconfigured”.
+- [x] ARCH-T9. Implementar cliente OpenAI con configuración externa y modo “unconfigured”.
 - [ ] ARCH-T11. Implementar carga de prompts por rol (`architect`, `operator`, `tester`).
 - [ ] ARCH-T12. Implementar selección de agente:
   - switch explícito por usuario
   - heurística simple por intención
-- [ ] ARCH-T12.1. Separar pipeline de mensajes normales vs mensajes de control; `SCMD:` no debe invocar al proveedor AI.
+- [x] ARCH-T12.1. Separar pipeline de mensajes normales vs mensajes de control; `SCMD:` no debe invocar al proveedor AI.
 - [ ] ARCH-T6. Implementar endpoint WebSocket de chat bidireccional.
 - [ ] ARCH-T10. Implementar streaming token-by-token hacia WebSocket.
 
