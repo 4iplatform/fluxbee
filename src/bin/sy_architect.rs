@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,7 +71,6 @@ struct ArchitectState {
     router_connected: AtomicBool,
     ai_configured: AtomicBool,
     chat_lock: Mutex<()>,
-    prompt_lock: Mutex<()>,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,43 +181,8 @@ struct ChatMessageRecord {
     seq: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct PromptStore {
-    prompts: HashMap<String, PromptSlot>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
-struct PromptSlot {
-    next_version: u64,
-    draft: Option<StoredPromptVersion>,
-    published: Option<StoredPromptVersion>,
-    previous_published: Option<StoredPromptVersion>,
-    history: Vec<PromptHistoryEntry>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct StoredPromptVersion {
-    version: u64,
-    content: String,
-    updated_at_ms: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct PromptHistoryEntry {
-    version: u64,
-    stage: String,
-    updated_at_ms: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct PromptCommand {
-    op: String,
-    prompt_id: Option<String>,
-    content: Option<String>,
-}
-
 #[derive(Debug)]
-struct ParsedAcmd {
+struct ParsedScmd {
     method: String,
     path: String,
     body: Option<Value>,
@@ -270,7 +234,6 @@ async fn main() -> Result<(), ArchitectError> {
         router_connected: AtomicBool::new(false),
         ai_configured: AtomicBool::new(hive_ai_configured(&hive)),
         chat_lock: Mutex::new(()),
-        prompt_lock: Mutex::new(()),
     });
 
     ensure_chat_storage(&state).await?;
@@ -518,46 +481,49 @@ async fn handle_chat_message(
             }
         };
 
-    let response = if let Some(raw) = message.strip_prefix("FCMD:") {
-        match handle_fcmd(state, raw.trim()).await {
+    let response = if let Some(raw) = message.strip_prefix("SCMD:") {
+        match handle_scmd(state, raw.trim()).await {
             Ok(output) => ChatResponse {
                 status: "ok".to_string(),
-                mode: "fcmd".to_string(),
+                mode: "scmd".to_string(),
                 output,
                 session_id: Some(resolved_session_id.clone()),
                 session_title: Some(session.title.clone()),
             },
             Err(err) => ChatResponse {
                 status: "error".to_string(),
-                mode: "fcmd".to_string(),
+                mode: "scmd".to_string(),
                 output: json!({ "error": err.to_string() }),
                 session_id: Some(resolved_session_id.clone()),
                 session_title: Some(session.title.clone()),
             },
         }
-    } else if let Some(raw) = message.strip_prefix("ACMD:") {
-        match handle_acmd(state, raw.trim()).await {
-            Ok(output) => ChatResponse {
-                status: "ok".to_string(),
-                mode: "acmd".to_string(),
-                output,
-                session_id: Some(resolved_session_id.clone()),
-                session_title: Some(session.title.clone()),
-            },
-            Err(err) => ChatResponse {
-                status: "error".to_string(),
-                mode: "acmd".to_string(),
-                output: json!({ "error": err.to_string() }),
-                session_id: Some(resolved_session_id.clone()),
-                session_title: Some(session.title.clone()),
-            },
+    } else if message.trim_start().starts_with("ACMD:") {
+        ChatResponse {
+            status: "error".to_string(),
+            mode: "chat".to_string(),
+            output: json!({
+                "error": "ACMD was renamed to SCMD. Use SCMD: curl -X GET /hives/{hive}/nodes"
+            }),
+            session_id: Some(resolved_session_id.clone()),
+            session_title: Some(session.title.clone()),
+        }
+    } else if message.trim_start().starts_with("FCMD:") {
+        ChatResponse {
+            status: "error".to_string(),
+            mode: "chat".to_string(),
+            output: json!({
+                "error": "FCMD prompt operations were removed. Architect prompts now ship with the project and change only through a rebuild."
+            }),
+            session_id: Some(resolved_session_id.clone()),
+            session_title: Some(session.title.clone()),
         }
     } else {
         ChatResponse {
             status: "ok".to_string(),
             mode: "chat".to_string(),
             output: json!({
-                "message": "AI chat path not implemented yet. Use FCMD: for prompt control or ACMD: for admin passthrough.",
+                "message": "AI chat path not implemented yet. Use SCMD: for system operations via socket/admin.",
                 "ai_configured": state.ai_configured.load(Ordering::Relaxed),
             }),
             session_id: Some(resolved_session_id.clone()),
@@ -579,126 +545,16 @@ async fn handle_chat_message(
     }
 }
 
-async fn handle_fcmd(state: &ArchitectState, raw: &str) -> Result<Value, ArchitectError> {
-    let cmd: PromptCommand = serde_json::from_str(raw)?;
-    let prompt_id = cmd
-        .prompt_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let _guard = state.prompt_lock.lock().await;
-    let path = prompt_store_path(state);
-    let mut store = load_prompt_store(&path)?;
-    let now = now_epoch_ms();
-
-    match cmd.op.as_str() {
-        "prompt.get" => {
-            let prompt_id = prompt_id.ok_or("prompt_id is required")?;
-            let slot = store.prompts.get(prompt_id).cloned().unwrap_or_default();
-            Ok(json!({
-                "prompt_id": prompt_id,
-                "draft": slot.draft,
-                "published": slot.published,
-                "previous_published": slot.previous_published,
-            }))
-        }
-        "prompt.update_draft" => {
-            let prompt_id = prompt_id.ok_or("prompt_id is required")?.to_string();
-            let content = cmd
-                .content
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or("content is required")?
-                .to_string();
-            let slot = store.prompts.entry(prompt_id.clone()).or_default();
-            slot.next_version += 1;
-            let version = StoredPromptVersion {
-                version: slot.next_version,
-                content,
-                updated_at_ms: now,
-            };
-            slot.history.push(PromptHistoryEntry {
-                version: version.version,
-                stage: "draft".to_string(),
-                updated_at_ms: now,
-            });
-            slot.draft = Some(version.clone());
-            save_prompt_store(&path, &store)?;
-            Ok(json!({
-                "prompt_id": prompt_id,
-                "draft": version,
-            }))
-        }
-        "prompt.publish" => {
-            let prompt_id = prompt_id.ok_or("prompt_id is required")?.to_string();
-            let response = {
-                let slot = store.prompts.entry(prompt_id.clone()).or_default();
-                let draft = slot.draft.clone().ok_or("draft missing")?;
-                slot.previous_published = slot.published.clone();
-                slot.published = Some(draft.clone());
-                slot.draft = None;
-                slot.history.push(PromptHistoryEntry {
-                    version: draft.version,
-                    stage: "published".to_string(),
-                    updated_at_ms: now,
-                });
-                json!({
-                    "prompt_id": prompt_id,
-                    "published": draft,
-                    "previous_published": slot.previous_published.clone(),
-                })
-            };
-            save_prompt_store(&path, &store)?;
-            Ok(response)
-        }
-        "prompt.rollback" => {
-            let prompt_id = prompt_id.ok_or("prompt_id is required")?.to_string();
-            let response = {
-                let slot = store.prompts.entry(prompt_id.clone()).or_default();
-                let previous = slot
-                    .previous_published
-                    .clone()
-                    .ok_or("previous_published missing")?;
-                let current = slot.published.clone();
-                slot.published = Some(previous.clone());
-                slot.previous_published = current;
-                slot.history.push(PromptHistoryEntry {
-                    version: previous.version,
-                    stage: "rollback".to_string(),
-                    updated_at_ms: now,
-                });
-                json!({
-                    "prompt_id": prompt_id,
-                    "published": previous,
-                    "previous_published": slot.previous_published.clone(),
-                })
-            };
-            save_prompt_store(&path, &store)?;
-            Ok(response)
-        }
-        "prompt.history" => {
-            let prompt_id = prompt_id.ok_or("prompt_id is required")?;
-            let slot = store.prompts.get(prompt_id).cloned().unwrap_or_default();
-            Ok(json!({
-                "prompt_id": prompt_id,
-                "history": slot.history,
-            }))
-        }
-        other => Err(format!("unsupported FCMD op: {other}").into()),
-    }
-}
-
-async fn handle_acmd(state: &ArchitectState, raw: &str) -> Result<Value, ArchitectError> {
-    let parsed = parse_acmd(raw)?;
-    let translated = translate_acmd(&state.hive_id, parsed)?;
+async fn handle_scmd(state: &ArchitectState, raw: &str) -> Result<Value, ArchitectError> {
+    let parsed = parse_scmd(raw)?;
+    let translated = translate_scmd(&state.hive_id, parsed)?;
     execute_admin_translation(state, translated).await
 }
 
-fn parse_acmd(raw: &str) -> Result<ParsedAcmd, ArchitectError> {
+fn parse_scmd(raw: &str) -> Result<ParsedScmd, ArchitectError> {
     let mut text = raw.trim();
     if !text.starts_with("curl ") {
-        return Err("ACMD must start with 'curl '".into());
+        return Err("SCMD must start with 'curl '".into());
     }
     let mut body = None;
     if let Some((head, body_raw)) = text.rsplit_once(" -d ") {
@@ -708,19 +564,19 @@ fn parse_acmd(raw: &str) -> Result<ParsedAcmd, ArchitectError> {
     }
     let tokens: Vec<&str> = text.split_whitespace().collect();
     if tokens.len() < 4 || tokens[0] != "curl" || tokens[1] != "-X" {
-        return Err("ACMD syntax must be: curl -X METHOD /relative/path [-d '{...}']".into());
+        return Err("SCMD syntax must be: curl -X METHOD /relative/path [-d '{...}']".into());
     }
     let method = tokens[2].trim().to_ascii_uppercase();
     let path = tokens[3].trim().to_string();
     if !path.starts_with('/') {
-        return Err("ACMD path must be relative and start with '/'".into());
+        return Err("SCMD path must be relative and start with '/'".into());
     }
-    Ok(ParsedAcmd { method, path, body })
+    Ok(ParsedScmd { method, path, body })
 }
 
-fn translate_acmd(
+fn translate_scmd(
     local_hive_id: &str,
-    parsed: ParsedAcmd,
+    parsed: ParsedScmd,
 ) -> Result<AdminTranslation, ArchitectError> {
     let segments: Vec<&str> = parsed
         .path
@@ -728,7 +584,7 @@ fn translate_acmd(
         .filter(|segment| !segment.is_empty())
         .collect();
     if segments.len() < 2 || segments[0] != "hives" {
-        return Err("ACMD path must start with /hives/{hive}/...".into());
+        return Err("SCMD path must start with /hives/{hive}/...".into());
     }
     let hive_id = segments[1].to_string();
     let admin_target = format!("SY.admin@{local_hive_id}");
@@ -781,7 +637,7 @@ fn translate_acmd(
         ("POST", ["hives", _, "nodes", node_name, "messages"]) => {
             let mut params = parsed.body.unwrap_or_else(|| json!({}));
             if !params.is_object() {
-                return Err("ACMD body for send message must be a JSON object".into());
+                return Err("SCMD body for send message must be a JSON object".into());
             }
             params["node_name"] = Value::String((*node_name).to_string());
             Ok(AdminTranslation {
@@ -791,7 +647,7 @@ fn translate_acmd(
                 params,
             })
         }
-        _ => Err(format!("unsupported ACMD path: {} {}", parsed.method, parsed.path).into()),
+        _ => Err(format!("unsupported SCMD path: {} {}", parsed.method, parsed.path).into()),
     }
 }
 
@@ -800,7 +656,7 @@ async fn execute_admin_translation(
     translation: AdminTranslation,
 ) -> Result<Value, ArchitectError> {
     let node_config = NodeConfig {
-        name: format!("SY.architect.acmd.{}", Uuid::new_v4().simple()),
+        name: format!("SY.architect.scmd.{}", Uuid::new_v4().simple()),
         router_socket: state.socket_dir.clone(),
         uuid_persistence_dir: state.state_dir.join("nodes"),
         uuid_mode: fluxbee_sdk::NodeUuidMode::Ephemeral,
@@ -1677,37 +1533,22 @@ fn update_title_from_message(current_title: &str, message: &str) -> String {
 
 fn compact_title_candidate(message: &str) -> String {
     let trimmed = message.trim();
-    if let Some(raw) = trimmed.strip_prefix("FCMD:") {
-        return compact_fcmd_title(raw.trim());
+    if let Some(raw) = trimmed.strip_prefix("SCMD:") {
+        return compact_scmd_title(raw.trim());
     }
-    if let Some(raw) = trimmed.strip_prefix("ACMD:") {
-        return compact_acmd_title(raw.trim());
+    if trimmed.starts_with("ACMD:") {
+        return "Legacy ACMD command".to_string();
+    }
+    if trimmed.starts_with("FCMD:") {
+        return "Legacy FCMD command".to_string();
     }
     trimmed.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn compact_fcmd_title(raw: &str) -> String {
-    match serde_json::from_str::<PromptCommand>(raw) {
-        Ok(command) => {
-            let mut parts = vec!["FCMD".to_string(), command.op];
-            if let Some(prompt_id) = command
-                .prompt_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                parts.push(prompt_id.to_string());
-            }
-            parts.join(" ")
-        }
-        Err(_) => format!("FCMD {}", preview_text(raw, 40)),
-    }
-}
-
-fn compact_acmd_title(raw: &str) -> String {
-    match parse_acmd(raw) {
+fn compact_scmd_title(raw: &str) -> String {
+    match parse_scmd(raw) {
         Ok(parsed) => format!("{} {}", parsed.method, preview_text(&parsed.path, 40)),
-        Err(_) => format!("ACMD {}", preview_text(raw, 40)),
+        Err(_) => format!("SCMD {}", preview_text(raw, 40)),
     }
 }
 
@@ -1731,30 +1572,6 @@ fn preview_text(input: &str, max_chars: usize) -> String {
         .trim()
         .to_string();
     format!("{truncated}…")
-}
-
-fn prompt_store_path(state: &ArchitectState) -> PathBuf {
-    json_router::paths::storage_root_dir()
-        .join("nodes")
-        .join("SY")
-        .join(format!("SY.architect@{}", state.hive_id))
-        .join("prompts.json")
-}
-
-fn load_prompt_store(path: &Path) -> Result<PromptStore, ArchitectError> {
-    if !path.exists() {
-        return Ok(PromptStore::default());
-    }
-    let data = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&data)?)
-}
-
-fn save_prompt_store(path: &Path, store: &PromptStore) -> Result<(), ArchitectError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_vec_pretty(store)?)?;
-    Ok(())
 }
 
 fn now_epoch_ms() -> u64 {
@@ -2434,7 +2251,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         </div>
         <div class="meta-grid">
           <div><strong>Node</strong>: {node}</div>
-          <div><strong>Modes</strong>: chat, FCMD, ACMD</div>
+          <div><strong>Modes</strong>: chat, SCMD</div>
         </div>
       </aside>
       <div class="shell">
@@ -2448,7 +2265,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         </div>
         <div id="messages" class="messages"></div>
         <div class="composer">
-          <textarea id="input" placeholder="Message, FCMD: {{...}}, or ACMD: curl -X GET /hives/{hive}/nodes"></textarea>
+          <textarea id="input" placeholder="Message or SCMD: curl -X GET /hives/{hive}/nodes"></textarea>
           <div class="composer-row">
             <div id="composer-hint" class="hint">Enter to send. Shift+Enter for newline. Sessions on the left are local and reload-safe.</div>
             <button id="send">Send</button>
@@ -2547,7 +2364,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       badge.className = "result-status";
       meta.className = "result-meta";
 
-      const modeLabel = mode === "acmd" ? "admin command" : mode === "fcmd" ? "prompt control" : "response";
+      const isSystemCommand = mode === "scmd" || mode === "acmd";
+      const modeLabel = isSystemCommand ? "system command" : "response";
       const resultStatus = String(data.status || "unknown");
       title.textContent = modeLabel;
       badge.textContent = resultStatus;
@@ -2559,7 +2377,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       head.appendChild(badge);
       shell.appendChild(head);
 
-      if (mode === "acmd") {{
+      if (isSystemCommand) {{
         const action = data.output && data.output.action ? data.output.action : "unknown";
         const traceId = data.output && data.output.trace_id ? data.output.trace_id : null;
         meta.textContent = "action: " + action + (traceId ? " | trace: " + traceId : "");
@@ -2570,11 +2388,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
         if (data.output && data.output.error_detail) {{
           shell.appendChild(createResultSection("error", data.output.error_detail));
         }}
-      }} else if (mode === "fcmd") {{
-        const promptId = data.output && data.output.prompt_id ? data.output.prompt_id : null;
-        meta.textContent = promptId ? "prompt: " + promptId : "local prompt operation";
-        shell.appendChild(meta);
-        shell.appendChild(createResultSection("result", data.output));
       }} else {{
         shell.appendChild(createResultSection("result", data.output));
       }}
@@ -2593,14 +2406,14 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     function isDestructiveMessage(message) {{
       const trimmed = String(message || "").trim();
-      if (!trimmed.startsWith("ACMD:")) return false;
+      if (!trimmed.startsWith("SCMD:")) return false;
       const command = trimmed.slice(5).trim().toUpperCase();
       return command.startsWith("CURL -X DELETE ");
     }}
     function seedWelcomeMessages() {{
-      addMessage("system", "Fluxbee architect interface ready. Prompt control is local through FCMD, and admin passthrough is available through ACMD.");
-      addMessage("architect", "I am archi. AI conversation is still pending, but the control-plane shell and prompt operations are live.");
-      addMessage("system", "Example: FCMD: {{\"op\":\"prompt.get\",\"prompt_id\":\"architect\"}} or ACMD: curl -X GET /hives/{hive}/nodes");
+      addMessage("system", "Fluxbee architect interface ready. System operations are available through SCMD.");
+      addMessage("architect", "I am archi. AI conversation is still pending, but the control-plane shell is live.");
+      addMessage("system", "Example: SCMD: curl -X GET /hives/{hive}/nodes");
     }}
     function resetChatViewport() {{
       messages.innerHTML = "";

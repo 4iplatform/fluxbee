@@ -53,10 +53,10 @@ Before implementation, the following constraints from the current core must be t
 │  ┌─────────────────────────────────────────────────────────────────┐│
 │  │                    Core Logic                                    ││
 │  │  • Chat management (conversations, history)                     ││
-│  │  • FCMD / ACMD parsing and execution                            ││
+│  │  • SCMD parsing and execution                                  ││
 │  │  • System state aggregation                                     ││
 │  │  • IO impersonation engine                                      ││
-│  │  • Prompt version management (chat-driven)                      ││
+│  │  • Prompt asset loading (project/binary owned)                  ││
 │  └─────────────────────────────────────────────────────────────────┘│
 │                            │                                         │
 │                            ▼                                         │
@@ -239,58 +239,31 @@ sy.architect/
         └── tester.md             # IO impersonation and testing agent
 ```
 
-At runtime, prompt maintenance should happen through the same chat surface used for normal operation. The persisted storage still lives locally on disk, but the human-facing control surface is the chat, not a separate prompt editor screen.
+### 5.3 Prompt Assets Are Project Assets
 
-### 5.3 Prompt Management Model (Chat-Only)
+Prompts for `SY.architect` are part of the project/package, not part of the runtime chat surface.
 
-Prompt maintenance for `SY.architect` should not require a separate UI area. The same chat supports two execution paths:
+That means:
 
-- normal conversational messages, which may invoke the AI provider
-- local control messages, parsed and executed directly by `SY.architect` without invoking the AI provider
+- prompts live in source-controlled assets within the project
+- `SY.architect` may load them locally at runtime once AI integration exists
+- changing them requires editing the project assets and rebuilding/redeploying the binary
+- there is no chat command surface for mutating prompts in v1
 
-For v1, local control messages use a reserved prefix:
+This keeps `SY.architect` aligned with its role as a core system node: the operator can use the chat to observe and operate the system, but not to rewrite the architect's own behavior live.
 
-- `FCMD:` for architect-owned local functions
+### 5.4 Runtime Editing Policy
 
-These commands must be parsed locally by `SY.architect`. They are not interpreted by the LLM, and they must keep a structured shape.
+The chat still supports two execution paths:
 
-Initial prompt operations should be limited to:
+- normal conversational messages, which may invoke the AI provider later
+- local system commands, parsed and executed directly by `SY.architect` without invoking the AI provider
 
-- `prompt.get`
-- `prompt.update_draft`
-- `prompt.publish`
-- `prompt.rollback`
-- `prompt.history`
+For v1, the only reserved command prefix is:
 
-Recommended wire shape in chat:
+- `SCMD:` for system operations translated into `ADMIN_COMMAND` calls over socket
 
-```text
-FCMD: {"op":"prompt.update_draft","prompt_id":"architect","content":"..."}
-```
-
-Not recommended:
-
-```text
-FCMD: cambiale el prompt al arquitecto para que sea mas corto
-```
-
-The node may still help the human improve prompt text conversationally, but the actual mutation only happens when a valid `FCMD:` payload is received.
-
-### 5.4 Prompt Versioning Requirements
-
-Prompt maintenance needs at least a minimal lifecycle, even if AI is unavailable:
-
-- one current published version
-- one current draft version
-- at least one previous published version for rollback
-
-Publishing should be a local state transition:
-
-- validate draft shape
-- promote draft to published
-- preserve previous published as rollback target
-
-This keeps architect operational even if the external AI provider is down: prompt inspection, prompt updates, history lookup, and rollback remain available because they are local functions.
+There is intentionally no `FCMD:` prompt-editing surface in runtime.
 
 ### 5.5 Agent Roles (Initial)
 
@@ -318,16 +291,15 @@ Maximum 3 concurrent agent connections to AI provider. If more specialization is
 
 The architect uses the `fluxbee_sdk::admin_command()` helper to send commands to `SY.admin` via socket. Every operation the admin API exposes is available to the architect.
 
-Operationally, the chat should expose two explicit non-AI command prefixes:
+Operationally, the chat should expose one explicit non-AI command prefix:
 
-- `FCMD:` → architect-local functions
-- `ACMD:` → admin passthrough commands
+- `SCMD:` → system/admin passthrough commands
 
-Both are parsed locally by `SY.architect` and bypass the LLM.
+`SCMD:` is parsed locally by `SY.architect` and bypasses the LLM.
 
-### 6.2 ACMD Model (Admin Passthrough)
+### 6.2 SCMD Model (System Passthrough)
 
-`ACMD:` exists so a human operator can use the architect chat as a single operational terminal without opening a separate shell. The syntax should resemble `curl`, but must not execute shell commands or invoke a real `curl` process.
+`SCMD:` exists so a human operator can use the architect chat as a single operational terminal without opening a separate shell. The syntax should resemble `curl`, but must not execute shell commands or invoke a real `curl` process.
 
 The intent is:
 
@@ -354,10 +326,10 @@ Disallowed:
 Examples:
 
 ```text
-ACMD: curl -X GET /hives/motherbee/nodes
-ACMD: curl -X GET /hives/motherbee/identity/ilks
-ACMD: curl -X DELETE /hives/motherbee/nodes/IO.slack.T123/instance
-ACMD: curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/messages -d '{"msg_type":"user","msg":"LLM","payload":{"text":"hola"}}'
+SCMD: curl -X GET /hives/motherbee/nodes
+SCMD: curl -X GET /hives/motherbee/identity/ilks
+SCMD: curl -X DELETE /hives/motherbee/nodes/IO.slack.T123/instance
+SCMD: curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/messages -d '{"msg_type":"user","msg":"LLM","payload":{"text":"hola"}}'
 ```
 
 ### 6.3 Command Flow in Chat
@@ -402,7 +374,7 @@ Notes:
 
 ### 6.5 Command Confirmation
 
-For destructive operations (`kill_node`, `remove_hive`), the AI should confirm with the user before executing. This is enforced in the system prompt, not in code.
+For destructive operations (`kill_node`, `remove_hive`), the shell should require explicit confirmation before executing. In v1 this should be enforced in code, not left only to prompt discipline.
 
 ---
 
@@ -465,7 +437,7 @@ Architect:
 
 ### 8.2 Use Cases
 
-- Upload a custom prompt file for a node.
+- Upload prompt assets or packaging inputs as part of build/publish workflows.
 - Upload a runtime package (zip) for publishing.
 - Upload configuration files.
 - Upload test data for IO impersonation scenarios.
@@ -608,13 +580,11 @@ Current repo state should be treated as a **partial shell**, not as a blank impl
   - HTTP server with static HTML UI
   - `GET /api/status`
   - `POST /api/chat`
-  - local `FCMD:` parser with prompt storage on disk
-  - local `ACMD:` parser translated to `ADMIN_COMMAND`
+  - local `SCMD:` parser translated to `ADMIN_COMMAND`
+  - persisted chat sessions/messages in local LanceDB
 - The current implementation does **not** yet provide:
   - WebSocket chat/streaming
   - real AI provider integration
-  - real system status bar backed by `ADMIN_COMMAND`/inventory over socket
-  - persisted chat sessions/messages
   - settings panel / `set_node_config`
   - IO impersonation
   - uploads / blobs
@@ -636,7 +606,7 @@ These are not optional details; they affect the shape of the implementation:
 This is the recommended first execution slice for the current repo state. It deliberately avoids AI-first work.
 
 - [x] ARCH-S1.1. Implement system status bar backed by `ADMIN_COMMAND` over socket (`SY.admin` target, no HTTP dependency).
-- [x] ARCH-S1.2. Improve `ACMD` rendering and validation so command results/errors are usable as an operational shell.
+- [x] ARCH-S1.2. Improve `SCMD` rendering and validation so command results/errors are usable as an operational shell.
 - [x] ARCH-S1.3. Add destructive action confirmation flow for `kill_node`, `remove_hive`, and future deletes.
 - [x] ARCH-S1.4. Implement real chat sessions (`create/list/load`) so the left rail stops being placeholder UI.
 - [x] ARCH-S1.5. Persist sessions and messages in LanceDB, with a schema tuned for single-process local usage.
@@ -682,7 +652,7 @@ Goal: consolidate what already exists in `sy_architect.rs` so the node has a rel
   - directorio de trabajo
   - storage/chat DB
   - carga de prompts/assets
-  - Current state: **partial** (prompt store local existe, pero no hay chat DB ni asset loading formal)
+  - Current state: **partial** (chat DB local ya existe; asset loading formal de prompts todavía no)
 - [ ] ARCH-T4. Definir health/status mínimo del nodo (`RUNNING`, readiness HTTP, AI provider ready/not configured).
   - Current state: **partial**
 - [ ] ARCH-T5. Servir frontend estático mínimo (chat + status + settings).
@@ -694,43 +664,28 @@ Goal: consolidate what already exists in `sy_architect.rs` so the node has a rel
 
 This is the most important product phase for now. The architect should become useful even with AI disabled.
 
-- [ ] ARCH-T13. Implementar parser y executor de `ACMD:` con sintaxis tipo `curl`, parseado localmente y traducido a llamadas internas contra `SY.admin`.
-  - Current state: **partial**
-- [ ] ARCH-T15. Representar resultados de comandos como mensajes de sistema en el chat.
-  - Current state: **partial**
-- [ ] ARCH-T14. Implementar barra/status de sistema usando:
+- [x] ARCH-T13. Implementar parser y executor de `SCMD:` con sintaxis tipo `curl`, parseado localmente y traducido a llamadas internas contra `SY.admin`.
+- [x] ARCH-T15. Representar resultados de comandos como mensajes de sistema en el chat.
+- [x] ARCH-T14. Implementar barra/status de sistema usando:
   - `ADMIN_COMMAND` por socket como camino canónico v1
   - SHM directo solo como optimización futura, no como contrato inicial
   - Nota: reemplaza placeholders locales del header; ésta es la próxima pieza estructural de UX.
-- [ ] ARCH-T16. Endurecer confirmación de operaciones destructivas (`kill_node`, `remove_hive`, futuros deletes).
+- [x] ARCH-T16. Endurecer confirmación de operaciones destructivas (`kill_node`, `remove_hive`, futuros deletes).
 
-### Phase D — Prompt Control Inside Chat
+### Phase D — Prompt Assets And Build-Time Policy
 
-Prompt control is already partly started and should be completed while the node is still non-AI-first.
+Prompt behavior is owned by the project/package, not by runtime chat commands.
 
-- [ ] ARCH-T16.1. Implementar parser local de `FCMD:` con payload JSON estructurado.
-  - Current state: **mostly done**
-- [ ] ARCH-T16.2. Implementar operaciones mínimas:
-  - `prompt.get`
-  - `prompt.update_draft`
-  - `prompt.publish`
-  - `prompt.rollback`
-  - `prompt.history`
-  - Current state: **mostly done**
-- [ ] ARCH-T16.3. Mantener storage local con al menos:
-  - draft actual
-  - published actual
-  - previous published
-  - Current state: **mostly done**
-- [ ] ARCH-T16.4. Validar localmente estructura mínima del prompt antes de publicar.
-- [ ] ARCH-T16.5. Representar historial/versiones de prompt como mensajes de sistema en el chat.
+- [x] ARCH-T16.1. Eliminar la superficie runtime de edición de prompts; no exponer comandos de chat que muten `SY.architect`.
+- [ ] ARCH-T16.2. Cargar prompts desde assets del proyecto/core packaging cuando la integración AI quede habilitada.
+- [ ] ARCH-T16.3. Definir layout/versionado de assets de prompts en el proyecto, con rebuild/redeploy como único camino de cambio.
 
 ### Phase E — Sessions, Persistence, And Left Rail Becoming Real
 
 This phase turns the current visual chat navigator into real product behavior.
 
-- [ ] ARCH-T27. Implementar sesiones de chat (create/list/load/delete).
-- [ ] ARCH-T28. Implementar persistencia local de mensajes.
+- [x] ARCH-T27. Implementar sesiones de chat (create/list/load/delete).
+- [x] ARCH-T28. Implementar persistencia local de mensajes.
 - [ ] ARCH-T30. Implementar búsqueda en historial y títulos de sesión.
 - [ ] ARCH-T29. Optimizar LanceDB para uso local single-process:
   - schema de sesiones/mensajes
@@ -757,7 +712,7 @@ This is intentionally later. The node should already be operational without it.
 - [ ] ARCH-T12. Implementar selección de agente:
   - switch explícito por usuario
   - heurística simple por intención
-- [ ] ARCH-T12.1. Separar pipeline de mensajes normales vs mensajes de control; `FCMD:` y `ACMD:` no deben invocar al proveedor AI.
+- [ ] ARCH-T12.1. Separar pipeline de mensajes normales vs mensajes de control; `SCMD:` no debe invocar al proveedor AI.
 - [ ] ARCH-T6. Implementar endpoint WebSocket de chat bidireccional.
 - [ ] ARCH-T10. Implementar streaming token-by-token hacia WebSocket.
 
@@ -836,6 +791,6 @@ sy.architect/
 | `10-identity-v2.md` | Architect registered as SY node under fluxbee tenant |
 | `system-inventory-spec.md` | Status bar reads from inventory |
 | `node-status-contract.md` | Architect can query node status for monitoring |
-| `runtime-packaging-cli-spec.md` | Core packaging may still ship default prompt assets, but runtime prompt maintenance in v1 happens through chat-local control |
+| `runtime-packaging-cli-spec.md` | Core packaging should ship architect prompt assets; changing them is a project/package update, not a runtime chat operation |
 | `runtime-lifecycle-spec.md` | Architect can trigger publish → deploy → spawn flow via chat |
 | `identity-v3-direction.md` | Future: architect may become a government node with institutional role |
