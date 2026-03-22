@@ -116,6 +116,8 @@ A small panel (modal or slide-out) for essential configuration that the system n
 
 Settings are saved via ADMIN_COMMAND `set_node_config` targeting self. Orchestrator updates config.json, architect rereads it.
 
+For v1, this panel should edit only architect-owned runtime settings stored in `config.json`. It should not edit bootstrap/network placement fields from `hive.yaml`.
+
 For network exposure, the bind/listen of the local HTTP server should be declared in `hive.yaml`:
 
 ```yaml
@@ -128,6 +130,7 @@ The intended deployment model is:
 - `SY.architect` binds to an internal/local address
 - the operator exposes it through an external reverse proxy if desired
 - `SY.architect` should not assume direct public exposure
+- `listen/bind` remains bootstrap-owned in `hive.yaml` for v1 and is out of scope for the first settings UI
 
 ### 3.2 System Status Bar (top)
 
@@ -192,6 +195,35 @@ architect:
 ```
 
 At startup, SY.architect reads from config.json first. If no key there, falls back to hive.yaml. If neither has a key, the architect operates in "unconfigured" mode — it can serve the UI and settings panel but cannot process AI conversations.
+
+### 4.3 Config Contract Direction (Pending)
+
+For `SY.architect`, the intended configuration ownership split is:
+
+| Surface | Canonical file | Writer | Purpose |
+|---------|----------------|--------|---------|
+| bootstrap/system | `/etc/fluxbee/hive.yaml` | human / orchestrator bootstrap | hive identity, role, WAN/system config, `architect.listen`, system-wide fallback values |
+| architect runtime | `/var/lib/fluxbee/nodes/SY/SY.architect@<hive>/config.json` | `SY.orchestrator` via `set_node_config` | mutable per-node settings owned by architect (`ai_providers`, future UI-managed settings, `_system` metadata) |
+
+Tentative rules:
+
+- `SY.architect` never writes its own `config.json` directly.
+- `SY.architect` reads `config.json` if present, but must tolerate it being absent during early bootstrap.
+- `hive.yaml` is bootstrap/fallback input, not the primary mutable settings store for architect.
+- `architect.listen` stays in `hive.yaml` for v1; it is not migrated into `config.json`.
+- AI provider settings use precedence: `config.json` first, `hive.yaml` fallback second.
+- Prompt assets are not config; they live in project/package assets and change only through rebuild/redeploy.
+
+Bootstrap requirement if this direction is adopted:
+
+- before the future settings UI depends on `set_node_config` targeting self, core bootstrap/orchestrator must ensure that `/var/lib/fluxbee/nodes/SY/SY.architect@<hive>/config.json` exists with a minimal root object and `_system` metadata
+- if that file is missing, architect may still run in read-only/fallback mode, but self-settings writes are not considered available yet
+
+Important note:
+
+- this contract is not considered closed yet at core level
+- today, other core/system nodes (`SY.admin`, `SY.storage`, `SY.identity`) still bootstrap from `hive.yaml`
+- while `hive.yaml` remains the effective startup source for core nodes, `config.json` for `SY.architect` should be treated as a pending direction rather than a fully-settled invariant
 
 ### 4.2 First-Run Flow
 
@@ -531,18 +563,25 @@ SY.architect is registered in identity under the `fluxbee` default tenant by orc
       "default_model": "gpt-4",
       "max_tokens": 4096
     }
-  },
-  "http": {
-    "listen": "127.0.0.1:3000"
   }
 }
 ```
+
+Config path for `SY.architect`:
+
+- `/var/lib/fluxbee/nodes/SY/SY.architect@<hive>/config.json`
 
 For v1, the effective bind order should be:
 
 1. `JSR_ARCHITECT_LISTEN` environment override
 2. `architect.listen` in `hive.yaml`
 3. fallback default `127.0.0.1:3000`
+
+For AI provider configuration, the effective precedence should be:
+
+1. `config.json`
+2. `hive.yaml`
+3. unconfigured mode
 
 ---
 
@@ -596,7 +635,7 @@ Because of that, the backlog should prioritize turning the current shell into a 
 These are not optional details; they affect the shape of the implementation:
 
 - **Core packaging boundary:** `SY.architect` is a core `SY.*` node, so frontend/prompt assets cannot assume managed runtime `_system.package_path`.
-- **Config ownership split:** today there is a practical split between `hive.yaml` bootstrap/fallback config and future self-managed `config.json`. This must be made explicit before implementing settings writes.
+- **Config ownership split:** today there is a practical split between `hive.yaml` bootstrap/fallback config and future self-managed `config.json`. This is still unresolved for core/system nodes as a class: orchestrator/admin can address `config.json`, but current `SY.*` runtimes still bootstrap from `hive.yaml`.
 - **Status source of truth:** for v1, the top bar should read through `ADMIN_COMMAND` over socket, not over HTTP. Direct SHM reads are a possible later optimization, not the initial contract.
 - **Persistence scope for v1:** chat sessions/messages should persist in LanceDB locally. Internal layout/flush/index strategy can be optimized for the fact that only this process reads/writes these chats.
 - **Non-AI usefulness first:** the architect should become a strong operational chat shell even if AI is disabled or delayed.
@@ -645,7 +684,7 @@ Goal: consolidate what already exists in `sy_architect.rs` so the node has a rel
 - [ ] ARCH-T2. Implementar lectura de configuración:
   - `config.json` propio
   - fallback a `hive.yaml` para provider keys si aplica
-  - Current state: **partial** (`hive.yaml` ya se lee; `config.json` todavía no)
+  - Current state: **partial** (`config.json` ya se lee para AI provider settings con fallback a `hive.yaml`, pero el contrato de core todavía no está cerrado mientras `SY.*` siga arrancando desde `hive.yaml`)
 - [ ] ARCH-T2.1. Leer `architect.listen` desde `hive.yaml` (con override opcional por env) para bind interno HTTP detrás de reverse proxy.
   - Current state: **mostly done**
 - [ ] ARCH-T3. Implementar bootstrap de estado local:
@@ -686,7 +725,7 @@ This phase turns the current visual chat navigator into real product behavior.
 
 - [x] ARCH-T27. Implementar sesiones de chat (create/list/load/delete).
 - [x] ARCH-T28. Implementar persistencia local de mensajes.
-- [ ] ARCH-T30. Implementar búsqueda en historial y títulos de sesión.
+- [x] ARCH-T30. Implementar búsqueda en historial y títulos de sesión.
 - [ ] ARCH-T29. Optimizar LanceDB para uso local single-process:
   - schema de sesiones/mensajes
   - estrategia de flush/compaction

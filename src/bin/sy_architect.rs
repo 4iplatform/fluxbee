@@ -61,6 +61,11 @@ struct OpenAiSection {
     api_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ArchitectNodeConfigFile {
+    ai_providers: Option<AiProvidersSection>,
+}
+
 struct ArchitectState {
     hive_id: String,
     node_name: String,
@@ -213,6 +218,7 @@ async fn main() -> Result<(), ArchitectError> {
     let socket_dir = json_router::paths::router_socket_dir();
 
     let hive = load_hive(&config_dir)?;
+    let node_config = load_architect_node_config(&hive.hive_id)?;
     let listen = std::env::var("JSR_ARCHITECT_LISTEN")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -232,7 +238,7 @@ async fn main() -> Result<(), ArchitectError> {
         state_dir,
         socket_dir,
         router_connected: AtomicBool::new(false),
-        ai_configured: AtomicBool::new(hive_ai_configured(&hive)),
+        ai_configured: AtomicBool::new(architect_ai_configured(node_config.as_ref(), &hive)),
         chat_lock: Mutex::new(()),
     });
 
@@ -286,6 +292,38 @@ fn hive_ai_configured(hive: &HiveFile) -> bool {
         .and_then(|openai| openai.api_key.as_ref())
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
+}
+
+fn architect_ai_configured(config: Option<&ArchitectNodeConfigFile>, hive: &HiveFile) -> bool {
+    config
+        .and_then(|cfg| cfg.ai_providers.as_ref())
+        .and_then(|providers| providers.openai.as_ref())
+        .and_then(|openai| openai.api_key.as_ref())
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| hive_ai_configured(hive))
+}
+
+fn load_architect_node_config(
+    hive_id: &str,
+) -> Result<Option<ArchitectNodeConfigFile>, ArchitectError> {
+    let path = architect_config_path(hive_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)?;
+    let parsed = serde_json::from_str(&raw)?;
+    Ok(Some(parsed))
+}
+
+fn architect_node_dir(hive_id: &str) -> PathBuf {
+    json_router::paths::storage_root_dir()
+        .join("nodes")
+        .join("SY")
+        .join(format!("SY.architect@{hive_id}"))
+}
+
+fn architect_config_path(hive_id: &str) -> PathBuf {
+    architect_node_dir(hive_id).join("config.json")
 }
 
 async fn router_connect_loop(config: NodeConfig, state: Arc<ArchitectState>) {
@@ -898,11 +936,7 @@ async fn open_architect_db(state: &ArchitectState) -> Result<Connection, Archite
 }
 
 fn architect_db_path(state: &ArchitectState) -> PathBuf {
-    json_router::paths::storage_root_dir()
-        .join("nodes")
-        .join("SY")
-        .join(format!("SY.architect@{}", state.hive_id))
-        .join("architect.lance")
+    architect_node_dir(&state.hive_id).join("architect.lance")
 }
 
 async fn ensure_sessions_table(db: &Connection) -> Result<lancedb::Table, ArchitectError> {
@@ -1868,6 +1902,22 @@ fn architect_index_html(state: &ArchitectState) -> String {
       color: #ffffff;
       justify-content: center;
     }}
+    .history-search {{
+      width: 100%;
+      margin-bottom: 14px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 11px 13px;
+      font: inherit;
+      font-size: 0.9rem;
+      color: var(--text);
+      background: #ffffff;
+      outline: none;
+    }}
+    .history-search:focus {{
+      border-color: #b8caef;
+      box-shadow: 0 0 0 4px rgba(69, 117, 220, 0.12);
+    }}
     .history-list {{
       display: grid;
       gap: 10px;
@@ -2245,6 +2295,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
           <button id="clear-history" class="mini-pill action" type="button">Clear</button>
         </div>
         <button id="new-chat" class="new-chat">New chat</button>
+        <input id="history-search" class="history-search" type="search" placeholder="Search chats" autocomplete="off" />
         <div id="history-list" class="history-list"></div>
         <div class="history-note">
           Chat sessions stay persisted locally on motherbee and reload automatically.
@@ -2286,6 +2337,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const send = document.getElementById("send");
     const newChat = document.getElementById("new-chat");
     const clearHistory = document.getElementById("clear-history");
+    const historySearch = document.getElementById("history-search");
     const historyList = document.getElementById("history-list");
     const composerHint = document.getElementById("composer-hint");
     let currentSessionId = null;
@@ -2425,6 +2477,15 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const count = Number(session.message_count || 0);
       return count + " messages · updated " + formatTimestamp(session.last_activity_at_ms);
     }}
+    function historyMatchesSearch(session, query) {{
+      if (!query) return true;
+      const haystack = [
+        session && session.title ? session.title : "",
+        session && session.last_message_preview ? session.last_message_preview : "",
+        session && session.agent ? session.agent : ""
+      ].join(" ").toLowerCase();
+      return haystack.includes(query);
+    }}
     function renderHistory() {{
       historyList.innerHTML = "";
       if (!sessionsCache.length) {{
@@ -2434,7 +2495,16 @@ fn architect_index_html(state: &ArchitectState) -> String {
         historyList.appendChild(empty);
         return;
       }}
-      sessionsCache.forEach((session) => {{
+      const query = (historySearch && historySearch.value ? historySearch.value : "").trim().toLowerCase();
+      const visibleSessions = sessionsCache.filter((session) => historyMatchesSearch(session, query));
+      if (!visibleSessions.length) {{
+        const empty = document.createElement("div");
+        empty.className = "history-card placeholder";
+        empty.innerHTML = '<div class="history-name">No matches</div><div class="history-meta">Try a different title or keyword from a recent message.</div>';
+        historyList.appendChild(empty);
+        return;
+      }}
+      visibleSessions.forEach((session) => {{
         const card = document.createElement("div");
         const head = document.createElement("div");
         const name = document.createElement("div");
@@ -2621,6 +2691,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
       clearAllHistory().catch((err) => {{
         addMessage("system", "Clear history failed: " + err);
       }});
+    }});
+    historySearch.addEventListener("input", () => {{
+      renderHistory();
     }});
     newChat.addEventListener("click", () => {{
       createSession(false).catch((err) => {{
