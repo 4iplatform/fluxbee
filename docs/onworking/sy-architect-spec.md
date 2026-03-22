@@ -682,18 +682,17 @@ This phase is design-first and should close the major ambiguities before the nod
 
 Goal: consolidate what already exists in `sy_architect.rs` so the node has a reliable non-AI base.
 
-- [ ] ARCH-T1. Consolidar `src/bin/sy_architect.rs` como shell base del nodo:
+- [x] ARCH-T1. Consolidar `src/bin/sy_architect.rs` como shell base del nodo:
   - conexión SDK al router
   - HTTP server `axum`
   - surface HTTP/UI estable
   - WebSocket queda pendiente para fase posterior
-  - Current state: **partial**
+  - Current state: **done for v1 base shell**
 - [ ] ARCH-T2. Implementar lectura de configuración:
   - `config.json` propio
   - fallback a `hive.yaml` para provider keys si aplica
   - Current state: **partial** (`config.json` ya se lee para AI provider settings con fallback a `hive.yaml`, pero el contrato de core todavía no está cerrado mientras `SY.*` siga arrancando desde `hive.yaml`)
-- [ ] ARCH-T2.1. Leer `architect.listen` desde `hive.yaml` (con override opcional por env) para bind interno HTTP detrás de reverse proxy.
-  - Current state: **mostly done**
+- [x] ARCH-T2.1. Leer `architect.listen` desde `hive.yaml` (con override opcional por env) para bind interno HTTP detrás de reverse proxy.
 - [ ] ARCH-T3. Implementar bootstrap de estado local:
   - directorio de trabajo
   - storage/chat DB
@@ -703,8 +702,7 @@ Goal: consolidate what already exists in `sy_architect.rs` so the node has a rel
   - Current state: **partial**
 - [ ] ARCH-T5. Servir frontend estático mínimo (chat + status + settings).
   - Current state: **partial** (chat + status scaffold existen; settings no)
-- [ ] ARCH-T8.1. Mantener una sola pantalla principal de chat; no agregar un editor/pantalla separada de prompts para v1.
-  - Current state: **aligned**
+- [x] ARCH-T8.1. Mantener una sola pantalla principal de chat; no agregar un editor/pantalla separada de prompts para v1.
 
 ### Phase C — Control Plane MVP Without AI
 
@@ -717,6 +715,38 @@ This is the most important product phase for now. The architect should become us
   - SHM directo solo como optimización futura, no como contrato inicial
   - Nota: reemplaza placeholders locales del header; ésta es la próxima pieza estructural de UX.
 - [x] ARCH-T16. Endurecer confirmación de operaciones destructivas (`kill_node`, `remove_hive`, futuros deletes).
+
+### Phase C.1 — Admin Surface Coverage
+
+This is now the highest-value execution track. `SY.architect` should converge toward broad operational coverage of what `SY.admin` already exposes today.
+
+- [ ] ARCH-T32. Expandir cobertura read-only de `SY.admin` en `SCMD` y tools del agente:
+  - `list_hives`, `get_hive`
+  - `list_admin_actions`
+  - `list_versions`, `get_versions`
+  - `list_runtimes`, `get_runtime`
+  - `list_routes`, `list_vpns`
+  - `get_storage`, `get_node_state`
+  - `list_deployments`, `get_deployments`
+  - `list_drift_alerts`, `get_drift_alerts`
+  - `opa_get_policy`, `opa_get_status`, `opa_check`
+- [ ] ARCH-T33. Exponer acciones mutating de `SY.admin` a través de `SY.architect` con política explícita de confirmación:
+  - `run_node`, `kill_node`, `remove_node_instance`
+  - `add_hive`, `remove_hive`
+  - `add_route`, `delete_route`
+  - `add_vpn`, `delete_vpn`
+  - `set_node_config`, `set_storage`
+  - `send_node_message`
+  - `update`, `sync_hint`
+  - `opa_compile`, `opa_apply`, `opa_compile_apply`, `opa_rollback`
+- [ ] ARCH-T34. Diseñar contrato de confirmación para tools de escritura:
+  - lectura libre
+  - escritura/mutación solo con confirmación explícita del operador
+  - no depender solo del prompt para seguridad
+- [ ] ARCH-T35. Mejorar render/persistencia de tool calls:
+  - mostrar qué tool usó `archi`
+  - mostrar inputs relevantes y resultado resumido
+  - mantener salida completa disponible en metadata
 
 ### Phase D — Prompt Assets And Build-Time Policy
 
@@ -779,7 +809,7 @@ This should happen after the control-plane shell is trustworthy, because it is p
 
 ### Phase I — Tenant / Identity Assisted Flows
 
-- [ ] ARCH-T21. Implementar lectura de ILKs desde architect (`list_ilks`, `get_ilk`) para depuración/UX.
+- [x] ARCH-T21. Implementar lectura de ILKs desde architect (`list_ilks`, `get_ilk`) para depuración/UX.
 - [ ] ARCH-T22. Si architect va a crear tenants o completar registros, implementar system-call path directo a `SY.identity` (`TNT_CREATE`, `ILK_REGISTER`, `ILK_ADD_CHANNEL`) fuera de admin REST.
 - [ ] ARCH-T23. Definir cómo se representa al usuario el resultado de writes de identity (ok/error/canonical tenant resolved).
 
