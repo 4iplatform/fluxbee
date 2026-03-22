@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use axum::extract::{Request, State};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::any;
@@ -32,6 +33,11 @@ const DEFAULT_ARCHITECT_LISTEN: &str = "127.0.0.1:3000";
 const ROUTER_RECONNECT_DELAY_SECS: u64 = 2;
 const CHAT_SESSIONS_TABLE: &str = "sessions";
 const CHAT_MESSAGES_TABLE: &str = "messages";
+const FAVICON_SVG: &str = include_str!("../../docs/tmp/favicon.svg");
+const FAVICON_ICO: &[u8] = include_bytes!("../../docs/tmp/favicon.ico");
+const FAVICON_16_PNG: &[u8] = include_bytes!("../../docs/tmp/favicon-16.png");
+const FAVICON_32_PNG: &[u8] = include_bytes!("../../docs/tmp/favicon-32.png");
+const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../../docs/tmp/apple-touch-icon.png");
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -364,6 +370,7 @@ async fn dynamic_handler(
 ) -> Response {
     let path = uri.path();
     match (method, path) {
+        (Method::GET, _) if is_favicon_path(path) => serve_favicon(path),
         (Method::GET, _) if is_status_path(path) => {
             let status = build_architect_status(&state).await;
             Json(status).into_response()
@@ -1789,6 +1796,39 @@ fn is_chat_path(path: &str) -> bool {
     path == "/api/chat" || path.ends_with("/api/chat")
 }
 
+fn is_favicon_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/favicon.ico"
+            | "/favicon.svg"
+            | "/favicon-16.png"
+            | "/favicon-32.png"
+            | "/apple-touch-icon.png"
+    )
+}
+
+fn serve_favicon(path: &str) -> Response {
+    match path {
+        "/favicon.svg" => (
+            [(CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+            FAVICON_SVG,
+        )
+            .into_response(),
+        "/favicon.ico" => ([(CONTENT_TYPE, "image/x-icon")], FAVICON_ICO).into_response(),
+        "/favicon-16.png" | "/favicon-32.png" | "/apple-touch-icon.png" => (
+            [(CONTENT_TYPE, "image/png")],
+            match path {
+                "/favicon-16.png" => FAVICON_16_PNG,
+                "/favicon-32.png" => FAVICON_32_PNG,
+                "/apple-touch-icon.png" => APPLE_TOUCH_ICON_PNG,
+                _ => unreachable!(),
+            },
+        )
+            .into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 fn is_sessions_collection_path(path: &str) -> bool {
     path == "/api/sessions" || path.ends_with("/api/sessions")
 }
@@ -1808,10 +1848,15 @@ fn architect_index_html(state: &ArchitectState) -> String {
     format!(
         r##"<!doctype html>
 <html lang="en">
-<head>
+  <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SY.architect</title>
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/favicon-16.png" sizes="16x16" type="image/png">
+  <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <style>
     :root {{
       --bg: #ffffff;
@@ -1821,7 +1866,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       --text: #171717;
       --muted: #667085;
       --line: #e6e9f0;
-      --accent: #4575dc;
+      --accent: #0070F3;
       --accent-soft: #e8f0ff;
       --logo-dark: #222222;
       --success: #1f7a4d;
@@ -2385,7 +2430,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         <button id="new-chat" class="new-chat">New chat</button>
         <div id="history-list" class="history-list"></div>
         <div class="history-note">
-          Chat sessions stay local to this node and reload from LanceDB.
+          Chat sessions stay persisted locally on motherbee and reload automatically.
         </div>
         <div class="meta-grid">
           <div><strong>Node</strong>: {node}</div>
