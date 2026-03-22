@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,13 +61,28 @@ struct ArchitectState {
 }
 
 #[derive(Debug, Serialize)]
-struct ArchitectStatus<'a> {
-    status: &'a str,
-    hive_id: &'a str,
-    node_name: &'a str,
-    listen: &'a str,
+struct ArchitectStatus {
+    status: String,
+    hive_id: String,
+    node_name: String,
     router_connected: bool,
-    ai_configured: bool,
+    admin_available: bool,
+    inventory_updated_at: Option<u64>,
+    total_hives: Option<u32>,
+    hives_alive: Option<u32>,
+    hives_stale: Option<u32>,
+    total_nodes: Option<u32>,
+    nodes_by_status: BTreeMap<String, u32>,
+    components: Vec<ArchitectComponentStatus>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArchitectComponentStatus {
+    key: String,
+    label: String,
+    status: String,
+    node_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,14 +281,7 @@ async fn dynamic_handler(
     let path = uri.path();
     match (method, path) {
         (Method::GET, _) if is_status_path(path) => {
-            let status = ArchitectStatus {
-                status: "ok",
-                hive_id: &state.hive_id,
-                node_name: &state.node_name,
-                listen: &state.listen,
-                router_connected: state.router_connected.load(Ordering::Relaxed),
-                ai_configured: state.ai_configured.load(Ordering::Relaxed),
-            };
+            let status = build_architect_status(&state).await;
             Json(status).into_response()
         }
         (Method::POST, _) if is_chat_path(path) => {
@@ -590,6 +598,193 @@ async fn execute_admin_translation(
     }))
 }
 
+async fn build_architect_status(state: &ArchitectState) -> ArchitectStatus {
+    let mut status = ArchitectStatus {
+        status: "ok".to_string(),
+        hive_id: state.hive_id.clone(),
+        node_name: state.node_name.clone(),
+        router_connected: state.router_connected.load(Ordering::Relaxed),
+        admin_available: false,
+        inventory_updated_at: None,
+        total_hives: None,
+        hives_alive: None,
+        hives_stale: None,
+        total_nodes: None,
+        nodes_by_status: BTreeMap::new(),
+        components: default_component_statuses(),
+        error: None,
+    };
+
+    match fetch_inventory_status_data(state).await {
+        Ok((summary, hive)) => {
+            status.admin_available = true;
+            apply_inventory_summary(&mut status, &summary);
+            status.components = parse_component_statuses(&hive);
+        }
+        Err(err) => {
+            status.status = "degraded".to_string();
+            status.error = Some(err.to_string());
+        }
+    }
+
+    status
+}
+
+async fn fetch_inventory_status_data(
+    state: &ArchitectState,
+) -> Result<(Value, Value), ArchitectError> {
+    let node_config = NodeConfig {
+        name: format!("SY.architect.status.{}", Uuid::new_v4().simple()),
+        router_socket: state.socket_dir.clone(),
+        uuid_persistence_dir: state.state_dir.join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Ephemeral,
+        config_dir: state.config_dir.clone(),
+        version: "0.1.0".to_string(),
+    };
+    let (sender, mut receiver) =
+        connect(&node_config).await.map_err(|err| -> ArchitectError { Box::new(err) })?;
+    let admin_target = format!("SY.admin@{}", state.hive_id);
+
+    let summary = admin_command(
+        &sender,
+        &mut receiver,
+        AdminCommandRequest {
+            admin_target: &admin_target,
+            action: "inventory",
+            target: None,
+            params: json!({ "scope": "summary" }),
+            request_id: None,
+            timeout: Duration::from_secs(5),
+        },
+    )
+    .await
+    .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    ensure_admin_ok("inventory summary", &summary)?;
+
+    let hive = admin_command(
+        &sender,
+        &mut receiver,
+        AdminCommandRequest {
+            admin_target: &admin_target,
+            action: "inventory",
+            target: None,
+            params: json!({ "scope": "hive", "filter_hive": state.hive_id }),
+            request_id: None,
+            timeout: Duration::from_secs(5),
+        },
+    )
+    .await
+    .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    ensure_admin_ok("inventory hive", &hive)?;
+
+    Ok((summary.payload, hive.payload))
+}
+
+fn ensure_admin_ok(label: &str, result: &fluxbee_sdk::AdminCommandResult) -> Result<(), ArchitectError> {
+    if result.status == "ok" {
+        return Ok(());
+    }
+    Err(format!(
+        "{label} failed: status={}, error_code={:?}, error_detail={:?}",
+        result.status, result.error_code, result.error_detail
+    )
+    .into())
+}
+
+fn apply_inventory_summary(status: &mut ArchitectStatus, payload: &Value) {
+    status.inventory_updated_at = payload.get("updated_at").and_then(Value::as_u64);
+    status.total_hives = payload
+        .get("total_hives")
+        .and_then(Value::as_u64)
+        .map(|value| value as u32);
+    status.hives_alive = payload
+        .get("hives_alive")
+        .and_then(Value::as_u64)
+        .map(|value| value as u32);
+    status.hives_stale = payload
+        .get("hives_stale")
+        .and_then(Value::as_u64)
+        .map(|value| value as u32);
+    status.total_nodes = payload
+        .get("total_nodes")
+        .and_then(Value::as_u64)
+        .map(|value| value as u32);
+
+    if let Some(map) = payload.get("nodes_by_status").and_then(Value::as_object) {
+        for (key, value) in map {
+            if let Some(count) = value.as_u64() {
+                status.nodes_by_status.insert(key.clone(), count as u32);
+            }
+        }
+    }
+}
+
+fn default_component_statuses() -> Vec<ArchitectComponentStatus> {
+    [
+        ("RT.gateway", "router"),
+        ("SY.orchestrator", "orchestrator"),
+        ("SY.admin", "admin"),
+        ("SY.identity", "identity"),
+        ("SY.storage", "storage"),
+    ]
+    .into_iter()
+    .map(|(key, label)| ArchitectComponentStatus {
+        key: key.to_string(),
+        label: label.to_string(),
+        status: "missing".to_string(),
+        node_name: None,
+    })
+    .collect()
+}
+
+fn parse_component_statuses(payload: &Value) -> Vec<ArchitectComponentStatus> {
+    let Some(nodes) = payload.get("nodes").and_then(Value::as_array) else {
+        return default_component_statuses();
+    };
+
+    default_component_statuses()
+        .into_iter()
+        .map(|component| {
+            let best = nodes
+                .iter()
+                .filter(|node| node_matches_component(node, &component.key))
+                .max_by_key(|node| component_status_rank(node.get("status").and_then(Value::as_str)));
+            match best {
+                Some(node) => ArchitectComponentStatus {
+                    status: node
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    node_name: node
+                        .get("node_name")
+                        .or_else(|| node.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    ..component
+                },
+                None => component,
+            }
+        })
+        .collect()
+}
+
+fn node_matches_component(node: &Value, key: &str) -> bool {
+    node.get("name")
+        .and_then(Value::as_str)
+        .map(|name| name == key || name.starts_with(&format!("{key}@")))
+        .unwrap_or(false)
+}
+
+fn component_status_rank(status: Option<&str>) -> u8 {
+    match status.unwrap_or_default().to_ascii_lowercase().as_str() {
+        "alive" | "running" | "healthy" | "ok" | "active" => 3,
+        "starting" | "unknown" => 2,
+        "stale" | "degraded" => 1,
+        _ => 0,
+    }
+}
+
 fn prompt_store_path(state: &ArchitectState) -> PathBuf {
     json_router::paths::storage_root_dir()
         .join("nodes")
@@ -757,12 +952,17 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     .topbar {{
       display: flex;
-      justify-content: flex-end;
-      gap: 16px;
-      align-items: center;
-      flex-wrap: wrap;
+      flex-direction: column;
+      gap: 10px;
+      align-items: flex-end;
     }}
     .status-strip {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }}
+    .service-strip {{
       display: flex;
       gap: 8px;
       flex-wrap: wrap;
@@ -773,7 +973,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font-size: 0.78rem;
       line-height: 1.35;
       text-align: right;
-      max-width: 280px;
+      max-width: 420px;
     }}
     .chip {{
       border: 1px solid var(--line);
@@ -803,6 +1003,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     .chip-value.warn {{
       color: var(--warning);
+    }}
+    .service-chip {{
+      background: var(--panel-alt);
     }}
     .workspace {{
       display: grid;
@@ -1080,11 +1283,15 @@ fn architect_index_html(state: &ArchitectState) -> String {
         align-items: stretch;
       }}
       .topbar {{
-        justify-content: flex-start;
+        align-items: stretch;
       }}
       .status-note {{
         text-align: left;
         max-width: none;
+      }}
+      .status-strip,
+      .service-strip {{
+        justify-content: flex-start;
       }}
       .brand-mark {{
         width: 48px;
@@ -1133,10 +1340,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
       </div>
       <div class="topbar">
         <div class="status-strip">
-          <div class="chip"><span class="chip-label">Router</span><span id="router" class="chip-value">{router}</span></div>
-          <div class="chip"><span class="chip-label">Hive</span><span class="chip-value">{hive}</span></div>
+          <div class="chip"><span class="chip-label">Hives</span><span id="hives-summary" class="chip-value">--</span></div>
+          <div class="chip"><span class="chip-label">Nodes</span><span id="nodes-summary" class="chip-value">--</span></div>
+          <div class="chip"><span class="chip-label">Updated</span><span id="updated-at" class="chip-value">--</span></div>
         </div>
-        <div class="status-note">System component states from inventory/SHM should land here next: `SY.orchestrator`, `SY.admin`, storage, identity, and related health signals.</div>
+        <div id="service-strip" class="service-strip"></div>
+        <div id="status-note" class="status-note">Reading system inventory via `ADMIN_COMMAND` over socket.</div>
       </div>
     </div>
     <div class="workspace">
@@ -1205,15 +1414,57 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const input = document.getElementById("input");
     const send = document.getElementById("send");
     const newChat = document.getElementById("new-chat");
+    const serviceStrip = document.getElementById("service-strip");
+    const statusNote = document.getElementById("status-note");
     const sessionTitle = document.getElementById("session-title");
     const sessionMeta = document.getElementById("session-meta");
     let userMessageCount = 0;
-    function formatBoolChip(elementId, activeText, inactiveText, value) {{
+    function formatChip(elementId, text, className) {{
       const element = document.getElementById(elementId);
       if (!element) return;
-      element.textContent = value ? activeText : inactiveText;
+      element.textContent = text;
       element.classList.remove("ok", "warn");
-      element.classList.add(value ? "ok" : "warn");
+      if (className) {{
+        element.classList.add(className);
+      }}
+    }}
+
+    function statusClass(raw) {{
+      const value = String(raw || "").toLowerCase();
+      if (["alive", "running", "healthy", "ok", "active", "connected"].includes(value)) return "ok";
+      if (["stale", "degraded", "failed", "error", "missing", "offline", "deleted"].includes(value)) return "warn";
+      return "";
+    }}
+
+    function formatTimestamp(value) {{
+      if (!value) return "--";
+      const date = new Date(Number(value));
+      if (Number.isNaN(date.getTime())) return "--";
+      return date.toLocaleTimeString([], {{ hour: "2-digit", minute: "2-digit", second: "2-digit" }});
+    }}
+
+    function renderComponents(components) {{
+      serviceStrip.innerHTML = "";
+      (components || []).forEach((component) => {{
+        const chip = document.createElement("div");
+        const label = document.createElement("span");
+        const value = document.createElement("span");
+        chip.className = "chip service-chip";
+        label.className = "chip-label";
+        label.textContent = component.label || component.key || "component";
+        value.className = "chip-value";
+        value.textContent = String(component.status || "unknown");
+        const cls = statusClass(component.status);
+        if (cls) {{
+          value.classList.add(cls);
+        }}
+        if (component.node_name) {{
+          chip.title = component.node_name;
+        }}
+        chip.appendChild(label);
+        chip.appendChild(value);
+        serviceStrip.appendChild(chip);
+      }});
     }}
 
     function updateSession(text) {{
@@ -1260,7 +1511,19 @@ fn architect_index_html(state: &ArchitectState) -> String {
       try {{
         const res = await fetch(statusUrl);
         const data = await res.json();
-        formatBoolChip("router", "connected", "offline", !!data.router_connected);
+        const alive = Number(data.hives_alive || 0);
+        const totalHives = Number(data.total_hives || 0);
+        const stale = Number(data.hives_stale || 0);
+        const totalNodes = Number(data.total_nodes || 0);
+        formatChip("hives-summary", totalHives ? (String(alive) + "/" + String(totalHives) + " alive") : "--", stale > 0 ? "warn" : "ok");
+        formatChip("nodes-summary", totalNodes ? String(totalNodes) : "--", totalNodes > 0 ? "ok" : "");
+        formatChip("updated-at", formatTimestamp(data.inventory_updated_at), data.admin_available ? "ok" : "warn");
+        renderComponents(data.components);
+        if (data.error) {{
+          statusNote.textContent = "Status degraded: " + data.error;
+        }} else {{
+          statusNote.textContent = "System inventory via ADMIN_COMMAND socket. Hive " + data.hive_id + ".";
+        }}
       }} catch (_err) {{}}
     }}
     async function submit() {{
@@ -1301,6 +1564,5 @@ fn architect_index_html(state: &ArchitectState) -> String {
 </html>"##,
         node = state.node_name,
         hive = state.hive_id,
-        router = state.router_connected.load(Ordering::Relaxed),
     )
 }

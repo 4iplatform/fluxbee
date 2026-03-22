@@ -138,7 +138,7 @@ Real-time system health, updated periodically (every 5-10 seconds):
 - Key service health (DB, NATS, identity sync).
 - Last inventory update timestamp.
 
-Data source: SHM reads (inventory from LSA, identity header) or ADMIN_COMMAND `get_inventory_summary`.
+Data source: for v1, `ADMIN_COMMAND` over the Fluxbee socket/admin surface should be the canonical path (`get_inventory_summary` or equivalent). Direct SHM reads may be added later as an optimization, but should not be the first contract the UI depends on.
 
 ### 3.3 Chat History (left panel)
 
@@ -599,7 +599,53 @@ Until this is resolved, SY.architect should only be exposed on trusted networks 
 
 ## 12. Implementation Tasks
 
-### Phase 0 — Contract / Frictions First
+### 12.1 Current Snapshot (2026-03-21)
+
+Current repo state should be treated as a **partial shell**, not as a blank implementation and not as a finished MVP.
+
+- `src/bin/sy_architect.rs` already exists and currently provides:
+  - SDK connection loop to router
+  - HTTP server with static HTML UI
+  - `GET /api/status`
+  - `POST /api/chat`
+  - local `FCMD:` parser with prompt storage on disk
+  - local `ACMD:` parser translated to `ADMIN_COMMAND`
+- The current implementation does **not** yet provide:
+  - WebSocket chat/streaming
+  - real AI provider integration
+  - real system status bar backed by `ADMIN_COMMAND`/inventory over socket
+  - persisted chat sessions/messages
+  - settings panel / `set_node_config`
+  - IO impersonation
+  - uploads / blobs
+
+Because of that, the backlog should prioritize turning the current shell into a useful control-plane tool **before** investing in AI or UI polish.
+
+### 12.2 Design Frictions To Resolve Early
+
+These are not optional details; they affect the shape of the implementation:
+
+- **Core packaging boundary:** `SY.architect` is a core `SY.*` node, so frontend/prompt assets cannot assume managed runtime `_system.package_path`.
+- **Config ownership split:** today there is a practical split between `hive.yaml` bootstrap/fallback config and future self-managed `config.json`. This must be made explicit before implementing settings writes.
+- **Status source of truth:** for v1, the top bar should read through `ADMIN_COMMAND` over socket, not over HTTP. Direct SHM reads are a possible later optimization, not the initial contract.
+- **Persistence scope for v1:** chat sessions/messages should persist in LanceDB locally. Internal layout/flush/index strategy can be optimized for the fact that only this process reads/writes these chats.
+- **Non-AI usefulness first:** the architect should become a strong operational chat shell even if AI is disabled or delayed.
+
+### 12.3 Sprint 1 — Recommended Next Slice
+
+This is the recommended first execution slice for the current repo state. It deliberately avoids AI-first work.
+
+- [ ] ARCH-S1.1. Implement system status bar backed by `ADMIN_COMMAND` over socket (`SY.admin` target, no HTTP dependency).
+- [ ] ARCH-S1.2. Improve `ACMD` rendering and validation so command results/errors are usable as an operational shell.
+- [ ] ARCH-S1.3. Add destructive action confirmation flow for `kill_node`, `remove_hive`, and future deletes.
+- [ ] ARCH-S1.4. Implement real chat sessions (`create/list/load`) so the left rail stops being placeholder UI.
+- [ ] ARCH-S1.5. Persist sessions and messages in LanceDB, with a schema tuned for single-process local usage.
+- [ ] ARCH-S1.6. Restore session content on reload and keep chat navigation stable across refreshes.
+- [ ] ARCH-S1.7. Freeze the config contract (`hive.yaml` bootstrap/fallback vs `config.json` self-managed state) before adding settings UI.
+
+### Phase A — Contracts And Bootstrap Invariants
+
+This phase is design-first and should close the major ambiguities before the node grows more features.
 
 - [ ] ARCH-T0.1. Definir lifecycle de despliegue de `SY.architect` como nodo core (`SY.*`), fuera del modelo `run_node`.
 - [ ] ARCH-T0.2. Definir path canónico de assets/prompts/frontend para core deployment; no asumir `_system.package_path` de managed runtimes.
@@ -616,69 +662,108 @@ Until this is resolved, SY.architect should only be exposed on trusted networks 
   - `SY.orchestrator` registra ILKs core después de eso
   - `SY.architect` asume ese baseline ya existente
 
-### Phase 1 — Node Shell / Backend Base
+### Phase B — Harden The Existing Shell Into A Real Node Base
 
-- [ ] ARCH-T1. Crear `src/bin/sy_architect.rs` con:
+Goal: consolidate what already exists in `sy_architect.rs` so the node has a reliable non-AI base.
+
+- [ ] ARCH-T1. Consolidar `src/bin/sy_architect.rs` como shell base del nodo:
   - conexión SDK al router
   - HTTP server `axum`
-  - WebSocket para streaming UI
+  - surface HTTP/UI estable
+  - WebSocket queda pendiente para fase posterior
+  - Current state: **partial**
 - [ ] ARCH-T2. Implementar lectura de configuración:
   - `config.json` propio
   - fallback a `hive.yaml` para provider keys si aplica
+  - Current state: **partial** (`hive.yaml` ya se lee; `config.json` todavía no)
 - [ ] ARCH-T2.1. Leer `architect.listen` desde `hive.yaml` (con override opcional por env) para bind interno HTTP detrás de reverse proxy.
+  - Current state: **mostly done**
 - [ ] ARCH-T3. Implementar bootstrap de estado local:
   - directorio de trabajo
   - storage/chat DB
   - carga de prompts/assets
+  - Current state: **partial** (prompt store local existe, pero no hay chat DB ni asset loading formal)
 - [ ] ARCH-T4. Definir health/status mínimo del nodo (`RUNNING`, readiness HTTP, AI provider ready/not configured).
-
-### Phase 2 — Frontend MVP
-
+  - Current state: **partial**
 - [ ] ARCH-T5. Servir frontend estático mínimo (chat + status + settings).
-- [ ] ARCH-T6. Implementar endpoint WebSocket de chat bidireccional.
-- [ ] ARCH-T7. Implementar panel/settings mínimo:
-  - API key
-  - modelo default
-  - listen/http config básico
-- [ ] ARCH-T8. Persistir settings vía `set_node_config` targeting self.
+  - Current state: **partial** (chat + status scaffold existen; settings no)
 - [ ] ARCH-T8.1. Mantener una sola pantalla principal de chat; no agregar un editor/pantalla separada de prompts para v1.
+  - Current state: **aligned**
 
-### Phase 3 — AI Provider Integration
+### Phase C — Control Plane MVP Without AI
 
-- [ ] ARCH-T9. Implementar cliente OpenAI con configuración externa y modo “unconfigured”.
-- [ ] ARCH-T10. Implementar streaming token-by-token hacia WebSocket.
-- [ ] ARCH-T11. Implementar carga de prompts por rol (`architect`, `operator`, `tester`).
-- [ ] ARCH-T12. Implementar selección de agente:
-  - switch explícito por usuario
-  - heurística simple por intención
-- [ ] ARCH-T12.1. Separar pipeline de mensajes normales vs mensajes de control; `FCMD:` y `ACMD:` no deben invocar al proveedor AI.
-
-### Phase 4 — Operational Surfaces
+This is the most important product phase for now. The architect should become useful even with AI disabled.
 
 - [ ] ARCH-T13. Implementar parser y executor de `ACMD:` con sintaxis tipo `curl`, parseado localmente y traducido a llamadas internas contra `SY.admin`.
-- [ ] ARCH-T14. Implementar barra/status de sistema usando:
-  - reads por admin
-  - y/o SHM local donde tenga sentido
+  - Current state: **partial**
 - [ ] ARCH-T15. Representar resultados de comandos como mensajes de sistema en el chat.
+  - Current state: **partial**
+- [ ] ARCH-T14. Implementar barra/status de sistema usando:
+  - `ADMIN_COMMAND` por socket como camino canónico v1
+  - SHM directo solo como optimización futura, no como contrato inicial
+  - Nota: reemplaza placeholders locales del header; ésta es la próxima pieza estructural de UX.
 - [ ] ARCH-T16. Endurecer confirmación de operaciones destructivas (`kill_node`, `remove_hive`, futuros deletes).
 
-### Phase 4.5 — Prompt Control Inside Chat
+### Phase D — Prompt Control Inside Chat
+
+Prompt control is already partly started and should be completed while the node is still non-AI-first.
 
 - [ ] ARCH-T16.1. Implementar parser local de `FCMD:` con payload JSON estructurado.
+  - Current state: **mostly done**
 - [ ] ARCH-T16.2. Implementar operaciones mínimas:
   - `prompt.get`
   - `prompt.update_draft`
   - `prompt.publish`
   - `prompt.rollback`
   - `prompt.history`
+  - Current state: **mostly done**
 - [ ] ARCH-T16.3. Mantener storage local con al menos:
   - draft actual
   - published actual
   - previous published
+  - Current state: **mostly done**
 - [ ] ARCH-T16.4. Validar localmente estructura mínima del prompt antes de publicar.
 - [ ] ARCH-T16.5. Representar historial/versiones de prompt como mensajes de sistema en el chat.
 
-### Phase 5 — Identity / IO Impersonation
+### Phase E — Sessions, Persistence, And Left Rail Becoming Real
+
+This phase turns the current visual chat navigator into real product behavior.
+
+- [ ] ARCH-T27. Implementar sesiones de chat (create/list/load/delete).
+- [ ] ARCH-T28. Implementar persistencia local de mensajes.
+- [ ] ARCH-T30. Implementar búsqueda en historial y títulos de sesión.
+- [ ] ARCH-T29. Optimizar LanceDB para uso local single-process:
+  - schema de sesiones/mensajes
+  - estrategia de flush/compaction
+  - metadata suficiente para recuperación rápida y futura semantic search
+- [ ] ARCH-T31. Refinar UI final (history panel, status refresh, upload state, command/result rendering).
+
+### Phase F — Settings And Self-Configuration
+
+Only after config ownership is explicit.
+
+- [ ] ARCH-T7. Implementar panel/settings mínimo:
+  - API key
+  - modelo default
+  - listen/http config básico
+- [ ] ARCH-T8. Persistir settings vía `set_node_config` targeting self.
+
+### Phase G — AI Provider Integration
+
+This is intentionally later. The node should already be operational without it.
+
+- [ ] ARCH-T9. Implementar cliente OpenAI con configuración externa y modo “unconfigured”.
+- [ ] ARCH-T11. Implementar carga de prompts por rol (`architect`, `operator`, `tester`).
+- [ ] ARCH-T12. Implementar selección de agente:
+  - switch explícito por usuario
+  - heurística simple por intención
+- [ ] ARCH-T12.1. Separar pipeline de mensajes normales vs mensajes de control; `FCMD:` y `ACMD:` no deben invocar al proveedor AI.
+- [ ] ARCH-T6. Implementar endpoint WebSocket de chat bidireccional.
+- [ ] ARCH-T10. Implementar streaming token-by-token hacia WebSocket.
+
+### Phase H — Identity / IO Impersonation
+
+This should happen after the control-plane shell is trustworthy, because it is privileged and operationally sensitive.
 
 - [ ] ARCH-T17. Implementar provisión de ILK temporal para test (`ILK_PROVISION`).
 - [ ] ARCH-T18. Implementar envío `Resolve` impersonado con:
@@ -690,25 +775,17 @@ Until this is resolved, SY.architect should only be exposed on trusted networks 
   - si no existe delete explícito, documentar expiración/retención
   - si se agrega cleanup, especificar system call
 
-### Phase 6 — Tenant / Identity Assisted Flows
+### Phase I — Tenant / Identity Assisted Flows
 
 - [ ] ARCH-T21. Implementar lectura de ILKs desde architect (`list_ilks`, `get_ilk`) para depuración/UX.
 - [ ] ARCH-T22. Si architect va a crear tenants o completar registros, implementar system-call path directo a `SY.identity` (`TNT_CREATE`, `ILK_REGISTER`, `ILK_ADD_CHANNEL`) fuera de admin REST.
 - [ ] ARCH-T23. Definir cómo se representa al usuario el resultado de writes de identity (ok/error/canonical tenant resolved).
 
-### Phase 7 — File Upload / Blobs
+### Phase J — File Upload / Blobs
 
 - [ ] ARCH-T24. Implementar upload multipart HTTP.
 - [ ] ARCH-T25. Integrar con blob toolkit (`put -> promote -> BlobRef`).
 - [ ] ARCH-T26. Permitir adjuntar BlobRefs en conversación o en acciones operativas posteriores.
-
-### Phase 8 — Persistence / Search / Polish
-
-- [ ] ARCH-T27. Implementar sesiones de chat (create/list/load/delete).
-- [ ] ARCH-T28. Implementar persistencia local de mensajes.
-- [ ] ARCH-T29. Mantener LanceDB sólo si realmente se usa semantic search; si no, degradar a storage local más simple en v1.
-- [ ] ARCH-T30. Implementar búsqueda en historial y títulos de sesión.
-- [ ] ARCH-T31. Refinar UI final (history panel, status refresh, upload state, command/result rendering).
 
 ### Out of Scope for v1
 
