@@ -135,6 +135,13 @@ struct SessionDetailResponse {
     messages: Vec<PersistedChatMessage>,
 }
 
+#[derive(Debug, Serialize)]
+struct SessionDeleteResponse {
+    status: String,
+    deleted_sessions: u64,
+    deleted_messages: u64,
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct PersistedChatMessage {
     message_id: String,
@@ -405,6 +412,16 @@ async fn dynamic_handler(
                     .into_response(),
             }
         }
+        (Method::DELETE, _) if is_sessions_collection_path(path) => {
+            match clear_chat_sessions(&state).await {
+                Ok(result) => Json(result).into_response(),
+                Err(err) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("failed to clear sessions: {err}") })),
+                )
+                    .into_response(),
+            }
+        }
         (Method::GET, _) if is_session_detail_path(path) => {
             let Some(session_id) = session_id_from_path(path) else {
                 return (
@@ -423,6 +440,23 @@ async fn dynamic_handler(
                 Err(err) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": format!("failed to load session: {err}") })),
+                )
+                    .into_response(),
+            }
+        }
+        (Method::DELETE, _) if is_session_detail_path(path) => {
+            let Some(session_id) = session_id_from_path(path) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "missing session id" })),
+                )
+                    .into_response();
+            };
+            match delete_chat_session(&state, session_id).await {
+                Ok(result) => Json(result).into_response(),
+                Err(err) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("failed to delete session: {err}") })),
                 )
                     .into_response(),
             }
@@ -1128,6 +1162,74 @@ async fn load_chat_session(
     }))
 }
 
+async fn delete_chat_session(
+    state: &ArchitectState,
+    session_id: &str,
+) -> Result<SessionDeleteResponse, ArchitectError> {
+    let _guard = state.chat_lock.lock().await;
+    let db = open_architect_db(state).await?;
+    let sessions = ensure_sessions_table(&db).await?;
+    let messages = ensure_messages_table(&db).await?;
+    let filter = session_filter(session_id);
+
+    let deleted_messages = count_session_messages(&messages, session_id).await?;
+    let deleted_sessions = if load_session_record(&sessions, session_id).await?.is_some() {
+        1
+    } else {
+        0
+    };
+
+    if deleted_sessions > 0 {
+        sessions
+            .delete(&filter)
+            .await
+            .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    }
+    if deleted_messages > 0 {
+        messages
+            .delete(&filter)
+            .await
+            .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    }
+
+    Ok(SessionDeleteResponse {
+        status: "ok".to_string(),
+        deleted_sessions,
+        deleted_messages,
+    })
+}
+
+async fn clear_chat_sessions(
+    state: &ArchitectState,
+) -> Result<SessionDeleteResponse, ArchitectError> {
+    let _guard = state.chat_lock.lock().await;
+    let db = open_architect_db(state).await?;
+    let sessions = ensure_sessions_table(&db).await?;
+    let messages = ensure_messages_table(&db).await?;
+
+    let deleted_sessions = count_all_rows(&sessions).await?;
+    let deleted_messages = count_all_rows(&messages).await?;
+
+    if deleted_sessions > 0 {
+        sessions
+            .delete("session_id IS NOT NULL")
+            .await
+            .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    }
+    if deleted_messages > 0 {
+        messages
+            .delete("message_id IS NOT NULL")
+            .await
+            .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    }
+
+    Ok(SessionDeleteResponse {
+        status: "ok".to_string(),
+        deleted_sessions,
+        deleted_messages,
+    })
+}
+
 async fn resolve_chat_session(
     state: &ArchitectState,
     session_id: Option<String>,
@@ -1254,7 +1356,7 @@ async fn load_session_messages(
     table: &lancedb::Table,
     session_id: &str,
 ) -> Result<Vec<PersistedChatMessage>, ArchitectError> {
-    let filter = format!("session_id = '{}'", session_id.replace('\'', "''"));
+    let filter = session_filter(session_id);
     let batches = table
         .query()
         .only_if(filter)
@@ -1277,6 +1379,26 @@ async fn load_session_messages(
     let mut rows = parse_message_records(&batches)?;
     rows.sort_by_key(|row| (row.seq, row.timestamp_ms));
     Ok(rows.into_iter().map(message_record_to_persisted).collect())
+}
+
+async fn count_session_messages(
+    table: &lancedb::Table,
+    session_id: &str,
+) -> Result<u64, ArchitectError> {
+    let filter = session_filter(session_id);
+    table
+        .count_rows(Some(filter.into()))
+        .await
+        .map(|count| count as u64)
+        .map_err(|err| -> ArchitectError { Box::new(err) })
+}
+
+async fn count_all_rows(table: &lancedb::Table) -> Result<u64, ArchitectError> {
+    table
+        .count_rows(None)
+        .await
+        .map(|count| count as u64)
+        .map_err(|err| -> ArchitectError { Box::new(err) })
 }
 
 async fn upsert_session_record(
@@ -1582,6 +1704,14 @@ fn compact_acmd_title(raw: &str) -> String {
     }
 }
 
+fn session_filter(session_id: &str) -> String {
+    format!("session_id = '{}'", escape_sql_literal(session_id))
+}
+
+fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 fn preview_text(input: &str, max_chars: usize) -> String {
     let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= max_chars {
@@ -1865,6 +1995,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
       color: var(--muted);
       background: var(--panel-alt);
     }}
+    .mini-pill.action {{
+      cursor: pointer;
+      font-weight: 700;
+    }}
     .new-chat {{
       width: 100%;
       margin-bottom: 14px;
@@ -1891,6 +2025,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
     .history-card.placeholder {{
       border-style: dashed;
       background: #fbfcfe;
+    }}
+    .history-card-head {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
     }}
     .history-name {{
       font-size: 0.95rem;
@@ -1923,6 +2063,26 @@ fn architect_index_html(state: &ArchitectState) -> String {
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }}
+    .history-delete {{
+      border: 1px solid var(--line);
+      background: #ffffff;
+      color: var(--muted);
+      border-radius: 999px;
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: none;
+      font-size: 0.9rem;
+      line-height: 1;
+    }}
+    .history-delete:hover {{
+      color: #b42318;
+      border-color: #f2c7c4;
+      background: #fff5f4;
     }}
     .history-note {{
       margin-top: 16px;
@@ -2220,7 +2380,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       <aside class="sidebar">
         <div class="sidebar-head">
           <div class="sidebar-title">Chat History</div>
-          <div class="mini-pill">LanceDB</div>
+          <button id="clear-history" class="mini-pill action" type="button">Clear</button>
         </div>
         <button id="new-chat" class="new-chat">New chat</button>
         <div id="history-list" class="history-list"></div>
@@ -2263,6 +2423,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const input = document.getElementById("input");
     const send = document.getElementById("send");
     const newChat = document.getElementById("new-chat");
+    const clearHistory = document.getElementById("clear-history");
     const historyList = document.getElementById("history-list");
     const composerHint = document.getElementById("composer-hint");
     let currentSessionId = null;
@@ -2417,14 +2578,29 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       sessionsCache.forEach((session) => {{
         const card = document.createElement("div");
+        const head = document.createElement("div");
         const name = document.createElement("div");
         const meta = document.createElement("div");
+        const deleteButton = document.createElement("button");
         card.className = "history-card" + (session.session_id === currentSessionId ? " active" : "");
+        head.className = "history-card-head";
         name.className = "history-name";
         meta.className = "history-meta";
+        deleteButton.className = "history-delete";
+        deleteButton.type = "button";
+        deleteButton.textContent = "×";
+        deleteButton.title = "Delete chat";
         name.textContent = session.title || "Untitled chat";
         meta.textContent = formatSessionMeta(session);
-        card.appendChild(name);
+        deleteButton.addEventListener("click", (event) => {{
+          event.stopPropagation();
+          deleteSession(session.session_id).catch((err) => {{
+            addMessage("system", "Delete chat failed: " + err);
+          }});
+        }});
+        head.appendChild(name);
+        head.appendChild(deleteButton);
+        card.appendChild(head);
         card.appendChild(meta);
         if (session.last_message_preview) {{
           const preview = document.createElement("div");
@@ -2451,6 +2627,38 @@ fn architect_index_html(state: &ArchitectState) -> String {
         currentSessionId = preferredSessionId;
       }}
       renderHistory();
+    }}
+    async function deleteSession(sessionId) {{
+      const confirmed = window.confirm("Delete this chat history?");
+      if (!confirmed) return;
+      const res = await fetch(sessionsUrl + "/" + encodeURIComponent(sessionId), {{
+        method: "DELETE"
+      }});
+      if (!res.ok) {{
+        throw new Error("session delete failed");
+      }}
+      await refreshSessionList(currentSessionId === sessionId ? null : currentSessionId);
+      if (!sessionsCache.length) {{
+        await createSession(false);
+        return;
+      }}
+      if (currentSessionId === sessionId) {{
+        await loadSession(sessionsCache[0].session_id, null, false);
+      }}
+    }}
+    async function clearAllHistory() {{
+      const confirmed = window.confirm("Delete all chat history?");
+      if (!confirmed) return;
+      const res = await fetch(sessionsUrl, {{
+        method: "DELETE"
+      }});
+      if (!res.ok) {{
+        throw new Error("history clear failed");
+      }}
+      currentSessionId = null;
+      localStorage.removeItem(currentSessionStorageKey);
+      await refreshSessionList(null);
+      await createSession(false);
     }}
     async function createSession(showWelcome = false) {{
       const res = await fetch(sessionsUrl, {{
@@ -2551,6 +2759,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
     }}
     send.addEventListener("click", submit);
+    clearHistory.addEventListener("click", () => {{
+      clearAllHistory().catch((err) => {{
+        addMessage("system", "Clear history failed: " + err);
+      }});
+    }});
     newChat.addEventListener("click", () => {{
       createSession(false).catch((err) => {{
         addMessage("system", "Session creation failed: " + err);
