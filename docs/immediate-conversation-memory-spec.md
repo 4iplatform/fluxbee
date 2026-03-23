@@ -442,4 +442,4 @@ This work is correct when:
 - [x] AI-SDK-IM3. Add simple bounded-window policy for recent interactions, without semantic compaction in v1
 - [x] AI-SDK-IM4. Update `SY.architect` to rehydrate immediate memory from session history + operation tracking
 - [x] AI-SDK-IM5. Add optional SDK helper for summary refresh/update
-- [ ] AI-SDK-IM6. Document immediate-memory usage for future `AI.*` nodes
+- [x] AI-SDK-IM6. Document immediate-memory usage for future `AI.*` nodes

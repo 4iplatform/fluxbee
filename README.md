@@ -735,6 +735,10 @@ If you want to build a node in another repo, use `fluxbee_sdk`
 
 For AI-specific runtimes, `json-router/crates/fluxbee_ai_sdk` is available as a separate higher-level SDK on top of `fluxbee_sdk`. It is intended for `SY.architect` and future `AI.*` nodes, not as a replacement for the transport/protocol SDK.
 
+SDK entry points:
+- [AI SDK README](./crates/fluxbee_ai_sdk/README.md) - Immediate memory, function calling, summary refresh, and AI runtime guidance.
+- [AI immediate memory spec](./docs/immediate-conversation-memory-spec.md) - Contract and design scope for short-horizon conversation context.
+
 For domain nodes that live in this repo (for example `.gov`), see:
 - `nodes/gov/README.md`
 
