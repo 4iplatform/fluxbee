@@ -334,7 +334,6 @@ impl FunctionTool for ArchitectSystemGetTool {
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
-        let raw_arguments = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
         let method = arguments
             .get("method")
             .and_then(Value::as_str)
@@ -451,6 +450,7 @@ impl FunctionTool for ArchitectSystemWriteTool {
                 )
             })?;
         let body = arguments.get("body").cloned();
+        let raw_arguments = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
         let raw = scmd_raw_from_parts(&method, path, body.as_ref());
         let parsed = parse_scmd(&raw).map_err(|err| {
             fluxbee_ai_sdk::AiSdkError::Protocol(format!("invalid system write path: {err}"))
