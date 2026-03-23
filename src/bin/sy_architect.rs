@@ -489,6 +489,7 @@ impl FunctionTool for ArchitectSystemWriteTool {
                 translation.action
             )));
         }
+        validate_mutating_translation_contract(&self.context, &translation).await?;
 
         let preview_command = format!("SCMD: {raw}");
         let operation_id = Uuid::new_v4().to_string();
@@ -1353,6 +1354,79 @@ async fn reconcile_timeout_unknown_operation(
     }
 
     Ok(false)
+}
+
+async fn fetch_admin_action_contract(
+    context: &ArchitectAdminToolContext,
+    action_name: &str,
+) -> Result<Value, ArchitectError> {
+    let output = execute_admin_translation_with_context(
+        context,
+        AdminTranslation {
+            admin_target: format!("SY.admin@{}", context.hive_id),
+            action: "get_admin_action_help".to_string(),
+            target_hive: context.hive_id.clone(),
+            params: json!({ "action_name": action_name }),
+        },
+        "tool.help",
+    )
+    .await?;
+
+    output
+        .get("payload")
+        .and_then(|payload| payload.get("entry"))
+        .and_then(|entry| entry.get("request_contract"))
+        .cloned()
+        .ok_or_else(|| format!("missing request_contract for admin action '{action_name}'").into())
+}
+
+async fn validate_mutating_translation_contract(
+    context: &ArchitectAdminToolContext,
+    translation: &AdminTranslation,
+) -> Result<(), fluxbee_ai_sdk::AiSdkError> {
+    let contract = fetch_admin_action_contract(context, &translation.action)
+        .await
+        .map_err(|err| {
+            fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                "failed to fetch admin action contract: {err}"
+            ))
+        })?;
+    let body = contract.get("body").cloned().unwrap_or_else(|| json!({}));
+    let required = body
+        .get("required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let required_fields = body
+        .get("required_fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if required_fields.is_empty() && !required {
+        return Ok(());
+    }
+    let params = translation.params.as_object().ok_or_else(|| {
+        fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+            "action '{}' requires a JSON object body",
+            translation.action
+        ))
+    })?;
+    let missing = required_fields
+        .iter()
+        .filter_map(|field| field.get("name").and_then(Value::as_str))
+        .filter(|name| match params.get(*name) {
+            Some(Value::Null) | None => true,
+            Some(Value::String(value)) if value.trim().is_empty() => true,
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+            "action '{}' is missing required fields from SY.admin request_contract: {}",
+            translation.action,
+            missing.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 fn operation_status_from_output(output: &Value) -> String {
