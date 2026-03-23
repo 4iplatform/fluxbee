@@ -139,7 +139,10 @@ impl OpaResolver {
             if wasm_bytes.is_empty() {
                 return Err(OpaError::NotLoaded);
             }
-            let parsed_bundle = match data_bundle_json.map(str::trim).filter(|raw| !raw.is_empty()) {
+            let parsed_bundle = match data_bundle_json
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty())
+            {
                 Some(raw) => Some(serde_json::from_str::<Value>(raw)?),
                 None => None,
             };
@@ -185,9 +188,8 @@ impl OpaResolver {
         let input_val = wasm.json_parse(&input_str)?;
         let ctx = wasm.opa_eval_ctx_new.call(&mut wasm.store, ())?;
 
-        let merged_dynamic_data = dynamic_data.map(|overlay| {
-            merge_opa_data(self.base_data_bundle.as_ref(), overlay)
-        });
+        let merged_dynamic_data =
+            dynamic_data.map(|overlay| merge_opa_data(self.base_data_bundle.as_ref(), overlay));
         if let Some(data) = merged_dynamic_data.as_ref() {
             if wasm.opa_eval_ctx_set_data.is_none() {
                 return Err(OpaError::MissingExport("opa_eval_ctx_set_data"));

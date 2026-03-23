@@ -51,7 +51,9 @@ impl Agent {
     }
 
     pub async fn run_text_stream(&self, input: impl Into<String>) -> Result<Vec<LlmStreamEvent>> {
-        self.llm.generate_stream(self.build_request(input.into())).await
+        self.llm
+            .generate_stream(self.build_request(input.into()))
+            .await
     }
 
     pub fn register_tool(&mut self, tool: Arc<dyn FunctionTool>) -> Result<()> {

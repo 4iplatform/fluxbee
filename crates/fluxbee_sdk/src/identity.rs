@@ -989,13 +989,13 @@ mod tests {
 
     #[test]
     fn permission_denied_lookup_is_treated_as_not_found() {
-        let out = match Err::<Option<String>, _>(IdentityShmError::Nix(nix::errno::Errno::EACCES))
-        {
-            Err(err) if is_permission_lookup_unavailable(&err) => Ok(None),
-            Err(err) => Err(err),
-            Ok(value) => Ok(value),
-        }
-        .expect("permission denied should degrade to lookup unavailable");
+        let out =
+            match Err::<Option<String>, _>(IdentityShmError::Nix(nix::errno::Errno::EACCES)) {
+                Err(err) if is_permission_lookup_unavailable(&err) => Ok(None),
+                Err(err) => Err(err),
+                Ok(value) => Ok(value),
+            }
+            .expect("permission denied should degrade to lookup unavailable");
         assert_eq!(out, None);
     }
 

@@ -12,7 +12,7 @@ This document defines the **immediate conversation memory** that should be nativ
 
 It is intentionally scoped to the short-horizon context that a live chat/agent needs between turns:
 
-- chat summary
+- conversation summary
 - recent interactions
 - active or ambiguous operations
 
@@ -56,8 +56,8 @@ The SDK should send **enough immediate context to be operationally coherent**, b
 Default principle:
 
 - keep short-term context explicit
-- compress old context aggressively
 - keep active operations visible
+- prefer simple raw recent context over smart compression in v1
 - leave long-term recall to later systems
 
 ## 5. Immediate Memory Bundle
@@ -65,7 +65,7 @@ Default principle:
 The SDK should expose a native input structure for a turn that includes:
 
 1. `system_prompt`
-2. `chat_summary`
+2. `conversation_summary`
 3. `recent_interactions`
 4. `active_operations`
 5. `current_user_message`
@@ -74,9 +74,9 @@ This bundle should be assembled by the caller, but normalized and serialized by 
 
 ## 6. Components
 
-### 6.1 Chat Summary
+### 6.1 Conversation Summary
 
-A compact, structured summary of the current chat state.
+A compact, structured summary of the current conversation state.
 
 Purpose:
 
@@ -96,7 +96,8 @@ Constraints:
 
 - short text only
 - no raw JSON dumps
-- rewritten over time by caller logic, not by the SDK itself
+- the caller owns the summary as state
+- the SDK may expose reusable helpers to refresh/summarize it, but should not update it implicitly on every turn
 
 Example:
 
@@ -129,12 +130,18 @@ Where one interaction may include:
 
 - user text
 - assistant text
-- compact tool/result summary when relevant
+- system/tool failure text when relevant
 
 Do not send:
 
-- full raw payloads for every old tool result
-- repeated status dumps already captured in summary
+- large historical dumps outside the recent window
+- repeated background refresh noise
+
+V1 rule:
+
+- send the latest `8-12` interactions mostly as they happened
+- do not introduce smart compaction/extraction logic in the SDK yet
+- tool failures should be preserved with priority because they affect the next turn directly
 
 Recommended shape:
 
@@ -167,6 +174,9 @@ The model must see ambiguous or in-flight actions without needing to rediscover 
 Recommended fields per operation:
 
 - `operation_id`
+- `resource_scope`
+- `origin_thread_id`
+- `origin_session_id`
 - `scope_id`
 - `action`
 - `target`
@@ -196,7 +206,10 @@ Example:
 [
   {
     "operation_id": "op-123",
-    "scope_id": "chat:abc",
+    "resource_scope": "hive:worker-220",
+    "origin_thread_id": "thread:abc",
+    "origin_session_id": "architect-session-1",
+    "scope_id": null,
     "action": "add_hive",
     "target": "worker-220",
     "status": "timeout_unknown",
@@ -212,12 +225,13 @@ The SDK should own:
 - canonical structs for immediate memory
 - validation and normalization
 - serialization into model input items
-- token-aware truncation policy for recent interactions
+- simple bounded-window handling for recent interactions
+- optional helpers for summary refresh
 
 The caller should own:
 
 - reading session history from local storage
-- maintaining chat summary
+- maintaining conversation summary as state
 - deciding which operations are relevant
 - passing the current user message
 
@@ -229,6 +243,8 @@ These are design targets, not final Rust signatures.
 
 ```rust
 pub struct ImmediateConversationMemory {
+    pub thread_id: Option<String>,
+    pub scope_id: Option<String>,
     pub summary: Option<ConversationSummary>,
     pub recent_interactions: Vec<ImmediateInteraction>,
     pub active_operations: Vec<ImmediateOperation>,
@@ -250,7 +266,10 @@ pub struct ImmediateInteraction {
 
 pub struct ImmediateOperation {
     pub operation_id: String,
-    pub scope_id: String,
+    pub resource_scope: Option<String>,
+    pub origin_thread_id: Option<String>,
+    pub origin_session_id: Option<String>,
+    pub scope_id: Option<String>,
     pub action: String,
     pub target: Option<String>,
     pub status: String,
@@ -260,13 +279,28 @@ pub struct ImmediateOperation {
 }
 ```
 
+Recommended `ImmediateInteractionKind` values for v1:
+
+- `text`
+  - plain user or assistant conversational text
+- `tool_result`
+  - successful tool output summarized as a recent interaction
+- `tool_error`
+  - failed tool call or operational error that should remain visible for the next turn
+- `operation_summary`
+  - compact operation state such as `add_hive -> timeout_unknown`
+- `system_note`
+  - local runtime note that is relevant to short-horizon reasoning but is not a user/assistant utterance
+
+The exact Rust enum name and shape are implementation details, but the SDK contract should keep these categories explicit enough that callers do not invent incompatible variants.
+
 ## 9. Proposed SDK Assembly Flow
 
 `fluxbee_ai_sdk` should support a turn input richer than a single `user_input: String`.
 
 Target flow:
 
-1. caller loads session summary
+1. caller loads conversation summary
 2. caller loads recent interactions
 3. caller loads active operations
 4. caller builds an `ImmediateConversationMemory`
@@ -277,8 +311,8 @@ The model should see the immediate memory in this order:
 
 1. system prompt
 2. immediate summary
-3. active operations
-4. recent interactions
+3. recent interactions
+4. active operations
 5. current user message
 
 ## 10. Serialization Policy
@@ -288,14 +322,14 @@ The SDK should serialize immediate memory as explicit textual blocks, not opaque
 Recommended pattern:
 
 - one synthetic system/developer-style block for summary
-- one compact block for active operations
 - then recent turns as user/assistant/system items
+- then one compact block for active operations immediately before the current user message
 
 This is preferable to dumping a large JSON object because:
 
 - it is easier for the model to follow
 - it preserves role ordering
-- it makes truncation simpler
+- it keeps the hottest operational state close to the current user message
 
 ## 11. Default Limits
 
@@ -304,12 +338,13 @@ Recommended v1 defaults:
 - `recent_interactions_max = 10`
 - `active_operations_max = 8`
 - `summary_max_chars = 1600`
-- `interaction_max_chars = 1200` per item after compaction
+- `interaction_max_chars = 1200` per item without smart semantic compaction
 
 If limits are exceeded:
 
 - drop oldest interactions first
 - keep `timeout_unknown` and `pending_confirm` operations before terminal ones
+- keep recent tool failures before older tool successes
 - never drop current user message
 
 ## 12. Immediate Memory Rules
@@ -323,10 +358,14 @@ If limits are exceeded:
 
 ### 12.2 What Should Be Compressed
 
-- large tool outputs
-- repeated inventory dumps
-- repeated status refreshes
-- old command payloads that have already become confirmed facts
+V1 does not introduce smart compression/summarization of recent interactions inside the SDK.
+
+Only simple hygiene is expected:
+
+- bound the recent window
+- trim obviously noisy refresh/status lines
+- keep tool failures visible
+- let long-horizon compression belong to `SY.cognitive` later
 
 ### 12.3 What Must Not Be Assumed
 
@@ -338,14 +377,15 @@ If limits are exceeded:
 
 For `SY.architect`, the first implementation should map:
 
-- `chat_summary`: derived from session-local state
+- `thread_id`: absent for now in the current local browser chat implementation
+- `conversation_summary`: derived from session-local state
 - `recent_interactions`: from persisted chat messages
 - `active_operations`: from `architect.lance/operations`
 
 Important:
 
-- this memory remains **chat-scoped**
-- later, if each chat maps to a distinct ILK, the same design can evolve to `chat/ILK` scope without changing the SDK contract
+- `SY.architect` may still have a local UI/session id, but the SDK contract must remain general and not assume browser-chat semantics
+- when future nodes or IO paths provide `thread_id`, the same contract should carry it directly
 
 ## 14. Relationship With `SY.cognitive`
 
@@ -364,11 +404,16 @@ Immediate memory remains necessary even after `SY.cognitive` exists.
 
 ## 15. Implementation Plan
 
+Open design point:
+
+- the refresh/update policy for `conversation_summary` is intentionally not closed in this spec yet; whether callers refresh it on every turn, every `N` turns, or only on structural events should be discussed separately
+
 ### Phase 1
 
 - add native immediate-memory structs to `fluxbee_ai_sdk`
 - add a richer turn-input API beside the current `run(..., user_input)`
 - support summary + recent interactions + active operations
+- add optional helper(s) to refresh conversation summary without making that automatic SDK behavior
 
 ### Phase 2
 
@@ -386,13 +431,15 @@ This work is correct when:
 - the model no longer loses basic chat continuity after one turn
 - pending/ambiguous operations remain visible between turns
 - old command payloads do not have to be repeated manually by the operator
+- recent tool failures remain visible enough to avoid blind re-tries
 - the SDK can support `SY.architect` and `AI.*` with the same immediate-memory contract
 - no dependency on `SY.cognitive` is required for this short-horizon memory
 
 ## 17. Backlog
 
-- [ ] AI-SDK-IM1. Add native immediate-memory structs to `fluxbee_ai_sdk`
-- [ ] AI-SDK-IM2. Add turn-input builder/API for summary + recent interactions + active operations
-- [ ] AI-SDK-IM3. Add default truncation/compaction policy for recent interactions
-- [ ] AI-SDK-IM4. Update `SY.architect` to rehydrate immediate memory from session history + operation tracking
-- [ ] AI-SDK-IM5. Document immediate-memory usage for future `AI.*` nodes
+- [x] AI-SDK-IM1. Add native immediate-memory structs to `fluxbee_ai_sdk`
+- [x] AI-SDK-IM2. Add turn-input builder/API for summary + recent interactions + active operations
+- [x] AI-SDK-IM3. Add simple bounded-window policy for recent interactions, without semantic compaction in v1
+- [x] AI-SDK-IM4. Update `SY.architect` to rehydrate immediate memory from session history + operation tracking
+- [x] AI-SDK-IM5. Add optional SDK helper for summary refresh/update
+- [ ] AI-SDK-IM6. Document immediate-memory usage for future `AI.*` nodes

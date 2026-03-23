@@ -43,7 +43,9 @@ async fn main() -> Result<(), DynError> {
     );
 
     let (sender, mut receiver) = connect(&cfg).await?;
-    let src_ilk = resolve_or_provision_ilk(&sender, &mut receiver, &config_dir, &channel_type, &address).await?;
+    let src_ilk =
+        resolve_or_provision_ilk(&sender, &mut receiver, &config_dir, &channel_type, &address)
+            .await?;
     tracing::info!(src_ilk = %src_ilk, "using src_ilk for routing probe");
 
     let trace_id = send_probe(&sender, &src_ilk, &probe_id, &text).await?;
@@ -245,7 +247,12 @@ fn env_opt(key: &str) -> Option<String> {
 fn env_bool(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }
 
@@ -261,9 +268,7 @@ fn is_lookup_unavailable(err: &IdentityShmError) -> bool {
         IdentityShmError::Nix(errno) => {
             matches!(
                 *errno,
-                nix::errno::Errno::ENOENT
-                    | nix::errno::Errno::EACCES
-                    | nix::errno::Errno::EPERM
+                nix::errno::Errno::ENOENT | nix::errno::Errno::EACCES | nix::errno::Errno::EPERM
             )
         }
         IdentityShmError::Io(io_err) => io_err.kind() == std::io::ErrorKind::NotFound,

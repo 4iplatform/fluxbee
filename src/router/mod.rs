@@ -3973,9 +3973,7 @@ fn inject_identity_data(root: &mut serde_json::Value, snapshot: &crate::shm::Ide
     );
 }
 
-fn build_dynamic_identity_opa_data(
-    snapshot: &crate::shm::IdentitySnapshot,
-) -> serde_json::Value {
+fn build_dynamic_identity_opa_data(snapshot: &crate::shm::IdentitySnapshot) -> serde_json::Value {
     let mut root = serde_json::json!({});
     inject_identity_data(&mut root, snapshot);
     root

@@ -30,7 +30,9 @@ async fn mock_llm_returns_deterministic_response_and_captures_request() {
     assert_eq!(req.system.as_deref(), Some("instrucciones"));
     assert_eq!(req.input, "hola");
     assert_eq!(
-        req.model_settings.as_ref().and_then(|s| s.max_output_tokens),
+        req.model_settings
+            .as_ref()
+            .and_then(|s| s.max_output_tokens),
         Some(128)
     );
 }
@@ -40,7 +42,10 @@ async fn mock_llm_errors_when_queue_is_empty() {
     let mock = MockLlmClient::default();
     let agent = Agent::new("test-agent", "gpt-4.1-mini", None, Arc::new(mock));
 
-    let err = agent.run_text("hola").await.expect_err("expected empty queue error");
+    let err = agent
+        .run_text("hola")
+        .await
+        .expect_err("expected empty queue error");
     let err_text = err.to_string();
     assert!(err_text.contains("mock llm has no queued response"));
 }

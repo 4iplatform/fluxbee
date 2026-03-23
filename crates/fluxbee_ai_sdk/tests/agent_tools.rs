@@ -38,7 +38,12 @@ impl FunctionToolProvider for ProviderWithEchoTool {
 
 #[test]
 fn agent_register_tool_exposes_definitions_and_rejects_duplicates() {
-    let mut agent = Agent::new("agent", "gpt-4.1-mini", None, Arc::new(MockLlmClient::default()));
+    let mut agent = Agent::new(
+        "agent",
+        "gpt-4.1-mini",
+        None,
+        Arc::new(MockLlmClient::default()),
+    );
     agent
         .register_tool(Arc::new(EchoTool))
         .expect("first tool registration should succeed");
@@ -55,7 +60,12 @@ fn agent_register_tool_exposes_definitions_and_rejects_duplicates() {
 
 #[test]
 fn agent_register_tools_from_provider() {
-    let mut agent = Agent::new("agent", "gpt-4.1-mini", None, Arc::new(MockLlmClient::default()));
+    let mut agent = Agent::new(
+        "agent",
+        "gpt-4.1-mini",
+        None,
+        Arc::new(MockLlmClient::default()),
+    );
     let provider = ProviderWithEchoTool;
 
     agent

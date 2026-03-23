@@ -16,8 +16,10 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
 use fluxbee_ai_sdk::{
-    FunctionCallingConfig, FunctionCallingRunner, FunctionTool, FunctionToolDefinition,
-    FunctionToolProvider, FunctionToolRegistry, ModelSettings, OpenAiResponsesClient,
+    ConversationSummary, FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput,
+    FunctionTool, FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
+    ImmediateConversationMemory, ImmediateInteraction, ImmediateInteractionKind,
+    ImmediateOperation, ImmediateRole, ModelSettings, OpenAiResponsesClient,
 };
 use fluxbee_sdk::{
     admin_command, connect, AdminCommandRequest, NodeConfig, NodeError, NodeReceiver,
@@ -1159,7 +1161,7 @@ async fn handle_chat_message(
             session_title: Some(session.title.clone()),
         }
     } else {
-        match handle_ai_chat(state, &resolved_session_id, message.trim()).await {
+        match handle_ai_chat(state, &session, message.trim()).await {
             Ok(output) => ChatResponse {
                 status: "ok".to_string(),
                 mode: "chat".to_string(),
@@ -1197,7 +1199,7 @@ async fn handle_chat_message(
 
 async fn handle_ai_chat(
     state: &ArchitectState,
-    session_id: &str,
+    session: &ChatSessionRecord,
     input: &str,
 ) -> Result<Value, ArchitectError> {
     let runtime = state.ai_runtime.clone().ok_or_else(|| -> ArchitectError {
@@ -1205,7 +1207,7 @@ async fn handle_ai_chat(
             .to_string()
             .into()
     })?;
-    let tool_context = admin_tool_context(state, Some(session_id));
+    let tool_context = admin_tool_context(state, Some(&session.session_id));
     let tool_provider = ArchitectAdminReadToolsProvider::new(tool_context);
     let mut tools = FunctionToolRegistry::new();
     tool_provider
@@ -1213,6 +1215,7 @@ async fn handle_ai_chat(
         .map_err(|err| -> ArchitectError {
             format!("AI tool registration failed: {err}").into()
         })?;
+    let memory = build_session_immediate_memory(state, session).await?;
 
     let model = runtime.client.clone().function_model(
         runtime.model.clone(),
@@ -1221,7 +1224,14 @@ async fn handle_ai_chat(
     );
     let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
     let result = runner
-        .run(&model, &tools, input.to_string())
+        .run_with_input(
+            &model,
+            &tools,
+            FunctionRunInput {
+                current_user_message: input.to_string(),
+                immediate_memory: Some(memory),
+            },
+        )
         .await
         .map_err(|err| -> ArchitectError { format!("AI request failed: {err}").into() })?;
 
@@ -1254,6 +1264,262 @@ async fn handle_ai_chat(
         "model": runtime.model,
         "tool_results": tool_results,
     }))
+}
+
+async fn build_session_immediate_memory(
+    state: &ArchitectState,
+    session: &ChatSessionRecord,
+) -> Result<ImmediateConversationMemory, ArchitectError> {
+    let _guard = state.chat_lock.lock().await;
+    let db = open_architect_db(state).await?;
+    let messages_table = ensure_messages_table(&db).await?;
+    let operations_table = ensure_operations_table(&db).await?;
+    let recent_messages = load_session_messages(&messages_table, &session.session_id).await?;
+    let operations = load_session_operations(&operations_table, &session.session_id).await?;
+    let summary = build_conversation_summary(session, &recent_messages, &operations);
+
+    Ok(ImmediateConversationMemory {
+        thread_id: None,
+        scope_id: None,
+        summary: Some(summary),
+        recent_interactions: recent_messages_to_immediate(recent_messages),
+        active_operations: operations_to_immediate(&session.session_id, operations),
+    })
+}
+
+fn build_conversation_summary(
+    session: &ChatSessionRecord,
+    messages: &[PersistedChatMessage],
+    operations: &[ChatOperationRecord],
+) -> ConversationSummary {
+    let goal = if session.title.trim().is_empty() || session.title == "Untitled chat" {
+        messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user" && !message.content.trim().is_empty())
+            .map(|message| preview_text(&message.content, 180))
+    } else {
+        Some(preview_text(&session.title, 180))
+    };
+    let current_focus = operations
+        .iter()
+        .find(|record| !is_terminal_operation_status(&record.status))
+        .map(operation_focus_summary)
+        .or_else(|| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| !message.content.trim().is_empty())
+                .map(|message| preview_text(&message.content, 180))
+        });
+
+    let mut decisions = Vec::new();
+    if operations
+        .iter()
+        .any(|record| record.status == "pending_confirm")
+    {
+        decisions.push(
+            "There are staged mutations in this conversation that require CONFIRM or CANCEL."
+                .to_string(),
+        );
+    }
+    if operations
+        .iter()
+        .any(|record| record.status == "timeout_unknown")
+    {
+        decisions.push(
+            "Timeout-unknown operations should be inspected before retrying the same mutation."
+                .to_string(),
+        );
+    }
+
+    let confirmed_facts = operations
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.status.as_str(),
+                "succeeded" | "succeeded_after_timeout"
+            )
+        })
+        .take(3)
+        .map(|record| {
+            format!(
+                "Recent operation succeeded: {}",
+                operation_focus_summary(record)
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let open_questions = operations
+        .iter()
+        .filter(|record| matches!(record.status.as_str(), "timeout_unknown" | "failed"))
+        .take(3)
+        .map(|record| {
+            if record.error_summary.trim().is_empty() {
+                format!(
+                    "Review operation state: {}",
+                    operation_focus_summary(record)
+                )
+            } else {
+                format!(
+                    "{}: {}",
+                    operation_focus_summary(record),
+                    preview_text(&record.error_summary, 180)
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+
+    ConversationSummary {
+        goal,
+        current_focus,
+        decisions,
+        confirmed_facts,
+        open_questions,
+    }
+}
+
+fn recent_messages_to_immediate(messages: Vec<PersistedChatMessage>) -> Vec<ImmediateInteraction> {
+    let start = messages.len().saturating_sub(10);
+    messages
+        .into_iter()
+        .skip(start)
+        .filter_map(|message| {
+            let content = message.content.trim();
+            if content.is_empty() {
+                return None;
+            }
+
+            let kind = match message.role.as_str() {
+                "system" => {
+                    if message
+                        .metadata
+                        .get("response")
+                        .and_then(|value| value.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("error")
+                    {
+                        ImmediateInteractionKind::ToolError
+                    } else {
+                        ImmediateInteractionKind::SystemNote
+                    }
+                }
+                _ => ImmediateInteractionKind::Text,
+            };
+
+            let role = match message.role.as_str() {
+                "user" => ImmediateRole::User,
+                "architect" => ImmediateRole::Assistant,
+                _ => ImmediateRole::System,
+            };
+
+            Some(ImmediateInteraction {
+                role,
+                kind,
+                content: content.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn operations_to_immediate(
+    session_id: &str,
+    operations: Vec<ChatOperationRecord>,
+) -> Vec<ImmediateOperation> {
+    let mut active = operations
+        .iter()
+        .filter(|record| !is_terminal_operation_status(&record.status))
+        .take(8)
+        .map(|record| operation_record_to_immediate(session_id, record))
+        .collect::<Vec<_>>();
+
+    if active.len() < 8 {
+        for record in operations
+            .iter()
+            .filter(|record| is_terminal_operation_status(&record.status))
+            .take(8 - active.len())
+        {
+            active.push(operation_record_to_immediate(session_id, record));
+        }
+    }
+
+    active
+}
+
+fn operation_record_to_immediate(
+    session_id: &str,
+    record: &ChatOperationRecord,
+) -> ImmediateOperation {
+    ImmediateOperation {
+        operation_id: record.operation_id.clone(),
+        resource_scope: Some(operation_resource_scope(record)),
+        origin_thread_id: None,
+        origin_session_id: Some(session_id.to_string()),
+        scope_id: if record.scope_id.trim().is_empty() {
+            None
+        } else {
+            Some(record.scope_id.clone())
+        },
+        action: record.action.clone(),
+        target: operation_target(record),
+        status: record.status.clone(),
+        summary: operation_model_summary(record),
+        created_at_ms: Some(record.created_at_ms),
+        updated_at_ms: Some(record.updated_at_ms),
+    }
+}
+
+fn operation_resource_scope(record: &ChatOperationRecord) -> String {
+    if record.action == "add_hive" {
+        if let Ok(params) = serde_json::from_str::<Value>(&record.params_json) {
+            if let Some(hive_id) = params.get("hive_id").and_then(Value::as_str) {
+                return format!("hive:{hive_id}");
+            }
+        }
+    }
+    format!("hive:{}", record.target_hive)
+}
+
+fn operation_target(record: &ChatOperationRecord) -> Option<String> {
+    if record.action == "add_hive" {
+        if let Ok(params) = serde_json::from_str::<Value>(&record.params_json) {
+            if let Some(hive_id) = params.get("hive_id").and_then(Value::as_str) {
+                return Some(hive_id.to_string());
+            }
+        }
+    }
+    if record.target_hive.trim().is_empty() {
+        None
+    } else {
+        Some(record.target_hive.clone())
+    }
+}
+
+fn operation_focus_summary(record: &ChatOperationRecord) -> String {
+    let target = operation_target(record).unwrap_or_else(|| record.target_hive.clone());
+    if target.trim().is_empty() {
+        format!("{} [{}]", record.action, record.status)
+    } else {
+        format!("{} {} [{}]", record.action, target, record.status)
+    }
+}
+
+fn operation_model_summary(record: &ChatOperationRecord) -> String {
+    match record.status.as_str() {
+        "pending_confirm" => format!(
+            "Prepared and waiting for confirmation: {}",
+            record.preview_command
+        ),
+        "dispatched" | "running" => format!("Running: {}", operation_focus_summary(record)),
+        "timeout_unknown" => format!(
+            "Timed out locally and may still be running: {}",
+            operation_focus_summary(record)
+        ),
+        "failed" if !record.error_summary.trim().is_empty() => {
+            format!("Failed: {}", preview_text(&record.error_summary, 180))
+        }
+        _ => operation_focus_summary(record),
+    }
 }
 
 async fn handle_scmd(

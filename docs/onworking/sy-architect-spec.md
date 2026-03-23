@@ -159,6 +159,10 @@ List of conversation sessions, ordered by last activity. Each session is a separ
 - Stored in LanceDB locally.
 - Searchable (semantic search over chat history).
 - Each session has a title (auto-generated from first message or AI summary).
+- Architect implementation note:
+  - the `SY.architect` process is one core system node, but each chat should be treated as a separate logical architect instance for AI/context purposes
+  - each chat may carry its own effective ILK/thread context, even though the outer process node is still `SY.architect@motherbee`
+  - this is important for future immediate-memory rehydration, per-chat operation tracking, and simulation flows
 
 ### 3.4 Chat Area (main panel)
 
@@ -169,6 +173,39 @@ Standard chat interface with:
 - File upload button (📎) for blob uploads.
 - Send button (➤).
 - WebSocket connection for real-time streaming of AI responses.
+
+### 3.5 Logical Per-Chat Identity
+
+For AI/runtime behavior, `SY.architect` should treat each chat as a logical node-like instance hosted inside the single architect process.
+
+This means:
+
+- one architect process can host multiple chat instances
+- each chat instance may have its own:
+  - local session id
+  - effective ILK context
+  - `thread_id` when the conversation is tied to an IO-defined thread
+  - immediate-memory state
+  - active operations
+
+Important distinction:
+
+- the outer connected node remains `SY.architect@motherbee`
+- the per-chat identity is logical, not a separate L1 router node
+
+Why this matters:
+
+- immediate memory should not bleed across chats
+- per-chat operation tracking should remain isolated
+- future impersonation/test flows can bind one chat to one impersonated ILK cleanly
+- simulations become easier to reason about because the chat behaves like a stable logical actor
+
+Architect does not mint permanent ILKs by itself. It either:
+
+- uses its own system identity as `SY.architect`
+- or temporarily operates through an impersonated/effective ILK context for testing/simulation
+
+This keeps the process model simple while allowing each chat to behave like a distinct conversational actor.
 
 ---
 

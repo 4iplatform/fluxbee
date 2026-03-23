@@ -797,7 +797,8 @@ async fn reconcile_persisted_custom_nodes(
                 continue;
             }
         };
-        let version = match resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version) {
+        let version = match resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version)
+        {
             Ok(value) => value,
             Err(err) => {
                 failed = failed.saturating_add(1);
@@ -861,7 +862,12 @@ async fn reconcile_persisted_custom_nodes(
         }
 
         let cmd = build_managed_node_run_command(&unit, &node.node_name, &entrypoint.script_path);
-        match execute_on_hive(state, &state.hive_id, &cmd, "reconcile_persisted_custom_nodes") {
+        match execute_on_hive(
+            state,
+            &state.hive_id,
+            &cmd,
+            "reconcile_persisted_custom_nodes",
+        ) {
             Ok(()) => {
                 started = started.saturating_add(1);
                 tracing::info!(
@@ -1565,13 +1571,9 @@ async fn handle_system_message(
         Some("REMOVE_NODE_INSTANCE") => {
             let result = remove_node_instance_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "REMOVE_NODE_INSTANCE processed");
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "REMOVE_NODE_INSTANCE_RESPONSE",
-                result,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "REMOVE_NODE_INSTANCE_RESPONSE", result)
+                    .await;
         }
         Some("NODE_CONFIG_SET") => {
             let result = set_node_config_flow(sender, state, &msg.payload).await;
@@ -1615,8 +1617,9 @@ async fn handle_system_message(
         }
         Some("REMOVE_RUNTIME_VERSION") => {
             let result = remove_runtime_version_flow(state, &msg.payload).await;
-            let _ = send_system_action_response(sender, msg, "REMOVE_RUNTIME_VERSION_RESPONSE", result)
-                .await;
+            let _ =
+                send_system_action_response(sender, msg, "REMOVE_RUNTIME_VERSION_RESPONSE", result)
+                    .await;
         }
         Some("INVENTORY_REQUEST") => {
             let result = inventory_flow(state, &msg.payload);
@@ -4252,7 +4255,8 @@ fn managed_node_inventory_with_root(
                 if let Ok(config_payload) = load_node_effective_config(&config_path) {
                     config_valid = true;
                     config_version = Some(config_version_from_value(&config_payload));
-                    if let Some(system) = config_payload.get("_system").and_then(|v| v.as_object()) {
+                    if let Some(system) = config_payload.get("_system").and_then(|v| v.as_object())
+                    {
                         runtime_name = system
                             .get("runtime")
                             .and_then(|v| v.as_str())
@@ -4336,18 +4340,28 @@ fn managed_node_inventory_with_root(
     }
 
     nodes.sort_by(|a, b| {
-        let a_name = a.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
-        let b_name = b.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
+        let a_name = a
+            .get("node_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let b_name = b
+            .get("node_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         a_name.cmp(b_name)
     });
     Ok(nodes)
 }
 
-fn managed_node_inventory(state: &OrchestratorState) -> Result<Vec<serde_json::Value>, OrchestratorError> {
+fn managed_node_inventory(
+    state: &OrchestratorState,
+) -> Result<Vec<serde_json::Value>, OrchestratorError> {
     managed_node_inventory_with_root(state, &node_files_root())
 }
 
-fn persisted_custom_nodes_with_root(root: &Path) -> Result<Vec<PersistedManagedNode>, OrchestratorError> {
+fn persisted_custom_nodes_with_root(
+    root: &Path,
+) -> Result<Vec<PersistedManagedNode>, OrchestratorError> {
     if !root.exists() {
         return Ok(Vec::new());
     }
@@ -4366,7 +4380,8 @@ fn persisted_custom_nodes_with_root(root: &Path) -> Result<Vec<PersistedManagedN
 
             let node_name = node_entry.file_name().to_string_lossy().to_string();
             let kind = node_kind_from_name(&node_name);
-            if matches!(kind.as_str(), "UNKNOWN") || !managed_reconcile_candidate_allowed(&node_name)
+            if matches!(kind.as_str(), "UNKNOWN")
+                || !managed_reconcile_candidate_allowed(&node_name)
             {
                 continue;
             }
@@ -4421,11 +4436,16 @@ fn persisted_custom_nodes_with_root(root: &Path) -> Result<Vec<PersistedManagedN
     Ok(nodes)
 }
 
-fn persisted_custom_nodes(_state: &OrchestratorState) -> Result<Vec<PersistedManagedNode>, OrchestratorError> {
+fn persisted_custom_nodes(
+    _state: &OrchestratorState,
+) -> Result<Vec<PersistedManagedNode>, OrchestratorError> {
     persisted_custom_nodes_with_root(&node_files_root())
 }
 
-async fn list_nodes_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+async fn list_nodes_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
     let target_hive = target_hive_from_payload(payload, &state.hive_id);
     if target_hive == state.hive_id {
         return match managed_node_inventory(state) {
@@ -4870,12 +4890,12 @@ async fn local_runtime_snapshot(
             };
             let usage =
                 local_runtime_usage_summary(state, runtime, version_filter).unwrap_or_else(|err| {
-                serde_json::json!({
-                    "scope": "hive_local_visible",
-                    "status": "error",
-                    "message": err.to_string(),
-                })
-            });
+                    serde_json::json!({
+                        "scope": "hive_local_visible",
+                        "status": "error",
+                        "message": err.to_string(),
+                    })
+                });
             let usage_global =
                 global_visible_runtime_usage_summary(state, runtime, version_filter).await;
             serde_json::json!({
@@ -4997,8 +5017,14 @@ fn local_runtime_usage_summary(
     }
 
     running_nodes.sort_by(|a, b| {
-        let a_name = a.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
-        let b_name = b.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
+        let a_name = a
+            .get("node_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let b_name = b
+            .get("node_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         a_name.cmp(b_name)
     });
 
@@ -5094,8 +5120,14 @@ async fn global_visible_runtime_usage_summary(
     running_nodes.sort_by(|a, b| {
         let a_hive = a.get("hive").and_then(|value| value.as_str()).unwrap_or("");
         let b_hive = b.get("hive").and_then(|value| value.as_str()).unwrap_or("");
-        let a_name = a.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
-        let b_name = b.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
+        let a_name = a
+            .get("node_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let b_name = b
+            .get("node_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         (a_hive, a_name).cmp(&(b_hive, b_name))
     });
 
@@ -5138,8 +5170,14 @@ fn runtime_dependents_summary(
         }));
     }
     dependents.sort_by(|a, b| {
-        let a_runtime = a.get("runtime").and_then(|value| value.as_str()).unwrap_or("");
-        let b_runtime = b.get("runtime").and_then(|value| value.as_str()).unwrap_or("");
+        let a_runtime = a
+            .get("runtime")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let b_runtime = b
+            .get("runtime")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         a_runtime.cmp(b_runtime)
     });
     Ok(dependents)
@@ -5185,7 +5223,9 @@ fn remove_runtime_version_from_manifest(
         .into());
     }
 
-    entry.available.retain(|value| value.trim() != runtime_version);
+    entry
+        .available
+        .retain(|value| value.trim() != runtime_version);
     if entry.available.is_empty() && current.is_empty() {
         runtime_entries.remove(runtime);
     } else {
@@ -5201,8 +5241,12 @@ fn remove_runtime_version_from_manifest(
     }
 
     let now_ms_i64 = Utc::now().timestamp_millis();
-    let now_ms = u64::try_from(now_ms_i64)
-        .map_err(|_| format!("runtime manifest remove failed: invalid clock value {}", now_ms_i64))?;
+    let now_ms = u64::try_from(now_ms_i64).map_err(|_| {
+        format!(
+            "runtime manifest remove failed: invalid clock value {}",
+            now_ms_i64
+        )
+    })?;
     updated.version = next_runtime_manifest_version_ms(now_ms, updated.version);
     updated.updated_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
     updated.hash = None;
@@ -5407,7 +5451,8 @@ async fn remove_runtime_version_flow(
         });
     }
 
-    let usage_global = global_visible_runtime_usage_summary(state, runtime, Some(runtime_version)).await;
+    let usage_global =
+        global_visible_runtime_usage_summary(state, runtime, Some(runtime_version)).await;
     if usage_global
         .get("status")
         .and_then(|value| value.as_str())
@@ -5465,30 +5510,31 @@ async fn remove_runtime_version_flow(
         });
     }
 
-    let updated_manifest = match remove_runtime_version_from_manifest(&manifest, runtime, runtime_version) {
-        Ok(value) => value,
-        Err(err) if err.to_string() == "RUNTIME_CURRENT_CONFLICT" => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "RUNTIME_CURRENT_CONFLICT",
-                "message": format!(
-                    "cannot delete current version '{}' for runtime '{}'",
-                    runtime_version, runtime
-                ),
-                "runtime": runtime,
-                "runtime_version": runtime_version,
-            });
-        }
-        Err(err) => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "RUNTIME_REMOVE_FAILED",
-                "message": err.to_string(),
-                "runtime": runtime,
-                "runtime_version": runtime_version,
-            });
-        }
-    };
+    let updated_manifest =
+        match remove_runtime_version_from_manifest(&manifest, runtime, runtime_version) {
+            Ok(value) => value,
+            Err(err) if err.to_string() == "RUNTIME_CURRENT_CONFLICT" => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "RUNTIME_CURRENT_CONFLICT",
+                    "message": format!(
+                        "cannot delete current version '{}' for runtime '{}'",
+                        runtime_version, runtime
+                    ),
+                    "runtime": runtime,
+                    "runtime_version": runtime_version,
+                });
+            }
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "RUNTIME_REMOVE_FAILED",
+                    "message": err.to_string(),
+                    "runtime": runtime,
+                    "runtime_version": runtime_version,
+                });
+            }
+        };
 
     let quarantined = match quarantine_runtime_version_dir(runtime, runtime_version) {
         Ok(value) => value,
@@ -10289,7 +10335,8 @@ async fn remove_node_instance_flow(
         });
     }
 
-    let cleanup_cmd = format!("systemctl stop {unit} || true; systemctl reset-failed {unit} || true");
+    let cleanup_cmd =
+        format!("systemctl stop {unit} || true; systemctl reset-failed {unit} || true");
     if let Err(err) = execute_on_hive(state, &target_hive, &cleanup_cmd, "remove_node_instance") {
         return serde_json::json!({
             "status": "error",
@@ -13715,8 +13762,8 @@ blob:
             hash: None,
         };
 
-        let updated =
-            remove_runtime_version_from_manifest(&manifest, "ai.test.gov", "0.9.0").expect("remove");
+        let updated = remove_runtime_version_from_manifest(&manifest, "ai.test.gov", "0.9.0")
+            .expect("remove");
         let entry = updated
             .runtimes
             .get("ai.test.gov")
@@ -13749,10 +13796,7 @@ blob:
 
     #[test]
     fn apply_runtime_retention_preserves_runtime_referenced_by_persisted_instance() {
-        let root = std::env::temp_dir().join(format!(
-            "fluxbee-retention-test-{}",
-            Uuid::new_v4()
-        ));
+        let root = std::env::temp_dir().join(format!("fluxbee-retention-test-{}", Uuid::new_v4()));
         let runtimes_root = root.join("dist").join("runtimes");
         let nodes_root = root.join("nodes");
 
@@ -13790,7 +13834,10 @@ blob:
         let stats = apply_runtime_retention_with_roots(&manifest, &runtimes_root, &nodes_root)
             .expect("retention should succeed");
 
-        assert!(kept_runtime_dir.exists(), "persisted runtime should be kept");
+        assert!(
+            kept_runtime_dir.exists(),
+            "persisted runtime should be kept"
+        );
         assert!(
             !pruned_runtime_dir.exists(),
             "unreferenced runtime should be pruned"
@@ -13830,7 +13877,10 @@ blob:
 
         let dependents = runtime_dependents_summary(&manifest, "ai.base").expect("dependents");
         assert_eq!(dependents.len(), 2);
-        assert_eq!(dependents[0]["runtime"], serde_json::json!("ai.child.config"));
+        assert_eq!(
+            dependents[0]["runtime"],
+            serde_json::json!("ai.child.config")
+        );
         assert_eq!(dependents[1]["runtime"], serde_json::json!("wf.child.flow"));
     }
 
@@ -14056,8 +14106,14 @@ blob:
             managed_spawn_disallowed_reason("RT.gateway@motherbee"),
             Some("managed spawn does not support RT.gateway; it is core hive infrastructure")
         );
-        assert_eq!(managed_spawn_disallowed_reason("RT.edge.buffer@motherbee"), None);
-        assert_eq!(managed_spawn_disallowed_reason("AI.frontdesk.gov@motherbee"), None);
+        assert_eq!(
+            managed_spawn_disallowed_reason("RT.edge.buffer@motherbee"),
+            None
+        );
+        assert_eq!(
+            managed_spawn_disallowed_reason("AI.frontdesk.gov@motherbee"),
+            None
+        );
     }
 
     #[test]
