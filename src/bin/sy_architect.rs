@@ -470,11 +470,21 @@ impl FunctionTool for ArchitectSystemWriteTool {
             preview_command: preview_command.clone(),
             created_at_ms: now_epoch_ms(),
         };
+        let params_json =
+            serde_json::to_string(&translation.params).unwrap_or_else(|_| "{}".to_string());
         self.context
             .pending_actions
             .lock()
             .await
             .insert(session_id.to_string(), pending);
+        tracing::info!(
+            session_id = %session_id,
+            action = %translation.action,
+            target_hive = %translation.target_hive,
+            preview_command = %preview_command,
+            params = %params_json,
+            "sy.architect staged admin write"
+        );
 
         Ok(json!({
             "pending_confirmation": true,
@@ -1580,6 +1590,16 @@ async fn execute_admin_translation_with_context(
     translation: AdminTranslation,
     purpose: &str,
 ) -> Result<Value, ArchitectError> {
+    let params_json =
+        serde_json::to_string(&translation.params).unwrap_or_else(|_| "{}".to_string());
+    tracing::info!(
+        purpose = %purpose,
+        admin_target = %translation.admin_target,
+        action = %translation.action,
+        target_hive = %translation.target_hive,
+        params = %params_json,
+        "sy.architect dispatching admin action"
+    );
     let node_config = NodeConfig {
         name: format!("SY.architect.{purpose}.{}", Uuid::new_v4().simple()),
         router_socket: context.socket_dir.clone(),
@@ -1601,7 +1621,32 @@ async fn execute_admin_translation_with_context(
             timeout: Duration::from_secs(10),
         },
     )
-    .await?;
+    .await
+    .map_err(|err| -> ArchitectError {
+        tracing::warn!(
+            purpose = %purpose,
+            admin_target = %translation.admin_target,
+            action = %translation.action,
+            target_hive = %translation.target_hive,
+            error = %err,
+            "sy.architect admin action failed"
+        );
+        Box::new(err)
+    })?;
+    let payload_json = serde_json::to_string(&out.payload).unwrap_or_else(|_| "null".to_string());
+    tracing::info!(
+        purpose = %purpose,
+        admin_target = %translation.admin_target,
+        action = %translation.action,
+        target_hive = %translation.target_hive,
+        status = %out.status,
+        error_code = ?out.error_code,
+        error_detail = ?out.error_detail,
+        request_id = ?out.request_id,
+        trace_id = ?out.trace_id,
+        payload = %payload_json,
+        "sy.architect admin action response"
+    );
     Ok(json!({
         "status": out.status,
         "action": out.action,
