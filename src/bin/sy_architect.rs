@@ -334,6 +334,7 @@ impl FunctionTool for ArchitectSystemGetTool {
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let raw_arguments = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
         let method = arguments
             .get("method")
             .and_then(Value::as_str)
@@ -481,6 +482,7 @@ impl FunctionTool for ArchitectSystemWriteTool {
             session_id = %session_id,
             action = %translation.action,
             target_hive = %translation.target_hive,
+            tool_arguments = %raw_arguments,
             preview_command = %preview_command,
             params = %params_json,
             "sy.architect staged admin write"
@@ -906,8 +908,9 @@ async fn handle_chat_message(
                     output["confirmed_command"] = Value::String(pending.preview_command);
                     output["pending_created_at_ms"] = json!(pending.created_at_ms);
                     output["confirmed_at_ms"] = json!(now_epoch_ms());
+                    let status = chat_status_from_command_output(&output);
                     ChatResponse {
-                        status: "ok".to_string(),
+                        status,
                         mode: "scmd".to_string(),
                         output,
                         session_id: Some(resolved_session_id.clone()),
@@ -956,13 +959,16 @@ async fn handle_chat_message(
         }
     } else if let Some(raw) = message.strip_prefix("SCMD:") {
         match handle_scmd(state, raw.trim()).await {
-            Ok(output) => ChatResponse {
-                status: "ok".to_string(),
-                mode: "scmd".to_string(),
-                output,
-                session_id: Some(resolved_session_id.clone()),
-                session_title: Some(session.title.clone()),
-            },
+            Ok(output) => {
+                let status = chat_status_from_command_output(&output);
+                ChatResponse {
+                    status,
+                    mode: "scmd".to_string(),
+                    output,
+                    session_id: Some(resolved_session_id.clone()),
+                    session_title: Some(session.title.clone()),
+                }
+            }
             Err(err) => ChatResponse {
                 status: "error".to_string(),
                 mode: "scmd".to_string(),
@@ -1153,6 +1159,16 @@ fn parse_scmd(raw: &str) -> Result<ParsedScmd, ArchitectError> {
         return Err("SCMD path must be relative and start with '/'".into());
     }
     Ok(ParsedScmd { method, path, body })
+}
+
+fn chat_status_from_command_output(output: &Value) -> String {
+    output
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("ok")
+        .to_string()
 }
 
 fn translate_scmd(

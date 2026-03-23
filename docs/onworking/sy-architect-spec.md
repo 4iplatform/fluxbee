@@ -629,6 +629,10 @@ Current repo state should be treated as a **partial shell**, not as a blank impl
   - `POST /api/chat`
   - local `SCMD:` parser translated to `ADMIN_COMMAND`
   - persisted chat sessions/messages in local LanceDB
+- current friction:
+  - header status chips currently poll `/api/status` every 5 seconds from the browser
+  - each refresh opens an ephemeral router/admin client path just to render `Hives` / `Nodes` / `Updated`
+  - revisit whether this status should poll less, pause on hidden tabs, move to frontend-only visibility-aware refresh, or be removed entirely
 - The current implementation does **not** yet provide:
   - WebSocket chat/streaming
   - real AI provider integration
@@ -779,6 +783,8 @@ This phase turns the current visual chat navigator into real product behavior.
   - estrategia de flush/compaction
   - metadata suficiente para recuperación rápida y futura semantic search
 - [ ] ARCH-T31. Refinar UI final (history panel, status refresh, upload state, command/result rendering).
+  - Revisar el polling de `/api/status`; hoy es demasiado agresivo para el valor que aporta.
+  - Evaluar pausar refresh con tab oculta, bajar frecuencia, cachear, mover la lógica a un modelo más frontend-aware, o eliminar directamente esos chips.
 
 ### Phase F — Settings And Self-Configuration
 
