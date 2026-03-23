@@ -22,7 +22,8 @@ use fluxbee_ai_sdk::{
     ImmediateOperation, ImmediateRole, ModelSettings, OpenAiResponsesClient,
 };
 use fluxbee_sdk::{
-    admin_command, connect, AdminCommandRequest, NodeConfig, NodeError, NodeReceiver,
+    admin_command, connect, list_ich_options_from_hive_config, AdminCommandRequest,
+    IdentityIchOption, NodeConfig, NodeError, NodeReceiver,
 };
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
@@ -179,6 +180,7 @@ struct ChatResponse {
 struct CreateSessionRequest {
     title: Option<String>,
     chat_mode: Option<String>,
+    effective_ich_id: Option<String>,
     effective_ilk: Option<String>,
     impersonation_target: Option<String>,
     thread_id: Option<String>,
@@ -196,6 +198,7 @@ struct SessionSummary {
     message_count: u64,
     last_message_preview: Option<String>,
     chat_mode: String,
+    effective_ich_id: Option<String>,
     effective_ilk: Option<String>,
     impersonation_target: Option<String>,
     thread_id: Option<String>,
@@ -221,6 +224,11 @@ struct SessionDeleteResponse {
     deleted_messages: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct IdentityIchOptionsResponse {
+    options: Vec<IdentityIchOption>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct PersistedChatMessage {
     message_id: String,
@@ -242,6 +250,7 @@ struct ChatSessionRecord {
     message_count: u64,
     last_message_preview: String,
     chat_mode: String,
+    effective_ich_id: String,
     effective_ilk: String,
     impersonation_target: String,
     thread_id: String,
@@ -253,6 +262,7 @@ struct ChatSessionRecord {
 struct ChatSessionProfileRecord {
     session_id: String,
     chat_mode: String,
+    effective_ich_id: String,
     effective_ilk: String,
     impersonation_target: String,
     thread_id: String,
@@ -819,6 +829,13 @@ fn merged_openai_section(
     }
 }
 
+fn load_identity_ich_options(
+    state: &ArchitectState,
+) -> Result<Vec<IdentityIchOption>, ArchitectError> {
+    list_ich_options_from_hive_config(&state.config_dir)
+        .map_err(|err| -> ArchitectError { Box::new(err) })
+}
+
 fn admin_tool_context(
     state: &ArchitectState,
     session_id: Option<&str>,
@@ -912,6 +929,16 @@ async fn dynamic_handler(
             let status = build_architect_status(&state).await;
             Json(status).into_response()
         }
+        (Method::GET, _) if is_identity_ich_options_path(path) => {
+            match load_identity_ich_options(&state) {
+                Ok(options) => Json(IdentityIchOptionsResponse { options }).into_response(),
+                Err(err) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("failed to load identity options: {err}") })),
+                )
+                    .into_response(),
+            }
+        }
         (Method::GET, _) if is_sessions_collection_path(path) => {
             match list_chat_sessions(&state).await {
                 Ok(sessions) => Json(SessionListResponse { sessions }).into_response(),
@@ -937,6 +964,7 @@ async fn dynamic_handler(
                 CreateSessionRequest {
                     title: None,
                     chat_mode: None,
+                    effective_ich_id: None,
                     effective_ilk: None,
                     impersonation_target: None,
                     thread_id: None,
@@ -1380,11 +1408,17 @@ fn build_conversation_summary(
     }
 
     let mut confirmed_facts = Vec::new();
+    if let Some(effective_ich_id) = none_if_empty(&session.effective_ich_id) {
+        confirmed_facts.push(format!("Effective ICH context: {effective_ich_id}"));
+    }
     if let Some(effective_ilk) = none_if_empty(&session.effective_ilk) {
         confirmed_facts.push(format!("Effective ILK context: {effective_ilk}"));
     }
     if let Some(impersonation_target) = none_if_empty(&session.impersonation_target) {
         confirmed_facts.push(format!("Impersonation target: {impersonation_target}"));
+    }
+    if let Some(source_channel_kind) = none_if_empty(&session.source_channel_kind) {
+        confirmed_facts.push(format!("Source channel kind: {source_channel_kind}"));
     }
     if let Some(thread_id) = none_if_empty(&session.thread_id) {
         confirmed_facts.push(format!("Thread context: {thread_id}"));
@@ -2786,13 +2820,45 @@ async fn ensure_operations_table(db: &Connection) -> Result<lancedb::Table, Arch
 
 async fn ensure_session_profiles_table(db: &Connection) -> Result<lancedb::Table, ArchitectError> {
     match db.open_table(CHAT_SESSION_PROFILES_TABLE).execute().await {
-        Ok(table) => Ok(table),
+        Ok(table) => {
+            if session_profiles_schema_matches(&table).await? {
+                Ok(table)
+            } else {
+                db.drop_table(CHAT_SESSION_PROFILES_TABLE, &[])
+                    .await
+                    .map_err(|err| -> ArchitectError { Box::new(err) })?;
+                db.create_empty_table(CHAT_SESSION_PROFILES_TABLE, chat_session_profiles_schema())
+                    .execute()
+                    .await
+                    .map_err(|err| -> ArchitectError { Box::new(err) })
+            }
+        }
         Err(_) => db
             .create_empty_table(CHAT_SESSION_PROFILES_TABLE, chat_session_profiles_schema())
             .execute()
             .await
             .map_err(|err| -> ArchitectError { Box::new(err) }),
     }
+}
+
+async fn session_profiles_schema_matches(table: &lancedb::Table) -> Result<bool, ArchitectError> {
+    let schema = table
+        .schema()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    let required = [
+        "session_id",
+        "chat_mode",
+        "effective_ich_id",
+        "effective_ilk",
+        "impersonation_target",
+        "thread_id",
+        "source_channel_kind",
+        "debug_enabled",
+    ];
+    Ok(required
+        .iter()
+        .all(|field| schema.column_with_name(field).is_some()))
 }
 
 fn chat_sessions_schema() -> Arc<Schema> {
@@ -2811,6 +2877,7 @@ fn chat_session_profiles_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("session_id", DataType::Utf8, false),
         Field::new("chat_mode", DataType::Utf8, false),
+        Field::new("effective_ich_id", DataType::Utf8, false),
         Field::new("effective_ilk", DataType::Utf8, false),
         Field::new("impersonation_target", DataType::Utf8, false),
         Field::new("thread_id", DataType::Utf8, false),
@@ -2901,6 +2968,7 @@ async fn create_chat_session(
     let CreateSessionRequest {
         title,
         chat_mode,
+        effective_ich_id,
         effective_ilk,
         impersonation_target,
         thread_id,
@@ -2918,6 +2986,7 @@ async fn create_chat_session(
         ..build_session_profile(CreateSessionRequest {
             title: None,
             chat_mode,
+            effective_ich_id,
             effective_ilk,
             impersonation_target,
             thread_id,
@@ -3501,6 +3570,11 @@ fn session_profile_batch_from_rows(
             )),
             Arc::new(StringArray::from(
                 rows.iter()
+                    .map(|row| row.effective_ich_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
                     .map(|row| row.effective_ilk.as_str())
                     .collect::<Vec<_>>(),
             )),
@@ -3655,6 +3729,7 @@ fn parse_session_records(
                 message_count: counts.value(idx),
                 last_message_preview: previews.value(idx).to_string(),
                 chat_mode: profile.chat_mode,
+                effective_ich_id: profile.effective_ich_id,
                 effective_ilk: profile.effective_ilk,
                 impersonation_target: profile.impersonation_target,
                 thread_id: profile.thread_id,
@@ -3798,6 +3873,7 @@ fn session_record_to_summary(record: &ChatSessionRecord) -> SessionSummary {
             Some(record.last_message_preview.clone())
         },
         chat_mode: record.chat_mode.clone(),
+        effective_ich_id: none_if_empty(&record.effective_ich_id),
         effective_ilk: none_if_empty(&record.effective_ilk),
         impersonation_target: none_if_empty(&record.impersonation_target),
         thread_id: none_if_empty(&record.thread_id),
@@ -3808,16 +3884,18 @@ fn session_record_to_summary(record: &ChatSessionRecord) -> SessionSummary {
 
 fn build_session_profile(req: CreateSessionRequest) -> Result<ChatSessionRecord, ArchitectError> {
     let chat_mode = normalize_chat_mode(req.chat_mode.as_deref())?;
+    let effective_ich_id = sanitize_optional_identity(req.effective_ich_id);
     let effective_ilk = sanitize_optional_identity(req.effective_ilk);
     let impersonation_target = sanitize_optional_identity(req.impersonation_target);
     let thread_id = sanitize_optional_value(req.thread_id);
     let source_channel_kind = sanitize_optional_value(req.source_channel_kind);
     if chat_mode == CHAT_MODE_IMPERSONATION
+        && effective_ich_id.is_empty()
         && effective_ilk.is_empty()
         && impersonation_target.is_empty()
     {
         return Err(
-            "impersonation chat mode requires at least effective_ilk or impersonation_target"
+            "impersonation chat mode requires at least effective_ich_id, effective_ilk or impersonation_target"
                 .to_string()
                 .into(),
         );
@@ -3834,6 +3912,7 @@ fn build_session_profile(req: CreateSessionRequest) -> Result<ChatSessionRecord,
         message_count: 0,
         last_message_preview: String::new(),
         chat_mode,
+        effective_ich_id,
         effective_ilk,
         impersonation_target,
         thread_id,
@@ -3852,6 +3931,7 @@ fn default_session_profile() -> ChatSessionRecord {
         message_count: 0,
         last_message_preview: String::new(),
         chat_mode: CHAT_MODE_OPERATOR.to_string(),
+        effective_ich_id: String::new(),
         effective_ilk: String::new(),
         impersonation_target: String::new(),
         thread_id: String::new(),
@@ -3870,6 +3950,7 @@ fn session_profile_from_record(record: &ChatSessionRecord) -> ChatSessionProfile
     ChatSessionProfileRecord {
         session_id: record.session_id.clone(),
         chat_mode: record.chat_mode.clone(),
+        effective_ich_id: record.effective_ich_id.clone(),
         effective_ilk: record.effective_ilk.clone(),
         impersonation_target: record.impersonation_target.clone(),
         thread_id: record.thread_id.clone(),
@@ -3918,6 +3999,9 @@ fn none_if_empty(value: &str) -> Option<String> {
 }
 
 fn session_scope_id(session: &ChatSessionRecord) -> Option<String> {
+    if let Some(effective_ich_id) = none_if_empty(&session.effective_ich_id) {
+        return Some(effective_ich_id);
+    }
     if let Some(effective_ilk) = none_if_empty(&session.effective_ilk) {
         return Some(effective_ilk);
     }
@@ -3942,6 +4026,7 @@ async fn load_session_profile_map(
         .select(Select::columns(&[
             "session_id",
             "chat_mode",
+            "effective_ich_id",
             "effective_ilk",
             "impersonation_target",
             "thread_id",
@@ -3968,6 +4053,7 @@ fn parse_session_profile_records(
     for batch in batches {
         let session_ids = string_column(batch, "session_id")?;
         let chat_modes = string_column(batch, "chat_mode")?;
+        let effective_ich_ids = string_column(batch, "effective_ich_id")?;
         let effective_ilks = string_column(batch, "effective_ilk")?;
         let impersonation_targets = string_column(batch, "impersonation_target")?;
         let thread_ids = string_column(batch, "thread_id")?;
@@ -3977,6 +4063,7 @@ fn parse_session_profile_records(
             out.push(ChatSessionProfileRecord {
                 session_id: session_ids.value(idx).to_string(),
                 chat_mode: chat_modes.value(idx).to_string(),
+                effective_ich_id: effective_ich_ids.value(idx).to_string(),
                 effective_ilk: effective_ilks.value(idx).to_string(),
                 impersonation_target: impersonation_targets.value(idx).to_string(),
                 thread_id: thread_ids.value(idx).to_string(),
@@ -4099,6 +4186,7 @@ fn is_api_path(path: &str) -> bool {
         || path == "/api/status"
         || path == "/api/chat"
         || path == "/api/sessions"
+        || path == "/api/identity/ich-options"
         || path.starts_with("/api/sessions/")
         || path.ends_with("/api/status")
         || path.ends_with("/api/chat")
@@ -4112,6 +4200,10 @@ fn is_status_path(path: &str) -> bool {
 
 fn is_chat_path(path: &str) -> bool {
     path == "/api/chat" || path.ends_with("/api/chat")
+}
+
+fn is_identity_ich_options_path(path: &str) -> bool {
+    path == "/api/identity/ich-options" || path.ends_with("/api/identity/ich-options")
 }
 
 fn is_favicon_path(path: &str) -> bool {
@@ -4587,7 +4679,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       text-transform: uppercase;
       color: var(--muted);
     }}
-    .field input {{
+    .field input,
+    .field select {{
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 14px;
@@ -4597,7 +4690,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       background: #ffffff;
       outline: none;
     }}
-    .field input:focus {{
+    .field input:focus,
+    .field select:focus {{
       border-color: #b8caef;
       box-shadow: 0 0 0 4px rgba(69, 117, 220, 0.12);
     }}
@@ -4989,7 +5083,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         <div>
           <div class="modal-kicker">Debug Session</div>
           <h2 id="impersonation-modal-title" class="modal-title">Create impersonation chat</h2>
-          <p class="modal-copy">Run a chat with an effective ILK or impersonation target so you can simulate external flows without connecting a real IO.</p>
+          <p class="modal-copy">Choose an existing ICH from identity SHM and, if needed, the ILK bound to that channel so you can simulate a real ingress path without connecting external IO.</p>
         </div>
         <button id="impersonation-close" class="modal-close" type="button" aria-label="Close impersonation dialog">×</button>
       </div>
@@ -4999,24 +5093,24 @@ fn architect_index_html(state: &ArchitectState) -> String {
             <label for="impersonation-title">Title</label>
             <input id="impersonation-title" type="text" placeholder="Impersonation chat" autocomplete="off" />
           </div>
-          <div class="field">
-            <label for="impersonation-effective-ilk">Effective ILK</label>
-            <input id="impersonation-effective-ilk" type="text" placeholder="customer.support" autocomplete="off" />
+          <div class="field span-2">
+            <label for="impersonation-ich">Existing ICH</label>
+            <select id="impersonation-ich">
+              <option value="">Loading identity channels...</option>
+            </select>
           </div>
-          <div class="field">
-            <label for="impersonation-target">Impersonation Target</label>
-            <input id="impersonation-target" type="text" placeholder="AI.helper@motherbee" autocomplete="off" />
+          <div class="field span-2">
+            <label for="impersonation-ilk">Effective ILK</label>
+            <select id="impersonation-ilk">
+              <option value="">Choose an ICH first</option>
+            </select>
           </div>
-          <div class="field">
+          <div class="field span-2">
             <label for="impersonation-thread-id">Thread Id</label>
             <input id="impersonation-thread-id" type="text" placeholder="thread:demo-123" autocomplete="off" />
           </div>
-          <div class="field">
-            <label for="impersonation-source-channel">Source Channel</label>
-            <input id="impersonation-source-channel" type="text" placeholder="whatsapp" autocomplete="off" />
-          </div>
         </div>
-        <div class="field-help">Set at least an effective ILK or an impersonation target. Thread and source channel are optional simulation context.</div>
+        <div class="field-help">The modal only offers active channels known by identity SHM. Thread is optional simulation context layered on top of the selected ingress path.</div>
         <div id="impersonation-error" class="modal-error"></div>
         <div class="modal-actions">
           <button id="impersonation-cancel" class="secondary-button" type="button">Cancel</button>
@@ -5031,6 +5125,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const statusUrl = (base || "") + "/api/status";
     const chatUrl = (base || "") + "/api/chat";
     const sessionsUrl = (base || "") + "/api/sessions";
+    const identityIchOptionsUrl = (base || "") + "/api/identity/ich-options";
     const currentSessionStorageKey = "sy.architect.currentSession.{hive}";
     const messages = document.getElementById("messages");
     const input = document.getElementById("input");
@@ -5046,45 +5141,123 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const impersonationClose = document.getElementById("impersonation-close");
     const impersonationCancel = document.getElementById("impersonation-cancel");
     const impersonationTitle = document.getElementById("impersonation-title");
-    const impersonationEffectiveIlk = document.getElementById("impersonation-effective-ilk");
-    const impersonationTarget = document.getElementById("impersonation-target");
+    const impersonationIch = document.getElementById("impersonation-ich");
+    const impersonationIlk = document.getElementById("impersonation-ilk");
     const impersonationThreadId = document.getElementById("impersonation-thread-id");
-    const impersonationSourceChannel = document.getElementById("impersonation-source-channel");
     const impersonationError = document.getElementById("impersonation-error");
     let currentSessionId = null;
     let sessionsCache = [];
     let pendingIndicator = null;
+    let impersonationOptionsCache = [];
+    function describeIchOption(option) {{
+      if (!option) return "";
+      const primary = option.is_primary ? " · primary" : "";
+      return option.channel_type + " · " + option.address + primary + " · " + option.ich_id;
+    }}
+    function selectedImpersonationOption() {{
+      const idx = Number(impersonationIch.value);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= impersonationOptionsCache.length) {{
+        return null;
+      }}
+      return impersonationOptionsCache[idx] || null;
+    }}
+    function syncImpersonationIlkOptions() {{
+      const option = selectedImpersonationOption();
+      impersonationIlk.innerHTML = "";
+      if (!option) {{
+        impersonationIlk.innerHTML = '<option value="">Choose an ICH first</option>';
+        impersonationIlk.disabled = true;
+        return;
+      }}
+      if (!Array.isArray(option.ilks) || option.ilks.length === 0) {{
+        impersonationIlk.innerHTML = '<option value="">No ILK bound to this ICH</option>';
+        impersonationIlk.disabled = true;
+        return;
+      }}
+      option.ilks.forEach((ilk) => {{
+        const item = document.createElement("option");
+        item.value = ilk.ilk_id;
+        item.textContent = (ilk.display_name || ilk.ilk_id) + " · " + ilk.registration_status;
+        impersonationIlk.appendChild(item);
+      }});
+      impersonationIlk.disabled = option.ilks.length <= 1;
+      impersonationIlk.value = option.ilks[0].ilk_id;
+    }}
+    function renderImpersonationIchOptions(options) {{
+      impersonationOptionsCache = Array.isArray(options) ? options : [];
+      impersonationIch.innerHTML = "";
+      if (!impersonationOptionsCache.length) {{
+        impersonationIch.innerHTML = '<option value="">No active ICH entries found</option>';
+        impersonationIch.disabled = true;
+        syncImpersonationIlkOptions();
+        return;
+      }}
+      impersonationIch.disabled = false;
+      impersonationOptionsCache.forEach((option, index) => {{
+        const item = document.createElement("option");
+        item.value = String(index);
+        item.textContent = describeIchOption(option);
+        impersonationIch.appendChild(item);
+      }});
+      impersonationIch.value = "0";
+      syncImpersonationIlkOptions();
+    }}
+    async function fetchImpersonationOptions() {{
+      const res = await fetch(identityIchOptionsUrl);
+      if (!res.ok) {{
+        const error = await res.json().catch(() => ({{ error: "identity options request failed" }}));
+        throw new Error(error && error.error ? error.error : "identity options request failed");
+      }}
+      const data = await res.json();
+      renderImpersonationIchOptions(Array.isArray(data.options) ? data.options : []);
+    }}
     function closeImpersonationModal() {{
       impersonationModal.classList.remove("open");
       impersonationModal.setAttribute("aria-hidden", "true");
       impersonationForm.reset();
       impersonationTitle.value = "Impersonation chat";
       impersonationError.textContent = "";
+      impersonationIch.disabled = false;
+      impersonationIlk.disabled = true;
+      impersonationIch.innerHTML = '<option value="">Loading identity channels...</option>';
+      impersonationIlk.innerHTML = '<option value="">Choose an ICH first</option>';
     }}
-    function openImpersonationModal() {{
+    async function openImpersonationModal() {{
       impersonationForm.reset();
       impersonationTitle.value = "Impersonation chat";
       impersonationError.textContent = "";
+      impersonationIch.disabled = true;
+      impersonationIlk.disabled = true;
+      impersonationIch.innerHTML = '<option value="">Loading identity channels...</option>';
+      impersonationIlk.innerHTML = '<option value="">Choose an ICH first</option>';
       impersonationModal.classList.add("open");
       impersonationModal.setAttribute("aria-hidden", "false");
-      window.setTimeout(() => impersonationEffectiveIlk.focus(), 0);
+      try {{
+        await fetchImpersonationOptions();
+      }} catch (err) {{
+        impersonationError.textContent = "Failed to load identity options: " + err;
+      }}
+      window.setTimeout(() => impersonationIch.focus(), 0);
     }}
     function collectImpersonationPayload() {{
+      const option = selectedImpersonationOption();
       const title = impersonationTitle.value.trim();
-      const effectiveIlk = impersonationEffectiveIlk.value.trim();
-      const target = impersonationTarget.value.trim();
       const threadId = impersonationThreadId.value.trim();
-      const sourceChannelKind = impersonationSourceChannel.value.trim();
-      if (!effectiveIlk && !target) {{
-        throw new Error("Impersonation mode requires effective ILK or impersonation target.");
+      const effectiveIlk = impersonationIlk.value.trim();
+      if (!option) {{
+        throw new Error("Choose an existing ICH before creating an impersonation chat.");
+      }}
+      if (!effectiveIlk) {{
+        throw new Error("Choose a valid ILK for the selected ICH.");
       }}
       return {{
         title: title || "Impersonation chat",
         chat_mode: "impersonation",
+        effective_ich_id: option.ich_id,
         effective_ilk: effectiveIlk || null,
-        impersonation_target: target || null,
+        impersonation_target: null,
         thread_id: threadId || null,
-        source_channel_kind: sourceChannelKind || null,
+        source_channel_kind: option.channel_type || null,
         debug_enabled: true
       }};
     }}
@@ -5265,8 +5438,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
         session && session.last_message_preview ? session.last_message_preview : "",
         session && session.agent ? session.agent : "",
         session && session.chat_mode ? session.chat_mode : "",
+        session && session.effective_ich_id ? session.effective_ich_id : "",
         session && session.effective_ilk ? session.effective_ilk : "",
         session && session.impersonation_target ? session.impersonation_target : "",
+        session && session.source_channel_kind ? session.source_channel_kind : "",
         session && session.thread_id ? session.thread_id : ""
       ].join(" ").toLowerCase();
       return haystack.includes(query);
@@ -5321,6 +5496,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
         modeBadge.className = "mode-badge " + sessionModeLabel(session);
         modeBadge.textContent = sessionModeLabel(session);
         modeRow.appendChild(modeBadge);
+        if (session.effective_ich_id) {{
+          const ichBadge = document.createElement("span");
+          ichBadge.className = "mode-badge";
+          ichBadge.textContent = session.effective_ich_id;
+          modeRow.appendChild(ichBadge);
+        }}
         if (session.effective_ilk) {{
           const ilkBadge = document.createElement("span");
           ilkBadge.className = "mode-badge";
@@ -5414,9 +5595,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const base = session.message_count
         ? "Enter to send. Shift+Enter for newline. This chat has " + session.message_count + " persisted messages."
         : "Enter to send. Shift+Enter for newline. This chat is empty and ready.";
-      composerHint.textContent = base + (sessionModeLabel(session) === "impersonation"
-        ? " Running in impersonation/debug mode."
-        : " Running in operator mode.");
+      if (sessionModeLabel(session) === "impersonation") {{
+        const channel = session.source_channel_kind ? " via " + session.source_channel_kind : "";
+        const ich = session.effective_ich_id ? " (" + session.effective_ich_id + ")" : "";
+        composerHint.textContent = base + " Running in impersonation/debug mode" + channel + ich + ".";
+      }} else {{
+        composerHint.textContent = base + " Running in operator mode.";
+      }}
     }}
     function renderSession(detail, showWelcome = false) {{
       resetChatViewport();
@@ -5520,7 +5705,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }});
     }});
     newChatImpersonation.addEventListener("click", () => {{
-      openImpersonationModal();
+      openImpersonationModal().catch((err) => {{
+        addMessage("system", "Failed to open impersonation modal: " + err);
+      }});
+    }});
+    impersonationIch.addEventListener("change", () => {{
+      syncImpersonationIlkOptions();
+      impersonationError.textContent = "";
     }});
     impersonationClose.addEventListener("click", closeImpersonationModal);
     impersonationCancel.addEventListener("click", closeImpersonationModal);

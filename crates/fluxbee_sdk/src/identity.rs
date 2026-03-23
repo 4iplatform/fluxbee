@@ -35,7 +35,14 @@ const ICH_CHANNEL_TYPE_MAX_LEN: usize = 32;
 const ICH_ADDRESS_MAX_LEN: usize = 256;
 const ICH_MAP_FLAG_OCCUPIED: u16 = 0x0001;
 const ICH_MAP_FLAG_TOMBSTONE: u16 = 0x0002;
+const FLAG_ACTIVE: u16 = 0x0001;
 const SEQLOCK_READ_TIMEOUT_MS: u64 = 5;
+const SHM_ILK_TYPE_HUMAN: u8 = 0;
+const SHM_ILK_TYPE_AGENT: u8 = 1;
+const SHM_ILK_TYPE_SYSTEM: u8 = 2;
+const SHM_REG_STATUS_TEMPORARY: u8 = 0;
+const SHM_REG_STATUS_PARTIAL: u8 = 1;
+const SHM_REG_STATUS_COMPLETE: u8 = 2;
 
 #[derive(Debug, Clone)]
 pub struct IlkProvisionRequest<'a> {
@@ -67,6 +74,24 @@ pub struct IdentitySystemResult {
     pub payload: Value,
     pub effective_target: String,
     pub trace_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct IdentityIlkOption {
+    pub ilk_id: String,
+    pub display_name: Option<String>,
+    pub handler_node: Option<String>,
+    pub registration_status: String,
+    pub ilk_type: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct IdentityIchOption {
+    pub ich_id: String,
+    pub channel_type: String,
+    pub address: String,
+    pub is_primary: bool,
+    pub ilks: Vec<IdentityIlkOption>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -243,6 +268,7 @@ struct TenantEntry {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct IlkEntry {
     ilk_id: [u8; 16],
     ilk_type: u8,
@@ -266,6 +292,7 @@ struct IlkEntry {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct IchEntry {
     ich_id: [u8; 16],
     ilk_id: [u8; 16],
@@ -676,6 +703,30 @@ pub fn resolve_ilk_from_hive_config(
     resolve_ilk_from_hive_id(&hive_id, channel_type, address)
 }
 
+/// List active ICH entries from identity SHM together with their candidate ILKs.
+pub fn list_ich_options_from_shm_name(
+    identity_shm_name: &str,
+) -> Result<Vec<IdentityIchOption>, IdentityShmError> {
+    let reader = open_identity_shm_reader(identity_shm_name)?;
+    reader.list_ich_options()
+}
+
+/// List active ICH entries from identity SHM for one hive.
+pub fn list_ich_options_from_hive_id(
+    hive_id: &str,
+) -> Result<Vec<IdentityIchOption>, IdentityShmError> {
+    let shm_name = identity_shm_name_for_hive(hive_id)?;
+    list_ich_options_from_shm_name(&shm_name)
+}
+
+/// List active ICH entries from identity SHM using `hive.yaml` from config dir.
+pub fn list_ich_options_from_hive_config(
+    config_dir: &Path,
+) -> Result<Vec<IdentityIchOption>, IdentityShmError> {
+    let hive_id = load_hive_id(config_dir)?;
+    list_ich_options_from_hive_id(&hive_id)
+}
+
 struct IdentityShmReader {
     mmap: Mmap,
     layout: IdentityRegionLayout,
@@ -696,6 +747,12 @@ impl IdentityShmReader {
             channel_type,
             address,
         )
+    }
+
+    fn list_ich_options(&self) -> Result<Vec<IdentityIchOption>, IdentityShmError> {
+        let header = header_ref::<IdentityHeader>(self.mmap.as_ref(), self.layout.header_offset)
+            .ok_or(IdentityShmError::InvalidShmHeader)?;
+        read_ich_options_from_region(header, self.mmap.as_ref(), &self.layout)
     }
 }
 
@@ -832,6 +889,41 @@ fn resolve_ich_mapping_from_region(
     }
 }
 
+fn read_ich_options_from_region(
+    header: &IdentityHeader,
+    mmap: &[u8],
+    layout: &IdentityRegionLayout,
+) -> Result<Vec<IdentityIchOption>, IdentityShmError> {
+    let start = StdInstant::now();
+    loop {
+        if start.elapsed() > StdDuration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            return Err(IdentityShmError::SeqLockTimeout);
+        }
+        let s1 = header.seq.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        atomic::fence(Ordering::Acquire);
+
+        let max_ilks = usize::min(header.ilk_count as usize, layout.limits.max_ilks as usize);
+        let max_ichs = usize::min(header.ich_count as usize, layout.limits.max_ichs() as usize);
+        let ilks = read_slice::<IlkEntry>(mmap, layout.ilk_offset, layout.limits.max_ilks as usize)
+            .ok_or(IdentityShmError::InvalidShmHeader)?;
+        let ichs =
+            read_slice::<IchEntry>(mmap, layout.ich_offset, layout.limits.max_ichs() as usize)
+                .ok_or(IdentityShmError::InvalidShmHeader)?;
+        let ilk_snapshot = ilks[..max_ilks].to_vec();
+        let ich_snapshot = ichs[..max_ichs].to_vec();
+
+        atomic::fence(Ordering::Acquire);
+        let s2 = header.seq.load(Ordering::Acquire);
+        if s1 == s2 {
+            return Ok(build_ich_options(&ilk_snapshot, &ich_snapshot));
+        }
+    }
+}
+
 fn is_region_valid(mmap: &[u8]) -> bool {
     let Some(magic_bytes) = mmap.get(0..4) else {
         return false;
@@ -882,6 +974,114 @@ fn resolve_ich_mapping_from_entries(
 fn fixed_str_matches(buf: &[u8], value: &str) -> bool {
     let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
     std::str::from_utf8(&buf[..end]).unwrap_or("") == value
+}
+
+fn fixed_str_to_string(buf: &[u8]) -> String {
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..end])
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn prefixed_uuid_from_bytes(prefix: &str, bytes: [u8; 16]) -> String {
+    format!("{prefix}:{}", Uuid::from_bytes(bytes))
+}
+
+fn ilk_type_from_shm(value: u8) -> String {
+    match value {
+        SHM_ILK_TYPE_HUMAN => "human",
+        SHM_ILK_TYPE_AGENT => "agent",
+        SHM_ILK_TYPE_SYSTEM => "system",
+        _ => "unknown",
+    }
+    .to_string()
+}
+
+fn registration_status_from_shm(value: u8) -> String {
+    match value {
+        SHM_REG_STATUS_TEMPORARY => "temporary",
+        SHM_REG_STATUS_PARTIAL => "partial",
+        SHM_REG_STATUS_COMPLETE => "complete",
+        _ => "unknown",
+    }
+    .to_string()
+}
+
+fn build_ich_options(ilks: &[IlkEntry], ichs: &[IchEntry]) -> Vec<IdentityIchOption> {
+    let mut ilk_map: std::collections::HashMap<[u8; 16], IdentityIlkOption> =
+        std::collections::HashMap::new();
+    for ilk in ilks {
+        if ilk.flags & FLAG_ACTIVE == 0 {
+            continue;
+        }
+        ilk_map.insert(
+            ilk.ilk_id,
+            IdentityIlkOption {
+                ilk_id: prefixed_uuid_from_bytes("ilk", ilk.ilk_id),
+                display_name: {
+                    let value = fixed_str_to_string(&ilk.display_name);
+                    (!value.is_empty()).then_some(value)
+                },
+                handler_node: {
+                    let value = fixed_str_to_string(&ilk.handler_node);
+                    (!value.is_empty()).then_some(value)
+                },
+                registration_status: registration_status_from_shm(ilk.registration_status),
+                ilk_type: ilk_type_from_shm(ilk.ilk_type),
+            },
+        );
+    }
+
+    let mut grouped: std::collections::BTreeMap<(String, String, String), IdentityIchOption> =
+        std::collections::BTreeMap::new();
+    for ich in ichs {
+        if ich.flags & FLAG_ACTIVE == 0 {
+            continue;
+        }
+        let ich_id = prefixed_uuid_from_bytes("ich", ich.ich_id);
+        let channel_type = fixed_str_to_string(&ich.channel_type);
+        let address = fixed_str_to_string(&ich.address);
+        if ich_id.is_empty() || channel_type.is_empty() || address.is_empty() {
+            continue;
+        }
+        let ilk = ilk_map.get(&ich.ilk_id).cloned();
+        let entry = grouped
+            .entry((ich_id.clone(), channel_type.clone(), address.clone()))
+            .or_insert_with(|| IdentityIchOption {
+                ich_id: ich_id.clone(),
+                channel_type: channel_type.clone(),
+                address: address.clone(),
+                is_primary: ich.is_primary != 0,
+                ilks: Vec::new(),
+            });
+        entry.is_primary = entry.is_primary || ich.is_primary != 0;
+        if let Some(ilk) = ilk {
+            if !entry
+                .ilks
+                .iter()
+                .any(|candidate| candidate.ilk_id == ilk.ilk_id)
+            {
+                entry.ilks.push(ilk);
+            }
+        }
+    }
+
+    let mut out: Vec<_> = grouped.into_values().collect();
+    for option in &mut out {
+        option.ilks.sort_by(|a, b| {
+            a.ilk_id
+                .cmp(&b.ilk_id)
+                .then_with(|| a.display_name.cmp(&b.display_name))
+        });
+    }
+    out.sort_by(|a, b| {
+        a.channel_type
+            .cmp(&b.channel_type)
+            .then_with(|| a.address.cmp(&b.address))
+            .then_with(|| a.ich_id.cmp(&b.ich_id))
+    });
+    out
 }
 
 fn compute_ich_hash(channel_type: &str, address: &str) -> u64 {
@@ -1043,5 +1243,102 @@ mod tests {
         };
         let err = parse_provision_payload(payload, "trace-1".to_string()).expect_err("must fail");
         assert!(matches!(err, IdentityError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn build_ich_options_groups_candidates_by_ich_entry() {
+        let ilk_a = IlkEntry {
+            ilk_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+                .unwrap()
+                .into_bytes(),
+            ilk_type: SHM_ILK_TYPE_HUMAN,
+            registration_status: SHM_REG_STATUS_COMPLETE,
+            flags: FLAG_ACTIVE,
+            tenant_id: [0; 16],
+            display_name: encode_fixed::<128>("Alice"),
+            handler_node: encode_fixed::<128>("AI.frontdesk@motherbee"),
+            ich_offset: 0,
+            ich_count: 0,
+            _pad0: [0; 2],
+            roles_offset: 0,
+            roles_len: 0,
+            _pad1: [0; 2],
+            capabilities_offset: 0,
+            capabilities_len: 0,
+            _pad2: [0; 2],
+            created_at: 0,
+            updated_at: 0,
+            _reserved: [0; 8],
+        };
+        let ilk_b = IlkEntry {
+            ilk_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001")
+                .unwrap()
+                .into_bytes(),
+            ilk_type: SHM_ILK_TYPE_AGENT,
+            registration_status: SHM_REG_STATUS_PARTIAL,
+            flags: FLAG_ACTIVE,
+            tenant_id: [0; 16],
+            display_name: encode_fixed::<128>("Support bot"),
+            handler_node: encode_fixed::<128>("AI.helper@motherbee"),
+            ich_offset: 0,
+            ich_count: 0,
+            _pad0: [0; 2],
+            roles_offset: 0,
+            roles_len: 0,
+            _pad1: [0; 2],
+            capabilities_offset: 0,
+            capabilities_len: 0,
+            _pad2: [0; 2],
+            created_at: 0,
+            updated_at: 0,
+            _reserved: [0; 8],
+        };
+        let ich_primary = IchEntry {
+            ich_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440010")
+                .unwrap()
+                .into_bytes(),
+            ilk_id: ilk_a.ilk_id,
+            channel_type: encode_fixed::<ICH_CHANNEL_TYPE_MAX_LEN>("whatsapp"),
+            address: encode_fixed::<ICH_ADDRESS_MAX_LEN>("5491112345678"),
+            flags: FLAG_ACTIVE,
+            is_primary: 1,
+            _pad0: [0; 5],
+            added_at: 0,
+            _reserved: [0; 16],
+        };
+        let ich_same = IchEntry {
+            ich_id: ich_primary.ich_id,
+            ilk_id: ilk_b.ilk_id,
+            channel_type: encode_fixed::<ICH_CHANNEL_TYPE_MAX_LEN>("whatsapp"),
+            address: encode_fixed::<ICH_ADDRESS_MAX_LEN>("5491112345678"),
+            flags: FLAG_ACTIVE,
+            is_primary: 0,
+            _pad0: [0; 5],
+            added_at: 0,
+            _reserved: [0; 16],
+        };
+
+        let options = build_ich_options(&[ilk_a, ilk_b], &[ich_primary, ich_same]);
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].channel_type, "whatsapp");
+        assert_eq!(options[0].address, "5491112345678");
+        assert!(options[0].is_primary);
+        assert_eq!(options[0].ilks.len(), 2);
+        assert_eq!(
+            options[0].ilks[0].ilk_id,
+            "ilk:550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(
+            options[0].ilks[1].ilk_id,
+            "ilk:550e8400-e29b-41d4-a716-446655440001"
+        );
+    }
+
+    fn encode_fixed<const N: usize>(value: &str) -> [u8; N] {
+        let mut out = [0u8; N];
+        let bytes = value.as_bytes();
+        let len = bytes.len().min(N);
+        out[..len].copy_from_slice(&bytes[..len]);
+        out
     }
 }
