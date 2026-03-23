@@ -5065,16 +5065,21 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     .composer {{
       border-top: 1px solid var(--line);
-      padding: 18px 20px 20px;
+      padding: 16px 20px 14px;
       background: #ffffff;
+    }}
+    .composer-box {{
+      position: relative;
+      display: grid;
+      gap: 8px;
     }}
     textarea {{
       width: 100%;
       min-height: 112px;
       resize: vertical;
       border: 1px solid var(--line);
-      border-radius: 18px;
-      padding: 16px;
+      border-radius: 22px;
+      padding: 18px 20px 68px;
       font: inherit;
       background: var(--panel);
       color: var(--text);
@@ -5084,17 +5089,19 @@ fn architect_index_html(state: &ArchitectState) -> String {
       border-color: #b8caef;
       box-shadow: 0 0 0 4px rgba(69, 117, 220, 0.12);
     }}
-    .composer-row {{
+    .composer-actions {{
+      position: absolute;
+      right: 14px;
+      bottom: 54px;
       display: flex;
-      justify-content: space-between;
-      gap: 14px;
       align-items: center;
-      margin-top: 12px;
+      gap: 10px;
     }}
     .hint {{
       color: var(--muted);
-      font-size: 0.79rem;
-      line-height: 1.45;
+      font-size: 0.77rem;
+      line-height: 1.35;
+      padding: 0 4px;
     }}
     button {{
       border: 0;
@@ -5105,6 +5112,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font: inherit;
       cursor: pointer;
       font-weight: 700;
+    }}
+    #send {{
+      min-width: 96px;
+      padding: 12px 20px;
+      box-shadow: 0 10px 24px rgba(23, 23, 23, 0.14);
     }}
     button:disabled {{
       opacity: 0.6;
@@ -5130,8 +5142,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         padding-bottom: 14px;
       }}
       .masthead,
-      .shell-title-row,
-      .composer-row {{
+      .shell-title-row {{
         flex-direction: column;
         align-items: stretch;
       }}
@@ -5150,6 +5161,17 @@ fn architect_index_html(state: &ArchitectState) -> String {
       .messages {{
         padding-left: 14px;
         padding-right: 14px;
+      }}
+      .composer {{
+        padding-left: 14px;
+        padding-right: 14px;
+      }}
+      .composer-actions {{
+        right: 12px;
+        bottom: 52px;
+      }}
+      #send {{
+        min-width: 84px;
       }}
       .msg {{
         max-width: 100%;
@@ -5226,10 +5248,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
         </div>
         <div id="messages" class="messages"></div>
         <div class="composer">
-          <textarea id="input" placeholder="Message or SCMD: curl -X GET /hives/{hive}/nodes"></textarea>
-          <div class="composer-row">
+          <div class="composer-box">
+            <textarea id="input" placeholder="Message or SCMD: curl -X GET /hives/{hive}/nodes"></textarea>
+            <div class="composer-actions">
+              <button id="send">Send</button>
+            </div>
             <div id="composer-hint" class="hint">Enter to send. Shift+Enter for newline. Sessions on the left are local and reload-safe.</div>
-            <button id="send">Send</button>
           </div>
         </div>
       </div>
