@@ -903,32 +903,37 @@ async fn handle_chat_message(
     let trimmed_message = message.trim();
     let response = if confirmation_requested(trimmed_message) {
         match take_pending_action(state, &resolved_session_id).await {
-            Some(pending) => match execute_admin_translation(state, pending.translation).await {
-                Ok(mut output) => {
-                    output["confirmed_command"] = Value::String(pending.preview_command);
-                    output["pending_created_at_ms"] = json!(pending.created_at_ms);
-                    output["confirmed_at_ms"] = json!(now_epoch_ms());
-                    let status = chat_status_from_command_output(&output);
-                    ChatResponse {
-                        status,
+            Some(pending) => {
+                let action_name = pending.translation.action.clone();
+                let preview_command = pending.preview_command.clone();
+                let pending_created_at_ms = pending.created_at_ms;
+                match execute_admin_translation(state, pending.translation).await {
+                    Ok(mut output) => {
+                        output["confirmed_command"] = Value::String(preview_command);
+                        output["pending_created_at_ms"] = json!(pending_created_at_ms);
+                        output["confirmed_at_ms"] = json!(now_epoch_ms());
+                        let status = chat_status_from_command_output(&output);
+                        ChatResponse {
+                            status,
+                            mode: "scmd".to_string(),
+                            output,
+                            session_id: Some(resolved_session_id.clone()),
+                            session_title: Some(session.title.clone()),
+                        }
+                    }
+                    Err(err) => ChatResponse {
+                        status: "error".to_string(),
                         mode: "scmd".to_string(),
-                        output,
+                        output: json!({
+                            "action": action_name,
+                            "confirmed_command": preview_command,
+                            "error": err.to_string()
+                        }),
                         session_id: Some(resolved_session_id.clone()),
                         session_title: Some(session.title.clone()),
-                    }
+                    },
                 }
-                Err(err) => ChatResponse {
-                    status: "error".to_string(),
-                    mode: "scmd".to_string(),
-                    output: json!({
-                        "action": pending.translation.action,
-                        "confirmed_command": pending.preview_command,
-                        "error": err.to_string()
-                    }),
-                    session_id: Some(resolved_session_id.clone()),
-                    session_title: Some(session.title.clone()),
-                },
-            },
+            }
             None => ChatResponse {
                 status: "error".to_string(),
                 mode: "chat".to_string(),
