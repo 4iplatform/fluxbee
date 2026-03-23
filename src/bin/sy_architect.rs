@@ -920,7 +920,11 @@ async fn handle_chat_message(
                 Err(err) => ChatResponse {
                     status: "error".to_string(),
                     mode: "scmd".to_string(),
-                    output: json!({ "error": err.to_string() }),
+                    output: json!({
+                        "action": pending.translation.action,
+                        "confirmed_command": pending.preview_command,
+                        "error": err.to_string()
+                    }),
                     session_id: Some(resolved_session_id.clone()),
                     session_title: Some(session.title.clone()),
                 },
@@ -1169,6 +1173,43 @@ fn chat_status_from_command_output(output: &Value) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or("ok")
         .to_string()
+}
+
+fn env_timeout_secs(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn architect_admin_action_timeout(action: &str) -> Duration {
+    match action {
+        "add_hive" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS").unwrap_or(180))
+        }
+        "update" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_UPDATE_TIMEOUT_SECS").unwrap_or(60))
+        }
+        "sync_hint" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
+        }
+        "run_node"
+        | "kill_node"
+        | "remove_node_instance"
+        | "remove_runtime_version"
+        | "set_node_config"
+        | "set_storage"
+        | "remove_hive"
+        | "opa_compile_apply"
+        | "opa_compile"
+        | "opa_apply"
+        | "opa_rollback" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30))
+        }
+        _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5)),
+    }
 }
 
 fn translate_scmd(
@@ -1608,11 +1649,13 @@ async fn execute_admin_translation_with_context(
 ) -> Result<Value, ArchitectError> {
     let params_json =
         serde_json::to_string(&translation.params).unwrap_or_else(|_| "{}".to_string());
+    let timeout = architect_admin_action_timeout(&translation.action);
     tracing::info!(
         purpose = %purpose,
         admin_target = %translation.admin_target,
         action = %translation.action,
         target_hive = %translation.target_hive,
+        timeout_ms = timeout.as_millis(),
         params = %params_json,
         "sy.architect dispatching admin action"
     );
@@ -1634,7 +1677,7 @@ async fn execute_admin_translation_with_context(
             target: Some(&translation.target_hive),
             params: translation.params,
             request_id: None,
-            timeout: Duration::from_secs(10),
+            timeout,
         },
     )
     .await
