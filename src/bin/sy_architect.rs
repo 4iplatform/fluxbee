@@ -5075,11 +5075,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     textarea {{
       width: 100%;
-      min-height: 112px;
+      min-height: 86px;
       resize: vertical;
       border: 1px solid var(--line);
       border-radius: 22px;
-      padding: 18px 20px 68px;
+      padding: 16px 128px 16px 20px;
       font: inherit;
       background: var(--panel);
       color: var(--text);
@@ -5092,7 +5092,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
     .composer-actions {{
       position: absolute;
       right: 14px;
-      bottom: 54px;
+      top: 50%;
+      bottom: auto;
+      transform: translateY(-50%);
       display: flex;
       align-items: center;
       gap: 10px;
@@ -5168,7 +5170,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       .composer-actions {{
         right: 12px;
-        bottom: 52px;
+        top: 50%;
+        bottom: auto;
+        transform: translateY(-50%);
       }}
       #send {{
         min-width: 84px;
