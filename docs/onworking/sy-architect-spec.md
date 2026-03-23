@@ -84,8 +84,8 @@ Current state in repo:
 - normal chat messages can go through a local `archi` agent when an OpenAI key is configured.
 - `SCMD:` remains a separate local/system path and does not invoke the AI provider.
 - the local agent can already use read-only socket-backed tools against `SY.admin` for live system state.
-- current limitation: chat history is persisted locally, but the AI turn still sends only the latest user message plus system prompt/tool loop context; prior session messages are not yet rehydrated into model input.
-- immediate memory for recent chat continuity should move to `fluxbee_ai_sdk` as a native concern; see `docs/immediate-conversation-memory-spec.md`.
+- immediate short-horizon memory is now rehydrated through `fluxbee_ai_sdk` using recent interactions, active operations, and conversation summary; see `docs/immediate-conversation-memory-spec.md`.
+- current limitation: chat mode/profile exists in the backend model, but the UI still launches only the normal operator chat flow by default.
 - streaming, multi-agent routing, and prompt assets by role are still pending.
 
 ---
@@ -206,6 +206,25 @@ Architect does not mint permanent ILKs by itself. It either:
 - or temporarily operates through an impersonated/effective ILK context for testing/simulation
 
 This keeps the process model simple while allowing each chat to behave like a distinct conversational actor.
+
+### 3.6 Chat Modes
+
+`SY.architect` should support two explicit conversation modes:
+
+- `operator`
+  - default mode
+  - architect acts as the system operator/control-plane assistant
+  - no external channel impersonation is assumed
+- `impersonation`
+  - explicit debug/simulation mode
+  - the chat may run with an effective ILK and/or impersonation target
+  - used to test flows before connecting real external IO such as WhatsApp/Instagram/other channels
+
+Important:
+
+- normal chats should default to `operator`
+- impersonation chats should be created intentionally, not inferred silently from normal usage
+- the first implementation may keep the UI launch simple, but the session/profile model must already distinguish these modes cleanly
 
 ---
 
@@ -538,6 +557,15 @@ Sessions:
   last_activity_at: timestamp
   agent: string (architect|operator|tester)
 
+SessionProfiles:
+  session_id: uuid
+  chat_mode: string (`operator`|`impersonation`)
+  effective_ilk: string?
+  impersonation_target: string?
+  thread_id: string?
+  source_channel_kind: string?
+  debug_enabled: bool
+
 Messages:
   message_id: uuid
   session_id: uuid
@@ -554,6 +582,7 @@ Messages:
 - Embedded, no external process.
 - Local to the architect node.
 - Reconstructible (chat history is operational, not business-critical).
+- Session mode/context can evolve without forcing a migration of the base `sessions` table.
 
 ### 9.3 Location
 
@@ -667,6 +696,7 @@ Current repo state should be treated as a **partial shell**, not as a blank impl
   - `POST /api/chat`
   - local `SCMD:` parser translated to `ADMIN_COMMAND`
   - persisted chat sessions/messages in local LanceDB
+  - persisted per-session chat profile/context (`operator` vs `impersonation`, effective ILK/thread context)
 - current friction:
   - header status chips currently poll `/api/status` every 5 seconds from the browser
   - each refresh opens an ephemeral router/admin client path just to render `Hives` / `Nodes` / `Updated`
@@ -676,7 +706,7 @@ Current repo state should be treated as a **partial shell**, not as a blank impl
   - WebSocket chat/streaming
   - real AI provider integration
   - settings panel / `set_node_config`
-  - IO impersonation
+  - explicit UI flow for launching impersonation/debug chats
   - uploads / blobs
 
 Because of that, the backlog should prioritize turning the current shell into a useful control-plane tool **before** investing in AI or UI polish.

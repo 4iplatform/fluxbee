@@ -43,6 +43,9 @@ const ROUTER_RECONNECT_DELAY_SECS: u64 = 2;
 const CHAT_SESSIONS_TABLE: &str = "sessions";
 const CHAT_MESSAGES_TABLE: &str = "messages";
 const CHAT_OPERATIONS_TABLE: &str = "operations";
+const CHAT_SESSION_PROFILES_TABLE: &str = "session_profiles";
+const CHAT_MODE_OPERATOR: &str = "operator";
+const CHAT_MODE_IMPERSONATION: &str = "impersonation";
 const ARCHI_SYSTEM_PROMPT: &str = r#"You are archi, the Fluxbee system architect.
 
 Operate as a concise technical assistant for the Fluxbee control plane.
@@ -175,6 +178,12 @@ struct ChatResponse {
 #[derive(Debug, Deserialize)]
 struct CreateSessionRequest {
     title: Option<String>,
+    chat_mode: Option<String>,
+    effective_ilk: Option<String>,
+    impersonation_target: Option<String>,
+    thread_id: Option<String>,
+    source_channel_kind: Option<String>,
+    debug_enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -186,6 +195,12 @@ struct SessionSummary {
     last_activity_at_ms: u64,
     message_count: u64,
     last_message_preview: Option<String>,
+    chat_mode: String,
+    effective_ilk: Option<String>,
+    impersonation_target: Option<String>,
+    thread_id: Option<String>,
+    source_channel_kind: Option<String>,
+    debug_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -226,6 +241,23 @@ struct ChatSessionRecord {
     last_activity_at_ms: u64,
     message_count: u64,
     last_message_preview: String,
+    chat_mode: String,
+    effective_ilk: String,
+    impersonation_target: String,
+    thread_id: String,
+    source_channel_kind: String,
+    debug_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ChatSessionProfileRecord {
+    session_id: String,
+    chat_mode: String,
+    effective_ilk: String,
+    impersonation_target: String,
+    thread_id: String,
+    source_channel_kind: String,
+    debug_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -902,7 +934,15 @@ async fn dynamic_handler(
                 }
             };
             let req = if body.is_empty() {
-                CreateSessionRequest { title: None }
+                CreateSessionRequest {
+                    title: None,
+                    chat_mode: None,
+                    effective_ilk: None,
+                    impersonation_target: None,
+                    thread_id: None,
+                    source_channel_kind: None,
+                    debug_enabled: None,
+                }
             } else {
                 match serde_json::from_slice::<CreateSessionRequest>(&body) {
                     Ok(req) => req,
@@ -915,7 +955,7 @@ async fn dynamic_handler(
                     }
                 }
             };
-            match create_chat_session(&state, req.title).await {
+            match create_chat_session(&state, req).await {
                 Ok(detail) => Json(detail).into_response(),
                 Err(err) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1279,8 +1319,8 @@ async fn build_session_immediate_memory(
     let summary = build_conversation_summary(session, &recent_messages, &operations);
 
     Ok(ImmediateConversationMemory {
-        thread_id: None,
-        scope_id: None,
+        thread_id: none_if_empty(&session.thread_id),
+        scope_id: session_scope_id(session),
         summary: Some(summary),
         recent_interactions: recent_messages_to_immediate(recent_messages),
         active_operations: operations_to_immediate(&session.session_id, operations),
@@ -1314,6 +1354,12 @@ fn build_conversation_summary(
         });
 
     let mut decisions = Vec::new();
+    if session.chat_mode == CHAT_MODE_IMPERSONATION {
+        decisions.push(
+            "This conversation runs in impersonation/debug mode and may simulate another ILK or node context."
+                .to_string(),
+        );
+    }
     if operations
         .iter()
         .any(|record| record.status == "pending_confirm")
@@ -1333,22 +1379,35 @@ fn build_conversation_summary(
         );
     }
 
-    let confirmed_facts = operations
-        .iter()
-        .filter(|record| {
-            matches!(
-                record.status.as_str(),
-                "succeeded" | "succeeded_after_timeout"
-            )
-        })
-        .take(3)
-        .map(|record| {
-            format!(
-                "Recent operation succeeded: {}",
-                operation_focus_summary(record)
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut confirmed_facts = Vec::new();
+    if let Some(effective_ilk) = none_if_empty(&session.effective_ilk) {
+        confirmed_facts.push(format!("Effective ILK context: {effective_ilk}"));
+    }
+    if let Some(impersonation_target) = none_if_empty(&session.impersonation_target) {
+        confirmed_facts.push(format!("Impersonation target: {impersonation_target}"));
+    }
+    if let Some(thread_id) = none_if_empty(&session.thread_id) {
+        confirmed_facts.push(format!("Thread context: {thread_id}"));
+    }
+
+    confirmed_facts.extend(
+        operations
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.status.as_str(),
+                    "succeeded" | "succeeded_after_timeout"
+                )
+            })
+            .take(3)
+            .map(|record| {
+                format!(
+                    "Recent operation succeeded: {}",
+                    operation_focus_summary(record)
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
 
     let open_questions = operations
         .iter()
@@ -2673,6 +2732,7 @@ fn component_status_rank(status: Option<&str>) -> u8 {
 async fn ensure_chat_storage(state: &ArchitectState) -> Result<(), ArchitectError> {
     let db = open_architect_db(state).await?;
     let _ = ensure_sessions_table(&db).await?;
+    let _ = ensure_session_profiles_table(&db).await?;
     let _ = ensure_messages_table(&db).await?;
     let _ = ensure_operations_table(&db).await?;
     Ok(())
@@ -2724,6 +2784,17 @@ async fn ensure_operations_table(db: &Connection) -> Result<lancedb::Table, Arch
     }
 }
 
+async fn ensure_session_profiles_table(db: &Connection) -> Result<lancedb::Table, ArchitectError> {
+    match db.open_table(CHAT_SESSION_PROFILES_TABLE).execute().await {
+        Ok(table) => Ok(table),
+        Err(_) => db
+            .create_empty_table(CHAT_SESSION_PROFILES_TABLE, chat_session_profiles_schema())
+            .execute()
+            .await
+            .map_err(|err| -> ArchitectError { Box::new(err) }),
+    }
+}
+
 fn chat_sessions_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("session_id", DataType::Utf8, false),
@@ -2733,6 +2804,18 @@ fn chat_sessions_schema() -> Arc<Schema> {
         Field::new("last_activity_at_ms", DataType::UInt64, false),
         Field::new("message_count", DataType::UInt64, false),
         Field::new("last_message_preview", DataType::Utf8, false),
+    ]))
+}
+
+fn chat_session_profiles_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("session_id", DataType::Utf8, false),
+        Field::new("chat_mode", DataType::Utf8, false),
+        Field::new("effective_ilk", DataType::Utf8, false),
+        Field::new("impersonation_target", DataType::Utf8, false),
+        Field::new("thread_id", DataType::Utf8, false),
+        Field::new("source_channel_kind", DataType::Utf8, false),
+        Field::new("debug_enabled", DataType::Boolean, false),
     ]))
 }
 
@@ -2774,8 +2857,9 @@ fn chat_operations_schema() -> Arc<Schema> {
 async fn list_chat_sessions(state: &ArchitectState) -> Result<Vec<SessionSummary>, ArchitectError> {
     let _guard = state.chat_lock.lock().await;
     let db = open_architect_db(state).await?;
-    let table = ensure_sessions_table(&db).await?;
-    let batches = table
+    let sessions_table = ensure_sessions_table(&db).await?;
+    let profiles_table = ensure_session_profiles_table(&db).await?;
+    let batches = sessions_table
         .query()
         .select(Select::columns(&[
             "session_id",
@@ -2792,7 +2876,10 @@ async fn list_chat_sessions(state: &ArchitectState) -> Result<Vec<SessionSummary
         .try_collect::<Vec<_>>()
         .await
         .map_err(|err| -> ArchitectError { Box::new(err) })?;
-    let mut sessions = parse_session_batches(&batches)?;
+    let mut sessions = parse_session_batches(
+        &batches,
+        &load_session_profile_map(&profiles_table, None).await?,
+    )?;
     sessions.sort_by(|a, b| {
         b.last_activity_at_ms
             .cmp(&a.last_activity_at_ms)
@@ -2803,13 +2890,23 @@ async fn list_chat_sessions(state: &ArchitectState) -> Result<Vec<SessionSummary
 
 async fn create_chat_session(
     state: &ArchitectState,
-    title: Option<String>,
+    req: CreateSessionRequest,
 ) -> Result<SessionDetailResponse, ArchitectError> {
     let _guard = state.chat_lock.lock().await;
     let db = open_architect_db(state).await?;
     let sessions = ensure_sessions_table(&db).await?;
+    let profiles = ensure_session_profiles_table(&db).await?;
     let _messages = ensure_messages_table(&db).await?;
     let now = now_epoch_ms();
+    let CreateSessionRequest {
+        title,
+        chat_mode,
+        effective_ilk,
+        impersonation_target,
+        thread_id,
+        source_channel_kind,
+        debug_enabled,
+    } = req;
     let record = ChatSessionRecord {
         session_id: Uuid::new_v4().to_string(),
         title: sanitize_session_title(title.as_deref()),
@@ -2818,8 +2915,18 @@ async fn create_chat_session(
         last_activity_at_ms: now,
         message_count: 0,
         last_message_preview: String::new(),
+        ..build_session_profile(CreateSessionRequest {
+            title: None,
+            chat_mode,
+            effective_ilk,
+            impersonation_target,
+            thread_id,
+            source_channel_kind,
+            debug_enabled,
+        })?
     };
     upsert_session_record(&sessions, &record).await?;
+    upsert_session_profile_record(&profiles, &session_profile_from_record(&record)).await?;
     Ok(SessionDetailResponse {
         session: session_record_to_summary(&record),
         messages: Vec::new(),
@@ -2833,8 +2940,9 @@ async fn load_chat_session(
     let _guard = state.chat_lock.lock().await;
     let db = open_architect_db(state).await?;
     let sessions = ensure_sessions_table(&db).await?;
+    let profiles = ensure_session_profiles_table(&db).await?;
     let messages = ensure_messages_table(&db).await?;
-    let Some(session) = load_session_record(&sessions, session_id).await? else {
+    let Some(session) = load_session_record(&sessions, &profiles, session_id).await? else {
         return Ok(None);
     };
     let persisted = load_session_messages(&messages, session_id).await?;
@@ -2852,12 +2960,16 @@ async fn delete_chat_session(
     let _guard = state.chat_lock.lock().await;
     let db = open_architect_db(state).await?;
     let sessions = ensure_sessions_table(&db).await?;
+    let profiles = ensure_session_profiles_table(&db).await?;
     let messages = ensure_messages_table(&db).await?;
     let operations = ensure_operations_table(&db).await?;
     let filter = session_filter(session_id);
 
     let deleted_messages = count_session_messages(&messages, session_id).await?;
-    let deleted_sessions = if load_session_record(&sessions, session_id).await?.is_some() {
+    let deleted_sessions = if load_session_record(&sessions, &profiles, session_id)
+        .await?
+        .is_some()
+    {
         1
     } else {
         0
@@ -2879,6 +2991,10 @@ async fn delete_chat_session(
         .delete(&filter)
         .await
         .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    profiles
+        .delete(&filter)
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
 
     Ok(SessionDeleteResponse {
         status: "ok".to_string(),
@@ -2894,6 +3010,7 @@ async fn clear_chat_sessions(
     let _guard = state.chat_lock.lock().await;
     let db = open_architect_db(state).await?;
     let sessions = ensure_sessions_table(&db).await?;
+    let profiles = ensure_session_profiles_table(&db).await?;
     let messages = ensure_messages_table(&db).await?;
     let operations = ensure_operations_table(&db).await?;
 
@@ -2916,6 +3033,10 @@ async fn clear_chat_sessions(
         .delete("operation_id IS NOT NULL")
         .await
         .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    profiles
+        .delete("session_id IS NOT NULL")
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
 
     Ok(SessionDeleteResponse {
         status: "ok".to_string(),
@@ -2932,10 +3053,11 @@ async fn resolve_chat_session(
     let _guard = state.chat_lock.lock().await;
     let db = open_architect_db(state).await?;
     let sessions = ensure_sessions_table(&db).await?;
+    let profiles = ensure_session_profiles_table(&db).await?;
     let _messages = ensure_messages_table(&db).await?;
 
     if let Some(session_id) = session_id {
-        if let Some(session) = load_session_record(&sessions, &session_id).await? {
+        if let Some(session) = load_session_record(&sessions, &profiles, &session_id).await? {
             return Ok((session_id, session));
         }
         return Err(format!("session not found: {session_id}").into());
@@ -2950,8 +3072,10 @@ async fn resolve_chat_session(
         last_activity_at_ms: now,
         message_count: 0,
         last_message_preview: String::new(),
+        ..default_session_profile()
     };
     upsert_session_record(&sessions, &record).await?;
+    upsert_session_profile_record(&profiles, &session_profile_from_record(&record)).await?;
     Ok((record.session_id.clone(), record))
 }
 
@@ -3020,11 +3144,12 @@ async fn persist_chat_exchange(
 }
 
 async fn load_session_record(
-    table: &lancedb::Table,
+    session_table: &lancedb::Table,
+    profiles_table: &lancedb::Table,
     session_id: &str,
 ) -> Result<Option<ChatSessionRecord>, ArchitectError> {
     let filter = format!("session_id = '{}'", session_id.replace('\'', "''"));
-    let batches = table
+    let batches = session_table
         .query()
         .only_if(filter)
         .select(Select::columns(&[
@@ -3042,7 +3167,8 @@ async fn load_session_record(
         .try_collect::<Vec<_>>()
         .await
         .map_err(|err| -> ArchitectError { Box::new(err) })?;
-    let mut rows = parse_session_records(&batches)?;
+    let profile_map = load_session_profile_map(profiles_table, Some(session_id)).await?;
+    let mut rows = parse_session_records(&batches, &profile_map)?;
     Ok(rows.pop())
 }
 
@@ -3220,6 +3346,22 @@ async fn upsert_session_record(
     Ok(())
 }
 
+async fn upsert_session_profile_record(
+    table: &lancedb::Table,
+    record: &ChatSessionProfileRecord,
+) -> Result<(), ArchitectError> {
+    let batch = session_profile_batch_from_rows(std::slice::from_ref(record))?;
+    let mut merge = table.merge_insert(&["session_id"]);
+    merge
+        .when_matched_update_all(None)
+        .when_not_matched_insert_all();
+    merge
+        .execute(single_batch_reader(batch))
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    Ok(())
+}
+
 async fn append_message_record(
     table: &lancedb::Table,
     record: &ChatMessageRecord,
@@ -3340,6 +3482,51 @@ fn message_batch_from_rows(rows: &[ChatMessageRecord]) -> Result<RecordBatch, Ar
     Ok(batch)
 }
 
+fn session_profile_batch_from_rows(
+    rows: &[ChatSessionProfileRecord],
+) -> Result<RecordBatch, ArchitectError> {
+    let schema = chat_session_profiles_schema();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.session_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.chat_mode.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.effective_ilk.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.impersonation_target.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.thread_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.source_channel_kind.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(arrow_array::BooleanArray::from(
+                rows.iter().map(|row| row.debug_enabled).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    Ok(batch)
+}
+
 fn operation_batch_from_rows(rows: &[ChatOperationRecord]) -> Result<RecordBatch, ArchitectError> {
     let schema = chat_operations_schema();
     let batch = RecordBatch::try_new(
@@ -3431,8 +3618,11 @@ fn operation_batch_from_rows(rows: &[ChatOperationRecord]) -> Result<RecordBatch
     Ok(batch)
 }
 
-fn parse_session_batches(batches: &[RecordBatch]) -> Result<Vec<SessionSummary>, ArchitectError> {
-    Ok(parse_session_records(batches)?
+fn parse_session_batches(
+    batches: &[RecordBatch],
+    profiles: &HashMap<String, ChatSessionProfileRecord>,
+) -> Result<Vec<SessionSummary>, ArchitectError> {
+    Ok(parse_session_records(batches, profiles)?
         .into_iter()
         .map(|record| session_record_to_summary(&record))
         .collect())
@@ -3440,6 +3630,7 @@ fn parse_session_batches(batches: &[RecordBatch]) -> Result<Vec<SessionSummary>,
 
 fn parse_session_records(
     batches: &[RecordBatch],
+    profiles: &HashMap<String, ChatSessionProfileRecord>,
 ) -> Result<Vec<ChatSessionRecord>, ArchitectError> {
     let mut out = Vec::new();
     for batch in batches {
@@ -3451,14 +3642,24 @@ fn parse_session_records(
         let counts = u64_column(batch, "message_count")?;
         let previews = string_column(batch, "last_message_preview")?;
         for idx in 0..batch.num_rows() {
+            let session_id = session_ids.value(idx).to_string();
+            let profile = profiles.get(&session_id).cloned().unwrap_or_else(|| {
+                session_profile_record(&default_session_profile_with_id(&session_id))
+            });
             out.push(ChatSessionRecord {
-                session_id: session_ids.value(idx).to_string(),
+                session_id,
                 title: session_title_or_default(titles.value(idx)),
                 agent: agents.value(idx).to_string(),
                 created_at_ms: created.value(idx),
                 last_activity_at_ms: updated.value(idx),
                 message_count: counts.value(idx),
                 last_message_preview: previews.value(idx).to_string(),
+                chat_mode: profile.chat_mode,
+                effective_ilk: profile.effective_ilk,
+                impersonation_target: profile.impersonation_target,
+                thread_id: profile.thread_id,
+                source_channel_kind: profile.source_channel_kind,
+                debug_enabled: profile.debug_enabled,
             });
         }
     }
@@ -3568,6 +3769,21 @@ fn u64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array,
         })
 }
 
+fn bool_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a arrow_array::BooleanArray, ArchitectError> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| format!("missing column: {name}").into())
+        .and_then(|column| {
+            column
+                .as_any()
+                .downcast_ref::<arrow_array::BooleanArray>()
+                .ok_or_else(|| format!("invalid bool column: {name}").into())
+        })
+}
+
 fn session_record_to_summary(record: &ChatSessionRecord) -> SessionSummary {
     SessionSummary {
         session_id: record.session_id.clone(),
@@ -3581,7 +3797,195 @@ fn session_record_to_summary(record: &ChatSessionRecord) -> SessionSummary {
         } else {
             Some(record.last_message_preview.clone())
         },
+        chat_mode: record.chat_mode.clone(),
+        effective_ilk: none_if_empty(&record.effective_ilk),
+        impersonation_target: none_if_empty(&record.impersonation_target),
+        thread_id: none_if_empty(&record.thread_id),
+        source_channel_kind: none_if_empty(&record.source_channel_kind),
+        debug_enabled: record.debug_enabled,
     }
+}
+
+fn build_session_profile(req: CreateSessionRequest) -> Result<ChatSessionRecord, ArchitectError> {
+    let chat_mode = normalize_chat_mode(req.chat_mode.as_deref())?;
+    let effective_ilk = sanitize_optional_identity(req.effective_ilk);
+    let impersonation_target = sanitize_optional_identity(req.impersonation_target);
+    let thread_id = sanitize_optional_value(req.thread_id);
+    let source_channel_kind = sanitize_optional_value(req.source_channel_kind);
+    if chat_mode == CHAT_MODE_IMPERSONATION
+        && effective_ilk.is_empty()
+        && impersonation_target.is_empty()
+    {
+        return Err(
+            "impersonation chat mode requires at least effective_ilk or impersonation_target"
+                .to_string()
+                .into(),
+        );
+    }
+    let debug_enabled = req
+        .debug_enabled
+        .unwrap_or(chat_mode == CHAT_MODE_IMPERSONATION);
+    Ok(ChatSessionRecord {
+        session_id: String::new(),
+        title: String::new(),
+        agent: String::new(),
+        created_at_ms: 0,
+        last_activity_at_ms: 0,
+        message_count: 0,
+        last_message_preview: String::new(),
+        chat_mode,
+        effective_ilk,
+        impersonation_target,
+        thread_id,
+        source_channel_kind,
+        debug_enabled,
+    })
+}
+
+fn default_session_profile() -> ChatSessionRecord {
+    ChatSessionRecord {
+        session_id: String::new(),
+        title: String::new(),
+        agent: String::new(),
+        created_at_ms: 0,
+        last_activity_at_ms: 0,
+        message_count: 0,
+        last_message_preview: String::new(),
+        chat_mode: CHAT_MODE_OPERATOR.to_string(),
+        effective_ilk: String::new(),
+        impersonation_target: String::new(),
+        thread_id: String::new(),
+        source_channel_kind: String::new(),
+        debug_enabled: false,
+    }
+}
+
+fn default_session_profile_with_id(session_id: &str) -> ChatSessionRecord {
+    let mut record = default_session_profile();
+    record.session_id = session_id.to_string();
+    record
+}
+
+fn session_profile_from_record(record: &ChatSessionRecord) -> ChatSessionProfileRecord {
+    ChatSessionProfileRecord {
+        session_id: record.session_id.clone(),
+        chat_mode: record.chat_mode.clone(),
+        effective_ilk: record.effective_ilk.clone(),
+        impersonation_target: record.impersonation_target.clone(),
+        thread_id: record.thread_id.clone(),
+        source_channel_kind: record.source_channel_kind.clone(),
+        debug_enabled: record.debug_enabled,
+    }
+}
+
+fn session_profile_record(record: &ChatSessionRecord) -> ChatSessionProfileRecord {
+    session_profile_from_record(record)
+}
+
+fn normalize_chat_mode(value: Option<&str>) -> Result<String, ArchitectError> {
+    let mode = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(CHAT_MODE_OPERATOR);
+    match mode {
+        CHAT_MODE_OPERATOR | CHAT_MODE_IMPERSONATION => Ok(mode.to_string()),
+        other => Err(format!(
+            "invalid chat_mode '{other}'. expected '{CHAT_MODE_OPERATOR}' or '{CHAT_MODE_IMPERSONATION}'"
+        )
+        .into()),
+    }
+}
+
+fn sanitize_optional_identity(value: Option<String>) -> String {
+    sanitize_optional_value(value)
+}
+
+fn sanitize_optional_value(value: Option<String>) -> String {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| preview_text(value, 120))
+        .unwrap_or_default()
+}
+
+fn none_if_empty(value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn session_scope_id(session: &ChatSessionRecord) -> Option<String> {
+    if let Some(effective_ilk) = none_if_empty(&session.effective_ilk) {
+        return Some(effective_ilk);
+    }
+    if let Some(impersonation_target) = none_if_empty(&session.impersonation_target) {
+        return Some(impersonation_target);
+    }
+    if let Some(thread_id) = none_if_empty(&session.thread_id) {
+        return Some(thread_id);
+    }
+    None
+}
+
+async fn load_session_profile_map(
+    table: &lancedb::Table,
+    session_id: Option<&str>,
+) -> Result<HashMap<String, ChatSessionProfileRecord>, ArchitectError> {
+    let mut query = table.query();
+    if let Some(session_id) = session_id {
+        query = query.only_if(session_filter(session_id));
+    }
+    let batches = query
+        .select(Select::columns(&[
+            "session_id",
+            "chat_mode",
+            "effective_ilk",
+            "impersonation_target",
+            "thread_id",
+            "source_channel_kind",
+            "debug_enabled",
+        ]))
+        .execute()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    let rows = parse_session_profile_records(&batches)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.session_id.clone(), row))
+        .collect())
+}
+
+fn parse_session_profile_records(
+    batches: &[RecordBatch],
+) -> Result<Vec<ChatSessionProfileRecord>, ArchitectError> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let session_ids = string_column(batch, "session_id")?;
+        let chat_modes = string_column(batch, "chat_mode")?;
+        let effective_ilks = string_column(batch, "effective_ilk")?;
+        let impersonation_targets = string_column(batch, "impersonation_target")?;
+        let thread_ids = string_column(batch, "thread_id")?;
+        let source_channel_kinds = string_column(batch, "source_channel_kind")?;
+        let debug_enabled = bool_column(batch, "debug_enabled")?;
+        for idx in 0..batch.num_rows() {
+            out.push(ChatSessionProfileRecord {
+                session_id: session_ids.value(idx).to_string(),
+                chat_mode: chat_modes.value(idx).to_string(),
+                effective_ilk: effective_ilks.value(idx).to_string(),
+                impersonation_target: impersonation_targets.value(idx).to_string(),
+                thread_id: thread_ids.value(idx).to_string(),
+                source_channel_kind: source_channel_kinds.value(idx).to_string(),
+                debug_enabled: debug_enabled.value(idx),
+            });
+        }
+    }
+    Ok(out)
 }
 
 fn message_record_to_persisted(record: ChatMessageRecord) -> PersistedChatMessage {
@@ -3938,10 +4342,49 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     .new-chat {{
       width: 100%;
-      margin-bottom: 14px;
       background: var(--logo-dark);
       color: #ffffff;
       justify-content: center;
+    }}
+    .new-chat-row {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 10px;
+      margin-bottom: 14px;
+    }}
+    .new-chat.operator {{
+      background: var(--logo-dark);
+    }}
+    .new-chat.debug {{
+      background: #9a6b00;
+      color: #fff9eb;
+    }}
+    .history-mode {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 8px;
+      flex-wrap: wrap;
+    }}
+    .mode-badge {{
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 0.7rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      background: #eef2f8;
+      color: #5c6c84;
+    }}
+    .mode-badge.operator {{
+      background: #e8f1ff;
+      color: #1f5fbf;
+    }}
+    .mode-badge.impersonation {{
+      background: #fff1cf;
+      color: #8a5a00;
     }}
     .history-search {{
       width: 100%;
@@ -4381,15 +4824,18 @@ fn architect_index_html(state: &ArchitectState) -> String {
           <div class="sidebar-title">Chat History</div>
           <button id="clear-history" class="mini-pill action" type="button">Clear</button>
         </div>
-        <button id="new-chat" class="new-chat">New chat</button>
+        <div class="new-chat-row">
+          <button id="new-chat-operator" class="new-chat operator">Operator</button>
+          <button id="new-chat-impersonation" class="new-chat debug">Impersonate</button>
+        </div>
         <input id="history-search" class="history-search" type="search" placeholder="Search chats" autocomplete="off" />
         <div id="history-list" class="history-list"></div>
         <div class="history-note">
-          Chat sessions stay persisted locally on motherbee and reload automatically.
+          Chat sessions stay persisted locally on motherbee and reload automatically. Use impersonation only for debug/simulation flows.
         </div>
         <div class="meta-grid">
           <div><strong>Node</strong>: {node}</div>
-          <div><strong>Modes</strong>: chat, SCMD</div>
+          <div><strong>Modes</strong>: operator, impersonation, SCMD</div>
         </div>
       </aside>
       <div class="shell">
@@ -4422,7 +4868,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const messages = document.getElementById("messages");
     const input = document.getElementById("input");
     const send = document.getElementById("send");
-    const newChat = document.getElementById("new-chat");
+    const newChatOperator = document.getElementById("new-chat-operator");
+    const newChatImpersonation = document.getElementById("new-chat-impersonation");
     const clearHistory = document.getElementById("clear-history");
     const historySearch = document.getElementById("history-search");
     const historyList = document.getElementById("history-list");
@@ -4596,12 +5043,20 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const count = Number(session.message_count || 0);
       return count + " messages · updated " + formatTimestamp(session.last_activity_at_ms);
     }}
+    function sessionModeLabel(session) {{
+      if (!session || !session.chat_mode) return "operator";
+      return session.chat_mode === "impersonation" ? "impersonation" : "operator";
+    }}
     function historyMatchesSearch(session, query) {{
       if (!query) return true;
       const haystack = [
         session && session.title ? session.title : "",
         session && session.last_message_preview ? session.last_message_preview : "",
-        session && session.agent ? session.agent : ""
+        session && session.agent ? session.agent : "",
+        session && session.chat_mode ? session.chat_mode : "",
+        session && session.effective_ilk ? session.effective_ilk : "",
+        session && session.impersonation_target ? session.impersonation_target : "",
+        session && session.thread_id ? session.thread_id : ""
       ].join(" ").toLowerCase();
       return haystack.includes(query);
     }}
@@ -4649,6 +5104,25 @@ fn architect_index_html(state: &ArchitectState) -> String {
         head.appendChild(deleteButton);
         card.appendChild(head);
         card.appendChild(meta);
+        const modeRow = document.createElement("div");
+        modeRow.className = "history-mode";
+        const modeBadge = document.createElement("span");
+        modeBadge.className = "mode-badge " + sessionModeLabel(session);
+        modeBadge.textContent = sessionModeLabel(session);
+        modeRow.appendChild(modeBadge);
+        if (session.effective_ilk) {{
+          const ilkBadge = document.createElement("span");
+          ilkBadge.className = "mode-badge";
+          ilkBadge.textContent = session.effective_ilk;
+          modeRow.appendChild(ilkBadge);
+        }}
+        if (session.thread_id) {{
+          const threadBadge = document.createElement("span");
+          threadBadge.className = "mode-badge";
+          threadBadge.textContent = session.thread_id;
+          modeRow.appendChild(threadBadge);
+        }}
+        card.appendChild(modeRow);
         if (session.last_message_preview) {{
           const preview = document.createElement("div");
           preview.className = "history-preview";
@@ -4686,7 +5160,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       await refreshSessionList(currentSessionId === sessionId ? null : currentSessionId);
       if (!sessionsCache.length) {{
-        await createSession(false);
+        await createSession({{}}, false);
         return;
       }}
       if (currentSessionId === sessionId) {{
@@ -4705,14 +5179,18 @@ fn architect_index_html(state: &ArchitectState) -> String {
       currentSessionId = null;
       localStorage.removeItem(currentSessionStorageKey);
       await refreshSessionList(null);
-      await createSession(false);
+      await createSession({{}}, false);
     }}
-    async function createSession(showWelcome = false) {{
+    async function createSession(payload = {{}}, showWelcome = false) {{
       const res = await fetch(sessionsUrl, {{
         method: "POST",
         headers: {{ "Content-Type": "application/json" }},
-        body: JSON.stringify({{}})
+        body: JSON.stringify(payload)
       }});
+      if (!res.ok) {{
+        const error = await res.json().catch(() => ({{ error: "session create failed" }}));
+        throw new Error(error && error.error ? error.error : "session create failed");
+      }}
       const detail = await res.json();
       await refreshSessionList(detail.session && detail.session.session_id ? detail.session.session_id : null);
       await loadSession(detail.session.session_id, detail, showWelcome);
@@ -4722,9 +5200,31 @@ fn architect_index_html(state: &ArchitectState) -> String {
         composerHint.textContent = "Enter to send. Shift+Enter for newline. Sessions on the left are local and reload-safe.";
         return;
       }}
-      composerHint.textContent = session.message_count
+      const base = session.message_count
         ? "Enter to send. Shift+Enter for newline. This chat has " + session.message_count + " persisted messages."
         : "Enter to send. Shift+Enter for newline. This chat is empty and ready.";
+      composerHint.textContent = base + (sessionModeLabel(session) === "impersonation"
+        ? " Running in impersonation/debug mode."
+        : " Running in operator mode.");
+    }}
+    function promptImpersonationConfig() {{
+      const title = (window.prompt("Debug chat title (optional):", "Impersonation chat") || "").trim();
+      const effectiveIlk = (window.prompt("Effective ILK (optional):", "") || "").trim();
+      const impersonationTarget = (window.prompt("Impersonation target node/ILK (optional):", "") || "").trim();
+      if (!effectiveIlk && !impersonationTarget) {{
+        throw new Error("Impersonation mode requires effective ILK or impersonation target.");
+      }}
+      const threadId = (window.prompt("Thread id (optional):", "") || "").trim();
+      const sourceChannelKind = (window.prompt("Source channel kind (optional):", "") || "").trim();
+      return {{
+        title: title || "Impersonation chat",
+        chat_mode: "impersonation",
+        effective_ilk: effectiveIlk || null,
+        impersonation_target: impersonationTarget || null,
+        thread_id: threadId || null,
+        source_channel_kind: sourceChannelKind || null,
+        debug_enabled: true
+      }};
     }}
     function renderSession(detail, showWelcome = false) {{
       resetChatViewport();
@@ -4822,10 +5322,20 @@ fn architect_index_html(state: &ArchitectState) -> String {
     historySearch.addEventListener("input", () => {{
       renderHistory();
     }});
-    newChat.addEventListener("click", () => {{
-      createSession(false).catch((err) => {{
+    newChatOperator.addEventListener("click", () => {{
+      createSession({{}}, false).catch((err) => {{
         addMessage("system", "Session creation failed: " + err);
       }});
+    }});
+    newChatImpersonation.addEventListener("click", () => {{
+      try {{
+        const payload = promptImpersonationConfig();
+        createSession(payload, false).catch((err) => {{
+          addMessage("system", "Impersonation session creation failed: " + err);
+        }});
+      }} catch (err) {{
+        addMessage("system", String(err));
+      }}
     }});
     input.addEventListener("keydown", (event) => {{
       if (event.key === "Enter" && !event.shiftKey) {{
@@ -4837,7 +5347,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       resetChatViewport();
       await refreshSessionList(localStorage.getItem(currentSessionStorageKey));
       if (!sessionsCache.length) {{
-        await createSession(true);
+        await createSession({{}}, true);
       }} else {{
         const preferred = currentSessionId || localStorage.getItem(currentSessionStorageKey) || sessionsCache[0].session_id;
         await loadSession(preferred, null, false);
