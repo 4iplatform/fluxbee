@@ -1360,12 +1360,13 @@ fn build_conversation_summary(
     messages: &[PersistedChatMessage],
     operations: &[ChatOperationRecord],
 ) -> ConversationSummary {
-    let goal = if session.title.trim().is_empty() || session.title == "Untitled chat" {
+    let goal = if session_title_is_generic(session) {
         messages
             .iter()
             .rev()
-            .find(|message| message.role == "user" && !message.content.trim().is_empty())
-            .map(|message| preview_text(&message.content, 180))
+            .filter(|message| message.role == "user")
+            .filter_map(message_focus_text)
+            .next()
     } else {
         Some(preview_text(&session.title, 180))
     };
@@ -1373,13 +1374,7 @@ fn build_conversation_summary(
         .iter()
         .find(|record| !is_terminal_operation_status(&record.status))
         .map(operation_focus_summary)
-        .or_else(|| {
-            messages
-                .iter()
-                .rev()
-                .find(|message| !message.content.trim().is_empty())
-                .map(|message| preview_text(&message.content, 180))
-        });
+        .or_else(|| messages.iter().rev().filter_map(message_focus_text).next());
 
     let mut decisions = Vec::new();
     if session.chat_mode == CHAT_MODE_IMPERSONATION {
@@ -1473,46 +1468,209 @@ fn build_conversation_summary(
 }
 
 fn recent_messages_to_immediate(messages: Vec<PersistedChatMessage>) -> Vec<ImmediateInteraction> {
-    let start = messages.len().saturating_sub(10);
-    messages
-        .into_iter()
-        .skip(start)
-        .filter_map(|message| {
-            let content = message.content.trim();
-            if content.is_empty() {
-                return None;
-            }
+    let mut interactions = messages
+        .iter()
+        .filter_map(immediate_interaction_from_message)
+        .collect::<Vec<_>>();
+    let start = interactions.len().saturating_sub(10);
+    interactions.drain(0..start);
+    interactions
+}
 
-            let kind = match message.role.as_str() {
-                "system" => {
-                    if message
-                        .metadata
-                        .get("response")
-                        .and_then(|value| value.get("status"))
-                        .and_then(Value::as_str)
-                        == Some("error")
-                    {
-                        ImmediateInteractionKind::ToolError
-                    } else {
-                        ImmediateInteractionKind::SystemNote
-                    }
-                }
-                _ => ImmediateInteractionKind::Text,
-            };
+fn session_title_is_generic(session: &ChatSessionRecord) -> bool {
+    matches!(
+        session.title.trim(),
+        "" | "Untitled chat" | "Impersonation chat" | "Operator chat"
+    )
+}
 
-            let role = match message.role.as_str() {
-                "user" => ImmediateRole::User,
-                "architect" => ImmediateRole::Assistant,
-                _ => ImmediateRole::System,
-            };
+fn message_focus_text(message: &PersistedChatMessage) -> Option<String> {
+    immediate_interaction_from_message(message)
+        .map(|interaction| interaction.content)
+        .filter(|content| !is_low_signal_control_text(content))
+        .map(|content| preview_text(&content, 180))
+}
 
-            Some(ImmediateInteraction {
-                role,
-                kind,
-                content: content.to_string(),
+fn is_low_signal_control_text(content: &str) -> bool {
+    matches!(
+        content.trim().to_ascii_uppercase().as_str(),
+        "CONFIRM" | "OK CONFIRM" | "CANCEL" | "ABORT"
+    )
+}
+
+fn immediate_interaction_from_message(
+    message: &PersistedChatMessage,
+) -> Option<ImmediateInteraction> {
+    let role = match message.role.as_str() {
+        "user" => ImmediateRole::User,
+        "architect" => ImmediateRole::Assistant,
+        _ => ImmediateRole::System,
+    };
+
+    if let Some(response) = message.metadata.get("response") {
+        if let Some(interaction) = immediate_interaction_from_response(
+            role.clone(),
+            response,
+            &message.content,
+            &message.mode,
+        ) {
+            return Some(interaction);
+        }
+    }
+
+    let content = message.content.trim();
+    if content.is_empty() {
+        return None;
+    }
+
+    let kind = match role {
+        ImmediateRole::System => ImmediateInteractionKind::SystemNote,
+        _ => ImmediateInteractionKind::Text,
+    };
+
+    Some(ImmediateInteraction {
+        role,
+        kind,
+        content: content.to_string(),
+    })
+}
+
+fn immediate_interaction_from_response(
+    role: ImmediateRole,
+    response: &Value,
+    fallback_content: &str,
+    fallback_mode: &str,
+) -> Option<ImmediateInteraction> {
+    let mode = response
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_mode);
+    let status = response
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let output = response.get("output");
+
+    if mode == "chat" {
+        if let Some(message) = output
+            .and_then(|value| value.get("message"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                let content = fallback_content.trim();
+                (!content.is_empty()).then_some(content)
             })
+        {
+            return Some(ImmediateInteraction {
+                role,
+                kind: ImmediateInteractionKind::Text,
+                content: message.to_string(),
+            });
+        }
+
+        let tool_names = output
+            .and_then(|value| value.get("tool_results"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("name").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !tool_names.is_empty() {
+            return Some(ImmediateInteraction {
+                role: ImmediateRole::System,
+                kind: ImmediateInteractionKind::ToolResult,
+                content: format!("AI used live system tools: {}", tool_names.join(", ")),
+            });
+        }
+
+        return None;
+    }
+
+    if mode == "scmd" || mode == "acmd" {
+        let action = output
+            .and_then(|value| value.get("action"))
+            .and_then(Value::as_str)
+            .unwrap_or("system_command");
+        let detail = output.and_then(response_detail_text).or_else(|| {
+            let content = fallback_content.trim();
+            (!content.is_empty()).then_some(content.to_string())
+        });
+        let kind = if status.eq_ignore_ascii_case("ok") {
+            ImmediateInteractionKind::ToolResult
+        } else {
+            ImmediateInteractionKind::ToolError
+        };
+        let content = if let Some(detail) = detail {
+            if status.eq_ignore_ascii_case("ok") {
+                format!("System command {action}: {detail}")
+            } else {
+                format!("System command {action} failed: {detail}")
+            }
+        } else if status.eq_ignore_ascii_case("ok") {
+            format!("System command {action} completed.")
+        } else {
+            format!("System command {action} failed.")
+        };
+
+        return Some(ImmediateInteraction {
+            role: ImmediateRole::System,
+            kind,
+            content,
+        });
+    }
+
+    let content = fallback_content.trim();
+    if content.is_empty() {
+        None
+    } else {
+        Some(ImmediateInteraction {
+            role,
+            kind: if status.eq_ignore_ascii_case("error") {
+                ImmediateInteractionKind::ToolError
+            } else {
+                ImmediateInteractionKind::SystemNote
+            },
+            content: content.to_string(),
         })
-        .collect()
+    }
+}
+
+fn response_detail_text(output: &Value) -> Option<String> {
+    output
+        .get("error_detail")
+        .and_then(value_to_compact_text)
+        .or_else(|| output.get("message").and_then(value_to_compact_text))
+        .or_else(|| {
+            output
+                .get("payload")
+                .and_then(|value| value.get("message"))
+                .and_then(value_to_compact_text)
+        })
+        .or_else(|| {
+            output
+                .get("payload")
+                .and_then(|value| value.get("error_code"))
+                .and_then(value_to_compact_text)
+        })
+}
+
+fn value_to_compact_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| preview_text(trimmed, 220))
+        }
+        other => {
+            let serialized = serde_json::to_string(other).ok()?;
+            let trimmed = serialized.trim();
+            (!trimmed.is_empty()).then(|| preview_text(trimmed, 220))
+        }
+    }
 }
 
 fn operations_to_immediate(

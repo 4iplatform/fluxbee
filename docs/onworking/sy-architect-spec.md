@@ -85,7 +85,10 @@ Current state in repo:
 - `SCMD:` remains a separate local/system path and does not invoke the AI provider.
 - the local agent can already use read-only socket-backed tools against `SY.admin` for live system state.
 - immediate short-horizon memory is now rehydrated through `fluxbee_ai_sdk` using recent interactions, active operations, and conversation summary; see `docs/immediate-conversation-memory-spec.md`.
-- current limitation: chat mode/profile exists in the backend model, but the UI still launches only the normal operator chat flow by default.
+- chat creation already supports both `operator` and `impersonation` modes.
+- impersonation chat launch is now backed by identity SHM options:
+  - the user selects an existing `ICH`
+  - architect then narrows to the candidate `ILK` list bound to that channel context
 - streaming, multi-agent routing, and prompt assets by role are still pending.
 
 ---
@@ -224,7 +227,28 @@ Important:
 
 - normal chats should default to `operator`
 - impersonation chats should be created intentionally, not inferred silently from normal usage
-- the first implementation may keep the UI launch simple, but the session/profile model must already distinguish these modes cleanly
+- the current UI already exposes both flows explicitly:
+  - `Operator` button for normal control-plane chats
+  - `Impersonate` button opening a modal backed by identity SHM options (`ICH` first, then `ILK`)
+
+### 3.7 Immediate Memory Rehydration
+
+For AI turns, `SY.architect` now rebuilds short-horizon conversation context before calling the model.
+
+Current bundle sent through `fluxbee_ai_sdk`:
+
+- `conversation_summary`
+  - session goal/focus
+  - mode-aware decisions such as `pending_confirm` or `timeout_unknown`
+  - confirmed facts including effective `ICH`, effective `ILK`, source channel kind, and `thread_id`
+- `recent_interactions`
+  - last bounded window of user / architect / system turns
+  - recent `SCMD` and admin/tool failures are preserved as explicit interaction summaries, not only as raw UI cards
+- `active_operations`
+  - non-terminal tracked operations first
+  - recent terminal operations when still relevant to the current conversation
+
+This memory is per chat/session and must not bleed across sessions.
 
 ---
 
@@ -560,6 +584,7 @@ Sessions:
 SessionProfiles:
   session_id: uuid
   chat_mode: string (`operator`|`impersonation`)
+  effective_ich_id: string?
   effective_ilk: string?
   impersonation_target: string?
   thread_id: string?
@@ -569,11 +594,30 @@ SessionProfiles:
 Messages:
   message_id: uuid
   session_id: uuid
-  role: string (user|assistant|system)
+  role: string (user|architect|system)
   content: string
   timestamp: timestamp
   metadata: json (command results, blob refs, test mode info)
   embedding: vector (for semantic search)
+
+Operations:
+  operation_id: uuid
+  session_id: uuid
+  scope_id: string
+  origin: string
+  action: string
+  target_hive: string
+  params_json: string
+  params_hash: string
+  preview_command: string
+  status: string
+  created_at_ms: u64
+  updated_at_ms: u64
+  dispatched_at_ms: u64
+  completed_at_ms: u64
+  request_id: string?
+  trace_id: string?
+  error_summary: string?
 ```
 
 ### 9.2 Why LanceDB
@@ -685,7 +729,7 @@ Until this is resolved, SY.architect should only be exposed on trusted networks 
 
 ## 12. Implementation Tasks
 
-### 12.1 Current Snapshot (2026-03-21)
+### 12.1 Current Snapshot (2026-03-23)
 
 Current repo state should be treated as a **partial shell**, not as a blank implementation and not as a finished MVP.
 
@@ -694,9 +738,14 @@ Current repo state should be treated as a **partial shell**, not as a blank impl
   - HTTP server with static HTML UI
   - `GET /api/status`
   - `POST /api/chat`
+  - `GET /api/identity/ich-options`
   - local `SCMD:` parser translated to `ADMIN_COMMAND`
+  - direct OpenAI chat integration through `fluxbee_ai_sdk`
   - persisted chat sessions/messages in local LanceDB
-  - persisted per-session chat profile/context (`operator` vs `impersonation`, effective ILK/thread context)
+  - persisted per-session chat profile/context (`operator` vs `impersonation`, effective `ICH` / effective `ILK` / thread context)
+  - tracked per-session operations for staged, running, timeout-unknown, and recent terminal mutations
+  - immediate-memory rehydration into the AI call using summary + recent interactions + active operations
+  - explicit UI flows for both operator chats and SHM-backed impersonation/debug chats
 - current friction:
   - header status chips currently poll `/api/status` every 5 seconds from the browser
   - each refresh opens an ephemeral router/admin client path just to render `Hives` / `Nodes` / `Updated`
@@ -704,12 +753,10 @@ Current repo state should be treated as a **partial shell**, not as a blank impl
   - long-running mutating actions can outlive the local caller timeout; architect must track them explicitly instead of treating timeout as a clean failure
 - The current implementation does **not** yet provide:
   - WebSocket chat/streaming
-  - real AI provider integration
   - settings panel / `set_node_config`
-  - explicit UI flow for launching impersonation/debug chats
   - uploads / blobs
 
-Because of that, the backlog should prioritize turning the current shell into a useful control-plane tool **before** investing in AI or UI polish.
+Because of that, the backlog should prioritize hardening the current control-plane tool and its AI/session semantics before adding more surface area.
 
 ### 12.2 Design Frictions To Resolve Early
 
