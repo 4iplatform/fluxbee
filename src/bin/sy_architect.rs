@@ -4342,9 +4342,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     .new-chat {{
       width: 100%;
+      min-height: 44px;
+      padding: 9px 14px;
+      font-size: 0.92rem;
       background: var(--logo-dark);
       color: #ffffff;
       justify-content: center;
+      box-shadow: none;
     }}
     .new-chat-row {{
       display: grid;
@@ -4353,11 +4357,14 @@ fn architect_index_html(state: &ArchitectState) -> String {
       margin-bottom: 14px;
     }}
     .new-chat.operator {{
-      background: var(--logo-dark);
+      background: #252528;
     }}
     .new-chat.debug {{
-      background: #9a6b00;
-      color: #fff9eb;
+      background: #2e6fda;
+      color: #f7fbff;
+    }}
+    .new-chat:hover {{
+      filter: brightness(1.04);
     }}
     .history-mode {{
       display: inline-flex;
@@ -4438,7 +4445,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
       white-space: nowrap;
     }}
     .history-meta,
-    .history-note,
     .meta-grid {{
       color: var(--muted);
       font-size: 0.82rem;
@@ -4480,23 +4486,141 @@ fn architect_index_html(state: &ArchitectState) -> String {
       border-color: #f2c7c4;
       background: #fff5f4;
     }}
-    .history-note {{
-      margin-top: 16px;
-      padding: 14px;
-      border-radius: 18px;
-      background: var(--panel-soft);
-      border: 1px dashed #d6dff0;
-    }}
     .meta-grid {{
-      margin-top: 18px;
+      margin-top: 16px;
       display: grid;
       gap: 8px;
-      padding-top: 18px;
+      padding-top: 16px;
       border-top: 1px solid var(--line);
+    }}
+    .meta-inline-note {{
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.45;
     }}
     .meta-grid strong {{
       color: var(--text);
       font-weight: 700;
+    }}
+    .modal-backdrop {{
+      position: fixed;
+      inset: 0;
+      background: rgba(19, 28, 43, 0.36);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+      z-index: 40;
+    }}
+    .modal-backdrop.open {{
+      display: flex;
+    }}
+    .modal-card {{
+      width: min(560px, 100%);
+      border-radius: 24px;
+      border: 1px solid var(--line);
+      background: #ffffff;
+      box-shadow: 0 22px 60px rgba(16, 24, 40, 0.18);
+      padding: 22px;
+      display: grid;
+      gap: 16px;
+    }}
+    .modal-head {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+    }}
+    .modal-kicker {{
+      color: var(--accent);
+      font-size: 0.74rem;
+      font-weight: 800;
+      letter-spacing: 0.11em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }}
+    .modal-title {{
+      margin: 0;
+      font-size: 1.35rem;
+      line-height: 1.05;
+      letter-spacing: -0.03em;
+    }}
+    .modal-copy {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.9rem;
+      line-height: 1.5;
+    }}
+    .modal-close {{
+      width: 34px;
+      height: 34px;
+      padding: 0;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #ffffff;
+      color: var(--muted);
+      font-size: 1rem;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    .modal-form {{
+      display: grid;
+      gap: 12px;
+    }}
+    .field-grid {{
+      display: grid;
+      gap: 12px;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    }}
+    .field {{
+      display: grid;
+      gap: 6px;
+    }}
+    .field.span-2 {{
+      grid-column: 1 / -1;
+    }}
+    .field label {{
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }}
+    .field input {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 11px 12px;
+      font: inherit;
+      color: var(--text);
+      background: #ffffff;
+      outline: none;
+    }}
+    .field input:focus {{
+      border-color: #b8caef;
+      box-shadow: 0 0 0 4px rgba(69, 117, 220, 0.12);
+    }}
+    .field-help {{
+      color: var(--muted);
+      font-size: 0.78rem;
+      line-height: 1.4;
+    }}
+    .modal-error {{
+      min-height: 1.2em;
+      color: #b42318;
+      font-size: 0.82rem;
+      line-height: 1.4;
+    }}
+    .modal-actions {{
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }}
+    .secondary-button {{
+      background: #ffffff;
+      color: var(--text);
+      border: 1px solid var(--line);
     }}
     .shell {{
       overflow: hidden;
@@ -4778,6 +4902,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
       .msg {{
         max-width: 100%;
       }}
+      .field-grid {{
+        grid-template-columns: 1fr;
+      }}
     }}
   </style>
 </head>
@@ -4830,10 +4957,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
         </div>
         <input id="history-search" class="history-search" type="search" placeholder="Search chats" autocomplete="off" />
         <div id="history-list" class="history-list"></div>
-        <div class="history-note">
-          Chat sessions stay persisted locally on motherbee and reload automatically. Use impersonation only for debug/simulation flows.
-        </div>
         <div class="meta-grid">
+          <div class="meta-inline-note">Stored locally on motherbee. Use impersonation only for debug and simulation flows.</div>
           <div><strong>Node</strong>: {node}</div>
           <div><strong>Modes</strong>: operator, impersonation, SCMD</div>
         </div>
@@ -4858,6 +4983,48 @@ fn architect_index_html(state: &ArchitectState) -> String {
       </div>
     </div>
   </div>
+  <div id="impersonation-modal" class="modal-backdrop" aria-hidden="true">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="impersonation-modal-title">
+      <div class="modal-head">
+        <div>
+          <div class="modal-kicker">Debug Session</div>
+          <h2 id="impersonation-modal-title" class="modal-title">Create impersonation chat</h2>
+          <p class="modal-copy">Run a chat with an effective ILK or impersonation target so you can simulate external flows without connecting a real IO.</p>
+        </div>
+        <button id="impersonation-close" class="modal-close" type="button" aria-label="Close impersonation dialog">×</button>
+      </div>
+      <form id="impersonation-form" class="modal-form">
+        <div class="field-grid">
+          <div class="field span-2">
+            <label for="impersonation-title">Title</label>
+            <input id="impersonation-title" type="text" placeholder="Impersonation chat" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="impersonation-effective-ilk">Effective ILK</label>
+            <input id="impersonation-effective-ilk" type="text" placeholder="customer.support" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="impersonation-target">Impersonation Target</label>
+            <input id="impersonation-target" type="text" placeholder="AI.helper@motherbee" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="impersonation-thread-id">Thread Id</label>
+            <input id="impersonation-thread-id" type="text" placeholder="thread:demo-123" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="impersonation-source-channel">Source Channel</label>
+            <input id="impersonation-source-channel" type="text" placeholder="whatsapp" autocomplete="off" />
+          </div>
+        </div>
+        <div class="field-help">Set at least an effective ILK or an impersonation target. Thread and source channel are optional simulation context.</div>
+        <div id="impersonation-error" class="modal-error"></div>
+        <div class="modal-actions">
+          <button id="impersonation-cancel" class="secondary-button" type="button">Cancel</button>
+          <button id="impersonation-submit" type="submit">Create chat</button>
+        </div>
+      </form>
+    </div>
+  </div>
   <script>
     const rawPath = window.location.pathname.replace(/\/+$/, "");
     const base = rawPath === "" ? "" : rawPath;
@@ -4874,9 +5041,53 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const historySearch = document.getElementById("history-search");
     const historyList = document.getElementById("history-list");
     const composerHint = document.getElementById("composer-hint");
+    const impersonationModal = document.getElementById("impersonation-modal");
+    const impersonationForm = document.getElementById("impersonation-form");
+    const impersonationClose = document.getElementById("impersonation-close");
+    const impersonationCancel = document.getElementById("impersonation-cancel");
+    const impersonationTitle = document.getElementById("impersonation-title");
+    const impersonationEffectiveIlk = document.getElementById("impersonation-effective-ilk");
+    const impersonationTarget = document.getElementById("impersonation-target");
+    const impersonationThreadId = document.getElementById("impersonation-thread-id");
+    const impersonationSourceChannel = document.getElementById("impersonation-source-channel");
+    const impersonationError = document.getElementById("impersonation-error");
     let currentSessionId = null;
     let sessionsCache = [];
     let pendingIndicator = null;
+    function closeImpersonationModal() {{
+      impersonationModal.classList.remove("open");
+      impersonationModal.setAttribute("aria-hidden", "true");
+      impersonationForm.reset();
+      impersonationTitle.value = "Impersonation chat";
+      impersonationError.textContent = "";
+    }}
+    function openImpersonationModal() {{
+      impersonationForm.reset();
+      impersonationTitle.value = "Impersonation chat";
+      impersonationError.textContent = "";
+      impersonationModal.classList.add("open");
+      impersonationModal.setAttribute("aria-hidden", "false");
+      window.setTimeout(() => impersonationEffectiveIlk.focus(), 0);
+    }}
+    function collectImpersonationPayload() {{
+      const title = impersonationTitle.value.trim();
+      const effectiveIlk = impersonationEffectiveIlk.value.trim();
+      const target = impersonationTarget.value.trim();
+      const threadId = impersonationThreadId.value.trim();
+      const sourceChannelKind = impersonationSourceChannel.value.trim();
+      if (!effectiveIlk && !target) {{
+        throw new Error("Impersonation mode requires effective ILK or impersonation target.");
+      }}
+      return {{
+        title: title || "Impersonation chat",
+        chat_mode: "impersonation",
+        effective_ilk: effectiveIlk || null,
+        impersonation_target: target || null,
+        thread_id: threadId || null,
+        source_channel_kind: sourceChannelKind || null,
+        debug_enabled: true
+      }};
+    }}
     function appendMessage(kind, labelText, bodyContent) {{
       const div = document.createElement("div");
       const label = document.createElement("div");
@@ -5207,25 +5418,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
         ? " Running in impersonation/debug mode."
         : " Running in operator mode.");
     }}
-    function promptImpersonationConfig() {{
-      const title = (window.prompt("Debug chat title (optional):", "Impersonation chat") || "").trim();
-      const effectiveIlk = (window.prompt("Effective ILK (optional):", "") || "").trim();
-      const impersonationTarget = (window.prompt("Impersonation target node/ILK (optional):", "") || "").trim();
-      if (!effectiveIlk && !impersonationTarget) {{
-        throw new Error("Impersonation mode requires effective ILK or impersonation target.");
-      }}
-      const threadId = (window.prompt("Thread id (optional):", "") || "").trim();
-      const sourceChannelKind = (window.prompt("Source channel kind (optional):", "") || "").trim();
-      return {{
-        title: title || "Impersonation chat",
-        chat_mode: "impersonation",
-        effective_ilk: effectiveIlk || null,
-        impersonation_target: impersonationTarget || null,
-        thread_id: threadId || null,
-        source_channel_kind: sourceChannelKind || null,
-        debug_enabled: true
-      }};
-    }}
     function renderSession(detail, showWelcome = false) {{
       resetChatViewport();
       const session = detail && detail.session ? detail.session : null;
@@ -5328,19 +5520,40 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }});
     }});
     newChatImpersonation.addEventListener("click", () => {{
-      try {{
-        const payload = promptImpersonationConfig();
-        createSession(payload, false).catch((err) => {{
-          addMessage("system", "Impersonation session creation failed: " + err);
-        }});
-      }} catch (err) {{
-        addMessage("system", String(err));
+      openImpersonationModal();
+    }});
+    impersonationClose.addEventListener("click", closeImpersonationModal);
+    impersonationCancel.addEventListener("click", closeImpersonationModal);
+    impersonationModal.addEventListener("click", (event) => {{
+      if (event.target === impersonationModal) {{
+        closeImpersonationModal();
       }}
+    }});
+    impersonationForm.addEventListener("submit", (event) => {{
+      event.preventDefault();
+      impersonationError.textContent = "";
+      let payload = null;
+      try {{
+        payload = collectImpersonationPayload();
+      }} catch (err) {{
+        impersonationError.textContent = String(err);
+        return;
+      }}
+      createSession(payload, false).then(() => {{
+        closeImpersonationModal();
+      }}).catch((err) => {{
+        impersonationError.textContent = "Impersonation session creation failed: " + err;
+      }});
     }});
     input.addEventListener("keydown", (event) => {{
       if (event.key === "Enter" && !event.shiftKey) {{
         event.preventDefault();
         submit();
+      }}
+    }});
+    window.addEventListener("keydown", (event) => {{
+      if (event.key === "Escape" && impersonationModal.classList.contains("open")) {{
+        closeImpersonationModal();
       }}
     }});
     async function bootstrap() {{
