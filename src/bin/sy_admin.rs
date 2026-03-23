@@ -784,7 +784,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "2";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "3";
 
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
@@ -3022,6 +3022,7 @@ fn build_admin_action_help_response(action_name: &str) -> (u16, String) {
 }
 
 fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
+    let path_patterns = admin_action_path_patterns(spec.action);
     let (handler, canonical_action) = match spec.route {
         InternalActionRoute::Query(canonical) => ("query", Some(canonical)),
         InternalActionRoute::Command(canonical) => ("command", Some(canonical)),
@@ -3040,7 +3041,8 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
         "read_only": admin_action_is_read_only(spec.action),
         "confirmation_required": admin_action_requires_confirmation(spec.action),
         "summary": admin_action_summary(spec.action),
-        "path_patterns": admin_action_path_patterns(spec.action),
+        "path_patterns": path_patterns,
+        "request_contract": admin_action_request_contract(spec.action),
     })
 }
 
@@ -3056,6 +3058,7 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "run_node"
             | "kill_node"
             | "remove_node_instance"
+            | "remove_runtime_version"
             | "set_node_config"
             | "send_node_message"
             | "set_storage"
@@ -3076,6 +3079,7 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "delete_vpn"
             | "kill_node"
             | "remove_node_instance"
+            | "remove_runtime_version"
             | "set_node_config"
             | "set_storage"
             | "update"
@@ -3105,6 +3109,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "get_versions" => "Read runtime versions for one hive.",
         "list_runtimes" => "List runtimes for one hive.",
         "get_runtime" => "Read one runtime definition in a hive.",
+        "remove_runtime_version" => "Delete one runtime version from a hive.",
         "list_routes" => "List route rules for a hive.",
         "list_vpns" => "List VPN patterns for a hive.",
         "get_storage" => "Read storage configuration and status.",
@@ -3158,6 +3163,9 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "get_versions" => vec!["GET /hives/{hive}/versions"],
         "list_runtimes" => vec!["GET /hives/{hive}/runtimes"],
         "get_runtime" => vec!["GET /hives/{hive}/runtimes/{runtime}"],
+        "remove_runtime_version" => {
+            vec!["DELETE /hives/{hive}/runtimes/{runtime}/versions/{version}"]
+        }
         "list_routes" => vec!["GET /hives/{hive}/routes"],
         "list_vpns" => vec!["GET /hives/{hive}/vpns"],
         "get_storage" => vec!["GET /config/storage"],
@@ -3188,6 +3196,566 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "opa_rollback" => vec!["POST /hives/{hive}/opa/policy/rollback"],
         _ => Vec::new(),
     }
+}
+
+fn admin_action_request_contract(action: &str) -> serde_json::Value {
+    let path_patterns = admin_action_path_patterns(action);
+    let required_fields = admin_action_body_required_fields(action);
+    let optional_fields = admin_action_body_optional_fields(action);
+    let example_payload = admin_action_example_payload(action);
+    let has_body = admin_action_body_required(action)
+        || !required_fields.is_empty()
+        || !optional_fields.is_empty()
+        || !example_payload.is_null();
+    serde_json::json!({
+        "transport": "http_via_sy_admin",
+        "method": admin_action_primary_method(action),
+        "path_patterns": path_patterns,
+        "path_params": admin_action_path_params(action),
+        "body": {
+            "kind": if has_body { "json_object" } else { "none" },
+            "required": admin_action_body_required(action),
+            "required_fields": required_fields,
+            "optional_fields": optional_fields,
+        },
+        "example_payload": example_payload,
+        "example_scmd": admin_action_example_scmd(action),
+        "notes": admin_action_request_notes(action),
+    })
+}
+
+fn admin_action_primary_method(action: &str) -> &'static str {
+    admin_action_path_patterns(action)
+        .first()
+        .and_then(|pattern| pattern.split_whitespace().next())
+        .unwrap_or("GET")
+}
+
+fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
+    match action {
+        "get_admin_action_help" => vec![admin_action_path_param(
+            "action",
+            "string",
+            "Admin action name, for example add_hive.",
+        )],
+        "get_hive" | "remove_hive" => vec![admin_action_path_param(
+            "hive",
+            "string",
+            "Hive id, for example worker-220.",
+        )],
+        "list_nodes" | "list_ilks" | "get_versions" | "list_runtimes" | "list_routes"
+        | "list_vpns" | "get_deployments" | "get_drift_alerts" | "opa_get_policy"
+        | "opa_get_status" | "update" | "sync_hint" | "opa_compile_apply" | "opa_compile"
+        | "opa_apply" | "opa_rollback" | "opa_check" => vec![admin_action_path_param(
+            "hive",
+            "string",
+            "Target hive id in the URL path.",
+        )],
+        "inventory" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param(
+                "scope",
+                "enum(summary|hive)",
+                "Inventory view encoded in the last path segment.",
+            ),
+        ],
+        "get_node_status"
+        | "get_node_state"
+        | "get_node_config"
+        | "kill_node"
+        | "remove_node_instance"
+        | "send_node_message"
+        | "set_node_config" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param(
+                "node_name",
+                "string",
+                "Fully-qualified node name, for example SY.admin@motherbee.",
+            ),
+        ],
+        "get_runtime" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param("runtime", "string", "Runtime name, for example AI.chat."),
+        ],
+        "remove_runtime_version" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param("runtime", "string", "Runtime name, for example AI.chat."),
+            admin_action_path_param("version", "string", "Runtime version to delete."),
+        ],
+        "get_ilk" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param("ilk_id", "string", "ILK identifier."),
+        ],
+        "run_node" => vec![admin_action_path_param(
+            "hive",
+            "string",
+            "Target hive where the node should start.",
+        )],
+        "add_route" => vec![admin_action_path_param(
+            "hive",
+            "string",
+            "Target hive where the route will be added.",
+        )],
+        "delete_route" => vec![
+            admin_action_path_param("hive", "string", "Target hive where the route exists."),
+            admin_action_path_param(
+                "prefix",
+                "string",
+                "Route prefix encoded in the URL path when deleting via HTTP.",
+            ),
+        ],
+        "add_vpn" => vec![admin_action_path_param(
+            "hive",
+            "string",
+            "Target hive where the VPN rule will be added.",
+        )],
+        "delete_vpn" => vec![
+            admin_action_path_param("hive", "string", "Target hive where the VPN rule exists."),
+            admin_action_path_param(
+                "pattern",
+                "string",
+                "VPN pattern encoded in the URL path when deleting via HTTP.",
+            ),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn admin_action_body_required(action: &str) -> bool {
+    matches!(
+        action,
+        "add_hive"
+            | "run_node"
+            | "add_route"
+            | "add_vpn"
+            | "set_node_config"
+            | "send_node_message"
+            | "set_storage"
+            | "update"
+            | "opa_compile_apply"
+            | "opa_compile"
+            | "opa_apply"
+            | "opa_check"
+    )
+}
+
+fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
+    match action {
+        "add_hive" => vec![
+            admin_action_body_field("hive_id", "string", "Unique hive id to create."),
+            admin_action_body_field(
+                "address",
+                "string",
+                "WAN or bootstrap address reachable from motherbee.",
+            ),
+        ],
+        "run_node" => vec![admin_action_body_field(
+            "node_name",
+            "string",
+            "Fully-qualified node name to start.",
+        )],
+        "add_route" => vec![
+            admin_action_body_field("prefix", "string", "Route prefix, for example AI.chat."),
+            admin_action_body_field(
+                "action",
+                "string",
+                "Routing action, typically next_hop_hive or similar route mode.",
+            ),
+        ],
+        "add_vpn" => vec![
+            admin_action_body_field("pattern", "string", "VPN match pattern."),
+            admin_action_body_field("vpn_id", "u32", "VPN identifier."),
+        ],
+        "set_node_config" => vec![admin_action_body_field(
+            "config",
+            "object",
+            "Node config patch or replacement object.",
+        )],
+        "send_node_message" => vec![
+            admin_action_body_field("msg_type", "string", "System message type."),
+            admin_action_body_field(
+                "payload",
+                "object",
+                "Message payload forwarded to the target node.",
+            ),
+        ],
+        "set_storage" => vec![admin_action_body_field(
+            "path",
+            "string",
+            "Absolute storage path to persist locally.",
+        )],
+        "update" => vec![admin_action_body_field(
+            "manifest_hash",
+            "string",
+            "Core/runtime/vendor manifest hash to apply.",
+        )],
+        "opa_compile_apply" | "opa_compile" | "opa_check" => vec![admin_action_body_field(
+            "rego",
+            "string",
+            "OPA rego source text.",
+        )],
+        "opa_apply" => vec![admin_action_body_field(
+            "version",
+            "u64",
+            "Compiled OPA version to apply.",
+        )],
+        _ => Vec::new(),
+    }
+}
+
+fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
+    match action {
+        "add_hive" => vec![
+            admin_action_body_field(
+                "harden_ssh",
+                "bool",
+                "Enable SSH hardening after bootstrap.",
+            ),
+            admin_action_body_field(
+                "restrict_ssh",
+                "bool",
+                "Restrict bootstrap SSH access after provisioning.",
+            ),
+            admin_action_body_field(
+                "require_dist_sync",
+                "bool",
+                "Require dist sync readiness before success.",
+            ),
+            admin_action_body_field(
+                "dist_sync_probe_timeout_secs",
+                "u64",
+                "Timeout for dist sync readiness probe.",
+            ),
+        ],
+        "run_node" => vec![
+            admin_action_body_field(
+                "runtime",
+                "string",
+                "Runtime name. Optional when derivable from node_name.",
+            ),
+            admin_action_body_field(
+                "runtime_version",
+                "string",
+                "Runtime version. Defaults to current.",
+            ),
+            admin_action_body_field("unit", "string", "Optional unit suffix override."),
+            admin_action_body_field(
+                "config",
+                "object",
+                "Optional runtime/node config passed during spawn.",
+            ),
+        ],
+        "kill_node" => vec![admin_action_body_field(
+            "force",
+            "bool",
+            "Force stop when supported by the target runtime.",
+        )],
+        "add_route" => vec![
+            admin_action_body_field("match_kind", "string", "Optional route match kind."),
+            admin_action_body_field(
+                "next_hop_hive",
+                "string",
+                "Next-hop hive when the route action needs one.",
+            ),
+            admin_action_body_field("metric", "u32", "Optional route metric."),
+            admin_action_body_field("priority", "u16", "Optional route priority."),
+        ],
+        "add_vpn" => vec![
+            admin_action_body_field("match_kind", "string", "Optional VPN match kind."),
+            admin_action_body_field("priority", "u16", "Optional VPN priority."),
+        ],
+        "set_node_config" => vec![
+            admin_action_body_field(
+                "replace",
+                "bool",
+                "Replace full config instead of patch/merge.",
+            ),
+            admin_action_body_field(
+                "notify",
+                "bool",
+                "Notify runtime after persisting the config.",
+            ),
+        ],
+        "send_node_message" => vec![
+            admin_action_body_field("msg", "string", "Optional message name."),
+            admin_action_body_field("ttl", "u16", "Optional TTL, default 16."),
+            admin_action_body_field("scope", "string", "Optional scope metadata."),
+            admin_action_body_field("priority", "u16", "Optional priority metadata."),
+            admin_action_body_field("src_ilk", "string", "Optional source ILK."),
+            admin_action_body_field(
+                "context",
+                "object",
+                "Optional metadata context forwarded with the message.",
+            ),
+        ],
+        "update" => vec![
+            admin_action_body_field(
+                "category",
+                "enum(runtime|core|vendor)",
+                "Update category. Defaults to runtime.",
+            ),
+            admin_action_body_field(
+                "manifest_version",
+                "u64",
+                "Expected manifest version. Defaults to 0.",
+            ),
+        ],
+        "sync_hint" => vec![
+            admin_action_body_field(
+                "channel",
+                "enum(blob|dist)",
+                "Sync channel. Defaults to blob.",
+            ),
+            admin_action_body_field(
+                "folder_id",
+                "string",
+                "Explicit folder id. Defaults from channel.",
+            ),
+            admin_action_body_field(
+                "wait_for_idle",
+                "bool",
+                "Wait for idle completion before returning.",
+            ),
+            admin_action_body_field(
+                "timeout_ms",
+                "u64",
+                "Timeout while waiting for idle completion.",
+            ),
+        ],
+        "opa_compile_apply" | "opa_compile" | "opa_check" => vec![
+            admin_action_body_field(
+                "entrypoint",
+                "string",
+                "OPA entrypoint. Defaults to router/target.",
+            ),
+            admin_action_body_field(
+                "version",
+                "u64",
+                "Optional explicit version. Otherwise a new version is assigned.",
+            ),
+        ],
+        "opa_apply" | "opa_rollback" => vec![admin_action_body_field(
+            "hive",
+            "string",
+            "Optional explicit hive override for OPA broadcast targeting.",
+        )],
+        "remove_runtime_version" => vec![admin_action_body_field(
+            "test_hold_ms",
+            "u64",
+            "Optional test-only hold used by E2E/runtime lifecycle checks.",
+        )],
+        _ => Vec::new(),
+    }
+}
+
+fn admin_action_example_payload(action: &str) -> serde_json::Value {
+    match action {
+        "add_hive" => serde_json::json!({
+            "hive_id": "worker-220",
+            "address": "192.168.8.220"
+        }),
+        "run_node" => serde_json::json!({
+            "node_name": "AI.chat@motherbee",
+            "runtime_version": "current"
+        }),
+        "kill_node" => serde_json::json!({
+            "force": false
+        }),
+        "add_route" => serde_json::json!({
+            "prefix": "AI.chat.",
+            "action": "next_hop_hive",
+            "next_hop_hive": "worker-220"
+        }),
+        "delete_route" => serde_json::json!({
+            "prefix": "AI.chat."
+        }),
+        "add_vpn" => serde_json::json!({
+            "pattern": "worker-*",
+            "vpn_id": 220
+        }),
+        "delete_vpn" => serde_json::json!({
+            "pattern": "worker-*"
+        }),
+        "set_node_config" => serde_json::json!({
+            "config": {
+                "openai": {
+                    "default_model": "gpt-4.1-mini"
+                }
+            },
+            "replace": false,
+            "notify": true
+        }),
+        "send_node_message" => serde_json::json!({
+            "msg_type": "PING",
+            "payload": {
+                "ping": true
+            }
+        }),
+        "set_storage" => serde_json::json!({
+            "path": "/var/lib/fluxbee"
+        }),
+        "update" => serde_json::json!({
+            "manifest_hash": "sha256:deadbeef",
+            "category": "runtime",
+            "manifest_version": 42
+        }),
+        "sync_hint" => serde_json::json!({
+            "channel": "blob",
+            "wait_for_idle": true,
+            "timeout_ms": 30000
+        }),
+        "opa_compile_apply" | "opa_compile" | "opa_check" => serde_json::json!({
+            "rego": "package router\n\ndefault allow = true\n",
+            "entrypoint": "router/target"
+        }),
+        "opa_apply" => serde_json::json!({
+            "version": 12
+        }),
+        "opa_rollback" => serde_json::json!({
+            "version": 11
+        }),
+        "remove_runtime_version" => serde_json::json!({
+            "test_hold_ms": 250
+        }),
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn admin_action_example_scmd(action: &str) -> Option<String> {
+    let text = match action {
+        "list_admin_actions" => "curl -X GET /admin/actions",
+        "get_admin_action_help" => "curl -X GET /admin/actions/add_hive",
+        "hive_status" => "curl -X GET /hive/status",
+        "list_hives" => "curl -X GET /hives",
+        "get_hive" => "curl -X GET /hives/worker-220",
+        "add_hive" => {
+            r#"curl -X POST /hives -d '{"hive_id":"worker-220","address":"192.168.8.220"}'"#
+        }
+        "remove_hive" => "curl -X DELETE /hives/worker-220",
+        "list_nodes" => "curl -X GET /hives/motherbee/nodes",
+        "get_node_status" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/status",
+        "get_node_state" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/state",
+        "get_node_config" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/config",
+        "run_node" => {
+            r#"curl -X POST /hives/motherbee/nodes -d '{"node_name":"AI.chat@motherbee","runtime_version":"current"}'"#
+        }
+        "kill_node" => "curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee",
+        "remove_node_instance" => {
+            "curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee/instance"
+        }
+        "send_node_message" => {
+            r#"curl -X POST /hives/motherbee/nodes/SY.admin@motherbee/messages -d '{"msg_type":"PING","payload":{"ping":true}}'"#
+        }
+        "list_ilks" => "curl -X GET /hives/motherbee/identity/ilks",
+        "get_ilk" => "curl -X GET /hives/motherbee/identity/ilks/demo-ilk",
+        "inventory" => "curl -X GET /hives/motherbee/inventory/summary",
+        "list_versions" => "curl -X GET /versions",
+        "get_versions" => "curl -X GET /hives/motherbee/versions",
+        "list_runtimes" => "curl -X GET /hives/motherbee/runtimes",
+        "get_runtime" => "curl -X GET /hives/motherbee/runtimes/AI.chat",
+        "remove_runtime_version" => {
+            "curl -X DELETE /hives/motherbee/runtimes/AI.chat/versions/1.2.3"
+        }
+        "list_routes" => "curl -X GET /hives/motherbee/routes",
+        "add_route" => {
+            r#"curl -X POST /hives/motherbee/routes -d '{"prefix":"AI.chat.","action":"next_hop_hive","next_hop_hive":"worker-220"}'"#
+        }
+        "delete_route" => "curl -X DELETE /hives/motherbee/routes/AI.chat.",
+        "list_vpns" => "curl -X GET /hives/motherbee/vpns",
+        "add_vpn" => {
+            r#"curl -X POST /hives/motherbee/vpns -d '{"pattern":"worker-*","vpn_id":220}'"#
+        }
+        "delete_vpn" => "curl -X DELETE /hives/motherbee/vpns/worker-*",
+        "get_storage" => "curl -X GET /config/storage",
+        "set_storage" => r#"curl -X PUT /config/storage -d '{"path":"/var/lib/fluxbee"}'"#,
+        "list_deployments" => "curl -X GET /deployments",
+        "get_deployments" => "curl -X GET /hives/motherbee/deployments",
+        "list_drift_alerts" => "curl -X GET /drift-alerts",
+        "get_drift_alerts" => "curl -X GET /hives/motherbee/drift-alerts",
+        "update" => {
+            r#"curl -X POST /hives/motherbee/update -d '{"manifest_hash":"sha256:deadbeef","category":"runtime","manifest_version":42}'"#
+        }
+        "sync_hint" => {
+            r#"curl -X POST /hives/motherbee/sync-hint -d '{"channel":"blob","wait_for_idle":true,"timeout_ms":30000}'"#
+        }
+        "opa_get_policy" => "curl -X GET /hives/motherbee/opa/policy",
+        "opa_get_status" => "curl -X GET /hives/motherbee/opa/status",
+        "opa_compile_apply" => {
+            r#"curl -X POST /hives/motherbee/opa/policy -d '{"rego":"package router\n\ndefault allow = true\n","entrypoint":"router/target"}'"#
+        }
+        "opa_compile" => {
+            r#"curl -X POST /hives/motherbee/opa/policy/compile -d '{"rego":"package router\n\ndefault allow = true\n","entrypoint":"router/target"}'"#
+        }
+        "opa_apply" => r#"curl -X POST /hives/motherbee/opa/policy/apply -d '{"version":12}'"#,
+        "opa_rollback" => {
+            r#"curl -X POST /hives/motherbee/opa/policy/rollback -d '{"version":11}'"#
+        }
+        "opa_check" => {
+            r#"curl -X POST /hives/motherbee/opa/policy/check -d '{"rego":"package router\n\ndefault allow = true\n","entrypoint":"router/target"}'"#
+        }
+        _ => return None,
+    };
+    Some(text.to_string())
+}
+
+fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
+    match action {
+        "add_hive" | "remove_hive" => vec![
+            "Motherbee-only operation.",
+            "For HTTP usage the hive id is in the body for add_hive and in the path for remove_hive.",
+        ],
+        "run_node" => vec![
+            "runtime can be omitted when it is derivable from node_name.",
+            "For internal ADMIN_COMMAND dispatch, the hive target is encoded via payload.target; in HTTP it comes from /hives/{hive}.",
+        ],
+        "kill_node" | "remove_node_instance" | "set_node_config" | "send_node_message" => vec![
+            "The hive target comes from the /hives/{hive} path in HTTP.",
+            "The node_name path segment should be a fully-qualified Fluxbee node name.",
+        ],
+        "delete_route" | "delete_vpn" => vec![
+            "HTTP delete uses the final path segment as identifier.",
+            "Internal admin commands may still carry the identifier in payload.",
+        ],
+        "inventory" => vec![
+            "Use /summary for global counts and /hive for the detailed hive inventory view.",
+        ],
+        "update" => vec![
+            "Legacy fields version/hash are rejected; use manifest_version/manifest_hash.",
+        ],
+        "sync_hint" => vec![
+            "Defaults are channel=blob, wait_for_idle=true, timeout_ms=30000.",
+        ],
+        "opa_compile_apply" | "opa_compile" | "opa_check" => vec![
+            "rego is required for compile/check flows.",
+            "entrypoint defaults to router/target when omitted.",
+        ],
+        "opa_apply" => vec![
+            "version is required for apply.",
+        ],
+        "opa_rollback" => vec![
+            "If version is omitted, rollback uses the implementation default (currently 0).",
+        ],
+        "set_storage" => vec![
+            "This persists the local storage path in hive.yaml on the target hive.",
+        ],
+        _ => vec![],
+    }
+}
+
+fn admin_action_path_param(name: &str, value_type: &str, description: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "type": value_type,
+        "description": description,
+    })
+}
+
+fn admin_action_body_field(name: &str, value_type: &str, description: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "type": value_type,
+        "description": description,
+    })
 }
 
 async fn handle_admin_command(

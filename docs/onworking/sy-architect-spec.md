@@ -84,6 +84,7 @@ Current state in repo:
 - normal chat messages can go through a local `archi` agent when an OpenAI key is configured.
 - `SCMD:` remains a separate local/system path and does not invoke the AI provider.
 - the local agent can already use read-only socket-backed tools against `SY.admin` for live system state.
+- current limitation: chat history is persisted locally, but the AI turn still sends only the latest user message plus system prompt/tool loop context; prior session messages are not yet rehydrated into model input.
 - streaming, multi-agent routing, and prompt assets by role are still pending.
 
 ---
@@ -756,6 +757,7 @@ This is now the highest-value execution track. `SY.architect` should converge to
 Note:
 - `SY.admin` should be the canonical dynamic help surface for action discovery.
 - `archi` should prefer `/admin/actions` and `/admin/actions/{action}` over hardcoded prompt knowledge when it is unsure about available operations.
+- `SY.admin` help should expose standardized request-contract metadata (`path_params`, body fields, notes, examples) so new actions do not require prompt surgery in `SY.architect`.
 
 ### Phase D — Prompt Assets And Build-Time Policy
 
@@ -799,6 +801,10 @@ This is intentionally later. The node should already be operational without it.
   - heurística simple por intención
 - [x] ARCH-T12.1. Separar pipeline de mensajes normales vs mensajes de control; `SCMD:` no debe invocar al proveedor AI.
 - [x] ARCH-T12.2. Exponer tools read-only del sistema al agente local usando `ADMIN_COMMAND` sobre socket.
+- [ ] ARCH-T12.3. Rehidratar contexto conversacional por sesión en cada turno AI:
+  - cargar historial reciente de la sesión desde LanceDB
+  - definir windowing/truncation para no crecer sin control
+  - decidir si tool results previos entran completos, resumidos o solo como metadata operacional
 - [ ] ARCH-T6. Implementar endpoint WebSocket de chat bidireccional.
 - [ ] ARCH-T10. Implementar streaming token-by-token hacia WebSocket.
 

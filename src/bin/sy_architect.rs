@@ -48,6 +48,7 @@ Rules:
 - Prefer short concrete answers over long explanations.
 - If the user asks about system state, deployments, nodes, hives, identity, or operations, prefer SCMD/system operations when available.
 - If you are unsure which Fluxbee action or path exists, inspect `/admin/actions` or `/admin/actions/{action}` before answering.
+- The admin help endpoint includes a standardized request contract with path params, body fields, notes, and example SCMD. Use it instead of guessing payloads.
 - Use the available read-only system tool when you need live Fluxbee state instead of guessing.
 - For mutations, use the write tool only to stage the action. Then instruct the operator to reply CONFIRM or CANCEL. Do not claim the mutation ran before confirmation.
 - Do not claim actions were executed unless they actually were.
@@ -301,7 +302,7 @@ impl FunctionTool for ArchitectSystemGetTool {
         FunctionToolDefinition {
             name: "fluxbee_system_get".to_string(),
             description: format!(
-                "Read live Fluxbee system state through SY.admin over socket for hive {}. Read-only. Supports GET paths and safe POST checks such as OPA policy validation. Use /admin/actions or /admin/actions/{{action}} when you need dynamic help. Example paths: /hives/{}/inventory/summary, /hives/{}/nodes, /hives/{}/nodes/SY.admin@{}/status, /hives/{}/identity/ilks, /admin/actions, /admin/actions/get_node_status, /config/storage",
+                "Read live Fluxbee system state through SY.admin over socket for hive {}. Read-only. Supports GET paths and safe POST checks such as OPA policy validation. Use /admin/actions or /admin/actions/{{action}} when you need dynamic help; those responses include standardized request_contract metadata, body fields, notes, and example_scmd values. Example paths: /hives/{}/inventory/summary, /hives/{}/nodes, /hives/{}/nodes/SY.admin@{}/status, /hives/{}/identity/ilks, /admin/actions, /admin/actions/get_node_status, /config/storage",
                 self.context.hive_id,
                 self.context.hive_id,
                 self.context.hive_id,
@@ -385,7 +386,7 @@ impl FunctionTool for ArchitectSystemWriteTool {
         FunctionToolDefinition {
             name: "fluxbee_system_write".to_string(),
             description: format!(
-                "Prepare a mutating Fluxbee admin action for hive {}. This tool does not execute immediately. It stages the action and requires explicit user confirmation in chat with CONFIRM or CANCEL. Use it for run_node, route/vpn changes, config writes, OPA apply flows, and other mutations.",
+                "Prepare a mutating Fluxbee admin action for hive {}. This tool does not execute immediately. It stages the action and requires explicit user confirmation in chat with CONFIRM or CANCEL. When mutation payloads are unclear, inspect /admin/actions/{{action}} first and use the request_contract/example_scmd guidance from SY.admin.",
                 self.context.hive_id,
             ),
             parameters_json_schema: json!({
@@ -1108,6 +1109,7 @@ fn admin_action_allows_ai_write(action: &str) -> bool {
             | "run_node"
             | "kill_node"
             | "remove_node_instance"
+            | "remove_runtime_version"
             | "set_node_config"
             | "send_node_message"
             | "set_storage"
@@ -1305,6 +1307,20 @@ fn translate_scmd(
             target_hive: (*hive_id).to_string(),
             params: json!({ "runtime": runtime }),
         }),
+        ("DELETE", ["hives", hive_id, "runtimes", runtime, "versions", version]) => {
+            let mut params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for remove_runtime_version must be a JSON object".into());
+            }
+            params["runtime"] = Value::String((*runtime).to_string());
+            params["runtime_version"] = Value::String((*version).to_string());
+            Ok(AdminTranslation {
+                admin_target,
+                action: "remove_runtime_version".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
         ("GET", ["hives", hive_id, "routes"]) => Ok(AdminTranslation {
             admin_target,
             action: "list_routes".to_string(),
@@ -1335,6 +1351,12 @@ fn translate_scmd(
                 params,
             })
         }
+        ("DELETE", ["hives", hive_id, "routes", prefix]) => Ok(AdminTranslation {
+            admin_target,
+            action: "delete_route".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({ "prefix": prefix }),
+        }),
         ("GET", ["hives", hive_id, "vpns"]) => Ok(AdminTranslation {
             admin_target,
             action: "list_vpns".to_string(),
@@ -1365,6 +1387,12 @@ fn translate_scmd(
                 params,
             })
         }
+        ("DELETE", ["hives", hive_id, "vpns", pattern]) => Ok(AdminTranslation {
+            admin_target,
+            action: "delete_vpn".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({ "pattern": pattern }),
+        }),
         ("GET", ["hives", hive_id, "deployments"]) => Ok(AdminTranslation {
             admin_target,
             action: "get_deployments".to_string(),
