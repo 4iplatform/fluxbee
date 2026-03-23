@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -39,6 +40,7 @@ const DEFAULT_ARCHITECT_MODEL: &str = "gpt-4.1-mini";
 const ROUTER_RECONNECT_DELAY_SECS: u64 = 2;
 const CHAT_SESSIONS_TABLE: &str = "sessions";
 const CHAT_MESSAGES_TABLE: &str = "messages";
+const CHAT_OPERATIONS_TABLE: &str = "operations";
 const ARCHI_SYSTEM_PROMPT: &str = r#"You are archi, the Fluxbee system architect.
 
 Operate as a concise technical assistant for the Fluxbee control plane.
@@ -110,6 +112,7 @@ struct ArchitectAdminToolContext {
     state_dir: PathBuf,
     socket_dir: PathBuf,
     session_id: Option<String>,
+    chat_lock: Arc<Mutex<()>>,
     pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
 }
 
@@ -123,7 +126,7 @@ struct ArchitectState {
     router_connected: AtomicBool,
     ai_configured: AtomicBool,
     ai_runtime: Option<ArchitectAiRuntime>,
-    chat_lock: Mutex<()>,
+    chat_lock: Arc<Mutex<()>>,
     pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
 }
 
@@ -235,6 +238,27 @@ struct ChatMessageRecord {
     seq: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ChatOperationRecord {
+    operation_id: String,
+    session_id: String,
+    scope_id: String,
+    origin: String,
+    action: String,
+    target_hive: String,
+    params_json: String,
+    params_hash: String,
+    preview_command: String,
+    status: String,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+    dispatched_at_ms: u64,
+    completed_at_ms: u64,
+    request_id: String,
+    trace_id: String,
+    error_summary: String,
+}
+
 #[derive(Debug)]
 struct ParsedScmd {
     method: String,
@@ -252,6 +276,7 @@ struct AdminTranslation {
 
 #[derive(Debug, Clone)]
 struct PendingAdminAction {
+    operation_id: String,
     translation: AdminTranslation,
     preview_command: String,
     created_at_ms: u64,
@@ -466,13 +491,105 @@ impl FunctionTool for ArchitectSystemWriteTool {
         }
 
         let preview_command = format!("SCMD: {raw}");
+        let operation_id = Uuid::new_v4().to_string();
+        let scope_id = operation_scope_id(session_id);
+        let normalized_params = normalize_json(&translation.params);
+        let params_json =
+            serde_json::to_string(&normalized_params).unwrap_or_else(|_| "{}".to_string());
+        let params_hash_value = params_hash(&translation.params);
+        if let Some(mut existing) = find_equivalent_operation_with_context(
+            &self.context,
+            session_id,
+            &translation.action,
+            &translation.target_hive,
+            &params_hash_value,
+        )
+        .await
+        .map_err(|err| {
+            fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                "failed to inspect prior operations: {err}"
+            ))
+        })? {
+            if existing.status == "timeout_unknown" && translation.action == "add_hive" {
+                let params = normalized_params.clone();
+                if let Some(hive_id) = params.get("hive_id").and_then(Value::as_str) {
+                    let output = execute_admin_translation_with_context(
+                        &self.context,
+                        AdminTranslation {
+                            admin_target: format!("SY.admin@{}", self.context.hive_id),
+                            action: "get_hive".to_string(),
+                            target_hive: self.context.hive_id.clone(),
+                            params: json!({ "hive_id": hive_id }),
+                        },
+                        "tool.reconcile",
+                    )
+                    .await
+                    .map_err(|err| {
+                        fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                            "failed to reconcile prior timeout: {err}"
+                        ))
+                    })?;
+                    if output
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(|value| value.eq_ignore_ascii_case("ok"))
+                        .unwrap_or(false)
+                    {
+                        existing.status = "succeeded_after_timeout".to_string();
+                        existing.updated_at_ms = now_epoch_ms();
+                        existing.completed_at_ms = existing.updated_at_ms;
+                        existing.error_summary.clear();
+                        save_operation_with_context(&self.context, &existing)
+                            .await
+                            .map_err(|err| {
+                                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                                    "failed to persist reconciled operation: {err}"
+                                ))
+                            })?;
+                        return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                            "A previous add_hive operation already completed after a timeout for hive '{}'. Do not retry blindly; inspect the hive state first.",
+                            hive_id
+                        )));
+                    }
+                }
+            }
+            return Err(fluxbee_ai_sdk::AiSdkError::Protocol(
+                operation_error_message(&existing),
+            ));
+        }
+        let created_at_ms = now_epoch_ms();
+        let operation = ChatOperationRecord {
+            operation_id: operation_id.clone(),
+            session_id: session_id.to_string(),
+            scope_id,
+            origin: "ai_write_stage".to_string(),
+            action: translation.action.clone(),
+            target_hive: translation.target_hive.clone(),
+            params_json: params_json.clone(),
+            params_hash: params_hash_value,
+            preview_command: preview_command.clone(),
+            status: "pending_confirm".to_string(),
+            created_at_ms,
+            updated_at_ms: created_at_ms,
+            dispatched_at_ms: 0,
+            completed_at_ms: 0,
+            request_id: String::new(),
+            trace_id: String::new(),
+            error_summary: String::new(),
+        };
+        save_operation_with_context(&self.context, &operation)
+            .await
+            .map_err(|err| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                    "failed to persist staged operation: {err}"
+                ))
+            })?;
         let pending = PendingAdminAction {
+            operation_id: operation_id.clone(),
             translation: translation.clone(),
             preview_command: preview_command.clone(),
-            created_at_ms: now_epoch_ms(),
+            created_at_ms,
         };
-        let params_json =
-            serde_json::to_string(&translation.params).unwrap_or_else(|_| "{}".to_string());
         self.context
             .pending_actions
             .lock()
@@ -483,12 +600,14 @@ impl FunctionTool for ArchitectSystemWriteTool {
             action = %translation.action,
             target_hive = %translation.target_hive,
             tool_arguments = %raw_arguments,
+            operation_id = %operation_id,
             preview_command = %preview_command,
             params = %params_json,
             "sy.architect staged admin write"
         );
 
         Ok(json!({
+            "operation_id": operation_id,
             "pending_confirmation": true,
             "requires_confirmation": true,
             "action": translation.action,
@@ -538,7 +657,7 @@ async fn main() -> Result<(), ArchitectError> {
         router_connected: AtomicBool::new(false),
         ai_configured: AtomicBool::new(ai_runtime.is_some()),
         ai_runtime,
-        chat_lock: Mutex::new(()),
+        chat_lock: Arc::new(Mutex::new(())),
         pending_actions: Arc::new(Mutex::new(HashMap::new())),
     });
 
@@ -675,6 +794,7 @@ fn admin_tool_context(
         state_dir: state.state_dir.clone(),
         socket_dir: state.socket_dir.clone(),
         session_id: session_id.map(str::to_string),
+        chat_lock: Arc::clone(&state.chat_lock),
         pending_actions: Arc::clone(&state.pending_actions),
     }
 }
@@ -907,31 +1027,34 @@ async fn handle_chat_message(
                 let action_name = pending.translation.action.clone();
                 let preview_command = pending.preview_command.clone();
                 let pending_created_at_ms = pending.created_at_ms;
-                match execute_admin_translation(state, pending.translation).await {
-                    Ok(mut output) => {
-                        output["confirmed_command"] = Value::String(preview_command);
-                        output["pending_created_at_ms"] = json!(pending_created_at_ms);
-                        output["confirmed_at_ms"] = json!(now_epoch_ms());
-                        let status = chat_status_from_command_output(&output);
-                        ChatResponse {
-                            status,
-                            mode: "scmd".to_string(),
-                            output,
-                            session_id: Some(resolved_session_id.clone()),
-                            session_title: Some(session.title.clone()),
-                        }
-                    }
-                    Err(err) => ChatResponse {
-                        status: "error".to_string(),
-                        mode: "scmd".to_string(),
-                        output: json!({
-                            "action": action_name,
-                            "confirmed_command": preview_command,
-                            "error": err.to_string()
-                        }),
-                        session_id: Some(resolved_session_id.clone()),
-                        session_title: Some(session.title.clone()),
-                    },
+                let mut output = match execute_tracked_admin_translation(
+                    state,
+                    &resolved_session_id,
+                    "ai_confirmed",
+                    pending.translation,
+                    preview_command.clone(),
+                    Some(pending.operation_id),
+                )
+                .await
+                {
+                    Ok(output) => output,
+                    Err(err) => json!({
+                        "status": "error",
+                        "action": action_name,
+                        "confirmed_command": preview_command,
+                        "error": err.to_string()
+                    }),
+                };
+                output["confirmed_command"] = Value::String(preview_command);
+                output["pending_created_at_ms"] = json!(pending_created_at_ms);
+                output["confirmed_at_ms"] = json!(now_epoch_ms());
+                let status = chat_status_from_command_output(&output);
+                ChatResponse {
+                    status,
+                    mode: "scmd".to_string(),
+                    output,
+                    session_id: Some(resolved_session_id.clone()),
+                    session_title: Some(session.title.clone()),
                 }
             }
             None => ChatResponse {
@@ -946,16 +1069,44 @@ async fn handle_chat_message(
         }
     } else if cancellation_requested(trimmed_message) {
         match clear_pending_action(state, &resolved_session_id).await {
-            Some(pending) => ChatResponse {
-                status: "ok".to_string(),
-                mode: "chat".to_string(),
-                output: json!({
-                    "message": format!("Pending action discarded: {}", pending.preview_command),
-                    "pending_created_at_ms": pending.created_at_ms,
-                }),
-                session_id: Some(resolved_session_id.clone()),
-                session_title: Some(session.title.clone()),
-            },
+            Some(pending) => {
+                let now = now_epoch_ms();
+                let params_json =
+                    serde_json::to_string(&normalize_json(&pending.translation.params))
+                        .unwrap_or_else(|_| "{}".to_string());
+                let record = ChatOperationRecord {
+                    operation_id: pending.operation_id,
+                    session_id: resolved_session_id.clone(),
+                    scope_id: operation_scope_id(&resolved_session_id),
+                    origin: "ai_write_stage".to_string(),
+                    action: pending.translation.action,
+                    target_hive: pending.translation.target_hive,
+                    params_json,
+                    params_hash: params_hash(&pending.translation.params),
+                    preview_command: pending.preview_command.clone(),
+                    status: "canceled".to_string(),
+                    created_at_ms: pending.created_at_ms,
+                    updated_at_ms: now,
+                    dispatched_at_ms: 0,
+                    completed_at_ms: now,
+                    request_id: String::new(),
+                    trace_id: String::new(),
+                    error_summary: String::new(),
+                };
+                let save_result = save_operation(state, &record).await;
+                ChatResponse {
+                    status: "ok".to_string(),
+                    mode: "chat".to_string(),
+                    output: json!({
+                        "message": format!("Pending action discarded: {}", pending.preview_command),
+                        "pending_created_at_ms": pending.created_at_ms,
+                        "operation_id": record.operation_id,
+                        "tracking_saved": save_result.is_ok(),
+                    }),
+                    session_id: Some(resolved_session_id.clone()),
+                    session_title: Some(session.title.clone()),
+                }
+            }
             None => ChatResponse {
                 status: "error".to_string(),
                 mode: "chat".to_string(),
@@ -967,7 +1118,7 @@ async fn handle_chat_message(
             },
         }
     } else if let Some(raw) = message.strip_prefix("SCMD:") {
-        match handle_scmd(state, raw.trim()).await {
+        match handle_scmd(state, &resolved_session_id, raw.trim()).await {
             Ok(output) => {
                 let status = chat_status_from_command_output(&output);
                 ChatResponse {
@@ -1104,10 +1255,26 @@ async fn handle_ai_chat(
     }))
 }
 
-async fn handle_scmd(state: &ArchitectState, raw: &str) -> Result<Value, ArchitectError> {
+async fn handle_scmd(
+    state: &ArchitectState,
+    session_id: &str,
+    raw: &str,
+) -> Result<Value, ArchitectError> {
     let parsed = parse_scmd(raw)?;
     let translated = translate_scmd(&state.hive_id, parsed)?;
-    execute_admin_translation(state, translated).await
+    if is_mutating_admin_action(&translated.action) {
+        execute_tracked_admin_translation(
+            state,
+            session_id,
+            "scmd",
+            translated,
+            format!("SCMD: {raw}"),
+            None,
+        )
+        .await
+    } else {
+        execute_admin_translation(state, translated).await
+    }
 }
 
 fn scmd_raw_from_parts(method: &str, path: &str, body: Option<&Value>) -> String {
@@ -1147,6 +1314,60 @@ fn admin_action_allows_ai_write(action: &str) -> bool {
     )
 }
 
+async fn reconcile_timeout_unknown_operation(
+    state: &ArchitectState,
+    record: &mut ChatOperationRecord,
+) -> Result<bool, ArchitectError> {
+    if record.status != "timeout_unknown" {
+        return Ok(false);
+    }
+
+    if record.action == "add_hive" {
+        let params: Value = serde_json::from_str(&record.params_json)
+            .unwrap_or_else(|_| Value::Object(Default::default()));
+        if let Some(hive_id) = params.get("hive_id").and_then(Value::as_str) {
+            let output = execute_admin_translation(
+                state,
+                AdminTranslation {
+                    admin_target: format!("SY.admin@{}", state.hive_id),
+                    action: "get_hive".to_string(),
+                    target_hive: state.hive_id.clone(),
+                    params: json!({ "hive_id": hive_id }),
+                },
+            )
+            .await?;
+            if output
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|value| value.eq_ignore_ascii_case("ok"))
+                .unwrap_or(false)
+            {
+                record.status = "succeeded_after_timeout".to_string();
+                record.updated_at_ms = now_epoch_ms();
+                record.completed_at_ms = record.updated_at_ms;
+                record.error_summary.clear();
+                save_operation(state, record).await?;
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn operation_status_from_output(output: &Value) -> String {
+    match output
+        .get("status")
+        .and_then(Value::as_str)
+        .map(|value| value.to_ascii_lowercase())
+    {
+        Some(status) if status == "ok" => "succeeded".to_string(),
+        Some(status) if status == "error" => "failed".to_string(),
+        Some(status) => status,
+        None => "succeeded".to_string(),
+    }
+}
+
 fn parse_scmd(raw: &str) -> Result<ParsedScmd, ArchitectError> {
     let mut text = raw.trim();
     if !text.starts_with("curl ") {
@@ -1178,6 +1399,71 @@ fn chat_status_from_command_output(output: &Value) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or("ok")
         .to_string()
+}
+
+fn is_mutating_admin_action(action: &str) -> bool {
+    admin_action_allows_ai_write(action)
+}
+
+fn operation_scope_id(session_id: &str) -> String {
+    format!("chat:{session_id}")
+}
+
+fn normalize_json(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(normalize_json).collect()),
+        Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                if let Some(entry) = map.get(&key) {
+                    out.insert(key, normalize_json(entry));
+                }
+            }
+            Value::Object(out)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn params_hash(value: &Value) -> String {
+    let normalized = serde_json::to_string(&normalize_json(value)).unwrap_or_else(|_| "{}".into());
+    let mut hasher = DefaultHasher::new();
+    normalized.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn is_terminal_operation_status(status: &str) -> bool {
+    matches!(
+        status,
+        "succeeded" | "succeeded_after_timeout" | "failed" | "canceled" | "replaced"
+    )
+}
+
+fn is_ambiguous_operation_status(status: &str) -> bool {
+    matches!(status, "dispatched" | "running" | "timeout_unknown")
+}
+
+fn operation_error_message(record: &ChatOperationRecord) -> String {
+    match record.status.as_str() {
+        "pending_confirm" => format!(
+            "There is already a prepared operation waiting for confirmation in this chat: {}",
+            record.preview_command
+        ),
+        "dispatched" | "running" => format!(
+            "An equivalent operation is already running in this chat (operation {}). Wait for it to finish before retrying.",
+            record.operation_id
+        ),
+        "timeout_unknown" => format!(
+            "An equivalent operation timed out locally but may still be running (operation {}). Inspect the result before retrying.",
+            record.operation_id
+        ),
+        _ => format!(
+            "An equivalent operation is already tracked in this chat (operation {}).",
+            record.operation_id
+        ),
+    }
 }
 
 fn env_timeout_secs(name: &str) -> Option<u64> {
@@ -1647,6 +1933,135 @@ async fn execute_admin_translation(
         .await
 }
 
+async fn execute_tracked_admin_translation(
+    state: &ArchitectState,
+    session_id: &str,
+    origin: &str,
+    translation: AdminTranslation,
+    preview_command: String,
+    existing_operation_id: Option<String>,
+) -> Result<Value, ArchitectError> {
+    let params_hash_value = params_hash(&translation.params);
+    let existing_match = find_equivalent_operation(
+        state,
+        session_id,
+        &translation.action,
+        &translation.target_hive,
+        &params_hash_value,
+    )
+    .await?;
+    if let Some(mut existing) = existing_match.clone() {
+        let existing_id = existing.operation_id.clone();
+        let current_id = existing_operation_id.as_deref();
+        if current_id != Some(existing_id.as_str()) {
+            if existing.status == "timeout_unknown" {
+                let _ = reconcile_timeout_unknown_operation(state, &mut existing).await;
+            }
+            if !is_terminal_operation_status(&existing.status) {
+                return Ok(json!({
+                    "status": "error",
+                    "action": translation.action,
+                    "error_code": "OPERATION_ALREADY_TRACKED",
+                    "error_detail": operation_error_message(&existing),
+                    "operation_id": existing.operation_id,
+                    "confirmed_command": preview_command,
+                }));
+            }
+        }
+    }
+
+    let now = now_epoch_ms();
+    let params_json =
+        serde_json::to_string(&normalize_json(&translation.params)).unwrap_or_else(|_| "{}".into());
+    let created_at_ms = existing_match
+        .as_ref()
+        .filter(|record| existing_operation_id.as_deref() == Some(record.operation_id.as_str()))
+        .map(|record| record.created_at_ms)
+        .unwrap_or(now);
+    let origin_value = existing_match
+        .as_ref()
+        .filter(|record| existing_operation_id.as_deref() == Some(record.operation_id.as_str()))
+        .map(|record| record.origin.clone())
+        .unwrap_or_else(|| origin.to_string());
+    let mut operation = ChatOperationRecord {
+        operation_id: existing_operation_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        session_id: session_id.to_string(),
+        scope_id: operation_scope_id(session_id),
+        origin: origin_value,
+        action: translation.action.clone(),
+        target_hive: translation.target_hive.clone(),
+        params_json,
+        params_hash: params_hash_value,
+        preview_command: preview_command.clone(),
+        status: "dispatched".to_string(),
+        created_at_ms,
+        updated_at_ms: now,
+        dispatched_at_ms: now,
+        completed_at_ms: 0,
+        request_id: String::new(),
+        trace_id: String::new(),
+        error_summary: String::new(),
+    };
+    save_operation(state, &operation).await?;
+
+    match execute_admin_translation(state, translation).await {
+        Ok(mut output) => {
+            operation.status = operation_status_from_output(&output);
+            operation.updated_at_ms = now_epoch_ms();
+            if is_terminal_operation_status(&operation.status) {
+                operation.completed_at_ms = operation.updated_at_ms;
+            }
+            operation.request_id = output
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            operation.trace_id = output
+                .get("trace_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            operation.error_summary = output
+                .get("error_detail")
+                .and_then(Value::as_str)
+                .or_else(|| output.get("error_code").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            save_operation(state, &operation).await?;
+            output["operation_id"] = Value::String(operation.operation_id);
+            output["operation_status"] = Value::String(operation.status);
+            Ok(output)
+        }
+        Err(err) => {
+            let err_text = err.to_string();
+            operation.status = if err_text.contains("timeout waiting ADMIN_COMMAND_RESPONSE") {
+                "timeout_unknown".to_string()
+            } else {
+                "failed".to_string()
+            };
+            operation.updated_at_ms = now_epoch_ms();
+            if is_terminal_operation_status(&operation.status) {
+                operation.completed_at_ms = operation.updated_at_ms;
+            }
+            operation.error_summary = err_text.clone();
+            save_operation(state, &operation).await?;
+            Ok(json!({
+                "status": if operation.status == "timeout_unknown" { "error" } else { "error" },
+                "action": operation.action,
+                "error_code": if operation.status == "timeout_unknown" { "TIMEOUT_UNKNOWN" } else { "EXECUTION_FAILED" },
+                "error_detail": if operation.status == "timeout_unknown" {
+                    "The operation timed out locally but may still be running. Inspect system state before retrying."
+                } else {
+                    err_text.as_str()
+                },
+                "operation_id": operation.operation_id,
+                "operation_status": operation.status,
+                "confirmed_command": preview_command,
+            }))
+        }
+    }
+}
+
 async fn execute_admin_translation_with_context(
     context: &ArchitectAdminToolContext,
     translation: AdminTranslation,
@@ -1919,6 +2334,7 @@ async fn ensure_chat_storage(state: &ArchitectState) -> Result<(), ArchitectErro
     let db = open_architect_db(state).await?;
     let _ = ensure_sessions_table(&db).await?;
     let _ = ensure_messages_table(&db).await?;
+    let _ = ensure_operations_table(&db).await?;
     Ok(())
 }
 
@@ -1957,6 +2373,17 @@ async fn ensure_messages_table(db: &Connection) -> Result<lancedb::Table, Archit
     }
 }
 
+async fn ensure_operations_table(db: &Connection) -> Result<lancedb::Table, ArchitectError> {
+    match db.open_table(CHAT_OPERATIONS_TABLE).execute().await {
+        Ok(table) => Ok(table),
+        Err(_) => db
+            .create_empty_table(CHAT_OPERATIONS_TABLE, chat_operations_schema())
+            .execute()
+            .await
+            .map_err(|err| -> ArchitectError { Box::new(err) }),
+    }
+}
+
 fn chat_sessions_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("session_id", DataType::Utf8, false),
@@ -1979,6 +2406,28 @@ fn chat_messages_schema() -> Arc<Schema> {
         Field::new("mode", DataType::Utf8, false),
         Field::new("metadata_json", DataType::Utf8, false),
         Field::new("seq", DataType::UInt64, false),
+    ]))
+}
+
+fn chat_operations_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("operation_id", DataType::Utf8, false),
+        Field::new("session_id", DataType::Utf8, false),
+        Field::new("scope_id", DataType::Utf8, false),
+        Field::new("origin", DataType::Utf8, false),
+        Field::new("action", DataType::Utf8, false),
+        Field::new("target_hive", DataType::Utf8, false),
+        Field::new("params_json", DataType::Utf8, false),
+        Field::new("params_hash", DataType::Utf8, false),
+        Field::new("preview_command", DataType::Utf8, false),
+        Field::new("status", DataType::Utf8, false),
+        Field::new("created_at_ms", DataType::UInt64, false),
+        Field::new("updated_at_ms", DataType::UInt64, false),
+        Field::new("dispatched_at_ms", DataType::UInt64, false),
+        Field::new("completed_at_ms", DataType::UInt64, false),
+        Field::new("request_id", DataType::Utf8, false),
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("error_summary", DataType::Utf8, false),
     ]))
 }
 
@@ -2064,6 +2513,7 @@ async fn delete_chat_session(
     let db = open_architect_db(state).await?;
     let sessions = ensure_sessions_table(&db).await?;
     let messages = ensure_messages_table(&db).await?;
+    let operations = ensure_operations_table(&db).await?;
     let filter = session_filter(session_id);
 
     let deleted_messages = count_session_messages(&messages, session_id).await?;
@@ -2085,6 +2535,10 @@ async fn delete_chat_session(
             .await
             .map_err(|err| -> ArchitectError { Box::new(err) })?;
     }
+    operations
+        .delete(&filter)
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
 
     Ok(SessionDeleteResponse {
         status: "ok".to_string(),
@@ -2101,6 +2555,7 @@ async fn clear_chat_sessions(
     let db = open_architect_db(state).await?;
     let sessions = ensure_sessions_table(&db).await?;
     let messages = ensure_messages_table(&db).await?;
+    let operations = ensure_operations_table(&db).await?;
 
     let deleted_sessions = count_all_rows(&sessions).await?;
     let deleted_messages = count_all_rows(&messages).await?;
@@ -2117,6 +2572,10 @@ async fn clear_chat_sessions(
             .await
             .map_err(|err| -> ArchitectError { Box::new(err) })?;
     }
+    operations
+        .delete("operation_id IS NOT NULL")
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
 
     Ok(SessionDeleteResponse {
         status: "ok".to_string(),
@@ -2276,6 +2735,115 @@ async fn load_session_messages(
     Ok(rows.into_iter().map(message_record_to_persisted).collect())
 }
 
+async fn load_session_operations(
+    table: &lancedb::Table,
+    session_id: &str,
+) -> Result<Vec<ChatOperationRecord>, ArchitectError> {
+    let filter = session_filter(session_id);
+    let batches = table
+        .query()
+        .only_if(filter)
+        .select(Select::columns(&[
+            "operation_id",
+            "session_id",
+            "scope_id",
+            "origin",
+            "action",
+            "target_hive",
+            "params_json",
+            "params_hash",
+            "preview_command",
+            "status",
+            "created_at_ms",
+            "updated_at_ms",
+            "dispatched_at_ms",
+            "completed_at_ms",
+            "request_id",
+            "trace_id",
+            "error_summary",
+        ]))
+        .execute()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    let mut rows = parse_operation_records(&batches)?;
+    rows.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+    });
+    Ok(rows)
+}
+
+async fn find_equivalent_operation(
+    state: &ArchitectState,
+    session_id: &str,
+    action: &str,
+    target_hive: &str,
+    params_hash_value: &str,
+) -> Result<Option<ChatOperationRecord>, ArchitectError> {
+    let _guard = state.chat_lock.lock().await;
+    let db = open_architect_db(state).await?;
+    let operations = ensure_operations_table(&db).await?;
+    let rows = load_session_operations(&operations, session_id).await?;
+    Ok(rows.into_iter().find(|row| {
+        row.action == action
+            && row.target_hive == target_hive
+            && row.params_hash == params_hash_value
+            && !is_terminal_operation_status(&row.status)
+    }))
+}
+
+async fn save_operation(
+    state: &ArchitectState,
+    record: &ChatOperationRecord,
+) -> Result<(), ArchitectError> {
+    let _guard = state.chat_lock.lock().await;
+    let db = open_architect_db(state).await?;
+    let operations = ensure_operations_table(&db).await?;
+    upsert_operation_record(&operations, record).await
+}
+
+async fn open_architect_db_for_hive(hive_id: &str) -> Result<Connection, ArchitectError> {
+    let path = architect_node_dir(hive_id).join("architect.lance");
+    fs::create_dir_all(&path)?;
+    lancedb::connect(path.to_string_lossy().as_ref())
+        .execute()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })
+}
+
+async fn find_equivalent_operation_with_context(
+    context: &ArchitectAdminToolContext,
+    session_id: &str,
+    action: &str,
+    target_hive: &str,
+    params_hash_value: &str,
+) -> Result<Option<ChatOperationRecord>, ArchitectError> {
+    let _guard = context.chat_lock.lock().await;
+    let db = open_architect_db_for_hive(&context.hive_id).await?;
+    let operations = ensure_operations_table(&db).await?;
+    let rows = load_session_operations(&operations, session_id).await?;
+    Ok(rows.into_iter().find(|row| {
+        row.action == action
+            && row.target_hive == target_hive
+            && row.params_hash == params_hash_value
+            && !is_terminal_operation_status(&row.status)
+    }))
+}
+
+async fn save_operation_with_context(
+    context: &ArchitectAdminToolContext,
+    record: &ChatOperationRecord,
+) -> Result<(), ArchitectError> {
+    let _guard = context.chat_lock.lock().await;
+    let db = open_architect_db_for_hive(&context.hive_id).await?;
+    let operations = ensure_operations_table(&db).await?;
+    upsert_operation_record(&operations, record).await
+}
+
 async fn count_session_messages(
     table: &lancedb::Table,
     session_id: &str,
@@ -2320,6 +2888,22 @@ async fn append_message_record(
     table
         .add(batch)
         .execute()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    Ok(())
+}
+
+async fn upsert_operation_record(
+    table: &lancedb::Table,
+    record: &ChatOperationRecord,
+) -> Result<(), ArchitectError> {
+    let batch = operation_batch_from_rows(std::slice::from_ref(record))?;
+    let mut merge = table.merge_insert(&["operation_id"]);
+    merge
+        .when_matched_update_all(None)
+        .when_not_matched_insert_all();
+    merge
+        .execute(single_batch_reader(batch))
         .await
         .map_err(|err| -> ArchitectError { Box::new(err) })?;
     Ok(())
@@ -2416,6 +3000,97 @@ fn message_batch_from_rows(rows: &[ChatMessageRecord]) -> Result<RecordBatch, Ar
     Ok(batch)
 }
 
+fn operation_batch_from_rows(rows: &[ChatOperationRecord]) -> Result<RecordBatch, ArchitectError> {
+    let schema = chat_operations_schema();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.operation_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.session_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.scope_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.origin.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.action.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.target_hive.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.params_json.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.params_hash.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.preview_command.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.status.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|row| row.created_at_ms).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|row| row.updated_at_ms).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter()
+                    .map(|row| row.dispatched_at_ms)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter()
+                    .map(|row| row.completed_at_ms)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.request_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.trace_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.error_summary.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    Ok(batch)
+}
+
 fn parse_session_batches(batches: &[RecordBatch]) -> Result<Vec<SessionSummary>, ArchitectError> {
     Ok(parse_session_records(batches)?
         .into_iter()
@@ -2473,6 +3148,53 @@ fn parse_message_records(
                 mode: modes.value(idx).to_string(),
                 metadata_json: metadata.value(idx).to_string(),
                 seq: seqs.value(idx),
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn parse_operation_records(
+    batches: &[RecordBatch],
+) -> Result<Vec<ChatOperationRecord>, ArchitectError> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let operation_ids = string_column(batch, "operation_id")?;
+        let session_ids = string_column(batch, "session_id")?;
+        let scope_ids = string_column(batch, "scope_id")?;
+        let origins = string_column(batch, "origin")?;
+        let actions = string_column(batch, "action")?;
+        let target_hives = string_column(batch, "target_hive")?;
+        let params_json = string_column(batch, "params_json")?;
+        let params_hash = string_column(batch, "params_hash")?;
+        let preview_commands = string_column(batch, "preview_command")?;
+        let statuses = string_column(batch, "status")?;
+        let created = u64_column(batch, "created_at_ms")?;
+        let updated = u64_column(batch, "updated_at_ms")?;
+        let dispatched = u64_column(batch, "dispatched_at_ms")?;
+        let completed = u64_column(batch, "completed_at_ms")?;
+        let request_ids = string_column(batch, "request_id")?;
+        let trace_ids = string_column(batch, "trace_id")?;
+        let error_summaries = string_column(batch, "error_summary")?;
+        for idx in 0..batch.num_rows() {
+            out.push(ChatOperationRecord {
+                operation_id: operation_ids.value(idx).to_string(),
+                session_id: session_ids.value(idx).to_string(),
+                scope_id: scope_ids.value(idx).to_string(),
+                origin: origins.value(idx).to_string(),
+                action: actions.value(idx).to_string(),
+                target_hive: target_hives.value(idx).to_string(),
+                params_json: params_json.value(idx).to_string(),
+                params_hash: params_hash.value(idx).to_string(),
+                preview_command: preview_commands.value(idx).to_string(),
+                status: statuses.value(idx).to_string(),
+                created_at_ms: created.value(idx),
+                updated_at_ms: updated.value(idx),
+                dispatched_at_ms: dispatched.value(idx),
+                completed_at_ms: completed.value(idx),
+                request_id: request_ids.value(idx).to_string(),
+                trace_id: trace_ids.value(idx).to_string(),
+                error_summary: error_summaries.value(idx).to_string(),
             });
         }
     }

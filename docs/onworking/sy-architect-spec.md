@@ -633,6 +633,7 @@ Current repo state should be treated as a **partial shell**, not as a blank impl
   - header status chips currently poll `/api/status` every 5 seconds from the browser
   - each refresh opens an ephemeral router/admin client path just to render `Hives` / `Nodes` / `Updated`
   - revisit whether this status should poll less, pause on hidden tabs, move to frontend-only visibility-aware refresh, or be removed entirely
+  - long-running mutating actions can outlive the local caller timeout; architect must track them explicitly instead of treating timeout as a clean failure
 - The current implementation does **not** yet provide:
   - WebSocket chat/streaming
   - real AI provider integration
@@ -749,10 +750,25 @@ This is now the highest-value execution track. `SY.architect` should converge to
   - lectura libre
   - escritura/mutación solo con confirmación explícita del operador
   - no depender solo del prompt para seguridad
+- [x] ARCH-T36. Registrar operaciones mutating en `SY.architect` con tracking local persistido:
+  - `operation_id`
+  - scope v1 = chat/session
+  - future direction: scope can evolve to `ILK/operation` when chats map to distinct ILKs
+  - statuses mínimos: `pending_confirm`, `dispatched`, `timeout_unknown`, `succeeded`, `failed`, `canceled`
+- [x] ARCH-T37. Bloquear reintentos equivalentes mientras exista una operación no terminal en el mismo scope:
+  - misma acción
+  - mismo target
+  - mismo payload normalizado
+  - timeout local no debe permitir reenvío ciego
+- [ ] ARCH-T38. Extender `SY.admin` con operation tracking nativo para acciones largas:
+  - `operation_id` canónico compartido con architect/admin/orchestrator
+  - consulta de estado de operación
+  - reconciliación explícita después de timeout del caller
 - Confirmation flow v1:
   - el agente puede preparar una mutación con `fluxbee_system_write`
   - la acción queda pendiente por sesión
   - el operador debe responder `CONFIRM` para ejecutar o `CANCEL` para descartar
+  - una vez confirmada, architect registra y secuencia la operación dentro del chat antes de volver a permitir otra equivalente
 - [ ] ARCH-T35. Mejorar render/persistencia de tool calls:
   - mostrar qué tool usó `archi`
   - mostrar inputs relevantes y resultado resumido
