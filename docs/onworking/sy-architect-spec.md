@@ -85,6 +85,7 @@ Current state in repo:
 - `SCMD:` remains a separate local/system path and does not invoke the AI provider.
 - the local agent can already use read-only socket-backed tools against `SY.admin` for live system state.
 - current limitation: chat history is persisted locally, but the AI turn still sends only the latest user message plus system prompt/tool loop context; prior session messages are not yet rehydrated into model input.
+- immediate memory for recent chat continuity should move to `fluxbee_ai_sdk` as a native concern; see `docs/onworking/fluxbee-ai-sdk-immediate-memory-spec.md`.
 - streaming, multi-agent routing, and prompt assets by role are still pending.
 
 ---
