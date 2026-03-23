@@ -275,24 +275,6 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
 
             for item in request_items {
                 match item {
-                    FunctionLoopItem::SystemText { content } => {
-                        input.push(json!({
-                            "role": "system",
-                            "content": [{"type":"input_text","text": content}],
-                        }));
-                    }
-                    FunctionLoopItem::UserText { content } => {
-                        input.push(json!({
-                            "role": "user",
-                            "content": [{"type":"input_text","text": content}],
-                        }));
-                    }
-                    FunctionLoopItem::AssistantText { content } => {
-                        input.push(json!({
-                            "role": "assistant",
-                            "content": [{"type":"input_text","text": content}],
-                        }));
-                    }
                     FunctionLoopItem::ToolResult { result } => {
                         let output_text = match result.output {
                             Value::String(s) => s,
@@ -306,6 +288,7 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                             "output": output_text,
                         }));
                     }
+                    other => input.push(loop_item_to_openai_input(other)),
                 }
             }
         }
@@ -460,5 +443,79 @@ fn parse_tool_arguments(raw: Value) -> Value {
     match raw {
         Value::String(s) => serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s)),
         other => other,
+    }
+}
+
+fn loop_item_to_openai_input(item: FunctionLoopItem) -> Value {
+    match item {
+        FunctionLoopItem::SystemText { content } => json!({
+            "role": "system",
+            "content": [{"type":"input_text","text": content}],
+        }),
+        FunctionLoopItem::UserText { content } => json!({
+            "role": "user",
+            "content": [{"type":"input_text","text": content}],
+        }),
+        FunctionLoopItem::AssistantText { content } => json!({
+            "role": "assistant",
+            "content": [{"type":"output_text","text": content}],
+        }),
+        FunctionLoopItem::ToolResult { result } => {
+            let output_text = match result.output {
+                Value::String(s) => s,
+                other => serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string()),
+            };
+            json!({
+                "type": "function_call_output",
+                "call_id": result.call_id,
+                "output": output_text,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::function_calling::FunctionToolResult;
+
+    #[test]
+    fn assistant_items_are_serialized_as_output_text() {
+        let value = loop_item_to_openai_input(FunctionLoopItem::AssistantText {
+            content: "previous assistant".to_string(),
+        });
+        assert_eq!(value["role"], "assistant");
+        assert_eq!(value["content"][0]["type"], "output_text");
+        assert_eq!(value["content"][0]["text"], "previous assistant");
+    }
+
+    #[test]
+    fn system_and_user_items_stay_as_input_text() {
+        let system = loop_item_to_openai_input(FunctionLoopItem::SystemText {
+            content: "summary".to_string(),
+        });
+        let user = loop_item_to_openai_input(FunctionLoopItem::UserText {
+            content: "current user".to_string(),
+        });
+        assert_eq!(system["content"][0]["type"], "input_text");
+        assert_eq!(user["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn tool_results_remain_function_call_outputs() {
+        let value = loop_item_to_openai_input(FunctionLoopItem::ToolResult {
+            result: FunctionToolResult {
+                call_id: "call-1".to_string(),
+                response_id: Some("resp-1".to_string()),
+                name: "demo".to_string(),
+                output: json!({"ok": true}),
+                is_error: false,
+            },
+        });
+        assert_eq!(value["type"], "function_call_output");
+        assert_eq!(value["call_id"], "call-1");
+        assert_eq!(value["output"], "{\"ok\":true}");
     }
 }
