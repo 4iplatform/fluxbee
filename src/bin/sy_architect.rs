@@ -3048,6 +3048,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
     .msg.system {{
       background: var(--bubble-system);
     }}
+    .msg.pending {{
+      border-style: dashed;
+      border-color: #d7e4ff;
+      background: linear-gradient(180deg, #fbfdff 0%, #f5f8ff 100%);
+    }}
     .msg-label {{
       font-size: 0.72rem;
       font-weight: 800;
@@ -3066,6 +3071,47 @@ fn architect_index_html(state: &ArchitectState) -> String {
       white-space: pre-wrap;
       line-height: 1.5;
       font-size: 0.96rem;
+    }}
+    .pending-body {{
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--muted);
+      white-space: normal;
+    }}
+    .pending-text {{
+      font-size: 0.92rem;
+      font-weight: 600;
+      color: #55637c;
+    }}
+    .thinking-dots {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }}
+    .thinking-dots span {{
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #9cb2de;
+      opacity: 0.28;
+      animation: thinkingPulse 1.2s infinite ease-in-out;
+    }}
+    .thinking-dots span:nth-child(2) {{
+      animation-delay: 0.16s;
+    }}
+    .thinking-dots span:nth-child(3) {{
+      animation-delay: 0.32s;
+    }}
+    @keyframes thinkingPulse {{
+      0%, 80%, 100% {{
+        opacity: 0.25;
+        transform: translateY(0);
+      }}
+      40% {{
+        opacity: 1;
+        transform: translateY(-2px);
+      }}
     }}
     .result-shell {{
       display: grid;
@@ -3316,6 +3362,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const composerHint = document.getElementById("composer-hint");
     let currentSessionId = null;
     let sessionsCache = [];
+    let pendingIndicator = null;
     function appendMessage(kind, labelText, bodyContent) {{
       const div = document.createElement("div");
       const label = document.createElement("div");
@@ -3333,6 +3380,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       div.appendChild(body);
       messages.appendChild(div);
       messages.scrollTop = messages.scrollHeight;
+      return div;
     }}
     function formatChip(elementId, text, className) {{
       const element = document.getElementById(elementId);
@@ -3361,6 +3409,27 @@ fn architect_index_html(state: &ArchitectState) -> String {
     function addMessage(kind, text) {{
       const labels = {{ user: "Operator", architect: "archi", system: "System" }};
       appendMessage(kind, labels[kind] || "Message", text);
+    }}
+    function showPendingIndicator(label = "archi", text = "Thinking") {{
+      hidePendingIndicator();
+      const body = document.createElement("div");
+      const message = document.createElement("div");
+      const dots = document.createElement("div");
+      body.className = "pending-body";
+      message.className = "pending-text";
+      message.textContent = text;
+      dots.className = "thinking-dots";
+      dots.innerHTML = "<span></span><span></span><span></span>";
+      body.appendChild(message);
+      body.appendChild(dots);
+      pendingIndicator = appendMessage("architect", label, body);
+      pendingIndicator.classList.add("pending");
+    }}
+    function hidePendingIndicator() {{
+      if (pendingIndicator && pendingIndicator.parentNode) {{
+        pendingIndicator.parentNode.removeChild(pendingIndicator);
+      }}
+      pendingIndicator = null;
     }}
     function createPre(value) {{
       const pre = document.createElement("pre");
@@ -3450,6 +3519,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       addMessage("system", "Example: SCMD: curl -X GET /hives/{hive}/nodes");
     }}
     function resetChatViewport() {{
+      hidePendingIndicator();
       messages.innerHTML = "";
       input.value = "";
     }}
@@ -3646,6 +3716,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
         if (!confirmed) return;
       }}
       addMessage("user", message);
+      const pendingLabel = message.trim().startsWith("SCMD:") || message.trim() === "CONFIRM"
+        ? "System"
+        : "archi";
+      const pendingText = pendingLabel === "System" ? "Executing action" : "Thinking";
+      showPendingIndicator(pendingLabel, pendingText);
       input.value = "";
       send.disabled = true;
       try {{
@@ -3659,11 +3734,14 @@ fn architect_index_html(state: &ArchitectState) -> String {
           currentSessionId = data.session_id;
           localStorage.setItem(currentSessionStorageKey, currentSessionId);
         }}
+        hidePendingIndicator();
         renderResponsePayload(data.status === "ok" ? "architect" : "system", data);
         await refreshSessionList(currentSessionId);
       }} catch (err) {{
+        hidePendingIndicator();
         addMessage("system", "Request failed: " + err);
       }} finally {{
+        hidePendingIndicator();
         send.disabled = false;
         refreshStatus();
       }}
