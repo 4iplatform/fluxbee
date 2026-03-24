@@ -6299,7 +6299,9 @@ systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
 systemctl disable \"$s\" >/dev/null 2>&1 || true; \
 systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
 systemctl reset-failed \"$s\" >/dev/null 2>&1 || true; \
-done"
+done; \
+rm -rf /var/lib/fluxbee/nodes/* >/dev/null 2>&1 || true; \
+rm -rf /var/lib/fluxbee/state/nodes/* >/dev/null 2>&1 || true"
 }
 
 fn remove_hive_cleanup_local_flow() -> serde_json::Value {
@@ -13522,6 +13524,13 @@ mod tests {
             sync_enabled: true,
             sync_tool: "syncthing".to_string(),
         }
+    }
+
+    #[test]
+    fn remove_hive_cleanup_script_cleans_persisted_node_dirs() {
+        let script = remove_hive_cleanup_script();
+        assert!(script.contains("/var/lib/fluxbee/nodes/*"));
+        assert!(script.contains("/var/lib/fluxbee/state/nodes/*"));
     }
 
     #[test]
