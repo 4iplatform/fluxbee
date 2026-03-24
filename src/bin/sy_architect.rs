@@ -4606,10 +4606,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
     .mini-pill {{
       border: 1px solid var(--line);
       border-radius: 999px;
-      padding: 5px 9px;
+      padding: 4px 9px;
       font-size: 0.72rem;
       color: var(--muted);
-      background: var(--panel-alt);
+      background: #ffffff;
     }}
     .mini-pill.action {{
       cursor: pointer;
@@ -4617,13 +4617,18 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     .new-chat {{
       width: 100%;
-      min-height: 44px;
-      padding: 9px 14px;
-      font-size: 0.92rem;
-      background: var(--logo-dark);
-      color: #ffffff;
+      min-height: 38px;
+      padding: 8px 12px;
+      font-size: 0.84rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      border: 1px solid transparent;
+      background: #f6f8fc;
+      color: #243142;
       justify-content: center;
       box-shadow: none;
+      transition: border-color 140ms ease, background 140ms ease, color 140ms ease,
+        transform 140ms ease;
     }}
     .new-chat-row {{
       display: grid;
@@ -4632,14 +4637,24 @@ fn architect_index_html(state: &ArchitectState) -> String {
       margin-bottom: 14px;
     }}
     .new-chat.operator {{
-      background: #252528;
+      background: #f4f5f7;
+      border-color: #d9dee8;
+      color: #1f2a37;
     }}
     .new-chat.debug {{
-      background: #2e6fda;
-      color: #f7fbff;
+      background: #edf4ff;
+      border-color: #c9dafb;
+      color: #1f5fbf;
     }}
     .new-chat:hover {{
-      filter: brightness(1.04);
+      transform: translateY(-1px);
+      background: #eef2f8;
+    }}
+    .new-chat.debug:hover {{
+      background: #e5efff;
+    }}
+    .new-chat.operator:hover {{
+      background: #eceff4;
     }}
     .history-mode {{
       display: inline-flex;
@@ -4969,28 +4984,25 @@ fn architect_index_html(state: &ArchitectState) -> String {
       grid-template-rows: auto minmax(0, 1fr) auto;
     }}
     .shell-head {{
-      padding: 18px 20px;
+      padding: 13px 20px 12px;
       border-bottom: 1px solid var(--line);
       background: linear-gradient(180deg, #ffffff 0%, #fafbfd 100%);
     }}
     .shell-title-row {{
       display: flex;
-      align-items: flex-start;
-      gap: 16px;
-    }}
-    .shell-kicker {{
-      color: var(--accent);
-      font-size: 0.78rem;
-      font-weight: 700;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      margin-bottom: 8px;
+      align-items: center;
+      gap: 10px;
     }}
     .shell-title {{
       margin: 0;
-      font-size: 1.8rem;
-      line-height: 1;
+      font-size: 1.1rem;
+      line-height: 1.1;
       letter-spacing: -0.04em;
+    }}
+    .shell-title-meta {{
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.1;
     }}
     .messages {{
       min-height: 0;
@@ -5414,10 +5426,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       <div class="shell">
         <div class="shell-head">
           <div class="shell-title-row">
-            <div>
-              <div class="shell-kicker">System Architect Terminal</div>
-              <h1 class="shell-title">archi</h1>
-            </div>
+            <h1 class="shell-title">archi</h1>
+            <div class="shell-title-meta">· system architect interface</div>
           </div>
         </div>
         <div id="messages" class="messages"></div>

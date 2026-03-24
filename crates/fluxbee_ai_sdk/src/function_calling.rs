@@ -529,7 +529,9 @@ mod tests {
                     }],
                 }),
                 _ => Ok(FunctionModelTurnResponse {
-                    assistant_text: Some("The tool failed, so there is nothing to confirm.".to_string()),
+                    assistant_text: Some(
+                        "The tool failed, so there is nothing to confirm.".to_string(),
+                    ),
                     tool_calls: Vec::new(),
                 }),
             }
@@ -560,7 +562,9 @@ mod tests {
         let model = SequencedModel::default();
         let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
         let mut tools = FunctionToolRegistry::new();
-        tools.register(Arc::new(DemoTool)).expect("tool should register");
+        tools
+            .register(Arc::new(DemoTool))
+            .expect("tool should register");
 
         let result = runner
             .run(&model, &tools, "create hive worker-220")
