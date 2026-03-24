@@ -748,9 +748,9 @@ Current repo state should be treated as a **partial shell**, not as a blank impl
   - explicit UI flows for both operator chats and SHM-backed impersonation/debug chats
   - persisted AI tool results with compact render of tool name, relevant input, summarized output, and full metadata retained
 - current friction:
-  - header status chips currently poll `/api/status` every 5 seconds from the browser
+  - header status chips still depend on `/api/status` and backend inventory freshness
   - each refresh opens an ephemeral router/admin client path just to render `Hives` / `Nodes` / `Updated`
-  - revisit whether this status should poll less, pause on hidden tabs, move to frontend-only visibility-aware refresh, or be removed entirely
+  - browser polling is already visibility-aware and less aggressive than the initial version, but the inventory summary itself can still lag behind recent mutations
   - long-running mutating actions can outlive the local caller timeout; architect must track them explicitly instead of treating timeout as a clean failure
 - The current implementation does **not** yet provide:
   - WebSocket chat/streaming
@@ -914,11 +914,12 @@ This phase turns the current visual chat navigator into real product behavior.
   - schema de sesiones/mensajes
   - estrategia de flush/compaction
   - metadata suficiente para recuperación rápida y futura semantic search
-- [ ] ARCH-T31. Refinar UI final (history panel, status refresh, upload state, command/result rendering).
+- [x] ARCH-T31. Refinar UI final (history panel, status refresh, command/result rendering).
   - Status refresh ya quedó más frontend-aware:
     - sin requests solapados
     - pausado/degradado con tab oculta
     - cadencia menor que el polling agresivo inicial
+    - chips mantenidos porque siguen siendo útiles como resumen operativo rápido
   - History panel ya quedó más legible:
     - mejor jerarquía de meta por chat
     - preview multilinea
@@ -929,10 +930,9 @@ This phase turns the current visual chat navigator into real product behavior.
   - Command/result rendering ya quedó más compacto:
     - preview corto para `payload`, `error`, `input` y `output`
     - detalle expandible para inspección completa cuando hace falta
-  - Pendiente:
-    - decidir si esos chips siguen teniendo suficiente valor como para mantenerlos
-    - upload state real cuando exista Phase J
-    - último pase menor de polish visual sobre command/result rendering
+    - bloque `Tool used` colapsado por default y ordenado para priorizar el intento relevante del turno
+  - Nota:
+    - `upload state` real queda deferido a `Phase J` y no bloquea el cierre de esta tarea de UI v1
 
 ### Phase F — Settings And Self-Configuration
 
