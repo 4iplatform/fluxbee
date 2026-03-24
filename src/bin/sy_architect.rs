@@ -5422,6 +5422,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const sessionsUrl = (base || "") + "/api/sessions";
     const identityIchOptionsUrl = (base || "") + "/api/identity/ich-options";
     const currentSessionStorageKey = "sy.architect.currentSession.{hive}";
+    const statusRefreshActiveMs = 15000;
+    const statusRefreshHiddenMs = 60000;
     const messages = document.getElementById("messages");
     const input = document.getElementById("input");
     const send = document.getElementById("send");
@@ -5444,6 +5446,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
     let sessionsCache = [];
     let pendingIndicator = null;
     let impersonationOptionsCache = [];
+    let statusRefreshTimer = null;
+    let statusRefreshInFlight = false;
     function describeIchOption(option) {{
       if (!option) return "";
       const primary = option.is_primary ? " · primary" : "";
@@ -6008,9 +6012,14 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const detail = await res.json();
       renderSession(detail, showWelcome);
     }}
-    async function refreshStatus() {{
+    async function refreshStatus(options = {{}}) {{
+      const force = !!(options && options.force);
+      if (statusRefreshInFlight && !force) {{
+        return;
+      }}
+      statusRefreshInFlight = true;
       try {{
-        const res = await fetch(statusUrl);
+        const res = await fetch(statusUrl, {{ cache: "no-store" }});
         const data = await res.json();
         const alive = Number(data.hives_alive || 0);
         const totalHives = Number(data.total_hives || 0);
@@ -6019,7 +6028,32 @@ fn architect_index_html(state: &ArchitectState) -> String {
         formatChip("hives-summary", totalHives ? (String(alive) + "/" + String(totalHives) + " alive") : "--", stale > 0 ? "warn" : "ok");
         formatChip("nodes-summary", totalNodes ? String(totalNodes) : "--", totalNodes > 0 ? "ok" : "");
         formatChip("updated-at", formatTimestamp(data.inventory_updated_at), data.admin_available ? "ok" : "warn");
-      }} catch (_err) {{}}
+      }} catch (_err) {{
+        formatChip("updated-at", "offline", "warn");
+      }} finally {{
+        statusRefreshInFlight = false;
+      }}
+    }}
+    function stopStatusRefreshLoop() {{
+      if (statusRefreshTimer) {{
+        window.clearTimeout(statusRefreshTimer);
+        statusRefreshTimer = null;
+      }}
+    }}
+    function scheduleStatusRefresh(delayMs) {{
+      stopStatusRefreshLoop();
+      statusRefreshTimer = window.setTimeout(async () => {{
+        await refreshStatus();
+        if (!document.hidden) {{
+          scheduleStatusRefresh(statusRefreshActiveMs);
+        }} else {{
+          scheduleStatusRefresh(statusRefreshHiddenMs);
+        }}
+      }}, delayMs);
+    }}
+    function restartStatusRefreshLoop(immediate = false) {{
+      const delay = immediate ? 0 : (document.hidden ? statusRefreshHiddenMs : statusRefreshActiveMs);
+      scheduleStatusRefresh(delay);
     }}
     async function submit() {{
       const message = input.value.trim();
@@ -6059,7 +6093,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }} finally {{
         hidePendingIndicator();
         send.disabled = false;
-        refreshStatus();
+        refreshStatus({{ force: true }});
       }}
     }}
     send.addEventListener("click", submit);
@@ -6119,6 +6153,14 @@ fn architect_index_html(state: &ArchitectState) -> String {
         closeImpersonationModal();
       }}
     }});
+    document.addEventListener("visibilitychange", () => {{
+      if (document.hidden) {{
+        restartStatusRefreshLoop(false);
+      }} else {{
+        refreshStatus({{ force: true }});
+        restartStatusRefreshLoop(false);
+      }}
+    }});
     async function bootstrap() {{
       resetChatViewport();
       await refreshSessionList(localStorage.getItem(currentSessionStorageKey));
@@ -6128,8 +6170,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
         const preferred = currentSessionId || localStorage.getItem(currentSessionStorageKey) || sessionsCache[0].session_id;
         await loadSession(preferred, null, false);
       }}
-      await refreshStatus();
-      setInterval(refreshStatus, 5000);
+      await refreshStatus({{ force: true }});
+      restartStatusRefreshLoop(false);
     }}
     bootstrap().catch((err) => {{
       addMessage("system", "Bootstrap failed: " + err);

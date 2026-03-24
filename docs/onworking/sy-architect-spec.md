@@ -915,8 +915,14 @@ This phase turns the current visual chat navigator into real product behavior.
   - estrategia de flush/compaction
   - metadata suficiente para recuperación rápida y futura semantic search
 - [ ] ARCH-T31. Refinar UI final (history panel, status refresh, upload state, command/result rendering).
-  - Revisar el polling de `/api/status`; hoy es demasiado agresivo para el valor que aporta.
-  - Evaluar pausar refresh con tab oculta, bajar frecuencia, cachear, mover la lógica a un modelo más frontend-aware, o eliminar directamente esos chips.
+  - Status refresh ya quedó más frontend-aware:
+    - sin requests solapados
+    - pausado/degradado con tab oculta
+    - cadencia menor que el polling agresivo inicial
+  - Pendiente:
+    - decidir si esos chips siguen teniendo suficiente valor como para mantenerlos
+    - upload state real cuando exista Phase J
+    - último pase de polish de history panel y command/result rendering
 
 ### Phase F — Settings And Self-Configuration
 
