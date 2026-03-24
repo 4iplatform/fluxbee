@@ -1308,9 +1308,12 @@ async fn handle_ai_chat(
         .iter()
         .filter_map(|item| match item {
             fluxbee_ai_sdk::FunctionLoopItem::ToolResult { result } => Some(json!({
+                "call_id": result.call_id.clone(),
                 "name": result.name.clone(),
+                "arguments": result.arguments.clone(),
                 "output": result.output.clone(),
                 "is_error": result.is_error,
+                "summary": summarize_tool_result(result.name.as_str(), &result.arguments, &result.output, result.is_error),
             })),
             _ => None,
         })
@@ -1332,6 +1335,28 @@ async fn handle_ai_chat(
         "model": runtime.model,
         "tool_results": tool_results,
     }))
+}
+
+fn summarize_tool_result(name: &str, arguments: &Value, output: &Value, is_error: bool) -> String {
+    let arguments_summary = summarize_tool_value(arguments, 120);
+    let output_summary = summarize_tool_value(output, 160);
+    if is_error {
+        format!("{name} failed | input: {arguments_summary} | output: {output_summary}")
+    } else {
+        format!("{name} ok | input: {arguments_summary} | output: {output_summary}")
+    }
+}
+
+fn summarize_tool_value(value: &Value, max_chars: usize) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::String(text) => preview_text(text, max_chars),
+        other => {
+            let serialized = serde_json::to_string(other)
+                .unwrap_or_else(|_| "{\"error\":\"unserializable\"}".to_string());
+            preview_text(&serialized, max_chars)
+        }
+    }
 }
 
 async fn build_session_immediate_memory(
@@ -5063,6 +5088,90 @@ fn architect_index_html(state: &ArchitectState) -> String {
       line-height: 1.45;
       font-family: "SFMono-Regular", "Menlo", "Consolas", monospace;
     }}
+    .chat-response {{
+      display: grid;
+      gap: 12px;
+    }}
+    .tool-summary {{
+      display: grid;
+      gap: 10px;
+      margin-top: 2px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(210, 218, 232, 0.9);
+    }}
+    .tool-summary-head {{
+      font-size: 0.72rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }}
+    .tool-list {{
+      display: grid;
+      gap: 8px;
+    }}
+    .tool-card {{
+      display: grid;
+      gap: 6px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: #fbfcfe;
+    }}
+    .tool-card-head {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    .tool-card-name {{
+      font-size: 0.84rem;
+      font-weight: 700;
+      color: var(--text);
+    }}
+    .tool-card-badge {{
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 0.68rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      background: var(--accent-soft);
+      color: var(--accent);
+    }}
+    .tool-card-badge.error {{
+      background: var(--warning-soft);
+      color: var(--warning);
+    }}
+    .tool-card-summary {{
+      color: var(--muted);
+      font-size: 0.8rem;
+      line-height: 1.45;
+    }}
+    .tool-card-row {{
+      font-size: 0.78rem;
+      line-height: 1.4;
+      color: var(--muted);
+      word-break: break-word;
+    }}
+    .tool-card-row strong {{
+      color: var(--text);
+    }}
+    .tool-card details {{
+      border-top: 1px dashed rgba(210, 218, 232, 0.9);
+      padding-top: 8px;
+    }}
+    .tool-card summary {{
+      cursor: pointer;
+      color: var(--accent);
+      font-size: 0.76rem;
+      font-weight: 700;
+      list-style: none;
+    }}
+    .tool-card summary::-webkit-details-marker {{
+      display: none;
+    }}
     .composer {{
       border-top: 1px solid var(--line);
       padding: 16px 20px 14px;
@@ -5531,6 +5640,72 @@ fn architect_index_html(state: &ArchitectState) -> String {
       section.appendChild(createPre(value));
       return section;
     }}
+    function compactValue(value, maxLen = 180) {{
+      let text = "";
+      if (typeof value === "string") {{
+        text = value;
+      }} else {{
+        try {{
+          text = JSON.stringify(value);
+        }} catch (_err) {{
+          text = String(value);
+        }}
+      }}
+      text = String(text || "").replace(/\s+/g, " ").trim();
+      if (!text) return "none";
+      if (text.length <= maxLen) return text;
+      return text.slice(0, Math.max(0, maxLen - 1)).trimEnd() + "…";
+    }}
+    function createToolSummarySection(toolResults) {{
+      if (!Array.isArray(toolResults) || !toolResults.length) return null;
+      const shell = document.createElement("div");
+      const head = document.createElement("div");
+      const list = document.createElement("div");
+      shell.className = "tool-summary";
+      head.className = "tool-summary-head";
+      head.textContent = toolResults.length === 1 ? "Tool used" : "Tools used";
+      list.className = "tool-list";
+      shell.appendChild(head);
+      shell.appendChild(list);
+      toolResults.forEach((tool) => {{
+        const card = document.createElement("div");
+        const cardHead = document.createElement("div");
+        const name = document.createElement("div");
+        const badge = document.createElement("div");
+        const summary = document.createElement("div");
+        const inputRow = document.createElement("div");
+        const outputRow = document.createElement("div");
+        const details = document.createElement("details");
+        const detailsSummary = document.createElement("summary");
+        card.className = "tool-card";
+        cardHead.className = "tool-card-head";
+        name.className = "tool-card-name";
+        badge.className = "tool-card-badge";
+        summary.className = "tool-card-summary";
+        inputRow.className = "tool-card-row";
+        outputRow.className = "tool-card-row";
+        name.textContent = tool && tool.name ? tool.name : "tool";
+        badge.textContent = tool && tool.is_error ? "error" : "ok";
+        if (tool && tool.is_error) {{
+          badge.classList.add("error");
+        }}
+        summary.textContent = tool && tool.summary ? tool.summary : compactValue(tool && tool.output !== undefined ? tool.output : null, 220);
+        inputRow.innerHTML = "<strong>Input:</strong> " + compactValue(tool && tool.arguments !== undefined ? tool.arguments : null, 180);
+        outputRow.innerHTML = "<strong>Output:</strong> " + compactValue(tool && tool.output !== undefined ? tool.output : null, 180);
+        cardHead.appendChild(name);
+        cardHead.appendChild(badge);
+        card.appendChild(cardHead);
+        card.appendChild(summary);
+        card.appendChild(inputRow);
+        card.appendChild(outputRow);
+        detailsSummary.textContent = "Show full output";
+        details.appendChild(detailsSummary);
+        details.appendChild(createPre(tool && tool.output !== undefined ? tool.output : null));
+        card.appendChild(details);
+        list.appendChild(card);
+      }});
+      return shell;
+    }}
     function renderCommandResult(kind, mode, data) {{
       const shell = document.createElement("div");
       const head = document.createElement("div");
@@ -5576,7 +5751,18 @@ fn architect_index_html(state: &ArchitectState) -> String {
     function renderResponsePayload(kind, data) {{
       const output = data && data.output ? data.output : null;
       if (data && data.mode === "chat" && output && typeof output.message === "string" && output.message.trim()) {{
-        addMessage(kind, output.message);
+        const toolSummary = createToolSummarySection(output.tool_results);
+        if (!toolSummary) {{
+          addMessage(kind, output.message);
+          return;
+        }}
+        const body = document.createElement("div");
+        const message = document.createElement("div");
+        body.className = "chat-response";
+        message.textContent = output.message;
+        body.appendChild(message);
+        body.appendChild(toolSummary);
+        appendMessage(kind, kind === "architect" ? "archi" : "System", body);
         return;
       }}
       renderCommandResult(kind, data.mode, data);

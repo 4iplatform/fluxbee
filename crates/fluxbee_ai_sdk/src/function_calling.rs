@@ -33,6 +33,8 @@ pub struct FunctionToolResult {
     #[serde(default)]
     pub response_id: Option<String>,
     pub name: String,
+    #[serde(default)]
+    pub arguments: Value,
     pub output: Value,
     pub is_error: bool,
 }
@@ -462,6 +464,7 @@ pub async fn dispatch_tool_calls(
                     call_id: call.call_id,
                     response_id: call.response_id,
                     name: call.name,
+                    arguments: call.arguments,
                     output,
                     is_error: false,
                 },
@@ -469,6 +472,7 @@ pub async fn dispatch_tool_calls(
                     call_id: call.call_id,
                     response_id: call.response_id,
                     name: call.name,
+                    arguments: call.arguments,
                     output: Value::String(err.to_string()),
                     is_error: true,
                 },
@@ -477,6 +481,7 @@ pub async fn dispatch_tool_calls(
                 call_id: call.call_id,
                 response_id: call.response_id,
                 name: call.name,
+                arguments: call.arguments,
                 output: Value::String("unknown_tool".to_string()),
                 is_error: true,
             },

@@ -510,6 +510,7 @@ mod tests {
                 call_id: "call-1".to_string(),
                 response_id: Some("resp-1".to_string()),
                 name: "demo".to_string(),
+                arguments: json!({"arg":"value"}),
                 output: json!({"ok": true}),
                 is_error: false,
             },

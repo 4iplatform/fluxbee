@@ -746,6 +746,7 @@ Current repo state should be treated as a **partial shell**, not as a blank impl
   - tracked per-session operations for staged, running, timeout-unknown, and recent terminal mutations
   - immediate-memory rehydration into the AI call using summary + recent interactions + active operations
   - explicit UI flows for both operator chats and SHM-backed impersonation/debug chats
+  - persisted AI tool results with compact render of tool name, relevant input, summarized output, and full metadata retained
 - current friction:
   - header status chips currently poll `/api/status` every 5 seconds from the browser
   - each refresh opens an ephemeral router/admin client path just to render `Hives` / `Nodes` / `Updated`
@@ -884,7 +885,7 @@ This is now the highest-value execution track. `SY.architect` should converge to
   - la acción queda pendiente por sesión
   - el operador debe responder `CONFIRM` para ejecutar o `CANCEL` para descartar
   - una vez confirmada, architect registra y secuencia la operación dentro del chat antes de volver a permitir otra equivalente
-- [ ] ARCH-T35. Mejorar render/persistencia de tool calls:
+- [x] ARCH-T35. Mejorar render/persistencia de tool calls:
   - mostrar qué tool usó `archi`
   - mostrar inputs relevantes y resultado resumido
   - mantener salida completa disponible en metadata
@@ -938,10 +939,11 @@ This is intentionally later. The node should already be operational without it.
   - heurística simple por intención
 - [x] ARCH-T12.1. Separar pipeline de mensajes normales vs mensajes de control; `SCMD:` no debe invocar al proveedor AI.
 - [x] ARCH-T12.2. Exponer tools read-only del sistema al agente local usando `ADMIN_COMMAND` sobre socket.
-- [ ] ARCH-T12.3. Rehidratar contexto conversacional por sesión en cada turno AI:
+- [x] ARCH-T12.3. Rehidratar contexto conversacional por sesión en cada turno AI:
   - cargar historial reciente de la sesión desde LanceDB
   - definir windowing/truncation para no crecer sin control
-  - decidir si tool results previos entran completos, resumidos o solo como metadata operacional
+  - incluir memoria inmediata mediante `conversation_summary`, `recent_interactions` y `active_operations`
+  - preservar errores/tool results recientes como contexto operativo útil
 - [ ] ARCH-T6. Implementar endpoint WebSocket de chat bidireccional.
 - [ ] ARCH-T10. Implementar streaming token-by-token hacia WebSocket.
 
