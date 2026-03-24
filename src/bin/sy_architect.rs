@@ -5191,12 +5191,29 @@ fn architect_index_html(state: &ArchitectState) -> String {
       padding-top: 10px;
       border-top: 1px solid rgba(210, 218, 232, 0.9);
     }}
+    .tool-summary-toggle {{
+      border-top: 1px solid rgba(210, 218, 232, 0.9);
+      padding-top: 10px;
+    }}
+    .tool-summary-toggle summary {{
+      cursor: pointer;
+      list-style: none;
+    }}
+    .tool-summary-toggle summary::-webkit-details-marker {{
+      display: none;
+    }}
     .tool-summary-head {{
       font-size: 0.72rem;
       font-weight: 800;
       letter-spacing: 0.08em;
       text-transform: uppercase;
       color: var(--muted);
+    }}
+    .tool-summary-meta {{
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 0.8rem;
+      line-height: 1.4;
     }}
     .tool-list {{
       display: grid;
@@ -5782,18 +5799,61 @@ fn architect_index_html(state: &ArchitectState) -> String {
       if (text.length <= maxLen) return text;
       return text.slice(0, Math.max(0, maxLen - 1)).trimEnd() + "…";
     }}
+    function toolSortWeight(tool, index) {{
+      const isError = !!(tool && tool.is_error);
+      const name = tool && tool.name ? String(tool.name) : "";
+      const isWrite = name === "fluxbee_system_write";
+      return {{
+        errorRank: isError ? 1 : 0,
+        writeRank: isWrite ? 0 : 1,
+        indexRank: -index,
+      }};
+    }}
     function createToolSummarySection(toolResults) {{
       if (!Array.isArray(toolResults) || !toolResults.length) return null;
-      const shell = document.createElement("div");
+      const shell = document.createElement("details");
       const head = document.createElement("div");
+      const meta = document.createElement("div");
       const list = document.createElement("div");
-      shell.className = "tool-summary";
+      const errorCount = toolResults.filter((tool) => tool && tool.is_error).length;
+      const okCount = toolResults.length - errorCount;
+      const orderedTools = toolResults
+        .map((tool, index) => ({{
+          tool,
+          index,
+          sort: toolSortWeight(tool, index),
+        }}))
+        .sort((a, b) => {{
+          if (a.sort.errorRank !== b.sort.errorRank) {{
+            return a.sort.errorRank - b.sort.errorRank;
+          }}
+          if (a.sort.writeRank !== b.sort.writeRank) {{
+            return a.sort.writeRank - b.sort.writeRank;
+          }}
+          return a.sort.indexRank - b.sort.indexRank;
+        }})
+        .map((entry) => entry.tool);
+      shell.className = "tool-summary-toggle";
       head.className = "tool-summary-head";
+      meta.className = "tool-summary-meta";
       head.textContent = toolResults.length === 1 ? "Tool used" : "Tools used";
+      if (errorCount && okCount) {{
+        meta.textContent = okCount + " ok, " + errorCount + " error";
+      }} else if (errorCount) {{
+        meta.textContent = errorCount === 1 ? "1 tool error" : errorCount + " tool errors";
+      }} else {{
+        meta.textContent = toolResults.length === 1 ? "1 successful tool" : toolResults.length + " successful tools";
+      }}
       list.className = "tool-list";
-      shell.appendChild(head);
-      shell.appendChild(list);
-      toolResults.forEach((tool) => {{
+      const summaryToggle = document.createElement("summary");
+      const body = document.createElement("div");
+      body.className = "tool-summary";
+      summaryToggle.appendChild(head);
+      summaryToggle.appendChild(meta);
+      shell.appendChild(summaryToggle);
+      shell.appendChild(body);
+      body.appendChild(list);
+      orderedTools.forEach((tool) => {{
         const card = document.createElement("div");
         const cardHead = document.createElement("div");
         const name = document.createElement("div");
