@@ -919,10 +919,17 @@ This phase turns the current visual chat navigator into real product behavior.
     - sin requests solapados
     - pausado/degradado con tab oculta
     - cadencia menor que el polling agresivo inicial
+  - History panel ya quedó más legible:
+    - mejor jerarquía de meta por chat
+    - preview multilinea
+    - badge explícito para la sesión abierta
+    - contador visible de resultados / chats locales
+    - contexto de impersonación más compacto (`ICH` / `ILK` / `Thread`) con tooltip completo
+    - sesión abierta priorizada arriba del listado
   - Pendiente:
     - decidir si esos chips siguen teniendo suficiente valor como para mantenerlos
     - upload state real cuando exista Phase J
-    - último pase de polish de history panel y command/result rendering
+    - último pase de polish de command/result rendering
 
 ### Phase F — Settings And Self-Configuration
 

@@ -4659,6 +4659,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
       text-transform: uppercase;
       background: #eef2f8;
       color: #5c6c84;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }}
     .mode-badge.operator {{
       background: #e8f1ff;
@@ -4667,6 +4671,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
     .mode-badge.impersonation {{
       background: #fff1cf;
       color: #8a5a00;
+    }}
+    .mode-badge.context {{
+      letter-spacing: 0.03em;
+      text-transform: none;
+      font-weight: 700;
+      max-width: 100%;
     }}
     .history-search {{
       width: 100%;
@@ -4684,25 +4694,51 @@ fn architect_index_html(state: &ArchitectState) -> String {
       border-color: #b8caef;
       box-shadow: 0 0 0 4px rgba(69, 117, 220, 0.12);
     }}
+    .history-stats {{
+      margin-bottom: 12px;
+      padding: 0 2px;
+      color: var(--muted);
+      font-size: 0.76rem;
+      line-height: 1.35;
+    }}
     .history-list {{
       display: grid;
       gap: 10px;
     }}
     .history-card {{
+      position: relative;
       padding: 14px 14px 13px;
       border-radius: 18px;
       border: 1px solid var(--line);
       background: var(--panel-alt);
       cursor: pointer;
       overflow: hidden;
+      transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+    }}
+    .history-card:hover {{
+      border-color: #d7e4ff;
+      box-shadow: 0 10px 24px rgba(31, 42, 55, 0.08);
+      transform: translateY(-1px);
     }}
     .history-card.active {{
       background: linear-gradient(180deg, #f5f8ff 0%, #eef3ff 100%);
       border-color: #d7e4ff;
+      box-shadow: 0 12px 28px rgba(69, 117, 220, 0.12);
     }}
     .history-card.placeholder {{
       border-style: dashed;
       background: #fbfcfe;
+    }}
+    .history-card.active::before {{
+      content: "";
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--accent);
+      box-shadow: 0 0 0 4px rgba(69, 117, 220, 0.14);
     }}
     .history-card-head {{
       display: flex;
@@ -4713,7 +4749,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
     .history-name {{
       font-size: 0.95rem;
       font-weight: 700;
-      margin-bottom: 5px;
+      margin-bottom: 3px;
       max-width: 100%;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -4726,7 +4762,17 @@ fn architect_index_html(state: &ArchitectState) -> String {
       line-height: 1.45;
     }}
     .history-meta {{
-      max-width: 100%;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }}
+    .history-meta-sep {{
+      opacity: 0.45;
+    }}
+    .history-meta-updated {{
+      min-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -4737,9 +4783,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font-size: 0.82rem;
       line-height: 1.4;
       max-width: 100%;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
       overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
     }}
     .history-delete {{
       border: 1px solid var(--line);
@@ -4772,6 +4819,19 @@ fn architect_index_html(state: &ArchitectState) -> String {
       color: var(--muted);
       font-size: 0.82rem;
       line-height: 1.45;
+    }}
+    .history-open-badge {{
+      display: inline-flex;
+      align-items: center;
+      margin-bottom: 6px;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: rgba(69, 117, 220, 0.12);
+      color: var(--accent);
+      font-size: 0.68rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
     }}
     .meta-grid strong {{
       color: var(--text);
@@ -5343,6 +5403,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
           <button id="new-chat-impersonation" class="new-chat debug">Impersonate</button>
         </div>
         <input id="history-search" class="history-search" type="search" placeholder="Search chats" autocomplete="off" />
+        <div id="history-stats" class="history-stats">Loading chats…</div>
         <div id="history-list" class="history-list"></div>
         <div class="meta-grid">
           <div class="meta-inline-note">Stored locally on motherbee. Use impersonation only for debug and simulation flows.</div>
@@ -5431,6 +5492,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const newChatImpersonation = document.getElementById("new-chat-impersonation");
     const clearHistory = document.getElementById("clear-history");
     const historySearch = document.getElementById("history-search");
+    const historyStats = document.getElementById("history-stats");
     const historyList = document.getElementById("history-list");
     const composerHint = document.getElementById("composer-hint");
     const impersonationModal = document.getElementById("impersonation-modal");
@@ -5803,6 +5865,41 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const count = Number(session.message_count || 0);
       return count + " messages · updated " + formatTimestamp(session.last_activity_at_ms);
     }}
+    function formatSessionCount(session) {{
+      if (!session || !session.message_count) return "waiting for first message";
+      const count = Number(session.message_count || 0);
+      return count === 1 ? "1 message" : count + " messages";
+    }}
+    function formatSessionUpdated(session) {{
+      if (!session || !session.last_activity_at_ms) return "not updated yet";
+      return "updated " + formatTimestamp(session.last_activity_at_ms);
+    }}
+    function compactHistoryToken(value) {{
+      if (!value) return "";
+      const text = String(value);
+      if (text.length <= 20) return text;
+      return text.slice(0, 8) + "…" + text.slice(-6);
+    }}
+    function appendHistoryBadge(container, label, value) {{
+      if (!value) return;
+      const badge = document.createElement("span");
+      badge.className = "mode-badge context";
+      badge.title = value;
+      badge.textContent = label + " " + compactHistoryToken(value);
+      container.appendChild(badge);
+    }}
+    function updateHistoryStats(visibleCount, totalCount, query) {{
+      if (!historyStats) return;
+      if (!totalCount) {{
+        historyStats.textContent = "Local session history is empty.";
+        return;
+      }}
+      if (query) {{
+        historyStats.textContent = "Showing " + visibleCount + " of " + totalCount + " chats for \"" + query + "\".";
+        return;
+      }}
+      historyStats.textContent = totalCount === 1 ? "1 local chat available." : totalCount + " local chats available.";
+    }}
     function sessionModeLabel(session) {{
       if (!session || !session.chat_mode) return "operator";
       return session.chat_mode === "impersonation" ? "impersonation" : "operator";
@@ -5822,9 +5919,17 @@ fn architect_index_html(state: &ArchitectState) -> String {
       ].join(" ").toLowerCase();
       return haystack.includes(query);
     }}
+    function sortHistorySessions(a, b) {{
+      if ((a && a.session_id) === currentSessionId && (b && b.session_id) !== currentSessionId) return -1;
+      if ((b && b.session_id) === currentSessionId && (a && a.session_id) !== currentSessionId) return 1;
+      const aUpdated = Number((a && a.last_activity_at_ms) || 0);
+      const bUpdated = Number((b && b.last_activity_at_ms) || 0);
+      return bUpdated - aUpdated;
+    }}
     function renderHistory() {{
       historyList.innerHTML = "";
       if (!sessionsCache.length) {{
+        updateHistoryStats(0, 0, "");
         const empty = document.createElement("div");
         empty.className = "history-card placeholder";
         empty.innerHTML = '<div class="history-name">No chats yet</div><div class="history-meta">Create the first session to start working with archi.</div>';
@@ -5832,7 +5937,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
         return;
       }}
       const query = (historySearch && historySearch.value ? historySearch.value : "").trim().toLowerCase();
-      const visibleSessions = sessionsCache.filter((session) => historyMatchesSearch(session, query));
+      const visibleSessions = sessionsCache
+        .filter((session) => historyMatchesSearch(session, query))
+        .sort(sortHistorySessions);
+      updateHistoryStats(visibleSessions.length, sessionsCache.length, query);
       if (!visibleSessions.length) {{
         const empty = document.createElement("div");
         empty.className = "history-card placeholder";
@@ -5855,7 +5963,23 @@ fn architect_index_html(state: &ArchitectState) -> String {
         deleteButton.textContent = "×";
         deleteButton.title = "Delete chat";
         name.textContent = session.title || "Untitled chat";
-        meta.textContent = formatSessionMeta(session);
+        if (session.session_id === currentSessionId) {{
+          const openBadge = document.createElement("div");
+          openBadge.className = "history-open-badge";
+          openBadge.textContent = "Open";
+          card.appendChild(openBadge);
+        }}
+        const countSpan = document.createElement("span");
+        const sepSpan = document.createElement("span");
+        const updatedSpan = document.createElement("span");
+        countSpan.textContent = formatSessionCount(session);
+        sepSpan.className = "history-meta-sep";
+        sepSpan.textContent = "•";
+        updatedSpan.className = "history-meta-updated";
+        updatedSpan.textContent = formatSessionUpdated(session);
+        meta.appendChild(countSpan);
+        meta.appendChild(sepSpan);
+        meta.appendChild(updatedSpan);
         deleteButton.addEventListener("click", (event) => {{
           event.stopPropagation();
           deleteSession(session.session_id).catch((err) => {{
@@ -5872,24 +5996,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
         modeBadge.className = "mode-badge " + sessionModeLabel(session);
         modeBadge.textContent = sessionModeLabel(session);
         modeRow.appendChild(modeBadge);
-        if (session.effective_ich_id) {{
-          const ichBadge = document.createElement("span");
-          ichBadge.className = "mode-badge";
-          ichBadge.textContent = session.effective_ich_id;
-          modeRow.appendChild(ichBadge);
-        }}
-        if (session.effective_ilk) {{
-          const ilkBadge = document.createElement("span");
-          ilkBadge.className = "mode-badge";
-          ilkBadge.textContent = session.effective_ilk;
-          modeRow.appendChild(ilkBadge);
-        }}
-        if (session.thread_id) {{
-          const threadBadge = document.createElement("span");
-          threadBadge.className = "mode-badge";
-          threadBadge.textContent = session.thread_id;
-          modeRow.appendChild(threadBadge);
-        }}
+        appendHistoryBadge(modeRow, "ICH", session.effective_ich_id);
+        appendHistoryBadge(modeRow, "ILK", session.effective_ilk);
+        appendHistoryBadge(modeRow, "Thread", session.thread_id);
         card.appendChild(modeRow);
         if (session.last_message_preview) {{
           const preview = document.createElement("div");
