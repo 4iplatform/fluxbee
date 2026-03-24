@@ -175,9 +175,12 @@ impl FunctionCallingRunner {
                 })
                 .await?;
 
-            if let Some(text) = response.assistant_text.clone() {
-                last_assistant_text = Some(text.clone());
-                items.push(FunctionLoopItem::AssistantText { content: text });
+            let should_commit_assistant_text = response.tool_calls.is_empty();
+            if should_commit_assistant_text {
+                if let Some(text) = response.assistant_text.clone() {
+                    last_assistant_text = Some(text.clone());
+                    items.push(FunctionLoopItem::AssistantText { content: text });
+                }
             }
 
             if response.tool_calls.is_empty() {
@@ -489,4 +492,98 @@ pub async fn dispatch_tool_calls(
         out.push(result);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use serde_json::json;
+    use tokio::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct SequencedModel {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl FunctionCallingModel for SequencedModel {
+        async fn run_turn(
+            &self,
+            _request: FunctionModelTurnRequest,
+        ) -> Result<FunctionModelTurnResponse> {
+            let mut calls = self.calls.lock().await;
+            let current = *calls;
+            *calls += 1;
+            match current {
+                0 => Ok(FunctionModelTurnResponse {
+                    assistant_text: Some("I will prepare the action now.".to_string()),
+                    tool_calls: vec![FunctionToolCall {
+                        call_id: "call-1".to_string(),
+                        response_id: Some("resp-1".to_string()),
+                        name: "demo_write".to_string(),
+                        arguments: json!({"path":"/hives"}),
+                    }],
+                }),
+                _ => Ok(FunctionModelTurnResponse {
+                    assistant_text: Some("The tool failed, so there is nothing to confirm.".to_string()),
+                    tool_calls: Vec::new(),
+                }),
+            }
+        }
+    }
+
+    struct DemoTool;
+
+    #[async_trait]
+    impl FunctionTool for DemoTool {
+        fn definition(&self) -> FunctionToolDefinition {
+            FunctionToolDefinition {
+                name: "demo_write".to_string(),
+                description: "demo".to_string(),
+                parameters_json_schema: json!({
+                    "type": "object"
+                }),
+            }
+        }
+
+        async fn call(&self, _arguments: Value) -> Result<Value> {
+            Err(AiSdkError::Protocol("missing required fields".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn ignores_provisional_assistant_text_when_tool_calls_exist() {
+        let model = SequencedModel::default();
+        let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+        let mut tools = FunctionToolRegistry::new();
+        tools.register(Arc::new(DemoTool)).expect("tool should register");
+
+        let result = runner
+            .run(&model, &tools, "create hive worker-220")
+            .await
+            .expect("runner should succeed");
+
+        assert_eq!(
+            result.final_assistant_text.as_deref(),
+            Some("The tool failed, so there is nothing to confirm.")
+        );
+
+        let assistant_messages = result
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                FunctionLoopItem::AssistantText { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            assistant_messages,
+            vec!["The tool failed, so there is nothing to confirm."]
+        );
+    }
 }
