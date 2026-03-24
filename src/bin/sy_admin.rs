@@ -686,11 +686,7 @@ async fn handle_internal_admin_command(
         .and_then(|v| v.as_str())
         .unwrap_or(&action)
         .to_string();
-    let payload = internal
-        .envelope
-        .get("payload")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let payload = internal_response_payload_value(&internal.envelope);
     let error_code = internal
         .envelope
         .get("error_code")
@@ -713,6 +709,23 @@ async fn handle_internal_admin_command(
         parsed.request_id,
     )
     .await
+}
+
+fn internal_response_payload_value(envelope: &serde_json::Value) -> serde_json::Value {
+    if let Some(value) = envelope.get("payload") {
+        return value.clone();
+    }
+    let Some(mut object) = envelope.as_object().cloned() else {
+        return serde_json::Value::Null;
+    };
+    for key in ["status", "action", "error_code", "error_detail", "request_id"] {
+        object.remove(key);
+    }
+    if object.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(object)
+    }
 }
 
 async fn send_admin_command_response(
@@ -5126,4 +5139,72 @@ fn build_opa_query_response(
     })
     .to_string();
     (status, body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn internal_response_payload_value_prefers_payload_field() {
+        let envelope = json!({
+            "status": "ok",
+            "action": "get_hive",
+            "payload": {
+                "hive_id": "worker-220"
+            },
+            "error_code": null,
+            "error_detail": null
+        });
+
+        assert_eq!(
+            internal_response_payload_value(&envelope),
+            json!({ "hive_id": "worker-220" })
+        );
+    }
+
+    #[test]
+    fn internal_response_payload_value_falls_back_to_top_level_body() {
+        let envelope = json!({
+            "status": "ok",
+            "action": "get_policy",
+            "responses": [
+                {
+                    "hive": "motherbee",
+                    "status": "ok",
+                    "payload": {
+                        "version": 10
+                    }
+                }
+            ],
+            "pending": [],
+            "expected_hives_policy": ["motherbee"],
+            "expected_hives_topology": ["motherbee"],
+            "pending_hives_policy": [],
+            "pending_hives_topology": [],
+            "error_code": null,
+            "error_detail": null
+        });
+
+        assert_eq!(
+            internal_response_payload_value(&envelope),
+            json!({
+                "responses": [
+                    {
+                        "hive": "motherbee",
+                        "status": "ok",
+                        "payload": {
+                            "version": 10
+                        }
+                    }
+                ],
+                "pending": [],
+                "expected_hives_policy": ["motherbee"],
+                "expected_hives_topology": ["motherbee"],
+                "pending_hives_policy": [],
+                "pending_hives_topology": []
+            })
+        );
+    }
 }
