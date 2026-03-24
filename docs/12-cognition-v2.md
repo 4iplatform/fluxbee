@@ -1,0 +1,863 @@
+# Fluxbee - 12 Cognition (SY.cognition) v2
+
+**Status:** v2.0 (final)
+**Date:** 2026-03-24
+**Audience:** All developers (cognitive, AI, IO, router, identity)
+**Replaces:** `12-cognition.md` (v1.16)
+**Sources:** Cognitive Lab audit (`15-auditoria-tecnica-especifica-independiente.md`), architecture sessions, operational reason design
+
+---
+
+## 1. Purpose
+
+SY.cognition is the cognitive engine of Fluxbee. It processes every message that flows through the system and builds structured understanding over time through two parallel corrients:
+
+- **What is being discussed** (semantic context)
+- **What the communication seeks to cause** (operational reason)
+
+Both corrients are born from the same message, live in parallel with the same mechanics, and fuse when consolidated into memory.
+
+Its responsibilities are:
+
+1. **Tag messages** — extract semantic tags AND reason signals from each message.
+2. **Maintain contexts** — track active topics with weight, decay, and ILK participation.
+3. **Maintain reasons** — track active operational drivers with the same mechanics.
+4. **Detect scope transitions** — identify when conversational cohesion shifts (using both context AND reason similarity).
+5. **Generate memories** — produce narrative summaries that fuse what was discussed with why it was discussed.
+6. **Detect episodes** — identify significant socio-emotional events with a conservative gate.
+7. **Serve cognitive data** — make contexts, reasons, memories, and episodes available for message enrichment.
+
+SY.cognition does NOT handle:
+
+- Immediate conversation memory (AI SDK responsibility).
+- Identity management (SY.identity).
+- Message persistence to PostgreSQL (SY.storage).
+- Routing decisions (router + OPA).
+
+---
+
+## 2. The Double Helix: Context and Reason
+
+### 2.1 Concept
+
+Every message carries two dimensions of information:
+
+**Context (semantic field):** What is this about? What topic persists? What subject gains or loses weight?
+
+**Reason (operational direction):** What does this message seek to cause? What drive does it carry? What kind of movement does it attempt to produce in the system?
+
+These two dimensions are:
+- **Born together** — extracted from the same message in a single tagger call.
+- **Tracked in parallel** — same mechanics (score, weight, decay, ILK profiles) but answering different questions.
+- **Fused in memory** — when consolidated, memory captures both the topic and the recurring drive behind it.
+
+### 2.2 Why Two Corrients
+
+Neither alone is sufficient:
+
+- Context without reason: "Juan discussed billing" — but was he complaining, seeking resolution, providing information, or threatening to leave?
+- Reason without context: "Someone was seeking resolution" — but about what?
+
+Together: "Juan brings billing recurrently as a complaint seeking urgent resolution." That is operational experience, not just topic archival.
+
+### 2.3 Separation Discipline
+
+While alive in caliente (per message, per thread), contexts and reasons are separate objects. They are NOT mixed prematurely. This prevents the common error of conflating topic, emotion, intent, and action into a single muddy tag.
+
+They fuse only at memory consolidation time, when the summarizer has enough evidence to produce a meaningful narrative that includes both.
+
+---
+
+## 3. The Six Core Entities
+
+### 3.1 Thread
+
+The physical unit of conversational continuity given by the medium. Created by the IO node.
+
+**Thread is purely physical/relational.** It does not depend on topic, context, or intention. It represents the communication structure of the medium: the channel, the relationship between interlocutors, and the sequencing that the medium imposes.
+
+**Identity:** `thread:<hash>` — deterministic, computed by the IO node based on channel type:
+
+| Channel type | Computation | Example |
+|-------------|-------------|---------|
+| DM / 1:1 | `hash(sorted(peer_ilks) + ich_id)` | WhatsApp 1:1 chat, email between A and B |
+| Group / persistent channel | `hash(ich_id)` | WhatsApp group, Slack channel. Roster changes do not change the thread |
+| Medium-native thread | `hash(native_thread_id + ich_id)` | Email In-Reply-To, Slack thread reply, helpdesk ticket ID |
+
+The IO node chooses the rule because it knows the channel type. The SDK provides a canonical `compute_thread_id(channel_type, params)` function.
+
+**Rules:**
+
+- Thread does not change when the topic changes. Semantic segmentation happens at scope/context level, not thread level.
+- Thread can be long-lived (months, years). That is a feature, not a bug — the meaning is tracked by contexts, reasons, and scopes, not by the thread itself.
+- For groups, participants entering or leaving do not create a new thread. The channel identity (ICH) is stable.
+- All messages, contexts, reasons, memories, and episodes are associated with a thread.
+
+### 3.2 Scope
+
+The abstract unit of conversational continuity. Emerges from accumulated context AND reason.
+
+**Identity:** `scope:<uuid-v4>`. Generated by SY.cognition when binding energy detects stable cohesion.
+
+**Scope Instance:** Temporal window within a scope. Cuts when binding energy indicates sustained shift — considering both thematic and reason-driven divergence.
+
+### 3.3 Context
+
+A semantic topic tracked over time. Answers: "what is being discussed."
+
+**Identity:** `context:<uuid-v4>`.
+
+**Mode:** Additive only. No label refinement. Subtopics create new contexts.
+
+```json
+{
+  "context_id": "context:uuid",
+  "thread_id": "thread:hash",
+  "scope_id": "scope:uuid",
+  "label": "billing dispute",
+  "status": "open",
+  "score": 7.8,
+  "weight": 4.2,
+  "weight_avg_cumulative": 2.85,
+  "weight_avg_ema": 2.85,
+  "weight_samples": 23,
+  "tags": ["billing", "refund", "invoice"],
+  "ilk_weights": { "ilk:uuid-juan": 6.0 },
+  "ilk_profile": { "ilk:uuid-juan": { "as_sender": 12, "as_receiver": 3 } },
+  "opened_at": "...",
+  "last_seen_at": "..."
+}
+```
+
+### 3.4 Reason
+
+An operational driver tracked over time. Answers: "what does the communication seek to cause."
+
+**Identity:** `reason:<uuid-v4>`.
+
+**Same mechanics as Context:** score, weight, decay, ILK weights, ILK profile. Lives in parallel, same lifecycle rules.
+
+```json
+{
+  "reason_id": "reason:uuid",
+  "thread_id": "thread:hash",
+  "scope_id": "scope:uuid",
+  "label": "seeking urgent resolution",
+  "status": "open",
+  "score": 8.1,
+  "weight": 3.8,
+  "weight_avg_cumulative": 3.2,
+  "weight_avg_ema": 3.2,
+  "weight_samples": 18,
+  "signals_canonical": ["resolve", "challenge"],
+  "signals_extra": ["urgency", "frustration"],
+  "ilk_weights": { "ilk:uuid-juan": 7.0 },
+  "ilk_profile": { "ilk:uuid-juan": { "as_sender": 15, "as_receiver": 1 } },
+  "opened_at": "...",
+  "last_seen_at": "..."
+}
+```
+
+### 3.5 Memory
+
+A narrative summary that fuses context + reason. Answers: "what does the system know about this, and with what recurring drive."
+
+**Identity:** `memory:<uuid-v4>`.
+
+Memory is narrative, not exact. Like human memory, it captures the essence with accumulated perspective, not a precise replay.
+
+```json
+{
+  "memory_id": "memory:uuid",
+  "thread_id": "thread:hash",
+  "scope_id": "scope:uuid",
+  "summary": "Juan brings billing issues recurrently as complaints seeking urgent resolution. He has a pattern of escalating when response time exceeds his expectation.",
+  "weight": 2.5,
+  "occurrences": 3,
+  "dominant_context_id": "context:uuid",
+  "dominant_reason_id": "reason:uuid",
+  "ilk_weights": { "ilk:uuid-juan": 5.0 },
+  "created_at": "...",
+  "last_seen_at": "..."
+}
+```
+
+The `summary` is the narrative fusion. The `dominant_context_id` and `dominant_reason_id` are structured metadata for OPA/routing consumption.
+
+### 3.6 Episode
+
+A significant socio-emotional event with intensity and evidence. Episodes are more precise than memories — they capture specific moments.
+
+**Identity:** `episode:<uuid-v4>`.
+
+Same structure as in the cognitive lab audit. Conservative gate: only persisted when evidence is strong and unambiguous.
+
+```json
+{
+  "episode_id": "episode:uuid",
+  "thread_id": "thread:hash",
+  "scope_id": "scope:uuid",
+  "fear_id": "anger",
+  "title": "Friction over delayed refund",
+  "summary": "Customer expressed strong frustration about refund processing time.",
+  "base_intensity": 8,
+  "evidence_strength": 9,
+  "evidence_context_ids": ["context:uuid"],
+  "evidence_reason_ids": ["reason:uuid"],
+  "evidence_signals": ["anger", "complaint"],
+  "intensity": 8,
+  "reason": "Explicit friction in dominant context with urgent resolution drive"
+}
+```
+
+---
+
+## 4. Reason Signals: The Commandments
+
+### 4.1 Philosophy
+
+Reason signals are NOT detailed action categories. They are fundamental, general behavioral principles — like commandments. The system should recognize basic human drives in communication without micromanaging intent classification.
+
+### 4.2 The Base Commandments (v1)
+
+These are the minimum reason signals the tagger should recognize. They are intentionally general and few:
+
+| Signal | Meaning |
+|--------|---------|
+| `resolve` | Seeking solution to a problem |
+| `inform` | Giving or seeking information |
+| `protect` | Defending from harm, guarding interests |
+| `connect` | Establishing or maintaining relationship |
+| `challenge` | Questioning, opposing, confronting |
+| `confirm` | Validating, agreeing, acknowledging |
+| `request` | Asking for something specific |
+| `abandon` | Withdrawing, giving up, disengaging |
+
+### 4.3 Rules
+
+- The tagger extracts reason signals from the same message, in the same call as semantic tags.
+- A message can carry multiple reason signals (a complaint that also seeks resolution).
+- **The 8 commandments are a closed canonical set for v1.** The reason evaluator and OPA only operate on these 8 signals. This ensures deterministic processing and stable SHM indexing.
+- If the tagger detects nuances beyond the 8, they go to a separate `reason_signals_extra` field as free-text evidence. This evidence is available for narrative memory generation but does NOT feed the reason evaluator or reach OPA.
+- The reason evaluator (same mechanics as context evaluator) groups canonical signals into reasons with labels, weights, and ILK profiles.
+- Reasons do not refine labels (same additive rule as contexts).
+
+**Canonical kernel vs periferia:**
+
+```json
+{
+  "reason_signals_canonical": ["resolve", "challenge"],
+  "reason_signals_extra": ["urgency", "frustration", "implicit_threat"],
+  "reason_label": "seeking urgent resolution"
+}
+```
+
+The canonical signals feed the deterministic pipeline. The extra signals enrich narrative memory but have no normative weight.
+
+### 4.4 Why General, Not Specific
+
+Specific categories (`request_resolution`, `complaint`, `escalation_attempt`) are tempting but create a catalog maintenance problem and force the system to classify intent with more precision than is useful in real-time.
+
+General commandments let the AI interpret freely while giving the deterministic engine enough structure to weight, decay, and correlate. The specificity comes later, in the narrative memory, not in the signal classification.
+
+---
+
+## 5. Pipeline
+
+### 5.1 Overview
+
+```
+Message arrives (via NATS from router)
+  │
+  ▼
+1. TAGGER (single AI call)
+   Extract semantic tags AND reason signals.
+   Input: message text + word_count
+   Output: tags[] + reason_signals[]
+  │
+  ├─── tags feed ──────────────► CONTEXT EVALUATOR (AI)
+  │                                Assign/create/close contexts
+  │
+  └─── reason_signals feed ────► REASON EVALUATOR (AI or deterministic)
+                                   Assign/create/close reasons
+  │
+  ▼
+3. DETERMINISTIC UPDATE (parallel for both)
+   Update context weights, ILK profiles, decay.
+   Update reason weights, ILK profiles, decay.
+   Apply MAX_OPEN guardrails.
+   Emit events.
+  │
+  ▼
+4. SCOPE BINDING EVALUATION
+   Calculate binding energy using BOTH context AND reason similarity.
+   Update EMA, evaluate threshold, detect scope change.
+  │
+  ▼
+5. PERIOD DETECTION
+   Build snapshots with main context + dominant reason.
+   Cut periods by switch, decay, or time threshold.
+  │
+  ▼
+6. SCOPE SUMMARIZER (single AI call per period)
+   Receives contexts AND reasons for the period.
+   Generates narrative memories that fuse both.
+   Evaluates episode decisions.
+  │
+  ▼
+7. APPLY RESULTS
+   Create/update memories (narrative fusion of context+reason).
+   Persist episodes that pass gate.
+   Update LanceDB + jsr-memory SHM.
+  │
+  ▼
+8. PUBLISH TO NATS (fire & forget)
+```
+
+### 5.2 Where Cognitive Gets Messages
+
+SY.cognition consumes from NATS (`storage.turns` stream). Same stream as SY.storage. Fire & forget from router (~1ms).
+
+### 5.3 Message Enrichment
+
+Router reads `jsr-memory-<hive>` SHM to attach `memory_package` to messages. The router enriches, not SY.cognition. SY.cognition writes, the router reads and attaches.
+
+---
+
+## 6. AI Contracts
+
+### 6.1 Tagger (Extended)
+
+Single AI call produces both semantic tags and reason signals.
+
+**Input:**
+
+```json
+{
+  "word_count": 18,
+  "max_tags": 12,
+  "max_reason_signals": 4,
+  "canonical_signals": ["resolve", "inform", "protect", "connect", "challenge", "confirm", "request", "abandon"],
+  "text": "Message text"
+}
+```
+
+**Output:**
+
+```json
+{
+  "tags": ["billing", "refund", "complaint"],
+  "reason_signals_canonical": ["resolve", "challenge"],
+  "reason_signals_extra": ["urgency", "frustration"]
+}
+```
+
+**Tag post-processing:** Same as before (lowercase, dedup, limit).
+
+**Reason signal post-processing:**
+- `reason_signals_canonical`: filter to only values present in the canonical set. Lowercase, dedup.
+- `reason_signals_extra`: any additional signals detected. Stored as evidence, does not feed reason evaluator.
+
+Each tag carries ILK metadata from the message:
+
+```json
+{ "tag": "billing", "ilk_sender": "ilk:uuid", "ilk_receiver": "ilk:uuid" }
+```
+
+Each reason signal carries the same:
+
+```json
+{ "signal": "resolve", "ilk_sender": "ilk:uuid", "ilk_receiver": "ilk:uuid" }
+```
+
+### 6.2 Context Evaluator
+
+Unchanged from cognitive lab audit. Tags-only input, additive mode.
+
+### 6.3 Reason Evaluator
+
+Same contract shape as Context Evaluator but for reason signals:
+
+**Input:**
+
+```json
+{
+  "REASON_SCORE_THRESHOLD": 4,
+  "signals": [{"value": "resolve"}, {"value": "challenge"}],
+  "open_reasons": [
+    {
+      "reason_id": "reason:uuid",
+      "label": "seeking urgent resolution",
+      "score": 7.2,
+      "weight": 3.1,
+      "status": "open"
+    }
+  ],
+  "identity": {
+    "sender_ilk": "ilk:uuid",
+    "recipient_ilks": ["ilk:uuid"]
+  }
+}
+```
+
+**Output:**
+
+```json
+{
+  "assignments": [
+    {"reason_id": "reason:uuid", "label": "seeking urgent resolution", "score": 7.8}
+  ],
+  "new_reasons": [
+    {"label": "confrontational pushback", "score": 6.5}
+  ],
+  "to_close": []
+}
+```
+
+Same rules as Context Evaluator: score threshold, additive mode, no label refinement.
+
+**Implementation note:** For v1, the Reason Evaluator can be a second AI call or deterministic mapping from signals to reasons. If signals are general enough (the commandments), deterministic mapping may suffice initially.
+
+### 6.4 Scope Summarizer (Extended)
+
+Single AI call per period. Now receives contexts AND reasons.
+
+**Input:**
+
+```json
+{
+  "period": {"start_ts": "...", "end_ts": "..."},
+  "main_context": {"context_id": "context:uuid", "label": "billing dispute"},
+  "dominant_reason": {"reason_id": "reason:uuid", "label": "seeking urgent resolution"},
+  "memories": [...],
+  "fears": [...],
+  "prior_stats": [...],
+  "contexts": [...],
+  "reasons": [
+    {
+      "reason_id": "reason:uuid",
+      "label": "seeking urgent resolution",
+      "weight": 3.8,
+      "weight_avg_ema": 3.2
+    }
+  ]
+}
+```
+
+**Output:** Same structure as before, but the AI is instructed to produce narrative memories that fuse context and reason:
+
+```json
+{
+  "period_memories": [
+    {
+      "extracto": "Juan brings billing issues recurrently as complaints seeking urgent resolution. He escalates when response time exceeds expectations.",
+      "memory_match_id": "memory:uuid",
+      "weight_delta": 1.2,
+      "enrich": true
+    }
+  ],
+  "global_adjustments": [...],
+  "episode_decision": {
+    "should_create_episode": true,
+    "evidence_context_ids": ["context:uuid"],
+    "evidence_reason_ids": ["reason:uuid"],
+    "evidence_signals": ["anger", "resolve"],
+    "evidence_strength": 9,
+    "reason": "Explicit friction in billing context driven by urgent resolution demand"
+  }
+}
+```
+
+---
+
+## 7. Scope Binding Energy (Extended)
+
+### 7.1 Two-Variable Binding
+
+Binding energy now considers BOTH context similarity AND reason similarity between active objects.
+
+**Step 1 — Context similarity (Jaccard of tags, as before):**
+
+```
+S_ctx(i,j) = |tags_i ∩ tags_j| / |tags_i ∪ tags_j|
+```
+
+**Step 2 — Reason similarity (Jaccard of canonical signals):**
+
+```
+S_rsn(i,j) = |signals_canonical_i ∩ signals_canonical_j| / |signals_canonical_i ∪ signals_canonical_j|
+```
+
+Only canonical signals feed the binding energy calculation. Extra signals are evidence for memory, not for binding.
+
+**Step 3 — ILK similarity (Cosine, unchanged):**
+
+```
+S_ilk(i,j) = cosine(vec_i, vec_j)
+```
+
+**Step 4 — Coupling (now three factors):**
+
+```
+J(i,j) = S_ctx(i,j) × S_rsn(i,j) × S_ilk(i,j)
+```
+
+When contexts and reasons are aligned (same topic AND same drive AND same participants), coupling is strong. When any dimension diverges, coupling weakens.
+
+**Steps 5-7** (energy, normalization, EMA, threshold): unchanged.
+
+### 7.2 What This Means for Scope
+
+A scope stays stable when people discuss similar topics with similar drives. A scope changes when:
+
+- Topics shift (different contexts) — already detected in v1.
+- Drives shift (same topic but different operational purpose) — NEW in v2.
+- Both shift — strongest signal.
+
+Example: "billing" discussed as complaint (challenge + resolve) vs "billing" discussed as routine inquiry (inform + confirm) — same context, different reasons. The binding energy detects this as a potential scope shift even though the topic hasn't changed.
+
+---
+
+## 8. Deterministic Algorithms
+
+### 8.1 Context Update Per Message
+
+Unchanged from cognitive lab audit. Score threshold, weight update, ILK profiles, decay, MAX_OPEN_CONTEXTS guardrail.
+
+### 8.2 Reason Update Per Message
+
+Same mechanics as Context Update, applied to reasons instead of contexts:
+
+1. Resolve assignments and new reasons from evaluator.
+2. Update weight, averages for each open reason.
+3. Close if weight <= 0.
+4. Update ILK weights and profiles if identity present.
+5. Apply `MAX_OPEN_REASONS` guardrail (same as MAX_OPEN_CONTEXTS).
+
+### 8.3 Scope Binding Energy
+
+Extended with reason similarity as described in section 7.
+
+### 8.4 Period Detection
+
+Now builds snapshots with main context AND dominant reason. Periods cut when either context or reason switches significantly.
+
+### 8.5 Memory Application
+
+Per period. AI returns narrative memories that fuse context+reason. Application mechanics unchanged (match → update, no match → create, decay unreinforced).
+
+### 8.6 Episode Gate
+
+Unchanged from audit. Gate conditions remain the same. Evidence now includes `evidence_reason_ids` in addition to `evidence_context_ids`.
+
+---
+
+## 9. Parameters and Thresholds
+
+### 9.1 Contexts
+
+| Parameter | Value |
+|-----------|-------|
+| `CONTEXT_SCORE_THRESHOLD` | 4 |
+| `MAX_TAGS` | 12 |
+| `MAX_OPEN_CONTEXTS` | 20 |
+
+### 9.2 Reasons
+
+| Parameter | Value |
+|-----------|-------|
+| `REASON_SCORE_THRESHOLD` | 4 |
+| `MAX_REASON_SIGNALS` | 4 |
+| `MAX_OPEN_REASONS` | 10 |
+
+### 9.3 ILK Weights
+
+| Parameter | Value |
+|-----------|-------|
+| `ILK_CONTEXT_WEIGHT_SENDER` | 1.0 |
+| `ILK_CONTEXT_WEIGHT_RECIPIENT` | 0.5 |
+
+Same weights apply for reasons.
+
+### 9.4 Scope Binding
+
+| Parameter | Value |
+|-----------|-------|
+| `SCOPE_ENERGY_ALPHA` | 0.25 |
+| `SCOPE_ENERGY_UNBIND_THRESHOLD` | -0.05 |
+| `SCOPE_ENERGY_MIN_CTX_FOR_EVAL` | 2 |
+| `SCOPE_ENERGY_SUSTAIN_COUNT` | 2 |
+
+### 9.5 Memories
+
+| Parameter | Value |
+|-----------|-------|
+| `MEMORY_DECAY_STEP` | 0.25 |
+
+### 9.6 Episodes
+
+| Parameter | Value |
+|-----------|-------|
+| `EPISODE_MIN_FINAL_INTENSITY` | 7 |
+| `EPISODE_MIN_EVIDENCE_STRENGTH` | 8 |
+
+---
+
+## 10. Architecture
+
+### 10.1 One Per Hive
+
+SY.cognition runs on every hive. Each instance processes messages from its local NATS stream.
+
+### 10.2 Storage Layers
+
+| Layer | Purpose | Location | Latency |
+|-------|---------|----------|---------|
+| jsr-memory SHM | Index for router enrichment | `/dev/shm/jsr-memory-<hive>` | ~μs |
+| LanceDB | Local cognitive database | `/var/lib/fluxbee/nodes/SY/SY.cognition@<hive>/memory.lance` | ~ms |
+| PostgreSQL | Durable source of truth (via SY.storage) | Motherbee only | ~10ms |
+
+### 10.3 Cold Start
+
+Rebuild from PostgreSQL via SY.storage socket. Replay turns through pipeline to reconstruct contexts, reasons, memories, episodes.
+
+### 10.4 SHM Region: jsr-memory-\<hive\>
+
+Single writer: SY.cognition. Uses seqlock.
+
+Contains inverted index of tags + reason signals → memory/episode references for router enrichment.
+
+---
+
+## 11. Memory Package (Router Enrichment)
+
+```json
+{
+  "meta": {
+    "memory_package": {
+      "contexts": [
+        {"context_id": "...", "label": "billing dispute", "weight": 4.2}
+      ],
+      "reasons": [
+        {"reason_id": "...", "label": "seeking urgent resolution", "weight": 3.8}
+      ],
+      "memories": [
+        {"memory_id": "...", "summary": "Juan brings billing issues as complaints...", "weight": 2.5,
+         "dominant_context_id": "...", "dominant_reason_id": "..."}
+      ],
+      "episodes": [
+        {"episode_id": "...", "title": "Friction over delayed refund", "intensity": 8}
+      ]
+    }
+  }
+}
+```
+
+### Limits
+
+| Limit | Value |
+|-------|-------|
+| `MEMORY_PACKAGE_MAX_BYTES` | 32,768 |
+| `MEMORY_PACKAGE_MAX_EVENTS` | 3 |
+| `MEMORY_PACKAGE_MAX_ITEMS` | 12 |
+| `MEMORY_FETCH_TIMEOUT_MS` | 50 |
+
+---
+
+## 12. Naming: v1.16 to v2 Migration
+
+| v1.16 Term | v2 Term | What Changed |
+|------------|---------|--------------|
+| `ctx:<hash>` | `thread:<hash>` | Thread is the physical conversation unit |
+| Episode (block of turns) | Scope Instance | Temporal window cut by binding energy |
+| Episode (event) | Episode | Socio-emotional event with gate |
+| Event (episodic unit) | Context + Reason | Two parallel tracking entities |
+| Memory Item | Memory | Narrative summary fusing context + reason |
+| Cue/Tag | Tag + Signal | Tags for context, signals for reason |
+| AI.tagger | Tagger | Internal to SY.cognition, produces both tags + signals |
+| AI.consolidator | Scope Summarizer | Single AI call, receives contexts + reasons |
+| activation_strength | weight | Same concept, simpler name |
+| (not in v1.16) | Reason | NEW: operational driver entity |
+
+---
+
+## 13. Open Design Questions
+
+### 13.1 Scope Association Algorithm
+
+How does SY.cognition match a new thread to an existing scope? By ILK overlap? ICH overlap? Minimum threshold?
+
+### 13.2 Fears Catalog
+
+Where does the catalog of fears live? For v1: hardcoded in SY.cognition.
+
+### 13.3 AI Call Strategy
+
+SY.cognition makes direct AI calls via AI SDK (same as SY.architect). Carries its own AI provider key in config.
+
+### 13.4 Reason Evaluator: AI or Deterministic?
+
+For v1, the reason evaluator is deterministic, operating only on the 8 canonical signals. It maps signals to reasons by keyword matching and grouping. Since the commandments are general and few, deterministic mapping is sufficient. Upgrade to AI call later if needed.
+
+### 13.5 Thread ID Hash Function
+
+**Resolved.** Thread computation uses three rules by channel type (see section 3.1). The SDK provides `compute_thread_id(channel_type, params)`. Hash function: to be specified (SHA-256 truncated or blake3).
+
+### 13.6 Feed/Stream Processing
+
+Continuous feeds deferred. System assumes discrete messages. IO handles segmentation.
+
+### 13.7 Future: Normative Interpretation Layer (SY.claims)
+
+SY.cognition describes and condenses experience. It does NOT interpret law or produce normative claims for enforcement.
+
+When the system needs a layer that translates reason signals + identity + context + memory into canonical normative claims for OPA (intent_class, risk_level, requires_confirmation, human_handoff_candidate, etc.), that layer should be a separate process — tentatively SY.claims or SY.norm.
+
+**For v1:** OPA consumes `dominant_reason_id` from memories and canonical reason signals directly. This is sufficient for basic routing decisions.
+
+**For future:** SY.claims sits between cognition and OPA:
+
+```
+SY.cognition (describes) → SY.claims (interprets) → OPA (enforces)
+```
+
+SY.claims would take: message + identity + active contexts/reasons + relevant memories/episodes. It would produce canonical normative claims: `{ intent_class, risk_level, requires_confirmation, read_only, touches_system_config, human_handoff_candidate }`. OPA would consume those claims, not raw cognitive data.
+
+This separation preserves:
+- **Cognition** as experience engine (description).
+- **Claims** as normative interpreter (jurisprudence).
+- **OPA** as enforcement engine (law/force).
+
+This is documented as design direction, not for implementation now.
+
+---
+
+## 14. Relationship to Immediate Memory (AI SDK)
+
+| Aspect | Immediate Memory (SDK) | Cognitive Memory (SY.cognition) |
+|--------|------------------------|--------------------------------|
+| Scope | Single session | Cross-session, cross-thread |
+| Horizon | Last 10-12 interactions | Days, weeks, months |
+| Owner | Each AI node | SY.cognition (system-wide) |
+| Content | What am I doing right now | What do I know + with what drive |
+| Consumed by | The AI node itself | Router (enrichment) + AI nodes (memory_package) |
+
+Both coexist. Neither replaces the other.
+
+---
+
+## 15. Implementation Tasks
+
+### Phase 1 — Contexts (Core Pipeline)
+
+- [ ] COG-T1. Implement `compute_thread_id(channel_type, params)` in SDK with three rules (DM, group, native).
+- [ ] COG-T2. IO nodes include `thread_id` in message metadata using SDK function.
+- [ ] COG-T3. SY.cognition consumes from NATS `storage.turns`.
+- [ ] COG-T4. Implement tagger (extended: tags + reason_signals_canonical + reason_signals_extra in single call).
+- [ ] COG-T5. Implement context evaluator.
+- [ ] COG-T6. Implement deterministic context update.
+
+### Phase 2 — Reasons (Parallel Corrient)
+
+- [ ] COG-T7. Implement reason evaluator (deterministic v1: canonical signals only, map to reasons).
+- [ ] COG-T8. Implement deterministic reason update (same mechanics as context).
+- [ ] COG-T9. Track co-occurrences between contexts and reasons.
+
+### Phase 3 — Scope and Binding
+
+- [ ] COG-T10. Implement scope creation and thread-scope association.
+- [ ] COG-T11. Implement binding energy with two-variable coupling (context + reason similarity).
+- [ ] COG-T12. Implement energy EMA and scope instance transitions.
+- [ ] COG-T13. Emit scope events to NATS.
+
+### Phase 4 — Memories (Narrative Fusion)
+
+- [ ] COG-T14. Implement period detection (with main context + dominant reason).
+- [ ] COG-T15. Implement scope summarizer (contexts + reasons → narrative memory).
+- [ ] COG-T16. Implement memory creation, reinforcement, and decay.
+- [ ] COG-T17. Store `dominant_context_id` and `dominant_reason_id` as structured metadata on memories.
+
+### Phase 5 — Episodes
+
+- [ ] COG-T18. Implement episode gate (conservative, multi-condition).
+- [ ] COG-T19. Include `evidence_reason_ids` in episode evidence.
+- [ ] COG-T20. Publish memory and episode events to NATS.
+
+### Phase 6 — Storage and SHM
+
+- [ ] COG-T21. Implement LanceDB schema for threads, contexts, reasons, memories, episodes.
+- [ ] COG-T22. Implement jsr-memory SHM writer (seqlock, tag + signal index).
+- [ ] COG-T23. Implement cold start (rebuild from PostgreSQL via SY.storage).
+
+### Phase 7 — Router Enrichment
+
+- [ ] COG-T24. Router reads jsr-memory and builds memory_package (includes reasons).
+- [ ] COG-T25. Router attaches memory_package to messages before delivery.
+- [ ] COG-T26. Respect memory_package limits.
+
+### Phase 8 — E2E Validation
+
+- [ ] COG-T27. E2E: message → tagger → context + reason created.
+- [ ] COG-T28. E2E: binding energy with context + reason → scope transition.
+- [ ] COG-T29. E2E: period → summarizer → narrative memory fusing context + reason.
+- [ ] COG-T30. E2E: episode with evidence from both context and reason.
+- [ ] COG-T31. E2E: router enrichment → memory_package with reasons.
+- [ ] COG-T32. E2E: cold start → rebuild from PostgreSQL.
+
+---
+
+## 16. Constants
+
+```rust
+// Contexts
+pub const CONTEXT_SCORE_THRESHOLD: f64 = 4.0;
+pub const MAX_TAGS: usize = 12;
+pub const MAX_OPEN_CONTEXTS: usize = 20;
+
+// Reasons
+pub const REASON_SCORE_THRESHOLD: f64 = 4.0;
+pub const MAX_REASON_SIGNALS: usize = 4;
+pub const MAX_OPEN_REASONS: usize = 10;
+
+// ILK weights (applies to both contexts and reasons)
+pub const ILK_WEIGHT_SENDER: f64 = 1.0;
+pub const ILK_WEIGHT_RECIPIENT: f64 = 0.5;
+
+// Scope binding
+pub const SCOPE_ENERGY_ALPHA: f64 = 0.25;
+pub const SCOPE_ENERGY_UNBIND_THRESHOLD: f64 = -0.05;
+pub const SCOPE_ENERGY_MIN_CTX_FOR_EVAL: usize = 2;
+pub const SCOPE_ENERGY_SUSTAIN_COUNT: usize = 2;
+
+// Memory
+pub const MEMORY_DECAY_STEP: f64 = 0.25;
+pub const MEMORY_PACKAGE_MAX_BYTES: usize = 32_768;
+pub const MEMORY_PACKAGE_MAX_EVENTS: usize = 3;
+pub const MEMORY_PACKAGE_MAX_ITEMS: usize = 12;
+pub const MEMORY_FETCH_TIMEOUT_MS: u64 = 50;
+
+// Episodes
+pub const EPISODE_MIN_FINAL_INTENSITY: u8 = 7;
+pub const EPISODE_MIN_EVIDENCE_STRENGTH: u8 = 8;
+
+// SHM
+pub const MEMORY_MAGIC: u32 = 0x4A534D45;  // "JSME"
+pub const MEMORY_VERSION: u32 = 2;
+```
+
+---
+
+## 17. References
+
+| Topic | Document |
+|-------|----------|
+| Identity (ILK, ICH, TNT) | `10-identity-v2.md` |
+| Storage (NATS, PostgreSQL) | `13-storage.md` |
+| Protocol (message format) | `02-protocolo.md` |
+| SHM regions | `03-shm.md` |
+| Routing | `04-routing.md` |
+| Scope binding energy (original) | `scope-binding-energy-spec.md` |
+| Cognitive Lab audit | `15-auditoria-tecnica-especifica-independiente.md` |
+| Immediate memory (AI SDK) | `immediate-conversation-memory-spec.md` |
+| SY nodes catalog | `SY_nodes_spec.md` |
+| Identity v3 direction (claims) | `identity-v3-direction.md` |
