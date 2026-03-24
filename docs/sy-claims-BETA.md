@@ -1,7 +1,7 @@
 # SY.claims — Normative Evaluation Engine (Beta)
 
 **Status:** beta / direction
-**Date:** 2026-03-14
+**Date:** 2026-03-24
 **Audience:** Architecture team, OPA developers, cognitive developers, orchestrator
 **Depends on:** `12-cognition-v2.md`, `identity-v3-direction.md`, OPA policies
 **Relationship:** Consumes cognitive output, produces normative consequences for OPA and identity
@@ -83,57 +83,113 @@ This means claims depends on cognitive being operational, but does not interfere
 
 ---
 
-## 4. What Claims Evaluates
+## 4. The Normative Case
 
-### 4.1 Per-Message Evaluation
+### 4.1 Three Distinct Objects
 
-For each message/action that flows through the system, claims asks:
+Claims operates on three distinct objects, kept separate:
 
-- Did this action fit within the norms for this ILK's identity and claims?
-- Did the reason signals indicate something that should be constrained?
-- Does the pattern of behavior (from cognitive memory) suggest normative concern?
-- Was there a previous restriction that was violated?
+| Object | Purpose | Contains |
+|--------|---------|----------|
+| **Normative Case** | The file of the incident | Who acted, what they did, what resulted, what cognitive evidence exists |
+| **Evaluation Record** | The judgment | Which rules matched, what claims were derived, provenance for reproducibility |
+| **Consequence** | The sanction | Flag, restriction, alert, proposed rule. With expiration and override |
 
-### 4.2 Inputs
+### 4.2 Normative Case Structure
+
+The normative case is the canonical representation of "what happened." It separates hard facts from cognitive evidence.
 
 ```json
 {
+  "case_id": "case:uuid",
   "message_id": "msg:uuid",
+  "trace_id": "trace:uuid",
   "thread_id": "thread:hash",
-  "action_performed": "send_message | admin_command | config_change | ...",
-  "identity": {
-    "sender_ilk": "ilk:uuid",
-    "ilk_type": "human | agent | system",
-    "registration_status": "temporary | partial | complete",
-    "tenant_id": "tnt:uuid",
+  "scope_id": "scope:uuid|null",
+  "tenant_id": "tnt:uuid",
+  "opened_at": "2026-03-24T18:10:00Z",
+
+  "subjects": {
+    "actor_ilk": "ilk:uuid",
+    "principal_ilk": "ilk:uuid|null",
+    "executor_node": "AI.support.l1@prod|null",
+    "affected_ilks": ["ilk:uuid-1"],
+    "sender_type": "human|agent|system",
+    "registration_status": "temporary|partial|complete",
     "active_restrictions": []
   },
-  "cognitive_context": {
-    "dominant_context": { "label": "billing dispute", "weight": 4.2 },
-    "dominant_reason": { "label": "seeking urgent resolution", "weight": 3.8 },
-    "reason_signals_canonical": ["resolve", "challenge"],
-    "recent_episodes": [
-      { "fear_id": "anger", "intensity": 8, "days_ago": 2 }
+
+  "act": {
+    "action_performed": "send_message|admin_command|config_change|tool_call|workflow_step",
+    "action_class": "message|read|write|system_config|topology_change|external_action|identity_change",
+    "target_class": "ilk|thread|scope|route_table|vpn_rule|node|workflow|external_api|tenant_data",
+    "target_ref": "route:billing.refunds|null",
+    "effect_class": "none|read|write|execute|restrict|notify",
+    "authority_source": "role|capability|explicit_override|system_default|unknown",
+    "touches_system_config": false,
+    "touches_external_world": false,
+    "touches_tenant_boundary": false
+  },
+
+  "result": {
+    "status": "succeeded|failed|timeout|rejected",
+    "side_effects": [
+      { "kind": "route_updated|message_sent|restriction_violated", "ref": "..." }
     ],
-    "relevant_memories": [
-      { "summary": "Juan brings billing issues as complaints...", "weight": 2.5 }
+    "restriction_violated": false
+  },
+
+  "cognitive_evidence": {
+    "dominant_context": {
+      "context_id": "context:uuid",
+      "label": "billing dispute",
+      "weight": 4.2
+    },
+    "dominant_reason": {
+      "reason_id": "reason:uuid",
+      "label": "seeking urgent resolution",
+      "weight": 3.8
+    },
+    "reason_signals_canonical": ["resolve", "challenge"],
+    "reason_signals_extra": ["urgency", "frustration"],
+    "memory_refs": [
+      { "memory_id": "memory:uuid", "weight": 2.5 }
+    ],
+    "episode_refs": [
+      { "episode_id": "episode:uuid", "intensity": 8, "days_ago": 2 }
     ]
   },
-  "action_result": {
-    "status": "succeeded | failed | timeout",
-    "target": "hive:worker-220",
-    "side_effects": []
+
+  "normative_claims": {
+    "intent_class": "request_change|request_read|inform_only|challenge_action|confirm_action|withdrawal",
+    "risk_level": "low|medium|high|critical",
+    "requires_confirmation": false,
+    "human_handoff_candidate": false,
+    "read_only": false,
+    "write_candidate": true,
+    "needs_review": false,
+    "policy_domain": "billing|identity|routing|topology|general",
+    "prior_pattern_match": false
   }
 }
 ```
 
-### 4.3 What Claims Does NOT Evaluate
+### 4.3 Key Separations
 
-- Message content for moderation (that's a different concern, potentially a future AI.moderator).
-- Routing correctness (that's OPA's job).
-- Cognitive accuracy (that's SY.cognition's internal concern).
+**Subjects:** Distinguishes who acted (`actor_ilk`), on whose behalf (`principal_ilk`), which node executed (`executor_node`), and who was affected (`affected_ilks`). This prevents blindly punishing the executor when the intent came from elsewhere. For v1, `principal_ilk` and `affected_ilks` are optional.
 
-Claims evaluates normative compliance: did this actor, with this identity, performing this action, in this context, with this drive, stay within the rules?
+**Act:** The core of the judgment. `action_class` + `target_class` + `effect_class` + `authority_source` give claims and OPA a stable interface that doesn't depend on narrative or cognitive labels. This is what rules match against.
+
+**Cognitive evidence:** Input from SY.cognition, used as supporting evidence. NOT the primary basis for judgment on serious consequences. The primary basis is `act` + `result` + `subjects`. Cognitive evidence enriches the judgment but does not define it.
+
+**Normative claims:** Derived structured facts that bridge cognitive evidence to OPA-consumable decisions. These are canonical, few, and hard — not narrative.
+
+### 4.4 What Claims Does NOT Evaluate
+
+- Message content for moderation (separate concern, future AI.moderator).
+- Routing correctness (OPA's job).
+- Cognitive accuracy (SY.cognition's internal concern).
+- Re-extraction of semantic tags or reason signals (uses cognitive output as-is).
 
 ---
 
@@ -160,36 +216,51 @@ Norms that apply to specific roles, offices, or operational domains. Can be upda
 
 ### 5.2 Rule Format (v1)
 
-For v1, rules are declarative and simple:
+Rules match against the normative case's `subjects`, `act`, `result`, and optionally `normative_claims`. They do NOT match against cognitive evidence narrative or labels directly.
+
+**Constitutional rule (matches act + subjects):**
 
 ```json
 {
   "rule_id": "norm:001",
   "tier": "constitutional",
+  "version": 1,
   "condition": {
-    "ilk_registration_status": "temporary",
-    "action_class": "system_config"
+    "subjects.registration_status": "temporary",
+    "act.action_class": "system_config"
   },
-  "consequence": "restrict",
+  "consequence_type": "restrict",
+  "restriction_spec": {
+    "deny_action_class": "system_config",
+    "ttl_days": null
+  },
   "severity": "serious",
   "description": "Temporary ILKs cannot modify system configuration"
 }
 ```
 
+**Charter rule (matches act + pattern from reincidence):**
+
 ```json
 {
   "rule_id": "norm:012",
   "tier": "charter",
+  "version": 1,
   "charter_ref": "charter://billing/support-v1",
   "condition": {
-    "reason_signal_pattern": ["challenge", "abandon"],
-    "pattern_count_threshold": 3,
-    "pattern_window_days": 7
+    "act.action_class": "message",
+    "normative_claims.policy_domain": "billing",
+    "reincidence.rule_id": "norm:012",
+    "reincidence.count_gte": 3,
+    "reincidence.window_days": 7
   },
-  "consequence": "flag_and_alert",
+  "consequence_type": "flag_and_alert",
   "severity": "mild",
   "description": "Repeated adversarial disengagement pattern in billing context"
 }
+```
+
+**Key rule:** conditions reference normative case fields using dot notation. Cognitive evidence labels like "billing dispute" are NOT used as match conditions — they inform `normative_claims.policy_domain` which IS matchable.
 ```
 
 ### 5.3 Rule Storage
@@ -237,13 +308,46 @@ For future: rules managed by architect via ADMIN_COMMAND, stored in PostgreSQL, 
 
 ### 6.3 How Restrictions Reach OPA
 
-When claims produces a `restrict` consequence:
+When claims produces a `restrict` consequence, it emits a restriction in a format that OPA can consume directly — concrete, small, and unambiguous:
 
-1. Claims writes the restriction to the ILK's metadata (via SY.identity or a dedicated claims store).
-2. OPA reads `active_restrictions[]` from identity data on the next routing decision.
-3. If the restriction matches the action being attempted, OPA denies it.
+```json
+{
+  "restriction_id": "rst:uuid",
+  "ilk_id": "ilk:uuid",
+  "deny_action_class": "system_config",
+  "deny_target_class": null,
+  "expires_at": "2026-03-31T00:00:00Z",
+  "source_consequence_id": "csq:uuid"
+}
+```
 
-This creates the feedback loop: post-facto evaluation → restriction → preventive enforcement on next attempt.
+**OPA restriction format rules:**
+
+- Restrictions are tiny and concrete: `deny action_class=X until Y`.
+- No narrative, no labels, no cognitive content reaches OPA as restriction.
+- OPA reads `active_restrictions[]` from claims store and matches against the action being attempted.
+- If match: deny. If no match: allow (OPA's other rules still apply).
+
+**Examples of valid restrictions:**
+
+```
+deny action_class=system_config until 2026-03-31
+deny action_class=topology_change until 2026-03-21
+require_human_handoff for policy_domain=billing until 2026-03-28
+read_only for target_class=tenant_data until 2026-04-01
+```
+
+**Examples of INVALID restrictions (too narrative, too vague):**
+
+```
+"repeated adversarial pattern in billing context"  ← NOT a restriction
+"user seems frustrated"                             ← NOT a restriction
+"high risk level detected"                          ← NOT a restriction
+```
+
+The motivo/narrative goes in the evaluation record and consequence audit trail. OPA never sees it.
+
+This creates the feedback loop: post-facto evaluation → concrete restriction → preventive enforcement on next attempt.
 
 ### 6.4 Expiration and Decay
 
@@ -333,14 +437,64 @@ Every architect override is logged:
 
 For v1, claims evaluation is deterministic rule matching:
 
-1. Read message + identity + cognitive context.
-2. Match against normative rules (condition evaluation).
-3. Check reincidence history.
-4. Apply consequence based on severity + reincidence.
+1. Build normative case from message + identity + action + result + cognitive evidence.
+2. Derive normative_claims (intent_class, risk_level, etc.) deterministically from case facts.
+3. Match normative case against rules (conditions reference case fields via dot notation).
+4. Check reincidence history for escalation.
+5. Produce consequence based on severity + reincidence.
 
 No AI involved. Rules are explicit. This is fast and auditable.
 
-### 9.2 Future: Hybrid (Deterministic + AI)
+### 9.2 Evaluation Provenance
+
+Every evaluation record carries provenance for reproducibility and appeal:
+
+```json
+{
+  "eval_id": "eval:uuid",
+  "case_id": "case:uuid",
+  "degraded_mode": false,
+  "claims_engine_version": "1.0.0",
+  "rule_set_version": "claims-rules@2026-03-24",
+  "cognitive_snapshot_ref": "cogsnap:uuid|null",
+  "rules_matched": ["norm:001"],
+  "rules_not_matched": ["norm:012"],
+  "basis": [
+    "subjects.registration_status=temporary",
+    "act.action_class=system_config"
+  ],
+  "consequence_id": "csq:uuid|null",
+  "evaluated_at": "2026-03-24T18:10:02Z"
+}
+```
+
+`basis` lists the specific field values that caused each rule match. This makes the judgment reproducible: if rules or engine version change, reevaluation can be traced.
+
+### 9.3 Degraded Mode
+
+If SY.cognition is down, delayed, or has not yet processed the message, claims operates in degraded mode:
+
+**With cognitive enrichment (normal):** Full evaluation using all normative case fields including `cognitive_evidence` and derived `normative_claims`.
+
+**Without cognitive enrichment (degraded):** Claims evaluates using only `subjects` + `act` + `result`. The `cognitive_evidence` block is null. `normative_claims` are derived from act/subjects only (no intent_class from reason signals, no policy_domain from context). The evaluation record marks `degraded_mode: true`.
+
+**Rule:** A cognitive failure must never relax the normative dimension. Constitutional rules (which match on subjects + act) still fire in degraded mode. Only charter rules that depend on cognitive evidence are skipped.
+
+### 9.4 Evidence Weight for Serious Consequences
+
+For mild consequences (`log`, `flag`): cognitive evidence + act facts are sufficient.
+
+For serious consequences (`restrict`, `alert`, `propose_rule`): the primary basis must be `act` + `result` + `subjects`. Cognitive evidence is supporting, not primary. This prevents a narrative label from causing a hard restriction.
+
+| Consequence | Primary basis | Supporting |
+|------------|--------------|------------|
+| `log` | Any matching field | Any |
+| `flag` | act + subjects OR cognitive pattern | Any |
+| `restrict` | act + subjects + result | Cognitive evidence |
+| `alert` | act + subjects + result | Cognitive evidence |
+| `propose_rule` | Sustained pattern in act + reincidence | Cognitive evidence |
+
+### 9.5 Future: Hybrid (Deterministic + AI)
 
 When norms become complex enough that deterministic rules can't capture the nuance:
 
@@ -390,39 +544,57 @@ For future (identity v3): restrictions and normative claims could be part of the
 {
   "rule_id": "norm:uuid",
   "tier": "constitutional | charter",
-  "charter_ref": "charter://...",
-  "condition": {},
+  "charter_ref": "charter://...|null",
+  "version": 1,
+  "condition": {
+    "subjects.registration_status": "temporary",
+    "act.action_class": "system_config"
+  },
   "consequence_type": "log | flag | restrict | alert | propose_rule",
+  "restriction_spec": {
+    "deny_action_class": "system_config",
+    "deny_target_class": null,
+    "ttl_days": 7
+  },
   "severity": "informational | mild | serious | critical",
+  "requires_cognitive": false,
   "description": "...",
   "enabled": true,
-  "version": 1,
   "created_at": "...",
   "updated_at": "..."
 }
 ```
 
-### 11.2 Evaluation Record
+`requires_cognitive: false` means the rule fires in degraded mode (no cognitive data). Constitutional rules should generally be `false`. Charter rules that depend on cognitive evidence should be `true`.
+
+### 11.2 Normative Case
+
+See section 4.2 for the full structure. This is the "file" — the canonical representation of what happened, with subjects, act, result, cognitive_evidence, and normative_claims.
+
+### 11.3 Evaluation Record
 
 ```json
 {
   "eval_id": "eval:uuid",
-  "message_id": "msg:uuid",
-  "thread_id": "thread:hash",
-  "ilk_id": "ilk:uuid",
+  "case_id": "case:uuid",
+  "degraded_mode": false,
+  "claims_engine_version": "1.0.0",
+  "rule_set_version": "claims-rules@2026-03-24",
+  "cognitive_snapshot_ref": "cogsnap:uuid|null",
   "rules_matched": ["norm:001"],
-  "rules_not_matched": [],
-  "consequence_produced": "csq:uuid",
-  "cognitive_snapshot": {
-    "dominant_context_label": "billing dispute",
-    "dominant_reason_label": "seeking urgent resolution",
-    "reason_signals": ["resolve", "challenge"]
-  },
+  "rules_not_matched": ["norm:012"],
+  "basis": [
+    "subjects.registration_status=temporary",
+    "act.action_class=system_config"
+  ],
+  "consequence_id": "csq:uuid|null",
   "evaluated_at": "..."
 }
 ```
 
-### 11.3 Consequence
+`basis` makes the judgment reproducible. `cognitive_snapshot_ref` traces what cognitive state existed at evaluation time.
+
+### 11.4 Consequence
 
 ```json
 {
@@ -432,9 +604,13 @@ For future (identity v3): restrictions and normative claims could be part of the
   "ilk_id": "ilk:uuid",
   "type": "log | flag | restrict | alert | propose_rule",
   "severity": "...",
-  "restriction": {},
+  "restriction": {
+    "restriction_id": "rst:uuid",
+    "deny_action_class": "system_config",
+    "deny_target_class": null,
+    "expires_at": "2026-03-31T00:00:00Z"
+  },
   "status": "active | expired | cleared | overridden",
-  "expires_at": "...",
   "created_at": "...",
   "cleared_by": null,
   "cleared_at": null,
@@ -442,7 +618,7 @@ For future (identity v3): restrictions and normative claims could be part of the
 }
 ```
 
-### 11.4 Reincidence Record
+### 11.5 Reincidence Record
 
 ```json
 {
@@ -451,7 +627,7 @@ For future (identity v3): restrictions and normative claims could be part of the
   "occurrences": 3,
   "first_at": "...",
   "last_at": "...",
-  "consequences": ["csq:uuid-1", "csq:uuid-2", "csq:uuid-3"],
+  "consequence_ids": ["csq:uuid-1", "csq:uuid-2", "csq:uuid-3"],
   "escalation_level": 2
 }
 ```
@@ -463,6 +639,7 @@ For future (identity v3): restrictions and normative claims could be part of the
 | Data | Location | Access |
 |------|----------|--------|
 | Normative rules | Package assets (v1) / PostgreSQL (future) | Read by SY.claims at startup |
+| Normative cases | LanceDB local (hot) + PostgreSQL via SY.storage (durable) | Written per evaluation |
 | Evaluation records | PostgreSQL (via SY.storage) | Append-only, audit trail |
 | Consequences (active) | LanceDB local + replicated via NATS events | Read by OPA for restrictions |
 | Reincidence tracking | LanceDB local | Read/write by SY.claims |
@@ -474,38 +651,48 @@ For future (identity v3): restrictions and normative claims could be part of the
 
 ### Phase 1 — Foundation
 
-- [ ] CLM-T1. Create SY.claims node (Rust, NATS consumer).
-- [ ] CLM-T2. Define normative rule schema and load from package assets.
-- [ ] CLM-T3. Implement deterministic rule matcher (condition evaluation).
-- [ ] CLM-T4. Implement consequence producer.
-- [ ] CLM-T5. Store evaluation records and consequences in LanceDB.
+- [ ] CLM-T1. Create SY.claims node (Rust, NATS consumer on `storage.turns`).
+- [ ] CLM-T2. Define normative rule schema with dot-notation conditions. Load from package assets.
+- [ ] CLM-T3. Implement normative case builder (subjects + act + result + cognitive_evidence + normative_claims).
+- [ ] CLM-T4. Implement deterministic rule matcher (conditions match against case fields).
+- [ ] CLM-T5. Implement normative_claims derivation from case facts (intent_class, risk_level, etc.).
+- [ ] CLM-T6. Implement consequence producer with restriction_spec for OPA.
+- [ ] CLM-T7. Store normative cases, evaluation records, and consequences in LanceDB.
 
-### Phase 2 — OPA Integration
+### Phase 2 — Degraded Mode and Evidence Weight
 
-- [ ] CLM-T6. Implement restriction publishing (claims → NATS → OPA data source).
-- [ ] CLM-T7. OPA reads active restrictions on routing decisions.
-- [ ] CLM-T8. Implement expiration/decay of consequences.
+- [ ] CLM-T8. Implement degraded mode: evaluate with subjects + act + result only when cognitive data unavailable.
+- [ ] CLM-T9. Mark rules with `requires_cognitive` flag. Skip cognitive-dependent rules in degraded mode.
+- [ ] CLM-T10. Implement evidence weight rules: restrict/alert require act+subjects+result as primary basis.
 
-### Phase 3 — Reincidence and Escalation
+### Phase 3 — OPA Integration
 
-- [ ] CLM-T9. Implement reincidence tracking per ILK per rule.
-- [ ] CLM-T10. Implement escalation logic (1st→flag, 2nd→restrict, 3rd→alert).
-- [ ] CLM-T11. Implement reevaluation on rule change.
+- [ ] CLM-T11. Implement restriction publishing (concrete deny_action_class format, via NATS).
+- [ ] CLM-T12. OPA reads active restrictions on routing decisions.
+- [ ] CLM-T13. Implement expiration/decay of consequences.
 
-### Phase 4 — Architect Integration
+### Phase 4 — Reincidence and Escalation
 
-- [ ] CLM-T12. ADMIN_COMMAND: `list_claims_consequences`, `clear_consequence`, `override_evaluation`.
-- [ ] CLM-T13. ADMIN_COMMAND: `list_normative_rules`, `update_normative_rule`, `disable_normative_rule`.
-- [ ] CLM-T14. ADMIN_COMMAND: `approve_proposed_rule`, `reject_proposed_rule`.
-- [ ] CLM-T15. Claims audit log viewable from SY.architect.
+- [ ] CLM-T14. Implement reincidence tracking per ILK per rule.
+- [ ] CLM-T15. Implement escalation logic (1st→flag, 2nd→restrict, 3rd→alert).
+- [ ] CLM-T16. Implement reevaluation on rule change.
 
-### Phase 5 — E2E Validation
+### Phase 5 — Architect Integration
 
-- [ ] CLM-T16. E2E: temporary ILK performs restricted action → claims flags → next attempt blocked by OPA.
-- [ ] CLM-T17. E2E: reincidence escalation (3 violations → restrict + alert).
-- [ ] CLM-T18. E2E: architect clears restriction → ILK can act again.
-- [ ] CLM-T19. E2E: consequence expires by TTL → ILK unflagged automatically.
-- [ ] CLM-T20. E2E: proposed OPA rule approved by architect → rule active on next evaluation.
+- [ ] CLM-T17. ADMIN_COMMAND: `list_claims_consequences`, `clear_consequence`, `override_evaluation`.
+- [ ] CLM-T18. ADMIN_COMMAND: `list_normative_rules`, `update_normative_rule`, `disable_normative_rule`.
+- [ ] CLM-T19. ADMIN_COMMAND: `approve_proposed_rule`, `reject_proposed_rule`.
+- [ ] CLM-T20. Claims audit log viewable from SY.architect (case + evaluation + consequence chain).
+
+### Phase 6 — E2E Validation
+
+- [ ] CLM-T21. E2E: temporary ILK performs restricted action → claims builds case → flags → next attempt blocked by OPA.
+- [ ] CLM-T22. E2E: reincidence escalation (3 violations → restrict + alert).
+- [ ] CLM-T23. E2E: architect clears restriction → ILK can act again.
+- [ ] CLM-T24. E2E: consequence expires by TTL → ILK unflagged automatically.
+- [ ] CLM-T25. E2E: proposed OPA rule approved by architect → rule active on next evaluation.
+- [ ] CLM-T26. E2E: degraded mode → constitutional rules still fire without cognitive data.
+- [ ] CLM-T27. E2E: evaluation provenance → case + eval record + basis reproducible.
 
 ---
 
@@ -516,6 +703,9 @@ For future (identity v3): restrictions and normative claims could be part of the
 - AI-assisted normative evaluation — deferred to future hybrid mode.
 - Cross-hive normative coordination — deferred.
 - Full constitutional document management — deferred (see `identity-v3-direction.md`).
+- Complex delegation chains (principal_ilk fully resolved) — v1 supports the field but does not trace delegation graphs.
+- Compound cases (multi-message violations) — deferred.
+- Cross-message correlation for patterns — deferred beyond reincidence tracking.
 
 ---
 

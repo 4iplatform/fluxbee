@@ -135,7 +135,9 @@ An operational driver tracked over time. Answers: "what does the communication s
 
 **Identity:** `reason:<uuid-v4>`.
 
-**Same mechanics as Context:** score, weight, decay, ILK weights, ILK profile. Lives in parallel, same lifecycle rules.
+**Same structural form as Context, independent parameters.** Reasons have score, weight, decay, ILK weights, ILK profile — same shape. But they run with their own parameter set (thresholds, decay rates, EMA alpha) because reasons and contexts have different temporal dynamics. A context like "billing" can persist for weeks. A reason like "challenge" can appear and vanish in 3 messages.
+
+Contexts and reasons are concurrent but not connected — they share only the originating message. They do not influence each other's weights or decay. They meet only at memory consolidation time.
 
 ```json
 {
@@ -197,7 +199,7 @@ Same structure as in the cognitive lab audit. Conservative gate: only persisted 
   "episode_id": "episode:uuid",
   "thread_id": "thread:hash",
   "scope_id": "scope:uuid",
-  "fear_id": "anger",
+  "affect_id": "anger",
   "title": "Friction over delayed refund",
   "summary": "Customer expressed strong frustration about refund processing time.",
   "base_intensity": 8,
@@ -358,17 +360,19 @@ Single AI call produces both semantic tags and reason signals.
 - `reason_signals_canonical`: filter to only values present in the canonical set. Lowercase, dedup.
 - `reason_signals_extra`: any additional signals detected. Stored as evidence, does not feed reason evaluator.
 
-Each tag carries ILK metadata from the message:
+**ILK metadata (added by backend, NOT by tagger):**
+
+The tagger outputs plain strings only — it does not know who sent the message. The backend enriches each tag and signal with ILK metadata from the message before feeding them to the evaluators:
 
 ```json
-{ "tag": "billing", "ilk_sender": "ilk:uuid", "ilk_receiver": "ilk:uuid" }
+{
+  "value": "billing",
+  "ilk_sender": "ilk:uuid",
+  "ilk_receiver": "ilk:uuid"
+}
 ```
 
-Each reason signal carries the same:
-
-```json
-{ "signal": "resolve", "ilk_sender": "ilk:uuid", "ilk_receiver": "ilk:uuid" }
-```
+This enriched form is what the Context Evaluator and Reason Evaluator receive. The tagger never sees ILK data.
 
 ### 6.2 Context Evaluator
 
@@ -430,7 +434,7 @@ Single AI call per period. Now receives contexts AND reasons.
   "main_context": {"context_id": "context:uuid", "label": "billing dispute"},
   "dominant_reason": {"reason_id": "reason:uuid", "label": "seeking urgent resolution"},
   "memories": [...],
-  "fears": [...],
+  "affects": [...],
   "prior_stats": [...],
   "contexts": [...],
   "reasons": [
@@ -459,6 +463,7 @@ Single AI call per period. Now receives contexts AND reasons.
   "global_adjustments": [...],
   "episode_decision": {
     "should_create_episode": true,
+    "affect_id": "anger",
     "evidence_context_ids": ["context:uuid"],
     "evidence_reason_ids": ["reason:uuid"],
     "evidence_signals": ["anger", "resolve"],
@@ -526,13 +531,15 @@ Unchanged from cognitive lab audit. Score threshold, weight update, ILK profiles
 
 ### 8.2 Reason Update Per Message
 
-Same mechanics as Context Update, applied to reasons instead of contexts:
+Same structural algorithm as Context Update, but using **reason-specific parameters** (`RSN_SCORE_THRESHOLD`, `RSN_DECAY_FACTOR`, `RSN_EMA_ALPHA`, `RSN_MAX_OPEN`, `RSN_ILK_WEIGHT_*`):
 
 1. Resolve assignments and new reasons from evaluator.
-2. Update weight, averages for each open reason.
+2. Update weight and averages for each open reason (using `RSN_EMA_ALPHA`, `RSN_DECAY_FACTOR`).
 3. Close if weight <= 0.
-4. Update ILK weights and profiles if identity present.
-5. Apply `MAX_OPEN_REASONS` guardrail (same as MAX_OPEN_CONTEXTS).
+4. Update ILK weights and profiles if identity present (using `RSN_ILK_WEIGHT_*`).
+5. Apply `RSN_MAX_OPEN` guardrail.
+
+Context update and reason update run concurrently on the same message but do not influence each other. They share no state — only the originating message.
 
 ### 8.3 Scope Binding Energy
 
@@ -564,20 +571,30 @@ Unchanged from audit. Gate conditions remain the same. Evidence now includes `ev
 
 ### 9.2 Reasons
 
-| Parameter | Value |
-|-----------|-------|
-| `REASON_SCORE_THRESHOLD` | 4 |
-| `MAX_REASON_SIGNALS` | 4 |
-| `MAX_OPEN_REASONS` | 10 |
+Reasons use the same structural form as contexts (score, weight, decay, EMA, ILK profiles) but with **independent parameters**. This is intentional: a topic can persist for weeks while an operational drive can shift in 3 messages. The tempo of context and the tempo of reason are different.
+
+| Parameter | Value | Note |
+|-----------|-------|------|
+| `REASON_SCORE_THRESHOLD` | 4 | May diverge from context threshold as tuning reveals different sensitivities |
+| `REASON_DECAY_FACTOR` | 1.5 | Faster decay than context — reasons are more volatile |
+| `MAX_REASON_SIGNALS` | 4 | Per message |
+| `MAX_OPEN_REASONS` | 10 | Lower than MAX_OPEN_CONTEXTS (20) because reasons are fewer and more general |
+| `REASON_ILK_WEIGHT_SENDER` | 1.0 | May diverge from context ILK weights |
+| `REASON_ILK_WEIGHT_RECIPIENT` | 0.5 | May diverge from context ILK weights |
+| `REASON_EMA_ALPHA` | 0.3 | Faster EMA than context (0.25) — reasons respond to recent signal more quickly |
+
+**Design rule:** "Same mechanics" means same structural form (score, weight, decay, ILK profiles, EMA). It does NOT mean same parameter values. Context and reason parameters MUST be independently tunable because they track phenomena with different temporal dynamics.
 
 ### 9.3 ILK Weights
 
 | Parameter | Value |
 |-----------|-------|
-| `ILK_CONTEXT_WEIGHT_SENDER` | 1.0 |
-| `ILK_CONTEXT_WEIGHT_RECIPIENT` | 0.5 |
+| `CTX_ILK_WEIGHT_SENDER` | 1.0 |
+| `CTX_ILK_WEIGHT_RECIPIENT` | 0.5 |
+| `RSN_ILK_WEIGHT_SENDER` | 1.0 |
+| `RSN_ILK_WEIGHT_RECIPIENT` | 0.5 |
 
-Same weights apply for reasons.
+Context and reason ILK weights start identical but are independently configurable.
 
 ### 9.4 Scope Binding
 
@@ -658,9 +675,24 @@ Contains inverted index of tags + reason signals → memory/episode references f
 | Limit | Value |
 |-------|-------|
 | `MEMORY_PACKAGE_MAX_BYTES` | 32,768 |
-| `MEMORY_PACKAGE_MAX_EVENTS` | 3 |
-| `MEMORY_PACKAGE_MAX_ITEMS` | 12 |
+| `MEMORY_PACKAGE_MAX_CONTEXTS` | 5 |
+| `MEMORY_PACKAGE_MAX_REASONS` | 3 |
+| `MEMORY_PACKAGE_MAX_MEMORIES` | 5 |
+| `MEMORY_PACKAGE_MAX_EPISODES` | 3 |
 | `MEMORY_FETCH_TIMEOUT_MS` | 50 |
+
+### Truncation Priority
+
+When the 32KB budget is exceeded, truncate in this order (lowest priority first):
+
+1. **Drop episodes** beyond limit (keep highest intensity first).
+2. **Drop reasons** beyond limit (keep highest weight first).
+3. **Truncate memory summaries** to 200 chars each (keep full dominant_context_id / dominant_reason_id).
+4. **Drop contexts** beyond limit (keep highest weight first).
+5. **Drop memories** beyond limit (keep highest weight first).
+6. **Never drop:** dominant context (highest weight context) and dominant reason (highest weight reason). These two are always present even if everything else is truncated.
+
+The rationale: the destination AI node must always know at minimum what the conversation is about (dominant context) and what it seeks (dominant reason). Everything else is enrichment.
 
 ---
 
@@ -678,6 +710,7 @@ Contains inverted index of tags + reason signals → memory/episode references f
 | AI.consolidator | Scope Summarizer | Single AI call, receives contexts + reasons |
 | activation_strength | weight | Same concept, simpler name |
 | (not in v1.16) | Reason | NEW: operational driver entity |
+| `fear_id` | `affect_id` | Renamed: not all episodic events are fear-based |
 
 ---
 
@@ -687,9 +720,9 @@ Contains inverted index of tags + reason signals → memory/episode references f
 
 How does SY.cognition match a new thread to an existing scope? By ILK overlap? ICH overlap? Minimum threshold?
 
-### 13.2 Fears Catalog
+### 13.2 Affects Catalog
 
-Where does the catalog of fears live? For v1: hardcoded in SY.cognition.
+Where does the catalog of affects (anger, frustration, satisfaction, conflict, etc.) live? For v1: hardcoded in SY.cognition. The field was previously named `fear_id` — renamed to `affect_id` because not all episodic events are fear-based.
 
 ### 13.3 AI Call Strategy
 
@@ -810,18 +843,21 @@ Both coexist. Neither replaces the other.
 
 ```rust
 // Contexts
-pub const CONTEXT_SCORE_THRESHOLD: f64 = 4.0;
-pub const MAX_TAGS: usize = 12;
-pub const MAX_OPEN_CONTEXTS: usize = 20;
+pub const CTX_SCORE_THRESHOLD: f64 = 4.0;
+pub const CTX_MAX_TAGS: usize = 12;
+pub const CTX_MAX_OPEN: usize = 20;
+pub const CTX_ILK_WEIGHT_SENDER: f64 = 1.0;
+pub const CTX_ILK_WEIGHT_RECIPIENT: f64 = 0.5;
+// Context EMA uses SCOPE_ENERGY_ALPHA (0.25)
 
-// Reasons
-pub const REASON_SCORE_THRESHOLD: f64 = 4.0;
-pub const MAX_REASON_SIGNALS: usize = 4;
-pub const MAX_OPEN_REASONS: usize = 10;
-
-// ILK weights (applies to both contexts and reasons)
-pub const ILK_WEIGHT_SENDER: f64 = 1.0;
-pub const ILK_WEIGHT_RECIPIENT: f64 = 0.5;
+// Reasons (same structural form, independent parameter values)
+pub const RSN_SCORE_THRESHOLD: f64 = 4.0;
+pub const RSN_DECAY_FACTOR: f64 = 1.5;         // Faster decay than context
+pub const RSN_MAX_SIGNALS: usize = 4;
+pub const RSN_MAX_OPEN: usize = 10;
+pub const RSN_ILK_WEIGHT_SENDER: f64 = 1.0;
+pub const RSN_ILK_WEIGHT_RECIPIENT: f64 = 0.5;
+pub const RSN_EMA_ALPHA: f64 = 0.3;            // Faster than context (0.25)
 
 // Scope binding
 pub const SCOPE_ENERGY_ALPHA: f64 = 0.25;
@@ -832,8 +868,10 @@ pub const SCOPE_ENERGY_SUSTAIN_COUNT: usize = 2;
 // Memory
 pub const MEMORY_DECAY_STEP: f64 = 0.25;
 pub const MEMORY_PACKAGE_MAX_BYTES: usize = 32_768;
-pub const MEMORY_PACKAGE_MAX_EVENTS: usize = 3;
-pub const MEMORY_PACKAGE_MAX_ITEMS: usize = 12;
+pub const MEMORY_PACKAGE_MAX_CONTEXTS: usize = 5;
+pub const MEMORY_PACKAGE_MAX_REASONS: usize = 3;
+pub const MEMORY_PACKAGE_MAX_MEMORIES: usize = 5;
+pub const MEMORY_PACKAGE_MAX_EPISODES: usize = 3;
 pub const MEMORY_FETCH_TIMEOUT_MS: u64 = 50;
 
 // Episodes
@@ -861,3 +899,4 @@ pub const MEMORY_VERSION: u32 = 2;
 | Immediate memory (AI SDK) | `immediate-conversation-memory-spec.md` |
 | SY nodes catalog | `SY_nodes_spec.md` |
 | Identity v3 direction (claims) | `identity-v3-direction.md` |
+| Normative evaluation (SY.claims) | `sy-claims-beta.md` |
