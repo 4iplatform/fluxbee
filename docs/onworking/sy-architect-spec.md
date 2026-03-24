@@ -926,10 +926,13 @@ This phase turns the current visual chat navigator into real product behavior.
     - contador visible de resultados / chats locales
     - contexto de impersonación más compacto (`ICH` / `ILK` / `Thread`) con tooltip completo
     - sesión abierta priorizada arriba del listado
+  - Command/result rendering ya quedó más compacto:
+    - preview corto para `payload`, `error`, `input` y `output`
+    - detalle expandible para inspección completa cuando hace falta
   - Pendiente:
     - decidir si esos chips siguen teniendo suficiente valor como para mantenerlos
     - upload state real cuando exista Phase J
-    - último pase de polish de command/result rendering
+    - último pase menor de polish visual sobre command/result rendering
 
 ### Phase F — Settings And Self-Configuration
 

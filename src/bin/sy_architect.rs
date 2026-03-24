@@ -5146,6 +5146,26 @@ fn architect_index_html(state: &ArchitectState) -> String {
       text-transform: uppercase;
       color: var(--muted);
     }}
+    .result-section-preview {{
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.45;
+      word-break: break-word;
+    }}
+    .result-section details {{
+      border-top: 1px dashed rgba(210, 218, 232, 0.9);
+      padding-top: 8px;
+    }}
+    .result-section summary {{
+      cursor: pointer;
+      color: var(--accent);
+      font-size: 0.76rem;
+      font-weight: 700;
+      list-style: none;
+    }}
+    .result-section summary::-webkit-details-marker {{
+      display: none;
+    }}
     .result-pre {{
       margin: 0;
       padding: 12px 13px;
@@ -5222,6 +5242,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       line-height: 1.45;
     }}
     .tool-card-row {{
+      display: grid;
+      gap: 4px;
       font-size: 0.78rem;
       line-height: 1.4;
       color: var(--muted);
@@ -5229,6 +5251,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     .tool-card-row strong {{
       color: var(--text);
+    }}
+    .tool-card-row-preview {{
+      color: var(--muted);
+      word-break: break-word;
     }}
     .tool-card details {{
       border-top: 1px dashed rgba(210, 218, 232, 0.9);
@@ -5706,6 +5732,29 @@ fn architect_index_html(state: &ArchitectState) -> String {
       pre.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
       return pre;
     }}
+    function shouldExpandValue(value, maxLen = 180) {{
+      if (value === null || value === undefined) return false;
+      if (typeof value !== "string") return true;
+      const text = value.trim();
+      return text.length > maxLen || text.includes("\n");
+    }}
+    function createExpandableValue(summaryLabel, value, maxLen = 180) {{
+      const shell = document.createElement("div");
+      const preview = document.createElement("div");
+      shell.className = "result-section";
+      preview.className = "result-section-preview";
+      preview.textContent = compactValue(value, maxLen);
+      shell.appendChild(preview);
+      if (shouldExpandValue(value, maxLen)) {{
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.textContent = summaryLabel;
+        details.appendChild(summary);
+        details.appendChild(createPre(value));
+        shell.appendChild(details);
+      }}
+      return shell;
+    }}
     function createResultSection(title, value) {{
       const section = document.createElement("div");
       const heading = document.createElement("div");
@@ -5713,7 +5762,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       heading.className = "result-section-title";
       heading.textContent = title;
       section.appendChild(heading);
-      section.appendChild(createPre(value));
+      const block = createExpandableValue("Show full " + title, value, 240);
+      Array.from(block.childNodes).forEach((child) => section.appendChild(child));
       return section;
     }}
     function compactValue(value, maxLen = 180) {{
@@ -5766,17 +5816,21 @@ fn architect_index_html(state: &ArchitectState) -> String {
           badge.classList.add("error");
         }}
         summary.textContent = tool && tool.summary ? tool.summary : compactValue(tool && tool.output !== undefined ? tool.output : null, 220);
-        inputRow.innerHTML = "<strong>Input:</strong> " + compactValue(tool && tool.arguments !== undefined ? tool.arguments : null, 180);
-        outputRow.innerHTML = "<strong>Output:</strong> " + compactValue(tool && tool.output !== undefined ? tool.output : null, 180);
+        inputRow.innerHTML = "<strong>Input</strong>";
+        outputRow.innerHTML = "<strong>Output</strong>";
         cardHead.appendChild(name);
         cardHead.appendChild(badge);
         card.appendChild(cardHead);
         card.appendChild(summary);
+        const inputBlock = createExpandableValue("Show full input", tool && tool.arguments !== undefined ? tool.arguments : null, 180);
+        const outputBlock = createExpandableValue("Show full output", tool && tool.output !== undefined ? tool.output : null, 180);
+        Array.from(inputBlock.childNodes).forEach((child) => inputRow.appendChild(child));
+        Array.from(outputBlock.childNodes).forEach((child) => outputRow.appendChild(child));
         card.appendChild(inputRow);
         card.appendChild(outputRow);
-        detailsSummary.textContent = "Show full output";
+        detailsSummary.textContent = "Show full tool result";
         details.appendChild(detailsSummary);
-        details.appendChild(createPre(tool && tool.output !== undefined ? tool.output : null));
+        details.appendChild(createPre(tool || null));
         card.appendChild(details);
         list.appendChild(card);
       }});
