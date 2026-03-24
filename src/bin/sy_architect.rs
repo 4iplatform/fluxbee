@@ -4964,6 +4964,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font-size: 0.82rem;
       line-height: 1.4;
     }}
+    .confirm-copy {{
+      margin: 0;
+      color: var(--text);
+      font-size: 0.98rem;
+      line-height: 1.55;
+    }}
     .modal-actions {{
       display: flex;
       justify-content: flex-end;
@@ -4973,6 +4979,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
       background: #ffffff;
       color: var(--text);
       border: 1px solid var(--line);
+    }}
+    .danger-button {{
+      background: #b42318;
+      color: #ffffff;
     }}
     .shell {{
       overflow: hidden;
@@ -5528,6 +5538,22 @@ fn architect_index_html(state: &ArchitectState) -> String {
       </form>
     </div>
   </div>
+  <div id="confirm-modal" class="modal-backdrop" aria-hidden="true">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title">
+      <div class="modal-head">
+        <div>
+          <div id="confirm-modal-kicker" class="modal-kicker">Confirm Action</div>
+          <h2 id="confirm-modal-title" class="modal-title">Please confirm</h2>
+          <p id="confirm-modal-copy" class="confirm-copy">Are you sure?</p>
+        </div>
+        <button id="confirm-close" class="modal-close" type="button" aria-label="Close confirmation dialog">×</button>
+      </div>
+      <div class="modal-actions">
+        <button id="confirm-cancel" class="secondary-button" type="button">Cancel</button>
+        <button id="confirm-accept" type="button">Confirm</button>
+      </div>
+    </div>
+  </div>
   <script>
     const rawPath = window.location.pathname.replace(/\/+$/, "");
     const base = rawPath === "" ? "" : rawPath;
@@ -5557,12 +5583,20 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const impersonationIlk = document.getElementById("impersonation-ilk");
     const impersonationThreadId = document.getElementById("impersonation-thread-id");
     const impersonationError = document.getElementById("impersonation-error");
+    const confirmModal = document.getElementById("confirm-modal");
+    const confirmModalKicker = document.getElementById("confirm-modal-kicker");
+    const confirmModalTitle = document.getElementById("confirm-modal-title");
+    const confirmModalCopy = document.getElementById("confirm-modal-copy");
+    const confirmClose = document.getElementById("confirm-close");
+    const confirmCancel = document.getElementById("confirm-cancel");
+    const confirmAccept = document.getElementById("confirm-accept");
     let currentSessionId = null;
     let sessionsCache = [];
     let pendingIndicator = null;
     let impersonationOptionsCache = [];
     let statusRefreshTimer = null;
     let statusRefreshInFlight = false;
+    let confirmResolver = null;
     function describeIchOption(option) {{
       if (!option) return "";
       const primary = option.is_primary ? " · primary" : "";
@@ -5652,6 +5686,40 @@ fn architect_index_html(state: &ArchitectState) -> String {
         impersonationError.textContent = "Failed to load identity options: " + err;
       }}
       window.setTimeout(() => impersonationIch.focus(), 0);
+    }}
+    function closeConfirmModal(confirmed = false) {{
+      confirmModal.classList.remove("open");
+      confirmModal.setAttribute("aria-hidden", "true");
+      confirmAccept.classList.remove("danger-button");
+      const resolver = confirmResolver;
+      confirmResolver = null;
+      if (resolver) {{
+        resolver(confirmed);
+      }}
+    }}
+    function openConfirmModal(options = {{}}) {{
+      if (confirmResolver) {{
+        confirmResolver(false);
+        confirmResolver = null;
+      }}
+      const title = options.title || "Please confirm";
+      const copy = options.message || "Are you sure?";
+      const kicker = options.kicker || "Confirm Action";
+      const confirmLabel = options.confirmLabel || "Confirm";
+      const cancelLabel = options.cancelLabel || "Cancel";
+      const tone = options.tone || "default";
+      confirmModalTitle.textContent = title;
+      confirmModalCopy.textContent = copy;
+      confirmModalKicker.textContent = kicker;
+      confirmAccept.textContent = confirmLabel;
+      confirmCancel.textContent = cancelLabel;
+      confirmAccept.classList.toggle("danger-button", tone === "danger");
+      confirmModal.classList.add("open");
+      confirmModal.setAttribute("aria-hidden", "false");
+      return new Promise((resolve) => {{
+        confirmResolver = resolve;
+        window.setTimeout(() => confirmAccept.focus(), 0);
+      }});
     }}
     function collectImpersonationPayload() {{
       const option = selectedImpersonationOption();
@@ -6151,7 +6219,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
       renderHistory();
     }}
     async function deleteSession(sessionId) {{
-      const confirmed = window.confirm("Delete this chat history?");
+      const confirmed = await openConfirmModal({{
+        title: "Delete chat",
+        message: "Delete this chat history?",
+        kicker: "Chat History",
+        confirmLabel: "Delete",
+        tone: "danger"
+      }});
       if (!confirmed) return;
       const res = await fetch(sessionsUrl + "/" + encodeURIComponent(sessionId), {{
         method: "DELETE"
@@ -6169,7 +6243,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
     }}
     async function clearAllHistory() {{
-      const confirmed = window.confirm("Delete all chat history?");
+      const confirmed = await openConfirmModal({{
+        title: "Delete all chats",
+        message: "Delete all chat history?",
+        kicker: "Chat History",
+        confirmLabel: "Delete all",
+        tone: "danger"
+      }});
       if (!confirmed) return;
       const res = await fetch(sessionsUrl, {{
         method: "DELETE"
@@ -6295,7 +6375,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
         await createSession();
       }}
       if (isDestructiveMessage(message)) {{
-        const confirmed = window.confirm("This command looks destructive. Do you want to send it?");
+        const confirmed = await openConfirmModal({{
+          title: "Send destructive command",
+          message: "This command looks destructive. Do you want to send it?",
+          kicker: "Safety Check",
+          confirmLabel: "Send command",
+          tone: "danger"
+        }});
         if (!confirmed) return;
       }}
       addMessage("user", message);
@@ -6359,6 +6445,14 @@ fn architect_index_html(state: &ArchitectState) -> String {
         closeImpersonationModal();
       }}
     }});
+    confirmClose.addEventListener("click", () => closeConfirmModal(false));
+    confirmCancel.addEventListener("click", () => closeConfirmModal(false));
+    confirmAccept.addEventListener("click", () => closeConfirmModal(true));
+    confirmModal.addEventListener("click", (event) => {{
+      if (event.target === confirmModal) {{
+        closeConfirmModal(false);
+      }}
+    }});
     impersonationForm.addEventListener("submit", (event) => {{
       event.preventDefault();
       impersonationError.textContent = "";
@@ -6382,8 +6476,14 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
     }});
     window.addEventListener("keydown", (event) => {{
-      if (event.key === "Escape" && impersonationModal.classList.contains("open")) {{
-        closeImpersonationModal();
+      if (event.key === "Escape") {{
+        if (confirmModal.classList.contains("open")) {{
+          closeConfirmModal(false);
+          return;
+        }}
+        if (impersonationModal.classList.contains("open")) {{
+          closeImpersonationModal();
+        }}
       }}
     }});
     document.addEventListener("visibilitychange", () => {{
