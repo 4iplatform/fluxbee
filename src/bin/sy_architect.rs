@@ -2260,6 +2260,12 @@ fn translate_scmd(
             target_hive: local_hive_id.to_string(),
             params: json!({ "hive_id": hive_id }),
         }),
+        ("GET", ["hives", hive_id, "status"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "inventory".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({ "scope": "hive", "filter_hive": hive_id }),
+        }),
         ("DELETE", ["hives", hive_id]) => Ok(AdminTranslation {
             admin_target,
             action: "remove_hive".to_string(),

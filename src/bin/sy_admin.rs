@@ -1852,6 +1852,15 @@ async fn handle_hive_paths(
         };
     }
     match (method, rest) {
+        ("GET", ["status"]) => {
+            let payload = serde_json::json!({
+                "scope": "hive",
+                "filter_hive": hive,
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "inventory", payload, None).await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["routes"]) => {
             let (status, resp) = handle_admin_query(ctx, client, "list_routes", Some(hive)).await?;
             Ok(Some((status, resp)))
