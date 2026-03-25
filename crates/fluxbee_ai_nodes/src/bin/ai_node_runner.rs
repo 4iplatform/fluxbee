@@ -690,6 +690,18 @@ impl AiNode for GenericAiNode {
         };
 
         let input = extract_text(&msg.payload).unwrap_or_default();
+        if msg.meta.msg_type.eq_ignore_ascii_case("user") {
+            tracing::info!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                src_ilk = ?behavior_ctx.src_ilk,
+                sender = ?incoming_sender_hint(&msg),
+                thread_id = ?behavior_ctx.thread_id,
+                input_len = input.len(),
+                input_preview = %text_preview(&input, 240),
+                "incoming user message"
+            );
+        }
         let output = match &behavior {
             NodeBehavior::Echo => format!("Echo: {input}"),
             NodeBehavior::OpenAiChat(openai) => {
@@ -2815,6 +2827,32 @@ fn src_ilk_source(msg: &Message) -> &'static str {
         return "context_legacy";
     }
     "missing"
+}
+
+fn incoming_sender_hint(msg: &Message) -> Option<String> {
+    let ctx = msg.meta.context.as_ref()?;
+    let io = ctx.get("io")?;
+    let sender = io.get("sender")?;
+    let kind = sender.get("kind").and_then(Value::as_str).map(str::trim);
+    let id = sender.get("id").and_then(Value::as_str).map(str::trim);
+    match (kind, id) {
+        (Some(k), Some(i)) if !k.is_empty() && !i.is_empty() => Some(format!("{k}:{i}")),
+        (_, Some(i)) if !i.is_empty() => Some(i.to_string()),
+        _ => None,
+    }
+}
+
+fn text_preview(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut out = String::new();
+    for ch in compact.chars().take(max_chars) {
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
 }
 
 #[allow(dead_code)]
