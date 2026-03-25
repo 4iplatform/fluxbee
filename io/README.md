@@ -12,7 +12,7 @@ This subtree hosts IO crates isolated from core routing/AI crates.
 
 - `io-common` and `io-slack` use `fluxbee_sdk` directly.
 - Runtime transport is the same node transport used by Fluxbee (`NodeConfig` + unix socket on linux).
-- Local shim crates (`router-client`, `router-protocol`, `router-stub`, `node-test`) are no longer workspace members.
+- Local shim crate paths were removed as part of IO cleanup.
 
 ## Install for Linux runtime
 

@@ -76,10 +76,10 @@ Description: ellipsis appears as malformed character in source.
 Current location: `io/crates/io-slack/src/main.rs`.
 Target: ASCII-safe output (e.g. `...`).
 
-- [ ] P2.3 Decide lifecycle for `io/legacy` crates.
-Description: imported shim crates remain on disk but outside active workspace.
-Current location: `io/legacy/`.
-Target: either remove or keep as archived reference with explicit policy.
+- [x] P2.3 Cleanup legacy imported shim crates.
+Description: imported shim crates were removed from the repository.
+Current location: n/a.
+Target: completed.
 
 ## Open decisions (product/architecture)
 

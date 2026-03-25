@@ -12,14 +12,8 @@ This subtree was imported from `D:\repos\slack-node` and then migrated to Fluxbe
 
 ## About shim crates
 
-The following imported crates still exist on disk under `io/legacy/crates` but are no longer used by the workspace:
-
-- `io/legacy/crates/router-client`
-- `io/legacy/crates/router-protocol`
-- `io/legacy/crates/router-stub`
-- `io/legacy/crates/node-test`
-
-They can be removed safely once you want a cleanup-only commit.
+Legacy imported shim crates were removed from this repository.
+The active workspace is limited to the crates listed above.
 
 ## Protocol note
 

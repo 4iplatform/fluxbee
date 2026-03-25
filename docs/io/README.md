@@ -26,7 +26,7 @@ When these docs conflict with the current Fluxbee v1.16/v1.17 direction in this 
 
 3. Transport:
 - Production node-to-router integration in this repo uses `fluxbee_sdk` + Unix sockets.
-- Any TCP/shim client in imported code is transitional and isolated under `io/legacy`.
+- Any TCP/shim client in imported code is transitional and outside the active workspace/runtime path.
 
 ## Known Issue / Troubleshooting
 
