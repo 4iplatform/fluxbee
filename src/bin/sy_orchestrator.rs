@@ -1262,7 +1262,7 @@ async fn handle_admin(
         "list_hives" => {
             serde_json::json!({
                 "status": "ok",
-                "hives": list_hives(&state.state_dir)?,
+                "hives": list_hives(state)?,
             })
         }
         "get_hive" => {
@@ -6271,23 +6271,41 @@ async fn send_config_response(
     Ok(())
 }
 
-fn list_hives(_state_dir: &Path) -> Result<Vec<serde_json::Value>, OrchestratorError> {
+fn list_hives(state: &OrchestratorState) -> Result<Vec<serde_json::Value>, OrchestratorError> {
     let root = hives_root();
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
     let mut out = Vec::new();
-    for entry in fs::read_dir(&root)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
+    if root.exists() {
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let hive_id = entry.file_name().to_string_lossy().to_string();
+            if let Ok(info) = read_hive_info(&root, &hive_id) {
+                out.push(info);
+            } else {
+                out.push(serde_json::json!({ "hive_id": hive_id }));
+            }
         }
-        let hive_id = entry.file_name().to_string_lossy().to_string();
-        if let Ok(info) = read_hive_info(&root, &hive_id) {
-            out.push(info);
+    }
+    if !out.iter().any(|entry| {
+        entry
+            .get("hive_id")
+            .and_then(|value| value.as_str())
+            .map(|value| value == state.hive_id)
+            .unwrap_or(false)
+    }) {
+        let local_role = if state.is_motherbee {
+            "motherbee"
         } else {
-            out.push(serde_json::json!({ "hive_id": hive_id }));
-        }
+            "worker"
+        };
+        out.push(serde_json::json!({
+            "hive_id": state.hive_id,
+            "role": local_role,
+            "status": "alive",
+            "is_local": true,
+        }));
     }
     out.sort_by(|a, b| {
         let a = a.get("hive_id").and_then(|v| v.as_str()).unwrap_or("");
