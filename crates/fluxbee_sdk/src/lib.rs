@@ -5,10 +5,6 @@ pub mod comm;
 pub mod identity;
 pub mod managed_node;
 pub mod nats;
-#[cfg(unix)]
-pub mod node_client;
-#[cfg(not(unix))]
-#[path = "node_client_stub.rs"]
 pub mod node_client;
 pub mod payload;
 pub mod prelude;
