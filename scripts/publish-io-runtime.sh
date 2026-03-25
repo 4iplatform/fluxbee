@@ -15,7 +15,7 @@ Required:
 
 Options:
   --runtime <name>         Override runtime key (defaults: IO.slack / IO.sim)
-  --binary <path>          Override binary path (defaults: io/target/release/io-slack|io-sim)
+  --binary <path>          Override binary path (defaults: nodes/io/target/release/io-slack|io-sim)
   --dist-root <path>       Dist root (default: /var/lib/fluxbee/dist)
   --set-current            Set current version in manifest
   --sudo                   Use sudo for writes
@@ -88,12 +88,12 @@ fi
 case "$KIND" in
   slack)
     default_runtime="IO.slack"
-    default_binary="$ROOT_DIR/io/target/release/io-slack"
+    default_binary="$ROOT_DIR/nodes/io/target/release/io-slack"
     build_pkg="io-slack"
     ;;
   sim)
     default_runtime="IO.sim"
-    default_binary="$ROOT_DIR/io/target/release/io-sim"
+    default_binary="$ROOT_DIR/nodes/io/target/release/io-sim"
     build_pkg="io-sim"
     ;;
   *)
@@ -114,7 +114,7 @@ if [[ "$SKIP_BUILD" != "1" ]]; then
     echo "Error: cargo not found (use --skip-build if binary already exists)" >&2
     exit 1
   fi
-  (cd "$ROOT_DIR" && cargo build --release --manifest-path io/Cargo.toml -p "$build_pkg")
+  (cd "$ROOT_DIR" && cargo build --release --manifest-path nodes/io/Cargo.toml -p "$build_pkg")
 fi
 
 cmd=(bash "$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --binary "$BINARY")

@@ -46,7 +46,7 @@ bash scripts/publish-io-runtime.sh --kind sim --version 0.1.0 --set-current --su
 Generic publish helper:
 
 ```bash
-bash scripts/publish-runtime.sh --runtime IO.slack --version 0.1.0 --binary io/target/release/io-slack --set-current --sudo
+bash scripts/publish-runtime.sh --runtime IO.slack --version 0.1.0 --binary nodes/io/target/release/io-slack --set-current --sudo
 ```
 
 Expected output includes:

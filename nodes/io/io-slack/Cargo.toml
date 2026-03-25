@@ -8,7 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 fluxbee-sdk.workspace = true
 futures-util.workspace = true
-io-common = { path = "../io-common" }
+io-common = { path = "../common" }
 regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true

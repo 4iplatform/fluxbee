@@ -93,7 +93,7 @@ Acceptance:
 
 ## P4 - Documentation Cleanup (legacy wording removal)
 
-- [x] P4.1 `io/README.md`: remove `IDENTITY_MODE` usage and legacy mode examples.
+- [x] P4.1 `nodes/io/README.md`: remove `IDENTITY_MODE` usage and legacy mode examples.
 - [x] P4.2 `docs/io/io-common.md`: update to single provision-on-miss baseline.
 - [x] P4.3 `docs/io/io-slack.md`: align env/config and behavior with common baseline.
 - [x] P4.4 `docs/io/io-slack-tasks.md`: ensure legacy-mode references are fully historical-only or removed from active tasks.

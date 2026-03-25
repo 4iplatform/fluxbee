@@ -21,10 +21,10 @@ if [[ "${SKIP_BUILD:-}" != "1" ]]; then
   fi
 
   echo "Building IO binaries (io-slack, io-sim)..."
-  (cd "$ROOT_DIR" && cargo build --release --manifest-path io/Cargo.toml -p io-slack -p io-sim)
+  (cd "$ROOT_DIR" && cargo build --release --manifest-path nodes/io/Cargo.toml -p io-slack -p io-sim)
 fi
 
-BIN_DIR="${BIN_DIR:-$ROOT_DIR/io/target/release}"
+BIN_DIR="${BIN_DIR:-$ROOT_DIR/nodes/io/target/release}"
 if [[ "${SKIP_BUILD:-}" == "1" ]]; then
   echo "SKIP_BUILD=1: installing only binaries from $BIN_DIR" >&2
 fi
@@ -42,7 +42,7 @@ if [[ ! -f "$SIM_BIN" ]]; then
   missing=1
 fi
 if [[ "$missing" -eq 1 ]]; then
-  echo "Build them first (e.g. cargo build --release --manifest-path io/Cargo.toml -p io-slack -p io-sim) or set BIN_DIR." >&2
+  echo "Build them first (e.g. cargo build --release --manifest-path nodes/io/Cargo.toml -p io-slack -p io-sim) or set BIN_DIR." >&2
   exit 1
 fi
 

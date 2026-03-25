@@ -11,7 +11,7 @@ Track what is missing or inconsistent after validating end-to-end flow (`Slack -
 
 - [ ] P0.1 Move identity fields to native protocol metadata.
 Description: `src_ilk/dst_ilk` are currently stored in `meta.context` as a temporary workaround.
-Current location: `io/crates/io-common/src/router_message.rs`.
+Current location: `nodes/io/common/src/router_message.rs`.
 Target: use native metadata fields once protocol supports them.
 > La especificación/documentación de protocolo en el repo contempla src_ilk/dst_ilk como metadata principal.
 Pero la implementación actual del struct Meta en fluxbee_sdk no tiene esos campos.
@@ -19,7 +19,7 @@ Por eso hoy estamos usando el workaround en meta.context.src_ilk / meta.context.
 
 - [ ] P0.2 Remove fixed destination test path from production behavior.
 Description: `IO_SLACK_DST_NODE` is useful for tests but should not be required for normal routing.
-Current location: `io/crates/io-slack/src/main.rs`.
+Current location: `nodes/io/io-slack/src/main.rs`.
 Target: Router/OPA-driven destination in production; keep fixed dst only as explicit test mode.
 
 - [x] P0.3 Add deploy/runtime path for AI and IO nodes.
@@ -40,17 +40,17 @@ Resolution:
 
 - [ ] P1.1 Harden IO outbound reliability.
 Description: Slack outbound is still best-effort (memory only).
-Current location: `io/crates/io-slack/src/main.rs`.
+Current location: `nodes/io/io-slack/src/main.rs`.
 Target: durable outbox/retry policy (or explicit product decision that MVP remains in-memory).
 
 - [ ] P1.2 Improve observability for dropped/ignored outbound messages.
 Description: messages without parseable `reply_target` are silently skipped.
-Current location: `io/crates/io-slack/src/main.rs` (`run_outbound_loop`).
+Current location: `nodes/io/io-slack/src/main.rs` (`run_outbound_loop`).
 Target: structured warn/metric with reason.
 
 - [ ] P1.3 Identity resolver configurability.
 Description: SHM path/limits are hardcoded (`/dev/shm/jsr-identity-*`, len limits).
-Current location: `io/crates/io-common/src/identity.rs`.
+Current location: `nodes/io/common/src/identity.rs`.
 Target: configurable path + documented limits, with safe defaults.
 
 - [x] P1.4 Replace placeholder reply source in AI runner path.
@@ -66,14 +66,14 @@ Resolution:
 - [ ] P2.1 Normalize defaults and config documentation across IO and AI.
 Description: path/model defaults exist in code and docs; risk of drift.
 Targets:
-- `io/crates/io-slack/src/main.rs`
+- `nodes/io/io-slack/src/main.rs`
 - `crates/fluxbee_ai_nodes/src/bin/ai_node_runner.rs`
 - `docs/AI_nodes_spec.md`
-- `io/README.md`
+- `nodes/io/README.md`
 
 - [ ] P2.2 Fix encoding artifact in Slack truncate helper.
 Description: ellipsis appears as malformed character in source.
-Current location: `io/crates/io-slack/src/main.rs`.
+Current location: `nodes/io/io-slack/src/main.rs`.
 Target: ASCII-safe output (e.g. `...`).
 
 - [x] P2.3 Cleanup legacy imported shim crates.
