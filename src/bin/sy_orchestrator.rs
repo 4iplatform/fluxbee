@@ -6313,9 +6313,14 @@ rm -rf /var/lib/fluxbee/nodes/* >/dev/null 2>&1 || true; \
 rm -rf /var/lib/fluxbee/state/nodes/* >/dev/null 2>&1 || true"
 }
 
+fn remove_hive_cleanup_shell_command(script: &str) -> String {
+    sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(script)))
+}
+
 fn remove_hive_cleanup_local_flow() -> serde_json::Value {
     let deferred_script = format!("sleep 1; {}", remove_hive_cleanup_script());
-    match Command::new("bash").arg("-lc").arg(deferred_script).spawn() {
+    let deferred_cmd = remove_hive_cleanup_shell_command(&deferred_script);
+    match Command::new("bash").arg("-lc").arg(deferred_cmd).spawn() {
         Ok(_) => serde_json::json!({
             "status": "ok",
             "cleanup": "scheduled",
@@ -6341,12 +6346,8 @@ fn remove_hive_cleanup_via_ssh(address: &str) -> Result<(), OrchestratorError> {
         )
         .into());
     }
-    ssh_with_key(
-        address,
-        &key_path,
-        &sudo_wrap(remove_hive_cleanup_script()),
-        BOOTSTRAP_SSH_USER,
-    )
+    let cleanup_cmd = remove_hive_cleanup_shell_command(remove_hive_cleanup_script());
+    ssh_with_key(address, &key_path, &cleanup_cmd, BOOTSTRAP_SSH_USER)
 }
 
 async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_json::Value {
@@ -13592,6 +13593,14 @@ mod tests {
         let script = remove_hive_cleanup_script();
         assert!(script.contains("/var/lib/fluxbee/nodes/*"));
         assert!(script.contains("/var/lib/fluxbee/state/nodes/*"));
+    }
+
+    #[test]
+    fn remove_hive_cleanup_shell_command_runs_via_sudo_bash() {
+        let cmd = remove_hive_cleanup_shell_command(remove_hive_cleanup_script());
+        assert!(cmd.starts_with("sudo -n bash -lc "));
+        assert!(cmd.contains("systemctl stop --no-block"));
+        assert!(cmd.contains("/var/lib/fluxbee/state/nodes/*"));
     }
 
     #[test]
