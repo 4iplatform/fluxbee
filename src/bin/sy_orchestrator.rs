@@ -6375,8 +6375,8 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
         });
     }
 
-    let remote_cleanup: &str;
-    let remote_cleanup_via: &str;
+    let remote_cleanup: String;
+    let remote_cleanup_via: String;
     let hive_info = read_hive_info(&root, hive_id).ok();
     let address = hive_info
         .as_ref()
@@ -6413,8 +6413,29 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
     let socket_cleanup_timed_out = socket_cleanup_timeout(&forward_result);
 
     if socket_cleanup_ok {
-        remote_cleanup = "socket_ok";
-        remote_cleanup_via = "socket";
+        let mut ssh_verified = false;
+        if !address.trim().is_empty() {
+            match remove_hive_cleanup_via_ssh(&address) {
+                Ok(()) => {
+                    ssh_verified = true;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        hive_id = hive_id,
+                        address = %address,
+                        error = %err,
+                        "ssh verification cleanup failed after socket remove_hive cleanup"
+                    );
+                }
+            }
+        }
+        if ssh_verified {
+            remote_cleanup = "socket_ok_ssh_verified".to_string();
+            remote_cleanup_via = "socket+ssh".to_string();
+        } else {
+            remote_cleanup = "socket_ok".to_string();
+            remote_cleanup_via = "socket".to_string();
+        }
     } else {
         let mut ssh_cleanup_ok = false;
         if !address.trim().is_empty() {
@@ -6437,15 +6458,17 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
                 "socket_timeout_ssh_ok"
             } else {
                 "socket_failed_ssh_ok"
-            };
-            remote_cleanup_via = "ssh";
+            }
+            .to_string();
+            remote_cleanup_via = "ssh".to_string();
         } else {
             remote_cleanup = if socket_cleanup_timed_out {
                 "socket_timeout"
             } else {
                 "local_only"
-            };
-            remote_cleanup_via = "local_only";
+            }
+            .to_string();
+            remote_cleanup_via = "local_only".to_string();
             if let Err(err) = &forward_result {
                 tracing::warn!(
                     hive_id = hive_id,
