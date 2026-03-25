@@ -61,6 +61,7 @@ Objetivo: revisar punto por punto y marcar pendientes.
   - Router carga opcionalmente `data.json` desde `/var/lib/fluxbee/opa/current/data.json`.
   - Si el archivo no existe, usa `data` embebido en WASM (comportamiento anterior).
   - Si `data.json` existe pero es inválido, el reload falla en forma explícita (`OPA_ERROR`).
+  - Para `Resolve`, el router superpone en runtime la identidad viva desde SHM (`data.identity`, `data.identity_aliases`), así que cambios de registro no requieren `OPA_RELOAD`.
 - [x] Validación de `hash` en `OPA_RELOAD`
 
 ## 7. Casos especiales
@@ -80,4 +81,5 @@ Objetivo: revisar punto por punto y marcar pendientes.
 - SY.opa.rules es **control plane** (Go), no router. Compila Rego → WASM y escribe en SHM.
 - Routers (Rust) leen WASM de `/dev/shm/jsr-opa-<hive>` y ejecutan con Wasmtime.
 - Router usa `data bundle` externo opcional (`/var/lib/fluxbee/opa/current/data.json`) para poblar `opa_eval_ctx_set_data`.
+- En `Resolve`, esos datos estáticos se combinan con identity viva desde SHM antes de evaluar OPA.
 - Si la policy usa builtins no implementados → `OPA_ERROR`.

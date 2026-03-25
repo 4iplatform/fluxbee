@@ -180,10 +180,7 @@ impl LlmClient for OpenAiResponsesClient {
             .as_ref()
             .and_then(|v| v.max_output_tokens)
             .or(request.max_output_tokens);
-        let temperature = request
-            .model_settings
-            .as_ref()
-            .and_then(|v| v.temperature);
+        let temperature = request.model_settings.as_ref().and_then(|v| v.temperature);
         let top_p = request.model_settings.as_ref().and_then(|v| v.top_p);
 
         let body = json!({
@@ -246,7 +243,10 @@ pub struct OpenAiFunctionCallingModel {
 
 #[async_trait]
 impl FunctionCallingModel for OpenAiFunctionCallingModel {
-    async fn run_turn(&self, request: FunctionModelTurnRequest) -> Result<FunctionModelTurnResponse> {
+    async fn run_turn(
+        &self,
+        request: FunctionModelTurnRequest,
+    ) -> Result<FunctionModelTurnResponse> {
         let (pending_tool_results, request_items) = split_pending_tool_results(request.items);
         let previous_response_id = pending_tool_results
             .first()
@@ -284,7 +284,9 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                     FunctionLoopItem::ToolResult { result } => {
                         let output_text = match result.output {
                             Value::String(s) => s,
-                            other => serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string()),
+                            other => {
+                                serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string())
+                            }
                         };
                         input.push(json!({
                             "type": "function_call_output",
@@ -292,11 +294,10 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                             "output": output_text,
                         }));
                     }
-                    FunctionLoopItem::AssistantText { .. } => {
-                        // We keep model input minimal for MVP: user turns + tool outputs.
-                    }
+                    other => input.push(loop_item_to_openai_input(other)),
                 }
             }
+        }
         }
 
         let tools = request
@@ -345,7 +346,10 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
             )));
         }
 
-        let response_id = value.get("id").and_then(Value::as_str).map(ToString::to_string);
+        let response_id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
         let mut assistant_text = value
             .get("output_text")
             .and_then(Value::as_str)
@@ -368,7 +372,9 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                         .unwrap_or_default()
                         .to_string();
                     let arguments = parse_tool_arguments(
-                        item.get("arguments").cloned().unwrap_or(Value::Object(Default::default())),
+                        item.get("arguments")
+                            .cloned()
+                            .unwrap_or(Value::Object(Default::default())),
                     );
                     if !call_id.is_empty() && !name.is_empty() {
                         tool_calls.push(FunctionToolCall {
@@ -382,17 +388,17 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                 }
 
                 if assistant_text.is_none() && item_type == "message" {
-                    assistant_text = item
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .and_then(|arr| {
-                            arr.iter().find_map(|content_item| {
-                                content_item
-                                    .get("text")
-                                    .and_then(Value::as_str)
-                                    .map(ToString::to_string)
-                            })
-                        });
+                    assistant_text =
+                        item.get("content")
+                            .and_then(Value::as_array)
+                            .and_then(|arr| {
+                                arr.iter().find_map(|content_item| {
+                                    content_item
+                                        .get("text")
+                                        .and_then(Value::as_str)
+                                        .map(ToString::to_string)
+                                })
+                            });
                 }
             }
         }
@@ -406,7 +412,10 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
 
 fn split_pending_tool_results(
     items: Vec<FunctionLoopItem>,
-) -> (Vec<crate::function_calling::FunctionToolResult>, Vec<FunctionLoopItem>) {
+) -> (
+    Vec<crate::function_calling::FunctionToolResult>,
+    Vec<FunctionLoopItem>,
+) {
     let mut prefix = items;
     let mut tail = Vec::new();
     let mut expected_response_id: Option<Option<String>> = None;
@@ -441,5 +450,80 @@ fn parse_tool_arguments(raw: Value) -> Value {
     match raw {
         Value::String(s) => serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s)),
         other => other,
+    }
+}
+
+fn loop_item_to_openai_input(item: FunctionLoopItem) -> Value {
+    match item {
+        FunctionLoopItem::SystemText { content } => json!({
+            "role": "system",
+            "content": [{"type":"input_text","text": content}],
+        }),
+        FunctionLoopItem::UserText { content } => json!({
+            "role": "user",
+            "content": [{"type":"input_text","text": content}],
+        }),
+        FunctionLoopItem::AssistantText { content } => json!({
+            "role": "assistant",
+            "content": [{"type":"output_text","text": content}],
+        }),
+        FunctionLoopItem::ToolResult { result } => {
+            let output_text = match result.output {
+                Value::String(s) => s,
+                other => serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string()),
+            };
+            json!({
+                "type": "function_call_output",
+                "call_id": result.call_id,
+                "output": output_text,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::function_calling::FunctionToolResult;
+
+    #[test]
+    fn assistant_items_are_serialized_as_output_text() {
+        let value = loop_item_to_openai_input(FunctionLoopItem::AssistantText {
+            content: "previous assistant".to_string(),
+        });
+        assert_eq!(value["role"], "assistant");
+        assert_eq!(value["content"][0]["type"], "output_text");
+        assert_eq!(value["content"][0]["text"], "previous assistant");
+    }
+
+    #[test]
+    fn system_and_user_items_stay_as_input_text() {
+        let system = loop_item_to_openai_input(FunctionLoopItem::SystemText {
+            content: "summary".to_string(),
+        });
+        let user = loop_item_to_openai_input(FunctionLoopItem::UserText {
+            content: "current user".to_string(),
+        });
+        assert_eq!(system["content"][0]["type"], "input_text");
+        assert_eq!(user["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn tool_results_remain_function_call_outputs() {
+        let value = loop_item_to_openai_input(FunctionLoopItem::ToolResult {
+            result: FunctionToolResult {
+                call_id: "call-1".to_string(),
+                response_id: Some("resp-1".to_string()),
+                name: "demo".to_string(),
+                arguments: json!({"arg":"value"}),
+                output: json!({"ok": true}),
+                is_error: false,
+            },
+        });
+        assert_eq!(value["type"], "function_call_output");
+        assert_eq!(value["call_id"], "call-1");
+        assert_eq!(value["output"], "{\"ok\":true}");
     }
 }

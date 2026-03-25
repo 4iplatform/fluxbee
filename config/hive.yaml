@@ -17,6 +17,10 @@ nats:
 admin:
   listen: "127.0.0.1:8080"
 
+# Local architect HTTP UI/API (typically exposed through reverse proxy).
+architect:
+  listen: "127.0.0.1:3000"
+
 # Shared filesystem root used by admin/orchestrator.
 storage:
   path: "/var/lib/fluxbee"
@@ -54,3 +58,10 @@ dist:
   sync:
     enabled: true
     tool: "syncthing"
+
+ai_providers:
+  openai:
+    api_key: "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"
+    default_model: "gpt-4.1-mini"
+    max_tokens: 1200
+    temperature: 0.2

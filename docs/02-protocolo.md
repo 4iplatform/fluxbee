@@ -49,7 +49,7 @@ Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisi
 | UUID | Unicast directo a ese nodo |
 | Nombre L2 (`SY.admin@motherbee`) | Resolve directo en FIB por nombre (sin OPA) |
 | `"broadcast"` | Entregar a todos (filtrado por `meta.target` si existe) |
-| `null` | Resolver destino via OPA usando `meta.target` |
+| `null` | Resolver destino via OPA |
 
 ---
 
@@ -90,8 +90,8 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 | `type` | string | Sí | Tipo de mensaje: `"user"`, `"system"`, `"admin"` |
 | `msg` | string | Sí si type=system | Tipo de mensaje de sistema (ej: `"HELLO"`, `"LSA"`) |
 | `scope` | string | No | Alcance VPN para broadcast/multicast: `"vpn"` (default) o `"global"` (solo system) |
-| `target` | string | Condicional | Para OPA o broadcast filter (nombre L2 con @isla) |
-| `src_ilk` | string | Sí (L3) | ILK del interlocutor que envía. OPA deriva tenant via `data.identity` |
+| `target` | string | Opcional | Hint/namespace opcional para OPA o filtro de broadcast (nombre L2, patrón o clave de policy) |
+| `src_ilk` | string | Sí (L3) | ILK del interlocutor que envía. OPA deriva tenant via `data.identity`, actualizado desde SHM de identity en cada `Resolve` |
 | `dst_ilk` | string | No | ILK del interlocutor destino (si se conoce) |
 | `ich` | string | Sí (L3) | ICH (Interlocutor Channel) por el cual se comunica |
 | `ctx` | string | Sí (L3) | Context ID. Calculado: `hash(src_ilk + ich)` |
@@ -104,6 +104,7 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 
 Nota de contrato:
 - el campo canónico de L3 para identity routing es `meta.src_ilk`
+- en `Destination::Resolve`, el router evalúa OPA con identidad fresca desde SHM (`data.identity`, `data.identity_aliases`); no depende de `OPA_RELOAD` para refrescar estados dinámicos como `temporary/complete`
 
 **Regla:** si `type="system"` y `scope="global"`, el router ignora el filtro de VPN para broadcast/multicast.
 
@@ -111,7 +112,8 @@ Nota de contrato:
 
 | `dst` | `meta.target` | Comportamiento |
 |-------|---------------|----------------|
-| `null` | nombre L2 | OPA resuelve destino usando target |
+| `null` | ausente | OPA resuelve usando `meta` (por ejemplo `src_ilk`, `dst_ilk`, `context`) |
+| `null` | presente | OPA resuelve usando `meta` y puede tratar `target` como hint/namespace de policy |
 | `"broadcast"` | patrón L2 | Router filtra: solo entrega a nodos que matchean |
 | `"broadcast"` | ausente | Router entrega a todos los nodos |
 | UUID o nombre L2 | - | Ignorado (unicast directo) |

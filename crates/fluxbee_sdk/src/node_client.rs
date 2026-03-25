@@ -431,8 +431,8 @@ mod tests {
     #[test]
     fn resolve_uuid_persistent_reuses_uuid_file() {
         let dir = test_temp_dir("node-client-persistent");
-        let first = resolve_uuid(NodeUuidMode::Persistent, &dir, "SY.test")
-            .expect("persistent uuid");
+        let first =
+            resolve_uuid(NodeUuidMode::Persistent, &dir, "SY.test").expect("persistent uuid");
         let second = resolve_uuid(NodeUuidMode::Persistent, &dir, "SY.test")
             .expect("persistent uuid reload");
         assert_eq!(first, second);
@@ -443,10 +443,9 @@ mod tests {
     #[test]
     fn resolve_uuid_ephemeral_does_not_persist_uuid_file() {
         let dir = test_temp_dir("node-client-ephemeral");
-        let first = resolve_uuid(NodeUuidMode::Ephemeral, &dir, "SY.test")
-            .expect("ephemeral uuid");
-        let second = resolve_uuid(NodeUuidMode::Ephemeral, &dir, "SY.test")
-            .expect("ephemeral uuid");
+        let first = resolve_uuid(NodeUuidMode::Ephemeral, &dir, "SY.test").expect("ephemeral uuid");
+        let second =
+            resolve_uuid(NodeUuidMode::Ephemeral, &dir, "SY.test").expect("ephemeral uuid");
         assert_ne!(first, second);
         assert!(!dir.join("SY.test.uuid").exists());
         let _ = fs::remove_dir_all(dir);

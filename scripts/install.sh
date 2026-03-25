@@ -28,6 +28,14 @@ if [[ "${SKIP_BUILD:-}" != "1" ]]; then
     fi
   fi
 
+  if [[ "${SKIP_BUILD:-}" != "1" ]] && ! command -v protoc >/dev/null 2>&1; then
+    echo "Error: protoc not found in PATH." >&2
+    echo "Fluxbee now builds LanceDB-backed components and requires the Protocol Buffers compiler on the build host." >&2
+    echo "Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y protobuf-compiler" >&2
+    echo "RHEL/CentOS: sudo dnf install -y protobuf-compiler" >&2
+    exit 1
+  fi
+
   if [[ "${SKIP_BUILD:-}" != "1" ]]; then
     echo "Building Rust binaries..."
     cargo build --release --bins
@@ -102,6 +110,7 @@ missing=0
 json_router_bin="$(pick_bin json-router)" || { echo "Missing binary: $BIN_DIR/json-router" >&2; missing=1; }
 sy_admin_bin="$(pick_bin sy_admin)" || { echo "Missing binary: $BIN_DIR/sy_admin" >&2; missing=1; }
 sy_config_bin="$(pick_bin sy_config_routes)" || { echo "Missing binary: $BIN_DIR/sy_config_routes" >&2; missing=1; }
+sy_architect_bin="$(pick_bin sy_architect)" || { echo "Missing binary: $BIN_DIR/sy_architect" >&2; missing=1; }
 sy_orch_bin="$(pick_bin sy_orchestrator)" || { echo "Missing binary: $BIN_DIR/sy_orchestrator" >&2; missing=1; }
 sy_storage_bin="$(pick_bin sy_storage)" || { echo "Missing binary: $BIN_DIR/sy_storage" >&2; missing=1; }
 sy_identity_bin="$(pick_bin sy_identity)" || { echo "Missing binary: $BIN_DIR/sy_identity" >&2; missing=1; }
@@ -124,6 +133,7 @@ fi
 sudo install -m 0755 "$json_router_bin" /usr/bin/rt-gateway
 sudo install -m 0755 "$sy_admin_bin" /usr/bin/sy-admin
 sudo install -m 0755 "$sy_config_bin" /usr/bin/sy-config-routes
+sudo install -m 0755 "$sy_architect_bin" /usr/bin/sy-architect
 sudo install -m 0755 "$sy_orch_bin" /usr/bin/sy-orchestrator
 sudo install -m 0755 "$sy_storage_bin" /usr/bin/sy-storage
 sudo install -m 0755 "$sy_identity_bin" /usr/bin/sy-identity
@@ -133,6 +143,7 @@ echo "Updating core source repo in $STATE_DIR/dist/core/bin..."
 sudo install -m 0755 "$json_router_bin" "$STATE_DIR/dist/core/bin/rt-gateway"
 sudo install -m 0755 "$sy_admin_bin" "$STATE_DIR/dist/core/bin/sy-admin"
 sudo install -m 0755 "$sy_config_bin" "$STATE_DIR/dist/core/bin/sy-config-routes"
+sudo install -m 0755 "$sy_architect_bin" "$STATE_DIR/dist/core/bin/sy-architect"
 sudo install -m 0755 "$sy_orch_bin" "$STATE_DIR/dist/core/bin/sy-orchestrator"
 sudo install -m 0755 "$sy_storage_bin" "$STATE_DIR/dist/core/bin/sy-storage"
 sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/dist/core/bin/sy-identity"
@@ -144,6 +155,8 @@ sy_admin_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-admin" | awk '{print $1}'
 sy_admin_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-admin")"
 sy_config_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-config-routes" | awk '{print $1}')"
 sy_config_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-config-routes")"
+sy_architect_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-architect" | awk '{print $1}')"
+sy_architect_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-architect")"
 sy_opa_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-opa-rules" | awk '{print $1}')"
 sy_opa_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-opa-rules")"
 sy_orch_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-orchestrator" | awk '{print $1}')"
@@ -170,6 +183,7 @@ cat >"$core_manifest_tmp" <<EOF
     "rt-gateway": {"service": "rt-gateway", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$rt_gateway_sha", "size": $rt_gateway_size},
     "sy-admin": {"service": "sy-admin", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_admin_sha", "size": $sy_admin_size},
     "sy-config-routes": {"service": "sy-config-routes", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_config_sha", "size": $sy_config_size},
+    "sy-architect": {"service": "sy-architect", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_architect_sha", "size": $sy_architect_size},
     "sy-opa-rules": {"service": "sy-opa-rules", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_opa_sha", "size": $sy_opa_size},
     "sy-identity": {"service": "sy-identity", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_identity_sha", "size": $sy_identity_size},
     "sy-orchestrator": {"service": "sy-orchestrator", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_orch_sha", "size": $sy_orch_size},
@@ -217,6 +231,7 @@ echo "Verifying installed core binaries (dist/core/bin + /usr/bin)..."
 verify_core_component "rt-gateway" "$rt_gateway_sha" "$rt_gateway_size"
 verify_core_component "sy-admin" "$sy_admin_sha" "$sy_admin_size"
 verify_core_component "sy-config-routes" "$sy_config_sha" "$sy_config_size"
+verify_core_component "sy-architect" "$sy_architect_sha" "$sy_architect_size"
 verify_core_component "sy-opa-rules" "$sy_opa_sha" "$sy_opa_size"
 verify_core_component "sy-identity" "$sy_identity_sha" "$sy_identity_size"
 verify_core_component "sy-orchestrator" "$sy_orch_sha" "$sy_orch_size"
@@ -383,6 +398,7 @@ install_unit "rt-gateway" "/usr/bin/rt-gateway"
 install_unit "sy-config-routes" "/usr/bin/sy-config-routes"
 install_unit "sy-opa-rules" "/usr/bin/sy-opa-rules"
 install_unit "sy-admin" "/usr/bin/sy-admin"
+install_unit "sy-architect" "/usr/bin/sy-architect"
 install_unit "sy-orchestrator" "/usr/bin/sy-orchestrator"
 install_unit "sy-storage" "/usr/bin/sy-storage"
 install_unit "sy-identity" "/usr/bin/sy-identity"
@@ -399,6 +415,15 @@ if [[ "$RESTART_ORCHESTRATOR_AFTER_INSTALL" == "1" ]]; then
   fi
 else
   echo "RESTART_ORCHESTRATOR_AFTER_INSTALL=0: skipping sy-orchestrator restart."
+fi
+
+if sudo systemctl list-unit-files sy-architect.service >/dev/null 2>&1; then
+  if sudo systemctl is-active --quiet sy-architect; then
+    echo "Restarting sy-architect to apply new binary..."
+    sudo systemctl restart sy-architect
+  else
+    echo "sy-architect is not active; skipping restart."
+  fi
 fi
 
 if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then

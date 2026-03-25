@@ -95,6 +95,7 @@ const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "sy-opa-rules",
     "sy-identity",
     "sy-admin",
+    "sy-architect",
     "sy-storage",
     "sy-orchestrator",
 ];
@@ -390,12 +391,13 @@ struct PersistedManagedNode {
     relaunch_on_boot: bool,
 }
 
-const MOTHERBEE_CRITICAL_SERVICES: [&str; 6] = [
+const MOTHERBEE_CRITICAL_SERVICES: [&str; 7] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
     "sy-admin",
+    "sy-architect",
     "sy-storage",
 ];
 const WORKER_CRITICAL_SERVICES: [&str; 4] = [
@@ -612,7 +614,13 @@ async fn bootstrap_local(
     }
 
     let mut services = if state.is_motherbee {
-        vec!["sy-config-routes", "sy-opa-rules", "sy-admin", "sy-storage"]
+        vec![
+            "sy-config-routes",
+            "sy-opa-rules",
+            "sy-admin",
+            "sy-architect",
+            "sy-storage",
+        ]
     } else {
         vec!["sy-config-routes", "sy-opa-rules"]
     };
@@ -789,7 +797,8 @@ async fn reconcile_persisted_custom_nodes(
                 continue;
             }
         };
-        let version = match resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version) {
+        let version = match resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version)
+        {
             Ok(value) => value,
             Err(err) => {
                 failed = failed.saturating_add(1);
@@ -853,7 +862,12 @@ async fn reconcile_persisted_custom_nodes(
         }
 
         let cmd = build_managed_node_run_command(&unit, &node.node_name, &entrypoint.script_path);
-        match execute_on_hive(state, &state.hive_id, &cmd, "reconcile_persisted_custom_nodes") {
+        match execute_on_hive(
+            state,
+            &state.hive_id,
+            &cmd,
+            "reconcile_persisted_custom_nodes",
+        ) {
             Ok(()) => {
                 started = started.saturating_add(1);
                 tracing::info!(
@@ -1075,7 +1089,13 @@ async fn shutdown_sequence(state: &OrchestratorState) {
 
     time::sleep(Duration::from_secs(10)).await;
 
-    for service in ["sy-storage", "sy-admin", "sy-config-routes", "sy-opa-rules"] {
+    for service in [
+        "sy-storage",
+        "sy-architect",
+        "sy-admin",
+        "sy-config-routes",
+        "sy-opa-rules",
+    ] {
         if let Err(err) = systemd_stop(service) {
             tracing::warn!(service = service, error = %err, "failed to stop service");
         }
@@ -1551,13 +1571,9 @@ async fn handle_system_message(
         Some("REMOVE_NODE_INSTANCE") => {
             let result = remove_node_instance_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "REMOVE_NODE_INSTANCE processed");
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "REMOVE_NODE_INSTANCE_RESPONSE",
-                result,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "REMOVE_NODE_INSTANCE_RESPONSE", result)
+                    .await;
         }
         Some("NODE_CONFIG_SET") => {
             let result = set_node_config_flow(sender, state, &msg.payload).await;
@@ -1601,8 +1617,9 @@ async fn handle_system_message(
         }
         Some("REMOVE_RUNTIME_VERSION") => {
             let result = remove_runtime_version_flow(state, &msg.payload).await;
-            let _ = send_system_action_response(sender, msg, "REMOVE_RUNTIME_VERSION_RESPONSE", result)
-                .await;
+            let _ =
+                send_system_action_response(sender, msg, "REMOVE_RUNTIME_VERSION_RESPONSE", result)
+                    .await;
         }
         Some("INVENTORY_REQUEST") => {
             let result = inventory_flow(state, &msg.payload);
@@ -4238,7 +4255,8 @@ fn managed_node_inventory_with_root(
                 if let Ok(config_payload) = load_node_effective_config(&config_path) {
                     config_valid = true;
                     config_version = Some(config_version_from_value(&config_payload));
-                    if let Some(system) = config_payload.get("_system").and_then(|v| v.as_object()) {
+                    if let Some(system) = config_payload.get("_system").and_then(|v| v.as_object())
+                    {
                         runtime_name = system
                             .get("runtime")
                             .and_then(|v| v.as_str())
@@ -4322,18 +4340,28 @@ fn managed_node_inventory_with_root(
     }
 
     nodes.sort_by(|a, b| {
-        let a_name = a.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
-        let b_name = b.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
+        let a_name = a
+            .get("node_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let b_name = b
+            .get("node_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         a_name.cmp(b_name)
     });
     Ok(nodes)
 }
 
-fn managed_node_inventory(state: &OrchestratorState) -> Result<Vec<serde_json::Value>, OrchestratorError> {
+fn managed_node_inventory(
+    state: &OrchestratorState,
+) -> Result<Vec<serde_json::Value>, OrchestratorError> {
     managed_node_inventory_with_root(state, &node_files_root())
 }
 
-fn persisted_custom_nodes_with_root(root: &Path) -> Result<Vec<PersistedManagedNode>, OrchestratorError> {
+fn persisted_custom_nodes_with_root(
+    root: &Path,
+) -> Result<Vec<PersistedManagedNode>, OrchestratorError> {
     if !root.exists() {
         return Ok(Vec::new());
     }
@@ -4352,7 +4380,8 @@ fn persisted_custom_nodes_with_root(root: &Path) -> Result<Vec<PersistedManagedN
 
             let node_name = node_entry.file_name().to_string_lossy().to_string();
             let kind = node_kind_from_name(&node_name);
-            if matches!(kind.as_str(), "UNKNOWN") || !managed_reconcile_candidate_allowed(&node_name)
+            if matches!(kind.as_str(), "UNKNOWN")
+                || !managed_reconcile_candidate_allowed(&node_name)
             {
                 continue;
             }
@@ -4407,11 +4436,16 @@ fn persisted_custom_nodes_with_root(root: &Path) -> Result<Vec<PersistedManagedN
     Ok(nodes)
 }
 
-fn persisted_custom_nodes(_state: &OrchestratorState) -> Result<Vec<PersistedManagedNode>, OrchestratorError> {
+fn persisted_custom_nodes(
+    _state: &OrchestratorState,
+) -> Result<Vec<PersistedManagedNode>, OrchestratorError> {
     persisted_custom_nodes_with_root(&node_files_root())
 }
 
-async fn list_nodes_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+async fn list_nodes_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
     let target_hive = target_hive_from_payload(payload, &state.hive_id);
     if target_hive == state.hive_id {
         return match managed_node_inventory(state) {
@@ -4856,12 +4890,12 @@ async fn local_runtime_snapshot(
             };
             let usage =
                 local_runtime_usage_summary(state, runtime, version_filter).unwrap_or_else(|err| {
-                serde_json::json!({
-                    "scope": "hive_local_visible",
-                    "status": "error",
-                    "message": err.to_string(),
-                })
-            });
+                    serde_json::json!({
+                        "scope": "hive_local_visible",
+                        "status": "error",
+                        "message": err.to_string(),
+                    })
+                });
             let usage_global =
                 global_visible_runtime_usage_summary(state, runtime, version_filter).await;
             serde_json::json!({
@@ -4983,8 +5017,14 @@ fn local_runtime_usage_summary(
     }
 
     running_nodes.sort_by(|a, b| {
-        let a_name = a.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
-        let b_name = b.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
+        let a_name = a
+            .get("node_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let b_name = b
+            .get("node_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         a_name.cmp(b_name)
     });
 
@@ -5080,8 +5120,14 @@ async fn global_visible_runtime_usage_summary(
     running_nodes.sort_by(|a, b| {
         let a_hive = a.get("hive").and_then(|value| value.as_str()).unwrap_or("");
         let b_hive = b.get("hive").and_then(|value| value.as_str()).unwrap_or("");
-        let a_name = a.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
-        let b_name = b.get("node_name").and_then(|value| value.as_str()).unwrap_or("");
+        let a_name = a
+            .get("node_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let b_name = b
+            .get("node_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         (a_hive, a_name).cmp(&(b_hive, b_name))
     });
 
@@ -5124,8 +5170,14 @@ fn runtime_dependents_summary(
         }));
     }
     dependents.sort_by(|a, b| {
-        let a_runtime = a.get("runtime").and_then(|value| value.as_str()).unwrap_or("");
-        let b_runtime = b.get("runtime").and_then(|value| value.as_str()).unwrap_or("");
+        let a_runtime = a
+            .get("runtime")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let b_runtime = b
+            .get("runtime")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         a_runtime.cmp(b_runtime)
     });
     Ok(dependents)
@@ -5171,7 +5223,9 @@ fn remove_runtime_version_from_manifest(
         .into());
     }
 
-    entry.available.retain(|value| value.trim() != runtime_version);
+    entry
+        .available
+        .retain(|value| value.trim() != runtime_version);
     if entry.available.is_empty() && current.is_empty() {
         runtime_entries.remove(runtime);
     } else {
@@ -5187,8 +5241,12 @@ fn remove_runtime_version_from_manifest(
     }
 
     let now_ms_i64 = Utc::now().timestamp_millis();
-    let now_ms = u64::try_from(now_ms_i64)
-        .map_err(|_| format!("runtime manifest remove failed: invalid clock value {}", now_ms_i64))?;
+    let now_ms = u64::try_from(now_ms_i64).map_err(|_| {
+        format!(
+            "runtime manifest remove failed: invalid clock value {}",
+            now_ms_i64
+        )
+    })?;
     updated.version = next_runtime_manifest_version_ms(now_ms, updated.version);
     updated.updated_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
     updated.hash = None;
@@ -5393,7 +5451,8 @@ async fn remove_runtime_version_flow(
         });
     }
 
-    let usage_global = global_visible_runtime_usage_summary(state, runtime, Some(runtime_version)).await;
+    let usage_global =
+        global_visible_runtime_usage_summary(state, runtime, Some(runtime_version)).await;
     if usage_global
         .get("status")
         .and_then(|value| value.as_str())
@@ -5451,30 +5510,31 @@ async fn remove_runtime_version_flow(
         });
     }
 
-    let updated_manifest = match remove_runtime_version_from_manifest(&manifest, runtime, runtime_version) {
-        Ok(value) => value,
-        Err(err) if err.to_string() == "RUNTIME_CURRENT_CONFLICT" => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "RUNTIME_CURRENT_CONFLICT",
-                "message": format!(
-                    "cannot delete current version '{}' for runtime '{}'",
-                    runtime_version, runtime
-                ),
-                "runtime": runtime,
-                "runtime_version": runtime_version,
-            });
-        }
-        Err(err) => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "RUNTIME_REMOVE_FAILED",
-                "message": err.to_string(),
-                "runtime": runtime,
-                "runtime_version": runtime_version,
-            });
-        }
-    };
+    let updated_manifest =
+        match remove_runtime_version_from_manifest(&manifest, runtime, runtime_version) {
+            Ok(value) => value,
+            Err(err) if err.to_string() == "RUNTIME_CURRENT_CONFLICT" => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "RUNTIME_CURRENT_CONFLICT",
+                    "message": format!(
+                        "cannot delete current version '{}' for runtime '{}'",
+                        runtime_version, runtime
+                    ),
+                    "runtime": runtime,
+                    "runtime_version": runtime_version,
+                });
+            }
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "RUNTIME_REMOVE_FAILED",
+                    "message": err.to_string(),
+                    "runtime": runtime,
+                    "runtime_version": runtime_version,
+                });
+            }
+        };
 
     let quarantined = match quarantine_runtime_version_dir(runtime, runtime_version) {
         Ok(value) => value,
@@ -6234,12 +6294,14 @@ fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
 }
 
 fn remove_hive_cleanup_script() -> &'static str {
-    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-orchestrator sy-admin sy-storage fluxbee-syncthing; do \
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-orchestrator sy-admin sy-architect sy-storage fluxbee-syncthing; do \
 systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
 systemctl disable \"$s\" >/dev/null 2>&1 || true; \
 systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
 systemctl reset-failed \"$s\" >/dev/null 2>&1 || true; \
-done"
+done; \
+rm -rf /var/lib/fluxbee/nodes/* >/dev/null 2>&1 || true; \
+rm -rf /var/lib/fluxbee/state/nodes/* >/dev/null 2>&1 || true"
 }
 
 fn remove_hive_cleanup_local_flow() -> serde_json::Value {
@@ -6522,6 +6584,78 @@ fn runtime_keep_versions(
     Ok(keep_map)
 }
 
+fn persisted_runtime_keep_versions_with_root(
+    nodes_root: &Path,
+) -> Result<HashMap<String, HashSet<String>>, OrchestratorError> {
+    if !nodes_root.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let mut keep_map: HashMap<String, HashSet<String>> = HashMap::new();
+    for kind_entry in fs::read_dir(nodes_root)? {
+        let kind_entry = kind_entry?;
+        if !kind_entry.file_type()?.is_dir() {
+            continue;
+        }
+        for node_entry in fs::read_dir(kind_entry.path())? {
+            let node_entry = node_entry?;
+            if !node_entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            let config_path = node_entry.path().join("config.json");
+            if !config_path.is_file() {
+                continue;
+            }
+            let config = match load_node_effective_config(&config_path) {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %config_path.display(),
+                        error = %err,
+                        "runtime retention skipping unreadable persisted node config"
+                    );
+                    continue;
+                }
+            };
+            let Some(system) = config.get("_system").and_then(|value| value.as_object()) else {
+                continue;
+            };
+            let Some(runtime) = system
+                .get("runtime")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let Some(runtime_version) = system
+                .get("runtime_version")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if !valid_token(runtime) || !valid_token(runtime_version) {
+                tracing::warn!(
+                    path = %config_path.display(),
+                    runtime = runtime,
+                    runtime_version = runtime_version,
+                    "runtime retention skipping persisted node with invalid runtime tokens"
+                );
+                continue;
+            }
+            keep_map
+                .entry(runtime.to_string())
+                .or_default()
+                .insert(runtime_version.to_string());
+        }
+    }
+
+    Ok(keep_map)
+}
+
 fn verify_runtime_current_artifacts(
     manifest: &RuntimeManifest,
 ) -> Result<Vec<String>, OrchestratorError> {
@@ -6660,11 +6794,16 @@ fn verify_runtime_current_artifacts_with_root(
     Ok(errors)
 }
 
-fn apply_runtime_retention(
+fn apply_runtime_retention_with_roots(
     manifest: &RuntimeManifest,
+    runtimes_root: &Path,
+    nodes_root: &Path,
 ) -> Result<RuntimeRetentionStats, OrchestratorError> {
-    let keep_map = runtime_keep_versions(manifest)?;
-    let root = runtimes_root();
+    let mut keep_map = runtime_keep_versions(manifest)?;
+    for (runtime, versions) in persisted_runtime_keep_versions_with_root(nodes_root)? {
+        keep_map.entry(runtime).or_default().extend(versions);
+    }
+    let root = runtimes_root.to_path_buf();
     if !root.exists() {
         return Ok(RuntimeRetentionStats::default());
     }
@@ -6712,6 +6851,12 @@ fn apply_runtime_retention(
         }
     }
     Ok(stats)
+}
+
+fn apply_runtime_retention(
+    manifest: &RuntimeManifest,
+) -> Result<RuntimeRetentionStats, OrchestratorError> {
+    apply_runtime_retention_with_roots(manifest, &runtimes_root(), &node_files_root())
 }
 
 fn runtimes_root() -> PathBuf {
@@ -7032,6 +7177,33 @@ fn normalize_node_name_for_target(
     Ok(format!("{raw}@{target_hive}"))
 }
 
+fn validate_existing_node_name_literal(raw_node_name: &str) -> Result<String, OrchestratorError> {
+    let raw = raw_node_name.trim();
+    if raw.is_empty() {
+        return Err("missing node_name".into());
+    }
+
+    if let Some((local, hive)) = raw.rsplit_once('@') {
+        let local = local.trim();
+        let hive = hive.trim();
+        if local.is_empty() || hive.is_empty() {
+            return Err("invalid node_name".into());
+        }
+        if !valid_node_local_name(local) {
+            return Err("invalid node_name".into());
+        }
+        if !valid_hive_id(hive) {
+            return Err("invalid node_name hive".into());
+        }
+        return Ok(format!("{local}@{hive}"));
+    }
+
+    if !valid_node_local_name(raw) {
+        return Err("invalid node_name".into());
+    }
+    Ok(raw.to_string())
+}
+
 fn node_runtime_from_name(node_name: &str) -> Option<String> {
     let local = node_name.split('@').next().unwrap_or(node_name);
     let mut parts = local.split('.');
@@ -7059,16 +7231,19 @@ fn node_files_root() -> PathBuf {
 }
 
 fn node_instance_dir(node_name: &str) -> Result<PathBuf, OrchestratorError> {
-    let (local, hive) = node_name
+    let local = node_name
         .rsplit_once('@')
-        .ok_or_else(|| format!("invalid node_name '{}': expected <name>@<hive>", node_name))?;
-    let local = local.trim();
-    let hive = hive.trim();
+        .map(|(local, _)| local)
+        .unwrap_or(node_name)
+        .trim();
     if !valid_node_local_name(local) {
         return Err(format!("invalid node_name local part '{}'", local).into());
     }
-    if !valid_hive_id(hive) {
-        return Err(format!("invalid node_name hive part '{}'", hive).into());
+    if let Some((_, hive)) = node_name.rsplit_once('@') {
+        let hive = hive.trim();
+        if !valid_hive_id(hive) {
+            return Err(format!("invalid node_name hive part '{}'", hive).into());
+        }
     }
     let node_kind = local
         .split('.')
@@ -8525,7 +8700,7 @@ async fn get_node_config_flow(
             target_hive = hive.trim().to_string();
         }
     }
-    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
+    let node_name = match validate_existing_node_name_literal(raw_node_name) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -8628,7 +8803,7 @@ async fn get_node_state_flow(
             target_hive = hive.trim().to_string();
         }
     }
-    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
+    let node_name = match validate_existing_node_name_literal(raw_node_name) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -8916,7 +9091,7 @@ async fn get_node_status_flow(
             target_hive = hive.trim().to_string();
         }
     }
-    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
+    let node_name = match validate_existing_node_name_literal(raw_node_name) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -9283,7 +9458,7 @@ async fn set_node_config_flow(
             target_hive = hive.trim().to_string();
         }
     }
-    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
+    let node_name = match validate_existing_node_name_literal(raw_node_name) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -9893,10 +10068,10 @@ async fn kill_node_flow(
         }
     }
 
-    let normalized_node_name = if node_name.is_empty() {
+    let validated_node_name = if node_name.is_empty() {
         None
     } else {
-        match normalize_node_name_for_target(&node_name, &target_hive) {
+        match validate_existing_node_name_literal(&node_name) {
             Ok(value) => Some(value),
             Err(err) => {
                 return serde_json::json!({
@@ -9914,7 +10089,7 @@ async fn kill_node_flow(
         .map(|v| sanitize_unit_suffix(v.trim()))
         .filter(|v| !v.is_empty())
         .or_else(|| {
-            normalized_node_name
+            validated_node_name
                 .as_ref()
                 .map(|name| unit_from_node_name(name))
         });
@@ -9956,7 +10131,7 @@ async fn kill_node_flow(
             obj.insert("unit".to_string(), serde_json::json!(unit));
             obj.insert("signal".to_string(), serde_json::json!(signal));
             obj.insert("force".to_string(), serde_json::json!(force));
-            if let Some(name) = normalized_node_name.as_ref() {
+            if let Some(name) = validated_node_name.as_ref() {
                 obj.insert("node_name".to_string(), serde_json::json!(name));
             }
         }
@@ -9975,7 +10150,7 @@ async fn kill_node_flow(
                 "error_code": "KILL_FAILED",
                 "message": err.to_string(),
                 "target": target_hive,
-                "node_name": normalized_node_name,
+                "node_name": validated_node_name,
                 "unit": unit,
             }),
         };
@@ -9984,11 +10159,11 @@ async fn kill_node_flow(
     match systemd_unit_is_active(&unit) {
         Ok(false) => {
             return serde_json::json!({
-                "status": "ok",
+                "status": "not_found",
                 "state": "not_found",
                 "hive": target_hive,
                 "target": target_hive,
-                "node_name": normalized_node_name,
+                "node_name": validated_node_name,
                 "unit": unit,
                 "signal": signal,
                 "force": force,
@@ -10001,7 +10176,7 @@ async fn kill_node_flow(
                 "error_code": "SERVICE_FAILED",
                 "message": format!("unable to check unit activity: {err}"),
                 "target": target_hive,
-                "node_name": normalized_node_name,
+                "node_name": validated_node_name,
                 "unit": unit,
             });
         }
@@ -10012,7 +10187,7 @@ async fn kill_node_flow(
             "status": "ok",
             "hive": target_hive,
             "target": target_hive,
-            "node_name": normalized_node_name,
+            "node_name": validated_node_name,
             "unit": unit,
             "signal": signal,
             "force": force,
@@ -10022,7 +10197,7 @@ async fn kill_node_flow(
             "error_code": "KILL_FAILED",
             "message": err.to_string(),
             "target": target_hive,
-            "node_name": normalized_node_name,
+            "node_name": validated_node_name,
             "unit": unit,
         }),
     }
@@ -10090,7 +10265,7 @@ async fn remove_node_instance_flow(
         }
     }
 
-    let node_name = match normalize_node_name_for_target(&node_name, &target_hive) {
+    let node_name = match validate_existing_node_name_literal(&node_name) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -10139,8 +10314,8 @@ async fn remove_node_instance_flow(
     };
     if !instance_dir.exists() {
         return serde_json::json!({
-            "status": "error",
-            "error_code": "NODE_NOT_FOUND",
+            "status": "not_found",
+            "error_code": serde_json::Value::Null,
             "message": format!("node '{}' not found", node_name),
             "target": target_hive,
             "node_name": node_name,
@@ -10162,7 +10337,8 @@ async fn remove_node_instance_flow(
         });
     }
 
-    let cleanup_cmd = format!("systemctl stop {unit} || true; systemctl reset-failed {unit} || true");
+    let cleanup_cmd =
+        format!("systemctl stop {unit} || true; systemctl reset-failed {unit} || true");
     if let Err(err) = execute_on_hive(state, &target_hive, &cleanup_cmd, "remove_node_instance") {
         return serde_json::json!({
             "status": "error",
@@ -10185,19 +10361,25 @@ async fn remove_node_instance_flow(
             "removed_kind_dir": removed_kind_dir,
         }),
         Err(err) => {
-            let error_code = if err.to_string() == "NODE_NOT_FOUND" {
-                "NODE_NOT_FOUND"
+            if err.to_string() == "NODE_NOT_FOUND" {
+                serde_json::json!({
+                    "status": "not_found",
+                    "error_code": serde_json::Value::Null,
+                    "message": format!("node '{}' not found", node_name),
+                    "target": target_hive,
+                    "node_name": node_name,
+                    "unit": unit,
+                })
             } else {
-                "NODE_INSTANCE_REMOVE_FAILED"
-            };
-            serde_json::json!({
-                "status": "error",
-                "error_code": error_code,
-                "message": err.to_string(),
-                "target": target_hive,
-                "node_name": node_name,
-                "unit": unit,
-            })
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "NODE_INSTANCE_REMOVE_FAILED",
+                    "message": err.to_string(),
+                    "target": target_hive,
+                    "node_name": node_name,
+                    "unit": unit,
+                })
+            }
         }
     }
 }
@@ -13351,6 +13533,13 @@ mod tests {
     }
 
     #[test]
+    fn remove_hive_cleanup_script_cleans_persisted_node_dirs() {
+        let script = remove_hive_cleanup_script();
+        assert!(script.contains("/var/lib/fluxbee/nodes/*"));
+        assert!(script.contains("/var/lib/fluxbee/state/nodes/*"));
+    }
+
+    #[test]
     fn resolve_syncthing_service_user_accepts_existing_user() {
         let mut blob = sample_blob_config();
         blob.sync_service_user = "root".to_string();
@@ -13588,8 +13777,8 @@ blob:
             hash: None,
         };
 
-        let updated =
-            remove_runtime_version_from_manifest(&manifest, "ai.test.gov", "0.9.0").expect("remove");
+        let updated = remove_runtime_version_from_manifest(&manifest, "ai.test.gov", "0.9.0")
+            .expect("remove");
         let entry = updated
             .runtimes
             .get("ai.test.gov")
@@ -13618,6 +13807,59 @@ blob:
         let err = remove_runtime_version_from_manifest(&manifest, "ai.test.gov", "1.0.0")
             .expect_err("current delete must fail");
         assert_eq!(err.to_string(), "RUNTIME_CURRENT_CONFLICT");
+    }
+
+    #[test]
+    fn apply_runtime_retention_preserves_runtime_referenced_by_persisted_instance() {
+        let root = std::env::temp_dir().join(format!("fluxbee-retention-test-{}", Uuid::new_v4()));
+        let runtimes_root = root.join("dist").join("runtimes");
+        let nodes_root = root.join("nodes");
+
+        let kept_runtime_dir = runtimes_root.join("AI.chat.test").join("1.0.0");
+        fs::create_dir_all(&kept_runtime_dir).expect("create kept runtime dir");
+        fs::write(kept_runtime_dir.join("marker"), "keep").expect("write kept marker");
+
+        let pruned_runtime_dir = runtimes_root.join("AI.prune.test").join("1.0.0");
+        fs::create_dir_all(&pruned_runtime_dir).expect("create pruned runtime dir");
+        fs::write(pruned_runtime_dir.join("marker"), "prune").expect("write pruned marker");
+
+        let node_dir = nodes_root.join("AI").join("AI.chat@motherbee");
+        fs::create_dir_all(&node_dir).expect("create node dir");
+        fs::write(
+            node_dir.join("config.json"),
+            serde_json::json!({
+                "_system": {
+                    "runtime": "AI.chat.test",
+                    "runtime_version": "1.0.0",
+                    "relaunch_on_boot": true
+                }
+            })
+            .to_string(),
+        )
+        .expect("write config");
+
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-03-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+
+        let stats = apply_runtime_retention_with_roots(&manifest, &runtimes_root, &nodes_root)
+            .expect("retention should succeed");
+
+        assert!(
+            kept_runtime_dir.exists(),
+            "persisted runtime should be kept"
+        );
+        assert!(
+            !pruned_runtime_dir.exists(),
+            "unreferenced runtime should be pruned"
+        );
+        assert_eq!(stats.removed_runtime_dirs, 1);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -13650,7 +13892,10 @@ blob:
 
         let dependents = runtime_dependents_summary(&manifest, "ai.base").expect("dependents");
         assert_eq!(dependents.len(), 2);
-        assert_eq!(dependents[0]["runtime"], serde_json::json!("ai.child.config"));
+        assert_eq!(
+            dependents[0]["runtime"],
+            serde_json::json!("ai.child.config")
+        );
         assert_eq!(dependents[1]["runtime"], serde_json::json!("wf.child.flow"));
     }
 
@@ -13876,8 +14121,14 @@ blob:
             managed_spawn_disallowed_reason("RT.gateway@motherbee"),
             Some("managed spawn does not support RT.gateway; it is core hive infrastructure")
         );
-        assert_eq!(managed_spawn_disallowed_reason("RT.edge.buffer@motherbee"), None);
-        assert_eq!(managed_spawn_disallowed_reason("AI.frontdesk.gov@motherbee"), None);
+        assert_eq!(
+            managed_spawn_disallowed_reason("RT.edge.buffer@motherbee"),
+            None
+        );
+        assert_eq!(
+            managed_spawn_disallowed_reason("AI.frontdesk.gov@motherbee"),
+            None
+        );
     }
 
     #[test]

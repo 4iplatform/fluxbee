@@ -169,6 +169,9 @@ RUNTIME_NAME="ai.my.node"
 RUNTIME_VERSION="1.0.0"
 PKG_DIR="$PWD/package"
 
+# prerequisite for current workspace builds: `protoc` in PATH
+# Debian/Ubuntu: sudo apt-get install -y protobuf-compiler
+
 # 1) build your node binary
 cargo build --release --bin ai-my-node
 
@@ -362,6 +365,65 @@ For a larger E2E checklist and error matrix, see:
 - `docs/onworking/sy_admin_e2e_curl_checklist.md`
 - `scripts/admin_add_hive_matrix.sh`
 
+### Identity inspection calls
+
+Useful when debugging registration and routing state from `SY.admin` without
+talking to `SY.identity` directly:
+
+```bash
+HIVE_ID="motherbee"
+ILK_ID="ilk:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# compact list of current ILKs on the hive
+curl -sS "$BASE/hives/$HIVE_ID/identity/ilks" | jq .
+
+# full detail for one ILK
+curl -sS "$BASE/hives/$HIVE_ID/identity/ilks/$ILK_ID" | jq .
+```
+
+`GET /hives/{hive}/identity/ilks` returns a compact row per ILK with:
+
+- `ilk_id`
+- `ilk_type`
+- `registration_status`
+- `tenant_id`
+- `tenant_name`
+- `display_name`
+- `node_name`
+- `channel_count`
+- `channels` (`ich_id`, `channel_type`, `address`)
+- `deleted_at_ms`
+
+### Debug message to one node
+
+For ad-hoc debugging, `SY.admin` can emit a direct message to a specific node by
+name and return the generated `trace_id`.
+
+```bash
+HIVE_ID="motherbee"
+NODE_NAME="AI.frontdesk.gov@motherbee"
+
+curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/messages" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "msg_type": "user",
+    "msg": "LLM",
+    "payload": {
+      "text": "hola desde admin"
+    }
+  }' | jq .
+```
+
+Optional fields:
+
+- `src_ilk`
+- `scope`
+- `meta_target`
+- `meta_action`
+- `priority`
+- `context`
+- `ttl`
+
 ### Endpoint Reference (SY.admin)
 
 Current HTTP surface exposed by `SY.admin`:
@@ -420,6 +482,9 @@ Hive-scoped endpoints:
 | `GET` | `/hives/{hive}/nodes/{name}/config` | Read node effective config |
 | `PUT` | `/hives/{hive}/nodes/{name}/config` | Update node effective config |
 | `GET` | `/hives/{hive}/nodes/{name}/state` | Read node runtime state payload |
+| `POST` | `/hives/{hive}/nodes/{name}/messages` | Send a direct debug message to one node |
+| `GET` | `/hives/{hive}/identity/ilks` | List ILKs on hive (compact identity view) |
+| `GET` | `/hives/{hive}/identity/ilks/{ilk_id}` | Read one ILK with resolved tenant/alias detail |
 | `POST` | `/hives/{hive}/update` | Send `SYSTEM_UPDATE` to hive orchestrator |
 | `POST` | `/hives/{hive}/sync-hint` | Send `SYSTEM_SYNC_HINT` (`blob`/`dist`) to hive orchestrator |
 | `GET` | `/hives/{hive}/versions` | Effective versions for hive |
@@ -666,7 +731,13 @@ This README explains the system and concepts. For how to run, build, and develop
 ### Node Development Template (Rust)
 
 If you want to build a node in another repo, use `fluxbee_sdk`
-(`json-router/crates/fluxbee_sdk`) as the canonical SDK.
+(`json-router/crates/fluxbee_sdk`) as the canonical base SDK.
+
+For AI-specific runtimes, `json-router/crates/fluxbee_ai_sdk` is available as a separate higher-level SDK on top of `fluxbee_sdk`. It is intended for `SY.architect` and future `AI.*` nodes, not as a replacement for the transport/protocol SDK.
+
+SDK entry points:
+- [AI SDK README](./crates/fluxbee_ai_sdk/README.md) - Immediate memory, function calling, summary refresh, and AI runtime guidance.
+- [AI immediate memory spec](./docs/immediate-conversation-memory-spec.md) - Contract and design scope for short-horizon conversation context.
 
 For domain nodes that live in this repo (for example `.gov`), see:
 - `nodes/gov/README.md`
@@ -755,7 +826,7 @@ Key documents:
 
 ### SDK Tools (Current)
 
-`fluxbee_sdk` is the canonical toolset for node development. Current toolbox:
+`fluxbee_sdk` is the canonical base toolset for node development. `fluxbee_ai_sdk` is a separate AI-oriented crate layered on top of it for architect/AI runtimes. Current base toolbox:
 
 | Tool | Path | Purpose |
 |---|---|---|

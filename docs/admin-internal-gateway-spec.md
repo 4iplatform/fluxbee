@@ -1,4 +1,8 @@
-# SY.admin Internal Command Gateway (Unified Spec)
+
+
+
+
+||AQ# SY.admin Internal Command Gateway (Unified Spec)
 
 **Status:** v1.2-draft  
 **Date:** 2026-03-14  
@@ -220,6 +224,7 @@ Implementación actual:
 | `GET /hives/{id}/nodes/{name}/config` | `get_node_config` | `handle_admin_command` |
 | `PUT /hives/{id}/nodes/{name}/config` | `set_node_config` | `handle_admin_command` |
 | `GET /hives/{id}/nodes/{name}/state` | `get_node_state` | `handle_admin_command` |
+| `POST /hives/{id}/nodes/{name}/messages` | `send_node_message` | `handle_admin_command` (direct debug emit via router) |
 | `GET /hives/{id}/identity/ilks` | `list_ilks` | `handle_admin_query` -> `SY.identity` (`ILK_LIST`) |
 | `GET /hives/{id}/identity/ilks/{ilk_id}` | `get_ilk` | `handle_admin_command` -> `SY.identity` (`ILK_GET`) |
 

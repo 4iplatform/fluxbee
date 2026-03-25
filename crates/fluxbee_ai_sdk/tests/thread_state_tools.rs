@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fluxbee_ai_sdk::{
-    FunctionTool, FunctionToolProvider, LanceDbThreadStateStore, ThreadStateDeleteTool, ThreadStateGetTool,
-    ThreadStatePutTool, ThreadStateStore, ThreadStateToolsProvider,
+    FunctionTool, FunctionToolProvider, LanceDbThreadStateStore, ThreadStateDeleteTool,
+    ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore, ThreadStateToolsProvider,
 };
 use serde_json::json;
 
@@ -55,13 +55,12 @@ async fn thread_state_get_returns_record_when_present() {
     assert_eq!(out.get("found").and_then(|v| v.as_bool()), Some(true));
     assert_eq!(out.get("thread_id").and_then(|v| v.as_str()), Some("thr-1"));
     assert_eq!(
-        out.get("data").and_then(|v| v.get("status")).and_then(|v| v.as_str()),
+        out.get("data")
+            .and_then(|v| v.get("status"))
+            .and_then(|v| v.as_str()),
         Some("open")
     );
-    assert_eq!(
-        out.get("ttl_seconds").and_then(|v| v.as_u64()),
-        Some(3600)
-    );
+    assert_eq!(out.get("ttl_seconds").and_then(|v| v.as_u64()), Some(3600));
 
     let _ = tokio::fs::remove_dir_all(root).await;
 }
@@ -96,10 +95,7 @@ async fn thread_state_put_writes_record_visible_to_store_get() {
         .expect("store get")
         .expect("record should exist");
     assert_eq!(
-        record
-            .data
-            .get("status")
-            .and_then(|v| v.as_str()),
+        record.data.get("status").and_then(|v| v.as_str()),
         Some("waiting_information")
     );
     assert_eq!(record.ttl_seconds, Some(120));
@@ -131,7 +127,10 @@ async fn thread_state_put_overwrites_existing_record() {
         .await
         .expect("store get")
         .expect("record should exist");
-    assert_eq!(record.data.get("status").and_then(|v| v.as_str()), Some("new"));
+    assert_eq!(
+        record.data.get("status").and_then(|v| v.as_str()),
+        Some("new")
+    );
     assert_eq!(record.data.get("counter").and_then(|v| v.as_i64()), Some(2));
     assert_eq!(record.ttl_seconds, None);
 
@@ -155,8 +154,14 @@ async fn thread_state_delete_removes_existing_record() {
         .expect("delete should succeed");
 
     assert_eq!(out.get("ok").and_then(|v| v.as_bool()), Some(true));
-    assert_eq!(out.get("thread_id").and_then(|v| v.as_str()), Some("thr-del-1"));
-    let after = store.get("thr-del-1").await.expect("store get after delete");
+    assert_eq!(
+        out.get("thread_id").and_then(|v| v.as_str()),
+        Some("thr-del-1")
+    );
+    let after = store
+        .get("thr-del-1")
+        .await
+        .expect("store get after delete");
     assert!(after.is_none());
 
     let _ = tokio::fs::remove_dir_all(root).await;
@@ -190,8 +195,7 @@ async fn scoped_provider_overrides_model_supplied_thread_id() {
     store.ensure_ready().await.expect("store ready");
     let store_arc: Arc<dyn ThreadStateStore> = Arc::new(store.clone());
 
-    let provider =
-        ThreadStateToolsProvider::with_get_put_delete_scoped(store_arc, "sim-thread-1");
+    let provider = ThreadStateToolsProvider::with_get_put_delete_scoped(store_arc, "sim-thread-1");
     let mut registry = fluxbee_ai_sdk::FunctionToolRegistry::new();
     provider
         .register_tools(&mut registry)
@@ -208,10 +212,7 @@ async fn scoped_provider_overrides_model_supplied_thread_id() {
         .await
         .expect("put call should succeed");
 
-    let scoped = store
-        .get("sim-thread-1")
-        .await
-        .expect("get scoped record");
+    let scoped = store.get("sim-thread-1").await.expect("get scoped record");
     assert!(scoped.is_some());
     let leaked = store
         .get("identity_thread")
@@ -228,7 +229,11 @@ async fn scoped_provider_migrates_legacy_key_on_get() {
     let store = LanceDbThreadStateStore::new(root.clone());
     store.ensure_ready().await.expect("store ready");
     store
-        .put("legacy-thread-1", json!({"email":"noe@gmail.com"}), Some(180))
+        .put(
+            "legacy-thread-1",
+            json!({"email":"noe@gmail.com"}),
+            Some(180),
+        )
         .await
         .expect("seed legacy record");
     let store_arc: Arc<dyn ThreadStateStore> = Arc::new(store.clone());

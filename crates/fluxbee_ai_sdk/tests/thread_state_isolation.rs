@@ -43,14 +43,8 @@ async fn same_thread_id_is_isolated_across_node_stores() {
         .expect("get b")
         .expect("record b");
 
-    assert_eq!(
-        a.data.get("owner").and_then(|v| v.as_str()),
-        Some("node-a")
-    );
-    assert_eq!(
-        b.data.get("owner").and_then(|v| v.as_str()),
-        Some("node-b")
-    );
+    assert_eq!(a.data.get("owner").and_then(|v| v.as_str()), Some("node-a"));
+    assert_eq!(b.data.get("owner").and_then(|v| v.as_str()), Some("node-b"));
 
     let _ = tokio::fs::remove_dir_all(state_dir).await;
 }

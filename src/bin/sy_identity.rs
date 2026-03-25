@@ -324,7 +324,11 @@ struct IdentityDeltaEnvelope {
 }
 
 impl IdentityStore {
-    fn find_tenant_by_hint(&self, name: &str, domain: Option<&str>) -> Option<(TenantRecord, &'static str)> {
+    fn find_tenant_by_hint(
+        &self,
+        name: &str,
+        domain: Option<&str>,
+    ) -> Option<(TenantRecord, &'static str)> {
         let normalized_domain = normalize_tenant_domain(domain);
         if let Some(expected_domain) = normalized_domain.as_deref() {
             let mut tenant_ids: Vec<&String> = self.tenants.keys().collect();
@@ -333,7 +337,8 @@ impl IdentityStore {
                 let Some(tenant) = self.tenants.get(tenant_id) else {
                     continue;
                 };
-                if normalize_tenant_domain(tenant.domain.as_deref()).as_deref() == Some(expected_domain)
+                if normalize_tenant_domain(tenant.domain.as_deref()).as_deref()
+                    == Some(expected_domain)
                 {
                     return Some((tenant.clone(), "domain"));
                 }
@@ -413,8 +418,8 @@ impl IdentityStore {
             .filter_map(|ilk_id| {
                 let ilk = self.ilks.get(ilk_id)?;
                 let tenant = self.tenants.get(&ilk.tenant_id);
-                let display_name = identification_str(&ilk.identification, "display_name")
-                    .map(str::to_string);
+                let display_name =
+                    identification_str(&ilk.identification, "display_name").map(str::to_string);
                 let node_name =
                     identification_str(&ilk.identification, "node_name").map(str::to_string);
                 Some(json!({
@@ -2288,7 +2293,9 @@ fn ilk_entry_from_record(ilk: &IlkRecord) -> Result<IlkEntry, IdentityError> {
     Ok(entry)
 }
 
-fn ich_entries_from_ilk_record(ilk: &IlkRecord) -> Result<Vec<(IchEntry, String, String)>, IdentityError> {
+fn ich_entries_from_ilk_record(
+    ilk: &IlkRecord,
+) -> Result<Vec<(IchEntry, String, String)>, IdentityError> {
     let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
     let now_ms = now_epoch_ms();
     let mut entries = Vec::with_capacity(ilk.channels.len());
@@ -2342,7 +2349,8 @@ fn apply_identity_shm_delta(
             writer.upsert_ilk_entry(ilk_entry_from_record(ilk)?)?;
             writer.clear_ich_mappings_for_ilk(*ilk_uuid.as_bytes())?;
             let ich_entries = ich_entries_from_ilk_record(ilk)?;
-            let entries_only: Vec<IchEntry> = ich_entries.iter().map(|(entry, _, _)| *entry).collect();
+            let entries_only: Vec<IchEntry> =
+                ich_entries.iter().map(|(entry, _, _)| *entry).collect();
             writer.replace_ich_entries_for_ilk(*ilk_uuid.as_bytes(), &entries_only)?;
             for (entry, channel_type, address) in ich_entries {
                 writer.upsert_ich_mapping(
@@ -2379,10 +2387,12 @@ fn apply_identity_shm_provision_fast(
     }
 
     let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
-    if writer
-        .read_snapshot()
-        .is_some_and(|snapshot| snapshot.ilks.iter().any(|entry| entry.ilk_id == *ilk_uuid.as_bytes()))
-    {
+    if writer.read_snapshot().is_some_and(|snapshot| {
+        snapshot
+            .ilks
+            .iter()
+            .any(|entry| entry.ilk_id == *ilk_uuid.as_bytes())
+    }) {
         tracing::debug!(
             ilk_id = %ilk.ilk_id,
             "identity shm fast provision skipped; ilk already present"
@@ -2978,7 +2988,8 @@ fn normalize_tenant_name(value: &str) -> String {
 }
 
 fn normalize_tenant_domain(value: Option<&str>) -> Option<String> {
-    value.map(str::trim)
+    value
+        .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase())
 }
@@ -3709,18 +3720,9 @@ mod tests {
         let hive = test_hive(Some("AI.frontdesk.gov@motherbee"));
         let runtime = IdentityRuntime::new(&hive, PathBuf::from("/tmp"), true, None);
 
-        assert!(runtime.is_authorized(
-            MSG_ILK_REGISTER,
-            Some("AI.frontdesk.gov@motherbee")
-        ));
-        assert!(runtime.is_authorized(
-            MSG_ILK_ADD_CHANNEL,
-            Some("AI.frontdesk.gov@motherbee")
-        ));
-        assert!(runtime.is_authorized(
-            MSG_TNT_CREATE,
-            Some("AI.frontdesk.gov@motherbee")
-        ));
+        assert!(runtime.is_authorized(MSG_ILK_REGISTER, Some("AI.frontdesk.gov@motherbee")));
+        assert!(runtime.is_authorized(MSG_ILK_ADD_CHANNEL, Some("AI.frontdesk.gov@motherbee")));
+        assert!(runtime.is_authorized(MSG_TNT_CREATE, Some("AI.frontdesk.gov@motherbee")));
     }
 
     #[test]
@@ -3810,7 +3812,10 @@ mod tests {
             Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
         );
         assert_eq!(by_name.get("created").and_then(Value::as_bool), Some(false));
-        assert_eq!(by_name.get("matched_by").and_then(Value::as_str), Some("name"));
+        assert_eq!(
+            by_name.get("matched_by").and_then(Value::as_str),
+            Some("name")
+        );
 
         let by_domain = store
             .create_tenant(TntCreateRequest {
@@ -3824,8 +3829,14 @@ mod tests {
             by_domain.get("tenant_id").and_then(Value::as_str),
             Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
         );
-        assert_eq!(by_domain.get("created").and_then(Value::as_bool), Some(false));
-        assert_eq!(by_domain.get("matched_by").and_then(Value::as_str), Some("domain"));
+        assert_eq!(
+            by_domain.get("created").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            by_domain.get("matched_by").and_then(Value::as_str),
+            Some("domain")
+        );
     }
 
     #[test]
@@ -3866,8 +3877,17 @@ mod tests {
             .get("ilks")
             .and_then(Value::as_array)
             .expect("ilks array");
-        assert_eq!(rows[0].get("tenant_name").and_then(Value::as_str), Some("fluxbee"));
-        assert_eq!(rows[0].get("channel_count").and_then(Value::as_u64), Some(1));
-        assert_eq!(rows[0].get("registration_status").and_then(Value::as_str), Some("temporary"));
+        assert_eq!(
+            rows[0].get("tenant_name").and_then(Value::as_str),
+            Some("fluxbee")
+        );
+        assert_eq!(
+            rows[0].get("channel_count").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            rows[0].get("registration_status").and_then(Value::as_str),
+            Some("temporary")
+        );
     }
 }

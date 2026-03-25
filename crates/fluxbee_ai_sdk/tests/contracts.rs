@@ -1,6 +1,6 @@
 use fluxbee_ai_sdk::{
-    build_reply_message, build_reply_message_runtime_src, build_reply_routing, extract_text,
-    build_text_response, Destination, Message, Meta, Routing,
+    build_reply_message, build_reply_message_runtime_src, build_reply_routing, build_text_response,
+    extract_text, Destination, Message, Meta, Routing,
 };
 use serde_json::json;
 
@@ -17,6 +17,7 @@ fn sample_message() -> Message {
             msg: Some("HELLO".to_string()),
             scope: Some("vpn".to_string()),
             target: Some("AI.echo@dev".to_string()),
+            src_ilk: None,
             action: None,
             priority: None,
             context: Some(json!({"thread_id":"thr-1"})),

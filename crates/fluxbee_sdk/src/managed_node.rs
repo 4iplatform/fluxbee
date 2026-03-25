@@ -15,11 +15,7 @@ pub enum ManagedNodeError {
 
 pub fn managed_node_name(default_name: &str, legacy_env_keys: &[&str]) -> String {
     env_non_empty(FLUXBEE_NODE_NAME_ENV)
-        .or_else(|| {
-            legacy_env_keys
-                .iter()
-                .find_map(|key| env_non_empty(key))
-        })
+        .or_else(|| legacy_env_keys.iter().find_map(|key| env_non_empty(key)))
         .unwrap_or_else(|| default_name.to_string())
 }
 

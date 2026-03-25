@@ -6,7 +6,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use crate::function_calling::{FunctionTool, FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry};
+use crate::function_calling::{
+    FunctionTool, FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
+};
 use crate::thread_state::ThreadStateStore;
 use crate::{AiSdkError, Result};
 
@@ -243,10 +245,7 @@ impl FunctionTool for ThreadStateGetTool {
                 "thread_state_get: invalid arguments (expected {{thread_id:string}}): {err}"
             ))
         })?;
-        let thread_id_owned = self
-            .scoped_thread_id
-            .clone()
-            .unwrap_or(args.thread_id);
+        let thread_id_owned = self.scoped_thread_id.clone().unwrap_or(args.thread_id);
         let thread_id = thread_id_owned.trim();
         if thread_id.is_empty() {
             return Err(AiSdkError::Protocol(
@@ -371,10 +370,7 @@ impl FunctionTool for ThreadStatePutTool {
                 "thread_state_put: invalid arguments (expected {{thread_id:string,data:any,ttl_seconds?:u64}}): {err}"
             ))
         })?;
-        let thread_id_owned = self
-            .scoped_thread_id
-            .clone()
-            .unwrap_or(args.thread_id);
+        let thread_id_owned = self.scoped_thread_id.clone().unwrap_or(args.thread_id);
         let thread_id = thread_id_owned.trim();
         if thread_id.is_empty() {
             return Err(AiSdkError::Protocol(
@@ -452,10 +448,7 @@ impl FunctionTool for ThreadStateDeleteTool {
                 "thread_state_delete: invalid arguments (expected {{thread_id:string}}): {err}"
             ))
         })?;
-        let thread_id_owned = self
-            .scoped_thread_id
-            .clone()
-            .unwrap_or(args.thread_id);
+        let thread_id_owned = self.scoped_thread_id.clone().unwrap_or(args.thread_id);
         let thread_id = thread_id_owned.trim();
         if thread_id.is_empty() {
             return Err(AiSdkError::Protocol(

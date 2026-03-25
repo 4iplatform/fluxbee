@@ -34,6 +34,7 @@ pub struct OpaResolver {
     opa_load_status: u8,
     logged_missing: bool,
     entrypoint: Option<String>,
+    base_data_bundle: Option<Value>,
     engine: Engine,
     module: Option<Module>,
     wasm: Option<OpaWasm>,
@@ -87,6 +88,7 @@ impl OpaResolver {
             opa_load_status: OPA_STATUS_ERROR,
             logged_missing: false,
             entrypoint: None,
+            base_data_bundle: None,
             engine: Engine::default(),
             module: None,
             wasm: None,
@@ -94,10 +96,14 @@ impl OpaResolver {
     }
 
     pub fn resolve_target(&mut self, msg: &Message) -> Result<Option<String>, OpaError> {
-        let target = msg.meta.target.as_deref();
-        if target.is_none() {
-            return Ok(None);
-        }
+        self.resolve_target_with_data(msg, None)
+    }
+
+    pub fn resolve_target_with_data(
+        &mut self,
+        msg: &Message,
+        dynamic_data: Option<&Value>,
+    ) -> Result<Option<String>, OpaError> {
         if !self.policy_loaded && !self.logged_missing {
             self.logged_missing = true;
             tracing::warn!("opa policy not loaded; resolver disabled");
@@ -111,7 +117,7 @@ impl OpaResolver {
                 "src": &msg.routing.src
             }
         });
-        self.eval_target(&input)
+        self.eval_target(&input, dynamic_data)
     }
 
     pub fn reload(
@@ -126,12 +132,20 @@ impl OpaResolver {
         let prev_version = self.policy_version;
         let prev_loaded = self.policy_loaded;
         let prev_entrypoint = self.entrypoint.clone();
+        let prev_base_data_bundle = self.base_data_bundle.clone();
 
         self.opa_load_status = OPA_STATUS_LOADING;
         let result = (|| {
             if wasm_bytes.is_empty() {
                 return Err(OpaError::NotLoaded);
             }
+            let parsed_bundle = match data_bundle_json
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty())
+            {
+                Some(raw) => Some(serde_json::from_str::<Value>(raw)?),
+                None => None,
+            };
             let module = Module::from_binary(&self.engine, wasm_bytes)?;
             let wasm = OpaWasm::instantiate(&self.engine, &module, data_bundle_json)?;
             self.module = Some(module);
@@ -139,6 +153,7 @@ impl OpaResolver {
             self.policy_loaded = true;
             self.policy_version = version;
             self.entrypoint = entrypoint;
+            self.base_data_bundle = parsed_bundle;
             self.opa_load_status = OPA_STATUS_OK;
             self.logged_missing = false;
             tracing::info!(version = version, "opa policy loaded");
@@ -150,6 +165,7 @@ impl OpaResolver {
             self.policy_loaded = prev_loaded;
             self.policy_version = prev_version;
             self.entrypoint = prev_entrypoint;
+            self.base_data_bundle = prev_base_data_bundle;
             self.opa_load_status = OPA_STATUS_ERROR;
             return Err(err);
         }
@@ -160,7 +176,11 @@ impl OpaResolver {
         (self.policy_version, self.opa_load_status)
     }
 
-    fn eval_target(&mut self, input: &Value) -> Result<Option<String>, OpaError> {
+    fn eval_target(
+        &mut self,
+        input: &Value,
+        dynamic_data: Option<&Value>,
+    ) -> Result<Option<String>, OpaError> {
         let wasm = self.wasm.as_mut().ok_or(OpaError::NotLoaded)?;
         wasm.store.data_mut().last_error = None;
 
@@ -168,7 +188,18 @@ impl OpaResolver {
         let input_val = wasm.json_parse(&input_str)?;
         let ctx = wasm.opa_eval_ctx_new.call(&mut wasm.store, ())?;
 
-        if let Some(data_addr) = wasm.external_data_addr.or(wasm.data_addr) {
+        let merged_dynamic_data =
+            dynamic_data.map(|overlay| merge_opa_data(self.base_data_bundle.as_ref(), overlay));
+        if let Some(data) = merged_dynamic_data.as_ref() {
+            if wasm.opa_eval_ctx_set_data.is_none() {
+                return Err(OpaError::MissingExport("opa_eval_ctx_set_data"));
+            }
+            let data_str = serde_json::to_string(data)?;
+            let data_addr = wasm.json_parse(&data_str)?;
+            if let Some(set_data) = &wasm.opa_eval_ctx_set_data {
+                set_data.call(&mut wasm.store, (ctx, data_addr))?;
+            }
+        } else if let Some(data_addr) = wasm.external_data_addr.or(wasm.data_addr) {
             if let Some(set_data) = &wasm.opa_eval_ctx_set_data {
                 set_data.call(&mut wasm.store, (ctx, data_addr))?;
             }
@@ -206,6 +237,29 @@ impl OpaResolver {
             );
         }
         target
+    }
+}
+
+fn merge_opa_data(base: Option<&Value>, overlay: &Value) -> Value {
+    let mut merged = base.cloned().unwrap_or_else(|| serde_json::json!({}));
+    merge_json_value(&mut merged, overlay);
+    merged
+}
+
+fn merge_json_value(dst: &mut Value, src: &Value) {
+    match (dst, src) {
+        (Value::Object(dst_map), Value::Object(src_map)) => {
+            for (key, value) in src_map {
+                if let Some(existing) = dst_map.get_mut(key) {
+                    merge_json_value(existing, value);
+                } else {
+                    dst_map.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        (dst_value, src_value) => {
+            *dst_value = src_value.clone();
+        }
     }
 }
 
@@ -1257,7 +1311,7 @@ fn json_to_opa_value(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_target_from_result, OpaDumpSource, OpaError};
+    use super::{merge_opa_data, parse_target_from_result, OpaDumpSource, OpaError};
 
     #[test]
     fn parse_target_from_result_extracts_top_level_target() {
@@ -1308,5 +1362,50 @@ mod tests {
             }
             other => panic!("expected OpaError::ResultParse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn merge_opa_data_overlays_dynamic_identity_without_dropping_static_data() {
+        let base = serde_json::json!({
+            "static_routes": { "default": "AI.default@sandbox" },
+            "identity": {
+                "ilk:old": { "registration_status": "temporary" }
+            }
+        });
+        let overlay = serde_json::json!({
+            "identity": {
+                "ilk:new": {
+                    "registration_status": "complete",
+                    "tenant_id": "tnt:123"
+                }
+            },
+            "identity_aliases": {
+                "ilk:old": "ilk:new"
+            }
+        });
+
+        let merged = merge_opa_data(Some(&base), &overlay);
+        assert_eq!(
+            merged
+                .get("static_routes")
+                .and_then(|v| v.get("default"))
+                .and_then(serde_json::Value::as_str),
+            Some("AI.default@sandbox")
+        );
+        assert_eq!(
+            merged
+                .get("identity")
+                .and_then(|v| v.get("ilk:new"))
+                .and_then(|v| v.get("registration_status"))
+                .and_then(serde_json::Value::as_str),
+            Some("complete")
+        );
+        assert_eq!(
+            merged
+                .get("identity_aliases")
+                .and_then(|v| v.get("ilk:old"))
+                .and_then(serde_json::Value::as_str),
+            Some("ilk:new")
+        );
     }
 }

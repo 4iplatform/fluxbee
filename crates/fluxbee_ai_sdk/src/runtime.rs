@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -138,8 +139,7 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
 
         let read_timeout = config.read_timeout;
         let mut reader_task = tokio::spawn(reader_loop(reader, tx, read_timeout, metrics.clone()));
-        let metrics_task =
-            tokio::spawn(metrics_loop(metrics.clone(), config.metrics_log_interval));
+        let metrics_task = tokio::spawn(metrics_loop(metrics.clone(), config.metrics_log_interval));
         let node = Arc::new(self.node);
         let mut workers = JoinSet::new();
 
@@ -220,7 +220,9 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
                     if matches!(err, AiSdkError::RecoverableExhausted(_)) {
-                        metrics.recoverable_exhausted.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .recoverable_exhausted
+                            .fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                     metrics.fatal_errors.fetch_add(1, Ordering::Relaxed);
@@ -230,7 +232,9 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
                 Err(err) => {
                     metrics.fatal_errors.fetch_add(1, Ordering::Relaxed);
                     metrics_task.abort();
-                    return Err(AiSdkError::Protocol(format!("worker task join error: {err}")));
+                    return Err(AiSdkError::Protocol(format!(
+                        "worker task join error: {err}"
+                    )));
                 }
             }
         }

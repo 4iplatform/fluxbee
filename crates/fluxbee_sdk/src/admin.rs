@@ -261,7 +261,7 @@ fn parse_admin_response(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(requested_action)
         .to_string();
-    let payload_value = payload.get("payload").cloned().unwrap_or(Value::Null);
+    let payload_value = admin_response_payload_value(&payload);
     let error_code = payload
         .get("error_code")
         .and_then(Value::as_str)
@@ -289,6 +289,30 @@ fn parse_admin_response(
     })
 }
 
+fn admin_response_payload_value(payload: &Value) -> Value {
+    if let Some(value) = payload.get("payload") {
+        return value.clone();
+    }
+    let Some(mut object) = payload.as_object().cloned() else {
+        return Value::Null;
+    };
+    for key in [
+        "status",
+        "action",
+        "error_code",
+        "error_detail",
+        "request_id",
+        "trace_id",
+    ] {
+        object.remove(key);
+    }
+    if object.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(object)
+    }
+}
+
 fn extract_error_message<'a>(
     payload: &'a Value,
     error_detail: Option<&'a Value>,
@@ -310,4 +334,72 @@ fn extract_error_message<'a>(
         .get("message")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_admin_response_prefers_payload_field_when_present() {
+        let raw = json!({
+            "status": "ok",
+            "action": "get_hive",
+            "payload": {
+                "hive_id": "worker-220"
+            },
+            "error_code": null,
+            "error_detail": null
+        });
+
+        let parsed = parse_admin_response("get_hive", "trace-1".to_string(), raw).unwrap();
+        assert_eq!(parsed.action, "get_hive");
+        assert_eq!(parsed.payload, json!({ "hive_id": "worker-220" }));
+    }
+
+    #[test]
+    fn parse_admin_response_falls_back_to_top_level_body_when_payload_missing() {
+        let raw = json!({
+            "status": "ok",
+            "action": "get_status",
+            "responses": [
+                {
+                    "hive": "motherbee",
+                    "status": "ok",
+                    "payload": {
+                        "version": 10
+                    }
+                }
+            ],
+            "pending": [],
+            "expected_hives_policy": ["motherbee"],
+            "expected_hives_topology": ["motherbee"],
+            "pending_hives_policy": [],
+            "pending_hives_topology": [],
+            "error_code": null,
+            "error_detail": null
+        });
+
+        let parsed = parse_admin_response("opa_get_status", "trace-2".to_string(), raw).unwrap();
+        assert_eq!(
+            parsed.payload,
+            json!({
+                "responses": [
+                    {
+                        "hive": "motherbee",
+                        "status": "ok",
+                        "payload": {
+                            "version": 10
+                        }
+                    }
+                ],
+                "pending": [],
+                "expected_hives_policy": ["motherbee"],
+                "expected_hives_topology": ["motherbee"],
+                "pending_hives_policy": [],
+                "pending_hives_topology": []
+            })
+        );
+    }
 }

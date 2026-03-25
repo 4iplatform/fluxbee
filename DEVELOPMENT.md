@@ -28,6 +28,15 @@ Si querés apuntar a un router específico: `JSR_ROUTER_NAME=RT.primary ...`
 `fluxbee-sdk` es la librería canónica para conectar nodos al router y usar utilidades de protocolo/NATS/blob.
 Vive en `crates/fluxbee_sdk`. Es **solo Linux**.
 
+## Librería AI (`fluxbee-ai-sdk`)
+
+`fluxbee-ai-sdk` vive en `crates/fluxbee_ai_sdk` y es un SDK separado, de nivel superior, pensado para:
+
+- `SY.architect`
+- futuros nodos `AI.*`
+
+No reemplaza a `fluxbee-sdk`; se apoya en él para conexión/router y encapsula runtime AI, cliente OpenAI, function calling y utilidades de thread state.
+
 ### Instalación paso a paso (proyecto nuevo)
 
 Opción A: copiar el crate dentro de tu repo.
