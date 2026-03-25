@@ -3184,6 +3184,9 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "list_ilks" => vec!["GET /hives/{hive}/identity/ilks"],
         "get_ilk" => vec!["GET /hives/{hive}/identity/ilks/{ilk_id}"],
         "inventory" => vec![
+            "GET /inventory",
+            "GET /inventory/summary",
+            "GET /inventory/{hive}",
             "GET /hives/{hive}/inventory/summary",
             "GET /hives/{hive}/inventory/hive",
         ],
@@ -3676,7 +3679,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "list_ilks" => "curl -X GET /hives/motherbee/identity/ilks",
         "get_ilk" => "curl -X GET /hives/motherbee/identity/ilks/demo-ilk",
-        "inventory" => "curl -X GET /hives/motherbee/inventory/summary",
+        "inventory" => "curl -X GET /inventory",
         "list_versions" => "curl -X GET /versions",
         "get_versions" => "curl -X GET /hives/motherbee/versions",
         "list_runtimes" => "curl -X GET /hives/motherbee/runtimes",
