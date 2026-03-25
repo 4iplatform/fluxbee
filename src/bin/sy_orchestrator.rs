@@ -4524,6 +4524,12 @@ fn inventory_filter_hive(payload: &serde_json::Value) -> Option<String> {
         .map(|v| v.to_string())
 }
 
+fn hive_is_registered_for_inventory(state: &OrchestratorState, hive_id: &str) -> bool {
+    let hive_id = hive_id.trim();
+    !hive_id.is_empty()
+        && (hive_id == state.hive_id || hives_root().join(hive_id).join("info.yaml").exists())
+}
+
 fn inventory_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
     let snapshot = match load_lsa_snapshot(state) {
         Ok(snapshot) => snapshot,
@@ -4553,6 +4559,9 @@ fn inventory_flow(state: &OrchestratorState, payload: &serde_json::Value) -> ser
         let Some(hive_id) = remote_hive_name(hive) else {
             continue;
         };
+        if !hive_is_registered_for_inventory(state, &hive_id) {
+            continue;
+        }
         if let Some(expected_hive) = filter_hive.as_deref() {
             if hive_id != expected_hive {
                 continue;
@@ -6319,6 +6328,27 @@ fn remove_hive_cleanup_local_flow() -> serde_json::Value {
     }
 }
 
+fn remove_hive_cleanup_via_ssh(address: &str) -> Result<(), OrchestratorError> {
+    let address = address.trim();
+    if address.is_empty() {
+        return Err("missing worker address for remote cleanup".into());
+    }
+    let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
+    if !key_path.exists() {
+        return Err(format!(
+            "motherbee ssh key missing (expected '{}')",
+            key_path.display()
+        )
+        .into());
+    }
+    ssh_with_key(
+        address,
+        &key_path,
+        &sudo_wrap(remove_hive_cleanup_script()),
+        BOOTSTRAP_SSH_USER,
+    )
+}
+
 async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_json::Value {
     if !valid_hive_id(hive_id) {
         return serde_json::json!({
@@ -6385,24 +6415,49 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
         remote_cleanup = "socket_ok";
         remote_cleanup_via = "socket";
     } else {
-        remote_cleanup = if socket_cleanup_timed_out {
-            "socket_timeout"
+        let mut ssh_cleanup_ok = false;
+        if !address.trim().is_empty() {
+            match remove_hive_cleanup_via_ssh(&address) {
+                Ok(()) => {
+                    ssh_cleanup_ok = true;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        hive_id = hive_id,
+                        address = %address,
+                        error = %err,
+                        "ssh cleanup fallback failed during remove_hive"
+                    );
+                }
+            }
+        }
+        if ssh_cleanup_ok {
+            remote_cleanup = if socket_cleanup_timed_out {
+                "socket_timeout_ssh_ok"
+            } else {
+                "socket_failed_ssh_ok"
+            };
+            remote_cleanup_via = "ssh";
         } else {
-            "local_only"
-        };
-        remote_cleanup_via = "local_only";
-        if let Err(err) = &forward_result {
-            tracing::warn!(
-                hive_id = hive_id,
-                error = %err,
-                "socket cleanup failed during remove_hive; using local-only cleanup"
-            );
-        } else if let Ok(payload) = &forward_result {
-            tracing::warn!(
-                hive_id = hive_id,
-                payload = %payload,
-                "socket cleanup returned non-ok status; using local-only cleanup"
-            );
+            remote_cleanup = if socket_cleanup_timed_out {
+                "socket_timeout"
+            } else {
+                "local_only"
+            };
+            remote_cleanup_via = "local_only";
+            if let Err(err) = &forward_result {
+                tracing::warn!(
+                    hive_id = hive_id,
+                    error = %err,
+                    "socket cleanup failed during remove_hive; using local-only cleanup"
+                );
+            } else if let Ok(payload) = &forward_result {
+                tracing::warn!(
+                    hive_id = hive_id,
+                    payload = %payload,
+                    "socket cleanup returned non-ok status; using local-only cleanup"
+                );
+            }
         }
     }
 
