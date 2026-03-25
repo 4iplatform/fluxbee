@@ -1,0 +1,31 @@
+﻿{
+  "node": {
+    "name": "AI.common@motherbee",
+    "version": "0.1.0",
+    "router_socket": "/var/run/fluxbee/routers",
+    "uuid_persistence_dir": "/var/lib/fluxbee/state/nodes",
+    "config_dir": "/etc/fluxbee",
+    "dynamic_config_dir": "/var/lib/fluxbee/state/ai-nodes/common"
+  },
+  "runtime": {
+    "read_timeout_ms": 3600000,
+    "handler_timeout_ms": 120000,
+    "write_timeout_ms": 15000,
+    "queue_capacity": 128,
+    "worker_pool_size": 4,
+    "retry_max_attempts": 3,
+    "retry_initial_backoff_ms": 200,
+    "retry_max_backoff_ms": 2000,
+    "metrics_log_interval_ms": 30000
+  },
+  "behavior": {
+    "kind": "openai_chat",
+    "model": "gpt-4.1-mini",
+    "instructions": {
+      "source": "inline",
+      "value": "Respond briefly and clearly in Spanish.",
+      "trim": true
+    },
+    "api_key_env": "OPENAI_API_KEY"
+  }
+}

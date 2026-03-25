@@ -275,6 +275,12 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
 
             for item in request_items {
                 match item {
+                    FunctionLoopItem::UserText { content } => {
+                        input.push(json!({
+                            "role": "user",
+                            "content": [{"type":"input_text","text": content}],
+                        }));
+                    }
                     FunctionLoopItem::ToolResult { result } => {
                         let output_text = match result.output {
                             Value::String(s) => s,
@@ -291,6 +297,7 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                     other => input.push(loop_item_to_openai_input(other)),
                 }
             }
+        }
         }
 
         let tools = request

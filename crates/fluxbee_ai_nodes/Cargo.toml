@@ -1,0 +1,17 @@
+[package]
+name = "fluxbee-ai-nodes"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["clock"] }
+fluxbee-ai-sdk = { path = "../fluxbee_ai_sdk" }
+fluxbee-sdk = { path = "../fluxbee_sdk" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }

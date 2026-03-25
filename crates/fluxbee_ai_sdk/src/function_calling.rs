@@ -147,24 +147,6 @@ impl FunctionCallingRunner {
         tools: &FunctionToolRegistry,
         user_input: impl Into<String>,
     ) -> Result<FunctionLoopRunResult> {
-        self.run_with_input(
-            model,
-            tools,
-            FunctionRunInput {
-                current_user_message: user_input.into(),
-                immediate_memory: None,
-            },
-        )
-        .await
-    }
-
-    pub async fn run_with_input(
-        &self,
-        model: &dyn FunctionCallingModel,
-        tools: &FunctionToolRegistry,
-        input: FunctionRunInput,
-    ) -> Result<FunctionLoopRunResult> {
-        let mut items = build_initial_items(input);
         let mut last_assistant_text = None;
 
         for _ in 0..self.config.max_turns {

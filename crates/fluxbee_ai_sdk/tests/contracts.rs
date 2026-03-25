@@ -100,3 +100,4 @@ fn contract_extract_text_rejects_non_text_payload() {
     let payload = json!({"type":"json","value":{"ok":true}});
     assert!(extract_text(&payload).is_none());
 }
+

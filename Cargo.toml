@@ -11,6 +11,8 @@ members = [
     "nodes/gov/ai-frontdesk-gov",
     "nodes/test/io-test",
     "nodes/test/ai-test-gov",
+    "crates/fluxbee_ai_sdk",
+    "crates/fluxbee_ai_nodes",
 ]
 
 [dependencies]
