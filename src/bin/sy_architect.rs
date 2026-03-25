@@ -1302,6 +1302,11 @@ async fn handle_ai_chat(
         )
         .await
         .map_err(|err| -> ArchitectError { format!("AI request failed: {err}").into() })?;
+    let pending_confirmation_staged = state
+        .pending_actions
+        .lock()
+        .await
+        .contains_key(&session.session_id);
 
     let tool_results = result
         .items
@@ -1318,7 +1323,7 @@ async fn handle_ai_chat(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let message = result
+    let raw_message = result
         .final_assistant_text
         .filter(|text| !text.trim().is_empty())
         .unwrap_or_else(|| {
@@ -1328,6 +1333,24 @@ async fn handle_ai_chat(
                 "I executed live system lookups, but the model returned no final text.".to_string()
             }
         });
+    let message = if pending_confirmation_staged {
+        latest_staged_confirmation_message(&result.items).unwrap_or(raw_message)
+    } else if text_suggests_pending_confirmation(&raw_message) {
+        if tool_results.iter().any(|result| {
+            result
+                .get("is_error")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        }) {
+            "I could not prepare the mutation in this turn. Review the tool errors and try again."
+                .to_string()
+        } else {
+            "The model suggested a confirmation, but no pending action was staged in this chat."
+                .to_string()
+        }
+    } else {
+        raw_message
+    };
 
     Ok(json!({
         "message": message,
@@ -1335,6 +1358,45 @@ async fn handle_ai_chat(
         "model": runtime.model,
         "tool_results": tool_results,
     }))
+}
+
+fn latest_staged_confirmation_message(
+    items: &[fluxbee_ai_sdk::FunctionLoopItem],
+) -> Option<String> {
+    items.iter().rev().find_map(|item| match item {
+        fluxbee_ai_sdk::FunctionLoopItem::ToolResult { result }
+            if !result.is_error && tool_output_requests_confirmation(&result.output) =>
+        {
+            result
+                .output
+                .get("message")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+        }
+        _ => None,
+    })
+}
+
+fn tool_output_requests_confirmation(output: &Value) -> bool {
+    output
+        .get("pending_confirmation")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || output
+            .get("requires_confirmation")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+}
+
+fn text_suggests_pending_confirmation(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("confirm")
+        && (lower.contains("cancel")
+            || lower.contains("prepared")
+            || lower.contains("pend")
+            || lower.contains("abort"))
 }
 
 fn summarize_tool_result(name: &str, arguments: &Value, output: &Value, is_error: bool) -> String {
