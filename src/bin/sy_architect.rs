@@ -1978,6 +1978,7 @@ fn operation_status_from_output(output: &Value) -> String {
         .map(|value| value.to_ascii_lowercase())
     {
         Some(status) if status == "ok" => "succeeded".to_string(),
+        Some(status) if status == "not_found" => "not_found".to_string(),
         Some(status) if status == "error" => "failed".to_string(),
         Some(status) => status,
         None => "succeeded".to_string(),
@@ -2053,7 +2054,7 @@ fn params_hash(value: &Value) -> String {
 fn is_terminal_operation_status(status: &str) -> bool {
     matches!(
         status,
-        "succeeded" | "succeeded_after_timeout" | "failed" | "canceled" | "replaced"
+        "succeeded" | "succeeded_after_timeout" | "failed" | "canceled" | "replaced" | "not_found"
     )
 }
 
@@ -3355,10 +3356,10 @@ async fn persist_chat_exchange(
     };
     append_message_record(&messages, &user_row).await?;
 
-    let response_role = if response.status == "ok" {
-        "architect"
-    } else {
+    let response_role = if response.status == "error" {
         "system"
+    } else {
+        "architect"
     };
     let response_row = ChatMessageRecord {
         message_id: Uuid::new_v4().to_string(),
@@ -5775,7 +5776,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
     function statusClass(raw) {{
       const value = String(raw || "").toLowerCase();
       if (["alive", "running", "healthy", "ok", "active", "connected"].includes(value)) return "ok";
-      if (["stale", "degraded", "failed", "error", "missing", "offline", "deleted"].includes(value)) return "warn";
+      if (["stale", "degraded", "failed", "error", "missing", "offline", "deleted", "not_found"].includes(value)) return "warn";
       return "";
     }}
 

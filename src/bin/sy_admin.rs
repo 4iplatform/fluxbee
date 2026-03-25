@@ -718,7 +718,13 @@ fn internal_response_payload_value(envelope: &serde_json::Value) -> serde_json::
     let Some(mut object) = envelope.as_object().cloned() else {
         return serde_json::Value::Null;
     };
-    for key in ["status", "action", "error_code", "error_detail", "request_id"] {
+    for key in [
+        "status",
+        "action",
+        "error_code",
+        "error_detail",
+        "request_id",
+    ] {
         object.remove(key);
     }
     if object.is_empty() {
@@ -2780,7 +2786,7 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
 }
 
 fn is_ok_status(status: Option<&str>) -> bool {
-    matches!(status, Some(value) if value.eq_ignore_ascii_case("ok"))
+    matches!(status, Some(value) if value.eq_ignore_ascii_case("ok") || value.eq_ignore_ascii_case("not_found"))
 }
 
 async fn respond_json(

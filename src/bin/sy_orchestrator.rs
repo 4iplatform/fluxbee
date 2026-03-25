@@ -10159,7 +10159,7 @@ async fn kill_node_flow(
     match systemd_unit_is_active(&unit) {
         Ok(false) => {
             return serde_json::json!({
-                "status": "ok",
+                "status": "not_found",
                 "state": "not_found",
                 "hive": target_hive,
                 "target": target_hive,
@@ -10314,8 +10314,8 @@ async fn remove_node_instance_flow(
     };
     if !instance_dir.exists() {
         return serde_json::json!({
-            "status": "error",
-            "error_code": "NODE_NOT_FOUND",
+            "status": "not_found",
+            "error_code": serde_json::Value::Null,
             "message": format!("node '{}' not found", node_name),
             "target": target_hive,
             "node_name": node_name,
@@ -10361,19 +10361,25 @@ async fn remove_node_instance_flow(
             "removed_kind_dir": removed_kind_dir,
         }),
         Err(err) => {
-            let error_code = if err.to_string() == "NODE_NOT_FOUND" {
-                "NODE_NOT_FOUND"
+            if err.to_string() == "NODE_NOT_FOUND" {
+                serde_json::json!({
+                    "status": "not_found",
+                    "error_code": serde_json::Value::Null,
+                    "message": format!("node '{}' not found", node_name),
+                    "target": target_hive,
+                    "node_name": node_name,
+                    "unit": unit,
+                })
             } else {
-                "NODE_INSTANCE_REMOVE_FAILED"
-            };
-            serde_json::json!({
-                "status": "error",
-                "error_code": error_code,
-                "message": err.to_string(),
-                "target": target_hive,
-                "node_name": node_name,
-                "unit": unit,
-            })
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "NODE_INSTANCE_REMOVE_FAILED",
+                    "message": err.to_string(),
+                    "target": target_hive,
+                    "node_name": node_name,
+                    "unit": unit,
+                })
+            }
         }
     }
 }
