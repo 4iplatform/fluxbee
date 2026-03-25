@@ -81,3 +81,12 @@ pub struct FunctionRunInput {
     #[serde(default)]
     pub immediate_memory: Option<ImmediateConversationMemory>,
 }
+
+impl FunctionRunInput {
+    pub fn new(current_user_message: impl Into<String>) -> Self {
+        Self {
+            current_user_message: current_user_message.into(),
+            immediate_memory: None,
+        }
+    }
+}

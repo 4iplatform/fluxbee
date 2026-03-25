@@ -298,7 +298,6 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                 }
             }
         }
-        }
 
         let tools = request
             .tools

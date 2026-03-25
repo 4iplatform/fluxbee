@@ -110,7 +110,9 @@ fn parse_args() -> Result<ProbeArgs, Box<dyn std::error::Error + Send + Sync>> {
     };
 
     if input.trim().is_empty() {
-        return Err("empty input; pass --input or provide stdin".to_string().into());
+        return Err("empty input; pass --input or provide stdin"
+            .to_string()
+            .into());
     }
 
     Ok(ProbeArgs {

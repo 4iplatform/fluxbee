@@ -1,31 +1,33 @@
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use fluxbee_ai_sdk::{
-    build_reply_message_runtime_src, build_text_response, extract_text, AiNode, AiNodeConfig, Message,
-    FunctionCallingConfig, FunctionCallingRunner, FunctionTool, FunctionToolDefinition,
-    FunctionToolProvider, FunctionToolRegistry,
-    LanceDbThreadStateStore, ModelSettings, NodeRuntime, OpenAiResponsesClient, RetryPolicy,
-    RouterClient, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
-};
 use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
-use fluxbee_sdk::{managed_node_config_path, managed_node_name};
+use fluxbee_ai_sdk::{
+    build_reply_message_runtime_src, build_text_response, extract_text, AiNode, AiNodeConfig,
+    FunctionCallingConfig, FunctionCallingRunner, FunctionTool, FunctionToolDefinition,
+    FunctionToolProvider, FunctionToolRegistry, LanceDbThreadStateStore, Message, ModelSettings,
+    NodeRuntime, OpenAiResponsesClient, RetryPolicy, RouterClient, RuntimeConfig, ThreadStateStore,
+    ThreadStateToolsProvider,
+};
 use fluxbee_sdk::node_client::NodeError;
-use fluxbee_sdk::protocol::{Destination, Meta, Routing, SYSTEM_KIND, MSG_TTL_EXCEEDED, MSG_UNREACHABLE};
+use fluxbee_sdk::protocol::{
+    Destination, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+};
+use fluxbee_sdk::{managed_node_config_path, managed_node_name};
 use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use uuid::Uuid;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 const MSG_NODE_STATUS_GET: &str = "NODE_STATUS_GET";
 const MSG_NODE_STATUS_GET_RESPONSE: &str = "NODE_STATUS_GET_RESPONSE";
@@ -496,7 +498,10 @@ impl GovIdentityBridge {
             }
             let remaining = deadline.saturating_duration_since(now);
             let mut guard = self.connection.inner.lock().await;
-            if let Some(idx) = guard.backlog.iter().position(|msg| msg.routing.trace_id == trace_id)
+            if let Some(idx) = guard
+                .backlog
+                .iter()
+                .position(|msg| msg.routing.trace_id == trace_id)
             {
                 let msg = guard.backlog.remove(idx).expect("backlog index");
                 drop(guard);
@@ -745,13 +750,11 @@ impl GenericAiNode {
         }
         let tool_registry = self.build_tool_registry(ctx)?;
         if !tool_registry.definitions().is_empty() {
-            let model = client
-                .clone()
-                .function_model(
-                    openai.model.clone(),
-                    openai.instructions.clone(),
-                    openai.model_settings.clone(),
-                );
+            let model = client.clone().function_model(
+                openai.model.clone(),
+                openai.instructions.clone(),
+                openai.model_settings.clone(),
+            );
             let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
             let result = runner.run(&model, &tool_registry, input.clone()).await?;
             if let Some(text) = result.final_assistant_text {
@@ -848,7 +851,8 @@ impl GenericAiNode {
         let Some(command) = msg.meta.msg.as_deref() else {
             return Ok(None);
         };
-        let (response_msg, response_payload) = if command.eq_ignore_ascii_case(MSG_NODE_STATUS_GET) {
+        let (response_msg, response_payload) = if command.eq_ignore_ascii_case(MSG_NODE_STATUS_GET)
+        {
             if !env_bool(NODE_STATUS_DEFAULT_HANDLER_ENABLED, true) {
                 return Ok(None);
             }
@@ -888,9 +892,11 @@ impl GenericAiNode {
         let subsystem = match msg.payload.get("subsystem").and_then(Value::as_str) {
             Some(value) if value == "ai_node" => value,
             Some(value) => {
-                return self.invalid_config_response(None, None, format!(
-                    "Invalid payload.subsystem: expected 'ai_node', got '{value}'"
-                ));
+                return self.invalid_config_response(
+                    None,
+                    None,
+                    format!("Invalid payload.subsystem: expected 'ai_node', got '{value}'"),
+                );
             }
             None => {
                 return self.invalid_config_response(
@@ -912,10 +918,14 @@ impl GenericAiNode {
             }
         };
         if !self.node_name_matches(requested_node_name) {
-            return self.invalid_config_response(None, None, format!(
-                "Invalid payload.node_name: expected '{}', got '{}'",
-                self.node_name, requested_node_name
-            ));
+            return self.invalid_config_response(
+                None,
+                None,
+                format!(
+                    "Invalid payload.node_name: expected '{}', got '{}'",
+                    self.node_name, requested_node_name
+                ),
+            );
         }
 
         let schema_version = match msg.payload.get("schema_version").and_then(Value::as_u64) {
@@ -1300,10 +1310,7 @@ impl FunctionTool for IlkRegisterTool {
             ))
         })?;
 
-        let src_ilk_owned = self
-            .scoped_src_ilk
-            .clone()
-            .unwrap_or(args.src_ilk);
+        let src_ilk_owned = self.scoped_src_ilk.clone().unwrap_or(args.src_ilk);
         let src_ilk = src_ilk_owned.trim();
         if src_ilk.is_empty() {
             return Ok(json!({
@@ -1326,7 +1333,11 @@ impl FunctionTool for IlkRegisterTool {
         }
 
         let explicit_tenant = args.tenant_id.as_deref().map(str::trim);
-        let tenant_hint = args.identity_candidate.tenant_hint.as_deref().map(str::trim);
+        let tenant_hint = args
+            .identity_candidate
+            .tenant_hint
+            .as_deref()
+            .map(str::trim);
         let cfg_tenant = self.default_tenant_id.as_deref().map(str::trim);
         let env_tenant = env_nonempty(GOV_IDENTITY_TENANT_ID_ENV);
         let mut tenant_source = tenant_resolution_source(explicit_tenant, tenant_hint, cfg_tenant);
@@ -1457,7 +1468,9 @@ impl FunctionTool for IlkRegisterTool {
             "sending ILK_REGISTER to identity"
         );
         let result = if let Some(bridge) = &self.bridge {
-            bridge.call_ok(&self.identity, MSG_ILK_REGISTER, payload).await
+            bridge
+                .call_ok(&self.identity, MSG_ILK_REGISTER, payload)
+                .await
         } else {
             Err("identity bridge not initialized".to_string())
         };
@@ -1642,12 +1655,13 @@ async fn run_single_connection_runtime(
                         "recoverable error, retrying"
                     );
                     tokio::time::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff.saturating_mul(2), config.retry_policy.max_backoff);
+                    backoff =
+                        std::cmp::min(backoff.saturating_mul(2), config.retry_policy.max_backoff);
                 }
                 Ok(Err(err)) if err.is_recoverable() => {
-                    return Err(fluxbee_ai_sdk::errors::AiSdkError::RecoverableExhausted(format!(
-                        "handler failed after {max_attempts} attempts: {err}"
-                    )));
+                    return Err(fluxbee_ai_sdk::errors::AiSdkError::RecoverableExhausted(
+                        format!("handler failed after {max_attempts} attempts: {err}"),
+                    ));
                 }
                 Ok(Err(err)) => return Err(err),
                 Err(_) => {
@@ -1692,12 +1706,11 @@ async fn run_one_config(
     mode: RunnerMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let startup_effective_doc = build_startup_effective_config_doc(&cfg);
-    let startup_effective_doc = materialize_effective_defaults(&cfg.node.name, startup_effective_doc);
+    let startup_effective_doc =
+        materialize_effective_defaults(&cfg.node.name, startup_effective_doc);
     let startup_effective_config = serde_json::to_value(&startup_effective_doc)?;
-    let persisted_dynamic = load_persisted_dynamic_config(
-        &PathBuf::from(&cfg.node.dynamic_config_dir),
-        &cfg.node.name,
-    );
+    let persisted_dynamic =
+        load_persisted_dynamic_config(&PathBuf::from(&cfg.node.dynamic_config_dir), &cfg.node.name);
     let behavior = build_behavior(&cfg)?;
     let ai_node_config = AiNodeConfig {
         name: cfg.node.name,
@@ -1730,7 +1743,8 @@ async fn run_one_config(
 
     let node_name = ai_node_config.name.clone();
     let gov_identity = gov_identity_config_from_env();
-    let thread_state_store = init_thread_state_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
+    let thread_state_store =
+        init_thread_state_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
     let node = GenericAiNode {
         mode,
         node_name,
@@ -1786,45 +1800,46 @@ async fn run_unconfigured_bootstrap(
         Some(stored) => {
             let materialized = materialize_effective_defaults(&node_name, stored.config.clone());
             match build_behavior_from_effective_config(&materialized) {
-            Ok(behavior) => {
-                tracing::info!(
-                    node_name = %node_name,
-                    config_version = stored.config_version,
-                    "loaded effective JSON config at bootstrap"
-                );
-                (
-                    Some(behavior),
-                    ControlPlaneState {
-                        current_state: NodeLifecycleState::Configured,
-                        config_source: "persisted",
-                        effective_config: Some(
-                            serde_json::to_value(materialized).unwrap_or(Value::Null),
-                        ),
-                        schema_version: stored.schema_version,
-                        config_version: stored.config_version,
-                    },
-                )
+                Ok(behavior) => {
+                    tracing::info!(
+                        node_name = %node_name,
+                        config_version = stored.config_version,
+                        "loaded effective JSON config at bootstrap"
+                    );
+                    (
+                        Some(behavior),
+                        ControlPlaneState {
+                            current_state: NodeLifecycleState::Configured,
+                            config_source: "persisted",
+                            effective_config: Some(
+                                serde_json::to_value(materialized).unwrap_or(Value::Null),
+                            ),
+                            schema_version: stored.schema_version,
+                            config_version: stored.config_version,
+                        },
+                    )
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        node_name = %node_name,
+                        error = %err,
+                        "persisted JSON config is invalid; booting FAILED_CONFIG"
+                    );
+                    (
+                        None,
+                        ControlPlaneState {
+                            current_state: NodeLifecycleState::FailedConfig,
+                            config_source: "persisted",
+                            effective_config: Some(
+                                serde_json::to_value(materialized).unwrap_or(Value::Null),
+                            ),
+                            schema_version: stored.schema_version,
+                            config_version: stored.config_version,
+                        },
+                    )
+                }
             }
-            Err(err) => {
-                tracing::warn!(
-                    node_name = %node_name,
-                    error = %err,
-                    "persisted JSON config is invalid; booting FAILED_CONFIG"
-                );
-                (
-                    None,
-                    ControlPlaneState {
-                        current_state: NodeLifecycleState::FailedConfig,
-                        config_source: "persisted",
-                        effective_config: Some(
-                            serde_json::to_value(materialized).unwrap_or(Value::Null),
-                        ),
-                        schema_version: stored.schema_version,
-                        config_version: stored.config_version,
-                    },
-                )
-            }
-        }},
+        }
         None => {
             if let Some(spawn_cfg) = spawn_effective {
                 match build_behavior_from_effective_config(&spawn_cfg.config) {
@@ -2017,7 +2032,9 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
             }
             "--uuid-persistence-dir" => {
                 let Some(value) = args.get(i + 1) else {
-                    return Err("missing value after --uuid-persistence-dir".to_string().into());
+                    return Err("missing value after --uuid-persistence-dir"
+                        .to_string()
+                        .into());
                 };
                 parsed.bootstrap.uuid_persistence_dir = Some(value.clone());
                 i += 2;
@@ -2031,7 +2048,9 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
             }
             "--dynamic-config-dir" => {
                 let Some(value) = args.get(i + 1) else {
-                    return Err("missing value after --dynamic-config-dir".to_string().into());
+                    return Err("missing value after --dynamic-config-dir"
+                        .to_string()
+                        .into());
                 };
                 parsed.bootstrap.dynamic_config_dir = Some(value.clone());
                 i += 2;
@@ -2158,7 +2177,9 @@ fn build_behavior_from_effective_config(
     let behavior = &config.behavior;
     let kind = behavior.kind.as_str();
     if kind.is_empty() {
-        return Err("missing behavior.kind in effective config".to_string().into());
+        return Err("missing behavior.kind in effective config"
+            .to_string()
+            .into());
     }
 
     match kind {
@@ -2186,9 +2207,7 @@ fn build_behavior_from_effective_config(
                 .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
             let yaml_inline_api_key = extract_openai_api_key_from_effective_config(config)
                 .filter(|v| v != "***REDACTED***");
-            let base_url = behavior
-                .base_url
-                .clone();
+            let base_url = behavior.base_url.clone();
 
             Ok(NodeBehavior::OpenAiChat(OpenAiChatRuntime {
                 model,
@@ -2221,20 +2240,21 @@ fn resolve_instructions(
             }
             InstructionsSourceKind::File => {
                 let Some(path) = strategy.value.clone() else {
-                    return Err("instructions.source=file requires instructions.value (path)".into());
+                    return Err(
+                        "instructions.source=file requires instructions.value (path)".into(),
+                    );
                 };
                 let content = fs::read_to_string(path)?;
                 Ok(Some(maybe_trim(content, strategy.trim)))
             }
             InstructionsSourceKind::Env => {
                 let Some(env_name) = strategy.value.clone() else {
-                    return Err("instructions.source=env requires instructions.value (env var)".into());
+                    return Err(
+                        "instructions.source=env requires instructions.value (env var)".into(),
+                    );
                 };
                 let value = std::env::var(&env_name).map_err(|_| {
-                    format!(
-                        "missing env var for instructions source env: {}",
-                        env_name
-                    )
+                    format!("missing env var for instructions source env: {}", env_name)
                 })?;
                 Ok(Some(maybe_trim(value, strategy.trim)))
             }
@@ -2342,9 +2362,7 @@ fn write_json_atomic(
 
     let tmp_name = format!(
         ".{}.tmp.{}.{}",
-        path.file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("state"),
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("state"),
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
@@ -2414,7 +2432,9 @@ fn extract_openai_api_key_from_config(config: &Value) -> Option<String> {
         })
 }
 
-fn extract_openai_api_key_from_effective_config(config: &EffectiveConfigDocument) -> Option<String> {
+fn extract_openai_api_key_from_effective_config(
+    config: &EffectiveConfigDocument,
+) -> Option<String> {
     config
         .behavior
         .openai
@@ -2433,7 +2453,9 @@ fn extract_openai_api_key_from_effective_config(config: &EffectiveConfigDocument
 fn parse_effective_config_doc(
     config: &Value,
 ) -> Result<EffectiveConfigDocument, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(serde_json::from_value::<EffectiveConfigDocument>(config.clone())?)
+    Ok(serde_json::from_value::<EffectiveConfigDocument>(
+        config.clone(),
+    )?)
 }
 
 #[derive(Debug)]
@@ -2582,9 +2604,8 @@ fn materialize_effective_defaults(
                 .as_ref()
                 .and_then(|v| v.openai.as_ref())
                 .and_then(|v| v.api_key_env.clone());
-            config.behavior.api_key_env = Some(
-                inherited.unwrap_or_else(|| default_openai_api_key_env()),
-            );
+            config.behavior.api_key_env =
+                Some(inherited.unwrap_or_else(|| default_openai_api_key_env()));
         }
         if config.secrets.is_none() {
             config.secrets = Some(EffectiveSecretsSection::default());
@@ -2639,7 +2660,6 @@ fn materialize_runtime_defaults(runtime: &mut EffectiveRuntimeSection) {
     }
 }
 
-
 fn is_control_plane(msg: &Message) -> bool {
     msg.meta.msg_type.eq_ignore_ascii_case("system")
         || msg.meta.msg_type.eq_ignore_ascii_case("admin")
@@ -2681,7 +2701,9 @@ fn node_not_configured_payload(state: NodeLifecycleState) -> Value {
     })
 }
 
-fn extract_instructions_from_effective_config(behavior: &EffectiveBehaviorSection) -> Option<String> {
+fn extract_instructions_from_effective_config(
+    behavior: &EffectiveBehaviorSection,
+) -> Option<String> {
     behavior
         .instructions
         .as_ref()
@@ -2693,10 +2715,17 @@ fn extract_instructions_from_effective_config(behavior: &EffectiveBehaviorSectio
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
         })
-        .or_else(|| behavior.params.as_ref().and_then(|p| p.system_prompt.clone()))
+        .or_else(|| {
+            behavior
+                .params
+                .as_ref()
+                .and_then(|p| p.system_prompt.clone())
+        })
 }
 
-fn extract_model_settings_from_effective_config(behavior: &EffectiveBehaviorSection) -> ModelSettings {
+fn extract_model_settings_from_effective_config(
+    behavior: &EffectiveBehaviorSection,
+) -> ModelSettings {
     let direct = behavior.model_settings.as_ref();
     let params = behavior.params.as_ref();
     ModelSettings {
@@ -2857,17 +2886,17 @@ fn text_preview(text: &str, max_chars: usize) -> String {
 
 #[allow(dead_code)]
 fn require_src_ilk(ctx: &BehaviorContext) -> fluxbee_ai_sdk::Result<&str> {
-    ctx.src_ilk.as_deref().ok_or_else(|| {
-        fluxbee_ai_sdk::errors::AiSdkError::Protocol("missing_src_ilk".to_string())
-    })
+    ctx.src_ilk
+        .as_deref()
+        .ok_or_else(|| fluxbee_ai_sdk::errors::AiSdkError::Protocol("missing_src_ilk".to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use fluxbee_ai_sdk::{Destination, Meta, Routing};
-    use std::sync::{Mutex, OnceLock};
     use std::sync::Arc;
+    use std::sync::{Mutex, OnceLock};
     use tokio::sync::RwLock;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -2921,10 +2950,7 @@ mod tests {
             MSG_NODE_STATUS_GET_RESPONSE,
             json!({"status":"ok","health_state":"HEALTHY"}),
         );
-        assert_eq!(
-            res.meta.msg.as_deref(),
-            Some(MSG_NODE_STATUS_GET_RESPONSE)
-        );
+        assert_eq!(res.meta.msg.as_deref(), Some(MSG_NODE_STATUS_GET_RESPONSE));
     }
 
     fn test_node() -> GenericAiNode {
@@ -2954,7 +2980,10 @@ mod tests {
         std::env::remove_var(NODE_STATUS_DEFAULT_HEALTH_STATE);
         let node = test_node();
         let req = sample_request();
-        let response = node.handle_control_plane(req).await.expect("control-plane should not fail");
+        let response = node
+            .handle_control_plane(req)
+            .await
+            .expect("control-plane should not fail");
         assert!(response.is_none());
         std::env::remove_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED);
     }
@@ -2973,10 +3002,7 @@ mod tests {
             .expect("control-plane should not fail")
             .expect("status response should exist");
         assert_eq!(
-            degraded
-                .payload
-                .get("health_state")
-                .and_then(Value::as_str),
+            degraded.payload.get("health_state").and_then(Value::as_str),
             Some("DEGRADED")
         );
 
@@ -2987,10 +3013,7 @@ mod tests {
             .expect("control-plane should not fail")
             .expect("status response should exist");
         assert_eq!(
-            fallback
-                .payload
-                .get("health_state")
-                .and_then(Value::as_str),
+            fallback.payload.get("health_state").and_then(Value::as_str),
             Some("HEALTHY")
         );
 
@@ -3030,23 +3053,20 @@ mod tests {
             .expect("response should be present");
 
         assert_eq!(
-            response
-                .payload
-                .get("code")
-                .and_then(Value::as_str),
+            response.payload.get("code").and_then(Value::as_str),
             Some("missing_openai_api_key")
         );
         assert_eq!(
-            response
-                .payload
-                .get("retryable")
-                .and_then(Value::as_bool),
+            response.payload.get("retryable").and_then(Value::as_bool),
             Some(true)
         );
         std::env::remove_var("OPENAI_API_KEY_MISSING_FOR_TEST");
     }
 
-    fn sample_user_request_with_context(context: Value, top_level_src_ilk: Option<&str>) -> Message {
+    fn sample_user_request_with_context(
+        context: Value,
+        top_level_src_ilk: Option<&str>,
+    ) -> Message {
         Message {
             routing: Routing {
                 src: "IO.sim.local@motherbee".to_string(),
