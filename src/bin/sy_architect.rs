@@ -371,7 +371,8 @@ impl FunctionTool for ArchitectSystemGetTool {
         FunctionToolDefinition {
             name: "fluxbee_system_get".to_string(),
             description: format!(
-                "Read live Fluxbee system state through SY.admin over socket for hive {}. Read-only. Supports GET paths and safe POST checks such as OPA policy validation. Use /admin/actions or /admin/actions/{{action}} when you need dynamic help; those responses include standardized request_contract metadata, body fields, notes, and example_scmd values. Example paths: /inventory, /inventory/summary, /inventory/{}, /hives/{}/nodes, /hives/{}/nodes/SY.admin@{}/status, /hives/{}/identity/ilks, /admin/actions, /admin/actions/get_node_status, /config/storage",
+                "Read live Fluxbee system state through SY.admin over socket for hive {}. Read-only. Supports GET paths and safe POST checks such as OPA policy validation. Use /admin/actions or /admin/actions/{{action}} when you need dynamic help; those responses include standardized request_contract metadata, body fields, notes, and example_scmd values. Use /inventory or /inventory/summary for system-wide node visibility, and use /versions or /hives/{}/versions for core and runtime versions. Example paths: /inventory, /inventory/summary, /inventory/{}, /versions, /hives/{}/versions, /hives/{}/nodes, /hives/{}/nodes/SY.admin@{}/status, /hives/{}/identity/ilks, /admin/actions, /admin/actions/get_node_status, /admin/actions/get_versions, /config/storage",
+                self.context.hive_id,
                 self.context.hive_id,
                 self.context.hive_id,
                 self.context.hive_id,

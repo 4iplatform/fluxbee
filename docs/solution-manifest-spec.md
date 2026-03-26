@@ -1,7 +1,7 @@
 # Solution Manifest — Declarative Configuration per Tenant
 
 **Status:** v1.0 (beta)
-**Date:** 2026-03-14
+**Date:** 2026-03-26
 **Audience:** SY.architect developers, orchestrator, admin API
 **Parent specs:** `node-spawn-config-spec.md`, `runtime-packaging-cli-spec.md`, `sy-architect-spec.md`, `sy-claims-beta.md`
 

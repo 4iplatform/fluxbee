@@ -3135,8 +3135,8 @@ fn admin_action_summary(action: &str) -> &'static str {
         "list_ilks" => "List identity ilks in a hive.",
         "get_ilk" => "Read one identity ilk.",
         "inventory" => "Read global or per-hive inventory, including system-wide node visibility.",
-        "list_versions" => "List runtime versions across hives.",
-        "get_versions" => "Read runtime versions for one hive.",
+        "list_versions" => "List core and runtime versions across hives.",
+        "get_versions" => "Read core and runtime versions for one hive.",
         "list_runtimes" => "List runtimes for one hive.",
         "get_runtime" => "Read one runtime definition in a hive.",
         "remove_runtime_version" => "Delete one runtime version from a hive.",
@@ -3757,6 +3757,10 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Use GET /inventory for the full global inventory view.",
             "Use GET /inventory/summary for global counts only.",
             "Use GET /inventory/{hive} or /hives/{hive}/inventory/hive for one hive.",
+        ],
+        "list_versions" | "get_versions" => vec![
+            "These endpoints report core component versions and runtime availability/current selections.",
+            "They describe versions available to a hive, not the state of one node instance.",
         ],
         "update" => vec![
             "Legacy fields version/hash are rejected; use manifest_version/manifest_hash.",
