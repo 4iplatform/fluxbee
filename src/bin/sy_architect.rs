@@ -16,10 +16,11 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
 use fluxbee_ai_sdk::{
-    ConversationSummary, FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput,
-    FunctionTool, FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
-    ImmediateConversationMemory, ImmediateInteraction, ImmediateInteractionKind,
-    ImmediateOperation, ImmediateRole, ModelSettings, OpenAiResponsesClient,
+    extract_text, ConversationSummary, FunctionCallingConfig, FunctionCallingRunner,
+    FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolProvider,
+    FunctionToolRegistry, ImmediateConversationMemory, ImmediateInteraction,
+    ImmediateInteractionKind, ImmediateOperation, ImmediateRole, ModelSettings,
+    OpenAiResponsesClient,
 };
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
@@ -896,7 +897,7 @@ async fn router_connect_loop(config: NodeConfig, state: Arc<ArchitectState>) {
                 *state.router_sender.lock().await = Some(sender);
                 state.router_connected.store(true, Ordering::Relaxed);
                 tracing::info!(node = %state.node_name, "sy.architect connected to router");
-                if let Err(err) = router_recv_loop(receiver).await {
+                if let Err(err) = router_recv_loop(receiver, Arc::clone(&state)).await {
                     tracing::warn!(error = %err, "sy.architect router loop ended");
                 }
                 *state.router_sender.lock().await = None;
@@ -912,7 +913,10 @@ async fn router_connect_loop(config: NodeConfig, state: Arc<ArchitectState>) {
     }
 }
 
-async fn router_recv_loop(mut receiver: NodeReceiver) -> Result<(), NodeError> {
+async fn router_recv_loop(
+    mut receiver: NodeReceiver,
+    state: Arc<ArchitectState>,
+) -> Result<(), NodeError> {
     loop {
         let msg = receiver.recv().await?;
         tracing::info!(
@@ -922,6 +926,16 @@ async fn router_recv_loop(mut receiver: NodeReceiver) -> Result<(), NodeError> {
             msg = ?msg.meta.msg,
             "sy.architect received message"
         );
+        if let Some(session_id) = router_message_session_id(&msg) {
+            if let Err(err) = persist_router_incoming_message(&state, &session_id, &msg).await {
+                tracing::warn!(
+                    error = %err,
+                    session_id = %session_id,
+                    trace_id = %msg.routing.trace_id,
+                    "failed to persist incoming router message for impersonation chat"
+                );
+            }
+        }
     }
 }
 
@@ -1245,7 +1259,7 @@ async fn handle_chat_message(
         match handle_impersonation_chat(state, &session, message.trim()).await {
             Ok(output) => ChatResponse {
                 status: "ok".to_string(),
-                mode: "chat".to_string(),
+                mode: "dispatch".to_string(),
                 output,
                 session_id: Some(resolved_session_id.clone()),
                 session_title: Some(session.title.clone()),
@@ -1477,7 +1491,8 @@ async fn handle_impersonation_chat(
     })?;
 
     Ok(json!({
-        "message": "Impersonation message dispatched via router with the selected ILK/ICH context.",
+        "suppress_echo": true,
+        "suppress_response_row": true,
         "dispatch": {
             "status": "sent",
             "trace_id": trace_id,
@@ -1487,9 +1502,100 @@ async fn handle_impersonation_chat(
             "source_channel_kind": source_channel_kind,
             "impersonation_target": impersonation_target,
             "route": "resolve",
-            "reply_capture": "router_log_only",
+            "reply_capture": "session_persisted",
         }
     }))
+}
+
+fn router_message_session_id(msg: &Message) -> Option<String> {
+    msg.meta
+        .context
+        .as_ref()
+        .and_then(|ctx| ctx.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn router_message_label(msg: &Message) -> String {
+    msg.meta
+        .src_ilk
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "archi".to_string())
+}
+
+fn router_message_text(msg: &Message) -> String {
+    if let Some(text) = extract_text(&msg.payload)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return text;
+    }
+    if let Some(text) = msg
+        .payload
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return text.to_string();
+    }
+    serde_json::to_string_pretty(&msg.payload)
+        .or_else(|_| serde_json::to_string(&msg.payload))
+        .unwrap_or_else(|_| "{\"error\":\"unserializable router payload\"}".to_string())
+}
+
+async fn persist_router_incoming_message(
+    state: &ArchitectState,
+    session_id: &str,
+    msg: &Message,
+) -> Result<(), ArchitectError> {
+    let _guard = state.chat_lock.lock().await;
+    let db = open_architect_db(state).await?;
+    let sessions = ensure_sessions_table(&db).await?;
+    let profiles = ensure_session_profiles_table(&db).await?;
+    let messages = ensure_messages_table(&db).await?;
+    let Some(mut session) = load_session_record(&sessions, &profiles, session_id).await? else {
+        return Ok(());
+    };
+    if session.chat_mode != CHAT_MODE_IMPERSONATION {
+        return Ok(());
+    }
+
+    let now = now_epoch_ms();
+    let content = router_message_text(msg);
+    let label = router_message_label(msg);
+    let row = ChatMessageRecord {
+        message_id: Uuid::new_v4().to_string(),
+        session_id: session.session_id.clone(),
+        role: "architect".to_string(),
+        content: content.clone(),
+        timestamp_ms: now,
+        mode: "chat".to_string(),
+        metadata_json: json!({
+            "kind": "router_message",
+            "label": label,
+            "trace_id": msg.routing.trace_id,
+            "routing_src": msg.routing.src,
+            "src_ilk": msg.meta.src_ilk,
+            "scope": msg.meta.scope,
+            "target": msg.meta.target,
+            "context": msg.meta.context,
+            "payload": msg.payload,
+        })
+        .to_string(),
+        seq: session.message_count + 1,
+    };
+    append_message_record(&messages, &row).await?;
+    session.message_count += 1;
+    session.last_activity_at_ms = now;
+    session.last_message_preview = preview_text(&content, 88);
+    upsert_session_record(&sessions, &session).await?;
+    Ok(())
 }
 
 fn latest_staged_confirmation_message(
@@ -3574,6 +3680,19 @@ async fn persist_chat_exchange(
     };
     append_message_record(&messages, &user_row).await?;
 
+    let suppress_response_row = response
+        .output
+        .get("suppress_response_row")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if suppress_response_row {
+        session.message_count += 1;
+        session.last_activity_at_ms = now;
+        session.last_message_preview = preview_text(&user_message, 88);
+        upsert_session_record(&sessions, session).await?;
+        return Ok(());
+    }
+
     let response_role = if response.status == "error" {
         "system"
     } else {
@@ -4488,6 +4607,16 @@ fn message_record_to_persisted(record: ChatMessageRecord) -> PersistedChatMessag
         metadata: serde_json::from_str(&record.metadata_json)
             .unwrap_or_else(|_| json!({ "kind": "text" })),
     }
+}
+
+fn persisted_message_label(message: &PersistedChatMessage) -> Option<String> {
+    message
+        .metadata
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn sanitize_session_title(title: Option<&str>) -> String {
@@ -5783,6 +5912,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const currentSessionStorageKey = "sy.architect.currentSession.{hive}";
     const statusRefreshActiveMs = 15000;
     const statusRefreshHiddenMs = 60000;
+    const sessionRefreshActiveMs = 2000;
+    const sessionRefreshHiddenMs = 8000;
     const messages = document.getElementById("messages");
     const input = document.getElementById("input");
     const send = document.getElementById("send");
@@ -5810,11 +5941,14 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const confirmCancel = document.getElementById("confirm-cancel");
     const confirmAccept = document.getElementById("confirm-accept");
     let currentSessionId = null;
+    let currentSessionRevision = "";
     let sessionsCache = [];
     let pendingIndicator = null;
     let impersonationOptionsCache = [];
     let statusRefreshTimer = null;
     let statusRefreshInFlight = false;
+    let sessionRefreshTimer = null;
+    let sessionRefreshInFlight = false;
     let confirmResolver = null;
     function describeIchOption(option) {{
       if (!option) return "";
@@ -6005,9 +6139,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
       return date.toLocaleTimeString([], {{ hour: "2-digit", minute: "2-digit", second: "2-digit" }});
     }}
 
-    function addMessage(kind, text) {{
+    function addMessage(kind, text, labelOverride) {{
       const labels = {{ user: "Operator", architect: "archi", system: "System" }};
-      appendMessage(kind, labels[kind] || "Message", text);
+      appendMessage(kind, labelOverride || labels[kind] || "Message", text);
     }}
     function showPendingIndicator(label = "archi", text = "Thinking") {{
       hidePendingIndicator();
@@ -6252,7 +6386,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
         return;
       }}
       const role = message.role === "architect" ? "architect" : message.role === "system" ? "system" : "user";
-      addMessage(role, message.content || "");
+      const label = metadata.kind === "router_message" && metadata.label ? String(metadata.label) : null;
+      addMessage(role, message.content || "", label);
     }}
     function isDestructiveMessage(message) {{
       const trimmed = String(message || "").trim();
@@ -6265,10 +6400,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
       addMessage("architect", "I am archi. Chat is live, and SCMD remains available for direct system operations.");
       addMessage("system", "Example: SCMD: curl -X GET /hives/{hive}/nodes");
     }}
-    function resetChatViewport() {{
+    function resetChatViewport(preserveComposer = false) {{
       hidePendingIndicator();
       messages.innerHTML = "";
-      input.value = "";
+      if (!preserveComposer) {{
+        input.value = "";
+      }}
     }}
     function formatSessionMeta(session) {{
       if (!session) return "waiting for first message";
@@ -6511,11 +6648,18 @@ fn architect_index_html(state: &ArchitectState) -> String {
         composerHint.textContent = base + " Running in operator mode.";
       }}
     }}
-    function renderSession(detail, showWelcome = false) {{
-      resetChatViewport();
+    function sessionRevision(detail) {{
+      const session = detail && detail.session ? detail.session : null;
+      const count = session && session.message_count ? Number(session.message_count) : 0;
+      const updated = session && session.last_activity_at_ms ? Number(session.last_activity_at_ms) : 0;
+      return String(count) + ":" + String(updated);
+    }}
+    function renderSession(detail, showWelcome = false, preserveComposer = false) {{
+      resetChatViewport(preserveComposer);
       const session = detail && detail.session ? detail.session : null;
       const sessionId = session && session.session_id ? session.session_id : null;
       currentSessionId = sessionId;
+      currentSessionRevision = sessionRevision(detail);
       if (sessionId) {{
         localStorage.setItem(currentSessionStorageKey, sessionId);
       }}
@@ -6537,12 +6681,34 @@ fn architect_index_html(state: &ArchitectState) -> String {
         renderSession(existingDetail, showWelcome);
         return;
       }}
-      const res = await fetch(sessionsUrl + "/" + encodeURIComponent(sessionId));
+      const res = await fetch(sessionsUrl + "/" + encodeURIComponent(sessionId), {{ cache: "no-store" }});
       if (!res.ok) {{
         throw new Error("session load failed");
       }}
       const detail = await res.json();
       renderSession(detail, showWelcome);
+    }}
+    async function refreshCurrentSession(options = {{}}) {{
+      const force = !!(options && options.force);
+      if (!currentSessionId || sessionRefreshInFlight) {{
+        return;
+      }}
+      sessionRefreshInFlight = true;
+      try {{
+        const res = await fetch(sessionsUrl + "/" + encodeURIComponent(currentSessionId), {{ cache: "no-store" }});
+        if (!res.ok) {{
+          return;
+        }}
+        const detail = await res.json();
+        const nextRevision = sessionRevision(detail);
+        if (force || nextRevision !== currentSessionRevision) {{
+          renderSession(detail, false, true);
+          await refreshSessionList(currentSessionId);
+        }}
+      }} catch (_err) {{
+      }} finally {{
+        sessionRefreshInFlight = false;
+      }}
     }}
     async function refreshStatus(options = {{}}) {{
       const force = !!(options && options.force);
@@ -6572,6 +6738,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
         statusRefreshTimer = null;
       }}
     }}
+    function stopSessionRefreshLoop() {{
+      if (sessionRefreshTimer) {{
+        window.clearTimeout(sessionRefreshTimer);
+        sessionRefreshTimer = null;
+      }}
+    }}
     function scheduleStatusRefresh(delayMs) {{
       stopStatusRefreshLoop();
       statusRefreshTimer = window.setTimeout(async () => {{
@@ -6586,6 +6758,17 @@ fn architect_index_html(state: &ArchitectState) -> String {
     function restartStatusRefreshLoop(immediate = false) {{
       const delay = immediate ? 0 : (document.hidden ? statusRefreshHiddenMs : statusRefreshActiveMs);
       scheduleStatusRefresh(delay);
+    }}
+    function scheduleSessionRefresh(delayMs) {{
+      stopSessionRefreshLoop();
+      sessionRefreshTimer = window.setTimeout(async () => {{
+        await refreshCurrentSession();
+        scheduleSessionRefresh(document.hidden ? sessionRefreshHiddenMs : sessionRefreshActiveMs);
+      }}, delayMs);
+    }}
+    function restartSessionRefreshLoop(immediate = false) {{
+      const delay = immediate ? 0 : (document.hidden ? sessionRefreshHiddenMs : sessionRefreshActiveMs);
+      scheduleSessionRefresh(delay);
     }}
     async function submit() {{
       const message = input.value.trim();
@@ -6623,8 +6806,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
           localStorage.setItem(currentSessionStorageKey, currentSessionId);
         }}
         hidePendingIndicator();
-        renderResponsePayload(data.status === "ok" ? "architect" : "system", data);
+        if (!(data && data.output && data.output.suppress_echo === true)) {{
+          renderResponsePayload(data.status === "ok" ? "architect" : "system", data);
+        }}
         await refreshSessionList(currentSessionId);
+        await refreshCurrentSession({{ force: true }});
       }} catch (err) {{
         hidePendingIndicator();
         addMessage("system", "Request failed: " + err);
@@ -6708,9 +6894,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
     document.addEventListener("visibilitychange", () => {{
       if (document.hidden) {{
         restartStatusRefreshLoop(false);
+        restartSessionRefreshLoop(false);
       }} else {{
         refreshStatus({{ force: true }});
+        refreshCurrentSession({{ force: true }});
         restartStatusRefreshLoop(false);
+        restartSessionRefreshLoop(false);
       }}
     }});
     async function bootstrap() {{
@@ -6724,6 +6913,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       await refreshStatus({{ force: true }});
       restartStatusRefreshLoop(false);
+      restartSessionRefreshLoop(false);
     }}
     bootstrap().catch((err) => {{
       addMessage("system", "Bootstrap failed: " + err);
