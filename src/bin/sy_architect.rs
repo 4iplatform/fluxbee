@@ -21,9 +21,11 @@ use fluxbee_ai_sdk::{
     ImmediateConversationMemory, ImmediateInteraction, ImmediateInteractionKind,
     ImmediateOperation, ImmediateRole, ModelSettings, OpenAiResponsesClient,
 };
+use fluxbee_sdk::payload::TextV1Payload;
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
 use fluxbee_sdk::{
     admin_command, connect, list_ich_options_from_hive_config, AdminCommandRequest,
-    IdentityIchOption, NodeConfig, NodeError, NodeReceiver,
+    IdentityIchOption, NodeConfig, NodeError, NodeReceiver, NodeSender,
 };
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
@@ -138,6 +140,7 @@ struct ArchitectState {
     ai_runtime: Option<ArchitectAiRuntime>,
     chat_lock: Arc<Mutex<()>>,
     pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
+    router_sender: Arc<Mutex<Option<NodeSender>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -710,6 +713,7 @@ async fn main() -> Result<(), ArchitectError> {
         ai_runtime,
         chat_lock: Arc::new(Mutex::new(())),
         pending_actions: Arc::new(Mutex::new(HashMap::new())),
+        router_sender: Arc::new(Mutex::new(None)),
     });
 
     ensure_chat_storage(&state).await?;
@@ -888,15 +892,18 @@ async fn clear_pending_action(
 async fn router_connect_loop(config: NodeConfig, state: Arc<ArchitectState>) {
     loop {
         match connect(&config).await {
-            Ok((_sender, receiver)) => {
+            Ok((sender, receiver)) => {
+                *state.router_sender.lock().await = Some(sender);
                 state.router_connected.store(true, Ordering::Relaxed);
                 tracing::info!(node = %state.node_name, "sy.architect connected to router");
                 if let Err(err) = router_recv_loop(receiver).await {
                     tracing::warn!(error = %err, "sy.architect router loop ended");
                 }
+                *state.router_sender.lock().await = None;
                 state.router_connected.store(false, Ordering::Relaxed);
             }
             Err(err) => {
+                *state.router_sender.lock().await = None;
                 state.router_connected.store(false, Ordering::Relaxed);
                 tracing::warn!(error = %err, "sy.architect router connect failed");
             }
@@ -1234,6 +1241,27 @@ async fn handle_chat_message(
             session_id: Some(resolved_session_id.clone()),
             session_title: Some(session.title.clone()),
         }
+    } else if session.chat_mode == CHAT_MODE_IMPERSONATION {
+        match handle_impersonation_chat(state, &session, message.trim()).await {
+            Ok(output) => ChatResponse {
+                status: "ok".to_string(),
+                mode: "chat".to_string(),
+                output,
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
+            },
+            Err(err) => ChatResponse {
+                status: "error".to_string(),
+                mode: "chat".to_string(),
+                output: json!({
+                    "error": err.to_string(),
+                    "message": err.to_string(),
+                    "router_connected": state.router_connected.load(Ordering::Relaxed),
+                }),
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
+            },
+        }
     } else {
         match handle_ai_chat(state, &session, message.trim()).await {
             Ok(output) => ChatResponse {
@@ -1363,6 +1391,104 @@ async fn handle_ai_chat(
         "provider": "openai",
         "model": runtime.model,
         "tool_results": tool_results,
+    }))
+}
+
+async fn handle_impersonation_chat(
+    state: &ArchitectState,
+    session: &ChatSessionRecord,
+    input: &str,
+) -> Result<Value, ArchitectError> {
+    let sender = state
+        .router_sender
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| -> ArchitectError {
+            "Router is not connected, so the impersonated message could not be dispatched."
+                .to_string()
+                .into()
+        })?;
+    let effective_ilk =
+        none_if_empty(&session.effective_ilk).ok_or_else(|| -> ArchitectError {
+            "Impersonation dispatch requires an effective_ilk in the session profile."
+                .to_string()
+                .into()
+        })?;
+    let thread_id = none_if_empty(&session.thread_id).ok_or_else(|| -> ArchitectError {
+        "Impersonation dispatch requires a thread_id so the downstream node can keep continuity."
+            .to_string()
+            .into()
+    })?;
+    let effective_ich_id = none_if_empty(&session.effective_ich_id);
+    let source_channel_kind = none_if_empty(&session.source_channel_kind);
+    let impersonation_target = none_if_empty(&session.impersonation_target);
+    let trace_id = Uuid::new_v4().to_string();
+
+    let mut context = serde_json::Map::new();
+    context.insert("thread_id".to_string(), Value::String(thread_id.clone()));
+    context.insert(
+        "chat_mode".to_string(),
+        Value::String(CHAT_MODE_IMPERSONATION.to_string()),
+    );
+    context.insert(
+        "session_id".to_string(),
+        Value::String(session.session_id.clone()),
+    );
+    context.insert("src_ilk".to_string(), Value::String(effective_ilk.clone()));
+    if let Some(value) = effective_ich_id.clone() {
+        context.insert("effective_ich_id".to_string(), Value::String(value.clone()));
+        context.insert("ich_id".to_string(), Value::String(value));
+    }
+    if let Some(value) = source_channel_kind.clone() {
+        context.insert("source_channel_kind".to_string(), Value::String(value));
+    }
+    if let Some(value) = impersonation_target.clone() {
+        context.insert("impersonation_target".to_string(), Value::String(value));
+    }
+
+    let payload =
+        TextV1Payload::new(input, vec![])
+            .to_value()
+            .map_err(|err| -> ArchitectError {
+                format!("failed to build impersonation text payload: {err}").into()
+            })?;
+    let msg = Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            dst: Destination::Resolve,
+            ttl: 16,
+            trace_id: trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: "user".to_string(),
+            msg: None,
+            src_ilk: Some(effective_ilk.clone()),
+            scope: effective_ich_id.clone(),
+            target: impersonation_target.clone(),
+            action: None,
+            priority: None,
+            context: Some(Value::Object(context)),
+        },
+        payload,
+    };
+    sender.send(msg).await.map_err(|err| -> ArchitectError {
+        format!("failed to dispatch impersonation message via router: {err}").into()
+    })?;
+
+    Ok(json!({
+        "message": "Impersonation message dispatched via router with the selected ILK/ICH context.",
+        "dispatch": {
+            "status": "sent",
+            "trace_id": trace_id,
+            "thread_id": thread_id,
+            "effective_ilk": effective_ilk,
+            "effective_ich_id": effective_ich_id,
+            "source_channel_kind": source_channel_kind,
+            "impersonation_target": impersonation_target,
+            "route": "resolve",
+            "reply_capture": "router_log_only",
+        }
     }))
 }
 
