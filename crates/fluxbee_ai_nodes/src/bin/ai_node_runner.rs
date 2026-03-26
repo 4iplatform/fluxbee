@@ -1673,12 +1673,18 @@ async fn run_single_connection_runtime(
         };
 
         if let Some(mut response) = maybe_response {
+            tracing::debug!(
+                trace_id = %response.routing.trace_id,
+                dst = ?response.routing.dst,
+                "sending ai response to router"
+            );
             response.routing.src = connection.uuid().await;
             tokio::time::timeout(config.write_timeout, connection.write(response))
                 .await
                 .map_err(|_| {
                     fluxbee_ai_sdk::errors::AiSdkError::Timeout("router write timeout".to_string())
                 })??;
+            tracing::debug!("ai response delivered to router");
             responses_sent = responses_sent.saturating_add(1);
         }
         processed_messages = processed_messages.saturating_add(1);
