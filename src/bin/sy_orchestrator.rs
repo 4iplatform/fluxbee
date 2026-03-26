@@ -4448,12 +4448,28 @@ async fn list_nodes_flow(
 ) -> serde_json::Value {
     let target_hive = target_hive_from_payload(payload, &state.hive_id);
     if target_hive == state.hive_id {
+        let inventory_payload = serde_json::json!({
+            "scope": "hive",
+            "filter_hive": state.hive_id,
+        });
+        let inventory = inventory_flow(state, &inventory_payload);
+        if inventory.get("status").and_then(|value| value.as_str()) == Some("ok") {
+            return serde_json::json!({
+                "status": "ok",
+                "target": state.hive_id,
+                "hive": state.hive_id,
+                "inventory_source": "lsa_inventory",
+                "hive_status": inventory.get("hive_status").cloned().unwrap_or(serde_json::Value::Null),
+                "node_count": inventory.get("node_count").cloned().unwrap_or(serde_json::json!(0)),
+                "nodes": inventory.get("nodes").cloned().unwrap_or_else(|| serde_json::json!([])),
+            });
+        }
         return match managed_node_inventory(state) {
             Ok(nodes) => serde_json::json!({
                 "status": "ok",
                 "target": state.hive_id,
                 "hive": state.hive_id,
-                "inventory_source": "managed_instances",
+                "inventory_source": "managed_instances_fallback",
                 "nodes": nodes,
             }),
             Err(err) => serde_json::json!({
