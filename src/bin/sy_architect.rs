@@ -58,6 +58,9 @@ Rules:
 - If you are unsure which Fluxbee action or path exists, inspect `/admin/actions` or `/admin/actions/{action}` before answering.
 - The admin help endpoint includes a standardized request contract with path params, body fields, notes, and example SCMD. Use it instead of guessing payloads.
 - Use the available read-only system tool when you need live Fluxbee state instead of guessing.
+- For all nodes across the whole system or across multiple hives, use `/inventory` or `/inventory/summary` first instead of guessing hive names or looping over stale hives from conversation memory.
+- Use `/hives/{hive}/nodes` only for one explicit hive.
+- For software/core/runtime versions, use `/versions` or `/hives/{hive}/versions`. Do not infer versions from `/hives/{hive}/nodes`.
 - For mutations, use the write tool only to stage the action. Then instruct the operator to reply CONFIRM or CANCEL. Do not claim the mutation ran before confirmation.
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.
@@ -392,7 +395,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Read-only Fluxbee path, for example /hives/motherbee/nodes or /admin/actions"
+                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions"
                     },
                     "body": {
                         "type": "object",
