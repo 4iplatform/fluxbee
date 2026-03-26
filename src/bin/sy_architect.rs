@@ -1519,6 +1519,9 @@ fn router_message_session_id(msg: &Message) -> Option<String> {
 }
 
 fn router_message_label(msg: &Message) -> String {
+    if msg.meta.msg_type.eq_ignore_ascii_case("system") {
+        return "System".to_string();
+    }
     msg.meta
         .src_ilk
         .as_deref()
@@ -1529,6 +1532,23 @@ fn router_message_label(msg: &Message) -> String {
 }
 
 fn router_message_text(msg: &Message) -> String {
+    if msg.meta.msg_type.eq_ignore_ascii_case("system")
+        && msg.meta.msg.as_deref() == Some("UNREACHABLE")
+    {
+        let reason = msg
+            .payload
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let original_dst = msg
+            .payload
+            .get("original_dst")
+            .and_then(Value::as_str)
+            .unwrap_or("resolve");
+        return format!(
+            "Router returned UNREACHABLE: reason={reason}, original_dst={original_dst}"
+        );
+    }
     if let Some(text) = extract_text(&msg.payload)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -1569,10 +1589,15 @@ async fn persist_router_incoming_message(
     let now = now_epoch_ms();
     let content = router_message_text(msg);
     let label = router_message_label(msg);
+    let role = if msg.meta.msg_type.eq_ignore_ascii_case("system") {
+        "system"
+    } else {
+        "architect"
+    };
     let row = ChatMessageRecord {
         message_id: Uuid::new_v4().to_string(),
         session_id: session.session_id.clone(),
-        role: "architect".to_string(),
+        role: role.to_string(),
         content: content.clone(),
         timestamp_ms: now,
         mode: "chat".to_string(),
