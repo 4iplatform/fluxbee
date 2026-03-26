@@ -61,6 +61,7 @@ Rules:
 - For all nodes across the whole system or across multiple hives, use `/inventory` or `/inventory/summary` first instead of guessing hive names or looping over stale hives from conversation memory.
 - Use `/hives/{hive}/nodes` only for one explicit hive.
 - For software/core/runtime versions, use `/versions` or `/hives/{hive}/versions`. Do not infer versions from `/hives/{hive}/nodes`.
+- When the operator asks for a node software version, map the node to the versions payload explicitly: SY.identity@hive -> core.components['sy-identity'].version; AI.chat@hive -> runtimes.runtimes['AI.chat'].current; IO.slack.T123@hive -> runtimes.runtimes['IO.slack'].current.
 - For mutations, use the write tool only to stage the action. Then instruct the operator to reply CONFIRM or CANCEL. Do not claim the mutation ran before confirmation.
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.

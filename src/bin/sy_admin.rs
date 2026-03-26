@@ -3740,6 +3740,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "list_nodes" => vec![
             "This endpoint is hive-scoped only.",
             "For all nodes across the system, use GET /inventory or GET /inventory/summary instead.",
+            "For node software versions, use GET /versions or GET /hives/{hive}/versions and map node names to core/runtime entries.",
         ],
         "run_node" => vec![
             "runtime can be omitted when it is derivable from node_name.",
@@ -3761,6 +3762,10 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "list_versions" | "get_versions" => vec![
             "These endpoints report core component versions and runtime availability/current selections.",
             "They describe versions available to a hive, not the state of one node instance.",
+            "For SY nodes, map node names to core components: for example SY.identity@motherbee -> core.components['sy-identity'].version.",
+            "For runtime-backed nodes, map the node runtime family to runtimes.runtimes[<runtime>].current: for example AI.chat@motherbee -> runtimes.runtimes['AI.chat'].current.",
+            "For IO or WF nodes with instance suffixes, use the runtime family/prefix, for example IO.slack.T123@motherbee -> IO.slack and WF.blob.consume.diag.x@y -> WF.blob.consume.diag when present.",
+            "Use GET /versions for cross-hive comparisons and GET /hives/{hive}/versions for one hive.",
         ],
         "update" => vec![
             "Legacy fields version/hash are rejected; use manifest_version/manifest_hash.",
