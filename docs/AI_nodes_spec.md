@@ -1,4 +1,4 @@
-# AI Nodes Specification — Consolidated Draft Replacement (v1)
+﻿# AI Nodes Specification — Consolidated Draft Replacement (v1)
 
 > ✅ Este documento consolida las Partes 1–5 en una única especificación “reemplazo” para **AI Nodes** en Fluxbee.  
 > Alcance: **AI Nodes** (Control Plane + Data Plane + Behaviors/Providers + Schema/Validation + Operación).  
@@ -1577,3 +1577,54 @@ Nota:
 ✅ **NORMATIVO (MVP)**:
 - Se asume un único proceso writer (la instancia del nodo) para su store.
 - El nodo debe serializar accesos concurrentes a un mismo key de estado para evitar corrupcion (mutex/actor queue).
+
+## 10. Immediate Conversation Memory in `ai_node_runner` (v1)
+
+> Objective: add short-horizon conversation continuity in `openai_chat` nodes without mixing it with `thread_state`.
+
+### 10.1 Scope and activation
+
+NORMATIVE (v1):
+- Applies to `behavior.kind = openai_chat`.
+- Enabled via config:
+  - `runtime.immediate_memory.enabled = true`
+- If disabled (`false`), runner keeps the classic path without immediate memory.
+
+### 10.2 Keying and isolation
+
+NORMATIVE (v1):
+- Canonical key is `src_ilk`.
+- `thread_id` is kept as auxiliary metadata.
+- Store remains private per node: one node does not read immediate memory from another node.
+
+### 10.3 Relationship with `thread_state`
+
+NORMATIVE (v1):
+- `thread_state_*` remains the hard-state tool store.
+- `immediate_memory` is short-horizon conversational context managed by the runner.
+- Both stores are separate (semantics and path), with no cross-overwrite.
+
+### 10.4 Persistence and path
+
+NORMATIVE (v1):
+- Runner persists immediate memory per `src_ilk` under:
+  - `${STATE_DIR}/ai-nodes/<node_name>/immediate-memory/threads/`
+- Runner applies pruning according to configured limits.
+
+### 10.5 Runtime config (v1)
+
+NORMATIVE (v1): supported `runtime.immediate_memory` fields:
+- `enabled` (bool, default `false`)
+- `recent_interactions_max` (int, default `10`)
+- `active_operations_max` (int, default `8`)
+- `summary_max_chars` (int, default `1600`)
+- `summary_refresh_every_turns` (int, default `3`)
+- `trim_noise_enabled` (bool, default `true`)
+
+### 10.6 Functional status in current v1
+
+NORMATIVE (current v1):
+- Runner builds `FunctionRunInput` and uses `run_with_input(...)` when immediate memory is enabled.
+- `recent_interactions` is rehydrated/persisted by `src_ilk`.
+- `active_operations` is currently empty in runner v1.
+- `conversation_summary` refresh remains for a dedicated next phase.
