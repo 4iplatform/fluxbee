@@ -3126,13 +3126,15 @@ fn admin_action_summary(action: &str) -> &'static str {
         "hive_status" => "Read the local hive status summary.",
         "list_hives" => "List all known hives.",
         "get_hive" => "Read one hive definition.",
-        "list_nodes" => "List nodes for a hive.",
+        "list_nodes" => {
+            "List nodes for one hive only. Use inventory for system-wide node visibility."
+        }
         "get_node_status" => "Read the effective runtime status of one node.",
         "get_node_state" => "Read the persisted state payload of one node.",
         "get_node_config" => "Read the stored node config payload.",
         "list_ilks" => "List identity ilks in a hive.",
         "get_ilk" => "Read one identity ilk.",
-        "inventory" => "Read inventory summary or hive inventory view.",
+        "inventory" => "Read global or per-hive inventory, including system-wide node visibility.",
         "list_versions" => "List runtime versions across hives.",
         "get_versions" => "Read runtime versions for one hive.",
         "list_runtimes" => "List runtimes for one hive.",
@@ -3735,6 +3737,10 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Motherbee-only operation.",
             "For HTTP usage the hive id is in the body for add_hive and in the path for remove_hive.",
         ],
+        "list_nodes" => vec![
+            "This endpoint is hive-scoped only.",
+            "For all nodes across the system, use GET /inventory or GET /inventory/summary instead.",
+        ],
         "run_node" => vec![
             "runtime can be omitted when it is derivable from node_name.",
             "For internal ADMIN_COMMAND dispatch, the hive target is encoded via payload.target; in HTTP it comes from /hives/{hive}.",
@@ -3748,7 +3754,9 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Internal admin commands may still carry the identifier in payload.",
         ],
         "inventory" => vec![
-            "Use /summary for global counts and /hive for the detailed hive inventory view.",
+            "Use GET /inventory for the full global inventory view.",
+            "Use GET /inventory/summary for global counts only.",
+            "Use GET /inventory/{hive} or /hives/{hive}/inventory/hive for one hive.",
         ],
         "update" => vec![
             "Legacy fields version/hash are rejected; use manifest_version/manifest_hash.",
