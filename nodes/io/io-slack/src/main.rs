@@ -640,38 +640,86 @@ impl SlackClients {
         mime: &str,
         bytes: Vec<u8>,
     ) -> Result<()> {
-        let part = reqwest::multipart::Part::bytes(bytes)
-            .file_name(filename.to_string())
-            .mime_str(mime)
-            .map_err(|err| anyhow::anyhow!("invalid attachment mime for upload: {err}"))?;
-        let mut form = reqwest::multipart::Form::new()
-            .text("channels", channel.to_string())
-            .part("file", part);
-        if let Some(ts) = thread_ts {
-            form = form.text("thread_ts", ts.to_string());
+        #[derive(Deserialize)]
+        struct GetUploadUrlResp {
+            ok: bool,
+            upload_url: Option<String>,
+            file_id: Option<String>,
+            error: Option<String>,
         }
 
         #[derive(Deserialize)]
-        struct UploadResp {
+        struct CompleteUploadResp {
             ok: bool,
             error: Option<String>,
         }
 
-        let resp: UploadResp = self
+        let get_resp: GetUploadUrlResp = self
             .http
-            .post("https://slack.com/api/files.upload")
+            .post("https://slack.com/api/files.getUploadURLExternal")
             .bearer_auth(&self.slack_bot_token)
-            .multipart(form)
+            .json(&serde_json::json!({
+                "filename": filename,
+                "length": bytes.len(),
+            }))
             .send()
             .await?
             .json()
             .await?;
-        if !resp.ok {
+        if !get_resp.ok {
             return Err(anyhow::anyhow!(
-                "files.upload failed: {}",
-                resp.error.unwrap_or_else(|| "unknown".to_string())
+                "files.getUploadURLExternal failed: {}",
+                get_resp.error.unwrap_or_else(|| "unknown".to_string())
             ));
         }
+        let upload_url = get_resp
+            .upload_url
+            .ok_or_else(|| anyhow::anyhow!("missing upload_url in files.getUploadURLExternal"))?;
+        let file_id = get_resp
+            .file_id
+            .ok_or_else(|| anyhow::anyhow!("missing file_id in files.getUploadURLExternal"))?;
+
+        let upload_response = self
+            .http
+            .post(upload_url)
+            .header(reqwest::header::CONTENT_TYPE, mime)
+            .body(bytes)
+            .send()
+            .await?;
+        if !upload_response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "external upload failed with status {}",
+                upload_response.status()
+            ));
+        }
+
+        let mut complete_payload = serde_json::json!({
+            "files": [{
+                "id": file_id,
+                "title": filename,
+            }],
+            "channel_id": channel,
+        });
+        if let Some(ts) = thread_ts {
+            complete_payload["thread_ts"] = serde_json::Value::String(ts.to_string());
+        }
+
+        let complete_resp: CompleteUploadResp = self
+            .http
+            .post("https://slack.com/api/files.completeUploadExternal")
+            .bearer_auth(&self.slack_bot_token)
+            .json(&complete_payload)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if !complete_resp.ok {
+            return Err(anyhow::anyhow!(
+                "files.completeUploadExternal failed: {}",
+                complete_resp.error.unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+
         Ok(())
     }
 }
