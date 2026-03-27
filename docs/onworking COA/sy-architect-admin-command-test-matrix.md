@@ -65,7 +65,7 @@ TEST_OPA_VERSION=12
 
 ### 4.1 Admin catalog
 
-`list_admin_actions`
+[x] `list_admin_actions`
 
 - curl:
 ```bash
@@ -78,7 +78,7 @@ SCMD: curl -X GET /admin/actions
 - check:
   - devuelve catálogo dinámico de acciones
 
-`get_admin_action_help`
+[x] `get_admin_action_help`
 
 - curl:
 ```bash
@@ -93,7 +93,7 @@ SCMD: curl -X GET /admin/actions/add_hive
 
 ### 4.2 Hive / global status
 
-`hive_status`
+[x] `hive_status`
 
 - curl:
 ```bash
@@ -106,7 +106,7 @@ SCMD: curl -X GET /hive/status
 - check:
   - `status=ok`
 
-`list_hives`
+[x] `list_hives`
 
 - curl:
 ```bash
@@ -119,7 +119,7 @@ SCMD: curl -X GET /hives
 - check:
   - lista hives conocidas
 
-`get_hive`
+[x] `get_hive`
 
 - curl:
 ```bash
@@ -132,7 +132,7 @@ SCMD: curl -X GET /hives/worker-220-other
 - check:
   - devuelve definición de una hive
 
-`inventory` summary
+[x] `inventory` summary
 
 - curl:
 ```bash
@@ -145,7 +145,7 @@ SCMD: curl -X GET /hives/motherbee/inventory/summary
 - check:
   - total de hives/nodes y timestamps
 
-`inventory` hive
+[x] `inventory` hive
 
 - curl:
 ```bash
@@ -160,7 +160,7 @@ SCMD: curl -X GET /hives/motherbee/inventory/hive
 
 ### 4.3 Versions / runtimes / deployments / drift
 
-`list_versions`
+[x] `list_versions`
 
 - curl:
 ```bash
@@ -173,7 +173,7 @@ SCMD: curl -X GET /versions
 - check:
   - vista global de versiones
 
-`get_versions`
+[ ] `get_versions`
 
 - curl:
 ```bash
@@ -186,7 +186,7 @@ SCMD: curl -X GET /hives/motherbee/versions
 - check:
   - versiones/readiness de una hive
 
-`list_runtimes`
+[ ] `list_runtimes`
 
 - curl:
 ```bash
@@ -199,7 +199,7 @@ SCMD: curl -X GET /hives/motherbee/runtimes
 - check:
   - runtimes presentes
 
-`get_runtime`
+[ ] `get_runtime`
 
 - curl:
 ```bash
@@ -212,7 +212,7 @@ SCMD: curl -X GET /hives/motherbee/runtimes/AI.chat
 - check:
   - detalle de runtime
 
-`list_deployments`
+[ ] `list_deployments`
 
 - curl:
 ```bash
@@ -225,7 +225,7 @@ SCMD: curl -X GET /deployments
 - check:
   - lista global de deployments
 
-`get_deployments`
+[ ] `get_deployments`
 
 - curl:
 ```bash
@@ -238,7 +238,7 @@ SCMD: curl -X GET /hives/motherbee/deployments
 - check:
   - deployments por hive
 
-`list_drift_alerts`
+[ ] `list_drift_alerts`
 
 - curl:
 ```bash
@@ -251,7 +251,7 @@ SCMD: curl -X GET /drift-alerts
 - check:
   - alertas globales
 
-`get_drift_alerts`
+[ ] `get_drift_alerts`
 
 - curl:
 ```bash
@@ -266,7 +266,7 @@ SCMD: curl -X GET /hives/motherbee/drift-alerts
 
 ### 4.4 Nodes / identity / storage / network
 
-`list_nodes`
+[ ] `list_nodes`
 
 - curl:
 ```bash
@@ -279,7 +279,7 @@ SCMD: curl -X GET /hives/motherbee/nodes
 - check:
   - lista instancias persistidas/visibles
 
-`get_node_status`
+[ ] `get_node_status`
 
 - curl:
 ```bash
@@ -292,7 +292,7 @@ SCMD: curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/status
 - check:
   - snapshot canónico de lifecycle/health
 
-`get_node_config`
+[ ] `get_node_config`
 
 - curl:
 ```bash
@@ -305,7 +305,7 @@ SCMD: curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/config
 - check:
   - config persistida
 
-`get_node_state`
+[ ] `get_node_state`
 
 - curl:
 ```bash
@@ -318,7 +318,7 @@ SCMD: curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/state
 - check:
   - state diagnóstica o `null`
 
-`list_ilks`
+[ ] `list_ilks`
 
 - curl:
 ```bash
@@ -331,7 +331,7 @@ SCMD: curl -X GET /hives/motherbee/identity/ilks
 - check:
   - ilks disponibles
 
-`get_ilk`
+[ ] `get_ilk`
 
 - curl:
 ```bash
@@ -344,7 +344,7 @@ SCMD: curl -X GET /hives/motherbee/identity/ilks/demo-ilk
 - check:
   - detalle de ILK
 
-`list_routes`
+[ ] `list_routes`
 
 - curl:
 ```bash
@@ -357,7 +357,7 @@ SCMD: curl -X GET /hives/motherbee/routes
 - check:
   - rutas configuradas
 
-`list_vpns`
+[ ] `list_vpns`
 
 - curl:
 ```bash
@@ -370,7 +370,7 @@ SCMD: curl -X GET /hives/motherbee/vpns
 - check:
   - patrones VPN configurados
 
-`get_storage`
+[ ] `get_storage`
 
 - curl:
 ```bash
@@ -385,7 +385,7 @@ SCMD: curl -X GET /config/storage
 
 ### 4.5 OPA read / validate
 
-`opa_get_policy`
+[ ] `opa_get_policy`
 
 - curl:
 ```bash
@@ -398,7 +398,7 @@ SCMD: curl -X GET /hives/motherbee/opa/policy
 - check:
   - policy actual
 
-`opa_get_status`
+[ ] `opa_get_status`
 
 - curl:
 ```bash
@@ -411,7 +411,7 @@ SCMD: curl -X GET /hives/motherbee/opa/status
 - check:
   - status OPA
 
-`opa_check`
+[ ] `opa_check`
 
 - curl:
 ```bash
@@ -438,7 +438,7 @@ Nota:
 
 ### 5.1 Hive lifecycle
 
-`add_hive`
+[ ] `add_hive`
 
 - curl:
 ```bash
@@ -454,7 +454,7 @@ SCMD: curl -X POST /hives -d '{"hive_id":"worker-220-other","address":"192.168.8
   - luego `GET /hives/worker-220-other`
   - luego `GET /hives`
 
-`remove_hive`
+[ ] `remove_hive`
 
 - curl:
 ```bash
@@ -469,7 +469,7 @@ SCMD: curl -X DELETE /hives/worker-220-other
 
 ### 5.2 Runtime / rollout
 
-`update`
+[ ] `update`
 
 - curl:
 ```bash
@@ -484,7 +484,7 @@ SCMD: curl -X POST /hives/motherbee/update -d '{"manifest_hash":"sha256:deadbeef
 - check:
   - respuesta `ok` o `sync_pending` según readiness
 
-`sync_hint`
+[ ] `sync_hint`
 
 - curl:
 ```bash
@@ -499,7 +499,7 @@ SCMD: curl -X POST /hives/motherbee/sync-hint -d '{"channel":"blob","wait_for_id
 - check:
   - trigger/espera de convergencia
 
-`remove_runtime_version`
+[ ] `remove_runtime_version`
 
 - curl:
 ```bash
@@ -514,7 +514,7 @@ SCMD: curl -X DELETE /hives/motherbee/runtimes/AI.chat/versions/1.2.3
 
 ### 5.3 Routes / VPNs
 
-`add_route`
+[ ] `add_route`
 
 - curl:
 ```bash
@@ -529,7 +529,7 @@ SCMD: curl -X POST /hives/motherbee/routes -d '{"prefix":"AI.chat.","action":"ne
 - check:
   - luego `GET /hives/motherbee/routes`
 
-`delete_route`
+[ ] `delete_route`
 
 - curl:
 ```bash
@@ -542,7 +542,7 @@ SCMD: curl -X DELETE /hives/motherbee/routes/AI.chat.
 - check:
   - luego `GET /hives/motherbee/routes`
 
-`add_vpn`
+[ ] `add_vpn`
 
 - curl:
 ```bash
@@ -557,7 +557,7 @@ SCMD: curl -X POST /hives/motherbee/vpns -d '{"pattern":"worker-*","vpn_id":220}
 - check:
   - luego `GET /hives/motherbee/vpns`
 
-`delete_vpn`
+[ ] `delete_vpn`
 
 - curl:
 ```bash
@@ -572,7 +572,7 @@ SCMD: curl -X DELETE /hives/motherbee/vpns/worker-*
 
 ### 5.4 Node lifecycle / debug
 
-`run_node`
+[ ] `run_node`
 
 - curl:
 ```bash
@@ -588,7 +588,7 @@ SCMD: curl -X POST /hives/motherbee/nodes -d '{"node_name":"AI.chat@motherbee","
   - luego `GET /hives/motherbee/nodes`
   - luego `GET /hives/motherbee/nodes/AI.chat@motherbee/status`
 
-`kill_node`
+[ ] `kill_node`
 
 - curl:
 ```bash
@@ -601,7 +601,7 @@ SCMD: curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee
 - check:
   - luego `GET /hives/motherbee/nodes/AI.chat@motherbee/status`
 
-`remove_node_instance`
+[ ] `remove_node_instance`
 
 - curl:
 ```bash
@@ -614,7 +614,7 @@ SCMD: curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee/instance
 - check:
   - la instancia deja de figurar en `GET /hives/motherbee/nodes`
 
-`set_node_config`
+[ ] `set_node_config`
 
 - curl:
 ```bash
@@ -629,7 +629,7 @@ SCMD: curl -X PUT /hives/motherbee/nodes/SY.admin@motherbee/config -d '{"openai"
 - check:
   - luego `GET /hives/motherbee/nodes/SY.admin@motherbee/config`
 
-`send_node_message`
+[ ] `send_node_message`
 
 - curl:
 ```bash
@@ -646,7 +646,7 @@ SCMD: curl -X POST /hives/motherbee/nodes/SY.admin@motherbee/messages -d '{"msg_
 
 ### 5.5 Storage / OPA
 
-`set_storage`
+[ ] `set_storage`
 
 - curl:
 ```bash
@@ -661,7 +661,7 @@ SCMD: curl -X PUT /config/storage -d '{"path":"/var/lib/fluxbee"}'
 - check:
   - luego `GET /config/storage`
 
-`opa_compile_apply`
+[ ] `opa_compile_apply`
 
 - curl:
 ```bash
@@ -676,7 +676,7 @@ SCMD: curl -X POST /hives/motherbee/opa/policy -d '{"rego":"package router\n\nde
 - check:
   - luego `GET /hives/motherbee/opa/status`
 
-`opa_compile`
+[ ] `opa_compile`
 
 - curl:
 ```bash
@@ -691,7 +691,7 @@ SCMD: curl -X POST /hives/motherbee/opa/policy/compile -d '{"rego":"package rout
 - check:
   - compile ok sin aplicar
 
-`opa_apply`
+[ ] `opa_apply`
 
 - curl:
 ```bash
@@ -706,7 +706,7 @@ SCMD: curl -X POST /hives/motherbee/opa/policy/apply -d '{"version":12}'
 - check:
   - luego `GET /hives/motherbee/opa/status`
 
-`opa_rollback`
+[ ] `opa_rollback`
 
 - curl:
 ```bash
