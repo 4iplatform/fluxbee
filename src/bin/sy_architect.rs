@@ -5708,9 +5708,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
       background: #ffffff;
     }}
     .composer-box {{
-      position: relative;
       display: grid;
       gap: 8px;
+    }}
+    .composer-input-shell {{
+      position: relative;
     }}
     textarea {{
       width: 100%;
@@ -5891,9 +5893,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
         <div id="messages" class="messages"></div>
         <div class="composer">
           <div class="composer-box">
-            <textarea id="input" placeholder="Message or SCMD: curl -X GET /hives/{hive}/nodes"></textarea>
-            <div class="composer-actions">
-              <button id="send">Send</button>
+            <div class="composer-input-shell">
+              <textarea id="input" placeholder="Message or SCMD: curl -X GET /hives/{hive}/nodes"></textarea>
+              <div class="composer-actions">
+                <button id="send">Send</button>
+              </div>
             </div>
             <div id="composer-hint" class="hint">Enter to send. Shift+Enter for newline. Sessions on the left are local and reload-safe.</div>
           </div>
