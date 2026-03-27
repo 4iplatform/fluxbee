@@ -646,30 +646,40 @@ impl SlackClients {
             upload_url: Option<String>,
             file_id: Option<String>,
             error: Option<String>,
+            response_metadata: Option<SlackResponseMetadata>,
         }
 
         #[derive(Deserialize)]
         struct CompleteUploadResp {
             ok: bool,
             error: Option<String>,
+            response_metadata: Option<SlackResponseMetadata>,
         }
 
+        #[derive(Deserialize)]
+        struct SlackResponseMetadata {
+            messages: Option<Vec<String>>,
+        }
+
+        let length = bytes.len().to_string();
         let get_resp: GetUploadUrlResp = self
             .http
             .post("https://slack.com/api/files.getUploadURLExternal")
             .bearer_auth(&self.slack_bot_token)
-            .json(&serde_json::json!({
-                "filename": filename,
-                "length": bytes.len(),
-            }))
+            .form(&[("filename", filename), ("length", length.as_str())])
             .send()
             .await?
             .json()
             .await?;
         if !get_resp.ok {
+            let detail = get_resp
+                .response_metadata
+                .and_then(|m| m.messages)
+                .map(|msgs| msgs.join(" | "))
+                .unwrap_or_else(|| "-".to_string());
             return Err(anyhow::anyhow!(
-                "files.getUploadURLExternal failed: {}",
-                get_resp.error.unwrap_or_else(|| "unknown".to_string())
+                "files.getUploadURLExternal failed: {} detail={detail}",
+                get_resp.error.unwrap_or_else(|| "unknown".to_string()),
             ));
         }
         let upload_url = get_resp
@@ -714,9 +724,14 @@ impl SlackClients {
             .json()
             .await?;
         if !complete_resp.ok {
+            let detail = complete_resp
+                .response_metadata
+                .and_then(|m| m.messages)
+                .map(|msgs| msgs.join(" | "))
+                .unwrap_or_else(|| "-".to_string());
             return Err(anyhow::anyhow!(
-                "files.completeUploadExternal failed: {}",
-                complete_resp.error.unwrap_or_else(|| "unknown".to_string())
+                "files.completeUploadExternal failed: {} detail={detail}",
+                complete_resp.error.unwrap_or_else(|| "unknown".to_string()),
             ));
         }
 
