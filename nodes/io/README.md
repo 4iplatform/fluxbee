@@ -137,6 +137,12 @@ Optional env vars for `io-sim`:
 - `SIM_CONVERSATION_ID` (default `sim-console`)
 - `SIM_THREAD_ID` (optional)
 - `SIM_TENANT_HINT` (optional)
+- `SIM_REPLY_KIND` (default `sim_log`; use `slack_post` to test `IO.slack` outbound)
+- `SIM_REPLY_ADDRESS` (default `stdout`; for Slack use target `channel_id`)
+- `SIM_REPLY_THREAD_TS` (optional; for Slack thread replies)
+- `SIM_REPLY_WORKSPACE_ID` (optional; for Slack context metadata)
+- `SIM_ATTACHMENTS_JSON` (optional JSON array de `BlobRef` para simular adjuntos outbound)
+- `SIM_CONTENT_REF_JSON` (optional JSON object `BlobRef` para simular texto en `content_ref`)
 
 Note:
 - `SIM_DST_NODE` must match the AI registered name (`AI.chat@<hive_id>`).

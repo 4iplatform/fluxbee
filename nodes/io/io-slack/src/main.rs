@@ -12,8 +12,8 @@ use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
 use io_common::io_context::{extract_slack_post_target, slack_inbound_io_context};
 use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox};
 use io_common::text_v1_blob::{
-    build_text_v1_inbound_payload, InboundAttachmentInput, IoBlobContractError,
-    IoBlobRuntimeConfig, IoTextBlobConfig,
+    build_text_v1_inbound_payload, resolve_text_v1_for_outbound, InboundAttachmentInput,
+    IoBlobContractError, IoBlobRuntimeConfig, IoTextBlobConfig,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -102,7 +102,12 @@ async fn main() -> Result<()> {
         None
     };
 
-    let outbound_task = tokio::spawn(run_outbound_loop(inbox.clone(), slack.clone()));
+    let outbound_task = tokio::spawn(run_outbound_loop(
+        inbox.clone(),
+        slack.clone(),
+        blob_toolkit.clone(),
+        blob_payload_cfg.clone(),
+    ));
 
     let inbound_task = tokio::spawn(run_inbound_socket_mode(
         config.clone(),
@@ -625,6 +630,49 @@ impl SlackClients {
             ));
         }
         Ok(response.bytes().await?.to_vec())
+    }
+
+    async fn upload_file(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        filename: &str,
+        mime: &str,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.to_string())
+            .mime_str(mime)
+            .map_err(|err| anyhow::anyhow!("invalid attachment mime for upload: {err}"))?;
+        let mut form = reqwest::multipart::Form::new()
+            .text("channels", channel.to_string())
+            .part("file", part);
+        if let Some(ts) = thread_ts {
+            form = form.text("thread_ts", ts.to_string());
+        }
+
+        #[derive(Deserialize)]
+        struct UploadResp {
+            ok: bool,
+            error: Option<String>,
+        }
+
+        let resp: UploadResp = self
+            .http
+            .post("https://slack.com/api/files.upload")
+            .bearer_auth(&self.slack_bot_token)
+            .multipart(form)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if !resp.ok {
+            return Err(anyhow::anyhow!(
+                "files.upload failed: {}",
+                resp.error.unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1392,7 +1440,12 @@ fn slack_external_id(node_name: &str, user_id: &str) -> String {
     format!("{node_name}:{user_id}")
 }
 
-async fn run_outbound_loop(inbox: Arc<Mutex<RouterInbox>>, slack: Arc<SlackClients>) -> Result<()> {
+async fn run_outbound_loop(
+    inbox: Arc<Mutex<RouterInbox>>,
+    slack: Arc<SlackClients>,
+    blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
+    blob_payload_cfg: IoTextBlobConfig,
+) -> Result<()> {
     loop {
         let Some(msg) = ({
             let mut guard = inbox.lock().await;
@@ -1436,38 +1489,123 @@ async fn run_outbound_loop(inbox: Arc<Mutex<RouterInbox>>, slack: Arc<SlackClien
             continue;
         };
 
-        let text = render_outbound_text(&msg.payload);
-        if text.is_empty() {
-            tracing::debug!(
-                trace_id = %msg.routing.trace_id,
-                payload = %msg.payload,
-                "skipping slack post for empty outbound payload"
-            );
-            continue;
+        let mut sent_any = false;
+        match resolve_text_v1_for_outbound(
+            blob_toolkit.as_ref(),
+            &blob_payload_cfg,
+            &msg.payload,
+            true,
+        )
+        .await
+        {
+            Ok(resolved) => {
+                if !resolved.text.trim().is_empty() {
+                    let blocks = msg.payload.get("blocks").cloned();
+                    tracing::debug!(
+                        slack_channel = target.channel_id,
+                        slack_thread_ts = target.thread_ts.as_deref().unwrap_or(""),
+                        text_len = resolved.text.len(),
+                        text_preview = %truncate(&resolved.text, 120),
+                        "sending slack message"
+                    );
+                    if let Err(e) = slack
+                        .post_message(
+                            &target.channel_id,
+                            &resolved.text,
+                            target.thread_ts.as_deref(),
+                            blocks,
+                        )
+                        .await
+                    {
+                        tracing::warn!(error=?e, "failed to send slack message");
+                    } else {
+                        sent_any = true;
+                        tracing::debug!("slack message sent");
+                    }
+                }
+
+                for attachment in resolved.attachments {
+                    let filename = if attachment.blob_ref.filename_original.trim().is_empty() {
+                        attachment.blob_ref.blob_name.as_str()
+                    } else {
+                        attachment.blob_ref.filename_original.as_str()
+                    };
+                    match std::fs::read(&attachment.path) {
+                        Ok(bytes) => {
+                            if let Err(error) = slack
+                                .upload_file(
+                                    &target.channel_id,
+                                    target.thread_ts.as_deref(),
+                                    filename,
+                                    &attachment.blob_ref.mime,
+                                    bytes,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    error = ?error,
+                                    blob_name = %attachment.blob_ref.blob_name,
+                                    "failed to upload attachment to Slack"
+                                );
+                            } else {
+                                sent_any = true;
+                                tracing::debug!(
+                                    blob_name = %attachment.blob_ref.blob_name,
+                                    filename = %filename,
+                                    "slack attachment uploaded"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                blob_name = %attachment.blob_ref.blob_name,
+                                "failed to read resolved attachment path"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    code = err.canonical_code(),
+                    error = %err,
+                    trace_id = %msg.routing.trace_id,
+                    "failed to resolve outbound text/v1 payload"
+                );
+                let fallback = format!(
+                    "Error ({}) al procesar contenido/adjuntos.",
+                    err.canonical_code()
+                );
+                if let Err(error) = slack
+                    .post_message(
+                        &target.channel_id,
+                        &fallback,
+                        target.thread_ts.as_deref(),
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(error=?error, "failed to send outbound fallback message");
+                } else {
+                    sent_any = true;
+                }
+            }
         }
 
-        let blocks = msg.payload.get("blocks").cloned();
-
-        tracing::debug!(
-            slack_channel = target.channel_id,
-            slack_thread_ts = target.thread_ts.as_deref().unwrap_or(""),
-            text_len = text.len(),
-            text_preview = %truncate(&text, 120),
-            "sending slack message"
-        );
-
-        if let Err(e) = slack
-            .post_message(
-                &target.channel_id,
-                &text,
-                target.thread_ts.as_deref(),
-                blocks,
-            )
-            .await
-        {
-            tracing::warn!(error=?e, "failed to send slack message");
-        } else {
-            tracing::debug!("slack message sent");
+        if !sent_any {
+            let fallback = "No pude entregar el mensaje en Slack (sin contenido util).";
+            if let Err(error) = slack
+                .post_message(
+                    &target.channel_id,
+                    fallback,
+                    target.thread_ts.as_deref(),
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(error=?error, "failed to send final outbound fallback");
+            }
         }
     }
 }
