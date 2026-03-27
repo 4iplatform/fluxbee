@@ -65,6 +65,7 @@ Rules:
 - Use `/hives/{hive}/nodes` only for one explicit hive.
 - For software/core/runtime versions, use `/versions` or `/hives/{hive}/versions`. Do not infer versions from `/hives/{hive}/nodes`.
 - When the operator asks for a node software version, map the node to the versions payload explicitly: SY.identity@hive -> core.components['sy-identity'].version; AI.chat@hive -> runtimes.runtimes['AI.chat'].current; IO.slack.T123@hive -> runtimes.runtimes['IO.slack'].current.
+- For live node-defined config contracts on non-SY nodes, use `POST /hives/{hive}/nodes/{node_name}/control/config-get`. For live node-defined config updates, use `POST /hives/{hive}/nodes/{node_name}/control/config-set`.
 - For mutations, use the write tool only to stage the action. Then instruct the operator to reply CONFIRM or CANCEL. Do not claim the mutation ran before confirmation.
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.
@@ -379,7 +380,9 @@ impl FunctionTool for ArchitectSystemGetTool {
         FunctionToolDefinition {
             name: "fluxbee_system_get".to_string(),
             description: format!(
-                "Read live Fluxbee system state through SY.admin over socket for hive {}. Read-only. Supports GET paths and safe POST checks such as OPA policy validation. Use /admin/actions or /admin/actions/{{action}} when you need dynamic help; those responses include standardized request_contract metadata, body fields, notes, and example_scmd values. Use /inventory or /inventory/summary for system-wide node visibility, and use /versions or /hives/{}/versions for core and runtime versions. Example paths: /inventory, /inventory/summary, /inventory/{}, /versions, /hives/{}/versions, /hives/{}/nodes, /hives/{}/nodes/SY.admin@{}/status, /hives/{}/identity/ilks, /admin/actions, /admin/actions/get_node_status, /admin/actions/get_versions, /config/storage",
+                "Read live Fluxbee system state through SY.admin over socket for hive {}. Read-only. Supports GET paths and safe POST checks such as OPA policy validation or non-SY node CONFIG_GET control-plane discovery. Use /admin/actions or /admin/actions/{{action}} when you need dynamic help; those responses include standardized request_contract metadata, body fields, notes, and example_scmd values. Use /inventory or /inventory/summary for system-wide node visibility, and use /versions or /hives/{}/versions for core and runtime versions. Example paths: /inventory, /inventory/summary, /inventory/{}, /versions, /hives/{}/versions, /hives/{}/nodes, /hives/{}/nodes/SY.admin@{}/status, /hives/{}/nodes/AI.chat@{}/control/config-get, /hives/{}/identity/ilks, /admin/actions, /admin/actions/get_node_status, /admin/actions/get_versions, /config/storage",
+                self.context.hive_id,
+                self.context.hive_id,
                 self.context.hive_id,
                 self.context.hive_id,
                 self.context.hive_id,
@@ -404,7 +407,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "body": {
                         "type": "object",
-                        "description": "Optional JSON object for safe POST checks such as /hives/{hive}/opa/policy/check"
+                        "description": "Optional JSON object for safe POST checks such as /hives/{hive}/opa/policy/check or /hives/{hive}/nodes/{node_name}/control/config-get"
                     }
                 },
                 "required": ["path"]
@@ -2171,6 +2174,7 @@ fn admin_action_allows_ai_write(action: &str) -> bool {
             | "remove_node_instance"
             | "remove_runtime_version"
             | "set_node_config"
+            | "node_control_config_set"
             | "send_node_message"
             | "set_storage"
             | "update"
@@ -2433,6 +2437,8 @@ fn architect_admin_action_timeout(action: &str) -> Duration {
         | "remove_node_instance"
         | "remove_runtime_version"
         | "set_node_config"
+        | "node_control_config_get"
+        | "node_control_config_set"
         | "set_storage"
         | "remove_hive"
         | "opa_compile_apply"
@@ -2854,6 +2860,32 @@ fn translate_scmd(
             Ok(AdminTranslation {
                 admin_target,
                 action: "send_node_message".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "nodes", node_name, "control", "config-get"]) => {
+            let mut params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for node_control_config_get must be a JSON object".into());
+            }
+            params["node_name"] = Value::String((*node_name).to_string());
+            Ok(AdminTranslation {
+                admin_target,
+                action: "node_control_config_get".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "nodes", node_name, "control", "config-set"]) => {
+            let mut params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for node_control_config_set must be a JSON object".into());
+            }
+            params["node_name"] = Value::String((*node_name).to_string());
+            Ok(AdminTranslation {
+                admin_target,
+                action: "node_control_config_set".to_string(),
                 target_hive: (*hive_id).to_string(),
                 params,
             })

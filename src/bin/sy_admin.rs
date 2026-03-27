@@ -975,6 +975,18 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "node_control_config_get",
+        route: InternalActionRoute::Command("node_control_config_get"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "node_control_config_set",
+        route: InternalActionRoute::Command("node_control_config_set"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "list_ilks",
         route: InternalActionRoute::Query("list_ilks"),
         requires_target: true,
@@ -2020,6 +2032,56 @@ async fn handle_hive_paths(
                 handle_admin_command(ctx, client, "send_node_message", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("POST", ["nodes", name, "control", "config-get"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if !payload.is_object() {
+                return Ok(Some((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "node_control_config_get",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": "request body must be a JSON object",
+                    })
+                    .to_string(),
+                )));
+            }
+            payload["node_name"] = serde_json::Value::String(decode_percent(name));
+            let (status, resp) =
+                handle_admin_command(ctx, client, "node_control_config_get", payload, Some(hive))
+                    .await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["nodes", name, "control", "config-set"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if !payload.is_object() {
+                return Ok(Some((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "node_control_config_set",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": "request body must be a JSON object",
+                    })
+                    .to_string(),
+                )));
+            }
+            payload["node_name"] = serde_json::Value::String(decode_percent(name));
+            let (status, resp) =
+                handle_admin_command(ctx, client, "node_control_config_set", payload, Some(hive))
+                    .await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["identity", "ilks"]) => {
             let (status, resp) = handle_admin_query(ctx, client, "list_ilks", Some(hive)).await?;
             Ok(Some((status, resp)))
@@ -2471,11 +2533,13 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "VERSION_MISMATCH"
         | "WAN_NOT_AUTHORIZED"
         | "NODE_INSTANCE_RUNNING"
+        | "NODE_NOT_CONFIGURED"
+        | "STALE_CONFIG_VERSION"
         | "RUNTIME_IN_USE"
         | "RUNTIME_HAS_DEPENDENTS"
         | "RUNTIME_CURRENT_CONFLICT"
         | "BUSY" => 409,
-        "COMPILE_ERROR" => 422,
+        "COMPILE_ERROR" | "INVALID_CONFIG" | "UNSUPPORTED_APPLY_MODE" => 422,
         "NOT_IMPLEMENTED" => 501,
         "SERVICE_FAILED"
         | "SPAWN_FAILED"
@@ -3088,6 +3152,7 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "remove_node_instance"
             | "remove_runtime_version"
             | "set_node_config"
+            | "node_control_config_set"
             | "send_node_message"
             | "set_storage"
             | "update"
@@ -3109,6 +3174,7 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "remove_node_instance"
             | "remove_runtime_version"
             | "set_node_config"
+            | "node_control_config_set"
             | "set_storage"
             | "update"
             | "sync_hint"
@@ -3132,6 +3198,12 @@ fn admin_action_summary(action: &str) -> &'static str {
         "get_node_status" => "Read the effective runtime status of one node.",
         "get_node_state" => "Read the persisted state payload of one node.",
         "get_node_config" => "Read the stored node config payload.",
+        "node_control_config_get" => {
+            "Send CONFIG_GET to a non-SY node and return its live CONFIG_RESPONSE."
+        }
+        "node_control_config_set" => {
+            "Send CONFIG_SET to a non-SY node and return its live CONFIG_RESPONSE."
+        }
         "list_ilks" => "List identity ilks in a hive.",
         "get_ilk" => "Read one identity ilk.",
         "inventory" => "Read global or per-hive inventory, including system-wide node visibility.",
@@ -3183,6 +3255,12 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "get_node_status" => vec!["GET /hives/{hive}/nodes/{node_name}/status"],
         "get_node_state" => vec!["GET /hives/{hive}/nodes/{node_name}/state"],
         "get_node_config" => vec!["GET /hives/{hive}/nodes/{node_name}/config"],
+        "node_control_config_get" => {
+            vec!["POST /hives/{hive}/nodes/{node_name}/control/config-get"]
+        }
+        "node_control_config_set" => {
+            vec!["POST /hives/{hive}/nodes/{node_name}/control/config-set"]
+        }
         "list_ilks" => vec!["GET /hives/{hive}/identity/ilks"],
         "get_ilk" => vec!["GET /hives/{hive}/identity/ilks/{ilk_id}"],
         "inventory" => vec![
@@ -3298,6 +3376,8 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         | "kill_node"
         | "remove_node_instance"
         | "send_node_message"
+        | "node_control_config_get"
+        | "node_control_config_set"
         | "set_node_config" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param(
@@ -3363,6 +3443,7 @@ fn admin_action_body_required(action: &str) -> bool {
             | "add_vpn"
             | "set_node_config"
             | "send_node_message"
+            | "node_control_config_set"
             | "set_storage"
             | "update"
             | "opa_compile_apply"
@@ -3404,6 +3485,28 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "object",
             "Node config patch or replacement object.",
         )],
+        "node_control_config_set" => vec![
+            admin_action_body_field(
+                "schema_version",
+                "u32",
+                "Schema version understood by the node.",
+            ),
+            admin_action_body_field(
+                "config_version",
+                "u64",
+                "Monotonic config version chosen by the caller or node contract.",
+            ),
+            admin_action_body_field(
+                "apply_mode",
+                "string",
+                "Apply mode, currently typically replace.",
+            ),
+            admin_action_body_field(
+                "config",
+                "object",
+                "Node-defined config payload forwarded without platform interpretation.",
+            ),
+        ],
         "send_node_message" => vec![
             admin_action_body_field("msg_type", "string", "System message type."),
             admin_action_body_field(
@@ -3508,6 +3611,39 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "bool",
                 "Notify runtime after persisting the config.",
             ),
+        ],
+        "node_control_config_get" | "node_control_config_set" => vec![
+            admin_action_body_field(
+                "request_id",
+                "string",
+                "Optional caller-defined request id forwarded in payload.",
+            ),
+            admin_action_body_field(
+                "contract_version",
+                "u32",
+                "Optional common control-plane contract version hint.",
+            ),
+            admin_action_body_field(
+                "requested_by",
+                "string",
+                "Optional caller identity label forwarded in payload.",
+            ),
+            admin_action_body_field(
+                "src_ilk",
+                "string",
+                "Optional source ILK forwarded in message metadata.",
+            ),
+            admin_action_body_field(
+                "scope",
+                "string",
+                "Optional metadata scope forwarded with the message.",
+            ),
+            admin_action_body_field(
+                "context",
+                "object",
+                "Optional metadata context forwarded with the message.",
+            ),
+            admin_action_body_field("ttl", "u16", "Optional TTL, default 16."),
         ],
         "send_node_message" => vec![
             admin_action_body_field("msg", "string", "Optional message name."),
@@ -3618,6 +3754,20 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "replace": false,
             "notify": true
         }),
+        "node_control_config_get" => serde_json::json!({
+            "requested_by": "archi"
+        }),
+        "node_control_config_set" => serde_json::json!({
+            "schema_version": 1,
+            "config_version": 7,
+            "apply_mode": "replace",
+            "config": {
+                "behavior": {
+                    "kind": "openai_chat",
+                    "model": "gpt-4.1-mini"
+                }
+            }
+        }),
         "send_node_message" => serde_json::json!({
             "msg_type": "PING",
             "payload": {
@@ -3678,6 +3828,12 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "send_node_message" => {
             r#"curl -X POST /hives/motherbee/nodes/SY.admin@motherbee/messages -d '{"msg_type":"PING","payload":{"ping":true}}'"#
+        }
+        "node_control_config_get" => {
+            r#"curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/control/config-get -d '{"requested_by":"archi"}'"#
+        }
+        "node_control_config_set" => {
+            r#"curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/control/config-set -d '{"schema_version":1,"config_version":7,"apply_mode":"replace","config":{"behavior":{"kind":"openai_chat","model":"gpt-4.1-mini"}}}'"#
         }
         "list_ilks" => "curl -X GET /hives/motherbee/identity/ilks",
         "get_ilk" => "curl -X GET /hives/motherbee/identity/ilks/demo-ilk",
@@ -3749,6 +3905,20 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "kill_node" | "remove_node_instance" | "set_node_config" | "send_node_message" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
+        ],
+        "node_control_config_get" => vec![
+            "The hive target comes from the /hives/{hive} path in HTTP.",
+            "The node_name path segment should be a fully-qualified Fluxbee node name.",
+            "This is the canonical live control-plane discovery path for non-SY nodes.",
+            "Admin forwards CONFIG_GET over L2 unicast and returns the node's CONFIG_RESPONSE.",
+            "The node defines the response contract and config schema; SY.admin only standardizes transport.",
+        ],
+        "node_control_config_set" => vec![
+            "The hive target comes from the /hives/{hive} path in HTTP.",
+            "The node_name path segment should be a fully-qualified Fluxbee node name.",
+            "This is the canonical live control-plane mutation path for non-SY nodes.",
+            "Admin forwards CONFIG_SET over L2 unicast and returns the node's CONFIG_RESPONSE.",
+            "The payload.config object is node-defined and is not interpreted by SY.admin.",
         ],
         "delete_route" | "delete_vpn" => vec![
             "HTTP delete uses the final path segment as identifier.",
@@ -3822,6 +3992,12 @@ async fn handle_admin_command(
     }
     if matches!(action, "send_node_message") {
         return handle_send_node_message(ctx, client, payload, hive).await;
+    }
+    if matches!(
+        action,
+        "node_control_config_get" | "node_control_config_set"
+    ) {
+        return handle_node_control_command(ctx, client, action, payload, hive).await;
     }
     if matches!(action, "get_ilk") {
         return handle_identity_command(ctx, client, action, payload, hive).await;
@@ -3950,6 +4126,150 @@ async fn handle_send_node_message(
         })
         .to_string(),
     ))
+}
+
+async fn handle_node_control_command(
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+    action: &str,
+    payload: serde_json::Value,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    let mut payload_map = payload
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    let Some(node_name) = payload_map
+        .get("node_name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+    else {
+        return Ok((
+            400,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": "node_name is required",
+            })
+            .to_string(),
+        ));
+    };
+    if let Some(node_hive) = node_name
+        .rsplit_once('@')
+        .map(|(_, hive_id)| hive_id.trim())
+    {
+        if !node_hive.is_empty() && node_hive != target_hive {
+            return Ok((
+                400,
+                serde_json::json!({
+                    "status": "error",
+                    "action": action,
+                    "payload": serde_json::Value::Null,
+                    "error_code": "INVALID_REQUEST",
+                    "error_detail": format!(
+                        "node_name hive '{}' does not match path hive '{}'",
+                        node_hive, target_hive
+                    ),
+                })
+                .to_string(),
+            ));
+        }
+    }
+
+    let ttl = payload_map
+        .remove("ttl")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.clamp(1, u8::MAX as u64) as u8)
+        .unwrap_or(16);
+    let src_ilk = payload_map
+        .remove("src_ilk")
+        .and_then(|value| value.as_str().map(|text| text.trim().to_string()))
+        .filter(|value| !value.is_empty());
+    let scope = payload_map
+        .remove("scope")
+        .and_then(|value| value.as_str().map(|text| text.trim().to_string()))
+        .filter(|value| !value.is_empty());
+    let context = payload_map.remove("context");
+
+    let request_msg = match action {
+        "node_control_config_get" => "CONFIG_GET",
+        "node_control_config_set" => "CONFIG_SET",
+        _ => return Err(format!("unsupported node control action: {action}").into()),
+    };
+    let request_payload = serde_json::Value::Object(payload_map);
+    let response = send_system_request_with_meta(
+        client,
+        &node_name,
+        request_msg,
+        "CONFIG_RESPONSE",
+        request_payload,
+        ttl,
+        src_ilk,
+        scope,
+        Some("node_config_control".to_string()),
+        Some(request_msg.to_string()),
+        context,
+        admin_action_timeout(action),
+    )
+    .await;
+
+    match response {
+        Ok(node_response) => {
+            let node_ok = node_response
+                .get("ok")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let node_error = node_response
+                .get("error")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            Ok((
+                200,
+                serde_json::json!({
+                    "status": "ok",
+                    "action": action,
+                    "payload": {
+                        "target": target_hive,
+                        "node_name": node_name,
+                        "request_msg": request_msg,
+                        "response_msg": "CONFIG_RESPONSE",
+                        "node_ok": node_ok,
+                        "node_error": node_error,
+                        "response": node_response,
+                    },
+                    "error_code": serde_json::Value::Null,
+                    "error_detail": serde_json::Value::Null,
+                })
+                .to_string(),
+            ))
+        }
+        Err(err) => {
+            let error_detail = err.to_string();
+            let error_code = infer_transport_error_code(&error_detail).to_string();
+            let status_code = error_code_to_http_status(&error_code);
+            Ok((
+                status_code,
+                serde_json::json!({
+                    "status": "error",
+                    "action": action,
+                    "payload": {
+                        "target": target_hive,
+                        "node_name": node_name,
+                        "request_msg": request_msg,
+                        "response_msg": "CONFIG_RESPONSE",
+                    },
+                    "error_code": error_code,
+                    "error_detail": error_detail,
+                })
+                .to_string(),
+            ))
+        }
+    }
 }
 
 async fn handle_identity_query(
@@ -4419,6 +4739,37 @@ async fn send_system_request(
     payload: serde_json::Value,
     timeout_window: Duration,
 ) -> Result<serde_json::Value, AdminError> {
+    send_system_request_with_meta(
+        client,
+        target,
+        request_msg,
+        expected_response_msg,
+        payload,
+        16,
+        None,
+        None,
+        None,
+        None,
+        None,
+        timeout_window,
+    )
+    .await
+}
+
+async fn send_system_request_with_meta(
+    client: &AdminRouterClient,
+    target: &str,
+    request_msg: &str,
+    expected_response_msg: &str,
+    payload: serde_json::Value,
+    ttl: u8,
+    src_ilk: Option<String>,
+    scope: Option<String>,
+    meta_target: Option<String>,
+    meta_action: Option<String>,
+    context: Option<serde_json::Value>,
+    timeout_window: Duration,
+) -> Result<serde_json::Value, AdminError> {
     use tokio::time::timeout;
 
     let trace_id = Uuid::new_v4().to_string();
@@ -4426,18 +4777,18 @@ async fn send_system_request(
         routing: Routing {
             src: client.sender.uuid().to_string(),
             dst: Destination::Unicast(target.to_string()),
-            ttl: 16,
+            ttl,
             trace_id: trace_id.clone(),
         },
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(request_msg.to_string()),
-            src_ilk: None,
-            scope: None,
-            target: Some(target.to_string()),
-            action: None,
+            src_ilk,
+            scope,
+            target: meta_target.or_else(|| Some(target.to_string())),
+            action: meta_action,
             priority: None,
-            context: None,
+            context,
         },
         payload,
     };
@@ -4465,6 +4816,32 @@ async fn send_system_request(
         return Err(format!(
             "invalid response type: expected={} got={}",
             SYSTEM_KIND, msg.meta.msg_type
+        )
+        .into());
+    }
+    if matches!(
+        msg.meta.msg.as_deref(),
+        Some("UNREACHABLE" | "TTL_EXCEEDED")
+    ) {
+        let system_msg = msg.meta.msg.as_deref().unwrap_or("");
+        let reason = msg
+            .payload
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let original_dst = msg
+            .payload
+            .get("original_dst")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let last_hop = msg
+            .payload
+            .get("last_hop")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        return Err(format!(
+            "router returned {} for target={} reason={} original_dst={} last_hop={}",
+            system_msg, target, reason, original_dst, last_hop
         )
         .into());
     }
@@ -4501,6 +4878,8 @@ fn admin_action_timeout(action: &str) -> Duration {
         | "remove_node_instance"
         | "remove_hive"
         | "set_node_config"
+        | "node_control_config_get"
+        | "node_control_config_set"
         | "get_node_config"
         | "get_node_state"
         | "get_node_status"
@@ -4671,6 +5050,8 @@ fn is_node_scoped_action(action: &str) -> bool {
             | "remove_node_instance"
             | "get_node_config"
             | "set_node_config"
+            | "node_control_config_get"
+            | "node_control_config_set"
             | "get_node_state"
             | "get_node_status"
             | "send_node_message"

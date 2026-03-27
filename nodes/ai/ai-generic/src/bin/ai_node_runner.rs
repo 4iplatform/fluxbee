@@ -11,9 +11,10 @@ use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
 use fluxbee_ai_sdk::{
     build_reply_message_runtime_src, build_text_response, extract_text, AiNode, AiNodeConfig,
     FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
-    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry, ImmediateConversationMemory,
-    LanceDbThreadStateStore, Message, ModelSettings, NodeRuntime, OpenAiResponsesClient,
-    RetryPolicy, RouterClient, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
+    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
+    ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelSettings, NodeRuntime,
+    OpenAiResponsesClient, RetryPolicy, RouterClient, RuntimeConfig, ThreadStateStore,
+    ThreadStateToolsProvider,
 };
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{
@@ -687,11 +688,13 @@ impl ImmediateMemoryStore {
     }
 
     async fn ensure_ready(&self) -> fluxbee_ai_sdk::Result<()> {
-        tokio_fs::create_dir_all(self.records_dir()).await.map_err(|err| {
-            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
-                "immediate memory init failed: {err}"
-            ))
-        })?;
+        tokio_fs::create_dir_all(self.records_dir())
+            .await
+            .map_err(|err| {
+                fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                    "immediate memory init failed: {err}"
+                ))
+            })?;
         Ok(())
     }
 
@@ -707,7 +710,10 @@ impl ImmediateMemoryStore {
         gate.lock_owned().await
     }
 
-    async fn get(&self, key: &str) -> fluxbee_ai_sdk::Result<Option<PersistedImmediateMemoryRecord>> {
+    async fn get(
+        &self,
+        key: &str,
+    ) -> fluxbee_ai_sdk::Result<Option<PersistedImmediateMemoryRecord>> {
         if key.trim().is_empty() {
             return Ok(None);
         }
@@ -726,7 +732,11 @@ impl ImmediateMemoryStore {
         Ok(Some(parsed))
     }
 
-    async fn put(&self, key: &str, record: &PersistedImmediateMemoryRecord) -> fluxbee_ai_sdk::Result<()> {
+    async fn put(
+        &self,
+        key: &str,
+        record: &PersistedImmediateMemoryRecord,
+    ) -> fluxbee_ai_sdk::Result<()> {
         if key.trim().is_empty() {
             return Ok(());
         }
@@ -890,14 +900,18 @@ impl GenericAiNode {
             );
             let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
             let immediate_memory = self.load_immediate_memory_for_input(openai, ctx).await;
-            let run_input = self.build_function_run_input(input.clone(), ctx, openai, immediate_memory);
+            let run_input =
+                self.build_function_run_input(input.clone(), ctx, openai, immediate_memory);
             let result = if openai.immediate_memory.enabled {
-                runner.run_with_input(&model, &tool_registry, run_input).await?
+                runner
+                    .run_with_input(&model, &tool_registry, run_input)
+                    .await?
             } else {
                 runner.run(&model, &tool_registry, input.clone()).await?
             };
             if let Some(text) = result.final_assistant_text {
-                self.persist_immediate_turn(openai, ctx, &input, &text).await;
+                self.persist_immediate_turn(openai, ctx, &input, &text)
+                    .await;
                 return Ok(text);
             }
         }
@@ -1043,16 +1057,20 @@ impl GenericAiNode {
         record.summary = record
             .summary
             .map(|summary| trim_summary(summary, openai.immediate_memory.summary_max_chars));
-        record.recent_interactions.push(fluxbee_ai_sdk::ImmediateInteraction {
-            role: fluxbee_ai_sdk::ImmediateRole::User,
-            kind: fluxbee_ai_sdk::ImmediateInteractionKind::Text,
-            content: trim_chars(user_input, IMMEDIATE_INTERACTION_MAX_CHARS),
-        });
-        record.recent_interactions.push(fluxbee_ai_sdk::ImmediateInteraction {
-            role: fluxbee_ai_sdk::ImmediateRole::Assistant,
-            kind: fluxbee_ai_sdk::ImmediateInteractionKind::Text,
-            content: trim_chars(assistant_output, IMMEDIATE_INTERACTION_MAX_CHARS),
-        });
+        record
+            .recent_interactions
+            .push(fluxbee_ai_sdk::ImmediateInteraction {
+                role: fluxbee_ai_sdk::ImmediateRole::User,
+                kind: fluxbee_ai_sdk::ImmediateInteractionKind::Text,
+                content: trim_chars(user_input, IMMEDIATE_INTERACTION_MAX_CHARS),
+            });
+        record
+            .recent_interactions
+            .push(fluxbee_ai_sdk::ImmediateInteraction {
+                role: fluxbee_ai_sdk::ImmediateRole::Assistant,
+                kind: fluxbee_ai_sdk::ImmediateInteractionKind::Text,
+                content: trim_chars(assistant_output, IMMEDIATE_INTERACTION_MAX_CHARS),
+            });
         record.recent_interactions = prune_recent_interactions(
             record.recent_interactions,
             openai.immediate_memory.recent_interactions_max,
@@ -2061,8 +2079,7 @@ async fn run_one_config(
     let thread_state_store =
         init_thread_state_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
     let immediate_memory_store =
-        init_immediate_memory_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir))
-            .await;
+        init_immediate_memory_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
     let node = GenericAiNode {
         mode,
         node_name,
