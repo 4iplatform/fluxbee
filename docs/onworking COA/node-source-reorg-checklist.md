@@ -32,6 +32,7 @@ Objetivo: reorganizar solo los fuentes de nodos bajo `nodes/`, sin tocar por aho
 - [x] Se dejó documentación mínima en `nodes/ai` y `nodes/wf`
 - [x] Se documentó el control-plane común de nodos no-`SY` en `docs/node-config-control-plane-spec.md`
 - [x] Se creó `nodes/common/README.md` como punto de entrada para contratos transversales de nodos
+- [x] Se agregó soporte compartido en `crates/fluxbee_sdk/src/node_config.rs` para metadata y envelopes de `CONFIG_GET` / `CONFIG_SET` / `CONFIG_RESPONSE`
 
 ## Decisiones temporales explícitas
 
@@ -46,5 +47,6 @@ Objetivo: reorganizar solo los fuentes de nodos bajo `nodes/`, sin tocar por aho
 - [ ] Reintroducir comportamiento GOV real dentro de `nodes/gov/ai-frontdesk-gov`
 - [x] Revisar documentación que todavía referencia `crates/fluxbee_ai_nodes`
 - [ ] Seguir corrigiendo documentación funcional que todavía asume `AI.chat` como runtime en vez de instancia
+- [ ] Migrar nodos no-`SY` para usar los helpers de `fluxbee_sdk::node_config` en vez de construir metadata de control-plane a mano
 - [ ] Decidir si `nodes/ai/common` y `nodes/wf/common` pasan a crates reales
 - [ ] Decidir si `nodes/test` se mantiene dentro de `nodes/` o se mueve a otro árbol

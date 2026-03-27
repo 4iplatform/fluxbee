@@ -25,5 +25,14 @@ pub use crate::managed_node::{
     managed_node_instance_dir_with_root, managed_node_name, ManagedNodeError,
     DEFAULT_MANAGED_NODE_ROOT, FLUXBEE_NODE_NAME_ENV,
 };
+pub use crate::node_config::{
+    build_node_config_get_message, build_node_config_response_message,
+    build_node_config_response_message_runtime_src, build_node_config_set_message,
+    is_node_config_get_message, is_node_config_response_message, is_node_config_set_message,
+    parse_node_config_request, parse_node_config_response, NodeConfigControlError,
+    NodeConfigControlRequest, NodeConfigControlResponse, NodeConfigEnvelopeOptions,
+    NodeConfigGetPayload, NodeConfigSetPayload, NODE_CONFIG_APPLY_MODE_REPLACE,
+    NODE_CONFIG_CONTROL_TARGET,
+};
 pub use crate::payload::{PayloadError, TextV1Payload, TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES};
 pub use crate::status::try_handle_default_node_status;

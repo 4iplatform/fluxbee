@@ -6,6 +6,7 @@ pub mod identity;
 pub mod managed_node;
 pub mod nats;
 pub mod node_client;
+pub mod node_config;
 pub mod payload;
 pub mod prelude;
 pub mod protocol;
@@ -33,5 +34,14 @@ pub use managed_node::{
     DEFAULT_MANAGED_NODE_ROOT, FLUXBEE_NODE_NAME_ENV,
 };
 pub use node_client::{connect, connect_with_client_config, NodeConfig, NodeError, NodeUuidMode};
+pub use node_config::{
+    build_node_config_get_message, build_node_config_response_message,
+    build_node_config_response_message_runtime_src, build_node_config_set_message,
+    is_node_config_get_message, is_node_config_response_message, is_node_config_set_message,
+    parse_node_config_request, parse_node_config_response, NodeConfigControlError,
+    NodeConfigControlRequest, NodeConfigControlResponse, NodeConfigEnvelopeOptions,
+    NodeConfigGetPayload, NodeConfigSetPayload, NODE_CONFIG_APPLY_MODE_REPLACE,
+    NODE_CONFIG_CONTROL_TARGET,
+};
 pub use split::{NodeReceiver, NodeSender};
 pub use status::try_handle_default_node_status;

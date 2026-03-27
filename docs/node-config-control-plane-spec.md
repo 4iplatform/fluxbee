@@ -61,6 +61,19 @@ Metadata baseline:
 
 The current platform transport that can already carry this is `send_node_message`.
 
+Shared code support now exists in:
+
+- `crates/fluxbee_sdk/src/node_config.rs`
+
+That helper module standardizes:
+
+- control-plane message constants
+- common request payload structs
+- common response parsing
+- response building with preserved `trace_id`
+
+It does not standardize the node-owned `payload.config` schema.
+
 ## 5. Common request envelope
 
 ### 5.1 CONFIG_GET
