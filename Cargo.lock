@@ -44,12 +44,17 @@ dependencies = [
 name = "ai-frontdesk-gov"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "chrono",
+ "fluxbee-ai-sdk",
  "fluxbee-sdk",
- "gov-common",
+ "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

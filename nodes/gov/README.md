@@ -13,12 +13,13 @@ Objetivo:
 ```
 nodes/gov/
 ├── common/                  # utilidades compartidas para nodos .gov
-└── ai-frontdesk-gov/        # runtime AI.frontdesk.gov (scaffold inicial)
+└── ai-frontdesk-gov/        # copia temporal del runner AI genérico para el caso gov
 ```
 
 Alcance de esta fase:
 - solo `ai-frontdesk-gov`;
-- no agregar otros nodos `.gov` hasta cerrar integración y E2E de frontdesk.
+- no agregar otros nodos `.gov` hasta cerrar integración y E2E de frontdesk;
+- `ai-frontdesk-gov` quedó temporalmente duplicado desde `nodes/ai/ai-generic`.
 
 ## Convenciones
 
@@ -33,7 +34,7 @@ Desde raíz del repo:
 
 ```bash
 cargo check -p gov-common
-cargo check -p ai-frontdesk-gov
+cargo check -p ai-frontdesk-gov --bin ai_node_runner
 ```
 
 ## Integración Identity (frontdesk)
