@@ -228,6 +228,27 @@ Implementación actual:
 | `GET /hives/{id}/identity/ilks` | `list_ilks` | `handle_admin_query` -> `SY.identity` (`ILK_LIST`) |
 | `GET /hives/{id}/identity/ilks/{ilk_id}` | `get_ilk` | `handle_admin_command` -> `SY.identity` (`ILK_GET`) |
 
+### 7.1.1 Planned node config control-plane wrappers (non-`SY`)
+
+The platform already has the generic transport needed to send node-level control-plane messages:
+
+- `POST /hives/{id}/nodes/{name}/messages`
+
+That path is sufficient for raw/debug unicast messages, but it is not the preferred public surface for `archi`.
+
+Planned wrappers for non-`SY` node config control-plane:
+
+| Endpoint | Intent | Transport |
+|---|---|---|
+| `POST /hives/{id}/nodes/{name}/control/config-get` | Request node-defined config contract + current config | unicast L2 to node (`meta.msg=CONFIG_GET`) |
+| `POST /hives/{id}/nodes/{name}/control/config-set` | Apply node-defined runtime/business config | unicast L2 to node (`meta.msg=CONFIG_SET`) |
+
+Notes:
+- This is separate from `PUT /hives/{id}/nodes/{name}/config`.
+- `PUT .../config` remains orchestrator-owned infra/bootstrap config.
+- `CONFIG_GET` / `CONFIG_SET` are node-owned runtime/business config contracts.
+- Node-specific `payload.config` remains opaque to admin; admin validates only common envelope metadata.
+
 ### 7.2 Routes, VPN, storage, rollout/drift
 
 | Endpoint | Action | Base handler |

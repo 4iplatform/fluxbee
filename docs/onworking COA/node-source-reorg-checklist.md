@@ -30,6 +30,8 @@ Objetivo: reorganizar solo los fuentes de nodos bajo `nodes/`, sin tocar por aho
 - [x] Se actualizó el workspace root para apuntar a `nodes/ai/ai-generic`
 - [x] Se sobrescribió `nodes/gov/ai-frontdesk-gov` con una copia temporal del runner AI genérico
 - [x] Se dejó documentación mínima en `nodes/ai` y `nodes/wf`
+- [x] Se documentó el control-plane común de nodos no-`SY` en `docs/node-config-control-plane-spec.md`
+- [x] Se creó `nodes/common/README.md` como punto de entrada para contratos transversales de nodos
 
 ## Decisiones temporales explícitas
 
