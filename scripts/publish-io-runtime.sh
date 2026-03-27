@@ -129,3 +129,41 @@ if [[ "$USE_SUDO" == "1" ]]; then
 fi
 
 "${cmd[@]}"
+
+DIST_ROOT_EFFECTIVE="${DIST_ROOT:-/var/lib/fluxbee/dist}"
+RUNTIME_DIR="$DIST_ROOT_EFFECTIVE/runtimes/$RUNTIME/$VERSION"
+BIN_DIR="$RUNTIME_DIR/bin"
+START_SH="$BIN_DIR/start.sh"
+BINARY_NAME="$(basename "$BINARY")"
+
+case "$KIND" in
+  slack)
+    DEFAULT_RUST_LOG="info,io_slack=debug,io_common=debug,fluxbee_sdk=info"
+    ;;
+  sim)
+    DEFAULT_RUST_LOG="info,io_sim=debug,io_common=debug,fluxbee_sdk=info"
+    ;;
+  *)
+    DEFAULT_RUST_LOG="info,fluxbee_sdk=info"
+    ;;
+esac
+
+tmp_start="$(mktemp)"
+cat >"$tmp_start" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -z "\${RUST_LOG:-}" ]]; then
+  export RUST_LOG="$DEFAULT_RUST_LOG"
+fi
+SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+exec "\$SCRIPT_DIR/$BINARY_NAME" "\$@"
+EOF
+
+if [[ "$USE_SUDO" == "1" ]]; then
+  sudo install -m 0755 "$tmp_start" "$START_SH"
+else
+  install -m 0755 "$tmp_start" "$START_SH"
+fi
+rm -f "$tmp_start"
+
+echo "Configured IO start.sh default RUST_LOG: $DEFAULT_RUST_LOG"

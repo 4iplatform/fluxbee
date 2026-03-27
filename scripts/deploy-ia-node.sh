@@ -24,6 +24,18 @@ Options:
   --tenant-id <tnt:...>        Tenant ID for identity registration (payload + config fallback)
   --runtime-version <ver>      Runtime version for spawn payload (default: current)
   --config-json <file>         JSON file with spawn config object
+  --immediate-memory-enabled <true|false>
+                               Set runtime.immediate_memory.enabled in spawn config (optional)
+  --immediate-memory-recent-max <n>
+                               Set runtime.immediate_memory.recent_interactions_max (optional)
+  --immediate-memory-active-max <n>
+                               Set runtime.immediate_memory.active_operations_max (optional)
+  --immediate-memory-summary-max-chars <n>
+                               Set runtime.immediate_memory.summary_max_chars (optional)
+  --immediate-memory-refresh-every-turns <n>
+                               Set runtime.immediate_memory.summary_refresh_every_turns (optional)
+  --immediate-memory-trim-noise <true|false>
+                               Set runtime.immediate_memory.trim_noise_enabled (optional)
   --spawn                      Force spawn step (requires --node-name and --config-json or --reuse-existing-config)
   --skip-spawn                 Skip spawn step (default unless --node-name is set)
   --kill-first                 If spawning, call DELETE node before POST node
@@ -63,6 +75,12 @@ RUNTIME_VERSION="current"
 NODE_NAME=""
 TENANT_ID=""
 CONFIG_JSON=""
+IMMEDIATE_MEMORY_ENABLED=""
+IMMEDIATE_MEMORY_RECENT_MAX=""
+IMMEDIATE_MEMORY_ACTIVE_MAX=""
+IMMEDIATE_MEMORY_SUMMARY_MAX_CHARS=""
+IMMEDIATE_MEMORY_REFRESH_EVERY_TURNS=""
+IMMEDIATE_MEMORY_TRIM_NOISE=""
 DO_SPAWN=0
 FORCE_SKIP_SPAWN=0
 KILL_FIRST=0
@@ -90,6 +108,12 @@ while [[ $# -gt 0 ]]; do
     --node-name) NODE_NAME="${2:-}"; shift 2 ;;
     --tenant-id) TENANT_ID="${2:-}"; shift 2 ;;
     --config-json) CONFIG_JSON="${2:-}"; shift 2 ;;
+    --immediate-memory-enabled) IMMEDIATE_MEMORY_ENABLED="${2:-}"; shift 2 ;;
+    --immediate-memory-recent-max) IMMEDIATE_MEMORY_RECENT_MAX="${2:-}"; shift 2 ;;
+    --immediate-memory-active-max) IMMEDIATE_MEMORY_ACTIVE_MAX="${2:-}"; shift 2 ;;
+    --immediate-memory-summary-max-chars) IMMEDIATE_MEMORY_SUMMARY_MAX_CHARS="${2:-}"; shift 2 ;;
+    --immediate-memory-refresh-every-turns) IMMEDIATE_MEMORY_REFRESH_EVERY_TURNS="${2:-}"; shift 2 ;;
+    --immediate-memory-trim-noise) IMMEDIATE_MEMORY_TRIM_NOISE="${2:-}"; shift 2 ;;
     --spawn) DO_SPAWN=1; shift ;;
     --skip-spawn) FORCE_SKIP_SPAWN=1; shift ;;
     --kill-first) KILL_FIRST=1; shift ;;
@@ -206,10 +230,42 @@ build_spawn_config_json() {
     echo "Error: --config-json not found: $CONFIG_JSON" >&2
     exit 1
   fi
-  CONFIG_JSON_PATH="$CONFIG_JSON" python3 - <<'PY'
+  CONFIG_JSON_PATH="$CONFIG_JSON" \
+  IMMEDIATE_MEMORY_ENABLED="$IMMEDIATE_MEMORY_ENABLED" \
+  IMMEDIATE_MEMORY_RECENT_MAX="$IMMEDIATE_MEMORY_RECENT_MAX" \
+  IMMEDIATE_MEMORY_ACTIVE_MAX="$IMMEDIATE_MEMORY_ACTIVE_MAX" \
+  IMMEDIATE_MEMORY_SUMMARY_MAX_CHARS="$IMMEDIATE_MEMORY_SUMMARY_MAX_CHARS" \
+  IMMEDIATE_MEMORY_REFRESH_EVERY_TURNS="$IMMEDIATE_MEMORY_REFRESH_EVERY_TURNS" \
+  IMMEDIATE_MEMORY_TRIM_NOISE="$IMMEDIATE_MEMORY_TRIM_NOISE" \
+  python3 - <<'PY'
 import json
 import os
 import sys
+
+def parse_bool_opt(value, name):
+    raw = (value or "").strip().lower()
+    if raw == "":
+        return None
+    if raw in ("true", "1", "yes", "y", "on"):
+        return True
+    if raw in ("false", "0", "no", "n", "off"):
+        return False
+    print(f"Error: {name} must be true|false (got '{value}')", file=sys.stderr)
+    sys.exit(1)
+
+def parse_int_opt(value, name):
+    raw = (value or "").strip()
+    if raw == "":
+        return None
+    try:
+        out = int(raw)
+    except Exception:
+        print(f"Error: {name} must be an integer (got '{value}')", file=sys.stderr)
+        sys.exit(1)
+    if out < 0:
+        print(f"Error: {name} must be >= 0 (got '{value}')", file=sys.stderr)
+        sys.exit(1)
+    return out
 
 path = os.environ["CONFIG_JSON_PATH"]
 try:
@@ -222,6 +278,36 @@ except Exception as e:
 if not isinstance(cfg, dict):
     print(f"Error: --config-json root must be object ({path})", file=sys.stderr)
     sys.exit(1)
+
+enabled = parse_bool_opt(os.environ.get("IMMEDIATE_MEMORY_ENABLED"), "--immediate-memory-enabled")
+recent_max = parse_int_opt(os.environ.get("IMMEDIATE_MEMORY_RECENT_MAX"), "--immediate-memory-recent-max")
+active_max = parse_int_opt(os.environ.get("IMMEDIATE_MEMORY_ACTIVE_MAX"), "--immediate-memory-active-max")
+summary_max_chars = parse_int_opt(os.environ.get("IMMEDIATE_MEMORY_SUMMARY_MAX_CHARS"), "--immediate-memory-summary-max-chars")
+refresh_every_turns = parse_int_opt(os.environ.get("IMMEDIATE_MEMORY_REFRESH_EVERY_TURNS"), "--immediate-memory-refresh-every-turns")
+trim_noise = parse_bool_opt(os.environ.get("IMMEDIATE_MEMORY_TRIM_NOISE"), "--immediate-memory-trim-noise")
+
+if any(v is not None for v in (enabled, recent_max, active_max, summary_max_chars, refresh_every_turns, trim_noise)):
+    runtime = cfg.get("runtime")
+    if not isinstance(runtime, dict):
+        runtime = {}
+        cfg["runtime"] = runtime
+    immediate = runtime.get("immediate_memory")
+    if not isinstance(immediate, dict):
+        immediate = {}
+        runtime["immediate_memory"] = immediate
+
+    if enabled is not None:
+        immediate["enabled"] = enabled
+    if recent_max is not None:
+        immediate["recent_interactions_max"] = recent_max
+    if active_max is not None:
+        immediate["active_operations_max"] = active_max
+    if summary_max_chars is not None:
+        immediate["summary_max_chars"] = summary_max_chars
+    if refresh_every_turns is not None:
+        immediate["summary_refresh_every_turns"] = refresh_every_turns
+    if trim_noise is not None:
+        immediate["trim_noise_enabled"] = trim_noise
 
 print(json.dumps(cfg, separators=(",", ":")))
 PY

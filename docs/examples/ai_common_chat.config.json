@@ -16,7 +16,15 @@
     "retry_max_attempts": 3,
     "retry_initial_backoff_ms": 200,
     "retry_max_backoff_ms": 2000,
-    "metrics_log_interval_ms": 30000
+    "metrics_log_interval_ms": 30000,
+    "immediate_memory": {
+      "enabled": true,
+      "recent_interactions_max": 10,
+      "active_operations_max": 8,
+      "summary_max_chars": 1600,
+      "summary_refresh_every_turns": 3,
+      "trim_noise_enabled": true
+    }
   },
   "behavior": {
     "kind": "openai_chat",
@@ -27,5 +35,10 @@
       "trim": true
     },
     "api_key_env": "OPENAI_API_KEY"
+  },
+   "secrets": {
+    "openai": {
+      "api_key": "sk-proj-key"
+    }
   }
 }

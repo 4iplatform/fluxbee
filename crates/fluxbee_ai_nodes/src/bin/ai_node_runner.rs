@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -10,10 +10,10 @@ use async_trait::async_trait;
 use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
 use fluxbee_ai_sdk::{
     build_reply_message_runtime_src, build_text_response, extract_text, AiNode, AiNodeConfig,
-    FunctionCallingConfig, FunctionCallingRunner, FunctionTool, FunctionToolDefinition,
-    FunctionToolProvider, FunctionToolRegistry, LanceDbThreadStateStore, Message, ModelSettings,
-    NodeRuntime, OpenAiResponsesClient, RetryPolicy, RouterClient, RuntimeConfig, ThreadStateStore,
-    ThreadStateToolsProvider,
+    FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
+    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry, ImmediateConversationMemory,
+    LanceDbThreadStateStore, Message, ModelSettings, NodeRuntime, OpenAiResponsesClient,
+    RetryPolicy, RouterClient, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
 };
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{
@@ -23,7 +23,8 @@ use fluxbee_sdk::{managed_node_config_path, managed_node_name};
 use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{Mutex, RwLock};
+use tokio::fs as tokio_fs;
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing_subscriber::EnvFilter;
@@ -36,6 +37,7 @@ const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE
 const GOV_IDENTITY_TARGET_ENV: &str = "GOV_IDENTITY_TARGET";
 const GOV_IDENTITY_TIMEOUT_MS_ENV: &str = "GOV_IDENTITY_TIMEOUT_MS";
 const GOV_IDENTITY_TENANT_ID_ENV: &str = "GOV_IDENTITY_TENANT_ID";
+const IMMEDIATE_INTERACTION_MAX_CHARS: usize = 1_200;
 
 #[derive(Debug, Deserialize)]
 struct RunnerConfig {
@@ -72,6 +74,19 @@ struct RuntimeSection {
     retry_initial_backoff_ms: u64,
     retry_max_backoff_ms: u64,
     metrics_log_interval_ms: u64,
+    #[serde(default)]
+    immediate_memory: ImmediateMemorySection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct ImmediateMemorySection {
+    enabled: bool,
+    recent_interactions_max: usize,
+    active_operations_max: usize,
+    summary_max_chars: usize,
+    summary_refresh_every_turns: usize,
+    trim_noise_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,6 +259,8 @@ struct EffectiveRuntimeSection {
     retry_max_backoff_ms: Option<u64>,
     #[serde(default)]
     metrics_log_interval_ms: Option<u64>,
+    #[serde(default)]
+    immediate_memory: Option<ImmediateMemorySection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -272,6 +289,20 @@ impl Default for RuntimeSection {
             retry_initial_backoff_ms: 200,
             retry_max_backoff_ms: 2_000,
             metrics_log_interval_ms: 30_000,
+            immediate_memory: ImmediateMemorySection::default(),
+        }
+    }
+}
+
+impl Default for ImmediateMemorySection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            recent_interactions_max: 10,
+            active_operations_max: 8,
+            summary_max_chars: 1_600,
+            summary_refresh_every_turns: 3,
+            trim_noise_enabled: true,
         }
     }
 }
@@ -322,6 +353,7 @@ struct OpenAiChatRuntime {
     api_key_env: String,
     yaml_inline_api_key: Option<String>,
     base_url: Option<String>,
+    immediate_memory: ImmediateMemorySection,
 }
 
 struct GenericAiNode {
@@ -330,6 +362,7 @@ struct GenericAiNode {
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
     dynamic_config_dir: PathBuf,
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
+    immediate_memory_store: Option<Arc<ImmediateMemoryStore>>,
     gov_identity: GovIdentityConfig,
     gov_identity_bridge: Option<Arc<GovIdentityBridge>>,
     control_plane: Arc<RwLock<ControlPlaneState>>,
@@ -610,6 +643,106 @@ struct BehaviorContext {
     src_ilk: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PersistedImmediateMemoryRecord {
+    #[serde(default)]
+    summary: Option<fluxbee_ai_sdk::ConversationSummary>,
+    #[serde(default)]
+    recent_interactions: Vec<fluxbee_ai_sdk::ImmediateInteraction>,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct ImmediateMemoryStore {
+    root_dir: PathBuf,
+    key_gates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+impl ImmediateMemoryStore {
+    fn path_for_node(state_dir: &std::path::Path, node_name: &str) -> PathBuf {
+        state_dir
+            .join("ai-nodes")
+            .join(sanitize_storage_key(node_name))
+            .join("immediate-memory")
+    }
+
+    fn new(root_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            root_dir: root_dir.into(),
+            key_gates: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn root_dir(&self) -> &std::path::Path {
+        &self.root_dir
+    }
+
+    fn records_dir(&self) -> PathBuf {
+        self.root_dir.join("threads")
+    }
+
+    fn key_file_path(&self, key: &str) -> PathBuf {
+        self.records_dir()
+            .join(format!("{}.json", sanitize_storage_key(key)))
+    }
+
+    async fn ensure_ready(&self) -> fluxbee_ai_sdk::Result<()> {
+        tokio_fs::create_dir_all(self.records_dir()).await.map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "immediate memory init failed: {err}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    async fn lock_key(&self, key: &str) -> OwnedMutexGuard<()> {
+        let safe = sanitize_storage_key(key);
+        let gate = {
+            let mut gates = self.key_gates.lock().await;
+            gates
+                .entry(safe)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        gate.lock_owned().await
+    }
+
+    async fn get(&self, key: &str) -> fluxbee_ai_sdk::Result<Option<PersistedImmediateMemoryRecord>> {
+        if key.trim().is_empty() {
+            return Ok(None);
+        }
+        let _guard = self.lock_key(key).await;
+        let path = self.key_file_path(key);
+        let raw = match tokio_fs::read_to_string(&path).await {
+            Ok(v) => v,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                    "immediate memory read failed: {err}"
+                )))
+            }
+        };
+        let parsed = serde_json::from_str::<PersistedImmediateMemoryRecord>(&raw)?;
+        Ok(Some(parsed))
+    }
+
+    async fn put(&self, key: &str, record: &PersistedImmediateMemoryRecord) -> fluxbee_ai_sdk::Result<()> {
+        if key.trim().is_empty() {
+            return Ok(());
+        }
+        let _guard = self.lock_key(key).await;
+        self.ensure_ready().await?;
+        let path = self.key_file_path(key);
+        let raw = serde_json::to_string_pretty(record)?;
+        tokio_fs::write(path, raw).await.map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "immediate memory write failed: {err}"
+            ))
+        })?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NodeLifecycleState {
     Unconfigured,
@@ -756,12 +889,20 @@ impl GenericAiNode {
                 openai.model_settings.clone(),
             );
             let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
-            let result = runner.run(&model, &tool_registry, input.clone()).await?;
+            let immediate_memory = self.load_immediate_memory_for_input(openai, ctx).await;
+            let run_input = self.build_function_run_input(input.clone(), ctx, openai, immediate_memory);
+            let result = if openai.immediate_memory.enabled {
+                runner.run_with_input(&model, &tool_registry, run_input).await?
+            } else {
+                runner.run(&model, &tool_registry, input.clone()).await?
+            };
             if let Some(text) = result.final_assistant_text {
+                self.persist_immediate_turn(openai, ctx, &input, &text).await;
                 return Ok(text);
             }
         }
 
+        let current_user_input = input.clone();
         let req = fluxbee_ai_sdk::llm::LlmRequest {
             model: openai.model.clone(),
             system: openai.instructions.clone(),
@@ -770,7 +911,173 @@ impl GenericAiNode {
             model_settings: Some(openai.model_settings.clone()),
         };
         let response = fluxbee_ai_sdk::llm::LlmClient::generate(&client, req).await?;
+        self.persist_immediate_turn(openai, ctx, &current_user_input, &response.content)
+            .await;
         Ok(response.content)
+    }
+
+    fn build_function_run_input(
+        &self,
+        input: String,
+        ctx: &BehaviorContext,
+        openai: &OpenAiChatRuntime,
+        immediate_memory: Option<ImmediateConversationMemory>,
+    ) -> FunctionRunInput {
+        if !openai.immediate_memory.enabled {
+            return FunctionRunInput::new(input);
+        }
+        FunctionRunInput {
+            current_user_message: input,
+            immediate_memory: immediate_memory.or_else(|| {
+                Some(ImmediateConversationMemory {
+                    thread_id: ctx.thread_id.clone(),
+                    scope_id: ctx.src_ilk.clone(),
+                    summary: None,
+                    recent_interactions: Vec::new(),
+                    active_operations: Vec::new(),
+                })
+            }),
+        }
+    }
+
+    async fn load_immediate_memory_for_input(
+        &self,
+        openai: &OpenAiChatRuntime,
+        ctx: &BehaviorContext,
+    ) -> Option<ImmediateConversationMemory> {
+        if !openai.immediate_memory.enabled {
+            return None;
+        }
+        let src_ilk = ctx.src_ilk.as_deref()?;
+        let store = self.immediate_memory_store.as_ref()?;
+        let record = match store.get(src_ilk).await {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    node_name = %self.node_name,
+                    src_ilk = %src_ilk,
+                    thread_id = ?ctx.thread_id,
+                    error = %err,
+                    "immediate memory get failed; continuing without persisted context"
+                );
+                None
+            }
+        };
+
+        let (summary, recent_interactions) = if let Some(mut record) = record {
+            record.summary = record
+                .summary
+                .map(|summary| trim_summary(summary, openai.immediate_memory.summary_max_chars));
+            record.recent_interactions = prune_recent_interactions(
+                record.recent_interactions,
+                openai.immediate_memory.recent_interactions_max,
+            );
+            tracing::debug!(
+                node_name = %self.node_name,
+                src_ilk = %src_ilk,
+                thread_id = ?ctx.thread_id,
+                memory_hit = true,
+                recent_interactions = record.recent_interactions.len(),
+                recent_interactions_max = openai.immediate_memory.recent_interactions_max,
+                active_operations_max = openai.immediate_memory.active_operations_max,
+                summary_max_chars = openai.immediate_memory.summary_max_chars,
+                summary_refresh_status = "not_implemented_v1",
+                "immediate memory loaded"
+            );
+            (record.summary, record.recent_interactions)
+        } else {
+            tracing::debug!(
+                node_name = %self.node_name,
+                src_ilk = %src_ilk,
+                thread_id = ?ctx.thread_id,
+                memory_hit = false,
+                recent_interactions_max = openai.immediate_memory.recent_interactions_max,
+                active_operations_max = openai.immediate_memory.active_operations_max,
+                summary_max_chars = openai.immediate_memory.summary_max_chars,
+                summary_refresh_status = "not_implemented_v1",
+                "immediate memory loaded"
+            );
+            (None, Vec::new())
+        };
+
+        Some(ImmediateConversationMemory {
+            thread_id: ctx.thread_id.clone(),
+            scope_id: ctx.src_ilk.clone(),
+            summary,
+            recent_interactions,
+            active_operations: Vec::new(),
+        })
+    }
+
+    async fn persist_immediate_turn(
+        &self,
+        openai: &OpenAiChatRuntime,
+        ctx: &BehaviorContext,
+        user_input: &str,
+        assistant_output: &str,
+    ) {
+        if !openai.immediate_memory.enabled {
+            return;
+        }
+        let Some(src_ilk) = ctx.src_ilk.as_deref() else {
+            return;
+        };
+        let Some(store) = self.immediate_memory_store.as_ref() else {
+            return;
+        };
+
+        let mut record = match store.get(src_ilk).await {
+            Ok(Some(record)) => record,
+            Ok(None) => PersistedImmediateMemoryRecord::default(),
+            Err(err) => {
+                tracing::warn!(
+                    node_name = %self.node_name,
+                    src_ilk = %src_ilk,
+                    thread_id = ?ctx.thread_id,
+                    error = %err,
+                    "immediate memory get-before-put failed; skipping persistence"
+                );
+                return;
+            }
+        };
+        record.summary = record
+            .summary
+            .map(|summary| trim_summary(summary, openai.immediate_memory.summary_max_chars));
+        record.recent_interactions.push(fluxbee_ai_sdk::ImmediateInteraction {
+            role: fluxbee_ai_sdk::ImmediateRole::User,
+            kind: fluxbee_ai_sdk::ImmediateInteractionKind::Text,
+            content: trim_chars(user_input, IMMEDIATE_INTERACTION_MAX_CHARS),
+        });
+        record.recent_interactions.push(fluxbee_ai_sdk::ImmediateInteraction {
+            role: fluxbee_ai_sdk::ImmediateRole::Assistant,
+            kind: fluxbee_ai_sdk::ImmediateInteractionKind::Text,
+            content: trim_chars(assistant_output, IMMEDIATE_INTERACTION_MAX_CHARS),
+        });
+        record.recent_interactions = prune_recent_interactions(
+            record.recent_interactions,
+            openai.immediate_memory.recent_interactions_max,
+        );
+        record.updated_at = chrono::Utc::now().to_rfc3339();
+
+        if let Err(err) = store.put(src_ilk, &record).await {
+            tracing::warn!(
+                node_name = %self.node_name,
+                src_ilk = %src_ilk,
+                thread_id = ?ctx.thread_id,
+                error = %err,
+                "immediate memory put failed; continuing without persistence"
+            );
+        } else {
+            tracing::debug!(
+                node_name = %self.node_name,
+                src_ilk = %src_ilk,
+                thread_id = ?ctx.thread_id,
+                persisted_recent_interactions = record.recent_interactions.len(),
+                recent_interactions_max = openai.immediate_memory.recent_interactions_max,
+                summary_refresh_status = "not_implemented_v1",
+                "immediate memory persisted"
+            );
+        }
     }
 
     fn build_tool_registry(
@@ -790,6 +1097,8 @@ impl GenericAiNode {
         registry: &mut FunctionToolRegistry,
         ctx: &BehaviorContext,
     ) -> fluxbee_ai_sdk::Result<()> {
+        // Thread state tools remain the source for node-level "hard state".
+        // Immediate memory is managed separately by the runner as short-horizon context.
         if let (Some(store), Some(src_ilk)) = (&self.thread_state_store, &ctx.src_ilk) {
             let provider = ThreadStateToolsProvider::with_get_put_delete_scoped_with_legacy(
                 store.clone(),
@@ -1673,12 +1982,18 @@ async fn run_single_connection_runtime(
         };
 
         if let Some(mut response) = maybe_response {
+            tracing::debug!(
+                trace_id = %response.routing.trace_id,
+                dst = ?response.routing.dst,
+                "sending ai response to router"
+            );
             response.routing.src = connection.uuid().await;
             tokio::time::timeout(config.write_timeout, connection.write(response))
                 .await
                 .map_err(|_| {
                     fluxbee_ai_sdk::errors::AiSdkError::Timeout("router write timeout".to_string())
                 })??;
+            tracing::debug!("ai response delivered to router");
             responses_sent = responses_sent.saturating_add(1);
         }
         processed_messages = processed_messages.saturating_add(1);
@@ -1745,12 +2060,16 @@ async fn run_one_config(
     let gov_identity = gov_identity_config_from_env();
     let thread_state_store =
         init_thread_state_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
+    let immediate_memory_store =
+        init_immediate_memory_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir))
+            .await;
     let node = GenericAiNode {
         mode,
         node_name,
         behavior: Arc::new(RwLock::new(Some(behavior))),
         dynamic_config_dir: PathBuf::from(cfg.node.dynamic_config_dir),
         thread_state_store,
+        immediate_memory_store,
         gov_identity,
         gov_identity_bridge: None,
         control_plane: Arc::new(RwLock::new(ControlPlaneState {
@@ -1790,6 +2109,7 @@ async fn run_unconfigured_bootstrap(
     let node_name = node.name.clone();
     let dynamic_dir = PathBuf::from(node.dynamic_config_dir.clone());
     let thread_state_store = init_thread_state_store(&node_name, &dynamic_dir).await;
+    let immediate_memory_store = init_immediate_memory_store(&node_name, &dynamic_dir).await;
     let persisted_dynamic = load_persisted_dynamic_config(&dynamic_dir, &node_name);
     let spawn_effective = if persisted_dynamic.is_none() {
         load_effective_config_from_spawn(&node_name)
@@ -1930,6 +2250,7 @@ async fn run_unconfigured_bootstrap(
         behavior: Arc::new(RwLock::new(behavior)),
         dynamic_config_dir: dynamic_dir,
         thread_state_store,
+        immediate_memory_store,
         gov_identity,
         gov_identity_bridge: None,
         control_plane: Arc::new(RwLock::new(state)),
@@ -2165,6 +2486,7 @@ fn build_behavior(
                 api_key_env: openai.api_key_env.clone(),
                 yaml_inline_api_key,
                 base_url: openai.base_url.clone(),
+                immediate_memory: cfg.runtime.immediate_memory.clone(),
             })
         }
     };
@@ -2208,6 +2530,11 @@ fn build_behavior_from_effective_config(
             let yaml_inline_api_key = extract_openai_api_key_from_effective_config(config)
                 .filter(|v| v != "***REDACTED***");
             let base_url = behavior.base_url.clone();
+            let immediate_memory = config
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.immediate_memory.clone())
+                .unwrap_or_default();
 
             Ok(NodeBehavior::OpenAiChat(OpenAiChatRuntime {
                 model,
@@ -2216,6 +2543,7 @@ fn build_behavior_from_effective_config(
                 api_key_env,
                 yaml_inline_api_key,
                 base_url,
+                immediate_memory,
             }))
         }
         other => Err(format!("unsupported behavior.kind '{other}'").into()),
@@ -2311,6 +2639,7 @@ fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocu
             retry_initial_backoff_ms: Some(cfg.runtime.retry_initial_backoff_ms),
             retry_max_backoff_ms: Some(cfg.runtime.retry_max_backoff_ms),
             metrics_log_interval_ms: Some(cfg.runtime.metrics_log_interval_ms),
+            immediate_memory: Some(cfg.runtime.immediate_memory.clone()),
         }),
         secrets: None,
     }
@@ -2658,6 +2987,9 @@ fn materialize_runtime_defaults(runtime: &mut EffectiveRuntimeSection) {
     if runtime.metrics_log_interval_ms.is_none() {
         runtime.metrics_log_interval_ms = Some(defaults.metrics_log_interval_ms);
     }
+    if runtime.immediate_memory.is_none() {
+        runtime.immediate_memory = Some(defaults.immediate_memory);
+    }
 }
 
 fn is_control_plane(msg: &Message) -> bool {
@@ -2766,6 +3098,22 @@ fn infer_state_dir_from_dynamic(dynamic_config_dir: &std::path::Path) -> PathBuf
         .unwrap_or_else(|| PathBuf::from("/var/lib/fluxbee/state"))
 }
 
+fn sanitize_storage_key(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            output.push(ch);
+        } else {
+            output.push('_');
+        }
+    }
+    if output.is_empty() {
+        "ai-node".to_string()
+    } else {
+        output
+    }
+}
+
 async fn init_thread_state_store(
     node_name: &str,
     dynamic_config_dir: &std::path::Path,
@@ -2791,6 +3139,80 @@ async fn init_thread_state_store(
             None
         }
     }
+}
+
+async fn init_immediate_memory_store(
+    node_name: &str,
+    dynamic_config_dir: &std::path::Path,
+) -> Option<Arc<ImmediateMemoryStore>> {
+    let state_dir = infer_state_dir_from_dynamic(dynamic_config_dir);
+    let store_root = ImmediateMemoryStore::path_for_node(&state_dir, node_name);
+    let store = ImmediateMemoryStore::new(store_root);
+    match store.ensure_ready().await {
+        Ok(()) => {
+            tracing::info!(
+                node_name = %node_name,
+                path = %store.root_dir().display(),
+                "immediate memory store ready"
+            );
+            Some(Arc::new(store))
+        }
+        Err(err) => {
+            tracing::warn!(
+                node_name = %node_name,
+                error = %err,
+                "immediate memory store unavailable; continuing without immediate persistence"
+            );
+            None
+        }
+    }
+}
+
+fn prune_recent_interactions(
+    interactions: Vec<fluxbee_ai_sdk::ImmediateInteraction>,
+    max_items: usize,
+) -> Vec<fluxbee_ai_sdk::ImmediateInteraction> {
+    if max_items == 0 {
+        return Vec::new();
+    }
+    let len = interactions.len();
+    let keep_from = len.saturating_sub(max_items);
+    interactions.into_iter().skip(keep_from).collect()
+}
+
+fn trim_summary(
+    mut summary: fluxbee_ai_sdk::ConversationSummary,
+    max_chars: usize,
+) -> fluxbee_ai_sdk::ConversationSummary {
+    summary.goal = summary.goal.map(|v| trim_chars(&v, max_chars));
+    summary.current_focus = summary.current_focus.map(|v| trim_chars(&v, max_chars));
+    summary.decisions = summary
+        .decisions
+        .into_iter()
+        .map(|v| trim_chars(&v, max_chars))
+        .collect();
+    summary.confirmed_facts = summary
+        .confirmed_facts
+        .into_iter()
+        .map(|v| trim_chars(&v, max_chars))
+        .collect();
+    summary.open_questions = summary
+        .open_questions
+        .into_iter()
+        .map(|v| trim_chars(&v, max_chars))
+        .collect();
+    summary
+}
+
+fn trim_chars(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for ch in value.chars().take(max_chars) {
+        out.push(ch);
+    }
+    out
 }
 
 fn invalid_payload_missing_thread_id() -> Value {
@@ -2961,6 +3383,7 @@ mod tests {
             behavior: Arc::new(RwLock::new(None)),
             dynamic_config_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
+            immediate_memory_store: None,
             gov_identity,
             gov_identity_bridge: None,
             control_plane: Arc::new(RwLock::new(ControlPlaneState {
@@ -3039,6 +3462,7 @@ mod tests {
                 api_key_env: "OPENAI_API_KEY_MISSING_FOR_TEST".to_string(),
                 yaml_inline_api_key: None,
                 base_url: None,
+                immediate_memory: ImmediateMemorySection::default(),
             }));
         }
 

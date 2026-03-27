@@ -6,3 +6,4 @@ pub mod reliability;
 pub mod router_message;
 pub mod inbound;
 pub mod provision;
+pub mod text_v1_blob;

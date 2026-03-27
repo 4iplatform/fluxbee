@@ -1,4 +1,4 @@
-# AI Nodes Deploy Runbook (publish/update/spawn)
+﻿# AI Nodes Deploy Runbook (publish/update/spawn)
 
 ## 1) Objetivo
 
@@ -192,3 +192,69 @@ Conclusión operativa:
 - para código: `publish -> update -> spawn` (canónico) ya sirve.
 - para config/prompt obligatoria en runtime: usá `CONFIG_SET`/estado dinámico del runner o flujo systemd+YAML hasta cerrar el hot-reload end-to-end de `config.json`.
 
+
+---
+
+## 9) Immediate memory options for spawn/deploy
+
+`deploy-ia-node.sh` now supports optional flags to inject `runtime.immediate_memory` into spawn config.
+
+Optional flags:
+- `--immediate-memory-enabled <true|false>`
+- `--immediate-memory-recent-max <n>`
+- `--immediate-memory-active-max <n>`
+- `--immediate-memory-summary-max-chars <n>`
+- `--immediate-memory-refresh-every-turns <n>`
+- `--immediate-memory-trim-noise <true|false>`
+
+Notes:
+- These flags are opt-in. Existing commands keep working unchanged.
+- If you do not pass these flags, config remains exactly as provided by `--config-json`.
+
+Example (`AI.chat@motherbee`):
+
+```bash
+bash scripts/deploy-ia-node.sh \
+  --base "http://127.0.0.1:8080" \
+  --hive-id "motherbee" \
+  --runtime "AI.chat" \
+  --version "0.1.1" \
+  --mode default \
+  --node-name "AI.chat@motherbee" \
+  --tenant-id "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" \
+  --config-json /tmp/ai_common_chat.config.json \
+  --immediate-memory-enabled true \
+  --immediate-memory-recent-max 10 \
+  --immediate-memory-active-max 8 \
+  --immediate-memory-summary-max-chars 1600 \
+  --immediate-memory-refresh-every-turns 3 \
+  --immediate-memory-trim-noise true \
+  --spawn \
+  --sync-hint \
+  --allow-sync-pending \
+  --sudo
+```
+
+Example (`AI.frontdesk.gov@motherbee`):
+
+```bash
+bash scripts/deploy-ia-node.sh \
+  --base "http://127.0.0.1:8080" \
+  --hive-id "motherbee" \
+  --runtime "AI.frontdesk.gov" \
+  --version "0.1.0" \
+  --mode gov \
+  --node-name "AI.frontdesk.gov@motherbee" \
+  --tenant-id "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" \
+  --config-json /tmp/ai_frontdesk_gov.spawn.json \
+  --immediate-memory-enabled true \
+  --immediate-memory-recent-max 10 \
+  --immediate-memory-active-max 8 \
+  --immediate-memory-summary-max-chars 1600 \
+  --immediate-memory-refresh-every-turns 3 \
+  --immediate-memory-trim-noise true \
+  --spawn \
+  --sync-hint \
+  --allow-sync-pending \
+  --sudo
+```

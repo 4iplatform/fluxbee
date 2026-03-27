@@ -111,6 +111,12 @@ struct Config {
     sim_conversation_id: String,
     sim_thread_id: Option<String>,
     sim_tenant_hint: Option<String>,
+    sim_reply_kind: String,
+    sim_reply_address: String,
+    sim_reply_thread_ts: Option<String>,
+    sim_reply_workspace_id: Option<String>,
+    sim_attachments_json: Option<String>,
+    sim_content_ref_json: Option<String>,
     identity_target: String,
     identity_timeout_ms: u64,
 }
@@ -148,6 +154,12 @@ impl Config {
                 .unwrap_or_else(|| "sim-console".to_string()),
             sim_thread_id: env("SIM_THREAD_ID"),
             sim_tenant_hint: env("SIM_TENANT_HINT"),
+            sim_reply_kind: env("SIM_REPLY_KIND").unwrap_or_else(|| "sim_log".to_string()),
+            sim_reply_address: env("SIM_REPLY_ADDRESS").unwrap_or_else(|| "stdout".to_string()),
+            sim_reply_thread_ts: env("SIM_REPLY_THREAD_TS"),
+            sim_reply_workspace_id: env("SIM_REPLY_WORKSPACE_ID"),
+            sim_attachments_json: env("SIM_ATTACHMENTS_JSON"),
+            sim_content_ref_json: env("SIM_CONTENT_REF_JSON"),
             identity_target: env("IDENTITY_TARGET")
                 .unwrap_or_else(|| format!("SY.identity@{island_id}")),
             identity_timeout_ms: env("IDENTITY_TIMEOUT_MS")
@@ -207,7 +219,16 @@ async fn run_stdin_inbound_loop(
         if text.is_empty() {
             continue;
         }
-        process_one_inbound(config, sender, inbox, identity, provisioner, inbound.clone(), text).await?;
+        process_one_inbound(
+            config,
+            sender,
+            inbox,
+            identity,
+            provisioner,
+            inbound.clone(),
+            text,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -222,6 +243,24 @@ async fn process_one_inbound(
     text: String,
 ) -> Result<()> {
     let message_id = format!("sim-{}", Uuid::new_v4());
+    let reply_params = if config.sim_reply_kind == "slack_post" {
+        let mut obj = serde_json::Map::new();
+        if let Some(thread_ts) = &config.sim_reply_thread_ts {
+            obj.insert(
+                "thread_ts".to_string(),
+                serde_json::Value::String(thread_ts.clone()),
+            );
+        }
+        if let Some(workspace_id) = &config.sim_reply_workspace_id {
+            obj.insert(
+                "workspace_id".to_string(),
+                serde_json::Value::String(workspace_id.clone()),
+            );
+        }
+        serde_json::Value::Object(obj)
+    } else {
+        serde_json::json!({})
+    };
     let io_ctx = IoContext {
         channel: config.sim_channel.clone(),
         entrypoint: PartyRef {
@@ -242,9 +281,9 @@ async fn process_one_inbound(
             timestamp: None,
         },
         reply_target: ReplyTarget {
-            kind: "sim_log".to_string(),
-            address: "stdout".to_string(),
-            params: serde_json::json!({}),
+            kind: config.sim_reply_kind.clone(),
+            address: config.sim_reply_address.clone(),
+            params: reply_params,
         },
     };
     tracing::debug!(
@@ -253,11 +292,34 @@ async fn process_one_inbound(
         "io-sim building inbound io context"
     );
 
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
       "type": "text",
       "content": text,
+      "attachments": [],
       "raw": { "sim": true },
     });
+    if let Some(raw_attachments) = &config.sim_attachments_json {
+        match serde_json::from_str::<serde_json::Value>(raw_attachments) {
+            Ok(attachments) if attachments.is_array() => {
+                payload["attachments"] = attachments;
+            }
+            Ok(_) => tracing::warn!("SIM_ATTACHMENTS_JSON ignored: expected JSON array"),
+            Err(err) => tracing::warn!(error = %err, "SIM_ATTACHMENTS_JSON ignored: invalid JSON"),
+        }
+    }
+    if let Some(raw_content_ref) = &config.sim_content_ref_json {
+        match serde_json::from_str::<serde_json::Value>(raw_content_ref) {
+            Ok(content_ref) if content_ref.is_object() => {
+                payload["content_ref"] = content_ref;
+                payload
+                    .as_object_mut()
+                    .expect("payload object")
+                    .remove("content");
+            }
+            Ok(_) => tracing::warn!("SIM_CONTENT_REF_JSON ignored: expected JSON object"),
+            Err(err) => tracing::warn!(error = %err, "SIM_CONTENT_REF_JSON ignored: invalid JSON"),
+        }
+    }
 
     let outcome = inbound
         .lock()
