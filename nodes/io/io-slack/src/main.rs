@@ -5,12 +5,16 @@ use fluxbee_sdk::{
     connect, managed_node_config_path, managed_node_name, NodeConfig, NodeSender, NodeUuidMode,
 };
 use futures_util::{SinkExt, StreamExt};
-use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
 use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
 };
+use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
 use io_common::io_context::{extract_slack_post_target, slack_inbound_io_context};
 use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox};
+use io_common::text_v1_blob::{
+    build_text_v1_inbound_payload, InboundAttachmentInput, IoBlobContractError,
+    IoBlobRuntimeConfig, IoTextBlobConfig,
+};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
@@ -28,9 +32,7 @@ async fn main() -> Result<()> {
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if config.dev_mode {
-            tracing_subscriber::EnvFilter::new(
-                "info,io_slack=debug,fluxbee_sdk=info",
-            )
+            tracing_subscriber::EnvFilter::new("info,io_slack=debug,fluxbee_sdk=info")
         } else {
             tracing_subscriber::EnvFilter::new("info")
         }
@@ -83,6 +85,13 @@ async fn main() -> Result<()> {
             provision_on_miss: true,
         },
     )));
+    let blob_toolkit = Arc::new(
+        config
+            .blob_runtime
+            .build_toolkit()
+            .map_err(|err| anyhow::anyhow!("invalid blob runtime config: {err}"))?,
+    );
+    let blob_payload_cfg = config.blob_runtime.text_v1.clone();
     let sessionizer = if config.slack_session_window_ms > 0 {
         Some(Arc::new(SlackSessionizer::new(
             Duration::from_millis(config.slack_session_window_ms),
@@ -93,10 +102,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let outbound_task = tokio::spawn(run_outbound_loop(
-        inbox.clone(),
-        slack.clone(),
-    ));
+    let outbound_task = tokio::spawn(run_outbound_loop(inbox.clone(), slack.clone()));
 
     let inbound_task = tokio::spawn(run_inbound_socket_mode(
         config.clone(),
@@ -106,6 +112,8 @@ async fn main() -> Result<()> {
         provisioner,
         inbound,
         sessionizer,
+        blob_toolkit,
+        blob_payload_cfg,
     ));
 
     let _ = tokio::join!(inbound_task, outbound_task);
@@ -132,16 +140,17 @@ struct Config {
     slack_session_window_ms: u64,
     slack_session_max_sessions: usize,
     slack_session_max_fragments: usize,
+    blob_runtime: IoBlobRuntimeConfig,
 }
 
 impl Config {
     fn from_env() -> Result<Self> {
         let env_node_name = managed_node_name("IO.slack.T123", &["NODE_NAME"]);
         let env_island_id = env("ISLAND_ID").unwrap_or_else(|| "local".to_string());
-        let env_config_dir = PathBuf::from(
-            env("CONFIG_DIR").unwrap_or_else(|| "/etc/fluxbee".to_string()),
-        );
-        let explicit_spawn_config_path = env("NODE_CONFIG_PATH").or_else(|| env("IO_SLACK_FORCE_CONFIG_PATH"));
+        let env_config_dir =
+            PathBuf::from(env("CONFIG_DIR").unwrap_or_else(|| "/etc/fluxbee".to_string()));
+        let explicit_spawn_config_path =
+            env("NODE_CONFIG_PATH").or_else(|| env("IO_SLACK_FORCE_CONFIG_PATH"));
         let spawn_cfg = load_spawn_config(
             explicit_spawn_config_path.map(PathBuf::from),
             &env_node_name,
@@ -153,18 +162,21 @@ impl Config {
         }
 
         let resolved_node_name = env("NODE_NAME")
-            .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
-                "node.name",
-                "_system.node_name",
-            ]))
+            .or_else(|| {
+                json_get_string_opt(
+                    spawn_cfg.as_ref().map(|c| &c.doc),
+                    &["node.name", "_system.node_name"],
+                )
+            })
             .unwrap_or_else(|| env_node_name.clone());
 
         let resolved_island_id = env("ISLAND_ID")
-            .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
-                "_system.hive_id",
-                "node.island_id",
-                "island_id",
-            ]))
+            .or_else(|| {
+                json_get_string_opt(
+                    spawn_cfg.as_ref().map(|c| &c.doc),
+                    &["_system.hive_id", "node.island_id", "island_id"],
+                )
+            })
             .unwrap_or_else(|| env_island_id.clone());
 
         let slack_app_token = env("SLACK_APP_TOKEN")
@@ -194,40 +206,161 @@ impl Config {
             ))
             .ok_or_else(|| anyhow::anyhow!("missing Slack bot token (set SLACK_BOT_TOKEN or config slack.bot_token / slack.bot_token_ref=env:VAR)"))?;
 
+        let blob_root = PathBuf::from(
+            env("BLOB_ROOT")
+                .or_else(|| {
+                    json_get_string_opt(
+                        spawn_cfg.as_ref().map(|c| &c.doc),
+                        &["blob.path", "io.blob.path"],
+                    )
+                })
+                .unwrap_or_else(|| "/var/lib/fluxbee/blob".to_string()),
+        );
+        let max_blob_bytes = env("BLOB_MAX_BYTES")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| {
+                json_get_u64_opt(
+                    spawn_cfg.as_ref().map(|c| &c.doc),
+                    &["blob.max_blob_bytes", "io.blob.max_blob_bytes"],
+                )
+            });
+        let allowed_mimes_override = env("IO_SLACK_ALLOWED_MIMES").or_else(|| {
+            json_get_string_opt(
+                spawn_cfg.as_ref().map(|c| &c.doc),
+                &["io.blob.allowed_mimes_csv"],
+            )
+        });
+        let mut text_v1_cfg = IoTextBlobConfig::default();
+        text_v1_cfg.max_message_bytes = env("IO_SLACK_MAX_MESSAGE_BYTES")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| {
+                json_get_u64_opt(
+                    spawn_cfg.as_ref().map(|c| &c.doc),
+                    &["io.blob.max_message_bytes"],
+                )
+                .map(|v| v as usize)
+            })
+            .unwrap_or(text_v1_cfg.max_message_bytes);
+        text_v1_cfg.message_overhead_bytes = env("IO_SLACK_MESSAGE_OVERHEAD_BYTES")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| {
+                json_get_u64_opt(
+                    spawn_cfg.as_ref().map(|c| &c.doc),
+                    &["io.blob.message_overhead_bytes"],
+                )
+                .map(|v| v as usize)
+            })
+            .unwrap_or(text_v1_cfg.message_overhead_bytes);
+        text_v1_cfg.max_attachments = env("IO_SLACK_MAX_ATTACHMENTS")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| {
+                json_get_u64_opt(
+                    spawn_cfg.as_ref().map(|c| &c.doc),
+                    &["io.blob.max_attachments"],
+                )
+                .map(|v| v as usize)
+            })
+            .unwrap_or(text_v1_cfg.max_attachments);
+        text_v1_cfg.max_attachment_bytes = env("IO_SLACK_MAX_ATTACHMENT_BYTES")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| {
+                json_get_u64_opt(
+                    spawn_cfg.as_ref().map(|c| &c.doc),
+                    &["io.blob.max_attachment_bytes"],
+                )
+            })
+            .unwrap_or(text_v1_cfg.max_attachment_bytes);
+        text_v1_cfg.max_total_attachment_bytes = env("IO_SLACK_MAX_TOTAL_ATTACHMENT_BYTES")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| {
+                json_get_u64_opt(
+                    spawn_cfg.as_ref().map(|c| &c.doc),
+                    &["io.blob.max_total_attachment_bytes"],
+                )
+            })
+            .unwrap_or(text_v1_cfg.max_total_attachment_bytes);
+        if let Some(csv) = allowed_mimes_override {
+            let parsed = csv
+                .split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            if !parsed.is_empty() {
+                text_v1_cfg.allowed_mimes = parsed;
+            }
+        }
+        let resolve_retry = fluxbee_sdk::blob::ResolveRetryConfig {
+            max_wait_ms: env("IO_SLACK_BLOB_RETRY_MAX_WAIT_MS")
+                .and_then(|v| v.parse().ok())
+                .or_else(|| {
+                    json_get_u64_opt(
+                        spawn_cfg.as_ref().map(|c| &c.doc),
+                        &["io.blob.resolve_retry.max_wait_ms"],
+                    )
+                })
+                .unwrap_or(fluxbee_sdk::blob::BLOB_RETRY_MAX_MS),
+            initial_delay_ms: env("IO_SLACK_BLOB_RETRY_INITIAL_MS")
+                .and_then(|v| v.parse().ok())
+                .or_else(|| {
+                    json_get_u64_opt(
+                        spawn_cfg.as_ref().map(|c| &c.doc),
+                        &["io.blob.resolve_retry.initial_delay_ms"],
+                    )
+                })
+                .unwrap_or(fluxbee_sdk::blob::BLOB_RETRY_INITIAL_MS),
+            backoff_factor: env("IO_SLACK_BLOB_RETRY_BACKOFF")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(fluxbee_sdk::blob::BLOB_RETRY_BACKOFF),
+        };
+        let blob_runtime = IoBlobRuntimeConfig {
+            blob_root,
+            max_blob_bytes,
+            text_v1: text_v1_cfg,
+            resolve_retry,
+        };
+
         Ok(Self {
             slack_app_token,
             slack_bot_token,
             node_name: resolved_node_name,
             island_id: resolved_island_id.clone(),
             node_version: env("NODE_VERSION")
-                .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
-                    "_system.runtime_version",
-                    "runtime.version",
-                    "node.version",
-                ]))
+                .or_else(|| {
+                    json_get_string_opt(
+                        spawn_cfg.as_ref().map(|c| &c.doc),
+                        &["_system.runtime_version", "runtime.version", "node.version"],
+                    )
+                })
                 .unwrap_or_else(|| "0.1".to_string()),
             router_socket: PathBuf::from(
                 env("ROUTER_SOCKET")
-                    .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
-                        "node.router_socket",
-                        "router_socket",
-                    ]))
+                    .or_else(|| {
+                        json_get_string_opt(
+                            spawn_cfg.as_ref().map(|c| &c.doc),
+                            &["node.router_socket", "router_socket"],
+                        )
+                    })
                     .unwrap_or_else(|| "/var/run/fluxbee/routers".to_string()),
             ),
             uuid_persistence_dir: PathBuf::from(
                 env("UUID_PERSISTENCE_DIR")
-                    .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
-                        "node.uuid_persistence_dir",
-                        "uuid_persistence_dir",
-                    ]))
+                    .or_else(|| {
+                        json_get_string_opt(
+                            spawn_cfg.as_ref().map(|c| &c.doc),
+                            &["node.uuid_persistence_dir", "uuid_persistence_dir"],
+                        )
+                    })
                     .unwrap_or_else(|| "/var/lib/fluxbee/state/nodes".to_string()),
             ),
             config_dir: PathBuf::from(
                 env("CONFIG_DIR")
-                    .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
-                        "node.config_dir",
-                        "config_dir",
-                    ]))
+                    .or_else(|| {
+                        json_get_string_opt(
+                            spawn_cfg.as_ref().map(|c| &c.doc),
+                            &["node.config_dir", "config_dir"],
+                        )
+                    })
                     .unwrap_or_else(|| env_config_dir.display().to_string()),
             ),
             dev_mode: env_bool("DEV_MODE").unwrap_or(false),
@@ -240,23 +373,28 @@ impl Config {
             dedup_max_entries: env("DEDUP_MAX_ENTRIES")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50_000),
-            dst_node: env("IO_SLACK_DST_NODE")
-                .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
-                    "io.dst_node",
-                    "dst_node",
-                ])),
+            dst_node: env("IO_SLACK_DST_NODE").or_else(|| {
+                json_get_string_opt(
+                    spawn_cfg.as_ref().map(|c| &c.doc),
+                    &["io.dst_node", "dst_node"],
+                )
+            }),
             identity_target: env("IDENTITY_TARGET")
-                .or_else(|| json_get_string_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
-                    "identity.target",
-                    "identity_target",
-                ]))
+                .or_else(|| {
+                    json_get_string_opt(
+                        spawn_cfg.as_ref().map(|c| &c.doc),
+                        &["identity.target", "identity_target"],
+                    )
+                })
                 .unwrap_or_else(|| format!("SY.identity@{resolved_island_id}")),
             identity_timeout_ms: env("IDENTITY_TIMEOUT_MS")
                 .and_then(|v| v.parse().ok())
-                .or_else(|| json_get_u64_opt(spawn_cfg.as_ref().map(|c| &c.doc), &[
-                    "identity.timeout_ms",
-                    "identity_timeout_ms",
-                ]))
+                .or_else(|| {
+                    json_get_u64_opt(
+                        spawn_cfg.as_ref().map(|c| &c.doc),
+                        &["identity.timeout_ms", "identity_timeout_ms"],
+                    )
+                })
                 .unwrap_or(10_000),
             slack_session_window_ms: env("SLACK_SESSION_WINDOW_MS")
                 .and_then(|v| v.parse().ok())
@@ -267,6 +405,7 @@ impl Config {
             slack_session_max_fragments: env("SLACK_SESSION_MAX_FRAGMENTS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
+            blob_runtime,
         })
     }
 }
@@ -423,7 +562,9 @@ impl SlackClients {
             ));
         }
 
-        let url = resp.url.ok_or_else(|| anyhow::anyhow!("missing url in response"))?;
+        let url = resp
+            .url
+            .ok_or_else(|| anyhow::anyhow!("missing url in response"))?;
         Ok(Url::parse(&url)?)
     }
 
@@ -469,6 +610,22 @@ impl SlackClients {
         }
         Ok(())
     }
+
+    async fn download_private_file(&self, url: &str) -> Result<Vec<u8>> {
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(&self.slack_bot_token)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "slack private download failed with status {status}"
+            ));
+        }
+        Ok(response.bytes().await?.to_vec())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -486,6 +643,8 @@ async fn run_inbound_socket_mode(
     provisioner: Arc<dyn IdentityProvisioner>,
     inbound: Arc<Mutex<InboundProcessor>>,
     sessionizer: Option<Arc<SlackSessionizer>>,
+    blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
+    blob_payload_cfg: IoTextBlobConfig,
 ) -> Result<()> {
     let mention_re = Regex::new(r"^<@[^>]+>\s*")?;
 
@@ -605,23 +764,25 @@ async fn run_inbound_socket_mode(
             );
 
             if let Some(sessionizer) = &sessionizer {
-                sessionizer
-                    .handle_event(
-                        &config.node_name,
-                        sender.clone(),
-                        identity.clone(),
-                        provisioner.clone(),
-                        inbound.clone(),
-                        &team_id,
-                        &user,
-                        &channel,
-                        thread_ts.as_deref(),
-                        &message_id,
-                        content,
-                        payload,
-                    )
-                    .await;
-                continue;
+                if !event_has_files(&event) {
+                    sessionizer
+                        .handle_event(
+                            &config.node_name,
+                            sender.clone(),
+                            identity.clone(),
+                            provisioner.clone(),
+                            inbound.clone(),
+                            &team_id,
+                            &user,
+                            &channel,
+                            thread_ts.as_deref(),
+                            &message_id,
+                            content,
+                            payload,
+                        )
+                        .await;
+                    continue;
+                }
             }
 
             let io_ctx = slack_inbound_io_context(
@@ -631,12 +792,32 @@ async fn run_inbound_socket_mode(
                 thread_ts.as_deref(),
                 &message_id,
             );
-
-            let payload = serde_json::json!({
-              "type": "text",
-              "content": content,
-              "raw": { "slack": payload },
-            });
+            let payload = match build_slack_inbound_payload(
+                slack.as_ref(),
+                blob_toolkit.as_ref(),
+                &blob_payload_cfg,
+                &team_id,
+                &user,
+                &channel,
+                thread_ts.as_deref(),
+                &message_id,
+                &content,
+                &event,
+            )
+            .await
+            {
+                Some(payload) => payload,
+                None => {
+                    tracing::warn!(
+                        team_id = %team_id,
+                        user = %user,
+                        channel = %channel,
+                        message_id = %message_id,
+                        "dropping inbound event: no valid text/attachments after blob processing"
+                    );
+                    continue;
+                }
+            };
 
             let outcome = inbound
                 .lock()
@@ -671,6 +852,287 @@ async fn run_inbound_socket_mode(
             }
         }
     }
+}
+
+fn event_has_files(event: &Value) -> bool {
+    event
+        .get("files")
+        .and_then(|v| v.as_array())
+        .is_some_and(|files| !files.is_empty())
+}
+
+async fn build_slack_inbound_payload(
+    slack: &SlackClients,
+    blob_toolkit: &fluxbee_sdk::blob::BlobToolkit,
+    blob_payload_cfg: &IoTextBlobConfig,
+    team_id: &str,
+    user: &str,
+    channel: &str,
+    thread_ts: Option<&str>,
+    message_id: &str,
+    content: &str,
+    event: &Value,
+) -> Option<Value> {
+    let attachments =
+        collect_slack_blob_attachments(slack, blob_toolkit, blob_payload_cfg, event).await;
+    if content.trim().is_empty() && attachments.is_empty() {
+        return None;
+    }
+
+    match build_text_v1_inbound_payload(blob_toolkit, blob_payload_cfg, content, attachments) {
+        Ok(mut payload) => {
+            attach_slack_raw_stub(&mut payload, team_id, user, channel, thread_ts, message_id);
+            Some(payload)
+        }
+        Err(err) => {
+            tracing::warn!(
+                code = err.canonical_code(),
+                error = %err,
+                "failed to build payload with attachments; retrying with text-only fallback"
+            );
+            if content.trim().is_empty() {
+                return None;
+            }
+            match build_text_v1_inbound_payload(blob_toolkit, blob_payload_cfg, content, vec![]) {
+                Ok(mut payload) => {
+                    attach_slack_raw_stub(
+                        &mut payload,
+                        team_id,
+                        user,
+                        channel,
+                        thread_ts,
+                        message_id,
+                    );
+                    Some(payload)
+                }
+                Err(fallback_err) => {
+                    tracing::warn!(
+                        code = fallback_err.canonical_code(),
+                        error = %fallback_err,
+                        "failed to build text-only fallback payload"
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
+async fn collect_slack_blob_attachments(
+    slack: &SlackClients,
+    blob_toolkit: &fluxbee_sdk::blob::BlobToolkit,
+    blob_payload_cfg: &IoTextBlobConfig,
+    event: &Value,
+) -> Vec<InboundAttachmentInput> {
+    let Some(files) = event.get("files").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let mut total_size: u64 = 0;
+    let allowed_mimes = blob_payload_cfg
+        .allowed_mimes
+        .iter()
+        .map(|m| normalize_mime(m))
+        .collect::<HashSet<_>>();
+
+    for file in files {
+        if out.len() >= blob_payload_cfg.max_attachments {
+            let err = IoBlobContractError::TooManyAttachments {
+                actual: files.len(),
+                max: blob_payload_cfg.max_attachments,
+            };
+            tracing::warn!(code = err.canonical_code(), error = %err, "attachment skipped");
+            break;
+        }
+
+        let file_id = file
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown-file");
+        let filename = file
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or(file_id);
+        let mime = file
+            .get("mimetype")
+            .and_then(|v| v.as_str())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        if !allowed_mimes.contains(&normalize_mime(&mime)) {
+            let err = IoBlobContractError::UnsupportedMime { mime: mime.clone() };
+            tracing::warn!(
+                file_id = %file_id,
+                filename = %filename,
+                code = err.canonical_code(),
+                error = %err,
+                "attachment skipped"
+            );
+            continue;
+        }
+
+        let size_hint = file.get("size").and_then(|v| v.as_u64());
+        if let Some(size) = size_hint {
+            if size > blob_payload_cfg.max_attachment_bytes {
+                let err = IoBlobContractError::BlobTooLarge {
+                    actual: size,
+                    max: blob_payload_cfg.max_attachment_bytes,
+                };
+                tracing::warn!(
+                    file_id = %file_id,
+                    filename = %filename,
+                    code = err.canonical_code(),
+                    error = %err,
+                    "attachment skipped"
+                );
+                continue;
+            }
+            if total_size.saturating_add(size) > blob_payload_cfg.max_total_attachment_bytes {
+                let err = IoBlobContractError::BlobTooLarge {
+                    actual: total_size.saturating_add(size),
+                    max: blob_payload_cfg.max_total_attachment_bytes,
+                };
+                tracing::warn!(
+                    file_id = %file_id,
+                    filename = %filename,
+                    code = err.canonical_code(),
+                    error = %err,
+                    "attachment skipped"
+                );
+                continue;
+            }
+        }
+
+        let download_url = file
+            .get("url_private_download")
+            .and_then(|v| v.as_str())
+            .or_else(|| file.get("url_private").and_then(|v| v.as_str()));
+        let Some(download_url) = download_url else {
+            let err = IoBlobContractError::Blob(fluxbee_sdk::blob::BlobError::Io(
+                "missing Slack file download URL".to_string(),
+            ));
+            tracing::warn!(
+                file_id = %file_id,
+                filename = %filename,
+                code = err.canonical_code(),
+                error = %err,
+                "attachment skipped"
+            );
+            continue;
+        };
+
+        let bytes = match slack.download_private_file(download_url).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let err = IoBlobContractError::Blob(fluxbee_sdk::blob::BlobError::Io(format!(
+                    "slack download failed: {error}"
+                )));
+                tracing::warn!(
+                    file_id = %file_id,
+                    filename = %filename,
+                    code = err.canonical_code(),
+                    error = %err,
+                    "attachment skipped"
+                );
+                continue;
+            }
+        };
+
+        let actual_size = bytes.len() as u64;
+        if actual_size > blob_payload_cfg.max_attachment_bytes {
+            let err = IoBlobContractError::BlobTooLarge {
+                actual: actual_size,
+                max: blob_payload_cfg.max_attachment_bytes,
+            };
+            tracing::warn!(
+                file_id = %file_id,
+                filename = %filename,
+                code = err.canonical_code(),
+                error = %err,
+                "attachment skipped"
+            );
+            continue;
+        }
+        if total_size.saturating_add(actual_size) > blob_payload_cfg.max_total_attachment_bytes {
+            let err = IoBlobContractError::BlobTooLarge {
+                actual: total_size.saturating_add(actual_size),
+                max: blob_payload_cfg.max_total_attachment_bytes,
+            };
+            tracing::warn!(
+                file_id = %file_id,
+                filename = %filename,
+                code = err.canonical_code(),
+                error = %err,
+                "attachment skipped"
+            );
+            continue;
+        }
+
+        let blob_ref = match blob_toolkit.put_bytes(&bytes, filename, &mime) {
+            Ok(blob_ref) => blob_ref,
+            Err(error) => {
+                let err = IoBlobContractError::Blob(error);
+                tracing::warn!(
+                    file_id = %file_id,
+                    filename = %filename,
+                    code = err.canonical_code(),
+                    error = %err,
+                    "attachment skipped"
+                );
+                continue;
+            }
+        };
+        if let Err(error) = blob_toolkit.promote(&blob_ref) {
+            let err = IoBlobContractError::Blob(error);
+            tracing::warn!(
+                file_id = %file_id,
+                filename = %filename,
+                code = err.canonical_code(),
+                error = %err,
+                "attachment skipped"
+            );
+            continue;
+        }
+
+        total_size = total_size.saturating_add(actual_size);
+        out.push(InboundAttachmentInput { blob_ref });
+    }
+
+    out
+}
+
+fn attach_slack_raw_stub(
+    payload: &mut Value,
+    team_id: &str,
+    user: &str,
+    channel: &str,
+    thread_ts: Option<&str>,
+    message_id: &str,
+) {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert(
+            "raw".to_string(),
+            serde_json::json!({
+                "slack": {
+                    "team_id": team_id,
+                    "user": user,
+                    "channel": channel,
+                    "thread_ts": thread_ts,
+                    "message_id": message_id
+                }
+            }),
+        );
+    }
+}
+
+fn normalize_mime(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 #[derive(Debug)]
@@ -750,20 +1212,22 @@ impl SlackSessionizer {
                 return;
             }
 
-            let entry = sessions.entry(key.clone()).or_insert_with(|| SlackSessionState {
-                deadline: now + self.window,
-                version: 0,
-                seen_message_ids: HashSet::new(),
-                io_ctx: slack_inbound_io_context(team_id, user, channel, thread_ts, message_id),
-                identity_input: ResolveOrCreateInput {
-                    channel: "slack".to_string(),
-                    external_id: slack_external_id(node_name, user),
-                    tenant_hint: Some(team_id.to_string()),
-                    attributes: serde_json::json!({ "team_id": team_id }),
-                },
-                contents: Vec::new(),
-                raws: Vec::new(),
-            });
+            let entry = sessions
+                .entry(key.clone())
+                .or_insert_with(|| SlackSessionState {
+                    deadline: now + self.window,
+                    version: 0,
+                    seen_message_ids: HashSet::new(),
+                    io_ctx: slack_inbound_io_context(team_id, user, channel, thread_ts, message_id),
+                    identity_input: ResolveOrCreateInput {
+                        channel: "slack".to_string(),
+                        external_id: slack_external_id(node_name, user),
+                        tenant_hint: Some(team_id.to_string()),
+                        attributes: serde_json::json!({ "team_id": team_id }),
+                    },
+                    contents: Vec::new(),
+                    raws: Vec::new(),
+                });
 
             if !entry.seen_message_ids.insert(message_id.to_string()) {
                 tracing::debug!(%key, %message_id, "session dedup hit; ignoring duplicate event");
@@ -937,7 +1401,11 @@ async fn run_outbound_loop(inbox: Arc<Mutex<RouterInbox>>, slack: Arc<SlackClien
             continue;
         };
 
-        let payload_type = msg.payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let payload_type = msg
+            .payload
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let meta_msg = msg.meta.msg.as_deref().unwrap_or("");
         tracing::debug!(
             trace_id = %msg.routing.trace_id,
@@ -989,7 +1457,12 @@ async fn run_outbound_loop(inbox: Arc<Mutex<RouterInbox>>, slack: Arc<SlackClien
         );
 
         if let Err(e) = slack
-            .post_message(&target.channel_id, &text, target.thread_ts.as_deref(), blocks)
+            .post_message(
+                &target.channel_id,
+                &text,
+                target.thread_ts.as_deref(),
+                blocks,
+            )
             .await
         {
             tracing::warn!(error=?e, "failed to send slack message");
@@ -1008,7 +1481,10 @@ fn render_outbound_text(payload: &Value) -> String {
 
     let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
     if payload_type.eq_ignore_ascii_case("error") {
-        let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let message = payload
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let code = payload.get("code").and_then(|v| v.as_str()).unwrap_or("");
         if !message.trim().is_empty() && !code.trim().is_empty() {
             return format!("Error ({code}): {message}");
