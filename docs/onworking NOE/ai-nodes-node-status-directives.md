@@ -123,7 +123,7 @@ pero **para MVP** alcanza con el helper default.
 ## 7) Checklist de implementacion en este repo (AI runner actual)
 
 Nota: el runtime AI actual no usa un loop directo con `NodeSender/NodeReceiver` como en el helper del SDK.
-La implementacion equivalente se hace en `crates/fluxbee_ai_nodes/src/bin/ai_node_runner.rs`,
+La implementacion equivalente se hace en `nodes/ai/ai-generic/src/bin/ai_node_runner.rs`,
 interceptando `NODE_STATUS_GET` en el path de control-plane.
 
 - [x] S1. Agregar manejo explicito de `meta.msg = NODE_STATUS_GET` en control-plane (antes de comandos de negocio).

@@ -8,3 +8,9 @@ Notas:
 - el nombre del paquete se conserva como `fluxbee-ai-nodes` para no romper scripts existentes,
 - el bin principal sigue siendo `ai_node_runner`,
 - `ai_local_probe` se conserva como bin auxiliar.
+
+Build desde raíz:
+
+```bash
+cargo check -p fluxbee-ai-nodes --bins
+```

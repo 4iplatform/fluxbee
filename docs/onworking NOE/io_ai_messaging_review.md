@@ -16,7 +16,7 @@ Fuentes principales:
 - `docs/io/io-slack.md`
 - `docs/AI_nodes_spec.md`
 - `docs/AI_Nodes_SDK_Spec_v1.md`
-- implementación actual en `crates/fluxbee_sdk`, `crates/fluxbee_ai_sdk`, `crates/fluxbee_ai_nodes`, `nodes/io/common`, `nodes/io/io-slack`
+- implementación actual en `crates/fluxbee_sdk`, `crates/fluxbee_ai_sdk`, `nodes/ai/ai-generic`, `nodes/io/common`, `nodes/io/io-slack`
 
 ## 2. Modelo canónico del protocolo
 

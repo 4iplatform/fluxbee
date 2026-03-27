@@ -29,7 +29,7 @@ Target: clear install/run strategy (systemd units, env files, restart policy, lo
 
 - [x] P0.4 Make AI runtime behavior explicit on idle read timeout.
 Description: operators interpret node exit as crash when timeout ends read loop.
-Current location: `crates/fluxbee_ai_sdk/src/runtime.rs` and `crates/fluxbee_ai_nodes/src/bin/ai_node_runner.rs`.
+Current location: `crates/fluxbee_ai_sdk/src/runtime.rs` and `nodes/ai/ai-generic/src/bin/ai_node_runner.rs`.
 Target: explicit policy (`exit_on_read_timeout` vs `keep_alive`) and documented defaults.
 Resolution:
 - Adopted `keep_alive`.
@@ -55,7 +55,7 @@ Target: configurable path + documented limits, with safe defaults.
 
 - [x] P1.4 Replace placeholder reply source in AI runner path.
 Description: reply source was coupled to a placeholder in runner path and rewritten later by runtime.
-Current location: `crates/fluxbee_ai_nodes/src/bin/ai_node_runner.rs`.
+Current location: `nodes/ai/ai-generic/src/bin/ai_node_runner.rs`.
 Target: remove placeholder dependency and make source assignment single-responsibility.
 Resolution:
 - `ai_node_runner` now builds replies with runtime-assigned source helper.
@@ -67,7 +67,7 @@ Resolution:
 Description: path/model defaults exist in code and docs; risk of drift.
 Targets:
 - `nodes/io/io-slack/src/main.rs`
-- `crates/fluxbee_ai_nodes/src/bin/ai_node_runner.rs`
+- `nodes/ai/ai-generic/src/bin/ai_node_runner.rs`
 - `docs/AI_nodes_spec.md`
 - `nodes/io/README.md`
 

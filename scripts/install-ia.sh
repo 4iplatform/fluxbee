@@ -30,7 +30,7 @@ if [[ "${SKIP_BUILD:-}" != "1" ]]; then
     echo "Error: cargo not found. Set SKIP_BUILD=1 to install existing binaries." >&2
     exit 1
   fi
-  echo "Building AI runner (fluxbee-ai-nodes/ai_node_runner)..."
+  echo "Building AI runner (nodes/ai/ai-generic -> fluxbee-ai-nodes/ai_node_runner)..."
   (
     cd "$ROOT_DIR"
     cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
@@ -47,7 +47,7 @@ NODECTL_SRC="$ROOT_DIR/scripts/ai-nodectl.sh"
 
 if [[ ! -f "$RUNNER_BIN_SRC" ]]; then
   echo "Error: missing runner binary: $RUNNER_BIN_SRC" >&2
-  echo "Hint: build with 'cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner' or set BIN_DIR." >&2
+  echo "Hint: build with 'cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner' from nodes/ai/ai-generic or set BIN_DIR." >&2
   exit 1
 fi
 if [[ ! -f "$NODECTL_SRC" ]]; then

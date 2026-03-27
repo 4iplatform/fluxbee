@@ -1421,8 +1421,8 @@ AI node development is split in two layers:
 - Reuses `fluxbee_sdk` socket/protocol primitives.
 - Contains: node trait, runtime loop, message helpers, text payload helpers, LLM client abstraction, minimal Agent abstraction.
 
-2. `crates/fluxbee_ai_nodes/src/bin/*.rs` (bootstrap) -> `ai_node_runner` (target)
-- Runtime executables layer (currently `crates/fluxbee_ai_nodes/src/bin/`).
+2. `nodes/ai/ai-generic/src/bin/*.rs` (bootstrap) -> `ai_node_runner` (target)
+- Runtime executables layer (currently `nodes/ai/ai-generic/src/bin/`).
 - Target state is one generic runner binary (`ai_node_runner`) instantiated with different configs.
 
 Implemented now:

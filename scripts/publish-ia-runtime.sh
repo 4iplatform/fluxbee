@@ -10,7 +10,7 @@ Usage:
   publish-ia-runtime.sh --runtime <AI.runtime> --version <version> [options]
 
 Required:
-  --runtime <AI.runtime>   Runtime key (example: AI.chat)
+  --runtime <AI.runtime>   Runtime key (example: AI.common)
   --version <version>      Runtime version (example: 0.1.0)
 
 Options:
@@ -24,6 +24,9 @@ Options:
   --sudo                   Use sudo for writes
   --skip-build             Skip cargo build
   -h, --help               Show help
+
+Notes:
+  - Source home for the generic AI runner: nodes/ai/ai-generic
 EOF
 }
 
