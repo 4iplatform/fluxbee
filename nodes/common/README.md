@@ -10,6 +10,7 @@ Current scope:
 
 Reference:
 - [Node Config Control Plane Spec](/Users/cagostino/Documents/GitHub/fluxbee/docs/node-config-control-plane-spec.md)
+- [Node Secret Config Spec](/Users/cagostino/Documents/GitHub/fluxbee/docs/onworking%20COA/node-secret-config-spec.md)
 
 Available shared code:
 - `build_node_config_get_message(...)`

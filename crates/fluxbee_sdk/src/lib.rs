@@ -7,6 +7,7 @@ pub mod managed_node;
 pub mod nats;
 pub mod node_client;
 pub mod node_config;
+pub mod node_secret;
 pub mod payload;
 pub mod prelude;
 pub mod protocol;
@@ -42,6 +43,15 @@ pub use node_config::{
     NodeConfigControlRequest, NodeConfigControlResponse, NodeConfigEnvelopeOptions,
     NodeConfigGetPayload, NodeConfigSetPayload, NODE_CONFIG_APPLY_MODE_REPLACE,
     NODE_CONFIG_CONTROL_TARGET,
+};
+pub use node_secret::{
+    build_node_secret_record, ensure_node_secret_dir, ensure_node_secret_dir_with_root,
+    load_node_secret_record, load_node_secret_record_from_path, load_node_secret_record_with_root,
+    node_secret_path, node_secret_path_with_root, redact_secret_map, redact_secret_value,
+    redacted_node_secret_record, save_node_secret_record, save_node_secret_record_to_path,
+    save_node_secret_record_with_root, NodeSecretDescriptor, NodeSecretError, NodeSecretRecord,
+    NodeSecretWriteOptions, NODE_SECRET_FILE_NAME, NODE_SECRET_REDACTION_TOKEN,
+    NODE_SECRET_SCHEMA_VERSION,
 };
 pub use split::{NodeReceiver, NodeSender};
 pub use status::try_handle_default_node_status;
