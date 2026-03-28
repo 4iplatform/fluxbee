@@ -64,6 +64,7 @@ The current platform transport that can already carry this is `send_node_message
 Shared code support now exists in:
 
 - `crates/fluxbee_sdk/src/node_config.rs`
+- `crates/fluxbee_sdk/src/node_secret.rs`
 
 That helper module standardizes:
 
@@ -71,6 +72,7 @@ That helper module standardizes:
 - common request payload structs
 - common response parsing
 - response building with preserved `trace_id`
+- reusable secret metadata descriptor support (`NodeSecretDescriptor`)
 
 It does not standardize the node-owned `payload.config` schema.
 
@@ -165,6 +167,39 @@ Recommended `contract` contents:
 - `examples`
 - `notes`
 
+### 7.1 Minimum `contract.secrets[*]` contract
+
+When a node supports secret-bearing config, each entry inside `contract.secrets` should expose at least:
+
+- `field`
+- `storage_key`
+- `required`
+- `configured`
+- `value_redacted`
+- `persistence`
+
+Semantics:
+
+- `field`
+  - node-owned logical config field inside `payload.config`
+- `storage_key`
+  - node-owned local key name used in secret persistence
+- `required`
+  - whether the node needs this secret for a healthy/usable configuration
+- `configured`
+  - whether the secret is already present locally
+- `value_redacted`
+  - must be `true` whenever the node returns secret-related current-state information
+- `persistence`
+  - for v1 should normally be `local_file`
+
+Rules:
+
+- `CONFIG_GET` must never return raw secret values in `contract.secrets[*]`.
+- `CONFIG_GET` must never return raw secret values inside `config`.
+- `CONFIG_SET` may carry secret values inside `payload.config`; the platform transport does not interpret them.
+- The node is responsible for separating regular config and secrets during persistence.
+
 Example:
 
 ```json
@@ -195,8 +230,11 @@ Example:
     "secrets": [
       {
         "field": "behavior.openai.api_key",
+        "storage_key": "openai_api_key",
         "required": false,
-        "persistence": "node_defined"
+        "configured": true,
+        "value_redacted": true,
+        "persistence": "local_file"
       }
     ],
     "examples": [
@@ -217,6 +255,10 @@ Example:
   }
 }
 ```
+
+The reusable SDK helper for this metadata shape is:
+
+- `fluxbee_sdk::node_secret::NodeSecretDescriptor`
 
 ## 8. CONFIG_SET response requirements
 

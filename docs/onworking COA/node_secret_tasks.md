@@ -67,9 +67,16 @@ Checklist:
 - [ ] S2-T1. Documentar ejemplos canónicos de `SCMD` para secrets vía `CONFIG_SET`.
 - [ ] S2-T2. Documentar ejemplo canónico de `CONFIG_GET` para descubrir faltantes de secrets.
 - [ ] S2-T3. Revisar logging de `SY.admin` para asegurar que payloads secretos no se impriman en claro.
-- [ ] S2-T4. Revisar logging/UX de `archi` para asegurar que no refleje secrets en respuestas o historial visible.
-- [ ] S2-T5. Alinear ayuda de `archi` para que entienda que keys/secrets entran por `CONFIG_SET` y no por `hive.yaml`.
+- [x] S2-T4. Revisar logging/UX de `archi` para asegurar que no refleje secrets en respuestas o historial visible.
+- [x] S2-T5. Alinear ayuda de `archi` para que entienda que keys/secrets entran por `CONFIG_SET` y no por `hive.yaml`.
 - [ ] S2-T6. Definir wording estándar para respuestas de `archi` cuando un nodo reporta `configured=false` en un secret requerido.
+
+Avance actual en `archi`:
+- [x] lectura preferente de OpenAI key desde `secrets.json` local con fallback legacy a `config.json` / `hive.yaml`
+- [x] `SCMD` local `GET /architect/control/config-get`
+- [x] `SCMD` local `POST /architect/control/config-set`
+- [x] recarga en memoria del runtime AI después de persistir la key
+- [x] redaction del comando `SCMD` antes de persistirlo en el historial del chat
 
 ## 4. Fase S3 - contrato de nodos
 
@@ -78,17 +85,24 @@ Meta:
 - pero todos publican el mismo tipo de metadata de secrets
 
 Checklist:
-- [ ] S3-T1. Fijar contrato mínimo para `contract.secrets[*]` en `CONFIG_GET`:
+- [x] S3-T1. Fijar contrato mínimo para `contract.secrets[*]` en `CONFIG_GET`:
   - `field`
   - `storage_key`
   - `required`
   - `configured`
   - `value_redacted`
   - `persistence`
-- [ ] S3-T2. Acordar que `CONFIG_GET` nunca devuelve valores secretos en claro.
-- [ ] S3-T3. Acordar que `CONFIG_SET` puede transportar secrets dentro del `payload.config` del nodo.
-- [ ] S3-T4. Acordar que el nodo es responsable de separar config normal y secrets al persistir.
+- [x] S3-T2. Acordar que `CONFIG_GET` nunca devuelve valores secretos en claro.
+- [x] S3-T3. Acordar que `CONFIG_SET` puede transportar secrets dentro del `payload.config` del nodo.
+- [x] S3-T4. Acordar que el nodo es responsable de separar config normal y secrets al persistir.
 - [ ] S3-T5. Documentar por familia de nodos qué campos son secret-bearing.
+
+Documentado en:
+- `docs/node-config-control-plane-spec.md`
+- `docs/onworking COA/node-secret-config-spec.md`
+
+Soporte común ya disponible en:
+- `crates/fluxbee_sdk/src/node_secret.rs` (`NodeSecretDescriptor`)
 
 ## 5. Fase S4 - adopción inicial en `AI.common`
 

@@ -168,6 +168,12 @@ Rules:
 - `required` may be exposed
 - `storage_key` may be exposed
 - raw secret values must not be exposed
+- `persistence` should be `local_file` in v1
+- `value_redacted` should always be `true` for exposed secret metadata
+
+Shared SDK support now exists for this metadata shape:
+
+- `fluxbee_sdk::node_secret::NodeSecretDescriptor`
 
 If the node wants to surface current config, it should either:
 
@@ -202,7 +208,7 @@ Recommended helper scope:
 - atomic read/write helpers
 - JSON load/save helpers
 - redaction helpers for responses and logs
-- optional helpers for secret metadata descriptors returned by `CONFIG_GET`
+- helpers for secret metadata descriptors returned by `CONFIG_GET`
 
 The SDK should standardize the mechanics, not the business contract.
 

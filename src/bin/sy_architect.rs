@@ -25,8 +25,11 @@ use fluxbee_ai_sdk::{
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
 use fluxbee_sdk::{
-    admin_command, connect, list_ich_options_from_hive_config, AdminCommandRequest,
-    IdentityIchOption, NodeConfig, NodeError, NodeReceiver, NodeSender,
+    admin_command, build_node_secret_record, connect, list_ich_options_from_hive_config,
+    load_node_secret_record_with_root, redacted_node_secret_record,
+    save_node_secret_record_with_root, AdminCommandRequest, IdentityIchOption, NodeConfig,
+    NodeError, NodeReceiver, NodeSecretDescriptor, NodeSecretError, NodeSecretRecord,
+    NodeSecretWriteOptions, NodeSender, NODE_SECRET_REDACTION_TOKEN,
 };
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
@@ -50,6 +53,7 @@ const CHAT_OPERATIONS_TABLE: &str = "operations";
 const CHAT_SESSION_PROFILES_TABLE: &str = "session_profiles";
 const CHAT_MODE_OPERATOR: &str = "operator";
 const CHAT_MODE_IMPERSONATION: &str = "impersonation";
+const ARCHITECT_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
 const ARCHI_SYSTEM_PROMPT: &str = r#"You are archi, the Fluxbee system architect.
 
 Operate as a concise technical assistant for the Fluxbee control plane.
@@ -66,6 +70,7 @@ Rules:
 - For software/core/runtime versions, use `/versions` or `/hives/{hive}/versions`. Do not infer versions from `/hives/{hive}/nodes`.
 - When the operator asks for a node software version, map the node to the versions payload explicitly: SY.identity@hive -> core.components['sy-identity'].version; AI.chat@hive -> runtimes.runtimes['AI.chat'].current; IO.slack.T123@hive -> runtimes.runtimes['IO.slack'].current.
 - For live node-defined config contracts on non-SY nodes, use `POST /hives/{hive}/nodes/{node_name}/control/config-get`. For live node-defined config updates, use `POST /hives/{hive}/nodes/{node_name}/control/config-set`.
+- For local architect OpenAI bootstrap, use `GET /architect/control/config-get` and `POST /architect/control/config-set`.
 - For mutations, use the write tool only to stage the action. Then instruct the operator to reply CONFIRM or CANCEL. Do not claim the mutation ran before confirmation.
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.
@@ -139,7 +144,7 @@ struct ArchitectState {
     socket_dir: PathBuf,
     router_connected: AtomicBool,
     ai_configured: AtomicBool,
-    ai_runtime: Option<ArchitectAiRuntime>,
+    ai_runtime: Arc<Mutex<Option<ArchitectAiRuntime>>>,
     chat_lock: Arc<Mutex<()>>,
     pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
     router_sender: Arc<Mutex<Option<NodeSender>>>,
@@ -693,7 +698,8 @@ async fn main() -> Result<(), ArchitectError> {
 
     let hive = load_hive(&config_dir)?;
     let node_config = load_architect_node_config(&hive.hive_id)?;
-    let ai_runtime = build_architect_ai_runtime(node_config.as_ref(), &hive);
+    let node_name = architect_node_name(&hive.hive_id);
+    let ai_runtime = build_architect_ai_runtime(&node_name, node_config.as_ref(), &hive);
     let listen = std::env::var("JSR_ARCHITECT_LISTEN")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -707,14 +713,14 @@ async fn main() -> Result<(), ArchitectError> {
 
     let state = Arc::new(ArchitectState {
         hive_id: hive.hive_id.clone(),
-        node_name: format!("SY.architect@{}", hive.hive_id),
+        node_name: node_name.clone(),
         listen: listen.clone(),
         config_dir,
         state_dir,
         socket_dir,
         router_connected: AtomicBool::new(false),
         ai_configured: AtomicBool::new(ai_runtime.is_some()),
-        ai_runtime,
+        ai_runtime: Arc::new(Mutex::new(ai_runtime)),
         chat_lock: Arc::new(Mutex::new(())),
         pending_actions: Arc::new(Mutex::new(HashMap::new())),
         router_sender: Arc::new(Mutex::new(None)),
@@ -782,15 +788,21 @@ fn architect_node_dir(hive_id: &str) -> PathBuf {
         .join(format!("SY.architect@{hive_id}"))
 }
 
+fn architect_node_name(hive_id: &str) -> String {
+    format!("SY.architect@{hive_id}")
+}
+
 fn architect_config_path(hive_id: &str) -> PathBuf {
     architect_node_dir(hive_id).join("config.json")
 }
 
 fn build_architect_ai_runtime(
+    node_name: &str,
     config: Option<&ArchitectNodeConfigFile>,
     hive: &HiveFile,
 ) -> Option<ArchitectAiRuntime> {
-    let openai = merged_openai_section(config, hive)?;
+    let secrets = load_architect_secret_record(node_name).ok().flatten();
+    let openai = merged_openai_section(config, hive, secrets.as_ref())?;
     let api_key = openai
         .api_key
         .as_deref()
@@ -820,6 +832,7 @@ fn build_architect_ai_runtime(
 fn merged_openai_section(
     config: Option<&ArchitectNodeConfigFile>,
     hive: &HiveFile,
+    secrets: Option<&NodeSecretRecord>,
 ) -> Option<OpenAiSection> {
     let config_openai = config
         .and_then(|cfg| cfg.ai_providers.as_ref())
@@ -828,19 +841,68 @@ fn merged_openai_section(
         .ai_providers
         .as_ref()
         .and_then(|providers| providers.openai.clone());
+    let secret_api_key = secrets
+        .and_then(|record| record.secrets.get(ARCHITECT_LOCAL_SECRET_KEY_OPENAI))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
 
     match (config_openai, hive_openai) {
         (Some(cfg), Some(hive_cfg)) => Some(OpenAiSection {
-            api_key: cfg.api_key.or(hive_cfg.api_key),
+            api_key: secret_api_key.or(cfg.api_key).or(hive_cfg.api_key),
             default_model: cfg.default_model.or(hive_cfg.default_model),
             max_tokens: cfg.max_tokens.or(hive_cfg.max_tokens),
             temperature: cfg.temperature.or(hive_cfg.temperature),
             top_p: cfg.top_p.or(hive_cfg.top_p),
         }),
-        (Some(cfg), None) => Some(cfg),
-        (None, Some(hive_cfg)) => Some(hive_cfg),
-        (None, None) => None,
+        (Some(cfg), None) => Some(OpenAiSection {
+            api_key: secret_api_key.or(cfg.api_key),
+            default_model: cfg.default_model,
+            max_tokens: cfg.max_tokens,
+            temperature: cfg.temperature,
+            top_p: cfg.top_p,
+        }),
+        (None, Some(hive_cfg)) => Some(OpenAiSection {
+            api_key: secret_api_key.or(hive_cfg.api_key),
+            default_model: hive_cfg.default_model,
+            max_tokens: hive_cfg.max_tokens,
+            temperature: hive_cfg.temperature,
+            top_p: hive_cfg.top_p,
+        }),
+        (None, None) => secret_api_key.map(|api_key| OpenAiSection {
+            api_key: Some(api_key),
+            default_model: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+        }),
     }
+}
+
+fn architect_nodes_root() -> PathBuf {
+    json_router::paths::storage_root_dir().join("nodes")
+}
+
+fn load_architect_secret_record(
+    node_name: &str,
+) -> Result<Option<NodeSecretRecord>, ArchitectError> {
+    match load_node_secret_record_with_root(node_name, architect_nodes_root()) {
+        Ok(record) => Ok(Some(record)),
+        Err(NodeSecretError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(Box::new(err)),
+    }
+}
+
+async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, ArchitectError> {
+    let hive = load_hive(&state.config_dir)?;
+    let node_config = load_architect_node_config(&hive.hive_id)?;
+    let runtime = build_architect_ai_runtime(&state.node_name, node_config.as_ref(), &hive);
+    state
+        .ai_configured
+        .store(runtime.is_some(), Ordering::Relaxed);
+    *state.ai_runtime.lock().await = runtime;
+    Ok(state.ai_configured.load(Ordering::Relaxed))
 }
 
 fn load_identity_ich_options(
@@ -1321,11 +1383,16 @@ async fn handle_ai_chat(
     session: &ChatSessionRecord,
     input: &str,
 ) -> Result<Value, ArchitectError> {
-    let runtime = state.ai_runtime.clone().ok_or_else(|| -> ArchitectError {
-        "AI provider not configured. Chat remains available for SCMD system operations."
-            .to_string()
-            .into()
-    })?;
+    let runtime = state
+        .ai_runtime
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| -> ArchitectError {
+            "AI provider not configured. Chat remains available for SCMD system operations."
+                .to_string()
+                .into()
+        })?;
     let tool_context = admin_tool_context(state, Some(&session.session_id));
     let tool_provider = ArchitectAdminReadToolsProvider::new(tool_context);
     let mut tools = FunctionToolRegistry::new();
@@ -2132,6 +2199,9 @@ async fn handle_scmd(
     raw: &str,
 ) -> Result<Value, ArchitectError> {
     let parsed = parse_scmd(raw)?;
+    if let Some(output) = handle_local_architect_scmd(state, &parsed).await? {
+        return Ok(output);
+    }
     let translated = translate_scmd(&state.hive_id, parsed)?;
     if is_mutating_admin_action(&translated.action) {
         execute_tracked_admin_translation(
@@ -2146,6 +2216,211 @@ async fn handle_scmd(
     } else {
         execute_admin_translation(state, translated).await
     }
+}
+
+async fn handle_local_architect_scmd(
+    state: &ArchitectState,
+    parsed: &ParsedScmd,
+) -> Result<Option<Value>, ArchitectError> {
+    let segments: Vec<&str> = parsed
+        .path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    match (parsed.method.as_str(), segments.as_slice()) {
+        ("GET", ["architect", "control", "config-get"]) => {
+            Ok(Some(handle_architect_local_config_get(state).await?))
+        }
+        ("POST", ["architect", "control", "config-set"]) => {
+            let body = parsed.body.clone().unwrap_or_else(|| json!({}));
+            if !body.is_object() {
+                return Err(
+                    "SCMD body for architect local config-set must be a JSON object".into(),
+                );
+            }
+            Ok(Some(handle_architect_local_config_set(state, body).await?))
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn handle_architect_local_config_get(
+    state: &ArchitectState,
+) -> Result<Value, ArchitectError> {
+    let hive = load_hive(&state.config_dir)?;
+    let node_config = load_architect_node_config(&state.hive_id)?;
+    let secret_record = load_architect_secret_record(&state.node_name)?;
+    let merged = merged_openai_section(node_config.as_ref(), &hive, secret_record.as_ref());
+    let configured = merged
+        .as_ref()
+        .and_then(|openai| openai.api_key.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let api_key_source = if secret_record
+        .as_ref()
+        .and_then(|record| record.secrets.get(ARCHITECT_LOCAL_SECRET_KEY_OPENAI))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        "local_file"
+    } else if node_config
+        .as_ref()
+        .and_then(|cfg| cfg.ai_providers.as_ref())
+        .and_then(|providers| providers.openai.as_ref())
+        .and_then(|openai| openai.api_key.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        "config.json_legacy"
+    } else if hive
+        .ai_providers
+        .as_ref()
+        .and_then(|providers| providers.openai.as_ref())
+        .and_then(|openai| openai.api_key.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        "hive.yaml_legacy"
+    } else {
+        "missing"
+    };
+    let descriptor = NodeSecretDescriptor {
+        field: "ai_providers.openai.api_key".to_string(),
+        storage_key: ARCHITECT_LOCAL_SECRET_KEY_OPENAI.to_string(),
+        required: true,
+        configured,
+        value_redacted: true,
+        persistence: "local_file".to_string(),
+    };
+    Ok(json!({
+        "status": "ok",
+        "action": "architect_local_config_get",
+        "payload": {
+            "ok": true,
+            "node_name": state.node_name,
+            "config_version": 1,
+            "state": if configured { "configured" } else { "missing_secret" },
+            "config": {
+                "ai_providers": {
+                    "openai": {
+                        "api_key": if configured { Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()) } else { Value::Null },
+                        "default_model": merged.as_ref().and_then(|openai| openai.default_model.clone()).map(Value::String).unwrap_or(Value::Null),
+                        "max_tokens": merged.as_ref().and_then(|openai| openai.max_tokens.map(Value::from)).unwrap_or(Value::Null),
+                        "temperature": merged.as_ref().and_then(|openai| openai.temperature.map(Value::from)).unwrap_or(Value::Null),
+                        "top_p": merged.as_ref().and_then(|openai| openai.top_p.map(Value::from)).unwrap_or(Value::Null)
+                    }
+                }
+            },
+            "contract": {
+                "node_family": "SY",
+                "node_kind": "SY.architect",
+                "supports": ["CONFIG_GET", "CONFIG_SET"],
+                "required_fields": ["config.ai_providers.openai.api_key"],
+                "optional_fields": [],
+                "secrets": [descriptor],
+                "notes": [
+                    "This local control path bootstraps archi's own OpenAI key without using hive.yaml.",
+                    "Secret values are persisted in local secrets.json and always returned redacted."
+                ]
+            },
+            "secret_record": secret_record.map(|record| redacted_node_secret_record(&record)),
+            "api_key_source": api_key_source
+        }
+    }))
+}
+
+async fn handle_architect_local_config_set(
+    state: &ArchitectState,
+    body: Value,
+) -> Result<Value, ArchitectError> {
+    let api_key = extract_architect_openai_api_key(&body)?.ok_or_else(|| -> ArchitectError {
+        "architect local config-set requires config.ai_providers.openai.api_key".into()
+    })?;
+    let updated_by_ilk = body
+        .get("updated_by_ilk")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let updated_by_label = body
+        .get("updated_by_label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| Some("archi".to_string()));
+    let trace_id = body
+        .get("trace_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let mut secrets = load_architect_secret_record(&state.node_name)?
+        .map(|record| record.secrets)
+        .unwrap_or_default();
+    secrets.insert(
+        ARCHITECT_LOCAL_SECRET_KEY_OPENAI.to_string(),
+        Value::String(api_key),
+    );
+    let record = build_node_secret_record(
+        secrets,
+        &NodeSecretWriteOptions {
+            updated_by_ilk,
+            updated_by_label,
+            trace_id: Some(trace_id.clone()),
+        },
+    );
+    let path = save_node_secret_record_with_root(&state.node_name, architect_nodes_root(), &record)
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    let ai_configured = refresh_architect_ai_runtime(state).await?;
+
+    Ok(json!({
+        "status": "ok",
+        "action": "architect_local_config_set",
+        "payload": {
+            "ok": true,
+            "node_name": state.node_name,
+            "state": if ai_configured { "configured" } else { "missing_secret" },
+            "trace_id": trace_id,
+            "ai_configured": ai_configured,
+            "persisted_path": path,
+            "stored_secrets": [{
+                "field": "ai_providers.openai.api_key",
+                "storage_key": ARCHITECT_LOCAL_SECRET_KEY_OPENAI,
+                "value_redacted": true
+            }],
+            "message": "Architect local OpenAI key stored in secrets.json and runtime reloaded."
+        }
+    }))
+}
+
+fn extract_architect_openai_api_key(body: &Value) -> Result<Option<String>, ArchitectError> {
+    if let Some(value) = body
+        .get("config")
+        .and_then(|config| config.get("ai_providers"))
+        .and_then(|providers| providers.get("openai"))
+        .and_then(|openai| openai.get("api_key"))
+        .and_then(Value::as_str)
+    {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+    if let Some(value) = body.get("api_key").and_then(Value::as_str) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 fn scmd_raw_from_parts(method: &str, path: &str, body: Option<&Value>) -> String {
@@ -3725,6 +4000,7 @@ async fn persist_chat_exchange(
     let messages = ensure_messages_table(&db).await?;
 
     let now = now_epoch_ms();
+    let user_message = sanitize_user_message_for_persistence(&user_message);
     let user_row = ChatMessageRecord {
         message_id: Uuid::new_v4().to_string(),
         session_id: session.session_id.clone(),
@@ -4726,6 +5002,55 @@ fn compact_scmd_title(raw: &str) -> String {
         Ok(parsed) => format!("{} {}", parsed.method, preview_text(&parsed.path, 40)),
         Err(_) => format!("SCMD {}", preview_text(raw, 40)),
     }
+}
+
+fn sanitize_user_message_for_persistence(user_message: &str) -> String {
+    let trimmed = user_message.trim();
+    let Some(raw) = trimmed.strip_prefix("SCMD:") else {
+        return user_message.to_string();
+    };
+    match parse_scmd(raw.trim()) {
+        Ok(parsed) => {
+            let redacted_body = parsed.body.as_ref().map(redact_json_secret_fields);
+            format!(
+                "SCMD: {}",
+                scmd_raw_from_parts(&parsed.method, &parsed.path, redacted_body.as_ref())
+            )
+        }
+        Err(_) => user_message.to_string(),
+    }
+}
+
+fn redact_json_secret_fields(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    if key_looks_secret(key) {
+                        (
+                            key.clone(),
+                            Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()),
+                        )
+                    } else {
+                        (key.clone(), redact_json_secret_fields(value))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redact_json_secret_fields).collect()),
+        other => other.clone(),
+    }
+}
+
+fn key_looks_secret(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "api_key" | "apikey" | "token" | "access_token" | "client_secret" | "secret" | "password"
+    ) || normalized.ends_with("_api_key")
+        || normalized.ends_with("_token")
+        || normalized.ends_with("_secret")
+        || normalized.ends_with("_password")
 }
 
 fn session_filter(session_id: &str) -> String {
