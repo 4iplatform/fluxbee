@@ -143,32 +143,36 @@
   - `error` (si `ok=false`)
   - `effective_config` (si `ok=true`, sin secretos en claro)
 
-### 2.1.4 Secrets (MVP) — inline ahora, ref a futuro
+### 2.1.4 Secrets (v1) — `CONFIG_SET` + `secrets.json` local
 
-✅ **NORMATIVO (MVP)**:
-- Para providers que requieren credenciales (p.ej. OpenAI), `CONFIG_SET` **MAY** incluir el secreto **inline** (ej. `openai.api_key`) para permitir operación sin intervención humana.
+✅ **NORMATIVO (v1)**:
+- Para providers que requieren credenciales (p.ej. OpenAI), `CONFIG_SET` **MAY** incluir el secreto inline dentro de `config.secrets.*` para permitir operación sin intervención humana.
+- El campo canónico actual para OpenAI es:
+  - `config.secrets.openai.api_key`
+- El nodo persiste el secreto en un archivo local:
+  - `/var/lib/fluxbee/nodes/<TYPE>/<node@hive>/secrets.json`
 
 
 #### Precedencia de secretos (HOY vs runtime)
 
 ✅ **NORMATIVO (HOY)**:
-- **Fuente primaria** (si está presente): secreto en YAML (`behavior.openai.api_key`) — persistido en disco.
-- **Override en caliente**: si llega un `CONFIG_SET` válido con secreto inline, el nodo **MAY** usar ese valor **en memoria** y **sobrescribe temporalmente** el valor del YAML mientras el proceso está vivo.
-- En ningún caso el nodo debe persistir el secreto inline en `${STATE_DIR}`.
+- **Fuente primaria** (si está presente): secreto en `secrets.json` local del nodo.
+- `CONFIG_SET` con `config.secrets.openai.api_key` debe persistir el secreto en `secrets.json`.
+- Durante migración, el nodo **MAY** aceptar aliases legacy (`behavior.openai.api_key`, `behavior.api_key`) y migrarlos a `secrets.json`.
+- En ningún caso el nodo debe persistir el secreto inline en `${STATE_DIR}` ni dejarlo en el `effective_config` devuelto por `CONFIG_GET`.
 
 ✅ **NORMATIVO (en reinicio)**:
-- Tras restart, el override en memoria se pierde.
-- Si el YAML trae el secreto inline, el nodo puede volver a `CONFIGURED` usando ese secreto.
-- Si el YAML NO trae secreto y no hay otra fuente, el nodo queda `FAILED_CONFIG (missing_secret)` hasta recibir nuevamente `CONFIG_SET` con secreto inline.
+- Tras restart, el nodo debe poder volver a `CONFIGURED` usando el secreto guardado en `secrets.json`.
+- Si no existe secreto local y no hay otra fuente de compatibilidad temporal, el nodo queda `FAILED_CONFIG (missing_secret)` hasta recibir nuevamente `CONFIG_SET`.
 
 🧩 **A ESPECIFICAR (futuro)**:
 - Cuando exista un gestor de secretos y `api_key_ref`, la precedencia recomendada será:
-  - `api_key_ref` (gestor) > override en caliente (si se permite) > inline YAML (deprecado).
+  - `api_key_ref` (gestor) > `secrets.json` local > compat legacy temporal.
 
-⚠️ **ADVERTENCIA (MVP)**:
+⚠️ **ADVERTENCIA (v1)**:
 - El nodo **MUST NOT** persistir secretos en claro dentro de `${STATE_DIR}`.
-- En MVP, el nodo puede mantener el secreto **solo en memoria**:
-  - tras un reinicio, si no existe otra fuente de secreto, el nodo puede quedar `FAILED_CONFIG (missing_secret)` hasta recibir nuevamente `CONFIG_SET` con el secreto inline.
+- `CONFIG_GET`, `CONFIG_RESPONSE`, status y logs no deben devolver el valor plano del secreto.
+- La metadata del secreto se expone por `contract.secrets[*]`, no por el valor efectivo.
 
 🧩 **A ESPECIFICAR (futuro)**:
 - Uso de `api_key_ref` (env/file/vault/kms) y un gestor de secretos (orchestrator/admin o servicio dedicado) para rotación y persistencia segura.
@@ -1099,7 +1103,7 @@ secrets:
 ✅ **NORMATIVO** (requeridos condicionales por behavior):
 - Si `behavior.kind = openai_chat`:
   - `behavior.params.model`
-  - credencial (HOY): `secrets.openai.api_key` (inline YAML/CONFIG_SET) o futura `api_key_ref` (🧩)
+  - credencial (HOY): `secrets.openai.api_key` vía `CONFIG_SET`, persistida localmente en `secrets.json`, o futura `api_key_ref` (🧩)
 
 #### Opcionales (con defaults)
 
@@ -1129,7 +1133,7 @@ mencionado en la “Living Spec” de AI Nodes. fileciteturn2file1L129-
 - `behavior.kind` (enum, requerido: `echo` | `openai_chat`)
 - Si `behavior.kind = openai_chat`:
   - `behavior.model` (string, requerido)
-  - credencial (ver §6/§8): `behavior.api_key_env` (v1 compat) o `secrets.api_key_ref` (recomendado)
+  - credencial (ver §6/§8): `secrets.openai.api_key` (canónico actual) o `secrets.api_key_ref` (futuro)
 
 ### 4.2 YAML canónico (v1, ejemplo)
 
@@ -1158,7 +1162,6 @@ runtime:
 behavior:
   kind: "openai_chat"          # echo | openai_chat
   model: "gpt-4.1-mini"
-  api_key_env: "OPENAI_API_KEY"  # compat v1
   base_url: "https://api.openai.com/v1/responses"  # opcional
   model_settings:
     temperature: 0.2
@@ -1168,6 +1171,15 @@ behavior:
     source: "inline"   # inline | file | env | none
     value: "You are a concise support assistant."
     trim: true
+
+secrets:
+  openai:
+    api_key_env: "OPENAI_API_KEY"   # compat temporal si no se cargó aún por CONFIG_SET
+
+> Nota operativa v1:
+> - el valor real de `secrets.openai.api_key` entra por `CONFIG_SET`
+> - luego el nodo lo persiste en `secrets.json`
+> - no debe mantenerse en `hive.yaml`
 ```
 
 ⚠️ **TENTATIVO**:

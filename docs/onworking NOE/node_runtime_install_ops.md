@@ -169,10 +169,17 @@ Important:
 - If YAML uses default `api_key_env: OPENAI_API_KEY`, `.env` must define `OPENAI_API_KEY=...`.
 - `AI_NODE_MODE=gov` is required for gov-only tools (for example `ilk_register`).
 
-OpenAI key precedence in current MVP runner:
-1. `CONFIG_SET.payload.config.behavior.openai.api_key` (hot override in memory, not persisted as plaintext)
-2. YAML inline key (`behavior.openai.api_key` or `behavior.api_key` when configured)
-3. env var pointed by `behavior.api_key_env` (default `OPENAI_API_KEY`)
+OpenAI key precedence in current runner:
+1. node-local `secrets.json`
+2. `CONFIG_SET.payload.config.secrets.openai.api_key` which is persisted to `secrets.json`
+3. temporary legacy aliases:
+   - `CONFIG_SET.payload.config.behavior.openai.api_key`
+   - `CONFIG_SET.payload.config.behavior.api_key`
+4. env var pointed by `behavior.api_key_env` (default `OPENAI_API_KEY`) as compatibility fallback
+
+Operational note:
+- the target steady state is `api_key_source = local_file`
+- `hive.yaml` is no longer the intended place for AI keys
 
 ### 2.2.1 NODE_STATUS_GET default handler (MVP)
 

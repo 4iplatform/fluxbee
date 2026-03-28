@@ -111,17 +111,32 @@ Meta:
 - tomar el caso real más urgente: OpenAI key en nodo AI
 
 Checklist:
-- [ ] S4-T1. Definir el campo canónico del contrato AI para la OpenAI key.
-- [ ] S4-T2. Hacer que `CONFIG_GET` del nodo AI declare esa key en `contract.secrets`.
-- [ ] S4-T3. Persistir la key localmente en `secrets.json` usando helpers del SDK.
-- [ ] S4-T4. Asegurar que el nodo AI lea primero del secret local antes de fallback legacy.
-- [ ] S4-T5. Mantener compatibilidad temporal con env/legacy mientras migra.
-- [ ] S4-T6. Evitar que la key aparezca en logs, `CONFIG_RESPONSE`, status o debug output.
-- [ ] S4-T7. Agregar pruebas del caso:
+- [x] S4-T1. Definir el campo canónico del contrato AI para la OpenAI key.
+- [x] S4-T2. Hacer que `CONFIG_GET` del nodo AI declare esa key en `contract.secrets`.
+- [x] S4-T3. Persistir la key localmente en `secrets.json` usando helpers del SDK.
+- [x] S4-T4. Asegurar que el nodo AI lea primero del secret local antes de fallback legacy.
+- [x] S4-T5. Mantener compatibilidad temporal con env/legacy mientras migra.
+- [x] S4-T6. Evitar que la key aparezca en logs, `CONFIG_RESPONSE`, status o debug output.
+- [x] S4-T7. Agregar pruebas del caso:
   - set secret
   - restart node
   - secret reload/readback redacted
   - no key en logs
+
+Implementado en:
+- `nodes/ai/ai-generic/src/bin/ai_node_runner.rs`
+
+Notas:
+- campo canónico publicado por `CONFIG_GET`: `config.secrets.openai.api_key`
+- aliases legacy todavía aceptados durante migración:
+  - `config.behavior.openai.api_key`
+  - `config.behavior.api_key`
+- `CONFIG_GET` ahora expone `api_key_source` y `contract.secrets[*]`
+- el runner persiste la key en `secrets.json`, la retira del `effective_config` y migra config legacy inline al secret local durante bootstrap cuando puede
+- tests agregados en el runner AI:
+  - roundtrip local de `secrets.json`
+  - migración bootstrap de secret inline hacia secret local
+  - validación de que el config serializado/readback ya no conserva la key inline
 
 ## 6. Fase S5 - migración operativa
 
@@ -129,15 +144,25 @@ Meta:
 - dejar de depender de `hive.yaml` para secrets de nodos
 
 Checklist:
-- [ ] S5-T1. Inventariar qué nodos hoy leen keys/secrets desde `hive.yaml`.
-- [ ] S5-T2. Priorizar migración inicial: `AI.common`.
-- [ ] S5-T3. Definir estrategia de transición para instalaciones existentes.
-- [ ] S5-T4. Documentar procedimiento operativo:
+- [x] S5-T1. Inventariar qué nodos hoy leen keys/secrets desde `hive.yaml`.
+- [x] S5-T2. Priorizar migración inicial: `AI.common`.
+- [x] S5-T3. Definir estrategia de transición para instalaciones existentes.
+- [x] S5-T4. Documentar procedimiento operativo:
   - instalar nodo
   - correr `CONFIG_GET`
   - detectar faltantes
   - enviar `CONFIG_SET`
-- [ ] S5-T5. Quitar examples/docs que sigan sugiriendo secrets en `hive.yaml`.
+- [x] S5-T5. Quitar examples/docs que sigan sugiriendo secrets en `hive.yaml`.
+
+Documentado en:
+- `docs/onworking COA/node_secret_migration_inventory.md`
+- `docs/onworking COA/node_secret_migration_runbook.md`
+
+Limpieza documental aplicada en:
+- `docs/AI_nodes_spec.md`
+- `docs/ai-nodes-examples-annex.md`
+- `docs/onworking NOE/node_runtime_install_ops.md`
+- `docs/examples/ai_common_chat.config.json`
 
 ## 7. Fase S6 - hardening opcional v1.1
 

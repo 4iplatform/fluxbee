@@ -61,7 +61,8 @@ Nota de transición:
 
   "secrets": {
     "openai": {
-      "api_key": "***INLINE_MVP_OR_REF***"
+      "api_key": "***SET_VIA_CONFIG_SET_AND_PERSIST_LOCALLY***",
+      "api_key_env": "OPENAI_API_KEY"
     }
   }
 }
@@ -69,7 +70,7 @@ Nota de transición:
 
 ### Comentarios
 - Este archivo representa la **config efectiva** aplicada.
-- Si el nodo recibe `CONFIG_SET` válido con `apply_mode="replace"`, persiste un JSON equivalente (sin secretos en claro si así se decide).
+- Si el nodo recibe `CONFIG_SET` válido con `apply_mode="replace"`, persiste un JSON equivalente, pero la key real debe vivir en `secrets.json`, no inline en el snapshot operativo.
 - Si el archivo no existe, el nodo arranca `UNCONFIGURED` y espera `CONFIG_SET`.
 json
 {
@@ -100,8 +101,11 @@ json
           "trim": true
         },
 
-        "openai": {
-          "api_key": "sk-REDACTED-INLINE-MVP"
+        "secrets": {
+          "openai": {
+            "api_key": "sk-REDACTED-INLINE-MVP",
+            "api_key_env": "OPENAI_API_KEY"
+          }
         },
 
         "model_settings": {
@@ -122,10 +126,11 @@ json
 ```
 
 ### Notas del ejemplo (MVP)
-- El secreto `openai.api_key` puede venir **inline** por CONFIG_SET o desde YAML.
-- **Precedencia** (si ambos existen): CONFIG_SET (memoria) sobrescribe el valor de YAML mientras el proceso esté vivo.
+- El campo canónico actual es `config.secrets.openai.api_key`.
+- El secreto entra por `CONFIG_SET` y luego se persiste en `secrets.json` local del nodo.
+- Si existen aliases legacy (`behavior.openai.api_key`, `behavior.api_key`), se aceptan solo durante migración.
 - El nodo **NO** debe persistir el secreto en claro en `${STATE_DIR}`.
-- En reinicio, si no hay otra fuente de secreto, el nodo puede quedar `FAILED_CONFIG (missing_secret)` hasta recibir CONFIG_SET nuevamente.
+- En reinicio, el nodo debe rehidratar desde `secrets.json`; si no existe secreto local, puede quedar `FAILED_CONFIG (missing_secret)` hasta recibir `CONFIG_SET` nuevamente.
 
 
 
@@ -166,10 +171,11 @@ json
           "temperature": 0.2,
           "top_p": 1.0,
           "max_output_tokens": 256
-        },
-
+        }
+      },
+      "secrets": {
         "openai": {
-          "api_key": "***REDACTED***"
+          "api_key_env": "OPENAI_API_KEY"
         }
       },
       "runtime": {
@@ -257,7 +263,7 @@ Caso típico: falta `behavior.model` o el `schema_version` no es soportado.
 Escenario:
 - El nodo tiene config persistida (sin secreto) y quedó `FAILED_CONFIG (missing_secret)` tras reinicio.
 - Orchestrator hace `CONFIG_GET` y ve `config_version=7`.
-- Reenvía `CONFIG_SET` con **la misma** `config_version=7` pero con `openai.api_key` inline.
+- Reenvía `CONFIG_SET` con **la misma** `config_version=7` pero con `config.secrets.openai.api_key`.
 
 **Respuesta esperada:**
 

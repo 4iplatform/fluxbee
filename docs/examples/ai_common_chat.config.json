@@ -35,10 +35,5 @@
       "trim": true
     },
     "api_key_env": "OPENAI_API_KEY"
-  },
-   "secrets": {
-    "openai": {
-      "api_key": "sk-proj-key"
-    }
   }
 }
