@@ -72,11 +72,12 @@ Checklist:
 - [ ] S2-T6. Definir wording estándar para respuestas de `archi` cuando un nodo reporta `configured=false` en un secret requerido.
 
 Avance actual en `archi`:
-- [x] lectura preferente de OpenAI key desde `secrets.json` local con fallback legacy a `config.json` / `hive.yaml`
+- [x] lectura de OpenAI key únicamente desde `secrets.json` local
 - [x] `SCMD` local `GET /architect/control/config-get`
 - [x] `SCMD` local `POST /architect/control/config-set`
 - [x] recarga en memoria del runtime AI después de persistir la key
 - [x] redaction del comando `SCMD` antes de persistirlo en el historial del chat
+- [x] retiro del fallback legacy para la OpenAI key: `archi` ya no toma credenciales desde `config.json` ni `hive.yaml`
 
 ## 4. Fase S3 - contrato de nodos
 

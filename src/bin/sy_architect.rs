@@ -850,21 +850,21 @@ fn merged_openai_section(
 
     match (config_openai, hive_openai) {
         (Some(cfg), Some(hive_cfg)) => Some(OpenAiSection {
-            api_key: secret_api_key.or(cfg.api_key).or(hive_cfg.api_key),
+            api_key: secret_api_key,
             default_model: cfg.default_model.or(hive_cfg.default_model),
             max_tokens: cfg.max_tokens.or(hive_cfg.max_tokens),
             temperature: cfg.temperature.or(hive_cfg.temperature),
             top_p: cfg.top_p.or(hive_cfg.top_p),
         }),
         (Some(cfg), None) => Some(OpenAiSection {
-            api_key: secret_api_key.or(cfg.api_key),
+            api_key: secret_api_key,
             default_model: cfg.default_model,
             max_tokens: cfg.max_tokens,
             temperature: cfg.temperature,
             top_p: cfg.top_p,
         }),
         (None, Some(hive_cfg)) => Some(OpenAiSection {
-            api_key: secret_api_key.or(hive_cfg.api_key),
+            api_key: secret_api_key,
             default_model: hive_cfg.default_model,
             max_tokens: hive_cfg.max_tokens,
             temperature: hive_cfg.temperature,
@@ -2266,26 +2266,6 @@ async fn handle_architect_local_config_get(
         .is_some()
     {
         "local_file"
-    } else if node_config
-        .as_ref()
-        .and_then(|cfg| cfg.ai_providers.as_ref())
-        .and_then(|providers| providers.openai.as_ref())
-        .and_then(|openai| openai.api_key.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some()
-    {
-        "config.json_legacy"
-    } else if hive
-        .ai_providers
-        .as_ref()
-        .and_then(|providers| providers.openai.as_ref())
-        .and_then(|openai| openai.api_key.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some()
-    {
-        "hive.yaml_legacy"
     } else {
         "missing"
     };
@@ -2324,7 +2304,7 @@ async fn handle_architect_local_config_get(
                 "optional_fields": [],
                 "secrets": [descriptor],
                 "notes": [
-                    "This local control path bootstraps archi's own OpenAI key without using hive.yaml.",
+                    "This local control path bootstraps archi's own OpenAI key only from local secrets.json.",
                     "Secret values are persisted in local secrets.json and always returned redacted."
                 ]
             },
