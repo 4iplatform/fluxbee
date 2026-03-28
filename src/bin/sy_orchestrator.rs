@@ -97,6 +97,7 @@ const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "sy-admin",
     "sy-architect",
     "sy-storage",
+    "ai-frontdesk-gov",
     "sy-orchestrator",
 ];
 const WORKER_MIN_CORE_COMPONENTS: [&str; 5] = [
@@ -391,7 +392,7 @@ struct PersistedManagedNode {
     relaunch_on_boot: bool,
 }
 
-const MOTHERBEE_CRITICAL_SERVICES: [&str; 7] = [
+const MOTHERBEE_CRITICAL_SERVICES: [&str; 8] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
@@ -399,6 +400,7 @@ const MOTHERBEE_CRITICAL_SERVICES: [&str; 7] = [
     "sy-admin",
     "sy-architect",
     "sy-storage",
+    "ai-frontdesk-gov",
 ];
 const WORKER_CRITICAL_SERVICES: [&str; 4] = [
     "rt-gateway",
@@ -620,6 +622,7 @@ async fn bootstrap_local(
             "sy-admin",
             "sy-architect",
             "sy-storage",
+            "ai-frontdesk-gov",
         ]
     } else {
         vec!["sy-config-routes", "sy-opa-rules"]
@@ -1090,6 +1093,7 @@ async fn shutdown_sequence(state: &OrchestratorState) {
     time::sleep(Duration::from_secs(10)).await;
 
     for service in [
+        "ai-frontdesk-gov",
         "sy-storage",
         "sy-architect",
         "sy-admin",
@@ -6337,7 +6341,7 @@ fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
 }
 
 fn remove_hive_cleanup_script() -> &'static str {
-    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-orchestrator sy-admin sy-architect sy-storage fluxbee-syncthing; do \
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-orchestrator sy-admin sy-architect sy-storage ai-frontdesk-gov fluxbee-syncthing; do \
 systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
 systemctl disable \"$s\" >/dev/null 2>&1 || true; \
 systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \

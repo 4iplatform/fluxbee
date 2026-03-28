@@ -13,6 +13,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
 fi
 
 services=(
+  "ai-frontdesk-gov"
   "sy-identity"
   "sy-admin"
   "sy-architect"
@@ -73,6 +74,7 @@ done
 
 echo "Cleaning residual processes..."
 residual_procs=(
+  "ai-frontdesk-gov"
   "sy-orchestrator"
   "sy-admin"
   "sy-architect"
@@ -89,6 +91,7 @@ residual_procs=(
   "sy_config_routes"
   "sy_opa_rules"
   "sy_identity"
+  "ai_node_runner"
   "syncthing"
 )
 for proc in "${residual_procs[@]}"; do
