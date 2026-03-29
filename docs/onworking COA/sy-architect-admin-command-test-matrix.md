@@ -55,6 +55,7 @@ TEST_ADDR=192.168.8.220
 TEST_RUNTIME=AI.chat
 TEST_RUNTIME_VERSION=1.2.3
 TEST_NODE=SY.admin@motherbee
+TEST_MANAGED_NODE=AI.chat@motherbee
 TEST_ROUTE_PREFIX=AI.chat.
 TEST_VPN_PATTERN=worker-*
 TEST_ILK=demo-ilk
@@ -212,7 +213,7 @@ SCMD: curl -X GET /hives/motherbee/runtimes/AI.chat
 - check:
   - detalle de runtime
 
-[ ] `list_deployments`
+[x] `list_deployments`
 
 - curl:
 ```bash
@@ -225,7 +226,7 @@ SCMD: curl -X GET /deployments
 - check:
   - lista global de deployments
 
-[ ] `get_deployments`
+[x] `get_deployments`
 
 - curl:
 ```bash
@@ -238,7 +239,7 @@ SCMD: curl -X GET /hives/motherbee/deployments
 - check:
   - deployments por hive
 
-[ ] `list_drift_alerts`
+[x] `list_drift_alerts`
 
 - curl:
 ```bash
@@ -251,7 +252,7 @@ SCMD: curl -X GET /drift-alerts
 - check:
   - alertas globales
 
-[ ] `get_drift_alerts`
+[x] `get_drift_alerts`
 
 - curl:
 ```bash
@@ -266,7 +267,7 @@ SCMD: curl -X GET /hives/motherbee/drift-alerts
 
 ### 4.4 Nodes / identity / storage / network
 
-[ ] `list_nodes`
+[x] `list_nodes`
 
 - curl:
 ```bash
@@ -296,14 +297,15 @@ SCMD: curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/status
 
 - curl:
 ```bash
-curl -sS "$BASE/hives/$LOCAL_HIVE/nodes/$TEST_NODE/config"
+curl -sS "$BASE/hives/$LOCAL_HIVE/nodes/$TEST_MANAGED_NODE/config"
 ```
 - SCMD:
 ```text
-SCMD: curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/config
+SCMD: curl -X GET /hives/motherbee/nodes/AI.chat@motherbee/config
 ```
 - check:
-  - config persistida
+  - config persistida de un nodo gestionado
+  - no usar `SY.*` como ejemplo acá: puede no tener `config.json` node-managed
 
 [ ] `get_node_state`
 
@@ -618,16 +620,16 @@ SCMD: curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee/instance
 
 - curl:
 ```bash
-curl -sS -X PUT "$BASE/hives/$LOCAL_HIVE/nodes/$TEST_NODE/config" \
+curl -sS -X PUT "$BASE/hives/$LOCAL_HIVE/nodes/$TEST_MANAGED_NODE/config" \
   -H 'Content-Type: application/json' \
   -d '{"config":{"openai":{"default_model":"gpt-4.1-mini"}}}'
 ```
 - SCMD:
 ```text
-SCMD: curl -X PUT /hives/motherbee/nodes/SY.admin@motherbee/config -d '{"openai":{"default_model":"gpt-4.1-mini"}}'
+SCMD: curl -X PUT /hives/motherbee/nodes/AI.chat@motherbee/config -d '{"config":{"openai":{"default_model":"gpt-4.1-mini"}}}'
 ```
 - check:
-  - luego `GET /hives/motherbee/nodes/SY.admin@motherbee/config`
+  - luego `GET /hives/motherbee/nodes/AI.chat@motherbee/config`
 
 [ ] `send_node_message`
 

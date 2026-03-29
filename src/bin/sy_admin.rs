@@ -3205,7 +3205,9 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "get_node_status" => "Read the effective runtime status of one node.",
         "get_node_state" => "Read the persisted state payload of one node.",
-        "get_node_config" => "Read the stored node config payload.",
+        "get_node_config" => {
+            "Read the stored node config payload for a managed node with persisted config.json."
+        }
         "node_control_config_get" => {
             "Send CONFIG_GET to a non-SY node and return its live CONFIG_RESPONSE."
         }
@@ -3826,7 +3828,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "list_nodes" => "curl -X GET /hives/motherbee/nodes",
         "get_node_status" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/status",
         "get_node_state" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/state",
-        "get_node_config" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/config",
+        "get_node_config" => "curl -X GET /hives/motherbee/nodes/AI.chat@motherbee/config",
         "run_node" => {
             r#"curl -X POST /hives/motherbee/nodes -d '{"node_name":"AI.chat@motherbee","runtime_version":"current"}'"#
         }
