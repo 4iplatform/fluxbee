@@ -2692,25 +2692,10 @@ fn architect_admin_action_timeout(action: &str) -> Duration {
         "sync_hint" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
         }
-        "list_versions" | "get_versions" => {
-            Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30))
+        "list_admin_actions" | "get_admin_action_help" | "hive_status" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5))
         }
-        "run_node"
-        | "kill_node"
-        | "remove_node_instance"
-        | "remove_runtime_version"
-        | "set_node_config"
-        | "node_control_config_get"
-        | "node_control_config_set"
-        | "set_storage"
-        | "remove_hive"
-        | "opa_compile_apply"
-        | "opa_compile"
-        | "opa_apply"
-        | "opa_rollback" => {
-            Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30))
-        }
-        _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5)),
+        _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30)),
     }
 }
 
