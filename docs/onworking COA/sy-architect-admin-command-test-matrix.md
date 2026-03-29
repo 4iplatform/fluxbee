@@ -55,9 +55,10 @@ TEST_ADDR=192.168.8.220
 TEST_RUNTIME=AI.chat
 TEST_RUNTIME_VERSION=1.2.3
 TEST_NODE=SY.admin@motherbee
+TEST_MANAGED_NODE=AI.frontdesk.gov@motherbee
 TEST_ROUTE_PREFIX=AI.chat.
 TEST_VPN_PATTERN=worker-*
-TEST_ILK=demo-ilk
+TEST_ILK=ilk:550e8400-e29b-41d4-a716-446655440000
 TEST_OPA_VERSION=12
 ```
 
@@ -236,7 +237,7 @@ curl -sS "$BASE/hives/$LOCAL_HIVE/deployments"
 SCMD: curl -X GET /hives/motherbee/deployments
 ```
 - check:
-  - deployments por hive
+  - historial de deployments por hive
 
 [x] `list_drift_alerts`
 
@@ -262,7 +263,7 @@ curl -sS "$BASE/hives/$LOCAL_HIVE/drift-alerts"
 SCMD: curl -X GET /hives/motherbee/drift-alerts
 ```
 - check:
-  - alertas por hive
+  - historial de drift alerts por hive
 
 ### 4.4 Nodes / identity / storage / network
 
@@ -296,16 +297,17 @@ SCMD: curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/status
 
 - curl:
 ```bash
-curl -sS "$BASE/hives/$LOCAL_HIVE/nodes/$TEST_NODE/config"
+curl -sS "$BASE/hives/$LOCAL_HIVE/nodes/$TEST_MANAGED_NODE/config"
 ```
 - SCMD:
 ```text
-SCMD: curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/config
+SCMD: curl -X GET /hives/motherbee/nodes/AI.frontdesk.gov@motherbee/config
 ```
 - check:
-  - config persistida
+  - config persistida de un nodo gestionado
+  - no usar `SY.*` como ejemplo acá: puede no tener `config.json` node-managed
 
-[ ] `get_node_state`
+[x] `get_node_state`
 
 - curl:
 ```bash
@@ -318,7 +320,7 @@ SCMD: curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/state
 - check:
   - state diagnóstica o `null`
 
-[ ] `list_ilks`
+[x] `list_ilks`
 
 - curl:
 ```bash
@@ -331,7 +333,7 @@ SCMD: curl -X GET /hives/motherbee/identity/ilks
 - check:
   - ilks disponibles
 
-[ ] `get_ilk`
+[x] `get_ilk`
 
 - curl:
 ```bash
@@ -339,12 +341,13 @@ curl -sS "$BASE/hives/$LOCAL_HIVE/identity/ilks/$TEST_ILK"
 ```
 - SCMD:
 ```text
-SCMD: curl -X GET /hives/motherbee/identity/ilks/demo-ilk
+SCMD: curl -X GET /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000
 ```
 - check:
   - detalle de ILK
+  - filtra por `ilk_id` exacto en formato `ilk:<uuid>`
 
-[ ] `list_routes`
+[x] `list_routes`
 
 - curl:
 ```bash
@@ -357,7 +360,7 @@ SCMD: curl -X GET /hives/motherbee/routes
 - check:
   - rutas configuradas
 
-[ ] `list_vpns`
+[x] `list_vpns`
 
 - curl:
 ```bash
@@ -370,7 +373,7 @@ SCMD: curl -X GET /hives/motherbee/vpns
 - check:
   - patrones VPN configurados
 
-[ ] `get_storage`
+[x] `get_storage`
 
 - curl:
 ```bash
@@ -385,7 +388,7 @@ SCMD: curl -X GET /config/storage
 
 ### 4.5 OPA read / validate
 
-[ ] `opa_get_policy`
+[x] `opa_get_policy`
 
 - curl:
 ```bash
@@ -398,7 +401,7 @@ SCMD: curl -X GET /hives/motherbee/opa/policy
 - check:
   - policy actual
 
-[ ] `opa_get_status`
+[x] `opa_get_status`
 
 - curl:
 ```bash
@@ -417,11 +420,11 @@ SCMD: curl -X GET /hives/motherbee/opa/status
 ```bash
 curl -sS -X POST "$BASE/hives/$LOCAL_HIVE/opa/policy/check" \
   -H 'Content-Type: application/json' \
-  -d '{"rego":"package router\n\ndefault allow = true\n","entrypoint":"router/target"}'
+  -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'
 ```
 - SCMD:
 ```text
-SCMD: curl -X POST /hives/motherbee/opa/policy/check -d '{"rego":"package router\n\ndefault allow = true\n","entrypoint":"router/target"}'
+SCMD: curl -X POST /hives/motherbee/opa/policy/check -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'
 ```
 - check:
   - valida rego sin aplicar
@@ -618,16 +621,16 @@ SCMD: curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee/instance
 
 - curl:
 ```bash
-curl -sS -X PUT "$BASE/hives/$LOCAL_HIVE/nodes/$TEST_NODE/config" \
+curl -sS -X PUT "$BASE/hives/$LOCAL_HIVE/nodes/$TEST_MANAGED_NODE/config" \
   -H 'Content-Type: application/json' \
-  -d '{"config":{"openai":{"default_model":"gpt-4.1-mini"}}}'
+  -d '{"openai":{"default_model":"gpt-4.1-mini"}}'
 ```
 - SCMD:
 ```text
-SCMD: curl -X PUT /hives/motherbee/nodes/SY.admin@motherbee/config -d '{"openai":{"default_model":"gpt-4.1-mini"}}'
+SCMD: curl -X PUT /hives/motherbee/nodes/AI.frontdesk.gov@motherbee/config -d '{"openai":{"default_model":"gpt-4.1-mini"}}'
 ```
 - check:
-  - luego `GET /hives/motherbee/nodes/SY.admin@motherbee/config`
+  - luego `GET /hives/motherbee/nodes/AI.frontdesk.gov@motherbee/config`
 
 [ ] `send_node_message`
 
@@ -667,11 +670,11 @@ SCMD: curl -X PUT /config/storage -d '{"path":"/var/lib/fluxbee"}'
 ```bash
 curl -sS -X POST "$BASE/hives/$LOCAL_HIVE/opa/policy" \
   -H 'Content-Type: application/json' \
-  -d '{"rego":"package router\n\ndefault allow = true\n","entrypoint":"router/target"}'
+  -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'
 ```
 - SCMD:
 ```text
-SCMD: curl -X POST /hives/motherbee/opa/policy -d '{"rego":"package router\n\ndefault allow = true\n","entrypoint":"router/target"}'
+SCMD: curl -X POST /hives/motherbee/opa/policy -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'
 ```
 - check:
   - luego `GET /hives/motherbee/opa/status`
@@ -682,11 +685,11 @@ SCMD: curl -X POST /hives/motherbee/opa/policy -d '{"rego":"package router\n\nde
 ```bash
 curl -sS -X POST "$BASE/hives/$LOCAL_HIVE/opa/policy/compile" \
   -H 'Content-Type: application/json' \
-  -d '{"rego":"package router\n\ndefault allow = true\n","entrypoint":"router/target"}'
+  -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'
 ```
 - SCMD:
 ```text
-SCMD: curl -X POST /hives/motherbee/opa/policy/compile -d '{"rego":"package router\n\ndefault allow = true\n","entrypoint":"router/target"}'
+SCMD: curl -X POST /hives/motherbee/opa/policy/compile -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'
 ```
 - check:
   - compile ok sin aplicar

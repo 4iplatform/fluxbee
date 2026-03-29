@@ -3405,7 +3405,11 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         ],
         "get_ilk" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
-            admin_action_path_param("ilk_id", "string", "ILK identifier."),
+            admin_action_path_param(
+                "ilk_id",
+                "string",
+                "ILK identifier in prefixed format, for example ilk:550e8400-e29b-41d4-a716-446655440000.",
+            ),
         ],
         "run_node" => vec![admin_action_path_param(
             "hive",
@@ -3796,7 +3800,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "timeout_ms": 30000
         }),
         "opa_compile_apply" | "opa_compile" | "opa_check" => serde_json::json!({
-            "rego": "package router\n\ndefault allow = true\n",
+            "rego": "package router\n\ndefault target = null\n",
             "entrypoint": "router/target"
         }),
         "opa_apply" => serde_json::json!({
@@ -3844,7 +3848,9 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             r#"curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/control/config-set -d '{"schema_version":1,"config_version":7,"apply_mode":"replace","config":{"behavior":{"kind":"openai_chat","model":"gpt-4.1-mini"}}}'"#
         }
         "list_ilks" => "curl -X GET /hives/motherbee/identity/ilks",
-        "get_ilk" => "curl -X GET /hives/motherbee/identity/ilks/demo-ilk",
+        "get_ilk" => {
+            "curl -X GET /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000"
+        }
         "inventory" => "curl -X GET /inventory",
         "list_versions" => "curl -X GET /versions",
         "get_versions" => "curl -X GET /hives/motherbee/versions",
@@ -3878,17 +3884,17 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "opa_get_policy" => "curl -X GET /hives/motherbee/opa/policy",
         "opa_get_status" => "curl -X GET /hives/motherbee/opa/status",
         "opa_compile_apply" => {
-            r#"curl -X POST /hives/motherbee/opa/policy -d '{"rego":"package router\n\ndefault allow = true\n","entrypoint":"router/target"}'"#
+            r#"curl -X POST /hives/motherbee/opa/policy -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
         }
         "opa_compile" => {
-            r#"curl -X POST /hives/motherbee/opa/policy/compile -d '{"rego":"package router\n\ndefault allow = true\n","entrypoint":"router/target"}'"#
+            r#"curl -X POST /hives/motherbee/opa/policy/compile -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
         }
         "opa_apply" => r#"curl -X POST /hives/motherbee/opa/policy/apply -d '{"version":12}'"#,
         "opa_rollback" => {
             r#"curl -X POST /hives/motherbee/opa/policy/rollback -d '{"version":11}'"#
         }
         "opa_check" => {
-            r#"curl -X POST /hives/motherbee/opa/policy/check -d '{"rego":"package router\n\ndefault allow = true\n","entrypoint":"router/target"}'"#
+            r#"curl -X POST /hives/motherbee/opa/policy/check -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
         }
         _ => return None,
     };
@@ -3935,6 +3941,12 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "This is the canonical live control-plane mutation path for non-SY nodes.",
             "Admin forwards CONFIG_SET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
+        ],
+        "get_ilk" => vec![
+            "The hive target comes from the /hives/{hive} path in HTTP.",
+            "The ilk_id path segment must use the prefixed UUID format ilk:<uuid>.",
+            "Identity may resolve an old alias ILK to its canonical ILK if an alias mapping exists.",
+            "This lookup is by ILK identifier, not by channel address, node name, or tenant.",
         ],
         "delete_route" | "delete_vpn" => vec![
             "HTTP delete uses the final path segment as identifier.",
