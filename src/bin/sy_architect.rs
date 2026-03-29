@@ -2201,6 +2201,9 @@ async fn handle_scmd(
     session_id: &str,
     raw: &str,
 ) -> Result<Value, ArchitectError> {
+    if let Some(output) = handle_meta_scmd(raw) {
+        return Ok(output);
+    }
     let parsed = parse_scmd(raw)?;
     if let Some(output) = handle_local_architect_scmd(state, &parsed).await? {
         return Ok(output);
@@ -2219,6 +2222,51 @@ async fn handle_scmd(
     } else {
         execute_admin_translation(state, translated).await
     }
+}
+
+fn handle_meta_scmd(raw: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    if !trimmed.eq_ignore_ascii_case("help")
+        && !trimmed.eq_ignore_ascii_case("?")
+        && !trimmed.eq_ignore_ascii_case("scmd help")
+    {
+        return None;
+    }
+
+    Some(json!({
+        "status": "ok",
+        "action": "scmd_help",
+        "payload": {
+            "syntax": "SCMD: curl -X METHOD /relative/path [-d '{...}']",
+            "notes": [
+                "Usa siempre paths relativos a SY.admin, por ejemplo /hives/motherbee/nodes.",
+                "Para descubrir el catálogo dinámico completo, usá GET /admin/actions.",
+                "Para ayuda detallada de una acción, usá GET /admin/actions/{action}."
+            ],
+            "examples": [
+                "SCMD: curl -X GET /admin/actions",
+                "SCMD: curl -X GET /hive/status",
+                "SCMD: curl -X GET /hives",
+                "SCMD: curl -X GET /inventory/summary",
+                "SCMD: curl -X GET /hives/motherbee/versions",
+                "SCMD: curl -X GET /hives/motherbee/runtimes/AI.chat",
+                "SCMD: curl -X GET /hives/motherbee/nodes",
+                "SCMD: curl -X GET /hives/motherbee/nodes/AI.chat@motherbee/status",
+                "SCMD: curl -X GET /hives/motherbee/nodes/AI.frontdesk.gov@motherbee/config",
+                "SCMD: curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/control/config-get -d '{\"requested_by\":\"archi\"}'",
+                "SCMD: curl -X GET /hives/motherbee/identity/ilks",
+                "SCMD: curl -X GET /hives/motherbee/deployments",
+                "SCMD: curl -X GET /hives/motherbee/drift-alerts",
+                "SCMD: curl -X GET /config/storage"
+            ],
+            "mutation_examples": [
+                "SCMD: curl -X POST /hives -d '{\"hive_id\":\"worker-220\",\"address\":\"192.168.8.220\"}'",
+                "SCMD: curl -X POST /hives/motherbee/sync-hint -d '{\"channel\":\"blob\",\"wait_for_idle\":true,\"timeout_ms\":30000}'",
+                "SCMD: curl -X POST /hives/motherbee/nodes -d '{\"node_name\":\"AI.chat@motherbee\",\"runtime_version\":\"current\"}'",
+                "SCMD: curl -X PUT /hives/motherbee/nodes/AI.frontdesk.gov@motherbee/config -d '{\"openai\":{\"default_model\":\"gpt-4.1-mini\"}}'"
+            ]
+        }
+    }))
 }
 
 async fn handle_local_architect_scmd(
@@ -6756,7 +6804,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
     function seedWelcomeMessages() {{
       addMessage("system", "Fluxbee architect interface ready. System operations are available through SCMD.");
       addMessage("architect", "I am archi. Chat is live, and SCMD remains available for direct system operations.");
-      addMessage("system", "Example: SCMD: curl -X GET /hives/{hive}/nodes");
+      addMessage("system", "Examples: SCMD: help | SCMD: curl -X GET /hives/{hive}/nodes");
     }}
     function resetChatViewport(preserveComposer = false) {{
       hidePendingIndicator();

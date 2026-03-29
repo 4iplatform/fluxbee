@@ -414,7 +414,7 @@ SCMD: curl -X GET /hives/motherbee/opa/status
 - check:
   - status OPA
 
-[ ] `opa_check`
+[x] `opa_check`
 
 - curl:
 ```bash
