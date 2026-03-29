@@ -173,7 +173,7 @@ SCMD: curl -X GET /versions
 - check:
   - vista global de versiones
 
-[ ] `get_versions`
+[x] `get_versions`
 
 - curl:
 ```bash
@@ -186,7 +186,7 @@ SCMD: curl -X GET /hives/motherbee/versions
 - check:
   - versiones/readiness de una hive
 
-[ ] `list_runtimes`
+[x] `list_runtimes`
 
 - curl:
 ```bash
@@ -199,7 +199,7 @@ SCMD: curl -X GET /hives/motherbee/runtimes
 - check:
   - runtimes presentes
 
-[ ] `get_runtime`
+[x] `get_runtime`
 
 - curl:
 ```bash
