@@ -67,7 +67,9 @@ Rules:
 - Use the available read-only system tool when you need live Fluxbee state instead of guessing.
 - For all nodes across the whole system or across multiple hives, use `/inventory` or `/inventory/summary` first instead of guessing hive names or looping over stale hives from conversation memory.
 - Use `/hives/{hive}/nodes` only for one explicit hive.
+- Distinguish runtime names from node instance names: `AI.chat` is a runtime/package; `AI.chat@motherbee` is a node instance.
 - For software/core/runtime versions, use `/versions` or `/hives/{hive}/versions`. Do not infer versions from `/hives/{hive}/nodes`.
+- When the operator asks for runtime/package info such as `AI.chat`, use `/hives/{hive}/runtimes/{runtime}` or `/hives/{hive}/runtimes`, not `/hives/{hive}/nodes`.
 - When the operator asks for a node software version, map the node to the versions payload explicitly: SY.identity@hive -> core.components['sy-identity'].version; AI.chat@hive -> runtimes.runtimes['AI.chat'].current; IO.slack.T123@hive -> runtimes.runtimes['IO.slack'].current.
 - For live node-defined config contracts on non-SY nodes, use `POST /hives/{hive}/nodes/{node_name}/control/config-get`. For live node-defined config updates, use `POST /hives/{hive}/nodes/{node_name}/control/config-set`.
 - For local architect OpenAI bootstrap, use `GET /architect/control/config-get` and `POST /architect/control/config-set`.
@@ -385,7 +387,11 @@ impl FunctionTool for ArchitectSystemGetTool {
         FunctionToolDefinition {
             name: "fluxbee_system_get".to_string(),
             description: format!(
-                "Read live Fluxbee system state through SY.admin over socket for hive {}. Read-only. Supports GET paths and safe POST checks such as OPA policy validation or non-SY node CONFIG_GET control-plane discovery. Use /admin/actions or /admin/actions/{{action}} when you need dynamic help; those responses include standardized request_contract metadata, body fields, notes, and example_scmd values. Use /inventory or /inventory/summary for system-wide node visibility, and use /versions or /hives/{}/versions for core and runtime versions. Example paths: /inventory, /inventory/summary, /inventory/{}, /versions, /hives/{}/versions, /hives/{}/nodes, /hives/{}/nodes/SY.admin@{}/status, /hives/{}/nodes/AI.chat@{}/control/config-get, /hives/{}/identity/ilks, /admin/actions, /admin/actions/get_node_status, /admin/actions/get_versions, /config/storage",
+                "Read live Fluxbee system state through SY.admin over socket for hive {}. Read-only. Supports GET paths and safe POST checks such as OPA policy validation or non-SY node CONFIG_GET control-plane discovery. Use /admin/actions or /admin/actions/{{action}} when you need dynamic help; those responses include standardized request_contract metadata, body fields, notes, and example_scmd values. Distinguish runtime names from node instances: `AI.chat` is a runtime, while `AI.chat@{}` is a node instance. Use /inventory or /inventory/summary for system-wide node visibility, use /versions or /hives/{}/versions for core and runtime versions, and use /hives/{}/runtimes or /hives/{}/runtimes/AI.chat for runtime/package info. Example paths: /inventory, /inventory/summary, /inventory/{}, /versions, /hives/{}/versions, /hives/{}/runtimes, /hives/{}/runtimes/AI.chat, /hives/{}/nodes, /hives/{}/nodes/SY.admin@{}/status, /hives/{}/nodes/AI.chat@{}/control/config-get, /hives/{}/identity/ilks, /admin/actions, /admin/actions/get_node_status, /admin/actions/get_versions, /config/storage",
+                self.context.hive_id,
+                self.context.hive_id,
+                self.context.hive_id,
+                self.context.hive_id,
                 self.context.hive_id,
                 self.context.hive_id,
                 self.context.hive_id,
