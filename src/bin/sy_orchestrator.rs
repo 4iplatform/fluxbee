@@ -1253,7 +1253,7 @@ async fn handle_admin(
         "get_runtime" => get_runtime_flow(state, &msg.payload).await,
         "remove_runtime_version" => remove_runtime_version_flow(state, &msg.payload).await,
         "remove_node_instance" => remove_node_instance_flow(state, &msg.payload).await,
-        "list_deployments" => list_deployments_flow(&msg.payload),
+        "list_deployments" => list_deployments_flow(state, &msg.payload),
         "get_deployments" => get_deployments_flow(state, &msg.payload),
         "list_drift_alerts" => list_drift_alerts_flow(&msg.payload),
         "get_drift_alerts" => get_drift_alerts_flow(state, &msg.payload),
@@ -5896,6 +5896,183 @@ fn read_deployment_history(
     Ok(entries)
 }
 
+fn hive_present_for_deployments(state: &OrchestratorState, hive_id: &str) -> bool {
+    let hive_id = hive_id.trim();
+    !hive_id.is_empty()
+        && (hive_id == state.hive_id || hives_root().join(hive_id).join("info.yaml").exists())
+}
+
+fn file_mtime_epoch_ms(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+}
+
+fn local_deployment_history_snapshot_entries(
+    state: &OrchestratorState,
+) -> Vec<DeploymentHistoryEntry> {
+    let mut entries = Vec::new();
+    let local_hive = state.hive_id.clone();
+
+    if let Some(core_path) = local_core_manifest_path() {
+        if let Ok(hash) = local_core_manifest_hash() {
+            let started_at = file_mtime_epoch_ms(&core_path).unwrap_or_else(now_epoch_ms);
+            entries.push(DeploymentHistoryEntry {
+                deployment_id: format!("local-core-{}", local_hive),
+                category: "core".to_string(),
+                trigger: "local_current_state".to_string(),
+                actor: default_deployment_actor(state),
+                started_at,
+                finished_at: started_at,
+                manifest_version: None,
+                manifest_hash: hash,
+                target_hives: vec![local_hive.clone()],
+                result: "ok".to_string(),
+                workers: vec![DeploymentWorkerOutcome {
+                    hive_id: local_hive.clone(),
+                    status: "ok".to_string(),
+                    reason: None,
+                    duration_ms: 0,
+                    local_hash: local_core_manifest_hash().ok().flatten(),
+                    remote_hash_before: None,
+                    remote_hash_after: None,
+                }],
+            });
+        }
+    }
+
+    if let Some(runtime_path) = local_runtime_manifest_paths()
+        .into_iter()
+        .find(|path| path.exists())
+    {
+        if let Ok(hash) = local_runtime_manifest_hash() {
+            let started_at = file_mtime_epoch_ms(&runtime_path).unwrap_or_else(now_epoch_ms);
+            entries.push(DeploymentHistoryEntry {
+                deployment_id: format!("local-runtime-{}", local_hive),
+                category: "runtime".to_string(),
+                trigger: "local_current_state".to_string(),
+                actor: default_deployment_actor(state),
+                started_at,
+                finished_at: started_at,
+                manifest_version: None,
+                manifest_hash: hash,
+                target_hives: vec![local_hive.clone()],
+                result: "ok".to_string(),
+                workers: vec![DeploymentWorkerOutcome {
+                    hive_id: local_hive.clone(),
+                    status: "ok".to_string(),
+                    reason: None,
+                    duration_ms: 0,
+                    local_hash: local_runtime_manifest_hash().ok().flatten(),
+                    remote_hash_before: None,
+                    remote_hash_after: None,
+                }],
+            });
+        }
+    }
+
+    if let Some(vendor_path) =
+        local_vendor_manifest_path().or_else(|| resolve_syncthing_vendor_source_path().ok())
+    {
+        if let Ok(hash) = local_syncthing_vendor_hash() {
+            let started_at = file_mtime_epoch_ms(&vendor_path).unwrap_or_else(now_epoch_ms);
+            entries.push(DeploymentHistoryEntry {
+                deployment_id: format!("local-vendor-{}", local_hive),
+                category: "vendor".to_string(),
+                trigger: "local_current_state".to_string(),
+                actor: default_deployment_actor(state),
+                started_at,
+                finished_at: started_at,
+                manifest_version: None,
+                manifest_hash: hash,
+                target_hives: vec![local_hive.clone()],
+                result: "ok".to_string(),
+                workers: vec![DeploymentWorkerOutcome {
+                    hive_id: local_hive.clone(),
+                    status: "ok".to_string(),
+                    reason: None,
+                    duration_ms: 0,
+                    local_hash: local_syncthing_vendor_hash().ok().flatten(),
+                    remote_hash_before: None,
+                    remote_hash_after: None,
+                }],
+            });
+        }
+    }
+
+    entries
+}
+
+fn enrich_deployment_history_entries(
+    state: &OrchestratorState,
+    mut entries: Vec<DeploymentHistoryEntry>,
+    hive_filter: Option<&str>,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let local_hive = state.hive_id.as_str();
+    let should_include_local_snapshot = match hive_filter {
+        Some(hive) => hive == local_hive,
+        None => true,
+    };
+
+    if should_include_local_snapshot {
+        let local_already_present = entries
+            .iter()
+            .any(|entry| entry.target_hives.iter().any(|hive| hive == local_hive));
+        if !local_already_present {
+            entries.extend(local_deployment_history_snapshot_entries(state));
+            entries.sort_by_key(|entry| std::cmp::Reverse(entry.finished_at));
+        }
+    }
+
+    if entries.len() > limit {
+        entries.truncate(limit);
+    }
+
+    entries
+        .into_iter()
+        .map(|entry| {
+            let target_hives_detail = entry
+                .target_hives
+                .iter()
+                .map(|hive_id| {
+                    serde_json::json!({
+                        "hive_id": hive_id,
+                        "present": hive_present_for_deployments(state, hive_id),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let workers = entry
+                .workers
+                .iter()
+                .map(|worker| {
+                    let mut value =
+                        serde_json::to_value(worker).unwrap_or_else(|_| serde_json::json!({}));
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert(
+                            "hive_present".to_string(),
+                            serde_json::json!(hive_present_for_deployments(state, &worker.hive_id)),
+                        );
+                    }
+                    value
+                })
+                .collect::<Vec<_>>();
+            let mut value = serde_json::to_value(entry).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("history_view".to_string(), serde_json::json!(true));
+                obj.insert(
+                    "target_hives_detail".to_string(),
+                    serde_json::Value::Array(target_hives_detail),
+                );
+                obj.insert("workers".to_string(), serde_json::Value::Array(workers));
+            }
+            value
+        })
+        .collect()
+}
+
 fn append_deployment_history(entry: &DeploymentHistoryEntry) -> Result<(), OrchestratorError> {
     let path = deployment_history_path();
     if let Some(parent) = path.parent() {
@@ -5955,7 +6132,10 @@ fn append_single_deployment_history(
     }
 }
 
-fn list_deployments_flow(payload: &serde_json::Value) -> serde_json::Value {
+fn list_deployments_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
     let limit = deployment_limit_from_payload(payload);
     let category = payload
         .get("category")
@@ -5965,7 +6145,8 @@ fn list_deployments_flow(payload: &serde_json::Value) -> serde_json::Value {
     match read_deployment_history(limit, None, category) {
         Ok(entries) => serde_json::json!({
             "status": "ok",
-            "entries": entries,
+            "view": "history",
+            "entries": enrich_deployment_history_entries(state, entries, None, limit),
         }),
         Err(err) => serde_json::json!({
             "status": "error",
@@ -5989,8 +6170,9 @@ fn get_deployments_flow(
     match read_deployment_history(limit, Some(&target_hive), category) {
         Ok(entries) => serde_json::json!({
             "status": "ok",
+            "view": "history",
             "hive_id": target_hive,
-            "entries": entries,
+            "entries": enrich_deployment_history_entries(state, entries, Some(&target_hive), limit),
         }),
         Err(err) => serde_json::json!({
             "status": "error",
