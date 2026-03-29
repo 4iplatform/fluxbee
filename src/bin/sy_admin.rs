@@ -1115,7 +1115,15 @@ async fn dispatch_internal_admin_command(
                     "missing target (payload.target required for this action)",
                 ));
             }
-            handle_admin_query(ctx, client, canonical, hive).await?
+            let has_payload = params
+                .as_object()
+                .map(|value| !value.is_empty())
+                .unwrap_or(false);
+            if has_payload {
+                handle_admin_query_with_payload(ctx, client, canonical, params, hive).await?
+            } else {
+                handle_admin_query(ctx, client, canonical, hive).await?
+            }
         }
         InternalActionRoute::Command(canonical) => {
             let hive = resolve_internal_action_hive(canonical, target, &params);
