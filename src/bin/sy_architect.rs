@@ -1295,7 +1295,12 @@ async fn handle_chat_message(
             Err(err) => ChatResponse {
                 status: "error".to_string(),
                 mode: "scmd".to_string(),
-                output: json!({ "error": err.to_string() }),
+                output: json!({
+                    "action": "scmd_error",
+                    "error_code": "SCMD_EXECUTION_FAILED",
+                    "error_detail": err.to_string(),
+                    "payload": serde_json::Value::Null,
+                }),
                 session_id: Some(resolved_session_id.clone()),
                 session_title: Some(session.title.clone()),
             },
@@ -6716,8 +6721,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
         if (data.output && data.output.payload !== undefined) {{
           shell.appendChild(createResultSection("payload", data.output.payload));
         }}
-        if (data.output && data.output.error_detail) {{
-          shell.appendChild(createResultSection("error", data.output.error_detail));
+        const commandError = data.output && (data.output.error_detail || data.output.error);
+        if (commandError) {{
+          shell.appendChild(createResultSection("error", commandError));
         }}
       }} else {{
         shell.appendChild(createResultSection("result", data.output));
