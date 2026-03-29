@@ -4872,22 +4872,10 @@ fn admin_action_timeout(action: &str) -> Duration {
         "sync_hint" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
         }
-        // other orchestrator mutating actions can also take longer than default.
-        "run_node"
-        | "kill_node"
-        | "remove_node_instance"
-        | "remove_hive"
-        | "set_node_config"
-        | "node_control_config_get"
-        | "node_control_config_set"
-        | "get_node_config"
-        | "get_node_state"
-        | "get_node_status"
-        | "get_runtime"
-        | "remove_runtime_version" => {
-            Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30))
+        "list_admin_actions" | "get_admin_action_help" | "hive_status" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5))
         }
-        _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5)),
+        _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30)),
     }
 }
 
