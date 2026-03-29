@@ -224,7 +224,7 @@ Lista de tareas FR-07:
 - [x] FR7-T11. Actualizar docs (`02-protocolo.md`, `07-operaciones.md`) y runbooks de troubleshooting.
 
 Borrador inicial para discusión:
-- `docs/onworking/node-status-contract-draft.md`
+- `docs/onworking COA/node-status-contract.md`
 
 Implementado en esta etapa (2026-03-14):
 - `GET /hives/{hive}/nodes/{node_name}/status` en `SY.admin`.

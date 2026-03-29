@@ -64,12 +64,18 @@ Meta:
 - documentar y endurecer el uso del transporte actual para secrets
 
 Checklist:
-- [ ] S2-T1. Documentar ejemplos canónicos de `SCMD` para secrets vía `CONFIG_SET`.
-- [ ] S2-T2. Documentar ejemplo canónico de `CONFIG_GET` para descubrir faltantes de secrets.
-- [ ] S2-T3. Revisar logging de `SY.admin` para asegurar que payloads secretos no se impriman en claro.
+- [x] S2-T1. Documentar ejemplos canónicos de `SCMD` para secrets vía `CONFIG_SET`.
+- [x] S2-T2. Documentar ejemplo canónico de `CONFIG_GET` para descubrir faltantes de secrets.
+- [x] S2-T3. Revisar logging de `SY.admin` para asegurar que payloads secretos no se impriman en claro.
 - [x] S2-T4. Revisar logging/UX de `archi` para asegurar que no refleje secrets en respuestas o historial visible.
 - [x] S2-T5. Alinear ayuda de `archi` para que entienda que keys/secrets entran por `CONFIG_SET` y no por `hive.yaml`.
 - [ ] S2-T6. Definir wording estándar para respuestas de `archi` cuando un nodo reporta `configured=false` en un secret requerido.
+
+Documentado / verificado en:
+- `docs/onworking COA/node_secret_migration_runbook.md`
+- `docs/node-config-control-plane-spec.md`
+- `src/bin/sy_admin.rs`
+- `src/bin/sy_architect.rs`
 
 Avance actual en `archi`:
 - [x] lectura de OpenAI key únicamente desde `secrets.json` local
@@ -97,10 +103,13 @@ Checklist:
 - [x] S3-T3. Acordar que `CONFIG_SET` puede transportar secrets dentro del `payload.config` del nodo.
 - [x] S3-T4. Acordar que el nodo es responsable de separar config normal y secrets al persistir.
 - [ ] S3-T5. Documentar por familia de nodos qué campos son secret-bearing.
+  - Estado actual: `AI` documentado; `IO` y `WF` quedan abiertos por definición de cada nodo/familia.
 
 Documentado en:
 - `docs/node-config-control-plane-spec.md`
 - `docs/onworking COA/node-secret-config-spec.md`
+- `docs/AI_nodes_spec.md`
+- `docs/ai-nodes-examples-annex.md`
 
 Soporte común ya disponible en:
 - `crates/fluxbee_sdk/src/node_secret.rs` (`NodeSecretDescriptor`)
@@ -187,8 +196,11 @@ Checklist:
 
 Se considera cerrado cuando:
 
-- [ ] existe helper estándar en `fluxbee_sdk`
-- [ ] `AI.common` ya no necesita leer su key principal desde `hive.yaml`
-- [ ] `CONFIG_GET` expone metadata de secrets sin revelar valores
-- [ ] `CONFIG_SET` permite cargar secrets operativamente desde `archi`
-- [ ] secrets no aparecen en logs, history ni status
+- [x] existe helper estándar en `fluxbee_sdk`
+- [x] `AI.common` ya no necesita leer su key principal desde `hive.yaml`
+- [x] `CONFIG_GET` expone metadata de secrets sin revelar valores
+- [x] `CONFIG_SET` permite cargar secrets operativamente desde `archi`
+- [x] secrets no aparecen en logs, history ni status
+
+Nota:
+- `S6` queda explícitamente fuera del cierre de `v1`; cifrado at-rest se mantiene como hardening opcional `v1.1`.
