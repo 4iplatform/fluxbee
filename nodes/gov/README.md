@@ -24,9 +24,14 @@ Alcance de esta fase:
 ## Convenciones
 
 - Nombre L2: `AI.<servicio>.gov@<hive>`
-- Runtime: `ai.<servicio>.gov`
+- Runtime: `AI.<servicio>.gov`
 - Configuración de ruteo de temporales:
   - `government.identity_frontdesk: "AI.frontdesk.gov@motherbee"`
+
+Control-plane y secrets:
+- los nodos `.gov` que reutilizan el runner AI siguen el mismo contrato `CONFIG_GET` / `CONFIG_SET`.
+- la key de OpenAI se persiste localmente en `secrets.json`.
+- el campo canónico actual es `config.secrets.openai.api_key`.
 
 ## Build
 
@@ -43,7 +48,7 @@ El nodo `AI.frontdesk.gov` debe usar helpers del SDK:
 - `identity_system_call_ok` para `ILK_REGISTER` y `ILK_ADD_CHANNEL`
 - fallback a primary (`SY.identity@<motherbee>`) cuando reciba `NOT_PRIMARY`
 
-Checklist operativo: `docs/onworking/identity_v2_tasks.md` sección `E2`.
+Checklist operativo: `docs/onworking COA/identity_v2_tasks.md` sección `E2`.
 
 ## Contrato de Status (FR7)
 

@@ -12,6 +12,12 @@ Importante:
 - no expresa todavía una frontera de arquitectura limpia,
 - sirve para sacar el runner AI de `crates/` y ubicar los fuentes bajo `nodes/`.
 
+Contrato operativo actual:
+- mantiene el mismo `CONFIG_GET` / `CONFIG_SET` que `nodes/ai/ai-generic`.
+- persiste la OpenAI key en `secrets.json`.
+- usa el campo canónico `config.secrets.openai.api_key`.
+- conserva compatibilidad temporal con aliases legacy mientras migra.
+
 ## Ejecutar local
 
 Desde raíz del repo:

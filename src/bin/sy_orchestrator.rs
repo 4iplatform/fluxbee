@@ -1255,7 +1255,7 @@ async fn handle_admin(
         "remove_node_instance" => remove_node_instance_flow(state, &msg.payload).await,
         "list_deployments" => list_deployments_flow(state, &msg.payload),
         "get_deployments" => get_deployments_flow(state, &msg.payload),
-        "list_drift_alerts" => list_drift_alerts_flow(&msg.payload),
+        "list_drift_alerts" => list_drift_alerts_flow(state, &msg.payload),
         "get_drift_alerts" => get_drift_alerts_flow(state, &msg.payload),
         "get_node_config" => get_node_config_flow(state, &msg.payload).await,
         "get_node_state" => get_node_state_flow(state, &msg.payload).await,
@@ -6256,6 +6256,154 @@ fn read_drift_alerts(
     Ok(entries)
 }
 
+fn local_drift_alert_history_snapshot_entries(state: &OrchestratorState) -> Vec<DriftAlertEntry> {
+    let mut entries = Vec::new();
+    let local_hive = state.hive_id.clone();
+
+    if let Some(core_path) = local_core_manifest_path() {
+        let detected_at = file_mtime_epoch_ms(&core_path).unwrap_or_else(now_epoch_ms);
+        entries.push(DriftAlertEntry {
+            alert_id: format!("local-drift-core-{}", local_hive),
+            detected_at,
+            category: "core".to_string(),
+            trigger: "local_current_state".to_string(),
+            hive_id: local_hive.clone(),
+            severity: "info".to_string(),
+            kind: "local_current_state".to_string(),
+            message: format!(
+                "Local hive current-state snapshot for {}. No historical drift alert entry was recorded for this category.",
+                local_hive
+            ),
+            local_hash: local_core_manifest_hash().ok().flatten(),
+            remote_hash_before: None,
+            remote_hash_after: None,
+        });
+    }
+
+    if let Some(runtime_path) = local_runtime_manifest_paths()
+        .into_iter()
+        .find(|path| path.exists())
+    {
+        let detected_at = file_mtime_epoch_ms(&runtime_path).unwrap_or_else(now_epoch_ms);
+        entries.push(DriftAlertEntry {
+            alert_id: format!("local-drift-runtime-{}", local_hive),
+            detected_at,
+            category: "runtime".to_string(),
+            trigger: "local_current_state".to_string(),
+            hive_id: local_hive.clone(),
+            severity: "info".to_string(),
+            kind: "local_current_state".to_string(),
+            message: format!(
+                "Local hive current-state snapshot for {}. No historical drift alert entry was recorded for this category.",
+                local_hive
+            ),
+            local_hash: local_runtime_manifest_hash().ok().flatten(),
+            remote_hash_before: None,
+            remote_hash_after: None,
+        });
+    }
+
+    if let Some(vendor_path) =
+        local_vendor_manifest_path().or_else(|| resolve_syncthing_vendor_source_path().ok())
+    {
+        let detected_at = file_mtime_epoch_ms(&vendor_path).unwrap_or_else(now_epoch_ms);
+        entries.push(DriftAlertEntry {
+            alert_id: format!("local-drift-vendor-{}", local_hive),
+            detected_at,
+            category: "vendor".to_string(),
+            trigger: "local_current_state".to_string(),
+            hive_id: local_hive.clone(),
+            severity: "info".to_string(),
+            kind: "local_current_state".to_string(),
+            message: format!(
+                "Local hive current-state snapshot for {}. No historical drift alert entry was recorded for this category.",
+                local_hive
+            ),
+            local_hash: local_syncthing_vendor_hash().ok().flatten(),
+            remote_hash_before: None,
+            remote_hash_after: None,
+        });
+    }
+
+    entries
+}
+
+fn enrich_drift_alert_history_entries(
+    state: &OrchestratorState,
+    mut entries: Vec<DriftAlertEntry>,
+    hive_filter: Option<&str>,
+    category_filter: Option<&str>,
+    severity_filter: Option<&str>,
+    kind_filter: Option<&str>,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let local_hive = state.hive_id.as_str();
+    let should_include_local_snapshot = match hive_filter {
+        Some(hive) => hive == local_hive,
+        None => true,
+    };
+
+    if should_include_local_snapshot {
+        let local_already_present = entries.iter().any(|entry| entry.hive_id == local_hive);
+        if !local_already_present {
+            let synthetic = local_drift_alert_history_snapshot_entries(state)
+                .into_iter()
+                .filter(|entry| {
+                    if let Some(category) = category_filter {
+                        if entry.category != category {
+                            return false;
+                        }
+                    }
+                    if let Some(severity) = severity_filter {
+                        if entry.severity != severity {
+                            return false;
+                        }
+                    }
+                    if let Some(kind) = kind_filter {
+                        if entry.kind != kind {
+                            return false;
+                        }
+                    }
+                    true
+                });
+            entries.extend(synthetic);
+            entries.sort_by_key(|entry| std::cmp::Reverse(entry.detected_at));
+        }
+    }
+
+    if entries.len() > limit {
+        entries.truncate(limit);
+    }
+
+    entries
+        .into_iter()
+        .map(|entry| {
+            let mut value = serde_json::to_value(entry).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("history_view".to_string(), serde_json::json!(true));
+                obj.insert(
+                    "hive_present".to_string(),
+                    serde_json::json!(hive_present_for_deployments(
+                        state,
+                        obj.get("hive_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                    )),
+                );
+                obj.insert(
+                    "synthetic".to_string(),
+                    serde_json::json!(obj
+                        .get("trigger")
+                        .and_then(|v| v.as_str())
+                        .map(|v| v == "local_current_state")
+                        .unwrap_or(false)),
+                );
+            }
+            value
+        })
+        .collect()
+}
+
 fn drift_filter_str<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     payload
         .get(key)
@@ -6264,7 +6412,10 @@ fn drift_filter_str<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a
         .filter(|v| !v.is_empty())
 }
 
-fn list_drift_alerts_flow(payload: &serde_json::Value) -> serde_json::Value {
+fn list_drift_alerts_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
     let limit = drift_alert_limit_from_payload(payload);
     let category = drift_filter_str(payload, "category");
     let severity = drift_filter_str(payload, "severity");
@@ -6272,7 +6423,16 @@ fn list_drift_alerts_flow(payload: &serde_json::Value) -> serde_json::Value {
     match read_drift_alerts(limit, None, category, severity, kind) {
         Ok(entries) => serde_json::json!({
             "status": "ok",
-            "entries": entries,
+            "view": "history",
+            "entries": enrich_drift_alert_history_entries(
+                state,
+                entries,
+                None,
+                category,
+                severity,
+                kind,
+                limit,
+            ),
         }),
         Err(err) => serde_json::json!({
             "status": "error",
@@ -6294,8 +6454,17 @@ fn get_drift_alerts_flow(
     match read_drift_alerts(limit, Some(&target_hive), category, severity, kind) {
         Ok(entries) => serde_json::json!({
             "status": "ok",
+            "view": "history",
             "hive_id": target_hive,
-            "entries": entries,
+            "entries": enrich_drift_alert_history_entries(
+                state,
+                entries,
+                Some(&target_hive),
+                category,
+                severity,
+                kind,
+                limit,
+            ),
         }),
         Err(err) => serde_json::json!({
             "status": "error",

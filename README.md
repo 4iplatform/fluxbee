@@ -297,7 +297,7 @@ Useful checks:
 In both cases the package must declare `runtime_base` in `package.json`, and the base runtime must already be published and ready on the target hive.
 
 For the full packaging contract and examples of all three package types, see:
-- [`docs/onworking/runtime-packaging-cli-spec.md`](docs/onworking/runtime-packaging-cli-spec.md)
+- [`docs/runtime-packaging-cli-spec.md`](docs/runtime-packaging-cli-spec.md)
 
 #### Low-level fallback: manual `dist` / manifest editing
 
@@ -361,8 +361,8 @@ curl -sS -X PUT "$BASE/config/vpns" \
   ]}'
 ```
 
-For a larger E2E checklist and error matrix, see:
-- `docs/onworking/sy_admin_e2e_curl_checklist.md`
+For a larger command matrix and error smoke checks, see:
+- `docs/onworking COA/sy-architect-admin-command-test-matrix.md`
 - `scripts/admin_add_hive_matrix.sh`
 
 ### Identity inspection calls
@@ -438,8 +438,8 @@ Global endpoints:
 | `GET` | `/hives` | List managed hives |
 | `POST` | `/hives` | Add hive (`hive_id`, `address`) |
 | `GET` | `/versions` | Effective versions (local or `?hive=`) |
-| `GET` | `/deployments` | Deployment history (`?hive=`, `?category=`, `?limit=`) |
-| `GET` | `/drift-alerts` | Drift alerts (`?hive=`, `?category=`, `?limit=`) |
+| `GET` | `/deployments` | Historical deployment entries (`?hive=`, `?category=`, `?limit=`) |
+| `GET` | `/drift-alerts` | Historical drift alert entries (`?hive=`, `?category=`, `?limit=`) |
 | `GET` | `/routes` | Read global routes |
 | `POST` | `/routes` | Add/update route entry |
 | `DELETE` | `/routes` | Delete route entry |
@@ -483,13 +483,15 @@ Hive-scoped endpoints:
 | `PUT` | `/hives/{hive}/nodes/{name}/config` | Update node effective config |
 | `GET` | `/hives/{hive}/nodes/{name}/state` | Read node runtime state payload |
 | `POST` | `/hives/{hive}/nodes/{name}/messages` | Send a direct debug message to one node |
+| `POST` | `/hives/{hive}/nodes/{name}/control/config-get` | Request node-owned control-plane contract/config (`CONFIG_GET`) |
+| `POST` | `/hives/{hive}/nodes/{name}/control/config-set` | Apply node-owned control-plane config (`CONFIG_SET`) |
 | `GET` | `/hives/{hive}/identity/ilks` | List ILKs on hive (compact identity view) |
 | `GET` | `/hives/{hive}/identity/ilks/{ilk_id}` | Read one ILK with resolved tenant/alias detail |
 | `POST` | `/hives/{hive}/update` | Send `SYSTEM_UPDATE` to hive orchestrator |
 | `POST` | `/hives/{hive}/sync-hint` | Send `SYSTEM_SYNC_HINT` (`blob`/`dist`) to hive orchestrator |
 | `GET` | `/hives/{hive}/versions` | Effective versions for hive |
-| `GET` | `/hives/{hive}/deployments` | Deployment history for hive |
-| `GET` | `/hives/{hive}/drift-alerts` | Drift alerts for hive |
+| `GET` | `/hives/{hive}/deployments` | Historical deployment entries targeting hive |
+| `GET` | `/hives/{hive}/drift-alerts` | Historical drift alert entries for hive |
 | `POST` | `/hives/{hive}/opa/policy` | Upload policy for hive |
 | `POST` | `/hives/{hive}/opa/policy/compile` | Compile policy for hive |
 | `POST` | `/hives/{hive}/opa/policy/apply` | Apply policy on hive |
@@ -500,6 +502,11 @@ Hive-scoped endpoints:
 
 Note:
 - Router operations are managed as node lifecycle (`RT.*`) via `/hives/{hive}/nodes`.
+- `GET /deployments` and `GET /hives/{hive}/deployments` are history views, not a list of currently running deployments.
+- `GET /drift-alerts` and `GET /hives/{hive}/drift-alerts` are history views, not a live health snapshot.
+- History responses may include `target_hives_detail[*].present` and `workers[*].hive_present` so removed hives remain visible as history.
+- Drift alert history responses may include `hive_present` and `synthetic` markers when a local `motherbee` current-state snapshot is synthesized for history continuity.
+- For `motherbee`, hive-scoped deployment history may include synthesized local-current-state entries when no older history was recorded with `motherbee` as explicit deployment target.
 
 ---
 
