@@ -2692,6 +2692,9 @@ fn architect_admin_action_timeout(action: &str) -> Duration {
         "sync_hint" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
         }
+        "list_versions" | "get_versions" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30))
+        }
         "run_node"
         | "kill_node"
         | "remove_node_instance"
