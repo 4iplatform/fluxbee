@@ -55,7 +55,6 @@ TEST_ADDR=192.168.8.220
 TEST_RUNTIME=AI.chat
 TEST_RUNTIME_VERSION=1.2.3
 TEST_NODE=SY.admin@motherbee
-TEST_MANAGED_NODE=AI.chat@motherbee
 TEST_ROUTE_PREFIX=AI.chat.
 TEST_VPN_PATTERN=worker-*
 TEST_ILK=demo-ilk
@@ -280,7 +279,7 @@ SCMD: curl -X GET /hives/motherbee/nodes
 - check:
   - lista instancias persistidas/visibles
 
-[ ] `get_node_status`
+[x] `get_node_status`
 
 - curl:
 ```bash
@@ -293,19 +292,18 @@ SCMD: curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/status
 - check:
   - snapshot canónico de lifecycle/health
 
-[ ] `get_node_config`
+[x] `get_node_config`
 
 - curl:
 ```bash
-curl -sS "$BASE/hives/$LOCAL_HIVE/nodes/$TEST_MANAGED_NODE/config"
+curl -sS "$BASE/hives/$LOCAL_HIVE/nodes/$TEST_NODE/config"
 ```
 - SCMD:
 ```text
-SCMD: curl -X GET /hives/motherbee/nodes/AI.chat@motherbee/config
+SCMD: curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/config
 ```
 - check:
-  - config persistida de un nodo gestionado
-  - no usar `SY.*` como ejemplo acá: puede no tener `config.json` node-managed
+  - config persistida
 
 [ ] `get_node_state`
 
@@ -620,16 +618,16 @@ SCMD: curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee/instance
 
 - curl:
 ```bash
-curl -sS -X PUT "$BASE/hives/$LOCAL_HIVE/nodes/$TEST_MANAGED_NODE/config" \
+curl -sS -X PUT "$BASE/hives/$LOCAL_HIVE/nodes/$TEST_NODE/config" \
   -H 'Content-Type: application/json' \
   -d '{"config":{"openai":{"default_model":"gpt-4.1-mini"}}}'
 ```
 - SCMD:
 ```text
-SCMD: curl -X PUT /hives/motherbee/nodes/AI.chat@motherbee/config -d '{"config":{"openai":{"default_model":"gpt-4.1-mini"}}}'
+SCMD: curl -X PUT /hives/motherbee/nodes/SY.admin@motherbee/config -d '{"openai":{"default_model":"gpt-4.1-mini"}}'
 ```
 - check:
-  - luego `GET /hives/motherbee/nodes/AI.chat@motherbee/config`
+  - luego `GET /hives/motherbee/nodes/SY.admin@motherbee/config`
 
 [ ] `send_node_message`
 

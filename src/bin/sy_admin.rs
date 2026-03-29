@@ -3205,9 +3205,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "get_node_status" => "Read the effective runtime status of one node.",
         "get_node_state" => "Read the persisted state payload of one node.",
-        "get_node_config" => {
-            "Read the stored node config payload for a managed node with persisted config.json."
-        }
+        "get_node_config" => "Read the stored effective config.json payload for a managed node.",
         "node_control_config_get" => {
             "Send CONFIG_GET to a non-SY node and return its live CONFIG_RESPONSE."
         }
@@ -3916,11 +3914,19 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
         ],
+        "get_node_config" => vec![
+            "The hive target comes from the /hives/{hive} path in HTTP.",
+            "The node_name path segment should be a fully-qualified Fluxbee node name.",
+            "This reads the stored effective config.json snapshot, not the live node-owned CONFIG_GET control-plane contract.",
+            "Use this when you want the persisted node config, for example to inspect prompt/instructions already materialized in config.json.",
+            "Use POST /hives/{hive}/nodes/{node_name}/control/config-get only when you need the node-defined live control-plane contract/config response.",
+        ],
         "node_control_config_get" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
             "This is the canonical live control-plane discovery path for non-SY nodes.",
             "Admin forwards CONFIG_GET over L2 unicast and returns the node's CONFIG_RESPONSE.",
+            "Use this when you need the node-defined live contract, dynamic config view, or secret metadata; not when a plain stored config.json read is enough.",
             "The node defines the response contract and config schema; SY.admin only standardizes transport.",
         ],
         "node_control_config_set" => vec![
