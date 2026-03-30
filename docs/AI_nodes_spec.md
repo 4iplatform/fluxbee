@@ -65,13 +65,17 @@
 
 ✅ **NORMATIVO**: el nodo AI implementa al menos estos estados operativos:
 
-- `UNCONFIGURED`: no existe configuración efectiva (ni YAML ni persistida).
-- `CONFIGURED`: existe configuración efectiva (YAML o persistida) y el nodo puede procesar mensajes de usuario.
+- `UNCONFIGURED`: no existe configuración efectiva (ni config dinámica del nodo ni fallback de orchestrator).
+- `CONFIGURED`: existe configuración efectiva y el nodo puede procesar mensajes de usuario.
 
-✅ **NORMATIVO**: prioridad de configuración efectiva (precedencia):
-1) **Config operator-managed** (YAML local)
-2) **Config dinámica persistida** (recibida por system/admin)
+✅ **NORMATIVO (operación managed-node actual)**: prioridad de configuración efectiva (precedencia):
+1) **Config dinámica persistida por el nodo** (`${STATE_DIR}/ai-nodes/<name>.json`, vía `CONFIG_SET`)
+2) **Config de orchestrator en spawn** (`/var/lib/fluxbee/nodes/<TYPE>/<node@hive>/config.json`)
 3) `UNCONFIGURED`
+
+⚠️ **Nota de compatibilidad**:
+- Si el runner se opera en modo YAML legacy (`--config ...`), ese flujo puede definir su propia precedencia de arranque.
+- Para el flujo canónico de nodos AI manejados por orchestrator (sin YAML por instancia), aplica la precedencia 1→2→3 anterior.
 
 ---
 
@@ -88,18 +92,15 @@
 
 ✅ **NORMATIVO**: en `FAILED_CONFIG` el nodo **MUST** seguir atendiendo: `PING`, `STATUS`, `CONFIG_GET`, `CONFIG_SET`.
 
-### Configuración efectiva: archivo único (JSON) y creación TBD
+### Configuración efectiva: doble persistencia y responsabilidad
 
-✅ **NORMATIVO (nuevo lineamiento operativo)**:
-- La configuración efectiva del nodo AI vive en **un único archivo JSON** bajo `${STATE_DIR}` (default: `/var/lib/fluxbee/state/ai-nodes/<node_name>.json`).
-- El nodo **MUST** leer y escribir este archivo (persistencia atómica) como “effective config” y fuente de verdad de runtime.
-
-🧩 **A ESPECIFICAR (fricción actual / responsabilidad de creación)**:
-- Quién crea el archivo por primera vez:
-  - **Opción A**: `SY.orchestrator` lo crea como parte del flujo de spawn/provision.
-  - **Opción B**: el nodo lo crea al recibir el primer `CONFIG_SET` válido.
-- Mientras no esté normado, el comportamiento del nodo debe ser:
-  - si el archivo no existe → estado `UNCONFIGURED` (atiende solo Control Plane).
+✅ **NORMATIVO**:
+- Existen dos persistencias distintas por diseño:
+  - `config.json` de orchestrator: infra/bootstrap de la instancia.
+  - JSON dinámico del nodo en `${STATE_DIR}/ai-nodes/<name>.json`: configuración runtime/business aplicada por `CONFIG_SET`.
+- El nodo AI **MUST** leer/escribir su JSON dinámico con persistencia atómica.
+- Si no existe JSON dinámico, el nodo **MAY** bootstrapear desde `config.json` de orchestrator.
+- Si no existe ninguna de las dos fuentes, el nodo queda `UNCONFIGURED` y atiende solo Control Plane.
 
 ⚠️ **DEPRECATED (no operator-managed)**:
 - Los YAML por nodo en `/etc/fluxbee/ai-nodes/*.yaml` dejan de ser “operator-managed config”.
@@ -1012,19 +1013,19 @@ secrets:
 
 ## 1. Tipos de configuración y precedencia
 
-✅ **NORMATIVO**: existen dos fuentes de configuración:
+✅ **NORMATIVO**: existen dos fuentes de configuración para nodos AI managed:
 
-1) **Operator-managed YAML**  
-   - Archivo en `${CONFIG_DIR}/ai-nodes/<name>.yaml` (default `/etc/fluxbee/ai-nodes/<name>.yaml`)
-   - Se carga al arranque del proceso `ai_node_runner`.
+1) **Config de orchestrator (spawn/bootstrap)**  
+   - Archivo en `/var/lib/fluxbee/nodes/<TYPE>/<node@hive>/config.json`.
+   - Writer: `SY.orchestrator` (`set_node_config` / `NODE_CONFIG_SET`).
 
-2) **Config dinámica (Control Plane)**  
+2) **Config dinámica del nodo (Control Plane)**  
    - Se recibe vía mensajes `system/admin` y se persiste en `${STATE_DIR}/ai-nodes/<name>.json`.
    - Ver Parte 1 (Control Plane) y Parte 3 (`merge_patch` RFC 7396).
 
 ✅ **NORMATIVO**: precedencia (effective config):
-1) YAML local
-2) config dinámica persistida
+1) config dinámica persistida por el nodo
+2) config de orchestrator (`config.json` spawn/bootstrap)
 3) `UNCONFIGURED`
 
 ---
@@ -1191,7 +1192,11 @@ secrets:
 
 ### 5.1 Alineación con normas generales de Fluxbee
 
-Fluxbee usa el patrón `CONFIG_CHANGED` con `payload.config` para distribuir cambios, y el receptor responde con `CONFIG_RESPONSE`. fileciteturn2file11L82-L90 fileciteturn2file11L137-L145
+Fluxbee mantiene dos capas:
+- capa core/orchestrator (`set_node_config`/`NODE_CONFIG_SET` + señal `CONFIG_CHANGED`)
+- capa node control-plane (`CONFIG_GET`/`CONFIG_SET` + `CONFIG_RESPONSE`)
+
+Para AI Nodes, el hot-reload operativo actual se realiza por `CONFIG_SET`.
 
 ✅ **NORMATIVO (decisión cerrada)**:
 - Para `CONFIG_SET`, se mantiene el mismo naming por consistencia: el contenido a aplicar viaja en `payload.config`.
@@ -1309,7 +1314,7 @@ Cada instancia opera aislada y no debe interferir con otras.
 
 ✅ **NORMATIVO**: el nodo AI implementa los estados (ver Parte 1):
 
-- `UNCONFIGURED`: sin configuración efectiva (ni YAML válido ni config dinámica persistida).
+- `UNCONFIGURED`: sin configuración efectiva (ni config dinámica persistida ni fallback de orchestrator).
 - `CONFIGURED`: con configuración efectiva.
 
 ✅ **NORMATIVO**:
@@ -1340,12 +1345,12 @@ Cada instancia opera aislada y no debe interferir con otras.
   Mientras no esté normado, se asume que el **nodo** lo crea si no existe.
 
 
-✅ **NORMATIVO**: al reiniciar una instancia:
+✅ **NORMATIVO**: al reiniciar una instancia managed:
 
-- Si existe YAML válido y soportado:
+- Si existe config dinámica persistida en `${STATE_DIR}/ai-nodes/<name>.json`:
   - se utiliza como configuración efectiva (precedencia).
-- Si no existe YAML válido:
-  - se intenta rehidratar desde config dinámica persistida en `${STATE_DIR}/ai-nodes/<name>.json`.
+- Si no existe config dinámica persistida:
+  - se intenta bootstrap desde `/var/lib/fluxbee/nodes/<TYPE>/<node@hive>/config.json`.
 - Si ninguna fuente existe:
   - el nodo queda `UNCONFIGURED`.
 

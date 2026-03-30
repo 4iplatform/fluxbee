@@ -242,34 +242,31 @@ Reglas:
 Modo spawn/orchestrator (compliance path):
 - El nodo puede leer configuración desde `config.json` de spawn:
   - ruta canónica: `/var/lib/fluxbee/nodes/IO/<node_name>/config.json`
-  - override: `NODE_CONFIG_PATH`
 - Tokens soportados en config:
   - `slack.app_token`, `slack.bot_token`
   - `slack.app_token_ref`, `slack.bot_token_ref` (`env:VAR`)
 - Precedencia:
   - env explícito (`SLACK_APP_TOKEN`/`SLACK_BOT_TOKEN`) sobre config de spawn.
+- Contrato de spawn activo:
+  - requiere `FLUXBEE_NODE_NAME` inyectado por orchestrator
+  - sin fallback legacy de `NODE_NAME`/`ISLAND_ID`
+  - sin path override legacy de config de spawn
 
 ## 12. Gaps conocidos (estado actual)
 
-- `CONFIG_CHANGED` hot-reload:
-  - pendiente implementar manejo explícito en runtime para recargar/aplicar cambios de `config.json` sin respawn.
-  - hoy, la actualización confiable de config en `IO.slack` se realiza por `KILL_NODE + SPAWN_NODE` (o restart controlado equivalente).
+- Frontera core vs node control-plane:
+  - `PUT .../config` (core) mantiene `config.json` administrado por orchestrator.
+  - hot reload runtime/business de `IO.slack` se aplica por `CONFIG_SET` (control-plane del nodo).
+  - `CONFIG_CHANGED` se trata como señal informativa de infraestructura; no reemplaza `CONFIG_SET` en v1.
 
 - Fallback de configuración y resiliencia de proceso:
   - hoy, si faltan credenciales (`slack.app_token`/`slack.bot_token`) el proceso termina con `exit 1`.
   - comportamiento esperado (pendiente): no crash; reportar estado/config error y seguir atendiendo control-plane.
-  - en entornos con unit transient sin `NODE_NAME`/`ISLAND_ID`/`NODE_CONFIG_PATH`, el nodo puede no encontrar `config.json` aunque exista (síntoma: `missing Slack app token`).
 
 - Bloqueante operativo (prioridad alta):
   - hoy el runtime trata falta de config/secrets como fatal de arranque (`exit 1`), lo que provoca restart loop en systemd.
   - responsabilidad de `IO.slack`: este caso debe pasar a modo degradado/no-ready, sin terminar proceso.
   - estado esperado (pendiente): levantar el runtime, publicar estado de error de config y permanecer controlable por orchestrator/admin.
-
-- Workaround temporal de path forzado (solo para destrabar pruebas):
-  - mientras `run_node` no inyecte `NODE_CONFIG_PATH`/`NODE_NAME`/`ISLAND_ID` en el unit transient, `io-slack` fuerza lectura desde:
-    - `/var/lib/fluxbee/nodes/IO/IO.slack.T123@motherbee/config.json`
-  - override soportado: `IO_SLACK_FORCE_CONFIG_PATH` o `NODE_CONFIG_PATH`.
-  - **pendiente eliminar** cuando core cierre el contrato final de spawn para runtime env.
 
 
 

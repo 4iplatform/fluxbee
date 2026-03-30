@@ -1,7 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fluxbee_sdk::node_client::NodeError;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
@@ -63,6 +64,8 @@ pub struct NodeRuntime<N: AiNode> {
 struct RuntimeMetrics {
     read_messages: AtomicU64,
     idle_read_timeouts: AtomicU64,
+    reconnect_events: AtomicU64,
+    reconnect_wait_cycles: AtomicU64,
     enqueued_messages: AtomicU64,
     processed_messages: AtomicU64,
     responses_sent: AtomicU64,
@@ -75,6 +78,8 @@ struct RuntimeMetrics {
 struct RuntimeMetricsSnapshot {
     read_messages: u64,
     idle_read_timeouts: u64,
+    reconnect_events: u64,
+    reconnect_wait_cycles: u64,
     enqueued_messages: u64,
     processed_messages: u64,
     responses_sent: u64,
@@ -88,6 +93,8 @@ impl RuntimeMetrics {
         RuntimeMetricsSnapshot {
             read_messages: self.read_messages.load(Ordering::Relaxed),
             idle_read_timeouts: self.idle_read_timeouts.load(Ordering::Relaxed),
+            reconnect_events: self.reconnect_events.load(Ordering::Relaxed),
+            reconnect_wait_cycles: self.reconnect_wait_cycles.load(Ordering::Relaxed),
             enqueued_messages: self.enqueued_messages.load(Ordering::Relaxed),
             processed_messages: self.processed_messages.load(Ordering::Relaxed),
             responses_sent: self.responses_sent.load(Ordering::Relaxed),
@@ -243,6 +250,8 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
         tracing::info!(
             read_messages = final_metrics.read_messages,
             idle_read_timeouts = final_metrics.idle_read_timeouts,
+            reconnect_events = final_metrics.reconnect_events,
+            reconnect_wait_cycles = final_metrics.reconnect_wait_cycles,
             enqueued_messages = final_metrics.enqueued_messages,
             processed_messages = final_metrics.processed_messages,
             responses_sent = final_metrics.responses_sent,
@@ -262,16 +271,34 @@ async fn reader_loop(
     read_timeout: Duration,
     metrics: Arc<RuntimeMetrics>,
 ) -> Result<()> {
+    let reconnect_initial_backoff = Duration::from_millis(200);
+    let reconnect_max_backoff = Duration::from_secs(5);
+
     loop {
         let msg = match reader.read_timeout(read_timeout).await {
             Ok(msg) => msg,
-            Err(AiSdkError::Node(fluxbee_sdk::node_client::NodeError::Timeout)) => {
+            Err(AiSdkError::Node(NodeError::Timeout)) => {
                 // Idle window elapsed: keep process alive and continue waiting.
                 metrics.idle_read_timeouts.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     read_timeout_ms = read_timeout.as_millis() as u64,
                     "ai runtime read timeout (idle)"
                 );
+                continue;
+            }
+            Err(err) if is_transient_link_error(&err) => {
+                metrics.reconnect_events.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    error = %err,
+                    "ai runtime disconnected from router; entering reconnect wait"
+                );
+                wait_for_reconnect(
+                    &reader,
+                    reconnect_initial_backoff,
+                    reconnect_max_backoff,
+                    metrics.clone(),
+                )
+                .await;
                 continue;
             }
             Err(err) => return Err(err),
@@ -282,6 +309,60 @@ async fn reader_loop(
         }
         metrics.enqueued_messages.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+fn is_transient_link_error(err: &AiSdkError) -> bool {
+    matches!(
+        err,
+        AiSdkError::Node(NodeError::Io(_) | NodeError::Disconnected)
+    )
+}
+
+async fn wait_for_reconnect(
+    reader: &RouterReader,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    metrics: Arc<RuntimeMetrics>,
+) {
+    let mut attempt: u64 = 0;
+    let mut backoff = initial_backoff;
+
+    loop {
+        if reader.is_connected() {
+            tracing::info!(attempt, "ai runtime reconnected to router");
+            return;
+        }
+
+        attempt = attempt.saturating_add(1);
+        let wait_for = with_jitter(backoff);
+        metrics
+            .reconnect_wait_cycles
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            attempt,
+            backoff_ms = backoff.as_millis() as u64,
+            wait_ms = wait_for.as_millis() as u64,
+            "ai runtime reconnecting to router"
+        );
+
+        let _ = timeout(wait_for, reader.wait_connected()).await;
+        backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
+    }
+}
+
+fn with_jitter(base: Duration) -> Duration {
+    // Simple bounded jitter (+0%..+24%) to reduce synchronized reconnect waits.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter_factor_percent = nanos % 25;
+    let jitter = base
+        .as_millis()
+        .saturating_mul(jitter_factor_percent as u128)
+        / 100;
+    let total = base.as_millis().saturating_add(jitter);
+    Duration::from_millis(total as u64)
 }
 
 async fn process_one<N: AiNode>(
@@ -382,6 +463,8 @@ async fn metrics_loop(metrics: Arc<RuntimeMetrics>, interval: Duration) {
         tracing::info!(
             read_messages = snapshot.read_messages,
             idle_read_timeouts = snapshot.idle_read_timeouts,
+            reconnect_events = snapshot.reconnect_events,
+            reconnect_wait_cycles = snapshot.reconnect_wait_cycles,
             enqueued_messages = snapshot.enqueued_messages,
             processed_messages = snapshot.processed_messages,
             responses_sent = snapshot.responses_sent,

@@ -7,6 +7,7 @@ use io_common::identity::{
 };
 use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
 use io_common::io_context::{ConversationRef, IoContext, MessageRef, PartyRef, ReplyTarget};
+use io_common::io_control_plane_logging::log_config_response_message;
 use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -407,6 +408,10 @@ async fn process_one_inbound(
 }
 
 fn log_outbound_message(msg: &fluxbee_sdk::protocol::Message) {
+    if log_config_response_message(msg, "io-sim") {
+        return;
+    }
+
     let msg_kind = msg.meta.msg.as_deref().unwrap_or("");
     let payload_type = msg
         .payload

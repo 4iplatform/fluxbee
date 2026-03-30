@@ -1,15 +1,34 @@
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
+use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{
-    connect, managed_node_config_path, managed_node_name, NodeConfig, NodeSender, NodeUuidMode,
+    connect, managed_node_config_path, NodeConfig, NodeSender, NodeUuidMode, FLUXBEE_NODE_NAME_ENV,
 };
 use futures_util::{SinkExt, StreamExt};
 use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
 };
 use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
+use io_common::io_adapter_config::{
+    apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
+};
 use io_common::io_context::{extract_slack_post_target, slack_inbound_io_context};
+use io_common::io_control_plane::{
+    build_io_config_get_response_payload, build_io_config_response_message,
+    build_io_config_set_error_payload, build_io_config_set_ok_payload,
+    ensure_config_version_advances, parse_and_validate_io_control_plane_request, IoConfigSource,
+    IoControlPlaneErrorInfo, IoControlPlaneRequest, IoControlPlaneState, IoNodeLifecycleState,
+};
+use io_common::io_control_plane_bootstrap::bootstrap_io_control_plane_state;
+use io_common::io_control_plane_logging::{
+    log_config_get_served, log_config_set_applied, log_config_set_invalid_runtime_credentials,
+    log_config_set_persist_error, log_config_set_stale_rejected,
+    log_control_plane_request_rejected,
+};
+use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
+use io_common::io_control_plane_store::{default_state_dir, persist_io_control_plane_state};
+use io_common::io_slack_adapter_config::IoSlackAdapterConfigContract;
 use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox};
 use io_common::text_v1_blob::{
     build_text_v1_inbound_payload, resolve_text_v1_for_outbound, InboundAttachmentInput,
@@ -19,10 +38,11 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use url::Url;
 
@@ -43,6 +63,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         node_name = %config.node_name,
         router_socket = %config.router_socket.display(),
+        state_dir = %config.state_dir.display(),
         dst_node = %config.dst_node.clone().unwrap_or_else(|| "resolve".to_string()),
         dev_mode = %config.dev_mode,
         "io-slack starting"
@@ -101,9 +122,51 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let mut boot_state = bootstrap_io_control_plane_state(&config.state_dir, &config.node_name)
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                error = %err,
+                state_dir = %config.state_dir.display(),
+                node_name = %config.node_name,
+                "failed to bootstrap IO control-plane state; using UNCONFIGURED"
+            );
+            IoControlPlaneState::default()
+        });
+    if let Some(effective) = boot_state.effective_config.as_ref() {
+        match extract_runtime_slack_credentials(effective) {
+            Ok((app_token, bot_token)) => {
+                slack.reload_credentials(app_token, bot_token).await;
+            }
+            Err(err) => {
+                boot_state.current_state = IoNodeLifecycleState::FailedConfig;
+                boot_state.last_error = Some(IoControlPlaneErrorInfo {
+                    code: "invalid_config".to_string(),
+                    message: err.to_string(),
+                });
+                tracing::warn!(
+                    node_name = %config.node_name,
+                    error = %err,
+                    "boot effective config is missing/invalid slack credentials; starting in FAILED_CONFIG"
+                );
+            }
+        }
+    }
+    let control_plane = Arc::new(RwLock::new(boot_state.clone()));
+    let control_metrics = Arc::new(IoControlPlaneMetrics::with_initial_state(
+        boot_state.current_state.as_str(),
+        boot_state.config_version,
+    ));
+    let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoSlackAdapterConfigContract);
 
     let outbound_task = tokio::spawn(run_outbound_loop(
         inbox.clone(),
+        sender.clone(),
+        config.node_name.clone(),
+        config.state_dir.clone(),
+        control_plane.clone(),
+        control_metrics.clone(),
+        adapter_contract.clone(),
+        inbound.clone(),
         slack.clone(),
         blob_toolkit.clone(),
         blob_payload_cfg.clone(),
@@ -127,14 +190,15 @@ async fn main() -> Result<()> {
 
 #[derive(Clone)]
 struct Config {
-    slack_app_token: String,
-    slack_bot_token: String,
+    slack_app_token: Option<String>,
+    slack_bot_token: Option<String>,
     node_name: String,
     island_id: String,
     node_version: String,
     router_socket: PathBuf,
     uuid_persistence_dir: PathBuf,
     config_dir: PathBuf,
+    state_dir: PathBuf,
     dev_mode: bool,
     ttl: u32,
     dedup_ttl_ms: u64,
@@ -150,139 +214,76 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Self> {
-        let env_node_name = managed_node_name("IO.slack.T123", &["NODE_NAME"]);
-        let env_island_id = env("ISLAND_ID").unwrap_or_else(|| "local".to_string());
+        let resolved_node_name = env(FLUXBEE_NODE_NAME_ENV).ok_or_else(|| {
+            anyhow::anyhow!("missing required env {FLUXBEE_NODE_NAME_ENV} for managed spawn")
+        })?;
+        let resolved_island_id = hive_from_node_name(&resolved_node_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid {FLUXBEE_NODE_NAME_ENV}='{resolved_node_name}': expected <name>@<hive>"
+            )
+        })?;
         let env_config_dir =
             PathBuf::from(env("CONFIG_DIR").unwrap_or_else(|| "/etc/fluxbee".to_string()));
-        let explicit_spawn_config_path =
-            env("NODE_CONFIG_PATH").or_else(|| env("IO_SLACK_FORCE_CONFIG_PATH"));
-        let spawn_cfg = load_spawn_config(
-            explicit_spawn_config_path.map(PathBuf::from),
-            &env_node_name,
-            &env_island_id,
-        );
+        let spawn_cfg = load_spawn_config(&resolved_node_name)?;
+        tracing::info!(path = %spawn_cfg.path.display(), "io-slack loaded spawn config");
+        let spawn_doc = Some(&spawn_cfg.doc);
 
-        if let Some(cfg) = &spawn_cfg {
-            tracing::info!(path = %cfg.path.display(), "io-slack loaded spawn config");
-        }
-
-        let resolved_node_name = env("NODE_NAME")
-            .or_else(|| {
-                json_get_string_opt(
-                    spawn_cfg.as_ref().map(|c| &c.doc),
-                    &["node.name", "_system.node_name"],
-                )
-            })
-            .unwrap_or_else(|| env_node_name.clone());
-
-        let resolved_island_id = env("ISLAND_ID")
-            .or_else(|| {
-                json_get_string_opt(
-                    spawn_cfg.as_ref().map(|c| &c.doc),
-                    &["_system.hive_id", "node.island_id", "island_id"],
-                )
-            })
-            .unwrap_or_else(|| env_island_id.clone());
-
-        let slack_app_token = env("SLACK_APP_TOKEN")
-            .or_else(|| resolve_secret(
-                spawn_cfg.as_ref().map(|c| &c.doc),
-                &[
-                    "slack.app_token",
-                    "slack_app_token",
-                ],
-                &[
-                    "slack.app_token_ref",
-                    "slack_app_token_ref",
-                ],
-            ))
-            .ok_or_else(|| anyhow::anyhow!("missing Slack app token (set SLACK_APP_TOKEN or config slack.app_token / slack.app_token_ref=env:VAR)"))?;
-        let slack_bot_token = env("SLACK_BOT_TOKEN")
-            .or_else(|| resolve_secret(
-                spawn_cfg.as_ref().map(|c| &c.doc),
-                &[
-                    "slack.bot_token",
-                    "slack_bot_token",
-                ],
-                &[
-                    "slack.bot_token_ref",
-                    "slack_bot_token_ref",
-                ],
-            ))
-            .ok_or_else(|| anyhow::anyhow!("missing Slack bot token (set SLACK_BOT_TOKEN or config slack.bot_token / slack.bot_token_ref=env:VAR)"))?;
+        let slack_app_token = env("SLACK_APP_TOKEN").or_else(|| {
+            resolve_secret(
+                spawn_doc,
+                &["slack.app_token", "slack_app_token"],
+                &["slack.app_token_ref", "slack_app_token_ref"],
+            )
+        });
+        let slack_bot_token = env("SLACK_BOT_TOKEN").or_else(|| {
+            resolve_secret(
+                spawn_doc,
+                &["slack.bot_token", "slack_bot_token"],
+                &["slack.bot_token_ref", "slack_bot_token_ref"],
+            )
+        });
 
         let blob_root = PathBuf::from(
             env("BLOB_ROOT")
-                .or_else(|| {
-                    json_get_string_opt(
-                        spawn_cfg.as_ref().map(|c| &c.doc),
-                        &["blob.path", "io.blob.path"],
-                    )
-                })
+                .or_else(|| json_get_string_opt(spawn_doc, &["blob.path", "io.blob.path"]))
                 .unwrap_or_else(|| "/var/lib/fluxbee/blob".to_string()),
         );
         let max_blob_bytes = env("BLOB_MAX_BYTES")
             .and_then(|v| v.parse().ok())
             .or_else(|| {
                 json_get_u64_opt(
-                    spawn_cfg.as_ref().map(|c| &c.doc),
+                    spawn_doc,
                     &["blob.max_blob_bytes", "io.blob.max_blob_bytes"],
                 )
             });
-        let allowed_mimes_override = env("IO_SLACK_ALLOWED_MIMES").or_else(|| {
-            json_get_string_opt(
-                spawn_cfg.as_ref().map(|c| &c.doc),
-                &["io.blob.allowed_mimes_csv"],
-            )
-        });
+        let allowed_mimes_override = env("IO_SLACK_ALLOWED_MIMES")
+            .or_else(|| json_get_string_opt(spawn_doc, &["io.blob.allowed_mimes_csv"]));
         let mut text_v1_cfg = IoTextBlobConfig::default();
         text_v1_cfg.max_message_bytes = env("IO_SLACK_MAX_MESSAGE_BYTES")
             .and_then(|v| v.parse().ok())
             .or_else(|| {
-                json_get_u64_opt(
-                    spawn_cfg.as_ref().map(|c| &c.doc),
-                    &["io.blob.max_message_bytes"],
-                )
-                .map(|v| v as usize)
+                json_get_u64_opt(spawn_doc, &["io.blob.max_message_bytes"]).map(|v| v as usize)
             })
             .unwrap_or(text_v1_cfg.max_message_bytes);
         text_v1_cfg.message_overhead_bytes = env("IO_SLACK_MESSAGE_OVERHEAD_BYTES")
             .and_then(|v| v.parse().ok())
             .or_else(|| {
-                json_get_u64_opt(
-                    spawn_cfg.as_ref().map(|c| &c.doc),
-                    &["io.blob.message_overhead_bytes"],
-                )
-                .map(|v| v as usize)
+                json_get_u64_opt(spawn_doc, &["io.blob.message_overhead_bytes"]).map(|v| v as usize)
             })
             .unwrap_or(text_v1_cfg.message_overhead_bytes);
         text_v1_cfg.max_attachments = env("IO_SLACK_MAX_ATTACHMENTS")
             .and_then(|v| v.parse().ok())
             .or_else(|| {
-                json_get_u64_opt(
-                    spawn_cfg.as_ref().map(|c| &c.doc),
-                    &["io.blob.max_attachments"],
-                )
-                .map(|v| v as usize)
+                json_get_u64_opt(spawn_doc, &["io.blob.max_attachments"]).map(|v| v as usize)
             })
             .unwrap_or(text_v1_cfg.max_attachments);
         text_v1_cfg.max_attachment_bytes = env("IO_SLACK_MAX_ATTACHMENT_BYTES")
             .and_then(|v| v.parse().ok())
-            .or_else(|| {
-                json_get_u64_opt(
-                    spawn_cfg.as_ref().map(|c| &c.doc),
-                    &["io.blob.max_attachment_bytes"],
-                )
-            })
+            .or_else(|| json_get_u64_opt(spawn_doc, &["io.blob.max_attachment_bytes"]))
             .unwrap_or(text_v1_cfg.max_attachment_bytes);
         text_v1_cfg.max_total_attachment_bytes = env("IO_SLACK_MAX_TOTAL_ATTACHMENT_BYTES")
             .and_then(|v| v.parse().ok())
-            .or_else(|| {
-                json_get_u64_opt(
-                    spawn_cfg.as_ref().map(|c| &c.doc),
-                    &["io.blob.max_total_attachment_bytes"],
-                )
-            })
+            .or_else(|| json_get_u64_opt(spawn_doc, &["io.blob.max_total_attachment_bytes"]))
             .unwrap_or(text_v1_cfg.max_total_attachment_bytes);
         if let Some(csv) = allowed_mimes_override {
             let parsed = csv
@@ -298,20 +299,12 @@ impl Config {
         let resolve_retry = fluxbee_sdk::blob::ResolveRetryConfig {
             max_wait_ms: env("IO_SLACK_BLOB_RETRY_MAX_WAIT_MS")
                 .and_then(|v| v.parse().ok())
-                .or_else(|| {
-                    json_get_u64_opt(
-                        spawn_cfg.as_ref().map(|c| &c.doc),
-                        &["io.blob.resolve_retry.max_wait_ms"],
-                    )
-                })
+                .or_else(|| json_get_u64_opt(spawn_doc, &["io.blob.resolve_retry.max_wait_ms"]))
                 .unwrap_or(fluxbee_sdk::blob::BLOB_RETRY_MAX_MS),
             initial_delay_ms: env("IO_SLACK_BLOB_RETRY_INITIAL_MS")
                 .and_then(|v| v.parse().ok())
                 .or_else(|| {
-                    json_get_u64_opt(
-                        spawn_cfg.as_ref().map(|c| &c.doc),
-                        &["io.blob.resolve_retry.initial_delay_ms"],
-                    )
+                    json_get_u64_opt(spawn_doc, &["io.blob.resolve_retry.initial_delay_ms"])
                 })
                 .unwrap_or(fluxbee_sdk::blob::BLOB_RETRY_INITIAL_MS),
             backoff_factor: env("IO_SLACK_BLOB_RETRY_BACKOFF")
@@ -333,7 +326,7 @@ impl Config {
             node_version: env("NODE_VERSION")
                 .or_else(|| {
                     json_get_string_opt(
-                        spawn_cfg.as_ref().map(|c| &c.doc),
+                        spawn_doc,
                         &["_system.runtime_version", "runtime.version", "node.version"],
                     )
                 })
@@ -341,10 +334,7 @@ impl Config {
             router_socket: PathBuf::from(
                 env("ROUTER_SOCKET")
                     .or_else(|| {
-                        json_get_string_opt(
-                            spawn_cfg.as_ref().map(|c| &c.doc),
-                            &["node.router_socket", "router_socket"],
-                        )
+                        json_get_string_opt(spawn_doc, &["node.router_socket", "router_socket"])
                     })
                     .unwrap_or_else(|| "/var/run/fluxbee/routers".to_string()),
             ),
@@ -352,7 +342,7 @@ impl Config {
                 env("UUID_PERSISTENCE_DIR")
                     .or_else(|| {
                         json_get_string_opt(
-                            spawn_cfg.as_ref().map(|c| &c.doc),
+                            spawn_doc,
                             &["node.uuid_persistence_dir", "uuid_persistence_dir"],
                         )
                     })
@@ -360,14 +350,13 @@ impl Config {
             ),
             config_dir: PathBuf::from(
                 env("CONFIG_DIR")
-                    .or_else(|| {
-                        json_get_string_opt(
-                            spawn_cfg.as_ref().map(|c| &c.doc),
-                            &["node.config_dir", "config_dir"],
-                        )
-                    })
+                    .or_else(|| json_get_string_opt(spawn_doc, &["node.config_dir", "config_dir"]))
                     .unwrap_or_else(|| env_config_dir.display().to_string()),
             ),
+            state_dir: env("STATE_DIR")
+                .or_else(|| json_get_string_opt(spawn_doc, &["node.state_dir", "state_dir"]))
+                .map(PathBuf::from)
+                .unwrap_or_else(default_state_dir),
             dev_mode: env_bool("DEV_MODE").unwrap_or(false),
             ttl: env("TTL")
                 .and_then(|v| v.parse().ok())
@@ -378,27 +367,15 @@ impl Config {
             dedup_max_entries: env("DEDUP_MAX_ENTRIES")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50_000),
-            dst_node: env("IO_SLACK_DST_NODE").or_else(|| {
-                json_get_string_opt(
-                    spawn_cfg.as_ref().map(|c| &c.doc),
-                    &["io.dst_node", "dst_node"],
-                )
-            }),
+            dst_node: env("IO_SLACK_DST_NODE")
+                .or_else(|| json_get_string_opt(spawn_doc, &["io.dst_node", "dst_node"])),
             identity_target: env("IDENTITY_TARGET")
-                .or_else(|| {
-                    json_get_string_opt(
-                        spawn_cfg.as_ref().map(|c| &c.doc),
-                        &["identity.target", "identity_target"],
-                    )
-                })
-                .unwrap_or_else(|| format!("SY.identity@{resolved_island_id}")),
+                .or_else(|| json_get_string_opt(spawn_doc, &["identity.target", "identity_target"]))
+                .unwrap_or_else(|| format!("SY.identity@{}", resolved_island_id)),
             identity_timeout_ms: env("IDENTITY_TIMEOUT_MS")
                 .and_then(|v| v.parse().ok())
                 .or_else(|| {
-                    json_get_u64_opt(
-                        spawn_cfg.as_ref().map(|c| &c.doc),
-                        &["identity.timeout_ms", "identity_timeout_ms"],
-                    )
+                    json_get_u64_opt(spawn_doc, &["identity.timeout_ms", "identity_timeout_ms"])
                 })
                 .unwrap_or(10_000),
             slack_session_window_ms: env("SLACK_SESSION_WINDOW_MS")
@@ -433,48 +410,30 @@ struct SpawnConfig {
     doc: Value,
 }
 
-fn load_spawn_config(
-    explicit_path: Option<PathBuf>,
-    node_name: &str,
-    island_id: &str,
-) -> Option<SpawnConfig> {
-    let mut candidates = Vec::new();
-    if let Some(path) = explicit_path {
-        candidates.push(path);
-    }
+fn load_spawn_config(node_name: &str) -> Result<SpawnConfig> {
+    let path = managed_node_config_path(node_name)
+        .map_err(|err| anyhow::anyhow!("failed to resolve managed config path: {err}"))?;
+    let raw = std::fs::read_to_string(&path).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to read managed config file {}: {err}",
+            path.display()
+        )
+    })?;
+    let doc = serde_json::from_str::<Value>(&raw).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to parse managed config JSON {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(SpawnConfig { path, doc })
+}
 
-    // Canonical managed-node paths from SDK helper.
-    if let Ok(path) = managed_node_config_path(node_name) {
-        candidates.push(path);
-    }
-    if !node_name.contains('@') && !island_id.is_empty() {
-        let fq_node_name = format!("{node_name}@{island_id}");
-        if let Ok(path) = managed_node_config_path(&fq_node_name) {
-            candidates.push(path);
-        }
-    }
-
-    for path in candidates {
-        if !path.exists() {
-            continue;
-        }
-        match std::fs::read_to_string(&path) {
-            Ok(raw) => match serde_json::from_str::<Value>(&raw) {
-                Ok(doc) => return Some(SpawnConfig { path, doc }),
-                Err(err) => tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "failed to parse spawn config JSON; ignoring file"
-                ),
-            },
-            Err(err) => tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "failed to read spawn config file; ignoring file"
-            ),
-        }
-    }
-    None
+fn hive_from_node_name(node_name: &str) -> Option<String> {
+    node_name
+        .split_once('@')
+        .map(|(_, hive)| hive.trim())
+        .filter(|hive| !hive.is_empty())
+        .map(ToString::to_string)
 }
 
 fn json_get_string_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<String> {
@@ -530,17 +489,63 @@ fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
 #[derive(Clone)]
 struct SlackClients {
     http: reqwest::Client,
-    slack_app_token: String,
-    slack_bot_token: String,
+    runtime: Arc<RwLock<SlackRuntimeState>>,
+}
+
+#[derive(Debug, Clone)]
+struct SlackRuntimeState {
+    slack_app_token: Option<String>,
+    slack_bot_token: Option<String>,
+    config_generation: u64,
 }
 
 impl SlackClients {
     fn new(config: &Config) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::new(),
-            slack_app_token: config.slack_app_token.clone(),
-            slack_bot_token: config.slack_bot_token.clone(),
+            runtime: Arc::new(RwLock::new(SlackRuntimeState {
+                slack_app_token: config.slack_app_token.clone(),
+                slack_bot_token: config.slack_bot_token.clone(),
+                config_generation: 0,
+            })),
         })
+    }
+
+    async fn config_generation(&self) -> u64 {
+        self.runtime.read().await.config_generation
+    }
+
+    async fn reload_credentials(&self, slack_app_token: String, slack_bot_token: String) {
+        let mut guard = self.runtime.write().await;
+        guard.slack_app_token = Some(slack_app_token);
+        guard.slack_bot_token = Some(slack_bot_token);
+        guard.config_generation = guard.config_generation.wrapping_add(1);
+    }
+
+    async fn slack_app_token(&self) -> Result<String> {
+        self.runtime
+            .read()
+            .await
+            .slack_app_token
+            .clone()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing Slack app token (set via CONFIG_SET slack.app_token/slack.app_token_ref)"
+                )
+            })
+    }
+
+    async fn slack_bot_token(&self) -> Result<String> {
+        self.runtime
+            .read()
+            .await
+            .slack_bot_token
+            .clone()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing Slack bot token (set via CONFIG_SET slack.bot_token/slack.bot_token_ref)"
+                )
+            })
     }
 
     async fn socket_mode_url(&self) -> Result<Url> {
@@ -550,11 +555,12 @@ impl SlackClients {
             url: Option<String>,
             error: Option<String>,
         }
+        let slack_app_token = self.slack_app_token().await?;
 
         let resp: OpenResp = self
             .http
             .post("https://slack.com/api/apps.connections.open")
-            .bearer_auth(&self.slack_app_token)
+            .bearer_auth(slack_app_token)
             .send()
             .await?
             .json()
@@ -596,11 +602,12 @@ impl SlackClients {
             ok: bool,
             error: Option<String>,
         }
+        let slack_bot_token = self.slack_bot_token().await?;
 
         let resp: PostResp = self
             .http
             .post("https://slack.com/api/chat.postMessage")
-            .bearer_auth(&self.slack_bot_token)
+            .bearer_auth(slack_bot_token)
             .json(&body)
             .send()
             .await?
@@ -617,10 +624,11 @@ impl SlackClients {
     }
 
     async fn download_private_file(&self, url: &str) -> Result<Vec<u8>> {
+        let slack_bot_token = self.slack_bot_token().await?;
         let response = self
             .http
             .get(url)
-            .bearer_auth(&self.slack_bot_token)
+            .bearer_auth(slack_bot_token)
             .send()
             .await?;
         let status = response.status();
@@ -660,12 +668,13 @@ impl SlackClients {
         struct SlackResponseMetadata {
             messages: Option<Vec<String>>,
         }
+        let slack_bot_token = self.slack_bot_token().await?;
 
         let length = bytes.len().to_string();
         let get_resp: GetUploadUrlResp = self
             .http
             .post("https://slack.com/api/files.getUploadURLExternal")
-            .bearer_auth(&self.slack_bot_token)
+            .bearer_auth(&slack_bot_token)
             .form(&[("filename", filename), ("length", length.as_str())])
             .send()
             .await?
@@ -717,7 +726,7 @@ impl SlackClients {
         let complete_resp: CompleteUploadResp = self
             .http
             .post("https://slack.com/api/files.completeUploadExternal")
-            .bearer_auth(&self.slack_bot_token)
+            .bearer_auth(slack_bot_token)
             .json(&complete_payload)
             .send()
             .await?
@@ -760,10 +769,23 @@ async fn run_inbound_socket_mode(
     let mention_re = Regex::new(r"^<@[^>]+>\s*")?;
 
     loop {
-        let url = slack.socket_mode_url().await?;
+        let socket_generation = slack.config_generation().await;
+        let url = match slack.socket_mode_url().await {
+            Ok(url) => url,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    config_generation = socket_generation,
+                    "socket mode not ready; waiting for valid slack credentials"
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
         tracing::info!(
             host = url.host_str().unwrap_or(""),
             path = url.path(),
+            config_generation = socket_generation,
             "socket mode connected"
         );
 
@@ -771,6 +793,15 @@ async fn run_inbound_socket_mode(
         let (mut write, mut read) = ws.split();
 
         while let Some(item) = read.next().await {
+            let current_generation = slack.config_generation().await;
+            if current_generation != socket_generation {
+                tracing::info!(
+                    previous_generation = socket_generation,
+                    current_generation,
+                    "slack runtime config changed; reconnecting socket mode"
+                );
+                break;
+            }
             let msg = match item {
                 Ok(m) => m,
                 Err(e) => {
@@ -1505,6 +1536,13 @@ fn slack_external_id(node_name: &str, user_id: &str) -> String {
 
 async fn run_outbound_loop(
     inbox: Arc<Mutex<RouterInbox>>,
+    sender: NodeSender,
+    node_name: String,
+    state_dir: PathBuf,
+    control_plane: Arc<RwLock<IoControlPlaneState>>,
+    control_metrics: Arc<IoControlPlaneMetrics>,
+    adapter_contract: Arc<dyn IoAdapterConfigContract>,
+    inbound: Arc<Mutex<InboundProcessor>>,
     slack: Arc<SlackClients>,
     blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
     blob_payload_cfg: IoTextBlobConfig,
@@ -1530,6 +1568,42 @@ async fn run_outbound_loop(
             payload_type = %payload_type,
             "outbound received from router"
         );
+
+        if let Some(response) = handle_io_control_plane_message(
+            &msg,
+            &node_name,
+            &state_dir,
+            control_plane.clone(),
+            control_metrics.clone(),
+            adapter_contract.as_ref(),
+            inbound.clone(),
+            slack.clone(),
+        )
+        .await
+        {
+            if let Err(err) = sender.send(response).await {
+                tracing::warn!(
+                    error = ?err,
+                    trace_id = %msg.routing.trace_id,
+                    "failed to send CONFIG_RESPONSE"
+                );
+            }
+            continue;
+        }
+
+        if is_control_plane_msg_type(&msg.meta.msg_type)
+            && msg
+                .meta
+                .msg
+                .as_deref()
+                .is_some_and(|m| m.eq_ignore_ascii_case("CONFIG_CHANGED"))
+        {
+            tracing::info!(
+                trace_id = %msg.routing.trace_id,
+                "received CONFIG_CHANGED (informative); runtime apply remains CONFIG_SET-owned"
+            );
+            continue;
+        }
 
         let Some(meta_context) = msg.meta.context.as_ref() else {
             tracing::debug!(
@@ -1673,38 +1747,431 @@ async fn run_outbound_loop(
     }
 }
 
-fn render_outbound_text(payload: &Value) -> String {
-    if let Some(content) = payload.get("content").and_then(|v| v.as_str()) {
-        if !content.trim().is_empty() {
-            return content.to_string();
+async fn handle_io_control_plane_message(
+    msg: &WireMessage,
+    node_name: &str,
+    state_dir: &Path,
+    control_plane: Arc<RwLock<IoControlPlaneState>>,
+    control_metrics: Arc<IoControlPlaneMetrics>,
+    adapter_contract: &dyn IoAdapterConfigContract,
+    inbound: Arc<Mutex<InboundProcessor>>,
+    slack: Arc<SlackClients>,
+) -> Option<fluxbee_sdk::protocol::Message> {
+    let command = msg.meta.msg.as_deref().unwrap_or_default();
+    if !is_control_plane_msg_type(&msg.meta.msg_type) {
+        return None;
+    }
+    if command.eq_ignore_ascii_case("PING") {
+        let state = control_plane.read().await.clone();
+        let payload = serde_json::json!({
+            "ok": true,
+            "node_name": node_name,
+            "state": state.current_state.as_str(),
+        });
+        return Some(build_system_reply(msg, "PONG", payload));
+    }
+    if command.eq_ignore_ascii_case("STATUS") {
+        let state = control_plane.read().await.clone();
+        let metrics = control_metrics.snapshot();
+        let payload = serde_json::json!({
+            "ok": true,
+            "node_name": node_name,
+            "state": state.current_state.as_str(),
+            "config_source": state.config_source.as_str(),
+            "schema_version": state.schema_version,
+            "config_version": state.config_version,
+            "last_error": state.last_error,
+            "metrics": {
+                "control_plane": metrics
+            }
+        });
+        return Some(build_system_reply(msg, "STATUS_RESPONSE", payload));
+    }
+    if !command.eq_ignore_ascii_case("CONFIG_GET") && !command.eq_ignore_ascii_case("CONFIG_SET") {
+        return None;
+    }
+
+    let payload = match parse_and_validate_io_control_plane_request(msg, node_name) {
+        Ok(IoControlPlaneRequest::Get(_)) => {
+            let state = control_plane.read().await.clone();
+            let redacted = redact_state(&state, adapter_contract);
+            log_config_get_served(msg.routing.trace_id.as_str(), node_name, &redacted);
+            let mut payload = build_io_config_get_response_payload(
+                node_name,
+                &redacted,
+                build_io_adapter_contract_payload(
+                    adapter_contract,
+                    state.effective_config.as_ref(),
+                ),
+            );
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "metrics".to_string(),
+                    serde_json::json!({
+                        "control_plane": control_metrics.snapshot()
+                    }),
+                );
+            }
+            payload
+        }
+        Ok(IoControlPlaneRequest::Set(set_payload)) => {
+            apply_io_config_set(
+                &set_payload,
+                node_name,
+                state_dir,
+                control_plane.clone(),
+                control_metrics,
+                adapter_contract,
+                inbound,
+                slack,
+            )
+            .await
+        }
+        Err(err) => {
+            let state = control_plane.read().await.clone();
+            let redacted = redact_state(&state, adapter_contract);
+            let err_text = err.to_string();
+            log_control_plane_request_rejected(
+                msg.routing.trace_id.as_str(),
+                node_name,
+                err.code(),
+                err_text.as_str(),
+            );
+            build_io_config_set_error_payload(node_name, &redacted, err.code(), err_text)
+        }
+    };
+
+    Some(build_io_config_response_message(msg, payload))
+}
+
+fn is_control_plane_msg_type(msg_type: &str) -> bool {
+    msg_type.eq_ignore_ascii_case(SYSTEM_KIND) || msg_type.eq_ignore_ascii_case("admin")
+}
+
+async fn apply_io_config_set(
+    payload: &fluxbee_sdk::node_config::NodeConfigSetPayload,
+    node_name: &str,
+    state_dir: &Path,
+    control_plane: Arc<RwLock<IoControlPlaneState>>,
+    control_metrics: Arc<IoControlPlaneMetrics>,
+    adapter_contract: &dyn IoAdapterConfigContract,
+    inbound: Arc<Mutex<InboundProcessor>>,
+    slack: Arc<SlackClients>,
+) -> Value {
+    let mut state = control_plane.write().await;
+
+    if let Err(err) = ensure_config_version_advances(payload.config_version, state.config_version) {
+        log_config_set_stale_rejected(node_name, payload.config_version, state.config_version);
+        control_metrics.record_config_set_error(
+            state.current_state.as_str(),
+            state.config_version,
+            err.code(),
+        );
+        let redacted = redact_state(&state, adapter_contract);
+        return build_io_config_set_error_payload(
+            node_name,
+            &redacted,
+            err.code(),
+            err.to_string(),
+        );
+    }
+
+    let effective = match apply_adapter_config_replace(adapter_contract, &payload.config) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            state.current_state = IoNodeLifecycleState::FailedConfig;
+            state.last_error = Some(IoControlPlaneErrorInfo {
+                code: err.code().to_string(),
+                message: err.to_string(),
+            });
+            let redacted = redact_state(&state, adapter_contract);
+            return build_io_config_set_error_payload(
+                node_name,
+                &redacted,
+                err.code(),
+                err.to_string(),
+            );
+        }
+    };
+
+    let previous_effective = state.effective_config.clone();
+    let mut apply_hot = Vec::<String>::new();
+    let mut apply_reinit = Vec::<String>::new();
+    let mut apply_restart_required = Vec::<String>::new();
+
+    if section_changed(previous_effective.as_ref(), &effective, &["identity"]) {
+        apply_restart_required.push("identity.*".to_string());
+    }
+    if section_changed(previous_effective.as_ref(), &effective, &["io", "blob"]) {
+        apply_restart_required.push("io.blob.*".to_string());
+    }
+    if section_changed(previous_effective.as_ref(), &effective, &["node"]) {
+        apply_restart_required.push("node.*".to_string());
+    }
+    if section_changed(previous_effective.as_ref(), &effective, &["runtime"]) {
+        apply_restart_required.push("runtime.*".to_string());
+    }
+
+    let app_and_bot = if slack_credentials_changed(previous_effective.as_ref(), &effective) {
+        match extract_runtime_slack_credentials(&effective) {
+            Ok(pair) => Some(pair),
+            Err(err) => {
+                let err_text = err.to_string();
+                log_config_set_invalid_runtime_credentials(
+                    node_name,
+                    payload.config_version,
+                    err_text.as_str(),
+                );
+                state.current_state = IoNodeLifecycleState::FailedConfig;
+                state.last_error = Some(IoControlPlaneErrorInfo {
+                    code: "invalid_config".to_string(),
+                    message: err_text.clone(),
+                });
+                control_metrics.record_config_set_error(
+                    state.current_state.as_str(),
+                    payload.config_version,
+                    "invalid_config",
+                );
+                let redacted = redact_state(&state, adapter_contract);
+                return build_io_config_set_error_payload(
+                    node_name,
+                    &redacted,
+                    "invalid_config",
+                    err_text,
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    state.current_state = IoNodeLifecycleState::Configured;
+    state.config_source = IoConfigSource::Dynamic;
+    state.schema_version = payload.schema_version;
+    state.config_version = payload.config_version;
+    state.effective_config = Some(effective.clone());
+    state.last_error = None;
+
+    if let Err(err) = persist_io_control_plane_state(state_dir, node_name, &state) {
+        let err_text = err.to_string();
+        log_config_set_persist_error(
+            node_name,
+            payload.schema_version,
+            payload.config_version,
+            err_text.as_str(),
+        );
+        state.current_state = IoNodeLifecycleState::FailedConfig;
+        state.last_error = Some(IoControlPlaneErrorInfo {
+            code: "config_persist_error".to_string(),
+            message: err_text.clone(),
+        });
+        control_metrics.record_config_set_error(
+            state.current_state.as_str(),
+            payload.config_version,
+            "config_persist_error",
+        );
+        let redacted = redact_state(&state, adapter_contract);
+        return build_io_config_set_error_payload(
+            node_name,
+            &redacted,
+            "config_persist_error",
+            err_text,
+        );
+    }
+
+    if extract_runtime_dst_node(previous_effective.as_ref())
+        != extract_runtime_dst_node(Some(&effective))
+    {
+        if let Some(dst_node) = extract_runtime_dst_node(Some(&effective)) {
+            inbound.lock().await.set_dst_node(Some(dst_node));
+            apply_hot.push("io.dst_node".to_string());
         }
     }
 
-    let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    if payload_type.eq_ignore_ascii_case("error") {
-        let message = payload
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let code = payload.get("code").and_then(|v| v.as_str()).unwrap_or("");
-        if !message.trim().is_empty() && !code.trim().is_empty() {
-            return format!("Error ({code}): {message}");
-        }
-        if !message.trim().is_empty() {
-            return format!("Error: {message}");
-        }
-        if !code.trim().is_empty() {
-            return format!("Error: {code}");
+    if let Some((app_token, bot_token)) = app_and_bot {
+        slack.reload_credentials(app_token, bot_token).await;
+        apply_reinit.push("slack.credentials".to_string());
+    }
+    control_metrics.record_config_set_ok(state.current_state.as_str(), state.config_version);
+
+    log_config_set_applied(
+        node_name,
+        payload.schema_version,
+        payload.config_version,
+        &apply_hot,
+        &apply_reinit,
+        &apply_restart_required,
+    );
+
+    let redacted = redact_state(&state, adapter_contract);
+    let mut response = build_io_config_set_ok_payload(node_name, &redacted);
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert(
+            "apply".to_string(),
+            serde_json::json!({
+                "mode": "hot_reload",
+                "hot_applied": apply_hot,
+                "reinit_performed": apply_reinit,
+                "restart_required": apply_restart_required
+            }),
+        );
+    }
+    response
+}
+
+fn extract_runtime_dst_node(effective_config: Option<&Value>) -> Option<String> {
+    effective_config
+        .and_then(|cfg| cfg.get("io"))
+        .and_then(|io| io.get("dst_node"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+}
+
+fn section_changed(
+    previous_effective: Option<&Value>,
+    current_effective: &Value,
+    path: &[&str],
+) -> bool {
+    value_at_path(previous_effective, path) != value_at_path(Some(current_effective), path)
+}
+
+fn value_at_path<'a>(root: Option<&'a Value>, path: &[&str]) -> Option<&'a Value> {
+    let mut current = root?;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    Some(current)
+}
+
+fn slack_credentials_changed(
+    previous_effective: Option<&Value>,
+    current_effective: &Value,
+) -> bool {
+    let app_prev = extract_slack_credential_marker(previous_effective, true);
+    let app_curr = extract_slack_credential_marker(Some(current_effective), true);
+    let bot_prev = extract_slack_credential_marker(previous_effective, false);
+    let bot_curr = extract_slack_credential_marker(Some(current_effective), false);
+    app_prev != app_curr || bot_prev != bot_curr
+}
+
+fn extract_slack_credential_marker(effective_config: Option<&Value>, app: bool) -> Option<String> {
+    let slack = effective_config
+        .and_then(|cfg| cfg.get("slack"))
+        .and_then(Value::as_object)?;
+    let (inline_keys, ref_keys) = if app {
+        (
+            ["app_token", "slack_app_token"],
+            ["app_token_ref", "slack_app_token_ref"],
+        )
+    } else {
+        (
+            ["bot_token", "slack_bot_token"],
+            ["bot_token_ref", "slack_bot_token_ref"],
+        )
+    };
+    for key in inline_keys {
+        let Some(value) = slack.get(key).and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if !value.is_empty() {
+            return Some(format!("inline:{value}"));
         }
     }
-
-    if let Some(message) = payload.get("message").and_then(|v| v.as_str()) {
-        if !message.trim().is_empty() {
-            return message.to_string();
+    for key in ref_keys {
+        let Some(value) = slack.get(key).and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if !value.is_empty() {
+            return Some(format!("ref:{value}"));
         }
     }
+    None
+}
 
-    String::new()
+fn extract_runtime_slack_credentials(effective_config: &Value) -> Result<(String, String)> {
+    let slack = effective_config
+        .get("slack")
+        .ok_or_else(|| anyhow::anyhow!("missing config.slack object"))?;
+    let app_token = resolve_secret_from_config_value(
+        slack,
+        &["app_token", "slack_app_token"],
+        &["app_token_ref", "slack_app_token_ref"],
+    )
+    .ok_or_else(|| anyhow::anyhow!("missing usable Slack app credential in config.slack"))?;
+    let bot_token = resolve_secret_from_config_value(
+        slack,
+        &["bot_token", "slack_bot_token"],
+        &["bot_token_ref", "slack_bot_token_ref"],
+    )
+    .ok_or_else(|| anyhow::anyhow!("missing usable Slack bot credential in config.slack"))?;
+    Ok((app_token, bot_token))
+}
+
+fn resolve_secret_from_config_value(
+    root: &Value,
+    value_keys: &[&str],
+    ref_keys: &[&str],
+) -> Option<String> {
+    for key in value_keys {
+        let Some(value) = root.get(*key).and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    for key in ref_keys {
+        let Some(reference) = root.get(*key).and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if let Some(var) = reference.strip_prefix("env:") {
+            if let Some(resolved) = env(var) {
+                return Some(resolved);
+            }
+        }
+    }
+    None
+}
+
+fn redact_state(
+    state: &IoControlPlaneState,
+    adapter_contract: &dyn IoAdapterConfigContract,
+) -> IoControlPlaneState {
+    let mut redacted = state.clone();
+    redacted.effective_config = state
+        .effective_config
+        .as_ref()
+        .map(|cfg| adapter_contract.redact_effective_config(cfg));
+    redacted
+}
+
+fn build_system_reply(incoming: &WireMessage, response_msg: &str, payload: Value) -> WireMessage {
+    let dst = if incoming.routing.src.trim().is_empty() {
+        Destination::Broadcast
+    } else {
+        Destination::Unicast(incoming.routing.src.clone())
+    };
+    WireMessage {
+        routing: Routing {
+            src: String::new(),
+            dst,
+            ttl: incoming.routing.ttl.max(1),
+            trace_id: incoming.routing.trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(response_msg.to_string()),
+            src_ilk: incoming.meta.src_ilk.clone(),
+            scope: incoming.meta.scope.clone(),
+            target: incoming.meta.target.clone(),
+            action: Some(response_msg.to_string()),
+            priority: incoming.meta.priority.clone(),
+            context: incoming.meta.context.clone(),
+        },
+        payload,
+    }
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {

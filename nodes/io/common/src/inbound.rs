@@ -79,6 +79,10 @@ impl InboundProcessor {
         self.stats
     }
 
+    pub fn set_dst_node(&mut self, dst_node: Option<String>) {
+        self.dst_node = dst_node;
+    }
+
     pub async fn process_inbound(
         &mut self,
         identity: &dyn IdentityResolver,
@@ -95,37 +99,38 @@ impl InboundProcessor {
         self.stats.dedup_misses += 1;
 
         let trace_id = new_trace_id();
-        let mut src_ilk = match identity.lookup(&identity_input.channel, &identity_input.external_id) {
-            Ok(Some(src_ilk)) => {
-                self.stats.identity_lookup_hits += 1;
-                tracing::debug!(
-                    channel = %identity_input.channel,
-                    external_id = %identity_input.external_id,
-                    src_ilk = %src_ilk,
-                    "identity lookup hit"
-                );
-                Some(src_ilk)
-            }
-            Ok(None) => {
-                self.stats.identity_lookup_misses += 1;
-                tracing::debug!(
-                    channel = %identity_input.channel,
-                    external_id = %identity_input.external_id,
-                    "identity lookup miss"
-                );
-                None
-            }
-            Err(error) => {
-                self.stats.identity_lookup_errors += 1;
-                tracing::warn!(
-                    ?error,
-                    channel = %identity_input.channel,
-                    external_id = %identity_input.external_id,
-                    "identity lookup error; treating as miss"
-                );
-                None
-            }
-        };
+        let mut src_ilk =
+            match identity.lookup(&identity_input.channel, &identity_input.external_id) {
+                Ok(Some(src_ilk)) => {
+                    self.stats.identity_lookup_hits += 1;
+                    tracing::debug!(
+                        channel = %identity_input.channel,
+                        external_id = %identity_input.external_id,
+                        src_ilk = %src_ilk,
+                        "identity lookup hit"
+                    );
+                    Some(src_ilk)
+                }
+                Ok(None) => {
+                    self.stats.identity_lookup_misses += 1;
+                    tracing::debug!(
+                        channel = %identity_input.channel,
+                        external_id = %identity_input.external_id,
+                        "identity lookup miss"
+                    );
+                    None
+                }
+                Err(error) => {
+                    self.stats.identity_lookup_errors += 1;
+                    tracing::warn!(
+                        ?error,
+                        channel = %identity_input.channel,
+                        external_id = %identity_input.external_id,
+                        "identity lookup error; treating as miss"
+                    );
+                    None
+                }
+            };
 
         if src_ilk.is_none() && self.provision_on_miss {
             if let Some(provisioner) = provisioner {
@@ -202,17 +207,17 @@ mod tests {
             self
         }
 
-        fn lookup(&self, _channel: &str, _external_id: &str) -> Result<Option<String>, IdentityError> {
+        fn lookup(
+            &self,
+            _channel: &str,
+            _external_id: &str,
+        ) -> Result<Option<String>, IdentityError> {
             Ok(None)
         }
     }
 
     fn assert_no_legacy_context_src_ilk(msg: &fluxbee_sdk::protocol::Message) {
-        let legacy = msg
-            .meta
-            .context
-            .as_ref()
-            .and_then(|ctx| ctx.get("src_ilk"));
+        let legacy = msg.meta.context.as_ref().and_then(|ctx| ctx.get("src_ilk"));
         assert!(
             legacy.is_none(),
             "legacy meta.context.src_ilk should not be present"
@@ -347,14 +352,8 @@ mod tests {
             .cloned()
             .expect("missing meta.context.io.reply_target");
 
-        assert_eq!(
-            rt.get("kind").and_then(|v| v.as_str()),
-            Some("slack_post")
-        );
-        assert_eq!(
-            rt.get("address").and_then(|v| v.as_str()),
-            Some("C789")
-        );
+        assert_eq!(rt.get("kind").and_then(|v| v.as_str()), Some("slack_post"));
+        assert_eq!(rt.get("address").and_then(|v| v.as_str()), Some("C789"));
         assert_eq!(
             rt.get("params")
                 .and_then(|v| v.get("thread_ts"))
@@ -373,7 +372,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IdentityProvisioner for AlwaysProvision {
-        async fn provision(&self, _input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
+        async fn provision(
+            &self,
+            _input: &ResolveOrCreateInput,
+        ) -> Result<Option<String>, IdentityError> {
             Ok(Some("ilk:provisional:test".to_string()))
         }
     }
@@ -382,7 +384,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IdentityProvisioner for AlwaysProvisionError {
-        async fn provision(&self, _input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
+        async fn provision(
+            &self,
+            _input: &ResolveOrCreateInput,
+        ) -> Result<Option<String>, IdentityError> {
             Err(IdentityError::Unavailable)
         }
     }
@@ -394,7 +399,11 @@ mod tests {
             self
         }
 
-        fn lookup(&self, _channel: &str, _external_id: &str) -> Result<Option<String>, IdentityError> {
+        fn lookup(
+            &self,
+            _channel: &str,
+            _external_id: &str,
+        ) -> Result<Option<String>, IdentityError> {
             Ok(Some("ilk:hit:test".to_string()))
         }
     }
@@ -405,7 +414,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IdentityProvisioner for CountingProvisioner {
-        async fn provision(&self, _input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
+        async fn provision(
+            &self,
+            _input: &ResolveOrCreateInput,
+        ) -> Result<Option<String>, IdentityError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Some("ilk:should-not-be-used".to_string()))
         }
