@@ -81,6 +81,14 @@ impl RouterReader {
     pub async fn read_timeout(&mut self, timeout: Duration) -> Result<Message> {
         Ok(self.receiver.recv_timeout(timeout).await?)
     }
+
+    pub fn is_connected(&self) -> bool {
+        self.receiver.is_connected()
+    }
+
+    pub async fn wait_connected(&self) {
+        self.receiver.wait_connected().await;
+    }
 }
 
 impl RouterWriter {

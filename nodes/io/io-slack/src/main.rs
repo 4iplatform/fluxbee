@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
-use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::protocol::{
+    Destination, Message as WireMessage, Meta, Routing, ADMIN_KIND, SYSTEM_KIND,
+};
 use fluxbee_sdk::{
     connect, managed_node_config_path, NodeConfig, NodeSender, NodeUuidMode, FLUXBEE_NODE_NAME_ENV,
 };
@@ -1591,7 +1593,7 @@ async fn run_outbound_loop(
             continue;
         }
 
-        if msg.meta.msg_type.eq_ignore_ascii_case("system")
+        if is_control_plane_msg_type(&msg.meta.msg_type)
             && msg
                 .meta
                 .msg
@@ -1758,7 +1760,7 @@ async fn handle_io_control_plane_message(
     slack: Arc<SlackClients>,
 ) -> Option<fluxbee_sdk::protocol::Message> {
     let command = msg.meta.msg.as_deref().unwrap_or_default();
-    if !msg.meta.msg_type.eq_ignore_ascii_case("system") {
+    if !is_control_plane_msg_type(&msg.meta.msg_type) {
         return None;
     }
     if command.eq_ignore_ascii_case("PING") {
@@ -1842,6 +1844,10 @@ async fn handle_io_control_plane_message(
     };
 
     Some(build_io_config_response_message(msg, payload))
+}
+
+fn is_control_plane_msg_type(msg_type: &str) -> bool {
+    msg_type.eq_ignore_ascii_case(SYSTEM_KIND) || msg_type.eq_ignore_ascii_case(ADMIN_KIND)
 }
 
 async fn apply_io_config_set(
