@@ -61,6 +61,98 @@ Checklist operativo para cerrar SY.orchestrator segun:
 - Para evitar ruido de runs viejos en `journalctl`, filtrar por ventana temporal:
   - `journalctl -u sy-orchestrator --since "YYYY-MM-DD HH:MM:SS" --no-pager`
 
+## TODO - Runtime materialization + `sync_pending` global (core)
+
+Contexto del problema:
+- `publish` local de un runtime nuevo materializa carpeta y `bin/start.sh`.
+- `SYSTEM_UPDATE category=runtime` puede devolver `sync_pending` por faltantes de runtimes no relacionados.
+- `spawn` posterior termina en `RUNTIME_NOT_PRESENT`.
+- En algunos casos se observa desaparición/poda del runtime recién publicado durante la ventana de no convergencia.
+
+Lectura técnica actual:
+- `apply_system_update_local(..., "runtime")` hoy mezcla:
+  - retención de artifacts,
+  - validación de presencia,
+  - y decisión de convergencia.
+- `verify_runtime_current_artifacts(...)` valida el manifest runtime global, no solo el runtime/version objetivo.
+- `runtime_verify_and_retain` puede operar con manifest cacheado en memoria.
+- Esto deja acoplados tres problemas:
+  - readiness global,
+  - retención destructiva,
+  - y deploy puntual de runtime.
+
+Objetivo:
+- permitir deploy y validación confiable de un runtime puntual sin bloquearlo por faltantes ajenos,
+- evitar poda/desmaterialización prematura,
+- y hacer observable el estado real de materialización por `runtime/version`.
+
+### Fase R1 - Triage reproducible y evidencia
+- [ ] R1-T1. Capturar correlación temporal completa para un caso reproducible:
+  - fin de `publish`,
+  - primer `SYSTEM_UPDATE sync_pending`,
+  - primer `missing directory`,
+  - `spawn_failed` con `RUNTIME_NOT_PRESENT`.
+- [ ] R1-T2. Guardar payloads completos de `SYSTEM_UPDATE` en varios retries, incluyendo `payload.errors[]`.
+- [ ] R1-T3. Guardar snapshot de `/var/lib/fluxbee/dist/runtimes/manifest.json`:
+  - antes de `publish`,
+  - después de `publish`,
+  - después del primer `sync_pending`.
+- [ ] R1-T4. Verificar en paralelo existencia de:
+  - `/var/lib/fluxbee/dist/runtimes/<runtime>/<version>/bin/start.sh`
+  - durante los retries de `SYSTEM_UPDATE`.
+- [ ] R1-T5. Confirmar si el manifest en memoria de `SY.orchestrator` queda stale respecto del manifest en disco tras `publish`.
+
+### Fase R2 - Corrección de fuente de verdad del manifest
+- [ ] R2-T1. Revisar todos los caminos que leen `state.runtime_manifest` y clasificar cuáles pueden usar cache y cuáles deben recargar desde disco.
+- [x] R2-T2. Cambiar `runtime_verify_and_retain` para no usar manifest stale como fuente preferida.
+- [ ] R2-T3. Definir estrategia explícita de invalidación/refresh del cache runtime manifest cuando `publish` o `SYSTEM_UPDATE` cambian el estado local.
+- [x] R2-T4. Agregar logs de diagnóstico cuando se detecte divergencia entre manifest en memoria y manifest en disco.
+
+### Fase R3 - Separar readiness puntual vs consistencia global
+- [x] R3-T1. Introducir validación por alcance para `SYSTEM_UPDATE category=runtime`:
+  - `runtime`
+  - `version`
+  - opcionalmente `target_hives`
+- [x] R3-T2. Hacer que el update puntual no falle ni quede en `sync_pending` por faltantes de `AI.*` / `IO.*` / `WF.*` ajenos al runtime solicitado.
+- [ ] R3-T3. Mantener una validación global aparte para salud general del sistema, sin usarla como bloqueo duro del deploy puntual.
+- [ ] R3-T4. Documentar la semántica nueva:
+  - `targeted readiness`
+  - vs `global runtime health`
+
+### Fase R4 - Retención segura y no destructiva
+- [x] R4-T1. Evitar `apply_runtime_retention` destructivo antes de validar convergencia del runtime objetivo.
+- [x] R4-T2. Si el sistema está en `sync_pending`, usar modo de retención no destructivo o diferir la poda.
+- [ ] R4-T3. Garantizar que un runtime recién publicado y materializado no pueda ser podado durante la misma ventana en la que todavía se está verificando.
+- [ ] R4-T4. Agregar evidencia explícita en logs cuando un runtime/version quede retenido por protección de convergencia.
+
+### Fase R5 - Materialization state explícito
+- [ ] R5-T1. Exponer estado de materialización local por `runtime/version`:
+  - directorio presente,
+  - `start.sh` presente,
+  - hash/manifest esperado,
+  - timestamp de última verificación.
+- [ ] R5-T2. Hacer que `spawn` pueda consultar ese estado previo y reportar mejor causa raíz cuando el runtime no está materializado.
+- [ ] R5-T3. Evaluar endpoint/admin payload para consultar materialización sin depender de inferencia indirecta desde `SYSTEM_UPDATE`.
+
+### Fase R6 - E2E y criterio de cierre
+- [ ] R6-T1. Caso E2E positivo:
+  - `publish` runtime nuevo,
+  - `SYSTEM_UPDATE` puntual,
+  - `spawn`,
+  - ejecución correcta.
+- [ ] R6-T2. Caso E2E negativo:
+  - faltantes globales en otros runtimes,
+  - deploy puntual igual debe converger si el artifact objetivo está materializado.
+- [ ] R6-T3. Caso E2E de no-regresión:
+  - watchdog/retry/retention no deben borrar el runtime recién publicado durante la ventana de verificación.
+- [ ] R6-T4. Cerrar workaround operativo actual (`reusar 0.1.0 y pisar binario`) una vez que el flujo puntual quede estable.
+
+### Criterio de salida de este TODO
+- [ ] Un runtime nuevo puede publicarse, verificarse y spawnearse sin quedar bloqueado por faltantes globales no relacionados.
+- [ ] `SY.orchestrator` no poda artifacts de runtime durante estados no convergentes.
+- [ ] Existe una fuente de verdad coherente para manifest runtime entre disco y memoria.
+- [ ] El estado de materialización por `runtime/version` es visible y utilizable operativamente.
+
 ## TODO - Versionado y propagacion de software (infra)
 
 Objetivo:

@@ -392,6 +392,15 @@ struct PersistedManagedNode {
     relaunch_on_boot: bool,
 }
 
+#[derive(Debug, Clone)]
+struct SystemUpdateRequest {
+    category: String,
+    manifest_version: u64,
+    manifest_hash: String,
+    runtime: Option<String>,
+    runtime_version: Option<String>,
+}
+
 const MOTHERBEE_CRITICAL_SERVICES: [&str; 8] = [
     "rt-gateway",
     "sy-config-routes",
@@ -1675,7 +1684,7 @@ fn local_system_manifest_state(
 
 fn parse_system_update_payload(
     payload: &serde_json::Value,
-) -> Result<(String, u64, String), OrchestratorError> {
+) -> Result<SystemUpdateRequest, OrchestratorError> {
     if payload.get("version").is_some() {
         return Err("legacy field 'version' is not supported; use 'manifest_version'".into());
     }
@@ -1706,7 +1715,43 @@ fn parse_system_update_payload(
         .ok_or("missing manifest_hash")?
         .to_string();
 
-    Ok((category, manifest_version, manifest_hash))
+    let runtime = payload
+        .get("runtime")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let runtime_version = payload
+        .get("runtime_version")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    if category != "runtime" && (runtime.is_some() || runtime_version.is_some()) {
+        return Err("runtime/runtime_version scope is only supported for category=runtime".into());
+    }
+    if runtime_version.is_some() && runtime.is_none() {
+        return Err("runtime_version requires runtime".into());
+    }
+    if let Some(runtime) = runtime.as_deref() {
+        if !valid_token(runtime) {
+            return Err("invalid runtime".into());
+        }
+    }
+    if let Some(runtime_version) = runtime_version.as_deref() {
+        if runtime_version != "current" && !valid_token(runtime_version) {
+            return Err("invalid runtime_version".into());
+        }
+    }
+
+    Ok(SystemUpdateRequest {
+        category,
+        manifest_version,
+        manifest_hash,
+        runtime,
+        runtime_version,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -2118,18 +2163,22 @@ fn rollback_local_core_binaries(
 
 async fn apply_system_update_local(
     state: &OrchestratorState,
-    category: &str,
+    request: &SystemUpdateRequest,
 ) -> Result<SystemUpdateApplyResult, OrchestratorError> {
     let _lifecycle_guard = state.runtime_lifecycle_lock.lock().await;
-    match category {
+    match request.category.as_str() {
         "runtime" => {
             let manifest =
                 load_runtime_manifest_result()?.ok_or("runtime manifest missing locally")?;
-            apply_runtime_retention(&manifest)?;
-            let artifact_errors = verify_runtime_current_artifacts(&manifest)?;
+            let artifact_errors = verify_runtime_artifacts_for_scope(
+                &manifest,
+                Path::new(DIST_RUNTIME_ROOT_DIR),
+                request.runtime.as_deref(),
+                request.runtime_version.as_deref(),
+            )?;
             {
                 let mut guard = state.runtime_manifest.lock().await;
-                *guard = Some(manifest);
+                *guard = Some(manifest.clone());
             }
             if !artifact_errors.is_empty() {
                 return Ok(SystemUpdateApplyResult {
@@ -2140,6 +2189,7 @@ async fn apply_system_update_local(
                     errors: artifact_errors,
                 });
             }
+            apply_runtime_retention(&manifest)?;
             Ok(SystemUpdateApplyResult {
                 status: "ok".to_string(),
                 updated: Vec::new(),
@@ -2257,18 +2307,20 @@ async fn handle_system_update_message(
     state: &OrchestratorState,
     msg: &Message,
 ) -> serde_json::Value {
-    let (category, expected_version, expected_hash) =
-        match parse_system_update_payload(&msg.payload) {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": "MANIFEST_INVALID",
-                    "message": err.to_string(),
-                    "category": msg.payload.get("category").and_then(|v| v.as_str()).unwrap_or(""),
-                });
-            }
-        };
+    let request = match parse_system_update_payload(&msg.payload) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "MANIFEST_INVALID",
+                "message": err.to_string(),
+                "category": msg.payload.get("category").and_then(|v| v.as_str()).unwrap_or(""),
+            });
+        }
+    };
+    let category = request.category.as_str();
+    let expected_version = request.manifest_version;
+    let expected_hash = request.manifest_hash.as_str();
 
     let local = match local_system_manifest_state(&category) {
         Ok(value) => value,
@@ -2301,6 +2353,8 @@ async fn handle_system_update_message(
                     "manifest_version": expected_version,
                     "local_manifest_version": local.version,
                     "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
+                    "runtime": request.runtime.clone(),
+                    "runtime_version": request.runtime_version.clone(),
                     "errors": [],
                 });
             }
@@ -2312,6 +2366,8 @@ async fn handle_system_update_message(
                     "manifest_version": expected_version,
                     "local_manifest_version": local.version,
                     "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
+                    "runtime": request.runtime.clone(),
+                    "runtime_version": request.runtime_version.clone(),
                     "errors": [],
                     "message": "Local manifest version is behind expected. Sync channel may still be propagating.",
                 });
@@ -2333,12 +2389,14 @@ async fn handle_system_update_message(
             "manifest_version": expected_version,
             "local_manifest_version": local.version,
             "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
+            "runtime": request.runtime.clone(),
+            "runtime_version": request.runtime_version.clone(),
             "errors": [],
             "message": "Local manifest does not match expected. Sync channel may still be propagating.",
         });
     }
 
-    match apply_system_update_local(state, &category).await {
+    match apply_system_update_local(state, &request).await {
         Ok(result) => serde_json::json!({
             "status": result.status,
             "category": category,
@@ -2346,6 +2404,8 @@ async fn handle_system_update_message(
             "manifest_version": expected_version,
             "local_manifest_version": local.version,
             "local_manifest_hash": local_hash,
+            "runtime": request.runtime.clone(),
+            "runtime_version": request.runtime_version.clone(),
             "updated": result.updated,
             "unchanged": result.unchanged,
             "restarted": result.restarted,
@@ -2360,6 +2420,8 @@ async fn handle_system_update_message(
             "manifest_version": expected_version,
             "local_manifest_version": local.version,
             "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
+            "runtime": request.runtime.clone(),
+            "runtime_version": request.runtime_version.clone(),
             "updated": [],
             "unchanged": [],
             "restarted": [],
@@ -7127,139 +7189,185 @@ fn persisted_runtime_keep_versions_with_root(
 fn verify_runtime_current_artifacts(
     manifest: &RuntimeManifest,
 ) -> Result<Vec<String>, OrchestratorError> {
-    verify_runtime_current_artifacts_with_root(manifest, Path::new(DIST_RUNTIME_ROOT_DIR))
+    verify_runtime_artifacts_for_scope(manifest, Path::new(DIST_RUNTIME_ROOT_DIR), None, None)
+}
+
+fn verify_runtime_artifact_entry(
+    runtime: &str,
+    entry: &RuntimeManifestEntry,
+    version: &str,
+    runtimes: &BTreeMap<String, RuntimeManifestEntry>,
+    runtimes_root: &Path,
+    errors: &mut Vec<String>,
+) -> Result<(), OrchestratorError> {
+    if version.is_empty() {
+        return Ok(());
+    }
+    if !valid_token(version) {
+        return Err(format!("runtime manifest invalid current version '{}'", version).into());
+    }
+
+    let package_dir = runtimes_root.join(runtime).join(version);
+    if !package_dir.is_dir() {
+        errors.push(format!(
+            "runtime package missing directory runtime='{}' version='{}' path='{}'",
+            runtime,
+            version,
+            package_dir.display()
+        ));
+        return Ok(());
+    }
+
+    match runtime_package_type(entry) {
+        "full_runtime" => {
+            let start_script = package_dir.join("bin/start.sh");
+            if !start_script.is_file() {
+                errors.push(format!(
+                    "runtime artifact missing start.sh runtime='{}' version='{}' path='{}'",
+                    runtime,
+                    version,
+                    start_script.display()
+                ));
+                return Ok(());
+            }
+            if !local_runtime_script_is_executable(&start_script) {
+                errors.push(format!(
+                    "runtime artifact start.sh is not executable runtime='{}' version='{}' path='{}'",
+                    runtime,
+                    version,
+                    start_script.display()
+                ));
+            }
+        }
+        "config_only" | "workflow" => {
+            let base_runtime = entry
+                .runtime_base
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let Some(base_runtime) = base_runtime else {
+                errors.push(format!(
+                    "runtime package missing runtime_base runtime='{}' version='{}' type='{}'",
+                    runtime,
+                    version,
+                    runtime_package_type(entry)
+                ));
+                return Ok(());
+            };
+            if !valid_token(base_runtime) {
+                errors.push(format!(
+                    "runtime package invalid runtime_base runtime='{}' version='{}' type='{}' runtime_base='{}'",
+                    runtime,
+                    version,
+                    runtime_package_type(entry),
+                    base_runtime
+                ));
+                return Ok(());
+            }
+            let Some(base_entry) = runtimes.get(base_runtime) else {
+                errors.push(format!(
+                    "runtime package runtime_base not available runtime='{}' version='{}' type='{}' runtime_base='{}'",
+                    runtime,
+                    version,
+                    runtime_package_type(entry),
+                    base_runtime
+                ));
+                return Ok(());
+            };
+            let base_version = base_entry.current.as_deref().map(str::trim).unwrap_or("");
+            if base_version.is_empty() || !valid_token(base_version) {
+                errors.push(format!(
+                    "runtime package runtime_base has invalid current version runtime='{}' version='{}' type='{}' runtime_base='{}' base_version='{}'",
+                    runtime,
+                    version,
+                    runtime_package_type(entry),
+                    base_runtime,
+                    base_version
+                ));
+                return Ok(());
+            }
+
+            let base_start = runtimes_root
+                .join(base_runtime)
+                .join(base_version)
+                .join("bin/start.sh");
+            if !base_start.is_file() {
+                errors.push(format!(
+                    "runtime artifact missing base start.sh runtime='{}' version='{}' runtime_base='{}' base_version='{}' path='{}'",
+                    runtime,
+                    version,
+                    base_runtime,
+                    base_version,
+                    base_start.display()
+                ));
+                return Ok(());
+            }
+            if !local_runtime_script_is_executable(&base_start) {
+                errors.push(format!(
+                    "runtime artifact base start.sh is not executable runtime='{}' version='{}' runtime_base='{}' base_version='{}' path='{}'",
+                    runtime,
+                    version,
+                    base_runtime,
+                    base_version,
+                    base_start.display()
+                ));
+            }
+        }
+        other => {
+            errors.push(format!(
+                "runtime package unknown type runtime='{}' version='{}' type='{}'",
+                runtime, version, other
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn verify_runtime_artifacts_for_scope(
+    manifest: &RuntimeManifest,
+    runtimes_root: &Path,
+    runtime_filter: Option<&str>,
+    runtime_version_filter: Option<&str>,
+) -> Result<Vec<String>, OrchestratorError> {
+    let runtimes = runtime_manifest_entry_map(manifest)?;
+    let mut errors = Vec::new();
+    if let Some(runtime_filter) = runtime_filter {
+        let runtime_key = resolve_runtime_key(manifest, runtime_filter)?;
+        let requested_version = runtime_version_filter.unwrap_or("current");
+        let resolved_version = resolve_runtime_version(manifest, &runtime_key, requested_version)?;
+        let entry = runtimes
+            .get(&runtime_key)
+            .ok_or_else(|| format!("runtime '{}' not found in manifest", runtime_key))?;
+        verify_runtime_artifact_entry(
+            &runtime_key,
+            entry,
+            &resolved_version,
+            &runtimes,
+            runtimes_root,
+            &mut errors,
+        )?;
+    } else {
+        for (runtime, entry) in &runtimes {
+            let version = entry.current.as_deref().map(str::trim).unwrap_or("");
+            verify_runtime_artifact_entry(
+                runtime,
+                entry,
+                version,
+                &runtimes,
+                runtimes_root,
+                &mut errors,
+            )?;
+        }
+    }
+    Ok(errors)
 }
 
 fn verify_runtime_current_artifacts_with_root(
     manifest: &RuntimeManifest,
     runtimes_root: &Path,
 ) -> Result<Vec<String>, OrchestratorError> {
-    let runtimes = runtime_manifest_entry_map(manifest)?;
-    let mut errors = Vec::new();
-    for (runtime, entry) in &runtimes {
-        let version = entry.current.as_deref().map(str::trim).unwrap_or("");
-        if version.is_empty() {
-            continue;
-        }
-        if !valid_token(version) {
-            return Err(format!("runtime manifest invalid current version '{}'", version).into());
-        }
-
-        let package_dir = runtimes_root.join(runtime).join(version);
-        if !package_dir.is_dir() {
-            errors.push(format!(
-                "runtime package missing directory runtime='{}' version='{}' path='{}'",
-                runtime,
-                version,
-                package_dir.display()
-            ));
-            continue;
-        }
-
-        match runtime_package_type(entry) {
-            "full_runtime" => {
-                let start_script = package_dir.join("bin/start.sh");
-                if !start_script.is_file() {
-                    errors.push(format!(
-                        "runtime artifact missing start.sh runtime='{}' version='{}' path='{}'",
-                        runtime,
-                        version,
-                        start_script.display()
-                    ));
-                    continue;
-                }
-                if !local_runtime_script_is_executable(&start_script) {
-                    errors.push(format!(
-                        "runtime artifact start.sh is not executable runtime='{}' version='{}' path='{}'",
-                        runtime,
-                        version,
-                        start_script.display()
-                    ));
-                }
-            }
-            "config_only" | "workflow" => {
-                let base_runtime = entry
-                    .runtime_base
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty());
-                let Some(base_runtime) = base_runtime else {
-                    errors.push(format!(
-                        "runtime package missing runtime_base runtime='{}' version='{}' type='{}'",
-                        runtime,
-                        version,
-                        runtime_package_type(entry)
-                    ));
-                    continue;
-                };
-                if !valid_token(base_runtime) {
-                    errors.push(format!(
-                        "runtime package invalid runtime_base runtime='{}' version='{}' type='{}' runtime_base='{}'",
-                        runtime,
-                        version,
-                        runtime_package_type(entry),
-                        base_runtime
-                    ));
-                    continue;
-                }
-                let Some(base_entry) = runtimes.get(base_runtime) else {
-                    errors.push(format!(
-                        "runtime package runtime_base not available runtime='{}' version='{}' type='{}' runtime_base='{}'",
-                        runtime,
-                        version,
-                        runtime_package_type(entry),
-                        base_runtime
-                    ));
-                    continue;
-                };
-                let base_version = base_entry.current.as_deref().map(str::trim).unwrap_or("");
-                if base_version.is_empty() || !valid_token(base_version) {
-                    errors.push(format!(
-                        "runtime package runtime_base has invalid current version runtime='{}' version='{}' type='{}' runtime_base='{}' base_version='{}'",
-                        runtime,
-                        version,
-                        runtime_package_type(entry),
-                        base_runtime,
-                        base_version
-                    ));
-                    continue;
-                }
-
-                let base_start = runtimes_root
-                    .join(base_runtime)
-                    .join(base_version)
-                    .join("bin/start.sh");
-                if !base_start.is_file() {
-                    errors.push(format!(
-                        "runtime artifact missing base start.sh runtime='{}' version='{}' runtime_base='{}' base_version='{}' path='{}'",
-                        runtime,
-                        version,
-                        base_runtime,
-                        base_version,
-                        base_start.display()
-                    ));
-                    continue;
-                }
-                if !local_runtime_script_is_executable(&base_start) {
-                    errors.push(format!(
-                        "runtime artifact base start.sh is not executable runtime='{}' version='{}' runtime_base='{}' base_version='{}' path='{}'",
-                        runtime,
-                        version,
-                        base_runtime,
-                        base_version,
-                        base_start.display()
-                    ));
-                }
-            }
-            other => {
-                errors.push(format!(
-                    "runtime package unknown type runtime='{}' version='{}' type='{}'",
-                    runtime, version, other
-                ));
-            }
-        }
-    }
-    Ok(errors)
+    verify_runtime_artifacts_for_scope(manifest, runtimes_root, None, None)
 }
 
 fn apply_runtime_retention_with_roots(
@@ -7498,19 +7606,40 @@ async fn runtime_verify_and_retain(state: &OrchestratorState) -> Result<(), Orch
             return Ok(());
         }
     };
-    let manifest = {
+    let cached_manifest = {
         let guard = state.runtime_manifest.lock().await;
         guard.clone()
-    }
-    .or_else(load_runtime_manifest);
+    };
+    let manifest = load_runtime_manifest_result()?.or(cached_manifest.clone());
 
     if let Some(manifest) = manifest {
-        if let Err(err) = apply_runtime_retention(&manifest) {
-            tracing::warn!(error = %err, "runtime retention failed during watchdog verify");
+        if let Some(cached) = cached_manifest.as_ref() {
+            if cached.version != manifest.version || cached.hash != manifest.hash {
+                tracing::info!(
+                    cached_version = cached.version,
+                    disk_version = manifest.version,
+                    cached_hash = ?cached.hash,
+                    disk_hash = ?manifest.hash,
+                    "watchdog verify: refreshing runtime manifest cache from disk"
+                );
+            }
         }
+        let artifact_errors = verify_runtime_current_artifacts(&manifest)?;
         {
             let mut guard = state.runtime_manifest.lock().await;
             *guard = Some(manifest.clone());
+        }
+        if !artifact_errors.is_empty() {
+            tracing::warn!(
+                error_count = artifact_errors.len(),
+                first_error = artifact_errors.first().cloned().unwrap_or_default(),
+                "watchdog verify: runtime artifacts not converged; skipping retention pass"
+            );
+            return Ok(());
+        }
+        if let Err(err) = apply_runtime_retention(&manifest) {
+            tracing::warn!(error = %err, "runtime retention failed during watchdog verify");
+            return Ok(());
         }
         tracing::info!("watchdog verify: runtime retention applied (software updates use SYSTEM_UPDATE per hive)");
     }
@@ -15187,6 +15316,95 @@ blob:
         assert!(errors.is_empty());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verify_runtime_artifacts_for_scope_ignores_unrelated_missing_current_runtime() {
+        let root = std::env::temp_dir().join(format!("fluxbee-verify-scope-{}", Uuid::new_v4()));
+        let target_runtime = "io.slack";
+        let target_version = "1.1.0";
+        let unrelated_runtime = "ai.common";
+        let unrelated_version = "0.1.2";
+        let target_start = root
+            .join(target_runtime)
+            .join(target_version)
+            .join("bin/start.sh");
+
+        fs::create_dir_all(
+            target_start
+                .parent()
+                .expect("target start script parent directory must exist"),
+        )
+        .expect("create target runtime dir");
+        fs::write(&target_start, "#!/usr/bin/env bash\necho ok\n").expect("write target start.sh");
+        let mut perms = fs::metadata(&target_start)
+            .expect("stat target start.sh")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&target_start, perms).expect("chmod target start.sh");
+
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000013333,
+            updated_at: Some("2026-03-30T02:00:00Z".to_string()),
+            runtimes: serde_json::json!({
+                target_runtime: {
+                    "available": [target_version],
+                    "current": target_version,
+                    "type": "full_runtime"
+                },
+                unrelated_runtime: {
+                    "available": [unrelated_version],
+                    "current": unrelated_version,
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let global_errors =
+            verify_runtime_current_artifacts_with_root(&manifest, &root).expect("global verify");
+        assert!(
+            global_errors
+                .iter()
+                .any(|item| item.contains("runtime='ai.common'")
+                    && item.contains("missing directory")),
+            "expected unrelated missing runtime in {:?}",
+            global_errors
+        );
+
+        let scoped_errors = verify_runtime_artifacts_for_scope(
+            &manifest,
+            &root,
+            Some(target_runtime),
+            Some(target_version),
+        )
+        .expect("scoped verify");
+        assert!(
+            scoped_errors.is_empty(),
+            "scoped runtime update should ignore unrelated missing runtimes: {:?}",
+            scoped_errors
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_system_update_payload_accepts_runtime_scope_for_runtime_category() {
+        let payload = serde_json::json!({
+            "category": "runtime",
+            "manifest_version": 42,
+            "manifest_hash": "sha256:deadbeef",
+            "runtime": "AI.common",
+            "runtime_version": "0.1.2"
+        });
+
+        let parsed = parse_system_update_payload(&payload).expect("parse runtime scoped payload");
+        assert_eq!(parsed.category, "runtime");
+        assert_eq!(parsed.manifest_version, 42);
+        assert_eq!(parsed.manifest_hash, "sha256:deadbeef");
+        assert_eq!(parsed.runtime.as_deref(), Some("AI.common"));
+        assert_eq!(parsed.runtime_version.as_deref(), Some("0.1.2"));
     }
 
     #[test]

@@ -3680,6 +3680,16 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "u64",
                 "Expected manifest version. Defaults to 0.",
             ),
+            admin_action_body_field(
+                "runtime",
+                "string",
+                "Optional runtime scope for targeted runtime readiness/materialization.",
+            ),
+            admin_action_body_field(
+                "runtime_version",
+                "string",
+                "Optional runtime version scope. Requires runtime. Defaults to current.",
+            ),
         ],
         "sync_hint" => vec![
             admin_action_body_field(
@@ -3792,7 +3802,9 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "update" => serde_json::json!({
             "manifest_hash": "sha256:deadbeef",
             "category": "runtime",
-            "manifest_version": 42
+            "manifest_version": 42,
+            "runtime": "AI.common",
+            "runtime_version": "0.1.2"
         }),
         "sync_hint" => serde_json::json!({
             "channel": "blob",
@@ -3876,7 +3888,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "list_drift_alerts" => "curl -X GET /drift-alerts",
         "get_drift_alerts" => "curl -X GET /hives/motherbee/drift-alerts",
         "update" => {
-            r#"curl -X POST /hives/motherbee/update -d '{"manifest_hash":"sha256:deadbeef","category":"runtime","manifest_version":42}'"#
+            r#"curl -X POST /hives/motherbee/update -d '{"manifest_hash":"sha256:deadbeef","category":"runtime","manifest_version":42,"runtime":"AI.common","runtime_version":"0.1.2"}'"#
         }
         "sync_hint" => {
             r#"curl -X POST /hives/motherbee/sync-hint -d '{"channel":"blob","wait_for_idle":true,"timeout_ms":30000}'"#
@@ -4420,12 +4432,43 @@ async fn handle_hive_update_command(
         ));
     }
 
+    let runtime = payload
+        .get("runtime")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let runtime_version = payload
+        .get("runtime_version")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    if category != "runtime" && (runtime.is_some() || runtime_version.is_some()) {
+        return Ok(invalid_request(
+            "runtime/runtime_version scope is only supported for category=runtime",
+        ));
+    }
+    if runtime_version.is_some() && runtime.is_none() {
+        return Ok(invalid_request("runtime_version requires runtime"));
+    }
+
     let target = format!("SY.orchestrator@{}", hive_id);
-    let system_payload = serde_json::json!({
+    let mut system_payload = serde_json::json!({
         "category": category,
         "manifest_version": manifest_version,
         "manifest_hash": manifest_hash,
     });
+    if let Some(obj) = system_payload.as_object_mut() {
+        if let Some(runtime) = runtime {
+            obj.insert("runtime".to_string(), serde_json::json!(runtime));
+        }
+        if let Some(runtime_version) = runtime_version {
+            obj.insert(
+                "runtime_version".to_string(),
+                serde_json::json!(runtime_version),
+            );
+        }
+    }
 
     let response = send_system_request(
         client,
