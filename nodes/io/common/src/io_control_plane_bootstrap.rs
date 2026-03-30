@@ -67,7 +67,7 @@ fn load_effective_config_from_orchestrator(
 
     let raw = fs::read_to_string(&path)?;
     let root: Value = serde_json::from_str(&raw)?;
-    let effective = extract_effective_config(root);
+    let effective = extract_effective_config(&root);
     if !effective.is_object() {
         return Ok(Some(IoControlPlaneState {
             current_state: IoNodeLifecycleState::FailedConfig,
@@ -101,8 +101,8 @@ fn load_effective_config_from_orchestrator(
     }))
 }
 
-fn extract_effective_config(root: Value) -> Value {
-    let mut candidate = root.get("config").cloned().unwrap_or(root);
+fn extract_effective_config(root: &Value) -> Value {
+    let mut candidate = root.get("config").cloned().unwrap_or_else(|| root.clone());
     if let Some(obj) = candidate.as_object_mut() {
         obj.remove("_system");
     }

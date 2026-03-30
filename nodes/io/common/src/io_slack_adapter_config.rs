@@ -1,6 +1,6 @@
 use crate::io_adapter_config::{IoAdapterConfigContract, IoAdapterConfigError};
 use fluxbee_sdk::node_secret::{NodeSecretDescriptor, NODE_SECRET_REDACTION_TOKEN};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
 pub struct IoSlackAdapterConfigContract;
 
@@ -190,6 +190,7 @@ fn has_slack_bot_secret(slack: &Map<String, Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn validate_materialize_requires_slack_credentials_and_sets_dst_default() {
