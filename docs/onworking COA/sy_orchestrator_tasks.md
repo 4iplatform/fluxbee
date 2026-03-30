@@ -114,7 +114,7 @@ Objetivo:
   - `version`
   - opcionalmente `target_hives`
 - [x] R3-T2. Hacer que el update puntual no falle ni quede en `sync_pending` por faltantes de `AI.*` / `IO.*` / `WF.*` ajenos al runtime solicitado.
-- [ ] R3-T3. Mantener una validación global aparte para salud general del sistema, sin usarla como bloqueo duro del deploy puntual.
+- [x] R3-T3. Mantener una validación global aparte para salud general del sistema, sin usarla como bloqueo duro del deploy puntual.
 - [ ] R3-T4. Documentar la semántica nueva:
   - `targeted readiness`
   - vs `global runtime health`
@@ -126,13 +126,13 @@ Objetivo:
 - [ ] R4-T4. Agregar evidencia explícita en logs cuando un runtime/version quede retenido por protección de convergencia.
 
 ### Fase R5 - Materialization state explícito
-- [ ] R5-T1. Exponer estado de materialización local por `runtime/version`:
+- [x] R5-T1. Exponer estado de materialización local por `runtime/version`:
   - directorio presente,
   - `start.sh` presente,
   - hash/manifest esperado,
   - timestamp de última verificación.
-- [ ] R5-T2. Hacer que `spawn` pueda consultar ese estado previo y reportar mejor causa raíz cuando el runtime no está materializado.
-- [ ] R5-T3. Evaluar endpoint/admin payload para consultar materialización sin depender de inferencia indirecta desde `SYSTEM_UPDATE`.
+- [x] R5-T2. Hacer que `spawn` pueda consultar ese estado previo y reportar mejor causa raíz cuando el runtime no está materializado.
+- [x] R5-T3. Evaluar endpoint/admin payload para consultar materialización sin depender de inferencia indirecta desde `SYSTEM_UPDATE`.
 
 ### Fase R6 - E2E y criterio de cierre
 - [ ] R6-T1. Caso E2E positivo:

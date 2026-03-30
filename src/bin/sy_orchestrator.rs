@@ -2396,6 +2396,43 @@ async fn handle_system_update_message(
         });
     }
 
+    let runtime_health_context = if category == "runtime" {
+        load_runtime_manifest_result()
+            .ok()
+            .flatten()
+            .map(|manifest| {
+                let targeted = runtime_health_snapshot(
+                    &manifest,
+                    Path::new(DIST_RUNTIME_ROOT_DIR),
+                    request.runtime.as_deref(),
+                    request.runtime_version.as_deref(),
+                )
+                .unwrap_or_else(|err| {
+                    serde_json::json!({
+                        "scope": if request.runtime.is_some() { "targeted" } else { "global_current" },
+                        "status": "error",
+                        "message": err.to_string(),
+                    })
+                });
+                let global = runtime_health_snapshot(
+                    &manifest,
+                    Path::new(DIST_RUNTIME_ROOT_DIR),
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|err| {
+                    serde_json::json!({
+                        "scope": "global_current",
+                        "status": "error",
+                        "message": err.to_string(),
+                    })
+                });
+                (targeted, global)
+            })
+    } else {
+        None
+    };
+
     match apply_system_update_local(state, &request).await {
         Ok(result) => serde_json::json!({
             "status": result.status,
@@ -2406,6 +2443,15 @@ async fn handle_system_update_message(
             "local_manifest_hash": local_hash,
             "runtime": request.runtime.clone(),
             "runtime_version": request.runtime_version.clone(),
+            "readiness_scope": if request.runtime.is_some() { "targeted" } else { "global" },
+            "targeted_runtime_health": runtime_health_context
+                .as_ref()
+                .map(|(targeted, _)| targeted.clone())
+                .unwrap_or(serde_json::Value::Null),
+            "global_runtime_health": runtime_health_context
+                .as_ref()
+                .map(|(_, global)| global.clone())
+                .unwrap_or(serde_json::Value::Null),
             "updated": result.updated,
             "unchanged": result.unchanged,
             "restarted": result.restarted,
@@ -2422,6 +2468,15 @@ async fn handle_system_update_message(
             "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
             "runtime": request.runtime.clone(),
             "runtime_version": request.runtime_version.clone(),
+            "readiness_scope": if request.runtime.is_some() { "targeted" } else { "global" },
+            "targeted_runtime_health": runtime_health_context
+                .as_ref()
+                .map(|(targeted, _)| targeted.clone())
+                .unwrap_or(serde_json::Value::Null),
+            "global_runtime_health": runtime_health_context
+                .as_ref()
+                .map(|(_, global)| global.clone())
+                .unwrap_or(serde_json::Value::Null),
             "updated": [],
             "unchanged": [],
             "restarted": [],
@@ -4908,6 +4963,11 @@ fn runtime_api_entry(
         "type": runtime_package_type(entry),
         "runtime_base": entry.runtime_base,
         "readiness": runtime_readiness_for_entry(runtime, entry, runtime_entries),
+        "materialization_summary": runtime_materialization_summary_for_entry(
+            runtime,
+            entry,
+            runtime_entries,
+        ),
     })
 }
 
@@ -4989,6 +5049,28 @@ async fn local_runtime_snapshot(
                 });
             let usage_global =
                 global_visible_runtime_usage_summary(state, runtime, version_filter).await;
+            let targeted_runtime_health = runtime_health_snapshot(
+                &manifest,
+                Path::new(DIST_RUNTIME_ROOT_DIR),
+                Some(runtime),
+                version_filter,
+            )
+            .unwrap_or_else(|err| {
+                serde_json::json!({
+                    "scope": "targeted",
+                    "status": "error",
+                    "message": err.to_string(),
+                })
+            });
+            let global_runtime_health =
+                runtime_health_snapshot(&manifest, Path::new(DIST_RUNTIME_ROOT_DIR), None, None)
+                    .unwrap_or_else(|err| {
+                        serde_json::json!({
+                            "scope": "global_current",
+                            "status": "error",
+                            "message": err.to_string(),
+                        })
+                    });
             serde_json::json!({
                 "status": "ok",
                 "hive_id": state.hive_id,
@@ -4996,6 +5078,14 @@ async fn local_runtime_snapshot(
                 "manifest_hash": manifest_hash,
                 "runtime": runtime_api_entry(runtime, entry, runtime_entries_snapshot.as_ref()),
                 "runtime_version_filter": version_filter,
+                "materialization": runtime_materialization_for_entry(
+                    runtime,
+                    entry,
+                    runtime_entries_snapshot.as_ref(),
+                    version_filter,
+                ),
+                "targeted_runtime_health": targeted_runtime_health,
+                "global_runtime_health": global_runtime_health,
                 "usage": usage,
                 "usage_global_visible": usage_global,
             })
@@ -8478,6 +8568,166 @@ fn runtime_base_start_script_preflight(
     Ok(())
 }
 
+fn runtime_spawn_preflight_with_manifest(
+    manifest: &RuntimeManifest,
+    requested_runtime: &str,
+    requested_version: &str,
+    entrypoint: &RuntimeSpawnEntrypoint,
+    target_hive: &str,
+    node_name: &str,
+) -> Result<(), serde_json::Value> {
+    runtime_spawn_preflight_with_manifest_and_root(
+        manifest,
+        requested_runtime,
+        requested_version,
+        entrypoint,
+        target_hive,
+        node_name,
+        Path::new(DIST_RUNTIME_ROOT_DIR),
+    )
+}
+
+fn runtime_spawn_preflight_with_manifest_and_root(
+    manifest: &RuntimeManifest,
+    requested_runtime: &str,
+    requested_version: &str,
+    entrypoint: &RuntimeSpawnEntrypoint,
+    target_hive: &str,
+    node_name: &str,
+    runtimes_root: &Path,
+) -> Result<(), serde_json::Value> {
+    let runtime_entries = manifest.runtimes.as_object();
+    let runtime_map = runtime_manifest_entry_map(manifest).map_err(|err| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": "MANIFEST_INVALID",
+            "message": err.to_string(),
+            "runtime": requested_runtime,
+            "version": requested_version,
+            "target": target_hive,
+            "node_name": node_name,
+        })
+    })?;
+
+    let requested_entry = runtime_map.get(requested_runtime).ok_or_else(|| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": "RUNTIME_NOT_AVAILABLE",
+            "message": format!("runtime '{}' not found in manifest", requested_runtime),
+            "runtime": requested_runtime,
+            "version": requested_version,
+            "target": target_hive,
+            "node_name": node_name,
+        })
+    })?;
+    let requested_materialization = runtime_materialization_for_entry_with_root(
+        requested_runtime,
+        requested_entry,
+        runtime_entries,
+        runtimes_root,
+        Some(requested_version),
+    );
+    let targeted_runtime_health = runtime_health_snapshot(
+        manifest,
+        runtimes_root,
+        Some(requested_runtime),
+        Some(requested_version),
+    )
+    .unwrap_or_else(|err| {
+        serde_json::json!({
+            "scope": "targeted",
+            "status": "error",
+            "message": err.to_string(),
+        })
+    });
+    let global_runtime_health = runtime_health_snapshot(manifest, runtimes_root, None, None)
+        .unwrap_or_else(|err| {
+            serde_json::json!({
+                "scope": "global_current",
+                "status": "error",
+                "message": err.to_string(),
+            })
+        });
+
+    if let Some(runtime_base) = entrypoint.runtime_base.as_deref() {
+        let base_entry = runtime_map.get(runtime_base).ok_or_else(|| {
+            serde_json::json!({
+                "status": "error",
+                "error_code": "BASE_RUNTIME_NOT_AVAILABLE",
+                "message": format!("runtime_base '{}' not found in manifest", runtime_base),
+                "runtime": requested_runtime,
+                "version": requested_version,
+                "runtime_base": runtime_base,
+                "base_version": entrypoint.script_version,
+                "expected_path": entrypoint.script_path,
+                "hint": "Publish/materialize the base runtime before spawning this node",
+                "target": target_hive,
+                "node_name": node_name,
+                "requested_runtime_materialization": requested_materialization,
+                "targeted_runtime_health": targeted_runtime_health,
+                "global_runtime_health": global_runtime_health,
+            })
+        })?;
+        let base_materialization = runtime_materialization_for_entry_with_root(
+            runtime_base,
+            base_entry,
+            runtime_entries,
+            runtimes_root,
+            Some(&entrypoint.script_version),
+        );
+
+        runtime_base_start_script_preflight(
+            requested_runtime,
+            requested_version,
+            runtime_base,
+            &entrypoint.script_version,
+            &entrypoint.script_path,
+            target_hive,
+            node_name,
+        )
+        .map_err(|mut payload| {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "requested_runtime_materialization".to_string(),
+                    requested_materialization,
+                );
+                obj.insert(
+                    "runtime_base_materialization".to_string(),
+                    base_materialization,
+                );
+                obj.insert(
+                    "targeted_runtime_health".to_string(),
+                    targeted_runtime_health,
+                );
+                obj.insert("global_runtime_health".to_string(), global_runtime_health);
+            }
+            payload
+        })
+    } else {
+        runtime_start_script_preflight(
+            &entrypoint.script_runtime,
+            &entrypoint.script_version,
+            &entrypoint.script_path,
+            target_hive,
+            node_name,
+        )
+        .map_err(|mut payload| {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "runtime_materialization".to_string(),
+                    requested_materialization,
+                );
+                obj.insert(
+                    "targeted_runtime_health".to_string(),
+                    targeted_runtime_health,
+                );
+                obj.insert("global_runtime_health".to_string(), global_runtime_health);
+            }
+            payload
+        })
+    }
+}
+
 fn runtime_versions_from_manifest_entry(entry: &RuntimeManifestEntry) -> Vec<String> {
     let mut versions = Vec::new();
     let mut seen = HashSet::new();
@@ -8587,6 +8837,259 @@ fn runtime_readiness_for_entry_with_root(
         );
     }
     serde_json::Value::Object(readiness)
+}
+
+fn runtime_health_snapshot(
+    manifest: &RuntimeManifest,
+    runtimes_root: &Path,
+    runtime_filter: Option<&str>,
+    runtime_version_filter: Option<&str>,
+) -> Result<serde_json::Value, OrchestratorError> {
+    let errors = verify_runtime_artifacts_for_scope(
+        manifest,
+        runtimes_root,
+        runtime_filter,
+        runtime_version_filter,
+    )?;
+    Ok(serde_json::json!({
+        "scope": if runtime_filter.is_some() { "targeted" } else { "global_current" },
+        "runtime": runtime_filter,
+        "runtime_version": runtime_version_filter,
+        "status": if errors.is_empty() { "ok" } else { "degraded" },
+        "error_count": errors.len(),
+        "errors": errors,
+    }))
+}
+
+fn runtime_materialization_for_entry(
+    runtime: &str,
+    entry: &RuntimeManifestEntry,
+    runtime_entries: Option<&serde_json::Map<String, serde_json::Value>>,
+    version_filter: Option<&str>,
+) -> serde_json::Value {
+    runtime_materialization_for_entry_with_root(
+        runtime,
+        entry,
+        runtime_entries,
+        Path::new(DIST_RUNTIME_ROOT_DIR),
+        version_filter,
+    )
+}
+
+fn runtime_materialization_for_entry_with_root(
+    runtime: &str,
+    entry: &RuntimeManifestEntry,
+    runtime_entries: Option<&serde_json::Map<String, serde_json::Value>>,
+    runtimes_root: &Path,
+    version_filter: Option<&str>,
+) -> serde_json::Value {
+    if !valid_token(runtime) {
+        return serde_json::json!({});
+    }
+
+    let package_type = runtime_package_type(entry);
+    let base_runtime_name = entry
+        .runtime_base
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let base_entry = base_runtime_name
+        .and_then(|name| runtime_entries.and_then(|entries| entries.get(name)))
+        .and_then(|value| {
+            base_runtime_name.and_then(|name| runtime_manifest_entry_from_value(name, value).ok())
+        });
+    let base_version = base_entry
+        .as_ref()
+        .and_then(|value| value.current.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let selected_version = version_filter
+        .and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() || trimmed == "current" {
+                entry.current.as_deref().map(str::trim)
+            } else {
+                Some(trimmed)
+            }
+        })
+        .filter(|value| !value.is_empty());
+
+    let mut versions = serde_json::Map::new();
+    for version in runtime_versions_from_manifest_entry(entry) {
+        if let Some(selected_version) = selected_version {
+            if version != selected_version {
+                continue;
+            }
+        }
+
+        let package_dir = runtimes_root.join(runtime).join(&version);
+        let package_dir_present = package_dir.is_dir();
+        let start_script_path = package_dir.join("bin/start.sh");
+
+        let mut detail = serde_json::Map::new();
+        detail.insert(
+            "package_dir".to_string(),
+            serde_json::json!(package_dir.display().to_string()),
+        );
+        detail.insert(
+            "package_dir_present".to_string(),
+            serde_json::json!(package_dir_present),
+        );
+
+        match package_type {
+            "full_runtime" => {
+                let start_present = start_script_path.is_file();
+                let start_exec =
+                    start_present && local_runtime_script_is_executable(&start_script_path);
+                let blocking_reason = if !package_dir_present {
+                    Some("missing_package_dir")
+                } else if !start_present {
+                    Some("missing_start_script")
+                } else if !start_exec {
+                    Some("start_script_not_executable")
+                } else {
+                    None
+                };
+                detail.insert(
+                    "start_script_path".to_string(),
+                    serde_json::json!(start_script_path.display().to_string()),
+                );
+                detail.insert(
+                    "start_script_present".to_string(),
+                    serde_json::json!(start_present),
+                );
+                detail.insert(
+                    "start_script_executable".to_string(),
+                    serde_json::json!(start_exec),
+                );
+                detail.insert(
+                    "materialized".to_string(),
+                    serde_json::json!(blocking_reason.is_none()),
+                );
+                detail.insert(
+                    "blocking_reason".to_string(),
+                    blocking_reason.map_or(serde_json::Value::Null, serde_json::Value::from),
+                );
+            }
+            "config_only" | "workflow" => {
+                let base_start =
+                    base_runtime_name
+                        .zip(base_version)
+                        .map(|(base_runtime, base_version)| {
+                            runtimes_root
+                                .join(base_runtime)
+                                .join(base_version)
+                                .join("bin/start.sh")
+                        });
+                let base_start_present = base_start.as_ref().is_some_and(|path| path.is_file());
+                let base_start_exec = base_start.as_ref().is_some_and(|path| {
+                    base_start_present && local_runtime_script_is_executable(path)
+                });
+                let blocking_reason = if !package_dir_present {
+                    Some("missing_package_dir")
+                } else if base_runtime_name.is_none() {
+                    Some("missing_runtime_base")
+                } else if base_version.is_none() {
+                    Some("missing_runtime_base_current")
+                } else if !base_start_present {
+                    Some("missing_base_start_script")
+                } else if !base_start_exec {
+                    Some("base_start_script_not_executable")
+                } else {
+                    None
+                };
+                detail.insert(
+                    "runtime_base".to_string(),
+                    base_runtime_name.map_or(serde_json::Value::Null, serde_json::Value::from),
+                );
+                detail.insert(
+                    "runtime_base_version".to_string(),
+                    base_version.map_or(serde_json::Value::Null, serde_json::Value::from),
+                );
+                detail.insert(
+                    "base_start_script_path".to_string(),
+                    base_start.as_ref().map_or(serde_json::Value::Null, |path| {
+                        serde_json::json!(path.display().to_string())
+                    }),
+                );
+                detail.insert(
+                    "base_start_script_present".to_string(),
+                    serde_json::json!(base_start_present),
+                );
+                detail.insert(
+                    "base_start_script_executable".to_string(),
+                    serde_json::json!(base_start_exec),
+                );
+                detail.insert(
+                    "materialized".to_string(),
+                    serde_json::json!(blocking_reason.is_none()),
+                );
+                detail.insert(
+                    "blocking_reason".to_string(),
+                    blocking_reason.map_or(serde_json::Value::Null, serde_json::Value::from),
+                );
+            }
+            other => {
+                detail.insert("materialized".to_string(), serde_json::json!(false));
+                detail.insert(
+                    "blocking_reason".to_string(),
+                    serde_json::json!(format!("unknown_package_type:{other}")),
+                );
+            }
+        }
+
+        versions.insert(version, serde_json::Value::Object(detail));
+    }
+
+    serde_json::json!({
+        "runtime": runtime,
+        "package_type": package_type,
+        "current": entry.current,
+        "runtime_base": entry.runtime_base,
+        "versions": versions,
+    })
+}
+
+fn runtime_materialization_summary_for_entry(
+    runtime: &str,
+    entry: &RuntimeManifestEntry,
+    runtime_entries: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Value {
+    let detail = runtime_materialization_for_entry(runtime, entry, runtime_entries, None);
+    let versions = detail
+        .get("versions")
+        .and_then(|value| value.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let materialized_versions = versions
+        .values()
+        .filter(|value| {
+            value
+                .get("materialized")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        })
+        .count();
+    let current_version = entry
+        .current
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let current_detail = current_version.and_then(|version| versions.get(version));
+    serde_json::json!({
+        "known_versions": versions.len(),
+        "materialized_versions": materialized_versions,
+        "current_version": current_version,
+        "current_materialized": current_detail
+            .and_then(|value| value.get("materialized"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        "current_blocking_reason": current_detail
+            .and_then(|value| value.get("blocking_reason"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    })
 }
 
 fn system_forward_timeout() -> Duration {
@@ -10430,22 +10933,11 @@ async fn run_node_flow(
             });
         }
     };
-    if let Some(runtime_base) = entrypoint.runtime_base.as_deref() {
-        if let Err(payload) = runtime_base_start_script_preflight(
-            &runtime_key,
-            &version,
-            runtime_base,
-            &entrypoint.script_version,
-            &entrypoint.script_path,
-            &target_hive,
-            &node_name,
-        ) {
-            return payload;
-        }
-    } else if let Err(payload) = runtime_start_script_preflight(
-        &entrypoint.script_runtime,
-        &entrypoint.script_version,
-        &entrypoint.script_path,
+    if let Err(payload) = runtime_spawn_preflight_with_manifest(
+        &manifest,
+        &runtime_key,
+        &version,
+        &entrypoint,
         &target_hive,
         &node_name,
     ) {
@@ -14818,6 +15310,50 @@ blob:
     }
 
     #[test]
+    fn runtime_spawn_preflight_with_manifest_includes_materialization_for_full_runtime() {
+        let root = std::env::temp_dir().join(format!("fluxbee-spawn-preflight-{}", Uuid::new_v4()));
+        let runtime = "ai.spawn.test";
+        let version = "1.0.0";
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000015555,
+            updated_at: Some("2026-03-30T02:20:00Z".to_string()),
+            runtimes: serde_json::json!({
+                runtime: {
+                    "available": [version],
+                    "current": version,
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+        let entrypoint =
+            resolve_runtime_spawn_entrypoint(&manifest, runtime, version).expect("entrypoint");
+
+        let out = runtime_spawn_preflight_with_manifest_and_root(
+            &manifest,
+            runtime,
+            version,
+            &entrypoint,
+            "worker-220",
+            "AI.spawn.test@worker-220",
+            &root,
+        )
+        .expect_err("missing start.sh must fail");
+
+        assert_eq!(out["error_code"], "RUNTIME_NOT_PRESENT");
+        assert!(out.get("runtime_materialization").is_some());
+        assert_eq!(
+            out["runtime_materialization"]["versions"][version]["blocking_reason"],
+            serde_json::json!("missing_package_dir")
+        );
+        assert_eq!(out["targeted_runtime_health"]["scope"], "targeted");
+        assert_eq!(out["global_runtime_health"]["scope"], "global_current");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn runtime_readiness_entry_keeps_fr8_fields() {
         let runtime = format!("wf.readiness.{}", Uuid::new_v4().simple());
         let version = format!("diag-{}", Uuid::new_v4().simple());
@@ -15238,6 +15774,63 @@ blob:
     }
 
     #[test]
+    fn runtime_spawn_preflight_with_manifest_includes_base_materialization_details() {
+        let root = std::env::temp_dir().join(format!("fluxbee-spawn-base-{}", Uuid::new_v4()));
+        let runtime = "wf.onboarding.standard";
+        let version = "1.0.0";
+        let base_runtime = "wf.engine";
+        let base_version = "9.9.1";
+        fs::create_dir_all(root.join(runtime).join(version)).expect("requested runtime dir");
+
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000016666,
+            updated_at: Some("2026-03-30T02:30:00Z".to_string()),
+            runtimes: serde_json::json!({
+                runtime: {
+                    "available": [version],
+                    "current": version,
+                    "type": "workflow",
+                    "runtime_base": base_runtime
+                },
+                base_runtime: {
+                    "available": [base_version],
+                    "current": base_version,
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+        let entrypoint =
+            resolve_runtime_spawn_entrypoint(&manifest, runtime, version).expect("entrypoint");
+
+        let out = runtime_spawn_preflight_with_manifest_and_root(
+            &manifest,
+            runtime,
+            version,
+            &entrypoint,
+            "worker-220",
+            "WF.onboarding.standard@worker-220",
+            &root,
+        )
+        .expect_err("missing base start.sh must fail");
+
+        assert_eq!(out["error_code"], "BASE_RUNTIME_NOT_PRESENT");
+        assert!(out.get("requested_runtime_materialization").is_some());
+        assert!(out.get("runtime_base_materialization").is_some());
+        assert_eq!(
+            out["requested_runtime_materialization"]["versions"][version]["blocking_reason"],
+            serde_json::json!("missing_base_start_script")
+        );
+        assert_eq!(
+            out["runtime_base_materialization"]["versions"][base_version]["blocking_reason"],
+            serde_json::json!("missing_package_dir")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn verify_runtime_current_artifacts_with_root_config_only_requires_runtime_base_start_script() {
         let root = std::env::temp_dir().join(format!("fluxbee-verify-{}", Uuid::new_v4()));
         let runtime = "ai.agent.config";
@@ -15398,6 +15991,108 @@ blob:
             scoped_errors.is_empty(),
             "scoped runtime update should ignore unrelated missing runtimes: {:?}",
             scoped_errors
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_health_snapshot_reports_targeted_ok_and_global_degraded() {
+        let root = std::env::temp_dir().join(format!("fluxbee-health-scope-{}", Uuid::new_v4()));
+        let target_runtime = "io.slack";
+        let target_version = "1.1.0";
+        let unrelated_runtime = "ai.common";
+        let unrelated_version = "0.1.2";
+        let target_start = root
+            .join(target_runtime)
+            .join(target_version)
+            .join("bin/start.sh");
+
+        fs::create_dir_all(
+            target_start
+                .parent()
+                .expect("target start script parent directory must exist"),
+        )
+        .expect("create target runtime dir");
+        fs::write(&target_start, "#!/usr/bin/env bash\necho ok\n").expect("write target start.sh");
+        let mut perms = fs::metadata(&target_start)
+            .expect("stat target start.sh")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&target_start, perms).expect("chmod target start.sh");
+
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000014444,
+            updated_at: Some("2026-03-30T02:10:00Z".to_string()),
+            runtimes: serde_json::json!({
+                target_runtime: {
+                    "available": [target_version],
+                    "current": target_version,
+                    "type": "full_runtime"
+                },
+                unrelated_runtime: {
+                    "available": [unrelated_version],
+                    "current": unrelated_version,
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let targeted =
+            runtime_health_snapshot(&manifest, &root, Some(target_runtime), Some(target_version))
+                .expect("targeted health");
+        assert_eq!(targeted["status"], "ok");
+        assert_eq!(targeted["scope"], "targeted");
+
+        let global =
+            runtime_health_snapshot(&manifest, &root, None, None).expect("global runtime health");
+        assert_eq!(global["status"], "degraded");
+        assert_eq!(global["scope"], "global_current");
+        assert!(
+            global["errors"]
+                .as_array()
+                .expect("global errors array")
+                .iter()
+                .any(|value| value.as_str().unwrap_or("").contains("runtime='ai.common'")),
+            "expected unrelated missing runtime in global health: {}",
+            global
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_materialization_for_entry_reports_current_blocking_reason() {
+        let root = std::env::temp_dir().join(format!("fluxbee-materialization-{}", Uuid::new_v4()));
+        let runtime = "ai.common";
+        let version = "0.1.2";
+        let package_dir = root.join(runtime).join(version);
+        fs::create_dir_all(&package_dir).expect("create package dir without start.sh");
+
+        let entry = RuntimeManifestEntry {
+            available: vec![version.to_string()],
+            current: Some(version.to_string()),
+            package_type: Some("full_runtime".to_string()),
+            runtime_base: None,
+            extra: BTreeMap::new(),
+        };
+
+        let detail =
+            runtime_materialization_for_entry_with_root(runtime, &entry, None, &root, None);
+        let current = detail["versions"][version].clone();
+        assert_eq!(current["materialized"], serde_json::json!(false));
+        assert_eq!(
+            current["blocking_reason"],
+            serde_json::json!("missing_start_script")
+        );
+
+        let summary = runtime_materialization_summary_for_entry(runtime, &entry, None);
+        assert_eq!(summary["current_materialized"], serde_json::json!(false));
+        assert_eq!(
+            summary["current_blocking_reason"],
+            serde_json::json!("missing_start_script")
         );
 
         let _ = fs::remove_dir_all(root);
