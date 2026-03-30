@@ -50,6 +50,7 @@ spawn_body="$tmpdir/spawn.json"
 kill_body="$tmpdir/kill.json"
 inventory_body="$tmpdir/inventory.json"
 publish_log="$tmpdir/publish.log"
+wrapper_start="$tmpdir/start.sh"
 
 cleanup() {
   local _ec=$?
@@ -360,6 +361,21 @@ if [[ -z "$manifest_version" || -z "$manifest_hash" ]]; then
   echo "FAIL: publish-runtime.sh did not return manifest metadata" >&2
   cat "$publish_log" >&2 || true
   exit 1
+fi
+
+echo "Step 2b/8: rewrite runtime wrapper with explicit node identity for the fixture"
+cat >"$wrapper_start" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export INVENTORY_HOLD_NODE_NAME="${NODE_NAME}"
+export INVENTORY_HOLD_NODE_VERSION="0.0.1"
+export INVENTORY_HOLD_SECS="0"
+exec "\$(dirname "\${BASH_SOURCE[0]}")/inventory_hold_diag"
+EOF
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+  install -m 0755 "$wrapper_start" "/var/lib/fluxbee/dist/runtimes/${RUNTIME}/${RUNTIME_VERSION}/bin/start.sh"
+else
+  sudo install -m 0755 "$wrapper_start" "/var/lib/fluxbee/dist/runtimes/${RUNTIME}/${RUNTIME_VERSION}/bin/start.sh"
 fi
 
 echo "Step 3/8: wait sync-hint dist"
