@@ -292,14 +292,14 @@ async fn reader_loop(
                     error = %err,
                     "ai runtime disconnected from router; entering reconnect wait"
                 );
-                wait_for_reconnect(
-                    &reader,
+                let msg = wait_for_reconnect(
+                    &mut reader,
                     reconnect_initial_backoff,
                     reconnect_max_backoff,
                     metrics.clone(),
                 )
-                .await;
-                continue;
+                .await?;
+                msg
             }
             Err(err) => return Err(err),
         };
@@ -319,18 +319,24 @@ fn is_transient_link_error(err: &AiSdkError) -> bool {
 }
 
 async fn wait_for_reconnect(
-    reader: &RouterReader,
+    reader: &mut RouterReader,
     initial_backoff: Duration,
     max_backoff: Duration,
     metrics: Arc<RuntimeMetrics>,
-) {
+) -> Result<crate::message::Message> {
     let mut attempt: u64 = 0;
     let mut backoff = initial_backoff;
+    let poll_timeout = Duration::from_millis(250);
 
     loop {
-        if reader.is_connected() {
-            tracing::info!(attempt, "ai runtime reconnected to router");
-            return;
+        match reader.read_timeout(poll_timeout).await {
+            Ok(msg) => {
+                tracing::info!(attempt, "ai runtime reconnected to router");
+                return Ok(msg);
+            }
+            Err(AiSdkError::Node(NodeError::Timeout)) => {}
+            Err(err) if is_transient_link_error(&err) => {}
+            Err(err) => return Err(err),
         }
 
         attempt = attempt.saturating_add(1);
@@ -344,8 +350,7 @@ async fn wait_for_reconnect(
             wait_ms = wait_for.as_millis() as u64,
             "ai runtime reconnecting to router"
         );
-
-        let _ = timeout(wait_for, reader.wait_connected()).await;
+        sleep(wait_for).await;
         backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
     }
 }

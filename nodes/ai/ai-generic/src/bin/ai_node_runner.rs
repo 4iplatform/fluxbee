@@ -451,11 +451,6 @@ impl SharedRouterConnection {
         let guard = self.inner.lock().await;
         guard.writer.write(msg).await
     }
-
-    async fn is_connected(&self) -> bool {
-        let guard = self.inner.lock().await;
-        guard.reader.is_connected()
-    }
 }
 
 struct GovIdentityBridge {
@@ -2168,9 +2163,23 @@ async fn wait_for_shared_reconnect(connection: &SharedRouterConnection) -> u64 {
     let max_backoff = Duration::from_secs(5);
 
     loop {
-        if connection.is_connected().await {
-            tracing::info!(attempt, "ai runtime reconnected to router");
-            return wait_cycles;
+        let poll_timeout = Duration::from_millis(250);
+        match connection.read_runtime_message(poll_timeout).await {
+            Ok(msg) => {
+                let mut guard = connection.inner.lock().await;
+                guard.backlog.push_front(msg);
+                drop(guard);
+                tracing::info!(attempt, "ai runtime reconnected to router");
+                return wait_cycles;
+            }
+            Err(fluxbee_ai_sdk::errors::AiSdkError::Node(NodeError::Timeout)) => {}
+            Err(err) if is_transient_link_error(&err) => {}
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "unexpected error while probing reconnect; keeping retry loop"
+                );
+            }
         }
 
         attempt = attempt.saturating_add(1);
