@@ -142,6 +142,7 @@ Objetivo:
   - ejecución correcta.
   - Script agregado: `scripts/orchestrator_runtime_targeted_e2e.sh`
   - Alcance actual: validación en hive local (`motherbee` / hive con `SY.orchestrator` presente).
+  - Validado en `motherbee` el `2026-03-30` con resultado final `status=ok`.
 - [ ] R6-T2. Caso E2E negativo:
   - faltantes globales en otros runtimes,
   - deploy puntual igual debe converger si el artifact objetivo está materializado.
