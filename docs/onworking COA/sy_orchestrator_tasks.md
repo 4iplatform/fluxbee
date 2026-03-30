@@ -141,6 +141,7 @@ Objetivo:
   - `spawn`,
   - ejecución correcta.
   - Script agregado: `scripts/orchestrator_runtime_targeted_e2e.sh`
+  - Alcance actual: validación en hive local (`motherbee` / hive con `SY.orchestrator` presente).
 - [ ] R6-T2. Caso E2E negativo:
   - faltantes globales en otros runtimes,
   - deploy puntual igual debe converger si el artifact objetivo está materializado.
@@ -151,6 +152,7 @@ Objetivo:
 Nota operativa:
 - En esta iteración se cubre solo `R6-T1`.
 - `R6-T2` a `R6-T4` quedan explícitamente para validación posterior de dev en worker real.
+- El harness `scripts/orchestrator_runtime_targeted_e2e.sh` está orientado a hive local; no intenta cubrir worker hives sin `SY.orchestrator` remoto.
 
 ### Criterio de salida de este TODO
 - [ ] Un runtime nuevo puede publicarse, verificarse y spawnearse sin quedar bloqueado por faltantes globales no relacionados.

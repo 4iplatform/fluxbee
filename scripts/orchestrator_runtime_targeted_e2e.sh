@@ -10,7 +10,7 @@ set -euo pipefail
 # 6) spawn y kill del nodo
 #
 # Uso:
-#   BASE="http://127.0.0.1:8080" HIVE_ID="worker-220" \
+#   BASE="http://127.0.0.1:8080" HIVE_ID="motherbee" \
 #     bash scripts/orchestrator_runtime_targeted_e2e.sh
 #
 # Variables opcionales:
@@ -26,7 +26,7 @@ set -euo pipefail
 #   SYNC_HINT_TIMEOUT_MS=30000
 
 BASE="${BASE:-http://127.0.0.1:8080}"
-HIVE_ID="${HIVE_ID:-worker-220}"
+HIVE_ID="${HIVE_ID:-}"
 BUILD_BIN="${BUILD_BIN:-1}"
 RUNTIME="${RUNTIME:-wf.inventory.hold.diag}"
 RUNTIME_VERSION="${RUNTIME_VERSION:-diag-$(date +%Y%m%d%H%M%S)}"
@@ -63,6 +63,18 @@ require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "FAIL: missing required command '$1'" >&2
     exit 1
+  fi
+}
+
+load_local_hive_id() {
+  local path=""
+  if [[ -f /etc/fluxbee/hive.yaml ]]; then
+    path="/etc/fluxbee/hive.yaml"
+  elif [[ -f "$ROOT_DIR/config/hive.yaml" ]]; then
+    path="$ROOT_DIR/config/hive.yaml"
+  fi
+  if [[ -n "$path" ]]; then
+    awk -F': *' '/^hive_id:/ {print $2; exit}' "$path" | tr -d '"'
   fi
 }
 
@@ -275,6 +287,19 @@ require_cmd bash
 require_cmd curl
 require_cmd python3
 require_cmd sudo
+
+LOCAL_HIVE_ID="$(load_local_hive_id || true)"
+if [[ -z "$HIVE_ID" ]]; then
+  HIVE_ID="${LOCAL_HIVE_ID:-motherbee}"
+fi
+
+if [[ -n "$LOCAL_HIVE_ID" && "$HIVE_ID" != "$LOCAL_HIVE_ID" ]]; then
+  echo "FAIL: scripts/orchestrator_runtime_targeted_e2e.sh is local-hive only in this iteration." >&2
+  echo "requested_hive=$HIVE_ID local_hive=$LOCAL_HIVE_ID" >&2
+  echo "Reason: /hives/{hive}/sync-hint and /hives/{hive}/update relay to SY.orchestrator@{hive}, and worker hives do not expose a remote orchestrator node." >&2
+  echo "Run this E2E against the local hive (typically motherbee), and leave remote-worker validation to dev." >&2
+  exit 1
+fi
 
 echo "TARGETED RUNTIME E2E: BASE=$BASE HIVE_ID=$HIVE_ID RUNTIME=$RUNTIME VERSION=$RUNTIME_VERSION NODE_NAME=$NODE_NAME"
 
