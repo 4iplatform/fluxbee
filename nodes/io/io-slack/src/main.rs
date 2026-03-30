@@ -1876,15 +1876,16 @@ async fn apply_io_config_set(
         match extract_runtime_slack_credentials(&effective) {
             Ok(pair) => Some(pair),
             Err(err) => {
+                let err_text = err.to_string();
                 log_config_set_invalid_runtime_credentials(
                     node_name,
                     payload.config_version,
-                    err.as_str(),
+                    err_text.as_str(),
                 );
                 state.current_state = IoNodeLifecycleState::FailedConfig;
                 state.last_error = Some(IoControlPlaneErrorInfo {
                     code: "invalid_config".to_string(),
-                    message: err.clone(),
+                    message: err_text.clone(),
                 });
                 control_metrics.record_config_set_error(
                     state.current_state.as_str(),
@@ -1896,7 +1897,7 @@ async fn apply_io_config_set(
                     node_name,
                     &redacted,
                     "invalid_config",
-                    err,
+                    err_text,
                 );
             }
         }
