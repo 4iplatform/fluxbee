@@ -49,6 +49,7 @@ runtime_body="$tmpdir/runtime.json"
 spawn_body="$tmpdir/spawn.json"
 kill_body="$tmpdir/kill.json"
 inventory_body="$tmpdir/inventory.json"
+node_status_body="$tmpdir/node_status.json"
 publish_log="$tmpdir/publish.log"
 wrapper_start="$tmpdir/start.sh"
 
@@ -312,6 +313,23 @@ wait_inventory_state() {
   return 1
 }
 
+wait_node_absent() {
+  local deadline=$(( $(date +%s) + WAIT_INVENTORY_SECS ))
+  while (( $(date +%s) <= deadline )); do
+    local http_status error_code payload_error_code
+    http_status="$(http_call "GET" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/status" "$node_status_body")"
+    error_code="$(json_pick "$node_status_body" error_code)"
+    payload_error_code="$(json_pick "$node_status_body" payload error_code)"
+    if [[ "$http_status" == "404" || "$error_code" == "NODE_NOT_FOUND" || "$payload_error_code" == "NODE_NOT_FOUND" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "FAIL: timeout waiting node status absence for ${NODE_NAME}@${HIVE_ID}" >&2
+  cat "$node_status_body" >&2 || true
+  return 1
+}
+
 require_cmd bash
 require_cmd curl
 require_cmd python3
@@ -416,7 +434,7 @@ if [[ "$kill_http" != "200" || "$kill_status" != "ok" ]]; then
   cat "$kill_body" >&2 || true
   exit 1
 fi
-wait_inventory_state "absent"
+wait_node_absent
 
 echo "status=ok"
 echo "hive_id=$HIVE_ID"
