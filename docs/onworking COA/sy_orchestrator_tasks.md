@@ -115,15 +115,15 @@ Objetivo:
   - opcionalmente `target_hives`
 - [x] R3-T2. Hacer que el update puntual no falle ni quede en `sync_pending` por faltantes de `AI.*` / `IO.*` / `WF.*` ajenos al runtime solicitado.
 - [x] R3-T3. Mantener una validación global aparte para salud general del sistema, sin usarla como bloqueo duro del deploy puntual.
-- [ ] R3-T4. Documentar la semántica nueva:
+- [x] R3-T4. Documentar la semántica nueva:
   - `targeted readiness`
   - vs `global runtime health`
 
 ### Fase R4 - Retención segura y no destructiva
 - [x] R4-T1. Evitar `apply_runtime_retention` destructivo antes de validar convergencia del runtime objetivo.
 - [x] R4-T2. Si el sistema está en `sync_pending`, usar modo de retención no destructivo o diferir la poda.
-- [ ] R4-T3. Garantizar que un runtime recién publicado y materializado no pueda ser podado durante la misma ventana en la que todavía se está verificando.
-- [ ] R4-T4. Agregar evidencia explícita en logs cuando un runtime/version quede retenido por protección de convergencia.
+- [x] R4-T3. Garantizar que un runtime recién publicado y materializado no pueda ser podado durante la misma ventana en la que todavía se está verificando.
+- [x] R4-T4. Agregar evidencia explícita en logs cuando un runtime/version quede retenido por protección de convergencia.
 
 ### Fase R5 - Materialization state explícito
 - [x] R5-T1. Exponer estado de materialización local por `runtime/version`:

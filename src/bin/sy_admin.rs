@@ -3979,6 +3979,10 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "update" => vec![
             "Legacy fields version/hash are rejected; use manifest_version/manifest_hash.",
+            "For category=runtime you may optionally scope the update with runtime + runtime_version.",
+            "Scoped runtime update uses targeted readiness for that runtime/version and no longer blocks on unrelated missing runtimes in the same manifest.",
+            "The response still includes global_runtime_health so operators can see overall runtime drift without turning it into a hard blocker for the targeted deploy.",
+            "Use GET /hives/{hive}/runtimes/{runtime} to inspect readiness/materialization for one runtime before or after update.",
         ],
         "sync_hint" => vec![
             "Defaults are channel=blob, wait_for_idle=true, timeout_ms=30000.",

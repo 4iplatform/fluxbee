@@ -50,6 +50,7 @@ const PRIMARY_HIVE_ID: &str = "motherbee";
 const ORCH_SUDOERS_PATH: &str = "/etc/sudoers.d/fluxbee-orchestrator";
 const ORCH_SSH_GATE_PATH: &str = "/usr/local/bin/fluxbee-ssh-gate.sh";
 const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
+const RUNTIME_RETENTION_PROTECTION_WINDOW_SECS: u64 = 600;
 const NATS_BOOTSTRAP_TIMEOUT_SECS: u64 = 20;
 const STORAGE_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_TIMEOUT_SECS: u64 = 30;
@@ -351,6 +352,8 @@ struct DriftAlertEntry {
 struct RuntimeRetentionStats {
     removed_runtime_dirs: u64,
     removed_version_dirs: u64,
+    protected_runtime_dirs: u64,
+    protected_version_dirs: u64,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -372,6 +375,7 @@ struct OrchestratorState {
     tracked_nodes: Mutex<HashSet<String>>,
     system_allowed_origins: HashSet<String>,
     runtime_manifest: Mutex<Option<RuntimeManifest>>,
+    protected_runtime_versions: Mutex<HashMap<(String, String), Instant>>,
     runtime_lifecycle_lock: Mutex<()>,
     last_runtime_verify: Mutex<Instant>,
     last_blob_gc: Mutex<Instant>,
@@ -491,6 +495,7 @@ async fn main() -> Result<(), OrchestratorError> {
         tracked_nodes: Mutex::new(HashSet::new()),
         system_allowed_origins,
         runtime_manifest: Mutex::new(runtime_manifest),
+        protected_runtime_versions: Mutex::new(HashMap::new()),
         runtime_lifecycle_lock: Mutex::new(()),
         last_runtime_verify: Mutex::new(Instant::now()),
         last_blob_gc: Mutex::new(Instant::now()),
@@ -2170,6 +2175,20 @@ async fn apply_system_update_local(
         "runtime" => {
             let manifest =
                 load_runtime_manifest_result()?.ok_or("runtime manifest missing locally")?;
+            let protected_versions = protect_runtime_versions_from_scope(
+                state,
+                &manifest,
+                request.runtime.as_deref(),
+                request.runtime_version.as_deref(),
+            )
+            .await?;
+            if !protected_versions.is_empty() {
+                tracing::info!(
+                    protected_versions = ?protected_versions,
+                    window_secs = RUNTIME_RETENTION_PROTECTION_WINDOW_SECS,
+                    "runtime update registered temporary retention protection for requested scope"
+                );
+            }
             let artifact_errors = verify_runtime_artifacts_for_scope(
                 &manifest,
                 Path::new(DIST_RUNTIME_ROOT_DIR),
@@ -2189,7 +2208,22 @@ async fn apply_system_update_local(
                     errors: artifact_errors,
                 });
             }
-            apply_runtime_retention(&manifest)?;
+            let protected_keep_versions = protected_runtime_keep_versions(state).await;
+            let retention = apply_runtime_retention_with_roots_and_protection(
+                &manifest,
+                &runtimes_root(),
+                &node_files_root(),
+                &protected_keep_versions,
+            )?;
+            if retention.protected_runtime_dirs > 0 || retention.protected_version_dirs > 0 {
+                tracing::info!(
+                    protected_runtime_dirs = retention.protected_runtime_dirs,
+                    protected_version_dirs = retention.protected_version_dirs,
+                    removed_runtime_dirs = retention.removed_runtime_dirs,
+                    removed_version_dirs = retention.removed_version_dirs,
+                    "runtime retention applied with temporary protection entries"
+                );
+            }
             Ok(SystemUpdateApplyResult {
                 status: "ok".to_string(),
                 updated: Vec::new(),
@@ -7204,6 +7238,72 @@ fn runtime_keep_versions(
     Ok(keep_map)
 }
 
+async fn protect_runtime_versions_from_scope(
+    state: &OrchestratorState,
+    manifest: &RuntimeManifest,
+    runtime_filter: Option<&str>,
+    runtime_version_filter: Option<&str>,
+) -> Result<Vec<(String, String)>, OrchestratorError> {
+    let Some(runtime_filter) = runtime_filter else {
+        return Ok(Vec::new());
+    };
+
+    let runtime_key = resolve_runtime_key(manifest, runtime_filter)?;
+    let requested_version = runtime_version_filter.unwrap_or("current");
+    let resolved_version = resolve_runtime_version(manifest, &runtime_key, requested_version)?;
+    let runtimes = runtime_manifest_entry_map(manifest)?;
+
+    let mut protected = vec![(runtime_key.clone(), resolved_version)];
+    if let Some(entry) = runtimes.get(&runtime_key) {
+        if matches!(runtime_package_type(entry), "config_only" | "workflow") {
+            if let Some(runtime_base) = entry
+                .runtime_base
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if let Some(base_entry) = runtimes.get(runtime_base) {
+                    if let Some(base_version) = base_entry
+                        .current
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        protected.push((runtime_base.to_string(), base_version.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut guard = state.protected_runtime_versions.lock().await;
+    let now = Instant::now();
+    let expires_at = now + Duration::from_secs(RUNTIME_RETENTION_PROTECTION_WINDOW_SECS);
+    guard.retain(|_, value| *value > now);
+    for (runtime, version) in &protected {
+        guard.insert((runtime.clone(), version.clone()), expires_at);
+    }
+
+    Ok(protected)
+}
+
+async fn protected_runtime_keep_versions(
+    state: &OrchestratorState,
+) -> HashMap<String, HashSet<String>> {
+    let mut guard = state.protected_runtime_versions.lock().await;
+    let now = Instant::now();
+    guard.retain(|_, value| *value > now);
+
+    let mut keep_map: HashMap<String, HashSet<String>> = HashMap::new();
+    for ((runtime, version), _) in guard.iter() {
+        keep_map
+            .entry(runtime.clone())
+            .or_default()
+            .insert(version.clone());
+    }
+    keep_map
+}
+
 fn persisted_runtime_keep_versions_with_root(
     nodes_root: &Path,
 ) -> Result<HashMap<String, HashSet<String>>, OrchestratorError> {
@@ -7465,6 +7565,20 @@ fn apply_runtime_retention_with_roots(
     runtimes_root: &Path,
     nodes_root: &Path,
 ) -> Result<RuntimeRetentionStats, OrchestratorError> {
+    apply_runtime_retention_with_roots_and_protection(
+        manifest,
+        runtimes_root,
+        nodes_root,
+        &HashMap::new(),
+    )
+}
+
+fn apply_runtime_retention_with_roots_and_protection(
+    manifest: &RuntimeManifest,
+    runtimes_root: &Path,
+    nodes_root: &Path,
+    protected_keep_versions: &HashMap<String, HashSet<String>>,
+) -> Result<RuntimeRetentionStats, OrchestratorError> {
     let mut keep_map = runtime_keep_versions(manifest)?;
     for (runtime, versions) in persisted_runtime_keep_versions_with_root(nodes_root)? {
         keep_map.entry(runtime).or_default().extend(versions);
@@ -7489,11 +7603,27 @@ fn apply_runtime_retention_with_roots(
             continue;
         }
         let runtime_dir = entry.path();
-        let Some(keep_versions) = keep_map.get(&runtime) else {
+        let mut combined_keep_versions = keep_map.get(&runtime).cloned().unwrap_or_default();
+        let protected_versions = protected_keep_versions
+            .get(&runtime)
+            .cloned()
+            .unwrap_or_default();
+        if !protected_versions.is_empty() {
+            combined_keep_versions.extend(protected_versions.iter().cloned());
+        }
+        if combined_keep_versions.is_empty() {
             fs::remove_dir_all(&runtime_dir)?;
             stats.removed_runtime_dirs += 1;
             continue;
-        };
+        }
+        if keep_map.get(&runtime).is_none() && !protected_versions.is_empty() {
+            stats.protected_runtime_dirs += 1;
+            tracing::info!(
+                runtime = %runtime,
+                protected_versions = ?protected_versions,
+                "runtime retention preserved runtime directory due temporary convergence protection"
+            );
+        }
 
         for version_entry in fs::read_dir(&runtime_dir)? {
             let version_entry = version_entry?;
@@ -7509,7 +7639,17 @@ fn apply_runtime_retention_with_roots(
                 );
                 continue;
             }
-            if keep_versions.contains(&version) {
+            if combined_keep_versions.contains(&version) {
+                if protected_versions.contains(&version)
+                    && !keep_map.get(&runtime).is_some_and(|v| v.contains(&version))
+                {
+                    stats.protected_version_dirs += 1;
+                    tracing::info!(
+                        runtime = %runtime,
+                        version = %version,
+                        "runtime retention preserved version due temporary convergence protection"
+                    );
+                }
                 continue;
             }
             fs::remove_dir_all(version_entry.path())?;
@@ -7727,9 +7867,27 @@ async fn runtime_verify_and_retain(state: &OrchestratorState) -> Result<(), Orch
             );
             return Ok(());
         }
-        if let Err(err) = apply_runtime_retention(&manifest) {
-            tracing::warn!(error = %err, "runtime retention failed during watchdog verify");
-            return Ok(());
+        let protected_keep_versions = protected_runtime_keep_versions(state).await;
+        let retention = match apply_runtime_retention_with_roots_and_protection(
+            &manifest,
+            &runtimes_root(),
+            &node_files_root(),
+            &protected_keep_versions,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = %err, "runtime retention failed during watchdog verify");
+                return Ok(());
+            }
+        };
+        if retention.protected_runtime_dirs > 0 || retention.protected_version_dirs > 0 {
+            tracing::info!(
+                protected_runtime_dirs = retention.protected_runtime_dirs,
+                protected_version_dirs = retention.protected_version_dirs,
+                removed_runtime_dirs = retention.removed_runtime_dirs,
+                removed_version_dirs = retention.removed_version_dirs,
+                "watchdog verify: runtime retention kept protected versions during convergence window"
+            );
         }
         tracing::info!("watchdog verify: runtime retention applied (software updates use SYSTEM_UPDATE per hive)");
     }
@@ -14974,6 +15132,56 @@ blob:
     }
 
     #[test]
+    fn apply_runtime_retention_with_roots_and_protection_keeps_temporarily_protected_version() {
+        let root =
+            std::env::temp_dir().join(format!("fluxbee-retention-protected-{}", Uuid::new_v4()));
+        let runtimes_root = root.join("runtimes");
+        let nodes_root = root.join("nodes");
+        let protected_runtime_dir = runtimes_root.join("AI.common").join("0.1.2");
+        let sibling_runtime_dir = runtimes_root.join("AI.common").join("0.1.1");
+
+        fs::create_dir_all(&protected_runtime_dir).expect("create protected runtime dir");
+        fs::create_dir_all(&sibling_runtime_dir).expect("create sibling runtime dir");
+        fs::create_dir_all(&nodes_root).expect("create nodes root");
+
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-03-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+
+        let mut protected_keep: HashMap<String, HashSet<String>> = HashMap::new();
+        protected_keep
+            .entry("AI.common".to_string())
+            .or_default()
+            .insert("0.1.2".to_string());
+
+        let stats = apply_runtime_retention_with_roots_and_protection(
+            &manifest,
+            &runtimes_root,
+            &nodes_root,
+            &protected_keep,
+        )
+        .expect("retention with protection should succeed");
+
+        assert!(
+            protected_runtime_dir.exists(),
+            "protected version should be kept during temporary retention window"
+        );
+        assert!(
+            !sibling_runtime_dir.exists(),
+            "unprotected sibling version should still be pruned"
+        );
+        assert_eq!(stats.protected_runtime_dirs, 1);
+        assert_eq!(stats.protected_version_dirs, 1);
+        assert_eq!(stats.removed_version_dirs, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn runtime_dependents_summary_detects_published_dependents() {
         let manifest = RuntimeManifest {
             schema_version: 1,
@@ -15024,6 +15232,7 @@ blob:
             tracked_nodes: Mutex::new(HashSet::new()),
             system_allowed_origins: HashSet::new(),
             runtime_manifest: Mutex::new(None),
+            protected_runtime_versions: Mutex::new(HashMap::new()),
             runtime_lifecycle_lock: Mutex::new(()),
             last_runtime_verify: Mutex::new(Instant::now()),
             last_blob_gc: Mutex::new(Instant::now()),

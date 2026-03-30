@@ -221,11 +221,19 @@ Important:
 
 - `update_status=sync_pending` is not a failure by itself
 - the correct post-publish check is runtime readiness in `/hives/<hive>/versions`
+- for runtime-only validation/materialization you can scope update with `runtime` + `runtime_version`
+- targeted runtime update may return `global_runtime_health` as context, but unrelated global drift should not block the targeted deploy
 
 #### Check readiness on the target hive
 
 ```bash
 curl -sS "$BASE/hives/$TARGET_HIVE/versions" | jq .
+```
+
+For one runtime with explicit materialization details:
+
+```bash
+curl -sS "$BASE/hives/$TARGET_HIVE/runtimes/$RUNTIME_NAME" | jq .
 ```
 
 Expected for `full_runtime`:

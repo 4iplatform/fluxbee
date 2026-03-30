@@ -835,7 +835,9 @@ Request:
   "payload": {
     "category": "runtime",
     "manifest_version": 14,
-    "manifest_hash": "sha256:a1b2c3..."
+    "manifest_hash": "sha256:a1b2c3...",
+    "runtime": "AI.common",
+    "runtime_version": "0.1.2"
   }
 }
 ```
@@ -847,6 +849,17 @@ Campos de request (`payload`):
 | `category` | string | No | `runtime`, `core`, `vendor` | Default: `runtime` |
 | `manifest_version` | u64 | No | >= 0 | No acepta alias legacy (`version`) |
 | `manifest_hash` | string | Sí | `sha256:...` o hash hex | No acepta alias legacy (`hash`) |
+| `runtime` | string | No | token runtime | Solo para `category=runtime`; habilita validación puntual |
+| `runtime_version` | string | No | versión runtime o `current` | Requiere `runtime`; solo para `category=runtime` |
+
+Semántica de `SYSTEM_UPDATE category=runtime`:
+
+- Sin `runtime`:
+  - valida el estado global de los runtimes `current` del manifest local.
+- Con `runtime` y opcional `runtime_version`:
+  - usa **targeted readiness** para ese runtime/version puntual.
+  - no debe bloquear por faltantes de otros runtimes ajenos al objetivo.
+  - la respuesta puede incluir `global_runtime_health` como contexto, pero ese estado global no actúa como bloqueo duro del deploy puntual.
 
 Response (`SYSTEM_UPDATE_RESPONSE`):
 
@@ -863,6 +876,21 @@ Response (`SYSTEM_UPDATE_RESPONSE`):
     "manifest_version": 14,
     "local_manifest_version": 14,
     "local_manifest_hash": "sha256:a1b2c3...",
+    "runtime": "AI.common",
+    "runtime_version": "0.1.2",
+    "readiness_scope": "targeted",
+    "targeted_runtime_health": {
+      "scope": "targeted",
+      "status": "ok",
+      "error_count": 0,
+      "errors": []
+    },
+    "global_runtime_health": {
+      "scope": "global_current",
+      "status": "degraded",
+      "error_count": 2,
+      "errors": ["..."]
+    },
     "updated": [],
     "unchanged": ["runtime-manifest"],
     "restarted": [],
@@ -876,7 +904,7 @@ Estados canónicos (`payload.status`):
 | Status | Significado |
 |--------|-------------|
 | `ok` | Update aplicado correctamente |
-| `sync_pending` | Manifest local aún no converge con el esperado |
+| `sync_pending` | Manifest local o artifacts del scope solicitado aún no convergen |
 | `partial` | Aplicación parcial (reservado para extensiones/handlers futuros) |
 | `error` | Fallo sin rollback exitoso |
 | `rollback` | Falló el update y se restauró versión previa (ej. `core`) |

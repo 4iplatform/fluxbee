@@ -172,6 +172,21 @@ curl -sS -X POST "$BASE/hives/$TARGET_HIVE/update" \
 Si devuelve `payload.status=sync_pending`, esperá unos segundos y repetí el `POST /update`.
 Si devuelve `payload.status=error` con `error_code=VERSION_MISMATCH`, no reintentes con la misma versión pedida: tomá el `manifest_version` vigente desde motherbee y reenviá el update.
 
+Semántica actual:
+
+- sin `runtime`, `SYSTEM_UPDATE category=runtime` valida el estado global de los runtimes `current` del manifest local;
+- con `runtime` y opcionalmente `runtime_version`, usa **targeted readiness** para ese runtime/version puntual.
+
+Ejemplo targeted:
+
+```bash
+curl -sS -X POST "$BASE/hives/$TARGET_HIVE/update" \
+  -H "Content-Type: application/json" \
+  -d "{\"category\":\"runtime\",\"manifest_version\":$MANIFEST_VERSION,\"manifest_hash\":\"$MANIFEST_HASH\",\"runtime\":\"$RUNTIME\",\"runtime_version\":\"$RUNTIME_VERSION\"}"; echo
+```
+
+En modo targeted, la respuesta puede seguir trayendo `global_runtime_health` como contexto, pero ese degradado global no debe bloquear el deploy puntual del runtime objetivo.
+
 Loop recomendado:
 
 ```bash
@@ -213,6 +228,19 @@ echo "$resp_target" | jq -e --arg rt "$RUNTIME" '
 }
 ```
 
+Para diagnóstico fino del runtime puntual:
+
+```bash
+curl -sS "$BASE/hives/$TARGET_HIVE/runtimes/$RUNTIME" | jq .
+```
+
+Ese endpoint expone:
+
+- `readiness`
+- `materialization`
+- `targeted_runtime_health`
+- `global_runtime_health`
+
 ## 7. Ejecutar nodo en el hive destino
 
 ```bash
@@ -246,9 +274,9 @@ curl -sS -X DELETE "$BASE/hives/$TARGET_HIVE/nodes/$NODE_NAME" \
 ## Troubleshooting rápido
 
 - `RUNTIME_NOT_AVAILABLE`: el `runtime` enviado no existe en manifest (revisar nombre exacto/case).
-- `RUNTIME_NOT_PRESENT`: existe en manifest pero falta `start.sh` en el hive destino (sync aún no convergió) o `start.sh` no es ejecutable.
+- `RUNTIME_NOT_PRESENT`: existe en manifest pero la materialización local no está lista; revisar `materialization.blocking_reason` y `targeted_runtime_health`.
 - `sync_pending` en `/sync-hint`: Syncthing aún no llegó a `idle` para `fluxbee-dist`.
-- `sync_pending` en `/update`: el destino todavía no tiene el manifest/hash esperado o faltan artefactos runtime locales.
+- `sync_pending` en `/update`: el destino todavía no tiene el manifest/hash esperado o faltan artefactos del scope validado.
 - `VERSION_MISMATCH` en `/update`: el destino tiene manifest local más nuevo que el solicitado (`local_manifest_version > manifest_version`).
 - `IDENTITY_REGISTER_FAILED`: faltó `tenant_id` en `POST /nodes` (runtime con identity strict).
 - `FORBIDDEN` en `/update`: origen no autorizado para acciones de sistema (revisar allowlist de system messages).
