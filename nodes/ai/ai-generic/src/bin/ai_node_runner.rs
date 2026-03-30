@@ -4,7 +4,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
@@ -450,6 +450,11 @@ impl SharedRouterConnection {
     async fn write(&self, msg: Message) -> fluxbee_ai_sdk::Result<()> {
         let guard = self.inner.lock().await;
         guard.writer.write(msg).await
+    }
+
+    async fn is_connected(&self) -> bool {
+        let guard = self.inner.lock().await;
+        guard.reader.is_connected()
     }
 }
 
@@ -2031,6 +2036,8 @@ async fn run_single_connection_runtime(
 
     let mut read_messages = 0u64;
     let mut idle_read_timeouts = 0u64;
+    let mut reconnect_events = 0u64;
+    let mut reconnect_wait_cycles = 0u64;
     let mut processed_messages = 0u64;
     let mut responses_sent = 0u64;
     let mut retry_attempts = 0u64;
@@ -2049,6 +2056,8 @@ async fn run_single_connection_runtime(
                     tracing::debug!(
                         read_messages,
                         idle_read_timeouts,
+                        reconnect_events,
+                        reconnect_wait_cycles,
                         enqueued_messages = read_messages,
                         processed_messages,
                         responses_sent,
@@ -2059,6 +2068,16 @@ async fn run_single_connection_runtime(
                     );
                     next_metrics_log = Instant::now() + config.metrics_log_interval;
                 }
+                continue;
+            }
+            Err(err) if is_transient_link_error(&err) => {
+                reconnect_events = reconnect_events.saturating_add(1);
+                tracing::warn!(
+                    error = %err,
+                    "ai runtime disconnected from router; entering reconnect wait"
+                );
+                reconnect_wait_cycles = reconnect_wait_cycles
+                    .saturating_add(wait_for_shared_reconnect(connection.as_ref()).await);
                 continue;
             }
             Err(err) => return Err(err),
@@ -2120,6 +2139,8 @@ async fn run_single_connection_runtime(
             tracing::debug!(
                 read_messages,
                 idle_read_timeouts,
+                reconnect_events,
+                reconnect_wait_cycles,
                 enqueued_messages = read_messages,
                 processed_messages,
                 responses_sent,
@@ -2131,6 +2152,53 @@ async fn run_single_connection_runtime(
             next_metrics_log = Instant::now() + config.metrics_log_interval;
         }
     }
+}
+
+fn is_transient_link_error(err: &fluxbee_ai_sdk::errors::AiSdkError) -> bool {
+    matches!(
+        err,
+        fluxbee_ai_sdk::errors::AiSdkError::Node(NodeError::Io(_) | NodeError::Disconnected)
+    )
+}
+
+async fn wait_for_shared_reconnect(connection: &SharedRouterConnection) -> u64 {
+    let mut attempt: u64 = 0;
+    let mut wait_cycles: u64 = 0;
+    let mut backoff = Duration::from_millis(200);
+    let max_backoff = Duration::from_secs(5);
+
+    loop {
+        if connection.is_connected().await {
+            tracing::info!(attempt, "ai runtime reconnected to router");
+            return wait_cycles;
+        }
+
+        attempt = attempt.saturating_add(1);
+        wait_cycles = wait_cycles.saturating_add(1);
+        let wait_for = with_jitter(backoff);
+        tracing::info!(
+            attempt,
+            backoff_ms = backoff.as_millis() as u64,
+            wait_ms = wait_for.as_millis() as u64,
+            "ai runtime reconnecting to router"
+        );
+        tokio::time::sleep(wait_for).await;
+        backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
+    }
+}
+
+fn with_jitter(base: Duration) -> Duration {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter_factor_percent = nanos % 25;
+    let jitter = base
+        .as_millis()
+        .saturating_mul(jitter_factor_percent as u128)
+        / 100;
+    let total = base.as_millis().saturating_add(jitter);
+    Duration::from_millis(total as u64)
 }
 
 async fn run_one_config(
