@@ -182,15 +182,22 @@ Variables recomendadas para frontdesk gov:
 
 ## 8) Importante: estado actual del runner IA
 
-Hoy `ai_node_runner` soporta:
-- YAML (`--config ...`) y
-- estado dinámico persistido en `/var/lib/fluxbee/state/ai-nodes/<node>.json` (Control Plane `CONFIG_SET`)
+Hoy hay dos persistencias distintas por capa:
+- `config.json` de orchestrator en `/var/lib/fluxbee/nodes/<TYPE>/<node@hive>/config.json` (infra/bootstrap).
+- estado dinámico del nodo en `/var/lib/fluxbee/state/ai-nodes/<node>.json` (runtime/business, vía `CONFIG_SET`).
 
-No tiene todavía una integración cerrada de hot-reload por `CONFIG_CHANGED` basada en `config.json` de orchestrator equivalente a IO Slack.
+Precedencia efectiva actual del runner AI (flujo managed-node):
+1. estado dinámico persistido por `CONFIG_SET`
+2. fallback a `config.json` de orchestrator
+3. `UNCONFIGURED`
+
+Hot reload actual:
+- confiable/canónico: `POST .../control/config-set` (`CONFIG_SET`).
+- `CONFIG_CHANGED` (enviado por core después de `PUT .../config`) todavía no está cerrado end-to-end como hot reload AI.
 
 Conclusión operativa:
 - para código: `publish -> update -> spawn` (canónico) ya sirve.
-- para config/prompt obligatoria en runtime: usá `CONFIG_SET`/estado dinámico del runner o flujo systemd+YAML hasta cerrar el hot-reload end-to-end de `config.json`.
+- para prompt/key/behavior en runtime: usar `CONFIG_SET` (control plane del nodo).
 
 
 ---

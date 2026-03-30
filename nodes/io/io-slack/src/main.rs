@@ -9,7 +9,19 @@ use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
 };
 use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
+use io_common::io_adapter_config::{
+    apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
+};
 use io_common::io_context::{extract_slack_post_target, slack_inbound_io_context};
+use io_common::io_control_plane::{
+    build_io_config_get_response_payload, build_io_config_response_message,
+    build_io_config_set_error_payload, build_io_config_set_ok_payload,
+    parse_and_validate_io_control_plane_request, IoConfigSource, IoControlPlaneErrorInfo,
+    IoControlPlaneRequest, IoControlPlaneState, IoNodeLifecycleState,
+};
+use io_common::io_control_plane_bootstrap::bootstrap_io_control_plane_state;
+use io_common::io_control_plane_store::{default_state_dir, persist_io_control_plane_state};
+use io_common::io_slack_adapter_config::IoSlackAdapterConfigContract;
 use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox};
 use io_common::text_v1_blob::{
     build_text_v1_inbound_payload, resolve_text_v1_for_outbound, InboundAttachmentInput,
@@ -19,10 +31,11 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use url::Url;
 
@@ -43,6 +56,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         node_name = %config.node_name,
         router_socket = %config.router_socket.display(),
+        state_dir = %config.state_dir.display(),
         dst_node = %config.dst_node.clone().unwrap_or_else(|| "resolve".to_string()),
         dev_mode = %config.dev_mode,
         "io-slack starting"
@@ -101,9 +115,28 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let control_plane = Arc::new(RwLock::new(
+        bootstrap_io_control_plane_state(&config.state_dir, &config.node_name).unwrap_or_else(
+            |err| {
+                tracing::warn!(
+                    error = %err,
+                    state_dir = %config.state_dir.display(),
+                    node_name = %config.node_name,
+                    "failed to bootstrap IO control-plane state; using UNCONFIGURED"
+                );
+                IoControlPlaneState::default()
+            },
+        ),
+    ));
+    let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoSlackAdapterConfigContract);
 
     let outbound_task = tokio::spawn(run_outbound_loop(
         inbox.clone(),
+        sender.clone(),
+        config.node_name.clone(),
+        config.state_dir.clone(),
+        control_plane.clone(),
+        adapter_contract.clone(),
         slack.clone(),
         blob_toolkit.clone(),
         blob_payload_cfg.clone(),
@@ -135,6 +168,7 @@ struct Config {
     router_socket: PathBuf,
     uuid_persistence_dir: PathBuf,
     config_dir: PathBuf,
+    state_dir: PathBuf,
     dev_mode: bool,
     ttl: u32,
     dedup_ttl_ms: u64,
@@ -368,6 +402,15 @@ impl Config {
                     })
                     .unwrap_or_else(|| env_config_dir.display().to_string()),
             ),
+            state_dir: env("STATE_DIR")
+                .or_else(|| {
+                    json_get_string_opt(
+                        spawn_cfg.as_ref().map(|c| &c.doc),
+                        &["node.state_dir", "state_dir"],
+                    )
+                })
+                .map(PathBuf::from)
+                .unwrap_or_else(default_state_dir),
             dev_mode: env_bool("DEV_MODE").unwrap_or(false),
             ttl: env("TTL")
                 .and_then(|v| v.parse().ok())
@@ -1505,6 +1548,11 @@ fn slack_external_id(node_name: &str, user_id: &str) -> String {
 
 async fn run_outbound_loop(
     inbox: Arc<Mutex<RouterInbox>>,
+    sender: NodeSender,
+    node_name: String,
+    state_dir: PathBuf,
+    control_plane: Arc<RwLock<IoControlPlaneState>>,
+    adapter_contract: Arc<dyn IoAdapterConfigContract>,
     slack: Arc<SlackClients>,
     blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
     blob_payload_cfg: IoTextBlobConfig,
@@ -1530,6 +1578,25 @@ async fn run_outbound_loop(
             payload_type = %payload_type,
             "outbound received from router"
         );
+
+        if let Some(response) = handle_io_control_plane_message(
+            &msg,
+            &node_name,
+            &state_dir,
+            control_plane.clone(),
+            adapter_contract.as_ref(),
+        )
+        .await
+        {
+            if let Err(err) = sender.send(response).await {
+                tracing::warn!(
+                    error = ?err,
+                    trace_id = %msg.routing.trace_id,
+                    "failed to send CONFIG_RESPONSE"
+                );
+            }
+            continue;
+        }
 
         let Some(meta_context) = msg.meta.context.as_ref() else {
             tracing::debug!(
@@ -1671,6 +1738,132 @@ async fn run_outbound_loop(
             }
         }
     }
+}
+
+async fn handle_io_control_plane_message(
+    msg: &fluxbee_sdk::protocol::Message,
+    node_name: &str,
+    state_dir: &Path,
+    control_plane: Arc<RwLock<IoControlPlaneState>>,
+    adapter_contract: &dyn IoAdapterConfigContract,
+) -> Option<fluxbee_sdk::protocol::Message> {
+    let command = msg.meta.msg.as_deref().unwrap_or_default();
+    if !msg.meta.msg_type.eq_ignore_ascii_case("system") {
+        return None;
+    }
+    if !command.eq_ignore_ascii_case("CONFIG_GET") && !command.eq_ignore_ascii_case("CONFIG_SET") {
+        return None;
+    }
+
+    let payload = match parse_and_validate_io_control_plane_request(msg, node_name) {
+        Ok(IoControlPlaneRequest::Get(_)) => {
+            let state = control_plane.read().await.clone();
+            let redacted = redact_state(&state, adapter_contract);
+            build_io_config_get_response_payload(
+                node_name,
+                &redacted,
+                build_io_adapter_contract_payload(
+                    adapter_contract,
+                    state.effective_config.as_ref(),
+                ),
+            )
+        }
+        Ok(IoControlPlaneRequest::Set(set_payload)) => {
+            apply_io_config_set(
+                &set_payload,
+                node_name,
+                state_dir,
+                control_plane.clone(),
+                adapter_contract,
+            )
+            .await
+        }
+        Err(err) => {
+            let state = control_plane.read().await.clone();
+            let redacted = redact_state(&state, adapter_contract);
+            build_io_config_set_error_payload(node_name, &redacted, err.code(), err.to_string())
+        }
+    };
+
+    Some(build_io_config_response_message(msg, payload))
+}
+
+async fn apply_io_config_set(
+    payload: &fluxbee_sdk::node_config::NodeConfigSetPayload,
+    node_name: &str,
+    state_dir: &Path,
+    control_plane: Arc<RwLock<IoControlPlaneState>>,
+    adapter_contract: &dyn IoAdapterConfigContract,
+) -> Value {
+    let mut state = control_plane.write().await;
+
+    if payload.config_version <= state.config_version {
+        let redacted = redact_state(&state, adapter_contract);
+        return build_io_config_set_error_payload(
+            node_name,
+            &redacted,
+            "stale_config_version",
+            format!(
+                "config_version {} must be greater than current {}",
+                payload.config_version, state.config_version
+            ),
+        );
+    }
+
+    let effective = match apply_adapter_config_replace(adapter_contract, &payload.config) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            state.current_state = IoNodeLifecycleState::FailedConfig;
+            state.last_error = Some(IoControlPlaneErrorInfo {
+                code: err.code().to_string(),
+                message: err.to_string(),
+            });
+            let redacted = redact_state(&state, adapter_contract);
+            return build_io_config_set_error_payload(
+                node_name,
+                &redacted,
+                err.code(),
+                err.to_string(),
+            );
+        }
+    };
+
+    state.current_state = IoNodeLifecycleState::Configured;
+    state.config_source = IoConfigSource::Dynamic;
+    state.schema_version = payload.schema_version;
+    state.config_version = payload.config_version;
+    state.effective_config = Some(effective);
+    state.last_error = None;
+
+    if let Err(err) = persist_io_control_plane_state(state_dir, node_name, &state) {
+        state.current_state = IoNodeLifecycleState::FailedConfig;
+        state.last_error = Some(IoControlPlaneErrorInfo {
+            code: "config_persist_error".to_string(),
+            message: err.to_string(),
+        });
+        let redacted = redact_state(&state, adapter_contract);
+        return build_io_config_set_error_payload(
+            node_name,
+            &redacted,
+            "config_persist_error",
+            err.to_string(),
+        );
+    }
+
+    let redacted = redact_state(&state, adapter_contract);
+    build_io_config_set_ok_payload(node_name, &redacted)
+}
+
+fn redact_state(
+    state: &IoControlPlaneState,
+    adapter_contract: &dyn IoAdapterConfigContract,
+) -> IoControlPlaneState {
+    let mut redacted = state.clone();
+    redacted.effective_config = state
+        .effective_config
+        .as_ref()
+        .map(|cfg| adapter_contract.redact_effective_config(cfg));
+    redacted
 }
 
 fn render_outbound_text(payload: &Value) -> String {
