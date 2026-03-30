@@ -1678,7 +1678,7 @@ fn local_system_manifest_state(
             version: load_vendor_manifest()?.map(|manifest| manifest.version),
             hash: local_syncthing_vendor_hash()?,
         }),
-        _ => Err(format!("unknown system update category '{}'", request.category).into()),
+        _ => Err(format!("unknown system update category '{}'", category).into()),
     }
 }
 
@@ -2299,7 +2299,7 @@ async fn apply_system_update_local(
                 })
             }
         }
-        _ => Err(format!("unknown system update category '{}'", category).into()),
+        _ => Err(format!("unknown system update category '{}'", request.category).into()),
     }
 }
 
