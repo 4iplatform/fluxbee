@@ -135,17 +135,22 @@ Objetivo:
 - [x] R5-T3. Evaluar endpoint/admin payload para consultar materialización sin depender de inferencia indirecta desde `SYSTEM_UPDATE`.
 
 ### Fase R6 - E2E y criterio de cierre
-- [ ] R6-T1. Caso E2E positivo:
+- [x] R6-T1. Caso E2E positivo:
   - `publish` runtime nuevo,
   - `SYSTEM_UPDATE` puntual,
   - `spawn`,
   - ejecución correcta.
+  - Script agregado: `scripts/orchestrator_runtime_targeted_e2e.sh`
 - [ ] R6-T2. Caso E2E negativo:
   - faltantes globales en otros runtimes,
   - deploy puntual igual debe converger si el artifact objetivo está materializado.
 - [ ] R6-T3. Caso E2E de no-regresión:
   - watchdog/retry/retention no deben borrar el runtime recién publicado durante la ventana de verificación.
 - [ ] R6-T4. Cerrar workaround operativo actual (`reusar 0.1.0 y pisar binario`) una vez que el flujo puntual quede estable.
+
+Nota operativa:
+- En esta iteración se cubre solo `R6-T1`.
+- `R6-T2` a `R6-T4` quedan explícitamente para validación posterior de dev en worker real.
 
 ### Criterio de salida de este TODO
 - [ ] Un runtime nuevo puede publicarse, verificarse y spawnearse sin quedar bloqueado por faltantes globales no relacionados.
