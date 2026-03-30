@@ -100,6 +100,20 @@ pub enum IoControlPlaneValidationError {
     InvalidConfigShape,
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum IoControlPlaneVersionError {
+    #[error("config_version {incoming} must be greater than current {current}")]
+    StaleConfigVersion { incoming: u64, current: u64 },
+}
+
+impl IoControlPlaneVersionError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::StaleConfigVersion { .. } => "stale_config_version",
+        }
+    }
+}
+
 impl IoControlPlaneValidationError {
     pub fn code(&self) -> &'static str {
         match self {
@@ -111,6 +125,16 @@ impl IoControlPlaneValidationError {
             Self::InvalidConfigShape => "invalid_config",
         }
     }
+}
+
+pub fn ensure_config_version_advances(
+    incoming: u64,
+    current: u64,
+) -> Result<(), IoControlPlaneVersionError> {
+    if incoming <= current {
+        return Err(IoControlPlaneVersionError::StaleConfigVersion { incoming, current });
+    }
+    Ok(())
 }
 
 pub fn parse_and_validate_io_control_plane_request(
@@ -218,7 +242,9 @@ fn validate_target_node(
     })
 }
 
-fn validate_set_payload(payload: &NodeConfigSetPayload) -> Result<(), IoControlPlaneValidationError> {
+fn validate_set_payload(
+    payload: &NodeConfigSetPayload,
+) -> Result<(), IoControlPlaneValidationError> {
     if payload.schema_version == 0 {
         return Err(IoControlPlaneValidationError::InvalidSchemaVersion);
     }
@@ -387,7 +413,10 @@ mod tests {
         );
 
         assert_eq!(payload.get("ok"), Some(&Value::Bool(false)));
-        assert_eq!(payload.get("state"), Some(&Value::String("UNCONFIGURED".to_string())));
+        assert_eq!(
+            payload.get("state"),
+            Some(&Value::String("UNCONFIGURED".to_string()))
+        );
         assert_eq!(
             payload
                 .get("error")
@@ -416,5 +445,36 @@ mod tests {
 
         assert_eq!(response.routing.trace_id, "trace-9");
         assert_eq!(response.meta.msg.as_deref(), Some("CONFIG_RESPONSE"));
+    }
+
+    #[test]
+    fn config_version_accepts_strictly_greater_values() {
+        assert!(ensure_config_version_advances(8, 7).is_ok());
+    }
+
+    #[test]
+    fn config_version_rejects_equal_as_stale_replay() {
+        let err = ensure_config_version_advances(7, 7).expect_err("must be stale");
+        assert_eq!(
+            err,
+            IoControlPlaneVersionError::StaleConfigVersion {
+                incoming: 7,
+                current: 7,
+            }
+        );
+        assert_eq!(err.code(), "stale_config_version");
+    }
+
+    #[test]
+    fn config_version_rejects_lower_values() {
+        let err = ensure_config_version_advances(6, 7).expect_err("must be stale");
+        assert_eq!(
+            err,
+            IoControlPlaneVersionError::StaleConfigVersion {
+                incoming: 6,
+                current: 7,
+            }
+        );
+        assert_eq!(err.code(), "stale_config_version");
     }
 }

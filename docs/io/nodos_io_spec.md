@@ -151,6 +151,20 @@ Según la especificación del Router v1.16:
 ✅ **NORMATIVO (replace MVP)**:
 - Para MVP, se prioriza `apply_mode="replace"` y se permite luego `merge_patch` (RFC 7396) como mejora.
 
+### 3.1 Frontera explícita con core/orchestrator
+
+✅ **NORMATIVO**:
+- `PUT /hives/{hive}/nodes/{node}/config` (core/orchestrator) actualiza `config.json` administrado por plataforma.
+- Ese endpoint **NO reemplaza** el contrato runtime node-owned de IO (`CONFIG_SET` / `CONFIG_GET`).
+- Para hot reload operacional del adapter IO, el camino canónico es `POST .../control/config-set` (`CONFIG_SET`).
+
+### 3.2 Política IO para `CONFIG_CHANGED` (v1)
+
+✅ **NORMATIVO (v1, elegido)**:
+- `CONFIG_CHANGED` se trata como señal de infraestructura (informativa) en la capa IO.
+- No es el camino canónico para aplicar runtime/business config del adapter.
+- La aplicación runtime efectiva de configuración IO se realiza por `CONFIG_SET`.
+
 ### 4) Reglas de configuración: común vs adapter-specific
 
 ✅ **NORMATIVO**:

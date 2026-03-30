@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use fluxbee_sdk::protocol::{
-    Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND, MSG_TTL_EXCEEDED,
-    MSG_UNREACHABLE,
+    Destination, Message as WireMessage, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE,
+    SYSTEM_KIND,
 };
 use fluxbee_sdk::{NodeError, NodeReceiver, NodeSender, MSG_ILK_PROVISION};
 use tokio::sync::Mutex;
@@ -31,7 +31,10 @@ impl RouterInbox {
         }
     }
 
-    pub async fn recv_next_timeout(&mut self, timeout: Duration) -> anyhow::Result<Option<WireMessage>> {
+    pub async fn recv_next_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<WireMessage>> {
         if let Some(msg) = self.backlog.pop_front() {
             return Ok(Some(msg));
         }
@@ -154,7 +157,9 @@ impl FluxbeeIdentityProvisioner {
 
         let msg = {
             let mut inbox = self.inbox.lock().await;
-            inbox.recv_for_trace_id(&trace_id, self.config.timeout).await?
+            inbox
+                .recv_for_trace_id(&trace_id, self.config.timeout)
+                .await?
         };
         tracing::debug!(
             trace_id = %trace_id,
@@ -168,7 +173,10 @@ impl FluxbeeIdentityProvisioner {
 
 #[async_trait]
 impl IdentityProvisioner for FluxbeeIdentityProvisioner {
-    async fn provision(&self, input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
+    async fn provision(
+        &self,
+        input: &ResolveOrCreateInput,
+    ) -> Result<Option<String>, IdentityError> {
         match self.call_provision_target(&self.config.target, input).await {
             Ok(src_ilk) => Ok(Some(src_ilk)),
             Err(IdentityError::Unavailable) | Err(IdentityError::Other(_)) => {
@@ -196,7 +204,11 @@ impl IdentityProvisioner for FluxbeeIdentityProvisioner {
 
 fn parse_provision_response(msg: WireMessage) -> Result<String, IdentityError> {
     if msg.meta.msg.as_deref() == Some(MSG_ILK_PROVISION_RESPONSE) {
-        let status = msg.payload.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let status = msg
+            .payload
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if status.eq_ignore_ascii_case("ok") {
             if let Some(ilk_id) = msg.payload.get("ilk_id").and_then(|v| v.as_str()) {
                 if !ilk_id.trim().is_empty() {

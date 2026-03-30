@@ -36,10 +36,9 @@ impl IoAdapterConfigContract for IoSlackAdapterConfigContract {
     }
 
     fn validate_and_materialize(&self, candidate: &Value) -> Result<Value, IoAdapterConfigError> {
-        let mut cfg = candidate
-            .as_object()
-            .cloned()
-            .ok_or_else(|| IoAdapterConfigError::InvalidConfig("config must be an object".to_string()))?;
+        let mut cfg = candidate.as_object().cloned().ok_or_else(|| {
+            IoAdapterConfigError::InvalidConfig("config must be an object".to_string())
+        })?;
 
         ensure_object_field(&mut cfg, "slack")?;
         ensure_optional_object_field(&mut cfg, "io")?;
@@ -48,10 +47,11 @@ impl IoAdapterConfigContract for IoSlackAdapterConfigContract {
         ensure_optional_object_field(&mut cfg, "runtime")?;
 
         {
-            let slack = cfg
-                .get("slack")
-                .and_then(Value::as_object)
-                .ok_or_else(|| IoAdapterConfigError::Internal("slack object missing after normalization".to_string()))?;
+            let slack = cfg.get("slack").and_then(Value::as_object).ok_or_else(|| {
+                IoAdapterConfigError::Internal(
+                    "slack object missing after normalization".to_string(),
+                )
+            })?;
 
             let has_app = has_non_empty_string(slack, "app_token")
                 || has_non_empty_string(slack, "slack_app_token")

@@ -94,7 +94,10 @@ mod tests {
             &["fake adapter for tests"]
         }
 
-        fn validate_and_materialize(&self, candidate: &Value) -> Result<Value, IoAdapterConfigError> {
+        fn validate_and_materialize(
+            &self,
+            candidate: &Value,
+        ) -> Result<Value, IoAdapterConfigError> {
             let has_required = candidate
                 .get("fake")
                 .and_then(|v| v.get("required"))
@@ -110,10 +113,8 @@ mod tests {
         }
 
         fn secret_descriptors(&self, _effective: Option<&Value>) -> Vec<NodeSecretDescriptor> {
-            let mut descriptor = NodeSecretDescriptor::new(
-                "config.secrets.fake.token",
-                "fake_token",
-            );
+            let mut descriptor =
+                NodeSecretDescriptor::new("config.secrets.fake.token", "fake_token");
             descriptor.required = true;
             descriptor.configured = false;
             vec![descriptor]
@@ -134,8 +135,8 @@ mod tests {
     #[test]
     fn replace_validates_with_adapter_schema() {
         let adapter = FakeAdapter;
-        let err = apply_adapter_config_replace(&adapter, &json!({"fake":{}}))
-            .expect_err("must fail");
+        let err =
+            apply_adapter_config_replace(&adapter, &json!({"fake":{}})).expect_err("must fail");
         assert_eq!(
             err,
             IoAdapterConfigError::InvalidConfig("missing fake.required".to_string())
@@ -150,8 +151,14 @@ mod tests {
     fn contract_payload_exposes_common_surface() {
         let adapter = FakeAdapter;
         let payload = build_io_adapter_contract_payload(&adapter, None);
-        assert_eq!(payload.get("node_family"), Some(&Value::String("IO".to_string())));
-        assert_eq!(payload.get("node_kind"), Some(&Value::String("IO.fake".to_string())));
+        assert_eq!(
+            payload.get("node_family"),
+            Some(&Value::String("IO".to_string()))
+        );
+        assert_eq!(
+            payload.get("node_kind"),
+            Some(&Value::String("IO.fake".to_string()))
+        );
         assert_eq!(
             payload
                 .get("supports")

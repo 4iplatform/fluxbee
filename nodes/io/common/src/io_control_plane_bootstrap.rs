@@ -43,7 +43,8 @@ pub fn bootstrap_io_control_plane_state_with_nodes_root(
         return Ok(state_from_dynamic_file(dynamic));
     }
 
-    if let Some(orchestrator_cfg) = load_effective_config_from_orchestrator(node_name, nodes_root)? {
+    if let Some(orchestrator_cfg) = load_effective_config_from_orchestrator(node_name, nodes_root)?
+    {
         return Ok(orchestrator_cfg);
     }
 
@@ -167,8 +168,9 @@ mod tests {
         )
         .expect("write orchestrator cfg");
 
-        let boot = bootstrap_io_control_plane_state_with_nodes_root(&state_dir, node_name, &nodes_root)
-            .expect("bootstrap");
+        let boot =
+            bootstrap_io_control_plane_state_with_nodes_root(&state_dir, node_name, &nodes_root)
+                .expect("bootstrap");
         assert_eq!(boot.config_source, IoConfigSource::Dynamic);
         assert_eq!(boot.config_version, 9);
     }
@@ -192,8 +194,9 @@ mod tests {
         )
         .expect("write orchestrator cfg");
 
-        let boot = bootstrap_io_control_plane_state_with_nodes_root(&state_dir, node_name, &nodes_root)
-            .expect("bootstrap");
+        let boot =
+            bootstrap_io_control_plane_state_with_nodes_root(&state_dir, node_name, &nodes_root)
+                .expect("bootstrap");
         assert_eq!(boot.config_source, IoConfigSource::OrchestratorFallback);
         assert_eq!(boot.current_state, IoNodeLifecycleState::Configured);
         assert_eq!(boot.config_version, 4);
@@ -205,8 +208,9 @@ mod tests {
         let nodes_root = temp_dir("none-nodes");
         let node_name = "IO.slack.T123@motherbee";
 
-        let boot = bootstrap_io_control_plane_state_with_nodes_root(&state_dir, node_name, &nodes_root)
-            .expect("bootstrap");
+        let boot =
+            bootstrap_io_control_plane_state_with_nodes_root(&state_dir, node_name, &nodes_root)
+                .expect("bootstrap");
         assert_eq!(boot.current_state, IoNodeLifecycleState::Unconfigured);
         assert_eq!(boot.config_source, IoConfigSource::None);
         assert_eq!(boot.config_version, 0);

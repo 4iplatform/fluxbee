@@ -41,7 +41,10 @@ pub trait IdentityResolver: Send + Sync {
 
 #[async_trait]
 pub trait IdentityProvisioner: Send + Sync {
-    async fn provision(&self, input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError>;
+    async fn provision(
+        &self,
+        input: &ResolveOrCreateInput,
+    ) -> Result<Option<String>, IdentityError>;
 }
 
 #[derive(Default)]
@@ -55,7 +58,10 @@ impl DisabledIdentityProvisioner {
 
 #[async_trait]
 impl IdentityProvisioner for DisabledIdentityProvisioner {
-    async fn provision(&self, _input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
+    async fn provision(
+        &self,
+        _input: &ResolveOrCreateInput,
+    ) -> Result<Option<String>, IdentityError> {
         Ok(None)
     }
 }
@@ -171,7 +177,8 @@ impl IdentityResolver for ShmIdentityResolver {
     }
 
     fn lookup(&self, channel: &str, external_id: &str) -> Result<Option<String>, IdentityError> {
-        if channel.len() > self.channel_type_max_len || external_id.len() > self.external_id_max_len {
+        if channel.len() > self.channel_type_max_len || external_id.len() > self.external_id_max_len
+        {
             return Ok(None);
         }
         if self.hive_id.is_empty() {
