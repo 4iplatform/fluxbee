@@ -1678,7 +1678,7 @@ fn local_system_manifest_state(
             version: load_vendor_manifest()?.map(|manifest| manifest.version),
             hash: local_syncthing_vendor_hash()?,
         }),
-        _ => Err(format!("unknown system update category '{}'", category).into()),
+        _ => Err(format!("unknown system update category '{}'", request.category).into()),
     }
 }
 
@@ -11724,7 +11724,14 @@ async fn add_hive_finalize_local_flow(
     let mut errors: Vec<String> = Vec::new();
     let mut core_sync_pending = false;
 
-    let core_result = match apply_system_update_local(state, "core").await {
+    let core_request = SystemUpdateRequest {
+        category: "core".to_string(),
+        manifest_version: 0,
+        manifest_hash: String::new(),
+        runtime: None,
+        runtime_version: None,
+    };
+    let core_result = match apply_system_update_local(state, &core_request).await {
         Ok(result) => result,
         Err(err) => {
             let err_text = err.to_string();
@@ -11785,7 +11792,14 @@ async fn add_hive_finalize_local_flow(
     unchanged.extend(core_result.unchanged);
     restarted.extend(core_result.restarted);
 
-    let vendor_result = match apply_system_update_local(state, "vendor").await {
+    let vendor_request = SystemUpdateRequest {
+        category: "vendor".to_string(),
+        manifest_version: 0,
+        manifest_hash: String::new(),
+        runtime: None,
+        runtime_version: None,
+    };
+    let vendor_result = match apply_system_update_local(state, &vendor_request).await {
         Ok(result) => result,
         Err(err) => {
             errors.push(err.to_string());
