@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let boot_state = bootstrap_io_control_plane_state(&config.state_dir, &config.node_name)
+    let mut boot_state = bootstrap_io_control_plane_state(&config.state_dir, &config.node_name)
         .unwrap_or_else(|err| {
             tracing::warn!(
                 error = %err,
@@ -132,6 +132,25 @@ async fn main() -> Result<()> {
             );
             IoControlPlaneState::default()
         });
+    if let Some(effective) = boot_state.effective_config.as_ref() {
+        match extract_runtime_slack_credentials(effective) {
+            Ok((app_token, bot_token)) => {
+                slack.reload_credentials(app_token, bot_token).await;
+            }
+            Err(err) => {
+                boot_state.current_state = IoNodeLifecycleState::FailedConfig;
+                boot_state.last_error = Some(IoControlPlaneErrorInfo {
+                    code: "invalid_config".to_string(),
+                    message: err.to_string(),
+                });
+                tracing::warn!(
+                    node_name = %config.node_name,
+                    error = %err,
+                    "boot effective config is missing/invalid slack credentials; starting in FAILED_CONFIG"
+                );
+            }
+        }
+    }
     let control_plane = Arc::new(RwLock::new(boot_state.clone()));
     let control_metrics = Arc::new(IoControlPlaneMetrics::with_initial_state(
         boot_state.current_state.as_str(),
@@ -171,8 +190,8 @@ async fn main() -> Result<()> {
 
 #[derive(Clone)]
 struct Config {
-    slack_app_token: String,
-    slack_bot_token: String,
+    slack_app_token: Option<String>,
+    slack_bot_token: Option<String>,
     node_name: String,
     island_id: String,
     node_version: String,
@@ -209,32 +228,20 @@ impl Config {
         tracing::info!(path = %spawn_cfg.path.display(), "io-slack loaded spawn config");
         let spawn_doc = Some(&spawn_cfg.doc);
 
-        let slack_app_token = env("SLACK_APP_TOKEN")
-            .or_else(|| resolve_secret(
+        let slack_app_token = env("SLACK_APP_TOKEN").or_else(|| {
+            resolve_secret(
                 spawn_doc,
-                &[
-                    "slack.app_token",
-                    "slack_app_token",
-                ],
-                &[
-                    "slack.app_token_ref",
-                    "slack_app_token_ref",
-                ],
-            ))
-            .ok_or_else(|| anyhow::anyhow!("missing Slack app token (set SLACK_APP_TOKEN or config slack.app_token / slack.app_token_ref=env:VAR)"))?;
-        let slack_bot_token = env("SLACK_BOT_TOKEN")
-            .or_else(|| resolve_secret(
+                &["slack.app_token", "slack_app_token"],
+                &["slack.app_token_ref", "slack_app_token_ref"],
+            )
+        });
+        let slack_bot_token = env("SLACK_BOT_TOKEN").or_else(|| {
+            resolve_secret(
                 spawn_doc,
-                &[
-                    "slack.bot_token",
-                    "slack_bot_token",
-                ],
-                &[
-                    "slack.bot_token_ref",
-                    "slack_bot_token_ref",
-                ],
-            ))
-            .ok_or_else(|| anyhow::anyhow!("missing Slack bot token (set SLACK_BOT_TOKEN or config slack.bot_token / slack.bot_token_ref=env:VAR)"))?;
+                &["slack.bot_token", "slack_bot_token"],
+                &["slack.bot_token_ref", "slack_bot_token_ref"],
+            )
+        });
 
         let blob_root = PathBuf::from(
             env("BLOB_ROOT")
@@ -487,8 +494,8 @@ struct SlackClients {
 
 #[derive(Debug, Clone)]
 struct SlackRuntimeState {
-    slack_app_token: String,
-    slack_bot_token: String,
+    slack_app_token: Option<String>,
+    slack_bot_token: Option<String>,
     config_generation: u64,
 }
 
@@ -510,17 +517,35 @@ impl SlackClients {
 
     async fn reload_credentials(&self, slack_app_token: String, slack_bot_token: String) {
         let mut guard = self.runtime.write().await;
-        guard.slack_app_token = slack_app_token;
-        guard.slack_bot_token = slack_bot_token;
+        guard.slack_app_token = Some(slack_app_token);
+        guard.slack_bot_token = Some(slack_bot_token);
         guard.config_generation = guard.config_generation.wrapping_add(1);
     }
 
-    async fn slack_app_token(&self) -> String {
-        self.runtime.read().await.slack_app_token.clone()
+    async fn slack_app_token(&self) -> Result<String> {
+        self.runtime
+            .read()
+            .await
+            .slack_app_token
+            .clone()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing Slack app token (set via CONFIG_SET slack.app_token/slack.app_token_ref)"
+                )
+            })
     }
 
-    async fn slack_bot_token(&self) -> String {
-        self.runtime.read().await.slack_bot_token.clone()
+    async fn slack_bot_token(&self) -> Result<String> {
+        self.runtime
+            .read()
+            .await
+            .slack_bot_token
+            .clone()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing Slack bot token (set via CONFIG_SET slack.bot_token/slack.bot_token_ref)"
+                )
+            })
     }
 
     async fn socket_mode_url(&self) -> Result<Url> {
@@ -530,7 +555,7 @@ impl SlackClients {
             url: Option<String>,
             error: Option<String>,
         }
-        let slack_app_token = self.slack_app_token().await;
+        let slack_app_token = self.slack_app_token().await?;
 
         let resp: OpenResp = self
             .http
@@ -577,7 +602,7 @@ impl SlackClients {
             ok: bool,
             error: Option<String>,
         }
-        let slack_bot_token = self.slack_bot_token().await;
+        let slack_bot_token = self.slack_bot_token().await?;
 
         let resp: PostResp = self
             .http
@@ -599,7 +624,7 @@ impl SlackClients {
     }
 
     async fn download_private_file(&self, url: &str) -> Result<Vec<u8>> {
-        let slack_bot_token = self.slack_bot_token().await;
+        let slack_bot_token = self.slack_bot_token().await?;
         let response = self
             .http
             .get(url)
@@ -643,7 +668,7 @@ impl SlackClients {
         struct SlackResponseMetadata {
             messages: Option<Vec<String>>,
         }
-        let slack_bot_token = self.slack_bot_token().await;
+        let slack_bot_token = self.slack_bot_token().await?;
 
         let length = bytes.len().to_string();
         let get_resp: GetUploadUrlResp = self
@@ -745,7 +770,18 @@ async fn run_inbound_socket_mode(
 
     loop {
         let socket_generation = slack.config_generation().await;
-        let url = slack.socket_mode_url().await?;
+        let url = match slack.socket_mode_url().await {
+            Ok(url) => url,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    config_generation = socket_generation,
+                    "socket mode not ready; waiting for valid slack credentials"
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
         tracing::info!(
             host = url.host_str().unwrap_or(""),
             path = url.path(),
