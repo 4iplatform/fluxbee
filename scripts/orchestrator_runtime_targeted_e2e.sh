@@ -78,6 +78,34 @@ load_local_hive_id() {
   fi
 }
 
+resolve_effective_tenant_id() {
+  if [[ -n "${TENANT_ID:-}" ]]; then
+    printf '%s\n' "$TENANT_ID"
+    return 0
+  fi
+  if [[ -n "${ORCH_DEFAULT_TENANT_ID:-}" ]]; then
+    printf '%s\n' "$ORCH_DEFAULT_TENANT_ID"
+    return 0
+  fi
+}
+
+validate_tenant_id() {
+  local tenant_id="${1:-}"
+  if [[ -z "$tenant_id" ]]; then
+    echo "FAIL: TENANT_ID is required for this E2E because the selected runtime requires identity registration at spawn time." >&2
+    echo "Hint: pass TENANT_ID=tnt:<uuid-v4> or set ORCH_DEFAULT_TENANT_ID in sy-orchestrator." >&2
+    exit 1
+  fi
+  if [[ "$tenant_id" == *"<"* || "$tenant_id" == *">"* ]]; then
+    echo "FAIL: TENANT_ID looks like placeholder ('$tenant_id'). Use real tnt:<uuid-v4>." >&2
+    exit 1
+  fi
+  if [[ ! "$tenant_id" =~ ^tnt:[0-9a-fA-F-]{36}$ ]]; then
+    echo "FAIL: invalid TENANT_ID='$tenant_id' (expected tnt:<uuid-v4>)" >&2
+    exit 1
+  fi
+}
+
 http_call() {
   local method="$1"
   local url="$2"
@@ -301,6 +329,8 @@ if [[ -n "$LOCAL_HIVE_ID" && "$HIVE_ID" != "$LOCAL_HIVE_ID" ]]; then
   exit 1
 fi
 
+EFFECTIVE_TENANT_ID="$(resolve_effective_tenant_id || true)"
+
 echo "TARGETED RUNTIME E2E: BASE=$BASE HIVE_ID=$HIVE_ID RUNTIME=$RUNTIME VERSION=$RUNTIME_VERSION NODE_NAME=$NODE_NAME"
 
 echo "Step 1/8: build inventory_hold_diag"
@@ -345,9 +375,10 @@ echo "Step 6/8: cleanup baseline node if present"
 http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" "$kill_body" '{"force":true}' >/dev/null 2>&1 || true
 
 echo "Step 7/8: spawn exact runtime version"
-if [[ -n "$TENANT_ID" ]]; then
+validate_tenant_id "$EFFECTIVE_TENANT_ID"
+if [[ -n "$EFFECTIVE_TENANT_ID" ]]; then
   spawn_payload="$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"%s","tenant_id":"%s"}' \
-    "$NODE_NAME" "$RUNTIME" "$RUNTIME_VERSION" "$TENANT_ID")"
+    "$NODE_NAME" "$RUNTIME" "$RUNTIME_VERSION" "$EFFECTIVE_TENANT_ID")"
 else
   spawn_payload="$(printf '{"node_name":"%s","runtime":"%s","runtime_version":"%s"}' \
     "$NODE_NAME" "$RUNTIME" "$RUNTIME_VERSION")"
@@ -377,4 +408,5 @@ echo "runtime=$RUNTIME@$RUNTIME_VERSION"
 echo "node_name=$NODE_NAME@$HIVE_ID"
 echo "manifest_version=$manifest_version"
 echo "manifest_hash=$manifest_hash"
+echo "tenant_id=$EFFECTIVE_TENANT_ID"
 echo "orchestrator targeted runtime update E2E passed."
