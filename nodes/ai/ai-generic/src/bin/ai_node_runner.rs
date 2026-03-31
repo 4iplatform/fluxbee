@@ -9,12 +9,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
 use fluxbee_ai_sdk::{
-    build_reply_message_runtime_src, build_text_response, extract_text, AiNode, AiNodeConfig,
-    FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
-    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
-    ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelSettings, NodeRuntime,
-    OpenAiResponsesClient, RetryPolicy, RouterClient, RuntimeConfig, ThreadStateStore,
-    ThreadStateToolsProvider,
+    build_model_input_from_payload, build_reply_message_runtime_src, build_text_response,
+    extract_text, AiNode, AiNodeConfig, FunctionCallingConfig, FunctionCallingRunner,
+    FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolProvider,
+    FunctionToolRegistry, ImmediateConversationMemory, LanceDbThreadStateStore, Message,
+    ModelSettings, NodeRuntime, OpenAiResponsesClient, RetryPolicy, RouterClient, RuntimeConfig,
+    ThreadStateStore, ThreadStateToolsProvider,
 };
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{
@@ -23,7 +23,9 @@ use fluxbee_sdk::protocol::{
 use fluxbee_sdk::{
     build_node_secret_record, load_node_secret_record, load_node_secret_record_with_root,
     managed_node_config_path, managed_node_name, save_node_secret_record,
-    save_node_secret_record_with_root, NodeSecretDescriptor, NodeSecretWriteOptions,
+    save_node_secret_record_with_root,
+    NodeSecretDescriptor,
+    NodeSecretWriteOptions,
     NODE_SECRET_REDACTION_TOKEN,
 };
 use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
@@ -864,7 +866,14 @@ impl AiNode for GenericAiNode {
             return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
         };
 
-        let input = extract_text(&msg.payload).unwrap_or_default();
+        let input = if msg.meta.msg_type.eq_ignore_ascii_case("user") {
+            match build_model_input_from_payload(&msg.payload) {
+                Ok(value) => value,
+                Err(err) => return Ok(Some(build_reply_message_runtime_src(&msg, err.to_error_payload()))),
+            }
+        } else {
+            extract_text(&msg.payload).unwrap_or_default()
+        };
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             tracing::info!(
                 node_name = %self.node_name,

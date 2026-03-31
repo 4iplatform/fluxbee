@@ -9,12 +9,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
 use fluxbee_ai_sdk::{
-    build_reply_message_runtime_src, build_text_response, extract_text, AiNode, AiNodeConfig,
-    FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
-    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
-    ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelSettings, NodeRuntime,
-    OpenAiResponsesClient, RetryPolicy, RouterClient, RuntimeConfig, ThreadStateStore,
-    ThreadStateToolsProvider,
+    build_model_input_from_payload, build_reply_message_runtime_src, build_text_response,
+    extract_text, AiNode, AiNodeConfig, FunctionCallingConfig, FunctionCallingRunner,
+    FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolProvider,
+    FunctionToolRegistry, ImmediateConversationMemory, LanceDbThreadStateStore, Message,
+    ModelSettings, NodeRuntime, OpenAiResponsesClient, RetryPolicy, RouterClient, RuntimeConfig,
+    ThreadStateStore, ThreadStateToolsProvider,
 };
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{
@@ -23,10 +23,17 @@ use fluxbee_sdk::protocol::{
 use fluxbee_sdk::{
     build_node_secret_record, load_node_secret_record, load_node_secret_record_with_root,
     managed_node_config_path, managed_node_name, save_node_secret_record,
-    save_node_secret_record_with_root, NodeSecretDescriptor, NodeSecretWriteOptions,
+    save_node_secret_record_with_root,
+    NodeSecretDescriptor,
+    NodeSecretWriteOptions,
     NODE_SECRET_REDACTION_TOKEN,
 };
 use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
+use gov_common::{
+    gov_identity_config_from_env, identity_error_to_tool_payload, looks_like_tenant_id,
+    resolve_tenant_id_for_register, tenant_resolution_source, GovIdentityConfig,
+    GOV_IDENTITY_TENANT_ID_ENV,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::fs as tokio_fs;
@@ -40,9 +47,6 @@ const MSG_NODE_STATUS_GET: &str = "NODE_STATUS_GET";
 const MSG_NODE_STATUS_GET_RESPONSE: &str = "NODE_STATUS_GET_RESPONSE";
 const NODE_STATUS_DEFAULT_HANDLER_ENABLED: &str = "NODE_STATUS_DEFAULT_HANDLER_ENABLED";
 const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE";
-const GOV_IDENTITY_TARGET_ENV: &str = "GOV_IDENTITY_TARGET";
-const GOV_IDENTITY_TIMEOUT_MS_ENV: &str = "GOV_IDENTITY_TIMEOUT_MS";
-const GOV_IDENTITY_TENANT_ID_ENV: &str = "GOV_IDENTITY_TENANT_ID";
 const IMMEDIATE_INTERACTION_MAX_CHARS: usize = 1_200;
 const AI_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
 
@@ -394,23 +398,6 @@ struct GenericAiNode {
     gov_identity: GovIdentityConfig,
     gov_identity_bridge: Option<Arc<GovIdentityBridge>>,
     control_plane: Arc<RwLock<ControlPlaneState>>,
-}
-
-#[derive(Debug, Clone)]
-struct GovIdentityConfig {
-    target: String,
-    fallback_target: Option<String>,
-    timeout: Duration,
-}
-
-impl Default for GovIdentityConfig {
-    fn default() -> Self {
-        Self {
-            target: "SY.identity@motherbee".to_string(),
-            fallback_target: None,
-            timeout: Duration::from_secs(10),
-        }
-    }
 }
 
 struct SharedRouterConnection {
@@ -864,7 +851,19 @@ impl AiNode for GenericAiNode {
             return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
         };
 
-        let input = extract_text(&msg.payload).unwrap_or_default();
+        let input = if msg.meta.msg_type.eq_ignore_ascii_case("user") {
+            match build_model_input_from_payload(&msg.payload) {
+                Ok(value) => value,
+                Err(err) => {
+                    return Ok(Some(build_reply_message_runtime_src(
+                        &msg,
+                        err.to_error_payload(),
+                    )))
+                }
+            }
+        } else {
+            extract_text(&msg.payload).unwrap_or_default()
+        };
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             tracing::info!(
                 node_name = %self.node_name,
@@ -1673,30 +1672,11 @@ fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .unwrap_or(default)
-}
-
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-}
-
-fn gov_identity_config_from_env() -> GovIdentityConfig {
-    let mut cfg = GovIdentityConfig::default();
-    if let Some(target) = env_nonempty(GOV_IDENTITY_TARGET_ENV) {
-        cfg.target = target;
-    }
-    cfg.timeout = Duration::from_millis(env_u64(
-        GOV_IDENTITY_TIMEOUT_MS_ENV,
-        cfg.timeout.as_millis() as u64,
-    ));
-    cfg
 }
 
 #[async_trait]
@@ -1930,32 +1910,6 @@ impl FunctionTool for IlkRegisterTool {
             }
         }
     }
-}
-
-fn identity_error_to_tool_payload(msg: String) -> Value {
-    let upper = msg.to_ascii_uppercase();
-    let (error_code, retryable) = if upper.contains("NOT_PRIMARY") {
-        ("NOT_PRIMARY", true)
-    } else if upper.contains("UNREACHABLE") || upper.contains("NODE_NOT_FOUND") {
-        ("UNAVAILABLE", true)
-    } else if upper.contains("TTL EXCEEDED") || upper.contains("TTL_EXCEEDED") {
-        ("TTL_EXCEEDED", true)
-    } else if upper.contains("TIMEOUT") {
-        ("TIMEOUT", true)
-    } else if upper.contains("INVALID_") {
-        ("INVALID_REQUEST", false)
-    } else if upper.contains("UNAUTHORIZED_REGISTRAR") {
-        ("UNAUTHORIZED_REGISTRAR", false)
-    } else {
-        ("IDENTITY_ERROR", true)
-    };
-
-    json!({
-        "status": "error",
-        "error_code": error_code,
-        "message": msg,
-        "retryable": retryable
-    })
 }
 
 impl NodeBehavior {
@@ -3188,87 +3142,6 @@ fn load_effective_config_from_spawn(node_name: &str) -> Option<SpawnEffectiveCon
         config_version,
         config,
     })
-}
-
-fn looks_like_tenant_id(raw: &str) -> bool {
-    let Some(rest) = raw.strip_prefix("tnt:") else {
-        return false;
-    };
-    Uuid::parse_str(rest.trim()).is_ok()
-}
-
-fn resolve_tenant_id_for_register(
-    explicit_tenant_id: Option<&str>,
-    tenant_hint: Option<&str>,
-    default_tenant_id: Option<&str>,
-) -> Option<String> {
-    let explicit = explicit_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .filter(|v| looks_like_tenant_id(v))
-        .map(ToString::to_string);
-    if explicit.is_some() {
-        return explicit;
-    }
-
-    let hint = tenant_hint
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .filter(|v| looks_like_tenant_id(v))
-        .map(ToString::to_string);
-    if hint.is_some() {
-        return hint;
-    }
-
-    let cfg_default = default_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .filter(|v| looks_like_tenant_id(v))
-        .map(ToString::to_string);
-    if cfg_default.is_some() {
-        return cfg_default;
-    }
-
-    env_nonempty(GOV_IDENTITY_TENANT_ID_ENV).filter(|v| looks_like_tenant_id(v))
-}
-
-fn tenant_resolution_source(
-    explicit_tenant_id: Option<&str>,
-    tenant_hint: Option<&str>,
-    default_tenant_id: Option<&str>,
-) -> &'static str {
-    let explicit_ok = explicit_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .is_some_and(looks_like_tenant_id);
-    if explicit_ok {
-        return "args.tenant_id";
-    }
-
-    let hint_ok = tenant_hint
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .is_some_and(looks_like_tenant_id);
-    if hint_ok {
-        return "identity_candidate.tenant_hint";
-    }
-
-    let cfg_ok = default_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .is_some_and(looks_like_tenant_id);
-    if cfg_ok {
-        return "effective_config.tenant_id";
-    }
-
-    let env_ok = env_nonempty(GOV_IDENTITY_TENANT_ID_ENV)
-        .as_deref()
-        .is_some_and(looks_like_tenant_id);
-    if env_ok {
-        return GOV_IDENTITY_TENANT_ID_ENV;
-    }
-
-    "missing"
 }
 
 fn materialize_effective_defaults(

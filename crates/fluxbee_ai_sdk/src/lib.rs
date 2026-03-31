@@ -38,7 +38,9 @@ pub use runtime::{NodeRuntime, RetryPolicy, RuntimeConfig};
 pub use summary_refresh::{
     refresh_conversation_summary, SummaryRefreshConfig, SummaryRefreshInput,
 };
-pub use text_payload::{build_text_response, extract_text};
+pub use text_payload::{
+    build_model_input_from_payload, build_text_response, extract_text, ModelInputPayloadError,
+};
 pub use thread_state::{LanceDbThreadStateStore, ThreadStateRecord, ThreadStateStore};
 pub use thread_state_tools::{
     ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool, ThreadStateToolsProvider,
