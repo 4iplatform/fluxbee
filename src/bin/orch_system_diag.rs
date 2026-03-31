@@ -183,6 +183,7 @@ async fn send_system_message(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };

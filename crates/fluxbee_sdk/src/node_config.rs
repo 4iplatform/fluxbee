@@ -245,6 +245,7 @@ fn build_node_config_message(
             action: Some(request_msg.to_string()),
             priority: None,
             context: options.context.clone(),
+            ..Meta::default()
         },
         payload,
     })
@@ -274,6 +275,7 @@ fn build_response_meta(msg: &Message) -> Meta {
         action: Some(MSG_CONFIG_RESPONSE.to_string()),
         priority: msg.meta.priority.clone(),
         context: msg.meta.context.clone(),
+        ..Meta::default()
     }
 }
 
@@ -393,6 +395,7 @@ mod tests {
                 action: Some(MSG_CONFIG_RESPONSE.to_string()),
                 priority: None,
                 context: None,
+                ..Meta::default()
             },
             payload: json!({
                 "ok": true,

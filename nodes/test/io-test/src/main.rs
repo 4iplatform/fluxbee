@@ -135,6 +135,7 @@ async fn send_probe(
             context: Some(json!({
                 "probe_id": probe_id,
             })),
+            ..Meta::default()
         },
         payload: json!({
             "kind": "io_test_probe",

@@ -1556,6 +1556,7 @@ async fn handle_impersonation_chat(
             action: None,
             priority: None,
             context: Some(Value::Object(context)),
+            ..Meta::default()
         },
         payload,
     };

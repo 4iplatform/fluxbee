@@ -5030,6 +5030,7 @@ mod tests {
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         };
         assert!(get_src_ilk_from_meta(&meta).is_none());
         set_src_ilk_in_meta(&mut meta, "ilk:11111111-1111-1111-1111-111111111111");
@@ -5060,6 +5061,7 @@ mod tests {
                 action: None,
                 priority: None,
                 context: None,
+                ..Meta::default()
             },
             payload: serde_json::json!({}),
         }

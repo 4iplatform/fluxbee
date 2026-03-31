@@ -287,6 +287,7 @@ mod tests {
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
+        assert_eq!(msg.meta.thread_id.as_deref(), Some("171234.567"));
         let thread_id = msg
             .meta
             .context
@@ -313,6 +314,7 @@ mod tests {
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
+        assert_eq!(msg.meta.thread_id.as_deref(), Some("C123"));
         let thread_id = msg
             .meta
             .context

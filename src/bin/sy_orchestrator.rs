@@ -1173,6 +1173,7 @@ async fn send_admin_forbidden(
             action: Some(action.to_string()),
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };
@@ -1407,6 +1408,7 @@ async fn handle_admin(
             action: Some(action.to_string()),
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };
@@ -2676,6 +2678,7 @@ async fn send_system_action_response(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };
@@ -6935,6 +6938,7 @@ async fn send_config_response(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };
@@ -8509,6 +8513,7 @@ async fn send_node_config_changed_signal(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload: serde_json::to_value(ConfigChangedPayload {
             subsystem: "node_config".to_string(),
@@ -9633,6 +9638,7 @@ async fn relay_system_action(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };

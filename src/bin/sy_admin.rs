@@ -525,6 +525,7 @@ async fn broadcast_config_changed(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload: serde_json::to_value(ConfigChangedPayload {
             subsystem: subsystem.to_string(),
@@ -771,6 +772,7 @@ async fn send_admin_command_response(
             action: Some(action.to_string()),
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload: body,
     };
@@ -4150,6 +4152,7 @@ async fn handle_send_node_message(
             action: req.meta_action,
             priority: req.priority,
             context: req.context,
+            ..Meta::default()
         },
         payload: req.payload,
     };
@@ -4787,6 +4790,7 @@ async fn send_admin_request(
             action: Some(request.action.clone()),
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload: request.payload,
     };
@@ -4871,6 +4875,7 @@ async fn send_system_request_with_meta(
             action: meta_action,
             priority: None,
             context,
+            ..Meta::default()
         },
         payload,
     };
@@ -5254,6 +5259,7 @@ async fn send_opa_query(
             target: target_pattern,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload: serde_json::json!({}),
     };

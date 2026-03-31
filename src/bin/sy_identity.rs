@@ -3006,6 +3006,7 @@ async fn send_system_response(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };

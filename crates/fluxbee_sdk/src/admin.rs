@@ -146,6 +146,7 @@ pub async fn admin_command(
             action: Some(action.to_string()),
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };

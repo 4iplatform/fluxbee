@@ -121,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 action: None,
                 priority: None,
                 context: None,
+                ..Meta::default()
             },
             payload: json!({"version": version, "hash": null}),
         };
@@ -147,6 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     action: None,
                     priority: None,
                     context: Some(json!({"opa_test": true, "seq": seq})),
+                    ..Meta::default()
                 },
                 payload: json!({"type": "opa_test", "content": format!("OPA {}", seq)}),
             };
@@ -183,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 action: None,
                 priority: None,
                 context: None,
+                ..Meta::default()
             },
             payload: json!({"type": "text", "content": format!("HOLA {}", seq)}),
         };

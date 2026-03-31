@@ -327,6 +327,7 @@ async fn send_config_response(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };
@@ -465,6 +466,7 @@ async fn handle_admin_action(
             action: Some(action.to_string()),
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload: reply_payload,
     };

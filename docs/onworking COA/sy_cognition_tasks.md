@@ -249,15 +249,21 @@ Nota práctica:
 - el cambio en `Meta` del SDK/core tiene fan-out alto porque hoy hay muchas inicializaciones estructurales manuales de `Meta { ... }`
 - conviene hacer esa actualización como una sola ola coherente dentro de `M1`, no como patch aislado
 
-- [ ] COG-M1-T1. Extender estructuras de mensaje en SDK/core para `meta.thread_id`.
-- [ ] COG-M1-T1b. Extender estructuras de mensaje en SDK/core para `meta.thread_seq`.
-- [ ] COG-M1-T2. Marcar `meta.ctx`, `meta.ctx_seq`, `meta.ctx_window` como legacy/deprecated en docs y types.
-- [ ] COG-M1-T3. Definir si `ctx_window`:
+- [x] COG-M1-T1. Extender estructuras de mensaje en SDK/core para `meta.thread_id`.
+- [x] COG-M1-T1b. Extender estructuras de mensaje en SDK/core para `meta.thread_seq`.
+- [x] COG-M1-T2. Marcar `meta.ctx`, `meta.ctx_seq`, `meta.ctx_window` como legacy/deprecated en docs y types.
+- [x] COG-M1-T3. Definir si `ctx_window`:
   - se elimina del carrier canónico, o
   - se mantiene como compat temporal solo para paths viejos
-- [ ] COG-M1-T4. Definir carrier canónico de `memory_package` v2 en `meta`.
-- [ ] COG-M1-T5. Actualizar `docs/02-protocolo.md` a la semántica nueva.
-- [ ] COG-M1-T6. Actualizar ejemplos/docs de AI/IO que todavía describen `ctx` como unidad central.
+- [x] COG-M1-T4. Definir carrier canónico de `memory_package` v2 en `meta`.
+- [x] COG-M1-T5. Actualizar `docs/02-protocolo.md` a la semántica nueva.
+- [x] COG-M1-T6. Actualizar ejemplos/docs de AI/IO que todavía describen `ctx` como unidad central.
+
+Estado actual de cierre de `M1`:
+- `Meta` del SDK/core ya modela `thread_id`, `thread_seq`, `dst_ilk`, `ich`, `ctx*` legacy y `memory_package`.
+- `docs/12-cognition-v2.md` y `docs/02-protocolo.md` ya reflejan el carrier v2.
+- los paths IO nuevos ya pueden emitir `meta.thread_id` canónico y los AI nodes leen `meta.thread_id` con fallback legacy a `context.thread_id`.
+- queda pendiente en la siguiente fase la asignación real de `thread_seq` en router por `thread_id`; el campo ya existe, pero el secuenciador todavía no está implementado.
 
 Salida:
 - protocolo y SDK ya hablan el idioma v2.
