@@ -3,8 +3,9 @@ set -euo pipefail
 
 # End-to-end smoke for SY.cognition without touching AI nodes:
 # 1) publish a deterministic turn into storage.turns
-# 2) verify cognition_* durable rows appear in PostgreSQL
-# 3) verify jsr-memory contains the thread memory_package
+# 2) verify raw turns appear in PostgreSQL
+# 3) verify cognition_* durable rows appear in PostgreSQL
+# 4) verify jsr-memory contains the thread memory_package
 
 CONFIG_FILE="${HIVE_CONFIG:-/etc/fluxbee/hive.yaml}"
 SUBJECT="${COGNITION_SUBJECT:-storage.turns}"
@@ -137,6 +138,7 @@ echo "Published 2 cognition smoke turns subject=$SUBJECT thread_id=$THREAD_ID en
 
 deadline=$(( $(date +%s) + TIMEOUT_SECS ))
 thread_ready=0
+turns_ready=0
 contexts_ready=0
 reasons_ready=0
 scopes_ready=0
@@ -144,6 +146,7 @@ memories_ready=0
 episodes_ready=0
 
 while [[ $(date +%s) -le $deadline ]]; do
+  turns_count="$(sql_value "SELECT count(*) FROM turns WHERE ctx = '$CTX';" || echo "0")"
   thread_count="$(sql_value "SELECT count(*) FROM cognition_threads WHERE thread_id = '$THREAD_ID';" || echo "0")"
   context_count="$(sql_value "SELECT count(*) FROM cognition_contexts WHERE thread_id = '$THREAD_ID';" || echo "0")"
   reason_count="$(sql_value "SELECT count(*) FROM cognition_reasons WHERE thread_id = '$THREAD_ID';" || echo "0")"
@@ -151,6 +154,7 @@ while [[ $(date +%s) -le $deadline ]]; do
   memory_count="$(sql_value "SELECT count(*) FROM cognition_memories WHERE thread_id = '$THREAD_ID';" || echo "0")"
   episode_count="$(sql_value "SELECT count(*) FROM cognition_episodes WHERE thread_id = '$THREAD_ID';" || echo "0")"
 
+  [[ "${turns_count:-0}" =~ ^[0-9]+$ ]] && [[ "$turns_count" -ge 2 ]] && turns_ready=1
   [[ "${thread_count:-0}" =~ ^[0-9]+$ ]] && [[ "$thread_count" -ge 1 ]] && thread_ready=1
   [[ "${context_count:-0}" =~ ^[0-9]+$ ]] && [[ "$context_count" -ge 1 ]] && contexts_ready=1
   [[ "${reason_count:-0}" =~ ^[0-9]+$ ]] && [[ "$reason_count" -ge 1 ]] && reasons_ready=1
@@ -158,15 +162,25 @@ while [[ $(date +%s) -le $deadline ]]; do
   [[ "${memory_count:-0}" =~ ^[0-9]+$ ]] && [[ "$memory_count" -ge 1 ]] && memories_ready=1
   [[ "${episode_count:-0}" =~ ^[0-9]+$ ]] && [[ "$episode_count" -ge 1 ]] && episodes_ready=1
 
-  if [[ "$thread_ready" == "1" && "$contexts_ready" == "1" && "$reasons_ready" == "1" && "$scopes_ready" == "1" && "$memories_ready" == "1" && "$episodes_ready" == "1" ]]; then
+  if [[ "$turns_ready" == "1" && "$thread_ready" == "1" && "$contexts_ready" == "1" && "$reasons_ready" == "1" && "$scopes_ready" == "1" && "$memories_ready" == "1" && "$episodes_ready" == "1" ]]; then
     break
   fi
   sleep 1
 done
 
+if [[ "$turns_ready" != "1" ]]; then
+  echo "FAIL: raw turns did not converge into PostgreSQL turns for ctx $CTX within ${TIMEOUT_SECS}s" >&2
+  echo "turns=$turns_count thread_id=$THREAD_ID" >&2
+  exit 1
+fi
+
+echo "OK: raw turns observed in turns"
+psql "$DB_URL" -c "SELECT ctx, seq, from_ilk, msg_type FROM turns WHERE ctx = '$CTX' ORDER BY seq;"
+
 if [[ "$thread_ready" != "1" || "$contexts_ready" != "1" || "$reasons_ready" != "1" || "$scopes_ready" != "1" || "$memories_ready" != "1" || "$episodes_ready" != "1" ]]; then
   echo "FAIL: cognition durable rows did not converge for thread $THREAD_ID within ${TIMEOUT_SECS}s" >&2
-  echo "threads=$thread_count contexts=$context_count reasons=$reason_count scopes=$scope_count memories=$memory_count episodes=$episode_count" >&2
+  echo "turns=$turns_count threads=$thread_count contexts=$context_count reasons=$reason_count scopes=$scope_count memories=$memory_count episodes=$episode_count" >&2
+  echo "Hint: query SY.cognition runtime counters with control/config-get and inspect processed_turns_total / published_entities_total / publish_errors_total." >&2
   exit 1
 fi
 
