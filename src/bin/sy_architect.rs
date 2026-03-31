@@ -1551,6 +1551,8 @@ async fn handle_impersonation_chat(
             msg_type: "user".to_string(),
             msg: None,
             src_ilk: Some(effective_ilk.clone()),
+            ich: effective_ich_id.clone(),
+            thread_id: Some(thread_id.clone()),
             scope: effective_ich_id.clone(),
             target: impersonation_target.clone(),
             action: None,

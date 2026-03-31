@@ -5127,6 +5127,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_thread_id_from_meta_prefers_canonical_and_falls_back_to_legacy_context() {
+        let canonical = canonical_thread_id_from_meta(&Meta {
+            msg_type: "user".to_string(),
+            thread_id: Some("thread:canonical".to_string()),
+            context: Some(serde_json::json!({ "thread_id": "thread:legacy" })),
+            ..Meta::default()
+        });
+        assert_eq!(canonical.as_deref(), Some("thread:canonical"));
+
+        let legacy = canonical_thread_id_from_meta(&Meta {
+            msg_type: "user".to_string(),
+            context: Some(serde_json::json!({ "thread_id": "thread:legacy" })),
+            ..Meta::default()
+        });
+        assert_eq!(legacy.as_deref(), Some("thread:legacy"));
+    }
+
+    #[tokio::test]
+    async fn assign_thread_seq_backfills_canonical_thread_and_monotonic_sequence() {
+        let sequences = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
+
+        let mut first = Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                dst: Destination::Resolve,
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                context: Some(serde_json::json!({ "thread_id": "thread:legacy" })),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        assign_thread_seq_if_missing(&mut first, &sequences).await;
+        assert_eq!(first.meta.thread_id.as_deref(), Some("thread:legacy"));
+        assert_eq!(first.meta.thread_seq, Some(1));
+
+        let mut second = Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                dst: Destination::Resolve,
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                thread_id: Some("thread:legacy".to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        assign_thread_seq_if_missing(&mut second, &sequences).await;
+        assert_eq!(second.meta.thread_seq, Some(2));
+    }
+
+    #[tokio::test]
+    async fn assign_thread_seq_preserves_existing_sequence() {
+        let sequences = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
+        let mut msg = Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                dst: Destination::Resolve,
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                thread_id: Some("thread:existing".to_string()),
+                thread_seq: Some(41),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+
+        assign_thread_seq_if_missing(&mut msg, &sequences).await;
+
+        assert_eq!(msg.meta.thread_seq, Some(41));
+        assert!(sequences.lock().await.is_empty());
+    }
+
     fn message_with_src_ilk(src_ilk: &str) -> Message {
         Message {
             routing: Routing {

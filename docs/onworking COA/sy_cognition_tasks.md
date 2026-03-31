@@ -263,7 +263,7 @@ Estado actual de cierre de `M1`:
 - `Meta` del SDK/core ya modela `thread_id`, `thread_seq`, `dst_ilk`, `ich`, `ctx*` legacy y `memory_package`.
 - `docs/12-cognition-v2.md` y `docs/02-protocolo.md` ya reflejan el carrier v2.
 - los paths IO nuevos ya pueden emitir `meta.thread_id` canónico y los AI nodes leen `meta.thread_id` con fallback legacy a `context.thread_id`.
-- queda pendiente en la siguiente fase la asignación real de `thread_seq` en router por `thread_id`; el campo ya existe, pero el secuenciador todavía no está implementado.
+- la asignación real de `thread_seq` ya quedó en el router por `thread_id`; la validación completa del root workspace sigue bloqueada externamente por `protoc` en `lance`.
 
 Salida:
 - protocolo y SDK ya hablan el idioma v2.
@@ -276,10 +276,10 @@ Salida:
   - DM / 1:1
   - group / persistent channel
   - medium-native thread
-- [ ] COG-M2-T4. Migrar IO nodes/productores para emitir `thread_id`.
-- [ ] COG-M2-T5. Implementar asignación de `thread_seq` en router por `thread_id`.
+- [x] COG-M2-T4. Migrar IO nodes/productores para emitir `thread_id`.
+- [x] COG-M2-T5. Implementar asignación de `thread_seq` en router por `thread_id`.
 - [x] COG-M2-T6. Definir fallback cuando el medium no provee `native_thread_id`.
-- [ ] COG-M2-T7. Agregar tests de estabilidad/compat del hash y del sequencing por thread.
+- [x] COG-M2-T7. Agregar tests de estabilidad/compat del hash y del sequencing por thread.
 
 Estado actual de `M2`:
 - `fluxbee_sdk` ya expone `compute_thread_id(...)`.
@@ -288,8 +288,10 @@ Estado actual de `M2`:
 - `io-common` ya adopta el cálculo canónico para Slack:
   - `NativeThread` cuando existe `thread_ts`
   - `PersistentChannel` cuando no existe `thread_ts`
-- el router ya tiene wiring inicial para asignar `thread_seq` cuando el mensaje entra sin secuencia usando `meta.thread_id` o fallback legacy a `context.thread_id`.
-- sigue pendiente validar E2E ese secuenciador en el root workspace y propagar el mismo patrón al resto de productores/medios.
+- `io-sim` ya genera `thread_id` canónico por defecto y mantiene `SIM_THREAD_ID` solo como override explícito.
+- `SY.architect` ya emite `meta.thread_id` y `meta.ich` en el path de impersonation chat, en vez de depender solo de `meta.context`.
+- el router ya asigna `thread_seq` cuando el mensaje entra sin secuencia usando `meta.thread_id` o fallback legacy a `context.thread_id`.
+- hay tests de hash/compat en `fluxbee_sdk` y tests de sequencing en router; correrlos en el root workspace sigue bloqueado externamente por `protoc` en `lance`.
 
 Salida:
 - todo turn nuevo relevante ya nace con `thread_id`.
