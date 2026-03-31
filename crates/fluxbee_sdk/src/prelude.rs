@@ -8,14 +8,14 @@ pub use crate::blob::{
     PublishBlobResult, ResolveRetryConfig, SyncHintTargetResult,
 };
 pub use crate::cognition::{
-    CognitionContextData, CognitionDurableEntity, CognitionDurableEnvelope, CognitionDurableOp,
-    CognitionEpisodeData, CognitionIlkProfile, CognitionMemoryData, CognitionReasonData,
-    CognitionScopeData, CognitionScopeInstanceData, CognitionThreadData,
-    COGNITION_DURABLE_ENTITY_VERSION_V1, COGNITION_DURABLE_SCHEMA_VERSION,
-    SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_EPISODES,
-    SUBJECT_STORAGE_COGNITION_MEMORIES, SUBJECT_STORAGE_COGNITION_REASONS,
-    SUBJECT_STORAGE_COGNITION_SCOPES, SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES,
-    SUBJECT_STORAGE_COGNITION_THREADS,
+    CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
+    CognitionDurableEnvelope, CognitionDurableOp, CognitionEpisodeData, CognitionIlkProfile,
+    CognitionMemoryData, CognitionReasonData, CognitionScopeData, CognitionScopeInstanceData,
+    CognitionThreadData, COGNITION_DURABLE_ENTITY_VERSION_V1, COGNITION_DURABLE_SCHEMA_VERSION,
+    SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_COOCCURRENCES,
+    SUBJECT_STORAGE_COGNITION_EPISODES, SUBJECT_STORAGE_COGNITION_MEMORIES,
+    SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
+    SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
 };
 pub use crate::comm::{
     connect, connect_with_client_config, ClientConfig, NodeConfig, NodeError, NodeReceiver,

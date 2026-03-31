@@ -8,6 +8,7 @@ pub const COGNITION_DURABLE_ENTITY_VERSION_V1: u16 = 1;
 pub const SUBJECT_STORAGE_COGNITION_THREADS: &str = "storage.cognition.threads";
 pub const SUBJECT_STORAGE_COGNITION_CONTEXTS: &str = "storage.cognition.contexts";
 pub const SUBJECT_STORAGE_COGNITION_REASONS: &str = "storage.cognition.reasons";
+pub const SUBJECT_STORAGE_COGNITION_COOCCURRENCES: &str = "storage.cognition.cooccurrences";
 pub const SUBJECT_STORAGE_COGNITION_SCOPES: &str = "storage.cognition.scopes";
 pub const SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES: &str = "storage.cognition.scope_instances";
 pub const SUBJECT_STORAGE_COGNITION_MEMORIES: &str = "storage.cognition.memories";
@@ -19,6 +20,7 @@ pub enum CognitionDurableEntity {
     Thread,
     Context,
     Reason,
+    Cooccurrence,
     Scope,
     ScopeInstance,
     Memory,
@@ -31,6 +33,7 @@ impl CognitionDurableEntity {
             Self::Thread => SUBJECT_STORAGE_COGNITION_THREADS,
             Self::Context => SUBJECT_STORAGE_COGNITION_CONTEXTS,
             Self::Reason => SUBJECT_STORAGE_COGNITION_REASONS,
+            Self::Cooccurrence => SUBJECT_STORAGE_COGNITION_COOCCURRENCES,
             Self::Scope => SUBJECT_STORAGE_COGNITION_SCOPES,
             Self::ScopeInstance => SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES,
             Self::Memory => SUBJECT_STORAGE_COGNITION_MEMORIES,
@@ -44,6 +47,7 @@ impl CognitionDurableEntity {
             Self::Thread
                 | Self::Context
                 | Self::Reason
+                | Self::Cooccurrence
                 | Self::ScopeInstance
                 | Self::Memory
                 | Self::Episode
@@ -182,6 +186,33 @@ pub struct CognitionReasonData {
     pub ilk_weights: BTreeMap<String, f64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ilk_profile: BTreeMap<String, CognitionIlkProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opened_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CognitionCooccurrenceData {
+    pub context_id: String,
+    pub context_label: String,
+    pub reason_id: String,
+    pub reason_label: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_avg_cumulative: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_avg_ema: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_samples: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurrences: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opened_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

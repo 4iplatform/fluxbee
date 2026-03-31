@@ -26,9 +26,10 @@ use fluxbee_sdk::{
     NODE_SECRET_REDACTION_TOKEN,
 };
 use fluxbee_sdk::{
-    CognitionContextData, CognitionDurableEntity, CognitionDurableEnvelope, CognitionDurableOp,
-    CognitionEpisodeData, CognitionMemoryData, CognitionReasonData, CognitionScopeData,
-    CognitionScopeInstanceData, CognitionThreadData, SUBJECT_STORAGE_COGNITION_CONTEXTS,
+    CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
+    CognitionDurableEnvelope, CognitionDurableOp, CognitionEpisodeData, CognitionMemoryData,
+    CognitionReasonData, CognitionScopeData, CognitionScopeInstanceData, CognitionThreadData,
+    SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_COOCCURRENCES,
     SUBJECT_STORAGE_COGNITION_EPISODES, SUBJECT_STORAGE_COGNITION_MEMORIES,
     SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
     SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
@@ -55,6 +56,7 @@ const DURABLE_QUEUE_REACTIVATION: &str = "durable.sy-storage.reactivation";
 const DURABLE_QUEUE_COGNITION_THREADS: &str = "durable.sy-storage.cognition.threads";
 const DURABLE_QUEUE_COGNITION_CONTEXTS: &str = "durable.sy-storage.cognition.contexts";
 const DURABLE_QUEUE_COGNITION_REASONS: &str = "durable.sy-storage.cognition.reasons";
+const DURABLE_QUEUE_COGNITION_COOCCURRENCES: &str = "durable.sy-storage.cognition.cooccurrences";
 const DURABLE_QUEUE_COGNITION_SCOPES: &str = "durable.sy-storage.cognition.scopes";
 const DURABLE_QUEUE_COGNITION_SCOPE_INSTANCES: &str =
     "durable.sy-storage.cognition.scope_instances";
@@ -307,6 +309,13 @@ async fn main() -> Result<(), StorageError> {
             Arc::clone(&nats_subscribe_errors),
             Arc::clone(&storage_handler_errors),
         )));
+        std::mem::drop(tokio::spawn(run_cognition_cooccurrences_loop(
+            endpoint.clone(),
+            use_durable_consumer,
+            Arc::clone(storage),
+            Arc::clone(&nats_subscribe_errors),
+            Arc::clone(&storage_handler_errors),
+        )));
         std::mem::drop(tokio::spawn(run_cognition_scopes_loop(
             endpoint.clone(),
             use_durable_consumer,
@@ -527,6 +536,30 @@ CREATE TABLE IF NOT EXISTS cognition_reasons (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS cognition_cooccurrences (
+    cooccurrence_id  TEXT PRIMARY KEY,
+    thread_id        TEXT NOT NULL,
+    context_id       TEXT NOT NULL,
+    context_label    TEXT NOT NULL,
+    reason_id        TEXT NOT NULL,
+    reason_label     TEXT NOT NULL,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    score            DOUBLE PRECISION,
+    weight           DOUBLE PRECISION,
+    weight_avg_cumulative DOUBLE PRECISION,
+    weight_avg_ema   DOUBLE PRECISION,
+    weight_samples   BIGINT,
+    occurrences      BIGINT,
+    opened_at        TEXT,
+    last_seen_at     TEXT,
+    closed_at        TEXT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS cognition_scopes (
     scope_id         TEXT PRIMARY KEY,
     entity_version   INT NOT NULL,
@@ -606,6 +639,9 @@ CREATE INDEX IF NOT EXISTS idx_cognition_contexts_thread ON cognition_contexts(t
 CREATE INDEX IF NOT EXISTS idx_cognition_contexts_scope ON cognition_contexts(scope_id);
 CREATE INDEX IF NOT EXISTS idx_cognition_reasons_thread ON cognition_reasons(thread_id);
 CREATE INDEX IF NOT EXISTS idx_cognition_reasons_scope ON cognition_reasons(scope_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_cooccurrences_thread ON cognition_cooccurrences(thread_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_cooccurrences_context ON cognition_cooccurrences(context_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_cooccurrences_reason ON cognition_cooccurrences(reason_id);
 CREATE INDEX IF NOT EXISTS idx_cognition_scope_instances_thread ON cognition_scope_instances(thread_id);
 CREATE INDEX IF NOT EXISTS idx_cognition_scope_instances_scope ON cognition_scope_instances(scope_id);
 CREATE INDEX IF NOT EXISTS idx_cognition_memories_thread ON cognition_memories(thread_id);
@@ -859,6 +895,12 @@ WHERE dedupe_key = $1
                 let envelope: CognitionDurableEnvelope<CognitionReasonData> =
                     parse_cognition_envelope(payload, CognitionDurableEntity::Reason)?;
                 self.persist_cognition_reason(&self.client, &envelope).await
+            }
+            HandlerKind::CognitionCooccurrences => {
+                let envelope: CognitionDurableEnvelope<CognitionCooccurrenceData> =
+                    parse_cognition_envelope(payload, CognitionDurableEntity::Cooccurrence)?;
+                self.persist_cognition_cooccurrence(&self.client, &envelope)
+                    .await
             }
             HandlerKind::CognitionScopes => {
                 let envelope: CognitionDurableEnvelope<CognitionScopeData> =
@@ -1285,6 +1327,84 @@ ON CONFLICT (reason_id) DO UPDATE SET
         Ok(())
     }
 
+    async fn persist_cognition_cooccurrence<C>(
+        &self,
+        db: &C,
+        envelope: &CognitionDurableEnvelope<CognitionCooccurrenceData>,
+    ) -> Result<(), StorageError>
+    where
+        C: GenericClient + Sync,
+    {
+        if matches!(envelope.op, CognitionDurableOp::Delete) {
+            db.execute(
+                "DELETE FROM cognition_cooccurrences WHERE cooccurrence_id = $1",
+                &[&envelope.entity_id],
+            )
+            .await?;
+            return Ok(());
+        }
+        let payload = json_value(&envelope.data)?;
+        db.execute(
+            r#"
+INSERT INTO cognition_cooccurrences (
+    cooccurrence_id, thread_id, context_id, context_label, reason_id, reason_label,
+    entity_version, writer, source_ts, status, score, weight,
+    weight_avg_cumulative, weight_avg_ema, weight_samples, occurrences,
+    opened_at, last_seen_at, closed_at, payload
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+ON CONFLICT (cooccurrence_id) DO UPDATE SET
+    thread_id = EXCLUDED.thread_id,
+    context_id = EXCLUDED.context_id,
+    context_label = EXCLUDED.context_label,
+    reason_id = EXCLUDED.reason_id,
+    reason_label = EXCLUDED.reason_label,
+    entity_version = EXCLUDED.entity_version,
+    writer = EXCLUDED.writer,
+    source_ts = EXCLUDED.source_ts,
+    status = EXCLUDED.status,
+    score = EXCLUDED.score,
+    weight = EXCLUDED.weight,
+    weight_avg_cumulative = EXCLUDED.weight_avg_cumulative,
+    weight_avg_ema = EXCLUDED.weight_avg_ema,
+    weight_samples = EXCLUDED.weight_samples,
+    occurrences = EXCLUDED.occurrences,
+    opened_at = EXCLUDED.opened_at,
+    last_seen_at = EXCLUDED.last_seen_at,
+    closed_at = EXCLUDED.closed_at,
+    payload = EXCLUDED.payload,
+    updated_at = now()
+"#,
+            &[
+                &envelope.entity_id,
+                envelope
+                    .thread_id
+                    .as_ref()
+                    .ok_or_else(|| missing_field("thread_id"))?,
+                &envelope.data.context_id,
+                &envelope.data.context_label,
+                &envelope.data.reason_id,
+                &envelope.data.reason_label,
+                &(envelope.entity_version as i32),
+                &envelope.writer,
+                &envelope.ts,
+                &normalized_status(&envelope.op, &envelope.data.status),
+                &envelope.data.score,
+                &envelope.data.weight,
+                &envelope.data.weight_avg_cumulative,
+                &envelope.data.weight_avg_ema,
+                &opt_i64(envelope.data.weight_samples),
+                &opt_i64(envelope.data.occurrences),
+                &envelope.data.opened_at,
+                &envelope.data.last_seen_at,
+                &envelope.data.closed_at,
+                &payload,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn persist_cognition_scope<C>(
         &self,
         db: &C,
@@ -1691,6 +1811,26 @@ async fn run_cognition_reasons_loop(
     .await;
 }
 
+async fn run_cognition_cooccurrences_loop(
+    endpoint: String,
+    use_durable_consumer: bool,
+    storage: Arc<Storage>,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
+) {
+    run_subject_loop(
+        endpoint,
+        SUBJECT_STORAGE_COGNITION_COOCCURRENCES,
+        17,
+        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_COOCCURRENCES),
+        storage,
+        HandlerKind::CognitionCooccurrences,
+        nats_subscribe_errors,
+        storage_handler_errors,
+    )
+    .await;
+}
+
 async fn run_cognition_scopes_loop(
     endpoint: String,
     use_durable_consumer: bool,
@@ -1701,7 +1841,7 @@ async fn run_cognition_scopes_loop(
     run_subject_loop(
         endpoint,
         SUBJECT_STORAGE_COGNITION_SCOPES,
-        17,
+        18,
         use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_SCOPES),
         storage,
         HandlerKind::CognitionScopes,
@@ -1721,7 +1861,7 @@ async fn run_cognition_scope_instances_loop(
     run_subject_loop(
         endpoint,
         SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES,
-        18,
+        19,
         use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_SCOPE_INSTANCES),
         storage,
         HandlerKind::CognitionScopeInstances,
@@ -1741,7 +1881,7 @@ async fn run_cognition_memories_loop(
     run_subject_loop(
         endpoint,
         SUBJECT_STORAGE_COGNITION_MEMORIES,
-        19,
+        20,
         use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_MEMORIES),
         storage,
         HandlerKind::CognitionMemories,
@@ -1761,7 +1901,7 @@ async fn run_cognition_episodes_loop(
     run_subject_loop(
         endpoint,
         SUBJECT_STORAGE_COGNITION_EPISODES,
-        20,
+        21,
         use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_EPISODES),
         storage,
         HandlerKind::CognitionEpisodes,
@@ -1780,6 +1920,7 @@ enum HandlerKind {
     CognitionThreads,
     CognitionContexts,
     CognitionReasons,
+    CognitionCooccurrences,
     CognitionScopes,
     CognitionScopeInstances,
     CognitionMemories,
@@ -1801,6 +1942,7 @@ fn handler_kind_for_subject(subject: &str) -> Option<HandlerKind> {
         SUBJECT_STORAGE_COGNITION_THREADS => Some(HandlerKind::CognitionThreads),
         SUBJECT_STORAGE_COGNITION_CONTEXTS => Some(HandlerKind::CognitionContexts),
         SUBJECT_STORAGE_COGNITION_REASONS => Some(HandlerKind::CognitionReasons),
+        SUBJECT_STORAGE_COGNITION_COOCCURRENCES => Some(HandlerKind::CognitionCooccurrences),
         SUBJECT_STORAGE_COGNITION_SCOPES => Some(HandlerKind::CognitionScopes),
         SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES => Some(HandlerKind::CognitionScopeInstances),
         SUBJECT_STORAGE_COGNITION_MEMORIES => Some(HandlerKind::CognitionMemories),

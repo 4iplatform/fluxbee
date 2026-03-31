@@ -409,23 +409,29 @@ Estado actual:
 ### Fase COG-M5 - Pipeline mínimo canónico: thread + tagger + contexts + reasons
 
 - [x] COG-M5-T1. Consumir turns desde el carrier decidido.
-- [ ] COG-M5-T2. Implementar tagger extendido:
+- [x] COG-M5-T2. Implementar tagger extendido:
   - `tags`
   - `reason_signals_canonical`
   - `reason_signals_extra`
-- [ ] COG-M5-T3. Implementar evaluator de contextos.
-- [ ] COG-M5-T4. Implementar reason evaluator determinístico v1.
-- [ ] COG-M5-T5. Implementar update determinístico de contextos.
-- [ ] COG-M5-T6. Implementar update determinístico de razones.
-- [ ] COG-M5-T7. Persistir entidades básicas v2.
-- [ ] COG-M5-T8. Definir y persistir co-ocurrencias contexto/razón si se mantienen como entidad explícita.
+- [x] COG-M5-T3. Implementar evaluator de contextos.
+- [x] COG-M5-T4. Implementar reason evaluator determinístico v1.
+- [x] COG-M5-T5. Implementar update determinístico de contextos.
+- [x] COG-M5-T6. Implementar update determinístico de razones.
+- [x] COG-M5-T7. Persistir entidades básicas v2.
+- [x] COG-M5-T8. Definir y persistir co-ocurrencias contexto/razón si se mantienen como entidad explícita.
 
 Salida:
 - cognition ya produce conocimiento estructurado básico sin esperar scope/memory/episode.
 
 Estado actual:
 - el consumer base de `storage.turns` ya corre en `SY.cognition`
-- lo que falta en `M5` es transformar esos turns en outputs cognitivos v2, no el carrier de entrada
+- el pipeline mínimo determinístico ya emite:
+  - `storage.cognition.threads`
+  - `storage.cognition.contexts`
+  - `storage.cognition.reasons`
+  - `storage.cognition.cooccurrences`
+- el tagger v1 actual es determinístico/lexical; la mejora futura a AI tagger queda abierta sin cambiar el contrato
+- `M5` queda cerrado con co-ocurrencias explícitas thread-scoped; el siguiente frente real ya es `M6+`
 
 ### Fase COG-M6 - Scope + binding + periodización
 

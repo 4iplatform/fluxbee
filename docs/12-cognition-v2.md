@@ -729,6 +729,7 @@ Recommended transport to `SY.storage`:
   - `storage.cognition.threads`
   - `storage.cognition.contexts`
   - `storage.cognition.reasons`
+  - `storage.cognition.cooccurrences`
   - `storage.cognition.scopes`
   - `storage.cognition.scope_instances`
   - `storage.cognition.memories`
@@ -761,7 +762,7 @@ Recommended envelope:
 
 Rules:
 - subject defines the domain stream; `entity` and `entity_id` make the payload self-describing.
-- `thread_id` is required for thread-scoped entities (`threads`, `contexts`, `reasons`, `scope_instances`, `memories`, `episodes`).
+- `thread_id` is required for thread-scoped entities (`threads`, `contexts`, `reasons`, `cooccurrences`, `scope_instances`, `memories`, `episodes`).
 - `op` should start as a closed deterministic set for v1:
   - `upsert`
   - `close`
@@ -787,6 +788,7 @@ Recommended subject-to-entity mapping:
 - `storage.cognition.threads` → thread snapshots / thread-level state
 - `storage.cognition.contexts` → context entities
 - `storage.cognition.reasons` → reason entities
+- `storage.cognition.cooccurrences` → thread-scoped context/reason coupling records
 - `storage.cognition.scopes` → scope definitions
 - `storage.cognition.scope_instances` → realized thread-local scope instances
 - `storage.cognition.memories` → narrative memories

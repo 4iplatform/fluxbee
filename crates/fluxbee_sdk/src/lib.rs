@@ -23,14 +23,14 @@ pub use admin::{
 };
 pub use client_config::ClientConfig;
 pub use cognition::{
-    CognitionContextData, CognitionDurableEntity, CognitionDurableEnvelope, CognitionDurableOp,
-    CognitionEpisodeData, CognitionIlkProfile, CognitionMemoryData, CognitionReasonData,
-    CognitionScopeData, CognitionScopeInstanceData, CognitionThreadData,
-    COGNITION_DURABLE_ENTITY_VERSION_V1, COGNITION_DURABLE_SCHEMA_VERSION,
-    SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_EPISODES,
-    SUBJECT_STORAGE_COGNITION_MEMORIES, SUBJECT_STORAGE_COGNITION_REASONS,
-    SUBJECT_STORAGE_COGNITION_SCOPES, SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES,
-    SUBJECT_STORAGE_COGNITION_THREADS,
+    CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
+    CognitionDurableEnvelope, CognitionDurableOp, CognitionEpisodeData, CognitionIlkProfile,
+    CognitionMemoryData, CognitionReasonData, CognitionScopeData, CognitionScopeInstanceData,
+    CognitionThreadData, COGNITION_DURABLE_ENTITY_VERSION_V1, COGNITION_DURABLE_SCHEMA_VERSION,
+    SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_COOCCURRENCES,
+    SUBJECT_STORAGE_COGNITION_EPISODES, SUBJECT_STORAGE_COGNITION_MEMORIES,
+    SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
+    SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
 };
 pub use identity::{
     identity_shm_name_for_hive, identity_system_call, identity_system_call_ok,
