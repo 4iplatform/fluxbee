@@ -282,6 +282,7 @@ impl Router {
         let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
         let wan_peers = Arc::clone(&self.wan_peers);
         let lsa_snapshot = Arc::clone(&self.lsa_snapshot);
+        let thread_sequences = Arc::clone(&self.thread_sequences);
         let is_gateway = self.cfg.is_gateway;
         let router_uuid = self.cfg.router_uuid;
         tokio::spawn(async move {
@@ -310,7 +311,7 @@ impl Router {
                 let wan_peers = Arc::clone(&wan_peers);
                 let lsa_reader = Arc::clone(&lsa_reader);
                 let lsa_snapshot = Arc::clone(&lsa_snapshot);
-                let thread_sequences = Arc::clone(&self.thread_sequences);
+                let thread_sequences = Arc::clone(&thread_sequences);
                 let is_gateway = is_gateway;
                 tokio::spawn(async move {
                     if let Err(err) = handle_peer_incoming(
@@ -851,7 +852,7 @@ async fn handle_message(
     };
 
     if msg.routing.ttl == 0 {
-        send_ttl_exceeded_to(msg, &src_handle.sender, router_uuid)?;
+        send_ttl_exceeded_to(&msg, &src_handle.sender, router_uuid)?;
         return Ok(());
     }
 
@@ -872,7 +873,7 @@ async fn handle_message(
                     ) {
                         senders.push(dst_handle.sender);
                     } else {
-                        send_unreachable_to(msg, &src_handle.sender, router_uuid, "VPN_BLOCKED")?;
+                        send_unreachable_to(&msg, &src_handle.sender, router_uuid, "VPN_BLOCKED")?;
                     }
                 } else {
                     let peer = {
@@ -888,21 +889,21 @@ async fn handle_message(
                             peer_node.vpn_id,
                         ) {
                             if msg.routing.ttl <= 1 {
-                                send_ttl_exceeded_to(msg, &src_handle.sender, router_uuid)?;
+                                send_ttl_exceeded_to(&msg, &src_handle.sender, router_uuid)?;
                                 return Ok(());
                             }
-                            if send_to_peer_router(peers, peer_node.router_uuid, msg).await? {
+                            if send_to_peer_router(peers, peer_node.router_uuid, &msg).await? {
                                 return Ok(());
                             }
                             send_unreachable_to(
-                                msg,
+                                &msg,
                                 &src_handle.sender,
                                 router_uuid,
                                 "PEER_UNAVAILABLE",
                             )?;
                         } else {
                             send_unreachable_to(
-                                msg,
+                                &msg,
                                 &src_handle.sender,
                                 router_uuid,
                                 "VPN_BLOCKED",
@@ -923,7 +924,7 @@ async fn handle_message(
                             ) {
                                 forward_to_hive(
                                     &remote.hive_id,
-                                    msg,
+                                    &msg,
                                     is_gateway,
                                     peer_routers,
                                     peers,
@@ -934,7 +935,7 @@ async fn handle_message(
                                 .await?;
                             } else {
                                 send_unreachable_to(
-                                    msg,
+                                    &msg,
                                     &src_handle.sender,
                                     router_uuid,
                                     "VPN_BLOCKED",
@@ -942,7 +943,7 @@ async fn handle_message(
                             }
                         } else {
                             send_unreachable_to(
-                                msg,
+                                &msg,
                                 &src_handle.sender,
                                 router_uuid,
                                 "NODE_NOT_FOUND",
@@ -956,7 +957,7 @@ async fn handle_message(
                 match route {
                     ResolvedRoute::Drop => {}
                     ResolvedRoute::Unreachable(reason) => {
-                        send_unreachable_to(msg, &src_handle.sender, router_uuid, reason)?;
+                        send_unreachable_to(&msg, &src_handle.sender, router_uuid, reason)?;
                     }
                     ResolvedRoute::Deliver(dst_uuid) => {
                         if let Some(dst_handle) = nodes_guard.get(&dst_uuid) {
@@ -970,7 +971,7 @@ async fn handle_message(
                                 senders.push(dst_handle.sender.clone());
                             } else {
                                 send_unreachable_to(
-                                    msg,
+                                    &msg,
                                     &src_handle.sender,
                                     router_uuid,
                                     "VPN_BLOCKED",
@@ -978,7 +979,7 @@ async fn handle_message(
                             }
                         } else {
                             send_unreachable_to(
-                                msg,
+                                &msg,
                                 &src_handle.sender,
                                 router_uuid,
                                 "NODE_NOT_FOUND",
@@ -987,14 +988,14 @@ async fn handle_message(
                     }
                     ResolvedRoute::ForwardRouter(peer_uuid) => {
                         if msg.routing.ttl <= 1 {
-                            send_ttl_exceeded_to(msg, &src_handle.sender, router_uuid)?;
+                            send_ttl_exceeded_to(&msg, &src_handle.sender, router_uuid)?;
                             return Ok(());
                         }
-                        if send_to_peer_router(peers, peer_uuid, msg).await? {
+                        if send_to_peer_router(peers, peer_uuid, &msg).await? {
                             return Ok(());
                         }
                         send_unreachable_to(
-                            msg,
+                            &msg,
                             &src_handle.sender,
                             router_uuid,
                             "PEER_UNAVAILABLE",
@@ -1003,7 +1004,7 @@ async fn handle_message(
                     ResolvedRoute::ForwardHive(hive_id) => {
                         forward_to_hive(
                             &hive_id,
-                            msg,
+                            &msg,
                             is_gateway,
                             peer_routers,
                             peers,
@@ -1051,11 +1052,11 @@ async fn handle_message(
                 senders.push(handle.sender.clone());
             }
             if msg.routing.ttl >= 2 {
-                broadcast_to_peers(peers, msg).await?;
+                broadcast_to_peers(peers, &msg).await?;
             }
             if msg.routing.ttl >= 3 {
                 forward_broadcast_to_wan(
-                    msg,
+                    &msg,
                     is_gateway,
                     peer_routers,
                     peers,
@@ -1067,19 +1068,23 @@ async fn handle_message(
             }
         }
         Destination::Resolve => {
-            let resolved_target =
-                match resolve_target_with_identity(opa, hive_id, identity_frontdesk_node_name, msg)
-                    .await
-                {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!("opa resolve failed: {err}");
-                        send_unreachable_to(msg, &src_handle.sender, router_uuid, "OPA_ERROR")?;
-                        return Ok(());
-                    }
-                };
+            let resolved_target = match resolve_target_with_identity(
+                opa,
+                hive_id,
+                identity_frontdesk_node_name,
+                &msg,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!("opa resolve failed: {err}");
+                    send_unreachable_to(&msg, &src_handle.sender, router_uuid, "OPA_ERROR")?;
+                    return Ok(());
+                }
+            };
             let Some(target) = resolved_target.as_deref() else {
-                send_unreachable_to(msg, &src_handle.sender, router_uuid, "OPA_NO_TARGET")?;
+                send_unreachable_to(&msg, &src_handle.sender, router_uuid, "OPA_NO_TARGET")?;
                 return Ok(());
             };
             let nodes_guard = nodes.lock().await;
@@ -1087,7 +1092,7 @@ async fn handle_message(
             match route {
                 ResolvedRoute::Drop => {}
                 ResolvedRoute::Unreachable(reason) => {
-                    send_unreachable_to(msg, &src_handle.sender, router_uuid, reason)?;
+                    send_unreachable_to(&msg, &src_handle.sender, router_uuid, reason)?;
                 }
                 ResolvedRoute::Deliver(dst_uuid) => {
                     if let Some(dst_handle) = nodes_guard.get(&dst_uuid) {
@@ -1101,7 +1106,7 @@ async fn handle_message(
                             senders.push(dst_handle.sender.clone());
                         } else {
                             send_unreachable_to(
-                                msg,
+                                &msg,
                                 &src_handle.sender,
                                 router_uuid,
                                 "VPN_BLOCKED",
@@ -1109,7 +1114,7 @@ async fn handle_message(
                         }
                     } else {
                         send_unreachable_to(
-                            msg,
+                            &msg,
                             &src_handle.sender,
                             router_uuid,
                             "NODE_NOT_FOUND",
@@ -1118,18 +1123,18 @@ async fn handle_message(
                 }
                 ResolvedRoute::ForwardRouter(peer_uuid) => {
                     if msg.routing.ttl <= 1 {
-                        send_ttl_exceeded_to(msg, &src_handle.sender, router_uuid)?;
+                        send_ttl_exceeded_to(&msg, &src_handle.sender, router_uuid)?;
                         return Ok(());
                     }
-                    if send_to_peer_router(peers, peer_uuid, msg).await? {
+                    if send_to_peer_router(peers, peer_uuid, &msg).await? {
                         return Ok(());
                     }
-                    send_unreachable_to(msg, &src_handle.sender, router_uuid, "PEER_UNAVAILABLE")?;
+                    send_unreachable_to(&msg, &src_handle.sender, router_uuid, "PEER_UNAVAILABLE")?;
                 }
                 ResolvedRoute::ForwardHive(hive_id) => {
                     forward_to_hive(
                         &hive_id,
-                        msg,
+                        &msg,
                         is_gateway,
                         peer_routers,
                         peers,
@@ -1144,7 +1149,7 @@ async fn handle_message(
     }
 
     if !senders.is_empty() {
-        let data = serde_json::to_vec(msg)?;
+        let data = serde_json::to_vec(&msg)?;
         for sender in senders {
             let _ = sender.send(data.clone());
         }
@@ -2183,7 +2188,7 @@ async fn handle_wan_message(
                             nodes_guard.get(&dst_uuid).cloned()
                         };
                         if let Some(dst_handle) = dst_handle {
-                            let data = serde_json::to_vec(msg)?;
+                            let data = serde_json::to_vec(&msg)?;
                             let _ = dst_handle.sender.send(data);
                         }
                     }
@@ -2206,7 +2211,7 @@ async fn handle_wan_message(
     };
 
     if msg.routing.ttl == 0 {
-        send_ttl_exceeded_to(msg, sender, ctx.router_uuid)?;
+        send_ttl_exceeded_to(&msg, sender, ctx.router_uuid)?;
         return Ok(());
     }
 
@@ -2228,7 +2233,7 @@ async fn handle_wan_message(
                     ) {
                         senders.push(dst_handle.sender);
                     } else {
-                        send_unreachable_to(msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
+                        send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                     }
                 } else {
                     let peer = {
@@ -2244,15 +2249,15 @@ async fn handle_wan_message(
                             peer_node.vpn_id,
                         ) {
                             if msg.routing.ttl <= 1 {
-                                send_ttl_exceeded_to(msg, sender, ctx.router_uuid)?;
+                                send_ttl_exceeded_to(&msg, sender, ctx.router_uuid)?;
                                 return Ok(());
                             }
-                            if send_to_peer_router(&ctx.peers, peer_node.router_uuid, msg).await? {
+                            if send_to_peer_router(&ctx.peers, peer_node.router_uuid, &msg).await? {
                                 return Ok(());
                             }
-                            send_unreachable_to(msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
+                            send_unreachable_to(&msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
                         } else {
-                            send_unreachable_to(msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
+                            send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                         }
                     } else {
                         let remote = {
@@ -2269,7 +2274,7 @@ async fn handle_wan_message(
                             ) {
                                 forward_to_hive(
                                     &remote.hive_id,
-                                    msg,
+                                    &msg,
                                     true,
                                     &ctx.peer_routers,
                                     &ctx.peers,
@@ -2279,10 +2284,10 @@ async fn handle_wan_message(
                                 )
                                 .await?;
                             } else {
-                                send_unreachable_to(msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
+                                send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                             }
                         } else {
-                            send_unreachable_to(msg, sender, ctx.router_uuid, "NODE_NOT_FOUND")?;
+                            send_unreachable_to(&msg, sender, ctx.router_uuid, "NODE_NOT_FOUND")?;
                         }
                     }
                 }
@@ -2304,7 +2309,7 @@ async fn handle_wan_message(
                 match route {
                     ResolvedRoute::Drop => {}
                     ResolvedRoute::Unreachable(reason) => {
-                        send_unreachable_to(msg, sender, ctx.router_uuid, reason)?;
+                        send_unreachable_to(&msg, sender, ctx.router_uuid, reason)?;
                     }
                     ResolvedRoute::Deliver(dst_uuid) => {
                         if let Some(dst_handle) = nodes_guard.get(&dst_uuid) {
@@ -2317,26 +2322,26 @@ async fn handle_wan_message(
                             ) {
                                 senders.push(dst_handle.sender.clone());
                             } else {
-                                send_unreachable_to(msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
+                                send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                             }
                         } else {
-                            send_unreachable_to(msg, sender, ctx.router_uuid, "NODE_NOT_FOUND")?;
+                            send_unreachable_to(&msg, sender, ctx.router_uuid, "NODE_NOT_FOUND")?;
                         }
                     }
                     ResolvedRoute::ForwardRouter(peer_uuid) => {
                         if msg.routing.ttl <= 1 {
-                            send_ttl_exceeded_to(msg, sender, ctx.router_uuid)?;
+                            send_ttl_exceeded_to(&msg, sender, ctx.router_uuid)?;
                             return Ok(());
                         }
-                        if send_to_peer_router(&ctx.peers, peer_uuid, msg).await? {
+                        if send_to_peer_router(&ctx.peers, peer_uuid, &msg).await? {
                             return Ok(());
                         }
-                        send_unreachable_to(msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
+                        send_unreachable_to(&msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
                     }
                     ResolvedRoute::ForwardHive(hive_id) => {
                         forward_to_hive(
                             &hive_id,
-                            msg,
+                            &msg,
                             true,
                             &ctx.peer_routers,
                             &ctx.peers,
@@ -2383,10 +2388,10 @@ async fn handle_wan_message(
                 senders.push(handle.sender.clone());
             }
             if msg.routing.ttl >= 2 {
-                broadcast_to_peers(&ctx.peers, msg).await?;
+                broadcast_to_peers(&ctx.peers, &msg).await?;
             }
             if msg.routing.ttl >= 3 {
-                broadcast_to_wan(&ctx.wan_peers, msg).await?;
+                broadcast_to_wan(&ctx.wan_peers, &msg).await?;
             }
         }
         Destination::Resolve => {
@@ -2394,19 +2399,19 @@ async fn handle_wan_message(
                 &ctx.opa,
                 &ctx.hive_id,
                 &ctx.identity_frontdesk_node_name,
-                msg,
+                &msg,
             )
             .await
             {
                 Ok(value) => value,
                 Err(err) => {
                     tracing::warn!("opa resolve failed: {err}");
-                    send_unreachable_to(msg, sender, ctx.router_uuid, "OPA_ERROR")?;
+                    send_unreachable_to(&msg, sender, ctx.router_uuid, "OPA_ERROR")?;
                     return Ok(());
                 }
             };
             let Some(target) = resolved_target.as_deref() else {
-                send_unreachable_to(msg, sender, ctx.router_uuid, "OPA_NO_TARGET")?;
+                send_unreachable_to(&msg, sender, ctx.router_uuid, "OPA_NO_TARGET")?;
                 return Ok(());
             };
             let nodes_guard = ctx.nodes.lock().await;
@@ -2426,7 +2431,7 @@ async fn handle_wan_message(
             match route {
                 ResolvedRoute::Drop => {}
                 ResolvedRoute::Unreachable(reason) => {
-                    send_unreachable_to(msg, sender, ctx.router_uuid, reason)?;
+                    send_unreachable_to(&msg, sender, ctx.router_uuid, reason)?;
                 }
                 ResolvedRoute::Deliver(dst_uuid) => {
                     if let Some(dst_handle) = nodes_guard.get(&dst_uuid) {
@@ -2439,26 +2444,26 @@ async fn handle_wan_message(
                         ) {
                             senders.push(dst_handle.sender.clone());
                         } else {
-                            send_unreachable_to(msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
+                            send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                         }
                     } else {
-                        send_unreachable_to(msg, sender, ctx.router_uuid, "NODE_NOT_FOUND")?;
+                        send_unreachable_to(&msg, sender, ctx.router_uuid, "NODE_NOT_FOUND")?;
                     }
                 }
                 ResolvedRoute::ForwardRouter(peer_uuid) => {
                     if msg.routing.ttl <= 1 {
-                        send_ttl_exceeded_to(msg, sender, ctx.router_uuid)?;
+                        send_ttl_exceeded_to(&msg, sender, ctx.router_uuid)?;
                         return Ok(());
                     }
-                    if send_to_peer_router(&ctx.peers, peer_uuid, msg).await? {
+                    if send_to_peer_router(&ctx.peers, peer_uuid, &msg).await? {
                         return Ok(());
                     }
-                    send_unreachable_to(msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
+                    send_unreachable_to(&msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
                 }
                 ResolvedRoute::ForwardHive(hive_id) => {
                     forward_to_hive(
                         &hive_id,
-                        msg,
+                        &msg,
                         true,
                         &ctx.peer_routers,
                         &ctx.peers,
@@ -2473,7 +2478,7 @@ async fn handle_wan_message(
     }
 
     if !senders.is_empty() {
-        let data = serde_json::to_vec(msg)?;
+        let data = serde_json::to_vec(&msg)?;
         for sender in senders {
             let _ = sender.send(data.clone());
         }
@@ -2936,7 +2941,7 @@ async fn handle_peer_message(
                                 nodes_guard.get(&dst_uuid).cloned()
                             };
                             if let Some(dst_handle) = dst_handle {
-                                let data = serde_json::to_vec(msg)?;
+                                let data = serde_json::to_vec(&msg)?;
                                 let _ = dst_handle.sender.send(data);
                             }
                         }
@@ -2959,7 +2964,7 @@ async fn handle_peer_message(
     let mut senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = Vec::new();
     if msg.routing.ttl == 0 {
         if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-            send_ttl_exceeded_to(msg, &peer.sender, router_uuid)?;
+            send_ttl_exceeded_to(&msg, &peer.sender, router_uuid)?;
         }
         return Ok(());
     }
@@ -2981,7 +2986,7 @@ async fn handle_peer_message(
                     ) {
                         senders.push(dst_handle.sender);
                     } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
+                        send_unreachable_to(&msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
                     }
                 } else {
                     let remote = {
@@ -2999,7 +3004,7 @@ async fn handle_peer_message(
                             if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                                 forward_to_hive(
                                     &remote.hive_id,
-                                    msg,
+                                    &msg,
                                     is_gateway,
                                     peer_routers,
                                     peers,
@@ -3010,10 +3015,10 @@ async fn handle_peer_message(
                                 .await?;
                             }
                         } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            send_unreachable_to(msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
+                            send_unreachable_to(&msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
                         }
                     } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
+                        send_unreachable_to(&msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
                     }
                 }
             } else {
@@ -3035,7 +3040,7 @@ async fn handle_peer_message(
                     ResolvedRoute::Drop => {}
                     ResolvedRoute::Unreachable(reason) => {
                         if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            send_unreachable_to(msg, &peer.sender, router_uuid, reason)?;
+                            send_unreachable_to(&msg, &peer.sender, router_uuid, reason)?;
                         }
                     }
                     ResolvedRoute::Deliver(dst_uuid) => {
@@ -3049,25 +3054,30 @@ async fn handle_peer_message(
                             ) {
                                 senders.push(dst_handle.sender.clone());
                             } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                                send_unreachable_to(msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
+                                send_unreachable_to(
+                                    &msg,
+                                    &peer.sender,
+                                    router_uuid,
+                                    "VPN_BLOCKED",
+                                )?;
                             }
                         } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            send_unreachable_to(msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
+                            send_unreachable_to(&msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
                         }
                     }
                     ResolvedRoute::ForwardRouter(peer_uuid) => {
                         if let Some(peer) = peers.lock().await.get(&peer_uuid).cloned() {
                             if msg.routing.ttl <= 1 {
-                                send_ttl_exceeded_to(msg, &peer.sender, router_uuid)?;
+                                send_ttl_exceeded_to(&msg, &peer.sender, router_uuid)?;
                                 return Ok(());
                             }
                         }
-                        if send_to_peer_router(peers, peer_uuid, msg).await? {
+                        if send_to_peer_router(peers, peer_uuid, &msg).await? {
                             return Ok(());
                         }
                         if let Some(peer) = peers.lock().await.get(&peer_uuid).cloned() {
                             send_unreachable_to(
-                                msg,
+                                &msg,
                                 &peer.sender,
                                 router_uuid,
                                 "PEER_UNAVAILABLE",
@@ -3078,7 +3088,7 @@ async fn handle_peer_message(
                         if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                             forward_to_hive(
                                 &hive_id,
-                                msg,
+                                &msg,
                                 is_gateway,
                                 peer_routers,
                                 peers,
@@ -3118,7 +3128,7 @@ async fn handle_peer_message(
             if msg.routing.ttl >= 3 {
                 if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                     forward_broadcast_to_wan(
-                        msg,
+                        &msg,
                         is_gateway,
                         peer_routers,
                         peers,
@@ -3131,22 +3141,26 @@ async fn handle_peer_message(
             }
         }
         Destination::Resolve => {
-            let resolved_target =
-                match resolve_target_with_identity(opa, hive_id, identity_frontdesk_node_name, msg)
-                    .await
-                {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!("opa resolve failed: {err}");
-                        if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            send_unreachable_to(msg, &peer.sender, router_uuid, "OPA_ERROR")?;
-                        }
-                        return Ok(());
+            let resolved_target = match resolve_target_with_identity(
+                opa,
+                hive_id,
+                identity_frontdesk_node_name,
+                &msg,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!("opa resolve failed: {err}");
+                    if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
+                        send_unreachable_to(&msg, &peer.sender, router_uuid, "OPA_ERROR")?;
                     }
-                };
+                    return Ok(());
+                }
+            };
             let Some(target) = resolved_target.as_deref() else {
                 if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                    send_unreachable_to(msg, &peer.sender, router_uuid, "OPA_NO_TARGET")?;
+                    send_unreachable_to(&msg, &peer.sender, router_uuid, "OPA_NO_TARGET")?;
                 }
                 return Ok(());
             };
@@ -3168,7 +3182,7 @@ async fn handle_peer_message(
                 ResolvedRoute::Drop => {}
                 ResolvedRoute::Unreachable(reason) => {
                     if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(msg, &peer.sender, router_uuid, reason)?;
+                        send_unreachable_to(&msg, &peer.sender, router_uuid, reason)?;
                     }
                 }
                 ResolvedRoute::Deliver(dst_uuid) => {
@@ -3182,31 +3196,31 @@ async fn handle_peer_message(
                         ) {
                             senders.push(dst_handle.sender.clone());
                         } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            send_unreachable_to(msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
+                            send_unreachable_to(&msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
                         }
                     } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
+                        send_unreachable_to(&msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
                     }
                 }
                 ResolvedRoute::ForwardRouter(peer_uuid) => {
                     if let Some(peer) = peers.lock().await.get(&peer_uuid).cloned() {
                         if msg.routing.ttl <= 1 {
-                            send_ttl_exceeded_to(msg, &peer.sender, router_uuid)?;
+                            send_ttl_exceeded_to(&msg, &peer.sender, router_uuid)?;
                             return Ok(());
                         }
                     }
-                    if send_to_peer_router(peers, peer_uuid, msg).await? {
+                    if send_to_peer_router(peers, peer_uuid, &msg).await? {
                         return Ok(());
                     }
                     if let Some(peer) = peers.lock().await.get(&peer_uuid).cloned() {
-                        send_unreachable_to(msg, &peer.sender, router_uuid, "PEER_UNAVAILABLE")?;
+                        send_unreachable_to(&msg, &peer.sender, router_uuid, "PEER_UNAVAILABLE")?;
                     }
                 }
                 ResolvedRoute::ForwardHive(hive_id) => {
                     if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                         forward_to_hive(
                             &hive_id,
-                            msg,
+                            &msg,
                             is_gateway,
                             peer_routers,
                             peers,
@@ -3222,7 +3236,7 @@ async fn handle_peer_message(
     }
 
     if !senders.is_empty() {
-        let data = serde_json::to_vec(msg)?;
+        let data = serde_json::to_vec(&msg)?;
         for sender in senders {
             let _ = sender.send(data.clone());
         }
