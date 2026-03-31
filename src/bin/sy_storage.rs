@@ -1337,7 +1337,7 @@ fn resolve_database_url(
         .database
         .as_ref()
         .and_then(|db| db.url.as_ref())
-        .map(str::trim)
+        .map(|value| value.trim())
         .filter(|value| !value.is_empty())
     {
         return (Some(url.to_string()), StorageDbSecretSource::HiveYamlLegacy);
