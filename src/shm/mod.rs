@@ -485,7 +485,7 @@ pub struct RemoteVpnEntry {
     pub _reserved: [u8; 18],
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct RegionLayout {
     header_offset: usize,
     node_offset: usize,
