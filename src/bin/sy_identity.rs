@@ -86,7 +86,6 @@ const MSG_TNT_APPROVE_RESPONSE: &str = "TNT_APPROVE_RESPONSE";
 enum IdentityDbSecretSource {
     LocalFile,
     EnvCompat,
-    HiveYamlLegacy,
     Missing,
 }
 
@@ -95,7 +94,6 @@ impl IdentityDbSecretSource {
         match self {
             Self::LocalFile => "local_file",
             Self::EnvCompat => "env_compat",
-            Self::HiveYamlLegacy => "hive_yaml_legacy",
             Self::Missing => "missing",
         }
     }
@@ -1815,7 +1813,7 @@ async fn main() -> Result<(), IdentityError> {
         .into());
     }
     let node_name = ensure_l2_name(IDENTITY_NODE_BASE_NAME, &hive.hive_id);
-    let (database_url, db_secret_source) = resolve_database_url(&hive, &node_name);
+    let (database_url, db_secret_source) = resolve_database_url(&node_name);
     let (db_config, db_init_error) = if is_primary {
         initialize_identity_database_backend(database_url.as_deref()).await
     } else {
@@ -3909,7 +3907,7 @@ fn build_identity_config_get_payload(
     } else {
         json!({
             "code": "missing_secret",
-            "message": "Missing database secret in local secrets.json, env overrides, or hive.yaml legacy fallback."
+            "message": "Missing database secret in local secrets.json or env overrides."
         })
     };
     json!({
@@ -4154,10 +4152,7 @@ fn build_secret_write_options_from_message(msg: &Message) -> NodeSecretWriteOpti
     }
 }
 
-fn resolve_database_url(
-    hive: &HiveFile,
-    node_name: &str,
-) -> (Option<String>, IdentityDbSecretSource) {
+fn resolve_database_url(node_name: &str) -> (Option<String>, IdentityDbSecretSource) {
     if let Some(url) = load_local_identity_postgres_url(node_name) {
         return (Some(url), IdentityDbSecretSource::LocalFile);
     }
@@ -4171,17 +4166,7 @@ fn resolve_database_url(
             return (Some(url), IdentityDbSecretSource::EnvCompat);
         }
     }
-    let url = hive
-        .database
-        .as_ref()
-        .and_then(|db| db.url.as_ref())
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    match url {
-        Some(url) => (Some(url), IdentityDbSecretSource::HiveYamlLegacy),
-        None => (None, IdentityDbSecretSource::Missing),
-    }
+    (None, IdentityDbSecretSource::Missing)
 }
 
 async fn initialize_identity_database_backend(
@@ -4193,10 +4178,7 @@ async fn initialize_identity_database_backend(
     else {
         return (
             None,
-            Some(
-                "Missing database secret in local secrets.json, env overrides, or hive.yaml legacy fallback."
-                    .to_string(),
-            ),
+            Some("Missing database secret in local secrets.json or env overrides.".to_string()),
         );
     };
     let base = match database_url.parse::<PgConfig>() {

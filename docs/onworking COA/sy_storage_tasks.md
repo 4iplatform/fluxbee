@@ -259,8 +259,8 @@ Estado 2026-03-31:
   - `CONFIG_GET` responde correctamente por `archi -> SY.admin -> SY.storage`
   - `CONFIG_SET` persiste `postgres_url` en `secrets.json` y devuelve redacción correcta
   - restart posterior de `sy-storage` vuelve a levantar usando el secreto local
-  - `SY.storage` ya no usa `hive.yaml -> database.url`; ese campo queda preservado por `SY.identity`
-  - `hive.yaml -> database.url` queda mantenido solo como fallback legacy temporal
+  - `SY.storage` ya no usa `hive.yaml -> database.url`
+  - `SY.identity` ya migró al mismo esquema, así que `database.url` queda fuera del camino canónico de ambos
 
 Fase propuesta:
 - Fase A:
@@ -372,7 +372,6 @@ Reglas:
 - `source` puede exponer:
   - `local_file`
   - `env_compat`
-  - `hive_yaml_legacy`
   - `missing`
 - `configured=true` no implica necesariamente conexión saludable; solo indica que existe secreto local
 
@@ -498,7 +497,7 @@ Recomendación v1:
 ### 7.7 Checklist
 
 - [x] ST-DB-0. Habilitar control-path/socket para `SY.storage` y meterlo al mismo plano `CONFIG_GET` / `CONFIG_SET` que otros nodos configurables.
-- [x] ST-DB-1. Documentar que `database.url` en `hive.yaml` deja de ser input para `SY.storage` y queda preservado por `SY.identity`.
+- [x] ST-DB-1. Documentar que `database.url` en `hive.yaml` deja de ser input para `SY.storage`.
 - [x] ST-DB-2. Definir contrato canónico para leer/aplicar config secreta de DB:
   - final deseado: `CONFIG_GET` / `CONFIG_SET`
   - transición opcional: action admin dedicada
@@ -516,7 +515,7 @@ Recomendación v1:
 - [x] `SY.storage` puede configurarse desde `archi` por su control-path normal sin editar `hive.yaml`.
 - [x] El secreto de DB queda persistido en `secrets.json` local, no en config pública.
 - [x] `SY.storage` vuelve a levantar correctamente tras restart usando el secreto local.
-- [x] `SY.storage` deja de depender de `hive.yaml`; el campo `database.url` puede permanecer mientras `SY.identity` todavía lo use.
+- [x] `SY.storage` deja de depender de `hive.yaml`; el campo `database.url` queda fuera del camino canónico actual.
 
 Nota:
 - validado manualmente el 2026-03-31 con `CONFIG_GET`, `CONFIG_SET`, restart y lectura efectiva posterior.
