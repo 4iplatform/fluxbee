@@ -86,6 +86,7 @@ The physical unit of conversational continuity given by the medium. Created by t
 | Medium-native thread | `hash(native_thread_id + ich_id)` | Email In-Reply-To, Slack thread reply, helpdesk ticket ID |
 
 The IO node chooses the rule because it knows the channel type. The SDK provides a canonical `compute_thread_id(channel_type, params)` function.
+The current canonical format uses versioned input material plus stable `sha256`, producing identifiers like `thread:sha256:<hex>`.
 
 **Sequencing:** every message that belongs to a thread also carries `meta.thread_seq`. Unlike `thread_id`, this value is **not** assigned by the IO node. It is assigned by the router when the message enters the local conversation flow for that thread, so the system has a deterministic per-thread order for persistence, replay, scope cuts, and evidence ranges.
 
@@ -919,7 +920,7 @@ For v1, the reason evaluator is deterministic, operating only on the 8 canonical
 
 ### 13.5 Thread ID Hash Function
 
-**Resolved.** Thread computation uses three rules by channel type (see section 3.1). The SDK provides `compute_thread_id(channel_type, params)`. Hash function: to be specified (SHA-256 truncated or blake3).
+**Resolved.** Thread computation uses three rules by channel type (see section 3.1). The SDK provides `compute_thread_id(channel_type, params)`. Current hash function/format: versioned canonical material + `sha256`, output as `thread:sha256:<hex>`.
 
 **Additional resolved rule:** `thread_seq` is assigned by the router, not by IO. The router is the only component that should serialize message order within a thread for cognition and durable replay.
 
@@ -968,7 +969,7 @@ Both coexist. Neither replaces the other.
 
 ### Phase 1 — Contexts (Core Pipeline)
 
-- [ ] COG-T1. Implement `compute_thread_id(channel_type, params)` in SDK with three rules (DM, group, native).
+- [x] COG-T1. Implement `compute_thread_id(channel_type, params)` in SDK with three rules (DM, group, native).
 - [ ] COG-T2. IO nodes include `thread_id` in message metadata using SDK function.
 - [ ] COG-T2b. Router assigns `thread_seq` per `thread_id` and includes it in message metadata.
 - [ ] COG-T3. SY.cognition consumes from NATS `storage.turns`.

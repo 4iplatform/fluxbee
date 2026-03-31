@@ -360,12 +360,17 @@ async fn process_one_inbound(
                 .is_some();
             let thread_id = msg
                 .meta
-                .context
-                .as_ref()
-                .and_then(|ctx| ctx.get("thread_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+                .thread_id
+                .clone()
+                .or_else(|| {
+                    msg.meta
+                        .context
+                        .as_ref()
+                        .and_then(|ctx| ctx.get("thread_id"))
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_default();
             if legacy_context_src_ilk {
                 tracing::warn!(
                     %trace_id,

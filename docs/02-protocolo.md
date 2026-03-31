@@ -129,10 +129,17 @@ Estos campos forman el carrier canónico de conversación para cognition v2:
 
 - **`ich`**: Canal por el cual el interlocutor se comunica (WhatsApp, Slack, email, etc.)
 - **`thread_id`**: Identificador físico del hilo, calculado por SDK/IO según tipo de canal
+  - se obtiene con `compute_thread_id(...)`
+  - usa material canónico versionado + `sha256`
+  - formato actual: `thread:sha256:<hex>`
 - **`thread_seq`**: Secuencia monotónica asignada por router dentro de `thread_id`
 
 Reglas:
 - `thread_id` lo calcula el productor que conoce el medium, típicamente el IO node.
+- el cálculo admite tres casos canónicos:
+  - `DirectPair`
+  - `PersistentChannel`
+  - `NativeThread`
 - `thread_seq` lo asigna el router.
 - `thread_seq` no es global; solo tiene orden dentro del thread.
 - cognition v2 usa `thread_id` y `thread_seq` como carrier canónico.

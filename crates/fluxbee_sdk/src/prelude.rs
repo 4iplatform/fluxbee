@@ -45,3 +45,4 @@ pub use crate::node_secret::{
 };
 pub use crate::payload::{PayloadError, TextV1Payload, TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES};
 pub use crate::status::try_handle_default_node_status;
+pub use crate::thread::{compute_thread_id, ThreadIdError, ThreadIdInput};

@@ -71,6 +71,7 @@ pub struct Router {
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_state: Arc<Mutex<std::collections::HashMap<String, RemoteHiveState>>>,
     lsa_seq: Arc<Mutex<u64>>,
+    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     nats_publisher: Option<Arc<NatsPublisher>>,
     nats_publish_errors: Arc<AtomicU64>,
 }
@@ -139,6 +140,7 @@ impl Router {
             wan_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lsa_state: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lsa_seq: Arc::new(Mutex::new(0)),
+            thread_sequences: Arc::new(Mutex::new(HashMap::new())),
             nats_publisher,
             nats_publish_errors: Arc::new(AtomicU64::new(0)),
         }
@@ -213,6 +215,7 @@ impl Router {
         let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
         let is_gateway = self.cfg.is_gateway;
         let peer_socket_dir = self.cfg.node_socket_dir.clone();
+        let thread_sequences_pd = Arc::clone(&self.thread_sequences);
         tokio::spawn(async move {
             peer_discovery_loop(
                 router_uuid,
@@ -236,6 +239,7 @@ impl Router {
                 opa_reader_pd,
                 lsa_snapshot_pd,
                 fib_pd,
+                thread_sequences_pd,
                 is_gateway,
             )
             .await;
@@ -306,6 +310,7 @@ impl Router {
                 let wan_peers = Arc::clone(&wan_peers);
                 let lsa_reader = Arc::clone(&lsa_reader);
                 let lsa_snapshot = Arc::clone(&lsa_snapshot);
+                let thread_sequences = Arc::clone(&self.thread_sequences);
                 let is_gateway = is_gateway;
                 tokio::spawn(async move {
                     if let Err(err) = handle_peer_incoming(
@@ -328,6 +333,7 @@ impl Router {
                         identity_frontdesk_node_name,
                         wan_peers,
                         lsa_snapshot,
+                        thread_sequences,
                         is_gateway,
                     )
                     .await
@@ -360,6 +366,7 @@ impl Router {
                 fib: Arc::clone(&self.fib),
                 broadcast_cache: Arc::clone(&self.broadcast_cache),
                 lsa_seq: Arc::clone(&self.lsa_seq),
+                thread_sequences: Arc::clone(&self.thread_sequences),
                 opa: Arc::clone(&self.opa),
                 wan_session_epochs: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 lsa_reject_counters: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -409,6 +416,7 @@ impl Router {
             let opa_reader = Arc::clone(&self.opa_reader);
             let broadcast_cache = Arc::clone(&self.broadcast_cache);
             let lsa_seq = Arc::clone(&self.lsa_seq);
+            let thread_sequences = Arc::clone(&self.thread_sequences);
             let nats_publisher = self.nats_publisher.clone();
             let nats_publish_errors = Arc::clone(&self.nats_publish_errors);
             let is_gateway = self.cfg.is_gateway;
@@ -433,6 +441,7 @@ impl Router {
                     opa_reader,
                     broadcast_cache,
                     lsa_seq,
+                    thread_sequences,
                     nats_publisher,
                     nats_publish_errors,
                     router_uuid,
@@ -469,6 +478,7 @@ async fn handle_node(
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
+    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     nats_publisher: Option<Arc<NatsPublisher>>,
     nats_publish_errors: Arc<AtomicU64>,
     router_uuid: Uuid,
@@ -608,7 +618,8 @@ async fn handle_node(
     loop {
         match read_frame(&mut reader).await? {
             Some(frame) => {
-                if let Ok(msg) = serde_json::from_slice::<Message>(&frame) {
+                if let Ok(mut msg) = serde_json::from_slice::<Message>(&frame) {
+                    assign_thread_seq_if_missing(&mut msg, &thread_sequences).await;
                     tracing::info!(
                         src = %msg.routing.src,
                         dst = ?msg.routing.dst,
@@ -761,6 +772,7 @@ async fn handle_node(
                         &wan_peers,
                         &opa,
                         &broadcast_cache,
+                        &thread_sequences,
                         &hive_id,
                         identity_frontdesk_node_name,
                         router_uuid,
@@ -815,6 +827,7 @@ async fn handle_message(
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     opa: &Arc<Mutex<OpaResolver>>,
     broadcast_cache: &Arc<Mutex<BroadcastCache>>,
+    thread_sequences: &Arc<Mutex<HashMap<String, u64>>>,
     hive_id: &str,
     identity_frontdesk_node_name: &str,
     router_uuid: Uuid,
@@ -822,6 +835,8 @@ async fn handle_message(
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
     _snapshot: Option<&ConfigSnapshot>,
 ) -> Result<(), RouterError> {
+    let mut msg = msg.clone();
+    assign_thread_seq_if_missing(&mut msg, thread_sequences).await;
     let src_uuid = match Uuid::parse_str(&msg.routing.src) {
         Ok(uuid) => uuid,
         Err(_) => return Ok(()),
@@ -1135,6 +1150,47 @@ async fn handle_message(
         }
     }
     Ok(())
+}
+
+async fn assign_thread_seq_if_missing(
+    msg: &mut Message,
+    thread_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+) {
+    let Some(thread_id) = canonical_thread_id_from_meta(&msg.meta) else {
+        return;
+    };
+
+    if msg.meta.thread_id.is_none() {
+        msg.meta.thread_id = Some(thread_id.clone());
+    }
+    if msg.meta.thread_seq.is_some() {
+        return;
+    }
+
+    let next_seq = {
+        let mut guard = thread_sequences.lock().await;
+        let entry = guard.entry(thread_id).or_insert(0);
+        *entry = entry.saturating_add(1);
+        *entry
+    };
+    msg.meta.thread_seq = Some(next_seq);
+}
+
+fn canonical_thread_id_from_meta(meta: &Meta) -> Option<String> {
+    meta.thread_id
+        .as_deref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            meta.context
+                .as_ref()
+                .and_then(|ctx| ctx.get("thread_id"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
 }
 
 fn send_unreachable_to(
@@ -2065,6 +2121,8 @@ async fn handle_wan_message(
     peer_router_name: &str,
     session_epoch: u64,
 ) -> Result<(), RouterError> {
+    let mut msg = msg.clone();
+    assign_thread_seq_if_missing(&mut msg, &ctx.thread_sequences).await;
     if msg.meta.msg_type == SYSTEM_KIND {
         if msg.meta.msg.as_deref() == Some(MSG_LSA) {
             let payload: LsaPayload = match serde_json::from_value(msg.payload.clone()) {
@@ -2450,6 +2508,7 @@ async fn peer_discovery_loop(
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
+    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     is_gateway: bool,
 ) {
     let mut ticker = time::interval(Duration::from_secs(5));
@@ -2507,6 +2566,7 @@ async fn peer_discovery_loop(
                     let self_shm_name = self_shm_name.to_string();
                     let vpn_rules = Arc::clone(&vpn_rules);
                     let lsa_snapshot = Arc::clone(&lsa_snapshot);
+                    let thread_sequences = Arc::clone(&thread_sequences);
                     let is_gateway = is_gateway;
                     let socket_dir = socket_dir.clone();
                     let identity_frontdesk_node_name = identity_frontdesk_node_name.to_string();
@@ -2534,6 +2594,7 @@ async fn peer_discovery_loop(
                             &identity_frontdesk_node_name,
                             lsa_snapshot,
                             fib,
+                            thread_sequences,
                             is_gateway,
                         )
                         .await;
@@ -2634,6 +2695,7 @@ async fn connect_to_peer(
     identity_frontdesk_node_name: &str,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
+    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
     let socket_path = peer_socket_path(socket_dir, peer_uuid);
@@ -2694,6 +2756,7 @@ async fn connect_to_peer(
                         self_uuid,
                         is_gateway,
                         &lsa_snapshot,
+                        &thread_sequences,
                     )
                     .await?;
                 }
@@ -2729,6 +2792,7 @@ async fn handle_peer_incoming(
     identity_frontdesk_node_name: String,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
+    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
     let (mut reader, mut writer) = stream.into_split();
@@ -2787,6 +2851,7 @@ async fn handle_peer_incoming(
                         router_uuid,
                         is_gateway,
                         &lsa_snapshot,
+                        &thread_sequences,
                     )
                     .await?;
                 }
@@ -2824,7 +2889,10 @@ async fn handle_peer_message(
     router_uuid: Uuid,
     is_gateway: bool,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
+    thread_sequences: &Arc<Mutex<HashMap<String, u64>>>,
 ) -> Result<(), RouterError> {
+    let mut msg = msg.clone();
+    assign_thread_seq_if_missing(&mut msg, thread_sequences).await;
     let src_uuid = match Uuid::parse_str(&msg.routing.src) {
         Ok(uuid) => uuid,
         Err(_) => return Ok(()),
@@ -3309,6 +3377,7 @@ struct WanContext {
     fib: Arc<Mutex<Vec<FibEntry>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
+    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     opa: Arc<Mutex<OpaResolver>>,
     wan_session_epochs: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     lsa_reject_counters: Arc<Mutex<std::collections::HashMap<String, u64>>>,

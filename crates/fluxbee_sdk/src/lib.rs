@@ -14,6 +14,7 @@ pub mod protocol;
 pub mod socket;
 pub mod split;
 pub mod status;
+pub mod thread;
 
 pub use admin::{
     admin_command, admin_command_ok, AdminCommandError, AdminCommandRequest, AdminCommandResult,
@@ -55,3 +56,4 @@ pub use node_secret::{
 };
 pub use split::{NodeReceiver, NodeSender};
 pub use status::try_handle_default_node_status;
+pub use thread::{compute_thread_id, ThreadIdError, ThreadIdInput};

@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use fluxbee_sdk::{compute_thread_id, ThreadIdInput};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IoContext {
@@ -92,11 +93,25 @@ pub fn slack_inbound_io_context(
     thread_ts: Option<&str>,
     message_id: &str,
 ) -> IoContext {
-    // AI nodes require a logical thread_id for user messages.
-    // For Slack root-channel messages (no thread_ts), use channel_id as fallback thread_id.
-    let thread_id = thread_ts
-        .map(|s| s.to_string())
-        .or_else(|| Some(channel_id.to_string()));
+    let thread_id = match thread_ts {
+        Some(native_thread_id) => Some(
+            compute_thread_id(ThreadIdInput::NativeThread {
+                channel_type: "slack",
+                entrypoint_id: Some(team_id),
+                conversation_id: channel_id,
+                native_thread_id,
+            })
+            .expect("valid slack native thread input"),
+        ),
+        None => Some(
+            compute_thread_id(ThreadIdInput::PersistentChannel {
+                channel_type: "slack",
+                entrypoint_id: Some(team_id),
+                conversation_id: channel_id,
+            })
+            .expect("valid slack channel thread input"),
+        ),
+    };
     let params = match thread_ts {
         Some(t) => serde_json::json!({ "thread_ts": t, "workspace_id": team_id }),
         None => serde_json::json!({ "workspace_id": team_id }),
@@ -132,6 +147,7 @@ pub fn slack_inbound_io_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxbee_sdk::{compute_thread_id, ThreadIdInput};
 
     #[test]
     fn extract_reply_target_roundtrip() {
@@ -165,7 +181,13 @@ mod tests {
     #[test]
     fn slack_thread_id_falls_back_to_channel_id_when_thread_ts_missing() {
         let io = slack_inbound_io_context("T123", "U456", "C789", None, "EvABC");
-        assert_eq!(io.conversation.thread_id.as_deref(), Some("C789"));
+        let expected = compute_thread_id(ThreadIdInput::PersistentChannel {
+            channel_type: "slack",
+            entrypoint_id: Some("T123"),
+            conversation_id: "C789",
+        })
+        .expect("thread id");
+        assert_eq!(io.conversation.thread_id.as_deref(), Some(expected.as_str()));
         assert_eq!(
             io.reply_target
                 .params
@@ -173,5 +195,18 @@ mod tests {
                 .and_then(|v| v.as_str()),
             None
         );
+    }
+
+    #[test]
+    fn slack_native_thread_uses_canonical_thread_id() {
+        let io = slack_inbound_io_context("T123", "U456", "C789", Some("171234.567"), "EvABC");
+        let expected = compute_thread_id(ThreadIdInput::NativeThread {
+            channel_type: "slack",
+            entrypoint_id: Some("T123"),
+            conversation_id: "C789",
+            native_thread_id: "171234.567",
+        })
+        .expect("thread id");
+        assert_eq!(io.conversation.thread_id.as_deref(), Some(expected.as_str()));
     }
 }

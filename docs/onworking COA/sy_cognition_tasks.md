@@ -270,16 +270,26 @@ Salida:
 
 ### Fase COG-M2 - Thread en SDK e IO
 
-- [ ] COG-M2-T1. Implementar `compute_thread_id(channel_type, params)` en SDK.
-- [ ] COG-M2-T2. Elegir función hash canónica y formato estable de input.
-- [ ] COG-M2-T3. Definir API de SDK para los tres casos:
+- [x] COG-M2-T1. Implementar `compute_thread_id(channel_type, params)` en SDK.
+- [x] COG-M2-T2. Elegir función hash canónica y formato estable de input.
+- [x] COG-M2-T3. Definir API de SDK para los tres casos:
   - DM / 1:1
   - group / persistent channel
   - medium-native thread
 - [ ] COG-M2-T4. Migrar IO nodes/productores para emitir `thread_id`.
 - [ ] COG-M2-T5. Implementar asignación de `thread_seq` en router por `thread_id`.
-- [ ] COG-M2-T6. Definir fallback cuando el medium no provee `native_thread_id`.
+- [x] COG-M2-T6. Definir fallback cuando el medium no provee `native_thread_id`.
 - [ ] COG-M2-T7. Agregar tests de estabilidad/compat del hash y del sequencing por thread.
+
+Estado actual de `M2`:
+- `fluxbee_sdk` ya expone `compute_thread_id(...)`.
+- el formato actual usa material canónico versionado + `sha256`, con salida `thread:sha256:<hex>`.
+- la API ya separa `DirectPair`, `PersistentChannel` y `NativeThread`.
+- `io-common` ya adopta el cálculo canónico para Slack:
+  - `NativeThread` cuando existe `thread_ts`
+  - `PersistentChannel` cuando no existe `thread_ts`
+- el router ya tiene wiring inicial para asignar `thread_seq` cuando el mensaje entra sin secuencia usando `meta.thread_id` o fallback legacy a `context.thread_id`.
+- sigue pendiente validar E2E ese secuenciador en el root workspace y propagar el mismo patrón al resto de productores/medios.
 
 Salida:
 - todo turn nuevo relevante ya nace con `thread_id`.
