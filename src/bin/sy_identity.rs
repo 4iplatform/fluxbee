@@ -4175,7 +4175,7 @@ fn resolve_database_url(
         .database
         .as_ref()
         .and_then(|db| db.url.as_ref())
-        .map(str::trim)
+        .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
     match url {
