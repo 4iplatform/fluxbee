@@ -28,6 +28,11 @@ Checklist operativo para cerrar SY.orchestrator segun:
 - [x] Hardening de origen para mensajes `system` sensibles:
   - [x] Validación de origen permitido (`routing.src` UUID -> nombre L2 via SHM del router) para `RUNTIME_UPDATE`/`SPAWN_NODE`/`KILL_NODE`.
   - [x] Allowlist configurable por `ORCH_SYSTEM_ALLOWED_ORIGINS` (default: `SY.admin,WF.orch.diag`, expandido a `@<hive>`).
+- [x] Dist sync authority corregida:
+  - `fluxbee-dist` deja de reconciliarse como bidireccional genérico
+  - motherbee usa `sendonly`
+  - workers usan `receiveonly`
+  - esto alinea Syncthing con el axioma operativo: motherbee publica software y los workers solo reciben
   - [x] Recomendación para producción: `ORCH_SYSTEM_ALLOWED_ORIGINS=SY.admin` (reservar `WF.orch.diag` para E2E).
   - [x] Respuesta explícita `FORBIDDEN` para `SPAWN_NODE_RESPONSE`/`KILL_NODE_RESPONSE` cuando origen no autorizado.
 - [x] Respuesta formal a mensajes `SPAWN_NODE`/`KILL_NODE` (`*_RESPONSE`).

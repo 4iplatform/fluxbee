@@ -630,6 +630,10 @@ En v2, la distribución de software diaria no usa SSH operativo.
 Modelo:
 - Motherbee publica artefactos y manifests en `/var/lib/fluxbee/dist/`.
 - Syncthing replica `dist/` entre hives.
+- Autoridad de `dist`:
+  - motherbee = source of truth (`sendonly`)
+  - workers = receptores (`receiveonly`)
+- Los workers no publican ni corrigen software en `dist`; cualquier runtime/binario nuevo se publica primero en motherbee.
 - `SY.admin` dispara `POST /hives/{id}/update`.
 - `SY.orchestrator@{hive}` valida manifest local (`manifest_version/manifest_hash`) y readiness de artefactos runtime (`start.sh` presente + ejecutable para versiones `current`) antes de responder `ok`.
 
