@@ -1868,6 +1868,99 @@ fn system_sync_hint_response_json(
     payload
 }
 
+#[derive(Debug, Clone)]
+struct SyncthingConvergenceProbe {
+    service_active: bool,
+    api_healthy: bool,
+    folder_status: Option<SyncthingFolderStatus>,
+    warnings: Vec<String>,
+    converged: bool,
+}
+
+async fn wait_for_syncthing_folder_convergence(
+    state: &OrchestratorState,
+    desired_blob: &BlobRuntimeConfig,
+    desired_dist: &DistRuntimeConfig,
+    folder_id: &str,
+    timeout_ms: u64,
+    wait_for_idle: bool,
+) -> Result<SyncthingConvergenceProbe, OrchestratorError> {
+    let desired_sync = effective_syncthing_runtime_config(desired_blob, desired_dist);
+    let mut service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+    let mut api_healthy = if service_active {
+        syncthing_api_healthy(desired_sync.sync_api_port).await
+    } else {
+        false
+    };
+
+    if !service_active || !api_healthy {
+        ensure_blob_sync_runtime(desired_blob, desired_dist, state.is_motherbee).await?;
+        service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+        api_healthy = if service_active {
+            syncthing_api_healthy(desired_sync.sync_api_port).await
+        } else {
+            false
+        };
+    }
+
+    if !service_active || !api_healthy {
+        return Ok(SyncthingConvergenceProbe {
+            service_active,
+            api_healthy,
+            folder_status: None,
+            warnings: Vec::new(),
+            converged: false,
+        });
+    }
+
+    let mut warnings = Vec::new();
+    if let Err(err) = syncthing_trigger_folder_scan(&desired_sync, folder_id) {
+        tracing::warn!(
+            folder = %folder_id,
+            error = %err,
+            "syncthing folder scan trigger failed; continuing with status probe"
+        );
+        warnings.push(format!("scan trigger failed: {err}"));
+    }
+
+    let mut folder_status = syncthing_folder_status(&desired_sync, folder_id)?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if !folder_status.is_healthy() {
+            return Ok(SyncthingConvergenceProbe {
+                service_active,
+                api_healthy,
+                folder_status: Some(folder_status),
+                warnings,
+                converged: false,
+            });
+        }
+
+        if folder_status.is_converged() {
+            return Ok(SyncthingConvergenceProbe {
+                service_active,
+                api_healthy,
+                folder_status: Some(folder_status),
+                warnings,
+                converged: true,
+            });
+        }
+
+        if !wait_for_idle || Instant::now() >= deadline {
+            return Ok(SyncthingConvergenceProbe {
+                service_active,
+                api_healthy,
+                folder_status: Some(folder_status),
+                warnings,
+                converged: false,
+            });
+        }
+
+        time::sleep(Duration::from_millis(SYSTEM_SYNC_HINT_POLL_INTERVAL_MS)).await;
+        folder_status = syncthing_folder_status(&desired_sync, folder_id)?;
+    }
+}
+
 async fn handle_system_sync_hint_message(
     state: &OrchestratorState,
     msg: &Message,
@@ -1913,57 +2006,16 @@ async fn handle_system_sync_hint_message(
         });
     }
 
-    let mut service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
-    let mut api_healthy = if service_active {
-        syncthing_api_healthy(desired_sync.sync_api_port).await
-    } else {
-        false
-    };
-
-    if !service_active || !api_healthy {
-        if let Err(err) =
-            ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee).await
-        {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SYNC_UNHEALTHY",
-                "message": format!("failed to reconcile syncthing runtime: {err}"),
-                "channel": request.channel,
-                "folder_id": request.folder_id,
-            });
-        }
-        service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
-        api_healthy = if service_active {
-            syncthing_api_healthy(desired_sync.sync_api_port).await
-        } else {
-            false
-        };
-    }
-
-    if !service_active || !api_healthy {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SYNC_UNHEALTHY",
-            "message": "syncthing service is not healthy",
-            "channel": request.channel,
-            "folder_id": request.folder_id,
-            "api_healthy": api_healthy,
-            "service_active": service_active,
-        });
-    }
-
-    let mut warnings = Vec::new();
-    if let Err(err) = syncthing_trigger_folder_scan(&desired_sync, &request.folder_id) {
-        tracing::warn!(
-            channel = %request.channel,
-            folder = %request.folder_id,
-            error = %err,
-            "sync hint scan trigger failed; continuing with status probe"
-        );
-        warnings.push(format!("scan trigger failed: {err}"));
-    }
-
-    let mut folder_status = match syncthing_folder_status(&desired_sync, &request.folder_id) {
+    let probe = match wait_for_syncthing_folder_convergence(
+        state,
+        &desired_blob,
+        &desired_dist,
+        &request.folder_id,
+        request.timeout_ms,
+        request.wait_for_idle,
+    )
+    .await
+    {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -1972,93 +2024,97 @@ async fn handle_system_sync_hint_message(
                 "message": err.to_string(),
                 "channel": request.channel,
                 "folder_id": request.folder_id,
-                "api_healthy": api_healthy,
-                "errors": warnings,
             });
         }
     };
 
-    let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
-    loop {
-        if !folder_status.is_healthy() {
-            let mut errors = warnings.clone();
-            if !folder_status.error.is_empty() {
-                errors.push(format!("folder error: {}", folder_status.error));
-            }
-            if !folder_status.invalid.is_empty() {
-                errors.push(format!("folder invalid: {}", folder_status.invalid));
-            }
+    if !probe.service_active || !probe.api_healthy {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SYNC_UNHEALTHY",
+            "message": "syncthing service is not healthy",
+            "channel": request.channel,
+            "folder_id": request.folder_id,
+            "api_healthy": probe.api_healthy,
+            "service_active": probe.service_active,
+        });
+    }
+
+    let folder_status = match probe.folder_status.as_ref() {
+        Some(value) => value,
+        None => {
             return serde_json::json!({
                 "status": "error",
-                "error_code": "SYNC_UNHEALTHY",
-                "message": "syncthing folder is unhealthy",
+                "error_code": "SYNC_STATUS_FAILED",
+                "message": "syncthing folder status probe returned no data",
                 "hive": state.hive_id.as_str(),
                 "channel": request.channel,
                 "folder_id": request.folder_id,
-                "api_healthy": api_healthy,
-                "folder_healthy": false,
-                "state": folder_status.state,
-                "need_total_items": folder_status.need_total_items,
-                "errors": errors,
+                "api_healthy": probe.api_healthy,
+                "errors": probe.warnings,
             });
         }
+    };
 
-        if folder_status.is_converged() {
-            return system_sync_hint_response_json(
-                state,
-                &request,
-                "ok",
-                api_healthy,
-                Some(&folder_status),
-                warnings,
-                None,
-            );
+    if !folder_status.is_healthy() {
+        let mut errors = probe.warnings.clone();
+        if !folder_status.error.is_empty() {
+            errors.push(format!("folder error: {}", folder_status.error));
         }
-
-        if !request.wait_for_idle {
-            return system_sync_hint_response_json(
-                state,
-                &request,
-                "sync_pending",
-                api_healthy,
-                Some(&folder_status),
-                warnings,
-                Some("folder has pending items".to_string()),
-            );
+        if !folder_status.invalid.is_empty() {
+            errors.push(format!("folder invalid: {}", folder_status.invalid));
         }
-
-        if Instant::now() >= deadline {
-            return system_sync_hint_response_json(
-                state,
-                &request,
-                "sync_pending",
-                api_healthy,
-                Some(&folder_status),
-                warnings,
-                Some(format!(
-                    "sync hint timeout after {}ms waiting for idle convergence",
-                    request.timeout_ms
-                )),
-            );
-        }
-
-        time::sleep(Duration::from_millis(SYSTEM_SYNC_HINT_POLL_INTERVAL_MS)).await;
-        folder_status = match syncthing_folder_status(&desired_sync, &request.folder_id) {
-            Ok(value) => value,
-            Err(err) => {
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": "SYNC_STATUS_FAILED",
-                    "message": err.to_string(),
-                    "hive": state.hive_id.as_str(),
-                    "channel": request.channel,
-                    "folder_id": request.folder_id,
-                    "api_healthy": api_healthy,
-                    "errors": warnings,
-                });
-            }
-        };
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SYNC_UNHEALTHY",
+            "message": "syncthing folder is unhealthy",
+            "hive": state.hive_id.as_str(),
+            "channel": request.channel,
+            "folder_id": request.folder_id,
+            "api_healthy": probe.api_healthy,
+            "folder_healthy": false,
+            "state": folder_status.state,
+            "need_total_items": folder_status.need_total_items,
+            "errors": errors,
+        });
     }
+
+    if probe.converged {
+        return system_sync_hint_response_json(
+            state,
+            &request,
+            "ok",
+            probe.api_healthy,
+            Some(folder_status),
+            probe.warnings,
+            None,
+        );
+    }
+
+    if !request.wait_for_idle {
+        return system_sync_hint_response_json(
+            state,
+            &request,
+            "sync_pending",
+            probe.api_healthy,
+            Some(folder_status),
+            probe.warnings,
+            Some("folder has pending items".to_string()),
+        );
+    }
+
+    system_sync_hint_response_json(
+        state,
+        &request,
+        "sync_pending",
+        probe.api_healthy,
+        Some(folder_status),
+        probe.warnings,
+        Some(format!(
+            "sync hint timeout after {}ms waiting for idle convergence",
+            request.timeout_ms
+        )),
+    )
 }
 
 async fn restart_local_core_services_with_health_gate() -> Result<Vec<String>, OrchestratorError> {
@@ -12587,31 +12643,59 @@ async fn add_hive_finalize_local_flow(
     } else {
         None
     };
-    let service_active = if desired_sync.sync_enabled {
-        systemd_is_active(SYNCTHING_SERVICE_NAME)
-    } else {
-        false
-    };
-    let api_healthy = if desired_sync.sync_enabled {
-        syncthing_api_healthy(desired_sync.sync_api_port).await
-    } else {
-        false
-    };
-    let runtime_manifest_ready =
+    let runtime_manifest_ready = local_runtime_manifest_ready_for_spawn();
+    let (service_active, api_healthy, folder_status, dist_sync_ready, dist_sync_errors) =
         if !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist) {
-            local_runtime_manifest_ready_for_spawn()
-        } else if service_active && api_healthy {
-            wait_for_local_runtime_manifest_ready(Duration::from_secs(dist_sync_probe_timeout_secs))
-                .await
+            (false, false, None, true, Vec::new())
         } else {
-            false
+            match wait_for_syncthing_folder_convergence(
+                state,
+                &desired_blob,
+                &desired_dist,
+                SYNCTHING_FOLDER_DIST_ID,
+                dist_sync_probe_timeout_secs.saturating_mul(1000),
+                true,
+            )
+            .await
+            {
+                Ok(probe) => {
+                    let mut errors = probe.warnings;
+                    if let Some(status) = probe.folder_status.as_ref() {
+                        if !status.error.is_empty() {
+                            errors.push(format!("folder error: {}", status.error));
+                        }
+                        if !status.invalid.is_empty() {
+                            errors.push(format!("folder invalid: {}", status.invalid));
+                        }
+                    }
+                    (
+                        probe.service_active,
+                        probe.api_healthy,
+                        probe.folder_status,
+                        probe.service_active && probe.api_healthy && probe.converged,
+                        errors,
+                    )
+                }
+                Err(err) => (
+                    systemd_is_active(SYNCTHING_SERVICE_NAME),
+                    false,
+                    None,
+                    false,
+                    vec![err.to_string()],
+                ),
+            }
         };
-    let dist_sync_ready =
-        if !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist) {
-            true
-        } else {
-            service_active && api_healthy && runtime_manifest_ready
-        };
+    let folder_healthy = folder_status
+        .as_ref()
+        .is_some_and(SyncthingFolderStatus::is_healthy);
+    let folder_state = folder_status
+        .as_ref()
+        .map(|status| status.state.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let folder_need_total_items = folder_status
+        .as_ref()
+        .map(|status| status.need_total_items)
+        .unwrap_or(0);
 
     serde_json::json!({
         "status": "ok",
@@ -12621,8 +12705,12 @@ async fn add_hive_finalize_local_flow(
         "service_active": service_active,
         "api_healthy": api_healthy,
         "runtime_manifest_ready": runtime_manifest_ready,
+        "folder_healthy": folder_healthy,
+        "folder_state": folder_state,
+        "folder_need_total_items": folder_need_total_items,
         "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
         "dist_sync_ready": dist_sync_ready,
+        "dist_sync_errors": dist_sync_errors,
         "core_sync_pending": core_sync_pending,
         "syncthing_peer_linked": syncthing_peer_linked,
         "syncthing_device_id": syncthing_device_id,
