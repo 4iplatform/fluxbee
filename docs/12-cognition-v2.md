@@ -1,7 +1,7 @@
 # Fluxbee - 12 Cognition (SY.cognition) v2
 
 **Status:** v2.0 (final)
-**Date:** 2026-03-24
+**Date:** 2026-03-31
 **Audience:** All developers (cognitive, AI, IO, router, identity)
 **Replaces:** `12-cognition.md` (v1.16)
 **Sources:** Cognitive Lab audit (`15-auditoria-tecnica-especifica-independiente.md`), architecture sessions, operational reason design
@@ -32,7 +32,8 @@ SY.cognition does NOT handle:
 - Immediate conversation memory (AI SDK responsibility).
 - Identity management (SY.identity).
 - Message persistence to PostgreSQL (SY.storage).
-- Routing decisions (router + OPA).
+- Routing decisions (router + OPA). Cognitive data does NOT feed OPA.
+- Normative evaluation (SY.policy responsibility). Cognitive does NOT judge compliance.
 
 ---
 
@@ -184,7 +185,7 @@ Memory is narrative, not exact. Like human memory, it captures the essence with 
 }
 ```
 
-The `summary` is the narrative fusion. The `dominant_context_id` and `dominant_reason_id` are structured metadata for OPA/routing consumption.
+The `summary` is the narrative fusion. The `dominant_context_id` and `dominant_reason_id` are structured metadata available for AI node enrichment via memory_package. OPA does not read these fields. SY.policy may read them as supporting evidence in the future but does not depend on them in v1.
 
 ### 3.6 Episode
 
@@ -239,10 +240,11 @@ These are the minimum reason signals the tagger should recognize. They are inten
 
 - The tagger extracts reason signals from the same message, in the same call as semantic tags.
 - A message can carry multiple reason signals (a complaint that also seeks resolution).
-- **The 8 commandments are a closed canonical set for v1.** The reason evaluator and OPA only operate on these 8 signals. This ensures deterministic processing and stable SHM indexing.
-- If the tagger detects nuances beyond the 8, they go to a separate `reason_signals_extra` field as free-text evidence. This evidence is available for narrative memory generation but does NOT feed the reason evaluator or reach OPA.
+- **The 8 commandments are a closed canonical set for v1.** The cognitive reason evaluator only operates on these 8 signals. This ensures deterministic processing and stable SHM indexing.
+- If the tagger detects nuances beyond the 8, they go to a separate `reason_signals_extra` field as free-text evidence. This evidence is available for narrative memory generation but does NOT feed the reason evaluator.
 - The reason evaluator (same mechanics as context evaluator) groups canonical signals into reasons with labels, weights, and ILK profiles.
 - Reasons do not refine labels (same additive rule as contexts).
+- **OPA does not read reason signals.** SY.policy may read them independently from the message stream for normative evaluation, but that is SY.policy's concern, not cognitive's.
 
 **Canonical kernel vs periferia:**
 
@@ -254,7 +256,7 @@ These are the minimum reason signals the tagger should recognize. They are inten
 }
 ```
 
-The canonical signals feed the deterministic pipeline. The extra signals enrich narrative memory but have no normative weight.
+The canonical signals feed the cognitive pipeline (reason evaluator → reasons → binding energy → memory fusion). The extra signals enrich narrative memory only.
 
 ### 4.4 Why General, Not Specific
 
@@ -322,7 +324,9 @@ SY.cognition consumes from NATS (`storage.turns` stream). Same stream as SY.stor
 
 ### 5.3 Message Enrichment
 
-Router reads `jsr-memory-<hive>` SHM to attach `memory_package` to messages. The router enriches, not SY.cognition. SY.cognition writes, the router reads and attaches.
+Router reads `jsr-memory-<hive>` SHM to attach `memory_package` to messages. The router enriches, not SY.cognition. SY.cognition writes the data; the router reads and attaches it.
+
+**Important:** Enrichment happens AFTER the routing decision. OPA decides where the message goes based on identity data only. Then, before delivery to the destination node, the router attaches the memory_package so the AI node has cognitive context. The memory_package does not influence routing.
 
 ---
 
@@ -646,7 +650,9 @@ Contains inverted index of tags + reason signals → memory/episode references f
 
 ---
 
-## 11. Memory Package (Router Enrichment)
+## 11. Memory Package (Router Enrichment for AI Nodes)
+
+The memory_package is attached by the router to messages before delivery to destination AI nodes. It provides the AI with conversational understanding accumulated over time. **The memory_package is NOT used for routing decisions.** OPA does not see it. Routing happens before enrichment.
 
 ```json
 {
@@ -740,28 +746,26 @@ For v1, the reason evaluator is deterministic, operating only on the 8 canonical
 
 Continuous feeds deferred. System assumes discrete messages. IO handles segmentation.
 
-### 13.7 Future: Normative Interpretation Layer (SY.claims)
+### 13.7 Relationship to SY.policy and OPA
 
-SY.cognition describes and condenses experience. It does NOT interpret law or produce normative claims for enforcement.
+**SY.cognition has no relationship to OPA.** OPA does not read any cognitive data — not contexts, not reasons, not memories, not episodes, not reason signals. OPA reads identity data (from jsr-identity SHM) and active restrictions (from SY.policy). That's it.
 
-When the system needs a layer that translates reason signals + identity + context + memory into canonical normative claims for OPA (intent_class, risk_level, requires_confirmation, human_handoff_candidate, etc.), that layer should be a separate process — tentatively SY.claims or SY.norm.
+**SY.cognition has no direct relationship to SY.policy.** SY.policy is a separate NATS consumer that reads the same message stream as cognitive. SY.policy may independently read reason signals from the original message (the tagger output that travels in the message metadata) to inform its normative evaluation. But SY.policy does not depend on cognitive having processed the message first. They run in parallel, not in series.
 
-**For v1:** OPA consumes `dominant_reason_id` from memories and canonical reason signals directly. This is sufficient for basic routing decisions.
-
-**For future:** SY.claims sits between cognition and OPA:
+**The architecture is:**
 
 ```
-SY.cognition (describes) → SY.claims (interprets) → OPA (enforces)
+Message → NATS
+  ├──► SY.cognition (describes: contexts, reasons, memories, episodes)
+  │         └──► jsr-memory SHM (for router enrichment of AI nodes)
+  │
+  └──► SY.policy (evaluates: normative compliance, post-facto)
+           └──► restrictions → jsr-identity SHM (for OPA to read)
 ```
 
-SY.claims would take: message + identity + active contexts/reasons + relevant memories/episodes. It would produce canonical normative claims: `{ intent_class, risk_level, requires_confirmation, read_only, touches_system_config, human_handoff_candidate }`. OPA would consume those claims, not raw cognitive data.
+Cognitive and policy are parallel consumers. Cognitive enriches AI nodes. Policy feeds OPA. They don't feed each other in v1.
 
-This separation preserves:
-- **Cognition** as experience engine (description).
-- **Claims** as normative interpreter (jurisprudence).
-- **OPA** as enforcement engine (law/force).
-
-This is documented as design direction, not for implementation now.
+**Future possibility:** SY.policy may eventually read cognitive output (memories, episodes) as supporting evidence for normative evaluation. But that is additive — cognitive does not change to accommodate policy, and policy does not depend on cognitive for its core function.
 
 ---
 
@@ -773,7 +777,7 @@ This is documented as design direction, not for implementation now.
 | Horizon | Last 10-12 interactions | Days, weeks, months |
 | Owner | Each AI node | SY.cognition (system-wide) |
 | Content | What am I doing right now | What do I know + with what drive |
-| Consumed by | The AI node itself | Router (enrichment) + AI nodes (memory_package) |
+| Consumed by | The AI node itself | Router (enrichment → AI nodes via memory_package). NOT consumed by OPA or SY.policy in v1 |
 
 Both coexist. Neither replaces the other.
 
@@ -899,4 +903,4 @@ pub const MEMORY_VERSION: u32 = 2;
 | Immediate memory (AI SDK) | `immediate-conversation-memory-spec.md` |
 | SY nodes catalog | `SY_nodes_spec.md` |
 | Identity v3 direction (claims) | `identity-v3-direction.md` |
-| Normative evaluation (SY.claims) | `sy-claims-beta.md` |
+| Normative evaluation (SY.policy) | `sy-policy-beta.md` |
