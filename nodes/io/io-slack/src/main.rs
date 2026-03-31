@@ -1548,10 +1548,10 @@ async fn run_outbound_loop(
     blob_payload_cfg: IoTextBlobConfig,
 ) -> Result<()> {
     loop {
-        let next_msg = ({
+        let next_msg = {
             let mut guard = inbox.lock().await;
             guard.recv_next_timeout(Duration::from_secs(1)).await
-        });
+        };
         let next_msg = match next_msg {
             Ok(value) => value,
             Err(err) => {
@@ -1584,6 +1584,7 @@ async fn run_outbound_loop(
         if let Some(response) = handle_io_control_plane_message(
             &msg,
             &node_name,
+            sender.uuid(),
             &state_dir,
             control_plane.clone(),
             control_metrics.clone(),
@@ -1762,6 +1763,7 @@ async fn run_outbound_loop(
 async fn handle_io_control_plane_message(
     msg: &WireMessage,
     node_name: &str,
+    control_src: &str,
     state_dir: &Path,
     control_plane: Arc<RwLock<IoControlPlaneState>>,
     control_metrics: Arc<IoControlPlaneMetrics>,
@@ -1780,7 +1782,7 @@ async fn handle_io_control_plane_message(
             "node_name": node_name,
             "state": state.current_state.as_str(),
         });
-        return Some(build_system_reply(msg, "PONG", payload));
+        return Some(build_system_reply(msg, control_src, "PONG", payload));
     }
     if command.eq_ignore_ascii_case("STATUS") {
         let state = control_plane.read().await.clone();
@@ -1797,7 +1799,12 @@ async fn handle_io_control_plane_message(
                 "control_plane": metrics
             }
         });
-        return Some(build_system_reply(msg, "STATUS_RESPONSE", payload));
+        return Some(build_system_reply(
+            msg,
+            control_src,
+            "STATUS_RESPONSE",
+            payload,
+        ));
     }
     if !command.eq_ignore_ascii_case("CONFIG_GET") && !command.eq_ignore_ascii_case("CONFIG_SET") {
         return None;
@@ -1853,7 +1860,9 @@ async fn handle_io_control_plane_message(
         }
     };
 
-    Some(build_io_config_response_message(msg, payload))
+    let mut response = build_io_config_response_message(msg, payload);
+    response.routing.src = control_src.to_string();
+    Some(response)
 }
 
 fn is_control_plane_msg_type(msg_type: &str) -> bool {
@@ -2159,7 +2168,12 @@ fn redact_state(
     redacted
 }
 
-fn build_system_reply(incoming: &WireMessage, response_msg: &str, payload: Value) -> WireMessage {
+fn build_system_reply(
+    incoming: &WireMessage,
+    control_src: &str,
+    response_msg: &str,
+    payload: Value,
+) -> WireMessage {
     let dst = if incoming.routing.src.trim().is_empty() {
         Destination::Broadcast
     } else {
@@ -2167,7 +2181,7 @@ fn build_system_reply(incoming: &WireMessage, response_msg: &str, payload: Value
     };
     WireMessage {
         routing: Routing {
-            src: String::new(),
+            src: control_src.to_string(),
             dst,
             ttl: incoming.routing.ttl.max(1),
             trace_id: incoming.routing.trace_id.clone(),
