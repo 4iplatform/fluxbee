@@ -884,7 +884,7 @@ impl AiNode for GenericAiNode {
                 }
             }
         } else {
-            extract_text(&msg.payload).unwrap_or_default()
+            (extract_text(&msg.payload).unwrap_or_default(), None)
         };
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             tracing::info!(
