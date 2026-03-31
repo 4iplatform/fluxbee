@@ -430,6 +430,7 @@ impl Router {
             let broadcast_cache = Arc::clone(&self.broadcast_cache);
             let lsa_seq = Arc::clone(&self.lsa_seq);
             let thread_sequences = Arc::clone(&self.thread_sequences);
+            let memory_reader = Arc::clone(&self.memory_reader);
             let nats_publisher = self.nats_publisher.clone();
             let nats_publish_errors = Arc::clone(&self.nats_publish_errors);
             let is_gateway = self.cfg.is_gateway;
@@ -454,6 +455,7 @@ impl Router {
                     opa_reader,
                     broadcast_cache,
                     lsa_seq,
+                    memory_reader,
                     thread_sequences,
                     nats_publisher,
                     nats_publish_errors,
@@ -491,6 +493,7 @@ async fn handle_node(
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
+    memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     nats_publisher: Option<Arc<NatsPublisher>>,
     nats_publish_errors: Arc<AtomicU64>,
