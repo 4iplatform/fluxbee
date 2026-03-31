@@ -209,17 +209,26 @@ async fn main() -> Result<(), StorageError> {
         config_dir: config_dir.clone(),
         version: STORAGE_NODE_VERSION.to_string(),
     };
-    let (base_database_config, db_secret_source) = database_config(&hive, &node_name)?;
+    let (database_url, db_secret_source) = resolve_database_url(&hive, &node_name);
     let mut control_state = bootstrap_storage_control_state(&node_name, db_secret_source)?;
-    ensure_database_exists(&base_database_config, STORAGE_DB_NAME).await?;
-    let storage_database_config = with_dbname(&base_database_config, STORAGE_DB_NAME);
-    let storage = Arc::new(Storage::connect(&storage_database_config).await?);
-    storage.ensure_schema().await?;
-    let replayed = storage
-        .replay_pending_messages(INBOX_REPLAY_BATCH_SIZE, INBOX_REPLAY_MAX_ROUNDS)
-        .await?;
-    if replayed > 0 {
-        tracing::info!(count = replayed, "replayed pending storage inbox messages");
+    let (mut sender, mut receiver) =
+        connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    tracing::info!(node_name = %sender.full_name(), "sy.storage connected to router");
+
+    let storage = initialize_storage_backend(database_url.as_deref(), &node_name).await;
+    if let Some(storage) = storage.as_ref() {
+        let replayed = storage
+            .replay_pending_messages(INBOX_REPLAY_BATCH_SIZE, INBOX_REPLAY_MAX_ROUNDS)
+            .await?;
+        if replayed > 0 {
+            tracing::info!(count = replayed, "replayed pending storage inbox messages");
+        }
+    } else {
+        tracing::warn!(
+            node_name = %node_name,
+            db_secret_source = %db_secret_source.as_str(),
+            "sy.storage started without active DB backend; CONFIG_SET + restart required"
+        );
     }
 
     tracing::info!(
@@ -227,55 +236,54 @@ async fn main() -> Result<(), StorageError> {
         node_name = %node_name,
         db_secret_source = %db_secret_source.as_str(),
         endpoint = %endpoint,
+        storage_ready = storage.is_some(),
         "sy.storage started"
     );
-
-    let (mut sender, mut receiver) =
-        connect_with_retry(&node_config, Duration::from_secs(1)).await?;
-    tracing::info!(node_name = %sender.full_name(), "sy.storage connected to router");
 
     let nats_subscribe_errors = Arc::new(AtomicU64::new(0));
     let storage_handler_errors = Arc::new(AtomicU64::new(0));
 
-    let turns_task = tokio::spawn(run_turns_loop(
-        endpoint.clone(),
-        use_durable_consumer,
-        Arc::clone(&storage),
-        Arc::clone(&nats_subscribe_errors),
-        Arc::clone(&storage_handler_errors),
-    ));
-    let events_task = tokio::spawn(run_events_loop(
-        endpoint.clone(),
-        use_durable_consumer,
-        Arc::clone(&storage),
-        Arc::clone(&nats_subscribe_errors),
-        Arc::clone(&storage_handler_errors),
-    ));
-    let items_task = tokio::spawn(run_items_loop(
-        endpoint.clone(),
-        use_durable_consumer,
-        Arc::clone(&storage),
-        Arc::clone(&nats_subscribe_errors),
-        Arc::clone(&storage_handler_errors),
-    ));
-    let react_task = tokio::spawn(run_reactivation_loop(
-        endpoint.clone(),
-        use_durable_consumer,
-        Arc::clone(&storage),
-        Arc::clone(&nats_subscribe_errors),
-        Arc::clone(&storage_handler_errors),
-    ));
-    let metrics_query_task = tokio::spawn(run_storage_metrics_query_loop(
+    if let Some(storage) = storage.as_ref() {
+        std::mem::drop(tokio::spawn(run_turns_loop(
+            endpoint.clone(),
+            use_durable_consumer,
+            Arc::clone(storage),
+            Arc::clone(&nats_subscribe_errors),
+            Arc::clone(&storage_handler_errors),
+        )));
+        std::mem::drop(tokio::spawn(run_events_loop(
+            endpoint.clone(),
+            use_durable_consumer,
+            Arc::clone(storage),
+            Arc::clone(&nats_subscribe_errors),
+            Arc::clone(&storage_handler_errors),
+        )));
+        std::mem::drop(tokio::spawn(run_items_loop(
+            endpoint.clone(),
+            use_durable_consumer,
+            Arc::clone(storage),
+            Arc::clone(&nats_subscribe_errors),
+            Arc::clone(&storage_handler_errors),
+        )));
+        std::mem::drop(tokio::spawn(run_reactivation_loop(
+            endpoint.clone(),
+            use_durable_consumer,
+            Arc::clone(storage),
+            Arc::clone(&nats_subscribe_errors),
+            Arc::clone(&storage_handler_errors),
+        )));
+        std::mem::drop(tokio::spawn(run_storage_metrics_loop(
+            Arc::clone(storage),
+            Arc::clone(&nats_subscribe_errors),
+            Arc::clone(&storage_handler_errors),
+        )));
+    }
+    std::mem::drop(tokio::spawn(run_storage_metrics_query_loop(
         config_dir.clone(),
-        Arc::clone(&storage),
+        storage.clone(),
         Arc::clone(&nats_subscribe_errors),
         Arc::clone(&storage_handler_errors),
-    ));
-    let metrics_task = tokio::spawn(run_storage_metrics_loop(
-        Arc::clone(&storage),
-        Arc::clone(&nats_subscribe_errors),
-        Arc::clone(&storage_handler_errors),
-    ));
+    )));
     let mut heartbeat = time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
@@ -988,7 +996,7 @@ async fn run_subject_loop(
 
 async fn run_storage_metrics_query_loop(
     config_dir: PathBuf,
-    storage: Arc<Storage>,
+    storage: Option<Arc<Storage>>,
     nats_subscribe_errors: Arc<AtomicU64>,
     storage_handler_errors: Arc<AtomicU64>,
 ) {
@@ -1013,13 +1021,13 @@ async fn run_storage_metrics_query_loop(
                 continue;
             }
         };
-        let storage = Arc::clone(&storage);
+        let storage = storage.clone();
         let config_dir_out = config_dir.clone();
         let nats_subscribe_errors = Arc::clone(&nats_subscribe_errors);
         let storage_handler_errors = Arc::clone(&storage_handler_errors);
         let run_result = subscriber
             .run(move |msg| {
-                let storage = Arc::clone(&storage);
+                let storage = storage.clone();
                 let config_dir_out = config_dir_out.clone();
                 let storage_handler_errors = Arc::clone(&storage_handler_errors);
                 async move {
@@ -1128,46 +1136,57 @@ async fn run_storage_metrics_query_loop(
                         reply_subject = %reply_subject,
                         "storage metrics db snapshot start"
                     );
-                    let (response, response_status) = match storage.inbox_metrics_snapshot().await {
-                        Ok(metrics) => {
-                            tracing::debug!(
-                                trace_id = %trace_id,
-                                request_subject = SUBJECT_STORAGE_METRICS_GET,
-                                reply_subject = %reply_subject,
-                                pending = metrics.pending,
-                                pending_with_error = metrics.pending_with_error,
-                                oldest_pending_age_s = metrics.oldest_pending_age_s,
-                                max_attempts = metrics.max_attempts,
-                                processed_total = metrics.processed_total,
-                                "storage metrics db snapshot success"
-                            );
-                            (
-                                NatsResponseEnvelope::ok(
-                                    SUBJECT_STORAGE_METRICS_GET,
-                                    trace_id.clone(),
-                                    metrics,
-                                ),
-                                "ok",
-                            )
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                trace_id = %trace_id,
-                                request_subject = SUBJECT_STORAGE_METRICS_GET,
-                                reply_subject = %reply_subject,
-                                error = %err,
-                                "storage metrics db snapshot failed"
-                            );
-                            (
-                                NatsResponseEnvelope::<StorageInboxMetricsSnapshot>::error(
-                                    SUBJECT_STORAGE_METRICS_GET,
-                                    trace_id.clone(),
-                                    "STORAGE_METRICS_UNAVAILABLE",
-                                    err.to_string(),
-                                ),
-                                "error",
-                            )
-                        }
+                    let (response, response_status) = match storage.as_ref() {
+                        Some(storage) => match storage.inbox_metrics_snapshot().await {
+                            Ok(metrics) => {
+                                tracing::debug!(
+                                    trace_id = %trace_id,
+                                    request_subject = SUBJECT_STORAGE_METRICS_GET,
+                                    reply_subject = %reply_subject,
+                                    pending = metrics.pending,
+                                    pending_with_error = metrics.pending_with_error,
+                                    oldest_pending_age_s = metrics.oldest_pending_age_s,
+                                    max_attempts = metrics.max_attempts,
+                                    processed_total = metrics.processed_total,
+                                    "storage metrics db snapshot success"
+                                );
+                                (
+                                    NatsResponseEnvelope::ok(
+                                        SUBJECT_STORAGE_METRICS_GET,
+                                        trace_id.clone(),
+                                        metrics,
+                                    ),
+                                    "ok",
+                                )
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    trace_id = %trace_id,
+                                    request_subject = SUBJECT_STORAGE_METRICS_GET,
+                                    reply_subject = %reply_subject,
+                                    error = %err,
+                                    "storage metrics db snapshot failed"
+                                );
+                                (
+                                    NatsResponseEnvelope::<StorageInboxMetricsSnapshot>::error(
+                                        SUBJECT_STORAGE_METRICS_GET,
+                                        trace_id.clone(),
+                                        "STORAGE_METRICS_UNAVAILABLE",
+                                        err.to_string(),
+                                    ),
+                                    "error",
+                                )
+                            }
+                        },
+                        None => (
+                            NatsResponseEnvelope::<StorageInboxMetricsSnapshot>::error(
+                                SUBJECT_STORAGE_METRICS_GET,
+                                trace_id.clone(),
+                                "STORAGE_NOT_READY",
+                                "storage backend not initialized; configure DB secret and restart sy-storage".to_string(),
+                            ),
+                            "error",
+                        ),
                     };
                     let db_elapsed_ms = db_started.elapsed().as_millis() as u64;
                     tracing::info!(
@@ -1297,41 +1316,86 @@ async fn load_hive(config_dir: &Path) -> Result<HiveFile, StorageError> {
     Ok(serde_yaml::from_str(&data)?)
 }
 
-fn base_database_url(
+fn resolve_database_url(
     hive: &HiveFile,
     node_name: &str,
-) -> Result<(String, StorageDbSecretSource), StorageError> {
+) -> (Option<String>, StorageDbSecretSource) {
     if let Some(url) = load_local_postgres_url(node_name) {
-        return Ok((url, StorageDbSecretSource::LocalFile));
+        return (Some(url), StorageDbSecretSource::LocalFile);
     }
     if let Ok(url) = std::env::var("FLUXBEE_DATABASE_URL") {
         if !url.trim().is_empty() {
-            return Ok((url, StorageDbSecretSource::EnvCompat));
+            return (Some(url), StorageDbSecretSource::EnvCompat);
         }
     }
     if let Ok(url) = std::env::var("JSR_DATABASE_URL") {
         if !url.trim().is_empty() {
-            return Ok((url, StorageDbSecretSource::EnvCompat));
+            return (Some(url), StorageDbSecretSource::EnvCompat);
         }
     }
-    let Some(db) = hive.database.as_ref() else {
-        return Err("database.url missing in local secrets.json, hive.yaml and env".into());
-    };
-    let Some(url) = db.url.as_ref() else {
-        return Err("database.url missing in local secrets.json, hive.yaml and env".into());
-    };
-    if url.trim().is_empty() {
-        return Err("database.url empty".into());
+    if let Some(url) = hive
+        .database
+        .as_ref()
+        .and_then(|db| db.url.as_ref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return (Some(url.to_string()), StorageDbSecretSource::HiveYamlLegacy);
     }
-    Ok((url.clone(), StorageDbSecretSource::HiveYamlLegacy))
+    (None, StorageDbSecretSource::Missing)
 }
 
-fn database_config(
-    hive: &HiveFile,
+fn database_config_from_url(url: &str) -> Result<PgConfig, StorageError> {
+    Ok(url.parse::<PgConfig>()?)
+}
+
+async fn initialize_storage_backend(
+    database_url: Option<&str>,
     node_name: &str,
-) -> Result<(PgConfig, StorageDbSecretSource), StorageError> {
-    let (url, source) = base_database_url(hive, node_name)?;
-    Ok((url.parse::<PgConfig>()?, source))
+) -> Option<Arc<Storage>> {
+    let Some(database_url) = database_url.filter(|value| !value.trim().is_empty()) else {
+        return None;
+    };
+    let base_database_config = match database_config_from_url(database_url) {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(
+                node_name = %node_name,
+                error = %err,
+                "invalid SY.storage database url; starting without DB backend"
+            );
+            return None;
+        }
+    };
+    if let Err(err) = ensure_database_exists(&base_database_config, STORAGE_DB_NAME).await {
+        tracing::warn!(
+            node_name = %node_name,
+            error = %err,
+            "failed to ensure storage database exists; starting without DB backend"
+        );
+        return None;
+    }
+    let storage_database_config = with_dbname(&base_database_config, STORAGE_DB_NAME);
+    let storage = match Storage::connect(&storage_database_config).await {
+        Ok(storage) => Arc::new(storage),
+        Err(err) => {
+            tracing::warn!(
+                node_name = %node_name,
+                error = %err,
+                "failed to connect SY.storage DB backend; starting without DB backend"
+            );
+            return None;
+        }
+    };
+    if let Err(err) = storage.ensure_schema().await {
+        tracing::warn!(
+            node_name = %node_name,
+            error = %err,
+            "failed to ensure SY.storage schema; starting without DB backend"
+        );
+        return None;
+    }
+    Some(storage)
 }
 
 fn with_dbname(base: &PgConfig, dbname: &str) -> PgConfig {
