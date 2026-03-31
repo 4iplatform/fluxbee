@@ -435,17 +435,27 @@ Estado actual:
 
 ### Fase COG-M6 - Scope + binding + periodización
 
-- [ ] COG-M6-T1. Definir algoritmo de asociación thread → scope actual.
-- [ ] COG-M6-T2. Implementar binding energy con:
+- [x] COG-M6-T1. Definir algoritmo de asociación thread → scope actual.
+- [x] COG-M6-T2. Implementar binding energy con:
   - similitud de contexto
   - similitud de reason canonical
   - similitud ILK
-- [ ] COG-M6-T3. Implementar EMA y threshold de unbind.
-- [ ] COG-M6-T4. Implementar `scope_instance`.
-- [ ] COG-M6-T5. Emitir eventos de transición de scope.
+- [x] COG-M6-T3. Implementar EMA y threshold de unbind.
+- [x] COG-M6-T4. Implementar `scope_instance`.
+- [x] COG-M6-T5. Emitir eventos de transición de scope.
 
 Nota:
 - si esta fase demora demasiado, puede diferirse la materialización completa de `scope_instance`, pero **no** redefinir el contrato. El contrato queda congelado desde `COG-M0`.
+
+Estado actual:
+- `SY.cognition` ya mantiene un scope activo por thread.
+- el binding v1 usa:
+  - Jaccard de tags del contexto dominante
+  - Jaccard de canonical signals de la razón dominante
+  - cosine simple sobre pesos ILK del turno actual vs scope activo
+- la transición se corta con EMA + `unbind_streak` corto y emite:
+  - `storage.cognition.scopes`
+  - `storage.cognition.scope_instances`
 
 ### Fase COG-M7 - Memory fusion + episodes
 

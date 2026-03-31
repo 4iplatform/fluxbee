@@ -26,9 +26,10 @@ use fluxbee_sdk::{
 use fluxbee_sdk::{
     CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
     CognitionDurableEnvelope, CognitionDurableOp, CognitionIlkProfile, CognitionReasonData,
-    CognitionThreadData, SUBJECT_STORAGE_COGNITION_CONTEXTS,
-    SUBJECT_STORAGE_COGNITION_COOCCURRENCES, SUBJECT_STORAGE_COGNITION_REASONS,
-    SUBJECT_STORAGE_COGNITION_THREADS,
+    CognitionScopeData, CognitionScopeInstanceData, CognitionThreadData,
+    SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_COOCCURRENCES,
+    SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
+    SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
 };
 use json_router::nats::{NatsSubscriber as RouterNatsSubscriber, SUBJECT_STORAGE_TURNS};
 
@@ -48,6 +49,9 @@ const COGNITION_COOCCURRENCE_DECAY_FACTOR: f64 = 0.80;
 const COGNITION_CONTEXT_EMA_ALPHA: f64 = 0.25;
 const COGNITION_REASON_EMA_ALPHA: f64 = 0.30;
 const COGNITION_COOCCURRENCE_EMA_ALPHA: f64 = 0.35;
+const COGNITION_SCOPE_ENERGY_ALPHA: f64 = 0.25;
+const COGNITION_SCOPE_UNBIND_THRESHOLD: f64 = 0.35;
+const COGNITION_SCOPE_SUSTAIN_COUNT: u32 = 2;
 const COGNITION_MAX_TAGS: usize = 12;
 const COGNITION_MAX_REASON_SIGNALS: usize = 4;
 const NATS_ERROR_LOG_EVERY: u64 = 20;
@@ -137,6 +141,7 @@ struct CognitionRuntimeState {
     open_reasons_total: u64,
     open_cooccurrences_total: u64,
     active_threads_total: u64,
+    active_scopes_total: u64,
 }
 
 #[derive(Debug)]
@@ -161,6 +166,7 @@ struct ThreadCognitionState {
     contexts: HashMap<String, ContextState>,
     reasons: HashMap<String, ReasonState>,
     cooccurrences: HashMap<String, CooccurrenceState>,
+    active_scope: Option<ScopeBindingState>,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +220,25 @@ struct CooccurrenceState {
     last_seen_at: String,
     closed_at: Option<String>,
     status: String,
+}
+
+#[derive(Debug, Clone)]
+struct ScopeBindingState {
+    scope_id: String,
+    scope_instance_id: String,
+    label: String,
+    dominant_context_id: String,
+    dominant_context_label: String,
+    dominant_context_tags: Vec<String>,
+    dominant_reason_id: String,
+    dominant_reason_label: String,
+    dominant_reason_signals: Vec<String>,
+    ilk_weights: BTreeMap<String, f64>,
+    binding_energy_ema: f64,
+    opened_at: String,
+    last_seen_at: String,
+    start_thread_seq: Option<u64>,
+    unbind_streak: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -481,7 +506,13 @@ async fn handle_turn_payload(
         }
     }
 
-    let (active_threads_total, open_contexts_total, open_reasons_total, open_cooccurrences_total) = {
+    let (
+        active_threads_total,
+        open_contexts_total,
+        open_reasons_total,
+        open_cooccurrences_total,
+        active_scopes_total,
+    ) = {
         let threads = app_state.thread_states.lock().await;
         let active_threads = threads.len() as u64;
         let open_contexts = threads
@@ -514,11 +545,16 @@ async fn handle_turn_payload(
                     .count() as u64
             })
             .sum();
+        let active_scopes = threads
+            .values()
+            .filter(|thread| thread.active_scope.is_some())
+            .count() as u64;
         (
             active_threads,
             open_contexts,
             open_reasons,
             open_cooccurrences,
+            active_scopes,
         )
     };
 
@@ -538,6 +574,7 @@ async fn handle_turn_payload(
     state.open_contexts_total = open_contexts_total;
     state.open_reasons_total = open_reasons_total;
     state.open_cooccurrences_total = open_cooccurrences_total;
+    state.active_scopes_total = active_scopes_total;
     Ok(())
 }
 
@@ -713,7 +750,8 @@ fn build_status_payload(
             "active_threads_total": runtime_state.active_threads_total,
             "open_contexts_total": runtime_state.open_contexts_total,
             "open_reasons_total": runtime_state.open_reasons_total,
-            "open_cooccurrences_total": runtime_state.open_cooccurrences_total
+            "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
+            "active_scopes_total": runtime_state.active_scopes_total
         },
         "paths": {
             "state_dir": runtime_paths.state_dir,
@@ -752,7 +790,7 @@ fn build_cognition_config_get_payload(
                 .to_string(),
         ),
         Value::String(
-            "Deterministic v1 writer for threads, contexts, reasons, and context-reason cooccurrences is active; SHM and memory/episode layers remain pending."
+            "Deterministic v1 writer for threads, contexts, reasons, cooccurrences, scopes, and scope_instances is active; SHM and memory/episode layers remain pending."
                 .to_string(),
         ),
     ];
@@ -804,7 +842,8 @@ fn build_cognition_config_get_payload(
             "last_tags": runtime_state.last_tags,
             "last_reason_signals_canonical": runtime_state.last_reason_signals_canonical,
             "last_reason_signals_extra": runtime_state.last_reason_signals_extra,
-            "open_cooccurrences_total": runtime_state.open_cooccurrences_total
+            "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
+            "active_scopes_total": runtime_state.active_scopes_total
         },
         "contract": {
             "node_family": "SY",
@@ -983,7 +1022,7 @@ fn cognition_state_label(control_state: &CognitionControlState) -> &'static str 
 }
 
 fn cognition_degraded_reasons(control_state: &CognitionControlState) -> Vec<&'static str> {
-    let mut reasons = vec!["memory_shm_pending", "scope_memory_episode_pending"];
+    let mut reasons = vec!["memory_shm_pending", "memory_episode_pending"];
     if control_state.ai_secret_source == CognitionAiSecretSource::Missing {
         reasons.push("ai_provider_missing");
     }
@@ -1445,6 +1484,19 @@ fn update_thread_state_and_build_envelopes(
         &thread_state.contexts,
         &thread_state.reasons,
         &mut thread_state.cooccurrences,
+    ));
+    out.extend(update_scope_binding_for_thread(
+        hive_id,
+        writer,
+        thread_id,
+        ts,
+        thread_seq,
+        src_ilk,
+        dst_ilk,
+        thread_state.turn_count,
+        &thread_state.contexts,
+        &thread_state.reasons,
+        &mut thread_state.active_scope,
     ));
     out
 }
@@ -1966,6 +2018,305 @@ fn update_cooccurrences_for_thread(
     }
 
     out
+}
+
+fn update_scope_binding_for_thread(
+    hive_id: &str,
+    writer: &str,
+    thread_id: &str,
+    ts: &str,
+    thread_seq: Option<u64>,
+    src_ilk: Option<&str>,
+    dst_ilk: Option<&str>,
+    turn_count: u64,
+    contexts: &HashMap<String, ContextState>,
+    reasons: &HashMap<String, ReasonState>,
+    active_scope: &mut Option<ScopeBindingState>,
+) -> Vec<(&'static str, Vec<u8>)> {
+    let mut out = Vec::new();
+    let Some(context) = select_dominant_context(contexts) else {
+        return out;
+    };
+    let Some(reason) = select_dominant_reason(reasons) else {
+        return out;
+    };
+
+    let current_label = format!("{} :: {}", context.label, reason.label);
+    let current_ilk_weights = current_turn_ilk_weights(src_ilk, dst_ilk);
+
+    match active_scope {
+        None => {
+            let opened = ScopeBindingState {
+                scope_id: format!("scope:{}", Uuid::new_v4()),
+                scope_instance_id: format!("scope_instance:{}", Uuid::new_v4()),
+                label: current_label,
+                dominant_context_id: context.context_id.clone(),
+                dominant_context_label: context.label.clone(),
+                dominant_context_tags: context.tags.clone(),
+                dominant_reason_id: reason.reason_id.clone(),
+                dominant_reason_label: reason.label.clone(),
+                dominant_reason_signals: reason.signals_canonical.clone(),
+                ilk_weights: current_ilk_weights,
+                binding_energy_ema: 1.0,
+                opened_at: ts.to_string(),
+                last_seen_at: ts.to_string(),
+                start_thread_seq: thread_seq,
+                unbind_streak: 0,
+            };
+            out.extend(build_scope_upsert_events(
+                hive_id, writer, thread_id, ts, thread_seq, &opened,
+            ));
+            *active_scope = Some(opened);
+        }
+        Some(scope) => {
+            let ctx_similarity =
+                jaccard_similarity(&scope.dominant_context_tags, &context.tags);
+            let reason_similarity =
+                jaccard_similarity(&scope.dominant_reason_signals, &reason.signals_canonical);
+            let ilk_similarity = cosine_similarity(&scope.ilk_weights, &current_ilk_weights);
+            let binding = ctx_similarity * reason_similarity * ilk_similarity;
+            scope.binding_energy_ema = update_ema(
+                scope.binding_energy_ema,
+                binding,
+                COGNITION_SCOPE_ENERGY_ALPHA,
+            );
+
+            let candidate_shift = scope.dominant_context_id != context.context_id
+                || scope.dominant_reason_id != reason.reason_id;
+            if candidate_shift
+                && turn_count >= 2
+                && scope.binding_energy_ema < COGNITION_SCOPE_UNBIND_THRESHOLD
+            {
+                scope.unbind_streak = scope.unbind_streak.saturating_add(1);
+            } else {
+                scope.unbind_streak = 0;
+            }
+
+            if candidate_shift && scope.unbind_streak >= COGNITION_SCOPE_SUSTAIN_COUNT {
+                out.extend(build_scope_close_events(
+                    hive_id, writer, thread_id, ts, thread_seq, scope,
+                ));
+                let opened = ScopeBindingState {
+                    scope_id: format!("scope:{}", Uuid::new_v4()),
+                    scope_instance_id: format!("scope_instance:{}", Uuid::new_v4()),
+                    label: current_label,
+                    dominant_context_id: context.context_id.clone(),
+                    dominant_context_label: context.label.clone(),
+                    dominant_context_tags: context.tags.clone(),
+                    dominant_reason_id: reason.reason_id.clone(),
+                    dominant_reason_label: reason.label.clone(),
+                    dominant_reason_signals: reason.signals_canonical.clone(),
+                    ilk_weights: current_ilk_weights,
+                    binding_energy_ema: binding,
+                    opened_at: ts.to_string(),
+                    last_seen_at: ts.to_string(),
+                    start_thread_seq: thread_seq,
+                    unbind_streak: 0,
+                };
+                out.extend(build_scope_upsert_events(
+                    hive_id, writer, thread_id, ts, thread_seq, &opened,
+                ));
+                *scope = opened;
+            } else {
+                scope.label = current_label;
+                scope.dominant_context_id = context.context_id.clone();
+                scope.dominant_context_label = context.label.clone();
+                scope.dominant_context_tags = context.tags.clone();
+                scope.dominant_reason_id = reason.reason_id.clone();
+                scope.dominant_reason_label = reason.label.clone();
+                scope.dominant_reason_signals = reason.signals_canonical.clone();
+                scope.ilk_weights = current_ilk_weights;
+                scope.last_seen_at = ts.to_string();
+                out.extend(build_scope_upsert_events(
+                    hive_id, writer, thread_id, ts, thread_seq, scope,
+                ));
+            }
+        }
+    }
+
+    out
+}
+
+fn build_scope_upsert_events(
+    hive_id: &str,
+    writer: &str,
+    thread_id: &str,
+    ts: &str,
+    thread_seq: Option<u64>,
+    scope: &ScopeBindingState,
+) -> Vec<(&'static str, Vec<u8>)> {
+    let mut out = Vec::new();
+    let scope_data = CognitionScopeData {
+        status: "open".to_string(),
+        label: Some(scope.label.clone()),
+        dominant_context_id: Some(scope.dominant_context_id.clone()),
+        dominant_reason_id: Some(scope.dominant_reason_id.clone()),
+        binding_energy_ema: Some(scope.binding_energy_ema),
+        opened_at: Some(scope.opened_at.clone()),
+        last_seen_at: Some(scope.last_seen_at.clone()),
+        closed_at: None,
+    };
+    if let Ok(body) = serde_json::to_vec(&CognitionDurableEnvelope::new(
+        CognitionDurableEntity::Scope,
+        CognitionDurableOp::Upsert,
+        scope.scope_id.clone(),
+        None,
+        hive_id.to_string(),
+        writer.to_string(),
+        ts.to_string(),
+        scope_data,
+    )) {
+        out.push((SUBJECT_STORAGE_COGNITION_SCOPES, body));
+    }
+
+    let scope_instance_data = CognitionScopeInstanceData {
+        scope_id: scope.scope_id.clone(),
+        dominant_context_id: Some(scope.dominant_context_id.clone()),
+        dominant_reason_id: Some(scope.dominant_reason_id.clone()),
+        start_thread_seq: scope.start_thread_seq,
+        end_thread_seq: thread_seq,
+        opened_at: Some(scope.opened_at.clone()),
+        closed_at: None,
+    };
+    if let Ok(body) = serde_json::to_vec(&CognitionDurableEnvelope::new(
+        CognitionDurableEntity::ScopeInstance,
+        CognitionDurableOp::Upsert,
+        scope.scope_instance_id.clone(),
+        Some(thread_id.to_string()),
+        hive_id.to_string(),
+        writer.to_string(),
+        ts.to_string(),
+        scope_instance_data,
+    )) {
+        out.push((SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, body));
+    }
+    out
+}
+
+fn build_scope_close_events(
+    hive_id: &str,
+    writer: &str,
+    thread_id: &str,
+    ts: &str,
+    thread_seq: Option<u64>,
+    scope: &ScopeBindingState,
+) -> Vec<(&'static str, Vec<u8>)> {
+    let mut out = Vec::new();
+    let scope_data = CognitionScopeData {
+        status: "closed".to_string(),
+        label: Some(scope.label.clone()),
+        dominant_context_id: Some(scope.dominant_context_id.clone()),
+        dominant_reason_id: Some(scope.dominant_reason_id.clone()),
+        binding_energy_ema: Some(scope.binding_energy_ema),
+        opened_at: Some(scope.opened_at.clone()),
+        last_seen_at: Some(ts.to_string()),
+        closed_at: Some(ts.to_string()),
+    };
+    if let Ok(body) = serde_json::to_vec(&CognitionDurableEnvelope::new(
+        CognitionDurableEntity::Scope,
+        CognitionDurableOp::Close,
+        scope.scope_id.clone(),
+        None,
+        hive_id.to_string(),
+        writer.to_string(),
+        ts.to_string(),
+        scope_data,
+    )) {
+        out.push((SUBJECT_STORAGE_COGNITION_SCOPES, body));
+    }
+
+    let scope_instance_data = CognitionScopeInstanceData {
+        scope_id: scope.scope_id.clone(),
+        dominant_context_id: Some(scope.dominant_context_id.clone()),
+        dominant_reason_id: Some(scope.dominant_reason_id.clone()),
+        start_thread_seq: scope.start_thread_seq,
+        end_thread_seq: thread_seq,
+        opened_at: Some(scope.opened_at.clone()),
+        closed_at: Some(ts.to_string()),
+    };
+    if let Ok(body) = serde_json::to_vec(&CognitionDurableEnvelope::new(
+        CognitionDurableEntity::ScopeInstance,
+        CognitionDurableOp::Close,
+        scope.scope_instance_id.clone(),
+        Some(thread_id.to_string()),
+        hive_id.to_string(),
+        writer.to_string(),
+        ts.to_string(),
+        scope_instance_data,
+    )) {
+        out.push((SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, body));
+    }
+    out
+}
+
+fn select_dominant_context<'a>(
+    contexts: &'a HashMap<String, ContextState>,
+) -> Option<&'a ContextState> {
+    contexts
+        .values()
+        .filter(|context| context.status == "open")
+        .max_by(|left, right| left.weight.total_cmp(&right.weight))
+}
+
+fn select_dominant_reason<'a>(
+    reasons: &'a HashMap<String, ReasonState>,
+) -> Option<&'a ReasonState> {
+    reasons
+        .values()
+        .filter(|reason| reason.status == "open")
+        .max_by(|left, right| left.weight.total_cmp(&right.weight))
+}
+
+fn current_turn_ilk_weights(src_ilk: Option<&str>, dst_ilk: Option<&str>) -> BTreeMap<String, f64> {
+    let mut out = BTreeMap::new();
+    if let Some(src_ilk) = src_ilk.map(str::trim).filter(|value| !value.is_empty()) {
+        *out.entry(src_ilk.to_string()).or_insert(0.0) += 1.0;
+    }
+    if let Some(dst_ilk) = dst_ilk.map(str::trim).filter(|value| !value.is_empty()) {
+        *out.entry(dst_ilk.to_string()).or_insert(0.0) += 0.5;
+    }
+    out
+}
+
+fn jaccard_similarity(left: &[String], right: &[String]) -> f64 {
+    if left.is_empty() && right.is_empty() {
+        return 1.0;
+    }
+    let left_set: HashSet<&str> = left.iter().map(String::as_str).collect();
+    let right_set: HashSet<&str> = right.iter().map(String::as_str).collect();
+    let intersection = left_set.intersection(&right_set).count() as f64;
+    let union = left_set.union(&right_set).count() as f64;
+    if union == 0.0 {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
+fn cosine_similarity(left: &BTreeMap<String, f64>, right: &BTreeMap<String, f64>) -> f64 {
+    if left.is_empty() && right.is_empty() {
+        return 1.0;
+    }
+    let mut dot = 0.0;
+    let mut left_norm = 0.0;
+    let mut right_norm = 0.0;
+
+    for value in left.values() {
+        left_norm += value * value;
+    }
+    for value in right.values() {
+        right_norm += value * value;
+    }
+    for (key, left_value) in left {
+        if let Some(right_value) = right.get(key) {
+            dot += left_value * right_value;
+        }
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        0.0
+    } else {
+        dot / (left_norm.sqrt() * right_norm.sqrt())
+    }
 }
 
 fn apply_ilk_participation(
