@@ -101,21 +101,24 @@ const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "sy-admin",
     "sy-architect",
     "sy-storage",
+    "sy-cognition",
     "ai-frontdesk-gov",
     "sy-orchestrator",
 ];
-const WORKER_MIN_CORE_COMPONENTS: [&str; 5] = [
+const WORKER_MIN_CORE_COMPONENTS: [&str; 6] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
+    "sy-cognition",
     "sy-orchestrator",
 ];
-const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 5] = [
+const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 6] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
+    "sy-cognition",
     "sy-orchestrator",
 ];
 const DEFAULT_BLOB_ENABLED: bool = true;
@@ -408,7 +411,7 @@ struct SystemUpdateRequest {
     runtime_version: Option<String>,
 }
 
-const MOTHERBEE_CRITICAL_SERVICES: [&str; 8] = [
+const MOTHERBEE_CRITICAL_SERVICES: [&str; 9] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
@@ -416,13 +419,15 @@ const MOTHERBEE_CRITICAL_SERVICES: [&str; 8] = [
     "sy-admin",
     "sy-architect",
     "sy-storage",
+    "sy-cognition",
     "ai-frontdesk-gov",
 ];
-const WORKER_CRITICAL_SERVICES: [&str; 4] = [
+const WORKER_CRITICAL_SERVICES: [&str; 5] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
+    "sy-cognition",
 ];
 
 #[tokio::main]
@@ -641,10 +646,11 @@ async fn bootstrap_local(
             "sy-admin",
             "sy-architect",
             "sy-storage",
+            "sy-cognition",
             "ai-frontdesk-gov",
         ]
     } else {
-        vec!["sy-config-routes", "sy-opa-rules"]
+        vec!["sy-config-routes", "sy-opa-rules", "sy-cognition"]
     };
     if identity_available() {
         services.push("sy-identity");
@@ -993,6 +999,9 @@ async fn wait_for_sy_nodes(
     if identity_available() {
         required.push("SY.identity");
     }
+    if cognition_available() {
+        required.push("SY.cognition");
+    }
     let start = Instant::now();
     let mut last_missing: Vec<String> = required.iter().map(|name| (*name).to_string()).collect();
     loop {
@@ -1056,6 +1065,19 @@ async fn watchdog_tick(state: &OrchestratorState) {
             );
         }
     }
+    if cognition_available() && !systemd_is_active("sy-cognition") {
+        tracing::warn!(
+            service = "sy-cognition",
+            "service not active; attempting restart"
+        );
+        if let Err(err) = systemd_start("sy-cognition") {
+            tracing::warn!(
+                service = "sy-cognition",
+                error = %err,
+                "service restart failed"
+            );
+        }
+    }
 
     if let Ok(snapshot) = load_router_snapshot(state) {
         let mut current = HashSet::new();
@@ -1113,6 +1135,7 @@ async fn shutdown_sequence(state: &OrchestratorState) {
 
     for service in [
         "ai-frontdesk-gov",
+        "sy-cognition",
         "sy-storage",
         "sy-architect",
         "sy-admin",
@@ -6996,7 +7019,7 @@ fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
 }
 
 fn remove_hive_cleanup_script() -> &'static str {
-    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-orchestrator sy-admin sy-architect sy-storage ai-frontdesk-gov fluxbee-syncthing; do \
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-cognition sy-orchestrator sy-admin sy-architect sy-storage ai-frontdesk-gov fluxbee-syncthing; do \
 systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
 systemctl disable \"$s\" >/dev/null 2>&1 || true; \
 systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
@@ -13235,6 +13258,7 @@ async fn add_hive_flow(
         }
     };
     let has_identity_source = core_manifest.components.contains_key("sy-identity");
+    let has_cognition_source = core_manifest.components.contains_key("sy-cognition");
 
     let core_deploy_started_at = now_epoch_ms();
     let core_deploy_started = Instant::now();
@@ -13413,6 +13437,9 @@ async fn add_hive_flow(
     ];
     if has_identity_source {
         worker_units.push(("sy-identity", "/usr/bin/sy-identity"));
+    }
+    if has_cognition_source {
+        worker_units.push(("sy-cognition", "/usr/bin/sy-cognition"));
     }
 
     for (name, exec_path) in &worker_units {
@@ -14391,6 +14418,10 @@ fn ensure_remote_orchestrator_sudoers_with_access(
 
 fn identity_available() -> bool {
     Path::new("/usr/bin/sy-identity").exists()
+}
+
+fn cognition_available() -> bool {
+    Path::new("/usr/bin/sy-cognition").exists()
 }
 
 fn askpass_script(password: &str) -> Result<PathBuf, OrchestratorError> {

@@ -5,10 +5,10 @@ Spec fuente: [`docs/12-cognition-v2.md`](/Users/cagostino/Documents/GitHub/fluxb
 
 ## 0) Estado real de partida
 
-Hoy `SY.cognition` **no existe** como binario implementado en el repo.
+Hoy `SY.cognition` ya existe como skeleton/binario implementado en el repo, pero todavía no completa el pipeline cognitivo v2.
 
 Estado observado del sistema:
-- no existe `src/bin/sy_cognition.rs`
+- ya existe `src/bin/sy_cognition.rs`
 - no existe `jsr-memory` implementado en código
 - no existe `memory_package` v2 implementado en router
 - no existe `compute_thread_id(...)` en SDK
@@ -392,7 +392,7 @@ Recomendación de source of truth:
   - sin storage
   - sin SHM
   - sin DB cache
-- [ ] COG-M4-T7. Integrar logs, status y unit systemd como el resto de SY.*
+- [x] COG-M4-T7. Integrar logs, status y unit systemd como el resto de SY.*
 
 Salida:
 - `SY.cognition` existe como proceso vivo y observable aunque todavía no procese todo el pipeline.
@@ -403,7 +403,8 @@ Estado actual:
 - expone `PING`, `STATUS`, `CONFIG_GET`, `CONFIG_SET`
 - persiste config pública local + secreto opcional `config.secrets.openai.api_key`
 - arranca en modo degradado sin provider AI y deja explícito en status que SHM/writers siguen pendientes
-- pendiente real de `M4`: integración operativa final de systemd/runtime packaging y después pasar al pipeline canónico `M5`
+- ya quedó integrado en `scripts/install.sh`, `SY.orchestrator` y `scripts/fluxbee_stop.sh` como servicio core del sistema
+- pendiente real después de `M4`: pasar al pipeline canónico `M5`
 
 ### Fase COG-M5 - Pipeline mínimo canónico: thread + tagger + contexts + reasons
 
