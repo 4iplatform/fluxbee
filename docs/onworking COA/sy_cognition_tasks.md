@@ -376,18 +376,18 @@ Recomendación de source of truth:
 
 ### Fase COG-M4 - Skeleton de `SY.cognition`
 
-- [ ] COG-M4-T1. Crear `src/bin/sy_cognition.rs`.
-- [ ] COG-M4-T2. Definir config del nodo:
+- [x] COG-M4-T1. Crear `src/bin/sy_cognition.rs`.
+- [x] COG-M4-T2. Definir config del nodo:
   - NATS endpoint / subjects
   - storage endpoint
   - AI provider config/secret
   - paths locales
   - tuning de thresholds
-- [ ] COG-M4-T3. Definir state dir:
+- [x] COG-M4-T3. Definir state dir:
   - `/var/lib/fluxbee/nodes/SY/SY.cognition@<hive>/...`
-- [ ] COG-M4-T4. Conectar al router como nodo SY regular.
-- [ ] COG-M4-T5. Exponer `PING`, `STATUS`, `CONFIG_GET`, `CONFIG_SET` si aplica
-- [ ] COG-M4-T6. Definir arranque degradado:
+- [x] COG-M4-T4. Conectar al router como nodo SY regular.
+- [x] COG-M4-T5. Exponer `PING`, `STATUS`, `CONFIG_GET`, `CONFIG_SET` si aplica
+- [x] COG-M4-T6. Definir arranque degradado:
   - sin AI provider
   - sin storage
   - sin SHM
@@ -397,9 +397,17 @@ Recomendación de source of truth:
 Salida:
 - `SY.cognition` existe como proceso vivo y observable aunque todavía no procese todo el pipeline.
 
+Estado actual:
+- `SY.cognition` ya conecta al router como nodo `SY.*` normal.
+- consume `storage.turns` con queue durable `durable.sy-cognition.turns` cuando NATS embedded está activo
+- expone `PING`, `STATUS`, `CONFIG_GET`, `CONFIG_SET`
+- persiste config pública local + secreto opcional `config.secrets.openai.api_key`
+- arranca en modo degradado sin provider AI y deja explícito en status que SHM/writers siguen pendientes
+- pendiente real de `M4`: integración operativa final de systemd/runtime packaging y después pasar al pipeline canónico `M5`
+
 ### Fase COG-M5 - Pipeline mínimo canónico: thread + tagger + contexts + reasons
 
-- [ ] COG-M5-T1. Consumir turns desde el carrier decidido.
+- [x] COG-M5-T1. Consumir turns desde el carrier decidido.
 - [ ] COG-M5-T2. Implementar tagger extendido:
   - `tags`
   - `reason_signals_canonical`
@@ -413,6 +421,10 @@ Salida:
 
 Salida:
 - cognition ya produce conocimiento estructurado básico sin esperar scope/memory/episode.
+
+Estado actual:
+- el consumer base de `storage.turns` ya corre en `SY.cognition`
+- lo que falta en `M5` es transformar esos turns en outputs cognitivos v2, no el carrier de entrada
 
 ### Fase COG-M6 - Scope + binding + periodización
 
