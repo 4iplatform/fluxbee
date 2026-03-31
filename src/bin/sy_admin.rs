@@ -3854,10 +3854,10 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             r#"curl -X POST /hives/motherbee/nodes/SY.admin@motherbee/messages -d '{"msg_type":"PING","payload":{"ping":true}}'"#
         }
         "node_control_config_get" => {
-            r#"curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/control/config-get -d '{"requested_by":"archi"}'"#
+            r#"curl -X POST /hives/motherbee/nodes/SY.storage@motherbee/control/config-get -d '{"requested_by":"archi"}'"#
         }
         "node_control_config_set" => {
-            r#"curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/control/config-set -d '{"schema_version":1,"config_version":7,"apply_mode":"replace","config":{"behavior":{"kind":"openai_chat","model":"gpt-4.1-mini"}}}'"#
+            r#"curl -X POST /hives/motherbee/nodes/SY.storage@motherbee/control/config-set -d '{"schema_version":1,"config_version":1,"apply_mode":"replace","config":{"database":{"postgres_url":"postgresql://fluxbee:secret@127.0.0.1:5432/fluxbee"}}}'"#
         }
         "list_ilks" => "curl -X GET /hives/motherbee/identity/ilks",
         "get_ilk" => {
@@ -3946,6 +3946,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Admin forwards CONFIG_GET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "Use this when you need the node-defined live contract, dynamic config view, or secret metadata; not when a plain stored config.json read is enough.",
             "The node defines the response contract and config schema; SY.admin only standardizes transport.",
+            "For SY.storage, this is the canonical way to inspect the redacted DB secret contract and its effective source/persistence metadata.",
         ],
         "node_control_config_set" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
@@ -3953,6 +3954,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "This is the canonical live control-plane mutation path for nodes that expose CONFIG_SET, including AI.*, IO.*, and SY.storage.",
             "Admin forwards CONFIG_SET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
+            "For SY.storage v1, the canonical secret field is config.database.postgres_url and the apply is persist-only until sy-storage is restarted.",
         ],
         "get_ilk" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
