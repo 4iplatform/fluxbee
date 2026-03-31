@@ -69,13 +69,13 @@ Contexto del problema:
 - `spawn` posterior termina en `RUNTIME_NOT_PRESENT`.
 - En algunos casos se observa desaparición/poda del runtime recién publicado durante la ventana de no convergencia.
 
-Lectura técnica actual:
-- `apply_system_update_local(..., "runtime")` hoy mezcla:
+Lectura técnica original del problema:
+- `apply_system_update_local(..., request category=runtime)` mezclaba:
   - retención de artifacts,
   - validación de presencia,
   - y decisión de convergencia.
-- `verify_runtime_current_artifacts(...)` valida el manifest runtime global, no solo el runtime/version objetivo.
-- `runtime_verify_and_retain` puede operar con manifest cacheado en memoria.
+- `verify_runtime_current_artifacts(...)` validaba el manifest runtime global, no solo el runtime/version objetivo.
+- `runtime_verify_and_retain` podía operar con manifest cacheado en memoria.
 - Esto deja acoplados tres problemas:
   - readiness global,
   - retención destructiva,
@@ -111,7 +111,7 @@ Objetivo:
 ### Fase R3 - Separar readiness puntual vs consistencia global
 - [x] R3-T1. Introducir validación por alcance para `SYSTEM_UPDATE category=runtime`:
   - `runtime`
-  - `version`
+  - `runtime_version`
   - opcionalmente `target_hives`
 - [x] R3-T2. Hacer que el update puntual no falle ni quede en `sync_pending` por faltantes de `AI.*` / `IO.*` / `WF.*` ajenos al runtime solicitado.
 - [x] R3-T3. Mantener una validación global aparte para salud general del sistema, sin usarla como bloqueo duro del deploy puntual.
