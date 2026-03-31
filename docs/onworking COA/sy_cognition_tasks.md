@@ -293,12 +293,18 @@ Estado actual de `M2`:
 - el router ya asigna `thread_seq` cuando el mensaje entra sin secuencia usando `meta.thread_id` o fallback legacy a `context.thread_id`.
 - hay tests de hash/compat en `fluxbee_sdk` y tests de sequencing en router; correrlos en el root workspace sigue bloqueado externamente por `protoc` en `lance`.
 
+Compatibilidad legacy todavía abierta y a cerrar:
+- el router todavía tiene fallback a `meta.context.thread_id` cuando falta `meta.thread_id`.
+- ese fallback existe solo para transición/migración.
+- debe removerse cuando los productores vivos ya no dependan del carrier legacy.
+- ese cierre queda explícitamente diferido a `COG-M9`.
+
 Salida:
 - todo turn nuevo relevante ya nace con `thread_id`.
 
 ### Fase COG-M3 - Nuevo contrato durable de cognition
 
-- [ ] COG-M3-T1. Definir si cognition v2 persiste por NATS subjects nuevos o por socket/admin hacia `SY.storage`.
+- [x] COG-M3-T1. Definir si cognition v2 persiste por NATS subjects nuevos o por socket/admin hacia `SY.storage`.
 - [ ] COG-M3-T2. No mezclar semánticamente `storage.events/items/reactivation` viejos con entidades nuevas sin una capa de compat explícita.
 - [ ] COG-M3-T3. Definir tablas/contratos para:
   - `cognition_threads`
@@ -317,11 +323,17 @@ Decisión recomendada:
 - persistencia por NATS subjects explícitos de cognition v2
 - no reciclar subjects viejos como carrier conceptual del modelo nuevo
 
+Estado actual de `M3`:
+- el contrato de transporte ya quedó congelado del lado core como familia NATS explícita `storage.cognition.*`.
+- el embedded broker ya trata esos subjects como storage/durable stream subjects.
+- falta todavía el contrato payload por entidad y el lado consumidor/escritor en `SY.storage` / `SY.cognition`.
+
 Subjects recomendados:
 - `storage.cognition.threads`
 - `storage.cognition.contexts`
 - `storage.cognition.reasons`
 - `storage.cognition.scopes`
+- `storage.cognition.scope_instances`
 - `storage.cognition.memories`
 - `storage.cognition.episodes`
 

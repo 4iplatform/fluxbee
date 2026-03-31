@@ -363,6 +363,10 @@ Rules:
 - `ctx`, `ctx_seq`, and `ctx_window` are not part of the v2 canonical model.
 - During migration, old producers/consumers may still read `ctx*`, but new canonical paths should not depend on them.
 
+Temporary migration note:
+- the router may still fallback from missing `meta.thread_id` to legacy `meta.context.thread_id` for continuity and `thread_seq` assignment.
+- this fallback is transitional only and must be removed once live producers stop depending on the legacy carrier.
+
 ### 5.3 Message Enrichment
 
 Router reads `jsr-memory-<hive>` SHM to attach `memory_package` to messages. The router enriches, not SY.cognition. SY.cognition writes the data; the router reads and attaches it.
@@ -726,10 +730,59 @@ Recommended transport to `SY.storage`:
   - `storage.cognition.contexts`
   - `storage.cognition.reasons`
   - `storage.cognition.scopes`
+  - `storage.cognition.scope_instances`
   - `storage.cognition.memories`
   - `storage.cognition.episodes`
 
 This keeps the domain typed, inspectable, and migration-safe.
+
+### 10.2.2 NATS Transport Envelope for Cognition v2
+
+The transport contract to `SY.storage` should be explicit and uniform across cognition entities.
+
+Recommended envelope:
+
+```json
+{
+  "schema_version": 1,
+  "entity_version": 1,
+  "entity": "context",
+  "op": "upsert",
+  "entity_id": "context:uuid",
+  "thread_id": "thread:sha256:...",
+  "hive": "motherbee",
+  "writer": "SY.cognition@motherbee",
+  "ts": "2026-03-31T12:34:56Z",
+  "data": {
+    "...": "entity payload"
+  }
+}
+```
+
+Rules:
+- subject defines the domain stream; `entity` and `entity_id` make the payload self-describing.
+- `thread_id` is required for thread-scoped entities (`threads`, `contexts`, `reasons`, `scope_instances`, `memories`, `episodes`).
+- `op` should start as a closed deterministic set for v1:
+  - `upsert`
+  - `close`
+  - `delete` only if a real deletion contract is later approved
+- `schema_version` is the transport version.
+- `entity_version` is the durable shape version for that entity.
+- `writer` identifies the emitting node instance and helps trace rebuild/drift issues.
+
+Recommended subject-to-entity mapping:
+- `storage.cognition.threads` → thread snapshots / thread-level state
+- `storage.cognition.contexts` → context entities
+- `storage.cognition.reasons` → reason entities
+- `storage.cognition.scopes` → scope definitions
+- `storage.cognition.scope_instances` → realized thread-local scope instances
+- `storage.cognition.memories` → narrative memories
+- `storage.cognition.episodes` → affective/episode records
+
+Turns remain special:
+- `storage.turns` is append-only immutable input
+- cognition entities are durable derived state
+- rebuilding cognition means replaying `storage.turns` into these typed cognition subjects / tables
 
 ### 10.3 Cold Start
 
