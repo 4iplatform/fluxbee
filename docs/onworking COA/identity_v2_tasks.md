@@ -258,6 +258,10 @@ Salida:
   - [x] actor no autorizado (`UNAUTHORIZED_REGISTRAR`)
   - [x] IDs mal formados (`INVALID_REQUEST`)
   - [x] tenant inexistente (`INVALID_TENANT`)
+  - [x] duplicado de email (`DUPLICATE_EMAIL`)
+  - [x] duplicado de ICH por unique (`DUPLICATE_ICH`)
+  - [x] colisión de `node_name` cubierta por canonicalización/idempotencia (G4), no se espera error de duplicado en flujo normal
+  - [x] corrida final de cierre con casos de duplicado
 
 ## 10) DB config / secrets migration para `SY.identity`
 
@@ -267,7 +271,12 @@ Contexto:
   - `JSR_DATABASE_URL`
   - `hive.yaml -> database.url`
 - En la iteración actual ya quedó habilitado el control-path `CONFIG_GET` / `CONFIG_SET` y el bootstrap degradado en [`src/bin/sy_identity.rs`](/Users/cagostino/Documents/GitHub/fluxbee/src/bin/sy_identity.rs).
-- Sigue pendiente cerrar contrato/documentación/help y la migración operativa completa fuera de `hive.yaml`.
+- También quedaron implementados:
+  - persistencia local en `secrets.json`
+  - snapshot `config.json` redacted
+  - contrato v1 con `config.database.postgres_url`
+  - semántica `persist_only` + restart
+- Sigue pendiente la validación operativa final sacando `database.url` de `hive.yaml`.
 - Objetivo: llevar `SY.identity` al mismo camino canónico:
   - `archi -> SY.admin -> SY.identity CONFIG_GET/CONFIG_SET -> local secrets.json -> restart`
 
@@ -283,7 +292,7 @@ Decisión base para esta fase:
   - bootstrap esperado: modo degradado/control-plane-only si falta secreto DB válido.
   - no debe quedar colgado por timeout en `SY.admin`.
 
-- [ ] ID-DB-1. Definir contrato canónico `CONFIG_GET` / `CONFIG_SET` para la DB de `SY.identity`.
+- [x] ID-DB-1. Definir contrato canónico `CONFIG_GET` / `CONFIG_SET` para la DB de `SY.identity`.
   - v1 pragmática:
     - secreto canónico: `config.database.postgres_url`
   - precedencia deseada:
@@ -298,7 +307,7 @@ Decisión base para esta fase:
     - persistir en `secrets.json`
     - devolver `apply.state = "persist_only"` si requiere restart
 
-- [ ] ID-DB-2. Persistencia local de secreto DB en `secrets.json`.
+- [x] ID-DB-2. Persistencia local de secreto DB en `secrets.json`.
   - path canónico por nodo:
     - `/var/lib/fluxbee/nodes/SY/SY.identity@<hive>/secrets.json`
   - permisos:
@@ -306,12 +315,12 @@ Decisión base para esta fase:
     - archivo `0600`
   - nunca devolver el valor secreto en claro en `CONFIG_GET`, logs o status.
 
-- [ ] ID-DB-3. Snapshot operativo/redacted para `get_node_config`.
+- [x] ID-DB-3. Snapshot operativo/redacted para `get_node_config`.
   - persistir `config.json` público/redacted de `SY.identity`
   - `GET /hives/{hive}/nodes/SY.identity@{hive}/config` debe funcionar sin exponer el secreto
   - `get_node_config` y `control/config-get` deben quedar claramente diferenciados, igual que en otros nodos
 
-- [ ] ID-DB-4. Bootstrap degradado de `SY.identity` sin DB lista.
+- [x] ID-DB-4. Bootstrap degradado de `SY.identity` sin DB lista.
   - si no existe secreto DB válido:
     - el nodo arranca
     - conecta al router
@@ -319,13 +328,13 @@ Decisión base para esta fase:
     - pero no intenta operar writes identity en DB
   - el estado debe ser explícito (`missing_secret` / `db_not_ready`)
 
-- [ ] ID-DB-5. Restart/apply semantics.
+- [x] ID-DB-5. Restart/apply semantics.
   - v1 permitida:
     - `CONFIG_SET` persiste secreto
     - restart requerido para usar la nueva conexión DB
   - dejar explícito en `CONFIG_RESPONSE` y help
 
-- [ ] ID-DB-6. Help/admin/archi.
+- [x] ID-DB-6. Help/admin/archi.
   - agregar ejemplos canónicos en `SY.admin` para:
     - `POST /hives/{hive}/nodes/SY.identity@{hive}/control/config-get`
     - `POST /hives/{hive}/nodes/SY.identity@{hive}/control/config-set`
@@ -351,10 +360,6 @@ Notas:
   - `config.database.port`
   - `config.database.password` como secreto
   pero no es prerequisito para cerrar esta migración.
-  - [x] duplicado de email (`DUPLICATE_EMAIL`)
-  - [x] duplicado de ICH por unique (`DUPLICATE_ICH`)
-  - [x] colisión de `node_name` cubierta por canonicalización/idempotencia (G4), no se espera error de duplicado en flujo normal
-  - [x] corrida final de cierre con casos de duplicado
 
 Salida:
 - gate de aceptación identity v2 completo.
