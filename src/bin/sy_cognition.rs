@@ -284,7 +284,7 @@ async fn handle_turn_payload(
         .clone()
         .or_else(|| legacy_context_thread_id(&msg));
     state.last_thread_seq = msg.meta.thread_seq;
-    state.last_src_ilk = Some(msg.meta.src_ilk.clone());
+    state.last_src_ilk = msg.meta.src_ilk.clone();
     state.last_ich = msg.meta.ich.clone();
     Ok(())
 }
