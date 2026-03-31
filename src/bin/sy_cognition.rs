@@ -15,7 +15,10 @@ use uuid::Uuid;
 
 use fluxbee_sdk::nats::{publish_local, resolve_local_nats_endpoint};
 use fluxbee_sdk::payload::TextV1Payload;
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::protocol::{
+    Destination, EpisodeSummary, MemoryContextSummary, MemoryPackage, MemoryPackageTruncated,
+    MemoryReasonSummary, MemorySummary, Message, Meta, Routing, SYSTEM_KIND,
+};
 use fluxbee_sdk::{
     build_node_config_response_message, build_node_secret_record, connect, load_node_secret_record,
     managed_node_config_path, managed_node_instance_dir, managed_node_name,
@@ -34,6 +37,9 @@ use fluxbee_sdk::{
     SUBJECT_STORAGE_COGNITION_THREADS,
 };
 use json_router::nats::{NatsSubscriber as RouterNatsSubscriber, SUBJECT_STORAGE_TURNS};
+use json_router::shm::{
+    memory_shm_name_for_hive, MemoryRegionWriter, MemoryShmSnapshot, MemoryShmThreadEntry,
+};
 
 type CognitionError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -162,6 +168,7 @@ struct CognitionAppState {
     runtime_state: Arc<Mutex<CognitionRuntimeState>>,
     nats_subscribe_errors: Arc<AtomicU64>,
     thread_states: Arc<Mutex<HashMap<String, ThreadCognitionState>>>,
+    memory_region: Arc<Mutex<Option<MemoryRegionWriter>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -369,6 +376,7 @@ async fn main() -> Result<(), CognitionError> {
         runtime_state: Arc::clone(&runtime_state),
         nats_subscribe_errors: Arc::clone(&nats_subscribe_errors),
         thread_states: Arc::new(Mutex::new(HashMap::new())),
+        memory_region: Arc::new(Mutex::new(None)),
     });
 
     let node_config = NodeConfig {
@@ -382,6 +390,18 @@ async fn main() -> Result<(), CognitionError> {
     let (mut sender, mut receiver) =
         connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     tracing::info!(node_name = %sender.full_name(), "sy.cognition connected to router");
+
+    if let Ok(owner_uuid) = Uuid::parse_str(sender.uuid()) {
+        let shm_name = memory_shm_name_for_hive(&hive.hive_id)?;
+        match MemoryRegionWriter::open_or_create(&shm_name, owner_uuid, &hive.hive_id) {
+            Ok(writer) => {
+                *app_state.memory_region.lock().await = Some(writer);
+            }
+            Err(err) => {
+                tracing::warn!(shm = %shm_name, error = %err, "failed to initialize jsr-memory writer");
+            }
+        }
+    }
 
     std::mem::drop(tokio::spawn(run_turns_loop(
         endpoint.clone(),
@@ -405,6 +425,9 @@ async fn main() -> Result<(), CognitionError> {
         tokio::select! {
             _ = heartbeat.tick() => {
                 let snapshot = control_state.lock().await.clone();
+                if let Some(memory_region) = app_state.memory_region.lock().await.as_mut() {
+                    memory_region.update_heartbeat();
+                }
                 tracing::debug!(
                     node_name = %sender.full_name(),
                     config_version = snapshot.config_version,
@@ -558,6 +581,15 @@ async fn handle_turn_payload(
         }
     }
 
+    if let Err(err) = sync_memory_shm(&app_state).await {
+        tracing::warn!(
+            error = %err,
+            trace_id = %msg.routing.trace_id,
+            thread_id = %thread_id,
+            "sy.cognition failed to sync jsr-memory"
+        );
+    }
+
     let (
         active_threads_total,
         open_contexts_total,
@@ -642,6 +674,136 @@ async fn handle_turn_payload(
     state.active_memories_total = active_memories_total;
     state.active_episodes_total = active_episodes_total;
     Ok(())
+}
+
+async fn sync_memory_shm(app_state: &CognitionAppState) -> Result<(), json_router::shm::ShmError> {
+    let snapshot = {
+        let threads = app_state.thread_states.lock().await;
+        let mut entries = Vec::with_capacity(threads.len());
+        for (thread_id, thread_state) in threads.iter() {
+            entries.push(MemoryShmThreadEntry {
+                thread_id: thread_id.clone(),
+                package: build_memory_package_for_thread(thread_id, thread_state),
+            });
+        }
+        MemoryShmSnapshot {
+            schema_version: 1,
+            updated_at: json_router::shm::now_epoch_ms(),
+            threads: entries,
+        }
+    };
+
+    let mut memory_region = app_state.memory_region.lock().await;
+    if let Some(region) = memory_region.as_mut() {
+        region.write_snapshot(&snapshot)?;
+    }
+    Ok(())
+}
+
+fn build_memory_package_for_thread(
+    thread_id: &str,
+    thread_state: &ThreadCognitionState,
+) -> MemoryPackage {
+    const MAX_CONTEXTS: usize = 6;
+    const MAX_REASONS: usize = 6;
+    const MAX_MEMORIES: usize = 6;
+    const MAX_EPISODES: usize = 4;
+
+    let mut contexts: Vec<&ContextState> = thread_state
+        .contexts
+        .values()
+        .filter(|context| context.status == "open")
+        .collect();
+    contexts.sort_by(|left, right| right.weight.total_cmp(&left.weight));
+
+    let mut reasons: Vec<&ReasonState> = thread_state
+        .reasons
+        .values()
+        .filter(|reason| reason.status == "open")
+        .collect();
+    reasons.sort_by(|left, right| right.weight.total_cmp(&left.weight));
+
+    let mut memories: Vec<&MemoryState> = thread_state.memories.values().collect();
+    memories.sort_by(|left, right| right.weight.total_cmp(&left.weight));
+
+    let mut episodes: Vec<&EpisodeState> = thread_state.episodes.values().collect();
+    episodes.sort_by(|left, right| right.intensity.total_cmp(&left.intensity));
+
+    let dominant_context = contexts.first().map(|context| MemoryContextSummary {
+        context_id: context.context_id.clone(),
+        label: context.label.clone(),
+        weight: context.weight,
+    });
+    let dominant_reason = reasons.first().map(|reason| MemoryReasonSummary {
+        reason_id: reason.reason_id.clone(),
+        label: reason.label.clone(),
+        weight: reason.weight,
+    });
+
+    let dropped_contexts = contexts.len().saturating_sub(MAX_CONTEXTS) as u32;
+    let dropped_reasons = reasons.len().saturating_sub(MAX_REASONS) as u32;
+    let dropped_memories = memories.len().saturating_sub(MAX_MEMORIES) as u32;
+    let dropped_episodes = episodes.len().saturating_sub(MAX_EPISODES) as u32;
+
+    MemoryPackage {
+        package_version: 2,
+        thread_id: thread_id.to_string(),
+        dominant_context,
+        dominant_reason,
+        contexts: contexts
+            .into_iter()
+            .take(MAX_CONTEXTS)
+            .map(|context| MemoryContextSummary {
+                context_id: context.context_id.clone(),
+                label: context.label.clone(),
+                weight: context.weight,
+            })
+            .collect(),
+        reasons: reasons
+            .into_iter()
+            .take(MAX_REASONS)
+            .map(|reason| MemoryReasonSummary {
+                reason_id: reason.reason_id.clone(),
+                label: reason.label.clone(),
+                weight: reason.weight,
+            })
+            .collect(),
+        memories: memories
+            .into_iter()
+            .take(MAX_MEMORIES)
+            .map(|memory| MemorySummary {
+                memory_id: memory.memory_id.clone(),
+                summary: memory.summary.clone(),
+                weight: memory.weight,
+                dominant_context_id: Some(memory.dominant_context_id.clone()),
+                dominant_reason_id: Some(memory.dominant_reason_id.clone()),
+            })
+            .collect(),
+        episodes: episodes
+            .into_iter()
+            .take(MAX_EPISODES)
+            .map(|episode| EpisodeSummary {
+                episode_id: episode.episode_id.clone(),
+                title: episode.title.clone(),
+                intensity: episode.intensity.round().clamp(0.0, u8::MAX as f64) as u8,
+            })
+            .collect(),
+        truncated: if dropped_contexts == 0
+            && dropped_reasons == 0
+            && dropped_memories == 0
+            && dropped_episodes == 0
+        {
+            None
+        } else {
+            Some(MemoryPackageTruncated {
+                applied: true,
+                dropped_contexts,
+                dropped_reasons,
+                dropped_memories,
+                dropped_episodes,
+            })
+        },
+    }
 }
 
 async fn process_router_message(

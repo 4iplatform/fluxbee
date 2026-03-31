@@ -481,13 +481,23 @@ Estado actual:
 
 ### Fase COG-M8 - SHM nueva + enrichment del router
 
-- [ ] COG-M8-T1. Diseñar layout físico de `jsr-memory-<hive>`.
-- [ ] COG-M8-T2. Implementar writer seqlock en `SY.cognition`.
-- [ ] COG-M8-T3. Implementar reader en router.
-- [ ] COG-M8-T4. Implementar fetch/build de `memory_package` v2.
-- [ ] COG-M8-T5. Aplicar límites y truncación.
-- [ ] COG-M8-T6. Garantizar que enrichment ocurre después del routing.
-- [ ] COG-M8-T7. Garantizar que OPA no lee `memory_package`.
+- [x] COG-M8-T1. Diseñar layout físico de `jsr-memory-<hive>`.
+- [x] COG-M8-T2. Implementar writer seqlock en `SY.cognition`.
+- [x] COG-M8-T3. Implementar reader en router.
+- [x] COG-M8-T4. Implementar fetch/build de `memory_package` v2.
+- [x] COG-M8-T5. Aplicar límites y truncación.
+- [x] COG-M8-T6. Garantizar que enrichment ocurre después del routing.
+- [x] COG-M8-T7. Garantizar que OPA no lee `memory_package`.
+
+Estado actual:
+- `jsr-memory-<hive>` ya existe como región SHM real con:
+  - header + seqlock
+  - blob JSON versionado
+  - snapshot por `thread_id` con `memory_package` v2 ya truncado
+- `SY.cognition` escribe el snapshot local después de procesar turns
+- el router hace lazy-open del reader y adjunta `memory_package` solo en entrega local, después de resolver routing
+- OPA no toca `memory_package` ni lee `jsr-memory`
+- si `jsr-memory` todavía no existe o falla la lectura, el router entrega igual y solo omite enrichment
 
 ### Fase COG-M9 - Alineación con AI runtime y compat controlada
 

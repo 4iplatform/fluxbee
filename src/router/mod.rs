@@ -19,12 +19,12 @@ use crate::nats::{
 };
 use crate::opa::OpaResolver;
 use crate::shm::{
-    copy_bytes_with_len, now_epoch_ms, ConfigRegionReader, ConfigSnapshot, IdentityRegionReader,
-    LsaRegionReader, LsaRegionWriter, LsaSnapshot, OpaRegionReader, OpaSnapshot, RemoteHiveEntry,
-    RemoteNodeEntry, RemoteRouteEntry, RemoteVpnEntry, RouterRegionReader, RouterRegionWriter,
-    VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE,
-    HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR,
-    OPA_STATUS_LOADING,
+    copy_bytes_with_len, memory_shm_name_for_hive, now_epoch_ms, ConfigRegionReader,
+    ConfigSnapshot, IdentityRegionReader, LsaRegionReader, LsaRegionWriter, LsaSnapshot,
+    MemoryRegionReader, OpaRegionReader, OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry,
+    RemoteRouteEntry, RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, VpnAssignment,
+    ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
+    HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
 };
 use fluxbee_sdk::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
@@ -67,6 +67,7 @@ pub struct Router {
     config_version: Arc<Mutex<u64>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
+    memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_state: Arc<Mutex<std::collections::HashMap<String, RemoteHiveState>>>,
@@ -115,6 +116,10 @@ impl Router {
             None
         };
         let opa = Arc::new(Mutex::new(OpaResolver::new()));
+        let memory_reader = match memory_shm_name_for_hive(&cfg.hive_id) {
+            Ok(name) => MemoryRegionReader::open_read_only(&name).ok(),
+            Err(_) => None,
+        };
         let nats_publisher = Some(Arc::new(NatsPublisher::new(
             cfg.nats_url.clone(),
             SUBJECT_STORAGE_TURNS.to_string(),
@@ -136,6 +141,7 @@ impl Router {
             config_version: Arc::new(Mutex::new(0)),
             opa,
             opa_reader: Arc::new(Mutex::new(None)),
+            memory_reader: Arc::new(Mutex::new(memory_reader)),
             broadcast_cache: Arc::new(Mutex::new(BroadcastCache::new())),
             wan_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lsa_state: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -216,6 +222,7 @@ impl Router {
         let is_gateway = self.cfg.is_gateway;
         let peer_socket_dir = self.cfg.node_socket_dir.clone();
         let thread_sequences_pd = Arc::clone(&self.thread_sequences);
+        let memory_reader_pd = Arc::clone(&self.memory_reader);
         tokio::spawn(async move {
             peer_discovery_loop(
                 router_uuid,
@@ -237,6 +244,7 @@ impl Router {
                 shm_pd,
                 opa_pd,
                 opa_reader_pd,
+                memory_reader_pd,
                 lsa_snapshot_pd,
                 fib_pd,
                 thread_sequences_pd,
@@ -306,6 +314,7 @@ impl Router {
                 let shm = Arc::clone(&shm);
                 let opa = Arc::clone(&opa);
                 let opa_reader = Arc::clone(&opa_reader);
+                let memory_reader = Arc::clone(&memory_reader);
                 let hive_id = hive_id.clone();
                 let identity_frontdesk_node_name = identity_frontdesk_node_name.clone();
                 let wan_peers = Arc::clone(&wan_peers);
@@ -330,6 +339,7 @@ impl Router {
                         shm,
                         opa,
                         opa_reader,
+                        memory_reader,
                         hive_id,
                         identity_frontdesk_node_name,
                         wan_peers,
@@ -368,6 +378,7 @@ impl Router {
                 broadcast_cache: Arc::clone(&self.broadcast_cache),
                 lsa_seq: Arc::clone(&self.lsa_seq),
                 thread_sequences: Arc::clone(&self.thread_sequences),
+                memory_reader: Arc::clone(&self.memory_reader),
                 opa: Arc::clone(&self.opa),
                 wan_session_epochs: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 lsa_reject_counters: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -773,6 +784,7 @@ async fn handle_node(
                         &wan_peers,
                         &opa,
                         &broadcast_cache,
+                        &memory_reader,
                         &thread_sequences,
                         &hive_id,
                         identity_frontdesk_node_name,
@@ -828,6 +840,7 @@ async fn handle_message(
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     opa: &Arc<Mutex<OpaResolver>>,
     broadcast_cache: &Arc<Mutex<BroadcastCache>>,
+    memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
     thread_sequences: &Arc<Mutex<HashMap<String, u64>>>,
     hive_id: &str,
     identity_frontdesk_node_name: &str,
@@ -1149,7 +1162,7 @@ async fn handle_message(
     }
 
     if !senders.is_empty() {
-        let data = serde_json::to_vec(&msg)?;
+        let data = serialize_for_local_delivery(memory_reader, hive_id, &msg).await?;
         for sender in senders {
             let _ = sender.send(data.clone());
         }
@@ -2478,7 +2491,7 @@ async fn handle_wan_message(
     }
 
     if !senders.is_empty() {
-        let data = serde_json::to_vec(&msg)?;
+        let data = serialize_for_local_delivery(&ctx.memory_reader, &ctx.hive_id, &msg).await?;
         for sender in senders {
             let _ = sender.send(data.clone());
         }
@@ -2511,6 +2524,7 @@ async fn peer_discovery_loop(
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
+    memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
     thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
@@ -2566,6 +2580,7 @@ async fn peer_discovery_loop(
                     let shm = Arc::clone(&shm);
                     let opa = Arc::clone(&opa);
                     let opa_reader = Arc::clone(&opa_reader);
+                    let memory_reader = Arc::clone(&memory_reader);
                     let hive_id = hive_id.to_string();
                     let self_router_name = self_router_name.to_string();
                     let self_shm_name = self_shm_name.to_string();
@@ -2595,6 +2610,7 @@ async fn peer_discovery_loop(
                             shm,
                             opa,
                             opa_reader,
+                            memory_reader,
                             &hive_id,
                             &identity_frontdesk_node_name,
                             lsa_snapshot,
@@ -2696,6 +2712,7 @@ async fn connect_to_peer(
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
+    memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: &str,
     identity_frontdesk_node_name: &str,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
@@ -2755,6 +2772,7 @@ async fn connect_to_peer(
                         &shm,
                         &opa,
                         &opa_reader,
+                        &memory_reader,
                         hive_id,
                         identity_frontdesk_node_name,
                         &fib,
@@ -2793,6 +2811,7 @@ async fn handle_peer_incoming(
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
+    memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: String,
     identity_frontdesk_node_name: String,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
@@ -2850,6 +2869,7 @@ async fn handle_peer_incoming(
                         &shm,
                         &opa,
                         &opa_reader,
+                        &memory_reader,
                         &hive_id,
                         &identity_frontdesk_node_name,
                         &fib,
@@ -2888,6 +2908,7 @@ async fn handle_peer_message(
     shm: &Arc<Mutex<RouterRegionWriter>>,
     opa: &Arc<Mutex<OpaResolver>>,
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
+    memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: &str,
     identity_frontdesk_node_name: &str,
     fib: &Arc<Mutex<Vec<FibEntry>>>,
@@ -3236,7 +3257,7 @@ async fn handle_peer_message(
     }
 
     if !senders.is_empty() {
-        let data = serde_json::to_vec(&msg)?;
+        let data = serialize_for_local_delivery(memory_reader, hive_id, &msg).await?;
         for sender in senders {
             let _ = sender.send(data.clone());
         }
@@ -3392,6 +3413,7 @@ struct WanContext {
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
     thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
+    memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     opa: Arc<Mutex<OpaResolver>>,
     wan_session_epochs: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     lsa_reject_counters: Arc<Mutex<std::collections::HashMap<String, u64>>>,
@@ -4788,6 +4810,66 @@ fn should_publish_turn(msg: &Message) -> bool {
         return false;
     }
     true
+}
+
+fn should_enrich_with_memory_package(msg: &Message) -> bool {
+    if msg.meta.msg_type == SYSTEM_KIND {
+        return false;
+    }
+    if msg.meta.msg_type == "admin" || msg.meta.msg_type == "query_response" {
+        return false;
+    }
+    true
+}
+
+async fn serialize_for_local_delivery(
+    memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
+    hive_id: &str,
+    msg: &Message,
+) -> Result<Vec<u8>, RouterError> {
+    let mut enriched = msg.clone();
+    maybe_attach_memory_package(memory_reader, hive_id, &mut enriched).await;
+    Ok(serde_json::to_vec(&enriched)?)
+}
+
+async fn maybe_attach_memory_package(
+    memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
+    hive_id: &str,
+    msg: &mut Message,
+) {
+    if !should_enrich_with_memory_package(msg) || msg.meta.memory_package.is_some() {
+        return;
+    }
+    let Some(thread_id) = canonical_thread_id_from_meta(&msg.meta) else {
+        return;
+    };
+    let shm_name = match memory_shm_name_for_hive(hive_id) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let snapshot = {
+        let mut guard = memory_reader.lock().await;
+        if guard.is_none() {
+            *guard = MemoryRegionReader::open_read_only(&shm_name).ok();
+        }
+        match guard
+            .as_ref()
+            .and_then(|reader| reader.read_snapshot().ok())
+        {
+            Some(snapshot) => snapshot,
+            None => return,
+        }
+    };
+    if let Some(entry) = snapshot
+        .threads
+        .iter()
+        .find(|entry| entry.thread_id == thread_id)
+    {
+        msg.meta.memory_package = Some(entry.package.clone());
+        if msg.meta.thread_id.is_none() {
+            msg.meta.thread_id = Some(thread_id);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -4,11 +4,13 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{self, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use fluxbee_sdk::protocol::MemoryPackage;
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use nix::fcntl::OFlag;
 use nix::sys::mman::{shm_open, shm_unlink};
 use nix::sys::stat::fstat;
 use nix::unistd::ftruncate;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const SHM_MAGIC: u32 = 0x4A535352; // "JSSR"
@@ -26,6 +28,9 @@ pub const OPA_MAX_WASM_SIZE: usize = 4 * 1024 * 1024;
 
 pub const IDENTITY_MAGIC: u32 = 0x4A534944; // "JSID"
 pub const IDENTITY_VERSION: u32 = 2;
+pub const MEMORY_MAGIC: u32 = 0x4A534D4D; // "JSMM"
+pub const MEMORY_VERSION: u32 = 1;
+pub const MEMORY_MAX_DATA_SIZE: usize = 4 * 1024 * 1024;
 
 pub const OPA_STATUS_OK: u8 = 0;
 pub const OPA_STATUS_ERROR: u8 = 1;
@@ -76,6 +81,8 @@ pub enum ShmError {
     Io(#[from] std::io::Error),
     #[error("nix error: {0}")]
     Nix(#[from] nix::Error),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("invalid header")]
     InvalidHeader,
     #[error("seqlock read timeout")]
@@ -283,6 +290,42 @@ pub struct IdentityHeader {
     pub hive_id_len: u16,
 
     pub _reserved: [u8; 6],
+}
+
+#[repr(C)]
+pub struct MemoryHeader {
+    pub magic: u32,
+    pub version: u32,
+    pub seq: AtomicU64,
+
+    pub data_size: u32,
+    pub thread_count: u32,
+
+    pub updated_at: u64,
+    pub heartbeat: u64,
+
+    pub owner_uuid: [u8; 16],
+    pub owner_pid: u32,
+    pub _pad0: u32,
+
+    pub hive_id: [u8; 64],
+    pub hive_id_len: u16,
+
+    pub _reserved: [u8; 30],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MemoryShmSnapshot {
+    pub schema_version: u32,
+    pub updated_at: u64,
+    #[serde(default)]
+    pub threads: Vec<MemoryShmThreadEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryShmThreadEntry {
+    pub thread_id: String,
+    pub package: MemoryPackage,
 }
 
 #[repr(C)]
@@ -651,6 +694,18 @@ pub struct IdentityRegionReader {
     layout: IdentityRegionLayout,
 }
 
+pub struct MemoryRegionWriter {
+    name: String,
+    mmap: MmapMut,
+    layout: RegionLayout,
+}
+
+pub struct MemoryRegionReader {
+    name: String,
+    mmap: Mmap,
+    layout: RegionLayout,
+}
+
 trait SeqHeader {
     fn seq(&mut self) -> &mut AtomicU64;
 }
@@ -674,6 +729,12 @@ impl SeqHeader for LsaHeader {
 }
 
 impl SeqHeader for IdentityHeader {
+    fn seq(&mut self) -> &mut AtomicU64 {
+        &mut self.seq
+    }
+}
+
+impl SeqHeader for MemoryHeader {
     fn seq(&mut self) -> &mut AtomicU64 {
         &mut self.seq
     }
@@ -1796,6 +1857,86 @@ impl IdentityRegionReader {
     }
 }
 
+impl MemoryRegionWriter {
+    pub fn open_or_create(name: &str, owner_uuid: Uuid, hive_id: &str) -> Result<Self, ShmError> {
+        validate_name(name)?;
+        let layout = layout_memory();
+        let mut mmap = open_or_create_region(name, layout.total_len, |mmap| {
+            initialize_memory_header(mmap, owner_uuid, hive_id);
+        })?;
+        normalize_seq_header::<MemoryHeader>(&mut mmap, layout.header_offset, "memory shm")?;
+        Ok(Self {
+            name: name.to_string(),
+            mmap,
+            layout,
+        })
+    }
+
+    pub fn read_snapshot(&self) -> Result<MemoryShmSnapshot, ShmError> {
+        let header = self.header_ref().ok_or(ShmError::InvalidHeader)?;
+        read_memory_snapshot(header, self.mmap.as_ref(), &self.layout)
+    }
+
+    pub fn update_heartbeat(&mut self) {
+        if let Some(header) = self.header_mut() {
+            let _write_guard = SeqlockWriteGuard::new(&header.seq);
+            header.heartbeat = now_epoch_ms();
+        }
+    }
+
+    pub fn write_snapshot(&mut self, snapshot: &MemoryShmSnapshot) -> Result<(), ShmError> {
+        let payload = serde_json::to_vec(snapshot)?;
+        if payload.len() > MEMORY_MAX_DATA_SIZE {
+            return Err(ShmError::ValueTooLong {
+                len: payload.len(),
+                max: MEMORY_MAX_DATA_SIZE,
+            });
+        }
+        let data_offset = self.layout.node_offset;
+        let data_end = data_offset + MEMORY_MAX_DATA_SIZE;
+        let header = self.header_mut().ok_or(ShmError::InvalidHeader)?;
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
+        header.data_size = payload.len() as u32;
+        header.thread_count = snapshot.threads.len() as u32;
+        header.updated_at = now_epoch_ms();
+        header.heartbeat = header.updated_at;
+        let _ = header;
+        self.mmap[data_offset..data_end].fill(0);
+        self.mmap[data_offset..data_offset + payload.len()].copy_from_slice(&payload);
+        Ok(())
+    }
+
+    fn header_ref(&self) -> Option<&MemoryHeader> {
+        header_ref::<MemoryHeader>(self.mmap.as_ref(), self.layout.header_offset)
+    }
+
+    fn header_mut(&mut self) -> Option<&mut MemoryHeader> {
+        header_mut::<MemoryHeader>(&mut self.mmap, self.layout.header_offset)
+    }
+}
+
+impl MemoryRegionReader {
+    pub fn open_read_only(name: &str) -> Result<Self, ShmError> {
+        validate_name(name)?;
+        let layout = layout_memory();
+        let mmap = open_read_only_region(name, layout.total_len)?;
+        Ok(Self {
+            name: name.to_string(),
+            mmap,
+            layout,
+        })
+    }
+
+    pub fn read_snapshot(&self) -> Result<MemoryShmSnapshot, ShmError> {
+        let header = self.header_ref().ok_or(ShmError::InvalidHeader)?;
+        read_memory_snapshot(header, self.mmap.as_ref(), &self.layout)
+    }
+
+    fn header_ref(&self) -> Option<&MemoryHeader> {
+        header_ref::<MemoryHeader>(self.mmap.as_ref(), self.layout.header_offset)
+    }
+}
+
 pub fn build_shm_name(prefix: &str, router_uuid: Uuid) -> String {
     let simple = router_uuid.simple().to_string();
     let name = format!("{}{}", prefix, simple);
@@ -1803,6 +1944,12 @@ pub fn build_shm_name(prefix: &str, router_uuid: Uuid) -> String {
         return name;
     }
     format!("{}{}", prefix, &simple[..16])
+}
+
+pub fn memory_shm_name_for_hive(hive_id: &str) -> Result<String, ShmError> {
+    let name = format!("/jsr-memory-{}", hive_id);
+    validate_name(&name)?;
+    Ok(name)
 }
 
 pub fn now_epoch_ms() -> u64 {
@@ -2003,6 +2150,40 @@ fn opa_region_len() -> usize {
     size_of::<OpaHeader>() + OPA_MAX_WASM_SIZE
 }
 
+fn layout_memory() -> RegionLayout {
+    let header_offset = 0;
+    let data_offset = align_up(size_of::<MemoryHeader>(), REGION_ALIGNMENT);
+    RegionLayout {
+        header_offset,
+        node_offset: data_offset,
+        static_offset: 0,
+        vpn_offset: 0,
+        hive_offset: 0,
+        remote_node_offset: 0,
+        remote_route_offset: 0,
+        remote_vpn_offset: 0,
+        total_len: data_offset + MEMORY_MAX_DATA_SIZE,
+    }
+}
+
+fn initialize_memory_header(mmap: &mut MmapMut, owner_uuid: Uuid, hive_id: &str) {
+    if let Some(header) = header_mut::<MemoryHeader>(mmap, 0) {
+        header.magic = MEMORY_MAGIC;
+        header.version = MEMORY_VERSION;
+        header.seq = AtomicU64::new(0);
+        header.data_size = 0;
+        header.thread_count = 0;
+        header.updated_at = now_epoch_ms();
+        header.heartbeat = header.updated_at;
+        header.owner_uuid = *owner_uuid.as_bytes();
+        header.owner_pid = std::process::id();
+        header._pad0 = 0;
+        header.hive_id = [0; 64];
+        header.hive_id_len = copy_bytes_with_len(&mut header.hive_id, hive_id) as u16;
+        header._reserved = [0; 30];
+    }
+}
+
 fn open_or_create_region<F>(name: &str, len: usize, init: F) -> Result<MmapMut, ShmError>
 where
     F: FnOnce(&mut MmapMut),
@@ -2086,6 +2267,44 @@ fn open_read_only_opa_region(name: &str) -> Result<Mmap, ShmError> {
     Ok(mmap)
 }
 
+fn read_memory_snapshot(
+    header: &MemoryHeader,
+    mmap: &[u8],
+    layout: &RegionLayout,
+) -> Result<MemoryShmSnapshot, ShmError> {
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > Duration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            return Err(ShmError::SeqLockTimeout);
+        }
+        let s1 = header.seq.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        atomic::fence(Ordering::Acquire);
+        let data_size = header.data_size as usize;
+        if data_size > MEMORY_MAX_DATA_SIZE {
+            return Err(ShmError::InvalidHeader);
+        }
+        let data_offset = layout.node_offset;
+        let payload = mmap
+            .get(data_offset..data_offset + data_size)
+            .ok_or(ShmError::InvalidHeader)?;
+        let snapshot = if payload.is_empty() {
+            MemoryShmSnapshot::default()
+        } else {
+            serde_json::from_slice::<MemoryShmSnapshot>(payload)
+                .map_err(|_| ShmError::InvalidHeader)?
+        };
+        atomic::fence(Ordering::Acquire);
+        let s2 = header.seq.load(Ordering::Acquire);
+        if s1 == s2 {
+            return Ok(snapshot);
+        }
+    }
+}
+
 fn is_region_valid(mmap: &[u8]) -> bool {
     let Some(magic_bytes) = mmap.get(0..4) else {
         return false;
@@ -2103,6 +2322,8 @@ fn is_region_valid(mmap: &[u8]) -> bool {
         LSA_MAGIC => {
             header_ref::<LsaHeader>(mmap, 0).is_some_and(|header| header.version == LSA_VERSION)
         }
+        MEMORY_MAGIC => header_ref::<MemoryHeader>(mmap, 0)
+            .is_some_and(|header| header.version == MEMORY_VERSION),
         IDENTITY_MAGIC => header_ref::<IdentityHeader>(mmap, 0)
             .is_some_and(|header| header.version == IDENTITY_VERSION),
         _ => false,
@@ -3300,6 +3521,10 @@ fn empty_vocabulary_entry() -> VocabularyEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxbee_sdk::protocol::{
+        EpisodeSummary, MemoryContextSummary, MemoryPackage, MemoryPackageTruncated,
+        MemoryReasonSummary, MemorySummary,
+    };
     use nix::sys::mman::shm_unlink;
     use std::ffi::CString;
 
@@ -3307,6 +3532,97 @@ mod tests {
         if let Ok(cstr) = CString::new(name) {
             let _ = shm_unlink(cstr.as_c_str());
         }
+    }
+
+    #[test]
+    fn memory_region_roundtrip_snapshot() {
+        let id = Uuid::new_v4().simple().to_string();
+        let name = format!("/jsmem-{}", &id[..8]);
+        cleanup_shm(&name);
+
+        let mut writer =
+            MemoryRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox").expect("writer");
+        let snapshot = MemoryShmSnapshot {
+            schema_version: 1,
+            updated_at: 123,
+            threads: vec![MemoryShmThreadEntry {
+                thread_id: "thread:sha256:test".to_string(),
+                package: MemoryPackage {
+                    package_version: 2,
+                    thread_id: "thread:sha256:test".to_string(),
+                    dominant_context: Some(MemoryContextSummary {
+                        context_id: "context:test".to_string(),
+                        label: "billing".to_string(),
+                        weight: 4.2,
+                    }),
+                    dominant_reason: Some(MemoryReasonSummary {
+                        reason_id: "reason:test".to_string(),
+                        label: "resolve urgent issue".to_string(),
+                        weight: 3.8,
+                    }),
+                    contexts: vec![MemoryContextSummary {
+                        context_id: "context:test".to_string(),
+                        label: "billing".to_string(),
+                        weight: 4.2,
+                    }],
+                    reasons: vec![MemoryReasonSummary {
+                        reason_id: "reason:test".to_string(),
+                        label: "resolve urgent issue".to_string(),
+                        weight: 3.8,
+                    }],
+                    memories: vec![MemorySummary {
+                        memory_id: "memory:test".to_string(),
+                        summary: "User has an unresolved billing problem".to_string(),
+                        weight: 2.4,
+                        dominant_context_id: Some("context:test".to_string()),
+                        dominant_reason_id: Some("reason:test".to_string()),
+                    }],
+                    episodes: vec![EpisodeSummary {
+                        episode_id: "episode:test".to_string(),
+                        title: "Urgent billing dispute".to_string(),
+                        intensity: 7,
+                    }],
+                    truncated: MemoryPackageTruncated {
+                        applied: false,
+                        dropped_contexts: 0,
+                        dropped_reasons: 0,
+                        dropped_memories: 0,
+                        dropped_episodes: 0,
+                    },
+                },
+            }],
+        };
+
+        writer.write_snapshot(&snapshot).expect("write snapshot");
+
+        let reader = MemoryRegionReader::open_read_only(&name).expect("reader");
+        let roundtrip = reader.read_snapshot().expect("roundtrip snapshot");
+        assert_eq!(roundtrip.schema_version, 1);
+        assert_eq!(roundtrip.updated_at, 123);
+        assert_eq!(roundtrip.threads.len(), 1);
+        assert_eq!(roundtrip.threads[0].thread_id, "thread:sha256:test");
+        assert_eq!(roundtrip.threads[0].package.package_version, 2);
+        assert_eq!(roundtrip.threads[0].package.thread_id, "thread:sha256:test");
+        assert_eq!(
+            roundtrip.threads[0]
+                .package
+                .dominant_context
+                .as_ref()
+                .map(|value| value.label.as_str()),
+            Some("billing")
+        );
+        assert_eq!(
+            roundtrip.threads[0]
+                .package
+                .dominant_reason
+                .as_ref()
+                .map(|value| value.label.as_str()),
+            Some("resolve urgent issue")
+        );
+        assert_eq!(roundtrip.threads[0].package.memories.len(), 1);
+        assert_eq!(roundtrip.threads[0].package.episodes.len(), 1);
+
+        cleanup_shm(&name);
     }
 
     #[test]

@@ -371,6 +371,11 @@ Temporary migration note:
 
 Router reads `jsr-memory-<hive>` SHM to attach `memory_package` to messages. The router enriches, not SY.cognition. SY.cognition writes the data; the router reads and attaches it.
 
+Current implementation note:
+- `jsr-memory-<hive>` is implemented as a seqlock-protected SHM region with a versioned JSON snapshot.
+- the lookup key is `thread_id`
+- each snapshot entry already contains a truncated `memory_package` v2 for that thread
+
 **Important:** Enrichment happens AFTER the routing decision. OPA decides where the message goes based on identity data only. Then, before delivery to the destination node, the router attaches the memory_package so the AI node has cognitive context. The memory_package does not influence routing.
 
 In v2, router enrichment should be resolved primarily by `thread_id` (and optionally narrowed by message identity metadata), not by semantic tags of the current message. This keeps the enrichment path viable even when cognitive tagging is asynchronous.
@@ -1074,14 +1079,14 @@ Both coexist. Neither replaces the other.
 ### Phase 6 — Storage and SHM
 
 - [ ] COG-T21. Implement LanceDB schema for threads, contexts, reasons, memories, episodes.
-- [ ] COG-T22. Implement jsr-memory SHM writer (seqlock, tag + signal index).
+- [x] COG-T22. Implement jsr-memory SHM writer (seqlock, versioned snapshot by `thread_id`).
 - [ ] COG-T23. Implement cold start (rebuild from PostgreSQL via SY.storage).
 
 ### Phase 7 — Router Enrichment
 
-- [ ] COG-T24. Router reads jsr-memory and builds memory_package (includes reasons).
-- [ ] COG-T25. Router attaches memory_package to messages before delivery.
-- [ ] COG-T26. Respect memory_package limits.
+- [x] COG-T24. Router reads jsr-memory and builds memory_package (includes reasons).
+- [x] COG-T25. Router attaches memory_package to messages before delivery.
+- [x] COG-T26. Respect memory_package limits.
 
 ### Phase 8 — E2E Validation
 

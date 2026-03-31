@@ -17,7 +17,7 @@ El sistema usa seis tipos de regiones de memoria compartida:
 ├── jsr-lsa-<hive>         # Una por isla
 ├── jsr-opa-<hive>         # Una por isla (WASM de policies)
 ├── jsr-identity-<hive>    # Una por isla (tenants, ILKs, ICHs, aliases, vocabulary)
-└── jsr-memory-<hive>      # Una por isla (índice de activación cognitiva)
+└── jsr-memory-<hive>      # Una por isla (snapshot cognitivo por thread)
 ```
 
 | Región | Writer | Contenido |
@@ -27,7 +27,7 @@ El sistema usa seis tipos de regiones de memoria compartida:
 | `jsr-lsa-<hive>` | Gateway | Topología de islas remotas |
 | `jsr-opa-<hive>` | SY.opa.rules | WASM compilado de policy OPA |
 | `jsr-identity-<hive>` | SY.identity | tenants, ILKs, ICHs, aliases temporales, vocabulary, mapping hash ICH->ILK |
-| `jsr-memory-<hive>` | SY.cognition | Índice de activación: tags → event_ids |
+| `jsr-memory-<hive>` | SY.cognition | Snapshot thread → `memory_package` v2 |
 
 **Principio clave:** Cada región tiene **un único writer** y múltiples readers. Esto permite usar `seqlock` (writer único + lecturas lock-free).
 
