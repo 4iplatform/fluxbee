@@ -9,8 +9,12 @@ Desplegar y actualizar nodos IA por el camino canónico de Fluxbee:
 3. `SPAWN_NODE` o restart controlado
 
 Incluye dos perfiles:
-- nodo IA común (`mode=default`)
-- frontdesk gov (`mode=gov`)
+- nodo IA común (`AI.common`)
+- frontdesk gov (`AI.frontdesk.gov`)
+
+Importante (estado de transición):
+- `--mode` se mantiene solo por compatibilidad en scripts de deploy.
+- Dirección objetivo y vigente: separar comportamiento por runtime (`AI.common` vs `AI.frontdesk.gov`).
 
 ---
 
@@ -19,8 +23,18 @@ Incluye dos perfiles:
 - `scripts/publish-ia-runtime.sh`
 - `scripts/deploy-ia-node.sh`
 
-`publish-ia-runtime.sh` ahora soporta:
-- `--mode default|gov` para fijar `AI_NODE_MODE` por defecto en `start.sh` del runtime publicado.
+`publish-ia-runtime.sh`:
+- selecciona el perfil de runtime por `--runtime`.
+- `--mode` queda deprecado/ignorado.
+
+`deploy-ia-node.sh` ahora soporta:
+- `--update-scope <targeted|global>` (default: `targeted`).
+- En `targeted`, `SYSTEM_UPDATE category=runtime` se envía con `runtime + runtime_version` para no bloquear deploy puntual por drift global de runtimes ajenos.
+- Spawn sin `--config-json` (genera config base `{}` y usa `tenant_id` como fallback si se pasa por flag).
+
+Decisión de ownership:
+- El prompt/flujo de `AI.frontdesk.gov` pertenece al runtime frontdesk.
+- `AI.common` no debe transportar lógica específica gov/frontdesk.
 
 ---
 
@@ -41,7 +55,7 @@ HIVE_ID="motherbee"
 
 ## 4) Deploy inicial de runtime IA
 
-### 4.1 Nodo IA común (`mode=default`)
+### 4.1 Nodo IA común
 
 ```bash
 bash scripts/deploy-ia-node.sh \
@@ -49,12 +63,11 @@ bash scripts/deploy-ia-node.sh \
   --hive-id "$HIVE_ID" \
   --runtime "AI.common" \
   --version "0.1.0" \
-  --mode default \
   --sync-hint \
   --sudo
 ```
 
-### 4.2 Frontdesk gov (`mode=gov`)
+### 4.2 Frontdesk gov
 
 ```bash
 bash scripts/deploy-ia-node.sh \
@@ -62,14 +75,13 @@ bash scripts/deploy-ia-node.sh \
   --hive-id "$HIVE_ID" \
   --runtime "AI.frontdesk.gov" \
   --version "0.1.0" \
-  --mode gov \
   --sync-hint \
   --sudo
 ```
 
 ---
 
-## 5) Spawn de nodo (con config)
+## 5) Spawn de nodo (config opcional)
 
 Ejemplo frontdesk:
 
@@ -79,15 +91,14 @@ bash scripts/deploy-ia-node.sh \
   --hive-id "$HIVE_ID" \
   --runtime "AI.frontdesk.gov" \
   --version "0.1.0" \
-  --mode gov \
   --node-name "AI.frontdesk.gov@$HIVE_ID" \
-  --config-json /tmp/ai_frontdesk_config.json \
   --spawn \
   --sync-hint \
   --sudo
 ```
 
-El JSON se envía como `config` en `POST /hives/{id}/nodes`.
+Si no enviás `--config-json`, el script hace spawn con `config={}` (más `tenant_id` si fue enviado).
+El detalle funcional (prompt/key/model/etc.) se recomienda cargarlo por `POST .../control/config-set`.
 
 ### 5.1 Bootstrap canonico por FLUXBEE_NODE_NAME (dos nodos)
 
@@ -100,7 +111,6 @@ bash scripts/deploy-ia-node.sh \
   --hive-id "$HIVE_ID" \
   --runtime "AI.frontdesk.gov" \
   --version "0.1.0" \
-  --mode gov \
   --sync-hint \
   --sudo
 
@@ -110,7 +120,6 @@ bash scripts/deploy-ia-node.sh \
   --hive-id "$HIVE_ID" \
   --runtime "AI.common" \
   --version "0.1.0" \
-  --mode default \
   --sync-hint \
   --sudo
 ```
@@ -127,7 +136,6 @@ bash scripts/deploy-ia-node.sh \
   --hive-id "$HIVE_ID" \
   --runtime "AI.frontdesk.gov" \
   --version "0.1.1" \
-  --mode gov \
   --node-name "AI.frontdesk.gov@$HIVE_ID" \
   --update-existing \
   --sync-hint \
@@ -136,9 +144,27 @@ bash scripts/deploy-ia-node.sh \
 
 `--update-existing` hace:
 - publish runtime nuevo
-- update con retries en `sync_pending`
+- update con retries (`targeted` por defecto)
 - `GET config` del nodo actual
 - `DELETE` + `POST` reutilizando esa config
+
+### 6.1 Scope recomendado de update
+
+- Recomendado (default): `--update-scope targeted`
+- Solo para diagnóstico de salud general: `--update-scope global`
+
+Ejemplo forzando modo global:
+
+```bash
+bash scripts/deploy-ia-node.sh \
+  --base "$BASE" \
+  --hive-id "$HIVE_ID" \
+  --runtime "AI.common" \
+  --version "0.1.2" \
+  --update-scope global \
+  --sync-hint \
+  --sudo
+```
 
 ---
 
@@ -198,6 +224,7 @@ Hot reload actual:
 Conclusión operativa:
 - para código: `publish -> update -> spawn` (canónico) ya sirve.
 - para prompt/key/behavior en runtime: usar `CONFIG_SET` (control plane del nodo).
+- para update de runtime puntual, mantener `deploy-ia-node.sh` en scope `targeted` (default).
 
 
 ---
@@ -226,7 +253,6 @@ bash scripts/deploy-ia-node.sh \
   --hive-id "motherbee" \
   --runtime "AI.chat" \
   --version "0.1.1" \
-  --mode default \
   --node-name "AI.chat@motherbee" \
   --tenant-id "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" \
   --config-json /tmp/ai_common_chat.config.json \
@@ -250,7 +276,6 @@ bash scripts/deploy-ia-node.sh \
   --hive-id "motherbee" \
   --runtime "AI.frontdesk.gov" \
   --version "0.1.0" \
-  --mode gov \
   --node-name "AI.frontdesk.gov@motherbee" \
   --tenant-id "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" \
   --config-json /tmp/ai_frontdesk_gov.spawn.json \

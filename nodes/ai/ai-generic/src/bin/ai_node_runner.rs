@@ -1132,9 +1132,6 @@ impl GenericAiNode {
     ) -> fluxbee_ai_sdk::Result<FunctionToolRegistry> {
         let mut registry = FunctionToolRegistry::new();
         self.register_common_tools(&mut registry, ctx)?;
-        if self.mode == RunnerMode::Gov {
-            self.register_gov_tools(&mut registry, ctx)?;
-        }
         Ok(registry)
     }
 
@@ -1988,17 +1985,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bootstrap_node = bootstrap_node_from_args(&args.bootstrap)?;
         tracing::info!(
             node_name = %bootstrap_node.name,
-            mode = %args.mode.as_str(),
             "starting ai_node_runner without YAML config (UNCONFIGURED mode)"
         );
-        run_unconfigured_bootstrap(bootstrap_node, args.mode).await?;
+        run_unconfigured_bootstrap(bootstrap_node).await?;
         return Ok(());
     }
 
     let mut runners = JoinSet::new();
-    let mode = args.mode;
     for (config_path, cfg) in loaded {
-        runners.spawn(async move { run_one_config(config_path, cfg, mode).await });
+        runners.spawn(async move { run_one_config(config_path, cfg).await });
     }
 
     while let Some(result) = runners.join_next().await {
@@ -2213,7 +2208,6 @@ fn with_jitter(base: Duration) -> Duration {
 async fn run_one_config(
     config_path: PathBuf,
     cfg: RunnerConfig,
-    mode: RunnerMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let startup_effective_doc = build_startup_effective_config_doc(&cfg);
     let startup_effective_doc =
@@ -2247,7 +2241,6 @@ async fn run_one_config(
     tracing::info!(
         config = %config_path.display(),
         node_name = %ai_node_config.name,
-        mode = %mode.as_str(),
         "starting ai_node_runner node instance"
     );
 
@@ -2258,7 +2251,7 @@ async fn run_one_config(
     let immediate_memory_store =
         init_immediate_memory_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
     let node = GenericAiNode {
-        mode,
+        mode: RunnerMode::Default,
         node_name,
         behavior: Arc::new(RwLock::new(Some(behavior))),
         dynamic_config_dir: PathBuf::from(cfg.node.dynamic_config_dir),
@@ -2281,24 +2274,14 @@ async fn run_one_config(
             ..ControlPlaneState::default()
         })),
     };
-    if mode == RunnerMode::Gov {
-        let client = RouterClient::connect(ai_node_config).await?;
-        let (reader, writer) = client.split();
-        let shared_conn = Arc::new(SharedRouterConnection::new(reader, writer));
-        let mut node = node;
-        node.gov_identity_bridge = Some(Arc::new(GovIdentityBridge::new(shared_conn.clone())));
-        run_single_connection_runtime(shared_conn, node, runtime_config).await?;
-    } else {
-        let client = RouterClient::connect(ai_node_config).await?;
-        let runtime = NodeRuntime::new(client, node);
-        runtime.run_with_config(runtime_config).await?;
-    }
+    let client = RouterClient::connect(ai_node_config).await?;
+    let runtime = NodeRuntime::new(client, node);
+    runtime.run_with_config(runtime_config).await?;
     Ok(())
 }
 
 async fn run_unconfigured_bootstrap(
     node: NodeSection,
-    mode: RunnerMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node_name = node.name.clone();
     let dynamic_dir = PathBuf::from(node.dynamic_config_dir.clone());
@@ -2467,12 +2450,11 @@ async fn run_unconfigured_bootstrap(
     };
     tracing::info!(
         node_name = %node_name,
-        mode = %mode.as_str(),
         "starting ai_node_runner bootstrap instance"
     );
     let gov_identity = gov_identity_config_from_env();
     let ai_node = GenericAiNode {
-        mode,
+        mode: RunnerMode::Default,
         node_name,
         behavior: Arc::new(RwLock::new(behavior)),
         dynamic_config_dir: dynamic_dir,
@@ -2482,18 +2464,9 @@ async fn run_unconfigured_bootstrap(
         gov_identity_bridge: None,
         control_plane: Arc::new(RwLock::new(state)),
     };
-    if mode == RunnerMode::Gov {
-        let client = RouterClient::connect(ai_node_config).await?;
-        let (reader, writer) = client.split();
-        let shared_conn = Arc::new(SharedRouterConnection::new(reader, writer));
-        let mut ai_node = ai_node;
-        ai_node.gov_identity_bridge = Some(Arc::new(GovIdentityBridge::new(shared_conn.clone())));
-        run_single_connection_runtime(shared_conn, ai_node, RuntimeConfig::default()).await?;
-    } else {
-        let client = RouterClient::connect(ai_node_config).await?;
-        let runtime = NodeRuntime::new(client, ai_node);
-        runtime.run_with_config(RuntimeConfig::default()).await?;
-    }
+    let client = RouterClient::connect(ai_node_config).await?;
+    let runtime = NodeRuntime::new(client, ai_node);
+    runtime.run_with_config(RuntimeConfig::default()).await?;
     Ok(())
 }
 
@@ -2511,7 +2484,6 @@ struct BootstrapArgs {
 struct RunnerArgs {
     config_paths: Vec<PathBuf>,
     bootstrap: BootstrapArgs,
-    mode: RunnerMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2540,13 +2512,7 @@ impl RunnerMode {
 
 fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + Sync>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let mut parsed = RunnerArgs {
-        mode: std::env::var("AI_NODE_MODE")
-            .ok()
-            .and_then(|v| RunnerMode::parse(&v))
-            .unwrap_or_default(),
-        ..RunnerArgs::default()
-    };
+    let mut parsed = RunnerArgs::default();
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -2607,13 +2573,13 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --mode".to_string().into());
                 };
-                let Some(mode) = RunnerMode::parse(value) else {
+                let normalized = value.trim().to_ascii_lowercase();
+                if normalized != "default" {
                     return Err(format!(
-                        "invalid value for --mode: {value} (expected default|gov)"
+                        "--mode={value} is not supported in AI.common runtime (only default)"
                     )
                     .into());
-                };
-                parsed.mode = mode;
+                }
                 i += 2;
             }
             other => {
@@ -3907,24 +3873,6 @@ mod tests {
             .map(|d| d.name)
             .collect::<Vec<_>>();
         assert!(!names.iter().any(|name| name == "ilk_register"));
-    }
-
-    #[test]
-    fn gov_mode_registry_exposes_ilk_register() {
-        let mut node = test_node();
-        node.mode = RunnerMode::Gov;
-        let registry = node
-            .build_tool_registry(&BehaviorContext {
-                thread_id: Some("legacy-thread-1".to_string()),
-                src_ilk: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
-            })
-            .expect("registry");
-        let names = registry
-            .definitions()
-            .into_iter()
-            .map(|d| d.name)
-            .collect::<Vec<_>>();
-        assert!(names.iter().any(|name| name == "ilk_register"));
     }
 
     #[tokio::test]

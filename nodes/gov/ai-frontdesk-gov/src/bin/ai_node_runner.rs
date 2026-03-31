@@ -2541,10 +2541,7 @@ impl RunnerMode {
 fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + Sync>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let mut parsed = RunnerArgs {
-        mode: std::env::var("AI_NODE_MODE")
-            .ok()
-            .and_then(|v| RunnerMode::parse(&v))
-            .unwrap_or_default(),
+        mode: RunnerMode::Gov,
         ..RunnerArgs::default()
     };
     let mut i = 0usize;
@@ -2607,13 +2604,14 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --mode".to_string().into());
                 };
-                let Some(mode) = RunnerMode::parse(value) else {
+                let normalized = value.trim().to_ascii_lowercase();
+                if normalized != "gov" {
                     return Err(format!(
-                        "invalid value for --mode: {value} (expected default|gov)"
+                        "--mode={value} is not supported in AI.frontdesk.gov runtime (only gov)"
                     )
                     .into());
-                };
-                parsed.mode = mode;
+                }
+                parsed.mode = RunnerMode::Gov;
                 i += 2;
             }
             other => {
@@ -3747,7 +3745,7 @@ mod tests {
     fn test_node() -> GenericAiNode {
         let gov_identity = GovIdentityConfig::default();
         GenericAiNode {
-            mode: RunnerMode::Default,
+            mode: RunnerMode::Gov,
             node_name: "AI.frontdesk.gov".to_string(),
             behavior: Arc::new(RwLock::new(None)),
             dynamic_config_dir: PathBuf::from("/tmp"),
@@ -3893,7 +3891,7 @@ mod tests {
     }
 
     #[test]
-    fn default_mode_registry_does_not_expose_gov_tools() {
+    fn frontdesk_registry_exposes_ilk_register_by_default() {
         let node = test_node();
         let registry = node
             .build_tool_registry(&BehaviorContext {
@@ -3906,59 +3904,7 @@ mod tests {
             .into_iter()
             .map(|d| d.name)
             .collect::<Vec<_>>();
-        assert!(!names.iter().any(|name| name == "ilk_register"));
-    }
-
-    #[test]
-    fn gov_mode_registry_exposes_ilk_register() {
-        let mut node = test_node();
-        node.mode = RunnerMode::Gov;
-        let registry = node
-            .build_tool_registry(&BehaviorContext {
-                thread_id: Some("legacy-thread-1".to_string()),
-                src_ilk: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
-            })
-            .expect("registry");
-        let names = registry
-            .definitions()
-            .into_iter()
-            .map(|d| d.name)
-            .collect::<Vec<_>>();
         assert!(names.iter().any(|name| name == "ilk_register"));
-    }
-
-    #[tokio::test]
-    async fn default_mode_rejects_ilk_register_with_unknown_tool() {
-        let node = test_node();
-        let registry = node
-            .build_tool_registry(&BehaviorContext {
-                thread_id: Some("legacy-thread-1".to_string()),
-                src_ilk: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
-            })
-            .expect("registry");
-
-        let results = fluxbee_ai_sdk::dispatch_tool_calls(
-            &registry,
-            vec![fluxbee_ai_sdk::FunctionToolCall {
-                call_id: "call_1".to_string(),
-                response_id: None,
-                name: "ilk_register".to_string(),
-                arguments: json!({
-                    "src_ilk": "ilk:11111111-1111-4111-8111-111111111111",
-                    "identity_candidate": {
-                        "name": "Noelia Eguren",
-                        "email": "neguren@4iplatform.com"
-                    }
-                }),
-            }],
-        )
-        .await;
-
-        assert_eq!(results.len(), 1);
-        let result = &results[0];
-        assert!(result.is_error);
-        assert_eq!(result.name, "ilk_register");
-        assert_eq!(result.output, Value::String("unknown_tool".to_string()));
     }
 
     #[test]
