@@ -514,7 +514,7 @@ Estado actual:
 - [ ] COG-M10-T1. Implementar rebuild desde storage durable.
 - [ ] COG-M10-T2. Regenerar `jsr-memory` desde durable.
 - [ ] COG-M10-T3. Definir criterio de corrupción/rebuild local.
-- [ ] COG-M10-T4. E2E completo:
+- [~] COG-M10-T4. E2E completo:
   - turn con `thread_id`
   - tagger
   - contexts + reasons
@@ -526,6 +526,15 @@ Estado actual:
 - [ ] COG-M10-T5. Remoción formal de mecanismos viejos:
   - `ctx` como unidad cognitiva canónica
   - shapes/documentación v1 incompatibles
+
+Estado actual:
+- existe smoke operativo sin tocar AI nodes:
+  - [`scripts/cognition_e2e_smoke.sh`](/Users/cagostino/Documents/GitHub/fluxbee/scripts/cognition_e2e_smoke.sh)
+  - publica turns canónicos a `storage.turns`
+  - valida `cognition_threads/contexts/reasons/scope_instances/memories/episodes`
+  - valida `jsr-memory` por `thread_id` con [`cognition_shm_dump.rs`](/Users/cagostino/Documents/GitHub/fluxbee/src/bin/cognition_shm_dump.rs)
+- esto cierra el E2E de `thread -> cognition -> storage -> SHM`
+- sigue pendiente el E2E de router enrichment real sobre entrega a nodo destino
 
 ---
 

@@ -1020,7 +1020,7 @@ fn build_cognition_config_get_payload(
                 .to_string(),
         ),
         Value::String(
-            "Deterministic v1 writer for threads, contexts, reasons, cooccurrences, scopes, scope_instances, memories, and episodes is active; SHM remains pending."
+            "Deterministic v1 writer for threads, contexts, reasons, cooccurrences, scopes, scope_instances, memories, and episodes is active; jsr-memory SHM writer is active and router enrichment is local-only after routing."
                 .to_string(),
         ),
     ];
