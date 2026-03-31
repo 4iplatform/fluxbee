@@ -12,6 +12,8 @@ members = [
     "nodes/gov/ai-frontdesk-gov",
     "nodes/test/io-test",
     "nodes/test/ai-test-gov",
+    "nodes/test/io-test-cognition",
+    "nodes/test/ai-test-cognition",
 ]
 
 [dependencies]

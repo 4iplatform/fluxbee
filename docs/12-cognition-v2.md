@@ -1090,6 +1090,11 @@ Both coexist. Neither replaces the other.
 
 ### Phase 8 — E2E Validation
 
+Validation note:
+- The canonical E2E for cognition v2 must enter through the router path with real/disposable nodes.
+- Direct publish to `storage.turns` is useful as a laboratory diagnostic for `SY.cognition` and `SY.storage`, but it is not the normative end-to-end path because it bypasses router/IO carrier shaping and delivery semantics.
+- PostgreSQL is not the primary oracle for the cognition E2E. The primary oracle is delivery to the destination node plus `jsr-memory` and `SY.cognition` runtime counters.
+
 - [ ] COG-T27. E2E: message → tagger → context + reason created.
 - [ ] COG-T28. E2E: binding energy with context + reason → scope transition.
 - [ ] COG-T29. E2E: period → summarizer → narrative memory fusing context + reason.

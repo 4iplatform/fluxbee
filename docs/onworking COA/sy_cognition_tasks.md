@@ -515,7 +515,8 @@ Estado actual:
 - [ ] COG-M10-T2. Regenerar `jsr-memory` desde durable.
 - [ ] COG-M10-T3. Definir criterio de corrupción/rebuild local.
 - [~] COG-M10-T4. E2E completo:
-  - turn con `thread_id`
+  - message real por router
+  - `thread_id/thread_seq` en carrier real
   - tagger
   - contexts + reasons
   - scope
@@ -528,13 +529,37 @@ Estado actual:
   - shapes/documentación v1 incompatibles
 
 Estado actual:
-- existe smoke operativo sin tocar AI nodes:
+- existe smoke operativo de laboratorio:
   - [`scripts/cognition_e2e_smoke.sh`](/Users/cagostino/Documents/GitHub/fluxbee/scripts/cognition_e2e_smoke.sh)
-  - publica turns canónicos a `storage.turns`
+  - publica directo a `storage.turns`
   - valida `cognition_threads/contexts/reasons/scope_instances/memories/episodes`
   - valida `jsr-memory` por `thread_id` con [`cognition_shm_dump.rs`](/Users/cagostino/Documents/GitHub/fluxbee/src/bin/cognition_shm_dump.rs)
-- esto cierra el E2E de `thread -> cognition -> storage -> SHM`
-- sigue pendiente el E2E de router enrichment real sobre entrega a nodo destino
+- sirve para diagnóstico de laboratorio del boundary `storage.turns -> SY.cognition -> storage.cognition.* -> jsr-memory`
+- no debe considerarse el E2E canónico del sistema porque bypassa router/IO y puede no reproducir el shape real del carrier
+- sigue pendiente el E2E canónico de router enrichment real sobre entrega a nodo destino
+
+Rediseño acordado de `COG-M10-T4`:
+- el E2E oficial debe entrar por router, no por publish directo a NATS
+- debe usar nodos disposable/test, no AI nodes productivos ni paths de DEV
+- no debe usar PostgreSQL como oráculo principal del resultado
+- el oráculo principal debe ser:
+  - mensaje recibido por el nodo destino test
+  - `STATUS` de `SY.cognition`
+  - `jsr-memory`
+
+Subtareas nuevas de `COG-M10-T4`:
+- [ ] COG-M10-T4a. Crear nodo `IO.test.cognition@<hive>` o emisor disposable equivalente que entre por router/socket normal.
+- [ ] COG-M10-T4b. Crear nodo `AI.test.cognition@<hive>` o receptor disposable equivalente que capture el mensaje entregado.
+- [ ] COG-M10-T4c. Validar que el router asigna `thread_seq` en el carrier real.
+- [ ] COG-M10-T4d. Validar que `SY.cognition` procesa el turn real y sube contadores (`processed_turns_total`, `published_entities_total`).
+- [ ] COG-M10-T4e. Validar que `jsr-memory` contiene `memory_package` para ese `thread_id`.
+- [ ] COG-M10-T4f. Validar que el nodo destino recibe el mensaje enriquecido con `memory_package`.
+- [ ] COG-M10-T4g. Mantener el smoke por `storage.turns` solo como `lab-only`, sin promocionarlo a prueba canónica.
+
+Estado actual:
+- [x] `IO.test.cognition` creado en [`nodes/test/io-test-cognition`](/Users/cagostino/Documents/GitHub/fluxbee/nodes/test/io-test-cognition)
+- [x] `AI.test.cognition` creado en [`nodes/test/ai-test-cognition`](/Users/cagostino/Documents/GitHub/fluxbee/nodes/test/ai-test-cognition)
+- [ ] sigue pendiente correr la validación operativa real y marcar `T4c..T4f`
 
 ---
 

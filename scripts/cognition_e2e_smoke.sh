@@ -91,6 +91,23 @@ if [[ -z "$DB_URL" ]]; then
   exit 1
 fi
 
+DB_URL="$(python3 - "$DB_URL" <<'PY'
+import sys
+from urllib.parse import urlsplit, urlunsplit
+
+raw = sys.argv[1].strip()
+parts = urlsplit(raw)
+path = parts.path or ""
+segments = [segment for segment in path.split("/") if segment]
+if segments:
+    segments[-1] = "fluxbee_storage"
+else:
+    segments = ["fluxbee_storage"]
+normalized = "/" + "/".join(segments)
+print(urlunsplit((parts.scheme, parts.netloc, normalized, parts.query, parts.fragment)))
+PY
+)"
+
 TRACE_ID="cognition-smoke-$(date +%s)-$RANDOM"
 THREAD_ID="thread:smoke:${TRACE_ID}"
 CTX="trace:${TRACE_ID}"
@@ -134,7 +151,7 @@ s.close()
 print(resp.strip())
 PY
 
-echo "Published 2 cognition smoke turns subject=$SUBJECT thread_id=$THREAD_ID endpoint=$NATS_URL"
+echo "Published 2 cognition smoke turns subject=$SUBJECT thread_id=$THREAD_ID endpoint=$NATS_URL db=$DB_URL"
 
 deadline=$(( $(date +%s) + TIMEOUT_SECS ))
 thread_ready=0
