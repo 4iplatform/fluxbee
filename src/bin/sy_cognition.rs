@@ -25,11 +25,13 @@ use fluxbee_sdk::{
 };
 use fluxbee_sdk::{
     CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
-    CognitionDurableEnvelope, CognitionDurableOp, CognitionIlkProfile, CognitionReasonData,
-    CognitionScopeData, CognitionScopeInstanceData, CognitionThreadData,
-    SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_COOCCURRENCES,
-    SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
-    SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
+    CognitionDurableEnvelope, CognitionDurableOp, CognitionEpisodeData, CognitionIlkProfile,
+    CognitionMemoryData, CognitionReasonData, CognitionScopeData, CognitionScopeInstanceData,
+    CognitionThreadData, SUBJECT_STORAGE_COGNITION_CONTEXTS,
+    SUBJECT_STORAGE_COGNITION_COOCCURRENCES, SUBJECT_STORAGE_COGNITION_EPISODES,
+    SUBJECT_STORAGE_COGNITION_MEMORIES, SUBJECT_STORAGE_COGNITION_REASONS,
+    SUBJECT_STORAGE_COGNITION_SCOPES, SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES,
+    SUBJECT_STORAGE_COGNITION_THREADS,
 };
 use json_router::nats::{NatsSubscriber as RouterNatsSubscriber, SUBJECT_STORAGE_TURNS};
 
@@ -52,6 +54,9 @@ const COGNITION_COOCCURRENCE_EMA_ALPHA: f64 = 0.35;
 const COGNITION_SCOPE_ENERGY_ALPHA: f64 = 0.25;
 const COGNITION_SCOPE_UNBIND_THRESHOLD: f64 = 0.35;
 const COGNITION_SCOPE_SUSTAIN_COUNT: u32 = 2;
+const COGNITION_MEMORY_DECAY_FACTOR: f64 = 0.97;
+const COGNITION_EPISODE_MIN_INTENSITY: f64 = 7.0;
+const COGNITION_EPISODE_MIN_EVIDENCE_STRENGTH: f64 = 8.0;
 const COGNITION_MAX_TAGS: usize = 12;
 const COGNITION_MAX_REASON_SIGNALS: usize = 4;
 const NATS_ERROR_LOG_EVERY: u64 = 20;
@@ -142,6 +147,8 @@ struct CognitionRuntimeState {
     open_cooccurrences_total: u64,
     active_threads_total: u64,
     active_scopes_total: u64,
+    active_memories_total: u64,
+    active_episodes_total: u64,
 }
 
 #[derive(Debug)]
@@ -167,6 +174,8 @@ struct ThreadCognitionState {
     reasons: HashMap<String, ReasonState>,
     cooccurrences: HashMap<String, CooccurrenceState>,
     active_scope: Option<ScopeBindingState>,
+    memories: HashMap<String, MemoryState>,
+    episodes: HashMap<String, EpisodeState>,
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +248,49 @@ struct ScopeBindingState {
     last_seen_at: String,
     start_thread_seq: Option<u64>,
     unbind_streak: u32,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryState {
+    memory_id: String,
+    scope_id: String,
+    summary: String,
+    weight: f64,
+    occurrences: u64,
+    dominant_context_id: String,
+    dominant_reason_id: String,
+    ilk_weights: BTreeMap<String, f64>,
+    created_at: String,
+    last_seen_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct EpisodeState {
+    episode_id: String,
+    scope_id: String,
+    scope_instance_id: String,
+    affect_id: String,
+    title: String,
+    summary: String,
+    base_intensity: f64,
+    evidence_strength: f64,
+    evidence_context_ids: Vec<String>,
+    evidence_reason_ids: Vec<String>,
+    evidence_signals: Vec<String>,
+    intensity: f64,
+    reason: String,
+    created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct EpisodeCandidate {
+    affect_id: String,
+    title: String,
+    summary: String,
+    base_intensity: f64,
+    evidence_strength: f64,
+    evidence_signals: Vec<String>,
+    reason: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -512,6 +564,8 @@ async fn handle_turn_payload(
         open_reasons_total,
         open_cooccurrences_total,
         active_scopes_total,
+        active_memories_total,
+        active_episodes_total,
     ) = {
         let threads = app_state.thread_states.lock().await;
         let active_threads = threads.len() as u64;
@@ -549,12 +603,22 @@ async fn handle_turn_payload(
             .values()
             .filter(|thread| thread.active_scope.is_some())
             .count() as u64;
+        let active_memories = threads
+            .values()
+            .map(|thread| thread.memories.len() as u64)
+            .sum();
+        let active_episodes = threads
+            .values()
+            .map(|thread| thread.episodes.len() as u64)
+            .sum();
         (
             active_threads,
             open_contexts,
             open_reasons,
             open_cooccurrences,
             active_scopes,
+            active_memories,
+            active_episodes,
         )
     };
 
@@ -575,6 +639,8 @@ async fn handle_turn_payload(
     state.open_reasons_total = open_reasons_total;
     state.open_cooccurrences_total = open_cooccurrences_total;
     state.active_scopes_total = active_scopes_total;
+    state.active_memories_total = active_memories_total;
+    state.active_episodes_total = active_episodes_total;
     Ok(())
 }
 
@@ -751,7 +817,9 @@ fn build_status_payload(
             "open_contexts_total": runtime_state.open_contexts_total,
             "open_reasons_total": runtime_state.open_reasons_total,
             "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
-            "active_scopes_total": runtime_state.active_scopes_total
+            "active_scopes_total": runtime_state.active_scopes_total,
+            "active_memories_total": runtime_state.active_memories_total,
+            "active_episodes_total": runtime_state.active_episodes_total
         },
         "paths": {
             "state_dir": runtime_paths.state_dir,
@@ -790,7 +858,7 @@ fn build_cognition_config_get_payload(
                 .to_string(),
         ),
         Value::String(
-            "Deterministic v1 writer for threads, contexts, reasons, cooccurrences, scopes, and scope_instances is active; SHM and memory/episode layers remain pending."
+            "Deterministic v1 writer for threads, contexts, reasons, cooccurrences, scopes, scope_instances, memories, and episodes is active; SHM remains pending."
                 .to_string(),
         ),
     ];
@@ -843,7 +911,9 @@ fn build_cognition_config_get_payload(
             "last_reason_signals_canonical": runtime_state.last_reason_signals_canonical,
             "last_reason_signals_extra": runtime_state.last_reason_signals_extra,
             "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
-            "active_scopes_total": runtime_state.active_scopes_total
+            "active_scopes_total": runtime_state.active_scopes_total,
+            "active_memories_total": runtime_state.active_memories_total,
+            "active_episodes_total": runtime_state.active_episodes_total
         },
         "contract": {
             "node_family": "SY",
@@ -1022,7 +1092,7 @@ fn cognition_state_label(control_state: &CognitionControlState) -> &'static str 
 }
 
 fn cognition_degraded_reasons(control_state: &CognitionControlState) -> Vec<&'static str> {
-    let mut reasons = vec!["memory_shm_pending", "memory_episode_pending"];
+    let mut reasons = vec!["memory_shm_pending"];
     if control_state.ai_secret_source == CognitionAiSecretSource::Missing {
         reasons.push("ai_provider_missing");
     }
@@ -1497,6 +1567,20 @@ fn update_thread_state_and_build_envelopes(
         &thread_state.contexts,
         &thread_state.reasons,
         &mut thread_state.active_scope,
+    ));
+    out.extend(update_memories_and_episodes_for_thread(
+        hive_id,
+        writer,
+        thread_id,
+        ts,
+        src_ilk,
+        dst_ilk,
+        tagger,
+        &thread_state.contexts,
+        &thread_state.reasons,
+        &thread_state.active_scope,
+        &mut thread_state.memories,
+        &mut thread_state.episodes,
     ));
     out
 }
@@ -2069,8 +2153,7 @@ fn update_scope_binding_for_thread(
             *active_scope = Some(opened);
         }
         Some(scope) => {
-            let ctx_similarity =
-                jaccard_similarity(&scope.dominant_context_tags, &context.tags);
+            let ctx_similarity = jaccard_similarity(&scope.dominant_context_tags, &context.tags);
             let reason_similarity =
                 jaccard_similarity(&scope.dominant_reason_signals, &reason.signals_canonical);
             let ilk_similarity = cosine_similarity(&scope.ilk_weights, &current_ilk_weights);
@@ -2135,6 +2218,332 @@ fn update_scope_binding_for_thread(
     }
 
     out
+}
+
+fn update_memories_and_episodes_for_thread(
+    hive_id: &str,
+    writer: &str,
+    thread_id: &str,
+    ts: &str,
+    src_ilk: Option<&str>,
+    dst_ilk: Option<&str>,
+    tagger: &DeterministicTaggerOutput,
+    contexts: &HashMap<String, ContextState>,
+    reasons: &HashMap<String, ReasonState>,
+    active_scope: &Option<ScopeBindingState>,
+    memories: &mut HashMap<String, MemoryState>,
+    episodes: &mut HashMap<String, EpisodeState>,
+) -> Vec<(&'static str, Vec<u8>)> {
+    let mut out = Vec::new();
+    let Some(scope) = active_scope.as_ref() else {
+        return out;
+    };
+    let Some(context) = contexts.get(&scope.dominant_context_label) else {
+        return out;
+    };
+    let Some(reason) = reasons.get(&scope.dominant_reason_label) else {
+        return out;
+    };
+
+    let current_ilk_weights = current_turn_ilk_weights(src_ilk, dst_ilk);
+    out.extend(update_memories_for_thread(
+        hive_id,
+        writer,
+        thread_id,
+        ts,
+        scope,
+        context,
+        reason,
+        &current_ilk_weights,
+        memories,
+    ));
+    out.extend(update_episodes_for_thread(
+        hive_id, writer, thread_id, ts, tagger, scope, context, reason, episodes,
+    ));
+    out
+}
+
+fn update_memories_for_thread(
+    hive_id: &str,
+    writer: &str,
+    thread_id: &str,
+    ts: &str,
+    scope: &ScopeBindingState,
+    context: &ContextState,
+    reason: &ReasonState,
+    current_ilk_weights: &BTreeMap<String, f64>,
+    memories: &mut HashMap<String, MemoryState>,
+) -> Vec<(&'static str, Vec<u8>)> {
+    let mut out = Vec::new();
+    let memory_key = scope.scope_id.clone();
+    let summary = summarize_scope_memory(context, reason);
+    let memory = memories
+        .entry(memory_key.clone())
+        .or_insert_with(|| MemoryState {
+            memory_id: stable_entity_id("memory", &[thread_id, &scope.scope_id]),
+            scope_id: scope.scope_id.clone(),
+            summary: summary.clone(),
+            weight: 0.0,
+            occurrences: 0,
+            dominant_context_id: context.context_id.clone(),
+            dominant_reason_id: reason.reason_id.clone(),
+            ilk_weights: BTreeMap::new(),
+            created_at: ts.to_string(),
+            last_seen_at: ts.to_string(),
+        });
+    memory.summary = summary;
+    memory.scope_id = scope.scope_id.clone();
+    memory.weight =
+        memory.weight * COGNITION_MEMORY_DECAY_FACTOR + scope.binding_energy_ema.max(0.25);
+    memory.occurrences = memory.occurrences.saturating_add(1);
+    memory.dominant_context_id = context.context_id.clone();
+    memory.dominant_reason_id = reason.reason_id.clone();
+    merge_ilk_weights(&mut memory.ilk_weights, current_ilk_weights);
+    memory.last_seen_at = ts.to_string();
+
+    let data = CognitionMemoryData {
+        summary: memory.summary.clone(),
+        scope_id: Some(memory.scope_id.clone()),
+        weight: Some(memory.weight),
+        occurrences: Some(memory.occurrences),
+        dominant_context_id: Some(memory.dominant_context_id.clone()),
+        dominant_reason_id: Some(memory.dominant_reason_id.clone()),
+        ilk_weights: memory.ilk_weights.clone(),
+        created_at: Some(memory.created_at.clone()),
+        last_seen_at: Some(memory.last_seen_at.clone()),
+    };
+    if let Ok(body) = serde_json::to_vec(&CognitionDurableEnvelope::new(
+        CognitionDurableEntity::Memory,
+        CognitionDurableOp::Upsert,
+        memory.memory_id.clone(),
+        Some(thread_id.to_string()),
+        hive_id.to_string(),
+        writer.to_string(),
+        ts.to_string(),
+        data,
+    )) {
+        out.push((SUBJECT_STORAGE_COGNITION_MEMORIES, body));
+    }
+
+    for (key, other_memory) in memories.iter_mut() {
+        if key == &memory_key {
+            continue;
+        }
+        other_memory.weight *= COGNITION_MEMORY_DECAY_FACTOR;
+        other_memory.last_seen_at = ts.to_string();
+        let data = CognitionMemoryData {
+            summary: other_memory.summary.clone(),
+            scope_id: Some(other_memory.scope_id.clone()),
+            weight: Some(other_memory.weight),
+            occurrences: Some(other_memory.occurrences),
+            dominant_context_id: Some(other_memory.dominant_context_id.clone()),
+            dominant_reason_id: Some(other_memory.dominant_reason_id.clone()),
+            ilk_weights: other_memory.ilk_weights.clone(),
+            created_at: Some(other_memory.created_at.clone()),
+            last_seen_at: Some(other_memory.last_seen_at.clone()),
+        };
+        if let Ok(body) = serde_json::to_vec(&CognitionDurableEnvelope::new(
+            CognitionDurableEntity::Memory,
+            CognitionDurableOp::Upsert,
+            other_memory.memory_id.clone(),
+            Some(thread_id.to_string()),
+            hive_id.to_string(),
+            writer.to_string(),
+            ts.to_string(),
+            data,
+        )) {
+            out.push((SUBJECT_STORAGE_COGNITION_MEMORIES, body));
+        }
+    }
+
+    out
+}
+
+fn update_episodes_for_thread(
+    hive_id: &str,
+    writer: &str,
+    thread_id: &str,
+    ts: &str,
+    tagger: &DeterministicTaggerOutput,
+    scope: &ScopeBindingState,
+    context: &ContextState,
+    reason: &ReasonState,
+    episodes: &mut HashMap<String, EpisodeState>,
+) -> Vec<(&'static str, Vec<u8>)> {
+    let mut out = Vec::new();
+    let Some(candidate) = build_episode_candidate(tagger, context, reason) else {
+        return out;
+    };
+
+    let episode_key = format!("{}|{}", scope.scope_instance_id, candidate.affect_id);
+    let episode = episodes.entry(episode_key).or_insert_with(|| EpisodeState {
+        episode_id: stable_entity_id(
+            "episode",
+            &[thread_id, &scope.scope_instance_id, &candidate.affect_id],
+        ),
+        scope_id: scope.scope_id.clone(),
+        scope_instance_id: scope.scope_instance_id.clone(),
+        affect_id: candidate.affect_id.clone(),
+        title: candidate.title.clone(),
+        summary: candidate.summary.clone(),
+        base_intensity: candidate.base_intensity,
+        evidence_strength: candidate.evidence_strength,
+        evidence_context_ids: vec![context.context_id.clone()],
+        evidence_reason_ids: vec![reason.reason_id.clone()],
+        evidence_signals: candidate.evidence_signals.clone(),
+        intensity: candidate.base_intensity,
+        reason: candidate.reason.clone(),
+        created_at: ts.to_string(),
+    });
+
+    episode.scope_id = scope.scope_id.clone();
+    episode.scope_instance_id = scope.scope_instance_id.clone();
+    episode.title = candidate.title.clone();
+    episode.summary = candidate.summary.clone();
+    episode.base_intensity = episode.base_intensity.max(candidate.base_intensity);
+    episode.evidence_strength = episode.evidence_strength.max(candidate.evidence_strength);
+    episode.intensity = episode.intensity.max(candidate.base_intensity);
+    episode.reason = candidate.reason.clone();
+    for context_id in [context.context_id.clone()] {
+        if !episode.evidence_context_ids.contains(&context_id) {
+            episode.evidence_context_ids.push(context_id);
+        }
+    }
+    for reason_id in [reason.reason_id.clone()] {
+        if !episode.evidence_reason_ids.contains(&reason_id) {
+            episode.evidence_reason_ids.push(reason_id);
+        }
+    }
+    for signal in &candidate.evidence_signals {
+        if !episode.evidence_signals.contains(signal) {
+            episode.evidence_signals.push(signal.clone());
+        }
+    }
+
+    let data = CognitionEpisodeData {
+        affect_id: episode.affect_id.clone(),
+        title: episode.title.clone(),
+        summary: episode.summary.clone(),
+        scope_id: Some(episode.scope_id.clone()),
+        base_intensity: Some(episode.base_intensity),
+        evidence_strength: Some(episode.evidence_strength),
+        evidence_context_ids: episode.evidence_context_ids.clone(),
+        evidence_reason_ids: episode.evidence_reason_ids.clone(),
+        evidence_signals: episode.evidence_signals.clone(),
+        intensity: Some(episode.intensity),
+        reason: Some(episode.reason.clone()),
+        created_at: Some(episode.created_at.clone()),
+    };
+    if let Ok(body) = serde_json::to_vec(&CognitionDurableEnvelope::new(
+        CognitionDurableEntity::Episode,
+        CognitionDurableOp::Upsert,
+        episode.episode_id.clone(),
+        Some(thread_id.to_string()),
+        hive_id.to_string(),
+        writer.to_string(),
+        ts.to_string(),
+        data,
+    )) {
+        out.push((SUBJECT_STORAGE_COGNITION_EPISODES, body));
+    }
+
+    out
+}
+
+fn summarize_scope_memory(context: &ContextState, reason: &ReasonState) -> String {
+    format!(
+        "The thread recurrently centers on {} with a dominant drive of {}.",
+        context.label, reason.label
+    )
+}
+
+fn build_episode_candidate(
+    tagger: &DeterministicTaggerOutput,
+    context: &ContextState,
+    reason: &ReasonState,
+) -> Option<EpisodeCandidate> {
+    let extra_signals: HashSet<&str> = tagger
+        .reason_signals_extra
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let canonical_signals: HashSet<&str> = tagger
+        .reason_signals_canonical
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    let mut affect_id = None;
+    let mut title = String::new();
+    let mut summary = String::new();
+    let mut reason_text = String::new();
+    let mut evidence_signals = Vec::new();
+    let mut base_intensity = 0.0;
+    let mut evidence_strength = 0.0;
+
+    if extra_signals.contains("frustration")
+        && (canonical_signals.contains("challenge") || canonical_signals.contains("resolve"))
+    {
+        affect_id = Some("anger".to_string());
+        title = format!("Friction around {}", context.label);
+        summary = format!(
+            "Strong friction emerged around {} with the drive of {}.",
+            context.label, reason.label
+        );
+        reason_text =
+            "Frustration aligned with a confrontational or urgent resolution drive".to_string();
+        evidence_signals.extend(["frustration".to_string(), "challenge".to_string()]);
+        base_intensity = 8.0;
+        evidence_strength = 9.0;
+    } else if extra_signals.contains("escalation")
+        && (canonical_signals.contains("protect") || canonical_signals.contains("challenge"))
+    {
+        affect_id = Some("escalation".to_string());
+        title = format!("Escalation around {}", context.label);
+        summary = format!(
+            "Escalation pressure appeared around {} with the drive of {}.",
+            context.label, reason.label
+        );
+        reason_text = "Escalation signal with protective or confrontational framing".to_string();
+        evidence_signals.extend(["escalation".to_string(), "protect".to_string()]);
+        base_intensity = 8.0;
+        evidence_strength = 9.0;
+    } else if extra_signals.contains("urgency")
+        && canonical_signals.contains("resolve")
+        && canonical_signals.contains("request")
+    {
+        affect_id = Some("urgency".to_string());
+        title = format!("Urgent push on {}", context.label);
+        summary = format!(
+            "Urgent pressure formed around {} while seeking {}.",
+            context.label, reason.label
+        );
+        reason_text =
+            "Urgency combined with explicit assistance and resolution seeking".to_string();
+        evidence_signals.extend([
+            "urgency".to_string(),
+            "request".to_string(),
+            "resolve".to_string(),
+        ]);
+        base_intensity = 7.0;
+        evidence_strength = 8.0;
+    }
+
+    if base_intensity < COGNITION_EPISODE_MIN_INTENSITY
+        || evidence_strength < COGNITION_EPISODE_MIN_EVIDENCE_STRENGTH
+    {
+        return None;
+    }
+
+    Some(EpisodeCandidate {
+        affect_id: affect_id?,
+        title,
+        summary,
+        base_intensity,
+        evidence_strength,
+        evidence_signals,
+        reason: reason_text,
+    })
 }
 
 fn build_scope_upsert_events(
@@ -2316,6 +2725,12 @@ fn cosine_similarity(left: &BTreeMap<String, f64>, right: &BTreeMap<String, f64>
         0.0
     } else {
         dot / (left_norm.sqrt() * right_norm.sqrt())
+    }
+}
+
+fn merge_ilk_weights(target: &mut BTreeMap<String, f64>, source: &BTreeMap<String, f64>) {
+    for (ilk, weight) in source {
+        *target.entry(ilk.clone()).or_insert(0.0) += weight;
     }
 }
 

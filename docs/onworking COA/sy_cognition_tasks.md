@@ -459,14 +459,25 @@ Estado actual:
 
 ### Fase COG-M7 - Memory fusion + episodes
 
-- [ ] COG-M7-T1. Implementar period detection con:
+- [x] COG-M7-T1. Implementar period detection con:
   - main context
   - dominant reason
-- [ ] COG-M7-T2. Implementar summarizer de scope
-- [ ] COG-M7-T3. Crear/reforzar/decayer memories
-- [ ] COG-M7-T4. Persistir `dominant_context_id` + `dominant_reason_id`
-- [ ] COG-M7-T5. Implementar gate de episodes
-- [ ] COG-M7-T6. Persistir `evidence_reason_ids`
+- [x] COG-M7-T2. Implementar summarizer de scope
+- [x] COG-M7-T3. Crear/reforzar/decayer memories
+- [x] COG-M7-T4. Persistir `dominant_context_id` + `dominant_reason_id`
+- [x] COG-M7-T5. Implementar gate de episodes
+- [x] COG-M7-T6. Persistir `evidence_reason_ids`
+
+Estado actual:
+- el período v1 queda materializado por el `scope_instance` activo y su par dominante `context + reason`
+- `SY.cognition` ya emite:
+  - `storage.cognition.memories`
+  - `storage.cognition.episodes`
+- la memoria v1 es narrativa determinística por `scope`
+- el gate de episodios es conservador y solo abre con combinaciones fuertes de:
+  - `frustration + challenge/resolve`
+  - `escalation + protect/challenge`
+  - `urgency + request + resolve`
 
 ### Fase COG-M8 - SHM nueva + enrichment del router
 
