@@ -376,10 +376,10 @@ async fn run_turns_loop(endpoint: String, app_state: Arc<CognitionAppState>) {
                 COGNITION_TURNS_SID,
             )
         };
-        let app_state = Arc::clone(&app_state);
+        let run_app_state = Arc::clone(&app_state);
         let run_result = subscriber
             .run(move |payload| {
-                let app_state = Arc::clone(&app_state);
+                let app_state = Arc::clone(&run_app_state);
                 async move { handle_turn_payload(payload, app_state).await }
             })
             .await;
@@ -1439,7 +1439,7 @@ fn update_thread_state_and_build_envelopes(
         writer,
         thread_id,
         ts,
-        ((thresholds.context_open + thresholds.reason_open) * 0.5),
+        (thresholds.context_open + thresholds.reason_open) * 0.5,
         &context_candidates,
         &reason_candidates,
         &thread_state.contexts,
