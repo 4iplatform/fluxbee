@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::time;
 use tokio_postgres::{error::SqlState, Client, Config as PgConfig, GenericClient, NoTls};
@@ -24,6 +24,14 @@ use fluxbee_sdk::{
     try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSecretDescriptor,
     NodeSecretWriteOptions, NodeSender, NodeUuidMode, NODE_CONFIG_APPLY_MODE_REPLACE,
     NODE_SECRET_REDACTION_TOKEN,
+};
+use fluxbee_sdk::{
+    CognitionContextData, CognitionDurableEntity, CognitionDurableEnvelope, CognitionDurableOp,
+    CognitionEpisodeData, CognitionMemoryData, CognitionReasonData, CognitionScopeData,
+    CognitionScopeInstanceData, CognitionThreadData, SUBJECT_STORAGE_COGNITION_CONTEXTS,
+    SUBJECT_STORAGE_COGNITION_EPISODES, SUBJECT_STORAGE_COGNITION_MEMORIES,
+    SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
+    SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
 };
 use json_router::nats::{
     NatsSubscriber as RouterNatsSubscriber, SUBJECT_STORAGE_EVENTS, SUBJECT_STORAGE_ITEMS,
@@ -44,6 +52,14 @@ const DURABLE_QUEUE_TURNS: &str = "durable.sy-storage.turns";
 const DURABLE_QUEUE_EVENTS: &str = "durable.sy-storage.events";
 const DURABLE_QUEUE_ITEMS: &str = "durable.sy-storage.items";
 const DURABLE_QUEUE_REACTIVATION: &str = "durable.sy-storage.reactivation";
+const DURABLE_QUEUE_COGNITION_THREADS: &str = "durable.sy-storage.cognition.threads";
+const DURABLE_QUEUE_COGNITION_CONTEXTS: &str = "durable.sy-storage.cognition.contexts";
+const DURABLE_QUEUE_COGNITION_REASONS: &str = "durable.sy-storage.cognition.reasons";
+const DURABLE_QUEUE_COGNITION_SCOPES: &str = "durable.sy-storage.cognition.scopes";
+const DURABLE_QUEUE_COGNITION_SCOPE_INSTANCES: &str =
+    "durable.sy-storage.cognition.scope_instances";
+const DURABLE_QUEUE_COGNITION_MEMORIES: &str = "durable.sy-storage.cognition.memories";
+const DURABLE_QUEUE_COGNITION_EPISODES: &str = "durable.sy-storage.cognition.episodes";
 const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const STORAGE_METRICS_QUERY_SID: u32 = 19;
 const STORAGE_DB_NAME: &str = "fluxbee_storage";
@@ -270,6 +286,55 @@ async fn main() -> Result<(), StorageError> {
             Arc::clone(&nats_subscribe_errors),
             Arc::clone(&storage_handler_errors),
         )));
+        std::mem::drop(tokio::spawn(run_cognition_threads_loop(
+            endpoint.clone(),
+            use_durable_consumer,
+            Arc::clone(storage),
+            Arc::clone(&nats_subscribe_errors),
+            Arc::clone(&storage_handler_errors),
+        )));
+        std::mem::drop(tokio::spawn(run_cognition_contexts_loop(
+            endpoint.clone(),
+            use_durable_consumer,
+            Arc::clone(storage),
+            Arc::clone(&nats_subscribe_errors),
+            Arc::clone(&storage_handler_errors),
+        )));
+        std::mem::drop(tokio::spawn(run_cognition_reasons_loop(
+            endpoint.clone(),
+            use_durable_consumer,
+            Arc::clone(storage),
+            Arc::clone(&nats_subscribe_errors),
+            Arc::clone(&storage_handler_errors),
+        )));
+        std::mem::drop(tokio::spawn(run_cognition_scopes_loop(
+            endpoint.clone(),
+            use_durable_consumer,
+            Arc::clone(storage),
+            Arc::clone(&nats_subscribe_errors),
+            Arc::clone(&storage_handler_errors),
+        )));
+        std::mem::drop(tokio::spawn(run_cognition_scope_instances_loop(
+            endpoint.clone(),
+            use_durable_consumer,
+            Arc::clone(storage),
+            Arc::clone(&nats_subscribe_errors),
+            Arc::clone(&storage_handler_errors),
+        )));
+        std::mem::drop(tokio::spawn(run_cognition_memories_loop(
+            endpoint.clone(),
+            use_durable_consumer,
+            Arc::clone(storage),
+            Arc::clone(&nats_subscribe_errors),
+            Arc::clone(&storage_handler_errors),
+        )));
+        std::mem::drop(tokio::spawn(run_cognition_episodes_loop(
+            endpoint.clone(),
+            use_durable_consumer,
+            Arc::clone(storage),
+            Arc::clone(&nats_subscribe_errors),
+            Arc::clone(&storage_handler_errors),
+        )));
         std::mem::drop(tokio::spawn(run_storage_metrics_loop(
             Arc::clone(storage),
             Arc::clone(&nats_subscribe_errors),
@@ -395,7 +460,159 @@ CREATE INDEX IF NOT EXISTS idx_events_activation ON events(activation_strength D
 CREATE INDEX IF NOT EXISTS idx_events_natural_key ON events(ctx, start_seq, end_seq, boundary_reason);
 CREATE INDEX IF NOT EXISTS idx_items_cues ON memory_items USING GIN(cues_signature);
 CREATE INDEX IF NOT EXISTS idx_storage_inbox_pending ON storage_inbox(processed_at, received_at);
-"#,
+
+CREATE TABLE IF NOT EXISTS cognition_threads (
+    thread_id        TEXT PRIMARY KEY,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    latest_thread_seq BIGINT,
+    src_ilk          TEXT,
+    dst_ilk          TEXT,
+    ich              TEXT,
+    status           TEXT,
+    first_seen_at    TEXT,
+    last_seen_at     TEXT,
+    turn_count       BIGINT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS cognition_contexts (
+    context_id       TEXT PRIMARY KEY,
+    thread_id        TEXT NOT NULL,
+    scope_id         TEXT,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    label            TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    score            DOUBLE PRECISION,
+    weight           DOUBLE PRECISION,
+    weight_avg_cumulative DOUBLE PRECISION,
+    weight_avg_ema   DOUBLE PRECISION,
+    weight_samples   BIGINT,
+    tags             TEXT[],
+    ilk_weights      JSONB,
+    ilk_profile      JSONB,
+    opened_at        TEXT,
+    last_seen_at     TEXT,
+    closed_at        TEXT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS cognition_reasons (
+    reason_id        TEXT PRIMARY KEY,
+    thread_id        TEXT NOT NULL,
+    scope_id         TEXT,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    label            TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    score            DOUBLE PRECISION,
+    weight           DOUBLE PRECISION,
+    weight_avg_cumulative DOUBLE PRECISION,
+    weight_avg_ema   DOUBLE PRECISION,
+    weight_samples   BIGINT,
+    signals_canonical TEXT[],
+    signals_extra    TEXT[],
+    ilk_weights      JSONB,
+    ilk_profile      JSONB,
+    opened_at        TEXT,
+    last_seen_at     TEXT,
+    closed_at        TEXT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS cognition_scopes (
+    scope_id         TEXT PRIMARY KEY,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    label            TEXT,
+    status           TEXT NOT NULL,
+    dominant_context_id TEXT,
+    dominant_reason_id TEXT,
+    binding_energy_ema DOUBLE PRECISION,
+    opened_at        TEXT,
+    last_seen_at     TEXT,
+    closed_at        TEXT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS cognition_scope_instances (
+    scope_instance_id TEXT PRIMARY KEY,
+    thread_id        TEXT NOT NULL,
+    scope_id         TEXT NOT NULL,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    dominant_context_id TEXT,
+    dominant_reason_id TEXT,
+    start_thread_seq BIGINT,
+    end_thread_seq   BIGINT,
+    opened_at        TEXT,
+    closed_at        TEXT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS cognition_memories (
+    memory_id        TEXT PRIMARY KEY,
+    thread_id        TEXT NOT NULL,
+    scope_id         TEXT,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    summary          TEXT NOT NULL,
+    weight           DOUBLE PRECISION,
+    occurrences      BIGINT,
+    dominant_context_id TEXT,
+    dominant_reason_id TEXT,
+    ilk_weights      JSONB,
+    created_at       TEXT,
+    last_seen_at     TEXT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS cognition_episodes (
+    episode_id       TEXT PRIMARY KEY,
+    thread_id        TEXT NOT NULL,
+    scope_id         TEXT,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    affect_id        TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    summary          TEXT NOT NULL,
+    base_intensity   DOUBLE PRECISION,
+    evidence_strength DOUBLE PRECISION,
+    evidence_context_ids TEXT[],
+    evidence_reason_ids TEXT[],
+    evidence_signals TEXT[],
+    intensity        DOUBLE PRECISION,
+    reason           TEXT,
+    created_at       TEXT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_cognition_contexts_thread ON cognition_contexts(thread_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_contexts_scope ON cognition_contexts(scope_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_reasons_thread ON cognition_reasons(thread_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_reasons_scope ON cognition_reasons(scope_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_scope_instances_thread ON cognition_scope_instances(thread_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_scope_instances_scope ON cognition_scope_instances(scope_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_memories_thread ON cognition_memories(thread_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_memories_scope ON cognition_memories(scope_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_episodes_thread ON cognition_episodes(thread_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_episodes_scope ON cognition_episodes(scope_id);
+	"#,
             )
             .await?;
         Ok(())
@@ -627,6 +844,44 @@ WHERE dedupe_key = $1
                 self.apply_reactivation(&self.client, dedupe_key, &parsed)
                     .await
             }
+            HandlerKind::CognitionThreads => {
+                let envelope: CognitionDurableEnvelope<CognitionThreadData> =
+                    parse_cognition_envelope(payload, CognitionDurableEntity::Thread)?;
+                self.persist_cognition_thread(&self.client, &envelope).await
+            }
+            HandlerKind::CognitionContexts => {
+                let envelope: CognitionDurableEnvelope<CognitionContextData> =
+                    parse_cognition_envelope(payload, CognitionDurableEntity::Context)?;
+                self.persist_cognition_context(&self.client, &envelope)
+                    .await
+            }
+            HandlerKind::CognitionReasons => {
+                let envelope: CognitionDurableEnvelope<CognitionReasonData> =
+                    parse_cognition_envelope(payload, CognitionDurableEntity::Reason)?;
+                self.persist_cognition_reason(&self.client, &envelope).await
+            }
+            HandlerKind::CognitionScopes => {
+                let envelope: CognitionDurableEnvelope<CognitionScopeData> =
+                    parse_cognition_envelope(payload, CognitionDurableEntity::Scope)?;
+                self.persist_cognition_scope(&self.client, &envelope).await
+            }
+            HandlerKind::CognitionScopeInstances => {
+                let envelope: CognitionDurableEnvelope<CognitionScopeInstanceData> =
+                    parse_cognition_envelope(payload, CognitionDurableEntity::ScopeInstance)?;
+                self.persist_cognition_scope_instance(&self.client, &envelope)
+                    .await
+            }
+            HandlerKind::CognitionMemories => {
+                let envelope: CognitionDurableEnvelope<CognitionMemoryData> =
+                    parse_cognition_envelope(payload, CognitionDurableEntity::Memory)?;
+                self.persist_cognition_memory(&self.client, &envelope).await
+            }
+            HandlerKind::CognitionEpisodes => {
+                let envelope: CognitionDurableEnvelope<CognitionEpisodeData> =
+                    parse_cognition_envelope(payload, CognitionDurableEntity::Episode)?;
+                self.persist_cognition_episode(&self.client, &envelope)
+                    .await
+            }
         }
     }
 
@@ -809,6 +1064,491 @@ WHERE event_id = $2
         }
         Ok(())
     }
+
+    async fn persist_cognition_thread<C>(
+        &self,
+        db: &C,
+        envelope: &CognitionDurableEnvelope<CognitionThreadData>,
+    ) -> Result<(), StorageError>
+    where
+        C: GenericClient + Sync,
+    {
+        if matches!(envelope.op, CognitionDurableOp::Delete) {
+            db.execute(
+                "DELETE FROM cognition_threads WHERE thread_id = $1",
+                &[&envelope.entity_id],
+            )
+            .await?;
+            return Ok(());
+        }
+        let payload = json_value(&envelope.data)?;
+        db.execute(
+            r#"
+INSERT INTO cognition_threads (
+    thread_id, entity_version, writer, source_ts, latest_thread_seq,
+    src_ilk, dst_ilk, ich, status, first_seen_at, last_seen_at, turn_count, payload
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+ON CONFLICT (thread_id) DO UPDATE SET
+    entity_version = EXCLUDED.entity_version,
+    writer = EXCLUDED.writer,
+    source_ts = EXCLUDED.source_ts,
+    latest_thread_seq = EXCLUDED.latest_thread_seq,
+    src_ilk = EXCLUDED.src_ilk,
+    dst_ilk = EXCLUDED.dst_ilk,
+    ich = EXCLUDED.ich,
+    status = EXCLUDED.status,
+    first_seen_at = EXCLUDED.first_seen_at,
+    last_seen_at = EXCLUDED.last_seen_at,
+    turn_count = EXCLUDED.turn_count,
+    payload = EXCLUDED.payload,
+    updated_at = now()
+"#,
+            &[
+                &envelope.entity_id,
+                &(envelope.entity_version as i32),
+                &envelope.writer,
+                &envelope.ts,
+                &opt_i64(envelope.data.latest_thread_seq),
+                &envelope.data.src_ilk,
+                &envelope.data.dst_ilk,
+                &envelope.data.ich,
+                &envelope.data.status,
+                &envelope.data.first_seen_at,
+                &envelope.data.last_seen_at,
+                &opt_i64(envelope.data.turn_count),
+                &payload,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn persist_cognition_context<C>(
+        &self,
+        db: &C,
+        envelope: &CognitionDurableEnvelope<CognitionContextData>,
+    ) -> Result<(), StorageError>
+    where
+        C: GenericClient + Sync,
+    {
+        if matches!(envelope.op, CognitionDurableOp::Delete) {
+            db.execute(
+                "DELETE FROM cognition_contexts WHERE context_id = $1",
+                &[&envelope.entity_id],
+            )
+            .await?;
+            return Ok(());
+        }
+        let payload = json_value(&envelope.data)?;
+        let ilk_weights = json_value(&envelope.data.ilk_weights)?;
+        let ilk_profile = json_value(&envelope.data.ilk_profile)?;
+        db.execute(
+            r#"
+INSERT INTO cognition_contexts (
+    context_id, thread_id, scope_id, entity_version, writer, source_ts,
+    label, status, score, weight, weight_avg_cumulative, weight_avg_ema,
+    weight_samples, tags, ilk_weights, ilk_profile, opened_at, last_seen_at, closed_at, payload
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+ON CONFLICT (context_id) DO UPDATE SET
+    thread_id = EXCLUDED.thread_id,
+    scope_id = EXCLUDED.scope_id,
+    entity_version = EXCLUDED.entity_version,
+    writer = EXCLUDED.writer,
+    source_ts = EXCLUDED.source_ts,
+    label = EXCLUDED.label,
+    status = EXCLUDED.status,
+    score = EXCLUDED.score,
+    weight = EXCLUDED.weight,
+    weight_avg_cumulative = EXCLUDED.weight_avg_cumulative,
+    weight_avg_ema = EXCLUDED.weight_avg_ema,
+    weight_samples = EXCLUDED.weight_samples,
+    tags = EXCLUDED.tags,
+    ilk_weights = EXCLUDED.ilk_weights,
+    ilk_profile = EXCLUDED.ilk_profile,
+    opened_at = EXCLUDED.opened_at,
+    last_seen_at = EXCLUDED.last_seen_at,
+    closed_at = EXCLUDED.closed_at,
+    payload = EXCLUDED.payload,
+    updated_at = now()
+"#,
+            &[
+                &envelope.entity_id,
+                envelope
+                    .thread_id
+                    .as_ref()
+                    .ok_or_else(|| missing_field("thread_id"))?,
+                &envelope.data.scope_id,
+                &(envelope.entity_version as i32),
+                &envelope.writer,
+                &envelope.ts,
+                &envelope.data.label,
+                &normalized_status(&envelope.op, &envelope.data.status),
+                &envelope.data.score,
+                &envelope.data.weight,
+                &envelope.data.weight_avg_cumulative,
+                &envelope.data.weight_avg_ema,
+                &opt_i64(envelope.data.weight_samples),
+                &envelope.data.tags,
+                &ilk_weights,
+                &ilk_profile,
+                &envelope.data.opened_at,
+                &envelope.data.last_seen_at,
+                &envelope.data.closed_at,
+                &payload,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn persist_cognition_reason<C>(
+        &self,
+        db: &C,
+        envelope: &CognitionDurableEnvelope<CognitionReasonData>,
+    ) -> Result<(), StorageError>
+    where
+        C: GenericClient + Sync,
+    {
+        if matches!(envelope.op, CognitionDurableOp::Delete) {
+            db.execute(
+                "DELETE FROM cognition_reasons WHERE reason_id = $1",
+                &[&envelope.entity_id],
+            )
+            .await?;
+            return Ok(());
+        }
+        let payload = json_value(&envelope.data)?;
+        let ilk_weights = json_value(&envelope.data.ilk_weights)?;
+        let ilk_profile = json_value(&envelope.data.ilk_profile)?;
+        db.execute(
+            r#"
+INSERT INTO cognition_reasons (
+    reason_id, thread_id, scope_id, entity_version, writer, source_ts,
+    label, status, score, weight, weight_avg_cumulative, weight_avg_ema,
+    weight_samples, signals_canonical, signals_extra, ilk_weights, ilk_profile,
+    opened_at, last_seen_at, closed_at, payload
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+ON CONFLICT (reason_id) DO UPDATE SET
+    thread_id = EXCLUDED.thread_id,
+    scope_id = EXCLUDED.scope_id,
+    entity_version = EXCLUDED.entity_version,
+    writer = EXCLUDED.writer,
+    source_ts = EXCLUDED.source_ts,
+    label = EXCLUDED.label,
+    status = EXCLUDED.status,
+    score = EXCLUDED.score,
+    weight = EXCLUDED.weight,
+    weight_avg_cumulative = EXCLUDED.weight_avg_cumulative,
+    weight_avg_ema = EXCLUDED.weight_avg_ema,
+    weight_samples = EXCLUDED.weight_samples,
+    signals_canonical = EXCLUDED.signals_canonical,
+    signals_extra = EXCLUDED.signals_extra,
+    ilk_weights = EXCLUDED.ilk_weights,
+    ilk_profile = EXCLUDED.ilk_profile,
+    opened_at = EXCLUDED.opened_at,
+    last_seen_at = EXCLUDED.last_seen_at,
+    closed_at = EXCLUDED.closed_at,
+    payload = EXCLUDED.payload,
+    updated_at = now()
+"#,
+            &[
+                &envelope.entity_id,
+                envelope
+                    .thread_id
+                    .as_ref()
+                    .ok_or_else(|| missing_field("thread_id"))?,
+                &envelope.data.scope_id,
+                &(envelope.entity_version as i32),
+                &envelope.writer,
+                &envelope.ts,
+                &envelope.data.label,
+                &normalized_status(&envelope.op, &envelope.data.status),
+                &envelope.data.score,
+                &envelope.data.weight,
+                &envelope.data.weight_avg_cumulative,
+                &envelope.data.weight_avg_ema,
+                &opt_i64(envelope.data.weight_samples),
+                &envelope.data.signals_canonical,
+                &envelope.data.signals_extra,
+                &ilk_weights,
+                &ilk_profile,
+                &envelope.data.opened_at,
+                &envelope.data.last_seen_at,
+                &envelope.data.closed_at,
+                &payload,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn persist_cognition_scope<C>(
+        &self,
+        db: &C,
+        envelope: &CognitionDurableEnvelope<CognitionScopeData>,
+    ) -> Result<(), StorageError>
+    where
+        C: GenericClient + Sync,
+    {
+        if matches!(envelope.op, CognitionDurableOp::Delete) {
+            db.execute(
+                "DELETE FROM cognition_scopes WHERE scope_id = $1",
+                &[&envelope.entity_id],
+            )
+            .await?;
+            return Ok(());
+        }
+        let payload = json_value(&envelope.data)?;
+        db.execute(
+            r#"
+INSERT INTO cognition_scopes (
+    scope_id, entity_version, writer, source_ts, label, status,
+    dominant_context_id, dominant_reason_id, binding_energy_ema,
+    opened_at, last_seen_at, closed_at, payload
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+ON CONFLICT (scope_id) DO UPDATE SET
+    entity_version = EXCLUDED.entity_version,
+    writer = EXCLUDED.writer,
+    source_ts = EXCLUDED.source_ts,
+    label = EXCLUDED.label,
+    status = EXCLUDED.status,
+    dominant_context_id = EXCLUDED.dominant_context_id,
+    dominant_reason_id = EXCLUDED.dominant_reason_id,
+    binding_energy_ema = EXCLUDED.binding_energy_ema,
+    opened_at = EXCLUDED.opened_at,
+    last_seen_at = EXCLUDED.last_seen_at,
+    closed_at = EXCLUDED.closed_at,
+    payload = EXCLUDED.payload,
+    updated_at = now()
+"#,
+            &[
+                &envelope.entity_id,
+                &(envelope.entity_version as i32),
+                &envelope.writer,
+                &envelope.ts,
+                &envelope.data.label,
+                &normalized_status(&envelope.op, &envelope.data.status),
+                &envelope.data.dominant_context_id,
+                &envelope.data.dominant_reason_id,
+                &envelope.data.binding_energy_ema,
+                &envelope.data.opened_at,
+                &envelope.data.last_seen_at,
+                &envelope.data.closed_at,
+                &payload,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn persist_cognition_scope_instance<C>(
+        &self,
+        db: &C,
+        envelope: &CognitionDurableEnvelope<CognitionScopeInstanceData>,
+    ) -> Result<(), StorageError>
+    where
+        C: GenericClient + Sync,
+    {
+        if matches!(envelope.op, CognitionDurableOp::Delete) {
+            db.execute(
+                "DELETE FROM cognition_scope_instances WHERE scope_instance_id = $1",
+                &[&envelope.entity_id],
+            )
+            .await?;
+            return Ok(());
+        }
+        let payload = json_value(&envelope.data)?;
+        db.execute(
+            r#"
+INSERT INTO cognition_scope_instances (
+    scope_instance_id, thread_id, scope_id, entity_version, writer, source_ts,
+    dominant_context_id, dominant_reason_id, start_thread_seq, end_thread_seq,
+    opened_at, closed_at, payload
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+ON CONFLICT (scope_instance_id) DO UPDATE SET
+    thread_id = EXCLUDED.thread_id,
+    scope_id = EXCLUDED.scope_id,
+    entity_version = EXCLUDED.entity_version,
+    writer = EXCLUDED.writer,
+    source_ts = EXCLUDED.source_ts,
+    dominant_context_id = EXCLUDED.dominant_context_id,
+    dominant_reason_id = EXCLUDED.dominant_reason_id,
+    start_thread_seq = EXCLUDED.start_thread_seq,
+    end_thread_seq = EXCLUDED.end_thread_seq,
+    opened_at = EXCLUDED.opened_at,
+    closed_at = EXCLUDED.closed_at,
+    payload = EXCLUDED.payload,
+    updated_at = now()
+"#,
+            &[
+                &envelope.entity_id,
+                envelope
+                    .thread_id
+                    .as_ref()
+                    .ok_or_else(|| missing_field("thread_id"))?,
+                &envelope.data.scope_id,
+                &(envelope.entity_version as i32),
+                &envelope.writer,
+                &envelope.ts,
+                &envelope.data.dominant_context_id,
+                &envelope.data.dominant_reason_id,
+                &opt_i64(envelope.data.start_thread_seq),
+                &opt_i64(envelope.data.end_thread_seq),
+                &envelope.data.opened_at,
+                &envelope.data.closed_at,
+                &payload,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn persist_cognition_memory<C>(
+        &self,
+        db: &C,
+        envelope: &CognitionDurableEnvelope<CognitionMemoryData>,
+    ) -> Result<(), StorageError>
+    where
+        C: GenericClient + Sync,
+    {
+        if matches!(envelope.op, CognitionDurableOp::Delete) {
+            db.execute(
+                "DELETE FROM cognition_memories WHERE memory_id = $1",
+                &[&envelope.entity_id],
+            )
+            .await?;
+            return Ok(());
+        }
+        let payload = json_value(&envelope.data)?;
+        let ilk_weights = json_value(&envelope.data.ilk_weights)?;
+        db.execute(
+            r#"
+INSERT INTO cognition_memories (
+    memory_id, thread_id, scope_id, entity_version, writer, source_ts,
+    summary, weight, occurrences, dominant_context_id, dominant_reason_id,
+    ilk_weights, created_at, last_seen_at, payload
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+ON CONFLICT (memory_id) DO UPDATE SET
+    thread_id = EXCLUDED.thread_id,
+    scope_id = EXCLUDED.scope_id,
+    entity_version = EXCLUDED.entity_version,
+    writer = EXCLUDED.writer,
+    source_ts = EXCLUDED.source_ts,
+    summary = EXCLUDED.summary,
+    weight = EXCLUDED.weight,
+    occurrences = EXCLUDED.occurrences,
+    dominant_context_id = EXCLUDED.dominant_context_id,
+    dominant_reason_id = EXCLUDED.dominant_reason_id,
+    ilk_weights = EXCLUDED.ilk_weights,
+    created_at = EXCLUDED.created_at,
+    last_seen_at = EXCLUDED.last_seen_at,
+    payload = EXCLUDED.payload,
+    updated_at = now()
+"#,
+            &[
+                &envelope.entity_id,
+                envelope
+                    .thread_id
+                    .as_ref()
+                    .ok_or_else(|| missing_field("thread_id"))?,
+                &envelope.data.scope_id,
+                &(envelope.entity_version as i32),
+                &envelope.writer,
+                &envelope.ts,
+                &envelope.data.summary,
+                &envelope.data.weight,
+                &opt_i64(envelope.data.occurrences),
+                &envelope.data.dominant_context_id,
+                &envelope.data.dominant_reason_id,
+                &ilk_weights,
+                &envelope.data.created_at,
+                &envelope.data.last_seen_at,
+                &payload,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn persist_cognition_episode<C>(
+        &self,
+        db: &C,
+        envelope: &CognitionDurableEnvelope<CognitionEpisodeData>,
+    ) -> Result<(), StorageError>
+    where
+        C: GenericClient + Sync,
+    {
+        if matches!(envelope.op, CognitionDurableOp::Delete) {
+            db.execute(
+                "DELETE FROM cognition_episodes WHERE episode_id = $1",
+                &[&envelope.entity_id],
+            )
+            .await?;
+            return Ok(());
+        }
+        let payload = json_value(&envelope.data)?;
+        db.execute(
+            r#"
+INSERT INTO cognition_episodes (
+    episode_id, thread_id, scope_id, entity_version, writer, source_ts,
+    affect_id, title, summary, base_intensity, evidence_strength,
+    evidence_context_ids, evidence_reason_ids, evidence_signals,
+    intensity, reason, created_at, payload
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+ON CONFLICT (episode_id) DO UPDATE SET
+    thread_id = EXCLUDED.thread_id,
+    scope_id = EXCLUDED.scope_id,
+    entity_version = EXCLUDED.entity_version,
+    writer = EXCLUDED.writer,
+    source_ts = EXCLUDED.source_ts,
+    affect_id = EXCLUDED.affect_id,
+    title = EXCLUDED.title,
+    summary = EXCLUDED.summary,
+    base_intensity = EXCLUDED.base_intensity,
+    evidence_strength = EXCLUDED.evidence_strength,
+    evidence_context_ids = EXCLUDED.evidence_context_ids,
+    evidence_reason_ids = EXCLUDED.evidence_reason_ids,
+    evidence_signals = EXCLUDED.evidence_signals,
+    intensity = EXCLUDED.intensity,
+    reason = EXCLUDED.reason,
+    created_at = EXCLUDED.created_at,
+    payload = EXCLUDED.payload,
+    updated_at = now()
+"#,
+            &[
+                &envelope.entity_id,
+                envelope
+                    .thread_id
+                    .as_ref()
+                    .ok_or_else(|| missing_field("thread_id"))?,
+                &envelope.data.scope_id,
+                &(envelope.entity_version as i32),
+                &envelope.writer,
+                &envelope.ts,
+                &envelope.data.affect_id,
+                &envelope.data.title,
+                &envelope.data.summary,
+                &envelope.data.base_intensity,
+                &envelope.data.evidence_strength,
+                &envelope.data.evidence_context_ids,
+                &envelope.data.evidence_reason_ids,
+                &envelope.data.evidence_signals,
+                &envelope.data.intensity,
+                &envelope.data.reason,
+                &envelope.data.created_at,
+                &payload,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 async fn run_turns_loop(
@@ -891,12 +1631,159 @@ async fn run_reactivation_loop(
     .await;
 }
 
+async fn run_cognition_threads_loop(
+    endpoint: String,
+    use_durable_consumer: bool,
+    storage: Arc<Storage>,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
+) {
+    run_subject_loop(
+        endpoint,
+        SUBJECT_STORAGE_COGNITION_THREADS,
+        14,
+        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_THREADS),
+        storage,
+        HandlerKind::CognitionThreads,
+        nats_subscribe_errors,
+        storage_handler_errors,
+    )
+    .await;
+}
+
+async fn run_cognition_contexts_loop(
+    endpoint: String,
+    use_durable_consumer: bool,
+    storage: Arc<Storage>,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
+) {
+    run_subject_loop(
+        endpoint,
+        SUBJECT_STORAGE_COGNITION_CONTEXTS,
+        15,
+        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_CONTEXTS),
+        storage,
+        HandlerKind::CognitionContexts,
+        nats_subscribe_errors,
+        storage_handler_errors,
+    )
+    .await;
+}
+
+async fn run_cognition_reasons_loop(
+    endpoint: String,
+    use_durable_consumer: bool,
+    storage: Arc<Storage>,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
+) {
+    run_subject_loop(
+        endpoint,
+        SUBJECT_STORAGE_COGNITION_REASONS,
+        16,
+        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_REASONS),
+        storage,
+        HandlerKind::CognitionReasons,
+        nats_subscribe_errors,
+        storage_handler_errors,
+    )
+    .await;
+}
+
+async fn run_cognition_scopes_loop(
+    endpoint: String,
+    use_durable_consumer: bool,
+    storage: Arc<Storage>,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
+) {
+    run_subject_loop(
+        endpoint,
+        SUBJECT_STORAGE_COGNITION_SCOPES,
+        17,
+        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_SCOPES),
+        storage,
+        HandlerKind::CognitionScopes,
+        nats_subscribe_errors,
+        storage_handler_errors,
+    )
+    .await;
+}
+
+async fn run_cognition_scope_instances_loop(
+    endpoint: String,
+    use_durable_consumer: bool,
+    storage: Arc<Storage>,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
+) {
+    run_subject_loop(
+        endpoint,
+        SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES,
+        18,
+        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_SCOPE_INSTANCES),
+        storage,
+        HandlerKind::CognitionScopeInstances,
+        nats_subscribe_errors,
+        storage_handler_errors,
+    )
+    .await;
+}
+
+async fn run_cognition_memories_loop(
+    endpoint: String,
+    use_durable_consumer: bool,
+    storage: Arc<Storage>,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
+) {
+    run_subject_loop(
+        endpoint,
+        SUBJECT_STORAGE_COGNITION_MEMORIES,
+        19,
+        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_MEMORIES),
+        storage,
+        HandlerKind::CognitionMemories,
+        nats_subscribe_errors,
+        storage_handler_errors,
+    )
+    .await;
+}
+
+async fn run_cognition_episodes_loop(
+    endpoint: String,
+    use_durable_consumer: bool,
+    storage: Arc<Storage>,
+    nats_subscribe_errors: Arc<AtomicU64>,
+    storage_handler_errors: Arc<AtomicU64>,
+) {
+    run_subject_loop(
+        endpoint,
+        SUBJECT_STORAGE_COGNITION_EPISODES,
+        20,
+        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_EPISODES),
+        storage,
+        HandlerKind::CognitionEpisodes,
+        nats_subscribe_errors,
+        storage_handler_errors,
+    )
+    .await;
+}
+
 #[derive(Clone, Copy)]
 enum HandlerKind {
     Turns,
     Events,
     Items,
     Reactivation,
+    CognitionThreads,
+    CognitionContexts,
+    CognitionReasons,
+    CognitionScopes,
+    CognitionScopeInstances,
+    CognitionMemories,
+    CognitionEpisodes,
 }
 
 struct InboxMetrics {
@@ -911,6 +1798,13 @@ fn handler_kind_for_subject(subject: &str) -> Option<HandlerKind> {
         SUBJECT_STORAGE_EVENTS => Some(HandlerKind::Events),
         SUBJECT_STORAGE_ITEMS => Some(HandlerKind::Items),
         SUBJECT_STORAGE_REACTIVATION => Some(HandlerKind::Reactivation),
+        SUBJECT_STORAGE_COGNITION_THREADS => Some(HandlerKind::CognitionThreads),
+        SUBJECT_STORAGE_COGNITION_CONTEXTS => Some(HandlerKind::CognitionContexts),
+        SUBJECT_STORAGE_COGNITION_REASONS => Some(HandlerKind::CognitionReasons),
+        SUBJECT_STORAGE_COGNITION_SCOPES => Some(HandlerKind::CognitionScopes),
+        SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES => Some(HandlerKind::CognitionScopeInstances),
+        SUBJECT_STORAGE_COGNITION_MEMORIES => Some(HandlerKind::CognitionMemories),
+        SUBJECT_STORAGE_COGNITION_EPISODES => Some(HandlerKind::CognitionEpisodes),
         _ => None,
     }
 }
@@ -1565,6 +2459,48 @@ fn parse_reactivation_payload(value: Value) -> Result<ReactivationPayload, Stora
         outcome_ok,
         events: parsed,
     })
+}
+
+fn parse_cognition_envelope<T>(
+    payload: &[u8],
+    expected: CognitionDurableEntity,
+) -> Result<CognitionDurableEnvelope<T>, StorageError>
+where
+    T: DeserializeOwned,
+{
+    let envelope: CognitionDurableEnvelope<T> = serde_json::from_slice(payload)?;
+    if envelope.entity != expected {
+        return Err(format!(
+            "invalid payload: cognition entity mismatch (expected {:?}, got {:?})",
+            expected, envelope.entity
+        )
+        .into());
+    }
+    if envelope.entity.requires_thread_id()
+        && envelope
+            .thread_id
+            .as_deref()
+            .map_or(true, |value| value.trim().is_empty())
+    {
+        return Err(missing_field("thread_id"));
+    }
+    Ok(envelope)
+}
+
+fn json_value<T: Serialize>(value: &T) -> Result<Value, StorageError> {
+    Ok(serde_json::to_value(value)?)
+}
+
+fn opt_i64(value: Option<u64>) -> Option<i64> {
+    value.and_then(|v| i64::try_from(v).ok())
+}
+
+fn normalized_status(op: &CognitionDurableOp, status: &str) -> String {
+    if matches!(op, CognitionDurableOp::Close) {
+        "closed".to_string()
+    } else {
+        status.to_string()
+    }
 }
 
 fn missing_field(field: &str) -> StorageError {
