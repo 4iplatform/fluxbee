@@ -13,7 +13,21 @@ Incluye dos runtimes mínimos:
 - `IO.test.cognition`: emisor disposable para E2E de cognition por router con
   `thread_id` canónico.
 - `AI.test.cognition`: receptor disposable que captura
-  `thread_id/thread_seq/memory_package` y responde con observaciones.
+  `trace_id/ich/thread_id/thread_seq/context/memory_package` y responde con observaciones.
+
+### E2E cognition por router: qué valida hoy
+
+El par `IO.test.cognition` + `AI.test.cognition` valida el carrier real por
+router, no un publish lateral a NATS. El chequeo actual cubre:
+
+- preservación de `trace_id`
+- preservación de `ich`
+- entrega al receptor esperado
+- `msg_type=user`
+- preservación de `thread_id`
+- asignación monotónica de `thread_seq`
+- presencia de `meta.context.probe_id/probe_step`
+- enrichment posterior con `memory_package`
 
 ## Objetivo
 

@@ -15,6 +15,16 @@ use uuid::Uuid;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
+#[derive(Debug, Clone, Copy)]
+struct CarrierValidation {
+    trace_ok: bool,
+    receiver_ok: bool,
+    msg_type_ok: bool,
+    thread_id_ok: bool,
+    ich_ok: bool,
+    context_ok: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
     tracing_subscriber::fmt()
@@ -50,6 +60,13 @@ async fn main() -> Result<(), DynError> {
     let mut first_observation = None;
     let mut final_observation = None;
     let mut success_step = None;
+    let mut trace_ok_all = true;
+    let mut receiver_ok_all = true;
+    let mut msg_type_ok_all = true;
+    let mut thread_id_ok_all = true;
+    let mut ich_ok_all = true;
+    let mut context_ok_all = true;
+    let expected_ich = format!("io.test.cognition://{}", probe_id);
 
     for step in 1..=max_steps {
         if step > 1 {
@@ -62,14 +79,30 @@ async fn main() -> Result<(), DynError> {
             .get("observation")
             .cloned()
             .unwrap_or(Value::Null);
+        let validation = validate_observation(
+            &observation,
+            &trace_id,
+            &target,
+            &probe_id,
+            step,
+            &thread_id,
+            &expected_ich,
+        )?;
         let memory_package_present = observation
             .get("memory_package_present")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        trace_ok_all &= validation.trace_ok;
+        receiver_ok_all &= validation.receiver_ok;
+        msg_type_ok_all &= validation.msg_type_ok;
+        thread_id_ok_all &= validation.thread_id_ok;
+        ich_ok_all &= validation.ich_ok;
+        context_ok_all &= validation.context_ok;
 
         tracing::info!(
             step,
             trace_id = %trace_id,
+            carrier_check = ?validation,
             memory_package_present,
             observation = %observation,
             "IO.test.cognition received reply"
@@ -104,6 +137,12 @@ async fn main() -> Result<(), DynError> {
     println!("THREAD_ID={thread_id}");
     println!("STEPS_USED={}", success_step.unwrap_or(max_steps));
     println!("MEMORY_PACKAGE_PRESENT={memory_package_present}");
+    println!("TRACE_ID_OK={trace_ok_all}");
+    println!("ICH_OK={ich_ok_all}");
+    println!("MSG_TYPE_OK={msg_type_ok_all}");
+    println!("THREAD_ID_OK={thread_id_ok_all}");
+    println!("RECEIVER_OK={receiver_ok_all}");
+    println!("CONTEXT_OK={context_ok_all}");
     if let Some(observation) = first_observation {
         println!(
             "FIRST_THREAD_SEQ={}",
@@ -143,6 +182,69 @@ async fn main() -> Result<(), DynError> {
         serde_json::to_string(&final_observation)?
     );
     Ok(())
+}
+
+fn validate_observation(
+    observation: &Value,
+    expected_trace_id: &str,
+    expected_receiver: &str,
+    expected_probe_id: &str,
+    expected_probe_step: u64,
+    expected_thread_id: &str,
+    expected_ich: &str,
+) -> Result<CarrierValidation, DynError> {
+    let trace_ok = observation.get("trace_id").and_then(Value::as_str) == Some(expected_trace_id);
+    let receiver_ok =
+        observation.get("receiver").and_then(Value::as_str) == Some(expected_receiver);
+    let probe_id_ok =
+        observation.get("probe_id").and_then(Value::as_str) == Some(expected_probe_id);
+    let probe_step_ok =
+        observation.get("probe_step").and_then(Value::as_u64) == Some(expected_probe_step);
+    let msg_type_ok = observation.get("msg_type").and_then(Value::as_str) == Some("user");
+    let thread_id_ok =
+        observation.get("thread_id").and_then(Value::as_str) == Some(expected_thread_id);
+    let ich_ok = observation.get("ich").and_then(Value::as_str) == Some(expected_ich);
+    let context = observation.get("context").unwrap_or(&Value::Null);
+    let context_probe_id_ok =
+        context.get("probe_id").and_then(Value::as_str) == Some(expected_probe_id);
+    let context_probe_step_ok =
+        context.get("probe_step").and_then(Value::as_u64) == Some(expected_probe_step);
+
+    let context_ok = context_probe_id_ok && context_probe_step_ok;
+    let ok = trace_ok
+        && receiver_ok
+        && probe_id_ok
+        && probe_step_ok
+        && msg_type_ok
+        && thread_id_ok
+        && ich_ok
+        && context_ok;
+
+    if !ok {
+        return Err(format!(
+            "carrier validation failed trace_ok={} receiver_ok={} probe_id_ok={} probe_step_ok={} msg_type_ok={} thread_id_ok={} ich_ok={} context_probe_id_ok={} context_probe_step_ok={} observation={}",
+            trace_ok,
+            receiver_ok,
+            probe_id_ok,
+            probe_step_ok,
+            msg_type_ok,
+            thread_id_ok,
+            ich_ok,
+            context_probe_id_ok,
+            context_probe_step_ok,
+            serde_json::to_string(observation)?
+        )
+        .into());
+    }
+
+    Ok(CarrierValidation {
+        trace_ok,
+        receiver_ok,
+        msg_type_ok,
+        thread_id_ok,
+        ich_ok,
+        context_ok,
+    })
 }
 
 fn resolve_thread_id(hive_id: &str, probe_id: &str) -> Result<String, DynError> {

@@ -1092,7 +1092,7 @@ Both coexist. Neither replaces the other.
 
 Validation note:
 - The canonical E2E for cognition v2 must enter through the router path with real/disposable nodes.
-- Direct publish to `storage.turns` is useful as a laboratory diagnostic for `SY.cognition` and `SY.storage`, but it is not the normative end-to-end path because it bypasses router/IO carrier shaping and delivery semantics.
+- The old direct publish-to-`storage.turns` smoke was removed from the repo to avoid confusing it with the normative path.
 - PostgreSQL is not the primary oracle for the cognition E2E. The primary oracle is delivery to the destination node plus `jsr-memory` and `SY.cognition` runtime counters.
 
 - [ ] COG-T27. E2E: message → tagger → context + reason created.
@@ -1101,6 +1101,20 @@ Validation note:
 - [ ] COG-T30. E2E: episode with evidence from both context and reason.
 - [ ] COG-T31. E2E: router enrichment → memory_package with reasons.
 - [ ] COG-T32. E2E: cold start → rebuild from PostgreSQL.
+
+### Phase 9 — Semantic Upgrade (Second Stage)
+
+- [ ] COG-T33. Introduce `AI.tagger` as an operational upgrade under the same `tags + reason_signals_*` contract.
+- [ ] COG-T34. Keep deterministic v1 tagger as fallback/runtime rollback path.
+- [ ] COG-T35. Improve semantic extraction for tags:
+  - paraphrases
+  - implicit intent
+  - soft entities from the message narrative
+- [ ] COG-T36. Improve semantic extraction for canonical reason signals while preserving the closed 8-signal evaluator contract.
+- [ ] COG-T37. Use `reason_signals_extra` as narrative evidence input for memory generation, not only as stored text.
+- [ ] COG-T38. Upgrade the summarizer/memory generator from deterministic lexical fusion to semantic narrative synthesis.
+- [ ] COG-T39. Build a golden corpus to compare deterministic v1 vs semantic v2 outputs.
+- [ ] COG-T40. Define rollback semantics: if the AI provider is unavailable, cognition falls back to deterministic v1 without changing carrier or durable entities.
 
 ---
 

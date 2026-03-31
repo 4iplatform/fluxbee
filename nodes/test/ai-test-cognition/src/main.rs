@@ -65,8 +65,10 @@ async fn run_loop(sender: &NodeSender, receiver: &mut NodeReceiver) -> Result<()
             "probe_id": probe_id,
             "probe_step": probe_step,
             "msg_type": msg.meta.msg_type,
+            "ich": msg.meta.ich,
             "thread_id": msg.meta.thread_id,
             "thread_seq": msg.meta.thread_seq,
+            "context": msg.meta.context,
             "text": text,
             "memory_package_present": memory_package.is_some(),
             "memory_package": memory_package.as_ref().map(|package| json!({

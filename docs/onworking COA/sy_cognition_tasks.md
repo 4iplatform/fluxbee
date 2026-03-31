@@ -20,6 +20,27 @@ Conclusión:
 - esto no es una iteración menor
 - es una **migración fundacional** de protocolo + SDK + router + IO + storage + AI + nuevo servicio `SY.cognition`
 
+Alcance funcional real por olas:
+- la ola ya implementada deja a `SY.cognition` como pipeline cognitivo v2 estructural y operativo:
+  - consume turns reales
+  - secuencia por `thread`
+  - produce `contexts`, `reasons`, `scopes`, `memories`, `episodes`
+  - escribe `jsr-memory`
+  - enriquece entrega real por router
+- pero esa ola **no agota** cognition:
+  - el tagger actual es lexical/determinístico
+  - la lectura semántica profunda del contenido del mensaje todavía no está resuelta
+  - la narrativa de memories/episodes sigue siendo v1 determinística
+- dicho de otra manera:
+  - la ola actual evita que cognition sea un simple pasamanos de mensajes
+  - pero todavía no es la etapa semántica/plena de análisis de contenido
+  - esa segunda ola queda formalmente tratada como `COG-M11` y debe considerarse parte del desarrollo real de cognition v2, aunque entre después
+
+Nota de planificación:
+- a nivel práctico, `COG-M11` funciona como un “spring 2” del sistema cognitivo
+- no es un opcional cosmético
+- es la etapa donde cognition pasa de pipeline estructural estable a análisis semántico más profundo
+
 ---
 
 ## 1) Decisiones ya cerradas
@@ -158,11 +179,21 @@ No construir una v2 “chiquita” con contrato incompleto, porque después cues
 ### 4.3 Arrancar Reason Evaluator determinístico
 
 Para v1 de ejecución:
-- tagger AI para:
+- tagger con contrato ya preparado para:
   - `tags`
   - `reason_signals_canonical`
   - `reason_signals_extra`
+- implementación inicial determinística/lexical del tagger
 - reason evaluator determinístico sobre las 8 commandments
+
+Segunda etapa explícita sobre el mismo contrato:
+- tagger AI/semántico para extraer `tags` y reason signals con mejor recall
+- análisis narrativo del contenido para memories/summaries sin cambiar las entidades v2
+- el salto de v1 determinística a v2 semántica debe cambiar el motor, no el carrier ni el durable model
+
+Consecuencia importante:
+- si no se hace esta segunda etapa, cognition queda funcional y útil, pero con comprensión semántica acotada
+- por eso `COG-M11` no debe perderse como backlog menor ni quedar implícito
 
 Esto reduce costo y estabiliza comportamiento.
 
@@ -433,6 +464,11 @@ Estado actual:
 - el tagger v1 actual es determinístico/lexical; la mejora futura a AI tagger queda abierta sin cambiar el contrato
 - `M5` queda cerrado con co-ocurrencias explícitas thread-scoped; el siguiente frente real ya es `M6+`
 
+Límite explícito de esta fase:
+- `M5` deja resuelto el pipeline cognitivo estructural mínimo
+- `M5` no resuelve todavía comprensión semántica profunda del texto
+- esa deuda no es un detalle: queda trasladada de forma explícita a `COG-M11`
+
 ### Fase COG-M6 - Scope + binding + periodización
 
 - [x] COG-M6-T1. Definir algoritmo de asociación thread → scope actual.
@@ -529,14 +565,9 @@ Estado actual:
   - shapes/documentación v1 incompatibles
 
 Estado actual:
-- existe smoke operativo de laboratorio:
-  - [`scripts/cognition_e2e_smoke.sh`](/Users/cagostino/Documents/GitHub/fluxbee/scripts/cognition_e2e_smoke.sh)
-  - publica directo a `storage.turns`
-  - valida `cognition_threads/contexts/reasons/scope_instances/memories/episodes`
-  - valida `jsr-memory` por `thread_id` con [`cognition_shm_dump.rs`](/Users/cagostino/Documents/GitHub/fluxbee/src/bin/cognition_shm_dump.rs)
-- sirve para diagnóstico de laboratorio del boundary `storage.turns -> SY.cognition -> storage.cognition.* -> jsr-memory`
-- no debe considerarse el E2E canónico del sistema porque bypassa router/IO y puede no reproducir el shape real del carrier
-- sigue pendiente el E2E canónico de router enrichment real sobre entrega a nodo destino
+- el E2E canónico ya quedó redirigido al path real por router con nodos disposable
+- se removió el smoke viejo por publish directo a `storage.turns` para no dejar una ruta muerta o engañosa en el repo
+- [`cognition_shm_dump.rs`](/Users/cagostino/Documents/GitHub/fluxbee/src/bin/cognition_shm_dump.rs) queda como herramienta de diagnóstico puntual de SHM, no como E2E
 
 Rediseño acordado de `COG-M10-T4`:
 - el E2E oficial debe entrar por router, no por publish directo a NATS
@@ -554,12 +585,62 @@ Subtareas nuevas de `COG-M10-T4`:
 - [ ] COG-M10-T4d. Validar que `SY.cognition` procesa el turn real y sube contadores (`processed_turns_total`, `published_entities_total`).
 - [ ] COG-M10-T4e. Validar que `jsr-memory` contiene `memory_package` para ese `thread_id`.
 - [ ] COG-M10-T4f. Validar que el nodo destino recibe el mensaje enriquecido con `memory_package`.
-- [ ] COG-M10-T4g. Mantener el smoke por `storage.turns` solo como `lab-only`, sin promocionarlo a prueba canónica.
 
 Estado actual:
 - [x] `IO.test.cognition` creado en [`nodes/test/io-test-cognition`](/Users/cagostino/Documents/GitHub/fluxbee/nodes/test/io-test-cognition)
 - [x] `AI.test.cognition` creado en [`nodes/test/ai-test-cognition`](/Users/cagostino/Documents/GitHub/fluxbee/nodes/test/ai-test-cognition)
-- [ ] sigue pendiente correr la validación operativa real y marcar `T4c..T4f`
+- [x] validación operativa real corrida en `motherbee`
+- [x] COG-M10-T4c. El router asigna `thread_seq` en el carrier real.
+- [x] COG-M10-T4d. `SY.cognition` procesa el turn real y produce enrichment observable.
+- [x] COG-M10-T4e. `jsr-memory` queda reflejada indirectamente por `memory_package` observable en entrega real.
+- [x] COG-M10-T4f. El nodo destino recibe el mensaje enriquecido con `memory_package`.
+- [x] El harness E2E real también valida integridad básica del carrier:
+  - `trace_id`
+  - `ich`
+  - `msg_type`
+  - `thread_id`
+  - `thread_seq`
+  - `meta.context.probe_id/probe_step`
+  - receptor esperado
+
+Hallazgo de la corrida real:
+- step 1 llegó al receptor con `thread_seq=1` y sin `memory_package`
+- step 2 llegó con `thread_seq=3` y con `memory_package`
+- la secuencia `1 -> 3` es consistente con el harness actual porque el reply del nodo receptor reutiliza el mismo `thread_id`, por lo que el router consume `thread_seq=2` en ese reply intermedio
+- esto confirma monotonicidad por thread; no implica salto espurio del router
+
+### Fase COG-M11 - Segunda etapa semántica: AI tagger + análisis narrativo
+
+Definición de alcance:
+- esta fase convierte a cognition desde un pipeline estructural determinístico hacia una capa con lectura semántica real del contenido
+- sin `M11`, el sistema ya clasifica, agrupa, periodiza y enriquece, pero lo hace con una semántica v1 todavía limitada
+- `M11` es la fase que completa el tratamiento del contenido del mensaje como problema cognitivo de primer orden
+- por eso debe pensarse como segunda gran ola del proyecto, no como ajuste fino posterior
+
+- [ ] COG-M11-T1. Diseñar contrato operacional del `AI.tagger` sin cambiar `tags/reason_signals_*`.
+- [ ] COG-M11-T2. Separar explícitamente `tagger v1 lexical` de `tagger v2 semantic/AI` con feature flag o config de provider.
+- [ ] COG-M11-T3. Mejorar extracción semántica de `tags`:
+  - sinonimia
+  - paráfrasis
+  - intents implícitos
+  - entidades blandas del relato
+- [ ] COG-M11-T4. Mejorar extracción semántica de `reason_signals_canonical`:
+  - mejor recall sobre mandato implícito
+  - mejor discriminación entre `request/resolve/challenge/protect`
+- [ ] COG-M11-T5. Usar `reason_signals_extra` como evidencia narrativa real para memory fusion, no solo como bolsa de strings.
+- [ ] COG-M11-T6. Introducir summarizer narrativo v2 para memories/episodes:
+  - resumen más fiel del contenido del thread
+  - continuidad temporal
+  - síntesis de contexto + razón + evidencia textual
+- [ ] COG-M11-T7. Definir corpus/golden tests para comparar v1 lexical vs v2 semantic.
+- [ ] COG-M11-T8. Definir política de rollback:
+  - si falla el provider AI, cae a tagger/summarizer v1 sin romper el contrato
+
+Objetivo:
+- tratar el análisis de contenido del mensaje como una segunda ola explícita
+- mantener estable el pipeline y el durable model ya cerrados
+- mejorar calidad semántica sin volver a abrir `thread/context/reason/scope/memory/episode`
+- dejar documentado que, hasta completar esta fase, cognition no debe venderse internamente como análisis semántico pleno sino como v2 estructural + enrichment operativo
 
 ---
 
