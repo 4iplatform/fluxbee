@@ -4179,6 +4179,9 @@ async fn handle_node_control_command(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
+    let timeout_window = admin_action_timeout(action)
+        .checked_sub(Duration::from_secs(5))
+        .unwrap_or_else(|| Duration::from_secs(25));
     let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
     let mut payload_map = payload
         .as_object()
@@ -4258,7 +4261,7 @@ async fn handle_node_control_command(
         Some("node_config_control".to_string()),
         Some(request_msg.to_string()),
         context,
-        admin_action_timeout(action),
+        timeout_window,
     )
     .await;
 

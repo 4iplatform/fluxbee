@@ -1705,6 +1705,15 @@ async fn process_router_message(
     control_state: &mut StorageControlState,
     node_name: &str,
 ) -> Result<(), StorageError> {
+    tracing::info!(
+        node_name = %node_name,
+        trace_id = %msg.routing.trace_id,
+        msg_type = %msg.meta.msg_type,
+        msg = msg.meta.msg.as_deref().unwrap_or(""),
+        action = msg.meta.action.as_deref().unwrap_or(""),
+        target = msg.meta.target.as_deref().unwrap_or(""),
+        "sy.storage received router message"
+    );
     if try_handle_default_node_status(sender, msg).await? {
         return Ok(());
     }
@@ -1717,12 +1726,25 @@ async fn process_router_message(
     match command {
         "CONFIG_GET" => {
             let payload = build_storage_config_get_payload(node_name, control_state, None);
+            tracing::info!(
+                node_name = %node_name,
+                trace_id = %msg.routing.trace_id,
+                state = %storage_state_label(control_state.secret_source),
+                "sy.storage replying CONFIG_GET"
+            );
             sender
                 .send(build_node_config_response_message_runtime_src(msg, payload))
                 .await?;
         }
         "CONFIG_SET" => {
             let payload = apply_storage_config_set(msg, node_name, control_state)?;
+            tracing::info!(
+                node_name = %node_name,
+                trace_id = %msg.routing.trace_id,
+                state = %storage_state_label(control_state.secret_source),
+                config_version = control_state.config_version,
+                "sy.storage replying CONFIG_SET"
+            );
             sender
                 .send(build_node_config_response_message_runtime_src(msg, payload))
                 .await?;
