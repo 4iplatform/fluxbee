@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use base64::Engine as _;
 use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit, ResolveRetryConfig};
 use fluxbee_sdk::payload::TextV1Payload;
 use serde_json::Value;
@@ -55,6 +56,77 @@ impl Default for TextResponseOptions {
             message_overhead_bytes: fluxbee_sdk::blob::TEXT_V1_DEFAULT_OVERHEAD_BYTES,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedModelAttachment {
+    pub blob_ref: BlobRef,
+    pub path: PathBuf,
+    pub text_content: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedModelInput {
+    pub main_text: String,
+    pub prompt_text: String,
+    pub attachments: Vec<ResolvedModelAttachment>,
+}
+
+pub async fn build_openai_user_content_parts(
+    input: &ResolvedModelInput,
+) -> std::result::Result<Vec<Value>, ModelInputPayloadError> {
+    let mut parts = Vec::new();
+    if !input.main_text.trim().is_empty() {
+        parts.push(serde_json::json!({
+            "type": "input_text",
+            "text": input.main_text,
+        }));
+    }
+
+    for attachment in &input.attachments {
+        if let Some(text) = &attachment.text_content {
+            parts.push(serde_json::json!({
+                "type": "input_text",
+                "text": format!(
+                    "Attachment ({}, {}):\n{}",
+                    attachment.blob_ref.filename_original,
+                    attachment.blob_ref.mime,
+                    truncate_chars(text, 4000)
+                )
+            }));
+            continue;
+        }
+
+        if is_openai_image_mime(&attachment.blob_ref.mime) {
+            let bytes = tokio_fs::read(&attachment.path).await.map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    ModelInputPayloadError::BlobNotFound(format!(
+                        "Failed to read attachment blob '{}': {}",
+                        attachment.blob_ref.blob_name, err
+                    ))
+                } else {
+                    ModelInputPayloadError::BlobIo(format!(
+                        "Failed to read attachment blob '{}': {}",
+                        attachment.blob_ref.blob_name, err
+                    ))
+                }
+            })?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            let image_url = format!("data:{};base64,{}", attachment.blob_ref.mime, encoded);
+            parts.push(serde_json::json!({
+                "type": "input_image",
+                "image_url": image_url,
+            }));
+            continue;
+        }
+
+        return Err(ModelInputPayloadError::UnsupportedAttachmentMime(format!(
+            "mime '{}' is not supported for OpenAI multimodal input",
+            attachment.blob_ref.mime
+        )));
+    }
+
+    Ok(parts)
 }
 
 pub fn build_text_response_with_options(
@@ -130,19 +202,41 @@ impl ModelInputPayloadError {
 pub async fn build_model_input_from_payload(
     payload: &Value,
 ) -> std::result::Result<String, ModelInputPayloadError> {
-    build_model_input_from_payload_with_options(payload, &ModelInputOptions::default()).await
+    let resolved =
+        resolve_model_input_from_payload_with_options(payload, &ModelInputOptions::default())
+            .await?;
+    Ok(resolved.prompt_text)
 }
 
 pub async fn build_model_input_from_payload_with_options(
     payload: &Value,
     options: &ModelInputOptions,
 ) -> std::result::Result<String, ModelInputPayloadError> {
+    let resolved = resolve_model_input_from_payload_with_options(payload, options).await?;
+    Ok(resolved.prompt_text)
+}
+
+pub async fn resolve_model_input_from_payload(
+    payload: &Value,
+) -> std::result::Result<ResolvedModelInput, ModelInputPayloadError> {
+    resolve_model_input_from_payload_with_options(payload, &ModelInputOptions::default()).await
+}
+
+pub async fn resolve_model_input_from_payload_with_options(
+    payload: &Value,
+    options: &ModelInputOptions,
+) -> std::result::Result<ResolvedModelInput, ModelInputPayloadError> {
     let is_text_v1 = payload
         .get("type")
         .and_then(Value::as_str)
         .is_some_and(|v| v.eq_ignore_ascii_case("text"));
     if !is_text_v1 {
-        return Ok(extract_text(payload).unwrap_or_default());
+        let main_text = extract_text(payload).unwrap_or_default();
+        return Ok(ResolvedModelInput {
+            prompt_text: main_text.clone(),
+            main_text,
+            attachments: Vec::new(),
+        });
     }
 
     let text_payload = TextV1Payload::from_value(payload).map_err(|err| {
@@ -158,7 +252,7 @@ pub async fn build_model_input_from_payload_with_options(
     }
 
     let blob = blob_toolkit(options.blob_root.as_ref())?;
-    let content = if let Some(inline) = text_payload.content {
+    let main_text = if let Some(inline) = text_payload.content {
         inline
     } else if let Some(content_ref) = text_payload.content_ref {
         validate_blob_limits(
@@ -172,9 +266,9 @@ pub async fn build_model_input_from_payload_with_options(
         String::new()
     };
 
+    let mut resolved_attachments = Vec::new();
     let mut attachment_blocks = Vec::new();
     for (idx, attachment) in text_payload.attachments.iter().enumerate() {
-        let slot = idx + 1;
         validate_blob_limits(
             attachment,
             options.max_attachment_bytes,
@@ -182,30 +276,53 @@ pub async fn build_model_input_from_payload_with_options(
             options.multimodal,
         )?;
 
+        let path =
+            resolve_blob_path(&blob, attachment, "attachments[]", options.resolve_retry).await?;
+        let mut text_content = None;
+        if is_textual_mime(&attachment.mime) {
+            text_content =
+                Some(load_blob_text_from_path(&path, attachment, "attachments[]").await?);
+        }
+        resolved_attachments.push(ResolvedModelAttachment {
+            blob_ref: attachment.clone(),
+            path: path.clone(),
+            text_content,
+        });
+
+        let slot = idx + 1;
         let mut block = format!(
-            "[attachment: {} | {} | {}]",
+            "[attachment #{slot}: {} | {} | {}]",
             attachment.filename_original, attachment.mime, attachment.size
         );
-        if is_textual_mime(&attachment.mime) {
-            let text =
-                load_blob_text(&blob, attachment, "attachments[]", options.resolve_retry).await?;
+        if let Some(text) = resolved_attachments
+            .last()
+            .and_then(|resolved| resolved.text_content.as_ref())
+        {
             block.push('\n');
-            block.push_str(&truncate_chars(&text, 4000));
+            block.push_str(&truncate_chars(text, 4000));
         }
         block.push_str("\n[attachment_end]");
         attachment_blocks.push(block);
     }
 
     if attachment_blocks.is_empty() {
-        return Ok(content);
+        return Ok(ResolvedModelInput {
+            prompt_text: main_text.clone(),
+            main_text,
+            attachments: resolved_attachments,
+        });
     }
 
-    let mut assembled = String::new();
-    assembled.push_str(&content);
-    assembled.push_str("\n\n--- attachments ---\n");
-    assembled.push_str(&attachment_blocks.join("\n\n"));
-    assembled.push_str("\n--- end attachments ---");
-    Ok(assembled)
+    let mut prompt_text = String::new();
+    prompt_text.push_str(&main_text);
+    prompt_text.push_str("\n\n--- attachments ---\n");
+    prompt_text.push_str(&attachment_blocks.join("\n\n"));
+    prompt_text.push_str("\n--- end attachments ---");
+    Ok(ResolvedModelInput {
+        main_text,
+        prompt_text,
+        attachments: resolved_attachments,
+    })
 }
 
 fn blob_toolkit(
@@ -218,7 +335,8 @@ fn blob_toolkit(
         .unwrap_or_else(|| "/var/lib/fluxbee/blob".to_string());
     let mut cfg = BlobConfig::default();
     cfg.blob_root = PathBuf::from(blob_root);
-    BlobToolkit::new(cfg).map_err(|err| ModelInputPayloadError::BlobToolkitUnavailable(err.to_string()))
+    BlobToolkit::new(cfg)
+        .map_err(|err| ModelInputPayloadError::BlobToolkitUnavailable(err.to_string()))
 }
 
 async fn load_blob_text(
@@ -227,7 +345,17 @@ async fn load_blob_text(
     field: &str,
     resolve_retry: Option<ResolveRetryConfig>,
 ) -> std::result::Result<String, ModelInputPayloadError> {
-    let path = if let Some(cfg) = resolve_retry {
+    let path = resolve_blob_path(blob, blob_ref, field, resolve_retry).await?;
+    load_blob_text_from_path(&path, blob_ref, field).await
+}
+
+async fn resolve_blob_path(
+    blob: &BlobToolkit,
+    blob_ref: &BlobRef,
+    field: &str,
+    resolve_retry: Option<ResolveRetryConfig>,
+) -> std::result::Result<PathBuf, ModelInputPayloadError> {
+    if let Some(cfg) = resolve_retry {
         blob.resolve_with_retry(blob_ref, cfg).await.map_err(|err| {
             if matches!(err, fluxbee_sdk::blob::BlobError::NotFound(_)) {
                 ModelInputPayloadError::BlobNotFound(format!(
@@ -240,11 +368,18 @@ async fn load_blob_text(
                     blob_ref.blob_name, err
                 ))
             }
-        })?
+        })
     } else {
-        blob.resolve(blob_ref)
-    };
-    let data = tokio_fs::read(&path).await.map_err(|err| {
+        Ok(blob.resolve(blob_ref))
+    }
+}
+
+async fn load_blob_text_from_path(
+    path: &PathBuf,
+    blob_ref: &BlobRef,
+    field: &str,
+) -> std::result::Result<String, ModelInputPayloadError> {
+    let data = tokio_fs::read(path).await.map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             ModelInputPayloadError::BlobNotFound(format!(
                 "Failed to resolve {field} blob '{}': {}",
@@ -261,10 +396,11 @@ async fn load_blob_text(
 }
 
 fn is_textual_mime(mime: &str) -> bool {
-    matches!(
-        mime,
-        "text/plain" | "text/markdown" | "application/json"
-    )
+    matches!(mime, "text/plain" | "text/markdown" | "application/json")
+}
+
+fn is_openai_image_mime(mime: &str) -> bool {
+    matches!(mime, "image/png" | "image/jpeg" | "image/webp")
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -309,6 +445,7 @@ mod tests {
     use super::*;
     use fluxbee_sdk::blob::BlobRef;
     use serde_json::json;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::time::{sleep, Duration};
@@ -505,6 +642,169 @@ mod tests {
             .expect("retry should resolve late blob");
         assert_eq!(out, "hola tardio");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn resolve_model_input_accepts_image_when_multimodal_enabled() {
+        let payload = json!({
+            "type": "text",
+            "content": "describe la imagen",
+            "attachments": [{
+                "type": "blob_ref",
+                "blob_name": "img_0123456789abcdef.png",
+                "size": 2048,
+                "mime": "image/png",
+                "filename_original": "image.png",
+                "spool_day": "2026-03-31"
+            }]
+        });
+        let options = ModelInputOptions {
+            multimodal: true,
+            ..ModelInputOptions::default()
+        };
+        let out = resolve_model_input_from_payload_with_options(&payload, &options)
+            .await
+            .expect("image should be accepted in multimodal");
+        assert_eq!(out.main_text, "describe la imagen");
+        assert_eq!(out.attachments.len(), 1);
+        assert_eq!(out.attachments[0].blob_ref.mime, "image/png");
+        assert!(out.attachments[0].text_content.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_model_input_builds_mixed_prompt_and_structured_attachments() {
+        let root = temp_blob_root();
+        let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
+        let text_blob = BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "doc_0123456789abcdef.txt".to_string(),
+            size: 15,
+            mime: "text/plain".to_string(),
+            filename_original: "error.txt".to_string(),
+            spool_day: "2026-03-31".to_string(),
+        };
+        let text_path = toolkit.resolve(&text_blob);
+        std::fs::create_dir_all(
+            text_path
+                .parent()
+                .expect("text blob parent must exist for test setup"),
+        )
+        .expect("create blob parent");
+        std::fs::write(&text_path, b"linea uno\nlinea dos").expect("write text blob");
+
+        let image_blob = BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "img_0123456789abcdef.png".to_string(),
+            size: 2048,
+            mime: "image/png".to_string(),
+            filename_original: "image.png".to_string(),
+            spool_day: "2026-03-31".to_string(),
+        };
+        let payload = json!({
+            "type": "text",
+            "content": "analiza los adjuntos",
+            "attachments": [
+                {
+                    "type": text_blob.ref_type,
+                    "blob_name": text_blob.blob_name,
+                    "size": text_blob.size,
+                    "mime": text_blob.mime,
+                    "filename_original": text_blob.filename_original,
+                    "spool_day": text_blob.spool_day
+                },
+                {
+                    "type": image_blob.ref_type,
+                    "blob_name": image_blob.blob_name,
+                    "size": image_blob.size,
+                    "mime": image_blob.mime,
+                    "filename_original": image_blob.filename_original,
+                    "spool_day": image_blob.spool_day
+                }
+            ]
+        });
+        let options = ModelInputOptions {
+            multimodal: true,
+            blob_root: Some(root.clone()),
+            ..ModelInputOptions::default()
+        };
+        let out = resolve_model_input_from_payload_with_options(&payload, &options)
+            .await
+            .expect("mixed payload should resolve");
+        assert_eq!(out.attachments.len(), 2);
+        assert_eq!(
+            out.attachments[0].text_content.as_deref(),
+            Some("linea uno\nlinea dos")
+        );
+        assert!(out.attachments[1].text_content.is_none());
+        assert!(out.prompt_text.contains("--- attachments ---"));
+        assert!(out.prompt_text.contains("linea uno"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn build_openai_user_content_parts_serializes_text_and_image() {
+        let root = temp_blob_root();
+        let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
+        let image_blob = BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "img_0123456789abcdef.png".to_string(),
+            size: 4,
+            mime: "image/png".to_string(),
+            filename_original: "image.png".to_string(),
+            spool_day: "2026-03-31".to_string(),
+        };
+        let image_path = toolkit.resolve(&image_blob);
+        std::fs::create_dir_all(
+            image_path
+                .parent()
+                .expect("image blob parent must exist for test setup"),
+        )
+        .expect("create blob parent");
+        std::fs::write(&image_path, [0_u8, 1_u8, 2_u8, 3_u8]).expect("write image bytes");
+
+        let input = ResolvedModelInput {
+            main_text: "mirá".to_string(),
+            prompt_text: "mirá".to_string(),
+            attachments: vec![ResolvedModelAttachment {
+                blob_ref: image_blob,
+                path: image_path,
+                text_content: None,
+            }],
+        };
+        let parts = build_openai_user_content_parts(&input)
+            .await
+            .expect("parts should build");
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(parts[1]["type"], "input_image");
+        assert!(parts[1]["image_url"]
+            .as_str()
+            .expect("image_url should be string")
+            .starts_with("data:image/png;base64,"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn build_openai_user_content_parts_rejects_unsupported_non_text_mime() {
+        let input = ResolvedModelInput {
+            main_text: "mirá".to_string(),
+            prompt_text: "mirá".to_string(),
+            attachments: vec![ResolvedModelAttachment {
+                blob_ref: BlobRef {
+                    ref_type: "blob_ref".to_string(),
+                    blob_name: "doc_0123456789abcdef.pdf".to_string(),
+                    size: 12,
+                    mime: "application/pdf".to_string(),
+                    filename_original: "doc.pdf".to_string(),
+                    spool_day: "2026-03-31".to_string(),
+                },
+                path: PathBuf::from("/tmp/unused.pdf"),
+                text_content: None,
+            }],
+        };
+        let err = build_openai_user_content_parts(&input)
+            .await
+            .expect_err("pdf should fail");
+        assert_eq!(err.code(), "unsupported_attachment_mime");
     }
 
     #[test]

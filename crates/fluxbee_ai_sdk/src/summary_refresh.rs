@@ -53,6 +53,7 @@ pub async fn refresh_conversation_summary(
         model: config.model,
         system: Some(compose_system_prompt(config.system_prompt.as_deref())),
         input: build_summary_refresh_input(input),
+        input_parts: None,
         max_output_tokens: None,
         model_settings: config.model_settings,
     };

@@ -556,10 +556,11 @@ Estructura:
 - Si el blob existe pero excede límites operativos (size/mime):
   - **MUST** responder error `BLOB_TOO_LARGE` o `unsupported_attachment_mime`.
 
-⚠️ **TENTATIVO** (límites recomendados; a decidir):
-- `text/plain` / `text/markdown` / `application/json`: 512KB por blob
-- `application/pdf`: 10MB por blob
-- imágenes: 10MB por blob
+✅ **NORMATIVO (baseline v1)**:
+- `text/plain` / `text/markdown` / `application/json`: hasta 10MB por blob (límite operativo vigente del SDK AI).
+- `application/pdf`: rechazado por default (`unsupported_attachment_mime`) hasta definir extractor dedicado.
+- imágenes (`image/png`, `image/jpeg`, `image/webp`): permitidas solo cuando `multimodal=true`.
+- `image/gif`: rechazado por default en baseline v1 (puede revisarse en una fase posterior).
 
 ---
 
@@ -880,16 +881,27 @@ Estructura:
 
 ## 4. Multimodal y attachments por behavior
 
+### 4.0 Defaults por runtime (decisión cerrada)
+
+✅ **NORMATIVO**:
+- `AI.common`: `capabilities.multimodal=true` por default.
+- `AI.frontdesk.gov`: `capabilities.multimodal=false` por default (temporal, revisable).
+- Ambos runtimes permiten override explícito vía config (`behavior.capabilities.multimodal`).
+
+✅ **NORMATIVO**:
+- La implementación multimodal del adapter OpenAI se alinea al modelo operativo vigente de OpenAI (Agents SDK + Responses API), evitando formatos ad-hoc cuando exista forma estándar en OpenAI.
+
 ✅ **NORMATIVO**:
 - El behavior declara `capabilities.multimodal = true|false`.
 - Si `multimodal=false`:
   - adjuntos no textuales → error `unsupported_attachment_mime` (y PDFs se rechazan por ahora; ver Parte 2).
 - Si `multimodal=true`:
-  - el provider adapter define cómo enviar blobs.
+  - el provider adapter envía adjuntos siguiendo el esquema OpenAI vigente para inputs multimodales.
 
-⚠️ **TENTATIVO (D3.4, en revisión)**:
-- Por ahora solo declaramos `multimodal: true|false`.
-- La tabla final MIME×behavior×provider se completa cuando se definan modelos/stack.
+✅ **NORMATIVO (matriz inicial MIME×modo)**:
+- `text/plain`, `text/markdown`, `application/json`: permitido en ambos modos (se incorporan al contexto textual).
+- `image/png`, `image/jpeg`, `image/webp`: permitido solo con `multimodal=true`.
+- `application/pdf`, `image/gif` y resto no textual: `unsupported_attachment_mime` en baseline v1.
 
 ---
 
@@ -1115,7 +1127,9 @@ secrets:
   - el nodo aplica defaults (timeouts, pool, queue, etc.),
   - y los escribe en el JSON efectivo.
 - `behavior.params.*` (temperature/top_p/max_output_tokens/timeouts) es **opcional** salvo los requeridos condicionales.
-- `capabilities.*` es opcional (por ejemplo `multimodal=false` por default).
+- `capabilities.*` es opcional:
+  - en `AI.common`: `multimodal=true` por default,
+  - en `AI.frontdesk.gov`: `multimodal=false` por default.
 
 > Nota: materializar defaults evita “config implícita” y facilita operación y debugging.
 

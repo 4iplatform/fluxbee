@@ -9,12 +9,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
 use fluxbee_ai_sdk::{
-    build_model_input_from_payload, build_reply_message_runtime_src, build_text_response,
-    extract_text, AiNode, AiNodeConfig, FunctionCallingConfig, FunctionCallingRunner,
-    FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolProvider,
-    FunctionToolRegistry, ImmediateConversationMemory, LanceDbThreadStateStore, Message,
-    ModelSettings, NodeRuntime, OpenAiResponsesClient, RetryPolicy, RouterClient, RuntimeConfig,
-    ThreadStateStore, ThreadStateToolsProvider,
+    build_openai_user_content_parts, build_reply_message_runtime_src, build_text_response,
+    extract_text, resolve_model_input_from_payload_with_options, AiNode, AiNodeConfig,
+    FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
+    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
+    ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
+    ModelSettings, NodeRuntime, OpenAiResponsesClient, ResolvedModelInput, RetryPolicy,
+    RouterClient, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
 };
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{
@@ -23,9 +24,7 @@ use fluxbee_sdk::protocol::{
 use fluxbee_sdk::{
     build_node_secret_record, load_node_secret_record, load_node_secret_record_with_root,
     managed_node_config_path, managed_node_name, save_node_secret_record,
-    save_node_secret_record_with_root,
-    NodeSecretDescriptor,
-    NodeSecretWriteOptions,
+    save_node_secret_record_with_root, NodeSecretDescriptor, NodeSecretWriteOptions,
     NODE_SECRET_REDACTION_TOKEN,
 };
 use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
@@ -144,6 +143,14 @@ struct OpenAiChatSection {
     openai: Option<OpenAiCredentialsSection>,
     #[serde(default)]
     base_url: Option<String>,
+    #[serde(default)]
+    capabilities: Option<BehaviorCapabilities>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct BehaviorCapabilities {
+    #[serde(default)]
+    multimodal: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +262,8 @@ struct EffectiveBehaviorSection {
     openai: Option<OpenAiCredentialsSection>,
     #[serde(default)]
     base_url: Option<String>,
+    #[serde(default)]
+    capabilities: Option<BehaviorCapabilities>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -367,6 +376,10 @@ fn default_openai_api_key_env() -> String {
     "OPENAI_API_KEY".to_string()
 }
 
+fn default_multimodal_for_runtime() -> bool {
+    false
+}
+
 fn default_trim_true() -> bool {
     true
 }
@@ -386,6 +399,7 @@ struct OpenAiChatRuntime {
     yaml_inline_api_key: Option<String>,
     base_url: Option<String>,
     immediate_memory: ImmediateMemorySection,
+    multimodal: bool,
 }
 
 struct GenericAiNode {
@@ -851,9 +865,17 @@ impl AiNode for GenericAiNode {
             return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
         };
 
-        let input = if msg.meta.msg_type.eq_ignore_ascii_case("user") {
-            match build_model_input_from_payload(&msg.payload).await {
-                Ok(value) => value,
+        let (input, resolved_user_input): (String, Option<ResolvedModelInput>) = if msg
+            .meta
+            .msg_type
+            .eq_ignore_ascii_case("user")
+        {
+            let options = ModelInputOptions {
+                multimodal: matches!(&behavior, NodeBehavior::OpenAiChat(openai) if openai.multimodal),
+                ..ModelInputOptions::default()
+            };
+            match resolve_model_input_from_payload_with_options(&msg.payload, &options).await {
+                Ok(value) => (value.prompt_text.clone(), Some(value)),
                 Err(err) => {
                     return Ok(Some(build_reply_message_runtime_src(
                         &msg,
@@ -879,7 +901,10 @@ impl AiNode for GenericAiNode {
         let output = match &behavior {
             NodeBehavior::Echo => format!("Echo: {input}"),
             NodeBehavior::OpenAiChat(openai) => {
-                match self.run_openai_chat(openai, input, &behavior_ctx).await {
+                match self
+                    .run_openai_chat(openai, input, resolved_user_input.as_ref(), &behavior_ctx)
+                    .await
+                {
                     Ok(output) => output,
                     Err(err) if err.to_string().contains("missing OpenAI api key") => {
                         tracing::warn!(
@@ -906,6 +931,7 @@ impl GenericAiNode {
         &self,
         openai: &OpenAiChatRuntime,
         input: String,
+        resolved_user_input: Option<&ResolvedModelInput>,
         ctx: &BehaviorContext,
     ) -> fluxbee_ai_sdk::Result<String> {
         let api_key = self.resolve_openai_api_key(openai).await.ok_or_else(|| {
@@ -944,10 +970,26 @@ impl GenericAiNode {
         }
 
         let current_user_input = input.clone();
+        let input_parts = if openai.multimodal {
+            if let Some(resolved) = resolved_user_input {
+                Some(
+                    build_openai_user_content_parts(resolved)
+                        .await
+                        .map_err(|err| {
+                            fluxbee_ai_sdk::errors::AiSdkError::Protocol(err.to_string())
+                        })?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let req = fluxbee_ai_sdk::llm::LlmRequest {
             model: openai.model.clone(),
             system: openai.instructions.clone(),
             input,
+            input_parts,
             max_output_tokens: None,
             model_settings: Some(openai.model_settings.clone()),
         };
@@ -1584,7 +1626,7 @@ impl GenericAiNode {
             "config_version": state.config_version,
             "contract": {
                 "node_family": "AI",
-                "node_kind": "AI.common",
+                "node_kind": "AI.frontdesk.gov",
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
                 "required_fields": [
                     "config.behavior.kind",
@@ -1595,12 +1637,14 @@ impl GenericAiNode {
                     "config.behavior.instructions",
                     "config.behavior.model_settings",
                     "config.behavior.base_url",
+                    "config.behavior.capabilities.multimodal",
                     "config.secrets.openai.api_key_env"
                 ],
                 "secrets": [secret_descriptor],
                 "notes": [
                     "Preferred secret field is config.secrets.openai.api_key.",
                     "Legacy aliases config.behavior.openai.api_key and config.behavior.api_key remain accepted during migration.",
+                    "AI.frontdesk.gov defaults behavior.capabilities.multimodal=false unless explicitly overridden.",
                     "Secret values are persisted in local secrets.json and always returned redacted."
                 ]
             },
@@ -2658,6 +2702,11 @@ fn build_behavior(
                 .as_ref()
                 .and_then(|v| v.api_key.clone())
                 .or_else(|| openai.api_key.clone());
+            let multimodal = openai
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.multimodal)
+                .unwrap_or_else(default_multimodal_for_runtime);
             NodeBehavior::OpenAiChat(OpenAiChatRuntime {
                 model: openai.model.clone(),
                 instructions,
@@ -2666,6 +2715,7 @@ fn build_behavior(
                 yaml_inline_api_key,
                 base_url: openai.base_url.clone(),
                 immediate_memory: cfg.runtime.immediate_memory.clone(),
+                multimodal,
             })
         }
     };
@@ -2714,6 +2764,11 @@ fn build_behavior_from_effective_config(
                 .as_ref()
                 .and_then(|runtime| runtime.immediate_memory.clone())
                 .unwrap_or_default();
+            let multimodal = behavior
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.multimodal)
+                .unwrap_or_else(default_multimodal_for_runtime);
 
             Ok(NodeBehavior::OpenAiChat(OpenAiChatRuntime {
                 model,
@@ -2723,6 +2778,7 @@ fn build_behavior_from_effective_config(
                 yaml_inline_api_key,
                 base_url,
                 immediate_memory,
+                multimodal,
             }))
         }
         other => Err(format!("unsupported behavior.kind '{other}'").into()),
@@ -2793,6 +2849,15 @@ fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocu
             api_key: openai.api_key.clone(),
             openai: openai.openai.clone(),
             base_url: openai.base_url.clone(),
+            capabilities: Some(BehaviorCapabilities {
+                multimodal: Some(
+                    openai
+                        .capabilities
+                        .as_ref()
+                        .and_then(|caps| caps.multimodal)
+                        .unwrap_or_else(default_multimodal_for_runtime),
+                ),
+            }),
             ..EffectiveBehaviorSection::default()
         },
     };
@@ -3163,6 +3228,15 @@ fn materialize_effective_defaults(
         materialize_runtime_defaults(runtime);
     }
     if config.behavior.kind.eq_ignore_ascii_case("openai_chat") {
+        if config.behavior.capabilities.is_none() {
+            config.behavior.capabilities = Some(BehaviorCapabilities {
+                multimodal: Some(default_multimodal_for_runtime()),
+            });
+        } else if let Some(caps) = config.behavior.capabilities.as_mut() {
+            if caps.multimodal.is_none() {
+                caps.multimodal = Some(default_multimodal_for_runtime());
+            }
+        }
         if config.behavior.provider.is_none() {
             config.behavior.provider = Some("openai".to_string());
         }
@@ -3714,6 +3788,7 @@ mod tests {
                 yaml_inline_api_key: None,
                 base_url: None,
                 immediate_memory: ImmediateMemorySection::default(),
+                multimodal: false,
             }));
         }
 
