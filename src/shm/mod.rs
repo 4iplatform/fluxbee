@@ -694,12 +694,14 @@ pub struct IdentityRegionReader {
     layout: IdentityRegionLayout,
 }
 
+#[derive(Debug)]
 pub struct MemoryRegionWriter {
     name: String,
     mmap: MmapMut,
     layout: RegionLayout,
 }
 
+#[derive(Debug)]
 pub struct MemoryRegionReader {
     name: String,
     mmap: Mmap,
