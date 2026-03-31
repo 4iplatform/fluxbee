@@ -12,9 +12,8 @@ Incluye dos perfiles:
 - nodo IA común (`AI.common`)
 - frontdesk gov (`AI.frontdesk.gov`)
 
-Importante (estado de transición):
-- `--mode` se mantiene solo por compatibilidad en scripts de deploy.
-- Dirección objetivo y vigente: separar comportamiento por runtime (`AI.common` vs `AI.frontdesk.gov`).
+Importante:
+- la separación de comportamiento es por runtime (`AI.common` vs `AI.frontdesk.gov`), no por flags de modo.
 
 ---
 
@@ -25,7 +24,6 @@ Importante (estado de transición):
 
 `publish-ia-runtime.sh`:
 - selecciona el perfil de runtime por `--runtime`.
-- `--mode` queda deprecado/ignorado.
 
 `deploy-ia-node.sh` ahora soporta:
 - `--update-scope <targeted|global>` (default: `targeted`).
@@ -35,6 +33,7 @@ Importante (estado de transición):
 Decisión de ownership:
 - El prompt/flujo de `AI.frontdesk.gov` pertenece al runtime frontdesk.
 - `AI.common` no debe transportar lógica específica gov/frontdesk.
+- El data-plane `text/v1` (incluyendo resolución de `content_ref`/`attachments` y offload de respuesta a `content_ref` por tamaño) pertenece al SDK AI compartido.
 
 ---
 

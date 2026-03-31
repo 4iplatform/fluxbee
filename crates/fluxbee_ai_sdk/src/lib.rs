@@ -39,7 +39,9 @@ pub use summary_refresh::{
     refresh_conversation_summary, SummaryRefreshConfig, SummaryRefreshInput,
 };
 pub use text_payload::{
-    build_model_input_from_payload, build_text_response, extract_text, ModelInputPayloadError,
+    build_model_input_from_payload, build_model_input_from_payload_with_options,
+    build_text_response, build_text_response_with_options, extract_text, ModelInputOptions,
+    ModelInputPayloadError, TextResponseOptions,
 };
 pub use thread_state::{LanceDbThreadStateStore, ThreadStateRecord, ThreadStateStore};
 pub use thread_state_tools::{

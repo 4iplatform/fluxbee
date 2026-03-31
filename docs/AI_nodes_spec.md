@@ -451,10 +451,12 @@ Códigos recomendados (no exhaustivo):
 - Límites finales por MIME/tamaño están como valores tentativos.
 - Tabla final de compatibilidad MIME × behavior × provider.
 
-🐞 **IMPLEMENTACIÓN PENDIENTE (runner actual)**:
-- El runner hoy procesa principalmente `payload.content`.
-- Falta implementar procesamiento completo de `attachments` y `content_ref` de entrada.
-- Falta implementar salida con adjuntos/blob refs (cuando el behavior genere artefactos).
+🔧 **IMPLEMENTACIÓN ACTUAL (runner + SDK AI)**:
+- Input `text/v1` completo: `content`, `content_ref`, `attachments[]`.
+- Resolución de blobs vía `fluxbee_sdk::blob` desde `fluxbee_ai_sdk::text_payload`.
+- Errores canónicos implementados: `BLOB_NOT_FOUND`, `BLOB_IO_ERROR`, `BLOB_TOO_LARGE`, `unsupported_attachment_mime`, `too_many_attachments`.
+- Salida `text/v1` con offload automático a `content_ref` cuando excede límite inline.
+- Adjuntos de salida generados por behavior quedan para fase posterior (cuando behaviors produzcan artefactos).
 
 ---
 
@@ -755,9 +757,9 @@ Estructura:
 
 ## 10. Desviaciones conocidas del código actual (para backlog)
 
-🐞 **DESVIACIÓN CÓDIGO (P0/P1)**:
-- El runner actual extrae input solo desde `payload.content` y no consume `attachments` ni `content_ref`.
-- No hay contrato de error formal.
+🔧 **ESTADO CÓDIGO (actual)**:
+- El runner consume `text/v1` completo (`content` / `content_ref` / `attachments`) usando SDK AI.
+- El contrato de error de blobs está normalizado en SDK AI y propagado como payload de error.
 
 ✅ **NORMATIVO**: el AI Node implementa `text/v1` completo según Blob Annex y falla con errores claros cuando no pueda leer blobs/attachments.
 
@@ -1517,10 +1519,10 @@ Installs:
 - `/usr/bin/ai-nodectl`
 - systemd template unit `/etc/systemd/system/fluxbee-ai-node@.service`
 
-Per-instance mode:
-- `AI_NODE_MODE=default|gov` (set in `/etc/fluxbee/ai-nodes/<name>.env`)
-- `default`: common tools only
-- `gov`: common tools + gov tools (for example `ilk_register`)
+Per-instance runtime profile:
+- `AI.common`: tools/behavior de AI común (sin identidad gov).
+- `AI.frontdesk.gov`: tools/behavior de frontdesk gov (incluye identidad, por ejemplo `ilk_register`).
+- no se usa `AI_NODE_MODE` para seleccionar capacidades del runtime.
 
 Manage instances with `ai-nodectl`:
 

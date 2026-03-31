@@ -16,9 +16,8 @@ Regla:
 - las instancias (`AI.chat@motherbee`, etc.) no viven en el repo.
 - acá viven solo los fuentes del runtime y sus especializaciones.
 
-Nota de transición:
-- El gating por `AI_NODE_MODE=default|gov` se considera transicional/legacy.
-- La dirección objetivo es separar comportamiento por runtime (AI común vs frontdesk gov), no por flag de modo.
+Nota:
+- La separación de comportamiento es por runtime (`AI.common` vs `AI.frontdesk.gov`), no por `AI_NODE_MODE`.
 
 Contrato operativo actual:
 - configuración funcional vía `CONFIG_GET` / `CONFIG_SET`.

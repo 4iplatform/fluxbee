@@ -852,7 +852,7 @@ impl AiNode for GenericAiNode {
         };
 
         let input = if msg.meta.msg_type.eq_ignore_ascii_case("user") {
-            match build_model_input_from_payload(&msg.payload) {
+            match build_model_input_from_payload(&msg.payload).await {
                 Ok(value) => value,
                 Err(err) => {
                     return Ok(Some(build_reply_message_runtime_src(
