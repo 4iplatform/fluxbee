@@ -19,8 +19,8 @@ use fluxbee_sdk::nats::{
 };
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{
-    build_node_config_response_message_runtime_src, build_node_secret_record, connect,
-    load_node_secret_record, managed_node_config_path, managed_node_name, save_node_secret_record,
+    build_node_config_response_message, build_node_secret_record, connect, load_node_secret_record,
+    managed_node_config_path, managed_node_name, save_node_secret_record,
     try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSecretDescriptor,
     NodeSecretWriteOptions, NodeSender, NodeUuidMode, NODE_CONFIG_APPLY_MODE_REPLACE,
     NODE_SECRET_REDACTION_TOKEN,
@@ -1708,6 +1708,8 @@ async fn process_router_message(
     tracing::info!(
         node_name = %node_name,
         trace_id = %msg.routing.trace_id,
+        src = %msg.routing.src,
+        dst = ?msg.routing.dst,
         msg_type = %msg.meta.msg_type,
         msg = msg.meta.msg.as_deref().unwrap_or(""),
         action = msg.meta.action.as_deref().unwrap_or(""),
@@ -1726,28 +1728,30 @@ async fn process_router_message(
     match command {
         "CONFIG_GET" => {
             let payload = build_storage_config_get_payload(node_name, control_state, None);
+            let response = build_node_config_response_message(msg, sender.uuid(), payload);
             tracing::info!(
                 node_name = %node_name,
                 trace_id = %msg.routing.trace_id,
+                response_src = %response.routing.src,
+                response_dst = ?response.routing.dst,
                 state = %storage_state_label(control_state.secret_source),
                 "sy.storage replying CONFIG_GET"
             );
-            sender
-                .send(build_node_config_response_message_runtime_src(msg, payload))
-                .await?;
+            sender.send(response).await?;
         }
         "CONFIG_SET" => {
             let payload = apply_storage_config_set(msg, node_name, control_state)?;
+            let response = build_node_config_response_message(msg, sender.uuid(), payload);
             tracing::info!(
                 node_name = %node_name,
                 trace_id = %msg.routing.trace_id,
+                response_src = %response.routing.src,
+                response_dst = ?response.routing.dst,
                 state = %storage_state_label(control_state.secret_source),
                 config_version = control_state.config_version,
                 "sy.storage replying CONFIG_SET"
             );
-            sender
-                .send(build_node_config_response_message_runtime_src(msg, payload))
-                .await?;
+            sender.send(response).await?;
         }
         "PING" => {
             sender
