@@ -23,6 +23,8 @@ Options:
   --node-name <name@hive>      If provided, script also spawns/restarts node
   --tenant-id <tnt:...>        Tenant ID for identity registration (payload + config fallback)
   --runtime-version <ver>      Runtime version for spawn payload (default: current)
+  --update-scope <targeted|global>
+                               SYSTEM_UPDATE scope (default: targeted)
   --config-json <file>         JSON file with spawn config object
   --immediate-memory-enabled <true|false>
                                Set runtime.immediate_memory.enabled in spawn config (optional)
@@ -75,6 +77,7 @@ MODE="default"
 FORCED_NODE_NAME=""
 FORCED_DYNAMIC_CONFIG_DIR=""
 RUNTIME_VERSION="current"
+UPDATE_SCOPE="targeted"
 NODE_NAME=""
 TENANT_ID=""
 CONFIG_JSON=""
@@ -108,6 +111,7 @@ while [[ $# -gt 0 ]]; do
     --forced-node-name) FORCED_NODE_NAME="${2:-}"; shift 2 ;;
     --forced-dynamic-config-dir) FORCED_DYNAMIC_CONFIG_DIR="${2:-}"; shift 2 ;;
     --runtime-version) RUNTIME_VERSION="${2:-}"; shift 2 ;;
+    --update-scope) UPDATE_SCOPE="${2:-}"; shift 2 ;;
     --node-name) NODE_NAME="${2:-}"; shift 2 ;;
     --tenant-id) TENANT_ID="${2:-}"; shift 2 ;;
     --config-json) CONFIG_JSON="${2:-}"; shift 2 ;;
@@ -140,6 +144,15 @@ if [[ -z "$BASE" || -z "$HIVE_ID" || -z "$RUNTIME" || -z "$VERSION" ]]; then
   usage
   exit 1
 fi
+
+case "$UPDATE_SCOPE" in
+  targeted|global)
+    ;;
+  *)
+    echo "Error: --update-scope must be targeted or global (got '$UPDATE_SCOPE')" >&2
+    exit 1
+    ;;
+esac
 
 case "$MODE" in
   default|gov)
@@ -354,8 +367,22 @@ if [[ -z "$MANIFEST_VERSION" || -z "$MANIFEST_HASH" ]]; then
 fi
 
 log "publish_ok manifest_version=$MANIFEST_VERSION manifest_hash=$MANIFEST_HASH"
+log "update_scope=$UPDATE_SCOPE runtime=$RUNTIME target_version=$VERSION"
 
-update_payload="$(python3 - <<PY
+if [[ "$UPDATE_SCOPE" == "targeted" ]]; then
+  update_payload="$(python3 - <<PY
+import json
+print(json.dumps({
+  "category": "runtime",
+  "manifest_version": int("${MANIFEST_VERSION}"),
+  "manifest_hash": "${MANIFEST_HASH}",
+  "runtime": "${RUNTIME}",
+  "runtime_version": "${VERSION}",
+}, separators=(",", ":")))
+PY
+)"
+else
+  update_payload="$(python3 - <<PY
 import json
 print(json.dumps({
   "category": "runtime",
@@ -364,6 +391,7 @@ print(json.dumps({
 }, separators=(",", ":")))
 PY
 )"
+fi
 
 attempt=1
 UPDATE_STATUS=""
