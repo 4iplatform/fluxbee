@@ -71,7 +71,11 @@ Firewall behavior in `SY.orchestrator`:
 
 Bootstrap behavior:
 
-- Both services read connection host/user/password from `database.url` (or env overrides).
+- `SY.identity` sigue leyendo bootstrap DB desde `database.url` (o env overrides).
+- `SY.storage` ahora usa esta precedencia:
+  - `secrets.json` local via `CONFIG_SET`
+  - env overrides
+  - no usa `database.url` en `hive.yaml`
 - On motherbee startup, each service ensures its own database exists (`CREATE DATABASE` if missing) and then ensures its own schema/tables.
 - Worker identity replicas remain read-only for DB writes and continue syncing from primary through identity sync.
 

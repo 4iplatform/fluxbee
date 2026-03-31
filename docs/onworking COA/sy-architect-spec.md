@@ -311,7 +311,7 @@ Bootstrap requirement if this direction is adopted:
 Important note:
 
 - this contract is not considered closed yet at core level
-- today, other core/system nodes (`SY.admin`, `SY.storage`, `SY.identity`) still bootstrap from `hive.yaml`
+- today, some core/system nodes still bootstrap from `hive.yaml`; `SY.storage` ya expone `CONFIG_GET` / `CONFIG_SET` y usa `secrets.json` como fuente preferida para su secreto DB, con `hive.yaml` solo como fallback legacy
 - while `hive.yaml` remains the effective startup source for core nodes, `config.json` for `SY.architect` should be treated as a pending direction rather than a fully-settled invariant
 
 ### 4.2 First-Run Flow

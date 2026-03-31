@@ -56,7 +56,6 @@ const STORAGE_CONFIG_SCHEMA_VERSION: u32 = 1;
 enum StorageDbSecretSource {
     LocalFile,
     EnvCompat,
-    HiveYamlLegacy,
     Missing,
 }
 
@@ -65,7 +64,6 @@ impl StorageDbSecretSource {
         match self {
             Self::LocalFile => "local_file",
             Self::EnvCompat => "env_compat",
-            Self::HiveYamlLegacy => "hive_yaml_legacy",
             Self::Missing => "missing",
         }
     }
@@ -1317,7 +1315,7 @@ async fn load_hive(config_dir: &Path) -> Result<HiveFile, StorageError> {
 }
 
 fn resolve_database_url(
-    hive: &HiveFile,
+    _hive: &HiveFile,
     node_name: &str,
 ) -> (Option<String>, StorageDbSecretSource) {
     if let Some(url) = load_local_postgres_url(node_name) {
@@ -1332,15 +1330,6 @@ fn resolve_database_url(
         if !url.trim().is_empty() {
             return (Some(url), StorageDbSecretSource::EnvCompat);
         }
-    }
-    if let Some(url) = hive
-        .database
-        .as_ref()
-        .and_then(|db| db.url.as_ref())
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-    {
-        return (Some(url.to_string()), StorageDbSecretSource::HiveYamlLegacy);
     }
     (None, StorageDbSecretSource::Missing)
 }
@@ -1931,7 +1920,7 @@ fn build_storage_config_get_payload(
         } else {
             json!({
                 "code": "missing_secret",
-                "message": "Missing database secret in local secrets.json, env, and hive.yaml."
+                "message": "Missing database secret in local secrets.json or env overrides."
             })
         }
     })

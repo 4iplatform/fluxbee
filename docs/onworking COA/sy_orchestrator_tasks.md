@@ -10,7 +10,7 @@ Checklist operativo para cerrar SY.orchestrator segun:
 
 ## Cerrado en esta iteracion
 - [x] Bootstrap local motherbee completo (router + SY.* + conexion de `SY.orchestrator`).
-- [x] Bootstrap de SY nodes corregido: no espera `SY.storage` en SHM del router (no hace HELLO al router).
+- [x] Bootstrap de SY nodes corregido para no depender de supuestos viejos sobre `SY.storage`; el servicio hoy hace `HELLO` al router y además mantiene su camino NATS para metrics/DB.
 - [x] Timeout de bootstrap de SY nodes ahora reporta el detalle de nodos faltantes.
 - [x] Watchdog de servicios criticos + shutdown ordenado.
 - [x] `add_hive` robusto (sin pasos criticos ignorados) con clasificacion de errores SSH inicial.

@@ -154,17 +154,13 @@ Mientras se termina Fase 1, cualquier productor nuevo de `storage.events/items/r
 
 ## 7) TODO - Migracion de credenciales DB fuera de `hive.yaml`
 
-Contexto actual:
+Contexto original:
 - `SY.storage` hoy arranca leyendo `database.url` desde:
   - `FLUXBEE_DATABASE_URL`
   - `JSR_DATABASE_URL`
-  - fallback `hive.yaml -> database.url`
+  - y en ese momento también tenía fallback `hive.yaml -> database.url`
 - Esto está implementado en `src/bin/sy_storage.rs` (`base_database_url(...)` / `database_config(...)`).
-- A diferencia de `AI.*`, `SY.storage` no participa hoy del control-plane de router como nodo gestionado para `CONFIG_GET` / `CONFIG_SET`.
-- En particular:
-  - `SY.storage` no usa el path `node_control_config_set`
-  - `SY.storage` no hace `HELLO` al router como nodo regular
-  - hoy `SY.admin` solo le consulta `storage.metrics.get` vía NATS
+- En ese momento `SY.storage` todavía no participaba del control-plane de router como nodo configurable para `CONFIG_GET` / `CONFIG_SET`.
 
 Problema:
 - El password de PostgreSQL sigue viviendo en `hive.yaml`, mezclado con bootstrap infra.
@@ -179,10 +175,7 @@ Dirección acordada:
 Nota importante de diseño:
 - Si `SY.storage` debe quedar alineado con el camino normal de config/secrets del sistema, entonces no alcanza con una acción admin dedicada.
 - Primero hay que habilitarle un control-path por socket/control-plane para `CONFIG_GET` / `CONFIG_SET`, análogo al resto de nodos configurables.
-- Hoy eso no existe en código:
-  - `SY.storage` no hace `HELLO` al router como nodo regular
-  - no expone `CONFIG_GET` / `CONFIG_SET`
-  - `SY.admin` solo le consulta `storage.metrics.get` vía NATS
+- Ese gap original ya quedó resuelto en código.
 - Entonces el trabajo correcto queda partido en dos:
   1. habilitar el control-path/socket para `SY.storage`
   2. recién ahí migrar el secreto DB al camino normal de `archi -> SY.admin -> CONFIG_SET`
@@ -246,7 +239,7 @@ Objetivo final:
   - `CONFIG_GET`
   - `CONFIG_SET`
 
-Gap actual:
+Gap original:
 - hoy `SY.storage` está integrado por NATS para metrics/ingesta, pero no por un canal normal de config del nodo
 - por lo tanto, antes de hablar de “usar el camino normal”, hay que implementarlo
 
@@ -258,10 +251,16 @@ Estado 2026-03-31:
 - `CONFIG_SET` hoy es `persist-only`:
   - guarda `postgres_url` en `secrets.json`
   - actualiza `config.json` público redactado
-  - pero requiere restart de `sy-storage` para aplicar la nueva conexión
-- Gap todavía abierto:
-  - si `SY.storage` no tiene ninguna fuente de DB (`secrets.json`, env o `hive.yaml` legacy), hoy no arranca
-  - o sea, el control-path ya existe, pero el bootstrap “sin secreto previo” todavía no quedó resuelto en esta iteración
+  - requiere restart de `sy-storage` para afectar la conexión DB en vivo
+- Precedencia efectiva actual para DB:
+  1. `secrets.json` local
+  2. env compat
+- Estado operativo validado:
+  - `CONFIG_GET` responde correctamente por `archi -> SY.admin -> SY.storage`
+  - `CONFIG_SET` persiste `postgres_url` en `secrets.json` y devuelve redacción correcta
+  - restart posterior de `sy-storage` vuelve a levantar usando el secreto local
+  - `SY.storage` ya no usa `hive.yaml -> database.url`; ese campo queda preservado por `SY.identity`
+  - `hive.yaml -> database.url` queda mantenido solo como fallback legacy temporal
 
 Fase propuesta:
 - Fase A:
@@ -275,21 +274,14 @@ Fase propuesta:
 - Fase T (transición, opcional):
   - acción admin dedicada temporal solo si hace falta destrabar antes de completar Fase A
 
-Pendiente de implementación:
-- agregar help/admin action explícita para storage DB config/secret
-- o, preferentemente, exponerlo via `CONFIG_GET` / `CONFIG_SET` una vez que el control-path exista
-
-Opciones:
-- Opción A: acción admin dedicada
-  - `get_storage_db_config`
-  - `set_storage_db_config`
-- Opción B: control-path local de system node, similar a `SY.architect`
-  - `GET /storage/control/config-get`
-  - `POST /storage/control/config-set`
-
-Recomendación actualizada:
-- contrato final deseado: Opción B
-- Opción A solo como transición si necesitamos destrabar antes que exista el control-path
+Resultado:
+- no hizo falta una action admin dedicada permanente
+- `SY.storage` quedó integrado al camino normal `CONFIG_GET` / `CONFIG_SET`
+- el flujo operativo nuevo queda:
+  - `CONFIG_SET`
+  - persistencia en `secrets.json`
+  - restart de `sy-storage`
+  - `CONFIG_GET` / health post-restart
 
 ### 7.4.1 Contrato canónico propuesto (`ST-DB-2`)
 
@@ -506,26 +498,27 @@ Recomendación v1:
 ### 7.7 Checklist
 
 - [x] ST-DB-0. Habilitar control-path/socket para `SY.storage` y meterlo al mismo plano `CONFIG_GET` / `CONFIG_SET` que otros nodos configurables.
-- [ ] ST-DB-1. Documentar que `database.url` en `hive.yaml` queda en estado legacy para `SY.storage`.
+- [x] ST-DB-1. Documentar que `database.url` en `hive.yaml` deja de ser input para `SY.storage` y queda preservado por `SY.identity`.
 - [x] ST-DB-2. Definir contrato canónico para leer/aplicar config secreta de DB:
   - final deseado: `CONFIG_GET` / `CONFIG_SET`
   - transición opcional: action admin dedicada
 - [x] ST-DB-3. Implementar persistencia en `secrets.json` usando `fluxbee_sdk::node_secret`.
 - [x] ST-DB-4. Cambiar `sy_storage.rs` para leer primero secreto local antes que env/hive.
 - [x] ST-DB-5. Agregar redaction en cualquier respuesta/help/status aplicable.
-- [ ] ST-DB-6. Implementar ciclo operativo:
+- [x] ST-DB-6. Implementar ciclo operativo:
   - persistir secreto
   - restart de `sy-storage`
   - verificación post-restart
-- [ ] ST-DB-7. Limpiar docs/examples que hoy siguen sugiriendo `database.url` en `hive.yaml` como camino principal.
+- [x] ST-DB-7. Limpiar docs/examples de mayor visibilidad para que `database.url` en `hive.yaml` deje de figurar como input de `SY.storage`.
 
 ### 7.8 Criterio de cierre
 
-- [ ] `SY.storage` puede configurarse desde `archi` por su control-path normal sin editar `hive.yaml`.
-- [ ] El secreto de DB queda persistido en `secrets.json` local, no en config pública.
-- [ ] `SY.storage` vuelve a levantar correctamente tras restart usando el secreto local.
-- [ ] `hive.yaml` queda solo como fallback legacy temporal o se elimina del flujo nuevo.
+- [x] `SY.storage` puede configurarse desde `archi` por su control-path normal sin editar `hive.yaml`.
+- [x] El secreto de DB queda persistido en `secrets.json` local, no en config pública.
+- [x] `SY.storage` vuelve a levantar correctamente tras restart usando el secreto local.
+- [x] `SY.storage` deja de depender de `hive.yaml`; el campo `database.url` puede permanecer mientras `SY.identity` todavía lo use.
 
 Nota:
-- el primer criterio ya quedó casi resuelto para instalaciones que todavía tienen bootstrap legacy o secreto local previo;
-  el gap restante es el arranque cold-start cuando no existe ninguna fuente de DB disponible.
+- validado manualmente el 2026-03-31 con `CONFIG_GET`, `CONFIG_SET`, restart y lectura efectiva posterior.
+- mejora futura opcional:
+  - separar `postgres_password` del resto de la URL pública en una v1.1

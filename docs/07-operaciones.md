@@ -207,7 +207,7 @@ identity:
 | `blob.gc.staging_ttl_hours` | No | `24` | TTL para limpiar huérfanos en `blob/staging/` |
 | `blob.gc.active_retain_days` | No | `30` | Retención mínima de blobs en `blob/active/` |
 | `admin.listen` | No | `127.0.0.1:8080` | Bind del API HTTP de SY.admin (recomendado loopback + proxy) |
-| `database.url` | Solo Motherbee | - | Connection string PostgreSQL |
+| `database.url` | Solo Motherbee | - | Connection string PostgreSQL. Sigue siendo input para `SY.identity`; `SY.storage` ya no la usa y toma su secreto por `CONFIG_SET` + `secrets.json`. |
 | `database.pool_size` | No | 10 | Conexiones en el pool |
 
 ### 2.5 Blob Sync (Syncthing) - Operación
