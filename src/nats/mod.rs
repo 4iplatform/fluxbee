@@ -7,6 +7,12 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+pub use fluxbee_sdk::cognition::{
+    SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_EPISODES,
+    SUBJECT_STORAGE_COGNITION_MEMORIES, SUBJECT_STORAGE_COGNITION_REASONS,
+    SUBJECT_STORAGE_COGNITION_SCOPES, SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES,
+    SUBJECT_STORAGE_COGNITION_THREADS,
+};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -18,13 +24,6 @@ pub const SUBJECT_STORAGE_TURNS: &str = "storage.turns";
 pub const SUBJECT_STORAGE_EVENTS: &str = "storage.events";
 pub const SUBJECT_STORAGE_ITEMS: &str = "storage.items";
 pub const SUBJECT_STORAGE_REACTIVATION: &str = "storage.reactivation";
-pub const SUBJECT_STORAGE_COGNITION_THREADS: &str = "storage.cognition.threads";
-pub const SUBJECT_STORAGE_COGNITION_CONTEXTS: &str = "storage.cognition.contexts";
-pub const SUBJECT_STORAGE_COGNITION_REASONS: &str = "storage.cognition.reasons";
-pub const SUBJECT_STORAGE_COGNITION_SCOPES: &str = "storage.cognition.scopes";
-pub const SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES: &str = "storage.cognition.scope_instances";
-pub const SUBJECT_STORAGE_COGNITION_MEMORIES: &str = "storage.cognition.memories";
-pub const SUBJECT_STORAGE_COGNITION_EPISODES: &str = "storage.cognition.episodes";
 
 const CONNECT_LINE: &str = "CONNECT {\"lang\":\"rust\",\"version\":\"0.1\",\"verbose\":false,\"pedantic\":false,\"tls_required\":false}\r\n";
 const EMBEDDED_INFO_LINE: &str =

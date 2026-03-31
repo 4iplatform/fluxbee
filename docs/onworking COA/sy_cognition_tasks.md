@@ -305,6 +305,16 @@ Salida:
 ### Fase COG-M3 - Nuevo contrato durable de cognition
 
 - [x] COG-M3-T1. Definir si cognition v2 persiste por NATS subjects nuevos o por socket/admin hacia `SY.storage`.
+- [ ] COG-M3-T1b. Congelar contrato JetStream/durable consumer para cognition v2:
+  - nombre canónico de consumer/queue para `SY.cognition` sobre `storage.turns`
+  - nombres canónicos para consumidores futuros de entidades `storage.cognition.*`
+- [ ] COG-M3-T1c. Congelar semántica de replay/restart:
+  - desde qué offset/seq retoma `SY.cognition`
+  - cómo reconstruye después de caída/redeploy
+- [ ] COG-M3-T1d. Congelar política de ack/redelivery/poison handling:
+  - cuándo se ackea
+  - qué pasa si un turn falla repetidamente
+  - cómo se evita bloquear el stream completo
 - [ ] COG-M3-T2. No mezclar semánticamente `storage.events/items/reactivation` viejos con entidades nuevas sin una capa de compat explícita.
 - [ ] COG-M3-T3. Definir tablas/contratos para:
   - `cognition_threads`
@@ -326,6 +336,20 @@ Decisión recomendada:
 Estado actual de `M3`:
 - el contrato de transporte ya quedó congelado del lado core como familia NATS explícita `storage.cognition.*`.
 - el embedded broker ya trata esos subjects como storage/durable stream subjects.
+- `fluxbee_sdk` ya expone tipos compartidos para:
+  - entidades durables cognition v2
+  - operaciones (`upsert` / `close` / `delete`)
+  - envelopes tipados
+  - mapping entidad -> subject
+- el boundary del router quedó más claro:
+  - router publica input inmutable a `storage.turns`
+  - router **no** publica entidades derivadas `storage.cognition.*`
+  - las entidades derivadas las escribirá `SY.cognition` hacia `SY.storage`
+- lo que sigue abierto en NATS/JetStream no es el publisher del router sino el contrato de consumidores durables:
+  - queue names
+  - replay/start position
+  - ack/redelivery
+  - recuperación tras restart
 - falta todavía el contrato payload por entidad y el lado consumidor/escritor en `SY.storage` / `SY.cognition`.
 
 Subjects recomendados:

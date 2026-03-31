@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod blob;
 pub mod client_config;
+pub mod cognition;
 pub mod comm;
 pub mod identity;
 pub mod managed_node;
@@ -21,6 +22,16 @@ pub use admin::{
     ADMIN_KIND, MSG_ADMIN_COMMAND, MSG_ADMIN_COMMAND_RESPONSE,
 };
 pub use client_config::ClientConfig;
+pub use cognition::{
+    CognitionContextData, CognitionDurableEntity, CognitionDurableEnvelope, CognitionDurableOp,
+    CognitionEpisodeData, CognitionIlkProfile, CognitionMemoryData, CognitionReasonData,
+    CognitionScopeData, CognitionScopeInstanceData, CognitionThreadData,
+    COGNITION_DURABLE_ENTITY_VERSION_V1, COGNITION_DURABLE_SCHEMA_VERSION,
+    SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_EPISODES,
+    SUBJECT_STORAGE_COGNITION_MEMORIES, SUBJECT_STORAGE_COGNITION_REASONS,
+    SUBJECT_STORAGE_COGNITION_SCOPES, SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES,
+    SUBJECT_STORAGE_COGNITION_THREADS,
+};
 pub use identity::{
     identity_shm_name_for_hive, identity_system_call, identity_system_call_ok,
     list_ich_options_from_hive_config, list_ich_options_from_hive_id,

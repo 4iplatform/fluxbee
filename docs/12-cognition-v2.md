@@ -770,6 +770,19 @@ Rules:
 - `entity_version` is the durable shape version for that entity.
 - `writer` identifies the emitting node instance and helps trace rebuild/drift issues.
 
+Router / JetStream boundary:
+- the router publishes only the immutable input stream (`storage.turns`).
+- the router is not the writer of derived cognition entities.
+- `storage.cognition.*` subjects belong to the `SY.cognition -> SY.storage` durable path.
+- the embedded broker/JetStream layer must therefore support both:
+  - durable replay of `storage.turns` for `SY.storage` and `SY.cognition`
+  - durable replay of `storage.cognition.*` for storage-side ingestion/rebuild flows
+
+Open transport items still to freeze in implementation:
+- canonical durable consumer names / queue names
+- replay/start semantics after restart
+- ack/redelivery/poison-message policy
+
 Recommended subject-to-entity mapping:
 - `storage.cognition.threads` → thread snapshots / thread-level state
 - `storage.cognition.contexts` → context entities
