@@ -286,6 +286,7 @@ impl Router {
         let shm = Arc::clone(&self.shm);
         let opa = Arc::clone(&self.opa);
         let opa_reader = Arc::clone(&self.opa_reader);
+        let memory_reader = Arc::clone(&self.memory_reader);
         let hive_id = self.cfg.hive_id.clone();
         let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
         let wan_peers = Arc::clone(&self.wan_peers);
