@@ -1,4 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use tokio::time;
 use tokio_postgres::{error::SqlState, Client, Config as PgConfig, GenericClient, NoTls};
 use tracing_subscriber::EnvFilter;
@@ -15,6 +16,14 @@ use fluxbee_sdk::nats::{
     publish_local as client_nats_publish_local, resolve_local_nats_endpoint, subscribe_local,
     NatsError as ClientNatsError, NatsRequestEnvelope, NatsResponseEnvelope,
     NATS_ENVELOPE_SCHEMA_VERSION,
+};
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::{
+    build_node_config_response_message_runtime_src, build_node_secret_record, connect,
+    load_node_secret_record, managed_node_config_path, managed_node_name, save_node_secret_record,
+    try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSecretDescriptor,
+    NodeSecretWriteOptions, NodeSender, NodeUuidMode, NODE_CONFIG_APPLY_MODE_REPLACE,
+    NODE_SECRET_REDACTION_TOKEN,
 };
 use json_router::nats::{
     NatsSubscriber as RouterNatsSubscriber, SUBJECT_STORAGE_EVENTS, SUBJECT_STORAGE_ITEMS,
@@ -38,6 +47,45 @@ const DURABLE_QUEUE_REACTIVATION: &str = "durable.sy-storage.reactivation";
 const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const STORAGE_METRICS_QUERY_SID: u32 = 19;
 const STORAGE_DB_NAME: &str = "fluxbee_storage";
+const STORAGE_NODE_BASE_NAME: &str = "SY.storage";
+const STORAGE_NODE_VERSION: &str = "2.0";
+const STORAGE_LOCAL_SECRET_KEY_POSTGRES_URL: &str = "postgres_url";
+const STORAGE_CONFIG_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageDbSecretSource {
+    LocalFile,
+    EnvCompat,
+    HiveYamlLegacy,
+    Missing,
+}
+
+impl StorageDbSecretSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalFile => "local_file",
+            Self::EnvCompat => "env_compat",
+            Self::HiveYamlLegacy => "hive_yaml_legacy",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StorageControlState {
+    schema_version: u32,
+    config_version: u64,
+    secret_source: StorageDbSecretSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StorageConfigStateFile {
+    schema_version: u32,
+    config_version: u64,
+    node_name: String,
+    config: Value,
+    updated_at: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -151,7 +199,18 @@ async fn main() -> Result<(), StorageError> {
         .and_then(|n| n.mode.as_deref())
         .map(|mode| mode.trim().eq_ignore_ascii_case("embedded"))
         .unwrap_or(true);
-    let base_database_config = database_config(&hive)?;
+    let node_base_name = managed_node_name(STORAGE_NODE_BASE_NAME, &["SY_STORAGE_NODE_NAME"]);
+    let node_name = ensure_l2_name(&node_base_name, &hive.hive_id);
+    let node_config = NodeConfig {
+        name: node_base_name,
+        router_socket: json_router::paths::router_socket_dir(),
+        uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
+        uuid_mode: NodeUuidMode::Persistent,
+        config_dir: config_dir.clone(),
+        version: STORAGE_NODE_VERSION.to_string(),
+    };
+    let (base_database_config, db_secret_source) = database_config(&hive, &node_name)?;
+    let mut control_state = bootstrap_storage_control_state(&node_name, db_secret_source)?;
     ensure_database_exists(&base_database_config, STORAGE_DB_NAME).await?;
     let storage_database_config = with_dbname(&base_database_config, STORAGE_DB_NAME);
     let storage = Arc::new(Storage::connect(&storage_database_config).await?);
@@ -165,9 +224,15 @@ async fn main() -> Result<(), StorageError> {
 
     tracing::info!(
         hive = %hive.hive_id,
+        node_name = %node_name,
+        db_secret_source = %db_secret_source.as_str(),
         endpoint = %endpoint,
         "sy.storage started"
     );
+
+    let (mut sender, mut receiver) =
+        connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    tracing::info!(node_name = %sender.full_name(), "sy.storage connected to router");
 
     let nats_subscribe_errors = Arc::new(AtomicU64::new(0));
     let storage_handler_errors = Arc::new(AtomicU64::new(0));
@@ -211,16 +276,36 @@ async fn main() -> Result<(), StorageError> {
         Arc::clone(&nats_subscribe_errors),
         Arc::clone(&storage_handler_errors),
     ));
-
-    let _ = tokio::join!(
-        turns_task,
-        events_task,
-        items_task,
-        react_task,
-        metrics_query_task,
-        metrics_task
-    );
-    Ok(())
+    let mut heartbeat = time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                tracing::debug!(
+                    node_name = %sender.full_name(),
+                    config_version = control_state.config_version,
+                    db_secret_source = %control_state.secret_source.as_str(),
+                    "sy.storage heartbeat"
+                );
+            }
+            received = receiver.recv() => {
+                let msg = match received {
+                    Ok(msg) => msg,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "sy.storage recv error; reconnecting");
+                        let (new_sender, new_receiver) =
+                            connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+                        sender = new_sender;
+                        receiver = new_receiver;
+                        tracing::info!(node_name = %sender.full_name(), "sy.storage reconnected to router");
+                        continue;
+                    }
+                };
+                if let Err(err) = process_router_message(&sender, &msg, &mut control_state, &node_name).await {
+                    tracing::warn!(error = %err, action = ?msg.meta.msg, "failed to process sy.storage system message");
+                }
+            }
+        }
+    }
 }
 
 impl Storage {
@@ -1212,32 +1297,41 @@ async fn load_hive(config_dir: &Path) -> Result<HiveFile, StorageError> {
     Ok(serde_yaml::from_str(&data)?)
 }
 
-fn base_database_url(hive: &HiveFile) -> Result<String, StorageError> {
+fn base_database_url(
+    hive: &HiveFile,
+    node_name: &str,
+) -> Result<(String, StorageDbSecretSource), StorageError> {
+    if let Some(url) = load_local_postgres_url(node_name) {
+        return Ok((url, StorageDbSecretSource::LocalFile));
+    }
     if let Ok(url) = std::env::var("FLUXBEE_DATABASE_URL") {
         if !url.trim().is_empty() {
-            return Ok(url);
+            return Ok((url, StorageDbSecretSource::EnvCompat));
         }
     }
     if let Ok(url) = std::env::var("JSR_DATABASE_URL") {
         if !url.trim().is_empty() {
-            return Ok(url);
+            return Ok((url, StorageDbSecretSource::EnvCompat));
         }
     }
     let Some(db) = hive.database.as_ref() else {
-        return Err("database.url missing in hive.yaml and env".into());
+        return Err("database.url missing in local secrets.json, hive.yaml and env".into());
     };
     let Some(url) = db.url.as_ref() else {
-        return Err("database.url missing in hive.yaml and env".into());
+        return Err("database.url missing in local secrets.json, hive.yaml and env".into());
     };
     if url.trim().is_empty() {
         return Err("database.url empty".into());
     }
-    Ok(url.clone())
+    Ok((url.clone(), StorageDbSecretSource::HiveYamlLegacy))
 }
 
-fn database_config(hive: &HiveFile) -> Result<PgConfig, StorageError> {
-    let url = base_database_url(hive)?;
-    Ok(url.parse::<PgConfig>()?)
+fn database_config(
+    hive: &HiveFile,
+    node_name: &str,
+) -> Result<(PgConfig, StorageDbSecretSource), StorageError> {
+    let (url, source) = base_database_url(hive, node_name)?;
+    Ok((url.parse::<PgConfig>()?, source))
 }
 
 fn with_dbname(base: &PgConfig, dbname: &str) -> PgConfig {
@@ -1524,4 +1618,470 @@ fn stable_i64(value: &str) -> i64 {
 
 fn is_mother_role(role: Option<&str>) -> bool {
     matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee")
+}
+
+async fn connect_with_retry(
+    config: &NodeConfig,
+    delay: Duration,
+) -> Result<(NodeSender, NodeReceiver), fluxbee_sdk::NodeError> {
+    loop {
+        match connect(config).await {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                tracing::warn!(error = %err, "sy.storage router connect failed; retrying");
+                time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+async fn process_router_message(
+    sender: &NodeSender,
+    msg: &Message,
+    control_state: &mut StorageControlState,
+    node_name: &str,
+) -> Result<(), StorageError> {
+    if try_handle_default_node_status(sender, msg).await? {
+        return Ok(());
+    }
+    if msg.meta.msg_type != SYSTEM_KIND {
+        return Ok(());
+    }
+    let Some(command) = msg.meta.msg.as_deref() else {
+        return Ok(());
+    };
+    match command {
+        "CONFIG_GET" => {
+            let payload = build_storage_config_get_payload(node_name, control_state, None);
+            sender
+                .send(build_node_config_response_message_runtime_src(msg, payload))
+                .await?;
+        }
+        "CONFIG_SET" => {
+            let payload = apply_storage_config_set(msg, node_name, control_state)?;
+            sender
+                .send(build_node_config_response_message_runtime_src(msg, payload))
+                .await?;
+        }
+        "PING" => {
+            sender
+                .send(build_system_reply(
+                    sender,
+                    msg,
+                    "PONG",
+                    json!({
+                        "ok": true,
+                        "node_name": node_name,
+                        "state": storage_state_label(control_state.secret_source),
+                        "database": {
+                            "mode": "postgres",
+                            "source": control_state.secret_source.as_str(),
+                            "configured": control_state.secret_source != StorageDbSecretSource::Missing
+                        }
+                    }),
+                ))
+                .await?;
+        }
+        "STATUS" => {
+            sender
+                .send(build_system_reply(
+                    sender,
+                    msg,
+                    "STATUS_RESPONSE",
+                    json!({
+                        "ok": true,
+                        "node_name": node_name,
+                        "state": storage_state_label(control_state.secret_source),
+                        "schema_version": control_state.schema_version,
+                        "config_version": control_state.config_version,
+                        "database": {
+                            "mode": "postgres",
+                            "source": control_state.secret_source.as_str(),
+                            "configured": control_state.secret_source != StorageDbSecretSource::Missing
+                        }
+                    }),
+                ))
+                .await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn build_system_reply(
+    sender: &NodeSender,
+    incoming: &Message,
+    response_msg: &str,
+    payload: Value,
+) -> Message {
+    Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            dst: Destination::Unicast(incoming.routing.src.clone()),
+            ttl: incoming.routing.ttl.max(1),
+            trace_id: incoming.routing.trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(response_msg.to_string()),
+            src_ilk: incoming.meta.src_ilk.clone(),
+            scope: incoming.meta.scope.clone(),
+            target: incoming.meta.target.clone(),
+            action: Some(response_msg.to_string()),
+            priority: incoming.meta.priority.clone(),
+            context: incoming.meta.context.clone(),
+        },
+        payload,
+    }
+}
+
+fn bootstrap_storage_control_state(
+    node_name: &str,
+    secret_source: StorageDbSecretSource,
+) -> Result<StorageControlState, StorageError> {
+    let persisted = load_storage_config_state(node_name);
+    let schema_version = persisted
+        .as_ref()
+        .map(|value| value.schema_version)
+        .unwrap_or(STORAGE_CONFIG_SCHEMA_VERSION);
+    let config_version = persisted
+        .as_ref()
+        .map(|value| value.config_version)
+        .unwrap_or(0);
+    let state = StorageControlState {
+        schema_version,
+        config_version,
+        secret_source,
+    };
+    persist_storage_config_state(node_name, &state)?;
+    Ok(state)
+}
+
+fn load_storage_config_state(node_name: &str) -> Option<StorageConfigStateFile> {
+    let path = managed_node_config_path(node_name).ok()?;
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<StorageConfigStateFile>(&raw).ok()
+}
+
+fn persist_storage_config_state(
+    node_name: &str,
+    state: &StorageControlState,
+) -> Result<(), StorageError> {
+    let path = managed_node_config_path(node_name)?;
+    let payload = StorageConfigStateFile {
+        schema_version: state.schema_version,
+        config_version: state.config_version,
+        node_name: node_name.to_string(),
+        config: storage_public_config(state.secret_source),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    write_json_atomic(&path, &serde_json::to_string_pretty(&payload)?)?;
+    Ok(())
+}
+
+fn storage_public_config(secret_source: StorageDbSecretSource) -> Value {
+    json!({
+        "database": {
+            "mode": "postgres",
+            "postgres_url": if secret_source == StorageDbSecretSource::Missing {
+                Value::Null
+            } else {
+                Value::String(NODE_SECRET_REDACTION_TOKEN.to_string())
+            },
+            "source": secret_source.as_str()
+        }
+    })
+}
+
+fn build_storage_config_get_payload(
+    node_name: &str,
+    state: &StorageControlState,
+    note: Option<&str>,
+) -> Value {
+    let configured = state.secret_source != StorageDbSecretSource::Missing;
+    let mut secret_descriptor = NodeSecretDescriptor::new(
+        "config.database.postgres_url",
+        STORAGE_LOCAL_SECRET_KEY_POSTGRES_URL,
+    );
+    secret_descriptor.required = true;
+    secret_descriptor.configured = configured;
+    secret_descriptor.persistence = state.secret_source.as_str().to_string();
+    let mut notes = vec![
+        Value::String("SY.storage uses PostgreSQL only on motherbee.".to_string()),
+        Value::String(
+            "Secret values are persisted in local secrets.json and always returned redacted."
+                .to_string(),
+        ),
+        Value::String(
+            "Applying a new DB secret persists locally and requires sy-storage restart to affect live connections."
+                .to_string(),
+        ),
+    ];
+    if let Some(note) = note.filter(|value| !value.trim().is_empty()) {
+        notes.push(Value::String(note.to_string()));
+    }
+    json!({
+        "ok": configured,
+        "node_name": node_name,
+        "state": storage_state_label(state.secret_source),
+        "schema_version": state.schema_version,
+        "config_version": state.config_version,
+        "config": storage_public_config(state.secret_source),
+        "contract": {
+            "node_family": "SY",
+            "node_kind": "SY.storage",
+            "supports": ["CONFIG_GET", "CONFIG_SET"],
+            "required_fields": ["config.database.postgres_url"],
+            "optional_fields": [],
+            "secrets": [secret_descriptor],
+            "notes": notes,
+        },
+        "error": if configured {
+            Value::Null
+        } else {
+            json!({
+                "code": "missing_secret",
+                "message": "Missing database secret in local secrets.json, env, and hive.yaml."
+            })
+        }
+    })
+}
+
+fn apply_storage_config_set(
+    msg: &Message,
+    node_name: &str,
+    control_state: &mut StorageControlState,
+) -> Result<Value, StorageError> {
+    let Some(requested_node_name) = msg.payload.get("node_name").and_then(Value::as_str) else {
+        return Ok(storage_config_error_response(
+            node_name,
+            control_state,
+            "invalid_config",
+            "Missing required field: payload.node_name".to_string(),
+        ));
+    };
+    if !storage_node_name_matches(node_name, requested_node_name) {
+        return Ok(storage_config_error_response(
+            node_name,
+            control_state,
+            "invalid_config",
+            format!(
+                "Invalid payload.node_name: expected '{}' or '{}', got '{}'",
+                node_name, STORAGE_NODE_BASE_NAME, requested_node_name
+            ),
+        ));
+    }
+    let Some(schema_version_raw) = msg.payload.get("schema_version").and_then(Value::as_u64) else {
+        return Ok(storage_config_error_response(
+            node_name,
+            control_state,
+            "invalid_config",
+            "Missing required field: payload.schema_version".to_string(),
+        ));
+    };
+    let schema_version = schema_version_raw as u32;
+    let Some(config_version) = msg.payload.get("config_version").and_then(Value::as_u64) else {
+        return Ok(storage_config_error_response(
+            node_name,
+            control_state,
+            "invalid_config",
+            "Missing required field: payload.config_version".to_string(),
+        ));
+    };
+    if config_version < control_state.config_version {
+        return Ok(storage_config_error_response(
+            node_name,
+            control_state,
+            "stale_config_version",
+            format!(
+                "Stale config_version: received {}, current {}",
+                config_version, control_state.config_version
+            ),
+        ));
+    }
+    let Some(apply_mode) = msg.payload.get("apply_mode").and_then(Value::as_str) else {
+        return Ok(storage_config_error_response(
+            node_name,
+            control_state,
+            "invalid_config",
+            "Missing required field: payload.apply_mode".to_string(),
+        ));
+    };
+    if apply_mode != NODE_CONFIG_APPLY_MODE_REPLACE {
+        return Ok(storage_config_error_response(
+            node_name,
+            control_state,
+            "unsupported_apply_mode",
+            format!("Unsupported payload.apply_mode='{apply_mode}'"),
+        ));
+    }
+    let Some(config) = msg.payload.get("config").and_then(Value::as_object) else {
+        return Ok(storage_config_error_response(
+            node_name,
+            control_state,
+            "invalid_config",
+            "Missing required field: payload.config".to_string(),
+        ));
+    };
+    let Some(postgres_url) = config
+        .get("database")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("postgres_url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(storage_config_error_response(
+            node_name,
+            control_state,
+            "invalid_config",
+            "config.database.postgres_url is required".to_string(),
+        ));
+    };
+    if let Err(err) = postgres_url.parse::<PgConfig>() {
+        return Ok(storage_config_error_response(
+            node_name,
+            control_state,
+            "invalid_config",
+            format!("invalid postgres_url: {err}"),
+        ));
+    }
+    persist_local_postgres_url(
+        node_name,
+        postgres_url,
+        &build_secret_write_options_from_message(msg),
+    )?;
+    control_state.schema_version = schema_version;
+    control_state.config_version = config_version;
+    control_state.secret_source = StorageDbSecretSource::LocalFile;
+    persist_storage_config_state(node_name, control_state)?;
+    Ok(json!({
+        "ok": true,
+        "node_name": node_name,
+        "state": storage_state_label(control_state.secret_source),
+        "schema_version": control_state.schema_version,
+        "config_version": control_state.config_version,
+        "config": storage_public_config(control_state.secret_source),
+        "notes": [
+            "postgres_url persisted in local secrets.json",
+            "restart_required: sy-storage must be restarted to apply new DB connection settings"
+        ],
+        "error": Value::Null
+    }))
+}
+
+fn storage_config_error_response(
+    node_name: &str,
+    control_state: &StorageControlState,
+    code: &str,
+    message: String,
+) -> Value {
+    json!({
+        "ok": false,
+        "node_name": node_name,
+        "state": storage_state_label(control_state.secret_source),
+        "schema_version": control_state.schema_version,
+        "config_version": control_state.config_version,
+        "config": storage_public_config(control_state.secret_source),
+        "error": {
+            "code": code,
+            "message": message
+        }
+    })
+}
+
+fn storage_state_label(secret_source: StorageDbSecretSource) -> &'static str {
+    match secret_source {
+        StorageDbSecretSource::Missing => "missing_secret",
+        _ => "configured",
+    }
+}
+
+fn storage_node_name_matches(expected: &str, requested: &str) -> bool {
+    requested == expected || requested == STORAGE_NODE_BASE_NAME
+}
+
+fn persist_local_postgres_url(
+    node_name: &str,
+    postgres_url: &str,
+    options: &NodeSecretWriteOptions,
+) -> Result<(), fluxbee_sdk::NodeSecretError> {
+    let mut secrets = load_node_secret_record(node_name)
+        .map(|record| record.secrets)
+        .unwrap_or_else(|_| Map::new());
+    secrets.insert(
+        STORAGE_LOCAL_SECRET_KEY_POSTGRES_URL.to_string(),
+        Value::String(postgres_url.to_string()),
+    );
+    let record = build_node_secret_record(secrets, options);
+    save_node_secret_record(node_name, &record)?;
+    Ok(())
+}
+
+fn load_local_postgres_url(node_name: &str) -> Option<String> {
+    load_node_secret_record(node_name)
+        .ok()
+        .and_then(|record| {
+            record
+                .secrets
+                .get(STORAGE_LOCAL_SECRET_KEY_POSTGRES_URL)
+                .cloned()
+        })
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .filter(|value| !value.trim().is_empty() && value != NODE_SECRET_REDACTION_TOKEN)
+}
+
+fn build_secret_write_options_from_message(msg: &Message) -> NodeSecretWriteOptions {
+    let updated_by_label = msg
+        .payload
+        .get("requested_by")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| msg.meta.action.clone());
+    NodeSecretWriteOptions {
+        updated_by_ilk: msg.meta.src_ilk.clone(),
+        updated_by_label,
+        trace_id: Some(msg.routing.trace_id.clone()),
+    }
+}
+
+fn ensure_l2_name(name: &str, hive_id: &str) -> String {
+    if name.contains('@') {
+        name.to_string()
+    } else {
+        format!("{name}@{hive_id}")
+    }
+}
+
+fn write_json_atomic(path: &Path, content: &str) -> Result<(), StorageError> {
+    let Some(parent) = path.parent() else {
+        return Err("target path has no parent directory".into());
+    };
+    fs::create_dir_all(parent)?;
+    let tmp_name = format!(
+        ".{}.tmp.{}.{}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("state"),
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let tmp_path = parent.join(tmp_name);
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp_path)?;
+    use std::io::Write;
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    fs::rename(&tmp_path, path)?;
+    if let Ok(dir_file) = OpenOptions::new().read(true).open(parent) {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
 }

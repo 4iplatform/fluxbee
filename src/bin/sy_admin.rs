@@ -3207,10 +3207,10 @@ fn admin_action_summary(action: &str) -> &'static str {
         "get_node_state" => "Read the persisted state payload of one node.",
         "get_node_config" => "Read the stored effective config.json payload for a managed node.",
         "node_control_config_get" => {
-            "Send CONFIG_GET to a non-SY node and return its live CONFIG_RESPONSE."
+            "Send CONFIG_GET to a node that participates in live control-plane config and return its CONFIG_RESPONSE."
         }
         "node_control_config_set" => {
-            "Send CONFIG_SET to a non-SY node and return its live CONFIG_RESPONSE."
+            "Send CONFIG_SET to a node that participates in live control-plane config and return its CONFIG_RESPONSE."
         }
         "list_ilks" => "List identity ilks in a hive.",
         "get_ilk" => "Read one identity ilk.",
@@ -3942,7 +3942,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "node_control_config_get" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
-            "This is the canonical live control-plane discovery path for non-SY nodes.",
+            "This is the canonical live control-plane discovery path for nodes that expose CONFIG_GET, including AI.*, IO.*, and SY.storage.",
             "Admin forwards CONFIG_GET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "Use this when you need the node-defined live contract, dynamic config view, or secret metadata; not when a plain stored config.json read is enough.",
             "The node defines the response contract and config schema; SY.admin only standardizes transport.",
@@ -3950,7 +3950,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "node_control_config_set" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
-            "This is the canonical live control-plane mutation path for non-SY nodes.",
+            "This is the canonical live control-plane mutation path for nodes that expose CONFIG_SET, including AI.*, IO.*, and SY.storage.",
             "Admin forwards CONFIG_SET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
         ],
