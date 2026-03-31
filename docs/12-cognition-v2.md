@@ -87,12 +87,15 @@ The physical unit of conversational continuity given by the medium. Created by t
 
 The IO node chooses the rule because it knows the channel type. The SDK provides a canonical `compute_thread_id(channel_type, params)` function.
 
+**Sequencing:** every message that belongs to a thread also carries `meta.thread_seq`. Unlike `thread_id`, this value is **not** assigned by the IO node. It is assigned by the router when the message enters the local conversation flow for that thread, so the system has a deterministic per-thread order for persistence, replay, scope cuts, and evidence ranges.
+
 **Rules:**
 
 - Thread does not change when the topic changes. Semantic segmentation happens at scope/context level, not thread level.
 - Thread can be long-lived (months, years). That is a feature, not a bug — the meaning is tracked by contexts, reasons, and scopes, not by the thread itself.
 - For groups, participants entering or leaving do not create a new thread. The channel identity (ICH) is stable.
 - All messages, contexts, reasons, memories, and episodes are associated with a thread.
+- `thread_id` is computed by SDK/IO. `thread_seq` is assigned by the router.
 
 ### 3.2 Scope
 
@@ -322,11 +325,50 @@ Message arrives (via NATS from router)
 
 SY.cognition consumes from NATS (`storage.turns` stream). Same stream as SY.storage. Fire & forget from router (~1ms).
 
+The canonical turn carrier for cognition v2 is:
+- `meta.thread_id`
+- `meta.thread_seq`
+- `meta.ich`
+- `meta.src_ilk`
+- `meta.dst_ilk` when known
+
+`meta.ctx`, `meta.ctx_seq`, and `meta.ctx_window` belong to the previous model and should be treated as legacy compatibility fields during migration, not as the canonical cognition carrier.
+
+### 5.2.1 Canonical `meta` fields for cognition v2
+
+The message protocol may still contain legacy fields during migration, but the **canonical** cognition carrier is:
+
+```json
+{
+  "meta": {
+    "type": "user",
+    "src_ilk": "ilk:...",
+    "dst_ilk": "ilk:...",
+    "ich": "ich:...",
+    "thread_id": "thread:...",
+    "thread_seq": 47,
+    "memory_package": {
+      "package_version": 2,
+      "...": "..."
+    }
+  }
+}
+```
+
+Rules:
+- `thread_id` is computed by SDK/IO.
+- `thread_seq` is assigned by the router.
+- `thread_seq` is monotonic **within a thread**, not globally.
+- `ctx`, `ctx_seq`, and `ctx_window` are not part of the v2 canonical model.
+- During migration, old producers/consumers may still read `ctx*`, but new canonical paths should not depend on them.
+
 ### 5.3 Message Enrichment
 
 Router reads `jsr-memory-<hive>` SHM to attach `memory_package` to messages. The router enriches, not SY.cognition. SY.cognition writes the data; the router reads and attaches it.
 
 **Important:** Enrichment happens AFTER the routing decision. OPA decides where the message goes based on identity data only. Then, before delivery to the destination node, the router attaches the memory_package so the AI node has cognitive context. The memory_package does not influence routing.
+
+In v2, router enrichment should be resolved primarily by `thread_id` (and optionally narrowed by message identity metadata), not by semantic tags of the current message. This keeps the enrichment path viable even when cognitive tagging is asynchronous.
 
 ---
 
@@ -638,6 +680,56 @@ SY.cognition runs on every hive. Each instance processes messages from its local
 | LanceDB | Local cognitive database | `/var/lib/fluxbee/nodes/SY/SY.cognition@<hive>/memory.lance` | ~ms |
 | PostgreSQL | Durable source of truth (via SY.storage) | Motherbee only | ~10ms |
 
+### 10.2.1 Durable Model (v2)
+
+The durable model for cognition v2 should be explicit and should not reuse the old `events/items/reactivation` semantics as its conceptual base.
+
+`storage.turns` remains the immutable input stream. Everything else belongs to the cognition v2 domain.
+
+Recommended durable entities:
+
+- `cognition_threads`
+- `cognition_contexts`
+- `cognition_reasons`
+- `cognition_scopes`
+- `cognition_scope_instances`
+- `cognition_memories`
+- `cognition_episodes`
+
+Optional auxiliary durable entities:
+
+- `cognition_context_signals`
+- `cognition_reason_signals`
+- `cognition_links`
+
+Durable source-of-truth policy:
+
+- **Source of truth**
+  - turns
+  - contexts
+  - reasons
+  - scopes
+  - scope_instances
+  - memories
+  - episodes
+- **Derived / rebuildable**
+  - `jsr-memory`
+  - local enrichment indexes
+  - local hot caches
+
+Recommended transport to `SY.storage`:
+
+- explicit cognition subjects, not the old v1 semantic subjects
+- for example:
+  - `storage.cognition.threads`
+  - `storage.cognition.contexts`
+  - `storage.cognition.reasons`
+  - `storage.cognition.scopes`
+  - `storage.cognition.memories`
+  - `storage.cognition.episodes`
+
+This keeps the domain typed, inspectable, and migration-safe.
+
 ### 10.3 Cold Start
 
 Rebuild from PostgreSQL via SY.storage socket. Replay turns through pipeline to reconstruct contexts, reasons, memories, episodes.
@@ -646,7 +738,69 @@ Rebuild from PostgreSQL via SY.storage socket. Replay turns through pipeline to 
 
 Single writer: SY.cognition. Uses seqlock.
 
-Contains inverted index of tags + reason signals → memory/episode references for router enrichment.
+Contains hot cognitive summaries keyed for router enrichment. In v2 the primary lookup axis is `thread_id`, with compact references to:
+- dominant context
+- dominant reason
+- top contexts
+- top reasons
+- top memories
+- top episodes
+
+The SHM is for fast enrichment lookups, not for full evidence replay.
+
+### 10.4.1 Logical Layout of `jsr-memory`
+
+The logical layout should prioritize deterministic, bounded router reads.
+
+Recommended contents:
+
+1. **Header**
+   - magic
+   - version
+   - owner UUID
+   - seqlock sequence
+   - counters
+   - timestamps
+
+2. **Thread Index**
+   - `thread_id -> thread_slot`
+   - fixed-size or bounded hash table
+
+3. **Thread Summary Entries**
+   - `thread_id`
+   - latest `thread_seq`
+   - dominant context ref
+   - dominant reason ref
+   - top-N context refs
+   - top-N reason refs
+   - top-N memory refs
+   - top-N episode refs
+   - updated_at
+
+4. **Compact Entity Pools**
+   - context summary pool
+   - reason summary pool
+   - memory summary pool
+   - episode summary pool
+
+5. **Optional reverse index**
+   - for future use only
+   - no semantic nearest-neighbor logic required in v1
+
+Design constraints:
+
+- single writer: `SY.cognition`
+- lock-free readers: router and local diagnostics
+- no large text bodies in SHM
+- summaries only; full evidence lives in durable storage / local DB
+- all arrays bounded with explicit truncation rules
+
+Recommended first read path:
+
+- router receives message with `thread_id`
+- router probes `jsr-memory` by `thread_id`
+- router builds `memory_package`
+- router never performs heavy semantic search in hot path
 
 ---
 
@@ -658,6 +812,18 @@ The memory_package is attached by the router to messages before delivery to dest
 {
   "meta": {
     "memory_package": {
+      "package_version": 2,
+      "thread_id": "thread:...",
+      "dominant_context": {
+        "context_id": "...",
+        "label": "billing dispute",
+        "weight": 4.2
+      },
+      "dominant_reason": {
+        "reason_id": "...",
+        "label": "seeking urgent resolution",
+        "weight": 3.8
+      },
       "contexts": [
         {"context_id": "...", "label": "billing dispute", "weight": 4.2}
       ],
@@ -670,11 +836,24 @@ The memory_package is attached by the router to messages before delivery to dest
       ],
       "episodes": [
         {"episode_id": "...", "title": "Friction over delayed refund", "intensity": 8}
+      ],
+      "truncated": {
+        "applied": false,
+        "dropped_contexts": 0,
+        "dropped_reasons": 0,
+        "dropped_memories": 0,
+        "dropped_episodes": 0
       ]
     }
   }
 }
 ```
+
+Contract notes:
+- `dominant_context` and `dominant_reason` are mandatory whenever the package is non-empty.
+- `thread_id` inside the package must match `meta.thread_id`.
+- `package_version=2` marks the new cognition model and separates it from the old event/highlight package shape.
+- The package is resolved from `jsr-memory` by `thread_id`, not by an inline semantic query over the current message text.
 
 ### Limits
 
@@ -742,6 +921,8 @@ For v1, the reason evaluator is deterministic, operating only on the 8 canonical
 
 **Resolved.** Thread computation uses three rules by channel type (see section 3.1). The SDK provides `compute_thread_id(channel_type, params)`. Hash function: to be specified (SHA-256 truncated or blake3).
 
+**Additional resolved rule:** `thread_seq` is assigned by the router, not by IO. The router is the only component that should serialize message order within a thread for cognition and durable replay.
+
 ### 13.6 Feed/Stream Processing
 
 Continuous feeds deferred. System assumes discrete messages. IO handles segmentation.
@@ -789,6 +970,7 @@ Both coexist. Neither replaces the other.
 
 - [ ] COG-T1. Implement `compute_thread_id(channel_type, params)` in SDK with three rules (DM, group, native).
 - [ ] COG-T2. IO nodes include `thread_id` in message metadata using SDK function.
+- [ ] COG-T2b. Router assigns `thread_seq` per `thread_id` and includes it in message metadata.
 - [ ] COG-T3. SY.cognition consumes from NATS `storage.turns`.
 - [ ] COG-T4. Implement tagger (extended: tags + reason_signals_canonical + reason_signals_extra in single call).
 - [ ] COG-T5. Implement context evaluator.
