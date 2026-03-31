@@ -1548,10 +1548,22 @@ async fn run_outbound_loop(
     blob_payload_cfg: IoTextBlobConfig,
 ) -> Result<()> {
     loop {
-        let Some(msg) = ({
+        let next_msg = ({
             let mut guard = inbox.lock().await;
-            guard.recv_next_timeout(Duration::from_secs(1)).await?
-        }) else {
+            guard.recv_next_timeout(Duration::from_secs(1)).await
+        });
+        let next_msg = match next_msg {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "router inbox recv failed in outbound loop; continuing"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+        };
+        let Some(msg) = next_msg else {
             continue;
         };
 
