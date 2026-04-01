@@ -953,32 +953,6 @@ impl GenericAiNode {
         if let Some(base_url) = &openai.base_url {
             client = client.with_base_url(base_url.clone());
         }
-        let tool_registry = self.build_tool_registry(ctx)?;
-        if !tool_registry.definitions().is_empty() {
-            let model = client.clone().function_model(
-                openai.model.clone(),
-                openai.instructions.clone(),
-                openai.model_settings.clone(),
-            );
-            let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
-            let immediate_memory = self.load_immediate_memory_for_input(openai, ctx).await;
-            let run_input =
-                self.build_function_run_input(input.clone(), ctx, openai, immediate_memory);
-            let result = if openai.immediate_memory.enabled {
-                runner
-                    .run_with_input(&model, &tool_registry, run_input)
-                    .await?
-            } else {
-                runner.run(&model, &tool_registry, input.clone()).await?
-            };
-            if let Some(text) = result.final_assistant_text {
-                self.persist_immediate_turn(openai, ctx, &input, &text)
-                    .await;
-                return Ok(text);
-            }
-        }
-
-        let current_user_input = input.clone();
         let input_parts = if openai.multimodal {
             if let Some(resolved) = resolved_user_input {
                 Some(
@@ -994,6 +968,33 @@ impl GenericAiNode {
         } else {
             None
         };
+        let tool_registry = self.build_tool_registry(ctx)?;
+        if !tool_registry.definitions().is_empty() {
+            let model = client.clone().function_model(
+                openai.model.clone(),
+                openai.instructions.clone(),
+                openai.model_settings.clone(),
+            );
+            let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+            let immediate_memory = self.load_immediate_memory_for_input(openai, ctx).await;
+            let run_input = self.build_function_run_input(
+                input.clone(),
+                input_parts.clone(),
+                ctx,
+                openai,
+                immediate_memory,
+            );
+            let result = runner
+                .run_with_input(&model, &tool_registry, run_input)
+                .await?;
+            if let Some(text) = result.final_assistant_text {
+                self.persist_immediate_turn(openai, ctx, &input, &text)
+                    .await;
+                return Ok(text);
+            }
+        }
+
+        let current_user_input = input.clone();
         let req = fluxbee_ai_sdk::llm::LlmRequest {
             model: openai.model.clone(),
             system: openai.instructions.clone(),
@@ -1011,15 +1012,21 @@ impl GenericAiNode {
     fn build_function_run_input(
         &self,
         input: String,
+        input_parts: Option<Vec<Value>>,
         ctx: &BehaviorContext,
         openai: &OpenAiChatRuntime,
         immediate_memory: Option<ImmediateConversationMemory>,
     ) -> FunctionRunInput {
         if !openai.immediate_memory.enabled {
-            return FunctionRunInput::new(input);
+            return FunctionRunInput {
+                current_user_message: input,
+                current_user_parts: input_parts,
+                immediate_memory: None,
+            };
         }
         FunctionRunInput {
             current_user_message: input,
+            current_user_parts: input_parts,
             immediate_memory: immediate_memory.or_else(|| {
                 Some(ImmediateConversationMemory {
                     thread_id: ctx.thread_id.clone(),

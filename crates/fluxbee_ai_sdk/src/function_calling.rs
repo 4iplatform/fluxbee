@@ -44,6 +44,7 @@ pub struct FunctionToolResult {
 pub enum FunctionLoopItem {
     SystemText { content: String },
     UserText { content: String },
+    UserContentParts { content: Vec<Value> },
     AssistantText { content: String },
     ToolResult { result: FunctionToolResult },
 }
@@ -220,9 +221,13 @@ fn build_initial_items(input: FunctionRunInput) -> Vec<FunctionLoopItem> {
             });
         }
     }
-    items.push(FunctionLoopItem::UserText {
-        content: trim_text(&input.current_user_message, DEFAULT_INTERACTION_MAX_CHARS),
-    });
+    if let Some(parts) = input.current_user_parts.filter(|parts| !parts.is_empty()) {
+        items.push(FunctionLoopItem::UserContentParts { content: parts });
+    } else {
+        items.push(FunctionLoopItem::UserText {
+            content: trim_text(&input.current_user_message, DEFAULT_INTERACTION_MAX_CHARS),
+        });
+    }
     items
 }
 
@@ -533,6 +538,25 @@ mod tests {
 
     struct DemoTool;
 
+    #[derive(Clone, Default)]
+    struct CaptureModel {
+        last_request: Arc<Mutex<Option<FunctionModelTurnRequest>>>,
+    }
+
+    #[async_trait]
+    impl FunctionCallingModel for CaptureModel {
+        async fn run_turn(
+            &self,
+            request: FunctionModelTurnRequest,
+        ) -> Result<FunctionModelTurnResponse> {
+            *self.last_request.lock().await = Some(request);
+            Ok(FunctionModelTurnResponse {
+                assistant_text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+            })
+        }
+    }
+
     #[async_trait]
     impl FunctionTool for DemoTool {
         fn definition(&self) -> FunctionToolDefinition {
@@ -582,5 +606,37 @@ mod tests {
             assistant_messages,
             vec!["The tool failed, so there is nothing to confirm."]
         );
+    }
+
+    #[tokio::test]
+    async fn function_run_input_can_seed_multimodal_user_parts() {
+        let model = CaptureModel::default();
+        let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+        let tools = FunctionToolRegistry::new();
+        let input = FunctionRunInput {
+            current_user_message: "fallback".to_string(),
+            current_user_parts: Some(vec![
+                json!({"type":"input_text","text":"hola"}),
+                json!({"type":"input_image","image_url":"data:image/png;base64,AAA"}),
+            ]),
+            immediate_memory: None,
+        };
+
+        let result = runner
+            .run_with_input(&model, &tools, input)
+            .await
+            .expect("run should succeed");
+        assert_eq!(result.final_assistant_text.as_deref(), Some("ok"));
+
+        let request = model
+            .last_request
+            .lock()
+            .await
+            .clone()
+            .expect("request should be captured");
+        assert!(request.items.iter().any(|item| matches!(
+            item,
+            FunctionLoopItem::UserContentParts { content } if content.len() == 2
+        )));
     }
 }

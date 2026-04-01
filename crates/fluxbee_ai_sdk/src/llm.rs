@@ -294,6 +294,12 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                             "content": [{"type":"input_text","text": content}],
                         }));
                     }
+                    FunctionLoopItem::UserContentParts { content } => {
+                        input.push(json!({
+                            "role": "user",
+                            "content": content,
+                        }));
+                    }
                     FunctionLoopItem::ToolResult { result } => {
                         let output_text = match result.output {
                             Value::String(s) => s,
@@ -475,6 +481,10 @@ fn loop_item_to_openai_input(item: FunctionLoopItem) -> Value {
             "role": "user",
             "content": [{"type":"input_text","text": content}],
         }),
+        FunctionLoopItem::UserContentParts { content } => json!({
+            "role": "user",
+            "content": content,
+        }),
         FunctionLoopItem::AssistantText { content } => json!({
             "role": "assistant",
             "content": [{"type":"output_text","text": content}],
@@ -520,6 +530,19 @@ mod tests {
         });
         assert_eq!(system["content"][0]["type"], "input_text");
         assert_eq!(user["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn user_content_parts_are_forwarded_verbatim() {
+        let item = loop_item_to_openai_input(FunctionLoopItem::UserContentParts {
+            content: vec![
+                json!({"type":"input_text","text":"hola"}),
+                json!({"type":"input_image","image_url":"data:image/jpeg;base64,AAA"}),
+            ],
+        });
+        assert_eq!(item["role"], "user");
+        assert_eq!(item["content"][0]["type"], "input_text");
+        assert_eq!(item["content"][1]["type"], "input_image");
     }
 
     #[test]
