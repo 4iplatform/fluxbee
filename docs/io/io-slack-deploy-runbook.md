@@ -269,3 +269,25 @@ bash scripts/deploy-io-slack.sh ... --allow-sync-pending
 ```
 
 Esto permite continuar a `spawn`, pero no corrige el problema de fondo del manifest global.
+
+---
+
+## 10) Nota de contrato `text/v1` (offload > limite)
+
+En estado actual, la regla de offload por tamano para inbound `text/v1` esta centralizada en `io-common`:
+
+- `io-slack` arma payload base (`content` + `attachments`).
+- `io-common` decide inline vs `content_ref` segun `io.blob.max_message_bytes` (default 64KB) y `io.blob.message_overhead_bytes`.
+
+Logs esperados:
+
+- `inbound text/v1 normalized` (debug)
+- `inbound text/v1 processed as blob` (info, solo cuando hubo offload)
+
+Esto evita divergencias entre adapters IO y mantiene comportamiento uniforme de `text/v1`.
+
+Nota de alcance de pruebas:
+
+- Para validar de forma determinística payloads de texto muy grandes (ejemplo `>64KB`), usar `io-sim`.
+- En Slack real, `chat.postMessage` tiene límites propios del canal y trunca texto por encima de 40.000 caracteres, por lo que no es un canal confiable para probar umbrales internos extremos.
+  - Fuente: https://docs.slack.dev/reference/methods/chat.postMessage/ ("Truncating content").

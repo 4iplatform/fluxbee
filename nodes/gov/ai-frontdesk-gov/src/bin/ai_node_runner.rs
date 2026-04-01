@@ -9,12 +9,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
 use fluxbee_ai_sdk::{
-    build_reply_message_runtime_src, build_text_response, extract_text, AiNode, AiNodeConfig,
+    build_openai_user_content_parts, build_reply_message_runtime_src, build_text_response,
+    extract_text, resolve_model_input_from_payload_with_options, AiNode, AiNodeConfig,
     FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
     FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
-    ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelSettings, NodeRuntime,
-    OpenAiResponsesClient, RetryPolicy, RouterClient, RuntimeConfig, ThreadStateStore,
-    ThreadStateToolsProvider,
+    ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
+    ModelSettings, NodeRuntime, OpenAiResponsesClient, ResolvedModelInput, RetryPolicy,
+    RouterClient, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
 };
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{
@@ -27,6 +28,11 @@ use fluxbee_sdk::{
     NODE_SECRET_REDACTION_TOKEN,
 };
 use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
+use gov_common::{
+    gov_identity_config_from_env, identity_error_to_tool_payload, looks_like_tenant_id,
+    resolve_tenant_id_for_register, tenant_resolution_source, GovIdentityConfig,
+    GOV_IDENTITY_TENANT_ID_ENV,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::fs as tokio_fs;
@@ -40,9 +46,6 @@ const MSG_NODE_STATUS_GET: &str = "NODE_STATUS_GET";
 const MSG_NODE_STATUS_GET_RESPONSE: &str = "NODE_STATUS_GET_RESPONSE";
 const NODE_STATUS_DEFAULT_HANDLER_ENABLED: &str = "NODE_STATUS_DEFAULT_HANDLER_ENABLED";
 const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE";
-const GOV_IDENTITY_TARGET_ENV: &str = "GOV_IDENTITY_TARGET";
-const GOV_IDENTITY_TIMEOUT_MS_ENV: &str = "GOV_IDENTITY_TIMEOUT_MS";
-const GOV_IDENTITY_TENANT_ID_ENV: &str = "GOV_IDENTITY_TENANT_ID";
 const IMMEDIATE_INTERACTION_MAX_CHARS: usize = 1_200;
 const AI_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
 
@@ -140,6 +143,14 @@ struct OpenAiChatSection {
     openai: Option<OpenAiCredentialsSection>,
     #[serde(default)]
     base_url: Option<String>,
+    #[serde(default)]
+    capabilities: Option<BehaviorCapabilities>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct BehaviorCapabilities {
+    #[serde(default)]
+    multimodal: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +262,8 @@ struct EffectiveBehaviorSection {
     openai: Option<OpenAiCredentialsSection>,
     #[serde(default)]
     base_url: Option<String>,
+    #[serde(default)]
+    capabilities: Option<BehaviorCapabilities>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -363,6 +376,10 @@ fn default_openai_api_key_env() -> String {
     "OPENAI_API_KEY".to_string()
 }
 
+fn default_multimodal_for_runtime() -> bool {
+    false
+}
+
 fn default_trim_true() -> bool {
     true
 }
@@ -382,6 +399,7 @@ struct OpenAiChatRuntime {
     yaml_inline_api_key: Option<String>,
     base_url: Option<String>,
     immediate_memory: ImmediateMemorySection,
+    multimodal: bool,
 }
 
 struct GenericAiNode {
@@ -394,23 +412,6 @@ struct GenericAiNode {
     gov_identity: GovIdentityConfig,
     gov_identity_bridge: Option<Arc<GovIdentityBridge>>,
     control_plane: Arc<RwLock<ControlPlaneState>>,
-}
-
-#[derive(Debug, Clone)]
-struct GovIdentityConfig {
-    target: String,
-    fallback_target: Option<String>,
-    timeout: Duration,
-}
-
-impl Default for GovIdentityConfig {
-    fn default() -> Self {
-        Self {
-            target: "SY.identity@motherbee".to_string(),
-            fallback_target: None,
-            timeout: Duration::from_secs(10),
-        }
-    }
 }
 
 struct SharedRouterConnection {
@@ -865,7 +866,27 @@ impl AiNode for GenericAiNode {
             return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
         };
 
-        let input = extract_text(&msg.payload).unwrap_or_default();
+        let (input, resolved_user_input): (String, Option<ResolvedModelInput>) = if msg
+            .meta
+            .msg_type
+            .eq_ignore_ascii_case("user")
+        {
+            let options = ModelInputOptions {
+                multimodal: matches!(&behavior, NodeBehavior::OpenAiChat(openai) if openai.multimodal),
+                ..ModelInputOptions::default()
+            };
+            match resolve_model_input_from_payload_with_options(&msg.payload, &options).await {
+                Ok(value) => (value.prompt_text.clone(), Some(value)),
+                Err(err) => {
+                    return Ok(Some(build_reply_message_runtime_src(
+                        &msg,
+                        err.to_error_payload(),
+                    )))
+                }
+            }
+        } else {
+            (extract_text(&msg.payload).unwrap_or_default(), None)
+        };
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             tracing::info!(
                 node_name = %self.node_name,
@@ -881,7 +902,33 @@ impl AiNode for GenericAiNode {
         let output = match &behavior {
             NodeBehavior::Echo => format!("Echo: {input}"),
             NodeBehavior::OpenAiChat(openai) => {
-                match self.run_openai_chat(openai, input, &behavior_ctx).await {
+                let input_parts = if openai.multimodal {
+                    if let Some(resolved) = resolved_user_input.as_ref() {
+                        match build_openai_user_content_parts(resolved).await {
+                            Ok(parts) => Some(parts),
+                            Err(err) => {
+                                tracing::warn!(
+                                    node_name = %self.node_name,
+                                    trace_id = %msg.routing.trace_id,
+                                    error = %err,
+                                    "failed to build structured user input parts; replying with canonical attachment error payload"
+                                );
+                                return Ok(Some(build_reply_message_runtime_src(
+                                    &msg,
+                                    err.to_error_payload(),
+                                )));
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                match self
+                    .run_openai_chat(openai, input, input_parts, &behavior_ctx)
+                    .await
+                {
                     Ok(output) => output,
                     Err(err) if err.to_string().contains("missing OpenAI api key") => {
                         tracing::warn!(
@@ -893,7 +940,51 @@ impl AiNode for GenericAiNode {
                         let payload = missing_openai_api_key_payload();
                         return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        let attachment_summary =
+                            attachment_summary_for_observability(resolved_user_input.as_ref());
+                        if let fluxbee_ai_sdk::errors::AiSdkError::Protocol(msg_text) = &err {
+                            if let Some((status, detail)) = parse_openai_status_error(msg_text) {
+                                tracing::warn!(
+                                    node_name = %self.node_name,
+                                    trace_id = %msg.routing.trace_id,
+                                    model = %openai.model,
+                                    provider_status = status,
+                                    provider_param = ?extract_openai_error_param(&detail),
+                                    provider_detail = %trim_chars(&detail, 280),
+                                    attachment_count = attachment_summary.count,
+                                    attachment_total_bytes = attachment_summary.total_bytes,
+                                    attachment_mimes = ?attachment_summary.mimes,
+                                    error = %err,
+                                    "openai runtime request failed with structured provider status; replying with provider error payload"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    node_name = %self.node_name,
+                                    trace_id = %msg.routing.trace_id,
+                                    model = %openai.model,
+                                    attachment_count = attachment_summary.count,
+                                    attachment_total_bytes = attachment_summary.total_bytes,
+                                    attachment_mimes = ?attachment_summary.mimes,
+                                    error = %err,
+                                    "openai runtime request failed; replying with provider error payload"
+                                );
+                            }
+                        } else {
+                            tracing::warn!(
+                                node_name = %self.node_name,
+                                trace_id = %msg.routing.trace_id,
+                                model = %openai.model,
+                                attachment_count = attachment_summary.count,
+                                attachment_total_bytes = attachment_summary.total_bytes,
+                                attachment_mimes = ?attachment_summary.mimes,
+                                error = %err,
+                                "openai runtime request failed; replying with provider error payload"
+                            );
+                        }
+                        let payload = openai_runtime_error_payload(&err);
+                        return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
+                    }
                 }
             }
         };
@@ -908,6 +999,7 @@ impl GenericAiNode {
         &self,
         openai: &OpenAiChatRuntime,
         input: String,
+        input_parts: Option<Vec<Value>>,
         ctx: &BehaviorContext,
     ) -> fluxbee_ai_sdk::Result<String> {
         let api_key = self.resolve_openai_api_key(openai).await.ok_or_else(|| {
@@ -929,15 +1021,16 @@ impl GenericAiNode {
             );
             let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
             let immediate_memory = self.load_immediate_memory_for_input(openai, ctx).await;
-            let run_input =
-                self.build_function_run_input(input.clone(), ctx, openai, immediate_memory);
-            let result = if openai.immediate_memory.enabled {
-                runner
-                    .run_with_input(&model, &tool_registry, run_input)
-                    .await?
-            } else {
-                runner.run(&model, &tool_registry, input.clone()).await?
-            };
+            let run_input = self.build_function_run_input(
+                input.clone(),
+                input_parts.clone(),
+                ctx,
+                openai,
+                immediate_memory,
+            );
+            let result = runner
+                .run_with_input(&model, &tool_registry, run_input)
+                .await?;
             if let Some(text) = result.final_assistant_text {
                 self.persist_immediate_turn(openai, ctx, &input, &text)
                     .await;
@@ -950,6 +1043,7 @@ impl GenericAiNode {
             model: openai.model.clone(),
             system: openai.instructions.clone(),
             input,
+            input_parts,
             max_output_tokens: None,
             model_settings: Some(openai.model_settings.clone()),
         };
@@ -962,15 +1056,21 @@ impl GenericAiNode {
     fn build_function_run_input(
         &self,
         input: String,
+        input_parts: Option<Vec<Value>>,
         ctx: &BehaviorContext,
         openai: &OpenAiChatRuntime,
         immediate_memory: Option<ImmediateConversationMemory>,
     ) -> FunctionRunInput {
         if !openai.immediate_memory.enabled {
-            return FunctionRunInput::new(input);
+            return FunctionRunInput {
+                current_user_message: input,
+                current_user_parts: input_parts,
+                immediate_memory: None,
+            };
         }
         FunctionRunInput {
             current_user_message: input,
+            current_user_parts: input_parts,
             immediate_memory: immediate_memory.or_else(|| {
                 Some(ImmediateConversationMemory {
                     thread_id: ctx.thread_id.clone(),
@@ -1586,7 +1686,7 @@ impl GenericAiNode {
             "config_version": state.config_version,
             "contract": {
                 "node_family": "AI",
-                "node_kind": "AI.common",
+                "node_kind": "AI.frontdesk.gov",
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
                 "required_fields": [
                     "config.behavior.kind",
@@ -1597,12 +1697,14 @@ impl GenericAiNode {
                     "config.behavior.instructions",
                     "config.behavior.model_settings",
                     "config.behavior.base_url",
+                    "config.behavior.capabilities.multimodal",
                     "config.secrets.openai.api_key_env"
                 ],
                 "secrets": [secret_descriptor],
                 "notes": [
                     "Preferred secret field is config.secrets.openai.api_key.",
                     "Legacy aliases config.behavior.openai.api_key and config.behavior.api_key remain accepted during migration.",
+                    "AI.frontdesk.gov defaults behavior.capabilities.multimodal=false unless explicitly overridden.",
                     "Secret values are persisted in local secrets.json and always returned redacted."
                 ]
             },
@@ -1674,30 +1776,11 @@ fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .unwrap_or(default)
-}
-
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-}
-
-fn gov_identity_config_from_env() -> GovIdentityConfig {
-    let mut cfg = GovIdentityConfig::default();
-    if let Some(target) = env_nonempty(GOV_IDENTITY_TARGET_ENV) {
-        cfg.target = target;
-    }
-    cfg.timeout = Duration::from_millis(env_u64(
-        GOV_IDENTITY_TIMEOUT_MS_ENV,
-        cfg.timeout.as_millis() as u64,
-    ));
-    cfg
 }
 
 #[async_trait]
@@ -1931,32 +2014,6 @@ impl FunctionTool for IlkRegisterTool {
             }
         }
     }
-}
-
-fn identity_error_to_tool_payload(msg: String) -> Value {
-    let upper = msg.to_ascii_uppercase();
-    let (error_code, retryable) = if upper.contains("NOT_PRIMARY") {
-        ("NOT_PRIMARY", true)
-    } else if upper.contains("UNREACHABLE") || upper.contains("NODE_NOT_FOUND") {
-        ("UNAVAILABLE", true)
-    } else if upper.contains("TTL EXCEEDED") || upper.contains("TTL_EXCEEDED") {
-        ("TTL_EXCEEDED", true)
-    } else if upper.contains("TIMEOUT") {
-        ("TIMEOUT", true)
-    } else if upper.contains("INVALID_") {
-        ("INVALID_REQUEST", false)
-    } else if upper.contains("UNAUTHORIZED_REGISTRAR") {
-        ("UNAUTHORIZED_REGISTRAR", false)
-    } else {
-        ("IDENTITY_ERROR", true)
-    };
-
-    json!({
-        "status": "error",
-        "error_code": error_code,
-        "message": msg,
-        "retryable": retryable
-    })
 }
 
 impl NodeBehavior {
@@ -2542,10 +2599,7 @@ impl RunnerMode {
 fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + Sync>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let mut parsed = RunnerArgs {
-        mode: std::env::var("AI_NODE_MODE")
-            .ok()
-            .and_then(|v| RunnerMode::parse(&v))
-            .unwrap_or_default(),
+        mode: RunnerMode::Gov,
         ..RunnerArgs::default()
     };
     let mut i = 0usize;
@@ -2608,13 +2662,14 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --mode".to_string().into());
                 };
-                let Some(mode) = RunnerMode::parse(value) else {
+                let normalized = value.trim().to_ascii_lowercase();
+                if normalized != "gov" {
                     return Err(format!(
-                        "invalid value for --mode: {value} (expected default|gov)"
+                        "--mode={value} is not supported in AI.frontdesk.gov runtime (only gov)"
                     )
                     .into());
-                };
-                parsed.mode = mode;
+                }
+                parsed.mode = RunnerMode::Gov;
                 i += 2;
             }
             other => {
@@ -2707,6 +2762,11 @@ fn build_behavior(
                 .as_ref()
                 .and_then(|v| v.api_key.clone())
                 .or_else(|| openai.api_key.clone());
+            let multimodal = openai
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.multimodal)
+                .unwrap_or_else(default_multimodal_for_runtime);
             NodeBehavior::OpenAiChat(OpenAiChatRuntime {
                 model: openai.model.clone(),
                 instructions,
@@ -2715,6 +2775,7 @@ fn build_behavior(
                 yaml_inline_api_key,
                 base_url: openai.base_url.clone(),
                 immediate_memory: cfg.runtime.immediate_memory.clone(),
+                multimodal,
             })
         }
     };
@@ -2763,6 +2824,11 @@ fn build_behavior_from_effective_config(
                 .as_ref()
                 .and_then(|runtime| runtime.immediate_memory.clone())
                 .unwrap_or_default();
+            let multimodal = behavior
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.multimodal)
+                .unwrap_or_else(default_multimodal_for_runtime);
 
             Ok(NodeBehavior::OpenAiChat(OpenAiChatRuntime {
                 model,
@@ -2772,6 +2838,7 @@ fn build_behavior_from_effective_config(
                 yaml_inline_api_key,
                 base_url,
                 immediate_memory,
+                multimodal,
             }))
         }
         other => Err(format!("unsupported behavior.kind '{other}'").into()),
@@ -2842,6 +2909,15 @@ fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocu
             api_key: openai.api_key.clone(),
             openai: openai.openai.clone(),
             base_url: openai.base_url.clone(),
+            capabilities: Some(BehaviorCapabilities {
+                multimodal: Some(
+                    openai
+                        .capabilities
+                        .as_ref()
+                        .and_then(|caps| caps.multimodal)
+                        .unwrap_or_else(default_multimodal_for_runtime),
+                ),
+            }),
             ..EffectiveBehaviorSection::default()
         },
     };
@@ -3193,87 +3269,6 @@ fn load_effective_config_from_spawn(node_name: &str) -> Option<SpawnEffectiveCon
     })
 }
 
-fn looks_like_tenant_id(raw: &str) -> bool {
-    let Some(rest) = raw.strip_prefix("tnt:") else {
-        return false;
-    };
-    Uuid::parse_str(rest.trim()).is_ok()
-}
-
-fn resolve_tenant_id_for_register(
-    explicit_tenant_id: Option<&str>,
-    tenant_hint: Option<&str>,
-    default_tenant_id: Option<&str>,
-) -> Option<String> {
-    let explicit = explicit_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .filter(|v| looks_like_tenant_id(v))
-        .map(ToString::to_string);
-    if explicit.is_some() {
-        return explicit;
-    }
-
-    let hint = tenant_hint
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .filter(|v| looks_like_tenant_id(v))
-        .map(ToString::to_string);
-    if hint.is_some() {
-        return hint;
-    }
-
-    let cfg_default = default_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .filter(|v| looks_like_tenant_id(v))
-        .map(ToString::to_string);
-    if cfg_default.is_some() {
-        return cfg_default;
-    }
-
-    env_nonempty(GOV_IDENTITY_TENANT_ID_ENV).filter(|v| looks_like_tenant_id(v))
-}
-
-fn tenant_resolution_source(
-    explicit_tenant_id: Option<&str>,
-    tenant_hint: Option<&str>,
-    default_tenant_id: Option<&str>,
-) -> &'static str {
-    let explicit_ok = explicit_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .is_some_and(looks_like_tenant_id);
-    if explicit_ok {
-        return "args.tenant_id";
-    }
-
-    let hint_ok = tenant_hint
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .is_some_and(looks_like_tenant_id);
-    if hint_ok {
-        return "identity_candidate.tenant_hint";
-    }
-
-    let cfg_ok = default_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .is_some_and(looks_like_tenant_id);
-    if cfg_ok {
-        return "effective_config.tenant_id";
-    }
-
-    let env_ok = env_nonempty(GOV_IDENTITY_TENANT_ID_ENV)
-        .as_deref()
-        .is_some_and(looks_like_tenant_id);
-    if env_ok {
-        return GOV_IDENTITY_TENANT_ID_ENV;
-    }
-
-    "missing"
-}
-
 fn materialize_effective_defaults(
     node_name: &str,
     mut config: EffectiveConfigDocument,
@@ -3293,6 +3288,15 @@ fn materialize_effective_defaults(
         materialize_runtime_defaults(runtime);
     }
     if config.behavior.kind.eq_ignore_ascii_case("openai_chat") {
+        if config.behavior.capabilities.is_none() {
+            config.behavior.capabilities = Some(BehaviorCapabilities {
+                multimodal: Some(default_multimodal_for_runtime()),
+            });
+        } else if let Some(caps) = config.behavior.capabilities.as_mut() {
+            if caps.multimodal.is_none() {
+                caps.multimodal = Some(default_multimodal_for_runtime());
+            }
+        }
         if config.behavior.provider.is_none() {
             config.behavior.provider = Some("openai".to_string());
         }
@@ -3458,6 +3462,137 @@ fn missing_openai_api_key_payload() -> Value {
         "message": "Missing OpenAI API key in local secrets.json, CONFIG_SET override, YAML inline, or env.",
         "retryable": true
     })
+}
+
+fn openai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
+    match err {
+        fluxbee_ai_sdk::errors::AiSdkError::Http(http_err)
+            if http_err.is_timeout() || http_err.is_connect() =>
+        {
+            json!({
+                "type": "error",
+                "code": "provider_unreachable",
+                "message": "The AI provider is temporarily unreachable. Please retry shortly.",
+                "retryable": true
+            })
+        }
+        fluxbee_ai_sdk::errors::AiSdkError::Timeout(_)
+        | fluxbee_ai_sdk::errors::AiSdkError::RecoverableExhausted(_) => json!({
+            "type": "error",
+            "code": "provider_timeout",
+            "message": "The AI provider did not respond in time. Please retry.",
+            "retryable": true
+        }),
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(msg) => {
+            if let Some((status, detail)) = parse_openai_status_error(msg) {
+                let (code, retryable, message) = match status {
+                    400 | 404 | 422 => (
+                        "provider_invalid_request",
+                        false,
+                        "The request is not valid for the AI provider.",
+                    ),
+                    401 | 403 => (
+                        "provider_auth_error",
+                        false,
+                        "AI provider authentication failed. Check configured credentials.",
+                    ),
+                    408 => (
+                        "provider_timeout",
+                        true,
+                        "The AI provider timed out while processing the request.",
+                    ),
+                    429 => (
+                        "provider_rate_limited",
+                        true,
+                        "The AI provider is rate limiting requests. Retry shortly.",
+                    ),
+                    500..=599 => (
+                        "provider_unavailable",
+                        true,
+                        "The AI provider is temporarily unavailable.",
+                    ),
+                    _ => (
+                        "provider_error",
+                        true,
+                        "The AI provider returned an error while processing the request.",
+                    ),
+                };
+                return json!({
+                    "type": "error",
+                    "code": code,
+                    "message": message,
+                    "retryable": retryable,
+                    "provider_status": status,
+                    "provider_detail": trim_chars(&detail, 280)
+                });
+            }
+            json!({
+                "type": "error",
+                "code": "provider_error",
+                "message": "The AI provider returned an unexpected error.",
+                "retryable": false
+            })
+        }
+        other => json!({
+            "type": "error",
+            "code": "ai_runtime_error",
+            "message": format!("AI runtime failure: {}", trim_chars(&other.to_string(), 220)),
+            "retryable": other.is_recoverable()
+        }),
+    }
+}
+
+fn parse_openai_status_error(message: &str) -> Option<(u16, String)> {
+    let marker = "openai error status=";
+    let idx = message.find(marker)?;
+    let after = &message[idx + marker.len()..];
+    let mut parts = after.splitn(2, ' ');
+    let status = parts.next()?.trim().parse::<u16>().ok()?;
+    let detail = after
+        .split_once(" body=")
+        .map(|(_, body)| body.trim().to_string())
+        .unwrap_or_default();
+    Some((status, detail))
+}
+
+#[derive(Debug, Default)]
+struct AttachmentObservabilitySummary {
+    count: usize,
+    total_bytes: u64,
+    mimes: Vec<String>,
+}
+
+fn attachment_summary_for_observability(
+    resolved_user_input: Option<&ResolvedModelInput>,
+) -> AttachmentObservabilitySummary {
+    let Some(input) = resolved_user_input else {
+        return AttachmentObservabilitySummary::default();
+    };
+    let count = input.attachments.len();
+    let total_bytes = input
+        .attachments
+        .iter()
+        .map(|attachment| attachment.blob_ref.size)
+        .sum();
+    let mimes = input
+        .attachments
+        .iter()
+        .map(|attachment| attachment.blob_ref.mime.clone())
+        .collect::<Vec<_>>();
+    AttachmentObservabilitySummary {
+        count,
+        total_bytes,
+        mimes,
+    }
+}
+
+fn extract_openai_error_param(detail: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(detail).ok()?;
+    parsed
+        .get("error")
+        .and_then(|error| error.get("param"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn infer_state_dir_from_dynamic(dynamic_config_dir: &std::path::Path) -> PathBuf {
@@ -3757,7 +3892,7 @@ mod tests {
     fn test_node() -> GenericAiNode {
         let gov_identity = GovIdentityConfig::default();
         GenericAiNode {
-            mode: RunnerMode::Default,
+            mode: RunnerMode::Gov,
             node_name: "AI.frontdesk.gov".to_string(),
             behavior: Arc::new(RwLock::new(None)),
             dynamic_config_dir: PathBuf::from("/tmp"),
@@ -3853,6 +3988,7 @@ mod tests {
                 yaml_inline_api_key: None,
                 base_url: None,
                 immediate_memory: ImmediateMemorySection::default(),
+                multimodal: false,
             }));
         }
 
@@ -3904,7 +4040,7 @@ mod tests {
     }
 
     #[test]
-    fn default_mode_registry_does_not_expose_gov_tools() {
+    fn frontdesk_registry_exposes_ilk_register_by_default() {
         let node = test_node();
         let registry = node
             .build_tool_registry(&BehaviorContext {
@@ -3917,59 +4053,7 @@ mod tests {
             .into_iter()
             .map(|d| d.name)
             .collect::<Vec<_>>();
-        assert!(!names.iter().any(|name| name == "ilk_register"));
-    }
-
-    #[test]
-    fn gov_mode_registry_exposes_ilk_register() {
-        let mut node = test_node();
-        node.mode = RunnerMode::Gov;
-        let registry = node
-            .build_tool_registry(&BehaviorContext {
-                thread_id: Some("legacy-thread-1".to_string()),
-                src_ilk: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
-            })
-            .expect("registry");
-        let names = registry
-            .definitions()
-            .into_iter()
-            .map(|d| d.name)
-            .collect::<Vec<_>>();
         assert!(names.iter().any(|name| name == "ilk_register"));
-    }
-
-    #[tokio::test]
-    async fn default_mode_rejects_ilk_register_with_unknown_tool() {
-        let node = test_node();
-        let registry = node
-            .build_tool_registry(&BehaviorContext {
-                thread_id: Some("legacy-thread-1".to_string()),
-                src_ilk: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
-            })
-            .expect("registry");
-
-        let results = fluxbee_ai_sdk::dispatch_tool_calls(
-            &registry,
-            vec![fluxbee_ai_sdk::FunctionToolCall {
-                call_id: "call_1".to_string(),
-                response_id: None,
-                name: "ilk_register".to_string(),
-                arguments: json!({
-                    "src_ilk": "ilk:11111111-1111-4111-8111-111111111111",
-                    "identity_candidate": {
-                        "name": "Noelia Eguren",
-                        "email": "neguren@4iplatform.com"
-                    }
-                }),
-            }],
-        )
-        .await;
-
-        assert_eq!(results.len(), 1);
-        let result = &results[0];
-        assert!(result.is_error);
-        assert_eq!(result.name, "ilk_register");
-        assert_eq!(result.output, Value::String("unknown_tool".to_string()));
     }
 
     #[test]

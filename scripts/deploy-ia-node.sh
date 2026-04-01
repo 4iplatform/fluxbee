@@ -16,13 +16,15 @@ Required:
   --version <ver>              Runtime version to publish (example: 0.1.0)
 
 Options:
-  --mode <default|gov>         Default AI_NODE_MODE embedded in runtime start.sh (default: default)
+  --mode <default|gov>         Deprecated compatibility flag (ignored)
   --forced-node-name <name>    Pass-through to publish-ia-runtime.sh (deprecated emergency override)
   --forced-dynamic-config-dir <path>
                                Pass-through to publish-ia-runtime.sh (deprecated emergency override)
   --node-name <name@hive>      If provided, script also spawns/restarts node
   --tenant-id <tnt:...>        Tenant ID for identity registration (payload + config fallback)
   --runtime-version <ver>      Runtime version for spawn payload (default: current)
+  --update-scope <targeted|global>
+                               SYSTEM_UPDATE scope (default: targeted)
   --config-json <file>         JSON file with spawn config object
   --immediate-memory-enabled <true|false>
                                Set runtime.immediate_memory.enabled in spawn config (optional)
@@ -36,7 +38,7 @@ Options:
                                Set runtime.immediate_memory.summary_refresh_every_turns (optional)
   --immediate-memory-trim-noise <true|false>
                                Set runtime.immediate_memory.trim_noise_enabled (optional)
-  --spawn                      Force spawn step (requires --node-name and --config-json or --reuse-existing-config)
+  --spawn                      Force spawn step (requires --node-name; config defaults to {} if not provided)
   --skip-spawn                 Skip spawn step (default unless --node-name is set)
   --kill-first                 If spawning, call DELETE node before POST node
   --reuse-existing-config      Fetch config from GET /hives/{id}/nodes/{name}/config and reuse it for spawn
@@ -72,9 +74,11 @@ HIVE_ID=""
 RUNTIME=""
 VERSION=""
 MODE="default"
+MODE_SET=0
 FORCED_NODE_NAME=""
 FORCED_DYNAMIC_CONFIG_DIR=""
 RUNTIME_VERSION="current"
+UPDATE_SCOPE="targeted"
 NODE_NAME=""
 TENANT_ID=""
 CONFIG_JSON=""
@@ -104,10 +108,11 @@ while [[ $# -gt 0 ]]; do
     --hive-id) HIVE_ID="${2:-}"; shift 2 ;;
     --runtime) RUNTIME="${2:-}"; shift 2 ;;
     --version) VERSION="${2:-}"; shift 2 ;;
-    --mode) MODE="${2:-}"; shift 2 ;;
+    --mode) MODE="${2:-}"; MODE_SET=1; shift 2 ;;
     --forced-node-name) FORCED_NODE_NAME="${2:-}"; shift 2 ;;
     --forced-dynamic-config-dir) FORCED_DYNAMIC_CONFIG_DIR="${2:-}"; shift 2 ;;
     --runtime-version) RUNTIME_VERSION="${2:-}"; shift 2 ;;
+    --update-scope) UPDATE_SCOPE="${2:-}"; shift 2 ;;
     --node-name) NODE_NAME="${2:-}"; shift 2 ;;
     --tenant-id) TENANT_ID="${2:-}"; shift 2 ;;
     --config-json) CONFIG_JSON="${2:-}"; shift 2 ;;
@@ -141,14 +146,18 @@ if [[ -z "$BASE" || -z "$HIVE_ID" || -z "$RUNTIME" || -z "$VERSION" ]]; then
   exit 1
 fi
 
-case "$MODE" in
-  default|gov)
+case "$UPDATE_SCOPE" in
+  targeted|global)
     ;;
   *)
-    echo "Error: --mode must be default or gov (got '$MODE')" >&2
+    echo "Error: --update-scope must be targeted or global (got '$UPDATE_SCOPE')" >&2
     exit 1
     ;;
 esac
+
+if [[ "$MODE_SET" == "1" ]]; then
+  echo "Warning: --mode is deprecated and ignored; runtime behavior is selected by --runtime" >&2
+fi
 
 if [[ "$FORCE_SKIP_SPAWN" == "1" ]]; then
   DO_SPAWN=0
@@ -225,15 +234,12 @@ build_spawn_config_json() {
     fetch_existing_config_json
     return
   fi
-  if [[ -z "$CONFIG_JSON" ]]; then
-    echo "Error: spawn requires --config-json or --reuse-existing-config" >&2
-    exit 1
-  fi
-  if [[ ! -f "$CONFIG_JSON" ]]; then
+  if [[ -n "$CONFIG_JSON" && ! -f "$CONFIG_JSON" ]]; then
     echo "Error: --config-json not found: $CONFIG_JSON" >&2
     exit 1
   fi
-  CONFIG_JSON_PATH="$CONFIG_JSON" \
+  CONFIG_JSON_PATH="${CONFIG_JSON:-}" \
+  TENANT_ID="$TENANT_ID" \
   IMMEDIATE_MEMORY_ENABLED="$IMMEDIATE_MEMORY_ENABLED" \
   IMMEDIATE_MEMORY_RECENT_MAX="$IMMEDIATE_MEMORY_RECENT_MAX" \
   IMMEDIATE_MEMORY_ACTIVE_MAX="$IMMEDIATE_MEMORY_ACTIVE_MAX" \
@@ -270,17 +276,26 @@ def parse_int_opt(value, name):
         sys.exit(1)
     return out
 
-path = os.environ["CONFIG_JSON_PATH"]
-try:
-    with open(path, "r", encoding="utf-8-sig") as f:
-        cfg = json.load(f)
-except Exception as e:
-    print(f"Error: invalid JSON in --config-json ({path}): {e}", file=sys.stderr)
-    sys.exit(1)
+path = (os.environ.get("CONFIG_JSON_PATH") or "").strip()
+tenant_id = (os.environ.get("TENANT_ID") or "").strip()
+
+if path:
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            cfg = json.load(f)
+    except Exception as e:
+        print(f"Error: invalid JSON in --config-json ({path}): {e}", file=sys.stderr)
+        sys.exit(1)
+else:
+    cfg = {}
 
 if not isinstance(cfg, dict):
-    print(f"Error: --config-json root must be object ({path})", file=sys.stderr)
+    source = path if path else "default-empty"
+    print(f"Error: spawn config root must be object ({source})", file=sys.stderr)
     sys.exit(1)
+
+if tenant_id:
+    cfg.setdefault("tenant_id", tenant_id)
 
 enabled = parse_bool_opt(os.environ.get("IMMEDIATE_MEMORY_ENABLED"), "--immediate-memory-enabled")
 recent_max = parse_int_opt(os.environ.get("IMMEDIATE_MEMORY_RECENT_MAX"), "--immediate-memory-recent-max")
@@ -324,9 +339,9 @@ require_cmd sed
 require_cmd grep
 
 log "starting deploy; log_file=$LOG_FILE"
-log "step=publish runtime=$RUNTIME version=$VERSION mode=$MODE"
+log "step=publish runtime=$RUNTIME version=$VERSION"
 
-publish_cmd=(bash "$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --mode "$MODE" --set-current)
+publish_cmd=(bash "$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --set-current)
 if [[ -n "$FORCED_NODE_NAME" ]]; then
   publish_cmd+=(--forced-node-name "$FORCED_NODE_NAME")
 fi
@@ -354,8 +369,22 @@ if [[ -z "$MANIFEST_VERSION" || -z "$MANIFEST_HASH" ]]; then
 fi
 
 log "publish_ok manifest_version=$MANIFEST_VERSION manifest_hash=$MANIFEST_HASH"
+log "update_scope=$UPDATE_SCOPE runtime=$RUNTIME target_version=$VERSION"
 
-update_payload="$(python3 - <<PY
+if [[ "$UPDATE_SCOPE" == "targeted" ]]; then
+  update_payload="$(python3 - <<PY
+import json
+print(json.dumps({
+  "category": "runtime",
+  "manifest_version": int("${MANIFEST_VERSION}"),
+  "manifest_hash": "${MANIFEST_HASH}",
+  "runtime": "${RUNTIME}",
+  "runtime_version": "${VERSION}",
+}, separators=(",", ":")))
+PY
+)"
+else
+  update_payload="$(python3 - <<PY
 import json
 print(json.dumps({
   "category": "runtime",
@@ -364,6 +393,7 @@ print(json.dumps({
 }, separators=(",", ":")))
 PY
 )"
+fi
 
 attempt=1
 UPDATE_STATUS=""

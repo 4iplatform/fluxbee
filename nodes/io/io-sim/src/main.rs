@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
             dedup_max_entries: config.dedup_max_entries,
             dst_node: config.dst_node.clone(),
             provision_on_miss: true,
+            blob_runtime: Some(io_common::text_v1_blob::IoBlobRuntimeConfig::default()),
         },
     )));
 

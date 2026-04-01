@@ -48,6 +48,7 @@ dependencies = [
  "chrono",
  "fluxbee-ai-sdk",
  "fluxbee-sdk",
+ "gov-common",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1964,6 +1965,7 @@ name = "fluxbee-ai-sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "fluxbee-sdk",
  "reqwest",
@@ -2251,6 +2253,8 @@ name = "gov-common"
 version = "0.1.0"
 dependencies = [
  "fluxbee-sdk",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

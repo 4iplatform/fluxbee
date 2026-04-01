@@ -16,7 +16,7 @@ Required:
 Options:
   --binary <path>          Binary path (default: target/release/ai_node_runner)
   --dist-root <path>       Dist root (default: /var/lib/fluxbee/dist)
-  --mode <default|gov>     Default AI_NODE_MODE for published start.sh (default: default)
+  --mode <default|gov>     Deprecated compatibility flag (ignored)
   --forced-node-name <n>   Deprecated emergency override for --node-name in start.sh
   --forced-dynamic-config-dir <p>
                             Deprecated emergency override for --dynamic-config-dir in start.sh
@@ -38,6 +38,7 @@ SET_CURRENT=0
 USE_SUDO=0
 SKIP_BUILD=0
 MODE="default"
+MODE_SET=0
 FORCED_NODE_NAME=""
 FORCED_DYNAMIC_CONFIG_DIR=""
 
@@ -61,6 +62,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --mode)
       MODE="${2:-}"
+      MODE_SET=1
       shift 2
       ;;
     --forced-node-name)
@@ -101,21 +103,20 @@ if [[ -z "$RUNTIME" || -z "$VERSION" ]]; then
   exit 1
 fi
 
-case "$MODE" in
-  default|gov)
-    ;;
-  *)
-    echo "Error: --mode must be default or gov (got '$MODE')" >&2
-    exit 1
-    ;;
-esac
+if [[ "$MODE_SET" == "1" ]]; then
+  echo "Warning: --mode is deprecated and ignored; runtime behavior is selected by --runtime" >&2
+fi
 
 if [[ "$SKIP_BUILD" != "1" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
     echo "Error: cargo not found (use --skip-build if binary already exists)" >&2
     exit 1
   fi
-  (cd "$ROOT_DIR" && cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner)
+  if [[ "$RUNTIME" == "AI.frontdesk.gov" ]]; then
+    (cd "$ROOT_DIR" && cargo build --release -p ai-frontdesk-gov --bin ai_node_runner)
+  else
+    (cd "$ROOT_DIR" && cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner)
+  fi
 fi
 
 cmd=(bash "$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --binary "$BINARY")
@@ -164,9 +165,6 @@ if [[ -n "\${AI_DYNAMIC_CONFIG_DIR:-}" ]]; then
 elif [[ -n "\${STATE_DIR:-}" ]]; then
   export AI_DYNAMIC_CONFIG_DIR="\${STATE_DIR}/ai-nodes"
 fi
-if [[ -z "\${AI_NODE_MODE:-}" ]]; then
-  export AI_NODE_MODE="$MODE"
-fi
 if [[ -z "\${RUST_LOG:-}" ]]; then
   export RUST_LOG="info,fluxbee_ai_nodes=debug,fluxbee_ai_sdk=info,fluxbee_ai_sdk::runtime=warn"
 fi
@@ -190,7 +188,7 @@ else
 fi
 rm -f "$tmp_start"
 
-echo "Configured AI start.sh mode default: $MODE"
+echo "Configured AI start.sh runtime profile: $RUNTIME"
 if [[ -n "$FORCED_NODE_NAME" ]]; then
   echo "Configured AI start.sh forced node name: $FORCED_NODE_NAME"
 fi

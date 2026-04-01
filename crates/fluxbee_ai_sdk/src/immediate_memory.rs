@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +80,8 @@ pub struct ImmediateOperation {
 pub struct FunctionRunInput {
     pub current_user_message: String,
     #[serde(default)]
+    pub current_user_parts: Option<Vec<Value>>,
+    #[serde(default)]
     pub immediate_memory: Option<ImmediateConversationMemory>,
 }
 
@@ -86,6 +89,7 @@ impl FunctionRunInput {
     pub fn new(current_user_message: impl Into<String>) -> Self {
         Self {
             current_user_message: current_user_message.into(),
+            current_user_parts: None,
             immediate_memory: None,
         }
     }

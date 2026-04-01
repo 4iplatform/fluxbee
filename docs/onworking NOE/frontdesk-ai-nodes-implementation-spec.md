@@ -1,5 +1,12 @@
 # Especificación técnica de cambios — Frontdesk + AI Nodes (mode gov) (v1)
 
+> Nota 2026-03-31:
+> Esta especificación refleja la etapa donde el gating era `mode=default|gov`.
+> La dirección vigente evolucionó a separación por runtime/ownership:
+> - `AI.common` y `AI.frontdesk.gov` como runtimes diferenciados,
+> - `AI.frontdesk.gov` apoyado en `nodes/gov/common` + SDKs,
+> - `mode=gov` queda como mecanismo transicional.
+
 > Objetivo: definir **qué hay que cambiar** (no el orden) para:
 > 1) habilitar `AI.frontdesk.gov` como **AI Node** con capacidad de completar identidad vía Identity,
 > 2) introducir **mode** (default/gov) en el runtime de AI Nodes para evitar creep de tools especiales,

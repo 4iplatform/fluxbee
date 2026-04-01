@@ -183,6 +183,21 @@ Interpretación operativa:
 }
 ```
 
+### 7.1 Regla de offload por tamaño (delegada a `io-common`)
+- `IO.slack` construye payload `text/v1` base (`content` + `attachments` cuando corresponda).
+- La decisión de dejar inline o convertir a `content_ref` por límite de tamaño **la toma `io-common`** en el pipeline inbound compartido.
+- Configuración relevante:
+  - `io.blob.max_message_bytes` (default 64KB),
+  - `io.blob.message_overhead_bytes`,
+  - límites de adjuntos (`io.blob.max_attachments`, `io.blob.max_attachment_bytes`, `io.blob.max_total_attachment_bytes`).
+- Objetivo: evitar divergencias entre adapters IO y mantener un comportamiento único para `text/v1`.
+
+### 7.2 Estado de validación y límite del canal Slack
+- El mecanismo canónico de offload (`content` -> `content_ref` al superar límite) se valida de forma determinística con `io-sim`, porque no depende de límites del proveedor externo.
+- En `IO.slack` se valida integración end-to-end del adapter (ingreso/salida, adjuntos, contrato `text/v1`), pero no es un canal confiable para probar payloads de texto extremos.
+- Referencia oficial Slack (`chat.postMessage`): Slack recomienda textos cortos y **trunca mensajes por encima de 40.000 caracteres**.
+  - Fuente: https://docs.slack.dev/reference/methods/chat.postMessage/ (sección "Truncating content").
+
 ---
 
 ## 8. Outbound: envío de mensajes a Slack

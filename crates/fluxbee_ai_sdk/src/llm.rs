@@ -18,6 +18,8 @@ pub struct LlmRequest {
     pub model: String,
     pub system: Option<String>,
     pub input: String,
+    #[serde(default)]
+    pub input_parts: Option<Vec<Value>>,
     pub max_output_tokens: Option<u32>,
     pub model_settings: Option<ModelSettings>,
 }
@@ -163,17 +165,7 @@ impl OpenAiResponsesClient {
 #[async_trait]
 impl LlmClient for OpenAiResponsesClient {
     async fn generate(&self, request: LlmRequest) -> Result<LlmResponse> {
-        let mut input = vec![];
-        if let Some(system) = request.system.clone() {
-            input.push(json!({
-                "role": "system",
-                "content": [{"type":"input_text","text": system}],
-            }));
-        }
-        input.push(json!({
-            "role": "user",
-            "content": [{"type":"input_text","text": request.input}],
-        }));
+        let input = build_openai_input_items(&request);
 
         let max_output_tokens = request
             .model_settings
@@ -233,6 +225,27 @@ impl LlmClient for OpenAiResponsesClient {
     }
 }
 
+fn build_openai_input_items(request: &LlmRequest) -> Vec<Value> {
+    let mut input = vec![];
+    if let Some(system) = request.system.clone() {
+        input.push(json!({
+            "role": "system",
+            "content": [{"type":"input_text","text": system}],
+        }));
+    }
+    let user_content = request.input_parts.clone().unwrap_or_else(|| {
+        vec![json!({
+            "type":"input_text",
+            "text": request.input
+        })]
+    });
+    input.push(json!({
+        "role": "user",
+        "content": user_content,
+    }));
+    input
+}
+
 #[derive(Clone)]
 pub struct OpenAiFunctionCallingModel {
     client: OpenAiResponsesClient,
@@ -279,6 +292,12 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                         input.push(json!({
                             "role": "user",
                             "content": [{"type":"input_text","text": content}],
+                        }));
+                    }
+                    FunctionLoopItem::UserContentParts { content } => {
+                        input.push(json!({
+                            "role": "user",
+                            "content": content,
                         }));
                     }
                     FunctionLoopItem::ToolResult { result } => {
@@ -462,6 +481,10 @@ fn loop_item_to_openai_input(item: FunctionLoopItem) -> Value {
             "role": "user",
             "content": [{"type":"input_text","text": content}],
         }),
+        FunctionLoopItem::UserContentParts { content } => json!({
+            "role": "user",
+            "content": content,
+        }),
         FunctionLoopItem::AssistantText { content } => json!({
             "role": "assistant",
             "content": [{"type":"output_text","text": content}],
@@ -510,6 +533,19 @@ mod tests {
     }
 
     #[test]
+    fn user_content_parts_are_forwarded_verbatim() {
+        let item = loop_item_to_openai_input(FunctionLoopItem::UserContentParts {
+            content: vec![
+                json!({"type":"input_text","text":"hola"}),
+                json!({"type":"input_image","image_url":"data:image/jpeg;base64,AAA"}),
+            ],
+        });
+        assert_eq!(item["role"], "user");
+        assert_eq!(item["content"][0]["type"], "input_text");
+        assert_eq!(item["content"][1]["type"], "input_image");
+    }
+
+    #[test]
     fn tool_results_remain_function_call_outputs() {
         let value = loop_item_to_openai_input(FunctionLoopItem::ToolResult {
             result: FunctionToolResult {
@@ -524,5 +560,40 @@ mod tests {
         assert_eq!(value["type"], "function_call_output");
         assert_eq!(value["call_id"], "call-1");
         assert_eq!(value["output"], "{\"ok\":true}");
+    }
+
+    #[test]
+    fn build_openai_input_items_uses_text_fallback_without_parts() {
+        let req = LlmRequest {
+            model: "gpt-4.1-mini".to_string(),
+            system: Some("sys".to_string()),
+            input: "hola".to_string(),
+            input_parts: None,
+            max_output_tokens: None,
+            model_settings: None,
+        };
+        let input = build_openai_input_items(&req);
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[1]["content"][0]["type"], "input_text");
+        assert_eq!(input[1]["content"][0]["text"], "hola");
+    }
+
+    #[test]
+    fn build_openai_input_items_prefers_structured_parts() {
+        let req = LlmRequest {
+            model: "gpt-4.1-mini".to_string(),
+            system: None,
+            input: "fallback".to_string(),
+            input_parts: Some(vec![
+                json!({"type":"input_text","text":"texto"}),
+                json!({"type":"input_image","image_url":"data:image/png;base64,AAA"}),
+            ]),
+            max_output_tokens: None,
+            model_settings: None,
+        };
+        let input = build_openai_input_items(&req);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][1]["type"], "input_image");
     }
 }

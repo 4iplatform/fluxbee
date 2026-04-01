@@ -31,8 +31,8 @@ use io_common::io_control_plane_store::{default_state_dir, persist_io_control_pl
 use io_common::io_slack_adapter_config::IoSlackAdapterConfigContract;
 use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox};
 use io_common::text_v1_blob::{
-    build_text_v1_inbound_payload, resolve_text_v1_for_outbound, InboundAttachmentInput,
-    IoBlobContractError, IoBlobRuntimeConfig, IoTextBlobConfig,
+    resolve_text_v1_for_outbound, InboundAttachmentInput, IoBlobContractError, IoBlobRuntimeConfig,
+    IoTextBlobConfig,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -104,6 +104,7 @@ async fn main() -> Result<()> {
             dedup_max_entries: config.dedup_max_entries,
             dst_node: config.dst_node.clone(),
             provision_on_miss: true,
+            blob_runtime: Some(config.blob_runtime.clone()),
         },
     )));
     let blob_toolkit = Arc::new(
@@ -1020,42 +1021,21 @@ async fn build_slack_inbound_payload(
     if content.trim().is_empty() && attachments.is_empty() {
         return None;
     }
-
-    match build_text_v1_inbound_payload(blob_toolkit, blob_payload_cfg, content, attachments) {
+    let payload = fluxbee_sdk::payload::TextV1Payload::new(
+        content,
+        attachments.into_iter().map(|a| a.blob_ref).collect(),
+    );
+    match payload.to_value() {
         Ok(mut payload) => {
             attach_slack_raw_stub(&mut payload, team_id, user, channel, thread_ts, message_id);
             Some(payload)
         }
-        Err(err) => {
+        Err(error) => {
             tracing::warn!(
-                code = err.canonical_code(),
-                error = %err,
-                "failed to build payload with attachments; retrying with text-only fallback"
+                error = %error,
+                "failed to build base text/v1 inbound payload"
             );
-            if content.trim().is_empty() {
-                return None;
-            }
-            match build_text_v1_inbound_payload(blob_toolkit, blob_payload_cfg, content, vec![]) {
-                Ok(mut payload) => {
-                    attach_slack_raw_stub(
-                        &mut payload,
-                        team_id,
-                        user,
-                        channel,
-                        thread_ts,
-                        message_id,
-                    );
-                    Some(payload)
-                }
-                Err(fallback_err) => {
-                    tracing::warn!(
-                        code = fallback_err.canonical_code(),
-                        error = %fallback_err,
-                        "failed to build text-only fallback payload"
-                    );
-                    None
-                }
-            }
+            None
         }
     }
 }
@@ -1548,10 +1528,22 @@ async fn run_outbound_loop(
     blob_payload_cfg: IoTextBlobConfig,
 ) -> Result<()> {
     loop {
-        let Some(msg) = ({
+        let next_msg = {
             let mut guard = inbox.lock().await;
-            guard.recv_next_timeout(Duration::from_secs(1)).await?
-        }) else {
+            guard.recv_next_timeout(Duration::from_secs(1)).await
+        };
+        let next_msg = match next_msg {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "router inbox recv failed in outbound loop; continuing"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+        };
+        let Some(msg) = next_msg else {
             continue;
         };
 
@@ -1572,6 +1564,7 @@ async fn run_outbound_loop(
         if let Some(response) = handle_io_control_plane_message(
             &msg,
             &node_name,
+            sender.uuid(),
             &state_dir,
             control_plane.clone(),
             control_metrics.clone(),
@@ -1750,6 +1743,7 @@ async fn run_outbound_loop(
 async fn handle_io_control_plane_message(
     msg: &WireMessage,
     node_name: &str,
+    control_src: &str,
     state_dir: &Path,
     control_plane: Arc<RwLock<IoControlPlaneState>>,
     control_metrics: Arc<IoControlPlaneMetrics>,
@@ -1768,7 +1762,7 @@ async fn handle_io_control_plane_message(
             "node_name": node_name,
             "state": state.current_state.as_str(),
         });
-        return Some(build_system_reply(msg, "PONG", payload));
+        return Some(build_system_reply(msg, control_src, "PONG", payload));
     }
     if command.eq_ignore_ascii_case("STATUS") {
         let state = control_plane.read().await.clone();
@@ -1785,7 +1779,12 @@ async fn handle_io_control_plane_message(
                 "control_plane": metrics
             }
         });
-        return Some(build_system_reply(msg, "STATUS_RESPONSE", payload));
+        return Some(build_system_reply(
+            msg,
+            control_src,
+            "STATUS_RESPONSE",
+            payload,
+        ));
     }
     if !command.eq_ignore_ascii_case("CONFIG_GET") && !command.eq_ignore_ascii_case("CONFIG_SET") {
         return None;
@@ -1841,7 +1840,9 @@ async fn handle_io_control_plane_message(
         }
     };
 
-    Some(build_io_config_response_message(msg, payload))
+    let mut response = build_io_config_response_message(msg, payload);
+    response.routing.src = control_src.to_string();
+    Some(response)
 }
 
 fn is_control_plane_msg_type(msg_type: &str) -> bool {
@@ -2147,7 +2148,12 @@ fn redact_state(
     redacted
 }
 
-fn build_system_reply(incoming: &WireMessage, response_msg: &str, payload: Value) -> WireMessage {
+fn build_system_reply(
+    incoming: &WireMessage,
+    control_src: &str,
+    response_msg: &str,
+    payload: Value,
+) -> WireMessage {
     let dst = if incoming.routing.src.trim().is_empty() {
         Destination::Broadcast
     } else {
@@ -2155,7 +2161,7 @@ fn build_system_reply(incoming: &WireMessage, response_msg: &str, payload: Value
     };
     WireMessage {
         routing: Routing {
-            src: String::new(),
+            src: control_src.to_string(),
             dst,
             ttl: incoming.routing.ttl.max(1),
             trace_id: incoming.routing.trace_id.clone(),

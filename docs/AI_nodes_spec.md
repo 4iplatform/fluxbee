@@ -451,10 +451,12 @@ Códigos recomendados (no exhaustivo):
 - Límites finales por MIME/tamaño están como valores tentativos.
 - Tabla final de compatibilidad MIME × behavior × provider.
 
-🐞 **IMPLEMENTACIÓN PENDIENTE (runner actual)**:
-- El runner hoy procesa principalmente `payload.content`.
-- Falta implementar procesamiento completo de `attachments` y `content_ref` de entrada.
-- Falta implementar salida con adjuntos/blob refs (cuando el behavior genere artefactos).
+🔧 **IMPLEMENTACIÓN ACTUAL (runner + SDK AI)**:
+- Input `text/v1` completo: `content`, `content_ref`, `attachments[]`.
+- Resolución de blobs vía `fluxbee_sdk::blob` desde `fluxbee_ai_sdk::text_payload`.
+- Errores canónicos implementados: `BLOB_NOT_FOUND`, `BLOB_IO_ERROR`, `BLOB_TOO_LARGE`, `unsupported_attachment_mime`, `too_many_attachments`.
+- Salida `text/v1` con offload automático a `content_ref` cuando excede límite inline.
+- Adjuntos de salida generados por behavior quedan para fase posterior (cuando behaviors produzcan artefactos).
 
 ---
 
@@ -554,10 +556,11 @@ Estructura:
 - Si el blob existe pero excede límites operativos (size/mime):
   - **MUST** responder error `BLOB_TOO_LARGE` o `unsupported_attachment_mime`.
 
-⚠️ **TENTATIVO** (límites recomendados; a decidir):
-- `text/plain` / `text/markdown` / `application/json`: 512KB por blob
-- `application/pdf`: 10MB por blob
-- imágenes: 10MB por blob
+✅ **NORMATIVO (baseline v1)**:
+- `text/plain` / `text/markdown` / `application/json`: hasta 10MB por blob (límite operativo vigente del SDK AI).
+- `application/pdf`: rechazado por default (`unsupported_attachment_mime`) hasta definir extractor dedicado.
+- imágenes (`image/png`, `image/jpeg`, `image/webp`): permitidas solo cuando `multimodal=true`.
+- `image/gif`: rechazado por default en baseline v1 (puede revisarse en una fase posterior).
 
 ---
 
@@ -755,9 +758,9 @@ Estructura:
 
 ## 10. Desviaciones conocidas del código actual (para backlog)
 
-🐞 **DESVIACIÓN CÓDIGO (P0/P1)**:
-- El runner actual extrae input solo desde `payload.content` y no consume `attachments` ni `content_ref`.
-- No hay contrato de error formal.
+🔧 **ESTADO CÓDIGO (actual)**:
+- El runner consume `text/v1` completo (`content` / `content_ref` / `attachments`) usando SDK AI.
+- El contrato de error de blobs está normalizado en SDK AI y propagado como payload de error.
 
 ✅ **NORMATIVO**: el AI Node implementa `text/v1` completo según Blob Annex y falla con errores claros cuando no pueda leer blobs/attachments.
 
@@ -878,16 +881,32 @@ Estructura:
 
 ## 4. Multimodal y attachments por behavior
 
+### 4.0 Defaults por runtime (decisión cerrada)
+
+✅ **NORMATIVO**:
+- `AI.common`: `capabilities.multimodal=true` por default.
+- `AI.frontdesk.gov`: `capabilities.multimodal=false` por default (temporal, revisable).
+- Ambos runtimes permiten override explícito vía config (`behavior.capabilities.multimodal`).
+
+✅ **NORMATIVO**:
+- La implementación multimodal del adapter OpenAI se alinea al modelo operativo vigente de OpenAI (Agents SDK + Responses API), evitando formatos ad-hoc cuando exista forma estándar en OpenAI.
+
+⚠️ **Estado de implementación (2026-04-01)**:
+- El camino de adjuntos en AI está avanzado, pero todavía no está cerrado end-to-end para todos los tipos.
+- Referencia operativa y comparativa contra Agents SDK: `docs/onworking NOE/ai_attachments_status.md`.
+- Pendientes principales: flujo `input_file` (PDF) y render de `payload.type="error"` en `IO.slack`.
+
 ✅ **NORMATIVO**:
 - El behavior declara `capabilities.multimodal = true|false`.
 - Si `multimodal=false`:
   - adjuntos no textuales → error `unsupported_attachment_mime` (y PDFs se rechazan por ahora; ver Parte 2).
 - Si `multimodal=true`:
-  - el provider adapter define cómo enviar blobs.
+  - el provider adapter envía adjuntos siguiendo el esquema OpenAI vigente para inputs multimodales.
 
-⚠️ **TENTATIVO (D3.4, en revisión)**:
-- Por ahora solo declaramos `multimodal: true|false`.
-- La tabla final MIME×behavior×provider se completa cuando se definan modelos/stack.
+✅ **NORMATIVO (matriz inicial MIME×modo)**:
+- `text/plain`, `text/markdown`, `application/json`: permitido en ambos modos (se incorporan al contexto textual).
+- `image/png`, `image/jpeg`, `image/webp`: permitido solo con `multimodal=true`.
+- `application/pdf`, `image/gif` y resto no textual: `unsupported_attachment_mime` en baseline v1.
 
 ---
 
@@ -1113,7 +1132,9 @@ secrets:
   - el nodo aplica defaults (timeouts, pool, queue, etc.),
   - y los escribe en el JSON efectivo.
 - `behavior.params.*` (temperature/top_p/max_output_tokens/timeouts) es **opcional** salvo los requeridos condicionales.
-- `capabilities.*` es opcional (por ejemplo `multimodal=false` por default).
+- `capabilities.*` es opcional:
+  - en `AI.common`: `multimodal=true` por default,
+  - en `AI.frontdesk.gov`: `multimodal=false` por default.
 
 > Nota: materializar defaults evita “config implícita” y facilita operación y debugging.
 
@@ -1517,10 +1538,10 @@ Installs:
 - `/usr/bin/ai-nodectl`
 - systemd template unit `/etc/systemd/system/fluxbee-ai-node@.service`
 
-Per-instance mode:
-- `AI_NODE_MODE=default|gov` (set in `/etc/fluxbee/ai-nodes/<name>.env`)
-- `default`: common tools only
-- `gov`: common tools + gov tools (for example `ilk_register`)
+Per-instance runtime profile:
+- `AI.common`: tools/behavior de AI común (sin identidad gov).
+- `AI.frontdesk.gov`: tools/behavior de frontdesk gov (incluye identidad, por ejemplo `ilk_register`).
+- no se usa `AI_NODE_MODE` para seleccionar capacidades del runtime.
 
 Manage instances with `ai-nodectl`:
 
