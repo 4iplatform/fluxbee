@@ -155,7 +155,8 @@ Pero esos campos ya no representan el carrier canónico del modelo cognitivo.
 
 Regla de migración:
 - paths nuevos deben producir `thread_id` + `thread_seq`
-- `ctx*` puede seguir leyéndose temporalmente en paths legacy
+- el runtime activo del repo ya no lee `ctx*` como carrier conversacional
+- `ctx*` queda solo como compatibilidad histórica/documental para payloads viejos
 - `ctx_window` deja de ser obligatorio en el modelo canónico
 
 ### 3.3 Antecedentes Cognitivos (memory_package)

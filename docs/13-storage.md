@@ -686,7 +686,7 @@ impl Cognition {
 | PostgreSQL cae | NATS madre bufferea, SY.storage retryea |
 | NATS local cae | Router no puede publicar, routing sigue funcionando |
 | SY.cognition cae | NATS bufferea, se procesa al reiniciar |
-| LanceDB > 50ms | Forward solo con ctx_window (sin memory_package) |
+| `jsr-memory` no disponible / lenta | Forward sin `memory_package` (enrichment fail-open) |
 
 ### 7.3 Idempotencia
 

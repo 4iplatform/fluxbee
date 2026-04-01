@@ -4,16 +4,13 @@
 > Este anexo asume el contrato `text/v1` y el Control Plane definidos en la spec consolidada.
 
 > ⚠️ **Alcance de este anexo**: los ejemplos describen el **contrato objetivo**.  
-> Estado actual del runner (MVP técnico): `attachments/content_ref` todavía no están implementados de punta a punta; `thread_id` se toma temporalmente como top-level.
+> Estado actual del runner (MVP técnico): `attachments/content_ref` todavía no están implementados de punta a punta; `thread_id` y `src_ilk` ya viajan canónicamente en `meta` top-level.
 
 ## Convenciones de identidad y thread
 
 - `src_ilk` se asume **siempre presente** (puede ser ILK temporal) y viaja en `meta.src_ilk`.
 - `thread_id` viaja canónicamente en `meta.thread_id`.
 - El key efectivo de thread state en MVP vigente es `src_ilk`.
-
-Nota de transición:
-- `src_ilk` viaja canónicamente en `meta.src_ilk`.
 
 ## Modo del runner (default/gov)
 

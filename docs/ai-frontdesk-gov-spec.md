@@ -72,12 +72,13 @@ Nota de transición:
 ✅ **NORMATIVO (MVP)**:
 - El nodo mantiene **1 JSON** por `src_ilk` (estructura libre por prompting/policy).
 - Tools mínimas (SDK/runtime):
-  - `thread_state_get(thread_id)`
-  - `thread_state_put(thread_id, data, ttl_seconds?)`
-  - `thread_state_delete(thread_id)`
+  - `thread_state_get(state_key)`
+  - `thread_state_put(state_key, data, ttl_seconds?)`
+  - `thread_state_delete(state_key)`
 
 Nota de compatibilidad:
-- El runtime puede aceptar `thread_id` legacy para migracion, pero la clave efectiva de estado debe ser `src_ilk`.
+- En runtime scoped, la clave efectiva de estado queda fijada al `src_ilk` actual.
+- El alias legacy `thread_id` ya no forma parte del contrato aceptado por las tools.
 
 ### 3.1 Estructura recomendada (no normativa)
 

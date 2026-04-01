@@ -1591,13 +1591,13 @@ ai-nodectl logs ai-chat --follow
 ### 9.4 API (Tool calling) minima
 
 ✅ **NORMATIVO (MVP)**: el runtime/SDK debe exponer tools equivalentes a:
-- `thread_state_get(thread_id) -> { data?, updated_at? }`
-- `thread_state_put(thread_id, data, ttl_seconds?) -> ok`
-- `thread_state_delete(thread_id) -> ok`
+- `thread_state_get(state_key) -> { data?, updated_at? }`
+- `thread_state_put(state_key, data, ttl_seconds?) -> ok`
+- `thread_state_delete(state_key) -> ok`
 
 Nota:
-- En modo scoped del runtime, el argumento `thread_id` enviado por el modelo puede ignorarse.
-- La ejecucion se scopea al key del contexto actual (`src_ilk`), con fallback legacy opcional.
+- En modo scoped del runtime, el `state_key` efectivo queda fijado por el runner al key del contexto actual (`src_ilk`).
+- El alias legacy `thread_id` ya no forma parte del contrato aceptado por las tools.
 
 > Nota: no se requiere query vectorial ni múltiple-key en MVP.
 
