@@ -35,6 +35,7 @@ async fn runner_serializes_immediate_memory_before_current_turn() {
     let tools = FunctionToolRegistry::new();
     let input = FunctionRunInput {
         current_user_message: "current user message".to_string(),
+        current_user_parts: None,
         immediate_memory: Some(ImmediateConversationMemory {
             thread_id: Some("thread:abc".to_string()),
             scope_id: Some("scope:demo".to_string()),
