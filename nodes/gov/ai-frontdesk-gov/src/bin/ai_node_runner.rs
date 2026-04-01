@@ -916,7 +916,16 @@ impl AiNode for GenericAiNode {
                         let payload = missing_openai_api_key_payload();
                         return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        tracing::warn!(
+                            node_name = %self.node_name,
+                            trace_id = %msg.routing.trace_id,
+                            error = %err,
+                            "openai runtime request failed; replying with provider error payload"
+                        );
+                        let payload = openai_runtime_error_payload(&err);
+                        return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
+                    }
                 }
             }
         };
@@ -3402,6 +3411,97 @@ fn missing_openai_api_key_payload() -> Value {
         "message": "Missing OpenAI API key in local secrets.json, CONFIG_SET override, YAML inline, or env.",
         "retryable": true
     })
+}
+
+fn openai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
+    match err {
+        fluxbee_ai_sdk::errors::AiSdkError::Http(http_err)
+            if http_err.is_timeout() || http_err.is_connect() =>
+        {
+            json!({
+                "type": "error",
+                "code": "provider_unreachable",
+                "message": "The AI provider is temporarily unreachable. Please retry shortly.",
+                "retryable": true
+            })
+        }
+        fluxbee_ai_sdk::errors::AiSdkError::Timeout(_)
+        | fluxbee_ai_sdk::errors::AiSdkError::RecoverableExhausted(_) => json!({
+            "type": "error",
+            "code": "provider_timeout",
+            "message": "The AI provider did not respond in time. Please retry.",
+            "retryable": true
+        }),
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(msg) => {
+            if let Some((status, detail)) = parse_openai_status_error(msg) {
+                let (code, retryable, message) = match status {
+                    400 | 404 | 422 => (
+                        "provider_invalid_request",
+                        false,
+                        "The request is not valid for the AI provider.",
+                    ),
+                    401 | 403 => (
+                        "provider_auth_error",
+                        false,
+                        "AI provider authentication failed. Check configured credentials.",
+                    ),
+                    408 => (
+                        "provider_timeout",
+                        true,
+                        "The AI provider timed out while processing the request.",
+                    ),
+                    429 => (
+                        "provider_rate_limited",
+                        true,
+                        "The AI provider is rate limiting requests. Retry shortly.",
+                    ),
+                    500..=599 => (
+                        "provider_unavailable",
+                        true,
+                        "The AI provider is temporarily unavailable.",
+                    ),
+                    _ => (
+                        "provider_error",
+                        true,
+                        "The AI provider returned an error while processing the request.",
+                    ),
+                };
+                return json!({
+                    "type": "error",
+                    "code": code,
+                    "message": message,
+                    "retryable": retryable,
+                    "provider_status": status,
+                    "provider_detail": trim_chars(&detail, 280)
+                });
+            }
+            json!({
+                "type": "error",
+                "code": "provider_error",
+                "message": "The AI provider returned an unexpected error.",
+                "retryable": false
+            })
+        }
+        other => json!({
+            "type": "error",
+            "code": "ai_runtime_error",
+            "message": format!("AI runtime failure: {}", trim_chars(&other.to_string(), 220)),
+            "retryable": other.is_recoverable()
+        }),
+    }
+}
+
+fn parse_openai_status_error(message: &str) -> Option<(u16, String)> {
+    let marker = "openai error status=";
+    let idx = message.find(marker)?;
+    let after = &message[idx + marker.len()..];
+    let mut parts = after.splitn(2, ' ');
+    let status = parts.next()?.trim().parse::<u16>().ok()?;
+    let detail = after
+        .split_once(" body=")
+        .map(|(_, body)| body.trim().to_string())
+        .unwrap_or_default();
+    Some((status, detail))
 }
 
 fn infer_state_dir_from_dynamic(dynamic_config_dir: &std::path::Path) -> PathBuf {
