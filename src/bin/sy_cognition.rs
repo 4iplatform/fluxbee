@@ -10,6 +10,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tokio::time;
+use tokio_postgres::{Config as PgConfig, NoTls, Row};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -47,6 +48,9 @@ const COGNITION_NODE_BASE_NAME: &str = "SY.cognition";
 const COGNITION_NODE_VERSION: &str = "2.0";
 const COGNITION_CONFIG_SCHEMA_VERSION: u32 = 1;
 const COGNITION_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
+const STORAGE_LOCAL_SECRET_KEY_POSTGRES_URL: &str = "postgres_url";
+const STORAGE_NODE_BASE_NAME: &str = "SY.storage";
+const STORAGE_DB_NAME: &str = "fluxbee_storage";
 const COGNITION_TURNS_SID: u32 = 27;
 const DURABLE_QUEUE_TURNS: &str = "durable.sy-cognition.turns";
 const COGNITION_DEFAULT_CONTEXT_OPEN_THRESHOLD: f64 = 0.5;
@@ -155,6 +159,13 @@ struct CognitionRuntimeState {
     active_scopes_total: u64,
     active_memories_total: u64,
     active_episodes_total: u64,
+    rebuild_attempts_total: u64,
+    rebuild_successes_total: u64,
+    rebuild_failures_total: u64,
+    rebuilt_threads_total: u64,
+    last_rebuild_status: Option<String>,
+    last_rebuild_source: Option<String>,
+    last_rebuild_at: Option<String>,
 }
 
 #[derive(Debug)]
@@ -301,6 +312,34 @@ struct EpisodeCandidate {
 }
 
 #[derive(Debug, Clone, Default)]
+struct RebuildSnapshot {
+    threads: HashMap<String, ThreadCognitionState>,
+    total_contexts: u64,
+    total_reasons: u64,
+    total_cooccurrences: u64,
+    total_scopes: u64,
+    total_memories: u64,
+    total_episodes: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ScopeInstancePayload {
+    scope_id: String,
+    #[serde(default)]
+    dominant_context_id: Option<String>,
+    #[serde(default)]
+    dominant_reason_id: Option<String>,
+    #[serde(default)]
+    start_thread_seq: Option<u64>,
+    #[serde(default)]
+    end_thread_seq: Option<u64>,
+    #[serde(default)]
+    opened_at: Option<String>,
+    #[serde(default)]
+    closed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 struct DeterministicTaggerOutput {
     tags: Vec<String>,
     reason_signals_canonical: Vec<String>,
@@ -402,6 +441,8 @@ async fn main() -> Result<(), CognitionError> {
             }
         }
     }
+
+    rebuild_from_durable_on_startup(Arc::clone(&app_state)).await;
 
     std::mem::drop(tokio::spawn(run_turns_loop(
         endpoint.clone(),
@@ -700,6 +741,616 @@ async fn sync_memory_shm(app_state: &CognitionAppState) -> Result<(), json_route
     Ok(())
 }
 
+async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
+    let started_at = chrono::Utc::now().to_rfc3339();
+    {
+        let mut state = app_state.runtime_state.lock().await;
+        state.rebuild_attempts_total = state.rebuild_attempts_total.saturating_add(1);
+        state.last_rebuild_at = Some(started_at.clone());
+    }
+
+    let should_rebuild = app_state.thread_states.lock().await.is_empty();
+    if !should_rebuild {
+        let mut state = app_state.runtime_state.lock().await;
+        state.last_rebuild_status = Some("skipped_nonempty_local_state".to_string());
+        state.last_rebuild_source = Some("startup".to_string());
+        return;
+    }
+
+    let Some(base_database_url) = resolve_storage_database_url(&app_state.hive_id) else {
+        let mut state = app_state.runtime_state.lock().await;
+        state.last_rebuild_status = Some("skipped_missing_storage_db".to_string());
+        state.last_rebuild_source = Some("startup".to_string());
+        tracing::info!(
+            node_name = %app_state.node_name,
+            "sy.cognition startup rebuild skipped; no durable storage DB configured"
+        );
+        return;
+    };
+
+    let snapshot = match load_rebuild_snapshot_from_storage(&base_database_url).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let mut state = app_state.runtime_state.lock().await;
+            state.rebuild_failures_total = state.rebuild_failures_total.saturating_add(1);
+            state.last_rebuild_status = Some(format!("failed:{err}"));
+            state.last_rebuild_source = Some("storage_durable".to_string());
+            tracing::warn!(
+                node_name = %app_state.node_name,
+                error = %err,
+                "sy.cognition startup rebuild from durable failed; continuing live"
+            );
+            return;
+        }
+    };
+
+    let rebuilt_threads_total = snapshot.threads.len() as u64;
+    {
+        let mut threads = app_state.thread_states.lock().await;
+        *threads = snapshot.threads;
+    }
+    if let Err(err) = sync_memory_shm(&app_state).await {
+        tracing::warn!(
+            node_name = %app_state.node_name,
+            error = %err,
+            "sy.cognition startup rebuild loaded durable state but failed to sync jsr-memory"
+        );
+    }
+    refresh_runtime_totals(
+        &app_state,
+        RuntimeRefreshDelta {
+            rebuilt_threads_total,
+            rebuild_source: Some("storage_durable".to_string()),
+            rebuild_status: Some("ok".to_string()),
+            rebuild_success: true,
+            ..RuntimeRefreshDelta::default()
+        },
+    )
+    .await;
+    tracing::info!(
+        node_name = %app_state.node_name,
+        rebuilt_threads_total,
+        contexts = snapshot.total_contexts,
+        reasons = snapshot.total_reasons,
+        cooccurrences = snapshot.total_cooccurrences,
+        scopes = snapshot.total_scopes,
+        memories = snapshot.total_memories,
+        episodes = snapshot.total_episodes,
+        "sy.cognition startup rebuild from durable completed"
+    );
+}
+
+async fn load_rebuild_snapshot_from_storage(
+    base_database_url: &str,
+) -> Result<RebuildSnapshot, CognitionError> {
+    let base_config: PgConfig = base_database_url.parse()?;
+    let storage_config = with_dbname(&base_config, STORAGE_DB_NAME);
+    let (client, connection) = storage_config.connect(NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "sy.cognition rebuild postgres connection closed");
+        }
+    });
+
+    let thread_rows = client
+        .query(
+            "SELECT thread_id, payload FROM cognition_threads ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?;
+    let mut snapshot = RebuildSnapshot::default();
+    for row in thread_rows {
+        let thread_id: String = row.get("thread_id");
+        let payload: CognitionThreadData = row_payload(&row)?;
+        let entry = snapshot
+            .threads
+            .entry(thread_id)
+            .or_insert_with(ThreadCognitionState::default);
+        entry.first_seen_at = payload.first_seen_at;
+        entry.last_seen_at = payload.last_seen_at;
+        entry.latest_thread_seq = payload.latest_thread_seq;
+        entry.turn_count = payload.turn_count.unwrap_or(0);
+    }
+
+    for row in client
+        .query(
+            "SELECT context_id, thread_id, payload FROM cognition_contexts ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        let context_id: String = row.get("context_id");
+        let thread_id: String = row.get("thread_id");
+        let payload: CognitionContextData = row_payload(&row)?;
+        let thread = snapshot
+            .threads
+            .entry(thread_id)
+            .or_insert_with(ThreadCognitionState::default);
+        thread.contexts.insert(
+            context_id.clone(),
+            context_state_from_payload(context_id, payload),
+        );
+        snapshot.total_contexts = snapshot.total_contexts.saturating_add(1);
+    }
+
+    for row in client
+        .query(
+            "SELECT reason_id, thread_id, payload FROM cognition_reasons ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        let reason_id: String = row.get("reason_id");
+        let thread_id: String = row.get("thread_id");
+        let payload: CognitionReasonData = row_payload(&row)?;
+        let thread = snapshot
+            .threads
+            .entry(thread_id)
+            .or_insert_with(ThreadCognitionState::default);
+        thread.reasons.insert(
+            reason_id.clone(),
+            reason_state_from_payload(reason_id, payload),
+        );
+        snapshot.total_reasons = snapshot.total_reasons.saturating_add(1);
+    }
+
+    for row in client
+        .query(
+            "SELECT cooccurrence_id, thread_id, payload FROM cognition_cooccurrences ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        let cooccurrence_id: String = row.get("cooccurrence_id");
+        let thread_id: String = row.get("thread_id");
+        let payload: CognitionCooccurrenceData = row_payload(&row)?;
+        let thread = snapshot
+            .threads
+            .entry(thread_id)
+            .or_insert_with(ThreadCognitionState::default);
+        thread.cooccurrences.insert(
+            cooccurrence_id.clone(),
+            cooccurrence_state_from_payload(cooccurrence_id, payload),
+        );
+        snapshot.total_cooccurrences = snapshot.total_cooccurrences.saturating_add(1);
+    }
+
+    let mut scope_payloads = HashMap::new();
+    for row in client
+        .query(
+            "SELECT scope_id, payload FROM cognition_scopes ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        let scope_id: String = row.get("scope_id");
+        let payload: CognitionScopeData = row_payload(&row)?;
+        scope_payloads.insert(scope_id, payload);
+    }
+
+    let mut open_scope_instances: HashMap<String, (String, ScopeInstancePayload)> = HashMap::new();
+    for row in client
+        .query(
+            "SELECT scope_instance_id, thread_id, payload FROM cognition_scope_instances ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        let scope_instance_id: String = row.get("scope_instance_id");
+        let thread_id: String = row.get("thread_id");
+        let payload: ScopeInstancePayload = row_payload(&row)?;
+        snapshot.total_scopes = snapshot.total_scopes.saturating_add(1);
+        if payload.closed_at.is_some() {
+            continue;
+        }
+        let replace = match open_scope_instances.get(&thread_id) {
+            None => true,
+            Some((_, current)) => payload.start_thread_seq >= current.start_thread_seq,
+        };
+        if replace {
+            open_scope_instances.insert(thread_id, (scope_instance_id, payload));
+        }
+    }
+
+    for row in client
+        .query(
+            "SELECT memory_id, thread_id, payload FROM cognition_memories ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        let memory_id: String = row.get("memory_id");
+        let thread_id: String = row.get("thread_id");
+        let payload: CognitionMemoryData = row_payload(&row)?;
+        let thread = snapshot
+            .threads
+            .entry(thread_id)
+            .or_insert_with(ThreadCognitionState::default);
+        thread.memories.insert(
+            memory_id.clone(),
+            memory_state_from_payload(memory_id, payload),
+        );
+        snapshot.total_memories = snapshot.total_memories.saturating_add(1);
+    }
+
+    for row in client
+        .query(
+            "SELECT episode_id, thread_id, payload FROM cognition_episodes ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        let episode_id: String = row.get("episode_id");
+        let thread_id: String = row.get("thread_id");
+        let payload: CognitionEpisodeData = row_payload(&row)?;
+        let thread = snapshot
+            .threads
+            .entry(thread_id.clone())
+            .or_insert_with(ThreadCognitionState::default);
+        let scope_instance_id = open_scope_instances
+            .get(&thread_id)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| payload.scope_id.clone().unwrap_or_default());
+        let episode_key = format!("{}|{}", scope_instance_id, payload.affect_id);
+        thread.episodes.insert(
+            episode_key,
+            episode_state_from_payload(episode_id, scope_instance_id, payload),
+        );
+        snapshot.total_episodes = snapshot.total_episodes.saturating_add(1);
+    }
+
+    for (thread_id, thread_state) in snapshot.threads.iter_mut() {
+        if let Some((scope_instance_id, scope_payload)) = open_scope_instances.get(thread_id) {
+            if let Some(scope) = scope_binding_state_from_payload(
+                scope_instance_id,
+                scope_payload,
+                scope_payloads.get(&scope_payload.scope_id),
+                &thread_state.contexts,
+                &thread_state.reasons,
+            ) {
+                thread_state.active_scope = Some(scope);
+            }
+        }
+    }
+
+    Ok(snapshot)
+}
+
+fn context_state_from_payload(context_id: String, data: CognitionContextData) -> ContextState {
+    ContextState {
+        context_id,
+        label: data.label,
+        weight: data.weight.unwrap_or_default(),
+        weight_avg_cumulative: data.weight_avg_cumulative.unwrap_or_default(),
+        weight_avg_ema: data.weight_avg_ema.unwrap_or_default(),
+        weight_samples: data.weight_samples.unwrap_or_default(),
+        tags: data.tags,
+        ilk_weights: data.ilk_weights,
+        ilk_profile: data.ilk_profile,
+        opened_at: data.opened_at.unwrap_or_default(),
+        last_seen_at: data.last_seen_at.unwrap_or_default(),
+        closed_at: data.closed_at,
+        status: data.status,
+    }
+}
+
+fn reason_state_from_payload(reason_id: String, data: CognitionReasonData) -> ReasonState {
+    ReasonState {
+        reason_id,
+        label: data.label,
+        weight: data.weight.unwrap_or_default(),
+        weight_avg_cumulative: data.weight_avg_cumulative.unwrap_or_default(),
+        weight_avg_ema: data.weight_avg_ema.unwrap_or_default(),
+        weight_samples: data.weight_samples.unwrap_or_default(),
+        signals_canonical: data.signals_canonical,
+        signals_extra: data.signals_extra,
+        ilk_weights: data.ilk_weights,
+        ilk_profile: data.ilk_profile,
+        opened_at: data.opened_at.unwrap_or_default(),
+        last_seen_at: data.last_seen_at.unwrap_or_default(),
+        closed_at: data.closed_at,
+        status: data.status,
+    }
+}
+
+fn cooccurrence_state_from_payload(
+    cooccurrence_id: String,
+    data: CognitionCooccurrenceData,
+) -> CooccurrenceState {
+    CooccurrenceState {
+        cooccurrence_id,
+        context_id: data.context_id,
+        context_label: data.context_label,
+        reason_id: data.reason_id,
+        reason_label: data.reason_label,
+        weight: data.weight.unwrap_or_default(),
+        weight_avg_cumulative: data.weight_avg_cumulative.unwrap_or_default(),
+        weight_avg_ema: data.weight_avg_ema.unwrap_or_default(),
+        weight_samples: data.weight_samples.unwrap_or_default(),
+        occurrences: data.occurrences.unwrap_or_default(),
+        opened_at: data.opened_at.unwrap_or_default(),
+        last_seen_at: data.last_seen_at.unwrap_or_default(),
+        closed_at: data.closed_at,
+        status: data.status,
+    }
+}
+
+fn memory_state_from_payload(memory_id: String, data: CognitionMemoryData) -> MemoryState {
+    MemoryState {
+        memory_id,
+        scope_id: data.scope_id.unwrap_or_default(),
+        summary: data.summary,
+        weight: data.weight.unwrap_or_default(),
+        occurrences: data.occurrences.unwrap_or_default(),
+        dominant_context_id: data.dominant_context_id.unwrap_or_default(),
+        dominant_reason_id: data.dominant_reason_id.unwrap_or_default(),
+        ilk_weights: data.ilk_weights,
+        created_at: data.created_at.unwrap_or_default(),
+        last_seen_at: data.last_seen_at.unwrap_or_default(),
+    }
+}
+
+fn episode_state_from_payload(
+    episode_id: String,
+    scope_instance_id: String,
+    data: CognitionEpisodeData,
+) -> EpisodeState {
+    EpisodeState {
+        episode_id,
+        scope_id: data.scope_id.unwrap_or_default(),
+        scope_instance_id,
+        affect_id: data.affect_id,
+        title: data.title,
+        summary: data.summary,
+        base_intensity: data.base_intensity.unwrap_or_default(),
+        evidence_strength: data.evidence_strength.unwrap_or_default(),
+        evidence_context_ids: data.evidence_context_ids,
+        evidence_reason_ids: data.evidence_reason_ids,
+        evidence_signals: data.evidence_signals,
+        intensity: data.intensity.unwrap_or_default(),
+        reason: data.reason.unwrap_or_default(),
+        created_at: data.created_at.unwrap_or_default(),
+    }
+}
+
+fn scope_binding_state_from_payload(
+    scope_instance_id: &str,
+    instance: &ScopeInstancePayload,
+    scope: Option<&CognitionScopeData>,
+    contexts: &HashMap<String, ContextState>,
+    reasons: &HashMap<String, ReasonState>,
+) -> Option<ScopeBindingState> {
+    let dominant_context_id = instance
+        .dominant_context_id
+        .clone()
+        .or_else(|| scope.and_then(|value| value.dominant_context_id.clone()))
+        .unwrap_or_default();
+    let dominant_reason_id = instance
+        .dominant_reason_id
+        .clone()
+        .or_else(|| scope.and_then(|value| value.dominant_reason_id.clone()))
+        .unwrap_or_default();
+    let dominant_context = contexts.get(&dominant_context_id)?;
+    let dominant_reason = reasons.get(&dominant_reason_id)?;
+    Some(ScopeBindingState {
+        scope_id: instance.scope_id.clone(),
+        scope_instance_id: scope_instance_id.to_string(),
+        label: scope
+            .and_then(|value| value.label.clone())
+            .unwrap_or_else(|| format!("scope:{}", instance.scope_id)),
+        dominant_context_id: dominant_context.context_id.clone(),
+        dominant_context_label: dominant_context.label.clone(),
+        dominant_context_tags: dominant_context.tags.clone(),
+        dominant_reason_id: dominant_reason.reason_id.clone(),
+        dominant_reason_label: dominant_reason.label.clone(),
+        dominant_reason_signals: dominant_reason.signals_canonical.clone(),
+        ilk_weights: merged_scope_ilk_weights(dominant_context, dominant_reason),
+        binding_energy_ema: scope
+            .and_then(|value| value.binding_energy_ema)
+            .unwrap_or_default(),
+        opened_at: instance
+            .opened_at
+            .clone()
+            .or_else(|| scope.and_then(|value| value.opened_at.clone()))
+            .unwrap_or_default(),
+        last_seen_at: scope
+            .and_then(|value| value.last_seen_at.clone())
+            .or_else(|| instance.opened_at.clone())
+            .unwrap_or_default(),
+        start_thread_seq: instance.start_thread_seq,
+        unbind_streak: 0,
+    })
+}
+
+fn merged_scope_ilk_weights(context: &ContextState, reason: &ReasonState) -> BTreeMap<String, f64> {
+    let mut out = context.ilk_weights.clone();
+    for (ilk, weight) in &reason.ilk_weights {
+        *out.entry(ilk.clone()).or_insert(0.0) += *weight;
+    }
+    out
+}
+
+fn row_payload<T: for<'de> Deserialize<'de>>(row: &Row) -> Result<T, CognitionError> {
+    let payload: Value = row.get("payload");
+    Ok(serde_json::from_value(payload)?)
+}
+
+fn resolve_storage_database_url(hive_id: &str) -> Option<String> {
+    let storage_node_name = ensure_l2_name(STORAGE_NODE_BASE_NAME, hive_id);
+    load_node_secret_record(&storage_node_name)
+        .ok()
+        .and_then(|record| {
+            record
+                .secrets
+                .get(STORAGE_LOCAL_SECRET_KEY_POSTGRES_URL)
+                .cloned()
+        })
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value != NODE_SECRET_REDACTION_TOKEN)
+        .or_else(|| {
+            std::env::var("FLUXBEE_DATABASE_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            std::env::var("JSR_DATABASE_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn with_dbname(base: &PgConfig, dbname: &str) -> PgConfig {
+    let mut cfg = base.clone();
+    cfg.dbname(dbname);
+    cfg
+}
+
+#[derive(Default)]
+struct RuntimeRefreshDelta {
+    processed_turns_delta: u64,
+    published_entities_delta: u64,
+    publish_errors_delta: u64,
+    invalid_turns_delta: u64,
+    last_trace_id: Option<String>,
+    last_thread_id: Option<String>,
+    last_thread_seq: Option<u64>,
+    last_src_ilk: Option<String>,
+    last_ich: Option<String>,
+    last_tags: Option<Vec<String>>,
+    last_reason_signals_canonical: Option<Vec<String>>,
+    last_reason_signals_extra: Option<Vec<String>>,
+    rebuilt_threads_total: u64,
+    rebuild_source: Option<String>,
+    rebuild_status: Option<String>,
+    rebuild_success: bool,
+}
+
+async fn refresh_runtime_totals(app_state: &CognitionAppState, delta: RuntimeRefreshDelta) {
+    let (
+        active_threads_total,
+        open_contexts_total,
+        open_reasons_total,
+        open_cooccurrences_total,
+        active_scopes_total,
+        active_memories_total,
+        active_episodes_total,
+    ) = {
+        let threads = app_state.thread_states.lock().await;
+        let active_threads = threads.len() as u64;
+        let open_contexts = threads
+            .values()
+            .map(|thread| {
+                thread
+                    .contexts
+                    .values()
+                    .filter(|context| context.status == "open")
+                    .count() as u64
+            })
+            .sum();
+        let open_reasons = threads
+            .values()
+            .map(|thread| {
+                thread
+                    .reasons
+                    .values()
+                    .filter(|reason| reason.status == "open")
+                    .count() as u64
+            })
+            .sum();
+        let open_cooccurrences = threads
+            .values()
+            .map(|thread| {
+                thread
+                    .cooccurrences
+                    .values()
+                    .filter(|cooccurrence| cooccurrence.status == "open")
+                    .count() as u64
+            })
+            .sum();
+        let active_scopes = threads
+            .values()
+            .filter(|thread| thread.active_scope.is_some())
+            .count() as u64;
+        let active_memories = threads
+            .values()
+            .map(|thread| thread.memories.len() as u64)
+            .sum();
+        let active_episodes = threads
+            .values()
+            .map(|thread| thread.episodes.len() as u64)
+            .sum();
+        (
+            active_threads,
+            open_contexts,
+            open_reasons,
+            open_cooccurrences,
+            active_scopes,
+            active_memories,
+            active_episodes,
+        )
+    };
+
+    let mut state = app_state.runtime_state.lock().await;
+    state.processed_turns_total = state
+        .processed_turns_total
+        .saturating_add(delta.processed_turns_delta);
+    state.invalid_turns_total = state
+        .invalid_turns_total
+        .saturating_add(delta.invalid_turns_delta);
+    state.published_entities_total = state
+        .published_entities_total
+        .saturating_add(delta.published_entities_delta);
+    state.publish_errors_total = state
+        .publish_errors_total
+        .saturating_add(delta.publish_errors_delta);
+    if let Some(value) = delta.last_trace_id {
+        state.last_trace_id = Some(value);
+    }
+    if let Some(value) = delta.last_thread_id {
+        state.last_thread_id = Some(value);
+    }
+    if delta.last_thread_seq.is_some() {
+        state.last_thread_seq = delta.last_thread_seq;
+    }
+    if let Some(value) = delta.last_src_ilk {
+        state.last_src_ilk = Some(value);
+    }
+    if let Some(value) = delta.last_ich {
+        state.last_ich = Some(value);
+    }
+    if let Some(value) = delta.last_tags {
+        state.last_tags = value;
+    }
+    if let Some(value) = delta.last_reason_signals_canonical {
+        state.last_reason_signals_canonical = value;
+    }
+    if let Some(value) = delta.last_reason_signals_extra {
+        state.last_reason_signals_extra = value;
+    }
+    state.active_threads_total = active_threads_total;
+    state.open_contexts_total = open_contexts_total;
+    state.open_reasons_total = open_reasons_total;
+    state.open_cooccurrences_total = open_cooccurrences_total;
+    state.active_scopes_total = active_scopes_total;
+    state.active_memories_total = active_memories_total;
+    state.active_episodes_total = active_episodes_total;
+    if delta.rebuilt_threads_total > 0 || delta.rebuild_status.is_some() {
+        state.rebuilt_threads_total = delta.rebuilt_threads_total;
+    }
+    if let Some(value) = delta.rebuild_source {
+        state.last_rebuild_source = Some(value);
+    }
+    if let Some(value) = delta.rebuild_status {
+        state.last_rebuild_status = Some(value);
+    }
+    if delta.rebuild_success {
+        state.rebuild_successes_total = state.rebuild_successes_total.saturating_add(1);
+    }
+}
+
 fn build_memory_package_for_thread(
     thread_id: &str,
     thread_state: &ThreadCognitionState,
@@ -981,7 +1632,14 @@ fn build_status_payload(
             "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
             "active_scopes_total": runtime_state.active_scopes_total,
             "active_memories_total": runtime_state.active_memories_total,
-            "active_episodes_total": runtime_state.active_episodes_total
+            "active_episodes_total": runtime_state.active_episodes_total,
+            "rebuild_attempts_total": runtime_state.rebuild_attempts_total,
+            "rebuild_successes_total": runtime_state.rebuild_successes_total,
+            "rebuild_failures_total": runtime_state.rebuild_failures_total,
+            "rebuilt_threads_total": runtime_state.rebuilt_threads_total,
+            "last_rebuild_status": runtime_state.last_rebuild_status,
+            "last_rebuild_source": runtime_state.last_rebuild_source,
+            "last_rebuild_at": runtime_state.last_rebuild_at
         },
         "paths": {
             "state_dir": runtime_paths.state_dir,
@@ -1021,6 +1679,10 @@ fn build_cognition_config_get_payload(
         ),
         Value::String(
             "Deterministic v1 writer for threads, contexts, reasons, cooccurrences, scopes, scope_instances, memories, and episodes is active; jsr-memory SHM writer is active and router enrichment is local-only after routing."
+                .to_string(),
+        ),
+        Value::String(
+            "Cold start rebuild from durable storage is attempted only when local cognition state is empty; when storage durable is unavailable the node stays fail-open and continues live."
                 .to_string(),
         ),
     ];
@@ -1072,10 +1734,20 @@ fn build_cognition_config_get_payload(
             "last_tags": runtime_state.last_tags,
             "last_reason_signals_canonical": runtime_state.last_reason_signals_canonical,
             "last_reason_signals_extra": runtime_state.last_reason_signals_extra,
+            "active_threads_total": runtime_state.active_threads_total,
+            "open_contexts_total": runtime_state.open_contexts_total,
+            "open_reasons_total": runtime_state.open_reasons_total,
             "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
             "active_scopes_total": runtime_state.active_scopes_total,
             "active_memories_total": runtime_state.active_memories_total,
-            "active_episodes_total": runtime_state.active_episodes_total
+            "active_episodes_total": runtime_state.active_episodes_total,
+            "rebuild_attempts_total": runtime_state.rebuild_attempts_total,
+            "rebuild_successes_total": runtime_state.rebuild_successes_total,
+            "rebuild_failures_total": runtime_state.rebuild_failures_total,
+            "rebuilt_threads_total": runtime_state.rebuilt_threads_total,
+            "last_rebuild_status": runtime_state.last_rebuild_status,
+            "last_rebuild_source": runtime_state.last_rebuild_source,
+            "last_rebuild_at": runtime_state.last_rebuild_at
         },
         "contract": {
             "node_family": "SY",

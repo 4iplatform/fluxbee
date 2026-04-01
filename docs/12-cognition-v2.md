@@ -1086,7 +1086,7 @@ Operational alignment note:
 
 - [ ] COG-T21. Implement LanceDB schema for threads, contexts, reasons, memories, episodes.
 - [x] COG-T22. Implement jsr-memory SHM writer (seqlock, versioned snapshot by `thread_id`).
-- [ ] COG-T23. Implement cold start (rebuild from PostgreSQL via SY.storage).
+- [x] COG-T23. Implement cold start (rebuild from PostgreSQL via SY.storage).
 
 ### Phase 7 — Router Enrichment
 
@@ -1100,6 +1100,7 @@ Validation note:
 - The canonical E2E for cognition v2 must enter through the router path with real/disposable nodes.
 - The old direct publish-to-`storage.turns` smoke was removed from the repo to avoid confusing it with the normative path.
 - PostgreSQL is not the primary oracle for the cognition E2E. The primary oracle is delivery to the destination node plus `jsr-memory` and `SY.cognition` runtime counters.
+- Cold start rebuild is startup-only and fail-open: rebuild is attempted only when local cognition state is empty, and missing/unreachable durable storage does not block live processing.
 
 - [ ] COG-T27. E2E: message → tagger → context + reason created.
 - [ ] COG-T28. E2E: binding energy with context + reason → scope transition.

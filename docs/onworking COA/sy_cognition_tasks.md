@@ -565,9 +565,9 @@ Estado actual:
 
 ### Fase COG-M10 - Cold start, rebuild y cierre de migración
 
-- [ ] COG-M10-T1. Implementar rebuild desde storage durable.
-- [ ] COG-M10-T2. Regenerar `jsr-memory` desde durable.
-- [ ] COG-M10-T3. Definir criterio de corrupción/rebuild local.
+- [x] COG-M10-T1. Implementar rebuild desde storage durable.
+- [x] COG-M10-T2. Regenerar `jsr-memory` desde durable.
+- [x] COG-M10-T3. Definir criterio de corrupción/rebuild local.
 - [~] COG-M10-T4. E2E completo:
   - message real por router
   - `thread_id/thread_seq` en carrier real
@@ -583,6 +583,12 @@ Estado actual:
   - shapes/documentación v1 incompatibles
 
 Estado actual:
+- `SY.cognition` ya intenta rebuild en startup desde durable (`cognition_*` en PostgreSQL vía `SY.storage`) cuando el estado local en memoria está vacío
+- el rebuild rehidrata `thread/context/reason/cooccurrence/scope/scope_instance/memory/episode` y vuelve a escribir `jsr-memory`
+- el criterio actual de cold start es fail-open:
+  - si ya hay estado local en memoria, no rebuilda
+  - si falta la configuración durable o PostgreSQL no responde, deja status de rebuild y sigue live
+  - si rebuilda bien, publica métricas/último estado de rebuild en `STATUS` y `CONFIG_GET`
 - el E2E canónico ya quedó redirigido al path real por router con nodos disposable
 - se removió el smoke viejo por publish directo a `storage.turns` para no dejar una ruta muerta o engañosa en el repo
 - [`cognition_shm_dump.rs`](/Users/cagostino/Documents/GitHub/fluxbee/src/bin/cognition_shm_dump.rs) queda como herramienta de diagnóstico puntual de SHM, no como E2E
