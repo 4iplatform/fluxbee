@@ -1025,7 +1025,7 @@ async fn build_slack_inbound_payload(
         content,
         attachments.into_iter().map(|a| a.blob_ref).collect(),
     );
-    match payload.and_then(|p| p.to_value()) {
+    match payload.to_value() {
         Ok(mut payload) => {
             attach_slack_raw_stub(&mut payload, team_id, user, channel, thread_ts, message_id);
             Some(payload)
