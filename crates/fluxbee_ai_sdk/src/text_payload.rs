@@ -72,8 +72,28 @@ pub struct ResolvedModelInput {
     pub attachments: Vec<ResolvedModelAttachment>,
 }
 
+#[derive(Debug, Clone)]
+pub struct OpenAiUserContentOptions {
+    pub image_detail: Option<String>,
+}
+
+impl Default for OpenAiUserContentOptions {
+    fn default() -> Self {
+        Self {
+            image_detail: Some("auto".to_string()),
+        }
+    }
+}
+
 pub async fn build_openai_user_content_parts(
     input: &ResolvedModelInput,
+) -> std::result::Result<Vec<Value>, ModelInputPayloadError> {
+    build_openai_user_content_parts_with_options(input, &OpenAiUserContentOptions::default()).await
+}
+
+pub async fn build_openai_user_content_parts_with_options(
+    input: &ResolvedModelInput,
+    options: &OpenAiUserContentOptions,
 ) -> std::result::Result<Vec<Value>, ModelInputPayloadError> {
     let mut parts = Vec::new();
     if !input.main_text.trim().is_empty() {
@@ -116,14 +136,35 @@ pub async fn build_openai_user_content_parts(
             parts.push(serde_json::json!({
                 "type": "input_image",
                 "image_url": image_url,
+                "detail": options.image_detail.clone().unwrap_or_else(|| "auto".to_string()),
             }));
             continue;
         }
 
-        return Err(ModelInputPayloadError::UnsupportedAttachmentMime(format!(
-            "mime '{}' is not supported for OpenAI multimodal input",
-            attachment.blob_ref.mime
-        )));
+        let bytes = tokio_fs::read(&attachment.path).await.map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                ModelInputPayloadError::BlobNotFound(format!(
+                    "Failed to read attachment blob '{}': {}",
+                    attachment.blob_ref.blob_name, err
+                ))
+            } else {
+                ModelInputPayloadError::BlobIo(format!(
+                    "Failed to read attachment blob '{}': {}",
+                    attachment.blob_ref.blob_name, err
+                ))
+            }
+        })?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let filename = if attachment.blob_ref.filename_original.trim().is_empty() {
+            attachment.blob_ref.blob_name.clone()
+        } else {
+            attachment.blob_ref.filename_original.clone()
+        };
+        parts.push(serde_json::json!({
+            "type": "input_file",
+            "filename": filename,
+            "file_data": encoded,
+        }));
     }
 
     Ok(parts)
@@ -763,8 +804,8 @@ mod tests {
         std::fs::write(&image_path, [0_u8, 1_u8, 2_u8, 3_u8]).expect("write image bytes");
 
         let input = ResolvedModelInput {
-            main_text: "mirá".to_string(),
-            prompt_text: "mirá".to_string(),
+            main_text: "mirÃ¡".to_string(),
+            prompt_text: "mirÃ¡".to_string(),
             attachments: vec![ResolvedModelAttachment {
                 blob_ref: image_blob,
                 path: image_path,
@@ -776,6 +817,7 @@ mod tests {
             .expect("parts should build");
         assert_eq!(parts[0]["type"], "input_text");
         assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(parts[1]["detail"], "auto");
         assert!(parts[1]["image_url"]
             .as_str()
             .expect("image_url should be string")
@@ -784,29 +826,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_openai_user_content_parts_rejects_unsupported_non_text_mime() {
+    #[tokio::test]
+    async fn build_openai_user_content_parts_serializes_non_image_as_input_file() {
+        let root = temp_blob_root();
+        let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
+        let file_blob = BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "doc_0123456789abcdef.pdf".to_string(),
+            size: 12,
+            mime: "application/pdf".to_string(),
+            filename_original: "doc.pdf".to_string(),
+            spool_day: "2026-03-31".to_string(),
+        };
+        let file_path = toolkit.resolve(&file_blob);
+        std::fs::create_dir_all(
+            file_path
+                .parent()
+                .expect("file blob parent must exist for test setup"),
+        )
+        .expect("create blob parent");
+        std::fs::write(&file_path, b"%PDF-test").expect("write file bytes");
         let input = ResolvedModelInput {
-            main_text: "mirá".to_string(),
-            prompt_text: "mirá".to_string(),
+            main_text: "mira".to_string(),
+            prompt_text: "mira".to_string(),
             attachments: vec![ResolvedModelAttachment {
-                blob_ref: BlobRef {
-                    ref_type: "blob_ref".to_string(),
-                    blob_name: "doc_0123456789abcdef.pdf".to_string(),
-                    size: 12,
-                    mime: "application/pdf".to_string(),
-                    filename_original: "doc.pdf".to_string(),
-                    spool_day: "2026-03-31".to_string(),
-                },
-                path: PathBuf::from("/tmp/unused.pdf"),
+                blob_ref: file_blob,
+                path: file_path,
                 text_content: None,
             }],
         };
-        let err = build_openai_user_content_parts(&input)
+        let parts = build_openai_user_content_parts(&input)
             .await
-            .expect_err("pdf should fail");
-        assert_eq!(err.code(), "unsupported_attachment_mime");
+            .expect("pdf should map to input_file");
+        assert_eq!(parts[1]["type"], "input_file");
+        assert_eq!(parts[1]["filename"], "doc.pdf");
+        assert!(
+            parts[1]["file_data"]
+                .as_str()
+                .expect("file_data should be string")
+                .len()
+                > 4
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn build_openai_user_content_parts_supports_image_detail_override() {
+        let root = temp_blob_root();
+        let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
+        let image_blob = BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "img_0123456789abcdef.jpg".to_string(),
+            size: 4,
+            mime: "image/jpeg".to_string(),
+            filename_original: "image.jpg".to_string(),
+            spool_day: "2026-03-31".to_string(),
+        };
+        let image_path = toolkit.resolve(&image_blob);
+        std::fs::create_dir_all(
+            image_path
+                .parent()
+                .expect("image blob parent must exist for test setup"),
+        )
+        .expect("create blob parent");
+        std::fs::write(&image_path, [0_u8, 1_u8, 2_u8, 3_u8]).expect("write image bytes");
+        let input = ResolvedModelInput {
+            main_text: "mira".to_string(),
+            prompt_text: "mira".to_string(),
+            attachments: vec![ResolvedModelAttachment {
+                blob_ref: image_blob,
+                path: image_path,
+                text_content: None,
+            }],
+        };
+        let opts = OpenAiUserContentOptions {
+            image_detail: Some("high".to_string()),
+        };
+        let parts = build_openai_user_content_parts_with_options(&input, &opts)
+            .await
+            .expect("image with detail should work");
+        assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(parts[1]["detail"], "high");
+        let _ = std::fs::remove_dir_all(root);
+    }
     #[test]
     fn text_response_offloads_large_content_to_content_ref() {
         let root = temp_blob_root();

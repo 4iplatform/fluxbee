@@ -40,10 +40,11 @@ pub use summary_refresh::{
 };
 pub use text_payload::{
     build_model_input_from_payload, build_model_input_from_payload_with_options,
-    build_openai_user_content_parts, build_text_response, build_text_response_with_options,
-    extract_text, resolve_model_input_from_payload, resolve_model_input_from_payload_with_options,
-    ModelInputOptions, ModelInputPayloadError, ResolvedModelAttachment, ResolvedModelInput,
-    TextResponseOptions,
+    build_openai_user_content_parts, build_openai_user_content_parts_with_options,
+    build_text_response, build_text_response_with_options, extract_text,
+    resolve_model_input_from_payload, resolve_model_input_from_payload_with_options,
+    ModelInputOptions, ModelInputPayloadError, OpenAiUserContentOptions, ResolvedModelAttachment,
+    ResolvedModelInput, TextResponseOptions,
 };
 pub use thread_state::{LanceDbThreadStateStore, ThreadStateRecord, ThreadStateStore};
 pub use thread_state_tools::{
