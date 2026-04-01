@@ -1418,6 +1418,7 @@ async fn handle_ai_chat(
             &tools,
             FunctionRunInput {
                 current_user_message: input.to_string(),
+                current_user_parts: None,
                 immediate_memory: Some(memory),
             },
         )
