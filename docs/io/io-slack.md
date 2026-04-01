@@ -183,14 +183,19 @@ Interpretación operativa:
 }
 ```
 
-### 7.1 Regla de offload por tamaño (delegada a `io-common`)
+### 7.1 Regla de offload por tamaño (delegada a SDK `send`)
 - `IO.slack` construye payload `text/v1` base (`content` + `attachments` cuando corresponda).
-- La decisión de dejar inline o convertir a `content_ref` por límite de tamaño **la toma `io-common`** en el pipeline inbound compartido.
-- Configuración relevante:
-  - `io.blob.max_message_bytes` (default 64KB),
-  - `io.blob.message_overhead_bytes`,
-  - límites de adjuntos (`io.blob.max_attachments`, `io.blob.max_attachment_bytes`, `io.blob.max_total_attachment_bytes`).
+- La decisión de dejar inline o convertir a `content_ref` por límite de tamaño **la toma `fluxbee_sdk::NodeSender::send`**.
+- Configuración relevante del enforcement SDK:
+  - `FLUXBEE_TEXT_V1_MAX_MESSAGE_BYTES` (default 64KB),
+  - `FLUXBEE_TEXT_V1_MESSAGE_OVERHEAD_BYTES`,
+  - `FLUXBEE_BLOB_ROOT`,
+  - `FLUXBEE_BLOB_MAX_BYTES`,
+  - `FLUXBEE_DISABLE_AUTO_BLOB_SEND` (escape hatch).
 - Objetivo: evitar divergencias entre adapters IO y mantener un comportamiento único para `text/v1`.
+
+Nota operativa:
+- `io.blob.*` en control-plane del nodo puede seguir siendo útil para validaciones/políticas del adapter, pero no gobierna por sí solo el auto-offload en `NodeSender::send`.
 
 ### 7.2 Estado de validación y límite del canal Slack
 - El mecanismo canónico de offload (`content` -> `content_ref` al superar límite) se valida de forma determinística con `io-sim`, porque no depende de límites del proveedor externo.
@@ -213,6 +218,25 @@ El Nodo IO Slack **DEBE**:
 - Enviar el mensaje al `channel` indicado.
 - Si `thread_ts` está presente, responder en el mismo hilo.
 - Caso contrario, publicar en el canal.
+
+### 8.3 Política de contenido largo (estado actual)
+
+✅ **Implementado hoy:**
+- Si el payload inbound a `io-slack` trae `content_ref` de texto, `io-slack` resuelve el blob y lo envía como texto por `chat.postMessage`.
+- Los `attachments[]` del payload se envían como archivos usando el flujo externo de Slack files API.
+
+⚠️ **Limitación conocida (hoy):**
+- Para texto muy largo, este comportamiento puede chocar con el límite de `chat.postMessage` (Slack trunca por encima de 40.000 caracteres).
+- En consecuencia, si un nodo upstream (por ejemplo AI) devuelve texto muy grande via `content_ref`, hoy `io-slack` puede terminar publicando texto truncado si no viene además como attachment explícito.
+
+🧩 **TBD / a normar para Slack:**
+- Definir fallback canónico cuando `resolved.text` excede límite de Slack:
+  - subir texto completo como archivo/snippet y no truncar,
+  - opcionalmente agregar notice configurable/localizable,
+  - o chunking controlado si se adopta esa estrategia.
+
+Referencia oficial de límite:
+- https://docs.slack.dev/reference/methods/chat.postMessage/ ("Truncating content").
 
 ---
 

@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::node_client::NodeError;
 use crate::protocol::{build_withdraw, Destination, Message};
+use crate::send_normalization::normalize_outbound_message;
 
 pub(crate) struct ConnectionState {
     connected: AtomicBool,
@@ -83,6 +84,7 @@ impl NodeSender {
     }
 
     pub async fn send(&self, msg: Message) -> Result<(), NodeError> {
+        let msg = normalize_outbound_message(msg);
         let data = serde_json::to_vec(&msg)?;
         self.tx.send(data).await.map_err(|_| {
             self.info.state.set_connected(false);

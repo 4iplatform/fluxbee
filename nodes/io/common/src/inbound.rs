@@ -8,8 +8,7 @@ use crate::identity::{IdentityProvisioner, IdentityResolver, ResolveOrCreateInpu
 use crate::io_context::{wrap_in_meta_context, IoContext};
 use crate::reliability::{dedup_key_from_io_context, DedupCache};
 use crate::router_message::{build_user_message, new_trace_id};
-use crate::text_v1_blob::{normalize_text_v1_inbound_payload, IoBlobRuntimeConfig, IoTextBlobConfig};
-use fluxbee_sdk::blob::BlobToolkit;
+use crate::text_v1_blob::IoBlobRuntimeConfig;
 use fluxbee_sdk::protocol::Message;
 
 #[derive(Debug, Clone)]
@@ -53,8 +52,6 @@ pub struct InboundProcessor {
     ttl: u32,
     dst_node: Option<String>,
     provision_on_miss: bool,
-    text_v1_blob_toolkit: Option<BlobToolkit>,
-    text_v1_blob_cfg: IoTextBlobConfig,
     dedup: DedupCache,
     stats: InboundStats,
 }
@@ -70,30 +67,13 @@ impl InboundProcessor {
         let ttl = config.ttl;
         let dst_node = config.dst_node;
         let dedup = DedupCache::new(config.dedup_ttl, config.dedup_max_entries);
-        let mut text_v1_blob_toolkit = None;
-        let mut text_v1_blob_cfg = IoTextBlobConfig::default();
-        if let Some(blob_runtime) = config.blob_runtime {
-            text_v1_blob_cfg = blob_runtime.text_v1.clone();
-            match blob_runtime.build_toolkit() {
-                Ok(toolkit) => {
-                    text_v1_blob_toolkit = Some(toolkit);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "inbound text/v1 normalization disabled: invalid blob runtime config"
-                    );
-                }
-            }
-        }
+        let _ = config.blob_runtime;
 
         Self {
             node_uuid: node_uuid.into(),
             ttl,
             dst_node,
             provision_on_miss: config.provision_on_miss,
-            text_v1_blob_toolkit,
-            text_v1_blob_cfg,
             dedup,
             stats: InboundStats::default(),
         }
@@ -123,7 +103,6 @@ impl InboundProcessor {
         self.stats.dedup_misses += 1;
 
         let trace_id = new_trace_id();
-        let payload = self.normalize_text_v1_payload(trace_id.as_str(), payload);
         let mut src_ilk =
             match identity.lookup(&identity_input.channel, &identity_input.external_id) {
                 Ok(Some(src_ilk)) => {
@@ -214,59 +193,6 @@ impl InboundProcessor {
             wrap_in_meta_context(&io_context),
             payload,
         ))
-    }
-
-    fn normalize_text_v1_payload(&self, trace_id: &str, payload: Value) -> Value {
-        let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or_default();
-        if payload_type != "text" {
-            return payload;
-        }
-
-        let Some(toolkit) = self.text_v1_blob_toolkit.as_ref() else {
-            tracing::debug!(
-                trace_id = %trace_id,
-                "inbound text/v1 normalization skipped: blob toolkit unavailable"
-            );
-            return payload;
-        };
-
-        match normalize_text_v1_inbound_payload(toolkit, &self.text_v1_blob_cfg, &payload) {
-            Ok((normalized, decision)) => {
-                tracing::debug!(
-                    trace_id = %trace_id,
-                    text_v1_normalized = true,
-                    offload_to_blob = decision.processed_as_blob,
-                    inline_bytes = decision.inline_payload_bytes,
-                    estimated_total_bytes = decision.estimated_total_bytes,
-                    max_message_bytes = decision.max_message_bytes,
-                    has_attachments = decision.has_attachments,
-                    "inbound text/v1 normalized"
-                );
-                if decision.processed_as_blob {
-                    if let Ok(parsed) = fluxbee_sdk::payload::TextV1Payload::from_value(&normalized) {
-                        if let Some(content_ref) = parsed.content_ref {
-                            tracing::info!(
-                                trace_id = %trace_id,
-                                reason = "message_over_limit_or_content_ref",
-                                blob_name = %content_ref.blob_name,
-                                blob_size = content_ref.size,
-                                "inbound text/v1 processed as blob"
-                            );
-                        }
-                    }
-                }
-                normalized
-            }
-            Err(error) => {
-                tracing::warn!(
-                    trace_id = %trace_id,
-                    canonical_code = error.canonical_code(),
-                    error_detail = %error,
-                    "inbound text/v1 normalization failed; forwarding payload as-is"
-                );
-                payload
-            }
-        }
     }
 }
 

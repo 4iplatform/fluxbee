@@ -309,3 +309,32 @@ Criterio de salida:
 4. Fase 3
 5. Fase 4
 6. Fase 5
+
+---
+
+## Addendum 2026-04-01 (enforcement comun `text/v1`)
+
+Estado actualizado de implementacion:
+
+- La decision `content` vs `content_ref` por limite de tamano ya no depende de `io-slack`.
+- El enforcement se ejecuta en `io-common::InboundProcessor` para payloads inbound `type="text"`.
+- `io-slack` ahora construye payload base `text/v1` (texto + adjuntos) y delega la normalizacion final a `io-common`.
+
+Implicancias:
+
+- Este punto reemplaza cualquier referencia previa que sugiera que `io-slack` decide localmente el offload por tamano.
+- El comportamiento esperado para adapters IO es:
+  1. mapear evento externo -> payload `text/v1` base,
+  2. delegar normalizacion/offload a `io-common`.
+
+Logging operativo esperado (comun):
+
+- `debug`: `inbound text/v1 normalized` con `offload_to_blob=true|false`.
+- `info`: `inbound text/v1 processed as blob` cuando aplica offload.
+- `warn`: errores de normalizacion con `canonical_code`.
+
+Limitacion de validacion en canal Slack:
+
+- El comportamiento de offload para payloads de texto extremos debe validarse de forma determinística con `io-sim`.
+- En Slack real, `chat.postMessage` trunca texto por encima de 40.000 caracteres, por lo que no sirve como prueba robusta de umbral interno `>64KB`.
+  - Fuente: https://docs.slack.dev/reference/methods/chat.postMessage/ (Truncating content).

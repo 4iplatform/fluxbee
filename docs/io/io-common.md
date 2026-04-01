@@ -79,10 +79,17 @@ Los detalles específicos quedan en cada Nodo IO.
 - Cola/buffer **acotado** de mensajes "pendientes" (p.ej. esperando identidad) con timeouts.
 
 ### 2.1.1 Normalización `text/v1` + offload a blob (canónico IO)
-- `io-common` **DEBE** centralizar la normalización de payloads inbound `type="text"` en contrato `text/v1`.
-- Si el payload inline supera el límite configurado (`io.blob.max_message_bytes`, default 64KB), `io-common` **DEBE** convertir automáticamente a `content_ref` (blob).
+- El punto de enforcement de offload `text/v1` (inline -> `content_ref`) está en `fluxbee_sdk::NodeSender::send`.
+- `io-common` **DEBE** delegar esa decisión al SDK y **NO** duplicar lógica de offload por tamaño.
 - Los adapters IO **NO** deben reimplementar la decisión `content` vs `content_ref`; solo deben mapear evento externo -> payload base + adjuntos.
-- `io-common` **DEBE** mantener validaciones de límites/mime/adjuntos con errores canónicos (`invalid_text_payload`, `BLOB_*`, `unsupported_attachment_mime`, `too_many_attachments`).
+- Validaciones específicas de canal (mimes, límites de adjuntos, etc.) pueden mantenerse en `io-common`/adapter cuando aplique.
+
+Configuración operativa actual del enforcement en SDK:
+- `FLUXBEE_DISABLE_AUTO_BLOB_SEND` (true/1/yes/on desactiva el auto-offload en `send`)
+- `FLUXBEE_BLOB_ROOT`
+- `FLUXBEE_BLOB_MAX_BYTES`
+- `FLUXBEE_TEXT_V1_MAX_MESSAGE_BYTES`
+- `FLUXBEE_TEXT_V1_MESSAGE_OVERHEAD_BYTES`
 
 Logging operativo (bajo ruido):
 - `debug`: decisión de normalización (`offload_to_blob`, bytes estimados, límite, adjuntos).
@@ -102,6 +109,25 @@ Validación recomendada:
 - Idempotencia outbound **por proceso** mediante claves internas en memoria (si se requiere).
 - Worker/dispatcher en memoria para procesar el outbox.
 - **Nota**: al no haber persistencia, tras restart puede perderse el outbox y, por ende, mensajes outbound que no hayan sido enviados todavía.
+
+### 2.2.2 Política de salida a canal externo (contenido grande)
+
+✅ **NORMATIVO (baseline IO):**
+- Los adapters IO **DEBEN** respetar límites del canal externo destino.
+- Los adapters IO **NO DEBEN** truncar contenido de forma silenciosa.
+- Frente a límite de canal, el adapter **DEBE** usar una estrategia explícita de entrega alternativa (por ejemplo archivo/adjunto/chunking), y dejar trazabilidad en logs/métricas.
+
+🧩 **TBD por canal:**
+- Cada canal define estrategia concreta de fallback para payloads largos:
+  - `text` directo,
+  - archivo/adjunto,
+  - chunking en múltiples mensajes,
+  - híbrido (resumen + adjunto).
+
+✅ **NORMATIVO UX (multilenguaje):**
+- No usar notices hardcodeados en un idioma fijo.
+- Si se envía mensaje de aviso por fallback, debe ser configurable/localizable por nodo.
+- Default recomendado cuando no hay localización: entregar contenido completo sin texto de aviso fijo.
 
 ### 2.2.1 Identity Resolution Client (SY.identity)
 

@@ -274,20 +274,29 @@ Esto permite continuar a `spawn`, pero no corrige el problema de fondo del manif
 
 ## 10) Nota de contrato `text/v1` (offload > limite)
 
-En estado actual, la regla de offload por tamano para inbound `text/v1` esta centralizada en `io-common`:
+En estado actual, la regla de offload por tamano para `text/v1` esta centralizada en `fluxbee_sdk::NodeSender::send`:
 
 - `io-slack` arma payload base (`content` + `attachments`).
-- `io-common` decide inline vs `content_ref` segun `io.blob.max_message_bytes` (default 64KB) y `io.blob.message_overhead_bytes`.
+- `NodeSender::send` decide inline vs `content_ref` usando configuracion del SDK (`FLUXBEE_TEXT_V1_MAX_MESSAGE_BYTES`, `FLUXBEE_TEXT_V1_MESSAGE_OVERHEAD_BYTES`, `FLUXBEE_BLOB_ROOT`).
 
 Logs esperados:
 
-- `inbound text/v1 normalized` (debug)
-- `inbound text/v1 processed as blob` (info, solo cuando hubo offload)
+- `sdk send text/v1 normalized` (debug)
+- `sdk send text/v1 processed as blob` (info, solo cuando hubo offload)
 
 Esto evita divergencias entre adapters IO y mantiene comportamiento uniforme de `text/v1`.
+
+Importante:
+- `io.blob.*` configurado por control-plane del nodo no aplica automaticamente al enforcement de `NodeSender::send` si no se mapea tambien a env/config del proceso.
 
 Nota de alcance de pruebas:
 
 - Para validar de forma determinística payloads de texto muy grandes (ejemplo `>64KB`), usar `io-sim`.
 - En Slack real, `chat.postMessage` tiene límites propios del canal y trunca texto por encima de 40.000 caracteres, por lo que no es un canal confiable para probar umbrales internos extremos.
   - Fuente: https://docs.slack.dev/reference/methods/chat.postMessage/ ("Truncating content").
+
+Estado actual outbound a considerar en pruebas:
+
+- Si `io-slack` recibe texto largo via `content_ref`, hoy lo resuelve y lo publica como texto por `chat.postMessage`.
+- Por lo tanto, textos muy largos pueden quedar truncados por el límite de Slack.
+- Validación de fallback canónico (archivo/snippet/chunking) queda pendiente de norma específica del canal.
