@@ -173,6 +173,7 @@ Compat/migración:
 
 - los replies nuevos del AI SDK ya no deben reemitir `ctx`, `ctx_seq`, `ctx_window` ni `memory_package`
 - los runtimes AI siguen leyendo `thread_id` y `src_ilk` desde `meta` top-level
-- si hace falta compat, pueden caer a `meta.context.thread_id` y `meta.context.src_ilk` solo como lectura legacy
+- los nodos AI del repo ya no deben depender de `meta.context.thread_id` ni `meta.context.src_ilk`
+- la compat legacy que todavía existe en helpers del SDK queda solo para migración controlada, no como carrier normal
 
 No hace compresión semántica avanzada. Esa capa queda para sistemas cognitivos posteriores.

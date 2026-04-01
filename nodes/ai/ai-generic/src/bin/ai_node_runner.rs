@@ -1257,14 +1257,13 @@ impl GenericAiNode {
         ctx: &BehaviorContext,
     ) -> fluxbee_ai_sdk::Result<()> {
         // Thread state tools remain the source for node-level "hard state".
-        // In scoped AI runtimes the canonical key is src_ilk; thread_id is kept only
-        // as metadata and as a legacy migration key for older records.
+        // In scoped AI runtimes the canonical key is src_ilk; thread_id is
+        // conversational metadata only.
         // Immediate memory is managed separately by the runner as short-horizon context.
         if let (Some(store), Some(src_ilk)) = (&self.thread_state_store, &ctx.src_ilk) {
-            let provider = ThreadStateToolsProvider::with_get_put_delete_scoped_with_legacy(
+            let provider = ThreadStateToolsProvider::with_get_put_delete_scoped(
                 store.clone(),
                 src_ilk.clone(),
-                ctx.thread_id.clone(),
             );
             provider.register_tools(registry)?;
         }
@@ -3846,34 +3845,12 @@ fn extract_thread_id(msg: &Message) -> Option<String> {
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-        .or_else(|| {
-            msg.meta
-                .context
-                .as_ref()
-                .and_then(|ctx| ctx.get("thread_id"))
-                .and_then(Value::as_str)
-                .map(|value| value.trim())
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-        })
 }
 
 fn extract_src_ilk(msg: &Message) -> Option<String> {
-    if let Some(src_ilk) = msg
-        .meta
+    msg.meta
         .src_ilk
         .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string)
-    {
-        return Some(src_ilk);
-    }
-    msg.meta
-        .context
-        .as_ref()
-        .and_then(|ctx| ctx.get("src_ilk"))
-        .and_then(Value::as_str)
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToString::to_string)
@@ -3888,17 +3865,6 @@ fn src_ilk_source(msg: &Message) -> &'static str {
         .is_some_and(|v| !v.is_empty())
     {
         return "meta";
-    }
-    if msg
-        .meta
-        .context
-        .as_ref()
-        .and_then(|ctx| ctx.get("src_ilk"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .is_some_and(|v| !v.is_empty())
-    {
-        return "context_legacy";
     }
     "missing"
 }
@@ -4215,16 +4181,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_src_ilk_falls_back_to_meta_context_legacy() {
+    fn extract_src_ilk_does_not_read_legacy_meta_context() {
         let msg = sample_user_request_with_context(
             json!({ "src_ilk": "ilk:11111111-1111-4111-8111-111111111111" }),
             None,
         );
-        assert_eq!(
-            extract_src_ilk(&msg).as_deref(),
-            Some("ilk:11111111-1111-4111-8111-111111111111")
-        );
-        assert_eq!(src_ilk_source(&msg), "context_legacy");
+        assert_eq!(extract_src_ilk(&msg), None);
+        assert_eq!(src_ilk_source(&msg), "missing");
     }
 
     #[test]
@@ -4246,9 +4209,9 @@ mod tests {
     }
 
     #[test]
-    fn extract_thread_id_falls_back_to_meta_context_legacy() {
+    fn extract_thread_id_does_not_read_legacy_meta_context() {
         let msg = sample_user_request_with_context(json!({ "thread_id": "legacy-thread-1" }), None);
-        assert_eq!(extract_thread_id(&msg).as_deref(), Some("legacy-thread-1"));
+        assert_eq!(extract_thread_id(&msg), None);
     }
 
     #[test]

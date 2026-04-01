@@ -1101,6 +1101,12 @@ Validation note:
 - The old direct publish-to-`storage.turns` smoke was removed from the repo to avoid confusing it with the normative path.
 - PostgreSQL is not the primary oracle for the cognition E2E. The primary oracle is delivery to the destination node plus `jsr-memory` and `SY.cognition` runtime counters.
 - Cold start rebuild is startup-only and fail-open: rebuild is attempted only when local cognition state is empty, and missing/unreachable durable storage does not block live processing.
+- Deferred design note:
+  - the current rebuild path is hive-scoped, not volume-bounded
+  - the next design pass should define a bounded rebuild / SHM hot set policy
+  - first filter: live threads (`ILK` / `ICH` active) and/or open `scope_instances`
+  - second filter: time window by recency (`last_seen_at` / `updated_at`)
+  - `jsr-memory` should eventually carry only a bounded hot set sized to SHM capacity, not the full durable universe
 
 - [ ] COG-T27. E2E: message → tagger → context + reason created.
 - [ ] COG-T28. E2E: binding energy with context + reason → scope transition.

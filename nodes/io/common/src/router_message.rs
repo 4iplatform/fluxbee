@@ -42,9 +42,6 @@ pub fn build_user_message(
     } else {
         extract_thread_id_from_context_obj(&context_obj)
     };
-    if let Some(thread_id) = thread_id.as_ref() {
-        context_obj.insert("thread_id".to_string(), Value::String(thread_id.clone()));
-    }
 
     Message {
         routing: Routing {
