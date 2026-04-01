@@ -78,6 +78,18 @@ Los detalles específicos quedan en cada Nodo IO.
   - el procesamiento downstream ocurre asincrónicamente.
 - Cola/buffer **acotado** de mensajes "pendientes" (p.ej. esperando identidad) con timeouts.
 
+### 2.1.1 Normalización `text/v1` + offload a blob (canónico IO)
+- `io-common` **DEBE** centralizar la normalización de payloads inbound `type="text"` en contrato `text/v1`.
+- Si el payload inline supera el límite configurado (`io.blob.max_message_bytes`, default 64KB), `io-common` **DEBE** convertir automáticamente a `content_ref` (blob).
+- Los adapters IO **NO** deben reimplementar la decisión `content` vs `content_ref`; solo deben mapear evento externo -> payload base + adjuntos.
+- `io-common` **DEBE** mantener validaciones de límites/mime/adjuntos con errores canónicos (`invalid_text_payload`, `BLOB_*`, `unsupported_attachment_mime`, `too_many_attachments`).
+
+Logging operativo (bajo ruido):
+- `debug`: decisión de normalización (`offload_to_blob`, bytes estimados, límite, adjuntos).
+- `info` solo cuando hubo offload a blob.
+- `warn` en error de normalización con código canónico.
+- Nunca loggear contenido de usuario ni bytes de blobs.
+
 ### 2.2 Outbound reliability
 - Outbox **en memoria** (best-effort) con:
   - cola acotada,

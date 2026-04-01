@@ -183,6 +183,15 @@ Interpretación operativa:
 }
 ```
 
+### 7.1 Regla de offload por tamaño (delegada a `io-common`)
+- `IO.slack` construye payload `text/v1` base (`content` + `attachments` cuando corresponda).
+- La decisión de dejar inline o convertir a `content_ref` por límite de tamaño **la toma `io-common`** en el pipeline inbound compartido.
+- Configuración relevante:
+  - `io.blob.max_message_bytes` (default 64KB),
+  - `io.blob.message_overhead_bytes`,
+  - límites de adjuntos (`io.blob.max_attachments`, `io.blob.max_attachment_bytes`, `io.blob.max_total_attachment_bytes`).
+- Objetivo: evitar divergencias entre adapters IO y mantener un comportamiento único para `text/v1`.
+
 ---
 
 ## 8. Outbound: envío de mensajes a Slack

@@ -124,6 +124,15 @@ pub struct InboundAttachmentInput {
     pub blob_ref: BlobRef,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextV1NormalizationDecision {
+    pub processed_as_blob: bool,
+    pub inline_payload_bytes: usize,
+    pub estimated_total_bytes: usize,
+    pub max_message_bytes: usize,
+    pub has_attachments: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedAttachment {
     pub blob_ref: BlobRef,
@@ -228,6 +237,64 @@ pub fn build_text_v1_inbound_payload(
         cfg.message_overhead_bytes,
     )?;
     payload.to_value().map_err(IoBlobContractError::from)
+}
+
+pub fn normalize_text_v1_inbound_payload(
+    blob: &BlobToolkit,
+    cfg: &IoTextBlobConfig,
+    payload: &Value,
+) -> Result<(Value, TextV1NormalizationDecision), IoBlobContractError> {
+    cfg.validate()?;
+    let parsed = TextV1Payload::from_value(payload)?;
+    let has_attachments = !parsed.attachments.is_empty();
+
+    match (parsed.content.clone(), parsed.content_ref.clone()) {
+        (Some(content), None) => {
+            let inline_payload = TextV1Payload::new(&content, parsed.attachments.clone());
+            let inline_payload_bytes = serde_json::to_vec(&inline_payload)?.len();
+            let estimated_total_bytes =
+                inline_payload_bytes.saturating_add(cfg.message_overhead_bytes);
+            let normalized = build_text_v1_inbound_payload(
+                blob,
+                cfg,
+                &content,
+                parsed
+                    .attachments
+                    .into_iter()
+                    .map(|blob_ref| InboundAttachmentInput { blob_ref })
+                    .collect(),
+            )?;
+            let normalized_parsed = TextV1Payload::from_value(&normalized)?;
+            Ok((
+                normalized,
+                TextV1NormalizationDecision {
+                    processed_as_blob: normalized_parsed.content_ref.is_some(),
+                    inline_payload_bytes,
+                    estimated_total_bytes,
+                    max_message_bytes: cfg.max_message_bytes,
+                    has_attachments,
+                },
+            ))
+        }
+        (None, Some(content_ref)) => {
+            content_ref.validate()?;
+            validate_blob_refs_limits(cfg, &parsed.attachments)?;
+            let normalized = parsed.to_value()?;
+            Ok((
+                normalized,
+                TextV1NormalizationDecision {
+                    processed_as_blob: true,
+                    inline_payload_bytes: 0,
+                    estimated_total_bytes: 0,
+                    max_message_bytes: cfg.max_message_bytes,
+                    has_attachments,
+                },
+            ))
+        }
+        _ => Err(IoBlobContractError::InvalidTextPayload(
+            "invalid text/v1 payload (content/content_ref)".to_string(),
+        )),
+    }
 }
 
 pub async fn resolve_text_v1_for_outbound(
@@ -477,6 +544,44 @@ mod tests {
         let parsed = TextV1Payload::from_value(&payload).expect("parse text_v1");
         assert_eq!(parsed.content.as_deref(), Some("hola"));
         assert!(parsed.content_ref.is_none());
+    }
+
+    #[test]
+    fn normalize_text_v1_keeps_inline_under_limit() {
+        let (toolkit, _root) = test_toolkit();
+        let cfg = IoTextBlobConfig::default();
+        let payload = TextV1Payload::new("hola", vec![])
+            .to_value()
+            .expect("payload value");
+
+        let (normalized, decision) =
+            normalize_text_v1_inbound_payload(&toolkit, &cfg, &payload).expect("normalize");
+        let parsed = TextV1Payload::from_value(&normalized).expect("parse normalized");
+        assert_eq!(parsed.content.as_deref(), Some("hola"));
+        assert!(parsed.content_ref.is_none());
+        assert!(!decision.processed_as_blob);
+        assert!(decision.inline_payload_bytes > 0);
+    }
+
+    #[test]
+    fn normalize_text_v1_offloads_over_limit() {
+        let (toolkit, _root) = test_toolkit();
+        let cfg = IoTextBlobConfig {
+            max_message_bytes: 256,
+            message_overhead_bytes: 128,
+            ..IoTextBlobConfig::default()
+        };
+        let content = "x".repeat(1024);
+        let payload = TextV1Payload::new(&content, vec![])
+            .to_value()
+            .expect("payload value");
+
+        let (normalized, decision) =
+            normalize_text_v1_inbound_payload(&toolkit, &cfg, &payload).expect("normalize");
+        let parsed = TextV1Payload::from_value(&normalized).expect("parse normalized");
+        assert!(parsed.content_ref.is_some());
+        assert!(decision.processed_as_blob);
+        assert!(decision.estimated_total_bytes > cfg.max_message_bytes);
     }
 
     #[test]

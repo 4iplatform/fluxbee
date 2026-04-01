@@ -269,3 +269,19 @@ bash scripts/deploy-io-slack.sh ... --allow-sync-pending
 ```
 
 Esto permite continuar a `spawn`, pero no corrige el problema de fondo del manifest global.
+
+---
+
+## 10) Nota de contrato `text/v1` (offload > limite)
+
+En estado actual, la regla de offload por tamano para inbound `text/v1` esta centralizada en `io-common`:
+
+- `io-slack` arma payload base (`content` + `attachments`).
+- `io-common` decide inline vs `content_ref` segun `io.blob.max_message_bytes` (default 64KB) y `io.blob.message_overhead_bytes`.
+
+Logs esperados:
+
+- `inbound text/v1 normalized` (debug)
+- `inbound text/v1 processed as blob` (info, solo cuando hubo offload)
+
+Esto evita divergencias entre adapters IO y mantiene comportamiento uniforme de `text/v1`.
