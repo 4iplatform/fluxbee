@@ -7,6 +7,12 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+pub use fluxbee_sdk::cognition::{
+    SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_COOCCURRENCES,
+    SUBJECT_STORAGE_COGNITION_EPISODES, SUBJECT_STORAGE_COGNITION_MEMORIES,
+    SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
+    SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
+};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -853,6 +859,14 @@ fn is_storage_subject(subject: &str) -> bool {
             | SUBJECT_STORAGE_EVENTS
             | SUBJECT_STORAGE_ITEMS
             | SUBJECT_STORAGE_REACTIVATION
+            | SUBJECT_STORAGE_COGNITION_THREADS
+            | SUBJECT_STORAGE_COGNITION_CONTEXTS
+            | SUBJECT_STORAGE_COGNITION_REASONS
+            | SUBJECT_STORAGE_COGNITION_COOCCURRENCES
+            | SUBJECT_STORAGE_COGNITION_SCOPES
+            | SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES
+            | SUBJECT_STORAGE_COGNITION_MEMORIES
+            | SUBJECT_STORAGE_COGNITION_EPISODES
     )
 }
 
@@ -1458,6 +1472,22 @@ mod tests {
             "storage.events",
             "storage.items"
         ));
+    }
+
+    #[test]
+    fn cognition_subjects_are_treated_as_storage_subjects() {
+        assert!(is_storage_subject(SUBJECT_STORAGE_TURNS));
+        assert!(is_storage_subject(SUBJECT_STORAGE_COGNITION_THREADS));
+        assert!(is_storage_subject(SUBJECT_STORAGE_COGNITION_CONTEXTS));
+        assert!(is_storage_subject(SUBJECT_STORAGE_COGNITION_REASONS));
+        assert!(is_storage_subject(SUBJECT_STORAGE_COGNITION_COOCCURRENCES));
+        assert!(is_storage_subject(SUBJECT_STORAGE_COGNITION_SCOPES));
+        assert!(is_storage_subject(
+            SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES
+        ));
+        assert!(is_storage_subject(SUBJECT_STORAGE_COGNITION_MEMORIES));
+        assert!(is_storage_subject(SUBJECT_STORAGE_COGNITION_EPISODES));
+        assert!(!is_storage_subject("storage.metrics.get"));
     }
 
     #[tokio::test]

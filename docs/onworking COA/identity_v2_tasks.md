@@ -263,6 +263,108 @@ Salida:
   - [x] colisión de `node_name` cubierta por canonicalización/idempotencia (G4), no se espera error de duplicado en flujo normal
   - [x] corrida final de cierre con casos de duplicado
 
+## 10) DB config / secrets migration para `SY.identity`
+
+Contexto:
+- Antes de esta migración, `SY.identity` tomaba bootstrap DB desde:
+  - `FLUXBEE_DATABASE_URL`
+  - `JSR_DATABASE_URL`
+- En la iteración actual ya quedó habilitado el control-path `CONFIG_GET` / `CONFIG_SET` y el bootstrap degradado en [`src/bin/sy_identity.rs`](/Users/cagostino/Documents/GitHub/fluxbee/src/bin/sy_identity.rs).
+- También quedaron implementados:
+  - persistencia local en `secrets.json`
+  - snapshot `config.json` redacted
+  - contrato v1 con `config.database.postgres_url`
+  - semántica `persist_only` + restart
+- Objetivo: llevar `SY.identity` al mismo camino canónico:
+  - `archi -> SY.admin -> SY.identity CONFIG_GET/CONFIG_SET -> local secrets.json -> restart`
+
+Decisión base para esta fase:
+- seguir el mismo patrón que `SY.storage`;
+- no abrir un contrato admin paralelo como camino final;
+- dejar `database.url` en `hive.yaml` fuera del camino operativo canónico de `SY.identity`.
+
+### Fase ID-DB - Control-path + migración fuera de `hive.yaml`
+
+- [x] ID-DB-0. Habilitar control-path/socket para `SY.identity` y meterlo al mismo plano `CONFIG_GET` / `CONFIG_SET` que otros nodos configurables.
+  - `SY.identity` debe poder responder aunque la DB no esté lista.
+  - bootstrap esperado: modo degradado/control-plane-only si falta secreto DB válido.
+  - no debe quedar colgado por timeout en `SY.admin`.
+
+- [x] ID-DB-1. Definir contrato canónico `CONFIG_GET` / `CONFIG_SET` para la DB de `SY.identity`.
+  - v1 pragmática:
+    - secreto canónico: `config.database.postgres_url`
+  - precedencia deseada:
+    - `secrets.json`
+    - env (`FLUXBEE_DATABASE_URL`, `JSR_DATABASE_URL`) como compat/override
+  - `CONFIG_GET` debe:
+    - devolver `postgres_url` redacted
+    - publicar `source`
+    - exponer `contract.secrets[*]`
+  - `CONFIG_SET` debe:
+    - persistir en `secrets.json`
+    - devolver `apply.state = "persist_only"` si requiere restart
+
+- [x] ID-DB-2. Persistencia local de secreto DB en `secrets.json`.
+  - path canónico por nodo:
+    - `/var/lib/fluxbee/nodes/SY/SY.identity@<hive>/secrets.json`
+  - permisos:
+    - directorio `0700`
+    - archivo `0600`
+  - nunca devolver el valor secreto en claro en `CONFIG_GET`, logs o status.
+
+- [x] ID-DB-3. Snapshot operativo/redacted para `get_node_config`.
+  - persistir `config.json` público/redacted de `SY.identity`
+  - `GET /hives/{hive}/nodes/SY.identity@{hive}/config` debe funcionar sin exponer el secreto
+  - `get_node_config` y `control/config-get` deben quedar claramente diferenciados, igual que en otros nodos
+
+- [x] ID-DB-4. Bootstrap degradado de `SY.identity` sin DB lista.
+  - si no existe secreto DB válido:
+    - el nodo arranca
+    - conecta al router
+    - responde `CONFIG_GET`, `CONFIG_SET`, `PING`, `STATUS`
+    - pero no intenta operar writes identity en DB
+  - el estado debe ser explícito (`missing_secret` / `db_not_ready`)
+
+- [x] ID-DB-5. Restart/apply semantics.
+  - v1 permitida:
+    - `CONFIG_SET` persiste secreto
+    - restart requerido para usar la nueva conexión DB
+  - dejar explícito en `CONFIG_RESPONSE` y help
+
+- [x] ID-DB-6. Help/admin/archi.
+  - agregar ejemplos canónicos en `SY.admin` para:
+    - `POST /hives/{hive}/nodes/SY.identity@{hive}/control/config-get`
+    - `POST /hives/{hive}/nodes/SY.identity@{hive}/control/config-set`
+  - alinear `SY.architect` para que entienda que `SY.identity` usa el mismo camino de control-plane que `SY.storage`
+
+- [x] ID-DB-7. Validación operativa de cierre.
+  - flujo esperado:
+    1. `CONFIG_GET`
+    2. `CONFIG_SET`
+    3. restart `sy-identity`
+    4. `CONFIG_GET` posterior
+    5. validación de operación identity con DB real
+  - criterio de done:
+    - `SY.identity` ya no lee `database.url` en `hive.yaml`
+    - el secreto DB vive en `secrets.json`
+    - `archi` puede descubrir y configurar por `CONFIG_GET` / `CONFIG_SET`
+
+Estado de cierre:
+- `SY.identity` quedó alineado con `SY.storage`:
+  - `secrets.json` local
+  - env overrides como compat
+  - sin fallback operativo a `hive.yaml`
+- validado manualmente con `CONFIG_GET`/`CONFIG_SET` y conexión del nodo el 2026-03-31.
+
+Notas:
+- `SY.identity` ya tiene el nombre de DB fijado por código (`fluxbee_identity`), así que en esta fase no hace falta abrir `dbname` como parámetro separado.
+- Si después queremos simplificar onboarding, la mejora natural sería una v1.1 con:
+  - `config.database.user`
+  - `config.database.host`
+  - `config.database.port`
+  - `config.database.password` como secreto
+  pero no es prerequisito para cerrar esta migración.
+
 Salida:
 - gate de aceptación identity v2 completo.
 

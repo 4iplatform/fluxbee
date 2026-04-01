@@ -15,6 +15,7 @@ fi
 services=(
   "ai-frontdesk-gov"
   "sy-identity"
+  "sy-cognition"
   "sy-admin"
   "sy-architect"
   "sy-storage"
@@ -79,6 +80,7 @@ residual_procs=(
   "sy-admin"
   "sy-architect"
   "sy-storage"
+  "sy-cognition"
   "sy-config-routes"
   "sy-opa-rules"
   "sy-identity"
@@ -88,6 +90,7 @@ residual_procs=(
   "sy_admin"
   "sy_architect"
   "sy_storage"
+  "sy_cognition"
   "sy_config_routes"
   "sy_opa_rules"
   "sy_identity"

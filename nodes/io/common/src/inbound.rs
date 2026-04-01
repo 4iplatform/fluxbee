@@ -275,6 +275,7 @@ mod tests {
         let mut p = InboundProcessor::new("node", InboundConfig::default());
         let id = MockIdentityResolver::new();
         let io = slack_inbound_io_context("T", "U", "C", Some("171234.567"), "Ev1");
+        let expected_thread_id = io.conversation.thread_id.clone();
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
@@ -287,13 +288,14 @@ mod tests {
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
+        assert_eq!(msg.meta.thread_id, expected_thread_id);
         let thread_id = msg
             .meta
             .context
             .as_ref()
             .and_then(|ctx| ctx.get("thread_id"))
             .and_then(|v| v.as_str());
-        assert_eq!(thread_id, Some("171234.567"));
+        assert_eq!(thread_id, msg.meta.thread_id.as_deref());
     }
 
     #[tokio::test]
@@ -301,6 +303,7 @@ mod tests {
         let mut p = InboundProcessor::new("node", InboundConfig::default());
         let id = MockIdentityResolver::new();
         let io = slack_inbound_io_context("T", "U", "C123", None, "Ev1");
+        let expected_thread_id = io.conversation.thread_id.clone();
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
@@ -313,13 +316,14 @@ mod tests {
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
+        assert_eq!(msg.meta.thread_id, expected_thread_id);
         let thread_id = msg
             .meta
             .context
             .as_ref()
             .and_then(|ctx| ctx.get("thread_id"))
             .and_then(|v| v.as_str());
-        assert_eq!(thread_id, Some("C123"));
+        assert_eq!(thread_id, msg.meta.thread_id.as_deref());
     }
 
     #[tokio::test]

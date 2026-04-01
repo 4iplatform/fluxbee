@@ -162,6 +162,7 @@ async fn send_resolve_probe(
             context: Some(json!({
                 "probe_id": probe_id,
             })),
+            ..Meta::default()
         },
         payload: json!({
             "probe_id": probe_id,

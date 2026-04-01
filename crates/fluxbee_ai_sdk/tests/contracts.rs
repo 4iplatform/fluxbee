@@ -21,6 +21,7 @@ fn sample_message() -> Message {
             action: None,
             priority: None,
             context: Some(json!({"thread_id":"thr-1"})),
+            ..Meta::default()
         },
         payload: json!({
             "type": "text",

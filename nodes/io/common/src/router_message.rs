@@ -30,12 +30,20 @@ pub fn build_user_message(
     };
     context_obj.insert(
         "dst_ilk".to_string(),
-        dst_ilk.map(Value::String).unwrap_or(Value::Null),
+        dst_ilk.clone().map(Value::String).unwrap_or(Value::Null),
     );
-    if !context_obj.contains_key("thread_id") {
-        if let Some(thread_id) = extract_thread_id_from_context_obj(&context_obj) {
-            context_obj.insert("thread_id".to_string(), Value::String(thread_id));
-        }
+    let thread_id = if context_obj.contains_key("thread_id") {
+        context_obj
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    } else {
+        extract_thread_id_from_context_obj(&context_obj)
+    };
+    if let Some(thread_id) = thread_id.as_ref() {
+        context_obj.insert("thread_id".to_string(), Value::String(thread_id.clone()));
     }
 
     Message {
@@ -51,11 +59,14 @@ pub fn build_user_message(
             msg_type: "user".to_string(),
             msg: None,
             src_ilk,
+            dst_ilk,
+            thread_id,
             scope: None,
             target: None,
             action: None,
             priority: None,
             context: Some(Value::Object(context_obj)),
+            ..Meta::default()
         },
         payload,
     }
@@ -67,7 +78,7 @@ fn extract_thread_id_from_context_obj(context_obj: &Map<String, Value>) -> Optio
         .and_then(|io| io.get("conversation"))
         .and_then(|conversation| conversation.get("thread_id"))
         .and_then(Value::as_str)
-        .map(str::trim)
+        .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
 }

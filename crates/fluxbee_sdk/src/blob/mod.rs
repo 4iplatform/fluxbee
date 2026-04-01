@@ -412,6 +412,7 @@ impl BlobToolkit {
                         action: None,
                         priority: None,
                         context: None,
+                        ..Meta::default()
                     },
                     payload,
                 };

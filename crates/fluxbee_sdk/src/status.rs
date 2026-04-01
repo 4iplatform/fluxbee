@@ -66,6 +66,7 @@ pub async fn try_handle_default_node_status(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };

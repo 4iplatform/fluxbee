@@ -556,6 +556,7 @@ async fn send_action_once(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };

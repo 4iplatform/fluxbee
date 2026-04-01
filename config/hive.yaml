@@ -25,16 +25,6 @@ architect:
 storage:
   path: "/var/lib/fluxbee"
 
-# Base PostgreSQL connection.
-# Runtime DB names are fixed by code:
-# - SY.identity -> fluxbee_identity
-# - SY.storage  -> fluxbee_storage
-# `database.url` is still kept for SY.identity.
-# SY.storage no longer reads this field.
-# Preferred path for SY.storage: CONFIG_SET -> local secrets.json -> restart sy-storage.
-database:
-  url: "postgresql://fluxbee_sa:magicAI@127.0.0.1:5432/fluxbee"
-
 # Identity runtime settings.
 identity:
   default_tenant: "fluxbee"

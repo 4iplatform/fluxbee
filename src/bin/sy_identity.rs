@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::fs::OpenOptions;
 use std::future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -16,7 +17,12 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
-use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::{
+    build_node_config_response_message, build_node_secret_record, connect, load_node_secret_record,
+    managed_node_config_path, save_node_secret_record, try_handle_default_node_status, NodeConfig,
+    NodeReceiver, NodeSecretDescriptor, NodeSecretWriteOptions, NodeSender,
+    NODE_CONFIG_APPLY_MODE_REPLACE, NODE_SECRET_REDACTION_TOKEN,
+};
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, IchEntry, IdentityRegionLimits, IdentityRegionWriter,
     IlkAliasEntry, IlkEntry, LsaRegionReader, LsaSnapshot, NodeEntry, RouterRegionReader,
@@ -33,6 +39,10 @@ const DEFAULT_MERGE_ALIAS_TTL_SECS: u64 = 3600;
 const ALIAS_GC_INTERVAL_SECS: u64 = 30;
 const DEFAULT_IDENTITY_SYNC_PORT: u16 = 9100;
 const IDENTITY_DB_NAME: &str = "fluxbee_identity";
+const IDENTITY_NODE_BASE_NAME: &str = "SY.identity";
+const IDENTITY_NODE_VERSION: &str = "2.0";
+const IDENTITY_LOCAL_SECRET_KEY_POSTGRES_URL: &str = "postgres_url";
+const IDENTITY_CONFIG_SCHEMA_VERSION: u32 = 1;
 const IDENTITY_FULL_SYNC_CHUNK_ITEMS: usize = 256;
 const IDENTITY_SYNC_VERSION: u32 = 1;
 const SYNC_OP_FULL_SYNC_REQUEST: &str = "IDENTITY_FULL_SYNC_REQUEST";
@@ -71,6 +81,41 @@ const MSG_TNT_CREATE: &str = "TNT_CREATE";
 const MSG_TNT_CREATE_RESPONSE: &str = "TNT_CREATE_RESPONSE";
 const MSG_TNT_APPROVE: &str = "TNT_APPROVE";
 const MSG_TNT_APPROVE_RESPONSE: &str = "TNT_APPROVE_RESPONSE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityDbSecretSource {
+    LocalFile,
+    EnvCompat,
+    Missing,
+}
+
+impl IdentityDbSecretSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalFile => "local_file",
+            Self::EnvCompat => "env_compat",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IdentityControlState {
+    schema_version: u32,
+    config_version: u64,
+    secret_source: IdentityDbSecretSource,
+    db_ready: bool,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IdentityConfigStateFile {
+    schema_version: u32,
+    config_version: u64,
+    node_name: String,
+    config: Value,
+    updated_at: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -986,6 +1031,8 @@ impl IdentityRuntime {
         allowed_prefixes.insert(MSG_ILK_UPDATE, vec!["SY.orchestrator@"]);
         allowed_prefixes.insert(MSG_TNT_CREATE, vec!["AI.frontdesk@"]);
         allowed_prefixes.insert(MSG_TNT_APPROVE, vec!["SY.admin@"]);
+        allowed_prefixes.insert("CONFIG_GET", vec!["SY.admin@"]);
+        allowed_prefixes.insert("CONFIG_SET", vec!["SY.admin@"]);
 
         let mut allowed_exacts: HashMap<&'static str, HashSet<String>> = HashMap::new();
         let mut bootstrap = HashSet::new();
@@ -1044,7 +1091,12 @@ impl IdentityRuntime {
         sender: &NodeSender,
         msg: &Message,
         identity_shm: Option<&mut IdentityRegionWriter>,
+        control_state: &mut IdentityControlState,
+        node_name: &str,
     ) -> Result<Vec<IdentityDeltaEnvelope>, IdentityError> {
+        if try_handle_default_node_status(sender, msg).await? {
+            return Ok(Vec::new());
+        }
         let Some(action) = msg.meta.msg.as_deref() else {
             return Ok(Vec::new());
         };
@@ -1074,6 +1126,56 @@ impl IdentityRuntime {
             send_system_response(sender, msg, response_name(action), payload).await?;
             return Ok(Vec::new());
         }
+        if action == "CONFIG_GET" {
+            let payload =
+                build_identity_config_get_payload(self.is_primary, node_name, control_state);
+            let response = build_node_config_response_message(msg, sender.uuid(), payload);
+            sender.send(response).await?;
+            return Ok(Vec::new());
+        }
+        if action == "CONFIG_SET" {
+            let payload =
+                apply_identity_config_set(msg, self.is_primary, node_name, control_state)?;
+            let response = build_node_config_response_message(msg, sender.uuid(), payload);
+            sender.send(response).await?;
+            return Ok(Vec::new());
+        }
+        if action == "PING" {
+            let payload = json!({
+                "status": "ok",
+                "ok": true,
+                "node_name": node_name,
+                "state": identity_state_label(self.is_primary, control_state),
+                "database": {
+                    "mode": "postgres",
+                    "source": identity_effective_source(self.is_primary, control_state),
+                    "configured": identity_secret_configured(self.is_primary, control_state),
+                    "ready": control_state.db_ready
+                }
+            });
+            send_system_response(sender, msg, "PONG", payload).await?;
+            return Ok(Vec::new());
+        }
+        if action == "STATUS" {
+            let payload = json!({
+                "status": "ok",
+                "ok": true,
+                "node_name": node_name,
+                "role": if self.is_primary { "primary" } else { "replica" },
+                "state": identity_state_label(self.is_primary, control_state),
+                "schema_version": control_state.schema_version,
+                "config_version": control_state.config_version,
+                "database": {
+                    "mode": "postgres",
+                    "source": identity_effective_source(self.is_primary, control_state),
+                    "configured": identity_secret_configured(self.is_primary, control_state),
+                    "ready": control_state.db_ready,
+                    "last_error": control_state.last_error.clone()
+                }
+            });
+            send_system_response(sender, msg, "STATUS_RESPONSE", payload).await?;
+            return Ok(Vec::new());
+        }
         if !self.is_primary && action_requires_primary(action) {
             let payload = json!({
                 "status": "error",
@@ -1081,6 +1183,21 @@ impl IdentityRuntime {
                 "message": "identity replica is read-only for this action; route request to primary",
                 "action": action,
                 "replica_hive_id": self.hive_id,
+            });
+            send_system_response(sender, msg, response_name(action), payload).await?;
+            return Ok(Vec::new());
+        }
+        if self.is_primary && action_requires_primary(action) && self.db_config.is_none() {
+            let payload = json!({
+                "status": "error",
+                "error_code": "DB_NOT_READY",
+                "message": control_state
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "identity primary DB is not ready; configure DB secret and restart sy-identity".to_string()),
+                "action": action,
+                "node_name": node_name,
+                "state": identity_state_label(self.is_primary, control_state),
             });
             send_system_response(sender, msg, response_name(action), payload).await?;
             return Ok(Vec::new());
@@ -1563,7 +1680,12 @@ impl IdentityRuntime {
     fn is_authorized(&self, action: &str, source_name: Option<&str>) -> bool {
         if matches!(
             action,
-            "IDENTITY_METRICS" | "IDENTITY_METRICS_RESPONSE" | "PING" | "PING_RESPONSE"
+            "IDENTITY_METRICS"
+                | "IDENTITY_METRICS_RESPONSE"
+                | "PING"
+                | "PING_RESPONSE"
+                | "STATUS"
+                | "STATUS_RESPONSE"
         ) {
             return true;
         }
@@ -1690,26 +1812,39 @@ async fn main() -> Result<(), IdentityError> {
         )
         .into());
     }
-    let db_config = if is_primary {
-        let base = database_config(&hive)?;
-        ensure_database_exists(&base, IDENTITY_DB_NAME).await?;
-        let cfg = with_dbname(&base, IDENTITY_DB_NAME);
-        ensure_primary_schema(&cfg).await?;
-        Some(cfg)
+    let node_name = ensure_l2_name(IDENTITY_NODE_BASE_NAME, &hive.hive_id);
+    let (database_url, db_secret_source) = resolve_database_url(&node_name);
+    let (db_config, db_init_error) = if is_primary {
+        initialize_identity_database_backend(database_url.as_deref()).await
     } else {
         tracing::info!(
             role = %hive.role.clone().unwrap_or_else(|| "unknown".to_string()),
             "sy.identity running without local DB (replica/non-primary mode)"
         );
-        None
+        (None, None)
     };
+    let mut control_state = bootstrap_identity_control_state(
+        &node_name,
+        db_secret_source,
+        is_primary,
+        db_config.is_some(),
+        db_init_error,
+    )?;
+    if is_primary && !control_state.db_ready {
+        tracing::warn!(
+            node_name = %node_name,
+            db_secret_source = %control_state.secret_source.as_str(),
+            error = ?control_state.last_error,
+            "sy.identity started without active DB backend; CONFIG_SET + restart required"
+        );
+    }
     let node_config = NodeConfig {
-        name: "SY.identity".to_string(),
+        name: IDENTITY_NODE_BASE_NAME.to_string(),
         router_socket: socket_dir,
         uuid_persistence_dir: state_dir.join("nodes"),
         uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
         config_dir: config_dir.clone(),
-        version: "2.0".to_string(),
+        version: IDENTITY_NODE_VERSION.to_string(),
     };
 
     let mut runtime = IdentityRuntime::new(&hive, state_dir.clone(), is_primary, db_config);
@@ -1737,6 +1872,11 @@ async fn main() -> Result<(), IdentityError> {
                     tracing::info!(metrics = %metrics, "loaded identity store from primary db");
                 }
                 Err(err) => {
+                    control_state.db_ready = false;
+                    control_state.last_error = Some(format!(
+                        "failed to load identity store from primary db: {err}"
+                    ));
+                    persist_identity_config_state(&node_name, is_primary, &control_state)?;
                     tracing::warn!(error = %err, "failed to load identity store from primary db; continuing with in-memory bootstrap");
                 }
             }
@@ -1890,7 +2030,13 @@ async fn main() -> Result<(), IdentityError> {
                 }
 
                 match runtime
-                    .process_system_message(&sender, &msg, identity_shm.as_mut())
+                    .process_system_message(
+                        &sender,
+                        &msg,
+                        identity_shm.as_mut(),
+                        &mut control_state,
+                        &node_name,
+                    )
                     .await
                 {
                     Ok(mut deltas) => {
@@ -2821,6 +2967,7 @@ fn response_name(action: &str) -> &'static str {
         MSG_TNT_CREATE => MSG_TNT_CREATE_RESPONSE,
         MSG_TNT_APPROVE => MSG_TNT_APPROVE_RESPONSE,
         "IDENTITY_METRICS" => "IDENTITY_METRICS_RESPONSE",
+        "CONFIG_GET" | "CONFIG_SET" => "CONFIG_RESPONSE",
         _ => "SYSTEM_ERROR",
     }
 }
@@ -2859,6 +3006,7 @@ async fn send_system_response(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };
@@ -3616,32 +3764,442 @@ SET
     Ok(())
 }
 
-fn base_database_url(hive: &HiveFile) -> Result<String, IdentityError> {
+fn identity_secret_configured(is_primary: bool, control_state: &IdentityControlState) -> bool {
+    is_primary && control_state.secret_source != IdentityDbSecretSource::Missing
+}
+
+fn identity_effective_source(
+    is_primary: bool,
+    control_state: &IdentityControlState,
+) -> &'static str {
+    if is_primary {
+        control_state.secret_source.as_str()
+    } else {
+        "replica_non_primary"
+    }
+}
+
+fn identity_state_label(is_primary: bool, control_state: &IdentityControlState) -> &'static str {
+    if !is_primary {
+        "replica_non_primary"
+    } else if control_state.db_ready {
+        "configured"
+    } else if control_state.secret_source == IdentityDbSecretSource::Missing {
+        "missing_secret"
+    } else {
+        "db_not_ready"
+    }
+}
+
+fn bootstrap_identity_control_state(
+    node_name: &str,
+    secret_source: IdentityDbSecretSource,
+    is_primary: bool,
+    db_ready: bool,
+    last_error: Option<String>,
+) -> Result<IdentityControlState, IdentityError> {
+    let persisted = load_identity_config_state(node_name);
+    let state = IdentityControlState {
+        schema_version: persisted
+            .as_ref()
+            .map(|value| value.schema_version)
+            .unwrap_or(IDENTITY_CONFIG_SCHEMA_VERSION),
+        config_version: persisted
+            .as_ref()
+            .map(|value| value.config_version)
+            .unwrap_or(0),
+        secret_source,
+        db_ready,
+        last_error,
+    };
+    persist_identity_config_state(node_name, is_primary, &state)?;
+    Ok(state)
+}
+
+fn load_identity_config_state(node_name: &str) -> Option<IdentityConfigStateFile> {
+    let path = managed_node_config_path(node_name).ok()?;
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<IdentityConfigStateFile>(&raw).ok()
+}
+
+fn persist_identity_config_state(
+    node_name: &str,
+    is_primary: bool,
+    state: &IdentityControlState,
+) -> Result<(), IdentityError> {
+    let path = managed_node_config_path(node_name)?;
+    let payload = IdentityConfigStateFile {
+        schema_version: state.schema_version,
+        config_version: state.config_version,
+        node_name: node_name.to_string(),
+        config: identity_public_config(is_primary, state),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    write_json_atomic(&path, &serde_json::to_string_pretty(&payload)?)?;
+    Ok(())
+}
+
+fn identity_public_config(is_primary: bool, state: &IdentityControlState) -> Value {
+    json!({
+        "database": {
+            "mode": "postgres",
+            "postgres_url": if identity_secret_configured(is_primary, state) {
+                Value::String(NODE_SECRET_REDACTION_TOKEN.to_string())
+            } else {
+                Value::Null
+            },
+            "source": identity_effective_source(is_primary, state),
+            "db_name": if is_primary {
+                Value::String(IDENTITY_DB_NAME.to_string())
+            } else {
+                Value::Null
+            }
+        }
+    })
+}
+
+fn build_identity_config_get_payload(
+    is_primary: bool,
+    node_name: &str,
+    control_state: &IdentityControlState,
+) -> Value {
+    let configured = identity_secret_configured(is_primary, control_state);
+    let mut secret_descriptor = NodeSecretDescriptor::new(
+        "config.database.postgres_url",
+        IDENTITY_LOCAL_SECRET_KEY_POSTGRES_URL,
+    );
+    secret_descriptor.required = is_primary;
+    secret_descriptor.configured = configured;
+    secret_descriptor.persistence = if is_primary {
+        control_state.secret_source.as_str().to_string()
+    } else {
+        "replica_non_primary".to_string()
+    };
+    let mut notes = vec![
+        Value::String("SY.identity uses PostgreSQL only on motherbee primary.".to_string()),
+        Value::String(
+            "Secret values are persisted in local secrets.json and always returned redacted."
+                .to_string(),
+        ),
+        Value::String(
+            "Applying a new DB secret persists locally and requires sy-identity restart to affect live connections."
+                .to_string(),
+        ),
+    ];
+    let error = if !is_primary {
+        notes.push(Value::String(
+            "Replica nodes do not use a local PostgreSQL backend.".to_string(),
+        ));
+        json!({
+            "code": "not_primary",
+            "message": "SY.identity uses local PostgreSQL only on motherbee primary."
+        })
+    } else if configured && control_state.db_ready {
+        Value::Null
+    } else if let Some(message) = control_state.last_error.as_ref() {
+        json!({
+            "code": if control_state.secret_source == IdentityDbSecretSource::Missing {
+                "missing_secret"
+            } else {
+                "db_not_ready"
+            },
+            "message": message
+        })
+    } else {
+        json!({
+            "code": "missing_secret",
+            "message": "Missing database secret in local secrets.json or env overrides."
+        })
+    };
+    json!({
+        "ok": is_primary && control_state.db_ready,
+        "node_name": node_name,
+        "state": identity_state_label(is_primary, control_state),
+        "schema_version": control_state.schema_version,
+        "config_version": control_state.config_version,
+        "config": identity_public_config(is_primary, control_state),
+        "contract": {
+            "node_family": "SY",
+            "node_kind": "SY.identity",
+            "supports": ["CONFIG_GET", "CONFIG_SET"],
+            "required_fields": if is_primary {
+                json!(["config.database.postgres_url"])
+            } else {
+                json!([])
+            },
+            "optional_fields": [],
+            "secrets": [secret_descriptor],
+            "notes": notes,
+        },
+        "error": error
+    })
+}
+
+fn apply_identity_config_set(
+    msg: &Message,
+    is_primary: bool,
+    node_name: &str,
+    control_state: &mut IdentityControlState,
+) -> Result<Value, IdentityError> {
+    if !is_primary {
+        return Ok(identity_config_error_response(
+            is_primary,
+            node_name,
+            control_state,
+            "not_primary",
+            "SY.identity uses local PostgreSQL only on motherbee primary.".to_string(),
+        ));
+    }
+    let Some(requested_node_name) = msg.payload.get("node_name").and_then(Value::as_str) else {
+        return Ok(identity_config_error_response(
+            is_primary,
+            node_name,
+            control_state,
+            "invalid_config",
+            "Missing required field: payload.node_name".to_string(),
+        ));
+    };
+    if requested_node_name != node_name && requested_node_name != IDENTITY_NODE_BASE_NAME {
+        return Ok(identity_config_error_response(
+            is_primary,
+            node_name,
+            control_state,
+            "invalid_config",
+            format!(
+                "Invalid payload.node_name: expected '{}' or '{}', got '{}'",
+                node_name, IDENTITY_NODE_BASE_NAME, requested_node_name
+            ),
+        ));
+    }
+    let Some(schema_version_raw) = msg.payload.get("schema_version").and_then(Value::as_u64) else {
+        return Ok(identity_config_error_response(
+            is_primary,
+            node_name,
+            control_state,
+            "invalid_config",
+            "Missing required field: payload.schema_version".to_string(),
+        ));
+    };
+    let schema_version = schema_version_raw as u32;
+    let Some(config_version) = msg.payload.get("config_version").and_then(Value::as_u64) else {
+        return Ok(identity_config_error_response(
+            is_primary,
+            node_name,
+            control_state,
+            "invalid_config",
+            "Missing required field: payload.config_version".to_string(),
+        ));
+    };
+    if config_version < control_state.config_version {
+        return Ok(identity_config_error_response(
+            is_primary,
+            node_name,
+            control_state,
+            "stale_config_version",
+            format!(
+                "Stale config_version: received {}, current {}",
+                config_version, control_state.config_version
+            ),
+        ));
+    }
+    let Some(apply_mode) = msg.payload.get("apply_mode").and_then(Value::as_str) else {
+        return Ok(identity_config_error_response(
+            is_primary,
+            node_name,
+            control_state,
+            "invalid_config",
+            "Missing required field: payload.apply_mode".to_string(),
+        ));
+    };
+    if apply_mode != NODE_CONFIG_APPLY_MODE_REPLACE {
+        return Ok(identity_config_error_response(
+            is_primary,
+            node_name,
+            control_state,
+            "unsupported_apply_mode",
+            format!("Unsupported payload.apply_mode='{apply_mode}'"),
+        ));
+    }
+    let Some(config) = msg.payload.get("config").and_then(Value::as_object) else {
+        return Ok(identity_config_error_response(
+            is_primary,
+            node_name,
+            control_state,
+            "invalid_config",
+            "Missing required field: payload.config".to_string(),
+        ));
+    };
+    let Some(postgres_url) = config
+        .get("database")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("postgres_url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(identity_config_error_response(
+            is_primary,
+            node_name,
+            control_state,
+            "invalid_config",
+            "config.database.postgres_url is required".to_string(),
+        ));
+    };
+    if let Err(err) = postgres_url.parse::<PgConfig>() {
+        return Ok(identity_config_error_response(
+            is_primary,
+            node_name,
+            control_state,
+            "invalid_config",
+            format!("invalid postgres_url: {err}"),
+        ));
+    }
+    persist_local_identity_postgres_url(
+        node_name,
+        postgres_url,
+        &build_secret_write_options_from_message(msg),
+    )?;
+    control_state.schema_version = schema_version;
+    control_state.config_version = config_version;
+    control_state.secret_source = IdentityDbSecretSource::LocalFile;
+    if control_state.db_ready {
+        control_state.last_error = None;
+    } else {
+        control_state.last_error = Some(
+            "restart_required: sy-identity must be restarted to apply new DB connection settings"
+                .to_string(),
+        );
+    }
+    persist_identity_config_state(node_name, is_primary, control_state)?;
+    Ok(json!({
+        "ok": true,
+        "node_name": node_name,
+        "state": identity_state_label(is_primary, control_state),
+        "schema_version": control_state.schema_version,
+        "config_version": control_state.config_version,
+        "config": identity_public_config(is_primary, control_state),
+        "notes": [
+            "postgres_url persisted in local secrets.json",
+            "restart_required: sy-identity must be restarted to apply new DB connection settings"
+        ],
+        "error": Value::Null
+    }))
+}
+
+fn identity_config_error_response(
+    is_primary: bool,
+    node_name: &str,
+    control_state: &IdentityControlState,
+    code: &str,
+    message: String,
+) -> Value {
+    json!({
+        "ok": false,
+        "node_name": node_name,
+        "state": identity_state_label(is_primary, control_state),
+        "schema_version": control_state.schema_version,
+        "config_version": control_state.config_version,
+        "config": identity_public_config(is_primary, control_state),
+        "error": {
+            "code": code,
+            "message": message
+        }
+    })
+}
+
+fn persist_local_identity_postgres_url(
+    node_name: &str,
+    postgres_url: &str,
+    options: &NodeSecretWriteOptions,
+) -> Result<(), fluxbee_sdk::NodeSecretError> {
+    let mut secrets = load_node_secret_record(node_name)
+        .map(|record| record.secrets)
+        .unwrap_or_else(|_| Map::new());
+    secrets.insert(
+        IDENTITY_LOCAL_SECRET_KEY_POSTGRES_URL.to_string(),
+        Value::String(postgres_url.to_string()),
+    );
+    let record = build_node_secret_record(secrets, options);
+    save_node_secret_record(node_name, &record)?;
+    Ok(())
+}
+
+fn load_local_identity_postgres_url(node_name: &str) -> Option<String> {
+    load_node_secret_record(node_name)
+        .ok()
+        .and_then(|record| {
+            record
+                .secrets
+                .get(IDENTITY_LOCAL_SECRET_KEY_POSTGRES_URL)
+                .cloned()
+        })
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .filter(|value| !value.trim().is_empty() && value != NODE_SECRET_REDACTION_TOKEN)
+}
+
+fn build_secret_write_options_from_message(msg: &Message) -> NodeSecretWriteOptions {
+    let updated_by_label = msg
+        .payload
+        .get("requested_by")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| msg.meta.action.clone());
+    NodeSecretWriteOptions {
+        updated_by_ilk: msg.meta.src_ilk.clone(),
+        updated_by_label,
+        trace_id: Some(msg.routing.trace_id.clone()),
+    }
+}
+
+fn resolve_database_url(node_name: &str) -> (Option<String>, IdentityDbSecretSource) {
+    if let Some(url) = load_local_identity_postgres_url(node_name) {
+        return (Some(url), IdentityDbSecretSource::LocalFile);
+    }
     if let Ok(url) = std::env::var("FLUXBEE_DATABASE_URL") {
         if !url.trim().is_empty() {
-            return Ok(url);
+            return (Some(url), IdentityDbSecretSource::EnvCompat);
         }
     }
     if let Ok(url) = std::env::var("JSR_DATABASE_URL") {
         if !url.trim().is_empty() {
-            return Ok(url);
+            return (Some(url), IdentityDbSecretSource::EnvCompat);
         }
     }
-    let Some(db) = hive.database.as_ref() else {
-        return Err("database.url missing in hive.yaml and env".into());
-    };
-    let Some(url) = db.url.as_ref() else {
-        return Err("database.url missing in hive.yaml and env".into());
-    };
-    if url.trim().is_empty() {
-        return Err("database.url empty".into());
-    }
-    Ok(url.clone())
+    (None, IdentityDbSecretSource::Missing)
 }
 
-fn database_config(hive: &HiveFile) -> Result<PgConfig, IdentityError> {
-    let url = base_database_url(hive)?;
-    Ok(url.parse::<PgConfig>()?)
+async fn initialize_identity_database_backend(
+    database_url: Option<&str>,
+) -> (Option<PgConfig>, Option<String>) {
+    let Some(database_url) = database_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (
+            None,
+            Some("Missing database secret in local secrets.json or env overrides.".to_string()),
+        );
+    };
+    let base = match database_url.parse::<PgConfig>() {
+        Ok(value) => value,
+        Err(err) => return (None, Some(format!("invalid postgres_url: {err}"))),
+    };
+    if let Err(err) = ensure_database_exists(&base, IDENTITY_DB_NAME).await {
+        return (
+            None,
+            Some(format!("failed to ensure identity database exists: {err}")),
+        );
+    }
+    let cfg = with_dbname(&base, IDENTITY_DB_NAME);
+    if let Err(err) = ensure_primary_schema(&cfg).await {
+        return (
+            None,
+            Some(format!("failed to ensure identity primary schema: {err}")),
+        );
+    }
+    (Some(cfg), None)
 }
 
 fn with_dbname(base: &PgConfig, dbname: &str) -> PgConfig {
@@ -3677,6 +4235,37 @@ async fn ensure_database_exists(base: &PgConfig, dbname: &str) -> Result<(), Ide
         } else {
             tracing::info!(db = dbname, "created identity database");
         }
+    }
+    Ok(())
+}
+
+fn write_json_atomic(path: &Path, content: &str) -> Result<(), IdentityError> {
+    let Some(parent) = path.parent() else {
+        return Err("target path has no parent directory".into());
+    };
+    fs::create_dir_all(parent)?;
+    let tmp_name = format!(
+        ".{}.tmp.{}.{}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("state"),
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let tmp_path = parent.join(tmp_name);
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp_path)?;
+    use std::io::Write;
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    fs::rename(&tmp_path, path)?;
+    if let Ok(dir_file) = OpenOptions::new().read(true).open(parent) {
+        let _ = dir_file.sync_all();
     }
     Ok(())
 }

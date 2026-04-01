@@ -555,6 +555,7 @@ impl GovIdentityBridge {
                 action: None,
                 priority: None,
                 context: None,
+                ..Meta::default()
             },
             payload,
         };
@@ -3755,13 +3756,21 @@ fn invalid_payload_missing_thread_id() -> Value {
 
 fn extract_thread_id(msg: &Message) -> Option<String> {
     msg.meta
-        .context
-        .as_ref()
-        .and_then(|ctx| ctx.get("thread_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
+        .thread_id
+        .as_deref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+        .or_else(|| {
+            msg.meta
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("thread_id"))
+                .and_then(Value::as_str)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
 }
 
 fn extract_src_ilk(msg: &Message) -> Option<String> {
@@ -3873,6 +3882,7 @@ mod tests {
                 action: None,
                 priority: None,
                 context: None,
+                ..Meta::default()
             },
             payload: json!({}),
         }
@@ -4049,6 +4059,7 @@ mod tests {
                 action: None,
                 priority: None,
                 context: Some(context),
+                ..Meta::default()
             },
             payload: json!({"type":"text","content":"hola"}),
         }
@@ -4215,6 +4226,7 @@ mod tests {
                 action: Some("CONFIG_SET".to_string()),
                 priority: None,
                 context: None,
+                ..Meta::default()
             },
             payload: json!({
                 "requested_by": "archi",

@@ -73,6 +73,9 @@ const SSH_HARDEN_VERIFY_RETRIES: usize = 6;
 const SSH_HARDEN_VERIFY_DELAY_MS: u64 = 1000;
 const SYNCTHING_FOLDER_BLOB_ID: &str = "fluxbee-blob";
 const SYNCTHING_FOLDER_DIST_ID: &str = "fluxbee-dist";
+const SYNCTHING_FOLDER_TYPE_SEND_RECEIVE: &str = "sendreceive";
+const SYNCTHING_FOLDER_TYPE_SEND_ONLY: &str = "sendonly";
+const SYNCTHING_FOLDER_TYPE_RECEIVE_ONLY: &str = "receiveonly";
 const SYSTEM_SYNC_HINT_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const SYSTEM_SYNC_HINT_MAX_TIMEOUT_MS: u64 = 300_000;
 const SYSTEM_SYNC_HINT_POLL_INTERVAL_MS: u64 = 250;
@@ -98,21 +101,24 @@ const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "sy-admin",
     "sy-architect",
     "sy-storage",
+    "sy-cognition",
     "ai-frontdesk-gov",
     "sy-orchestrator",
 ];
-const WORKER_MIN_CORE_COMPONENTS: [&str; 5] = [
+const WORKER_MIN_CORE_COMPONENTS: [&str; 6] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
+    "sy-cognition",
     "sy-orchestrator",
 ];
-const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 5] = [
+const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 6] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
+    "sy-cognition",
     "sy-orchestrator",
 ];
 const DEFAULT_BLOB_ENABLED: bool = true;
@@ -405,7 +411,7 @@ struct SystemUpdateRequest {
     runtime_version: Option<String>,
 }
 
-const MOTHERBEE_CRITICAL_SERVICES: [&str; 8] = [
+const MOTHERBEE_CRITICAL_SERVICES: [&str; 9] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
@@ -413,13 +419,15 @@ const MOTHERBEE_CRITICAL_SERVICES: [&str; 8] = [
     "sy-admin",
     "sy-architect",
     "sy-storage",
+    "sy-cognition",
     "ai-frontdesk-gov",
 ];
-const WORKER_CRITICAL_SERVICES: [&str; 4] = [
+const WORKER_CRITICAL_SERVICES: [&str; 5] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
+    "sy-cognition",
 ];
 
 #[tokio::main]
@@ -619,7 +627,9 @@ async fn bootstrap_local(
     ensure_core_firewall_local(state);
     let startup_sync = effective_syncthing_runtime_config(&state.blob, &state.dist);
     if startup_sync.sync_enabled {
-        if let Err(err) = ensure_blob_sync_runtime(&state.blob, &state.dist).await {
+        if let Err(err) =
+            ensure_blob_sync_runtime(&state.blob, &state.dist, state.is_motherbee).await
+        {
             tracing::warn!(
                 error = %err,
                 "blob sync runtime bootstrap failed; continuing startup and relying on watchdog retries"
@@ -636,10 +646,11 @@ async fn bootstrap_local(
             "sy-admin",
             "sy-architect",
             "sy-storage",
+            "sy-cognition",
             "ai-frontdesk-gov",
         ]
     } else {
-        vec!["sy-config-routes", "sy-opa-rules"]
+        vec!["sy-config-routes", "sy-opa-rules", "sy-cognition"]
     };
     if identity_available() {
         services.push("sy-identity");
@@ -988,6 +999,9 @@ async fn wait_for_sy_nodes(
     if identity_available() {
         required.push("SY.identity");
     }
+    if cognition_available() {
+        required.push("SY.cognition");
+    }
     let start = Instant::now();
     let mut last_missing: Vec<String> = required.iter().map(|name| (*name).to_string()).collect();
     loop {
@@ -1051,6 +1065,19 @@ async fn watchdog_tick(state: &OrchestratorState) {
             );
         }
     }
+    if cognition_available() && !systemd_is_active("sy-cognition") {
+        tracing::warn!(
+            service = "sy-cognition",
+            "service not active; attempting restart"
+        );
+        if let Err(err) = systemd_start("sy-cognition") {
+            tracing::warn!(
+                service = "sy-cognition",
+                error = %err,
+                "service restart failed"
+            );
+        }
+    }
 
     if let Ok(snapshot) = load_router_snapshot(state) {
         let mut current = HashSet::new();
@@ -1108,6 +1135,7 @@ async fn shutdown_sequence(state: &OrchestratorState) {
 
     for service in [
         "ai-frontdesk-gov",
+        "sy-cognition",
         "sy-storage",
         "sy-architect",
         "sy-admin",
@@ -1168,6 +1196,7 @@ async fn send_admin_forbidden(
             action: Some(action.to_string()),
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };
@@ -1402,6 +1431,7 @@ async fn handle_admin(
             action: Some(action.to_string()),
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };
@@ -1863,6 +1893,99 @@ fn system_sync_hint_response_json(
     payload
 }
 
+#[derive(Debug, Clone)]
+struct SyncthingConvergenceProbe {
+    service_active: bool,
+    api_healthy: bool,
+    folder_status: Option<SyncthingFolderStatus>,
+    warnings: Vec<String>,
+    converged: bool,
+}
+
+async fn wait_for_syncthing_folder_convergence(
+    state: &OrchestratorState,
+    desired_blob: &BlobRuntimeConfig,
+    desired_dist: &DistRuntimeConfig,
+    folder_id: &str,
+    timeout_ms: u64,
+    wait_for_idle: bool,
+) -> Result<SyncthingConvergenceProbe, OrchestratorError> {
+    let desired_sync = effective_syncthing_runtime_config(desired_blob, desired_dist);
+    let mut service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+    let mut api_healthy = if service_active {
+        syncthing_api_healthy(desired_sync.sync_api_port).await
+    } else {
+        false
+    };
+
+    if !service_active || !api_healthy {
+        ensure_blob_sync_runtime(desired_blob, desired_dist, state.is_motherbee).await?;
+        service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+        api_healthy = if service_active {
+            syncthing_api_healthy(desired_sync.sync_api_port).await
+        } else {
+            false
+        };
+    }
+
+    if !service_active || !api_healthy {
+        return Ok(SyncthingConvergenceProbe {
+            service_active,
+            api_healthy,
+            folder_status: None,
+            warnings: Vec::new(),
+            converged: false,
+        });
+    }
+
+    let mut warnings = Vec::new();
+    if let Err(err) = syncthing_trigger_folder_scan(&desired_sync, folder_id) {
+        tracing::warn!(
+            folder = %folder_id,
+            error = %err,
+            "syncthing folder scan trigger failed; continuing with status probe"
+        );
+        warnings.push(format!("scan trigger failed: {err}"));
+    }
+
+    let mut folder_status = syncthing_folder_status(&desired_sync, folder_id)?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if !folder_status.is_healthy() {
+            return Ok(SyncthingConvergenceProbe {
+                service_active,
+                api_healthy,
+                folder_status: Some(folder_status),
+                warnings,
+                converged: false,
+            });
+        }
+
+        if folder_status.is_converged() {
+            return Ok(SyncthingConvergenceProbe {
+                service_active,
+                api_healthy,
+                folder_status: Some(folder_status),
+                warnings,
+                converged: true,
+            });
+        }
+
+        if !wait_for_idle || Instant::now() >= deadline {
+            return Ok(SyncthingConvergenceProbe {
+                service_active,
+                api_healthy,
+                folder_status: Some(folder_status),
+                warnings,
+                converged: false,
+            });
+        }
+
+        time::sleep(Duration::from_millis(SYSTEM_SYNC_HINT_POLL_INTERVAL_MS)).await;
+        folder_status = syncthing_folder_status(&desired_sync, folder_id)?;
+    }
+}
+
 async fn handle_system_sync_hint_message(
     state: &OrchestratorState,
     msg: &Message,
@@ -1908,55 +2031,16 @@ async fn handle_system_sync_hint_message(
         });
     }
 
-    let mut service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
-    let mut api_healthy = if service_active {
-        syncthing_api_healthy(desired_sync.sync_api_port).await
-    } else {
-        false
-    };
-
-    if !service_active || !api_healthy {
-        if let Err(err) = ensure_blob_sync_runtime(&desired_blob, &desired_dist).await {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SYNC_UNHEALTHY",
-                "message": format!("failed to reconcile syncthing runtime: {err}"),
-                "channel": request.channel,
-                "folder_id": request.folder_id,
-            });
-        }
-        service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
-        api_healthy = if service_active {
-            syncthing_api_healthy(desired_sync.sync_api_port).await
-        } else {
-            false
-        };
-    }
-
-    if !service_active || !api_healthy {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "SYNC_UNHEALTHY",
-            "message": "syncthing service is not healthy",
-            "channel": request.channel,
-            "folder_id": request.folder_id,
-            "api_healthy": api_healthy,
-            "service_active": service_active,
-        });
-    }
-
-    let mut warnings = Vec::new();
-    if let Err(err) = syncthing_trigger_folder_scan(&desired_sync, &request.folder_id) {
-        tracing::warn!(
-            channel = %request.channel,
-            folder = %request.folder_id,
-            error = %err,
-            "sync hint scan trigger failed; continuing with status probe"
-        );
-        warnings.push(format!("scan trigger failed: {err}"));
-    }
-
-    let mut folder_status = match syncthing_folder_status(&desired_sync, &request.folder_id) {
+    let probe = match wait_for_syncthing_folder_convergence(
+        state,
+        &desired_blob,
+        &desired_dist,
+        &request.folder_id,
+        request.timeout_ms,
+        request.wait_for_idle,
+    )
+    .await
+    {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -1965,93 +2049,97 @@ async fn handle_system_sync_hint_message(
                 "message": err.to_string(),
                 "channel": request.channel,
                 "folder_id": request.folder_id,
-                "api_healthy": api_healthy,
-                "errors": warnings,
             });
         }
     };
 
-    let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
-    loop {
-        if !folder_status.is_healthy() {
-            let mut errors = warnings.clone();
-            if !folder_status.error.is_empty() {
-                errors.push(format!("folder error: {}", folder_status.error));
-            }
-            if !folder_status.invalid.is_empty() {
-                errors.push(format!("folder invalid: {}", folder_status.invalid));
-            }
+    if !probe.service_active || !probe.api_healthy {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SYNC_UNHEALTHY",
+            "message": "syncthing service is not healthy",
+            "channel": request.channel,
+            "folder_id": request.folder_id,
+            "api_healthy": probe.api_healthy,
+            "service_active": probe.service_active,
+        });
+    }
+
+    let folder_status = match probe.folder_status.as_ref() {
+        Some(value) => value,
+        None => {
             return serde_json::json!({
                 "status": "error",
-                "error_code": "SYNC_UNHEALTHY",
-                "message": "syncthing folder is unhealthy",
+                "error_code": "SYNC_STATUS_FAILED",
+                "message": "syncthing folder status probe returned no data",
                 "hive": state.hive_id.as_str(),
                 "channel": request.channel,
                 "folder_id": request.folder_id,
-                "api_healthy": api_healthy,
-                "folder_healthy": false,
-                "state": folder_status.state,
-                "need_total_items": folder_status.need_total_items,
-                "errors": errors,
+                "api_healthy": probe.api_healthy,
+                "errors": probe.warnings,
             });
         }
+    };
 
-        if folder_status.is_converged() {
-            return system_sync_hint_response_json(
-                state,
-                &request,
-                "ok",
-                api_healthy,
-                Some(&folder_status),
-                warnings,
-                None,
-            );
+    if !folder_status.is_healthy() {
+        let mut errors = probe.warnings.clone();
+        if !folder_status.error.is_empty() {
+            errors.push(format!("folder error: {}", folder_status.error));
         }
-
-        if !request.wait_for_idle {
-            return system_sync_hint_response_json(
-                state,
-                &request,
-                "sync_pending",
-                api_healthy,
-                Some(&folder_status),
-                warnings,
-                Some("folder has pending items".to_string()),
-            );
+        if !folder_status.invalid.is_empty() {
+            errors.push(format!("folder invalid: {}", folder_status.invalid));
         }
-
-        if Instant::now() >= deadline {
-            return system_sync_hint_response_json(
-                state,
-                &request,
-                "sync_pending",
-                api_healthy,
-                Some(&folder_status),
-                warnings,
-                Some(format!(
-                    "sync hint timeout after {}ms waiting for idle convergence",
-                    request.timeout_ms
-                )),
-            );
-        }
-
-        time::sleep(Duration::from_millis(SYSTEM_SYNC_HINT_POLL_INTERVAL_MS)).await;
-        folder_status = match syncthing_folder_status(&desired_sync, &request.folder_id) {
-            Ok(value) => value,
-            Err(err) => {
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": "SYNC_STATUS_FAILED",
-                    "message": err.to_string(),
-                    "hive": state.hive_id.as_str(),
-                    "channel": request.channel,
-                    "folder_id": request.folder_id,
-                    "api_healthy": api_healthy,
-                    "errors": warnings,
-                });
-            }
-        };
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SYNC_UNHEALTHY",
+            "message": "syncthing folder is unhealthy",
+            "hive": state.hive_id.as_str(),
+            "channel": request.channel,
+            "folder_id": request.folder_id,
+            "api_healthy": probe.api_healthy,
+            "folder_healthy": false,
+            "state": folder_status.state,
+            "need_total_items": folder_status.need_total_items,
+            "errors": errors,
+        });
     }
+
+    if probe.converged {
+        return system_sync_hint_response_json(
+            state,
+            &request,
+            "ok",
+            probe.api_healthy,
+            Some(folder_status),
+            probe.warnings,
+            None,
+        );
+    }
+
+    if !request.wait_for_idle {
+        return system_sync_hint_response_json(
+            state,
+            &request,
+            "sync_pending",
+            probe.api_healthy,
+            Some(folder_status),
+            probe.warnings,
+            Some("folder has pending items".to_string()),
+        );
+    }
+
+    system_sync_hint_response_json(
+        state,
+        &request,
+        "sync_pending",
+        probe.api_healthy,
+        Some(folder_status),
+        probe.warnings,
+        Some(format!(
+            "sync hint timeout after {}ms waiting for idle convergence",
+            request.timeout_ms
+        )),
+    )
 }
 
 async fn restart_local_core_services_with_health_gate() -> Result<Vec<String>, OrchestratorError> {
@@ -2315,7 +2403,7 @@ async fn apply_system_update_local(
                 && (blob_sync_tool_is_syncthing(&desired_sync)
                     || dist_sync_tool_is_syncthing(&desired_dist))
             {
-                ensure_blob_sync_runtime(&desired_blob, &desired_dist).await?;
+                ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee).await?;
                 Ok(SystemUpdateApplyResult {
                     status: "ok".to_string(),
                     updated: Vec::new(),
@@ -2613,6 +2701,7 @@ async fn send_system_action_response(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };
@@ -3621,11 +3710,20 @@ fn set_xml_attr(start_tag: &str, attr: &str, value: &str) -> Result<String, Orch
     Ok(updated)
 }
 
+fn dist_syncthing_folder_type(is_motherbee: bool) -> &'static str {
+    if is_motherbee {
+        SYNCTHING_FOLDER_TYPE_SEND_ONLY
+    } else {
+        SYNCTHING_FOLDER_TYPE_RECEIVE_ONLY
+    }
+}
+
 fn rewrite_syncthing_folder_block(
     block: &str,
     folder_id: &str,
     folder_path: &str,
     folder_label: &str,
+    folder_type: &str,
 ) -> Result<String, OrchestratorError> {
     let Some(tag_end) = block.find('>') else {
         return Err("invalid syncthing folder block".into());
@@ -3636,9 +3734,7 @@ fn rewrite_syncthing_folder_block(
     updated_tag = set_xml_attr(&updated_tag, "id", &xml_escape_attr(folder_id))?;
     updated_tag = set_xml_attr(&updated_tag, "path", &xml_escape_attr(folder_path))?;
     updated_tag = set_xml_attr(&updated_tag, "label", &xml_escape_attr(folder_label))?;
-    if !updated_tag.contains(" type=") {
-        updated_tag = set_xml_attr(&updated_tag, "type", "sendreceive")?;
-    }
+    updated_tag = set_xml_attr(&updated_tag, "type", folder_type)?;
     Ok(format!("{updated_tag}{body}"))
 }
 
@@ -3647,6 +3743,7 @@ fn minimal_syncthing_folder_block(
     folder_id: &str,
     folder_path: &str,
     folder_label: &str,
+    folder_type: &str,
 ) -> Result<String, OrchestratorError> {
     let device_re = Regex::new(r#"<device\b[^>]*\bid="([^"]+)""#)?;
     let Some(caps) = device_re.captures(config_xml) else {
@@ -3656,10 +3753,11 @@ fn minimal_syncthing_folder_block(
         return Err("syncthing config has malformed device id".into());
     };
     Ok(format!(
-        "<folder id=\"{}\" label=\"{}\" path=\"{}\" type=\"sendreceive\" rescanIntervalS=\"3600\" fsWatcherEnabled=\"true\" fsWatcherDelayS=\"10\" ignorePerms=\"false\" autoNormalize=\"true\">\n    <filesystemType>basic</filesystemType>\n    <device id=\"{}\" introducedBy=\"\"/>\n    <minDiskFree unit=\"%\">1</minDiskFree>\n  </folder>",
+        "<folder id=\"{}\" label=\"{}\" path=\"{}\" type=\"{}\" rescanIntervalS=\"3600\" fsWatcherEnabled=\"true\" fsWatcherDelayS=\"10\" ignorePerms=\"false\" autoNormalize=\"true\">\n    <filesystemType>basic</filesystemType>\n    <device id=\"{}\" introducedBy=\"\"/>\n    <minDiskFree unit=\"%\">1</minDiskFree>\n  </folder>",
         xml_escape_attr(folder_id),
         xml_escape_attr(folder_label),
         xml_escape_attr(folder_path),
+        xml_escape_attr(folder_type),
         xml_escape_attr(device_id)
     ))
 }
@@ -3669,6 +3767,7 @@ fn ensure_syncthing_folder_in_config_xml(
     folder_id: &str,
     folder_path: &str,
     folder_label: &str,
+    folder_type: &str,
 ) -> Result<(String, bool), OrchestratorError> {
     let folder_re = Regex::new(r#"(?s)<folder\b[^>]*\bid="([^"]+)"[^>]*>.*?</folder>"#)?;
 
@@ -3682,8 +3781,13 @@ fn ensure_syncthing_folder_in_config_xml(
         let Some(full) = caps.get(0) else {
             continue;
         };
-        let rewritten =
-            rewrite_syncthing_folder_block(full.as_str(), folder_id, folder_path, folder_label)?;
+        let rewritten = rewrite_syncthing_folder_block(
+            full.as_str(),
+            folder_id,
+            folder_path,
+            folder_label,
+            folder_type,
+        )?;
         if rewritten == full.as_str() {
             return Ok((config_xml.to_string(), false));
         }
@@ -3710,9 +3814,21 @@ fn ensure_syncthing_folder_in_config_xml(
     }
 
     let new_block = if let Some(template) = template_block {
-        rewrite_syncthing_folder_block(&template, folder_id, folder_path, folder_label)?
+        rewrite_syncthing_folder_block(
+            &template,
+            folder_id,
+            folder_path,
+            folder_label,
+            folder_type,
+        )?
     } else {
-        minimal_syncthing_folder_block(config_xml, folder_id, folder_path, folder_label)?
+        minimal_syncthing_folder_block(
+            config_xml,
+            folder_id,
+            folder_path,
+            folder_label,
+            folder_type,
+        )?
     };
 
     let insert_at = config_xml
@@ -3822,6 +3938,7 @@ fn reconcile_syncthing_peer_xml(
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
     peer_name: &str,
+    is_motherbee: bool,
 ) -> Result<(String, bool), OrchestratorError> {
     let mut updated = config_xml.to_string();
     let mut changed = false;
@@ -3838,6 +3955,7 @@ fn reconcile_syncthing_peer_xml(
             SYNCTHING_FOLDER_BLOB_ID,
             &blob_sync_path.display().to_string(),
             "Fluxbee Blob",
+            SYNCTHING_FOLDER_TYPE_SEND_RECEIVE,
         )?;
         updated = next;
         changed |= folder_changed;
@@ -3853,6 +3971,7 @@ fn reconcile_syncthing_peer_xml(
             SYNCTHING_FOLDER_DIST_ID,
             &dist.path.display().to_string(),
             "Fluxbee Dist",
+            dist_syncthing_folder_type(is_motherbee),
         )?;
         updated = next;
         changed |= folder_changed;
@@ -3871,11 +3990,18 @@ fn ensure_local_syncthing_peer_link(
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
     peer_name: &str,
+    is_motherbee: bool,
 ) -> Result<bool, OrchestratorError> {
     let config_path = sync.sync_data_dir.join("config.xml");
     let current = fs::read_to_string(&config_path)?;
-    let (updated, changed) =
-        reconcile_syncthing_peer_xml(&current, blob, dist, peer_device_id, peer_name)?;
+    let (updated, changed) = reconcile_syncthing_peer_xml(
+        &current,
+        blob,
+        dist,
+        peer_device_id,
+        peer_name,
+        is_motherbee,
+    )?;
     if changed {
         fs::write(&config_path, updated)?;
     }
@@ -3888,6 +4014,7 @@ async fn ensure_syncthing_peer_link_runtime(
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
     peer_name: &str,
+    is_motherbee: bool,
 ) -> Result<(), OrchestratorError> {
     if !sync.sync_enabled {
         return Ok(());
@@ -3895,7 +4022,14 @@ async fn ensure_syncthing_peer_link_runtime(
     if !(blob_sync_tool_is_syncthing(sync) || dist_sync_tool_is_syncthing(dist)) {
         return Ok(());
     }
-    let changed = ensure_local_syncthing_peer_link(sync, blob, dist, peer_device_id, peer_name)?;
+    let changed = ensure_local_syncthing_peer_link(
+        sync,
+        blob,
+        dist,
+        peer_device_id,
+        peer_name,
+        is_motherbee,
+    )?;
     if !changed {
         return Ok(());
     }
@@ -4066,6 +4200,7 @@ fn reconcile_syncthing_folders_xml(
     config_xml: &str,
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
+    is_motherbee: bool,
 ) -> Result<(String, Vec<String>), OrchestratorError> {
     let mut updated = config_xml.to_string();
     let mut changed_folders = Vec::new();
@@ -4077,6 +4212,7 @@ fn reconcile_syncthing_folders_xml(
             SYNCTHING_FOLDER_BLOB_ID,
             &blob_sync_path.display().to_string(),
             "Fluxbee Blob",
+            SYNCTHING_FOLDER_TYPE_SEND_RECEIVE,
         )?;
         if changed {
             changed_folders.push(SYNCTHING_FOLDER_BLOB_ID.to_string());
@@ -4090,6 +4226,7 @@ fn reconcile_syncthing_folders_xml(
             SYNCTHING_FOLDER_DIST_ID,
             &dist.path.display().to_string(),
             "Fluxbee Dist",
+            dist_syncthing_folder_type(is_motherbee),
         )?;
         if changed {
             changed_folders.push(SYNCTHING_FOLDER_DIST_ID.to_string());
@@ -4104,10 +4241,12 @@ fn reconcile_local_syncthing_folders(
     sync: &BlobRuntimeConfig,
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
+    is_motherbee: bool,
 ) -> Result<Vec<String>, OrchestratorError> {
     let config_path = sync.sync_data_dir.join("config.xml");
     let current = fs::read_to_string(&config_path)?;
-    let (updated, changed_folders) = reconcile_syncthing_folders_xml(&current, blob, dist)?;
+    let (updated, changed_folders) =
+        reconcile_syncthing_folders_xml(&current, blob, dist, is_motherbee)?;
     if !changed_folders.is_empty() {
         fs::write(&config_path, updated)?;
     }
@@ -4149,6 +4288,7 @@ fn ensure_syncthing_folder_markers(
 async fn ensure_blob_sync_runtime(
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
+    is_motherbee: bool,
 ) -> Result<(), OrchestratorError> {
     let sync = effective_syncthing_runtime_config(blob, dist);
     if !sync.sync_enabled {
@@ -4179,7 +4319,7 @@ async fn ensure_blob_sync_runtime(
     )
     .await?;
     wait_for_syncthing_health(&sync).await?;
-    let changed_folders = reconcile_local_syncthing_folders(&sync, blob, dist)?;
+    let changed_folders = reconcile_local_syncthing_folders(&sync, blob, dist, is_motherbee)?;
     if !changed_folders.is_empty() || !repaired_markers.is_empty() {
         tracing::info!(
             service = SYNCTHING_SERVICE_NAME,
@@ -4266,7 +4406,7 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
 
     if changed {
         tracing::info!("blob/dist sync config changed in hive.yaml; reconciling syncthing runtime");
-        ensure_blob_sync_runtime(&desired_blob, &desired_dist).await?;
+        ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee).await?;
         return Ok(());
     }
 
@@ -4326,7 +4466,7 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         folders_healthy = folders_healthy,
         "syncthing unhealthy; restarting"
     );
-    ensure_blob_sync_runtime(&desired_blob, &desired_dist).await?;
+    ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee).await?;
     Ok(())
 }
 
@@ -6821,6 +6961,7 @@ async fn send_config_response(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };
@@ -6878,7 +7019,7 @@ fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
 }
 
 fn remove_hive_cleanup_script() -> &'static str {
-    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-orchestrator sy-admin sy-architect sy-storage ai-frontdesk-gov fluxbee-syncthing; do \
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-cognition sy-orchestrator sy-admin sy-architect sy-storage ai-frontdesk-gov fluxbee-syncthing; do \
 systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
 systemctl disable \"$s\" >/dev/null 2>&1 || true; \
 systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
@@ -8395,6 +8536,7 @@ async fn send_node_config_changed_signal(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload: serde_json::to_value(ConfigChangedPayload {
             subsystem: "node_config".to_string(),
@@ -9519,6 +9661,7 @@ async fn relay_system_action(
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         },
         payload,
     };
@@ -12500,6 +12643,7 @@ async fn add_hive_finalize_local_flow(
             &desired_dist,
             peer_device_id,
             &syncthing_peer_name,
+            state.is_motherbee,
         )
         .await
         {
@@ -12528,31 +12672,59 @@ async fn add_hive_finalize_local_flow(
     } else {
         None
     };
-    let service_active = if desired_sync.sync_enabled {
-        systemd_is_active(SYNCTHING_SERVICE_NAME)
-    } else {
-        false
-    };
-    let api_healthy = if desired_sync.sync_enabled {
-        syncthing_api_healthy(desired_sync.sync_api_port).await
-    } else {
-        false
-    };
-    let runtime_manifest_ready =
+    let runtime_manifest_ready = local_runtime_manifest_ready_for_spawn();
+    let (service_active, api_healthy, folder_status, dist_sync_ready, dist_sync_errors) =
         if !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist) {
-            local_runtime_manifest_ready_for_spawn()
-        } else if service_active && api_healthy {
-            wait_for_local_runtime_manifest_ready(Duration::from_secs(dist_sync_probe_timeout_secs))
-                .await
+            (false, false, None, true, Vec::new())
         } else {
-            false
+            match wait_for_syncthing_folder_convergence(
+                state,
+                &desired_blob,
+                &desired_dist,
+                SYNCTHING_FOLDER_DIST_ID,
+                dist_sync_probe_timeout_secs.saturating_mul(1000),
+                true,
+            )
+            .await
+            {
+                Ok(probe) => {
+                    let mut errors = probe.warnings;
+                    if let Some(status) = probe.folder_status.as_ref() {
+                        if !status.error.is_empty() {
+                            errors.push(format!("folder error: {}", status.error));
+                        }
+                        if !status.invalid.is_empty() {
+                            errors.push(format!("folder invalid: {}", status.invalid));
+                        }
+                    }
+                    (
+                        probe.service_active,
+                        probe.api_healthy,
+                        probe.folder_status,
+                        probe.service_active && probe.api_healthy && probe.converged,
+                        errors,
+                    )
+                }
+                Err(err) => (
+                    systemd_is_active(SYNCTHING_SERVICE_NAME),
+                    false,
+                    None,
+                    false,
+                    vec![err.to_string()],
+                ),
+            }
         };
-    let dist_sync_ready =
-        if !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist) {
-            true
-        } else {
-            service_active && api_healthy && runtime_manifest_ready
-        };
+    let folder_healthy = folder_status
+        .as_ref()
+        .is_some_and(SyncthingFolderStatus::is_healthy);
+    let folder_state = folder_status
+        .as_ref()
+        .map(|status| status.state.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let folder_need_total_items = folder_status
+        .as_ref()
+        .map(|status| status.need_total_items)
+        .unwrap_or(0);
 
     serde_json::json!({
         "status": "ok",
@@ -12562,8 +12734,12 @@ async fn add_hive_finalize_local_flow(
         "service_active": service_active,
         "api_healthy": api_healthy,
         "runtime_manifest_ready": runtime_manifest_ready,
+        "folder_healthy": folder_healthy,
+        "folder_state": folder_state,
+        "folder_need_total_items": folder_need_total_items,
         "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
         "dist_sync_ready": dist_sync_ready,
+        "dist_sync_errors": dist_sync_errors,
         "core_sync_pending": core_sync_pending,
         "syncthing_peer_linked": syncthing_peer_linked,
         "syncthing_device_id": syncthing_device_id,
@@ -12900,6 +13076,7 @@ async fn add_hive_flow(
                         &desired_dist,
                         &peer_device_id,
                         hive_id,
+                        state.is_motherbee,
                     )
                     .await
                     {
@@ -13081,6 +13258,7 @@ async fn add_hive_flow(
         }
     };
     let has_identity_source = core_manifest.components.contains_key("sy-identity");
+    let has_cognition_source = core_manifest.components.contains_key("sy-cognition");
 
     let core_deploy_started_at = now_epoch_ms();
     let core_deploy_started = Instant::now();
@@ -13259,6 +13437,9 @@ async fn add_hive_flow(
     ];
     if has_identity_source {
         worker_units.push(("sy-identity", "/usr/bin/sy-identity"));
+    }
+    if has_cognition_source {
+        worker_units.push(("sy-cognition", "/usr/bin/sy-cognition"));
     }
 
     for (name, exec_path) in &worker_units {
@@ -13490,6 +13671,7 @@ async fn add_hive_flow(
             &desired_dist,
             &peer_device_id,
             hive_id,
+            state.is_motherbee,
         )
         .await
         {
@@ -14238,6 +14420,10 @@ fn identity_available() -> bool {
     Path::new("/usr/bin/sy-identity").exists()
 }
 
+fn cognition_available() -> bool {
+    Path::new("/usr/bin/sy-cognition").exists()
+}
+
 fn askpass_script(password: &str) -> Result<PathBuf, OrchestratorError> {
     let dir = std::env::temp_dir();
     let path = dir.join(format!("jsr-askpass-{}.sh", now_epoch_ms()));
@@ -14914,6 +15100,38 @@ blob:
 
         assert!(!changed);
         assert_eq!(updated, config);
+    }
+
+    #[test]
+    fn reconcile_syncthing_folders_sets_dist_sendonly_on_motherbee() {
+        let config = sample_syncthing_config_with_peer();
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+
+        let (updated, changed_folders) =
+            reconcile_syncthing_folders_xml(&config, &blob, &dist, true)
+                .expect("folder reconcile must succeed");
+
+        assert!(changed_folders.contains(&SYNCTHING_FOLDER_DIST_ID.to_string()));
+        assert!(updated.contains(
+            "<folder id=\"fluxbee-dist\" label=\"Fluxbee Dist\" path=\"/var/lib/fluxbee/dist\" type=\"sendonly\""
+        ));
+    }
+
+    #[test]
+    fn reconcile_syncthing_folders_sets_dist_receiveonly_on_worker() {
+        let config = sample_syncthing_config_with_peer();
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+
+        let (updated, changed_folders) =
+            reconcile_syncthing_folders_xml(&config, &blob, &dist, false)
+                .expect("folder reconcile must succeed");
+
+        assert!(changed_folders.contains(&SYNCTHING_FOLDER_DIST_ID.to_string()));
+        assert!(updated.contains(
+            "<folder id=\"fluxbee-dist\" label=\"Fluxbee Dist\" path=\"/var/lib/fluxbee/dist\" type=\"receiveonly\""
+        ));
     }
 
     #[test]

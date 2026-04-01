@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
-use fluxbee_sdk::{connect, NodeConfig, NodeSender, NodeUuidMode};
+use fluxbee_sdk::{
+    compute_thread_id, connect, NodeConfig, NodeSender, NodeUuidMode, ThreadIdInput,
+};
 use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
 };
@@ -203,6 +205,23 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
+fn resolve_sim_thread_id(config: &Config) -> Option<String> {
+    if let Some(thread_id) = config.sim_thread_id.as_ref().map(String::as_str) {
+        let trimmed = thread_id.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    Some(
+        compute_thread_id(ThreadIdInput::PersistentChannel {
+            channel_type: &config.sim_channel,
+            entrypoint_id: Some(&config.island_id),
+            conversation_id: &config.sim_conversation_id,
+        })
+        .expect("valid io-sim thread input"),
+    )
+}
+
 async fn run_stdin_inbound_loop(
     config: &Config,
     sender: &NodeSender,
@@ -275,7 +294,7 @@ async fn process_one_inbound(
         conversation: ConversationRef {
             kind: "sim_conversation".to_string(),
             id: config.sim_conversation_id.clone(),
-            thread_id: config.sim_thread_id.clone(),
+            thread_id: resolve_sim_thread_id(config),
         },
         message: MessageRef {
             id: message_id.clone(),
@@ -288,7 +307,7 @@ async fn process_one_inbound(
         },
     };
     tracing::debug!(
-        sim_thread_id = ?config.sim_thread_id,
+        sim_thread_id = ?resolve_sim_thread_id(config),
         sim_conversation_id = %config.sim_conversation_id,
         "io-sim building inbound io context"
     );
@@ -360,12 +379,17 @@ async fn process_one_inbound(
                 .is_some();
             let thread_id = msg
                 .meta
-                .context
-                .as_ref()
-                .and_then(|ctx| ctx.get("thread_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+                .thread_id
+                .clone()
+                .or_else(|| {
+                    msg.meta
+                        .context
+                        .as_ref()
+                        .and_then(|ctx| ctx.get("thread_id"))
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_default();
             if legacy_context_src_ilk {
                 tracing::warn!(
                     %trace_id,
@@ -471,4 +495,59 @@ fn log_outbound_message(msg: &fluxbee_sdk::protocol::Message) {
         original_dst = %original_dst,
         "io-sim received outbound from router"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_config() -> Config {
+        Config {
+            node_name: "IO.sim.local".to_string(),
+            island_id: "motherbee".to_string(),
+            node_version: "0.1".to_string(),
+            router_socket: PathBuf::from("/tmp/router"),
+            uuid_persistence_dir: PathBuf::from("/tmp/state"),
+            config_dir: PathBuf::from("/tmp/config"),
+            ttl: 16,
+            dedup_ttl_ms: 1_000,
+            dedup_max_entries: 1_000,
+            dst_node: None,
+            sim_channel: "sim".to_string(),
+            sim_sender_id: "user.local".to_string(),
+            sim_conversation_id: "sim-console".to_string(),
+            sim_thread_id: None,
+            sim_tenant_hint: None,
+            sim_reply_kind: "sim_log".to_string(),
+            sim_reply_address: "stdout".to_string(),
+            sim_reply_thread_ts: None,
+            sim_reply_workspace_id: None,
+            sim_attachments_json: None,
+            sim_content_ref_json: None,
+            identity_target: "SY.identity@motherbee".to_string(),
+            identity_timeout_ms: 10_000,
+        }
+    }
+
+    #[test]
+    fn resolve_sim_thread_id_uses_override_when_present() {
+        let mut config = base_config();
+        config.sim_thread_id = Some("thread:manual".to_string());
+
+        assert_eq!(resolve_sim_thread_id(&config).as_deref(), Some("thread:manual"));
+    }
+
+    #[test]
+    fn resolve_sim_thread_id_computes_canonical_default() {
+        let config = base_config();
+
+        let expected = compute_thread_id(ThreadIdInput::PersistentChannel {
+            channel_type: "sim",
+            entrypoint_id: Some("motherbee"),
+            conversation_id: "sim-console",
+        })
+        .expect("thread id");
+
+        assert_eq!(resolve_sim_thread_id(&config).as_deref(), Some(expected.as_str()));
+    }
 }

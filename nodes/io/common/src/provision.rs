@@ -136,6 +136,7 @@ impl FluxbeeIdentityProvisioner {
                 action: None,
                 priority: None,
                 context: None,
+                ..Meta::default()
             },
             payload: serde_json::json!({
                 "ich_id": stable_ich_id(&normalized_channel, &normalized_address),

@@ -19,12 +19,12 @@ use crate::nats::{
 };
 use crate::opa::OpaResolver;
 use crate::shm::{
-    copy_bytes_with_len, now_epoch_ms, ConfigRegionReader, ConfigSnapshot, IdentityRegionReader,
-    LsaRegionReader, LsaRegionWriter, LsaSnapshot, OpaRegionReader, OpaSnapshot, RemoteHiveEntry,
-    RemoteNodeEntry, RemoteRouteEntry, RemoteVpnEntry, RouterRegionReader, RouterRegionWriter,
-    VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE,
-    HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR,
-    OPA_STATUS_LOADING,
+    copy_bytes_with_len, memory_shm_name_for_hive, now_epoch_ms, ConfigRegionReader,
+    ConfigSnapshot, IdentityRegionReader, LsaRegionReader, LsaRegionWriter, LsaSnapshot,
+    MemoryRegionReader, OpaRegionReader, OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry,
+    RemoteRouteEntry, RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, VpnAssignment,
+    ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
+    HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
 };
 use fluxbee_sdk::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
@@ -67,10 +67,12 @@ pub struct Router {
     config_version: Arc<Mutex<u64>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
+    memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_state: Arc<Mutex<std::collections::HashMap<String, RemoteHiveState>>>,
     lsa_seq: Arc<Mutex<u64>>,
+    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     nats_publisher: Option<Arc<NatsPublisher>>,
     nats_publish_errors: Arc<AtomicU64>,
 }
@@ -114,6 +116,10 @@ impl Router {
             None
         };
         let opa = Arc::new(Mutex::new(OpaResolver::new()));
+        let memory_reader = match memory_shm_name_for_hive(&cfg.hive_id) {
+            Ok(name) => MemoryRegionReader::open_read_only(&name).ok(),
+            Err(_) => None,
+        };
         let nats_publisher = Some(Arc::new(NatsPublisher::new(
             cfg.nats_url.clone(),
             SUBJECT_STORAGE_TURNS.to_string(),
@@ -135,10 +141,12 @@ impl Router {
             config_version: Arc::new(Mutex::new(0)),
             opa,
             opa_reader: Arc::new(Mutex::new(None)),
+            memory_reader: Arc::new(Mutex::new(memory_reader)),
             broadcast_cache: Arc::new(Mutex::new(BroadcastCache::new())),
             wan_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lsa_state: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lsa_seq: Arc::new(Mutex::new(0)),
+            thread_sequences: Arc::new(Mutex::new(HashMap::new())),
             nats_publisher,
             nats_publish_errors: Arc::new(AtomicU64::new(0)),
         }
@@ -213,6 +221,8 @@ impl Router {
         let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
         let is_gateway = self.cfg.is_gateway;
         let peer_socket_dir = self.cfg.node_socket_dir.clone();
+        let thread_sequences_pd = Arc::clone(&self.thread_sequences);
+        let memory_reader_pd = Arc::clone(&self.memory_reader);
         tokio::spawn(async move {
             peer_discovery_loop(
                 router_uuid,
@@ -234,8 +244,10 @@ impl Router {
                 shm_pd,
                 opa_pd,
                 opa_reader_pd,
+                memory_reader_pd,
                 lsa_snapshot_pd,
                 fib_pd,
+                thread_sequences_pd,
                 is_gateway,
             )
             .await;
@@ -274,10 +286,12 @@ impl Router {
         let shm = Arc::clone(&self.shm);
         let opa = Arc::clone(&self.opa);
         let opa_reader = Arc::clone(&self.opa_reader);
+        let memory_reader = Arc::clone(&self.memory_reader);
         let hive_id = self.cfg.hive_id.clone();
         let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
         let wan_peers = Arc::clone(&self.wan_peers);
         let lsa_snapshot = Arc::clone(&self.lsa_snapshot);
+        let thread_sequences = Arc::clone(&self.thread_sequences);
         let is_gateway = self.cfg.is_gateway;
         let router_uuid = self.cfg.router_uuid;
         tokio::spawn(async move {
@@ -301,11 +315,13 @@ impl Router {
                 let shm = Arc::clone(&shm);
                 let opa = Arc::clone(&opa);
                 let opa_reader = Arc::clone(&opa_reader);
+                let memory_reader = Arc::clone(&memory_reader);
                 let hive_id = hive_id.clone();
                 let identity_frontdesk_node_name = identity_frontdesk_node_name.clone();
                 let wan_peers = Arc::clone(&wan_peers);
                 let lsa_reader = Arc::clone(&lsa_reader);
                 let lsa_snapshot = Arc::clone(&lsa_snapshot);
+                let thread_sequences = Arc::clone(&thread_sequences);
                 let is_gateway = is_gateway;
                 tokio::spawn(async move {
                     if let Err(err) = handle_peer_incoming(
@@ -324,10 +340,12 @@ impl Router {
                         shm,
                         opa,
                         opa_reader,
+                        memory_reader,
                         hive_id,
                         identity_frontdesk_node_name,
                         wan_peers,
                         lsa_snapshot,
+                        thread_sequences,
                         is_gateway,
                     )
                     .await
@@ -360,6 +378,8 @@ impl Router {
                 fib: Arc::clone(&self.fib),
                 broadcast_cache: Arc::clone(&self.broadcast_cache),
                 lsa_seq: Arc::clone(&self.lsa_seq),
+                thread_sequences: Arc::clone(&self.thread_sequences),
+                memory_reader: Arc::clone(&self.memory_reader),
                 opa: Arc::clone(&self.opa),
                 wan_session_epochs: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 lsa_reject_counters: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -409,6 +429,8 @@ impl Router {
             let opa_reader = Arc::clone(&self.opa_reader);
             let broadcast_cache = Arc::clone(&self.broadcast_cache);
             let lsa_seq = Arc::clone(&self.lsa_seq);
+            let thread_sequences = Arc::clone(&self.thread_sequences);
+            let memory_reader = Arc::clone(&self.memory_reader);
             let nats_publisher = self.nats_publisher.clone();
             let nats_publish_errors = Arc::clone(&self.nats_publish_errors);
             let is_gateway = self.cfg.is_gateway;
@@ -433,6 +455,8 @@ impl Router {
                     opa_reader,
                     broadcast_cache,
                     lsa_seq,
+                    memory_reader,
+                    thread_sequences,
                     nats_publisher,
                     nats_publish_errors,
                     router_uuid,
@@ -469,6 +493,8 @@ async fn handle_node(
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
+    memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
+    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     nats_publisher: Option<Arc<NatsPublisher>>,
     nats_publish_errors: Arc<AtomicU64>,
     router_uuid: Uuid,
@@ -608,7 +634,8 @@ async fn handle_node(
     loop {
         match read_frame(&mut reader).await? {
             Some(frame) => {
-                if let Ok(msg) = serde_json::from_slice::<Message>(&frame) {
+                if let Ok(mut msg) = serde_json::from_slice::<Message>(&frame) {
+                    assign_thread_seq_if_missing(&mut msg, &thread_sequences).await;
                     tracing::info!(
                         src = %msg.routing.src,
                         dst = ?msg.routing.dst,
@@ -761,6 +788,8 @@ async fn handle_node(
                         &wan_peers,
                         &opa,
                         &broadcast_cache,
+                        &memory_reader,
+                        &thread_sequences,
                         &hive_id,
                         identity_frontdesk_node_name,
                         router_uuid,
@@ -815,6 +844,8 @@ async fn handle_message(
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     opa: &Arc<Mutex<OpaResolver>>,
     broadcast_cache: &Arc<Mutex<BroadcastCache>>,
+    memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
+    thread_sequences: &Arc<Mutex<HashMap<String, u64>>>,
     hive_id: &str,
     identity_frontdesk_node_name: &str,
     router_uuid: Uuid,
@@ -822,6 +853,8 @@ async fn handle_message(
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
     _snapshot: Option<&ConfigSnapshot>,
 ) -> Result<(), RouterError> {
+    let mut msg = msg.clone();
+    assign_thread_seq_if_missing(&mut msg, thread_sequences).await;
     let src_uuid = match Uuid::parse_str(&msg.routing.src) {
         Ok(uuid) => uuid,
         Err(_) => return Ok(()),
@@ -836,7 +869,7 @@ async fn handle_message(
     };
 
     if msg.routing.ttl == 0 {
-        send_ttl_exceeded_to(msg, &src_handle.sender, router_uuid)?;
+        send_ttl_exceeded_to(&msg, &src_handle.sender, router_uuid)?;
         return Ok(());
     }
 
@@ -857,7 +890,7 @@ async fn handle_message(
                     ) {
                         senders.push(dst_handle.sender);
                     } else {
-                        send_unreachable_to(msg, &src_handle.sender, router_uuid, "VPN_BLOCKED")?;
+                        send_unreachable_to(&msg, &src_handle.sender, router_uuid, "VPN_BLOCKED")?;
                     }
                 } else {
                     let peer = {
@@ -873,21 +906,21 @@ async fn handle_message(
                             peer_node.vpn_id,
                         ) {
                             if msg.routing.ttl <= 1 {
-                                send_ttl_exceeded_to(msg, &src_handle.sender, router_uuid)?;
+                                send_ttl_exceeded_to(&msg, &src_handle.sender, router_uuid)?;
                                 return Ok(());
                             }
-                            if send_to_peer_router(peers, peer_node.router_uuid, msg).await? {
+                            if send_to_peer_router(peers, peer_node.router_uuid, &msg).await? {
                                 return Ok(());
                             }
                             send_unreachable_to(
-                                msg,
+                                &msg,
                                 &src_handle.sender,
                                 router_uuid,
                                 "PEER_UNAVAILABLE",
                             )?;
                         } else {
                             send_unreachable_to(
-                                msg,
+                                &msg,
                                 &src_handle.sender,
                                 router_uuid,
                                 "VPN_BLOCKED",
@@ -908,7 +941,7 @@ async fn handle_message(
                             ) {
                                 forward_to_hive(
                                     &remote.hive_id,
-                                    msg,
+                                    &msg,
                                     is_gateway,
                                     peer_routers,
                                     peers,
@@ -919,7 +952,7 @@ async fn handle_message(
                                 .await?;
                             } else {
                                 send_unreachable_to(
-                                    msg,
+                                    &msg,
                                     &src_handle.sender,
                                     router_uuid,
                                     "VPN_BLOCKED",
@@ -927,7 +960,7 @@ async fn handle_message(
                             }
                         } else {
                             send_unreachable_to(
-                                msg,
+                                &msg,
                                 &src_handle.sender,
                                 router_uuid,
                                 "NODE_NOT_FOUND",
@@ -941,7 +974,7 @@ async fn handle_message(
                 match route {
                     ResolvedRoute::Drop => {}
                     ResolvedRoute::Unreachable(reason) => {
-                        send_unreachable_to(msg, &src_handle.sender, router_uuid, reason)?;
+                        send_unreachable_to(&msg, &src_handle.sender, router_uuid, reason)?;
                     }
                     ResolvedRoute::Deliver(dst_uuid) => {
                         if let Some(dst_handle) = nodes_guard.get(&dst_uuid) {
@@ -955,7 +988,7 @@ async fn handle_message(
                                 senders.push(dst_handle.sender.clone());
                             } else {
                                 send_unreachable_to(
-                                    msg,
+                                    &msg,
                                     &src_handle.sender,
                                     router_uuid,
                                     "VPN_BLOCKED",
@@ -963,7 +996,7 @@ async fn handle_message(
                             }
                         } else {
                             send_unreachable_to(
-                                msg,
+                                &msg,
                                 &src_handle.sender,
                                 router_uuid,
                                 "NODE_NOT_FOUND",
@@ -972,14 +1005,14 @@ async fn handle_message(
                     }
                     ResolvedRoute::ForwardRouter(peer_uuid) => {
                         if msg.routing.ttl <= 1 {
-                            send_ttl_exceeded_to(msg, &src_handle.sender, router_uuid)?;
+                            send_ttl_exceeded_to(&msg, &src_handle.sender, router_uuid)?;
                             return Ok(());
                         }
-                        if send_to_peer_router(peers, peer_uuid, msg).await? {
+                        if send_to_peer_router(peers, peer_uuid, &msg).await? {
                             return Ok(());
                         }
                         send_unreachable_to(
-                            msg,
+                            &msg,
                             &src_handle.sender,
                             router_uuid,
                             "PEER_UNAVAILABLE",
@@ -988,7 +1021,7 @@ async fn handle_message(
                     ResolvedRoute::ForwardHive(hive_id) => {
                         forward_to_hive(
                             &hive_id,
-                            msg,
+                            &msg,
                             is_gateway,
                             peer_routers,
                             peers,
@@ -1036,11 +1069,11 @@ async fn handle_message(
                 senders.push(handle.sender.clone());
             }
             if msg.routing.ttl >= 2 {
-                broadcast_to_peers(peers, msg).await?;
+                broadcast_to_peers(peers, &msg).await?;
             }
             if msg.routing.ttl >= 3 {
                 forward_broadcast_to_wan(
-                    msg,
+                    &msg,
                     is_gateway,
                     peer_routers,
                     peers,
@@ -1052,19 +1085,23 @@ async fn handle_message(
             }
         }
         Destination::Resolve => {
-            let resolved_target =
-                match resolve_target_with_identity(opa, hive_id, identity_frontdesk_node_name, msg)
-                    .await
-                {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!("opa resolve failed: {err}");
-                        send_unreachable_to(msg, &src_handle.sender, router_uuid, "OPA_ERROR")?;
-                        return Ok(());
-                    }
-                };
+            let resolved_target = match resolve_target_with_identity(
+                opa,
+                hive_id,
+                identity_frontdesk_node_name,
+                &msg,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!("opa resolve failed: {err}");
+                    send_unreachable_to(&msg, &src_handle.sender, router_uuid, "OPA_ERROR")?;
+                    return Ok(());
+                }
+            };
             let Some(target) = resolved_target.as_deref() else {
-                send_unreachable_to(msg, &src_handle.sender, router_uuid, "OPA_NO_TARGET")?;
+                send_unreachable_to(&msg, &src_handle.sender, router_uuid, "OPA_NO_TARGET")?;
                 return Ok(());
             };
             let nodes_guard = nodes.lock().await;
@@ -1072,7 +1109,7 @@ async fn handle_message(
             match route {
                 ResolvedRoute::Drop => {}
                 ResolvedRoute::Unreachable(reason) => {
-                    send_unreachable_to(msg, &src_handle.sender, router_uuid, reason)?;
+                    send_unreachable_to(&msg, &src_handle.sender, router_uuid, reason)?;
                 }
                 ResolvedRoute::Deliver(dst_uuid) => {
                     if let Some(dst_handle) = nodes_guard.get(&dst_uuid) {
@@ -1086,7 +1123,7 @@ async fn handle_message(
                             senders.push(dst_handle.sender.clone());
                         } else {
                             send_unreachable_to(
-                                msg,
+                                &msg,
                                 &src_handle.sender,
                                 router_uuid,
                                 "VPN_BLOCKED",
@@ -1094,7 +1131,7 @@ async fn handle_message(
                         }
                     } else {
                         send_unreachable_to(
-                            msg,
+                            &msg,
                             &src_handle.sender,
                             router_uuid,
                             "NODE_NOT_FOUND",
@@ -1103,18 +1140,18 @@ async fn handle_message(
                 }
                 ResolvedRoute::ForwardRouter(peer_uuid) => {
                     if msg.routing.ttl <= 1 {
-                        send_ttl_exceeded_to(msg, &src_handle.sender, router_uuid)?;
+                        send_ttl_exceeded_to(&msg, &src_handle.sender, router_uuid)?;
                         return Ok(());
                     }
-                    if send_to_peer_router(peers, peer_uuid, msg).await? {
+                    if send_to_peer_router(peers, peer_uuid, &msg).await? {
                         return Ok(());
                     }
-                    send_unreachable_to(msg, &src_handle.sender, router_uuid, "PEER_UNAVAILABLE")?;
+                    send_unreachable_to(&msg, &src_handle.sender, router_uuid, "PEER_UNAVAILABLE")?;
                 }
                 ResolvedRoute::ForwardHive(hive_id) => {
                     forward_to_hive(
                         &hive_id,
-                        msg,
+                        &msg,
                         is_gateway,
                         peer_routers,
                         peers,
@@ -1129,12 +1166,53 @@ async fn handle_message(
     }
 
     if !senders.is_empty() {
-        let data = serde_json::to_vec(msg)?;
+        let data = serialize_for_local_delivery(memory_reader, hive_id, &msg).await?;
         for sender in senders {
             let _ = sender.send(data.clone());
         }
     }
     Ok(())
+}
+
+async fn assign_thread_seq_if_missing(
+    msg: &mut Message,
+    thread_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+) {
+    let Some(thread_id) = canonical_thread_id_from_meta(&msg.meta) else {
+        return;
+    };
+
+    if msg.meta.thread_id.is_none() {
+        msg.meta.thread_id = Some(thread_id.clone());
+    }
+    if msg.meta.thread_seq.is_some() {
+        return;
+    }
+
+    let next_seq = {
+        let mut guard = thread_sequences.lock().await;
+        let entry = guard.entry(thread_id).or_insert(0);
+        *entry = entry.saturating_add(1);
+        *entry
+    };
+    msg.meta.thread_seq = Some(next_seq);
+}
+
+fn canonical_thread_id_from_meta(meta: &Meta) -> Option<String> {
+    meta.thread_id
+        .as_deref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            meta.context
+                .as_ref()
+                .and_then(|ctx| ctx.get("thread_id"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
 }
 
 fn send_unreachable_to(
@@ -2065,6 +2143,8 @@ async fn handle_wan_message(
     peer_router_name: &str,
     session_epoch: u64,
 ) -> Result<(), RouterError> {
+    let mut msg = msg.clone();
+    assign_thread_seq_if_missing(&mut msg, &ctx.thread_sequences).await;
     if msg.meta.msg_type == SYSTEM_KIND {
         if msg.meta.msg.as_deref() == Some(MSG_LSA) {
             let payload: LsaPayload = match serde_json::from_value(msg.payload.clone()) {
@@ -2125,7 +2205,7 @@ async fn handle_wan_message(
                             nodes_guard.get(&dst_uuid).cloned()
                         };
                         if let Some(dst_handle) = dst_handle {
-                            let data = serde_json::to_vec(msg)?;
+                            let data = serde_json::to_vec(&msg)?;
                             let _ = dst_handle.sender.send(data);
                         }
                     }
@@ -2148,7 +2228,7 @@ async fn handle_wan_message(
     };
 
     if msg.routing.ttl == 0 {
-        send_ttl_exceeded_to(msg, sender, ctx.router_uuid)?;
+        send_ttl_exceeded_to(&msg, sender, ctx.router_uuid)?;
         return Ok(());
     }
 
@@ -2170,7 +2250,7 @@ async fn handle_wan_message(
                     ) {
                         senders.push(dst_handle.sender);
                     } else {
-                        send_unreachable_to(msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
+                        send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                     }
                 } else {
                     let peer = {
@@ -2186,15 +2266,15 @@ async fn handle_wan_message(
                             peer_node.vpn_id,
                         ) {
                             if msg.routing.ttl <= 1 {
-                                send_ttl_exceeded_to(msg, sender, ctx.router_uuid)?;
+                                send_ttl_exceeded_to(&msg, sender, ctx.router_uuid)?;
                                 return Ok(());
                             }
-                            if send_to_peer_router(&ctx.peers, peer_node.router_uuid, msg).await? {
+                            if send_to_peer_router(&ctx.peers, peer_node.router_uuid, &msg).await? {
                                 return Ok(());
                             }
-                            send_unreachable_to(msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
+                            send_unreachable_to(&msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
                         } else {
-                            send_unreachable_to(msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
+                            send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                         }
                     } else {
                         let remote = {
@@ -2211,7 +2291,7 @@ async fn handle_wan_message(
                             ) {
                                 forward_to_hive(
                                     &remote.hive_id,
-                                    msg,
+                                    &msg,
                                     true,
                                     &ctx.peer_routers,
                                     &ctx.peers,
@@ -2221,10 +2301,10 @@ async fn handle_wan_message(
                                 )
                                 .await?;
                             } else {
-                                send_unreachable_to(msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
+                                send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                             }
                         } else {
-                            send_unreachable_to(msg, sender, ctx.router_uuid, "NODE_NOT_FOUND")?;
+                            send_unreachable_to(&msg, sender, ctx.router_uuid, "NODE_NOT_FOUND")?;
                         }
                     }
                 }
@@ -2246,7 +2326,7 @@ async fn handle_wan_message(
                 match route {
                     ResolvedRoute::Drop => {}
                     ResolvedRoute::Unreachable(reason) => {
-                        send_unreachable_to(msg, sender, ctx.router_uuid, reason)?;
+                        send_unreachable_to(&msg, sender, ctx.router_uuid, reason)?;
                     }
                     ResolvedRoute::Deliver(dst_uuid) => {
                         if let Some(dst_handle) = nodes_guard.get(&dst_uuid) {
@@ -2259,26 +2339,26 @@ async fn handle_wan_message(
                             ) {
                                 senders.push(dst_handle.sender.clone());
                             } else {
-                                send_unreachable_to(msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
+                                send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                             }
                         } else {
-                            send_unreachable_to(msg, sender, ctx.router_uuid, "NODE_NOT_FOUND")?;
+                            send_unreachable_to(&msg, sender, ctx.router_uuid, "NODE_NOT_FOUND")?;
                         }
                     }
                     ResolvedRoute::ForwardRouter(peer_uuid) => {
                         if msg.routing.ttl <= 1 {
-                            send_ttl_exceeded_to(msg, sender, ctx.router_uuid)?;
+                            send_ttl_exceeded_to(&msg, sender, ctx.router_uuid)?;
                             return Ok(());
                         }
-                        if send_to_peer_router(&ctx.peers, peer_uuid, msg).await? {
+                        if send_to_peer_router(&ctx.peers, peer_uuid, &msg).await? {
                             return Ok(());
                         }
-                        send_unreachable_to(msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
+                        send_unreachable_to(&msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
                     }
                     ResolvedRoute::ForwardHive(hive_id) => {
                         forward_to_hive(
                             &hive_id,
-                            msg,
+                            &msg,
                             true,
                             &ctx.peer_routers,
                             &ctx.peers,
@@ -2325,10 +2405,10 @@ async fn handle_wan_message(
                 senders.push(handle.sender.clone());
             }
             if msg.routing.ttl >= 2 {
-                broadcast_to_peers(&ctx.peers, msg).await?;
+                broadcast_to_peers(&ctx.peers, &msg).await?;
             }
             if msg.routing.ttl >= 3 {
-                broadcast_to_wan(&ctx.wan_peers, msg).await?;
+                broadcast_to_wan(&ctx.wan_peers, &msg).await?;
             }
         }
         Destination::Resolve => {
@@ -2336,19 +2416,19 @@ async fn handle_wan_message(
                 &ctx.opa,
                 &ctx.hive_id,
                 &ctx.identity_frontdesk_node_name,
-                msg,
+                &msg,
             )
             .await
             {
                 Ok(value) => value,
                 Err(err) => {
                     tracing::warn!("opa resolve failed: {err}");
-                    send_unreachable_to(msg, sender, ctx.router_uuid, "OPA_ERROR")?;
+                    send_unreachable_to(&msg, sender, ctx.router_uuid, "OPA_ERROR")?;
                     return Ok(());
                 }
             };
             let Some(target) = resolved_target.as_deref() else {
-                send_unreachable_to(msg, sender, ctx.router_uuid, "OPA_NO_TARGET")?;
+                send_unreachable_to(&msg, sender, ctx.router_uuid, "OPA_NO_TARGET")?;
                 return Ok(());
             };
             let nodes_guard = ctx.nodes.lock().await;
@@ -2368,7 +2448,7 @@ async fn handle_wan_message(
             match route {
                 ResolvedRoute::Drop => {}
                 ResolvedRoute::Unreachable(reason) => {
-                    send_unreachable_to(msg, sender, ctx.router_uuid, reason)?;
+                    send_unreachable_to(&msg, sender, ctx.router_uuid, reason)?;
                 }
                 ResolvedRoute::Deliver(dst_uuid) => {
                     if let Some(dst_handle) = nodes_guard.get(&dst_uuid) {
@@ -2381,26 +2461,26 @@ async fn handle_wan_message(
                         ) {
                             senders.push(dst_handle.sender.clone());
                         } else {
-                            send_unreachable_to(msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
+                            send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                         }
                     } else {
-                        send_unreachable_to(msg, sender, ctx.router_uuid, "NODE_NOT_FOUND")?;
+                        send_unreachable_to(&msg, sender, ctx.router_uuid, "NODE_NOT_FOUND")?;
                     }
                 }
                 ResolvedRoute::ForwardRouter(peer_uuid) => {
                     if msg.routing.ttl <= 1 {
-                        send_ttl_exceeded_to(msg, sender, ctx.router_uuid)?;
+                        send_ttl_exceeded_to(&msg, sender, ctx.router_uuid)?;
                         return Ok(());
                     }
-                    if send_to_peer_router(&ctx.peers, peer_uuid, msg).await? {
+                    if send_to_peer_router(&ctx.peers, peer_uuid, &msg).await? {
                         return Ok(());
                     }
-                    send_unreachable_to(msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
+                    send_unreachable_to(&msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
                 }
                 ResolvedRoute::ForwardHive(hive_id) => {
                     forward_to_hive(
                         &hive_id,
-                        msg,
+                        &msg,
                         true,
                         &ctx.peer_routers,
                         &ctx.peers,
@@ -2415,7 +2495,7 @@ async fn handle_wan_message(
     }
 
     if !senders.is_empty() {
-        let data = serde_json::to_vec(msg)?;
+        let data = serialize_for_local_delivery(&ctx.memory_reader, &ctx.hive_id, &msg).await?;
         for sender in senders {
             let _ = sender.send(data.clone());
         }
@@ -2448,8 +2528,10 @@ async fn peer_discovery_loop(
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
+    memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
+    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     is_gateway: bool,
 ) {
     let mut ticker = time::interval(Duration::from_secs(5));
@@ -2502,11 +2584,13 @@ async fn peer_discovery_loop(
                     let shm = Arc::clone(&shm);
                     let opa = Arc::clone(&opa);
                     let opa_reader = Arc::clone(&opa_reader);
+                    let memory_reader = Arc::clone(&memory_reader);
                     let hive_id = hive_id.to_string();
                     let self_router_name = self_router_name.to_string();
                     let self_shm_name = self_shm_name.to_string();
                     let vpn_rules = Arc::clone(&vpn_rules);
                     let lsa_snapshot = Arc::clone(&lsa_snapshot);
+                    let thread_sequences = Arc::clone(&thread_sequences);
                     let is_gateway = is_gateway;
                     let socket_dir = socket_dir.clone();
                     let identity_frontdesk_node_name = identity_frontdesk_node_name.to_string();
@@ -2530,10 +2614,12 @@ async fn peer_discovery_loop(
                             shm,
                             opa,
                             opa_reader,
+                            memory_reader,
                             &hive_id,
                             &identity_frontdesk_node_name,
                             lsa_snapshot,
                             fib,
+                            thread_sequences,
                             is_gateway,
                         )
                         .await;
@@ -2630,10 +2716,12 @@ async fn connect_to_peer(
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
+    memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: &str,
     identity_frontdesk_node_name: &str,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
+    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
     let socket_path = peer_socket_path(socket_dir, peer_uuid);
@@ -2688,12 +2776,14 @@ async fn connect_to_peer(
                         &shm,
                         &opa,
                         &opa_reader,
+                        &memory_reader,
                         hive_id,
                         identity_frontdesk_node_name,
                         &fib,
                         self_uuid,
                         is_gateway,
                         &lsa_snapshot,
+                        &thread_sequences,
                     )
                     .await?;
                 }
@@ -2725,10 +2815,12 @@ async fn handle_peer_incoming(
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
+    memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: String,
     identity_frontdesk_node_name: String,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
+    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
     let (mut reader, mut writer) = stream.into_split();
@@ -2781,12 +2873,14 @@ async fn handle_peer_incoming(
                         &shm,
                         &opa,
                         &opa_reader,
+                        &memory_reader,
                         &hive_id,
                         &identity_frontdesk_node_name,
                         &fib,
                         router_uuid,
                         is_gateway,
                         &lsa_snapshot,
+                        &thread_sequences,
                     )
                     .await?;
                 }
@@ -2818,13 +2912,17 @@ async fn handle_peer_message(
     shm: &Arc<Mutex<RouterRegionWriter>>,
     opa: &Arc<Mutex<OpaResolver>>,
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
+    memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: &str,
     identity_frontdesk_node_name: &str,
     fib: &Arc<Mutex<Vec<FibEntry>>>,
     router_uuid: Uuid,
     is_gateway: bool,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
+    thread_sequences: &Arc<Mutex<HashMap<String, u64>>>,
 ) -> Result<(), RouterError> {
+    let mut msg = msg.clone();
+    assign_thread_seq_if_missing(&mut msg, thread_sequences).await;
     let src_uuid = match Uuid::parse_str(&msg.routing.src) {
         Ok(uuid) => uuid,
         Err(_) => return Ok(()),
@@ -2868,7 +2966,7 @@ async fn handle_peer_message(
                                 nodes_guard.get(&dst_uuid).cloned()
                             };
                             if let Some(dst_handle) = dst_handle {
-                                let data = serde_json::to_vec(msg)?;
+                                let data = serde_json::to_vec(&msg)?;
                                 let _ = dst_handle.sender.send(data);
                             }
                         }
@@ -2891,7 +2989,7 @@ async fn handle_peer_message(
     let mut senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = Vec::new();
     if msg.routing.ttl == 0 {
         if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-            send_ttl_exceeded_to(msg, &peer.sender, router_uuid)?;
+            send_ttl_exceeded_to(&msg, &peer.sender, router_uuid)?;
         }
         return Ok(());
     }
@@ -2913,7 +3011,7 @@ async fn handle_peer_message(
                     ) {
                         senders.push(dst_handle.sender);
                     } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
+                        send_unreachable_to(&msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
                     }
                 } else {
                     let remote = {
@@ -2931,7 +3029,7 @@ async fn handle_peer_message(
                             if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                                 forward_to_hive(
                                     &remote.hive_id,
-                                    msg,
+                                    &msg,
                                     is_gateway,
                                     peer_routers,
                                     peers,
@@ -2942,10 +3040,10 @@ async fn handle_peer_message(
                                 .await?;
                             }
                         } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            send_unreachable_to(msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
+                            send_unreachable_to(&msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
                         }
                     } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
+                        send_unreachable_to(&msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
                     }
                 }
             } else {
@@ -2967,7 +3065,7 @@ async fn handle_peer_message(
                     ResolvedRoute::Drop => {}
                     ResolvedRoute::Unreachable(reason) => {
                         if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            send_unreachable_to(msg, &peer.sender, router_uuid, reason)?;
+                            send_unreachable_to(&msg, &peer.sender, router_uuid, reason)?;
                         }
                     }
                     ResolvedRoute::Deliver(dst_uuid) => {
@@ -2981,25 +3079,30 @@ async fn handle_peer_message(
                             ) {
                                 senders.push(dst_handle.sender.clone());
                             } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                                send_unreachable_to(msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
+                                send_unreachable_to(
+                                    &msg,
+                                    &peer.sender,
+                                    router_uuid,
+                                    "VPN_BLOCKED",
+                                )?;
                             }
                         } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            send_unreachable_to(msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
+                            send_unreachable_to(&msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
                         }
                     }
                     ResolvedRoute::ForwardRouter(peer_uuid) => {
                         if let Some(peer) = peers.lock().await.get(&peer_uuid).cloned() {
                             if msg.routing.ttl <= 1 {
-                                send_ttl_exceeded_to(msg, &peer.sender, router_uuid)?;
+                                send_ttl_exceeded_to(&msg, &peer.sender, router_uuid)?;
                                 return Ok(());
                             }
                         }
-                        if send_to_peer_router(peers, peer_uuid, msg).await? {
+                        if send_to_peer_router(peers, peer_uuid, &msg).await? {
                             return Ok(());
                         }
                         if let Some(peer) = peers.lock().await.get(&peer_uuid).cloned() {
                             send_unreachable_to(
-                                msg,
+                                &msg,
                                 &peer.sender,
                                 router_uuid,
                                 "PEER_UNAVAILABLE",
@@ -3010,7 +3113,7 @@ async fn handle_peer_message(
                         if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                             forward_to_hive(
                                 &hive_id,
-                                msg,
+                                &msg,
                                 is_gateway,
                                 peer_routers,
                                 peers,
@@ -3050,7 +3153,7 @@ async fn handle_peer_message(
             if msg.routing.ttl >= 3 {
                 if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                     forward_broadcast_to_wan(
-                        msg,
+                        &msg,
                         is_gateway,
                         peer_routers,
                         peers,
@@ -3063,22 +3166,26 @@ async fn handle_peer_message(
             }
         }
         Destination::Resolve => {
-            let resolved_target =
-                match resolve_target_with_identity(opa, hive_id, identity_frontdesk_node_name, msg)
-                    .await
-                {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!("opa resolve failed: {err}");
-                        if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            send_unreachable_to(msg, &peer.sender, router_uuid, "OPA_ERROR")?;
-                        }
-                        return Ok(());
+            let resolved_target = match resolve_target_with_identity(
+                opa,
+                hive_id,
+                identity_frontdesk_node_name,
+                &msg,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!("opa resolve failed: {err}");
+                    if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
+                        send_unreachable_to(&msg, &peer.sender, router_uuid, "OPA_ERROR")?;
                     }
-                };
+                    return Ok(());
+                }
+            };
             let Some(target) = resolved_target.as_deref() else {
                 if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                    send_unreachable_to(msg, &peer.sender, router_uuid, "OPA_NO_TARGET")?;
+                    send_unreachable_to(&msg, &peer.sender, router_uuid, "OPA_NO_TARGET")?;
                 }
                 return Ok(());
             };
@@ -3100,7 +3207,7 @@ async fn handle_peer_message(
                 ResolvedRoute::Drop => {}
                 ResolvedRoute::Unreachable(reason) => {
                     if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(msg, &peer.sender, router_uuid, reason)?;
+                        send_unreachable_to(&msg, &peer.sender, router_uuid, reason)?;
                     }
                 }
                 ResolvedRoute::Deliver(dst_uuid) => {
@@ -3114,31 +3221,31 @@ async fn handle_peer_message(
                         ) {
                             senders.push(dst_handle.sender.clone());
                         } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            send_unreachable_to(msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
+                            send_unreachable_to(&msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
                         }
                     } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
+                        send_unreachable_to(&msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
                     }
                 }
                 ResolvedRoute::ForwardRouter(peer_uuid) => {
                     if let Some(peer) = peers.lock().await.get(&peer_uuid).cloned() {
                         if msg.routing.ttl <= 1 {
-                            send_ttl_exceeded_to(msg, &peer.sender, router_uuid)?;
+                            send_ttl_exceeded_to(&msg, &peer.sender, router_uuid)?;
                             return Ok(());
                         }
                     }
-                    if send_to_peer_router(peers, peer_uuid, msg).await? {
+                    if send_to_peer_router(peers, peer_uuid, &msg).await? {
                         return Ok(());
                     }
                     if let Some(peer) = peers.lock().await.get(&peer_uuid).cloned() {
-                        send_unreachable_to(msg, &peer.sender, router_uuid, "PEER_UNAVAILABLE")?;
+                        send_unreachable_to(&msg, &peer.sender, router_uuid, "PEER_UNAVAILABLE")?;
                     }
                 }
                 ResolvedRoute::ForwardHive(hive_id) => {
                     if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                         forward_to_hive(
                             &hive_id,
-                            msg,
+                            &msg,
                             is_gateway,
                             peer_routers,
                             peers,
@@ -3154,7 +3261,7 @@ async fn handle_peer_message(
     }
 
     if !senders.is_empty() {
-        let data = serde_json::to_vec(msg)?;
+        let data = serialize_for_local_delivery(memory_reader, hive_id, &msg).await?;
         for sender in senders {
             let _ = sender.send(data.clone());
         }
@@ -3309,6 +3416,8 @@ struct WanContext {
     fib: Arc<Mutex<Vec<FibEntry>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
+    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
+    memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     opa: Arc<Mutex<OpaResolver>>,
     wan_session_epochs: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     lsa_reject_counters: Arc<Mutex<std::collections::HashMap<String, u64>>>,
@@ -4707,6 +4816,66 @@ fn should_publish_turn(msg: &Message) -> bool {
     true
 }
 
+fn should_enrich_with_memory_package(msg: &Message) -> bool {
+    if msg.meta.msg_type == SYSTEM_KIND {
+        return false;
+    }
+    if msg.meta.msg_type == "admin" || msg.meta.msg_type == "query_response" {
+        return false;
+    }
+    true
+}
+
+async fn serialize_for_local_delivery(
+    memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
+    hive_id: &str,
+    msg: &Message,
+) -> Result<Vec<u8>, RouterError> {
+    let mut enriched = msg.clone();
+    maybe_attach_memory_package(memory_reader, hive_id, &mut enriched).await;
+    Ok(serde_json::to_vec(&enriched)?)
+}
+
+async fn maybe_attach_memory_package(
+    memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
+    hive_id: &str,
+    msg: &mut Message,
+) {
+    if !should_enrich_with_memory_package(msg) || msg.meta.memory_package.is_some() {
+        return;
+    }
+    let Some(thread_id) = canonical_thread_id_from_meta(&msg.meta) else {
+        return;
+    };
+    let shm_name = match memory_shm_name_for_hive(hive_id) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let snapshot = {
+        let mut guard = memory_reader.lock().await;
+        if guard.is_none() {
+            *guard = MemoryRegionReader::open_read_only(&shm_name).ok();
+        }
+        match guard
+            .as_ref()
+            .and_then(|reader| reader.read_snapshot().ok())
+        {
+            Some(snapshot) => snapshot,
+            None => return,
+        }
+    };
+    if let Some(entry) = snapshot
+        .threads
+        .iter()
+        .find(|entry| entry.thread_id == thread_id)
+    {
+        msg.meta.memory_package = Some(entry.package.clone());
+        if msg.meta.thread_id.is_none() {
+            msg.meta.thread_id = Some(thread_id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5030,6 +5199,7 @@ mod tests {
             action: None,
             priority: None,
             context: None,
+            ..Meta::default()
         };
         assert!(get_src_ilk_from_meta(&meta).is_none());
         set_src_ilk_in_meta(&mut meta, "ilk:11111111-1111-1111-1111-111111111111");
@@ -5041,6 +5211,89 @@ mod tests {
             get_src_ilk_from_meta(&meta).as_deref(),
             Some("ilk:11111111-1111-1111-1111-111111111111")
         );
+    }
+
+    #[test]
+    fn canonical_thread_id_from_meta_prefers_canonical_and_falls_back_to_legacy_context() {
+        let canonical = canonical_thread_id_from_meta(&Meta {
+            msg_type: "user".to_string(),
+            thread_id: Some("thread:canonical".to_string()),
+            context: Some(serde_json::json!({ "thread_id": "thread:legacy" })),
+            ..Meta::default()
+        });
+        assert_eq!(canonical.as_deref(), Some("thread:canonical"));
+
+        let legacy = canonical_thread_id_from_meta(&Meta {
+            msg_type: "user".to_string(),
+            context: Some(serde_json::json!({ "thread_id": "thread:legacy" })),
+            ..Meta::default()
+        });
+        assert_eq!(legacy.as_deref(), Some("thread:legacy"));
+    }
+
+    #[tokio::test]
+    async fn assign_thread_seq_backfills_canonical_thread_and_monotonic_sequence() {
+        let sequences = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
+
+        let mut first = Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                dst: Destination::Resolve,
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                context: Some(serde_json::json!({ "thread_id": "thread:legacy" })),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        assign_thread_seq_if_missing(&mut first, &sequences).await;
+        assert_eq!(first.meta.thread_id.as_deref(), Some("thread:legacy"));
+        assert_eq!(first.meta.thread_seq, Some(1));
+
+        let mut second = Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                dst: Destination::Resolve,
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                thread_id: Some("thread:legacy".to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        assign_thread_seq_if_missing(&mut second, &sequences).await;
+        assert_eq!(second.meta.thread_seq, Some(2));
+    }
+
+    #[tokio::test]
+    async fn assign_thread_seq_preserves_existing_sequence() {
+        let sequences = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
+        let mut msg = Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                dst: Destination::Resolve,
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                thread_id: Some("thread:existing".to_string()),
+                thread_seq: Some(41),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+
+        assign_thread_seq_if_missing(&mut msg, &sequences).await;
+
+        assert_eq!(msg.meta.thread_seq, Some(41));
+        assert!(sequences.lock().await.is_empty());
     }
 
     fn message_with_src_ilk(src_ilk: &str) -> Message {
@@ -5060,6 +5313,7 @@ mod tests {
                 action: None,
                 priority: None,
                 context: None,
+                ..Meta::default()
             },
             payload: serde_json::json!({}),
         }

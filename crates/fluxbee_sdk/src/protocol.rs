@@ -39,7 +39,7 @@ impl Serialize for Destination {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Meta {
     #[serde(rename = "type")]
     pub msg_type: String,
@@ -47,6 +47,22 @@ pub struct Meta {
     pub msg: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub src_ilk: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_ilk: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ich: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ctx: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ctx_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ctx_window: Option<Vec<CtxTurn>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_package: Option<MemoryPackage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -57,6 +73,77 @@ pub struct Meta {
     pub priority: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryPackage {
+    pub package_version: u32,
+    pub thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dominant_context: Option<MemoryContextSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dominant_reason: Option<MemoryReasonSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contexts: Vec<MemoryContextSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<MemoryReasonSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memories: Vec<MemorySummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub episodes: Vec<EpisodeSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<MemoryPackageTruncated>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryContextSummary {
+    pub context_id: String,
+    pub label: String,
+    pub weight: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryReasonSummary {
+    pub reason_id: String,
+    pub label: String,
+    pub weight: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemorySummary {
+    pub memory_id: String,
+    pub summary: String,
+    pub weight: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dominant_context_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dominant_reason_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpisodeSummary {
+    pub episode_id: String,
+    pub title: String,
+    pub intensity: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryPackageTruncated {
+    pub applied: bool,
+    pub dropped_contexts: u32,
+    pub dropped_reasons: u32,
+    pub dropped_memories: u32,
+    pub dropped_episodes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CtxTurn {
+    pub seq: u64,
+    pub ts: String,
+    pub from: String,
+    #[serde(rename = "type")]
+    pub turn_type: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +334,14 @@ pub fn build_system_message(
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(msg.to_string()),
             src_ilk: None,
+            dst_ilk: None,
+            ich: None,
+            thread_id: None,
+            thread_seq: None,
+            ctx: None,
+            ctx_seq: None,
+            ctx_window: None,
+            memory_package: None,
             scope: None,
             target: None,
             action: None,

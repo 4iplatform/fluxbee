@@ -71,7 +71,9 @@ Firewall behavior in `SY.orchestrator`:
 
 Bootstrap behavior:
 
-- `SY.identity` sigue leyendo bootstrap DB desde `database.url` (o env overrides).
+- `SY.identity` now exposes `CONFIG_GET` / `CONFIG_SET` for its primary DB bootstrap and uses this precedence:
+  - `secrets.json` local via `CONFIG_SET`
+  - env overrides
 - `SY.storage` ahora usa esta precedencia:
   - `secrets.json` local via `CONFIG_SET`
   - env overrides

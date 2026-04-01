@@ -66,7 +66,7 @@
 
 - **jsr-identity-<hive>**: Región de identidad. Contiene ILKs, ICHs, modules, degrees. Writer: SY.identity.
 
-- **jsr-memory-<hive>**: Región de índice cognitivo. Contiene inverted index de tags → event_ids. Writer: SY.cognition.
+- **jsr-memory-<hive>**: Región SHM cognitiva. Contiene snapshot por `thread_id` con `memory_package` v2 truncado. Writer: SY.cognition.
 
 - **Epoch/RCU**: Mecanismo de sincronización para un writer y múltiples readers. Writer usa shadow region + epoch bump + swap. Readers nunca copian, leen in-place.
 
@@ -116,13 +116,13 @@
 
 - **context_inhibition**: Supresión contextual de un evento/item. Permite reemplazo funcional sin borrado.
 
-- **jsr-memory-<hive>**: Región SHM con índice invertido de tags → eventos. Writer: SY.cognition.
+- **jsr-memory-<hive>**: Región SHM con snapshot `thread_id` → `memory_package` v2. Writer: SY.cognition.
 
 - **LanceDB**: Base de datos embebida para episodios y items. Cache reconstruible desde PostgreSQL.
 
 - **MemoryPackage**: Paquete de antecedentes relevantes que el router agrega al mensaje.
 
-- **SY.cognition**: Proceso que consolida evidencia en memoria episódica. Single-writer de jsr-memory y LanceDB.
+- **SY.cognition**: Proceso que consolida evidencia en memoria episódica. Single-writer de `jsr-memory` y durable cognition storage; LanceDB sigue diferido.
 
 - **Cold Start**: Reconstrucción de memoria desde PostgreSQL cuando LanceDB está vacío/corrupto.
 

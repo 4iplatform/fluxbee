@@ -207,7 +207,7 @@ identity:
 | `blob.gc.staging_ttl_hours` | No | `24` | TTL para limpiar huérfanos en `blob/staging/` |
 | `blob.gc.active_retain_days` | No | `30` | Retención mínima de blobs en `blob/active/` |
 | `admin.listen` | No | `127.0.0.1:8080` | Bind del API HTTP de SY.admin (recomendado loopback + proxy) |
-| `database.url` | Solo Motherbee | - | Connection string PostgreSQL. Sigue siendo input para `SY.identity`; `SY.storage` ya no la usa y toma su secreto por `CONFIG_SET` + `secrets.json`. |
+| `database.url` | Solo Motherbee | - | Connection string PostgreSQL legacy/manual. `SY.identity` y `SY.storage` ya no la usan como input canónico; ambos toman su secreto por `CONFIG_SET` + `secrets.json` (con env overrides como compat). |
 | `database.pool_size` | No | 10 | Conexiones en el pool |
 
 ### 2.5 Blob Sync (Syncthing) - Operación
@@ -630,6 +630,10 @@ En v2, la distribución de software diaria no usa SSH operativo.
 Modelo:
 - Motherbee publica artefactos y manifests en `/var/lib/fluxbee/dist/`.
 - Syncthing replica `dist/` entre hives.
+- Autoridad de `dist`:
+  - motherbee = source of truth (`sendonly`)
+  - workers = receptores (`receiveonly`)
+- Los workers no publican ni corrigen software en `dist`; cualquier runtime/binario nuevo se publica primero en motherbee.
 - `SY.admin` dispara `POST /hives/{id}/update`.
 - `SY.orchestrator@{hive}` valida manifest local (`manifest_version/manifest_hash`) y readiness de artefactos runtime (`start.sh` presente + ejecutable para versiones `current`) antes de responder `ok`.
 

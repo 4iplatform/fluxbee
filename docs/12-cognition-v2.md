@@ -1,7 +1,7 @@
 # Fluxbee - 12 Cognition (SY.cognition) v2
 
 **Status:** v2.0 (final)
-**Date:** 2026-03-24
+**Date:** 2026-03-31
 **Audience:** All developers (cognitive, AI, IO, router, identity)
 **Replaces:** `12-cognition.md` (v1.16)
 **Sources:** Cognitive Lab audit (`15-auditoria-tecnica-especifica-independiente.md`), architecture sessions, operational reason design
@@ -32,7 +32,8 @@ SY.cognition does NOT handle:
 - Immediate conversation memory (AI SDK responsibility).
 - Identity management (SY.identity).
 - Message persistence to PostgreSQL (SY.storage).
-- Routing decisions (router + OPA).
+- Routing decisions (router + OPA). Cognitive data does NOT feed OPA.
+- Normative evaluation (SY.policy responsibility). Cognitive does NOT judge compliance.
 
 ---
 
@@ -85,6 +86,9 @@ The physical unit of conversational continuity given by the medium. Created by t
 | Medium-native thread | `hash(native_thread_id + ich_id)` | Email In-Reply-To, Slack thread reply, helpdesk ticket ID |
 
 The IO node chooses the rule because it knows the channel type. The SDK provides a canonical `compute_thread_id(channel_type, params)` function.
+The current canonical format uses versioned input material plus stable `sha256`, producing identifiers like `thread:sha256:<hex>`.
+
+**Sequencing:** every message that belongs to a thread also carries `meta.thread_seq`. Unlike `thread_id`, this value is **not** assigned by the IO node. It is assigned by the router when the message enters the local conversation flow for that thread, so the system has a deterministic per-thread order for persistence, replay, scope cuts, and evidence ranges.
 
 **Rules:**
 
@@ -92,6 +96,7 @@ The IO node chooses the rule because it knows the channel type. The SDK provides
 - Thread can be long-lived (months, years). That is a feature, not a bug — the meaning is tracked by contexts, reasons, and scopes, not by the thread itself.
 - For groups, participants entering or leaving do not create a new thread. The channel identity (ICH) is stable.
 - All messages, contexts, reasons, memories, and episodes are associated with a thread.
+- `thread_id` is computed by SDK/IO. `thread_seq` is assigned by the router.
 
 ### 3.2 Scope
 
@@ -184,7 +189,7 @@ Memory is narrative, not exact. Like human memory, it captures the essence with 
 }
 ```
 
-The `summary` is the narrative fusion. The `dominant_context_id` and `dominant_reason_id` are structured metadata for OPA/routing consumption.
+The `summary` is the narrative fusion. The `dominant_context_id` and `dominant_reason_id` are structured metadata available for AI node enrichment via memory_package. OPA does not read these fields. SY.policy may read them as supporting evidence in the future but does not depend on them in v1.
 
 ### 3.6 Episode
 
@@ -239,10 +244,11 @@ These are the minimum reason signals the tagger should recognize. They are inten
 
 - The tagger extracts reason signals from the same message, in the same call as semantic tags.
 - A message can carry multiple reason signals (a complaint that also seeks resolution).
-- **The 8 commandments are a closed canonical set for v1.** The reason evaluator and OPA only operate on these 8 signals. This ensures deterministic processing and stable SHM indexing.
-- If the tagger detects nuances beyond the 8, they go to a separate `reason_signals_extra` field as free-text evidence. This evidence is available for narrative memory generation but does NOT feed the reason evaluator or reach OPA.
+- **The 8 commandments are a closed canonical set for v1.** The cognitive reason evaluator only operates on these 8 signals. This ensures deterministic processing and stable SHM indexing.
+- If the tagger detects nuances beyond the 8, they go to a separate `reason_signals_extra` field as free-text evidence. This evidence is available for narrative memory generation but does NOT feed the reason evaluator.
 - The reason evaluator (same mechanics as context evaluator) groups canonical signals into reasons with labels, weights, and ILK profiles.
 - Reasons do not refine labels (same additive rule as contexts).
+- **OPA does not read reason signals.** SY.policy may read them independently from the message stream for normative evaluation, but that is SY.policy's concern, not cognitive's.
 
 **Canonical kernel vs periferia:**
 
@@ -254,7 +260,7 @@ These are the minimum reason signals the tagger should recognize. They are inten
 }
 ```
 
-The canonical signals feed the deterministic pipeline. The extra signals enrich narrative memory but have no normative weight.
+The canonical signals feed the cognitive pipeline (reason evaluator → reasons → binding energy → memory fusion). The extra signals enrich narrative memory only.
 
 ### 4.4 Why General, Not Specific
 
@@ -320,9 +326,59 @@ Message arrives (via NATS from router)
 
 SY.cognition consumes from NATS (`storage.turns` stream). Same stream as SY.storage. Fire & forget from router (~1ms).
 
+The canonical turn carrier for cognition v2 is:
+- `meta.thread_id`
+- `meta.thread_seq`
+- `meta.ich`
+- `meta.src_ilk`
+- `meta.dst_ilk` when known
+
+`meta.ctx`, `meta.ctx_seq`, and `meta.ctx_window` belong to the previous model and should be treated as legacy compatibility fields during migration, not as the canonical cognition carrier.
+
+### 5.2.1 Canonical `meta` fields for cognition v2
+
+The message protocol may still contain legacy fields during migration, but the **canonical** cognition carrier is:
+
+```json
+{
+  "meta": {
+    "type": "user",
+    "src_ilk": "ilk:...",
+    "dst_ilk": "ilk:...",
+    "ich": "ich:...",
+    "thread_id": "thread:...",
+    "thread_seq": 47,
+    "memory_package": {
+      "package_version": 2,
+      "...": "..."
+    }
+  }
+}
+```
+
+Rules:
+- `thread_id` is computed by SDK/IO.
+- `thread_seq` is assigned by the router.
+- `thread_seq` is monotonic **within a thread**, not globally.
+- `ctx`, `ctx_seq`, and `ctx_window` are not part of the v2 canonical model.
+- During migration, old producers/consumers may still read `ctx*`, but new canonical paths should not depend on them.
+
+Temporary migration note:
+- the router may still fallback from missing `meta.thread_id` to legacy `meta.context.thread_id` for continuity and `thread_seq` assignment.
+- this fallback is transitional only and must be removed once live producers stop depending on the legacy carrier.
+
 ### 5.3 Message Enrichment
 
-Router reads `jsr-memory-<hive>` SHM to attach `memory_package` to messages. The router enriches, not SY.cognition. SY.cognition writes, the router reads and attaches.
+Router reads `jsr-memory-<hive>` SHM to attach `memory_package` to messages. The router enriches, not SY.cognition. SY.cognition writes the data; the router reads and attaches it.
+
+Current implementation note:
+- `jsr-memory-<hive>` is implemented as a seqlock-protected SHM region with a versioned JSON snapshot.
+- the lookup key is `thread_id`
+- each snapshot entry already contains a truncated `memory_package` v2 for that thread
+
+**Important:** Enrichment happens AFTER the routing decision. OPA decides where the message goes based on identity data only. Then, before delivery to the destination node, the router attaches the memory_package so the AI node has cognitive context. The memory_package does not influence routing.
+
+In v2, router enrichment should be resolved primarily by `thread_id` (and optionally narrowed by message identity metadata), not by semantic tags of the current message. This keeps the enrichment path viable even when cognitive tagging is asynchronous.
 
 ---
 
@@ -634,6 +690,120 @@ SY.cognition runs on every hive. Each instance processes messages from its local
 | LanceDB | Local cognitive database | `/var/lib/fluxbee/nodes/SY/SY.cognition@<hive>/memory.lance` | ~ms |
 | PostgreSQL | Durable source of truth (via SY.storage) | Motherbee only | ~10ms |
 
+### 10.2.1 Durable Model (v2)
+
+The durable model for cognition v2 should be explicit and should not reuse the old `events/items/reactivation` semantics as its conceptual base.
+
+`storage.turns` remains the immutable input stream. Everything else belongs to the cognition v2 domain.
+
+Recommended durable entities:
+
+- `cognition_threads`
+- `cognition_contexts`
+- `cognition_reasons`
+- `cognition_scopes`
+- `cognition_scope_instances`
+- `cognition_memories`
+- `cognition_episodes`
+
+Optional auxiliary durable entities:
+
+- `cognition_context_signals`
+- `cognition_reason_signals`
+- `cognition_links`
+
+Durable source-of-truth policy:
+
+- **Source of truth**
+  - turns
+  - contexts
+  - reasons
+  - scopes
+  - scope_instances
+  - memories
+  - episodes
+- **Derived / rebuildable**
+  - `jsr-memory`
+  - local enrichment indexes
+  - local hot caches
+
+Recommended transport to `SY.storage`:
+
+- explicit cognition subjects, not the old v1 semantic subjects
+- for example:
+  - `storage.cognition.threads`
+  - `storage.cognition.contexts`
+  - `storage.cognition.reasons`
+  - `storage.cognition.cooccurrences`
+  - `storage.cognition.scopes`
+  - `storage.cognition.scope_instances`
+  - `storage.cognition.memories`
+  - `storage.cognition.episodes`
+
+This keeps the domain typed, inspectable, and migration-safe.
+
+### 10.2.2 NATS Transport Envelope for Cognition v2
+
+The transport contract to `SY.storage` should be explicit and uniform across cognition entities.
+
+Recommended envelope:
+
+```json
+{
+  "schema_version": 1,
+  "entity_version": 1,
+  "entity": "context",
+  "op": "upsert",
+  "entity_id": "context:uuid",
+  "thread_id": "thread:sha256:...",
+  "hive": "motherbee",
+  "writer": "SY.cognition@motherbee",
+  "ts": "2026-03-31T12:34:56Z",
+  "data": {
+    "...": "entity payload"
+  }
+}
+```
+
+Rules:
+- subject defines the domain stream; `entity` and `entity_id` make the payload self-describing.
+- `thread_id` is required for thread-scoped entities (`threads`, `contexts`, `reasons`, `cooccurrences`, `scope_instances`, `memories`, `episodes`).
+- `op` should start as a closed deterministic set for v1:
+  - `upsert`
+  - `close`
+  - `delete` only if a real deletion contract is later approved
+- `schema_version` is the transport version.
+- `entity_version` is the durable shape version for that entity.
+- `writer` identifies the emitting node instance and helps trace rebuild/drift issues.
+
+Router / JetStream boundary:
+- the router publishes only the immutable input stream (`storage.turns`).
+- the router is not the writer of derived cognition entities.
+- `storage.cognition.*` subjects belong to the `SY.cognition -> SY.storage` durable path.
+- the embedded broker/JetStream layer must therefore support both:
+  - durable replay of `storage.turns` for `SY.storage` and `SY.cognition`
+  - durable replay of `storage.cognition.*` for storage-side ingestion/rebuild flows
+
+Open transport items still to freeze in implementation:
+- canonical durable consumer names / queue names
+- replay/start semantics after restart
+- ack/redelivery/poison-message policy
+
+Recommended subject-to-entity mapping:
+- `storage.cognition.threads` → thread snapshots / thread-level state
+- `storage.cognition.contexts` → context entities
+- `storage.cognition.reasons` → reason entities
+- `storage.cognition.cooccurrences` → thread-scoped context/reason coupling records
+- `storage.cognition.scopes` → scope definitions
+- `storage.cognition.scope_instances` → realized thread-local scope instances
+- `storage.cognition.memories` → narrative memories
+- `storage.cognition.episodes` → affective/episode records
+
+Turns remain special:
+- `storage.turns` is append-only immutable input
+- cognition entities are durable derived state
+- rebuilding cognition means replaying `storage.turns` into these typed cognition subjects / tables
+
 ### 10.3 Cold Start
 
 Rebuild from PostgreSQL via SY.storage socket. Replay turns through pipeline to reconstruct contexts, reasons, memories, episodes.
@@ -642,16 +812,92 @@ Rebuild from PostgreSQL via SY.storage socket. Replay turns through pipeline to 
 
 Single writer: SY.cognition. Uses seqlock.
 
-Contains inverted index of tags + reason signals → memory/episode references for router enrichment.
+Contains hot cognitive summaries keyed for router enrichment. In v2 the primary lookup axis is `thread_id`, with compact references to:
+- dominant context
+- dominant reason
+- top contexts
+- top reasons
+- top memories
+- top episodes
+
+The SHM is for fast enrichment lookups, not for full evidence replay.
+
+### 10.4.1 Logical Layout of `jsr-memory`
+
+The logical layout should prioritize deterministic, bounded router reads.
+
+Recommended contents:
+
+1. **Header**
+   - magic
+   - version
+   - owner UUID
+   - seqlock sequence
+   - counters
+   - timestamps
+
+2. **Thread Index**
+   - `thread_id -> thread_slot`
+   - fixed-size or bounded hash table
+
+3. **Thread Summary Entries**
+   - `thread_id`
+   - latest `thread_seq`
+   - dominant context ref
+   - dominant reason ref
+   - top-N context refs
+   - top-N reason refs
+   - top-N memory refs
+   - top-N episode refs
+   - updated_at
+
+4. **Compact Entity Pools**
+   - context summary pool
+   - reason summary pool
+   - memory summary pool
+   - episode summary pool
+
+5. **Optional reverse index**
+   - for future use only
+   - no semantic nearest-neighbor logic required in v1
+
+Design constraints:
+
+- single writer: `SY.cognition`
+- lock-free readers: router and local diagnostics
+- no large text bodies in SHM
+- summaries only; full evidence lives in durable storage / local DB
+- all arrays bounded with explicit truncation rules
+
+Recommended first read path:
+
+- router receives message with `thread_id`
+- router probes `jsr-memory` by `thread_id`
+- router builds `memory_package`
+- router never performs heavy semantic search in hot path
 
 ---
 
-## 11. Memory Package (Router Enrichment)
+## 11. Memory Package (Router Enrichment for AI Nodes)
+
+The memory_package is attached by the router to messages before delivery to destination AI nodes. It provides the AI with conversational understanding accumulated over time. **The memory_package is NOT used for routing decisions.** OPA does not see it. Routing happens before enrichment.
 
 ```json
 {
   "meta": {
     "memory_package": {
+      "package_version": 2,
+      "thread_id": "thread:...",
+      "dominant_context": {
+        "context_id": "...",
+        "label": "billing dispute",
+        "weight": 4.2
+      },
+      "dominant_reason": {
+        "reason_id": "...",
+        "label": "seeking urgent resolution",
+        "weight": 3.8
+      },
       "contexts": [
         {"context_id": "...", "label": "billing dispute", "weight": 4.2}
       ],
@@ -664,11 +910,24 @@ Contains inverted index of tags + reason signals → memory/episode references f
       ],
       "episodes": [
         {"episode_id": "...", "title": "Friction over delayed refund", "intensity": 8}
+      ],
+      "truncated": {
+        "applied": false,
+        "dropped_contexts": 0,
+        "dropped_reasons": 0,
+        "dropped_memories": 0,
+        "dropped_episodes": 0
       ]
     }
   }
 }
 ```
+
+Contract notes:
+- `dominant_context` and `dominant_reason` are mandatory whenever the package is non-empty.
+- `thread_id` inside the package must match `meta.thread_id`.
+- `package_version=2` marks the new cognition model and separates it from the old event/highlight package shape.
+- The package is resolved from `jsr-memory` by `thread_id`, not by an inline semantic query over the current message text.
 
 ### Limits
 
@@ -734,34 +993,34 @@ For v1, the reason evaluator is deterministic, operating only on the 8 canonical
 
 ### 13.5 Thread ID Hash Function
 
-**Resolved.** Thread computation uses three rules by channel type (see section 3.1). The SDK provides `compute_thread_id(channel_type, params)`. Hash function: to be specified (SHA-256 truncated or blake3).
+**Resolved.** Thread computation uses three rules by channel type (see section 3.1). The SDK provides `compute_thread_id(channel_type, params)`. Current hash function/format: versioned canonical material + `sha256`, output as `thread:sha256:<hex>`.
+
+**Additional resolved rule:** `thread_seq` is assigned by the router, not by IO. The router is the only component that should serialize message order within a thread for cognition and durable replay.
 
 ### 13.6 Feed/Stream Processing
 
 Continuous feeds deferred. System assumes discrete messages. IO handles segmentation.
 
-### 13.7 Future: Normative Interpretation Layer (SY.claims)
+### 13.7 Relationship to SY.policy and OPA
 
-SY.cognition describes and condenses experience. It does NOT interpret law or produce normative claims for enforcement.
+**SY.cognition has no relationship to OPA.** OPA does not read any cognitive data — not contexts, not reasons, not memories, not episodes, not reason signals. OPA reads identity data (from jsr-identity SHM) and active restrictions (from SY.policy). That's it.
 
-When the system needs a layer that translates reason signals + identity + context + memory into canonical normative claims for OPA (intent_class, risk_level, requires_confirmation, human_handoff_candidate, etc.), that layer should be a separate process — tentatively SY.claims or SY.norm.
+**SY.cognition has no direct relationship to SY.policy.** SY.policy is a separate NATS consumer that reads the same message stream as cognitive. SY.policy may independently read reason signals from the original message (the tagger output that travels in the message metadata) to inform its normative evaluation. But SY.policy does not depend on cognitive having processed the message first. They run in parallel, not in series.
 
-**For v1:** OPA consumes `dominant_reason_id` from memories and canonical reason signals directly. This is sufficient for basic routing decisions.
-
-**For future:** SY.claims sits between cognition and OPA:
+**The architecture is:**
 
 ```
-SY.cognition (describes) → SY.claims (interprets) → OPA (enforces)
+Message → NATS
+  ├──► SY.cognition (describes: contexts, reasons, memories, episodes)
+  │         └──► jsr-memory SHM (for router enrichment of AI nodes)
+  │
+  └──► SY.policy (evaluates: normative compliance, post-facto)
+           └──► restrictions → jsr-identity SHM (for OPA to read)
 ```
 
-SY.claims would take: message + identity + active contexts/reasons + relevant memories/episodes. It would produce canonical normative claims: `{ intent_class, risk_level, requires_confirmation, read_only, touches_system_config, human_handoff_candidate }`. OPA would consume those claims, not raw cognitive data.
+Cognitive and policy are parallel consumers. Cognitive enriches AI nodes. Policy feeds OPA. They don't feed each other in v1.
 
-This separation preserves:
-- **Cognition** as experience engine (description).
-- **Claims** as normative interpreter (jurisprudence).
-- **OPA** as enforcement engine (law/force).
-
-This is documented as design direction, not for implementation now.
+**Future possibility:** SY.policy may eventually read cognitive output (memories, episodes) as supporting evidence for normative evaluation. But that is additive — cognitive does not change to accommodate policy, and policy does not depend on cognitive for its core function.
 
 ---
 
@@ -773,7 +1032,7 @@ This is documented as design direction, not for implementation now.
 | Horizon | Last 10-12 interactions | Days, weeks, months |
 | Owner | Each AI node | SY.cognition (system-wide) |
 | Content | What am I doing right now | What do I know + with what drive |
-| Consumed by | The AI node itself | Router (enrichment) + AI nodes (memory_package) |
+| Consumed by | The AI node itself | Router (enrichment → AI nodes via memory_package). NOT consumed by OPA or SY.policy in v1 |
 
 Both coexist. Neither replaces the other.
 
@@ -783,8 +1042,9 @@ Both coexist. Neither replaces the other.
 
 ### Phase 1 — Contexts (Core Pipeline)
 
-- [ ] COG-T1. Implement `compute_thread_id(channel_type, params)` in SDK with three rules (DM, group, native).
+- [x] COG-T1. Implement `compute_thread_id(channel_type, params)` in SDK with three rules (DM, group, native).
 - [ ] COG-T2. IO nodes include `thread_id` in message metadata using SDK function.
+- [ ] COG-T2b. Router assigns `thread_seq` per `thread_id` and includes it in message metadata.
 - [ ] COG-T3. SY.cognition consumes from NATS `storage.turns`.
 - [ ] COG-T4. Implement tagger (extended: tags + reason_signals_canonical + reason_signals_extra in single call).
 - [ ] COG-T5. Implement context evaluator.
@@ -819,16 +1079,21 @@ Both coexist. Neither replaces the other.
 ### Phase 6 — Storage and SHM
 
 - [ ] COG-T21. Implement LanceDB schema for threads, contexts, reasons, memories, episodes.
-- [ ] COG-T22. Implement jsr-memory SHM writer (seqlock, tag + signal index).
+- [x] COG-T22. Implement jsr-memory SHM writer (seqlock, versioned snapshot by `thread_id`).
 - [ ] COG-T23. Implement cold start (rebuild from PostgreSQL via SY.storage).
 
 ### Phase 7 — Router Enrichment
 
-- [ ] COG-T24. Router reads jsr-memory and builds memory_package (includes reasons).
-- [ ] COG-T25. Router attaches memory_package to messages before delivery.
-- [ ] COG-T26. Respect memory_package limits.
+- [x] COG-T24. Router reads jsr-memory and builds memory_package (includes reasons).
+- [x] COG-T25. Router attaches memory_package to messages before delivery.
+- [x] COG-T26. Respect memory_package limits.
 
 ### Phase 8 — E2E Validation
+
+Validation note:
+- The canonical E2E for cognition v2 must enter through the router path with real/disposable nodes.
+- The old direct publish-to-`storage.turns` smoke was removed from the repo to avoid confusing it with the normative path.
+- PostgreSQL is not the primary oracle for the cognition E2E. The primary oracle is delivery to the destination node plus `jsr-memory` and `SY.cognition` runtime counters.
 
 - [ ] COG-T27. E2E: message → tagger → context + reason created.
 - [ ] COG-T28. E2E: binding energy with context + reason → scope transition.
@@ -836,6 +1101,20 @@ Both coexist. Neither replaces the other.
 - [ ] COG-T30. E2E: episode with evidence from both context and reason.
 - [ ] COG-T31. E2E: router enrichment → memory_package with reasons.
 - [ ] COG-T32. E2E: cold start → rebuild from PostgreSQL.
+
+### Phase 9 — Semantic Upgrade (Second Stage)
+
+- [ ] COG-T33. Introduce `AI.tagger` as an operational upgrade under the same `tags + reason_signals_*` contract.
+- [ ] COG-T34. Keep deterministic v1 tagger as fallback/runtime rollback path.
+- [ ] COG-T35. Improve semantic extraction for tags:
+  - paraphrases
+  - implicit intent
+  - soft entities from the message narrative
+- [ ] COG-T36. Improve semantic extraction for canonical reason signals while preserving the closed 8-signal evaluator contract.
+- [ ] COG-T37. Use `reason_signals_extra` as narrative evidence input for memory generation, not only as stored text.
+- [ ] COG-T38. Upgrade the summarizer/memory generator from deterministic lexical fusion to semantic narrative synthesis.
+- [ ] COG-T39. Build a golden corpus to compare deterministic v1 vs semantic v2 outputs.
+- [ ] COG-T40. Define rollback semantics: if the AI provider is unavailable, cognition falls back to deterministic v1 without changing carrier or durable entities.
 
 ---
 
@@ -899,4 +1178,4 @@ pub const MEMORY_VERSION: u32 = 2;
 | Immediate memory (AI SDK) | `immediate-conversation-memory-spec.md` |
 | SY nodes catalog | `SY_nodes_spec.md` |
 | Identity v3 direction (claims) | `identity-v3-direction.md` |
-| Normative evaluation (SY.claims) | `sy-claims-beta.md` |
+| Normative evaluation (SY.policy) | `sy-policy-beta.md` |

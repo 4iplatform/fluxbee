@@ -7,6 +7,7 @@ Documentos operativos activos organizados por proceso/componente:
 - `docs/onworking COA/sy_orchestrator_tasks.md`
 - `docs/onworking COA/sy_router_tasks.md`
 - `docs/onworking COA/sy_storage_tasks.md`
+- `docs/onworking COA/sy_cognition_tasks.md`
 - `docs/onworking COA/nats_tasks.md`
 - `docs/onworking COA/blob_tasks.md`
 - `docs/onworking COA/sdk_tasks.md`

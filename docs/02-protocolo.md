@@ -55,7 +55,7 @@ Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisi
 
 ## 3. Sección `meta` (Metadata para OPA y Sistema)
 
-Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado, persistencia de contexto y enriquecimiento cognitivo.
+Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado, persistencia conversacional y enriquecimiento cognitivo.
 
 ```json
 {
@@ -66,16 +66,17 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
     "src_ilk": "ilk:550e8400-e29b-41d4-a716-446655440000",
     "dst_ilk": "ilk:7c9e6679-7425-40de-944b-e07fc1f90ae7",
     "ich": "ich:a1b2c3d4-5678-90ab-cdef-1234567890ab",
-    "ctx": "ctx:abc123def456789012345678901234ab",
-    "ctx_seq": 47,
-    "ctx_window": [
-      { "seq": 28, "ts": "2026-02-04T14:30:00Z", "from": "ilk:550e8400-...", "type": "text", "text": "Hola" },
-      { "seq": 29, "ts": "2026-02-04T14:30:05Z", "from": "ilk:7c9e6679-...", "type": "text", "text": "¿En qué puedo ayudarte?" },
-      { "seq": 47, "ts": "2026-02-04T15:00:00Z", "from": "ilk:550e8400-...", "type": "text", "text": "Tengo un problema con mi factura" }
-    ],
+    "thread_id": "thread:abc123def456789012345678901234ab",
+    "thread_seq": 47,
     "memory_package": {
-      "events": [...],
-      "evidence_expand": {...}
+      "package_version": 2,
+      "thread_id": "thread:abc123def456789012345678901234ab",
+      "dominant_context": { "context_id": "context:uuid", "label": "billing dispute", "weight": 4.2 },
+      "dominant_reason": { "reason_id": "reason:uuid", "label": "seeking urgent resolution", "weight": 3.8 },
+      "contexts": [...],
+      "reasons": [...],
+      "memories": [...],
+      "episodes": [...]
     },
     "priority": "high",
     "context": {
@@ -94,10 +95,12 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 | `src_ilk` | string | Sí (L3) | ILK del interlocutor que envía. OPA deriva tenant via `data.identity`, actualizado desde SHM de identity en cada `Resolve` |
 | `dst_ilk` | string | No | ILK del interlocutor destino (si se conoce) |
 | `ich` | string | Sí (L3) | ICH (Interlocutor Channel) por el cual se comunica |
-| `ctx` | string | Sí (L3) | Context ID. Calculado: `hash(src_ilk + ich)` |
-| `ctx_seq` | integer | Sí (L3) | Último número de secuencia conocido del contexto |
-| `ctx_window` | array | Sí (L3) | Últimos 20 turns del contexto. Agregado por router |
-| `memory_package` | object | No | Antecedentes episódicos relevantes. Agregado por router |
+| `thread_id` | string | Sí (L3 canónico) | ID físico del hilo conversacional. Calculado por SDK/IO según tipo de canal |
+| `thread_seq` | integer | Sí (L3 canónico) | Secuencia monotónica dentro de `thread_id`. Asignada por el router |
+| `ctx` | string | Legacy | Carrier viejo de contexto conversacional. Solo compat temporal |
+| `ctx_seq` | integer | Legacy | Carrier viejo de secuencia contextual. Solo compat temporal |
+| `ctx_window` | array | Legacy | Carrier viejo de turns recientes. Solo compat temporal |
+| `memory_package` | object | No | Paquete cognitivo v2. Agregado por router después del routing |
 | `priority` | string | No | Hint de prioridad para OPA |
 | `context` | object | No | Datos adicionales para reglas OPA |
 | `action` | string | No | Para mensajes admin: acción a ejecutar |
@@ -120,26 +123,64 @@ Nota de contrato:
 
 ### 3.2 Campos de Contexto (ich, ctx, ctx_seq, ctx_window)
 
-Estos campos permiten mantener conversaciones con historia:
+### 3.2 Campos Canónicos de Conversación (`ich`, `thread_id`, `thread_seq`)
+
+Estos campos forman el carrier canónico de conversación para cognition v2:
 
 - **`ich`**: Canal por el cual el interlocutor se comunica (WhatsApp, Slack, email, etc.)
-- **`ctx`**: Identificador único de la conversación, calculado como `hash(src_ilk + ich)`
-- **`ctx_seq`**: Número de secuencia del último mensaje conocido en este contexto
-- **`ctx_window`**: Array con los últimos 20 turns del contexto (o menos si hay menos)
+- **`thread_id`**: Identificador físico del hilo, calculado por SDK/IO según tipo de canal
+  - se obtiene con `compute_thread_id(...)`
+  - usa material canónico versionado + `sha256`
+  - formato actual: `thread:sha256:<hex>`
+- **`thread_seq`**: Secuencia monotónica asignada por router dentro de `thread_id`
 
-El router usa `ctx` y `ctx_seq` para persistir la historia de la conversación en PostgreSQL.
-El router incluye `ctx_window` al hacer forward, permitiendo que el nodo destino responda inmediatamente sin consultar la DB en el caso común.
+Reglas:
+- `thread_id` lo calcula el productor que conoce el medium, típicamente el IO node.
+- el cálculo admite tres casos canónicos:
+  - `DirectPair`
+  - `PersistentChannel`
+  - `NativeThread`
+- `thread_seq` lo asigna el router.
+- `thread_seq` no es global; solo tiene orden dentro del thread.
+- cognition v2 usa `thread_id` y `thread_seq` como carrier canónico.
+
+### 3.2.1 Compatibilidad legacy con `ctx*`
+
+Durante la migración pueden seguir apareciendo:
+- `ctx`
+- `ctx_seq`
+- `ctx_window`
+
+Pero esos campos ya no representan el carrier canónico del modelo cognitivo.
+
+Regla de migración:
+- paths nuevos deben producir `thread_id` + `thread_seq`
+- `ctx*` puede seguir leyéndose temporalmente en paths legacy
+- `ctx_window` deja de ser obligatorio en el modelo canónico
 
 ### 3.3 Antecedentes Cognitivos (memory_package)
 
-El router consulta `jsr-memory` y `LanceDB` para incluir episodios relevantes:
+El router consulta `jsr-memory` para construir `memory_package` antes de entregar al nodo destino. El lookup principal de v2 es por `thread_id`.
 
-- **`memory_package.events`**: Episodios pasados que matchean los tags del mensaje actual
-- **`memory_package.evidence_expand`**: Punteros para expandir a evidencia completa si se necesita
+El paquete cognitivo v2 debe incluir, como mínimo:
 
-Ver `12-cognition.md` para detalles del sistema cognitivo.
+- `package_version = 2`
+- `thread_id`
+- `dominant_context`
+- `dominant_reason`
+- `contexts[]`
+- `reasons[]`
+- `memories[]`
+- `episodes[]`
+- `truncated`
 
-**Estructura de cada turn en ctx_window:**
+Reglas:
+- el router enriquece después del routing
+- OPA no lee `memory_package`
+- `memory_package.thread_id` debe coincidir con `meta.thread_id`
+- `dominant_context` y `dominant_reason` deben estar presentes cuando el paquete no está vacío
+
+**Estructura legacy de cada turn en `ctx_window`**:
 ```json
 {
   "seq": 47,
@@ -234,21 +275,28 @@ pub struct Meta {
     /// ICH (Interlocutor Channel) - canal de comunicación
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ich: Option<String>,
-    
-    /// Context ID - hash(src_ilk + ich), identifica la conversación
+
+    /// Thread físico de conversación. Canónico para cognition v2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+
+    /// Secuencia monotónica dentro del thread. La asigna el router.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_seq: Option<u64>,
+
+    /// Legacy: carrier viejo de contexto conversacional
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctx: Option<String>,
-    
-    /// Último número de secuencia conocido del contexto
+
+    /// Legacy: secuencia vieja de contexto
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctx_seq: Option<u64>,
-    
-    /// Últimos N turns del contexto (max 20). El router los incluye al forward.
+
+    /// Legacy: ventana vieja de turns
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctx_window: Option<Vec<CtxTurn>>,
-    
-    /// Antecedentes episódicos relevantes. El router los incluye si disponibles.
-    /// Max 32KB. Si excede, se truncan highlights.
+
+    /// Paquete cognitivo v2. El router lo adjunta después del routing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_package: Option<MemoryPackage>,
     
@@ -262,99 +310,69 @@ pub struct Meta {
     pub context: Option<Value>,
 }
 
-/// Paquete de antecedentes cognitivos
+/// Paquete cognitivo v2 para enrichment de AI nodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryPackage {
-    pub package_version: String,
-    pub query: MemoryQuery,
-    pub events: Vec<MemoryEvent>,
+    pub package_version: u32,
+    pub thread_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub evidence_expand: Option<EvidenceExpand>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryQuery {
-    pub ctx: String,
-    pub cues_turn: Vec<String>,
-    pub limits: MemoryLimits,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryLimits {
-    pub max_events: usize,
-    pub max_items: usize,
-    pub max_highlights_per_event: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryEvent {
-    pub event_id: i64,
-    pub header: MemoryEventHeader,
-    pub highlights: Vec<Highlight>,
-    pub items: Vec<MemoryItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryEventHeader {
-    pub ctx: String,
-    pub start_seq: i64,
-    pub end_seq: i64,
-    pub boundary_reason: String,
-    pub cues_agg: Vec<String>,
-    pub outcome: Outcome,
-    pub priority_state: PriorityState,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Outcome {
-    pub status: String,
-    pub duration_ms: i64,
-    pub escalations: i32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PriorityState {
-    pub activation_strength: f32,
-    pub context_inhibition: f32,
+    pub dominant_context: Option<MemoryContextSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_used_at: Option<String>,
+    pub dominant_reason: Option<MemoryReasonSummary>,
+    #[serde(default)]
+    pub contexts: Vec<MemoryContextSummary>,
+    #[serde(default)]
+    pub reasons: Vec<MemoryReasonSummary>,
+    #[serde(default)]
+    pub memories: Vec<MemorySummary>,
+    #[serde(default)]
+    pub episodes: Vec<EpisodeSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<MemoryPackageTruncated>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Highlight {
-    pub seq: i64,
-    pub role: String,
-    pub text: String,
-    pub tags: Vec<String>,
+pub struct MemoryContextSummary {
+    pub context_id: String,
+    pub label: String,
+    pub weight: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryItem {
+pub struct MemoryReasonSummary {
+    pub reason_id: String,
+    pub label: String,
+    pub weight: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemorySummary {
     pub memory_id: String,
-    #[serde(rename = "type")]
-    pub item_type: String,
-    pub confidence: f32,
-    pub content: Value,
-    pub cues_signature: Vec<String>,
-    pub evidence_refs: Vec<i64>,
+    pub summary: String,
+    pub weight: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dominant_context_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dominant_reason_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvidenceExpand {
-    pub available: bool,
-    pub how: String,
-    pub ranges: Vec<EvidenceRange>,
+pub struct EpisodeSummary {
+    pub episode_id: String,
+    pub title: String,
+    pub intensity: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvidenceRange {
-    pub event_id: i64,
-    pub ctx: String,
-    pub start_seq: i64,
-    pub end_seq: i64,
+pub struct MemoryPackageTruncated {
+    pub applied: bool,
+    pub dropped_contexts: u32,
+    pub dropped_reasons: u32,
+    pub dropped_memories: u32,
+    pub dropped_episodes: u32,
 }
 
-/// Turn dentro de ctx_window
+/// Turn legacy dentro de ctx_window
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CtxTurn {
     pub seq: u64,
