@@ -891,6 +891,11 @@ Estructura:
 ✅ **NORMATIVO**:
 - La implementación multimodal del adapter OpenAI se alinea al modelo operativo vigente de OpenAI (Agents SDK + Responses API), evitando formatos ad-hoc cuando exista forma estándar en OpenAI.
 
+⚠️ **Estado de implementación (2026-04-01)**:
+- El camino de adjuntos en AI está avanzado, pero todavía no está cerrado end-to-end para todos los tipos.
+- Referencia operativa y comparativa contra Agents SDK: `docs/onworking NOE/ai_attachments_status.md`.
+- Pendientes principales: flujo `input_file` (PDF) y render de `payload.type="error"` en `IO.slack`.
+
 ✅ **NORMATIVO**:
 - El behavior declara `capabilities.multimodal = true|false`.
 - Si `multimodal=false`:
