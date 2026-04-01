@@ -941,12 +941,47 @@ impl AiNode for GenericAiNode {
                         return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
                     }
                     Err(err) => {
-                        tracing::warn!(
-                            node_name = %self.node_name,
-                            trace_id = %msg.routing.trace_id,
-                            error = %err,
-                            "openai runtime request failed; replying with provider error payload"
-                        );
+                        let attachment_summary =
+                            attachment_summary_for_observability(resolved_user_input.as_ref());
+                        if let fluxbee_ai_sdk::errors::AiSdkError::Protocol(msg_text) = &err {
+                            if let Some((status, detail)) = parse_openai_status_error(msg_text) {
+                                tracing::warn!(
+                                    node_name = %self.node_name,
+                                    trace_id = %msg.routing.trace_id,
+                                    model = %openai.model,
+                                    provider_status = status,
+                                    provider_param = ?extract_openai_error_param(&detail),
+                                    provider_detail = %trim_chars(&detail, 280),
+                                    attachment_count = attachment_summary.count,
+                                    attachment_total_bytes = attachment_summary.total_bytes,
+                                    attachment_mimes = ?attachment_summary.mimes,
+                                    error = %err,
+                                    "openai runtime request failed with structured provider status; replying with provider error payload"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    node_name = %self.node_name,
+                                    trace_id = %msg.routing.trace_id,
+                                    model = %openai.model,
+                                    attachment_count = attachment_summary.count,
+                                    attachment_total_bytes = attachment_summary.total_bytes,
+                                    attachment_mimes = ?attachment_summary.mimes,
+                                    error = %err,
+                                    "openai runtime request failed; replying with provider error payload"
+                                );
+                            }
+                        } else {
+                            tracing::warn!(
+                                node_name = %self.node_name,
+                                trace_id = %msg.routing.trace_id,
+                                model = %openai.model,
+                                attachment_count = attachment_summary.count,
+                                attachment_total_bytes = attachment_summary.total_bytes,
+                                attachment_mimes = ?attachment_summary.mimes,
+                                error = %err,
+                                "openai runtime request failed; replying with provider error payload"
+                            );
+                        }
                         let payload = openai_runtime_error_payload(&err);
                         return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
                     }
@@ -3518,6 +3553,46 @@ fn parse_openai_status_error(message: &str) -> Option<(u16, String)> {
         .map(|(_, body)| body.trim().to_string())
         .unwrap_or_default();
     Some((status, detail))
+}
+
+#[derive(Debug, Default)]
+struct AttachmentObservabilitySummary {
+    count: usize,
+    total_bytes: u64,
+    mimes: Vec<String>,
+}
+
+fn attachment_summary_for_observability(
+    resolved_user_input: Option<&ResolvedModelInput>,
+) -> AttachmentObservabilitySummary {
+    let Some(input) = resolved_user_input else {
+        return AttachmentObservabilitySummary::default();
+    };
+    let count = input.attachments.len();
+    let total_bytes = input
+        .attachments
+        .iter()
+        .map(|attachment| attachment.blob_ref.size)
+        .sum();
+    let mimes = input
+        .attachments
+        .iter()
+        .map(|attachment| attachment.blob_ref.mime.clone())
+        .collect::<Vec<_>>();
+    AttachmentObservabilitySummary {
+        count,
+        total_bytes,
+        mimes,
+    }
+}
+
+fn extract_openai_error_param(detail: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(detail).ok()?;
+    parsed
+        .get("error")
+        .and_then(|error| error.get("param"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn infer_state_dir_from_dynamic(dynamic_config_dir: &std::path::Path) -> PathBuf {
