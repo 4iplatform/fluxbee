@@ -85,11 +85,8 @@ Los detalles específicos quedan en cada Nodo IO.
 - Validaciones específicas de canal (mimes, límites de adjuntos, etc.) pueden mantenerse en `io-common`/adapter cuando aplique.
 
 Configuración operativa actual del enforcement en SDK:
-- `FLUXBEE_DISABLE_AUTO_BLOB_SEND` (true/1/yes/on desactiva el auto-offload en `send`)
-- `FLUXBEE_BLOB_ROOT`
-- `FLUXBEE_BLOB_MAX_BYTES`
-- `FLUXBEE_TEXT_V1_MAX_MESSAGE_BYTES`
-- `FLUXBEE_TEXT_V1_MESSAGE_OVERHEAD_BYTES`
+- La normalización en `NodeSender::send` usa defaults internos del SDK.
+- No depende de variables de entorno para decidir offload en esta etapa.
 
 Logging operativo (bajo ruido):
 - `debug`: decisión de normalización (`offload_to_blob`, bytes estimados, límite, adjuntos).

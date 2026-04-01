@@ -277,7 +277,7 @@ Esto permite continuar a `spawn`, pero no corrige el problema de fondo del manif
 En estado actual, la regla de offload por tamano para `text/v1` esta centralizada en `fluxbee_sdk::NodeSender::send`:
 
 - `io-slack` arma payload base (`content` + `attachments`).
-- `NodeSender::send` decide inline vs `content_ref` usando configuracion del SDK (`FLUXBEE_TEXT_V1_MAX_MESSAGE_BYTES`, `FLUXBEE_TEXT_V1_MESSAGE_OVERHEAD_BYTES`, `FLUXBEE_BLOB_ROOT`).
+- `NodeSender::send` decide inline vs `content_ref` usando defaults internos del SDK (`max_message_bytes=64KB`, `message_overhead_bytes=2048`).
 
 Logs esperados:
 
@@ -287,7 +287,7 @@ Logs esperados:
 Esto evita divergencias entre adapters IO y mantiene comportamiento uniforme de `text/v1`.
 
 Importante:
-- `io.blob.*` configurado por control-plane del nodo no aplica automaticamente al enforcement de `NodeSender::send` si no se mapea tambien a env/config del proceso.
+- `io.blob.*` configurado por control-plane del nodo no aplica automaticamente al enforcement de `NodeSender::send` en esta etapa.
 
 Nota de alcance de pruebas:
 

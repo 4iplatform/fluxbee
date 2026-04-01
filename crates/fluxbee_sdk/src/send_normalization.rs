@@ -26,61 +26,9 @@ impl Default for SendNormalizationConfig {
 }
 
 impl SendNormalizationConfig {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-
-        if let Some(v) = std::env::var_os("FLUXBEE_DISABLE_AUTO_BLOB_SEND") {
-            cfg.enabled = !looks_true(&v.to_string_lossy());
-        }
-
-        if let Some(v) = std::env::var_os("FLUXBEE_BLOB_ROOT") {
-            let root = PathBuf::from(v);
-            if !root.as_os_str().is_empty() {
-                cfg.blob_root = root;
-            }
-        }
-
-        if let Some(parsed) = parse_u64_env("FLUXBEE_BLOB_MAX_BYTES") {
-            cfg.max_blob_bytes = Some(parsed);
-        }
-
-        if let Some(parsed) = parse_usize_env("FLUXBEE_TEXT_V1_MAX_MESSAGE_BYTES") {
-            cfg.max_message_bytes = parsed;
-        }
-
-        if let Some(parsed) = parse_usize_env("FLUXBEE_TEXT_V1_MESSAGE_OVERHEAD_BYTES") {
-            cfg.message_overhead_bytes = parsed;
-        }
-
-        cfg
+    fn configured() -> Self {
+        Self::default()
     }
-}
-
-fn looks_true(raw: &str) -> bool {
-    matches!(
-        raw.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-fn parse_usize_env(key: &str) -> Option<usize> {
-    let raw = std::env::var(key).ok()?;
-    let parsed = raw.trim().parse::<usize>().ok()?;
-    if parsed == 0 {
-        tracing::warn!(env = key, value = %raw, "ignoring invalid zero env override");
-        return None;
-    }
-    Some(parsed)
-}
-
-fn parse_u64_env(key: &str) -> Option<u64> {
-    let raw = std::env::var(key).ok()?;
-    let parsed = raw.trim().parse::<u64>().ok()?;
-    if parsed == 0 {
-        tracing::warn!(env = key, value = %raw, "ignoring invalid zero env override");
-        return None;
-    }
-    Some(parsed)
 }
 
 fn payload_error_code(error: &PayloadError) -> &'static str {
@@ -213,7 +161,7 @@ fn normalize_text_payload(
 }
 
 pub(crate) fn normalize_outbound_message(mut msg: Message) -> Message {
-    let cfg = SendNormalizationConfig::from_env();
+    let cfg = SendNormalizationConfig::configured();
 
     if !cfg.enabled {
         return msg;

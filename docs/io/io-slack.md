@@ -187,11 +187,7 @@ Interpretación operativa:
 - `IO.slack` construye payload `text/v1` base (`content` + `attachments` cuando corresponda).
 - La decisión de dejar inline o convertir a `content_ref` por límite de tamaño **la toma `fluxbee_sdk::NodeSender::send`**.
 - Configuración relevante del enforcement SDK:
-  - `FLUXBEE_TEXT_V1_MAX_MESSAGE_BYTES` (default 64KB),
-  - `FLUXBEE_TEXT_V1_MESSAGE_OVERHEAD_BYTES`,
-  - `FLUXBEE_BLOB_ROOT`,
-  - `FLUXBEE_BLOB_MAX_BYTES`,
-  - `FLUXBEE_DISABLE_AUTO_BLOB_SEND` (escape hatch).
+  - defaults internos del SDK (`max_message_bytes=64KB`, `message_overhead_bytes=2048`).
 - Objetivo: evitar divergencias entre adapters IO y mantener un comportamiento único para `text/v1`.
 
 Nota operativa:

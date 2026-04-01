@@ -35,7 +35,7 @@ No alcance de esta etapa:
   - [x] `message_overhead_bytes`.
   - [x] path/config blob runtime.
 - [x] Definir precedence de configuracion (runtime/env/default) sin romper comportamiento actual.
-- [x] Definir switch de escape temporal (`disable_auto_blob`) para rollback controlado.
+- [ ] Definir switch de escape temporal (`disable_auto_blob`) para rollback controlado.
 
 Entregable:
 - API interna de normalizacion + decision de config documentada en codigo.
