@@ -365,7 +365,7 @@ Rules:
 
 Temporary migration note:
 - the router may still fallback from missing `meta.thread_id` to legacy `meta.context.thread_id` for continuity and `thread_seq` assignment.
-- this fallback is transitional only and must be removed once live producers stop depending on the legacy carrier.
+- this fallback is transitional only and now remains only in router/core; repo IO and AI nodes already use top-level canonical fields.
 
 ### 5.3 Message Enrichment
 
@@ -1040,7 +1040,8 @@ Operational alignment note:
 
 - `thread_id` is conversational metadata for cognition and router enrichment
 - AI runtime immediate memory and node-local hard state remain keyed by `src_ilk`
-- legacy reads may still fall back to `meta.context.thread_id` / `meta.context.src_ilk` during migration, but new AI paths should not keep producing `ctx*` as canonical carrier fields
+- repo AI runtimes now read only top-level `meta.thread_id` / `meta.src_ilk`
+- any remaining legacy fallback is limited to router/core migration paths, not AI SDK thread-state tooling
 
 ---
 

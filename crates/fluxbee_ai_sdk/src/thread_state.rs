@@ -13,8 +13,7 @@ use crate::{AiSdkError, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadStateRecord {
-    /// Legacy field name kept for wire/storage compatibility.
-    /// In scoped AI runtimes the canonical key is `src_ilk`, not `thread_id`.
+    /// Stored state key. In scoped AI runtimes the canonical key is `src_ilk`.
     pub thread_id: String,
     pub data: Value,
     pub updated_at: String,
@@ -34,7 +33,6 @@ struct PersistedThreadStateRecord {
 #[async_trait]
 pub trait ThreadStateStore: Send + Sync {
     /// The key is caller-defined. In AI runtimes this is canonically `src_ilk`.
-    /// `thread_id` remains supported as a legacy migration key only.
     async fn get(&self, thread_id: &str) -> Result<Option<ThreadStateRecord>>;
     async fn put(&self, thread_id: &str, data: Value, ttl_seconds: Option<u64>) -> Result<()>;
     async fn delete(&self, thread_id: &str) -> Result<()>;

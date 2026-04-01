@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use fluxbee_ai_sdk::{
@@ -8,10 +9,12 @@ use fluxbee_ai_sdk::{
 use serde_json::json;
 
 fn unique_temp_store_root() -> PathBuf {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
     std::env::temp_dir().join(format!(
-        "fluxbee_ai_sdk_thread_state_tools_{}_{}",
+        "fluxbee_ai_sdk_thread_state_tools_{}_{}_{}",
         std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
@@ -32,10 +35,7 @@ async fn thread_state_get_returns_found_false_when_record_is_missing() {
         out.get("state_key").and_then(|v| v.as_str()),
         Some("thr-missing")
     );
-    assert_eq!(
-        out.get("thread_id").and_then(|v| v.as_str()),
-        Some("thr-missing")
-    );
+    assert_eq!(out.get("thread_id").and_then(|v| v.as_str()), None);
 
     let _ = tokio::fs::remove_dir_all(root).await;
 }
@@ -58,7 +58,7 @@ async fn thread_state_get_returns_record_when_present() {
 
     assert_eq!(out.get("found").and_then(|v| v.as_bool()), Some(true));
     assert_eq!(out.get("state_key").and_then(|v| v.as_str()), Some("thr-1"));
-    assert_eq!(out.get("thread_id").and_then(|v| v.as_str()), Some("thr-1"));
+    assert_eq!(out.get("thread_id").and_then(|v| v.as_str()), None);
     assert_eq!(
         out.get("data")
             .and_then(|v| v.get("status"))
@@ -93,10 +93,7 @@ async fn thread_state_put_writes_record_visible_to_store_get() {
         out.get("state_key").and_then(|v| v.as_str()),
         Some("thr-put-1")
     );
-    assert_eq!(
-        out.get("thread_id").and_then(|v| v.as_str()),
-        Some("thr-put-1")
-    );
+    assert_eq!(out.get("thread_id").and_then(|v| v.as_str()), None);
 
     let record = store
         .get("thr-put-1")
@@ -167,10 +164,7 @@ async fn thread_state_delete_removes_existing_record() {
         out.get("state_key").and_then(|v| v.as_str()),
         Some("thr-del-1")
     );
-    assert_eq!(
-        out.get("thread_id").and_then(|v| v.as_str()),
-        Some("thr-del-1")
-    );
+    assert_eq!(out.get("thread_id").and_then(|v| v.as_str()), None);
     let after = store
         .get("thr-del-1")
         .await
@@ -197,10 +191,7 @@ async fn thread_state_delete_is_idempotent_for_missing_record() {
         out.get("state_key").and_then(|v| v.as_str()),
         Some("thr-del-missing")
     );
-    assert_eq!(
-        out.get("thread_id").and_then(|v| v.as_str()),
-        Some("thr-del-missing")
-    );
+    assert_eq!(out.get("thread_id").and_then(|v| v.as_str()), None);
 
     let _ = tokio::fs::remove_dir_all(root).await;
 }
@@ -241,161 +232,22 @@ async fn scoped_provider_overrides_model_supplied_thread_id() {
 }
 
 #[tokio::test]
-async fn scoped_provider_migrates_legacy_key_on_get() {
-    let root = unique_temp_store_root();
-    let store = LanceDbThreadStateStore::new(root.clone());
-    store.ensure_ready().await.expect("store ready");
-    store
-        .put(
-            "legacy-thread-1",
-            json!({"email":"noe@gmail.com"}),
-            Some(180),
-        )
-        .await
-        .expect("seed legacy record");
-    let store_arc: Arc<dyn ThreadStateStore> = Arc::new(store.clone());
-
-    let provider = ThreadStateToolsProvider::with_get_put_delete_scoped_with_legacy(
-        store_arc,
-        "ilk:11111111-1111-4111-8111-111111111111",
-        Some("legacy-thread-1".to_string()),
-    );
-    let mut registry = fluxbee_ai_sdk::FunctionToolRegistry::new();
-    provider
-        .register_tools(&mut registry)
-        .expect("register scoped tools");
-
-    let get_tool = registry
-        .get("thread_state_get")
-        .expect("thread_state_get tool exists");
-    let out = get_tool
-        .call(json!({
-            "thread_id": "ignored-by-scoped-provider"
-        }))
-        .await
-        .expect("get call should succeed");
-
-    assert_eq!(out.get("found").and_then(|v| v.as_bool()), Some(true));
-    assert_eq!(
-        out.get("state_key").and_then(|v| v.as_str()),
-        Some("ilk:11111111-1111-4111-8111-111111111111")
-    );
-    assert_eq!(
-        out.get("thread_id").and_then(|v| v.as_str()),
-        Some("ilk:11111111-1111-4111-8111-111111111111")
-    );
-    assert_eq!(
-        out.get("data")
-            .and_then(|v| v.get("email"))
-            .and_then(|v| v.as_str()),
-        Some("noe@gmail.com")
-    );
-
-    let primary = store
-        .get("ilk:11111111-1111-4111-8111-111111111111")
-        .await
-        .expect("get primary record");
-    assert!(primary.is_some());
-    let legacy = store
-        .get("legacy-thread-1")
-        .await
-        .expect("get legacy record");
-    assert!(legacy.is_none());
-
-    let _ = tokio::fs::remove_dir_all(root).await;
-}
-
-#[tokio::test]
-async fn scoped_provider_put_and_delete_cleanup_legacy_key() {
-    let root = unique_temp_store_root();
-    let store = LanceDbThreadStateStore::new(root.clone());
-    store.ensure_ready().await.expect("store ready");
-    store
-        .put("legacy-thread-2", json!({"stale":true}), None)
-        .await
-        .expect("seed legacy record");
-    let store_arc: Arc<dyn ThreadStateStore> = Arc::new(store.clone());
-
-    let provider = ThreadStateToolsProvider::with_get_put_delete_scoped_with_legacy(
-        store_arc,
-        "ilk:22222222-2222-4222-8222-222222222222",
-        Some("legacy-thread-2".to_string()),
-    );
-    let mut registry = fluxbee_ai_sdk::FunctionToolRegistry::new();
-    provider
-        .register_tools(&mut registry)
-        .expect("register scoped tools");
-
-    let put_tool = registry
-        .get("thread_state_put")
-        .expect("thread_state_put tool exists");
-    put_tool
-        .call(json!({
-            "state_key": "ignored-by-scoped-provider",
-            "data": {"tenant_hint":"4iplatform"}
-        }))
-        .await
-        .expect("put call should succeed");
-
-    let primary = store
-        .get("ilk:22222222-2222-4222-8222-222222222222")
-        .await
-        .expect("get primary record after put");
-    assert!(primary.is_some());
-    let legacy_after_put = store
-        .get("legacy-thread-2")
-        .await
-        .expect("get legacy record after put");
-    assert!(legacy_after_put.is_none());
-
-    let delete_tool = registry
-        .get("thread_state_delete")
-        .expect("thread_state_delete tool exists");
-    delete_tool
-        .call(json!({
-            "state_key": "ignored-by-scoped-provider"
-        }))
-        .await
-        .expect("delete call should succeed");
-
-    let primary_after_delete = store
-        .get("ilk:22222222-2222-4222-8222-222222222222")
-        .await
-        .expect("get primary record after delete");
-    assert!(primary_after_delete.is_none());
-    let legacy_after_delete = store
-        .get("legacy-thread-2")
-        .await
-        .expect("get legacy record after delete");
-    assert!(legacy_after_delete.is_none());
-
-    let _ = tokio::fs::remove_dir_all(root).await;
-}
-
-#[tokio::test]
-async fn legacy_thread_id_alias_is_still_accepted_for_unscoped_tools() {
+async fn thread_state_tools_reject_legacy_thread_id_alias() {
     let root = unique_temp_store_root();
     let store = LanceDbThreadStateStore::new(root.clone());
     store.ensure_ready().await.expect("store ready");
 
-    let put_tool = ThreadStatePutTool::new(Arc::new(store.clone()));
-    put_tool
+    let put_tool = ThreadStatePutTool::new(Arc::new(store));
+    let err = put_tool
         .call(json!({
             "thread_id": "legacy-thread-3",
             "data": { "status": "ok" }
         }))
         .await
-        .expect("legacy alias should still work");
-
-    let record = store
-        .get("legacy-thread-3")
-        .await
-        .expect("store get")
-        .expect("record should exist");
-    assert_eq!(
-        record.data.get("status").and_then(|v| v.as_str()),
-        Some("ok")
-    );
+        .expect_err("legacy alias must be rejected");
+    let err_text = err.to_string();
+    assert!(err_text.contains("thread_id"));
+    assert!(err_text.contains("state_key"));
 
     let _ = tokio::fs::remove_dir_all(root).await;
 }

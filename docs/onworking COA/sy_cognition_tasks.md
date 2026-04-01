@@ -293,7 +293,7 @@ Nota práctica:
 Estado actual de cierre de `M1`:
 - `Meta` del SDK/core ya modela `thread_id`, `thread_seq`, `dst_ilk`, `ich`, `ctx*` legacy y `memory_package`.
 - `docs/12-cognition-v2.md` y `docs/02-protocolo.md` ya reflejan el carrier v2.
-- los paths IO nuevos ya pueden emitir `meta.thread_id` canónico y los AI nodes leen `meta.thread_id` con fallback legacy a `context.thread_id`.
+- los paths IO nuevos ya emiten `meta.thread_id` canónico y los AI nodes del repo leen solo `meta.thread_id` top-level.
 - la asignación real de `thread_seq` ya quedó en el router por `thread_id`; la validación completa del root workspace sigue bloqueada externamente por `protoc` en `lance`.
 
 Salida:
@@ -328,7 +328,7 @@ Compatibilidad legacy todavía abierta y a cerrar:
 - el router todavía tiene fallback a `meta.context.thread_id` cuando falta `meta.thread_id`.
 - ese fallback existe solo para transición/migración.
 - debe removerse cuando los productores vivos ya no dependan del carrier legacy.
-- ese cierre queda explícitamente diferido a `COG-M9`.
+- ese cierre ya no vive en nodos/SDK del repo; quedó acotado al router/core como residual de transición.
 
 Salida:
 - todo turn nuevo relevante ya nace con `thread_id`.
@@ -549,19 +549,17 @@ Estado actual:
 - `AI.frontdesk.gov` y `ai-generic` ya tratan:
   - `thread_id` como metadata conversacional
   - `src_ilk` como key canónica de state/immediate memory
-- los runners AI siguen leyendo compat legacy desde `meta.context` para:
-  - `thread_id`
-  - `src_ilk`
-- los thread-state tools del AI SDK ya aceptan `state_key` como argumento canónico
-  - `thread_id` queda como alias legacy de compat
-  - en runtimes scoped el provider sigue fijando el key real a `src_ilk`
+- los runners AI del repo ya no leen compat legacy desde `meta.context` para `thread_id` ni `src_ilk`
+- los thread-state tools del AI SDK aceptan solo `state_key` como argumento canónico
+  - `thread_id` ya no existe como alias aceptado
+  - en runtimes scoped el provider fija el key real a `src_ilk`
 - los replies nuevos del AI SDK ya no reemiten:
   - `thread_seq`
   - `ctx`
   - `ctx_seq`
   - `ctx_window`
   - `memory_package`
-- con esto, los paths nuevos de AI dejan de seguir propagando `ctx*` como carrier canónico, pero la lectura legacy sigue tolerada durante migración
+- con esto, los paths nuevos de AI dejan de seguir propagando `ctx*` como carrier canónico y el SDK/runners del repo ya no toleran lectura legacy para thread/state
 
 ### Fase COG-M10 - Cold start, rebuild y cierre de migración
 
