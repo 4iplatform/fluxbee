@@ -826,7 +826,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[tokio::test]
     async fn build_openai_user_content_parts_serializes_non_image_as_input_file() {
         let root = temp_blob_root();
         let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
