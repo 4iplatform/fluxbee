@@ -32,16 +32,7 @@ pub fn build_user_message(
         "dst_ilk".to_string(),
         dst_ilk.clone().map(Value::String).unwrap_or(Value::Null),
     );
-    let thread_id = if context_obj.contains_key("thread_id") {
-        context_obj
-            .get("thread_id")
-            .and_then(Value::as_str)
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-    } else {
-        extract_thread_id_from_context_obj(&context_obj)
-    };
+    let thread_id = extract_thread_id_from_context_obj(&context_obj);
 
     Message {
         routing: Routing {
@@ -78,6 +69,61 @@ fn extract_thread_id_from_context_obj(context_obj: &Map<String, Value>) -> Optio
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn build_user_message_reads_thread_id_only_from_io_conversation() {
+        let msg = build_user_message(
+            "src-node",
+            Some("AI.echo@motherbee".to_string()),
+            DEFAULT_TTL,
+            "trace-1".to_string(),
+            Some("ilk:src".to_string()),
+            None,
+            json!({
+                "thread_id": "thread:legacy-flat",
+                "io": {
+                    "conversation": {
+                        "thread_id": "thread:canonical-io"
+                    }
+                }
+            }),
+            json!({"type":"text","content":"hi"}),
+        );
+
+        assert_eq!(msg.meta.thread_id.as_deref(), Some("thread:canonical-io"));
+        assert_eq!(
+            msg.meta
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("thread_id"))
+                .and_then(|value| value.as_str()),
+            Some("thread:legacy-flat")
+        );
+    }
+
+    #[test]
+    fn build_user_message_does_not_promote_legacy_flat_context_thread_id() {
+        let msg = build_user_message(
+            "src-node",
+            Some("AI.echo@motherbee".to_string()),
+            DEFAULT_TTL,
+            "trace-1".to_string(),
+            Some("ilk:src".to_string()),
+            None,
+            json!({
+                "thread_id": "thread:legacy-flat"
+            }),
+            json!({"type":"text","content":"hi"}),
+        );
+
+        assert_eq!(msg.meta.thread_id, None);
+    }
 }
 
 pub fn build_inbound_user_message_to_router(

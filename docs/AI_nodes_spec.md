@@ -1565,14 +1565,14 @@ ai-nodectl logs ai-chat --follow
 
 ✅ **NORMATIVO (MVP vigente)**:
 - El key principal de thread state es `src_ilk`.
-- El runner extrae `src_ilk` desde `meta.src_ilk` (canónico), con fallback legacy a `meta.context.src_ilk` durante transición.
+- El runner extrae `src_ilk` solo desde `meta.src_ilk` (canónico).
 - Si falta `src_ilk`, las tools de thread state deben fallar con error explicito (`missing_src_ilk`).
 
 ### 9.2 Compatibilidad legacy con `thread_id`
 
 ✅ **NORMATIVO (MVP)**:
 - `thread_id` se mantiene solo como compatibilidad legacy/migracion.
-- El runner puede extraer `thread_id` desde `meta.context.thread_id`.
+- El runner extrae `thread_id` solo desde `meta.thread_id`.
 - Si existe estado legacy por `thread_id`, el runtime puede migrarlo al key principal (`src_ilk`) y limpiar la key legacy.
 
 ### 9.3 Modelo de datos: 1 JSON por key de estado (`src_ilk`)

@@ -321,14 +321,12 @@ Estado actual de `M2`:
   - `PersistentChannel` cuando no existe `thread_ts`
 - `io-sim` ya genera `thread_id` canónico por defecto y mantiene `SIM_THREAD_ID` solo como override explícito.
 - `SY.architect` ya emite `meta.thread_id` y `meta.ich` en el path de impersonation chat, en vez de depender solo de `meta.context`.
-- el router ya asigna `thread_seq` cuando el mensaje entra sin secuencia usando `meta.thread_id` o fallback legacy a `context.thread_id`.
+- el router ya asigna `thread_seq` cuando el mensaje entra sin secuencia usando solo `meta.thread_id` canónico.
 - hay tests de hash/compat en `fluxbee_sdk` y tests de sequencing en router; correrlos en el root workspace sigue bloqueado externamente por `protoc` en `lance`.
 
 Compatibilidad legacy todavía abierta y a cerrar:
-- el router todavía tiene fallback a `meta.context.thread_id` cuando falta `meta.thread_id`.
-- ese fallback existe solo para transición/migración.
-- debe removerse cuando los productores vivos ya no dependan del carrier legacy.
-- ese cierre ya no vive en nodos/SDK del repo; quedó acotado al router/core como residual de transición.
+- no queda fallback runtime del repo a `meta.context.thread_id` en IO/AI/SDK/router.
+- `meta.context.thread_id` queda solo como residuo documental/histórico en notas viejas o payloads de compat ya persistidos, no como carrier leído por paths activos.
 
 Salida:
 - todo turn nuevo relevante ya nace con `thread_id`.

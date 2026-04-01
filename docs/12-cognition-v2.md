@@ -364,8 +364,8 @@ Rules:
 - During migration, old producers/consumers may still read `ctx*`, but new canonical paths should not depend on them.
 
 Temporary migration note:
-- the router may still fallback from missing `meta.thread_id` to legacy `meta.context.thread_id` for continuity and `thread_seq` assignment.
-- this fallback is transitional only and now remains only in router/core; repo IO and AI nodes already use top-level canonical fields.
+- router, IO, and AI repo paths now read only top-level `meta.thread_id` for active thread routing/sequencing behavior.
+- any legacy `meta.context.thread_id` still present in old payloads is no longer part of the runtime carrier contract.
 
 ### 5.3 Message Enrichment
 

@@ -51,7 +51,7 @@
   - payload `text/v1` con `content` y/o `attachments`.
 
 Nota de transición:
-- `meta.context.src_ilk` puede aceptarse solo como compatibilidad legacy temporal.
+- el repo ya no usa `meta.context.src_ilk` como fallback runtime; el carrier canónico es `meta.src_ilk`.
 
 ✅ **NORMATIVO**:
 - `AI.frontdesk.gov` asume que la derivación a frontdesk se hace por policy/core cuando el `src_ilk` está en estado `temporary` o equivalente.
