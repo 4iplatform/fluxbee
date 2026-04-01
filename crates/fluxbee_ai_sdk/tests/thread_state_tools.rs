@@ -23,11 +23,15 @@ async fn thread_state_get_returns_found_false_when_record_is_missing() {
 
     let tool = ThreadStateGetTool::new(Arc::new(store));
     let out = tool
-        .call(json!({ "thread_id": "thr-missing" }))
+        .call(json!({ "state_key": "thr-missing" }))
         .await
         .expect("tool call should succeed");
 
     assert_eq!(out.get("found").and_then(|v| v.as_bool()), Some(false));
+    assert_eq!(
+        out.get("state_key").and_then(|v| v.as_str()),
+        Some("thr-missing")
+    );
     assert_eq!(
         out.get("thread_id").and_then(|v| v.as_str()),
         Some("thr-missing")
@@ -48,11 +52,12 @@ async fn thread_state_get_returns_record_when_present() {
 
     let tool = ThreadStateGetTool::new(Arc::new(store));
     let out = tool
-        .call(json!({ "thread_id": "thr-1" }))
+        .call(json!({ "state_key": "thr-1" }))
         .await
         .expect("tool call should succeed");
 
     assert_eq!(out.get("found").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(out.get("state_key").and_then(|v| v.as_str()), Some("thr-1"));
     assert_eq!(out.get("thread_id").and_then(|v| v.as_str()), Some("thr-1"));
     assert_eq!(
         out.get("data")
@@ -76,7 +81,7 @@ async fn thread_state_put_writes_record_visible_to_store_get() {
 
     let out = put_tool
         .call(json!({
-            "thread_id": "thr-put-1",
+            "state_key": "thr-put-1",
             "data": { "status": "waiting_information", "counter": 1 },
             "ttl_seconds": 120
         }))
@@ -84,6 +89,10 @@ async fn thread_state_put_writes_record_visible_to_store_get() {
         .expect("put tool call should succeed");
 
     assert_eq!(out.get("ok").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        out.get("state_key").and_then(|v| v.as_str()),
+        Some("thr-put-1")
+    );
     assert_eq!(
         out.get("thread_id").and_then(|v| v.as_str()),
         Some("thr-put-1")
@@ -116,7 +125,7 @@ async fn thread_state_put_overwrites_existing_record() {
     let put_tool = ThreadStatePutTool::new(Arc::new(store.clone()));
     put_tool
         .call(json!({
-            "thread_id": "thr-put-2",
+            "state_key": "thr-put-2",
             "data": { "status": "new", "counter": 2 }
         }))
         .await
@@ -149,11 +158,15 @@ async fn thread_state_delete_removes_existing_record() {
 
     let delete_tool = ThreadStateDeleteTool::new(Arc::new(store.clone()));
     let out = delete_tool
-        .call(json!({ "thread_id": "thr-del-1" }))
+        .call(json!({ "state_key": "thr-del-1" }))
         .await
         .expect("delete should succeed");
 
     assert_eq!(out.get("ok").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        out.get("state_key").and_then(|v| v.as_str()),
+        Some("thr-del-1")
+    );
     assert_eq!(
         out.get("thread_id").and_then(|v| v.as_str()),
         Some("thr-del-1")
@@ -175,11 +188,15 @@ async fn thread_state_delete_is_idempotent_for_missing_record() {
 
     let delete_tool = ThreadStateDeleteTool::new(Arc::new(store));
     let out = delete_tool
-        .call(json!({ "thread_id": "thr-del-missing" }))
+        .call(json!({ "state_key": "thr-del-missing" }))
         .await
         .expect("delete should succeed for missing records");
 
     assert_eq!(out.get("ok").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        out.get("state_key").and_then(|v| v.as_str()),
+        Some("thr-del-missing")
+    );
     assert_eq!(
         out.get("thread_id").and_then(|v| v.as_str()),
         Some("thr-del-missing")
@@ -206,7 +223,7 @@ async fn scoped_provider_overrides_model_supplied_thread_id() {
         .expect("thread_state_put tool exists");
     put_tool
         .call(json!({
-            "thread_id": "identity_thread",
+            "state_key": "identity_thread",
             "data": {"email":"noe@gmail.com"}
         }))
         .await
@@ -260,6 +277,10 @@ async fn scoped_provider_migrates_legacy_key_on_get() {
 
     assert_eq!(out.get("found").and_then(|v| v.as_bool()), Some(true));
     assert_eq!(
+        out.get("state_key").and_then(|v| v.as_str()),
+        Some("ilk:11111111-1111-4111-8111-111111111111")
+    );
+    assert_eq!(
         out.get("thread_id").and_then(|v| v.as_str()),
         Some("ilk:11111111-1111-4111-8111-111111111111")
     );
@@ -310,7 +331,7 @@ async fn scoped_provider_put_and_delete_cleanup_legacy_key() {
         .expect("thread_state_put tool exists");
     put_tool
         .call(json!({
-            "thread_id": "ignored-by-scoped-provider",
+            "state_key": "ignored-by-scoped-provider",
             "data": {"tenant_hint":"4iplatform"}
         }))
         .await
@@ -332,7 +353,7 @@ async fn scoped_provider_put_and_delete_cleanup_legacy_key() {
         .expect("thread_state_delete tool exists");
     delete_tool
         .call(json!({
-            "thread_id": "ignored-by-scoped-provider"
+            "state_key": "ignored-by-scoped-provider"
         }))
         .await
         .expect("delete call should succeed");
@@ -347,6 +368,34 @@ async fn scoped_provider_put_and_delete_cleanup_legacy_key() {
         .await
         .expect("get legacy record after delete");
     assert!(legacy_after_delete.is_none());
+
+    let _ = tokio::fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn legacy_thread_id_alias_is_still_accepted_for_unscoped_tools() {
+    let root = unique_temp_store_root();
+    let store = LanceDbThreadStateStore::new(root.clone());
+    store.ensure_ready().await.expect("store ready");
+
+    let put_tool = ThreadStatePutTool::new(Arc::new(store.clone()));
+    put_tool
+        .call(json!({
+            "thread_id": "legacy-thread-3",
+            "data": { "status": "ok" }
+        }))
+        .await
+        .expect("legacy alias should still work");
+
+    let record = store
+        .get("legacy-thread-3")
+        .await
+        .expect("store get")
+        .expect("record should exist");
+    assert_eq!(
+        record.data.get("status").and_then(|v| v.as_str()),
+        Some("ok")
+    );
 
     let _ = tokio::fs::remove_dir_all(root).await;
 }

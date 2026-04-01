@@ -9,6 +9,13 @@ Expone cuatro bloques principales:
 - thread state tools/store
 - memoria inmediata de conversación para continuidad entre turns
 
+Regla canónica actual:
+
+- `thread_id` llega al nodo AI como metadata conversacional
+- `src_ilk` sigue siendo la key canónica de state/immediate memory en runtimes AI
+- los thread-state tools quedan por compatibilidad de nombre, pero en runtimes scoped operan sobre `src_ilk`
+- `thread_id` sigue disponible como metadata y como alias legacy de migración para hard state previo
+
 La spec de memoria inmediata vive en [docs/immediate-conversation-memory-spec.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/immediate-conversation-memory-spec.md).
 
 ## Function Calling
@@ -43,6 +50,12 @@ El bundle admite:
 - `active_operations`
 - `thread_id`
 - `scope_id`
+
+Semántica recomendada en v2:
+
+- `thread_id` describe continuidad conversacional/cognitiva
+- `scope_id` en runtimes AI suele mapear a `src_ilk`
+- la persistencia de memoria inmediata se resuelve por `src_ilk`, no por `thread_id`
 
 Ejemplo:
 
@@ -155,5 +168,11 @@ Para `AI.*` y `SY.architect`, la recomendación v1 es:
 - preservar errores/tool failures recientes
 - incluir operaciones activas o ambiguas
 - usar el helper de refresh solo cuando el caller decida actualizar el summary
+
+Compat/migración:
+
+- los replies nuevos del AI SDK ya no deben reemitir `ctx`, `ctx_seq`, `ctx_window` ni `memory_package`
+- los runtimes AI siguen leyendo `thread_id` y `src_ilk` desde `meta` top-level
+- si hace falta compat, pueden caer a `meta.context.thread_id` y `meta.context.src_ilk` solo como lectura legacy
 
 No hace compresión semántica avanzada. Esa capa queda para sistemas cognitivos posteriores.

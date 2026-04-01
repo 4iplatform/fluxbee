@@ -1257,6 +1257,8 @@ impl GenericAiNode {
         ctx: &BehaviorContext,
     ) -> fluxbee_ai_sdk::Result<()> {
         // Thread state tools remain the source for node-level "hard state".
+        // In scoped AI runtimes the canonical key is src_ilk; thread_id is kept only
+        // as metadata and as a legacy migration key for older records.
         // Immediate memory is managed separately by the runner as short-horizon context.
         if let (Some(store), Some(src_ilk)) = (&self.thread_state_store, &ctx.src_ilk) {
             let provider = ThreadStateToolsProvider::with_get_put_delete_scoped_with_legacy(
@@ -4230,6 +4232,23 @@ mod tests {
         let msg = sample_user_request_with_context(json!({}), None);
         assert_eq!(extract_src_ilk(&msg), None);
         assert_eq!(src_ilk_source(&msg), "missing");
+    }
+
+    #[test]
+    fn extract_thread_id_reads_from_meta_top_level_first() {
+        let mut msg =
+            sample_user_request_with_context(json!({ "thread_id": "legacy-thread-1" }), None);
+        msg.meta.thread_id = Some("thread:canonical-1".to_string());
+        assert_eq!(
+            extract_thread_id(&msg).as_deref(),
+            Some("thread:canonical-1")
+        );
+    }
+
+    #[test]
+    fn extract_thread_id_falls_back_to_meta_context_legacy() {
+        let msg = sample_user_request_with_context(json!({ "thread_id": "legacy-thread-1" }), None);
+        assert_eq!(extract_thread_id(&msg).as_deref(), Some("legacy-thread-1"));
     }
 
     #[test]

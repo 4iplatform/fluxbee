@@ -13,6 +13,8 @@ use crate::{AiSdkError, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadStateRecord {
+    /// Legacy field name kept for wire/storage compatibility.
+    /// In scoped AI runtimes the canonical key is `src_ilk`, not `thread_id`.
     pub thread_id: String,
     pub data: Value,
     pub updated_at: String,
@@ -31,13 +33,15 @@ struct PersistedThreadStateRecord {
 
 #[async_trait]
 pub trait ThreadStateStore: Send + Sync {
+    /// The key is caller-defined. In AI runtimes this is canonically `src_ilk`.
+    /// `thread_id` remains supported as a legacy migration key only.
     async fn get(&self, thread_id: &str) -> Result<Option<ThreadStateRecord>>;
     async fn put(&self, thread_id: &str, data: Value, ttl_seconds: Option<u64>) -> Result<()>;
     async fn delete(&self, thread_id: &str) -> Result<()>;
 }
 
-/// MVP concrete adapter for thread state under a LanceDB-compatible node-local path.
-/// In this phase, records are persisted as one JSON file per thread inside `<root>/threads/`.
+/// MVP concrete adapter for node-local hard state under a LanceDB-compatible path.
+/// In this phase, records are persisted as one JSON file per state key inside `<root>/threads/`.
 #[derive(Debug, Clone)]
 pub struct LanceDbThreadStateStore {
     root_dir: PathBuf,

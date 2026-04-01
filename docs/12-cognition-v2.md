@@ -1036,6 +1036,12 @@ Cognitive and policy are parallel consumers. Cognitive enriches AI nodes. Policy
 
 Both coexist. Neither replaces the other.
 
+Operational alignment note:
+
+- `thread_id` is conversational metadata for cognition and router enrichment
+- AI runtime immediate memory and node-local hard state remain keyed by `src_ilk`
+- legacy reads may still fall back to `meta.context.thread_id` / `meta.context.src_ilk` during migration, but new AI paths should not keep producing `ctx*` as canonical carrier fields
+
 ---
 
 ## 15. Implementation Tasks

@@ -537,13 +537,31 @@ Estado actual:
 
 ### Fase COG-M9 - Alineación con AI runtime y compat controlada
 
-- [ ] COG-M9-T1. Alinear docs y runtime AI:
+- [x] COG-M9-T1. Alinear docs y runtime AI:
   - `thread_id` = metadata
   - `src_ilk` = key canónico de state/immediate memory
-- [ ] COG-M9-T2. Garantizar que `memory_package` no rompe prompts/configs vigentes.
-- [ ] COG-M9-T3. Revisar `AI.frontdesk.gov` y otros nodos que hoy dependen de `thread_state`.
-- [ ] COG-M9-T4. Definir carrier legacy de compat para paths que todavía lean `ctx`.
-- [ ] COG-M9-T5. Remover gradualmente producción canónica de `ctx*` en nuevos paths.
+- [x] COG-M9-T2. Garantizar que `memory_package` no rompe prompts/configs vigentes.
+- [x] COG-M9-T3. Revisar `AI.frontdesk.gov` y otros nodos que hoy dependen de `thread_state`.
+- [x] COG-M9-T4. Definir carrier legacy de compat para paths que todavía lean `ctx`.
+- [x] COG-M9-T5. Remover gradualmente producción canónica de `ctx*` en nuevos paths.
+
+Estado actual:
+- `AI.frontdesk.gov` y `ai-generic` ya tratan:
+  - `thread_id` como metadata conversacional
+  - `src_ilk` como key canónica de state/immediate memory
+- los runners AI siguen leyendo compat legacy desde `meta.context` para:
+  - `thread_id`
+  - `src_ilk`
+- los thread-state tools del AI SDK ya aceptan `state_key` como argumento canónico
+  - `thread_id` queda como alias legacy de compat
+  - en runtimes scoped el provider sigue fijando el key real a `src_ilk`
+- los replies nuevos del AI SDK ya no reemiten:
+  - `thread_seq`
+  - `ctx`
+  - `ctx_seq`
+  - `ctx_window`
+  - `memory_package`
+- con esto, los paths nuevos de AI dejan de seguir propagando `ctx*` como carrier canónico, pero la lectura legacy sigue tolerada durante migración
 
 ### Fase COG-M10 - Cold start, rebuild y cierre de migración
 
