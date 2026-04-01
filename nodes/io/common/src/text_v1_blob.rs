@@ -251,7 +251,9 @@ pub fn normalize_text_v1_inbound_payload(
     match (parsed.content.clone(), parsed.content_ref.clone()) {
         (Some(content), None) => {
             let inline_payload = TextV1Payload::new(&content, parsed.attachments.clone());
-            let inline_payload_bytes = serde_json::to_vec(&inline_payload)?.len();
+            let inline_payload_bytes = serde_json::to_vec(&inline_payload)
+                .map_err(PayloadError::from)?
+                .len();
             let estimated_total_bytes =
                 inline_payload_bytes.saturating_add(cfg.message_overhead_bytes);
             let normalized = build_text_v1_inbound_payload(
