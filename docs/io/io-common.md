@@ -90,6 +90,10 @@ Logging operativo (bajo ruido):
 - `warn` en error de normalización con código canónico.
 - Nunca loggear contenido de usuario ni bytes de blobs.
 
+Validación recomendada:
+- Prueba determinística de payloads grandes (`>64KB` default) con `io-sim`.
+- En `io-slack`, usar pruebas de integración de adapter y contrato, considerando límites propios del canal.
+
 ### 2.2 Outbound reliability
 - Outbox **en memoria** (best-effort) con:
   - cola acotada,

@@ -285,3 +285,9 @@ Logs esperados:
 - `inbound text/v1 processed as blob` (info, solo cuando hubo offload)
 
 Esto evita divergencias entre adapters IO y mantiene comportamiento uniforme de `text/v1`.
+
+Nota de alcance de pruebas:
+
+- Para validar de forma determinística payloads de texto muy grandes (ejemplo `>64KB`), usar `io-sim`.
+- En Slack real, `chat.postMessage` tiene límites propios del canal y trunca texto por encima de 40.000 caracteres, por lo que no es un canal confiable para probar umbrales internos extremos.
+  - Fuente: https://docs.slack.dev/reference/methods/chat.postMessage/ ("Truncating content").
