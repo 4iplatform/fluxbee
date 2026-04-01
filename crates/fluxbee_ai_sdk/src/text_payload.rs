@@ -908,6 +908,136 @@ mod tests {
         assert_eq!(parts[1]["detail"], "high");
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[tokio::test]
+    async fn build_openai_user_content_parts_does_not_downgrade_image_to_text() {
+        let root = temp_blob_root();
+        let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
+        let image_blob = BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "img_1123456789abcdef.png".to_string(),
+            size: 4,
+            mime: "image/png".to_string(),
+            filename_original: "photo.png".to_string(),
+            spool_day: "2026-03-31".to_string(),
+        };
+        let image_path = toolkit.resolve(&image_blob);
+        std::fs::create_dir_all(
+            image_path
+                .parent()
+                .expect("image blob parent must exist for test setup"),
+        )
+        .expect("create image parent");
+        std::fs::write(&image_path, [9_u8, 8_u8, 7_u8, 6_u8]).expect("write image bytes");
+
+        let input = ResolvedModelInput {
+            main_text: String::new(),
+            prompt_text: String::new(),
+            attachments: vec![ResolvedModelAttachment {
+                blob_ref: image_blob,
+                path: image_path,
+                text_content: None,
+            }],
+        };
+
+        let parts = build_openai_user_content_parts(&input)
+            .await
+            .expect("image attachment should serialize");
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "input_image");
+        assert!(parts
+            .iter()
+            .all(|part| part.get("type").and_then(Value::as_str) != Some("input_text")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn build_openai_user_content_parts_keeps_one_output_per_attachment() {
+        let root = temp_blob_root();
+        let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
+
+        let image_blob = BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "img_0123456789abcdef.png".to_string(),
+            size: 4,
+            mime: "image/png".to_string(),
+            filename_original: "image.png".to_string(),
+            spool_day: "2026-03-31".to_string(),
+        };
+        let image_path = toolkit.resolve(&image_blob);
+        std::fs::create_dir_all(
+            image_path
+                .parent()
+                .expect("image blob parent must exist for test setup"),
+        )
+        .expect("create image parent");
+        std::fs::write(&image_path, [0_u8, 1_u8, 2_u8, 3_u8]).expect("write image bytes");
+
+        let file_blob = BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "doc_0123456789abcdef.docx".to_string(),
+            size: 8,
+            mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                .to_string(),
+            filename_original: "report.docx".to_string(),
+            spool_day: "2026-03-31".to_string(),
+        };
+        let file_path = toolkit.resolve(&file_blob);
+        std::fs::create_dir_all(
+            file_path
+                .parent()
+                .expect("file blob parent must exist for test setup"),
+        )
+        .expect("create file parent");
+        std::fs::write(&file_path, b"DOCXTEST").expect("write file bytes");
+
+        let text_blob = BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "txt_0123456789abcdef.txt".to_string(),
+            size: 12,
+            mime: "text/plain".to_string(),
+            filename_original: "notes.txt".to_string(),
+            spool_day: "2026-03-31".to_string(),
+        };
+
+        let input = ResolvedModelInput {
+            main_text: String::new(),
+            prompt_text: String::new(),
+            attachments: vec![
+                ResolvedModelAttachment {
+                    blob_ref: text_blob,
+                    path: root.join("unused-notes-path.txt"),
+                    text_content: Some("linea uno".to_string()),
+                },
+                ResolvedModelAttachment {
+                    blob_ref: image_blob,
+                    path: image_path,
+                    text_content: None,
+                },
+                ResolvedModelAttachment {
+                    blob_ref: file_blob,
+                    path: file_path,
+                    text_content: None,
+                },
+            ],
+        };
+
+        let parts = build_openai_user_content_parts(&input)
+            .await
+            .expect("attachments should map to input parts");
+
+        // With empty main text, each attachment must produce exactly one output part.
+        assert_eq!(parts.len(), input.attachments.len());
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(parts[2]["type"], "input_file");
+        assert_eq!(parts[2]["filename"], "report.docx");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn text_response_offloads_large_content_to_content_ref() {
         let root = temp_blob_root();

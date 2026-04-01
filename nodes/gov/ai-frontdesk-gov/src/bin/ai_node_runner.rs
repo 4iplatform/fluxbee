@@ -902,8 +902,31 @@ impl AiNode for GenericAiNode {
         let output = match &behavior {
             NodeBehavior::Echo => format!("Echo: {input}"),
             NodeBehavior::OpenAiChat(openai) => {
+                let input_parts = if openai.multimodal {
+                    if let Some(resolved) = resolved_user_input.as_ref() {
+                        match build_openai_user_content_parts(resolved).await {
+                            Ok(parts) => Some(parts),
+                            Err(err) => {
+                                tracing::warn!(
+                                    node_name = %self.node_name,
+                                    trace_id = %msg.routing.trace_id,
+                                    error = %err,
+                                    "failed to build structured user input parts; replying with canonical attachment error payload"
+                                );
+                                return Ok(Some(build_reply_message_runtime_src(
+                                    &msg,
+                                    err.to_error_payload(),
+                                )));
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 match self
-                    .run_openai_chat(openai, input, resolved_user_input.as_ref(), &behavior_ctx)
+                    .run_openai_chat(openai, input, input_parts, &behavior_ctx)
                     .await
                 {
                     Ok(output) => output,
@@ -941,7 +964,7 @@ impl GenericAiNode {
         &self,
         openai: &OpenAiChatRuntime,
         input: String,
-        resolved_user_input: Option<&ResolvedModelInput>,
+        input_parts: Option<Vec<Value>>,
         ctx: &BehaviorContext,
     ) -> fluxbee_ai_sdk::Result<String> {
         let api_key = self.resolve_openai_api_key(openai).await.ok_or_else(|| {
@@ -954,21 +977,6 @@ impl GenericAiNode {
         if let Some(base_url) = &openai.base_url {
             client = client.with_base_url(base_url.clone());
         }
-        let input_parts = if openai.multimodal {
-            if let Some(resolved) = resolved_user_input {
-                Some(
-                    build_openai_user_content_parts(resolved)
-                        .await
-                        .map_err(|err| {
-                            fluxbee_ai_sdk::errors::AiSdkError::Protocol(err.to_string())
-                        })?,
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         let tool_registry = self.build_tool_registry(ctx)?;
         if !tool_registry.definitions().is_empty() {
             let model = client.clone().function_model(
