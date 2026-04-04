@@ -4,7 +4,6 @@ use crate::{SemanticTaggerOutput, COGNITION_REASON_CANONICAL_SIGNALS};
 
 // Transitional bootstrap tagger kept isolated until the AI-backed semantic
 // pipeline replaces it. This is not the target long-term architecture.
-#[derive(Debug, Clone, Default)]
 pub(super) fn run_bootstrap_lexical_tagger(
     text: &str,
     max_tags: usize,
