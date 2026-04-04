@@ -430,6 +430,74 @@ The tagger outputs plain strings only — it does not know who sent the message.
 
 This enriched form is what the Context Evaluator and Reason Evaluator receive. The tagger never sees ILK data.
 
+### 6.1.1 Operational Contract of `AI.tagger`
+
+`AI.tagger` is an internal component of `SY.cognition`. It is not a separate node, does not publish its own NATS subject, and does not alter the external carrier contract.
+
+Operational role:
+- run once per turn before context/reason structural evaluation
+- produce semantic extraction only
+- leave thread sequencing, durable entities, SHM, and router enrichment unchanged
+
+Minimum runtime input:
+
+```json
+{
+  "text": "Message text",
+  "word_count": 18,
+  "max_tags": 12,
+  "max_reason_signals": 4,
+  "canonical_signals": ["resolve", "inform", "protect", "connect", "challenge", "confirm", "request", "abandon"],
+  "identity_hints": {
+    "src_ilk": "ilk:uuid-or-null",
+    "dst_ilk": "ilk:uuid-or-null",
+    "ich": "ich-or-null"
+  }
+}
+```
+
+Notes:
+- `identity_hints` are auxiliary runtime hints only.
+- They are not part of the semantic durable contract and must not change the output schema.
+- The durable/product contract remains `tags + reason_signals_*`.
+
+Minimum runtime output:
+
+```json
+{
+  "tags": ["billing", "refund", "complaint"],
+  "reason_signals_canonical": ["resolve", "challenge"],
+  "reason_signals_extra": ["urgency", "frustration"]
+}
+```
+
+Mandatory backend post-processing:
+- lowercase
+- trim
+- dedup
+- hard limit on list sizes
+- strict filter of `reason_signals_canonical` against the closed 8-signal set
+
+Failure semantics:
+- if the AI response is missing, empty, malformed, or out of contract, the turn is counted as a semantic tagger failure
+- carrier and durable entity schemas do not change
+- `SY.cognition` reports degraded semantic capability for that turn/window
+- there is no silent lexical fallback as the target product behavior for stage 2
+
+Operational config to expose in `SY.cognition` when implemented:
+- `provider`
+- `model`
+- `timeout_ms`
+- low/fixed sampling policy
+- `max_tags`
+- `max_reason_signals`
+
+Operational metrics to expose in `STATUS` / `CONFIG_GET` when implemented:
+- `semantic_tagger_calls_total`
+- `semantic_tagger_failures_total`
+- `semantic_tagger_invalid_outputs_total`
+- `last_semantic_model`
+
 ### 6.2 Context Evaluator
 
 Unchanged from cognitive lab audit. Tags-only input, additive mode.

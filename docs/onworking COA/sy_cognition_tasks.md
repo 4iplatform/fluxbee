@@ -674,11 +674,50 @@ Definición de alcance:
 - el tagger/summarizer determinístico actual no se considera fallback oficial de producto para esta etapa
 - ese código se conserva solo como bootstrap transitorio, encapsulado y fácil de remover durante la migración
 
-- [ ] COG-M11-T1. Diseñar contrato operacional del `AI.tagger` sin cambiar `tags/reason_signals_*`.
+- [x] COG-M11-T1. Diseñar contrato operacional del `AI.tagger` sin cambiar `tags/reason_signals_*`:
+  - `AI.tagger` queda como componente interno de `SY.cognition`, no como nodo separado ni subject NATS propio
+  - hace una llamada AI por turn para extracción semántica, antes del evaluador estructural
+  - input operacional mínimo:
+    - `text`
+    - `word_count`
+    - `max_tags`
+    - `max_reason_signals`
+    - lista cerrada de `canonical_signals`
+    - hints opcionales de canal/identidad (`src_ilk`, `dst_ilk`, `ich`) solo como metadata auxiliar, no como parte del contrato semántico durable
+  - output operacional mínimo:
+    - `tags`
+    - `reason_signals_canonical`
+    - `reason_signals_extra`
+  - post-proceso obligatorio backend:
+    - lowercase
+    - trim
+    - dedup
+    - limit
+    - filtro estricto de `reason_signals_canonical` contra el set cerrado de 8 señales
+  - si la respuesta AI viene vacía, inválida o fuera de contrato:
+    - se cuenta como failure del `AI.tagger`
+    - no cambia carrier ni durable model
+    - `SY.cognition` queda degradado para semántica de ese turn; no hace rollback silencioso al lexical como camino oficial
+  - configuración operacional a introducir en `SY.cognition`:
+    - provider
+    - model
+    - timeout
+    - temperatura baja / fija
+    - límites de salida (`max_tags`, `max_reason_signals`)
+  - observabilidad mínima a exponer en `STATUS/CONFIG_GET` cuando se implemente:
+    - `semantic_tagger_calls_total`
+    - `semantic_tagger_failures_total`
+    - `semantic_tagger_invalid_outputs_total`
+    - `last_semantic_model`
 - [ ] COG-M11-T2. Reemplazar el rol central del tagger lexical por `AI.tagger` como motor semántico oficial:
   - sin feature flag de fallback de producto
   - sin dualidad permanente `lexical|semantic`
   - dejando el bootstrap lexical solo como código transitorio/removible
+  - estado actual de implementación:
+    - `SY.cognition` ya expone `config.semantic_tagger.*` en `CONFIG_GET/CONFIG_SET`
+    - `STATUS/CONFIG_GET` ya exponen contadores y estado del `semantic_tagger`
+    - el bootstrap lexical ya quedó aislado y consume los límites del `semantic_tagger`
+    - sigue pendiente el reemplazo del bootstrap por la llamada AI real; por eso esta tarea todavía no se marca cerrada
 - [ ] COG-M11-T3. Mejorar extracción semántica de `tags`:
   - sinonimia
   - paráfrasis

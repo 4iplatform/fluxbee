@@ -61,6 +61,9 @@ const COGNITION_TURNS_SID: u32 = 27;
 const DURABLE_QUEUE_TURNS: &str = "durable.sy-cognition.turns";
 const COGNITION_DEFAULT_CONTEXT_OPEN_THRESHOLD: f64 = 0.5;
 const COGNITION_DEFAULT_REASON_OPEN_THRESHOLD: f64 = 0.5;
+const COGNITION_DEFAULT_SEMANTIC_TAGGER_PROVIDER: &str = "openai";
+const COGNITION_DEFAULT_SEMANTIC_TAGGER_MODEL: &str = "gpt-4.1-mini";
+const COGNITION_DEFAULT_SEMANTIC_TAGGER_TIMEOUT_MS: u64 = 8_000;
 const COGNITION_CONTEXT_DECAY_FACTOR: f64 = 0.85;
 const COGNITION_REASON_DECAY_FACTOR: f64 = 0.75;
 const COGNITION_COOCCURRENCE_DECAY_FACTOR: f64 = 0.80;
@@ -119,12 +122,34 @@ impl Default for CognitionThresholds {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CognitionSemanticTaggerConfig {
+    provider: String,
+    model: String,
+    timeout_ms: u64,
+    max_tags: usize,
+    max_reason_signals: usize,
+}
+
+impl Default for CognitionSemanticTaggerConfig {
+    fn default() -> Self {
+        Self {
+            provider: COGNITION_DEFAULT_SEMANTIC_TAGGER_PROVIDER.to_string(),
+            model: COGNITION_DEFAULT_SEMANTIC_TAGGER_MODEL.to_string(),
+            timeout_ms: COGNITION_DEFAULT_SEMANTIC_TAGGER_TIMEOUT_MS,
+            max_tags: COGNITION_MAX_TAGS,
+            max_reason_signals: COGNITION_MAX_REASON_SIGNALS,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CognitionControlState {
     schema_version: u32,
     config_version: u64,
     ai_secret_source: CognitionAiSecretSource,
     thresholds: CognitionThresholds,
+    semantic_tagger: CognitionSemanticTaggerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +202,11 @@ struct CognitionRuntimeState {
     shm_payload_bytes: u64,
     last_shm_sync_status: Option<String>,
     last_shm_sync_at: Option<String>,
+    semantic_tagger_calls_total: u64,
+    semantic_tagger_failures_total: u64,
+    semantic_tagger_invalid_outputs_total: u64,
+    last_semantic_model: Option<String>,
+    last_semantic_impl: Option<String>,
 }
 
 #[derive(Debug)]
@@ -601,8 +631,18 @@ async fn handle_turn_payload(
     };
 
     let text = extract_turn_text(&msg.payload).unwrap_or_default();
-    let tagger = run_bootstrap_lexical_tagger(&text);
-    let thresholds = app_state.control_state.lock().await.thresholds.clone();
+    let (thresholds, semantic_tagger_config) = {
+        let control_state = app_state.control_state.lock().await;
+        (
+            control_state.thresholds.clone(),
+            control_state.semantic_tagger.clone(),
+        )
+    };
+    let tagger = run_bootstrap_lexical_tagger(
+        &text,
+        semantic_tagger_config.max_tags,
+        semantic_tagger_config.max_reason_signals,
+    );
     let ts = chrono::Utc::now().to_rfc3339();
     let thread_seq = msg.meta.thread_seq;
     let src_ilk = msg.meta.src_ilk.clone();
@@ -653,6 +693,13 @@ async fn handle_turn_payload(
             thread_id = %thread_id,
             "sy.cognition failed to sync jsr-memory"
         );
+    }
+
+    {
+        let mut state = app_state.runtime_state.lock().await;
+        state.semantic_tagger_calls_total = state.semantic_tagger_calls_total.saturating_add(1);
+        state.last_semantic_model = Some(semantic_tagger_config.model.clone());
+        state.last_semantic_impl = Some("bootstrap_lexical_transitional".to_string());
     }
 
     let (
@@ -1815,6 +1862,15 @@ fn build_status_payload(
             "configured": control_state.ai_secret_source != CognitionAiSecretSource::Missing,
             "source": control_state.ai_secret_source.as_str()
         },
+        "semantic_tagger": {
+            "provider": control_state.semantic_tagger.provider,
+            "model": control_state.semantic_tagger.model,
+            "timeout_ms": control_state.semantic_tagger.timeout_ms,
+            "max_tags": control_state.semantic_tagger.max_tags,
+            "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
+            "ai_required": true,
+            "implementation_status": "bootstrap_transitional"
+        },
         "turns_consumer": {
             "subject": SUBJECT_STORAGE_TURNS,
             "mode": if use_durable_consumer { "durable" } else { "volatile" },
@@ -1849,7 +1905,12 @@ fn build_status_payload(
             "rebuilt_threads_total": runtime_state.rebuilt_threads_total,
             "last_rebuild_status": runtime_state.last_rebuild_status,
             "last_rebuild_source": runtime_state.last_rebuild_source,
-            "last_rebuild_at": runtime_state.last_rebuild_at
+            "last_rebuild_at": runtime_state.last_rebuild_at,
+            "semantic_tagger_calls_total": runtime_state.semantic_tagger_calls_total,
+            "semantic_tagger_failures_total": runtime_state.semantic_tagger_failures_total,
+            "semantic_tagger_invalid_outputs_total": runtime_state.semantic_tagger_invalid_outputs_total,
+            "last_semantic_model": runtime_state.last_semantic_model,
+            "last_semantic_impl": runtime_state.last_semantic_impl
         },
         "paths": {
             "state_dir": runtime_paths.state_dir,
@@ -1892,11 +1953,11 @@ fn build_cognition_config_get_payload(
                 .to_string(),
         ),
         Value::String(
-            "The OpenAI provider secret is optional at this stage; the node starts in degraded mode when missing."
+            "The OpenAI provider secret is optional for the current bootstrap pipeline, but required for the AI semantic stage."
                 .to_string(),
         ),
         Value::String(
-            "Deterministic v1 writer for threads, contexts, reasons, cooccurrences, scopes, scope_instances, memories, and episodes is active; jsr-memory SHM writer is active and router enrichment is local-only after routing."
+            "The semantic tagger is modeled as an AI-backed internal component of SY.cognition; the current lexical tagger remains isolated as transitional bootstrap code."
                 .to_string(),
         ),
         Value::String(
@@ -1929,6 +1990,15 @@ fn build_cognition_config_get_payload(
                     "provider": "openai",
                     "api_key": if configured { Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()) } else { Value::Null }
                 }
+            },
+            "semantic_tagger": {
+                "provider": control_state.semantic_tagger.provider,
+                "model": control_state.semantic_tagger.model,
+                "timeout_ms": control_state.semantic_tagger.timeout_ms,
+                "max_tags": control_state.semantic_tagger.max_tags,
+                "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
+                "ai_required": true,
+                "implementation_status": "bootstrap_transitional"
             },
             "thresholds": {
                 "context_open": control_state.thresholds.context_open,
@@ -1970,7 +2040,12 @@ fn build_cognition_config_get_payload(
             "shm_pruned_threads_total": runtime_state.shm_pruned_threads_total,
             "shm_payload_bytes": runtime_state.shm_payload_bytes,
             "last_shm_sync_status": runtime_state.last_shm_sync_status,
-            "last_shm_sync_at": runtime_state.last_shm_sync_at
+            "last_shm_sync_at": runtime_state.last_shm_sync_at,
+            "semantic_tagger_calls_total": runtime_state.semantic_tagger_calls_total,
+            "semantic_tagger_failures_total": runtime_state.semantic_tagger_failures_total,
+            "semantic_tagger_invalid_outputs_total": runtime_state.semantic_tagger_invalid_outputs_total,
+            "last_semantic_model": runtime_state.last_semantic_model,
+            "last_semantic_impl": runtime_state.last_semantic_impl
         },
         "contract": {
             "node_family": "SY",
@@ -1979,6 +2054,11 @@ fn build_cognition_config_get_payload(
             "required_fields": [],
             "optional_fields": [
                 "config.secrets.openai.api_key",
+                "config.semantic_tagger.provider",
+                "config.semantic_tagger.model",
+                "config.semantic_tagger.timeout_ms",
+                "config.semantic_tagger.max_tags",
+                "config.semantic_tagger.max_reason_signals",
                 "config.thresholds.context_open",
                 "config.thresholds.reason_open"
             ],
@@ -2046,6 +2126,19 @@ fn apply_cognition_config_set(
             ));
         }
     };
+    let semantic_tagger = match extract_cognition_semantic_tagger_config(&msg.payload) {
+        Ok(value) => value,
+        Err(err) => {
+            return Ok(config_error_response(
+                node_name,
+                control_state,
+                runtime_paths,
+                use_durable_consumer,
+                "invalid_config",
+                &err.to_string(),
+            ));
+        }
+    };
 
     if let Some(api_key) = openai_api_key.as_deref() {
         persist_local_openai_api_key(
@@ -2069,6 +2162,9 @@ fn apply_cognition_config_set(
     if let Some(thresholds) = thresholds {
         control_state.thresholds = thresholds;
     }
+    if let Some(semantic_tagger) = semantic_tagger {
+        control_state.semantic_tagger = semantic_tagger;
+    }
     control_state.config_version = control_state.config_version.saturating_add(1);
     persist_cognition_config_state(node_name, control_state)?;
 
@@ -2080,6 +2176,15 @@ fn apply_cognition_config_set(
         "config_version": control_state.config_version,
         "apply_mode": NODE_CONFIG_APPLY_MODE_REPLACE,
         "config": {
+            "semantic_tagger": {
+                "provider": control_state.semantic_tagger.provider,
+                "model": control_state.semantic_tagger.model,
+                "timeout_ms": control_state.semantic_tagger.timeout_ms,
+                "max_tags": control_state.semantic_tagger.max_tags,
+                "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
+                "ai_required": true,
+                "implementation_status": "bootstrap_transitional"
+            },
             "thresholds": {
                 "context_open": control_state.thresholds.context_open,
                 "reason_open": control_state.thresholds.reason_open
@@ -2094,7 +2199,7 @@ fn apply_cognition_config_set(
         } else {
             Value::Array(Vec::new())
         },
-        "message": "SY.cognition local config persisted. Provider secret affects future AI calls once the cognitive pipeline is enabled."
+        "message": "SY.cognition local config persisted. Semantic tagger settings now describe the future AI-backed engine; bootstrap lexical processing remains transitional until the provider path is wired."
     }))
 }
 
@@ -2179,11 +2284,24 @@ fn bootstrap_cognition_control_state(
                 .and_then(|value| serde_json::from_value::<CognitionThresholds>(value).ok())
         })
         .unwrap_or_default();
+    let semantic_tagger = persisted
+        .as_ref()
+        .and_then(|value| {
+            value
+                .config
+                .get("semantic_tagger")
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<CognitionSemanticTaggerConfig>(value).ok()
+                })
+        })
+        .unwrap_or_default();
     let state = CognitionControlState {
         schema_version,
         config_version,
         ai_secret_source,
         thresholds,
+        semantic_tagger,
     };
     persist_cognition_config_state(node_name, &state)?;
     Ok(state)
@@ -2205,6 +2323,13 @@ fn persist_cognition_config_state(
         config_version: state.config_version,
         node_name: node_name.to_string(),
         config: json!({
+            "semantic_tagger": {
+                "provider": state.semantic_tagger.provider,
+                "model": state.semantic_tagger.model,
+                "timeout_ms": state.semantic_tagger.timeout_ms,
+                "max_tags": state.semantic_tagger.max_tags,
+                "max_reason_signals": state.semantic_tagger.max_reason_signals
+            },
             "thresholds": {
                 "context_open": state.thresholds.context_open,
                 "reason_open": state.thresholds.reason_open
@@ -2267,6 +2392,51 @@ fn extract_cognition_thresholds(
         context_open,
         reason_open,
     }))
+}
+
+fn extract_cognition_semantic_tagger_config(
+    body: &Value,
+) -> Result<Option<CognitionSemanticTaggerConfig>, CognitionError> {
+    let Some(config) = body
+        .get("config")
+        .and_then(|value| value.get("semantic_tagger"))
+    else {
+        return Ok(None);
+    };
+    let mut merged = CognitionSemanticTaggerConfig::default();
+    if let Some(provider) = config.get("provider").and_then(Value::as_str) {
+        let provider = provider.trim();
+        if provider.is_empty() {
+            return Err("config.semantic_tagger.provider must not be empty".into());
+        }
+        merged.provider = provider.to_string();
+    }
+    if let Some(model) = config.get("model").and_then(Value::as_str) {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err("config.semantic_tagger.model must not be empty".into());
+        }
+        merged.model = model.to_string();
+    }
+    if let Some(timeout_ms) = config.get("timeout_ms").and_then(Value::as_u64) {
+        if timeout_ms == 0 {
+            return Err("config.semantic_tagger.timeout_ms must be > 0".into());
+        }
+        merged.timeout_ms = timeout_ms;
+    }
+    if let Some(max_tags) = config.get("max_tags").and_then(Value::as_u64) {
+        if max_tags == 0 {
+            return Err("config.semantic_tagger.max_tags must be > 0".into());
+        }
+        merged.max_tags = max_tags as usize;
+    }
+    if let Some(max_reason_signals) = config.get("max_reason_signals").and_then(Value::as_u64) {
+        if max_reason_signals == 0 {
+            return Err("config.semantic_tagger.max_reason_signals must be > 0".into());
+        }
+        merged.max_reason_signals = max_reason_signals as usize;
+    }
+    Ok(Some(merged))
 }
 
 fn extract_turn_text(payload: &Value) -> Option<String> {

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{COGNITION_MAX_REASON_SIGNALS, COGNITION_MAX_TAGS, COGNITION_REASON_CANONICAL_SIGNALS};
+use crate::COGNITION_REASON_CANONICAL_SIGNALS;
 
 // Transitional bootstrap tagger kept isolated until the AI-backed semantic
 // pipeline replaces it. This is not the target long-term architecture.
@@ -11,7 +11,11 @@ pub(super) struct DeterministicTaggerOutput {
     pub(super) reason_signals_extra: Vec<String>,
 }
 
-pub(super) fn run_bootstrap_lexical_tagger(text: &str) -> DeterministicTaggerOutput {
+pub(super) fn run_bootstrap_lexical_tagger(
+    text: &str,
+    max_tags: usize,
+    max_reason_signals: usize,
+) -> DeterministicTaggerOutput {
     let normalized = normalize_text(text);
     if normalized.is_empty() {
         return DeterministicTaggerOutput::default();
@@ -249,7 +253,7 @@ pub(super) fn run_bootstrap_lexical_tagger(text: &str) -> DeterministicTaggerOut
         extra.push("escalation".to_string());
     }
 
-    tags = dedup_limit(tags, COGNITION_MAX_TAGS);
+    tags = dedup_limit(tags, max_tags);
     canonical = dedup_limit(
         canonical
             .into_iter()
@@ -259,12 +263,12 @@ pub(super) fn run_bootstrap_lexical_tagger(text: &str) -> DeterministicTaggerOut
                     .any(|allowed| allowed == value)
             })
             .collect(),
-        COGNITION_MAX_REASON_SIGNALS,
+        max_reason_signals,
     );
-    extra = dedup_limit(extra, COGNITION_MAX_REASON_SIGNALS);
+    extra = dedup_limit(extra, max_reason_signals);
 
     if tags.is_empty() {
-        tags = fallback_tags(&tokens, COGNITION_MAX_TAGS);
+        tags = fallback_tags(&tokens, max_tags);
     }
 
     DeterministicTaggerOutput {
