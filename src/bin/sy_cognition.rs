@@ -40,6 +40,7 @@ use fluxbee_sdk::{
 use json_router::nats::{NatsSubscriber as RouterNatsSubscriber, SUBJECT_STORAGE_TURNS};
 use json_router::shm::{
     memory_shm_name_for_hive, MemoryRegionWriter, MemoryShmSnapshot, MemoryShmThreadEntry,
+    MEMORY_MAX_DATA_SIZE,
 };
 
 type CognitionError = Box<dyn std::error::Error + Send + Sync>;
@@ -166,6 +167,11 @@ struct CognitionRuntimeState {
     last_rebuild_status: Option<String>,
     last_rebuild_source: Option<String>,
     last_rebuild_at: Option<String>,
+    shm_hot_threads_total: u64,
+    shm_pruned_threads_total: u64,
+    shm_payload_bytes: u64,
+    last_shm_sync_status: Option<String>,
+    last_shm_sync_at: Option<String>,
 }
 
 #[derive(Debug)]
@@ -320,6 +326,31 @@ struct RebuildSnapshot {
     total_scopes: u64,
     total_memories: u64,
     total_episodes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MemoryHotSetStats {
+    selected_threads_total: u64,
+    pruned_threads_total: u64,
+    payload_bytes: u64,
+}
+
+#[derive(Debug)]
+struct MemoryHotSetBuild {
+    snapshot: MemoryShmSnapshot,
+    selected_thread_ids: HashSet<String>,
+    stats: MemoryHotSetStats,
+}
+
+#[derive(Debug)]
+struct MemoryHotThreadCandidate {
+    entry: MemoryShmThreadEntry,
+    serialized_bytes: usize,
+    has_active_scope: bool,
+    live_entities_total: usize,
+    last_seen_epoch_ms: i64,
+    latest_thread_seq: u64,
+    turn_count: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -560,12 +591,7 @@ async fn handle_turn_payload(
         }
     };
 
-    let Some(thread_id) = msg
-        .meta
-        .thread_id
-        .clone()
-        .or_else(|| legacy_context_thread_id(&msg))
-    else {
+    let Some(thread_id) = msg.meta.thread_id.clone() else {
         let mut state = app_state.runtime_state.lock().await;
         state.invalid_turns_total = state.invalid_turns_total.saturating_add(1);
         state.last_trace_id = Some(msg.routing.trace_id.clone());
@@ -718,27 +744,190 @@ async fn handle_turn_payload(
 }
 
 async fn sync_memory_shm(app_state: &CognitionAppState) -> Result<(), json_router::shm::ShmError> {
-    let snapshot = {
+    let hot_set = {
         let threads = app_state.thread_states.lock().await;
-        let mut entries = Vec::with_capacity(threads.len());
-        for (thread_id, thread_state) in threads.iter() {
-            entries.push(MemoryShmThreadEntry {
-                thread_id: thread_id.clone(),
-                package: build_memory_package_for_thread(thread_id, thread_state),
-            });
-        }
-        MemoryShmSnapshot {
-            schema_version: 1,
-            updated_at: json_router::shm::now_epoch_ms(),
-            threads: entries,
-        }
+        build_memory_hot_set_snapshot(&threads)?
     };
 
+    let sync_status = if hot_set.stats.pruned_threads_total > 0 {
+        "ok_pruned"
+    } else {
+        "ok"
+    };
     let mut memory_region = app_state.memory_region.lock().await;
     if let Some(region) = memory_region.as_mut() {
-        region.write_snapshot(&snapshot)?;
+        region.write_snapshot(&hot_set.snapshot)?;
+    } else {
+        let mut state = app_state.runtime_state.lock().await;
+        state.last_shm_sync_status = Some("skipped_missing_region".to_string());
+        state.last_shm_sync_at = Some(chrono::Utc::now().to_rfc3339());
+        return Ok(());
     }
+
+    let mut state = app_state.runtime_state.lock().await;
+    state.shm_hot_threads_total = hot_set.stats.selected_threads_total;
+    state.shm_pruned_threads_total = hot_set.stats.pruned_threads_total;
+    state.shm_payload_bytes = hot_set.stats.payload_bytes;
+    state.last_shm_sync_status = Some(sync_status.to_string());
+    state.last_shm_sync_at = Some(chrono::Utc::now().to_rfc3339());
     Ok(())
+}
+
+fn build_memory_hot_set_snapshot(
+    threads: &HashMap<String, ThreadCognitionState>,
+) -> Result<MemoryHotSetBuild, json_router::shm::ShmError> {
+    let updated_at = json_router::shm::now_epoch_ms();
+    let base_snapshot = MemoryShmSnapshot {
+        schema_version: 1,
+        updated_at,
+        threads: Vec::new(),
+    };
+    let base_size = serde_json::to_vec(&base_snapshot)?.len();
+    let mut candidates = Vec::with_capacity(threads.len());
+    for (thread_id, thread_state) in threads {
+        let entry = MemoryShmThreadEntry {
+            thread_id: thread_id.clone(),
+            package: build_memory_package_for_thread(thread_id, thread_state),
+        };
+        let serialized_bytes = serde_json::to_vec(&entry)?.len();
+        candidates.push(MemoryHotThreadCandidate {
+            entry,
+            serialized_bytes,
+            has_active_scope: thread_state.active_scope.is_some(),
+            live_entities_total: thread_live_entities_total(thread_state),
+            last_seen_epoch_ms: thread_last_seen_epoch_ms(thread_state),
+            latest_thread_seq: thread_state.latest_thread_seq.unwrap_or(0),
+            turn_count: thread_state.turn_count,
+        });
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .has_active_scope
+            .cmp(&left.has_active_scope)
+            .then_with(|| right.live_entities_total.cmp(&left.live_entities_total))
+            .then_with(|| right.last_seen_epoch_ms.cmp(&left.last_seen_epoch_ms))
+            .then_with(|| right.latest_thread_seq.cmp(&left.latest_thread_seq))
+            .then_with(|| right.turn_count.cmp(&left.turn_count))
+            .then_with(|| left.entry.thread_id.cmp(&right.entry.thread_id))
+    });
+
+    let mut selected_thread_ids = HashSet::with_capacity(candidates.len());
+    let mut selected_entries = Vec::with_capacity(candidates.len());
+    let mut payload_bytes = base_size;
+    for candidate in candidates {
+        let extra_bytes = candidate.serialized_bytes + usize::from(!selected_entries.is_empty());
+        if payload_bytes.saturating_add(extra_bytes) > MEMORY_MAX_DATA_SIZE {
+            continue;
+        }
+        payload_bytes = payload_bytes.saturating_add(extra_bytes);
+        selected_thread_ids.insert(candidate.entry.thread_id.clone());
+        selected_entries.push(candidate.entry);
+    }
+
+    let selected_threads_total = selected_entries.len() as u64;
+    let pruned_threads_total = threads.len().saturating_sub(selected_entries.len()) as u64;
+    Ok(MemoryHotSetBuild {
+        snapshot: MemoryShmSnapshot {
+            schema_version: 1,
+            updated_at,
+            threads: selected_entries,
+        },
+        selected_thread_ids,
+        stats: MemoryHotSetStats {
+            selected_threads_total,
+            pruned_threads_total,
+            payload_bytes: payload_bytes as u64,
+        },
+    })
+}
+
+fn apply_memory_hot_set_to_rebuild_snapshot(
+    snapshot: &mut RebuildSnapshot,
+) -> Result<MemoryHotSetStats, json_router::shm::ShmError> {
+    let hot_set = build_memory_hot_set_snapshot(&snapshot.threads)?;
+    snapshot
+        .threads
+        .retain(|thread_id, _| hot_set.selected_thread_ids.contains(thread_id));
+    recount_rebuild_snapshot_totals(snapshot);
+    Ok(hot_set.stats)
+}
+
+fn recount_rebuild_snapshot_totals(snapshot: &mut RebuildSnapshot) {
+    snapshot.total_contexts = snapshot
+        .threads
+        .values()
+        .map(|thread| thread.contexts.len() as u64)
+        .sum();
+    snapshot.total_reasons = snapshot
+        .threads
+        .values()
+        .map(|thread| thread.reasons.len() as u64)
+        .sum();
+    snapshot.total_cooccurrences = snapshot
+        .threads
+        .values()
+        .map(|thread| thread.cooccurrences.len() as u64)
+        .sum();
+    snapshot.total_scopes = snapshot
+        .threads
+        .values()
+        .filter(|thread| thread.active_scope.is_some())
+        .count() as u64;
+    snapshot.total_memories = snapshot
+        .threads
+        .values()
+        .map(|thread| thread.memories.len() as u64)
+        .sum();
+    snapshot.total_episodes = snapshot
+        .threads
+        .values()
+        .map(|thread| thread.episodes.len() as u64)
+        .sum();
+}
+
+fn thread_live_entities_total(thread_state: &ThreadCognitionState) -> usize {
+    let open_contexts = thread_state
+        .contexts
+        .values()
+        .filter(|context| context.status == "open")
+        .count();
+    let open_reasons = thread_state
+        .reasons
+        .values()
+        .filter(|reason| reason.status == "open")
+        .count();
+    let open_cooccurrences = thread_state
+        .cooccurrences
+        .values()
+        .filter(|cooccurrence| cooccurrence.status == "open")
+        .count();
+    usize::from(thread_state.active_scope.is_some())
+        + open_contexts
+        + open_reasons
+        + open_cooccurrences
+        + thread_state.memories.len()
+        + thread_state.episodes.len()
+}
+
+fn thread_last_seen_epoch_ms(thread_state: &ThreadCognitionState) -> i64 {
+    thread_state
+        .last_seen_at
+        .as_deref()
+        .and_then(parse_rfc3339_epoch_ms)
+        .or_else(|| {
+            thread_state
+                .first_seen_at
+                .as_deref()
+                .and_then(parse_rfc3339_epoch_ms)
+        })
+        .unwrap_or_default()
+}
+
+fn parse_rfc3339_epoch_ms(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
 }
 
 async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
@@ -768,7 +957,7 @@ async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
         return;
     };
 
-    let snapshot = match load_rebuild_snapshot_from_storage(&base_database_url).await {
+    let mut snapshot = match load_rebuild_snapshot_from_storage(&base_database_url).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let mut state = app_state.runtime_state.lock().await;
@@ -779,6 +968,22 @@ async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
                 node_name = %app_state.node_name,
                 error = %err,
                 "sy.cognition startup rebuild from durable failed; continuing live"
+            );
+            return;
+        }
+    };
+
+    let hot_set_stats = match apply_memory_hot_set_to_rebuild_snapshot(&mut snapshot) {
+        Ok(stats) => stats,
+        Err(err) => {
+            let mut state = app_state.runtime_state.lock().await;
+            state.rebuild_failures_total = state.rebuild_failures_total.saturating_add(1);
+            state.last_rebuild_status = Some(format!("failed:{err}"));
+            state.last_rebuild_source = Some("storage_durable".to_string());
+            tracing::warn!(
+                node_name = %app_state.node_name,
+                error = %err,
+                "sy.cognition startup rebuild failed while bounding jsr-memory hot set; continuing live"
             );
             return;
         }
@@ -801,7 +1006,11 @@ async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
         RuntimeRefreshDelta {
             rebuilt_threads_total,
             rebuild_source: Some("storage_durable".to_string()),
-            rebuild_status: Some("ok".to_string()),
+            rebuild_status: Some(if hot_set_stats.pruned_threads_total > 0 {
+                "ok_hot_set_pruned".to_string()
+            } else {
+                "ok".to_string()
+            }),
             rebuild_success: true,
             ..RuntimeRefreshDelta::default()
         },
@@ -816,6 +1025,9 @@ async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
         scopes = snapshot.total_scopes,
         memories = snapshot.total_memories,
         episodes = snapshot.total_episodes,
+        shm_hot_threads_total = hot_set_stats.selected_threads_total,
+        shm_pruned_threads_total = hot_set_stats.pruned_threads_total,
+        shm_payload_bytes = hot_set_stats.payload_bytes,
         "sy.cognition startup rebuild from durable completed"
     );
 }
@@ -1646,6 +1858,14 @@ fn build_status_payload(
             "cache_dir": runtime_paths.cache_dir,
             "shm_dir": runtime_paths.shm_dir,
             "memory_lance": runtime_paths.memory_lance_path
+        },
+        "shm": {
+            "capacity_bytes": MEMORY_MAX_DATA_SIZE,
+            "hot_threads_total": runtime_state.shm_hot_threads_total,
+            "pruned_threads_total": runtime_state.shm_pruned_threads_total,
+            "payload_bytes": runtime_state.shm_payload_bytes,
+            "last_sync_status": runtime_state.last_shm_sync_status,
+            "last_sync_at": runtime_state.last_shm_sync_at
         }
     })
 }
@@ -1747,7 +1967,12 @@ fn build_cognition_config_get_payload(
             "rebuilt_threads_total": runtime_state.rebuilt_threads_total,
             "last_rebuild_status": runtime_state.last_rebuild_status,
             "last_rebuild_source": runtime_state.last_rebuild_source,
-            "last_rebuild_at": runtime_state.last_rebuild_at
+            "last_rebuild_at": runtime_state.last_rebuild_at,
+            "shm_hot_threads_total": runtime_state.shm_hot_threads_total,
+            "shm_pruned_threads_total": runtime_state.shm_pruned_threads_total,
+            "shm_payload_bytes": runtime_state.shm_payload_bytes,
+            "last_shm_sync_status": runtime_state.last_shm_sync_status,
+            "last_shm_sync_at": runtime_state.last_shm_sync_at
         },
         "contract": {
             "node_family": "SY",
@@ -3732,17 +3957,6 @@ fn resolve_openai_api_key_source(node_name: &str) -> CognitionAiSecretSource {
         return CognitionAiSecretSource::EnvCompat;
     }
     CognitionAiSecretSource::Missing
-}
-
-fn legacy_context_thread_id(msg: &Message) -> Option<String> {
-    msg.meta
-        .context
-        .as_ref()
-        .and_then(|value| value.get("thread_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
 }
 
 fn load_hive(config_dir: &Path) -> Result<HiveFile, CognitionError> {

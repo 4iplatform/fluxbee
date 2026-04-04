@@ -572,12 +572,19 @@ Estado actual:
 - [x] COG-M10-T5. Remoción formal de mecanismos viejos:
   - `ctx` como unidad cognitiva canónica
   - shapes/documentación v1 incompatibles
-- [ ] COG-M10-T6. Diseñar rebuild acotado + hot set de `jsr-memory` para escala:
-  - hoy el rebuild lee todo el durable del hive y eso no escala bien
-  - el criterio a diseñar debe priorizar threads vivos (`ILK`/`ICH` activos) y/o `scope_instances` abiertos
-  - como segundo filtro, aplicar ventana temporal por `last_seen_at` / `updated_at`
-  - `jsr-memory` no debe intentar reflejar todo el durable; debe mantener solo un hot set bounded por bytes/capacidad
-  - dejar explícita la política cuando el snapshot excede capacidad: poda/LRU/recency antes de escribir SHM
+- [x] COG-M10-T6. Implementar rebuild acotado + hot set de `jsr-memory` para escala:
+  - `SY.cognition` ya no intenta volcar todo el universo de threads a SHM
+  - `jsr-memory` se construye como hot set bounded por `MEMORY_MAX_DATA_SIZE`
+  - prioridad de selección actual:
+    - threads con `active_scope`
+    - mayor cantidad de entidades vivas (`contexts/reasons/cooccurrences` abiertos + memories/episodes)
+    - recencia por `last_seen_at`
+    - `latest_thread_seq`
+    - `turn_count`
+  - si un thread no entra por capacidad, se poda del snapshot SHM y queda fuera del hot set
+  - el rebuild de startup desde durable ya no rehidrata todo el hive en memoria: primero calcula ese mismo hot set y luego solo restaura esos threads
+  - el estado operativo ahora expone métricas de SHM (`hot_threads_total`, `pruned_threads_total`, `payload_bytes`, `last_sync_status`)
+  - nota: esta primera implementación hace el bounding en runtime después de leer durable; el pushdown del filtro al SQL queda como optimización futura separada
 
 Estado actual:
 - `SY.cognition` ya intenta rebuild en startup desde durable (`cognition_*` en PostgreSQL vía `SY.storage`) cuando el estado local en memoria está vacío
@@ -587,8 +594,8 @@ Estado actual:
   - si falta la configuración durable o PostgreSQL no responde, deja status de rebuild y sigue live
   - si rebuilda bien, publica métricas/último estado de rebuild en `STATUS` y `CONFIG_GET`
 - limitación explícita a revisar después:
-  - hoy el rebuild está scopeado al hive, pero no está acotado por volumen
-  - todavía no existe selección de hot set para SHM; si el universo durable crece mucho, esa estrategia necesita rediseño
+  - hoy el query-side rebuild sigue leyendo durable completo del hive y recién después aplica el hot set en runtime
+  - si el volumen durable creciera mucho, el siguiente paso sería empujar esa selección al SQL (`active_scope`/recency) para bajar costo de cold start
 - el E2E canónico ya quedó redirigido al path real por router con nodos disposable
 - se removió el smoke viejo por publish directo a `storage.turns` para no dejar una ruta muerta o engañosa en el repo
 - [`cognition_shm_dump.rs`](/Users/cagostino/Documents/GitHub/fluxbee/src/bin/cognition_shm_dump.rs) queda como herramienta de diagnóstico puntual de SHM, no como E2E
