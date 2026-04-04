@@ -709,15 +709,15 @@ Definición de alcance:
     - `semantic_tagger_failures_total`
     - `semantic_tagger_invalid_outputs_total`
     - `last_semantic_model`
-- [ ] COG-M11-T2. Reemplazar el rol central del tagger lexical por `AI.tagger` como motor semántico oficial:
+- [x] COG-M11-T2. Reemplazar el rol central del tagger lexical por `AI.tagger` como motor semántico oficial:
   - sin feature flag de fallback de producto
   - sin dualidad permanente `lexical|semantic`
   - dejando el bootstrap lexical solo como código transitorio/removible
   - estado actual de implementación:
     - `SY.cognition` ya expone `config.semantic_tagger.*` en `CONFIG_GET/CONFIG_SET`
     - `STATUS/CONFIG_GET` ya exponen contadores y estado del `semantic_tagger`
-    - el bootstrap lexical ya quedó aislado y consume los límites del `semantic_tagger`
-    - sigue pendiente el reemplazo del bootstrap por la llamada AI real; por eso esta tarea todavía no se marca cerrada
+    - el path central del turn ahora usa llamada AI real por `OpenAiResponsesClient`
+    - el bootstrap lexical quedó aislado fuera del flujo normal para facilitar su futura remoción
 - [ ] COG-M11-T3. Mejorar extracción semántica de `tags`:
   - sinonimia
   - paráfrasis

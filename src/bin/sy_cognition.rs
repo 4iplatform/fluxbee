@@ -43,10 +43,13 @@ use json_router::shm::{
     MEMORY_MAX_DATA_SIZE,
 };
 
+#[allow(dead_code)]
 #[path = "sy_cognition/bootstrap_lexical_tagger.rs"]
 mod bootstrap_lexical_tagger;
+#[path = "sy_cognition/semantic_tagger_ai.rs"]
+mod semantic_tagger_ai;
 
-use bootstrap_lexical_tagger::{run_bootstrap_lexical_tagger, DeterministicTaggerOutput};
+use semantic_tagger_ai::run_semantic_tagger_ai;
 
 type CognitionError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -89,6 +92,13 @@ const COGNITION_REASON_CANONICAL_SIGNALS: [&str; 8] = [
     "request",
     "abandon",
 ];
+
+#[derive(Debug, Clone, Default)]
+struct SemanticTaggerOutput {
+    tags: Vec<String>,
+    reason_signals_canonical: Vec<String>,
+    reason_signals_extra: Vec<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CognitionAiSecretSource {
@@ -638,16 +648,74 @@ async fn handle_turn_payload(
             control_state.semantic_tagger.clone(),
         )
     };
-    let tagger = run_bootstrap_lexical_tagger(
-        &text,
-        semantic_tagger_config.max_tags,
-        semantic_tagger_config.max_reason_signals,
-    );
     let ts = chrono::Utc::now().to_rfc3339();
     let thread_seq = msg.meta.thread_seq;
     let src_ilk = msg.meta.src_ilk.clone();
     let dst_ilk = msg.meta.dst_ilk.clone();
     let ich = msg.meta.ich.clone();
+    {
+        let mut state = app_state.runtime_state.lock().await;
+        state.semantic_tagger_calls_total = state.semantic_tagger_calls_total.saturating_add(1);
+        state.last_semantic_model = Some(semantic_tagger_config.model.clone());
+        state.last_semantic_impl = Some("openai_responses".to_string());
+    }
+
+    let Some(api_key) = resolve_openai_api_key(&app_state.node_name) else {
+        let mut state = app_state.runtime_state.lock().await;
+        state.semantic_tagger_failures_total =
+            state.semantic_tagger_failures_total.saturating_add(1);
+        state.last_trace_id = Some(msg.routing.trace_id.clone());
+        state.last_thread_id = Some(thread_id.clone());
+        state.last_thread_seq = thread_seq;
+        state.last_src_ilk = src_ilk.clone();
+        state.last_ich = ich.clone();
+        tracing::warn!(
+            trace_id = %msg.routing.trace_id,
+            thread_id = %thread_id,
+            "sy.cognition semantic tagger skipped turn because OpenAI api key is missing"
+        );
+        return Ok(());
+    };
+
+    let tagger = match run_semantic_tagger_ai(semantic_tagger_ai::SemanticTaggerAiInput {
+        api_key: &api_key,
+        text: &text,
+        src_ilk: src_ilk.as_deref(),
+        dst_ilk: dst_ilk.as_deref(),
+        ich: ich.as_deref(),
+        config: &semantic_tagger_config,
+    })
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            let is_invalid_output = matches!(
+                err,
+                fluxbee_ai_sdk::AiSdkError::Json(_) | fluxbee_ai_sdk::AiSdkError::Protocol(_)
+            );
+            let mut state = app_state.runtime_state.lock().await;
+            if is_invalid_output {
+                state.semantic_tagger_invalid_outputs_total = state
+                    .semantic_tagger_invalid_outputs_total
+                    .saturating_add(1);
+            } else {
+                state.semantic_tagger_failures_total =
+                    state.semantic_tagger_failures_total.saturating_add(1);
+            }
+            state.last_trace_id = Some(msg.routing.trace_id.clone());
+            state.last_thread_id = Some(thread_id.clone());
+            state.last_thread_seq = thread_seq;
+            state.last_src_ilk = src_ilk.clone();
+            state.last_ich = ich.clone();
+            tracing::warn!(
+                trace_id = %msg.routing.trace_id,
+                thread_id = %thread_id,
+                error = %err,
+                "sy.cognition semantic tagger failed; turn skipped"
+            );
+            return Ok(());
+        }
+    };
 
     let envelopes = {
         let mut threads = app_state.thread_states.lock().await;
@@ -693,13 +761,6 @@ async fn handle_turn_payload(
             thread_id = %thread_id,
             "sy.cognition failed to sync jsr-memory"
         );
-    }
-
-    {
-        let mut state = app_state.runtime_state.lock().await;
-        state.semantic_tagger_calls_total = state.semantic_tagger_calls_total.saturating_add(1);
-        state.last_semantic_model = Some(semantic_tagger_config.model.clone());
-        state.last_semantic_impl = Some("bootstrap_lexical_transitional".to_string());
     }
 
     let (
@@ -1859,7 +1920,7 @@ fn build_status_payload(
         "max_tags": control_state.semantic_tagger.max_tags,
         "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
         "ai_required": true,
-        "implementation_status": "bootstrap_transitional"
+        "implementation_status": "openai_responses"
     });
     let turns_consumer = json!({
         "subject": SUBJECT_STORAGE_TURNS,
@@ -1963,11 +2024,11 @@ fn build_cognition_config_get_payload(
                 .to_string(),
         ),
         Value::String(
-            "The OpenAI provider secret is optional for the current bootstrap pipeline, but required for the AI semantic stage."
+            "The OpenAI provider secret is required for the semantic extraction stage; without it, SY.cognition stays fail-open and skips new semantic derivations."
                 .to_string(),
         ),
         Value::String(
-            "The semantic tagger is modeled as an AI-backed internal component of SY.cognition; the current lexical tagger remains isolated as transitional bootstrap code."
+            "The semantic tagger is an internal AI-backed component of SY.cognition using the configured provider/model; the old lexical bootstrap code is isolated and not part of the normal runtime path."
                 .to_string(),
         ),
         Value::String(
@@ -2010,7 +2071,7 @@ fn build_cognition_config_get_payload(
             "max_tags": control_state.semantic_tagger.max_tags,
             "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
             "ai_required": true,
-            "implementation_status": "bootstrap_transitional"
+            "implementation_status": "openai_responses"
         },
         "thresholds": {
             "context_open": control_state.thresholds.context_open,
@@ -2214,7 +2275,7 @@ fn apply_cognition_config_set(
                 "max_tags": control_state.semantic_tagger.max_tags,
                 "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
                 "ai_required": true,
-                "implementation_status": "bootstrap_transitional"
+                "implementation_status": "openai_responses"
             },
             "thresholds": {
                 "context_open": control_state.thresholds.context_open,
@@ -2230,7 +2291,7 @@ fn apply_cognition_config_set(
         } else {
             Value::Array(Vec::new())
         },
-        "message": "SY.cognition local config persisted. Semantic tagger settings now describe the future AI-backed engine; bootstrap lexical processing remains transitional until the provider path is wired."
+        "message": "SY.cognition local config persisted. Semantic extraction now uses the configured AI semantic tagger; the old lexical bootstrap remains isolated for transition only."
     }))
 }
 
@@ -2440,6 +2501,9 @@ fn extract_cognition_semantic_tagger_config(
         if provider.is_empty() {
             return Err("config.semantic_tagger.provider must not be empty".into());
         }
+        if !provider.eq_ignore_ascii_case("openai") {
+            return Err("config.semantic_tagger.provider currently supports only 'openai'".into());
+        }
         merged.provider = provider.to_string();
     }
     if let Some(model) = config.get("model").and_then(Value::as_str) {
@@ -2486,7 +2550,7 @@ fn update_thread_state_and_build_envelopes(
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
     ich: Option<&str>,
-    tagger: &DeterministicTaggerOutput,
+    tagger: &SemanticTaggerOutput,
     thresholds: &CognitionThresholds,
     ts: &str,
     thread_state: &mut ThreadCognitionState,
@@ -2580,7 +2644,7 @@ fn update_thread_state_and_build_envelopes(
     out
 }
 
-fn build_context_candidates(tagger: &DeterministicTaggerOutput) -> Vec<ContextCandidate> {
+fn build_context_candidates(tagger: &SemanticTaggerOutput) -> Vec<ContextCandidate> {
     tagger
         .tags
         .iter()
@@ -2592,7 +2656,7 @@ fn build_context_candidates(tagger: &DeterministicTaggerOutput) -> Vec<ContextCa
         .collect()
 }
 
-fn build_reason_candidates(tagger: &DeterministicTaggerOutput) -> Vec<ReasonCandidate> {
+fn build_reason_candidates(tagger: &SemanticTaggerOutput) -> Vec<ReasonCandidate> {
     let signals: HashSet<&str> = tagger
         .reason_signals_canonical
         .iter()
@@ -3222,7 +3286,7 @@ fn update_memories_and_episodes_for_thread(
     ts: &str,
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
-    tagger: &DeterministicTaggerOutput,
+    tagger: &SemanticTaggerOutput,
     contexts: &HashMap<String, ContextState>,
     reasons: &HashMap<String, ReasonState>,
     active_scope: &Option<ScopeBindingState>,
@@ -3359,7 +3423,7 @@ fn update_episodes_for_thread(
     writer: &str,
     thread_id: &str,
     ts: &str,
-    tagger: &DeterministicTaggerOutput,
+    tagger: &SemanticTaggerOutput,
     scope: &ScopeBindingState,
     context: &ContextState,
     reason: &ReasonState,
@@ -3453,7 +3517,7 @@ fn summarize_scope_memory(context: &ContextState, reason: &ReasonState) -> Strin
 }
 
 fn build_episode_candidate(
-    tagger: &DeterministicTaggerOutput,
+    tagger: &SemanticTaggerOutput,
     context: &ContextState,
     reason: &ReasonState,
 ) -> Option<EpisodeCandidate> {
@@ -3811,6 +3875,15 @@ fn load_local_openai_api_key(node_name: &str) -> Option<String> {
         .and_then(|value| value.as_str().map(ToString::to_string))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn resolve_openai_api_key(node_name: &str) -> Option<String> {
+    load_local_openai_api_key(node_name).or_else(|| {
+        std::env::var("OPENAI_API_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn resolve_openai_api_key_source(node_name: &str) -> CognitionAiSecretSource {

@@ -1,24 +1,18 @@
 use std::collections::HashSet;
 
-use crate::COGNITION_REASON_CANONICAL_SIGNALS;
+use crate::{SemanticTaggerOutput, COGNITION_REASON_CANONICAL_SIGNALS};
 
 // Transitional bootstrap tagger kept isolated until the AI-backed semantic
 // pipeline replaces it. This is not the target long-term architecture.
 #[derive(Debug, Clone, Default)]
-pub(super) struct DeterministicTaggerOutput {
-    pub(super) tags: Vec<String>,
-    pub(super) reason_signals_canonical: Vec<String>,
-    pub(super) reason_signals_extra: Vec<String>,
-}
-
 pub(super) fn run_bootstrap_lexical_tagger(
     text: &str,
     max_tags: usize,
     max_reason_signals: usize,
-) -> DeterministicTaggerOutput {
+) -> SemanticTaggerOutput {
     let normalized = normalize_text(text);
     if normalized.is_empty() {
-        return DeterministicTaggerOutput::default();
+        return SemanticTaggerOutput::default();
     }
     let tokens = tokenize(&normalized);
     let mut tags = Vec::new();
@@ -271,7 +265,7 @@ pub(super) fn run_bootstrap_lexical_tagger(
         tags = fallback_tags(&tokens, max_tags);
     }
 
-    DeterministicTaggerOutput {
+    SemanticTaggerOutput {
         tags,
         reason_signals_canonical: canonical,
         reason_signals_extra: extra,

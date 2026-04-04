@@ -1057,6 +1057,7 @@ For the semantic stage, `SY.cognition` makes direct AI calls via AI SDK (same fa
 
 Architectural clarification:
 - semantic cognition in stage 2 is AI-backed and AI-required
+- the operational tagger path is now the direct AI call inside `SY.cognition`
 - the current lexical/deterministic tagger is retained only as transitional bootstrap code during migration
 - that bootstrap implementation is not the target operational fallback of the product
 
