@@ -1847,6 +1847,75 @@ fn build_status_payload(
     nats_subscribe_errors: u64,
 ) -> Value {
     let degraded_reasons = cognition_degraded_reasons(control_state);
+    let ai_provider = json!({
+        "provider": "openai",
+        "configured": control_state.ai_secret_source != CognitionAiSecretSource::Missing,
+        "source": control_state.ai_secret_source.as_str()
+    });
+    let semantic_tagger = json!({
+        "provider": control_state.semantic_tagger.provider,
+        "model": control_state.semantic_tagger.model,
+        "timeout_ms": control_state.semantic_tagger.timeout_ms,
+        "max_tags": control_state.semantic_tagger.max_tags,
+        "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
+        "ai_required": true,
+        "implementation_status": "bootstrap_transitional"
+    });
+    let turns_consumer = json!({
+        "subject": SUBJECT_STORAGE_TURNS,
+        "mode": if use_durable_consumer { "durable" } else { "volatile" },
+        "durable_queue": if use_durable_consumer {
+            Value::String(DURABLE_QUEUE_TURNS.to_string())
+        } else {
+            Value::Null
+        },
+        "processed_turns_total": runtime_state.processed_turns_total,
+        "invalid_turns_total": runtime_state.invalid_turns_total,
+        "subscribe_failures": nats_subscribe_errors,
+        "published_entities_total": runtime_state.published_entities_total,
+        "publish_errors_total": runtime_state.publish_errors_total,
+        "last_trace_id": runtime_state.last_trace_id,
+        "last_thread_id": runtime_state.last_thread_id,
+        "last_thread_seq": runtime_state.last_thread_seq,
+        "last_src_ilk": runtime_state.last_src_ilk,
+        "last_ich": runtime_state.last_ich,
+        "last_tags": runtime_state.last_tags,
+        "last_reason_signals_canonical": runtime_state.last_reason_signals_canonical,
+        "last_reason_signals_extra": runtime_state.last_reason_signals_extra,
+        "active_threads_total": runtime_state.active_threads_total,
+        "open_contexts_total": runtime_state.open_contexts_total,
+        "open_reasons_total": runtime_state.open_reasons_total,
+        "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
+        "active_scopes_total": runtime_state.active_scopes_total,
+        "active_memories_total": runtime_state.active_memories_total,
+        "active_episodes_total": runtime_state.active_episodes_total,
+        "rebuild_attempts_total": runtime_state.rebuild_attempts_total,
+        "rebuild_successes_total": runtime_state.rebuild_successes_total,
+        "rebuild_failures_total": runtime_state.rebuild_failures_total,
+        "rebuilt_threads_total": runtime_state.rebuilt_threads_total,
+        "last_rebuild_status": runtime_state.last_rebuild_status,
+        "last_rebuild_source": runtime_state.last_rebuild_source,
+        "last_rebuild_at": runtime_state.last_rebuild_at,
+        "semantic_tagger_calls_total": runtime_state.semantic_tagger_calls_total,
+        "semantic_tagger_failures_total": runtime_state.semantic_tagger_failures_total,
+        "semantic_tagger_invalid_outputs_total": runtime_state.semantic_tagger_invalid_outputs_total,
+        "last_semantic_model": runtime_state.last_semantic_model,
+        "last_semantic_impl": runtime_state.last_semantic_impl
+    });
+    let paths = json!({
+        "state_dir": runtime_paths.state_dir,
+        "cache_dir": runtime_paths.cache_dir,
+        "shm_dir": runtime_paths.shm_dir,
+        "memory_lance": runtime_paths.memory_lance_path
+    });
+    let shm = json!({
+        "capacity_bytes": MEMORY_MAX_DATA_SIZE,
+        "hot_threads_total": runtime_state.shm_hot_threads_total,
+        "pruned_threads_total": runtime_state.shm_pruned_threads_total,
+        "payload_bytes": runtime_state.shm_payload_bytes,
+        "last_sync_status": runtime_state.last_shm_sync_status,
+        "last_sync_at": runtime_state.last_shm_sync_at
+    });
     json!({
         "ok": true,
         "node_name": node_name,
@@ -1857,75 +1926,11 @@ fn build_status_payload(
             "active": !degraded_reasons.is_empty(),
             "reasons": degraded_reasons
         },
-        "ai_provider": {
-            "provider": "openai",
-            "configured": control_state.ai_secret_source != CognitionAiSecretSource::Missing,
-            "source": control_state.ai_secret_source.as_str()
-        },
-        "semantic_tagger": {
-            "provider": control_state.semantic_tagger.provider,
-            "model": control_state.semantic_tagger.model,
-            "timeout_ms": control_state.semantic_tagger.timeout_ms,
-            "max_tags": control_state.semantic_tagger.max_tags,
-            "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
-            "ai_required": true,
-            "implementation_status": "bootstrap_transitional"
-        },
-        "turns_consumer": {
-            "subject": SUBJECT_STORAGE_TURNS,
-            "mode": if use_durable_consumer { "durable" } else { "volatile" },
-            "durable_queue": if use_durable_consumer {
-                Value::String(DURABLE_QUEUE_TURNS.to_string())
-            } else {
-                Value::Null
-            },
-            "processed_turns_total": runtime_state.processed_turns_total,
-            "invalid_turns_total": runtime_state.invalid_turns_total,
-            "subscribe_failures": nats_subscribe_errors,
-            "published_entities_total": runtime_state.published_entities_total,
-            "publish_errors_total": runtime_state.publish_errors_total,
-            "last_trace_id": runtime_state.last_trace_id,
-            "last_thread_id": runtime_state.last_thread_id,
-            "last_thread_seq": runtime_state.last_thread_seq,
-            "last_src_ilk": runtime_state.last_src_ilk,
-            "last_ich": runtime_state.last_ich,
-            "last_tags": runtime_state.last_tags,
-            "last_reason_signals_canonical": runtime_state.last_reason_signals_canonical,
-            "last_reason_signals_extra": runtime_state.last_reason_signals_extra,
-            "active_threads_total": runtime_state.active_threads_total,
-            "open_contexts_total": runtime_state.open_contexts_total,
-            "open_reasons_total": runtime_state.open_reasons_total,
-            "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
-            "active_scopes_total": runtime_state.active_scopes_total,
-            "active_memories_total": runtime_state.active_memories_total,
-            "active_episodes_total": runtime_state.active_episodes_total,
-            "rebuild_attempts_total": runtime_state.rebuild_attempts_total,
-            "rebuild_successes_total": runtime_state.rebuild_successes_total,
-            "rebuild_failures_total": runtime_state.rebuild_failures_total,
-            "rebuilt_threads_total": runtime_state.rebuilt_threads_total,
-            "last_rebuild_status": runtime_state.last_rebuild_status,
-            "last_rebuild_source": runtime_state.last_rebuild_source,
-            "last_rebuild_at": runtime_state.last_rebuild_at,
-            "semantic_tagger_calls_total": runtime_state.semantic_tagger_calls_total,
-            "semantic_tagger_failures_total": runtime_state.semantic_tagger_failures_total,
-            "semantic_tagger_invalid_outputs_total": runtime_state.semantic_tagger_invalid_outputs_total,
-            "last_semantic_model": runtime_state.last_semantic_model,
-            "last_semantic_impl": runtime_state.last_semantic_impl
-        },
-        "paths": {
-            "state_dir": runtime_paths.state_dir,
-            "cache_dir": runtime_paths.cache_dir,
-            "shm_dir": runtime_paths.shm_dir,
-            "memory_lance": runtime_paths.memory_lance_path
-        },
-        "shm": {
-            "capacity_bytes": MEMORY_MAX_DATA_SIZE,
-            "hot_threads_total": runtime_state.shm_hot_threads_total,
-            "pruned_threads_total": runtime_state.shm_pruned_threads_total,
-            "payload_bytes": runtime_state.shm_payload_bytes,
-            "last_sync_status": runtime_state.last_shm_sync_status,
-            "last_sync_at": runtime_state.last_shm_sync_at
-        }
+        "ai_provider": ai_provider,
+        "semantic_tagger": semantic_tagger,
+        "turns_consumer": turns_consumer,
+        "paths": paths,
+        "shm": shm
     })
 }
 
@@ -1939,6 +1944,11 @@ fn build_cognition_config_get_payload(
     note: Option<&str>,
 ) -> Value {
     let configured = control_state.ai_secret_source != CognitionAiSecretSource::Missing;
+    let redacted_api_key = if configured {
+        Value::String(NODE_SECRET_REDACTION_TOKEN.to_string())
+    } else {
+        Value::Null
+    };
     let mut secret_descriptor = NodeSecretDescriptor::new(
         "config.secrets.openai.api_key",
         COGNITION_LOCAL_SECRET_KEY_OPENAI,
@@ -1968,6 +1978,105 @@ fn build_cognition_config_get_payload(
     if let Some(note) = note.filter(|value| !value.trim().is_empty()) {
         notes.push(Value::String(note.to_string()));
     }
+    let config = json!({
+        "nats": {
+            "input_subject": SUBJECT_STORAGE_TURNS,
+            "consumer_mode": if use_durable_consumer { "durable" } else { "volatile" },
+            "durable_queue": if use_durable_consumer {
+                Value::String(DURABLE_QUEUE_TURNS.to_string())
+            } else {
+                Value::Null
+            }
+        },
+        "storage": {
+            "write_subject_prefix": "storage.cognition",
+            "enabled": true
+        },
+        "ai_providers": {
+            "openai": {
+                "provider": "openai",
+                "api_key": redacted_api_key.clone()
+            }
+        },
+        "secrets": {
+            "openai": {
+                "api_key": redacted_api_key
+            }
+        },
+        "semantic_tagger": {
+            "provider": control_state.semantic_tagger.provider,
+            "model": control_state.semantic_tagger.model,
+            "timeout_ms": control_state.semantic_tagger.timeout_ms,
+            "max_tags": control_state.semantic_tagger.max_tags,
+            "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
+            "ai_required": true,
+            "implementation_status": "bootstrap_transitional"
+        },
+        "thresholds": {
+            "context_open": control_state.thresholds.context_open,
+            "reason_open": control_state.thresholds.reason_open
+        },
+        "paths": {
+            "state_dir": runtime_paths.state_dir,
+            "cache_dir": runtime_paths.cache_dir,
+            "shm_dir": runtime_paths.shm_dir,
+            "memory_lance": runtime_paths.memory_lance_path
+        }
+    });
+    let runtime = json!({
+        "processed_turns_total": runtime_state.processed_turns_total,
+        "invalid_turns_total": runtime_state.invalid_turns_total,
+        "published_entities_total": runtime_state.published_entities_total,
+        "publish_errors_total": runtime_state.publish_errors_total,
+        "subscribe_failures": nats_subscribe_errors,
+        "last_thread_id": runtime_state.last_thread_id,
+        "last_thread_seq": runtime_state.last_thread_seq,
+        "last_tags": runtime_state.last_tags,
+        "last_reason_signals_canonical": runtime_state.last_reason_signals_canonical,
+        "last_reason_signals_extra": runtime_state.last_reason_signals_extra,
+        "active_threads_total": runtime_state.active_threads_total,
+        "open_contexts_total": runtime_state.open_contexts_total,
+        "open_reasons_total": runtime_state.open_reasons_total,
+        "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
+        "active_scopes_total": runtime_state.active_scopes_total,
+        "active_memories_total": runtime_state.active_memories_total,
+        "active_episodes_total": runtime_state.active_episodes_total,
+        "rebuild_attempts_total": runtime_state.rebuild_attempts_total,
+        "rebuild_successes_total": runtime_state.rebuild_successes_total,
+        "rebuild_failures_total": runtime_state.rebuild_failures_total,
+        "rebuilt_threads_total": runtime_state.rebuilt_threads_total,
+        "last_rebuild_status": runtime_state.last_rebuild_status,
+        "last_rebuild_source": runtime_state.last_rebuild_source,
+        "last_rebuild_at": runtime_state.last_rebuild_at,
+        "shm_hot_threads_total": runtime_state.shm_hot_threads_total,
+        "shm_pruned_threads_total": runtime_state.shm_pruned_threads_total,
+        "shm_payload_bytes": runtime_state.shm_payload_bytes,
+        "last_shm_sync_status": runtime_state.last_shm_sync_status,
+        "last_shm_sync_at": runtime_state.last_shm_sync_at,
+        "semantic_tagger_calls_total": runtime_state.semantic_tagger_calls_total,
+        "semantic_tagger_failures_total": runtime_state.semantic_tagger_failures_total,
+        "semantic_tagger_invalid_outputs_total": runtime_state.semantic_tagger_invalid_outputs_total,
+        "last_semantic_model": runtime_state.last_semantic_model,
+        "last_semantic_impl": runtime_state.last_semantic_impl
+    });
+    let contract = json!({
+        "node_family": "SY",
+        "node_kind": "SY.cognition",
+        "supports": ["CONFIG_GET", "CONFIG_SET"],
+        "required_fields": [],
+        "optional_fields": [
+            "config.secrets.openai.api_key",
+            "config.semantic_tagger.provider",
+            "config.semantic_tagger.model",
+            "config.semantic_tagger.timeout_ms",
+            "config.semantic_tagger.max_tags",
+            "config.semantic_tagger.max_reason_signals",
+            "config.thresholds.context_open",
+            "config.thresholds.reason_open"
+        ],
+        "secrets": [secret_descriptor],
+        "notes": notes
+    });
 
     json!({
         "ok": true,
@@ -1975,96 +2084,9 @@ fn build_cognition_config_get_payload(
         "state": cognition_state_label(control_state),
         "schema_version": control_state.schema_version,
         "config_version": control_state.config_version,
-        "config": {
-            "nats": {
-                "input_subject": SUBJECT_STORAGE_TURNS,
-                "consumer_mode": if use_durable_consumer { "durable" } else { "volatile" },
-                "durable_queue": if use_durable_consumer { Value::String(DURABLE_QUEUE_TURNS.to_string()) } else { Value::Null }
-            },
-            "storage": {
-                "write_subject_prefix": "storage.cognition",
-                "enabled": true
-            },
-            "ai_providers": {
-                "openai": {
-                    "provider": "openai",
-                    "api_key": if configured { Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()) } else { Value::Null }
-                }
-            },
-            "semantic_tagger": {
-                "provider": control_state.semantic_tagger.provider,
-                "model": control_state.semantic_tagger.model,
-                "timeout_ms": control_state.semantic_tagger.timeout_ms,
-                "max_tags": control_state.semantic_tagger.max_tags,
-                "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
-                "ai_required": true,
-                "implementation_status": "bootstrap_transitional"
-            },
-            "thresholds": {
-                "context_open": control_state.thresholds.context_open,
-                "reason_open": control_state.thresholds.reason_open
-            },
-            "paths": {
-                "state_dir": runtime_paths.state_dir,
-                "cache_dir": runtime_paths.cache_dir,
-                "shm_dir": runtime_paths.shm_dir,
-                "memory_lance": runtime_paths.memory_lance_path
-            }
-        },
-        "runtime": {
-            "processed_turns_total": runtime_state.processed_turns_total,
-            "invalid_turns_total": runtime_state.invalid_turns_total,
-            "published_entities_total": runtime_state.published_entities_total,
-            "publish_errors_total": runtime_state.publish_errors_total,
-            "subscribe_failures": nats_subscribe_errors,
-            "last_thread_id": runtime_state.last_thread_id,
-            "last_thread_seq": runtime_state.last_thread_seq,
-            "last_tags": runtime_state.last_tags,
-            "last_reason_signals_canonical": runtime_state.last_reason_signals_canonical,
-            "last_reason_signals_extra": runtime_state.last_reason_signals_extra,
-            "active_threads_total": runtime_state.active_threads_total,
-            "open_contexts_total": runtime_state.open_contexts_total,
-            "open_reasons_total": runtime_state.open_reasons_total,
-            "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
-            "active_scopes_total": runtime_state.active_scopes_total,
-            "active_memories_total": runtime_state.active_memories_total,
-            "active_episodes_total": runtime_state.active_episodes_total,
-            "rebuild_attempts_total": runtime_state.rebuild_attempts_total,
-            "rebuild_successes_total": runtime_state.rebuild_successes_total,
-            "rebuild_failures_total": runtime_state.rebuild_failures_total,
-            "rebuilt_threads_total": runtime_state.rebuilt_threads_total,
-            "last_rebuild_status": runtime_state.last_rebuild_status,
-            "last_rebuild_source": runtime_state.last_rebuild_source,
-            "last_rebuild_at": runtime_state.last_rebuild_at,
-            "shm_hot_threads_total": runtime_state.shm_hot_threads_total,
-            "shm_pruned_threads_total": runtime_state.shm_pruned_threads_total,
-            "shm_payload_bytes": runtime_state.shm_payload_bytes,
-            "last_shm_sync_status": runtime_state.last_shm_sync_status,
-            "last_shm_sync_at": runtime_state.last_shm_sync_at,
-            "semantic_tagger_calls_total": runtime_state.semantic_tagger_calls_total,
-            "semantic_tagger_failures_total": runtime_state.semantic_tagger_failures_total,
-            "semantic_tagger_invalid_outputs_total": runtime_state.semantic_tagger_invalid_outputs_total,
-            "last_semantic_model": runtime_state.last_semantic_model,
-            "last_semantic_impl": runtime_state.last_semantic_impl
-        },
-        "contract": {
-            "node_family": "SY",
-            "node_kind": "SY.cognition",
-            "supports": ["CONFIG_GET", "CONFIG_SET"],
-            "required_fields": [],
-            "optional_fields": [
-                "config.secrets.openai.api_key",
-                "config.semantic_tagger.provider",
-                "config.semantic_tagger.model",
-                "config.semantic_tagger.timeout_ms",
-                "config.semantic_tagger.max_tags",
-                "config.semantic_tagger.max_reason_signals",
-                "config.thresholds.context_open",
-                "config.thresholds.reason_open"
-            ],
-            "secrets": [secret_descriptor],
-            "notes": notes
-        }
+        "config": config,
+        "runtime": runtime,
+        "contract": contract
     })
 }
 
@@ -2176,6 +2198,15 @@ fn apply_cognition_config_set(
         "config_version": control_state.config_version,
         "apply_mode": NODE_CONFIG_APPLY_MODE_REPLACE,
         "config": {
+            "secrets": {
+                "openai": {
+                    "api_key": if control_state.ai_secret_source != CognitionAiSecretSource::Missing {
+                        Value::String(NODE_SECRET_REDACTION_TOKEN.to_string())
+                    } else {
+                        Value::Null
+                    }
+                }
+            },
             "semantic_tagger": {
                 "provider": control_state.semantic_tagger.provider,
                 "model": control_state.semantic_tagger.model,
