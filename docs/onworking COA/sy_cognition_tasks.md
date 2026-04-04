@@ -28,7 +28,7 @@ Alcance funcional real por olas:
   - escribe `jsr-memory`
   - enriquece entrega real por router
 - pero esa ola **no agota** cognition:
-  - el tagger actual es lexical/determinístico
+  - el tagger actual es lexical/determinístico y queda solo como bootstrap transitorio encapsulado
   - la lectura semántica profunda del contenido del mensaje todavía no está resuelta
   - la narrativa de memories/episodes sigue siendo v1 determinística
 - dicho de otra manera:
@@ -178,13 +178,14 @@ Para v1 de ejecución:
   - `tags`
   - `reason_signals_canonical`
   - `reason_signals_extra`
-- implementación inicial determinística/lexical del tagger
+- implementación inicial determinística/lexical del tagger, aislada como bootstrap transitorio
 - reason evaluator determinístico sobre las 8 commandments
 
 Segunda etapa explícita sobre el mismo contrato:
-- tagger AI/semántico para extraer `tags` y reason signals con mejor recall
+- tagger AI/semántico obligatorio para extraer `tags` y reason signals con mejor recall
 - análisis narrativo del contenido para memories/summaries sin cambiar las entidades v2
 - el salto de v1 determinística a v2 semántica debe cambiar el motor, no el carrier ni el durable model
+- en `M11` el objetivo ya no es sostener un fallback lexical de producto; el bootstrap v1 queda solo como código transitorio/removible
 
 Consecuencia importante:
 - si no se hace esta segunda etapa, cognition queda funcional y útil, pero con comprensión semántica acotada
@@ -584,7 +585,22 @@ Estado actual:
   - si un thread no entra por capacidad, se poda del snapshot SHM y queda fuera del hot set
   - el rebuild de startup desde durable ya no rehidrata todo el hive en memoria: primero calcula ese mismo hot set y luego solo restaura esos threads
   - el estado operativo ahora expone métricas de SHM (`hot_threads_total`, `pruned_threads_total`, `payload_bytes`, `last_sync_status`)
-  - nota: esta primera implementación hace el bounding en runtime después de leer durable; el pushdown del filtro al SQL queda como optimización futura separada
+  - nota: esta primera implementación hace el bounding en runtime después de leer durable; no hay todavía filtro SQL-side / query-side en PostgreSQL
+- [ ] COG-M10-T7. Pushdown SQL del hot set para cold start grande:
+  - hoy `SY.cognition` lee durable completo del hive y recién después aplica el hot set en runtime
+  - siguiente paso: mover parte de esa selección al query plan SQL para bajar costo de rebuild
+  - primer filtro a estudiar:
+    - threads con `active_scope`
+    - threads asociados a `scope_instances` abiertos
+    - threads con actividad reciente por `last_seen_at` / `updated_at`
+  - segundo filtro:
+    - ventana temporal configurable
+    - límite de cardinalidad previo al rebuild en memoria
+  - objetivo:
+    - reducir lecturas PostgreSQL en cold start grande
+    - mantener `jsr-memory` y rebuild local alineados con el mismo hot set
+  - nota:
+    - esto es optimización de escala, no requisito para el piloto alpha actual
 
 Estado actual:
 - `SY.cognition` ya intenta rebuild en startup desde durable (`cognition_*` en PostgreSQL vía `SY.storage`) cuando el estado local en memoria está vacío
@@ -595,7 +611,7 @@ Estado actual:
   - si rebuilda bien, publica métricas/último estado de rebuild en `STATUS` y `CONFIG_GET`
 - limitación explícita a revisar después:
   - hoy el query-side rebuild sigue leyendo durable completo del hive y recién después aplica el hot set en runtime
-  - si el volumen durable creciera mucho, el siguiente paso sería empujar esa selección al SQL (`active_scope`/recency) para bajar costo de cold start
+  - el backlog concreto para eso es `COG-M10-T7` (pushdown SQL / filtro SQL-side del hot set)
 - el E2E canónico ya quedó redirigido al path real por router con nodos disposable
 - se removió el smoke viejo por publish directo a `storage.turns` para no dejar una ruta muerta o engañosa en el repo
 - [`cognition_shm_dump.rs`](/Users/cagostino/Documents/GitHub/fluxbee/src/bin/cognition_shm_dump.rs) queda como herramienta de diagnóstico puntual de SHM, no como E2E
@@ -654,9 +670,15 @@ Definición de alcance:
 - sin `M11`, el sistema ya clasifica, agrupa, periodiza y enriquece, pero lo hace con una semántica v1 todavía limitada
 - `M11` es la fase que completa el tratamiento del contenido del mensaje como problema cognitivo de primer orden
 - por eso debe pensarse como segunda gran ola del proyecto, no como ajuste fino posterior
+- para la arquitectura objetivo de `M11`, cognition semántico pasa a ser **AI-backed y AI-required**
+- el tagger/summarizer determinístico actual no se considera fallback oficial de producto para esta etapa
+- ese código se conserva solo como bootstrap transitorio, encapsulado y fácil de remover durante la migración
 
 - [ ] COG-M11-T1. Diseñar contrato operacional del `AI.tagger` sin cambiar `tags/reason_signals_*`.
-- [ ] COG-M11-T2. Separar explícitamente `tagger v1 lexical` de `tagger v2 semantic/AI` con feature flag o config de provider.
+- [ ] COG-M11-T2. Reemplazar el rol central del tagger lexical por `AI.tagger` como motor semántico oficial:
+  - sin feature flag de fallback de producto
+  - sin dualidad permanente `lexical|semantic`
+  - dejando el bootstrap lexical solo como código transitorio/removible
 - [ ] COG-M11-T3. Mejorar extracción semántica de `tags`:
   - sinonimia
   - paráfrasis
@@ -670,15 +692,18 @@ Definición de alcance:
   - resumen más fiel del contenido del thread
   - continuidad temporal
   - síntesis de contexto + razón + evidencia textual
-- [ ] COG-M11-T7. Definir corpus/golden tests para comparar v1 lexical vs v2 semantic.
-- [ ] COG-M11-T8. Definir política de rollback:
-  - si falla el provider AI, cae a tagger/summarizer v1 sin romper el contrato
+- [ ] COG-M11-T7. Definir corpus/golden tests para validar calidad semántica del `AI.tagger` y del summarizer v2.
+- [ ] COG-M11-T8. Definir política operacional cuando AI no esté disponible:
+  - `SY.cognition` queda degradado para semántica profunda
+  - no debe hacer rollback silencioso al tagger/summarizer lexical como comportamiento oficial de producto
+  - el carrier y durable model no cambian; cambia solo la capacidad de producir enriquecimiento semántico nuevo
 
 Objetivo:
 - tratar el análisis de contenido del mensaje como una segunda ola explícita
 - mantener estable el pipeline y el durable model ya cerrados
 - mejorar calidad semántica sin volver a abrir `thread/context/reason/scope/memory/episode`
 - dejar documentado que, hasta completar esta fase, cognition no debe venderse internamente como análisis semántico pleno sino como v2 estructural + enrichment operativo
+- dejar documentado que el bootstrap lexical actual es transitorio y está encapsulado para su futura remoción
 
 ---
 

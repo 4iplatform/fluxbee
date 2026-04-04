@@ -985,11 +985,24 @@ Where does the catalog of affects (anger, frustration, satisfaction, conflict, e
 
 ### 13.3 AI Call Strategy
 
-SY.cognition makes direct AI calls via AI SDK (same as SY.architect). Carries its own AI provider key in config.
+For the semantic stage, `SY.cognition` makes direct AI calls via AI SDK (same family as `SY.architect`) and carries its own AI provider key in config.
+
+Architectural clarification:
+- semantic cognition in stage 2 is AI-backed and AI-required
+- the current lexical/deterministic tagger is retained only as transitional bootstrap code during migration
+- that bootstrap implementation is not the target operational fallback of the product
 
 ### 13.4 Reason Evaluator: AI or Deterministic?
 
-For v1, the reason evaluator is deterministic, operating only on the 8 canonical signals. It maps signals to reasons by keyword matching and grouping. Since the commandments are general and few, deterministic mapping is sufficient. Upgrade to AI call later if needed.
+The closed 8-signal reason evaluator can remain deterministic even in the semantic stage.
+
+The AI responsibility is:
+- extract better `tags`
+- extract better `reason_signals_canonical`
+- produce richer `reason_signals_extra`
+- support better narrative synthesis for memories/episodes
+
+The evaluator contract itself stays closed and deterministic over the 8 canonical signals. This keeps the durable model stable while the semantic extraction layer upgrades.
 
 ### 13.5 Thread ID Hash Function
 
@@ -1109,10 +1122,14 @@ Validation note:
     - count of live cognitive entities
     - recency by `last_seen_at`
     - `latest_thread_seq`
-    - `turn_count`
+  - `turn_count`
   - startup rebuild from durable now rehydrates only that selected hot set into local cognition memory before resuming live processing
   - if the snapshot exceeds SHM capacity, lower-priority threads are pruned before the write
-  - deferred optimization: the durable read path is still hive-scoped and applies the hot-set filter in runtime; a later pass can push that selection into SQL for very large installs
+  - deferred optimization: the durable read path is still hive-scoped and applies the hot-set filter in runtime; there is no SQL-side / query-side filter yet
+  - future backlog item:
+    - push the hot-set selection into PostgreSQL queries for very large installs
+    - first-stage candidate filters: `active_scope`, open `scope_instances`, recency by `last_seen_at` / `updated_at`
+    - second-stage candidate filters: bounded time window and/or bounded candidate cardinality before rebuild
 
 - [ ] COG-T27. E2E: message → tagger → context + reason created.
 - [ ] COG-T28. E2E: binding energy with context + reason → scope transition.
@@ -1124,7 +1141,9 @@ Validation note:
 ### Phase 9 — Semantic Upgrade (Second Stage)
 
 - [ ] COG-T33. Introduce `AI.tagger` as an operational upgrade under the same `tags + reason_signals_*` contract.
-- [ ] COG-T34. Keep deterministic v1 tagger as fallback/runtime rollback path.
+- [ ] COG-T34. Treat `AI.tagger` as the official semantic engine for stage 2:
+  - no permanent runtime fallback path as product architecture
+  - isolate the current lexical tagger as transitional bootstrap code only
 - [ ] COG-T35. Improve semantic extraction for tags:
   - paraphrases
   - implicit intent
@@ -1132,8 +1151,11 @@ Validation note:
 - [ ] COG-T36. Improve semantic extraction for canonical reason signals while preserving the closed 8-signal evaluator contract.
 - [ ] COG-T37. Use `reason_signals_extra` as narrative evidence input for memory generation, not only as stored text.
 - [ ] COG-T38. Upgrade the summarizer/memory generator from deterministic lexical fusion to semantic narrative synthesis.
-- [ ] COG-T39. Build a golden corpus to compare deterministic v1 vs semantic v2 outputs.
-- [ ] COG-T40. Define rollback semantics: if the AI provider is unavailable, cognition falls back to deterministic v1 without changing carrier or durable entities.
+- [ ] COG-T39. Build a golden corpus to validate semantic outputs and narrative quality under `AI.tagger`.
+- [ ] COG-T40. Define degraded semantics when the AI provider is unavailable:
+  - cognition does not silently roll back to lexical semantics as the official product path
+  - carrier and durable entities stay unchanged
+  - the node reports degraded semantic capability until AI is available again
 
 ---
 
