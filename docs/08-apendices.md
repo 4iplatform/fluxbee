@@ -94,13 +94,13 @@
 
 ### Contexto y Conversaciones
 
-- **ctx_client**: Librería para acceder a historia completa de contextos. Uso raro (cuando ctx_window no es suficiente).
+- **thread_id**: Identificador físico/canónico de la conversación. Lo calcula SDK/IO y viaja en `meta.thread_id`.
 
-- **ctx_seq**: Número de secuencia del último mensaje conocido en un contexto.
+- **thread_seq**: Secuencia monotónica por `thread_id`. La asigna el router.
 
-- **ctx_window**: Array con los últimos 20 turns de un contexto. Agregado por el router al mensaje. Permite que el nodo responda sin consultar DB.
+- **ctx / ctx_seq / ctx_window**: Campos legacy/históricos del protocolo. Ya no forman parte del carrier conversacional activo del repo.
 
-- **Persistencia de turns**: El router persiste cada mensaje con ctx en PostgreSQL (async).
+- **Persistencia de turns**: El router publica cada mensaje en `storage.turns`; `SY.storage` lo materializa en durable.
 
 ### Cognición y Memoria
 
@@ -261,10 +261,6 @@ pub const HEARTBEAT_STALE_MS: u64 = 30_000;
 pub const HELLO_INTERVAL_MS: u64 = 10_000;
 pub const DEAD_INTERVAL_MS: u64 = 40_000;
 
-// Contexto
-pub const CTX_WINDOW_SIZE: usize = 20;          // Turns en ctx_window
-pub const CTX_WINDOW_FETCH_TIMEOUT_MS: u64 = 50; // Timeout para fetch de window
-
 // Cognición (jsr-memory)
 pub const MEMORY_MAGIC: u32 = 0x4A534D45;       // "JSME"
 pub const MEMORY_VERSION: u32 = 1;
@@ -297,8 +293,8 @@ pub const WAN_BATCH_TIMEOUT_MS: u64 = 100;
 | 08 | `08-apendices.md` | Glosario, decisiones, límites |
 | 09 | `09-router-status.md` | Estado de implementación del router |
 | 10 | `10-identity-layer3.md` | **ILK, SY.identity, routing L3** |
-| 11 | `11-context.md` | **ICH, CTX, conversaciones, ctx_window** |
-| 12 | `12-cognition.md` | **SY.cognition, episodios, jsr-memory, LanceDB** |
+| 11 | `11-context.md` | **Documento histórico del modelo CTX/ctx_window** |
+| 12 | `12-cognition.md` | **Documento histórico v1 de cognition** |
 | 13 | `13-storage.md` | **NATS embebido, SY.storage, persistencia** |
 | -- | `SY_nodes_spec.md` | Nodos SY (config.routes, opa.rules, identity, cognition, storage) |
 

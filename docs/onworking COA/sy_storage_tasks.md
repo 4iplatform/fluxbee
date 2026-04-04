@@ -1,5 +1,7 @@
 # SY.storage - Contrato canonico de subjects (Fase 1)
 
+> Documento histórico/parcial. Para cognition v2 el camino canónico nuevo es `storage.cognition.*`; `storage.events/items/reactivation` quedan como contrato legado y no como modelo vigente de `SY.cognition`.
+
 Fecha: 2026-02-16
 
 Documento operativo para alinear productores/consumidor (`SY.storage`) en los subjects:
@@ -8,11 +10,11 @@ Documento operativo para alinear productores/consumidor (`SY.storage`) en los su
 - `storage.items`
 - `storage.reactivation`
 
-Ownership acordado (2026-02-19):
+Ownership acordado (2026-02-19, histórico):
 - `storage.turns`: `rt-gateway` (activo en codigo).
-- `storage.events`: `SY.cognition` (objetivo; pipeline productor pendiente de cierre E2E).
-- `storage.items`: `SY.cognition` (objetivo; pipeline productor pendiente de cierre E2E).
-- `storage.reactivation`: `SY.cognition` (objetivo; pipeline productor pendiente de cierre E2E).
+- `storage.events`: contrato viejo/no canónico para cognition v2.
+- `storage.items`: contrato viejo/no canónico para cognition v2.
+- `storage.reactivation`: contrato viejo/no canónico para cognition v2.
 
 ## 1) storage.turns
 

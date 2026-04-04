@@ -642,148 +642,56 @@ Cuando no se encuentra destino:
 
 ---
 
-## 11. Persistencia de Contexto y ctx_window
+## 11. Persistencia conversacional y enrichment actual
+
+> Esta sección reemplaza la estrategia vieja basada en `ctx_window`. En el runtime activo del repo, el router ya no usa `ctx` como unidad canónica ni agrega `ctx_window` al mensaje.
 
 ### 11.1 Rol del Router
 
-El router es el único componente que ve **todos** los mensajes. Cuando un mensaje tiene `meta.ctx`:
+El router hoy hace tres cosas relevantes para la conversación:
 
-1. Persiste el turn en PostgreSQL (async)
-2. Agrega `ctx_window` con los últimos 20 turns antes de hacer forward
+1. publica el mensaje en `storage.turns` como evidencia durable
+2. asigna `meta.thread_seq` cuando entra un mensaje con `meta.thread_id` y todavía no tiene secuencia
+3. antes de la entrega local, consulta `jsr-memory-<hive>` para adjuntar `memory_package` si existe snapshot para ese `thread_id`
 
-### 11.2 Flujo
+### 11.2 Flujo actual
 
 ```
 Mensaje llega
       │
       ▼
-¿Tiene meta.ctx?
+¿Tiene meta.thread_id?
       │
   ┌───┴───┐
   │       │
  NO      SÍ
   │       │
   │       ▼
-  │   INSERT INTO turns (async)
-  │       │
-  │       ▼
-  │   Fetch últimos 20 turns
-  │       │
-  │       ▼
-  │   Agregar ctx_window al mensaje
+  │   Asignar thread_seq si falta
   │       │
   └───┬───┘
       │
       ▼
-  Forward normal
+Publicar en storage.turns (async)
+      │
+      ▼
+Routing / OPA
+      │
+      ▼
+Intentar enrichment desde jsr-memory
+      │
+      ▼
+Forward normal (con o sin memory_package)
 ```
 
-### 11.3 Implementación
+### 11.3 Contrato operativo
 
-```rust
-const CTX_WINDOW_SIZE: usize = 20;
-
-impl Router {
-    async fn handle_message(&mut self, msg: Message) -> Result<()> {
-        // 1. Si tiene contexto, persistir y enriquecer
-        if let Some(ctx) = &msg.meta.ctx {
-            // Persistir turn actual (async, no bloquea)
-            self.persist_turn(&msg);
-            
-            // Agregar ctx_window si no viene ya poblado
-            if msg.meta.ctx_window.is_none() {
-                let window = self.fetch_ctx_window(ctx).await;
-                msg.meta.ctx_window = Some(window);
-            }
-        }
-        
-        // 2. Routing normal
-        self.route_message(msg).await
-    }
-    
-    fn persist_turn(&self, msg: &Message) {
-        let pool = self.db_pool.clone();
-        let ctx = msg.meta.ctx.clone().unwrap();
-        let seq = msg.meta.ctx_seq.unwrap_or(0) + 1;
-        let from_ilk = msg.meta.src_ilk.clone().unwrap_or_default();
-        let to_ilk = msg.meta.dst_ilk.clone();
-        let ich = msg.meta.ich.clone().unwrap_or_default();
-        let content = msg.payload.clone();
-        
-        // Fire-and-forget: no bloquea el routing
-        tokio::spawn(async move {
-            let _ = sqlx::query!(
-                r#"INSERT INTO turns (ctx, seq, ts, from_ilk, to_ilk, ich, msg_type, content)
-                   VALUES ($1, $2, now(), $3, $4, $5, 'message', $6)
-                   ON CONFLICT (ctx, seq) DO NOTHING"#,
-                ctx, seq as i64, from_ilk, to_ilk, ich, content
-            )
-            .execute(&pool)
-            .await;
-        });
-    }
-    
-    async fn fetch_ctx_window(&self, ctx: &str) -> Vec<CtxTurn> {
-        // Intentar fetch de DB con timeout corto
-        let result = tokio::time::timeout(
-            Duration::from_millis(50),
-            self.query_recent_turns(ctx, CTX_WINDOW_SIZE)
-        ).await;
-        
-        match result {
-            Ok(Ok(turns)) => turns,
-            _ => vec![],  // Si falla o timeout, continuar sin window
-        }
-    }
-    
-    async fn query_recent_turns(&self, ctx: &str, limit: usize) -> Result<Vec<CtxTurn>> {
-        sqlx::query_as!(
-            CtxTurn,
-            r#"SELECT seq, ts, from_ilk as "from", msg_type as turn_type, 
-                      content->>'text' as text
-               FROM turns 
-               WHERE ctx = $1 
-               ORDER BY seq DESC 
-               LIMIT $2"#,
-            ctx, limit as i64
-        )
-        .fetch_all(&self.db_pool)
-        .await
-        .map(|mut v| { v.reverse(); v })  // Ordenar cronológicamente
-    }
-}
-```
-
-### 11.4 Beneficios de ctx_window
-
-| Beneficio | Descripción |
-|-----------|-------------|
-| Latencia cero | Nodo AI responde inmediato si 20 turns son suficientes |
-| Resiliencia | Si DB está lenta/caída, conversaciones activas funcionan |
-| OPA | Puede usar ctx_window para reglas basadas en historial |
-| Simplicidad | Nodo no necesita ctx_client si ctx_window es suficiente |
-
-### 11.5 Cuándo el nodo necesita más historia
-
-Si el nodo necesita más de 20 turns (raro):
-
-```rust
-impl AiNode {
-    async fn handle_message(&mut self, msg: Message) -> Result<()> {
-        let window = msg.meta.ctx_window.as_ref().unwrap_or(&vec![]);
-        
-        if self.needs_full_history(&msg) && window.len() >= CTX_WINDOW_SIZE {
-            // Caso raro: necesita más historia
-            let ctx = msg.meta.ctx.as_ref().unwrap();
-            let full_history = self.ctx_client.get_turns(ctx, 0).await?;
-            return self.process_with_full_history(&msg, &full_history).await;
-        }
-        
-        // Caso común: ctx_window es suficiente
-        self.process_with_window(&msg, window).await
-    }
-}
-```
+- `thread_id` y `thread_seq` son el carrier conversacional canónico
+- `ctx`, `ctx_seq`, `ctx_window` quedan solo como campos legacy/históricos del protocolo
+- el enrichment es fail-open:
+  - si `jsr-memory` no está disponible, el router entrega igual
+  - OPA no lee `memory_package`
+  - `memory_package` no influye en la decisión de routing
 
 ---
 

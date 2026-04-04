@@ -62,9 +62,9 @@ Nota actual:
 - [x] Endurecer validacion en `sy_storage` (rechazo + log estructurado por campo invalido).
 - [x] Acordar productores por subject (router/cognition/u otros).
   - `storage.turns`: `rt-gateway` (publicacion actual implementada).
-  - `storage.events`: `SY.cognition` (productor objetivo; `SY.storage` ya preparado para consumir).
-  - `storage.items`: `SY.cognition` (productor objetivo; `SY.storage` ya preparado para consumir).
-  - `storage.reactivation`: `SY.cognition` (productor objetivo; `SY.storage` ya preparado para consumir).
+  - `storage.events`: contrato viejo/no canónico para cognition v2.
+  - `storage.items`: contrato viejo/no canónico para cognition v2.
+  - `storage.reactivation`: contrato viejo/no canónico para cognition v2.
   - Nota operativa: hasta cerrar el pipeline cognitivo/WAN completo, el unico flujo E2E validado es `storage.turns`.
 
 Criterio de salida:
@@ -263,7 +263,8 @@ Criterio de salida:
 
 ## Proximo bloque sugerido (orden de ejecucion)
 
-1. Activar productor real de `storage.events/items/reactivation` (SY.cognition) para validar pipeline E2E completo sobre infraestructura durable.
+1. No abrir productores nuevos sobre `storage.events/items/reactivation` para cognition v2.
+   Nota: ese camino queda superseded por `storage.cognition.*` como contrato canónico nuevo.
 2. Cerrar contrato final (Fase 3B) con versionado y validaciones estrictas.
 3. Ajustar esquema/indices/constraints finales de storage segun contrato definitivo.
 

@@ -107,11 +107,11 @@ Según la especificación del Router v1.16:
 - `ctx_window` no está garantizado en runtime hoy; `ctx_seq` puede no venir en algunos flujos.
 
 ✅ **NORMATIVO (HOY)**:
-- IO Nodes **MUST** tolerar `ctx_window` faltante (no fallar), loggear advertencia y continuar.
-- IO Nodes **SHOULD** tolerar `ctx_seq` faltante (asumir `0` o equivalente para no abortar).
+- IO Nodes **MUST** tolerar `ctx_window` y `ctx_seq` ausentes sin fallar.
+- esos fields ya no forman parte del carrier canónico activo del repo.
 
 🧩 **A ESPECIFICAR**:
-- Cuándo y cómo se vuelve obligatorio `ctx_window` (cuando el router/core lo implemente consistentemente).
+- si se mantienen en el protocolo, quedan solo como compatibilidad histórica; no hay plan activo para volverlos obligatorios.
 
 
 ## Lifecycle & configuración (modelo unificado con AI Nodes)
@@ -188,7 +188,6 @@ Según la especificación del Router v1.16:
 
 🧩 **A ESPECIFICAR (futuro)**:
 - `*_key_ref` (env/file/vault/kms) + gestor de secretos (orchestrator/admin o servicio dedicado) para rotación/persistencia segura.
-
 
 
 

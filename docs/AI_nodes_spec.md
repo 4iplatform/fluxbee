@@ -471,16 +471,18 @@ Códigos recomendados (no exhaustivo):
 
 ### Campos L3 de contexto (ctx, ctx_seq, ctx_window)
 
-✅ **NORMATIVO (canónico en protocolo)**:
-- `ctx` y `ctx_seq` se tratan como campos de contexto L3 del mensaje.
-- `ctx_window` se define como historia reciente agregada por router.
+✅ **NORMATIVO (estado actual del repo)**:
+- `ctx`, `ctx_seq` y `ctx_window` quedan como fields legacy/históricos del protocolo.
+- no forman parte del carrier canónico activo de AI Nodes.
 
 ⚠️ **TOLERANCIA OPERATIVA (HOY)**:
-- En el código core revisado, `ctx_window` no aparece implementado/inyectado por el router (solo está documentado).  
-  Por lo tanto, AI Nodes **MUST** tolerar `ctx_window` faltante:
-  - loggear advertencia (`missing_ctx_window`),
-  - continuar procesando usando `payload.content`/`content_ref` y attachments disponibles.
-- Cuando el router lo implemente, `ctx_window` pasará a ser **obligatorio** para el “happy path” (sin cambiar el contrato de AI Nodes).
+- AI Nodes **MUST** tolerar `ctx`, `ctx_seq` y `ctx_window` ausentes sin degradar el happy path.
+- si esos fields aparecen en payloads viejos, deben tratarse como metadata opaca/legacy, no como fuente canónica de contexto.
+- el contexto canónico relevante para AI Nodes hoy entra por:
+  - `meta.thread_id`
+  - `meta.thread_seq`
+  - `meta.src_ilk`
+  - `meta.memory_package`
 
 
 

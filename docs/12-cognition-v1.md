@@ -1,5 +1,7 @@
 # Fluxbee - 12 Cognición (SY.cognition)
 
+> Superseded by [`docs/12-cognition-v2.md`](/Users/cagostino/Documents/GitHub/fluxbee/docs/12-cognition-v2.md). This v1 document remains only as historical context for the older `ctx/ctx_window` model.
+
 **Estado:** v1.16  
 **Fecha:** 2026-02-05  
 **Audiencia:** Desarrolladores de router core, infraestructura, AI

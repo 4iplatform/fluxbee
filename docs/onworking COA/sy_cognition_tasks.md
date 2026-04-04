@@ -9,10 +9,10 @@ Hoy `SY.cognition` ya existe como skeleton/binario implementado en el repo, pero
 
 Estado observado del sistema:
 - ya existe `src/bin/sy_cognition.rs`
-- no existe `jsr-memory` implementado en código
-- no existe `memory_package` v2 implementado en router
-- no existe `compute_thread_id(...)` en SDK
-- el protocolo activo sigue anclado en `ctx`, `ctx_seq`, `ctx_window`
+- `jsr-memory` ya existe como SHM real y writer/readers operativos
+- `memory_package` v2 ya se arma en router y se adjunta en entrega local
+- `compute_thread_id(...)` ya existe en SDK/IO
+- el protocolo/core ya modela `thread_id`, `thread_seq` y `memory_package` v2 como carrier canónico
 - los AI nodes hoy manejan memoria inmediata y `thread_state` con key canónico `src_ilk`
 - `storage.events`, `storage.items`, `storage.reactivation` responden al modelo cognitivo viejo, no al modelo v2 consolidado
 
@@ -86,29 +86,24 @@ Regla arquitectónica:
 
 ### 3.1 Protocolo
 
-- [`docs/02-protocolo.md`](/Users/cagostino/Documents/GitHub/fluxbee/docs/02-protocolo.md) sigue modelando:
-  - `ctx`
-  - `ctx_seq`
-  - `ctx_window`
-  - `memory_package` viejo
-- v2 necesita:
-  - `thread_id` canónico
-  - `thread_seq` canónico
-  - nuevo `memory_package`
-  - eventualmente `reason`/`context` cognitivos, no `ctx` legacy
+- el carrier canónico ya quedó en:
+  - `thread_id`
+  - `thread_seq`
+  - `memory_package` v2
+- `ctx`, `ctx_seq`, `ctx_window` sobreviven solo como fields legacy/históricos del protocolo, no como forma activa de trabajo del repo
+- falta terminar de barrer documentación residual v1 para no mezclar semánticas
 
 ### 3.2 Router
 
-- hoy no existe reader de `jsr-memory`
-- hoy no existe ensamblado real de `memory_package`
-- hay que decidir qué queda del carrier viejo (`ctx_window`) y qué deja de producir router
+- el router ya tiene reader de `jsr-memory`
+- el router ya ensambla y adjunta `memory_package` v2
+- el router ya no produce ni consume `ctx_window` como mecanismo runtime del repo
 
 ### 3.3 SDKs
 
-- falta `compute_thread_id(...)`
-- falta modelado canónico de `thread_id`
-- falta modelado canónico de `thread_seq`
-- falta contrato de `memory_package` v2
+- el SDK ya modela `thread_id`, `thread_seq` y `memory_package` v2
+- los SDKs/runtime AI del repo ya no leen compat legacy desde `meta.context` para thread/state
+- falta solo seguir endureciendo/explicitar en docs qué shapes v1 quedan como históricos
 - falta contrato canónico para turn/event payloads que cognition va a consumir/producir
 
 ### 3.4 IO nodes
@@ -564,7 +559,7 @@ Estado actual:
 - [x] COG-M10-T1. Implementar rebuild desde storage durable.
 - [x] COG-M10-T2. Regenerar `jsr-memory` desde durable.
 - [x] COG-M10-T3. Definir criterio de corrupción/rebuild local.
-- [~] COG-M10-T4. E2E completo:
+- [x] COG-M10-T4. E2E completo:
   - message real por router
   - `thread_id/thread_seq` en carrier real
   - tagger
@@ -574,7 +569,7 @@ Estado actual:
   - episode
   - SHM
   - router enrichment
-- [ ] COG-M10-T5. Remoción formal de mecanismos viejos:
+- [x] COG-M10-T5. Remoción formal de mecanismos viejos:
   - `ctx` como unidad cognitiva canónica
   - shapes/documentación v1 incompatibles
 - [ ] COG-M10-T6. Diseñar rebuild acotado + hot set de `jsr-memory` para escala:
@@ -608,12 +603,12 @@ Rediseño acordado de `COG-M10-T4`:
   - `jsr-memory`
 
 Subtareas nuevas de `COG-M10-T4`:
-- [ ] COG-M10-T4a. Crear nodo `IO.test.cognition@<hive>` o emisor disposable equivalente que entre por router/socket normal.
-- [ ] COG-M10-T4b. Crear nodo `AI.test.cognition@<hive>` o receptor disposable equivalente que capture el mensaje entregado.
-- [ ] COG-M10-T4c. Validar que el router asigna `thread_seq` en el carrier real.
-- [ ] COG-M10-T4d. Validar que `SY.cognition` procesa el turn real y sube contadores (`processed_turns_total`, `published_entities_total`).
-- [ ] COG-M10-T4e. Validar que `jsr-memory` contiene `memory_package` para ese `thread_id`.
-- [ ] COG-M10-T4f. Validar que el nodo destino recibe el mensaje enriquecido con `memory_package`.
+- [x] COG-M10-T4a. Crear nodo `IO.test.cognition@<hive>` o emisor disposable equivalente que entre por router/socket normal.
+- [x] COG-M10-T4b. Crear nodo `AI.test.cognition@<hive>` o receptor disposable equivalente que capture el mensaje entregado.
+- [x] COG-M10-T4c. Validar que el router asigna `thread_seq` en el carrier real.
+- [x] COG-M10-T4d. Validar que `SY.cognition` procesa el turn real y sube contadores (`processed_turns_total`, `published_entities_total`).
+- [x] COG-M10-T4e. Validar que `jsr-memory` contiene `memory_package` para ese `thread_id`.
+- [x] COG-M10-T4f. Validar que el nodo destino recibe el mensaje enriquecido con `memory_package`.
 
 Estado actual:
 - [x] `IO.test.cognition` creado en [`nodes/test/io-test-cognition`](/Users/cagostino/Documents/GitHub/fluxbee/nodes/test/io-test-cognition)
@@ -637,6 +632,13 @@ Hallazgo de la corrida real:
 - step 2 llegó con `thread_seq=3` y con `memory_package`
 - la secuencia `1 -> 3` es consistente con el harness actual porque el reply del nodo receptor reutiliza el mismo `thread_id`, por lo que el router consume `thread_seq=2` en ese reply intermedio
 - esto confirma monotonicidad por thread; no implica salto espurio del router
+
+Estado actual de `COG-M10-T5`:
+- las rutas runtime activas del repo ya no usan `ctx` como unidad cognitiva canónica
+- `ctx`, `ctx_seq`, `ctx_window` quedan solo como fields legacy/históricos en `Meta`
+- el router ya no documenta ni implementa `ctx_window` como enrichment operativo
+- `12-cognition-v1.md` y `12-cognition-v2-BETA.md` quedan marcados como material histórico/superseded
+- `storage.events/items/reactivation` siguen existiendo en `SY.storage` como contrato viejo, pero ya no se describen como camino canónico de cognition v2
 
 ### Fase COG-M11 - Segunda etapa semántica: AI tagger + análisis narrativo
 

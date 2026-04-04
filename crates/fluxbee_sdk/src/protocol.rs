@@ -56,10 +56,13 @@ pub struct Meta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Legacy/historical field from the pre-thread cognition model.
     pub ctx: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Legacy/historical field from the pre-thread cognition model.
     pub ctx_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Legacy/historical field from the pre-thread cognition model.
     pub ctx_window: Option<Vec<CtxTurn>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_package: Option<MemoryPackage>,
