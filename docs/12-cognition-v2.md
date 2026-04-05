@@ -1223,7 +1223,7 @@ Validation note:
   - implicit intent
   - soft entities from the message narrative
 - [x] COG-T36. Improve semantic extraction for canonical reason signals while preserving the closed 8-signal evaluator contract.
-- [ ] COG-T37. Use `reason_signals_extra` as narrative evidence input for memory generation, not only as stored text.
+- [x] COG-T37. Use `reason_signals_extra` as narrative evidence input for memory generation, not only as stored text.
 - [ ] COG-T38. Upgrade the summarizer/memory generator from deterministic lexical fusion to semantic narrative synthesis.
 - [ ] COG-T39. Build a golden corpus to validate semantic outputs and narrative quality under `AI.tagger`.
 - [ ] COG-T40. Define degraded semantics when the AI provider is unavailable:

@@ -3313,6 +3313,7 @@ fn update_memories_and_episodes_for_thread(
         scope,
         context,
         reason,
+        tagger,
         &current_ilk_weights,
         memories,
     ));
@@ -3330,12 +3331,13 @@ fn update_memories_for_thread(
     scope: &ScopeBindingState,
     context: &ContextState,
     reason: &ReasonState,
+    tagger: &SemanticTaggerOutput,
     current_ilk_weights: &BTreeMap<String, f64>,
     memories: &mut HashMap<String, MemoryState>,
 ) -> Vec<(&'static str, Vec<u8>)> {
     let mut out = Vec::new();
     let memory_key = scope.scope_id.clone();
-    let summary = summarize_scope_memory(context, reason);
+    let summary = summarize_scope_memory(context, reason, &tagger.reason_signals_extra);
     let memory = memories
         .entry(memory_key.clone())
         .or_insert_with(|| MemoryState {
@@ -3509,11 +3511,20 @@ fn update_episodes_for_thread(
     out
 }
 
-fn summarize_scope_memory(context: &ContextState, reason: &ReasonState) -> String {
-    format!(
+fn summarize_scope_memory(
+    context: &ContextState,
+    reason: &ReasonState,
+    reason_signals_extra: &[String],
+) -> String {
+    let mut summary = format!(
         "The thread recurrently centers on {} with a dominant drive of {}.",
         context.label, reason.label
-    )
+    );
+    if let Some(evidence_clause) = build_reason_signals_extra_clause(reason_signals_extra) {
+        summary.push(' ');
+        summary.push_str(&evidence_clause);
+    }
+    summary
 }
 
 fn build_episode_candidate(
@@ -3539,6 +3550,7 @@ fn build_episode_candidate(
     let mut evidence_signals = Vec::new();
     let mut base_intensity = 0.0;
     let mut evidence_strength = 0.0;
+    let narrative_clause = build_reason_signals_extra_clause(&tagger.reason_signals_extra);
 
     if extra_signals.contains("frustration")
         && (canonical_signals.contains("challenge") || canonical_signals.contains("resolve"))
@@ -3594,6 +3606,13 @@ fn build_episode_candidate(
         return None;
     }
 
+    if let Some(clause) = narrative_clause {
+        summary.push(' ');
+        summary.push_str(&clause);
+        reason_text.push_str(". ");
+        reason_text.push_str(&clause);
+    }
+
     Some(EpisodeCandidate {
         affect_id: affect_id?,
         title,
@@ -3603,6 +3622,60 @@ fn build_episode_candidate(
         evidence_signals,
         reason: reason_text,
     })
+}
+
+fn build_reason_signals_extra_clause(reason_signals_extra: &[String]) -> Option<String> {
+    let normalized = dedup_reason_signal_extras(reason_signals_extra);
+    if normalized.is_empty() {
+        return None;
+    }
+    let descriptors = normalized
+        .iter()
+        .filter_map(|signal| match signal.as_str() {
+            "urgency" => Some("clear urgency"),
+            "frustration" => Some("visible frustration"),
+            "gratitude" => Some("moments of gratitude"),
+            "confusion" => Some("signs of confusion"),
+            "escalation" => Some("escalation pressure"),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if descriptors.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Narrative evidence includes {}.",
+        join_human_list(&descriptors)
+    ))
+}
+
+fn dedup_reason_signal_extras(reason_signals_extra: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for signal in reason_signals_extra {
+        let normalized = signal.trim().to_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+    out
+}
+
+fn join_human_list(values: &[&str]) -> String {
+    match values.len() {
+        0 => String::new(),
+        1 => values[0].to_string(),
+        2 => format!("{} and {}", values[0], values[1]),
+        _ => {
+            let mut out = values[..values.len() - 1].join(", ");
+            out.push_str(", and ");
+            out.push_str(values[values.len() - 1]);
+            out
+        }
+    }
 }
 
 fn build_scope_upsert_events(
@@ -3955,4 +4028,100 @@ fn write_json_atomic(path: &Path, body: &str) -> Result<(), CognitionError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarize_scope_memory_includes_reason_signal_evidence_clause() {
+        let context = ContextState {
+            context_id: "context:1".to_string(),
+            label: "billing".to_string(),
+            tags: vec!["billing".to_string()],
+            score: 1.0,
+            weight: 1.0,
+            weight_avg_cumulative: 1.0,
+            weight_avg_ema: 1.0,
+            weight_samples: 1,
+            occurrences: 1,
+            opened_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            closed_at: None,
+            status: "open".to_string(),
+        };
+        let reason = ReasonState {
+            reason_id: "reason:1".to_string(),
+            label: "seeking urgent resolution".to_string(),
+            signals_canonical: vec!["resolve".to_string(), "challenge".to_string()],
+            signals_extra: vec!["urgency".to_string(), "frustration".to_string()],
+            score: 1.0,
+            weight: 1.0,
+            weight_avg_cumulative: 1.0,
+            weight_avg_ema: 1.0,
+            weight_samples: 1,
+            occurrences: 1,
+            opened_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            closed_at: None,
+            status: "open".to_string(),
+        };
+
+        let summary = summarize_scope_memory(
+            &context,
+            &reason,
+            &["urgency".to_string(), "frustration".to_string()],
+        );
+        assert!(summary.contains("Narrative evidence includes"));
+        assert!(summary.contains("clear urgency"));
+        assert!(summary.contains("visible frustration"));
+    }
+
+    #[test]
+    fn build_episode_candidate_uses_reason_signal_extras_as_narrative_evidence() {
+        let tagger = SemanticTaggerOutput {
+            tags: vec!["billing".to_string()],
+            reason_signals_canonical: vec!["resolve".to_string(), "challenge".to_string()],
+            reason_signals_extra: vec!["frustration".to_string(), "escalation".to_string()],
+        };
+        let context = ContextState {
+            context_id: "context:1".to_string(),
+            label: "billing".to_string(),
+            tags: vec!["billing".to_string()],
+            score: 1.0,
+            weight: 1.0,
+            weight_avg_cumulative: 1.0,
+            weight_avg_ema: 1.0,
+            weight_samples: 1,
+            occurrences: 1,
+            opened_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            closed_at: None,
+            status: "open".to_string(),
+        };
+        let reason = ReasonState {
+            reason_id: "reason:1".to_string(),
+            label: "confrontational pushback".to_string(),
+            signals_canonical: vec!["challenge".to_string()],
+            signals_extra: vec!["frustration".to_string(), "escalation".to_string()],
+            score: 1.0,
+            weight: 1.0,
+            weight_avg_cumulative: 1.0,
+            weight_avg_ema: 1.0,
+            weight_samples: 1,
+            occurrences: 1,
+            opened_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            closed_at: None,
+            status: "open".to_string(),
+        };
+
+        let candidate = build_episode_candidate(&tagger, &context, &reason).expect("candidate");
+        assert!(candidate.summary.contains("Narrative evidence includes"));
+        assert!(candidate.reason.contains("Narrative evidence includes"));
+        assert!(candidate
+            .evidence_signals
+            .contains(&"frustration".to_string()));
+    }
 }

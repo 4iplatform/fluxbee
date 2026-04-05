@@ -734,7 +734,11 @@ Definición de alcance:
     - prompt de `AI.tagger` reforzado con definiciones explícitas para las 8 señales
     - ejemplos de discriminación por intención comunicativa y no solo por surface words
     - canonicalización backend de aliases/sinónimos antes del filtro cerrado de 8 señales
-- [ ] COG-M11-T5. Usar `reason_signals_extra` como evidencia narrativa real para memory fusion, no solo como bolsa de strings.
+- [x] COG-M11-T5. Usar `reason_signals_extra` como evidencia narrativa real para memory fusion, no solo como bolsa de strings.
+  - implementación actual:
+    - `reason_signals_extra` ya alimenta el summary de memories mediante cláusulas narrativas explícitas
+    - `reason_signals_extra` también refuerza `summary` y `reason` de episodios, no solo el trigger/gate
+    - el esquema durable no cambia; la mejora vive en la síntesis narrativa del contenido
 - [ ] COG-M11-T6. Introducir summarizer narrativo v2 para memories/episodes:
   - resumen más fiel del contenido del thread
   - continuidad temporal
