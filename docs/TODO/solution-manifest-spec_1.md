@@ -1,9 +1,11 @@
 # Solution Manifest — Declarative Configuration per Tenant
 
-**Status:** v1.0 (beta)
+**Status:** beta / canonical direction for policy-integrated solution manifests
 **Date:** 2026-03-31
 **Audience:** SY.architect developers, orchestrator, admin API
 **Parent specs:** `node-spawn-config-spec.md`, `runtime-packaging-cli-spec.md`, `sy-architect-spec.md`, `sy-policy-beta.md`
+
+> Direction note (2026-04-05): this is the solution-manifest spec to use for the `SY.policy` initiative. The old `SY.claims`-oriented manifest under `docs/legacy/solution-manifest-spec.md` is historical only and must not drive new implementation.
 
 ---
 
