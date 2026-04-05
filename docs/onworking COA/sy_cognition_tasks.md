@@ -5,7 +5,7 @@ Spec fuente: [`docs/12-cognition-v2.md`](/Users/cagostino/Documents/GitHub/fluxb
 
 ## 0) Estado real de partida
 
-Hoy `SY.cognition` ya existe como skeleton/binario implementado en el repo, pero todavía no completa el pipeline cognitivo v2.
+Hoy `SY.cognition` ya existe como servicio funcional implementado en el repo y ya completa el pipeline cognitivo v2 actualmente definido.
 
 Estado observado del sistema:
 - ya existe `src/bin/sy_cognition.rs`
@@ -28,9 +28,9 @@ Alcance funcional real por olas:
   - escribe `jsr-memory`
   - enriquece entrega real por router
 - pero esa ola **no agota** cognition:
-  - el tagger actual es lexical/determinístico y queda solo como bootstrap transitorio encapsulado
-  - la lectura semántica profunda del contenido del mensaje todavía no está resuelta
-  - la narrativa de memories/episodes sigue siendo v1 determinística
+  - la lectura semántica profunda y la narrativa v2 ya están activas bajo AI
+  - no quedó un fallback lexical operativo en el producto
+  - lo pendiente pasa más por endurecimiento, corpus y operación
 - dicho de otra manera:
   - la ola actual evita que cognition sea un simple pasamanos de mensajes
   - pero todavía no es la etapa semántica/plena de análisis de contenido
@@ -178,14 +178,14 @@ Para v1 de ejecución:
   - `tags`
   - `reason_signals_canonical`
   - `reason_signals_extra`
-- implementación inicial determinística/lexical del tagger, aislada como bootstrap transitorio
+- implementación inicial del tagger ya reemplazada por el path AI de producto
 - reason evaluator determinístico sobre las 8 commandments
 
 Segunda etapa explícita sobre el mismo contrato:
 - tagger AI/semántico obligatorio para extraer `tags` y reason signals con mejor recall
 - análisis narrativo del contenido para memories/summaries sin cambiar las entidades v2
 - el salto de v1 determinística a v2 semántica debe cambiar el motor, no el carrier ni el durable model
-- en `M11` el objetivo ya no es sostener un fallback lexical de producto; el bootstrap v1 queda solo como código transitorio/removible
+- en `M11` el objetivo ya no es sostener un fallback de producto alternativo para semántica
 
 Consecuencia importante:
 - si no se hace esta segunda etapa, cognition queda funcional y útil, pero con comprensión semántica acotada
@@ -455,7 +455,7 @@ Estado actual:
   - `storage.cognition.contexts`
   - `storage.cognition.reasons`
   - `storage.cognition.cooccurrences`
-- el tagger v1 actual es determinístico/lexical; la mejora futura a AI tagger queda abierta sin cambiar el contrato
+- el tagger de producto actual es AI-backed; la mejora futura queda en calidad, corpus y operación sin cambiar el contrato
 - `M5` queda cerrado con co-ocurrencias explícitas thread-scoped; el siguiente frente real ya es `M6+`
 
 Límite explícito de esta fase:
@@ -697,27 +697,32 @@ Definición de alcance:
   - si la respuesta AI viene vacía, inválida o fuera de contrato:
     - se cuenta como failure del `AI.tagger`
     - no cambia carrier ni durable model
-    - `SY.cognition` queda degradado para semántica de ese turn; no hace rollback silencioso al lexical como camino oficial
-  - configuración operacional a introducir en `SY.cognition`:
+    - `SY.cognition` queda degradado para semántica de ese turn; no hace fallback silencioso como camino oficial
+  - configuración operacional ya expuesta en `SY.cognition`:
     - provider
     - model
     - timeout
     - temperatura baja / fija
     - límites de salida (`max_tags`, `max_reason_signals`)
-  - observabilidad mínima a exponer en `STATUS/CONFIG_GET` cuando se implemente:
+    - secreto AI canónico en `config.secrets.openai.api_key`
+  - observabilidad mínima ya expuesta en `STATUS/CONFIG_GET`:
     - `semantic_tagger_calls_total`
     - `semantic_tagger_failures_total`
     - `semantic_tagger_invalid_outputs_total`
     - `last_semantic_model`
+    - `narrative_summarizer_calls_total`
+    - `narrative_summarizer_failures_total`
+    - `narrative_summarizer_invalid_outputs_total`
+    - `last_narrative_model`
+    - `degraded_semantics_policy`
 - [x] COG-M11-T2. Reemplazar el rol central del tagger lexical por `AI.tagger` como motor semántico oficial:
   - sin feature flag de fallback de producto
   - sin dualidad permanente `lexical|semantic`
-  - dejando el bootstrap lexical solo como código transitorio/removible
   - estado actual de implementación:
     - `SY.cognition` ya expone `config.semantic_tagger.*` en `CONFIG_GET/CONFIG_SET`
     - `STATUS/CONFIG_GET` ya exponen contadores y estado del `semantic_tagger`
     - el path central del turn ahora usa llamada AI real por `OpenAiResponsesClient`
-    - el bootstrap lexical quedó aislado fuera del flujo normal para facilitar su futura remoción
+    - el runtime ya no conserva ningún bootstrap semántico alternativo como path activo
 - [x] COG-M11-T3. Mejorar extracción semántica de `tags`:
   - sinonimia
   - paráfrasis
@@ -747,43 +752,49 @@ Definición de alcance:
     - una llamada AI interna sintetiza `memory_summary` y, si aplica, `episode_summary` + `episode_reason`
     - la entrada incluye continuidad con summaries previos para evitar resets narrativos por turn
     - el gate estructural del episodio sigue determinístico; mejora solo la síntesis narrativa
-    - si el summarizer AI falla, el turn queda degradado para narrativa y no hace fallback silencioso al resumen lexical
+    - si el summarizer AI falla, el turn queda degradado para narrativa y no hace fallback silencioso a otro summarizer
 - [x] COG-M11-T7. Definir corpus/golden tests para validar calidad semántica del `AI.tagger` y del summarizer v2.
   - implementación actual:
     - corpus versionado en `src/bin/sy_cognition/golden_corpus.json`
     - golden tests automáticos para `AI.tagger` sobre normalización/contracto semántico
     - golden tests automáticos para el summarizer narrativo sobre fragments mínimos esperados
     - estos tests no llaman al provider live; sirven como baseline reproducible de contrato/calidad mínima
-- [ ] COG-M11-T8. Definir política operacional cuando AI no esté disponible:
+- [x] COG-M11-T8. Definir política operacional cuando AI no esté disponible:
   - `SY.cognition` queda degradado para semántica profunda
-  - no debe hacer rollback silencioso al tagger/summarizer lexical como comportamiento oficial de producto
+  - no debe hacer rollback silencioso a un path semántico alternativo como comportamiento oficial de producto
   - el carrier y durable model no cambian; cambia solo la capacidad de producir enriquecimiento semántico nuevo
+  - implementación actual:
+    - `STATUS/CONFIG_GET` exponen `degraded_semantics_policy`
+    - sin AI secret: el turno no produce nuevas derivaciones semánticas y el nodo sigue fail-open
+    - si falla `AI.tagger`: se omite la derivación semántica del turn
+    - si falla el summarizer narrativo: se omite la actualización narrativa del turn
+    - no hay fallback silencioso de producto cuando AI no está disponible
 
 Objetivo:
 - tratar el análisis de contenido del mensaje como una segunda ola explícita
 - mantener estable el pipeline y el durable model ya cerrados
 - mejorar calidad semántica sin volver a abrir `thread/context/reason/scope/memory/episode`
 - dejar documentado que, hasta completar esta fase, cognition no debe venderse internamente como análisis semántico pleno sino como v2 estructural + enrichment operativo
-- dejar documentado que el bootstrap lexical actual es transitorio y está encapsulado para su futura remoción
+- dejar documentado que la semántica de producto ya es AI-only y sin fallback silencioso
 
 ---
 
 ## 6) Sistemas a tocar
 
-Este cambio no es solo un nuevo binario. Toca como mínimo:
+Este cambio no fue solo un nuevo binario. La ola efectivamente tocó:
 
-- [ ] `docs/12-cognition-v2.md`
-- [ ] `docs/02-protocolo.md`
-- [ ] `docs/03-shm.md`
-- [ ] `docs/13-storage.md`
-- [ ] `docs/AI_nodes_spec.md`
-- [ ] IO docs/runtime specs
-- [ ] `crates/fluxbee_sdk`
-- [ ] SDK/runtime helpers de AI si corresponde
-- [ ] router
-- [ ] `SY.storage`
-- [ ] `SY.cognition` nuevo
-- [ ] AI nodes que consumen metadata conversacional
+- [x] `docs/12-cognition-v2.md`
+- [x] `docs/02-protocolo.md`
+- [x] `docs/03-shm.md`
+- [x] `docs/13-storage.md`
+- [x] `docs/AI_nodes_spec.md`
+- [x] IO docs/runtime specs
+- [x] `crates/fluxbee_sdk`
+- [x] SDK/runtime helpers de AI
+- [x] router
+- [x] `SY.storage`
+- [x] `SY.cognition`
+- [x] AI nodes que consumen metadata conversacional
 
 ---
 

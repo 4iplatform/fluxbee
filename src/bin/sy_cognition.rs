@@ -43,9 +43,6 @@ use json_router::shm::{
     MEMORY_MAX_DATA_SIZE,
 };
 
-#[allow(dead_code)]
-#[path = "sy_cognition/bootstrap_lexical_tagger.rs"]
-mod bootstrap_lexical_tagger;
 #[path = "sy_cognition/narrative_summarizer_ai.rs"]
 mod narrative_summarizer_ai;
 #[path = "sy_cognition/semantic_tagger_ai.rs"]
@@ -1960,6 +1957,20 @@ fn build_status_payload(
         "ai_required": true,
         "implementation_status": "openai_responses"
     });
+    let degraded_semantics_policy = json!({
+        "ai_required": true,
+        "silent_fallback": false,
+        "carrier_changes_when_degraded": false,
+        "durable_schema_changes_when_degraded": false,
+        "turn_behavior_without_ai": "skip_semantic_derivation_fail_open",
+        "turn_behavior_on_semantic_tagger_failure": "skip_semantic_derivation_fail_open",
+        "turn_behavior_on_narrative_summarizer_failure": "skip_narrative_update_fail_open",
+        "notes": [
+            "Without AI, SY.cognition stays live but does not produce new semantic derivations for the affected turn.",
+            "The router carrier and durable entity schemas remain unchanged while semantic capability is degraded.",
+            "There is no silent fallback path as product behavior."
+        ]
+    });
     let turns_consumer = json!({
         "subject": SUBJECT_STORAGE_TURNS,
         "mode": if use_durable_consumer { "durable" } else { "volatile" },
@@ -2031,6 +2042,7 @@ fn build_status_payload(
         },
         "ai_provider": ai_provider,
         "semantic_tagger": semantic_tagger,
+        "degraded_semantics_policy": degraded_semantics_policy,
         "turns_consumer": turns_consumer,
         "paths": paths,
         "shm": shm
@@ -2066,11 +2078,15 @@ fn build_cognition_config_get_payload(
                 .to_string(),
         ),
         Value::String(
-            "The OpenAI provider secret is required for the semantic extraction stage; without it, SY.cognition stays fail-open and skips new semantic derivations."
+            "The OpenAI provider secret is required for the semantic extraction stage; without it, SY.cognition stays fail-open and skips new semantic derivations for affected turns."
                 .to_string(),
         ),
         Value::String(
-            "The semantic tagger is an internal AI-backed component of SY.cognition using the configured provider/model; the old lexical bootstrap code is isolated and not part of the normal runtime path."
+            "The semantic tagger is an internal AI-backed component of SY.cognition using the configured provider/model."
+                .to_string(),
+        ),
+        Value::String(
+            "When AI is unavailable or a semantic call fails, carrier and durable schemas do not change; only new semantic enrichment is skipped for that turn/window."
                 .to_string(),
         ),
         Value::String(
@@ -2114,6 +2130,15 @@ fn build_cognition_config_get_payload(
             "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
             "ai_required": true,
             "implementation_status": "openai_responses"
+        },
+        "degraded_semantics_policy": {
+            "ai_required": true,
+            "silent_fallback": false,
+            "carrier_changes_when_degraded": false,
+            "durable_schema_changes_when_degraded": false,
+            "turn_behavior_without_ai": "skip_semantic_derivation_fail_open",
+            "turn_behavior_on_semantic_tagger_failure": "skip_semantic_derivation_fail_open",
+            "turn_behavior_on_narrative_summarizer_failure": "skip_narrative_update_fail_open"
         },
         "thresholds": {
             "context_open": control_state.thresholds.context_open,
@@ -2337,7 +2362,7 @@ fn apply_cognition_config_set(
         } else {
             Value::Array(Vec::new())
         },
-        "message": "SY.cognition local config persisted. Semantic extraction now uses the configured AI semantic tagger; the old lexical bootstrap remains isolated for transition only."
+        "message": "SY.cognition local config persisted. Semantic extraction uses the configured AI semantic tagger."
     }))
 }
 
@@ -2387,12 +2412,14 @@ fn config_error_response(
 fn cognition_state_label(control_state: &CognitionControlState) -> &'static str {
     match control_state.ai_secret_source {
         CognitionAiSecretSource::Missing => "degraded_no_ai_provider",
-        CognitionAiSecretSource::LocalFile | CognitionAiSecretSource::EnvCompat => "ready_scaffold",
+        CognitionAiSecretSource::LocalFile | CognitionAiSecretSource::EnvCompat => {
+            "ready_semantic_ai"
+        }
     }
 }
 
 fn cognition_degraded_reasons(control_state: &CognitionControlState) -> Vec<&'static str> {
-    let mut reasons = vec!["memory_shm_pending"];
+    let mut reasons = Vec::new();
     if control_state.ai_secret_source == CognitionAiSecretSource::Missing {
         reasons.push("ai_provider_missing");
     }

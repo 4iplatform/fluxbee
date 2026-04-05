@@ -487,21 +487,27 @@ Failure semantics:
 - if the AI response is missing, empty, malformed, or out of contract, the turn is counted as a semantic tagger failure
 - carrier and durable entity schemas do not change
 - `SY.cognition` reports degraded semantic capability for that turn/window
-- there is no silent lexical fallback as the target product behavior for stage 2
+- there is no silent fallback path as the target product behavior for stage 2
 
-Operational config to expose in `SY.cognition` when implemented:
+Operational config exposed in `SY.cognition`:
 - `provider`
 - `model`
 - `timeout_ms`
 - low/fixed sampling policy
 - `max_tags`
 - `max_reason_signals`
+- canonical AI secret under `config.secrets.openai.api_key`
 
-Operational metrics to expose in `STATUS` / `CONFIG_GET` when implemented:
+Operational metrics exposed in `STATUS` / `CONFIG_GET`:
 - `semantic_tagger_calls_total`
 - `semantic_tagger_failures_total`
 - `semantic_tagger_invalid_outputs_total`
 - `last_semantic_model`
+- `narrative_summarizer_calls_total`
+- `narrative_summarizer_failures_total`
+- `narrative_summarizer_invalid_outputs_total`
+- `last_narrative_model`
+- `degraded_semantics_policy`
 
 ### 6.2 Context Evaluator
 
@@ -1063,7 +1069,7 @@ For the semantic stage, `SY.cognition` makes direct AI calls via AI SDK (same fa
 Architectural clarification:
 - semantic cognition in stage 2 is AI-backed and AI-required
 - the operational tagger path is now the direct AI call inside `SY.cognition`
-- the current lexical/deterministic tagger is retained only as transitional bootstrap code during migration
+- the semantic stage is AI-backed and does not retain a product fallback path
 - that bootstrap implementation is not the target operational fallback of the product
 
 ### 13.4 Reason Evaluator: AI or Deterministic?
@@ -1217,7 +1223,7 @@ Validation note:
 - [ ] COG-T33. Introduce `AI.tagger` as an operational upgrade under the same `tags + reason_signals_*` contract.
 - [ ] COG-T34. Treat `AI.tagger` as the official semantic engine for stage 2:
   - no permanent runtime fallback path as product architecture
-  - isolate the current lexical tagger as transitional bootstrap code only
+  - remove the previous transitional semantic bootstrap from the runtime path
 - [x] COG-T35. Improve semantic extraction for tags:
   - paraphrases
   - implicit intent
@@ -1226,8 +1232,8 @@ Validation note:
 - [x] COG-T37. Use `reason_signals_extra` as narrative evidence input for memory generation, not only as stored text.
 - [x] COG-T38. Upgrade the summarizer/memory generator from deterministic lexical fusion to semantic narrative synthesis.
 - [x] COG-T39. Build a golden corpus to validate semantic outputs and narrative quality under `AI.tagger`.
-- [ ] COG-T40. Define degraded semantics when the AI provider is unavailable:
-  - cognition does not silently roll back to lexical semantics as the official product path
+- [x] COG-T40. Define degraded semantics when the AI provider is unavailable:
+  - cognition does not silently fall back to an alternate semantic path as the official product path
   - carrier and durable entities stay unchanged
   - the node reports degraded semantic capability until AI is available again
 
