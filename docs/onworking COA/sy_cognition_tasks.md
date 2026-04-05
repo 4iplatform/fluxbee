@@ -748,7 +748,12 @@ Definición de alcance:
     - la entrada incluye continuidad con summaries previos para evitar resets narrativos por turn
     - el gate estructural del episodio sigue determinístico; mejora solo la síntesis narrativa
     - si el summarizer AI falla, el turn queda degradado para narrativa y no hace fallback silencioso al resumen lexical
-- [ ] COG-M11-T7. Definir corpus/golden tests para validar calidad semántica del `AI.tagger` y del summarizer v2.
+- [x] COG-M11-T7. Definir corpus/golden tests para validar calidad semántica del `AI.tagger` y del summarizer v2.
+  - implementación actual:
+    - corpus versionado en `src/bin/sy_cognition/golden_corpus.json`
+    - golden tests automáticos para `AI.tagger` sobre normalización/contracto semántico
+    - golden tests automáticos para el summarizer narrativo sobre fragments mínimos esperados
+    - estos tests no llaman al provider live; sirven como baseline reproducible de contrato/calidad mínima
 - [ ] COG-M11-T8. Definir política operacional cuando AI no esté disponible:
   - `SY.cognition` queda degradado para semántica profunda
   - no debe hacer rollback silencioso al tagger/summarizer lexical como comportamiento oficial de producto

@@ -187,6 +187,27 @@ fn normalize_sentence(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct GoldenCorpus {
+        narrative_cases: Vec<NarrativeCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct NarrativeCase {
+        name: String,
+        expect_episode: bool,
+        raw_output: String,
+        memory_summary_contains: Vec<String>,
+        episode_summary_contains: Vec<String>,
+        episode_reason_contains: Vec<String>,
+    }
+
+    fn load_golden_corpus() -> GoldenCorpus {
+        serde_json::from_str(include_str!("golden_corpus.json"))
+            .expect("golden corpus should parse")
+    }
 
     #[test]
     fn parses_memory_only_narrative() {
@@ -204,5 +225,46 @@ mod tests {
         let raw = r#"{"memory_summary":"Recurring billing friction.","episode_summary":"Pressure escalated.","episode_reason":null}"#;
         let err = parse_narrative_summaries(raw, true).expect_err("should fail");
         assert!(err.to_string().contains("incomplete episode narrative"));
+    }
+
+    #[test]
+    fn golden_narrative_corpus_matches_minimum_expected_content() {
+        let corpus = load_golden_corpus();
+        for case in corpus.narrative_cases {
+            let parsed =
+                parse_narrative_summaries(&case.raw_output, case.expect_episode).expect("parse");
+            for expected in case.memory_summary_contains {
+                assert!(
+                    parsed.memory_summary.contains(&expected),
+                    "narrative case {} missing memory fragment {}",
+                    case.name,
+                    expected
+                );
+            }
+            for expected in case.episode_summary_contains {
+                assert!(
+                    parsed
+                        .episode_summary
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains(&expected),
+                    "narrative case {} missing episode summary fragment {}",
+                    case.name,
+                    expected
+                );
+            }
+            for expected in case.episode_reason_contains {
+                assert!(
+                    parsed
+                        .episode_reason
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains(&expected),
+                    "narrative case {} missing episode reason fragment {}",
+                    case.name,
+                    expected
+                );
+            }
+        }
     }
 }

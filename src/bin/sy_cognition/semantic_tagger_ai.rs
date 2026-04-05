@@ -309,6 +309,26 @@ fn is_generic_tag(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct GoldenCorpus {
+        semantic_cases: Vec<SemanticCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SemanticCase {
+        name: String,
+        raw_output: String,
+        expected_tags: Vec<String>,
+        expected_canonical: Vec<String>,
+        expected_extra: Vec<String>,
+    }
+
+    fn load_golden_corpus() -> GoldenCorpus {
+        serde_json::from_str(include_str!("golden_corpus.json"))
+            .expect("golden corpus should parse")
+    }
 
     #[test]
     fn parses_plain_json_and_filters_unknown_canonical_signals() {
@@ -355,5 +375,29 @@ mod tests {
         }"#;
         let parsed = parse_semantic_tagger_response(raw, 6, 6).expect("should parse");
         assert_eq!(parsed.tags, vec!["duplicate charge", "account security"]);
+    }
+
+    #[test]
+    fn golden_semantic_corpus_matches_expected_normalized_outputs() {
+        let corpus = load_golden_corpus();
+        for case in corpus.semantic_cases {
+            let parsed =
+                parse_semantic_tagger_response(&case.raw_output, 12, 8).expect("should parse");
+            assert_eq!(
+                parsed.tags, case.expected_tags,
+                "semantic case {}",
+                case.name
+            );
+            assert_eq!(
+                parsed.reason_signals_canonical, case.expected_canonical,
+                "semantic case {}",
+                case.name
+            );
+            assert_eq!(
+                parsed.reason_signals_extra, case.expected_extra,
+                "semantic case {}",
+                case.name
+            );
+        }
     }
 }
