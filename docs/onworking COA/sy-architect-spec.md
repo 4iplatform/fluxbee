@@ -749,9 +749,10 @@ Current repo state should be treated as a **partial shell**, not as a blank impl
   - persisted AI tool results with compact render of tool name, relevant input, summarized output, and full metadata retained
 - current friction:
   - header status chips still depend on `/api/status` and backend inventory freshness
-  - each refresh opens an ephemeral router/admin client path just to render `Hives` / `Nodes` / `Updated`
+  - today each refresh can still open an ephemeral router/admin client path just to render `Hives` / `Nodes` / `Updated`
   - browser polling is already visibility-aware and less aggressive than the initial version, but the inventory summary itself can still lag behind recent mutations
   - long-running mutating actions can outlive the local caller timeout; architect must track them explicitly instead of treating timeout as a clean failure
+  - for these three lightweight chips specifically, the preferred next optimization is local inventory snapshot/SHM read inside `SY.architect`, not a control-plane roundtrip
 - The current implementation does **not** yet provide:
   - WebSocket chat/streaming
   - settings panel / `set_node_config`
@@ -765,7 +766,7 @@ These are not optional details; they affect the shape of the implementation:
 
 - **Core packaging boundary:** `SY.architect` is a core `SY.*` node, so frontend/prompt assets cannot assume managed runtime `_system.package_path`.
 - **Config ownership split:** today there is a practical split between `hive.yaml` bootstrap/fallback config and future self-managed `config.json`. This is still unresolved for core/system nodes as a class: orchestrator/admin can address `config.json`, but current `SY.*` runtimes still bootstrap from `hive.yaml`.
-- **Status source of truth:** for v1, the top bar should read through `ADMIN_COMMAND` over socket, not over HTTP. Direct SHM reads are a possible later optimization, not the initial contract.
+- **Status source of truth:** the full operational surface should continue to use `ADMIN_COMMAND` over socket. However, the top-bar lightweight chips (`Hives`, `Nodes`, `Updated`) should migrate to local inventory snapshot/SHM reads inside `SY.architect` to avoid repeated control-plane roundtrips for low-value polling data.
 - **Persistence scope for v1:** chat sessions/messages should persist in LanceDB locally. Internal layout/flush/index strategy can be optimized for the fact that only this process reads/writes these chats.
 - **Non-AI usefulness first:** the architect should become a strong operational chat shell even if AI is disabled or delayed.
 
@@ -834,8 +835,12 @@ This is the most important product phase for now. The architect should become us
 - [x] ARCH-T15. Representar resultados de comandos como mensajes de sistema en el chat.
 - [x] ARCH-T14. Implementar barra/status de sistema usando:
   - `ADMIN_COMMAND` por socket como camino canónico v1
-  - SHM directo solo como optimización futura, no como contrato inicial
+  - y dejar explícito que los chips livianos del topbar (`Hives`, `Nodes`, `Updated`) pueden pasar a snapshot local/SHM directo como optimización operativa
   - Nota: reemplaza placeholders locales del header; ésta es la próxima pieza estructural de UX.
+- [ ] ARCH-T14.1. Mover los chips `Hives` / `Nodes` / `Updated` a lectura local de snapshot/SHM dentro de `SY.architect`:
+  - mantener `/api/status` como superficie HTTP para la UI
+  - evitar roundtrip `SY.architect -> SY.admin -> SY.orchestrator` en polling frecuente
+  - reservar `ADMIN_COMMAND` para vistas operativas ricas y acciones, no para contadores livianos de topbar
 - [x] ARCH-T16. Endurecer confirmación de operaciones destructivas (`kill_node`, `remove_hive`, futuros deletes).
 
 ### Phase C.1 — Admin Surface Coverage

@@ -3455,7 +3455,9 @@ async fn build_architect_status(state: &ArchitectState) -> ArchitectStatus {
         Ok((summary, hive)) => {
             status.admin_available = true;
             apply_inventory_summary(&mut status, &summary);
-            status.components = parse_component_statuses(&hive);
+            if let Some(hive) = hive.as_ref() {
+                status.components = parse_component_statuses(hive);
+            }
         }
         Err(err) => {
             status.status = "degraded".to_string();
@@ -3468,7 +3470,7 @@ async fn build_architect_status(state: &ArchitectState) -> ArchitectStatus {
 
 async fn fetch_inventory_status_data(
     state: &ArchitectState,
-) -> Result<(Value, Value), ArchitectError> {
+) -> Result<(Value, Option<Value>), ArchitectError> {
     let node_config = NodeConfig {
         name: format!("SY.architect.status.{}", Uuid::new_v4().simple()),
         router_socket: state.socket_dir.clone(),
@@ -3510,11 +3512,19 @@ async fn fetch_inventory_status_data(
             timeout: Duration::from_secs(5),
         },
     )
-    .await
-    .map_err(|err| -> ArchitectError { Box::new(err) })?;
-    ensure_admin_ok("inventory hive", &hive)?;
+    .await;
+    let hive_payload = match hive {
+        Ok(result) => {
+            if ensure_admin_ok("inventory hive", &result).is_ok() {
+                Some(result.payload)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
 
-    Ok((summary.payload, hive.payload))
+    Ok((summary.payload, hive_payload))
 }
 
 fn ensure_admin_ok(
