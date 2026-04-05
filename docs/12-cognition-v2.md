@@ -476,6 +476,11 @@ Mandatory backend post-processing:
 - trim
 - dedup
 - hard limit on list sizes
+- light semantic cleanup for tags:
+  - drop generic placeholders/noise
+  - normalize separators/punctuation
+  - keep short semantic noun phrases
+- canonical alias normalization for `reason_signals_canonical` before final validation
 - strict filter of `reason_signals_canonical` against the closed 8-signal set
 
 Failure semantics:
@@ -1213,11 +1218,11 @@ Validation note:
 - [ ] COG-T34. Treat `AI.tagger` as the official semantic engine for stage 2:
   - no permanent runtime fallback path as product architecture
   - isolate the current lexical tagger as transitional bootstrap code only
-- [ ] COG-T35. Improve semantic extraction for tags:
+- [x] COG-T35. Improve semantic extraction for tags:
   - paraphrases
   - implicit intent
   - soft entities from the message narrative
-- [ ] COG-T36. Improve semantic extraction for canonical reason signals while preserving the closed 8-signal evaluator contract.
+- [x] COG-T36. Improve semantic extraction for canonical reason signals while preserving the closed 8-signal evaluator contract.
 - [ ] COG-T37. Use `reason_signals_extra` as narrative evidence input for memory generation, not only as stored text.
 - [ ] COG-T38. Upgrade the summarizer/memory generator from deterministic lexical fusion to semantic narrative synthesis.
 - [ ] COG-T39. Build a golden corpus to validate semantic outputs and narrative quality under `AI.tagger`.

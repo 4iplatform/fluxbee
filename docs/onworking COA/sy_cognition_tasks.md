@@ -718,14 +718,22 @@ Definición de alcance:
     - `STATUS/CONFIG_GET` ya exponen contadores y estado del `semantic_tagger`
     - el path central del turn ahora usa llamada AI real por `OpenAiResponsesClient`
     - el bootstrap lexical quedó aislado fuera del flujo normal para facilitar su futura remoción
-- [ ] COG-M11-T3. Mejorar extracción semántica de `tags`:
+- [x] COG-M11-T3. Mejorar extracción semántica de `tags`:
   - sinonimia
   - paráfrasis
   - intents implícitos
   - entidades blandas del relato
-- [ ] COG-M11-T4. Mejorar extracción semántica de `reason_signals_canonical`:
+  - implementación actual:
+    - prompt de `AI.tagger` reforzado con guías de calidad para tags semánticos
+    - ejemplos operativos para inferir dominio/intento aunque no esté literal en el texto
+    - post-proceso backend para limpiar tags genéricos/ruidosos y normalizar labels cortos
+- [x] COG-M11-T4. Mejorar extracción semántica de `reason_signals_canonical`:
   - mejor recall sobre mandato implícito
   - mejor discriminación entre `request/resolve/challenge/protect`
+  - implementación actual:
+    - prompt de `AI.tagger` reforzado con definiciones explícitas para las 8 señales
+    - ejemplos de discriminación por intención comunicativa y no solo por surface words
+    - canonicalización backend de aliases/sinónimos antes del filtro cerrado de 8 señales
 - [ ] COG-M11-T5. Usar `reason_signals_extra` como evidencia narrativa real para memory fusion, no solo como bolsa de strings.
 - [ ] COG-M11-T6. Introducir summarizer narrativo v2 para memories/episodes:
   - resumen más fiel del contenido del thread
