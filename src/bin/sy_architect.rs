@@ -6243,7 +6243,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         <div class="composer">
           <div class="composer-box">
             <div class="composer-input-shell">
-              <textarea id="input" placeholder="Message or SCMD: curl -X GET /hives/{hive}/nodes"></textarea>
+              <textarea id="input" placeholder="Message or SCMD. Try: SCMD: help"></textarea>
               <div class="composer-actions">
                 <button id="send">Send</button>
               </div>
