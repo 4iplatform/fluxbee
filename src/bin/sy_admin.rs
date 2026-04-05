@@ -1459,11 +1459,24 @@ async fn handle_http(
             respond_json(stream, status, &resp).await?;
             return Ok(());
         }
+        if path == "/inventory/nodes" {
+            let mut payload = serde_json::json!({ "scope": "global" });
+            if let Some(kind) = query
+                .get("type")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                payload["filter_type"] = serde_json::Value::String(kind.to_ascii_uppercase());
+            }
+            let (status, resp) = handle_inventory_http(ctx, client, payload).await?;
+            respond_json(stream, status, &resp).await?;
+            return Ok(());
+        }
         if let Some(hive_id) = path
             .strip_prefix("/inventory/")
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .filter(|value| *value != "summary")
+            .filter(|value| *value != "summary" && *value != "nodes")
         {
             let mut payload = serde_json::json!({
                 "scope": "hive",
