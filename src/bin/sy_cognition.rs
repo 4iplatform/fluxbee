@@ -46,9 +46,12 @@ use json_router::shm::{
 #[allow(dead_code)]
 #[path = "sy_cognition/bootstrap_lexical_tagger.rs"]
 mod bootstrap_lexical_tagger;
+#[path = "sy_cognition/narrative_summarizer_ai.rs"]
+mod narrative_summarizer_ai;
 #[path = "sy_cognition/semantic_tagger_ai.rs"]
 mod semantic_tagger_ai;
 
+use narrative_summarizer_ai::run_narrative_summarizer_ai;
 use semantic_tagger_ai::run_semantic_tagger_ai;
 
 type CognitionError = Box<dyn std::error::Error + Send + Sync>;
@@ -98,6 +101,19 @@ struct SemanticTaggerOutput {
     tags: Vec<String>,
     reason_signals_canonical: Vec<String>,
     reason_signals_extra: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NarrativeOutcome {
+    called: bool,
+    failed: bool,
+    invalid_output: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ThreadUpdateResult {
+    envelopes: Vec<(&'static str, Vec<u8>)>,
+    narrative: NarrativeOutcome,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +233,10 @@ struct CognitionRuntimeState {
     semantic_tagger_invalid_outputs_total: u64,
     last_semantic_model: Option<String>,
     last_semantic_impl: Option<String>,
+    narrative_summarizer_calls_total: u64,
+    narrative_summarizer_failures_total: u64,
+    narrative_summarizer_invalid_outputs_total: u64,
+    last_narrative_model: Option<String>,
 }
 
 #[derive(Debug)]
@@ -717,7 +737,7 @@ async fn handle_turn_payload(
         }
     };
 
-    let envelopes = {
+    let update_result = {
         let mut threads = app_state.thread_states.lock().await;
         let thread_state = threads
             .entry(thread_id.clone())
@@ -732,10 +752,14 @@ async fn handle_turn_payload(
             ich.as_deref(),
             &tagger,
             &thresholds,
+            &api_key,
+            &semantic_tagger_config,
             &ts,
             thread_state,
         )
+        .await
     };
+    let envelopes = update_result.envelopes;
 
     let mut published = 0u64;
     let mut publish_errors = 0u64;
@@ -839,6 +863,20 @@ async fn handle_turn_payload(
     state.last_tags = tagger.tags;
     state.last_reason_signals_canonical = tagger.reason_signals_canonical;
     state.last_reason_signals_extra = tagger.reason_signals_extra;
+    if update_result.narrative.called {
+        state.narrative_summarizer_calls_total =
+            state.narrative_summarizer_calls_total.saturating_add(1);
+        state.last_narrative_model = Some(semantic_tagger_config.model.clone());
+    }
+    if update_result.narrative.failed {
+        state.narrative_summarizer_failures_total =
+            state.narrative_summarizer_failures_total.saturating_add(1);
+    }
+    if update_result.narrative.invalid_output {
+        state.narrative_summarizer_invalid_outputs_total = state
+            .narrative_summarizer_invalid_outputs_total
+            .saturating_add(1);
+    }
     state.active_threads_total = active_threads_total;
     state.open_contexts_total = open_contexts_total;
     state.open_reasons_total = open_reasons_total;
@@ -1961,7 +1999,11 @@ fn build_status_payload(
         "semantic_tagger_failures_total": runtime_state.semantic_tagger_failures_total,
         "semantic_tagger_invalid_outputs_total": runtime_state.semantic_tagger_invalid_outputs_total,
         "last_semantic_model": runtime_state.last_semantic_model,
-        "last_semantic_impl": runtime_state.last_semantic_impl
+        "last_semantic_impl": runtime_state.last_semantic_impl,
+        "narrative_summarizer_calls_total": runtime_state.narrative_summarizer_calls_total,
+        "narrative_summarizer_failures_total": runtime_state.narrative_summarizer_failures_total,
+        "narrative_summarizer_invalid_outputs_total": runtime_state.narrative_summarizer_invalid_outputs_total,
+        "last_narrative_model": runtime_state.last_narrative_model
     });
     let paths = json!({
         "state_dir": runtime_paths.state_dir,
@@ -2118,7 +2160,11 @@ fn build_cognition_config_get_payload(
         "semantic_tagger_failures_total": runtime_state.semantic_tagger_failures_total,
         "semantic_tagger_invalid_outputs_total": runtime_state.semantic_tagger_invalid_outputs_total,
         "last_semantic_model": runtime_state.last_semantic_model,
-        "last_semantic_impl": runtime_state.last_semantic_impl
+        "last_semantic_impl": runtime_state.last_semantic_impl,
+        "narrative_summarizer_calls_total": runtime_state.narrative_summarizer_calls_total,
+        "narrative_summarizer_failures_total": runtime_state.narrative_summarizer_failures_total,
+        "narrative_summarizer_invalid_outputs_total": runtime_state.narrative_summarizer_invalid_outputs_total,
+        "last_narrative_model": runtime_state.last_narrative_model
     });
     let contract = json!({
         "node_family": "SY",
@@ -2542,7 +2588,7 @@ fn extract_turn_text(payload: &Value) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn update_thread_state_and_build_envelopes(
+async fn update_thread_state_and_build_envelopes(
     hive_id: &str,
     writer: &str,
     thread_id: &str,
@@ -2552,9 +2598,11 @@ fn update_thread_state_and_build_envelopes(
     ich: Option<&str>,
     tagger: &SemanticTaggerOutput,
     thresholds: &CognitionThresholds,
+    api_key: &str,
+    semantic_tagger_config: &CognitionSemanticTaggerConfig,
     ts: &str,
     thread_state: &mut ThreadCognitionState,
-) -> Vec<(&'static str, Vec<u8>)> {
+) -> ThreadUpdateResult {
     if thread_state.first_seen_at.is_none() {
         thread_state.first_seen_at = Some(ts.to_string());
     }
@@ -2627,7 +2675,7 @@ fn update_thread_state_and_build_envelopes(
         &thread_state.reasons,
         &mut thread_state.active_scope,
     ));
-    out.extend(update_memories_and_episodes_for_thread(
+    let memory_episode_result = update_memories_and_episodes_for_thread(
         hive_id,
         writer,
         thread_id,
@@ -2635,13 +2683,20 @@ fn update_thread_state_and_build_envelopes(
         src_ilk,
         dst_ilk,
         tagger,
+        api_key,
+        semantic_tagger_config,
         &thread_state.contexts,
         &thread_state.reasons,
         &thread_state.active_scope,
         &mut thread_state.memories,
         &mut thread_state.episodes,
-    ));
-    out
+    )
+    .await;
+    out.extend(memory_episode_result.envelopes);
+    ThreadUpdateResult {
+        envelopes: out,
+        narrative: memory_episode_result.narrative,
+    }
 }
 
 fn build_context_candidates(tagger: &SemanticTaggerOutput) -> Vec<ContextCandidate> {
@@ -3279,7 +3334,7 @@ fn update_scope_binding_for_thread(
     out
 }
 
-fn update_memories_and_episodes_for_thread(
+async fn update_memories_and_episodes_for_thread(
     hive_id: &str,
     writer: &str,
     thread_id: &str,
@@ -3287,21 +3342,76 @@ fn update_memories_and_episodes_for_thread(
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
     tagger: &SemanticTaggerOutput,
+    api_key: &str,
+    semantic_tagger_config: &CognitionSemanticTaggerConfig,
     contexts: &HashMap<String, ContextState>,
     reasons: &HashMap<String, ReasonState>,
     active_scope: &Option<ScopeBindingState>,
     memories: &mut HashMap<String, MemoryState>,
     episodes: &mut HashMap<String, EpisodeState>,
-) -> Vec<(&'static str, Vec<u8>)> {
+) -> ThreadUpdateResult {
     let mut out = Vec::new();
     let Some(scope) = active_scope.as_ref() else {
-        return out;
+        return ThreadUpdateResult::default();
     };
     let Some(context) = contexts.get(&scope.dominant_context_label) else {
-        return out;
+        return ThreadUpdateResult::default();
     };
     let Some(reason) = reasons.get(&scope.dominant_reason_label) else {
-        return out;
+        return ThreadUpdateResult::default();
+    };
+
+    let episode_candidate = build_episode_candidate(tagger, context, reason);
+    let episode_existing = episode_candidate.as_ref().and_then(|candidate| {
+        let episode_key = format!("{}|{}", scope.scope_instance_id, candidate.affect_id);
+        episodes.get(&episode_key)
+    });
+
+    let narrative_result = match run_narrative_summarizer_ai(
+        narrative_summarizer_ai::NarrativeSummarizerAiInput {
+            api_key,
+            config: semantic_tagger_config,
+            thread_id,
+            context_label: &context.label,
+            context_tags: &context.tags,
+            reason_label: &reason.label,
+            canonical_signals: &reason.signals_canonical,
+            extra_signals: &tagger.reason_signals_extra,
+            previous_memory_summary: memories.get(&scope.scope_id).map(|m| m.summary.as_str()),
+            episode_affect_id: episode_candidate.as_ref().map(|c| c.affect_id.as_str()),
+            episode_title: episode_candidate.as_ref().map(|c| c.title.as_str()),
+            previous_episode_summary: episode_existing.map(|episode| episode.summary.as_str()),
+            previous_episode_reason: episode_existing.map(|episode| episode.reason.as_str()),
+        },
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                thread_id = %thread_id,
+                context = %context.label,
+                reason = %reason.label,
+                error = %err,
+                "sy.cognition narrative summarizer failed; skipping memory/episode synthesis for turn"
+            );
+            return ThreadUpdateResult {
+                envelopes: out,
+                narrative: NarrativeOutcome {
+                    called: true,
+                    failed: !matches!(
+                        err,
+                        fluxbee_ai_sdk::AiSdkError::Json(_)
+                            | fluxbee_ai_sdk::AiSdkError::Protocol(_)
+                    ),
+                    invalid_output: matches!(
+                        err,
+                        fluxbee_ai_sdk::AiSdkError::Json(_)
+                            | fluxbee_ai_sdk::AiSdkError::Protocol(_)
+                    ),
+                },
+            };
+        }
     };
 
     let current_ilk_weights = current_turn_ilk_weights(src_ilk, dst_ilk);
@@ -3313,14 +3423,30 @@ fn update_memories_and_episodes_for_thread(
         scope,
         context,
         reason,
-        tagger,
+        &narrative_result.memory_summary,
         &current_ilk_weights,
         memories,
     ));
     out.extend(update_episodes_for_thread(
-        hive_id, writer, thread_id, ts, tagger, scope, context, reason, episodes,
+        hive_id,
+        writer,
+        thread_id,
+        ts,
+        episode_candidate,
+        &narrative_result,
+        scope,
+        context,
+        reason,
+        episodes,
     ));
-    out
+    ThreadUpdateResult {
+        envelopes: out,
+        narrative: NarrativeOutcome {
+            called: true,
+            failed: false,
+            invalid_output: false,
+        },
+    }
 }
 
 fn update_memories_for_thread(
@@ -3331,13 +3457,13 @@ fn update_memories_for_thread(
     scope: &ScopeBindingState,
     context: &ContextState,
     reason: &ReasonState,
-    tagger: &SemanticTaggerOutput,
+    narrative_summary: &str,
     current_ilk_weights: &BTreeMap<String, f64>,
     memories: &mut HashMap<String, MemoryState>,
 ) -> Vec<(&'static str, Vec<u8>)> {
     let mut out = Vec::new();
     let memory_key = scope.scope_id.clone();
-    let summary = summarize_scope_memory(context, reason, &tagger.reason_signals_extra);
+    let summary = narrative_summary.to_string();
     let memory = memories
         .entry(memory_key.clone())
         .or_insert_with(|| MemoryState {
@@ -3425,16 +3551,25 @@ fn update_episodes_for_thread(
     writer: &str,
     thread_id: &str,
     ts: &str,
-    tagger: &SemanticTaggerOutput,
+    episode_candidate: Option<EpisodeCandidate>,
+    narrative_result: &narrative_summarizer_ai::NarrativeSummaries,
     scope: &ScopeBindingState,
     context: &ContextState,
     reason: &ReasonState,
     episodes: &mut HashMap<String, EpisodeState>,
 ) -> Vec<(&'static str, Vec<u8>)> {
     let mut out = Vec::new();
-    let Some(candidate) = build_episode_candidate(tagger, context, reason) else {
+    let Some(mut candidate) = episode_candidate else {
         return out;
     };
+    candidate.summary = narrative_result
+        .episode_summary
+        .clone()
+        .unwrap_or(candidate.summary);
+    candidate.reason = narrative_result
+        .episode_reason
+        .clone()
+        .unwrap_or(candidate.reason);
 
     let episode_key = format!("{}|{}", scope.scope_instance_id, candidate.affect_id);
     let episode = episodes.entry(episode_key).or_insert_with(|| EpisodeState {

@@ -739,10 +739,15 @@ Definición de alcance:
     - `reason_signals_extra` ya alimenta el summary de memories mediante cláusulas narrativas explícitas
     - `reason_signals_extra` también refuerza `summary` y `reason` de episodios, no solo el trigger/gate
     - el esquema durable no cambia; la mejora vive en la síntesis narrativa del contenido
-- [ ] COG-M11-T6. Introducir summarizer narrativo v2 para memories/episodes:
+- [x] COG-M11-T6. Introducir summarizer narrativo v2 para memories/episodes:
   - resumen más fiel del contenido del thread
   - continuidad temporal
   - síntesis de contexto + razón + evidencia textual
+  - implementación actual:
+    - una llamada AI interna sintetiza `memory_summary` y, si aplica, `episode_summary` + `episode_reason`
+    - la entrada incluye continuidad con summaries previos para evitar resets narrativos por turn
+    - el gate estructural del episodio sigue determinístico; mejora solo la síntesis narrativa
+    - si el summarizer AI falla, el turn queda degradado para narrativa y no hace fallback silencioso al resumen lexical
 - [ ] COG-M11-T7. Definir corpus/golden tests para validar calidad semántica del `AI.tagger` y del summarizer v2.
 - [ ] COG-M11-T8. Definir política operacional cuando AI no esté disponible:
   - `SY.cognition` queda degradado para semántica profunda
