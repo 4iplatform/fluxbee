@@ -118,27 +118,29 @@ Evolve identity toward the richer claims model:
   - keep room in the matcher/compiler for future structured-claim adapters
   - allow rule metadata to carry non-executable references such as `charter_ref`
   - do not require `claims[]` / `recognized_by` / `institutional_role` in runtime evaluation yet
-- [ ] POL-S1-T3. Define matcher semantics:
+- [x] POL-S1-T3. Define matcher semantics:
   - scalar equality
   - array contains for `role` / `capability`
-  - wildcard support or explicit no-wildcard rule
-- [ ] POL-S1-T4. Define rule priority / tie-breaking:
+  - no generic wildcard in v1
+- [x] POL-S1-T4. Define rule priority / tie-breaking:
   - more specific beats less specific
+  - specificity = predicate count in `match`
   - deny beats allow
   - override beats base rule
+  - same-specificity conflicting rules are compile/apply-time errors
 - [ ] POL-S1-T5. Define default behavior when no rule matches:
   - keep current proposal `allow`
   - or tighten selected action classes only
 
 ### POL-S2 — Define canonical `action_class` mapping
 
-- [ ] POL-S2-T1. Define the runtime source of truth for classification inputs:
+- [x] POL-S2-T1. Define the runtime source of truth for classification inputs:
   - `msg_type`
   - admin action
   - node control action
   - destination/type context
   - result status
-- [ ] POL-S2-T2. Produce a first deterministic classifier for:
+- [x] POL-S2-T2. Produce a first deterministic classifier for:
   - `send_message`
   - `read`
   - `write`
@@ -148,15 +150,25 @@ Evolve identity toward the richer claims model:
   - `identity_change`
   - `workflow_step`
   - `node_lifecycle`
-- [ ] POL-S2-T3. Define where this classifier runs:
+- [x] POL-S2-T3. Define where this classifier runs:
   - router helper for routed messages
   - admin helper for admin commands
   - IO/WF helper for external/workflow-origin actions
   - shared deterministic classifier only if it does not become a hidden static catalog
-- [ ] POL-S2-T4. Document ambiguous cases:
+- [x] POL-S2-T4. Document ambiguous cases:
   - admin read vs node control read
   - config set vs node spawn
   - workflow internal messages vs user/system messages
+- [x] POL-S2-T5. Freeze `action_result` contract for evaluable classes:
+  - `blocked | applied | failed`
+  - required for side-effect classes
+  - optional for `read` / `send_message`
+  - `result_origin` required when `action_result=blocked`
+- [ ] POL-S2-T6. Implement metadata injection in real producers:
+  - router emits canonical `action_class`
+  - admin emits canonical `action_class`
+  - IO/WF emit canonical `action_class`
+  - evaluable actions emit `action_result`
 
 ### POL-S3 — Freeze v1 effect set
 

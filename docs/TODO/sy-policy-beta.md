@@ -106,23 +106,77 @@ The `match` field evaluates against identity data from jsr-identity SHM:
 
 For v1, matching is based on the flat roles/capabilities from identity v2. When identity v3 adds structured claims (domain/function/responsibility), the same `match` field should extend naturally without changing the rule shape.
 
+V1 matcher constraints:
+
+- scalar equality only
+- array-contains only for `role` and `capability`
+- no generic wildcard matcher in v1
+
 ### 3.3 Action Classes
 
-A fixed vocabulary of what can happen in the system:
+`action_class` is not inferred by AI and not guessed by `SY.policy`. It is assigned deterministically at the point of entry and carried as canonical metadata into post-facto evaluation.
 
-| Action class | Meaning | Examples |
-|-------------|---------|---------|
-| `send_message` | Regular message between nodes/users | Chat, notification |
-| `read` | Read system state or data | GET inventory, GET config |
-| `write` | Modify data within existing scope | Update config, update tenant |
-| `system_config` | Modify system configuration | Set routes, set OPA, set storage config |
-| `topology_change` | Modify system structure | Add/remove hive, add/remove VPN |
-| `external_action` | Action that touches the outside world | Send WhatsApp, call external API |
-| `identity_change` | Modify identity data | Register ILK, update capabilities |
-| `workflow_step` | Execute a step in a workflow | Trigger, advance, complete |
-| `node_lifecycle` | Spawn, kill, or reconfigure a node | run_node, kill_node, set_node_config |
+Fixed vocabulary:
 
-### 3.4 Effects
+| Action class | Meaning | Canonical examples |
+|-------------|---------|-------------------|
+| `send_message` | Regular message between nodes/users | chat, notification, `send_node_message`, inbound IO message |
+| `read` | Read system state or data | inventory, `CONFIG_GET`, `STATUS`, `PING` |
+| `write` | Modify data within an existing scope | `CONFIG_SET`, `set_node_config`, tenant update |
+| `system_config` | Modify system-wide configuration | routes, VPNs, OPA apply/rollback, policy matrix update |
+| `topology_change` | Modify system structure | add/remove hive |
+| `external_action` | Action that touches the outside world | send WhatsApp, send email, call external API |
+| `identity_change` | Modify identity data | create tenant, approve tenant, mutate ILK/vocabulary state |
+| `workflow_step` | Execute a workflow transition | trigger, advance, complete |
+| `node_lifecycle` | Spawn, kill, or clean node runtime state | `run_node`, `kill_node`, `remove_node_instance` |
+
+Classifier ownership in v1:
+
+- Router classifies normal routed carrier messages.
+- Admin classifies admin actions.
+- IO/WF runtimes classify explicit external/workflow side effects.
+- `SY.policy` never guesses missing `action_class`; it logs and skips evaluation.
+- `action_class="*"` is not allowed in v1.
+
+### 3.4 Action Result Contract
+
+For actions with real side effects, `SY.policy` needs to know not only what was attempted but what actually happened.
+
+`action_result` is therefore:
+
+- required for `write`
+- required for `system_config`
+- required for `topology_change`
+- required for `external_action`
+- required for `identity_change`
+- required for `workflow_step`
+- required for `node_lifecycle`
+- optional for `read`
+- optional for `send_message`
+
+Allowed values in v1:
+
+| `action_result` | Meaning |
+|----------------|---------|
+| `blocked` | The action was stopped before the effect occurred |
+| `applied` | The effect actually happened |
+| `failed` | The action did not complete, but not because policy necessarily blocked it |
+
+`result_origin` remains optional in general, but is required when `action_result=blocked` so policy can distinguish:
+
+- OPA or policy enforcement blocked correctly
+- a node/runtime blocked for its own reason
+- an external dependency or platform blocked independently
+
+`result_detail_code` is optional in v1 and exists as the forward-compatible escape hatch for technical failure vs business rejection distinctions.
+
+Normative reading:
+
+- `deny + applied` = real violation
+- `deny + blocked` = correct enforcement
+- `deny + failed` = not assumed a violation in v1
+
+### 3.5 Effects
 
 What happens when a match + action matches a rule:
 
@@ -135,16 +189,27 @@ What happens when a match + action matches a rule:
 | `require_confirmation` | Future only. Needs confirmation flow support in the destination/runtime |
 | `flag` | Future only. Deferred until audit storage/visibility is designed cleanly |
 
-### 3.5 Rule Levels
+### 3.6 Rule Levels
 
 | Level | Source | Mutability |
 |------|--------|-----------|
 | `axiom` | Fluxbee system policy | System-owned. Not overridden by `SY.policy` |
 | `solution` | Solution manifest / Blueprint | Stageable, replaceable, overridable by `SY.policy` |
 
-### 3.6 Default Effect
+### 3.7 Default Effect
 
 If no rule matches a match + action combination: **allow**. The system starts permissive. SY.policy hardens it over time when violations are detected.
+
+### 3.8 Priority and Ambiguity
+
+V1 resolution rules:
+
+- override beats base rule
+- more specific `match` beats less specific `match`
+- specificity = number of predicates in `match`
+- in same-specificity ties, `deny` beats `allow`
+
+If two base rules reach the same specificity, same `action_class`, and incompatible effects, the compiler/apply flow must reject the matrix as ambiguous. Runtime evaluation does not guess.
 
 ---
 
@@ -279,16 +344,18 @@ For each action in the message stream, policy asks:
   },
 
   "act": {
-    "action_performed": "admin_command",
+    "action_name": "opa_apply",
     "action_class": "system_config",
-    "target_ref": "route:billing.refunds",
-    "result_status": "succeeded"
+    "action_target_ref": "route:billing.refunds",
+    "action_result": "applied",
+    "result_origin": "admin",
+    "result_detail_code": null
   },
 
   "evaluation": {
     "matched_rules": ["pm:004"],
     "expected_effect": "deny",
-    "actual_outcome": "succeeded",
+    "actual_outcome": "applied",
     "violation": true,
     "degraded_mode": false
   }
@@ -300,7 +367,7 @@ For each action in the message stream, policy asks:
 If identity data is unavailable, policy evaluates with what it has:
 
 - **Normal mode:** Full match + action + law evaluation.
-- **Degraded mode:** Action + result only. Axioms that don't depend on identity-specific fields still fire (e.g., "no action_class=topology_change from any ILK during maintenance window").
+- **Degraded mode:** Action class + result only. Axioms that don't depend on identity-specific fields still fire (e.g., "no action_class=topology_change from any ILK during maintenance window").
 
 A cognitive failure does NOT affect policy. Policy does not depend on cognitive data in v1.
 

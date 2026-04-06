@@ -247,7 +247,7 @@ Today, deploying a complete solution requires dozens of manual API calls: create
   },
 
   "policy": {
-    "description": "Unified match × actions → effects matrix. Compiles to solution-level OPA Rego automatically. SY.policy uses the same matrix for post-facto evaluation.",
+    "description": "Unified match × actions → effects matrix. Compiles to solution-level OPA Rego automatically. SY.policy uses the same matrix for post-facto evaluation. Runtime evaluation depends on canonical `action_class` plus `action_result` metadata produced by router/admin/IO/WF surfaces.",
     "policy_matrix": [
       {
         "rule_id": "pm:001",
@@ -272,14 +272,6 @@ Today, deploying a complete solution requires dozens of manual API calls: create
         "effect": "deny",
         "level": "solution",
         "description": "Temporary ILKs cannot trigger workflows"
-      },
-      {
-        "rule_id": "pm:010",
-        "match": { "tenant_id": "tnt:uuid" },
-        "action_class": "*",
-        "effect": "allow",
-        "level": "solution",
-        "description": "Acme tenant ILKs can operate within their own scope"
       },
       {
         "rule_id": "pm:020",
@@ -373,6 +365,12 @@ Message routing rules. Describes how messages flow between nodes based on identi
 ### 5.7 policy
 
 The unified match × actions → effects matrix. This is the solution-level law of the solution. Each rule says: "if an ILK matching these predicates performs this action, the effect is X." The matrix serves two purposes simultaneously: it compiles to solution-level OPA Rego for real-time enforcement, and it is one input to the effective policy matrix that `SY.policy` uses for post-facto evaluation. System-owned axioms are not authored here; `SY.architect` composes them with this manifest policy from the installed read-only system-policy pack in its environment. See `sy-policy-beta.md` for the full model.
+
+V1 constraints:
+
+- `action_class` must be one value from the closed enum; no `*`
+- `match` supports scalar equality plus contains for `role` / `capability`
+- if two rules are equally specific and conflict on effect for the same normative space, apply must fail with ambiguity instead of activating the manifest
 
 ### 5.9 identity
 

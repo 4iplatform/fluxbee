@@ -23,6 +23,12 @@
 
 `match` is a generic predicate evaluator over identity data. Today it evaluates flat fields from identity v2. When identity v3 adds structured claims, the same `match` evaluates deeper fields. The code is a predicate evaluator over a key-value map — it doesn't know which identity version is running.
 
+**V1 constraints on `match`:**
+
+- scalar equality only
+- array-contains only for `role` / `capability`
+- no generic wildcard matcher in v1
+
 **Action:** Replace `claim` with `match` in all policy_matrix references. This change applies to `sy-policy-beta.md`, `solution-manifest-spec.md`, and any implementation code.
 
 ---
@@ -31,40 +37,109 @@
 
 **Decision:** The point of entry classifies the action. It is deterministic, not AI. The classification lives as a canonical system contract, administered through code/admin surfaces, not as an ad-hoc static catalog file.
 
-**Router classifies messages:**
+**Canonical v1 enum:**
 
-| `meta.type` | `meta.msg` | `action_class` |
-|-------------|-----------|----------------|
-| `user` | (any) | `send_message` |
-| `system` | `SPAWN_NODE` | `node_lifecycle` |
-| `system` | `CONFIG_CHANGED` | `write` |
+- `send_message`
+- `read`
+- `write`
+- `system_config`
+- `topology_change`
+- `external_action`
+- `identity_change`
+- `workflow_step`
+- `node_lifecycle`
+
+`action_class="*"` is not allowed in v1. The class space stays closed and explicit.
+
+**Router classifies common routed messages:**
+
+| Origin | Condition | `action_class` |
+|--------|-----------|----------------|
+| Carrier/router | normal user/app message | `send_message` |
+| IO inbound | external channel enters Fluxbee | `send_message` |
+| Node-to-node direct message | `send_node_message` | `send_message` |
 
 **Admin classifies commands (by action field):**
 
 | `action` | `action_class` |
 |----------|----------------|
-| `run_node`, `kill_node` | `node_lifecycle` |
+| `list_hives`, `get_hive`, `list_nodes`, `get_node_status`, `get_node_config`, `get_node_state`, `get_versions`, `inventory`, `opa_get_status`, `opa_get_policy` | `read` |
+| `CONFIG_GET`, `STATUS`, `PING` | `read` |
+| `set_node_config`, `node_control_config_set`, `CONFIG_SET` | `write` |
+| `add_route`, `delete_route`, `add_vpn`, `delete_vpn`, `opa_apply`, `opa_compile_apply`, `opa_rollback`, `update_policy_matrix`, `clear_override`, `sync_hint`, `update` | `system_config` |
 | `add_hive`, `remove_hive` | `topology_change` |
-| `set_node_config` | `write` |
-| `get_inventory`, `get_versions`, `get_node_status`, `get_node_config` | `read` |
-| `add_route`, `delete_route`, `add_vpn`, `delete_vpn` | `system_config` |
-| `opa_apply`, `opa_compile`, `opa_rollback` | `system_config` |
-| `get_config_storage`, `set_config_storage` | `system_config` |
-| `create_tenant`, `update_tenant`, `approve_tenant` | `identity_change` |
-| `list_ilks`, `get_ilk`, `delete_ilk` | `identity_change` |
-| `list_vocabulary`, `add_vocabulary`, `deprecate_vocabulary` | `identity_change` |
-| `update_policy_matrix`, `clear_override` | `system_config` |
-| `sync_hint`, `update` | `system_config` |
-| `list_hives`, `get_hive`, `list_nodes` | `read` |
+| `run_node`, `kill_node`, `remove_node_instance` | `node_lifecycle` |
+| `create_tenant`, `update_tenant`, `approve_tenant`, `list_ilks`, `get_ilk`, `delete_ilk`, `list_vocabulary`, `add_vocabulary`, `deprecate_vocabulary` | `identity_change` |
 
-**IO/WF external actions:**
+**IO/WF classify explicit side effects:**
 
 | Origin | Action type | `action_class` |
-|--------|-----------|----------------|
+|--------|-------------|----------------|
 | IO node sending to external API | WhatsApp send, email send | `external_action` |
-| WF node executing step | Workflow advance, trigger | `workflow_step` |
+| WF node executing step | workflow advance, trigger, complete | `workflow_step` |
 
-**Action:** This table must exist as a canonical system contract. Router and admin must set `action_class` in the message metadata. If a message arrives at SY.policy without `action_class`, policy logs an error and skips evaluation — it does not guess.
+**Action:** Router/admin/IO/WF must set `action_class` in the action metadata. If an event arrives at `SY.policy` without `action_class`, policy logs an error and skips evaluation — it does not guess.
+
+### 2.1 `action_result` contract
+
+**Decision:** `SY.policy` also needs the action outcome for all evaluable side-effect classes.
+
+`action_result` is required for:
+
+- `write`
+- `system_config`
+- `topology_change`
+- `external_action`
+- `identity_change`
+- `workflow_step`
+- `node_lifecycle`
+
+`action_result` is optional for:
+
+- `read`
+- `send_message`
+
+**Canonical v1 values:**
+
+- `blocked`
+- `applied`
+- `failed`
+
+**Normative reading:**
+
+- `deny + applied` = real violation
+- `deny + blocked` = correct enforcement
+- `deny + failed` = not treated as violation by default in v1
+
+**Additional outcome fields:**
+
+- `result_origin`:
+  - optional in general
+  - required when `action_result=blocked`
+  - tells whether the block came from `opa`, `node`, `external`, or another source
+- `result_detail_code`:
+  - optional
+  - reserved for future distinction between technical failure and business rejection
+
+### 2.2 Priority and collision rules
+
+**Decision:** v1 keeps rule resolution simple and rejects ambiguity early.
+
+Priority:
+
+- override beats base rule
+- more specific `match` beats less specific `match`
+- specificity = number of predicates in `match`
+- on same-specificity ties, `deny` beats `allow`
+
+Compiler/apply collision rule:
+
+- if two base rules have the same `action_class`
+- and the same predicate count
+- and they target the same normative space
+- and they produce different effects
+
+the matrix is rejected at apply time as ambiguous. Runtime evaluation does not try to guess which law should win.
 
 ---
 
@@ -314,19 +389,20 @@ The matcher doesn't change. The map gets richer. Zero retrabajo in policy.
 ## Summary of implementation order
 
 ```
-1. Define action_class canonical table (this note, point 2)
-2. Router/admin inject action_class in message meta
-3. Implement immutable system-axioms pack shipped with Fluxbee core
-4. Install that pack into the `SY.architect` environment during system bootstrap
-5. Implement composition into effective policy matrix
-6. Implement axioms.rego generation from the installed system-axioms pack
-7. Implement matrix-to-Rego compiler (solution rules only)
-8. Implement jsr-policy SHM region for runtime exceptions / overrides
-9. Implement local bootstrap persistence for active overrides
-10. Implement SY.policy node (NATS consumer, post-facto evaluator)
-11. Implement override writer + OPA reads overrides
-12. Implement phased deploy (prepare → enable → validate → rollback)
-13. Integrate into Blueprint reconciliation
+1. Freeze action_class canonical table + action_result contract (this note, point 2)
+2. Router/admin/IO/WF inject action_class into event metadata
+3. Emit action_result for evaluable action classes
+4. Implement immutable system-axioms pack shipped with Fluxbee core
+5. Install that pack into the `SY.architect` environment during system bootstrap
+6. Implement composition into effective policy matrix
+7. Implement axioms.rego generation from the installed system-axioms pack
+8. Implement matrix-to-Rego compiler (solution rules only)
+9. Implement jsr-policy SHM region for runtime exceptions / overrides
+10. Implement local bootstrap persistence for active overrides
+11. Implement SY.policy node (NATS consumer, post-facto evaluator)
+12. Implement override writer + OPA reads overrides
+13. Implement phased deploy (prepare → enable → validate → rollback)
+14. Integrate into Blueprint reconciliation
 ```
 
 Identity v3 is NOT in this sequence. Policy works against identity v2 as-is.
