@@ -560,8 +560,9 @@ Estructura:
 
 ✅ **NORMATIVO (baseline v1)**:
 - `text/plain` / `text/markdown` / `application/json`: hasta 10MB por blob (límite operativo vigente del SDK AI).
-- `application/pdf`: rechazado por default (`unsupported_attachment_mime`) hasta definir extractor dedicado.
+- `application/pdf`: permitido solo cuando `multimodal=true`, mediante `input_file.file_data` (`data:<mime>;base64,...`) + `filename`.
 - imágenes (`image/png`, `image/jpeg`, `image/webp`): permitidas solo cuando `multimodal=true`.
+- otros binarios no imagen: permitidos solo cuando `multimodal=true`, mediante `input_file.file_data` (`data:<mime>;base64,...`) + `filename`.
 - `image/gif`: rechazado por default en baseline v1 (puede revisarse en una fase posterior).
 
 ---
@@ -583,19 +584,19 @@ Estructura:
 
 1) **Adjuntos textuales** (`mime` in `{"text/plain","text/markdown","application/json"}`):
    - **MUST** leerse y agregarse al input como “contexto adjunto” con separador estable.
-2) **Adjuntos no textuales** (PDF, imágenes, audio, etc.):
+2) **Adjuntos no textuales** (PDF, imágenes, audio, office docs, binarios, etc.):
    - Se rigen por capacidades del behavior/provider:
      - si `multimodal=true`: pasar el blob según adapter del provider,
      - si `multimodal=false`: comportamiento normado en 4.3.
 
-### 4.3 PDFs cuando `multimodal=false`
+### 4.3 Adjuntos no textuales cuando `multimodal=false`
 
 ✅ **NORMATIVO (decisión cerrada)**:
-- Si `multimodal=false` y el nodo recibe un attachment con `mime="application/pdf"`:
-  - **MUST** responder `unsupported_attachment_mime` (rechazar PDF).
+- Si `multimodal=false` y el nodo recibe un attachment no textual (por ejemplo `application/pdf`, imágenes, audio, office docs u otros binarios):
+  - **MUST** responder `unsupported_attachment_mime`.
 
 🧩 **A ESPECIFICAR / IMPLEMENTAR SI SURGE NECESIDAD (futuro)**:
-- Alternativas posibles si se decide soportar PDFs en modo no multimodal:
+- Alternativas posibles si se decide soportar adjuntos no textuales en modo no multimodal:
   - **Opción B**: permitir `extract_text` si existe extractor instalado y el behavior lo habilita; si no, error.
   - **Opción C**: intentar extracción siempre (dependencia obligatoria; mayor costo y riesgos).
 
@@ -896,19 +897,38 @@ Estructura:
 ⚠️ **Estado de implementación (2026-04-01)**:
 - El camino de adjuntos en AI está avanzado, pero todavía no está cerrado end-to-end para todos los tipos.
 - Referencia operativa y comparativa contra Agents SDK: `docs/onworking NOE/ai_attachments_status.md`.
-- Pendientes principales: flujo `input_file` (PDF) y render de `payload.type="error"` en `IO.slack`.
+- Pendientes principales: compatibilidad real de provider para PDF/`input_file`, batería E2E por tipo y render de `payload.type="error"` en `IO.slack`.
 
 ✅ **NORMATIVO**:
 - El behavior declara `capabilities.multimodal = true|false`.
 - Si `multimodal=false`:
-  - adjuntos no textuales → error `unsupported_attachment_mime` (y PDFs se rechazan por ahora; ver Parte 2).
+  - adjuntos no textuales → error `unsupported_attachment_mime` (ver Parte 2).
 - Si `multimodal=true`:
   - el provider adapter envía adjuntos siguiendo el esquema OpenAI vigente para inputs multimodales.
+  - imágenes soportadas → `input_image.image_url` (`data:image/...;base64,...`)
+  - adjuntos no imagen → `input_file.file_data` (`data:<mime>;base64,...`) + `filename`
 
 ✅ **NORMATIVO (matriz inicial MIME×modo)**:
 - `text/plain`, `text/markdown`, `application/json`: permitido en ambos modos (se incorporan al contexto textual).
 - `image/png`, `image/jpeg`, `image/webp`: permitido solo con `multimodal=true`.
-- `application/pdf`, `image/gif` y resto no textual: `unsupported_attachment_mime` en baseline v1.
+- `application/pdf`: permitido solo con `multimodal=true` por `input_file.file_data`, sujeto a compatibilidad del provider/modelo.
+- otros binarios no imagen: permitidos solo con `multimodal=true` por `input_file.file_data`, sujeto a política/límites vigentes del SDK AI.
+- `image/gif`: `unsupported_attachment_mime` en baseline v1.
+
+✅ **NORMATIVO (alcance actual vs TBD)**:
+- Implementado hoy:
+  - `input_text`
+  - `input_image.image_url`
+  - `input_image.detail`
+  - `input_file.file_data`
+  - `input_file.filename`
+- Diferido por contrato/core:
+  - `input_image.file_id`
+  - `input_file.file_id`
+  - `input_file.file_url`
+- TBD operativo:
+  - compatibilidad estable de PDF en todos los modelos/providers soportados
+  - política final de selección entre `file_data` / `file_id` / `file_url`
 
 ---
 

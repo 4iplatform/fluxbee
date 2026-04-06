@@ -104,6 +104,8 @@ pub async fn build_openai_user_content_parts_with_options(
     }
 
     for attachment in &input.attachments {
+        validate_attachment_for_openai(attachment)?;
+
         if let Some(text) = &attachment.text_content {
             parts.push(serde_json::json!({
                 "type": "input_text",
@@ -155,15 +157,10 @@ pub async fn build_openai_user_content_parts_with_options(
             }
         })?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-        let filename = if attachment.blob_ref.filename_original.trim().is_empty() {
-            attachment.blob_ref.blob_name.clone()
-        } else {
-            attachment.blob_ref.filename_original.clone()
-        };
         parts.push(serde_json::json!({
             "type": "input_file",
-            "filename": filename,
-            "file_data": encoded,
+            "filename": canonical_attachment_filename(attachment),
+            "file_data": build_openai_file_data_url(&attachment.blob_ref.mime, &encoded)?,
         }));
     }
 
@@ -193,6 +190,8 @@ pub fn build_text_response_with_options(
 pub enum ModelInputPayloadError {
     #[error("invalid payload: {0}")]
     InvalidPayload(String),
+    #[error("invalid attachment: {0}")]
+    InvalidAttachment(String),
     #[error("blob toolkit unavailable: {0}")]
     BlobToolkitUnavailable(String),
     #[error("blob not found: {0}")]
@@ -211,6 +210,7 @@ impl ModelInputPayloadError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::InvalidPayload(_) => "invalid_payload",
+            Self::InvalidAttachment(_) => "invalid_attachment",
             Self::BlobToolkitUnavailable(_) => "blob_toolkit_unavailable",
             Self::BlobNotFound(_) => "BLOB_NOT_FOUND",
             Self::BlobIo(_) => "BLOB_IO_ERROR",
@@ -224,6 +224,7 @@ impl ModelInputPayloadError {
         !matches!(
             self,
             Self::InvalidPayload(_)
+                | Self::InvalidAttachment(_)
                 | Self::BlobTooLarge(_)
                 | Self::UnsupportedAttachmentMime(_)
                 | Self::TooManyAttachments(_)
@@ -442,6 +443,45 @@ fn is_textual_mime(mime: &str) -> bool {
 
 fn is_openai_image_mime(mime: &str) -> bool {
     matches!(mime, "image/png" | "image/jpeg" | "image/webp")
+}
+
+fn canonical_attachment_filename(attachment: &ResolvedModelAttachment) -> String {
+    if attachment.blob_ref.filename_original.trim().is_empty() {
+        attachment.blob_ref.blob_name.clone()
+    } else {
+        attachment.blob_ref.filename_original.clone()
+    }
+}
+
+fn validate_attachment_for_openai(
+    attachment: &ResolvedModelAttachment,
+) -> std::result::Result<(), ModelInputPayloadError> {
+    if attachment.blob_ref.mime.trim().is_empty() {
+        return Err(ModelInputPayloadError::InvalidAttachment(format!(
+            "attachment '{}' is missing mime",
+            attachment.blob_ref.blob_name
+        )));
+    }
+    if canonical_attachment_filename(attachment).trim().is_empty() {
+        return Err(ModelInputPayloadError::InvalidAttachment(format!(
+            "attachment '{}' is missing filename",
+            attachment.blob_ref.blob_name
+        )));
+    }
+    Ok(())
+}
+
+fn build_openai_file_data_url(
+    mime: &str,
+    base64_data: &str,
+) -> std::result::Result<String, ModelInputPayloadError> {
+    let mime = mime.trim();
+    if mime.is_empty() {
+        return Err(ModelInputPayloadError::InvalidAttachment(
+            "cannot build input_file without mime".to_string(),
+        ));
+    }
+    Ok(format!("data:{mime};base64,{base64_data}"))
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -863,10 +903,80 @@ mod tests {
             parts[1]["file_data"]
                 .as_str()
                 .expect("file_data should be string")
-                .len()
-                > 4
+                .starts_with("data:application/pdf;base64,")
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn build_openai_user_content_parts_serializes_docx_as_data_url_file() {
+        let root = temp_blob_root();
+        let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
+        let file_blob = BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "doc_2123456789abcdef.docx".to_string(),
+            size: 8,
+            mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                .to_string(),
+            filename_original: "report.docx".to_string(),
+            spool_day: "2026-03-31".to_string(),
+        };
+        let file_path = toolkit.resolve(&file_blob);
+        std::fs::create_dir_all(
+            file_path
+                .parent()
+                .expect("file blob parent must exist for test setup"),
+        )
+        .expect("create blob parent");
+        std::fs::write(&file_path, b"DOCXTEST").expect("write file bytes");
+        let input = ResolvedModelInput {
+            main_text: "mira".to_string(),
+            prompt_text: "mira".to_string(),
+            attachments: vec![ResolvedModelAttachment {
+                blob_ref: file_blob,
+                path: file_path,
+                text_content: None,
+            }],
+        };
+        let parts = build_openai_user_content_parts(&input)
+            .await
+            .expect("docx should map to input_file");
+        assert_eq!(parts[1]["type"], "input_file");
+        assert_eq!(parts[1]["filename"], "report.docx");
+        assert!(
+            parts[1]["file_data"]
+                .as_str()
+                .expect("file_data should be string")
+                .starts_with(
+                    "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,"
+                )
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn build_openai_user_content_parts_rejects_attachment_without_mime() {
+        let input = ResolvedModelInput {
+            main_text: "mira".to_string(),
+            prompt_text: "mira".to_string(),
+            attachments: vec![ResolvedModelAttachment {
+                blob_ref: BlobRef {
+                    ref_type: "blob_ref".to_string(),
+                    blob_name: "bad_0123456789abcdef.bin".to_string(),
+                    size: 4,
+                    mime: String::new(),
+                    filename_original: "bad.bin".to_string(),
+                    spool_day: "2026-03-31".to_string(),
+                },
+                path: PathBuf::from("bad.bin"),
+                text_content: None,
+            }],
+        };
+        let err = build_openai_user_content_parts(&input)
+            .await
+            .expect_err("missing mime must fail");
+        assert_eq!(err.code(), "invalid_attachment");
+        assert!(!err.retryable());
     }
 
     #[tokio::test]

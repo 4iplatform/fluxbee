@@ -225,6 +225,12 @@ Conclusión operativa:
 - para prompt/key/behavior en runtime: usar `CONFIG_SET` (control plane del nodo).
 - para update de runtime puntual, mantener `deploy-ia-node.sh` en scope `targeted` (default).
 
+Nota sobre attachments AI (estado 2026-04-06):
+- `AI.*` ya consume `attachments[]`/`content_ref` vía SDK AI compartido.
+- imágenes soportadas (`png`/`jpeg`/`webp`) viajan como `input_image.image_url`.
+- archivos no imagen, cuando `multimodal=true`, viajan como `input_file.file_data` con formato `data:<mime>;base64,...` y `filename`.
+- `file_id` / `file_url` siguen diferidos hasta que Fluxbee/Core defina metadata suficiente para soportarlos de forma canónica.
+
 
 ---
 
