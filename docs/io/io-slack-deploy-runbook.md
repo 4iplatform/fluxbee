@@ -300,3 +300,36 @@ Estado actual outbound a considerar en pruebas:
 - Si `io-slack` recibe texto largo via `content_ref`, hoy lo resuelve y lo publica como texto por `chat.postMessage`.
 - Por lo tanto, textos muy largos pueden quedar truncados por el límite de Slack.
 - Validación de fallback canónico (archivo/snippet/chunking) queda pendiente de norma específica del canal.
+
+## 11) Nota operativa sobre attachments inbound
+
+En estado actual, `IO.slack` no acepta cualquier archivo que Slack entregue.
+
+La normalizacion inbound a `text/v1.attachments[]` pasa por la validacion comun de `io-common`, pero la allowlist efectiva la define `IO.slack`. En estado actual, `IO.slack` acepta:
+
+- `image/jpeg`
+- `image/png`
+- `image/webp`
+- `image/gif`
+- `application/pdf`
+- `text/plain`
+- `text/markdown`
+- `application/json`
+- `text/csv`
+- `application/msword`
+- `application/vnd.ms-excel`
+- `application/vnd.ms-powerpoint`
+- `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
+- `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+- `application/vnd.openxmlformats-officedocument.presentationml.presentation`
+
+Consecuencia:
+
+- `xlsx`, `docx`, `csv` y office comunes equivalentes deberían llegar al router y a nodos `AI.*` si Slack los entrega con esos MIME esperados
+- si un archivo queda afuera de la allowlist efectiva, se descarta inbound con `unsupported_attachment_mime`
+- por lo tanto, el limite E2E real queda en la policy efectiva de `IO.slack`, no en `AI`, para cualquier tipo que todavia no este admitido por el adapter
+
+Si se quiere ajustar el set admitido en deploy, `IO.slack` soporta override por:
+
+- `IO_SLACK_ALLOWED_MIMES`
+- `io.blob.allowed_mimes_csv`

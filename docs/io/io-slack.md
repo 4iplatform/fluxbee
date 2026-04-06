@@ -194,6 +194,47 @@ Interpretación operativa:
 Nota operativa:
 - `io.blob.*` en control-plane del nodo puede seguir siendo útil para validaciones/políticas del adapter, pero no gobierna por sí solo el auto-offload en `NodeSender::send`.
 
+### 7.1.b Estado actual de attachments inbound aceptados
+
+En el camino actual `IO.slack` -> `io-common` -> router, los adjuntos inbound solo se normalizan a `attachments[]` cuando su MIME entra en la allowlist vigente de `io-common`.
+
+Allowlist efectiva actual de `IO.slack`:
+
+- `image/jpeg`
+- `image/png`
+- `image/webp`
+- `image/gif`
+- `application/pdf`
+- `text/plain`
+- `text/markdown`
+- `application/json`
+- `text/csv`
+- `application/msword`
+- `application/vnd.ms-excel`
+- `application/vnd.ms-powerpoint`
+- `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
+- `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+- `application/vnd.openxmlformats-officedocument.presentationml.presentation`
+
+Diseño aplicado:
+
+- `io-common` mantiene la validación y enforcement común de `text/v1`
+- `IO.slack` define su policy efectiva de MIME aceptados
+- el override `IO_SLACK_ALLOWED_MIMES` / `io.blob.allowed_mimes_csv` sigue teniendo precedencia si se quiere ajustar el set en deploy
+
+Consecuencia operativa actual:
+
+- si un attachment queda fuera de esta lista efectiva, se descarta inbound con `unsupported_attachment_mime`
+- esos archivos no llegan al router ni a `AI.*`
+- por lo tanto, si un tipo de archivo esta soportado del lado `AI` pero no entra en esta policy efectiva, el limite real E2E sigue estando en `IO.slack`
+
+Estado actual:
+
+- `png/jpg/webp/gif`: llegan como attachments
+- `pdf`: llega como attachment
+- `text/plain`, `text/markdown`, `application/json`: llegan como attachments
+- `csv`, `doc/docx`, `xls/xlsx`, `ppt/pptx`: quedan admitidos por la policy efectiva actual de `IO.slack`
+
 ### 7.2 Estado de validación y límite del canal Slack
 - El mecanismo canónico de offload (`content` -> `content_ref` al superar límite) se valida de forma determinística con `io-sim`, porque no depende de límites del proveedor externo.
 - En `IO.slack` se valida integración end-to-end del adapter (ingreso/salida, adjuntos, contrato `text/v1`), pero no es un canal confiable para probar payloads de texto extremos.
