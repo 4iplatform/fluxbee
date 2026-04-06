@@ -378,23 +378,23 @@ async fn process_one_inbound(
                 .as_ref()
                 .and_then(|ctx| ctx.get("src_ilk"))
                 .is_some();
-            let thread_id = msg
+            let legacy_context_thread_id = msg
                 .meta
-                .thread_id
-                .clone()
-                .or_else(|| {
-                    msg.meta
-                        .context
-                        .as_ref()
-                        .and_then(|ctx| ctx.get("thread_id"))
-                        .and_then(|v| v.as_str())
-                        .map(ToString::to_string)
-                })
-                .unwrap_or_default();
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("thread_id"))
+                .is_some();
+            let thread_id = msg.meta.thread_id.clone().unwrap_or_default();
             if legacy_context_src_ilk {
                 tracing::warn!(
                     %trace_id,
                     "io-sim outbound still includes legacy meta.context.src_ilk"
+                );
+            }
+            if legacy_context_thread_id {
+                tracing::warn!(
+                    %trace_id,
+                    "io-sim outbound still includes legacy meta.context.thread_id"
                 );
             }
             if let Ok(wire) = serde_json::to_string(&msg) {

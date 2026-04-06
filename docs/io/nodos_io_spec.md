@@ -94,8 +94,10 @@ Según la especificación del Router v1.16:
 
 - `meta.ctx` representa el **Contexto Conversacional (CTX)**
 - `meta.context` se reserva exclusivamente para **datos adicionales evaluados por OPA**
+- `meta.thread_id` es el carrier canónico de thread (cognition v2)
 
 `meta.context` **NO** debe usarse para almacenar historia, turns ni contexto conversacional.
+`meta.context.thread_id` está deprecado/removido en IO y no debe emitirse.
 
 
 ## Adaptación temporal (spec canónica vs core actual)

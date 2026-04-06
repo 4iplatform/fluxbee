@@ -409,6 +409,8 @@ Pipeline normativo:
 3. si provision falla/timeout: forward degradado con `meta.src_ilk = null`
 
 `src_ilk` debe ir en `meta.src_ilk`; `meta.context` queda para metadata adicional (incluyendo `meta.context.io.*`).
+`thread_id` debe ir en `meta.thread_id` (carrier canónico v2).
+`meta.context.thread_id` fue removido del pipeline IO y no debe usarse.
 
 ---
 
@@ -423,6 +425,7 @@ Pipeline normativo:
 - `meta.ctx`: contexto conversacional
 - `meta.context`: metadata adicional (OPA + carrier temporal para campos no tipados)
 - IO metadata de canal bajo `meta.context.io.*`
+- `thread_id`: solo en `meta.thread_id` (no en `meta.context.thread_id`)
 
 ---
 

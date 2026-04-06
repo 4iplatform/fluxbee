@@ -42,9 +42,8 @@ pub fn build_user_message(
     } else {
         extract_thread_id_from_context_obj(&context_obj)
     };
-    if let Some(thread_id) = thread_id.as_ref() {
-        context_obj.insert("thread_id".to_string(), Value::String(thread_id.clone()));
-    }
+    // Keep thread_id only in canonical meta.thread_id carrier.
+    context_obj.remove("thread_id");
 
     Message {
         routing: Routing {

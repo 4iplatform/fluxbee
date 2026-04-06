@@ -154,6 +154,7 @@ Interpretación operativa:
 ### meta
 - `meta.type = "user"`
 - `meta.src_ilk`: ILK representando al usuario de Slack (humano externo) **o null**
+- `meta.thread_id`: thread canónico v2 para router/cognition
 - `meta.context.io`:
 ```json
 {
@@ -328,6 +329,7 @@ Según la especificación del Router v1.16:
 - `meta.context` se reserva exclusivamente para **datos adicionales evaluados por OPA**
 
 `meta.context` **NO** debe usarse para almacenar historia, turns ni contexto conversacional.
+`meta.context.thread_id` fue removido del pipeline IO; el carrier válido es `meta.thread_id`.
 
 
 

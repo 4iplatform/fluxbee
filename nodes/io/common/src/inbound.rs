@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwards_thread_id_at_context_top_level_for_ai_nodes() {
+    async fn forwards_thread_id_in_meta_without_legacy_context_thread_id() {
         let mut p = InboundProcessor::new("node", InboundConfig::default());
         let id = MockIdentityResolver::new();
         let io = slack_inbound_io_context("T", "U", "C", Some("171234.567"), "Ev1");
@@ -293,17 +293,17 @@ mod tests {
             panic!("unexpected outcome: {o:?}");
         };
         assert_eq!(msg.meta.thread_id, expected_thread_id);
-        let thread_id = msg
+        let legacy_context_thread_id = msg
             .meta
             .context
             .as_ref()
             .and_then(|ctx| ctx.get("thread_id"))
             .and_then(|v| v.as_str());
-        assert_eq!(thread_id, msg.meta.thread_id.as_deref());
+        assert_eq!(legacy_context_thread_id, None);
     }
 
     #[tokio::test]
-    async fn forwards_channel_id_as_thread_id_when_slack_thread_is_missing() {
+    async fn forwards_channel_id_as_thread_id_without_legacy_context_thread_id() {
         let mut p = InboundProcessor::new("node", InboundConfig::default());
         let id = MockIdentityResolver::new();
         let io = slack_inbound_io_context("T", "U", "C123", None, "Ev1");
@@ -321,13 +321,13 @@ mod tests {
             panic!("unexpected outcome: {o:?}");
         };
         assert_eq!(msg.meta.thread_id, expected_thread_id);
-        let thread_id = msg
+        let legacy_context_thread_id = msg
             .meta
             .context
             .as_ref()
             .and_then(|ctx| ctx.get("thread_id"))
             .and_then(|v| v.as_str());
-        assert_eq!(thread_id, msg.meta.thread_id.as_deref());
+        assert_eq!(legacy_context_thread_id, None);
     }
 
     #[tokio::test]
