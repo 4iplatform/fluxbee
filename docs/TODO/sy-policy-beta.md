@@ -6,6 +6,8 @@
 **Depends on:** `12-cognition-v2.md`, `10-identity-v2.md`, OPA, jsr-identity SHM
 **Replaces:** `sy-claims-beta.md` (renamed from SY.claims to SY.policy)
 
+> Compatibility note (2026-04-05): `SY.policy` v1 runs on current Identity v2 flat metadata (`registration_status`, `tenant_id`, `ilk_type`, `roles[]`, `capabilities[]`). Identity v3 structured claims remain a later extension. New implementation should be forward-compatible with that extension, but must not depend on the Identity v3 migration now.
+
 ---
 
 ## 1. Purpose

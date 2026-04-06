@@ -1,9 +1,11 @@
 # Solution Manifest — Declarative Configuration per Tenant
 
-**Status:** v1.0 (beta)
+**Status:** legacy / superseded for policy-integrated manifest work
 **Date:** 2026-03-26
 **Audience:** SY.architect developers, orchestrator, admin API
 **Parent specs:** `node-spawn-config-spec.md`, `runtime-packaging-cli-spec.md`, `sy-architect-spec.md`, `sy-claims-beta.md`
+
+> Legacy note (2026-04-05): superseded by [`docs/TODO/solution-manifest-spec_1.md`](/Users/cagostino/Documents/GitHub/fluxbee/docs/TODO/solution-manifest-spec_1.md) for all new `SY.policy` and `policy_matrix` work. Keep this file only as historical reference for the old `SY.claims` direction.
 
 ---
 

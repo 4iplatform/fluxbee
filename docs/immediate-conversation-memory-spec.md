@@ -51,6 +51,12 @@ This spec does **not** cover:
 
 ## 4. Design Rule
 
+Canonical runtime note:
+
+- `thread_id` is conversational metadata provided by router/IO/cognition
+- immediate memory and node-local hard state stay keyed by `src_ilk`
+- `thread_id` can still be stored inside the memory bundle as metadata, but it is not the canonical lookup key for AI runtime continuity
+
 The SDK should send **enough immediate context to be operationally coherent**, but not dump the full raw chat transcript on every turn.
 
 Default principle:

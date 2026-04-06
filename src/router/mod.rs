@@ -1204,15 +1204,6 @@ fn canonical_thread_id_from_meta(meta: &Meta) -> Option<String> {
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-        .or_else(|| {
-            meta.context
-                .as_ref()
-                .and_then(|ctx| ctx.get("thread_id"))
-                .and_then(|value| value.as_str())
-                .map(|value| value.trim())
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-        })
 }
 
 fn send_unreachable_to(
@@ -5214,7 +5205,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_thread_id_from_meta_prefers_canonical_and_falls_back_to_legacy_context() {
+    fn canonical_thread_id_from_meta_reads_only_canonical_top_level() {
         let canonical = canonical_thread_id_from_meta(&Meta {
             msg_type: "user".to_string(),
             thread_id: Some("thread:canonical".to_string()),
@@ -5228,11 +5219,11 @@ mod tests {
             context: Some(serde_json::json!({ "thread_id": "thread:legacy" })),
             ..Meta::default()
         });
-        assert_eq!(legacy.as_deref(), Some("thread:legacy"));
+        assert_eq!(legacy, None);
     }
 
     #[tokio::test]
-    async fn assign_thread_seq_backfills_canonical_thread_and_monotonic_sequence() {
+    async fn assign_thread_seq_requires_canonical_thread_id_and_monotonic_sequence() {
         let sequences = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
 
         let mut first = Message {
@@ -5250,8 +5241,9 @@ mod tests {
             payload: serde_json::json!({}),
         };
         assign_thread_seq_if_missing(&mut first, &sequences).await;
-        assert_eq!(first.meta.thread_id.as_deref(), Some("thread:legacy"));
-        assert_eq!(first.meta.thread_seq, Some(1));
+        assert_eq!(first.meta.thread_id, None);
+        assert_eq!(first.meta.thread_seq, None);
+        assert!(sequences.lock().await.is_empty());
 
         let mut second = Message {
             routing: Routing {

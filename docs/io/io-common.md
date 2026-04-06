@@ -37,8 +37,9 @@
 ⚠️ **ADVERTENCIA:**
 - El uso de `meta.context` como carrier es temporal para campos no tipados. `meta.src_ilk` ya es canónico y no debe duplicarse en `meta.context`.
 
-🧩 **A ESPECIFICAR (cuando el core se alinee):**
-- Momento exacto de corte (release) donde `ctx_seq/ctx_window` pasan a ser obligatorios en el happy path.
+🧩 **Estado actual del core:**
+- `ctx_seq/ctx_window` no forman parte del happy path canónico del repo.
+- si aparecen en payloads viejos, deben tratarse como metadata legacy/opaca.
 
 
 
@@ -433,7 +434,6 @@ Pipeline normativo:
 
 El MVP usa memoria para estado tecnico local (dedup/sessions/outbox).
 IO no es source of truth; la persistencia canonica permanece en core (Router/Storage/Identity).
-
 
 
 

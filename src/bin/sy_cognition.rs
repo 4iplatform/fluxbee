@@ -10,6 +10,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tokio::time;
+use tokio_postgres::{Config as PgConfig, NoTls, Row};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -39,7 +40,16 @@ use fluxbee_sdk::{
 use json_router::nats::{NatsSubscriber as RouterNatsSubscriber, SUBJECT_STORAGE_TURNS};
 use json_router::shm::{
     memory_shm_name_for_hive, MemoryRegionWriter, MemoryShmSnapshot, MemoryShmThreadEntry,
+    MEMORY_MAX_DATA_SIZE,
 };
+
+#[path = "sy_cognition/narrative_summarizer_ai.rs"]
+mod narrative_summarizer_ai;
+#[path = "sy_cognition/semantic_tagger_ai.rs"]
+mod semantic_tagger_ai;
+
+use narrative_summarizer_ai::run_narrative_summarizer_ai;
+use semantic_tagger_ai::run_semantic_tagger_ai;
 
 type CognitionError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -47,10 +57,16 @@ const COGNITION_NODE_BASE_NAME: &str = "SY.cognition";
 const COGNITION_NODE_VERSION: &str = "2.0";
 const COGNITION_CONFIG_SCHEMA_VERSION: u32 = 1;
 const COGNITION_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
+const STORAGE_LOCAL_SECRET_KEY_POSTGRES_URL: &str = "postgres_url";
+const STORAGE_NODE_BASE_NAME: &str = "SY.storage";
+const STORAGE_DB_NAME: &str = "fluxbee_storage";
 const COGNITION_TURNS_SID: u32 = 27;
 const DURABLE_QUEUE_TURNS: &str = "durable.sy-cognition.turns";
 const COGNITION_DEFAULT_CONTEXT_OPEN_THRESHOLD: f64 = 0.5;
 const COGNITION_DEFAULT_REASON_OPEN_THRESHOLD: f64 = 0.5;
+const COGNITION_DEFAULT_SEMANTIC_TAGGER_PROVIDER: &str = "openai";
+const COGNITION_DEFAULT_SEMANTIC_TAGGER_MODEL: &str = "gpt-4.1-mini";
+const COGNITION_DEFAULT_SEMANTIC_TAGGER_TIMEOUT_MS: u64 = 8_000;
 const COGNITION_CONTEXT_DECAY_FACTOR: f64 = 0.85;
 const COGNITION_REASON_DECAY_FACTOR: f64 = 0.75;
 const COGNITION_COOCCURRENCE_DECAY_FACTOR: f64 = 0.80;
@@ -76,6 +92,26 @@ const COGNITION_REASON_CANONICAL_SIGNALS: [&str; 8] = [
     "request",
     "abandon",
 ];
+
+#[derive(Debug, Clone, Default)]
+struct SemanticTaggerOutput {
+    tags: Vec<String>,
+    reason_signals_canonical: Vec<String>,
+    reason_signals_extra: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NarrativeOutcome {
+    called: bool,
+    failed: bool,
+    invalid_output: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ThreadUpdateResult {
+    envelopes: Vec<(&'static str, Vec<u8>)>,
+    narrative: NarrativeOutcome,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CognitionAiSecretSource {
@@ -109,12 +145,34 @@ impl Default for CognitionThresholds {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CognitionSemanticTaggerConfig {
+    provider: String,
+    model: String,
+    timeout_ms: u64,
+    max_tags: usize,
+    max_reason_signals: usize,
+}
+
+impl Default for CognitionSemanticTaggerConfig {
+    fn default() -> Self {
+        Self {
+            provider: COGNITION_DEFAULT_SEMANTIC_TAGGER_PROVIDER.to_string(),
+            model: COGNITION_DEFAULT_SEMANTIC_TAGGER_MODEL.to_string(),
+            timeout_ms: COGNITION_DEFAULT_SEMANTIC_TAGGER_TIMEOUT_MS,
+            max_tags: COGNITION_MAX_TAGS,
+            max_reason_signals: COGNITION_MAX_REASON_SIGNALS,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CognitionControlState {
     schema_version: u32,
     config_version: u64,
     ai_secret_source: CognitionAiSecretSource,
     thresholds: CognitionThresholds,
+    semantic_tagger: CognitionSemanticTaggerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +213,27 @@ struct CognitionRuntimeState {
     active_scopes_total: u64,
     active_memories_total: u64,
     active_episodes_total: u64,
+    rebuild_attempts_total: u64,
+    rebuild_successes_total: u64,
+    rebuild_failures_total: u64,
+    rebuilt_threads_total: u64,
+    last_rebuild_status: Option<String>,
+    last_rebuild_source: Option<String>,
+    last_rebuild_at: Option<String>,
+    shm_hot_threads_total: u64,
+    shm_pruned_threads_total: u64,
+    shm_payload_bytes: u64,
+    last_shm_sync_status: Option<String>,
+    last_shm_sync_at: Option<String>,
+    semantic_tagger_calls_total: u64,
+    semantic_tagger_failures_total: u64,
+    semantic_tagger_invalid_outputs_total: u64,
+    last_semantic_model: Option<String>,
+    last_semantic_impl: Option<String>,
+    narrative_summarizer_calls_total: u64,
+    narrative_summarizer_failures_total: u64,
+    narrative_summarizer_invalid_outputs_total: u64,
+    last_narrative_model: Option<String>,
 }
 
 #[derive(Debug)]
@@ -301,10 +380,56 @@ struct EpisodeCandidate {
 }
 
 #[derive(Debug, Clone, Default)]
-struct DeterministicTaggerOutput {
-    tags: Vec<String>,
-    reason_signals_canonical: Vec<String>,
-    reason_signals_extra: Vec<String>,
+struct RebuildSnapshot {
+    threads: HashMap<String, ThreadCognitionState>,
+    total_contexts: u64,
+    total_reasons: u64,
+    total_cooccurrences: u64,
+    total_scopes: u64,
+    total_memories: u64,
+    total_episodes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MemoryHotSetStats {
+    selected_threads_total: u64,
+    pruned_threads_total: u64,
+    payload_bytes: u64,
+}
+
+#[derive(Debug)]
+struct MemoryHotSetBuild {
+    snapshot: MemoryShmSnapshot,
+    selected_thread_ids: HashSet<String>,
+    stats: MemoryHotSetStats,
+}
+
+#[derive(Debug)]
+struct MemoryHotThreadCandidate {
+    entry: MemoryShmThreadEntry,
+    serialized_bytes: usize,
+    has_active_scope: bool,
+    live_entities_total: usize,
+    last_seen_epoch_ms: i64,
+    latest_thread_seq: u64,
+    turn_count: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ScopeInstancePayload {
+    scope_id: String,
+    #[serde(default)]
+    dominant_context_id: Option<String>,
+    #[serde(default)]
+    dominant_reason_id: Option<String>,
+    #[serde(default)]
+    start_thread_seq: Option<u64>,
+    #[serde(default)]
+    end_thread_seq: Option<u64>,
+    #[serde(default)]
+    opened_at: Option<String>,
+    #[serde(default)]
+    closed_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +527,8 @@ async fn main() -> Result<(), CognitionError> {
             }
         }
     }
+
+    rebuild_from_durable_on_startup(Arc::clone(&app_state)).await;
 
     std::mem::drop(tokio::spawn(run_turns_loop(
         endpoint.clone(),
@@ -519,12 +646,7 @@ async fn handle_turn_payload(
         }
     };
 
-    let Some(thread_id) = msg
-        .meta
-        .thread_id
-        .clone()
-        .or_else(|| legacy_context_thread_id(&msg))
-    else {
+    let Some(thread_id) = msg.meta.thread_id.clone() else {
         let mut state = app_state.runtime_state.lock().await;
         state.invalid_turns_total = state.invalid_turns_total.saturating_add(1);
         state.last_trace_id = Some(msg.routing.trace_id.clone());
@@ -536,15 +658,83 @@ async fn handle_turn_payload(
     };
 
     let text = extract_turn_text(&msg.payload).unwrap_or_default();
-    let tagger = deterministic_tagger(&text);
-    let thresholds = app_state.control_state.lock().await.thresholds.clone();
+    let (thresholds, semantic_tagger_config) = {
+        let control_state = app_state.control_state.lock().await;
+        (
+            control_state.thresholds.clone(),
+            control_state.semantic_tagger.clone(),
+        )
+    };
     let ts = chrono::Utc::now().to_rfc3339();
     let thread_seq = msg.meta.thread_seq;
     let src_ilk = msg.meta.src_ilk.clone();
     let dst_ilk = msg.meta.dst_ilk.clone();
     let ich = msg.meta.ich.clone();
+    {
+        let mut state = app_state.runtime_state.lock().await;
+        state.semantic_tagger_calls_total = state.semantic_tagger_calls_total.saturating_add(1);
+        state.last_semantic_model = Some(semantic_tagger_config.model.clone());
+        state.last_semantic_impl = Some("openai_responses".to_string());
+    }
 
-    let envelopes = {
+    let Some(api_key) = resolve_openai_api_key(&app_state.node_name) else {
+        let mut state = app_state.runtime_state.lock().await;
+        state.semantic_tagger_failures_total =
+            state.semantic_tagger_failures_total.saturating_add(1);
+        state.last_trace_id = Some(msg.routing.trace_id.clone());
+        state.last_thread_id = Some(thread_id.clone());
+        state.last_thread_seq = thread_seq;
+        state.last_src_ilk = src_ilk.clone();
+        state.last_ich = ich.clone();
+        tracing::warn!(
+            trace_id = %msg.routing.trace_id,
+            thread_id = %thread_id,
+            "sy.cognition semantic tagger skipped turn because OpenAI api key is missing"
+        );
+        return Ok(());
+    };
+
+    let tagger = match run_semantic_tagger_ai(semantic_tagger_ai::SemanticTaggerAiInput {
+        api_key: &api_key,
+        text: &text,
+        src_ilk: src_ilk.as_deref(),
+        dst_ilk: dst_ilk.as_deref(),
+        ich: ich.as_deref(),
+        config: &semantic_tagger_config,
+    })
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            let is_invalid_output = matches!(
+                err,
+                fluxbee_ai_sdk::AiSdkError::Json(_) | fluxbee_ai_sdk::AiSdkError::Protocol(_)
+            );
+            let mut state = app_state.runtime_state.lock().await;
+            if is_invalid_output {
+                state.semantic_tagger_invalid_outputs_total = state
+                    .semantic_tagger_invalid_outputs_total
+                    .saturating_add(1);
+            } else {
+                state.semantic_tagger_failures_total =
+                    state.semantic_tagger_failures_total.saturating_add(1);
+            }
+            state.last_trace_id = Some(msg.routing.trace_id.clone());
+            state.last_thread_id = Some(thread_id.clone());
+            state.last_thread_seq = thread_seq;
+            state.last_src_ilk = src_ilk.clone();
+            state.last_ich = ich.clone();
+            tracing::warn!(
+                trace_id = %msg.routing.trace_id,
+                thread_id = %thread_id,
+                error = %err,
+                "sy.cognition semantic tagger failed; turn skipped"
+            );
+            return Ok(());
+        }
+    };
+
+    let update_result = {
         let mut threads = app_state.thread_states.lock().await;
         let thread_state = threads
             .entry(thread_id.clone())
@@ -559,10 +749,14 @@ async fn handle_turn_payload(
             ich.as_deref(),
             &tagger,
             &thresholds,
+            &api_key,
+            &semantic_tagger_config,
             &ts,
             thread_state,
         )
+        .await
     };
+    let envelopes = update_result.envelopes;
 
     let mut published = 0u64;
     let mut publish_errors = 0u64;
@@ -666,6 +860,20 @@ async fn handle_turn_payload(
     state.last_tags = tagger.tags;
     state.last_reason_signals_canonical = tagger.reason_signals_canonical;
     state.last_reason_signals_extra = tagger.reason_signals_extra;
+    if update_result.narrative.called {
+        state.narrative_summarizer_calls_total =
+            state.narrative_summarizer_calls_total.saturating_add(1);
+        state.last_narrative_model = Some(semantic_tagger_config.model.clone());
+    }
+    if update_result.narrative.failed {
+        state.narrative_summarizer_failures_total =
+            state.narrative_summarizer_failures_total.saturating_add(1);
+    }
+    if update_result.narrative.invalid_output {
+        state.narrative_summarizer_invalid_outputs_total = state
+            .narrative_summarizer_invalid_outputs_total
+            .saturating_add(1);
+    }
     state.active_threads_total = active_threads_total;
     state.open_contexts_total = open_contexts_total;
     state.open_reasons_total = open_reasons_total;
@@ -677,27 +885,823 @@ async fn handle_turn_payload(
 }
 
 async fn sync_memory_shm(app_state: &CognitionAppState) -> Result<(), json_router::shm::ShmError> {
-    let snapshot = {
+    let hot_set = {
         let threads = app_state.thread_states.lock().await;
-        let mut entries = Vec::with_capacity(threads.len());
-        for (thread_id, thread_state) in threads.iter() {
-            entries.push(MemoryShmThreadEntry {
-                thread_id: thread_id.clone(),
-                package: build_memory_package_for_thread(thread_id, thread_state),
-            });
+        build_memory_hot_set_snapshot(&threads)?
+    };
+
+    let sync_status = if hot_set.stats.pruned_threads_total > 0 {
+        "ok_pruned"
+    } else {
+        "ok"
+    };
+    let mut memory_region = app_state.memory_region.lock().await;
+    if let Some(region) = memory_region.as_mut() {
+        region.write_snapshot(&hot_set.snapshot)?;
+    } else {
+        let mut state = app_state.runtime_state.lock().await;
+        state.last_shm_sync_status = Some("skipped_missing_region".to_string());
+        state.last_shm_sync_at = Some(chrono::Utc::now().to_rfc3339());
+        return Ok(());
+    }
+
+    let mut state = app_state.runtime_state.lock().await;
+    state.shm_hot_threads_total = hot_set.stats.selected_threads_total;
+    state.shm_pruned_threads_total = hot_set.stats.pruned_threads_total;
+    state.shm_payload_bytes = hot_set.stats.payload_bytes;
+    state.last_shm_sync_status = Some(sync_status.to_string());
+    state.last_shm_sync_at = Some(chrono::Utc::now().to_rfc3339());
+    Ok(())
+}
+
+fn build_memory_hot_set_snapshot(
+    threads: &HashMap<String, ThreadCognitionState>,
+) -> Result<MemoryHotSetBuild, json_router::shm::ShmError> {
+    let updated_at = json_router::shm::now_epoch_ms();
+    let base_snapshot = MemoryShmSnapshot {
+        schema_version: 1,
+        updated_at,
+        threads: Vec::new(),
+    };
+    let base_size = serde_json::to_vec(&base_snapshot)?.len();
+    let mut candidates = Vec::with_capacity(threads.len());
+    for (thread_id, thread_state) in threads {
+        let entry = MemoryShmThreadEntry {
+            thread_id: thread_id.clone(),
+            package: build_memory_package_for_thread(thread_id, thread_state),
+        };
+        let serialized_bytes = serde_json::to_vec(&entry)?.len();
+        candidates.push(MemoryHotThreadCandidate {
+            entry,
+            serialized_bytes,
+            has_active_scope: thread_state.active_scope.is_some(),
+            live_entities_total: thread_live_entities_total(thread_state),
+            last_seen_epoch_ms: thread_last_seen_epoch_ms(thread_state),
+            latest_thread_seq: thread_state.latest_thread_seq.unwrap_or(0),
+            turn_count: thread_state.turn_count,
+        });
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .has_active_scope
+            .cmp(&left.has_active_scope)
+            .then_with(|| right.live_entities_total.cmp(&left.live_entities_total))
+            .then_with(|| right.last_seen_epoch_ms.cmp(&left.last_seen_epoch_ms))
+            .then_with(|| right.latest_thread_seq.cmp(&left.latest_thread_seq))
+            .then_with(|| right.turn_count.cmp(&left.turn_count))
+            .then_with(|| left.entry.thread_id.cmp(&right.entry.thread_id))
+    });
+
+    let mut selected_thread_ids = HashSet::with_capacity(candidates.len());
+    let mut selected_entries = Vec::with_capacity(candidates.len());
+    let mut payload_bytes = base_size;
+    for candidate in candidates {
+        let extra_bytes = candidate.serialized_bytes + usize::from(!selected_entries.is_empty());
+        if payload_bytes.saturating_add(extra_bytes) > MEMORY_MAX_DATA_SIZE {
+            continue;
         }
-        MemoryShmSnapshot {
+        payload_bytes = payload_bytes.saturating_add(extra_bytes);
+        selected_thread_ids.insert(candidate.entry.thread_id.clone());
+        selected_entries.push(candidate.entry);
+    }
+
+    let selected_threads_total = selected_entries.len() as u64;
+    let pruned_threads_total = threads.len().saturating_sub(selected_entries.len()) as u64;
+    Ok(MemoryHotSetBuild {
+        snapshot: MemoryShmSnapshot {
             schema_version: 1,
-            updated_at: json_router::shm::now_epoch_ms(),
-            threads: entries,
+            updated_at,
+            threads: selected_entries,
+        },
+        selected_thread_ids,
+        stats: MemoryHotSetStats {
+            selected_threads_total,
+            pruned_threads_total,
+            payload_bytes: payload_bytes as u64,
+        },
+    })
+}
+
+fn apply_memory_hot_set_to_rebuild_snapshot(
+    snapshot: &mut RebuildSnapshot,
+) -> Result<MemoryHotSetStats, json_router::shm::ShmError> {
+    let hot_set = build_memory_hot_set_snapshot(&snapshot.threads)?;
+    snapshot
+        .threads
+        .retain(|thread_id, _| hot_set.selected_thread_ids.contains(thread_id));
+    recount_rebuild_snapshot_totals(snapshot);
+    Ok(hot_set.stats)
+}
+
+fn recount_rebuild_snapshot_totals(snapshot: &mut RebuildSnapshot) {
+    snapshot.total_contexts = snapshot
+        .threads
+        .values()
+        .map(|thread| thread.contexts.len() as u64)
+        .sum();
+    snapshot.total_reasons = snapshot
+        .threads
+        .values()
+        .map(|thread| thread.reasons.len() as u64)
+        .sum();
+    snapshot.total_cooccurrences = snapshot
+        .threads
+        .values()
+        .map(|thread| thread.cooccurrences.len() as u64)
+        .sum();
+    snapshot.total_scopes = snapshot
+        .threads
+        .values()
+        .filter(|thread| thread.active_scope.is_some())
+        .count() as u64;
+    snapshot.total_memories = snapshot
+        .threads
+        .values()
+        .map(|thread| thread.memories.len() as u64)
+        .sum();
+    snapshot.total_episodes = snapshot
+        .threads
+        .values()
+        .map(|thread| thread.episodes.len() as u64)
+        .sum();
+}
+
+fn thread_live_entities_total(thread_state: &ThreadCognitionState) -> usize {
+    let open_contexts = thread_state
+        .contexts
+        .values()
+        .filter(|context| context.status == "open")
+        .count();
+    let open_reasons = thread_state
+        .reasons
+        .values()
+        .filter(|reason| reason.status == "open")
+        .count();
+    let open_cooccurrences = thread_state
+        .cooccurrences
+        .values()
+        .filter(|cooccurrence| cooccurrence.status == "open")
+        .count();
+    usize::from(thread_state.active_scope.is_some())
+        + open_contexts
+        + open_reasons
+        + open_cooccurrences
+        + thread_state.memories.len()
+        + thread_state.episodes.len()
+}
+
+fn thread_last_seen_epoch_ms(thread_state: &ThreadCognitionState) -> i64 {
+    thread_state
+        .last_seen_at
+        .as_deref()
+        .and_then(parse_rfc3339_epoch_ms)
+        .or_else(|| {
+            thread_state
+                .first_seen_at
+                .as_deref()
+                .and_then(parse_rfc3339_epoch_ms)
+        })
+        .unwrap_or_default()
+}
+
+fn parse_rfc3339_epoch_ms(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
+    let started_at = chrono::Utc::now().to_rfc3339();
+    {
+        let mut state = app_state.runtime_state.lock().await;
+        state.rebuild_attempts_total = state.rebuild_attempts_total.saturating_add(1);
+        state.last_rebuild_at = Some(started_at.clone());
+    }
+
+    let should_rebuild = app_state.thread_states.lock().await.is_empty();
+    if !should_rebuild {
+        let mut state = app_state.runtime_state.lock().await;
+        state.last_rebuild_status = Some("skipped_nonempty_local_state".to_string());
+        state.last_rebuild_source = Some("startup".to_string());
+        return;
+    }
+
+    let Some(base_database_url) = resolve_storage_database_url(&app_state.hive_id) else {
+        let mut state = app_state.runtime_state.lock().await;
+        state.last_rebuild_status = Some("skipped_missing_storage_db".to_string());
+        state.last_rebuild_source = Some("startup".to_string());
+        tracing::info!(
+            node_name = %app_state.node_name,
+            "sy.cognition startup rebuild skipped; no durable storage DB configured"
+        );
+        return;
+    };
+
+    let mut snapshot = match load_rebuild_snapshot_from_storage(&base_database_url).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let mut state = app_state.runtime_state.lock().await;
+            state.rebuild_failures_total = state.rebuild_failures_total.saturating_add(1);
+            state.last_rebuild_status = Some(format!("failed:{err}"));
+            state.last_rebuild_source = Some("storage_durable".to_string());
+            tracing::warn!(
+                node_name = %app_state.node_name,
+                error = %err,
+                "sy.cognition startup rebuild from durable failed; continuing live"
+            );
+            return;
         }
     };
 
-    let mut memory_region = app_state.memory_region.lock().await;
-    if let Some(region) = memory_region.as_mut() {
-        region.write_snapshot(&snapshot)?;
+    let hot_set_stats = match apply_memory_hot_set_to_rebuild_snapshot(&mut snapshot) {
+        Ok(stats) => stats,
+        Err(err) => {
+            let mut state = app_state.runtime_state.lock().await;
+            state.rebuild_failures_total = state.rebuild_failures_total.saturating_add(1);
+            state.last_rebuild_status = Some(format!("failed:{err}"));
+            state.last_rebuild_source = Some("storage_durable".to_string());
+            tracing::warn!(
+                node_name = %app_state.node_name,
+                error = %err,
+                "sy.cognition startup rebuild failed while bounding jsr-memory hot set; continuing live"
+            );
+            return;
+        }
+    };
+
+    let rebuilt_threads_total = snapshot.threads.len() as u64;
+    {
+        let mut threads = app_state.thread_states.lock().await;
+        *threads = snapshot.threads;
     }
-    Ok(())
+    if let Err(err) = sync_memory_shm(&app_state).await {
+        tracing::warn!(
+            node_name = %app_state.node_name,
+            error = %err,
+            "sy.cognition startup rebuild loaded durable state but failed to sync jsr-memory"
+        );
+    }
+    refresh_runtime_totals(
+        &app_state,
+        RuntimeRefreshDelta {
+            rebuilt_threads_total,
+            rebuild_source: Some("storage_durable".to_string()),
+            rebuild_status: Some(if hot_set_stats.pruned_threads_total > 0 {
+                "ok_hot_set_pruned".to_string()
+            } else {
+                "ok".to_string()
+            }),
+            rebuild_success: true,
+            ..RuntimeRefreshDelta::default()
+        },
+    )
+    .await;
+    tracing::info!(
+        node_name = %app_state.node_name,
+        rebuilt_threads_total,
+        contexts = snapshot.total_contexts,
+        reasons = snapshot.total_reasons,
+        cooccurrences = snapshot.total_cooccurrences,
+        scopes = snapshot.total_scopes,
+        memories = snapshot.total_memories,
+        episodes = snapshot.total_episodes,
+        shm_hot_threads_total = hot_set_stats.selected_threads_total,
+        shm_pruned_threads_total = hot_set_stats.pruned_threads_total,
+        shm_payload_bytes = hot_set_stats.payload_bytes,
+        "sy.cognition startup rebuild from durable completed"
+    );
+}
+
+async fn load_rebuild_snapshot_from_storage(
+    base_database_url: &str,
+) -> Result<RebuildSnapshot, CognitionError> {
+    let base_config: PgConfig = base_database_url.parse()?;
+    let storage_config = with_dbname(&base_config, STORAGE_DB_NAME);
+    let (client, connection) = storage_config.connect(NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "sy.cognition rebuild postgres connection closed");
+        }
+    });
+
+    let thread_rows = client
+        .query(
+            "SELECT thread_id, payload FROM cognition_threads ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?;
+    let mut snapshot = RebuildSnapshot::default();
+    for row in thread_rows {
+        let thread_id: String = row.get("thread_id");
+        let payload: CognitionThreadData = row_payload(&row)?;
+        let entry = snapshot
+            .threads
+            .entry(thread_id)
+            .or_insert_with(ThreadCognitionState::default);
+        entry.first_seen_at = payload.first_seen_at;
+        entry.last_seen_at = payload.last_seen_at;
+        entry.latest_thread_seq = payload.latest_thread_seq;
+        entry.turn_count = payload.turn_count.unwrap_or(0);
+    }
+
+    for row in client
+        .query(
+            "SELECT context_id, thread_id, payload FROM cognition_contexts ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        let context_id: String = row.get("context_id");
+        let thread_id: String = row.get("thread_id");
+        let payload: CognitionContextData = row_payload(&row)?;
+        let thread = snapshot
+            .threads
+            .entry(thread_id)
+            .or_insert_with(ThreadCognitionState::default);
+        thread.contexts.insert(
+            context_id.clone(),
+            context_state_from_payload(context_id, payload),
+        );
+        snapshot.total_contexts = snapshot.total_contexts.saturating_add(1);
+    }
+
+    for row in client
+        .query(
+            "SELECT reason_id, thread_id, payload FROM cognition_reasons ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        let reason_id: String = row.get("reason_id");
+        let thread_id: String = row.get("thread_id");
+        let payload: CognitionReasonData = row_payload(&row)?;
+        let thread = snapshot
+            .threads
+            .entry(thread_id)
+            .or_insert_with(ThreadCognitionState::default);
+        thread.reasons.insert(
+            reason_id.clone(),
+            reason_state_from_payload(reason_id, payload),
+        );
+        snapshot.total_reasons = snapshot.total_reasons.saturating_add(1);
+    }
+
+    for row in client
+        .query(
+            "SELECT cooccurrence_id, thread_id, payload FROM cognition_cooccurrences ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        let cooccurrence_id: String = row.get("cooccurrence_id");
+        let thread_id: String = row.get("thread_id");
+        let payload: CognitionCooccurrenceData = row_payload(&row)?;
+        let thread = snapshot
+            .threads
+            .entry(thread_id)
+            .or_insert_with(ThreadCognitionState::default);
+        thread.cooccurrences.insert(
+            cooccurrence_id.clone(),
+            cooccurrence_state_from_payload(cooccurrence_id, payload),
+        );
+        snapshot.total_cooccurrences = snapshot.total_cooccurrences.saturating_add(1);
+    }
+
+    let mut scope_payloads = HashMap::new();
+    for row in client
+        .query(
+            "SELECT scope_id, payload FROM cognition_scopes ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        let scope_id: String = row.get("scope_id");
+        let payload: CognitionScopeData = row_payload(&row)?;
+        scope_payloads.insert(scope_id, payload);
+    }
+
+    let mut open_scope_instances: HashMap<String, (String, ScopeInstancePayload)> = HashMap::new();
+    for row in client
+        .query(
+            "SELECT scope_instance_id, thread_id, payload FROM cognition_scope_instances ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        let scope_instance_id: String = row.get("scope_instance_id");
+        let thread_id: String = row.get("thread_id");
+        let payload: ScopeInstancePayload = row_payload(&row)?;
+        snapshot.total_scopes = snapshot.total_scopes.saturating_add(1);
+        if payload.closed_at.is_some() {
+            continue;
+        }
+        let replace = match open_scope_instances.get(&thread_id) {
+            None => true,
+            Some((_, current)) => payload.start_thread_seq >= current.start_thread_seq,
+        };
+        if replace {
+            open_scope_instances.insert(thread_id, (scope_instance_id, payload));
+        }
+    }
+
+    for row in client
+        .query(
+            "SELECT memory_id, thread_id, payload FROM cognition_memories ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        let memory_id: String = row.get("memory_id");
+        let thread_id: String = row.get("thread_id");
+        let payload: CognitionMemoryData = row_payload(&row)?;
+        let thread = snapshot
+            .threads
+            .entry(thread_id)
+            .or_insert_with(ThreadCognitionState::default);
+        thread.memories.insert(
+            memory_id.clone(),
+            memory_state_from_payload(memory_id, payload),
+        );
+        snapshot.total_memories = snapshot.total_memories.saturating_add(1);
+    }
+
+    for row in client
+        .query(
+            "SELECT episode_id, thread_id, payload FROM cognition_episodes ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        let episode_id: String = row.get("episode_id");
+        let thread_id: String = row.get("thread_id");
+        let payload: CognitionEpisodeData = row_payload(&row)?;
+        let thread = snapshot
+            .threads
+            .entry(thread_id.clone())
+            .or_insert_with(ThreadCognitionState::default);
+        let scope_instance_id = open_scope_instances
+            .get(&thread_id)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| payload.scope_id.clone().unwrap_or_default());
+        let episode_key = format!("{}|{}", scope_instance_id, payload.affect_id);
+        thread.episodes.insert(
+            episode_key,
+            episode_state_from_payload(episode_id, scope_instance_id, payload),
+        );
+        snapshot.total_episodes = snapshot.total_episodes.saturating_add(1);
+    }
+
+    for (thread_id, thread_state) in snapshot.threads.iter_mut() {
+        if let Some((scope_instance_id, scope_payload)) = open_scope_instances.get(thread_id) {
+            if let Some(scope) = scope_binding_state_from_payload(
+                scope_instance_id,
+                scope_payload,
+                scope_payloads.get(&scope_payload.scope_id),
+                &thread_state.contexts,
+                &thread_state.reasons,
+            ) {
+                thread_state.active_scope = Some(scope);
+            }
+        }
+    }
+
+    Ok(snapshot)
+}
+
+fn context_state_from_payload(context_id: String, data: CognitionContextData) -> ContextState {
+    ContextState {
+        context_id,
+        label: data.label,
+        weight: data.weight.unwrap_or_default(),
+        weight_avg_cumulative: data.weight_avg_cumulative.unwrap_or_default(),
+        weight_avg_ema: data.weight_avg_ema.unwrap_or_default(),
+        weight_samples: data.weight_samples.unwrap_or_default(),
+        tags: data.tags,
+        ilk_weights: data.ilk_weights,
+        ilk_profile: data.ilk_profile,
+        opened_at: data.opened_at.unwrap_or_default(),
+        last_seen_at: data.last_seen_at.unwrap_or_default(),
+        closed_at: data.closed_at,
+        status: data.status,
+    }
+}
+
+fn reason_state_from_payload(reason_id: String, data: CognitionReasonData) -> ReasonState {
+    ReasonState {
+        reason_id,
+        label: data.label,
+        weight: data.weight.unwrap_or_default(),
+        weight_avg_cumulative: data.weight_avg_cumulative.unwrap_or_default(),
+        weight_avg_ema: data.weight_avg_ema.unwrap_or_default(),
+        weight_samples: data.weight_samples.unwrap_or_default(),
+        signals_canonical: data.signals_canonical,
+        signals_extra: data.signals_extra,
+        ilk_weights: data.ilk_weights,
+        ilk_profile: data.ilk_profile,
+        opened_at: data.opened_at.unwrap_or_default(),
+        last_seen_at: data.last_seen_at.unwrap_or_default(),
+        closed_at: data.closed_at,
+        status: data.status,
+    }
+}
+
+fn cooccurrence_state_from_payload(
+    cooccurrence_id: String,
+    data: CognitionCooccurrenceData,
+) -> CooccurrenceState {
+    CooccurrenceState {
+        cooccurrence_id,
+        context_id: data.context_id,
+        context_label: data.context_label,
+        reason_id: data.reason_id,
+        reason_label: data.reason_label,
+        weight: data.weight.unwrap_or_default(),
+        weight_avg_cumulative: data.weight_avg_cumulative.unwrap_or_default(),
+        weight_avg_ema: data.weight_avg_ema.unwrap_or_default(),
+        weight_samples: data.weight_samples.unwrap_or_default(),
+        occurrences: data.occurrences.unwrap_or_default(),
+        opened_at: data.opened_at.unwrap_or_default(),
+        last_seen_at: data.last_seen_at.unwrap_or_default(),
+        closed_at: data.closed_at,
+        status: data.status,
+    }
+}
+
+fn memory_state_from_payload(memory_id: String, data: CognitionMemoryData) -> MemoryState {
+    MemoryState {
+        memory_id,
+        scope_id: data.scope_id.unwrap_or_default(),
+        summary: data.summary,
+        weight: data.weight.unwrap_or_default(),
+        occurrences: data.occurrences.unwrap_or_default(),
+        dominant_context_id: data.dominant_context_id.unwrap_or_default(),
+        dominant_reason_id: data.dominant_reason_id.unwrap_or_default(),
+        ilk_weights: data.ilk_weights,
+        created_at: data.created_at.unwrap_or_default(),
+        last_seen_at: data.last_seen_at.unwrap_or_default(),
+    }
+}
+
+fn episode_state_from_payload(
+    episode_id: String,
+    scope_instance_id: String,
+    data: CognitionEpisodeData,
+) -> EpisodeState {
+    EpisodeState {
+        episode_id,
+        scope_id: data.scope_id.unwrap_or_default(),
+        scope_instance_id,
+        affect_id: data.affect_id,
+        title: data.title,
+        summary: data.summary,
+        base_intensity: data.base_intensity.unwrap_or_default(),
+        evidence_strength: data.evidence_strength.unwrap_or_default(),
+        evidence_context_ids: data.evidence_context_ids,
+        evidence_reason_ids: data.evidence_reason_ids,
+        evidence_signals: data.evidence_signals,
+        intensity: data.intensity.unwrap_or_default(),
+        reason: data.reason.unwrap_or_default(),
+        created_at: data.created_at.unwrap_or_default(),
+    }
+}
+
+fn scope_binding_state_from_payload(
+    scope_instance_id: &str,
+    instance: &ScopeInstancePayload,
+    scope: Option<&CognitionScopeData>,
+    contexts: &HashMap<String, ContextState>,
+    reasons: &HashMap<String, ReasonState>,
+) -> Option<ScopeBindingState> {
+    let dominant_context_id = instance
+        .dominant_context_id
+        .clone()
+        .or_else(|| scope.and_then(|value| value.dominant_context_id.clone()))
+        .unwrap_or_default();
+    let dominant_reason_id = instance
+        .dominant_reason_id
+        .clone()
+        .or_else(|| scope.and_then(|value| value.dominant_reason_id.clone()))
+        .unwrap_or_default();
+    let dominant_context = contexts.get(&dominant_context_id)?;
+    let dominant_reason = reasons.get(&dominant_reason_id)?;
+    Some(ScopeBindingState {
+        scope_id: instance.scope_id.clone(),
+        scope_instance_id: scope_instance_id.to_string(),
+        label: scope
+            .and_then(|value| value.label.clone())
+            .unwrap_or_else(|| format!("scope:{}", instance.scope_id)),
+        dominant_context_id: dominant_context.context_id.clone(),
+        dominant_context_label: dominant_context.label.clone(),
+        dominant_context_tags: dominant_context.tags.clone(),
+        dominant_reason_id: dominant_reason.reason_id.clone(),
+        dominant_reason_label: dominant_reason.label.clone(),
+        dominant_reason_signals: dominant_reason.signals_canonical.clone(),
+        ilk_weights: merged_scope_ilk_weights(dominant_context, dominant_reason),
+        binding_energy_ema: scope
+            .and_then(|value| value.binding_energy_ema)
+            .unwrap_or_default(),
+        opened_at: instance
+            .opened_at
+            .clone()
+            .or_else(|| scope.and_then(|value| value.opened_at.clone()))
+            .unwrap_or_default(),
+        last_seen_at: scope
+            .and_then(|value| value.last_seen_at.clone())
+            .or_else(|| instance.opened_at.clone())
+            .unwrap_or_default(),
+        start_thread_seq: instance.start_thread_seq,
+        unbind_streak: 0,
+    })
+}
+
+fn merged_scope_ilk_weights(context: &ContextState, reason: &ReasonState) -> BTreeMap<String, f64> {
+    let mut out = context.ilk_weights.clone();
+    for (ilk, weight) in &reason.ilk_weights {
+        *out.entry(ilk.clone()).or_insert(0.0) += *weight;
+    }
+    out
+}
+
+fn row_payload<T: for<'de> Deserialize<'de>>(row: &Row) -> Result<T, CognitionError> {
+    let payload: Value = row.get("payload");
+    Ok(serde_json::from_value(payload)?)
+}
+
+fn resolve_storage_database_url(hive_id: &str) -> Option<String> {
+    let storage_node_name = ensure_l2_name(STORAGE_NODE_BASE_NAME, hive_id);
+    load_node_secret_record(&storage_node_name)
+        .ok()
+        .and_then(|record| {
+            record
+                .secrets
+                .get(STORAGE_LOCAL_SECRET_KEY_POSTGRES_URL)
+                .cloned()
+        })
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value != NODE_SECRET_REDACTION_TOKEN)
+        .or_else(|| {
+            std::env::var("FLUXBEE_DATABASE_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            std::env::var("JSR_DATABASE_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn with_dbname(base: &PgConfig, dbname: &str) -> PgConfig {
+    let mut cfg = base.clone();
+    cfg.dbname(dbname);
+    cfg
+}
+
+#[derive(Default)]
+struct RuntimeRefreshDelta {
+    processed_turns_delta: u64,
+    published_entities_delta: u64,
+    publish_errors_delta: u64,
+    invalid_turns_delta: u64,
+    last_trace_id: Option<String>,
+    last_thread_id: Option<String>,
+    last_thread_seq: Option<u64>,
+    last_src_ilk: Option<String>,
+    last_ich: Option<String>,
+    last_tags: Option<Vec<String>>,
+    last_reason_signals_canonical: Option<Vec<String>>,
+    last_reason_signals_extra: Option<Vec<String>>,
+    rebuilt_threads_total: u64,
+    rebuild_source: Option<String>,
+    rebuild_status: Option<String>,
+    rebuild_success: bool,
+}
+
+async fn refresh_runtime_totals(app_state: &CognitionAppState, delta: RuntimeRefreshDelta) {
+    let (
+        active_threads_total,
+        open_contexts_total,
+        open_reasons_total,
+        open_cooccurrences_total,
+        active_scopes_total,
+        active_memories_total,
+        active_episodes_total,
+    ) = {
+        let threads = app_state.thread_states.lock().await;
+        let active_threads = threads.len() as u64;
+        let open_contexts = threads
+            .values()
+            .map(|thread| {
+                thread
+                    .contexts
+                    .values()
+                    .filter(|context| context.status == "open")
+                    .count() as u64
+            })
+            .sum();
+        let open_reasons = threads
+            .values()
+            .map(|thread| {
+                thread
+                    .reasons
+                    .values()
+                    .filter(|reason| reason.status == "open")
+                    .count() as u64
+            })
+            .sum();
+        let open_cooccurrences = threads
+            .values()
+            .map(|thread| {
+                thread
+                    .cooccurrences
+                    .values()
+                    .filter(|cooccurrence| cooccurrence.status == "open")
+                    .count() as u64
+            })
+            .sum();
+        let active_scopes = threads
+            .values()
+            .filter(|thread| thread.active_scope.is_some())
+            .count() as u64;
+        let active_memories = threads
+            .values()
+            .map(|thread| thread.memories.len() as u64)
+            .sum();
+        let active_episodes = threads
+            .values()
+            .map(|thread| thread.episodes.len() as u64)
+            .sum();
+        (
+            active_threads,
+            open_contexts,
+            open_reasons,
+            open_cooccurrences,
+            active_scopes,
+            active_memories,
+            active_episodes,
+        )
+    };
+
+    let mut state = app_state.runtime_state.lock().await;
+    state.processed_turns_total = state
+        .processed_turns_total
+        .saturating_add(delta.processed_turns_delta);
+    state.invalid_turns_total = state
+        .invalid_turns_total
+        .saturating_add(delta.invalid_turns_delta);
+    state.published_entities_total = state
+        .published_entities_total
+        .saturating_add(delta.published_entities_delta);
+    state.publish_errors_total = state
+        .publish_errors_total
+        .saturating_add(delta.publish_errors_delta);
+    if let Some(value) = delta.last_trace_id {
+        state.last_trace_id = Some(value);
+    }
+    if let Some(value) = delta.last_thread_id {
+        state.last_thread_id = Some(value);
+    }
+    if delta.last_thread_seq.is_some() {
+        state.last_thread_seq = delta.last_thread_seq;
+    }
+    if let Some(value) = delta.last_src_ilk {
+        state.last_src_ilk = Some(value);
+    }
+    if let Some(value) = delta.last_ich {
+        state.last_ich = Some(value);
+    }
+    if let Some(value) = delta.last_tags {
+        state.last_tags = value;
+    }
+    if let Some(value) = delta.last_reason_signals_canonical {
+        state.last_reason_signals_canonical = value;
+    }
+    if let Some(value) = delta.last_reason_signals_extra {
+        state.last_reason_signals_extra = value;
+    }
+    state.active_threads_total = active_threads_total;
+    state.open_contexts_total = open_contexts_total;
+    state.open_reasons_total = open_reasons_total;
+    state.open_cooccurrences_total = open_cooccurrences_total;
+    state.active_scopes_total = active_scopes_total;
+    state.active_memories_total = active_memories_total;
+    state.active_episodes_total = active_episodes_total;
+    if delta.rebuilt_threads_total > 0 || delta.rebuild_status.is_some() {
+        state.rebuilt_threads_total = delta.rebuilt_threads_total;
+    }
+    if let Some(value) = delta.rebuild_source {
+        state.last_rebuild_source = Some(value);
+    }
+    if let Some(value) = delta.rebuild_status {
+        state.last_rebuild_status = Some(value);
+    }
+    if delta.rebuild_success {
+        state.rebuild_successes_total = state.rebuild_successes_total.saturating_add(1);
+    }
 }
 
 fn build_memory_package_for_thread(
@@ -939,6 +1943,93 @@ fn build_status_payload(
     nats_subscribe_errors: u64,
 ) -> Value {
     let degraded_reasons = cognition_degraded_reasons(control_state);
+    let ai_provider = json!({
+        "provider": "openai",
+        "configured": control_state.ai_secret_source != CognitionAiSecretSource::Missing,
+        "source": control_state.ai_secret_source.as_str()
+    });
+    let semantic_tagger = json!({
+        "provider": control_state.semantic_tagger.provider,
+        "model": control_state.semantic_tagger.model,
+        "timeout_ms": control_state.semantic_tagger.timeout_ms,
+        "max_tags": control_state.semantic_tagger.max_tags,
+        "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
+        "ai_required": true,
+        "implementation_status": "openai_responses"
+    });
+    let degraded_semantics_policy = json!({
+        "ai_required": true,
+        "silent_fallback": false,
+        "carrier_changes_when_degraded": false,
+        "durable_schema_changes_when_degraded": false,
+        "turn_behavior_without_ai": "skip_semantic_derivation_fail_open",
+        "turn_behavior_on_semantic_tagger_failure": "skip_semantic_derivation_fail_open",
+        "turn_behavior_on_narrative_summarizer_failure": "skip_narrative_update_fail_open",
+        "notes": [
+            "Without AI, SY.cognition stays live but does not produce new semantic derivations for the affected turn.",
+            "The router carrier and durable entity schemas remain unchanged while semantic capability is degraded.",
+            "There is no silent fallback path as product behavior."
+        ]
+    });
+    let turns_consumer = json!({
+        "subject": SUBJECT_STORAGE_TURNS,
+        "mode": if use_durable_consumer { "durable" } else { "volatile" },
+        "durable_queue": if use_durable_consumer {
+            Value::String(DURABLE_QUEUE_TURNS.to_string())
+        } else {
+            Value::Null
+        },
+        "processed_turns_total": runtime_state.processed_turns_total,
+        "invalid_turns_total": runtime_state.invalid_turns_total,
+        "subscribe_failures": nats_subscribe_errors,
+        "published_entities_total": runtime_state.published_entities_total,
+        "publish_errors_total": runtime_state.publish_errors_total,
+        "last_trace_id": runtime_state.last_trace_id,
+        "last_thread_id": runtime_state.last_thread_id,
+        "last_thread_seq": runtime_state.last_thread_seq,
+        "last_src_ilk": runtime_state.last_src_ilk,
+        "last_ich": runtime_state.last_ich,
+        "last_tags": runtime_state.last_tags,
+        "last_reason_signals_canonical": runtime_state.last_reason_signals_canonical,
+        "last_reason_signals_extra": runtime_state.last_reason_signals_extra,
+        "active_threads_total": runtime_state.active_threads_total,
+        "open_contexts_total": runtime_state.open_contexts_total,
+        "open_reasons_total": runtime_state.open_reasons_total,
+        "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
+        "active_scopes_total": runtime_state.active_scopes_total,
+        "active_memories_total": runtime_state.active_memories_total,
+        "active_episodes_total": runtime_state.active_episodes_total,
+        "rebuild_attempts_total": runtime_state.rebuild_attempts_total,
+        "rebuild_successes_total": runtime_state.rebuild_successes_total,
+        "rebuild_failures_total": runtime_state.rebuild_failures_total,
+        "rebuilt_threads_total": runtime_state.rebuilt_threads_total,
+        "last_rebuild_status": runtime_state.last_rebuild_status,
+        "last_rebuild_source": runtime_state.last_rebuild_source,
+        "last_rebuild_at": runtime_state.last_rebuild_at,
+        "semantic_tagger_calls_total": runtime_state.semantic_tagger_calls_total,
+        "semantic_tagger_failures_total": runtime_state.semantic_tagger_failures_total,
+        "semantic_tagger_invalid_outputs_total": runtime_state.semantic_tagger_invalid_outputs_total,
+        "last_semantic_model": runtime_state.last_semantic_model,
+        "last_semantic_impl": runtime_state.last_semantic_impl,
+        "narrative_summarizer_calls_total": runtime_state.narrative_summarizer_calls_total,
+        "narrative_summarizer_failures_total": runtime_state.narrative_summarizer_failures_total,
+        "narrative_summarizer_invalid_outputs_total": runtime_state.narrative_summarizer_invalid_outputs_total,
+        "last_narrative_model": runtime_state.last_narrative_model
+    });
+    let paths = json!({
+        "state_dir": runtime_paths.state_dir,
+        "cache_dir": runtime_paths.cache_dir,
+        "shm_dir": runtime_paths.shm_dir,
+        "memory_lance": runtime_paths.memory_lance_path
+    });
+    let shm = json!({
+        "capacity_bytes": MEMORY_MAX_DATA_SIZE,
+        "hot_threads_total": runtime_state.shm_hot_threads_total,
+        "pruned_threads_total": runtime_state.shm_pruned_threads_total,
+        "payload_bytes": runtime_state.shm_payload_bytes,
+        "last_sync_status": runtime_state.last_shm_sync_status,
+        "last_sync_at": runtime_state.last_shm_sync_at
+    });
     json!({
         "ok": true,
         "node_name": node_name,
@@ -949,46 +2040,12 @@ fn build_status_payload(
             "active": !degraded_reasons.is_empty(),
             "reasons": degraded_reasons
         },
-        "ai_provider": {
-            "provider": "openai",
-            "configured": control_state.ai_secret_source != CognitionAiSecretSource::Missing,
-            "source": control_state.ai_secret_source.as_str()
-        },
-        "turns_consumer": {
-            "subject": SUBJECT_STORAGE_TURNS,
-            "mode": if use_durable_consumer { "durable" } else { "volatile" },
-            "durable_queue": if use_durable_consumer {
-                Value::String(DURABLE_QUEUE_TURNS.to_string())
-            } else {
-                Value::Null
-            },
-            "processed_turns_total": runtime_state.processed_turns_total,
-            "invalid_turns_total": runtime_state.invalid_turns_total,
-            "subscribe_failures": nats_subscribe_errors,
-            "published_entities_total": runtime_state.published_entities_total,
-            "publish_errors_total": runtime_state.publish_errors_total,
-            "last_trace_id": runtime_state.last_trace_id,
-            "last_thread_id": runtime_state.last_thread_id,
-            "last_thread_seq": runtime_state.last_thread_seq,
-            "last_src_ilk": runtime_state.last_src_ilk,
-            "last_ich": runtime_state.last_ich,
-            "last_tags": runtime_state.last_tags,
-            "last_reason_signals_canonical": runtime_state.last_reason_signals_canonical,
-            "last_reason_signals_extra": runtime_state.last_reason_signals_extra,
-            "active_threads_total": runtime_state.active_threads_total,
-            "open_contexts_total": runtime_state.open_contexts_total,
-            "open_reasons_total": runtime_state.open_reasons_total,
-            "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
-            "active_scopes_total": runtime_state.active_scopes_total,
-            "active_memories_total": runtime_state.active_memories_total,
-            "active_episodes_total": runtime_state.active_episodes_total
-        },
-        "paths": {
-            "state_dir": runtime_paths.state_dir,
-            "cache_dir": runtime_paths.cache_dir,
-            "shm_dir": runtime_paths.shm_dir,
-            "memory_lance": runtime_paths.memory_lance_path
-        }
+        "ai_provider": ai_provider,
+        "semantic_tagger": semantic_tagger,
+        "degraded_semantics_policy": degraded_semantics_policy,
+        "turns_consumer": turns_consumer,
+        "paths": paths,
+        "shm": shm
     })
 }
 
@@ -1002,6 +2059,11 @@ fn build_cognition_config_get_payload(
     note: Option<&str>,
 ) -> Value {
     let configured = control_state.ai_secret_source != CognitionAiSecretSource::Missing;
+    let redacted_api_key = if configured {
+        Value::String(NODE_SECRET_REDACTION_TOKEN.to_string())
+    } else {
+        Value::Null
+    };
     let mut secret_descriptor = NodeSecretDescriptor::new(
         "config.secrets.openai.api_key",
         COGNITION_LOCAL_SECRET_KEY_OPENAI,
@@ -1016,17 +2078,137 @@ fn build_cognition_config_get_payload(
                 .to_string(),
         ),
         Value::String(
-            "The OpenAI provider secret is optional at this stage; the node starts in degraded mode when missing."
+            "The OpenAI provider secret is required for the semantic extraction stage; without it, SY.cognition stays fail-open and skips new semantic derivations for affected turns."
                 .to_string(),
         ),
         Value::String(
-            "Deterministic v1 writer for threads, contexts, reasons, cooccurrences, scopes, scope_instances, memories, and episodes is active; jsr-memory SHM writer is active and router enrichment is local-only after routing."
+            "The semantic tagger is an internal AI-backed component of SY.cognition using the configured provider/model."
+                .to_string(),
+        ),
+        Value::String(
+            "When AI is unavailable or a semantic call fails, carrier and durable schemas do not change; only new semantic enrichment is skipped for that turn/window."
+                .to_string(),
+        ),
+        Value::String(
+            "Cold start rebuild from durable storage is attempted only when local cognition state is empty; when storage durable is unavailable the node stays fail-open and continues live."
                 .to_string(),
         ),
     ];
     if let Some(note) = note.filter(|value| !value.trim().is_empty()) {
         notes.push(Value::String(note.to_string()));
     }
+    let config = json!({
+        "nats": {
+            "input_subject": SUBJECT_STORAGE_TURNS,
+            "consumer_mode": if use_durable_consumer { "durable" } else { "volatile" },
+            "durable_queue": if use_durable_consumer {
+                Value::String(DURABLE_QUEUE_TURNS.to_string())
+            } else {
+                Value::Null
+            }
+        },
+        "storage": {
+            "write_subject_prefix": "storage.cognition",
+            "enabled": true
+        },
+        "ai_providers": {
+            "openai": {
+                "provider": "openai",
+                "api_key": redacted_api_key.clone()
+            }
+        },
+        "secrets": {
+            "openai": {
+                "api_key": redacted_api_key
+            }
+        },
+        "semantic_tagger": {
+            "provider": control_state.semantic_tagger.provider,
+            "model": control_state.semantic_tagger.model,
+            "timeout_ms": control_state.semantic_tagger.timeout_ms,
+            "max_tags": control_state.semantic_tagger.max_tags,
+            "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
+            "ai_required": true,
+            "implementation_status": "openai_responses"
+        },
+        "degraded_semantics_policy": {
+            "ai_required": true,
+            "silent_fallback": false,
+            "carrier_changes_when_degraded": false,
+            "durable_schema_changes_when_degraded": false,
+            "turn_behavior_without_ai": "skip_semantic_derivation_fail_open",
+            "turn_behavior_on_semantic_tagger_failure": "skip_semantic_derivation_fail_open",
+            "turn_behavior_on_narrative_summarizer_failure": "skip_narrative_update_fail_open"
+        },
+        "thresholds": {
+            "context_open": control_state.thresholds.context_open,
+            "reason_open": control_state.thresholds.reason_open
+        },
+        "paths": {
+            "state_dir": runtime_paths.state_dir,
+            "cache_dir": runtime_paths.cache_dir,
+            "shm_dir": runtime_paths.shm_dir,
+            "memory_lance": runtime_paths.memory_lance_path
+        }
+    });
+    let runtime = json!({
+        "processed_turns_total": runtime_state.processed_turns_total,
+        "invalid_turns_total": runtime_state.invalid_turns_total,
+        "published_entities_total": runtime_state.published_entities_total,
+        "publish_errors_total": runtime_state.publish_errors_total,
+        "subscribe_failures": nats_subscribe_errors,
+        "last_thread_id": runtime_state.last_thread_id,
+        "last_thread_seq": runtime_state.last_thread_seq,
+        "last_tags": runtime_state.last_tags,
+        "last_reason_signals_canonical": runtime_state.last_reason_signals_canonical,
+        "last_reason_signals_extra": runtime_state.last_reason_signals_extra,
+        "active_threads_total": runtime_state.active_threads_total,
+        "open_contexts_total": runtime_state.open_contexts_total,
+        "open_reasons_total": runtime_state.open_reasons_total,
+        "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
+        "active_scopes_total": runtime_state.active_scopes_total,
+        "active_memories_total": runtime_state.active_memories_total,
+        "active_episodes_total": runtime_state.active_episodes_total,
+        "rebuild_attempts_total": runtime_state.rebuild_attempts_total,
+        "rebuild_successes_total": runtime_state.rebuild_successes_total,
+        "rebuild_failures_total": runtime_state.rebuild_failures_total,
+        "rebuilt_threads_total": runtime_state.rebuilt_threads_total,
+        "last_rebuild_status": runtime_state.last_rebuild_status,
+        "last_rebuild_source": runtime_state.last_rebuild_source,
+        "last_rebuild_at": runtime_state.last_rebuild_at,
+        "shm_hot_threads_total": runtime_state.shm_hot_threads_total,
+        "shm_pruned_threads_total": runtime_state.shm_pruned_threads_total,
+        "shm_payload_bytes": runtime_state.shm_payload_bytes,
+        "last_shm_sync_status": runtime_state.last_shm_sync_status,
+        "last_shm_sync_at": runtime_state.last_shm_sync_at,
+        "semantic_tagger_calls_total": runtime_state.semantic_tagger_calls_total,
+        "semantic_tagger_failures_total": runtime_state.semantic_tagger_failures_total,
+        "semantic_tagger_invalid_outputs_total": runtime_state.semantic_tagger_invalid_outputs_total,
+        "last_semantic_model": runtime_state.last_semantic_model,
+        "last_semantic_impl": runtime_state.last_semantic_impl,
+        "narrative_summarizer_calls_total": runtime_state.narrative_summarizer_calls_total,
+        "narrative_summarizer_failures_total": runtime_state.narrative_summarizer_failures_total,
+        "narrative_summarizer_invalid_outputs_total": runtime_state.narrative_summarizer_invalid_outputs_total,
+        "last_narrative_model": runtime_state.last_narrative_model
+    });
+    let contract = json!({
+        "node_family": "SY",
+        "node_kind": "SY.cognition",
+        "supports": ["CONFIG_GET", "CONFIG_SET"],
+        "required_fields": [],
+        "optional_fields": [
+            "config.secrets.openai.api_key",
+            "config.semantic_tagger.provider",
+            "config.semantic_tagger.model",
+            "config.semantic_tagger.timeout_ms",
+            "config.semantic_tagger.max_tags",
+            "config.semantic_tagger.max_reason_signals",
+            "config.thresholds.context_open",
+            "config.thresholds.reason_open"
+        ],
+        "secrets": [secret_descriptor],
+        "notes": notes
+    });
 
     json!({
         "ok": true,
@@ -1034,62 +2216,9 @@ fn build_cognition_config_get_payload(
         "state": cognition_state_label(control_state),
         "schema_version": control_state.schema_version,
         "config_version": control_state.config_version,
-        "config": {
-            "nats": {
-                "input_subject": SUBJECT_STORAGE_TURNS,
-                "consumer_mode": if use_durable_consumer { "durable" } else { "volatile" },
-                "durable_queue": if use_durable_consumer { Value::String(DURABLE_QUEUE_TURNS.to_string()) } else { Value::Null }
-            },
-            "storage": {
-                "write_subject_prefix": "storage.cognition",
-                "enabled": true
-            },
-            "ai_providers": {
-                "openai": {
-                    "provider": "openai",
-                    "api_key": if configured { Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()) } else { Value::Null }
-                }
-            },
-            "thresholds": {
-                "context_open": control_state.thresholds.context_open,
-                "reason_open": control_state.thresholds.reason_open
-            },
-            "paths": {
-                "state_dir": runtime_paths.state_dir,
-                "cache_dir": runtime_paths.cache_dir,
-                "shm_dir": runtime_paths.shm_dir,
-                "memory_lance": runtime_paths.memory_lance_path
-            }
-        },
-        "runtime": {
-            "processed_turns_total": runtime_state.processed_turns_total,
-            "invalid_turns_total": runtime_state.invalid_turns_total,
-            "published_entities_total": runtime_state.published_entities_total,
-            "publish_errors_total": runtime_state.publish_errors_total,
-            "subscribe_failures": nats_subscribe_errors,
-            "last_thread_id": runtime_state.last_thread_id,
-            "last_thread_seq": runtime_state.last_thread_seq,
-            "last_tags": runtime_state.last_tags,
-            "last_reason_signals_canonical": runtime_state.last_reason_signals_canonical,
-            "last_reason_signals_extra": runtime_state.last_reason_signals_extra,
-            "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
-            "active_scopes_total": runtime_state.active_scopes_total,
-            "active_memories_total": runtime_state.active_memories_total,
-            "active_episodes_total": runtime_state.active_episodes_total
-        },
-        "contract": {
-            "node_family": "SY",
-            "node_kind": "SY.cognition",
-            "supports": ["CONFIG_GET", "CONFIG_SET"],
-            "required_fields": [],
-            "optional_fields": [
-                "config.secrets.openai.api_key",
-                "config.thresholds.context_open",
-                "config.thresholds.reason_open"
-            ],
-            "secrets": [secret_descriptor],
-            "notes": notes
-        }
+        "config": config,
+        "runtime": runtime,
+        "contract": contract
     })
 }
 
@@ -1151,6 +2280,19 @@ fn apply_cognition_config_set(
             ));
         }
     };
+    let semantic_tagger = match extract_cognition_semantic_tagger_config(&msg.payload) {
+        Ok(value) => value,
+        Err(err) => {
+            return Ok(config_error_response(
+                node_name,
+                control_state,
+                runtime_paths,
+                use_durable_consumer,
+                "invalid_config",
+                &err.to_string(),
+            ));
+        }
+    };
 
     if let Some(api_key) = openai_api_key.as_deref() {
         persist_local_openai_api_key(
@@ -1174,6 +2316,9 @@ fn apply_cognition_config_set(
     if let Some(thresholds) = thresholds {
         control_state.thresholds = thresholds;
     }
+    if let Some(semantic_tagger) = semantic_tagger {
+        control_state.semantic_tagger = semantic_tagger;
+    }
     control_state.config_version = control_state.config_version.saturating_add(1);
     persist_cognition_config_state(node_name, control_state)?;
 
@@ -1185,6 +2330,24 @@ fn apply_cognition_config_set(
         "config_version": control_state.config_version,
         "apply_mode": NODE_CONFIG_APPLY_MODE_REPLACE,
         "config": {
+            "secrets": {
+                "openai": {
+                    "api_key": if control_state.ai_secret_source != CognitionAiSecretSource::Missing {
+                        Value::String(NODE_SECRET_REDACTION_TOKEN.to_string())
+                    } else {
+                        Value::Null
+                    }
+                }
+            },
+            "semantic_tagger": {
+                "provider": control_state.semantic_tagger.provider,
+                "model": control_state.semantic_tagger.model,
+                "timeout_ms": control_state.semantic_tagger.timeout_ms,
+                "max_tags": control_state.semantic_tagger.max_tags,
+                "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
+                "ai_required": true,
+                "implementation_status": "openai_responses"
+            },
             "thresholds": {
                 "context_open": control_state.thresholds.context_open,
                 "reason_open": control_state.thresholds.reason_open
@@ -1199,7 +2362,7 @@ fn apply_cognition_config_set(
         } else {
             Value::Array(Vec::new())
         },
-        "message": "SY.cognition local config persisted. Provider secret affects future AI calls once the cognitive pipeline is enabled."
+        "message": "SY.cognition local config persisted. Semantic extraction uses the configured AI semantic tagger."
     }))
 }
 
@@ -1249,12 +2412,14 @@ fn config_error_response(
 fn cognition_state_label(control_state: &CognitionControlState) -> &'static str {
     match control_state.ai_secret_source {
         CognitionAiSecretSource::Missing => "degraded_no_ai_provider",
-        CognitionAiSecretSource::LocalFile | CognitionAiSecretSource::EnvCompat => "ready_scaffold",
+        CognitionAiSecretSource::LocalFile | CognitionAiSecretSource::EnvCompat => {
+            "ready_semantic_ai"
+        }
     }
 }
 
 fn cognition_degraded_reasons(control_state: &CognitionControlState) -> Vec<&'static str> {
-    let mut reasons = vec!["memory_shm_pending"];
+    let mut reasons = Vec::new();
     if control_state.ai_secret_source == CognitionAiSecretSource::Missing {
         reasons.push("ai_provider_missing");
     }
@@ -1284,11 +2449,24 @@ fn bootstrap_cognition_control_state(
                 .and_then(|value| serde_json::from_value::<CognitionThresholds>(value).ok())
         })
         .unwrap_or_default();
+    let semantic_tagger = persisted
+        .as_ref()
+        .and_then(|value| {
+            value
+                .config
+                .get("semantic_tagger")
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<CognitionSemanticTaggerConfig>(value).ok()
+                })
+        })
+        .unwrap_or_default();
     let state = CognitionControlState {
         schema_version,
         config_version,
         ai_secret_source,
         thresholds,
+        semantic_tagger,
     };
     persist_cognition_config_state(node_name, &state)?;
     Ok(state)
@@ -1310,6 +2488,13 @@ fn persist_cognition_config_state(
         config_version: state.config_version,
         node_name: node_name.to_string(),
         config: json!({
+            "semantic_tagger": {
+                "provider": state.semantic_tagger.provider,
+                "model": state.semantic_tagger.model,
+                "timeout_ms": state.semantic_tagger.timeout_ms,
+                "max_tags": state.semantic_tagger.max_tags,
+                "max_reason_signals": state.semantic_tagger.max_reason_signals
+            },
             "thresholds": {
                 "context_open": state.thresholds.context_open,
                 "reason_open": state.thresholds.reason_open
@@ -1374,6 +2559,54 @@ fn extract_cognition_thresholds(
     }))
 }
 
+fn extract_cognition_semantic_tagger_config(
+    body: &Value,
+) -> Result<Option<CognitionSemanticTaggerConfig>, CognitionError> {
+    let Some(config) = body
+        .get("config")
+        .and_then(|value| value.get("semantic_tagger"))
+    else {
+        return Ok(None);
+    };
+    let mut merged = CognitionSemanticTaggerConfig::default();
+    if let Some(provider) = config.get("provider").and_then(Value::as_str) {
+        let provider = provider.trim();
+        if provider.is_empty() {
+            return Err("config.semantic_tagger.provider must not be empty".into());
+        }
+        if !provider.eq_ignore_ascii_case("openai") {
+            return Err("config.semantic_tagger.provider currently supports only 'openai'".into());
+        }
+        merged.provider = provider.to_string();
+    }
+    if let Some(model) = config.get("model").and_then(Value::as_str) {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err("config.semantic_tagger.model must not be empty".into());
+        }
+        merged.model = model.to_string();
+    }
+    if let Some(timeout_ms) = config.get("timeout_ms").and_then(Value::as_u64) {
+        if timeout_ms == 0 {
+            return Err("config.semantic_tagger.timeout_ms must be > 0".into());
+        }
+        merged.timeout_ms = timeout_ms;
+    }
+    if let Some(max_tags) = config.get("max_tags").and_then(Value::as_u64) {
+        if max_tags == 0 {
+            return Err("config.semantic_tagger.max_tags must be > 0".into());
+        }
+        merged.max_tags = max_tags as usize;
+    }
+    if let Some(max_reason_signals) = config.get("max_reason_signals").and_then(Value::as_u64) {
+        if max_reason_signals == 0 {
+            return Err("config.semantic_tagger.max_reason_signals must be > 0".into());
+        }
+        merged.max_reason_signals = max_reason_signals as usize;
+    }
+    Ok(Some(merged))
+}
+
 fn extract_turn_text(payload: &Value) -> Option<String> {
     TextV1Payload::from_value(payload)
         .ok()
@@ -1382,270 +2615,7 @@ fn extract_turn_text(payload: &Value) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn deterministic_tagger(text: &str) -> DeterministicTaggerOutput {
-    let normalized = normalize_text(text);
-    if normalized.is_empty() {
-        return DeterministicTaggerOutput::default();
-    }
-    let tokens = tokenize(&normalized);
-    let mut tags = Vec::new();
-    let mut canonical = Vec::new();
-    let mut extra = Vec::new();
-
-    add_tag_if_matches(
-        &mut tags,
-        &tokens,
-        &[
-            "billing", "refund", "invoice", "payment", "charge", "charged",
-        ],
-        "billing",
-    );
-    add_tag_if_matches(
-        &mut tags,
-        &tokens,
-        &["account", "login", "password", "access", "user", "profile"],
-        "account",
-    );
-    add_tag_if_matches(
-        &mut tags,
-        &tokens,
-        &[
-            "support", "issue", "problem", "broken", "error", "bug", "failed", "failing",
-        ],
-        "support",
-    );
-    add_tag_if_matches(
-        &mut tags,
-        &tokens,
-        &["order", "shipping", "delivery", "package", "shipment"],
-        "orders",
-    );
-    add_tag_if_matches(
-        &mut tags,
-        &tokens,
-        &["identity", "tenant", "ilk", "channel", "provision"],
-        "identity",
-    );
-    add_tag_if_matches(
-        &mut tags,
-        &tokens,
-        &[
-            "policy",
-            "permission",
-            "role",
-            "access",
-            "authorize",
-            "approval",
-        ],
-        "policy",
-    );
-    add_tag_if_matches(
-        &mut tags,
-        &tokens,
-        &["meeting", "schedule", "calendar", "call", "appointment"],
-        "scheduling",
-    );
-    add_tag_if_matches(
-        &mut tags,
-        &tokens,
-        &[
-            "deploy",
-            "release",
-            "runtime",
-            "node",
-            "orchestrator",
-            "service",
-        ],
-        "operations",
-    );
-
-    if matches_any_phrase(
-        &normalized,
-        &[
-            "please",
-            "can you",
-            "could you",
-            "need you",
-            "i need",
-            "i want",
-        ],
-    ) || tokens
-        .iter()
-        .any(|token| matches!(token.as_str(), "please" | "need" | "want"))
-    {
-        canonical.push("request".to_string());
-    }
-    if matches_any_phrase(
-        &normalized,
-        &[
-            "fix",
-            "solve",
-            "resolve",
-            "refund",
-            "help me",
-            "not working",
-            "working again",
-        ],
-    ) || tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "fix" | "solve" | "resolve" | "refund" | "help"
-        )
-    }) {
-        canonical.push("resolve".to_string());
-    }
-    if matches_any_phrase(
-        &normalized,
-        &[
-            "why",
-            "wrong",
-            "broken",
-            "still broken",
-            "doesnt work",
-            "unacceptable",
-            "complaint",
-        ],
-    ) || tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "wrong" | "broken" | "complaint" | "bad" | "still"
-        )
-    }) {
-        canonical.push("challenge".to_string());
-    }
-    if matches_any_phrase(
-        &normalized,
-        &[
-            "status",
-            "update",
-            "explain",
-            "information",
-            "details",
-            "clarify",
-        ],
-    ) || tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "status" | "update" | "explain" | "details" | "clarify" | "info"
-        )
-    }) {
-        canonical.push("inform".to_string());
-    }
-    if matches_any_phrase(
-        &normalized,
-        &[
-            "confirm",
-            "verify",
-            "is it correct",
-            "is that correct",
-            "okay?",
-        ],
-    ) || tokens
-        .iter()
-        .any(|token| matches!(token.as_str(), "confirm" | "verify" | "correct" | "ok"))
-    {
-        canonical.push("confirm".to_string());
-    }
-    if matches_any_phrase(
-        &normalized,
-        &["security", "fraud", "risk", "protect", "block", "suspend"],
-    ) || tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "security" | "fraud" | "risk" | "protect" | "block" | "suspend"
-        )
-    }) {
-        canonical.push("protect".to_string());
-    }
-    if matches_any_phrase(
-        &normalized,
-        &[
-            "hello",
-            "thanks",
-            "thank you",
-            "appreciate",
-            "glad",
-            "connect",
-        ],
-    ) || tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "hello" | "thanks" | "thank" | "appreciate" | "glad" | "connect"
-        )
-    }) {
-        canonical.push("connect".to_string());
-    }
-    if matches_any_phrase(
-        &normalized,
-        &[
-            "cancel",
-            "stop",
-            "nevermind",
-            "never mind",
-            "close this",
-            "no longer",
-        ],
-    ) || tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "cancel" | "stop" | "nevermind" | "close" | "abandon"
-        )
-    }) {
-        canonical.push("abandon".to_string());
-    }
-
-    if matches_any_phrase(&normalized, &["urgent", "asap", "immediately", "right now"]) {
-        extra.push("urgency".to_string());
-    }
-    if matches_any_phrase(
-        &normalized,
-        &[
-            "frustrated",
-            "angry",
-            "broken",
-            "still broken",
-            "again",
-            "unacceptable",
-        ],
-    ) {
-        extra.push("frustration".to_string());
-    }
-    if matches_any_phrase(&normalized, &["thanks", "thank you", "appreciate"]) {
-        extra.push("gratitude".to_string());
-    }
-    if matches_any_phrase(&normalized, &["why", "how", "confused", "dont understand"]) {
-        extra.push("confusion".to_string());
-    }
-    if matches_any_phrase(&normalized, &["lawyer", "legal", "complaint", "escalate"]) {
-        extra.push("escalation".to_string());
-    }
-
-    tags = dedup_limit(tags, COGNITION_MAX_TAGS);
-    canonical = dedup_limit(
-        canonical
-            .into_iter()
-            .filter(|value| {
-                COGNITION_REASON_CANONICAL_SIGNALS
-                    .iter()
-                    .any(|allowed| allowed == value)
-            })
-            .collect(),
-        COGNITION_MAX_REASON_SIGNALS,
-    );
-    extra = dedup_limit(extra, COGNITION_MAX_REASON_SIGNALS);
-
-    if tags.is_empty() {
-        tags = fallback_tags(&tokens, COGNITION_MAX_TAGS);
-    }
-
-    DeterministicTaggerOutput {
-        tags,
-        reason_signals_canonical: canonical,
-        reason_signals_extra: extra,
-    }
-}
-
-fn update_thread_state_and_build_envelopes(
+async fn update_thread_state_and_build_envelopes(
     hive_id: &str,
     writer: &str,
     thread_id: &str,
@@ -1653,11 +2623,13 @@ fn update_thread_state_and_build_envelopes(
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
     ich: Option<&str>,
-    tagger: &DeterministicTaggerOutput,
+    tagger: &SemanticTaggerOutput,
     thresholds: &CognitionThresholds,
+    api_key: &str,
+    semantic_tagger_config: &CognitionSemanticTaggerConfig,
     ts: &str,
     thread_state: &mut ThreadCognitionState,
-) -> Vec<(&'static str, Vec<u8>)> {
+) -> ThreadUpdateResult {
     if thread_state.first_seen_at.is_none() {
         thread_state.first_seen_at = Some(ts.to_string());
     }
@@ -1730,7 +2702,7 @@ fn update_thread_state_and_build_envelopes(
         &thread_state.reasons,
         &mut thread_state.active_scope,
     ));
-    out.extend(update_memories_and_episodes_for_thread(
+    let memory_episode_result = update_memories_and_episodes_for_thread(
         hive_id,
         writer,
         thread_id,
@@ -1738,16 +2710,23 @@ fn update_thread_state_and_build_envelopes(
         src_ilk,
         dst_ilk,
         tagger,
+        api_key,
+        semantic_tagger_config,
         &thread_state.contexts,
         &thread_state.reasons,
         &thread_state.active_scope,
         &mut thread_state.memories,
         &mut thread_state.episodes,
-    ));
-    out
+    )
+    .await;
+    out.extend(memory_episode_result.envelopes);
+    ThreadUpdateResult {
+        envelopes: out,
+        narrative: memory_episode_result.narrative,
+    }
 }
 
-fn build_context_candidates(tagger: &DeterministicTaggerOutput) -> Vec<ContextCandidate> {
+fn build_context_candidates(tagger: &SemanticTaggerOutput) -> Vec<ContextCandidate> {
     tagger
         .tags
         .iter()
@@ -1759,7 +2738,7 @@ fn build_context_candidates(tagger: &DeterministicTaggerOutput) -> Vec<ContextCa
         .collect()
 }
 
-fn build_reason_candidates(tagger: &DeterministicTaggerOutput) -> Vec<ReasonCandidate> {
+fn build_reason_candidates(tagger: &SemanticTaggerOutput) -> Vec<ReasonCandidate> {
     let signals: HashSet<&str> = tagger
         .reason_signals_canonical
         .iter()
@@ -2382,29 +3361,84 @@ fn update_scope_binding_for_thread(
     out
 }
 
-fn update_memories_and_episodes_for_thread(
+async fn update_memories_and_episodes_for_thread(
     hive_id: &str,
     writer: &str,
     thread_id: &str,
     ts: &str,
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
-    tagger: &DeterministicTaggerOutput,
+    tagger: &SemanticTaggerOutput,
+    api_key: &str,
+    semantic_tagger_config: &CognitionSemanticTaggerConfig,
     contexts: &HashMap<String, ContextState>,
     reasons: &HashMap<String, ReasonState>,
     active_scope: &Option<ScopeBindingState>,
     memories: &mut HashMap<String, MemoryState>,
     episodes: &mut HashMap<String, EpisodeState>,
-) -> Vec<(&'static str, Vec<u8>)> {
+) -> ThreadUpdateResult {
     let mut out = Vec::new();
     let Some(scope) = active_scope.as_ref() else {
-        return out;
+        return ThreadUpdateResult::default();
     };
     let Some(context) = contexts.get(&scope.dominant_context_label) else {
-        return out;
+        return ThreadUpdateResult::default();
     };
     let Some(reason) = reasons.get(&scope.dominant_reason_label) else {
-        return out;
+        return ThreadUpdateResult::default();
+    };
+
+    let episode_candidate = build_episode_candidate(tagger, context, reason);
+    let episode_existing = episode_candidate.as_ref().and_then(|candidate| {
+        let episode_key = format!("{}|{}", scope.scope_instance_id, candidate.affect_id);
+        episodes.get(&episode_key)
+    });
+
+    let narrative_result = match run_narrative_summarizer_ai(
+        narrative_summarizer_ai::NarrativeSummarizerAiInput {
+            api_key,
+            config: semantic_tagger_config,
+            thread_id,
+            context_label: &context.label,
+            context_tags: &context.tags,
+            reason_label: &reason.label,
+            canonical_signals: &reason.signals_canonical,
+            extra_signals: &tagger.reason_signals_extra,
+            previous_memory_summary: memories.get(&scope.scope_id).map(|m| m.summary.as_str()),
+            episode_affect_id: episode_candidate.as_ref().map(|c| c.affect_id.as_str()),
+            episode_title: episode_candidate.as_ref().map(|c| c.title.as_str()),
+            previous_episode_summary: episode_existing.map(|episode| episode.summary.as_str()),
+            previous_episode_reason: episode_existing.map(|episode| episode.reason.as_str()),
+        },
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                thread_id = %thread_id,
+                context = %context.label,
+                reason = %reason.label,
+                error = %err,
+                "sy.cognition narrative summarizer failed; skipping memory/episode synthesis for turn"
+            );
+            return ThreadUpdateResult {
+                envelopes: out,
+                narrative: NarrativeOutcome {
+                    called: true,
+                    failed: !matches!(
+                        err,
+                        fluxbee_ai_sdk::AiSdkError::Json(_)
+                            | fluxbee_ai_sdk::AiSdkError::Protocol(_)
+                    ),
+                    invalid_output: matches!(
+                        err,
+                        fluxbee_ai_sdk::AiSdkError::Json(_)
+                            | fluxbee_ai_sdk::AiSdkError::Protocol(_)
+                    ),
+                },
+            };
+        }
     };
 
     let current_ilk_weights = current_turn_ilk_weights(src_ilk, dst_ilk);
@@ -2416,13 +3450,30 @@ fn update_memories_and_episodes_for_thread(
         scope,
         context,
         reason,
+        &narrative_result.memory_summary,
         &current_ilk_weights,
         memories,
     ));
     out.extend(update_episodes_for_thread(
-        hive_id, writer, thread_id, ts, tagger, scope, context, reason, episodes,
+        hive_id,
+        writer,
+        thread_id,
+        ts,
+        episode_candidate,
+        &narrative_result,
+        scope,
+        context,
+        reason,
+        episodes,
     ));
-    out
+    ThreadUpdateResult {
+        envelopes: out,
+        narrative: NarrativeOutcome {
+            called: true,
+            failed: false,
+            invalid_output: false,
+        },
+    }
 }
 
 fn update_memories_for_thread(
@@ -2433,12 +3484,13 @@ fn update_memories_for_thread(
     scope: &ScopeBindingState,
     context: &ContextState,
     reason: &ReasonState,
+    narrative_summary: &str,
     current_ilk_weights: &BTreeMap<String, f64>,
     memories: &mut HashMap<String, MemoryState>,
 ) -> Vec<(&'static str, Vec<u8>)> {
     let mut out = Vec::new();
     let memory_key = scope.scope_id.clone();
-    let summary = summarize_scope_memory(context, reason);
+    let summary = narrative_summary.to_string();
     let memory = memories
         .entry(memory_key.clone())
         .or_insert_with(|| MemoryState {
@@ -2526,16 +3578,25 @@ fn update_episodes_for_thread(
     writer: &str,
     thread_id: &str,
     ts: &str,
-    tagger: &DeterministicTaggerOutput,
+    episode_candidate: Option<EpisodeCandidate>,
+    narrative_result: &narrative_summarizer_ai::NarrativeSummaries,
     scope: &ScopeBindingState,
     context: &ContextState,
     reason: &ReasonState,
     episodes: &mut HashMap<String, EpisodeState>,
 ) -> Vec<(&'static str, Vec<u8>)> {
     let mut out = Vec::new();
-    let Some(candidate) = build_episode_candidate(tagger, context, reason) else {
+    let Some(mut candidate) = episode_candidate else {
         return out;
     };
+    candidate.summary = narrative_result
+        .episode_summary
+        .clone()
+        .unwrap_or(candidate.summary);
+    candidate.reason = narrative_result
+        .episode_reason
+        .clone()
+        .unwrap_or(candidate.reason);
 
     let episode_key = format!("{}|{}", scope.scope_instance_id, candidate.affect_id);
     let episode = episodes.entry(episode_key).or_insert_with(|| EpisodeState {
@@ -2612,15 +3673,24 @@ fn update_episodes_for_thread(
     out
 }
 
-fn summarize_scope_memory(context: &ContextState, reason: &ReasonState) -> String {
-    format!(
+fn summarize_scope_memory(
+    context: &ContextState,
+    reason: &ReasonState,
+    reason_signals_extra: &[String],
+) -> String {
+    let mut summary = format!(
         "The thread recurrently centers on {} with a dominant drive of {}.",
         context.label, reason.label
-    )
+    );
+    if let Some(evidence_clause) = build_reason_signals_extra_clause(reason_signals_extra) {
+        summary.push(' ');
+        summary.push_str(&evidence_clause);
+    }
+    summary
 }
 
 fn build_episode_candidate(
-    tagger: &DeterministicTaggerOutput,
+    tagger: &SemanticTaggerOutput,
     context: &ContextState,
     reason: &ReasonState,
 ) -> Option<EpisodeCandidate> {
@@ -2642,6 +3712,7 @@ fn build_episode_candidate(
     let mut evidence_signals = Vec::new();
     let mut base_intensity = 0.0;
     let mut evidence_strength = 0.0;
+    let narrative_clause = build_reason_signals_extra_clause(&tagger.reason_signals_extra);
 
     if extra_signals.contains("frustration")
         && (canonical_signals.contains("challenge") || canonical_signals.contains("resolve"))
@@ -2697,6 +3768,13 @@ fn build_episode_candidate(
         return None;
     }
 
+    if let Some(clause) = narrative_clause {
+        summary.push(' ');
+        summary.push_str(&clause);
+        reason_text.push_str(". ");
+        reason_text.push_str(&clause);
+    }
+
     Some(EpisodeCandidate {
         affect_id: affect_id?,
         title,
@@ -2706,6 +3784,60 @@ fn build_episode_candidate(
         evidence_signals,
         reason: reason_text,
     })
+}
+
+fn build_reason_signals_extra_clause(reason_signals_extra: &[String]) -> Option<String> {
+    let normalized = dedup_reason_signal_extras(reason_signals_extra);
+    if normalized.is_empty() {
+        return None;
+    }
+    let descriptors = normalized
+        .iter()
+        .filter_map(|signal| match signal.as_str() {
+            "urgency" => Some("clear urgency"),
+            "frustration" => Some("visible frustration"),
+            "gratitude" => Some("moments of gratitude"),
+            "confusion" => Some("signs of confusion"),
+            "escalation" => Some("escalation pressure"),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if descriptors.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Narrative evidence includes {}.",
+        join_human_list(&descriptors)
+    ))
+}
+
+fn dedup_reason_signal_extras(reason_signals_extra: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for signal in reason_signals_extra {
+        let normalized = signal.trim().to_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+    out
+}
+
+fn join_human_list(values: &[&str]) -> String {
+    match values.len() {
+        0 => String::new(),
+        1 => values[0].to_string(),
+        2 => format!("{} and {}", values[0], values[1]),
+        _ => {
+            let mut out = values[..values.len() - 1].join(", ");
+            out.push_str(", and ");
+            out.push_str(values[values.len() - 1]);
+            out
+        }
+    }
 }
 
 fn build_scope_upsert_events(
@@ -2949,73 +4081,6 @@ fn update_ema(current: f64, new_value: f64, alpha: f64) -> f64 {
     }
 }
 
-fn normalize_text(text: &str) -> String {
-    text.to_ascii_lowercase()
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() {
-                ch
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-}
-
-fn tokenize(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
-fn matches_any_phrase(text: &str, phrases: &[&str]) -> bool {
-    phrases.iter().any(|phrase| text.contains(phrase))
-}
-
-fn add_tag_if_matches(tags: &mut Vec<String>, tokens: &[String], lexicon: &[&str], label: &str) {
-    if tokens
-        .iter()
-        .any(|token| lexicon.iter().any(|candidate| candidate == token))
-    {
-        tags.push(label.to_string());
-    }
-}
-
-fn dedup_limit(values: Vec<String>, limit: usize) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for value in values {
-        if value.trim().is_empty() || !seen.insert(value.clone()) {
-            continue;
-        }
-        out.push(value);
-        if out.len() >= limit {
-            break;
-        }
-    }
-    out
-}
-
-fn fallback_tags(tokens: &[String], limit: usize) -> Vec<String> {
-    let stopwords: HashSet<&str> = [
-        "a", "an", "and", "are", "as", "at", "be", "but", "by", "do", "for", "from", "how", "i",
-        "if", "in", "is", "it", "me", "my", "of", "on", "or", "our", "please", "so", "that", "the",
-        "this", "to", "we", "what", "why", "you", "your",
-    ]
-    .into_iter()
-    .collect();
-    dedup_limit(
-        tokens
-            .iter()
-            .filter(|token| token.len() >= 4 && !stopwords.contains(token.as_str()))
-            .cloned()
-            .collect(),
-        limit,
-    )
-}
-
 fn persist_local_openai_api_key(
     node_name: &str,
     api_key: &str,
@@ -3047,6 +4112,15 @@ fn load_local_openai_api_key(node_name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn resolve_openai_api_key(node_name: &str) -> Option<String> {
+    load_local_openai_api_key(node_name).or_else(|| {
+        std::env::var("OPENAI_API_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
 fn resolve_openai_api_key_source(node_name: &str) -> CognitionAiSecretSource {
     if load_local_openai_api_key(node_name).is_some() {
         return CognitionAiSecretSource::LocalFile;
@@ -3060,17 +4134,6 @@ fn resolve_openai_api_key_source(node_name: &str) -> CognitionAiSecretSource {
         return CognitionAiSecretSource::EnvCompat;
     }
     CognitionAiSecretSource::Missing
-}
-
-fn legacy_context_thread_id(msg: &Message) -> Option<String> {
-    msg.meta
-        .context
-        .as_ref()
-        .and_then(|value| value.get("thread_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
 }
 
 fn load_hive(config_dir: &Path) -> Result<HiveFile, CognitionError> {
@@ -3127,4 +4190,100 @@ fn write_json_atomic(path: &Path, body: &str) -> Result<(), CognitionError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarize_scope_memory_includes_reason_signal_evidence_clause() {
+        let context = ContextState {
+            context_id: "context:1".to_string(),
+            label: "billing".to_string(),
+            tags: vec!["billing".to_string()],
+            score: 1.0,
+            weight: 1.0,
+            weight_avg_cumulative: 1.0,
+            weight_avg_ema: 1.0,
+            weight_samples: 1,
+            occurrences: 1,
+            opened_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            closed_at: None,
+            status: "open".to_string(),
+        };
+        let reason = ReasonState {
+            reason_id: "reason:1".to_string(),
+            label: "seeking urgent resolution".to_string(),
+            signals_canonical: vec!["resolve".to_string(), "challenge".to_string()],
+            signals_extra: vec!["urgency".to_string(), "frustration".to_string()],
+            score: 1.0,
+            weight: 1.0,
+            weight_avg_cumulative: 1.0,
+            weight_avg_ema: 1.0,
+            weight_samples: 1,
+            occurrences: 1,
+            opened_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            closed_at: None,
+            status: "open".to_string(),
+        };
+
+        let summary = summarize_scope_memory(
+            &context,
+            &reason,
+            &["urgency".to_string(), "frustration".to_string()],
+        );
+        assert!(summary.contains("Narrative evidence includes"));
+        assert!(summary.contains("clear urgency"));
+        assert!(summary.contains("visible frustration"));
+    }
+
+    #[test]
+    fn build_episode_candidate_uses_reason_signal_extras_as_narrative_evidence() {
+        let tagger = SemanticTaggerOutput {
+            tags: vec!["billing".to_string()],
+            reason_signals_canonical: vec!["resolve".to_string(), "challenge".to_string()],
+            reason_signals_extra: vec!["frustration".to_string(), "escalation".to_string()],
+        };
+        let context = ContextState {
+            context_id: "context:1".to_string(),
+            label: "billing".to_string(),
+            tags: vec!["billing".to_string()],
+            score: 1.0,
+            weight: 1.0,
+            weight_avg_cumulative: 1.0,
+            weight_avg_ema: 1.0,
+            weight_samples: 1,
+            occurrences: 1,
+            opened_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            closed_at: None,
+            status: "open".to_string(),
+        };
+        let reason = ReasonState {
+            reason_id: "reason:1".to_string(),
+            label: "confrontational pushback".to_string(),
+            signals_canonical: vec!["challenge".to_string()],
+            signals_extra: vec!["frustration".to_string(), "escalation".to_string()],
+            score: 1.0,
+            weight: 1.0,
+            weight_avg_cumulative: 1.0,
+            weight_avg_ema: 1.0,
+            weight_samples: 1,
+            occurrences: 1,
+            opened_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            closed_at: None,
+            status: "open".to_string(),
+        };
+
+        let candidate = build_episode_candidate(&tagger, &context, &reason).expect("candidate");
+        assert!(candidate.summary.contains("Narrative evidence includes"));
+        assert!(candidate.reason.contains("Narrative evidence includes"));
+        assert!(candidate
+            .evidence_signals
+            .contains(&"frustration".to_string()));
+    }
 }

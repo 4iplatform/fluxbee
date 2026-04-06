@@ -494,6 +494,7 @@ mod tests {
     fn rejects_total_size_limit() {
         let (toolkit, _root) = test_toolkit();
         let cfg = IoTextBlobConfig {
+            max_attachment_bytes: 100,
             max_total_attachment_bytes: 150,
             ..IoTextBlobConfig::default()
         };

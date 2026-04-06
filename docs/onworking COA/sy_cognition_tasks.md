@@ -5,14 +5,14 @@ Spec fuente: [`docs/12-cognition-v2.md`](/Users/cagostino/Documents/GitHub/fluxb
 
 ## 0) Estado real de partida
 
-Hoy `SY.cognition` ya existe como skeleton/binario implementado en el repo, pero todavía no completa el pipeline cognitivo v2.
+Hoy `SY.cognition` ya existe como servicio funcional implementado en el repo y ya completa el pipeline cognitivo v2 actualmente definido.
 
 Estado observado del sistema:
 - ya existe `src/bin/sy_cognition.rs`
-- no existe `jsr-memory` implementado en código
-- no existe `memory_package` v2 implementado en router
-- no existe `compute_thread_id(...)` en SDK
-- el protocolo activo sigue anclado en `ctx`, `ctx_seq`, `ctx_window`
+- `jsr-memory` ya existe como SHM real y writer/readers operativos
+- `memory_package` v2 ya se arma en router y se adjunta en entrega local
+- `compute_thread_id(...)` ya existe en SDK/IO
+- el protocolo/core ya modela `thread_id`, `thread_seq` y `memory_package` v2 como carrier canónico
 - los AI nodes hoy manejan memoria inmediata y `thread_state` con key canónico `src_ilk`
 - `storage.events`, `storage.items`, `storage.reactivation` responden al modelo cognitivo viejo, no al modelo v2 consolidado
 
@@ -28,9 +28,9 @@ Alcance funcional real por olas:
   - escribe `jsr-memory`
   - enriquece entrega real por router
 - pero esa ola **no agota** cognition:
-  - el tagger actual es lexical/determinístico
-  - la lectura semántica profunda del contenido del mensaje todavía no está resuelta
-  - la narrativa de memories/episodes sigue siendo v1 determinística
+  - la lectura semántica profunda y la narrativa v2 ya están activas bajo AI
+  - no quedó un fallback lexical operativo en el producto
+  - lo pendiente pasa más por endurecimiento, corpus y operación
 - dicho de otra manera:
   - la ola actual evita que cognition sea un simple pasamanos de mensajes
   - pero todavía no es la etapa semántica/plena de análisis de contenido
@@ -86,29 +86,24 @@ Regla arquitectónica:
 
 ### 3.1 Protocolo
 
-- [`docs/02-protocolo.md`](/Users/cagostino/Documents/GitHub/fluxbee/docs/02-protocolo.md) sigue modelando:
-  - `ctx`
-  - `ctx_seq`
-  - `ctx_window`
-  - `memory_package` viejo
-- v2 necesita:
-  - `thread_id` canónico
-  - `thread_seq` canónico
-  - nuevo `memory_package`
-  - eventualmente `reason`/`context` cognitivos, no `ctx` legacy
+- el carrier canónico ya quedó en:
+  - `thread_id`
+  - `thread_seq`
+  - `memory_package` v2
+- `ctx`, `ctx_seq`, `ctx_window` sobreviven solo como fields legacy/históricos del protocolo, no como forma activa de trabajo del repo
+- falta terminar de barrer documentación residual v1 para no mezclar semánticas
 
 ### 3.2 Router
 
-- hoy no existe reader de `jsr-memory`
-- hoy no existe ensamblado real de `memory_package`
-- hay que decidir qué queda del carrier viejo (`ctx_window`) y qué deja de producir router
+- el router ya tiene reader de `jsr-memory`
+- el router ya ensambla y adjunta `memory_package` v2
+- el router ya no produce ni consume `ctx_window` como mecanismo runtime del repo
 
 ### 3.3 SDKs
 
-- falta `compute_thread_id(...)`
-- falta modelado canónico de `thread_id`
-- falta modelado canónico de `thread_seq`
-- falta contrato de `memory_package` v2
+- el SDK ya modela `thread_id`, `thread_seq` y `memory_package` v2
+- los SDKs/runtime AI del repo ya no leen compat legacy desde `meta.context` para thread/state
+- falta solo seguir endureciendo/explicitar en docs qué shapes v1 quedan como históricos
 - falta contrato canónico para turn/event payloads que cognition va a consumir/producir
 
 ### 3.4 IO nodes
@@ -183,13 +178,14 @@ Para v1 de ejecución:
   - `tags`
   - `reason_signals_canonical`
   - `reason_signals_extra`
-- implementación inicial determinística/lexical del tagger
+- implementación inicial del tagger ya reemplazada por el path AI de producto
 - reason evaluator determinístico sobre las 8 commandments
 
 Segunda etapa explícita sobre el mismo contrato:
-- tagger AI/semántico para extraer `tags` y reason signals con mejor recall
+- tagger AI/semántico obligatorio para extraer `tags` y reason signals con mejor recall
 - análisis narrativo del contenido para memories/summaries sin cambiar las entidades v2
 - el salto de v1 determinística a v2 semántica debe cambiar el motor, no el carrier ni el durable model
+- en `M11` el objetivo ya no es sostener un fallback de producto alternativo para semántica
 
 Consecuencia importante:
 - si no se hace esta segunda etapa, cognition queda funcional y útil, pero con comprensión semántica acotada
@@ -293,7 +289,7 @@ Nota práctica:
 Estado actual de cierre de `M1`:
 - `Meta` del SDK/core ya modela `thread_id`, `thread_seq`, `dst_ilk`, `ich`, `ctx*` legacy y `memory_package`.
 - `docs/12-cognition-v2.md` y `docs/02-protocolo.md` ya reflejan el carrier v2.
-- los paths IO nuevos ya pueden emitir `meta.thread_id` canónico y los AI nodes leen `meta.thread_id` con fallback legacy a `context.thread_id`.
+- los paths IO nuevos ya emiten `meta.thread_id` canónico y los AI nodes del repo leen solo `meta.thread_id` top-level.
 - la asignación real de `thread_seq` ya quedó en el router por `thread_id`; la validación completa del root workspace sigue bloqueada externamente por `protoc` en `lance`.
 
 Salida:
@@ -321,14 +317,12 @@ Estado actual de `M2`:
   - `PersistentChannel` cuando no existe `thread_ts`
 - `io-sim` ya genera `thread_id` canónico por defecto y mantiene `SIM_THREAD_ID` solo como override explícito.
 - `SY.architect` ya emite `meta.thread_id` y `meta.ich` en el path de impersonation chat, en vez de depender solo de `meta.context`.
-- el router ya asigna `thread_seq` cuando el mensaje entra sin secuencia usando `meta.thread_id` o fallback legacy a `context.thread_id`.
+- el router ya asigna `thread_seq` cuando el mensaje entra sin secuencia usando solo `meta.thread_id` canónico.
 - hay tests de hash/compat en `fluxbee_sdk` y tests de sequencing en router; correrlos en el root workspace sigue bloqueado externamente por `protoc` en `lance`.
 
 Compatibilidad legacy todavía abierta y a cerrar:
-- el router todavía tiene fallback a `meta.context.thread_id` cuando falta `meta.thread_id`.
-- ese fallback existe solo para transición/migración.
-- debe removerse cuando los productores vivos ya no dependan del carrier legacy.
-- ese cierre queda explícitamente diferido a `COG-M9`.
+- no queda fallback runtime del repo a `meta.context.thread_id` en IO/AI/SDK/router.
+- `meta.context.thread_id` queda solo como residuo documental/histórico en notas viejas o payloads de compat ya persistidos, no como carrier leído por paths activos.
 
 Salida:
 - todo turn nuevo relevante ya nace con `thread_id`.
@@ -461,7 +455,7 @@ Estado actual:
   - `storage.cognition.contexts`
   - `storage.cognition.reasons`
   - `storage.cognition.cooccurrences`
-- el tagger v1 actual es determinístico/lexical; la mejora futura a AI tagger queda abierta sin cambiar el contrato
+- el tagger de producto actual es AI-backed; la mejora futura queda en calidad, corpus y operación sin cambiar el contrato
 - `M5` queda cerrado con co-ocurrencias explícitas thread-scoped; el siguiente frente real ya es `M6+`
 
 Límite explícito de esta fase:
@@ -537,20 +531,36 @@ Estado actual:
 
 ### Fase COG-M9 - Alineación con AI runtime y compat controlada
 
-- [ ] COG-M9-T1. Alinear docs y runtime AI:
+- [x] COG-M9-T1. Alinear docs y runtime AI:
   - `thread_id` = metadata
   - `src_ilk` = key canónico de state/immediate memory
-- [ ] COG-M9-T2. Garantizar que `memory_package` no rompe prompts/configs vigentes.
-- [ ] COG-M9-T3. Revisar `AI.frontdesk.gov` y otros nodos que hoy dependen de `thread_state`.
-- [ ] COG-M9-T4. Definir carrier legacy de compat para paths que todavía lean `ctx`.
-- [ ] COG-M9-T5. Remover gradualmente producción canónica de `ctx*` en nuevos paths.
+- [x] COG-M9-T2. Garantizar que `memory_package` no rompe prompts/configs vigentes.
+- [x] COG-M9-T3. Revisar `AI.frontdesk.gov` y otros nodos que hoy dependen de `thread_state`.
+- [x] COG-M9-T4. Definir carrier legacy de compat para paths que todavía lean `ctx`.
+- [x] COG-M9-T5. Remover gradualmente producción canónica de `ctx*` en nuevos paths.
+
+Estado actual:
+- `AI.frontdesk.gov` y `ai-generic` ya tratan:
+  - `thread_id` como metadata conversacional
+  - `src_ilk` como key canónica de state/immediate memory
+- los runners AI del repo ya no leen compat legacy desde `meta.context` para `thread_id` ni `src_ilk`
+- los thread-state tools del AI SDK aceptan solo `state_key` como argumento canónico
+  - `thread_id` ya no existe como alias aceptado
+  - en runtimes scoped el provider fija el key real a `src_ilk`
+- los replies nuevos del AI SDK ya no reemiten:
+  - `thread_seq`
+  - `ctx`
+  - `ctx_seq`
+  - `ctx_window`
+  - `memory_package`
+- con esto, los paths nuevos de AI dejan de seguir propagando `ctx*` como carrier canónico y el SDK/runners del repo ya no toleran lectura legacy para thread/state
 
 ### Fase COG-M10 - Cold start, rebuild y cierre de migración
 
-- [ ] COG-M10-T1. Implementar rebuild desde storage durable.
-- [ ] COG-M10-T2. Regenerar `jsr-memory` desde durable.
-- [ ] COG-M10-T3. Definir criterio de corrupción/rebuild local.
-- [~] COG-M10-T4. E2E completo:
+- [x] COG-M10-T1. Implementar rebuild desde storage durable.
+- [x] COG-M10-T2. Regenerar `jsr-memory` desde durable.
+- [x] COG-M10-T3. Definir criterio de corrupción/rebuild local.
+- [x] COG-M10-T4. E2E completo:
   - message real por router
   - `thread_id/thread_seq` en carrier real
   - tagger
@@ -560,11 +570,48 @@ Estado actual:
   - episode
   - SHM
   - router enrichment
-- [ ] COG-M10-T5. Remoción formal de mecanismos viejos:
+- [x] COG-M10-T5. Remoción formal de mecanismos viejos:
   - `ctx` como unidad cognitiva canónica
   - shapes/documentación v1 incompatibles
+- [x] COG-M10-T6. Implementar rebuild acotado + hot set de `jsr-memory` para escala:
+  - `SY.cognition` ya no intenta volcar todo el universo de threads a SHM
+  - `jsr-memory` se construye como hot set bounded por `MEMORY_MAX_DATA_SIZE`
+  - prioridad de selección actual:
+    - threads con `active_scope`
+    - mayor cantidad de entidades vivas (`contexts/reasons/cooccurrences` abiertos + memories/episodes)
+    - recencia por `last_seen_at`
+    - `latest_thread_seq`
+    - `turn_count`
+  - si un thread no entra por capacidad, se poda del snapshot SHM y queda fuera del hot set
+  - el rebuild de startup desde durable ya no rehidrata todo el hive en memoria: primero calcula ese mismo hot set y luego solo restaura esos threads
+  - el estado operativo ahora expone métricas de SHM (`hot_threads_total`, `pruned_threads_total`, `payload_bytes`, `last_sync_status`)
+  - nota: esta primera implementación hace el bounding en runtime después de leer durable; no hay todavía filtro SQL-side / query-side en PostgreSQL
+- [ ] COG-M10-T7. Pushdown SQL del hot set para cold start grande:
+  - hoy `SY.cognition` lee durable completo del hive y recién después aplica el hot set en runtime
+  - siguiente paso: mover parte de esa selección al query plan SQL para bajar costo de rebuild
+  - primer filtro a estudiar:
+    - threads con `active_scope`
+    - threads asociados a `scope_instances` abiertos
+    - threads con actividad reciente por `last_seen_at` / `updated_at`
+  - segundo filtro:
+    - ventana temporal configurable
+    - límite de cardinalidad previo al rebuild en memoria
+  - objetivo:
+    - reducir lecturas PostgreSQL en cold start grande
+    - mantener `jsr-memory` y rebuild local alineados con el mismo hot set
+  - nota:
+    - esto es optimización de escala, no requisito para el piloto alpha actual
 
 Estado actual:
+- `SY.cognition` ya intenta rebuild en startup desde durable (`cognition_*` en PostgreSQL vía `SY.storage`) cuando el estado local en memoria está vacío
+- el rebuild rehidrata `thread/context/reason/cooccurrence/scope/scope_instance/memory/episode` y vuelve a escribir `jsr-memory`
+- el criterio actual de cold start es fail-open:
+  - si ya hay estado local en memoria, no rebuilda
+  - si falta la configuración durable o PostgreSQL no responde, deja status de rebuild y sigue live
+  - si rebuilda bien, publica métricas/último estado de rebuild en `STATUS` y `CONFIG_GET`
+- limitación explícita a revisar después:
+  - hoy el query-side rebuild sigue leyendo durable completo del hive y recién después aplica el hot set en runtime
+  - el backlog concreto para eso es `COG-M10-T7` (pushdown SQL / filtro SQL-side del hot set)
 - el E2E canónico ya quedó redirigido al path real por router con nodos disposable
 - se removió el smoke viejo por publish directo a `storage.turns` para no dejar una ruta muerta o engañosa en el repo
 - [`cognition_shm_dump.rs`](/Users/cagostino/Documents/GitHub/fluxbee/src/bin/cognition_shm_dump.rs) queda como herramienta de diagnóstico puntual de SHM, no como E2E
@@ -579,12 +626,12 @@ Rediseño acordado de `COG-M10-T4`:
   - `jsr-memory`
 
 Subtareas nuevas de `COG-M10-T4`:
-- [ ] COG-M10-T4a. Crear nodo `IO.test.cognition@<hive>` o emisor disposable equivalente que entre por router/socket normal.
-- [ ] COG-M10-T4b. Crear nodo `AI.test.cognition@<hive>` o receptor disposable equivalente que capture el mensaje entregado.
-- [ ] COG-M10-T4c. Validar que el router asigna `thread_seq` en el carrier real.
-- [ ] COG-M10-T4d. Validar que `SY.cognition` procesa el turn real y sube contadores (`processed_turns_total`, `published_entities_total`).
-- [ ] COG-M10-T4e. Validar que `jsr-memory` contiene `memory_package` para ese `thread_id`.
-- [ ] COG-M10-T4f. Validar que el nodo destino recibe el mensaje enriquecido con `memory_package`.
+- [x] COG-M10-T4a. Crear nodo `IO.test.cognition@<hive>` o emisor disposable equivalente que entre por router/socket normal.
+- [x] COG-M10-T4b. Crear nodo `AI.test.cognition@<hive>` o receptor disposable equivalente que capture el mensaje entregado.
+- [x] COG-M10-T4c. Validar que el router asigna `thread_seq` en el carrier real.
+- [x] COG-M10-T4d. Validar que `SY.cognition` procesa el turn real y sube contadores (`processed_turns_total`, `published_entities_total`).
+- [x] COG-M10-T4e. Validar que `jsr-memory` contiene `memory_package` para ese `thread_id`.
+- [x] COG-M10-T4f. Validar que el nodo destino recibe el mensaje enriquecido con `memory_package`.
 
 Estado actual:
 - [x] `IO.test.cognition` creado en [`nodes/test/io-test-cognition`](/Users/cagostino/Documents/GitHub/fluxbee/nodes/test/io-test-cognition)
@@ -609,6 +656,13 @@ Hallazgo de la corrida real:
 - la secuencia `1 -> 3` es consistente con el harness actual porque el reply del nodo receptor reutiliza el mismo `thread_id`, por lo que el router consume `thread_seq=2` en ese reply intermedio
 - esto confirma monotonicidad por thread; no implica salto espurio del router
 
+Estado actual de `COG-M10-T5`:
+- las rutas runtime activas del repo ya no usan `ctx` como unidad cognitiva canónica
+- `ctx`, `ctx_seq`, `ctx_window` quedan solo como fields legacy/históricos en `Meta`
+- el router ya no documenta ni implementa `ctx_window` como enrichment operativo
+- `12-cognition-v1.md` y `12-cognition-v2-BETA.md` quedan marcados como material histórico/superseded
+- `storage.events/items/reactivation` siguen existiendo en `SY.storage` como contrato viejo, pero ya no se describen como camino canónico de cognition v2
+
 ### Fase COG-M11 - Segunda etapa semántica: AI tagger + análisis narrativo
 
 Definición de alcance:
@@ -616,50 +670,131 @@ Definición de alcance:
 - sin `M11`, el sistema ya clasifica, agrupa, periodiza y enriquece, pero lo hace con una semántica v1 todavía limitada
 - `M11` es la fase que completa el tratamiento del contenido del mensaje como problema cognitivo de primer orden
 - por eso debe pensarse como segunda gran ola del proyecto, no como ajuste fino posterior
+- para la arquitectura objetivo de `M11`, cognition semántico pasa a ser **AI-backed y AI-required**
+- el tagger/summarizer determinístico actual no se considera fallback oficial de producto para esta etapa
+- ese código se conserva solo como bootstrap transitorio, encapsulado y fácil de remover durante la migración
 
-- [ ] COG-M11-T1. Diseñar contrato operacional del `AI.tagger` sin cambiar `tags/reason_signals_*`.
-- [ ] COG-M11-T2. Separar explícitamente `tagger v1 lexical` de `tagger v2 semantic/AI` con feature flag o config de provider.
-- [ ] COG-M11-T3. Mejorar extracción semántica de `tags`:
+- [x] COG-M11-T1. Diseñar contrato operacional del `AI.tagger` sin cambiar `tags/reason_signals_*`:
+  - `AI.tagger` queda como componente interno de `SY.cognition`, no como nodo separado ni subject NATS propio
+  - hace una llamada AI por turn para extracción semántica, antes del evaluador estructural
+  - input operacional mínimo:
+    - `text`
+    - `word_count`
+    - `max_tags`
+    - `max_reason_signals`
+    - lista cerrada de `canonical_signals`
+    - hints opcionales de canal/identidad (`src_ilk`, `dst_ilk`, `ich`) solo como metadata auxiliar, no como parte del contrato semántico durable
+  - output operacional mínimo:
+    - `tags`
+    - `reason_signals_canonical`
+    - `reason_signals_extra`
+  - post-proceso obligatorio backend:
+    - lowercase
+    - trim
+    - dedup
+    - limit
+    - filtro estricto de `reason_signals_canonical` contra el set cerrado de 8 señales
+  - si la respuesta AI viene vacía, inválida o fuera de contrato:
+    - se cuenta como failure del `AI.tagger`
+    - no cambia carrier ni durable model
+    - `SY.cognition` queda degradado para semántica de ese turn; no hace fallback silencioso como camino oficial
+  - configuración operacional ya expuesta en `SY.cognition`:
+    - provider
+    - model
+    - timeout
+    - temperatura baja / fija
+    - límites de salida (`max_tags`, `max_reason_signals`)
+    - secreto AI canónico en `config.secrets.openai.api_key`
+  - observabilidad mínima ya expuesta en `STATUS/CONFIG_GET`:
+    - `semantic_tagger_calls_total`
+    - `semantic_tagger_failures_total`
+    - `semantic_tagger_invalid_outputs_total`
+    - `last_semantic_model`
+    - `narrative_summarizer_calls_total`
+    - `narrative_summarizer_failures_total`
+    - `narrative_summarizer_invalid_outputs_total`
+    - `last_narrative_model`
+    - `degraded_semantics_policy`
+- [x] COG-M11-T2. Reemplazar el rol central del tagger lexical por `AI.tagger` como motor semántico oficial:
+  - sin feature flag de fallback de producto
+  - sin dualidad permanente `lexical|semantic`
+  - estado actual de implementación:
+    - `SY.cognition` ya expone `config.semantic_tagger.*` en `CONFIG_GET/CONFIG_SET`
+    - `STATUS/CONFIG_GET` ya exponen contadores y estado del `semantic_tagger`
+    - el path central del turn ahora usa llamada AI real por `OpenAiResponsesClient`
+    - el runtime ya no conserva ningún bootstrap semántico alternativo como path activo
+- [x] COG-M11-T3. Mejorar extracción semántica de `tags`:
   - sinonimia
   - paráfrasis
   - intents implícitos
   - entidades blandas del relato
-- [ ] COG-M11-T4. Mejorar extracción semántica de `reason_signals_canonical`:
+  - implementación actual:
+    - prompt de `AI.tagger` reforzado con guías de calidad para tags semánticos
+    - ejemplos operativos para inferir dominio/intento aunque no esté literal en el texto
+    - post-proceso backend para limpiar tags genéricos/ruidosos y normalizar labels cortos
+- [x] COG-M11-T4. Mejorar extracción semántica de `reason_signals_canonical`:
   - mejor recall sobre mandato implícito
   - mejor discriminación entre `request/resolve/challenge/protect`
-- [ ] COG-M11-T5. Usar `reason_signals_extra` como evidencia narrativa real para memory fusion, no solo como bolsa de strings.
-- [ ] COG-M11-T6. Introducir summarizer narrativo v2 para memories/episodes:
+  - implementación actual:
+    - prompt de `AI.tagger` reforzado con definiciones explícitas para las 8 señales
+    - ejemplos de discriminación por intención comunicativa y no solo por surface words
+    - canonicalización backend de aliases/sinónimos antes del filtro cerrado de 8 señales
+- [x] COG-M11-T5. Usar `reason_signals_extra` como evidencia narrativa real para memory fusion, no solo como bolsa de strings.
+  - implementación actual:
+    - `reason_signals_extra` ya alimenta el summary de memories mediante cláusulas narrativas explícitas
+    - `reason_signals_extra` también refuerza `summary` y `reason` de episodios, no solo el trigger/gate
+    - el esquema durable no cambia; la mejora vive en la síntesis narrativa del contenido
+- [x] COG-M11-T6. Introducir summarizer narrativo v2 para memories/episodes:
   - resumen más fiel del contenido del thread
   - continuidad temporal
   - síntesis de contexto + razón + evidencia textual
-- [ ] COG-M11-T7. Definir corpus/golden tests para comparar v1 lexical vs v2 semantic.
-- [ ] COG-M11-T8. Definir política de rollback:
-  - si falla el provider AI, cae a tagger/summarizer v1 sin romper el contrato
+  - implementación actual:
+    - una llamada AI interna sintetiza `memory_summary` y, si aplica, `episode_summary` + `episode_reason`
+    - la entrada incluye continuidad con summaries previos para evitar resets narrativos por turn
+    - el gate estructural del episodio sigue determinístico; mejora solo la síntesis narrativa
+    - si el summarizer AI falla, el turn queda degradado para narrativa y no hace fallback silencioso a otro summarizer
+- [x] COG-M11-T7. Definir corpus/golden tests para validar calidad semántica del `AI.tagger` y del summarizer v2.
+  - implementación actual:
+    - corpus versionado en `src/bin/sy_cognition/golden_corpus.json`
+    - golden tests automáticos para `AI.tagger` sobre normalización/contracto semántico
+    - golden tests automáticos para el summarizer narrativo sobre fragments mínimos esperados
+    - estos tests no llaman al provider live; sirven como baseline reproducible de contrato/calidad mínima
+- [x] COG-M11-T8. Definir política operacional cuando AI no esté disponible:
+  - `SY.cognition` queda degradado para semántica profunda
+  - no debe hacer rollback silencioso a un path semántico alternativo como comportamiento oficial de producto
+  - el carrier y durable model no cambian; cambia solo la capacidad de producir enriquecimiento semántico nuevo
+  - implementación actual:
+    - `STATUS/CONFIG_GET` exponen `degraded_semantics_policy`
+    - sin AI secret: el turno no produce nuevas derivaciones semánticas y el nodo sigue fail-open
+    - si falla `AI.tagger`: se omite la derivación semántica del turn
+    - si falla el summarizer narrativo: se omite la actualización narrativa del turn
+    - no hay fallback silencioso de producto cuando AI no está disponible
 
 Objetivo:
 - tratar el análisis de contenido del mensaje como una segunda ola explícita
 - mantener estable el pipeline y el durable model ya cerrados
 - mejorar calidad semántica sin volver a abrir `thread/context/reason/scope/memory/episode`
 - dejar documentado que, hasta completar esta fase, cognition no debe venderse internamente como análisis semántico pleno sino como v2 estructural + enrichment operativo
+- dejar documentado que la semántica de producto ya es AI-only y sin fallback silencioso
 
 ---
 
 ## 6) Sistemas a tocar
 
-Este cambio no es solo un nuevo binario. Toca como mínimo:
+Este cambio no fue solo un nuevo binario. La ola efectivamente tocó:
 
-- [ ] `docs/12-cognition-v2.md`
-- [ ] `docs/02-protocolo.md`
-- [ ] `docs/03-shm.md`
-- [ ] `docs/13-storage.md`
-- [ ] `docs/AI_nodes_spec.md`
-- [ ] IO docs/runtime specs
-- [ ] `crates/fluxbee_sdk`
-- [ ] SDK/runtime helpers de AI si corresponde
-- [ ] router
-- [ ] `SY.storage`
-- [ ] `SY.cognition` nuevo
-- [ ] AI nodes que consumen metadata conversacional
+- [x] `docs/12-cognition-v2.md`
+- [x] `docs/02-protocolo.md`
+- [x] `docs/03-shm.md`
+- [x] `docs/13-storage.md`
+- [x] `docs/AI_nodes_spec.md`
+- [x] IO docs/runtime specs
+- [x] `crates/fluxbee_sdk`
+- [x] SDK/runtime helpers de AI
+- [x] router
+- [x] `SY.storage`
+- [x] `SY.cognition`
+- [x] AI nodes que consumen metadata conversacional
 
 ---
 

@@ -348,7 +348,12 @@ mod tests {
             panic!("unexpected outcome: {o:?}");
         };
 
-        assert_eq!(msg.meta.src_ilk.as_deref(), Some("ilk:test"));
+        assert!(
+            msg.meta
+                .src_ilk
+                .as_deref()
+                .is_some_and(|value| value.starts_with("ilk:mock:"))
+        );
         assert_no_legacy_context_src_ilk(&msg);
 
         let rt = msg

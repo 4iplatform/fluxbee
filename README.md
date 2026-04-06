@@ -879,6 +879,37 @@ Recommended for every new node/scaffold:
 - keep it enabled unless the runtime provides a custom status handler with the same contract.
 - this makes `GET /hives/{hive}/nodes/{name}/status` report `health_source=NODE_REPORTED` in normal operation.
 
+### Cognitive data access: carrier vs NATS vs SHM
+
+For the current cognition v2 implementation, cognitive data is exposed in three different ways:
+
+1. Message carrier, automatic for normal nodes:
+   - `meta.thread_id`
+   - `meta.thread_seq`
+   - `meta.memory_package` when local router enrichment finds data for that thread
+2. NATS durable streams, explicit subscription required:
+   - `storage.turns`
+   - `storage.cognition.*`
+3. Local SHM (`jsr-memory-<hive>`), not a normal application-node contract:
+   - written by `SY.cognition`
+   - read by router for enrichment
+   - suitable for diagnostics/admin tooling, not as the default path for AI/IO nodes
+
+Practical rule:
+
+- If you are writing a normal AI/IO/WF node, consume cognitive context from the delivered message (`meta.thread_id`, `meta.thread_seq`, `meta.memory_package`).
+- If you need raw durable cognition entities or replay semantics, subscribe explicitly with `fluxbee_sdk::nats`.
+- Do not assume that `storage.cognition.*` or SHM content is injected automatically into every node message.
+- Do not use PostgreSQL as the primary integration surface for normal nodes.
+
+Today the canonic cognition boundary is:
+
+- router publishes immutable input to `storage.turns`
+- `SY.cognition` consumes `storage.turns`
+- `SY.cognition` publishes derived durable entities to `storage.cognition.*`
+- `SY.storage` consumes those durable streams
+- router reads `jsr-memory` and attaches `memory_package` on local delivery
+
 #### Admin internal gateway from SDK (`ADMIN_COMMAND`)
 
 Use this when a node/workflow needs to call `SY.admin` without HTTP (socket/WAN path):

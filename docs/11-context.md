@@ -252,13 +252,13 @@ El mensaje que el **router** entrega al nodo destino (con ctx_window):
 | `src_ilk` | string | Sí | ILK que envía el mensaje |
 | `dst_ilk` | string | No | ILK destino (si se conoce) |
 | `ich` | string | Sí | Canal por el cual llegó/sale el mensaje |
-| `ctx` | string | Sí | Context ID (calculado de src_ilk + ich) |
-| `ctx_seq` | integer | Sí | Último seq conocido de este contexto |
-| `ctx_window` | array | Sí* | Últimos 20 turns. *Agregado por el router |
+| `ctx` | string | Legacy | Context ID del modelo anterior |
+| `ctx_seq` | integer | Legacy | Secuencia del modelo anterior |
+| `ctx_window` | array | Legacy | Historia reciente del modelo anterior |
 
 ### 5.3 ctx_window — Historia Reciente
 
-El **router** agrega `ctx_window` al mensaje antes de hacer forward:
+En el modelo histórico, el **router** agregaba `ctx_window` al mensaje antes de hacer forward:
 
 ```
 ctx_window = últimos 20 turns del contexto (o menos si hay menos)
@@ -867,3 +867,4 @@ Pero empezamos con PostgreSQL solo.
 | Estructura de mensaje | `02-protocolo.md` |
 | Router | `04-routing.md` |
 | Operaciones | `07-operaciones.md` |
+> Historical document from the older CTX/ctx_window model. The active conversational carrier in the repo is now based on `meta.thread_id` / `meta.thread_seq`; `ctx*` remains only as legacy protocol surface.

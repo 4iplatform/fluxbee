@@ -9,7 +9,54 @@ Expone cuatro bloques principales:
 - thread state tools/store
 - memoria inmediata de conversación para continuidad entre turns
 
+Regla canónica actual:
+
+- `thread_id` llega al nodo AI como metadata conversacional
+- `src_ilk` sigue siendo la key canónica de state/immediate memory en runtimes AI
+- los thread-state tools quedan por compatibilidad de nombre, pero en runtimes scoped operan sobre `src_ilk`
+- `thread_id` sigue disponible como metadata conversacional
+
 La spec de memoria inmediata vive en [docs/immediate-conversation-memory-spec.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/immediate-conversation-memory-spec.md).
+
+## Cognitive input boundary for AI nodes
+
+Para un nodo AI normal, cognition no entra por una única vía.
+
+### Lo que llega automáticamente en el mensaje
+
+Si el router tiene enrichment disponible para ese thread, el nodo recibe en `meta`:
+
+- `thread_id`
+- `thread_seq`
+- `memory_package`
+
+Ese es el camino canónico para consumo cognitivo online en un `AI.*`.
+
+### Lo que NO llega automáticamente
+
+Los subjects durables de cognition no se inyectan solos en el carrier:
+
+- `storage.turns`
+- `storage.cognition.threads`
+- `storage.cognition.contexts`
+- `storage.cognition.reasons`
+- `storage.cognition.cooccurrences`
+- `storage.cognition.scopes`
+- `storage.cognition.scope_instances`
+- `storage.cognition.memories`
+- `storage.cognition.episodes`
+
+Si un nodo AI quiere consumirlos, tiene que suscribirse explícitamente por NATS con `fluxbee_sdk::nats`.
+
+### Qué hacer y qué no hacer
+
+- Usar `meta.memory_package` para enrichment conversacional normal.
+- Usar `meta.thread_id` / `meta.thread_seq` como metadata conversacional.
+- Mantener state e immediate memory keyed por `src_ilk`.
+- Ir a NATS solo si el nodo necesita replay, durable entities crudas o un rol de observador/processor.
+- No asumir acceso automático a `storage.cognition.*`.
+- No usar SHM (`jsr-memory`) como interfaz normal de nodo AI.
+- No usar PostgreSQL como superficie primaria para un nodo AI normal.
 
 ## Function Calling
 
@@ -43,6 +90,12 @@ El bundle admite:
 - `active_operations`
 - `thread_id`
 - `scope_id`
+
+Semántica recomendada en v2:
+
+- `thread_id` describe continuidad conversacional/cognitiva
+- `scope_id` en runtimes AI suele mapear a `src_ilk`
+- la persistencia de memoria inmediata se resuelve por `src_ilk`, no por `thread_id`
 
 Ejemplo:
 
@@ -155,5 +208,12 @@ Para `AI.*` y `SY.architect`, la recomendación v1 es:
 - preservar errores/tool failures recientes
 - incluir operaciones activas o ambiguas
 - usar el helper de refresh solo cuando el caller decida actualizar el summary
+
+Compat/migración:
+
+- los replies nuevos del AI SDK ya no deben reemitir `ctx`, `ctx_seq`, `ctx_window` ni `memory_package`
+- los runtimes AI siguen leyendo `thread_id` y `src_ilk` desde `meta` top-level
+- los nodos AI del repo ya no deben depender de `meta.context.thread_id` ni `meta.context.src_ilk`
+- los thread-state tools del SDK aceptan solo `state_key`; si llega `thread_id` como alias legacy, la tool lo rechaza explícitamente
 
 No hace compresión semántica avanzada. Esa capa queda para sistemas cognitivos posteriores.

@@ -364,8 +364,8 @@ Rules:
 - During migration, old producers/consumers may still read `ctx*`, but new canonical paths should not depend on them.
 
 Temporary migration note:
-- the router may still fallback from missing `meta.thread_id` to legacy `meta.context.thread_id` for continuity and `thread_seq` assignment.
-- this fallback is transitional only and must be removed once live producers stop depending on the legacy carrier.
+- router, IO, and AI repo paths now read only top-level `meta.thread_id` for active thread routing/sequencing behavior.
+- any legacy `meta.context.thread_id` still present in old payloads is no longer part of the runtime carrier contract.
 
 ### 5.3 Message Enrichment
 
@@ -429,6 +429,85 @@ The tagger outputs plain strings only — it does not know who sent the message.
 ```
 
 This enriched form is what the Context Evaluator and Reason Evaluator receive. The tagger never sees ILK data.
+
+### 6.1.1 Operational Contract of `AI.tagger`
+
+`AI.tagger` is an internal component of `SY.cognition`. It is not a separate node, does not publish its own NATS subject, and does not alter the external carrier contract.
+
+Operational role:
+- run once per turn before context/reason structural evaluation
+- produce semantic extraction only
+- leave thread sequencing, durable entities, SHM, and router enrichment unchanged
+
+Minimum runtime input:
+
+```json
+{
+  "text": "Message text",
+  "word_count": 18,
+  "max_tags": 12,
+  "max_reason_signals": 4,
+  "canonical_signals": ["resolve", "inform", "protect", "connect", "challenge", "confirm", "request", "abandon"],
+  "identity_hints": {
+    "src_ilk": "ilk:uuid-or-null",
+    "dst_ilk": "ilk:uuid-or-null",
+    "ich": "ich-or-null"
+  }
+}
+```
+
+Notes:
+- `identity_hints` are auxiliary runtime hints only.
+- They are not part of the semantic durable contract and must not change the output schema.
+- The durable/product contract remains `tags + reason_signals_*`.
+
+Minimum runtime output:
+
+```json
+{
+  "tags": ["billing", "refund", "complaint"],
+  "reason_signals_canonical": ["resolve", "challenge"],
+  "reason_signals_extra": ["urgency", "frustration"]
+}
+```
+
+Mandatory backend post-processing:
+- lowercase
+- trim
+- dedup
+- hard limit on list sizes
+- light semantic cleanup for tags:
+  - drop generic placeholders/noise
+  - normalize separators/punctuation
+  - keep short semantic noun phrases
+- canonical alias normalization for `reason_signals_canonical` before final validation
+- strict filter of `reason_signals_canonical` against the closed 8-signal set
+
+Failure semantics:
+- if the AI response is missing, empty, malformed, or out of contract, the turn is counted as a semantic tagger failure
+- carrier and durable entity schemas do not change
+- `SY.cognition` reports degraded semantic capability for that turn/window
+- there is no silent fallback path as the target product behavior for stage 2
+
+Operational config exposed in `SY.cognition`:
+- `provider`
+- `model`
+- `timeout_ms`
+- low/fixed sampling policy
+- `max_tags`
+- `max_reason_signals`
+- canonical AI secret under `config.secrets.openai.api_key`
+
+Operational metrics exposed in `STATUS` / `CONFIG_GET`:
+- `semantic_tagger_calls_total`
+- `semantic_tagger_failures_total`
+- `semantic_tagger_invalid_outputs_total`
+- `last_semantic_model`
+- `narrative_summarizer_calls_total`
+- `narrative_summarizer_failures_total`
+- `narrative_summarizer_invalid_outputs_total`
+- `last_narrative_model`
+- `degraded_semantics_policy`
 
 ### 6.2 Context Evaluator
 
@@ -985,11 +1064,25 @@ Where does the catalog of affects (anger, frustration, satisfaction, conflict, e
 
 ### 13.3 AI Call Strategy
 
-SY.cognition makes direct AI calls via AI SDK (same as SY.architect). Carries its own AI provider key in config.
+For the semantic stage, `SY.cognition` makes direct AI calls via AI SDK (same family as `SY.architect`) and carries its own AI provider key in config.
+
+Architectural clarification:
+- semantic cognition in stage 2 is AI-backed and AI-required
+- the operational tagger path is now the direct AI call inside `SY.cognition`
+- the semantic stage is AI-backed and does not retain a product fallback path
+- that bootstrap implementation is not the target operational fallback of the product
 
 ### 13.4 Reason Evaluator: AI or Deterministic?
 
-For v1, the reason evaluator is deterministic, operating only on the 8 canonical signals. It maps signals to reasons by keyword matching and grouping. Since the commandments are general and few, deterministic mapping is sufficient. Upgrade to AI call later if needed.
+The closed 8-signal reason evaluator can remain deterministic even in the semantic stage.
+
+The AI responsibility is:
+- extract better `tags`
+- extract better `reason_signals_canonical`
+- produce richer `reason_signals_extra`
+- support better narrative synthesis for memories/episodes
+
+The evaluator contract itself stays closed and deterministic over the 8 canonical signals. This keeps the durable model stable while the semantic extraction layer upgrades.
 
 ### 13.5 Thread ID Hash Function
 
@@ -1036,6 +1129,13 @@ Cognitive and policy are parallel consumers. Cognitive enriches AI nodes. Policy
 
 Both coexist. Neither replaces the other.
 
+Operational alignment note:
+
+- `thread_id` is conversational metadata for cognition and router enrichment
+- AI runtime immediate memory and node-local hard state remain keyed by `src_ilk`
+- repo AI runtimes now read only top-level `meta.thread_id` / `meta.src_ilk`
+- any remaining legacy fallback is limited to router/core migration paths, not AI SDK thread-state tooling
+
 ---
 
 ## 15. Implementation Tasks
@@ -1080,7 +1180,7 @@ Both coexist. Neither replaces the other.
 
 - [ ] COG-T21. Implement LanceDB schema for threads, contexts, reasons, memories, episodes.
 - [x] COG-T22. Implement jsr-memory SHM writer (seqlock, versioned snapshot by `thread_id`).
-- [ ] COG-T23. Implement cold start (rebuild from PostgreSQL via SY.storage).
+- [x] COG-T23. Implement cold start (rebuild from PostgreSQL via SY.storage).
 
 ### Phase 7 — Router Enrichment
 
@@ -1094,6 +1194,22 @@ Validation note:
 - The canonical E2E for cognition v2 must enter through the router path with real/disposable nodes.
 - The old direct publish-to-`storage.turns` smoke was removed from the repo to avoid confusing it with the normative path.
 - PostgreSQL is not the primary oracle for the cognition E2E. The primary oracle is delivery to the destination node plus `jsr-memory` and `SY.cognition` runtime counters.
+- Cold start rebuild is startup-only and fail-open: rebuild is attempted only when local cognition state is empty, and missing/unreachable durable storage does not block live processing.
+- Current bounded hot-set note:
+  - `jsr-memory` is now emitted as a bounded hot set sized to `MEMORY_MAX_DATA_SIZE`
+  - selection priority is:
+    - `active_scope`
+    - count of live cognitive entities
+    - recency by `last_seen_at`
+    - `latest_thread_seq`
+  - `turn_count`
+  - startup rebuild from durable now rehydrates only that selected hot set into local cognition memory before resuming live processing
+  - if the snapshot exceeds SHM capacity, lower-priority threads are pruned before the write
+  - deferred optimization: the durable read path is still hive-scoped and applies the hot-set filter in runtime; there is no SQL-side / query-side filter yet
+  - future backlog item:
+    - push the hot-set selection into PostgreSQL queries for very large installs
+    - first-stage candidate filters: `active_scope`, open `scope_instances`, recency by `last_seen_at` / `updated_at`
+    - second-stage candidate filters: bounded time window and/or bounded candidate cardinality before rebuild
 
 - [ ] COG-T27. E2E: message → tagger → context + reason created.
 - [ ] COG-T28. E2E: binding energy with context + reason → scope transition.
@@ -1105,16 +1221,21 @@ Validation note:
 ### Phase 9 — Semantic Upgrade (Second Stage)
 
 - [ ] COG-T33. Introduce `AI.tagger` as an operational upgrade under the same `tags + reason_signals_*` contract.
-- [ ] COG-T34. Keep deterministic v1 tagger as fallback/runtime rollback path.
-- [ ] COG-T35. Improve semantic extraction for tags:
+- [ ] COG-T34. Treat `AI.tagger` as the official semantic engine for stage 2:
+  - no permanent runtime fallback path as product architecture
+  - remove the previous transitional semantic bootstrap from the runtime path
+- [x] COG-T35. Improve semantic extraction for tags:
   - paraphrases
   - implicit intent
   - soft entities from the message narrative
-- [ ] COG-T36. Improve semantic extraction for canonical reason signals while preserving the closed 8-signal evaluator contract.
-- [ ] COG-T37. Use `reason_signals_extra` as narrative evidence input for memory generation, not only as stored text.
-- [ ] COG-T38. Upgrade the summarizer/memory generator from deterministic lexical fusion to semantic narrative synthesis.
-- [ ] COG-T39. Build a golden corpus to compare deterministic v1 vs semantic v2 outputs.
-- [ ] COG-T40. Define rollback semantics: if the AI provider is unavailable, cognition falls back to deterministic v1 without changing carrier or durable entities.
+- [x] COG-T36. Improve semantic extraction for canonical reason signals while preserving the closed 8-signal evaluator contract.
+- [x] COG-T37. Use `reason_signals_extra` as narrative evidence input for memory generation, not only as stored text.
+- [x] COG-T38. Upgrade the summarizer/memory generator from deterministic lexical fusion to semantic narrative synthesis.
+- [x] COG-T39. Build a golden corpus to validate semantic outputs and narrative quality under `AI.tagger`.
+- [x] COG-T40. Define degraded semantics when the AI provider is unavailable:
+  - cognition does not silently fall back to an alternate semantic path as the official product path
+  - carrier and durable entities stay unchanged
+  - the node reports degraded semantic capability until AI is available again
 
 ---
 

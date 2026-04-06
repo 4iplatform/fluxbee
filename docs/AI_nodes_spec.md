@@ -471,16 +471,18 @@ Códigos recomendados (no exhaustivo):
 
 ### Campos L3 de contexto (ctx, ctx_seq, ctx_window)
 
-✅ **NORMATIVO (canónico en protocolo)**:
-- `ctx` y `ctx_seq` se tratan como campos de contexto L3 del mensaje.
-- `ctx_window` se define como historia reciente agregada por router.
+✅ **NORMATIVO (estado actual del repo)**:
+- `ctx`, `ctx_seq` y `ctx_window` quedan como fields legacy/históricos del protocolo.
+- no forman parte del carrier canónico activo de AI Nodes.
 
 ⚠️ **TOLERANCIA OPERATIVA (HOY)**:
-- En el código core revisado, `ctx_window` no aparece implementado/inyectado por el router (solo está documentado).  
-  Por lo tanto, AI Nodes **MUST** tolerar `ctx_window` faltante:
-  - loggear advertencia (`missing_ctx_window`),
-  - continuar procesando usando `payload.content`/`content_ref` y attachments disponibles.
-- Cuando el router lo implemente, `ctx_window` pasará a ser **obligatorio** para el “happy path” (sin cambiar el contrato de AI Nodes).
+- AI Nodes **MUST** tolerar `ctx`, `ctx_seq` y `ctx_window` ausentes sin degradar el happy path.
+- si esos fields aparecen en payloads viejos, deben tratarse como metadata opaca/legacy, no como fuente canónica de contexto.
+- el contexto canónico relevante para AI Nodes hoy entra por:
+  - `meta.thread_id`
+  - `meta.thread_seq`
+  - `meta.src_ilk`
+  - `meta.memory_package`
 
 
 
@@ -1565,14 +1567,14 @@ ai-nodectl logs ai-chat --follow
 
 ✅ **NORMATIVO (MVP vigente)**:
 - El key principal de thread state es `src_ilk`.
-- El runner extrae `src_ilk` desde `meta.src_ilk` (canónico), con fallback legacy a `meta.context.src_ilk` durante transición.
+- El runner extrae `src_ilk` solo desde `meta.src_ilk` (canónico).
 - Si falta `src_ilk`, las tools de thread state deben fallar con error explicito (`missing_src_ilk`).
 
 ### 9.2 Compatibilidad legacy con `thread_id`
 
 ✅ **NORMATIVO (MVP)**:
 - `thread_id` se mantiene solo como compatibilidad legacy/migracion.
-- El runner puede extraer `thread_id` desde `meta.context.thread_id`.
+- El runner extrae `thread_id` solo desde `meta.thread_id`.
 - Si existe estado legacy por `thread_id`, el runtime puede migrarlo al key principal (`src_ilk`) y limpiar la key legacy.
 
 ### 9.3 Modelo de datos: 1 JSON por key de estado (`src_ilk`)
@@ -1591,13 +1593,13 @@ ai-nodectl logs ai-chat --follow
 ### 9.4 API (Tool calling) minima
 
 ✅ **NORMATIVO (MVP)**: el runtime/SDK debe exponer tools equivalentes a:
-- `thread_state_get(thread_id) -> { data?, updated_at? }`
-- `thread_state_put(thread_id, data, ttl_seconds?) -> ok`
-- `thread_state_delete(thread_id) -> ok`
+- `thread_state_get(state_key) -> { data?, updated_at? }`
+- `thread_state_put(state_key, data, ttl_seconds?) -> ok`
+- `thread_state_delete(state_key) -> ok`
 
 Nota:
-- En modo scoped del runtime, el argumento `thread_id` enviado por el modelo puede ignorarse.
-- La ejecucion se scopea al key del contexto actual (`src_ilk`), con fallback legacy opcional.
+- En modo scoped del runtime, el `state_key` efectivo queda fijado por el runner al key del contexto actual (`src_ilk`).
+- El alias legacy `thread_id` ya no forma parte del contrato aceptado por las tools.
 
 > Nota: no se requiere query vectorial ni múltiple-key en MVP.
 

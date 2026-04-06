@@ -1,0 +1,48 @@
+{
+  "semantic_cases": [
+    {
+      "name": "billing_refund_escalation",
+      "raw_output": "{\"tags\":[\"Billing\",\"Duplicate_Charge\",\"Issue\",\"Refund Dispute\"],\"reason_signals_canonical\":[\"complaint\",\"refund\",\"asking\"],\"reason_signals_extra\":[\"urgency\",\"frustration\",\"escalation\"]}",
+      "expected_tags": ["billing", "duplicate charge", "refund dispute"],
+      "expected_canonical": ["challenge", "resolve", "request"],
+      "expected_extra": ["urgency", "frustration", "escalation"]
+    },
+    {
+      "name": "account_security_confirmation",
+      "raw_output": "```json\n{\"tags\":[\"Account/Security\",\"Suspicious Login\",\"Question\"],\"reason_signals_canonical\":[\"security\",\"verification\",\"ask\"],\"reason_signals_extra\":[\"confusion\"]}\n```",
+      "expected_tags": ["account security", "suspicious login"],
+      "expected_canonical": ["protect", "confirm", "request"],
+      "expected_extra": ["confusion"]
+    }
+  ],
+  "narrative_cases": [
+    {
+      "name": "memory_only_billing_pattern",
+      "expect_episode": false,
+      "raw_output": "{\"memory_summary\":\"The thread repeatedly returns to billing friction and a push for resolution.\",\"episode_summary\":null,\"episode_reason\":null}",
+      "memory_summary_contains": [
+        "billing friction",
+        "push for resolution"
+      ],
+      "episode_summary_contains": [],
+      "episode_reason_contains": []
+    },
+    {
+      "name": "episode_escalation_pressure",
+      "expect_episode": true,
+      "raw_output": "{\"memory_summary\":\"The conversation keeps circling back to refund complaints and escalation pressure.\",\"episode_summary\":\"A concrete escalation moment formed around the refund dispute as frustration intensified.\",\"episode_reason\":\"The episode is registered because escalation pressure became explicit around an unresolved billing complaint.\"}",
+      "memory_summary_contains": [
+        "refund complaints",
+        "escalation pressure"
+      ],
+      "episode_summary_contains": [
+        "escalation moment",
+        "refund dispute"
+      ],
+      "episode_reason_contains": [
+        "escalation pressure",
+        "billing complaint"
+      ]
+    }
+  ]
+}

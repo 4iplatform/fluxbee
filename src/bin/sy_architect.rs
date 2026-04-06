@@ -76,7 +76,8 @@ Rules:
 - For drift alerts specifically, if `/hives/{hive}/drift-alerts` returns `entries: []`, answer that there are no recorded drift alerts for that hive. Do not infer drift from `/deployments`, `/versions`, `/nodes`, or from the global `/drift-alerts` list.
 - Distinguish stored node config from live node control-plane config: `GET /hives/{hive}/nodes/{node_name}/config` reads persisted effective `config.json`; `POST /hives/{hive}/nodes/{node_name}/control/config-get` asks the node for live CONFIG_GET.
 - If the operator asks for the current prompt, instructions, or config content of a managed node and `GET .../config` is available, try `GET .../config` first. Use `POST .../control/config-get` only when you need the node-defined live contract or the GET config path is unavailable.
-- For live node-defined config contracts on nodes that expose CONFIG_GET, including `SY.storage` and `SY.identity`, use `POST /hives/{hive}/nodes/{node_name}/control/config-get`. For live node-defined config updates, use `POST /hives/{hive}/nodes/{node_name}/control/config-set`.
+- For live node-defined config contracts on nodes that expose CONFIG_GET, including `SY.storage`, `SY.identity`, and `SY.cognition`, use `POST /hives/{hive}/nodes/{node_name}/control/config-get`. For live node-defined config updates, use `POST /hives/{hive}/nodes/{node_name}/control/config-set`.
+- For `SY.cognition`, prefer live CONFIG_GET/SET when the operator asks about semantic_tagger config, degraded semantics policy, or AI secret setup. The canonical secret field is `config.secrets.openai.api_key`; semantic controls live under `config.semantic_tagger.*`.
 - For local architect OpenAI bootstrap, use `GET /architect/control/config-get` and `POST /architect/control/config-set`.
 - For mutations, use the write tool only to stage the action. Then instruct the operator to reply CONFIRM or CANCEL. Do not claim the mutation ran before confirmation.
 - Do not claim actions were executed unless they actually were.
@@ -392,7 +393,7 @@ impl FunctionTool for ArchitectSystemGetTool {
         FunctionToolDefinition {
             name: "fluxbee_system_get".to_string(),
             description: format!(
-                "Read live Fluxbee system state through SY.admin over socket for hive {hive}. Read-only. Supports GET paths and safe POST checks such as OPA policy validation or node CONFIG_GET control-plane discovery, including `SY.storage` and `SY.identity`. Use /admin/actions or /admin/actions/{{action}} when you need dynamic help; those responses include standardized request_contract metadata, body fields, notes, and example_scmd values. Distinguish runtime names from node instances: `AI.chat` is a runtime, while `AI.chat@{hive}` is a node instance. Distinguish stored node config from live node control-plane config: GET /hives/{hive}/nodes/{{node_name}}/config reads persisted effective config.json, while POST /hives/{hive}/nodes/{{node_name}}/control/config-get asks the node for live CONFIG_GET. If the operator asks for current prompt/instructions/config content, prefer GET .../config first when available. Use /inventory or /inventory/summary for system-wide node visibility, use /versions or /hives/{hive}/versions for core and runtime versions, use /hives/{hive}/runtimes or /hives/{hive}/runtimes/AI.chat for runtime/package info, and use /hives/{hive}/deployments or /hives/{hive}/drift-alerts for hive-scoped views instead of locally filtering global lists. If a hive endpoint returns zero entries, report zero entries instead of inventing filtered results. For drift alerts specifically, `entries: []` means no recorded drift alerts for that hive; do not infer drift from `/deployments`, `/versions`, `/nodes`, or the global `/drift-alerts` list. Example paths: /inventory, /inventory/summary, /inventory/{hive}, /versions, /hives/{hive}/versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/AI.chat, /hives/{hive}/deployments, /hives/{hive}/drift-alerts, /hives/{hive}/nodes, /hives/{hive}/nodes/AI.chat@{hive}/config, /hives/{hive}/nodes/SY.admin@{hive}/status, /hives/{hive}/nodes/SY.storage@{hive}/control/config-get, /hives/{hive}/nodes/SY.storage@{hive}/control/config-set, /hives/{hive}/nodes/SY.identity@{hive}/control/config-get, /hives/{hive}/nodes/SY.identity@{hive}/control/config-set, /hives/{hive}/identity/ilks, /admin/actions, /admin/actions/get_node_status, /admin/actions/get_versions, /config/storage",
+                "Read live Fluxbee system state through SY.admin over socket for hive {hive}. Read-only. Supports GET paths and safe POST checks such as OPA policy validation or node CONFIG_GET control-plane discovery, including `SY.storage` and `SY.identity`. Use /admin/actions or /admin/actions/{{action}} when you need dynamic help; those responses include standardized request_contract metadata, body fields, notes, and example_scmd values. Distinguish runtime names from node instances: `AI.chat` is a runtime, while `AI.chat@{hive}` is a node instance. Distinguish stored node config from live node control-plane config: GET /hives/{hive}/nodes/{{node_name}}/config reads persisted effective config.json, while POST /hives/{hive}/nodes/{{node_name}}/control/config-get asks the node for live CONFIG_GET. If the operator asks for current prompt/instructions/config content, prefer GET .../config first when available. Use /inventory or /inventory/summary for system-wide node visibility, use /hives/{hive}/nodes for one-hive node lists, and do not invent /inventory/nodes as a canonical path. Use /versions or /hives/{hive}/versions for core and runtime versions, use /hives/{hive}/runtimes or /hives/{hive}/runtimes/AI.chat for runtime/package info, and use /hives/{hive}/deployments or /hives/{hive}/drift-alerts for hive-scoped views instead of locally filtering global lists. If a hive endpoint returns zero entries, report zero entries instead of inventing filtered results. For drift alerts specifically, `entries: []` means no recorded drift alerts for that hive; do not infer drift from `/deployments`, `/versions`, `/nodes`, or the global `/drift-alerts` list. Example paths: /inventory, /inventory/summary, /inventory/{hive}, /versions, /hives/{hive}/versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/AI.chat, /hives/{hive}/deployments, /hives/{hive}/drift-alerts, /hives/{hive}/nodes, /hives/{hive}/nodes/AI.chat@{hive}/config, /hives/{hive}/nodes/SY.admin@{hive}/status, /hives/{hive}/nodes/SY.storage@{hive}/control/config-get, /hives/{hive}/nodes/SY.storage@{hive}/control/config-set, /hives/{hive}/nodes/SY.identity@{hive}/control/config-get, /hives/{hive}/nodes/SY.identity@{hive}/control/config-set, /hives/{hive}/identity/ilks, /admin/actions, /admin/actions/get_node_status, /admin/actions/get_versions, /config/storage",
                 hive = self.context.hive_id,
             ),
             parameters_json_schema: json!({
@@ -1418,6 +1419,7 @@ async fn handle_ai_chat(
             &tools,
             FunctionRunInput {
                 current_user_message: input.to_string(),
+                current_user_parts: None,
                 immediate_memory: Some(memory),
             },
         )
@@ -2790,6 +2792,12 @@ fn translate_scmd(
             target_hive: local_hive_id.to_string(),
             params: json!({ "scope": "summary" }),
         }),
+        ("GET", ["inventory", "nodes"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "inventory".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({ "scope": "global" }),
+        }),
         ("GET", ["inventory", hive_id]) => Ok(AdminTranslation {
             admin_target,
             action: "inventory".to_string(),
@@ -3453,7 +3461,9 @@ async fn build_architect_status(state: &ArchitectState) -> ArchitectStatus {
         Ok((summary, hive)) => {
             status.admin_available = true;
             apply_inventory_summary(&mut status, &summary);
-            status.components = parse_component_statuses(&hive);
+            if let Some(hive) = hive.as_ref() {
+                status.components = parse_component_statuses(hive);
+            }
         }
         Err(err) => {
             status.status = "degraded".to_string();
@@ -3466,7 +3476,7 @@ async fn build_architect_status(state: &ArchitectState) -> ArchitectStatus {
 
 async fn fetch_inventory_status_data(
     state: &ArchitectState,
-) -> Result<(Value, Value), ArchitectError> {
+) -> Result<(Value, Option<Value>), ArchitectError> {
     let node_config = NodeConfig {
         name: format!("SY.architect.status.{}", Uuid::new_v4().simple()),
         router_socket: state.socket_dir.clone(),
@@ -3508,11 +3518,19 @@ async fn fetch_inventory_status_data(
             timeout: Duration::from_secs(5),
         },
     )
-    .await
-    .map_err(|err| -> ArchitectError { Box::new(err) })?;
-    ensure_admin_ok("inventory hive", &hive)?;
+    .await;
+    let hive_payload = match hive {
+        Ok(result) => {
+            if ensure_admin_ok("inventory hive", &result).is_ok() {
+                Some(result.payload)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
 
-    Ok((summary.payload, hive.payload))
+    Ok((summary.payload, hive_payload))
 }
 
 fn ensure_admin_ok(
@@ -6241,7 +6259,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         <div class="composer">
           <div class="composer-box">
             <div class="composer-input-shell">
-              <textarea id="input" placeholder="Message or SCMD: curl -X GET /hives/{hive}/nodes"></textarea>
+              <textarea id="input" placeholder="Message or SCMD. Try: SCMD: help"></textarea>
               <div class="composer-actions">
                 <button id="send">Send</button>
               </div>

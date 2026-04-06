@@ -1,5 +1,7 @@
 # Fluxbee - 12 Cognition (SY.cognition) v2
 
+> Superseded by [`docs/12-cognition-v2.md`](/Users/cagostino/Documents/GitHub/fluxbee/docs/12-cognition-v2.md). This beta draft remains only as historical design context.
+
 **Status:** v2.0 (rewrite)
 **Date:** 2026-03-14
 **Audience:** All developers (cognitive, AI, IO, router, identity)

@@ -19,7 +19,7 @@ pub fn build_reply_routing(msg: &Message, src_uuid: &str) -> Routing {
 pub fn build_reply_message(msg: &Message, src_uuid: &str, payload: Value) -> Message {
     Message {
         routing: build_reply_routing(msg, src_uuid),
-        meta: msg.meta.clone(),
+        meta: build_reply_meta(&msg.meta),
         payload,
     }
 }
@@ -29,7 +29,27 @@ pub fn build_reply_message(msg: &Message, src_uuid: &str, payload: Value) -> Mes
 pub fn build_reply_message_runtime_src(msg: &Message, payload: Value) -> Message {
     Message {
         routing: build_reply_routing(msg, ""),
-        meta: msg.meta.clone(),
+        meta: build_reply_meta(&msg.meta),
         payload,
     }
+}
+
+fn build_reply_meta(meta: &Meta) -> Meta {
+    let mut reply = meta.clone();
+    reply.thread_seq = None;
+    reply.ctx = None;
+    reply.ctx_seq = None;
+    reply.ctx_window = None;
+    reply.memory_package = None;
+    reply.context = sanitize_reply_context(reply.context);
+    reply
+}
+
+fn sanitize_reply_context(context: Option<Value>) -> Option<Value> {
+    let Some(Value::Object(mut obj)) = context else {
+        return context;
+    };
+    obj.remove("thread_id");
+    obj.remove("src_ilk");
+    Some(Value::Object(obj))
 }
