@@ -230,6 +230,9 @@ Nota sobre attachments AI (estado 2026-04-06):
 - imágenes soportadas (`png`/`jpeg`/`webp`) viajan como `input_image.image_url`.
 - archivos no imagen, cuando `multimodal=true`, viajan como `input_file.file_data` con formato `data:<mime>;base64,...` y `filename`.
 - `file_id` / `file_url` siguen diferidos hasta que Fluxbee/Core defina metadata suficiente para soportarlos de forma canónica.
+- esto no debe leerse como "cualquier tipo de archivo ya quedó validado end-to-end":
+  - evidencia E2E asentada hoy: imagen, PDF y `xlsx`
+  - siguen faltando pruebas por familias de tipos adicionales (`docx`, audio, otros binarios y mezcla de adjuntos)
 
 
 ---

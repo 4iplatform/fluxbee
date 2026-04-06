@@ -222,6 +222,12 @@ Diseño aplicado:
 - `IO.slack` define su policy efectiva de MIME aceptados
 - el override `IO_SLACK_ALLOWED_MIMES` / `io.blob.allowed_mimes_csv` sigue teniendo precedencia si se quiere ajustar el set en deploy
 
+Alcance exacto de esta lista:
+
+- esta lista describe lo que `IO.slack` acepta hoy en este repo
+- no implica que `IO.slack` acepte todos los formatos de archivo que Slack pueda transportar
+- cualquier MIME fuera de esta lista sigue siendo rechazado por el adapter hasta que se agregue explicitamente y se valide su comportamiento E2E
+
 Consecuencia operativa actual:
 
 - si un attachment queda fuera de esta lista efectiva, se descarta inbound con `unsupported_attachment_mime`
@@ -234,6 +240,12 @@ Estado actual:
 - `pdf`: llega como attachment
 - `text/plain`, `text/markdown`, `application/json`: llegan como attachments
 - `csv`, `doc/docx`, `xls/xlsx`, `ppt/pptx`: quedan admitidos por la policy efectiva actual de `IO.slack`
+
+Lo que falta dejar cerrado por tipo:
+
+- no hay garantia documental de que `IO.slack` acepte todos los formatos que hoy acepte Slack
+- faltan pruebas E2E asentadas por familias adicionales de MIME, por ejemplo audio y otros binarios fuera de office/PDF
+- si se decide sumar mas tipos, el criterio vigente es: agregarlos a la policy efectiva del adapter y validarlos de punta a punta
 
 ### 7.2 Estado de validación y límite del canal Slack
 - El mecanismo canónico de offload (`content` -> `content_ref` al superar límite) se valida de forma determinística con `io-sim`, porque no depende de límites del proveedor externo.

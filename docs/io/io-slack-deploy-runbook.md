@@ -329,6 +329,12 @@ Consecuencia:
 - si un archivo queda afuera de la allowlist efectiva, se descarta inbound con `unsupported_attachment_mime`
 - por lo tanto, el limite E2E real queda en la policy efectiva de `IO.slack`, no en `AI`, para cualquier tipo que todavia no este admitido por el adapter
 
+Alcance de esta nota:
+
+- esto no significa que `IO.slack` acepte todos los formatos que Slack pueda transportar
+- solo deja asentado el set explicitamente admitido hoy por el adapter en este repo
+- cualquier nuevo tipo requiere incorporacion explicita en la policy efectiva y validacion E2E
+
 Si se quiere ajustar el set admitido en deploy, `IO.slack` soporta override por:
 
 - `IO_SLACK_ALLOWED_MIMES`

@@ -930,6 +930,16 @@ Estructura:
   - compatibilidad estable de PDF en todos los modelos/providers soportados
   - política final de selección entre `file_data` / `file_id` / `file_url`
 
+✅ **ACLARACION DE ALCANCE POR TIPO DE ARCHIVO**:
+- En el Agents SDK local tomado como referencia, `input_file` existe como modo canonico y expone `file_data`, `file_url` y `file_id`.
+- En este repo no hay una lista exhaustiva y cerrada de MIME "validos por Agents SDK" para `file_data`; el SDK modela el modo, no una matriz completa de tipos probados.
+- Por lo tanto, en `AI.*` no debe afirmarse "soporta todos los tipos validos del Agents SDK" solo por implementar `input_file.file_data`.
+- Lo correcto es afirmar:
+  - `AI.*` implementa el modo `input_file.file_data` para adjuntos no imagen que lleguen como `BlobRef`
+  - la evidencia E2E asentada hoy cubre imagen, PDF y `xlsx`
+  - siguen faltando pruebas por familias adicionales de archivos, por ejemplo `docx`, audio y otros binarios relevantes
+- Los modos `file_id` y `file_url` siguen diferidos por contrato/Core.
+
 ---
 
 ## 5. Límites, timeouts y rate limiting
