@@ -30,7 +30,7 @@
 
 - `SY.policy` is implementable now without Identity v3.
 - The beta policy model already defines a valid v1 basis:
-  - matrix = `claim × action_class × effect`
+  - matrix = `match × action_class × effect`
   - runtime matching can use identity v2 flat fields
   - OPA can consume compiled base rules plus a future override table
 - The solution manifest can already adopt `policy_matrix` as the canonical normative section.
@@ -94,7 +94,7 @@ Evolve identity toward the richer claims model:
   - Identity v3 claims are deferred
   - only forward-compatible hooks that reduce later migration cost should be prepared now
 - [x] POL-S0-T4. Freeze vocabulary:
-  - `claim matcher`
+  - `match`
   - `action_class`
   - `effect`
   - `override`
@@ -103,7 +103,7 @@ Evolve identity toward the richer claims model:
 
 ### POL-S1 — Freeze `policy_matrix` v1 against Identity v2
 
-- [ ] POL-S1-T1. Define the exact allowed claim matcher keys for v1:
+- [ ] POL-S1-T1. Define the exact allowed `match` keys for v1:
   - `registration_status`
   - `tenant_id`
   - `ilk_type`
@@ -149,9 +149,10 @@ Evolve identity toward the richer claims model:
   - `workflow_step`
   - `node_lifecycle`
 - [ ] POL-S2-T3. Define where this classifier runs:
-  - router helper
-  - `SY.policy`
-  - shared library/helper
+  - router helper for routed messages
+  - admin helper for admin commands
+  - IO/WF helper for external/workflow-origin actions
+  - shared deterministic classifier only if it does not become a hidden static catalog
 - [ ] POL-S2-T4. Document ambiguous cases:
   - admin read vs node control read
   - config set vs node spawn
@@ -163,20 +164,39 @@ Evolve identity toward the richer claims model:
   - `allow`
   - `deny`
   - `route_to_frontdesk`
-  - maybe `route_to`
 - [ ] POL-S3-T2. Defer effects that need extra product plumbing:
   - `require_confirmation`
-  - `flag` as real runtime behavior
-- [ ] POL-S3-T3. For deferred effects, define fallback behavior:
-  - accepted in spec but not executable yet
-  - or forbidden in v1 schema
+  - `route_to`
+  - `flag`
+- [ ] POL-S3-T3. For deferred effects, define behavior:
+  - accepted in schema for forward-compat
+  - stored but not compiled/executed in v1
+- [ ] POL-S3-T4. Revisit `flag` only after audit storage, visibility, and operator UX are designed.
 
 ### POL-S4 — OPA integration shape
 
 - [ ] POL-S4-T1. Define deterministic compiler from `policy_matrix` to Rego/WASM input.
-- [ ] POL-S4-T2. Decide whether base rules still live only in `jsr-opa` compiled WASM or also as structured matrix payload for `SY.policy`.
+- [ ] POL-S4-T2. Keep one rule model, two compiled/loading targets:
+  - `solution.rego` from solution manifest policy_matrix
+  - `axioms.rego` from system-owned policy config
+  - `SY.policy` evaluates the same rule model, not a second semantic variant
 - [ ] POL-S4-T3. Define override precedence contract in OPA.
 - [ ] POL-S4-T4. Define override expiry semantics and time source.
+- [ ] POL-S4-T5. Define where axioms live operationally:
+  - shipped with Fluxbee core as an immutable system-policy pack
+  - installed by orchestrator/bootstrap into the `SY.architect` environment
+  - read by `SY.architect` as a read-only composition source
+  - no ad-hoc side files or hidden shared catalogs
+  - if `hive.yaml` participates, keep it bootstrap-only
+- [ ] POL-S4-T6. Define architect composition flow:
+  - read system axioms state
+  - read solution manifest `policy_matrix`
+  - produce `effective_policy_matrix`
+  - compile/apply Rego for OPA
+- [ ] POL-S4-T7. Define `SY.policy` persistence contract for `effective_policy_matrix`:
+  - architect delivers the effective matrix by config/apply flow
+  - `SY.policy` persists it as evaluation reference
+  - post-facto evaluation does not recompute merge semantics independently
 
 ### POL-S5 — `jsr-policy` SHM
 
@@ -190,7 +210,16 @@ Evolve identity toward the richer claims model:
   - TTL/expiry
   - source rule/case
 - [ ] POL-S5-T3. Define capacity and eviction/failure behavior.
-- [ ] POL-S5-T4. Define read path for OPA/router and write path for `SY.policy`.
+- [ ] POL-S5-T4. Freeze `jsr-policy` as runtime exceptions only:
+  - no historical cases
+  - no audit trail
+  - no per-message evaluation cache
+- [ ] POL-S5-T5. Define read path for OPA/router and write path for `SY.policy`.
+- [ ] POL-S5-T6. Define bootstrap persistence for active overrides:
+  - local to `SY.policy`
+  - restore on startup
+  - cleanup expired entries
+  - do not depend on `SY.storage` for primary recovery
 
 ### POL-S6 — `SY.policy` node v1
 
@@ -209,7 +238,8 @@ Evolve identity toward the richer claims model:
   - actual outcome
 - [ ] POL-S6-T4. Evaluate case against matrix.
 - [ ] POL-S6-T5. Write overrides to `jsr-policy`.
-- [ ] POL-S6-T6. Persist cases / audit trail via `SY.storage`.
+- [ ] POL-S6-T6. Persist cases / audit trail via `SY.storage` as fire-and-forget durable trail.
+- [ ] POL-S6-T7. Keep active override recovery local to `SY.policy`, not in shared storage.
 
 ### POL-S7 — Admin and Architect integration
 
@@ -221,10 +251,19 @@ Evolve identity toward the richer claims model:
   - `list_policy_violations`
 - [ ] POL-S7-T2. Update Archi SCMD/help/prompts for the policy surface.
 - [ ] POL-S7-T3. Define confirmation rules for policy mutations.
+- [ ] POL-S7-T4. Add architect/admin surface for system axioms:
+  - view installed system axioms version/hash
+  - report source release/pack identity
+  - no normal runtime mutation path in v1
 
 ### POL-S8 — Solution manifest integration
 
-- [ ] POL-S8-T1. Make `policy.policy_matrix` the canonical normative block.
+- [ ] POL-S8-T1. Make `policy.policy_matrix` the canonical solution-level normative block.
+- [ ] POL-S8-T1b. Keep system axioms outside the solution manifest:
+  - shipped as immutable system-policy pack with Fluxbee
+  - installed into the `SY.architect` environment
+  - composed with solution policy at apply time
+  - not authored as a second hidden static file set
 - [ ] POL-S8-T2. Remove old `SY.claims` wording from specs used by new implementation.
 - [ ] POL-S8-T3. Define manifest validation for:
   - policy_matrix schema
@@ -232,8 +271,12 @@ Evolve identity toward the richer claims model:
   - runtime/node references
   - tenant/hive consistency
 - [ ] POL-S8-T4. Define reconciliation order for policy:
-  - compile/apply OPA
-  - load matrix reference for `SY.policy`
+  - load installed system axioms pack
+  - PREPARE compiled solution policy
+  - compose effective policy matrix
+  - ENABLE atomic solution.rego swap
+  - keep axioms untouched
+  - load effective matrix reference into `SY.policy`
   - verify policy active
 
 ### POL-S9 — Reconciliation engine in Architect
