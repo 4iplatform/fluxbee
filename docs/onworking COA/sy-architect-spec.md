@@ -482,7 +482,7 @@ The full list is defined in `admin-internal-gateway-spec.md`. Initial actions ex
 | Category | Actions |
 |----------|---------|
 | Hive management | `add_hive`, `remove_hive`, `list_hives`, `get_inventory` |
-| Node management | `run_node`, `kill_node`, `list_nodes`, `get_node_status`, `get_node_config`, `set_node_config` |
+| Node management | `run_node`, `kill_node`, `remove_node_instance`, `list_nodes`, `get_node_status`, `get_node_config`, `set_node_config` |
 | Runtime management | `get_versions`, `update`, `sync_hint` |
 | Identity read | `list_ilks`, `get_ilk` |
 | Routing | `list_routes`, `add_route`, `list_vpns`, `add_vpn` |
@@ -495,7 +495,9 @@ Notes:
 
 ### 6.5 Command Confirmation
 
-For destructive operations (`kill_node`, `remove_hive`), the shell should require explicit confirmation before executing. In v1 this should be enforced in code, not left only to prompt discipline.
+For destructive operations (`kill_node`, `remove_node_instance`, `remove_hive`), the shell should require explicit confirmation before executing. In v1 this should be enforced in code, not left only to prompt discipline.
+
+`kill_node` may also be used with `purge_instance=true` when the operator wants a stop + persisted-instance cleanup in one step before reinstall/recreate.
 
 ---
 

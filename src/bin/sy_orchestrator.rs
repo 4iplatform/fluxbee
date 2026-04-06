@@ -11496,6 +11496,10 @@ async fn kill_node_flow(
         .get("force")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let purge_instance = payload
+        .get("purge_instance")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let signal = if force {
         "SIGKILL".to_string()
     } else {
@@ -11521,6 +11525,10 @@ async fn kill_node_flow(
             obj.insert("unit".to_string(), serde_json::json!(unit));
             obj.insert("signal".to_string(), serde_json::json!(signal));
             obj.insert("force".to_string(), serde_json::json!(force));
+            obj.insert(
+                "purge_instance".to_string(),
+                serde_json::json!(purge_instance),
+            );
             if let Some(name) = validated_node_name.as_ref() {
                 obj.insert("node_name".to_string(), serde_json::json!(name));
             }
@@ -11557,6 +11565,7 @@ async fn kill_node_flow(
                 "unit": unit,
                 "signal": signal,
                 "force": force,
+                "purge_instance": purge_instance,
             });
         }
         Ok(true) => {}
@@ -11568,20 +11577,55 @@ async fn kill_node_flow(
                 "target": target_hive,
                 "node_name": validated_node_name,
                 "unit": unit,
+                "purge_instance": purge_instance,
             });
         }
     }
 
     match execute_on_hive(state, &target_hive, &cmd, "kill_node") {
-        Ok(()) => serde_json::json!({
-            "status": "ok",
-            "hive": target_hive,
-            "target": target_hive,
-            "node_name": validated_node_name,
-            "unit": unit,
-            "signal": signal,
-            "force": force,
-        }),
+        Ok(()) => {
+            let mut response = serde_json::json!({
+                "status": "ok",
+                "hive": target_hive,
+                "target": target_hive,
+                "node_name": validated_node_name,
+                "unit": unit.clone(),
+                "signal": signal.clone(),
+                "force": force,
+                "purge_instance": purge_instance,
+            });
+            if purge_instance {
+                if let Some(node_name) = validated_node_name.as_ref() {
+                    match remove_node_instance_dir_with_root(node_name, &node_files_root()) {
+                        Ok((removed_path, removed_kind_dir)) => {
+                            response["instance_purged"] = serde_json::json!(true);
+                            response["removed_path"] =
+                                serde_json::json!(removed_path.display().to_string());
+                            response["removed_kind_dir"] = serde_json::json!(removed_kind_dir);
+                        }
+                        Err(err) => {
+                            if err.to_string() == "NODE_NOT_FOUND" {
+                                response["instance_purged"] = serde_json::json!(false);
+                                response["purge_status"] = serde_json::json!("not_found");
+                            } else {
+                                return serde_json::json!({
+                                    "status": "error",
+                                    "error_code": "NODE_INSTANCE_PURGE_FAILED",
+                                    "message": err.to_string(),
+                                    "target": target_hive,
+                                    "node_name": node_name,
+                                    "unit": unit,
+                                    "signal": signal,
+                                    "force": force,
+                                    "purge_instance": purge_instance,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            response
+        }
         Err(err) => serde_json::json!({
             "status": "error",
             "error_code": "KILL_FAILED",
@@ -11589,6 +11633,7 @@ async fn kill_node_flow(
             "target": target_hive,
             "node_name": validated_node_name,
             "unit": unit,
+            "purge_instance": purge_instance,
         }),
     }
 }
