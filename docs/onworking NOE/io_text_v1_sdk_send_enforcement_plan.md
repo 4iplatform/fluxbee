@@ -1,119 +1,78 @@
-﻿# Migracion de offload text/v1 a SDK (NodeSender::send)
+# Migracion de offload text/v1 a SDK - Estado final de criterio
+
+Fecha: 2026-04-06
+Estado: criterio funcional cerrado para `text/v1`
 
 ## Objetivo
 
-Mover la logica de normalizacion/offload de `text/v1` (inline -> `content_ref` cuando supera limite) desde `io-common` al SDK de Fluxbee, aplicandola en `NodeSender::send` para cobertura inmediata en la mayoria de nodos que ya usan SDK.
+Dejar explicito donde vive hoy la normalizacion/offload de texto grande para el contrato `text/v1`.
 
-Alcance de esta etapa:
-- enforcement automatico en `send` para `payload.type == "text"` (contrato `text/v1`),
-- mantener compatibilidad con mensaje ya normalizado (`content_ref` valido),
-- evitar tocar router.
+## Criterio correcto segun codigo actual
 
-No alcance de esta etapa:
-- normalizacion global de payloads no `text/v1`,
-- cambios en router.
+El comportamiento automatico existe hoy para:
 
----
+- mensajes cuyo `payload.type == "text"`
+- y cuyo payload valida como contrato `text/v1`
 
-## Principios de implementacion
+Implementacion real:
 
-1. Punto unico de enforcement: `NodeSender::send`.
-2. Contrato canonico: mantener envelope `Message` y normalizar solo `payload` de texto.
-3. Idempotencia: si el payload ya viene como `content_ref`, no reprocesar.
-4. Rollout seguro: incluir switch de escape temporal para desactivar auto-offload si aparece regresion.
-5. `io-common` pasa a delegar en SDK para evitar logica duplicada.
+1. `NodeSender::send` llama a `normalize_outbound_message(...)`
+2. si el payload es `type="text"`, intenta parsearlo como `TextV1Payload`
+3. si el parseo valida:
+   - estima tamano
+   - usa `BlobToolkit::build_text_v1_payload_with_limit(...)`
+   - deja `content` inline o promueve a `content_ref`
+4. si el parseo no valida:
+   - loguea warning
+   - forwardea el payload tal como vino
 
----
+## Lo que SI significa
 
-## Plan de tareas (tests al final)
+- para el contrato canonico `text/v1`, el offload `>64KB` ya esta centralizado en SDK
+- `IO.slack` e `IO.sim` quedan cubiertos cuando envian por `sender.send(msg)`
+- los productores no tienen que decidir manualmente `content` vs `content_ref` si ya trabajan dentro del contrato `text/v1`
 
-## Fase 1 - Diseno tecnico en SDK
+## Lo que NO significa
 
-- [x] Definir modulo de normalizacion en `crates/fluxbee_sdk` reutilizable desde `NodeSender::send`.
-- [x] Definir estructura de config efectiva de offload en SDK:
-  - [x] `max_message_bytes` (default contrato).
-  - [x] `message_overhead_bytes`.
-  - [x] path/config blob runtime.
-- [x] Definir precedence de configuracion (runtime/env/default) sin romper comportamiento actual.
-- [ ] Definir switch de escape temporal (`disable_auto_blob`) para rollback controlado.
+- no es una interceptacion universal para cualquier JSON arbitrario
+- no convierte payloads no `text/v1`
+- no reemplaza la responsabilidad de cada nodo de usar el contrato canonico y el send-path correcto
 
-Entregable:
-- API interna de normalizacion + decision de config documentada en codigo.
+## Relacion con `BlobToolkit`
 
-## Fase 2 - Enforcement en NodeSender::send
+La logica efectiva de corte usa el helper canonico del blob toolkit:
 
-- [x] Integrar normalizacion justo antes de serializar (`serde_json::to_vec`).
-- [x] Aplicar solo cuando `payload.type == "text"`.
-- [x] Mantener passthrough total para payloads no texto.
-- [x] Mantener idempotencia para `content_ref` existente.
-- [x] Agregar logs operativos de bajo ruido en SDK:
-  - [x] `debug`: decision (`offload_to_blob`, bytes estimados, limite).
-  - [x] `info`: solo cuando hay offload real (`blob_name`, `size`).
-  - [x] `warn`: fallo de normalizacion + codigo canonico.
+- `BlobToolkit::build_text_v1_payload()`
+- `BlobToolkit::build_text_v1_payload_with_limit()`
 
-Entregable:
-- `send` con enforcement activo por default.
+Por eso, ambas afirmaciones son compatibles:
 
-## Fase 3 - Ajuste de io-common (correccion de duplicacion)
+1. el corte real lo resuelve el helper de blob toolkit
+2. el punto de enforcement operativo actual para envios `text/v1` al router es `NodeSender::send`
 
-- [x] Reemplazar normalizacion propia de inbound en `io-common` por delegacion al camino SDK (o dejarla en modo compatibilidad sin duplicar decision).
-- [x] Evitar doble procesamiento `io-common` + `NodeSender::send`.
-- [x] Mantener resolucion outbound (`content_ref` -> texto) en `io-common` donde corresponde por canal.
-- [x] Revisar `io-slack` e `io-sim` para que no conserven offload paralelo ad-hoc.
+## Estado de cierre
 
-Entregable:
-- una sola fuente real de decision de offload (`send`), sin drift entre capas.
+### Cerrado
 
-## Fase 4 - Migracion operacional y docs
+- ownership del offload para `text/v1`
+- logs de normalizacion en SDK
+- tests unitarios base del SDK
+- smoke Linux `>64KB` con `io-sim`
+- adapters IO actuales revisados sin bypass conocido
 
-- [x] Actualizar docs core/IO para dejar explicito que el enforcement esta en SDK (`send`).
-- [x] Actualizar docs de IO indicando que `io-common` ya no decide offload por su cuenta.
-- [x] Actualizar runbooks de prueba (`io-sim` y `io-slack`) con expectativas nuevas.
-- [x] Incluir nota de limitaciones actuales de canal (ej. Slack) en salida exterior.
+### Pendiente
 
-Entregable:
-- documentacion alineada a la arquitectura real post-migracion.
+- mas tests de integracion `io-common` / `IO.slack`
+- dejar como requisito de adopcion para futuros adapters IO:
+  - usar contrato `text/v1`
+  - enviar por `NodeSender::send`
 
-## Fase 5 - Tests (ultimo)
+## Escape hatch
 
-- [ ] Unit tests SDK:
-  - [ ] inline bajo limite (sin offload).
-  - [ ] inline sobre limite (offload a `content_ref`).
-  - [ ] `content_ref` preexistente (idempotente).
-  - [ ] payload invalido (error canonico).
-- [ ] Tests de integracion IO:
-  - [ ] `io-sim` verifica que mensaje grande sale como `content_ref` usando `send`.
-- [ ] Smoke E2E:
-  - [ ] IO -> AI con texto grande.
-  - [ ] verificacion de logs de decision y no regresion en respuestas.
-- [ ] Test de escape hatch:
-  - [ ] con `disable_auto_blob=true`, confirmar passthrough.
+No se implementa `disable_auto_blob` por ahora.
 
-Entregable:
-- suite verde con cobertura minima de contrato + regresion.
+Motivo:
 
----
-
-## Riesgos y mitigacion
-
-1. Riesgo: impacto global inesperado por cambiar `send`.
-- Mitigacion: escape hatch temporal + logs de decision + rollout gradual.
-
-2. Riesgo: doble offload por coexistencia de logicas.
-- Mitigacion: fase explicita de limpieza en `io-common`.
-
-3. Riesgo: diferencias de configuracion por nodo/runtime.
-- Mitigacion: precedence unica en SDK y defaults canonicos.
-
-4. Riesgo: canales externos con limites menores al contrato interno.
-- Mitigacion: documentar fallback por canal y mantener esta decision fuera de esta etapa.
-
----
-
-## Criterio de cierre
-
-Se considera cerrado cuando:
-- [ ] `NodeSender::send` aplica offload `text/v1` por default.
-- [ ] `io-common` no duplica la decision de offload.
-- [ ] Docs reflejan el nuevo ownership (SDK send-path).
-- [ ] Tests (SDK + integracion + smoke) pasan.
+- en documentos core/protocolo del repo esta normado que, si el texto no cabe inline, debe ir por `content_ref`
+- no aparece en core una excepcion normativa ni un flag para desactivar ese comportamiento
+- por lo tanto, el auto-offload se trata como contrato, no como opcion de rollback

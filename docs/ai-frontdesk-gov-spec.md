@@ -11,6 +11,9 @@
 - **Nombre L2 (fijo)**: `AI.frontdesk.gov`
 - **Nombre calificado**: `AI.frontdesk.gov@<hive_id>`
 
+Nota operativa vigente:
+- aunque hoy siga desplegando por el camino general de runtimes AI, `AI.frontdesk.gov` debe leerse como nodo `system-default` por hive y singleton operativo esperado.
+
 > Nota: `AI.frontdesk.gov` **no** reemplaza a `AI.default` (fallback general).  
 > La equivalencia `frontdesk == default` queda 🧩 TBD.
 
@@ -189,6 +192,14 @@ Variables de entorno por instancia recomendadas:
   - config efectiva en `${STATE_DIR}/ai-nodes/AI.frontdesk.gov.json` (nombre calificado por hive a nivel sistema).
   - hot updates por Control Plane (`CONFIG_SET/GET` unicast).
   - defaults materializados en el JSON efectivo.
+
+Estado operativo actual del runtime:
+- el prompt funcional base de frontdesk ya debe considerarse propiedad del runtime `AI.frontdesk.gov`, no de `AI.common`
+- si `behavior.instructions` no se configura, el runtime puede usar un prompt default propio embebido/versionado con el runtime
+- `CONFIG_SET` sigue siendo, por ahora, el camino operativo temporal para cargar o rotar `config.secrets.openai.api_key`
+
+Riesgo/decision pendiente de core:
+- si `AI.frontdesk.gov` se confirma como nodo AI critico del sistema, queda pendiente definir si su secreto principal puede seguir mutandose por el mismo `CONFIG_SET` de un `AI.*` comun o si requiere un surface mas protegido
 
 🧩 **A ESPECIFICAR (core)**:
 - Referencia exacta en `hive.yaml`:

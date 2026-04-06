@@ -91,6 +91,12 @@ Regla operativa para MIME:
 - si Fluxbee puede transportar un attachment y el canal/adapter tiene capacidad razonable de aceptarlo, el adapter debería incluir ese MIME en su policy efectiva
 - si un MIME queda afuera, debe ser por limitación concreta del canal/adaptation o por decisión explícita documentada, no por un default implícito accidental
 
+Regla corta de adopcion para futuros `IO.*`:
+- si el adapter produce mensajes de usuario textuales hacia el router, debe usar el contrato canonico `text/v1`
+- esos mensajes deben enviarse al router por `fluxbee_sdk::NodeSender::send`
+- el adapter no debe reimplementar por su cuenta la decision `content` vs `content_ref`
+- si el adapter necesita otro tipo de payload que no sea `text/v1`, no hereda automaticamente el auto-offload y debe definirse explicitamente su contrato/tamano antes de asumir comportamiento equivalente
+
 Configuración operativa actual del enforcement en SDK:
 - La normalización en `NodeSender::send` usa defaults internos del SDK.
 - No depende de variables de entorno para decidir offload en esta etapa.

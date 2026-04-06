@@ -22,6 +22,8 @@ Contrato operativo actual:
 - persiste la OpenAI key en `secrets.json`.
 - usa el campo canónico `config.secrets.openai.api_key`.
 - conserva compatibilidad temporal con aliases legacy mientras migra.
+- si `behavior.instructions` se omite, el runtime usa un prompt base propio de frontdesk embebido en el runner.
+- `behavior.instructions` debe leerse ahora como override opcional, no como requisito para que el nodo tenga identidad funcional.
 
 ## Ejecutar local
 
@@ -41,3 +43,7 @@ Pendiente posterior a esta reorganización:
 Prompt/behavior de frontdesk:
 - El prompt funcional de frontdesk debe viajar con el runtime `AI.frontdesk.gov` (artefacto/versionado propio).
 - No debe depender de mutaciones ad-hoc en runtime común.
+- Implementación actual:
+  - existe un prompt base runtime-owned en el runner de `AI.frontdesk.gov`
+  - la key de provider sigue entrando temporalmente por `CONFIG_SET` y se persiste en `secrets.json`
+  - la decisión final sobre surface/privilegios para esa key queda pendiente de `CORE`

@@ -35,6 +35,11 @@ Decisión de ownership:
 - `AI.common` no debe transportar lógica específica gov/frontdesk.
 - El data-plane `text/v1` (incluyendo resolución de `content_ref`/`attachments` y offload de respuesta a `content_ref` por tamaño) pertenece al SDK AI compartido.
 
+Nota operativa vigente para frontdesk:
+- `AI.frontdesk.gov` sigue usando hoy el camino general de deploy de runtimes AI, pero debe leerse como runtime singleton `system-default` por hive.
+- el prompt funcional base del runtime no debería depender de que el operador lo cargue por `CONFIG_SET`.
+- la key de provider puede seguir entrando temporalmente por `CONFIG_SET` y persistirse en `secrets.json` mientras `CORE` define el modelo final para secretos de un AI de sistema crítico.
+
 ---
 
 ## 3) Prerrequisitos
@@ -169,7 +174,12 @@ bash scripts/deploy-ia-node.sh \
 
 ## 7) Prompts/config obligatorias
 
-Para imponer prompts/config obligatorias, versioná ese bloque en el `config` del nodo (spawn o update de config).
+Para `AI.common`, los prompts/config obligatorias pueden versionarse en el `config` del nodo.
+
+Para `AI.frontdesk.gov`, la direccion vigente es distinta:
+- el prompt funcional base pertenece al runtime frontdesk,
+- `CONFIG_SET` queda preferentemente para modelo, timeouts, flags operativos y secrets,
+- no para transportar obligatoriamente todo el prompt funcional del nodo.
 
 Ejemplo base para `openai_chat`:
 
@@ -233,6 +243,11 @@ Nota sobre attachments AI (estado 2026-04-06):
 - esto no debe leerse como "cualquier tipo de archivo ya quedó validado end-to-end":
   - evidencia E2E asentada hoy: imagen, PDF y `xlsx`
   - siguen faltando pruebas por familias de tipos adicionales (`docx`, audio, otros binarios y mezcla de adjuntos)
+- esto tampoco debe leerse como "AI ya devuelve archivos al usuario final":
+  - el contrato de salida soporta `attachments[]`
+  - `IO.slack` sabe publicar adjuntos salientes si existen
+  - pero los runners `AI.*` actuales responden texto y offload de texto largo a `content_ref`
+  - la generacion de PDF/XLSX/imagen saliente como adjunto no esta cerrada hoy como flujo general
 
 
 ---

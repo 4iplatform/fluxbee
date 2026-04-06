@@ -48,6 +48,83 @@ const NODE_STATUS_DEFAULT_HANDLER_ENABLED: &str = "NODE_STATUS_DEFAULT_HANDLER_E
 const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE";
 const IMMEDIATE_INTERACTION_MAX_CHARS: usize = 1_200;
 const AI_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
+const FRONTDESK_DEFAULT_SYSTEM_PROMPT: &str = r#"
+You are AI.frontdesk.gov.
+
+Goal:
+- Collect required identity fields: name, email, tenant_hint.
+- Use thread_state_* to keep progress.
+- On positive confirmation, call ilk_register and close.
+
+State schema (data):
+{
+  "status": "collecting|awaiting_confirmation|completed|completed_error",
+  "collected": {
+    "name": null|string,
+    "email": null|string,
+    "tenant_hint": null|string
+  },
+  "register_attempted": false,
+  "register_error": null
+}
+
+Mandatory flow:
+1) On every user turn, call thread_state_get first.
+2) Extract and merge any new values for name/email/tenant_hint.
+3) If state changed, call thread_state_put immediately.
+4) If any required field is missing, ask ONLY missing fields.
+5) If all required fields are present and status is not completed/completed_error:
+   - set status=awaiting_confirmation
+   - call thread_state_put
+   - show summary and ask confirmation.
+
+Extraction rules:
+- If message contains an email pattern, map it to email.
+- If message mentions tenant/tenant_hint/company/org, prioritize tenant_hint.
+- If only one field is missing, treat concise user answer as that field unless clearly contradictory.
+
+Confirmation normalization:
+- positive: si,si,ok,confirmo,correcto,asi es,de acuerdo,dale
+- negative: no,incorrecto,corregir,hay error
+
+STRICT NO-LOOP RULE:
+- If status==awaiting_confirmation and user is positive:
+  - If register_attempted==false:
+    a) Call ilk_register with:
+       - src_ilk (from context)
+       - identity_candidate {name,email,tenant_hint}
+    b) If tool returns status=ok:
+       - call thread_state_delete
+       - send final success message
+       - stop (do not ask confirmation again)
+    c) If tool returns status=error:
+       - set status=completed_error
+       - set register_attempted=true
+       - set register_error={error_code,message}
+       - call thread_state_put
+       - send final error summary
+       - stop (do not ask confirmation again)
+  - If register_attempted==true:
+    - send final error summary from register_error
+    - stop (do not ask confirmation again)
+
+- If status==awaiting_confirmation and user is negative:
+  - set status=collecting
+  - call thread_state_put
+  - ask which field to correct.
+
+ANTI-REASK RULE:
+- If thread_state already contains a non-empty value for a required field, do not ask for that field again unless the user is explicitly correcting it.
+- If the user says they already provided the data, inspect thread_state and current turn extraction before asking for missing fields again.
+- If all required fields are already present in thread_state, never ask for the data again; move to confirmation or registration as appropriate.
+
+ANTI-RECONFIRM RULE:
+- If status==awaiting_confirmation and the user reply is positive, do not restate the collected data and do not ask for confirmation again; call ilk_register immediately.
+- If registration already succeeded or failed terminally in the current turn, stop after the final message.
+
+Do not invent src_ilk or thread_id.
+Keep replies short in Spanish.
+"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenAiApiKeySource {
@@ -68,6 +145,18 @@ impl OpenAiApiKeySource {
             Self::Missing => "missing",
         }
     }
+}
+
+fn frontdesk_default_instructions() -> String {
+    FRONTDESK_DEFAULT_SYSTEM_PROMPT.trim().to_string()
+}
+
+fn frontdesk_default_instructions_snapshot() -> Value {
+    json!({
+        "source": "inline",
+        "value": frontdesk_default_instructions(),
+        "trim": true
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1703,6 +1792,7 @@ impl GenericAiNode {
                 ],
                 "secrets": [secret_descriptor],
                 "notes": [
+                    "AI.frontdesk.gov ships a runtime-owned default prompt when behavior.instructions is omitted.",
                     "Preferred secret field is config.secrets.openai.api_key.",
                     "Legacy aliases config.behavior.openai.api_key and config.behavior.api_key remain accepted during migration.",
                     "AI.frontdesk.gov defaults behavior.capabilities.multimodal=false unless explicitly overridden.",
@@ -2748,7 +2838,8 @@ fn build_behavior(
     let behavior = match &cfg.behavior {
         BehaviorSection::Echo => NodeBehavior::Echo,
         BehaviorSection::OpenaiChat(openai) => {
-            let instructions = resolve_instructions(&openai.instructions)?;
+            let instructions = resolve_instructions(&openai.instructions)?
+                .or_else(|| Some(frontdesk_default_instructions()));
             let model_settings = openai
                 .model_settings
                 .as_ref()
@@ -2804,7 +2895,8 @@ fn build_behavior_from_effective_config(
                 .ok_or_else(|| "missing behavior.model for openai_chat".to_string())?
                 .to_string();
 
-            let instructions = extract_instructions_from_effective_config(behavior);
+            let instructions = extract_instructions_from_effective_config(behavior)
+                .or_else(|| Some(frontdesk_default_instructions()));
             let model_settings = extract_model_settings_from_effective_config(behavior);
             let api_key_env = behavior
                 .api_key_env
@@ -2904,7 +2996,11 @@ fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocu
         BehaviorSection::OpenaiChat(openai) => EffectiveBehaviorSection {
             kind: "openai_chat".to_string(),
             model: Some(openai.model.clone()),
-            instructions: Some(format_instructions_snapshot(&openai.instructions)),
+            instructions: Some(if openai.instructions.is_some() {
+                format_instructions_snapshot(&openai.instructions)
+            } else {
+                frontdesk_default_instructions_snapshot()
+            }),
             model_settings: openai.model_settings.clone(),
             api_key_env: Some(openai.api_key_env.clone()),
             api_key: openai.api_key.clone(),
@@ -3289,6 +3385,9 @@ fn materialize_effective_defaults(
         materialize_runtime_defaults(runtime);
     }
     if config.behavior.kind.eq_ignore_ascii_case("openai_chat") {
+        if config.behavior.instructions.is_none() {
+            config.behavior.instructions = Some(frontdesk_default_instructions_snapshot());
+        }
         if config.behavior.capabilities.is_none() {
             config.behavior.capabilities = Some(BehaviorCapabilities {
                 multimodal: Some(default_multimodal_for_runtime()),
@@ -4283,5 +4382,51 @@ mod tests {
         let hint = "tnt:22222222-2222-4222-8222-222222222222";
         let out = resolve_tenant_id_for_register(None, Some(hint), None);
         assert_eq!(out.as_deref(), Some(hint));
+    }
+
+    #[test]
+    fn materialize_effective_config_defaults_injects_frontdesk_prompt_when_missing() {
+        let config = materialize_effective_config_defaults(
+            "AI.frontdesk.gov@motherbee",
+            EffectiveConfigDocument {
+                behavior: EffectiveBehaviorSection {
+                    kind: "openai_chat".to_string(),
+                    model: Some("gpt-4.1-mini".to_string()),
+                    ..EffectiveBehaviorSection::default()
+                },
+                ..EffectiveConfigDocument::default()
+            },
+        );
+
+        let instructions = config
+            .behavior
+            .instructions
+            .as_ref()
+            .and_then(|value| value.get("value"))
+            .and_then(Value::as_str);
+        assert_eq!(instructions, Some(frontdesk_default_instructions().as_str()));
+    }
+
+    #[test]
+    fn build_behavior_from_effective_config_uses_frontdesk_prompt_when_missing() {
+        let behavior = build_behavior_from_effective_config(&EffectiveConfigDocument {
+            behavior: EffectiveBehaviorSection {
+                kind: "openai_chat".to_string(),
+                model: Some("gpt-4.1-mini".to_string()),
+                ..EffectiveBehaviorSection::default()
+            },
+            ..EffectiveConfigDocument::default()
+        })
+        .expect("build behavior");
+
+        match behavior {
+            NodeBehavior::OpenAiChat(openai) => {
+                assert_eq!(
+                    openai.instructions.as_deref(),
+                    Some(frontdesk_default_instructions().as_str())
+                );
+            }
+            other => panic!("expected OpenAiChat behavior, got {other:?}"),
+        }
     }
 }

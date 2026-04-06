@@ -458,6 +458,15 @@ Códigos recomendados (no exhaustivo):
 - Salida `text/v1` con offload automático a `content_ref` cuando excede límite inline.
 - Adjuntos de salida generados por behavior quedan para fase posterior (cuando behaviors produzcan artefactos).
 
+✅ **ACLARACION DE IMPLEMENTACION ACTUAL**:
+- El contrato de salida ya contempla `payload.attachments[]`.
+- `IO.slack` ya sabe publicar `attachments[]` en Slack cuando recibe `BlobRef` salientes.
+- Pero los runners `AI.*` actuales no exponen todavia un flujo funcional general para que un behavior genere artefactos de salida y los devuelva como adjuntos al usuario final.
+- En la implementacion actual, la respuesta normal del runner es texto `text/v1`:
+  - inline si entra
+  - o `content_ref` si excede limite
+- Casos tipo "te genero un PDF/XLSX/imagen y te lo adjunto" no deben considerarse cerrados hoy en `AI.*`.
+
 ---
 
 ## Convenciones de estado del documento
@@ -645,6 +654,11 @@ Estructura:
 - Si el nodo genera artefactos (PDF/imagen/etc.), debe:
   1) escribirlos al blob storage (staging → promover a active) según Blob Annex,
   2) devolver `BlobRef` en `payload.attachments`.
+
+⚠️ **ESTADO DE IMPLEMENTACION ACTUAL**:
+- Este contrato existe, pero los runners `AI.*` actuales no lo usan todavia como camino general de salida.
+- Hoy el comportamiento implementado y validado es respuesta textual (`content` / `content_ref`).
+- La generacion de artefactos salientes (por ejemplo PDF/XLSX/imagen) y su devolucion como `attachments[]` queda pendiente de implementacion especifica del behavior/runtime.
 
 ### 5.2 Routing de respuesta (anti-loop)
 
