@@ -2,7 +2,7 @@
 
 **Status:** planning / pre-implementation  
 **Date:** 2026-04-07  
-**Scope:** `SY.config.routes` and `SY.opa.rules`  
+**Scope:** `SY.config.routes`, `SY.opa.rules`, and the minimal Go SDK needed to make `SY.opa.rules` a first-class node  
 **Reference nodes for alignment:** `SY.admin`, `SY.orchestrator`, `SY.identity`, `SY.cognition`, AI nodes using current SDK helpers
 
 **Intent:**
@@ -14,13 +14,18 @@
 
 ## 1) Why this exists
 
-`SY.config.routes` and `SY.opa.rules` are not at the same maturity level as the current system nodes.
+`SY.config.routes` and `SY.opa.rules` are not at the same maturity level as the current system nodes, but they do not need the same treatment.
 
 This creates three problems:
 
 - They do not expose the same message and control-plane conventions as the newer nodes.
 - `SY.admin` and `SY.orchestrator` have to compensate for legacy behavior instead of relying on a stable node contract.
 - Any policy or observability work done on top of them becomes fragile because the base message/config model is inconsistent.
+
+The key difference is:
+
+- `SY.config.routes` is a Rust node that should be brought up to the current Rust SDK/runtime standard.
+- `SY.opa.rules` is effectively carrying its own mini SDK today; the cleaner path is to turn that into a real `fluxbee-go-sdk` and then migrate `SY.opa.rules` onto it.
 
 **Important decision:**
 - Do **not** partially retrofit these nodes only for policy metadata.
@@ -73,7 +78,7 @@ Today these two nodes are "special cases" in different ways:
 - `SY.config.routes` is a Rust node on old message/config conventions.
 - `SY.opa.rules` is a non-SDK node with its own protocol model.
 
-That makes them hard to reason about as first-class Fluxbee nodes.
+That makes them hard to reason about as first-class Fluxbee nodes, but the remediation path is different for each one.
 
 ---
 
@@ -123,14 +128,15 @@ This should be treated as an infrastructure modernization stream with two tracks
 
 Bring the existing Rust node up to current SDK and config conventions.
 
-### Track B — `SY.opa.rules`
+### Track B — `fluxbee-go-sdk` + `SY.opa.rules`
 
-Decide whether to:
+Build the minimum Go SDK needed to expose the same external runtime contract as the Rust SDK, then migrate `SY.opa.rules` to use it.
 
-- keep it in Go but formally align its external contract to the Fluxbee runtime model
-- or migrate it toward shared helpers / a Rust implementation later
+For now, the target is:
 
-For now, the minimum requirement is contract alignment, not language migration.
+- no ad hoc compatibility layer embedded only in `SY.opa.rules`
+- no forced Rust rewrite
+- a real SDK path for Go-based nodes, with `SY.opa.rules` as first consumer
 
 ---
 
@@ -160,7 +166,8 @@ For now, the minimum requirement is contract alignment, not language migration.
   - outbound types `command_response` / `query_response` / `system`
   - HELLO/ANNOUNCE handshake behavior
   - OPA-specific actions and responses
-- [ ] SYS-ALIGN-S1-T3. Compare both inventories against the current SDK-driven node contract.
+- [ ] SYS-ALIGN-S1-T3. Compare `SY.config.routes` against the current Rust SDK node contract.
+- [ ] SYS-ALIGN-S1-T3b. Compare `SY.opa.rules` against the current Rust SDK node contract and identify what must be replicated in Go.
 - [ ] SYS-ALIGN-S1-T4. Mark which mismatches are:
   - compatibility-critical
   - admin/orchestrator ergonomics
@@ -182,7 +189,8 @@ For now, the minimum requirement is contract alignment, not language migration.
   - `target`
   - `trace_id`
 - [ ] SYS-ALIGN-S2-T4. Remove older ad hoc differences such as mixed `error` vs `error_code` shapes.
-- [ ] SYS-ALIGN-S2-T5. Decide whether `SY.opa.rules` keeps custom `command/query` message kinds or is adapted to the current shared runtime model.
+- [ ] SYS-ALIGN-S2-T5. Freeze which parts of the Rust message model must be reproduced by `fluxbee-go-sdk`.
+- [ ] SYS-ALIGN-S2-T6. Decide whether `SY.opa.rules` keeps custom `command/query` message kinds as first-class Fluxbee categories or is adapted to the same shared runtime model used by Rust nodes.
 
 ### SYS-ALIGN-S3 — Normalize config/control-plane behavior
 
@@ -218,17 +226,39 @@ For now, the minimum requirement is contract alignment, not language migration.
 - [ ] SYS-ALIGN-S5-T3. Normalize admin replies and system replies to the current common shape.
 - [ ] SYS-ALIGN-S5-T4. Add tests for request parsing and response envelope consistency.
 
+#### `fluxbee-go-sdk`
+
+- [ ] SYS-ALIGN-S5-T5. Define the minimum v1 scope of `fluxbee-go-sdk`.
+- [ ] SYS-ALIGN-S5-T6. Implement shared Go types equivalent to the common node envelope:
+  - `Message`
+  - `Meta`
+  - `Routing`
+  - destination helpers
+- [ ] SYS-ALIGN-S5-T7. Implement router framing and connection lifecycle helpers:
+  - connect
+  - HELLO / ANNOUNCE
+  - sender / receiver
+  - reconnect behavior
+- [ ] SYS-ALIGN-S5-T8. Implement standard reply helpers in Go:
+  - request/reply
+  - error replies
+  - trace propagation
+- [ ] SYS-ALIGN-S5-T9. Decide whether node config control-plane helpers belong in v1 of the Go SDK or in a later phase.
+- [ ] SYS-ALIGN-S5-T10. Add protocol-level tests or fixtures proving parity with the chosen Rust-side contract.
+
 #### `SY.opa.rules`
 
-- [ ] SYS-ALIGN-S5-T5. Decide if the Go service remains standalone long-term or is only a compatibility bridge.
-- [ ] SYS-ALIGN-S5-T6. If it remains in Go, define and implement a formal compatibility layer to the Fluxbee node contract.
-- [ ] SYS-ALIGN-S5-T7. If it migrates later, prepare a staged migration plan that preserves OPA SHM behavior and operational semantics.
-- [ ] SYS-ALIGN-S5-T8. Add protocol-level tests or fixtures proving parity with the chosen contract.
+- [ ] SYS-ALIGN-S5-T11. Migrate `SY.opa.rules` transport/envelope code to `fluxbee-go-sdk`.
+- [ ] SYS-ALIGN-S5-T12. Replace its local `Message` / `Meta` / `Routing` structs with SDK equivalents.
+- [ ] SYS-ALIGN-S5-T13. Replace its embedded router client lifecycle with SDK connection helpers.
+- [ ] SYS-ALIGN-S5-T14. Preserve OPA SHM, compile/apply/rollback, and router reload semantics during the migration.
+- [ ] SYS-ALIGN-S5-T15. Re-test admin and orchestrator interoperability after the SDK migration.
 
 ### SYS-ALIGN-S6 — Documentation and operator model
 
 - [ ] SYS-ALIGN-S6-T1. Document the canonical action surface for `SY.config.routes`.
 - [ ] SYS-ALIGN-S6-T2. Document the canonical action surface for `SY.opa.rules`.
+- [ ] SYS-ALIGN-S6-T2b. Document `fluxbee-go-sdk` as the canonical Go path for Fluxbee-compatible nodes.
 - [ ] SYS-ALIGN-S6-T3. Document what operators should treat as:
   - read/query
   - config control-plane
@@ -242,7 +272,7 @@ For now, the minimum requirement is contract alignment, not language migration.
 
 - This is **not** yet the `SY.policy` integration plan.
 - This does **not** decide the final online policy architecture.
-- This does **not** require rewriting `SY.opa.rules` in Rust immediately.
+- This does **not** require rewriting `SY.opa.rules` in Rust.
 - This does **not** require redesigning route/VPN semantics or OPA semantics themselves.
 
 The goal is narrower:
@@ -262,4 +292,5 @@ Recommended implementation order:
 
 **Pragmatic recommendation:**
 - Do `SY.config.routes` first because it is already a Rust node and the gap is mostly contract/SDK drift.
-- Do `SY.opa.rules` second because it likely needs an explicit compatibility decision before implementation work.
+- For `SY.opa.rules`, do not build a one-off compatibility layer inside the node.
+- Start by freezing the minimum `fluxbee-go-sdk` contract, then migrate `SY.opa.rules` onto that SDK.
