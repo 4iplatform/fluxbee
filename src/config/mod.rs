@@ -20,7 +20,7 @@ const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
 const DEFAULT_BLOB_SYNC_TOOL: &str = "syncthing";
 const DEFAULT_BLOB_SYNC_API_PORT: u16 = 8384;
 const DEFAULT_BLOB_SYNC_DATA_DIR: &str = "/var/lib/fluxbee/syncthing";
-const DEFAULT_IDENTITY_FRONTDESK_NODE_BASE: &str = "AI.frontdesk";
+const DEFAULT_IDENTITY_FRONTDESK_NODE_BASE: &str = "SY.frontdesk.gov";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {

@@ -13,7 +13,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
 fi
 
 services=(
-  "ai-frontdesk-gov"
+  "sy-frontdesk-gov"
   "sy-identity"
   "sy-cognition"
   "sy-admin"
@@ -75,7 +75,7 @@ done
 
 echo "Cleaning residual processes..."
 residual_procs=(
-  "ai-frontdesk-gov"
+  "sy-frontdesk-gov"
   "sy-orchestrator"
   "sy-admin"
   "sy-architect"

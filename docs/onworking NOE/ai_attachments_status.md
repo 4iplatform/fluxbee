@@ -1,7 +1,7 @@
 # Estado de Adjuntos AI vs Agents SDK
 
 Fecha: 2026-04-06
-Alcance: `AI.common` / `AI.frontdesk.gov` + `fluxbee_ai_sdk` (ingesta y envio a OpenAI Responses).
+Alcance: `AI.common` / `SY.frontdesk.gov` + `fluxbee_ai_sdk` (ingesta y envio a OpenAI Responses).
 
 ## Objetivo de este documento
 

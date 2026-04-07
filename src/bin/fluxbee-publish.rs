@@ -1172,7 +1172,7 @@ mod tests {
         write_package_json(
             &dir,
             r#"{
-  "name": "ai.frontdesk.gov",
+  "name": "sy.frontdesk.gov",
   "version": "1.0.0",
   "type": "full_runtime"
 }"#,
@@ -1182,7 +1182,7 @@ mod tests {
         make_executable(&start_sh);
 
         let out = validate_package(&dir, None).expect("validate should succeed");
-        assert_eq!(out.metadata.name, "ai.frontdesk.gov");
+        assert_eq!(out.metadata.name, "sy.frontdesk.gov");
         assert_eq!(package_type_label(out.package_type), "full_runtime");
         let _ = fs::remove_dir_all(dir);
     }
@@ -1213,7 +1213,7 @@ mod tests {
         write_package_json(
             &dir,
             r#"{
-  "name": "ai.frontdesk.gov",
+  "name": "sy.frontdesk.gov",
   "version": "v1",
   "type": "full_runtime"
 }"#,
@@ -1233,7 +1233,7 @@ mod tests {
         write_package_json(
             &dir,
             r#"{
-  "name": "ai.frontdesk.gov",
+  "name": "sy.frontdesk.gov",
   "version": "1.0.0",
   "type": "full_runtime"
 }"#,
@@ -1302,7 +1302,7 @@ mod tests {
         let validated = ValidatedPackage {
             package_dir: PathBuf::from("/tmp/pkg"),
             metadata: PackageMetadata {
-                name: "ai.frontdesk.gov".to_string(),
+                name: "sy.frontdesk.gov".to_string(),
                 version: "1.0.0".to_string(),
                 package_type: "full_runtime".to_string(),
                 description: None,
@@ -1316,7 +1316,7 @@ mod tests {
         let plan = build_dry_run_plan(&validated, Some("worker-220"));
         assert_eq!(
             plan.target_dir,
-            PathBuf::from("/var/lib/fluxbee/dist/runtimes/ai.frontdesk.gov/1.0.1")
+            PathBuf::from("/var/lib/fluxbee/dist/runtimes/sy.frontdesk.gov/1.0.1")
         );
         assert_eq!(
             plan.manifest_path,
@@ -1331,7 +1331,7 @@ mod tests {
         write_package_json(
             &dir,
             r#"{
-  "name": "ai.frontdesk.gov",
+  "name": "sy.frontdesk.gov",
   "version": "1.0.0",
   "type": "full_runtime"
 }"#,
@@ -1355,7 +1355,7 @@ mod tests {
         write_package_json(
             &dir,
             r#"{
-  "name": "ai.frontdesk.gov",
+  "name": "sy.frontdesk.gov",
   "version": "1.0.0",
   "type": "full_runtime"
 }"#,
@@ -1383,7 +1383,7 @@ mod tests {
         write_package_json(
             &package_dir,
             r#"{
-  "name": "ai.frontdesk.gov",
+  "name": "sy.frontdesk.gov",
   "version": "1.0.0",
   "type": "full_runtime"
 }"#,
@@ -1413,7 +1413,7 @@ mod tests {
         let validated = validate_package(&package_dir, None).expect("validate");
         let install =
             install_validated_package(&validated, &runtimes_root, &manifest_path).expect("install");
-        assert_eq!(install.runtime_name, "ai.frontdesk.gov");
+        assert_eq!(install.runtime_name, "sy.frontdesk.gov");
         assert_eq!(install.runtime_version, "1.0.0");
         assert!(install.manifest_version > 1710000000000);
         assert!(install.installed_path.exists());
@@ -1438,7 +1438,7 @@ mod tests {
             .expect("load manifest")
             .expect("manifest exists");
         let runtimes = loaded.runtimes.as_object().expect("runtimes object");
-        let entry_value = runtimes.get("ai.frontdesk.gov").expect("runtime entry");
+        let entry_value = runtimes.get("sy.frontdesk.gov").expect("runtime entry");
         let entry: RuntimeManifestEntry =
             serde_json::from_value(entry_value.clone()).expect("entry deserialize");
         assert_eq!(entry.current.as_deref(), Some("1.0.0"));
@@ -1456,7 +1456,7 @@ mod tests {
         write_package_json(
             &package_dir,
             r#"{
-  "name": "ai.frontdesk.gov",
+  "name": "sy.frontdesk.gov",
   "version": "1.0.0",
   "type": "full_runtime"
 }"#,
@@ -1467,7 +1467,7 @@ mod tests {
 
         let dist_root = test_temp_dir("fluxbee-publish-install-existing-dist");
         let runtimes_root = dist_root.join("runtimes");
-        let target_dir = runtimes_root.join("ai.frontdesk.gov/1.0.0");
+        let target_dir = runtimes_root.join("sy.frontdesk.gov/1.0.0");
         fs::create_dir_all(&target_dir).expect("precreate target");
         let manifest_path = runtimes_root.join("manifest.json");
         let manifest = RuntimeManifest {
@@ -1500,7 +1500,7 @@ mod tests {
             version: 1710000000000,
             updated_at: Some("2026-03-16T00:00:00Z".to_string()),
             runtimes: serde_json::json!({
-                "ai.frontdesk.gov": {
+                "sy.frontdesk.gov": {
                     "available": ["0.9.0"],
                     "current": "0.9.0",
                     "type": "full_runtime",
@@ -1516,7 +1516,7 @@ mod tests {
         write_package_json(
             &package_dir,
             r#"{
-  "name": "ai.frontdesk.gov",
+  "name": "sy.frontdesk.gov",
   "version": "1.0.0",
   "type": "full_runtime"
 }"#,
@@ -1535,7 +1535,7 @@ mod tests {
         let runtimes = loaded.runtimes.as_object().expect("runtimes object");
         let entry: RuntimeManifestEntry = serde_json::from_value(
             runtimes
-                .get("ai.frontdesk.gov")
+                .get("sy.frontdesk.gov")
                 .cloned()
                 .expect("runtime entry"),
         )
@@ -1629,7 +1629,7 @@ mod tests {
         write_package_json(
             &package_dir,
             r#"{
-  "name": "ai.frontdesk.gov",
+  "name": "sy.frontdesk.gov",
   "version": "1.0.0",
   "type": "full_runtime"
 }"#,
@@ -1657,7 +1657,7 @@ mod tests {
             install_validated_package(&validated, &runtimes_root, &manifest_path).expect("install");
         assert!(install
             .installed_path
-            .ends_with(Path::new("ai.frontdesk.gov/2.4.1")));
+            .ends_with(Path::new("sy.frontdesk.gov/2.4.1")));
 
         let loaded = load_runtime_manifest_from_paths(std::slice::from_ref(&manifest_path))
             .expect("load manifest")
@@ -1665,7 +1665,7 @@ mod tests {
         let runtimes = loaded.runtimes.as_object().expect("runtimes object");
         let entry: RuntimeManifestEntry = serde_json::from_value(
             runtimes
-                .get("ai.frontdesk.gov")
+                .get("sy.frontdesk.gov")
                 .cloned()
                 .expect("runtime entry"),
         )

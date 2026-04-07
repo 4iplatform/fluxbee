@@ -106,6 +106,6 @@ The migration status today is:
 
 - `SY.architect`: migrated
 - `AI.common`: migrated with temporary compatibility
-- `AI.frontdesk.gov`: pending re-sync
+- `SY.frontdesk.gov`: pending re-sync
 - `IO.slack`: separate secret migration still pending
 - docs/examples: partial cleanup still pending

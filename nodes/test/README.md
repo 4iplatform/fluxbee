@@ -4,10 +4,10 @@ Este directorio contiene nodos de ejemplo orientados a validar transporte/routin
 real con el SDK, pero escritos para que también sirvan como referencia a equipos
 externos.
 
-Incluye dos runtimes mínimos:
+Incluye dos runtimes mí­nimos:
 
 - `IO.test`: conecta al router, obtiene/provisiona un ILK temporal opcionalmente
-  y envía un mensaje `Resolve`.
+  y enví­a un mensaje `Resolve`.
 - `AI.test.gov`: actúa como frontdesk simple, recibe el mensaje ruteado por el
   router y responde con un ack.
 - `IO.test.cognition`: emisor disposable para E2E de cognition por router con
@@ -51,7 +51,7 @@ nodes/test/
 
 ## Build
 
-Desde raíz del repo:
+Desde raí­z del repo:
 
 ```bash
 cargo check -p io-test
@@ -88,7 +88,7 @@ cargo run -p io-test
 Comportamiento esperado:
 
 1. `IO.test` provisiona un ILK temporal si no recibe uno por env.
-2. `IO.test` envía un mensaje `Resolve` con `meta.src_ilk`.
+2. `IO.test` enví­a un mensaje `Resolve` con `meta.src_ilk`.
 3. El router detecta `registration_status=temporary` y fuerza destino a
    `AI.test.gov@motherbee` sin entrar a OPA.
 4. `AI.test.gov` registra el mensaje recibido y devuelve un reply simple a
@@ -113,18 +113,18 @@ Esto aplica tanto al spawn normal como al relaunch de reboot/reconcile.
 Ejemplo:
 
 ```bash
-FLUXBEE_NODE_NAME="AI.frontdesk.gov@motherbee"
+FLUXBEE_NODE_NAME="SY.frontdesk.gov@motherbee"
 ```
 
 Para ese caso, el path de instancia esperado es:
 
 ```text
-/var/lib/fluxbee/nodes/AI/AI.frontdesk.gov@motherbee/config.json
+/var/lib/fluxbee/nodes/SY/SY.frontdesk.gov@motherbee/config.json
 ```
 
 ### Por qué este contrato
 
-- evita duplicar `NODE_NAME` y `NODE_CONFIG` como dos referencias que podrían divergir
+- evita duplicar `NODE_NAME` y `NODE_CONFIG` como dos referencias que podrí­an divergir
 - evita depender de argumentos en todos los `start.sh`
 - concentra el cambio en `SY.orchestrator` usando `systemd-run --setenv=...`
 - sirve igual para singleton e instanciado
@@ -154,7 +154,7 @@ let cfg = NodeConfig {
 
 Notas prácticas:
 
-- si el proceso arranca bajo orchestrator, `FLUXBEE_NODE_NAME` debería ganar siempre
+- si el proceso arranca bajo orchestrator, `FLUXBEE_NODE_NAME` deberí­a ganar siempre
 - las env vars legacy (`AI_TEST_NODE_NAME`, `IO_TEST_NODE_NAME`, `GOV_NODE_NAME`) quedan sólo como compatibilidad o uso manual
 - `_system.node_name` dentro de `config.json` sigue siendo la fuente de verdad persistida
 
@@ -167,12 +167,12 @@ Ejemplos:
 
 - `AI.*`, `IO.*` y `WF.*` suelen correr como runtimes gestionados publicados
   en `dist`
-- un nodo `AI.*` puede cumplir un rol muy importante en la arquitectura y aun así
+- un nodo `AI.*` puede cumplir un rol muy importante en la arquitectura y aun así­
   seguir estando en el modelo de runtime gestionado
 - `SY.*` identifica control-plane/core del sistema
 - `RT.gateway` identifica infraestructura base del hive
 
-Entonces, para v1, la regla operativa no es “AI/IO/WF sí, resto no”.
+Entonces, para v1, la regla operativa no es "AI/IO/WF sí­, resto no".
 
 La regla real es:
 
@@ -260,14 +260,14 @@ cargo run -p io-test-cognition
 
 Comportamiento esperado:
 
-1. `IO.test.cognition` calcula un `thread_id` canónico y envía un primer turn
+1. `IO.test.cognition` calcula un `thread_id` canónico y enví­a un primer turn
    unicast a `AI.test.cognition@<hive>`.
 2. El router asigna `thread_seq` y entrega al nodo receptor.
 3. `AI.test.cognition` devuelve en el reply su observación del mensaje recibido:
    - `thread_id`
    - `thread_seq`
    - presencia/ausencia de `memory_package`
-4. `IO.test.cognition` envía turns adicionales sobre el mismo thread hasta
+4. `IO.test.cognition` enví­a turns adicionales sobre el mismo thread hasta
    observar `memory_package` o agotar el máximo configurado.
 
 Variables útiles:

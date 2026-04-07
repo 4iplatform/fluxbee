@@ -1,8 +1,8 @@
-﻿# AI Runner - Immediate Memory Integration Tasks
+# AI Runner - Immediate Memory Integration Tasks
 
 ## Objetivo
 
-Integrar memoria inmediata en `ai_node_runner` para nodos `AI.*` (incluyendo `AI.chat` y `AI.frontdesk.gov`), manteniendo compatibilidad con el comportamiento actual y actualizando deploy/docs.
+Integrar memoria inmediata en `ai_node_runner` para nodos `AI.*` (incluyendo `AI.chat` y `SY.frontdesk.gov`), manteniendo compatibilidad con el comportamiento actual y actualizando deploy/docs.
 
 ## Checklist
 
@@ -32,10 +32,10 @@ Integrar memoria inmediata en `ai_node_runner` para nodos `AI.*` (incluyendo `AI
   - degradación segura ante fallas de persistencia
 - [x] 9. Ajustar deploy para configuración de immediate memory:
   - decidir si `scripts/deploy-ia-node.sh` incorpora flags o si se documenta solo vía `--config-json`.
-  - mantener compatibilidad con comandos actuales de spawn (`AI.chat` y `AI.frontdesk.gov`).
+  - mantener compatibilidad con comandos actuales de spawn (`AI.chat` y `SY.frontdesk.gov`).
 - [x] 10. Actualizar ejemplos de config:
   - `AI.chat@motherbee` con immediate memory habilitada.
-  - `AI.frontdesk.gov@motherbee` con immediate memory + thread_state.
+  - `SY.frontdesk.gov@motherbee` con immediate memory + thread_state.
 - [ ] 11. Validar E2E con flujo actual de spawn:
   - continuidad entre turnos
   - aislamiento por `src_ilk`

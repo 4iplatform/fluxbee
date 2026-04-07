@@ -313,7 +313,7 @@ mod tests {
                 schema_version: 1,
                 config_version: 7,
                 apply_mode: NODE_CONFIG_APPLY_MODE_REPLACE.to_string(),
-                config: json!({"io":{"dst_node":"AI.frontdesk.gov@motherbee"}}),
+                config: json!({"io":{"dst_node":"SY.frontdesk.gov@motherbee"}}),
                 ..Default::default()
             },
             &NodeConfigEnvelopeOptions::default(),

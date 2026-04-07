@@ -1,4 +1,4 @@
-﻿# AI Nodes Specification — Consolidated Draft Replacement (v1)
+# AI Nodes Specification — Consolidated Draft Replacement (v1)
 
 > ✅ Este documento consolida las Partes 1–5 en una única especificación “reemplazo” para **AI Nodes** en Fluxbee.  
 > Alcance: **AI Nodes** (Control Plane + Data Plane + Behaviors/Providers + Schema/Validation + Operación).  
@@ -499,7 +499,7 @@ Códigos recomendados (no exhaustivo):
 
 ✅ **NORMATIVO (alineación core)**:
 - Los mensajes `user` deben incluir `src_ilk` como ILK **siempre presente**.
-- `src_ilk` puede estar en estado **temporary** (identidad incompleta). En ese caso, nodos como `AI.frontdesk.gov` actúan para completar/actualizar la identidad a través del pipeline de sistema (no “inventan” identity).
+- `src_ilk` puede estar en estado **temporary** (identidad incompleta). En ese caso, nodos como `SY.frontdesk.gov` actúan para completar/actualizar la identidad a través del pipeline de sistema (no “inventan” identity).
 
 > Nota: los detalles del provisioning/upgrade viven en core (SY.admin/SY.orchestrator/SY.identity); el nodo AI solo consume `src_ilk`.
 
@@ -902,7 +902,7 @@ Estructura:
 
 ✅ **NORMATIVO**:
 - `AI.common`: `capabilities.multimodal=true` por default.
-- `AI.frontdesk.gov`: `capabilities.multimodal=false` por default (temporal, revisable).
+- `SY.frontdesk.gov`: `capabilities.multimodal=false` por default (temporal, revisable).
 - Ambos runtimes permiten override explícito vía config (`behavior.capabilities.multimodal`).
 
 ✅ **NORMATIVO**:
@@ -1180,7 +1180,7 @@ secrets:
 - `behavior.params.*` (temperature/top_p/max_output_tokens/timeouts) es **opcional** salvo los requeridos condicionales.
 - `capabilities.*` es opcional:
   - en `AI.common`: `multimodal=true` por default,
-  - en `AI.frontdesk.gov`: `multimodal=false` por default.
+  - en `SY.frontdesk.gov`: `multimodal=false` por default.
 
 > Nota: materializar defaults evita “config implícita” y facilita operación y debugging.
 
@@ -1586,7 +1586,7 @@ Installs:
 
 Per-instance runtime profile:
 - `AI.common`: tools/behavior de AI común (sin identidad gov).
-- `AI.frontdesk.gov`: tools/behavior de frontdesk gov (incluye identidad, por ejemplo `ilk_register`).
+- `SY.frontdesk.gov`: tools/behavior de frontdesk gov (incluye identidad, por ejemplo `ilk_register`).
 - no se usa `AI_NODE_MODE` para seleccionar capacidades del runtime.
 
 Manage instances with `ai-nodectl`:

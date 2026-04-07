@@ -3944,7 +3944,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: "SY.orchestrator@motherbee".to_string(),
-                dst: Destination::Unicast("AI.frontdesk.gov@motherbee".to_string()),
+                dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-123".to_string(),
             },
@@ -3994,7 +3994,7 @@ mod tests {
         let gov_identity = GovIdentityConfig::default();
         GenericAiNode {
             mode: RunnerMode::Default,
-            node_name: "AI.frontdesk.gov".to_string(),
+            node_name: "SY.frontdesk.gov".to_string(),
             behavior: Arc::new(RwLock::new(None)),
             dynamic_config_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
@@ -4121,7 +4121,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: "IO.sim.local@motherbee".to_string(),
-                dst: Destination::Unicast("AI.frontdesk.gov@motherbee".to_string()),
+                dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-user-123".to_string(),
             },

@@ -276,7 +276,7 @@ async fn main() -> Result<(), DiagError> {
         if let Some(target_hive) = hive_from_node_name(&target) {
             if target_hive != hive_id {
                 return Err(format!(
-                    "IDENTITY_PROVISION_COMPLETE_TARGET={} points to remote hive '{}', but this E2E validates local routing probe to AI.frontdesk@{}. Use local target or set IDENTITY_PROVISION_COMPLETE_ALLOW_REMOTE_TARGET=true",
+                    "IDENTITY_PROVISION_COMPLETE_TARGET={} points to remote hive '{}', but this E2E validates local routing probe to SY.frontdesk.gov@{}. Use local target or set IDENTITY_PROVISION_COMPLETE_ALLOW_REMOTE_TARGET=true",
                     target, target_hive, hive_id
                 )
                 .into());
@@ -299,7 +299,7 @@ async fn main() -> Result<(), DiagError> {
     );
     let frontdesk_node_name = env_or(
         "IDENTITY_PROVISION_COMPLETE_FRONTDESK_NODE_NAME",
-        &format!("AI.frontdesk@{}", hive_id),
+        &format!("SY.frontdesk.gov@{}", hive_id),
     );
 
     let io_cfg = NodeConfig {

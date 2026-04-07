@@ -91,7 +91,7 @@ hive_id: produccion
 role: motherbee
 
 government:
-  identity_frontdesk: "AI.frontdesk@motherbee"
+  identity_frontdesk: "SY.frontdesk.gov@motherbee"
 
 wan:
   gateway_name: RT.gateway         # Opcional, default: RT.gateway
@@ -137,7 +137,7 @@ hive_id: staging
 role: worker
 
 government:
-  identity_frontdesk: "AI.frontdesk@motherbee"
+  identity_frontdesk: "SY.frontdesk.gov@motherbee"
 
 wan:
   gateway_name: RT.gateway
@@ -176,9 +176,9 @@ identity:
 
 | Campo | Obligatorio | Default | Descripción |
 |-------|-------------|---------|-------------|
-| `hive_id` | **Sí** | - | Identificador único de la isla |
+| `hive_id` | **Sí­** | - | Identificador único de la isla |
 | `role` | No | `worker` | `motherbee` o `worker` |
-| `government.identity_frontdesk` | No | `AI.frontdesk@<hive_id>` | Nodo L2 de frontdesk para ruteo de ILK temporales (puede apuntar a motherbee) |
+| `government.identity_frontdesk` | No | `SY.frontdesk.gov@<hive_id>` | Nodo L2 de frontdesk para ruteo de ILK temporales (puede apuntar a motherbee) |
 | `identity.max_ilks` | No | `1000000` | Límite superior de ILKs para región SHM identity |
 | `identity.max_tenants` | No | `10000` | Límite de tenants para región SHM identity |
 | `identity.max_vocabulary` | No | `4096` | Límite de vocabulary en SHM identity |
@@ -1299,7 +1299,7 @@ curl -X POST http://localhost:8080/hives \
 | SY.config.routes | ❌ No | Crítico para routing |
 | SY.opa.rules | ❌ No | Crítico para policies |
 | SY.identity | ❌ No | Crítico para L3/ILKs |
-| AI.*, WF.*, IO.* | ✅ Sí | Nodos de aplicación |
+| AI.*, WF.*, IO.* | ✅ Sí­ | Nodos de aplicación |
 
 ---
 

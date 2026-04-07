@@ -102,7 +102,7 @@ const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "sy-architect",
     "sy-storage",
     "sy-cognition",
-    "ai-frontdesk-gov",
+    "sy-frontdesk-gov",
     "sy-orchestrator",
 ];
 const WORKER_MIN_CORE_COMPONENTS: [&str; 6] = [
@@ -420,7 +420,7 @@ const MOTHERBEE_CRITICAL_SERVICES: [&str; 9] = [
     "sy-architect",
     "sy-storage",
     "sy-cognition",
-    "ai-frontdesk-gov",
+    "sy-frontdesk-gov",
 ];
 const WORKER_CRITICAL_SERVICES: [&str; 5] = [
     "rt-gateway",
@@ -647,7 +647,7 @@ async fn bootstrap_local(
             "sy-architect",
             "sy-storage",
             "sy-cognition",
-            "ai-frontdesk-gov",
+            "sy-frontdesk-gov",
         ]
     } else {
         vec!["sy-config-routes", "sy-opa-rules", "sy-cognition"]
@@ -1134,7 +1134,7 @@ async fn shutdown_sequence(state: &OrchestratorState) {
     time::sleep(Duration::from_secs(10)).await;
 
     for service in [
-        "ai-frontdesk-gov",
+        "sy-frontdesk-gov",
         "sy-cognition",
         "sy-storage",
         "sy-architect",
@@ -7019,7 +7019,7 @@ fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
 }
 
 fn remove_hive_cleanup_script() -> &'static str {
-    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-cognition sy-orchestrator sy-admin sy-architect sy-storage ai-frontdesk-gov fluxbee-syncthing; do \
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-cognition sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov fluxbee-syncthing; do \
 systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
 systemctl disable \"$s\" >/dev/null 2>&1 || true; \
 systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
@@ -13366,7 +13366,7 @@ async fn add_hive_flow(
     let identity_frontdesk_node_name = local_hive
         .as_ref()
         .map(identity_frontdesk_node_name_from_hive)
-        .unwrap_or_else(|| format!("AI.frontdesk@{}", state.hive_id));
+        .unwrap_or_else(|| format!("SY.frontdesk.gov@{}", state.hive_id));
     let identity_sync_port = local_hive
         .as_ref()
         .map(identity_sync_port_from_hive)
@@ -14851,7 +14851,7 @@ fn identity_frontdesk_node_name_from_hive(hive: &HiveFile) -> String {
     match configured {
         Some(value) if value.contains('@') => value.to_string(),
         Some(value) => format!("{value}@{}", hive.hive_id),
-        None => format!("AI.frontdesk@{}", hive.hive_id),
+        None => format!("SY.frontdesk.gov@{}", hive.hive_id),
     }
 }
 
@@ -15664,7 +15664,7 @@ blob:
             None
         );
         assert_eq!(
-            managed_spawn_disallowed_reason("AI.frontdesk.gov@motherbee"),
+            managed_spawn_disallowed_reason("SY.frontdesk.gov@motherbee"),
             None
         );
     }

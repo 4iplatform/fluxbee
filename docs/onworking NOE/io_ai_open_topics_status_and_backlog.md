@@ -288,7 +288,7 @@ Se marcaron como cerradas en docs existentes las siguientes tareas porque ya coi
 
 Motivo:
 
-- ambos runners (`AI.common` y `AI.frontdesk.gov`) ya usan el mismo camino del SDK AI para resolver input, construir parts estructurados y mantener fallback textual/controlado
+- ambos runners (`AI.common` y `SY.frontdesk.gov`) ya usan el mismo camino del SDK AI para resolver input, construir parts estructurados y mantener fallback textual/controlado
 
 ## Gaps que seguian repartidos y conviene explicitar aca
 
@@ -332,7 +332,7 @@ Todavia falta volverlo garantia de arquitectura para cualquier adapter nuevo med
 
 ### Gap transversal D - attachments AI alineados a Agents SDK completos
 
-El objetivo no es “leer algunos adjuntos”.
+El objetivo no es "leer algunos adjuntos".
 El objetivo es:
 
 - soportar todos los modos representables desde Fluxbee sin desviar el modelo OpenAI
@@ -535,7 +535,7 @@ Backlog propuesto:
   - texto breve + archivos
   - solo archivo si aplica
   - offload de texto largo a `content_ref` si hiciera falta
-[ ] AI 4bis.5: integrar ese camino en runners `AI.common` y `AI.frontdesk.gov`
+[ ] AI 4bis.5: integrar ese camino en runners `AI.common` y `SY.frontdesk.gov`
   - mantener backward compatibility del caso actual `String -> build_text_response(...)`
   - usar el camino nuevo solo cuando el behavior devuelva artefactos finales
 [ ] AI 4bis.6: definir politica de fallback/error para generacion de artefactos
@@ -602,9 +602,9 @@ Prioridad: P2
 ## Items que estaban afuera o poco visibles y se agregan explicitamente
 
 1. El riesgo de heredar estado dinamico viejo no es solo AI; tambien puede afectar IO si el lifecycle pretende ser limpio.
-2. El soporte completo “alineado a Agents SDK” no se agota en aceptar blobs locales; incluye decidir y documentar los modos diferidos por transporte.
+2. El soporte completo "alineado a Agents SDK" no se agota en aceptar blobs locales; incluye decidir y documentar los modos diferidos por transporte.
 3. El envio saliente de adjuntos desde runners AI no esta cerrado como flujo funcional general, aunque el SDK ya tenga primitives para texto largo y parts estructurados de entrada.
-4. La garantia “esto aplica a cualquier IO nuevo” todavia no existe como enforcement de arquitectura; hoy existe como implementacion correcta del camino actual.
+4. La garantia "esto aplica a cualquier IO nuevo" todavia no existe como enforcement de arquitectura; hoy existe como implementacion correcta del camino actual.
 
 ## Orden recomendado para avanzar
 

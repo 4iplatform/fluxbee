@@ -1,163 +1,86 @@
-# Frontdesk Singleton System-Default Direction
+# Frontdesk Singleton System Default Direction
 
 Fecha: 2026-04-06
-Estado: propuesta de refinamiento sobre estado actual del repo
+Estado: propuesta de direccion
 
 ## 1. Objetivo
 
-Dejar explícita la dirección de producto/arquitectura para `AI.frontdesk.gov` a partir del estado actual del repo:
+Dejar explicita la direccion actual para `SY.frontdesk.gov`:
 
-- se parece más a `SY.architect` en ownership y bootstrap,
-- pero no necesita convertirse en `SY.*`,
-- y no debe seguir pensándose como "un AI node más" ni como `AI.common` con otro prompt.
+- debe parecerse mas a `SY.architect` en ownership y bootstrap
+- ya no debe tratarse como un `AI.*` comun
+- debe considerarse nodo singleton del sistema por hive
 
-Este documento no cambia el contrato actual del core.
-Ordena la lectura de lo ya documentado y separa:
+## 2. Sintesis propuesta
 
-- lo que ya favorece esta dirección,
-- lo que sigue heredado del modelo viejo,
-- y lo que habría que redefinir después.
+Direccion propuesta:
 
-## 2. Síntesis propuesta
+- `SY.frontdesk.gov` se trata como nodo `SY.*`
+- existe una sola instancia canonica por hive
+- sale con el sistema
+- su prompt y flujo base pertenecen al runtime del propio frontdesk
+- no debe depender de cargar su prompt funcional por `CONFIG_SET`
+- las keys siguen separadas del prompt y, por ahora, pueden entrar temporalmente por `CONFIG_SET`
 
-Dirección propuesta:
+## 3. Evidencia del repo que ya favorece esta direccion
 
-- `AI.frontdesk.gov` sigue siendo formalmente un runtime/nodo no-`SY`.
-- Debe tratarse como un nodo `system-default` por hive.
-- Debe existir una sola instancia canónica por hive.
-- Su prompt y flujo base deben pertenecer al runtime `AI.frontdesk.gov`.
-- No debe depender de que el operador cargue el prompt funcional por `CONFIG_SET`.
-- Las secrets/keys deben seguir separadas del prompt y persistidas como secreto local del nodo.
+- `government.identity_frontdesk` existe como referencia canonica en config de hive
+- el router puede forzar destino al frontdesk cuando `registration_status=temporary`
+- `SY.identity` autoriza operaciones sensibles para el frontdesk configurado
+- el servicio ya forma parte del set base que orchestrator contempla
 
-En términos prácticos:
+## 4. Que quedo heredado del modelo viejo
 
-- `AI.frontdesk.gov` no debe seguir pensándose como `AI.common` + config.
-- Debe pensarse como runtime singleton especializado del sistema.
+Todavia quedan rastros de la etapa previa:
 
-## 3. Evidencia del repo que ya favorece esta dirección
+- documentos que lo describian como `AI.frontdesk.gov`
+- runbooks que lo trataban como runtime AI gestionado por deploy/spawn
+- ejemplos donde el prompt funcional completo vivia en config mutable
 
-### 3.1 Frontdesk ya está tratado como nodo especial del sistema
+## 5. Direccion recomendada
 
-La spec vigente ya lo define así:
+Tomar como direccion estable:
 
-- `AI.frontdesk.gov` es un nodo AI no-`SY`, parte del "system default set": [ai-frontdesk-gov-spec.md](d:/repos/json-router/docs/ai-frontdesk-gov-spec.md)
-- Tiene nombre L2 fijo:
-  - `AI.frontdesk.gov`
-  - `AI.frontdesk.gov@<hive_id>`
+- `SY.frontdesk.gov` como nodo singleton `system-default`
+- prompt base runtime-owned
+- `CONFIG_SET` temporalmente permitido para keys y parametros operativos
+- decision final de bootstrap/secrets pendiente de `CORE`
 
-Esto ya favorece una instancia canónica por hive, no un pool replicable genérico.
+## 6. Implicancias practicas
 
-### 3.2 El core/router ya lo trata como destino especial
+### Prompt
 
-El core ya tiene una referencia canónica a "identity frontdesk":
+Debe vivir:
 
-- `government.identity_frontdesk` en config de hive: [mod.rs](d:/repos/json-router/src/config/mod.rs)
-- routing forzado cuando `registration_status=temporary`: [mod.rs](d:/repos/json-router/src/router/mod.rs)
-- autorización explícita en `SY.identity` para `ILK_REGISTER`, `ILK_ADD_CHANNEL` y `TNT_CREATE` del frontdesk configurado: [sy_identity.rs](d:/repos/json-router/src/bin/sy_identity.rs)
+- en codigo del runtime, o
+- en assets versionados del propio nodo
 
-Esto se parece más a un nodo sistémico singleton que a un `AI.*` arbitrario.
+No debe vivir como dependencia obligatoria de config operativa mutable.
 
-### 3.3 La separación por runtime ya está documentada
+### Keys
 
-El repo ya dejó atrás la dirección vieja de "mismo runner con flag gov" como objetivo final:
-
-- separación por runtime, no por `AI_NODE_MODE`: [README.md](d:/repos/json-router/nodes/ai/README.md)
-- `AI.frontdesk.gov` con ownership propio y no mezclado en `AI.common`: [README.md](d:/repos/json-router/nodes/gov/ai-frontdesk-gov/README.md)
-- el runbook AI ya dice:
-  - el prompt/flujo de `AI.frontdesk.gov` pertenece al runtime frontdesk
-  - `AI.common` no debe transportar lógica gov/frontdesk
-  : [ai-nodes-deploy-runbook.md](d:/repos/json-router/docs/ai-nodes-deploy-runbook.md)
-
-## 4. Qué quedó heredado del modelo viejo
-
-Todavía hay partes del repo que responden a la etapa anterior, donde frontdesk era tratado como un AI node más:
-
-- la spec actual todavía dice "usa el lifecycle estándar de AI Nodes": [ai-frontdesk-gov-spec.md](d:/repos/json-router/docs/ai-frontdesk-gov-spec.md)
-- el runbook operativo actual sigue planteando `publish/update/spawn` con el flujo normal de runtimes IA: [ai-nodes-deploy-runbook.md](d:/repos/json-router/docs/ai-nodes-deploy-runbook.md)
-- el ejemplo de config de frontdesk mete el prompt funcional completo en config mutable: [ai_frontdesk_gov.config.json](d:/repos/json-router/docs/examples/ai_frontdesk_gov.config.json)
-- varios documentos viejos todavía reflejan la etapa `mode=gov`: [frontdesk-ai-nodes-implementation-spec.md](d:/repos/json-router/docs/onworking%20NOE/frontdesk-ai-nodes-implementation-spec.md)
-
-Nada de eso invalida la nueva dirección.
-Solo muestra que deploy/bootstrap/config todavía no fueron realineados del todo.
-
-## 5. Comparación útil con `SY.architect`
-
-Lo que sí conviene tomar de `SY.architect`:
-
-- prompt base perteneciente al nodo/runtime, no a config mutable del operador
-- separación entre comportamiento base y secrets
-- comportamiento estable aunque la key no esté configurada todavía
-- identidad operacional fuerte del nodo dentro del sistema
-
-Lo que no hace falta copiar literalmente:
-
-- no hace falta convertir frontdesk a `SY.*`
-- no hace falta desplegarlo exactamente como binario core estilo `sy-architect`
-- no hace falta meterlo dentro del mismo lifecycle que los daemons core
-
-Conclusión:
-
-- "parecerse a architect" debe leerse como ownership/bootstrapping,
-- no como cambio automático de clase a `SY.*`.
-
-## 6. Dirección recomendada
-
-Lectura recomendada del repo a partir de ahora:
-
-- `AI.frontdesk.gov` = runtime singleton system-default por hive
-- no replicable por diseño operativo normal
-- su comportamiento base vive con el runtime
-- `CONFIG_SET` queda para configuración operativa/secrets, no para transportar el prompt funcional principal
-
-## 7. Implicancias prácticas
-
-### 7.1 Prompt
-
-El prompt funcional de frontdesk debería vivir:
-
-- en código del runtime, o
-- en assets versionados dentro del package/runtime `AI.frontdesk.gov`
-
-No debería vivir como dependencia obligatoria de:
-
-- `config.behavior.instructions` cargado por deploy manual,
-- o un ejemplo JSON copiado por operador para que el nodo "cobre identidad".
-
-### 7.2 Keys
-
-Las keys de provider no necesitan cambiar de modelo.
-La dirección vigente del repo ya es razonable:
+Solucion temporal vigente:
 
 - `config.secrets.openai.api_key`
-- persistencia local en `secrets.json`
-- hot reload por `CONFIG_SET`
+- persistencia en `secrets.json`
+- entrada via `CONFIG_SET`
 
-Eso ya está alineado con la idea de separar prompt de secreto.
+Solucion final:
 
-### 7.3 Deploy
+- pendiente de definicion de `CORE`
 
-El deploy actual por `publish/update/spawn` debe leerse como estado heredado, no como decisión cerrada.
+### Deploy
 
-Lo importante a redefinir después no es primero el mecanismo exacto, sino el contrato esperado:
+El deploy heredado no debe leerse como contrato final.
+Lo importante es la semantica:
 
-- frontdesk sale con el sistema,
-- hay una sola instancia canónica por hive,
-- no depende de inyectarle el prompt funcional por config mutable.
+- sale con el sistema
+- hay una sola instancia por hive
+- y su comportamiento base no depende de inyectar prompt por config mutable
 
-## 8. Criterio de lectura recomendado para próximos cambios
+## 7. Tareas derivadas
 
-Hasta que se redefina formalmente el deploy/bootstrap:
-
-- si hay conflicto entre "frontdesk como AI node genérico" y "frontdesk como singleton system-default", tomar esta segunda lectura como dirección objetivo,
-- manteniendo compatibilidad con el core actual.
-
-## 9. Tareas derivadas
-
-- [ ] Definir documentalmente el contrato objetivo de deploy/bootstrap para `AI.frontdesk.gov` como singleton system-default por hive.
-- [x] Mover el prompt funcional principal de frontdesk fuera de config operativa mutable.
-- [ ] Revisar si el deploy actual debe seguir usando el camino general `deploy-ia-node.sh` o si necesita un camino de instalación/base distinto.
-- [ ] Actualizar la spec de frontdesk para reflejar:
-  - singleton por hive,
-  - ownership del prompt por runtime,
-  - y separación entre prompt base vs secrets/config operativa.
-- [ ] Revisar si el nombre canónico debe seguir siendo `AI.frontdesk.gov` o si el core/doc histórica todavía asume `AI.frontdesk`.
+- [ ] Definir documentalmente el contrato objetivo de bootstrap/deploy para `SY.frontdesk.gov`
+- [x] Mover el prompt funcional principal de frontdesk fuera de config operativa mutable
+- [ ] Definir con `CORE` el modelo final de keys/secrets para frontdesk
+- [ ] Revisar si queda algun surface/trace importante con naming viejo

@@ -1257,7 +1257,7 @@ mod tests {
             flags: FLAG_ACTIVE,
             tenant_id: [0; 16],
             display_name: encode_fixed::<128>("Alice"),
-            handler_node: encode_fixed::<128>("AI.frontdesk@motherbee"),
+            handler_node: encode_fixed::<128>("SY.frontdesk.gov@motherbee"),
             ich_offset: 0,
             ich_count: 0,
             _pad0: [0; 2],

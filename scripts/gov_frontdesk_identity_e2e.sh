@@ -3,7 +3,7 @@ set -euo pipefail
 
 BUILD_BIN="${BUILD_BIN:-0}"
 IDENTITY_TARGET="${IDENTITY_TARGET:-SY.identity@sandbox}"
-FRONTDESK_NODE_NAME="${FRONTDESK_NODE_NAME:-AI.frontdesk.gov@sandbox}"
+FRONTDESK_NODE_NAME="${FRONTDESK_NODE_NAME:-SY.frontdesk.gov@sandbox}"
 MERGE_TARGET="${MERGE_TARGET:-SY.identity@worker-220}"
 MERGE_FALLBACK_TARGET="${MERGE_FALLBACK_TARGET:-SY.identity@sandbox}"
 

@@ -127,10 +127,10 @@ RUST_LOG=info,fluxbee_ai_nodes=debug,fluxbee_ai_sdk=debug
 EOF
 ```
 
-Example for `AI.frontdesk.gov` (gov mode + identity targets):
+Example for `SY.frontdesk.gov` (gov mode + identity targets):
 
 ```bash
-sudo tee /etc/fluxbee/ai-nodes/ai-frontdesk-gov.env >/dev/null <<'EOF'
+sudo tee /etc/fluxbee/ai-nodes/sy-frontdesk-gov.env >/dev/null <<'EOF'
 AI_NODE_MODE=gov
 OPENAI_API_KEY=sk-REPLACE_ME
 GOV_IDENTITY_TARGET=SY.identity

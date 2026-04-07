@@ -671,13 +671,13 @@ Los routers pueden:
 |---------|-------------------|---------|-----------|
 | `ILK_PROVISION` | `IO.*@*` | `SY.identity@<hive>` | Crear ILK temporal para ICH desconocido |
 | `ILK_PROVISION_RESPONSE` | `SY.identity` | Originador | Resultado de provisión |
-| `ILK_REGISTER` | `AI.frontdesk@*`, `SY.orchestrator@*` | `SY.identity@<primary_hive>` | Completar ILK temporal o registrar nodo |
+| `ILK_REGISTER` | `SY.frontdesk.gov@*`, `SY.orchestrator@*` | `SY.identity@<primary_hive>` | Completar ILK temporal o registrar nodo |
 | `ILK_REGISTER_RESPONSE` | `SY.identity` | Originador | Resultado de registro |
-| `ILK_ADD_CHANNEL` | `AI.frontdesk@*` | `SY.identity@<primary_hive>` | Asociar canal y opcionalmente mergear ILK temporal |
+| `ILK_ADD_CHANNEL` | `SY.frontdesk.gov@*` | `SY.identity@<primary_hive>` | Asociar canal y opcionalmente mergear ILK temporal |
 | `ILK_ADD_CHANNEL_RESPONSE` | `SY.identity` | Originador | Resultado de asociación/merge |
 | `ILK_UPDATE` | `SY.orchestrator@*` | `SY.identity@<primary_hive>` | Actualizar metadata del ILK (roles/capabilities/channels) |
 | `ILK_UPDATE_RESPONSE` | `SY.identity` | Originador | Resultado de update |
-| `TNT_CREATE` | `AI.frontdesk@*` | `SY.identity@<primary_hive>` | Crear tenant (típicamente `pending`) |
+| `TNT_CREATE` | `SY.frontdesk.gov@*` | `SY.identity@<primary_hive>` | Crear tenant (típicamente `pending`) |
 | `TNT_CREATE_RESPONSE` | `SY.identity` | Originador | Resultado de create tenant |
 | `TNT_APPROVE` | `SY.admin@*` | `SY.identity@<primary_hive>` | Aprobar tenant pending |
 | `TNT_APPROVE_RESPONSE` | `SY.identity` | Originador | Resultado de approve tenant |
@@ -1605,7 +1605,7 @@ impl MyNode {
 | Handshake HELLO/ANNOUNCE | Librería |
 | Reconexión automática con backoff | Librería |
 | Envío de WITHDRAW en close() | Librería |
-| Resolver UUID L1 (persistente o efímero) | Librería |
+| Resolver UUID L1 (persistente o efÃ­mero) | Librería |
 | Agregar @isla al nombre | Librería |
 | Request/response (correlación) | **Nodo** |
 | Qué hacer post-reconexión | **Nodo** |

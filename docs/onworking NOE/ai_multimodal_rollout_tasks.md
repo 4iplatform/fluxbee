@@ -21,13 +21,13 @@ Objetivo: habilitar procesamiento multimodal en nodos AI de forma segura, empeza
 
 ## Alcance
 
-- Incluye: `fluxbee_ai_sdk`, runners `AI.common` / `AI.frontdesk.gov` (wiring/config), `IO.slack` (UX de error outbound), docs AI.
+- Incluye: `fluxbee_ai_sdk`, runners `AI.common` / `SY.frontdesk.gov` (wiring/config), `IO.slack` (UX de error outbound), docs AI.
 - Excluye por ahora: cambios de producto gov especificos (solo dejar preparado para decision futura).
 
 ## Fase 0 - Definiciones de contrato (bloqueante)
 
 - [x] M0.1 Cerrar spec: `AI.common` con `multimodal=true` por default.
-- [x] M0.2 Cerrar spec: `AI.frontdesk.gov` default temporal (`false`) con override via config.
+- [x] M0.2 Cerrar spec: `SY.frontdesk.gov` default temporal (`false`) con override via config.
 - [x] M0.3 Cerrar matriz MIME inicial:
   - aceptar en multimodal: `image/png`, `image/jpeg`, `image/webp`
   - mantener textuales: `text/plain`, `text/markdown`, `application/json`
@@ -38,7 +38,7 @@ Objetivo: habilitar procesamiento multimodal en nodos AI de forma segura, empeza
 - [x] M1.1 Soportar `behavior.capabilities.multimodal` en config efectiva (`CONFIG_SET` + bootstrap/persisted).
 - [x] M1.2 Aplicar defaults por runtime:
   - `AI.common`: `multimodal=true`
-  - `AI.frontdesk.gov`: `multimodal=false`
+  - `SY.frontdesk.gov`: `multimodal=false`
 - [x] M1.3 Exponer en `CONFIG_GET` el valor efectivo de `multimodal`.
 
 ## Fase 2 - SDK AI: input multimodal estructurado
@@ -62,7 +62,7 @@ Objetivo: habilitar procesamiento multimodal en nodos AI de forma segura, empeza
 ## Fase 4 - Runner wiring
 
 - [x] M4.1 `AI.common`: usar camino multimodal del SDK segun config efectiva.
-- [x] M4.2 `AI.frontdesk.gov`: mismo wiring, respetando default/override.
+- [x] M4.2 `SY.frontdesk.gov`: mismo wiring, respetando default/override.
 - [x] M4.3 Evitar logica duplicada fuera del SDK AI.
 - [x] M4.4 Regla explicita:
   - si hay adjunto no textual y `multimodal=true`, no degradar a texto en modo tools

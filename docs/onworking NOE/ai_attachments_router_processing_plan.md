@@ -1,7 +1,7 @@
 # AI Attachments - Immediate Plan (router inbound first, checklist)
 
 Date: 2026-04-01
-Scope: `AI.common`, `AI.frontdesk.gov`, `fluxbee_ai_sdk`
+Scope: `AI.common`, `SY.frontdesk.gov`, `fluxbee_ai_sdk`
 
 ## Objective (immediate)
 
@@ -251,13 +251,13 @@ Implemented in both runners:
    - `nodes/ai/ai-generic/src/bin/ai_node_runner.rs`
    - `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs`
 
-### D. Runner parity (AI.common + AI.frontdesk.gov)
+### D. Runner parity (AI.common + SY.frontdesk.gov)
 
 - [x] D1. Confirm both runners use the exact same SDK attachment path.
 - [x] D2. Remove/avoid diverging per-runner attachment logic.
 - [x] D3. Preserve defaults:
   - `AI.common` multimodal=true
-  - `AI.frontdesk.gov` multimodal=false (override allowed)
+  - `SY.frontdesk.gov` multimodal=false (override allowed)
 - [x] D4. Enforce behavior for multimodal=false:
   - reject non-text attachments with canonical error
   - keep runtime alive and control-plane responsive
@@ -315,4 +315,4 @@ Milestone is done when:
 3. Router inbound attachments are processable for common MIME (text + png/jpg/webp + pdf with deterministic behavior).
 4. Node never crashes on attachment errors.
 5. Errors are canonical and actionable.
-6. AI.common and AI.frontdesk.gov behave consistently through shared SDK path.
+6. AI.common and SY.frontdesk.gov behave consistently through shared SDK path.

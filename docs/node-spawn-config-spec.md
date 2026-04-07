@@ -32,7 +32,7 @@ When orchestrator spawns a business node (AI, WF, IO), the node needs configurat
 ```
 /var/lib/fluxbee/nodes/
 ├── AI/
-│   └── AI.frontdesk@motherbee/
+│   └── SY.frontdesk.gov@motherbee/
 │       ├── config.json   # written by orchestrator
 │       └── state.json    # written by node
 ├── WF/
@@ -91,8 +91,8 @@ fn state_path(node_name: &str) -> PathBuf {
 
 ```json
 {
-  "node_name": "AI.frontdesk.gov",
-  "runtime": "ai.frontdesk.gov",
+  "node_name": "SY.frontdesk.gov",
+  "runtime": "sy.frontdesk.gov",
   "runtime_version": "current",
   "config": {
     "tenant_id": "tnt:...",

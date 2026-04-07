@@ -5,13 +5,13 @@ Estado: propuesta para ejecución por etapas
 
 ## 1. Objetivo
 
-Resolver dos líneas críticas de trabajo en AI Nodes sin retrabajo:
+Resolver dos lí­neas crí­ticas de trabajo en AI Nodes sin retrabajo:
 
-1. separar `AI.common` y `AI.frontdesk.gov` como runtimes con ownership y responsabilidad distinta;
+1. separar `AI.common` y `SY.frontdesk.gov` como runtimes con ownership y responsabilidad distinta;
 2. integrar contrato de blobs (`text/v1`: `content_ref` + `attachments`) en AI Nodes.
 
 Este plan asume la directriz actual:
-- `AI.frontdesk.gov` no debe depender de `nodes/ai/common`;
+- `SY.frontdesk.gov` no debe depender de `nodes/ai/common`;
 - frontdesk/gov debe apoyarse en `nodes/gov/common` + SDKs.
 
 ## 2. Estrategia de orden (recomendada)
@@ -33,7 +33,7 @@ Motivo:
 - Sin tools/flujo gov.
 - Sin flags de modo `gov`.
 
-### 3.2 `AI.frontdesk.gov` (familia gov)
+### 3.2 `SY.frontdesk.gov` (familia gov)
 
 - Runtime especializado para frontdesk.
 - Prompt/flujo funcional propio de frontdesk.
@@ -51,25 +51,25 @@ Motivo:
 
 - [x] A1. Documentar oficialmente la frontera:
   - `AI.common` no consume `nodes/gov/common`.
-  - `AI.frontdesk.gov` no consume `nodes/ai/common`.
+  - `SY.frontdesk.gov` no consume `nodes/ai/common`.
 - [x] A2. Declarar deprecado el uso de `AI_NODE_MODE=gov` para distinguir runtimes.
 - [x] A3. Definir contrato de prompts frontdesk:
-  - prompts/versionado ligados al runtime `AI.frontdesk.gov` (no mutación ad-hoc por chat).
+  - prompts/versionado ligados al runtime `SY.frontdesk.gov` (no mutación ad-hoc por chat).
 
 ## Fase B - Split de runtime/deploy (sin cambiar features)
 
 - [x] B1. Separar publicación/deploy:
   - quitar dependencia funcional de `--mode default|gov` en scripts de AI.
-  - publicar `AI.common` y `AI.frontdesk.gov` por su propio paquete/comportamiento.
+  - publicar `AI.common` y `SY.frontdesk.gov` por su propio paquete/comportamiento.
 - [x] B2. Quitar código gov del runner común:
   - remover registro de tools gov en `AI.common`.
   - remover wiring de bridge de identidad gov en `AI.common`.
 - [ ] B3. Mantener comportamiento actual en frontdesk:
-  - [x] B3.a. Forzar runtime `AI.frontdesk.gov` a perfil gov por defecto (sin depender del flag para seleccionar perfil).
+  - [x] B3.a. Forzar runtime `SY.frontdesk.gov` a perfil gov por defecto (sin depender del flag para seleccionar perfil).
   - [x] B3.b. Migrar lógica compartible hacia `nodes/gov/common` y eliminar duplicación residual.
 - [ ] B4. Tests de no-regresión del split:
   - `AI.common` sin capacidad gov.
-  - `AI.frontdesk.gov` mantiene capacidades de identidad esperadas.
+  - `SY.frontdesk.gov` mantiene capacidades de identidad esperadas.
 
 ## Fase C - Integración de blobs en AI Nodes
 
@@ -96,15 +96,15 @@ Motivo:
 
 - [x] D1. Remover remanentes `mode=gov` en docs/runbooks AI.
 - [x] D2. Actualizar runbooks de deploy:
-  - `AI.common` y `AI.frontdesk.gov` como caminos separados.
+  - `AI.common` y `SY.frontdesk.gov` como caminos separados.
 - [x] D3. Actualizar spec AI con estado final de blobs implementado.
 - [ ] D4. Cerrar checklist de handoff frontdesk (si owner externo sigue vigente).
 
-## 5. Criterios de done por línea
+## 5. Criterios de done por lí­nea
 
 Split AI/frontdesk cerrado cuando:
 - `AI.common` no contiene ni expone lógica gov;
-- `AI.frontdesk.gov` funciona sin depender de `nodes/ai/common`;
+- `SY.frontdesk.gov` funciona sin depender de `nodes/ai/common`;
 - deploy/publicación no requieren `mode=gov` para distinguir runtimes.
 
 Blobs AI cerrados cuando:

@@ -1,6 +1,6 @@
-﻿{
+{
   "node": {
-    "name": "AI.frontdesk.gov@motherbee",
+    "name": "SY.frontdesk.gov@motherbee",
     "version": "0.1.0",
     "router_socket": "/var/run/fluxbee/routers",
     "uuid_persistence_dir": "/var/lib/fluxbee/state/nodes",

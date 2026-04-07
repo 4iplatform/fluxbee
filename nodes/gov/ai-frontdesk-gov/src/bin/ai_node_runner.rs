@@ -49,7 +49,7 @@ const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE
 const IMMEDIATE_INTERACTION_MAX_CHARS: usize = 1_200;
 const AI_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
 const FRONTDESK_DEFAULT_SYSTEM_PROMPT: &str = r#"
-You are AI.frontdesk.gov.
+You are SY.frontdesk.gov.
 
 Goal:
 - Collect required identity fields: name, email, tenant_hint.
@@ -1775,8 +1775,8 @@ impl GenericAiNode {
             "schema_version": state.schema_version,
             "config_version": state.config_version,
             "contract": {
-                "node_family": "AI",
-                "node_kind": "AI.frontdesk.gov",
+                "node_family": "SY",
+                "node_kind": "SY.frontdesk.gov",
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
                 "required_fields": [
                     "config.behavior.kind",
@@ -1792,10 +1792,10 @@ impl GenericAiNode {
                 ],
                 "secrets": [secret_descriptor],
                 "notes": [
-                    "AI.frontdesk.gov ships a runtime-owned default prompt when behavior.instructions is omitted.",
+                    "SY.frontdesk.gov ships a runtime-owned default prompt when behavior.instructions is omitted.",
                     "Preferred secret field is config.secrets.openai.api_key.",
                     "Legacy aliases config.behavior.openai.api_key and config.behavior.api_key remain accepted during migration.",
-                    "AI.frontdesk.gov defaults behavior.capabilities.multimodal=false unless explicitly overridden.",
+                    "SY.frontdesk.gov defaults behavior.capabilities.multimodal=false unless explicitly overridden.",
                     "Secret values are persisted in local secrets.json and always returned redacted."
                 ]
             },
@@ -2756,7 +2756,7 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
                 let normalized = value.trim().to_ascii_lowercase();
                 if normalized != "gov" {
                     return Err(format!(
-                        "--mode={value} is not supported in AI.frontdesk.gov runtime (only gov)"
+                        "--mode={value} is not supported in SY.frontdesk.gov runtime (only gov)"
                     )
                     .into());
                 }
@@ -3934,7 +3934,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: "SY.orchestrator@motherbee".to_string(),
-                dst: Destination::Unicast("AI.frontdesk.gov@motherbee".to_string()),
+                dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-123".to_string(),
             },
@@ -3984,7 +3984,7 @@ mod tests {
         let gov_identity = GovIdentityConfig::default();
         GenericAiNode {
             mode: RunnerMode::Gov,
-            node_name: "AI.frontdesk.gov".to_string(),
+            node_name: "SY.frontdesk.gov".to_string(),
             behavior: Arc::new(RwLock::new(None)),
             dynamic_config_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
@@ -4111,7 +4111,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: "IO.sim.local@motherbee".to_string(),
-                dst: Destination::Unicast("AI.frontdesk.gov@motherbee".to_string()),
+                dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-user-123".to_string(),
             },
@@ -4387,7 +4387,7 @@ mod tests {
     #[test]
     fn materialize_effective_config_defaults_injects_frontdesk_prompt_when_missing() {
         let config = materialize_effective_config_defaults(
-            "AI.frontdesk.gov@motherbee",
+            "SY.frontdesk.gov@motherbee",
             EffectiveConfigDocument {
                 behavior: EffectiveBehaviorSection {
                     kind: "openai_chat".to_string(),

@@ -40,7 +40,7 @@ Spec fuente: `docs/10-identity-v2.md`
 - `ILK_ADD_CHANNEL` (frontdesk) asocia canal y puede mergear ILK temporal.
 - `identity_ilks.tenant_id` no nulo: provisión entra en `default_tenant`; reasignación solo en `temporary -> complete`.
 - Alias de merge (`old_ilk -> canonical_ilk`) con TTL (`merge_alias_ttl_secs`) para mensajes en vuelo.
-- DB con columnas denormalizadas e índices únicos parciales (`email`, `node_name`).
+- DB con columnas denormalizadas e í­ndices únicos parciales (`email`, `node_name`).
 - `identity_ichs` con `tenant_id` directo + `UNIQUE(channel_type, address, tenant_id)`.
 
 ## 3) Fase A - Contrato de protocolo y autorización
@@ -55,8 +55,8 @@ Spec fuente: `docs/10-identity-v2.md`
 - [x] A2. Implementar validación estricta de payload por acción (campos requeridos/tipos).
 - [x] A3. Implementar allowlist por acción (enforcement autoritativo):
   - `ILK_PROVISION`: `IO.*@*`
-  - `ILK_REGISTER`: `AI.frontdesk@*`, `SY.orchestrator@*`
-  - `ILK_ADD_CHANNEL`: `AI.frontdesk@*`
+  - `ILK_REGISTER`: `SY.frontdesk.gov@*`, `SY.orchestrator@*`
+  - `ILK_ADD_CHANNEL`: `SY.frontdesk.gov@*`
   - `ILK_UPDATE` nodo/sistema: `SY.orchestrator@*`
 - [x] A4. Normalizar/validar IDs prefijados (`ilk:`, `ich:`, `tnt:`) en frontera protocolo.
 
@@ -71,11 +71,11 @@ Salida:
   - `identity_ichs`
   - `identity_vocabulary`
   - `identity_ilk_aliases`
-- [x] B2. Implementar índices/constraints:
+- [x] B2. Implementar í­ndices/constraints:
   - unique parcial `identity_ilks(email, tenant_id)` (no deleted)
   - unique parcial `identity_ilks(node_name)` (no deleted)
   - unique `identity_ichs(channel_type, address, tenant_id)`
-  - índices de alias por `canonical_ilk_id` y `expires_at`
+  - í­ndices de alias por `canonical_ilk_id` y `expires_at`
 - [x] B3. Implementar reglas de transición:
   - provisión en `default_tenant`
   - reasignación de tenant solo en `registration_status=temporary`
@@ -136,7 +136,7 @@ Salida:
     - usa `fluxbee-publish` para `AI.test.gov` + `IO.test` y valida publish/deploy/spawn/routing end-to-end
   - [x] precondición de spec aplicada en plataforma:
     - `sy-identity` pasa a core requerido en instalación/manifiesto (`scripts/install.sh`)
-    - bootstrap worker mínimo incluye `sy-identity` junto a `rt-gateway` y `sy-orchestrator`
+    - bootstrap worker mí­nimo incluye `sy-identity` junto a `rt-gateway` y `sy-orchestrator`
   - [ ] integrar en runtimes IO reales (fuera de este repo) para:
     - lookup en SHM
     - miss -> `ILK_PROVISION`
@@ -148,17 +148,17 @@ Salida:
   - [x] workspace/scaffold para handoff externo disponible en repo:
     - `nodes/gov/common`
     - `nodes/gov/ai-frontdesk-gov`
-    - alcance actual: solo `AI.frontdesk.gov` (sin segundo nodo `.gov` en esta fase)
+    - alcance actual: solo `SY.frontdesk.gov` (sin segundo nodo `.gov` en esta fase)
   - [ ] integrar en runtime `AI.frontdesk` real (fuera de este repo):
     - completar registro vía `ILK_REGISTER` sobre ILK temporal
     - canal extra por `ILK_ADD_CHANNEL`
     - scaffold base disponible en este repo: `nodes/gov/ai-frontdesk-gov` (+ `nodes/gov/common`)
-  - [ ] checklist de handoff `AI.frontdesk.gov` (owner externo, pendiente cuando entre al repo):
+  - [ ] checklist de handoff `SY.frontdesk.gov` (owner externo, pendiente cuando entre al repo):
     - [ ] configuración de destino frontdesk en `hive.yaml`:
-      - `government.identity_frontdesk: "AI.frontdesk.gov@motherbee"` (o nombre final acordado)
+      - `government.identity_frontdesk: "SY.frontdesk.gov@motherbee"` (o nombre final acordado)
     - [ ] flujo de registro temporal -> completo:
       - consumir `meta.src_ilk` temporal
-      - recolectar mínimos (`email`, `display_name`, `tenant_id`)
+      - recolectar mí­nimos (`email`, `display_name`, `tenant_id`)
       - enviar `ILK_REGISTER` con `identity_system_call_ok`
       - verificar `ilk_id` devuelto == ILK temporal original
     - [ ] flujo de canal adicional + merge:
@@ -166,13 +166,13 @@ Salida:
       - enviar `ILK_ADD_CHANNEL` con `merge_from_ilk_id`
       - verificar convergencia alias old->canonical (durante TTL)
     - [ ] manejo de errores de negocio:
-      - contemplar explícitamente `INVALID_TENANT`, `TENANT_PENDING`, `DUPLICATE_EMAIL`,
+      - contemplar explí­citamente `INVALID_TENANT`, `TENANT_PENDING`, `DUPLICATE_EMAIL`,
         `INVALID_REQUEST`, `UNAUTHORIZED_REGISTRAR`
       - no reintentar errores de validación (solo transitorios de red/routing)
     - [ ] gates E2E de cierre (cuando el nodo exista):
-      - `BUILD_BIN=0 IDENTITY_PROVISION_COMPLETE_TARGET=\"SY.identity@sandbox\" IDENTITY_PROVISION_COMPLETE_FRONTDESK_NODE_NAME=\"AI.frontdesk.gov@sandbox\" bash scripts/identity_provision_complete_e2e.sh`
-      - `BUILD_BIN=0 IDENTITY_MERGE_TARGET=\"SY.identity@worker-220\" IDENTITY_MERGE_FALLBACK_TARGET=\"SY.identity@sandbox\" IDENTITY_MERGE_FRONTDESK_NODE_NAME=\"AI.frontdesk.gov@sandbox\" bash scripts/identity_merge_alias_e2e.sh`
-      - wrapper integrado: `BUILD_BIN=0 FRONTDESK_NODE_NAME=\"AI.frontdesk.gov@sandbox\" bash scripts/gov_frontdesk_identity_e2e.sh`
+      - `BUILD_BIN=0 IDENTITY_PROVISION_COMPLETE_TARGET=\"SY.identity@sandbox\" IDENTITY_PROVISION_COMPLETE_FRONTDESK_NODE_NAME=\"SY.frontdesk.gov@sandbox\" bash scripts/identity_provision_complete_e2e.sh`
+      - `BUILD_BIN=0 IDENTITY_MERGE_TARGET=\"SY.identity@worker-220\" IDENTITY_MERGE_FALLBACK_TARGET=\"SY.identity@sandbox\" IDENTITY_MERGE_FRONTDESK_NODE_NAME=\"SY.frontdesk.gov@sandbox\" bash scripts/identity_merge_alias_e2e.sh`
+      - wrapper integrado: `BUILD_BIN=0 FRONTDESK_NODE_NAME=\"SY.frontdesk.gov@sandbox\" bash scripts/gov_frontdesk_identity_e2e.sh`
     - [ ] criterio de done:
       - ambos E2E en `status=ok`
       - sin overrides/manual workarounds de targets al cerrar
@@ -183,7 +183,7 @@ Salida:
     - persiste `node_name -> ilk_id` en estado local orchestrator como cache/diagnóstico (no fuente de verdad)
     - modo estricto obligatorio en core: si `ILK_REGISTER` no devuelve `status=ok`, `run_node` falla con `IDENTITY_REGISTER_FAILED` (sin soft-fail)
     - tenant resuelto desde `payload.tenant_id`, `payload.config.tenant_id` o `ORCH_DEFAULT_TENANT_ID`
-  - [x] updates de metadata por `ILK_UPDATE` en `run_node` (delta explícito):
+  - [x] updates de metadata por `ILK_UPDATE` en `run_node` (delta explí­cito):
     - target fijo `SY.identity@<primary_hive>` (misma regla que `ILK_REGISTER`)
     - soporta `add_roles`, `remove_roles`, `add_capabilities`, `remove_capabilities`, `add_channels`, `identity_change_reason`
     - falla el spawn con `IDENTITY_UPDATE_FAILED` si se pidió delta y identity devuelve error
@@ -212,7 +212,7 @@ Salida:
 - [x] F3. Ruteo de temporales a frontdesk.
   - Implementado en `router` como override pre-OPA:
     - si `registration_status=temporary`, fuerza target configurado en `hive.yaml`:
-      `government.identity_frontdesk` (fallback: `AI.frontdesk@<hive_local>`).
+      `government.identity_frontdesk` (fallback: `SY.frontdesk.gov@<hive_local>`).
 - [x] F4. Validar que mensajes con ILK temporal mergeado sigan resolviendo por alias durante TTL.
   - Validado en tests de `router` (pre-resolve identity):
     - `apply_identity_pre_resolve_keeps_alias_canonical_during_ttl`
@@ -323,13 +323,13 @@ Decisión base para esta fase:
     - conecta al router
     - responde `CONFIG_GET`, `CONFIG_SET`, `PING`, `STATUS`
     - pero no intenta operar writes identity en DB
-  - el estado debe ser explícito (`missing_secret` / `db_not_ready`)
+  - el estado debe ser explí­cito (`missing_secret` / `db_not_ready`)
 
 - [x] ID-DB-5. Restart/apply semantics.
   - v1 permitida:
     - `CONFIG_SET` persiste secreto
     - restart requerido para usar la nueva conexión DB
-  - dejar explícito en `CONFIG_RESPONSE` y help
+  - dejar explí­cito en `CONFIG_RESPONSE` y help
 
 - [x] ID-DB-6. Help/admin/archi.
   - agregar ejemplos canónicos en `SY.admin` para:
@@ -357,8 +357,8 @@ Estado de cierre:
 - validado manualmente con `CONFIG_GET`/`CONFIG_SET` y conexión del nodo el 2026-03-31.
 
 Notas:
-- `SY.identity` ya tiene el nombre de DB fijado por código (`fluxbee_identity`), así que en esta fase no hace falta abrir `dbname` como parámetro separado.
-- Si después queremos simplificar onboarding, la mejora natural sería una v1.1 con:
+- `SY.identity` ya tiene el nombre de DB fijado por código (`fluxbee_identity`), así­ que en esta fase no hace falta abrir `dbname` como parámetro separado.
+- Si después queremos simplificar onboarding, la mejora natural serí­a una v1.1 con:
   - `config.database.user`
   - `config.database.host`
   - `config.database.port`

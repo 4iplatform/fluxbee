@@ -386,8 +386,8 @@ When an ILK or TNT is created, updated, or deleted, motherbee SY.identity propag
 1. **Router/OPA level:** OPA can reject ILK_REGISTER/ILK_PROVISION from unauthorized sources before they reach identity.
 2. **SY.identity level (authoritative):** action-scoped allowlists:
    - `ILK_PROVISION`: `IO.*@*`
-   - `ILK_REGISTER`: `AI.frontdesk@*`, `SY.orchestrator@*`
-   - `ILK_ADD_CHANNEL`: `AI.frontdesk@*`
+   - `ILK_REGISTER`: `SY.frontdesk.gov@*`, `SY.orchestrator@*`
+   - `ILK_ADD_CHANNEL`: `SY.frontdesk.gov@*`
    - `ILK_UPDATE` (node/system metadata): `SY.orchestrator@*`
    Requests outside allowlist are rejected with `UNAUTHORIZED_REGISTRAR`.
    This is the definitive enforcement — OPA is defense in depth.
@@ -1095,7 +1095,7 @@ get_tenant(ilk) = tenant {
 }
 
 # Route temporary ILKs to frontdesk
-target = "AI.frontdesk@production" {
+target = "SY.frontdesk.gov@production" {
     src := object.get(data.identity_aliases, input.meta.src_ilk, input.meta.src_ilk)
     data.identity[src].registration_status == "temporary"
 }
@@ -1220,7 +1220,7 @@ Note: Tables are prefixed `identity_` to avoid collision with SY.storage's domai
 ```yaml
 # Motherbee
 government:
-  identity_frontdesk: "AI.frontdesk@motherbee"
+  identity_frontdesk: "SY.frontdesk.gov@motherbee"
 
 identity:
   max_ilks: 1000000
@@ -1232,7 +1232,7 @@ identity:
 
 # Worker
 government:
-  identity_frontdesk: "AI.frontdesk@motherbee"  # Resolved cross-hive by router
+  identity_frontdesk: "SY.frontdesk.gov@motherbee"  # Resolved cross-hive by router
 
 identity:
   sync:
