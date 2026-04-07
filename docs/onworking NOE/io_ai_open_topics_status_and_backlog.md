@@ -509,6 +509,14 @@ Objetivo del bloque:
   - "claro, aca esta"
   - texto breve de acompanamiento
   - mas uno o mas archivos/imagenes adjuntos generados por el agente
+- cerrar un pipeline general de artefactos salientes user-facing, sin acoplar el desarrollo al primer tipo de archivo validado en E2E
+
+Decision de diseno para este backlog:
+
+- el MVP se valida con un tipo de artefacto representativo, pero el contrato interno debe ser MIME-agnostico
+- el primer tipo validado no debe definir ni limitar la arquitectura del camino saliente
+- el runtime no debe inferir automaticamente que todo archivo generado por tools es entregable al usuario
+- la publicacion a usuario final debe ser una decision explicita del behavior/runtime
 
 Estado actual:
 
@@ -516,47 +524,167 @@ Estado actual:
 - `IO.slack` ya sabe publicar `attachments[]` si recibe `BlobRef`
 - los runners `AI.*` actuales responden texto y/o `content_ref`, pero no exponen todavia un flujo general para artefactos salientes
 
+Contrato propuesto para `4bis.A1` / `4bis.A2`:
+
+- no reemplazar el camino actual `String -> build_text_response(...)`
+- agregar un segundo camino compatible para salida estructurada final del runtime
+- reutilizar `build_text_response_with_options(content, attachments, ...)` como builder canonico Fluxbee de salida
+
+Shape propuesto de tipos en SDK AI:
+
+```rust
+pub enum AiBehaviorOutput {
+    Text(String),
+    Final(AiFinalOutput),
+}
+
+pub struct AiFinalOutput {
+    pub text: Option<String>,
+    pub artifacts: Vec<AiUserArtifact>,
+}
+
+pub struct AiUserArtifact {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+    pub filename: String,
+}
+```
+
+Reglas propuestas para este shape:
+
+- `AiBehaviorOutput::Text` mantiene el caso actual y evita romper runners/behaviors existentes
+- `AiBehaviorOutput::Final` representa salida user-facing explicita
+- `AiUserArtifact` es MIME-agnostico:
+  - no codifica `pdf`, `image`, `xlsx`, etc. como variantes especiales del runtime
+  - el primer tipo validado en E2E no cambia este contrato
+- no se publica nada al usuario final por el solo hecho de que una tool haya producido bytes/archivo
+- solo se publica lo que el behavior devuelva dentro de `AiFinalOutput.artifacts`
+
+Builder/flujo propuesto en runtime:
+
+1. behavior devuelve `AiBehaviorOutput`
+2. si es `Text`, se mantiene:
+   - `build_text_response(...)`
+3. si es `Final`:
+   - cada `AiUserArtifact` se materializa a blob con helper comun (`put_bytes` + `promote`)
+   - el runtime junta `Vec<BlobRef>`
+   - el runtime responde usando:
+     - `build_text_response_with_options(text_or_empty, blob_refs, ...)`
+
+Decision operativa recomendada para MVP:
+
+- soportar como caso principal `text + attachments[]`
+- permitir `attachments[]` sin texto solo si entra naturalmente en el builder actual
+- multiples attachments pueden quedar soportados por shape desde el inicio
+- el primer E2E puede validar solo un archivo representativo, pero el shape debe seguir siendo general
+
+Impacto esperado en codigo:
+
+- `run_openai_chat(...)` ya no deberia devolver solo `String`
+- el runner necesita un tipo final comun que cubra:
+  - texto solo
+  - texto + adjuntos
+- `build_text_response_with_options(...)` ya cubre la serializacion Fluxbee necesaria; el gap real esta antes, en el contrato de salida del behavior/runtime
+
+Decision explicita para evitar repetir el problema de attachments inbound:
+
+- no introducir ramas del tipo:
+  - `if pdf => ...`
+  - `if image => ...`
+  - `if xlsx => ...`
+  en el contrato del runtime saliente
+- las diferencias por tipo deben aparecer solo:
+  - en el behavior/herramienta que produce el archivo
+  - o en validaciones puntuales de MIME si hicieran falta
+- no en el shape comun de salida final del runner
+
 Backlog propuesto:
 
-[ ] AI 4bis.1: definir contrato interno de salida de behavior/runtime para artefactos user-facing
+Subbloque 4bis.A - contrato interno del runtime AI
+
+[ ] AI 4bis.A1: definir contrato interno de salida final de behavior/runtime para artefactos user-facing
   - no inferir automaticamente "todo tool output archivo => adjunto al usuario"
   - exigir una decision explicita de runtime/behavior sobre que artefactos son final user deliverable
   - mantener alineacion conceptual con `tool_use_behavior` del Agents SDK
-[ ] AI 4bis.2: definir tipo reusable en SDK AI para salida final con adjuntos
-  - ejemplo de forma:
-    - texto final
-    - lista de artefactos generados (`bytes`, `mime`, `filename`)
-  - esto debe convivir con el caso actual de salida solo texto
-[ ] AI 4bis.3: implementar helper comun en SDK AI para materializar artefactos salientes a blob
+  - el contrato debe servir para cualquier `mime`/`filename`/binario, no para un tipo fijo
+[ ] AI 4bis.A2: definir tipo reusable en SDK AI para salida final con adjuntos
+  - debe convivir con el caso actual de salida solo texto
+  - forma minima recomendada:
+    - `text` opcional
+    - `artifacts[]` opcional
+    - cada artifact con:
+      - `bytes`
+      - `mime`
+      - `filename`
+      - marca explicita de entrega a usuario final
+[ ] AI 4bis.A3: definir regla minima de producto para el contrato de salida
+  - caso principal MVP: `texto + attachment`
+  - `attachment-only` queda permitido por contrato solo si no complica la implementacion del builder
+  - multiples attachments pueden quedar soportados por shape aunque el primer E2E valide solo uno
+
+Subbloque 4bis.B - materializacion a blob y respuesta Fluxbee
+
+[ ] AI 4bis.B1: implementar helper comun en SDK AI para materializar artefactos salientes a blob
   - `put_bytes`
   - `promote`
   - retorno de `BlobRef`
-[ ] AI 4bis.4: implementar builder de respuesta `text/v1` con `attachments[]` salientes
+  - logging y errores canonicos uniformes
+[ ] AI 4bis.B2: implementar builder de respuesta `text/v1` con `attachments[]` salientes
   - texto breve + archivos
   - solo archivo si aplica
   - offload de texto largo a `content_ref` si hiciera falta
-[ ] AI 4bis.5: integrar ese camino en runners `AI.common` y `SY.frontdesk.gov`
-  - mantener backward compatibility del caso actual `String -> build_text_response(...)`
-  - usar el camino nuevo solo cuando el behavior devuelva artefactos finales
-[ ] AI 4bis.6: definir politica de fallback/error para generacion de artefactos
+  - mantener el contrato Fluxbee actual sin introducir payloads ad-hoc nuevos
+[ ] AI 4bis.B3: definir politica de fallback/error para generacion de artefactos
   - si el texto esta listo pero el archivo falla
   - si falla blob persist/promote
   - si hay multiple attachments y falla uno
-[ ] AI 4bis.7: elegir un MVP de artefacto saliente
-  - recomendado: un solo tipo primero (`pdf` o imagen)
-  - no intentar cerrar de entrada PDF + XLSX + imagen + otros
-[ ] IO/AI 4bis.8: validar E2E con `IO.slack`
+  - explicitar si el comportamiento MVP es fail-closed o entrega parcial controlada
+
+Subbloque 4bis.C - integracion en runners AI
+
+[ ] AI 4bis.C1: integrar el camino nuevo en runners `AI.common` y `SY.frontdesk.gov`
+  - mantener backward compatibility del caso actual `String -> build_text_response(...)`
+  - usar el camino nuevo solo cuando el behavior devuelva artefactos finales
+[ ] AI 4bis.C2: definir un behavior/tool de referencia para validar el pipeline de artefactos salientes
+  - el behavior de prueba debe generar un archivo a partir de datos de entrada reales
+  - la eleccion del primer tipo a validar no debe introducir ramas especiales permanentes en el runtime
+[ ] AI 4bis.C3: elegir un primer artefacto representativo solo para validacion E2E del MVP
+  - recomendado: `application/pdf` o una imagen simple
+  - esta eleccion no debe acoplar el contrato ni el helper blob a ese tipo puntual
+
+Subbloque 4bis.D - validacion E2E y cierre documental
+
+[ ] IO/AI 4bis.D1: validar E2E con `IO.slack`
   - texto + attachment saliente
-  - attachment saliente sin texto si se decide soportarlo
+  - attachment saliente sin texto si se decide soportarlo en MVP
   - error canonicamente visible si la generacion falla
-[ ] AI/IO 4bis.9: actualizar docs canonicamente
+[ ] IO/AI 4bis.D2: agregar prueba/caso de regresion para confirmar que el pipeline saliente sigue siendo MIME-agnostico
+  - el objetivo no es cerrar una matriz completa de tipos ahora
+  - el objetivo es evitar que el primer tipo validado quede hardcodeado en el runtime
+[ ] AI/IO 4bis.D3: actualizar docs canonicamente
   - que soporta el contrato
   - que esta implementado hoy
-  - que tipos de artefactos salientes quedan dentro del MVP
+  - que fue validado en el MVP
+  - que tipos quedan solo como validacion futura, no como restriccion de arquitectura
+
+Orden recomendado de implementacion para este bloque:
+
+1. `4bis.A1`
+2. `4bis.A2`
+3. `4bis.A3`
+4. `4bis.B1`
+5. `4bis.B2`
+6. `4bis.B3`
+7. `4bis.C1`
+8. `4bis.C2`
+9. `4bis.C3`
+10. `4bis.D1`
+11. `4bis.D2`
+12. `4bis.D3`
 
 Preguntas de decision minima antes de implementarlo:
 
-- si el MVP sale solo para un tipo de artefacto o para varios
+- con que tipo representativo se valida primero el E2E
 - si el primer MVP se apoya en:
   - tool local especifica de generacion
   - o behavior especifico que ya produzca el archivo
@@ -564,10 +692,18 @@ Preguntas de decision minima antes de implementarlo:
   - texto + attachment
   - o tambien attachment-only
 
+Respuesta recomendada para no bloquear implementacion:
+
+- validar el MVP con un solo tipo representativo en E2E
+- mantener el contrato y el helper de runtime MIME-agnosticos desde el inicio
+- arrancar por `texto + attachment`
+- dejar `attachment-only` como soporte opcional si entra sin complejidad extra relevante
+
 Riesgo principal a controlar:
 
 - no filtrar al usuario archivos generados para razonamiento interno del agente
 - la publicacion a usuario final debe ser una decision explicita del runtime/behavior, no una inferencia automatica por tipo de tool output
+- no hardcodear el primer tipo de archivo validado como si fuera una restriccion estructural del pipeline
 
 ### Bloque 5 - Cerrar UX IO<->AI para errores y archivos
 

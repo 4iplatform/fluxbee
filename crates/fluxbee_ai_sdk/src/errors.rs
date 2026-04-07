@@ -1,3 +1,4 @@
+use fluxbee_sdk::blob::BlobError;
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::payload::PayloadError;
 
@@ -7,6 +8,8 @@ pub enum AiSdkError {
     Node(#[from] NodeError),
     #[error("payload error: {0}")]
     Payload(#[from] PayloadError),
+    #[error("blob error: {0}")]
+    Blob(#[from] BlobError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("http error: {0}")]
@@ -35,6 +38,14 @@ impl AiSdkError {
                 NodeError::HandshakeFailed(_) => false,
             },
             AiSdkError::Http(err) => err.is_timeout() || err.is_connect() || err.is_request(),
+            AiSdkError::Blob(err) => matches!(
+                err,
+                BlobError::NotFound(_)
+                    | BlobError::Io(_)
+                    | BlobError::SyncHintTimeout { .. }
+                    | BlobError::SyncHintFailed { .. }
+                    | BlobError::SyncHintTransport { .. }
+            ),
             AiSdkError::Timeout(_) => true,
             AiSdkError::RecoverableExhausted(_) => true,
             AiSdkError::Payload(_) => false,

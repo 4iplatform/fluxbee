@@ -899,12 +899,10 @@ mod tests {
             .expect("pdf should map to input_file");
         assert_eq!(parts[1]["type"], "input_file");
         assert_eq!(parts[1]["filename"], "doc.pdf");
-        assert!(
-            parts[1]["file_data"]
-                .as_str()
-                .expect("file_data should be string")
-                .starts_with("data:application/pdf;base64,")
-        );
+        assert!(parts[1]["file_data"]
+            .as_str()
+            .expect("file_data should be string")
+            .starts_with("data:application/pdf;base64,"));
         let _ = std::fs::remove_dir_all(root);
     }
 

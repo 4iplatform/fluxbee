@@ -9,9 +9,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
 use fluxbee_ai_sdk::{
-    build_openai_user_content_parts, build_reply_message_runtime_src, build_text_response,
-    extract_text, resolve_model_input_from_payload_with_options, AiNode, AiNodeConfig,
-    FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
+    build_ai_behavior_response, build_openai_user_content_parts, build_reply_message_runtime_src,
+    extract_text, resolve_model_input_from_payload_with_options, AiBehaviorOutput, AiFinalOutput,
+    AiNode, AiNodeConfig, AiUserArtifact, FunctionCallingConfig, FunctionCallingRunner,
+    FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput, FunctionTool,
     FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
     ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
     ModelSettings, NodeRuntime, OpenAiResponsesClient, ResolvedModelInput, RetryPolicy,
@@ -682,10 +683,38 @@ struct IlkRegisterTool {
     bridge: Option<Arc<GovIdentityBridge>>,
 }
 
+#[derive(Clone)]
+struct GenerateCsvArtifactTool;
+
 #[derive(Debug, Clone)]
 struct BehaviorContext {
     thread_id: Option<String>,
     src_ilk: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GenerateCsvArtifactArgs {
+    filename: String,
+    rows: Vec<Vec<String>>,
+    #[serde(default)]
+    headers: Option<Vec<String>>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ToolFinalArtifactEnvelope {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    artifacts: Vec<ToolFinalArtifactItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ToolFinalArtifactItem {
+    filename: String,
+    mime: String,
+    bytes_base64: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -915,7 +944,7 @@ impl AiNode for GenericAiNode {
             );
         }
         let output = match &behavior {
-            NodeBehavior::Echo => format!("Echo: {input}"),
+            NodeBehavior::Echo => AiBehaviorOutput::text(format!("Echo: {input}")),
             NodeBehavior::OpenAiChat(openai) => {
                 let input_parts = if openai.multimodal {
                     if let Some(resolved) = resolved_user_input.as_ref() {
@@ -1004,7 +1033,18 @@ impl AiNode for GenericAiNode {
             }
         };
 
-        let payload = build_text_response(output)?;
+        let payload = match build_ai_behavior_response(output) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::warn!(
+                    node_name = %self.node_name,
+                    trace_id = %msg.routing.trace_id,
+                    error = %err,
+                    "failed to build final AI response with user-facing artifacts; replying with artifact generation error payload"
+                );
+                ai_final_output_error_payload(&err)
+            }
+        };
         Ok(Some(build_reply_message_runtime_src(&msg, payload)))
     }
 }
@@ -1016,7 +1056,7 @@ impl GenericAiNode {
         input: String,
         input_parts: Option<Vec<Value>>,
         ctx: &BehaviorContext,
-    ) -> fluxbee_ai_sdk::Result<String> {
+    ) -> fluxbee_ai_sdk::Result<AiBehaviorOutput> {
         let api_key = self.resolve_openai_api_key(openai).await.ok_or_else(|| {
             fluxbee_ai_sdk::errors::AiSdkError::Protocol(
                 "missing OpenAI api key (local secrets.json, CONFIG_SET override, YAML inline, or env)"
@@ -1046,10 +1086,16 @@ impl GenericAiNode {
             let result = runner
                 .run_with_input(&model, &tool_registry, run_input)
                 .await?;
+            if let Some(output) = extract_final_output_from_tool_results(&result)? {
+                let summary_text = summarize_behavior_output(&output);
+                self.persist_immediate_turn(openai, ctx, &input, &summary_text)
+                    .await;
+                return Ok(output);
+            }
             if let Some(text) = result.final_assistant_text {
                 self.persist_immediate_turn(openai, ctx, &input, &text)
                     .await;
-                return Ok(text);
+                return Ok(AiBehaviorOutput::text(text));
             }
         }
 
@@ -1065,7 +1111,7 @@ impl GenericAiNode {
         let response = fluxbee_ai_sdk::llm::LlmClient::generate(&client, req).await?;
         self.persist_immediate_turn(openai, ctx, &current_user_input, &response.content)
             .await;
-        Ok(response.content)
+        Ok(AiBehaviorOutput::text(response.content))
     }
 
     fn build_function_run_input(
@@ -1267,6 +1313,7 @@ impl GenericAiNode {
             );
             provider.register_tools(registry)?;
         }
+        registry.register(Arc::new(GenerateCsvArtifactTool))?;
         Ok(())
     }
 
@@ -1778,6 +1825,80 @@ fn normalize_health_state(raw: &str) -> &'static str {
     }
 }
 
+fn extract_final_output_from_tool_results(
+    result: &FunctionLoopRunResult,
+) -> fluxbee_ai_sdk::Result<Option<AiBehaviorOutput>> {
+    for item in result.items.iter().rev() {
+        let FunctionLoopItem::ToolResult { result } = item else {
+            continue;
+        };
+        if result.is_error {
+            continue;
+        }
+        let Some(final_output_value) = result.output.get("final_output") else {
+            continue;
+        };
+        let envelope: ToolFinalArtifactEnvelope =
+            serde_json::from_value(final_output_value.clone()).map_err(|err| {
+                fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                    "tool final_output envelope is invalid: {err}"
+                ))
+            })?;
+        let mut artifacts = Vec::with_capacity(envelope.artifacts.len());
+        for artifact in envelope.artifacts {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(artifact.bytes_base64)
+                .map_err(|err| {
+                    fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                        "tool final_output artifact bytes_base64 is invalid: {err}"
+                    ))
+                })?;
+            artifacts.push(AiUserArtifact::new(bytes, artifact.mime, artifact.filename));
+        }
+        return Ok(Some(AiBehaviorOutput::final_output(AiFinalOutput::new(
+            envelope.text,
+            artifacts,
+        ))));
+    }
+    Ok(None)
+}
+
+fn summarize_behavior_output(output: &AiBehaviorOutput) -> String {
+    match output {
+        AiBehaviorOutput::Text(text) => text.clone(),
+        AiBehaviorOutput::Final(final_output) => {
+            if let Some(text) = final_output
+                .text
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                return text.to_string();
+            }
+            if final_output.artifacts.is_empty() {
+                return "Generated final output without text.".to_string();
+            }
+            let filenames = final_output
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.filename.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Generated user-facing artifact(s): {filenames}")
+        }
+    }
+}
+
+fn csv_line(cells: &[String]) -> String {
+    cells
+        .iter()
+        .map(|cell| {
+            let escaped = cell.replace('"', "\"\"");
+            format!("\"{escaped}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()
@@ -1813,6 +1934,81 @@ fn gov_identity_config_from_env() -> GovIdentityConfig {
         cfg.timeout.as_millis() as u64,
     ));
     cfg
+}
+
+#[async_trait]
+impl FunctionTool for GenerateCsvArtifactTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "generate_csv_artifact".to_string(),
+            description: "Generate a CSV file as a final user-facing artifact from tabular rows."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "minLength": 1 },
+                    "headers": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "rows": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "text": { "type": "string" }
+                },
+                "required": ["filename", "rows"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: GenerateCsvArtifactArgs = serde_json::from_value(arguments).map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "generate_csv_artifact: invalid arguments: {err}"
+            ))
+        })?;
+
+        let filename = args.filename.trim();
+        if filename.is_empty() {
+            return Ok(json!({
+                "status": "error",
+                "error_code": "invalid_filename",
+                "message": "filename is required",
+                "retryable": false
+            }));
+        }
+
+        let mut lines = Vec::new();
+        if let Some(headers) = args.headers.as_ref().filter(|headers| !headers.is_empty()) {
+            lines.push(csv_line(headers));
+        }
+        for row in &args.rows {
+            lines.push(csv_line(row));
+        }
+        let csv_content = if lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", lines.join("\n"))
+        };
+        let bytes_base64 = base64::engine::general_purpose::STANDARD.encode(csv_content.as_bytes());
+
+        Ok(json!({
+            "status": "ok",
+            "final_output": {
+                "text": args.text.or_else(|| Some(format!("Aca esta el archivo solicitado: {}", filename))),
+                "artifacts": [{
+                    "filename": filename,
+                    "mime": "text/csv",
+                    "bytes_base64": bytes_base64
+                }]
+            }
+        }))
+    }
 }
 
 #[async_trait]
@@ -3667,6 +3863,40 @@ fn openai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Val
     }
 }
 
+fn ai_final_output_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
+    match err {
+        fluxbee_ai_sdk::errors::AiSdkError::Blob(blob_err) => json!({
+            "type": "error",
+            "code": "artifact_materialization_failed",
+            "message": format!(
+                "The AI generated a user-facing artifact, but it could not be materialized for delivery: {}",
+                trim_chars(&blob_err.to_string(), 220)
+            ),
+            "retryable": err.is_recoverable()
+        }),
+        fluxbee_ai_sdk::errors::AiSdkError::Payload(_)
+        | fluxbee_ai_sdk::errors::AiSdkError::Json(_)
+        | fluxbee_ai_sdk::errors::AiSdkError::Protocol(_) => json!({
+            "type": "error",
+            "code": "artifact_generation_failed",
+            "message": format!(
+                "The AI could not build the final artifact response: {}",
+                trim_chars(&err.to_string(), 220)
+            ),
+            "retryable": false
+        }),
+        other => json!({
+            "type": "error",
+            "code": "artifact_generation_failed",
+            "message": format!(
+                "The AI failed while preparing the final artifact response: {}",
+                trim_chars(&other.to_string(), 220)
+            ),
+            "retryable": other.is_recoverable()
+        }),
+    }
+}
+
 fn parse_openai_status_error(message: &str) -> Option<(u16, String)> {
     let marker = "openai error status=";
     let idx = message.find(marker)?;
@@ -4155,6 +4385,7 @@ mod tests {
             .map(|d| d.name)
             .collect::<Vec<_>>();
         assert!(!names.iter().any(|name| name == "ilk_register"));
+        assert!(names.iter().any(|name| name == "generate_csv_artifact"));
     }
 
     #[tokio::test]
@@ -4246,6 +4477,48 @@ mod tests {
         };
         let err = require_src_ilk(&ctx).expect_err("missing src_ilk should fail");
         assert!(err.to_string().contains("missing_src_ilk"));
+    }
+
+    #[test]
+    fn extract_final_output_from_tool_results_parses_artifact_envelope() {
+        let csv_b64 = base64::engine::general_purpose::STANDARD.encode("a,b\n1,2\n");
+        let result = FunctionLoopRunResult {
+            final_assistant_text: Some("texto provisional".to_string()),
+            items: vec![FunctionLoopItem::ToolResult {
+                result: fluxbee_ai_sdk::FunctionToolResult {
+                    call_id: "call_1".to_string(),
+                    response_id: None,
+                    name: "generate_csv_artifact".to_string(),
+                    arguments: json!({}),
+                    output: json!({
+                        "status": "ok",
+                        "final_output": {
+                            "text": "aca esta",
+                            "artifacts": [{
+                                "filename": "reporte.csv",
+                                "mime": "text/csv",
+                                "bytes_base64": csv_b64
+                            }]
+                        }
+                    }),
+                    is_error: false,
+                },
+            }],
+        };
+
+        let output = extract_final_output_from_tool_results(&result)
+            .expect("tool final output should parse")
+            .expect("final output should exist");
+        match output {
+            AiBehaviorOutput::Final(final_output) => {
+                assert_eq!(final_output.text.as_deref(), Some("aca esta"));
+                assert_eq!(final_output.artifacts.len(), 1);
+                assert_eq!(final_output.artifacts[0].filename, "reporte.csv");
+                assert_eq!(final_output.artifacts[0].mime, "text/csv");
+                assert_eq!(final_output.artifacts[0].bytes, b"a,b\n1,2\n".to_vec());
+            }
+            other => panic!("expected final output, got {other:?}"),
+        }
     }
 
     #[test]
