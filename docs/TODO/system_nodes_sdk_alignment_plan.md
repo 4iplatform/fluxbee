@@ -386,9 +386,9 @@ For now, the target is:
 
 ### SYS-ALIGN-S0 — Freeze the alignment goal
 
-- [ ] SYS-ALIGN-S0-T1. Confirm that this effort is independent from `SY.policy`.
-- [ ] SYS-ALIGN-S0-T2. Confirm that no partial "policy-only" metadata retrofits should be done first.
-- [ ] SYS-ALIGN-S0-T3. Define the canonical reference contract for a modern Fluxbee system node:
+- [x] SYS-ALIGN-S0-T1. Confirm that this effort is independent from `SY.policy`.
+- [x] SYS-ALIGN-S0-T2. Confirm that no partial "policy-only" metadata retrofits should be done first.
+- [x] SYS-ALIGN-S0-T3. Define the canonical reference contract for a modern Fluxbee system node:
   - envelope
   - request/reply types
   - error model
@@ -403,13 +403,13 @@ For now, the target is:
   - system messages
   - reply message shapes
   - error payload shapes
-- [ ] SYS-ALIGN-S1-T2. Produce a full protocol inventory for `SY.opa.rules`:
+- [x] SYS-ALIGN-S1-T2. Produce a full protocol inventory for `SY.opa.rules`:
   - inbound types `command` / `query` / `system`
   - outbound types `command_response` / `query_response` / `system`
   - HELLO/ANNOUNCE handshake behavior
   - OPA-specific actions and responses
 - [ ] SYS-ALIGN-S1-T3. Compare `SY.config.routes` against the current Rust SDK node contract.
-- [ ] SYS-ALIGN-S1-T3b. Compare `SY.opa.rules` against the current Rust SDK node contract and identify what must be replicated in Go.
+- [x] SYS-ALIGN-S1-T3b. Compare `SY.opa.rules` against the current Rust SDK node contract and identify what must be replicated in Go.
 - [ ] SYS-ALIGN-S1-T4. Mark which mismatches are:
   - compatibility-critical
   - admin/orchestrator ergonomics
@@ -418,56 +418,56 @@ For now, the target is:
 
 ### SYS-ALIGN-S2 — Normalize message envelopes
 
-- [ ] SYS-ALIGN-S2-T1. Define the canonical message categories these nodes should expose.
+- [x] SYS-ALIGN-S2-T1. Define the canonical message categories these nodes should expose.
 - [ ] SYS-ALIGN-S2-T2. Standardize reply payload conventions:
   - `status`
   - `error_code`
   - `error_detail`
   - version/config fields where applicable
-- [ ] SYS-ALIGN-S2-T3. Standardize metadata fields that must always be carried:
+- [x] SYS-ALIGN-S2-T3. Standardize metadata fields that must always be carried:
   - `msg_type`
   - `msg`
   - `action`
   - `target`
   - `trace_id`
 - [ ] SYS-ALIGN-S2-T4. Remove older ad hoc differences such as mixed `error` vs `error_code` shapes.
-- [ ] SYS-ALIGN-S2-T5. Freeze which parts of the Rust message model must be reproduced by `fluxbee-go-sdk`.
-- [ ] SYS-ALIGN-S2-T6. Decide whether `SY.opa.rules` keeps custom `command/query` message kinds as first-class Fluxbee categories or is adapted to the same shared runtime model used by Rust nodes.
+- [x] SYS-ALIGN-S2-T5. Freeze which parts of the Rust message model must be reproduced by `fluxbee-go-sdk`.
+- [x] SYS-ALIGN-S2-T6. Decide whether `SY.opa.rules` keeps custom `command/query` message kinds as first-class Fluxbee categories or is adapted to the same shared runtime model used by Rust nodes.
 
 ### SYS-ALIGN-S2A — Freeze `fluxbee-go-sdk` v1 minimum scope
 
-- [ ] SYS-ALIGN-S2A-T1. Freeze `fluxbee-go-sdk` v1.0 as a **transport/runtime SDK** with a public reusable surface, not yet full parity with every Rust helper.
-- [ ] SYS-ALIGN-S2A-T2. Include in v1 the minimum common envelope types:
+- [x] SYS-ALIGN-S2A-T1. Freeze `fluxbee-go-sdk` v1.0 as a **transport/runtime SDK** with a public reusable surface, not yet full parity with every Rust helper.
+- [x] SYS-ALIGN-S2A-T2. Include in v1 the minimum common envelope types:
   - `Message`
   - `Meta`
   - `Routing`
   - destination helpers
-- [ ] SYS-ALIGN-S2A-T3. Include in v1 the minimum router transport behavior:
+- [x] SYS-ALIGN-S2A-T3. Include in v1 the minimum router transport behavior:
   - unix socket connect
   - HELLO
   - ANNOUNCE handling
   - frame read/write
   - reconnect loop
-- [ ] SYS-ALIGN-S2A-T4. Include in v1 the minimum node lifecycle helpers:
+- [x] SYS-ALIGN-S2A-T4. Include in v1 the minimum node lifecycle helpers:
   - node identity / UUID loading
   - sender / receiver abstraction
   - request reply helper
   - trace propagation helper
-- [ ] SYS-ALIGN-S2A-T5. Include in v1 standardized reply helpers for:
+- [x] SYS-ALIGN-S2A-T5. Include in v1 standardized reply helpers for:
   - success replies
   - error replies
   - system message replies
   - query / command reply patterns if those categories remain in scope
-- [ ] SYS-ALIGN-S2A-T6. Explicitly defer from v1 unless needed by the first migration:
+- [x] SYS-ALIGN-S2A-T6. Explicitly defer from v1 unless needed by the first migration:
   - higher-level admin client helpers
   - policy helpers
   - manifest helpers
   - storage/query convenience clients
-- [ ] SYS-ALIGN-S2A-T7. Freeze the first consumer contract:
+- [x] SYS-ALIGN-S2A-T7. Freeze the first consumer contract:
   - `SY.opa.rules` must be migratable to `fluxbee-go-sdk` without changing OPA SHM semantics
   - the SDK should be reusable by future internal or third-party Go nodes, but v1 is allowed to be minimal
-- [ ] SYS-ALIGN-S2A-T8. Keep package boundaries, naming, and exported API stable enough that `fluxbee-go-sdk` can be documented and published as the Go counterpart of the Rust SDK.
-- [ ] SYS-ALIGN-S2A-T9. Freeze the exact node-config subset that enters Go v1.0 for `SY.opa.rules`:
+- [x] SYS-ALIGN-S2A-T8. Keep package boundaries, naming, and exported API stable enough that `fluxbee-go-sdk` can be documented and published as the Go counterpart of the Rust SDK.
+- [x] SYS-ALIGN-S2A-T9. Freeze the exact node-config subset that enters Go v1.0 for `SY.opa.rules`:
   - `CONFIG_GET`
   - `CONFIG_SET`
   - `CONFIG_RESPONSE`
@@ -480,12 +480,12 @@ For now, the target is:
 - [ ] SYS-ALIGN-S3-T3. Decide how its existing domain actions relate to node config:
   - route/vpn mutations as domain admin actions
   - full effective config reads/writes as node control-plane config
-- [ ] SYS-ALIGN-S3-T4. Decide what "live config" means for `SY.opa.rules`:
+- [x] SYS-ALIGN-S3-T4. Decide what "live config" means for `SY.opa.rules`:
   - staged policy
   - current applied policy
   - router SHM state
   - backup policy
-- [ ] SYS-ALIGN-S3-T5. Define whether OPA compile/apply/rollback remain domain actions or become partially expressible through a config contract.
+- [x] SYS-ALIGN-S3-T5. Define whether OPA compile/apply/rollback remain domain actions or become partially expressible through a config contract.
 - [ ] SYS-ALIGN-S3-T6. Ensure admin documentation clearly distinguishes:
   - stored config
   - live control-plane config
@@ -509,30 +509,30 @@ For now, the target is:
 
 #### `fluxbee-go-sdk`
 
-- [ ] SYS-ALIGN-S5-T5. Define the minimum v1.0 scope of `fluxbee-go-sdk`.
-- [ ] SYS-ALIGN-S5-T6. Implement shared Go types equivalent to the common node envelope:
+- [x] SYS-ALIGN-S5-T5. Define the minimum v1.0 scope of `fluxbee-go-sdk`.
+- [x] SYS-ALIGN-S5-T6. Implement shared Go types equivalent to the common node envelope:
   - `Message`
   - `Meta`
   - `Routing`
   - destination helpers
-- [ ] SYS-ALIGN-S5-T7. Implement router framing and connection lifecycle helpers:
+- [x] SYS-ALIGN-S5-T7. Implement router framing and connection lifecycle helpers:
   - connect
   - HELLO / ANNOUNCE
   - sender / receiver
   - reconnect behavior
-- [ ] SYS-ALIGN-S5-T8. Implement standard reply helpers in Go:
+- [x] SYS-ALIGN-S5-T8. Implement standard reply helpers in Go:
   - request/reply
   - error replies
   - trace propagation
-- [ ] SYS-ALIGN-S5-T9. Implement the node config control-plane subset needed by `SY.opa.rules` v1.0.
-- [ ] SYS-ALIGN-S5-T10. Add protocol-level tests or fixtures proving parity with the chosen Rust-side contract.
+- [x] SYS-ALIGN-S5-T9. Implement the node config control-plane subset needed by `SY.opa.rules` v1.0.
+- [x] SYS-ALIGN-S5-T10. Add protocol-level tests or fixtures proving parity with the chosen Rust-side contract.
 
 #### `SY.opa.rules`
 
 - [ ] SYS-ALIGN-S5-T11. Migrate `SY.opa.rules` transport/envelope code to `fluxbee-go-sdk`.
 - [ ] SYS-ALIGN-S5-T12. Replace its local `Message` / `Meta` / `Routing` structs with SDK equivalents.
 - [ ] SYS-ALIGN-S5-T13. Replace its embedded router client lifecycle with SDK connection helpers.
-- [ ] SYS-ALIGN-S5-T14. Add Rust-SDK-aligned config/control-plane support without breaking the current OPA action surface.
+- [x] SYS-ALIGN-S5-T14. Add Rust-SDK-aligned config/control-plane support without breaking the current OPA action surface.
 - [ ] SYS-ALIGN-S5-T15. Preserve OPA SHM, compile/apply/rollback, and router reload semantics during the migration.
 - [ ] SYS-ALIGN-S5-T16. Re-test admin and orchestrator interoperability after the SDK migration.
 - [ ] SYS-ALIGN-S5-T17. Leave deeper OPA-specific cleanup for v2.0.
@@ -541,7 +541,7 @@ For now, the target is:
 
 - [ ] SYS-ALIGN-S6-T1. Document the canonical action surface for `SY.config.routes`.
 - [ ] SYS-ALIGN-S6-T2. Document the canonical action surface for `SY.opa.rules`.
-- [ ] SYS-ALIGN-S6-T2b. Document `fluxbee-go-sdk` as the canonical Go path for Fluxbee-compatible nodes.
+- [x] SYS-ALIGN-S6-T2b. Document `fluxbee-go-sdk` as the canonical Go path for Fluxbee-compatible nodes.
 - [ ] SYS-ALIGN-S6-T3. Document what operators should treat as:
   - read/query
   - config control-plane

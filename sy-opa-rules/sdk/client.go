@@ -182,7 +182,7 @@ func connectionManager(cfg NodeConfig, baseName, fullName, uuidValue string, tx 
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
-		announce, err := performHandshake(conn, fullName, uuidValue, cfg.Version)
+		announce, _, err := PerformHandshake(conn, fullName, uuidValue, cfg.Version)
 		if err != nil {
 			_ = conn.Close()
 			state.SetConnected(false)
@@ -252,7 +252,7 @@ func connectAndHandshake(ctx context.Context, cfg NodeConfig, baseName, fullName
 	}
 	done := make(chan result, 1)
 	go func() {
-		payload, err := performHandshake(conn, fullName, uuidValue, cfg.Version)
+		_, payload, err := PerformHandshake(conn, fullName, uuidValue, cfg.Version)
 		done <- result{payload: payload, err: err}
 	}()
 	select {
@@ -263,38 +263,38 @@ func connectAndHandshake(ctx context.Context, cfg NodeConfig, baseName, fullName
 	}
 }
 
-func performHandshake(conn net.Conn, fullName, uuidValue, version string) (*NodeAnnouncePayload, error) {
+func PerformHandshake(conn net.Conn, fullName, uuidValue, version string) (*Message, *NodeAnnouncePayload, error) {
 	hello, err := BuildHello(uuidValue, uuid.NewString(), NodeHelloPayload{
 		UUID:    uuidValue,
 		Name:    fullName,
 		Version: version,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	data, err := json.Marshal(hello)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := WriteFrame(conn, data); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	frame, err := ReadFrame(conn)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var msg Message
 	if err := json.Unmarshal(frame, &msg); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if msg.Meta.MsgType != SYSTEMKind || stringValue(msg.Meta.Msg) != MSGAnnounce {
-		return nil, fmt.Errorf("expected ANNOUNCE")
+		return nil, nil, fmt.Errorf("expected ANNOUNCE")
 	}
 	var announce NodeAnnouncePayload
 	if err := json.Unmarshal(msg.Payload, &announce); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &announce, nil
+	return &msg, &announce, nil
 }
 
 func loadHiveID(configDir string) (string, error) {
@@ -339,7 +339,7 @@ func resolveUUID(mode NodeUuidMode, dir, baseName string) (uuid.UUID, error) {
 }
 
 func connectRouter(routerSocket, nodeName string) (net.Conn, error) {
-	candidates, err := routerSocketCandidates(routerSocket, nodeName)
+	candidates, err := RouterSocketCandidates(routerSocket, nodeName)
 	if err != nil {
 		return nil, err
 	}
@@ -355,6 +355,10 @@ func connectRouter(routerSocket, nodeName string) (net.Conn, error) {
 		return nil, lastErr
 	}
 	return nil, fmt.Errorf("no router sockets found")
+}
+
+func RouterSocketCandidates(path, nodeName string) ([]string, error) {
+	return routerSocketCandidates(path, nodeName)
 }
 
 func routerSocketCandidates(path, nodeName string) ([]string, error) {

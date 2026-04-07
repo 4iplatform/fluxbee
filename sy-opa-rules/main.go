@@ -1436,7 +1436,7 @@ func (c *RouterClient) Run(service *Service) {
 }
 
 func (c *RouterClient) connect() (net.Conn, error) {
-	candidates, err := routerSocketCandidates(routerSockDir, c.nodeBase)
+	candidates, err := fluxbeesdk.RouterSocketCandidates(routerSockDir, c.nodeBase)
 	if err != nil {
 		return nil, err
 	}
@@ -1456,34 +1456,13 @@ func (c *RouterClient) connect() (net.Conn, error) {
 }
 
 func (c *RouterClient) handshake(conn net.Conn) error {
-	hello, err := fluxbeesdk.BuildHello(c.nodeUUID.String(), uuid.New().String(), fluxbeesdk.NodeHelloPayload{
-		UUID:    c.nodeUUID.String(),
-		Name:    c.nodeName,
-		Version: "1.0",
-	})
+	announceMsg, payload, err := fluxbeesdk.PerformHandshake(conn, c.nodeName, c.nodeUUID.String(), "1.0")
 	if err != nil {
 		return err
 	}
-	if err := writeFrame(conn, mustJSON(hello)); err != nil {
-		return err
-	}
-	log.Printf("waiting for ANNOUNCE")
-	frame, err := readFrame(conn)
-	if err != nil {
-		return err
-	}
-	var msg Message
-	if err := json.Unmarshal(frame, &msg); err != nil {
-		return err
-	}
-	if msg.Meta.Type != fluxbeesdk.SYSTEMKind || msg.Meta.Msg != fluxbeesdk.MSGAnnounce {
-		return fmt.Errorf("unexpected announce")
-	}
-	var payload fluxbeesdk.NodeAnnouncePayload
-	_ = json.Unmarshal(msg.Payload, &payload)
 	log.Printf("connected as %s (vpn=%d router=%s)", payload.Name, payload.VpnID, payload.RouterName)
 	c.mu.Lock()
-	c.lastDst = msg.Routing.Src
+	c.lastDst = announceMsg.Routing.Src
 	c.mu.Unlock()
 	return nil
 }
@@ -1551,36 +1530,6 @@ func writeFrame(conn net.Conn, payload []byte) error {
 	return fluxbeesdk.WriteFrame(conn, payload)
 }
 
-func routerSocketCandidates(dir string, nodeName string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	var sockets []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if strings.HasPrefix(name, "irp-") {
-			continue
-		}
-		if !strings.HasSuffix(name, ".sock") {
-			continue
-		}
-		sockets = append(sockets, filepath.Join(dir, name))
-	}
-	if len(sockets) == 0 {
-		return nil, fmt.Errorf("no router sockets found")
-	}
-	sort.Strings(sockets)
-	idx := int(fnv1a64([]byte(nodeName)) % uint64(len(sockets)))
-	ordered := make([]string, 0, len(sockets))
-	ordered = append(ordered, sockets[idx:]...)
-	ordered = append(ordered, sockets[:idx]...)
-	return ordered, nil
-}
-
 func (c *RouterClient) drainTxQueue() {
 	for {
 		select {
@@ -1597,19 +1546,6 @@ func nextBackoff(current time.Duration) time.Duration {
 		return 30 * time.Second
 	}
 	return next
-}
-
-func fnv1a64(data []byte) uint64 {
-	const (
-		offset64 = 14695981039346656037
-		prime64  = 1099511628211
-	)
-	hash := uint64(offset64)
-	for _, b := range data {
-		hash ^= uint64(b)
-		hash *= prime64
-	}
-	return hash
 }
 
 func mustJSON(v any) []byte {
