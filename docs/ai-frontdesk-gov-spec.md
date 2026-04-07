@@ -115,6 +115,7 @@ Estado vigente:
 - `SY.frontdesk.gov` usa hoy el runner compartido que expone `CONFIG_GET` / `CONFIG_SET`
 - el prompt funcional base pertenece al runtime `SY.frontdesk.gov`
 - si `behavior.instructions` falta, el runtime usa un prompt base embebido
+- si corre como servicio del sistema sin YAML de nodo, bootstrappea su `node_name` desde `hive.yaml` como `SY.frontdesk.gov@<hive_id>`
 - la key de provider entra temporalmente por `CONFIG_SET` y luego se persiste en `secrets.json`
 
 Esto es una solucion operativa transitoria.

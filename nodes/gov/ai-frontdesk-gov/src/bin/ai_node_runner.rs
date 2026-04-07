@@ -168,6 +168,11 @@ struct RunnerConfig {
 }
 
 #[derive(Debug, Deserialize)]
+struct FrontdeskBootstrapHiveFile {
+    hive_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct NodeSection {
     name: String,
     #[serde(default = "default_version")]
@@ -2775,16 +2780,31 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
 fn bootstrap_node_from_args(
     args: &BootstrapArgs,
 ) -> Result<NodeSection, Box<dyn std::error::Error + Send + Sync>> {
-    let name = args.node_name.clone().or_else(|| {
-        let resolved = managed_node_name("", &["AI_NODE_NAME", "NODE_NAME"]);
-        if resolved.trim().is_empty() {
-            None
-        } else {
-            Some(resolved)
-        }
-    }).ok_or_else(|| {
-        "when no --config is provided, pass --node-name (or FLUXBEE_NODE_NAME/AI_NODE_NAME env var)".to_string()
-    })?;
+    let config_dir = args
+        .config_dir
+        .clone()
+        .or_else(|| std::env::var("AI_CONFIG_DIR").ok())
+        .unwrap_or_else(default_config_dir);
+    let dynamic_config_dir = args
+        .dynamic_config_dir
+        .clone()
+        .or_else(|| std::env::var("AI_DYNAMIC_CONFIG_DIR").ok())
+        .unwrap_or_else(default_dynamic_config_dir);
+    let name = args
+        .node_name
+        .clone()
+        .or_else(|| {
+            let resolved = managed_node_name("", &["AI_NODE_NAME", "NODE_NAME"]);
+            if resolved.trim().is_empty() {
+                None
+            } else {
+                Some(resolved)
+            }
+        })
+        .or_else(|| infer_frontdesk_node_name_from_hive(PathBuf::from(&config_dir).as_path()))
+        .ok_or_else(|| {
+            "when no --config is provided, pass --node-name (or FLUXBEE_NODE_NAME/AI_NODE_NAME env var), or provide hive.yaml with hive_id for SY.frontdesk.gov bootstrap".to_string()
+        })?;
     Ok(NodeSection {
         name,
         version: args
@@ -2805,14 +2825,22 @@ fn bootstrap_node_from_args(
         config_dir: args
             .config_dir
             .clone()
-            .or_else(|| std::env::var("AI_CONFIG_DIR").ok())
-            .unwrap_or_else(default_config_dir),
+            .unwrap_or(config_dir),
         dynamic_config_dir: args
             .dynamic_config_dir
             .clone()
-            .or_else(|| std::env::var("AI_DYNAMIC_CONFIG_DIR").ok())
-            .unwrap_or_else(default_dynamic_config_dir),
+            .unwrap_or(dynamic_config_dir),
     })
+}
+
+fn infer_frontdesk_node_name_from_hive(config_dir: &std::path::Path) -> Option<String> {
+    let raw = fs::read_to_string(config_dir.join("hive.yaml")).ok()?;
+    let hive: FrontdeskBootstrapHiveFile = serde_yaml::from_str(&raw).ok()?;
+    let hive_id = hive.hive_id.trim();
+    if hive_id.is_empty() {
+        return None;
+    }
+    Some(format!("SY.frontdesk.gov@{hive_id}"))
 }
 
 fn ensure_unique_node_names(
@@ -4428,5 +4456,20 @@ mod tests {
             }
             other => panic!("expected OpenAiChat behavior, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn infer_frontdesk_node_name_from_hive_uses_hive_id() {
+        let root = std::env::temp_dir().join(format!(
+            "frontdesk-hive-bootstrap-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).expect("create temp config dir");
+        fs::write(root.join("hive.yaml"), "hive_id: motherbee\n").expect("write hive.yaml");
+
+        let inferred = infer_frontdesk_node_name_from_hive(root.as_path());
+        assert_eq!(inferred.as_deref(), Some("SY.frontdesk.gov@motherbee"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
