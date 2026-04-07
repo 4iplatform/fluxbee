@@ -5673,6 +5673,7 @@ fn build_opa_query_response(
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::sync::broadcast;
 
     #[test]
     fn internal_response_payload_value_prefers_payload_field() {
@@ -5734,5 +5735,73 @@ mod tests {
                 "pending_hives_topology": []
             })
         );
+    }
+
+    #[tokio::test]
+    async fn collect_opa_responses_accepts_sy_opa_rules_config_response_shape() {
+        let (tx, mut rx) = broadcast::channel(8);
+        tx.send(Message {
+            routing: Routing {
+                src: "SY.opa.rules@motherbee".to_string(),
+                dst: Destination::Unicast("SY.admin@motherbee".to_string()),
+                ttl: 16,
+                trace_id: "trace-opa-config".to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some("CONFIG_RESPONSE".to_string()),
+                ..Meta::default()
+            },
+            payload: json!({
+                "subsystem": "opa",
+                "action": "compile",
+                "version": 7,
+                "status": "ok",
+                "hive": "motherbee",
+                "compile_time_ms": 12,
+                "wasm_size_bytes": 2048,
+                "hash": "sha256:test"
+            }),
+        })
+        .unwrap();
+
+        let responses = collect_opa_responses(&mut rx, "compile", 7, &["motherbee".to_string()]).await;
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].hive, "motherbee");
+        assert_eq!(responses[0].status, "ok");
+        assert_eq!(responses[0].version, Some(7));
+        assert_eq!(responses[0].hash.as_deref(), Some("sha256:test"));
+    }
+
+    #[tokio::test]
+    async fn collect_opa_query_responses_accepts_sy_opa_rules_query_response_shape() {
+        let (tx, mut rx) = broadcast::channel(8);
+        tx.send(Message {
+            routing: Routing {
+                src: "SY.opa.rules@motherbee".to_string(),
+                dst: Destination::Unicast("SY.admin@motherbee".to_string()),
+                ttl: 16,
+                trace_id: "trace-opa-query".to_string(),
+            },
+            meta: Meta {
+                msg_type: "query_response".to_string(),
+                action: Some("get_status".to_string()),
+                ..Meta::default()
+            },
+            payload: json!({
+                "hive": "motherbee",
+                "status": "ok",
+                "current_version": 4,
+                "current_hash": "sha256:current"
+            }),
+        })
+        .unwrap();
+
+        let responses =
+            collect_opa_query_responses(&mut rx, "get_status", &["motherbee".to_string()]).await;
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].hive, "motherbee");
+        assert_eq!(responses[0].status, "ok");
+        assert_eq!(responses[0].payload["current_version"], json!(4));
     }
 }
