@@ -68,8 +68,8 @@ pub use node_secret::{
     NODE_SECRET_SCHEMA_VERSION,
 };
 pub use policy::{
-    classify_admin_action, classify_routed_message, classify_system_message, ActionClass,
-    ActionResult,
+    action_class_requires_result, classify_admin_action, classify_routed_message,
+    classify_system_message, derive_action_outcome, ActionClass, ActionResult,
 };
 pub use split::{NodeReceiver, NodeSender};
 pub use status::try_handle_default_node_status;

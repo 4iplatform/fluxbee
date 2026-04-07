@@ -21,8 +21,8 @@ use fluxbee_sdk::protocol::{
     SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    classify_admin_action, classify_system_message, connect, ClientConfig, NodeConfig,
-    NodeReceiver, NodeSender,
+    classify_admin_action, classify_system_message, connect, derive_action_outcome, ClientConfig,
+    NodeConfig, NodeReceiver, NodeSender,
 };
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, RemoteHiveEntry, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
@@ -748,6 +748,9 @@ async fn send_admin_command_response(
     error_detail: Option<serde_json::Value>,
     request_id: Option<String>,
 ) -> Result<(), AdminError> {
+    let action_class = classify_admin_action(action);
+    let (action_result, result_origin) =
+        derive_action_outcome(action_class, Some(status), error_code.as_deref());
     let mut body = serde_json::json!({
         "status": status,
         "action": action,
@@ -773,6 +776,9 @@ async fn send_admin_command_response(
             scope: None,
             target: None,
             action: Some(action.to_string()),
+            action_class,
+            action_result,
+            result_origin: result_origin.map(str::to_string),
             priority: None,
             context: None,
             ..Meta::default()

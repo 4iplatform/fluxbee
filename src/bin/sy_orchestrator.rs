@@ -26,7 +26,10 @@ use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED,
     MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SCOPE_GLOBAL, SYSTEM_KIND,
 };
-use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender, NodeUuidMode};
+use fluxbee_sdk::{
+    classify_admin_action, classify_system_message, connect, derive_action_outcome, NodeConfig,
+    NodeReceiver, NodeSender, NodeUuidMode,
+};
 use json_router::{
     runtime_manifest::{
         load_runtime_manifest_from_paths as load_runtime_manifest_paths_shared,
@@ -1175,6 +1178,9 @@ async fn send_admin_forbidden(
     action: &str,
     reason: &str,
 ) -> Result<(), OrchestratorError> {
+    let action_class = classify_admin_action(action);
+    let (action_result, result_origin) =
+        derive_action_outcome(action_class, Some("error"), Some("FORBIDDEN"));
     let payload = serde_json::json!({
         "status": "error",
         "error_code": "FORBIDDEN",
@@ -1194,6 +1200,9 @@ async fn send_admin_forbidden(
             scope: None,
             target: None,
             action: Some(action.to_string()),
+            action_class,
+            action_result,
+            result_origin: result_origin.map(str::to_string),
             priority: None,
             context: None,
             ..Meta::default()
@@ -1414,6 +1423,10 @@ async fn handle_admin(
             "message": format!("action '{action}' not implemented"),
         }),
     };
+    let action_class = classify_admin_action(action);
+    let status = payload.get("status").and_then(|value| value.as_str());
+    let error_code = payload.get("error_code").and_then(|value| value.as_str());
+    let (action_result, result_origin) = derive_action_outcome(action_class, status, error_code);
 
     let reply = Message {
         routing: Routing {
@@ -1429,6 +1442,9 @@ async fn handle_admin(
             scope: None,
             target: None,
             action: Some(action.to_string()),
+            action_class,
+            action_result,
+            result_origin: result_origin.map(str::to_string),
             priority: None,
             context: None,
             ..Meta::default()
@@ -2685,6 +2701,14 @@ async fn send_system_action_response(
     msg_name: &str,
     payload: serde_json::Value,
 ) -> Result<(), OrchestratorError> {
+    let action_class = request
+        .meta
+        .msg
+        .as_deref()
+        .and_then(classify_system_message);
+    let status = payload.get("status").and_then(|value| value.as_str());
+    let error_code = payload.get("error_code").and_then(|value| value.as_str());
+    let (action_result, result_origin) = derive_action_outcome(action_class, status, error_code);
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
@@ -2698,7 +2722,10 @@ async fn send_system_action_response(
             src_ilk: None,
             scope: None,
             target: None,
-            action: None,
+            action: request.meta.msg.clone(),
+            action_class,
+            action_result,
+            result_origin: result_origin.map(str::to_string),
             priority: None,
             context: None,
             ..Meta::default()
@@ -6933,6 +6960,9 @@ async fn send_config_response(
     error_detail: Option<String>,
     hive: &str,
 ) -> Result<(), OrchestratorError> {
+    let action_class = classify_system_message("CONFIG_SET");
+    let (action_result, result_origin) =
+        derive_action_outcome(action_class, Some(status), error_code.as_deref());
     let mut payload = serde_json::json!({
         "subsystem": subsystem,
         "version": version,
@@ -6958,7 +6988,10 @@ async fn send_config_response(
             src_ilk: None,
             scope: None,
             target: None,
-            action: None,
+            action: Some("CONFIG_SET".to_string()),
+            action_class,
+            action_result,
+            result_origin: result_origin.map(str::to_string),
             priority: None,
             context: None,
             ..Meta::default()

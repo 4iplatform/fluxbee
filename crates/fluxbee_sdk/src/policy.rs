@@ -148,10 +148,41 @@ pub fn classify_system_message(msg: &str) -> Option<ActionClass> {
     }
 }
 
+pub const fn action_class_requires_result(action_class: ActionClass) -> bool {
+    !matches!(action_class, ActionClass::SendMessage | ActionClass::Read)
+}
+
+pub fn derive_action_outcome(
+    action_class: Option<ActionClass>,
+    status: Option<&str>,
+    error_code: Option<&str>,
+) -> (Option<ActionResult>, Option<&'static str>) {
+    let Some(_action_class) = action_class.filter(|class| action_class_requires_result(*class)) else {
+        return (None, None);
+    };
+
+    if status.is_some_and(|value| value.eq_ignore_ascii_case("ok")) {
+        return (Some(ActionResult::Applied), None);
+    }
+
+    if status.is_some_and(|value| value.eq_ignore_ascii_case("blocked"))
+        || error_code.is_some_and(|value| value.eq_ignore_ascii_case("FORBIDDEN"))
+    {
+        return (Some(ActionResult::Blocked), Some("node"));
+    }
+
+    if status.is_some() {
+        return (Some(ActionResult::Failed), None);
+    }
+
+    (None, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_admin_action, classify_routed_message, classify_system_message, ActionClass,
+        action_class_requires_result, classify_admin_action, classify_routed_message,
+        classify_system_message, derive_action_outcome, ActionClass, ActionResult,
     };
 
     #[test]
@@ -181,5 +212,40 @@ mod tests {
         assert_eq!(classify_routed_message("system"), None);
         assert_eq!(classify_routed_message("admin"), None);
         assert_eq!(classify_routed_message("query_response"), None);
+    }
+
+    #[test]
+    fn marks_only_evaluable_classes_as_result_driven() {
+        assert!(!action_class_requires_result(ActionClass::SendMessage));
+        assert!(!action_class_requires_result(ActionClass::Read));
+        assert!(action_class_requires_result(ActionClass::SystemConfig));
+    }
+
+    #[test]
+    fn derives_applied_blocked_and_failed_outcomes() {
+        assert_eq!(
+            derive_action_outcome(Some(ActionClass::SystemConfig), Some("ok"), None),
+            (Some(ActionResult::Applied), None)
+        );
+        assert_eq!(
+            derive_action_outcome(
+                Some(ActionClass::NodeLifecycle),
+                Some("error"),
+                Some("FORBIDDEN")
+            ),
+            (Some(ActionResult::Blocked), Some("node"))
+        );
+        assert_eq!(
+            derive_action_outcome(
+                Some(ActionClass::TopologyChange),
+                Some("error"),
+                Some("IO_ERROR")
+            ),
+            (Some(ActionResult::Failed), None)
+        );
+        assert_eq!(
+            derive_action_outcome(Some(ActionClass::Read), Some("ok"), None),
+            (None, None)
+        );
     }
 }
