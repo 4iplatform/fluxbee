@@ -609,6 +609,10 @@ func (s *Service) loadCurrentPolicy() error {
 func (s *Service) handleMessage(msg Message) {
 	switch msg.Meta.Type {
 	case "system":
+		if msg.Meta.Msg == fluxbeesdk.MSGNodeStatusGet {
+			s.handleNodeStatusGet(msg)
+			return
+		}
 		if msg.Meta.Msg == fluxbeesdk.MSGConfigGet {
 			s.handleNodeConfigGet(msg)
 			return
@@ -639,20 +643,34 @@ func (s *Service) handleMessage(msg Message) {
 	}
 }
 
+func (s *Service) handleNodeStatusGet(msg Message) {
+	resp, err := fluxbeesdk.BuildDefaultNodeStatusResponse(
+		toSDKMessage(msg),
+		s.nodeUUID.String(),
+		"HEALTHY",
+	)
+	if err != nil {
+		log.Printf("failed to build node status response: %v", err)
+		return
+	}
+	s.routerConn.Send(fromSDKMessage(resp))
+}
+
 func (s *Service) handleNodeConfigGet(msg Message) {
-	var req fluxbeesdk.NodeConfigGetPayload
-	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+	reqMsg, err := fluxbeesdk.ParseNodeConfigRequest(toSDKMessage(msg))
+	if err != nil || reqMsg == nil || reqMsg.Get == nil {
 		s.sendNodeConfigResponse(msg, map[string]any{
 			"ok":        false,
 			"node_name": s.nodeName,
 			"state":     "error",
 			"error": map[string]any{
 				"code":   "INVALID_CONFIG_GET",
-				"detail": err.Error(),
+				"detail": errorString(err, "invalid CONFIG_GET request"),
 			},
 		})
 		return
 	}
+	req := reqMsg.Get
 	currentMeta, _ := readMetadata(filepath.Join(stateDir, "current", "metadata.json"))
 	stagedMeta, _ := readMetadata(filepath.Join(stateDir, "staged", "metadata.json"))
 	backupMeta, _ := readMetadata(filepath.Join(stateDir, "backup", "metadata.json"))
@@ -690,19 +708,20 @@ func (s *Service) handleNodeConfigGet(msg Message) {
 }
 
 func (s *Service) handleNodeConfigSet(msg Message) {
-	var req fluxbeesdk.NodeConfigSetPayload
-	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+	reqMsg, err := fluxbeesdk.ParseNodeConfigRequest(toSDKMessage(msg))
+	if err != nil || reqMsg == nil || reqMsg.Set == nil {
 		s.sendNodeConfigResponse(msg, map[string]any{
 			"ok":        false,
 			"node_name": s.nodeName,
 			"state":     "error",
 			"error": map[string]any{
 				"code":   "INVALID_CONFIG_SET",
-				"detail": err.Error(),
+				"detail": errorString(err, "invalid CONFIG_SET request"),
 			},
 		})
 		return
 	}
+	req := reqMsg.Set
 	if req.ApplyMode != "" && req.ApplyMode != fluxbeesdk.NodeConfigApplyModeReplace {
 		s.sendNodeConfigResponse(msg, map[string]any{
 			"ok":        false,
@@ -810,26 +829,12 @@ func (s *Service) handleNodeConfigSet(msg Message) {
 }
 
 func (s *Service) sendNodeConfigResponse(request Message, payload map[string]any) {
-	resp := Message{
-		Routing: Routing{
-			Src:     s.nodeUUID.String(),
-			Dst:     request.Routing.Src,
-			Ttl:     16,
-			TraceID: request.Routing.TraceID,
-		},
-		Meta: Meta{
-			Type:     fluxbeesdk.SYSTEMKind,
-			Msg:      fluxbeesdk.MSGConfigResponse,
-			Target:   fluxbeesdk.NodeConfigControlTarget,
-			Action:   fluxbeesdk.MSGConfigResponse,
-			SrcIlk:   request.Meta.SrcIlk,
-			Scope:    request.Meta.Scope,
-			Priority: request.Meta.Priority,
-			Context:  request.Meta.Context,
-		},
-		Payload: mustJSON(payload),
+	resp, err := fluxbeesdk.BuildNodeConfigResponseMessage(toSDKMessage(request), s.nodeUUID.String(), payload)
+	if err != nil {
+		log.Printf("failed to build CONFIG_RESPONSE: %v", err)
+		return
 	}
-	s.routerConn.Send(resp)
+	s.routerConn.Send(fromSDKMessage(resp))
 }
 
 func buildPolicySnapshot(meta PolicyMetadata) map[string]any {
@@ -856,6 +861,122 @@ func inferOpaErrorCode(err error) string {
 		return oePtr.Code
 	}
 	return "OPA_CONFIG_ERROR"
+}
+
+func errorString(err error, fallback string) string {
+	if err == nil {
+		return fallback
+	}
+	return err.Error()
+}
+
+func toSDKMessage(msg Message) *fluxbeesdk.Message {
+	return &fluxbeesdk.Message{
+		Routing: fluxbeesdk.Routing{
+			Src:     msg.Routing.Src,
+			Dst:     toSDKDestination(msg.Routing.Dst),
+			TTL:     msg.Routing.Ttl,
+			TraceID: msg.Routing.TraceID,
+		},
+		Meta: fluxbeesdk.Meta{
+			MsgType:          msg.Meta.Type,
+			Msg:              stringPtr(msg.Meta.Msg),
+			SrcIlk:           stringPtr(msg.Meta.SrcIlk),
+			DstIlk:           stringPtr(msg.Meta.DstIlk),
+			Ich:              stringPtr(msg.Meta.Ich),
+			ThreadID:         stringPtr(msg.Meta.ThreadID),
+			Ctx:              stringPtr(msg.Meta.Ctx),
+			Scope:            stringPtr(msg.Meta.Scope),
+			Target:           stringPtr(msg.Meta.Target),
+			Action:           stringPtr(msg.Meta.Action),
+			ActionClass:      stringPtr(msg.Meta.ActionClass),
+			ActionResult:     stringPtr(msg.Meta.ActionResult),
+			ResultOrigin:     stringPtr(msg.Meta.ResultOrigin),
+			ResultDetailCode: stringPtr(msg.Meta.ResultDetailCode),
+			Priority:         stringPtr(msg.Meta.Priority),
+			Context:          cloneRawMessage(msg.Meta.Context),
+		},
+		Payload: cloneRawMessage(msg.Payload),
+	}
+}
+
+func fromSDKMessage(msg fluxbeesdk.Message) Message {
+	return Message{
+		Routing: Routing{
+			Src:     msg.Routing.Src,
+			Dst:     fromSDKDestination(msg.Routing.Dst),
+			Ttl:     msg.Routing.TTL,
+			TraceID: msg.Routing.TraceID,
+		},
+		Meta: Meta{
+			Type:             msg.Meta.MsgType,
+			Msg:              derefString(msg.Meta.Msg),
+			SrcIlk:           derefString(msg.Meta.SrcIlk),
+			DstIlk:           derefString(msg.Meta.DstIlk),
+			Ich:              derefString(msg.Meta.Ich),
+			ThreadID:         derefString(msg.Meta.ThreadID),
+			Ctx:              derefString(msg.Meta.Ctx),
+			Scope:            derefString(msg.Meta.Scope),
+			Target:           derefString(msg.Meta.Target),
+			Action:           derefString(msg.Meta.Action),
+			ActionClass:      derefString(msg.Meta.ActionClass),
+			ActionResult:     derefString(msg.Meta.ActionResult),
+			ResultOrigin:     derefString(msg.Meta.ResultOrigin),
+			ResultDetailCode: derefString(msg.Meta.ResultDetailCode),
+			Priority:         derefString(msg.Meta.Priority),
+			Context:          cloneRawMessage(msg.Meta.Context),
+		},
+		Payload: cloneRawMessage(msg.Payload),
+	}
+}
+
+func toSDKDestination(dst any) fluxbeesdk.Destination {
+	switch value := dst.(type) {
+	case nil:
+		return fluxbeesdk.ResolveDestination()
+	case string:
+		if value == "broadcast" {
+			return fluxbeesdk.BroadcastDestination()
+		}
+		return fluxbeesdk.UnicastDestination(value)
+	default:
+		return fluxbeesdk.ResolveDestination()
+	}
+}
+
+func fromSDKDestination(dst fluxbeesdk.Destination) any {
+	switch {
+	case dst.IsBroadcast():
+		return "broadcast"
+	case dst.IsResolve():
+		return nil
+	default:
+		return dst.Value()
+	}
+}
+
+func stringPtr(value string) *string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	copy := value
+	return &copy
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func cloneRawMessage(value json.RawMessage) json.RawMessage {
+	if len(value) == 0 {
+		return nil
+	}
+	out := make([]byte, len(value))
+	copy(out, value)
+	return out
 }
 
 func (s *Service) handleCommand(msg Message) {
