@@ -530,7 +530,7 @@ For now, the target is:
 #### `SY.opa.rules`
 
 - [x] SYS-ALIGN-S5-T11. Migrate `SY.opa.rules` transport/envelope code to `fluxbee-go-sdk`.
-- [ ] SYS-ALIGN-S5-T12. Replace its local `Message` / `Meta` / `Routing` structs with SDK equivalents.
+- [x] SYS-ALIGN-S5-T12. Replace its local `Message` / `Meta` / `Routing` structs with SDK equivalents.
 - [x] SYS-ALIGN-S5-T13. Replace its embedded router client lifecycle with SDK connection helpers.
 - [x] SYS-ALIGN-S5-T14. Add Rust-SDK-aligned config/control-plane support without breaking the current OPA action surface.
 - [ ] SYS-ALIGN-S5-T15. Preserve OPA SHM, compile/apply/rollback, and router reload semantics during the migration.

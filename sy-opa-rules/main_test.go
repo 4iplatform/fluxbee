@@ -62,7 +62,7 @@ func TestHandleNodeConfigGetReturnsContractAndSnapshots(t *testing.T) {
 		t.Fatalf("build config get: %v", err)
 	}
 
-	service.handleNodeConfigGet(fromSDKMessage(req))
+	service.handleNodeConfigGet(req)
 
 	if len(router.sent) != 1 {
 		t.Fatalf("expected 1 response, got %d", len(router.sent))
@@ -105,7 +105,7 @@ func TestHandleNodeConfigSetRejectsNonObjectConfig(t *testing.T) {
 		t.Fatalf("build config set: %v", err)
 	}
 
-	service.handleNodeConfigSet(fromSDKMessage(req))
+	service.handleNodeConfigSet(req)
 
 	if len(router.sent) != 1 {
 		t.Fatalf("expected 1 response, got %d", len(router.sent))
