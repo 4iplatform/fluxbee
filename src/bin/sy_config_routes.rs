@@ -717,20 +717,11 @@ async fn handle_admin_action(
 }
 
 fn admin_success_payload(action: &str, payload: serde_json::Value) -> serde_json::Value {
-    let mut body = serde_json::Map::new();
-    body.insert(
-        "status".to_string(),
-        serde_json::Value::String("ok".to_string()),
-    );
-    body.insert(
-        "action".to_string(),
-        serde_json::Value::String(action.to_string()),
-    );
-    body.insert("payload".to_string(), payload.clone());
-    if let Some(object) = payload.as_object() {
-        body.extend(object.clone());
-    }
-    serde_json::Value::Object(body)
+    serde_json::json!({
+        "status": "ok",
+        "action": action,
+        "payload": payload,
+    })
 }
 
 fn admin_error_payload(action: &str, code: &str, detail: String) -> serde_json::Value {
@@ -740,8 +731,6 @@ fn admin_error_payload(action: &str, code: &str, detail: String) -> serde_json::
         "payload": serde_json::Value::Null,
         "error_code": code,
         "error_detail": detail,
-        "error": code,
-        "message": detail,
     })
 }
 
@@ -1114,19 +1103,19 @@ mod tests {
     }
 
     #[test]
-    fn admin_error_payload_keeps_legacy_and_modern_fields() {
+    fn admin_error_payload_uses_canonical_fields() {
         let payload = admin_error_payload("delete_route", "NOT_FOUND", "missing route".to_string());
         assert_eq!(payload["status"], json!("error"));
         assert_eq!(payload["action"], json!("delete_route"));
         assert_eq!(payload["payload"], serde_json::Value::Null);
         assert_eq!(payload["error_code"], json!("NOT_FOUND"));
         assert_eq!(payload["error_detail"], json!("missing route"));
-        assert_eq!(payload["error"], json!("NOT_FOUND"));
-        assert_eq!(payload["message"], json!("missing route"));
+        assert!(payload.get("error").is_none());
+        assert!(payload.get("message").is_none());
     }
 
     #[test]
-    fn admin_success_payload_keeps_modern_and_legacy_fields() {
+    fn admin_success_payload_uses_canonical_envelope() {
         let payload = admin_success_payload(
             "list_routes",
             json!({
@@ -1143,7 +1132,7 @@ mod tests {
                 "routes": [{ "prefix": "alpha/**" }],
             })
         );
-        assert_eq!(payload["config_version"], json!(4));
-        assert_eq!(payload["routes"][0]["prefix"], json!("alpha/**"));
+        assert!(payload.get("config_version").is_none());
+        assert!(payload.get("routes").is_none());
     }
 }

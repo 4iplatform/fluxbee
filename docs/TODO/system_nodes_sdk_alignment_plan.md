@@ -493,7 +493,9 @@ For now, the target is:
 
 ### SYS-ALIGN-S4 — Admin/orchestrator contract cleanup
 
-- [ ] SYS-ALIGN-S4-T1. Make `SY.admin` the single canonical origin of operator/system commands for these nodes.
+- [x] SYS-ALIGN-S4-T1. Make `SY.admin` the single canonical origin of operator/system commands for these nodes.
+  - Operator/system commands for `SY.config.routes` and `SY.opa.rules` are canonically issued through `SY.admin`.
+  - Any direct node-local admin/command/query surface that remains is treated as implementation compatibility, not as the primary operator contract.
 - [ ] SYS-ALIGN-S4-T2. Ensure both nodes expose explicit, documented action catalogs that `SY.admin` can rely on.
 - [ ] SYS-ALIGN-S4-T3. Ensure `SY.orchestrator` only depends on stable service lifecycle contracts, not node-specific reply quirks.
 - [ ] SYS-ALIGN-S4-T4. Review whether `sy-opa-rules` and `sy-config-routes` should advertise richer capability/contracts during startup.
