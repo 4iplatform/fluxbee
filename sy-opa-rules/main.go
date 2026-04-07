@@ -31,12 +31,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+var (
+	configDir     = "/etc/fluxbee"
+	stateDir      = "/var/lib/fluxbee/opa"
+	nodesDir      = "/var/lib/fluxbee/state/nodes"
+	routerSockDir = "/var/run/fluxbee/routers"
+	lockPath      = "/var/run/fluxbee/sy-opa-rules.lock"
+)
+
 const (
-	configDir           = "/etc/fluxbee"
-	stateDir            = "/var/lib/fluxbee/opa"
-	nodesDir            = "/var/lib/fluxbee/state/nodes"
-	routerSockDir       = "/var/run/fluxbee/routers"
-	lockPath            = "/var/run/fluxbee/sy-opa-rules.lock"
 	opaShmPrefix        = "/jsr-opa-"
 	routerShmPrefix     = "/jsr-"
 	opaMagic            = 0x4A534F50 // "JSOP"
@@ -201,10 +204,15 @@ type Service struct {
 	hiveID     string
 	nodeUUID   uuid.UUID
 	nodeName   string
-	routerConn *RouterClient
+	routerConn routerTransport
 	opaRegion  *OpaRegion
 
 	lastError string
+}
+
+type routerTransport interface {
+	SendSDK(fluxbeesdk.Message)
+	LastPeer() string
 }
 
 type RouterStatus struct {
@@ -652,7 +660,7 @@ func (s *Service) handleNodeStatusGet(msg Message) {
 		log.Printf("failed to build node status response: %v", err)
 		return
 	}
-	s.routerConn.Send(fromSDKMessage(resp))
+	s.routerConn.SendSDK(resp)
 }
 
 func (s *Service) handleNodeConfigGet(msg Message) {
@@ -833,7 +841,7 @@ func (s *Service) sendNodeConfigResponse(request Message, payload map[string]any
 		log.Printf("failed to build CONFIG_RESPONSE: %v", err)
 		return
 	}
-	s.routerConn.Send(fromSDKMessage(resp))
+	s.routerConn.SendSDK(resp)
 }
 
 func buildPolicySnapshot(meta PolicyMetadata) map[string]any {
@@ -1268,7 +1276,7 @@ func (s *Service) sendCommandResponse(msg Message, action string, payload map[st
 		log.Printf("failed to build command response: %v", err)
 		return
 	}
-	s.routerConn.Send(fromSDKMessage(resp))
+	s.routerConn.SendSDK(resp)
 }
 
 func (s *Service) sendCommandError(action string, version uint64, code, detail string) {
@@ -1278,22 +1286,19 @@ func (s *Service) sendCommandError(action string, version uint64, code, detail s
 		"error_detail": detail,
 		"version":      version,
 	}
-	resp, err := fluxbeesdk.BuildCommandResponse(s.nodeUUID.String(), "", uuid.New().String(), action, payload)
+	dst := ""
+	if s.routerConn != nil {
+		dst = s.routerConn.LastPeer()
+	}
+	if dst == "" {
+		return
+	}
+	resp, err := fluxbeesdk.BuildCommandResponse(s.nodeUUID.String(), dst, uuid.New().String(), action, payload)
 	if err != nil {
 		log.Printf("failed to build command error response: %v", err)
 		return
 	}
-	local := fromSDKMessage(resp)
-	local.Routing.Dst = nil
-	if s.routerConn != nil {
-		if dst := s.routerConn.LastPeer(); dst != "" {
-			local.Routing.Dst = dst
-		}
-	}
-	if local.Routing.Dst == nil {
-		return
-	}
-	s.routerConn.Send(local)
+	s.routerConn.SendSDK(resp)
 }
 
 func (s *Service) sendQueryResponse(msg Message, action string, payload map[string]any) {
@@ -1307,7 +1312,7 @@ func (s *Service) sendQueryResponse(msg Message, action string, payload map[stri
 	} else {
 		log.Printf("query response action=%s", action)
 	}
-	s.routerConn.Send(fromSDKMessage(resp))
+	s.routerConn.SendSDK(resp)
 }
 
 func (s *Service) sendSystemMessage(dst, msg string, payload map[string]any) {
@@ -1316,7 +1321,7 @@ func (s *Service) sendSystemMessage(dst, msg string, payload map[string]any) {
 		log.Printf("failed to build system message: %v", err)
 		return
 	}
-	s.routerConn.Send(fromSDKMessage(resp))
+	s.routerConn.SendSDK(resp)
 }
 
 func (s *Service) broadcastOpaReload(version uint64, hash string) {
@@ -1329,7 +1334,7 @@ func (s *Service) broadcastOpaReload(version uint64, hash string) {
 		log.Printf("failed to build OPA_RELOAD broadcast: %v", err)
 		return
 	}
-	s.routerConn.Send(fromSDKMessage(msg))
+	s.routerConn.SendSDK(msg)
 }
 
 func (s *Service) heartbeatLoop() {
@@ -1343,7 +1348,7 @@ func (s *Service) heartbeatLoop() {
 type RouterClient struct {
 	nodeUUID uuid.UUID
 	nodeName string
-	tx       chan Message
+	tx       chan fluxbeesdk.Message
 	sender   *fluxbeesdk.NodeSender
 	mu       sync.Mutex
 	lastDst  string
@@ -1353,7 +1358,7 @@ func NewRouterClient(nodeUUID uuid.UUID, nodeName string) *RouterClient {
 	return &RouterClient{
 		nodeUUID: nodeUUID,
 		nodeName: nodeName,
-		tx:       make(chan Message, 256),
+		tx:       make(chan fluxbeesdk.Message, 256),
 	}
 }
 
@@ -1405,7 +1410,7 @@ func (c *RouterClient) Run(service *Service) {
 	}
 }
 
-func (c *RouterClient) Send(msg Message) {
+func (c *RouterClient) SendSDK(msg fluxbeesdk.Message) {
 	c.tx <- msg
 }
 
@@ -1419,7 +1424,7 @@ func nextBackoff(current time.Duration) time.Duration {
 
 func (c *RouterClient) forwardOutgoing(sender *fluxbeesdk.NodeSender) {
 	for msg := range c.tx {
-		if err := sender.Send(*toSDKMessage(msg)); err != nil {
+		if err := sender.Send(msg); err != nil {
 			log.Printf("failed to send router message: %v", err)
 		}
 	}
