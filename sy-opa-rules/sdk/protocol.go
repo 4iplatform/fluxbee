@@ -236,6 +236,27 @@ func BuildSystemMessage(src string, dst Destination, ttl uint8, traceID, msg str
 	}, nil
 }
 
+func BuildMessageEnvelope(src string, dst Destination, ttl uint8, traceID, msgType string, msgName, action *string, payload any) (Message, error) {
+	raw, err := MarshalPayload(payload)
+	if err != nil {
+		return Message{}, err
+	}
+	return Message{
+		Routing: Routing{
+			Src:     src,
+			Dst:     dst,
+			TTL:     ttl,
+			TraceID: traceID,
+		},
+		Meta: Meta{
+			MsgType: msgType,
+			Msg:     msgName,
+			Action:  action,
+		},
+		Payload: raw,
+	}, nil
+}
+
 func BuildHello(src, traceID string, payload NodeHelloPayload) (Message, error) {
 	return BuildSystemMessage(src, ResolveDestination(), 1, traceID, MSGHello, payload)
 }
@@ -246,4 +267,22 @@ func BuildAnnounce(src, dst, traceID string, payload NodeAnnouncePayload) (Messa
 
 func BuildWithdraw(src string, dst Destination, traceID, uuid string) (Message, error) {
 	return BuildSystemMessage(src, dst, 1, traceID, MSGWithdraw, WithdrawPayload{UUID: uuid})
+}
+
+func BuildCommandResponse(src, dst, traceID, action string, payload any) (Message, error) {
+	actionCopy := action
+	return BuildMessageEnvelope(src, UnicastDestination(dst), 16, traceID, "command_response", nil, &actionCopy, payload)
+}
+
+func BuildQueryResponse(src, dst, traceID, action string, payload any) (Message, error) {
+	actionCopy := action
+	return BuildMessageEnvelope(src, UnicastDestination(dst), 16, traceID, "query_response", nil, &actionCopy, payload)
+}
+
+func BuildSystemUnicast(src, dst, traceID, msg string, payload any) (Message, error) {
+	return BuildSystemMessage(src, UnicastDestination(dst), 16, traceID, msg, payload)
+}
+
+func BuildSystemBroadcast(src, traceID, msg string, payload any, ttl uint8) (Message, error) {
+	return BuildSystemMessage(src, BroadcastDestination(), ttl, traceID, msg, payload)
 }

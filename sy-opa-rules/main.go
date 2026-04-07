@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1264,20 +1263,12 @@ func (s *Service) sendConfigResponse(dst, action string, version uint64, status 
 }
 
 func (s *Service) sendCommandResponse(msg Message, action string, payload map[string]any) {
-	resp := Message{
-		Routing: Routing{
-			Src:     s.nodeUUID.String(),
-			Dst:     msg.Routing.Src,
-			Ttl:     16,
-			TraceID: uuid.New().String(),
-		},
-		Meta: Meta{
-			Type:   "command_response",
-			Action: action,
-		},
-		Payload: mustJSON(payload),
+	resp, err := fluxbeesdk.BuildCommandResponse(s.nodeUUID.String(), msg.Routing.Src, uuid.New().String(), action, payload)
+	if err != nil {
+		log.Printf("failed to build command response: %v", err)
+		return
 	}
-	s.routerConn.Send(resp)
+	s.routerConn.Send(fromSDKMessage(resp))
 }
 
 func (s *Service) sendCommandError(action string, version uint64, code, detail string) {
@@ -1287,67 +1278,45 @@ func (s *Service) sendCommandError(action string, version uint64, code, detail s
 		"error_detail": detail,
 		"version":      version,
 	}
-	resp := Message{
-		Routing: Routing{
-			Src:     s.nodeUUID.String(),
-			Dst:     nil,
-			Ttl:     16,
-			TraceID: uuid.New().String(),
-		},
-		Meta: Meta{
-			Type:   "command_response",
-			Action: action,
-		},
-		Payload: mustJSON(payload),
-	}
-	if s.routerConn != nil {
-		if dst := s.routerConn.LastPeer(); dst != "" {
-			resp.Routing.Dst = dst
-		}
-	}
-	if resp.Routing.Dst == nil {
+	resp, err := fluxbeesdk.BuildCommandResponse(s.nodeUUID.String(), "", uuid.New().String(), action, payload)
+	if err != nil {
+		log.Printf("failed to build command error response: %v", err)
 		return
 	}
-	s.routerConn.Send(resp)
+	local := fromSDKMessage(resp)
+	local.Routing.Dst = nil
+	if s.routerConn != nil {
+		if dst := s.routerConn.LastPeer(); dst != "" {
+			local.Routing.Dst = dst
+		}
+	}
+	if local.Routing.Dst == nil {
+		return
+	}
+	s.routerConn.Send(local)
 }
 
 func (s *Service) sendQueryResponse(msg Message, action string, payload map[string]any) {
-	resp := Message{
-		Routing: Routing{
-			Src:     s.nodeUUID.String(),
-			Dst:     msg.Routing.Src,
-			Ttl:     16,
-			TraceID: uuid.New().String(),
-		},
-		Meta: Meta{
-			Type:   "query_response",
-			Action: action,
-		},
-		Payload: mustJSON(payload),
+	resp, err := fluxbeesdk.BuildQueryResponse(s.nodeUUID.String(), msg.Routing.Src, uuid.New().String(), action, payload)
+	if err != nil {
+		log.Printf("failed to build query response: %v", err)
+		return
 	}
 	if version, ok := payload["version"]; ok {
 		log.Printf("query response action=%s version=%v", action, version)
 	} else {
 		log.Printf("query response action=%s", action)
 	}
-	s.routerConn.Send(resp)
+	s.routerConn.Send(fromSDKMessage(resp))
 }
 
 func (s *Service) sendSystemMessage(dst, msg string, payload map[string]any) {
-	resp := Message{
-		Routing: Routing{
-			Src:     s.nodeUUID.String(),
-			Dst:     dst,
-			Ttl:     16,
-			TraceID: uuid.New().String(),
-		},
-		Meta: Meta{
-			Type: "system",
-			Msg:  msg,
-		},
-		Payload: mustJSON(payload),
+	resp, err := fluxbeesdk.BuildSystemUnicast(s.nodeUUID.String(), dst, uuid.New().String(), msg, payload)
+	if err != nil {
+		log.Printf("failed to build system message: %v", err)
+		return
 	}
-	s.routerConn.Send(resp)
+	s.routerConn.Send(fromSDKMessage(resp))
 }
 
 func (s *Service) broadcastOpaReload(version uint64, hash string) {
@@ -1355,20 +1324,12 @@ func (s *Service) broadcastOpaReload(version uint64, hash string) {
 		"version": version,
 		"hash":    hash,
 	}
-	msg := Message{
-		Routing: Routing{
-			Src:     s.nodeUUID.String(),
-			Dst:     "broadcast",
-			Ttl:     2,
-			TraceID: uuid.New().String(),
-		},
-		Meta: Meta{
-			Type: "system",
-			Msg:  "OPA_RELOAD",
-		},
-		Payload: mustJSON(payload),
+	msg, err := fluxbeesdk.BuildSystemBroadcast(s.nodeUUID.String(), uuid.New().String(), fluxbeesdk.MSGOPAReload, payload, 2)
+	if err != nil {
+		log.Printf("failed to build OPA_RELOAD broadcast: %v", err)
+		return
 	}
-	s.routerConn.Send(msg)
+	s.routerConn.Send(fromSDKMessage(msg))
 }
 
 func (s *Service) heartbeatLoop() {
@@ -1382,22 +1343,17 @@ func (s *Service) heartbeatLoop() {
 type RouterClient struct {
 	nodeUUID uuid.UUID
 	nodeName string
-	nodeBase string
-	tx       chan []byte
+	tx       chan Message
+	sender   *fluxbeesdk.NodeSender
 	mu       sync.Mutex
 	lastDst  string
 }
 
 func NewRouterClient(nodeUUID uuid.UUID, nodeName string) *RouterClient {
-	base := nodeName
-	if parts := strings.Split(nodeName, "@"); len(parts) > 1 {
-		base = parts[0]
-	}
 	return &RouterClient{
 		nodeUUID: nodeUUID,
 		nodeName: nodeName,
-		nodeBase: base,
-		tx:       make(chan []byte, 256),
+		tx:       make(chan Message, 256),
 	}
 }
 
@@ -1410,134 +1366,47 @@ func (c *RouterClient) LastPeer() string {
 func (c *RouterClient) Run(service *Service) {
 	backoff := 100 * time.Millisecond
 	for {
-		c.drainTxQueue()
-		conn, err := c.connect()
+		sender, receiver, err := fluxbeesdk.Connect(fluxbeesdk.NodeConfig{
+			Name:               c.nodeName,
+			RouterSocket:       routerSockDir,
+			UUIDPersistenceDir: nodesDir,
+			UUIDMode:           fluxbeesdk.NodeUuidPersistent,
+			ConfigDir:          configDir,
+			Version:            "1.0",
+		})
 		if err != nil {
 			log.Printf("connect failed: %v", err)
 			time.Sleep(backoff)
 			backoff = nextBackoff(backoff)
 			continue
 		}
-		if err := c.handshake(conn); err != nil {
-			log.Printf("handshake failed: %v", err)
-			conn.Close()
-			time.Sleep(backoff)
-			backoff = nextBackoff(backoff)
-			continue
+		c.mu.Lock()
+		c.sender = sender
+		c.mu.Unlock()
+		if sender.UUID() != c.nodeUUID.String() {
+			log.Printf("router sdk uuid differs from bootstrap uuid sdk=%s bootstrap=%s", sender.UUID(), c.nodeUUID)
 		}
 		backoff = 100 * time.Millisecond
-		if err := c.runConn(conn, service); err != nil {
-			log.Printf("router connection error: %v", err)
-		}
-		conn.Close()
-		time.Sleep(backoff)
-		backoff = nextBackoff(backoff)
-	}
-}
+		go c.forwardOutgoing(sender)
 
-func (c *RouterClient) connect() (net.Conn, error) {
-	candidates, err := fluxbeesdk.RouterSocketCandidates(routerSockDir, c.nodeBase)
-	if err != nil {
-		return nil, err
-	}
-	var lastErr error
-	for _, sock := range candidates {
-		conn, err := net.Dial("unix", sock)
-		if err == nil {
-			log.Printf("connected to router socket=%s name=%s", sock, c.nodeName)
-			return conn, nil
-		}
-		lastErr = err
-	}
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, fmt.Errorf("no router sockets found")
-}
-
-func (c *RouterClient) handshake(conn net.Conn) error {
-	announceMsg, payload, err := fluxbeesdk.PerformHandshake(conn, c.nodeName, c.nodeUUID.String(), "1.0")
-	if err != nil {
-		return err
-	}
-	log.Printf("connected as %s (vpn=%d router=%s)", payload.Name, payload.VpnID, payload.RouterName)
-	c.mu.Lock()
-	c.lastDst = announceMsg.Routing.Src
-	c.mu.Unlock()
-	return nil
-}
-
-func (c *RouterClient) readLoop(conn net.Conn, service *Service) error {
-	for {
-		frame, err := readFrame(conn)
-		if err != nil {
-			return err
-		}
-		var msg Message
-		if err := json.Unmarshal(frame, &msg); err != nil {
-			log.Printf("invalid message: %v", err)
-			continue
-		}
-		if msg.Routing.Src != "" {
-			c.mu.Lock()
-			c.lastDst = msg.Routing.Src
-			c.mu.Unlock()
-		}
-		service.handleMessage(msg)
-	}
-}
-
-func (c *RouterClient) runConn(conn net.Conn, service *Service) error {
-	errCh := make(chan error, 2)
-	done := make(chan struct{})
-	go func() {
-		errCh <- c.readLoop(conn, service)
-	}()
-	go func() {
-		errCh <- c.writeLoop(conn, done)
-	}()
-	err := <-errCh
-	close(done)
-	return err
-}
-
-func (c *RouterClient) writeLoop(conn net.Conn, done <-chan struct{}) error {
-	for {
-		select {
-		case <-done:
-			return nil
-		case frame, ok := <-c.tx:
-			if !ok {
-				return io.EOF
+		for {
+			msg, err := receiver.Recv(context.Background())
+			if err != nil {
+				time.Sleep(200 * time.Millisecond)
+				continue
 			}
-			if err := writeFrame(conn, frame); err != nil {
-				return err
+			if msg.Routing.Src != "" {
+				c.mu.Lock()
+				c.lastDst = msg.Routing.Src
+				c.mu.Unlock()
 			}
+			service.handleMessage(fromSDKMessage(msg))
 		}
 	}
 }
 
 func (c *RouterClient) Send(msg Message) {
-	data := mustJSON(msg)
-	c.tx <- data
-}
-
-func readFrame(conn net.Conn) ([]byte, error) {
-	return fluxbeesdk.ReadFrame(conn)
-}
-
-func writeFrame(conn net.Conn, payload []byte) error {
-	return fluxbeesdk.WriteFrame(conn, payload)
-}
-
-func (c *RouterClient) drainTxQueue() {
-	for {
-		select {
-		case <-c.tx:
-		default:
-			return
-		}
-	}
+	c.tx <- msg
 }
 
 func nextBackoff(current time.Duration) time.Duration {
@@ -1546,6 +1415,14 @@ func nextBackoff(current time.Duration) time.Duration {
 		return 30 * time.Second
 	}
 	return next
+}
+
+func (c *RouterClient) forwardOutgoing(sender *fluxbeesdk.NodeSender) {
+	for msg := range c.tx {
+		if err := sender.Send(*toSDKMessage(msg)); err != nil {
+			log.Printf("failed to send router message: %v", err)
+		}
+	}
 }
 
 func mustJSON(v any) []byte {
