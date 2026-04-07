@@ -475,9 +475,9 @@ For now, the target is:
 
 ### SYS-ALIGN-S3 — Normalize config/control-plane behavior
 
-- [ ] SYS-ALIGN-S3-T1. Decide what "live config" means for `SY.config.routes`.
-- [ ] SYS-ALIGN-S3-T2. Decide whether `SY.config.routes` should expose canonical `CONFIG_GET` / `CONFIG_SET` through the SDK control-plane helpers.
-- [ ] SYS-ALIGN-S3-T3. Decide how its existing domain actions relate to node config:
+- [x] SYS-ALIGN-S3-T1. Decide what "live config" means for `SY.config.routes`.
+- [x] SYS-ALIGN-S3-T2. Decide whether `SY.config.routes` should expose canonical `CONFIG_GET` / `CONFIG_SET` through the SDK control-plane helpers.
+- [x] SYS-ALIGN-S3-T3. Decide how its existing domain actions relate to node config:
   - route/vpn mutations as domain admin actions
   - full effective config reads/writes as node control-plane config
 - [x] SYS-ALIGN-S3-T4. Decide what "live config" means for `SY.opa.rules`:
@@ -486,7 +486,7 @@ For now, the target is:
   - router SHM state
   - backup policy
 - [x] SYS-ALIGN-S3-T5. Define whether OPA compile/apply/rollback remain domain actions or become partially expressible through a config contract.
-- [ ] SYS-ALIGN-S3-T6. Ensure admin documentation clearly distinguishes:
+- [x] SYS-ALIGN-S3-T6. Ensure admin documentation clearly distinguishes:
   - stored config
   - live control-plane config
   - domain actions with side effects
@@ -502,10 +502,10 @@ For now, the target is:
 
 #### `SY.config.routes`
 
-- [ ] SYS-ALIGN-S5-T1. Upgrade to current SDK conventions used by modern nodes.
-- [ ] SYS-ALIGN-S5-T2. Replace manual config control-plane handling where shared SDK helpers already exist.
-- [ ] SYS-ALIGN-S5-T3. Normalize admin replies and system replies to the current common shape.
-- [ ] SYS-ALIGN-S5-T4. Add tests for request parsing and response envelope consistency.
+- [x] SYS-ALIGN-S5-T1. Upgrade to current SDK conventions used by modern nodes.
+- [x] SYS-ALIGN-S5-T2. Replace manual config control-plane handling where shared SDK helpers already exist.
+- [x] SYS-ALIGN-S5-T3. Normalize admin replies and system replies to the current common shape.
+- [x] SYS-ALIGN-S5-T4. Add tests for request parsing and response envelope consistency.
 
 #### `fluxbee-go-sdk`
 
@@ -533,8 +533,8 @@ For now, the target is:
 - [x] SYS-ALIGN-S5-T12. Replace its local `Message` / `Meta` / `Routing` structs with SDK equivalents.
 - [x] SYS-ALIGN-S5-T13. Replace its embedded router client lifecycle with SDK connection helpers.
 - [x] SYS-ALIGN-S5-T14. Add Rust-SDK-aligned config/control-plane support without breaking the current OPA action surface.
-- [ ] SYS-ALIGN-S5-T15. Preserve OPA SHM, compile/apply/rollback, and router reload semantics during the migration.
-- [ ] SYS-ALIGN-S5-T16. Re-test admin and orchestrator interoperability after the SDK migration.
+- [x] SYS-ALIGN-S5-T15. Preserve OPA SHM, compile/apply/rollback, and router reload semantics during the migration.
+- [x] SYS-ALIGN-S5-T16. Re-test admin and orchestrator interoperability after the SDK migration.
 - [ ] SYS-ALIGN-S5-T17. Leave deeper OPA-specific cleanup for v2.0.
 
 ### SYS-ALIGN-S6 — Documentation and operator model

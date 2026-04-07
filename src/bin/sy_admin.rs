@@ -3976,33 +3976,42 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "node_control_config_get" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
-            "This is the canonical live control-plane discovery path for nodes that expose CONFIG_GET, including AI.*, IO.*, SY.storage, SY.identity, and SY.cognition.",
+            "This is the canonical live control-plane discovery path for nodes that expose CONFIG_GET, including AI.*, IO.*, SY.storage, SY.identity, SY.cognition, and SY.config.routes.",
             "Admin forwards CONFIG_GET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "Use this when you need the node-defined live contract, dynamic config view, or secret metadata; not when a plain stored config.json read is enough.",
             "The node defines the response contract and config schema; SY.admin only standardizes transport.",
             "For SY.storage, this is the canonical way to inspect the redacted DB secret contract and its effective source/persistence metadata.",
             "For SY.identity, this is the canonical way to inspect the redacted primary DB secret contract and degraded/bootstrap state.",
             "For SY.cognition, this is the canonical way to inspect semantic_tagger config, degraded_semantics_policy, AI secret redaction, and runtime counters for semantic/narrative processing.",
+            "For SY.config.routes, this returns the live effective routes/vpns contract owned by the node, not the legacy admin list/add/delete action surface.",
         ],
         "node_control_config_set" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
-            "This is the canonical live control-plane mutation path for nodes that expose CONFIG_SET, including AI.*, IO.*, SY.storage, SY.identity, and SY.cognition.",
+            "This is the canonical live control-plane mutation path for nodes that expose CONFIG_SET, including AI.*, IO.*, SY.storage, SY.identity, SY.cognition, and SY.config.routes.",
             "Admin forwards CONFIG_SET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
             "For SY.storage v1, the canonical secret field is config.database.postgres_url and the apply is persist-only until sy-storage is restarted.",
             "For SY.identity v1, the canonical secret field is config.database.postgres_url and the apply is persist-only until sy-identity is restarted.",
             "For SY.cognition, the canonical AI secret field is config.secrets.openai.api_key and semantic controls live under config.semantic_tagger.*.",
+            "For SY.config.routes v1, CONFIG_SET replaces selected sections of the node-owned effective routes/vpns config; use add/delete actions when you want explicit domain mutations instead of a control-plane config replace.",
+        ],
+        "list_routes" | "list_vpns" => vec![
+            "These are SY.config.routes domain read actions exposed as admin queries.",
+            "Use them when you want the route/VPN lists in the legacy admin surface.",
+            "For the node-owned live config contract, use node_control_config_get against SY.config.routes instead.",
+        ],
+        "add_route" | "delete_route" | "add_vpn" | "delete_vpn" => vec![
+            "These are SY.config.routes domain mutation actions exposed as admin commands.",
+            "They mutate one route/VPN rule at a time and preserve the legacy operational surface.",
+            "For HTTP delete calls, the identifier lives in the final path segment; internal admin commands may still carry it in payload.",
+            "Use node_control_config_set against SY.config.routes only when you want the node-owned live config replace path instead of one explicit domain mutation.",
         ],
         "get_ilk" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The ilk_id path segment must use the prefixed UUID format ilk:<uuid>.",
             "Identity may resolve an old alias ILK to its canonical ILK if an alias mapping exists.",
             "This lookup is by ILK identifier, not by channel address, node name, or tenant.",
-        ],
-        "delete_route" | "delete_vpn" => vec![
-            "HTTP delete uses the final path segment as identifier.",
-            "Internal admin commands may still carry the identifier in payload.",
         ],
         "inventory" => vec![
             "Use GET /inventory for the full global inventory view.",
@@ -5214,7 +5223,7 @@ async fn broadcast_full_config(
         .get("status")
         .and_then(|v| v.as_str())
         .filter(|v| *v == "ok")
-        .and_then(|_| response.get("routes").or_else(|| response.get("vpns")))
+        .and_then(|_| list_config_items_payload(&response, list_action))
         .ok_or("list response missing routes/vpns")?;
     let config = if list_action == "list_routes" {
         serde_json::json!({ "routes": payload })
@@ -5230,6 +5239,21 @@ async fn broadcast_full_config(
     let version = next_config_changed_version(&ctx.state_dir, subsystem, None)?;
     broadcast_config_changed(client, subsystem, None, None, version, config, None).await?;
     Ok(())
+}
+
+fn list_config_items_payload<'a>(
+    response: &'a serde_json::Value,
+    list_action: &str,
+) -> Option<&'a serde_json::Value> {
+    let item_key = if list_action == "list_routes" {
+        "routes"
+    } else {
+        "vpns"
+    };
+    response
+        .get("payload")
+        .and_then(|payload| payload.get(item_key))
+        .or_else(|| response.get(item_key))
 }
 
 async fn send_opa_action(
@@ -5765,7 +5789,8 @@ mod tests {
         })
         .unwrap();
 
-        let responses = collect_opa_responses(&mut rx, "compile", 7, &["motherbee".to_string()]).await;
+        let responses =
+            collect_opa_responses(&mut rx, "compile", 7, &["motherbee".to_string()]).await;
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].hive, "motherbee");
         assert_eq!(responses[0].status, "ok");
@@ -5803,5 +5828,37 @@ mod tests {
         assert_eq!(responses[0].hive, "motherbee");
         assert_eq!(responses[0].status, "ok");
         assert_eq!(responses[0].payload["current_version"], json!(4));
+    }
+
+    #[test]
+    fn list_config_items_payload_prefers_nested_payload_shape() {
+        let response = json!({
+            "status": "ok",
+            "action": "list_routes",
+            "payload": {
+                "config_version": 7,
+                "routes": [{ "prefix": "alpha/**" }]
+            },
+            "config_version": 7,
+            "routes": [{ "prefix": "legacy/**" }]
+        });
+
+        assert_eq!(
+            list_config_items_payload(&response, "list_routes"),
+            Some(&json!([{ "prefix": "alpha/**" }]))
+        );
+    }
+
+    #[test]
+    fn list_config_items_payload_falls_back_to_legacy_top_level_shape() {
+        let response = json!({
+            "status": "ok",
+            "vpns": [{ "pattern": "ops/*" }]
+        });
+
+        assert_eq!(
+            list_config_items_payload(&response, "list_vpns"),
+            Some(&json!([{ "pattern": "ops/*" }]))
+        );
     }
 }

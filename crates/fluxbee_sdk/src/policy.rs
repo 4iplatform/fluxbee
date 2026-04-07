@@ -122,26 +122,12 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
 
 pub fn classify_system_message(msg: &str) -> Option<ActionClass> {
     match msg {
-        MSG_CONFIG_GET
-        | "STATUS"
-        | "PING"
-        | "NODE_CONFIG_GET"
-        | "NODE_STATE_GET"
-        | "NODE_STATUS_GET"
-        | "GET_VERSIONS"
-        | "GET_RUNTIMES"
-        | "LIST_NODES"
-        | "GET_RUNTIME"
-        | "INVENTORY_REQUEST"
-        | "ILK_LIST"
-        | "ILK_GET" => Some(ActionClass::Read),
+        MSG_CONFIG_GET | "STATUS" | "PING" | "NODE_CONFIG_GET" | "NODE_STATE_GET"
+        | "NODE_STATUS_GET" | "GET_VERSIONS" | "GET_RUNTIMES" | "LIST_NODES" | "GET_RUNTIME"
+        | "INVENTORY_REQUEST" | "ILK_LIST" | "ILK_GET" => Some(ActionClass::Read),
         MSG_CONFIG_SET | "NODE_CONFIG_SET" => Some(ActionClass::Write),
-        "RUNTIME_UPDATE"
-        | "SYSTEM_UPDATE"
-        | "SYSTEM_SYNC_HINT"
-        | "OPA_APPLY"
-        | "OPA_COMPILE_APPLY"
-        | "OPA_ROLLBACK" => Some(ActionClass::SystemConfig),
+        "RUNTIME_UPDATE" | "SYSTEM_UPDATE" | "SYSTEM_SYNC_HINT" | "OPA_APPLY"
+        | "OPA_COMPILE_APPLY" | "OPA_ROLLBACK" => Some(ActionClass::SystemConfig),
         "ADD_HIVE_FINALIZE" | "REMOVE_HIVE_CLEANUP" => Some(ActionClass::TopologyChange),
         "SPAWN_NODE" | "KILL_NODE" | "REMOVE_NODE_INSTANCE" => Some(ActionClass::NodeLifecycle),
         _ => None,
@@ -157,7 +143,8 @@ pub fn derive_action_outcome(
     status: Option<&str>,
     error_code: Option<&str>,
 ) -> (Option<ActionResult>, Option<&'static str>) {
-    let Some(_action_class) = action_class.filter(|class| action_class_requires_result(*class)) else {
+    let Some(_action_class) = action_class.filter(|class| action_class_requires_result(*class))
+    else {
         return (None, None);
     };
 
@@ -187,7 +174,10 @@ mod tests {
 
     #[test]
     fn classifies_known_admin_actions() {
-        assert_eq!(classify_admin_action("run_node"), Some(ActionClass::NodeLifecycle));
+        assert_eq!(
+            classify_admin_action("run_node"),
+            Some(ActionClass::NodeLifecycle)
+        );
         assert_eq!(
             classify_admin_action("set_node_config"),
             Some(ActionClass::Write)
@@ -200,15 +190,30 @@ mod tests {
 
     #[test]
     fn classifies_known_system_messages() {
-        assert_eq!(classify_system_message("SPAWN_NODE"), Some(ActionClass::NodeLifecycle));
-        assert_eq!(classify_system_message("NODE_CONFIG_GET"), Some(ActionClass::Read));
-        assert_eq!(classify_system_message("CONFIG_SET"), Some(ActionClass::Write));
+        assert_eq!(
+            classify_system_message("SPAWN_NODE"),
+            Some(ActionClass::NodeLifecycle)
+        );
+        assert_eq!(
+            classify_system_message("NODE_CONFIG_GET"),
+            Some(ActionClass::Read)
+        );
+        assert_eq!(
+            classify_system_message("CONFIG_SET"),
+            Some(ActionClass::Write)
+        );
     }
 
     #[test]
     fn classifies_routed_messages_only_when_evaluable() {
-        assert_eq!(classify_routed_message("user"), Some(ActionClass::SendMessage));
-        assert_eq!(classify_routed_message("query"), Some(ActionClass::SendMessage));
+        assert_eq!(
+            classify_routed_message("user"),
+            Some(ActionClass::SendMessage)
+        );
+        assert_eq!(
+            classify_routed_message("query"),
+            Some(ActionClass::SendMessage)
+        );
         assert_eq!(classify_routed_message("system"), None);
         assert_eq!(classify_routed_message("admin"), None);
         assert_eq!(classify_routed_message("query_response"), None);

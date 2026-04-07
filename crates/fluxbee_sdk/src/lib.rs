@@ -13,11 +13,11 @@ pub mod payload;
 pub mod policy;
 pub mod prelude;
 pub mod protocol;
+mod send_normalization;
 pub mod socket;
 pub mod split;
 pub mod status;
 pub mod thread;
-mod send_normalization;
 
 pub use admin::{
     admin_command, admin_command_ok, AdminCommandError, AdminCommandRequest, AdminCommandResult,

@@ -659,7 +659,12 @@ async fn bootstrap_local(
             "sy-frontdesk-gov",
         ]
     } else {
-        vec!["sy-config-routes", "sy-opa-rules", "sy-cognition", "sy-policy"]
+        vec![
+            "sy-config-routes",
+            "sy-opa-rules",
+            "sy-cognition",
+            "sy-policy",
+        ]
     };
     if identity_available() {
         services.push("sy-identity");
@@ -1525,13 +1530,9 @@ async fn handle_system_message(
             });
             match action {
                 "SYSTEM_UPDATE" => {
-                    let _ = send_system_action_response(
-                        sender,
-                        msg,
-                        "SYSTEM_UPDATE_RESPONSE",
-                        payload,
-                    )
-                    .await;
+                    let _ =
+                        send_system_action_response(sender, msg, "SYSTEM_UPDATE_RESPONSE", payload)
+                            .await;
                 }
                 "SYSTEM_SYNC_HINT" => {
                     let _ = send_system_action_response(
@@ -1543,22 +1544,13 @@ async fn handle_system_message(
                     .await;
                 }
                 "SPAWN_NODE" => {
-                    let _ = send_system_action_response(
-                        sender,
-                        msg,
-                        "SPAWN_NODE_RESPONSE",
-                        payload,
-                    )
-                    .await;
+                    let _ =
+                        send_system_action_response(sender, msg, "SPAWN_NODE_RESPONSE", payload)
+                            .await;
                 }
                 "KILL_NODE" => {
-                    let _ = send_system_action_response(
-                        sender,
-                        msg,
-                        "KILL_NODE_RESPONSE",
-                        payload,
-                    )
-                    .await;
+                    let _ = send_system_action_response(sender, msg, "KILL_NODE_RESPONSE", payload)
+                        .await;
                 }
                 "REMOVE_NODE_INSTANCE" => {
                     let _ = send_system_action_response(
@@ -1606,22 +1598,13 @@ async fn handle_system_message(
                     .await;
                 }
                 "GET_VERSIONS" => {
-                    let _ = send_system_action_response(
-                        sender,
-                        msg,
-                        "GET_VERSIONS_RESPONSE",
-                        payload,
-                    )
-                    .await;
+                    let _ =
+                        send_system_action_response(sender, msg, "GET_VERSIONS_RESPONSE", payload)
+                            .await;
                 }
                 "INVENTORY_REQUEST" => {
-                    let _ = send_system_action_response(
-                        sender,
-                        msg,
-                        "INVENTORY_RESPONSE",
-                        payload,
-                    )
-                    .await;
+                    let _ = send_system_action_response(sender, msg, "INVENTORY_RESPONSE", payload)
+                        .await;
                 }
                 "ADD_HIVE_FINALIZE" => {
                     let _ = send_system_action_response(
@@ -1654,192 +1637,98 @@ async fn handle_system_message(
                 "error_code": "INVALID_REQUEST",
                 "message": "action 'RUNTIME_UPDATE' is not supported; use 'SYSTEM_UPDATE'",
             });
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "RUNTIME_UPDATE_RESPONSE",
-                payload,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "RUNTIME_UPDATE_RESPONSE", payload).await;
         }
         Some("SYSTEM_UPDATE") => {
             let result = handle_system_update_message(state, msg).await;
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "SYSTEM_UPDATE_RESPONSE",
-                result,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "SYSTEM_UPDATE_RESPONSE", result).await;
         }
         Some("SYSTEM_SYNC_HINT") => {
             let result = handle_system_sync_hint_message(state, msg).await;
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "SYSTEM_SYNC_HINT_RESPONSE",
-                result,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "SYSTEM_SYNC_HINT_RESPONSE", result).await;
         }
         Some("SPAWN_NODE") => {
             let result = run_node_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "SPAWN_NODE processed");
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "SPAWN_NODE_RESPONSE",
-                result,
-            )
-            .await;
+            let _ = send_system_action_response(sender, msg, "SPAWN_NODE_RESPONSE", result).await;
         }
         Some("KILL_NODE") => {
             let result = kill_node_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "KILL_NODE processed");
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "KILL_NODE_RESPONSE",
-                result,
-            )
-            .await;
+            let _ = send_system_action_response(sender, msg, "KILL_NODE_RESPONSE", result).await;
         }
         Some("REMOVE_NODE_INSTANCE") => {
             let result = remove_node_instance_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "REMOVE_NODE_INSTANCE processed");
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "REMOVE_NODE_INSTANCE_RESPONSE",
-                result,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "REMOVE_NODE_INSTANCE_RESPONSE", result)
+                    .await;
         }
         Some("NODE_CONFIG_SET") => {
             let result = set_node_config_flow(sender, state, &msg.payload).await;
             tracing::info!(result = %result, "NODE_CONFIG_SET processed");
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "NODE_CONFIG_SET_RESPONSE",
-                result,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "NODE_CONFIG_SET_RESPONSE", result).await;
         }
         Some("NODE_CONFIG_GET") => {
             let result = get_node_config_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "NODE_CONFIG_GET processed");
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "NODE_CONFIG_GET_RESPONSE",
-                result,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "NODE_CONFIG_GET_RESPONSE", result).await;
         }
         Some("NODE_STATE_GET") => {
             let result = get_node_state_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "NODE_STATE_GET processed");
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "NODE_STATE_GET_RESPONSE",
-                result,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "NODE_STATE_GET_RESPONSE", result).await;
         }
         Some("NODE_STATUS_GET") => {
             let result = get_node_status_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "NODE_STATUS_GET processed");
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "NODE_STATUS_GET_RESPONSE",
-                result,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "NODE_STATUS_GET_RESPONSE", result).await;
         }
         Some("GET_VERSIONS") => {
             let result = get_versions_flow(state, &msg.payload).await;
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "GET_VERSIONS_RESPONSE",
-                result,
-            )
-            .await;
+            let _ = send_system_action_response(sender, msg, "GET_VERSIONS_RESPONSE", result).await;
         }
         Some("GET_RUNTIMES") => {
             let result = list_runtimes_flow(state, &msg.payload).await;
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "GET_RUNTIMES_RESPONSE",
-                result,
-            )
-            .await;
+            let _ = send_system_action_response(sender, msg, "GET_RUNTIMES_RESPONSE", result).await;
         }
         Some("LIST_NODES") => {
             let result = list_nodes_flow(state, &msg.payload).await;
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "LIST_NODES_RESPONSE",
-                result,
-            )
-            .await;
+            let _ = send_system_action_response(sender, msg, "LIST_NODES_RESPONSE", result).await;
         }
         Some("GET_RUNTIME") => {
             let result = get_runtime_flow(state, &msg.payload).await;
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "GET_RUNTIME_RESPONSE",
-                result,
-            )
-            .await;
+            let _ = send_system_action_response(sender, msg, "GET_RUNTIME_RESPONSE", result).await;
         }
         Some("REMOVE_RUNTIME_VERSION") => {
             let result = remove_runtime_version_flow(state, &msg.payload).await;
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "REMOVE_RUNTIME_VERSION_RESPONSE",
-                result,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "REMOVE_RUNTIME_VERSION_RESPONSE", result)
+                    .await;
         }
         Some("INVENTORY_REQUEST") => {
             let result = inventory_flow(state, &msg.payload);
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "INVENTORY_RESPONSE",
-                result,
-            )
-            .await;
+            let _ = send_system_action_response(sender, msg, "INVENTORY_RESPONSE", result).await;
         }
         Some("ADD_HIVE_FINALIZE") => {
             let result = add_hive_finalize_local_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "ADD_HIVE_FINALIZE processed");
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "ADD_HIVE_FINALIZE_RESPONSE",
-                result,
-            )
-            .await;
+            let _ = send_system_action_response(sender, msg, "ADD_HIVE_FINALIZE_RESPONSE", result)
+                .await;
         }
         Some("REMOVE_HIVE_CLEANUP") => {
             let result = remove_hive_cleanup_local_flow();
             tracing::info!(result = %result, "REMOVE_HIVE_CLEANUP processed");
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "REMOVE_HIVE_CLEANUP_RESPONSE",
-                result,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "REMOVE_HIVE_CLEANUP_RESPONSE", result)
+                    .await;
         }
         _ => {}
     }
