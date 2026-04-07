@@ -40,8 +40,7 @@ if [[ "${SKIP_BUILD:-}" != "1" ]]; then
     echo "Building Rust binaries..."
     cargo build --release --bins
     echo "Building sy-frontdesk-gov core binary..."
-    cargo build --release -p sy-frontdesk-gov --bin ai_node_runner
-    cp "$BIN_DIR/ai_node_runner" "$BIN_DIR/sy-frontdesk-gov"
+    cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
   fi
 fi
 

@@ -113,7 +113,8 @@ if [[ "$SKIP_BUILD" != "1" ]]; then
     exit 1
   fi
   if [[ "$RUNTIME" == "SY.frontdesk.gov" ]]; then
-    (cd "$ROOT_DIR" && cargo build --release -p sy-frontdesk-gov --bin ai_node_runner)
+    BINARY="$ROOT_DIR/target/release/sy-frontdesk-gov"
+    (cd "$ROOT_DIR" && cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov)
   else
     (cd "$ROOT_DIR" && cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner)
   fi
