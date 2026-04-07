@@ -1,36 +1,35 @@
 # Gov Nodes Workspace
 
-Este directorio agrupa nodos de dominio `.gov` que forman parte del sistema Fluxbee,
-pero no del core `SY.*`.
+Este directorio agrupa código de dominio `.gov` dentro de Fluxbee.
 
 Objetivo:
 - mantener separación clara entre infraestructura core y lógica de dominio,
-- permitir que equipos externos desarrollen/iteren nodos `.gov` sin tocar `src/bin` core,
-- compartir utilidades comunes de configuración y bootstrap.
+- permitir que equipos externos desarrollen/iteren componentes `.gov` sin tocar `src/bin`,
+- compartir utilidades comunes de configuración y bootstrap cuando haga falta.
 
 ## Estructura
 
-```
+```text
 nodes/gov/
-├── common/                  # utilidades compartidas para nodos .gov
-└── ai-frontdesk-gov/        # copia temporal del runner AI genérico para el caso gov
+├── common/                  # utilidades compartidas para código gov
+└── ai-frontdesk-gov/        # runtime actual que implementa SY.frontdesk.gov
 ```
 
 Alcance de esta fase:
-- solo `ai-frontdesk-gov`;
-- no agregar otros nodos `.gov` hasta cerrar integración y E2E de frontdesk;
-- `ai-frontdesk-gov` quedó temporalmente duplicado desde `nodes/ai/ai-generic`.
+- el foco actual está en `ai-frontdesk-gov`;
+- no agregar otros componentes `.gov` hasta cerrar integración y E2E de frontdesk;
+- `ai-frontdesk-gov` sigue temporalmente cercano al runner de `nodes/ai/ai-generic`.
 
 ## Convenciones
 
-- Nombre L2: `AI.<servicio>.gov@<hive>`
-- Runtime: `AI.<servicio>.gov`
+- Nodo canónico actual: `SY.frontdesk.gov@<hive>`
+- Runtime canónico actual: `SY.frontdesk.gov`
 - Configuración de ruteo de temporales:
-  - `government.identity_frontdesk: "AI.frontdesk.gov@motherbee"`
+  - `government.identity_frontdesk: "SY.frontdesk.gov@motherbee"`
 
-Control-plane y secrets:
-- los nodos `.gov` que reutilizan el runner AI siguen el mismo contrato `CONFIG_GET` / `CONFIG_SET`.
-- la key de OpenAI se persiste localmente en `secrets.json`.
+Control plane y secrets:
+- frontdesk mantiene hoy el mismo contrato `CONFIG_GET` / `CONFIG_SET` del runner AI;
+- la key de OpenAI se persiste localmente en `secrets.json`;
 - el campo canónico actual es `config.secrets.openai.api_key`.
 
 ## Build
@@ -39,12 +38,12 @@ Desde raíz del repo:
 
 ```bash
 cargo check -p gov-common
-cargo check -p ai-frontdesk-gov --bin ai_node_runner
+cargo check -p sy-frontdesk-gov --bin ai_node_runner
 ```
 
 ## Integración Identity (frontdesk)
 
-El nodo `AI.frontdesk.gov` debe usar helpers del SDK:
+El nodo `SY.frontdesk.gov` debe usar helpers del SDK:
 - `identity_system_call_ok` para `ILK_REGISTER` y `ILK_ADD_CHANNEL`
 - fallback a primary (`SY.identity@<motherbee>`) cuando reciba `NOT_PRIMARY`
 
@@ -52,7 +51,7 @@ Checklist operativo: `docs/onworking COA/identity_v2_tasks.md` sección `E2`.
 
 ## Contrato de Status (FR7)
 
-Para cualquier nodo `.gov`, el contrato operativo recomendado es:
+Para cualquier componente `.gov`, el contrato operativo recomendado es:
 - responder `get_node_status` vía SDK (handler default o custom),
 - exponer `health_state` consistente (`HEALTHY|DEGRADED|ERROR|UNKNOWN`),
 - mantener `extensions` solo para métricas runtime-specific.
@@ -62,7 +61,7 @@ Validación desde API admin:
 ```bash
 BASE="http://127.0.0.1:8080"
 HIVE_ID="motherbee"
-NODE_NAME="AI.frontdesk.gov@$HIVE_ID"
+NODE_NAME="SY.frontdesk.gov@$HIVE_ID"
 curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/status" | jq .
 ```
 

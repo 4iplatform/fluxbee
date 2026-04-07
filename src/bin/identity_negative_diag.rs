@@ -64,7 +64,7 @@ async fn main() -> Result<(), DynError> {
     // Case 2: malformed ilk_id should fail with INVALID_REQUEST.
     let frontdesk_name = env_or(
         "IDENTITY_NEGATIVE_FRONTDESK_NODE_NAME",
-        &format!("AI.frontdesk@{}-neg-{}", hive_id, test_id),
+        &format!("SY.frontdesk.gov@{}-neg-{}", hive_id, test_id),
     );
     let malformed_payload = json!({
         "ilk_id": "ilk:not-a-uuid",

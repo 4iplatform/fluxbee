@@ -1,4 +1,4 @@
-﻿# AI Nodes Deploy Runbook (publish/update/spawn)
+# AI Nodes Deploy Runbook (publish/update/spawn)
 
 ## 1) Objetivo
 
@@ -10,10 +10,10 @@ Desplegar y actualizar nodos IA por el camino canónico de Fluxbee:
 
 Incluye dos perfiles:
 - nodo IA común (`AI.common`)
-- frontdesk gov (`AI.frontdesk.gov`)
+- frontdesk gov (`SY.frontdesk.gov`)
 
 Importante:
-- la separación de comportamiento es por runtime (`AI.common` vs `AI.frontdesk.gov`), no por flags de modo.
+- la separación de comportamiento es por runtime (`AI.common` vs `SY.frontdesk.gov`), no por flags de modo.
 
 ---
 
@@ -31,9 +31,14 @@ Importante:
 - Spawn sin `--config-json` (genera config base `{}` y usa `tenant_id` como fallback si se pasa por flag).
 
 Decisión de ownership:
-- El prompt/flujo de `AI.frontdesk.gov` pertenece al runtime frontdesk.
+- El prompt/flujo de `SY.frontdesk.gov` pertenece al runtime frontdesk.
 - `AI.common` no debe transportar lógica específica gov/frontdesk.
 - El data-plane `text/v1` (incluyendo resolución de `content_ref`/`attachments` y offload de respuesta a `content_ref` por tamaño) pertenece al SDK AI compartido.
+
+Nota operativa vigente para frontdesk:
+- `SY.frontdesk.gov` sigue usando hoy el camino general de deploy de runtimes AI, pero debe leerse como runtime singleton `system-default` por hive.
+- el prompt funcional base del runtime no debería depender de que el operador lo cargue por `CONFIG_SET`.
+- la key de provider puede seguir entrando temporalmente por `CONFIG_SET` y persistirse en `secrets.json` mientras `CORE` define el modelo final para secretos de un AI de sistema crítico.
 
 ---
 
@@ -72,7 +77,7 @@ bash scripts/deploy-ia-node.sh \
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "AI.frontdesk.gov" \
+  --runtime "SY.frontdesk.gov" \
   --version "0.1.0" \
   --sync-hint \
   --sudo
@@ -88,27 +93,27 @@ Ejemplo frontdesk:
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "AI.frontdesk.gov" \
+  --runtime "SY.frontdesk.gov" \
   --version "0.1.0" \
-  --node-name "AI.frontdesk.gov@$HIVE_ID" \
+  --node-name "SY.frontdesk.gov@$HIVE_ID" \
   --spawn \
   --sync-hint \
   --sudo
 ```
 
-Si no enviás `--config-json`, el script hace spawn con `config={}` (más `tenant_id` si fue enviado).
+Si no envías `--config-json`, el script hace spawn con `config={}` (más `tenant_id` si fue enviado).
 El detalle funcional (prompt/key/model/etc.) se recomienda cargarlo por `POST .../control/config-set`.
 
-### 5.1 Bootstrap canonico por FLUXBEE_NODE_NAME (dos nodos)
+### 5.1 Bootstrap canónico por FLUXBEE_NODE_NAME (dos nodos)
 
-Con el contrato actual de core, `spawn` inyecta `FLUXBEE_NODE_NAME=<node@hive>` y el runtime deriva su `config.json` canonico. No hace falta path fijo.
+Con el contrato actual de core, `spawn` inyecta `FLUXBEE_NODE_NAME=<node@hive>` y el runtime deriva su `config.json` canónico. No hace falta path fijo.
 
 ```bash
 # GOV
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "AI.frontdesk.gov" \
+  --runtime "SY.frontdesk.gov" \
   --version "0.1.0" \
   --sync-hint \
   --sudo
@@ -133,9 +138,9 @@ Los flags `--forced-node-name` y `--forced-dynamic-config-dir` quedan solo para 
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "AI.frontdesk.gov" \
+  --runtime "SY.frontdesk.gov" \
   --version "0.1.1" \
-  --node-name "AI.frontdesk.gov@$HIVE_ID" \
+  --node-name "SY.frontdesk.gov@$HIVE_ID" \
   --update-existing \
   --sync-hint \
   --sudo
@@ -169,7 +174,12 @@ bash scripts/deploy-ia-node.sh \
 
 ## 7) Prompts/config obligatorias
 
-Para imponer prompts/config obligatorias, versioná ese bloque en el `config` del nodo (spawn o update de config).
+Para `AI.common`, los prompts/config obligatorias pueden versionarse en el `config` del nodo.
+
+Para `SY.frontdesk.gov`, la dirección vigente es distinta:
+- el prompt funcional base pertenece al runtime frontdesk,
+- `CONFIG_SET` queda preferentemente para modelo, timeouts, flags operativos y secrets,
+- no para transportar obligatoriamente todo el prompt funcional del nodo.
 
 Ejemplo base para `openai_chat`:
 
@@ -225,6 +235,19 @@ Conclusión operativa:
 - para prompt/key/behavior en runtime: usar `CONFIG_SET` (control plane del nodo).
 - para update de runtime puntual, mantener `deploy-ia-node.sh` en scope `targeted` (default).
 
+Nota sobre attachments AI (estado 2026-04-06):
+- `AI.*` ya consume `attachments[]`/`content_ref` vía SDK AI compartido.
+- imágenes soportadas (`png`/`jpeg`/`webp`) viajan como `input_image.image_url`.
+- archivos no imagen, cuando `multimodal=true`, viajan como `input_file.file_data` con formato `data:<mime>;base64,...` y `filename`.
+- `file_id` / `file_url` siguen diferidos hasta que Fluxbee/Core defina metadata suficiente para soportarlos de forma canónica.
+- esto no debe leerse como "cualquier tipo de archivo ya quedó validado end-to-end":
+  - evidencia E2E asentada hoy: imagen, PDF y `xlsx`
+  - siguen faltando pruebas por familias de tipos adicionales (`docx`, audio, otros binarios y mezcla de adjuntos)
+- esto tampoco debe leerse como "AI ya devuelve archivos al usuario final":
+  - el contrato de salida soporta `attachments[]`
+  - `IO.slack` sabe publicar adjuntos salientes si existen
+  - pero los runners `AI.*` actuales responden texto y offload de texto largo a `content_ref`
+  - la generación de PDF/XLSX/imagen saliente como adjunto no está cerrada hoy como flujo general
 
 ---
 
@@ -267,15 +290,15 @@ bash scripts/deploy-ia-node.sh \
   --sudo
 ```
 
-Example (`AI.frontdesk.gov@motherbee`):
+Example (`SY.frontdesk.gov@motherbee`):
 
 ```bash
 bash scripts/deploy-ia-node.sh \
   --base "http://127.0.0.1:8080" \
   --hive-id "motherbee" \
-  --runtime "AI.frontdesk.gov" \
+  --runtime "SY.frontdesk.gov" \
   --version "0.1.0" \
-  --node-name "AI.frontdesk.gov@motherbee" \
+  --node-name "SY.frontdesk.gov@motherbee" \
   --tenant-id "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" \
   --config-json /tmp/ai_frontdesk_gov.spawn.json \
   --immediate-memory-enabled true \

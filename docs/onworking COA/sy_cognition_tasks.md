@@ -535,12 +535,12 @@ Estado actual:
   - `thread_id` = metadata
   - `src_ilk` = key canónico de state/immediate memory
 - [x] COG-M9-T2. Garantizar que `memory_package` no rompe prompts/configs vigentes.
-- [x] COG-M9-T3. Revisar `AI.frontdesk.gov` y otros nodos que hoy dependen de `thread_state`.
+- [x] COG-M9-T3. Revisar `SY.frontdesk.gov` y otros nodos que hoy dependen de `thread_state`.
 - [x] COG-M9-T4. Definir carrier legacy de compat para paths que todavía lean `ctx`.
 - [x] COG-M9-T5. Remover gradualmente producción canónica de `ctx*` en nuevos paths.
 
 Estado actual:
-- `AI.frontdesk.gov` y `ai-generic` ya tratan:
+- `SY.frontdesk.gov` y `ai-generic` ya tratan:
   - `thread_id` como metadata conversacional
   - `src_ilk` como key canónica de state/immediate memory
 - los runners AI del repo ya no leen compat legacy desde `meta.context` para `thread_id` ni `src_ilk`

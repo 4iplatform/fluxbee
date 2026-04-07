@@ -33,6 +33,8 @@ pub fn build_user_message(
         dst_ilk.clone().map(Value::String).unwrap_or(Value::Null),
     );
     let thread_id = extract_thread_id_from_context_obj(&context_obj);
+    // Keep thread_id only in canonical meta.thread_id carrier.
+    context_obj.remove("thread_id");
 
     Message {
         routing: Routing {
@@ -103,7 +105,7 @@ mod tests {
                 .as_ref()
                 .and_then(|ctx| ctx.get("thread_id"))
                 .and_then(|value| value.as_str()),
-            Some("thread:legacy-flat")
+            None
         );
     }
 

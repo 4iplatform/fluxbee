@@ -51,7 +51,7 @@ Para frontdesk de identity:
 
 ```yaml
 government:
-  identity_frontdesk: "AI.frontdesk.gov@motherbee"
+  identity_frontdesk: "SY.frontdesk.gov@motherbee"
 ```
 
 ## 5) Validación mínima
@@ -62,4 +62,4 @@ cargo check -p ai-compliance-gov
 
 Si interactúa con identity:
 - usar helpers `fluxbee_sdk::identity::*`,
-- cubrir flujo en scripts E2E existentes o agregar wrapper específico en `scripts/`.
+- cubrir flujo en scripts E2E existentes o agregar wrapper especí­fico en `scripts/`.

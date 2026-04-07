@@ -162,7 +162,7 @@ mod tests {
             &orchestrator_cfg_path,
             serde_json::to_vec_pretty(&serde_json::json!({
                 "_system": {"config_version": 3},
-                "config": {"io":{"dst_node":"AI.frontdesk.gov@motherbee"}}
+                "config": {"io":{"dst_node":"SY.frontdesk.gov@motherbee"}}
             }))
             .expect("json"),
         )
@@ -188,7 +188,7 @@ mod tests {
             &orchestrator_cfg_path,
             serde_json::to_vec_pretty(&serde_json::json!({
                 "_system": {"config_version": 4},
-                "config": {"io":{"dst_node":"AI.frontdesk.gov@motherbee"}}
+                "config": {"io":{"dst_node":"SY.frontdesk.gov@motherbee"}}
             }))
             .expect("json"),
         )

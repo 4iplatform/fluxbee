@@ -1026,10 +1026,10 @@ impl IdentityRuntime {
         allowed_prefixes.insert(MSG_ILK_PROVISION, vec!["IO."]);
         allowed_prefixes.insert(MSG_ILK_LIST, vec!["SY.admin@"]);
         allowed_prefixes.insert(MSG_ILK_GET, vec!["SY.admin@"]);
-        allowed_prefixes.insert(MSG_ILK_REGISTER, vec!["AI.frontdesk@", "SY.orchestrator@"]);
-        allowed_prefixes.insert(MSG_ILK_ADD_CHANNEL, vec!["AI.frontdesk@"]);
+        allowed_prefixes.insert(MSG_ILK_REGISTER, vec!["SY.frontdesk.gov@", "SY.orchestrator@"]);
+        allowed_prefixes.insert(MSG_ILK_ADD_CHANNEL, vec!["SY.frontdesk.gov@"]);
         allowed_prefixes.insert(MSG_ILK_UPDATE, vec!["SY.orchestrator@"]);
-        allowed_prefixes.insert(MSG_TNT_CREATE, vec!["AI.frontdesk@"]);
+        allowed_prefixes.insert(MSG_TNT_CREATE, vec!["SY.frontdesk.gov@"]);
         allowed_prefixes.insert(MSG_TNT_APPROVE, vec!["SY.admin@"]);
         allowed_prefixes.insert("CONFIG_GET", vec!["SY.admin@"]);
         allowed_prefixes.insert("CONFIG_SET", vec!["SY.admin@"]);
@@ -4297,21 +4297,21 @@ mod tests {
 
     #[test]
     fn configured_identity_frontdesk_node_name_normalizes_local_name() {
-        let hive = test_hive(Some("AI.frontdesk.gov"));
+        let hive = test_hive(Some("SY.frontdesk.gov"));
         assert_eq!(
             configured_identity_frontdesk_node_name(&hive).as_deref(),
-            Some("AI.frontdesk.gov@motherbee")
+            Some("SY.frontdesk.gov@motherbee")
         );
     }
 
     #[test]
     fn identity_runtime_authorizes_configured_frontdesk_exact_name() {
-        let hive = test_hive(Some("AI.frontdesk.gov@motherbee"));
+        let hive = test_hive(Some("SY.frontdesk.gov@motherbee"));
         let runtime = IdentityRuntime::new(&hive, PathBuf::from("/tmp"), true, None);
 
-        assert!(runtime.is_authorized(MSG_ILK_REGISTER, Some("AI.frontdesk.gov@motherbee")));
-        assert!(runtime.is_authorized(MSG_ILK_ADD_CHANNEL, Some("AI.frontdesk.gov@motherbee")));
-        assert!(runtime.is_authorized(MSG_TNT_CREATE, Some("AI.frontdesk.gov@motherbee")));
+        assert!(runtime.is_authorized(MSG_ILK_REGISTER, Some("SY.frontdesk.gov@motherbee")));
+        assert!(runtime.is_authorized(MSG_ILK_ADD_CHANNEL, Some("SY.frontdesk.gov@motherbee")));
+        assert!(runtime.is_authorized(MSG_TNT_CREATE, Some("SY.frontdesk.gov@motherbee")));
     }
 
     #[test]
@@ -4334,7 +4334,7 @@ mod tests {
                 ilk_type: "human".to_string(),
                 registration_status: "complete".to_string(),
                 tenant_id: "tnt:11111111-1111-1111-1111-111111111111".to_string(),
-                identification: json!({"display_name":"Jane","node_name":"AI.frontdesk.gov@motherbee"}),
+                identification: json!({"display_name":"Jane","node_name":"SY.frontdesk.gov@motherbee"}),
                 roles: vec!["user".to_string()],
                 capabilities: vec!["chat".to_string()],
                 channels: vec![ChannelRecord {
@@ -4448,7 +4448,7 @@ mod tests {
                 ilk_type: "human".to_string(),
                 registration_status: "temporary".to_string(),
                 tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
-                identification: json!({"display_name":"Jane","node_name":"AI.frontdesk.gov@motherbee"}),
+                identification: json!({"display_name":"Jane","node_name":"SY.frontdesk.gov@motherbee"}),
                 roles: vec![],
                 capabilities: vec![],
                 channels: vec![ChannelRecord {

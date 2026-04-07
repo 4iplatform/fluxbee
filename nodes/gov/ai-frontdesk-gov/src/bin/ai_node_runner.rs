@@ -48,6 +48,83 @@ const NODE_STATUS_DEFAULT_HANDLER_ENABLED: &str = "NODE_STATUS_DEFAULT_HANDLER_E
 const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE";
 const IMMEDIATE_INTERACTION_MAX_CHARS: usize = 1_200;
 const AI_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
+const FRONTDESK_DEFAULT_SYSTEM_PROMPT: &str = r#"
+You are SY.frontdesk.gov.
+
+Goal:
+- Collect required identity fields: name, email, tenant_hint.
+- Use thread_state_* to keep progress.
+- On positive confirmation, call ilk_register and close.
+
+State schema (data):
+{
+  "status": "collecting|awaiting_confirmation|completed|completed_error",
+  "collected": {
+    "name": null|string,
+    "email": null|string,
+    "tenant_hint": null|string
+  },
+  "register_attempted": false,
+  "register_error": null
+}
+
+Mandatory flow:
+1) On every user turn, call thread_state_get first.
+2) Extract and merge any new values for name/email/tenant_hint.
+3) If state changed, call thread_state_put immediately.
+4) If any required field is missing, ask ONLY missing fields.
+5) If all required fields are present and status is not completed/completed_error:
+   - set status=awaiting_confirmation
+   - call thread_state_put
+   - show summary and ask confirmation.
+
+Extraction rules:
+- If message contains an email pattern, map it to email.
+- If message mentions tenant/tenant_hint/company/org, prioritize tenant_hint.
+- If only one field is missing, treat concise user answer as that field unless clearly contradictory.
+
+Confirmation normalization:
+- positive: si,si,ok,confirmo,correcto,asi es,de acuerdo,dale
+- negative: no,incorrecto,corregir,hay error
+
+STRICT NO-LOOP RULE:
+- If status==awaiting_confirmation and user is positive:
+  - If register_attempted==false:
+    a) Call ilk_register with:
+       - src_ilk (from context)
+       - identity_candidate {name,email,tenant_hint}
+    b) If tool returns status=ok:
+       - call thread_state_delete
+       - send final success message
+       - stop (do not ask confirmation again)
+    c) If tool returns status=error:
+       - set status=completed_error
+       - set register_attempted=true
+       - set register_error={error_code,message}
+       - call thread_state_put
+       - send final error summary
+       - stop (do not ask confirmation again)
+  - If register_attempted==true:
+    - send final error summary from register_error
+    - stop (do not ask confirmation again)
+
+- If status==awaiting_confirmation and user is negative:
+  - set status=collecting
+  - call thread_state_put
+  - ask which field to correct.
+
+ANTI-REASK RULE:
+- If thread_state already contains a non-empty value for a required field, do not ask for that field again unless the user is explicitly correcting it.
+- If the user says they already provided the data, inspect thread_state and current turn extraction before asking for missing fields again.
+- If all required fields are already present in thread_state, never ask for the data again; move to confirmation or registration as appropriate.
+
+ANTI-RECONFIRM RULE:
+- If status==awaiting_confirmation and the user reply is positive, do not restate the collected data and do not ask for confirmation again; call ilk_register immediately.
+- If registration already succeeded or failed terminally in the current turn, stop after the final message.
+
+Do not invent src_ilk or thread_id.
+Keep replies short in Spanish.
+"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenAiApiKeySource {
@@ -70,12 +147,29 @@ impl OpenAiApiKeySource {
     }
 }
 
+fn frontdesk_default_instructions() -> String {
+    FRONTDESK_DEFAULT_SYSTEM_PROMPT.trim().to_string()
+}
+
+fn frontdesk_default_instructions_snapshot() -> Value {
+    json!({
+        "source": "inline",
+        "value": frontdesk_default_instructions(),
+        "trim": true
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct RunnerConfig {
     node: NodeSection,
     #[serde(default)]
     runtime: RuntimeSection,
     behavior: BehaviorSection,
+}
+
+#[derive(Debug, Deserialize)]
+struct FrontdeskBootstrapHiveFile {
+    hive_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1686,8 +1780,8 @@ impl GenericAiNode {
             "schema_version": state.schema_version,
             "config_version": state.config_version,
             "contract": {
-                "node_family": "AI",
-                "node_kind": "AI.frontdesk.gov",
+                "node_family": "SY",
+                "node_kind": "SY.frontdesk.gov",
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
                 "required_fields": [
                     "config.behavior.kind",
@@ -1703,9 +1797,10 @@ impl GenericAiNode {
                 ],
                 "secrets": [secret_descriptor],
                 "notes": [
+                    "SY.frontdesk.gov ships a runtime-owned default prompt when behavior.instructions is omitted.",
                     "Preferred secret field is config.secrets.openai.api_key.",
                     "Legacy aliases config.behavior.openai.api_key and config.behavior.api_key remain accepted during migration.",
-                    "AI.frontdesk.gov defaults behavior.capabilities.multimodal=false unless explicitly overridden.",
+                    "SY.frontdesk.gov defaults behavior.capabilities.multimodal=false unless explicitly overridden.",
                     "Secret values are persisted in local secrets.json and always returned redacted."
                 ]
             },
@@ -2028,8 +2123,9 @@ impl NodeBehavior {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(EnvFilter::new(log_filter))
         .init();
 
     let args = parse_runner_args()?;
@@ -2532,7 +2628,7 @@ async fn run_unconfigured_bootstrap(
     let gov_identity = gov_identity_config_from_env();
     let ai_node = GenericAiNode {
         mode,
-        node_name,
+        node_name: node_name.clone(),
         behavior: Arc::new(RwLock::new(behavior)),
         dynamic_config_dir: dynamic_dir,
         thread_state_store,
@@ -2543,6 +2639,11 @@ async fn run_unconfigured_bootstrap(
     };
     if mode == RunnerMode::Gov {
         let client = RouterClient::connect(ai_node_config).await?;
+        tracing::info!(
+            node_name = %node_name,
+            mode = %mode.as_str(),
+            "SY.frontdesk.gov connected to router"
+        );
         let (reader, writer) = client.split();
         let shared_conn = Arc::new(SharedRouterConnection::new(reader, writer));
         let mut ai_node = ai_node;
@@ -2550,6 +2651,11 @@ async fn run_unconfigured_bootstrap(
         run_single_connection_runtime(shared_conn, ai_node, RuntimeConfig::default()).await?;
     } else {
         let client = RouterClient::connect(ai_node_config).await?;
+        tracing::info!(
+            node_name = %node_name,
+            mode = %mode.as_str(),
+            "AI runner connected to router"
+        );
         let runtime = NodeRuntime::new(client, ai_node);
         runtime.run_with_config(RuntimeConfig::default()).await?;
     }
@@ -2666,7 +2772,7 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
                 let normalized = value.trim().to_ascii_lowercase();
                 if normalized != "gov" {
                     return Err(format!(
-                        "--mode={value} is not supported in AI.frontdesk.gov runtime (only gov)"
+                        "--mode={value} is not supported in SY.frontdesk.gov runtime (only gov)"
                     )
                     .into());
                 }
@@ -2685,16 +2791,45 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
 fn bootstrap_node_from_args(
     args: &BootstrapArgs,
 ) -> Result<NodeSection, Box<dyn std::error::Error + Send + Sync>> {
-    let name = args.node_name.clone().or_else(|| {
-        let resolved = managed_node_name("", &["AI_NODE_NAME", "NODE_NAME"]);
-        if resolved.trim().is_empty() {
-            None
-        } else {
-            Some(resolved)
-        }
-    }).ok_or_else(|| {
-        "when no --config is provided, pass --node-name (or FLUXBEE_NODE_NAME/AI_NODE_NAME env var)".to_string()
-    })?;
+    let config_dir = args
+        .config_dir
+        .clone()
+        .or_else(|| std::env::var("AI_CONFIG_DIR").ok())
+        .unwrap_or_else(default_config_dir);
+    let dynamic_config_dir = args
+        .dynamic_config_dir
+        .clone()
+        .or_else(|| std::env::var("AI_DYNAMIC_CONFIG_DIR").ok())
+        .unwrap_or_else(default_dynamic_config_dir);
+    let mut node_name_source = "args_or_env";
+    let name = args
+        .node_name
+        .clone()
+        .or_else(|| {
+            let resolved = managed_node_name("", &["AI_NODE_NAME", "NODE_NAME"]);
+            if resolved.trim().is_empty() {
+                None
+            } else {
+                Some(resolved)
+            }
+        })
+        .or_else(|| {
+            let inferred = infer_frontdesk_node_name_from_hive(PathBuf::from(&config_dir).as_path());
+            if inferred.is_some() {
+                node_name_source = "hive_yaml";
+            }
+            inferred
+        })
+        .ok_or_else(|| {
+            "when no --config is provided, pass --node-name (or FLUXBEE_NODE_NAME/AI_NODE_NAME env var), or provide hive.yaml with hive_id for SY.frontdesk.gov bootstrap".to_string()
+        })?;
+    tracing::info!(
+        node_name = %name,
+        node_name_source,
+        config_dir = %config_dir,
+        dynamic_config_dir = %dynamic_config_dir,
+        "resolved SY.frontdesk.gov bootstrap node"
+    );
     Ok(NodeSection {
         name,
         version: args
@@ -2715,14 +2850,27 @@ fn bootstrap_node_from_args(
         config_dir: args
             .config_dir
             .clone()
-            .or_else(|| std::env::var("AI_CONFIG_DIR").ok())
-            .unwrap_or_else(default_config_dir),
+            .unwrap_or(config_dir),
         dynamic_config_dir: args
             .dynamic_config_dir
             .clone()
-            .or_else(|| std::env::var("AI_DYNAMIC_CONFIG_DIR").ok())
-            .unwrap_or_else(default_dynamic_config_dir),
+            .unwrap_or(dynamic_config_dir),
     })
+}
+
+fn infer_frontdesk_node_name_from_hive(config_dir: &std::path::Path) -> Option<String> {
+    let raw = fs::read_to_string(config_dir.join("hive.yaml")).ok()?;
+    let hive: FrontdeskBootstrapHiveFile = serde_yaml::from_str(&raw).ok()?;
+    let hive_id = hive.hive_id.trim();
+    if hive_id.is_empty() {
+        return None;
+    }
+    tracing::info!(
+        hive_id,
+        config_dir = %config_dir.display(),
+        "bootstrapping SY.frontdesk.gov node_name from hive.yaml"
+    );
+    Some(format!("SY.frontdesk.gov@{hive_id}"))
 }
 
 fn ensure_unique_node_names(
@@ -2748,7 +2896,8 @@ fn build_behavior(
     let behavior = match &cfg.behavior {
         BehaviorSection::Echo => NodeBehavior::Echo,
         BehaviorSection::OpenaiChat(openai) => {
-            let instructions = resolve_instructions(&openai.instructions)?;
+            let instructions = resolve_instructions(&openai.instructions)?
+                .or_else(|| Some(frontdesk_default_instructions()));
             let model_settings = openai
                 .model_settings
                 .as_ref()
@@ -2804,7 +2953,8 @@ fn build_behavior_from_effective_config(
                 .ok_or_else(|| "missing behavior.model for openai_chat".to_string())?
                 .to_string();
 
-            let instructions = extract_instructions_from_effective_config(behavior);
+            let instructions = extract_instructions_from_effective_config(behavior)
+                .or_else(|| Some(frontdesk_default_instructions()));
             let model_settings = extract_model_settings_from_effective_config(behavior);
             let api_key_env = behavior
                 .api_key_env
@@ -2904,7 +3054,11 @@ fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocu
         BehaviorSection::OpenaiChat(openai) => EffectiveBehaviorSection {
             kind: "openai_chat".to_string(),
             model: Some(openai.model.clone()),
-            instructions: Some(format_instructions_snapshot(&openai.instructions)),
+            instructions: Some(if openai.instructions.is_some() {
+                format_instructions_snapshot(&openai.instructions)
+            } else {
+                frontdesk_default_instructions_snapshot()
+            }),
             model_settings: openai.model_settings.clone(),
             api_key_env: Some(openai.api_key_env.clone()),
             api_key: openai.api_key.clone(),
@@ -3289,6 +3443,9 @@ fn materialize_effective_defaults(
         materialize_runtime_defaults(runtime);
     }
     if config.behavior.kind.eq_ignore_ascii_case("openai_chat") {
+        if config.behavior.instructions.is_none() {
+            config.behavior.instructions = Some(frontdesk_default_instructions_snapshot());
+        }
         if config.behavior.capabilities.is_none() {
             config.behavior.capabilities = Some(BehaviorCapabilities {
                 multimodal: Some(default_multimodal_for_runtime()),
@@ -3486,6 +3643,21 @@ fn openai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Val
         }),
         fluxbee_ai_sdk::errors::AiSdkError::Protocol(msg) => {
             if let Some((status, detail)) = parse_openai_status_error(msg) {
+                if status == 400 || status == 404 || status == 422 {
+                    if extract_openai_error_param(&detail)
+                        .as_deref()
+                        .is_some_and(is_openai_attachment_param)
+                    {
+                        return json!({
+                            "type": "error",
+                            "code": "provider_attachment_invalid_request",
+                            "message": "The AI provider rejected one or more attached files for the current model/provider.",
+                            "retryable": false,
+                            "provider_status": status,
+                            "provider_detail": trim_chars(&detail, 280)
+                        });
+                    }
+                }
                 let (code, retryable, message) = match status {
                     400 | 404 | 422 => (
                         "provider_invalid_request",
@@ -3594,6 +3766,15 @@ fn extract_openai_error_param(detail: &str) -> Option<String> {
         .and_then(|error| error.get("param"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+fn is_openai_attachment_param(param: &str) -> bool {
+    let param = param.trim();
+    param.contains(".file_data")
+        || param.contains(".file_id")
+        || param.contains(".file_url")
+        || param.contains(".image_url")
+        || param.contains(".content")
 }
 
 fn infer_state_dir_from_dynamic(dynamic_config_dir: &std::path::Path) -> PathBuf {
@@ -3811,7 +3992,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: "SY.orchestrator@motherbee".to_string(),
-                dst: Destination::Unicast("AI.frontdesk.gov@motherbee".to_string()),
+                dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-123".to_string(),
             },
@@ -3861,7 +4042,7 @@ mod tests {
         let gov_identity = GovIdentityConfig::default();
         GenericAiNode {
             mode: RunnerMode::Gov,
-            node_name: "AI.frontdesk.gov".to_string(),
+            node_name: "SY.frontdesk.gov".to_string(),
             behavior: Arc::new(RwLock::new(None)),
             dynamic_config_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
@@ -3988,7 +4169,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: "IO.sim.local@motherbee".to_string(),
-                dst: Destination::Unicast("AI.frontdesk.gov@motherbee".to_string()),
+                dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-user-123".to_string(),
             },
@@ -4259,5 +4440,66 @@ mod tests {
         let hint = "tnt:22222222-2222-4222-8222-222222222222";
         let out = resolve_tenant_id_for_register(None, Some(hint), None);
         assert_eq!(out.as_deref(), Some(hint));
+    }
+
+    #[test]
+    fn materialize_effective_config_defaults_injects_frontdesk_prompt_when_missing() {
+        let config = materialize_effective_config_defaults(
+            "SY.frontdesk.gov@motherbee",
+            EffectiveConfigDocument {
+                behavior: EffectiveBehaviorSection {
+                    kind: "openai_chat".to_string(),
+                    model: Some("gpt-4.1-mini".to_string()),
+                    ..EffectiveBehaviorSection::default()
+                },
+                ..EffectiveConfigDocument::default()
+            },
+        );
+
+        let instructions = config
+            .behavior
+            .instructions
+            .as_ref()
+            .and_then(|value| value.get("value"))
+            .and_then(Value::as_str);
+        assert_eq!(instructions, Some(frontdesk_default_instructions().as_str()));
+    }
+
+    #[test]
+    fn build_behavior_from_effective_config_uses_frontdesk_prompt_when_missing() {
+        let behavior = build_behavior_from_effective_config(&EffectiveConfigDocument {
+            behavior: EffectiveBehaviorSection {
+                kind: "openai_chat".to_string(),
+                model: Some("gpt-4.1-mini".to_string()),
+                ..EffectiveBehaviorSection::default()
+            },
+            ..EffectiveConfigDocument::default()
+        })
+        .expect("build behavior");
+
+        match behavior {
+            NodeBehavior::OpenAiChat(openai) => {
+                assert_eq!(
+                    openai.instructions.as_deref(),
+                    Some(frontdesk_default_instructions().as_str())
+                );
+            }
+            other => panic!("expected OpenAiChat behavior, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn infer_frontdesk_node_name_from_hive_uses_hive_id() {
+        let root = std::env::temp_dir().join(format!(
+            "frontdesk-hive-bootstrap-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).expect("create temp config dir");
+        fs::write(root.join("hive.yaml"), "hive_id: motherbee\n").expect("write hive.yaml");
+
+        let inferred = infer_frontdesk_node_name_from_hive(root.as_path());
+        assert_eq!(inferred.as_deref(), Some("SY.frontdesk.gov@motherbee"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

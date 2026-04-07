@@ -3,12 +3,12 @@
 > Nota 2026-03-31:
 > Esta especificación refleja la etapa donde el gating era `mode=default|gov`.
 > La dirección vigente evolucionó a separación por runtime/ownership:
-> - `AI.common` y `AI.frontdesk.gov` como runtimes diferenciados,
-> - `AI.frontdesk.gov` apoyado en `nodes/gov/common` + SDKs,
+> - `AI.common` y `SY.frontdesk.gov` como runtimes diferenciados,
+> - `SY.frontdesk.gov` apoyado en `nodes/gov/common` + SDKs,
 > - `mode=gov` queda como mecanismo transicional.
 
 > Objetivo: definir **qué hay que cambiar** (no el orden) para:
-> 1) habilitar `AI.frontdesk.gov` como **AI Node** con capacidad de completar identidad vía Identity,
+> 1) habilitar `SY.frontdesk.gov` como **AI Node** con capacidad de completar identidad vía Identity,
 > 2) introducir **mode** (default/gov) en el runtime de AI Nodes para evitar creep de tools especiales,
 > 3) ajustar extracción/uso de `src_ilk` y el keying de LanceDB (thread-state) según la decisión actual.
 
@@ -83,19 +83,19 @@
 
 **Requerimiento**
 - Actualizar las tools internas `thread_state_get/put/delete` (o equivalente) para que:
-  - key principal = `src_ilk` (extraído por A3)
+  - key principal = `src_ilk` (extraí­do por A3)
   - el JSON guardado sea libre por prompting
 
 **Compat y alias/canonical**
 - Por Identity flows: pueden existir alias con TTL y canonicalización.
 - El store por `src_ilk` debe contemplar continuidad.
-  - Mínimo requerido en MVP: intentar lookup en el orden:
+  - mínimo requerido en MVP: intentar lookup en el orden:
     1) `src_ilk` recibido
     2) (si Identity expone canonical) `canonical_ilk` (🧩)
   - Alternativa MVP aceptable: almacenar en el JSON un campo `known_ilks: []` y migrar (rename) cuando cambie (si se detecta).
 
 **Errores**
-- Si falta `src_ilk`, `thread_state_*` debe fallar con error explícito (no silent).
+- Si falta `src_ilk`, `thread_state_*` debe fallar con error explí­cito (no silent).
 
 ---
 
@@ -156,11 +156,11 @@
 **Requerimiento**
 - A nivel registry, `ilk_register` no existe en mode=default.
 - Si un prompt intenta llamarla en mode=default:
-  - el runtime debe responder “tool not found” (o error explícito) y no ejecutar nada.
+  - el runtime debe responder “tool not found” (o error explí­cito) y no ejecutar nada.
 
 ---
 
-## C. Implementación del nodo `AI.frontdesk.gov` (como config/prompt sobre AI Nodes)
+## C. Implementación del nodo `SY.frontdesk.gov` (como config/prompt sobre AI Nodes)
 
 ### C1) Config/prompt: “frontdesk flow” usando thread-state + confirmación
 
@@ -169,7 +169,7 @@
 - El prompt debe:
   1) mantener estado local usando `thread_state_get/put/delete` (ahora keyeado por `src_ilk`)
   2) pedir datos mínimos: `name`, `email`, tenant association (según docs core)
-  3) pedir confirmación explícita
+  3) pedir confirmación explí­cita
   4) llamar `ilk_register` (tool gov) al confirmar
   5) borrar estado (`thread_state_delete`) al éxito
 
@@ -181,7 +181,7 @@
 ### C2) Wiring de deploy/spawn
 
 **Requerimiento**
-- Orchestrator/systemd debe spawnear `AI.frontdesk.gov` con:
+- Orchestrator/systemd debe spawnear `SY.frontdesk.gov` con:
   - `ai_node_runner --mode=gov --config <config_path>`
 - El resto de AI Nodes debe spawnearse con `--mode=default`.
 
@@ -211,7 +211,7 @@
 
 ## E. Criterios de validación (alto nivel)
 
-- `AI.frontdesk.gov` puede completar identidad:
+- `SY.frontdesk.gov` puede completar identidad:
   - recibe conversación con `meta.context.src_ilk` temporal
   - recolecta mínimos, confirma
   - ejecuta `ILK_REGISTER`
@@ -219,7 +219,7 @@
 
 - En `--mode=default`, tool `ilk_register` no existe y no puede ser invocada.
 
-- Thread-state funciona keyeado por `src_ilk` (y falla explícito si falta).
+- Thread-state funciona keyeado por `src_ilk` (y falla explí­cito si falta).
 
 
 ---
@@ -286,7 +286,7 @@
 
 ### F7) Wiring frontdesk runtime
 
-- [x] Ajustar config/prompt de `AI.frontdesk.gov` al flujo:
+- [x] Ajustar config/prompt de `SY.frontdesk.gov` al flujo:
   - recolectar minimos,
   - confirmar,
   - llamar `ilk_register`,
@@ -327,7 +327,7 @@ RUST_LOG=info cargo run --release -p fluxbee-ai-nodes --bin ai_node_runner -- \
 ```bash
 bash scripts/install-ia.sh
 sudo install -m 0644 /tmp/ai_frontdesk_gov.utf8.yaml /etc/fluxbee/ai-nodes/ai-frontdesk-gov.yaml
-sudo tee /etc/fluxbee/ai-nodes/ai-frontdesk-gov.env >/dev/null <<'EOF'
+sudo tee /etc/fluxbee/ai-nodes/sy-frontdesk-gov.env >/dev/null <<'EOF'
 AI_NODE_MODE=gov
 OPENAI_API_KEY=sk-REPLACE_ME
 GOV_IDENTITY_TARGET=SY.identity
@@ -336,8 +336,8 @@ GOV_IDENTITY_TIMEOUT_MS=10000
 RUST_LOG=info,fluxbee_ai_nodes=debug,fluxbee_ai_sdk=debug
 EOF
 sudo systemctl daemon-reload
-sudo systemctl enable --now fluxbee-ai-node@ai-frontdesk-gov
-sudo journalctl -u fluxbee-ai-node@ai-frontdesk-gov -f
+sudo systemctl enable --now fluxbee-ai-node@sy-frontdesk-gov
+sudo journalctl -u fluxbee-ai-node@sy-frontdesk-gov -f
 ```
 
 ### G3) Nodo AI comun en mode=default (instalado/systemd)
@@ -356,7 +356,7 @@ sudo systemctl restart fluxbee-ai-node@ai-chat
 ```bash
 SIM_THREAD_ID="sim-thread-1" \
 SIM_SRC_ILK="ilk:11111111-1111-4111-8111-111111111111" \
-SIM_DST_NODE="AI.frontdesk.gov@motherbee" \
+SIM_DST_NODE="SY.frontdesk.gov@motherbee" \
 ROUTER_SOCKET="/var/run/fluxbee/routers" \
 CONFIG_DIR="/etc/fluxbee" \
 UUID_PERSISTENCE_DIR="/var/lib/fluxbee/state/nodes" \

@@ -5036,7 +5036,7 @@ mod tests {
             updated_at: now,
             _reserved: [0u8; 8],
         };
-        copy_bytes_with_len(&mut ilk.handler_node, "AI.frontdesk@sandbox");
+        copy_bytes_with_len(&mut ilk.handler_node, "SY.frontdesk.gov@sandbox");
 
         let alias = IlkAliasEntry {
             old_ilk_id: *old_ilk_id.as_bytes(),
@@ -5098,7 +5098,7 @@ mod tests {
             record
                 .get("handler_node")
                 .and_then(serde_json::Value::as_str),
-            Some("AI.frontdesk@sandbox")
+            Some("SY.frontdesk.gov@sandbox")
         );
 
         let aliases = root
@@ -5374,7 +5374,7 @@ mod tests {
         let expected_canonical = format!("ilk:{canonical_ilk_id}");
         let mut msg = message_with_src_ilk(&old_src);
         let forced_target =
-            apply_identity_pre_resolve(&mut msg, "AI.frontdesk@sandbox", &snapshot, now);
+            apply_identity_pre_resolve(&mut msg, "SY.frontdesk.gov@sandbox", &snapshot, now);
 
         assert!(forced_target.is_none());
         assert_eq!(
@@ -5445,7 +5445,7 @@ mod tests {
         let old_src = format!("ilk:{old_ilk_id}");
         let mut msg = message_with_src_ilk(&old_src);
         let forced_target =
-            apply_identity_pre_resolve(&mut msg, "AI.frontdesk@sandbox", &snapshot, now);
+            apply_identity_pre_resolve(&mut msg, "SY.frontdesk.gov@sandbox", &snapshot, now);
 
         assert!(forced_target.is_none());
         assert_eq!(

@@ -1,5 +1,5 @@
 node:
-  name: "AI.frontdesk.gov"
+  name: "SY.frontdesk.gov"
   version: "0.1.0"
   router_socket: "/var/run/fluxbee/routers"
   uuid_persistence_dir: "/var/lib/fluxbee/state/nodes"
@@ -23,7 +23,7 @@ behavior:
   instructions:
     source: "inline"
     value: |
-      Eres AI.frontdesk.gov. Debes gestionar identidad minima por hilo usando tools.
+      Eres SY.frontdesk.gov. Debes gestionar identidad minima por hilo usando tools.
 
       Objetivo:
       - Recolectar y confirmar: name, email, tenant_hint.

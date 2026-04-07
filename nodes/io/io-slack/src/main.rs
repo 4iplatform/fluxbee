@@ -260,6 +260,7 @@ impl Config {
         let allowed_mimes_override = env("IO_SLACK_ALLOWED_MIMES")
             .or_else(|| json_get_string_opt(spawn_doc, &["io.blob.allowed_mimes_csv"]));
         let mut text_v1_cfg = IoTextBlobConfig::default();
+        text_v1_cfg.allowed_mimes = default_slack_allowed_mimes();
         text_v1_cfg.max_message_bytes = env("IO_SLACK_MAX_MESSAGE_BYTES")
             .and_then(|v| v.parse().ok())
             .or_else(|| {
@@ -391,6 +392,26 @@ impl Config {
             blob_runtime,
         })
     }
+}
+
+fn default_slack_allowed_mimes() -> Vec<String> {
+    vec![
+        "image/jpeg".to_string(),
+        "image/png".to_string(),
+        "image/webp".to_string(),
+        "image/gif".to_string(),
+        "application/pdf".to_string(),
+        "text/plain".to_string(),
+        "text/markdown".to_string(),
+        "application/json".to_string(),
+        "text/csv".to_string(),
+        "application/msword".to_string(),
+        "application/vnd.ms-excel".to_string(),
+        "application/vnd.ms-powerpoint".to_string(),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string(),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string(),
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation".to_string(),
+    ]
 }
 
 fn env(key: &str) -> Option<String> {
@@ -1222,6 +1243,38 @@ async fn collect_slack_blob_attachments(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_slack_allowed_mimes;
+
+    #[test]
+    fn default_slack_allowed_mimes_include_office_common_types() {
+        let allowed = default_slack_allowed_mimes();
+
+        assert!(allowed.contains(
+            &"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()
+        ));
+        assert!(allowed.contains(
+            &"application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string()
+        ));
+        assert!(allowed.contains(
+            &"application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                .to_string()
+        ));
+        assert!(allowed.contains(&"text/csv".to_string()));
+    }
+
+    #[test]
+    fn default_slack_allowed_mimes_preserve_existing_core_types() {
+        let allowed = default_slack_allowed_mimes();
+
+        assert!(allowed.contains(&"image/png".to_string()));
+        assert!(allowed.contains(&"image/jpeg".to_string()));
+        assert!(allowed.contains(&"application/pdf".to_string()));
+        assert!(allowed.contains(&"application/json".to_string()));
+    }
 }
 
 fn attach_slack_raw_stub(

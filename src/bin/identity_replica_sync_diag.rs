@@ -48,7 +48,7 @@ async fn main() -> Result<(), DynError> {
     );
     let frontdesk_node_name = env_or(
         "IDENTITY_REPLICA_FRONTDESK_NODE_NAME",
-        &format!("AI.frontdesk@{}-replicasync-{}", local_hive_id, test_id),
+        &format!("SY.frontdesk.gov@{}-replicasync-{}", local_hive_id, test_id),
     );
     let io_node_name = env_or(
         "IDENTITY_REPLICA_IO_NODE_NAME",

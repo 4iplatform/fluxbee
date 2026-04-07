@@ -1,9 +1,9 @@
 # gov-common
 
-Librería compartida para runtimes de la familia `gov`.
+Librerí­a compartida para runtimes de la familia `gov`.
 
 Objetivo:
-- concentrar helpers y contratos reutilizables de `AI.frontdesk.gov`,
+- concentrar helpers y contratos reutilizables de `SY.frontdesk.gov`,
 - evitar que frontdesk dependa de `nodes/ai/common`,
 - sostener la separación de ownership entre familia `AI` y familia `gov`.
 
@@ -14,4 +14,4 @@ Estado actual:
 
 Dirección:
 - mover gradualmente lógica reusable de `nodes/gov/ai-frontdesk-gov` a este crate,
-- mantener `AI.common` y `AI.frontdesk.gov` sin dependencia cruzada.
+- mantener `AI.common` y `SY.frontdesk.gov` sin dependencia cruzada.

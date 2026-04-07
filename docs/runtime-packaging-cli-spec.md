@@ -82,7 +82,7 @@ my-onboarding-flow/
 
 ```json
 {
-  "name": "ai.frontdesk.gov",
+  "name": "sy.frontdesk.gov",
   "version": "1.0.0",
   "type": "full_runtime",
   "description": "Government frontdesk AI with specialized document processing",
@@ -109,7 +109,7 @@ my-onboarding-flow/
 **Full runtime:**
 ```json
 {
-  "name": "ai.frontdesk.gov",
+  "name": "sy.frontdesk.gov",
   "version": "1.0.0",
   "type": "full_runtime",
   "description": "Government frontdesk AI",
@@ -286,7 +286,7 @@ Publish aborted. Publish the base runtime first.
 ```
 /var/lib/fluxbee/dist/runtimes/
 ├── manifest.json
-└── ai.frontdesk.gov/
+└── sy.frontdesk.gov/
     └── 1.0.0/
         ├── package.json
         ├── bin/
@@ -620,14 +620,14 @@ cd fluxbee/nodes/gov/ai-frontdesk-gov
 
 # 2. COMPILE — build the binary
 cargo build --release
-# Output: fluxbee/target/release/ai-frontdesk-gov
+# Output: fluxbee/target/release/sy-frontdesk-gov
 
 # 3. PACKAGE — create the package directory
 #    Can be done in a temp dir or in a package/ subdir of the project
 mkdir -p package/bin package/assets/prompts package/config
 
 # Copy binary as start.sh (orchestrator's entry point)
-cp ../../../target/release/ai-frontdesk-gov package/bin/start.sh
+cp ../../../target/release/sy-frontdesk-gov package/bin/start.sh
 chmod +x package/bin/start.sh
 
 # Copy assets and config template from source
@@ -637,7 +637,7 @@ cp config/default-config.json package/config/
 # Write package.json
 cat > package/package.json <<EOF
 {
-  "name": "ai.frontdesk.gov",
+  "name": "sy.frontdesk.gov",
   "version": "1.0.0",
   "type": "full_runtime",
   "description": "Government frontdesk AI with document processing",
@@ -655,8 +655,8 @@ fluxbee-publish ./package --deploy worker-220
 curl -X POST "$BASE/hives/worker-220/nodes" \
   -H "Content-Type: application/json" \
   -d '{
-    "node_name": "AI.frontdesk.gov",
-    "runtime": "ai.frontdesk.gov",
+    "node_name": "SY.frontdesk.gov",
+    "runtime": "sy.frontdesk.gov",
     "runtime_version": "current",
     "config": {"api_key": "sk-..."}
   }'
@@ -758,8 +758,8 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../../.." && pwd)"
-BINARY_NAME="ai-frontdesk-gov"
-RUNTIME_NAME="ai.frontdesk.gov"
+BINARY_NAME="sy-frontdesk-gov"
+RUNTIME_NAME="sy.frontdesk.gov"
 VERSION="${1:-0.0.1}"
 
 # Build

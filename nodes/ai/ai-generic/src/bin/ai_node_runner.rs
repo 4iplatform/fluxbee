@@ -3595,6 +3595,21 @@ fn openai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Val
         }),
         fluxbee_ai_sdk::errors::AiSdkError::Protocol(msg) => {
             if let Some((status, detail)) = parse_openai_status_error(msg) {
+                if status == 400 || status == 404 || status == 422 {
+                    if extract_openai_error_param(&detail)
+                        .as_deref()
+                        .is_some_and(is_openai_attachment_param)
+                    {
+                        return json!({
+                            "type": "error",
+                            "code": "provider_attachment_invalid_request",
+                            "message": "The AI provider rejected one or more attached files for the current model/provider.",
+                            "retryable": false,
+                            "provider_status": status,
+                            "provider_detail": trim_chars(&detail, 280)
+                        });
+                    }
+                }
                 let (code, retryable, message) = match status {
                     400 | 404 | 422 => (
                         "provider_invalid_request",
@@ -3703,6 +3718,15 @@ fn extract_openai_error_param(detail: &str) -> Option<String> {
         .and_then(|error| error.get("param"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+fn is_openai_attachment_param(param: &str) -> bool {
+    let param = param.trim();
+    param.contains(".file_data")
+        || param.contains(".file_id")
+        || param.contains(".file_url")
+        || param.contains(".image_url")
+        || param.contains(".content")
 }
 
 fn infer_state_dir_from_dynamic(dynamic_config_dir: &std::path::Path) -> PathBuf {
@@ -3920,7 +3944,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: "SY.orchestrator@motherbee".to_string(),
-                dst: Destination::Unicast("AI.frontdesk.gov@motherbee".to_string()),
+                dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-123".to_string(),
             },
@@ -3970,7 +3994,7 @@ mod tests {
         let gov_identity = GovIdentityConfig::default();
         GenericAiNode {
             mode: RunnerMode::Default,
-            node_name: "AI.frontdesk.gov".to_string(),
+            node_name: "SY.frontdesk.gov".to_string(),
             behavior: Arc::new(RwLock::new(None)),
             dynamic_config_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
@@ -4097,7 +4121,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: "IO.sim.local@motherbee".to_string(),
-                dst: Destination::Unicast("AI.frontdesk.gov@motherbee".to_string()),
+                dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-user-123".to_string(),
             },

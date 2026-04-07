@@ -55,7 +55,7 @@ TEST_ADDR=192.168.8.220
 TEST_RUNTIME=AI.chat
 TEST_RUNTIME_VERSION=1.2.3
 TEST_NODE=SY.admin@motherbee
-TEST_MANAGED_NODE=AI.frontdesk.gov@motherbee
+TEST_MANAGED_NODE=SY.frontdesk.gov@motherbee
 TEST_ROUTE_PREFIX=AI.chat.
 TEST_VPN_PATTERN=worker-*
 TEST_ILK=ilk:550e8400-e29b-41d4-a716-446655440000
@@ -301,7 +301,7 @@ curl -sS "$BASE/hives/$LOCAL_HIVE/nodes/$TEST_MANAGED_NODE/config"
 ```
 - SCMD:
 ```text
-SCMD: curl -X GET /hives/motherbee/nodes/AI.frontdesk.gov@motherbee/config
+SCMD: curl -X GET /hives/motherbee/nodes/SY.frontdesk.gov@motherbee/config
 ```
 - check:
   - config persistida de un nodo gestionado
@@ -627,10 +627,10 @@ curl -sS -X PUT "$BASE/hives/$LOCAL_HIVE/nodes/$TEST_MANAGED_NODE/config" \
 ```
 - SCMD:
 ```text
-SCMD: curl -X PUT /hives/motherbee/nodes/AI.frontdesk.gov@motherbee/config -d '{"openai":{"default_model":"gpt-4.1-mini"}}'
+SCMD: curl -X PUT /hives/motherbee/nodes/SY.frontdesk.gov@motherbee/config -d '{"openai":{"default_model":"gpt-4.1-mini"}}'
 ```
 - check:
-  - luego `GET /hives/motherbee/nodes/AI.frontdesk.gov@motherbee/config`
+  - luego `GET /hives/motherbee/nodes/SY.frontdesk.gov@motherbee/config`
 
 [ ] `send_node_message`
 

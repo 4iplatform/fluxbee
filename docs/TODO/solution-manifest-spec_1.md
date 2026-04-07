@@ -215,7 +215,7 @@ Today, deploying a complete solution requires dozens of manual API calls: create
           "src_registration_status": "temporary",
           "ich_type": "whatsapp"
         },
-        "destination": "AI.frontdesk@motherbee"
+        "destination": "SY.frontdesk.gov@motherbee"
       },
       {
         "name": "billing-route",

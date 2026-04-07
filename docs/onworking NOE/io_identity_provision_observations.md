@@ -41,7 +41,7 @@ Interpretación:
 - Logs de `sy-config-routes` muestran sólo regla activa `WF.echo.*`.
 
 Esperable:
-- Si existe regla/policy para ese `src_ilk`/tipo `user`, resolver a `AI.frontdesk.gov@motherbee`.
+- Si existe regla/policy para ese `src_ilk`/tipo `user`, resolver a `SY.frontdesk.gov@motherbee`.
 - Si no existe, resolve falla (comportamiento actual).
 
 ### 2.2 Miss repetido en lookup SHM para mismo sender

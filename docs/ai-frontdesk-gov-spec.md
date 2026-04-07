@@ -1,216 +1,157 @@
-# AI.frontdesk.gov — Especificación técnica (v1)
+# SY.frontdesk.gov - Especificacion tecnica (v1)
 
-> ✅ Nodo **AI** (no SY), parte del “system default set”.  
-> Rol: **frontdesk de government/identity** para completar identidad cuando el interlocutor todavía está en estado *temporary*.  
-> Cognition: fuera de alcance (este documento describe solo comportamiento del nodo).
+Estado: vigente
 
----
+## 1. Rol
 
-## 0) Identidad y naming
+`SY.frontdesk.gov` es el frontdesk de government/identity del sistema.
+Su funcion es completar el upgrade de identidad cuando el interlocutor sigue en estado `temporary`.
 
-- **Nombre L2 (fijo)**: `AI.frontdesk.gov`
-- **Nombre calificado**: `AI.frontdesk.gov@<hive_id>`
+No reemplaza a `AI.default`.
+Su rol es especifico de identidad y onboarding.
 
-> Nota: `AI.frontdesk.gov` **no** reemplaza a `AI.default` (fallback general).  
-> La equivalencia `frontdesk == default` queda 🧩 TBD.
+## 2. Identidad y naming
 
----
+- Nombre L2 fijo: `SY.frontdesk.gov`
+- Nombre calificado: `SY.frontdesk.gov@<hive_id>`
 
-## 1) Alcance y responsabilidades
+Direccion vigente:
 
-### 1.1 Qué hace
+- existe una sola instancia canonica por hive
+- debe considerarse parte del `system default set`
+- el router puede derivar mensajes a este nodo cuando el `src_ilk` esta en estado `temporary`
 
-✅ **NORMATIVO**:
-- Recibe conversaciones donde `src_ilk` está presente pero la identidad asociada está **incompleta/temporary**.
-- Mantiene el control conversacional hasta reunir los **datos mínimos** para completar identidad.
-- Pide **confirmación explícita** al usuario antes de solicitar el “upgrade” de identidad.
-- Solicita al core la **completación/upgrade** de identidad para el `src_ilk` (vía SY.admin/SY.orchestrator/identity, ver §6).
-- Una vez completada la identidad:
-  - informa al usuario (por IO),
-  - limpia su estado por thread (LanceDB),
-  - y permite que el sistema derive el caso al flujo normal (soporte/ventas/etc.) por policy.
+## 3. Responsabilidades
 
-### 1.2 Qué NO hace
+`SY.frontdesk.gov`:
 
-✅ **NORMATIVO**:
-- No escribe ni modifica identity DB directamente.
-- No inventa tenants ni ILKs por su cuenta.
-- No actúa como “default catch-all” del sistema (eso corresponde a `AI.default`, si existe).
-- No guarda conversación completa; solo guarda **datos duros relevantes** por thread.
+- recibe conversaciones con `src_ilk` temporal o identidad incompleta
+- recolecta los datos minimos de identidad
+- pide confirmacion explicita
+- ejecuta el upgrade llamando a Identity via `ilk_register`
+- limpia el estado del hilo cuando el upgrade termina
 
----
+No debe:
 
-## 2) Inputs: cuándo recibe trabajo
+- escribir directamente en la identity DB
+- inventar tenants o ILKs
+- actuar como catch-all general del sistema
 
-### 2.1 Condición de entrada
+## 4. Inputs esperados
 
-✅ **NORMATIVO**:
-- El mensaje entrante debe incluir:
-  - `src_ilk` en `meta.src_ilk` (siempre presente; puede ser ILK temporal),
-  - `thread_id` (asignado por IO; ubicación tentantiva en top-level),
-  - payload `text/v1` con `content` y/o `attachments`.
+El mensaje entrante debe incluir:
 
-Nota de transición:
-- el repo ya no usa `meta.context.src_ilk` como fallback runtime; el carrier canónico es `meta.src_ilk`.
+- `meta.src_ilk`
+- `thread_id`
+- payload `text/v1` con `content` y/o `attachments`
 
-✅ **NORMATIVO**:
-- `AI.frontdesk.gov` asume que la derivación a frontdesk se hace por policy/core cuando el `src_ilk` está en estado `temporary` o equivalente.
+El carrier canonico para `src_ilk` es `meta.src_ilk`.
 
-🧩 **A ESPECIFICAR (core)**:
-- Señal canónica exacta de “identidad incompleta” (campo/flag) para routing a frontdesk.
+## 5. Estado por hilo
 
-### 2.2 Metadata esperada de IO
+Mantiene un JSON por `src_ilk` usando `thread_state_*`.
 
-✅ **NORMATIVO (mínimo)**:
-- `thread_id`: identifica conversación/canal/hilo.
-- `io_context` (dentro del carrier actual): suficiente para responder por el mismo canal.
+Store minimo:
 
----
+- `thread_state_get`
+- `thread_state_put`
+- `thread_state_delete`
 
-## 3) Estado por hilo (LanceDB)
+La clave efectiva de estado queda asociada al `src_ilk`.
 
-✅ **NORMATIVO (MVP)**:
-- El nodo mantiene **1 JSON** por `src_ilk` (estructura libre por prompting/policy).
-- Tools mínimas (SDK/runtime):
-  - `thread_state_get(state_key)`
-  - `thread_state_put(state_key, data, ttl_seconds?)`
-  - `thread_state_delete(state_key)`
+## 6. Flujo conversacional
 
-Nota de compatibilidad:
-- En runtime scoped, la clave efectiva de estado queda fijada al `src_ilk` actual.
-- El alias legacy `thread_id` ya no forma parte del contrato aceptado por las tools.
+Flujo base:
 
-### 3.1 Estructura recomendada (no normativa)
+1. leer `thread_state`
+2. extraer y mergear datos nuevos
+3. persistir cambios
+4. pedir solo faltantes
+5. cuando ya estan todos los datos, resumir y pedir confirmacion
+6. ante confirmacion positiva, llamar `ilk_register` en ese mismo turno
+7. responder exito o error final y cortar el loop
 
-Ejemplo típico:
+Reglas de producto vigentes:
 
-```json
-{
-  "status": "waiting_information",
-  "requested_fields": ["name", "email", "phone"],
-  "collected": {
-    "name": null,
-    "email": null,
-    "phone": "+541112345678"
-  },
-  "tenant_hint": {
-    "domain": "example.com",
-    "tenant_code": null
-  },
-  "last_question": "¿Me confirmás tu email?"
-}
-```
+- no volver a pedir campos ya presentes en `thread_state` salvo correccion explicita
+- no volver a pedir confirmacion si el estado ya es `awaiting_confirmation` y la respuesta es positiva
 
-### 3.2 Lifecycle del estado
+## 7. Accion de completacion
 
-✅ **NORMATIVO**:
-- El nodo actualiza el JSON en cada turno relevante.
-- El nodo **borra inmediatamente** el estado (`thread_state_delete`) cuando:
-  - la identidad se completa exitosamente, o
-  - el thread se cierra por policy externa (🧩).
+El nodo usa la tool `ilk_register`.
 
----
+Payload minimo esperado:
 
-## 4) Datos mínimos a recolectar
-
-✅ **NORMATIVO (alineación core)**:
-- Mínimo para completar identidad (según docs core):
+- `src_ilk`
+- `thread_id`
+- `identity_candidate`
   - `name`
   - `email`
-  - y asociación a tenant (por dominio/código/solicitud).
+  - `phone` si aplica
+  - `tenant_hint`
 
-🧩 **A ESPECIFICAR (core)**:
-- Reglas exactas de “tenant association” (dominio, catálogo, approval, etc.).
+Resultado esperado:
 
----
+- exito: el mismo `src_ilk` pasa a identidad completa
+- error: devuelve razon canonica y el nodo responde error final
 
-## 5) Flujo conversacional (v1)
+## 8. Data plane
 
-### 5.1 High-level state machine
+El nodo responde por el mismo canal de entrada usando la metadata de IO.
 
-✅ **NORMATIVO**:
-1) **Detectar faltantes**: leer `thread_state` y/o extraer datos del mensaje actual.
-2) **Pedir faltantes**: solicitar al usuario la información mínima que falta.
-3) **Confirmación**: cuando el nodo cree tener lo mínimo, debe:
-   - resumir los datos,
-   - pedir confirmación explícita (“¿Confirmás que es correcto?”).
-4) **Solicitar upgrade**: con confirmación positiva, disparar request al core (§6).
-5) **Responder resultado**:
-   - éxito: informar + limpiar estado,
-   - error: informar y volver a pedir/reintentar según corresponda.
+Para mensajes normales:
 
-### 5.2 Reintentos
+- `text/v1`
 
-✅ **NORMATIVO**:
-- Si no se obtienen mínimos tras N intentos, **por ahora no hay cutoff**: el nodo sigue pidiendo lo faltante.
+Para errores:
 
----
+- `payload.type="error"` si el consumer lo soporta
+- o texto de fallback controlado
 
-## 6) Accion de completacion de identidad (MVP vigente)
+## 9. Configuracion y operacion
 
-✅ **NORMATIVO (MVP)**:
-- El nodo usa la tool `ilk_register` (solo disponible en `mode=gov`).
-- `ilk_register` invoca `ILK_REGISTER` via Identity (`identity_system_call_ok`).
+Estado vigente:
 
-✅ **NORMATIVO (payload mínimo esperado)**:
-- `src_ilk` (el ILK a completar)
-- `thread_id` (para trazabilidad)
-- `identity_candidate`:
-  - `name`
-  - `email`
-  - `phone` (si aplica)
-  - `tenant_hint` (dominio/código/solicitud)
+- `SY.frontdesk.gov` usa hoy el runner compartido que expone `CONFIG_GET` / `CONFIG_SET`
+- el prompt funcional base pertenece al runtime `SY.frontdesk.gov`
+- si `behavior.instructions` falta, el runtime usa un prompt base embebido
+- si corre como servicio del sistema sin YAML de nodo, bootstrappea su `node_name` desde `hive.yaml` como `SY.frontdesk.gov@<hive_id>`
+- la key de provider entra temporalmente por `CONFIG_SET` y luego se persiste en `secrets.json`
 
-✅ **NORMATIVO (resultado)**:
-- Éxito: el core devuelve identidad “complete” asociada al mismo `src_ilk` (no cambia el ILK).
-- Fallo: error con razón (email ya en uso, tenant inválido, etc.).
+Esto es una solucion operativa transitoria.
+La decision final sobre surface de secretos y bootstrap queda pendiente de `CORE`.
 
-Variables de entorno por instancia recomendadas:
-- `AI_NODE_MODE=gov`
-- `GOV_IDENTITY_TARGET` (default `SY.identity`)
-- `GOV_IDENTITY_FALLBACK_TARGET` (opcional)
-- `GOV_IDENTITY_TIMEOUT_MS` (default 10000)
+## 10. Defaults actuales
 
----
+- `multimodal=false` por default, salvo override explicito
+- secret canonico:
+  - `config.secrets.openai.api_key`
+- provider base:
+  - OpenAI
 
-## 7) Respuestas hacia IO (Data Plane)
+## 11. Integracion con core
 
-✅ **NORMATIVO**:
-- El nodo responde siempre por el mismo canal, usando el routing/metadata que provee IO.
-- Para mensajes normales: `text/v1`.
-- Para errores de contenido: `payload.type="error"` (ErrorV1Payload AI Nodes), si el consumer lo soporta; fallback texto prefijado permitido.
+`SY.frontdesk.gov` depende de estas aristas de core:
 
----
+- `government.identity_frontdesk` en `hive.yaml`
+- routing por `registration_status=temporary`
+- autorizacion en `SY.identity` para:
+  - `ILK_REGISTER`
+  - `ILK_ADD_CHANNEL`
+  - `TNT_CREATE`
 
-## 8) Configuración y operación (como AI Node system-default)
+## 12. Observabilidad minima
 
-✅ **NORMATIVO**:
-- El nodo usa el lifecycle estándar de AI Nodes:
-  - config efectiva en `${STATE_DIR}/ai-nodes/AI.frontdesk.gov.json` (nombre calificado por hive a nivel sistema).
-  - hot updates por Control Plane (`CONFIG_SET/GET` unicast).
-  - defaults materializados en el JSON efectivo.
+Debe exponer:
 
-🧩 **A ESPECIFICAR (core)**:
-- Referencia exacta en `hive.yaml`:
-  - `government.identity_frontdesk` debería apuntar a `AI.frontdesk.gov@<hive_id>`.
-
----
-
-## 9) Observabilidad mínima
-
-✅ **NORMATIVO**: `STATUS` debe reportar:
-- `state`: `UNCONFIGURED/CONFIGURED/FAILED_CONFIG`
-- counters sugeridos:
+- `state`: `UNCONFIGURED|CONFIGURED|FAILED_CONFIG`
+- contadores sugeridos:
   - `threads_active`
   - `identity_upgrades_ok`
   - `identity_upgrades_error`
-- última acción relevante (timestamp)
 
----
+## 13. Pendientes de core
 
-## 10) Seguridad y guardrails
-
-✅ **NORMATIVO**:
-- No loggear datos sensibles en claro (email/teléfono) salvo modo debug controlado.
-- No exfiltrar secretos del sistema.
-- Toda acción de upgrade debe pasar por control-plane autorizado (OPA/policy).
+- definir bootstrap/secret model final para un nodo `SY` con configuracion AI
+- confirmar si `CONFIG_SET` sigue siendo surface temporal o definitivo
+- cerrar naming/config canonica en `hive.yaml`

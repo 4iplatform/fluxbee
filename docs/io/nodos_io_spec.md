@@ -94,8 +94,10 @@ Según la especificación del Router v1.16:
 
 - `meta.ctx` representa el **Contexto Conversacional (CTX)**
 - `meta.context` se reserva exclusivamente para **datos adicionales evaluados por OPA**
+- `meta.thread_id` es el carrier canónico de thread (cognition v2)
 
 `meta.context` **NO** debe usarse para almacenar historia, turns ni contexto conversacional.
+`meta.context.thread_id` está deprecado/removido en IO y no debe emitirse.
 
 
 ## Adaptación temporal (spec canónica vs core actual)
@@ -188,6 +190,18 @@ Según la especificación del Router v1.16:
 
 🧩 **A ESPECIFICAR (futuro)**:
 - `*_key_ref` (env/file/vault/kms) + gestor de secretos (orchestrator/admin o servicio dedicado) para rotación/persistencia segura.
+
+### 6) Regla de adopcion para futuros adapters IO
+
+✅ **NORMATIVO**:
+- Si un adapter `IO.*` produce mensajes de usuario textuales hacia router, **MUST** usar el contrato canonico `text/v1`.
+- Esos mensajes **MUST** salir por `fluxbee_sdk::NodeSender::send`.
+- El adapter **MUST NOT** reimplementar localmente la decision `content` vs `content_ref` para `text/v1`.
+
+✅ **ACLARACION**:
+- El auto-offload actual del SDK cubre el contrato `text/v1`.
+- No debe asumirse automaticamente para payloads arbitrarios fuera de ese contrato.
+- Si un adapter necesita otro payload no `text/v1`, ese contrato debe definir explicitamente como resuelve limites de tamano y blobs.
 
 
 

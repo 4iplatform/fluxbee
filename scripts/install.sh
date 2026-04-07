@@ -39,9 +39,8 @@ if [[ "${SKIP_BUILD:-}" != "1" ]]; then
   if [[ "${SKIP_BUILD:-}" != "1" ]]; then
     echo "Building Rust binaries..."
     cargo build --release --bins
-    echo "Building ai-frontdesk-gov core binary..."
-    cargo build --release -p ai-frontdesk-gov --bin ai_node_runner
-    cp "$BIN_DIR/ai_node_runner" "$BIN_DIR/ai-frontdesk-gov"
+    echo "Building sy-frontdesk-gov core binary..."
+    cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
   fi
 fi
 
@@ -118,7 +117,7 @@ sy_orch_bin="$(pick_bin sy_orchestrator)" || { echo "Missing binary: $BIN_DIR/sy
 sy_storage_bin="$(pick_bin sy_storage)" || { echo "Missing binary: $BIN_DIR/sy_storage" >&2; missing=1; }
 sy_identity_bin="$(pick_bin sy_identity)" || { echo "Missing binary: $BIN_DIR/sy_identity" >&2; missing=1; }
 sy_cognition_bin="$(pick_bin sy_cognition)" || { echo "Missing binary: $BIN_DIR/sy_cognition" >&2; missing=1; }
-ai_frontdesk_gov_bin="$(pick_bin ai-frontdesk-gov)" || { echo "Missing binary: $BIN_DIR/ai-frontdesk-gov" >&2; missing=1; }
+sy_frontdesk_gov_bin="$(pick_bin sy-frontdesk-gov)" || { echo "Missing binary: $BIN_DIR/sy-frontdesk-gov" >&2; missing=1; }
 sy_opa_rules_bin=""
 if [[ -f "$ROOT_DIR/sy-opa-rules/sy-opa-rules" ]]; then
   sy_opa_rules_bin="$ROOT_DIR/sy-opa-rules/sy-opa-rules"
@@ -144,7 +143,7 @@ sudo install -m 0755 "$sy_storage_bin" /usr/bin/sy-storage
 sudo install -m 0755 "$sy_identity_bin" /usr/bin/sy-identity
 sudo install -m 0755 "$sy_cognition_bin" /usr/bin/sy-cognition
 sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
-sudo install -m 0755 "$ai_frontdesk_gov_bin" /usr/bin/ai-frontdesk-gov
+sudo install -m 0755 "$sy_frontdesk_gov_bin" /usr/bin/sy-frontdesk-gov
 
 echo "Updating core source repo in $STATE_DIR/dist/core/bin..."
 sudo install -m 0755 "$json_router_bin" "$STATE_DIR/dist/core/bin/rt-gateway"
@@ -156,7 +155,7 @@ sudo install -m 0755 "$sy_storage_bin" "$STATE_DIR/dist/core/bin/sy-storage"
 sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/dist/core/bin/sy-identity"
 sudo install -m 0755 "$sy_cognition_bin" "$STATE_DIR/dist/core/bin/sy-cognition"
 sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/dist/core/bin/sy-opa-rules"
-sudo install -m 0755 "$ai_frontdesk_gov_bin" "$STATE_DIR/dist/core/bin/ai-frontdesk-gov"
+sudo install -m 0755 "$sy_frontdesk_gov_bin" "$STATE_DIR/dist/core/bin/sy-frontdesk-gov"
 
 rt_gateway_sha="$(sha256sum "$STATE_DIR/dist/core/bin/rt-gateway" | awk '{print $1}')"
 rt_gateway_size="$(stat -c %s "$STATE_DIR/dist/core/bin/rt-gateway")"
@@ -174,8 +173,8 @@ sy_storage_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-storage" | awk '{print 
 sy_storage_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-storage")"
 sy_cognition_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-cognition" | awk '{print $1}')"
 sy_cognition_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-cognition")"
-ai_frontdesk_gov_sha="$(sha256sum "$STATE_DIR/dist/core/bin/ai-frontdesk-gov" | awk '{print $1}')"
-ai_frontdesk_gov_size="$(stat -c %s "$STATE_DIR/dist/core/bin/ai-frontdesk-gov")"
+sy_frontdesk_gov_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-frontdesk-gov" | awk '{print $1}')"
+sy_frontdesk_gov_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-frontdesk-gov")"
 core_version="${FLUXBEE_CORE_VERSION:-dev}"
 if [[ -n "${FLUXBEE_CORE_BUILD_ID:-}" ]]; then
   core_build_id="$FLUXBEE_CORE_BUILD_ID"
@@ -202,7 +201,7 @@ cat >"$core_manifest_tmp" <<EOF
     "sy-orchestrator": {"service": "sy-orchestrator", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_orch_sha", "size": $sy_orch_size},
     "sy-storage": {"service": "sy-storage", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_storage_sha", "size": $sy_storage_size},
     "sy-cognition": {"service": "sy-cognition", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_cognition_sha", "size": $sy_cognition_size},
-    "ai-frontdesk-gov": {"service": "ai-frontdesk-gov", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$ai_frontdesk_gov_sha", "size": $ai_frontdesk_gov_size}
+    "sy-frontdesk-gov": {"service": "sy-frontdesk-gov", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_frontdesk_gov_sha", "size": $sy_frontdesk_gov_size}
   }
 }
 EOF
@@ -252,7 +251,7 @@ verify_core_component "sy-identity" "$sy_identity_sha" "$sy_identity_size"
 verify_core_component "sy-orchestrator" "$sy_orch_sha" "$sy_orch_size"
 verify_core_component "sy-storage" "$sy_storage_sha" "$sy_storage_size"
 verify_core_component "sy-cognition" "$sy_cognition_sha" "$sy_cognition_size"
-verify_core_component "ai-frontdesk-gov" "$ai_frontdesk_gov_sha" "$ai_frontdesk_gov_size"
+verify_core_component "sy-frontdesk-gov" "$sy_frontdesk_gov_sha" "$sy_frontdesk_gov_size"
 echo "Core binaries verification passed."
 
 seeded_syncthing_vendor=0
@@ -420,7 +419,7 @@ install_unit "sy-orchestrator" "/usr/bin/sy-orchestrator"
 install_unit "sy-storage" "/usr/bin/sy-storage"
 install_unit "sy-identity" "/usr/bin/sy-identity"
 install_unit "sy-cognition" "/usr/bin/sy-cognition"
-install_unit "ai-frontdesk-gov" "/usr/bin/ai-frontdesk-gov"
+install_unit "sy-frontdesk-gov" "/usr/bin/sy-frontdesk-gov"
 sudo systemctl daemon-reload
 
 if [[ "$RESTART_ORCHESTRATOR_AFTER_INSTALL" == "1" ]]; then
@@ -445,12 +444,12 @@ if sudo systemctl list-unit-files sy-architect.service >/dev/null 2>&1; then
   fi
 fi
 
-if sudo systemctl list-unit-files ai-frontdesk-gov.service >/dev/null 2>&1; then
-  if sudo systemctl is-active --quiet ai-frontdesk-gov; then
-    echo "Restarting ai-frontdesk-gov to apply new binary..."
-    sudo systemctl restart ai-frontdesk-gov
+if sudo systemctl list-unit-files sy-frontdesk-gov.service >/dev/null 2>&1; then
+  if sudo systemctl is-active --quiet sy-frontdesk-gov; then
+    echo "Restarting sy-frontdesk-gov to apply new binary..."
+    sudo systemctl restart sy-frontdesk-gov
   else
-    echo "ai-frontdesk-gov is not active; skipping restart."
+    echo "sy-frontdesk-gov is not active; skipping restart."
   fi
 fi
 

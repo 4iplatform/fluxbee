@@ -1,4 +1,4 @@
-﻿# AI Nodes Specification — Consolidated Draft Replacement (v1)
+# AI Nodes Specification — Consolidated Draft Replacement (v1)
 
 > ✅ Este documento consolida las Partes 1–5 en una única especificación “reemplazo” para **AI Nodes** en Fluxbee.  
 > Alcance: **AI Nodes** (Control Plane + Data Plane + Behaviors/Providers + Schema/Validation + Operación).  
@@ -458,6 +458,15 @@ Códigos recomendados (no exhaustivo):
 - Salida `text/v1` con offload automático a `content_ref` cuando excede límite inline.
 - Adjuntos de salida generados por behavior quedan para fase posterior (cuando behaviors produzcan artefactos).
 
+✅ **ACLARACION DE IMPLEMENTACION ACTUAL**:
+- El contrato de salida ya contempla `payload.attachments[]`.
+- `IO.slack` ya sabe publicar `attachments[]` en Slack cuando recibe `BlobRef` salientes.
+- Pero los runners `AI.*` actuales no exponen todavia un flujo funcional general para que un behavior genere artefactos de salida y los devuelva como adjuntos al usuario final.
+- En la implementacion actual, la respuesta normal del runner es texto `text/v1`:
+  - inline si entra
+  - o `content_ref` si excede limite
+- Casos tipo "te genero un PDF/XLSX/imagen y te lo adjunto" no deben considerarse cerrados hoy en `AI.*`.
+
 ---
 
 ## Convenciones de estado del documento
@@ -490,7 +499,7 @@ Códigos recomendados (no exhaustivo):
 
 ✅ **NORMATIVO (alineación core)**:
 - Los mensajes `user` deben incluir `src_ilk` como ILK **siempre presente**.
-- `src_ilk` puede estar en estado **temporary** (identidad incompleta). En ese caso, nodos como `AI.frontdesk.gov` actúan para completar/actualizar la identidad a través del pipeline de sistema (no “inventan” identity).
+- `src_ilk` puede estar en estado **temporary** (identidad incompleta). En ese caso, nodos como `SY.frontdesk.gov` actúan para completar/actualizar la identidad a través del pipeline de sistema (no “inventan” identity).
 
 > Nota: los detalles del provisioning/upgrade viven en core (SY.admin/SY.orchestrator/SY.identity); el nodo AI solo consume `src_ilk`.
 
@@ -560,8 +569,9 @@ Estructura:
 
 ✅ **NORMATIVO (baseline v1)**:
 - `text/plain` / `text/markdown` / `application/json`: hasta 10MB por blob (límite operativo vigente del SDK AI).
-- `application/pdf`: rechazado por default (`unsupported_attachment_mime`) hasta definir extractor dedicado.
+- `application/pdf`: permitido solo cuando `multimodal=true`, mediante `input_file.file_data` (`data:<mime>;base64,...`) + `filename`.
 - imágenes (`image/png`, `image/jpeg`, `image/webp`): permitidas solo cuando `multimodal=true`.
+- otros binarios no imagen: permitidos solo cuando `multimodal=true`, mediante `input_file.file_data` (`data:<mime>;base64,...`) + `filename`.
 - `image/gif`: rechazado por default en baseline v1 (puede revisarse en una fase posterior).
 
 ---
@@ -583,19 +593,19 @@ Estructura:
 
 1) **Adjuntos textuales** (`mime` in `{"text/plain","text/markdown","application/json"}`):
    - **MUST** leerse y agregarse al input como “contexto adjunto” con separador estable.
-2) **Adjuntos no textuales** (PDF, imágenes, audio, etc.):
+2) **Adjuntos no textuales** (PDF, imágenes, audio, office docs, binarios, etc.):
    - Se rigen por capacidades del behavior/provider:
      - si `multimodal=true`: pasar el blob según adapter del provider,
      - si `multimodal=false`: comportamiento normado en 4.3.
 
-### 4.3 PDFs cuando `multimodal=false`
+### 4.3 Adjuntos no textuales cuando `multimodal=false`
 
 ✅ **NORMATIVO (decisión cerrada)**:
-- Si `multimodal=false` y el nodo recibe un attachment con `mime="application/pdf"`:
-  - **MUST** responder `unsupported_attachment_mime` (rechazar PDF).
+- Si `multimodal=false` y el nodo recibe un attachment no textual (por ejemplo `application/pdf`, imágenes, audio, office docs u otros binarios):
+  - **MUST** responder `unsupported_attachment_mime`.
 
 🧩 **A ESPECIFICAR / IMPLEMENTAR SI SURGE NECESIDAD (futuro)**:
-- Alternativas posibles si se decide soportar PDFs en modo no multimodal:
+- Alternativas posibles si se decide soportar adjuntos no textuales en modo no multimodal:
   - **Opción B**: permitir `extract_text` si existe extractor instalado y el behavior lo habilita; si no, error.
   - **Opción C**: intentar extracción siempre (dependencia obligatoria; mayor costo y riesgos).
 
@@ -644,6 +654,11 @@ Estructura:
 - Si el nodo genera artefactos (PDF/imagen/etc.), debe:
   1) escribirlos al blob storage (staging → promover a active) según Blob Annex,
   2) devolver `BlobRef` en `payload.attachments`.
+
+⚠️ **ESTADO DE IMPLEMENTACION ACTUAL**:
+- Este contrato existe, pero los runners `AI.*` actuales no lo usan todavia como camino general de salida.
+- Hoy el comportamiento implementado y validado es respuesta textual (`content` / `content_ref`).
+- La generacion de artefactos salientes (por ejemplo PDF/XLSX/imagen) y su devolucion como `attachments[]` queda pendiente de implementacion especifica del behavior/runtime.
 
 ### 5.2 Routing de respuesta (anti-loop)
 
@@ -887,7 +902,7 @@ Estructura:
 
 ✅ **NORMATIVO**:
 - `AI.common`: `capabilities.multimodal=true` por default.
-- `AI.frontdesk.gov`: `capabilities.multimodal=false` por default (temporal, revisable).
+- `SY.frontdesk.gov`: `capabilities.multimodal=false` por default (temporal, revisable).
 - Ambos runtimes permiten override explícito vía config (`behavior.capabilities.multimodal`).
 
 ✅ **NORMATIVO**:
@@ -896,19 +911,48 @@ Estructura:
 ⚠️ **Estado de implementación (2026-04-01)**:
 - El camino de adjuntos en AI está avanzado, pero todavía no está cerrado end-to-end para todos los tipos.
 - Referencia operativa y comparativa contra Agents SDK: `docs/onworking NOE/ai_attachments_status.md`.
-- Pendientes principales: flujo `input_file` (PDF) y render de `payload.type="error"` en `IO.slack`.
+- Pendientes principales: compatibilidad real de provider para PDF/`input_file`, batería E2E por tipo y render de `payload.type="error"` en `IO.slack`.
 
 ✅ **NORMATIVO**:
 - El behavior declara `capabilities.multimodal = true|false`.
 - Si `multimodal=false`:
-  - adjuntos no textuales → error `unsupported_attachment_mime` (y PDFs se rechazan por ahora; ver Parte 2).
+  - adjuntos no textuales → error `unsupported_attachment_mime` (ver Parte 2).
 - Si `multimodal=true`:
   - el provider adapter envía adjuntos siguiendo el esquema OpenAI vigente para inputs multimodales.
+  - imágenes soportadas → `input_image.image_url` (`data:image/...;base64,...`)
+  - adjuntos no imagen → `input_file.file_data` (`data:<mime>;base64,...`) + `filename`
 
 ✅ **NORMATIVO (matriz inicial MIME×modo)**:
 - `text/plain`, `text/markdown`, `application/json`: permitido en ambos modos (se incorporan al contexto textual).
 - `image/png`, `image/jpeg`, `image/webp`: permitido solo con `multimodal=true`.
-- `application/pdf`, `image/gif` y resto no textual: `unsupported_attachment_mime` en baseline v1.
+- `application/pdf`: permitido solo con `multimodal=true` por `input_file.file_data`, sujeto a compatibilidad del provider/modelo.
+- otros binarios no imagen: permitidos solo con `multimodal=true` por `input_file.file_data`, sujeto a política/límites vigentes del SDK AI.
+- `image/gif`: `unsupported_attachment_mime` en baseline v1.
+
+✅ **NORMATIVO (alcance actual vs TBD)**:
+- Implementado hoy:
+  - `input_text`
+  - `input_image.image_url`
+  - `input_image.detail`
+  - `input_file.file_data`
+  - `input_file.filename`
+- Diferido por contrato/core:
+  - `input_image.file_id`
+  - `input_file.file_id`
+  - `input_file.file_url`
+- TBD operativo:
+  - compatibilidad estable de PDF en todos los modelos/providers soportados
+  - política final de selección entre `file_data` / `file_id` / `file_url`
+
+✅ **ACLARACION DE ALCANCE POR TIPO DE ARCHIVO**:
+- En el Agents SDK local tomado como referencia, `input_file` existe como modo canonico y expone `file_data`, `file_url` y `file_id`.
+- En este repo no hay una lista exhaustiva y cerrada de MIME "validos por Agents SDK" para `file_data`; el SDK modela el modo, no una matriz completa de tipos probados.
+- Por lo tanto, en `AI.*` no debe afirmarse "soporta todos los tipos validos del Agents SDK" solo por implementar `input_file.file_data`.
+- Lo correcto es afirmar:
+  - `AI.*` implementa el modo `input_file.file_data` para adjuntos no imagen que lleguen como `BlobRef`
+  - la evidencia E2E asentada hoy cubre imagen, PDF y `xlsx`
+  - siguen faltando pruebas por familias adicionales de archivos, por ejemplo `docx`, audio y otros binarios relevantes
+- Los modos `file_id` y `file_url` siguen diferidos por contrato/Core.
 
 ---
 
@@ -1136,7 +1180,7 @@ secrets:
 - `behavior.params.*` (temperature/top_p/max_output_tokens/timeouts) es **opcional** salvo los requeridos condicionales.
 - `capabilities.*` es opcional:
   - en `AI.common`: `multimodal=true` por default,
-  - en `AI.frontdesk.gov`: `multimodal=false` por default.
+  - en `SY.frontdesk.gov`: `multimodal=false` por default.
 
 > Nota: materializar defaults evita “config implícita” y facilita operación y debugging.
 
@@ -1542,7 +1586,7 @@ Installs:
 
 Per-instance runtime profile:
 - `AI.common`: tools/behavior de AI común (sin identidad gov).
-- `AI.frontdesk.gov`: tools/behavior de frontdesk gov (incluye identidad, por ejemplo `ilk_register`).
+- `SY.frontdesk.gov`: tools/behavior de frontdesk gov (incluye identidad, por ejemplo `ilk_register`).
 - no se usa `AI_NODE_MODE` para seleccionar capacidades del runtime.
 
 Manage instances with `ai-nodectl`:

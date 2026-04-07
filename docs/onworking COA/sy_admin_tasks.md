@@ -60,7 +60,7 @@ Lista de tareas cerradas para alinear `SY.admin` con la especificacion actual y 
 Motivación:
 - Hoy `SY.admin` permite instalar software indirectamente vía `fluxbee-publish`, y permite operar instancias vía `/hives/{id}/nodes`.
 - Falta el complemento REST para remover artifacts de runtime publicados en `dist`/manifest sin tocar el CLI ni editar archivos manualmente.
-- La operación canónica debería vivir en `SY.admin` y pasar por el mismo modelo HTTP + gateway interno que el resto de las acciones administrativas.
+- La operación canónica deberí­a vivir en `SY.admin` y pasar por el mismo modelo HTTP + gateway interno que el resto de las acciones administrativas.
 
 Alcance propuesto:
 - administrar artifacts publicados (manifest + `dist`)
@@ -79,9 +79,9 @@ Contrato operativo cerrado:
 - criterio de dependencia:
   - un runtime base no puede borrarse si existen runtimes publicados `config_only` o `workflow` cuyo `runtime_base` lo referencia
   - este check sale del manifest/`GET /versions`, no del inventario de nodos
-- política de current:
+- polí­tica de current:
   - no se permite borrar la versión `current`
-  - no hay fallback automático ni promote implícito
+  - no hay fallback automático ni promote implí­cito
 - atomicidad:
   - el delete es atómico en `motherbee`
   - luego la remoción converge al resto de hives por replicación
@@ -110,13 +110,13 @@ Fuera de alcance en v1:
 - [ ] `DELETE /hives/{hive}/runtimes/{runtime}`
   - removido del alcance inicial
   - choca con la regla `no current delete`
-  - si se necesita más adelante, requerirá contrato explícito de deprecación/desasignación de `current`
+  - si se necesita más adelante, requerirá contrato explí­cito de deprecación/desasignación de `current`
 
 Decisiones de contrato resueltas:
 - [x] ownership real:
   - sólo `motherbee` modifica manifest/dist
   - `hive` en el endpoint se interpreta como contexto operativo/consulta, no como owner alternativo de artifacts
-- [x] política de seguridad:
+- [x] polí­tica de seguridad:
   - rechazar delete si existe algún nodo `RUNNING` usando ese runtime/version
   - rechazar delete de runtime base si hay `config_only`/`workflow` dependientes publicados
   - rechazar delete de `current`
@@ -213,8 +213,8 @@ Ejes:
 
 | Caso | Estado actual | Qué ya está resuelto | Qué sigue abierto |
 |------|---------------|----------------------|-------------------|
-| `CORE + singleton` | **Mayormente resuelto** | bootstrap escribe units persistentes en `/etc/systemd/system`, hace `daemon-reload`, habilita y arranca bootstrap units; `SYSTEM_UPDATE` cubre rollout core | terminar de dejar explícita la semántica completa de lifecycle REST para core cuando corresponda |
-| `CORE + instanciado` | **Resuelto para v1 con excepción explícita** | `run_node` rechaza `SY.*` y `RT.gateway`; `RT.<otro>` se permite como runtime gestionado publicado | revisar sólo si en el futuro se quiere modelar más core por este camino |
+| `CORE + singleton` | **Mayormente resuelto** | bootstrap escribe units persistentes en `/etc/systemd/system`, hace `daemon-reload`, habilita y arranca bootstrap units; `SYSTEM_UPDATE` cubre rollout core | terminar de dejar explí­cita la semántica completa de lifecycle REST para core cuando corresponda |
+| `CORE + instanciado` | **Resuelto para v1 con excepción explí­cita** | `run_node` rechaza `SY.*` y `RT.gateway`; `RT.<otro>` se permite como runtime gestionado publicado | revisar sólo si en el futuro se quiere modelar más core por este camino |
 | `CUSTOM + singleton` | **Mayormente resuelto** | package `full_runtime/config_only/workflow`, publish/install, `--deploy`, readiness, spawn, config persistida, inventario de instancias, `remove` real de instancia, reboot/reconcile validado E2E | cleanup documental y decisión separada sobre `CORE + instanciado` |
 | `CUSTOM + instanciado` | **Mayormente resuelto** | runtime único con múltiples `node_name`, `config.json` por instancia, `_system` inyectado, `kill_node/get_node_*` por nombre, inventario persistente, remove real, reboot/reconcile validado E2E | cleanup documental y reglas finas si aparece algún caso borde |
 
@@ -248,11 +248,11 @@ Ejes:
   - ejemplo: `ai.test.gov.reboot.1773959170@1.0.0-rebootreconcile-1773959170-5980`
   - ownership: `motherbee`
   - converge por Syncthing
-  - no implica por sí mismo un proceso corriendo
+  - no implica por sí­ mismo un proceso corriendo
 
 - `instancia gestionada persistida`
   - entidad local del hive representada por `config.json` bajo `/var/lib/fluxbee/nodes/<KIND>/<node_name@hive>/`
-  - ejemplo: `/var/lib/fluxbee/nodes/AI/AI.frontdesk.gov@motherbee/config.json`
+  - ejemplo: `/var/lib/fluxbee/nodes/SY/SY.frontdesk.gov@motherbee/config.json`
   - visible en `GET /hives/{hive}/nodes`
   - puede existir aunque el proceso esté parado
   - ownership: orchestrator local del hive
@@ -261,7 +261,7 @@ Ejes:
   - ejecución actual del nodo, observable por systemd + router/LSA
   - se expresa como `RUNNING/STARTING/STOPPED/FAILED` y `visible_in_router`
   - puede caer y volver sin que desaparezca la instancia persistida
-  - no es equivalente a “runtime publicado” ni a “instancia existente”
+  - no es equivalente a â€œruntime publicadoâ€ ni a â€œinstancia existenteâ€
 
 Contrato operativo resumido:
 - publicar/instalar runtime crea catálogo en `dist`
@@ -271,7 +271,7 @@ Contrato operativo resumido:
 - reboot/reconcile parte de la instancia persistida, no del proceso ni del catálogo solo
 
 Nota adicional:
-- el prefijo funcional del nodo (`AI.*`, `IO.*`, `WF.*`, `SY.*`, `RT.*`) no equivale por sí mismo a la clasificación de lifecycle (`core` vs runtime gestionado)
+- el prefijo funcional del nodo (`AI.*`, `IO.*`, `WF.*`, `SY.*`, `RT.*`) no equivale por sí­ mismo a la clasificación de lifecycle (`core` vs runtime gestionado)
 - para v1, el corte operativo es:
   - `SY.*` y `RT.gateway` fuera de spawn gestionado
   - `AI.*`, `IO.*`, `WF.*` y `RT.<otro>` permitidos como runtimes gestionados publicados
@@ -310,8 +310,8 @@ Revisión 2026-03-19:
   - modelo elegido: reconcile/autostart desde `SY.orchestrator` al arranque leyendo `/var/lib/fluxbee/nodes/**/config.json`
   - implementado:
     - scan de instancias persistidas
-    - salto explícito de `SY.*` y `RT.gateway`
-    - relaunch de instancias `CUSTOM` caídas si tienen `runtime` + `runtime_version` válidos, no están activas/visibles y `_system.relaunch_on_boot=true`
+    - salto explí­cito de `SY.*` y `RT.gateway`
+    - relaunch de instancias `CUSTOM` caí­das si tienen `runtime` + `runtime_version` válidos, no están activas/visibles y `_system.relaunch_on_boot=true`
   - contrato de bootstrap de nombre para runtimes gestionados:
     - `SY.orchestrator` debe pasar el nombre canónico de la instancia al proceso al momento del spawn/relaunch
     - forma elegida para v1: variable de entorno `FLUXBEE_NODE_NAME=<node_name@hive>`
@@ -322,7 +322,7 @@ Revisión 2026-03-19:
     - `FLUXBEE_NODE_NAME` es el dato de bootstrap para que el proceso llegue a esa persistencia al arrancar
     - el reconcile de reboot/autostart es opt-in por `_system.relaunch_on_boot=true`
   - rationale del contrato:
-    - evita duplicar dos referencias (`NODE_NAME` + `NODE_CONFIG`) que podrían divergir
+    - evita duplicar dos referencias (`NODE_NAME` + `NODE_CONFIG`) que podrí­an divergir
     - evita depender de parsing de argumentos en todos los `start.sh`
     - calza bien con `systemd-run --setenv=...`
     - mantiene el cambio concentrado en `SY.orchestrator`, no en cada runtime individual
@@ -339,7 +339,7 @@ Revisión 2026-03-19:
       - `fluxbee_sdk::managed_node_config_path(...)`
     - endurecer reglas finas de elegibilidad si aparece algún caso borde
 
-- [x] Agregar E2E específico de reboot semantics para workloads custom.
+- [x] Agregar E2E especí­fico de reboot semantics para workloads custom.
   - cubierto por `scripts/custom_node_reboot_reconcile_e2e.sh`
   - validado:
     - relaunch automático si corresponde
@@ -392,11 +392,11 @@ Revisión 2026-03-19:
 - [x] Hacer que fallo de broadcast/config sea error observable en API (no solo warning en logs).
   - Casos actuales a endurecer:
     - [x] cola de broadcast con `message dropped` (ahora responde `CONFIG_BROADCAST_FAILED`).
-    - [x] `broadcast after admin action failed` sin degradar respuesta HTTP (ahora degrada a error explícito).
+    - [x] `broadcast after admin action failed` sin degradar respuesta HTTP (ahora degrada a error explí­cito).
 
 ### P1 - Cobertura real de fanout OPA
-- [x] Resolver `expected_hives` con fuente de topología real (LSA/SHM) en lugar de depender solo de `authorized_hives`.
-- [x] Diferenciar en respuesta OPA: `pending_hives` esperadas por topología vs autorizadas por política.
+- [x] Resolver `expected_hives` con fuente de topologí­a real (LSA/SHM) en lugar de depender solo de `authorized_hives`.
+- [x] Diferenciar en respuesta OPA: `pending_hives` esperadas por topologí­a vs autorizadas por polí­tica.
 
 ### P1 - Homogeneidad de documentación
 - [x] Alinear en docs el path canónico del contador de versión OPA con el path real usado por código.
@@ -407,7 +407,7 @@ Revisión 2026-03-19:
 ### P2 - Hardening operativo (infra)
 - [x] Definir perfil seguro por default para `admin.listen` en despliegues productivos (bind local o detrás de proxy).
   - Implementado en `SY.admin`: default `127.0.0.1:8080` cuando no hay `admin.listen` ni `JSR_ADMIN_LISTEN`.
-- [x] Documentar política de exposición de API admin (red, proxy, ACL) para evitar despliegues abiertos por error.
+- [x] Documentar polí­tica de exposición de API admin (red, proxy, ACL) para evitar despliegues abiertos por error.
   - Sección nueva: `docs/07-operaciones.md` -> "2.6 Exposición del API Admin (perfil seguro)".
 
 ## Anexo - Checklist E2E (migrado)

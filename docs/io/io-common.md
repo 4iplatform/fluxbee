@@ -80,10 +80,26 @@ Los detalles específicos quedan en cada Nodo IO.
 - Cola/buffer **acotado** de mensajes "pendientes" (p.ej. esperando identidad) con timeouts.
 
 ### 2.1.1 Normalización `text/v1` + offload a blob (canónico IO)
-- `io-common` **DEBE** centralizar la normalización de payloads inbound `type="text"` en contrato `text/v1`.
-- Si el payload inline supera el límite configurado (`io.blob.max_message_bytes`, default 64KB), `io-common` **DEBE** convertir automáticamente a `content_ref` (blob).
+- El punto de enforcement de offload `text/v1` (inline -> `content_ref`) está en `fluxbee_sdk::NodeSender::send`.
+- `io-common` **DEBE** delegar esa decisión al SDK y **NO** duplicar lógica de offload por tamaño.
 - Los adapters IO **NO** deben reimplementar la decisión `content` vs `content_ref`; solo deben mapear evento externo -> payload base + adjuntos.
-- `io-common` **DEBE** mantener validaciones de límites/mime/adjuntos con errores canónicos (`invalid_text_payload`, `BLOB_*`, `unsupported_attachment_mime`, `too_many_attachments`).
+- Las validaciones comunes de `text/v1` (shape, límites, conteo, resolución de blobs) viven en `io-common`.
+- La policy efectiva de MIME aceptados debe ser definida por cada adapter IO según sus capacidades y el canal externo, y `io-common` debe aplicarla de forma uniforme.
+- Un default de `io-common` puede servir como baseline técnico, pero no debe reemplazar una decisión explícita del adapter cuando el canal soporta más o menos tipos.
+
+Regla operativa para MIME:
+- si Fluxbee puede transportar un attachment y el canal/adapter tiene capacidad razonable de aceptarlo, el adapter debería incluir ese MIME en su policy efectiva
+- si un MIME queda afuera, debe ser por limitación concreta del canal/adaptation o por decisión explícita documentada, no por un default implícito accidental
+
+Regla corta de adopcion para futuros `IO.*`:
+- si el adapter produce mensajes de usuario textuales hacia el router, debe usar el contrato canonico `text/v1`
+- esos mensajes deben enviarse al router por `fluxbee_sdk::NodeSender::send`
+- el adapter no debe reimplementar por su cuenta la decision `content` vs `content_ref`
+- si el adapter necesita otro tipo de payload que no sea `text/v1`, no hereda automaticamente el auto-offload y debe definirse explicitamente su contrato/tamano antes de asumir comportamiento equivalente
+
+Configuración operativa actual del enforcement en SDK:
+- La normalización en `NodeSender::send` usa defaults internos del SDK.
+- No depende de variables de entorno para decidir offload en esta etapa.
 
 Logging operativo (bajo ruido):
 - `debug`: decisión de normalización (`offload_to_blob`, bytes estimados, límite, adjuntos).
@@ -103,6 +119,25 @@ Validación recomendada:
 - Idempotencia outbound **por proceso** mediante claves internas en memoria (si se requiere).
 - Worker/dispatcher en memoria para procesar el outbox.
 - **Nota**: al no haber persistencia, tras restart puede perderse el outbox y, por ende, mensajes outbound que no hayan sido enviados todavía.
+
+### 2.2.2 Política de salida a canal externo (contenido grande)
+
+✅ **NORMATIVO (baseline IO):**
+- Los adapters IO **DEBEN** respetar límites del canal externo destino.
+- Los adapters IO **NO DEBEN** truncar contenido de forma silenciosa.
+- Frente a límite de canal, el adapter **DEBE** usar una estrategia explícita de entrega alternativa (por ejemplo archivo/adjunto/chunking), y dejar trazabilidad en logs/métricas.
+
+🧩 **TBD por canal:**
+- Cada canal define estrategia concreta de fallback para payloads largos:
+  - `text` directo,
+  - archivo/adjunto,
+  - chunking en múltiples mensajes,
+  - híbrido (resumen + adjunto).
+
+✅ **NORMATIVO UX (multilenguaje):**
+- No usar notices hardcodeados en un idioma fijo.
+- Si se envía mensaje de aviso por fallback, debe ser configurable/localizable por nodo.
+- Default recomendado cuando no hay localización: entregar contenido completo sin texto de aviso fijo.
 
 ### 2.2.1 Identity Resolution Client (SY.identity)
 
@@ -387,6 +422,8 @@ Pipeline normativo:
 3. si provision falla/timeout: forward degradado con `meta.src_ilk = null`
 
 `src_ilk` debe ir en `meta.src_ilk`; `meta.context` queda para metadata adicional (incluyendo `meta.context.io.*`).
+`thread_id` debe ir en `meta.thread_id` (carrier canónico v2).
+`meta.context.thread_id` fue removido del pipeline IO y no debe usarse.
 
 ---
 
@@ -401,6 +438,7 @@ Pipeline normativo:
 - `meta.ctx`: contexto conversacional
 - `meta.context`: metadata adicional (OPA + carrier temporal para campos no tipados)
 - IO metadata de canal bajo `meta.context.io.*`
+- `thread_id`: solo en `meta.thread_id` (no en `meta.context.thread_id`)
 
 ---
 

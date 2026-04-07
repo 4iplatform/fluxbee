@@ -154,6 +154,7 @@ Interpretación operativa:
 ### meta
 - `meta.type = "user"`
 - `meta.src_ilk`: ILK representando al usuario de Slack (humano externo) **o null**
+- `meta.thread_id`: thread canónico v2 para router/cognition
 - `meta.context.io`:
 ```json
 {
@@ -183,14 +184,68 @@ Interpretación operativa:
 }
 ```
 
-### 7.1 Regla de offload por tamaño (delegada a `io-common`)
+### 7.1 Regla de offload por tamaño (delegada a SDK `send`)
 - `IO.slack` construye payload `text/v1` base (`content` + `attachments` cuando corresponda).
-- La decisión de dejar inline o convertir a `content_ref` por límite de tamaño **la toma `io-common`** en el pipeline inbound compartido.
-- Configuración relevante:
-  - `io.blob.max_message_bytes` (default 64KB),
-  - `io.blob.message_overhead_bytes`,
-  - límites de adjuntos (`io.blob.max_attachments`, `io.blob.max_attachment_bytes`, `io.blob.max_total_attachment_bytes`).
+- La decisión de dejar inline o convertir a `content_ref` por límite de tamaño **la toma `fluxbee_sdk::NodeSender::send`**.
+- Configuración relevante del enforcement SDK:
+  - defaults internos del SDK (`max_message_bytes=64KB`, `message_overhead_bytes=2048`).
 - Objetivo: evitar divergencias entre adapters IO y mantener un comportamiento único para `text/v1`.
+
+Nota operativa:
+- `io.blob.*` en control-plane del nodo puede seguir siendo útil para validaciones/políticas del adapter, pero no gobierna por sí solo el auto-offload en `NodeSender::send`.
+
+### 7.1.b Estado actual de attachments inbound aceptados
+
+En el camino actual `IO.slack` -> `io-common` -> router, los adjuntos inbound solo se normalizan a `attachments[]` cuando su MIME entra en la allowlist vigente de `io-common`.
+
+Allowlist efectiva actual de `IO.slack`:
+
+- `image/jpeg`
+- `image/png`
+- `image/webp`
+- `image/gif`
+- `application/pdf`
+- `text/plain`
+- `text/markdown`
+- `application/json`
+- `text/csv`
+- `application/msword`
+- `application/vnd.ms-excel`
+- `application/vnd.ms-powerpoint`
+- `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
+- `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+- `application/vnd.openxmlformats-officedocument.presentationml.presentation`
+
+Diseño aplicado:
+
+- `io-common` mantiene la validación y enforcement común de `text/v1`
+- `IO.slack` define su policy efectiva de MIME aceptados
+- el override `IO_SLACK_ALLOWED_MIMES` / `io.blob.allowed_mimes_csv` sigue teniendo precedencia si se quiere ajustar el set en deploy
+
+Alcance exacto de esta lista:
+
+- esta lista describe lo que `IO.slack` acepta hoy en este repo
+- no implica que `IO.slack` acepte todos los formatos de archivo que Slack pueda transportar
+- cualquier MIME fuera de esta lista sigue siendo rechazado por el adapter hasta que se agregue explicitamente y se valide su comportamiento E2E
+
+Consecuencia operativa actual:
+
+- si un attachment queda fuera de esta lista efectiva, se descarta inbound con `unsupported_attachment_mime`
+- esos archivos no llegan al router ni a `AI.*`
+- por lo tanto, si un tipo de archivo esta soportado del lado `AI` pero no entra en esta policy efectiva, el limite real E2E sigue estando en `IO.slack`
+
+Estado actual:
+
+- `png/jpg/webp/gif`: llegan como attachments
+- `pdf`: llega como attachment
+- `text/plain`, `text/markdown`, `application/json`: llegan como attachments
+- `csv`, `doc/docx`, `xls/xlsx`, `ppt/pptx`: quedan admitidos por la policy efectiva actual de `IO.slack`
+
+Lo que falta dejar cerrado por tipo:
+
+- no hay garantia documental de que `IO.slack` acepte todos los formatos que hoy acepte Slack
+- faltan pruebas E2E asentadas por familias adicionales de MIME, por ejemplo audio y otros binarios fuera de office/PDF
+- si se decide sumar mas tipos, el criterio vigente es: agregarlos a la policy efectiva del adapter y validarlos de punta a punta
 
 ### 7.2 Estado de validación y límite del canal Slack
 - El mecanismo canónico de offload (`content` -> `content_ref` al superar límite) se valida de forma determinística con `io-sim`, porque no depende de límites del proveedor externo.
@@ -213,6 +268,25 @@ El Nodo IO Slack **DEBE**:
 - Enviar el mensaje al `channel` indicado.
 - Si `thread_ts` está presente, responder en el mismo hilo.
 - Caso contrario, publicar en el canal.
+
+### 8.3 Política de contenido largo (estado actual)
+
+✅ **Implementado hoy:**
+- Si el payload inbound a `io-slack` trae `content_ref` de texto, `io-slack` resuelve el blob y lo envía como texto por `chat.postMessage`.
+- Los `attachments[]` del payload se envían como archivos usando el flujo externo de Slack files API.
+
+⚠️ **Limitación conocida (hoy):**
+- Para texto muy largo, este comportamiento puede chocar con el límite de `chat.postMessage` (Slack trunca por encima de 40.000 caracteres).
+- En consecuencia, si un nodo upstream (por ejemplo AI) devuelve texto muy grande via `content_ref`, hoy `io-slack` puede terminar publicando texto truncado si no viene además como attachment explícito.
+
+🧩 **TBD / a normar para Slack:**
+- Definir fallback canónico cuando `resolved.text` excede límite de Slack:
+  - subir texto completo como archivo/snippet y no truncar,
+  - opcionalmente agregar notice configurable/localizable,
+  - o chunking controlado si se adopta esa estrategia.
+
+Referencia oficial de límite:
+- https://docs.slack.dev/reference/methods/chat.postMessage/ ("Truncating content").
 
 ---
 
@@ -308,6 +382,7 @@ Según la especificación del Router v1.16:
 - `meta.context` se reserva exclusivamente para **datos adicionales evaluados por OPA**
 
 `meta.context` **NO** debe usarse para almacenar historia, turns ni contexto conversacional.
+`meta.context.thread_id` fue removido del pipeline IO; el carrier válido es `meta.thread_id`.
 
 
 

@@ -415,7 +415,7 @@ name and return the generated `trace_id`.
 
 ```bash
 HIVE_ID="motherbee"
-NODE_NAME="AI.frontdesk.gov@motherbee"
+NODE_NAME="SY.frontdesk.gov@motherbee"
 
 curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/messages" \
   -H "Content-Type: application/json" \
