@@ -217,8 +217,7 @@ async fn handle_turn_payload(
     };
 
     if action_class_requires_result(action_class) && msg.meta.action_result.is_none() {
-        state.missing_action_result_total =
-            state.missing_action_result_total.saturating_add(1);
+        state.missing_action_result_total = state.missing_action_result_total.saturating_add(1);
         tracing::warn!(
             trace_id = %msg.routing.trace_id,
             action_class = %action_class,
@@ -231,8 +230,7 @@ async fn handle_turn_payload(
     }
 
     if msg.meta.action_result == Some(ActionResult::Blocked) && msg.meta.result_origin.is_none() {
-        state.missing_result_origin_total =
-            state.missing_result_origin_total.saturating_add(1);
+        state.missing_result_origin_total = state.missing_result_origin_total.saturating_add(1);
         tracing::warn!(
             trace_id = %msg.routing.trace_id,
             action_class = %action_class,
