@@ -2638,6 +2638,11 @@ async fn run_unconfigured_bootstrap(
     };
     if mode == RunnerMode::Gov {
         let client = RouterClient::connect(ai_node_config).await?;
+        tracing::info!(
+            node_name = %node_name,
+            mode = %mode.as_str(),
+            "SY.frontdesk.gov connected to router"
+        );
         let (reader, writer) = client.split();
         let shared_conn = Arc::new(SharedRouterConnection::new(reader, writer));
         let mut ai_node = ai_node;
@@ -2645,6 +2650,11 @@ async fn run_unconfigured_bootstrap(
         run_single_connection_runtime(shared_conn, ai_node, RuntimeConfig::default()).await?;
     } else {
         let client = RouterClient::connect(ai_node_config).await?;
+        tracing::info!(
+            node_name = %node_name,
+            mode = %mode.as_str(),
+            "AI runner connected to router"
+        );
         let runtime = NodeRuntime::new(client, ai_node);
         runtime.run_with_config(RuntimeConfig::default()).await?;
     }
@@ -2790,6 +2800,7 @@ fn bootstrap_node_from_args(
         .clone()
         .or_else(|| std::env::var("AI_DYNAMIC_CONFIG_DIR").ok())
         .unwrap_or_else(default_dynamic_config_dir);
+    let mut node_name_source = "args_or_env";
     let name = args
         .node_name
         .clone()
@@ -2801,10 +2812,23 @@ fn bootstrap_node_from_args(
                 Some(resolved)
             }
         })
-        .or_else(|| infer_frontdesk_node_name_from_hive(PathBuf::from(&config_dir).as_path()))
+        .or_else(|| {
+            let inferred = infer_frontdesk_node_name_from_hive(PathBuf::from(&config_dir).as_path());
+            if inferred.is_some() {
+                node_name_source = "hive_yaml";
+            }
+            inferred
+        })
         .ok_or_else(|| {
             "when no --config is provided, pass --node-name (or FLUXBEE_NODE_NAME/AI_NODE_NAME env var), or provide hive.yaml with hive_id for SY.frontdesk.gov bootstrap".to_string()
         })?;
+    tracing::info!(
+        node_name = %name,
+        node_name_source,
+        config_dir = %config_dir,
+        dynamic_config_dir = %dynamic_config_dir,
+        "resolved SY.frontdesk.gov bootstrap node"
+    );
     Ok(NodeSection {
         name,
         version: args
@@ -2840,6 +2864,11 @@ fn infer_frontdesk_node_name_from_hive(config_dir: &std::path::Path) -> Option<S
     if hive_id.is_empty() {
         return None;
     }
+    tracing::info!(
+        hive_id,
+        config_dir = %config_dir.display(),
+        "bootstrapping SY.frontdesk.gov node_name from hive.yaml"
+    );
     Some(format!("SY.frontdesk.gov@{hive_id}"))
 }
 
