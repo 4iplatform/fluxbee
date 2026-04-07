@@ -603,3 +603,41 @@ To avoid losing the sequence, the execution order for this stream is:
 
 **Immediate next step:**
 - Start with steps 1 to 4, because if the Go SDK scope and the config subset are not frozen first, `SY.opa.rules` will just grow another embedded compatibility layer.
+
+## 9) Linux validation checklist for `SY.opa.rules`
+
+When this migration slice is ready for runtime validation on Linux, verify:
+
+1. Service boot and router attach
+   - start `sy-opa-rules`
+   - confirm HELLO/ANNOUNCE completes
+   - confirm node appears as `SY.opa.rules@<hive>`
+
+2. Query interoperability from `SY.admin`
+   - run `opa_get_status`
+   - run `opa_get_policy`
+   - confirm replies arrive as `query_response`
+   - confirm `meta.action` remains `get_status` / `get_policy`
+
+3. Command interoperability from `SY.admin`
+   - run `opa_check`
+   - run `opa_compile`
+   - run `opa_apply`
+   - run `opa_rollback`
+   - confirm replies preserve `command_response` / `CONFIG_RESPONSE` semantics expected by admin
+
+4. Config control-plane interoperability
+   - send `CONFIG_GET`
+   - send `CONFIG_SET` with a valid OPA control payload
+   - send `CONFIG_SET` with an invalid payload
+   - confirm `CONFIG_RESPONSE` shape stays stable
+
+5. Router / SHM semantics
+   - confirm current/staged/backup policy files still behave the same
+   - confirm router SHM status is still visible in `get_status` / `CONFIG_GET`
+   - confirm `OPA_RELOAD` still broadcasts after apply/rollback paths that should trigger it
+
+6. Failure behavior
+   - send malformed `compile_policy`
+   - send malformed `CONFIG_SET`
+   - confirm error replies still carry the expected `error_code` / `error_detail`

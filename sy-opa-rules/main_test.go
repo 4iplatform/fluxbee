@@ -220,3 +220,111 @@ func TestHandleQueryGetStatusPreservesQueryResponseShape(t *testing.T) {
 		t.Fatalf("unexpected status payload: %+v", payload)
 	}
 }
+
+func TestHandleQueryGetPolicyPreservesQueryResponseShape(t *testing.T) {
+	oldStateDir := stateDir
+	stateDir = t.TempDir()
+	defer func() { stateDir = oldStateDir }()
+
+	if err := os.MkdirAll(filepath.Join(stateDir, "current"), 0o755); err != nil {
+		t.Fatalf("mkdir current: %v", err)
+	}
+	if err := writeMetadata(filepath.Join(stateDir, "current", "metadata.json"), PolicyMetadata{
+		Version:    6,
+		Hash:       "sha256:policy",
+		Entrypoint: "router/target",
+	}); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "current", "policy.rego"), []byte("package router\ndefault allow := true\n"), 0o644); err != nil {
+		t.Fatalf("write rego: %v", err)
+	}
+
+	router := &stubRouterTransport{}
+	service := &Service{
+		hiveID:     "motherbee",
+		nodeUUID:   uuid.MustParse("11111111-1111-1111-1111-111111111111"),
+		nodeName:   "SY.opa.rules@motherbee",
+		routerConn: router,
+	}
+
+	request, err := fluxbeesdk.BuildMessageEnvelope(
+		"22222222-2222-2222-2222-222222222222",
+		fluxbeesdk.UnicastDestination(service.nodeName),
+		16,
+		"trace-policy",
+		"query",
+		nil,
+		func() *string {
+			value := "get_policy"
+			return &value
+		}(),
+		map[string]any{},
+	)
+	if err != nil {
+		t.Fatalf("build query request: %v", err)
+	}
+
+	service.handleQuery(request)
+
+	if len(router.sent) != 1 {
+		t.Fatalf("expected 1 query response, got %d", len(router.sent))
+	}
+	resp := router.sent[0]
+	if resp.Meta.MsgType != "query_response" || derefString(resp.Meta.Action) != "get_policy" {
+		t.Fatalf("unexpected query response envelope: %+v", resp.Meta)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(resp.Payload, &payload); err != nil {
+		t.Fatalf("decode query response payload: %v", err)
+	}
+	if payload["status"] != "ok" || payload["rego"] == nil {
+		t.Fatalf("unexpected policy payload: %+v", payload)
+	}
+}
+
+func TestHandleCommandCompilePolicyInvalidPayloadReturnsCommandResponseError(t *testing.T) {
+	router := &stubRouterTransport{}
+	service := &Service{
+		hiveID:     "motherbee",
+		nodeUUID:   uuid.MustParse("11111111-1111-1111-1111-111111111111"),
+		nodeName:   "SY.opa.rules@motherbee",
+		routerConn: router,
+	}
+
+	request, err := fluxbeesdk.BuildMessageEnvelope(
+		"22222222-2222-2222-2222-222222222222",
+		fluxbeesdk.UnicastDestination(service.nodeName),
+		16,
+		"trace-command",
+		"command",
+		nil,
+		func() *string {
+			value := "compile_policy"
+			return &value
+		}(),
+		map[string]any{
+			"rego": 17,
+		},
+	)
+	if err != nil {
+		t.Fatalf("build command request: %v", err)
+	}
+
+	service.handleCommand(request)
+
+	if len(router.sent) != 1 {
+		t.Fatalf("expected 1 command response, got %d", len(router.sent))
+	}
+	resp := router.sent[0]
+	if resp.Meta.MsgType != "command_response" || derefString(resp.Meta.Action) != "compile_policy" {
+		t.Fatalf("unexpected command response envelope: %+v", resp.Meta)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(resp.Payload, &payload); err != nil {
+		t.Fatalf("decode command response payload: %v", err)
+	}
+	if payload["status"] != "error" || payload["error_code"] != "COMPILE_ERROR" {
+		t.Fatalf("unexpected command error payload: %+v", payload)
+	}
+}
