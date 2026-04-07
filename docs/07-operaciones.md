@@ -1012,7 +1012,7 @@ ssh -i /var/lib/fluxbee/ssh/motherbee.key administrator@192.168.1.50
 |---------------|--------|-------------|
 | `GET /hives/{id}/nodes` | `list_nodes` | Lista nodos de hive |
 | `POST /hives/{id}/nodes` | `run_node` | Envía `SPAWN_NODE` (contrato v2: `node_name`, `runtime`, `runtime_version`) |
-| `DELETE /hives/{id}/nodes/{name}` | `kill_node` | Envía `KILL_NODE` (soporta `force=true/false`) |
+| `DELETE /hives/{id}/nodes/{name}` | `kill_node` | Envía `KILL_NODE` (soporta `force=true/false` y `purge_instance=true/false`) |
 | `DELETE /hives/{id}/nodes/{name}/instance` | `remove_node_instance` | Borra la instancia persistida del nodo; falla si sigue corriendo/visible |
 | `GET /hives/{id}/nodes/{name}/status` | `get_node_status` | Snapshot canónico de estado de nodo (`lifecycle`, `health`, `source`, `status_version`) |
 | `GET /hives/{id}/nodes/{name}/config` | `get_node_config` | Lee `config.json` efectivo del nodo |
@@ -1020,6 +1020,7 @@ ssh -i /var/lib/fluxbee/ssh/motherbee.key administrator@192.168.1.50
 | `GET /hives/{id}/nodes/{name}/state` | `get_node_state` | Lectura diagnóstica de `state.json` (o `null` si no existe) |
 
 Nota:
+- Si el objetivo es `delete + reinstall`, usar `DELETE /hives/{id}/nodes/{name}` con body `{"purge_instance":true}` para detener el nodo y limpiar también su directorio persistido en un solo paso.
 - Los routers se gestionan como nodos `RT.*` vía `SPAWN_NODE`/`KILL_NODE` usando los endpoints de nodos.
 
 ### 5.2.1 Runbook de Status por Nodo

@@ -3,4 +3,9 @@
 # Visual Studio 2015/2017 cache/options directory
 .vs/
 nodes/io/target
+/.claude/
+/.claude/
+/.claude/
+/.claude/
+/.claude/
 /agents-sdk-python

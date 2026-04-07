@@ -3246,7 +3246,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "opa_get_status" => "Read OPA status for a hive.",
         "opa_check" => "Validate OPA policy text without applying it.",
         "run_node" => "Start a node in a hive.",
-        "kill_node" => "Stop a node in a hive.",
+        "kill_node" => "Stop a node in a hive. Optional purge_instance also removes its persisted instance directory.",
         "remove_node_instance" => "Delete a node instance from disk/runtime state.",
         "send_node_message" => "Send a system message to a node.",
         "set_node_config" => "Persist node config changes.",
@@ -3608,11 +3608,18 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Optional runtime/node config passed during spawn.",
             ),
         ],
-        "kill_node" => vec![admin_action_body_field(
-            "force",
-            "bool",
-            "Force stop when supported by the target runtime.",
-        )],
+        "kill_node" => vec![
+            admin_action_body_field(
+                "force",
+                "bool",
+                "Force stop when supported by the target runtime.",
+            ),
+            admin_action_body_field(
+                "purge_instance",
+                "bool",
+                "Also remove the node persisted instance directory after stop. Useful before reinstall/recreate.",
+            ),
+        ],
         "add_route" => vec![
             admin_action_body_field("match_kind", "string", "Optional route match kind."),
             admin_action_body_field(
@@ -3765,7 +3772,8 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "runtime_version": "current"
         }),
         "kill_node" => serde_json::json!({
-            "force": false
+            "force": false,
+            "purge_instance": true
         }),
         "add_route" => serde_json::json!({
             "prefix": "AI.chat.",
@@ -3861,7 +3869,9 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "run_node" => {
             r#"curl -X POST /hives/motherbee/nodes -d '{"node_name":"AI.chat@motherbee","runtime_version":"current"}'"#
         }
-        "kill_node" => "curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee",
+        "kill_node" => {
+            r#"curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee -d '{"force":false,"purge_instance":true}'"#
+        }
         "remove_node_instance" => {
             "curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee/instance"
         }

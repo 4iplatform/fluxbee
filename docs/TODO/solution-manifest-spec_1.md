@@ -6,6 +6,8 @@
 **Parent specs:** `node-spawn-config-spec.md`, `runtime-packaging-cli-spec.md`, `sy-architect-spec.md`, `sy-policy-beta.md`
 
 > Direction note (2026-04-05): this is the solution-manifest spec to use for the `SY.policy` initiative. The old `SY.claims`-oriented manifest under `docs/legacy/solution-manifest-spec.md` is historical only and must not drive new implementation.
+>
+> Policy composition note (2026-04-06): the manifest carries only solution-level policy rules. System axioms are shipped separately with Fluxbee core as an immutable policy pack, installed into the `SY.architect` environment, and composed with the manifest policy at apply time.
 
 ---
 
@@ -19,7 +21,7 @@ SY.architect generates this file conversationally, versions it, and applies it b
 
 ## 2. Problem
 
-Today, deploying a complete solution requires dozens of manual API calls: create tenant, add hives, publish runtimes, spawn nodes with individual configs, add routes, configure VPN, apply OPA policies, set up claims rules. There is no way to:
+Today, deploying a complete solution requires dozens of manual API calls: create tenant, add hives, publish runtimes, spawn nodes with individual configs, add routes, configure VPN, apply OPA policies, and set up solution policy rules. There is no way to:
 
 - Describe a solution declaratively.
 - Reproduce it in another environment.
@@ -245,63 +247,55 @@ Today, deploying a complete solution requires dozens of manual API calls: create
   },
 
   "policy": {
-    "description": "Unified claims × actions → effects matrix. Compiles to OPA Rego automatically. SY.policy uses the same matrix for post-facto evaluation.",
+    "description": "Unified match × actions → effects matrix. Compiles to solution-level OPA Rego automatically. SY.policy uses the same matrix for post-facto evaluation. Runtime evaluation depends on canonical `action_class` plus `action_result` metadata produced by router/admin/IO/WF surfaces.",
     "policy_matrix": [
       {
         "rule_id": "pm:001",
-        "claim": { "registration_status": "temporary" },
+        "match": { "registration_status": "temporary" },
         "action_class": "send_message",
         "effect": "route_to_frontdesk",
-        "tier": "constitutional",
+        "level": "solution",
         "description": "Temporary ILKs go to frontdesk for registration"
       },
       {
         "rule_id": "pm:002",
-        "claim": { "registration_status": "temporary" },
+        "match": { "registration_status": "temporary" },
         "action_class": "system_config",
         "effect": "deny",
-        "tier": "constitutional",
+        "level": "solution",
         "description": "Temporary ILKs cannot modify system configuration"
       },
       {
         "rule_id": "pm:003",
-        "claim": { "registration_status": "temporary" },
+        "match": { "registration_status": "temporary" },
         "action_class": "workflow_step",
         "effect": "deny",
-        "tier": "constitutional",
+        "level": "solution",
         "description": "Temporary ILKs cannot trigger workflows"
       },
       {
-        "rule_id": "pm:010",
-        "claim": { "tenant_id": "tnt:uuid" },
-        "action_class": "*",
-        "effect": "allow",
-        "tier": "constitutional",
-        "description": "Acme tenant ILKs can operate within their own scope"
-      },
-      {
         "rule_id": "pm:020",
-        "claim": { "capability": "billing" },
+        "match": { "capability": "billing" },
         "action_class": "external_action",
         "effect": "allow",
-        "tier": "charter",
+        "level": "solution",
         "charter_ref": "charter://acme/support-v1",
         "description": "Billing agents can perform external actions in billing domain"
       },
       {
         "rule_id": "pm:021",
-        "claim": { "role": "support_l1" },
+        "match": { "role": "support_l1" },
         "action_class": "topology_change",
         "effect": "deny",
-        "tier": "constitutional",
+        "level": "solution",
         "description": "L1 support agents cannot change system topology"
       },
       {
         "rule_id": "pm:022",
-        "claim": { "role": "support_l1" },
+        "match": { "role": "support_l1" },
         "action_class": "system_config",
         "effect": "deny",
-        "tier": "constitutional",
+        "level": "solution",
         "description": "L1 support agents cannot modify system config"
       }
     ]
@@ -370,7 +364,13 @@ Message routing rules. Describes how messages flow between nodes based on identi
 
 ### 5.7 policy
 
-The unified claims × actions → effects matrix. This is the law of the solution. Each rule says: "if an ILK with these claims performs this action, the effect is X." The matrix serves two purposes simultaneously: it compiles to OPA Rego for real-time enforcement, and SY.policy uses it as reference for post-facto evaluation. One source of truth, two consumers. See `sy-policy-beta.md` for the full model.
+The unified match × actions → effects matrix. This is the solution-level law of the solution. Each rule says: "if an ILK matching these predicates performs this action, the effect is X." The matrix serves two purposes simultaneously: it compiles to solution-level OPA Rego for real-time enforcement, and it is one input to the effective policy matrix that `SY.policy` uses for post-facto evaluation. System-owned axioms are not authored here; `SY.architect` composes them with this manifest policy from the installed read-only system-policy pack in its environment. See `sy-policy-beta.md` for the full model.
+
+V1 constraints:
+
+- `action_class` must be one value from the closed enum; no `*`
+- `match` supports scalar equality plus contains for `role` / `capability`
+- if two rules are equally specific and conflict on effect for the same normative space, apply must fail with ambiguity instead of activating the manifest
 
 ### 5.9 identity
 
@@ -482,9 +482,11 @@ When architect applies a manifest, it does NOT execute it as a script. It reconc
    - Remove routes not in manifest (with confirmation)
 
 6. POLICY
-   - Compile policy_matrix to Rego
+   - Load installed system axioms pack from the `SY.architect` environment
+   - Compose effective policy = system axioms + solution policy_matrix
+   - Compile effective model into axioms.rego + solution.rego
    - Apply via opa_apply → jsr-opa SHM
-   - Load matrix into SY.policy as evaluation reference
+   - Persist effective policy matrix into SY.policy as evaluation reference
    - Verify OPA rules are active
 
 7. IDENTITY
@@ -607,5 +609,5 @@ For future: secrets replaced by references (`secret://openai-key`) resolved at a
 | `admin-internal-gateway-spec.md` | Reconciliation uses ADMIN_COMMAND for all operations |
 | `system-inventory-spec.md` | State reader uses inventory for actual state |
 | `node-status-contract.md` | Post-apply verification uses node status |
-| `sy-policy-beta.md` | Policy section defines the claims × actions matrix that SY.policy evaluates |
+| `sy-policy-beta.md` | Policy section defines the match × actions matrix that SY.policy evaluates |
 | `10-identity-v2.md` | Tenant and identity section maps to identity operations |
