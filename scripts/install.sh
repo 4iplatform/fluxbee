@@ -18,7 +18,7 @@ if [[ "${SKIP_BUILD:-}" != "1" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
     # Common case: running with plain sudo loses user PATH (cargo unavailable as root).
     # If release binaries already exist, continue without rebuilding.
-    if [[ -x "$BIN_DIR/json-router" && -x "$BIN_DIR/sy_orchestrator" && -x "$BIN_DIR/sy_identity" && -x "$BIN_DIR/sy_cognition" ]]; then
+    if [[ -x "$BIN_DIR/json-router" && -x "$BIN_DIR/sy_orchestrator" && -x "$BIN_DIR/sy_identity" && -x "$BIN_DIR/sy_cognition" && -x "$BIN_DIR/sy_policy" ]]; then
       echo "Warning: cargo not found; using prebuilt binaries from $BIN_DIR (SKIP_BUILD=1)."
       SKIP_BUILD=1
     else
@@ -117,6 +117,7 @@ sy_orch_bin="$(pick_bin sy_orchestrator)" || { echo "Missing binary: $BIN_DIR/sy
 sy_storage_bin="$(pick_bin sy_storage)" || { echo "Missing binary: $BIN_DIR/sy_storage" >&2; missing=1; }
 sy_identity_bin="$(pick_bin sy_identity)" || { echo "Missing binary: $BIN_DIR/sy_identity" >&2; missing=1; }
 sy_cognition_bin="$(pick_bin sy_cognition)" || { echo "Missing binary: $BIN_DIR/sy_cognition" >&2; missing=1; }
+sy_policy_bin="$(pick_bin sy_policy)" || { echo "Missing binary: $BIN_DIR/sy_policy" >&2; missing=1; }
 sy_frontdesk_gov_bin="$(pick_bin sy-frontdesk-gov)" || { echo "Missing binary: $BIN_DIR/sy-frontdesk-gov" >&2; missing=1; }
 sy_opa_rules_bin=""
 if [[ -f "$ROOT_DIR/sy-opa-rules/sy-opa-rules" ]]; then
@@ -142,6 +143,7 @@ sudo install -m 0755 "$sy_orch_bin" /usr/bin/sy-orchestrator
 sudo install -m 0755 "$sy_storage_bin" /usr/bin/sy-storage
 sudo install -m 0755 "$sy_identity_bin" /usr/bin/sy-identity
 sudo install -m 0755 "$sy_cognition_bin" /usr/bin/sy-cognition
+sudo install -m 0755 "$sy_policy_bin" /usr/bin/sy-policy
 sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
 sudo install -m 0755 "$sy_frontdesk_gov_bin" /usr/bin/sy-frontdesk-gov
 
@@ -154,6 +156,7 @@ sudo install -m 0755 "$sy_orch_bin" "$STATE_DIR/dist/core/bin/sy-orchestrator"
 sudo install -m 0755 "$sy_storage_bin" "$STATE_DIR/dist/core/bin/sy-storage"
 sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/dist/core/bin/sy-identity"
 sudo install -m 0755 "$sy_cognition_bin" "$STATE_DIR/dist/core/bin/sy-cognition"
+sudo install -m 0755 "$sy_policy_bin" "$STATE_DIR/dist/core/bin/sy-policy"
 sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/dist/core/bin/sy-opa-rules"
 sudo install -m 0755 "$sy_frontdesk_gov_bin" "$STATE_DIR/dist/core/bin/sy-frontdesk-gov"
 
@@ -173,6 +176,8 @@ sy_storage_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-storage" | awk '{print 
 sy_storage_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-storage")"
 sy_cognition_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-cognition" | awk '{print $1}')"
 sy_cognition_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-cognition")"
+sy_policy_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-policy" | awk '{print $1}')"
+sy_policy_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-policy")"
 sy_frontdesk_gov_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-frontdesk-gov" | awk '{print $1}')"
 sy_frontdesk_gov_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-frontdesk-gov")"
 core_version="${FLUXBEE_CORE_VERSION:-dev}"
@@ -201,6 +206,7 @@ cat >"$core_manifest_tmp" <<EOF
     "sy-orchestrator": {"service": "sy-orchestrator", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_orch_sha", "size": $sy_orch_size},
     "sy-storage": {"service": "sy-storage", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_storage_sha", "size": $sy_storage_size},
     "sy-cognition": {"service": "sy-cognition", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_cognition_sha", "size": $sy_cognition_size},
+    "sy-policy": {"service": "sy-policy", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_policy_sha", "size": $sy_policy_size},
     "sy-frontdesk-gov": {"service": "sy-frontdesk-gov", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_frontdesk_gov_sha", "size": $sy_frontdesk_gov_size}
   }
 }
@@ -251,6 +257,7 @@ verify_core_component "sy-identity" "$sy_identity_sha" "$sy_identity_size"
 verify_core_component "sy-orchestrator" "$sy_orch_sha" "$sy_orch_size"
 verify_core_component "sy-storage" "$sy_storage_sha" "$sy_storage_size"
 verify_core_component "sy-cognition" "$sy_cognition_sha" "$sy_cognition_size"
+verify_core_component "sy-policy" "$sy_policy_sha" "$sy_policy_size"
 verify_core_component "sy-frontdesk-gov" "$sy_frontdesk_gov_sha" "$sy_frontdesk_gov_size"
 echo "Core binaries verification passed."
 
@@ -419,6 +426,7 @@ install_unit "sy-orchestrator" "/usr/bin/sy-orchestrator"
 install_unit "sy-storage" "/usr/bin/sy-storage"
 install_unit "sy-identity" "/usr/bin/sy-identity"
 install_unit "sy-cognition" "/usr/bin/sy-cognition"
+install_unit "sy-policy" "/usr/bin/sy-policy"
 install_unit "sy-frontdesk-gov" "/usr/bin/sy-frontdesk-gov"
 sudo systemctl daemon-reload
 
