@@ -25,6 +25,7 @@ import (
 	"time"
 	"unsafe"
 
+	fluxbeesdk "github.com/4iplatform/json-router/sy-opa-rules/sdk"
 	"github.com/google/uuid"
 	"github.com/open-policy-agent/opa/compile"
 	"golang.org/x/sys/unix"
@@ -60,9 +61,22 @@ type HiveConfig struct {
 }
 
 type Meta struct {
-	Type   string `json:"type"`
-	Msg    string `json:"msg,omitempty"`
-	Action string `json:"action,omitempty"`
+	Type             string          `json:"type"`
+	Msg              string          `json:"msg,omitempty"`
+	SrcIlk           string          `json:"src_ilk,omitempty"`
+	DstIlk           string          `json:"dst_ilk,omitempty"`
+	Ich              string          `json:"ich,omitempty"`
+	ThreadID         string          `json:"thread_id,omitempty"`
+	Ctx              string          `json:"ctx,omitempty"`
+	Scope            string          `json:"scope,omitempty"`
+	Target           string          `json:"target,omitempty"`
+	Action           string          `json:"action,omitempty"`
+	ActionClass      string          `json:"action_class,omitempty"`
+	ActionResult     string          `json:"action_result,omitempty"`
+	ResultOrigin     string          `json:"result_origin,omitempty"`
+	ResultDetailCode string          `json:"result_detail_code,omitempty"`
+	Priority         string          `json:"priority,omitempty"`
+	Context          json.RawMessage `json:"context,omitempty"`
 }
 
 type Routing struct {
@@ -595,6 +609,14 @@ func (s *Service) loadCurrentPolicy() error {
 func (s *Service) handleMessage(msg Message) {
 	switch msg.Meta.Type {
 	case "system":
+		if msg.Meta.Msg == fluxbeesdk.MSGConfigGet {
+			s.handleNodeConfigGet(msg)
+			return
+		}
+		if msg.Meta.Msg == fluxbeesdk.MSGConfigSet {
+			s.handleNodeConfigSet(msg)
+			return
+		}
 		if msg.Meta.Msg == "CONFIG_CHANGED" {
 			var payload ConfigChangedPayload
 			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
@@ -615,6 +637,225 @@ func (s *Service) handleMessage(msg Message) {
 	case "query":
 		s.handleQuery(msg)
 	}
+}
+
+func (s *Service) handleNodeConfigGet(msg Message) {
+	var req fluxbeesdk.NodeConfigGetPayload
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":        false,
+			"node_name": s.nodeName,
+			"state":     "error",
+			"error": map[string]any{
+				"code":   "INVALID_CONFIG_GET",
+				"detail": err.Error(),
+			},
+		})
+		return
+	}
+	currentMeta, _ := readMetadata(filepath.Join(stateDir, "current", "metadata.json"))
+	stagedMeta, _ := readMetadata(filepath.Join(stateDir, "staged", "metadata.json"))
+	backupMeta, _ := readMetadata(filepath.Join(stateDir, "backup", "metadata.json"))
+	state := "empty"
+	if currentMeta.Version > 0 || currentMeta.Hash != "" {
+		state = "configured"
+	}
+	response := map[string]any{
+		"ok":             true,
+		"node_name":      s.nodeName,
+		"state":          state,
+		"schema_version": 1,
+		"config_version": currentMeta.Version,
+		"effective_config": map[string]any{
+			"current": buildPolicySnapshot(currentMeta),
+			"staged":  buildPolicySnapshot(stagedMeta),
+			"backup":  buildPolicySnapshot(backupMeta),
+			"router": map[string]any{
+				"routers": listRouterStatuses(),
+			},
+		},
+		"contract": map[string]any{
+			"supports":              []string{fluxbeesdk.MSGConfigGet, fluxbeesdk.MSGConfigSet},
+			"target":                fluxbeesdk.NodeConfigControlTarget,
+			"schema_version":        1,
+			"apply_modes":           []string{fluxbeesdk.NodeConfigApplyModeReplace},
+			"config_schema":         "opa_control_v1",
+			"supported_operations":  []string{"check", "compile", "compile_apply", "apply", "rollback"},
+			"requested_node_name":   req.NodeName,
+			"preserves_opa_actions": true,
+			"preserves_opa_queries": true,
+		},
+	}
+	s.sendNodeConfigResponse(msg, response)
+}
+
+func (s *Service) handleNodeConfigSet(msg Message) {
+	var req fluxbeesdk.NodeConfigSetPayload
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":        false,
+			"node_name": s.nodeName,
+			"state":     "error",
+			"error": map[string]any{
+				"code":   "INVALID_CONFIG_SET",
+				"detail": err.Error(),
+			},
+		})
+		return
+	}
+	if req.ApplyMode != "" && req.ApplyMode != fluxbeesdk.NodeConfigApplyModeReplace {
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":        false,
+			"node_name": s.nodeName,
+			"state":     "error",
+			"error": map[string]any{
+				"code":   "UNSUPPORTED_APPLY_MODE",
+				"detail": fmt.Sprintf("unsupported apply_mode: %s", req.ApplyMode),
+			},
+		})
+		return
+	}
+
+	configMap, ok := req.Config.(map[string]any)
+	if !ok {
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":        false,
+			"node_name": s.nodeName,
+			"state":     "error",
+			"error": map[string]any{
+				"code":   "INVALID_CONFIG_SET",
+				"detail": "config must be a JSON object",
+			},
+		})
+		return
+	}
+
+	operation, _ := configMap["operation"].(string)
+	operation = strings.TrimSpace(strings.ToLower(operation))
+	if operation == "" {
+		operation = "check"
+	}
+	version := req.ConfigVersion
+	if rawVersion, ok := configMap["version"].(float64); ok && uint64(rawVersion) != 0 {
+		version = uint64(rawVersion)
+	}
+	rego, _ := configMap["rego"].(string)
+	entrypoint, _ := configMap["entrypoint"].(string)
+	autoApply, _ := configMap["auto_apply"].(bool)
+
+	var opaCfg *OpaConfigPayload
+	if rego != "" || entrypoint != "" {
+		opaCfg = &OpaConfigPayload{
+			Rego:       rego,
+			Entrypoint: entrypoint,
+		}
+	}
+
+	handled, err := s.handleOpaAction(msg.Routing.Src, operation, version, opaCfg, autoApply, false)
+	if err != nil {
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":             false,
+			"node_name":      s.nodeName,
+			"state":          "error",
+			"schema_version": req.SchemaVersion,
+			"config_version": version,
+			"error": map[string]any{
+				"code":   inferOpaErrorCode(err),
+				"detail": err.Error(),
+			},
+		})
+		return
+	}
+	if !handled {
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":             false,
+			"node_name":      s.nodeName,
+			"state":          "error",
+			"schema_version": req.SchemaVersion,
+			"config_version": version,
+			"error": map[string]any{
+				"code":   "UNSUPPORTED_OPERATION",
+				"detail": fmt.Sprintf("unsupported OPA config operation: %s", operation),
+			},
+		})
+		return
+	}
+
+	currentMeta, _ := readMetadata(filepath.Join(stateDir, "current", "metadata.json"))
+	if operation == "check" || operation == "compile" || operation == "compile_apply" {
+		stagedMeta, _ := readMetadata(filepath.Join(stateDir, "staged", "metadata.json"))
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":             true,
+			"node_name":      s.nodeName,
+			"state":          "configured",
+			"schema_version": req.SchemaVersion,
+			"config_version": stagedMeta.Version,
+			"effective_config": map[string]any{
+				"staged": buildPolicySnapshot(stagedMeta),
+			},
+		})
+		return
+	}
+
+	s.sendNodeConfigResponse(msg, map[string]any{
+		"ok":             true,
+		"node_name":      s.nodeName,
+		"state":          "configured",
+		"schema_version": req.SchemaVersion,
+		"config_version": currentMeta.Version,
+		"effective_config": map[string]any{
+			"current": buildPolicySnapshot(currentMeta),
+		},
+	})
+}
+
+func (s *Service) sendNodeConfigResponse(request Message, payload map[string]any) {
+	resp := Message{
+		Routing: Routing{
+			Src:     s.nodeUUID.String(),
+			Dst:     request.Routing.Src,
+			Ttl:     16,
+			TraceID: request.Routing.TraceID,
+		},
+		Meta: Meta{
+			Type:     fluxbeesdk.SYSTEMKind,
+			Msg:      fluxbeesdk.MSGConfigResponse,
+			Target:   fluxbeesdk.NodeConfigControlTarget,
+			Action:   fluxbeesdk.MSGConfigResponse,
+			SrcIlk:   request.Meta.SrcIlk,
+			Scope:    request.Meta.Scope,
+			Priority: request.Meta.Priority,
+			Context:  request.Meta.Context,
+		},
+		Payload: mustJSON(payload),
+	}
+	s.routerConn.Send(resp)
+}
+
+func buildPolicySnapshot(meta PolicyMetadata) map[string]any {
+	return map[string]any{
+		"version":         meta.Version,
+		"hash":            meta.Hash,
+		"entrypoint":      meta.Entrypoint,
+		"compiled_at":     meta.CompiledAt,
+		"wasm_size_bytes": meta.WasmSize,
+		"error_detail":    meta.ErrorDetail,
+	}
+}
+
+func inferOpaErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	var oe OpaError
+	if errors.As(err, &oe) {
+		return oe.Code
+	}
+	var oePtr *OpaError
+	if errors.As(err, &oePtr) && oePtr != nil {
+		return oePtr.Code
+	}
+	return "OPA_CONFIG_ERROR"
 }
 
 func (s *Service) handleCommand(msg Message) {
@@ -1094,22 +1335,13 @@ func (c *RouterClient) connect() (net.Conn, error) {
 }
 
 func (c *RouterClient) handshake(conn net.Conn) error {
-	hello := Message{
-		Routing: Routing{
-			Src:     c.nodeUUID.String(),
-			Dst:     nil,
-			Ttl:     1,
-			TraceID: uuid.New().String(),
-		},
-		Meta: Meta{
-			Type: "system",
-			Msg:  "HELLO",
-		},
-		Payload: mustJSON(NodeHelloPayload{
-			UUID:    c.nodeUUID.String(),
-			Name:    c.nodeName,
-			Version: "1.0",
-		}),
+	hello, err := fluxbeesdk.BuildHello(c.nodeUUID.String(), uuid.New().String(), fluxbeesdk.NodeHelloPayload{
+		UUID:    c.nodeUUID.String(),
+		Name:    c.nodeName,
+		Version: "1.0",
+	})
+	if err != nil {
+		return err
 	}
 	if err := writeFrame(conn, mustJSON(hello)); err != nil {
 		return err
@@ -1123,10 +1355,10 @@ func (c *RouterClient) handshake(conn net.Conn) error {
 	if err := json.Unmarshal(frame, &msg); err != nil {
 		return err
 	}
-	if msg.Meta.Type != "system" || msg.Meta.Msg != "ANNOUNCE" {
+	if msg.Meta.Type != fluxbeesdk.SYSTEMKind || msg.Meta.Msg != fluxbeesdk.MSGAnnounce {
 		return fmt.Errorf("unexpected announce")
 	}
-	var payload NodeAnnouncePayload
+	var payload fluxbeesdk.NodeAnnouncePayload
 	_ = json.Unmarshal(msg.Payload, &payload)
 	log.Printf("connected as %s (vpn=%d router=%s)", payload.Name, payload.VpnID, payload.RouterName)
 	c.mu.Lock()
@@ -1191,32 +1423,11 @@ func (c *RouterClient) Send(msg Message) {
 }
 
 func readFrame(conn net.Conn) ([]byte, error) {
-	var lenBuf [4]byte
-	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-		return nil, err
-	}
-	size := binary.BigEndian.Uint32(lenBuf[:])
-	if size == 0 {
-		return nil, fmt.Errorf("empty frame")
-	}
-	buf := make([]byte, size)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return nil, err
-	}
-	return buf, nil
+	return fluxbeesdk.ReadFrame(conn)
 }
 
 func writeFrame(conn net.Conn, payload []byte) error {
-	if len(payload) > 64*1024 {
-		return fmt.Errorf("frame too large")
-	}
-	var lenBuf [4]byte
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
-	if _, err := conn.Write(lenBuf[:]); err != nil {
-		return err
-	}
-	_, err := conn.Write(payload)
-	return err
+	return fluxbeesdk.WriteFrame(conn, payload)
 }
 
 func routerSocketCandidates(dir string, nodeName string) ([]string, error) {
