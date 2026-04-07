@@ -126,3 +126,97 @@ func TestHandleNodeConfigSetRejectsNonObjectConfig(t *testing.T) {
 		t.Fatalf("unexpected error code: %q", payload.Error.Code)
 	}
 }
+
+func TestBroadcastOpaReloadUsesSystemBroadcastEnvelope(t *testing.T) {
+	router := &stubRouterTransport{}
+	service := &Service{
+		hiveID:     "motherbee",
+		nodeUUID:   uuid.MustParse("11111111-1111-1111-1111-111111111111"),
+		nodeName:   "SY.opa.rules@motherbee",
+		routerConn: router,
+	}
+
+	service.broadcastOpaReload(9, "sha256:test")
+
+	if len(router.sent) != 1 {
+		t.Fatalf("expected 1 broadcast, got %d", len(router.sent))
+	}
+	msg := router.sent[0]
+	if msg.Meta.MsgType != fluxbeesdk.SYSTEMKind || derefString(msg.Meta.Msg) != fluxbeesdk.MSGOPAReload {
+		t.Fatalf("unexpected message envelope: %+v", msg.Meta)
+	}
+	if !msg.Routing.Dst.IsBroadcast() {
+		t.Fatalf("expected broadcast destination")
+	}
+}
+
+func TestHandleQueryGetStatusPreservesQueryResponseShape(t *testing.T) {
+	oldStateDir := stateDir
+	oldRouterSockDir := routerSockDir
+	stateDir = t.TempDir()
+	routerSockDir = t.TempDir()
+	defer func() {
+		stateDir = oldStateDir
+		routerSockDir = oldRouterSockDir
+	}()
+
+	for _, dir := range []string{"current", "staged"} {
+		if err := os.MkdirAll(filepath.Join(stateDir, dir), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := writeMetadata(filepath.Join(stateDir, "current", "metadata.json"), PolicyMetadata{
+		Version: 4,
+		Hash:    "sha256:current",
+	}); err != nil {
+		t.Fatalf("write current metadata: %v", err)
+	}
+	if err := writeMetadata(filepath.Join(stateDir, "staged", "metadata.json"), PolicyMetadata{
+		Version: 5,
+		Hash:    "sha256:staged",
+	}); err != nil {
+		t.Fatalf("write staged metadata: %v", err)
+	}
+
+	router := &stubRouterTransport{}
+	service := &Service{
+		hiveID:     "motherbee",
+		nodeUUID:   uuid.MustParse("11111111-1111-1111-1111-111111111111"),
+		nodeName:   "SY.opa.rules@motherbee",
+		routerConn: router,
+	}
+
+	request, err := fluxbeesdk.BuildMessageEnvelope(
+		"22222222-2222-2222-2222-222222222222",
+		fluxbeesdk.UnicastDestination(service.nodeName),
+		16,
+		"trace-query",
+		"query",
+		nil,
+		func() *string {
+			value := "get_status"
+			return &value
+		}(),
+		map[string]any{},
+	)
+	if err != nil {
+		t.Fatalf("build query request: %v", err)
+	}
+
+	service.handleQuery(request)
+
+	if len(router.sent) != 1 {
+		t.Fatalf("expected 1 query response, got %d", len(router.sent))
+	}
+	resp := router.sent[0]
+	if resp.Meta.MsgType != "query_response" || derefString(resp.Meta.Action) != "get_status" {
+		t.Fatalf("unexpected query response envelope: %+v", resp.Meta)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(resp.Payload, &payload); err != nil {
+		t.Fatalf("decode query response payload: %v", err)
+	}
+	if payload["status"] != "ok" {
+		t.Fatalf("unexpected status payload: %+v", payload)
+	}
+}
