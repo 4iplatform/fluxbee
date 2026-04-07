@@ -20,7 +20,10 @@ use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SCOPE_GLOBAL,
     SYSTEM_KIND,
 };
-use fluxbee_sdk::{connect, ClientConfig, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::{
+    classify_admin_action, classify_system_message, connect, ClientConfig, NodeConfig,
+    NodeReceiver, NodeSender,
+};
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, RemoteHiveEntry, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
 };
@@ -4813,6 +4816,7 @@ async fn send_admin_request(
             scope: None,
             target: Some(request.target.clone()),
             action: Some(request.action.clone()),
+            action_class: classify_admin_action(&request.action),
             priority: None,
             context: None,
             ..Meta::default()
@@ -4898,6 +4902,7 @@ async fn send_system_request_with_meta(
             scope,
             target: meta_target.or_else(|| Some(target.to_string())),
             action: meta_action,
+            action_class: classify_system_message(request_msg),
             priority: None,
             context,
             ..Meta::default()

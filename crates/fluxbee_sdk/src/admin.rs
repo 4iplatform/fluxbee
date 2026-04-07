@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
-use crate::{NodeError, NodeReceiver, NodeSender};
+use crate::{classify_admin_action, NodeError, NodeReceiver, NodeSender};
 
 pub const ADMIN_KIND: &str = "admin";
 pub const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
@@ -144,6 +144,7 @@ pub async fn admin_command(
             scope: None,
             target: Some(admin_target.to_string()),
             action: Some(action.to_string()),
+            action_class: classify_admin_action(action),
             priority: None,
             context: None,
             ..Meta::default()

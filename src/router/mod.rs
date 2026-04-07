@@ -34,6 +34,7 @@ use fluxbee_sdk::protocol::{
     WanTimers, MSG_CONFIG_CHANGED, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED,
     MSG_UNREACHABLE, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
 };
+use fluxbee_sdk::classify_routed_message;
 use fluxbee_sdk::socket::connection::{read_frame, write_frame};
 
 #[derive(Debug, thiserror::Error)]
@@ -4775,7 +4776,11 @@ fn maybe_publish_turn(
     };
     let publisher = Arc::clone(publisher);
     let nats_publish_errors = Arc::clone(nats_publish_errors);
-    let payload = match serde_json::to_vec(msg) {
+    let mut enriched = msg.clone();
+    if enriched.meta.action_class.is_none() {
+        enriched.meta.action_class = classify_routed_message(&enriched.meta.msg_type);
+    }
+    let payload = match serde_json::to_vec(&enriched) {
         Ok(payload) => payload,
         Err(err) => {
             tracing::warn!(error = %err, "turn serialize failed");
@@ -4823,6 +4828,9 @@ async fn serialize_for_local_delivery(
     msg: &Message,
 ) -> Result<Vec<u8>, RouterError> {
     let mut enriched = msg.clone();
+    if enriched.meta.action_class.is_none() {
+        enriched.meta.action_class = classify_routed_message(&enriched.meta.msg_type);
+    }
     maybe_attach_memory_package(memory_reader, hive_id, &mut enriched).await;
     Ok(serde_json::to_vec(&enriched)?)
 }
