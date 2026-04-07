@@ -9,6 +9,11 @@
 - Bring the legacy system nodes to the same operational level as the current Fluxbee runtime contract.
 - Align message envelopes, config control-plane behavior, request/reply semantics, and node lifecycle expectations.
 - Do this as a dedicated infrastructure effort, not as a side effect of `SY.policy`.
+- For `SY.opa.rules`, take a compatibility-first v1.0 path:
+  - keep the current OPA-facing behavior working
+  - preserve current OPA-related actions and mechanisms unless a change is required by the new config/control-plane support
+  - extract reusable runtime/protocol pieces into `fluxbee-go-sdk`
+- Treat `fluxbee-go-sdk` as a real reusable SDK for third-party or future internal Go nodes, but allow its first cut to be shaped by `SY.opa.rules` compatibility needs.
 
 ---
 
@@ -25,7 +30,7 @@ This creates three problems:
 The key difference is:
 
 - `SY.config.routes` is a Rust node that should be brought up to the current Rust SDK/runtime standard.
-- `SY.opa.rules` is effectively carrying its own mini SDK today; the cleaner path is to turn that into a real `fluxbee-go-sdk` and then migrate `SY.opa.rules` onto it.
+- `SY.opa.rules` is effectively carrying its own mini SDK today; the cleaner path is to extract the runtime/protocol pieces it already uses into a real `fluxbee-go-sdk`, add the newer config/control-plane support there, and leave deeper OPA-specific cleanup for a later version.
 
 **Important decision:**
 - Do **not** partially retrofit these nodes only for policy metadata.
@@ -118,6 +123,241 @@ For v1 alignment, these nodes should behave closer to:
 - `SY.cognition`
 - AI/IO nodes that already implement `CONFIG_GET` / `CONFIG_SET` through the current SDK
 
+### 3.3 Canonical modern node contract reference
+
+For this initiative, the baseline contract to mirror is the one exposed today by the newer Rust nodes and the shared Rust SDK.
+
+This is the reference shape to compare against and reproduce.
+
+#### Envelope baseline
+
+- Common envelope type: `Message`
+- Common metadata block: `Meta`
+- Common routing block: `Routing`
+- Shared router-facing concepts:
+  - source identity
+  - destination
+  - TTL
+  - `trace_id`
+
+#### Runtime lifecycle baseline
+
+- Node connects through the router socket
+- Node performs `HELLO`
+- Node receives `ANNOUNCE`
+- Node keeps a reconnect-capable sender/receiver lifecycle
+- Node identity/UUID is stable and persisted according to node runtime rules
+
+#### Reply model baseline
+
+Replies should be standardized around:
+
+- `status`
+- `error_code`
+- `error_detail`
+- stable action echo where appropriate
+- trace continuity from request to reply
+
+Older shapes such as ad hoc `error` fields are considered legacy.
+
+#### Config/control-plane baseline
+
+Modern nodes distinguish between:
+
+- live node control-plane config
+- persisted effective config
+- domain actions with side effects
+
+Where applicable, newer nodes already expose canonical `CONFIG_GET` / `CONFIG_SET` and `CONFIG_RESPONSE` semantics through shared helpers.
+
+#### Important boundary
+
+This baseline does **not** force every node to have identical internal implementation.
+
+It does require that, from the outside:
+
+- `SY.admin` sees a stable request/reply contract
+- `SY.orchestrator` sees stable lifecycle behavior
+- operators see a coherent distinction between query, control-plane config, and domain actions
+
+### 3.4 Rust SDK to Go SDK migration matrix
+
+To build `fluxbee-go-sdk` correctly, the immediate task is **not** to port the whole Rust SDK.
+
+The task is to identify which Rust SDK modules define the current external contract and classify them as:
+
+- `Go v1.0`: required for the compatibility-first `SY.opa.rules` cut
+- `Go v1.1+`: valuable next step after the first migration
+- `Not in Go SDK scope now`: internal or unrelated to the first consumer
+
+#### Go v1.0 — must be reproduced first
+
+- [`protocol.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/protocol.rs)
+  - reason: canonical `Message`, `Meta`, `Routing`, `Destination`, shared protocol constants, HELLO/ANNOUNCE builders
+  - Go requirement: reproduce the **current Rust wire format**, including the newer metadata fields
+- [`socket/connection.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/socket/connection.rs)
+  - reason: canonical router framing
+  - Go requirement: same frame size limits and read/write semantics
+- [`node_client.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/node_client.rs)
+  - reason: canonical node connection lifecycle
+  - Go requirement: connect, HELLO, ANNOUNCE, reconnect, UUID persistence, router socket discovery
+- [`split.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/split.rs)
+  - reason: sender/receiver abstraction and disconnect behavior
+  - Go requirement: equivalent node sender/receiver model with trace-safe send path
+- [`status.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/status.rs)
+  - reason: default node status helper is part of the modern operational baseline
+  - Go requirement: at least the same default `NODE_STATUS_GET` handling path or a clearly equivalent helper
+
+#### Go v1.0 — selectively required by `SY.opa.rules`
+
+- [`admin.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/admin.rs)
+  - reason: `SY.opa.rules` is an admin-invoked system node and should follow the same admin request/reply contract
+  - Go requirement: not necessarily a full admin client in v1.0, but the **envelope and response semantics** must match the Rust side where admin interoperability matters
+- [`node_config.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/node_config.rs)
+  - reason: this is the main newer Rust-SDK capability we likely want `SY.opa.rules` to start supporting now
+  - Go requirement: bring in the subset needed for canonical `CONFIG_GET` / `CONFIG_SET` / `CONFIG_RESPONSE` behavior without breaking the current OPA action surface
+- [`send_normalization.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/send_normalization.rs)
+  - reason: `NodeSender::send()` currently applies outbound normalization in Rust
+  - Go requirement: defer unless a first Go node actually needs it; do not force it into the initial compatibility cut without a concrete need
+
+#### Go v1.1+ — likely next after first migration
+
+- [`client_config.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/client_config.rs)
+  - reason: convenience wrapper around node config + local NATS resolution
+  - Go requirement: useful later, but not essential for first router SDK cut
+- [`policy.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/policy.rs)
+  - reason: shared policy classification vocabulary
+  - Go requirement: only after/if Go nodes need to emit policy metadata under the same contract
+- [`identity.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/identity.rs)
+  - reason: possible future parity point if Go nodes need identity/ILK SHM helpers
+  - Go requirement: optional future addition; visible as useful, but not a blocker for v1.0
+
+#### Not in Go SDK scope now
+
+- [`managed_node.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/managed_node.rs)
+  - reason: orchestrator/managed-node operations, not generic node SDK baseline
+- [`node_secret.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/node_secret.rs)
+  - reason: secret persistence helper, orthogonal to first Go node contract
+- [`payload.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/payload.rs)
+  - reason: useful only if text payload normalization is brought into Go v1
+- [`blob/`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/blob/mod.rs)
+  - reason: same as payload/blob offload; defer unless required
+- [`cognition.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/cognition.rs)
+  - reason: domain-specific storage/cognition schema, not SDK transport core
+- [`nats.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/nats.rs)
+  - reason: not needed for first `SY.opa.rules` router contract work
+- [`node_client.rs`]-adjacent higher-level convenience modules such as:
+  - [`prelude.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/prelude.rs)
+  - [`comm/`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/comm/mod.rs)
+  - [`thread.rs`](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/thread.rs)
+  - [`split.rs`] helpers beyond the sender/receiver baseline
+  - reason: not required to make `SY.opa.rules` a first-class node on the current wire/runtime contract
+
+#### Important implementation note
+
+For `fluxbee-go-sdk`, parity means:
+
+- same wire format
+- same message field names
+- same canonical constants
+- same reply/error semantics
+
+It does **not** mean:
+
+- every Rust convenience helper must exist on day one
+- every Rust domain module must be reimplemented in Go immediately
+- `SY.opa.rules` must lose its current working OPA-specific surface in v1.0
+
+### 3.5 Versioned migration approach for `SY.opa.rules`
+
+#### v1.0 — compatibility-first
+
+Goals:
+
+- keep the current OPA-related behavior working
+- preserve current OPA action names, message patterns, and operational semantics unless change is required by the new config/control-plane support
+- extract reusable runtime/protocol pieces into `fluxbee-go-sdk`
+- add canonical Rust-SDK-style config/control-plane support where needed now
+
+This means v1.0 should:
+
+- keep current OPA command/query behavior working
+- keep current SHM and OPA reload behavior working
+- add support for newer config/control-plane integration, especially `CONFIG_GET` / `CONFIG_SET` / `CONFIG_RESPONSE` if adopted
+- avoid broad rewrites of the OPA domain logic
+
+#### v2.0 — deeper OPA migration
+
+Goals:
+
+- migrate remaining OPA-specific logic that still lives as legacy/custom code
+- reduce node-specific protocol handling further
+- move more of the node behavior onto stable SDK helpers where that produces real simplification
+
+The full cleanup of `SY.opa.rules` is intentionally deferred until after the compatibility-first v1.0 cut.
+
+### 3.6 Exact `node_config` subset for `SY.opa.rules` v1.0
+
+Based on the current Rust-side admin/control-plane flow, the exact contract `SY.opa.rules` needs now is:
+
+- `SY.admin` sends:
+  - `msg_type = system`
+  - `msg = CONFIG_GET` or `CONFIG_SET`
+  - `target = node_config_control`
+  - request/reply correlation through the same `trace_id`
+- the node replies with:
+  - `msg_type = system`
+  - `msg = CONFIG_RESPONSE`
+  - `target = node_config_control`
+  - same `trace_id`
+
+For `fluxbee-go-sdk` v1.0, the recommended approach is to include the **full current Rust `node_config.rs` helper surface**, because it is already small, canonical, and self-contained.
+
+That means including:
+
+- constants:
+  - `MSG_CONFIG_GET`
+  - `MSG_CONFIG_SET`
+  - `MSG_CONFIG_RESPONSE`
+  - `NODE_CONFIG_CONTROL_TARGET`
+  - `NODE_CONFIG_APPLY_MODE_REPLACE`
+- payload structs:
+  - `NodeConfigGetPayload`
+  - `NodeConfigSetPayload`
+  - `NodeConfigControlResponse`
+- request/response helpers:
+  - `is_node_config_get_message`
+  - `is_node_config_set_message`
+  - `is_node_config_response_message`
+  - `parse_node_config_request`
+  - `parse_node_config_response`
+  - `build_node_config_get_message`
+  - `build_node_config_set_message`
+  - `build_node_config_response_message`
+  - `build_node_config_response_message_runtime_src`
+- support types:
+  - `NodeConfigEnvelopeOptions`
+  - `NodeConfigControlRequest`
+  - `NodeConfigControlError`
+
+Why include the whole helper set instead of only a server-side subset:
+
+- it is already the canonical Rust control-plane contract
+- it is small enough that partial porting buys little and creates future drift risk
+- it is useful for third-party Go nodes, not only for `SY.opa.rules`
+- it allows `SY.opa.rules` to add `CONFIG_GET` / `CONFIG_SET` cleanly without touching its OPA-specific actions
+
+What v1.0 should **not** do:
+
+- replace existing OPA command/query/config actions with node-config control-plane actions
+- force `CONFIG_GET` / `CONFIG_SET` to become the primary way to compile/apply/rollback OPA policy
+
+The intended v1.0 split is:
+
+- existing OPA actions keep working as they do today
+- canonical node config control-plane support is added alongside them
+- deeper unification is a later decision
+
 ---
 
 ## 4) Work split
@@ -130,13 +370,15 @@ Bring the existing Rust node up to current SDK and config conventions.
 
 ### Track B — `fluxbee-go-sdk` + `SY.opa.rules`
 
-Build the minimum Go SDK needed to expose the same external runtime contract as the Rust SDK, then migrate `SY.opa.rules` to use it.
+Build the minimum Go SDK needed to support `SY.opa.rules` without breaking its current working OPA behavior, then use that SDK to add newer Rust-SDK-aligned control-plane pieces.
 
 For now, the target is:
 
 - no ad hoc compatibility layer embedded only in `SY.opa.rules`
 - no forced Rust rewrite
+- preserve the current OPA-facing actions and mechanisms in v1.0 unless change is required by the config/control-plane work
 - a real SDK path for Go-based nodes, with `SY.opa.rules` as first consumer
+- a public-facing SDK shape that can be used by third parties building Fluxbee-compatible Go nodes
 
 ---
 
@@ -192,6 +434,45 @@ For now, the target is:
 - [ ] SYS-ALIGN-S2-T5. Freeze which parts of the Rust message model must be reproduced by `fluxbee-go-sdk`.
 - [ ] SYS-ALIGN-S2-T6. Decide whether `SY.opa.rules` keeps custom `command/query` message kinds as first-class Fluxbee categories or is adapted to the same shared runtime model used by Rust nodes.
 
+### SYS-ALIGN-S2A — Freeze `fluxbee-go-sdk` v1 minimum scope
+
+- [ ] SYS-ALIGN-S2A-T1. Freeze `fluxbee-go-sdk` v1.0 as a **transport/runtime SDK** with a public reusable surface, not yet full parity with every Rust helper.
+- [ ] SYS-ALIGN-S2A-T2. Include in v1 the minimum common envelope types:
+  - `Message`
+  - `Meta`
+  - `Routing`
+  - destination helpers
+- [ ] SYS-ALIGN-S2A-T3. Include in v1 the minimum router transport behavior:
+  - unix socket connect
+  - HELLO
+  - ANNOUNCE handling
+  - frame read/write
+  - reconnect loop
+- [ ] SYS-ALIGN-S2A-T4. Include in v1 the minimum node lifecycle helpers:
+  - node identity / UUID loading
+  - sender / receiver abstraction
+  - request reply helper
+  - trace propagation helper
+- [ ] SYS-ALIGN-S2A-T5. Include in v1 standardized reply helpers for:
+  - success replies
+  - error replies
+  - system message replies
+  - query / command reply patterns if those categories remain in scope
+- [ ] SYS-ALIGN-S2A-T6. Explicitly defer from v1 unless needed by the first migration:
+  - higher-level admin client helpers
+  - policy helpers
+  - manifest helpers
+  - storage/query convenience clients
+- [ ] SYS-ALIGN-S2A-T7. Freeze the first consumer contract:
+  - `SY.opa.rules` must be migratable to `fluxbee-go-sdk` without changing OPA SHM semantics
+  - the SDK should be reusable by future internal or third-party Go nodes, but v1 is allowed to be minimal
+- [ ] SYS-ALIGN-S2A-T8. Keep package boundaries, naming, and exported API stable enough that `fluxbee-go-sdk` can be documented and published as the Go counterpart of the Rust SDK.
+- [ ] SYS-ALIGN-S2A-T9. Freeze the exact node-config subset that enters Go v1.0 for `SY.opa.rules`:
+  - `CONFIG_GET`
+  - `CONFIG_SET`
+  - `CONFIG_RESPONSE`
+  - helper builders/parsers needed for those flows
+
 ### SYS-ALIGN-S3 — Normalize config/control-plane behavior
 
 - [ ] SYS-ALIGN-S3-T1. Decide what "live config" means for `SY.config.routes`.
@@ -228,7 +509,7 @@ For now, the target is:
 
 #### `fluxbee-go-sdk`
 
-- [ ] SYS-ALIGN-S5-T5. Define the minimum v1 scope of `fluxbee-go-sdk`.
+- [ ] SYS-ALIGN-S5-T5. Define the minimum v1.0 scope of `fluxbee-go-sdk`.
 - [ ] SYS-ALIGN-S5-T6. Implement shared Go types equivalent to the common node envelope:
   - `Message`
   - `Meta`
@@ -243,7 +524,7 @@ For now, the target is:
   - request/reply
   - error replies
   - trace propagation
-- [ ] SYS-ALIGN-S5-T9. Decide whether node config control-plane helpers belong in v1 of the Go SDK or in a later phase.
+- [ ] SYS-ALIGN-S5-T9. Implement the node config control-plane subset needed by `SY.opa.rules` v1.0.
 - [ ] SYS-ALIGN-S5-T10. Add protocol-level tests or fixtures proving parity with the chosen Rust-side contract.
 
 #### `SY.opa.rules`
@@ -251,8 +532,10 @@ For now, the target is:
 - [ ] SYS-ALIGN-S5-T11. Migrate `SY.opa.rules` transport/envelope code to `fluxbee-go-sdk`.
 - [ ] SYS-ALIGN-S5-T12. Replace its local `Message` / `Meta` / `Routing` structs with SDK equivalents.
 - [ ] SYS-ALIGN-S5-T13. Replace its embedded router client lifecycle with SDK connection helpers.
-- [ ] SYS-ALIGN-S5-T14. Preserve OPA SHM, compile/apply/rollback, and router reload semantics during the migration.
-- [ ] SYS-ALIGN-S5-T15. Re-test admin and orchestrator interoperability after the SDK migration.
+- [ ] SYS-ALIGN-S5-T14. Add Rust-SDK-aligned config/control-plane support without breaking the current OPA action surface.
+- [ ] SYS-ALIGN-S5-T15. Preserve OPA SHM, compile/apply/rollback, and router reload semantics during the migration.
+- [ ] SYS-ALIGN-S5-T16. Re-test admin and orchestrator interoperability after the SDK migration.
+- [ ] SYS-ALIGN-S5-T17. Leave deeper OPA-specific cleanup for v2.0.
 
 ### SYS-ALIGN-S6 — Documentation and operator model
 
@@ -278,6 +561,10 @@ For now, the target is:
 The goal is narrower:
 - make these legacy nodes coherent with the current Fluxbee runtime contract first
 
+For `fluxbee-go-sdk`, that still means a real external SDK:
+- the first consumer is `SY.opa.rules`
+- but the design target is a third-party-usable Go SDK, analogous in intent to the Rust SDK
+
 ---
 
 ## 7) Recommended order
@@ -286,11 +573,33 @@ Recommended implementation order:
 
 1. `SYS-ALIGN-S1` protocol audit
 2. `SYS-ALIGN-S2` envelope normalization decisions
-3. `SYS-ALIGN-S3` config/control-plane decisions
-4. `SYS-ALIGN-S5` implementation
-5. `SYS-ALIGN-S6` documentation updates
+3. `SYS-ALIGN-S2A` freeze `fluxbee-go-sdk` v1 minimum scope
+4. `SYS-ALIGN-S3` config/control-plane decisions
+5. `SYS-ALIGN-S5` implementation
+6. `SYS-ALIGN-S6` documentation updates
 
 **Pragmatic recommendation:**
-- Do `SY.config.routes` first because it is already a Rust node and the gap is mostly contract/SDK drift.
+- Do not change working OPA behavior in `SY.opa.rules` unless it is part of the new config/control-plane support being added now.
 - For `SY.opa.rules`, do not build a one-off compatibility layer inside the node.
-- Start by freezing the minimum `fluxbee-go-sdk` contract, then migrate `SY.opa.rules` onto that SDK.
+- Start by freezing the minimum `fluxbee-go-sdk` contract plus the node-config subset it needs, then migrate `SY.opa.rules` onto that SDK.
+
+---
+
+## 8) Execution order
+
+To avoid losing the sequence, the execution order for this stream is:
+
+1. Freeze the canonical modern node contract reference.
+2. Audit `SY.opa.rules` against that contract.
+3. Freeze `fluxbee-go-sdk` v1.0 minimum scope.
+4. Freeze the `node_config` subset that `SY.opa.rules` needs now.
+5. Implement `fluxbee-go-sdk` core transport/runtime pieces.
+6. Implement the config/control-plane subset needed now.
+7. Migrate `SY.opa.rules` to `fluxbee-go-sdk` without changing the current OPA-facing behavior.
+8. Re-test `SY.admin` and `SY.orchestrator` interoperability with `SY.opa.rules`.
+9. Audit `SY.config.routes` against the modern Rust node contract.
+10. Bring `SY.config.routes` up to current Rust SDK/config conventions.
+11. Update docs and operator-facing action/config references.
+
+**Immediate next step:**
+- Start with steps 1 to 4, because if the Go SDK scope and the config subset are not frozen first, `SY.opa.rules` will just grow another embedded compatibility layer.
