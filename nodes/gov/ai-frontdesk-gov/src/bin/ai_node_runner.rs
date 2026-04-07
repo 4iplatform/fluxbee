@@ -2627,7 +2627,7 @@ async fn run_unconfigured_bootstrap(
     let gov_identity = gov_identity_config_from_env();
     let ai_node = GenericAiNode {
         mode,
-        node_name,
+        node_name: node_name.clone(),
         behavior: Arc::new(RwLock::new(behavior)),
         dynamic_config_dir: dynamic_dir,
         thread_state_store,
