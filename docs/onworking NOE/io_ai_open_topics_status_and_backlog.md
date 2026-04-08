@@ -684,6 +684,8 @@ Estado despues de este avance:
   - unitarias del SDK para contrato y materializacion
   - una validacion E2E real con `IO.slack` para `text/csv`
   - una prueba negativa manual intentada en Linux que no logro forzar el fallo de materializacion en ese entorno
+  - compilacion Linux real de `fluxbee-ai-nodes`
+  - suite local del runner AI en Linux con `24` tests verdes
 [x] AI/IO 4bis.D3: actualizar docs canonicamente
   - que soporta el contrato
   - que esta implementado hoy
@@ -728,6 +730,334 @@ Riesgo principal a controlar:
 - no filtrar al usuario archivos generados para razonamiento interno del agente
 - la publicacion a usuario final debe ser una decision explicita del runtime/behavior, no una inferencia automatica por tipo de tool output
 - no hardcodear el primer tipo de archivo validado como si fuera una restriccion estructural del pipeline
+
+### Bloque 4 ter - Ampliar formatos salientes para cerrar un MVP decente
+
+Prioridad: P1
+
+Objetivo del bloque:
+
+- aprovechar que el pipeline saliente ya quedo general (`bytes + mime + filename -> blob -> attachments[]`)
+- sumar una cantidad razonable de formatos user-facing utiles sin reabrir la arquitectura base
+- cerrar un MVP que cubra reportes, documentos, tablas y una salida visual simple
+
+Criterio de diseno:
+
+- no agregar ramas especiales por formato dentro del contrato comun del runner
+- mantener `AiUserArtifact` como shape MIME-agnostico
+- concentrar diferencias por tipo en:
+  - tools/behaviors productores
+  - validaciones puntuales de MIME/filename
+  - pruebas E2E por familia de formatos
+
+Alcance recomendado para este MVP:
+
+- incluir:
+  - `text/plain`
+  - `text/csv`
+  - `application/json`
+  - `text/markdown`
+  - `text/html`
+  - `application/pdf`
+  - `image/png`
+  - `image/jpeg`
+  - `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` (`.xlsx`)
+  - `application/vnd.openxmlformats-officedocument.wordprocessingml.document` (`.docx`)
+- dejar fuera por ahora:
+  - ejecutables (`.exe`, `.sh`, `.bat`, `.msi`)
+  - formatos con macros (`.xlsm`, `.docm`)
+  - archivos comprimidos genericos (`.zip`, `.rar`, `.7z`) salvo caso puntual
+  - audio/video
+  - `pptx` si no aparece necesidad real inmediata
+
+Subbloque 4ter.A - reglas canonicas de aceptacion saliente
+
+[x] AI 4ter.A1: definir allowlist saliente de MIME permitidos para artefactos AI del MVP
+  - concentrar la decision en un helper comun
+  - no dejar la validacion dispersa por tool
+  - si el MIME no esta permitido, devolver error canonico claro
+[x] AI 4ter.A2: validar `filename` saliente de forma canonica
+  - nombre no vacio
+  - extension coherente con MIME cuando aplique
+  - longitud razonable
+  - sanitizacion minima sin romper nombres de usuario utiles
+[x] AI 4ter.A3: definir errores canonicos adicionales de salida
+  - `artifact_mime_not_allowed`
+  - `artifact_filename_invalid`
+  - mantener `artifact_generation_failed`
+  - mantener `artifact_materialization_failed`
+
+Subbloque 4ter.B - helpers comunes para productores de artefactos
+
+[x] AI 4ter.B1: agregar helper/builder comun para construir `AiUserArtifact`
+  - `from_bytes(...)`
+  - `from_text(...)`
+  - `from_json(...)`
+  - `from_markdown(...)`
+  - `from_html(...)`
+[x] AI 4ter.B2: evitar que cada tool rehaga manualmente
+  - serializacion
+  - MIME
+  - filename
+  - validaciones minimas
+[x] AI 4ter.B3: estandarizar observabilidad por artefacto
+  - tool usada
+  - MIME
+  - filename
+  - size en bytes
+  - exito/fallo de blob
+
+Subbloque 4ter.C - formatos textuales y estructurados
+
+[x] AI 4ter.C1: implementar `generate_text_artifact`
+  - `text/plain`
+  - usarlo como baseline mas simple despues de CSV
+[x] AI 4ter.C2: implementar `generate_json_artifact`
+  - desde datos estructurados
+  - output estable y descargable
+[x] AI 4ter.C3: implementar `generate_markdown_artifact`
+  - contenido lineal
+  - listas/tablas simples
+[x] AI 4ter.C4: implementar `generate_html_artifact`
+  - HTML simple y controlado
+  - sin abrir superficie innecesaria de contenido arbitrario
+
+Subbloque 4ter.D - documentos y tablas de oficina
+
+[x] AI 4ter.D1: implementar productor de `application/pdf`
+  - elegir estrategia concreta de generacion
+  - no acoplar el runner a una unica libreria si se puede evitar
+[x] AI 4ter.D2: implementar productor de `.xlsx`
+  - hoja unica en MVP
+  - datos tabulares
+  - sin formulas complejas ni estilos avanzados
+[x] AI 4ter.D3: implementar productor de `.docx`
+  - titulo
+  - parrafos
+  - lista
+  - tabla simple opcional
+[x] AI 4ter.D4: mantener `generate_csv_artifact` como caso estable de regresion
+  - no reemplazarlo por formatos mas complejos
+  - usarlo como baseline del pipeline
+
+Subbloque 4ter.E - imagenes simples
+
+[x] AI 4ter.E1: implementar productor de `image/png`
+  - primer caso visual simple y controlado
+  - no hace falta arrancar por generacion de imagen compleja
+[x] AI 4ter.E2: implementar productor de `image/jpeg`
+  - solo si entra naturalmente desde el mismo flujo de imagen
+  - no reabrir trabajo innecesario si `png` cubre mejor el MVP
+
+Subbloque 4ter.F - validacion E2E por familias
+
+[ ] IO/AI 4ter.F1: validar familia texto
+  - `txt`
+  - `json`
+  - `md`
+  - `html`
+[ ] IO/AI 4ter.F2: validar familia tablas
+  - `csv`
+  - `xlsx`
+[ ] IO/AI 4ter.F3: validar familia documentos
+  - `pdf`
+  - `docx`
+[ ] IO/AI 4ter.F4: validar familia imagen
+  - `png`
+  - `jpeg` si entra en MVP
+[ ] IO/AI 4ter.F5: confirmar entrega real en `IO.slack`
+  - no solo blob en disco
+  - tambien recepcion visible por el usuario final
+
+Subbloque 4ter.G - cierre documental de formatos soportados
+
+[x] AI/IO 4ter.G1: documentar matriz MVP de formatos salientes
+  - formatos soportados por contrato
+  - formatos implementados por tools/behaviors
+  - formatos validados E2E
+  - formatos explicitamente fuera de alcance
+[x] AI/IO 4ter.G2: dejar explicitado que `csv` fue el primer caso de validacion
+  - pero no una restriccion estructural del pipeline
+
+Matriz MVP actual de formatos salientes:
+
+- soportados por contrato comun de salida:
+  - `text/plain`
+  - `text/csv`
+  - `application/json`
+  - `text/markdown`
+  - `text/html`
+  - `application/pdf`
+  - `image/png`
+  - `image/jpeg`
+  - `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` (`.xlsx`)
+  - `application/vnd.openxmlformats-officedocument.wordprocessingml.document` (`.docx`)
+- implementados hoy por tools/behaviors en `AI.common`:
+  - `generate_text_artifact`
+  - `generate_csv_artifact`
+  - `generate_json_artifact`
+  - `generate_markdown_artifact`
+  - `generate_html_artifact`
+  - `generate_pdf_artifact`
+  - `generate_xlsx_artifact`
+  - `generate_docx_artifact`
+  - `generate_png_artifact`
+  - `generate_jpeg_artifact`
+- validados E2E reales con `IO.slack`:
+  - `text/csv`
+- validados por compilacion Linux + tests del runner:
+  - `text/plain`
+  - `application/json`
+  - `text/markdown`
+  - `text/html`
+  - `application/pdf`
+  - `.xlsx`
+  - `.docx`
+  - `image/png`
+  - `image/jpeg`
+- explicitamente fuera de alcance de este MVP:
+  - ejecutables
+  - formatos con macros
+  - comprimidos genericos
+  - audio/video
+  - `pptx`
+- `csv` queda documentado como primer caso de validacion E2E:
+  - fue el artefacto inicial de referencia para cerrar el pipeline
+  - no representa una restriccion estructural del contrato ni del runtime
+
+Orden recomendado para este bloque:
+
+1. `4ter.A1`
+2. `4ter.A2`
+3. `4ter.A3`
+4. `4ter.B1`
+5. `4ter.B2`
+6. `4ter.B3`
+7. `4ter.C1`
+8. `4ter.C2`
+9. `4ter.C3`
+10. `4ter.C4`
+11. `4ter.D1`
+12. `4ter.D2`
+13. `4ter.D3`
+14. `4ter.D4`
+15. `4ter.E1`
+16. `4ter.E2`
+17. `4ter.F1`
+18. `4ter.F2`
+19. `4ter.F3`
+20. `4ter.F4`
+21. `4ter.F5`
+22. `4ter.G1`
+23. `4ter.G2`
+
+Fases recomendadas de ejecucion:
+
+Fase 1 - habilitar formatos rapidos sobre la base ya cerrada
+
+- objetivo:
+  - sumar varios formatos utiles sin agregar dependencias pesadas al principio
+  - cerrar reglas comunes antes de multiplicar tools
+- alcance:
+  - `4ter.A1`
+  - `4ter.A2`
+  - `4ter.A3`
+  - `4ter.B1`
+  - `4ter.B2`
+  - `4ter.B3`
+  - `4ter.C1`
+  - `4ter.C2`
+  - `4ter.C3`
+  - `4ter.C4`
+- salida esperada:
+  - allowlist saliente cerrada
+  - builder comun de artefactos
+  - soporte real para:
+    - `txt`
+    - `csv`
+    - `json`
+    - `md`
+    - `html`
+  - estado:
+    - implementacion de codigo cerrada
+    - tests directos del runner para tools textuales agregados
+    - falta validacion E2E especifica de la familia texto
+
+Fase 2 - cerrar formatos de documento con mayor valor de producto
+
+- objetivo:
+  - cubrir los formatos que mas valor suelen aportar al usuario final
+  - mantener el pipeline unico y solo sumar productores concretos
+- alcance:
+  - `4ter.D1`
+  - `4ter.D2`
+  - `4ter.D3`
+  - `4ter.D4`
+  - `4ter.E1`
+  - `4ter.E2`
+- salida esperada:
+  - soporte real para:
+    - `pdf`
+    - `xlsx`
+    - `docx`
+    - `png`
+    - `jpeg` si entra sin costo alto
+  - estado:
+    - implementacion de codigo cerrada para `pdf`, `xlsx`, `docx`, `png`, `jpeg`
+    - tests directos del runner para `pdf`, `xlsx`, `docx`, `png`, `jpeg`
+    - sigue pendiente la validacion E2E por familia
+
+Fase 3 - validacion por familias y cierre de MVP
+
+- objetivo:
+  - confirmar que los formatos llegan realmente al usuario
+  - dejar cerrada la matriz MVP y sus limites
+- alcance:
+  - `4ter.F1`
+  - `4ter.F2`
+  - `4ter.F3`
+  - `4ter.F4`
+  - `4ter.F5`
+  - `4ter.G1`
+  - `4ter.G2`
+- salida esperada:
+  - evidencia E2E por familia
+  - matriz documentada de formatos soportados
+  - limites del MVP explicitados
+
+Prioridad operativa recomendada:
+
+- arrancar por Fase 1
+- no empezar `pdf/xlsx/docx/png` antes de cerrar allowlist + builder comun
+- si hubiera que recortar alcance para llegar antes a valor visible, el orden de conservacion recomendado es:
+  - `txt`
+  - `csv`
+  - `json`
+  - `md`
+  - `html`
+  - `pdf`
+  - `xlsx`
+  - `docx`
+  - `png`
+
+Criterio recomendado de cierre de MVP:
+
+- considerar el MVP suficientemente decente si quedan funcionales y descargables por Slack:
+  - `txt`
+  - `csv`
+  - `json`
+  - `md`
+  - `html`
+  - `pdf`
+  - `xlsx`
+  - `docx`
+  - `png`
+- con eso se cubren:
+  - reportes
+  - tablas
+  - documentos
+  - exportes estructurados
+  - una salida visual simple
 
 ### Bloque 5 - Cerrar UX IO<->AI para errores y archivos
 
