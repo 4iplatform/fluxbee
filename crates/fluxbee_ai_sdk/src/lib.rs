@@ -35,8 +35,9 @@ pub use message::{
 };
 pub use node_trait::AiNode;
 pub use output::{
-    build_ai_behavior_response, build_ai_behavior_response_with_options,
-    materialize_user_artifacts, AiBehaviorOutput, AiFinalOutput, AiUserArtifact,
+    allowed_user_artifact_mime, build_ai_behavior_response,
+    build_ai_behavior_response_with_options, materialize_user_artifacts, AiBehaviorOutput,
+    AiFinalOutput, AiUserArtifact,
 };
 pub use router_client::{AiNodeConfig, RouterClient};
 pub use runtime::{NodeRuntime, RetryPolicy, RuntimeConfig};

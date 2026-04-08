@@ -2,8 +2,28 @@ use fluxbee_sdk::blob::{BlobRef, BlobToolkit};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::errors::Result;
+use crate::errors::{AiSdkError, Result};
 use crate::text_payload::{build_text_response_with_options, TextResponseOptions};
+
+const AI_USER_ARTIFACT_FILENAME_MAX_CHARS: usize = 128;
+const ALLOWED_USER_ARTIFACT_MIMES: &[(&str, &[&str])] = &[
+    ("text/plain", &["txt"]),
+    ("text/csv", &["csv"]),
+    ("application/json", &["json"]),
+    ("text/markdown", &["md", "markdown"]),
+    ("text/html", &["html", "htm"]),
+    ("application/pdf", &["pdf"]),
+    ("image/png", &["png"]),
+    ("image/jpeg", &["jpg", "jpeg"]),
+    (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        &["xlsx"],
+    ),
+    (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        &["docx"],
+    ),
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AiBehaviorOutput {
@@ -61,6 +81,36 @@ impl AiUserArtifact {
             filename: filename.into(),
         }
     }
+
+    pub fn from_text(filename: impl Into<String>, content: impl Into<String>) -> Result<Self> {
+        Self::new(content.into().into_bytes(), "text/plain", filename).validated()
+    }
+
+    pub fn from_markdown(filename: impl Into<String>, content: impl Into<String>) -> Result<Self> {
+        Self::new(content.into().into_bytes(), "text/markdown", filename).validated()
+    }
+
+    pub fn from_html(filename: impl Into<String>, content: impl Into<String>) -> Result<Self> {
+        Self::new(content.into().into_bytes(), "text/html", filename).validated()
+    }
+
+    pub fn from_json<T: Serialize>(filename: impl Into<String>, value: &T) -> Result<Self> {
+        let bytes = serde_json::to_vec_pretty(value)?;
+        Self::new(bytes, "application/json", filename).validated()
+    }
+
+    pub fn from_bytes(
+        filename: impl Into<String>,
+        mime: impl Into<String>,
+        bytes: impl Into<Vec<u8>>,
+    ) -> Result<Self> {
+        Self::new(bytes, mime, filename).validated()
+    }
+
+    pub fn validated(self) -> Result<Self> {
+        validate_user_artifact(&self)?;
+        Ok(self)
+    }
 }
 
 pub fn build_ai_behavior_response(output: AiBehaviorOutput) -> Result<Value> {
@@ -97,11 +147,77 @@ pub fn materialize_user_artifacts(
 
     let mut refs = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
+        validate_user_artifact(artifact)?;
         let blob_ref = blob.put_bytes(&artifact.bytes, &artifact.filename, &artifact.mime)?;
         blob.promote(&blob_ref)?;
         refs.push(blob_ref);
     }
     Ok(refs)
+}
+
+pub fn allowed_user_artifact_mime(mime: &str) -> bool {
+    normalized_user_artifact_extension_set(mime).is_some()
+}
+
+fn validate_user_artifact(artifact: &AiUserArtifact) -> Result<()> {
+    if !allowed_user_artifact_mime(&artifact.mime) {
+        return Err(AiSdkError::ArtifactMimeNotAllowed {
+            mime: artifact.mime.clone(),
+        });
+    }
+    validate_user_artifact_filename(&artifact.filename, &artifact.mime)
+}
+
+fn validate_user_artifact_filename(filename: &str, mime: &str) -> Result<()> {
+    let trimmed = filename.trim();
+    if trimmed.is_empty() {
+        return Err(AiSdkError::ArtifactFilenameInvalid {
+            detail: "filename is required".to_string(),
+        });
+    }
+    if trimmed.len() > AI_USER_ARTIFACT_FILENAME_MAX_CHARS {
+        return Err(AiSdkError::ArtifactFilenameInvalid {
+            detail: format!("filename exceeds {AI_USER_ARTIFACT_FILENAME_MAX_CHARS} characters"),
+        });
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
+        return Err(AiSdkError::ArtifactFilenameInvalid {
+            detail: "path traversal is not allowed in filename".to_string(),
+        });
+    }
+    if trimmed.chars().any(|ch| ch.is_control()) {
+        return Err(AiSdkError::ArtifactFilenameInvalid {
+            detail: "filename contains control characters".to_string(),
+        });
+    }
+    let extension = trimmed
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.trim().to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty())
+        .ok_or_else(|| AiSdkError::ArtifactFilenameInvalid {
+            detail: "filename must include an extension".to_string(),
+        })?;
+    let allowed_extensions = normalized_user_artifact_extension_set(mime).ok_or_else(|| {
+        AiSdkError::ArtifactMimeNotAllowed {
+            mime: mime.to_string(),
+        }
+    })?;
+    if !allowed_extensions
+        .iter()
+        .any(|candidate| *candidate == extension)
+    {
+        return Err(AiSdkError::ArtifactFilenameInvalid {
+            detail: format!("filename extension '.{extension}' does not match MIME '{mime}'"),
+        });
+    }
+    Ok(())
+}
+
+fn normalized_user_artifact_extension_set(mime: &str) -> Option<&'static [&'static str]> {
+    let normalized = mime.trim().to_ascii_lowercase();
+    ALLOWED_USER_ARTIFACT_MIMES
+        .iter()
+        .find_map(|(candidate, extensions)| (*candidate == normalized).then_some(*extensions))
 }
 
 #[cfg(test)]
@@ -170,5 +286,35 @@ mod tests {
             path.exists(),
             "artifact should be promoted to active blob storage"
         );
+    }
+
+    #[test]
+    fn artifact_builder_rejects_disallowed_mime() {
+        let err = AiUserArtifact::from_bytes("payload.bin", "application/octet-stream", b"x")
+            .expect_err("disallowed MIME should fail");
+        assert!(matches!(err, AiSdkError::ArtifactMimeNotAllowed { .. }));
+    }
+
+    #[test]
+    fn artifact_builder_rejects_mismatched_extension() {
+        let err = AiUserArtifact::from_text("reporte.csv", "hola")
+            .expect_err("mismatched extension should fail");
+        assert!(matches!(err, AiSdkError::ArtifactFilenameInvalid { .. }));
+    }
+
+    #[test]
+    fn artifact_builders_create_supported_formats() {
+        let txt = AiUserArtifact::from_text("nota.txt", "hola").expect("txt");
+        assert_eq!(txt.mime, "text/plain");
+
+        let json =
+            AiUserArtifact::from_json("payload.json", &serde_json::json!({"a":1})).expect("json");
+        assert_eq!(json.mime, "application/json");
+
+        let md = AiUserArtifact::from_markdown("readme.md", "# Hola").expect("markdown");
+        assert_eq!(md.mime, "text/markdown");
+
+        let html = AiUserArtifact::from_html("index.html", "<p>Hola</p>").expect("html");
+        assert_eq!(html.mime, "text/html");
     }
 }

@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::hash::{Hash, Hasher};
+use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -687,6 +688,33 @@ struct IlkRegisterTool {
 #[derive(Clone)]
 struct GenerateCsvArtifactTool;
 
+#[derive(Clone)]
+struct GenerateTextArtifactTool;
+
+#[derive(Clone)]
+struct GenerateJsonArtifactTool;
+
+#[derive(Clone)]
+struct GenerateMarkdownArtifactTool;
+
+#[derive(Clone)]
+struct GenerateHtmlArtifactTool;
+
+#[derive(Clone)]
+struct GeneratePdfArtifactTool;
+
+#[derive(Clone)]
+struct GenerateXlsxArtifactTool;
+
+#[derive(Clone)]
+struct GenerateDocxArtifactTool;
+
+#[derive(Clone)]
+struct GeneratePngArtifactTool;
+
+#[derive(Clone)]
+struct GenerateJpegArtifactTool;
+
 #[derive(Debug, Clone)]
 struct BehaviorContext {
     thread_id: Option<String>,
@@ -704,6 +732,93 @@ struct GenerateCsvArtifactArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct GenerateTextArtifactArgs {
+    filename: String,
+    content: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GenerateJsonArtifactArgs {
+    filename: String,
+    data: Value,
+    #[serde(default = "default_true")]
+    pretty: bool,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GenerateMarkdownArtifactArgs {
+    filename: String,
+    content: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GenerateHtmlArtifactArgs {
+    filename: String,
+    content: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GeneratePdfArtifactArgs {
+    filename: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    lines: Vec<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GenerateXlsxArtifactArgs {
+    filename: String,
+    rows: Vec<Vec<String>>,
+    #[serde(default)]
+    headers: Option<Vec<String>>,
+    #[serde(default)]
+    sheet_name: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GenerateDocxArtifactArgs {
+    filename: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    paragraphs: Vec<String>,
+    #[serde(default)]
+    bullets: Vec<String>,
+    #[serde(default)]
+    table_headers: Option<Vec<String>>,
+    #[serde(default)]
+    table_rows: Vec<Vec<String>>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GenerateRasterArtifactArgs {
+    filename: String,
+    #[serde(default)]
+    bands: Vec<String>,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ToolFinalArtifactEnvelope {
     #[serde(default)]
     text: Option<String>,
@@ -711,7 +826,7 @@ struct ToolFinalArtifactEnvelope {
     artifacts: Vec<ToolFinalArtifactItem>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ToolFinalArtifactItem {
     filename: String,
     mime: String,
@@ -1322,6 +1437,15 @@ impl GenericAiNode {
             provider.register_tools(registry)?;
         }
         registry.register(Arc::new(GenerateCsvArtifactTool))?;
+        registry.register(Arc::new(GenerateTextArtifactTool))?;
+        registry.register(Arc::new(GenerateJsonArtifactTool))?;
+        registry.register(Arc::new(GenerateMarkdownArtifactTool))?;
+        registry.register(Arc::new(GenerateHtmlArtifactTool))?;
+        registry.register(Arc::new(GeneratePdfArtifactTool))?;
+        registry.register(Arc::new(GenerateXlsxArtifactTool))?;
+        registry.register(Arc::new(GenerateDocxArtifactTool))?;
+        registry.register(Arc::new(GeneratePngArtifactTool))?;
+        registry.register(Arc::new(GenerateJpegArtifactTool))?;
         Ok(())
     }
 
@@ -1919,6 +2043,535 @@ fn csv_line(cells: &[String]) -> String {
         .join(",")
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn build_tool_success_artifact_response(
+    tool_name: &str,
+    text: Option<String>,
+    artifacts: Vec<AiUserArtifact>,
+) -> fluxbee_ai_sdk::Result<Value> {
+    tracing::info!(
+        tool = %tool_name,
+        artifact_count = artifacts.len(),
+        artifact_filenames = ?artifacts
+            .iter()
+            .map(|artifact| artifact.filename.clone())
+            .collect::<Vec<_>>(),
+        artifact_mimes = ?artifacts
+            .iter()
+            .map(|artifact| artifact.mime.clone())
+            .collect::<Vec<_>>(),
+        artifact_total_bytes = artifacts.iter().map(|artifact| artifact.bytes.len()).sum::<usize>(),
+        "tool produced final user-facing artifacts"
+    );
+    let envelope = ToolFinalArtifactEnvelope {
+        text,
+        artifacts: artifacts
+            .into_iter()
+            .map(|artifact| ToolFinalArtifactItem {
+                filename: artifact.filename,
+                mime: artifact.mime,
+                bytes_base64: base64::engine::general_purpose::STANDARD.encode(artifact.bytes),
+            })
+            .collect(),
+    };
+    Ok(json!({
+        "status": "ok",
+        "final_output": envelope
+    }))
+}
+
+fn invalid_tool_args_error(tool_name: &str, err: serde_json::Error) -> fluxbee_ai_sdk::AiSdkError {
+    fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("{tool_name}: invalid arguments: {err}"))
+}
+
+fn invalid_tool_artifact_error(tool_name: &str, err: fluxbee_ai_sdk::AiSdkError) -> Value {
+    let error_code = match &err {
+        fluxbee_ai_sdk::errors::AiSdkError::ArtifactMimeNotAllowed { .. } => {
+            "artifact_mime_not_allowed"
+        }
+        fluxbee_ai_sdk::errors::AiSdkError::ArtifactFilenameInvalid { .. } => {
+            "artifact_filename_invalid"
+        }
+        _ => "artifact_generation_failed",
+    };
+    json!({
+        "status": "error",
+        "error_code": error_code,
+        "message": format!("{tool_name}: {err}"),
+        "retryable": false
+    })
+}
+
+fn xml_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn pdf_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('(', "\\(")
+        .replace(')', "\\)")
+}
+
+fn build_pdf_bytes(title: Option<&str>, lines: &[String]) -> fluxbee_ai_sdk::Result<Vec<u8>> {
+    let mut content_lines = Vec::new();
+    if let Some(title) = title.map(str::trim).filter(|value| !value.is_empty()) {
+        content_lines.push(title.to_string());
+        content_lines.push(String::new());
+    }
+    if lines.is_empty() && title.is_none() {
+        content_lines.push("Documento generado por AI".to_string());
+    } else {
+        content_lines.extend(lines.iter().cloned());
+    }
+
+    let mut content = String::from("BT\n/F1 12 Tf\n50 742 Td\n14 TL\n");
+    for line in content_lines {
+        content.push_str(&format!("({}) Tj\nT*\n", pdf_escape(&line)));
+    }
+    content.push_str("ET\n");
+    let content_bytes = content.into_bytes();
+
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    let objects = vec![
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n".to_vec(),
+        b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+        format!(
+            "5 0 obj\n<< /Length {} >>\nstream\n",
+            content_bytes.len()
+        )
+        .into_bytes(),
+    ];
+
+    for object in objects.into_iter().take(4) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(&object);
+    }
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        format!("5 0 obj\n<< /Length {} >>\nstream\n", content_bytes.len()).as_bytes(),
+    );
+    pdf.extend_from_slice(&content_bytes);
+    pdf.extend_from_slice(b"endstream\nendobj\n");
+
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            6, xref_offset
+        )
+        .as_bytes(),
+    );
+    Ok(pdf)
+}
+
+fn sanitize_sheet_name(raw: Option<&str>) -> String {
+    let candidate = raw.unwrap_or("Sheet1").trim();
+    let filtered = candidate
+        .chars()
+        .filter(|ch| !matches!(ch, ':' | '\\' | '/' | '?' | '*' | '[' | ']'))
+        .collect::<String>();
+    let final_name = if filtered.is_empty() {
+        "Sheet1"
+    } else {
+        filtered.as_str()
+    };
+    final_name.chars().take(31).collect()
+}
+
+fn column_name(index: usize) -> String {
+    let mut value = index + 1;
+    let mut out = String::new();
+    while value > 0 {
+        let rem = (value - 1) % 26;
+        out.insert(0, (b'A' + rem as u8) as char);
+        value = (value - 1) / 26;
+    }
+    out
+}
+
+fn build_xlsx_bytes(args: &GenerateXlsxArtifactArgs) -> fluxbee_ai_sdk::Result<Vec<u8>> {
+    let mut rows = Vec::new();
+    if let Some(headers) = args.headers.as_ref().filter(|headers| !headers.is_empty()) {
+        rows.push(headers.clone());
+    }
+    rows.extend(args.rows.clone());
+    if rows.is_empty() {
+        rows.push(vec!["Generated by AI".to_string()]);
+    }
+    let sheet_name = sanitize_sheet_name(args.sheet_name.as_deref());
+    let mut sheet_xml = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>"#,
+    );
+    for (row_idx, row) in rows.iter().enumerate() {
+        sheet_xml.push_str(&format!(r#"<row r="{}">"#, row_idx + 1));
+        for (col_idx, cell) in row.iter().enumerate() {
+            let cell_ref = format!("{}{}", column_name(col_idx), row_idx + 1);
+            sheet_xml.push_str(&format!(
+                r#"<c r="{cell_ref}" t="inlineStr"><is><t>{}</t></is></c>"#,
+                xml_escape(cell)
+            ));
+        }
+        sheet_xml.push_str("</row>");
+    }
+    sheet_xml.push_str("</sheetData></worksheet>");
+
+    let cursor = Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(cursor);
+    let options =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+    zip.start_file("[Content_Types].xml", options)
+        .map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "xlsx: start content types failed: {err}"
+            ))
+        })?;
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+</Types>"#,
+    )
+    .map_err(|err| fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("xlsx: write content types failed: {err}")))?;
+
+    zip.start_file("_rels/.rels", options).map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("xlsx: start rels failed: {err}"))
+    })?;
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
+</Relationships>"#,
+    )
+    .map_err(|err| fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("xlsx: write rels failed: {err}")))?;
+
+    zip.start_file("docProps/core.xml", options)
+        .map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "xlsx: start core props failed: {err}"
+            ))
+        })?;
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dc:title>AI Generated Spreadsheet</dc:title>
+  <dc:creator>Fluxbee AI</dc:creator>
+</cp:coreProperties>"#,
+    )
+    .map_err(|err| fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("xlsx: write core props failed: {err}")))?;
+
+    zip.start_file("docProps/app.xml", options).map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("xlsx: start app props failed: {err}"))
+    })?;
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
+  <Application>Fluxbee AI</Application>
+</Properties>"#,
+    )
+    .map_err(|err| fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("xlsx: write app props failed: {err}")))?;
+
+    zip.start_file("xl/workbook.xml", options).map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("xlsx: start workbook failed: {err}"))
+    })?;
+    zip.write_all(
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="{}" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>"#,
+            xml_escape(&sheet_name)
+        )
+        .as_bytes(),
+    )
+    .map_err(|err| fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("xlsx: write workbook failed: {err}")))?;
+
+    zip.start_file("xl/_rels/workbook.xml.rels", options)
+        .map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "xlsx: start workbook rels failed: {err}"
+            ))
+        })?;
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#,
+    )
+    .map_err(|err| fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("xlsx: write workbook rels failed: {err}")))?;
+
+    zip.start_file("xl/styles.xml", options).map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("xlsx: start styles failed: {err}"))
+    })?;
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+  <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+  <borders count="1"><border/></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>
+</styleSheet>"#,
+    )
+    .map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("xlsx: write styles failed: {err}"))
+    })?;
+
+    zip.start_file("xl/worksheets/sheet1.xml", options)
+        .map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("xlsx: start sheet failed: {err}"))
+        })?;
+    zip.write_all(sheet_xml.as_bytes()).map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("xlsx: write sheet failed: {err}"))
+    })?;
+
+    let cursor = zip.finish().map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("xlsx: finish zip failed: {err}"))
+    })?;
+    Ok(cursor.into_inner())
+}
+
+fn build_docx_bytes(args: &GenerateDocxArtifactArgs) -> fluxbee_ai_sdk::Result<Vec<u8>> {
+    let mut body = String::new();
+    if let Some(title) = args
+        .title
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        body.push_str(&format!(
+            r#"<w:p><w:r><w:t>{}</w:t></w:r></w:p>"#,
+            xml_escape(title)
+        ));
+    }
+    if args.paragraphs.is_empty()
+        && args.bullets.is_empty()
+        && args.table_headers.is_none()
+        && args.table_rows.is_empty()
+        && args.title.is_none()
+    {
+        body.push_str(r#"<w:p><w:r><w:t>Documento generado por AI</w:t></w:r></w:p>"#);
+    }
+    for paragraph in &args.paragraphs {
+        body.push_str(&format!(
+            r#"<w:p><w:r><w:t xml:space="preserve">{}</w:t></w:r></w:p>"#,
+            xml_escape(paragraph)
+        ));
+    }
+    for bullet in &args.bullets {
+        body.push_str(&format!(
+            r#"<w:p><w:r><w:t>- {}</w:t></w:r></w:p>"#,
+            xml_escape(bullet)
+        ));
+    }
+    if args.table_headers.is_some() || !args.table_rows.is_empty() {
+        body.push_str(r#"<w:tbl>"#);
+        if let Some(headers) = args.table_headers.as_ref() {
+            body.push_str("<w:tr>");
+            for cell in headers {
+                body.push_str(&format!(
+                    r#"<w:tc><w:p><w:r><w:t>{}</w:t></w:r></w:p></w:tc>"#,
+                    xml_escape(cell)
+                ));
+            }
+            body.push_str("</w:tr>");
+        }
+        for row in &args.table_rows {
+            body.push_str("<w:tr>");
+            for cell in row {
+                body.push_str(&format!(
+                    r#"<w:tc><w:p><w:r><w:t>{}</w:t></w:r></w:p></w:tc>"#,
+                    xml_escape(cell)
+                ));
+            }
+            body.push_str("</w:tr>");
+        }
+        body.push_str("</w:tbl>");
+    }
+
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:w10="urn:schemas-microsoft-com:office:word" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" mc:Ignorable="w14 wp14">
+  <w:body>{}<w:sectPr/></w:body>
+</w:document>"#,
+        body
+    );
+
+    let cursor = Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(cursor);
+    let options =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+    zip.start_file("[Content_Types].xml", options)
+        .map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "docx: start content types failed: {err}"
+            ))
+        })?;
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+</Types>"#,
+    )
+    .map_err(|err| fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("docx: write content types failed: {err}")))?;
+
+    zip.start_file("_rels/.rels", options).map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("docx: start rels failed: {err}"))
+    })?;
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
+</Relationships>"#,
+    )
+    .map_err(|err| fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("docx: write rels failed: {err}")))?;
+
+    zip.start_file("docProps/core.xml", options)
+        .map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "docx: start core props failed: {err}"
+            ))
+        })?;
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <dc:title>AI Generated Document</dc:title>
+  <dc:creator>Fluxbee AI</dc:creator>
+</cp:coreProperties>"#,
+    )
+    .map_err(|err| fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("docx: write core props failed: {err}")))?;
+
+    zip.start_file("docProps/app.xml", options).map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("docx: start app props failed: {err}"))
+    })?;
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
+  <Application>Fluxbee AI</Application>
+</Properties>"#,
+    )
+    .map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("docx: write app props failed: {err}"))
+    })?;
+
+    zip.start_file("word/document.xml", options)
+        .map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "docx: start document failed: {err}"
+            ))
+        })?;
+    zip.write_all(document_xml.as_bytes()).map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("docx: write document failed: {err}"))
+    })?;
+
+    zip.start_file("word/styles.xml", options).map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("docx: start styles failed: {err}"))
+    })?;
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#,
+    )
+    .map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("docx: write styles failed: {err}"))
+    })?;
+
+    let cursor = zip.finish().map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!("docx: finish zip failed: {err}"))
+    })?;
+    Ok(cursor.into_inner())
+}
+
+fn color_from_seed(seed: &str) -> [u8; 3] {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut hasher);
+    let value = hasher.finish();
+    [
+        48 + ((value & 0x7f) as u8),
+        48 + (((value >> 8) & 0x7f) as u8),
+        48 + (((value >> 16) & 0x7f) as u8),
+    ]
+}
+
+fn build_raster_bytes(
+    bands: &[String],
+    width: Option<u32>,
+    height: Option<u32>,
+    format: image::ImageFormat,
+) -> fluxbee_ai_sdk::Result<Vec<u8>> {
+    let width = width.unwrap_or(1200).clamp(64, 2400);
+    let height = height.unwrap_or(800).clamp(64, 2400);
+    let mut image = image::RgbImage::from_pixel(width, height, image::Rgb([245, 245, 245]));
+    let effective_bands = if bands.is_empty() {
+        vec!["generated".to_string()]
+    } else {
+        bands.to_vec()
+    };
+    let band_height = (height / effective_bands.len() as u32).max(1);
+    for (idx, band) in effective_bands.iter().enumerate() {
+        let y_start = idx as u32 * band_height;
+        let y_end = ((idx as u32 + 1) * band_height).min(height);
+        let color = color_from_seed(band);
+        for y in y_start..y_end {
+            for x in 0..width {
+                image.put_pixel(x, y, image::Rgb(color));
+            }
+        }
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut cursor, format)
+        .map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "raster artifact encoding failed: {err}"
+            ))
+        })?;
+    Ok(cursor.into_inner())
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()
@@ -1987,11 +2640,8 @@ impl FunctionTool for GenerateCsvArtifactTool {
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
-        let args: GenerateCsvArtifactArgs = serde_json::from_value(arguments).map_err(|err| {
-            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
-                "generate_csv_artifact: invalid arguments: {err}"
-            ))
-        })?;
+        let args: GenerateCsvArtifactArgs = serde_json::from_value(arguments)
+            .map_err(|err| invalid_tool_args_error("generate_csv_artifact", err))?;
 
         let filename = args.filename.trim();
         if filename.is_empty() {
@@ -2022,19 +2672,420 @@ impl FunctionTool for GenerateCsvArtifactTool {
             csv_bytes = csv_content.len(),
             "generate_csv_artifact produced CSV final artifact"
         );
-        let bytes_base64 = base64::engine::general_purpose::STANDARD.encode(csv_content.as_bytes());
+        let artifact =
+            match AiUserArtifact::from_bytes(filename, "text/csv", csv_content.into_bytes()) {
+                Ok(artifact) => artifact,
+                Err(err) => return Ok(invalid_tool_artifact_error("generate_csv_artifact", err)),
+            };
+        build_tool_success_artifact_response(
+            "generate_csv_artifact",
+            args.text
+                .or_else(|| Some(format!("Aca esta el archivo solicitado: {}", filename))),
+            vec![artifact],
+        )
+    }
+}
 
-        Ok(json!({
-            "status": "ok",
-            "final_output": {
-                "text": args.text.or_else(|| Some(format!("Aca esta el archivo solicitado: {}", filename))),
-                "artifacts": [{
-                    "filename": filename,
-                    "mime": "text/csv",
-                    "bytes_base64": bytes_base64
-                }]
+#[async_trait]
+impl FunctionTool for GenerateTextArtifactTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "generate_text_artifact".to_string(),
+            description: "Generate a plain text file as a final user-facing artifact.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "minLength": 1 },
+                    "content": { "type": "string" },
+                    "text": { "type": "string" }
+                },
+                "required": ["filename", "content"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: GenerateTextArtifactArgs = serde_json::from_value(arguments)
+            .map_err(|err| invalid_tool_args_error("generate_text_artifact", err))?;
+        let filename = args.filename.trim();
+        let artifact = match AiUserArtifact::from_text(filename, args.content) {
+            Ok(artifact) => artifact,
+            Err(err) => return Ok(invalid_tool_artifact_error("generate_text_artifact", err)),
+        };
+        build_tool_success_artifact_response(
+            "generate_text_artifact",
+            args.text
+                .or_else(|| Some(format!("Aca esta el archivo solicitado: {}", filename))),
+            vec![artifact],
+        )
+    }
+}
+
+#[async_trait]
+impl FunctionTool for GenerateJsonArtifactTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "generate_json_artifact".to_string(),
+            description: "Generate a JSON file as a final user-facing artifact.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "minLength": 1 },
+                    "data": {},
+                    "pretty": { "type": "boolean" },
+                    "text": { "type": "string" }
+                },
+                "required": ["filename", "data"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: GenerateJsonArtifactArgs = serde_json::from_value(arguments)
+            .map_err(|err| invalid_tool_args_error("generate_json_artifact", err))?;
+        let filename = args.filename.trim();
+        let bytes = if args.pretty {
+            serde_json::to_vec_pretty(&args.data)?
+        } else {
+            serde_json::to_vec(&args.data)?
+        };
+        let artifact = match AiUserArtifact::from_bytes(filename, "application/json", bytes) {
+            Ok(artifact) => artifact,
+            Err(err) => return Ok(invalid_tool_artifact_error("generate_json_artifact", err)),
+        };
+        build_tool_success_artifact_response(
+            "generate_json_artifact",
+            args.text
+                .or_else(|| Some(format!("Aca esta el archivo solicitado: {}", filename))),
+            vec![artifact],
+        )
+    }
+}
+
+#[async_trait]
+impl FunctionTool for GenerateMarkdownArtifactTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "generate_markdown_artifact".to_string(),
+            description: "Generate a Markdown file as a final user-facing artifact.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "minLength": 1 },
+                    "content": { "type": "string" },
+                    "text": { "type": "string" }
+                },
+                "required": ["filename", "content"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: GenerateMarkdownArtifactArgs = serde_json::from_value(arguments)
+            .map_err(|err| invalid_tool_args_error("generate_markdown_artifact", err))?;
+        let filename = args.filename.trim();
+        let artifact = match AiUserArtifact::from_markdown(filename, args.content) {
+            Ok(artifact) => artifact,
+            Err(err) => {
+                return Ok(invalid_tool_artifact_error(
+                    "generate_markdown_artifact",
+                    err,
+                ))
             }
-        }))
+        };
+        build_tool_success_artifact_response(
+            "generate_markdown_artifact",
+            args.text
+                .or_else(|| Some(format!("Aca esta el archivo solicitado: {}", filename))),
+            vec![artifact],
+        )
+    }
+}
+
+#[async_trait]
+impl FunctionTool for GenerateHtmlArtifactTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "generate_html_artifact".to_string(),
+            description: "Generate an HTML file as a final user-facing artifact.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "minLength": 1 },
+                    "content": { "type": "string" },
+                    "text": { "type": "string" }
+                },
+                "required": ["filename", "content"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: GenerateHtmlArtifactArgs = serde_json::from_value(arguments)
+            .map_err(|err| invalid_tool_args_error("generate_html_artifact", err))?;
+        let filename = args.filename.trim();
+        let artifact = match AiUserArtifact::from_html(filename, args.content) {
+            Ok(artifact) => artifact,
+            Err(err) => return Ok(invalid_tool_artifact_error("generate_html_artifact", err)),
+        };
+        build_tool_success_artifact_response(
+            "generate_html_artifact",
+            args.text
+                .or_else(|| Some(format!("Aca esta el archivo solicitado: {}", filename))),
+            vec![artifact],
+        )
+    }
+}
+
+#[async_trait]
+impl FunctionTool for GeneratePdfArtifactTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "generate_pdf_artifact".to_string(),
+            description: "Generate a PDF document as a final user-facing artifact.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "minLength": 1 },
+                    "title": { "type": "string" },
+                    "lines": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "text": { "type": "string" }
+                },
+                "required": ["filename"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: GeneratePdfArtifactArgs = serde_json::from_value(arguments)
+            .map_err(|err| invalid_tool_args_error("generate_pdf_artifact", err))?;
+        let filename = args.filename.trim();
+        let bytes = build_pdf_bytes(args.title.as_deref(), &args.lines)?;
+        let artifact = match AiUserArtifact::from_bytes(filename, "application/pdf", bytes) {
+            Ok(artifact) => artifact,
+            Err(err) => return Ok(invalid_tool_artifact_error("generate_pdf_artifact", err)),
+        };
+        build_tool_success_artifact_response(
+            "generate_pdf_artifact",
+            args.text
+                .or_else(|| Some(format!("Aca esta el PDF solicitado: {}", filename))),
+            vec![artifact],
+        )
+    }
+}
+
+#[async_trait]
+impl FunctionTool for GenerateXlsxArtifactTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "generate_xlsx_artifact".to_string(),
+            description: "Generate an XLSX spreadsheet as a final user-facing artifact."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "minLength": 1 },
+                    "headers": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "rows": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "sheet_name": { "type": "string" },
+                    "text": { "type": "string" }
+                },
+                "required": ["filename", "rows"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: GenerateXlsxArtifactArgs = serde_json::from_value(arguments)
+            .map_err(|err| invalid_tool_args_error("generate_xlsx_artifact", err))?;
+        let filename = args.filename.trim();
+        let bytes = build_xlsx_bytes(&args)?;
+        let artifact = match AiUserArtifact::from_bytes(
+            filename,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            bytes,
+        ) {
+            Ok(artifact) => artifact,
+            Err(err) => return Ok(invalid_tool_artifact_error("generate_xlsx_artifact", err)),
+        };
+        build_tool_success_artifact_response(
+            "generate_xlsx_artifact",
+            args.text
+                .or_else(|| Some(format!("Aca esta la planilla solicitada: {}", filename))),
+            vec![artifact],
+        )
+    }
+}
+
+#[async_trait]
+impl FunctionTool for GenerateDocxArtifactTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "generate_docx_artifact".to_string(),
+            description: "Generate a DOCX document as a final user-facing artifact.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "minLength": 1 },
+                    "title": { "type": "string" },
+                    "paragraphs": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "bullets": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "table_headers": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "table_rows": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "text": { "type": "string" }
+                },
+                "required": ["filename"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: GenerateDocxArtifactArgs = serde_json::from_value(arguments)
+            .map_err(|err| invalid_tool_args_error("generate_docx_artifact", err))?;
+        let filename = args.filename.trim();
+        let bytes = build_docx_bytes(&args)?;
+        let artifact = match AiUserArtifact::from_bytes(
+            filename,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            bytes,
+        ) {
+            Ok(artifact) => artifact,
+            Err(err) => return Ok(invalid_tool_artifact_error("generate_docx_artifact", err)),
+        };
+        build_tool_success_artifact_response(
+            "generate_docx_artifact",
+            args.text
+                .or_else(|| Some(format!("Aca esta el documento solicitado: {}", filename))),
+            vec![artifact],
+        )
+    }
+}
+
+#[async_trait]
+impl FunctionTool for GeneratePngArtifactTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "generate_png_artifact".to_string(),
+            description: "Generate a simple PNG raster artifact with colored bands.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "minLength": 1 },
+                    "bands": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "width": { "type": "integer", "minimum": 64 },
+                    "height": { "type": "integer", "minimum": 64 },
+                    "text": { "type": "string" }
+                },
+                "required": ["filename"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: GenerateRasterArtifactArgs = serde_json::from_value(arguments)
+            .map_err(|err| invalid_tool_args_error("generate_png_artifact", err))?;
+        let filename = args.filename.trim();
+        let bytes = build_raster_bytes(
+            &args.bands,
+            args.width,
+            args.height,
+            image::ImageFormat::Png,
+        )?;
+        let artifact = match AiUserArtifact::from_bytes(filename, "image/png", bytes) {
+            Ok(artifact) => artifact,
+            Err(err) => return Ok(invalid_tool_artifact_error("generate_png_artifact", err)),
+        };
+        build_tool_success_artifact_response(
+            "generate_png_artifact",
+            args.text
+                .or_else(|| Some(format!("Aca esta la imagen solicitada: {}", filename))),
+            vec![artifact],
+        )
+    }
+}
+
+#[async_trait]
+impl FunctionTool for GenerateJpegArtifactTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "generate_jpeg_artifact".to_string(),
+            description: "Generate a simple JPEG raster artifact with colored bands.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "minLength": 1 },
+                    "bands": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "width": { "type": "integer", "minimum": 64 },
+                    "height": { "type": "integer", "minimum": 64 },
+                    "text": { "type": "string" }
+                },
+                "required": ["filename"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: GenerateRasterArtifactArgs = serde_json::from_value(arguments)
+            .map_err(|err| invalid_tool_args_error("generate_jpeg_artifact", err))?;
+        let filename = args.filename.trim();
+        let bytes = build_raster_bytes(
+            &args.bands,
+            args.width,
+            args.height,
+            image::ImageFormat::Jpeg,
+        )?;
+        let artifact = match AiUserArtifact::from_bytes(filename, "image/jpeg", bytes) {
+            Ok(artifact) => artifact,
+            Err(err) => return Ok(invalid_tool_artifact_error("generate_jpeg_artifact", err)),
+        };
+        build_tool_success_artifact_response(
+            "generate_jpeg_artifact",
+            args.text
+                .or_else(|| Some(format!("Aca esta la imagen solicitada: {}", filename))),
+            vec![artifact],
+        )
     }
 }
 
@@ -4413,6 +5464,17 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!names.iter().any(|name| name == "ilk_register"));
         assert!(names.iter().any(|name| name == "generate_csv_artifact"));
+        assert!(names.iter().any(|name| name == "generate_text_artifact"));
+        assert!(names.iter().any(|name| name == "generate_json_artifact"));
+        assert!(names
+            .iter()
+            .any(|name| name == "generate_markdown_artifact"));
+        assert!(names.iter().any(|name| name == "generate_html_artifact"));
+        assert!(names.iter().any(|name| name == "generate_pdf_artifact"));
+        assert!(names.iter().any(|name| name == "generate_xlsx_artifact"));
+        assert!(names.iter().any(|name| name == "generate_docx_artifact"));
+        assert!(names.iter().any(|name| name == "generate_png_artifact"));
+        assert!(names.iter().any(|name| name == "generate_jpeg_artifact"));
     }
 
     #[tokio::test]
