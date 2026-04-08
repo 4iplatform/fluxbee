@@ -207,7 +207,7 @@ identity:
 | `blob.gc.staging_ttl_hours` | No | `24` | TTL para limpiar huérfanos en `blob/staging/` |
 | `blob.gc.active_retain_days` | No | `30` | Retención mínima de blobs en `blob/active/` |
 | `admin.listen` | No | `127.0.0.1:8080` | Bind del API HTTP de SY.admin (recomendado loopback + proxy) |
-| `database.url` | Solo Motherbee | - | Connection string PostgreSQL legacy/manual. `SY.identity` y `SY.storage` ya no la usan como input canónico; ambos toman su secreto por `CONFIG_SET` + `secrets.json` (con env overrides como compat). |
+| `database.url` | Solo Motherbee | - | Connection string PostgreSQL legacy/manual. `SY.identity` y `SY.storage` ya no la usan como input canónico; ambos toman su secreto por `CONFIG_SET` + `secrets.json` (con env overrides como compat). No confundir con `storage.path`: `storage.path` define el root local de filesystem, mientras que el secreto DB de `SY.storage` vive en `config.database.postgres_url`. |
 | `database.pool_size` | No | 10 | Conexiones en el pool |
 
 ### 2.5 Blob Sync (Syncthing) - Operación

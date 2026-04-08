@@ -108,17 +108,11 @@ struct HiveFile {
     hive_id: String,
     role: Option<String>,
     nats: Option<NatsSection>,
-    database: Option<DatabaseSection>,
 }
 
 #[derive(Debug, Deserialize)]
 struct NatsSection {
     mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DatabaseSection {
-    url: Option<String>,
 }
 
 struct Storage {
@@ -225,7 +219,7 @@ async fn main() -> Result<(), StorageError> {
         config_dir: config_dir.clone(),
         version: STORAGE_NODE_VERSION.to_string(),
     };
-    let (database_url, db_secret_source) = resolve_database_url(&hive, &node_name);
+    let (database_url, db_secret_source) = resolve_database_url(&node_name);
     let mut control_state = bootstrap_storage_control_state(&node_name, db_secret_source)?;
     let (mut sender, mut receiver) =
         connect_with_retry(&node_config, Duration::from_secs(1)).await?;
@@ -2350,10 +2344,7 @@ async fn load_hive(config_dir: &Path) -> Result<HiveFile, StorageError> {
     Ok(serde_yaml::from_str(&data)?)
 }
 
-fn resolve_database_url(
-    _hive: &HiveFile,
-    node_name: &str,
-) -> (Option<String>, StorageDbSecretSource) {
+fn resolve_database_url(node_name: &str) -> (Option<String>, StorageDbSecretSource) {
     if let Some(url) = load_local_postgres_url(node_name) {
         return (Some(url), StorageDbSecretSource::LocalFile);
     }
