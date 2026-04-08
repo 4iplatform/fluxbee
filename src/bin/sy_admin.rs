@@ -20,7 +20,10 @@ use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SCOPE_GLOBAL,
     SYSTEM_KIND,
 };
-use fluxbee_sdk::{connect, ClientConfig, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::{
+    classify_admin_action, classify_system_message, connect, derive_action_outcome, ClientConfig,
+    NodeConfig, NodeReceiver, NodeSender,
+};
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, RemoteHiveEntry, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
 };
@@ -745,6 +748,9 @@ async fn send_admin_command_response(
     error_detail: Option<serde_json::Value>,
     request_id: Option<String>,
 ) -> Result<(), AdminError> {
+    let action_class = classify_admin_action(action);
+    let (action_result, result_origin) =
+        derive_action_outcome(action_class, Some(status), error_code.as_deref());
     let mut body = serde_json::json!({
         "status": status,
         "action": action,
@@ -770,6 +776,9 @@ async fn send_admin_command_response(
             scope: None,
             target: None,
             action: Some(action.to_string()),
+            action_class,
+            action_result,
+            result_origin: result_origin.map(str::to_string),
             priority: None,
             context: None,
             ..Meta::default()
@@ -3967,33 +3976,42 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "node_control_config_get" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
-            "This is the canonical live control-plane discovery path for nodes that expose CONFIG_GET, including AI.*, IO.*, SY.storage, SY.identity, and SY.cognition.",
+            "This is the canonical live control-plane discovery path for nodes that expose CONFIG_GET, including AI.*, IO.*, SY.storage, SY.identity, SY.cognition, and SY.config.routes.",
             "Admin forwards CONFIG_GET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "Use this when you need the node-defined live contract, dynamic config view, or secret metadata; not when a plain stored config.json read is enough.",
             "The node defines the response contract and config schema; SY.admin only standardizes transport.",
             "For SY.storage, this is the canonical way to inspect the redacted DB secret contract and its effective source/persistence metadata.",
             "For SY.identity, this is the canonical way to inspect the redacted primary DB secret contract and degraded/bootstrap state.",
             "For SY.cognition, this is the canonical way to inspect semantic_tagger config, degraded_semantics_policy, AI secret redaction, and runtime counters for semantic/narrative processing.",
+            "For SY.config.routes, this returns the live effective routes/vpns contract owned by the node, not the legacy admin list/add/delete action surface.",
         ],
         "node_control_config_set" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
-            "This is the canonical live control-plane mutation path for nodes that expose CONFIG_SET, including AI.*, IO.*, SY.storage, SY.identity, and SY.cognition.",
+            "This is the canonical live control-plane mutation path for nodes that expose CONFIG_SET, including AI.*, IO.*, SY.storage, SY.identity, SY.cognition, and SY.config.routes.",
             "Admin forwards CONFIG_SET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
             "For SY.storage v1, the canonical secret field is config.database.postgres_url and the apply is persist-only until sy-storage is restarted.",
             "For SY.identity v1, the canonical secret field is config.database.postgres_url and the apply is persist-only until sy-identity is restarted.",
             "For SY.cognition, the canonical AI secret field is config.secrets.openai.api_key and semantic controls live under config.semantic_tagger.*.",
+            "For SY.config.routes v1, CONFIG_SET replaces selected sections of the node-owned effective routes/vpns config; use add/delete actions when you want explicit domain mutations instead of a control-plane config replace.",
+        ],
+        "list_routes" | "list_vpns" => vec![
+            "These are SY.config.routes domain read actions exposed as admin queries.",
+            "Use them when you want the route/VPN lists in the legacy admin surface.",
+            "For the node-owned live config contract, use node_control_config_get against SY.config.routes instead.",
+        ],
+        "add_route" | "delete_route" | "add_vpn" | "delete_vpn" => vec![
+            "These are SY.config.routes domain mutation actions exposed as admin commands.",
+            "They mutate one route/VPN rule at a time and preserve the legacy operational surface.",
+            "For HTTP delete calls, the identifier lives in the final path segment; internal admin commands may still carry it in payload.",
+            "Use node_control_config_set against SY.config.routes only when you want the node-owned live config replace path instead of one explicit domain mutation.",
         ],
         "get_ilk" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The ilk_id path segment must use the prefixed UUID format ilk:<uuid>.",
             "Identity may resolve an old alias ILK to its canonical ILK if an alias mapping exists.",
             "This lookup is by ILK identifier, not by channel address, node name, or tenant.",
-        ],
-        "delete_route" | "delete_vpn" => vec![
-            "HTTP delete uses the final path segment as identifier.",
-            "Internal admin commands may still carry the identifier in payload.",
         ],
         "inventory" => vec![
             "Use GET /inventory for the full global inventory view.",
@@ -4813,6 +4831,7 @@ async fn send_admin_request(
             scope: None,
             target: Some(request.target.clone()),
             action: Some(request.action.clone()),
+            action_class: classify_admin_action(&request.action),
             priority: None,
             context: None,
             ..Meta::default()
@@ -4898,6 +4917,7 @@ async fn send_system_request_with_meta(
             scope,
             target: meta_target.or_else(|| Some(target.to_string())),
             action: meta_action,
+            action_class: classify_system_message(request_msg),
             priority: None,
             context,
             ..Meta::default()
@@ -5203,7 +5223,7 @@ async fn broadcast_full_config(
         .get("status")
         .and_then(|v| v.as_str())
         .filter(|v| *v == "ok")
-        .and_then(|_| response.get("routes").or_else(|| response.get("vpns")))
+        .and_then(|_| list_config_items_payload(&response, list_action))
         .ok_or("list response missing routes/vpns")?;
     let config = if list_action == "list_routes" {
         serde_json::json!({ "routes": payload })
@@ -5219,6 +5239,21 @@ async fn broadcast_full_config(
     let version = next_config_changed_version(&ctx.state_dir, subsystem, None)?;
     broadcast_config_changed(client, subsystem, None, None, version, config, None).await?;
     Ok(())
+}
+
+fn list_config_items_payload<'a>(
+    response: &'a serde_json::Value,
+    list_action: &str,
+) -> Option<&'a serde_json::Value> {
+    let item_key = if list_action == "list_routes" {
+        "routes"
+    } else {
+        "vpns"
+    };
+    response
+        .get("payload")
+        .and_then(|payload| payload.get(item_key))
+        .or_else(|| response.get(item_key))
 }
 
 async fn send_opa_action(
@@ -5662,6 +5697,7 @@ fn build_opa_query_response(
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::sync::broadcast;
 
     #[test]
     fn internal_response_payload_value_prefers_payload_field() {
@@ -5722,6 +5758,107 @@ mod tests {
                 "pending_hives_policy": [],
                 "pending_hives_topology": []
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_opa_responses_accepts_sy_opa_rules_config_response_shape() {
+        let (tx, mut rx) = broadcast::channel(8);
+        tx.send(Message {
+            routing: Routing {
+                src: "SY.opa.rules@motherbee".to_string(),
+                dst: Destination::Unicast("SY.admin@motherbee".to_string()),
+                ttl: 16,
+                trace_id: "trace-opa-config".to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some("CONFIG_RESPONSE".to_string()),
+                ..Meta::default()
+            },
+            payload: json!({
+                "subsystem": "opa",
+                "action": "compile",
+                "version": 7,
+                "status": "ok",
+                "hive": "motherbee",
+                "compile_time_ms": 12,
+                "wasm_size_bytes": 2048,
+                "hash": "sha256:test"
+            }),
+        })
+        .unwrap();
+
+        let responses =
+            collect_opa_responses(&mut rx, "compile", 7, &["motherbee".to_string()]).await;
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].hive, "motherbee");
+        assert_eq!(responses[0].status, "ok");
+        assert_eq!(responses[0].version, Some(7));
+        assert_eq!(responses[0].hash.as_deref(), Some("sha256:test"));
+    }
+
+    #[tokio::test]
+    async fn collect_opa_query_responses_accepts_sy_opa_rules_query_response_shape() {
+        let (tx, mut rx) = broadcast::channel(8);
+        tx.send(Message {
+            routing: Routing {
+                src: "SY.opa.rules@motherbee".to_string(),
+                dst: Destination::Unicast("SY.admin@motherbee".to_string()),
+                ttl: 16,
+                trace_id: "trace-opa-query".to_string(),
+            },
+            meta: Meta {
+                msg_type: "query_response".to_string(),
+                action: Some("get_status".to_string()),
+                ..Meta::default()
+            },
+            payload: json!({
+                "hive": "motherbee",
+                "status": "ok",
+                "current_version": 4,
+                "current_hash": "sha256:current"
+            }),
+        })
+        .unwrap();
+
+        let responses =
+            collect_opa_query_responses(&mut rx, "get_status", &["motherbee".to_string()]).await;
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].hive, "motherbee");
+        assert_eq!(responses[0].status, "ok");
+        assert_eq!(responses[0].payload["current_version"], json!(4));
+    }
+
+    #[test]
+    fn list_config_items_payload_prefers_nested_payload_shape() {
+        let response = json!({
+            "status": "ok",
+            "action": "list_routes",
+            "payload": {
+                "config_version": 7,
+                "routes": [{ "prefix": "alpha/**" }]
+            },
+            "config_version": 7,
+            "routes": [{ "prefix": "legacy/**" }]
+        });
+
+        assert_eq!(
+            list_config_items_payload(&response, "list_routes"),
+            Some(&json!([{ "prefix": "alpha/**" }]))
+        );
+    }
+
+    #[test]
+    fn list_config_items_payload_falls_back_to_legacy_top_level_shape() {
+        let response = json!({
+            "status": "ok",
+            "vpns": [{ "pattern": "ops/*" }]
+        });
+
+        assert_eq!(
+            list_config_items_payload(&response, "list_vpns"),
+            Some(&json!([{ "pattern": "ops/*" }]))
         );
     }
 }

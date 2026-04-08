@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,18 +24,22 @@ import (
 	"time"
 	"unsafe"
 
+	fluxbeesdk "github.com/4iplatform/json-router/sy-opa-rules/sdk"
 	"github.com/google/uuid"
 	"github.com/open-policy-agent/opa/compile"
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
 
+var (
+	configDir     = "/etc/fluxbee"
+	stateDir      = "/var/lib/fluxbee/opa"
+	nodesDir      = "/var/lib/fluxbee/state/nodes"
+	routerSockDir = "/var/run/fluxbee/routers"
+	lockPath      = "/var/run/fluxbee/sy-opa-rules.lock"
+)
+
 const (
-	configDir           = "/etc/fluxbee"
-	stateDir            = "/var/lib/fluxbee/opa"
-	nodesDir            = "/var/lib/fluxbee/state/nodes"
-	routerSockDir       = "/var/run/fluxbee/routers"
-	lockPath            = "/var/run/fluxbee/sy-opa-rules.lock"
 	opaShmPrefix        = "/jsr-opa-"
 	routerShmPrefix     = "/jsr-"
 	opaMagic            = 0x4A534F50 // "JSOP"
@@ -57,39 +60,6 @@ const (
 
 type HiveConfig struct {
 	HiveID string `yaml:"hive_id"`
-}
-
-type Meta struct {
-	Type   string `json:"type"`
-	Msg    string `json:"msg,omitempty"`
-	Action string `json:"action,omitempty"`
-}
-
-type Routing struct {
-	Src     string `json:"src"`
-	Dst     any    `json:"dst"`
-	Ttl     uint8  `json:"ttl"`
-	TraceID string `json:"trace_id"`
-}
-
-type Message struct {
-	Routing Routing         `json:"routing"`
-	Meta    Meta            `json:"meta"`
-	Payload json.RawMessage `json:"payload"`
-}
-
-type NodeHelloPayload struct {
-	UUID    string `json:"uuid"`
-	Name    string `json:"name"`
-	Version string `json:"version"`
-}
-
-type NodeAnnouncePayload struct {
-	UUID       string `json:"uuid"`
-	Name       string `json:"name"`
-	Status     string `json:"status"`
-	VpnID      uint32 `json:"vpn_id"`
-	RouterName string `json:"router_name"`
 }
 
 type OpaConfigPayload struct {
@@ -188,10 +158,15 @@ type Service struct {
 	hiveID     string
 	nodeUUID   uuid.UUID
 	nodeName   string
-	routerConn *RouterClient
+	routerConn routerTransport
 	opaRegion  *OpaRegion
 
 	lastError string
+}
+
+type routerTransport interface {
+	SendSDK(fluxbeesdk.Message)
+	LastPeer() string
 }
 
 type RouterStatus struct {
@@ -592,10 +567,22 @@ func (s *Service) loadCurrentPolicy() error {
 	return nil
 }
 
-func (s *Service) handleMessage(msg Message) {
-	switch msg.Meta.Type {
+func (s *Service) handleMessage(msg fluxbeesdk.Message) {
+	switch msg.Meta.MsgType {
 	case "system":
-		if msg.Meta.Msg == "CONFIG_CHANGED" {
+		if derefString(msg.Meta.Msg) == fluxbeesdk.MSGNodeStatusGet {
+			s.handleNodeStatusGet(msg)
+			return
+		}
+		if derefString(msg.Meta.Msg) == fluxbeesdk.MSGConfigGet {
+			s.handleNodeConfigGet(msg)
+			return
+		}
+		if derefString(msg.Meta.Msg) == fluxbeesdk.MSGConfigSet {
+			s.handleNodeConfigSet(msg)
+			return
+		}
+		if derefString(msg.Meta.Msg) == "CONFIG_CHANGED" {
 			var payload ConfigChangedPayload
 			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 				log.Printf("invalid config payload: %v", err)
@@ -617,8 +604,242 @@ func (s *Service) handleMessage(msg Message) {
 	}
 }
 
-func (s *Service) handleCommand(msg Message) {
-	action := strings.ToLower(msg.Meta.Action)
+func (s *Service) handleNodeStatusGet(msg fluxbeesdk.Message) {
+	resp, err := fluxbeesdk.BuildDefaultNodeStatusResponse(
+		&msg,
+		s.nodeUUID.String(),
+		"HEALTHY",
+	)
+	if err != nil {
+		log.Printf("failed to build node status response: %v", err)
+		return
+	}
+	s.routerConn.SendSDK(resp)
+}
+
+func (s *Service) handleNodeConfigGet(msg fluxbeesdk.Message) {
+	reqMsg, err := fluxbeesdk.ParseNodeConfigRequest(&msg)
+	if err != nil || reqMsg == nil || reqMsg.Get == nil {
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":        false,
+			"node_name": s.nodeName,
+			"state":     "error",
+			"error": map[string]any{
+				"code":   "INVALID_CONFIG_GET",
+				"detail": errorString(err, "invalid CONFIG_GET request"),
+			},
+		})
+		return
+	}
+	req := reqMsg.Get
+	currentMeta, _ := readMetadata(filepath.Join(stateDir, "current", "metadata.json"))
+	stagedMeta, _ := readMetadata(filepath.Join(stateDir, "staged", "metadata.json"))
+	backupMeta, _ := readMetadata(filepath.Join(stateDir, "backup", "metadata.json"))
+	state := "empty"
+	if currentMeta.Version > 0 || currentMeta.Hash != "" {
+		state = "configured"
+	}
+	response := map[string]any{
+		"ok":             true,
+		"node_name":      s.nodeName,
+		"state":          state,
+		"schema_version": 1,
+		"config_version": currentMeta.Version,
+		"effective_config": map[string]any{
+			"current": buildPolicySnapshot(currentMeta),
+			"staged":  buildPolicySnapshot(stagedMeta),
+			"backup":  buildPolicySnapshot(backupMeta),
+			"router": map[string]any{
+				"routers": listRouterStatuses(),
+			},
+		},
+		"contract": map[string]any{
+			"supports":              []string{fluxbeesdk.MSGConfigGet, fluxbeesdk.MSGConfigSet},
+			"target":                fluxbeesdk.NodeConfigControlTarget,
+			"schema_version":        1,
+			"apply_modes":           []string{fluxbeesdk.NodeConfigApplyModeReplace},
+			"config_schema":         "opa_control_v1",
+			"supported_operations":  []string{"check", "compile", "compile_apply", "apply", "rollback"},
+			"requested_node_name":   req.NodeName,
+			"preserves_opa_actions": true,
+			"preserves_opa_queries": true,
+		},
+	}
+	s.sendNodeConfigResponse(msg, response)
+}
+
+func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
+	reqMsg, err := fluxbeesdk.ParseNodeConfigRequest(&msg)
+	if err != nil || reqMsg == nil || reqMsg.Set == nil {
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":        false,
+			"node_name": s.nodeName,
+			"state":     "error",
+			"error": map[string]any{
+				"code":   "INVALID_CONFIG_SET",
+				"detail": errorString(err, "invalid CONFIG_SET request"),
+			},
+		})
+		return
+	}
+	req := reqMsg.Set
+	if req.ApplyMode != "" && req.ApplyMode != fluxbeesdk.NodeConfigApplyModeReplace {
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":        false,
+			"node_name": s.nodeName,
+			"state":     "error",
+			"error": map[string]any{
+				"code":   "UNSUPPORTED_APPLY_MODE",
+				"detail": fmt.Sprintf("unsupported apply_mode: %s", req.ApplyMode),
+			},
+		})
+		return
+	}
+
+	configMap, ok := req.Config.(map[string]any)
+	if !ok {
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":        false,
+			"node_name": s.nodeName,
+			"state":     "error",
+			"error": map[string]any{
+				"code":   "INVALID_CONFIG_SET",
+				"detail": "config must be a JSON object",
+			},
+		})
+		return
+	}
+
+	operation, _ := configMap["operation"].(string)
+	operation = strings.TrimSpace(strings.ToLower(operation))
+	if operation == "" {
+		operation = "check"
+	}
+	version := req.ConfigVersion
+	if rawVersion, ok := configMap["version"].(float64); ok && uint64(rawVersion) != 0 {
+		version = uint64(rawVersion)
+	}
+	rego, _ := configMap["rego"].(string)
+	entrypoint, _ := configMap["entrypoint"].(string)
+	autoApply, _ := configMap["auto_apply"].(bool)
+
+	var opaCfg *OpaConfigPayload
+	if rego != "" || entrypoint != "" {
+		opaCfg = &OpaConfigPayload{
+			Rego:       rego,
+			Entrypoint: entrypoint,
+		}
+	}
+
+	handled, err := s.handleOpaAction(msg.Routing.Src, operation, version, opaCfg, autoApply, false)
+	if err != nil {
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":             false,
+			"node_name":      s.nodeName,
+			"state":          "error",
+			"schema_version": req.SchemaVersion,
+			"config_version": version,
+			"error": map[string]any{
+				"code":   inferOpaErrorCode(err),
+				"detail": err.Error(),
+			},
+		})
+		return
+	}
+	if !handled {
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":             false,
+			"node_name":      s.nodeName,
+			"state":          "error",
+			"schema_version": req.SchemaVersion,
+			"config_version": version,
+			"error": map[string]any{
+				"code":   "UNSUPPORTED_OPERATION",
+				"detail": fmt.Sprintf("unsupported OPA config operation: %s", operation),
+			},
+		})
+		return
+	}
+
+	currentMeta, _ := readMetadata(filepath.Join(stateDir, "current", "metadata.json"))
+	if operation == "check" || operation == "compile" || operation == "compile_apply" {
+		stagedMeta, _ := readMetadata(filepath.Join(stateDir, "staged", "metadata.json"))
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":             true,
+			"node_name":      s.nodeName,
+			"state":          "configured",
+			"schema_version": req.SchemaVersion,
+			"config_version": stagedMeta.Version,
+			"effective_config": map[string]any{
+				"staged": buildPolicySnapshot(stagedMeta),
+			},
+		})
+		return
+	}
+
+	s.sendNodeConfigResponse(msg, map[string]any{
+		"ok":             true,
+		"node_name":      s.nodeName,
+		"state":          "configured",
+		"schema_version": req.SchemaVersion,
+		"config_version": currentMeta.Version,
+		"effective_config": map[string]any{
+			"current": buildPolicySnapshot(currentMeta),
+		},
+	})
+}
+
+func (s *Service) sendNodeConfigResponse(request fluxbeesdk.Message, payload map[string]any) {
+	resp, err := fluxbeesdk.BuildNodeConfigResponseMessage(&request, s.nodeUUID.String(), payload)
+	if err != nil {
+		log.Printf("failed to build CONFIG_RESPONSE: %v", err)
+		return
+	}
+	s.routerConn.SendSDK(resp)
+}
+
+func buildPolicySnapshot(meta PolicyMetadata) map[string]any {
+	return map[string]any{
+		"version":         meta.Version,
+		"hash":            meta.Hash,
+		"entrypoint":      meta.Entrypoint,
+		"compiled_at":     meta.CompiledAt,
+		"wasm_size_bytes": meta.WasmSize,
+		"error_detail":    meta.ErrorDetail,
+	}
+}
+
+func inferOpaErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	var oe OpaError
+	if errors.As(err, &oe) {
+		return oe.Code
+	}
+	var oePtr *OpaError
+	if errors.As(err, &oePtr) && oePtr != nil {
+		return oePtr.Code
+	}
+	return "OPA_CONFIG_ERROR"
+}
+
+func errorString(err error, fallback string) string {
+	if err == nil {
+		return fallback
+	}
+	return err.Error()
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func (s *Service) handleCommand(msg fluxbeesdk.Message) {
+	action := strings.ToLower(derefString(msg.Meta.Action))
 	switch action {
 	case "compile_policy":
 		var req CompileRequest
@@ -664,8 +885,8 @@ func (s *Service) handleCommand(msg Message) {
 	}
 }
 
-func (s *Service) handleQuery(msg Message) {
-	action := strings.ToLower(msg.Meta.Action)
+func (s *Service) handleQuery(msg fluxbeesdk.Message) {
+	action := strings.ToLower(derefString(msg.Meta.Action))
 	log.Printf("query received action=%s src=%s", action, msg.Routing.Src)
 	switch action {
 	case "get_policy":
@@ -901,21 +1122,13 @@ func (s *Service) sendConfigResponse(dst, action string, version uint64, status 
 	s.sendSystemMessage(dst, "CONFIG_RESPONSE", payload)
 }
 
-func (s *Service) sendCommandResponse(msg Message, action string, payload map[string]any) {
-	resp := Message{
-		Routing: Routing{
-			Src:     s.nodeUUID.String(),
-			Dst:     msg.Routing.Src,
-			Ttl:     16,
-			TraceID: uuid.New().String(),
-		},
-		Meta: Meta{
-			Type:   "command_response",
-			Action: action,
-		},
-		Payload: mustJSON(payload),
+func (s *Service) sendCommandResponse(msg fluxbeesdk.Message, action string, payload map[string]any) {
+	resp, err := fluxbeesdk.BuildCommandResponse(s.nodeUUID.String(), msg.Routing.Src, uuid.New().String(), action, payload)
+	if err != nil {
+		log.Printf("failed to build command response: %v", err)
+		return
 	}
-	s.routerConn.Send(resp)
+	s.routerConn.SendSDK(resp)
 }
 
 func (s *Service) sendCommandError(action string, version uint64, code, detail string) {
@@ -925,67 +1138,42 @@ func (s *Service) sendCommandError(action string, version uint64, code, detail s
 		"error_detail": detail,
 		"version":      version,
 	}
-	resp := Message{
-		Routing: Routing{
-			Src:     s.nodeUUID.String(),
-			Dst:     nil,
-			Ttl:     16,
-			TraceID: uuid.New().String(),
-		},
-		Meta: Meta{
-			Type:   "command_response",
-			Action: action,
-		},
-		Payload: mustJSON(payload),
-	}
+	dst := ""
 	if s.routerConn != nil {
-		if dst := s.routerConn.LastPeer(); dst != "" {
-			resp.Routing.Dst = dst
-		}
+		dst = s.routerConn.LastPeer()
 	}
-	if resp.Routing.Dst == nil {
+	if dst == "" {
 		return
 	}
-	s.routerConn.Send(resp)
+	resp, err := fluxbeesdk.BuildCommandResponse(s.nodeUUID.String(), dst, uuid.New().String(), action, payload)
+	if err != nil {
+		log.Printf("failed to build command error response: %v", err)
+		return
+	}
+	s.routerConn.SendSDK(resp)
 }
 
-func (s *Service) sendQueryResponse(msg Message, action string, payload map[string]any) {
-	resp := Message{
-		Routing: Routing{
-			Src:     s.nodeUUID.String(),
-			Dst:     msg.Routing.Src,
-			Ttl:     16,
-			TraceID: uuid.New().String(),
-		},
-		Meta: Meta{
-			Type:   "query_response",
-			Action: action,
-		},
-		Payload: mustJSON(payload),
+func (s *Service) sendQueryResponse(msg fluxbeesdk.Message, action string, payload map[string]any) {
+	resp, err := fluxbeesdk.BuildQueryResponse(s.nodeUUID.String(), msg.Routing.Src, uuid.New().String(), action, payload)
+	if err != nil {
+		log.Printf("failed to build query response: %v", err)
+		return
 	}
 	if version, ok := payload["version"]; ok {
 		log.Printf("query response action=%s version=%v", action, version)
 	} else {
 		log.Printf("query response action=%s", action)
 	}
-	s.routerConn.Send(resp)
+	s.routerConn.SendSDK(resp)
 }
 
 func (s *Service) sendSystemMessage(dst, msg string, payload map[string]any) {
-	resp := Message{
-		Routing: Routing{
-			Src:     s.nodeUUID.String(),
-			Dst:     dst,
-			Ttl:     16,
-			TraceID: uuid.New().String(),
-		},
-		Meta: Meta{
-			Type: "system",
-			Msg:  msg,
-		},
-		Payload: mustJSON(payload),
+	resp, err := fluxbeesdk.BuildSystemUnicast(s.nodeUUID.String(), dst, uuid.New().String(), msg, payload)
+	if err != nil {
+		log.Printf("failed to build system message: %v", err)
+		return
 	}
-	s.routerConn.Send(resp)
+	s.routerConn.SendSDK(resp)
 }
 
 func (s *Service) broadcastOpaReload(version uint64, hash string) {
@@ -993,20 +1181,12 @@ func (s *Service) broadcastOpaReload(version uint64, hash string) {
 		"version": version,
 		"hash":    hash,
 	}
-	msg := Message{
-		Routing: Routing{
-			Src:     s.nodeUUID.String(),
-			Dst:     "broadcast",
-			Ttl:     2,
-			TraceID: uuid.New().String(),
-		},
-		Meta: Meta{
-			Type: "system",
-			Msg:  "OPA_RELOAD",
-		},
-		Payload: mustJSON(payload),
+	msg, err := fluxbeesdk.BuildSystemBroadcast(s.nodeUUID.String(), uuid.New().String(), fluxbeesdk.MSGOPAReload, payload, 2)
+	if err != nil {
+		log.Printf("failed to build OPA_RELOAD broadcast: %v", err)
+		return
 	}
-	s.routerConn.Send(msg)
+	s.routerConn.SendSDK(msg)
 }
 
 func (s *Service) heartbeatLoop() {
@@ -1020,22 +1200,17 @@ func (s *Service) heartbeatLoop() {
 type RouterClient struct {
 	nodeUUID uuid.UUID
 	nodeName string
-	nodeBase string
-	tx       chan []byte
+	tx       chan fluxbeesdk.Message
+	sender   *fluxbeesdk.NodeSender
 	mu       sync.Mutex
 	lastDst  string
 }
 
 func NewRouterClient(nodeUUID uuid.UUID, nodeName string) *RouterClient {
-	base := nodeName
-	if parts := strings.Split(nodeName, "@"); len(parts) > 1 {
-		base = parts[0]
-	}
 	return &RouterClient{
 		nodeUUID: nodeUUID,
 		nodeName: nodeName,
-		nodeBase: base,
-		tx:       make(chan []byte, 256),
+		tx:       make(chan fluxbeesdk.Message, 256),
 	}
 }
 
@@ -1048,215 +1223,47 @@ func (c *RouterClient) LastPeer() string {
 func (c *RouterClient) Run(service *Service) {
 	backoff := 100 * time.Millisecond
 	for {
-		c.drainTxQueue()
-		conn, err := c.connect()
+		sender, receiver, err := fluxbeesdk.Connect(fluxbeesdk.NodeConfig{
+			Name:               c.nodeName,
+			RouterSocket:       routerSockDir,
+			UUIDPersistenceDir: nodesDir,
+			UUIDMode:           fluxbeesdk.NodeUuidPersistent,
+			ConfigDir:          configDir,
+			Version:            "1.0",
+		})
 		if err != nil {
 			log.Printf("connect failed: %v", err)
 			time.Sleep(backoff)
 			backoff = nextBackoff(backoff)
 			continue
 		}
-		if err := c.handshake(conn); err != nil {
-			log.Printf("handshake failed: %v", err)
-			conn.Close()
-			time.Sleep(backoff)
-			backoff = nextBackoff(backoff)
-			continue
+		c.mu.Lock()
+		c.sender = sender
+		c.mu.Unlock()
+		if sender.UUID() != c.nodeUUID.String() {
+			log.Printf("router sdk uuid differs from bootstrap uuid sdk=%s bootstrap=%s", sender.UUID(), c.nodeUUID)
 		}
 		backoff = 100 * time.Millisecond
-		if err := c.runConn(conn, service); err != nil {
-			log.Printf("router connection error: %v", err)
-		}
-		conn.Close()
-		time.Sleep(backoff)
-		backoff = nextBackoff(backoff)
-	}
-}
+		go c.forwardOutgoing(sender)
 
-func (c *RouterClient) connect() (net.Conn, error) {
-	candidates, err := routerSocketCandidates(routerSockDir, c.nodeBase)
-	if err != nil {
-		return nil, err
-	}
-	var lastErr error
-	for _, sock := range candidates {
-		conn, err := net.Dial("unix", sock)
-		if err == nil {
-			log.Printf("connected to router socket=%s name=%s", sock, c.nodeName)
-			return conn, nil
-		}
-		lastErr = err
-	}
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, fmt.Errorf("no router sockets found")
-}
-
-func (c *RouterClient) handshake(conn net.Conn) error {
-	hello := Message{
-		Routing: Routing{
-			Src:     c.nodeUUID.String(),
-			Dst:     nil,
-			Ttl:     1,
-			TraceID: uuid.New().String(),
-		},
-		Meta: Meta{
-			Type: "system",
-			Msg:  "HELLO",
-		},
-		Payload: mustJSON(NodeHelloPayload{
-			UUID:    c.nodeUUID.String(),
-			Name:    c.nodeName,
-			Version: "1.0",
-		}),
-	}
-	if err := writeFrame(conn, mustJSON(hello)); err != nil {
-		return err
-	}
-	log.Printf("waiting for ANNOUNCE")
-	frame, err := readFrame(conn)
-	if err != nil {
-		return err
-	}
-	var msg Message
-	if err := json.Unmarshal(frame, &msg); err != nil {
-		return err
-	}
-	if msg.Meta.Type != "system" || msg.Meta.Msg != "ANNOUNCE" {
-		return fmt.Errorf("unexpected announce")
-	}
-	var payload NodeAnnouncePayload
-	_ = json.Unmarshal(msg.Payload, &payload)
-	log.Printf("connected as %s (vpn=%d router=%s)", payload.Name, payload.VpnID, payload.RouterName)
-	c.mu.Lock()
-	c.lastDst = msg.Routing.Src
-	c.mu.Unlock()
-	return nil
-}
-
-func (c *RouterClient) readLoop(conn net.Conn, service *Service) error {
-	for {
-		frame, err := readFrame(conn)
-		if err != nil {
-			return err
-		}
-		var msg Message
-		if err := json.Unmarshal(frame, &msg); err != nil {
-			log.Printf("invalid message: %v", err)
-			continue
-		}
-		if msg.Routing.Src != "" {
-			c.mu.Lock()
-			c.lastDst = msg.Routing.Src
-			c.mu.Unlock()
-		}
-		service.handleMessage(msg)
-	}
-}
-
-func (c *RouterClient) runConn(conn net.Conn, service *Service) error {
-	errCh := make(chan error, 2)
-	done := make(chan struct{})
-	go func() {
-		errCh <- c.readLoop(conn, service)
-	}()
-	go func() {
-		errCh <- c.writeLoop(conn, done)
-	}()
-	err := <-errCh
-	close(done)
-	return err
-}
-
-func (c *RouterClient) writeLoop(conn net.Conn, done <-chan struct{}) error {
-	for {
-		select {
-		case <-done:
-			return nil
-		case frame, ok := <-c.tx:
-			if !ok {
-				return io.EOF
+		for {
+			msg, err := receiver.Recv(context.Background())
+			if err != nil {
+				time.Sleep(200 * time.Millisecond)
+				continue
 			}
-			if err := writeFrame(conn, frame); err != nil {
-				return err
+			if msg.Routing.Src != "" {
+				c.mu.Lock()
+				c.lastDst = msg.Routing.Src
+				c.mu.Unlock()
 			}
+			service.handleMessage(msg)
 		}
 	}
 }
 
-func (c *RouterClient) Send(msg Message) {
-	data := mustJSON(msg)
-	c.tx <- data
-}
-
-func readFrame(conn net.Conn) ([]byte, error) {
-	var lenBuf [4]byte
-	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-		return nil, err
-	}
-	size := binary.BigEndian.Uint32(lenBuf[:])
-	if size == 0 {
-		return nil, fmt.Errorf("empty frame")
-	}
-	buf := make([]byte, size)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return nil, err
-	}
-	return buf, nil
-}
-
-func writeFrame(conn net.Conn, payload []byte) error {
-	if len(payload) > 64*1024 {
-		return fmt.Errorf("frame too large")
-	}
-	var lenBuf [4]byte
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
-	if _, err := conn.Write(lenBuf[:]); err != nil {
-		return err
-	}
-	_, err := conn.Write(payload)
-	return err
-}
-
-func routerSocketCandidates(dir string, nodeName string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	var sockets []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if strings.HasPrefix(name, "irp-") {
-			continue
-		}
-		if !strings.HasSuffix(name, ".sock") {
-			continue
-		}
-		sockets = append(sockets, filepath.Join(dir, name))
-	}
-	if len(sockets) == 0 {
-		return nil, fmt.Errorf("no router sockets found")
-	}
-	sort.Strings(sockets)
-	idx := int(fnv1a64([]byte(nodeName)) % uint64(len(sockets)))
-	ordered := make([]string, 0, len(sockets))
-	ordered = append(ordered, sockets[idx:]...)
-	ordered = append(ordered, sockets[:idx]...)
-	return ordered, nil
-}
-
-func (c *RouterClient) drainTxQueue() {
-	for {
-		select {
-		case <-c.tx:
-		default:
-			return
-		}
-	}
+func (c *RouterClient) SendSDK(msg fluxbeesdk.Message) {
+	c.tx <- msg
 }
 
 func nextBackoff(current time.Duration) time.Duration {
@@ -1267,17 +1274,12 @@ func nextBackoff(current time.Duration) time.Duration {
 	return next
 }
 
-func fnv1a64(data []byte) uint64 {
-	const (
-		offset64 = 14695981039346656037
-		prime64  = 1099511628211
-	)
-	hash := uint64(offset64)
-	for _, b := range data {
-		hash ^= uint64(b)
-		hash *= prime64
+func (c *RouterClient) forwardOutgoing(sender *fluxbeesdk.NodeSender) {
+	for msg := range c.tx {
+		if err := sender.Send(msg); err != nil {
+			log.Printf("failed to send router message: %v", err)
+		}
 	}
-	return hash
 }
 
 func mustJSON(v any) []byte {

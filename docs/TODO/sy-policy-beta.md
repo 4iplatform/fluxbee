@@ -184,7 +184,7 @@ What happens when a match + action matches a rule:
 |--------|---------|
 | `allow` | Action is permitted |
 | `deny` | Action is blocked |
-| `route_to_frontdesk` | Message is redirected to AI.frontdesk |
+| `route_to_frontdesk` | Message is redirected to `SY.frontdesk.gov` |
 | `route_to` | Future only. Needs dynamic routing target support |
 | `require_confirmation` | Future only. Needs confirmation flow support in the destination/runtime |
 | `flag` | Future only. Deferred until audit storage/visibility is designed cleanly |

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::policy::{ActionClass, ActionResult};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub routing: Routing,
@@ -72,6 +74,14 @@ pub struct Meta {
     pub target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_class: Option<ActionClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_result: Option<ActionResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_detail_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -348,6 +358,10 @@ pub fn build_system_message(
             scope: None,
             target: None,
             action: None,
+            action_class: None,
+            action_result: None,
+            result_origin: None,
+            result_detail_code: None,
             priority: None,
             context: None,
         },

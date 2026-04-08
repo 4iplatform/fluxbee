@@ -26,6 +26,7 @@ use crate::shm::{
     ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
     HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
 };
+use fluxbee_sdk::classify_routed_message;
 use fluxbee_sdk::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
     build_wan_accept, build_wan_hello, build_wan_reject, Destination, LsaNode, LsaPayload,
@@ -4775,7 +4776,11 @@ fn maybe_publish_turn(
     };
     let publisher = Arc::clone(publisher);
     let nats_publish_errors = Arc::clone(nats_publish_errors);
-    let payload = match serde_json::to_vec(msg) {
+    let mut enriched = msg.clone();
+    if enriched.meta.action_class.is_none() {
+        enriched.meta.action_class = classify_routed_message(&enriched.meta.msg_type);
+    }
+    let payload = match serde_json::to_vec(&enriched) {
         Ok(payload) => payload,
         Err(err) => {
             tracing::warn!(error = %err, "turn serialize failed");
@@ -4823,6 +4828,9 @@ async fn serialize_for_local_delivery(
     msg: &Message,
 ) -> Result<Vec<u8>, RouterError> {
     let mut enriched = msg.clone();
+    if enriched.meta.action_class.is_none() {
+        enriched.meta.action_class = classify_routed_message(&enriched.meta.msg_type);
+    }
     maybe_attach_memory_package(memory_reader, hive_id, &mut enriched).await;
     Ok(serde_json::to_vec(&enriched)?)
 }

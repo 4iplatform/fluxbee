@@ -8,9 +8,15 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use fluxbee_sdk::protocol::{
-    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SYSTEM_KIND,
+    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, MSG_CONFIG_GET,
+    MSG_CONFIG_SET, SYSTEM_KIND,
 };
-use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::{
+    build_node_config_response_message, connect, parse_node_config_request, NodeConfig,
+    NodeConfigControlRequest, NodeConfigSetPayload, NodeReceiver, NodeSender,
+    NODE_CONFIG_APPLY_MODE_REPLACE, NODE_CONFIG_CONTROL_TARGET,
+    try_handle_default_node_status,
+};
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, VpnAssignment,
     ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
@@ -86,6 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => socket_dir.clone(),
     };
     let mut sy_config = load_config(&config_dir)?;
+    let node_name = format!("SY.config.routes@{}", hive.hive_id);
 
     let shm_name = format!("/jsr-config-{}", hive.hive_id);
     let node_uuid = load_or_create_uuid(&state_dir.join("nodes"), "SY.config.routes")?;
@@ -127,6 +134,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                 };
+                if try_handle_default_node_status(&sender, &msg).await? {
+                    continue;
+                }
                 if msg.meta.msg_type == "admin" {
                     if let Err(err) = handle_admin_action(
                         &sender,
@@ -137,6 +147,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await {
                         tracing::warn!("admin action error: {err}");
+                    }
+                    continue;
+                }
+                if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_CONFIG_GET) {
+                    if let Err(err) = handle_node_config_get(
+                        &sender,
+                        &msg,
+                        &node_name,
+                        &hive_id,
+                        &sy_config,
+                    ).await {
+                        tracing::warn!("node config get error: {err}");
+                    }
+                    continue;
+                }
+                if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_CONFIG_SET) {
+                    if let Err(err) = handle_node_config_set(
+                        &sender,
+                        &msg,
+                        &config_dir,
+                        &node_name,
+                        &hive_id,
+                        &mut sy_config,
+                        &mut writer,
+                    ).await {
+                        tracing::warn!("node config set error: {err}");
                     }
                     continue;
                 }
@@ -289,6 +325,166 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+async fn handle_node_config_get(
+    sender: &NodeSender,
+    msg: &Message,
+    node_name: &str,
+    hive_id: &str,
+    sy_config: &SyConfigFile,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let requested_node_name = match parse_node_config_request(msg) {
+        Ok(NodeConfigControlRequest::Get(req)) => req.node_name,
+        Ok(NodeConfigControlRequest::Set(_)) => {
+            send_node_config_control_response(
+                sender,
+                msg,
+                serde_json::json!({
+                    "ok": false,
+                    "node_name": node_name,
+                    "state": "error",
+                    "error": {
+                        "code": "INVALID_CONFIG_GET",
+                        "detail": "received CONFIG_SET while handling CONFIG_GET"
+                    }
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(err) => {
+            send_node_config_control_response(
+                sender,
+                msg,
+                serde_json::json!({
+                    "ok": false,
+                    "node_name": node_name,
+                    "state": "error",
+                    "error": {
+                        "code": "INVALID_CONFIG_GET",
+                        "detail": err.to_string()
+                    }
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    send_node_config_control_response(
+        sender,
+        msg,
+        build_node_config_get_payload(node_name, hive_id, sy_config, &requested_node_name),
+    )
+    .await
+}
+
+async fn handle_node_config_set(
+    sender: &NodeSender,
+    msg: &Message,
+    config_dir: &Path,
+    node_name: &str,
+    hive_id: &str,
+    sy_config: &mut SyConfigFile,
+    writer: &mut ConfigRegionWriter,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = match parse_node_config_request(msg) {
+        Ok(NodeConfigControlRequest::Set(req)) => req,
+        Ok(NodeConfigControlRequest::Get(_)) => {
+            send_node_config_control_response(
+                sender,
+                msg,
+                serde_json::json!({
+                    "ok": false,
+                    "node_name": node_name,
+                    "state": "error",
+                    "error": {
+                        "code": "INVALID_CONFIG_SET",
+                        "detail": "received CONFIG_GET while handling CONFIG_SET"
+                    }
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(err) => {
+            send_node_config_control_response(
+                sender,
+                msg,
+                serde_json::json!({
+                    "ok": false,
+                    "node_name": node_name,
+                    "state": "error",
+                    "error": {
+                        "code": "INVALID_CONFIG_SET",
+                        "detail": err.to_string()
+                    }
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let (next_config, changed_fields) = match apply_node_config_set_request(sy_config, &request) {
+        Ok(result) => result,
+        Err(err) => {
+            send_node_config_control_response(
+                sender,
+                msg,
+                serde_json::json!({
+                    "ok": false,
+                    "node_name": node_name,
+                    "state": "error",
+                    "schema_version": request.schema_version,
+                    "config_version": sy_config.version,
+                    "error": {
+                        "code": "INVALID_CONFIG_SET",
+                        "detail": err.to_string()
+                    }
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if next_config != *sy_config {
+        apply_config(writer, &next_config)?;
+        write_config(config_dir, &next_config)?;
+        *sy_config = next_config;
+    }
+
+    send_node_config_control_response(
+        sender,
+        msg,
+        serde_json::json!({
+            "ok": true,
+            "node_name": node_name,
+            "state": "configured",
+            "schema_version": request.schema_version,
+            "config_version": sy_config.version,
+            "effective_config": {
+                "routes": sy_config.routes,
+                "vpns": sy_config.vpns,
+                "updated_at": sy_config.updated_at,
+                "hive": hive_id,
+            },
+            "applied_fields": changed_fields,
+        }),
+    )
+    .await
+}
+
+async fn send_node_config_control_response(
+    sender: &NodeSender,
+    request: &Message,
+    payload: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let reply = build_node_config_response_message(request, sender.uuid(), payload);
+    sender.send(reply).await?;
+    Ok(())
+}
+
 async fn send_config_response(
     sender: &NodeSender,
     request: &Message,
@@ -335,6 +531,40 @@ async fn send_config_response(
     Ok(())
 }
 
+fn build_node_config_get_payload(
+    node_name: &str,
+    hive_id: &str,
+    sy_config: &SyConfigFile,
+    requested_node_name: &str,
+) -> serde_json::Value {
+    let state = if sy_config.routes.is_empty() && sy_config.vpns.is_empty() {
+        "empty"
+    } else {
+        "configured"
+    };
+    serde_json::json!({
+        "ok": true,
+        "node_name": node_name,
+        "state": state,
+        "schema_version": 1,
+        "config_version": sy_config.version,
+        "effective_config": {
+            "routes": sy_config.routes,
+            "vpns": sy_config.vpns,
+            "updated_at": sy_config.updated_at,
+            "hive": hive_id,
+        },
+        "contract": {
+            "supports": [MSG_CONFIG_GET, MSG_CONFIG_SET],
+            "target": NODE_CONFIG_CONTROL_TARGET,
+            "schema_version": 1,
+            "apply_modes": [NODE_CONFIG_APPLY_MODE_REPLACE],
+            "config_schema": "sy_config_routes_v1",
+            "requested_node_name": requested_node_name,
+        }
+    })
+}
+
 async fn handle_admin_action(
     sender: &NodeSender,
     msg: &Message,
@@ -344,35 +574,41 @@ async fn handle_admin_action(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let action = msg.meta.action.as_deref().unwrap_or("");
     let reply_payload = match action {
-        "list_routes" => serde_json::json!({
-            "status": "ok",
-            "config_version": sy_config.version,
-            "routes": sy_config.routes.clone(),
-        }),
-        "list_vpns" => serde_json::json!({
-            "status": "ok",
-            "config_version": sy_config.version,
-            "vpns": sy_config.vpns.clone(),
-        }),
+        "list_routes" => admin_success_payload(
+            action,
+            serde_json::json!({
+                "config_version": sy_config.version,
+                "routes": sy_config.routes.clone(),
+            }),
+        ),
+        "list_vpns" => admin_success_payload(
+            action,
+            serde_json::json!({
+                "config_version": sy_config.version,
+                "vpns": sy_config.vpns.clone(),
+            }),
+        ),
         "add_route" => {
             let route: RouteConfig = serde_json::from_value(msg.payload.clone())?;
             if sy_config.routes.iter().any(|r| r.prefix == route.prefix) {
-                serde_json::json!({
-                    "status": "error",
-                    "error": "DUPLICATE_PREFIX",
-                    "message": format!("Route with prefix '{}' already exists", route.prefix),
-                })
+                admin_error_payload(
+                    action,
+                    "DUPLICATE_PREFIX",
+                    format!("Route with prefix '{}' already exists", route.prefix),
+                )
             } else {
                 sy_config.routes.push(route.clone());
                 sy_config.version = sy_config.version.saturating_add(1);
                 sy_config.updated_at = now_epoch_ms().to_string();
                 apply_config(writer, sy_config)?;
                 write_config(config_dir, sy_config)?;
-                serde_json::json!({
-                    "status": "ok",
-                    "config_version": sy_config.version,
-                    "route": route,
-                })
+                admin_success_payload(
+                    action,
+                    serde_json::json!({
+                        "config_version": sy_config.version,
+                        "route": route,
+                    }),
+                )
             }
         }
         "delete_route" => {
@@ -381,41 +617,45 @@ async fn handle_admin_action(
             let before = sy_config.routes.len();
             sy_config.routes.retain(|r| r.prefix != prefix);
             if sy_config.routes.len() == before {
-                serde_json::json!({
-                    "status": "error",
-                    "error": "NOT_FOUND",
-                    "message": format!("Route with prefix '{}' not found", prefix),
-                })
+                admin_error_payload(
+                    action,
+                    "NOT_FOUND",
+                    format!("Route with prefix '{}' not found", prefix),
+                )
             } else {
                 sy_config.version = sy_config.version.saturating_add(1);
                 sy_config.updated_at = now_epoch_ms().to_string();
                 apply_config(writer, sy_config)?;
                 write_config(config_dir, sy_config)?;
-                serde_json::json!({
-                    "status": "ok",
-                    "config_version": sy_config.version,
-                })
+                admin_success_payload(
+                    action,
+                    serde_json::json!({
+                        "config_version": sy_config.version,
+                    }),
+                )
             }
         }
         "add_vpn" => {
             let vpn: VpnConfig = serde_json::from_value(msg.payload.clone())?;
             if sy_config.vpns.iter().any(|v| v.pattern == vpn.pattern) {
-                serde_json::json!({
-                    "status": "error",
-                    "error": "DUPLICATE_PATTERN",
-                    "message": format!("VPN with pattern '{}' already exists", vpn.pattern),
-                })
+                admin_error_payload(
+                    action,
+                    "DUPLICATE_PATTERN",
+                    format!("VPN with pattern '{}' already exists", vpn.pattern),
+                )
             } else {
                 sy_config.vpns.push(vpn.clone());
                 sy_config.version = sy_config.version.saturating_add(1);
                 sy_config.updated_at = now_epoch_ms().to_string();
                 apply_config(writer, sy_config)?;
                 write_config(config_dir, sy_config)?;
-                serde_json::json!({
-                    "status": "ok",
-                    "config_version": sy_config.version,
-                    "vpn": vpn,
-                })
+                admin_success_payload(
+                    action,
+                    serde_json::json!({
+                        "config_version": sy_config.version,
+                        "vpn": vpn,
+                    }),
+                )
             }
         }
         "delete_vpn" => {
@@ -427,27 +667,29 @@ async fn handle_admin_action(
             let before = sy_config.vpns.len();
             sy_config.vpns.retain(|v| v.pattern != pattern);
             if sy_config.vpns.len() == before {
-                serde_json::json!({
-                    "status": "error",
-                    "error": "NOT_FOUND",
-                    "message": format!("VPN with pattern '{}' not found", pattern),
-                })
+                admin_error_payload(
+                    action,
+                    "NOT_FOUND",
+                    format!("VPN with pattern '{}' not found", pattern),
+                )
             } else {
                 sy_config.version = sy_config.version.saturating_add(1);
                 sy_config.updated_at = now_epoch_ms().to_string();
                 apply_config(writer, sy_config)?;
                 write_config(config_dir, sy_config)?;
-                serde_json::json!({
-                    "status": "ok",
-                    "config_version": sy_config.version,
-                })
+                admin_success_payload(
+                    action,
+                    serde_json::json!({
+                        "config_version": sy_config.version,
+                    }),
+                )
             }
         }
-        _ => serde_json::json!({
-            "status": "error",
-            "error": "UNKNOWN_ACTION",
-            "message": format!("Unsupported admin action '{}'", action),
-        }),
+        _ => admin_error_payload(
+            action,
+            "UNKNOWN_ACTION",
+            format!("Unsupported admin action '{}'", action),
+        ),
     };
 
     let reply = Message {
@@ -472,6 +714,24 @@ async fn handle_admin_action(
     };
     sender.send(reply).await?;
     Ok(())
+}
+
+fn admin_success_payload(action: &str, payload: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "status": "ok",
+        "action": action,
+        "payload": payload,
+    })
+}
+
+fn admin_error_payload(action: &str, code: &str, detail: String) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "action": action,
+        "payload": serde_json::Value::Null,
+        "error_code": code,
+        "error_detail": detail,
+    })
 }
 
 async fn connect_with_retry(
@@ -643,6 +903,51 @@ fn parse_vpns(
     Ok(None)
 }
 
+fn apply_node_config_set_request(
+    current: &SyConfigFile,
+    request: &NodeConfigSetPayload,
+) -> Result<(SyConfigFile, Vec<&'static str>), Box<dyn std::error::Error>> {
+    if request.apply_mode != NODE_CONFIG_APPLY_MODE_REPLACE {
+        return Err(format!("unsupported apply_mode '{}'", request.apply_mode).into());
+    }
+    let config = request
+        .config
+        .as_object()
+        .ok_or("config must be a JSON object")?;
+
+    let mut next = current.clone();
+    let mut changed_fields = Vec::new();
+
+    if config.get("routes").is_some() {
+        let routes = parse_routes(&request.config)?.ok_or("routes must be present")?;
+        if routes != current.routes {
+            next.routes = routes;
+            changed_fields.push("routes");
+        }
+    }
+    if config.get("vpns").is_some() {
+        let vpns = parse_vpns(&request.config)?.ok_or("vpns must be present")?;
+        if vpns != current.vpns {
+            next.vpns = vpns;
+            changed_fields.push("vpns");
+        }
+    }
+    if config.get("routes").is_none() && config.get("vpns").is_none() {
+        return Err("config must include 'routes' or 'vpns'".into());
+    }
+
+    if !changed_fields.is_empty() {
+        next.version = if request.config_version == 0 {
+            current.version.saturating_add(1)
+        } else {
+            request.config_version
+        };
+        next.updated_at = now_epoch_ms().to_string();
+    }
+
+    Ok((next, changed_fields))
+}
+
 fn match_kind(value: Option<&str>) -> Result<u8, Box<dyn std::error::Error>> {
     match value.unwrap_or("PREFIX") {
         "EXACT" => Ok(MATCH_EXACT),
@@ -707,3 +1012,127 @@ fn empty_vpn_assignment() -> VpnAssignment {
 }
 
 // CONFIG_CHANGED lo emite SY.admin (motherbee).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_config() -> SyConfigFile {
+        SyConfigFile {
+            version: 3,
+            updated_at: "100".to_string(),
+            routes: vec![RouteConfig {
+                prefix: "support/".to_string(),
+                match_kind: Some("PREFIX".to_string()),
+                action: "FORWARD".to_string(),
+                next_hop_hive: Some("worker-1".to_string()),
+                metric: Some(10),
+                priority: Some(100),
+            }],
+            vpns: vec![VpnConfig {
+                pattern: "tenant/*".to_string(),
+                match_kind: Some("GLOB".to_string()),
+                vpn_id: 7,
+                priority: Some(100),
+            }],
+        }
+    }
+
+    #[test]
+    fn build_node_config_get_payload_exposes_contract() {
+        let payload = build_node_config_get_payload(
+            "SY.config.routes@motherbee",
+            "motherbee",
+            &sample_config(),
+            "SY.config.routes@motherbee",
+        );
+        assert_eq!(payload["ok"], json!(true));
+        assert_eq!(payload["node_name"], json!("SY.config.routes@motherbee"));
+        assert_eq!(
+            payload["contract"]["supports"],
+            json!([MSG_CONFIG_GET, MSG_CONFIG_SET])
+        );
+        assert_eq!(
+            payload["effective_config"]["routes"][0]["prefix"],
+            json!("support/")
+        );
+    }
+
+    #[test]
+    fn apply_node_config_set_request_replaces_selected_sections() {
+        let current = sample_config();
+        let request = NodeConfigSetPayload {
+            node_name: "SY.config.routes@motherbee".to_string(),
+            schema_version: 1,
+            config_version: 8,
+            apply_mode: NODE_CONFIG_APPLY_MODE_REPLACE.to_string(),
+            config: json!({
+                "routes": [{
+                    "prefix": "billing/",
+                    "match_kind": "PREFIX",
+                    "action": "FORWARD",
+                    "next_hop_hive": "worker-2",
+                    "metric": 5,
+                    "priority": 90
+                }]
+            }),
+            ..Default::default()
+        };
+
+        let (next, changed) = apply_node_config_set_request(&current, &request).unwrap();
+        assert_eq!(changed, vec!["routes"]);
+        assert_eq!(next.version, 8);
+        assert_eq!(next.routes[0].prefix, "billing/");
+        assert_eq!(next.vpns, current.vpns);
+    }
+
+    #[test]
+    fn apply_node_config_set_request_rejects_non_object_config() {
+        let current = sample_config();
+        let request = NodeConfigSetPayload {
+            node_name: "SY.config.routes@motherbee".to_string(),
+            schema_version: 1,
+            config_version: 8,
+            apply_mode: NODE_CONFIG_APPLY_MODE_REPLACE.to_string(),
+            config: json!("bad"),
+            ..Default::default()
+        };
+        let err = apply_node_config_set_request(&current, &request).unwrap_err();
+        assert!(err.to_string().contains("JSON object"));
+    }
+
+    #[test]
+    fn admin_error_payload_uses_canonical_fields() {
+        let payload = admin_error_payload("delete_route", "NOT_FOUND", "missing route".to_string());
+        assert_eq!(payload["status"], json!("error"));
+        assert_eq!(payload["action"], json!("delete_route"));
+        assert_eq!(payload["payload"], serde_json::Value::Null);
+        assert_eq!(payload["error_code"], json!("NOT_FOUND"));
+        assert_eq!(payload["error_detail"], json!("missing route"));
+        assert!(payload.get("error").is_none());
+        assert!(payload.get("message").is_none());
+    }
+
+    #[test]
+    fn admin_success_payload_uses_canonical_envelope() {
+        let payload = admin_success_payload(
+            "list_routes",
+            json!({
+                "config_version": 4,
+                "routes": [{ "prefix": "alpha/**" }],
+            }),
+        );
+        assert_eq!(payload["status"], json!("ok"));
+        assert_eq!(payload["action"], json!("list_routes"));
+        assert_eq!(
+            payload["payload"],
+            json!({
+                "config_version": 4,
+                "routes": [{ "prefix": "alpha/**" }],
+            })
+        );
+        assert!(payload.get("config_version").is_none());
+        assert!(payload.get("routes").is_none());
+    }
+}

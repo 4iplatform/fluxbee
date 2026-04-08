@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
-use crate::{NodeError, NodeReceiver, NodeSender};
+use crate::{classify_admin_action, ActionResult, NodeError, NodeReceiver, NodeSender};
 
 pub const ADMIN_KIND: &str = "admin";
 pub const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
@@ -27,6 +27,8 @@ pub struct AdminCommandResult {
     pub status: String,
     pub action: String,
     pub payload: Value,
+    pub action_result: Option<ActionResult>,
+    pub result_origin: Option<String>,
     pub error_code: Option<String>,
     pub error_detail: Option<Value>,
     pub request_id: Option<String>,
@@ -144,6 +146,7 @@ pub async fn admin_command(
             scope: None,
             target: Some(admin_target.to_string()),
             action: Some(action.to_string()),
+            action_class: classify_admin_action(action),
             priority: None,
             context: None,
             ..Meta::default()
@@ -153,7 +156,7 @@ pub async fn admin_command(
     sender.send(msg).await?;
 
     let incoming = wait_admin_response(receiver, admin_target, action, &trace_id, timeout).await?;
-    parse_admin_response(action, trace_id, incoming.payload)
+    parse_admin_response(action, trace_id, incoming)
 }
 
 /// Like [`admin_command`], but enforces payload `status="ok"`.
@@ -249,8 +252,9 @@ async fn wait_admin_response(
 fn parse_admin_response(
     requested_action: &str,
     trace_id: String,
-    payload: Value,
+    message: Message,
 ) -> Result<AdminCommandResult, AdminCommandError> {
+    let payload = message.payload;
     let status = payload
         .get("status")
         .and_then(Value::as_str)
@@ -283,6 +287,8 @@ fn parse_admin_response(
         status,
         action,
         payload: payload_value,
+        action_result: message.meta.action_result,
+        result_origin: message.meta.result_origin,
         error_code,
         error_detail,
         request_id,
@@ -342,6 +348,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn admin_response_message(payload: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: "src".to_string(),
+                dst: Destination::Unicast("dst".to_string()),
+                ttl: 16,
+                trace_id: "trace-test".to_string(),
+            },
+            meta: Meta {
+                msg_type: ADMIN_KIND.to_string(),
+                msg: Some(MSG_ADMIN_COMMAND_RESPONSE.to_string()),
+                ..Meta::default()
+            },
+            payload,
+        }
+    }
+
     #[test]
     fn parse_admin_response_prefers_payload_field_when_present() {
         let raw = json!({
@@ -354,7 +377,12 @@ mod tests {
             "error_detail": null
         });
 
-        let parsed = parse_admin_response("get_hive", "trace-1".to_string(), raw).unwrap();
+        let parsed = parse_admin_response(
+            "get_hive",
+            "trace-1".to_string(),
+            admin_response_message(raw),
+        )
+        .unwrap();
         assert_eq!(parsed.action, "get_hive");
         assert_eq!(parsed.payload, json!({ "hive_id": "worker-220" }));
     }
@@ -382,7 +410,12 @@ mod tests {
             "error_detail": null
         });
 
-        let parsed = parse_admin_response("opa_get_status", "trace-2".to_string(), raw).unwrap();
+        let parsed = parse_admin_response(
+            "opa_get_status",
+            "trace-2".to_string(),
+            admin_response_message(raw),
+        )
+        .unwrap();
         assert_eq!(
             parsed.payload,
             json!({

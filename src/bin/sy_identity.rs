@@ -1026,7 +1026,10 @@ impl IdentityRuntime {
         allowed_prefixes.insert(MSG_ILK_PROVISION, vec!["IO."]);
         allowed_prefixes.insert(MSG_ILK_LIST, vec!["SY.admin@"]);
         allowed_prefixes.insert(MSG_ILK_GET, vec!["SY.admin@"]);
-        allowed_prefixes.insert(MSG_ILK_REGISTER, vec!["SY.frontdesk.gov@", "SY.orchestrator@"]);
+        allowed_prefixes.insert(
+            MSG_ILK_REGISTER,
+            vec!["SY.frontdesk.gov@", "SY.orchestrator@"],
+        );
         allowed_prefixes.insert(MSG_ILK_ADD_CHANNEL, vec!["SY.frontdesk.gov@"]);
         allowed_prefixes.insert(MSG_ILK_UPDATE, vec!["SY.orchestrator@"]);
         allowed_prefixes.insert(MSG_TNT_CREATE, vec!["SY.frontdesk.gov@"]);

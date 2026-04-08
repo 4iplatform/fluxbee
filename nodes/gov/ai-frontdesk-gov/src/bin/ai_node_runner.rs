@@ -2847,10 +2847,7 @@ fn bootstrap_node_from_args(
             .clone()
             .or_else(|| std::env::var("AI_UUID_PERSISTENCE_DIR").ok())
             .unwrap_or_else(default_state_dir),
-        config_dir: args
-            .config_dir
-            .clone()
-            .unwrap_or(config_dir),
+        config_dir: args.config_dir.clone().unwrap_or(config_dir),
         dynamic_config_dir: args
             .dynamic_config_dir
             .clone()
@@ -4462,7 +4459,10 @@ mod tests {
             .as_ref()
             .and_then(|value| value.get("value"))
             .and_then(Value::as_str);
-        assert_eq!(instructions, Some(frontdesk_default_instructions().as_str()));
+        assert_eq!(
+            instructions,
+            Some(frontdesk_default_instructions().as_str())
+        );
     }
 
     #[test]

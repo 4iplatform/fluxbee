@@ -10,13 +10,14 @@ pub mod node_client;
 pub mod node_config;
 pub mod node_secret;
 pub mod payload;
+pub mod policy;
 pub mod prelude;
 pub mod protocol;
+mod send_normalization;
 pub mod socket;
 pub mod split;
 pub mod status;
 pub mod thread;
-mod send_normalization;
 
 pub use admin::{
     admin_command, admin_command_ok, AdminCommandError, AdminCommandRequest, AdminCommandResult,
@@ -65,6 +66,10 @@ pub use node_secret::{
     save_node_secret_record_with_root, NodeSecretDescriptor, NodeSecretError, NodeSecretRecord,
     NodeSecretWriteOptions, NODE_SECRET_FILE_NAME, NODE_SECRET_REDACTION_TOKEN,
     NODE_SECRET_SCHEMA_VERSION,
+};
+pub use policy::{
+    action_class_requires_result, classify_admin_action, classify_routed_message,
+    classify_system_message, derive_action_outcome, ActionClass, ActionResult,
 };
 pub use split::{NodeReceiver, NodeSender};
 pub use status::try_handle_default_node_status;
