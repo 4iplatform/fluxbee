@@ -3,7 +3,7 @@
 **Status:** planning / ready for implementation
 **Date:** 2026-04-08
 **Primary spec:** [sy-timer.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/sy-timer.md)
-**Related work:** `fluxbee-go-sdk` v1 inside `sy-opa-rules/sdk`
+**Related work:** formal top-level `fluxbee-go-sdk`
 
 ---
 
@@ -14,7 +14,7 @@ Implement `SY.timer` as a first-class Fluxbee system node that provides:
 - persistent one-shot and recurring timers
 - authoritative time/timezone operations
 - direct node-to-node invocation through the standard Fluxbee envelope
-- a reusable Go SDK surface that can later be published outside the current `sy-opa-rules/sdk` location
+- a reusable formal Go SDK surface for first-party and third-party node authors
 
 This effort is intentionally split into:
 
@@ -96,17 +96,28 @@ That means:
 - the direct-call contract is part of the public platform surface
 - `TIMER_HELP` and SDK ergonomics matter more than in current admin-mediated nodes
 
+### 2.7 Go SDK publication model
+
+`fluxbee-go-sdk` is frozen as a formal top-level SDK in the repository.
+
+It must:
+
+- move out of `sy-opa-rules/sdk`
+- be clearly identified as the Go SDK counterpart for Fluxbee
+- remain usable by first-party nodes and external users
+- avoid hidden coupling to the `SY.opa.rules` package layout
+
 ---
 
 ## 3) Implementation strategy
 
 Recommended order:
 
-1. Extend `fluxbee-go-sdk` to the minimum needed by `SY.timer`
-2. Build `SY.timer` node with direct SDK-first interface
-3. Integrate as a system node in core
-4. Add admin/operator visibility and docs
-5. Revisit publication/extraction of `fluxbee-go-sdk`
+1. Formalize top-level `fluxbee-go-sdk`
+2. Extend it to the minimum needed by `SY.timer`
+3. Build `SY.timer` node with direct SDK-first interface
+4. Integrate as a system node in core
+5. Add admin/operator visibility and docs
 
 ---
 
@@ -119,6 +130,7 @@ Recommended order:
 - [x] SYT-S0-T3. UUID->L2 ownership resolution frozen as a `fluxbee-go-sdk` responsibility.
 - [x] SYT-S0-T4. `created_at_linux` dropped; v1 keeps a single preserved creation timestamp.
 - [x] SYT-S0-T5. `TIMER_HELP` remains node-specific in v1; generic `HELP` stays for a later platform pass.
+- [x] SYT-S0-T6. `fluxbee-go-sdk` is frozen as a formal top-level SDK, not an internal subpackage under `SY.opa.rules`.
 
 ---
 
@@ -126,14 +138,18 @@ Recommended order:
 
 ### SYT-S1 — Promote the current Go SDK from OPA-specific bootstrap to reusable platform SDK
 
-- [ ] SYT-S1-T1. Define the target package identity for v1:
-  - keep temporarily under `sy-opa-rules/sdk`
-  - or move to a top-level `fluxbee-go-sdk/`
+- [ ] SYT-S1-T1. Create a formal top-level `fluxbee-go-sdk/` module in the repo.
 - [ ] SYT-S1-T2. Preserve backward compatibility for `SY.opa.rules` while extending the SDK.
 - [ ] SYT-S1-T3. Add peer identity resolution support needed by `SY.timer`.
 - [ ] SYT-S1-T4. Add typed request/reply helpers for direct `system` RPC-style node interactions.
 - [ ] SYT-S1-T5. Add typed error parsing helpers matching `TIMER_RESPONSE`.
 - [ ] SYT-S1-T6. Add reusable `HELP` descriptor helpers if that reduces duplication.
+- [ ] SYT-S1-T7. Move the current SDK code from `sy-opa-rules/sdk` into the formal SDK layout.
+- [ ] SYT-S1-T8. Define stable package naming and import path for Go consumers.
+- [ ] SYT-S1-T9. Add module README and first-party/third-party usage guidance.
+- [ ] SYT-S1-T10. Define versioning/compatibility policy for the Go SDK.
+- [ ] SYT-S1-T11. Add wire-compatibility tests against the Rust SDK contract.
+- [ ] SYT-S1-T12. Leave a compatibility migration path for `SY.opa.rules` while imports move to the formal SDK.
 
 ### SYT-S2 — Add `timer` client module to the Go SDK
 
@@ -284,7 +300,7 @@ Recommended order:
 
 ## 10) Recommended execution order
 
-1. `SYT-S1` extend `fluxbee-go-sdk`
+1. `SYT-S1` formalize top-level `fluxbee-go-sdk`
 2. `SYT-S2` add Go timer client module
 3. `SYT-S3` / `SYT-S4` / `SYT-S5` node core
 4. `SYT-S6` request handlers
@@ -301,6 +317,7 @@ The spec is implementable and the main architecture is now frozen.
 
 The remaining work is implementation-oriented:
 
-1. extend `fluxbee-go-sdk` with UUID->L2 identity support and timer client primitives
-2. implement `SY.timer` as a core singleton `SY.*` service
-3. integrate install/orchestrator/docs
+1. formalize and move `fluxbee-go-sdk` to a top-level SDK module
+2. extend it with UUID->L2 identity support and timer client primitives
+3. implement `SY.timer` as a core singleton `SY.*` service
+4. integrate install/orchestrator/docs
