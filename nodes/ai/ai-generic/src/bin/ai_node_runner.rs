@@ -5382,7 +5382,7 @@ mod tests {
     async fn openai_chat_missing_api_key_returns_error_payload_instead_of_fatal() {
         let _guard = env_lock().lock().expect("env lock");
         std::env::remove_var("OPENAI_API_KEY_MISSING_FOR_TEST");
-        let mut node = test_node();
+        let node = test_node();
         {
             let mut state = node.control_plane.write().await;
             state.current_state = NodeLifecycleState::Configured;
@@ -5640,6 +5640,84 @@ mod tests {
             .decode(&artifacts[0].bytes_base64)
             .expect("valid base64");
         assert!(bytes.starts_with(b"%PDF-1.4"));
+    }
+
+    #[tokio::test]
+    async fn generate_textual_artifact_tools_return_expected_mime_and_filenames() {
+        let text_tool = GenerateTextArtifactTool;
+        let json_tool = GenerateJsonArtifactTool;
+        let markdown_tool = GenerateMarkdownArtifactTool;
+        let html_tool = GenerateHtmlArtifactTool;
+
+        let text_output = text_tool
+            .call(json!({
+                "filename": "nota.txt",
+                "content": "hola mundo"
+            }))
+            .await
+            .expect("text tool should succeed");
+        let json_output = json_tool
+            .call(json!({
+                "filename": "payload.json",
+                "data": {"ok": true, "count": 2}
+            }))
+            .await
+            .expect("json tool should succeed");
+        let markdown_output = markdown_tool
+            .call(json!({
+                "filename": "readme.md",
+                "content": "# Hola\n\n- uno\n- dos"
+            }))
+            .await
+            .expect("markdown tool should succeed");
+        let html_output = html_tool
+            .call(json!({
+                "filename": "page.html",
+                "content": "<h1>Hola</h1><p>Mundo</p>"
+            }))
+            .await
+            .expect("html tool should succeed");
+
+        let (_, text_artifacts) = decode_tool_artifact(text_output);
+        let (_, json_artifacts) = decode_tool_artifact(json_output);
+        let (_, markdown_artifacts) = decode_tool_artifact(markdown_output);
+        let (_, html_artifacts) = decode_tool_artifact(html_output);
+
+        assert_eq!(text_artifacts[0].filename, "nota.txt");
+        assert_eq!(text_artifacts[0].mime, "text/plain");
+        assert_eq!(json_artifacts[0].filename, "payload.json");
+        assert_eq!(json_artifacts[0].mime, "application/json");
+        assert_eq!(markdown_artifacts[0].filename, "readme.md");
+        assert_eq!(markdown_artifacts[0].mime, "text/markdown");
+        assert_eq!(html_artifacts[0].filename, "page.html");
+        assert_eq!(html_artifacts[0].mime, "text/html");
+
+        let text_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&text_artifacts[0].bytes_base64)
+            .expect("valid txt base64");
+        let json_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&json_artifacts[0].bytes_base64)
+            .expect("valid json base64");
+        let markdown_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&markdown_artifacts[0].bytes_base64)
+            .expect("valid markdown base64");
+        let html_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&html_artifacts[0].bytes_base64)
+            .expect("valid html base64");
+
+        assert_eq!(
+            String::from_utf8(text_bytes).expect("utf8 txt"),
+            "hola mundo"
+        );
+        assert!(String::from_utf8(json_bytes)
+            .expect("utf8 json")
+            .contains("\"ok\": true"));
+        assert!(String::from_utf8(markdown_bytes)
+            .expect("utf8 markdown")
+            .contains("# Hola"));
+        assert!(String::from_utf8(html_bytes)
+            .expect("utf8 html")
+            .contains("<h1>Hola</h1>"));
     }
 
     #[tokio::test]

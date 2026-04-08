@@ -656,9 +656,34 @@ Estructura:
   2) devolver `BlobRef` en `payload.attachments`.
 
 ⚠️ **ESTADO DE IMPLEMENTACION ACTUAL**:
-- Este contrato existe, pero los runners `AI.*` actuales no lo usan todavia como camino general de salida.
-- Hoy el comportamiento implementado y validado es respuesta textual (`content` / `content_ref`).
-- La generacion de artefactos salientes (por ejemplo PDF/XLSX/imagen) y su devolucion como `attachments[]` queda pendiente de implementacion especifica del behavior/runtime.
+- El contrato ya esta implementado como camino general de salida para artefactos user-facing en `AI.common`.
+- El runtime AI expone hoy salida final estructurada con:
+  - texto solo
+  - texto + `attachments[]`
+  - `attachments[]` sin texto, si el behavior/tool asi lo devuelve
+- La materializacion saliente usa el flujo canonico `put_bytes -> promote -> BlobRef`.
+- La politica MVP ante fallo de artefacto es `fail-closed`:
+  - si falla la generacion o materializacion del adjunto, el runner responde error canonico
+  - no entrega un falso exito textual como si el archivo hubiera salido bien
+
+⚠️ **ESTADO DE VALIDACION ACTUAL**:
+- Validado E2E real con `IO.slack`:
+  - `text/csv`
+- Validado por compilacion Linux + tests unitarios/directos del runner:
+  - `text/plain`
+  - `application/json`
+  - `text/markdown`
+  - `text/html`
+  - `application/pdf`
+  - `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` (`.xlsx`)
+  - `application/vnd.openxmlformats-officedocument.wordprocessingml.document` (`.docx`)
+  - `image/png`
+  - `image/jpeg`
+- Pendiente de validacion E2E por familia:
+  - texto estructurado (`txt/json/md/html`)
+  - documentos (`pdf/docx`)
+  - tablas (`xlsx`)
+  - imagenes (`png/jpeg`)
 
 ### 5.2 Routing de respuesta (anti-loop)
 
