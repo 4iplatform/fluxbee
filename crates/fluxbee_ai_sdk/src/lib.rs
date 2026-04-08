@@ -5,6 +5,7 @@ pub mod immediate_memory;
 pub mod llm;
 pub mod message;
 pub mod node_trait;
+pub mod output;
 pub mod router_client;
 pub mod runtime;
 pub mod summary_refresh;
@@ -33,6 +34,11 @@ pub use message::{
     Message, Meta, Routing,
 };
 pub use node_trait::AiNode;
+pub use output::{
+    allowed_user_artifact_mime, build_ai_behavior_response,
+    build_ai_behavior_response_with_options, materialize_user_artifacts, AiBehaviorOutput,
+    AiFinalOutput, AiUserArtifact,
+};
 pub use router_client::{AiNodeConfig, RouterClient};
 pub use runtime::{NodeRuntime, RetryPolicy, RuntimeConfig};
 pub use summary_refresh::{

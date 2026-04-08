@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["clock"] }
 fluxbee-ai-sdk = { path = "../../../crates/fluxbee_ai_sdk" }
 fluxbee-sdk = { path = "../../../crates/fluxbee_sdk" }
@@ -15,3 +16,5 @@ tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+zip = "0.6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
