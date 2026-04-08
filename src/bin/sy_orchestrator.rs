@@ -96,6 +96,12 @@ const NODE_STATUS_SCHEMA_VERSION: &str = "1";
 const NODE_STATUS_FORWARD_TIMEOUT_SECS: u64 = 2;
 const DEPLOYMENT_HISTORY_MAX_LIMIT: usize = 500;
 const DRIFT_ALERT_MAX_LIMIT: usize = 500;
+const LEGACY_ALIGNED_NODE_NAMES: &[&str] = &["SY.config.routes", "SY.opa.rules"];
+const LEGACY_ALIGNED_SERVICE_UNITS: &[&str] = &["sy-config-routes", "sy-opa-rules"];
+const LEGACY_ALIGNED_WORKER_UNITS: &[(&str, &str)] = &[
+    ("sy-config-routes", "/usr/bin/sy-config-routes"),
+    ("sy-opa-rules", "/usr/bin/sy-opa-rules"),
+];
 const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "rt-gateway",
     "sy-config-routes",
@@ -648,23 +654,20 @@ async fn bootstrap_local(
     }
 
     let mut services = if state.is_motherbee {
-        vec![
-            "sy-config-routes",
-            "sy-opa-rules",
+        let mut services = LEGACY_ALIGNED_SERVICE_UNITS.to_vec();
+        services.extend([
             "sy-admin",
             "sy-architect",
             "sy-storage",
             "sy-cognition",
             "sy-policy",
             "sy-frontdesk-gov",
-        ]
+        ]);
+        services
     } else {
-        vec![
-            "sy-config-routes",
-            "sy-opa-rules",
-            "sy-cognition",
-            "sy-policy",
-        ]
+        let mut services = LEGACY_ALIGNED_SERVICE_UNITS.to_vec();
+        services.extend(["sy-cognition", "sy-policy"]);
+        services
     };
     if identity_available() {
         services.push("sy-identity");
@@ -1006,7 +1009,7 @@ async fn wait_for_sy_nodes(
     timeout: Duration,
 ) -> Result<(), OrchestratorError> {
     // Only router-connected SY nodes are visible in router SHM.
-    let mut required = vec!["SY.config.routes", "SY.opa.rules"];
+    let mut required: Vec<&str> = LEGACY_ALIGNED_NODE_NAMES.to_vec();
     if state.is_motherbee {
         required.push("SY.admin");
     }
@@ -1163,16 +1166,16 @@ async fn shutdown_sequence(state: &OrchestratorState) {
 
     time::sleep(Duration::from_secs(10)).await;
 
-    for service in [
+    let mut shutdown_services = vec![
         "sy-frontdesk-gov",
         "sy-policy",
         "sy-cognition",
         "sy-storage",
         "sy-architect",
         "sy-admin",
-        "sy-config-routes",
-        "sy-opa-rules",
-    ] {
+    ];
+    shutdown_services.extend(LEGACY_ALIGNED_SERVICE_UNITS.iter().copied());
+    for service in shutdown_services {
         if let Err(err) = systemd_stop(service) {
             tracing::warn!(service = service, error = %err, "failed to stop service");
         }
@@ -13538,10 +13541,9 @@ async fn add_hive_flow(
 
     let mut worker_units = vec![
         ("rt-gateway", "/usr/bin/rt-gateway"),
-        ("sy-config-routes", "/usr/bin/sy-config-routes"),
-        ("sy-opa-rules", "/usr/bin/sy-opa-rules"),
         ("sy-orchestrator", "/usr/bin/sy-orchestrator"),
     ];
+    worker_units.extend(LEGACY_ALIGNED_WORKER_UNITS.iter().copied());
     if has_identity_source {
         worker_units.push(("sy-identity", "/usr/bin/sy-identity"));
     }

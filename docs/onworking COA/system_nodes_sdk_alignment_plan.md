@@ -496,9 +496,19 @@ For now, the target is:
 - [x] SYS-ALIGN-S4-T1. Make `SY.admin` the single canonical origin of operator/system commands for these nodes.
   - Operator/system commands for `SY.config.routes` and `SY.opa.rules` are canonically issued through `SY.admin`.
   - Any direct node-local admin/command/query surface that remains is treated as implementation compatibility, not as the primary operator contract.
-- [ ] SYS-ALIGN-S4-T2. Ensure both nodes expose explicit, documented action catalogs that `SY.admin` can rely on.
-- [ ] SYS-ALIGN-S4-T3. Ensure `SY.orchestrator` only depends on stable service lifecycle contracts, not node-specific reply quirks.
-- [ ] SYS-ALIGN-S4-T4. Review whether `sy-opa-rules` and `sy-config-routes` should advertise richer capability/contracts during startup.
+- [x] SYS-ALIGN-S4-T2. Ensure both nodes expose explicit, documented action catalogs that `SY.admin` can rely on.
+  - Canonical action catalogs are documented in [system_node_action_catalogs.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/TODO/system_node_action_catalogs.md).
+- [x] SYS-ALIGN-S4-T3. Ensure `SY.orchestrator` only depends on stable service lifecycle contracts, not node-specific reply quirks.
+  - Audit result: `SY.orchestrator` interacts with `SY.config.routes` and `SY.opa.rules` through systemd/unit management, router SHM visibility, remote file deployment, and generic `CONFIG_CHANGED` dispatch.
+  - It does **not** parse node-specific `CONFIG_RESPONSE` payloads from those nodes to manage their lifecycle.
+  - Local cleanup: shared service/unit constants now centralize the legacy-aligned nodes so the orchestrator contract stays service-oriented rather than reply-shape-oriented.
+- [x] SYS-ALIGN-S4-T4. Review whether `sy-opa-rules` and `sy-config-routes` should advertise richer capability/contracts during startup.
+  - Review result: **do not** extend node startup handshake in v1.0.
+  - Current node `HELLO` / `ANNOUNCE` payloads do not carry a first-class node capability/contract field, and changing that would widen the wire contract beyond this alignment stream.
+  - Canonical rich contract exposure for these nodes remains:
+    - `SY.admin` action catalogs
+    - `CONFIG_GET` / `CONFIG_RESPONSE` contract payloads
+  - Startup remains intentionally minimal: identity, presence, router attachment, and service lifecycle only.
 
 ### SYS-ALIGN-S5 — SDK and implementation work
 
