@@ -1088,6 +1088,13 @@ impl GenericAiNode {
                 .run_with_input(&model, &tool_registry, run_input)
                 .await?;
             if let Some(output) = extract_final_output_from_tool_results(&result)? {
+                tracing::info!(
+                    node_name = %self.node_name,
+                    thread_id = ?ctx.thread_id,
+                    src_ilk = ?ctx.src_ilk,
+                    output_summary = %summarize_behavior_output(&output),
+                    "tool run produced explicit final_output with user-facing artifacts"
+                );
                 let summary_text = summarize_behavior_output(&output);
                 self.persist_immediate_turn(openai, ctx, &input, &summary_text)
                     .await;
@@ -1856,6 +1863,18 @@ fn extract_final_output_from_tool_results(
                 })?;
             artifacts.push(AiUserArtifact::new(bytes, artifact.mime, artifact.filename));
         }
+        tracing::info!(
+            artifact_count = artifacts.len(),
+            artifact_filenames = ?artifacts
+                .iter()
+                .map(|artifact| artifact.filename.clone())
+                .collect::<Vec<_>>(),
+            artifact_mimes = ?artifacts
+                .iter()
+                .map(|artifact| artifact.mime.clone())
+                .collect::<Vec<_>>(),
+            "parsed explicit final_output artifact envelope from tool result"
+        );
         return Ok(Some(AiBehaviorOutput::final_output(AiFinalOutput::new(
             envelope.text,
             artifacts,
@@ -1996,6 +2015,13 @@ impl FunctionTool for GenerateCsvArtifactTool {
         } else {
             format!("{}\n", lines.join("\n"))
         };
+        tracing::info!(
+            filename = %filename,
+            headers = args.headers.as_ref().map(|headers| headers.len()).unwrap_or(0),
+            rows = args.rows.len(),
+            csv_bytes = csv_content.len(),
+            "generate_csv_artifact produced CSV final artifact"
+        );
         let bytes_base64 = base64::engine::general_purpose::STANDARD.encode(csv_content.as_bytes());
 
         Ok(json!({

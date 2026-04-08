@@ -602,12 +602,12 @@ Backlog propuesto:
 
 Subbloque 4bis.A - contrato interno del runtime AI
 
-[ ] AI 4bis.A1: definir contrato interno de salida final de behavior/runtime para artefactos user-facing
+[x] AI 4bis.A1: definir contrato interno de salida final de behavior/runtime para artefactos user-facing
   - no inferir automaticamente "todo tool output archivo => adjunto al usuario"
   - exigir una decision explicita de runtime/behavior sobre que artefactos son final user deliverable
   - mantener alineacion conceptual con `tool_use_behavior` del Agents SDK
   - el contrato debe servir para cualquier `mime`/`filename`/binario, no para un tipo fijo
-[ ] AI 4bis.A2: definir tipo reusable en SDK AI para salida final con adjuntos
+[x] AI 4bis.A2: definir tipo reusable en SDK AI para salida final con adjuntos
   - debe convivir con el caso actual de salida solo texto
   - forma minima recomendada:
     - `text` opcional
@@ -617,24 +617,24 @@ Subbloque 4bis.A - contrato interno del runtime AI
       - `mime`
       - `filename`
       - marca explicita de entrega a usuario final
-[ ] AI 4bis.A3: definir regla minima de producto para el contrato de salida
+[x] AI 4bis.A3: definir regla minima de producto para el contrato de salida
   - caso principal MVP: `texto + attachment`
   - `attachment-only` queda permitido por contrato solo si no complica la implementacion del builder
   - multiples attachments pueden quedar soportados por shape aunque el primer E2E valide solo uno
 
 Subbloque 4bis.B - materializacion a blob y respuesta Fluxbee
 
-[ ] AI 4bis.B1: implementar helper comun en SDK AI para materializar artefactos salientes a blob
+[x] AI 4bis.B1: implementar helper comun en SDK AI para materializar artefactos salientes a blob
   - `put_bytes`
   - `promote`
   - retorno de `BlobRef`
   - logging y errores canonicos uniformes
-[ ] AI 4bis.B2: implementar builder de respuesta `text/v1` con `attachments[]` salientes
+[x] AI 4bis.B2: implementar builder de respuesta `text/v1` con `attachments[]` salientes
   - texto breve + archivos
   - solo archivo si aplica
   - offload de texto largo a `content_ref` si hiciera falta
   - mantener el contrato Fluxbee actual sin introducir payloads ad-hoc nuevos
-[ ] AI 4bis.B3: definir politica de fallback/error para generacion de artefactos
+[x] AI 4bis.B3: definir politica de fallback/error para generacion de artefactos
   - si el texto esta listo pero el archivo falla
   - si falla blob persist/promote
   - si hay multiple attachments y falla uno
@@ -642,30 +642,54 @@ Subbloque 4bis.B - materializacion a blob y respuesta Fluxbee
 
 Subbloque 4bis.C - integracion en runners AI
 
-[ ] AI 4bis.C1: integrar el camino nuevo en runners `AI.common` y `SY.frontdesk.gov`
+[x] AI 4bis.C1: integrar el camino nuevo en runners `AI.common` y `SY.frontdesk.gov`
   - mantener backward compatibility del caso actual `String -> build_text_response(...)`
   - usar el camino nuevo solo cuando el behavior devuelva artefactos finales
-[ ] AI 4bis.C2: definir un behavior/tool de referencia para validar el pipeline de artefactos salientes
+[x] AI 4bis.C2: definir un behavior/tool de referencia para validar el pipeline de artefactos salientes
   - el behavior de prueba debe generar un archivo a partir de datos de entrada reales
   - la eleccion del primer tipo a validar no debe introducir ramas especiales permanentes en el runtime
-[ ] AI 4bis.C3: elegir un primer artefacto representativo solo para validacion E2E del MVP
-  - recomendado: `application/pdf` o una imagen simple
+[x] AI 4bis.C3: elegir un primer artefacto representativo solo para validacion E2E del MVP
+  - elegido para este primer cierre tecnico: `text/csv`
   - esta eleccion no debe acoplar el contrato ni el helper blob a ese tipo puntual
 
 Subbloque 4bis.D - validacion E2E y cierre documental
 
-[ ] IO/AI 4bis.D1: validar E2E con `IO.slack`
+[x] IO/AI 4bis.D1: validar E2E con `IO.slack`
   - texto + attachment saliente
   - attachment saliente sin texto si se decide soportarlo en MVP
   - error canonicamente visible si la generacion falla
-[ ] IO/AI 4bis.D2: agregar prueba/caso de regresion para confirmar que el pipeline saliente sigue siendo MIME-agnostico
+  - validacion Linux real completada el `2026-04-08` con `AI.chat@motherbee` + `IO.slack`
+  - prompt usado: generar `reporte.csv` con columnas `nombre,edad` y filas `Ana,30` / `Luis,41`
+  - evidencia observada:
+    - el usuario recibio `reporte.csv` en Slack
+    - el blob quedo materializado en `blob/active/`
+    - el contenido recibido fue correcto
+[x] IO/AI 4bis.D2: agregar prueba/caso de regresion para confirmar que el pipeline saliente sigue siendo MIME-agnostico
   - el objetivo no es cerrar una matriz completa de tipos ahora
   - el objetivo es evitar que el primer tipo validado quede hardcodeado en el runtime
-[ ] AI/IO 4bis.D3: actualizar docs canonicamente
+
+Estado despues de este avance:
+
+- el SDK AI ya expone un contrato de salida final reusable para:
+  - texto solo
+  - texto + adjuntos
+  - adjuntos sin texto si hiciera falta
+- el helper comun de materializacion a blob y el builder de respuesta Fluxbee ya existen
+- los runners `AI.*` ya aceptan el nuevo tipo de salida final sin romper el camino actual de solo texto
+- ya existe un tool de referencia para devolver un artefacto user-facing explicito (`generate_csv_artifact`)
+- la politica MVP elegida para fallos de artefactos es `fail-closed`
+  - si falla generacion/materializacion del artefacto, no se entrega texto parcial como si el adjunto hubiese salido bien
+  - el runner responde con error canonico (`artifact_generation_failed` / `artifact_materialization_failed`)
+- las pruebas agregadas por ahora incluyen:
+  - unitarias del SDK para contrato y materializacion
+  - una validacion E2E real con `IO.slack` para `text/csv`
+  - una prueba negativa manual intentada en Linux que no logro forzar el fallo de materializacion en ese entorno
+[x] AI/IO 4bis.D3: actualizar docs canonicamente
   - que soporta el contrato
   - que esta implementado hoy
   - que fue validado en el MVP
   - que tipos quedan solo como validacion futura, no como restriccion de arquitectura
+  - dejar explicitado que la politica `fail-closed` queda validada por codigo y pendiente de una prueba negativa mas controlada a nivel operativo
 
 Orden recomendado de implementacion para este bloque:
 
