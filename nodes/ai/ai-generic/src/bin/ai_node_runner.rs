@@ -5401,10 +5401,11 @@ mod tests {
             }));
         }
 
-        let msg = sample_user_request_with_context(
+        let mut msg = sample_user_request_with_context(
             json!({ "thread_id": "sim-thread-1" }),
             Some("ilk:11111111-1111-4111-8111-111111111111"),
         );
+        msg.meta.thread_id = Some("thread:sim-thread-1".to_string());
         let response = node
             .on_message(msg)
             .await
