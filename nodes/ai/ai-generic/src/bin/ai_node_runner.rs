@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use base64::Engine;
 use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
 use fluxbee_ai_sdk::{
     build_ai_behavior_response, build_openai_user_content_parts, build_reply_message_runtime_src,
