@@ -19,7 +19,7 @@ Forma parte de la familia de nodos del sistema, junto con `SY.storage`, `SY.admi
 
 **No es un sistema de tiempo real.** `SY.timer` está diseñado para workflows, cognición, agentes y automatización. La granularidad mínima de un timer es **60 segundos**, la precisión de disparo es *best-effort* con tolerancia del orden de segundos, y la carga esperada es de hasta ~10.000 timers concurrentes por hive.
 
-**Ownership estricto por nombre L2.** Cada nodo solo puede ver, modificar y cancelar sus propios timers. La única excepción es `SY.orchestrator`, que puede invocar `TIMER_PURGE_OWNER` como parte del teardown de un nodo.
+**Ownership estricto por nombre L2.** Cada nodo solo puede ver, modificar y cancelar sus propios timers. La única excepción es `SY.orchestrator`, que puede invocar `TIMER_PURGE_OWNER` como parte del teardown de un nodo. La resolución `routing.src (UUID) -> nombre L2` se realiza a través del runtime/SDK Go, no por heurística local del nodo.
 
 ---
 
@@ -143,7 +143,7 @@ Nodos futuros con interacción directa (por ejemplo `WF.*`, `SY.policy`, capabil
 /var/lib/fluxbee/nodes/SY/SY.timer@<hive>/timers.db
 ```
 
-Junto con el resto del estado managed del nodo (`config.json`, `status_version`, etc.), siguiendo la convención de instancias managed del orchestrator.
+Junto con el resto del estado persistente del nodo (`config.json`, `status_version`, etc.), siguiendo la convención canónica de directorios por nodo del sistema.
 
 ### 5.2 Schema
 
@@ -162,14 +162,13 @@ CREATE TABLE timers (
                         CHECK(missed_policy IN ('fire','drop','fire_if_within')),
     missed_within_ms    INTEGER,           -- solo si missed_policy='fire_if_within'
 
-    payload             TEXT NOT NULL,     -- JSON blob, opaco para sy.timer
+    payload             TEXT NOT NULL,     -- JSON blob, opaco para SY.timer
     metadata            TEXT,              -- JSON blob libre, opaco
 
     status              TEXT NOT NULL DEFAULT 'pending'
                         CHECK(status IN ('pending','fired','canceled')),
 
-    created_at_utc      INTEGER NOT NULL,  -- unix ms, del reloj del SO
-    created_at_linux    INTEGER NOT NULL,  -- idem, preservado aún si se reschedulea
+    created_at_utc      INTEGER NOT NULL,  -- unix ms, del reloj del SO; preservado aun si se reschedulea
     last_fired_at_utc   INTEGER,           -- último disparo (recurrentes)
     fire_count          INTEGER NOT NULL DEFAULT 0
 );
@@ -180,8 +179,7 @@ CREATE INDEX idx_timers_status ON timers(status);
 ```
 
 **Notas:**
-- `created_at_linux` se preserva para siempre, incluso tras reschedules. Sirve para trazabilidad y para decisiones de `fire_if_within` basadas en antigüedad del timer original.
-- `created_at_utc` es redundante en v1 pero se deja explícito para permitir en el futuro separar reloj de sistema vs reloj lógico.
+- `created_at_utc` se preserva para siempre, incluso tras reschedules. Sirve para trazabilidad y para decisiones de `fire_if_within` basadas en antigüedad del timer original.
 - Los timers `fired` (one-shot completados) pueden ser purgados por un GC periódico tras N días (configurable, default 7 días) para evitar que la base crezca indefinidamente.
 
 ---
@@ -196,7 +194,7 @@ Todos los mensajes siguen el envelope estándar de Fluxbee:
 {
   "routing": {
     "src": "<uuid-del-nodo-cliente>",
-    "dst": "sy.timer@<hive>",
+    "dst": "SY.timer@<hive>",
     "ttl": 16,
     "trace_id": "<uuid>"
   },
@@ -208,7 +206,7 @@ Todos los mensajes siguen el envelope estándar de Fluxbee:
 }
 ```
 
-- Destino: siempre L2 unicast a `sy.timer@<hive-local>`. El SDK resuelve el nombre automáticamente.
+- Destino: siempre L2 unicast a `SY.timer@<hive-local>`. El SDK resuelve el nombre automáticamente.
 - `meta.msg_type`: siempre `"system"`.
 - `meta.msg`: uno de los verbos definidos en la sección 7.
 - Respuesta: siempre `meta.msg = "TIMER_RESPONSE"`, con el mismo `trace_id` del request.
@@ -245,7 +243,7 @@ Crea un timer one-shot.
 
 ```json
 {
-  "routing": { "dst": "sy.timer@motherbee", "ttl": 16, "trace_id": "..." },
+  "routing": { "dst": "SY.timer@motherbee", "ttl": 16, "trace_id": "..." },
   "meta": { "msg_type": "system", "msg": "TIMER_SCHEDULE" },
   "payload": {
     "fire_at_utc_ms": 1775577600000,
@@ -270,7 +268,7 @@ Crea un timer one-shot.
 |---|---|---|
 | `fire_at_utc_ms` | sí* | Instante absoluto UTC en ms. Alternativa a `fire_in_ms`. |
 | `fire_in_ms` | sí* | Duración relativa desde `now()`. Alternativa a `fire_at_utc_ms`. |
-| `target_l2_name` | no | Nombre L2 del nodo a notificar. Default: el propio requester (`routing.src`). |
+| `target_l2_name` | no | Nombre L2 del nodo a notificar. Default: el propio requester, resuelto server-side desde `routing.src` mediante el runtime/SDK. |
 | `client_ref` | no | Etiqueta amigable definida por el cliente. |
 | `payload` | no | JSON arbitrario que se incluirá en `TIMER_FIRED.payload.user_payload`. |
 | `missed_policy` | no | `"fire"` (default), `"drop"`, o `"fire_if_within"`. |
@@ -343,7 +341,7 @@ Crea un timer recurrente con sintaxis cron estándar.
 }
 ```
 
-Validación: el `owner_l2_name` del timer debe coincidir con el `routing.src` (mapeado a nombre L2). Si no: `TIMER_NOT_OWNER`.
+Validación: el `owner_l2_name` del timer debe coincidir con el nombre L2 resuelto desde `routing.src`. Si no: `TIMER_NOT_OWNER`.
 
 Si el timer ya fue disparado (`status = 'fired'`): `TIMER_ALREADY_FIRED`. Si no existe: `TIMER_NOT_FOUND`.
 
@@ -449,7 +447,7 @@ Lista los timers del requester. Sin parámetros = todos los propios.
 }
 ```
 
-El filtro por `owner_l2_name = routing.src` es implícito y no se puede desactivar desde un nodo normal.
+El filtro por `owner_l2_name = sender_l2_name(routing.src)` es implícito y no se puede desactivar desde un nodo normal.
 
 ### 7.7 `TIMER_PURGE_OWNER` (uso exclusivo de `SY.orchestrator`)
 
@@ -464,7 +462,7 @@ Borra **todos los timers** de un `owner_l2_name` dado.
 }
 ```
 
-**Autorización:** `SY.timer` valida que `routing.src` corresponda al nombre L2 `sy.orchestrator@<hive-local>`. Cualquier otro origen: error `TIMER_FORBIDDEN`.
+**Autorización:** `SY.timer` valida que `routing.src` corresponda al nombre L2 `SY.orchestrator@<hive-local>`. Cualquier otro origen: error `TIMER_FORBIDDEN`.
 
 **Semántica:**
 - Borrado idempotente: si no hay timers, responde `ok` con `deleted_count: 0`.
@@ -490,7 +488,7 @@ Emitido por `SY.timer` hacia el `target_l2_name` cuando un timer vence.
 ```json
 {
   "routing": {
-    "src": "sy.timer@motherbee",
+    "src": "SY.timer@motherbee",
     "dst": "WF.onboarding.step2@motherbee",
     "ttl": 16,
     "trace_id": "<nuevo-uuid>"
@@ -758,11 +756,11 @@ query: WHERE owner_l2_name = sender_l2_name(routing.src)
 
 Para `TIMER_PURGE_OWNER`:
 ```
-if sender_l2_name(routing.src) != "sy.orchestrator@<local-hive>":
+if sender_l2_name(routing.src) != "SY.orchestrator@<local-hive>":
     return error TIMER_FORBIDDEN
 ```
 
-La validación se hace por nombre L2 del sender, confiando en la capa L2 del router para la integridad del `routing.src`. Esto es consistente con el modelo de autorización del resto de nodos del sistema.
+La validación se hace por nombre L2 del sender, resolviendo `routing.src` (UUID L1) a través del runtime/SDK Go y confiando en la capa L2 del router para la integridad de esa identidad. Esto es consistente con el modelo de autorización del resto de nodos del sistema.
 
 ### 12.3 Flujo de borrado de nodo
 
@@ -877,7 +875,7 @@ func ScheduleIn(ctx context.Context, d time.Duration, opts ScheduleOptions) (Tim
     if d < MinDuration {
         return "", ErrBelowMinimum
     }
-    // ... resuelve nombre L2 de sy.timer en hive local
+    // ... resuelve nombre L2 de SY.timer en hive local
     // ... arma TIMER_SCHEDULE
     // ... envía y parsea response
 }
@@ -970,10 +968,11 @@ Formato de response de error:
 
 ### 16.1 Systemd
 
-`SY.timer` es lanzado y mantenido por `SY.orchestrator`, igual que el resto de los nodos del sistema. No tiene unit file propio; el orchestrator lo registra como un nodo managed.
+`SY.timer` es un singleton core por hive, lanzado y mantenido por `SY.orchestrator` a través del mismo modelo operativo que el resto de los nodos `SY.*` del sistema. Tiene binario core instalado, copia en `dist/core/bin`, unit file de systemd y supervisión/restart por orchestrator.
 
 Binario: `/usr/bin/sy-timer` (instalado por `install.sh`).
 Copia de distribución: `/var/lib/fluxbee/dist/core/bin/sy-timer`.
+Unit: `/etc/systemd/system/sy-timer.service`.
 
 ### 16.2 Paths de runtime
 
