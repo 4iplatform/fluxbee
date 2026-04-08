@@ -5611,6 +5611,141 @@ mod tests {
         }
     }
 
+    fn decode_tool_artifact(output: Value) -> (Option<String>, Vec<ToolFinalArtifactItem>) {
+        let final_output = output
+            .get("final_output")
+            .cloned()
+            .expect("tool should return final_output");
+        let envelope: ToolFinalArtifactEnvelope =
+            serde_json::from_value(final_output).expect("tool final_output should deserialize");
+        (envelope.text, envelope.artifacts)
+    }
+
+    #[tokio::test]
+    async fn generate_pdf_artifact_tool_returns_pdf_bytes() {
+        let tool = GeneratePdfArtifactTool;
+        let output = tool
+            .call(json!({
+                "filename": "reporte.pdf",
+                "title": "Reporte",
+                "lines": ["Linea 1", "Linea 2"]
+            }))
+            .await
+            .expect("pdf tool should succeed");
+        let (_text, artifacts) = decode_tool_artifact(output);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].filename, "reporte.pdf");
+        assert_eq!(artifacts[0].mime, "application/pdf");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&artifacts[0].bytes_base64)
+            .expect("valid base64");
+        assert!(bytes.starts_with(b"%PDF-1.4"));
+    }
+
+    #[tokio::test]
+    async fn generate_xlsx_artifact_tool_returns_zip_with_workbook_parts() {
+        let tool = GenerateXlsxArtifactTool;
+        let output = tool
+            .call(json!({
+                "filename": "tabla.xlsx",
+                "headers": ["nombre", "edad"],
+                "rows": [["Ana", "30"], ["Luis", "41"]]
+            }))
+            .await
+            .expect("xlsx tool should succeed");
+        let (_text, artifacts) = decode_tool_artifact(output);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].filename, "tabla.xlsx");
+        assert_eq!(
+            artifacts[0].mime,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&artifacts[0].bytes_base64)
+            .expect("valid base64");
+        let cursor = Cursor::new(bytes);
+        let mut zip = zip::ZipArchive::new(cursor).expect("xlsx should be a zip archive");
+        zip.by_name("[Content_Types].xml")
+            .expect("xlsx content types");
+        zip.by_name("xl/workbook.xml").expect("xlsx workbook");
+        zip.by_name("xl/worksheets/sheet1.xml").expect("xlsx sheet");
+    }
+
+    #[tokio::test]
+    async fn generate_docx_artifact_tool_returns_zip_with_document_parts() {
+        let tool = GenerateDocxArtifactTool;
+        let output = tool
+            .call(json!({
+                "filename": "nota.docx",
+                "title": "Nota",
+                "paragraphs": ["Parrafo 1", "Parrafo 2"],
+                "bullets": ["Uno", "Dos"]
+            }))
+            .await
+            .expect("docx tool should succeed");
+        let (_text, artifacts) = decode_tool_artifact(output);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].filename, "nota.docx");
+        assert_eq!(
+            artifacts[0].mime,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&artifacts[0].bytes_base64)
+            .expect("valid base64");
+        let cursor = Cursor::new(bytes);
+        let mut zip = zip::ZipArchive::new(cursor).expect("docx should be a zip archive");
+        zip.by_name("[Content_Types].xml")
+            .expect("docx content types");
+        zip.by_name("word/document.xml").expect("docx document");
+        zip.by_name("word/styles.xml").expect("docx styles");
+    }
+
+    #[tokio::test]
+    async fn generate_png_and_jpeg_artifact_tools_return_decodable_images() {
+        let png_tool = GeneratePngArtifactTool;
+        let jpeg_tool = GenerateJpegArtifactTool;
+
+        let png_output = png_tool
+            .call(json!({
+                "filename": "grafico.png",
+                "bands": ["rojo", "verde", "azul"],
+                "width": 320,
+                "height": 180
+            }))
+            .await
+            .expect("png tool should succeed");
+        let jpeg_output = jpeg_tool
+            .call(json!({
+                "filename": "grafico.jpg",
+                "bands": ["uno", "dos"],
+                "width": 320,
+                "height": 180
+            }))
+            .await
+            .expect("jpeg tool should succeed");
+
+        let (_, png_artifacts) = decode_tool_artifact(png_output);
+        let (_, jpeg_artifacts) = decode_tool_artifact(jpeg_output);
+
+        let png_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&png_artifacts[0].bytes_base64)
+            .expect("valid png base64");
+        let jpeg_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&jpeg_artifacts[0].bytes_base64)
+            .expect("valid jpeg base64");
+
+        let png = image::load_from_memory_with_format(&png_bytes, image::ImageFormat::Png)
+            .expect("png should decode");
+        let jpeg = image::load_from_memory_with_format(&jpeg_bytes, image::ImageFormat::Jpeg)
+            .expect("jpeg should decode");
+
+        assert_eq!(png.width(), 320);
+        assert_eq!(png.height(), 180);
+        assert_eq!(jpeg.width(), 320);
+        assert_eq!(jpeg.height(), 180);
+    }
+
     #[test]
     fn strip_openai_secret_removes_inline_secret_fields() {
         let mut config = EffectiveConfigDocument {
