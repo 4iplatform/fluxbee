@@ -409,6 +409,8 @@ where
         session.fragment_count = session.fragment_count.saturating_add(1);
         session.byte_count = next_bytes;
 
+        let has_new_attachments = !fragment.attachments.is_empty();
+
         if let Some(content) = fragment.content_text {
             session.contents.push(content);
         }
@@ -426,7 +428,6 @@ where
             "relay fragment buffered"
         );
 
-        let has_new_attachments = !fragment.attachments.is_empty();
         let flush_reason =
             if self.policy.flush_on_explicit_final && fragment.flush_hints.final_fragment {
                 Some(FlushReason::ExplicitFinal)
