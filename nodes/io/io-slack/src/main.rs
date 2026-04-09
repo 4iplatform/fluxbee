@@ -30,6 +30,10 @@ use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::{default_state_dir, persist_io_control_plane_state};
 use io_common::io_slack_adapter_config::IoSlackAdapterConfigContract;
 use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox};
+use io_common::relay::{
+    AssembledTurn, InMemoryRelayStore, RelayBuffer, RelayDecision, RelayFlushHints, RelayFragment,
+    RelayPolicy,
+};
 use io_common::text_v1_blob::{
     resolve_text_v1_for_outbound, InboundAttachmentInput, IoBlobContractError, IoBlobRuntimeConfig,
     IoTextBlobConfig,
@@ -37,7 +41,7 @@ use io_common::text_v1_blob::{
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -114,15 +118,20 @@ async fn main() -> Result<()> {
             .map_err(|err| anyhow::anyhow!("invalid blob runtime config: {err}"))?,
     );
     let blob_payload_cfg = config.blob_runtime.text_v1.clone();
-    let sessionizer = if config.slack_session_window_ms > 0 {
-        Some(Arc::new(SlackSessionizer::new(
-            Duration::from_millis(config.slack_session_window_ms),
-            config.slack_session_max_sessions,
-            config.slack_session_max_fragments,
-        )))
-    } else {
-        None
-    };
+    let relay_policy = slack_relay_policy(&config)
+        .map_err(|err| anyhow::anyhow!("invalid relay policy from slack config: {err}"))?;
+    tracing::info!(
+        relay_enabled = relay_policy.enabled,
+        relay_window_ms = relay_policy.relay_window_ms,
+        relay_max_open_sessions = relay_policy.max_open_sessions,
+        relay_max_fragments = relay_policy.max_fragments_per_session,
+        relay_max_bytes = relay_policy.max_bytes_per_session,
+        "io-slack relay policy initialized"
+    );
+    let relay = Arc::new(Mutex::new(
+        RelayBuffer::new(relay_policy.clone(), InMemoryRelayStore::new())
+            .map_err(|err| anyhow::anyhow!("invalid relay policy: {err}"))?,
+    ));
     let mut boot_state = bootstrap_io_control_plane_state(&config.state_dir, &config.node_name)
         .unwrap_or_else(|err| {
             tracing::warn!(
@@ -175,17 +184,37 @@ async fn main() -> Result<()> {
 
     let inbound_task = tokio::spawn(run_inbound_socket_mode(
         config.clone(),
-        sender,
-        slack,
-        identity,
-        provisioner,
-        inbound,
-        sessionizer,
-        blob_toolkit,
-        blob_payload_cfg,
+        sender.clone(),
+        slack.clone(),
+        identity.clone(),
+        provisioner.clone(),
+        inbound.clone(),
+        relay.clone(),
+        blob_toolkit.clone(),
+        blob_payload_cfg.clone(),
     ));
 
-    let _ = tokio::join!(inbound_task, outbound_task);
+    let relay_flush_task = if relay_policy.enabled && relay_policy.relay_window_ms > 0 {
+        Some(tokio::spawn(run_relay_flush_loop(
+            relay,
+            sender,
+            identity,
+            provisioner,
+            inbound,
+            relay_policy.relay_window_ms,
+        )))
+    } else {
+        None
+    };
+
+    match relay_flush_task {
+        Some(relay_flush_task) => {
+            let _ = tokio::join!(inbound_task, outbound_task, relay_flush_task);
+        }
+        None => {
+            let _ = tokio::join!(inbound_task, outbound_task);
+        }
+    }
     Ok(())
 }
 
@@ -784,7 +813,7 @@ async fn run_inbound_socket_mode(
     identity: Arc<dyn IdentityResolver>,
     provisioner: Arc<dyn IdentityProvisioner>,
     inbound: Arc<Mutex<InboundProcessor>>,
-    sessionizer: Option<Arc<SlackSessionizer>>,
+    relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
     blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
     blob_payload_cfg: IoTextBlobConfig,
 ) -> Result<()> {
@@ -927,28 +956,6 @@ async fn run_inbound_socket_mode(
                 "inbound app_mention"
             );
 
-            if let Some(sessionizer) = &sessionizer {
-                if !event_has_files(&event) {
-                    sessionizer
-                        .handle_event(
-                            &config.node_name,
-                            sender.clone(),
-                            identity.clone(),
-                            provisioner.clone(),
-                            inbound.clone(),
-                            &team_id,
-                            &user,
-                            &channel,
-                            thread_ts.as_deref(),
-                            &message_id,
-                            content,
-                            payload,
-                        )
-                        .await;
-                    continue;
-                }
-            }
-
             let io_ctx = slack_inbound_io_context(
                 &team_id,
                 &user,
@@ -956,20 +963,22 @@ async fn run_inbound_socket_mode(
                 thread_ts.as_deref(),
                 &message_id,
             );
-            let payload = match build_slack_inbound_payload(
+            let attachments = collect_slack_blob_attachments(
                 slack.as_ref(),
                 blob_toolkit.as_ref(),
                 &blob_payload_cfg,
+                &event,
+            )
+            .await;
+            let payload = match build_slack_inbound_payload_from_parts(
                 &team_id,
                 &user,
                 &channel,
                 thread_ts.as_deref(),
                 &message_id,
                 &content,
-                &event,
-            )
-            .await
-            {
+                &attachments,
+            ) {
                 Some(payload) => payload,
                 None => {
                     tracing::warn!(
@@ -982,6 +991,58 @@ async fn run_inbound_socket_mode(
                     continue;
                 }
             };
+
+            let relay_fragment = build_slack_relay_fragment(
+                &config.node_name,
+                &team_id,
+                &user,
+                &channel,
+                thread_ts.as_deref(),
+                &message_id,
+                &content,
+                attachments,
+                payload.clone(),
+            );
+
+            let relay_decision = relay.lock().await.handle_fragment(relay_fragment);
+            match relay_decision {
+                RelayDecision::Hold => continue,
+                RelayDecision::FlushNow(turn) => {
+                    dispatch_assembled_turn(
+                        sender.clone(),
+                        identity.as_ref(),
+                        provisioner.as_ref(),
+                        inbound.clone(),
+                        turn,
+                        "relay immediate flush",
+                    )
+                    .await;
+                    continue;
+                }
+                RelayDecision::DropDuplicate => {
+                    tracing::debug!(message_id = %message_id, "relay dedup hit; dropping inbound fragment");
+                    continue;
+                }
+                RelayDecision::RejectCapacity => {
+                    tracing::warn!(
+                        team_id = %team_id,
+                        user = %user,
+                        channel = %channel,
+                        message_id = %message_id,
+                        "relay capacity reached; using fail-open direct inbound path"
+                    );
+                }
+                RelayDecision::DropExpired => {
+                    tracing::warn!(
+                        team_id = %team_id,
+                        user = %user,
+                        channel = %channel,
+                        message_id = %message_id,
+                        "relay dropped fragment due to expired/invalid session state"
+                    );
+                    continue;
+                }
+            }
 
             let outcome = inbound
                 .lock()
@@ -1000,51 +1061,26 @@ async fn run_inbound_socket_mode(
                 )
                 .await;
 
-            match outcome {
-                InboundOutcome::SendNow(msg) => {
-                    let trace_id = msg.routing.trace_id.clone();
-                    let has_src_ilk = msg.meta.src_ilk.as_deref().is_some_and(|v| !v.is_empty());
-                    if let Err(e) = sender.send(msg).await {
-                        tracing::warn!(error=?e, %trace_id, "failed to send to router");
-                    } else {
-                        tracing::debug!(%trace_id, has_src_ilk, "sent to router");
-                    }
-                }
-                InboundOutcome::DroppedDuplicate => {
-                    tracing::debug!("dedup hit; dropping inbound");
-                }
-            }
+            dispatch_inbound_outcome(sender.clone(), outcome, "direct inbound").await;
         }
     }
 }
 
-fn event_has_files(event: &Value) -> bool {
-    event
-        .get("files")
-        .and_then(|v| v.as_array())
-        .is_some_and(|files| !files.is_empty())
-}
-
-async fn build_slack_inbound_payload(
-    slack: &SlackClients,
-    blob_toolkit: &fluxbee_sdk::blob::BlobToolkit,
-    blob_payload_cfg: &IoTextBlobConfig,
+fn build_slack_inbound_payload_from_parts(
     team_id: &str,
     user: &str,
     channel: &str,
     thread_ts: Option<&str>,
     message_id: &str,
     content: &str,
-    event: &Value,
+    attachments: &[InboundAttachmentInput],
 ) -> Option<Value> {
-    let attachments =
-        collect_slack_blob_attachments(slack, blob_toolkit, blob_payload_cfg, event).await;
     if content.trim().is_empty() && attachments.is_empty() {
         return None;
     }
     let payload = fluxbee_sdk::payload::TextV1Payload::new(
         content,
-        attachments.into_iter().map(|a| a.blob_ref).collect(),
+        attachments.iter().map(|a| a.blob_ref.clone()).collect(),
     );
     match payload.to_value() {
         Ok(mut payload) => {
@@ -1059,6 +1095,136 @@ async fn build_slack_inbound_payload(
             None
         }
     }
+}
+
+fn build_slack_relay_fragment(
+    node_name: &str,
+    team_id: &str,
+    user: &str,
+    channel: &str,
+    thread_ts: Option<&str>,
+    message_id: &str,
+    content: &str,
+    attachments: Vec<InboundAttachmentInput>,
+    raw_payload: Value,
+) -> RelayFragment {
+    RelayFragment {
+        relay_key: slack_relay_key(team_id, user, channel, thread_ts),
+        fragment_id: message_id.to_string(),
+        received_at_ms: now_epoch_ms(),
+        content_text: Some(content.to_string()),
+        attachments: attachments
+            .into_iter()
+            .filter_map(|attachment| serde_json::to_value(attachment.blob_ref).ok())
+            .collect(),
+        raw_payload: Some(raw_payload),
+        io_context: slack_inbound_io_context(team_id, user, channel, thread_ts, message_id),
+        identity_input: ResolveOrCreateInput {
+            channel: "slack".to_string(),
+            external_id: slack_external_id(node_name, user),
+            tenant_hint: Some(team_id.to_string()),
+            attributes: serde_json::json!({ "team_id": team_id }),
+        },
+        flush_hints: RelayFlushHints::default(),
+    }
+}
+
+async fn dispatch_assembled_turn(
+    sender: NodeSender,
+    identity: &dyn IdentityResolver,
+    provisioner: &dyn IdentityProvisioner,
+    inbound: Arc<Mutex<InboundProcessor>>,
+    turn: AssembledTurn,
+    send_context: &str,
+) {
+    let outcome = inbound
+        .lock()
+        .await
+        .process_assembled_turn(identity, Some(provisioner), turn)
+        .await;
+
+    dispatch_inbound_outcome(sender, outcome, send_context).await;
+}
+
+async fn dispatch_inbound_outcome(sender: NodeSender, outcome: InboundOutcome, send_context: &str) {
+    match outcome {
+        InboundOutcome::SendNow(msg) => {
+            let trace_id = msg.routing.trace_id.clone();
+            let has_src_ilk = msg.meta.src_ilk.as_deref().is_some_and(|v| !v.is_empty());
+            if let Err(e) = sender.send(msg).await {
+                tracing::warn!(error=?e, %trace_id, context = send_context, "failed to send to router");
+            } else {
+                tracing::debug!(%trace_id, has_src_ilk, context = send_context, "sent to router");
+            }
+        }
+        InboundOutcome::DroppedDuplicate => {
+            tracing::debug!(context = send_context, "dedup hit; dropping inbound");
+        }
+    }
+}
+
+async fn run_relay_flush_loop(
+    relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
+    sender: NodeSender,
+    identity: Arc<dyn IdentityResolver>,
+    provisioner: Arc<dyn IdentityProvisioner>,
+    inbound: Arc<Mutex<InboundProcessor>>,
+    relay_window_ms: u64,
+) -> Result<()> {
+    let tick_ms = relay_window_ms.clamp(25, 250);
+    let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
+    loop {
+        interval.tick().await;
+        let turns = relay.lock().await.flush_expired(now_epoch_ms());
+        for turn in turns {
+            dispatch_assembled_turn(
+                sender.clone(),
+                identity.as_ref(),
+                provisioner.as_ref(),
+                inbound.clone(),
+                turn,
+                "relay scheduled flush",
+            )
+            .await;
+        }
+    }
+}
+
+fn slack_relay_key(team_id: &str, user: &str, channel: &str, thread_ts: Option<&str>) -> String {
+    let thread_or_channel = thread_ts.unwrap_or(channel);
+    format!("slack:{team_id}:{channel}:{thread_or_channel}:{user}")
+}
+
+fn slack_relay_policy(config: &Config) -> Result<RelayPolicy> {
+    let mut policy = RelayPolicy {
+        enabled: config.slack_session_window_ms > 0,
+        relay_window_ms: config.slack_session_window_ms,
+        max_open_sessions: config.slack_session_max_sessions,
+        max_fragments_per_session: config.slack_session_max_fragments,
+        ..RelayPolicy::default()
+    };
+    if policy.relay_window_ms == 0 {
+        policy.enabled = false;
+        policy.stale_session_ttl_ms = 0;
+    } else {
+        policy.stale_session_ttl_ms = policy
+            .relay_window_ms
+            .saturating_mul(4)
+            .max(policy.relay_window_ms);
+    }
+    policy.validate().map_err(|err| anyhow::anyhow!(err))?;
+    Ok(policy)
+}
+
+fn now_epoch_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 async fn collect_slack_blob_attachments(
@@ -1308,259 +1474,6 @@ fn normalize_mime(value: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase()
-}
-
-#[derive(Debug)]
-struct SlackSessionizer {
-    window: Duration,
-    max_sessions: usize,
-    max_fragments: usize,
-    sessions: Mutex<HashMap<String, SlackSessionState>>,
-}
-
-#[derive(Debug)]
-struct SlackSessionState {
-    deadline: tokio::time::Instant,
-    version: u64,
-    seen_message_ids: HashSet<String>,
-    io_ctx: io_common::io_context::IoContext,
-    identity_input: ResolveOrCreateInput,
-    contents: Vec<String>,
-    raws: Vec<serde_json::Value>,
-}
-
-impl SlackSessionizer {
-    fn new(window: Duration, max_sessions: usize, max_fragments: usize) -> Self {
-        Self {
-            window,
-            max_sessions: max_sessions.max(1),
-            max_fragments: max_fragments.max(1),
-            sessions: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn key(team_id: &str, user: &str, channel: &str, thread_ts: Option<&str>) -> String {
-        // Suggested spec key: (channel, user, thread_ts || channel)
-        let thread_or_channel = thread_ts.unwrap_or(channel);
-        format!("slack:{team_id}:{channel}:{thread_or_channel}:{user}")
-    }
-
-    async fn handle_event(
-        self: &Arc<Self>,
-        node_name: &str,
-        sender: NodeSender,
-        identity: Arc<dyn IdentityResolver>,
-        provisioner: Arc<dyn IdentityProvisioner>,
-        inbound: Arc<Mutex<InboundProcessor>>,
-        team_id: &str,
-        user: &str,
-        channel: &str,
-        thread_ts: Option<&str>,
-        message_id: &str,
-        content: String,
-        raw_envelope_payload: serde_json::Value,
-    ) {
-        let key = Self::key(team_id, user, channel, thread_ts);
-        let now = tokio::time::Instant::now();
-        let mut maybe_spawn = None;
-
-        {
-            let mut sessions = self.sessions.lock().await;
-            if !sessions.contains_key(&key) && sessions.len() >= self.max_sessions {
-                drop(sessions);
-                tracing::warn!(%key, "session buffer full; sending message immediately");
-                self.send_one(
-                    node_name,
-                    sender,
-                    identity,
-                    provisioner,
-                    inbound,
-                    team_id,
-                    user,
-                    channel,
-                    thread_ts,
-                    message_id,
-                    content,
-                    raw_envelope_payload,
-                )
-                .await;
-                return;
-            }
-
-            let entry = sessions
-                .entry(key.clone())
-                .or_insert_with(|| SlackSessionState {
-                    deadline: now + self.window,
-                    version: 0,
-                    seen_message_ids: HashSet::new(),
-                    io_ctx: slack_inbound_io_context(team_id, user, channel, thread_ts, message_id),
-                    identity_input: ResolveOrCreateInput {
-                        channel: "slack".to_string(),
-                        external_id: slack_external_id(node_name, user),
-                        tenant_hint: Some(team_id.to_string()),
-                        attributes: serde_json::json!({ "team_id": team_id }),
-                    },
-                    contents: Vec::new(),
-                    raws: Vec::new(),
-                });
-
-            if !entry.seen_message_ids.insert(message_id.to_string()) {
-                tracing::debug!(%key, %message_id, "session dedup hit; ignoring duplicate event");
-                return;
-            }
-
-            if entry.contents.len() < self.max_fragments {
-                entry.contents.push(content);
-                entry.raws.push(raw_envelope_payload);
-            } else {
-                tracing::warn!(%key, max_fragments=self.max_fragments, "session max_fragments reached; dropping fragment");
-            }
-
-            entry.deadline = now + self.window;
-            entry.version = entry.version.wrapping_add(1);
-
-            // Spawn flusher only for new sessions.
-            if entry.version == 1 {
-                maybe_spawn = Some((key.clone(), entry.version));
-            }
-        }
-
-        if let Some((key, version)) = maybe_spawn {
-            tokio::spawn(self.clone().flush_task(
-                key,
-                version,
-                sender,
-                identity,
-                provisioner,
-                inbound,
-            ));
-        }
-    }
-
-    async fn flush_task(
-        self: Arc<Self>,
-        key: String,
-        mut version: u64,
-        sender: NodeSender,
-        identity: Arc<dyn IdentityResolver>,
-        provisioner: Arc<dyn IdentityProvisioner>,
-        inbound: Arc<Mutex<InboundProcessor>>,
-    ) {
-        loop {
-            let deadline = {
-                let sessions = self.sessions.lock().await;
-                let Some(state) = sessions.get(&key) else {
-                    return;
-                };
-                if state.version != version {
-                    version = state.version;
-                }
-                state.deadline
-            };
-
-            tokio::time::sleep_until(deadline).await;
-
-            let state = {
-                let mut sessions = self.sessions.lock().await;
-                let Some(state) = sessions.get(&key) else {
-                    return;
-                };
-                if tokio::time::Instant::now() < state.deadline || state.version != version {
-                    continue;
-                }
-                sessions.remove(&key)
-            };
-
-            let Some(state) = state else {
-                return;
-            };
-
-            let content = state.contents.join("\n");
-            let payload = serde_json::json!({
-              "type": "text",
-              "content": content,
-              "raw": { "slack_batch": state.raws },
-            });
-
-            let outcome = inbound
-                .lock()
-                .await
-                .process_inbound(
-                    identity.as_ref(),
-                    Some(provisioner.as_ref()),
-                    state.identity_input,
-                    state.io_ctx,
-                    payload,
-                )
-                .await;
-
-            match outcome {
-                InboundOutcome::SendNow(msg) => {
-                    let trace_id = msg.routing.trace_id.clone();
-                    let has_src_ilk = msg.meta.src_ilk.as_deref().is_some_and(|v| !v.is_empty());
-                    if let Err(e) = sender.send(msg).await {
-                        tracing::warn!(error=?e, %trace_id, "failed to send to router (session flush)");
-                    } else {
-                        tracing::debug!(%trace_id, has_src_ilk, "sent to router (session flush)");
-                    }
-                }
-                InboundOutcome::DroppedDuplicate => {
-                    tracing::debug!("dedup hit; dropping inbound (session flush)");
-                }
-            }
-            return;
-        }
-    }
-
-    async fn send_one(
-        &self,
-        node_name: &str,
-        sender: NodeSender,
-        identity: Arc<dyn IdentityResolver>,
-        provisioner: Arc<dyn IdentityProvisioner>,
-        inbound: Arc<Mutex<InboundProcessor>>,
-        team_id: &str,
-        user: &str,
-        channel: &str,
-        thread_ts: Option<&str>,
-        message_id: &str,
-        content: String,
-        raw_envelope_payload: serde_json::Value,
-    ) {
-        let io_ctx = slack_inbound_io_context(team_id, user, channel, thread_ts, message_id);
-        let payload = serde_json::json!({
-          "type": "text",
-          "content": content,
-          "raw": { "slack": raw_envelope_payload },
-        });
-
-        let outcome = inbound
-            .lock()
-            .await
-            .process_inbound(
-                identity.as_ref(),
-                Some(provisioner.as_ref()),
-                ResolveOrCreateInput {
-                    channel: "slack".to_string(),
-                    external_id: slack_external_id(node_name, user),
-                    tenant_hint: Some(team_id.to_string()),
-                    attributes: serde_json::json!({ "team_id": team_id }),
-                },
-                io_ctx,
-                payload,
-            )
-            .await;
-
-        if let InboundOutcome::SendNow(msg) = outcome {
-            let trace_id = msg.routing.trace_id.clone();
-            let has_src_ilk = msg.meta.src_ilk.as_deref().is_some_and(|v| !v.is_empty());
-            if let Err(e) = sender.send(msg).await {
-                tracing::warn!(error=?e, %trace_id, "failed to send to router");
-            } else {
-                tracing::debug!(%trace_id, has_src_ilk, "sent to router");
-            }
-        }
-    }
 }
 
 fn slack_external_id(node_name: &str, user_id: &str) -> String {

@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::identity::{IdentityProvisioner, IdentityResolver, ResolveOrCreateInput};
 use crate::io_context::{wrap_in_meta_context, IoContext};
+use crate::relay::AssembledTurn;
 use crate::reliability::{dedup_key_from_io_context, DedupCache};
 use crate::router_message::{build_user_message, new_trace_id};
 use crate::text_v1_blob::IoBlobRuntimeConfig;
@@ -102,6 +103,47 @@ impl InboundProcessor {
         }
         self.stats.dedup_misses += 1;
 
+        self.process_message_parts(
+            identity,
+            provisioner,
+            identity_input,
+            wrap_in_meta_context(&io_context),
+            payload,
+        )
+        .await
+    }
+
+    pub async fn process_assembled_turn(
+        &mut self,
+        identity: &dyn IdentityResolver,
+        provisioner: Option<&dyn IdentityProvisioner>,
+        turn: AssembledTurn,
+    ) -> InboundOutcome {
+        let dedup_key = dedup_key_from_io_context(&turn.io_context);
+        if self.dedup.is_duplicate_and_mark(&dedup_key) {
+            self.stats.dedup_hits += 1;
+            return InboundOutcome::DroppedDuplicate;
+        }
+        self.stats.dedup_misses += 1;
+
+        self.process_message_parts(
+            identity,
+            provisioner,
+            turn.identity_input,
+            turn.meta_context,
+            turn.payload,
+        )
+        .await
+    }
+
+    async fn process_message_parts(
+        &mut self,
+        identity: &dyn IdentityResolver,
+        provisioner: Option<&dyn IdentityProvisioner>,
+        identity_input: ResolveOrCreateInput,
+        meta_context: Value,
+        payload: Value,
+    ) -> InboundOutcome {
         let trace_id = new_trace_id();
         let mut src_ilk =
             match identity.lookup(&identity_input.channel, &identity_input.external_id) {
@@ -190,7 +232,7 @@ impl InboundProcessor {
             trace_id,
             src_ilk,
             None,
-            wrap_in_meta_context(&io_context),
+            meta_context,
             payload,
         ))
     }
@@ -348,12 +390,11 @@ mod tests {
             panic!("unexpected outcome: {o:?}");
         };
 
-        assert!(
-            msg.meta
-                .src_ilk
-                .as_deref()
-                .is_some_and(|value| value.starts_with("ilk:mock:"))
-        );
+        assert!(msg
+            .meta
+            .src_ilk
+            .as_deref()
+            .is_some_and(|value| value.starts_with("ilk:mock:")));
         assert_no_legacy_context_src_ilk(&msg);
 
         let rt = msg
