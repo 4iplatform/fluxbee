@@ -2149,6 +2149,7 @@ fn build_system_reply(
             action: Some(response_msg.to_string()),
             priority: incoming.meta.priority.clone(),
             context: incoming.meta.context.clone(),
+            ..Meta::default()
         },
         payload,
     }
