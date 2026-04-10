@@ -1,6 +1,16 @@
 const http = require('http');
 const https = require('https');
-require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
+
+// Load .env manually — zero external dependencies
+const envPath = path.join(__dirname, '.env');
+if (fs.existsSync(envPath)) {
+  fs.readFileSync(envPath, 'utf8').split('\n').forEach(line => {
+    const [k, ...v] = line.trim().split('=');
+    if (k && !k.startsWith('#')) process.env[k] = v.join('=');
+  });
+}
 
 const PORT = process.env.PORT || 3001;
 const SLACK_TOKEN = process.env.SLACK_TOKEN;
