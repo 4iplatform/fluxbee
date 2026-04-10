@@ -150,6 +150,7 @@ Recommended order:
 - [ ] SYT-S1-T10. Define versioning/compatibility policy for the Go SDK.
 - [ ] SYT-S1-T11. Add wire-compatibility tests against the Rust SDK contract.
 - [x] SYT-S1-T12. Leave a compatibility migration path for `SY.opa.rules` while imports move to the formal SDK.
+- [ ] SYT-S1-T13. Replace the temporary local `uuid_persistence_dir`-based UUID->L2 resolver with the canonical runtime identity resolution path shared with the rest of the platform.
 
 Current status after extraction:
 
@@ -159,6 +160,7 @@ Current status after extraction:
 - the old `sy-opa-rules/sdk` implementation has been removed to avoid dual sources of truth
 - v1 peer identity resolution is now explicit in the SDK via local `uuid_persistence_dir` lookup mapped to canonical L2 names for the local hive
 - direct `system` RPC helpers and `TIMER_RESPONSE` / `HELP` base types are now available for `SY.timer`
+- the current UUID->L2 resolver is intentionally tracked as transitional, not final platform architecture
 
 ### SYT-S2 — Add `timer` client module to the Go SDK
 
@@ -193,10 +195,10 @@ Current status after extraction:
 
 Current status:
 
-- implemented client calls so far: `Now`, `NowIn`, `Help`
+- implemented client calls so far: `Now`, `NowIn`, `Convert`, `Parse`, `Format`, `Help`
 - implemented time-operation retry budget for the currently supported direct time calls
 - implemented `ParseFiredEvent(msg)`
-- remaining client calls still to add: `Convert`, `Parse`, `Format`, `Schedule`, `ScheduleIn`, `ScheduleRecurring`, `Cancel`, `Reschedule`, `Get`, `ListMine`
+- remaining client calls still to add: `Schedule`, `ScheduleIn`, `ScheduleRecurring`, `Cancel`, `Reschedule`, `Get`, `ListMine`
 
 ---
 
