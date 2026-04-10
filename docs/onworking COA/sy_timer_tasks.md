@@ -344,11 +344,29 @@ Current status:
 
 ### SYT-S9 — Admin and operator visibility
 
-- [ ] SYT-S9-T1. Decide whether `SY.admin` needs explicit operator endpoints for `SY.timer` in v1.
-- [ ] SYT-S9-T2. If yes, define a narrow operator surface:
+- [x] SYT-S9-T1. Decide whether `SY.admin` needs explicit operator endpoints for `SY.timer` in v1.
+- [x] SYT-S9-T2. If yes, define a narrow operator surface:
   - read/help only
-  - or full timer operations
-- [ ] SYT-S9-T3. Document that direct node SDK usage remains the primary interaction model even if admin visibility exists.
+  - no owner-bound timer CRUD/scheduling through admin in v1
+- [x] SYT-S9-T3. Document that direct node SDK usage remains the primary interaction model even if admin visibility exists.
+
+Current status:
+
+- `SY.admin` now exposes a narrow read-only surface for `SY.timer`:
+  - `timer_help`
+  - `timer_now`
+  - `timer_now_in`
+  - `timer_convert`
+  - `timer_parse`
+  - `timer_format`
+- owner-bound timer verbs remain SDK-only in v1:
+  - `TIMER_SCHEDULE`
+  - `TIMER_SCHEDULE_RECURRING`
+  - `TIMER_GET`
+  - `TIMER_LIST`
+  - `TIMER_CANCEL`
+  - `TIMER_RESCHEDULE`
+- this is intentional because `SY.timer` ownership is enforced against the request source node identity (`routing.src` -> L2), so `SY.admin` is not a transparent proxy for per-node timer ownership semantics
 
 ---
 

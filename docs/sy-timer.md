@@ -47,6 +47,28 @@ El propósito es doble:
 
 `SY.timer` es el **primer nodo en implementar este principio** de forma puntual, dado que es el primer nodo del sistema con interacción directa desde otros nodos sin pasar por `SY.admin`. La operación se llama `TIMER_HELP` por consistencia con el resto de su familia de verbos, pero cumple el contrato general de `HELP`.
 
+### 1.1 Visibilidad mínima vía `SY.admin` en v1
+
+En v1, `SY.admin` expone solo una superficie **read-only** y de introspección para `SY.timer`:
+
+- `timer_help`
+- `timer_now`
+- `timer_now_in`
+- `timer_convert`
+- `timer_parse`
+- `timer_format`
+
+Las operaciones owner-bound siguen fuera de `SY.admin` y se mantienen como uso directo vía SDK:
+
+- `TIMER_SCHEDULE`
+- `TIMER_SCHEDULE_RECURRING`
+- `TIMER_GET`
+- `TIMER_LIST`
+- `TIMER_CANCEL`
+- `TIMER_RESCHEDULE`
+
+La razón es arquitectónica: `SY.timer` autoriza por identidad efectiva del requester (`routing.src` resuelto a L2). `SY.admin` no actúa como proxy transparente de ownership para timers en v1.
+
 Nodos futuros con interacción directa (por ejemplo `WF.*`, `SY.policy`, capabilities invocables) deben implementar su propia operación `HELP` equivalente. La generalización del protocolo, los campos comunes y el naming se formalizarán en un documento aparte cuando aparezca el segundo o tercer caso.
 
 ---

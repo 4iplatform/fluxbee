@@ -804,6 +804,7 @@ enum InternalActionRoute {
     Inventory,
     OpaHttp(OpaAction),
     OpaQuery(&'static str),
+    TimerRpc(&'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -814,7 +815,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "3";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "4";
 
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
@@ -1099,6 +1100,42 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         requires_target: false,
         allow_legacy_hive_id: false,
     },
+    InternalActionSpec {
+        action: "timer_help",
+        route: InternalActionRoute::TimerRpc("TIMER_HELP"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "timer_now",
+        route: InternalActionRoute::TimerRpc("TIMER_NOW"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "timer_now_in",
+        route: InternalActionRoute::TimerRpc("TIMER_NOW_IN"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "timer_convert",
+        route: InternalActionRoute::TimerRpc("TIMER_CONVERT"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "timer_parse",
+        route: InternalActionRoute::TimerRpc("TIMER_PARSE"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "timer_format",
+        route: InternalActionRoute::TimerRpc("TIMER_FORMAT"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
 ];
 
 async fn dispatch_internal_admin_command(
@@ -1176,6 +1213,16 @@ async fn dispatch_internal_admin_command(
         InternalActionRoute::OpaQuery(query_action) => {
             let hive = resolve_internal_action_hive(action, target, &params);
             handle_opa_query(ctx, client, query_action, hive.clone()).await?
+        }
+        InternalActionRoute::TimerRpc(timer_msg) => {
+            let hive = resolve_internal_action_hive(action, target, &params);
+            let Some(hive_id) = hive else {
+                return Ok(internal_invalid_request(
+                    action,
+                    "missing target (payload.target required for this action)",
+                ));
+            };
+            handle_timer_rpc(ctx, client, action, timer_msg, params, hive_id).await?
         }
     };
 
@@ -2235,6 +2282,74 @@ async fn handle_hive_paths(
             let (status, resp) = handle_opa_query(ctx, client, "get_status", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("GET", ["timer", "help"]) => {
+            let (status, resp) = handle_timer_rpc(
+                ctx,
+                client,
+                "timer_help",
+                "TIMER_HELP",
+                serde_json::json!({}),
+                hive,
+            )
+            .await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["timer", "now"]) => {
+            let (status, resp) = handle_timer_rpc(
+                ctx,
+                client,
+                "timer_now",
+                "TIMER_NOW",
+                serde_json::json!({}),
+                hive,
+            )
+            .await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["timer", "now-in"]) => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let (status, resp) =
+                handle_timer_rpc(ctx, client, "timer_now_in", "TIMER_NOW_IN", payload, hive)
+                    .await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["timer", "convert"]) => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let (status, resp) =
+                handle_timer_rpc(ctx, client, "timer_convert", "TIMER_CONVERT", payload, hive)
+                    .await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["timer", "parse"]) => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let (status, resp) =
+                handle_timer_rpc(ctx, client, "timer_parse", "TIMER_PARSE", payload, hive)
+                    .await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["timer", "format"]) => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let (status, resp) =
+                handle_timer_rpc(ctx, client, "timer_format", "TIMER_FORMAT", payload, hive)
+                    .await?;
+            Ok(Some((status, resp)))
+        }
         _ => Ok(None),
     }
 }
@@ -3058,6 +3173,32 @@ async fn handle_opa_query(
     Ok(build_opa_query_response(ctx, action, responses, target))
 }
 
+async fn handle_timer_rpc(
+    _ctx: &AdminContext,
+    client: &AdminRouterClient,
+    action: &str,
+    timer_msg: &str,
+    payload: serde_json::Value,
+    hive_id: String,
+) -> Result<(u16, String), AdminError> {
+    let target = format!("SY.timer@{}", hive_id);
+    let normalized_payload = if payload.is_null() {
+        serde_json::json!({})
+    } else {
+        payload
+    };
+    let response = send_system_request(
+        client,
+        &target,
+        timer_msg,
+        "TIMER_RESPONSE",
+        normalized_payload,
+        admin_action_timeout(action),
+    )
+    .await;
+    Ok(build_admin_http_response(action, response))
+}
+
 async fn handle_admin_query(
     ctx: &AdminContext,
     client: &AdminRouterClient,
@@ -3155,6 +3296,7 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
         InternalActionRoute::Inventory => ("inventory", None),
         InternalActionRoute::OpaHttp(_) => ("opa_http", None),
         InternalActionRoute::OpaQuery(canonical) => ("opa_query", Some(canonical)),
+        InternalActionRoute::TimerRpc(canonical) => ("timer_rpc", Some(canonical)),
     };
     serde_json::json!({
         "action": spec.action,
@@ -3253,6 +3395,12 @@ fn admin_action_summary(action: &str) -> &'static str {
         "get_drift_alerts" => "List historical drift alerts for one hive.",
         "opa_get_policy" => "Read current OPA policy text for a hive.",
         "opa_get_status" => "Read OPA status for a hive.",
+        "timer_help" => "Read the self-described SY.timer capability catalog for a hive.",
+        "timer_now" => "Read the current UTC time from SY.timer for a hive.",
+        "timer_now_in" => "Read the current time in one IANA timezone from SY.timer for a hive.",
+        "timer_convert" => "Convert one UTC instant through SY.timer for a hive.",
+        "timer_parse" => "Parse a date/time string through SY.timer for a hive.",
+        "timer_format" => "Format a UTC instant through SY.timer for a hive.",
         "opa_check" => "Validate OPA policy text without applying it.",
         "run_node" => "Start a node in a hive.",
         "kill_node" => "Stop a node in a hive. Optional purge_instance also removes its persisted instance directory.",
@@ -3318,6 +3466,12 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "get_drift_alerts" => vec!["GET /hives/{hive}/drift-alerts"],
         "opa_get_policy" => vec!["GET /hives/{hive}/opa/policy"],
         "opa_get_status" => vec!["GET /hives/{hive}/opa/status"],
+        "timer_help" => vec!["GET /hives/{hive}/timer/help"],
+        "timer_now" => vec!["GET /hives/{hive}/timer/now"],
+        "timer_now_in" => vec!["POST /hives/{hive}/timer/now-in"],
+        "timer_convert" => vec!["POST /hives/{hive}/timer/convert"],
+        "timer_parse" => vec!["POST /hives/{hive}/timer/parse"],
+        "timer_format" => vec!["POST /hives/{hive}/timer/format"],
         "opa_check" => vec!["POST /hives/{hive}/opa/policy/check"],
         "run_node" => vec!["POST /hives/{hive}/nodes"],
         "kill_node" => vec!["DELETE /hives/{hive}/nodes/{node_name}"],
@@ -3388,8 +3542,10 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         )],
         "list_nodes" | "list_ilks" | "get_versions" | "list_runtimes" | "list_routes"
         | "list_vpns" | "get_deployments" | "get_drift_alerts" | "opa_get_policy"
-        | "opa_get_status" | "update" | "sync_hint" | "opa_compile_apply" | "opa_compile"
-        | "opa_apply" | "opa_rollback" | "opa_check" => vec![admin_action_path_param(
+        | "opa_get_status" | "timer_help" | "timer_now" | "timer_now_in" | "timer_convert"
+        | "timer_parse" | "timer_format" | "update" | "sync_hint" | "opa_compile_apply"
+        | "opa_compile" | "opa_apply" | "opa_rollback" | "opa_check" => vec![
+            admin_action_path_param(
             "hive",
             "string",
             "Target hive id in the URL path.",
@@ -3486,6 +3642,10 @@ fn admin_action_body_required(action: &str) -> bool {
             | "opa_compile"
             | "opa_apply"
             | "opa_check"
+            | "timer_now_in"
+            | "timer_convert"
+            | "timer_parse"
+            | "timer_format"
     )
 }
 
@@ -3571,6 +3731,37 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "u64",
             "Compiled OPA version to apply.",
         )],
+        "timer_now_in" => vec![admin_action_body_field(
+            "tz",
+            "string",
+            "IANA timezone name, for example America/Argentina/Buenos_Aires.",
+        )],
+        "timer_convert" => vec![
+            admin_action_body_field(
+                "instant_utc_ms",
+                "i64",
+                "UTC instant in unix milliseconds.",
+            ),
+            admin_action_body_field(
+                "to_tz",
+                "string",
+                "IANA timezone name to convert into.",
+            ),
+        ],
+        "timer_parse" => vec![
+            admin_action_body_field("input", "string", "Input date/time text to parse."),
+            admin_action_body_field("layout", "string", "Go time layout used to parse input."),
+            admin_action_body_field("tz", "string", "IANA timezone applied to the parsed input."),
+        ],
+        "timer_format" => vec![
+            admin_action_body_field(
+                "instant_utc_ms",
+                "i64",
+                "UTC instant in unix milliseconds.",
+            ),
+            admin_action_body_field("layout", "string", "Go time layout used for formatting."),
+            admin_action_body_field("tz", "string", "IANA timezone used for rendering."),
+        ],
         _ => Vec::new(),
     }
 }
@@ -3822,6 +4013,23 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
                 }
             }
         }),
+        "timer_now_in" => serde_json::json!({
+            "tz": "America/Argentina/Buenos_Aires"
+        }),
+        "timer_convert" => serde_json::json!({
+            "instant_utc_ms": 1775771100000i64,
+            "to_tz": "Europe/Madrid"
+        }),
+        "timer_parse" => serde_json::json!({
+            "input": "2026-04-10 18:30",
+            "layout": "2006-01-02 15:04",
+            "tz": "America/Argentina/Buenos_Aires"
+        }),
+        "timer_format" => serde_json::json!({
+            "instant_utc_ms": 1775771100000i64,
+            "layout": "2006-01-02 15:04 MST",
+            "tz": "America/Argentina/Buenos_Aires"
+        }),
         "send_node_message" => serde_json::json!({
             "msg_type": "PING",
             "payload": {
@@ -3929,6 +4137,20 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "opa_get_policy" => "curl -X GET /hives/motherbee/opa/policy",
         "opa_get_status" => "curl -X GET /hives/motherbee/opa/status",
+        "timer_help" => "curl -X GET /hives/motherbee/timer/help",
+        "timer_now" => "curl -X GET /hives/motherbee/timer/now",
+        "timer_now_in" => {
+            r#"curl -X POST /hives/motherbee/timer/now-in -d '{"tz":"America/Argentina/Buenos_Aires"}'"#
+        }
+        "timer_convert" => {
+            r#"curl -X POST /hives/motherbee/timer/convert -d '{"instant_utc_ms":1775771100000,"to_tz":"Europe/Madrid"}'"#
+        }
+        "timer_parse" => {
+            r#"curl -X POST /hives/motherbee/timer/parse -d '{"input":"2026-04-10 18:30","layout":"2006-01-02 15:04","tz":"America/Argentina/Buenos_Aires"}'"#
+        }
+        "timer_format" => {
+            r#"curl -X POST /hives/motherbee/timer/format -d '{"instant_utc_ms":1775771100000,"layout":"2006-01-02 15:04 MST","tz":"America/Argentina/Buenos_Aires"}'"#
+        }
         "opa_compile_apply" => {
             r#"curl -X POST /hives/motherbee/opa/policy -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
         }
@@ -4006,6 +4228,12 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "They mutate one route/VPN rule at a time and preserve the legacy operational surface.",
             "For HTTP delete calls, the identifier lives in the final path segment; internal admin commands may still carry it in payload.",
             "Use node_control_config_set against SY.config.routes only when you want the node-owned live config replace path instead of one explicit domain mutation.",
+        ],
+        "timer_help" | "timer_now" | "timer_now_in" | "timer_convert" | "timer_parse"
+        | "timer_format" => vec![
+            "These are narrow SY.timer read-only actions exposed through SY.admin for operator visibility and introspection.",
+            "Direct node-to-node SDK usage remains the primary interaction model for SY.timer.",
+            "Owner-bound timer verbs such as schedule/get/list/cancel/reschedule are intentionally not exposed through SY.admin in v1 because ownership is enforced against the request source node identity.",
         ],
         "get_ilk" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
@@ -5004,7 +5232,15 @@ fn admin_action_timeout(action: &str) -> Duration {
         "sync_hint" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
         }
-        "list_admin_actions" | "get_admin_action_help" | "hive_status" => {
+        "list_admin_actions"
+        | "get_admin_action_help"
+        | "hive_status"
+        | "timer_help"
+        | "timer_now"
+        | "timer_now_in"
+        | "timer_convert"
+        | "timer_parse"
+        | "timer_format" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5))
         }
         _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30)),
@@ -5859,6 +6095,37 @@ mod tests {
         assert_eq!(
             list_config_items_payload(&response, "list_vpns"),
             Some(&json!([{ "pattern": "ops/*" }]))
+        );
+    }
+
+    #[test]
+    fn timer_help_action_doc_is_registered_as_timer_rpc() {
+        let spec = resolve_internal_action_spec("timer_help").expect("timer_help must exist");
+        let doc = build_admin_action_doc(spec);
+
+        assert_eq!(doc["action"], json!("timer_help"));
+        assert_eq!(doc["handler"], json!("timer_rpc"));
+        assert_eq!(doc["canonical_action"], json!("TIMER_HELP"));
+        assert_eq!(doc["read_only"], json!(true));
+        assert_eq!(doc["requires_target"], json!(true));
+    }
+
+    #[test]
+    fn timer_parse_request_contract_exposes_timer_path_and_fields() {
+        let contract = admin_action_request_contract("timer_parse");
+
+        assert_eq!(contract["method"], json!("POST"));
+        assert_eq!(
+            contract["path_patterns"],
+            json!(["POST /hives/{hive}/timer/parse"])
+        );
+        assert_eq!(
+            contract["body"]["required_fields"],
+            json!([
+                { "name": "input", "type": "string", "description": "Input date/time text to parse." },
+                { "name": "layout", "type": "string", "description": "Go time layout used to parse input." },
+                { "name": "tz", "type": "string", "description": "IANA timezone applied to the parsed input." }
+            ])
         );
     }
 }
