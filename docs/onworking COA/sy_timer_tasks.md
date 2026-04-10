@@ -325,7 +325,7 @@ Current status:
 - [x] SYT-S8-T4. Add core manifest entry for `sy-timer`.
 - [x] SYT-S8-T5. Add systemd unit for `sy-timer`.
 - [x] SYT-S8-T6. Add orchestrator startup/shutdown/watchdog handling for `sy-timer`.
-- [ ] SYT-S8-T7. Add node cleanup hook from orchestrator:
+- [x] SYT-S8-T7. Add node cleanup hook from orchestrator:
   - `TIMER_PURGE_OWNER` before node teardown
 - [ ] SYT-S8-T8. Decide whether orchestrator itself should use `SY.timer` for any internal delayed actions in v1 or not.
 
@@ -340,7 +340,7 @@ Current status:
   - router-connected `SY.*` readiness wait
   - shutdown sequence
   - worker bootstrap unit generation
-- explicit teardown-time owner purge remains deferred until `TIMER_PURGE_OWNER` exists
+- node teardown now triggers `TIMER_PURGE_OWNER` best-effort before instance removal / purge, and includes the result in the orchestrator response payload
 
 ### SYT-S9 — Admin and operator visibility
 
