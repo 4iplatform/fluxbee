@@ -475,9 +475,11 @@
       .github-nav .github-label { display: none; }
       .hero-content { padding: 4rem 1.5rem 3rem; }
       section { padding: 4rem 0; }
-      .oss-box { flex-direction: column; gap: 1.5rem; padding: 2rem; width: 100%; }
-      .oss-text { width: 100%; min-width: 0; }
-      .oss-chip { word-break: break-all; }
+      .oss-box { flex-direction: column; gap: 1.5rem; padding: 1.5rem; width: 100%; box-sizing: border-box; overflow: hidden; }
+      .oss-text { width: 100%; min-width: 0; overflow: hidden; }
+      .oss-text p { word-break: break-word; overflow-wrap: break-word; }
+      .oss-chips { width: 100%; }
+      .oss-chip { max-width: 100%; word-break: break-all; overflow: hidden; }
       .form-row { flex-direction: column; }
       .form-row button { width: 100%; }
     }
