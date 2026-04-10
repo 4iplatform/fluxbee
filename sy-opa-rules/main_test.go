@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	fluxbeesdk "github.com/4iplatform/json-router/sy-opa-rules/sdk"
+	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 	"github.com/google/uuid"
 )
 

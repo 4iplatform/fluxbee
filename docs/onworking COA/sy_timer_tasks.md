@@ -138,18 +138,25 @@ Recommended order:
 
 ### SYT-S1 — Promote the current Go SDK from OPA-specific bootstrap to reusable platform SDK
 
-- [ ] SYT-S1-T1. Create a formal top-level `fluxbee-go-sdk/` module in the repo.
-- [ ] SYT-S1-T2. Preserve backward compatibility for `SY.opa.rules` while extending the SDK.
+- [x] SYT-S1-T1. Create a formal top-level `fluxbee-go-sdk/` module in the repo.
+- [x] SYT-S1-T2. Preserve backward compatibility for `SY.opa.rules` while extending the SDK.
 - [ ] SYT-S1-T3. Add peer identity resolution support needed by `SY.timer`.
 - [ ] SYT-S1-T4. Add typed request/reply helpers for direct `system` RPC-style node interactions.
 - [ ] SYT-S1-T5. Add typed error parsing helpers matching `TIMER_RESPONSE`.
 - [ ] SYT-S1-T6. Add reusable `HELP` descriptor helpers if that reduces duplication.
-- [ ] SYT-S1-T7. Move the current SDK code from `sy-opa-rules/sdk` into the formal SDK layout.
-- [ ] SYT-S1-T8. Define stable package naming and import path for Go consumers.
-- [ ] SYT-S1-T9. Add module README and first-party/third-party usage guidance.
+- [x] SYT-S1-T7. Move the current SDK code from `sy-opa-rules/sdk` into the formal SDK layout.
+- [x] SYT-S1-T8. Define stable package naming and import path for Go consumers.
+- [x] SYT-S1-T9. Add module README and first-party/third-party usage guidance.
 - [ ] SYT-S1-T10. Define versioning/compatibility policy for the Go SDK.
 - [ ] SYT-S1-T11. Add wire-compatibility tests against the Rust SDK contract.
-- [ ] SYT-S1-T12. Leave a compatibility migration path for `SY.opa.rules` while imports move to the formal SDK.
+- [x] SYT-S1-T12. Leave a compatibility migration path for `SY.opa.rules` while imports move to the formal SDK.
+
+Current status after extraction:
+
+- top-level module path: `github.com/4iplatform/json-router/fluxbee-go-sdk`
+- first migrated consumer: `SY.opa.rules`
+- local workspace wiring uses `go.mod replace ../fluxbee-go-sdk` during in-repo development
+- the old `sy-opa-rules/sdk` implementation has been removed to avoid dual sources of truth
 
 ### SYT-S2 — Add `timer` client module to the Go SDK
 

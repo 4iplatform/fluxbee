@@ -177,7 +177,7 @@ Interpretation rule:
 
 Current implementation reference:
 - [main.go](/Users/cagostino/Documents/GitHub/fluxbee/sy-opa-rules/main.go)
-- [sdk](/Users/cagostino/Documents/GitHub/fluxbee/sy-opa-rules/sdk)
+- [fluxbee-go-sdk](/Users/cagostino/Documents/GitHub/fluxbee/fluxbee-go-sdk)
 
 ### 3.1 Node role
 
