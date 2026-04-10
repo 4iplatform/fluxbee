@@ -312,15 +312,28 @@ Current status:
 
 ### SYT-S8 — Install, orchestrator, and service model
 
-- [ ] SYT-S8-T1. Integrate `sy-timer` build into `scripts/install.sh`.
-- [ ] SYT-S8-T2. Install binary to `/usr/bin/sy-timer`.
-- [ ] SYT-S8-T3. Publish binary to `/var/lib/fluxbee/dist/core/bin/sy-timer`.
-- [ ] SYT-S8-T4. Add core manifest entry for `sy-timer`.
-- [ ] SYT-S8-T5. Add systemd unit for `sy-timer`.
-- [ ] SYT-S8-T6. Add orchestrator startup/shutdown/watchdog handling for `sy-timer`.
+- [x] SYT-S8-T1. Integrate `sy-timer` build into `scripts/install.sh`.
+- [x] SYT-S8-T2. Install binary to `/usr/bin/sy-timer`.
+- [x] SYT-S8-T3. Publish binary to `/var/lib/fluxbee/dist/core/bin/sy-timer`.
+- [x] SYT-S8-T4. Add core manifest entry for `sy-timer`.
+- [x] SYT-S8-T5. Add systemd unit for `sy-timer`.
+- [x] SYT-S8-T6. Add orchestrator startup/shutdown/watchdog handling for `sy-timer`.
 - [ ] SYT-S8-T7. Add node cleanup hook from orchestrator:
   - `TIMER_PURGE_OWNER` before node teardown
 - [ ] SYT-S8-T8. Decide whether orchestrator itself should use `SY.timer` for any internal delayed actions in v1 or not.
+
+Current status:
+
+- `scripts/install.sh` now builds the Go binary, installs it to `/usr/bin/sy-timer`, publishes it to `dist/core/bin`, and includes it in the core manifest and `systemd` units
+- `scripts/fluxbee_stop.sh` now stops and cleans residual `sy-timer` processes together with the rest of the core services
+- `SY.orchestrator` now treats `sy-timer` as another core `SY.*` singleton:
+  - core sync / restart order
+  - critical services
+  - local bootstrap start list
+  - router-connected `SY.*` readiness wait
+  - shutdown sequence
+  - worker bootstrap unit generation
+- explicit teardown-time owner purge remains deferred until `TIMER_PURGE_OWNER` exists
 
 ### SYT-S9 — Admin and operator visibility
 
