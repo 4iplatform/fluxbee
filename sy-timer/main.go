@@ -47,6 +47,7 @@ type Service struct {
 	dbPath             string
 	db                 *sql.DB
 	uuidPersistenceDir string
+	scheduler          *timerScheduler
 }
 
 type timerNowInRequest struct {
@@ -147,15 +148,20 @@ func main() {
 		db:                 db,
 		uuidPersistenceDir: uuidPersistenceDir,
 	}
+	service.scheduler = newTimerScheduler(service)
 	deleted, err := gcHistoricalTimers(context.Background(), db, time.Now().UTC(), defaultHistoryRetention)
 	if err != nil {
 		log.Printf("historical timer gc failed: %v", err)
+	}
+	if err := service.scheduler.replayPending(context.Background(), time.Now().UTC()); err != nil {
+		log.Fatalf("failed to replay pending timers: %v", err)
 	}
 	pendingCount, err := countPendingTimers(context.Background(), db)
 	if err != nil {
 		log.Printf("failed to count pending timers: %v", err)
 	}
 	log.Printf("SY.timer ready: node=%s db=%s pending=%d gc_deleted=%d", service.nodeName, service.dbPath, pendingCount, deleted)
+	service.scheduler.start()
 	service.run()
 }
 
@@ -409,6 +415,7 @@ func (s *Service) respondTimerSchedule(incoming fluxbeesdk.Message) error {
 	if err := insertTimer(context.Background(), s.db, row); err != nil {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE", "TIMER_STORAGE_ERROR", err.Error())
 	}
+	s.signalScheduler()
 	return s.sendTimerResponse(incoming, map[string]any{
 		"ok":             true,
 		"verb":           "TIMER_SCHEDULE",
@@ -483,6 +490,7 @@ func (s *Service) respondTimerScheduleRecurring(incoming fluxbeesdk.Message) err
 	if err := insertTimer(context.Background(), s.db, row); err != nil {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE_RECURRING", "TIMER_STORAGE_ERROR", err.Error())
 	}
+	s.signalScheduler()
 	return s.sendTimerResponse(incoming, map[string]any{
 		"ok":             true,
 		"verb":           "TIMER_SCHEDULE_RECURRING",
@@ -591,6 +599,7 @@ func (s *Service) respondTimerCancel(incoming fluxbeesdk.Message) error {
 	if err := updateTimer(context.Background(), s.db, *row); err != nil {
 		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_STORAGE_ERROR", err.Error())
 	}
+	s.signalScheduler()
 	return s.sendTimerResponse(incoming, map[string]any{
 		"ok":         true,
 		"verb":       "TIMER_CANCEL",
@@ -635,6 +644,7 @@ func (s *Service) respondTimerReschedule(incoming fluxbeesdk.Message) error {
 	if err := updateTimer(context.Background(), s.db, *row); err != nil {
 		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_STORAGE_ERROR", err.Error())
 	}
+	s.signalScheduler()
 	return s.sendTimerResponse(incoming, map[string]any{
 		"ok":             true,
 		"verb":           "TIMER_RESCHEDULE",
@@ -666,6 +676,12 @@ func (s *Service) sendTimerError(incoming fluxbeesdk.Message, verb, code, messag
 			"message": message,
 		},
 	})
+}
+
+func (s *Service) signalScheduler() {
+	if s.scheduler != nil {
+		s.scheduler.signal()
+	}
 }
 
 func loadLocation(raw string) (*time.Location, error) {

@@ -522,6 +522,7 @@ Emitido por `SY.timer` hacia el `target_l2_name` cuando un timer vence.
 **Notas de diseño:**
 - `trace_id` es nuevo, no reutiliza el del `TIMER_SCHEDULE` original. Esto permite trazar el disparo como un evento independiente.
 - `scheduled_fire_at_utc_ms` vs `actual_fire_at_utc_ms` permite al consumidor medir el jitter real.
+- En v1, `actual_fire_at_utc_ms` se captura inmediatamente antes del intento de envío del evento, no después de confirmar una escritura exitosa del socket.
 - `is_last_fire` para recurrentes que tienen algún criterio de terminación (v1 siempre `false` para recurrentes; reservado para v2).
 - `user_payload` es exactamente lo que el cliente pasó en el `TIMER_SCHEDULE.payload.payload`, sin modificar.
 - `metadata` también se devuelve tal cual, para que el consumidor pueda tener el contexto que el creador dejó.

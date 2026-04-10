@@ -250,16 +250,26 @@ Current status:
 
 ### SYT-S5 — Scheduler engine
 
-- [ ] SYT-S5-T1. Implement in-memory heap ordered by next `fire_at`.
-- [ ] SYT-S5-T2. Implement startup replay from pending timers.
-- [ ] SYT-S5-T3. Implement missed-policy behavior on restart:
+- [x] SYT-S5-T1. Implement in-memory heap ordered by next `fire_at`.
+- [x] SYT-S5-T2. Implement startup replay from pending timers.
+- [x] SYT-S5-T3. Implement missed-policy behavior on restart:
   - `fire`
   - `drop`
   - `fire_if_within`
-- [ ] SYT-S5-T4. Implement recurring timer next-fire computation from cron.
-- [ ] SYT-S5-T5. Implement per-timer locking around fire/cancel/reschedule races.
-- [ ] SYT-S5-T6. Emit `TIMER_FIRED` as fire-and-forget L2 event.
-- [ ] SYT-S5-T7. Define whether `actual_fire_at_utc_ms` is taken before send or after successful socket write.
+- [x] SYT-S5-T4. Implement recurring timer next-fire computation from cron.
+- [x] SYT-S5-T5. Implement per-timer locking around fire/cancel/reschedule races.
+- [x] SYT-S5-T6. Emit `TIMER_FIRED` as fire-and-forget L2 event.
+- [x] SYT-S5-T7. Define whether `actual_fire_at_utc_ms` is taken before send or after successful socket write.
+
+Current status:
+
+- the node now replays pending timers at boot before entering the receive loop
+- one-shot missed timers apply `fire` / `drop` / `fire_if_within` against persisted rows
+- recurring timers are recomputed forward from `now()` using persisted `cron_spec` / `cron_tz`
+- the scheduler uses an in-memory min-heap plus per-timer mutexes
+- `TIMER_FIRED` is sent as fire-and-forget L2 unicast to the persisted `target_l2_name`
+- `actual_fire_at_utc_ms` is captured immediately before the send attempt, not after a successful write
+- remaining work in this area is mostly hardening and Linux runtime validation, not missing core scheduler behavior
 
 ### SYT-S6 — Request handlers
 

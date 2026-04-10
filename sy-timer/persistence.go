@@ -200,6 +200,21 @@ LIMIT ?
 	return collectTimerRows(rows)
 }
 
+func listPendingTimers(ctx context.Context, db *sql.DB) ([]timerRow, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
+       missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
+FROM timers
+WHERE status='pending'
+ORDER BY fire_at_utc ASC
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return collectTimerRows(rows)
+}
+
 func countPendingTimers(ctx context.Context, db *sql.DB) (int64, error) {
 	var count int64
 	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM timers WHERE status='pending'`).Scan(&count)
