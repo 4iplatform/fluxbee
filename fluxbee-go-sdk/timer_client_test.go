@@ -285,3 +285,190 @@ func TestParseFiredEventParsesPayload(t *testing.T) {
 		t.Fatalf("unexpected fired event: %+v", event)
 	}
 }
+
+func TestScheduleInRejectsBelowMinimumClientSide(t *testing.T) {
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
+		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+	_, err = client.ScheduleIn(context.Background(), 30*time.Second, ScheduleOptions{})
+	if err == nil {
+		t.Fatalf("expected below-minimum error")
+	}
+	respErr, ok := err.(*SystemResponseError)
+	if !ok || respErr.Code != "TIMER_BELOW_MINIMUM" {
+		t.Fatalf("unexpected error: %T %+v", err, err)
+	}
+}
+
+func TestScheduleUsesTimerResponseTimerUUID(t *testing.T) {
+	tx := make(chan []byte, 1)
+	rx := make(chan receivedMessage, 1)
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
+		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+
+	go func() {
+		frame := <-tx
+		var request Message
+		if err := json.Unmarshal(frame, &request); err != nil {
+			t.Errorf("unmarshal request: %v", err)
+			return
+		}
+		if stringValue(request.Meta.Msg) != "TIMER_SCHEDULE" {
+			t.Errorf("unexpected request verb: %q", stringValue(request.Meta.Msg))
+			return
+		}
+		response, err := BuildSystemResponse(
+			&request,
+			"timer-uuid",
+			MsgTimerResponse,
+			map[string]any{
+				"ok":             true,
+				"verb":           "TIMER_SCHEDULE",
+				"timer_uuid":     "timer-1",
+				"fire_at_utc_ms": int64(1775577600000),
+			},
+			SystemEnvelopeOptions{},
+		)
+		if err != nil {
+			t.Errorf("build response: %v", err)
+			return
+		}
+		rx <- receivedMessage{msg: response}
+	}()
+
+	id, err := client.ScheduleIn(context.Background(), time.Minute, ScheduleOptions{ClientRef: "demo"})
+	if err != nil {
+		t.Fatalf("schedule in: %v", err)
+	}
+	if id != TimerID("timer-1") {
+		t.Fatalf("unexpected timer id: %q", id)
+	}
+}
+
+func TestGetParsesTimerInfo(t *testing.T) {
+	tx := make(chan []byte, 1)
+	rx := make(chan receivedMessage, 1)
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
+		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+
+	go func() {
+		frame := <-tx
+		var request Message
+		if err := json.Unmarshal(frame, &request); err != nil {
+			t.Errorf("unmarshal request: %v", err)
+			return
+		}
+		response, err := BuildSystemResponse(
+			&request,
+			"timer-uuid",
+			MsgTimerResponse,
+			map[string]any{
+				"ok":   true,
+				"verb": "TIMER_GET",
+				"timer": map[string]any{
+					"uuid":              "timer-1",
+					"owner_l2_name":     "WF.demo@motherbee",
+					"target_l2_name":    "WF.demo@motherbee",
+					"kind":              "oneshot",
+					"fire_at_utc_ms":    int64(1775577600000),
+					"missed_policy":     "fire",
+					"status":            "pending",
+					"created_at_utc_ms": int64(1775574000000),
+					"fire_count":        int64(0),
+					"payload":           map[string]any{"ticket_id": 1234},
+					"metadata":          map[string]any{"created_by_reasoning": "..."},
+				},
+			},
+			SystemEnvelopeOptions{},
+		)
+		if err != nil {
+			t.Errorf("build response: %v", err)
+			return
+		}
+		rx <- receivedMessage{msg: response}
+	}()
+
+	info, err := client.Get(context.Background(), TimerID("timer-1"))
+	if err != nil {
+		t.Fatalf("get timer: %v", err)
+	}
+	if info.UUID != "timer-1" || info.OwnerL2Name != "WF.demo@motherbee" {
+		t.Fatalf("unexpected timer info: %+v", info)
+	}
+}
+
+func TestListMineParsesTimers(t *testing.T) {
+	tx := make(chan []byte, 1)
+	rx := make(chan receivedMessage, 1)
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
+		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+
+	go func() {
+		frame := <-tx
+		var request Message
+		if err := json.Unmarshal(frame, &request); err != nil {
+			t.Errorf("unmarshal request: %v", err)
+			return
+		}
+		response, err := BuildSystemResponse(
+			&request,
+			"timer-uuid",
+			MsgTimerResponse,
+			map[string]any{
+				"ok":    true,
+				"verb":  "TIMER_LIST",
+				"count": 1,
+				"timers": []map[string]any{
+					{
+						"uuid":              "timer-1",
+						"owner_l2_name":     "WF.demo@motherbee",
+						"target_l2_name":    "WF.demo@motherbee",
+						"kind":              "oneshot",
+						"fire_at_utc_ms":    int64(1775577600000),
+						"missed_policy":     "fire",
+						"status":            "pending",
+						"created_at_utc_ms": int64(1775574000000),
+						"fire_count":        int64(0),
+					},
+				},
+			},
+			SystemEnvelopeOptions{},
+		)
+		if err != nil {
+			t.Errorf("build response: %v", err)
+			return
+		}
+		rx <- receivedMessage{msg: response}
+	}()
+
+	items, err := client.ListMine(context.Background(), ListFilter{StatusFilter: "pending", Limit: 100})
+	if err != nil {
+		t.Fatalf("list mine: %v", err)
+	}
+	if len(items) != 1 || items[0].UUID != "timer-1" {
+		t.Fatalf("unexpected timers: %+v", items)
+	}
+}

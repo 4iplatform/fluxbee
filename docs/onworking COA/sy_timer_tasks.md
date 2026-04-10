@@ -171,7 +171,7 @@ Current status after extraction:
   - `MissedPolicy`
   - `ListFilter`
   - `HelpDescriptor`
-- [ ] SYT-S2-T2. Implement typed client calls:
+- [x] SYT-S2-T2. Implement typed client calls:
   - `Now`
   - `NowIn`
   - `Convert`
@@ -196,9 +196,10 @@ Current status after extraction:
 Current status:
 
 - implemented client calls so far: `Now`, `NowIn`, `Convert`, `Parse`, `Format`, `Help`
+- implemented scheduling calls: `Schedule`, `ScheduleIn`, `ScheduleRecurring`, `Cancel`, `Reschedule`, `Get`, `ListMine`
 - implemented time-operation retry budget for the currently supported direct time calls
 - implemented `ParseFiredEvent(msg)`
-- remaining client calls still to add: `Schedule`, `ScheduleIn`, `ScheduleRecurring`, `Cancel`, `Reschedule`, `Get`, `ListMine`
+- remaining SDK work before the node binary: tighten client-side validation and broaden retry semantics from direct time calls to the final desired scope
 
 ---
 
@@ -206,12 +207,28 @@ Current status:
 
 ### SYT-S3 — Node skeleton and lifecycle
 
-- [ ] SYT-S3-T1. Create Go binary/package for `SY.timer`.
-- [ ] SYT-S3-T2. Connect through `fluxbee-go-sdk` lifecycle.
-- [ ] SYT-S3-T3. Use canonical node instance dir under `/var/lib/fluxbee/nodes/SY/SY.timer@<hive>/`.
-- [ ] SYT-S3-T4. Open/create `timers.db` on startup.
-- [ ] SYT-S3-T5. Enable SQLite WAL mode and define safe startup/shutdown semantics.
+- [x] SYT-S3-T1. Create Go binary/package for `SY.timer`.
+- [x] SYT-S3-T2. Connect through `fluxbee-go-sdk` lifecycle.
+- [x] SYT-S3-T3. Use canonical node instance dir under `/var/lib/fluxbee/nodes/SY/SY.timer@<hive>/`.
+- [x] SYT-S3-T4. Open/create `timers.db` on startup.
+- [x] SYT-S3-T5. Enable SQLite WAL mode and define safe startup/shutdown semantics.
 - [ ] SYT-S3-T6. Add structured logging conventions for timer lifecycle and fire events.
+
+Current status:
+
+- module created at `/sy-timer`
+- lifecycle wired through `fluxbee-go-sdk.Connect(...)`
+- canonical instance dir and `timers.db` path created on boot
+- SQLite file opens with `journal_mode=WAL` and `busy_timeout`
+- current live handlers implemented in the skeleton:
+  - `NODE_STATUS_GET`
+  - `TIMER_NOW`
+  - `TIMER_NOW_IN`
+  - `TIMER_CONVERT`
+  - `TIMER_PARSE`
+  - `TIMER_FORMAT`
+  - `TIMER_HELP`
+- scheduling verbs still return typed "not implemented in current build" until `S4`/`S5`/`S6`
 
 ### SYT-S4 — Persistence and schema
 
