@@ -602,6 +602,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fluxbee-sdk",
+ "io-common",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "io-common"
 version = "0.1.0"
 dependencies = [
