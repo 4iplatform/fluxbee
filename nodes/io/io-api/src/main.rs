@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use axum::body::to_bytes;
-use axum::extract::{Request, State};
+use axum::extract::{FromRequest, Multipart, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -45,6 +45,10 @@ use io_common::relay::{
     RelayPolicy,
 };
 use io_common::router_message::DEFAULT_TTL;
+use io_common::text_v1_blob::{
+    build_text_v1_inbound_payload, InboundAttachmentInput, IoBlobContractError,
+    IoBlobRuntimeConfig, IoTextBlobConfig,
+};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,6 +74,7 @@ struct Config {
     dedup_ttl_ms: u64,
     dedup_max_entries: usize,
     relay: ApiRelayConfig,
+    blob_runtime: IoBlobRuntimeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +119,8 @@ struct HttpState {
     provisioner: Arc<dyn IdentityProvisioner>,
     inbound: Arc<Mutex<InboundProcessor>>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
+    blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
+    blob_payload_cfg: IoTextBlobConfig,
 }
 
 #[derive(Clone)]
@@ -253,6 +260,13 @@ async fn main() -> Result<()> {
         RelayBuffer::new(relay_policy.clone(), InMemoryRelayStore::new())
             .map_err(|err| anyhow::anyhow!("invalid relay policy: {err}"))?,
     ));
+    let blob_toolkit = Arc::new(
+        config
+            .blob_runtime
+            .build_toolkit()
+            .map_err(|err| anyhow::anyhow!("invalid blob runtime config: {err}"))?,
+    );
+    let blob_payload_cfg = config.blob_runtime.text_v1.clone();
 
     let control_plane = Arc::new(RwLock::new(boot_state.clone()));
     let control_metrics = Arc::new(IoControlPlaneMetrics::with_initial_state(
@@ -271,6 +285,8 @@ async fn main() -> Result<()> {
         provisioner: provisioner.clone(),
         inbound: inbound.clone(),
         relay: relay.clone(),
+        blob_toolkit,
+        blob_payload_cfg,
     });
 
     let http_listener = TcpListener::bind(&config.listen_addr)
@@ -451,6 +467,23 @@ impl Config {
                 )
                 .unwrap_or(256 * 1024),
             },
+            blob_runtime: IoBlobRuntimeConfig {
+                blob_root: PathBuf::from(
+                    env("BLOB_ROOT")
+                        .or_else(|| json_get_string_opt(spawn_doc, &["blob.path", "io.blob.path"]))
+                        .unwrap_or_else(|| "/var/lib/fluxbee/blob".to_string()),
+                ),
+                max_blob_bytes: env("BLOB_MAX_BYTES")
+                    .and_then(|value| value.parse().ok())
+                    .or_else(|| {
+                        json_get_u64_opt(
+                            spawn_doc,
+                            &["blob.max_blob_bytes", "io.blob.max_blob_bytes"],
+                        )
+                    }),
+                text_v1: IoTextBlobConfig::default(),
+                resolve_retry: fluxbee_sdk::blob::ResolveRetryConfig::default(),
+            },
         })
     }
 }
@@ -624,11 +657,116 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         );
     }
     if content_type.starts_with("multipart/form-data") {
-        return api_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "multipart_not_implemented",
-            "multipart/form-data ingress is not implemented yet in this phase",
-        );
+        let mut multipart = match Multipart::from_request(request, &()).await {
+            Ok(value) => value,
+            Err(err) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_multipart",
+                    format!("Invalid multipart request: {err}"),
+                );
+            }
+        };
+        let blob_cfg = effective_blob_payload_cfg(Some(effective), &state.blob_payload_cfg);
+        let (metadata, attachments) = match collect_multipart_blob_attachments(
+            &mut multipart,
+            state.blob_toolkit.as_ref(),
+            &blob_cfg,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err((status, code, message)) => return api_error(status, code, message),
+        };
+        let parsed = match parse_json_message_request(
+            &metadata,
+            effective,
+            &auth_match,
+            !attachments.is_empty(),
+        ) {
+            Ok(value) => value,
+            Err((status, code, message)) => return api_error(status, code, message),
+        };
+        let text = parsed
+            .payload
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let payload = match build_text_v1_inbound_payload(
+            state.blob_toolkit.as_ref(),
+            &blob_cfg,
+            text,
+            attachments,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                let (status, code, message) = map_blob_error_to_http(&err);
+                return api_error(status, code, message);
+            }
+        };
+        let parsed = ParsedHttpMessage { payload, ..parsed };
+        let relay_fragment =
+            build_api_relay_fragment(&state.node_name, &parsed, metadata.clone(), &auth_match);
+
+        return match state.relay.lock().await.handle_fragment(relay_fragment) {
+            RelayDecision::Hold => {
+                accepted_response(&state.node_name, parsed.request_id, None, "held")
+            }
+            RelayDecision::FlushNow(turn) => {
+                let trace_id = dispatch_assembled_turn_for_http(
+                    state.sender.clone(),
+                    state.identity.as_ref(),
+                    state.provisioner.as_ref(),
+                    state.inbound.clone(),
+                    turn,
+                    "relay immediate flush",
+                )
+                .await;
+                accepted_response(
+                    &state.node_name,
+                    parsed.request_id,
+                    trace_id,
+                    "flushed_immediately",
+                )
+            }
+            RelayDecision::DropDuplicate => accepted_response(
+                &state.node_name,
+                parsed.request_id,
+                None,
+                "duplicate_dropped",
+            ),
+            RelayDecision::RejectCapacity => {
+                let outcome = state
+                    .inbound
+                    .lock()
+                    .await
+                    .process_inbound(
+                        state.identity.as_ref(),
+                        Some(state.provisioner.as_ref()),
+                        parsed.identity_input,
+                        parsed.io_context,
+                        parsed.payload,
+                    )
+                    .await;
+                let trace_id = send_inbound_outcome(
+                    state.sender.clone(),
+                    outcome,
+                    "relay fail-open direct inbound",
+                )
+                .await;
+                accepted_response(
+                    &state.node_name,
+                    parsed.request_id,
+                    trace_id,
+                    "flushed_immediately",
+                )
+            }
+            RelayDecision::DropExpired => api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "relay_unavailable",
+                "Relay session expired before request could be accepted",
+            ),
+        };
     }
 
     let body_limit = extract_max_request_bytes(Some(effective));
@@ -654,7 +792,7 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         }
     };
 
-    let parsed = match parse_json_message_request(&envelope, effective, &auth_match) {
+    let parsed = match parse_json_message_request(&envelope, effective, &auth_match, false) {
         Ok(value) => value,
         Err((status, code, message)) => return api_error(status, code, message),
     };
@@ -1217,6 +1355,7 @@ fn parse_json_message_request(
     envelope: &Value,
     effective: &Value,
     auth_match: &AuthMatch,
+    allow_empty_text_if_attachments: bool,
 ) -> std::result::Result<ParsedHttpMessage, (StatusCode, &'static str, String)> {
     let subject_mode = extract_subject_mode(Some(effective)).unwrap_or_default();
     let message = envelope
@@ -1234,7 +1373,7 @@ fn parse_json_message_request(
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
-    if text.is_empty() {
+    if text.is_empty() && !allow_empty_text_if_attachments {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_payload",
@@ -1443,6 +1582,12 @@ fn build_api_relay_fragment(
         .get("content")
         .and_then(Value::as_str)
         .map(ToString::to_string);
+    let attachments = parsed
+        .payload
+        .get("attachments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     RelayFragment {
         relay_key: api_relay_key(
             node_name,
@@ -1452,7 +1597,7 @@ fn build_api_relay_fragment(
         fragment_id: parsed.io_context.message.id.clone(),
         received_at_ms: now_epoch_ms(),
         content_text,
-        attachments: Vec::new(),
+        attachments,
         raw_payload: Some(serde_json::json!({
             "request": raw_payload,
             "auth_key_id": auth_match.key_id.clone(),
@@ -1542,6 +1687,208 @@ fn accepted_response(
         })),
     )
         .into_response()
+}
+
+async fn collect_multipart_blob_attachments(
+    multipart: &mut Multipart,
+    blob_toolkit: &fluxbee_sdk::blob::BlobToolkit,
+    cfg: &IoTextBlobConfig,
+) -> std::result::Result<(Value, Vec<InboundAttachmentInput>), (StatusCode, &'static str, String)> {
+    let mut metadata: Option<Value> = None;
+    let mut attachments = Vec::new();
+    let allowed_mimes = cfg
+        .allowed_mimes
+        .iter()
+        .map(|mime| normalize_mime(mime))
+        .collect::<std::collections::HashSet<_>>();
+    let mut total_size: u64 = 0;
+
+    while let Some(field) = multipart.next_field().await.map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid_multipart",
+            format!("Invalid multipart field: {err}"),
+        )
+    })? {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "metadata" {
+            let bytes = field.bytes().await.map_err(|err| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_multipart",
+                    format!("Cannot read metadata part: {err}"),
+                )
+            })?;
+            let value = serde_json::from_slice::<Value>(&bytes).map_err(|err| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_json",
+                    format!("metadata part is not valid JSON: {err}"),
+                )
+            })?;
+            metadata = Some(value);
+            continue;
+        }
+
+        if attachments.len() >= cfg.max_attachments {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_many_attachments",
+                format!("Too many attachments: max {}", cfg.max_attachments),
+            ));
+        }
+
+        let filename = field.file_name().unwrap_or("attachment.bin").to_string();
+        let mime = field
+            .content_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        if !allowed_mimes.contains(&normalize_mime(&mime)) {
+            return Err((
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_attachment_mime",
+                format!("Unsupported attachment mime: {mime}"),
+            ));
+        }
+
+        let bytes = field.bytes().await.map_err(|err| {
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_multipart",
+                format!("Cannot read attachment bytes: {err}"),
+            )
+        })?;
+        let size = bytes.len() as u64;
+        if size > cfg.max_attachment_bytes {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "attachment_too_large",
+                format!(
+                    "Attachment exceeds max size of {}",
+                    cfg.max_attachment_bytes
+                ),
+            ));
+        }
+        if total_size.saturating_add(size) > cfg.max_total_attachment_bytes {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "attachments_too_large",
+                format!(
+                    "Total attachment bytes exceed max {}",
+                    cfg.max_total_attachment_bytes
+                ),
+            ));
+        }
+
+        let blob_ref = blob_toolkit
+            .put_bytes(&bytes, &filename, &mime)
+            .map_err(|err| {
+                let code = match err {
+                    fluxbee_sdk::blob::BlobError::TooLarge { .. } => "attachment_too_large",
+                    _ => "blob_put_error",
+                };
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    code,
+                    format!("Failed to materialize attachment: {err}"),
+                )
+            })?;
+        blob_toolkit.promote(&blob_ref).map_err(|err| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "blob_promote_error",
+                format!("Failed to promote attachment blob: {err}"),
+            )
+        })?;
+
+        total_size = total_size.saturating_add(size);
+        attachments.push(InboundAttachmentInput { blob_ref });
+    }
+
+    let metadata = metadata.ok_or_else(|| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_payload",
+            "multipart/form-data requires a metadata JSON part".to_string(),
+        )
+    })?;
+    Ok((metadata, attachments))
+}
+
+fn effective_blob_payload_cfg(
+    effective_config: Option<&Value>,
+    defaults: &IoTextBlobConfig,
+) -> IoTextBlobConfig {
+    let mut cfg = defaults.clone();
+    let Some(ingress) = effective_config
+        .and_then(|cfg| cfg.get("ingress"))
+        .and_then(Value::as_object)
+    else {
+        return cfg;
+    };
+    if let Some(value) = ingress
+        .get("max_attachments_per_request")
+        .and_then(Value::as_u64)
+    {
+        if let Ok(value) = usize::try_from(value) {
+            cfg.max_attachments = value;
+        }
+    }
+    if let Some(value) = ingress
+        .get("max_attachment_size_bytes")
+        .and_then(Value::as_u64)
+    {
+        cfg.max_attachment_bytes = value;
+    }
+    if let Some(value) = ingress
+        .get("max_total_attachment_bytes")
+        .and_then(Value::as_u64)
+    {
+        cfg.max_total_attachment_bytes = value;
+    }
+    if let Some(values) = ingress.get("allowed_mime_types").and_then(Value::as_array) {
+        let parsed = values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if !parsed.is_empty() {
+            cfg.allowed_mimes = parsed;
+        }
+    }
+    cfg
+}
+
+fn normalize_mime(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn map_blob_error_to_http(err: &IoBlobContractError) -> (StatusCode, &'static str, String) {
+    match err {
+        IoBlobContractError::UnsupportedMime { .. } => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            err.canonical_code(),
+            err.to_string(),
+        ),
+        IoBlobContractError::BlobTooLarge { .. }
+        | IoBlobContractError::TooManyAttachments { .. } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            err.canonical_code(),
+            err.to_string(),
+        ),
+        _ => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            err.canonical_code(),
+            err.to_string(),
+        ),
+    }
 }
 
 fn api_error(
@@ -2088,5 +2435,143 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn configured_effective(subject_mode: &str) -> Value {
+        serde_json::json!({
+            "listen": {
+                "address": "127.0.0.1",
+                "port": 8080
+            },
+            "auth": {
+                "mode": "api_key",
+                "api_keys": [
+                    {
+                        "key_id": "partner1",
+                        "token_ref": "local_file:io_api_key__partner1",
+                        "caller_identity": {
+                            "external_user_id": "caller-1",
+                            "display_name": "Caller One"
+                        }
+                    }
+                ]
+            },
+            "ingress": {
+                "subject_mode": subject_mode,
+                "accepted_content_types": ["application/json"]
+            },
+            "io": {
+                "dst_node": "resolve"
+            }
+        })
+    }
+
+    #[test]
+    fn parse_json_message_request_accepts_explicit_subject() {
+        let effective = configured_effective("explicit_subject");
+        let auth_match = AuthMatch {
+            key_id: "partner1".to_string(),
+            caller_identity: None,
+        };
+        let envelope = serde_json::json!({
+            "subject": {
+                "external_user_id": "crm:123",
+                "display_name": "Juan Perez",
+                "tenant_hint": "acme"
+            },
+            "message": {
+                "text": "hola",
+                "external_message_id": "crm-msg-1"
+            },
+            "options": {
+                "relay": {
+                    "final": true
+                },
+                "metadata": {
+                    "conversation_id": "conv-1"
+                }
+            }
+        });
+
+        let parsed =
+            parse_json_message_request(&envelope, &effective, &auth_match, false).expect("parsed");
+        assert_eq!(parsed.identity_input.channel, "api");
+        assert_eq!(parsed.identity_input.external_id, "crm:123");
+        assert_eq!(parsed.identity_input.tenant_hint.as_deref(), Some("acme"));
+        assert_eq!(parsed.io_context.conversation.id, "conv-1");
+        assert_eq!(parsed.io_context.message.id, "crm-msg-1");
+        assert!(parsed.relay_final);
+    }
+
+    #[test]
+    fn parse_json_message_request_rejects_subject_for_caller_is_subject() {
+        let effective = configured_effective("caller_is_subject");
+        let auth_match = AuthMatch {
+            key_id: "partner1".to_string(),
+            caller_identity: Some(serde_json::json!({
+                "external_user_id": "caller-1"
+            })),
+        };
+        let envelope = serde_json::json!({
+            "subject": {
+                "external_user_id": "crm:123"
+            },
+            "message": {
+                "text": "hola"
+            }
+        });
+
+        let err = parse_json_message_request(&envelope, &effective, &auth_match, false)
+            .expect_err("must reject subject");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.1, "invalid_payload");
+    }
+
+    #[test]
+    fn parse_json_message_request_uses_authenticated_caller() {
+        let effective = configured_effective("caller_is_subject");
+        let auth_match = AuthMatch {
+            key_id: "partner1".to_string(),
+            caller_identity: Some(serde_json::json!({
+                "external_user_id": "caller-1",
+                "display_name": "Caller One",
+                "tenant_hint": "tenant-a"
+            })),
+        };
+        let envelope = serde_json::json!({
+            "message": {
+                "text": "hola"
+            }
+        });
+
+        let parsed =
+            parse_json_message_request(&envelope, &effective, &auth_match, false).expect("parsed");
+        assert_eq!(parsed.identity_input.external_id, "caller-1");
+        assert_eq!(
+            parsed.identity_input.tenant_hint.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(parsed.io_context.sender.id, "caller-1");
+    }
+
+    #[test]
+    fn parse_json_message_request_allows_empty_text_when_attachments_exist() {
+        let effective = configured_effective("explicit_subject");
+        let auth_match = AuthMatch {
+            key_id: "partner1".to_string(),
+            caller_identity: None,
+        };
+        let envelope = serde_json::json!({
+            "subject": {
+                "external_user_id": "crm:123"
+            },
+            "message": {
+                "text": ""
+            }
+        });
+
+        let parsed =
+            parse_json_message_request(&envelope, &effective, &auth_match, true).expect("parsed");
+        assert_eq!(parsed.identity_input.external_id, "crm:123");
     }
 }
