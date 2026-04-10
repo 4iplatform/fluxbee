@@ -16,8 +16,8 @@ Usage:
 
 Options:
   --node-name <name@hive>      Managed node name (default: IO.api.local@motherbee)
-  --listen-address <addr>      Listen address for bootstrap config (default: 127.0.0.1)
-  --listen-port <port>         Listen port for bootstrap config (default: 18080)
+  --listen-address <addr>      Optional listen address for bootstrap config
+  --listen-port <port>         Optional listen port for bootstrap config
   --tenant-id <id>             Optional tenant_id for bootstrap config
   --dst-node <name>            Optional io.dst_node bootstrap value
   --identity-target <name>     Optional identity target bootstrap value
@@ -31,8 +31,8 @@ EOF
 }
 
 NODE_NAME="IO.api.local@motherbee"
-LISTEN_ADDRESS="127.0.0.1"
-LISTEN_PORT="18080"
+LISTEN_ADDRESS=""
+LISTEN_PORT=""
 TENANT_ID=""
 DST_NODE=""
 IDENTITY_TARGET=""
@@ -109,11 +109,14 @@ python3 - <<PY >"$tmp_cfg"
 import json
 
 cfg = {
-    "listen": {
+}
+if "${LISTEN_ADDRESS}" and "${LISTEN_PORT}":
+    cfg["listen"] = {
         "address": "${LISTEN_ADDRESS}",
         "port": int("${LISTEN_PORT}")
     }
-}
+elif "${LISTEN_ADDRESS}" or "${LISTEN_PORT}":
+    raise SystemExit("listen.address and listen.port must be provided together")
 if "${TENANT_ID}":
     cfg["tenant_id"] = "${TENANT_ID}"
 if "${DST_NODE}":

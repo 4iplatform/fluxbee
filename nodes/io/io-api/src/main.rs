@@ -1,5 +1,12 @@
 #![forbid(unsafe_code)]
 
+mod attachments;
+mod auth;
+mod config;
+mod http;
+mod schema;
+mod subject;
+
 use anyhow::Result;
 use axum::body::to_bytes;
 use axum::extract::{FromRequest, Multipart, Request, State};
@@ -8,13 +15,11 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{
-    build_node_secret_record, compute_thread_id, connect, load_node_secret_record,
-    load_node_secret_record_with_root, managed_node_config_path, save_node_secret_record,
-    save_node_secret_record_with_root, try_handle_default_node_status, NodeConfig, NodeSecretError,
-    NodeSecretRecord, NodeSecretWriteOptions, NodeUuidMode, ThreadIdInput, FLUXBEE_NODE_NAME_ENV,
+    build_node_secret_record, connect, load_node_secret_record_with_root,
+    save_node_secret_record_with_root, try_handle_default_node_status, NodeConfig,
+    NodeSecretWriteOptions, NodeUuidMode,
 };
 use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
@@ -23,8 +28,8 @@ use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
 use io_common::io_adapter_config::{
     apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
 };
-use io_common::io_api_adapter_config::{api_key_storage_key, IoApiAdapterConfigContract};
-use io_common::io_context::{ConversationRef, IoContext, MessageRef, PartyRef, ReplyTarget};
+use io_common::io_api_adapter_config::IoApiAdapterConfigContract;
+use io_common::io_context::IoContext;
 use io_common::io_control_plane::{
     build_io_config_get_response_payload, build_io_config_response_message,
     build_io_config_set_error_payload, build_io_config_set_ok_payload,
@@ -38,17 +43,12 @@ use io_common::io_control_plane_logging::{
     log_control_plane_request_rejected,
 };
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
-use io_common::io_control_plane_store::{default_state_dir, persist_io_control_plane_state};
+use io_common::io_control_plane_store::persist_io_control_plane_state;
 use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox};
 use io_common::relay::{
     AssembledTurn, InMemoryRelayStore, RelayBuffer, RelayDecision, RelayFlushHints, RelayFragment,
-    RelayPolicy,
 };
-use io_common::router_message::DEFAULT_TTL;
-use io_common::text_v1_blob::{
-    build_text_v1_inbound_payload, InboundAttachmentInput, IoBlobContractError,
-    IoBlobRuntimeConfig, IoTextBlobConfig,
-};
+use io_common::text_v1_blob::{build_text_v1_inbound_payload, IoTextBlobConfig};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,6 +56,24 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
+
+use attachments::{
+    collect_multipart_blob_attachments, effective_blob_payload_cfg, map_blob_error_to_http,
+};
+use auth::{
+    authenticate_bearer, extract_bearer_token, load_runtime_api_registry,
+    materialize_inline_api_keys, prepare_runtime_api_config, ApiAuthRegistry, ApiKeyRuntime,
+    AuthMatch,
+};
+use config::{
+    api_relay_policy, api_relay_policy_from_config, extract_runtime_dst_node, load_spawn_config,
+};
+use http::{accepted_response, api_error};
+use schema::{
+    build_configured_schema, build_unconfigured_schema, extract_accepted_content_types,
+    extract_max_request_bytes, extract_subject_mode, lifecycle_status,
+};
+use subject::{api_relay_key, parse_json_message_request};
 
 #[derive(Clone)]
 struct Config {
@@ -320,175 +338,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-impl Config {
-    fn from_env() -> Result<Self> {
-        let resolved_node_name = env(FLUXBEE_NODE_NAME_ENV).ok_or_else(|| {
-            anyhow::anyhow!("missing required env {FLUXBEE_NODE_NAME_ENV} for managed spawn")
-        })?;
-        let resolved_island_id = hive_from_node_name(&resolved_node_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "invalid {FLUXBEE_NODE_NAME_ENV}='{resolved_node_name}': expected <name>@<hive>"
-            )
-        })?;
-        let spawn_cfg = load_spawn_config(&resolved_node_name)?;
-        tracing::info!(path = %spawn_cfg.path.display(), "io-api loaded spawn config");
-        let spawn_doc = Some(&spawn_cfg.doc);
-
-        let listen_address = env("IO_API_LISTEN_ADDRESS")
-            .or_else(|| {
-                json_get_string_opt(
-                    spawn_doc,
-                    &[
-                        "config.listen.address",
-                        "listen.address",
-                        "node.listen.address",
-                    ],
-                )
-            })
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-        let listen_port = env("IO_API_LISTEN_PORT")
-            .and_then(|value| value.parse::<u16>().ok())
-            .or_else(|| {
-                json_get_u16_opt(
-                    spawn_doc,
-                    &["config.listen.port", "listen.port", "node.listen.port"],
-                )
-            })
-            .unwrap_or(8080);
-
-        Ok(Self {
-            node_name: resolved_node_name.clone(),
-            island_id: resolved_island_id.clone(),
-            node_version: env("NODE_VERSION")
-                .or_else(|| {
-                    json_get_string_opt(
-                        spawn_doc,
-                        &["_system.runtime_version", "runtime.version", "node.version"],
-                    )
-                })
-                .unwrap_or_else(|| "0.1".to_string()),
-            listen_addr: format!("{listen_address}:{listen_port}"),
-            router_socket: PathBuf::from(
-                env("ROUTER_SOCKET")
-                    .or_else(|| {
-                        json_get_string_opt(spawn_doc, &["node.router_socket", "router_socket"])
-                    })
-                    .unwrap_or_else(|| "/var/run/fluxbee/routers".to_string()),
-            ),
-            uuid_persistence_dir: PathBuf::from(
-                env("UUID_PERSISTENCE_DIR")
-                    .or_else(|| {
-                        json_get_string_opt(
-                            spawn_doc,
-                            &["node.uuid_persistence_dir", "uuid_persistence_dir"],
-                        )
-                    })
-                    .unwrap_or_else(|| "/var/lib/fluxbee/state/nodes".to_string()),
-            ),
-            config_dir: PathBuf::from(
-                env("CONFIG_DIR")
-                    .or_else(|| json_get_string_opt(spawn_doc, &["node.config_dir", "config_dir"]))
-                    .unwrap_or_else(|| "/etc/fluxbee".to_string()),
-            ),
-            state_dir: PathBuf::from(
-                env("STATE_DIR")
-                    .or_else(|| json_get_string_opt(spawn_doc, &["node.state_dir", "state_dir"]))
-                    .unwrap_or_else(|| default_state_dir().display().to_string()),
-            ),
-            spawn_config_path: spawn_cfg.path,
-            identity_target: env("IDENTITY_TARGET")
-                .or_else(|| {
-                    json_get_string_opt(
-                        spawn_doc,
-                        &[
-                            "config.identity.target",
-                            "identity.target",
-                            "identity_target",
-                        ],
-                    )
-                })
-                .unwrap_or_else(|| format!("SY.identity@{resolved_island_id}")),
-            identity_timeout_ms: env("IDENTITY_TIMEOUT_MS")
-                .and_then(|value| value.parse().ok())
-                .or_else(|| {
-                    json_get_u64_opt(
-                        spawn_doc,
-                        &[
-                            "config.identity.timeout_ms",
-                            "identity.timeout_ms",
-                            "identity_timeout_ms",
-                        ],
-                    )
-                })
-                .unwrap_or(10_000),
-            ttl: env("TTL")
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(DEFAULT_TTL),
-            dedup_ttl_ms: env("DEDUP_TTL_MS")
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(10 * 60 * 1000),
-            dedup_max_entries: env("DEDUP_MAX_ENTRIES")
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(50_000),
-            relay: ApiRelayConfig {
-                window_ms: json_get_u64_opt(
-                    spawn_doc,
-                    &[
-                        "config.io.relay.window_ms",
-                        "io.relay.window_ms",
-                        "relay.window_ms",
-                    ],
-                )
-                .unwrap_or_default(),
-                max_open_sessions: json_get_usize_opt(
-                    spawn_doc,
-                    &[
-                        "config.io.relay.max_open_sessions",
-                        "io.relay.max_open_sessions",
-                        "relay.max_open_sessions",
-                    ],
-                )
-                .unwrap_or(10_000),
-                max_fragments_per_session: json_get_usize_opt(
-                    spawn_doc,
-                    &[
-                        "config.io.relay.max_fragments_per_session",
-                        "io.relay.max_fragments_per_session",
-                        "relay.max_fragments_per_session",
-                    ],
-                )
-                .unwrap_or(8),
-                max_bytes_per_session: json_get_usize_opt(
-                    spawn_doc,
-                    &[
-                        "config.io.relay.max_bytes_per_session",
-                        "io.relay.max_bytes_per_session",
-                        "relay.max_bytes_per_session",
-                    ],
-                )
-                .unwrap_or(256 * 1024),
-            },
-            blob_runtime: IoBlobRuntimeConfig {
-                blob_root: PathBuf::from(
-                    env("BLOB_ROOT")
-                        .or_else(|| json_get_string_opt(spawn_doc, &["blob.path", "io.blob.path"]))
-                        .unwrap_or_else(|| "/var/lib/fluxbee/blob".to_string()),
-                ),
-                max_blob_bytes: env("BLOB_MAX_BYTES")
-                    .and_then(|value| value.parse().ok())
-                    .or_else(|| {
-                        json_get_u64_opt(
-                            spawn_doc,
-                            &["blob.max_blob_bytes", "io.blob.max_blob_bytes"],
-                        )
-                    }),
-                text_v1: IoTextBlobConfig::default(),
-                resolve_retry: fluxbee_sdk::blob::ResolveRetryConfig::default(),
-            },
-        })
-    }
-}
-
 async fn run_http_server(listener: TcpListener, state: Arc<HttpState>) -> Result<()> {
     let app = Router::new()
         .route("/schema", get(get_schema))
@@ -590,27 +439,26 @@ async fn get_schema(State(state): State<Arc<HttpState>>) -> Response {
             key_count,
         )
     } else {
-        serde_json::json!({
-            "status": lifecycle_status(&snapshot.current_state),
-            "node_name": state.node_name,
-            "runtime": "IO.api",
-            "contract_version": 1,
-            "effective_schema": Value::Null,
-            "required_configuration": state.adapter_contract.required_fields(),
-            "last_error": snapshot.last_error,
-        })
+        build_unconfigured_schema(&state.node_name, &snapshot, state.adapter_contract.as_ref())
     };
 
     (StatusCode::OK, Json(body)).into_response()
 }
 
 async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) -> Response {
+    let request_path = request.uri().path().to_string();
     let headers = request.headers().clone();
 
     let state_snapshot = state.control_plane.read().await.clone();
     if state_snapshot.current_state != IoNodeLifecycleState::Configured
         || state_snapshot.effective_config.is_none()
     {
+        tracing::warn!(
+            node_name = %state.node_name,
+            path = %request_path,
+            lifecycle_state = lifecycle_status(&state_snapshot.current_state),
+            "io-api request rejected: node not configured"
+        );
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "node_not_configured",
@@ -625,21 +473,31 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
     let bearer = match extract_bearer_token(&headers) {
         Some(value) => value,
         None => {
+            tracing::warn!(
+                node_name = %state.node_name,
+                path = %request_path,
+                "io-api request rejected: missing bearer token"
+            );
             return api_error(
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "Missing bearer token",
-            )
+            );
         }
     };
     let auth_match = match authenticate_bearer(&state.auth_registry, bearer.as_str()).await {
         Some(value) => value,
         None => {
+            tracing::warn!(
+                node_name = %state.node_name,
+                path = %request_path,
+                "io-api request rejected: invalid bearer token"
+            );
             return api_error(
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "Invalid bearer token",
-            )
+            );
         }
     };
 
@@ -649,8 +507,22 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         .unwrap_or("")
         .trim()
         .to_string();
+    tracing::debug!(
+        node_name = %state.node_name,
+        path = %request_path,
+        key_id = %auth_match.key_id,
+        content_type = %content_type,
+        "io-api request authenticated"
+    );
     let accepted_content_types = extract_accepted_content_types(Some(effective));
     if !content_type_matches_any(content_type.as_str(), &accepted_content_types) {
+        tracing::debug!(
+            node_name = %state.node_name,
+            path = %request_path,
+            content_type = %content_type,
+            accepted = ?accepted_content_types,
+            "io-api request rejected: unsupported content type"
+        );
         return api_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "unsupported_media_type",
@@ -661,6 +533,12 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         let mut multipart = match Multipart::from_request(request, &()).await {
             Ok(value) => value,
             Err(err) => {
+                tracing::debug!(
+                    node_name = %state.node_name,
+                    path = %request_path,
+                    error = %err,
+                    "io-api request rejected: invalid multipart envelope"
+                );
                 return api_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_multipart",
@@ -679,6 +557,13 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
             Ok(value) => value,
             Err((status, code, message)) => return api_error(status, code, message),
         };
+        tracing::debug!(
+            node_name = %state.node_name,
+            path = %request_path,
+            key_id = %auth_match.key_id,
+            attachment_count = attachments.len(),
+            "io-api multipart payload accepted"
+        );
         let parsed = match parse_json_message_request(
             &metadata,
             effective,
@@ -785,6 +670,12 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
     let envelope: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(err) => {
+            tracing::debug!(
+                node_name = %state.node_name,
+                path = %request_path,
+                error = %err,
+                "io-api request rejected: invalid json"
+            );
             return api_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_json",
@@ -797,6 +688,14 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         Ok(value) => value,
         Err((status, code, message)) => return api_error(status, code, message),
     };
+    tracing::debug!(
+        node_name = %state.node_name,
+        path = %request_path,
+        key_id = %auth_match.key_id,
+        subject_mode = extract_subject_mode(Some(effective)).unwrap_or_else(|| "unknown".to_string()),
+        relay_final = parsed.relay_final,
+        "io-api json payload accepted"
+    );
 
     let relay_fragment =
         build_api_relay_fragment(&state.node_name, &parsed, envelope.clone(), &auth_match);
@@ -1221,355 +1120,10 @@ fn http_state_ref_for_runtime_updates(
     }
 }
 
-fn lifecycle_status(state: &IoNodeLifecycleState) -> &'static str {
-    match state {
-        IoNodeLifecycleState::Unconfigured => "unconfigured",
-        IoNodeLifecycleState::Configured => "configured",
-        IoNodeLifecycleState::FailedConfig => "failed_config",
-    }
-}
-
-fn build_configured_schema(
-    node_name: &str,
-    state: &IoControlPlaneState,
-    effective: &Value,
-    adapter_contract: &dyn IoAdapterConfigContract,
-    key_count: usize,
-) -> Value {
-    let subject_mode =
-        extract_subject_mode(Some(effective)).unwrap_or_else(|| "unknown".to_string());
-    let accepted_content_types = extract_accepted_content_types(Some(effective));
-    let subject = if subject_mode == "explicit_subject" {
-        serde_json::json!({
-            "required": true,
-            "allowed": true,
-            "lookup_key_field": "external_user_id",
-            "optional_identity_candidates": ["display_name", "email", "tenant_hint"]
-        })
-    } else {
-        serde_json::json!({
-            "required": false,
-            "allowed": false,
-            "resolution": "derived_from_authenticated_caller"
-        })
-    };
-    let required_fields = if subject_mode == "explicit_subject" {
-        serde_json::json!({
-            "json": ["subject", "message"],
-            "multipart": ["metadata"]
-        })
-    } else {
-        serde_json::json!({
-            "json": ["message"],
-            "multipart": ["metadata"]
-        })
-    };
-    serde_json::json!({
-        "status": lifecycle_status(&state.current_state),
-        "node_name": node_name,
-        "runtime": "IO.api",
-        "contract_version": 1,
-        "config_version": state.config_version,
-        "auth": {
-            "mode": effective.get("auth").and_then(|auth| auth.get("mode")).and_then(Value::as_str).unwrap_or("api_key"),
-            "transport": "Authorization: Bearer <token>",
-            "active_key_count": key_count
-        },
-        "ingress": {
-            "subject_mode": subject_mode,
-            "accepted_content_types": accepted_content_types
-        },
-        "required_fields": required_fields,
-        "subject": subject,
-        "attachments": {
-            "supported": accepted_content_types.iter().any(|value| value == "multipart/form-data"),
-            "mode": "multipart"
-        },
-        "relay": {
-            "config_path": "config.io.relay.*",
-            "effective": effective.get("io").and_then(|io| io.get("relay")).cloned().unwrap_or(Value::Null)
-        },
-        "secrets": build_io_adapter_contract_payload(adapter_contract, Some(effective))
-            .get("secrets")
-            .cloned()
-            .unwrap_or(Value::Array(Vec::new())),
-        "last_error": state.last_error.clone(),
-    })
-}
-
-fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
-    let raw = headers.get(AUTHORIZATION)?.to_str().ok()?.trim();
-    let token = raw
-        .strip_prefix("Bearer ")
-        .or_else(|| raw.strip_prefix("bearer "))?;
-    let trimmed = token.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-async fn authenticate_bearer(
-    registry: &Arc<RwLock<ApiAuthRegistry>>,
-    token: &str,
-) -> Option<AuthMatch> {
-    let registry = registry.read().await;
-    registry.keys.iter().find_map(|entry| {
-        (entry.token == token).then(|| AuthMatch {
-            key_id: entry.key_id.clone(),
-            caller_identity: entry.caller_identity.clone(),
-        })
-    })
-}
-
 fn content_type_matches_any(content_type: &str, accepted: &[String]) -> bool {
     accepted
         .iter()
         .any(|candidate| content_type.starts_with(candidate))
-}
-
-fn extract_accepted_content_types(effective_config: Option<&Value>) -> Vec<String> {
-    effective_config
-        .and_then(|cfg| cfg.get("ingress"))
-        .and_then(|ingress| ingress.get("accepted_content_types"))
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .filter(|values| !values.is_empty())
-        .unwrap_or_else(|| vec!["application/json".to_string()])
-}
-
-fn extract_max_request_bytes(effective_config: Option<&Value>) -> usize {
-    effective_config
-        .and_then(|cfg| cfg.get("ingress"))
-        .and_then(|ingress| ingress.get("max_request_bytes"))
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(256 * 1024)
-}
-
-fn parse_json_message_request(
-    envelope: &Value,
-    effective: &Value,
-    auth_match: &AuthMatch,
-    allow_empty_text_if_attachments: bool,
-) -> std::result::Result<ParsedHttpMessage, (StatusCode, &'static str, String)> {
-    let subject_mode = extract_subject_mode(Some(effective)).unwrap_or_default();
-    let message = envelope
-        .get("message")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_payload",
-                "Field 'message' is required".to_string(),
-            )
-        })?;
-    let text = message
-        .get("text")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
-    if text.is_empty() && !allow_empty_text_if_attachments {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_payload",
-            "Field 'message.text' is required in JSON ingress until attachments are implemented"
-                .to_string(),
-        ));
-    }
-
-    let subject = envelope.get("subject");
-    let caller_identity = auth_match.caller_identity.as_ref();
-    let (external_user_id, display_name, email, tenant_hint) = if subject_mode == "explicit_subject"
-    {
-        let subject_obj = subject.and_then(Value::as_object).ok_or_else(|| {
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_payload",
-                "Field 'subject' is required for subject_mode=explicit_subject".to_string(),
-            )
-        })?;
-        let external_user_id = subject_obj
-            .get("external_user_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "invalid_payload",
-                    "Field 'subject.external_user_id' is required".to_string(),
-                )
-            })?
-            .to_string();
-        (
-            external_user_id,
-            subject_obj.get("display_name").cloned(),
-            subject_obj.get("email").cloned(),
-            subject_obj.get("tenant_hint").cloned(),
-        )
-    } else {
-        if subject.is_some() {
-            return Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_payload",
-                "Field 'subject' is not allowed for subject_mode=caller_is_subject".to_string(),
-            ));
-        }
-        let caller = caller_identity.and_then(Value::as_object).ok_or_else(|| {
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_payload",
-                "Authenticated caller does not define caller_identity".to_string(),
-            )
-        })?;
-        let external_user_id = caller
-            .get("external_user_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "invalid_payload",
-                    "Authenticated caller is missing external_user_id".to_string(),
-                )
-            })?
-            .to_string();
-        (
-            external_user_id,
-            caller.get("display_name").cloned(),
-            caller.get("email").cloned(),
-            caller.get("tenant_hint").cloned(),
-        )
-    };
-
-    let request_id = format!("req_{}", Uuid::new_v4().simple());
-    let external_message_id = message
-        .get("external_message_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| request_id.clone());
-    let timestamp = message
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    let conversation_seed = envelope
-        .get("options")
-        .and_then(|options| options.get("metadata"))
-        .and_then(|metadata| metadata.get("conversation_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| external_user_id.clone());
-    let thread_id = compute_thread_id(ThreadIdInput::PersistentChannel {
-        channel_type: "api",
-        entrypoint_id: Some(
-            effective
-                .get("listen")
-                .and_then(|listen| listen.get("address"))
-                .and_then(Value::as_str)
-                .unwrap_or("api"),
-        ),
-        conversation_id: conversation_seed.as_str(),
-    })
-    .map_err(|err| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_payload",
-            format!("Failed to build thread_id: {err}"),
-        )
-    })?;
-
-    let mut attributes = serde_json::Map::new();
-    attributes.insert(
-        "auth_key_id".to_string(),
-        Value::String(auth_match.key_id.clone()),
-    );
-    if let Some(value) = display_name.clone() {
-        attributes.insert("display_name".to_string(), value);
-    }
-    if let Some(value) = email.clone() {
-        attributes.insert("email".to_string(), value);
-    }
-    if let Some(metadata) = envelope
-        .get("options")
-        .and_then(|options| options.get("metadata"))
-        .cloned()
-    {
-        attributes.insert("request_metadata".to_string(), metadata);
-    }
-
-    let text_payload = TextV1Payload::new(text, vec![]).to_value().map_err(|err| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_payload",
-            format!("Unable to build text/v1 payload: {err}"),
-        )
-    })?;
-
-    Ok(ParsedHttpMessage {
-        request_id,
-        identity_input: ResolveOrCreateInput {
-            channel: "api".to_string(),
-            external_id: external_user_id.clone(),
-            tenant_hint: tenant_hint
-                .as_ref()
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            attributes: Value::Object(attributes),
-        },
-        io_context: IoContext {
-            channel: "api".to_string(),
-            entrypoint: PartyRef {
-                kind: "io_api_instance".to_string(),
-                id: effective
-                    .get("listen")
-                    .and_then(|listen| listen.get("address"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("api")
-                    .to_string(),
-            },
-            sender: PartyRef {
-                kind: "api_subject".to_string(),
-                id: external_user_id,
-            },
-            conversation: ConversationRef {
-                kind: "api_conversation".to_string(),
-                id: conversation_seed,
-                thread_id: Some(thread_id),
-            },
-            message: MessageRef {
-                id: external_message_id,
-                timestamp,
-            },
-            reply_target: ReplyTarget {
-                kind: "io_api_noop".to_string(),
-                address: effective
-                    .get("listen")
-                    .and_then(|listen| listen.get("address"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("api")
-                    .to_string(),
-                params: serde_json::json!({}),
-            },
-        },
-        payload: text_payload,
-        relay_final: envelope
-            .get("options")
-            .and_then(|options| options.get("relay"))
-            .and_then(|relay| relay.get("final"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    })
 }
 
 fn build_api_relay_fragment(
@@ -1671,582 +1225,6 @@ async fn send_inbound_outcome(
     }
 }
 
-fn accepted_response(
-    node_name: &str,
-    request_id: String,
-    trace_id: Option<String>,
-    relay_status: &str,
-) -> Response {
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "status": "accepted",
-            "request_id": request_id,
-            "trace_id": trace_id,
-            "relay_status": relay_status,
-            "node_name": node_name,
-        })),
-    )
-        .into_response()
-}
-
-async fn collect_multipart_blob_attachments(
-    multipart: &mut Multipart,
-    blob_toolkit: &fluxbee_sdk::blob::BlobToolkit,
-    cfg: &IoTextBlobConfig,
-) -> std::result::Result<(Value, Vec<InboundAttachmentInput>), (StatusCode, &'static str, String)> {
-    let mut metadata: Option<Value> = None;
-    let mut attachments = Vec::new();
-    let allowed_mimes = cfg
-        .allowed_mimes
-        .iter()
-        .map(|mime| normalize_mime(mime))
-        .collect::<std::collections::HashSet<_>>();
-    let mut total_size: u64 = 0;
-
-    while let Some(field) = multipart.next_field().await.map_err(|err| {
-        (
-            StatusCode::BAD_REQUEST,
-            "invalid_multipart",
-            format!("Invalid multipart field: {err}"),
-        )
-    })? {
-        let name = field.name().unwrap_or("").to_string();
-        if name == "metadata" {
-            let bytes = field.bytes().await.map_err(|err| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "invalid_multipart",
-                    format!("Cannot read metadata part: {err}"),
-                )
-            })?;
-            let value = serde_json::from_slice::<Value>(&bytes).map_err(|err| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "invalid_json",
-                    format!("metadata part is not valid JSON: {err}"),
-                )
-            })?;
-            metadata = Some(value);
-            continue;
-        }
-
-        if attachments.len() >= cfg.max_attachments {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "too_many_attachments",
-                format!("Too many attachments: max {}", cfg.max_attachments),
-            ));
-        }
-
-        let filename = field.file_name().unwrap_or("attachment.bin").to_string();
-        let mime = field
-            .content_type()
-            .unwrap_or("application/octet-stream")
-            .to_string();
-        if !allowed_mimes.contains(&normalize_mime(&mime)) {
-            return Err((
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "unsupported_attachment_mime",
-                format!("Unsupported attachment mime: {mime}"),
-            ));
-        }
-
-        let bytes = field.bytes().await.map_err(|err| {
-            (
-                StatusCode::BAD_REQUEST,
-                "invalid_multipart",
-                format!("Cannot read attachment bytes: {err}"),
-            )
-        })?;
-        let size = bytes.len() as u64;
-        if size > cfg.max_attachment_bytes {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "attachment_too_large",
-                format!(
-                    "Attachment exceeds max size of {}",
-                    cfg.max_attachment_bytes
-                ),
-            ));
-        }
-        if total_size.saturating_add(size) > cfg.max_total_attachment_bytes {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "attachments_too_large",
-                format!(
-                    "Total attachment bytes exceed max {}",
-                    cfg.max_total_attachment_bytes
-                ),
-            ));
-        }
-
-        let blob_ref = blob_toolkit
-            .put_bytes(&bytes, &filename, &mime)
-            .map_err(|err| {
-                let code = match err {
-                    fluxbee_sdk::blob::BlobError::TooLarge { .. } => "attachment_too_large",
-                    _ => "blob_put_error",
-                };
-                (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    code,
-                    format!("Failed to materialize attachment: {err}"),
-                )
-            })?;
-        blob_toolkit.promote(&blob_ref).map_err(|err| {
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "blob_promote_error",
-                format!("Failed to promote attachment blob: {err}"),
-            )
-        })?;
-
-        total_size = total_size.saturating_add(size);
-        attachments.push(InboundAttachmentInput { blob_ref });
-    }
-
-    let metadata = metadata.ok_or_else(|| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_payload",
-            "multipart/form-data requires a metadata JSON part".to_string(),
-        )
-    })?;
-    Ok((metadata, attachments))
-}
-
-fn effective_blob_payload_cfg(
-    effective_config: Option<&Value>,
-    defaults: &IoTextBlobConfig,
-) -> IoTextBlobConfig {
-    let mut cfg = defaults.clone();
-    let Some(ingress) = effective_config
-        .and_then(|cfg| cfg.get("ingress"))
-        .and_then(Value::as_object)
-    else {
-        return cfg;
-    };
-    if let Some(value) = ingress
-        .get("max_attachments_per_request")
-        .and_then(Value::as_u64)
-    {
-        if let Ok(value) = usize::try_from(value) {
-            cfg.max_attachments = value;
-        }
-    }
-    if let Some(value) = ingress
-        .get("max_attachment_size_bytes")
-        .and_then(Value::as_u64)
-    {
-        cfg.max_attachment_bytes = value;
-    }
-    if let Some(value) = ingress
-        .get("max_total_attachment_bytes")
-        .and_then(Value::as_u64)
-    {
-        cfg.max_total_attachment_bytes = value;
-    }
-    if let Some(values) = ingress.get("allowed_mime_types").and_then(Value::as_array) {
-        let parsed = values
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        if !parsed.is_empty() {
-            cfg.allowed_mimes = parsed;
-        }
-    }
-    cfg
-}
-
-fn normalize_mime(value: &str) -> String {
-    value
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase()
-}
-
-fn map_blob_error_to_http(err: &IoBlobContractError) -> (StatusCode, &'static str, String) {
-    match err {
-        IoBlobContractError::UnsupportedMime { .. } => (
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            err.canonical_code(),
-            err.to_string(),
-        ),
-        IoBlobContractError::BlobTooLarge { .. }
-        | IoBlobContractError::TooManyAttachments { .. } => (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            err.canonical_code(),
-            err.to_string(),
-        ),
-        _ => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            err.canonical_code(),
-            err.to_string(),
-        ),
-    }
-}
-
-fn api_error(
-    status: StatusCode,
-    error_code: &'static str,
-    error_message: impl Into<String>,
-) -> Response {
-    (
-        status,
-        Json(serde_json::json!({
-            "status": "error",
-            "error_code": error_code,
-            "error_message": error_message.into(),
-        })),
-    )
-        .into_response()
-}
-
-fn prepare_runtime_api_config(
-    node_name: &str,
-    effective: &Value,
-    secret_root: Option<&Path>,
-) -> Result<(Value, ApiAuthRegistry)> {
-    let sanitized = materialize_inline_api_keys(node_name, effective, secret_root)?;
-    let registry = load_runtime_api_registry(node_name, &sanitized, secret_root)?;
-    Ok((sanitized, registry))
-}
-
-fn materialize_inline_api_keys(
-    node_name: &str,
-    effective: &Value,
-    secret_root: Option<&Path>,
-) -> Result<Value> {
-    let mut sanitized = effective.clone();
-    let api_keys = sanitized
-        .get_mut("auth")
-        .and_then(Value::as_object_mut)
-        .and_then(|auth| auth.get_mut("api_keys"))
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| anyhow::anyhow!("missing config.auth.api_keys"))?;
-
-    let mut secret_record = load_or_default_secret_record(node_name, secret_root)?;
-    let mut secrets_changed = false;
-
-    for entry in api_keys {
-        let Some(entry_obj) = entry.as_object_mut() else {
-            return Err(anyhow::anyhow!(
-                "config.auth.api_keys[] entries must be objects"
-            ));
-        };
-        let key_id = entry_obj
-            .get("key_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("config.auth.api_keys[].key_id is required"))?;
-        let inline_token = entry_obj
-            .get("token")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
-        let Some(token) = inline_token else {
-            continue;
-        };
-
-        let storage_key = api_key_storage_key(key_id);
-        secret_record
-            .secrets
-            .insert(storage_key.clone(), Value::String(token));
-        entry_obj.remove("token");
-        entry_obj.insert(
-            "token_ref".to_string(),
-            Value::String(format!("local_file:{storage_key}")),
-        );
-        secrets_changed = true;
-    }
-
-    if secrets_changed {
-        let record =
-            build_node_secret_record(secret_record.secrets, &NodeSecretWriteOptions::default());
-        save_secret_record(node_name, secret_root, &record)?;
-    }
-
-    Ok(sanitized)
-}
-
-fn load_runtime_api_registry(
-    node_name: &str,
-    effective: &Value,
-    secret_root: Option<&Path>,
-) -> Result<ApiAuthRegistry> {
-    let api_keys = effective
-        .get("auth")
-        .and_then(|auth| auth.get("api_keys"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("missing config.auth.api_keys"))?;
-    let mut registry = ApiAuthRegistry::default();
-    let mut secret_record: Option<NodeSecretRecord> = None;
-
-    for entry in api_keys {
-        let Some(entry_obj) = entry.as_object() else {
-            return Err(anyhow::anyhow!(
-                "config.auth.api_keys[] entries must be objects"
-            ));
-        };
-        let key_id = entry_obj
-            .get("key_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("config.auth.api_keys[].key_id is required"))?;
-        let token = resolve_api_key_token(node_name, entry_obj, &mut secret_record, secret_root)?;
-        registry.keys.push(ApiKeyRuntime {
-            key_id: key_id.to_string(),
-            token,
-            caller_identity: entry_obj.get("caller_identity").cloned(),
-        });
-    }
-
-    Ok(registry)
-}
-
-fn resolve_api_key_token(
-    node_name: &str,
-    entry: &Map<String, Value>,
-    secret_record: &mut Option<NodeSecretRecord>,
-    secret_root: Option<&Path>,
-) -> Result<String> {
-    if let Some(token) = entry
-        .get("token")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(token.to_string());
-    }
-
-    let reference = entry
-        .get("token_ref")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("config.auth.api_keys[] requires token or token_ref"))?;
-
-    if let Some(var) = reference.strip_prefix("env:") {
-        return env(var)
-            .ok_or_else(|| anyhow::anyhow!("unresolved env secret reference '{reference}'"));
-    }
-
-    if let Some(storage_key) = reference.strip_prefix("local_file:") {
-        if secret_record.is_none() {
-            *secret_record = Some(load_or_default_secret_record(node_name, secret_root)?);
-        }
-        return secret_record
-            .as_ref()
-            .and_then(|record| record.secrets.get(storage_key))
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-            .ok_or_else(|| anyhow::anyhow!("missing local secret '{storage_key}'"));
-    }
-
-    Err(anyhow::anyhow!(
-        "unsupported secret reference '{reference}' for config.auth.api_keys[].token_ref"
-    ))
-}
-
-fn api_relay_key(node_name: &str, conversation_id: &str, external_user_id: &str) -> String {
-    format!("api:{node_name}:{conversation_id}:{external_user_id}")
-}
-
-fn api_relay_policy(config: &Config, effective_config: Option<&Value>) -> Result<RelayPolicy> {
-    let relay_cfg = extract_runtime_relay_config(effective_config, &config.relay)?;
-    api_relay_policy_from_config(&relay_cfg)
-}
-
-fn api_relay_policy_from_config(relay_cfg: &ApiRelayConfig) -> Result<RelayPolicy> {
-    let mut policy = RelayPolicy {
-        enabled: relay_cfg.window_ms > 0,
-        relay_window_ms: relay_cfg.window_ms,
-        max_open_sessions: relay_cfg.max_open_sessions,
-        max_fragments_per_session: relay_cfg.max_fragments_per_session,
-        max_bytes_per_session: relay_cfg.max_bytes_per_session,
-        ..RelayPolicy::default()
-    };
-    if policy.relay_window_ms == 0 {
-        policy.enabled = false;
-        policy.stale_session_ttl_ms = 0;
-    } else {
-        policy.stale_session_ttl_ms = policy
-            .relay_window_ms
-            .saturating_mul(4)
-            .max(policy.relay_window_ms);
-    }
-    policy.validate().map_err(|err| anyhow::anyhow!(err))?;
-    Ok(policy)
-}
-
-fn extract_runtime_relay_config(
-    effective_config: Option<&Value>,
-    defaults: &ApiRelayConfig,
-) -> Result<ApiRelayConfig> {
-    let Some(relay) = effective_config
-        .and_then(|cfg| cfg.get("io"))
-        .and_then(|io| io.get("relay"))
-        .and_then(Value::as_object)
-    else {
-        return Ok(defaults.clone());
-    };
-    Ok(ApiRelayConfig {
-        window_ms: relay
-            .get("window_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(defaults.window_ms),
-        max_open_sessions: relay
-            .get("max_open_sessions")
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(defaults.max_open_sessions),
-        max_fragments_per_session: relay
-            .get("max_fragments_per_session")
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(defaults.max_fragments_per_session),
-        max_bytes_per_session: relay
-            .get("max_bytes_per_session")
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(defaults.max_bytes_per_session),
-    })
-}
-
-fn extract_runtime_dst_node(effective_config: Option<&Value>) -> Option<String> {
-    effective_config
-        .and_then(|cfg| cfg.get("io"))
-        .and_then(|io| io.get("dst_node"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-fn load_or_default_secret_record(
-    node_name: &str,
-    secret_root: Option<&Path>,
-) -> Result<NodeSecretRecord> {
-    match load_secret_record(node_name, secret_root) {
-        Ok(record) => Ok(record),
-        Err(NodeSecretError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
-            Ok(NodeSecretRecord::default())
-        }
-        Err(err) => Err(err.into()),
-    }
-}
-
-fn load_secret_record(
-    node_name: &str,
-    secret_root: Option<&Path>,
-) -> Result<NodeSecretRecord, NodeSecretError> {
-    match secret_root {
-        Some(root) => load_node_secret_record_with_root(node_name, root),
-        None => load_node_secret_record(node_name),
-    }
-}
-
-fn save_secret_record(
-    node_name: &str,
-    secret_root: Option<&Path>,
-    record: &NodeSecretRecord,
-) -> Result<()> {
-    match secret_root {
-        Some(root) => {
-            save_node_secret_record_with_root(node_name, root, record)?;
-        }
-        None => {
-            save_node_secret_record(node_name, record)?;
-        }
-    }
-    Ok(())
-}
-
-fn load_spawn_config(node_name: &str) -> Result<SpawnConfig> {
-    let path = managed_node_config_path(node_name)
-        .map_err(|err| anyhow::anyhow!("failed to resolve managed config path: {err}"))?;
-    let raw = std::fs::read_to_string(&path).map_err(|err| {
-        anyhow::anyhow!(
-            "failed to read managed config file {}: {err}",
-            path.display()
-        )
-    })?;
-    let doc = serde_json::from_str::<Value>(&raw).map_err(|err| {
-        anyhow::anyhow!(
-            "failed to parse managed config JSON {}: {err}",
-            path.display()
-        )
-    })?;
-    Ok(SpawnConfig { path, doc })
-}
-
-fn hive_from_node_name(node_name: &str) -> Option<String> {
-    node_name
-        .split_once('@')
-        .map(|(_, hive)| hive.trim())
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-fn env(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|value| !value.is_empty())
-}
-
-fn json_get_string_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<String> {
-    let doc = doc?;
-    for path in dotted_paths {
-        if let Some(value) = json_get_path(doc, path).and_then(Value::as_str) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn json_get_u64_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<u64> {
-    let doc = doc?;
-    for path in dotted_paths {
-        if let Some(value) = json_get_path(doc, path) {
-            if let Some(number) = value.as_u64() {
-                return Some(number);
-            }
-            if let Some(text) = value.as_str() {
-                if let Ok(number) = text.parse::<u64>() {
-                    return Some(number);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn json_get_u16_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<u16> {
-    json_get_u64_opt(doc, dotted_paths).and_then(|value| u16::try_from(value).ok())
-}
-
-fn json_get_usize_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<usize> {
-    json_get_u64_opt(doc, dotted_paths).and_then(|value| usize::try_from(value).ok())
-}
-
-fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
-    let mut current = root;
-    for segment in dotted_path.split('.') {
-        current = current.get(segment)?;
-    }
-    Some(current)
-}
-
 fn is_control_plane_msg_type(msg_type: &str) -> bool {
     msg_type.eq_ignore_ascii_case(SYSTEM_KIND) || msg_type.eq_ignore_ascii_case("admin")
 }
@@ -2265,16 +1243,6 @@ fn value_at_path<'a>(root: Option<&'a Value>, path: &[&str]) -> Option<&'a Value
         current = current.get(*segment)?;
     }
     Some(current)
-}
-
-fn extract_subject_mode(effective_config: Option<&Value>) -> Option<String> {
-    effective_config
-        .and_then(|cfg| cfg.get("ingress"))
-        .and_then(|ingress| ingress.get("subject_mode"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
 }
 
 fn redact_state(
@@ -2465,6 +1433,123 @@ mod tests {
                 "dst_node": "resolve"
             }
         })
+    }
+
+    #[test]
+    fn extract_bearer_token_parses_authorization_header() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer secret-token"),
+        );
+        assert_eq!(
+            extract_bearer_token(&headers).as_deref(),
+            Some("secret-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticate_bearer_matches_registry_token() {
+        let registry = Arc::new(RwLock::new(ApiAuthRegistry {
+            keys: vec![ApiKeyRuntime {
+                key_id: "partner1".to_string(),
+                token: "secret-token".to_string(),
+                caller_identity: Some(serde_json::json!({
+                    "external_user_id": "caller-1"
+                })),
+            }],
+        }));
+
+        let auth = authenticate_bearer(&registry, "secret-token")
+            .await
+            .expect("auth match");
+        assert_eq!(auth.key_id, "partner1");
+        assert_eq!(
+            auth.caller_identity
+                .as_ref()
+                .and_then(|value| value.get("external_user_id"))
+                .and_then(Value::as_str),
+            Some("caller-1")
+        );
+    }
+
+    #[test]
+    fn build_unconfigured_schema_reports_required_configuration() {
+        let state = IoControlPlaneState {
+            current_state: IoNodeLifecycleState::FailedConfig,
+            last_error: Some(IoControlPlaneErrorInfo {
+                code: "invalid_config".to_string(),
+                message: "missing auth".to_string(),
+            }),
+            ..IoControlPlaneState::default()
+        };
+        let schema =
+            build_unconfigured_schema("IO.api.demo@motherbee", &state, &IoApiAdapterConfigContract);
+
+        assert_eq!(
+            schema.get("status").and_then(Value::as_str),
+            Some("failed_config")
+        );
+        assert_eq!(
+            schema.get("runtime").and_then(Value::as_str),
+            Some("IO.api")
+        );
+        assert!(schema
+            .get("required_configuration")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty()));
+        assert_eq!(
+            schema
+                .get("last_error")
+                .and_then(|value| value.get("code"))
+                .and_then(Value::as_str),
+            Some("invalid_config")
+        );
+    }
+
+    #[test]
+    fn build_configured_schema_reflects_effective_contract() {
+        let effective = configured_effective("explicit_subject");
+        let state = IoControlPlaneState {
+            current_state: IoNodeLifecycleState::Configured,
+            effective_config: Some(effective.clone()),
+            config_version: 7,
+            ..IoControlPlaneState::default()
+        };
+
+        let schema = build_configured_schema(
+            "IO.api.demo@motherbee",
+            &state,
+            &effective,
+            &IoApiAdapterConfigContract,
+            1,
+        );
+
+        assert_eq!(
+            schema.get("status").and_then(Value::as_str),
+            Some("configured")
+        );
+        assert_eq!(
+            schema
+                .get("ingress")
+                .and_then(|value| value.get("subject_mode"))
+                .and_then(Value::as_str),
+            Some("explicit_subject")
+        );
+        assert_eq!(
+            schema
+                .get("auth")
+                .and_then(|value| value.get("active_key_count"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            schema
+                .get("relay")
+                .and_then(|value| value.get("config_path"))
+                .and_then(Value::as_str),
+            Some("config.io.relay.*")
+        );
     }
 
     #[test]

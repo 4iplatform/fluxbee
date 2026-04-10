@@ -22,8 +22,8 @@ Options:
                                SYSTEM_UPDATE scope (default: targeted)
   --tenant-id <id>             Tenant ID for spawn identity registration (required in some hives)
   --config-json <file>         JSON file with spawn config object
-  --listen-address <addr>      Convenience: set listen.address in spawn config (default: 127.0.0.1)
-  --listen-port <port>         Convenience: set listen.port in spawn config (default: 18080)
+  --listen-address <addr>      Convenience: set listen.address in spawn config
+  --listen-port <port>         Convenience: set listen.port in spawn config
   --dst-node <name>            Convenience: set io.dst_node in spawn config
   --blob-root <path>           Convenience: set blob.path in spawn config
   --identity-target <name>     Convenience: add identity_target to spawn config
@@ -46,7 +46,7 @@ Options:
 Notes:
   - The script parses manifest_version/manifest_hash from publish output automatically.
   - On update status=sync_pending, it retries according to --update-retries.
-  - Default spawn config is intentionally minimal and leaves business config to CONFIG_SET.
+  - Default spawn config may be empty and leaves business config to CONFIG_SET.
 EOF
 }
 
@@ -66,8 +66,8 @@ UPDATE_SCOPE="targeted"
 TENANT_ID=""
 NODE_NAME=""
 CONFIG_JSON=""
-LISTEN_ADDRESS="127.0.0.1"
-LISTEN_PORT="18080"
+LISTEN_ADDRESS=""
+LISTEN_PORT=""
 DST_NODE=""
 BLOB_ROOT=""
 IDENTITY_TARGET=""
@@ -196,13 +196,6 @@ ident = cfg.get("identity")
 if isinstance(ident, dict):
     ident.pop("fallback_target", None)
 
-listen = cfg.get("listen")
-if not isinstance(listen, dict) or not listen.get("address") or not listen.get("port"):
-    print(
-        "Warning: sanitized config has no complete listen.address/listen.port; spawn may succeed but runtime will fail bootstrap",
-        file=sys.stderr,
-    )
-
 print(json.dumps(cfg, separators=(",", ":")))
 PY
 }
@@ -226,11 +219,15 @@ build_spawn_config_json() {
 import json
 
 cfg = {
-    "listen": {
+}
+
+if "${LISTEN_ADDRESS}" and "${LISTEN_PORT}":
+    cfg["listen"] = {
         "address": "${LISTEN_ADDRESS}",
         "port": int("${LISTEN_PORT}")
     }
-}
+elif "${LISTEN_ADDRESS}" or "${LISTEN_PORT}":
+    raise SystemExit("listen.address and listen.port must be provided together")
 
 if "${DST_NODE}":
     cfg.setdefault("io", {})["dst_node"] = "${DST_NODE}"
