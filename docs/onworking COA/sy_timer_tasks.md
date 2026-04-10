@@ -140,10 +140,10 @@ Recommended order:
 
 - [x] SYT-S1-T1. Create a formal top-level `fluxbee-go-sdk/` module in the repo.
 - [x] SYT-S1-T2. Preserve backward compatibility for `SY.opa.rules` while extending the SDK.
-- [ ] SYT-S1-T3. Add peer identity resolution support needed by `SY.timer`.
-- [ ] SYT-S1-T4. Add typed request/reply helpers for direct `system` RPC-style node interactions.
-- [ ] SYT-S1-T5. Add typed error parsing helpers matching `TIMER_RESPONSE`.
-- [ ] SYT-S1-T6. Add reusable `HELP` descriptor helpers if that reduces duplication.
+- [x] SYT-S1-T3. Add peer identity resolution support needed by `SY.timer`.
+- [x] SYT-S1-T4. Add typed request/reply helpers for direct `system` RPC-style node interactions.
+- [x] SYT-S1-T5. Add typed error parsing helpers matching `TIMER_RESPONSE`.
+- [x] SYT-S1-T6. Add reusable `HELP` descriptor helpers if that reduces duplication.
 - [x] SYT-S1-T7. Move the current SDK code from `sy-opa-rules/sdk` into the formal SDK layout.
 - [x] SYT-S1-T8. Define stable package naming and import path for Go consumers.
 - [x] SYT-S1-T9. Add module README and first-party/third-party usage guidance.
@@ -157,10 +157,12 @@ Current status after extraction:
 - first migrated consumer: `SY.opa.rules`
 - local workspace wiring uses `go.mod replace ../fluxbee-go-sdk` during in-repo development
 - the old `sy-opa-rules/sdk` implementation has been removed to avoid dual sources of truth
+- v1 peer identity resolution is now explicit in the SDK via local `uuid_persistence_dir` lookup mapped to canonical L2 names for the local hive
+- direct `system` RPC helpers and `TIMER_RESPONSE` / `HELP` base types are now available for `SY.timer`
 
 ### SYT-S2 — Add `timer` client module to the Go SDK
 
-- [ ] SYT-S2-T1. Define Go types:
+- [x] SYT-S2-T1. Define Go types:
   - `TimerID`
   - `TimerInfo`
   - `FiredEvent`
@@ -186,8 +188,15 @@ Current status after extraction:
   - mutually exclusive absolute vs relative scheduling fields
   - recurring validation shape
 - [ ] SYT-S2-T4. Implement retry policy for time operations as defined by the spec.
-- [ ] SYT-S2-T5. Implement `ParseFiredEvent(msg)` helper.
+- [x] SYT-S2-T5. Implement `ParseFiredEvent(msg)` helper.
 - [ ] SYT-S2-T6. Add tests/golden fixtures for SDK wire compatibility.
+
+Current status:
+
+- implemented client calls so far: `Now`, `NowIn`, `Help`
+- implemented time-operation retry budget for the currently supported direct time calls
+- implemented `ParseFiredEvent(msg)`
+- remaining client calls still to add: `Convert`, `Parse`, `Format`, `Schedule`, `ScheduleIn`, `ScheduleRecurring`, `Cancel`, `Reschedule`, `Get`, `ListMine`
 
 ---
 

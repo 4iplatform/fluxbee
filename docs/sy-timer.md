@@ -19,7 +19,7 @@ Forma parte de la familia de nodos del sistema, junto con `SY.storage`, `SY.admi
 
 **No es un sistema de tiempo real.** `SY.timer` está diseñado para workflows, cognición, agentes y automatización. La granularidad mínima de un timer es **60 segundos**, la precisión de disparo es *best-effort* con tolerancia del orden de segundos, y la carga esperada es de hasta ~10.000 timers concurrentes por hive.
 
-**Ownership estricto por nombre L2.** Cada nodo solo puede ver, modificar y cancelar sus propios timers. La única excepción es `SY.orchestrator`, que puede invocar `TIMER_PURGE_OWNER` como parte del teardown de un nodo. La resolución `routing.src (UUID) -> nombre L2` se realiza a través del runtime/SDK Go, no por heurística local del nodo.
+**Ownership estricto por nombre L2.** Cada nodo solo puede ver, modificar y cancelar sus propios timers. La única excepción es `SY.orchestrator`, que puede invocar `TIMER_PURGE_OWNER` como parte del teardown de un nodo. La resolución `routing.src (UUID) -> nombre L2` se realiza a través del runtime/SDK Go, no por heurística local del nodo. En v1, el SDK Go resuelve esa identidad desde el registro local de UUIDs persistidos en `uuid_persistence_dir` (normalmente `/var/lib/fluxbee/state/nodes`).
 
 ---
 
