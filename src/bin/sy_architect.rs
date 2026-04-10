@@ -5112,7 +5112,7 @@ fn preview_text(input: &str, max_chars: usize) -> String {
         .collect::<String>()
         .trim()
         .to_string();
-    format!("{truncated}â€¦")
+    format!("{truncated}...")
 }
 
 fn now_epoch_ms() -> u64 {
@@ -6217,7 +6217,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
           <div class="wordmark">flux<span>bee</span></div>
           <div class="product-line">
             <span class="process-pill">SY.architect</span>
-            <span>archi Â· system architect interface</span>
+            <span>archi &middot; system architect interface</span>
           </div>
         </div>
       </div>
@@ -6240,7 +6240,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
           <button id="new-chat-impersonation" class="new-chat debug">Impersonate</button>
         </div>
         <input id="history-search" class="history-search" type="search" placeholder="Search chats" autocomplete="off" />
-        <div id="history-stats" class="history-stats">Loading chatsâ€¦</div>
+        <div id="history-stats" class="history-stats">Loading chats...</div>
         <div id="history-list" class="history-list"></div>
         <div class="meta-grid">
           <div class="meta-inline-note">Stored locally on motherbee. Use impersonation only for debug and simulation flows.</div>
@@ -6252,7 +6252,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         <div class="shell-head">
           <div class="shell-title-row">
             <h1 class="shell-title">archi</h1>
-            <div class="shell-title-meta">Â· system architect interface</div>
+            <div class="shell-title-meta">&middot; system architect interface</div>
           </div>
         </div>
         <div id="messages" class="messages"></div>
@@ -6278,7 +6278,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
           <h2 id="impersonation-modal-title" class="modal-title">Create impersonation chat</h2>
           <p class="modal-copy">Choose an existing ICH from identity SHM and, if needed, the ILK bound to that channel so you can simulate a real ingress path without connecting external IO.</p>
         </div>
-        <button id="impersonation-close" class="modal-close" type="button" aria-label="Close impersonation dialog">Ã—</button>
+        <button id="impersonation-close" class="modal-close" type="button" aria-label="Close impersonation dialog">&times;</button>
       </div>
       <form id="impersonation-form" class="modal-form">
         <div class="field-grid">
@@ -6320,7 +6320,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
           <h2 id="confirm-modal-title" class="modal-title">Please confirm</h2>
           <p id="confirm-modal-copy" class="confirm-copy">Are you sure?</p>
         </div>
-        <button id="confirm-close" class="modal-close" type="button" aria-label="Close confirmation dialog">Ã—</button>
+        <button id="confirm-close" class="modal-close" type="button" aria-label="Close confirmation dialog">&times;</button>
       </div>
       <div class="modal-actions">
         <button id="confirm-cancel" class="secondary-button" type="button">Cancel</button>
@@ -6378,8 +6378,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
     let confirmResolver = null;
     function describeIchOption(option) {{
       if (!option) return "";
-      const primary = option.is_primary ? " Â· primary" : "";
-      return option.channel_type + " Â· " + option.address + primary + " Â· " + option.ich_id;
+      const primary = option.is_primary ? " \u00B7 primary" : "";
+      return option.channel_type + " \u00B7 " + option.address + primary + " \u00B7 " + option.ich_id;
     }}
     function selectedImpersonationOption() {{
       const idx = Number(impersonationIch.value);
@@ -6404,7 +6404,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       option.ilks.forEach((ilk) => {{
         const item = document.createElement("option");
         item.value = ilk.ilk_id;
-        item.textContent = (ilk.display_name || ilk.ilk_id) + " Â· " + ilk.registration_status;
+        item.textContent = (ilk.display_name || ilk.ilk_id) + " \u00B7 " + ilk.registration_status;
         impersonationIlk.appendChild(item);
       }});
       impersonationIlk.disabled = option.ilks.length <= 1;
@@ -6644,7 +6644,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       text = String(text || "").replace(/\s+/g, " ").trim();
       if (!text) return "none";
       if (text.length <= maxLen) return text;
-      return text.slice(0, Math.max(0, maxLen - 1)).trimEnd() + "â€¦";
+      return text.slice(0, Math.max(0, maxLen - 3)).trimEnd() + "...";
     }}
     function toolSortWeight(tool, index) {{
       const isError = !!(tool && tool.is_error);
@@ -6838,7 +6838,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       if (!session) return "waiting for first message";
       if (!session.message_count) return "waiting for first message";
       const count = Number(session.message_count || 0);
-      return count + " messages Â· updated " + formatTimestamp(session.last_activity_at_ms);
+      return count + " messages \u00B7 updated " + formatTimestamp(session.last_activity_at_ms);
     }}
     function formatSessionCount(session) {{
       if (!session || !session.message_count) return "waiting for first message";
@@ -6853,7 +6853,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       if (!value) return "";
       const text = String(value);
       if (text.length <= 20) return text;
-      return text.slice(0, 8) + "â€¦" + text.slice(-6);
+      return text.slice(0, 8) + "..." + text.slice(-6);
     }}
     function appendHistoryBadge(container, label, value) {{
       if (!value) return;
@@ -6935,7 +6935,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         meta.className = "history-meta";
         deleteButton.className = "history-delete";
         deleteButton.type = "button";
-        deleteButton.textContent = "Ã—";
+        deleteButton.innerHTML = "&times;";
         deleteButton.title = "Delete chat";
         name.textContent = session.title || "Untitled chat";
         if (session.session_id === currentSessionId) {{
@@ -6949,7 +6949,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         const updatedSpan = document.createElement("span");
         countSpan.textContent = formatSessionCount(session);
         sepSpan.className = "history-meta-sep";
-        sepSpan.textContent = "â€¢";
+        sepSpan.textContent = "\u2022";
         updatedSpan.className = "history-meta-updated";
         updatedSpan.textContent = formatSessionUpdated(session);
         meta.appendChild(countSpan);
@@ -7110,6 +7110,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       const res = await fetch(sessionsUrl + "/" + encodeURIComponent(sessionId), {{ cache: "no-store" }});
       if (!res.ok) {{
+        if (res.status === 404) {{
+          localStorage.removeItem(currentSessionStorageKey);
+        }}
         throw new Error("session load failed");
       }}
       const detail = await res.json();
@@ -7335,8 +7338,24 @@ fn architect_index_html(state: &ArchitectState) -> String {
       if (!sessionsCache.length) {{
         await createSession({{}}, true);
       }} else {{
-        const preferred = currentSessionId || localStorage.getItem(currentSessionStorageKey) || sessionsCache[0].session_id;
-        await loadSession(preferred, null, false);
+        const stored = currentSessionId || localStorage.getItem(currentSessionStorageKey);
+        const preferred = sessionsCache.some((session) => session.session_id === stored)
+          ? stored
+          : sessionsCache[0].session_id;
+        if (stored && stored !== preferred) {{
+          localStorage.setItem(currentSessionStorageKey, preferred);
+        }}
+        try {{
+          await loadSession(preferred, null, false);
+        }} catch (_err) {{
+          localStorage.removeItem(currentSessionStorageKey);
+          const fallback = sessionsCache[0] && sessionsCache[0].session_id ? sessionsCache[0].session_id : null;
+          if (fallback) {{
+            await loadSession(fallback, null, false);
+          }} else {{
+            await createSession({{}}, true);
+          }}
+        }}
       }}
       await refreshStatus({{ force: true }});
       restartStatusRefreshLoop(false);
