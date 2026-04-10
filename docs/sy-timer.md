@@ -1,6 +1,6 @@
 # SY.timer — Nodo del Sistema
 
-**Estado:** v1.0 draft
+**Estado:** v1.0 implemented / aligned with current runtime
 **Fecha:** 2026-04-08
 **Audiencia:** Desarrolladores de nodos, autores de workflows, ops/SRE
 
@@ -52,6 +52,8 @@ El propósito es doble:
 En v1, `SY.admin` expone solo una superficie **read-only** y de introspección para `SY.timer`:
 
 - `timer_help`
+- `timer_get`
+- `timer_list`
 - `timer_now`
 - `timer_now_in`
 - `timer_convert`
@@ -80,7 +82,7 @@ Nodos futuros con interacción directa (por ejemplo `WF.*`, `SY.policy`, capabil
 - **Timezone data:** `time/tzdata` embebido en binario, con fallback a `/usr/share/zoneinfo` del SO
 - **Cron parser:** `github.com/robfig/cron/v3` (spec estándar, conocida por LLMs)
 - **Scheduler interno:** heap binario ordenado por `fire_at_utc`, protegido por mutex
-- **Runtime:** SDK Go estándar de Fluxbee (`fluxbee-sdk-go`), mismo loop de lectura de socket que el resto de nodos `SY.*`
+- **Runtime:** SDK Go estándar de Fluxbee (`fluxbee-go-sdk`), mismo loop de lectura de socket que el resto de nodos `SY.*`
 
 ### 4.2 Componentes
 
@@ -265,7 +267,7 @@ Crea un timer one-shot.
 
 ```json
 {
-  "routing": { "dst": "SY.timer@motherbee", "ttl": 16, "trace_id": "..." },
+  "routing": { "dst": "SY.timer@<hive>", "ttl": 16, "trace_id": "..." },
   "meta": { "msg_type": "system", "msg": "TIMER_SCHEDULE" },
   "payload": {
     "fire_at_utc_ms": 1775577600000,
@@ -512,7 +514,7 @@ Emitido por `SY.timer` hacia el `target_l2_name` cuando un timer vence.
 ```json
 {
   "routing": {
-    "src": "SY.timer@motherbee",
+    "src": "SY.timer@<hive>",
     "dst": "WF.onboarding.step2@motherbee",
     "ttl": 16,
     "trace_id": "<nuevo-uuid>"
@@ -549,6 +551,8 @@ Emitido por `SY.timer` hacia el `target_l2_name` cuando un timer vence.
 - `user_payload` es exactamente lo que el cliente pasó en el `TIMER_SCHEDULE.payload.payload`, sin modificar.
 - `metadata` también se devuelve tal cual, para que el consumidor pueda tener el contexto que el creador dejó.
 - El target NO debe responder con `TIMER_RESPONSE`. `TIMER_FIRED` es fire-and-forget; si el target está caído, el evento se pierde. Si hace falta retry, es responsabilidad del creador del timer diseñar esa semántica en su lógica de aplicación.
+- `SY.timer` considera el disparo intentado cuando entrega el mensaje al router local; no espera ack aplicativo ni confirmación del target.
+- En v1 no existe dead-letter queue ni retry automático de `TIMER_FIRED`. La durabilidad sigue viviendo en la fila del timer y en los logs del nodo.
 
 ---
 
@@ -848,7 +852,52 @@ El orchestrator debe llamar a `TIMER_PURGE_OWNER` **antes** de matar el proceso 
 
 El SDK Go de Fluxbee expone un módulo `timer` que encapsula toda la interacción con `SY.timer`. El autor del nodo cliente nunca ve JSON.
 
-### 14.1 Firmas principales
+### 14.1 Patrón recomendado de uso directo
+
+Para nodos `WF.*`, `AI.*`, `IO.*` y futuros nodos Go, el patrón recomendado es:
+
+1. conectarse al router con `fluxbee-go-sdk`
+2. construir un `TimerClient` sobre el `NodeSender`
+3. usar métodos tipados del cliente para tiempo, scheduling y lectura
+4. procesar `TIMER_FIRED` como mensaje `system` normal en el handler del nodo
+
+En v1 este es el camino primario de integración. `SY.admin` aporta visibilidad read-only y utilidades de tiempo, pero la semántica owner-bound de scheduling y mutaciones sigue siendo de uso directo por SDK.
+
+Ejemplo mínimo:
+
+```go
+sender, receiver, err := sdk.Connect(sdk.NodeConfig{
+    Name:               "WF.demo",
+    RouterSocket:       "/var/run/fluxbee/routers",
+    UUIDPersistenceDir: "/var/lib/fluxbee/state/nodes",
+    UUIDMode:           sdk.NodeUuidPersistent,
+    ConfigDir:          "/etc/fluxbee",
+    Version:            "1.0",
+})
+if err != nil {
+    return err
+}
+
+timerClient, err := sdk.NewTimerClient(sender, "")
+if err != nil {
+    return err
+}
+
+timerID, err := timerClient.ScheduleIn(ctx, 2*time.Minute, sdk.ScheduleOptions{
+    ClientRef: "wf-demo-timeout",
+    Payload: map[string]any{
+        "kind": "timeout",
+    },
+})
+if err != nil {
+    return err
+}
+
+_ = timerID
+_ = receiver
+```
+
+### 14.2 Firmas principales
 
 ```go
 package timer
@@ -900,7 +949,7 @@ func ListMine(ctx context.Context, filter ListFilter) ([]TimerInfo, error)
 func Help(ctx context.Context) (*HelpDescriptor, error)
 ```
 
-### 14.2 Validación client-side
+### 14.3 Validación client-side
 
 ```go
 func ScheduleIn(ctx context.Context, d time.Duration, opts ScheduleOptions) (TimerID, error) {
@@ -915,7 +964,7 @@ func ScheduleIn(ctx context.Context, d time.Duration, opts ScheduleOptions) (Tim
 
 El mínimo de 60s se valida **client-side** antes de mandar el request, evitando roundtrip. También se valida server-side como defensa en profundidad.
 
-### 14.3 Reintento de operaciones de tiempo
+### 14.4 Reintento de operaciones de tiempo
 
 ```go
 func Now(ctx context.Context) (time.Time, error) {
@@ -932,7 +981,7 @@ func Now(ctx context.Context) (time.Time, error) {
 }
 ```
 
-### 14.4 Manejo de `TIMER_FIRED` en el nodo cliente
+### 14.5 Manejo de `TIMER_FIRED` en el nodo cliente
 
 El SDK expone un handler tipado:
 

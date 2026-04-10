@@ -390,12 +390,23 @@ Current status:
 
 ### SYT-S10 — Spec alignment and docs
 
-- [ ] SYT-S10-T1. Update [sy-timer.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/sy-timer.md) after freezing the open decisions.
-- [ ] SYT-S10-T2. Keep the operation section aligned with the current core singleton `SY.*` model.
-- [ ] SYT-S10-T3. Normalize all examples to `SY.timer@<hive>`.
-- [ ] SYT-S10-T4. Add `SY.timer` to operator/system node catalogs if applicable.
-- [ ] SYT-S10-T5. Document the direct SDK interaction pattern for workflow/node authors.
-- [ ] SYT-S10-T6. Document the exact semantics of `TIMER_FIRED` being fire-and-forget.
+- [x] SYT-S10-T1. Update [sy-timer.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/sy-timer.md) after freezing the open decisions.
+- [x] SYT-S10-T2. Keep the operation section aligned with the current core singleton `SY.*` model.
+- [x] SYT-S10-T3. Normalize all examples to `SY.timer@<hive>`.
+- [x] SYT-S10-T4. Add `SY.timer` to operator/system node catalogs if applicable.
+- [x] SYT-S10-T5. Document the direct SDK interaction pattern for workflow/node authors.
+- [x] SYT-S10-T6. Document the exact semantics of `TIMER_FIRED` being fire-and-forget.
+
+Current status:
+
+- `sy-timer.md` now reflects the implemented runtime shape, the current admin visibility surface, and the current ownership model
+- examples and canonical names are normalized around `SY.timer@<hive>`
+- the spec now documents the direct SDK-first integration pattern used by workflow/node authors
+- the exact fire-and-forget semantics of `TIMER_FIRED` are explicit:
+  - no app ack
+  - no dead-letter queue
+  - no automatic retry
+- `SY.timer` has been added to the operator/system node action catalog as a first-class system node
 
 ---
 
