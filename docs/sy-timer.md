@@ -765,6 +765,8 @@ if sender_l2_name(routing.src) != "SY.orchestrator@<local-hive>":
 
 La validación se hace por nombre L2 del sender, resolviendo `routing.src` (UUID L1) a través del runtime/SDK Go y confiando en la capa L2 del router para la integridad de esa identidad. Esto es consistente con el modelo de autorización del resto de nodos del sistema.
 
+En v1 actual, esa resolución en Go usa el registro local de UUID persistidos del runtime. Está tratado como solución transicional y ya quedó explicitado en el plan para migrarlo después a la ruta canónica compartida de identidad de plataforma.
+
 ### 12.3 Flujo de borrado de nodo
 
 ```

@@ -215,6 +215,14 @@ ORDER BY fire_at_utc ASC
 	return collectTimerRows(rows)
 }
 
+func deleteTimersByOwner(ctx context.Context, db *sql.DB, ownerL2Name string) (int64, error) {
+	result, err := db.ExecContext(ctx, `DELETE FROM timers WHERE owner_l2_name=?`, ownerL2Name)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func countPendingTimers(ctx context.Context, db *sql.DB) (int64, error) {
 	var count int64
 	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM timers WHERE status='pending'`).Scan(&count)

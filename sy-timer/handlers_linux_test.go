@@ -58,6 +58,13 @@ func newTestService(t *testing.T) (*Service, chan []byte) {
 	return service, tx
 }
 
+func registerUUID(t *testing.T, dir, l2Name, uuidValue string) {
+	t.Helper()
+	if err := osWriteFile(filepath.Join(dir, l2Name+".uuid"), []byte(uuidValue)); err != nil {
+		t.Fatalf("write %s uuid: %v", l2Name, err)
+	}
+}
+
 func TestRespondTimerSchedulePersistsOwnedTimer(t *testing.T) {
 	service, tx := newTestService(t)
 	fireInMS := int64((time.Minute).Milliseconds())
@@ -103,6 +110,28 @@ func TestRespondTimerGetRejectsForeignOwner(t *testing.T) {
 	response := mustReadTimerResponse(t, tx)
 	if response.OK || response.Error == nil || response.Error.Code != "TIMER_NOT_OWNER" {
 		t.Fatalf("unexpected get response: %+v", response)
+	}
+}
+
+func TestRespondTimerGetRejectsUnknownSourceUUID(t *testing.T) {
+	service, tx := newTestService(t)
+	msg, err := fluxbeesdk.BuildSystemMessage(
+		"22222222-2222-2222-2222-222222222222",
+		fluxbeesdk.UnicastDestination("SY.timer@motherbee"),
+		16,
+		uuid.NewString(),
+		"TIMER_GET",
+		map[string]any{"timer_uuid": "timer-1"},
+	)
+	if err != nil {
+		t.Fatalf("build message: %v", err)
+	}
+	if err := service.respondTimerGet(msg); err != nil {
+		t.Fatalf("get timer with unknown source: %v", err)
+	}
+	response := mustReadTimerResponse(t, tx)
+	if response.OK || response.Error == nil || response.Error.Code != "TIMER_INTERNAL" {
+		t.Fatalf("unexpected unknown source response: %+v", response)
 	}
 }
 
@@ -277,6 +306,97 @@ func TestRespondTimerListOnlyReturnsOwnerTimers(t *testing.T) {
 	}
 	if payload.Count != 1 || payload.Timers[0]["uuid"] != "timer-owned" {
 		t.Fatalf("unexpected list payload: %+v", payload)
+	}
+}
+
+func TestRespondTimerPurgeOwnerRequiresLocalOrchestrator(t *testing.T) {
+	service, tx := newTestService(t)
+	insertOwnedTimer(t, service.db, timerRow{
+		UUID:         "timer-owned",
+		OwnerL2Name:  "WF.demo@motherbee",
+		TargetL2Name: "WF.demo@motherbee",
+		Kind:         "oneshot",
+		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+	})
+
+	msg := mustBuildSystemMessage(t, map[string]any{"owner_l2_name": "WF.demo@motherbee"}, "TIMER_PURGE_OWNER")
+	if err := service.respondTimerPurgeOwner(msg); err != nil {
+		t.Fatalf("purge owner forbidden: %v", err)
+	}
+	response := mustReadTimerResponse(t, tx)
+	if response.OK || response.Error == nil || response.Error.Code != "TIMER_FORBIDDEN" {
+		t.Fatalf("unexpected purge forbidden response: %+v", response)
+	}
+}
+
+func TestRespondTimerPurgeOwnerDeletesTimersForOwner(t *testing.T) {
+	service, tx := newTestService(t)
+	registerUUID(t, service.uuidPersistenceDir, "SY.orchestrator@motherbee", "33333333-3333-3333-3333-333333333333")
+
+	insertOwnedTimer(t, service.db, timerRow{
+		UUID:         "timer-owned-1",
+		OwnerL2Name:  "WF.demo@motherbee",
+		TargetL2Name: "WF.demo@motherbee",
+		Kind:         "oneshot",
+		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+	})
+	insertOwnedTimer(t, service.db, timerRow{
+		UUID:         "timer-owned-2",
+		OwnerL2Name:  "WF.demo@motherbee",
+		TargetL2Name: "WF.demo@motherbee",
+		Kind:         "oneshot",
+		FireAtUTC:    time.Now().UTC().Add(2 * time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+	})
+	insertOwnedTimer(t, service.db, timerRow{
+		UUID:         "timer-other",
+		OwnerL2Name:  "AI.other@motherbee",
+		TargetL2Name: "AI.other@motherbee",
+		Kind:         "oneshot",
+		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+	})
+
+	msg, err := fluxbeesdk.BuildSystemMessage(
+		"33333333-3333-3333-3333-333333333333",
+		fluxbeesdk.UnicastDestination("SY.timer@motherbee"),
+		16,
+		uuid.NewString(),
+		"TIMER_PURGE_OWNER",
+		map[string]any{"owner_l2_name": "WF.demo@motherbee"},
+	)
+	if err != nil {
+		t.Fatalf("build purge message: %v", err)
+	}
+	if err := service.respondTimerPurgeOwner(msg); err != nil {
+		t.Fatalf("purge owner: %v", err)
+	}
+	response := mustReadTimerResponse(t, tx)
+	if !response.OK || response.DeletedCount == nil || *response.DeletedCount != 2 {
+		t.Fatalf("unexpected purge response: %+v", response)
+	}
+	if _, err := getTimer(context.Background(), service.db, "timer-owned-1"); err == nil {
+		t.Fatalf("expected first owned timer to be deleted")
+	}
+	if _, err := getTimer(context.Background(), service.db, "timer-owned-2"); err == nil {
+		t.Fatalf("expected second owned timer to be deleted")
+	}
+	if _, err := getTimer(context.Background(), service.db, "timer-other"); err != nil {
+		t.Fatalf("expected unrelated timer to remain: %v", err)
 	}
 }
 

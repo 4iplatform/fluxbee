@@ -297,14 +297,21 @@ Current status:
 
 ### SYT-S7 — Authorization and identity
 
-- [ ] SYT-S7-T1. Implement source UUID -> source L2 resolution path.
-- [ ] SYT-S7-T2. Enforce strict ownership on:
+- [x] SYT-S7-T1. Implement source UUID -> source L2 resolution path.
+- [x] SYT-S7-T2. Enforce strict ownership on:
   - `TIMER_GET`
   - `TIMER_LIST`
   - `TIMER_CANCEL`
   - `TIMER_RESCHEDULE`
-- [ ] SYT-S7-T3. Enforce orchestrator-only permission for `TIMER_PURGE_OWNER`.
-- [ ] SYT-S7-T4. Add negative tests for forged/foreign timer access.
+- [x] SYT-S7-T3. Enforce orchestrator-only permission for `TIMER_PURGE_OWNER`.
+- [x] SYT-S7-T4. Add negative tests for forged/foreign timer access.
+
+Current status:
+
+- requester identity is resolved from `routing.src` UUID into canonical L2 through the current `fluxbee-go-sdk` resolver
+- ownership checks are enforced on read/list/cancel/reschedule paths against persisted `owner_l2_name`
+- `TIMER_PURGE_OWNER` now exists and is restricted to `SY.orchestrator@<local-hive>`
+- negative tests cover foreign owner access, unknown source UUIDs, and forbidden purge attempts
 
 ---
 

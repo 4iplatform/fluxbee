@@ -108,6 +108,10 @@ type timerListRequest struct {
 	Limit        int    `json:"limit,omitempty"`
 }
 
+type timerPurgeOwnerRequest struct {
+	OwnerL2Name string `json:"owner_l2_name"`
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
@@ -212,6 +216,8 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) error {
 		return s.respondTimerCancel(msg)
 	case "TIMER_RESCHEDULE":
 		return s.respondTimerReschedule(msg)
+	case "TIMER_PURGE_OWNER":
+		return s.respondTimerPurgeOwner(msg)
 	case fluxbeesdk.MsgTimerHelp:
 		return s.respondTimerHelp(msg)
 	default:
@@ -332,6 +338,7 @@ func (s *Service) respondTimerHelp(incoming fluxbeesdk.Message) error {
 			{Verb: "TIMER_LIST", Description: "List timers owned by the requester.", OptionalFields: []string{"status_filter", "limit"}},
 			{Verb: "TIMER_CANCEL", Description: "Cancel a pending owned timer.", RequiredFields: []string{"timer_uuid"}},
 			{Verb: "TIMER_RESCHEDULE", Description: "Reschedule a pending one-shot timer owned by the requester.", RequiredFields: []string{"timer_uuid", "new_fire_at_utc_ms OR new_fire_in_ms"}},
+			{Verb: "TIMER_PURGE_OWNER", Description: "Delete every timer owned by a node. Reserved to SY.orchestrator.", RequiredFields: []string{"owner_l2_name"}},
 			{Verb: "TIMER_NOW", Description: "Return current UTC time."},
 			{Verb: "TIMER_NOW_IN", Description: "Return current time in a requested IANA timezone.", RequiredFields: []string{"tz"}},
 			{Verb: "TIMER_CONVERT", Description: "Convert a UTC instant into a target timezone.", RequiredFields: []string{"instant_utc_ms", "to_tz"}},
@@ -344,6 +351,7 @@ func (s *Service) respondTimerHelp(incoming fluxbeesdk.Message) error {
 			{Code: "TIMER_INVALID_PAYLOAD", Description: "Request payload is malformed or missing required fields."},
 			{Code: "TIMER_INVALID_CRON", Description: "Recurring cron expression is invalid."},
 			{Code: "TIMER_INVALID_TIMEZONE", Description: "Requested timezone is not a valid IANA timezone."},
+			{Code: "TIMER_FORBIDDEN", Description: "Requester is not authorized for the requested operation."},
 			{Code: "TIMER_NOT_FOUND", Description: "Requested timer does not exist."},
 			{Code: "TIMER_NOT_OWNER", Description: "Requester does not own the timer."},
 			{Code: "TIMER_ALREADY_FIRED", Description: "Timer already fired and can no longer be modified."},
@@ -653,6 +661,35 @@ func (s *Service) respondTimerReschedule(incoming fluxbeesdk.Message) error {
 	})
 }
 
+func (s *Service) respondTimerPurgeOwner(incoming fluxbeesdk.Message) error {
+	var req timerPurgeOwnerRequest
+	if err := json.Unmarshal(incoming.Payload, &req); err != nil {
+		return s.sendTimerError(incoming, "TIMER_PURGE_OWNER", "TIMER_INVALID_PAYLOAD", err.Error())
+	}
+	requesterL2, err := s.resolveSourceL2Name(incoming.Routing.Src)
+	if err != nil {
+		return s.sendTimerError(incoming, "TIMER_PURGE_OWNER", "TIMER_INTERNAL", err.Error())
+	}
+	localOrchestrator := s.localOrchestratorL2Name()
+	if requesterL2 != localOrchestrator {
+		return s.sendTimerError(incoming, "TIMER_PURGE_OWNER", "TIMER_FORBIDDEN", "operation is reserved to local SY.orchestrator")
+	}
+	ownerL2Name := strings.TrimSpace(req.OwnerL2Name)
+	if !isCanonicalL2Name(ownerL2Name) {
+		return s.sendTimerError(incoming, "TIMER_PURGE_OWNER", "TIMER_INVALID_PAYLOAD", "owner_l2_name must be a canonical L2 name")
+	}
+	deletedCount, err := deleteTimersByOwner(context.Background(), s.db, ownerL2Name)
+	if err != nil {
+		return s.sendTimerError(incoming, "TIMER_PURGE_OWNER", "TIMER_STORAGE_ERROR", err.Error())
+	}
+	s.signalScheduler()
+	return s.sendTimerResponse(incoming, map[string]any{
+		"ok":            true,
+		"verb":          "TIMER_PURGE_OWNER",
+		"deleted_count": deletedCount,
+	})
+}
+
 func (s *Service) sendTimerResponse(incoming fluxbeesdk.Message, payload any) error {
 	response, err := fluxbeesdk.BuildSystemResponse(
 		&incoming,
@@ -700,6 +737,11 @@ func (s *Service) resolveSourceL2Name(sourceUUID string) (string, error) {
 		UUIDPersistenceDir: s.uuidPersistenceDir,
 		HiveID:             hive,
 	})
+}
+
+func (s *Service) localOrchestratorL2Name() string {
+	_, hive, _ := strings.Cut(s.nodeName, "@")
+	return fmt.Sprintf("SY.orchestrator@%s", hive)
 }
 
 func scheduleFireAt(req timerScheduleRequest) (int64, error) {
