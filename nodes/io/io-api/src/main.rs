@@ -141,6 +141,7 @@ struct SpawnConfig {
     doc: Value,
 }
 
+#[derive(Debug)]
 struct ParsedHttpMessage {
     request_id: String,
     identity_input: ResolveOrCreateInput,
