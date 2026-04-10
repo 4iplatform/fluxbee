@@ -9,7 +9,7 @@ Current v1 scope:
 - node handshake helpers
 - node config control-plane helpers
 - default node status helpers
-- local peer UUID -> L2 resolution through `uuid_persistence_dir`
+- local peer UUID -> L2 resolution through the SHM of the router that actually accepted the node connection (`ANNOUNCE.router_name`)
 - direct `system` request/reply RPC helpers
 - canonical `HELP` descriptor types
 - base `TIMER_RESPONSE` parsing helpers

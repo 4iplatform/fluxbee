@@ -53,8 +53,9 @@ type receivedMessage struct {
 }
 
 type connectionState struct {
-	mu        sync.RWMutex
-	connected bool
+	mu         sync.RWMutex
+	connected  bool
+	routerName string
 }
 
 type HiveFile struct {
@@ -67,10 +68,22 @@ func (s *connectionState) SetConnected(value bool) {
 	s.connected = value
 }
 
+func (s *connectionState) SetRouterName(value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.routerName = strings.TrimSpace(value)
+}
+
 func (s *connectionState) IsConnected() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.connected
+}
+
+func (s *connectionState) RouterName() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.routerName
 }
 
 func Connect(cfg NodeConfig) (*NodeSender, *NodeReceiver, error) {
@@ -97,6 +110,7 @@ func Connect(cfg NodeConfig) (*NodeSender, *NodeReceiver, error) {
 	}
 
 	state.SetConnected(true)
+	state.SetRouterName(announce.RouterName)
 	go connectionManager(cfg, baseName, fullName, nodeID.String(), tx, rx, state)
 
 	sender := &NodeSender{
@@ -145,6 +159,10 @@ func (s *NodeSender) FullName() string {
 	return s.fullName
 }
 
+func (s *NodeSender) RouterName() string {
+	return s.state.RouterName()
+}
+
 func (r *NodeReceiver) Recv(ctx context.Context) (Message, error) {
 	select {
 	case <-ctx.Done():
@@ -174,6 +192,10 @@ func (r *NodeReceiver) VpnID() uint32 {
 	return r.vpnID
 }
 
+func (r *NodeReceiver) RouterName() string {
+	return r.state.RouterName()
+}
+
 func connectionManager(cfg NodeConfig, baseName, fullName, uuidValue string, tx <-chan []byte, rx chan<- receivedMessage, state *connectionState) {
 	for {
 		conn, err := connectRouter(cfg.RouterSocket, baseName)
@@ -182,7 +204,7 @@ func connectionManager(cfg NodeConfig, baseName, fullName, uuidValue string, tx 
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
-		announce, _, err := PerformHandshake(conn, fullName, uuidValue, cfg.Version)
+		_, announce, err := PerformHandshake(conn, fullName, uuidValue, cfg.Version)
 		if err != nil {
 			_ = conn.Close()
 			state.SetConnected(false)
@@ -190,7 +212,7 @@ func connectionManager(cfg NodeConfig, baseName, fullName, uuidValue string, tx 
 			continue
 		}
 		state.SetConnected(true)
-		_ = announce
+		state.SetRouterName(announce.RouterName)
 
 		done := make(chan struct{}, 2)
 		go func() {

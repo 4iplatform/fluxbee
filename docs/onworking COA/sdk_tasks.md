@@ -41,3 +41,22 @@ Regla operativa acordada:
 
 - Migración SDK cerrada.
 - `fluxbee_sdk` queda como único SDK soportado para nuevos desarrollos.
+
+## Backlog explícito - `fluxbee-go-sdk`
+
+- [x] GO-SDK-1. Formalizar `fluxbee-go-sdk` como módulo top-level reutilizable por nodos first-party y terceros.
+- [x] GO-SDK-2. Portar envelope, handshake, framing y lifecycle base de conexión al router.
+- [x] GO-SDK-3. Portar helpers canónicos de `CONFIG_GET` / `CONFIG_SET` / `CONFIG_RESPONSE` y `NODE_STATUS_GET`.
+- [x] GO-SDK-4. Portar helpers RPC `system` y tipos reutilizables de `HELP`.
+- [x] GO-SDK-5. Agregar resolución de identidad `uuid -> L2` vía router SHM local.
+- [x] GO-SDK-6. Corregir la resolución de router para no depender de `gateway_name`:
+  - persistir `ANNOUNCE.router_name` en el estado de conexión
+  - exponerlo en `NodeSender` / `NodeReceiver`
+  - usar ese router efectivo para abrir `state/<router_l2_name>/identity.yaml` y su SHM
+- [ ] GO-SDK-7. Revisar si conviene extender `ANNOUNCE` con `shm_name` explícito para evitar lectura adicional de `identity.yaml`.
+- [ ] GO-SDK-8. Revisar el modelo de múltiples routers por hive y congelar semántica para consumidores SDK:
+  - un nodo puede conectarse a cualquier router local
+  - la router SHM sigue siendo per-router, no una vista fusionada por hive
+  - documentar esto como contrato explícito
+- [ ] GO-SDK-9. Portar readers SHM adicionales que hoy siguen faltando respecto del runtime Rust, empezando por los casos con valor real para nodos Go.
+- [ ] GO-SDK-10. Revisar el surface público del SDK Go y estabilizar política de versionado/compatibilidad para terceros.

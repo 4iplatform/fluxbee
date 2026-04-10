@@ -1107,6 +1107,18 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "timer_get",
+        route: InternalActionRoute::TimerRpc("TIMER_GET"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "timer_list",
+        route: InternalActionRoute::TimerRpc("TIMER_LIST"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "timer_now",
         route: InternalActionRoute::TimerRpc("TIMER_NOW"),
         requires_target: true,
@@ -2294,6 +2306,31 @@ async fn handle_hive_paths(
             .await?;
             Ok(Some((status, resp)))
         }
+        ("GET", ["timer", "timers"]) => {
+            let mut payload = serde_json::json!({});
+            if let Some(owner_l2_name) = query.get("owner_l2_name").filter(|value| !value.is_empty())
+            {
+                payload["owner_l2_name"] = serde_json::json!(owner_l2_name);
+            }
+            if let Some(status_filter) = query.get("status_filter").filter(|value| !value.is_empty())
+            {
+                payload["status_filter"] = serde_json::json!(status_filter);
+            }
+            if let Some(limit) = query.get("limit").and_then(|value| value.parse::<u64>().ok()) {
+                payload["limit"] = serde_json::json!(limit);
+            }
+            let (status, resp) =
+                handle_timer_rpc(ctx, client, "timer_list", "TIMER_LIST", payload, hive).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["timer", "timers", timer_uuid]) => {
+            let payload = serde_json::json!({
+                "timer_uuid": decode_percent(timer_uuid),
+            });
+            let (status, resp) =
+                handle_timer_rpc(ctx, client, "timer_get", "TIMER_GET", payload, hive).await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["timer", "now"]) => {
             let (status, resp) = handle_timer_rpc(
                 ctx,
@@ -3396,6 +3433,8 @@ fn admin_action_summary(action: &str) -> &'static str {
         "opa_get_policy" => "Read current OPA policy text for a hive.",
         "opa_get_status" => "Read OPA status for a hive.",
         "timer_help" => "Read the self-described SY.timer capability catalog for a hive.",
+        "timer_get" => "Read one timer by uuid from SY.timer for a hive.",
+        "timer_list" => "List timers from SY.timer for a hive, optionally filtered by owner.",
         "timer_now" => "Read the current UTC time from SY.timer for a hive.",
         "timer_now_in" => "Read the current time in one IANA timezone from SY.timer for a hive.",
         "timer_convert" => "Convert one UTC instant through SY.timer for a hive.",
@@ -3467,6 +3506,8 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "opa_get_policy" => vec!["GET /hives/{hive}/opa/policy"],
         "opa_get_status" => vec!["GET /hives/{hive}/opa/status"],
         "timer_help" => vec!["GET /hives/{hive}/timer/help"],
+        "timer_get" => vec!["GET /hives/{hive}/timer/timers/{timer_uuid}"],
+        "timer_list" => vec!["GET /hives/{hive}/timer/timers"],
         "timer_now" => vec!["GET /hives/{hive}/timer/now"],
         "timer_now_in" => vec!["POST /hives/{hive}/timer/now-in"],
         "timer_convert" => vec!["POST /hives/{hive}/timer/convert"],
@@ -3542,14 +3583,23 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         )],
         "list_nodes" | "list_ilks" | "get_versions" | "list_runtimes" | "list_routes"
         | "list_vpns" | "get_deployments" | "get_drift_alerts" | "opa_get_policy"
-        | "opa_get_status" | "timer_help" | "timer_now" | "timer_now_in" | "timer_convert"
-        | "timer_parse" | "timer_format" | "update" | "sync_hint" | "opa_compile_apply"
+        | "opa_get_status" | "timer_help" | "timer_list" | "timer_now" | "timer_now_in"
+        | "timer_convert" | "timer_parse" | "timer_format" | "update" | "sync_hint"
+        | "opa_compile_apply"
         | "opa_compile" | "opa_apply" | "opa_rollback" | "opa_check" => vec![
             admin_action_path_param(
             "hive",
             "string",
             "Target hive id in the URL path.",
         )],
+        "timer_get" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param(
+                "timer_uuid",
+                "string",
+                "Timer uuid to read from the local SY.timer instance.",
+            ),
+        ],
         "inventory" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param(
@@ -3730,6 +3780,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "version",
             "u64",
             "Compiled OPA version to apply.",
+        )],
+        "timer_get" => vec![admin_action_body_field(
+            "timer_uuid",
+            "string",
+            "Timer uuid to read when using internal admin dispatch instead of the HTTP path form.",
         )],
         "timer_now_in" => vec![admin_action_body_field(
             "tz",
@@ -3957,6 +4012,23 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             "u64",
             "Optional test-only hold used by E2E/runtime lifecycle checks.",
         )],
+        "timer_list" => vec![
+            admin_action_body_field(
+                "owner_l2_name",
+                "string",
+                "Optional canonical L2 owner filter. When omitted, SY.timer returns timers for the full hive.",
+            ),
+            admin_action_body_field(
+                "status_filter",
+                "string",
+                "Optional timer status filter: pending, fired, canceled, or all.",
+            ),
+            admin_action_body_field(
+                "limit",
+                "u32",
+                "Optional result limit. Defaults inside SY.timer and is capped there.",
+            ),
+        ],
         _ => Vec::new(),
     }
 }
@@ -4015,6 +4087,14 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         }),
         "timer_now_in" => serde_json::json!({
             "tz": "America/Argentina/Buenos_Aires"
+        }),
+        "timer_get" => serde_json::json!({
+            "timer_uuid": "9d8c6f4b-2f4d-4ad4-b5f4-8d8d9d9d0001"
+        }),
+        "timer_list" => serde_json::json!({
+            "owner_l2_name": "WF.onboarding@motherbee",
+            "status_filter": "pending",
+            "limit": 100
         }),
         "timer_convert" => serde_json::json!({
             "instant_utc_ms": 1775771100000i64,
@@ -4138,6 +4218,10 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "opa_get_policy" => "curl -X GET /hives/motherbee/opa/policy",
         "opa_get_status" => "curl -X GET /hives/motherbee/opa/status",
         "timer_help" => "curl -X GET /hives/motherbee/timer/help",
+        "timer_get" => "curl -X GET /hives/motherbee/timer/timers/9d8c6f4b-2f4d-4ad4-b5f4-8d8d9d9d0001",
+        "timer_list" => {
+            "curl -X GET '/hives/motherbee/timer/timers?owner_l2_name=WF.onboarding@motherbee&status_filter=pending&limit=100'"
+        }
         "timer_now" => "curl -X GET /hives/motherbee/timer/now",
         "timer_now_in" => {
             r#"curl -X POST /hives/motherbee/timer/now-in -d '{"tz":"America/Argentina/Buenos_Aires"}'"#
@@ -4229,11 +4313,12 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "For HTTP delete calls, the identifier lives in the final path segment; internal admin commands may still carry it in payload.",
             "Use node_control_config_set against SY.config.routes only when you want the node-owned live config replace path instead of one explicit domain mutation.",
         ],
-        "timer_help" | "timer_now" | "timer_now_in" | "timer_convert" | "timer_parse"
-        | "timer_format" => vec![
+        "timer_help" | "timer_get" | "timer_list" | "timer_now" | "timer_now_in"
+        | "timer_convert" | "timer_parse" | "timer_format" => vec![
             "These are narrow SY.timer read-only actions exposed through SY.admin for operator visibility and introspection.",
-            "Direct node-to-node SDK usage remains the primary interaction model for SY.timer.",
-            "Owner-bound timer verbs such as schedule/get/list/cancel/reschedule are intentionally not exposed through SY.admin in v1 because ownership is enforced against the request source node identity.",
+            "Direct node-to-node SDK usage remains the primary interaction model for SY.timer scheduling and owner-bound mutations.",
+            "TIMER_GET and TIMER_LIST are open read operations in v1, so SY.admin may expose them without impersonation or ownership proxying.",
+            "Owner-bound mutation verbs such as schedule/cancel/reschedule remain outside SY.admin in v1.",
         ],
         "get_ilk" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
@@ -6125,6 +6210,36 @@ mod tests {
                 { "name": "input", "type": "string", "description": "Input date/time text to parse." },
                 { "name": "layout", "type": "string", "description": "Go time layout used to parse input." },
                 { "name": "tz", "type": "string", "description": "IANA timezone applied to the parsed input." }
+            ])
+        );
+    }
+
+    #[test]
+    fn timer_get_action_doc_is_registered_as_timer_rpc() {
+        let spec = resolve_internal_action_spec("timer_get").expect("timer_get must exist");
+        let doc = build_admin_action_doc(spec);
+
+        assert_eq!(doc["action"], json!("timer_get"));
+        assert_eq!(doc["handler"], json!("timer_rpc"));
+        assert_eq!(doc["canonical_action"], json!("TIMER_GET"));
+        assert_eq!(doc["read_only"], json!(true));
+    }
+
+    #[test]
+    fn timer_list_request_contract_exposes_owner_filter() {
+        let contract = admin_action_request_contract("timer_list");
+
+        assert_eq!(contract["method"], json!("GET"));
+        assert_eq!(
+            contract["path_patterns"],
+            json!(["GET /hives/{hive}/timer/timers"])
+        );
+        assert_eq!(
+            contract["body"]["optional_fields"],
+            json!([
+                { "name": "owner_l2_name", "type": "string", "description": "Optional canonical L2 owner filter. When omitted, SY.timer returns timers for the full hive." },
+                { "name": "status_filter", "type": "string", "description": "Optional timer status filter: pending, fired, canceled, or all." },
+                { "name": "limit", "type": "u32", "description": "Optional result limit. Defaults inside SY.timer and is capped there." }
             ])
         );
     }

@@ -150,7 +150,21 @@ Recommended order:
 - [ ] SYT-S1-T10. Define versioning/compatibility policy for the Go SDK.
 - [ ] SYT-S1-T11. Add wire-compatibility tests against the Rust SDK contract.
 - [x] SYT-S1-T12. Leave a compatibility migration path for `SY.opa.rules` while imports move to the formal SDK.
-- [ ] SYT-S1-T13. Replace the temporary local `uuid_persistence_dir`-based UUID->L2 resolver with the canonical runtime identity resolution path shared with the rest of the platform.
+- [x] SYT-S1-T13. Replace the temporary local `uuid_persistence_dir`-based UUID->L2 resolver with the canonical runtime identity resolution path shared with the rest of the platform.
+
+Follow-up breakdown for `SYT-S1-T13`:
+
+- [x] SYT-S1-T13a. Freeze the source of truth as **local router SHM only** for `SY.timer` requester identity resolution.
+- [x] SYT-S1-T13b. Port the minimal router SHM reader surface into `fluxbee-go-sdk`:
+  - router header access
+  - node entry layout
+  - consistent snapshot read
+- [x] SYT-S1-T13c. Implement `ResolvePeerL2NameFromRouterSHM(...)` in `fluxbee-go-sdk`.
+- [x] SYT-S1-T13d. Switch `SY.timer` ownership enforcement from `uuid_persistence_dir` lookup to router SHM lookup.
+- [x] SYT-S1-T13e. Keep the file-based resolver only as a short-lived compatibility fallback during migration, or delete it immediately if the SHM path is validated quickly.
+- [x] SYT-S1-T13f. Add tests proving `uuid -> L2` resolution from router SHM snapshots.
+- [x] SYT-S1-T13g. Update docs to state explicitly that `SY.timer` uses local router SHM, not filesystem UUID files, for requester identity.
+- [x] SYT-S1-T13h. Stop inferring the router from `gateway_name`; consume the effective `router_name` received in `ANNOUNCE` and resolve identity against that router SHM.
 
 Current status after extraction:
 
@@ -158,9 +172,10 @@ Current status after extraction:
 - first migrated consumer: `SY.opa.rules`
 - local workspace wiring uses `go.mod replace ../fluxbee-go-sdk` during in-repo development
 - the old `sy-opa-rules/sdk` implementation has been removed to avoid dual sources of truth
-- v1 peer identity resolution is now explicit in the SDK via local `uuid_persistence_dir` lookup mapped to canonical L2 names for the local hive
+- peer identity resolution in the SDK now uses the effective `router_name` received in `ANNOUNCE`, reads that router identity file, opens that router SHM, and resolves `uuid -> canonical L2 name` from the live router node table
+- the transitional file-based resolver has been removed from the active path
 - direct `system` RPC helpers and `TIMER_RESPONSE` / `HELP` base types are now available for `SY.timer`
-- the current UUID->L2 resolver is intentionally tracked as transitional, not final platform architecture
+- local-only scope is intentional here: `SY.timer` is one-per-hive and only needs local requester identity
 
 ### SYT-S2 — Add `timer` client module to the Go SDK
 
@@ -285,7 +300,7 @@ Current status:
 - [x] SYT-S6-T10. Implement `TIMER_PARSE`.
 - [x] SYT-S6-T11. Implement `TIMER_FORMAT`.
 - [x] SYT-S6-T12. Implement `TIMER_HELP`.
-- [ ] SYT-S6-T13. Implement `TIMER_PURGE_OWNER` with orchestrator-only authorization.
+- [x] SYT-S6-T13. Implement `TIMER_PURGE_OWNER` with orchestrator-only authorization.
 
 Current status:
 
@@ -293,14 +308,12 @@ Current status:
 - recurring creation is live, including cron/timezone validation and next-fire computation
 - `TIMER_GET` / `TIMER_LIST` already expose recurring rows with `cron_spec` / `cron_tz`
 - recurrent firing, replay, and `TIMER_FIRED` emission remain part of `S5`
-- `TIMER_PURGE_OWNER` remains deferred until the orchestrator integration pass
+- `TIMER_PURGE_OWNER` is live with orchestrator-only authorization and is consumed by the orchestrator teardown path
 
 ### SYT-S7 — Authorization and identity
 
 - [x] SYT-S7-T1. Implement source UUID -> source L2 resolution path.
 - [x] SYT-S7-T2. Enforce strict ownership on:
-  - `TIMER_GET`
-  - `TIMER_LIST`
   - `TIMER_CANCEL`
   - `TIMER_RESCHEDULE`
 - [x] SYT-S7-T3. Enforce orchestrator-only permission for `TIMER_PURGE_OWNER`.
@@ -309,7 +322,8 @@ Current status:
 Current status:
 
 - requester identity is resolved from `routing.src` UUID into canonical L2 through the current `fluxbee-go-sdk` resolver
-- ownership checks are enforced on read/list/cancel/reschedule paths against persisted `owner_l2_name`
+- ownership checks are enforced on the owner-bound mutation paths against persisted `owner_l2_name`
+- `TIMER_GET` and `TIMER_LIST` are open read operations within the local hive, with optional filtering by `owner_l2_name`
 - `TIMER_PURGE_OWNER` now exists and is restricted to `SY.orchestrator@<local-hive>`
 - negative tests cover foreign owner access, unknown source UUIDs, and forbidden purge attempts
 
@@ -354,19 +368,21 @@ Current status:
 
 - `SY.admin` now exposes a narrow read-only surface for `SY.timer`:
   - `timer_help`
+  - `timer_get`
+  - `timer_list`
   - `timer_now`
   - `timer_now_in`
   - `timer_convert`
   - `timer_parse`
   - `timer_format`
-- owner-bound timer verbs remain SDK-only in v1:
+- owner-bound mutation verbs remain SDK-only in v1:
   - `TIMER_SCHEDULE`
   - `TIMER_SCHEDULE_RECURRING`
-  - `TIMER_GET`
-  - `TIMER_LIST`
   - `TIMER_CANCEL`
   - `TIMER_RESCHEDULE`
-- this is intentional because `SY.timer` ownership is enforced against the request source node identity (`routing.src` -> L2), so `SY.admin` is not a transparent proxy for per-node timer ownership semantics
+- `TIMER_GET` and `TIMER_LIST` are now open read operations inside the local hive
+- `TIMER_LIST` defaults to the full hive view and accepts optional `owner_l2_name`, `status_filter`, and `limit`
+- this allows `SY.admin` and Archi to inspect timers without introducing impersonation semantics into the ownership model
 
 ---
 

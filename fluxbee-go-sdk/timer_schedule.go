@@ -163,8 +163,11 @@ func (c *TimerClient) Get(ctx context.Context, id TimerID) (*TimerInfo, error) {
 	return &payload.Timer, nil
 }
 
-func (c *TimerClient) ListMine(ctx context.Context, filter ListFilter) ([]TimerInfo, error) {
+func (c *TimerClient) List(ctx context.Context, filter ListFilter) ([]TimerInfo, error) {
 	payloadMap := map[string]any{}
+	if filter.OwnerL2Name != "" {
+		payloadMap["owner_l2_name"] = filter.OwnerL2Name
+	}
 	if filter.StatusFilter != "" {
 		payloadMap["status_filter"] = filter.StatusFilter
 	}
@@ -191,6 +194,13 @@ func (c *TimerClient) ListMine(ctx context.Context, filter ListFilter) ([]TimerI
 		return nil, err
 	}
 	return payload.Timers, nil
+}
+
+func (c *TimerClient) ListMine(ctx context.Context, filter ListFilter) ([]TimerInfo, error) {
+	if filter.OwnerL2Name == "" {
+		filter.OwnerL2Name = c.sender.FullName()
+	}
+	return c.List(ctx, filter)
 }
 
 func validateAbsoluteScheduleTime(fireAt time.Time) error {

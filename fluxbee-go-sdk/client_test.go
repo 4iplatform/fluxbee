@@ -125,3 +125,15 @@ func TestPerformHandshakeReturnsAnnounceEnvelopeAndPayload(t *testing.T) {
 		t.Fatalf("server goroutine: %v", err)
 	}
 }
+
+func TestConnectionStateTracksRouterName(t *testing.T) {
+	var state connectionState
+	state.SetRouterName("RT.edge@motherbee")
+	if got := state.RouterName(); got != "RT.edge@motherbee" {
+		t.Fatalf("unexpected router name: %q", got)
+	}
+	state.SetRouterName("  RT.gateway@motherbee  ")
+	if got := state.RouterName(); got != "RT.gateway@motherbee" {
+		t.Fatalf("unexpected trimmed router name: %q", got)
+	}
+}

@@ -6,8 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"os"
-	"path/filepath"
+	"fmt"
 	"testing"
 	"time"
 
@@ -40,29 +39,23 @@ func (s *stubSender) FullName() string {
 
 func newTestService(t *testing.T) (*Service, chan []byte) {
 	t.Helper()
-	dir := t.TempDir()
-
-	motherbeeUUID := "11111111-1111-1111-1111-111111111111"
-	if err := osWriteFile(filepath.Join(dir, "WF.demo.uuid"), []byte(motherbeeUUID)); err != nil {
-		t.Fatalf("write wf uuid: %v", err)
-	}
-
 	db := openTestTimerDB(t)
 	tx := make(chan []byte, 8)
+	peerMap := map[string]string{
+		"11111111-1111-1111-1111-111111111111": "WF.demo@motherbee",
+	}
 	service := &Service{
-		sender:             &stubSender{uuid: "timer-node-uuid", fullName: "SY.timer@motherbee", tx: tx},
-		nodeName:           "SY.timer@motherbee",
-		db:                 db,
-		uuidPersistenceDir: dir,
+		sender:   &stubSender{uuid: "timer-node-uuid", fullName: "SY.timer@motherbee", tx: tx},
+		nodeName: "SY.timer@motherbee",
+		db:       db,
+		resolvePeerL2Name: func(sourceUUID string) (string, error) {
+			if name, ok := peerMap[sourceUUID]; ok {
+				return name, nil
+			}
+			return "", fmt.Errorf("source uuid %s not found", sourceUUID)
+		},
 	}
 	return service, tx
-}
-
-func registerUUID(t *testing.T, dir, l2Name, uuidValue string) {
-	t.Helper()
-	if err := osWriteFile(filepath.Join(dir, l2Name+".uuid"), []byte(uuidValue)); err != nil {
-		t.Fatalf("write %s uuid: %v", l2Name, err)
-	}
 }
 
 func TestRespondTimerSchedulePersistsOwnedTimer(t *testing.T) {
@@ -89,7 +82,7 @@ func TestRespondTimerSchedulePersistsOwnedTimer(t *testing.T) {
 	}
 }
 
-func TestRespondTimerGetRejectsForeignOwner(t *testing.T) {
+func TestRespondTimerGetAllowsReadingForeignTimer(t *testing.T) {
 	service, tx := newTestService(t)
 	insertOwnedTimer(t, service.db, timerRow{
 		UUID:         "timer-1",
@@ -108,7 +101,7 @@ func TestRespondTimerGetRejectsForeignOwner(t *testing.T) {
 		t.Fatalf("get timer: %v", err)
 	}
 	response := mustReadTimerResponse(t, tx)
-	if response.OK || response.Error == nil || response.Error.Code != "TIMER_NOT_OWNER" {
+	if !response.OK || response.Timer == nil || response.Timer.UUID != "timer-1" {
 		t.Fatalf("unexpected get response: %+v", response)
 	}
 }
@@ -258,7 +251,7 @@ func TestRespondTimerRescheduleRejectsRecurringTimer(t *testing.T) {
 	}
 }
 
-func TestRespondTimerListOnlyReturnsOwnerTimers(t *testing.T) {
+func TestRespondTimerListReturnsAllTimersByDefault(t *testing.T) {
 	service, tx := newTestService(t)
 	insertOwnedTimer(t, service.db, timerRow{
 		UUID:         "timer-owned",
@@ -304,8 +297,56 @@ func TestRespondTimerListOnlyReturnsOwnerTimers(t *testing.T) {
 	if err := json.Unmarshal(payloadData, &payload); err != nil {
 		t.Fatalf("decode list payload: %v", err)
 	}
-	if payload.Count != 1 || payload.Timers[0]["uuid"] != "timer-owned" {
+	if payload.Count != 2 {
 		t.Fatalf("unexpected list payload: %+v", payload)
+	}
+}
+
+func TestRespondTimerListFiltersByOwnerWhenRequested(t *testing.T) {
+	service, tx := newTestService(t)
+	insertOwnedTimer(t, service.db, timerRow{
+		UUID:         "timer-owned",
+		OwnerL2Name:  "WF.demo@motherbee",
+		TargetL2Name: "WF.demo@motherbee",
+		Kind:         "oneshot",
+		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+	})
+	insertOwnedTimer(t, service.db, timerRow{
+		UUID:         "timer-other",
+		OwnerL2Name:  "AI.other@motherbee",
+		TargetL2Name: "AI.other@motherbee",
+		Kind:         "oneshot",
+		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+	})
+
+	msg := mustBuildSystemMessage(t, map[string]any{
+		"owner_l2_name": "WF.demo@motherbee",
+		"status_filter": "pending",
+		"limit":         10,
+	}, "TIMER_LIST")
+	if err := service.respondTimerList(msg); err != nil {
+		t.Fatalf("list timers by owner: %v", err)
+	}
+	payloadData := mustReadResponsePayload(t, tx)
+	var payload struct {
+		OK     bool             `json:"ok"`
+		Verb   string           `json:"verb"`
+		Count  int              `json:"count"`
+		Timers []map[string]any `json:"timers"`
+	}
+	if err := json.Unmarshal(payloadData, &payload); err != nil {
+		t.Fatalf("decode list payload: %v", err)
+	}
+	if payload.Count != 1 || payload.Timers[0]["uuid"] != "timer-owned" {
+		t.Fatalf("unexpected filtered list payload: %+v", payload)
 	}
 }
 
@@ -335,7 +376,16 @@ func TestRespondTimerPurgeOwnerRequiresLocalOrchestrator(t *testing.T) {
 
 func TestRespondTimerPurgeOwnerDeletesTimersForOwner(t *testing.T) {
 	service, tx := newTestService(t)
-	registerUUID(t, service.uuidPersistenceDir, "SY.orchestrator@motherbee", "33333333-3333-3333-3333-333333333333")
+	service.resolvePeerL2Name = func(sourceUUID string) (string, error) {
+		switch sourceUUID {
+		case "11111111-1111-1111-1111-111111111111":
+			return "WF.demo@motherbee", nil
+		case "33333333-3333-3333-3333-333333333333":
+			return "SY.orchestrator@motherbee", nil
+		default:
+			return "", fmt.Errorf("source uuid %s not found", sourceUUID)
+		}
+	}
 
 	insertOwnedTimer(t, service.db, timerRow{
 		UUID:         "timer-owned-1",
@@ -441,8 +491,4 @@ func mustReadResponsePayload(t *testing.T, tx chan []byte) []byte {
 		t.Fatalf("decode sent message: %v", err)
 	}
 	return msg.Payload
-}
-
-func osWriteFile(path string, data []byte) error {
-	return os.WriteFile(path, data, 0o644)
 }

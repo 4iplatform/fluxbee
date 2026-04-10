@@ -25,6 +25,7 @@ const (
 )
 
 type ListFilter struct {
+	OwnerL2Name  string `json:"owner_l2_name,omitempty"`
 	StatusFilter string `json:"status_filter,omitempty"`
 	Limit        int    `json:"limit,omitempty"`
 }

@@ -169,6 +169,36 @@ func listTimers(ctx context.Context, db *sql.DB, ownerL2Name, statusFilter strin
 	if limit > maxListLimit {
 		limit = maxListLimit
 	}
+	if ownerL2Name == "" {
+		if statusFilter == "" || statusFilter == "all" {
+			rows, err := db.QueryContext(ctx, `
+SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
+       missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
+FROM timers
+ORDER BY fire_at_utc ASC
+LIMIT ?
+`, limit)
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+			return collectTimerRows(rows)
+		}
+
+		rows, err := db.QueryContext(ctx, `
+SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
+       missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
+FROM timers
+WHERE status=?
+ORDER BY fire_at_utc ASC
+LIMIT ?
+`, statusFilter, limit)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return collectTimerRows(rows)
+	}
 	if statusFilter == "" || statusFilter == "all" {
 		rows, err := db.QueryContext(ctx, `
 SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,

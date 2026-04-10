@@ -19,7 +19,7 @@ Forma parte de la familia de nodos del sistema, junto con `SY.storage`, `SY.admi
 
 **No es un sistema de tiempo real.** `SY.timer` está diseñado para workflows, cognición, agentes y automatización. La granularidad mínima de un timer es **60 segundos**, la precisión de disparo es *best-effort* con tolerancia del orden de segundos, y la carga esperada es de hasta ~10.000 timers concurrentes por hive.
 
-**Ownership estricto por nombre L2.** Cada nodo solo puede ver, modificar y cancelar sus propios timers. La única excepción es `SY.orchestrator`, que puede invocar `TIMER_PURGE_OWNER` como parte del teardown de un nodo. La resolución `routing.src (UUID) -> nombre L2` se realiza a través del runtime/SDK Go, no por heurística local del nodo. En v1, el SDK Go resuelve esa identidad desde el registro local de UUIDs persistidos en `uuid_persistence_dir` (normalmente `/var/lib/fluxbee/state/nodes`).
+**Ownership estricto por nombre L2 para mutaciones.** Cada nodo puede crear, cancelar y reschedulear sus propios timers. La lectura (`TIMER_GET`, `TIMER_LIST`) es abierta dentro del hive. La única excepción de mutación administrativa es `SY.orchestrator`, que puede invocar `TIMER_PURGE_OWNER` como parte del teardown de un nodo. La resolución `routing.src (UUID) -> nombre L2` se realiza a través del runtime/SDK Go leyendo la SHM del router local al que el nodo quedó efectivamente conectado según el `ANNOUNCE`, no por heurística local del nodo ni por archivos `.uuid`.
 
 ---
 
@@ -28,7 +28,7 @@ Forma parte de la familia de nodos del sistema, junto con `SY.storage`, `SY.admi
 - **Autonomía por hive.** Un `SY.timer` por hive, sin sincronización cruzada. Si un host cae, solo se ven afectados los timers locales a ese hive.
 - **Delegación del tiempo al SO.** `SY.timer` no implementa NTP ni sincronización externa. Lee el reloj del SO y confía en que el operador lo mantiene sincronizado.
 - **Fuente única de verdad temporal.** Cualquier nodo que necesite `now()` consistente a nivel hive lo pide a `SY.timer`. No hay cache local, no hay offsets locales: roundtrip por cada llamada, con reintento acotado en el SDK.
-- **Ownership estricto.** Un nodo solo opera sobre sus propios timers. Sin nodo admin, sin override, sin capabilities ocultas.
+- **Mutación con ownership estricto.** Crear/cancelar/reschedulear mantiene aislamiento por owner L2. La lectura es deliberadamente abierta para observabilidad del hive.
 - **Excepción única y explícita.** `SY.orchestrator` puede purgar todos los timers de un owner al borrar un nodo. Es la única vía por la que un timer puede ser tocado por alguien que no sea su creador.
 - **JSON descriptivo y extensible.** Los nombres de campos son auto-explicativos, los enums son strings legibles, los errores devuelven mensajes humanos además de códigos. Todos los requests aceptan un campo `metadata` libre que `SY.timer` persiste sin interpretar, pensado para que clientes LLM puedan anotar contexto extra (razones, correlaciones, recordatorios humanos) sin romper el schema.
 - **SDK como frontera de abstracción.** Los autores de nodos cliente nunca arman JSON a mano ni resuelven nombres L2. Llaman funciones tipadas del SDK y reciben tipos nativos (`time.Time`, structs). Si cambia el wire format, cambia el SDK, no los nodos.
@@ -58,16 +58,14 @@ En v1, `SY.admin` expone solo una superficie **read-only** y de introspección p
 - `timer_parse`
 - `timer_format`
 
-Las operaciones owner-bound siguen fuera de `SY.admin` y se mantienen como uso directo vía SDK:
+Las operaciones owner-bound de mutación siguen fuera de `SY.admin` y se mantienen como uso directo vía SDK:
 
 - `TIMER_SCHEDULE`
 - `TIMER_SCHEDULE_RECURRING`
-- `TIMER_GET`
-- `TIMER_LIST`
 - `TIMER_CANCEL`
 - `TIMER_RESCHEDULE`
 
-La razón es arquitectónica: `SY.timer` autoriza por identidad efectiva del requester (`routing.src` resuelto a L2). `SY.admin` no actúa como proxy transparente de ownership para timers en v1.
+`TIMER_GET` y `TIMER_LIST` sí pueden exponerse por `SY.admin` porque la lectura es abierta en v1. La razón para mantener scheduling y mutaciones fuera de admin es arquitectónica: `SY.timer` autoriza esas operaciones por identidad efectiva del requester (`routing.src` resuelto a L2), y `SY.admin` no actúa como proxy transparente de ownership.
 
 Nodos futuros con interacción directa (por ejemplo `WF.*`, `SY.policy`, capabilities invocables) deben implementar su propia operación `HELP` equivalente. La generalización del protocolo, los campos comunes y el naming se formalizarán en un documento aparte cuando aparezca el segundo o tercer caso.
 
@@ -243,8 +241,8 @@ Todos los mensajes siguen el envelope estándar de Fluxbee:
 | `TIMER_SCHEDULE_RECURRING` | Crear timer recurrente (cron) |
 | `TIMER_CANCEL` | Cancelar timer propio |
 | `TIMER_RESCHEDULE` | Modificar `fire_at` de timer propio pendiente |
-| `TIMER_GET` | Obtener un timer propio por uuid |
-| `TIMER_LIST` | Listar timers propios del requester |
+| `TIMER_GET` | Obtener un timer por uuid |
+| `TIMER_LIST` | Listar timers del hive, opcionalmente filtrados por owner |
 | `TIMER_NOW` | Obtener instante actual en UTC |
 | `TIMER_NOW_IN` | Obtener instante actual en timezone especificada |
 | `TIMER_CONVERT` | Convertir instante entre timezones |
@@ -438,16 +436,17 @@ El mínimo de 60s se aplica al `new_fire_at` también.
 }
 ```
 
-Ownership: el timer debe pertenecer al requester. Error `TIMER_NOT_OWNER` si no.
+Lectura abierta dentro del hive. No requiere ownership del requester.
 
 ### 7.6 `TIMER_LIST`
 
-Lista los timers del requester. Sin parámetros = todos los propios.
+Lista timers del hive local. Sin parámetros = todos los `pending`. Puede filtrarse por `owner_l2_name`.
 
 ```json
 {
   "meta": { "msg": "TIMER_LIST" },
   "payload": {
+    "owner_l2_name": "WF.onboarding@motherbee",
     "status_filter": "pending",
     "limit": 100
   }
@@ -456,6 +455,7 @@ Lista los timers del requester. Sin parámetros = todos los propios.
 
 | Campo | Descripción |
 |---|---|
+| `owner_l2_name` | Filtro opcional por owner canónico L2. |
 | `status_filter` | `"pending"`, `"fired"`, `"canceled"`, o `"all"` (default `"pending"`). |
 | `limit` | Máximo de resultados. Default 100, máximo 1000. |
 
@@ -471,7 +471,7 @@ Lista los timers del requester. Sin parámetros = todos los propios.
 }
 ```
 
-El filtro por `owner_l2_name = sender_l2_name(routing.src)` es implícito y no se puede desactivar desde un nodo normal.
+`owner_l2_name` es opcional. Si se omite, `SY.timer` lista el conjunto completo del hive sujeto a `status_filter` y `limit`.
 
 ### 7.7 `TIMER_PURGE_OWNER` (uso exclusivo de `SY.orchestrator`)
 
@@ -766,15 +766,20 @@ Al arranque del nodo:
 
 ### 12.1 Regla general
 
-Para `TIMER_CANCEL`, `TIMER_RESCHEDULE`, `TIMER_GET`:
+Para `TIMER_CANCEL`, `TIMER_RESCHEDULE`:
 ```
 if timer.owner_l2_name != sender_l2_name(routing.src):
     return error TIMER_NOT_OWNER
 ```
 
+Para `TIMER_GET`:
+```
+read timer by uuid without ownership restriction
+```
+
 Para `TIMER_LIST`:
 ```
-query: WHERE owner_l2_name = sender_l2_name(routing.src)
+query: optional WHERE owner_l2_name = <owner_l2_name>
 ```
 
 ### 12.2 Excepción única
@@ -787,7 +792,7 @@ if sender_l2_name(routing.src) != "SY.orchestrator@<local-hive>":
 
 La validación se hace por nombre L2 del sender, resolviendo `routing.src` (UUID L1) a través del runtime/SDK Go y confiando en la capa L2 del router para la integridad de esa identidad. Esto es consistente con el modelo de autorización del resto de nodos del sistema.
 
-En v1 actual, esa resolución en Go usa el registro local de UUID persistidos del runtime. Está tratado como solución transicional y ya quedó explicitado en el plan para migrarlo después a la ruta canónica compartida de identidad de plataforma.
+En v1 actual, esa resolución en Go toma el `router_name` recibido en el `ANNOUNCE`, lee `state/<router_l2_name>/identity.yaml` para ubicar el `shm.name`, abre esa router SHM en modo read-only y resuelve `uuid -> L2` desde la tabla viva de nodos conectados a ese router.
 
 ### 12.3 Flujo de borrado de nodo
 
@@ -965,7 +970,7 @@ node.OnSystemMessage("TIMER_FIRED", func(msg Message) error {
 | `TIMER_INVALID_TIMEZONE` | `tz` / `cron_tz` no es una zona IANA válida. |
 | `TIMER_INVALID_PAYLOAD` | `payload` del request no es JSON válido o faltan campos obligatorios. |
 | `TIMER_NOT_FOUND` | `timer_uuid` no existe. |
-| `TIMER_NOT_OWNER` | El requester no es dueño del timer. |
+| `TIMER_NOT_OWNER` | El requester no es dueño del timer para verbos de mutación (`TIMER_CANCEL`, `TIMER_RESCHEDULE`). |
 | `TIMER_ALREADY_FIRED` | Timer ya disparado, no se puede cancelar/reprogramar. |
 | `TIMER_RECURRING_NOT_RESCHEDULABLE` | No se permite reschedule sobre recurrentes en v1. |
 | `TIMER_FORBIDDEN` | Operación restringida (ej. `TIMER_PURGE_OWNER` desde nodo no-orchestrator). |
