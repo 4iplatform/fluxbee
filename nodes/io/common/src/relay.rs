@@ -317,6 +317,12 @@ where
         &mut self.store
     }
 
+    pub fn replace_policy(&mut self, policy: RelayPolicy) -> Result<(), String> {
+        policy.validate()?;
+        self.policy = policy;
+        Ok(())
+    }
+
     pub fn handle_fragment(&mut self, fragment: RelayFragment) -> RelayDecision {
         if !self.policy.enabled || self.policy.relay_window_ms == 0 {
             tracing::debug!(
@@ -769,5 +775,17 @@ mod tests {
             relay.handle_fragment(test_fragment("k2", "f2", 20, "b")),
             RelayDecision::RejectCapacity
         ));
+    }
+
+    #[test]
+    fn replace_policy_updates_runtime_settings() {
+        let mut relay = RelayBuffer::new(test_policy(), InMemoryRelayStore::new()).expect("relay");
+        let mut next = relay.policy().clone();
+        next.relay_window_ms = 250;
+        next.max_open_sessions = 4;
+
+        relay.replace_policy(next.clone()).expect("replace policy");
+
+        assert_eq!(relay.policy(), &next);
     }
 }

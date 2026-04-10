@@ -4,7 +4,7 @@ This subtree hosts IO crates isolated from core routing/AI crates.
 
 ## Crates
 
-- `crates/io-common`: shared IO helpers (dedup, identity lookup, io context).
+- `crates/io-common`: shared IO helpers (dedup, identity lookup, io context, inbound relay/sessionization).
 - `crates/io-sim`: simulation IO node for local/Linux E2E tests (stdin/--once inbound, log-only outbound).
 - `crates/io-slack`: Slack IO node (Socket Mode inbound, Web API outbound).
 
@@ -87,9 +87,24 @@ Optional env vars:
 - `DEDUP_TTL_MS` (default `600000`)
 - `DEDUP_MAX_ENTRIES` (default `50000`)
 - `IO_SLACK_DST_NODE` (optional fixed unicast destination, e.g. `AI.chat@sandbox`; if omitted uses `resolve`; keep fixed dst for test/recovery only, not production baseline)
-- `SLACK_SESSION_WINDOW_MS` (default `0` to disable)
-- `SLACK_SESSION_MAX_SESSIONS` (default `10000`)
-- `SLACK_SESSION_MAX_FRAGMENTS` (default `8`)
+
+Relay note:
+
+- relay config now belongs to formal node config under `config.io.relay.*`
+- relevant keys:
+  - `config.io.relay.window_ms`
+  - `config.io.relay.max_open_sessions`
+  - `config.io.relay.max_fragments_per_session`
+  - `config.io.relay.max_bytes_per_session`
+- `config.io.relay.window_ms=0` means relay passthrough
+- `config.io.relay.window_ms>0` means short-window consolidation before the router
+- `IO.slack` no longer owns a private `SlackSessionizer`
+- `SLACK_SESSION_*` remains only as temporary compatibility fallback for unmanaged/local env boot, not as canonical runtime surface for spawned nodes
+
+Logging note:
+
+- canonical runtime publish defaults include `io_common=debug`, so relay event logs should show in `journalctl`
+- local installs via `install-io.sh` only show those debug logs if `/etc/fluxbee/io-slack.env` defines `RUST_LOG`
 
 Identity behavior is provision-on-miss by default in current IO nodes (no mode flag required).
 

@@ -90,21 +90,30 @@ Slack puede reenviar eventos si:
 
 ---
 
-## 5. Sessionización (Slack)
+## 5. Relay inbound (Slack)
 
 ### Objetivo
-Agrupar múltiples mensajes consecutivos del mismo usuario en el mismo canal/hilo
-en un único turno lógico.
+Agrupar múltiples fragmentos inbound del mismo usuario en el mismo canal/hilo
+en un único turno lógico antes de enviarlo al router.
 
 ### Reglas MVP
-- **PUEDE** aplicarse sessionización para Slack.
+- Slack ya no mantiene un `SlackSessionizer` privado.
+- El mecanismo de relay/sessionización vive en `io-common` y `IO.slack` solo aporta la semántica del canal.
 - Clave sugerida:
 ```
 (channel, user, thread_ts || channel)
 ```
-- Ventana de tiempo configurable (ej: 2-5 segundos).
-- Si el nodo se reinicia durante la ventana, el MVP **PUEDE** aceptar pérdida
-de agrupamiento (mensajes procesados separados).
+- Derivación implementada hoy:
+```
+slack:<team_id>:<channel>:<thread_ts||channel>:<user>
+```
+- Ventana de tiempo configurable.
+- `relay_window_ms = 0` implica passthrough inmediato.
+- `relay_window_ms > 0` implica consolidación dentro de la ventana configurada.
+- La superficie formal de configuración del relay es `config.io.relay.*`.
+- `IO.slack` toma esa config desde spawn config/bootstrap y la puede actualizar en caliente por `CONFIG_SET`.
+- Si el nodo se reinicia durante la ventana, el modo `memory` puede perder agrupamiento y emitir mensajes separados.
+- El flush del relay produce un único `text/v1` y recién ahí corre el pipeline común de identidad/forward.
 
 ---
 
@@ -139,6 +148,8 @@ El control de flujo (espera/reinyección) es responsabilidad de `WF.onboarding` 
 
 Además de `meta.src_ilk` (o `null`), el IO Slack **DEBE** adjuntar el bloque estandarizado `meta.context.io` (contrato IO Context), incluyendo `entrypoint` (workspace), `conversation` (channel/thread) y `reply_target` (channel + thread_ts).
 
+Si el mensaje pasó por relay, también **DEBE** adjuntar `meta.context.io.relay.*` con metadata de trazabilidad del ensamblado.
+
 Por cada evento válido (`app_mention`), el Nodo IO Slack **DEBE** construir un
 `Message` del protocolo interno con:
 
@@ -168,6 +179,12 @@ Interpretación operativa:
       "kind": "slack_post",
       "address": "<channel>",
       "params": { "thread_ts": "<thread_ts si existe>", "workspace_id": "<team_id>" }
+    },
+    "relay": {
+      "applied": true,
+      "reason": "window_elapsed|explicit_final|max_fragments|...",
+      "parts": 3,
+      "window_ms": 2500
     }
   }
 }
@@ -389,7 +406,8 @@ Según la especificación del Router v1.16:
 ## Retries y deduplicación
 
 ✅ **NORMATIVO (HOY, Socket Mode)**:
-- La deduplicación se hace por un `message_id` estable (preferentemente `event_id`; fallback `ts`) dentro de la ventana del sessionizer.
+- La deduplicación general sigue usando un `message_id` estable (preferentemente `event_id`; fallback `ts`).
+- Además, el relay común hace deduplicación best-effort por `fragment_id` dentro de cada sesión abierta.
 - No se depende de headers `X-Slack-Retry-*` (propios de HTTP Events API), dado que el modo activo es Socket Mode.
 
 🧩 **A ESPECIFICAR**:
@@ -405,6 +423,28 @@ Según la especificación del Router v1.16:
   1) Override en memoria recibido por `CONFIG_SET` (si existe)
   2) Config local (YAML/env)
 - En reinicio, el override en memoria se pierde; si no hay config local, el nodo puede quedar `FAILED_CONFIG (missing_secret)` hasta recibir `CONFIG_SET` nuevamente.
+
+Superficie vigente de relay en `CONFIG_SET` / config efectiva:
+
+- `config.io.relay.window_ms`
+- `config.io.relay.max_open_sessions`
+- `config.io.relay.max_fragments_per_session`
+- `config.io.relay.max_bytes_per_session`
+
+## Logging operativo del relay
+
+Política vigente:
+
+- no usar logs periódicos ni snapshots constantes;
+- usar logs por evento relevante del relay;
+- `debug` para apertura de sesión, buffering, flush y dedup;
+- `warn` para capacidad, expiración, drops o fallback fail-open;
+- `info` para la inicialización de política del relay al arranque.
+
+Observación de deploy:
+
+- en el camino canónico de runtime, el `start.sh` publicado deja `RUST_LOG` incluyendo `io_common=debug`, por lo que los logs del relay deberían verse en `journalctl`;
+- en installs locales con `install-io.sh`, si `/etc/fluxbee/io-slack.env` no define `RUST_LOG`, esos `debug` pueden no aparecer aunque el relay esté activo.
 
 
 

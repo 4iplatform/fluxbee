@@ -166,7 +166,15 @@ curl -sS -X POST \
     "config_version":8,
     "apply_mode":"replace",
     "config":{
-      "io":{"dst_node":"AI.chat@motherbee"},
+      "io":{
+        "dst_node":"AI.chat@motherbee",
+        "relay":{
+          "window_ms":2500,
+          "max_open_sessions":10000,
+          "max_fragments_per_session":8,
+          "max_bytes_per_session":262144
+        }
+      },
       "slack":{"app_token_ref":"env:SLACK_APP_TOKEN","bot_token_ref":"env:SLACK_BOT_TOKEN"}
     }
   }'
@@ -216,6 +224,26 @@ Opcional:
 
 - `CONFIG_GET` y revisar `metrics.control_plane`
 - `GET /hives/{id}/versions` y revisar readiness de `IO.slack` en versión actual
+
+### Logs del relay
+
+El relay inbound de `IO.slack` vive en `io-common` y su logging actual es event-driven.
+
+Qué esperar:
+
+- `info`: `io-slack relay policy initialized`
+- `debug`: `relay session opened`, `relay fragment buffered`, `relay session flushed`, `relay duplicate fragment dropped`, `relay passthrough immediate`
+- `warn`: `relay capacity rejected`, drops por expiración/límites y fallback fail-open
+
+Cómo verlo en runtime canónico:
+
+- el runtime publicado por `scripts/publish-io-runtime.sh` ya incluye `RUST_LOG` default con `io_common=debug`
+- por eso, en deploy canónico, esos eventos deberían aparecer en `journalctl`
+
+Cómo verlo en install local:
+
+- si el nodo se levantó con `install-io.sh`, revisar `/etc/fluxbee/io-slack.env`
+- si `RUST_LOG` no está definido, los logs `debug` del relay pueden no verse
 
 ---
 

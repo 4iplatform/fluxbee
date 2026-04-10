@@ -118,20 +118,6 @@ async fn main() -> Result<()> {
             .map_err(|err| anyhow::anyhow!("invalid blob runtime config: {err}"))?,
     );
     let blob_payload_cfg = config.blob_runtime.text_v1.clone();
-    let relay_policy = slack_relay_policy(&config)
-        .map_err(|err| anyhow::anyhow!("invalid relay policy from slack config: {err}"))?;
-    tracing::info!(
-        relay_enabled = relay_policy.enabled,
-        relay_window_ms = relay_policy.relay_window_ms,
-        relay_max_open_sessions = relay_policy.max_open_sessions,
-        relay_max_fragments = relay_policy.max_fragments_per_session,
-        relay_max_bytes = relay_policy.max_bytes_per_session,
-        "io-slack relay policy initialized"
-    );
-    let relay = Arc::new(Mutex::new(
-        RelayBuffer::new(relay_policy.clone(), InMemoryRelayStore::new())
-            .map_err(|err| anyhow::anyhow!("invalid relay policy: {err}"))?,
-    ));
     let mut boot_state = bootstrap_io_control_plane_state(&config.state_dir, &config.node_name)
         .unwrap_or_else(|err| {
             tracing::warn!(
@@ -161,6 +147,25 @@ async fn main() -> Result<()> {
             }
         }
     }
+    let relay_policy = slack_relay_policy(&config, boot_state.effective_config.as_ref())
+        .map_err(|err| anyhow::anyhow!("invalid relay policy from node config: {err}"))?;
+    tracing::info!(
+        relay_enabled = relay_policy.enabled,
+        relay_window_ms = relay_policy.relay_window_ms,
+        relay_max_open_sessions = relay_policy.max_open_sessions,
+        relay_max_fragments = relay_policy.max_fragments_per_session,
+        relay_max_bytes = relay_policy.max_bytes_per_session,
+        relay_source = if boot_state.effective_config.is_some() {
+            "effective_config"
+        } else {
+            "spawn_config"
+        },
+        "io-slack relay policy initialized"
+    );
+    let relay = Arc::new(Mutex::new(
+        RelayBuffer::new(relay_policy.clone(), InMemoryRelayStore::new())
+            .map_err(|err| anyhow::anyhow!("invalid relay policy: {err}"))?,
+    ));
     let control_plane = Arc::new(RwLock::new(boot_state.clone()));
     let control_metrics = Arc::new(IoControlPlaneMetrics::with_initial_state(
         boot_state.current_state.as_str(),
@@ -178,6 +183,7 @@ async fn main() -> Result<()> {
         adapter_contract.clone(),
         inbound.clone(),
         slack.clone(),
+        relay.clone(),
         blob_toolkit.clone(),
         blob_payload_cfg.clone(),
     ));
@@ -194,27 +200,15 @@ async fn main() -> Result<()> {
         blob_payload_cfg.clone(),
     ));
 
-    let relay_flush_task = if relay_policy.enabled && relay_policy.relay_window_ms > 0 {
-        Some(tokio::spawn(run_relay_flush_loop(
-            relay,
-            sender,
-            identity,
-            provisioner,
-            inbound,
-            relay_policy.relay_window_ms,
-        )))
-    } else {
-        None
-    };
+    let relay_flush_task = tokio::spawn(run_relay_flush_loop(
+        relay,
+        sender,
+        identity,
+        provisioner,
+        inbound,
+    ));
 
-    match relay_flush_task {
-        Some(relay_flush_task) => {
-            let _ = tokio::join!(inbound_task, outbound_task, relay_flush_task);
-        }
-        None => {
-            let _ = tokio::join!(inbound_task, outbound_task);
-        }
-    }
+    let _ = tokio::join!(inbound_task, outbound_task, relay_flush_task);
     Ok(())
 }
 
@@ -236,10 +230,27 @@ struct Config {
     dst_node: Option<String>,
     identity_target: String,
     identity_timeout_ms: u64,
-    slack_session_window_ms: u64,
-    slack_session_max_sessions: usize,
-    slack_session_max_fragments: usize,
+    relay: SlackRelayConfig,
     blob_runtime: IoBlobRuntimeConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlackRelayConfig {
+    window_ms: u64,
+    max_open_sessions: usize,
+    max_fragments_per_session: usize,
+    max_bytes_per_session: usize,
+}
+
+impl Default for SlackRelayConfig {
+    fn default() -> Self {
+        Self {
+            window_ms: 0,
+            max_open_sessions: 10_000,
+            max_fragments_per_session: 8,
+            max_bytes_per_session: 256 * 1024,
+        }
+    }
 }
 
 impl Config {
@@ -348,6 +359,47 @@ impl Config {
             text_v1: text_v1_cfg,
             resolve_retry,
         };
+        let relay = SlackRelayConfig {
+            window_ms: json_get_u64_opt(
+                spawn_doc,
+                &[
+                    "config.io.relay.window_ms",
+                    "io.relay.window_ms",
+                    "relay.window_ms",
+                ],
+            )
+            .or_else(|| env("SLACK_SESSION_WINDOW_MS").and_then(|v| v.parse().ok()))
+            .unwrap_or_default(),
+            max_open_sessions: json_get_usize_opt(
+                spawn_doc,
+                &[
+                    "config.io.relay.max_open_sessions",
+                    "io.relay.max_open_sessions",
+                    "relay.max_open_sessions",
+                ],
+            )
+            .or_else(|| env("SLACK_SESSION_MAX_SESSIONS").and_then(|v| v.parse().ok()))
+            .unwrap_or(10_000),
+            max_fragments_per_session: json_get_usize_opt(
+                spawn_doc,
+                &[
+                    "config.io.relay.max_fragments_per_session",
+                    "io.relay.max_fragments_per_session",
+                    "relay.max_fragments_per_session",
+                ],
+            )
+            .or_else(|| env("SLACK_SESSION_MAX_FRAGMENTS").and_then(|v| v.parse().ok()))
+            .unwrap_or(8),
+            max_bytes_per_session: json_get_usize_opt(
+                spawn_doc,
+                &[
+                    "config.io.relay.max_bytes_per_session",
+                    "io.relay.max_bytes_per_session",
+                    "relay.max_bytes_per_session",
+                ],
+            )
+            .unwrap_or(256 * 1024),
+        };
 
         Ok(Self {
             slack_app_token,
@@ -409,15 +461,7 @@ impl Config {
                     json_get_u64_opt(spawn_doc, &["identity.timeout_ms", "identity_timeout_ms"])
                 })
                 .unwrap_or(10_000),
-            slack_session_window_ms: env("SLACK_SESSION_WINDOW_MS")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            slack_session_max_sessions: env("SLACK_SESSION_MAX_SESSIONS")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10_000),
-            slack_session_max_fragments: env("SLACK_SESSION_MAX_FRAGMENTS")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
+            relay,
             blob_runtime,
         })
     }
@@ -516,6 +560,10 @@ fn json_get_u64_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<u64> {
         }
     }
     None
+}
+
+fn json_get_usize_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<usize> {
+    json_get_u64_opt(doc, dotted_paths).and_then(|value| usize::try_from(value).ok())
 }
 
 fn resolve_secret(doc: Option<&Value>, value_paths: &[&str], ref_paths: &[&str]) -> Option<String> {
@@ -1169,10 +1217,8 @@ async fn run_relay_flush_loop(
     identity: Arc<dyn IdentityResolver>,
     provisioner: Arc<dyn IdentityProvisioner>,
     inbound: Arc<Mutex<InboundProcessor>>,
-    relay_window_ms: u64,
 ) -> Result<()> {
-    let tick_ms = relay_window_ms.clamp(25, 250);
-    let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
     loop {
         interval.tick().await;
         let turns = relay.lock().await.flush_expired(now_epoch_ms());
@@ -1195,12 +1241,18 @@ fn slack_relay_key(team_id: &str, user: &str, channel: &str, thread_ts: Option<&
     format!("slack:{team_id}:{channel}:{thread_or_channel}:{user}")
 }
 
-fn slack_relay_policy(config: &Config) -> Result<RelayPolicy> {
+fn slack_relay_policy(config: &Config, effective_config: Option<&Value>) -> Result<RelayPolicy> {
+    let relay_cfg = extract_runtime_relay_config(effective_config, &config.relay)?;
+    slack_relay_policy_from_config(&relay_cfg)
+}
+
+fn slack_relay_policy_from_config(relay_cfg: &SlackRelayConfig) -> Result<RelayPolicy> {
     let mut policy = RelayPolicy {
-        enabled: config.slack_session_window_ms > 0,
-        relay_window_ms: config.slack_session_window_ms,
-        max_open_sessions: config.slack_session_max_sessions,
-        max_fragments_per_session: config.slack_session_max_fragments,
+        enabled: relay_cfg.window_ms > 0,
+        relay_window_ms: relay_cfg.window_ms,
+        max_open_sessions: relay_cfg.max_open_sessions,
+        max_fragments_per_session: relay_cfg.max_fragments_per_session,
+        max_bytes_per_session: relay_cfg.max_bytes_per_session,
         ..RelayPolicy::default()
     };
     if policy.relay_window_ms == 0 {
@@ -1214,6 +1266,74 @@ fn slack_relay_policy(config: &Config) -> Result<RelayPolicy> {
     }
     policy.validate().map_err(|err| anyhow::anyhow!(err))?;
     Ok(policy)
+}
+
+fn extract_runtime_relay_config(
+    effective_config: Option<&Value>,
+    defaults: &SlackRelayConfig,
+) -> Result<SlackRelayConfig> {
+    let relay_root = effective_config
+        .and_then(|cfg| cfg.get("io"))
+        .and_then(|io| io.get("relay"));
+    let window_ms = relay_root
+        .and_then(|relay| relay.get("window_ms"))
+        .map(parse_config_u64)
+        .transpose()?
+        .unwrap_or(defaults.window_ms);
+    let max_open_sessions = relay_root
+        .and_then(|relay| relay.get("max_open_sessions"))
+        .map(parse_config_usize)
+        .transpose()?
+        .unwrap_or(defaults.max_open_sessions);
+    let max_fragments_per_session = relay_root
+        .and_then(|relay| relay.get("max_fragments_per_session"))
+        .map(parse_config_usize)
+        .transpose()?
+        .unwrap_or(defaults.max_fragments_per_session);
+    let max_bytes_per_session = relay_root
+        .and_then(|relay| relay.get("max_bytes_per_session"))
+        .map(parse_config_usize)
+        .transpose()?
+        .unwrap_or(defaults.max_bytes_per_session);
+
+    let relay = SlackRelayConfig {
+        window_ms,
+        max_open_sessions,
+        max_fragments_per_session,
+        max_bytes_per_session,
+    };
+    validate_slack_relay_config(&relay)?;
+    Ok(relay)
+}
+
+fn parse_config_u64(value: &Value) -> Result<u64> {
+    value
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("relay config value must be a non-negative integer"))
+}
+
+fn parse_config_usize(value: &Value) -> Result<usize> {
+    let raw = parse_config_u64(value)?;
+    usize::try_from(raw).map_err(|_| anyhow::anyhow!("relay config value exceeds usize range"))
+}
+
+fn validate_slack_relay_config(relay: &SlackRelayConfig) -> Result<()> {
+    if relay.max_open_sessions == 0 {
+        return Err(anyhow::anyhow!(
+            "io.relay.max_open_sessions must be greater than zero"
+        ));
+    }
+    if relay.max_fragments_per_session == 0 {
+        return Err(anyhow::anyhow!(
+            "io.relay.max_fragments_per_session must be greater than zero"
+        ));
+    }
+    if relay.max_bytes_per_session == 0 {
+        return Err(anyhow::anyhow!(
+            "io.relay.max_bytes_per_session must be greater than zero"
+        ));
+    }
+    Ok(())
 }
 
 fn now_epoch_ms() -> u64 {
@@ -1413,7 +1533,11 @@ async fn collect_slack_blob_attachments(
 
 #[cfg(test)]
 mod tests {
-    use super::default_slack_allowed_mimes;
+    use super::{
+        default_slack_allowed_mimes, extract_runtime_relay_config, slack_relay_policy_from_config,
+        SlackRelayConfig,
+    };
+    use serde_json::json;
 
     #[test]
     fn default_slack_allowed_mimes_include_office_common_types() {
@@ -1440,6 +1564,77 @@ mod tests {
         assert!(allowed.contains(&"image/jpeg".to_string()));
         assert!(allowed.contains(&"application/pdf".to_string()));
         assert!(allowed.contains(&"application/json".to_string()));
+    }
+
+    #[test]
+    fn extract_runtime_relay_config_uses_effective_config_values() {
+        let defaults = SlackRelayConfig::default();
+        let relay = extract_runtime_relay_config(
+            Some(&json!({
+                "io": {
+                    "relay": {
+                        "window_ms": 2500,
+                        "max_open_sessions": 2000,
+                        "max_fragments_per_session": 6,
+                        "max_bytes_per_session": 131072
+                    }
+                }
+            })),
+            &defaults,
+        )
+        .expect("relay config");
+
+        assert_eq!(relay.window_ms, 2500);
+        assert_eq!(relay.max_open_sessions, 2000);
+        assert_eq!(relay.max_fragments_per_session, 6);
+        assert_eq!(relay.max_bytes_per_session, 131072);
+    }
+
+    #[test]
+    fn extract_runtime_relay_config_falls_back_to_defaults_when_absent() {
+        let defaults = SlackRelayConfig {
+            window_ms: 1700,
+            max_open_sessions: 222,
+            max_fragments_per_session: 4,
+            max_bytes_per_session: 99_999,
+        };
+        let relay = extract_runtime_relay_config(Some(&json!({ "io": {} })), &defaults)
+            .expect("relay defaults");
+
+        assert_eq!(relay, defaults);
+    }
+
+    #[test]
+    fn slack_relay_policy_from_config_disables_passthrough_when_window_zero() {
+        let relay = SlackRelayConfig {
+            window_ms: 0,
+            ..SlackRelayConfig::default()
+        };
+
+        let policy = slack_relay_policy_from_config(&relay).expect("policy");
+
+        assert!(!policy.enabled);
+        assert_eq!(policy.relay_window_ms, 0);
+    }
+
+    #[test]
+    fn extract_runtime_relay_config_rejects_zero_limits() {
+        let err = extract_runtime_relay_config(
+            Some(&json!({
+                "io": {
+                    "relay": {
+                        "max_open_sessions": 0
+                    }
+                }
+            })),
+            &SlackRelayConfig::default(),
+        )
+        .expect_err("must reject zero");
+
+        assert_eq!(
+            err.to_string(),
+            "io.relay.max_open_sessions must be greater than zero"
+        );
     }
 }
 
@@ -1490,6 +1685,7 @@ async fn run_outbound_loop(
     adapter_contract: Arc<dyn IoAdapterConfigContract>,
     inbound: Arc<Mutex<InboundProcessor>>,
     slack: Arc<SlackClients>,
+    relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
     blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
     blob_payload_cfg: IoTextBlobConfig,
 ) -> Result<()> {
@@ -1537,6 +1733,7 @@ async fn run_outbound_loop(
             adapter_contract.as_ref(),
             inbound.clone(),
             slack.clone(),
+            relay.clone(),
         )
         .await
         {
@@ -1716,6 +1913,7 @@ async fn handle_io_control_plane_message(
     adapter_contract: &dyn IoAdapterConfigContract,
     inbound: Arc<Mutex<InboundProcessor>>,
     slack: Arc<SlackClients>,
+    relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
 ) -> Option<fluxbee_sdk::protocol::Message> {
     let command = msg.meta.msg.as_deref().unwrap_or_default();
     if !is_control_plane_msg_type(&msg.meta.msg_type) {
@@ -1789,6 +1987,7 @@ async fn handle_io_control_plane_message(
                 adapter_contract,
                 inbound,
                 slack,
+                relay,
             )
             .await
         }
@@ -1824,6 +2023,7 @@ async fn apply_io_config_set(
     adapter_contract: &dyn IoAdapterConfigContract,
     inbound: Arc<Mutex<InboundProcessor>>,
     slack: Arc<SlackClients>,
+    relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
 ) -> Value {
     let mut state = control_plane.write().await;
 
@@ -1952,6 +2152,68 @@ async fn apply_io_config_set(
         if let Some(dst_node) = extract_runtime_dst_node(Some(&effective)) {
             inbound.lock().await.set_dst_node(Some(dst_node));
             apply_hot.push("io.dst_node".to_string());
+        }
+    }
+
+    match extract_runtime_relay_config(Some(&effective), &SlackRelayConfig::default())
+        .and_then(|relay_cfg| slack_relay_policy_from_config(&relay_cfg))
+    {
+        Ok(policy) => {
+            let mut relay_guard = relay.lock().await;
+            let relay_changed = relay_guard.policy() != &policy;
+            if let Err(err) = relay_guard.replace_policy(policy.clone()) {
+                let err_text = err.to_string();
+                state.current_state = IoNodeLifecycleState::FailedConfig;
+                state.last_error = Some(IoControlPlaneErrorInfo {
+                    code: "invalid_config".to_string(),
+                    message: err_text.clone(),
+                });
+                control_metrics.record_config_set_error(
+                    state.current_state.as_str(),
+                    payload.config_version,
+                    "invalid_config",
+                );
+                let redacted = redact_state(&state, adapter_contract);
+                return build_io_config_set_error_payload(
+                    node_name,
+                    &redacted,
+                    "invalid_config",
+                    err_text,
+                );
+            }
+            drop(relay_guard);
+            if relay_changed {
+                tracing::info!(
+                    node_name = %node_name,
+                    relay_enabled = policy.enabled,
+                    relay_window_ms = policy.relay_window_ms,
+                    relay_max_open_sessions = policy.max_open_sessions,
+                    relay_max_fragments = policy.max_fragments_per_session,
+                    relay_max_bytes = policy.max_bytes_per_session,
+                    "io-slack relay policy hot-applied"
+                );
+                apply_hot.push("io.relay.*".to_string());
+            }
+        }
+        Err(err) => {
+            let err_text = err.to_string();
+            state.current_state = IoNodeLifecycleState::FailedConfig;
+            state.last_error = Some(IoControlPlaneErrorInfo {
+                code: "invalid_config".to_string(),
+                message: err_text.clone(),
+            });
+            control_metrics.record_config_set_error(
+                state.current_state.as_str(),
+                payload.config_version,
+                "invalid_config",
+            );
+            let redacted = redact_state(&state, adapter_contract);
+            return build_io_config_set_error_payload(
+                node_name,
+                &redacted,
+                "invalid_config",
+                err_text,
+            );
         }
     }
 

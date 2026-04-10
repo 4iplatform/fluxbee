@@ -158,10 +158,16 @@ Propiedades requeridas:
 - no mantiene sesiones sin límite esperando identidad
 - logs/counters para hit/miss/error/provision/fallback
 
-### 2.3 Sessionización (opcional)
-- Agrupamiento de fragmentos en turnos.
-- Ventanas configurables.
-- Implementación local (MVP) o durable (post-MVP).
+### 2.3 Relay / sessionización inbound común
+- El relay inbound vive en `io-common`; no debe existir un sessionizer privado por adapter.
+- Su función es consolidar múltiples fragmentos inbound del mismo turno físico en un único `text/v1` antes de llamar al pipeline común de inbound.
+- La identidad sigue resolviéndose al flush del relay; no durante la acumulación.
+- El adapter define la clave de relay y los hints del canal; `io-common` solo administra buffer, límites, deadlines, flush y ensamblado.
+- `relay_window_ms = 0` implica passthrough inmediato.
+- `relay_window_ms > 0` implica consolidación dentro de una ventana corta.
+- La configuración formal recomendada para adapters IO queda bajo `config.io.relay.*`.
+- La primera implementación activa usa store `memory`; durable queda como evolución posterior sin cambiar el contrato del adapter.
+- El relay deja trazabilidad en `meta.context.io.relay.*`.
 
 ### 2.4 Retry y errores
 - Clasificación de errores (retryable / non-retryable / rate_limited).
@@ -177,6 +183,11 @@ Propiedades requeridas:
 - Logs estructurados comunes.
 - Métricas estándar.
 - Propagación de `trace_id`.
+- Para el relay, la política inicial de logging es event-driven:
+  - sin logs periódicos,
+  - `debug` para apertura/buffer/flush/dedup,
+  - `info` para hitos de inicialización o drain,
+  - `warn` para capacidad, expiración, drops y fallbacks.
 
 ---
 
@@ -225,8 +236,8 @@ No depende de un resolver de identidad adicional en `io-common`.
 **InboundAdapter (por canal)**
 - parse_event(raw) -> InboundEvent
 - dedup_key(event) -> DedupKey
-- session_key(event) -> SessionKey?
-- to_internal_message(event|turn) -> Message
+- relay_key(event) -> RelayKey
+- to_relay_fragment(event) -> RelayFragment
 
 **OutboundAdapter (por canal)**
 - build_outbound(message) -> OutboxItem
@@ -238,7 +249,28 @@ No depende de un resolver de identidad adicional en `io-common`.
 **Storage**
 - dedup_store
 - outbox_store
-- session_store (opcional)
+- relay_store
+
+### 4.2 Relay común (`io-common`)
+
+Contrato mínimo vigente:
+
+- `RelayPolicy`
+- `RelayStore`
+- `InMemoryRelayStore`
+- `RelayFragment`
+- `RelaySession`
+- `AssembledTurn`
+- `RelayDecision`
+- `FlushReason`
+- `RelayBuffer`
+
+Flujo normativo:
+
+1. el adapter parsea el evento externo;
+2. construye `RelayFragment` con `relay_key`, `fragment_id`, `io_context` e `identity_input`;
+3. `RelayBuffer` decide `Hold`, `FlushNow`, `DropDuplicate`, `RejectCapacity` o `DropExpired`;
+4. cuando hay `FlushNow`, `InboundProcessor` resuelve identidad y construye el mensaje final al router.
 
 ---
 
@@ -270,7 +302,7 @@ Bajo las directivas actuales, los Nodos IO **NO** manejan base de datos ni Redis
 Por lo tanto, `io-common` implementa almacenamiento **en memoria** para:
 
 - `dedup_cache` (TTL + cap)
-- `session_buffer` (ventanas + caps)
+- `relay_store` / `relay_buffer` (ventanas + caps)
 - `outbox_queue` (cola + caps)
 
 ### 5.1 Reglas obligatorias de acotamiento
@@ -278,7 +310,7 @@ Por lo tanto, `io-common` implementa almacenamiento **en memoria** para:
 `io-common` **DEBE** exponer configuración para limitar memoria y evitar crecimiento sin control:
 
 - `dedup.ttl_ms`, `dedup.max_entries`, `dedup.max_bytes`
-- `session.window_ms`, `session.max_sessions`, `session.max_fragments`, `session.max_bytes`
+- `relay.window_ms`, `relay.max_open_sessions`, `relay.max_fragments_per_session`, `relay.max_bytes_per_session`
 - `outbox.max_pending`, `outbox.max_inflight`, `outbox.max_age_ms`
 - políticas de expulsión (eviction) y flush forzado
 
@@ -322,9 +354,9 @@ de `io-common` debe mantener puntos de extensión para incorporarlas (por ejempl
 - DB por IO: más aislamiento, más ops.
 - Schema por IO: menos ops, menos aislamiento.
 
-### 7.2 Sessionización obligatoria u opcional
-- Obligatoria en chat: menos ruido downstream.
-- Opcional: MVP más simple.
+### 7.2 Backend durable del relay
+- Mantener `memory` como baseline simple y predecible.
+- Definir `durable` sin convertir el relay en backlog histórico.
 
 ### 7.3 Estrategia de claiming del outbox
 - SELECT FOR UPDATE SKIP LOCKED.
@@ -345,7 +377,7 @@ Cada Nodo IO debe implementar:
 - backoff,
 - lifecycle y draining,
 - métricas y logging,
-- sessionización (si aplica).
+- relay/sessionización inbound (si aplica).
 
 Riesgos:
 - inconsistencia entre canales,
