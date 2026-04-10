@@ -157,6 +157,7 @@ CREATE TABLE timers (
 
     fire_at_utc         INTEGER NOT NULL,  -- unix ms, próximo disparo
     cron_spec           TEXT,              -- solo si kind='recurring'
+    cron_tz             TEXT,              -- timezone IANA del cron recurrente
 
     missed_policy       TEXT NOT NULL DEFAULT 'fire'
                         CHECK(missed_policy IN ('fire','drop','fire_if_within')),
@@ -180,6 +181,7 @@ CREATE INDEX idx_timers_status ON timers(status);
 
 **Notas:**
 - `created_at_utc` se preserva para siempre, incluso tras reschedules. Sirve para trazabilidad y para decisiones de `fire_if_within` basadas en antigüedad del timer original.
+- `cron_tz` se persiste explícitamente para que el próximo disparo recurrente pueda recomputarse sin perder la timezone de origen.
 - Los timers `fired` (one-shot completados) pueden ser purgados por un GC periódico tras N días (configurable, default 7 días) para evitar que la base crezca indefinidamente.
 
 ---

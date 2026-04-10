@@ -24,7 +24,6 @@ const (
 	configDir           = "/etc/fluxbee"
 	nodesDir            = "/var/lib/fluxbee/state/nodes"
 	routerSockDir       = "/var/run/fluxbee/routers"
-	nodeRootDir         = "/var/lib/fluxbee/nodes"
 )
 
 type Service struct {
@@ -96,7 +95,15 @@ func main() {
 		dbPath:      dbPath,
 		db:          db,
 	}
-	log.Printf("SY.timer ready: node=%s db=%s", service.nodeName, service.dbPath)
+	deleted, err := gcHistoricalTimers(context.Background(), db, time.Now().UTC(), defaultHistoryRetention)
+	if err != nil {
+		log.Printf("historical timer gc failed: %v", err)
+	}
+	pendingCount, err := countPendingTimers(context.Background(), db)
+	if err != nil {
+		log.Printf("failed to count pending timers: %v", err)
+	}
+	log.Printf("SY.timer ready: node=%s db=%s pending=%d gc_deleted=%d", service.nodeName, service.dbPath, pendingCount, deleted)
 	service.run()
 }
 
@@ -288,38 +295,6 @@ func (s *Service) sendTimerError(incoming fluxbeesdk.Message, verb, code, messag
 			"message": message,
 		},
 	})
-}
-
-func openTimerDB(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if _, err := db.Exec("PRAGMA busy_timeout=5000;"); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	return db, nil
-}
-
-func managedNodeInstanceDir(nodeName string) (string, error) {
-	nodeName = strings.TrimSpace(nodeName)
-	if nodeName == "" {
-		return "", fmt.Errorf("node_name must be non-empty")
-	}
-	localName, _, ok := strings.Cut(nodeName, "@")
-	if !ok || strings.TrimSpace(localName) == "" {
-		return "", fmt.Errorf("node_name must include hive suffix")
-	}
-	kind, _, ok := strings.Cut(localName, ".")
-	if !ok || strings.TrimSpace(kind) == "" {
-		return "", fmt.Errorf("node_name must include kind prefix")
-	}
-	return filepath.Join(nodeRootDir, kind, nodeName), nil
 }
 
 func loadLocation(raw string) (*time.Location, error) {

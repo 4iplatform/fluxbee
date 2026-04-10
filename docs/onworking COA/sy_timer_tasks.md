@@ -232,11 +232,21 @@ Current status:
 
 ### SYT-S4 — Persistence and schema
 
-- [ ] SYT-S4-T1. Implement SQLite schema creation/migrations for `timers`.
-- [ ] SYT-S4-T2. Add indexes exactly as required by the spec or revise them if schema is frozen differently.
-- [ ] SYT-S4-T3. Implement timer row serialization/deserialization with JSON payload/metadata blobs.
-- [ ] SYT-S4-T4. Decide whether to persist all timestamps as unix ms integers in v1.
-- [ ] SYT-S4-T5. Implement GC for historical timers (`fired`, `canceled`) with default retention.
+- [x] SYT-S4-T1. Implement SQLite schema creation/migrations for `timers`.
+- [x] SYT-S4-T2. Add indexes exactly as required by the spec or revise them if schema is frozen differently.
+- [x] SYT-S4-T3. Implement timer row serialization/deserialization with JSON payload/metadata blobs.
+- [x] SYT-S4-T4. Decide whether to persist all timestamps as unix ms integers in v1.
+- [x] SYT-S4-T5. Implement GC for historical timers (`fired`, `canceled`) with default retention.
+
+Current status:
+
+- schema initialization now runs during `openTimerDB(...)`
+- SQLite `user_version` is set for migration tracking
+- indexes for owner / pending `fire_at` / status are created automatically
+- timer row persistence helpers exist for insert / update / get / list / count
+- JSON `payload` and `metadata` blobs roundtrip through typed conversion to `TimerInfo`
+- historical GC helper is implemented and executed once on boot with the current default retention
+- schema was aligned to persist `cron_tz` explicitly, matching the request/response contract for recurring timers
 
 ### SYT-S5 — Scheduler engine
 
