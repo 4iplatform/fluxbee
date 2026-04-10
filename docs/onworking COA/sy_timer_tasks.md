@@ -263,19 +263,27 @@ Current status:
 
 ### SYT-S6 — Request handlers
 
-- [ ] SYT-S6-T1. Implement `TIMER_SCHEDULE`.
-- [ ] SYT-S6-T2. Implement `TIMER_SCHEDULE_RECURRING`.
-- [ ] SYT-S6-T3. Implement `TIMER_CANCEL`.
-- [ ] SYT-S6-T4. Implement `TIMER_RESCHEDULE`.
-- [ ] SYT-S6-T5. Implement `TIMER_GET`.
-- [ ] SYT-S6-T6. Implement `TIMER_LIST`.
-- [ ] SYT-S6-T7. Implement `TIMER_NOW`.
-- [ ] SYT-S6-T8. Implement `TIMER_NOW_IN`.
-- [ ] SYT-S6-T9. Implement `TIMER_CONVERT`.
-- [ ] SYT-S6-T10. Implement `TIMER_PARSE`.
-- [ ] SYT-S6-T11. Implement `TIMER_FORMAT`.
-- [ ] SYT-S6-T12. Implement `TIMER_HELP`.
+- [x] SYT-S6-T1. Implement `TIMER_SCHEDULE`.
+- [x] SYT-S6-T2. Implement `TIMER_SCHEDULE_RECURRING`.
+- [x] SYT-S6-T3. Implement `TIMER_CANCEL`.
+- [x] SYT-S6-T4. Implement `TIMER_RESCHEDULE`.
+- [x] SYT-S6-T5. Implement `TIMER_GET`.
+- [x] SYT-S6-T6. Implement `TIMER_LIST`.
+- [x] SYT-S6-T7. Implement `TIMER_NOW`.
+- [x] SYT-S6-T8. Implement `TIMER_NOW_IN`.
+- [x] SYT-S6-T9. Implement `TIMER_CONVERT`.
+- [x] SYT-S6-T10. Implement `TIMER_PARSE`.
+- [x] SYT-S6-T11. Implement `TIMER_FORMAT`.
+- [x] SYT-S6-T12. Implement `TIMER_HELP`.
 - [ ] SYT-S6-T13. Implement `TIMER_PURGE_OWNER` with orchestrator-only authorization.
+
+Current status:
+
+- one-shot CRUD handlers are live and persisted in SQLite
+- recurring creation is live, including cron/timezone validation and next-fire computation
+- `TIMER_GET` / `TIMER_LIST` already expose recurring rows with `cron_spec` / `cron_tz`
+- recurrent firing, replay, and `TIMER_FIRED` emission remain part of `S5`
+- `TIMER_PURGE_OWNER` remains deferred until the orchestrator integration pass
 
 ### SYT-S7 — Authorization and identity
 
