@@ -11654,6 +11654,16 @@ async fn kill_node_flow(
         }
     }
 
+    let timer_purge = if purge_instance {
+        if let Some(node_name) = validated_node_name.as_ref() {
+            Some(purge_owner_timers_before_teardown(state, &target_hive, node_name).await)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     match execute_on_hive(state, &target_hive, &cmd, "kill_node") {
         Ok(()) => {
             let mut response = serde_json::json!({
@@ -11666,6 +11676,9 @@ async fn kill_node_flow(
                 "force": force,
                 "purge_instance": purge_instance,
             });
+            if let Some(timer_purge) = timer_purge {
+                response["timer_purge"] = timer_purge;
+            }
             if purge_instance {
                 if let Some(node_name) = validated_node_name.as_ref() {
                     match remove_node_instance_dir_with_root(node_name, &node_files_root()) {
@@ -11857,6 +11870,7 @@ async fn remove_node_instance_flow(
         });
     }
 
+    let timer_purge = purge_owner_timers_before_teardown(state, &target_hive, &node_name).await;
     match remove_node_instance_dir_with_root(&node_name, &node_files_root()) {
         Ok((removed_path, removed_kind_dir)) => serde_json::json!({
             "status": "ok",
@@ -11866,6 +11880,7 @@ async fn remove_node_instance_flow(
             "unit": unit,
             "removed_path": removed_path.display().to_string(),
             "removed_kind_dir": removed_kind_dir,
+            "timer_purge": timer_purge,
         }),
         Err(err) => {
             if err.to_string() == "NODE_NOT_FOUND" {
@@ -11876,6 +11891,7 @@ async fn remove_node_instance_flow(
                     "target": target_hive,
                     "node_name": node_name,
                     "unit": unit,
+                    "timer_purge": timer_purge,
                 })
             } else {
                 serde_json::json!({
@@ -11885,9 +11901,55 @@ async fn remove_node_instance_flow(
                     "target": target_hive,
                     "node_name": node_name,
                     "unit": unit,
+                    "timer_purge": timer_purge,
                 })
             }
         }
+    }
+}
+
+async fn purge_owner_timers_before_teardown(
+    state: &OrchestratorState,
+    target_hive: &str,
+    owner_l2_name: &str,
+) -> serde_json::Value {
+    let timer_node = ensure_l2_name("SY.timer", target_hive);
+    match relay_system_action(
+        state,
+        &timer_node,
+        "TIMER_PURGE_OWNER",
+        "TIMER_RESPONSE",
+        serde_json::json!({
+            "owner_l2_name": owner_l2_name,
+        }),
+        Duration::from_secs(3),
+    )
+    .await
+    {
+        Ok(payload) => {
+            let status = if payload
+                .get("ok")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                "ok"
+            } else {
+                "error"
+            };
+            serde_json::json!({
+                "status": status,
+                "target": timer_node,
+                "owner_l2_name": owner_l2_name,
+                "deleted_count": payload.get("deleted_count").cloned().unwrap_or(serde_json::Value::Null),
+                "payload": payload,
+            })
+        }
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "target": timer_node,
+            "owner_l2_name": owner_l2_name,
+            "message": err.to_string(),
+        }),
     }
 }
 

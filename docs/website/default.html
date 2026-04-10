@@ -1035,7 +1035,7 @@
       try {
         // TODO: replace endpoint and body with the actual admin POST call
         // e.g. POST https://fluxbee.ai/api/waitlist  { "email": email }
-        const res = await fetch('/api/waitlist', {
+        const res = await fetch('http://localhost:3001', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({ email })
