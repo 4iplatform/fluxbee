@@ -112,25 +112,28 @@ const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "sy-storage",
     "sy-cognition",
     "sy-policy",
+    "sy-timer",
     "sy-frontdesk-gov",
     "sy-orchestrator",
 ];
-const WORKER_MIN_CORE_COMPONENTS: [&str; 7] = [
+const WORKER_MIN_CORE_COMPONENTS: [&str; 8] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
     "sy-cognition",
     "sy-policy",
+    "sy-timer",
     "sy-orchestrator",
 ];
-const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 7] = [
+const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 8] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
     "sy-cognition",
     "sy-policy",
+    "sy-timer",
     "sy-orchestrator",
 ];
 const DEFAULT_BLOB_ENABLED: bool = true;
