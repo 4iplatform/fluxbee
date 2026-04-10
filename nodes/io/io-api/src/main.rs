@@ -933,7 +933,7 @@ async fn apply_io_config_set(
     }
 
     match extract_runtime_relay_config(Some(&effective), &ApiRelayConfig::default())
-        .and_then(api_relay_policy_from_config)
+        .and_then(|relay_cfg| api_relay_policy_from_config(&relay_cfg))
     {
         Ok(policy) => {
             let mut relay_guard = runtime_updates.relay.lock().await;
