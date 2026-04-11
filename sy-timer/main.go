@@ -166,6 +166,12 @@ func main() {
 	if err != nil {
 		log.Printf("failed to count pending timers: %v", err)
 	}
+	logEvent("timer_startup", map[string]any{
+		"node_name":     service.nodeName,
+		"db_path":       service.dbPath,
+		"pending_count": pendingCount,
+		"gc_deleted":    deleted,
+	})
 	log.Printf("SY.timer ready: node=%s db=%s pending=%d gc_deleted=%d", service.nodeName, service.dbPath, pendingCount, deleted)
 	service.scheduler.start()
 	service.run()
@@ -175,11 +181,20 @@ func (s *Service) run() {
 	for {
 		msg, err := s.receiver.Recv(context.Background())
 		if err != nil {
+			logEvent("timer_receiver_error", map[string]any{
+				"error": err.Error(),
+			})
 			log.Printf("receiver error: %v", err)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		if err := s.handleMessage(msg); err != nil {
+			logEvent("timer_handler_error", map[string]any{
+				"error":    err.Error(),
+				"msg_type": msg.Meta.MsgType,
+				"verb":     stringValue(msg.Meta.Msg),
+				"trace_id": msg.Routing.TraceID,
+			})
 			log.Printf("handle message error: %v", err)
 		}
 	}
@@ -426,6 +441,17 @@ func (s *Service) respondTimerSchedule(incoming fluxbeesdk.Message) error {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE", "TIMER_STORAGE_ERROR", err.Error())
 	}
 	s.signalScheduler()
+	logEvent("timer_scheduled", map[string]any{
+		"timer_uuid":      timerID,
+		"owner_l2_name":   ownerL2,
+		"target_l2_name":  targetL2,
+		"kind":            "oneshot",
+		"fire_at_utc_ms":  fireAtUTCMS,
+		"trace_id":        incoming.Routing.TraceID,
+		"missed_policy":   missedPolicy,
+		"has_client_ref":  row.ClientRef.Valid,
+		"has_metadata":    row.Metadata.Valid,
+	})
 	return s.sendTimerResponse(incoming, map[string]any{
 		"ok":             true,
 		"verb":           "TIMER_SCHEDULE",
@@ -501,6 +527,18 @@ func (s *Service) respondTimerScheduleRecurring(incoming fluxbeesdk.Message) err
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE_RECURRING", "TIMER_STORAGE_ERROR", err.Error())
 	}
 	s.signalScheduler()
+	logEvent("timer_scheduled", map[string]any{
+		"timer_uuid":      timerID,
+		"owner_l2_name":   ownerL2,
+		"target_l2_name":  targetL2,
+		"kind":            "recurring",
+		"fire_at_utc_ms":  fireAtUTCMS,
+		"cron_tz":         cronTZ,
+		"trace_id":        incoming.Routing.TraceID,
+		"missed_policy":   missedPolicy,
+		"has_client_ref":  row.ClientRef.Valid,
+		"has_metadata":    row.Metadata.Valid,
+	})
 	return s.sendTimerResponse(incoming, map[string]any{
 		"ok":             true,
 		"verb":           "TIMER_SCHEDULE_RECURRING",
@@ -604,6 +642,12 @@ func (s *Service) respondTimerCancel(incoming fluxbeesdk.Message) error {
 		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_STORAGE_ERROR", err.Error())
 	}
 	s.signalScheduler()
+	logEvent("timer_canceled", map[string]any{
+		"timer_uuid":     row.UUID,
+		"owner_l2_name":  row.OwnerL2Name,
+		"target_l2_name": row.TargetL2Name,
+		"trace_id":       incoming.Routing.TraceID,
+	})
 	return s.sendTimerResponse(incoming, map[string]any{
 		"ok":         true,
 		"verb":       "TIMER_CANCEL",
@@ -649,6 +693,13 @@ func (s *Service) respondTimerReschedule(incoming fluxbeesdk.Message) error {
 		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_STORAGE_ERROR", err.Error())
 	}
 	s.signalScheduler()
+	logEvent("timer_rescheduled", map[string]any{
+		"timer_uuid":      row.UUID,
+		"owner_l2_name":   row.OwnerL2Name,
+		"target_l2_name":  row.TargetL2Name,
+		"fire_at_utc_ms":  fireAtUTCMS,
+		"trace_id":        incoming.Routing.TraceID,
+	})
 	return s.sendTimerResponse(incoming, map[string]any{
 		"ok":             true,
 		"verb":           "TIMER_RESCHEDULE",
@@ -679,6 +730,12 @@ func (s *Service) respondTimerPurgeOwner(incoming fluxbeesdk.Message) error {
 		return s.sendTimerError(incoming, "TIMER_PURGE_OWNER", "TIMER_STORAGE_ERROR", err.Error())
 	}
 	s.signalScheduler()
+	logEvent("timer_owner_purged", map[string]any{
+		"owner_l2_name":  ownerL2Name,
+		"deleted_count":  deletedCount,
+		"requester_l2":   requesterL2,
+		"trace_id":       incoming.Routing.TraceID,
+	})
 	return s.sendTimerResponse(incoming, map[string]any{
 		"ok":            true,
 		"verb":          "TIMER_PURGE_OWNER",

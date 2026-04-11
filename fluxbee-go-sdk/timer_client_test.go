@@ -238,6 +238,59 @@ func TestTimerClientFormatUsesTimerResponse(t *testing.T) {
 	}
 }
 
+func TestTimerClientHelpUsesTimerResponse(t *testing.T) {
+	tx := make(chan []byte, 1)
+	rx := make(chan receivedMessage, 1)
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
+		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+
+	go func() {
+		frame := <-tx
+		var request Message
+		if err := json.Unmarshal(frame, &request); err != nil {
+			t.Errorf("unmarshal request: %v", err)
+			return
+		}
+		if stringValue(request.Meta.Msg) != MsgTimerHelp {
+			t.Errorf("unexpected request verb: %q", stringValue(request.Meta.Msg))
+			return
+		}
+		response, err := BuildSystemResponse(
+			&request,
+			"timer-uuid",
+			MsgTimerResponse,
+			map[string]any{
+				"ok":          true,
+				"verb":        MsgTimerHelp,
+				"node_family": "SY",
+				"node_kind":   "SY.timer",
+				"version":     "1.0",
+				"description": "timer help",
+			},
+			SystemEnvelopeOptions{},
+		)
+		if err != nil {
+			t.Errorf("build response: %v", err)
+			return
+		}
+		rx <- receivedMessage{msg: response}
+	}()
+
+	help, err := client.Help(context.Background())
+	if err != nil {
+		t.Fatalf("help: %v", err)
+	}
+	if help.NodeKind != "SY.timer" || help.Verb != MsgTimerHelp {
+		t.Fatalf("unexpected help payload: %+v", help)
+	}
+}
+
 func TestTimerClientNowReturnsTypedUnreachableErrorAfterRetries(t *testing.T) {
 	client, err := NewTimerClient(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 4), state: &connectionState{connected: true}},
@@ -353,6 +406,151 @@ func TestScheduleUsesTimerResponseTimerUUID(t *testing.T) {
 	}
 	if id != TimerID("timer-1") {
 		t.Fatalf("unexpected timer id: %q", id)
+	}
+}
+
+func TestScheduleRecurringUsesTimerResponseTimerUUID(t *testing.T) {
+	tx := make(chan []byte, 1)
+	rx := make(chan receivedMessage, 1)
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
+		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+
+	go func() {
+		frame := <-tx
+		var request Message
+		if err := json.Unmarshal(frame, &request); err != nil {
+			t.Errorf("unmarshal request: %v", err)
+			return
+		}
+		if stringValue(request.Meta.Msg) != "TIMER_SCHEDULE_RECURRING" {
+			t.Errorf("unexpected request verb: %q", stringValue(request.Meta.Msg))
+			return
+		}
+		response, err := BuildSystemResponse(
+			&request,
+			"timer-uuid",
+			MsgTimerResponse,
+			map[string]any{
+				"ok":             true,
+				"verb":           "TIMER_SCHEDULE_RECURRING",
+				"timer_uuid":     "timer-r1",
+				"fire_at_utc_ms": int64(1775577600000),
+			},
+			SystemEnvelopeOptions{},
+		)
+		if err != nil {
+			t.Errorf("build response: %v", err)
+			return
+		}
+		rx <- receivedMessage{msg: response}
+	}()
+
+	id, err := client.ScheduleRecurring(context.Background(), RecurringOptions{CronSpec: "0 9 * * MON"})
+	if err != nil {
+		t.Fatalf("schedule recurring: %v", err)
+	}
+	if id != TimerID("timer-r1") {
+		t.Fatalf("unexpected timer id: %q", id)
+	}
+}
+
+func TestCancelReturnsNilOnSuccessfulTimerResponse(t *testing.T) {
+	tx := make(chan []byte, 1)
+	rx := make(chan receivedMessage, 1)
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
+		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+
+	go func() {
+		frame := <-tx
+		var request Message
+		if err := json.Unmarshal(frame, &request); err != nil {
+			t.Errorf("unmarshal request: %v", err)
+			return
+		}
+		if stringValue(request.Meta.Msg) != "TIMER_CANCEL" {
+			t.Errorf("unexpected request verb: %q", stringValue(request.Meta.Msg))
+			return
+		}
+		response, err := BuildSystemResponse(
+			&request,
+			"timer-uuid",
+			MsgTimerResponse,
+			map[string]any{
+				"ok":         true,
+				"verb":       "TIMER_CANCEL",
+				"timer_uuid": "timer-1",
+				"status":     "canceled",
+			},
+			SystemEnvelopeOptions{},
+		)
+		if err != nil {
+			t.Errorf("build response: %v", err)
+			return
+		}
+		rx <- receivedMessage{msg: response}
+	}()
+
+	if err := client.Cancel(context.Background(), TimerID("timer-1")); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+}
+
+func TestRescheduleReturnsNilOnSuccessfulTimerResponse(t *testing.T) {
+	tx := make(chan []byte, 1)
+	rx := make(chan receivedMessage, 1)
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
+		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+
+	go func() {
+		frame := <-tx
+		var request Message
+		if err := json.Unmarshal(frame, &request); err != nil {
+			t.Errorf("unmarshal request: %v", err)
+			return
+		}
+		if stringValue(request.Meta.Msg) != "TIMER_RESCHEDULE" {
+			t.Errorf("unexpected request verb: %q", stringValue(request.Meta.Msg))
+			return
+		}
+		response, err := BuildSystemResponse(
+			&request,
+			"timer-uuid",
+			MsgTimerResponse,
+			map[string]any{
+				"ok":             true,
+				"verb":           "TIMER_RESCHEDULE",
+				"timer_uuid":     "timer-1",
+				"fire_at_utc_ms": int64(1775577600000),
+			},
+			SystemEnvelopeOptions{},
+		)
+		if err != nil {
+			t.Errorf("build response: %v", err)
+			return
+		}
+		rx <- receivedMessage{msg: response}
+	}()
+
+	if err := client.Reschedule(context.Background(), TimerID("timer-1"), time.Now().UTC().Add(2*time.Hour)); err != nil {
+		t.Fatalf("reschedule: %v", err)
 	}
 }
 

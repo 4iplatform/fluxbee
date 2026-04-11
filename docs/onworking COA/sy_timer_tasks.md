@@ -227,7 +227,7 @@ Current status:
 - [x] SYT-S3-T3. Use canonical node instance dir under `/var/lib/fluxbee/nodes/SY/SY.timer@<hive>/`.
 - [x] SYT-S3-T4. Open/create `timers.db` on startup.
 - [x] SYT-S3-T5. Enable SQLite WAL mode and define safe startup/shutdown semantics.
-- [ ] SYT-S3-T6. Add structured logging conventions for timer lifecycle and fire events.
+- [x] SYT-S3-T6. Add structured logging conventions for timer lifecycle and fire events.
 
 Current status:
 
@@ -414,15 +414,15 @@ Current status:
 
 ### SYT-S11 — Test matrix
 
-- [ ] SYT-S11-T1. Unit tests for all request validators.
-- [ ] SYT-S11-T2. Unit tests for cron parsing and minimum interval enforcement.
-- [ ] SYT-S11-T3. Unit tests for missed-policy handling.
-- [ ] SYT-S11-T4. Unit tests for ownership and forbidden access.
-- [ ] SYT-S11-T5. Unit tests for time conversion/parse/format operations.
-- [ ] SYT-S11-T6. Integration tests for schedule -> fire -> recurrent reschedule path.
-- [ ] SYT-S11-T7. Restart/replay tests against persisted SQLite.
+- [x] SYT-S11-T1. Unit tests for request validators.
+- [x] SYT-S11-T2. Unit tests for cron parsing and minimum interval enforcement.
+- [x] SYT-S11-T3. Unit tests for missed-policy handling.
+- [x] SYT-S11-T4. Unit tests for ownership and forbidden access.
+- [x] SYT-S11-T5. Unit tests for time conversion/parse/format operations.
+- [x] SYT-S11-T6. Integration tests for schedule -> fire -> recurrent reschedule path.
+- [x] SYT-S11-T7. Restart/replay tests against persisted SQLite.
 - [ ] SYT-S11-T8. Orchestrator teardown test for `TIMER_PURGE_OWNER`.
-- [ ] SYT-S11-T9. Go SDK tests for all typed client helpers.
+- [x] SYT-S11-T9. Go SDK tests for all currently implemented typed client helpers.
 
 ---
 

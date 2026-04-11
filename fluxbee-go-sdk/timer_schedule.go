@@ -115,7 +115,10 @@ func (c *TimerClient) Cancel(ctx context.Context, id TimerID) error {
 	if err != nil {
 		return err
 	}
-	return timerResp.ResponseError()
+	if respErr := timerResp.ResponseError(); respErr != nil {
+		return respErr
+	}
+	return nil
 }
 
 func (c *TimerClient) Reschedule(ctx context.Context, id TimerID, newFireAt time.Time) error {
@@ -137,7 +140,10 @@ func (c *TimerClient) Reschedule(ctx context.Context, id TimerID, newFireAt time
 	if err != nil {
 		return err
 	}
-	return timerResp.ResponseError()
+	if respErr := timerResp.ResponseError(); respErr != nil {
+		return respErr
+	}
+	return nil
 }
 
 func (c *TimerClient) Get(ctx context.Context, id TimerID) (*TimerInfo, error) {
