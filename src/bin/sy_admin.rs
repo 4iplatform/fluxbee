@@ -2761,11 +2761,25 @@ fn value_string_field(value: &serde_json::Value, field: &str) -> Option<String> 
 }
 
 fn payload_error_code(payload: &serde_json::Value) -> Option<String> {
-    value_string_field(payload, "error_code")
+    value_string_field(payload, "error_code").or_else(|| {
+        payload
+            .get("error")
+            .and_then(|value| value.get("code"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+    })
 }
 
 fn payload_error_detail(payload: &serde_json::Value) -> Option<String> {
-    value_string_field(payload, "error_detail").or_else(|| value_string_field(payload, "message"))
+    value_string_field(payload, "error_detail")
+        .or_else(|| value_string_field(payload, "message"))
+        .or_else(|| {
+            payload
+                .get("error")
+                .and_then(|value| value.get("message"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        })
 }
 
 async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
@@ -3046,6 +3060,16 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
 
 fn is_ok_status(status: Option<&str>) -> bool {
     matches!(status, Some(value) if value.eq_ignore_ascii_case("ok") || value.eq_ignore_ascii_case("not_found"))
+}
+
+fn payload_is_ok(payload: &serde_json::Value) -> bool {
+    if is_ok_status(payload.get("status").and_then(|v| v.as_str())) {
+        return true;
+    }
+    payload
+        .get("ok")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 async fn respond_json(
@@ -5335,8 +5359,7 @@ fn build_admin_http_response(
 ) -> (u16, String) {
     match response {
         Ok(payload) => {
-            let status = payload.get("status").and_then(|v| v.as_str());
-            if is_ok_status(status) {
+            if payload_is_ok(&payload) {
                 return (
                     200,
                     serde_json::json!({
@@ -6239,5 +6262,22 @@ mod tests {
                 { "name": "limit", "type": "u32", "description": "Optional result limit. Defaults inside SY.timer and is capped there." }
             ])
         );
+    }
+
+    #[test]
+    fn build_admin_http_response_accepts_timer_ok_boolean_contract() {
+        let payload = json!({
+            "ok": true,
+            "verb": "TIMER_LIST",
+            "count": 0,
+            "timers": []
+        });
+
+        let (status, body) = build_admin_http_response("timer_list", Ok(payload));
+        let body_json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+
+        assert_eq!(status, 200);
+        assert_eq!(body_json["status"], json!("ok"));
+        assert_eq!(body_json["error_code"], serde_json::Value::Null);
     }
 }
