@@ -2670,13 +2670,6 @@ fn drift_alerts_payload_from_query(query: &HashMap<String, String>) -> serde_jso
     payload
 }
 
-fn load_node_uuid(dir: &Path, base_name: &str) -> Result<String, AdminError> {
-    let path = dir.join(format!("{base_name}.uuid"));
-    let data = fs::read_to_string(&path)?;
-    let uuid = Uuid::parse_str(data.trim())?;
-    Ok(uuid.to_string())
-}
-
 fn is_mother_role(role: Option<&str>) -> bool {
     matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee")
 }
@@ -5107,16 +5100,11 @@ fn build_admin_request(
     } else {
         format!("{}@{}", base, route_hive)
     };
-    let unicast = if target.ends_with(&format!("@{}", ctx.hive_id)) {
-        load_node_uuid(&ctx.state_dir.join("nodes"), base).ok()
-    } else {
-        None
-    };
     AdminRequest {
         action: action.to_string(),
         payload,
         target,
-        unicast,
+        unicast: None,
     }
 }
 
