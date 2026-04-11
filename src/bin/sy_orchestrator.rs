@@ -1248,6 +1248,13 @@ async fn send_admin_forbidden(
         },
         payload,
     };
+    tracing::info!(
+        action = action,
+        status = ?reply.payload.get("status").and_then(|value| value.as_str()),
+        trace_id = %reply.routing.trace_id,
+        dst = %msg.routing.src,
+        "sy.orchestrator sending admin reply"
+    );
     sender.send(reply).await?;
     Ok(())
 }
