@@ -1,0 +1,21 @@
+{
+  "routing": {
+    "src": "timer-node-uuid",
+    "dst": "src-uuid-1",
+    "ttl": 16,
+    "trace_id": "trace-error-1"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "TIMER_RESPONSE",
+    "action": "TIMER_RESPONSE"
+  },
+  "payload": {
+    "ok": false,
+    "verb": "TIMER_CANCEL",
+    "error": {
+      "code": "TIMER_NOT_FOUND",
+      "message": "timer does not exist"
+    }
+  }
+}

@@ -863,6 +863,8 @@ Para nodos `WF.*`, `AI.*`, `IO.*` y futuros nodos Go, el patrón recomendado es:
 
 En v1 este es el camino primario de integración. `SY.admin` aporta visibilidad read-only y utilidades de tiempo, pero la semántica owner-bound de scheduling y mutaciones sigue siendo de uso directo por SDK.
 
+**Nota de transporte:** el `fluxbee-go-sdk` emite estas requests directas como `system` unicast local con TTL default `1`, porque el destino esperado es siempre el `SY.timer@<hive-local>` del mismo hive. Los ejemplos de envelope en esta spec son ilustrativos del shape; el contrato canónico para clientes SDK queda fijado además por los golden tests del SDK.
+
 Ejemplo mínimo:
 
 ```go

@@ -148,7 +148,7 @@ Recommended order:
 - [x] SYT-S1-T8. Define stable package naming and import path for Go consumers.
 - [x] SYT-S1-T9. Add module README and first-party/third-party usage guidance.
 - [ ] SYT-S1-T10. Define versioning/compatibility policy for the Go SDK.
-- [ ] SYT-S1-T11. Add wire-compatibility tests against the Rust SDK contract.
+- [x] SYT-S1-T11. Add wire-compatibility tests against the Rust SDK contract.
 - [x] SYT-S1-T12. Leave a compatibility migration path for `SY.opa.rules` while imports move to the formal SDK.
 - [x] SYT-S1-T13. Replace the temporary local `uuid_persistence_dir`-based UUID->L2 resolver with the canonical runtime identity resolution path shared with the rest of the platform.
 
@@ -206,7 +206,7 @@ Current status after extraction:
   - recurring validation shape
 - [x] SYT-S2-T4. Implement retry policy for time operations as defined by the spec.
 - [x] SYT-S2-T5. Implement `ParseFiredEvent(msg)` helper.
-- [ ] SYT-S2-T6. Add tests/golden fixtures for SDK wire compatibility.
+- [x] SYT-S2-T6. Add tests/golden fixtures for SDK wire compatibility.
 
 Current status:
 
@@ -224,10 +224,17 @@ Current status:
   - `300ms`
   - `1s`
 - implemented `ParseFiredEvent(msg)`
+- added JSON fixtures / golden tests for:
+  - canonical `TIMER_SCHEDULE` request wire shape
+  - `TIMER_RESPONSE` success payloads
+  - `TIMER_RESPONSE` error payloads
+  - `TIMER_FIRED` event payloads
+- added explicit wire-compat checks against the current Rust/runtime envelope contract:
+  - `meta.type`
+  - `routing.trace_id`
+  - no legacy `msg_type` field in fixtures
 - remaining SDK work before Rust parity:
-  - wire-compat fixtures/golden tests
   - explicit versioning/compatibility policy
-  - wire-compat tests against the Rust contract
 
 ---
 

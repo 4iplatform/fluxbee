@@ -1,0 +1,29 @@
+{
+  "routing": {
+    "src": "SY.timer@motherbee",
+    "dst": "WF.demo@motherbee",
+    "ttl": 16,
+    "trace_id": "trace-fired-1"
+  },
+  "meta": {
+    "type": "system",
+    "msg": "TIMER_FIRED",
+    "action": "TIMER_FIRED"
+  },
+  "payload": {
+    "timer_uuid": "timer-1",
+    "owner_l2_name": "WF.demo@motherbee",
+    "client_ref": "demo-timeout",
+    "kind": "oneshot",
+    "scheduled_fire_at_utc_ms": 1775577600000,
+    "actual_fire_at_utc_ms": 1775577600123,
+    "fire_count": 1,
+    "is_last_fire": true,
+    "user_payload": {
+      "kind": "timeout"
+    },
+    "metadata": {
+      "source": "fixture"
+    }
+  }
+}
