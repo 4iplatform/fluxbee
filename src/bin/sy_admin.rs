@@ -127,15 +127,6 @@ impl AdminRouterClient {
         if msg.meta.msg_type == "admin" || msg.meta.msg_type == SYSTEM_KIND {
             let mut pending = self.pending_admin.lock().await;
             if let Some(tx) = pending.remove(&msg.routing.trace_id) {
-                tracing::info!(
-                    trace_id = %msg.routing.trace_id,
-                    msg_type = %msg.meta.msg_type,
-                    msg = ?msg.meta.msg,
-                    action = ?msg.meta.action,
-                    src = %msg.routing.src,
-                    dst = ?msg.routing.dst,
-                    "sy.admin matched pending response"
-                );
                 let _ = tx.send(msg);
                 return;
             }
@@ -5159,14 +5150,6 @@ async fn send_admin_request(
     };
     let (tx, rx) = oneshot::channel::<Message>();
     client.enqueue_admin_waiter(trace_id.clone(), tx).await;
-    tracing::info!(
-        trace_id = %trace_id,
-        action = %request.action,
-        target = %request.target,
-        dst = %dst,
-        timeout_secs = timeout_window.as_secs(),
-        "sy.admin sending routed admin request"
-    );
     client.sender.send(msg).await?;
 
     use tokio::time::{timeout, Instant};
@@ -5177,13 +5160,6 @@ async fn send_admin_request(
         Ok(Err(_)) => return Err("admin response channel closed".into()),
         Err(_) => {
             client.drop_admin_waiter(&trace_id).await;
-            tracing::warn!(
-                trace_id = %trace_id,
-                action = %request.action,
-                target = %request.target,
-                timeout_secs = timeout_window.as_secs(),
-                "sy.admin timed out waiting routed admin response"
-            );
             return Err(format!(
                 "admin request timeout action={} timeout_secs={}",
                 request.action,

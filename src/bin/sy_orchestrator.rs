@@ -1263,13 +1263,6 @@ async fn send_admin_forbidden(
         },
         payload,
     };
-    tracing::info!(
-        action = action,
-        status = ?reply.payload.get("status").and_then(|value| value.as_str()),
-        trace_id = %reply.routing.trace_id,
-        dst = %msg.routing.src,
-        "sy.orchestrator sending admin reply"
-    );
     sender.send(reply).await?;
     Ok(())
 }
@@ -1292,16 +1285,7 @@ async fn handle_admin(
             })
         }
         "get_storage" => {
-            tracing::info!(
-                trace_id = %msg.routing.trace_id,
-                "sy.orchestrator get_storage start"
-            );
             let path = state.storage_path.lock().await.clone();
-            tracing::info!(
-                trace_id = %msg.routing.trace_id,
-                path = %path,
-                "sy.orchestrator get_storage resolved"
-            );
             serde_json::json!({
                 "status": "ok",
                 "path": path,
@@ -1386,16 +1370,7 @@ async fn handle_admin(
         "run_node" => run_node_flow(state, &msg.payload).await,
         "kill_node" => kill_node_flow(state, &msg.payload).await,
         "list_hives" => {
-            tracing::info!(
-                trace_id = %msg.routing.trace_id,
-                "sy.orchestrator list_hives start"
-            );
             let hives = list_hives(state)?;
-            tracing::info!(
-                trace_id = %msg.routing.trace_id,
-                hive_count = hives.len(),
-                "sy.orchestrator list_hives resolved"
-            );
             serde_json::json!({
                 "status": "ok",
                 "hives": hives,
@@ -1532,11 +1507,6 @@ async fn handle_admin(
         payload,
     };
     sender.send(reply).await?;
-    tracing::info!(
-        action = action,
-        trace_id = %msg.routing.trace_id,
-        "sy.orchestrator admin reply sent"
-    );
     Ok(())
 }
 
