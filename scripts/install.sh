@@ -8,11 +8,100 @@ RUN_DIR="/var/run/fluxbee"
 APPLY_DEV_OWNERSHIP="${APPLY_DEV_OWNERSHIP:-1}"
 INSTALL_OWNER="${INSTALL_OWNER:-${SUDO_USER:-$USER}}"
 RESTART_ORCHESTRATOR_AFTER_INSTALL="${RESTART_ORCHESTRATOR_AFTER_INSTALL:-1}"
+CLEAN_RUNTIME_VOLATILE_ON_INSTALL="${CLEAN_RUNTIME_VOLATILE_ON_INSTALL:-1}"
 SEED_RUNTIME_FIXTURE="${SEED_RUNTIME_FIXTURE:-1}"
 RUNTIME_FIXTURE_NAME="${RUNTIME_FIXTURE_NAME:-wf.orch.diag}"
 RUNTIME_FIXTURE_VERSION="${RUNTIME_FIXTURE_VERSION:-0.0.1}"
 RUNTIME_FIXTURE_SLEEP_SECS="${RUNTIME_FIXTURE_SLEEP_SECS:-3600}"
 BIN_DIR="${BIN_DIR:-$ROOT_DIR/target/release}"
+STATE_ROOT_DIR="$STATE_DIR/state"
+
+install_service_exists() {
+  local svc="$1"
+  sudo systemctl show "${svc}.service" --property=LoadState --value 2>/dev/null | grep -qv '^not-found$'
+}
+
+install_service_is_active() {
+  local svc="$1"
+  sudo systemctl is-active --quiet "${svc}.service"
+}
+
+stop_install_service() {
+  local svc="$1"
+  if ! install_service_exists "$svc"; then
+    return 0
+  fi
+  if install_service_is_active "$svc"; then
+    echo "Stopping ${svc}.service for clean reinstall..."
+    sudo systemctl stop "${svc}.service" || true
+    if sudo systemctl is-active --quiet "${svc}.service"; then
+      sudo systemctl kill "${svc}.service" || true
+      sleep 0.5
+    fi
+  fi
+}
+
+cleanup_router_shm_from_identities() {
+  if [[ ! -d "$STATE_ROOT_DIR" ]]; then
+    return 0
+  fi
+  while IFS= read -r identity_path; do
+    [[ -n "$identity_path" ]] || continue
+    local shm_name
+    shm_name="$(
+      awk '
+        /^shm:/ { in_shm=1; next }
+        in_shm && /^[^[:space:]]/ { in_shm=0 }
+        in_shm && /^[[:space:]]*name:/ {
+          value=$2
+          gsub(/"/, "", value)
+          print value
+          exit
+        }
+      ' "$identity_path"
+    )"
+    [[ -n "$shm_name" ]] || continue
+    sudo rm -f "/dev/shm/${shm_name#/}" 2>/dev/null || true
+  done < <(find "$STATE_ROOT_DIR" -mindepth 2 -maxdepth 2 -type f -name identity.yaml 2>/dev/null | sort)
+}
+
+cleanup_volatile_runtime_artifacts() {
+  echo "Cleaning volatile Fluxbee runtime artifacts..."
+  sudo find "$RUN_DIR/routers" -maxdepth 1 \( -type s -o -type f \) -name '*.sock' -delete 2>/dev/null || true
+  for pattern in \
+    /dev/shm/jsr-config-* \
+    /dev/shm/jsr-lsa-* \
+    /dev/shm/jsr-identity-* \
+    /dev/shm/jsr-opa-* \
+    /dev/shm/jsr-memory-*; do
+    sudo rm -f $pattern 2>/dev/null || true
+  done
+  cleanup_router_shm_from_identities
+}
+
+declare -A INSTALL_WAS_ACTIVE=()
+INSTALL_RESTART_SERVICES=(
+  "rt-gateway"
+  "sy-config-routes"
+  "sy-opa-rules"
+  "sy-admin"
+  "sy-architect"
+  "sy-storage"
+  "sy-identity"
+  "sy-cognition"
+  "sy-policy"
+  "sy-timer"
+  "sy-frontdesk-gov"
+  "fluxbee-syncthing"
+)
+
+if [[ "$CLEAN_RUNTIME_VOLATILE_ON_INSTALL" == "1" ]]; then
+  for svc in sy-orchestrator "${INSTALL_RESTART_SERVICES[@]}"; do
+    if install_service_is_active "$svc"; then
+      INSTALL_WAS_ACTIVE["$svc"]=1
+    fi
+  done
+fi
 
 if [[ "${SKIP_BUILD:-}" != "1" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
@@ -93,6 +182,17 @@ sudo install -d "$STATE_DIR/dist/vendor"
 sudo install -d "$STATE_DIR/dist/vendor/syncthing"
 sudo install -d "$RUN_DIR"
 sudo install -d "$RUN_DIR/routers"
+sudo install -d "$STATE_ROOT_DIR"
+
+if [[ "$CLEAN_RUNTIME_VOLATILE_ON_INSTALL" == "1" ]]; then
+  stop_install_service "sy-orchestrator"
+  for svc in "${INSTALL_RESTART_SERVICES[@]}"; do
+    stop_install_service "$svc"
+  done
+  cleanup_volatile_runtime_artifacts
+else
+  echo "CLEAN_RUNTIME_VOLATILE_ON_INSTALL=0: preserving router sockets and SHM artifacts."
+fi
 
 MOTHERBEE_KEY="$STATE_DIR/ssh/motherbee.key"
 MOTHERBEE_KEY_PUB="$STATE_DIR/ssh/motherbee.key.pub"
@@ -461,34 +561,46 @@ install_unit "sy-frontdesk-gov" "/usr/bin/sy-frontdesk-gov"
 sudo systemctl daemon-reload
 
 if [[ "$RESTART_ORCHESTRATOR_AFTER_INSTALL" == "1" ]]; then
-  if sudo systemctl list-unit-files sy-orchestrator.service >/dev/null 2>&1; then
-    if sudo systemctl is-active --quiet sy-orchestrator; then
-      echo "Restarting sy-orchestrator to apply new binary..."
+  if install_service_exists "sy-orchestrator"; then
+    if [[ "${INSTALL_WAS_ACTIVE[sy-orchestrator]:-0}" == "1" ]]; then
+      echo "Restarting sy-orchestrator to restore runtime after install..."
       sudo systemctl restart sy-orchestrator
     else
-      echo "sy-orchestrator is not active; skipping restart."
+      echo "sy-orchestrator was not active before install; skipping restart."
     fi
   fi
 else
   echo "RESTART_ORCHESTRATOR_AFTER_INSTALL=0: skipping sy-orchestrator restart."
 fi
 
-if sudo systemctl list-unit-files sy-architect.service >/dev/null 2>&1; then
-  if sudo systemctl is-active --quiet sy-architect; then
-    echo "Restarting sy-architect to apply new binary..."
+if [[ "${INSTALL_WAS_ACTIVE[sy-orchestrator]:-0}" != "1" ]] && install_service_exists "sy-architect"; then
+  if [[ "${INSTALL_WAS_ACTIVE[sy-architect]:-0}" == "1" ]]; then
+    echo "Restarting sy-architect to restore pre-install state..."
     sudo systemctl restart sy-architect
   else
-    echo "sy-architect is not active; skipping restart."
+    echo "sy-architect was not active before install; skipping restart."
   fi
 fi
 
-if sudo systemctl list-unit-files sy-frontdesk-gov.service >/dev/null 2>&1; then
-  if sudo systemctl is-active --quiet sy-frontdesk-gov; then
-    echo "Restarting sy-frontdesk-gov to apply new binary..."
+if [[ "${INSTALL_WAS_ACTIVE[sy-orchestrator]:-0}" != "1" ]] && install_service_exists "sy-frontdesk-gov"; then
+  if [[ "${INSTALL_WAS_ACTIVE[sy-frontdesk-gov]:-0}" == "1" ]]; then
+    echo "Restarting sy-frontdesk-gov to restore pre-install state..."
     sudo systemctl restart sy-frontdesk-gov
   else
-    echo "sy-frontdesk-gov is not active; skipping restart."
+    echo "sy-frontdesk-gov was not active before install; skipping restart."
   fi
+fi
+
+if [[ "${INSTALL_WAS_ACTIVE[sy-orchestrator]:-0}" != "1" ]]; then
+  for svc in "${INSTALL_RESTART_SERVICES[@]}"; do
+    if [[ "$svc" == "sy-architect" || "$svc" == "sy-frontdesk-gov" ]]; then
+      continue
+    fi
+    if [[ "${INSTALL_WAS_ACTIVE[$svc]:-0}" == "1" ]] && install_service_exists "$svc"; then
+      echo "Restarting ${svc}.service to restore pre-install state..."
+      sudo systemctl restart "${svc}.service"
+    fi
+  done
 fi
 
 if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then
